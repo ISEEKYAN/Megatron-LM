@@ -7,6 +7,7 @@ Megatron-style sharded linear surfaces, not arbitrary PEFT injection.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,11 +25,23 @@ _TARGET_ALIASES = {
 }
 
 
+def lora_scaling(rank: int, alpha: int | None, use_rslora: bool = False) -> float:
+    """LoRA scaling factor applied to ``B @ A``.
+
+    Standard LoRA uses ``alpha / rank``; rsLoRA (Kalajdzievski, 2023) uses
+    ``alpha / sqrt(rank)`` so the effective update magnitude stays rank-stable,
+    enabling learning-rate reuse across ranks.
+    """
+    numerator = float(rank if alpha is None else alpha)
+    return numerator / (math.sqrt(rank) if use_rslora else float(rank))
+
+
 @dataclass(frozen=True)
 class LoraConfig:
     rank: int = 0
     alpha: int | None = None
     dropout: float = 0.0
+    use_rslora: bool = False
     target_modules: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_TARGET_MODULES)
 
     @property
@@ -37,7 +50,7 @@ class LoraConfig:
 
     @property
     def scale(self) -> float:
-        return float(self.rank if self.alpha is None else self.alpha) / float(self.rank)
+        return lora_scaling(self.rank, self.alpha, self.use_rslora)
 
     def targets(self) -> set[str]:
         out = set()
@@ -353,6 +366,7 @@ class LinearLoRA(nn.Module):
         *,
         alpha: int | None = None,
         dropout: float = 0.0,
+        use_rslora: bool = False,
         sequence_parallel_input: bool = False,
         row_parallel_output: bool = False,
         sequence_parallel_scatter_output: bool = False,
@@ -388,7 +402,8 @@ class LinearLoRA(nn.Module):
         else:
             self.rank_partition_size = 1
             self.local_rank = self.rank
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
+        self.scale = lora_scaling(rank, alpha, use_rslora)
+        self.use_rslora = bool(use_rslora)
         self.dropout_p = float(dropout)
         self.sequence_parallel_input = bool(sequence_parallel_input)
         self.row_parallel_output = bool(row_parallel_output)
@@ -472,13 +487,15 @@ class GroupedLinearLoRA(nn.Module):
         *,
         alpha: int | None = None,
         dropout: float = 0.0,
+        use_rslora: bool = False,
     ):
         super().__init__()
         if rank <= 0:
             raise ValueError("LoRA rank must be positive for GroupedLinearLoRA.")
         self.num_local_experts = int(num_local_experts)
         self.rank = int(rank)
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
+        self.scale = lora_scaling(rank, alpha, use_rslora)
+        self.use_rslora = bool(use_rslora)
         self.dropout_p = float(dropout)
         self.lora_a = nn.Parameter(torch.empty(num_local_experts, rank, in_features))
         self.lora_b = nn.Parameter(torch.empty(num_local_experts, out_features, rank))
@@ -520,13 +537,15 @@ class SharedGroupedLinearLoRA(nn.Module):
         *,
         alpha: int | None = None,
         dropout: float = 0.0,
+        use_rslora: bool = False,
     ):
         super().__init__()
         if rank <= 0:
             raise ValueError("LoRA rank must be positive for SharedGroupedLinearLoRA.")
         self.num_local_experts = int(num_local_experts)
         self.rank = int(rank)
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
+        self.scale = lora_scaling(rank, alpha, use_rslora)
+        self.use_rslora = bool(use_rslora)
         self.dropout_p = float(dropout)
         self.shared_across_experts = True
         self.lora_a = nn.Parameter(torch.empty(rank, in_features))

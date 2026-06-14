@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -229,7 +230,9 @@ def _infer_native_alpha(chunks: list[nn.Module] | tuple[nn.Module, ...]) -> int 
         scale = getattr(module, "scale", None)
         if rank is None or scale is None:
             continue
-        alphas.add(int(round(float(scale) * int(rank))))
+        # Invert the module's scaling convention: scale = alpha / (sqrt(rank) if rsLoRA else rank).
+        denom = math.sqrt(rank) if getattr(module, "use_rslora", False) else float(rank)
+        alphas.add(int(round(float(scale) * denom)))
     if not alphas:
         return None
     if len(alphas) != 1:
@@ -237,6 +240,15 @@ def _infer_native_alpha(chunks: list[nn.Module] | tuple[nn.Module, ...]) -> int 
             f"Native LoRA modules have inconsistent effective alpha values: {sorted(alphas)}."
         )
     return next(iter(alphas))
+
+
+def _infer_native_use_rslora(chunks: list[nn.Module] | tuple[nn.Module, ...]) -> bool | None:
+    flags = {bool(getattr(module, "use_rslora", False)) for module in _iter_native_lora_modules(chunks)}
+    if not flags:
+        return None
+    if len(flags) != 1:
+        raise ValueError(f"Native LoRA modules have inconsistent use_rslora values: {sorted(flags)}.")
+    return next(iter(flags))
 
 
 def _validate_adapter_config(
@@ -272,9 +284,20 @@ def _validate_adapter_config(
             f"Adapter config lora_alpha={config_alpha} does not match native model alpha={native_alpha}."
         )
 
+    config_rslora = adapter_config.get("use_rslora")
+    native_rslora = _infer_native_use_rslora(chunks)
+    if config_rslora is not None and native_rslora is not None and bool(config_rslora) != native_rslora:
+        raise ValueError(
+            f"Adapter config use_rslora={config_rslora} does not match native model use_rslora={native_rslora}."
+        )
+
     if lora_config is not None:
         expected = normalize_lora_config(lora_config)
         expected_targets = set(_target_modules_from_lora_config(expected))
+        if config_rslora is not None and bool(config_rslora) != expected.use_rslora:
+            raise ValueError(
+                f"Adapter config use_rslora={config_rslora} does not match expected use_rslora {expected.use_rslora}."
+            )
         if config_rank is not None and int(config_rank) != expected.rank:
             raise ValueError(
                 f"Adapter config rank r={config_rank} does not match expected rank {expected.rank}."
@@ -455,6 +478,7 @@ def save_lora_adapter(
             "r": lora.rank,
             "lora_alpha": _effective_lora_alpha(lora),
             "lora_dropout": lora.dropout,
+            "use_rslora": lora.use_rslora,
             "target_modules": _target_modules_from_lora_config(lora),
             "bias": "none",
             "fan_in_fan_out": False,
