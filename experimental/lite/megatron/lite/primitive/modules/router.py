@@ -71,11 +71,25 @@ class TopKRouter(nn.Module):
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, replay_indices: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         router_dtype = self.router_dtype or x.dtype
         logits = router_gating_linear(x, self.gate.weight, None, router_dtype)
         logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
+        if replay_indices is not None:
+            # R3 Router Replay (arXiv:2606.02437 §3, the MoE TIM fix): pin the discrete top-k
+            # SELECTION to the recorded rollout routing, but recompute the SCORES differentiably
+            # from the current logits (so gradients still reach the gate weight and the upstream
+            # LoRA adapters). "Replay verbatim" = freeze the indices, keep the probabilities live.
+            topk_indices = replay_indices.to(device=logits.device).long().view(num_tokens, self.topk)
+            logits_f = logits.float()
+            if self.use_pre_softmax:
+                topk_scores = torch.gather(torch.softmax(logits_f, dim=-1), 1, topk_indices)
+            else:
+                topk_scores = torch.softmax(torch.gather(logits_f, 1, topk_indices), dim=-1)
+            return topk_scores.to(x.dtype), topk_indices
         if self.moe_router_fusion:
             probs_dense, _ = topk_routing_with_score_function(
                 logits,

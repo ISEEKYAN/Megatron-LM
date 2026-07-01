@@ -149,6 +149,42 @@ def test_olora_tail_init_rejects_tp_sharded_weight():
         layer.olora_tail_init_(torch.randn(16, 12))
 
 
+def test_r3_router_replay_pins_selection_and_stays_differentiable():
+    # R3 (arXiv:2606.02437 §3): replay pins the discrete top-k SELECTION to recorded routing but
+    # recomputes SCORES from live logits -> indices frozen, probabilities differentiable.
+    from types import SimpleNamespace
+
+    from megatron.lite.primitive.modules.router import TopKRouter
+
+    cfg = SimpleNamespace(
+        num_experts_per_tok=2, num_experts=8, router_aux_loss_coef=0.0, hidden_size=16
+    )
+    ps = SimpleNamespace(tp_size=1, tp_group=None)
+    # router_gating_linear routes through the TE GEMM when TE is installed, which is
+    # CUDA-only — run on the GPU there, and on CPU only in TE-less dev environments.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    router = TopKRouter(cfg, ps, compute_aux_loss=False).to(device)
+    torch.manual_seed(0)
+    x = torch.randn(5, 16, device=device)
+
+    with torch.no_grad():
+        scores0, idx0 = router(x)
+        scores_r, idx_r = router(x, replay_indices=idx0)
+        assert torch.equal(idx_r, idx0)  # replay reproduces the recorded selection exactly
+        # perturb the gate (simulates the rollout->train policy drift that causes TIM)
+        router.gate.weight.add_(torch.randn_like(router.gate.weight) * 3.0)
+        _, idx_noreplay = router(x)
+        scores_r2, idx_r2 = router(x, replay_indices=idx0)
+    assert torch.equal(idx_r2, idx0)  # WITH replay: selection stays pinned despite the drift
+    assert not torch.equal(idx_noreplay, idx0)  # WITHOUT replay: top-k flips (the TIM the paper fixes)
+    assert not torch.allclose(scores_r2, scores_r)  # scores track the new (perturbed) logits = live
+
+    router.gate.weight.requires_grad_(True)
+    s, _ = router(x, replay_indices=idx0)
+    s.sum().backward()
+    assert router.gate.weight.grad is not None and router.gate.weight.grad.abs().sum() > 0
+
+
 def test_linear_lora_forward_backward_matches_low_rank_delta():
     layer = LinearLoRA(3, 2, rank=2, alpha=4, dropout=0.0)
     with torch.no_grad():
