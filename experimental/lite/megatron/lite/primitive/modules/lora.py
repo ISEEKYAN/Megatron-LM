@@ -38,6 +38,14 @@ def lora_scaling(rank: int, alpha: int | None, *, use_rslora: bool = False) -> f
     return effective_alpha / denom
 
 
+def olora_tail_factors(weight: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return minor-SVD OLoRA factors B[out, rank], A[rank, in]."""
+    if weight.ndim != 2 or rank > min(weight.shape):
+        raise ValueError(f"OLoRA-tail rank/weight mismatch: rank={rank}, shape={tuple(weight.shape)}")
+    u, _, vh = torch.linalg.svd(weight.detach().float(), full_matrices=False)
+    return u[:, -rank:].contiguous(), vh[-rank:, :].contiguous()
+
+
 @dataclass(frozen=True)
 class LoraSpec:
     enabled: bool = False
@@ -501,12 +509,19 @@ class LinearLoRA(nn.Module):
 
     def olora_tail_init_(self, base_weight: torch.Tensor) -> None:
         with torch.no_grad():
-            delta = self.materialized_delta_weight()
-            if base_weight.shape != delta.shape:
+            if self.rank_partitioned_a or self.output_partitioned_b:
+                raise NotImplementedError("OLoRA-tail requires an unsharded base weight.")
+            if tuple(base_weight.shape) != (self.lora_b.shape[0], self.lora_a.shape[1]):
                 raise ValueError(
-                    f"OLoRA-tail base shape {base_weight.shape} != delta {delta.shape}."
+                    f"OLoRA-tail base shape {base_weight.shape} does not match adapter."
                 )
-            base_weight.sub_(delta.to(base_weight.dtype))
+            b0, a0 = olora_tail_factors(base_weight, self.rank)
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                dist.broadcast(b0, src=0)
+                dist.broadcast(a0, src=0)
+            self.lora_b.copy_(b0.to(self.lora_b.dtype))
+            self.lora_a.copy_(a0.to(self.lora_a.dtype))
+            base_weight.sub_((b0 @ a0).to(base_weight.dtype), alpha=self.scale)
 
 
 class SharedGroupedLinearLoRA(nn.Module):
@@ -600,5 +615,6 @@ __all__ = [
     "lora_scaling",
     "normalize_lora_config",
     "normalize_lora_spec",
+    "olora_tail_factors",
     "trainable_param_stats",
 ]
