@@ -12,6 +12,7 @@ from megatron.lite.primitive.modules.lora import (
     freeze_non_lora_params,
     lora_scaling,
     normalize_lora_config,
+    olora_tail_factors,
     trainable_param_stats,
 )
 
@@ -84,6 +85,68 @@ def test_rslora_forward_scales_delta_by_sqrt_rank():
             layer.lora_b.copy_(b)
     x = torch.randn(1, 3)
     torch.testing.assert_close(rs(x), std(x) * (4**0.5))
+
+
+def test_olora_tail_factors_are_minor_subspace_without_sigma():
+    # B0=U_-r, A0=V_-r^T from the SMALLEST r singular values, orthonormal (no Sigma scaling).
+    torch.manual_seed(0)
+    out_f, in_f, rank = 16, 12, 3
+    w = torch.randn(out_f, in_f)
+    u, _s, vh = torch.linalg.svd(w, full_matrices=False)  # singular values descending
+    b0, a0 = olora_tail_factors(w, rank)
+
+    assert b0.shape == (out_f, rank)
+    assert a0.shape == (rank, in_f)
+    # orthonormal => NO singular-value scaling injected (unlike MiLoRA's Sigma^1/2)
+    torch.testing.assert_close(b0.t() @ b0, torch.eye(rank), atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(a0 @ a0.t(), torch.eye(rank), atol=1e-4, rtol=1e-4)
+    # spans the MINOR subspace (smallest r vectors), up to per-vector sign
+    torch.testing.assert_close(b0.abs(), u[:, -rank:].abs(), atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(a0.abs(), vh[-rank:, :].abs(), atol=1e-4, rtol=1e-4)
+    with pytest.raises(ValueError, match="exceeds"):
+        olora_tail_factors(w, rank=13)
+
+
+def test_linear_lora_olora_tail_preserves_init_output():
+    # PiSSA-style residual: effective output unchanged at init, but adapter delta is NON-zero.
+    torch.manual_seed(0)
+    in_f, out_f, rank = 12, 16, 3
+    layer = LinearLoRA(in_f, out_f, rank, alpha=6)  # scale = 6/3 = 2
+    w = torch.randn(out_f, in_f)
+    w0 = w.clone()
+    x = torch.randn(4, in_f)
+    base_out = x @ w0.t()
+
+    layer.olora_tail_init_(w)  # sets lora_a/b, subtracts scale*B0@A0 from w in place
+
+    effective = x @ w.t() + layer(x)  # residual base + adapter
+    torch.testing.assert_close(effective, base_out, atol=1e-4, rtol=1e-4)
+    assert layer.lora_b.abs().sum() > 0  # unlike standard zero-init B
+
+
+def test_shared_grouped_olora_tail_preserves_every_expert_output():
+    # one shared adapter; subtract same delta from each expert -> each expert output preserved.
+    torch.manual_seed(0)
+    n_exp, in_f, out_f, rank = 3, 12, 16, 2
+    layer = SharedGroupedLinearLoRA(n_exp, in_f, out_f, rank, alpha=4)  # scale = 2
+    ws = [torch.randn(out_f, in_f) for _ in range(n_exp)]
+    w0s = [w.clone() for w in ws]
+
+    layer.olora_tail_init_(ws)
+
+    x = torch.randn(5, in_f)
+    shared = (x @ layer.lora_a.t()) @ layer.lora_b.t() * layer.scale
+    for w_after, w0 in zip(ws, w0s, strict=True):
+        torch.testing.assert_close(x @ w_after.t() + shared, x @ w0.t(), atol=1e-4, rtol=1e-4)
+
+
+def test_olora_tail_init_rejects_tp_sharded_weight():
+    # tp>1 / partitioned surfaces need a distributed SVD; we guard against silent wrong init.
+    # rank must be divisible by the partition size (4 % 2 == 0) so construction succeeds and
+    # the guard — not the constructor — is what rejects the sharded surface.
+    layer = LinearLoRA(12, 16, rank=4, alpha=6, rank_partitioned_a=True, rank_partition_size=2)
+    with pytest.raises(NotImplementedError, match="tp=1"):
+        layer.olora_tail_init_(torch.randn(16, 12))
 
 
 def test_linear_lora_forward_backward_matches_low_rank_delta():
