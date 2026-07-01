@@ -150,11 +150,18 @@ def test_olora_tail_init_rejects_tp_sharded_weight():
 
 
 def test_r3_router_replay_pins_selection_and_stays_differentiable():
-    # R3 (arXiv:2606.02437 §3): replay pins the discrete top-k SELECTION to recorded routing but
-    # recomputes SCORES from live logits -> indices frozen, probabilities differentiable.
+    # R3 (arXiv:2606.02437 §3) via the upstream-PR#49-shaped RouterReplay registry:
+    # RECORD captures the fresh top-k; REPLAY_FORWARD pins the SELECTION to it while
+    # recomputing SCORES from live logits -> indices frozen, probabilities differentiable.
     from types import SimpleNamespace
 
-    from megatron.lite.primitive.modules.router import TopKRouter
+    from megatron.lite.primitive.modules.router import (
+        RouterReplay,
+        RouterReplayAction,
+        TopKRouter,
+        attach_router_replay,
+        detach_router_replay,
+    )
 
     cfg = SimpleNamespace(
         num_experts_per_tok=2, num_experts=8, router_aux_loss_coef=0.0, hidden_size=16
@@ -164,25 +171,59 @@ def test_r3_router_replay_pins_selection_and_stays_differentiable():
     # CUDA-only — run on the GPU there, and on CPU only in TE-less dev environments.
     device = "cuda" if torch.cuda.is_available() else "cpu"
     router = TopKRouter(cfg, ps, compute_aux_loss=False).to(device)
+    assert attach_router_replay(router) == 1
     torch.manual_seed(0)
     x = torch.randn(5, 16, device=device)
 
     with torch.no_grad():
-        scores0, idx0 = router(x)
-        scores_r, idx_r = router(x, replay_indices=idx0)
-        assert torch.equal(idx_r, idx0)  # replay reproduces the recorded selection exactly
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        _, idx0 = router(x)
+        recorded = RouterReplay.get_recorded_data()
+        assert len(recorded) == 1 and torch.equal(recorded[0], idx0)
+
         # perturb the gate (simulates the rollout->train policy drift that causes TIM)
         router.gate.weight.add_(torch.randn_like(router.gate.weight) * 3.0)
+        RouterReplay.set_global_router_replay_action(None)
         _, idx_noreplay = router(x)
-        scores_r2, idx_r2 = router(x, replay_indices=idx0)
-    assert torch.equal(idx_r2, idx0)  # WITH replay: selection stays pinned despite the drift
-    assert not torch.equal(idx_noreplay, idx0)  # WITHOUT replay: top-k flips (the TIM the paper fixes)
-    assert not torch.allclose(scores_r2, scores_r)  # scores track the new (perturbed) logits = live
+        assert not torch.equal(idx_noreplay, idx0)  # WITHOUT replay: top-k flips (the TIM)
+
+        RouterReplay.set_replay_data([idx0])
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        scores_r, idx_r = router(x)
+    assert torch.equal(idx_r, idx0)  # WITH replay: selection pinned despite the drift
+    # Regression vs gathering from post-topk scatter-zeroed dense probs (upstream PR#49
+    # bug): drifted replayed experts must get LIVE nonzero scores matching the router's
+    # native normalization (post-softmax mode: softmax over the replayed-k logits).
+    assert scores_r.min() > 0
+    with torch.no_grad():
+        manual_logits = torch.nn.functional.linear(x.float(), router.gate.weight.float())
+        expected = torch.softmax(manual_logits.gather(1, idx0), dim=-1)
+    torch.testing.assert_close(
+        scores_r.float(), expected, atol=2e-2, rtol=2e-2  # loose: TE gemm vs fp32 matmul
+    )
 
     router.gate.weight.requires_grad_(True)
-    s, _ = router(x, replay_indices=idx0)
+    RouterReplay.set_replay_data([idx0])
+    s, _ = router(x)
     s.sum().backward()
     assert router.gate.weight.grad is not None and router.gate.weight.grad.abs().sum() > 0
+
+    # REPLAY_BACKWARD pops one queued tensor per (re)forward — exhaustion must fail loudly.
+    # (clear first: each set_replay_data call above queued one backward entry)
+    RouterReplay.clear_global_indices()
+    RouterReplay.set_replay_data([idx0])
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+    with torch.no_grad():
+        router(x)  # consumes the single queued entry
+        with pytest.raises(RuntimeError, match="exhausted"):
+            router(x)
+
+    detach_router_replay(router)
+    assert router.router_replay is None
+    assert RouterReplay.global_router_replay_instances == []
+    with torch.no_grad():
+        _, idx_off = router(x)
+    assert torch.equal(idx_off, idx_noreplay)  # replay fully off after detach
 
 
 def test_linear_lora_forward_backward_matches_low_rank_delta():

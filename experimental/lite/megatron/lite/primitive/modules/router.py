@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import TYPE_CHECKING
 
 import torch  # pyright: ignore[reportMissingImports]
@@ -19,6 +20,162 @@ from megatron.lite.primitive.utils.moe import (
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.parallel import ParallelState
+
+
+class RouterReplayAction(Enum):
+    """Action for a router-replay step (mirrors the verl/mcore contract)."""
+
+    RECORD = "record"  # capture the topk expert indices for later replay
+    REPLAY_FORWARD = "replay_forward"  # force the recorded indices in the forward pass
+    REPLAY_BACKWARD = "replay_backward"  # force them again during backward recompute
+
+
+class RouterReplay:
+    """R3 record/replay of MoE routing decisions (arXiv:2606.02437 §3).
+
+    Architecture follows upstream mlite PR#49 / verl ``router_replay_patch``:
+    one instance per MoE router, registered in ``global_router_replay_instances``
+    in attach order so the runtime can address per-layer routing tensors
+    positionally, with global set-data/set-action fan-out.
+
+    Score semantics deliberately follow the verl/slime reference, NOT upstream
+    PR#49's ``apply(probs_dense, ...)``: the reference gathers replayed scores
+    from the FULL dense score tensor (every expert has a live score), whereas
+    PR#49 gathers from the post-topk scatter-zeroed dense probs — any replayed
+    index outside the CURRENT top-k (i.e. exactly the drifted tokens R3 exists
+    to fix) reads score 0.0 there, silently zeroing that expert's contribution
+    and its gate gradient. Here the router hands ``apply_from_logits`` the raw
+    gating logits instead: pre-softmax mode gathers from softmax(logits);
+    post-softmax mode softmaxes the gathered logits over the replayed k —
+    matching each mode's native score normalization.
+    """
+
+    global_router_replay_instances: list["RouterReplay"] = []
+
+    # ── global controls (one call fans out to every layer) ──
+    @staticmethod
+    def set_replay_data(all_layers_topk_indices: list[torch.Tensor]) -> None:
+        instances = RouterReplay.global_router_replay_instances
+        if len(all_layers_topk_indices) != len(instances):
+            raise ValueError(
+                f"router replay expects {len(instances)} per-layer tensors, "
+                f"got {len(all_layers_topk_indices)}."
+            )
+        for inst, idx in zip(instances, all_layers_topk_indices, strict=True):
+            inst.set_target_indices(idx)
+
+    @staticmethod
+    def get_recorded_data() -> list[torch.Tensor | None]:
+        return [
+            inst.get_recorded_indices() for inst in RouterReplay.global_router_replay_instances
+        ]
+
+    @staticmethod
+    def clear_global_indices() -> None:
+        for inst in RouterReplay.global_router_replay_instances:
+            inst.clear_indices()
+
+    @staticmethod
+    def set_global_router_replay_action(action: RouterReplayAction | None) -> None:
+        for inst in RouterReplay.global_router_replay_instances:
+            inst.router_replay_action = action
+
+    @staticmethod
+    def clear_global_router_replay_instances() -> None:
+        RouterReplay.global_router_replay_instances.clear()
+
+    # ── per-instance state ──
+    def __init__(self) -> None:
+        self.target_topk_idx: torch.Tensor | None = None
+        self.recorded_topk_idx: torch.Tensor | None = None
+        self.router_replay_action: RouterReplayAction | None = None
+        self.replay_backward_list: list[torch.Tensor] = []
+        RouterReplay.global_router_replay_instances.append(self)
+
+    def set_target_indices(self, topk_indices: torch.Tensor) -> None:
+        self.target_topk_idx = topk_indices
+        # Each replayed forward (incl. the backward recompute) pops one entry, in order.
+        self.replay_backward_list.append(topk_indices)
+
+    def get_recorded_indices(self) -> torch.Tensor | None:
+        return self.recorded_topk_idx
+
+    def clear_indices(self) -> None:
+        self.recorded_topk_idx = None
+        self.target_topk_idx = None
+        self.replay_backward_list = []
+
+    def apply_from_logits(
+        self,
+        logits: torch.Tensor,
+        topk_scores: torch.Tensor,
+        topk_indices: torch.Tensor,
+        *,
+        use_pre_softmax: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Replay hook the router calls after computing its own fresh topk.
+
+        ``logits`` are the raw dense gating logits ``[tokens, num_experts]``;
+        the fresh ``topk_scores``/``topk_indices`` pass through unchanged unless
+        an action is armed.
+        """
+        action = self.router_replay_action
+        if action is None:
+            return topk_scores, topk_indices
+        if action == RouterReplayAction.RECORD:
+            self.recorded_topk_idx = topk_indices
+            return topk_scores, topk_indices
+        if action == RouterReplayAction.REPLAY_FORWARD:
+            target = self.target_topk_idx
+            if target is None:
+                raise RuntimeError("router replay is in replay mode but no target indices were set.")
+        elif action == RouterReplayAction.REPLAY_BACKWARD:
+            if not self.replay_backward_list:
+                raise RuntimeError(
+                    "router replay backward list exhausted; recompute/forward mismatch."
+                )
+            target = self.replay_backward_list.pop(0)
+        else:  # pragma: no cover - enum is closed
+            return topk_scores, topk_indices
+        target = target.to(device=logits.device).long().view(logits.size(0), topk_indices.size(-1))
+        logits_f = logits.float()
+        if use_pre_softmax:
+            probs = torch.softmax(logits_f, dim=-1).gather(1, target)
+        else:
+            probs = torch.softmax(logits_f.gather(1, target), dim=-1)
+        return probs.to(topk_scores.dtype), target
+
+
+def _is_replay_capable_router(module: nn.Module) -> bool:
+    return hasattr(module, "router_replay") and not getattr(
+        module, "_router_replay_exclude", False
+    )
+
+
+def attach_router_replay(model: nn.Module, *, reset: bool = True) -> int:
+    """Enable router replay on every replay-capable MoE router in ``model``.
+
+    Walks the module tree and gives each router a fresh :class:`RouterReplay`,
+    registered in module-traversal (== layer) order — no model constructor
+    changes needed. ``reset=False`` appends to the existing registry so a
+    multi-chunk (PP/VPP) model can attach chunk-by-chunk in global layer order.
+    Returns the attached router count.
+    """
+    if reset:
+        RouterReplay.clear_global_router_replay_instances()
+    count = 0
+    for module in model.modules():
+        if _is_replay_capable_router(module):
+            module.router_replay = RouterReplay()
+            count += 1
+    return count
+
+
+def detach_router_replay(model: nn.Module) -> None:
+    for module in model.modules():
+        if _is_replay_capable_router(module):
+            module.router_replay = None
+    RouterReplay.clear_global_router_replay_instances()
 
 
 def _ordered_topk_from_routing_map(
@@ -68,28 +225,16 @@ class TopKRouter(nn.Module):
         self.register_buffer(
             "expert_bias", torch.zeros(config.num_experts, dtype=torch.float32), persistent=False
         )
+        # R3 replay slot: populated by attach_router_replay(); None = replay off.
+        self.router_replay: RouterReplay | None = None
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
 
-    def forward(
-        self, x: torch.Tensor, replay_indices: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         router_dtype = self.router_dtype or x.dtype
         logits = router_gating_linear(x, self.gate.weight, None, router_dtype)
         logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
-        if replay_indices is not None:
-            # R3 Router Replay (arXiv:2606.02437 §3, the MoE TIM fix): pin the discrete top-k
-            # SELECTION to the recorded rollout routing, but recompute the SCORES differentiably
-            # from the current logits (so gradients still reach the gate weight and the upstream
-            # LoRA adapters). "Replay verbatim" = freeze the indices, keep the probabilities live.
-            topk_indices = replay_indices.to(device=logits.device).long().view(num_tokens, self.topk)
-            logits_f = logits.float()
-            if self.use_pre_softmax:
-                topk_scores = torch.gather(torch.softmax(logits_f, dim=-1), 1, topk_indices)
-            else:
-                topk_scores = torch.softmax(torch.gather(logits_f, 1, topk_indices), dim=-1)
-            return topk_scores.to(x.dtype), topk_indices
         if self.moe_router_fusion:
             probs_dense, _ = topk_routing_with_score_function(
                 logits,
@@ -109,6 +254,13 @@ class TopKRouter(nn.Module):
             )
             topk_scores, topk_indices = _ordered_topk_from_routing_map(
                 probs_dense, routing_map, self.topk
+            )
+        if self.router_replay is not None:
+            # R3 (arXiv:2606.02437 §3): pin the discrete selection to the recorded rollout
+            # routing while keeping the scores live from the current logits, so gradients
+            # still reach the gate and upstream adapters despite the frozen sparse path.
+            topk_scores, topk_indices = self.router_replay.apply_from_logits(
+                logits, topk_scores, topk_indices, use_pre_softmax=self.use_pre_softmax
             )
         if self.router_dtype is None:
             topk_scores = topk_scores.to(x.dtype)
