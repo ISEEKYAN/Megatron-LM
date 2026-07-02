@@ -497,3 +497,93 @@ def test_qwen2_forward_step_loss_is_next_token_shifted():
         per_target.append(F.cross_entropy(row[: n - 1], row_ids[1:n], reduction="sum"))
     expected = torch.stack(per_target).sum() / 4.0
     torch.testing.assert_close(out["loss"].float(), expected, atol=1e-4, rtol=1e-4)
+
+
+def _tiny_lora_bundle(seed: int):
+    import torch
+
+    from megatron.lite.model.qwen2.config import Qwen2Config
+    from megatron.lite.model.qwen2.lite.protocol import ImplConfig, build_model
+
+    torch.manual_seed(seed)
+    cfg = Qwen2Config(
+        num_hidden_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        vocab_size=32,
+        intermediate_size=32,
+        max_position_embeddings=16,
+    )
+    bundle = build_model(
+        cfg,
+        impl_cfg=ImplConfig(
+            lora={"rank": 2, "alpha": 4, "target_modules": ["all-linear"], "use_rslora": True}
+        ),
+    )
+    return cfg, bundle
+
+
+def test_qwen2_lora_adapter_save_load_round_trip(tmp_path):
+    import torch
+
+    from megatron.lite.model.qwen2.lite.protocol import load_lora_adapter, save_lora_adapter
+
+    cfg, src = _tiny_lora_bundle(11)
+    _, dst = _tiny_lora_bundle(22)
+    with torch.no_grad():
+        for name, p in src.chunks[0].named_parameters():
+            if "lora" in name:
+                p.copy_(torch.randn_like(p))
+
+    out = save_lora_adapter(
+        src.chunks, cfg, src.parallel_state, tmp_path / "adapter",
+        lora_config=src.extras["lora_config"],
+    )
+    assert (out / "adapter_model.safetensors").is_file()
+    assert (out / "adapter_config.json").is_file()
+    assert (out / "megatron.lite_adapter_meta.json").is_file()
+
+    result = load_lora_adapter(
+        dst.chunks, out, cfg, dst.parallel_state, lora_config=dst.extras["lora_config"]
+    )
+    assert result["loaded_lora_modules"] == 2 * 4  # 2 layers x (qkv, proj, gate_up, down)
+
+    src_params = dict(src.chunks[0].named_parameters())
+    for name, p in dst.chunks[0].named_parameters():
+        if "lora" in name:
+            assert torch.equal(p, src_params[name]), name
+
+
+def test_qwen2_lora_adapter_peft_key_syntax_and_strictness(tmp_path):
+    import torch
+
+    from megatron.lite.model.qwen2.lite.protocol import (
+        export_lora_adapter_state,
+        load_lora_adapter_state,
+    )
+
+    cfg, bundle = _tiny_lora_bundle(33)
+    state = export_lora_adapter_state(bundle.chunks, cfg, bundle.parallel_state)
+    # 2 layers x 7 PEFT projections x (A, B)
+    assert len(state) == 2 * 7 * 2
+    sample = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+    assert sample in state
+    # fused surfaces share lora_A across their PEFT projections
+    for proj in ("k_proj", "v_proj"):
+        assert torch.equal(
+            state[sample], state[sample.replace("q_proj", proj)]
+        )
+
+    with pytest.raises(ValueError, match="unexpected keys"):
+        load_lora_adapter_state(
+            bundle.chunks, {**state, "base_model.model.model.bogus": state[sample]},
+            cfg, bundle.parallel_state,
+        )
+
+    broken = dict(state)
+    k_key = sample.replace("q_proj", "k_proj")
+    broken[k_key] = broken[k_key] + 1.0
+    with pytest.raises(ValueError, match="identical\\s+lora_A"):
+        load_lora_adapter_state(bundle.chunks, broken, cfg, bundle.parallel_state)

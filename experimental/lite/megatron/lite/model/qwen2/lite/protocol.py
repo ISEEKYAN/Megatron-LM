@@ -40,7 +40,11 @@ __all__ = [
     "build_model_config",
     "export_hf_state_dict",
     "export_hf_weights",
+    "export_lora_adapter_state",
     "initialize_lora_olora_tail",
+    "load_lora_adapter",
+    "load_lora_adapter_state",
+    "save_lora_adapter",
     "load_hf_state_dict",
     "load_hf_weights",
     "save_hf_weights",
@@ -396,6 +400,30 @@ def initialize_lora_olora_tail(
                     lora.olora_tail_init_(base.weight.data)
                     initialized += 1
     return {"olora_initialized": initialized}
+
+
+def export_lora_adapter_state(chunks, model_cfg: Qwen2Config, ps: ParallelState, **kwargs):
+    from megatron.lite.model.qwen2.lite.lora_adapter import export_lora_adapter_state as impl
+
+    return impl(chunks, model_cfg, ps, **kwargs)
+
+
+def save_lora_adapter(chunks, model_cfg: Qwen2Config, ps: ParallelState, output_dir, **kwargs):
+    from megatron.lite.model.qwen2.lite.lora_adapter import save_lora_adapter as impl
+
+    return impl(chunks, model_cfg, ps, output_dir, **kwargs)
+
+
+def load_lora_adapter_state(chunks, state, model_cfg: Qwen2Config, ps: ParallelState, **kwargs):
+    from megatron.lite.model.qwen2.lite.lora_adapter import load_lora_adapter_state as impl
+
+    return impl(chunks, state, model_cfg, ps, **kwargs)
+
+
+def load_lora_adapter(chunks, adapter_dir, model_cfg: Qwen2Config, ps: ParallelState, **kwargs):
+    from megatron.lite.model.qwen2.lite.lora_adapter import load_lora_adapter as impl
+
+    return impl(chunks, adapter_dir, model_cfg, ps, **kwargs)
 
 
 def vocab_size(model_cfg) -> int | None:
