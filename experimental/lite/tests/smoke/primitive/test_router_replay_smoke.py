@@ -120,7 +120,11 @@ def _forward_loss(runtime: MegatronLiteRuntime, handle: ModelHandle, batch: Pack
     result = runtime.forward_backward(
         handle, iter([batch]), None, num_microbatches=1, forward_only=True
     )
-    return float(result.metrics["loss"])
+    # post-#68 contract: loss is optional in metrics; the canonical scalar lives on
+    # model_output.loss (None only when the model computes no loss, e.g. no labels).
+    loss = result.model_output.loss
+    assert loss is not None, "labels were provided; forward-only must surface a loss"
+    return float(loss.detach().item()) if hasattr(loss, "detach") else float(loss)
 
 
 def test_router_replay_record_then_replay_closed_loop():
