@@ -283,6 +283,7 @@ def _iter_hf_state_tensors(
     *,
     rank0_only: bool = False,
     export_dtype: str | torch.dtype | None = None,
+    merge_lora: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     _validate_parallel_scope(ps)
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -299,6 +300,15 @@ def _iter_hf_state_tensors(
             f"but config expects {config.num_hidden_layers}."
         )
 
+    def _surface(module: nn.Module, lora) -> torch.Tensor:
+        # rollout weight sync must see the CURRENT policy: base + adapter delta.
+        weight = module.weight
+        if merge_lora and lora is not None:
+            weight = weight + lora.materialized_delta_weight().to(
+                dtype=weight.dtype, device=weight.device
+            )
+        return weight
+
     resolved_dtype = _resolve_export_dtype(export_dtype)
     yield "model.embed_tokens.weight", _export_tensor(
         qwen_model.embed_tokens.weight, resolved_dtype
@@ -314,7 +324,8 @@ def _iter_hf_state_tensors(
             layer.input_layernorm.weight, resolved_dtype
         )
 
-        q, k, v = torch.split(layer.self_attn.qkv.weight, [q_size, kv_size, kv_size], dim=0)
+        qkv_w = _surface(layer.self_attn.qkv, layer.self_attn.qkv_lora)
+        q, k, v = torch.split(qkv_w, [q_size, kv_size, kv_size], dim=0)
         yield f"{hf_layer}.self_attn.q_proj.weight", _export_tensor(q, resolved_dtype)
         yield f"{hf_layer}.self_attn.k_proj.weight", _export_tensor(k, resolved_dtype)
         yield f"{hf_layer}.self_attn.v_proj.weight", _export_tensor(v, resolved_dtype)
@@ -328,7 +339,7 @@ def _iter_hf_state_tensors(
             yield f"{hf_layer}.self_attn.k_proj.bias", _export_tensor(k_bias, resolved_dtype)
             yield f"{hf_layer}.self_attn.v_proj.bias", _export_tensor(v_bias, resolved_dtype)
         yield f"{hf_layer}.self_attn.o_proj.weight", _export_tensor(
-            layer.self_attn.proj.weight, resolved_dtype
+            _surface(layer.self_attn.proj, layer.self_attn.proj_lora), resolved_dtype
         )
 
         yield f"{hf_layer}.post_attention_layernorm.weight", _export_tensor(
@@ -336,14 +347,14 @@ def _iter_hf_state_tensors(
         )
 
         gate, up = torch.split(
-            layer.mlp.gate_up.weight,
+            _surface(layer.mlp.gate_up, layer.mlp.gate_up_lora),
             [config.intermediate_size, config.intermediate_size],
             dim=0,
         )
         yield f"{hf_layer}.mlp.gate_proj.weight", _export_tensor(gate, resolved_dtype)
         yield f"{hf_layer}.mlp.up_proj.weight", _export_tensor(up, resolved_dtype)
         yield f"{hf_layer}.mlp.down_proj.weight", _export_tensor(
-            layer.mlp.down.weight, resolved_dtype
+            _surface(layer.mlp.down, layer.mlp.down_lora), resolved_dtype
         )
 
 
@@ -354,6 +365,7 @@ def export_hf_state_dict(
     *,
     rank0_only: bool = False,
     export_dtype: str | torch.dtype | None = None,
+    merge_lora: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Export native fused Qwen2 tensors to HF Qwen2 state-dict names."""
 
@@ -364,6 +376,7 @@ def export_hf_state_dict(
             ps,
             rank0_only=rank0_only,
             export_dtype=export_dtype,
+            merge_lora=merge_lora,
         )
     )
 

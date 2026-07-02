@@ -620,27 +620,46 @@ def test_qwen2_lora_adapter_peft_key_syntax_and_strictness(tmp_path):
     with pytest.raises(ValueError, match="identical\\s+lora_A"):
         load_lora_adapter_state(bundle.chunks, broken, cfg, bundle.parallel_state)
 
-def test_qwen2_unpack_forward_output_returns_jagged_nested():
-    # verl postprocess unbinds per-sequence rows; flat 1-D would unbind to 0-dim
-    # scalars and crash torch.nested.as_nested_tensor (caught live in the RL pilot).
+
+def test_qwen2_export_merge_lora_folds_adapter_into_base_weights():
+    # rollout weight sync: the serving engine must see base + adapter. merge_lora=True
+    # folds scale*B@A into every LoRA'd surface; merge_lora=False stays pure base.
     import torch
 
-    from megatron.lite.model.qwen2.lite.protocol import unpack_forward_output
-    from megatron.lite.runtime.contracts.data import PackedBatch
+    from megatron.lite.model.qwen2.lite.checkpoint import export_hf_state_dict
 
-    batch = PackedBatch(
-        input_ids=torch.arange(6),
-        labels=torch.arange(6),
-        seq_lens=torch.tensor([4, 2]),
+    cfg, bundle = _tiny_lora_bundle(44)
+    model = bundle.chunks[0]
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if "lora" in name:
+                p.copy_(torch.randn_like(p) * 0.1)
+
+    base = export_hf_state_dict(model, cfg, bundle.parallel_state, export_dtype=torch.float32)
+    merged = export_hf_state_dict(
+        model, cfg, bundle.parallel_state, export_dtype=torch.float32, merge_lora=True
     )
-    padded = torch.arange(12, dtype=torch.float32).view(2, 6)
-    nt = unpack_forward_output(None, batch, padded)
-    assert nt.is_nested
-    rows = nt.unbind()
-    assert [r.numel() for r in rows] == [4, 2]
-    assert torch.equal(rows[0], padded[0, :4]) and torch.equal(rows[1], padded[1, :2])
 
-    packed = torch.arange(6, dtype=torch.float32)
-    rows = unpack_forward_output(None, batch, packed).unbind()
-    assert [r.numel() for r in rows] == [4, 2]
-    assert torch.equal(rows[1], packed[4:])
+    layer = model.model.layers[0]
+    q = cfg.num_attention_heads * cfg.head_dim
+    kv = cfg.num_key_value_heads * cfg.head_dim
+    qkv_delta = layer.self_attn.qkv_lora.materialized_delta_weight()
+    down_delta = layer.mlp.down_lora.materialized_delta_weight()
+
+    key = "model.layers.0.self_attn.k_proj.weight"
+    torch.testing.assert_close(
+        merged[key], base[key] + qkv_delta[q : q + kv].float(), atol=1e-5, rtol=1e-5
+    )
+    key = "model.layers.0.mlp.down_proj.weight"
+    torch.testing.assert_close(
+        merged[key], base[key] + down_delta.float(), atol=1e-5, rtol=1e-5
+    )
+    # non-LoRA tensors and biases are untouched
+    for key in ("model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.bias"):
+        torch.testing.assert_close(merged[key], base[key])
+    # dropout>0 cannot be represented by a static merge — must refuse
+    layer.self_attn.qkv_lora.dropout_p = 0.5
+    with pytest.raises(NotImplementedError, match="dropout"):
+        export_hf_state_dict(
+            model, cfg, bundle.parallel_state, export_dtype=torch.float32, merge_lora=True
+        )

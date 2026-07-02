@@ -577,6 +577,25 @@ class LinearLoRA(nn.Module):
             out = _scatter_sequence_parallel(out, self.tp_group, self.tp_rank)
         return out
 
+    def materialized_delta_weight(self) -> torch.Tensor:
+        """The adapter's effective weight-space delta ``scale * B @ A``.
+
+        Used to merge LoRA into exported base weights (e.g. rollout weight sync,
+        where the serving engine must see the CURRENT policy = base + adapter).
+        Rejects configurations whose runtime behavior a static delta cannot
+        represent (dropout) or whose factors are sharded on this rank.
+        """
+        if self.dropout_p:
+            raise NotImplementedError(
+                "materialized_delta_weight requires dropout=0 (a static delta cannot "
+                "represent dropout's stochastic forward)."
+            )
+        if self.rank_partitioned_a or self.output_partitioned_b:
+            raise NotImplementedError(
+                "materialized_delta_weight requires unsharded LoRA factors (tp=1)."
+            )
+        return (self.lora_b @ self.lora_a) * self.scale
+
     @torch.no_grad()
     def olora_tail_init_(self, base_weight: torch.Tensor) -> None:
         """OLoRA-tail init (minor SVD subspace) — see ``_orthogonal_init_``."""
