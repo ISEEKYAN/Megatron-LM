@@ -181,7 +181,13 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
     return model(**kwargs)
 
 
-def unpack_forward_output(model: nn.Module, batch: PackedBatch, output: torch.Tensor) -> torch.Tensor:
+def unpack_forward_output(model: nn.Module, batch: PackedBatch, output: torch.Tensor):
+    """Reverse padded/packed per-token outputs to jagged nested form.
+
+    verl's postprocess unbinds per-sequence rows from a nested tensor (the THD
+    path's contract via unpack_thd_to_nested); returning a flat 1-D tensor here
+    unbinds into zero-dim scalars and crashes nested-tensor construction.
+    """
     del model
     seq_lens = [int(length) for length in batch.seq_lens.detach().cpu().tolist()]
     total_tokens = sum(seq_lens)
@@ -190,18 +196,15 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output: torch.Te
             raise ValueError(
                 f"Packed Qwen2 output has {output.numel()} tokens, expected {total_tokens}."
             )
-        return output
-    if output.ndim < 2:
-        raise ValueError(f"Qwen2 padded output must be rank >= 2, got {tuple(output.shape)}.")
-    if output.shape[0] != len(seq_lens):
-        raise ValueError(
-            f"Qwen2 padded output batch dim {output.shape[0]} does not match "
-            f"PackedBatch sequence count {len(seq_lens)}."
-        )
-    return torch.cat(
-        [output[row, :length, ...] for row, length in enumerate(seq_lens) if length > 0],
-        dim=0,
-    ).contiguous()
+        rows = list(torch.split(output, seq_lens))
+    else:
+        if output.shape[0] != len(seq_lens):
+            raise ValueError(
+                f"Qwen2 padded output batch dim {output.shape[0]} does not match "
+                f"PackedBatch sequence count {len(seq_lens)}."
+            )
+        rows = [output[i, :length] for i, length in enumerate(seq_lens)]
+    return torch.nested.as_nested_tensor([row.contiguous() for row in rows], layout=torch.jagged)
 
 
 def _build_dist_opt_optimizer(
