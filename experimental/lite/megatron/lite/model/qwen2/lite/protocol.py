@@ -137,6 +137,13 @@ def _packed_to_padded(
             else batch.loss_mask[offset : offset + length].to(dtype=torch.float32)
         )
         offset += length
+        # mlite batch contract (same as the THD path's roll_labels/roll_loss_mask):
+        # ``labels`` are the RAW tokens and the protocol does the next-token shift per
+        # sequence, rolling the loss mask with them. Without this the model scores
+        # P(x_t | x_<=t) against x_t itself — real-weight CE ~15 instead of ~1.7 while
+        # every hidden state matches the HF reference exactly.
+        labels = torch.cat([labels[1:], labels.new_zeros(1)])
+        mask = torch.cat([mask[1:], mask.new_zeros(1)])
         pad = max_len - length
         if pad:
             ids = torch.cat([ids, ids.new_zeros(pad)])

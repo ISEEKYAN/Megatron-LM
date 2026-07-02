@@ -452,3 +452,48 @@ def test_qwen2_hf_checkpoint_state_dict_round_trip(tmp_path):
         assert "up_proj.weight" in str(exc)
     else:
         raise AssertionError("dense Qwen2 checkpoint loader accepted a bad up_proj shape")
+
+def test_qwen2_forward_step_loss_is_next_token_shifted():
+    # Regression: the protocol must roll labels/mask per sequence (THD roll_labels
+    # convention). Unshifted CE scores P(x_t|x_<=t) against x_t itself — on real
+    # weights that read CE ~15 vs the HF reference 1.7 while every hidden state
+    # matched (runs/20260702-qwen2-15b-realweight-smoke).
+    import torch
+    import torch.nn.functional as F
+
+    from megatron.lite.model.qwen2.config import Qwen2Config
+    from megatron.lite.model.qwen2.lite.protocol import ImplConfig, build_model, _forward_step
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    torch.manual_seed(3)
+    cfg = Qwen2Config(
+        num_hidden_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        vocab_size=32,
+        intermediate_size=32,
+        max_position_embeddings=16,
+    )
+    bundle = build_model(cfg, impl_cfg=ImplConfig())
+    model = bundle.chunks[0]
+    ids = torch.tensor([5, 9, 2, 7, 11, 3], dtype=torch.long)
+    batch = PackedBatch(
+        input_ids=ids,
+        labels=ids.clone(),
+        seq_lens=torch.tensor([4, 2], dtype=torch.long),
+        loss_mask=torch.ones(6),
+    )
+    with torch.no_grad():
+        out = _forward_step(model, batch)
+        # reference: per-sequence explicit next-token CE from the raw logits
+        logits = model(
+            input_ids=torch.stack([ids[:4], torch.cat([ids[4:], ids.new_zeros(2)])])
+        )["logits"].float()
+    # masked mean over shifted positions: (sum of per-target CE) / (#targets = 3+1)
+    per_target = []
+    for row, (row_ids, n) in zip(logits, ((ids[:4], 4), (ids[4:], 2)), strict=True):
+        per_target.append(F.cross_entropy(row[: n - 1], row_ids[1:n], reduction="sum"))
+    expected = torch.stack(per_target).sum() / 4.0
+    torch.testing.assert_close(out["loss"].float(), expected, atol=1e-4, rtol=1e-4)
