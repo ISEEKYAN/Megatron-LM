@@ -594,7 +594,13 @@ class LinearLoRA(nn.Module):
             raise NotImplementedError(
                 "materialized_delta_weight requires unsharded LoRA factors (tp=1)."
             )
-        return (self.lora_b @ self.lora_a) * self.scale
+        a, b = self.lora_a, self.lora_b
+        # fsdp2 shards params as DTensors; full_tensor() is a symmetric collective.
+        if hasattr(a, "full_tensor"):
+            a = a.full_tensor()
+        if hasattr(b, "full_tensor"):
+            b = b.full_tensor()
+        return (b @ a) * self.scale
 
     @torch.no_grad()
     def olora_tail_init_(self, base_weight: torch.Tensor) -> None:

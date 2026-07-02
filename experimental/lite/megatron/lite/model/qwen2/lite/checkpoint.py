@@ -269,11 +269,18 @@ def load_hf_state_dict(
     }
 
 
+def _full_local(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialize fsdp2 DTensor shards to a full tensor (symmetric collective)."""
+    if hasattr(tensor, "full_tensor"):
+        return tensor.full_tensor()
+    return tensor
+
+
 def _export_tensor(
     tensor: torch.Tensor,
     export_dtype: torch.dtype | None,
 ) -> torch.Tensor:
-    return _cast_export_tensor(tensor.detach().cpu().contiguous(), export_dtype)
+    return _cast_export_tensor(_full_local(tensor).detach().cpu().contiguous(), export_dtype)
 
 
 def _iter_hf_state_tensors(
@@ -302,7 +309,7 @@ def _iter_hf_state_tensors(
 
     def _surface(module: nn.Module, lora) -> torch.Tensor:
         # rollout weight sync must see the CURRENT policy: base + adapter delta.
-        weight = module.weight
+        weight = _full_local(module.weight)
         if merge_lora and lora is not None:
             weight = weight + lora.materialized_delta_weight().to(
                 dtype=weight.dtype, device=weight.device
