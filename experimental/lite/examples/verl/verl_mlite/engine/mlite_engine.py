@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import contextmanager
 from enum import Enum
 from typing import Any
 
@@ -293,6 +294,19 @@ class MegatronLiteEngine(BaseEngine):
         self.handle = self.runtime.build_model()
         self.module = self._extract_primary_module()
 
+        self._router_replay_count = 0
+        if getattr(self.engine_config, "router_replay", False):
+            from megatron.lite.primitive.modules.router import attach_router_replay
+
+            chunks = self.handle._extras.get("model_chunks", [self.handle._model])
+            for i, chunk in enumerate(chunks):
+                self._router_replay_count += attach_router_replay(chunk, reset=(i == 0))
+            if self._router_replay_count == 0:
+                raise ValueError(
+                    "router_replay=True but the model exposes no replay-capable MoE "
+                    "routers (dense model or unsupported router)."
+                )
+
         if self.handle._optimizer is not None and self.handle._lr_scheduler is None:
             self.handle._lr_scheduler = _build_lr_scheduler(
                 self.handle._optimizer, self._mlite_config.optimizer
@@ -366,6 +380,55 @@ class MegatronLiteEngine(BaseEngine):
             loss_function=loss_function,
             forward_only=forward_only,
         )
+
+    def _require_router_replay(self) -> None:
+        self._require_initialized()
+        if not getattr(self, "_router_replay_count", 0):
+            raise RuntimeError(
+                "router replay is not attached; set engine_config.router_replay=True."
+            )
+
+    def record_routed_experts(self, data: TensorDict, loss_function=None) -> list:
+        """Forward-only pass with RECORD armed; returns per-layer top-k indices.
+
+        R3 phase 1 (arXiv:2606.02437 §3): the recorded routing stands in for the
+        rollout engine's routing decisions (same policy weights, same inputs).
+        NOTE: RECORD keeps one tensor per router; drive this with data that maps
+        to a single microbatch — with several microbatches only the last one's
+        routing survives, so replaying it against the full batch is wrong.
+        """
+        from megatron.lite.primitive.modules.router import RouterReplay, RouterReplayAction
+
+        self._require_router_replay()
+        RouterReplay.clear_global_indices()
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        try:
+            self.forward_backward_batch(data, loss_function, forward_only=True)
+        finally:
+            RouterReplay.set_global_router_replay_action(None)
+        recorded = RouterReplay.get_recorded_data()
+        missing = sum(1 for r in recorded if r is None)
+        if missing:
+            raise RuntimeError(f"router replay recorded no routing for {missing} router(s).")
+        return recorded
+
+    @contextmanager
+    def replay_routed_experts(self, all_layers_topk_indices: list):
+        """Arm REPLAY_FORWARD with recorded routing for the enclosed engine calls.
+
+        Selection is pinned to the recorded indices; scores stay live from the
+        current logits (gradients keep flowing to the gate and LoRA adapters).
+        """
+        from megatron.lite.primitive.modules.router import RouterReplay, RouterReplayAction
+
+        self._require_router_replay()
+        RouterReplay.set_replay_data(list(all_layers_topk_indices))
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        try:
+            yield
+        finally:
+            RouterReplay.set_global_router_replay_action(None)
+            RouterReplay.clear_global_indices()
 
     def get_per_tensor_param(self, **kwargs):
         self._require_initialized()

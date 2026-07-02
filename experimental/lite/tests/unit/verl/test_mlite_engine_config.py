@@ -210,3 +210,84 @@ def test_engine_export_merges_lora_when_adapter_enabled(monkeypatch) -> None:
     captured.clear()
     make({"rank": 0}).get_per_tensor_param()
     assert "merge_lora" not in captured
+
+
+def test_router_replay_config_flag_defaults_off() -> None:
+    from verl_mlite.engine.config import MegatronLiteEngineConfig
+
+    assert MegatronLiteEngineConfig().router_replay is False
+    assert MegatronLiteEngineConfig(router_replay=True).router_replay is True
+
+
+def test_engine_record_and_replay_drive_router_replay_actions(monkeypatch) -> None:
+    # Engine-side contract only (the runtime-level closed loop is covered by
+    # tests/smoke/primitive/test_router_replay_smoke.py): record arms RECORD around a
+    # forward-only pass and returns the registry data; replay arms REPLAY_FORWARD with
+    # the provided per-layer tensors and always clears state, even on error.
+    import sys
+    import types
+
+    calls: list[tuple] = []
+
+    class _FakeReplay:
+        recorded = ["l0", "l1"]
+
+        @staticmethod
+        def clear_global_indices():
+            calls.append(("clear",))
+
+        @staticmethod
+        def set_global_router_replay_action(action):
+            calls.append(("action", getattr(action, "name", None)))
+
+        @staticmethod
+        def get_recorded_data():
+            return list(_FakeReplay.recorded)
+
+        @staticmethod
+        def set_replay_data(data):
+            calls.append(("data", len(data)))
+
+    class _FakeAction:
+        class RECORD:
+            name = "RECORD"
+
+        class REPLAY_FORWARD:
+            name = "REPLAY_FORWARD"
+
+    stub = types.ModuleType("megatron.lite.primitive.modules.router")
+    stub.RouterReplay = _FakeReplay
+    stub.RouterReplayAction = _FakeAction
+    monkeypatch.setitem(sys.modules, "megatron.lite.primitive.modules.router", stub)
+
+    from verl_mlite.engine.mlite_engine import MegatronLiteEngine
+
+    engine = MegatronLiteEngine.__new__(MegatronLiteEngine)
+    engine._router_replay_count = 2
+    engine._require_initialized = lambda: None
+    engine.forward_backward_batch = lambda data, loss_fn, forward_only=False: calls.append(
+        ("fwd", forward_only)
+    )
+
+    recorded = engine.record_routed_experts({"x": 1})
+    assert recorded == ["l0", "l1"]
+    assert calls == [("clear",), ("action", "RECORD"), ("fwd", True), ("action", None)]
+
+    calls.clear()
+    with engine.replay_routed_experts(["l0", "l1"]):
+        calls.append(("inside",))
+    assert calls == [
+        ("data", 2),
+        ("action", "REPLAY_FORWARD"),
+        ("inside",),
+        ("action", None),
+        ("clear",),
+    ]
+
+    engine._router_replay_count = 0
+    try:
+        engine.record_routed_experts({"x": 1})
+    except RuntimeError as e:
+        assert "router_replay" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError without attached replay")

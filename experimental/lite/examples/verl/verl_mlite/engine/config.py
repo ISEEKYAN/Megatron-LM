@@ -27,6 +27,9 @@ class MegatronLiteEngineConfig(EngineConfig):
     cp: int = 1
 
     attention_backend_override: str | None = "flash"
+    # R3 router replay (arXiv:2606.02437 §3): attach RouterReplay to every MoE router
+    # at build so the engine can record rollout routing and replay it in training.
+    router_replay: bool = False
     router_aux_loss_coef: float | None = None
     cross_entropy_fusion: bool | None = None
     export_dtype: str | None = "bfloat16"
