@@ -248,8 +248,15 @@ def build_model(model_cfg: Qwen2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         trainable_stats = trainable_param_stats(model)
         lora_stats = {"chunks": [{**freeze_stats, **trainable_stats}]}
 
+    if lora_init == "olora_tail" and impl_cfg.optimizer == "dist_opt":
+        raise ValueError(
+            "Qwen2 lora_init='olora_tail' requires the fsdp2 optimizer (or none): "
+            "dist_opt captures its master param buffer at build time, before weights "
+            "load, so a post-load OLoRA init would desync master and model params."
+        )
+
     post_model_load_hook = None
-    if lora_init == "olora_tail":
+    if lora_init == "olora_tail" and impl_cfg.optimizer != "fsdp2":
 
         def _post_model_load_hook():
             return {
@@ -271,6 +278,35 @@ def build_model(model_cfg: Qwen2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         attach_model_sharded_state_dict(chunks, ps)
         register_training_hooks(chunks, optimizer)
         optimizer_backend = "dist_opt"
+    elif impl_cfg.optimizer == "fsdp2":
+        optimizer_backend = "fsdp2"
+        if torch.cuda.is_available():
+            model = model.to(torch.bfloat16).cuda()
+            chunks[0] = model
+
+        def _fsdp2_post_model_load_hook():
+            from megatron.lite.model.qwen2.lite.model import Qwen2DecoderLayer
+            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+
+            extras: dict[str, Any] = {}
+            # OLoRA-tail must precede the optimizer build so it captures the
+            # OLoRA-initialized params (and the residual-shifted base weights).
+            if lora_init == "olora_tail":
+                extras["lora_init_result"] = initialize_lora_olora_tail([model], model_cfg, ps)
+            return {
+                "optimizer": build_fsdp2_training_optimizer(
+                    chunks,
+                    impl_cfg.optimizer_config,
+                    ps,
+                    unit_modules=(Qwen2DecoderLayer,),
+                    deterministic=impl_cfg.deterministic,
+                    vpp=impl_cfg.parallel.vpp,
+                    leaf_module_names=(),
+                ),
+                "extras": extras,
+            }
+
+        post_model_load_hook = _fsdp2_post_model_load_hook
     elif impl_cfg.optimizer is None:
         optimizer_backend = "none"
     else:
