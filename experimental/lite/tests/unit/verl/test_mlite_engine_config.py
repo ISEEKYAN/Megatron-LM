@@ -336,3 +336,44 @@ def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
 
     assert scheduler.state_dict() == state
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.7)
+
+def test_engine_export_merges_lora_when_adapter_enabled(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import verl_mlite.engine.mlite_engine as engine_mod
+    from verl_mlite.engine.mlite_engine import MegatronLiteEngine
+
+    # CUDA cache hygiene is irrelevant to the export-kwargs contract under test
+    monkeypatch.setattr(engine_mod, "aggressive_empty_cache", lambda **_: None)
+
+    captured: dict = {}
+
+    class _FakeRuntime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            captured.update(kwargs)
+            return iter(())
+
+    def make(lora):
+        engine = MegatronLiteEngine.__new__(MegatronLiteEngine)
+        engine._require_initialized = lambda: None
+        # is_param_offload_enabled is a property over engine_config offload flags
+        engine.engine_config = SimpleNamespace(
+            model_name="qwen2", export_dtype=None, param_offload=False
+        )
+        engine._mlite_config = SimpleNamespace(impl_cfg={"lora": lora} if lora else {})
+        engine.runtime = _FakeRuntime()
+        engine.handle = object()
+        return engine
+
+    captured.clear()
+    make({"rank": 16, "alpha": 32}).get_per_tensor_param()
+    assert captured.get("merge_lora") is True
+
+    captured.clear()
+    make(None).get_per_tensor_param()
+    assert "merge_lora" not in captured
+
+    captured.clear()
+    make({"rank": 0}).get_per_tensor_param()
+    assert "merge_lora" not in captured

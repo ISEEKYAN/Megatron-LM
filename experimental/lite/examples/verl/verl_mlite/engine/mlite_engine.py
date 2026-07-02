@@ -397,6 +397,11 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
+        lora_cfg = (self._mlite_config.impl_cfg or {}).get("lora") if self._mlite_config else None
+        if isinstance(lora_cfg, dict) and int(lora_cfg.get("rank", 0) or 0) > 0:
+            # Rollout synchronization consumes the current policy, including
+            # the adapter delta and any OLoRA residual write-back.
+            export_kwargs["merge_lora"] = True
         weights = self.runtime.export_weights(self.handle, **export_kwargs)
         if self.engine_config.qat.get("enable", False):
             from verl.utils.modelopt import export_qat_weights
