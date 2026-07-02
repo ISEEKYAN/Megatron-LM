@@ -86,6 +86,10 @@ class LoraConfig:
     def targets(self) -> set[str]:
         out = set()
         for target in self.target_modules:
+            # HF PEFT convention: "all-linear" targets every linear surface.
+            if target == "all-linear":
+                out.update(_DEFAULT_TARGET_MODULES)
+                continue
             out.add(_TARGET_ALIASES.get(target, target))
         return out
 
@@ -111,6 +115,10 @@ def normalize_lora_config(config: LoraConfig | dict[str, Any] | None) -> LoraCon
         values.pop("targets", None)
     if "target_modules" in values and not isinstance(values["target_modules"], tuple):
         values["target_modules"] = tuple(values["target_modules"])
+    if "init_lora_weights" in values and "init" not in values:  # HF PEFT field name
+        values["init"] = values.pop("init_lora_weights")
+    else:
+        values.pop("init_lora_weights", None)
     return LoraConfig(**values)
 
 
