@@ -230,3 +230,25 @@ def test_gated_delta_static_helpers_are_finite_and_shape_stable(transformer_engi
     assert torch.isfinite(g).all()
     assert torch.isfinite(beta_sigmoid).all()
     assert torch.all(g < 0)
+
+
+def test_olora_plain_qr_factors_and_output_preservation():
+    """Plain OLoRA (QR, arXiv:2406.01775): orthonormal B0 and init-time output
+    preservation via the shared PiSSA-style residual write-back."""
+    import torch
+
+    from megatron.lite.primitive.modules.lora import LinearLoRA, olora_factors
+
+    torch.manual_seed(0)
+    w = torch.randn(64, 96)
+    b0, a0 = olora_factors(w, 8)
+    assert b0.shape == (64, 8) and a0.shape == (8, 96)
+    assert (b0.T @ b0 - torch.eye(8)).abs().max() < 1e-5
+
+    lora = LinearLoRA(96, 64, rank=8, alpha=32, use_rslora=True)
+    base = w.clone()
+    x = torch.randn(4, 96)
+    y_ref = x @ base.T
+    lora.olora_init_(base)
+    y = x @ base.T + lora(x)
+    assert (y - y_ref).abs().max() < 1e-3

@@ -91,7 +91,7 @@ def _resolve_lora_init(impl_cfg: ImplConfig) -> str | None:
     normalized = value.strip().lower()
     if normalized in ("", "none", "null", "false", "true", "default"):
         return None
-    if normalized == "olora_tail":
+    if normalized in ("olora_tail", "olora"):
         return normalized
     raise NotImplementedError(
         f"Qwen2 LoRA init {value!r} is not implemented in MLite yet; "
@@ -233,7 +233,7 @@ def build_model(model_cfg: Qwen2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     _validate_parallel_scope(impl_cfg.parallel)
     lora_config = normalize_lora_config(impl_cfg.lora)
     lora_init = _resolve_lora_init(impl_cfg)
-    if lora_init == "olora_tail":
+    if lora_init in ("olora_tail", "olora"):
         if not lora_config.enabled:
             raise ValueError("Qwen2 lora_init='olora_tail' requires enabled LoRA rank > 0.")
         if impl_cfg.parallel.tp != 1:
@@ -258,7 +258,7 @@ def build_model(model_cfg: Qwen2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         trainable_stats = trainable_param_stats(model)
         lora_stats = {"chunks": [{**freeze_stats, **trainable_stats}]}
 
-    if lora_init == "olora_tail" and impl_cfg.optimizer == "dist_opt":
+    if lora_init in ("olora_tail", "olora") and impl_cfg.optimizer == "dist_opt":
         raise ValueError(
             "Qwen2 lora_init='olora_tail' requires the fsdp2 optimizer (or none): "
             "dist_opt captures its master param buffer at build time, before weights "
@@ -266,12 +266,12 @@ def build_model(model_cfg: Qwen2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         )
 
     post_model_load_hook = None
-    if lora_init == "olora_tail" and impl_cfg.optimizer != "fsdp2":
+    if lora_init in ("olora_tail", "olora") and impl_cfg.optimizer != "fsdp2":
 
         def _post_model_load_hook():
             return {
                 "extras": {
-                    "lora_init_result": initialize_lora_olora_tail([model], model_cfg, ps)
+                    "lora_init_result": initialize_lora_olora_tail([model], model_cfg, ps, kind=lora_init)
                 }
             }
 
@@ -301,8 +301,8 @@ def build_model(model_cfg: Qwen2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
             extras: dict[str, Any] = {}
             # OLoRA-tail must precede the optimizer build so it captures the
             # OLoRA-initialized params (and the residual-shifted base weights).
-            if lora_init == "olora_tail":
-                extras["lora_init_result"] = initialize_lora_olora_tail([model], model_cfg, ps)
+            if lora_init in ("olora_tail", "olora"):
+                extras["lora_init_result"] = initialize_lora_olora_tail([model], model_cfg, ps, kind=lora_init)
             return {
                 "optimizer": build_fsdp2_training_optimizer(
                     chunks,
@@ -380,17 +380,25 @@ def save_hf_weights(chunks, path: str | Path, model_cfg: Qwen2Config, ps: Parall
 
 
 def initialize_lora_olora_tail(
-    chunks, model_cfg: Qwen2Config | None = None, ps: ParallelState | None = None, **_: object
+    chunks,
+    model_cfg: Qwen2Config | None = None,
+    ps: ParallelState | None = None,
+    kind: str = "olora_tail",
+    **_: object,
 ) -> dict[str, int]:
-    """OLoRA-tail init for dense Qwen2 LoRA surfaces (arXiv:2606.02437 §4.1.2).
+    """Orthogonal LoRA init for dense Qwen2 LoRA surfaces.
 
-    Uses the primitive ``LinearLoRA.olora_tail_init_`` (minor-SVD factors with the
-    PiSSA-style base residual, so each layer's output is unchanged at init). Dense
-    module pairs by attribute convention: attention ``qkv``/``proj`` and MLP
-    ``gate_up``/``down`` with their ``*_lora`` adapters. tp=1 only (enforced by the
-    build-time parallel scope); PEFT adapter import/export follows separately.
+    ``kind="olora_tail"`` (arXiv:2606.02437 §4.1.2, minor-SVD subspace) or
+    ``kind="olora"`` (arXiv:2406.01775, QR principal-leaning — the Fig 13
+    collapse-contrast arm). Both use the primitive's PiSSA-style base residual,
+    so each layer's output is unchanged at init. Dense module pairs by attribute
+    convention: attention ``qkv``/``proj`` and MLP ``gate_up``/``down`` with their
+    ``*_lora`` adapters. tp=1 only (enforced by the build-time parallel scope);
+    PEFT adapter import/export follows separately.
     """
     del model_cfg, ps
+    if kind not in ("olora_tail", "olora"):
+        raise ValueError(f"Unknown orthogonal LoRA init kind {kind!r}.")
     initialized = 0
     for chunk in chunks:
         for module in chunk.modules():
@@ -403,7 +411,10 @@ def initialize_lora_olora_tail(
                 base = getattr(module, base_attr, None)
                 lora = getattr(module, lora_attr, None)
                 if base is not None and lora is not None and hasattr(base, "weight"):
-                    lora.olora_tail_init_(base.weight.data)
+                    if kind == "olora_tail":
+                        lora.olora_tail_init_(base.weight.data)
+                    else:
+                        lora.olora_init_(base.weight.data)
                     initialized += 1
     return {"olora_initialized": initialized}
 

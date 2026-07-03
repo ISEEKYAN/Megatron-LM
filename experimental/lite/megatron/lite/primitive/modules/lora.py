@@ -62,6 +62,29 @@ def olora_tail_factors(weight: torch.Tensor, rank: int) -> tuple[torch.Tensor, t
     return B0, A0
 
 
+def olora_factors(weight: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Plain OLoRA init factors ``(B0, A0)`` from a frozen base weight.
+
+    Per OLoRA (arXiv:2406.01775, mirroring HF PEFT ``init_lora_weights="olora"``):
+    economy QR of the base weight, ``B0 = Q[:, :rank]`` (orthonormal columns),
+    ``A0 = R[:rank, :]``. Unlike olora_tail this seeds the adapter with the
+    *leading* (principal-leaning) content of W0 — the aggressive init that
+    arXiv:2606.02437 Fig. 13 shows collapsing under on-policy RL, kept here as
+    the contrast arm to OLoRA-tail.
+
+    ``weight`` is ``[out, in]``; returns ``B0 [out, rank]``, ``A0 [rank, in]``.
+    QR is computed in float32 for stability regardless of the weight dtype.
+    """
+    w = weight.detach().to(torch.float32)
+    if w.dim() != 2:
+        raise ValueError(f"olora_factors expects a 2D weight, got shape {tuple(w.shape)}.")
+    k = min(w.shape)
+    if rank > k:
+        raise ValueError(f"OLoRA rank {rank} exceeds min(out, in) = {k}.")
+    q, r = torch.linalg.qr(w, mode="reduced")
+    return q[:, :rank].contiguous(), r[:rank, :].contiguous()
+
+
 @dataclass(frozen=True)
 class LoraConfig:
     rank: int = 0
@@ -556,26 +579,36 @@ class LinearLoRA(nn.Module):
 
     @torch.no_grad()
     def olora_tail_init_(self, base_weight: torch.Tensor) -> None:
-        """OLoRA-tail init from the (loaded) frozen base weight, in place.
+        """OLoRA-tail init (minor SVD subspace) — see ``_orthogonal_init_``."""
+        self._orthogonal_init_(base_weight, olora_tail_factors, "OLoRA-tail")
 
-        Sets ``lora_b = U₋ᵣ``, ``lora_a = V₋ᵣᵀ`` from the minor SVD subspace, then
-        subtracts ``scale · B0 @ A0`` from ``base_weight`` (PiSSA-style residual) so
-        the layer output is UNCHANGED at init: ``W0 x = (W0 - scale·B0A0)x + scale·B0A0x``.
-        tp=1 only — a sharded base weight would need a distributed SVD.
+    @torch.no_grad()
+    def olora_init_(self, base_weight: torch.Tensor) -> None:
+        """Plain OLoRA init (QR, principal-leaning) — see ``_orthogonal_init_``."""
+        self._orthogonal_init_(base_weight, olora_factors, "OLoRA")
+
+    @torch.no_grad()
+    def _orthogonal_init_(self, base_weight: torch.Tensor, factors_fn, kind: str) -> None:
+        """Orthogonal-factor init from the (loaded) frozen base weight, in place.
+
+        Sets ``lora_b/lora_a`` from ``factors_fn`` then subtracts
+        ``scale · B0 @ A0`` from ``base_weight`` (PiSSA-style residual) so the
+        layer output is UNCHANGED at init: ``W0 x = (W0 - scale·B0A0)x + scale·B0A0x``.
+        tp=1 only — a sharded base weight would need a distributed factorization.
         """
         tp_world = dist.get_world_size(self.tp_group) if self.tp_group is not None else 1
         if self.rank_partitioned_a or self.output_partitioned_b or tp_world > 1:
             raise NotImplementedError(
-                "OLoRA-tail init supports tp=1 (unsharded base weight) only; "
+                f"{kind} init supports tp=1 (unsharded base weight) only; "
                 f"got tp_world={tp_world}, rank_partitioned_a={self.rank_partitioned_a}, "
                 f"output_partitioned_b={self.output_partitioned_b}."
             )
         expected = (self.lora_b.shape[0], self.lora_a.shape[1])
         if tuple(base_weight.shape) != expected:
             raise ValueError(
-                f"OLoRA-tail base weight shape {tuple(base_weight.shape)} != expected {expected}."
+                f"{kind} base weight shape {tuple(base_weight.shape)} != expected {expected}."
             )
-        b0, a0 = olora_tail_factors(base_weight, self.rank)
+        b0, a0 = factors_fn(base_weight, self.rank)
         # SVD factors carry sign/degeneracy ambiguity that differs across ranks.
         # The init runs pre-sharding on replicated weights, but fsdp2 later shards
         # lora_a/lora_b dim-0 across data-parallel ranks: the concatenated factors
@@ -714,5 +747,6 @@ __all__ = [
     "freeze_non_lora_params",
     "normalize_lora_config",
     "olora_tail_factors",
+    "olora_factors",
     "trainable_param_stats",
 ]
