@@ -43,6 +43,7 @@ class DeepseekV4Config:
     index_head_dim: int = 128
     index_n_heads: int = 64
     index_topk: int = 512
+    dsa_indexer_loss_coeff: float = 0.0
     num_nextn_predict_layers: int = 1
     mtp_loss_scaling_factor: float = 0.1
     rms_norm_eps: float = 1e-6

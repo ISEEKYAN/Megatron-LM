@@ -5,7 +5,10 @@ from typing import Any
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
-from megatron.lite.primitive.modules.attention.dsa import rotate_activation
+from megatron.lite.primitive.modules.attention.dsa import (
+    DSAIndexerLossAutoScaler,
+    rotate_activation,
+)
 from megatron.lite.primitive.modules.attention.cp import (
     compress_contiguous_chunks_for_cp,
     iter_cp_sources,
@@ -659,7 +662,8 @@ class CompressedSparseAttention(nn.Module):
         sink = self.sinks.float()
 
         if self.training and torch.is_grad_enabled():
-            out, _indexer_loss = dsa_kernels.fused_indexer_sparse_attn(
+            indexer_loss_coeff = self.config.dsa_indexer_loss_coeff
+            out, indexer_loss = dsa_kernels.fused_indexer_sparse_attn(
                 query,
                 kv_full,
                 sink,
@@ -671,11 +675,13 @@ class CompressedSparseAttention(nn.Module):
                 self.compress_ratio,
                 self.head_dim**-0.5,
                 self.indexer.softmax_scale,
-                0.0,
+                indexer_loss_coeff,
                 sparse_loss=False,
                 kv_offset=seq_len,
                 calculate_per_token_loss=False,
             )
+            if indexer_loss_coeff > 0:
+                out = DSAIndexerLossAutoScaler.apply(out, indexer_loss)
         else:
             topk_indices, _topk_length = dsa_kernels.indexer_topk(
                 q_indexer,
