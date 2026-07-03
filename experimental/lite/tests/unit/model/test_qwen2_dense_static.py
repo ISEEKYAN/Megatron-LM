@@ -620,6 +620,31 @@ def test_qwen2_lora_adapter_peft_key_syntax_and_strictness(tmp_path):
     with pytest.raises(ValueError, match="identical\\s+lora_A"):
         load_lora_adapter_state(bundle.chunks, broken, cfg, bundle.parallel_state)
 
+def test_qwen2_unpack_forward_output_returns_jagged_nested():
+    # verl postprocess unbinds per-sequence rows; flat 1-D would unbind to 0-dim
+    # scalars and crash torch.nested.as_nested_tensor (caught live in the RL pilot).
+    import torch
+
+    from megatron.lite.model.qwen2.lite.protocol import unpack_forward_output
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    batch = PackedBatch(
+        input_ids=torch.arange(6),
+        labels=torch.arange(6),
+        seq_lens=torch.tensor([4, 2]),
+    )
+    padded = torch.arange(12, dtype=torch.float32).view(2, 6)
+    nt = unpack_forward_output(None, batch, padded)
+    assert nt.is_nested
+    rows = nt.unbind()
+    assert [r.numel() for r in rows] == [4, 2]
+    assert torch.equal(rows[0], padded[0, :4]) and torch.equal(rows[1], padded[1, :2])
+
+    packed = torch.arange(6, dtype=torch.float32)
+    rows = unpack_forward_output(None, batch, packed).unbind()
+    assert [r.numel() for r in rows] == [4, 2]
+    assert torch.equal(rows[1], packed[4:])
+
 
 def test_qwen2_export_merge_lora_folds_adapter_into_base_weights():
     # rollout weight sync: the serving engine must see base + adapter. merge_lora=True
