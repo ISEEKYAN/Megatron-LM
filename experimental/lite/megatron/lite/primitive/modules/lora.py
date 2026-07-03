@@ -568,6 +568,14 @@ class LinearLoRA(nn.Module):
                 f"OLoRA-tail base weight shape {tuple(base_weight.shape)} != expected {expected}."
             )
         b0, a0 = olora_tail_factors(base_weight, self.rank)
+        # SVD factors carry sign/degeneracy ambiguity that differs across ranks.
+        # The init runs pre-sharding on replicated weights, but fsdp2 later shards
+        # lora_a/lora_b dim-0 across data-parallel ranks: the concatenated factors
+        # must reproduce the exact B0@A0 every rank's residual write-back used, so
+        # all ranks must hold identical factors.
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.broadcast(b0, src=0)
+            dist.broadcast(a0, src=0)
         self.lora_b.copy_(b0.to(self.lora_b.dtype))
         self.lora_a.copy_(a0.to(self.lora_a.dtype))
         base_weight.sub_((b0 @ a0).to(base_weight.dtype), alpha=self.scale)
