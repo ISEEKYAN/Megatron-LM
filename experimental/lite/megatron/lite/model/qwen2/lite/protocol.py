@@ -78,7 +78,10 @@ def build_model_config(source: str | Path | dict, **overrides) -> Qwen2Config:
 def _resolve_lora_init(impl_cfg: ImplConfig) -> str | None:
     value = impl_cfg.lora_init
     if value is None and isinstance(impl_cfg.lora, Mapping):
-        value = impl_cfg.lora.get("init_lora_weights")
+        # Accept both spellings: "init" (LoraConfig field) and "init_lora_weights"
+        # (HF PEFT field). Reading only one made the other silently skip the
+        # protocol-level init hook (vacuous OLoRA arms in sweeps).
+        value = impl_cfg.lora.get("init_lora_weights", impl_cfg.lora.get("init"))
     if value in (None, True, False):
         return None
     if not isinstance(value, str):
@@ -86,7 +89,7 @@ def _resolve_lora_init(impl_cfg: ImplConfig) -> str | None:
             f"Qwen2 LoRA init must be a string, boolean, or None, got {type(value)!r}."
         )
     normalized = value.strip().lower()
-    if normalized in ("", "none", "null", "false", "true"):
+    if normalized in ("", "none", "null", "false", "true", "default"):
         return None
     if normalized == "olora_tail":
         return normalized
