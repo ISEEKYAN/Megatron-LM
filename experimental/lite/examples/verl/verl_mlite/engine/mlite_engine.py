@@ -384,7 +384,11 @@ class MegatronLiteEngine(BaseEngine):
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
         lora_cfg = (self._mlite_config.impl_cfg or {}).get("lora") if self._mlite_config else None
-        if isinstance(lora_cfg, dict) and int(lora_cfg.get("rank", 0) or 0) > 0:
+        # Duck-typed: hydra hands us OmegaConf DictConfig for nested sections, which
+        # fails isinstance(dict) — that silently skipped merge_lora, so the rollout
+        # received the residual-shifted base WITHOUT the adapter delta (W0 - s*B0A0).
+        lora_rank = int(lora_cfg.get("rank", 0) or 0) if hasattr(lora_cfg, "get") else 0
+        if lora_rank > 0:
             # Rollout weight sync must see the CURRENT policy (base + adapter);
             # with OLoRA's PiSSA residual, adapter-only sync on the original
             # base would be numerically wrong, so merged export is mandatory.
