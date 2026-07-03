@@ -7,18 +7,48 @@ import pytest
 from pathlib import Path
 
 
-def _workspace_root() -> Path:
-    return Path(__file__).resolve().parents[6]
+# DeepSeek-R1-Distill-Qwen-1.5B config.json, embedded so the test is
+# checkout-independent (no reliance on files outside the repo).
+_DS_R1_DISTILL_QWEN_15B_CONFIG = """\
+{
+  "architectures": ["Qwen2ForCausalLM"],
+  "attention_dropout": 0.0,
+  "bos_token_id": 151643,
+  "eos_token_id": 151643,
+  "hidden_act": "silu",
+  "hidden_size": 1536,
+  "initializer_range": 0.02,
+  "intermediate_size": 8960,
+  "max_position_embeddings": 131072,
+  "max_window_layers": 21,
+  "model_type": "qwen2",
+  "num_attention_heads": 12,
+  "num_hidden_layers": 28,
+  "num_key_value_heads": 2,
+  "rms_norm_eps": 1e-06,
+  "rope_theta": 10000,
+  "sliding_window": 4096,
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.44.0",
+  "use_cache": true,
+  "use_mrope": false,
+  "use_sliding_window": false,
+  "vocab_size": 151936
+}
+"""
 
 
-def _exact_qwen2_reference_dir() -> Path:
-    return _workspace_root() / "references" / "external" / "hf-deepseek-ai-DeepSeek-R1-Distill-Qwen-1.5B"
+@pytest.fixture
+def qwen2_15b_reference_dir(tmp_path: Path) -> Path:
+    (tmp_path / "config.json").write_text(_DS_R1_DISTILL_QWEN_15B_CONFIG)
+    return tmp_path
 
 
-def test_qwen2_config_reads_exact_fig14_target_hf_config():
+def test_qwen2_config_reads_exact_fig14_target_hf_config(qwen2_15b_reference_dir):
     from megatron.lite.model.qwen2.config import Qwen2Config
 
-    cfg = Qwen2Config.from_hf(str(_exact_qwen2_reference_dir()))
+    cfg = Qwen2Config.from_hf(str(qwen2_15b_reference_dir))
 
     assert cfg.num_hidden_layers == 28
     assert cfg.hidden_size == 1536
@@ -34,14 +64,14 @@ def test_qwen2_config_reads_exact_fig14_target_hf_config():
     assert cfg.tie_word_embeddings is False
 
 
-def test_qwen2_registry_resolves_exact_target_lite_runtime_name():
+def test_qwen2_registry_resolves_exact_target_lite_runtime_name(qwen2_15b_reference_dir):
     from megatron.lite.model.registry import (
         get_model_package,
         resolve_model_type_from_hf,
         resolve_runtime_model_name,
     )
 
-    assert resolve_model_type_from_hf(str(_exact_qwen2_reference_dir())) == "qwen2"
+    assert resolve_model_type_from_hf(str(qwen2_15b_reference_dir)) == "qwen2"
     assert get_model_package("qwen2").Qwen2Config.__name__ == "Qwen2Config"
     assert resolve_runtime_model_name("qwen2", "lite") == "qwen2"
 
