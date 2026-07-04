@@ -51,6 +51,18 @@ except ImportError:
 
 _LR_SCHEDULER_STATE = "lr_scheduler.pt"
 
+# Recompute specs whose module_map wrapping re-runs the MoE router forward inside
+# backward — only these need the REPLAY_BACKWARD arming (R3 phase-2 plan WS3);
+# selective attention/expert-only recompute never re-runs the router.
+_ROUTER_RERUNNING_RECOMPUTE = {"full", "moe", "router"}
+
+
+def _recompute_arms_router_replay(impl_cfg: dict[str, Any] | None) -> bool:
+    from megatron.lite.primitive.recompute import parse_recompute_spec
+
+    spec = parse_recompute_spec((impl_cfg or {}).get("recompute"))
+    return bool(_ROUTER_RERUNNING_RECOMPUTE.intersection(spec))
+
 
 def _isolate_compile_cache_per_rank() -> None:
     """Avoid torchinductor/triton cache races between local torchrun ranks."""
@@ -268,6 +280,11 @@ class MegatronLiteEngine(BaseEngine):
         self.module = None
         self._mlite_config = None
         self._rank = dist.get_rank() if dist.is_initialized() else 0
+        # R3 router replay step state: None | "record" | "replay"; per-sample routing
+        # rides the batch during "replay"; layout is stashed while splitting on "record".
+        self._router_replay_mode = None
+        self._router_replay_routing = None
+        self._router_replay_layout = None
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -298,9 +315,14 @@ class MegatronLiteEngine(BaseEngine):
         if getattr(self.engine_config, "router_replay", False):
             from megatron.lite.primitive.modules.router import attach_router_replay
 
+            # full/moe recompute re-runs the router in backward: arm REPLAY_BACKWARD
+            # (WS3); the gate follows the recompute setting, no extra user knob.
+            recompute_replay = _recompute_arms_router_replay(self._mlite_config.impl_cfg)
             chunks = self.handle._extras.get("model_chunks", [self.handle._model])
             for i, chunk in enumerate(chunks):
-                self._router_replay_count += attach_router_replay(chunk, reset=(i == 0))
+                self._router_replay_count += attach_router_replay(
+                    chunk, reset=(i == 0), recompute_replay=recompute_replay
+                )
             if self._router_replay_count == 0:
                 raise ValueError(
                     "router_replay=True but the model exposes no replay-capable MoE "
@@ -367,6 +389,11 @@ class MegatronLiteEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
+        if getattr(self, "_router_replay_routing", None) is not None:
+            # per-sample [T_i, L, K] replay routing rides the batch so the splitter
+            # below keys it per microbatch exactly like input_ids
+            data["routed_experts"] = self._router_replay_routing
+
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
@@ -387,48 +414,116 @@ class MegatronLiteEngine(BaseEngine):
             raise RuntimeError(
                 "router replay is not attached; set engine_config.router_replay=True."
             )
+        if self.engine_config.cp != 1:
+            raise NotImplementedError(
+                "router replay requires cp=1; routing tensors are not CP-split yet."
+            )
 
-    def record_routed_experts(self, data: TensorDict, loss_function=None) -> list:
-        """Forward-only pass with RECORD armed; returns per-layer top-k indices.
+    def record_routed_experts(self, data: TensorDict, loss_function=None):
+        """Forward-only pass with RECORD armed; returns per-sample routing.
 
-        R3 phase 1 (arXiv:2606.02437 §3): the recorded routing stands in for the
-        rollout engine's routing decisions (same policy weights, same inputs).
-        NOTE: RECORD keeps one tensor per router; drive this with data that maps
-        to a single microbatch — with several microbatches only the last one's
-        routing survives, so replaying it against the full batch is wrong.
+        R3 phase 2 (arXiv:2606.02437 §3): every microbatch records under its own
+        key and the result folds back to per-sample ``[T_i, L, K]`` jagged routing
+        in the ORIGINAL batch order (L = locally attached routers in registry
+        order), so the caller is microbatch-layout independent. The recorded
+        routing stands in for the rollout engine's routing decisions (same policy
+        weights, same inputs).
         """
         from megatron.lite.primitive.modules.router import RouterReplay, RouterReplayAction
 
         self._require_router_replay()
         RouterReplay.clear_global_indices()
         RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        self._router_replay_layout = None
+        self._router_replay_mode = "record"
         try:
             self.forward_backward_batch(data, loss_function, forward_only=True)
+            return self._fold_recorded_routing(RouterReplay.get_recorded_data())
         finally:
+            self._router_replay_mode = None
             RouterReplay.set_global_router_replay_action(None)
-        recorded = RouterReplay.get_recorded_data()
-        missing = sum(1 for r in recorded if r is None)
-        if missing:
-            raise RuntimeError(f"router replay recorded no routing for {missing} router(s).")
-        return recorded
+            RouterReplay.clear_global_indices()
+            RouterReplay.clear_microbatch_schedule()
 
     @contextmanager
-    def replay_routed_experts(self, all_layers_topk_indices: list):
+    def replay_routed_experts(self, routing):
         """Arm REPLAY_FORWARD with recorded routing for the enclosed engine calls.
 
-        Selection is pinned to the recorded indices; scores stay live from the
-        current logits (gradients keep flowing to the gate and LoRA adapters).
+        Accepts per-sample ``[T_i, L, K]`` routing (jagged tensor or list, as
+        returned by :meth:`record_routed_experts`) — it rides the batch as a
+        TensorDict field so every forward splits it exactly where
+        prepare_micro_batches splits ``input_ids`` — or the phase-1 per-layer
+        ``[tokens, K]`` list (single-microbatch compat). Selection is pinned to
+        the recorded indices; scores stay live from the current logits (gradients
+        keep flowing to the gate and LoRA adapters). Under full recompute the
+        backward re-forwards drain a per-router FIFO (REPLAY_BACKWARD), which
+        must be empty again by context exit.
         """
         from megatron.lite.primitive.modules.router import RouterReplay, RouterReplayAction
 
         self._require_router_replay()
-        RouterReplay.set_replay_data(list(all_layers_topk_indices))
+        first = routing[0] if isinstance(routing, (list, tuple)) and len(routing) else routing
+        if getattr(routing, "is_nested", False) or getattr(first, "ndim", None) == 3:
+            self._router_replay_routing = (
+                routing
+                if isinstance(routing, torch.Tensor)
+                else torch.nested.as_nested_tensor(list(routing), layout=torch.jagged)
+            )
+        else:
+            RouterReplay.set_replay_data(list(routing))
+        self._router_replay_mode = "replay"
         RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
         try:
             yield
+            RouterReplay.assert_backward_replay_drained()
         finally:
+            self._router_replay_mode = None
+            self._router_replay_routing = None
             RouterReplay.set_global_router_replay_action(None)
             RouterReplay.clear_global_indices()
+            RouterReplay.clear_microbatch_schedule()
+
+    def _fold_recorded_routing(self, recorded: list) -> torch.Tensor:
+        """Fold per-router ``{microbatch: [tokens, K]}`` records into per-sample
+        ``[T_i, L, K]`` jagged routing in the original batch order, using the
+        microbatch layout stashed while splitting."""
+        layout = self._router_replay_layout
+        if not recorded or not layout:
+            raise RuntimeError("router replay recorded no routing (no MoE forward ran).")
+        expected = set(range(len(layout)))
+        missing = sum(1 for per_router in recorded if set(per_router) != expected)
+        if missing:
+            raise RuntimeError(
+                f"router replay recorded incomplete routing for {missing} router(s)."
+            )
+        rows: dict[int, torch.Tensor] = {}
+        next_pos = 0
+        for micro_idx, (sample_indices, seq_lens) in enumerate(layout):
+            # [tokens_m, L, K]: routers stack in registry (== layer) order
+            packed = torch.stack([per_router[micro_idx] for per_router in recorded], dim=1)
+            splits = packed.split(seq_lens.tolist(), dim=0)
+            if sample_indices is None:  # no dynamic-bsz index map: sequential chunks
+                sample_indices = range(next_pos, next_pos + len(splits))
+                next_pos += len(splits)
+            for pos, row in zip(sample_indices, splits, strict=True):
+                rows[int(pos)] = row
+        return torch.nested.as_nested_tensor(
+            [rows[i] for i in range(len(rows))], layout=torch.jagged
+        )
+
+    @staticmethod
+    def _load_replay_targets_for_microbatch(micro_idx: int, routed_experts) -> None:
+        from megatron.lite.primitive.modules.router import RouterReplay
+
+        # [n_m, T_i, L, K] jagged -> THD-packed [tokens_m, L, K] -> per-router [tokens_m, K]
+        packed = (
+            routed_experts.values()
+            if getattr(routed_experts, "is_nested", False)
+            else routed_experts.reshape(-1, *routed_experts.shape[-2:])
+        )
+        RouterReplay.set_replay_data_for_microbatch(
+            micro_idx, [t.contiguous() for t in packed.unbind(dim=1)]
+        )
 
     def get_per_tensor_param(self, **kwargs):
         self._require_initialized()
@@ -735,15 +830,36 @@ class MegatronLiteEngine(BaseEngine):
         if batch_num_tokens <= 0:
             raise ValueError(f"batch_num_tokens must be positive, got {batch_num_tokens}.")
         loss_scale = self.get_data_parallel_size() * num_micro_batches / float(batch_num_tokens)
+        router_replay_mode = getattr(self, "_router_replay_mode", None)
+        if router_replay_mode is not None:
+            from megatron.lite.primitive.modules.router import RouterReplay
+
+            # chunk forward pre-hooks pop private copies of this schedule (WS1 §1.2)
+            RouterReplay.load_microbatch_schedule(range(num_micro_batches))
+        record_layout = [] if router_replay_mode == "record" else None
         for micro_idx, micro_batch in enumerate(micro_batches):
             tu.assign_non_tensor(micro_batch, micro_batch_idx=micro_idx)
             micro_batch = micro_batch.to(get_device_id())
+            runtime_batch = self._make_runtime_batch(micro_batch)
+            if record_layout is not None:
+                record_layout.append(
+                    (
+                        None if indices is None else list(indices[micro_idx]),
+                        runtime_batch.seq_lens,
+                    )
+                )
+            elif router_replay_mode == "replay" and "routed_experts" in micro_batch.keys():
+                self._load_replay_targets_for_microbatch(
+                    micro_idx, micro_batch["routed_experts"]
+                )
             runtime_batches.append(
                 (
-                    self._make_runtime_batch(micro_batch),
+                    runtime_batch,
                     self._make_runtime_loss_context(micro_batch, loss_scale=loss_scale),
                 )
             )
+        if record_layout is not None:
+            self._router_replay_layout = record_layout
 
         runtime_loss_fn = None
         reduced_outputs = [] if (loss_function is not None or forward_only) and self.is_mp_src_rank_with_outputs() else None
