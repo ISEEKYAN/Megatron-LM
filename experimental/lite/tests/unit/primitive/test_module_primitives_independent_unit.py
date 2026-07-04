@@ -206,7 +206,13 @@ def test_r3_router_replay_pins_selection_and_stays_differentiable():
     router.gate.weight.requires_grad_(True)
     RouterReplay.set_replay_data([idx0])
     s, _ = router(x)
-    s.sum().backward()
+    # Post-softmax scores sum to 1 per token, so s.sum() is a CONSTANT and its gradient
+    # to the gate is mathematically zero — the old s.sum().backward() check only passed
+    # on softmax-backward FP noise, which flips to exactly 0.0 depending on allocator/
+    # reduction state across tests. Use a non-uniform functional (distinct per-k weights)
+    # whose gradient is genuinely nonzero, so this tests real grad flow to the gate.
+    weights = torch.arange(1, s.size(-1) + 1, device=s.device, dtype=torch.float32)
+    (s.float() * weights).sum().backward()
     assert router.gate.weight.grad is not None and router.gate.weight.grad.abs().sum() > 0
 
     # REPLAY_BACKWARD pops one queued tensor per (re)forward — exhaustion must fail
