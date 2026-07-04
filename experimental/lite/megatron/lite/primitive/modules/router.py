@@ -136,6 +136,19 @@ class RouterReplay:
         RouterReplay.current_microbatch = None
 
     @staticmethod
+    def assert_backward_replay_drained() -> None:
+        """End-of-step invariant: recompute consumed every queued backward replay."""
+        leftover = sum(
+            len(inst.replay_backward_list)
+            for inst in RouterReplay.global_router_replay_instances
+        )
+        if leftover:
+            raise RuntimeError(
+                f"router replay backward FIFO has {leftover} unconsumed entries; "
+                "recompute/forward mismatch."
+            )
+
+    @staticmethod
     def _resolved_microbatch() -> int:
         # No cursor (bare router / single-microbatch legacy callers) == microbatch 0.
         mb = RouterReplay.current_microbatch
@@ -228,7 +241,9 @@ def _is_replay_capable_router(module: nn.Module) -> bool:
     )
 
 
-def attach_router_replay(model: nn.Module, *, reset: bool = True) -> int:
+def attach_router_replay(
+    model: nn.Module, *, reset: bool = True, recompute_replay: bool = False
+) -> int:
     """Enable router replay on every replay-capable MoE router in ``model``.
 
     Walks the module tree and gives each router a fresh :class:`RouterReplay`,
@@ -242,6 +257,14 @@ def attach_router_replay(model: nn.Module, *, reset: bool = True) -> int:
     cursor from this chunk's private copy of ``RouterReplay.microbatch_schedule``.
     Recompute re-forwards bypass ``Module.__call__`` on the chunk (checkpointing
     calls the saved function directly), so the hook never refires under recompute.
+
+    ``recompute_replay=True`` (caller gates it on a recompute config that re-runs
+    the router in backward, e.g. full/moe recompute) arms the upstream
+    REPLAY_BACKWARD dance (verl ``transformer_impl.py``): the chunk post-hook
+    flips replayed routers to REPLAY_BACKWARD so backward re-forwards drain the
+    per-router FIFO in forward order, and the next microbatch's pre-hook flips
+    them back to REPLAY_FORWARD — otherwise recompute could pick a different
+    fresh topk than the forward, corrupting the sparse path's gradient wiring.
     """
     if reset:
         RouterReplay.clear_global_router_replay_instances()
@@ -256,6 +279,12 @@ def attach_router_replay(model: nn.Module, *, reset: bool = True) -> int:
     cursor_state: dict = {"generation": None, "queue": None}
 
     def _chunk_pre_hook(module, args) -> None:
+        queue_backward = recompute_replay and torch.is_grad_enabled()
+        for replay in chunk_replays:
+            # previous microbatch's recompute is done; replay live forwards again
+            if replay.router_replay_action is RouterReplayAction.REPLAY_BACKWARD:
+                replay.router_replay_action = RouterReplayAction.REPLAY_FORWARD
+            replay.queue_backward_replays = queue_backward
         if all(replay.router_replay_action is None for replay in chunk_replays):
             return
         if cursor_state["generation"] != RouterReplay._schedule_generation:
@@ -271,7 +300,19 @@ def attach_router_replay(model: nn.Module, *, reset: bool = True) -> int:
             )
         RouterReplay.current_microbatch = cursor_state["queue"].popleft()
 
-    model._router_replay_hook_handles = [model.register_forward_pre_hook(_chunk_pre_hook)]
+    def _chunk_post_hook(module, args, output) -> None:
+        # Recompute re-forwards must consume the FIFO (forward order), not the
+        # microbatch cursor, which may have advanced by the time backward runs.
+        if not torch.is_grad_enabled():
+            return  # forward-only pass: no backward, no recompute
+        for replay in chunk_replays:
+            if replay.router_replay_action is RouterReplayAction.REPLAY_FORWARD:
+                replay.router_replay_action = RouterReplayAction.REPLAY_BACKWARD
+
+    handles = [model.register_forward_pre_hook(_chunk_pre_hook)]
+    if recompute_replay:
+        handles.append(model.register_forward_hook(_chunk_post_hook))
+    model._router_replay_hook_handles = handles
     return len(chunk_replays)
 
 

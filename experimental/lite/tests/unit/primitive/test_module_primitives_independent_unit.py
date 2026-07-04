@@ -212,19 +212,21 @@ def test_r3_router_replay_pins_selection_and_stays_differentiable():
     # REPLAY_BACKWARD pops one queued tensor per (re)forward — exhaustion must fail
     # loudly. The FIFO fills at REPLAY time (not set_replay_data time) and only when
     # the chunk hook armed queue_backward_replays (full recompute re-runs the router).
+    # Call router.forward directly: recompute re-forwards bypass Module.__call__ and
+    # thus the chunk hooks, which would otherwise re-manage the flag and the action.
     RouterReplay.clear_global_indices()
     RouterReplay.set_replay_data([idx0])
     inst = RouterReplay.global_router_replay_instances[0]
     inst.queue_backward_replays = True
     RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
     with torch.no_grad():
-        router(x)  # replayed forward queues exactly one backward entry
+        router.forward(x)  # replayed forward queues exactly one backward entry
         assert len(inst.replay_backward_list) == 1
         RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
-        _, idx_bwd = router(x)  # the recompute re-forward consumes it
+        _, idx_bwd = router.forward(x)  # the recompute re-forward consumes it
         assert torch.equal(idx_bwd, idx0)
         with pytest.raises(RuntimeError, match="exhausted"):
-            router(x)
+            router.forward(x)
 
     detach_router_replay(router)
     assert router.router_replay is None
@@ -362,6 +364,121 @@ def test_r3_chunk_pre_hook_advances_private_microbatch_schedule(transformer_engi
     detach_router_replay(chunk0)
     detach_router_replay(chunk1)
     assert RouterReplay.microbatch_schedule is None
+
+
+def test_r3_replay_backward_recompute_matches_no_recompute(transformer_engine_import_stub):
+    # Plan WS3 (mirrors verl transformer_impl.py REPLAY_BACKWARD dance): with full
+    # activation recompute the backward re-runs the router forward AFTER the microbatch
+    # cursor has advanced (1F1B interleave), so recompute must drain the per-router
+    # FIFO in forward order instead of consulting the cursor. Contract: (i) recompute
+    # topk == forward topk bitwise, (ii) grads under replay+recompute == grads under
+    # replay without recompute bitwise (same CPU fp32 op sequence), (iii) the FIFO is
+    # fully drained after backward and leftovers fail loudly.
+    transformer_engine_import_stub()
+    import copy
+    from types import SimpleNamespace
+
+    from megatron.lite.primitive.modules.router import (
+        RouterReplay,
+        RouterReplayAction,
+        TopKRouter,
+        attach_router_replay,
+        detach_router_replay,
+    )
+    from megatron.lite.primitive.recompute import wrap_checkpoint
+
+    cfg = SimpleNamespace(
+        num_experts_per_tok=2, num_experts=8, router_aux_loss_coef=0.0, hidden_size=16
+    )
+    ps = SimpleNamespace(tp_size=1, tp_group=None)
+
+    class RouterBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.router = TopKRouter(cfg, ps, compute_aux_loss=False)
+
+        def forward(self, x):
+            scores, indices = self.router(x)
+            # selection-dependent output: replaying the wrong microbatch's indices
+            # changes both the value (indices term) and the gate grads (scores term)
+            return x * scores.sum(-1, keepdim=True) + indices.float().sum(-1, keepdim=True)
+
+    class Chunk(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([RouterBlock(), RouterBlock()])
+
+        def forward(self, x):
+            for block in self.blocks:
+                x = block(x)
+            return x
+
+    torch.manual_seed(3)
+    chunk = Chunk()
+    ref = copy.deepcopy(chunk)  # identical weights, no recompute
+    # grad-requiring inputs: the reentrant CheckpointFunction threads gradients
+    # through its tensor args (parameters reach it via the recompute closure)
+    x0, x1 = torch.randn(4, 16, requires_grad=True), torch.randn(4, 16, requires_grad=True)
+
+    # cross-swapped targets (mb0 <- x1's routing, mb1 <- x0's) so a recompute that
+    # consulted the advanced cursor or fresh logits would pick DIFFERENT indices
+    assert attach_router_replay(ref, reset=True) == 2
+    RouterReplay.load_microbatch_schedule(range(2))
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+    with torch.no_grad():
+        ref(x1)
+        ref(x0)
+    targets = RouterReplay.get_recorded_data()
+    assert all(not torch.equal(t[0], t[1]) for t in targets)
+    RouterReplay.set_global_router_replay_action(None)
+    RouterReplay.clear_global_indices()
+
+    def replay_interleaved(model):
+        # 1F1B-style interleave: both forwards run before the first backward, so
+        # mb0's recompute happens after the cursor moved on to mb1
+        RouterReplay.set_replay_data([dict(t) for t in targets])
+        RouterReplay.load_microbatch_schedule(range(2))
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        loss_mb0 = model(x0).square().mean()
+        loss_mb1 = model(x1).square().mean()
+        loss_mb0.backward()
+        loss_mb1.backward()
+        RouterReplay.set_global_router_replay_action(None)
+        return loss_mb0.detach(), loss_mb1.detach()
+
+    ref_losses = replay_interleaved(ref)
+    ref_grads = [p.grad.clone() for p in ref.parameters()]
+    RouterReplay.assert_backward_replay_drained()  # no recompute -> nothing queued
+    detach_router_replay(ref)
+
+    assert attach_router_replay(chunk, reset=True, recompute_replay=True) == 2
+    for block in chunk.blocks:
+        wrap_checkpoint(block, preserve_rng_state=False)
+    emitted = {id(block): [] for block in chunk.blocks}
+    for block in chunk.blocks:
+        block.router.register_forward_hook(
+            lambda module, args, out, key=id(block): emitted[key].append(out[1])
+        )
+
+    losses = replay_interleaved(chunk)
+    RouterReplay.assert_backward_replay_drained()  # (iii) recompute consumed the FIFO
+    assert torch.equal(losses[0], ref_losses[0]) and torch.equal(losses[1], ref_losses[1])
+    for ref_grad, grad in zip(ref_grads, (p.grad for p in chunk.parameters()), strict=True):
+        torch.testing.assert_close(grad, ref_grad, rtol=0, atol=0)  # (ii) bitwise
+    for indices in emitted.values():
+        # forward mb0, forward mb1, recompute mb0, recompute mb1
+        assert len(indices) == 4
+        assert torch.equal(indices[2], indices[0]) and torch.equal(indices[3], indices[1])  # (i)
+
+    # leftover FIFO entries (a replayed grad-enabled forward whose backward never ran)
+    # must fail loudly instead of leaking into the next step
+    RouterReplay.set_replay_data([dict(t) for t in targets])
+    RouterReplay.load_microbatch_schedule(range(1))
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    chunk(x0)
+    with pytest.raises(RuntimeError, match="unconsumed"):
+        RouterReplay.assert_backward_replay_drained()
+    detach_router_replay(chunk)
 
 
 def test_linear_lora_forward_backward_matches_low_rank_delta():
