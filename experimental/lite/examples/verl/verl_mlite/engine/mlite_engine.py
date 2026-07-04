@@ -285,6 +285,8 @@ class MegatronLiteEngine(BaseEngine):
         self._router_replay_mode = None
         self._router_replay_routing = None
         self._router_replay_layout = None
+        # MinT §6.3 count: fraction of rollout tokens masked to live-routing fallback.
+        self._router_replay_unmappable_frac = None
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -328,6 +330,15 @@ class MegatronLiteEngine(BaseEngine):
                     "router_replay=True but the model exposes no replay-capable MoE "
                     "routers (dense model or unsupported router)."
                 )
+            # rollout-routing ingest validates its [T, L, K] layout against these
+            routers = [
+                module
+                for chunk in chunks
+                for module in chunk.modules()
+                if getattr(module, "router_replay", None) is not None
+            ]
+            self._router_replay_topk = routers[0].topk
+            self._router_replay_num_experts = routers[0].num_experts
 
         if self.handle._optimizer is not None and self.handle._lr_scheduler is None:
             self.handle._lr_scheduler = _build_lr_scheduler(
@@ -369,6 +380,12 @@ class MegatronLiteEngine(BaseEngine):
         self, data: TensorDict, loss_function, forward_only: bool = False
     ) -> dict[str, Any]:
         self._require_initialized()
+        if self._should_replay_rollout_routing(data):
+            # WS2 (R3 phase-2 plan §2.2): the serving engine's routing rides the batch
+            # as `routed_experts`; every trainer pass over it — old-logprob recompute
+            # and actor update alike — replays it (re-entered with "replay" armed).
+            with self.replay_routed_experts(self._ingest_rollout_routing(data)):
+                return self.forward_backward_batch(data, loss_function, forward_only)
         pad_mode = tu.get_non_tensor_data(
             data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING
         )
@@ -418,6 +435,72 @@ class MegatronLiteEngine(BaseEngine):
             raise NotImplementedError(
                 "router replay requires cp=1; routing tensors are not CP-split yet."
             )
+
+    def _should_replay_rollout_routing(self, data: TensorDict) -> bool:
+        if (
+            self._router_replay_mode is not None  # already inside a record/replay pass
+            or getattr(self.engine_config, "router_replay_source", "self_record") != "rollout"
+        ):
+            return False
+        if "routed_experts" not in data.keys():
+            raise ValueError(
+                "router_replay_source='rollout' but the batch carries no 'routed_experts'; "
+                "enable rollout routing capture (enable_return_routed_experts) or use "
+                "router_replay_source='self_record'."
+            )
+        return True
+
+    def _ingest_rollout_routing(self, data: TensorDict) -> torch.Tensor:
+        """Validate and sanitize batch-carried rollout routing for replay.
+
+        verl's no-padding conversion delivers per-sample jagged ``[T_i, L, K]``
+        expert ids (uint8-cast upstream) whose unmappable positions — spans the
+        serving engine never recorded (capture gaps, truncation edges) — are
+        ZERO-filled, and 0 is a valid expert id. MinT §6.3 (arXiv:2605.13779):
+        such tokens are masked to sentinel ``-1`` so the router keeps live
+        routing there, counted as ``router_replay/unmappable_frac`` — never
+        silently replayed as expert 0. All-zero ``[L, K]`` rows identify the
+        zero-fill exactly for top-k >= 2 (a genuine top-k never repeats an
+        expert within a layer).
+        """
+        self._require_router_replay()
+        routing = data["routed_experts"]
+        input_ids = data["input_ids"]
+        if not getattr(routing, "is_nested", False) or routing.values().ndim != 3:
+            raise ValueError(
+                "rollout 'routed_experts' must be a per-sample jagged [T_i, L, K] "
+                "nested tensor (no-padding batch contract)."
+            )
+        if not torch.equal(routing.offsets().long(), input_ids.offsets().long()):
+            raise ValueError("rollout 'routed_experts' token spans do not match input_ids.")
+        values = routing.values()
+        num_routers, topk = values.shape[1], values.shape[2]
+        if num_routers != self._router_replay_count or topk != self._router_replay_topk:
+            raise ValueError(
+                f"rollout routing layout [L={num_routers}, K={topk}] does not match the "
+                f"attached routers [L={self._router_replay_count}, "
+                f"K={self._router_replay_topk}] (PP-sliced routing is not supported yet)."
+            )
+        if int(values.max()) >= self._router_replay_num_experts:
+            raise ValueError(
+                f"rollout routing contains expert id {int(values.max())} >= "
+                f"num_experts={self._router_replay_num_experts}."
+            )
+        values = values.to(torch.int16)  # sentinel -1 needs a signed dtype
+        unmappable = values.flatten(1).eq(0).all(dim=1)
+        values[unmappable] = -1
+        self._router_replay_unmappable_frac = unmappable.float().mean().item()
+        loss_mask = self._loss_mask_for_packing(data, input_ids)
+        if loss_mask is not None:
+            lost = int((unmappable & loss_mask.values().bool()).sum())
+            if lost and not getattr(self, "_warned_unmappable_loss", False):
+                self._warned_unmappable_loss = True
+                print(
+                    f"[router_replay] {lost}/{int(unmappable.sum())} unmappable rollout-"
+                    "routing tokens carry loss; they fall back to live routing (MinT §6.3)"
+                    " — check rollout capture coverage (prompt-only gaps are expected)."
+                )
+        return torch.nested.nested_tensor_from_jagged(values, offsets=routing.offsets())
 
     def record_routed_experts(self, data: TensorDict, loss_function=None):
         """Forward-only pass with RECORD armed; returns per-sample routing.
@@ -479,6 +562,7 @@ class MegatronLiteEngine(BaseEngine):
         finally:
             self._router_replay_mode = None
             self._router_replay_routing = None
+            self._router_replay_unmappable_frac = None
             RouterReplay.set_global_router_replay_action(None)
             RouterReplay.clear_global_indices()
             RouterReplay.clear_microbatch_schedule()
@@ -1001,6 +1085,10 @@ class MegatronLiteEngine(BaseEngine):
                 metrics["mtp_losses/mtp_1_loss"] = (
                     float(mtp_loss.item()) if mtp_loss.numel() == 1 else mtp_loss.cpu().tolist()
                 )
+
+            if self._router_replay_unmappable_frac is not None:
+                metrics = dict(metrics)
+                metrics["router_replay/unmappable_frac"] = self._router_replay_unmappable_frac
 
             raw_output["_verl_metrics"] = metrics
             if output_lst is not None:

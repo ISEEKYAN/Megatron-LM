@@ -219,6 +219,21 @@ def test_router_replay_config_flag_defaults_off() -> None:
     assert MegatronLiteEngineConfig(router_replay=True).router_replay is True
 
 
+def test_router_replay_source_config_gate() -> None:
+    # WS2 (R3 phase-2 plan §2.2): "rollout" switches replay to the serving engine's
+    # batch-carried routing; default stays the phase-1 self-record proxy. The gate is
+    # validated at config time — rollout routing without attached routers is useless.
+    from verl_mlite.engine.config import MegatronLiteEngineConfig
+
+    assert MegatronLiteEngineConfig().router_replay_source == "self_record"
+    cfg = MegatronLiteEngineConfig(router_replay=True, router_replay_source="rollout")
+    assert cfg.router_replay_source == "rollout"
+    with pytest.raises(ValueError, match="requires router_replay=True"):
+        MegatronLiteEngineConfig(router_replay_source="rollout")
+    with pytest.raises(ValueError, match="router_replay_source"):
+        MegatronLiteEngineConfig(router_replay=True, router_replay_source="serving")
+
+
 def _stub_router_replay_module(monkeypatch, calls: list[tuple]):
     import sys
     import types
@@ -356,6 +371,126 @@ def test_engine_replay_accepts_per_sample_routing_and_requires_cp1(monkeypatch) 
     with pytest.raises(NotImplementedError, match="cp=1"):
         with engine.replay_routed_experts(per_sample):
             pass
+
+
+def test_forward_backward_auto_arms_replay_only_for_rollout_source() -> None:
+    # WS2 §2.2: with router_replay_source="rollout" every forward_backward_batch over a
+    # rollout batch replays the batch-carried routing; a rollout-sourced engine that
+    # gets a batch WITHOUT routing fails loudly (training un-replayed would be silently
+    # wrong); self_record and already-armed passes never auto-arm.
+    from verl_mlite.engine.mlite_engine import MegatronLiteEngine
+
+    engine = MegatronLiteEngine.__new__(MegatronLiteEngine)
+    engine._router_replay_mode = None
+    engine.engine_config = SimpleNamespace(router_replay_source="rollout")
+    assert engine._should_replay_rollout_routing({"routed_experts": object()}) is True
+    with pytest.raises(ValueError, match="routed_experts"):
+        engine._should_replay_rollout_routing({"input_ids": object()})
+
+    engine._router_replay_mode = "replay"  # re-entered pass: don't arm twice
+    assert engine._should_replay_rollout_routing({"routed_experts": object()}) is False
+    engine._router_replay_mode = "record"  # self-record proxy pass over a rollout batch
+    assert engine._should_replay_rollout_routing({"routed_experts": object()}) is False
+
+    engine._router_replay_mode = None
+    engine.engine_config = SimpleNamespace(router_replay_source="self_record")
+    assert engine._should_replay_rollout_routing({"routed_experts": object()}) is False
+
+
+def _nested(rows):
+    return torch.nested.as_nested_tensor(list(rows), layout=torch.jagged)
+
+
+def _rollout_ingest_engine(*, routers=2, topk=2, num_experts=8):
+    from verl_mlite.engine.mlite_engine import MegatronLiteEngine
+
+    engine = MegatronLiteEngine.__new__(MegatronLiteEngine)
+    engine._require_initialized = lambda: None
+    engine.engine_config = SimpleNamespace(cp=1)
+    engine._router_replay_count = routers
+    engine._router_replay_topk = topk
+    engine._router_replay_num_experts = num_experts
+    engine._router_replay_unmappable_frac = None
+    return engine
+
+
+def test_engine_ingest_masks_unmappable_rollout_routing() -> None:
+    # WS2 §2.3 (MinT arXiv:2605.13779 §6.3): the agent loop ZERO-fills routing outside
+    # the captured span and 0 is a valid expert id — ingest converts all-zero [L, K]
+    # rows to sentinel -1 (live-routing fallback in the router), counts the fraction,
+    # and keeps rows that merely contain expert 0. Loss-carrying unmappable tokens
+    # trigger the one-shot coverage warning.
+    engine = _rollout_ingest_engine()
+    input_ids = _nested([torch.arange(3), torch.arange(4)])
+    r0 = torch.tensor(
+        [[[1, 2], [3, 4]], [[0, 1], [2, 3]], [[0, 0], [0, 0]]], dtype=torch.uint8
+    )
+    r1 = torch.tensor(
+        [[[5, 6], [7, 1]], [[0, 0], [0, 0]], [[2, 3], [4, 5]], [[1, 0], [3, 2]]],
+        dtype=torch.uint8,
+    )
+    loss_mask = _nested([torch.tensor([0.0, 0.0, 1.0]), torch.tensor([0.0, 0.0, 1.0, 1.0])])
+    data = {"routed_experts": _nested([r0, r1]), "input_ids": input_ids, "loss_mask": loss_mask}
+
+    sanitized = engine._ingest_rollout_routing(data)
+
+    assert sanitized.is_nested and sanitized.values().dtype == torch.int16
+    assert torch.equal(sanitized.offsets().long(), input_ids.offsets().long())
+    values = sanitized.values()
+    assert (values[2] == -1).all() and (values[4] == -1).all()  # zero-filled rows masked
+    assert torch.equal(values[1], r0[1].to(torch.int16))  # expert 0 among others survives
+    assert engine._router_replay_unmappable_frac == pytest.approx(2 / 7)
+    # sample 0 token 2 is unmappable AND loss-carrying -> one-shot warning latched
+    assert engine._warned_unmappable_loss is True
+
+
+def test_engine_ingest_rejects_mismatched_rollout_routing() -> None:
+    # §2.2.4 fail-loudly validation: router count (PP-sliced layouts unsupported),
+    # top-k width, expert-id range, non-jagged layout, and token-span misalignment.
+    input_ids = _nested([torch.arange(3)])
+    good = _nested([torch.tensor([[[1, 2], [3, 4]]] * 3, dtype=torch.uint8)])
+
+    with pytest.raises(ValueError, match=r"L=2.*does not match"):
+        _rollout_ingest_engine(routers=3)._ingest_rollout_routing(
+            {"routed_experts": good, "input_ids": input_ids}
+        )
+    with pytest.raises(ValueError, match=r"K=2.*does not match"):
+        _rollout_ingest_engine(topk=4)._ingest_rollout_routing(
+            {"routed_experts": good, "input_ids": input_ids}
+        )
+    with pytest.raises(ValueError, match="num_experts=4"):
+        _rollout_ingest_engine(num_experts=4)._ingest_rollout_routing(
+            {"routed_experts": good, "input_ids": input_ids}
+        )
+    with pytest.raises(ValueError, match="jagged"):
+        _rollout_ingest_engine()._ingest_rollout_routing(
+            {"routed_experts": torch.zeros(1, 3, 2, 2), "input_ids": input_ids}
+        )
+    with pytest.raises(ValueError, match="token spans"):
+        _rollout_ingest_engine()._ingest_rollout_routing(
+            {
+                "routed_experts": _nested([torch.ones(2, 2, 2, dtype=torch.uint8)]),
+                "input_ids": input_ids,
+            }
+        )
+
+
+def test_loss_hook_reports_unmappable_frac_metric() -> None:
+    # The MinT §6.3 count rides the per-microbatch metrics (reduce_metrics folds it);
+    # outside a rollout-replay pass the key is absent.
+    engine = _engine(engine_config=_engine_config())
+    engine._build_verl_model_output = lambda **_kwargs: {"log_probs": torch.tensor(0.0)}
+    engine.get_data_parallel_group = lambda: None
+    hook = engine._make_runtime_loss_fn(
+        lambda model_output, **_kwargs: (torch.tensor(0.0), {}), 1, output_lst=None
+    )
+
+    _, metrics = hook({}, object(), LossContext(source_batch=object()))
+    assert "router_replay/unmappable_frac" not in metrics
+
+    engine._router_replay_unmappable_frac = 0.25
+    _, metrics = hook({}, object(), LossContext(source_batch=object()))
+    assert metrics["router_replay/unmappable_frac"] == 0.25
 
 
 def test_engine_folds_recorded_routing_to_per_sample_layout() -> None:
