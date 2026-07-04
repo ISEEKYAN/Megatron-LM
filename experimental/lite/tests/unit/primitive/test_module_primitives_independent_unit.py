@@ -179,7 +179,8 @@ def test_r3_router_replay_pins_selection_and_stays_differentiable():
         RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
         _, idx0 = router(x)
         recorded = RouterReplay.get_recorded_data()
-        assert len(recorded) == 1 and torch.equal(recorded[0], idx0)
+        # no cursor advanced: bare-router records land under microbatch key 0
+        assert len(recorded) == 1 and torch.equal(recorded[0][0], idx0)
 
         # perturb the gate (simulates the rollout->train policy drift that causes TIM)
         router.gate.weight.add_(torch.randn_like(router.gate.weight) * 3.0)
@@ -208,13 +209,20 @@ def test_r3_router_replay_pins_selection_and_stays_differentiable():
     s.sum().backward()
     assert router.gate.weight.grad is not None and router.gate.weight.grad.abs().sum() > 0
 
-    # REPLAY_BACKWARD pops one queued tensor per (re)forward — exhaustion must fail loudly.
-    # (clear first: each set_replay_data call above queued one backward entry)
+    # REPLAY_BACKWARD pops one queued tensor per (re)forward — exhaustion must fail
+    # loudly. The FIFO fills at REPLAY time (not set_replay_data time) and only when
+    # the chunk hook armed queue_backward_replays (full recompute re-runs the router).
     RouterReplay.clear_global_indices()
     RouterReplay.set_replay_data([idx0])
-    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+    inst = RouterReplay.global_router_replay_instances[0]
+    inst.queue_backward_replays = True
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
     with torch.no_grad():
-        router(x)  # consumes the single queued entry
+        router(x)  # replayed forward queues exactly one backward entry
+        assert len(inst.replay_backward_list) == 1
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+        _, idx_bwd = router(x)  # the recompute re-forward consumes it
+        assert torch.equal(idx_bwd, idx0)
         with pytest.raises(RuntimeError, match="exhausted"):
             router(x)
 
@@ -224,6 +232,136 @@ def test_r3_router_replay_pins_selection_and_stays_differentiable():
     with torch.no_grad():
         _, idx_off = router(x)
     assert torch.equal(idx_off, idx_noreplay)  # replay fully off after detach
+
+
+def test_r3_router_replay_keys_record_and_replay_by_microbatch(transformer_engine_import_stub):
+    # R3 phase 2 (arXiv:2606.02437 §3, plan WS1): RECORD/REPLAY storage is keyed by the
+    # class-level microbatch cursor so N microbatches per step round-trip correctly;
+    # double-record without cursor advance and missing replay keys fail loudly.
+    transformer_engine_import_stub()
+    from types import SimpleNamespace
+
+    from megatron.lite.primitive.modules.router import (
+        RouterReplay,
+        RouterReplayAction,
+        TopKRouter,
+        attach_router_replay,
+        detach_router_replay,
+    )
+
+    cfg = SimpleNamespace(
+        num_experts_per_tok=2, num_experts=8, router_aux_loss_coef=0.0, hidden_size=16
+    )
+    ps = SimpleNamespace(tp_size=1, tp_group=None)
+    router = TopKRouter(cfg, ps, compute_aux_loss=False)
+    assert attach_router_replay(router) == 1
+    torch.manual_seed(1)
+    x0, x1 = torch.randn(5, 16), torch.randn(5, 16)
+
+    with torch.no_grad():
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        RouterReplay.current_microbatch = 0
+        _, idx_mb0 = router(x0)
+        RouterReplay.current_microbatch = 1
+        _, idx_mb1 = router(x1)
+        recorded = RouterReplay.get_recorded_data()
+        assert set(recorded[0]) == {0, 1}
+        assert torch.equal(recorded[0][0], idx_mb0) and torch.equal(recorded[0][1], idx_mb1)
+        assert not torch.equal(idx_mb0, idx_mb1)  # distinct inputs -> keyed data differs
+
+        # double-record without cursor advance must fail loudly
+        with pytest.raises(RuntimeError, match="already recorded microbatch 1"):
+            router(x1)
+
+        # replay round-trip: get_recorded_data feeds set_replay_data (dict-keyed),
+        # each microbatch replays ITS OWN routing even with swapped lookup order
+        RouterReplay.set_global_router_replay_action(None)
+        RouterReplay.clear_global_indices()
+        RouterReplay.set_replay_data(recorded)
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        RouterReplay.current_microbatch = 1
+        _, idx_r1 = router(x0)  # drifted input, pinned mb1 selection
+        assert torch.equal(idx_r1, idx_mb1)
+        RouterReplay.current_microbatch = 0
+        _, idx_r0 = router(x1)
+        assert torch.equal(idx_r0, idx_mb0)
+
+        # missing microbatch key fails loudly instead of replaying the wrong routing
+        RouterReplay.current_microbatch = 2
+        with pytest.raises(RuntimeError, match="microbatch 2"):
+            router(x0)
+
+    detach_router_replay(router)
+    assert RouterReplay.current_microbatch is None
+
+
+def test_r3_chunk_pre_hook_advances_private_microbatch_schedule(transformer_engine_import_stub):
+    # Plan WS1 §1.2: the engine loads a microbatch schedule; each chunk's forward
+    # pre-hook pops a PRIVATE copy (one chunk forward == one microbatch), so VPP-style
+    # interleaving across chunks stays keyed correctly and over-consumption raises.
+    transformer_engine_import_stub()
+    from types import SimpleNamespace
+
+    from megatron.lite.primitive.modules.router import (
+        RouterReplay,
+        RouterReplayAction,
+        TopKRouter,
+        attach_router_replay,
+        detach_router_replay,
+    )
+
+    cfg = SimpleNamespace(
+        num_experts_per_tok=2, num_experts=8, router_aux_loss_coef=0.0, hidden_size=16
+    )
+    ps = SimpleNamespace(tp_size=1, tp_group=None)
+
+    class TwoRouterChunk(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.r0 = TopKRouter(cfg, ps, compute_aux_loss=False)
+            self.r1 = TopKRouter(cfg, ps, compute_aux_loss=False)
+
+        def forward(self, x):
+            (s0, _), (s1, _) = self.r0(x), self.r1(x)
+            return s0.sum() + s1.sum()
+
+    torch.manual_seed(2)
+    chunk0, chunk1 = TwoRouterChunk(), TwoRouterChunk()
+    # PP/VPP registry order: reset on the first chunk, append on the rest
+    assert attach_router_replay(chunk0, reset=True) == 2
+    assert attach_router_replay(chunk1, reset=False) == 2
+    assert len(RouterReplay.global_router_replay_instances) == 4
+
+    x0, x1 = torch.randn(3, 16), torch.randn(3, 16)
+    with torch.no_grad():
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        RouterReplay.load_microbatch_schedule(range(2))
+        # interleaved chunk order (VPP-style); per chunk the order is monotone 0..N-1
+        chunk0(x0)
+        chunk1(x0)
+        chunk0(x1)
+        chunk1(x1)
+        for per_router in RouterReplay.get_recorded_data():
+            assert set(per_router) == {0, 1}
+
+        # a 5th chunk forward exceeds either chunk's private schedule copy
+        with pytest.raises(RuntimeError, match="schedule exhausted"):
+            chunk0(x0)
+
+        # hook is inert while no action is armed (normal training forwards)
+        RouterReplay.set_global_router_replay_action(None)
+        chunk0(x0)
+
+        # reloading the schedule refreshes the per-chunk copies (next train step)
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        RouterReplay.clear_global_indices()
+        RouterReplay.load_microbatch_schedule(range(2))
+        chunk0(x0)
+        assert RouterReplay.current_microbatch == 0
+
+    detach_router_replay(chunk0)
+    detach_router_replay(chunk1)
+    assert RouterReplay.microbatch_schedule is None
 
 
 def test_linear_lora_forward_backward_matches_low_rank_delta():

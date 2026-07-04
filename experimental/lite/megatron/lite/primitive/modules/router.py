@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Iterable
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -36,7 +38,11 @@ class RouterReplay:
     Architecture follows upstream mlite PR#49 / verl ``router_replay_patch``:
     one instance per MoE router, registered in ``global_router_replay_instances``
     in attach order so the runtime can address per-layer routing tensors
-    positionally, with global set-data/set-action fan-out.
+    positionally, with global set-data/set-action fan-out. Record/replay storage
+    is keyed by microbatch index (upstream reference: verl
+    ``router_replay_utils.set_router_replay_data`` feeds one microbatch at a
+    time); the cursor advances via the chunk forward pre-hook, so keyed lookups
+    fail loudly on schedule/order bugs instead of replaying the wrong microbatch.
 
     Score semantics deliberately follow the verl/slime reference, NOT upstream
     PR#49's ``apply(probs_dense, ...)``: the reference gathers replayed scores
@@ -52,9 +58,24 @@ class RouterReplay:
 
     global_router_replay_instances: list["RouterReplay"] = []
 
+    # ── class-level microbatch cursor (fanned out globally) ──
+    # RECORD/REPLAY storage is keyed by microbatch index so N microbatches per
+    # optimizer step record and replay correctly. The router cannot know the
+    # microbatch index; the chunk forward pre-hook (attach_router_replay) pops it
+    # from a per-chunk copy of ``microbatch_schedule`` — one chunk forward == one
+    # microbatch, monotone 0..N-1 per chunk under mlite's schedules (incl. 1F1B).
+    current_microbatch: int | None = None
+    microbatch_schedule: list[int] | None = None
+    _schedule_generation: int = 0
+
     # ── global controls (one call fans out to every layer) ──
     @staticmethod
-    def set_replay_data(all_layers_topk_indices: list[torch.Tensor]) -> None:
+    def set_replay_data(
+        all_layers_topk_indices: list[torch.Tensor | dict[int, torch.Tensor]],
+    ) -> None:
+        """Set per-layer replay targets: a plain tensor pins microbatch 0
+        (single-microbatch compat), a dict keys targets by microbatch index —
+        symmetric with :meth:`get_recorded_data`."""
         instances = RouterReplay.global_router_replay_instances
         if len(all_layers_topk_indices) != len(instances):
             raise ValueError(
@@ -65,7 +86,20 @@ class RouterReplay:
             inst.set_target_indices(idx)
 
     @staticmethod
-    def get_recorded_data() -> list[torch.Tensor | None]:
+    def set_replay_data_for_microbatch(
+        microbatch_idx: int, all_layers_topk_indices: list[torch.Tensor]
+    ) -> None:
+        instances = RouterReplay.global_router_replay_instances
+        if len(all_layers_topk_indices) != len(instances):
+            raise ValueError(
+                f"router replay expects {len(instances)} per-layer tensors, "
+                f"got {len(all_layers_topk_indices)}."
+            )
+        for inst, idx in zip(instances, all_layers_topk_indices, strict=True):
+            inst.targets_by_mb[microbatch_idx] = idx
+
+    @staticmethod
+    def get_recorded_data() -> list[dict[int, torch.Tensor]]:
         return [
             inst.get_recorded_indices() for inst in RouterReplay.global_router_replay_instances
         ]
@@ -84,25 +118,52 @@ class RouterReplay:
     def clear_global_router_replay_instances() -> None:
         RouterReplay.global_router_replay_instances.clear()
 
+    @staticmethod
+    def load_microbatch_schedule(schedule: Iterable[int]) -> None:
+        """Load the microbatch-index schedule one forward_backward will consume.
+
+        Each attached chunk's forward pre-hook pops a private copy in order, so
+        multi-chunk (VPP) interleaving stays correct; a stale per-chunk copy is
+        refreshed via the generation counter on the next load."""
+        RouterReplay.microbatch_schedule = list(schedule)
+        RouterReplay._schedule_generation += 1
+        RouterReplay.current_microbatch = None
+
+    @staticmethod
+    def clear_microbatch_schedule() -> None:
+        RouterReplay.microbatch_schedule = None
+        RouterReplay._schedule_generation += 1
+        RouterReplay.current_microbatch = None
+
+    @staticmethod
+    def _resolved_microbatch() -> int:
+        # No cursor (bare router / single-microbatch legacy callers) == microbatch 0.
+        mb = RouterReplay.current_microbatch
+        return 0 if mb is None else mb
+
     # ── per-instance state ──
     def __init__(self) -> None:
-        self.target_topk_idx: torch.Tensor | None = None
-        self.recorded_topk_idx: torch.Tensor | None = None
+        self.targets_by_mb: dict[int, torch.Tensor] = {}
+        self.recorded_by_mb: dict[int, torch.Tensor] = {}
         self.router_replay_action: RouterReplayAction | None = None
         self.replay_backward_list: list[torch.Tensor] = []
+        # Armed per chunk-forward when full recompute will re-run this router in
+        # backward: each replayed forward then queues its target for the recompute.
+        self.queue_backward_replays: bool = False
         RouterReplay.global_router_replay_instances.append(self)
 
-    def set_target_indices(self, topk_indices: torch.Tensor) -> None:
-        self.target_topk_idx = topk_indices
-        # Each replayed forward (incl. the backward recompute) pops one entry, in order.
-        self.replay_backward_list.append(topk_indices)
+    def set_target_indices(self, topk_indices: torch.Tensor | dict[int, torch.Tensor]) -> None:
+        if isinstance(topk_indices, dict):
+            self.targets_by_mb = dict(topk_indices)
+        else:
+            self.targets_by_mb = {0: topk_indices}
 
-    def get_recorded_indices(self) -> torch.Tensor | None:
-        return self.recorded_topk_idx
+    def get_recorded_indices(self) -> dict[int, torch.Tensor]:
+        return dict(self.recorded_by_mb)
 
     def clear_indices(self) -> None:
-        self.recorded_topk_idx = None
-        self.target_topk_idx = None
+        self.recorded_by_mb = {}
+        self.targets_by_mb = {}
         self.replay_backward_list = []
 
     def apply_from_logits(
@@ -123,12 +184,27 @@ class RouterReplay:
         if action is None:
             return topk_scores, topk_indices
         if action == RouterReplayAction.RECORD:
-            self.recorded_topk_idx = topk_indices
+            mb = RouterReplay._resolved_microbatch()
+            if mb in self.recorded_by_mb:
+                raise RuntimeError(
+                    f"router replay already recorded microbatch {mb}; advance the "
+                    "microbatch cursor (or clear) before recording again."
+                )
+            self.recorded_by_mb[mb] = topk_indices
             return topk_scores, topk_indices
         if action == RouterReplayAction.REPLAY_FORWARD:
-            target = self.target_topk_idx
+            mb = RouterReplay._resolved_microbatch()
+            target = self.targets_by_mb.get(mb)
             if target is None:
-                raise RuntimeError("router replay is in replay mode but no target indices were set.")
+                raise RuntimeError(
+                    "router replay is in replay mode but no target indices were set "
+                    f"for microbatch {mb}."
+                )
+            if self.queue_backward_replays:
+                # Full-recompute backwards re-run this forward and drain the FIFO in
+                # forward order (append here, not in set_target_indices, so FIFO
+                # order == actual replayed-forward order).
+                self.replay_backward_list.append(target)
         elif action == RouterReplayAction.REPLAY_BACKWARD:
             if not self.replay_backward_list:
                 raise RuntimeError(
@@ -160,22 +236,55 @@ def attach_router_replay(model: nn.Module, *, reset: bool = True) -> int:
     changes needed. ``reset=False`` appends to the existing registry so a
     multi-chunk (PP/VPP) model can attach chunk-by-chunk in global layer order.
     Returns the attached router count.
+
+    Also registers a forward pre-hook on ``model`` (the chunk root): one chunk
+    forward == one microbatch, so the hook advances the class-level microbatch
+    cursor from this chunk's private copy of ``RouterReplay.microbatch_schedule``.
+    Recompute re-forwards bypass ``Module.__call__`` on the chunk (checkpointing
+    calls the saved function directly), so the hook never refires under recompute.
     """
     if reset:
         RouterReplay.clear_global_router_replay_instances()
-    count = 0
+    for handle in getattr(model, "_router_replay_hook_handles", ()):
+        handle.remove()
+    chunk_replays: list[RouterReplay] = []
     for module in model.modules():
         if _is_replay_capable_router(module):
             module.router_replay = RouterReplay()
-            count += 1
-    return count
+            chunk_replays.append(module.router_replay)
+
+    cursor_state: dict = {"generation": None, "queue": None}
+
+    def _chunk_pre_hook(module, args) -> None:
+        if all(replay.router_replay_action is None for replay in chunk_replays):
+            return
+        if cursor_state["generation"] != RouterReplay._schedule_generation:
+            template = RouterReplay.microbatch_schedule
+            cursor_state["queue"] = None if template is None else deque(template)
+            cursor_state["generation"] = RouterReplay._schedule_generation
+        if cursor_state["queue"] is None:
+            return  # no schedule loaded: single-microbatch (key 0) semantics
+        if not cursor_state["queue"]:
+            raise RuntimeError(
+                "router replay microbatch schedule exhausted: more chunk forwards "
+                "than scheduled microbatches."
+            )
+        RouterReplay.current_microbatch = cursor_state["queue"].popleft()
+
+    model._router_replay_hook_handles = [model.register_forward_pre_hook(_chunk_pre_hook)]
+    return len(chunk_replays)
 
 
 def detach_router_replay(model: nn.Module) -> None:
+    for handle in getattr(model, "_router_replay_hook_handles", ()):
+        handle.remove()
+    if hasattr(model, "_router_replay_hook_handles"):
+        del model._router_replay_hook_handles
     for module in model.modules():
         if _is_replay_capable_router(module):
             module.router_replay = None
     RouterReplay.clear_global_router_replay_instances()
+    RouterReplay.clear_microbatch_schedule()
 
 
 def _ordered_topk_from_routing_map(
