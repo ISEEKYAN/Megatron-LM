@@ -4,7 +4,10 @@
 Record routing on a forward-only pass, drift the gates (the rollout->train policy
 drift that causes TIM), then replay the recorded routing during training forwards:
 the sparse path is pinned, losses are deterministic, and detach fully restores
-normal routing. Single GPU; exercises MoELayer/dispatcher, not just the bare router.
+normal routing. Phase 2: two microbatches per forward_backward, keyed by the
+chunk-hook cursor — each microbatch replays ITS OWN routing and swapped keys
+provably change the result. Single GPU; exercises MoELayer/dispatcher, not just
+the bare router.
 """
 from __future__ import annotations
 
@@ -107,21 +110,27 @@ def _build_handle() -> tuple[ModelHandle, object]:
     return handle, model_cfg
 
 
-def _batch(vocab_size: int) -> PackedBatch:
+def _batches(vocab_size: int) -> list[PackedBatch]:
     torch.manual_seed(1357)
-    return PackedBatch(
-        input_ids=torch.randint(0, vocab_size, (8,), device="cuda"),
-        labels=torch.randint(0, vocab_size, (8,), device="cuda"),
-        seq_lens=torch.full((2,), 4, dtype=torch.int64, device="cuda"),
-    )
+    return [
+        PackedBatch(
+            input_ids=torch.randint(0, vocab_size, (8,), device="cuda"),
+            labels=torch.randint(0, vocab_size, (8,), device="cuda"),
+            seq_lens=torch.full((2,), 4, dtype=torch.int64, device="cuda"),
+        )
+        for _ in range(2)  # sequential draws: distinct data per microbatch
+    ]
 
 
-def _forward_loss(runtime: MegatronLiteRuntime, handle: ModelHandle, batch: PackedBatch) -> float:
+def _forward_loss(
+    runtime: MegatronLiteRuntime, handle: ModelHandle, batches: list[PackedBatch]
+) -> float:
     result = runtime.forward_backward(
-        handle, iter([batch]), None, num_microbatches=1, forward_only=True
+        handle, iter(batches), None, num_microbatches=len(batches), forward_only=True
     )
     # post-#68 contract: loss is optional in metrics; the canonical scalar lives on
-    # model_output.loss (None only when the model computes no loss, e.g. no labels).
+    # model_output.loss (None only when the model computes no loss, e.g. no labels;
+    # with several microbatches it is the LAST one's loss — determinism still holds).
     loss = result.model_output.loss
     assert loss is not None, "labels were provided; forward-only must surface a loss"
     return float(loss.detach().item()) if hasattr(loss, "detach") else float(loss)
@@ -141,7 +150,7 @@ def test_router_replay_record_then_replay_closed_loop():
     set_deterministic(2026)
     handle, model_cfg = _build_handle()
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
-    batch = _batch(model_cfg.vocab_size)
+    batches = _batches(model_cfg.vocab_size)
 
     # attach chunk-by-chunk preserving global layer order (reset only on the first)
     chunks = handle._extras["model_chunks"]
@@ -150,35 +159,57 @@ def test_router_replay_record_then_replay_closed_loop():
         count += attach_router_replay(chunk, reset=(i == 0))
     assert count == model_cfg.num_hidden_layers  # one router per MoE layer
 
-    # 1) RECORD on a forward-only pass (the "rollout" stand-in)
+    # 1) RECORD on a forward-only pass (the "rollout" stand-in); the chunk-hook
+    # cursor keys each microbatch's routing under its schedule index
     RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
-    loss_rollout = _forward_loss(runtime, handle, batch)
+    RouterReplay.load_microbatch_schedule(range(len(batches)))
+    loss_rollout = _forward_loss(runtime, handle, batches)
     recorded = RouterReplay.get_recorded_data()
-    assert len(recorded) == count and all(r is not None for r in recorded)
-    assert all(r.shape[-1] == model_cfg.num_experts_per_tok for r in recorded)
+    assert len(recorded) == count
+    assert all(set(r) == {0, 1} for r in recorded)
+    assert all(
+        t.shape[-1] == model_cfg.num_experts_per_tok for r in recorded for t in r.values()
+    )
+    # distinct microbatch data routes distinctly, so the keying is load-bearing
+    assert any(not torch.equal(r[0], r[1]) for r in recorded)
 
-    # 2) drift every gate (rollout->train mismatch); routing must actually flip
+    # 2) drift every gate (rollout->train mismatch); routing must actually flip.
+    # Re-recording needs a clear (double-record fails loudly) and a fresh schedule.
     with torch.no_grad():
         for chunk in chunks:
             for name, param in chunk.named_parameters():
                 if "gate.weight" in name and param.shape[-1] == model_cfg.hidden_size:
                     param.add_(torch.randn_like(param) * 3.0)
-    loss_drift = _forward_loss(runtime, handle, batch)  # RECORD still armed: re-records
+    RouterReplay.clear_global_indices()
+    RouterReplay.load_microbatch_schedule(range(len(batches)))
+    loss_drift = _forward_loss(runtime, handle, batches)
     drifted = RouterReplay.get_recorded_data()
-    assert any(not torch.equal(a, b) for a, b in zip(recorded, drifted, strict=True))
+    assert any(
+        not torch.equal(a[mb], b[mb])
+        for a, b in zip(recorded, drifted, strict=True)
+        for mb in (0, 1)
+    )
 
-    # 3) replay the ORIGINAL rollout routing on the drifted model
+    # 3) replay the ORIGINAL rollout routing on the drifted model, per microbatch
     RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
     RouterReplay.set_replay_data(list(recorded))
-    loss_replay_1 = _forward_loss(runtime, handle, batch)
-    RouterReplay.set_replay_data(list(recorded))
-    loss_replay_2 = _forward_loss(runtime, handle, batch)
+    RouterReplay.load_microbatch_schedule(range(len(batches)))
+    loss_replay_1 = _forward_loss(runtime, handle, batches)
+    RouterReplay.load_microbatch_schedule(range(len(batches)))
+    loss_replay_2 = _forward_loss(runtime, handle, batches)
     assert loss_replay_1 == loss_replay_2  # deterministic under pinned routing
     assert loss_replay_1 != loss_drift  # pinned sparse path != drifted free routing
+
+    # 3b) swapping the microbatch keys replays the WRONG routing per microbatch —
+    # proof the replay is keyed, not just fanned out batch-wide
+    RouterReplay.set_replay_data([{0: r[1], 1: r[0]} for r in recorded])
+    RouterReplay.load_microbatch_schedule(range(len(batches)))
+    loss_swapped = _forward_loss(runtime, handle, batches)
+    assert loss_swapped != loss_replay_1
 
     # 4) detach restores normal routing exactly
     for chunk in chunks:
         detach_router_replay(chunk)
     assert RouterReplay.global_router_replay_instances == []
-    loss_detached = _forward_loss(runtime, handle, batch)
+    loss_detached = _forward_loss(runtime, handle, batches)
     assert loss_detached == loss_drift
