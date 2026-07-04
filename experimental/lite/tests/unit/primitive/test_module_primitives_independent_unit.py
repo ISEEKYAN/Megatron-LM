@@ -242,6 +242,59 @@ def test_r3_router_replay_pins_selection_and_stays_differentiable():
     assert torch.equal(idx_off, idx_noreplay)  # replay fully off after detach
 
 
+def test_r3_router_replay_sentinel_tokens_fall_back_to_live_routing():
+    # MinT §6.3 (arXiv:2605.13779, plan WS2 §2.3): sentinel -1 marks tokens whose
+    # rollout routes cannot be mapped to this batch — replay must keep their FRESH
+    # selection AND scores (live routing, bitwise vs no replay) while mapped tokens
+    # in the same pass still pin to the recorded indices. Never silently wrong:
+    # zero-filled rows would otherwise replay as expert 0.
+    from types import SimpleNamespace
+
+    from megatron.lite.primitive.modules.router import (
+        RouterReplay,
+        RouterReplayAction,
+        TopKRouter,
+        attach_router_replay,
+        detach_router_replay,
+    )
+
+    cfg = SimpleNamespace(
+        num_experts_per_tok=2, num_experts=8, router_aux_loss_coef=0.0, hidden_size=16
+    )
+    ps = SimpleNamespace(tp_size=1, tp_group=None)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    router = TopKRouter(cfg, ps, compute_aux_loss=False).to(device)
+    assert attach_router_replay(router) == 1
+    torch.manual_seed(3)
+    x = torch.randn(5, 16, device=device)
+
+    with torch.no_grad():
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        _, idx0 = router(x)
+        # drift the gate so fresh routing provably departs from the record
+        router.gate.weight.add_(torch.randn_like(router.gate.weight) * 3.0)
+        RouterReplay.set_global_router_replay_action(None)
+        fresh_scores, fresh_idx = router(x)
+        assert not torch.equal(fresh_idx, idx0)
+
+        # int16-safe sentinel rows (ingest dtype) on tokens 1 and 3
+        target = idx0.clone().to(torch.int16)
+        target[1] = -1
+        target[3] = -1
+        RouterReplay.clear_global_indices()
+        RouterReplay.set_replay_data([target])
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        scores_r, idx_r = router(x)
+
+    mapped = torch.tensor([True, False, True, False, True], device=device)
+    assert torch.equal(idx_r[mapped], idx0[mapped])  # mapped: pinned despite drift
+    assert torch.equal(idx_r[~mapped], fresh_idx[~mapped])  # unmappable: live routing
+    assert torch.equal(scores_r[~mapped], fresh_scores[~mapped])  # bitwise fresh scores
+    assert scores_r[mapped].min() > 0  # replayed experts keep live nonzero scores
+
+    detach_router_replay(router)
+
+
 def test_r3_router_replay_keys_record_and_replay_by_microbatch(transformer_engine_import_stub):
     # R3 phase 2 (arXiv:2606.02437 §3, plan WS1): RECORD/REPLAY storage is keyed by the
     # class-level microbatch cursor so N microbatches per step round-trip correctly;

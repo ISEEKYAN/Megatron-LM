@@ -207,6 +207,15 @@ def test_router_replay_record_then_replay_closed_loop():
     loss_swapped = _forward_loss(runtime, handle, batches)
     assert loss_swapped != loss_replay_1
 
+    # 3c) MinT §6.3 sentinel: fully-unmappable targets (-1) fall back to live routing
+    # through the real MoE dispatcher — bitwise identical to not replaying at all
+    RouterReplay.set_replay_data(
+        [{mb: torch.full_like(r[mb], -1) for mb in (0, 1)} for r in recorded]
+    )
+    RouterReplay.load_microbatch_schedule(range(len(batches)))
+    loss_sentinel = _forward_loss(runtime, handle, batches)
+    assert loss_sentinel == loss_drift
+
     # 4) detach restores normal routing exactly
     for chunk in chunks:
         detach_router_replay(chunk)

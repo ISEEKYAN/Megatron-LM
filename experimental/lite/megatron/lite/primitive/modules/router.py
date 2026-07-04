@@ -227,11 +227,18 @@ class RouterReplay:
         else:  # pragma: no cover - enum is closed
             return topk_scores, topk_indices
         target = target.to(device=logits.device).long().view(logits.size(0), topk_indices.size(-1))
+        # MinT §6.3 (arXiv:2605.13779): sentinel -1 marks tokens whose rollout routes
+        # could not be mapped to this batch (zero-filled capture gaps, re-tokenized
+        # spans). They keep the FRESH selection and scores — live routing — instead
+        # of replaying a silently wrong route (0 is a valid expert id).
+        valid = target.ge(0).all(dim=-1, keepdim=True)
+        target = torch.where(valid, target, topk_indices)
         logits_f = logits.float()
         if use_pre_softmax:
             probs = torch.softmax(logits_f, dim=-1).gather(1, target)
         else:
             probs = torch.softmax(logits_f.gather(1, target), dim=-1)
+        probs = torch.where(valid, probs, topk_scores.float())
         return probs.to(topk_scores.dtype), target
 
 
