@@ -146,6 +146,36 @@ def normalize_delta_mem_config(
     return DeltaMemConfig(**values)
 
 
+def apply_delta_mem_base_slice_init(model: nn.Module) -> dict[str, int]:
+    """Apply the released-model ``base_slice_fixed`` Δ-head init to every
+    ``DeltaMemory`` under ``model`` (post-load hook, like OLoRA-tail init).
+
+    Pairs each adapter with its frozen base weights by the mlite attribute
+    convention: the owning attention module exposes a fused ``qkv`` linear
+    (query rows first), a ``proj`` linear, and ``q_size``.
+    """
+    count = 0
+    for module in model.modules():
+        adapter = getattr(module, "delta_mem", None)
+        if not isinstance(adapter, DeltaMemory):
+            continue
+        if adapter.config.output_init != "base_slice_fixed":
+            continue
+        qkv = getattr(module, "qkv", None)
+        proj = getattr(module, "proj", None)
+        q_size = getattr(module, "q_size", None)
+        if qkv is None or proj is None or q_size is None:
+            raise ValueError(
+                "delta_mem base_slice init: the module owning `delta_mem` must "
+                "expose fused `qkv` (query rows first), `proj`, and `q_size`."
+            )
+        qkv_weight = qkv.weight if hasattr(qkv, "weight") else qkv.linear.weight
+        proj_weight = proj.weight if hasattr(proj, "weight") else proj.linear.weight
+        adapter.base_slice_init_(qkv_weight[:q_size], proj_weight)
+        count += 1
+    return {"delta_mem_base_slice_inits": count}
+
+
 class DeltaMemory(nn.Module):
     """The δ-mem state module for one attention layer (all heads share one state).
 

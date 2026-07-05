@@ -153,7 +153,11 @@ def freeze_non_lora_params(model: nn.Module) -> dict[str, int]:
     frozen_tensors = 0
     frozen_numel = 0
     for name, param in model.named_parameters():
-        if "lora" in name.lower() or "adapter" in name.lower():
+        if (
+            "lora" in name.lower()
+            or "adapter" in name.lower()
+            or "delta_mem" in name.lower()
+        ):
             param.requires_grad_(True)
             lora_tensors += 1
             lora_numel += param.numel()

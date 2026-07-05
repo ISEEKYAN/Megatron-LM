@@ -17,6 +17,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.lite.model.qwen2.config import Qwen2Config
+from megatron.lite.primitive.modules.delta_mem import (
+    DeltaMemConfig,
+    DeltaMemory,
+    normalize_delta_mem_config,
+)
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
 from megatron.lite.primitive.parallel import ParallelState
@@ -36,6 +41,20 @@ def _targets_any_lora(lora: LoraConfig, *names: str) -> bool:
     return lora.enabled and any(lora.targets_module(name) for name in names)
 
 
+def _normalize_delta_mem(
+    config: DeltaMemConfig | Mapping[str, Any] | None,
+) -> DeltaMemConfig:
+    # Convert non-dict Mappings (e.g. OmegaConf DictConfig) before the strict
+    # primitive normalizer — the isinstance(dict) trap bit us once (9b9da6d34).
+    if (
+        config is not None
+        and not isinstance(config, (DeltaMemConfig, dict))
+        and isinstance(config, Mapping)
+    ):
+        config = dict(config)
+    return normalize_delta_mem_config(config)
+
+
 def _temperature_to_float(temperature: float | torch.Tensor) -> float:
     if isinstance(temperature, torch.Tensor):
         if temperature.numel() != 1:
@@ -50,6 +69,7 @@ class Qwen2Attention(nn.Module):
         config: Qwen2Config,
         *,
         lora_config: LoraConfig | Mapping[str, Any] | None = None,
+        delta_mem_config: DeltaMemConfig | Mapping[str, Any] | None = None,
     ):
         super().__init__()
         self.config = config
@@ -96,12 +116,35 @@ class Qwen2Attention(nn.Module):
                 use_rslora=lora.use_rslora,
             )
 
+        delta_mem = _normalize_delta_mem(delta_mem_config)
+        self.delta_mem: DeltaMemory | None = None
+        if delta_mem.enabled:
+            self.delta_mem = DeltaMemory(
+                config.hidden_size,
+                self.q_size,
+                config.hidden_size,
+                delta_mem,
+            )
+
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor | None = None) -> torch.Tensor:
         # x: [S, B, H]
         qkv = self.qkv(x)
         if self.qkv_lora is not None:
             qkv = qkv + self.qkv_lora(x)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+        delta_o = None
+        if self.delta_mem is not None:
+            # v1 training wiring = full-sequence steering: a fresh zero state per
+            # forward, per layer (the reference's non-default "dialogue" mode).
+            # Packed rows are NOT supported — the recurrent state would leak
+            # across documents packed into one row; feed padded batches.
+            x_bth = x.transpose(0, 1)
+            state = self.delta_mem.init_state(x.size(1), device=x.device, dtype=x.dtype)
+            delta_q, delta_o, _ = self.delta_mem(x_bth, state)
+            if delta_q is not None:
+                # Reference injection point: the RAW q-projection output, before
+                # head reshape and RoPE (delta_impl.py:1849-1869).
+                q = q + delta_q.transpose(0, 1)
         seq_len, batch_size, _ = x.shape
         q = q.view(seq_len, batch_size, self.num_attention_heads, self.head_dim)
         k = k.view(seq_len, batch_size, self.num_key_value_heads, self.head_dim)
@@ -121,6 +164,8 @@ class Qwen2Attention(nn.Module):
         out = self.proj(attn)
         if self.proj_lora is not None:
             out = out + self.proj_lora(attn)
+        if delta_o is not None:
+            out = out + delta_o.transpose(0, 1)
         return out
 
     def _apply_rope(
@@ -201,10 +246,13 @@ class Qwen2DecoderLayer(nn.Module):
         config: Qwen2Config,
         *,
         lora_config: LoraConfig | Mapping[str, Any] | None = None,
+        delta_mem_config: DeltaMemConfig | Mapping[str, Any] | None = None,
     ):
         super().__init__()
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = Qwen2Attention(config, lora_config=lora_config)
+        self.self_attn = Qwen2Attention(
+            config, lora_config=lora_config, delta_mem_config=delta_mem_config
+        )
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = Qwen2MLP(config, lora_config=lora_config)
 
@@ -221,6 +269,7 @@ class Qwen2Model(nn.Module):
         ps: ParallelState | None = None,
         *,
         lora_config: LoraConfig | Mapping[str, Any] | None = None,
+        delta_mem_config: DeltaMemConfig | Mapping[str, Any] | None = None,
     ):
         super().__init__()
         self.config = config
@@ -228,7 +277,9 @@ class Qwen2Model(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [
-                Qwen2DecoderLayer(config, lora_config=lora_config)
+                Qwen2DecoderLayer(
+                    config, lora_config=lora_config, delta_mem_config=delta_mem_config
+                )
                 for _ in range(config.num_hidden_layers)
             ]
         )
@@ -252,11 +303,14 @@ class Qwen2ForCausalLM(nn.Module):
         ps: ParallelState | None = None,
         *,
         lora_config: LoraConfig | Mapping[str, Any] | None = None,
+        delta_mem_config: DeltaMemConfig | Mapping[str, Any] | None = None,
     ):
         super().__init__()
         self.config = config
         self.ps = ps or ParallelState()
-        self.model = Qwen2Model(config, self.ps, lora_config=lora_config)
+        self.model = Qwen2Model(
+            config, self.ps, lora_config=lora_config, delta_mem_config=delta_mem_config
+        )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(

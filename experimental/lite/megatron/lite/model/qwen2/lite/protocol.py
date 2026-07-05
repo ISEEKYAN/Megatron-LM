@@ -24,6 +24,11 @@ from megatron.lite.model.protocol_utils import add_loss_context_kwargs
 from megatron.lite.model.qwen2.config import Qwen2Config
 from megatron.lite.model.qwen2.lite.model import Qwen2ForCausalLM
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.modules.delta_mem import (
+    DeltaMemConfig,
+    apply_delta_mem_base_slice_init,
+    normalize_delta_mem_config,
+)
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     freeze_non_lora_params,
@@ -61,6 +66,7 @@ class ImplConfig:
     deterministic: bool = True
     lora: LoraConfig | Mapping[str, Any] | None = None
     lora_init: bool | str | None = None
+    delta_mem: DeltaMemConfig | Mapping[str, Any] | None = None
 
 
 def build_model_config(source: str | Path | dict, **overrides) -> Qwen2Config:
@@ -245,15 +251,25 @@ def build_model(model_cfg: Qwen2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
             raise NotImplementedError("Qwen2 lora_init='olora_tail' currently supports etp=1.")
         if impl_cfg.parallel.cp != 1:
             raise NotImplementedError("Qwen2 lora_init='olora_tail' currently supports cp=1.")
+    raw_delta_mem = impl_cfg.delta_mem
+    if (
+        raw_delta_mem is not None
+        and not isinstance(raw_delta_mem, (DeltaMemConfig, dict))
+        and isinstance(raw_delta_mem, Mapping)
+    ):
+        raw_delta_mem = dict(raw_delta_mem)  # OmegaConf DictConfig etc. (9b9da6d34 lesson)
+    delta_mem_config = normalize_delta_mem_config(raw_delta_mem)
     ps = _parallel_state(impl_cfg.parallel)
-    model = Qwen2ForCausalLM(model_cfg, ps, lora_config=lora_config)
+    model = Qwen2ForCausalLM(
+        model_cfg, ps, lora_config=lora_config, delta_mem_config=delta_mem_config
+    )
     chunks = [model]
     if impl_cfg.optimizer == "dist_opt" and torch.cuda.is_available():
         model = model.to(torch.bfloat16).cuda()
         chunks[0] = model
 
     lora_stats = None
-    if lora_config.enabled:
+    if lora_config.enabled or delta_mem_config.enabled:
         freeze_stats = freeze_non_lora_params(model)
         trainable_stats = trainable_param_stats(model)
         lora_stats = {"chunks": [{**freeze_stats, **trainable_stats}]}
@@ -264,16 +280,30 @@ def build_model(model_cfg: Qwen2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
             "dist_opt captures its master param buffer at build time, before weights "
             "load, so a post-load OLoRA init would desync master and model params."
         )
+    needs_delta_mem_init = (
+        delta_mem_config.enabled and delta_mem_config.output_init == "base_slice_fixed"
+    )
+    if needs_delta_mem_init and impl_cfg.optimizer == "dist_opt":
+        raise ValueError(
+            "Qwen2 delta_mem output_init='base_slice_fixed' requires the fsdp2 "
+            "optimizer (or none): the post-load Δ-head init would desync dist_opt's "
+            "master params, same failure mode as OLoRA-tail."
+        )
 
     post_model_load_hook = None
-    if lora_init in ("olora_tail", "olora") and impl_cfg.optimizer != "fsdp2":
+    if (
+        lora_init in ("olora_tail", "olora") or needs_delta_mem_init
+    ) and impl_cfg.optimizer != "fsdp2":
 
         def _post_model_load_hook():
-            return {
-                "extras": {
-                    "lora_init_result": initialize_lora_olora_tail([model], model_cfg, ps, kind=lora_init)
-                }
-            }
+            extras: dict[str, Any] = {}
+            if lora_init in ("olora_tail", "olora"):
+                extras["lora_init_result"] = initialize_lora_olora_tail(
+                    [model], model_cfg, ps, kind=lora_init
+                )
+            if needs_delta_mem_init:
+                extras["delta_mem_init_result"] = apply_delta_mem_base_slice_init(model)
+            return {"extras": extras}
 
         post_model_load_hook = _post_model_load_hook
 
@@ -303,6 +333,9 @@ def build_model(model_cfg: Qwen2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
             # OLoRA-initialized params (and the residual-shifted base weights).
             if lora_init in ("olora_tail", "olora"):
                 extras["lora_init_result"] = initialize_lora_olora_tail([model], model_cfg, ps, kind=lora_init)
+            # Same ordering constraint for the δ-mem base-slice Δ-head init.
+            if needs_delta_mem_init:
+                extras["delta_mem_init_result"] = apply_delta_mem_base_slice_init(model)
             return {
                 "optimizer": build_fsdp2_training_optimizer(
                     chunks,
