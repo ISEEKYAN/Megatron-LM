@@ -696,6 +696,25 @@ class GroupedLinearLoRA(nn.Module):
             offset += size
         return torch.cat(outputs, dim=0) if outputs else x.new_empty((0, self.lora_b.shape[1]))
 
+    def materialized_delta_weight(self, expert_idx: int) -> torch.Tensor:
+        """Effective weight delta ``scale * B_e @ A_e`` for one LOCAL expert.
+
+        Used to merge expert LoRA into exported base weights (rollout weight
+        sync). Rejects dropout for the same reason as ``LinearLoRA``.
+        """
+        if self.dropout_p:
+            raise NotImplementedError(
+                "materialized_delta_weight requires dropout=0 (a static delta cannot "
+                "represent dropout's stochastic forward)."
+            )
+        a, b = self.lora_a, self.lora_b
+        # fsdp2 shards params as DTensors; full_tensor() is a symmetric collective.
+        if hasattr(a, "full_tensor"):
+            a = a.full_tensor()
+        if hasattr(b, "full_tensor"):
+            b = b.full_tensor()
+        return (b[expert_idx] @ a[expert_idx]) * self.scale
+
 
 class SharedGroupedLinearLoRA(nn.Module):
     """LoRA delta shared by all local experts in a GroupedLinear."""
@@ -734,6 +753,20 @@ class SharedGroupedLinearLoRA(nn.Module):
             )
         dropped = F.dropout(x, p=self.dropout_p, training=self.training) if self.dropout_p else x
         return dropped.matmul(self.lora_a.t()).matmul(self.lora_b.t()) * self.scale
+
+    def materialized_delta_weight(self, expert_idx: int = 0) -> torch.Tensor:
+        """The SHARED delta ``scale * B @ A`` — identical for every local expert."""
+        if self.dropout_p:
+            raise NotImplementedError(
+                "materialized_delta_weight requires dropout=0 (a static delta cannot "
+                "represent dropout's stochastic forward)."
+            )
+        a, b = self.lora_a, self.lora_b
+        if hasattr(a, "full_tensor"):
+            a = a.full_tensor()
+        if hasattr(b, "full_tensor"):
+            b = b.full_tensor()
+        return (b @ a) * self.scale
 
     @torch.no_grad()
     def olora_tail_init_(self, expert_weights: list[torch.Tensor]) -> None:
