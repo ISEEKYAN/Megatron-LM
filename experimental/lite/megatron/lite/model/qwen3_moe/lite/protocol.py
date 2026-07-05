@@ -305,8 +305,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             "pre_forward_hook": _pre_forward_hook,
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
-            "lora_config": lora_config,
+            "lora_spec": lora_spec,
             "lora_stats": lora_stats,
+            "olora_hook": olora_hook,
         },
     )
 

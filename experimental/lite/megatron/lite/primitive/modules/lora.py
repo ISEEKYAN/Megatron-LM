@@ -483,7 +483,21 @@ class LinearLoRA(nn.Module):
     def materialized_delta_weight(self) -> torch.Tensor:
         if self.dropout_p != 0.0:
             raise ValueError("materialized_delta_weight requires dropout=0.")
-        return (self.lora_b @ self.lora_a) * self.scale
+        lora_a = self.lora_a
+        lora_b = self.lora_b
+        if hasattr(lora_a, "full_tensor"):
+            lora_a = lora_a.full_tensor()
+        if hasattr(lora_b, "full_tensor"):
+            lora_b = lora_b.full_tensor()
+        if self.rank_partitioned_a:
+            lora_a = _all_gather_last_dim_forward(
+                lora_a.t(), self.tp_group, self.rank_partition_size
+            ).t()
+        if self.output_partitioned_b:
+            lora_b = _all_gather_last_dim_forward(
+                lora_b.t(), self.tp_group, self.output_partition_size
+            ).t()
+        return (lora_b @ lora_a) * self.scale
 
     def olora_tail_init_(self, base_weight: torch.Tensor) -> None:
         with torch.no_grad():
@@ -533,10 +547,17 @@ class SharedGroupedLinearLoRA(nn.Module):
         dropped = F.dropout(x, p=self.dropout_p, training=self.training) if self.dropout_p else x
         return dropped.matmul(self.lora_a.t()).matmul(self.lora_b.t()) * self.scale
 
-    def materialized_delta_weight(self) -> torch.Tensor:
+    def materialized_delta_weight(self, expert_idx: int = 0) -> torch.Tensor:
         if self.dropout_p != 0.0:
             raise ValueError("materialized_delta_weight requires dropout=0.")
-        return (self.lora_b @ self.lora_a) * self.scale
+        del expert_idx
+        lora_a = self.lora_a
+        lora_b = self.lora_b
+        if hasattr(lora_a, "full_tensor"):
+            lora_a = lora_a.full_tensor()
+        if hasattr(lora_b, "full_tensor"):
+            lora_b = lora_b.full_tensor()
+        return (lora_b @ lora_a) * self.scale
 
 
 def _weight_owner(module: nn.Module) -> nn.Module | None:
