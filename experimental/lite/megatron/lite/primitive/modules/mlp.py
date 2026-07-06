@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Model-agnostic tensor-parallel SwiGLU MLP primitives."""
 
 from __future__ import annotations

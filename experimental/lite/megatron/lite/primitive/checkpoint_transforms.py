@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Reusable checkpoint tensor layout transforms without I/O dependencies."""
 
 from __future__ import annotations

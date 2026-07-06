@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Native Hy3 composition over Megatron Lite primitives."""
 
 from __future__ import annotations
