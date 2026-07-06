@@ -34,6 +34,14 @@
 - 已下强制单变量校验:fusion on/off 严格对照 + 查 effective 值是否被 launcher/env 覆盖(类 betas 坑)+
   嫌疑退回 verl↔engine 集成层(micro 累加/DTensor reduce)。晨报需 bayan 知悉:定罪≠已解决,勿轻信。
 
+## 12:56 硬对照(秘书直接判读)
+- 两发全模型 replay 天然构成 fusion on/off 对照:13497653(修复前)gn=0.140048 vs 13500928(修复后)
+  =0.139983——**dispatcher 修复对全模型 grad_norm 无影响(0.05%)**。确证:六罪犯全修后 grad 仍 3.3x。
+- **grad_norm 3.3x 主因至今未定位**;嫌疑集中 verl↔engine 集成层(micro 累加口径 / fsdp2 DTensor
+  grad reduce)。六罪犯修复价值=loss/精度对齐+回归资产,应入 PR,但不等于"grad 差不多"达成。
+- ⚠给 bayan:这是硬骨头,可能需要你醒后定夺——是继续钻 grad_norm(集成层),还是先按'RL 实效'
+  路线(.3 用全修复 mlite 跑 15K 看 acc 是否健康涨点,grad_norm 差记为已定界 backlog)收口交付。
+
 ## 事实基线(睡前)
 - loss 已对齐 0.01%;grad 3.3x 未闭环;罪犯 1-5 已修(明细见 GATE0.md/G2-RESULTS.md)。
 - 15K megatron 锚点 step5 acc=0.7479;is/main 落后审计与 router primitive 修复方案在 .9 队列。
