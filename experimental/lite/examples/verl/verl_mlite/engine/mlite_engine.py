@@ -770,7 +770,20 @@ class MegatronLiteEngine(BaseEngine):
                 )
             full_mask = torch.zeros(seq_len, dtype=row_mask.dtype, device=row_mask.device)
             if response_tokens:
-                full_mask[-response_tokens:] = row_mask[:response_tokens]
+                head = row_mask[:response_tokens]
+                # This padded->packed fallback can only RELOCATE a contiguous
+                # all-ones response prefix to the packed tail. A mask with
+                # interior zeros (multi-turn / tool-use observation tokens)
+                # would be silently misaligned — training observation tokens
+                # and skipping real response tokens — so fail loudly instead.
+                if int(head.sum().item()) != response_tokens:
+                    raise ValueError(
+                        "packed loss_mask fallback requires the response mask to "
+                        "be a contiguous all-ones prefix of its nonzero span; got "
+                        "interior zeros (multi-turn/tool-use mask). Pass a nested/"
+                        "jagged loss_mask aligned to input_ids instead."
+                    )
+                full_mask[-response_tokens:] = head
             rows.append(full_mask)
         return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 

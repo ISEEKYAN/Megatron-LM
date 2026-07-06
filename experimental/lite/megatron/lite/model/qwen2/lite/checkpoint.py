@@ -295,6 +295,24 @@ def _iter_hf_state_tensors(
     _validate_parallel_scope(ps)
     rank = dist.get_rank() if dist.is_initialized() else 0
     if rank0_only and rank != 0:
+        # fsdp2 shards params as DTensors, and materializing one
+        # (``full_tensor()`` inside ``_export_tensor`` / the LoRA delta merge)
+        # is a COLLECTIVE. An early return here leaves rank 0 blocked inside
+        # that collective until the NCCL timeout. Every rank must drive the
+        # same iteration; non-zero ranks simply emit nothing.
+        if any(
+            hasattr(p, "full_tensor")
+            for p in unwrap_model(_as_model(model)).parameters()
+        ):
+            for _ in _iter_hf_state_tensors(
+                model,
+                config,
+                ps,
+                rank0_only=False,
+                export_dtype=export_dtype,
+                merge_lora=merge_lora,
+            ):
+                pass
         return
 
     base_model = unwrap_model(_as_model(model))
