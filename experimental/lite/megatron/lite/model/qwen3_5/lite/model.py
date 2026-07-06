@@ -278,7 +278,7 @@ class Qwen35Layer(nn.Module):
             router_bias_rate=router_bias_rate,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
-            router_dtype=torch.float32 if deterministic else None,
+            router_dtype=torch.float32,
             preserve_3d_graph=deterministic,
             shared_expert_plain_te=deterministic,
         )

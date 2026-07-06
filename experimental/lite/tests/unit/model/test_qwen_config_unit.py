@@ -123,6 +123,36 @@ def test_qwen_lite_protocols_reexport_checkpoint_hook_names():
         assert "PLACEMENT_FN" in checkpoint_imports
 
 
+def test_qwen35_router_gemm_is_fp32_outside_deterministic_mode(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    import torch
+    import torch.nn as nn
+
+    from megatron.lite.model.qwen3_5.lite import model
+    from megatron.lite.primitive.parallel import ParallelState
+
+    captured = {}
+
+    class _FakeModule(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    def _fake_moe(*args, **kwargs):
+        captured.update(kwargs)
+        return _FakeModule()
+
+    monkeypatch.setattr(model, "GatedDeltaNet", _FakeModule)
+    monkeypatch.setattr(model.te, "RMSNorm", _FakeModule)
+    monkeypatch.setattr(model, "MoELayer", _fake_moe)
+    cfg = Qwen35Config._from_hf_dict(_tiny_qwen35_text_config())
+
+    model.Qwen35Layer(cfg, ParallelState(), 0, deterministic=False)
+
+    assert captured["router_dtype"] is torch.float32
+
+
 def _string_list_assignment(tree: ast.Module, name: str) -> set[str]:
     for node in tree.body:
         if not isinstance(node, ast.Assign):
