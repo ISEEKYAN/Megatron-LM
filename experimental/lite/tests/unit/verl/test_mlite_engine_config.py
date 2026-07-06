@@ -415,7 +415,7 @@ def _rollout_ingest_engine(*, routers=2, topk=2, num_experts=8):
 
 
 def test_engine_ingest_masks_unmappable_rollout_routing() -> None:
-    # WS2 §2.3 (MinT arXiv:2605.13779 §6.3): the agent loop ZERO-fills routing outside
+    # Unmappable-routing masking contract (arXiv:2605.13779 §6.3): the agent loop ZERO-fills routing outside
     # the captured span and 0 is a valid expert id — ingest converts all-zero [L, K]
     # rows to sentinel -1 (live-routing fallback in the router), counts the fraction,
     # and keeps rows that merely contain expert 0. Loss-carrying unmappable tokens
@@ -476,7 +476,7 @@ def test_engine_ingest_rejects_mismatched_rollout_routing() -> None:
 
 
 def test_loss_hook_reports_unmappable_frac_metric() -> None:
-    # The MinT §6.3 count rides the per-microbatch metrics (reduce_metrics folds it);
+    # The the unmappable-routing masking contract (arXiv:2605.13779 §6.3) count rides the per-microbatch metrics (reduce_metrics folds it);
     # outside a rollout-replay pass the key is absent.
     engine = _engine(engine_config=_engine_config())
     engine._build_verl_model_output = lambda **_kwargs: {"log_probs": torch.tensor(0.0)}

@@ -285,7 +285,7 @@ class MegatronLiteEngine(BaseEngine):
         self._router_replay_mode = None
         self._router_replay_routing = None
         self._router_replay_layout = None
-        # MinT §6.3 count: fraction of rollout tokens masked to live-routing fallback.
+        # Unmappable-routing count (arXiv:2605.13779 §6.3): fraction of rollout tokens masked to live-routing fallback.
         self._router_replay_unmappable_frac = None
 
     @property
@@ -456,7 +456,7 @@ class MegatronLiteEngine(BaseEngine):
         verl's no-padding conversion delivers per-sample jagged ``[T_i, L, K]``
         expert ids (uint8-cast upstream) whose unmappable positions — spans the
         serving engine never recorded (capture gaps, truncation edges) — are
-        ZERO-filled, and 0 is a valid expert id. MinT §6.3 (arXiv:2605.13779):
+        ZERO-filled, and 0 is a valid expert id. Unmappable-routing masking contract (arXiv:2605.13779 §6.3):
         such tokens are masked to sentinel ``-1`` so the router keeps live
         routing there, counted as ``router_replay/unmappable_frac`` — never
         silently replayed as expert 0. All-zero ``[L, K]`` rows identify the
@@ -497,7 +497,7 @@ class MegatronLiteEngine(BaseEngine):
                 self._warned_unmappable_loss = True
                 print(
                     f"[router_replay] {lost}/{int(unmappable.sum())} unmappable rollout-"
-                    "routing tokens carry loss; they fall back to live routing (MinT §6.3)"
+                    "routing tokens carry loss; they fall back to live routing (unmappable-routing masking contract, arXiv:2605.13779 §6.3)"
                     " — check rollout capture coverage (prompt-only gaps are expected)."
                 )
         return torch.nested.nested_tensor_from_jagged(values, offsets=routing.offsets())

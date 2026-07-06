@@ -243,7 +243,7 @@ def test_r3_router_replay_pins_selection_and_stays_differentiable():
 
 
 def test_r3_router_replay_sentinel_tokens_fall_back_to_live_routing():
-    # MinT §6.3 (arXiv:2605.13779, plan WS2 §2.3): sentinel -1 marks tokens whose
+    # Unmappable-routing masking contract (arXiv:2605.13779 §6.3): sentinel -1 marks tokens whose
     # rollout routes cannot be mapped to this batch — replay must keep their FRESH
     # selection AND scores (live routing, bitwise vs no replay) while mapped tokens
     # in the same pass still pin to the recorded indices. Never silently wrong:
