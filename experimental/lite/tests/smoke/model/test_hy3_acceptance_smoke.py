@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import os
@@ -215,4 +216,3 @@ def test_hy3_distributed_forward_backward_uses_requested_paths(topology: str):
     marker = torch.tensor([1], device="cuda")
     dist.all_reduce(marker)
     assert marker.item() == expected_world
-

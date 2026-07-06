@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tencent Hy3 architecture configuration."""
 
 from __future__ import annotations
