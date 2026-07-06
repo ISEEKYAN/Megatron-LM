@@ -35,10 +35,13 @@
 
 ## 待办(gate0 收尾)
 
-- [ ] bayan 定 verl pin(cw HEAD 7cf31bf9 vs 老基线 c3ef4275 vs AB 的 verl-main-latest 快照)
-- [ ] 读 megatron_proven.sh/mlite_node.sh 全文,提取 resolved 超参作为 G2 的 A/B 基准配置
+- [x] verl pin:**bayan 裁定保持现状不折腾**——AB 管线用 `$U/code/verl-main-latest`(HEAD `a6ef5009`),沿用
+- [x] proven 脚本已读透(2026-07-05):
+  - megatron 侧 `megatron_proven.sh`:超参全量在文件内(bs32/gen96/8K/TP1PP1CP1EP8/betas0.999/token-mean/clip 0.2-0.28-10/filter_groups),`DRY_RUN=1` 支持,末尾 `"$@"` 可追加 hydra 覆盖;offload param/opt/grad 全 True;**未设 calculate_log_probs**
+  - mlite 侧 `mlite.sbatch`→`mlite_node.sh`→`wt-qwen35-dapo` launcher `run_qwen3moe_gsm8k_dapo.sh`:launcher **硬编码 `calculate_log_probs=True`**(L271),支持 `TOTAL_TRAINING_STEPS`/`RESUME_MODE` env 与 EXTRA_ARGS;offload=param True/opt False/grad False(**注意与 megatron 侧不对称,老 AB 就如此**)
+  - mlite 引擎 worktree = `wt-qwen35-dapo` @ `a5d035b26`(老基线代际);**当前 mlite HEAD c178e1c3e 不含 DAPO launcher**(只有 run_qwen3moe_sft.sh)——新 HEAD 参战需先移植 launcher 三连 commit(99978314c/a3ed33ab3/a5d035b26)
 - [ ] 向报告方索取:H20 侧 verl/mlite/vllm commit + Megatron 基线原始 script
-- [ ] G0b DRY_RUN 双侧 resolved config diff
+- [ ] G0b DRY_RUN 双侧 resolved config diff(megatron 侧 DRY_RUN=1 login 可跑,纯 bash)
 
 ## 复现载具决策(建议)
 
