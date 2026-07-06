@@ -167,6 +167,10 @@ def _batch_first(tensor: torch.Tensor, batch: int) -> torch.Tensor:
     return tensor.transpose(0, 1).contiguous()
 
 
+def _router_batch_first(tensor: torch.Tensor, batch: int, sequence: int) -> torch.Tensor:
+    return tensor.reshape(sequence, batch, -1).transpose(0, 1).reshape(batch * sequence, -1)
+
+
 def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor, atol=3e-2):
     actual_f = actual.detach().float()
     expected_f = expected.detach().float()
@@ -220,6 +224,8 @@ def test_hy3_transformers_5_6_layer_router_logits_loss_and_gradient_parity():
     assert len(hf_router) == len(native_router) == 1
     hf_scores, hf_indices = hf_router[0]
     native_scores, native_indices = native_router[0]
+    native_scores = _router_batch_first(native_scores, *input_ids.shape)
+    native_indices = _router_batch_first(native_indices, *input_ids.shape)
     assert torch.equal(native_indices, hf_indices)
     _assert_close("router_scores", native_scores, hf_scores, atol=2e-3)
     _assert_close("logits", native_logits, hf_logits)
@@ -257,4 +263,3 @@ def test_hy3_transformers_5_6_layer_router_logits_loss_and_gradient_parity():
     for name, (native_grad, hf_grad) in gradient_pairs.items():
         assert native_grad is not None and hf_grad is not None
         _assert_close(name, native_grad, hf_grad, atol=8e-2)
-
