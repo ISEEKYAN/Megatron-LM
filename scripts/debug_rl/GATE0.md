@@ -47,3 +47,12 @@
 
 优先复用 `qwen35_dapo_ab` proven 管线(gate0 对齐成本≈0,只需把 mlite worktree 推到 c178e1c3e),
 本 repo `scripts/debug_rl/run_dapo_h100.sh`(报告方 script 的移植版)作为"复现报告方现象"的对照载具。
+
+## ⚠ 2026-07-06 重大勘误(基座过时)
+
+原记录"本轮 mlite HEAD c178e1c3e"实为 **6-08 老 main**,落后 GitHub `is/main@69ea18d07`(6-30)**1468 commits**。
+上游 6-27~6-30 已修:loss reduction/forward-only 契约(5d2f0c9b3, PR#68)、router GEMM 回退(f8ade9a29)、
+Qwen3.5 rollout 权重同步(d39205e59)、跨并行后端训练 parity(3d48e1a0b);inv_freq FP32 保存亦在(model.py:651)。
+战役基座已重定向到 `is/main@69ea18d07`;本文件此前的版本结论按老基座理解。
+对报告方的候选最终答案:若其 run 基于 <6-27 版本,升级 ≥69ea18d07 重跑。
+教训:gate0 必须 fetch 上游 tip 对照(git rev-list --count HEAD..upstream/main),本地/集群一致≠最新。
