@@ -42,6 +42,12 @@
 - ⚠给 bayan:这是硬骨头,可能需要你醒后定夺——是继续钻 grad_norm(集成层),还是先按'RL 实效'
   路线(.3 用全修复 mlite 跑 15K 看 acc 是否健康涨点,grad_norm 差记为已定界 backlog)收口交付。
 
+## 13:35 突破:grad 3.3x 主因收敛
+- 12层 optimizer proxy(13503009)**首次 proxy 复现分叉**:reported grad_norm 12.67 vs MCore 2.75=4.6x
+  (4层不够放大→之前 grad_abs=0 是假阴性,不是无罪);关 recompute(13503610)仍 12.67→排除 recompute。
+- **源码嫌疑锁定 `run_microbatch_loop` 的 micro 累加/grad 归一口径**(verl↔engine 集成层,与 12:56 判断一致)。
+- 有了可复现 12层 proxy(分钟级)+源码定位,收敛在望;worker weighted_logprob_unit 深挖中。
+
 ## 事实基线(睡前)
 - loss 已对齐 0.01%;grad 3.3x 未闭环;罪犯 1-5 已修(明细见 GATE0.md/G2-RESULTS.md)。
 - 15K megatron 锚点 step5 acc=0.7479;is/main 落后审计与 router primitive 修复方案在 .9 队列。
