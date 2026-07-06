@@ -18,6 +18,10 @@
   routed experts 全 exact。追查 13499476 在跑。proxy 域并未穷尽——EP8+stage 粒度才暴露此差。
 - .6 第 3 次 headless 超时挂 needs_human(10:40)——晨报队列 +1;建议改交互式 vicky run 或调大超时。
 
+- 11:20 突破:40层全专家 EP8 proxy **复现强分叉**(迭代域夺回,分钟级可用);layer0 上 shared/routed
+  expert 输出均逐字节一致——**首差收窄到 routed combine/unpermute/最终合并序(MoE TokenDispatcher)**,
+  worker 在对照两侧 dispatcher 并插桩。罪犯 6 候选从 shared expert 改判 dispatcher combine 路径。
+
 ## 事实基线(睡前)
 - loss 已对齐 0.01%;grad 3.3x 未闭环;罪犯 1-5 已修(明细见 GATE0.md/G2-RESULTS.md)。
 - 15K megatron 锚点 step5 acc=0.7479;is/main 落后审计与 router primitive 修复方案在 .9 队列。
