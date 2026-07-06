@@ -23,6 +23,7 @@ import torch.nn as nn
 from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
 
+from megatron.lite.primitive.checkpoint_transforms import iter_checkpoint_tensors
 
 @runtime_checkable
 class HFWeights(Protocol):
@@ -323,7 +324,7 @@ def load_hf_weights(
 
         actual = _resolve_param_name(mapped, state)
         if actual:
-            loaded[actual] = tensor.to(dtype=torch.bfloat16)
+            loaded[actual] = tensor.to(dtype=state[actual].dtype)
 
     for name, param in base_model.named_parameters():
         if name in loaded:
@@ -332,6 +333,9 @@ def load_hf_weights(
             continue
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
+    for name, buffer in base_model.named_buffers():
+        if name in loaded:
+            buffer.data.copy_(loaded[name])
 
 
 def _load_expert_weight(native_name, hf_names, reader, spec, ps, loaded, expert_gid, expert_shard):
@@ -404,7 +408,7 @@ def export_hf_weights(
                 if hasattr(base_chunk, "layer_indices")
                 else {}
             )
-            for name, param in base_chunk.named_parameters():
+            for name, param in iter_checkpoint_tensors(base_chunk, spec.weight_map()):
                 gname = to_global_layer_name(name, layer_map)
                 tensor = param.data.detach()
 
@@ -452,7 +456,7 @@ def export_hf_weights(
             if hasattr(base_chunk, "layer_indices")
             else {}
         )
-        for name, param in base_chunk.named_parameters():
+        for name, param in iter_checkpoint_tensors(base_chunk, spec.weight_map()):
             gname = to_global_layer_name(name, layer_map)
             t = param.data.detach()
 

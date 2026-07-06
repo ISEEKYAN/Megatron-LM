@@ -8,7 +8,11 @@ import pytest
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.model.registry import resolve_model_type_from_hf, resolve_runtime_model_name
+from megatron.lite.model.hy3.config import Hy3Config
+from megatron.lite.model.registry import (
+    resolve_model_type_from_hf,
+    resolve_runtime_model_name,
+)
 
 pytestmark = pytest.mark.mlite
 
@@ -59,6 +63,63 @@ def test_registry_resolves_qwen_lite_model_names():
     assert resolve_runtime_model_name("qwen3", "lite") == "qwen3"
     assert resolve_runtime_model_name("qwen3_moe", "lite") == "qwen3_moe"
     assert resolve_runtime_model_name("qwen3_5", "lite") == "qwen3_5"
+
+
+def _tiny_hy3_hf_dict() -> dict:
+    return {
+        "model_type": "hy_v3",
+        "hidden_size": 16,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 4,
+        "num_hidden_layers": 3,
+        "vocab_size": 64,
+        "intermediate_size": 24,
+        "moe_intermediate_size": 8,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "num_shared_experts": 1,
+        "first_k_dense_replace": 1,
+        "router_scaling_factor": 2.5,
+        "qk_norm": True,
+        "moe_router_use_sigmoid": True,
+        "moe_router_enable_expert_bias": True,
+        "route_norm": True,
+        "hidden_act": "silu",
+        "rope_parameters": {"rope_theta": 12345.0, "rope_type": "default"},
+        "num_nextn_predict_layers": 1,
+    }
+
+
+def test_hy3_registry_and_config_preserve_nonstandard_contract():
+    assert resolve_model_type_from_hf({"model_type": "hy_v3"}) == "hy3"
+    assert resolve_runtime_model_name("hy3", "lite") == "hy3"
+
+    cfg = Hy3Config._from_hf_dict(_tiny_hy3_hf_dict())
+
+    assert cfg.layer_types == ["dense", "sparse", "sparse"]
+    assert cfg.rope_theta == 12345.0
+    assert cfg.shared_expert_intermediate_size == 8
+    assert cfg.num_nextn_predict_layers == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("qk_norm", False),
+        ("moe_router_use_sigmoid", False),
+        ("moe_router_enable_expert_bias", False),
+        ("route_norm", False),
+        ("num_shared_experts", 2),
+        ("hidden_act", "gelu"),
+    ],
+)
+def test_hy3_config_rejects_unsupported_architecture_drift(field, value):
+    hf = _tiny_hy3_hf_dict()
+    hf[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        Hy3Config._from_hf_dict(hf)
 
 
 def test_qwen3_config_from_hf_dict_derives_head_dim_and_rope_theta():

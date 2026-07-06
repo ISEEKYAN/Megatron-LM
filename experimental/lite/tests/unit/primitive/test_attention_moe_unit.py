@@ -33,6 +33,14 @@ def _router_and_parallel_state(monkeypatch):
     return TopKRouter, ParallelState
 
 
+def _sigmoid_router_and_parallel_state():
+    pytest.importorskip("transformer_engine.pytorch")
+    from megatron.lite.primitive.modules.router import SigmoidTopKRouter
+    from megatron.lite.primitive.parallel import ParallelState
+
+    return SigmoidTopKRouter, ParallelState
+
+
 def _router_config():
     return SimpleNamespace(
         hidden_size=4, num_experts=4, num_experts_per_tok=2, router_aux_loss_coef=0.1
@@ -146,3 +154,37 @@ def test_topk_router_aux_loss_contributes_gate_gradient(monkeypatch):
     assert torch.isfinite(grad_with_aux).all()
     assert torch.isfinite(grad_no_aux).all()
     assert (grad_with_aux - grad_no_aux).abs().sum().item() > 0.0
+
+
+def test_sigmoid_router_uses_bias_only_for_selection_and_persists_it():
+    SigmoidTopKRouter, ParallelState = _sigmoid_router_and_parallel_state()
+    config = SimpleNamespace(
+        hidden_size=2,
+        num_experts=3,
+        num_experts_per_tok=2,
+        router_scaling_factor=2.5,
+        router_aux_loss_coef=0.0,
+    )
+    router = SigmoidTopKRouter(
+        config,
+        ParallelState(),
+        compute_aux_loss=False,
+        persistent_expert_bias=True,
+    )
+    with torch.no_grad():
+        router.gate.weight.copy_(torch.tensor([[2.0, 0.0], [1.0, 0.0], [-2.0, 0.0]]))
+        router.expert_bias.copy_(torch.tensor([-10.0, 0.0, 10.0]))
+
+    hidden = torch.tensor([[1.0, 0.0]])
+    scores, indices = router(hidden)
+
+    assert set(indices[0].tolist()) == {1, 2}
+    raw = torch.sigmoid(torch.tensor([1.0, -2.0]))
+    expected = raw / raw.sum() * 2.5
+    by_index = {idx.item(): score for idx, score in zip(indices[0], scores[0])}
+    torch.testing.assert_close(by_index[1], expected[0])
+    torch.testing.assert_close(by_index[2], expected[1])
+    assert "expert_bias" in router.state_dict()
+    router.to(dtype=torch.bfloat16)
+    assert router.gate.weight.dtype == torch.bfloat16
+    assert router.expert_bias.dtype == torch.float32

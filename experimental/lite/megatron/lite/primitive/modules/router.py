@@ -129,7 +129,12 @@ class TopKRouter(nn.Module):
 
 
 class SigmoidTopKRouter(nn.Module):
-    """Sigmoid-based TopK router for DeepSeek V3."""
+    """Sigmoid top-k router with optional expert-selection bias.
+
+    The bias affects expert selection only.  Dispatched token weights are
+    gathered from the original sigmoid scores, normalized over the selected
+    experts, and multiplied by the configured scaling factor.
+    """
 
     def __init__(
         self,
@@ -140,6 +145,7 @@ class SigmoidTopKRouter(nn.Module):
         compute_aux_loss: bool = True,
         use_pre_softmax: bool = False,
         moe_router_fusion: bool = False,
+        persistent_expert_bias: bool = False,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -148,40 +154,58 @@ class SigmoidTopKRouter(nn.Module):
                 "use load_balancing_type='none' or extend ParallelState."
             )
         self.topk = config.num_experts_per_tok
-        self.num_experts = config.n_routed_experts
-        self.aux_loss_coeff = config.aux_loss_alpha
-        self.scaling_factor = config.routed_scaling_factor
+        self.num_experts = getattr(config, "num_experts", None)
+        if self.num_experts is None:
+            self.num_experts = config.n_routed_experts
+        self.aux_loss_coeff = getattr(
+            config,
+            "router_aux_loss_coef",
+            getattr(config, "aux_loss_alpha", 0.0),
+        )
+        self.scaling_factor = getattr(
+            config,
+            "router_scaling_factor",
+            getattr(config, "routed_scaling_factor", 1.0),
+        )
         self.router_bias_rate = router_bias_rate
         self.compute_aux_loss = compute_aux_loss
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
 
-        self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
+        self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
         self.register_buffer(
             "expert_bias",
-            torch.zeros(config.n_routed_experts, dtype=torch.float32),
-            persistent=False,
+            torch.zeros(self.num_experts, dtype=torch.float32),
+            persistent=persistent_expert_bias,
         )
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = self.gate(x)
-        logits = logits.view(-1, self.num_experts)
-        num_tokens = logits.size(0)
-        probs_dense, routing_map = topk_routing_with_score_function(
-            logits,
-            self.topk,
-            score_function="sigmoid",
-            expert_bias=self.expert_bias.to(logits.dtype),
-            scaling_factor=(self.scaling_factor or None),
-            fused=self.moe_router_fusion,
-        )
-        topk_scores, topk_indices = _ordered_topk_from_routing_map(
-            probs_dense, routing_map, self.topk
-        )
-        topk_scores = topk_scores.to(logits.dtype)
+    def _apply(self, fn):
+        result = super()._apply(fn)
+        # Expert-selection bias is accumulated and applied in fp32. Keep it
+        # fp32 even when the surrounding model is converted to bf16.
+        self.expert_bias = self.expert_bias.float()
+        return result
 
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = torch.nn.functional.linear(x.float(), self.gate.weight.float())
+        num_tokens = logits.size(0)
+        routing_scores = torch.sigmoid(logits)
+        selection_scores = routing_scores + self.expert_bias.to(routing_scores.dtype)
+        _selection_values, topk_indices = torch.topk(
+            selection_scores,
+            k=self.topk,
+            dim=-1,
+            sorted=False,
+        )
+        topk_scores = routing_scores.gather(-1, topk_indices)
+        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        topk_scores = topk_scores * self.scaling_factor
+        topk_scores = topk_scores.to(x.dtype)
+        routing_map = torch.zeros_like(routing_scores, dtype=torch.bool).scatter_(
+            -1, topk_indices, True
+        )
         if self.compute_aux_loss and self.training and torch.is_grad_enabled():
             _, aux_scores = compute_routing_scores_for_aux_loss(
                 logits, self.topk, score_function="sigmoid", fused=self.moe_router_fusion

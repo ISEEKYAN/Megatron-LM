@@ -27,6 +27,14 @@ def _qwen35_symbols():
     return Qwen35Config, Qwen35Model
 
 
+def _hy3_symbols():
+    pytest.importorskip("transformer_engine.pytorch")
+    from megatron.lite.model.hy3.config import Hy3Config
+    from megatron.lite.model.hy3.lite.model import Hy3Model
+
+    return Hy3Config, Hy3Model
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _single_node_cuda_dist():
     if not torch.cuda.is_available():
@@ -92,6 +100,25 @@ def _tiny_qwen35_config():
     )
 
 
+def _tiny_hy3_config():
+    Hy3Config, _Hy3Model = _hy3_symbols()
+    return Hy3Config(
+        num_hidden_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        vocab_size=64,
+        intermediate_size=24,
+        num_experts=2,
+        num_experts_per_tok=1,
+        moe_intermediate_size=8,
+        first_k_dense_replace=1,
+        max_position_embeddings=16,
+        num_nextn_predict_layers=0,
+    )
+
+
 def _parallel_state():
     from megatron.lite.primitive.parallel import init_parallel
     from megatron.lite.runtime.contracts.config import ParallelConfig
@@ -151,6 +178,37 @@ def test_qwen35_lite_tiny_forward_backward_smoke():
 
     output = model(input_ids=input_ids, labels=labels)
 
+    assert output["hidden_states"].shape[-1] == config.hidden_size
+    assert output["log_probs"].shape == labels.shape
+    _assert_loss_and_backward(output, model)
+
+
+def test_hy3_lite_tiny_forward_backward_uses_dense_and_sparse_paths():
+    _Hy3Config, Hy3Model = _hy3_symbols()
+    config = _tiny_hy3_config()
+    model = Hy3Model(config, _parallel_state(), use_deepep=False).cuda().to(torch.bfloat16)
+    input_ids, labels = _token_batch(config.vocab_size)
+
+    calls = {"dense": 0, "router": 0, "shared": 0, "experts": 0}
+    hooks = [
+        model.layers[0].mlp.register_forward_hook(
+            lambda *_args: calls.__setitem__("dense", calls["dense"] + 1)
+        ),
+        model.layers[1].moe.router.register_forward_hook(
+            lambda *_args: calls.__setitem__("router", calls["router"] + 1)
+        ),
+        model.layers[1].moe.shared_mlp.register_forward_hook(
+            lambda *_args: calls.__setitem__("shared", calls["shared"] + 1)
+        ),
+        model.layers[1].moe.experts.register_forward_hook(
+            lambda *_args: calls.__setitem__("experts", calls["experts"] + 1)
+        ),
+    ]
+    output = model(input_ids=input_ids, labels=labels, return_log_probs=True)
+    for hook in hooks:
+        hook.remove()
+
+    assert calls == {"dense": 1, "router": 1, "shared": 1, "experts": 1}
     assert output["hidden_states"].shape[-1] == config.hidden_size
     assert output["log_probs"].shape == labels.shape
     _assert_loss_and_backward(output, model)

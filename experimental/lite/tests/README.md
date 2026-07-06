@@ -43,5 +43,6 @@ Current matrix:
 | Optimizer update-state offload fraction | `unit/primitive/test_runtime_config_unit.py` and single-process CUDA coverage in `unit/primitive/test_fsdp2_offload_gpu.py` | multi-rank offloaded grad clipping is checked against the non-offloaded baseline in `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
 | Qwen3 MoE lite config/build/forward | `unit/model/test_qwen_config_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
 | Qwen3.5 MoE lite config/build/forward | `unit/model/test_qwen_config_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
+| Hy3 config/weights/native forward | `unit/model/test_qwen_config_unit.py`, `unit/model/test_hy3_checkpoint_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
 
 Classic FSDP is not a separate MLite primitive in the current source tree; MLite's native sharded optimizer coverage is FSDP2 plus Megatron DDP/distopt.

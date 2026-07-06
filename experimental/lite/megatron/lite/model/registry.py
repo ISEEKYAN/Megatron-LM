@@ -92,6 +92,13 @@ register_model(
     impls={"lite": "megatron.lite.model.qwen3_5.lite.protocol"},
 )
 
+register_model(
+    "hy3",
+    package="megatron.lite.model.hy3",
+    hf_model_types=["hy_v3"],
+    impls={"lite": "megatron.lite.model.hy3.lite.protocol"},
+)
+
 
 # ---------------------------------------------------------------------------
 # Lookup functions

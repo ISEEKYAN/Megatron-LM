@@ -18,7 +18,7 @@ This initial drop contains:
 
 - A lightweight runtime API in `megatron.lite.runtime`.
 - Common training primitives in `megatron.lite.primitive`.
-- Lite-only native model implementations for Qwen3 MoE and Qwen3.5 MoE.
+- Lite-only native model implementations for Qwen3 MoE, Qwen3.5 MoE, and Tencent Hy3.
 - Hugging Face safetensors load/export helpers for the included models.
 - Megatron-Core optimizer wrapping for the lite runtime.
 - FSDP2 optimizer primitives for supported lite model protocols.
@@ -98,6 +98,8 @@ Canonical model names currently registered by default:
 
 - `qwen3_moe`: Qwen3 MoE lite implementation. Use this name in new configs.
 - `qwen3_5`: Qwen3.5 MoE lite implementation.
+- `hy3`: Tencent Hy3 native lite implementation. HF `model_type=hy_v3`
+  resolves to this model name.
 
 Compatibility names:
 
@@ -129,6 +131,7 @@ bash experimental/lite/examples/bench/scripts/run_qwen35_correctness_pair.sh
 - [Architecture](docs/architecture.md)
 - [Runtime](docs/runtime.md)
 - [Models](docs/models.md)
+- [Hy3 Architecture Mapping](docs/hy3_architecture.md)
 - [Porting Notes](docs/porting.md)
 - [Skills](skills/README.md)
 - [Bench Example](examples/bench/README.md)
