@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -239,12 +240,8 @@ class FSDP2Optimizer:
                 group=self.expert_sharded_grad_norm_group,
             )
 
-        total_sq = (
-            total_sq
-            + tp_replicated_sq.to(total_sq.device)
-            + replicated_sq.to(total_sq.device)
-            + expert_sharded_sq.to(total_sq.device)
-        )
+        dense_sq = total_sq + tp_replicated_sq.to(total_sq.device) + replicated_sq.to(total_sq.device)
+        total_sq = dense_sq + expert_sharded_sq.to(total_sq.device)
         if (
             self.ps is not None
             and self.ps.pp_group is not None
@@ -252,6 +249,18 @@ class FSDP2Optimizer:
             and dist.get_world_size(self.ps.pp_group) > 1
         ):
             all_reduce_scalar_(total_sq, op=dist.ReduceOp.SUM, group=self.ps.pp_group)
+
+        if os.environ.get("MLITE_GRAD_NORM_DEBUG") == "1" and (
+            not dist.is_initialized() or dist.get_rank() == 0
+        ):
+            print(
+                "MLITE_GRAD_NORM_COMPONENTS "
+                f"dense_sq={dense_sq.float().item():.12g} "
+                f"expert_sq={expert_sharded_sq.float().item():.12g} "
+                f"global_sq={total_sq.float().item():.12g} "
+                f"expert_scale={self.expert_sharded_grad_scale:.12g}",
+                flush=True,
+            )
 
         grad_norm = total_sq.sqrt()
         if torch.isfinite(grad_norm):
