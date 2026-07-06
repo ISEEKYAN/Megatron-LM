@@ -21,6 +21,7 @@ wrong-env invocation skips rather than errors.
 from __future__ import annotations
 
 import os
+import re
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -28,6 +29,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.lite.primitive.ckpt.hf_weights import to_global_layer_name, unwrap_model
 from megatron.lite.primitive.deterministic import set_deterministic
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
@@ -449,6 +451,39 @@ def _is_valid_hf_export_key(key: str, model_name: str) -> bool:
     return key.startswith("model.") or key in ("lm_head.weight",)
 
 
+# Router correction bias keys: ``model.``-rooted kimi/glm5 layout and the bare
+# DS4-Flash layout. The bias steers top-k expert selection, so the export must
+# pass it through bit-identical to the live buffer (never silently cast it).
+_ROUTER_BIAS_KEY_RE = re.compile(
+    r"(?:model\.)?layers\.(\d+)\.(?:mlp\.gate\.e_score_correction_bias|ffn\.gate\.bias)"
+)
+
+
+def _live_router_biases(handle: ModelHandle, num_layers: int) -> dict[int, torch.Tensor]:
+    """Global layer idx -> live router bias buffer (this rank's stages only —
+    exactly the buffers the per-model export bias loop yields)."""
+    biases: dict[int, torch.Tensor] = {}
+    for chunk in handle._extras["model_chunks"]:
+        base_chunk = unwrap_model(chunk)
+        layer_map = (
+            {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
+            if hasattr(base_chunk, "layer_indices")
+            else {}
+        )
+        for name, buffer in base_chunk.named_buffers():
+            if not name.endswith((".moe.router.expert_bias", ".mlp.gate.expert_bias")):
+                continue
+            gname = to_global_layer_name(name, layer_map)
+            if gname.startswith("layers."):
+                idx = int(gname.split(".")[1])
+            elif gname.startswith("mtp.layers."):
+                idx = num_layers + int(gname.split(".")[2])
+            else:
+                continue
+            biases[idx] = buffer.detach().cpu()
+    return biases
+
+
 def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str, model_name: str) -> None:
     """Export HF weights (bf16) and assert the reloaded shards are valid.
 
@@ -481,9 +516,12 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str, model_n
     shards = [f for f in os.listdir(out_dir) if f.endswith(".safetensors")]
     assert shards, f"no safetensors exported to {out_dir}"
     keys: set[str] = set()
-    # The shared exporter casts EVERY floating tensor to bf16 (``_cast_export_tensor``
-    # with export_dtype=bf16) and leaves integers untouched.  So every float weight
-    # — including the router correction bias — must be bf16, while integer auxiliary
+    live_biases = _live_router_biases(handle, int(getattr(cfg, "num_hidden_layers")))
+    # The exporter casts floating tensors to bf16 and leaves integers untouched,
+    # with ONE floating exemption: the router correction bias steers top-k
+    # expert selection, so hub layouts and the load path keep it fp32 (HF
+    # ``_keep_in_fp32_modules_strict``) and the export passes it through
+    # bit-identical to the live buffer instead of casting it.  Integer auxiliary
     # buffers (e.g. DS4 hash-routing ``tid2eid`` index tables; casting them would
     # corrupt the indices) keep their native integral dtype.  Excluding such buffers
     # from the export would be a de-scope; we keep them and check their dtype.
@@ -491,7 +529,19 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str, model_n
         with safe_open(os.path.join(out_dir, shard), framework="pt") as fh:
             for key in fh.keys():
                 tensor = fh.get_tensor(key)
-                if tensor.dtype.is_floating_point:
+                bias_match = _ROUTER_BIAS_KEY_RE.fullmatch(key)
+                if bias_match is not None:
+                    source = live_biases.get(int(bias_match.group(1)))
+                    assert source is not None, f"{key} has no live router bias source"
+                    if key.endswith(".mlp.gate.e_score_correction_bias"):
+                        assert tensor.dtype == torch.float32, (
+                            f"{key} exported as {tensor.dtype}, want fp32"
+                        )
+                    assert tensor.dtype == source.dtype, (
+                        f"{key} exported as {tensor.dtype}, want untouched {source.dtype}"
+                    )
+                    assert torch.equal(tensor, source), f"{key} altered by export"
+                elif tensor.dtype.is_floating_point:
                     assert tensor.dtype == torch.bfloat16, (
                         f"{key} exported as {tensor.dtype}, want bf16"
                     )

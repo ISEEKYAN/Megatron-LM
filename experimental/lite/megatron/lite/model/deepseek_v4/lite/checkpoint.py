@@ -34,8 +34,6 @@ import torch.nn as nn
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
-    _cast_export_tensor,
-    _resolve_export_dtype,
     parse_expert_idx,
     to_global_layer_name,
     unwrap_model,
@@ -473,7 +471,6 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
 
     spec = DeepseekV4WeightSpec(config)
     rank0_only = bool(kwargs.get("rank0_only", False))
-    export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
     yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
 
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -490,11 +487,14 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
         for name, buffer in base_chunk.named_buffers():
             # Persistent router buffers carried into HF: hash-layer ``tid2eid``
             # and the (made-persistent for non-hash layers) ``expert_bias``.
+            # Both bypass the export_dtype cast: tid2eid is integral, and
+            # expert_bias steers top-k selection — hub layout and the load
+            # path keep it fp32 regardless of export_dtype.
             if not (name.endswith(".mlp.gate.tid2eid") or name.endswith(".mlp.gate.expert_bias")):
                 continue
             global_name = to_global_layer_name(name, layer_map)
             for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer.detach().cpu()):
-                yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
+                yield hf_name, hf_tensor
 
 
 def save_hf_weights(model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs) -> None:

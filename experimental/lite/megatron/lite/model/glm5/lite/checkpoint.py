@@ -31,8 +31,6 @@ from torch.distributed.tensor import Replicate, Shard
 from megatron.lite.model.glm5.config import Glm5Config
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
-    _cast_export_tensor,
-    _resolve_export_dtype,
     parse_expert_idx,
     to_global_layer_name,
     unwrap_model,
@@ -628,7 +626,6 @@ def export_hf_weights(model, config: Glm5Config, ps: ParallelState, **kwargs):
 
     spec = Glm5WeightSpec(config)
     rank0_only = bool(kwargs.get("rank0_only", False))
-    export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
     yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
     rank = dist.get_rank() if dist.is_initialized() else 0
     if rank0_only and rank != 0:
@@ -645,8 +642,10 @@ def export_hf_weights(model, config: Glm5Config, ps: ParallelState, **kwargs):
             if not name.endswith(".moe.router.expert_bias"):
                 continue
             global_name = to_global_layer_name(name, layer_map)
+            # expert_bias steers top-k selection; hub layout and the load path
+            # keep it fp32 regardless of export_dtype, so it bypasses the cast.
             for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer.detach().cpu()):
-                yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
+                yield hf_name, hf_tensor
 
 
 def save_hf_weights(model, path: str, config: Glm5Config, ps: ParallelState, **kwargs) -> None:

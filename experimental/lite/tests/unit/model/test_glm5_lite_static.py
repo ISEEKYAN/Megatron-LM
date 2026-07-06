@@ -384,7 +384,8 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     cfg = Glm5Config(**_tiny_config_kwargs())
     ps = ParallelState()
     model = _make_glm5_model(cfg, ps=ps)
-    model.layers[1].moe.router.expert_bias.copy_(torch.tensor([0.25, -0.5, 1.0]))
+    # Deliberately not bf16-representable so the fp32 pin below is non-vacuous.
+    model.layers[1].moe.router.expert_bias.copy_(torch.tensor([0.05, -0.51, 1.01]))
 
     exported = dict(export_hf_weights(model, cfg, ps))
     state = model.state_dict()
@@ -421,14 +422,22 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     )
 
     hf_bf16_dir = tmp_path / "hf_bf16"
+    bias_key = "model.layers.1.mlp.gate.e_score_correction_bias"
     save_hf_weights(model, str(hf_bf16_dir), cfg, ps, export_dtype=torch.bfloat16)
     with safe_open(str(hf_bf16_dir / "model.safetensors"), framework="pt", device="cpu") as handle:
         floating_dtypes = {
             handle.get_tensor(key).dtype
             for key in handle.keys()
-            if handle.get_tensor(key).is_floating_point()
+            if key != bias_key and handle.get_tensor(key).is_floating_point()
         }
         assert floating_dtypes == {torch.bfloat16}
+        # expert_bias steers top-k selection; hub layout and the load path keep
+        # it fp32 regardless of export_dtype.
+        assert handle.get_tensor(bias_key).dtype == torch.float32
+        assert torch.equal(
+            handle.get_tensor(bias_key),
+            state["layers.1.moe.router.expert_bias"].detach().cpu(),
+        )
 
     loaded_bf16 = _make_glm5_model(cfg, ps=ps)
     load_hf_weights(loaded_bf16, str(hf_bf16_dir), cfg, ps)
@@ -443,6 +452,12 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
         .cpu()
         .to(torch.bfloat16)
         .to(torch.float32),
+    )
+    # Roundtrip idempotency restored by the fp32 exemption: the bias survives a
+    # bf16 export -> reload bitwise-intact.
+    assert torch.equal(
+        loaded_bf16.state_dict()["layers.1.moe.router.expert_bias"].detach().cpu(),
+        state["layers.1.moe.router.expert_bias"].detach().cpu(),
     )
 
 
