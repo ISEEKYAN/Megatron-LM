@@ -296,7 +296,7 @@ def test_r3_router_replay_sentinel_tokens_fall_back_to_live_routing():
 
 
 def test_r3_router_replay_keys_record_and_replay_by_microbatch(transformer_engine_import_stub):
-    # R3 phase 2 (arXiv:2606.02437 §3, plan WS1): RECORD/REPLAY storage is keyed by the
+    # R3 phase 2 (arXiv:2606.02437 §3), multi-microbatch storage: RECORD/REPLAY is keyed by the
     # class-level microbatch cursor so N microbatches per step round-trip correctly;
     # double-record without cursor advance and missing replay keys fail loudly.
     transformer_engine_import_stub()

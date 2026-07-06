@@ -52,7 +52,7 @@ except ImportError:
 _LR_SCHEDULER_STATE = "lr_scheduler.pt"
 
 # Recompute specs whose module_map wrapping re-runs the MoE router forward inside
-# backward — only these need the REPLAY_BACKWARD arming (R3 phase-2 plan WS3);
+# backward — only these need the REPLAY_BACKWARD arming (recompute path);
 # selective attention/expert-only recompute never re-runs the router.
 _ROUTER_RERUNNING_RECOMPUTE = {"full", "moe", "router"}
 

@@ -374,7 +374,7 @@ def test_engine_replay_accepts_per_sample_routing_and_requires_cp1(monkeypatch) 
 
 
 def test_forward_backward_auto_arms_replay_only_for_rollout_source() -> None:
-    # WS2 §2.2: with router_replay_source="rollout" every forward_backward_batch over a
+    # Rollout-route ingest: with router_replay_source="rollout" every forward_backward_batch over a
     # rollout batch replays the batch-carried routing; a rollout-sourced engine that
     # gets a batch WITHOUT routing fails loudly (training un-replayed would be silently
     # wrong); self_record and already-armed passes never auto-arm.
