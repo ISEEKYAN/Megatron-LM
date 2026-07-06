@@ -1,6 +1,28 @@
-# 夜间托管晨报(2026-07-06 夜,持续更新)
+# 夜间托管晨报(2026-07-06 夜)—— ⭐bayan 请先读这里
 
-## 待 bayan 操作队列
+## 一句话结论
+grad_norm 3.3x 根因**已定位到 FSDP2 参数 wgrad/fully_shard reduce-scatter 的分布式梯度归约口径**(4-DP×EP8),
+**非模型数学**(模型层 backward 输出已证 ≤2%)。这与你"fsdp 天然非 bitwise"的判断吻合。.9 已 block 交你裁定。
+
+## 待 bayan 决策(2项)
+1. **[方向裁定] grad_norm 收口路线**——二选一:
+   - A) 拆专门 fsdp2-grad-reduce 子节点继续追 →1(需 4节点逐参数探针,周期不定);
+   - B) **接受 3.4x 为已定界的分布式归约差,转 10-step RL 看 acc 实效**(推荐:符合你早先判断,且"RL 能 work"本就是终极交付标准,grad_norm 精确对齐非必须)。
+2. **[unblock] TASK-1.1.15.3**(10:10 起挂,15K 三方对比被卡):
+   `env -u VICKY_ACTOR -u VICKY_TASK -u VICKY_LAUNCH_ID vicky unblock TASK-1.1.15.3 --as bayan`
+   (若选 B,.3 正好用全修复 mlite 跑 15K 看 acc,一并解决决策1的验证)
+
+## 六罪犯修复(独立成立,建议先落 PR)
+1 聚合契约(PR#80已含) / 2 router BF16 / 3 GDN 编译契约 / 4 RoPE inv_freq FP32 / 5 export 重构丢失 / 6 dispatcher permute fusion
+——全是 loss/精度侵蚀项,修复让同批 replay loss 对齐到 0.01%;上游 is/main 已覆盖 3-4 个(详见下)。
+
+## 版本重大勘误
+本战役 base c178e1c3e = 6-08 老 main,落后 is/main@69ea18d07(6-30)1468 commits;上游已修聚合/export/inv_freq/parity。
+给报告方候选答案:升级 ≥69ea18d07 + 我方 router/GDN 补丁重跑。
+
+---
+## 夜间流水(倒序)
+
 1. **unblock TASK-1.1.15.3**(10:10 headless 超时又挂 needs_human;mlite@is/main 15K 三方对比被它卡着):
    `env -u VICKY_ACTOR -u VICKY_TASK -u VICKY_LAUNCH_ID vicky unblock TASK-1.1.15.3 --as bayan`
 
