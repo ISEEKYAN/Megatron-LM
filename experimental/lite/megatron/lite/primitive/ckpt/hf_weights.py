@@ -403,12 +403,14 @@ def export_hf_weights(
         expert_groups: dict[str, list[tuple[int, str, torch.Tensor]]] = {}
         for chunk in chunks:
             base_chunk = unwrap_model(chunk)
+            expert_names = _expert_export_name_map(base_chunk, spec, ps)
             layer_map = (
                 {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
                 if hasattr(base_chunk, "layer_indices")
                 else {}
             )
             for name, param in iter_checkpoint_tensors(base_chunk, spec.weight_map()):
+                name = expert_names.get(name, name)
                 gname = to_global_layer_name(name, layer_map)
                 tensor = param.data.detach()
 
@@ -450,6 +452,7 @@ def export_hf_weights(
     gathered: dict[str, torch.Tensor] = {}
     for chunk in chunks:
         base_chunk = unwrap_model(chunk)
+        expert_names = _expert_export_name_map(base_chunk, spec, ps)
         # Map local layer indices to global for PP
         layer_map = (
             {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
@@ -457,6 +460,7 @@ def export_hf_weights(
             else {}
         )
         for name, param in iter_checkpoint_tensors(base_chunk, spec.weight_map()):
+            name = expert_names.get(name, name)
             gname = to_global_layer_name(name, layer_map)
             t = param.data.detach()
 
@@ -488,6 +492,28 @@ def export_hf_weights(
     for native_name, tensor in gathered.items():
         for hf_name, hf_tensor in spec.native_to_hf(native_name, tensor):
             yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
+
+
+def _expert_export_name_map(model: nn.Module, spec: HFWeights, ps) -> dict[str, str]:
+    """Map local TE GroupedLinear names back to synthetic global expert names."""
+    global_to_local = (
+        {global_idx: local_idx for local_idx, global_idx in enumerate(model.layer_indices)}
+        if hasattr(model, "layer_indices")
+        else {}
+    )
+    experts_per_rank = spec.num_experts // ps.ep_size
+    local_start = ps.ep_rank * experts_per_rank
+    result: dict[str, str] = {}
+    for synthetic_name in spec.weight_map():
+        mapped = remap_layer_index(synthetic_name, global_to_local)
+        if mapped is None:
+            continue
+        global_id = spec.expert_global_id(mapped)
+        if global_id is None or not local_start <= global_id < local_start + experts_per_rank:
+            continue
+        local_name = spec.expert_local_name(mapped, global_id - local_start)
+        result[local_name] = mapped
+    return result
 
 
 def _gather_dense(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch.Tensor:
