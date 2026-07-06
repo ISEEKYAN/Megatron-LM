@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import pytest
+from types import SimpleNamespace
 
 from megatron.lite.model.hy3.config import Hy3Config
 from megatron.lite.model.hy3.lite.checkpoint import Hy3WeightSpec
@@ -82,3 +84,44 @@ def test_checkpoint_tensor_iterator_includes_only_mapped_persistent_buffers():
     weight_map = {"weight": ["weight"], "expert_bias": ["expert_bias"]}
     tensors = dict(iter_checkpoint_tensors(Module(), weight_map))
     assert set(tensors) == {"weight", "expert_bias"}
+
+
+def test_hy3_export_translates_grouped_linear_local_expert_names():
+    pytest.importorskip("safetensors")
+    from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights
+
+    class Experts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = nn.Module()
+            self.fc1.register_parameter("weight0", nn.Parameter(torch.arange(64).reshape(8, 8).float()))
+
+    class Sparse(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe = nn.Module()
+            self.moe.experts = Experts()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Identity(), Sparse()])
+            self.layer_indices = [0, 1]
+
+    ps = SimpleNamespace(
+        pp_size=1,
+        tp_size=1,
+        tp_rank=0,
+        tp_group=None,
+        etp_size=1,
+        etp_rank=0,
+        etp_group=None,
+        ep_size=1,
+        ep_rank=0,
+        ep_group=None,
+    )
+    exported = dict(export_hf_weights(Model(), Hy3WeightSpec(_config()), ps))
+    assert set(exported) == {
+        "model.layers.1.mlp.experts.0.gate_proj.weight",
+        "model.layers.1.mlp.experts.0.up_proj.weight",
+    }
