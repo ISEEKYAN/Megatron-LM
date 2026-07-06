@@ -29,6 +29,14 @@ def _qwen35_symbols():
     return Qwen35Config, Qwen35Model
 
 
+def _hy3_symbols():
+    pytest.importorskip("transformer_engine.pytorch")
+    from megatron.lite.model.hy3.config import Hy3Config
+    from megatron.lite.model.hy3.lite.model import Hy3Model
+
+    return Hy3Config, Hy3Model
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _single_node_cuda_dist():
     if not torch.cuda.is_available():
@@ -91,6 +99,25 @@ def _tiny_qwen35_config():
         partial_rotary_factor=1.0,
         mrope_section=[1, 1, 0],
         layer_types=["linear_attention"],
+    )
+
+
+def _tiny_hy3_config():
+    Hy3Config, _Hy3Model = _hy3_symbols()
+    return Hy3Config(
+        num_hidden_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        vocab_size=64,
+        intermediate_size=24,
+        num_experts=2,
+        num_experts_per_tok=1,
+        moe_intermediate_size=8,
+        first_k_dense_replace=1,
+        max_position_embeddings=16,
+        num_nextn_predict_layers=0,
     )
 
 

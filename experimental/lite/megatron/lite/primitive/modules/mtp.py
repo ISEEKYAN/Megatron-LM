@@ -66,18 +66,27 @@ class MTPDecoderLayer(nn.Module):
         embedding: VocabParallelEmbedding,
         transformer_layer: nn.Module,
         detach_encoder: bool,
+        zero_centered_gamma: bool = True,
     ):
         super().__init__()
         self.ps = ps
         self.embedding = embedding
         self.detach_encoder = detach_encoder
-        self.enorm = te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
-        self.hnorm = te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
+        self.enorm = te.RMSNorm(
+            hidden_size, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
+        )
+        self.hnorm = te.RMSNorm(
+            hidden_size, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
+        )
         self.eh_proj = VanillaColumnParallelLinear(
             hidden_size * 2, hidden_size, ps, sp=ps.tp_size > 1, gather_output=True
         )
         self.transformer_layer = transformer_layer
-        self.final_layernorm = te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
+        self.final_layernorm = te.RMSNorm(
+            hidden_size,
+            eps=rms_norm_eps,
+            zero_centered_gamma=zero_centered_gamma,
+        )
 
     def forward(
         self,

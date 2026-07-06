@@ -201,7 +201,7 @@ class SigmoidTopKRouter(nn.Module):
         self.router_dtype = router_dtype
         self.router_replay: RouterReplay | None = None
 
-        self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
+        self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
         self.register_buffer(
             "expert_bias",
             torch.zeros(config.n_routed_experts, dtype=torch.float32),

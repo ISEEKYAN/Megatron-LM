@@ -25,25 +25,25 @@ from torch.distributed.tensor import Replicate, Shard
 def _pack_mcore_qkv(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, config: Qwen3MoEConfig
 ) -> torch.Tensor:
-    q_per_group = config.num_attention_heads // config.num_key_value_heads
-    q = q.view(config.num_key_value_heads, q_per_group * config.head_dim, -1)
-    k = k.view(config.num_key_value_heads, config.head_dim, -1)
-    v = v.view(config.num_key_value_heads, config.head_dim, -1)
-    return torch.cat([q, k, v], dim=1).reshape(-1, q.shape[-1]).contiguous()
+    return pack_grouped_query_qkv(
+        q,
+        k,
+        v,
+        num_attention_heads=config.num_attention_heads,
+        num_key_value_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+    )
 
 
 def _unpack_mcore_qkv(
     tensor: torch.Tensor, config: Qwen3MoEConfig
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q_per_group = config.num_attention_heads // config.num_key_value_heads
-    group_width = (q_per_group + 2) * config.head_dim
-    packed = tensor.view(config.num_key_value_heads, group_width, -1)
-    q_end = q_per_group * config.head_dim
-    k_end = q_end + config.head_dim
-    q = packed[:, :q_end].reshape(config.num_attention_heads * config.head_dim, -1)
-    k = packed[:, q_end:k_end].reshape(config.num_key_value_heads * config.head_dim, -1)
-    v = packed[:, k_end:].reshape(config.num_key_value_heads * config.head_dim, -1)
-    return q, k, v
+    return unpack_grouped_query_qkv(
+        tensor,
+        num_attention_heads=config.num_attention_heads,
+        num_key_value_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+    )
 
 
 class Qwen3MoEWeightSpec:

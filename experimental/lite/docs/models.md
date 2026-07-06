@@ -33,6 +33,16 @@ and `qwen2_moe` currently resolve through this compatibility path.
 megatron.lite.model.qwen3_5.lite.protocol
 ```
 
+`hy3` maps Hugging Face `model_type=hy_v3` to the native Tencent Hy3 lite
+implementation:
+
+```text
+megatron.lite.model.hy3.lite.protocol
+```
+
+Its architecture and primitive decisions are frozen in
+[`hy3_architecture.md`](hy3_architecture.md).
+
 ## Acknowledgements
 
 The Qwen3 MoE LoRA adapter support follows Mind-Lab's PEFT/Mint-compatible

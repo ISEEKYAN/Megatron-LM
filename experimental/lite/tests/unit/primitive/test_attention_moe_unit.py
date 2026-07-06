@@ -34,6 +34,14 @@ def _router_and_parallel_state(monkeypatch):
     return TopKRouter, ParallelState
 
 
+def _sigmoid_router_and_parallel_state():
+    pytest.importorskip("transformer_engine.pytorch")
+    from megatron.lite.primitive.modules.router import SigmoidTopKRouter
+    from megatron.lite.primitive.parallel import ParallelState
+
+    return SigmoidTopKRouter, ParallelState
+
+
 def _router_config():
     return SimpleNamespace(
         hidden_size=4, num_experts=4, num_experts_per_tok=2, router_aux_loss_coef=0.1
