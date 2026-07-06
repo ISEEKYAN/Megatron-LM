@@ -22,6 +22,11 @@
   expert 输出均逐字节一致——**首差收窄到 routed combine/unpermute/最终合并序(MoE TokenDispatcher)**,
   worker 在对照两侧 dispatcher 并插桩。罪犯 6 候选从 shared expert 改判 dispatcher combine 路径。
 
+- 11:53 **罪犯6定罪+修复**:dispatcher permute fusion——mlite Qwen3.5 未显式启用 MoE dispatcher
+  的 permute fusion(MCore 默认走),routed combine/unpermute 分叉源。修复 commit 1cd4573f3,红-绿+
+  33项聚焦回归通过;全深度 EP8 终验 13500499 在跑。**六罪犯全部定罪**(1聚合/2router/3GDN编译/
+  4RoPE/5export/6dispatcher fusion)。下一步:全模型同批 replay 比值终验→is/main port→10-step RL。
+
 ## 事实基线(睡前)
 - loss 已对齐 0.01%;grad 3.3x 未闭环;罪犯 1-5 已修(明细见 GATE0.md/G2-RESULTS.md)。
 - 15K megatron 锚点 step5 acc=0.7479;is/main 落后审计与 router primitive 修复方案在 .9 队列。
