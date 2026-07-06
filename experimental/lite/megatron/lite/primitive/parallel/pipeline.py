@@ -28,6 +28,7 @@ def forward_backward_pipelining(
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
     forward_only: bool = False,
+    loss_is_global_batch_normalized: bool = False,
 ) -> list[dict]:
     """
     Run forward and backward passes with pipeline parallelism.
@@ -65,6 +66,7 @@ def forward_backward_pipelining(
             grad_sync_fn=grad_sync_fn,
             pre_forward_hook=pre_forward_hook,
             loss_fn=loss_fn,
+            loss_is_global_batch_normalized=loss_is_global_batch_normalized,
         )
 
     if tensor_shape is None:
@@ -96,6 +98,7 @@ def forward_backward_pipelining(
             grad_sync_fn=grad_sync_fn,
             pre_forward_hook=pre_forward_hook,
             loss_fn=loss_fn,
+            loss_is_global_batch_normalized=loss_is_global_batch_normalized,
         )
 
     return _1f1b_schedule(
@@ -109,6 +112,7 @@ def forward_backward_pipelining(
         grad_sync_fn=grad_sync_fn,
         pre_forward_hook=pre_forward_hook,
         loss_fn=loss_fn,
+        loss_is_global_batch_normalized=loss_is_global_batch_normalized,
     )
 
 
@@ -149,6 +153,17 @@ def _apply_external_loss(
     return loss, metrics
 
 
+def _loss_for_backward(
+    loss: torch.Tensor,
+    num_microbatches: int,
+    loss_fn,
+    loss_is_global_batch_normalized: bool,
+) -> torch.Tensor:
+    if loss_fn is not None and loss_is_global_batch_normalized:
+        return loss
+    return loss / num_microbatches
+
+
 def _compact_pipeline_output(out: dict | None) -> dict:
     if not out:
         return {}
@@ -175,6 +190,7 @@ def _no_pipeline(
     grad_sync_fn=None,
     pre_forward_hook=None,
     loss_fn=None,
+    loss_is_global_batch_normalized: bool = False,
 ):
     num_microbatches = _num_microbatches_from_config(config, ps)
     outputs = []
@@ -189,7 +205,12 @@ def _no_pipeline(
             assert loss is not None
         else:
             loss = output["loss"]
-        loss = loss / num_microbatches
+        loss = _loss_for_backward(
+            loss,
+            num_microbatches,
+            loss_fn,
+            loss_is_global_batch_normalized,
+        )
         loss.backward()
         outputs.append(_compact_pipeline_output(output))
     return outputs
@@ -225,6 +246,7 @@ def _1f1b_schedule(
     grad_sync_fn=None,
     pre_forward_hook=None,
     loss_fn=None,
+    loss_is_global_batch_normalized: bool = False,
 ):
     """
     1-Forward-1-Backward pipeline schedule using batch_isend_irecv.
@@ -301,7 +323,16 @@ def _1f1b_schedule(
         current_input = fwd_input
         out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
-        loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
+        loss_s = (
+            _loss_for_backward(
+                out["loss"],
+                num_microbatches,
+                loss_fn,
+                loss_is_global_batch_normalized,
+            )
+            if "loss" in out and ps.pp_is_last
+            else None
+        )
 
         need_recv_next = not ps.pp_is_first and k < num_warmup - 1
         if not ps.pp_is_last:
@@ -327,7 +358,16 @@ def _1f1b_schedule(
         mb_idx += 1
         out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
-        loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
+        loss_s = (
+            _loss_for_backward(
+                out["loss"],
+                num_microbatches,
+                loss_fn,
+                loss_is_global_batch_normalized,
+            )
+            if "loss" in out and ps.pp_is_last
+            else None
+        )
 
         input_tensors.append(fwd_input if not ps.pp_is_first else None)
         output_hiddens.append(hidden)
@@ -602,6 +642,7 @@ def _interleaved_1f1b_schedule(
     grad_sync_fn=None,
     pre_forward_hook=None,
     loss_fn=None,
+    loss_is_global_batch_normalized: bool = False,
 ):
     """
     Correct non-overlapped schedule for Virtual Pipeline Parallelism (VPP).
@@ -676,7 +717,16 @@ def _interleaved_1f1b_schedule(
                         f"chunk={chunk_id} hidden_shape={hidden_shape}",
                         flush=True,
                     )
-                loss = out["loss"] / num_microbatches if is_last_stage and "loss" in out else None
+                loss = (
+                    _loss_for_backward(
+                        out["loss"],
+                        num_microbatches,
+                        loss_fn,
+                        loss_is_global_batch_normalized,
+                    )
+                    if is_last_stage and "loss" in out
+                    else None
+                )
                 saved[stage_id] = (activation, hidden, loss, out)
 
                 if is_last_stage:

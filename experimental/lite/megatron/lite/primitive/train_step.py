@@ -22,6 +22,7 @@ def run_microbatch_loop(
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
     forward_only: bool = False,
+    loss_is_global_batch_normalized: bool = False,
 ):
     """Run forward-backward over microbatches with loss accumulation.
 
@@ -45,9 +46,14 @@ def run_microbatch_loop(
             ``infer_batch``). The caller (verl) runs the forward under ``no_grad`` so the
             loss has no ``grad_fn``; calling ``.backward()`` then raises. Mirrors the
             pipeline path, which already threads ``forward_only`` to skip backward.
+        loss_is_global_batch_normalized: The external loss already uses the logical
+            batch's global denominator. Such per-microbatch contributions are summed
+            for backward instead of averaged again. Ignored when ``loss_fn`` is None.
     """
     last_out = None
     all_metrics: list[dict] = []
+    micro_outputs: list[dict] = []
+    accumulated_loss: torch.Tensor | None = None
     for mb in range(num_microbatches):
         batch, loss_context = split_loss_context(next(data_iter))
         if pre_forward_hook is not None:
@@ -62,15 +68,36 @@ def run_microbatch_loop(
                 loss, metrics = loss_fn(out, batch)
             else:
                 loss, metrics = loss_fn(out, batch, loss_context)
+            backward_loss = loss if loss_is_global_batch_normalized else loss / num_microbatches
             if not forward_only:
-                (loss / num_microbatches).backward()
+                backward_loss.backward()
             out["loss"] = loss.detach()
             all_metrics.append(metrics)
+            micro_outputs.append(
+                {
+                    "model_output": out.get("_verl_model_output", {}),
+                    "loss": loss.detach().item(),
+                    "metrics": metrics,
+                }
+            )
         elif not forward_only:
-            (out["loss"] / num_microbatches).backward()
+            backward_loss = out["loss"] / num_microbatches
+            backward_loss.backward()
+        else:
+            backward_loss = out["loss"] / num_microbatches
+        detached_backward_loss = backward_loss.detach()
+        accumulated_loss = (
+            detached_backward_loss
+            if accumulated_loss is None
+            else accumulated_loss + detached_backward_loss
+        )
         last_out = out
-    if last_out is not None and all_metrics:
-        last_out["_loss_fn_metrics"] = all_metrics
+    if last_out is not None:
+        if accumulated_loss is not None:
+            last_out["loss"] = accumulated_loss
+        if all_metrics:
+            last_out["_loss_fn_metrics"] = all_metrics
+            last_out["_micro_outputs"] = micro_outputs
     return last_out
 
 

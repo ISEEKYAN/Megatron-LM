@@ -678,6 +678,7 @@ class MegatronLiteEngine(BaseEngine):
             loss_fn=runtime_loss_fn,
             num_microbatches=num_micro_batches,
             forward_only=forward_only,
+            loss_is_global_batch_normalized=loss_function is not None,
         )
         metrics = dict(result.metrics)
         micro_outputs = metrics.pop("_micro_outputs", None)

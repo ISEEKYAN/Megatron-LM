@@ -79,12 +79,16 @@ class Runtime(ABC):
         *,
         num_microbatches: int = 1,
         forward_only: bool = False,
+        loss_is_global_batch_normalized: bool = False,
     ) -> ForwardResult:
         """Forward + backward pass over data.
 
         Args:
             num_microbatches: Number of microbatches to accumulate inside one
                 logical training step.
+            loss_is_global_batch_normalized: Whether each external loss is an
+                already globally normalized contribution to the logical batch.
+                When true, contributions are summed instead of averaged again.
             loss_fn: Optional external loss function with signature::
 
                 loss_fn(model_output: dict, batch) -> (loss: Tensor, metrics: dict)

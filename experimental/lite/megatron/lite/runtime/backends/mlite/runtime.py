@@ -391,6 +391,7 @@ class MegatronLiteRuntime(RuntimeBase):
         *,
         num_microbatches: int = 1,
         forward_only: bool = False,
+        loss_is_global_batch_normalized: bool = False,
     ) -> ForwardResult:
         from megatron.lite.primitive.train_step import run_microbatch_loop
 
@@ -427,6 +428,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 pre_forward_hook=handle._extras.get("pre_forward_hook"),
                 loss_fn=loss_fn,
                 forward_only=forward_only,
+                loss_is_global_batch_normalized=loss_is_global_batch_normalized,
             )
             out = _last_loss_output(outputs)
             loss_obj = out.get("loss") if out else None
@@ -451,6 +453,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 pre_forward_hook=handle._extras.get("pre_forward_hook"),
                 loss_fn=loss_fn,
                 forward_only=forward_only,
+                loss_is_global_batch_normalized=loss_is_global_batch_normalized,
             )
 
         if not forward_only:
@@ -469,6 +472,8 @@ class MegatronLiteRuntime(RuntimeBase):
             for k, v in m.items():
                 if k not in metrics:
                     metrics[k] = v
+        if out and out.get("_micro_outputs") is not None:
+            metrics["_micro_outputs"] = out["_micro_outputs"]
         if ps.pp_size > 1:
             for item in outputs:
                 for k, v in item.get("metrics", {}).items():
