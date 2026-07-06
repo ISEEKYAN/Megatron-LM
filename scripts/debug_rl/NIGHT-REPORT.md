@@ -27,6 +27,13 @@
   33项聚焦回归通过;全深度 EP8 终验 13500499 在跑。**六罪犯全部定罪**(1聚合/2router/3GDN编译/
   4RoPE/5export/6dispatcher fusion)。下一步:全模型同批 replay 比值终验→is/main port→10-step RL。
 
+## ⚠ 12:22 反转警示
+- 全模型 replay 13500928(dispatcher 修复后)grad_norm **仍 0.140=3.33x**,loss 仍对齐。
+  => 六罪犯修复对 loss 有效,对全模型 grad_norm 比值**未见效**。dispatcher fusion 的单元级证据
+  (grad_abs=0)可能是窄证明,不代表全模型梯度贡献占比。**grad_norm 3.3x 仍未真正闭环**。
+- 已下强制单变量校验:fusion on/off 严格对照 + 查 effective 值是否被 launcher/env 覆盖(类 betas 坑)+
+  嫌疑退回 verl↔engine 集成层(micro 累加/DTensor reduce)。晨报需 bayan 知悉:定罪≠已解决,勿轻信。
+
 ## 事实基线(睡前)
 - loss 已对齐 0.01%;grad 3.3x 未闭环;罪犯 1-5 已修(明细见 GATE0.md/G2-RESULTS.md)。
 - 15K megatron 锚点 step5 acc=0.7479;is/main 落后审计与 router primitive 修复方案在 .9 队列。
