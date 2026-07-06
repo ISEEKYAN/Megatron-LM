@@ -4,9 +4,11 @@ from dataclasses import dataclass
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 import torch.nn as nn
 
 from megatron.lite.runtime import create_runtime
@@ -261,6 +263,41 @@ def test_runtime_dispatch_creates_mlite_backend():
 def test_runtime_dispatch_unknown_backend_raises():
     with pytest.raises(KeyError):
         create_runtime(RuntimeConfig(backend="nonexistent"))
+
+
+def test_runtime_preserves_all_micro_outputs_for_external_loss_aggregation():
+    model = nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    handle = ModelHandle(
+        model=model,
+        parallel_state=SimpleNamespace(pp_size=1),
+        _extras={"forward_step": lambda module, batch: {"value": module(batch["tokens"])}},
+    )
+    batches = iter(
+        [
+            {"tokens": torch.tensor([[2.0]]), "global_tokens": torch.tensor(8.0)},
+            {"tokens": torch.tensor([[6.0]]), "global_tokens": torch.tensor(8.0)},
+        ]
+    )
+
+    def loss_fn(output, batch):
+        loss = output["value"].sum() / batch["global_tokens"]
+        return loss, {"pg_loss": loss.detach()}
+
+    result = MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
+        handle,
+        batches,
+        loss_fn,
+        num_microbatches=2,
+        loss_is_global_batch_normalized=True,
+    )
+
+    assert model.weight.grad.item() == pytest.approx(1.0)
+    assert result.model_output.loss.item() == pytest.approx(1.0)
+    assert [item["loss"] for item in result.metrics["_micro_outputs"]] == pytest.approx([0.25, 0.75])
+    assert [
+        item["metrics"]["pg_loss"].item() for item in result.metrics["_micro_outputs"]
+    ] == pytest.approx([0.25, 0.75])
 
 
 def _run_verl_sft_dry_run(script: Path, tmp_path: Path, **env_overrides: str) -> str:
