@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,7 @@ import torch
 from verl_mlite.engine.config import MegatronLiteEngineConfig
 from verl_mlite.engine.mlite_engine import MegatronLiteEngine, _build_lr_scheduler
 from megatron.lite.runtime.contracts import LossContext
+from megatron.lite.runtime.backends.mlite.runtime import _build_impl_cfg
 
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
@@ -180,6 +182,7 @@ def test_rl_engine_defaults_router_aux_loss_off() -> None:
     config = engine._build_mlite_config()
 
     assert config.router_aux_loss_coef == 0.0
+    assert _runtime_impl_config(config).router_aux_loss_coef == 0.0
 
 
 def test_rl_engine_explicit_router_aux_loss_coef_wins() -> None:
@@ -188,3 +191,13 @@ def test_rl_engine_explicit_router_aux_loss_coef_wins() -> None:
     config = engine._build_mlite_config()
 
     assert config.router_aux_loss_coef == 0.005
+    assert _runtime_impl_config(config).router_aux_loss_coef == 0.005
+
+
+def _runtime_impl_config(config):
+    @dataclass
+    class _ImplConfig:
+        parallel: object
+        router_aux_loss_coef: float | None = None
+
+    return _build_impl_cfg(SimpleNamespace(ImplConfig=_ImplConfig), config)
