@@ -169,3 +169,22 @@ def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
 
     assert scheduler.state_dict() == state
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.7)
+
+
+def test_rl_engine_defaults_router_aux_loss_off() -> None:
+    """RL parity: verl megatron runs moe_router_load_balancing_type='none'
+    ("turn off aux_loss as it hurts perf in RL"); the mlite engine must not
+    fall through to the HF checkpoint's nonzero router_aux_loss_coef."""
+    engine = _engine(engine_config=_engine_config())
+
+    config = engine._build_mlite_config()
+
+    assert config.router_aux_loss_coef == 0.0
+
+
+def test_rl_engine_explicit_router_aux_loss_coef_wins() -> None:
+    engine = _engine(engine_config=_engine_config(router_aux_loss_coef=0.005))
+
+    config = engine._build_mlite_config()
+
+    assert config.router_aux_loss_coef == 0.005
