@@ -1,16 +1,21 @@
-# 夜间托管晨报(2026-07-06 夜)—— ⭐bayan 请先读这里
+# 夜间托管晨报(2026-07-06 夜,07-07 晨刷新)—— ⭐bayan 请先读这里
 
-## 一句话结论
-grad_norm 3.3x 根因**已定位到 FSDP2 参数 wgrad/fully_shard reduce-scatter 的分布式梯度归约口径**(4-DP×EP8),
-**非模型数学**(模型层 backward 输出已证 ≤2%)。这与你"fsdp 天然非 bitwise"的判断吻合。.9 已 block 交你裁定。
+## 一句话结论(07-07 晨版,推翻昨晚 fsdp2 归约结论)
+grad_norm 3.4x 根因**未闭环但大幅收敛**:昨晚"FSDP2 归约口径"已被实验推翻(lite+distopt 也 0.140,job13517351)。
+确证事实链(全有 job id,详见 .10 notes 02:14 条):只发散在**参数 wgrad**(dgrad 对齐 1.007-1.02)、
+只在**长序列 8289 触发**(SFT 短序列恒对齐,含 micro>1/recompute=full)、逐族越深越大(head1.0→GDN4.0)、
+**head 是唯一对齐族且是唯一不走 TE 的层**(vanilla matmul,linear.py)——最新硬线索=**TE Linear wgrad 路径**(mlite 用 TE 的方式 vs MCore),具体行未定。
+已排除(实测):优化器/FSDP2·norm 归约/loss 缩放(13516738 负结果)/expert1/8/THD 边界/micro 累加/recompute/六罪犯。
 
 ## 待 bayan 决策(2项)
 1. **[方向裁定] grad_norm 收口路线**——二选一:
-   - A) 拆专门 fsdp2-grad-reduce 子节点继续追 →1(需 4节点逐参数探针,周期不定);
-   - B) **接受 3.4x 为已定界的分布式归约差,转 10-step RL 看 acc 实效**(推荐:符合你早先判断,且"RL 能 work"本就是终极交付标准,grad_norm 精确对齐非必须)。
+   - A) 继续钻 TE Linear wgrad:比对 mlite 调 TE Linear 的方式 vs MCore(wgrad 精度/fuse/accumulation 口径),有 12层分钟级 proxy+逐族比值口径可用,收敛在望但周期不定;
+   - B) **转 10-step RL 看 acc 实效**(grad_norm 差记为已定界 backlog:wgrad×长序列×TE 路径;"RL 能 work"是终极交付标准)。
 2. **[unblock] TASK-1.1.15.3**(10:10 起挂,15K 三方对比被卡):
    `env -u VICKY_ACTOR -u VICKY_TASK -u VICKY_LAUNCH_ID vicky unblock TASK-1.1.15.3 --as bayan`
    (若选 B,.3 正好用全修复 mlite 跑 15K 看 acc,一并解决决策1的验证)
+
+> 注:以下"六罪犯/版本勘误"仍有效;昨晚流水里 12:22 后的 fsdp2/优化器方向结论已被 07-07 凌晨实验修正,以本节和 .10 notes(02:14/02:23 两条)为准。
 
 ## 六罪犯修复(独立成立,建议先落 PR)
 1 聚合契约(PR#80已含) / 2 router BF16 / 3 GDN 编译契约 / 4 RoPE inv_freq FP32 / 5 export 重构丢失 / 6 dispatcher permute fusion
