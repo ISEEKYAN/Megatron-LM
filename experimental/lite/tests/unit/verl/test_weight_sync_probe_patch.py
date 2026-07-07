@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import importlib.util
 import json
 import sys
 
@@ -43,6 +45,14 @@ def test_sender_patch_installs_lazy_hook_without_importing_verl(monkeypatch):
         assert not _patch_bucketed_weight_sender()
     finally:
         sys.meta_path[:] = original_meta_path
+
+
+@pytest.mark.skipif(importlib.util.find_spec("verl") is None, reason="veRL is required")
+def test_lazy_hook_patches_real_verl_sender(monkeypatch):
+    monkeypatch.setenv("MLITE_WEIGHT_SYNC_PROBE", "1")
+    assert _patch_bucketed_weight_sender()
+    module = importlib.import_module(_BUCKETED_SENDER_MODULE)
+    assert module.BucketedWeightSender._mlite_weight_sync_probe_patch
 
 
 def test_sender_patch_is_idempotent_and_profiles_handshake(monkeypatch, capsys):
