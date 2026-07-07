@@ -28,6 +28,43 @@ try:
 except Exception:  # pragma: no cover - older torch without DTensor
     DTensor = None  # type: ignore[assignment]
 
+from megatron.lite.primitive.ckpt.weight_sync_probe import get_weight_sync_probe
+
+
+def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
+
+
+def _to_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type == "cpu":
+        return tensor
+    with get_weight_sync_probe().measure("d2h", nbytes=_tensor_nbytes(tensor), device=tensor.device):
+        return tensor.cpu()
+
+
+def _copy_to_cpu(dst: torch.Tensor, src: torch.Tensor) -> None:
+    if src.device.type == "cpu":
+        dst.copy_(src)
+        return
+    with get_weight_sync_probe().measure("d2h", nbytes=_tensor_nbytes(src), device=src.device):
+        dst.copy_(src)
+
+
+def _ep_all_gather(outputs: list[torch.Tensor], tensor: torch.Tensor, group) -> None:
+    with get_weight_sync_probe().measure(
+        "ep_gather",
+        nbytes=sum(_tensor_nbytes(output) for output in outputs),
+        device=tensor.device,
+    ):
+        dist.all_gather(outputs, tensor, group=group)
+
+
+def _native_to_hf(spec: HFWeights, name: str, tensor: torch.Tensor):
+    with get_weight_sync_probe().measure("mapping") as sample:
+        mapped = spec.native_to_hf(name, tensor)
+        sample.nbytes = sum(_tensor_nbytes(value) for _, value in mapped)
+        return mapped
+
 
 def _materialize_dtensor(tensor: torch.Tensor) -> torch.Tensor:
     """Reconstruct a plain local tensor from an FSDP2 ``DTensor`` parameter.
@@ -42,7 +79,10 @@ def _materialize_dtensor(tensor: torch.Tensor) -> torch.Tensor:
     params (dist_opt backend) pass through untouched.
     """
     if DTensor is not None and isinstance(tensor, DTensor):
-        return tensor.full_tensor()
+        with get_weight_sync_probe().measure("fsdp_gather", device=tensor.device) as sample:
+            result = tensor.full_tensor()
+            sample.nbytes = _tensor_nbytes(result)
+            return result
     return tensor
 
 
@@ -449,7 +489,7 @@ def export_hf_weights(
                             "embed" in native_name or "head" in native_name
                         ):
                             gathered_tensor = gathered_tensor[:vocab_size]
-                        for hf_name, hf_tensor in spec.native_to_hf(native_name, gathered_tensor):
+                        for hf_name, hf_tensor in _native_to_hf(spec, native_name, gathered_tensor):
                             yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
 
                 if limit is not None and exported_params >= limit:
@@ -461,7 +501,7 @@ def export_hf_weights(
             if not rank0_only or rank == 0:
                 for native_name in sorted(gathered_group, key=parse_expert_idx):
                     gathered_tensor = gathered_group[native_name]
-                    for hf_name, hf_tensor in spec.native_to_hf(native_name, gathered_tensor):
+                    for hf_name, hf_tensor in _native_to_hf(spec, native_name, gathered_tensor):
                         yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
         return
 
@@ -504,7 +544,7 @@ def export_hf_weights(
 
     # Convert Megatron Lite names → HF names via spec
     for native_name, tensor in gathered.items():
-        for hf_name, hf_tensor in spec.native_to_hf(native_name, tensor):
+        for hf_name, hf_tensor in _native_to_hf(spec, native_name, tensor):
             yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
 
 
@@ -514,14 +554,14 @@ def _gather_dense(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch
     if callable(custom_gather):
         gathered = custom_gather(name, tensor, ps)
         if gathered is not None:
-            return gathered.cpu()
+            return _to_cpu(gathered)
 
     tp_info = spec.tp_spec(name)
     if tp_info is not None and ps.tp_size > 1:
         split_d, tp_or_etp = tp_info
         if tp_or_etp == 0:
             tensor = allgather_concat(tensor, ps.tp_size, ps.tp_group, dim=split_d)
-    return tensor.cpu()
+    return _to_cpu(tensor)
 
 
 def _gather_expert(
@@ -535,12 +575,12 @@ def _gather_expert(
     if ps.ep_size > 1 and ps.ep_group is not None:
         n_local = spec.num_experts // ps.ep_size
         ep_gathered = [torch.empty_like(tensor) for _ in range(ps.ep_size)]
-        dist.all_gather(ep_gathered, tensor.contiguous(), group=ps.ep_group)
+        _ep_all_gather(ep_gathered, tensor.contiguous(), ps.ep_group)
         for ep_rank, ep_tensor in enumerate(ep_gathered):
             global_idx = ep_rank * n_local + local_idx
-            out[set_expert_idx(name, global_idx)] = ep_tensor.cpu()
+            out[set_expert_idx(name, global_idx)] = _to_cpu(ep_tensor)
     else:
-        out[name] = tensor.cpu()
+        out[name] = _to_cpu(tensor)
 
 
 def _gather_expert_etp(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch.Tensor:
@@ -572,9 +612,9 @@ def _gather_expert_group(
         packed_name = packed_group_name(prepared[0][1])
         if packed_name is not None:
             if ps.ep_size <= 1 or ps.ep_group is None:
-                out[packed_name] = torch.stack(
-                    [tensor.contiguous() for _, _, tensor in prepared], dim=0
-                ).cpu()
+                out[packed_name] = _to_cpu(
+                    torch.stack([tensor.contiguous() for _, _, tensor in prepared], dim=0)
+                )
                 return
 
             sample = prepared[0][2]
@@ -583,26 +623,29 @@ def _gather_expert_group(
                 batch = prepared[batch_start : batch_start + 4]
                 stacked = torch.stack([tensor.contiguous() for _, _, tensor in batch], dim=0)
                 ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
-                dist.all_gather(ep_gathered, stacked, group=ps.ep_group)
+                _ep_all_gather(ep_gathered, stacked, ps.ep_group)
                 for ep_rank, ep_tensor in enumerate(ep_gathered):
                     for batch_idx, (local_idx, _, _) in enumerate(batch):
-                        packed[ep_rank * (spec.num_experts // ps.ep_size) + local_idx].copy_(ep_tensor[batch_idx])
+                        _copy_to_cpu(
+                            packed[ep_rank * (spec.num_experts // ps.ep_size) + local_idx],
+                            ep_tensor[batch_idx],
+                        )
             out[packed_name] = packed
             return
 
     if ps.ep_size <= 1 or ps.ep_group is None:
         for _, name, tensor in prepared:
-            out[name] = tensor.cpu()
+            out[name] = _to_cpu(tensor)
         return
 
     n_local = spec.num_experts // ps.ep_size
     stacked = torch.stack([tensor.contiguous() for _, _, tensor in prepared], dim=0)
     ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
-    dist.all_gather(ep_gathered, stacked, group=ps.ep_group)
+    _ep_all_gather(ep_gathered, stacked, ps.ep_group)
     for ep_rank, ep_tensor in enumerate(ep_gathered):
         for slot, (local_idx, name, _) in enumerate(prepared):
             global_idx = ep_rank * n_local + local_idx
-            out[set_expert_idx(name, global_idx)] = ep_tensor[slot].cpu()
+            out[set_expert_idx(name, global_idx)] = _to_cpu(ep_tensor[slot])
 
 
 def save_hf_weights(

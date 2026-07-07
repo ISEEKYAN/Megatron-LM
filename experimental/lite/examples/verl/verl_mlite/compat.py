@@ -4,11 +4,103 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from collections.abc import Iterable
 from functools import wraps
 from pathlib import Path
 from typing import Any
+
+
+def _instrument_bucketed_weight_sender(sender_cls: type) -> bool:
+    """Patch veRL's sender only while the opt-in sync probe is enabled."""
+    if getattr(sender_cls, "_mlite_weight_sync_probe_patch", False):
+        return False
+
+    import torch
+    import torch.distributed as dist
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from megatron.lite.primitive.ckpt.weight_sync_probe import (
+        get_weight_sync_probe,
+        weight_sync_probe_session,
+    )
+
+    probe = get_weight_sync_probe()
+    original_init_socket = sender_cls._init_socket
+    original_async_send_weights = sender_cls.async_send_weights
+
+    class _ProfiledSocket:
+        def __init__(self, socket):
+            self._socket = socket
+
+        def __getattr__(self, name):
+            return getattr(self._socket, name)
+
+        def send_pyobj(self, *args, **kwargs):
+            with probe.measure("handshake"):
+                return self._socket.send_pyobj(*args, **kwargs)
+
+        def recv(self, *args, **kwargs):
+            with probe.measure("handshake"):
+                return self._socket.recv(*args, **kwargs)
+
+    class _H2DCopyMode(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if func is torch.ops.aten.copy_.default and len(args) >= 2:
+                dst, src = args[:2]
+                if (
+                    isinstance(dst, torch.Tensor)
+                    and isinstance(src, torch.Tensor)
+                    and dst.device.type == "cuda"
+                    and src.device.type == "cpu"
+                ):
+                    with probe.measure("h2d", nbytes=src.nbytes, device=dst.device):
+                        return func(*args, **kwargs)
+            return func(*args, **kwargs)
+
+    def profiled_init_socket(self, *args, **kwargs):
+        result = original_init_socket(self, *args, **kwargs)
+        self.socket = _ProfiledSocket(self.socket)
+        return result
+
+    async def profiled_async_send_weights(self, weights):
+        backend = os.getenv("MLITE_WEIGHT_SYNC_PROBE_BACKEND", "unknown")
+        original_all_gather_into_tensor = dist.all_gather_into_tensor
+
+        def profiled_all_gather_into_tensor(output, tensor, *args, **kwargs):
+            with probe.measure("mbridge_gather", nbytes=output.nbytes, device=tensor.device):
+                return original_all_gather_into_tensor(output, tensor, *args, **kwargs)
+
+        with weight_sync_probe_session(backend), _H2DCopyMode():
+            dist.all_gather_into_tensor = profiled_all_gather_into_tensor
+            try:
+                return await original_async_send_weights(self, weights)
+            finally:
+                dist.all_gather_into_tensor = original_all_gather_into_tensor
+
+    sender_cls._init_socket = profiled_init_socket
+    sender_cls.async_send_weights = profiled_async_send_weights
+    sender_cls._mlite_weight_sync_probe_patch = True
+    return True
+
+
+def _patch_bucketed_weight_sender() -> None:
+    if os.getenv("MLITE_WEIGHT_SYNC_PROBE", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    try:
+        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
+            BucketedWeightSender,
+        )
+    except (ModuleNotFoundError, ImportError):
+        return
+    _instrument_bucketed_weight_sender(BucketedWeightSender)
 
 
 def _patch_transformers_rope_ignore_keys() -> None:
@@ -57,6 +149,7 @@ def _patch_transformers_rope_ignore_keys() -> None:
 
 def apply_runtime_patches() -> None:
     _patch_transformers_rope_ignore_keys()
+    _patch_bucketed_weight_sender()
 
 
 def _load_verl_file(relative_path: str, module_name: str):
