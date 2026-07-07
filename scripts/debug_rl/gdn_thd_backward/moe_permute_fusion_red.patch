@@ -1,0 +1,26 @@
+diff --git a/experimental/lite/tests/unit/model/test_qwen_config_unit.py b/experimental/lite/tests/unit/model/test_qwen_config_unit.py
+--- a/experimental/lite/tests/unit/model/test_qwen_config_unit.py
++++ b/experimental/lite/tests/unit/model/test_qwen_config_unit.py
+@@ -151,6 +151,8 @@ def test_qwen35_router_gemm_is_fp32_outside_deterministic_mode(
+     model.Qwen35Layer(cfg, ParallelState(), 0, deterministic=False)
+ 
+     assert captured["router_dtype"] is torch.float32
++    assert captured["shared_expert_plain_te"] is True
++    assert captured["moe_permute_fusion"] is True
+ 
+ 
+ def test_qwen35_full_attention_applies_rope_in_fp32(
+diff --git a/experimental/lite/tests/unit/primitive/test_parallel_dimensions_independent_unit.py b/experimental/lite/tests/unit/primitive/test_parallel_dimensions_independent_unit.py
+--- a/experimental/lite/tests/unit/primitive/test_parallel_dimensions_independent_unit.py
++++ b/experimental/lite/tests/unit/primitive/test_parallel_dimensions_independent_unit.py
+@@ -130,1 +130,10 @@ def test_ep_token_dispatcher_local_roundtrip_is_independent_of_deepep():
+     torch.testing.assert_close(hidden.grad, torch.ones_like(hidden))
++
++
++def test_ep_token_dispatcher_accepts_explicit_permute_fusion():
++    from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
++
++    dispatcher = TokenDispatcher(3, 2, ParallelState(), moe_permute_fusion=True)
++    assert dispatcher.moe_permute_fusion is True
++
++

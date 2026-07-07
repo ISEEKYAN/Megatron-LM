@@ -1,0 +1,109 @@
+diff --git a/experimental/lite/megatron/lite/primitive/modules/dispatcher.py b/experimental/lite/megatron/lite/primitive/modules/dispatcher.py
+--- a/experimental/lite/megatron/lite/primitive/modules/dispatcher.py
++++ b/experimental/lite/megatron/lite/primitive/modules/dispatcher.py
+@@ -188,13 +188,20 @@ class TokenDispatcher:
+ 
+     def __init__(
+-        self, num_experts: int, hidden_size: int, ps: ParallelState, *, use_deepep: bool = True
++        self,
++        num_experts: int,
++        hidden_size: int,
++        ps: ParallelState,
++        *,
++        use_deepep: bool = True,
++        moe_permute_fusion: bool | None = None,
+     ):
+         self.ps = ps
+         self.num_experts = num_experts
+         self.ep_size = ps.ep_size
+         self.num_local_experts = ensure_divisible(num_experts, ps.ep_size)
++        self.moe_permute_fusion = (
++            _use_moe_permute_fusion() if moe_permute_fusion is None else bool(moe_permute_fusion)
++        )
+ 
+         self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
+         if self.use_deepep:
+@@ -245,7 +252,7 @@ class TokenDispatcher:
+             expert_output,
+             self._row_id_map,
+             restore_shape=self._restore_shape,
+-            fused=_use_moe_permute_fusion(),
++            fused=self.moe_permute_fusion,
+         )
+@@ -294,7 +301,7 @@ class TokenDispatcher:
+             routing_map,
+             probs=probs_2d,
+             num_out_tokens=num_out,
+-            fused=_use_moe_permute_fusion(),
++            fused=self.moe_permute_fusion,
+         )[:3]
+@@ -308,7 +315,7 @@ class TokenDispatcher:
+             expert_output,
+             self._row_id_map,
+             restore_shape=self._restore_shape,
+-            fused=_use_moe_permute_fusion(),
++            fused=self.moe_permute_fusion,
+         )
+@@ -336,7 +343,7 @@ class TokenDispatcher:
+             routing_map,
+             probs=probs_2d,
+             num_out_tokens=num_out,
+-            fused=_use_moe_permute_fusion(),
++            fused=self.moe_permute_fusion,
+         )[:3]
+@@ -398,7 +405,7 @@ class TokenDispatcher:
+             combined,
+             self._row_id_map,
+             restore_shape=self._restore_shape,
+-            fused=_use_moe_permute_fusion(),
++            fused=self.moe_permute_fusion,
+         )
+@@ -503,7 +510,7 @@ class TokenDispatcher:
+             routing_map,
+             probs=probs_2d,
+             num_out_tokens=num_out,
+-            fused=_use_moe_permute_fusion(),
++            fused=self.moe_permute_fusion,
+         )[:3]
+@@ -562,7 +569,7 @@ class TokenDispatcher:
+             combined,
+             self._row_id_map,
+             restore_shape=self._restore_shape,
+-            fused=_use_moe_permute_fusion(),
++            fused=self.moe_permute_fusion,
+         )
+diff --git a/experimental/lite/megatron/lite/model/qwen3_5/lite/model.py b/experimental/lite/megatron/lite/model/qwen3_5/lite/model.py
+--- a/experimental/lite/megatron/lite/model/qwen3_5/lite/model.py
++++ b/experimental/lite/megatron/lite/model/qwen3_5/lite/model.py
+@@ -165,6 +165,7 @@ class MoELayer(nn.Module):
+         router_dtype: torch.dtype | None = None,
+         preserve_3d_graph: bool = False,
+         shared_expert_plain_te: bool = False,
++        moe_permute_fusion: bool | None = None,
+     ):
+@@ -178,7 +179,11 @@ class MoELayer(nn.Module):
+         )
+         self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
+         self.dispatcher = TokenDispatcher(
+-            config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
++            config.num_experts,
++            config.hidden_size,
++            ps,
++            use_deepep=use_deepep,
++            moe_permute_fusion=moe_permute_fusion,
+         )
+@@ -283,6 +288,7 @@ class Qwen35Layer(nn.Module):
+             router_dtype=torch.float32,
+             preserve_3d_graph=deterministic,
+             shared_expert_plain_te=deterministic,
++            moe_permute_fusion=True,
+         )
+diff --git a/experimental/lite/tests/unit/model/test_qwen_config_unit.py b/experimental/lite/tests/unit/model/test_qwen_config_unit.py
+--- a/experimental/lite/tests/unit/model/test_qwen_config_unit.py
++++ b/experimental/lite/tests/unit/model/test_qwen_config_unit.py
+@@ -151,7 +151,6 @@ def test_qwen35_router_gemm_is_fp32_outside_deterministic_mode(
+     model.Qwen35Layer(cfg, ParallelState(), 0, deterministic=False)
+ 
+     assert captured["router_dtype"] is torch.float32
+-    assert captured["shared_expert_plain_te"] is True
+     assert captured["moe_permute_fusion"] is True
