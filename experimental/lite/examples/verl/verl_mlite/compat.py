@@ -16,6 +16,15 @@ from typing import Any
 _BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
 
 
+def _weight_sync_probe_enabled() -> bool:
+    return os.getenv("MLITE_WEIGHT_SYNC_PROBE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _instrument_bucketed_weight_sender(sender_cls: type) -> bool:
     """Patch veRL's sender only while the opt-in sync probe is enabled."""
     if getattr(sender_cls, "_mlite_weight_sync_probe_patch", False):
@@ -116,12 +125,7 @@ class _SenderPatchFinder(importlib.abc.MetaPathFinder):
 
 
 def _patch_bucketed_weight_sender() -> bool:
-    if os.getenv("MLITE_WEIGHT_SYNC_PROBE", "").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    if not _weight_sync_probe_enabled():
         return False
 
     module = sys.modules.get(_BUCKETED_SENDER_MODULE)

@@ -14,6 +14,7 @@ from verl_mlite.compat import (
     _BUCKETED_SENDER_MODULE,
     _instrument_bucketed_weight_sender,
     _patch_bucketed_weight_sender,
+    _weight_sync_probe_enabled,
 )
 
 
@@ -33,6 +34,16 @@ class _Sender:
         self._init_socket()
         self.socket.send_pyobj({"is_last": True})
         return self.socket.recv()
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "false", "off"])
+def test_probe_flag_rejects_false_values(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("MLITE_WEIGHT_SYNC_PROBE", raising=False)
+    else:
+        monkeypatch.setenv("MLITE_WEIGHT_SYNC_PROBE", value)
+
+    assert not _weight_sync_probe_enabled()
 
 
 def test_sender_patch_installs_lazy_hook_without_importing_verl(monkeypatch):
