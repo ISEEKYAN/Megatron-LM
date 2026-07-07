@@ -60,9 +60,11 @@ def counting_scaler(monkeypatch):
 
 @pytest.mark.parametrize("coef,expected_calls", [(0.0, 0), (0.001, 1)])
 def test_topk_router_skips_aux_loss_when_coef_zero(counting_scaler, coef, expected_calls):
-    router = TopKRouter(_config(coef), _ps())
+    if not torch.cuda.is_available():
+        pytest.skip("TopKRouter gating GEMM requires CUDA")
+    router = TopKRouter(_config(coef), _ps()).cuda()
     router.train()
-    x = torch.randn(6, 8, requires_grad=True)
+    x = torch.randn(6, 8, device="cuda", requires_grad=True)
     scores, indices = router(x)
     assert scores.shape == (6, 2)
     assert indices.shape == (6, 2)
