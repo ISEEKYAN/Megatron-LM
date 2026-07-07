@@ -62,5 +62,12 @@ def test_kimi_k2_nonzero_aux_loss_changes_router_gradients():
 
     gate_delta = torch.linalg.vector_norm(gate_on - gate_off)
     input_delta = torch.linalg.vector_norm(input_on - input_off)
+    print(
+        "Kimi K2 router aux gradient A/B: "
+        f"gate_off={torch.linalg.vector_norm(gate_off).item():.8e}, "
+        f"gate_on={torch.linalg.vector_norm(gate_on).item():.8e}, "
+        f"gate_delta={gate_delta.item():.8e}, "
+        f"input_delta={input_delta.item():.8e}"
+    )
     assert gate_delta.item() > 0.0
     assert input_delta.item() > 0.0
