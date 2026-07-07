@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import importlib.abc
+import importlib.machinery
 import importlib.util
 import os
 import sys
@@ -10,6 +12,8 @@ from collections.abc import Iterable
 from functools import wraps
 from pathlib import Path
 from typing import Any
+
+_BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
 
 
 def _instrument_bucketed_weight_sender(sender_cls: type) -> bool:
@@ -86,21 +90,47 @@ def _instrument_bucketed_weight_sender(sender_cls: type) -> bool:
     return True
 
 
-def _patch_bucketed_weight_sender() -> None:
+class _SenderPatchLoader(importlib.abc.Loader):
+    def __init__(self, loader: importlib.abc.Loader):
+        self._loader = loader
+
+    def create_module(self, spec):
+        create_module = getattr(self._loader, "create_module", None)
+        return create_module(spec) if create_module is not None else None
+
+    def exec_module(self, module) -> None:
+        self._loader.exec_module(module)
+        _instrument_bucketed_weight_sender(module.BucketedWeightSender)
+
+
+class _SenderPatchFinder(importlib.abc.MetaPathFinder):
+    _mlite_weight_sync_probe_finder = True
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname != _BUCKETED_SENDER_MODULE:
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+        if spec is not None and spec.loader is not None:
+            spec.loader = _SenderPatchLoader(spec.loader)
+        return spec
+
+
+def _patch_bucketed_weight_sender() -> bool:
     if os.getenv("MLITE_WEIGHT_SYNC_PROBE", "").strip().lower() not in {
         "1",
         "true",
         "yes",
         "on",
     }:
-        return
-    try:
-        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
-            BucketedWeightSender,
-        )
-    except (ModuleNotFoundError, ImportError):
-        return
-    _instrument_bucketed_weight_sender(BucketedWeightSender)
+        return False
+
+    module = sys.modules.get(_BUCKETED_SENDER_MODULE)
+    if module is not None:
+        return _instrument_bucketed_weight_sender(module.BucketedWeightSender)
+    if any(getattr(finder, "_mlite_weight_sync_probe_finder", False) for finder in sys.meta_path):
+        return False
+    sys.meta_path.insert(0, _SenderPatchFinder())
+    return True
 
 
 def _patch_transformers_rope_ignore_keys() -> None:

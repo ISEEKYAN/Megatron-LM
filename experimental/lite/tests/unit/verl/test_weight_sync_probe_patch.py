@@ -3,11 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 import pytest
 import torch
 
-from verl_mlite.compat import _instrument_bucketed_weight_sender
+from verl_mlite.compat import (
+    _BUCKETED_SENDER_MODULE,
+    _instrument_bucketed_weight_sender,
+    _patch_bucketed_weight_sender,
+)
 
 
 class _Socket:
@@ -26,6 +31,18 @@ class _Sender:
         self._init_socket()
         self.socket.send_pyobj({"is_last": True})
         return self.socket.recv()
+
+
+def test_sender_patch_installs_lazy_hook_without_importing_verl(monkeypatch):
+    monkeypatch.setenv("MLITE_WEIGHT_SYNC_PROBE", "1")
+    monkeypatch.delitem(sys.modules, _BUCKETED_SENDER_MODULE, raising=False)
+    original_meta_path = list(sys.meta_path)
+    try:
+        assert _patch_bucketed_weight_sender()
+        assert _BUCKETED_SENDER_MODULE not in sys.modules
+        assert not _patch_bucketed_weight_sender()
+    finally:
+        sys.meta_path[:] = original_meta_path
 
 
 def test_sender_patch_is_idempotent_and_profiles_handshake(monkeypatch, capsys):
