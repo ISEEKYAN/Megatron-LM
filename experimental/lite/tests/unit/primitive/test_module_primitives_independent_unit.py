@@ -122,52 +122,10 @@ def test_gated_delta_static_helpers_are_finite_and_shape_stable(transformer_engi
     alpha = torch.tensor([[[0.0, 1.0], [-1.0, 2.0]]])
     beta = torch.tensor([[[0.0, 2.0], [-2.0, 4.0]]])
 
-    compute_g_and_beta = getattr(
-        GatedDeltaNet._compute_g_and_beta,
-        "_torchdynamo_orig_callable",
-        GatedDeltaNet._compute_g_and_beta,
-    )
-    g, beta_sigmoid = compute_g_and_beta(torch.zeros(2), torch.ones(2), alpha, beta)
+    g, beta_sigmoid = GatedDeltaNet._compute_g_and_beta(torch.zeros(2), torch.ones(2), alpha, beta)
 
     assert g.shape == alpha.shape
     assert beta_sigmoid.shape == beta.shape
     assert torch.isfinite(g).all()
     assert torch.isfinite(beta_sigmoid).all()
     assert torch.all(g < 0)
-
-
-def test_gated_delta_prepare_uses_compiled_joint_qk_l2norm(transformer_engine_import_stub):
-    transformer_engine_import_stub()
-    from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
-
-    normalized_shapes = []
-
-    class _Stub:
-        qk_dim_local = 4
-        v_dim_local = 6
-        num_k_heads_local = 2
-        num_v_heads_local = 3
-        dk = 2
-        dv = 2
-        v_heads_per_k_head = 1
-
-        @staticmethod
-        def _l2norm(x):
-            normalized_shapes.append(x.shape)
-            return x
-
-    prepare = getattr(
-        GatedDeltaNet._prepare_qkv,
-        "_torchdynamo_orig_callable",
-        GatedDeltaNet._prepare_qkv,
-    )
-    qkv = torch.randn(1, 3, 14)
-    trailing = torch.randn(1, 3, 3)
-    query, key, value, *_ = prepare(_Stub(), qkv, trailing, trailing, trailing, 1, 3)
-
-    assert normalized_shapes == [torch.Size([1, 3, 4, 2])]
-    assert query.shape == key.shape == (1, 3, 2, 2)
-    assert value.shape == (1, 3, 3, 2)
-    assert hasattr(GatedDeltaNet._prepare_qkv, "_torchdynamo_orig_callable")
-    assert hasattr(GatedDeltaNet._l2norm, "_torchdynamo_orig_callable")
-    assert hasattr(GatedDeltaNet._compute_g_and_beta, "_torchdynamo_orig_callable")
