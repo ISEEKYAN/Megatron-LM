@@ -151,6 +151,7 @@ def test_qwen35_router_gemm_is_fp32_outside_deterministic_mode(
     model.Qwen35Layer(cfg, ParallelState(), 0, deterministic=False)
 
     assert captured["router_dtype"] is torch.float32
+    assert captured["moe_permute_fusion"] is True
 
 
 def _string_list_assignment(tree: ast.Module, name: str) -> set[str]:
