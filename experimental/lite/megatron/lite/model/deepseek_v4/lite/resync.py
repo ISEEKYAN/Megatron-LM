@@ -22,11 +22,11 @@ def _matches_prefix(name: str, prefix: str) -> bool:
     return name == prefix or name.startswith(f"{prefix}.")
 
 
-def _is_routed_expert(name: str) -> bool:
+def is_routed_expert(name: str) -> bool:
     return ".ffn.experts." in name and ".shared_experts." not in name
 
 
-def _is_release_unquantized_weight(name: str) -> bool:
+def is_release_unquantized_weight(name: str) -> bool:
     """Match the unscaled families in the official V4 Flash checkpoint index."""
     if name in {"embed.weight", "head.weight", "norm.weight"}:
         return True
@@ -77,13 +77,13 @@ def export_resync_weights(
             not name.endswith(".weight")
             or tensor.ndim < 2
             or not tensor.dtype.is_floating_point
-            or _is_release_unquantized_weight(name)
+            or is_release_unquantized_weight(name)
             or any(_matches_prefix(name, prefix) for prefix in ignored)
         ):
             yield name, tensor
             continue
 
-        if _is_routed_expert(name) and expert_dtype == "fp4":
+        if is_routed_expert(name) and expert_dtype == "fp4":
             quantized, scale = quantize_mxfp4(tensor)
         else:
             quantized, scale = quantize_block_fp8(
@@ -93,4 +93,8 @@ def export_resync_weights(
         yield _scale_name(name), scale
 
 
-__all__ = ["export_resync_weights"]
+__all__ = [
+    "export_resync_weights",
+    "is_release_unquantized_weight",
+    "is_routed_expert",
+]
