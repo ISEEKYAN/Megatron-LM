@@ -144,6 +144,20 @@ def _global_expert_idx_from_local(local_idx: int, config: DeepseekV4Config, ps: 
     return ps.ep_rank * num_local + local_idx
 
 
+def _router_buffer_matches_layer_kind(name: str, config: DeepseekV4Config) -> bool:
+    """Keep only the router buffer serialized by the corresponding HF layer."""
+    match = _BLOCK_KEY_RE.match(name)
+    if match is None:
+        return False
+    block, index_text, _ = match.groups()
+    is_hash_layer = block == "layers" and int(index_text) < config.num_hash_layers
+    if name.endswith(".mlp.gate.tid2eid"):
+        return is_hash_layer
+    if name.endswith(".mlp.gate.expert_bias"):
+        return not is_hash_layer
+    return False
+
+
 def _hf_names_for_state_key(name: str, config: DeepseekV4Config) -> list[str]:
     """Map a bare DS4 native key (global layer idx, global expert id) to HF name(s).
 
@@ -490,9 +504,9 @@ def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelSta
         for name, buffer in base_chunk.named_buffers():
             # Persistent router buffers carried into HF: hash-layer ``tid2eid``
             # and the (made-persistent for non-hash layers) ``expert_bias``.
-            if not (name.endswith(".mlp.gate.tid2eid") or name.endswith(".mlp.gate.expert_bias")):
-                continue
             global_name = to_global_layer_name(name, layer_map)
+            if not _router_buffer_matches_layer_kind(global_name, config):
+                continue
             for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer.detach().cpu()):
                 yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
 

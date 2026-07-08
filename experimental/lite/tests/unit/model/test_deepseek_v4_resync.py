@@ -116,6 +116,28 @@ def test_deepseek_config_preserves_checkpoint_quantization_contract() -> None:
 
 
 @pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("layers.0.mlp.gate.tid2eid", True),
+        ("layers.0.mlp.gate.expert_bias", False),
+        ("layers.1.mlp.gate.tid2eid", False),
+        ("layers.1.mlp.gate.expert_bias", True),
+        ("mtp.0.mlp.gate.tid2eid", False),
+        ("mtp.0.mlp.gate.expert_bias", True),
+    ],
+)
+def test_router_export_keeps_only_the_buffer_for_each_layer_kind(
+    name: str, expected: bool
+) -> None:
+    from megatron.lite.model.deepseek_v4.lite.checkpoint import (
+        _router_buffer_matches_layer_kind,
+    )
+
+    config = SimpleNamespace(num_hash_layers=1)
+    assert _router_buffer_matches_layer_kind(name, config) is expected
+
+
+@pytest.mark.parametrize(
     "name",
     [
         "embed.weight",
