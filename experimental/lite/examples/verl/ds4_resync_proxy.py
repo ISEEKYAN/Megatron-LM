@@ -295,6 +295,7 @@ def run(output_dir: Path) -> None:
     torch.cuda.empty_cache()
 
     checkpoint_diff = _dequantized_checkpoint_diff(direct_path, resync_path)
+    dist.destroy_process_group()
     os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "0"
     llm = LLM(
         model=str(direct_path),
@@ -308,7 +309,6 @@ def run(output_dir: Path) -> None:
         max_logprobs=config.vocab_size,
         gpu_memory_utilization=0.5,
         kv_cache_dtype="fp8",
-        moe_backend="deep_gemm",
         worker_extension_cls=(
             "verl_mlite.rollout.vllm_worker.VllmCheckpointWorkerExtension"
         ),
