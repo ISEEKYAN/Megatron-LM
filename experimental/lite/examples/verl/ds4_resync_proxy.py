@@ -66,16 +66,21 @@ def tiny_config() -> dict[str, Any]:
     }
 
 
+def _proxy_parallel_config():
+    from megatron.lite.runtime.contracts import ParallelConfig
+
+    return ParallelConfig(tp=1, etp=1, ep=1, pp=1, vpp=1, cp=1)
+
+
 def _build_bundle(config_dict: dict[str, Any]):
     from megatron.lite.model.deepseek_v4.lite.protocol import ImplConfig, build_model
     from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-    from megatron.lite.runtime.contracts import ParallelConfig
 
     config = DeepseekV4Config._from_hf_dict(config_dict)
     bundle = build_model(
         config,
         impl_cfg=ImplConfig(
-            parallel=ParallelConfig(),
+            parallel=_proxy_parallel_config(),
             optimizer=None,
             mtp_enable=False,
             mtp_enable_train=False,
