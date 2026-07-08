@@ -7,6 +7,7 @@ import types
 
 import torch
 import torch.nn as nn
+import pytest
 
 if importlib.util.find_spec("safetensors") is None:
     safetensors = types.ModuleType("safetensors")
@@ -20,6 +21,54 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     bucketed_all_gather_into_tensor,
     export_hf_weights,
 )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_gpu_resident_export_is_bitwise_equal_to_legacy_cpu_export() -> None:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.arange(12, dtype=torch.bfloat16, device="cuda").reshape(3, 4)
+            )
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def is_expert(name):
+            return False
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+    model = Model()
+
+    legacy = dict(export_hf_weights(model, Spec(), ps, cpu=True))
+    resident = dict(export_hf_weights(model, Spec(), ps, cpu=False))
+
+    assert legacy.keys() == resident.keys()
+    assert legacy["weight"].device.type == "cpu"
+    assert resident["weight"].device.type == "cuda"
+    assert torch.equal(legacy["weight"], resident["weight"].cpu())
 
 
 def test_bucketed_all_gather_uses_bounded_flat_buffers(monkeypatch) -> None:
