@@ -162,6 +162,23 @@ so the MLite actor is wired up correctly without any extra worker-path knob.
 By default, GSM8K GRPO artifacts are written under
 `experimental/lite/examples/verl/outputs/qwen35_gsm8k_grpo`.
 
+### Serialized checkpoint weight resync
+
+Quantized inference models must receive weights in the same serialized format
+as their original checkpoint. Set the MLite actor engine's
+`resync_format=vllm_checkpoint` and select
+`verl_mlite.rollout.vllm_worker.VllmCheckpointWorkerExtension` through vLLM's
+`worker_extension_cls` engine argument. The extension streams all IPC buckets
+through one vLLM layerwise reload lifecycle. It does not call veRL's online FP8
+quantizer, so `VERL_VLLM_FP8_QUANT_ENABLED` must be unset or `0`.
+
+The generic engine only forwards the format contract. Model adapters own
+checkpoint naming and serialization. The DeepSeek-V4 adapter emits 128x128
+block-FP8 linear weights and keeps routed experts in the checkpoint's declared
+format: MXFP4 E2M1 with UE8M0 scales for `expert_dtype=fp4`, or block-FP8 with
+FP32 scales for `expert_dtype=fp8`. Router, normalization, compressor, and other
+unscaled checkpoint families remain unquantized.
+
 ## Smoke / Dry-Run Checks
 
 Checked on this branch on 2026-06-07. These checks cover shell syntax,

@@ -460,8 +460,8 @@ class DeepseekV4WeightSpec:
         return f"{prefix}.weight{local_idx}"
 
 
-def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
-    """Export DS4 weights as HF (name, tensor) pairs via the SHARED exporter.
+def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
+    """Export gathered DS4 BF16 weights and persistent router buffers.
 
     Identical structure to kimi/glm5: delegate to the shared ``_export`` (which
     does the TP/ETP/EP/PP gather, including the PP ``all_gather_object`` reached
@@ -495,6 +495,25 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
             global_name = to_global_layer_name(name, layer_map)
             for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer.detach().cpu()):
                 yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
+
+
+def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
+    """Export DS4 weights as HF or serialized vLLM-checkpoint pairs.
+
+    The default remains the ordinary HF/BF16 stream. ``vllm_checkpoint`` is a
+    model-owned adapter over that gathered stream; the runtime and veRL engine
+    do not classify DS4 tensors.
+    """
+    target = kwargs.pop("target", "hf")
+    if target not in {"hf", "bf16", "vllm_checkpoint"}:
+        raise ValueError(f"Unsupported DeepSeek-V4 export target: {target!r}")
+    weights = _export_unquantized_weights(model, config, ps, **kwargs)
+    if target == "vllm_checkpoint":
+        from megatron.lite.model.deepseek_v4.lite.resync import export_resync_weights
+
+        yield from export_resync_weights(weights, config)
+    else:
+        yield from weights
 
 
 def save_hf_weights(model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs) -> None:

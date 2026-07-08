@@ -47,6 +47,8 @@ class DeepseekV4Config:
     mtp_loss_scaling_factor: float = 0.1
     rms_norm_eps: float = 1e-6
     initializer_range: float = 0.02
+    expert_dtype: str = "fp4"
+    quantization_config: dict[str, Any] = field(default_factory=dict)
 
     @property
     def num_experts(self) -> int:

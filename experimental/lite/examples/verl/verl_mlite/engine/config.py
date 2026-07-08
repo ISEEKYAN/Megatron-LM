@@ -30,6 +30,7 @@ class MegatronLiteEngineConfig(EngineConfig):
     router_aux_loss_coef: float | None = None
     cross_entropy_fusion: bool | None = None
     export_dtype: str | None = "bfloat16"
+    resync_format: str | None = None
     load_hf_weights: bool = True
     impl_cfg: dict[str, Any] = field(default_factory=dict)
 
@@ -41,3 +42,7 @@ class MegatronLiteEngineConfig(EngineConfig):
             )
         if self.custom_backend_module:
             importlib.import_module(self.custom_backend_module)
+        if self.resync_format is not None:
+            from megatron.lite.runtime.contracts.weights import ResyncFormat
+
+            self.resync_format = ResyncFormat.parse(self.resync_format).value
