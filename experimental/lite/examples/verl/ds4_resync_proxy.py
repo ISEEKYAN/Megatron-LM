@@ -71,6 +71,7 @@ def tiny_config() -> dict[str, Any]:
         "architectures": ["DeepseekV4ForCausalLM"],
         "model_type": "deepseek_v4",
         "torch_dtype": "bfloat16",
+        "hidden_act": "silu",
         "vocab_size": 1024,
         "hidden_size": 1024,
         "moe_intermediate_size": 256,

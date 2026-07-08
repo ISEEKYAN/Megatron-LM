@@ -1,6 +1,35 @@
 import os
 
 
+def test_proxy_config_covers_vllm_ds4_constructor_fields() -> None:
+    from examples.verl.ds4_resync_proxy import tiny_config
+
+    required = {
+        "expert_dtype",
+        "hc_eps",
+        "hc_mult",
+        "hc_sinkhorn_iters",
+        "hidden_act",
+        "hidden_size",
+        "index_topk",
+        "moe_intermediate_size",
+        "n_routed_experts",
+        "n_shared_experts",
+        "norm_topk_prob",
+        "num_attention_heads",
+        "num_experts_per_tok",
+        "num_hash_layers",
+        "num_hidden_layers",
+        "rms_norm_eps",
+        "swiglu_limit",
+        "vocab_size",
+    }
+
+    config = tiny_config()
+    assert required <= config.keys()
+    assert config["hidden_act"] == "silu"
+
+
 def test_proxy_impl_config_is_concrete_and_uses_local_attention() -> None:
     from examples.verl.ds4_resync_proxy import _proxy_impl_config
 
