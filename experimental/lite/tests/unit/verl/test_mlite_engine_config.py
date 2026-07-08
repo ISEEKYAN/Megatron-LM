@@ -160,7 +160,7 @@ def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
     assert captured == {
         "handle": engine.handle,
         "kwargs": {
-            "buffer_max_size_bytes": 2 * 1024**3,
+            "buffer_max_size_bytes": 256 * 1024**2,
             "cpu": False,
             "export_dtype": "bfloat16",
             "limit": 3,
