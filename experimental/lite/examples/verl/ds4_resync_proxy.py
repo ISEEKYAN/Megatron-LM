@@ -72,21 +72,24 @@ def _proxy_parallel_config():
     return ParallelConfig(tp=1, etp=1, ep=1, pp=1, vpp=1, cp=1)
 
 
+def _proxy_impl_config():
+    from megatron.lite.model.deepseek_v4.lite.protocol import ImplConfig
+
+    return ImplConfig(
+        parallel=_proxy_parallel_config(),
+        optimizer=None,
+        mtp_enable=False,
+        mtp_enable_train=False,
+        attention_backend_override="local",
+    )
+
+
 def _build_bundle(config_dict: dict[str, Any]):
-    from megatron.lite.model.deepseek_v4.lite.protocol import ImplConfig, build_model
+    from megatron.lite.model.deepseek_v4.lite.protocol import build_model
     from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 
     config = DeepseekV4Config._from_hf_dict(config_dict)
-    bundle = build_model(
-        config,
-        impl_cfg=ImplConfig(
-            parallel=_proxy_parallel_config(),
-            optimizer=None,
-            mtp_enable=False,
-            mtp_enable_train=False,
-            attention_backend_override="torch",
-        ),
-    )
+    bundle = build_model(config, impl_cfg=_proxy_impl_config())
     return config, bundle
 
 
