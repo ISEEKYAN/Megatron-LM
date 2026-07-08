@@ -389,6 +389,63 @@ def _resolve_param_name(name: str, state_dict: dict) -> str | None:
     return None
 
 
+_ADAPTER_NAME_MARKERS = ("lora", "adapter", "delta_mem")
+
+
+def _is_adapter_param(name: str) -> bool:
+    lowered = name.lower()
+    return any(marker in lowered for marker in _ADAPTER_NAME_MARKERS)
+
+
+def _lora_delta_resolvers(base_chunk: nn.Module) -> dict:
+    """Map base-param LOCAL names → zero-arg delta callables.
+
+    Pairing follows the mlite attribute convention (same walk as
+    ``apply_olora_tail_init``): attention ``qkv_lora``/``proj_lora`` over
+    ``qkv.linear.weight``/``proj.linear.weight``; expert ``fc1_lora``/``fc2_lora``
+    (grouped or shared) over the GroupedLinear per-local-expert ``weight{e}``.
+    Deltas are local-shard-consistent: dense adapters refuse sharded factors
+    (``LinearLoRA.materialized_delta_weight`` guard), expert adapters live on
+    the same EP rank as their base weights.
+    """
+    import functools
+
+    resolvers: dict = {}
+    for module_name, module in base_chunk.named_modules():
+        prefix = f"{module_name}." if module_name else ""
+        for lora_attr, base_attr in (("qkv_lora", "qkv"), ("proj_lora", "proj")):
+            adapter = getattr(module, lora_attr, None)
+            base = getattr(module, base_attr, None)
+            if adapter is None or base is None:
+                continue
+            weight_path = (
+                f"{base_attr}.linear.weight" if hasattr(base, "linear") else f"{base_attr}.weight"
+            )
+            resolvers[f"{prefix}{weight_path}"] = adapter.materialized_delta_weight
+        n_local = int(getattr(module, "num_local_experts", 0) or 0)
+        for lora_attr, base_attr in (("fc1_lora", "fc1"), ("fc2_lora", "fc2")):
+            adapter = getattr(module, lora_attr, None)
+            base = getattr(module, base_attr, None)
+            if adapter is None or base is None or n_local <= 0:
+                continue
+            for expert_idx in range(n_local):
+                if getattr(base, f"weight{expert_idx}", None) is None:
+                    continue
+                resolvers[f"{prefix}{base_attr}.weight{expert_idx}"] = functools.partial(
+                    adapter.materialized_delta_weight, expert_idx
+                )
+    return resolvers
+
+
+def _merged_param_tensor(name: str, param: torch.Tensor, delta_resolvers: dict) -> torch.Tensor:
+    tensor = _materialize_dtensor(param.data.detach())
+    resolver = delta_resolvers.get(name)
+    if resolver is not None:
+        # Rollout weight sync must see the CURRENT policy: base + adapter delta.
+        tensor = tensor + resolver().to(dtype=tensor.dtype, device=tensor.device)
+    return tensor
+
+
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,
@@ -398,6 +455,7 @@ def export_hf_weights(
     limit: int | None = None,
     rank0_only: bool = False,
     export_dtype: str | torch.dtype | None = None,
+    merge_lora: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Export model weights as HF-format (name, tensor) pairs.
 
@@ -405,6 +463,11 @@ def export_hf_weights(
     every participating rank. RL weight sync needs every colocated rollout rank
     to receive weights; save paths can pass ``rank0_only=True`` to avoid
     materializing duplicate writers.
+
+    Adapter parameters (LoRA/delta_mem) never appear in the HF stream — they are
+    not base tensors (the PEFT sidecar owns them). With ``merge_lora=True`` each
+    adapted base weight is exported as ``base + scale·B@A`` so a serving engine
+    receives the current policy.
     """
     if isinstance(model, nn.ModuleList):
         chunks: list[nn.Module] = list(model)
@@ -426,9 +489,12 @@ def export_hf_weights(
                 if hasattr(base_chunk, "layer_indices")
                 else {}
             )
+            delta_resolvers = _lora_delta_resolvers(base_chunk) if merge_lora else {}
             for name, param in base_chunk.named_parameters():
+                if _is_adapter_param(name):
+                    continue
                 gname = to_global_layer_name(name, layer_map)
-                tensor = _materialize_dtensor(param.data.detach())
+                tensor = _merged_param_tensor(name, param, delta_resolvers)
 
                 gathered_one: dict[str, torch.Tensor] = {}
                 if spec.is_expert(gname):
@@ -474,9 +540,12 @@ def export_hf_weights(
             if hasattr(base_chunk, "layer_indices")
             else {}
         )
+        delta_resolvers = _lora_delta_resolvers(base_chunk) if merge_lora else {}
         for name, param in base_chunk.named_parameters():
+            if _is_adapter_param(name):
+                continue
             gname = to_global_layer_name(name, layer_map)
-            t = _materialize_dtensor(param.data.detach())
+            t = _merged_param_tensor(name, param, delta_resolvers)
 
             if spec.is_expert(gname):
                 _gather_expert(gname, t, spec, ps, gathered)

@@ -86,6 +86,13 @@ register_model(
 )
 
 register_model(
+    "qwen2",
+    package="megatron.lite.model.qwen2",
+    hf_model_types=["qwen2"],
+    impls={"lite": "megatron.lite.model.qwen2.lite.protocol"},
+)
+
+register_model(
     "qwen3_5",
     package="megatron.lite.model.qwen3_5",
     hf_model_types=["qwen3_5_moe"],
