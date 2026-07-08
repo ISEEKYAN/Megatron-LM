@@ -58,7 +58,7 @@ def test_checkpoint_bucket_reload_does_not_finalize_failed_partial_update() -> N
 
 
 def test_checkpoint_path_reload_uses_vllm_native_checkpoint_lifecycle() -> None:
-    from verl_mlite.rollout.vllm_worker import VllmCheckpointWorkerExtension
+    from verl_mlite.rollout.vllm_worker import VllmCheckpointPathWorkerExtension
 
     calls = []
     extension = SimpleNamespace(
@@ -67,6 +67,28 @@ def test_checkpoint_path_reload_uses_vllm_native_checkpoint_lifecycle() -> None:
         )
     )
 
-    VllmCheckpointWorkerExtension.reload_checkpoint_from_path(extension, "/tmp/resync")
+    VllmCheckpointPathWorkerExtension.reload_checkpoint_from_path(
+        extension, "/tmp/resync"
+    )
 
     assert calls == [{"weights_path": "/tmp/resync", "is_checkpoint_format": True}]
+
+
+def test_proxy_worker_module_does_not_import_verl(monkeypatch) -> None:
+    import builtins
+    import importlib
+    import sys
+
+    module_name = "verl_mlite.rollout.vllm_worker"
+    sys.modules.pop(module_name, None)
+    original_import = builtins.__import__
+
+    def reject_verl(name, *args, **kwargs):
+        if name == "verl" or name.startswith("verl."):
+            raise AssertionError(f"proxy worker imported {name}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_verl)
+    module = importlib.import_module(module_name)
+
+    assert module.VllmCheckpointPathWorkerExtension is not None

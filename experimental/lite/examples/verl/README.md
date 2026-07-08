@@ -167,7 +167,7 @@ By default, GSM8K GRPO artifacts are written under
 Quantized inference models must receive weights in the same serialized format
 as their original checkpoint. Set the MLite actor engine's
 `resync_format=vllm_checkpoint` and select
-`verl_mlite.rollout.vllm_worker.VllmCheckpointWorkerExtension` through vLLM's
+`verl_mlite.rollout.verl_worker.VllmCheckpointWorkerExtension` through vLLM's
 `worker_extension_cls` engine argument. The extension streams all IPC buckets
 through one vLLM layerwise reload lifecycle. It does not call veRL's online FP8
 quantizer, so `VERL_VLLM_FP8_QUANT_ENABLED` must be unset or `0`.

@@ -310,7 +310,7 @@ def run(output_dir: Path) -> None:
         gpu_memory_utilization=0.5,
         kv_cache_dtype="fp8",
         worker_extension_cls=(
-            "verl_mlite.rollout.vllm_worker.VllmCheckpointWorkerExtension"
+            "verl_mlite.rollout.vllm_worker.VllmCheckpointPathWorkerExtension"
         ),
     )
     direct_rows = _vllm_logprobs(llm, sequences, config.vocab_size)
