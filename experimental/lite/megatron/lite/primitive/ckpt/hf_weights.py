@@ -382,7 +382,6 @@ def _iter_bucketed_materialized_tensors(
 
     for name, tensor in named_tensors:
         if DTensor is None or not isinstance(tensor, DTensor):
-            yield from _flush_bucket()
             yield name, tensor
             continue
 
@@ -748,8 +747,16 @@ def export_hf_weights(
                 for name, param in base_chunk.named_parameters():
                     yield to_global_layer_name(name, layer_map), param.data.detach()
 
-        materialized_params = _iter_bucketed_materialized_tensors(
-            _iter_native_params(), buffer_max_size_bytes=buffer_max_size_bytes
+        native_params = _iter_native_params()
+        materialized_params = (
+            _iter_bucketed_materialized_tensors(
+                native_params, buffer_max_size_bytes=buffer_max_size_bytes
+            )
+            if limit is None
+            else (
+                (name, _materialize_dtensor(tensor))
+                for name, tensor in native_params
+            )
         )
         for gname, tensor in materialized_params:
             gathered_one: dict[str, torch.Tensor] = {}

@@ -166,13 +166,20 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
         torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
     )
 
-    materialized = dict(
+    outputs = list(
         _iter_bucketed_materialized_tensors(
-            [("first", first), ("second", second)], buffer_max_size_bytes=1024
+            [
+                ("first", first),
+                ("plain", torch.tensor([7.0])),
+                ("second", second),
+            ],
+            buffer_max_size_bytes=1024,
         )
     )
+    materialized = dict(outputs)
 
     assert len(calls) == 1
+    assert [name for name, _ in outputs] == ["plain", "first", "second"]
     assert torch.equal(
         materialized["first"],
         torch.cat([first.to_local(), first.to_local() + 100], dim=0),
