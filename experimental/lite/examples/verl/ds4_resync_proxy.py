@@ -307,6 +307,7 @@ def run(output_dir: Path) -> None:
         max_num_seqs=1,
         max_logprobs=config.vocab_size,
         gpu_memory_utilization=0.5,
+        kv_cache_dtype="fp8",
         moe_backend="deep_gemm",
         worker_extension_cls=(
             "verl_mlite.rollout.vllm_worker.VllmCheckpointWorkerExtension"
