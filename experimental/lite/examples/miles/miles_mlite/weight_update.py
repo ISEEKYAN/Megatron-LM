@@ -184,7 +184,7 @@ class RawHFWeightUpdater:
         chunk = []
         chunk_bytes = 0
         limit = int(getattr(self.args, "update_weight_buffer_size", 2**30))
-        export_kwargs = {}
+        export_kwargs = {"cpu": False}
         if getattr(self.args, "mlite_export_dtype", None):
             export_kwargs["export_dtype"] = self.args.mlite_export_dtype
         for name, tensor in self._iter_local_hf_weights(**export_kwargs):
