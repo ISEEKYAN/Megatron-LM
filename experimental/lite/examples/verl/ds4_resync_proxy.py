@@ -95,6 +95,11 @@ def tiny_config() -> dict[str, Any]:
         "max_position_embeddings": 512,
         "rope_theta": 10000.0,
         "compress_rope_theta": 40000.0,
+        "rope_parameters": {
+            "rope_type": "yarn",
+            "factor": 1.0,
+            "original_max_position_embeddings": 512,
+        },
         "compress_ratios": [0, 0],
         "sliding_window": 64,
         "hc_eps": 1e-6,
