@@ -147,27 +147,6 @@ def test_prefetch_builds_next_bucket_while_receiver_ack_is_blocked():
     assert not waiter.is_alive()
 
 
-def test_prefetch_fills_the_unused_ipc_buffer_for_the_first_bucket(monkeypatch):
-    sender_cls = _prefetch_sender_class()
-    assert _install_bucketed_sender_prefetch(sender_cls)
-    sender = sender_cls()
-    original_empty_like = torch.empty_like
-    staging_allocations = []
-
-    def record_empty_like(tensor, *args, **kwargs):
-        staging = original_empty_like(tensor, *args, **kwargs)
-        staging_allocations.append(staging)
-        return staging
-
-    monkeypatch.setattr(torch, "empty_like", record_empty_like)
-    asyncio.run(sender.async_send_weights([("a", torch.arange(2))]))
-
-    assert len(staging_allocations) == 1
-    assert _data_messages(sender)[0]["payload"].tolist() == torch.arange(2).view(
-        torch.uint8
-    ).tolist()
-
-
 def test_prefetch_preserves_payloads_and_marks_partial_terminal_bucket():
     sender_cls = _prefetch_sender_class()
     assert _install_bucketed_sender_prefetch(sender_cls)

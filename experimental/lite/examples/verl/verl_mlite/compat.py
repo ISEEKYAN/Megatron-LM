@@ -28,10 +28,6 @@ class _SyncBucketProducer:
         self._pending = None
         self._exhausted = False
 
-    def replace_staging(self, staging) -> None:
-        """Switch buffers after the first bucket has filled the IPC buffer directly."""
-        self._staging = staging
-
     def next_bucket(self):
         import torch
 
@@ -105,7 +101,7 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
                 raise RuntimeError("MLite sender prefetch requires a CUDA IPC buffer")
 
             staging = torch.empty_like(self.buffer)
-            producer = _SyncBucketProducer(weights, self.buffer, self.bucket_size)
+            producer = _SyncBucketProducer(weights, staging, self.bucket_size)
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlite-weight-prefetch")
 
             def submit_next():
@@ -128,14 +124,9 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
 
                 if ready is not None:
                     ready.synchronize()
-                if producer._staging is self.buffer:
-                    producer.replace_staging(staging)
-                else:
-                    self.buffer[:used_bytes].copy_(
-                        staging[:used_bytes], non_blocking=True
-                    )
-                    if self.buffer.device.type == "cuda":
-                        torch.cuda.synchronize(self.buffer.device)
+                self.buffer[:used_bytes].copy_(staging[:used_bytes], non_blocking=True)
+                if self.buffer.device.type == "cuda":
+                    torch.cuda.synchronize(self.buffer.device)
 
                 self.socket.send_pyobj(
                     {"bucket_meta": metadata_or_name, "is_last": is_last}
