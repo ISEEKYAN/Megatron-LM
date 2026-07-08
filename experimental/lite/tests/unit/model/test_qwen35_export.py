@@ -154,6 +154,24 @@ def test_qwen35_export_preserves_runtime_parameter_dtype_by_default() -> None:
     )
 
 
+def test_qwen35_online_export_keeps_weights_on_the_source_device() -> None:
+    class TinyQwen35Module(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.norm = nn.LayerNorm(8, device="meta")
+
+    exported = dict(
+        export_hf_weights(
+            TinyQwen35Module(),
+            _tiny_config(),
+            _single_rank_parallel_state(),
+            cpu=False,
+        )
+    )
+
+    assert exported["model.language_model.norm.weight"].device.type == "meta"
+
+
 def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
     class TinyQwen35Module(nn.Module):
         def __init__(self, config: Qwen35Config) -> None:
@@ -187,13 +205,18 @@ def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
     )
     gather_calls = []
 
-    def fake_all_gather(outputs, tensor, group=None):
+    def fake_all_gather(output, tensor, group=None):
         del group
-        gather_calls.append(tensor.clone())
-        outputs[0].copy_(tensor)
-        outputs[1].copy_(tensor + 2000)
+        gather_calls.append(
+            tensor.clone().reshape(-1, cfg.moe_intermediate_size * 2, cfg.hidden_size)
+        )
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor + 2000)
 
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.all_gather", fake_all_gather)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor",
+        fake_all_gather,
+    )
 
     exported = dict(export_hf_weights(model, cfg, ps))
 
@@ -270,15 +293,18 @@ def test_qwen35_export_rank0_only_still_participates_in_ep_gather(monkeypatch) -
     )
     gather_calls = []
 
-    def fake_all_gather(outputs, tensor, group=None):
+    def fake_all_gather(output, tensor, group=None):
         del group
         gather_calls.append(tensor.clone())
-        outputs[0].copy_(tensor)
-        outputs[1].copy_(tensor + 2)
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor + 2)
 
     monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.is_initialized", lambda: True)
     monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.get_rank", lambda: 1)
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.all_gather", fake_all_gather)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor",
+        fake_all_gather,
+    )
 
     exported = list(export_hf_weights(TinyQwen35Module(cfg), cfg, ps, rank0_only=True))
 
@@ -451,14 +477,15 @@ def test_qwen35_export_uses_mbridge_conv1d_tp_gather(monkeypatch) -> None:
     )
     gather_calls = []
 
-    def fake_all_gather(outputs, tensor, group=None):
+    def fake_all_gather(output, tensor, group=None):
         assert group is ps.tp_group
-        gather_calls.append(tensor.clone())
-        outputs[0].copy_(shards[0])
-        outputs[1].copy_(shards[1])
+        gather_calls.append(tensor.clone().reshape_as(shards[0]))
+        output[: tensor.numel()].copy_(shards[0].view(-1))
+        output[tensor.numel() :].copy_(shards[1].view(-1))
 
     monkeypatch.setattr(
-        "megatron.lite.model.qwen3_5.lite.checkpoint.dist.all_gather", fake_all_gather
+        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor",
+        fake_all_gather,
     )
 
     exported = dict(export_hf_weights(TinyQwen35Module(shards[0]), cfg, ps))

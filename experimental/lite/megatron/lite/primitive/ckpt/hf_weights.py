@@ -66,6 +66,9 @@ def _native_to_hf(spec: HFWeights, name: str, tensor: torch.Tensor):
         return mapped
 
 
+DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES = 2 * 1024**3
+
+
 def _materialize_dtensor(tensor: torch.Tensor) -> torch.Tensor:
     """Reconstruct a plain local tensor from an FSDP2 ``DTensor`` parameter.
 
@@ -264,6 +267,88 @@ def allgather_concat(
     return torch.cat(gathered, dim=dim)
 
 
+def bucketed_all_gather_into_tensor(
+    bucket: list[tuple[str, torch.Tensor]],
+    *,
+    group: dist.ProcessGroup | None,
+    group_size: int,
+    buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+) -> list[tuple[str, torch.Tensor, list[torch.Tensor]]]:
+    """Gather a same-dtype tensor bucket through bounded flat GPU buffers."""
+    if not bucket:
+        return []
+    if group_size <= 1:
+        return [(name, tensor, [tensor]) for name, tensor in bucket]
+
+    dtype = bucket[0][1].dtype
+    device = bucket[0][1].device
+    if any(tensor.dtype != dtype for _, tensor in bucket):
+        raise ValueError("bucket tensors must share the same dtype")
+    if buffer_max_size_bytes <= 0:
+        raise ValueError("buffer_max_size_bytes must be positive")
+
+    element_size = bucket[0][1].element_size()
+    per_rank_buffer_bytes = max(buffer_max_size_bytes // group_size, element_size)
+    max_chunk_numel = max(1, per_rank_buffer_bytes // element_size)
+    flat_shards = [tensor.reshape(-1) for _, tensor in bucket]
+    numel_per_tensor = [tensor.numel() for tensor in flat_shards]
+    gathered_shards_by_rank = [
+        [torch.empty_like(tensor) for _, tensor in bucket] for _ in range(group_size)
+    ]
+    gathered_flat_views = [
+        [tensor.view(-1) for tensor in rank_shards] for rank_shards in gathered_shards_by_rank
+    ]
+
+    send_buffer = torch.empty(max_chunk_numel, dtype=dtype, device=device)
+    recv_buffer = torch.empty(group_size * max_chunk_numel, dtype=dtype, device=device)
+    tensor_idx = 0
+    tensor_offset = 0
+    while tensor_idx < len(bucket):
+        chunk_segments = []
+        chunk_numel = 0
+        while tensor_idx < len(bucket) and chunk_numel < max_chunk_numel:
+            available = numel_per_tensor[tensor_idx] - tensor_offset
+            take_numel = min(available, max_chunk_numel - chunk_numel)
+            send_buffer[chunk_numel : chunk_numel + take_numel].copy_(
+                flat_shards[tensor_idx][tensor_offset : tensor_offset + take_numel]
+            )
+            chunk_segments.append((tensor_idx, tensor_offset, chunk_numel, take_numel))
+            chunk_numel += take_numel
+            tensor_offset += take_numel
+            if tensor_offset == numel_per_tensor[tensor_idx]:
+                tensor_idx += 1
+                tensor_offset = 0
+
+        recv_view = recv_buffer[: group_size * chunk_numel]
+        dist.all_gather_into_tensor(recv_view, send_buffer[:chunk_numel], group=group)
+        for rank in range(group_size):
+            rank_recv_view = recv_view[rank * chunk_numel : (rank + 1) * chunk_numel]
+            for tensor_i, output_offset, chunk_offset, segment_numel in chunk_segments:
+                gathered_flat_views[rank][tensor_i][
+                    output_offset : output_offset + segment_numel
+                ].copy_(rank_recv_view[chunk_offset : chunk_offset + segment_numel])
+
+    return [
+        (
+            name,
+            tensor,
+            [gathered_shards_by_rank[rank][idx] for rank in range(group_size)],
+        )
+        for idx, (name, tensor) in enumerate(bucket)
+    ]
+
+
+def _maybe_cpu(tensor: torch.Tensor, *, cpu: bool) -> torch.Tensor:
+    return _to_cpu(tensor) if cpu else tensor
+
+
+def _copy_export_tensor(dst: torch.Tensor, src: torch.Tensor, *, cpu: bool) -> None:
+    if cpu:
+        _copy_to_cpu(dst, src)
+    else:
+        dst.copy_(src)
+
+
 def remap_layer_index(name: str, global_to_local: dict[int, int]) -> str | None:
     if not global_to_local:
         return name
@@ -429,6 +514,27 @@ def _resolve_param_name(name: str, state_dict: dict) -> str | None:
     return None
 
 
+def _merge_dense_shards(
+    name: str,
+    tensor: torch.Tensor,
+    shards: list[torch.Tensor],
+    spec: HFWeights,
+) -> torch.Tensor:
+    custom_merge = getattr(spec, "merge_dense_shards", None)
+    if callable(custom_merge):
+        merged = custom_merge(name, shards)
+        if merged is not None:
+            return merged
+
+    tp_info = spec.tp_spec(name)
+    if tp_info is None:
+        return tensor
+    split_dim, tp_or_etp = tp_info
+    if tp_or_etp != 0:
+        return tensor
+    return torch.cat(shards, dim=split_dim)
+
+
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,
@@ -438,6 +544,8 @@ def export_hf_weights(
     limit: int | None = None,
     rank0_only: bool = False,
     export_dtype: str | torch.dtype | None = None,
+    cpu: bool = True,
+    buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Export model weights as HF-format (name, tensor) pairs.
 
@@ -459,6 +567,39 @@ def export_hf_weights(
     if ps.pp_size <= 1:
         exported_params = 0
         expert_groups: dict[str, list[tuple[int, str, torch.Tensor]]] = {}
+        dense_bucket: list[tuple[str, torch.Tensor]] = []
+        dense_bucket_bytes = 0
+        dense_bucket_limit_bytes = (
+            buffer_max_size_bytes
+            if ps.tp_size <= 1
+            else max(buffer_max_size_bytes // ps.tp_size, 1)
+        )
+
+        def _iter_mapped(gathered_tensors: dict[str, torch.Tensor]):
+            if rank0_only and rank != 0:
+                return
+            for native_name, gathered_tensor in gathered_tensors.items():
+                if vocab_size is not None and ("embed" in native_name or "head" in native_name):
+                    gathered_tensor = gathered_tensor[:vocab_size]
+                for hf_name, hf_tensor in _native_to_hf(spec, native_name, gathered_tensor):
+                    yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
+
+        def _flush_dense_bucket():
+            nonlocal dense_bucket, dense_bucket_bytes
+            if not dense_bucket:
+                return
+            gathered_bucket = bucketed_all_gather_into_tensor(
+                dense_bucket,
+                group=ps.tp_group,
+                group_size=ps.tp_size,
+                buffer_max_size_bytes=buffer_max_size_bytes,
+            )
+            dense_bucket = []
+            dense_bucket_bytes = 0
+            for native_name, local_tensor, shards in gathered_bucket:
+                merged = _merge_dense_shards(native_name, local_tensor, shards, spec)
+                yield from _iter_mapped({native_name: _maybe_cpu(merged, cpu=cpu)})
+
         for chunk in chunks:
             base_chunk = unwrap_model(chunk)
             layer_map = (
@@ -472,37 +613,60 @@ def export_hf_weights(
 
                 gathered_one: dict[str, torch.Tensor] = {}
                 if spec.is_expert(gname):
+                    yield from _flush_dense_bucket()
                     if limit is None:
                         expert_groups.setdefault(_expert_group_key(gname), []).append(
                             (parse_expert_idx(gname), gname, tensor)
                         )
                         exported_params += 1
                         continue
-                    _gather_expert(gname, tensor, spec, ps, gathered_one)
+                    _gather_expert(gname, tensor, spec, ps, gathered_one, cpu=cpu)
                 else:
-                    gathered_one[gname] = _gather_dense(gname, tensor, spec, ps)
+                    tp_info = spec.tp_spec(gname)
+                    is_tp = tp_info is not None and tp_info[1] == 0 and ps.tp_size > 1
+                    if is_tp:
+                        tensor_bytes = tensor.numel() * tensor.element_size()
+                        should_flush = bool(dense_bucket) and (
+                            tensor.dtype != dense_bucket[0][1].dtype
+                            or dense_bucket_bytes + tensor_bytes > dense_bucket_limit_bytes
+                        )
+                        if should_flush:
+                            yield from _flush_dense_bucket()
+                        dense_bucket.append((gname, tensor))
+                        dense_bucket_bytes += tensor_bytes
+                        exported_params += 1
+                        if dense_bucket_bytes >= dense_bucket_limit_bytes:
+                            yield from _flush_dense_bucket()
+                        if limit is not None and exported_params >= limit:
+                            yield from _flush_dense_bucket()
+                            return
+                        continue
+
+                    yield from _flush_dense_bucket()
+                    gathered_one[gname] = _maybe_cpu(tensor, cpu=cpu)
 
                 exported_params += 1
-                if not rank0_only or rank == 0:
-                    for native_name, gathered_tensor in gathered_one.items():
-                        if vocab_size is not None and (
-                            "embed" in native_name or "head" in native_name
-                        ):
-                            gathered_tensor = gathered_tensor[:vocab_size]
-                        for hf_name, hf_tensor in _native_to_hf(spec, native_name, gathered_tensor):
-                            yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
+                yield from _iter_mapped(gathered_one)
 
                 if limit is not None and exported_params >= limit:
                     return
 
+        yield from _flush_dense_bucket()
         for group_key in sorted(expert_groups):
             gathered_group: dict[str, torch.Tensor] = {}
-            _gather_expert_group(expert_groups[group_key], spec, ps, gathered_group)
-            if not rank0_only or rank == 0:
-                for native_name in sorted(gathered_group, key=parse_expert_idx):
-                    gathered_tensor = gathered_group[native_name]
-                    for hf_name, hf_tensor in _native_to_hf(spec, native_name, gathered_tensor):
-                        yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
+            _gather_expert_group(
+                expert_groups[group_key],
+                spec,
+                ps,
+                gathered_group,
+                cpu=cpu,
+                buffer_max_size_bytes=buffer_max_size_bytes,
+            )
+            ordered_group = {
+                native_name: gathered_group[native_name]
+                for native_name in sorted(gathered_group, key=parse_expert_idx)
+            }
+            yield from _iter_mapped(ordered_group)
         return
 
     gathered: dict[str, torch.Tensor] = {}
@@ -519,9 +683,9 @@ def export_hf_weights(
             t = _materialize_dtensor(param.data.detach())
 
             if spec.is_expert(gname):
-                _gather_expert(gname, t, spec, ps, gathered)
+                _gather_expert(gname, t, spec, ps, gathered, cpu=cpu)
             else:
-                gathered[gname] = _gather_dense(gname, t, spec, ps)
+                gathered[gname] = _gather_dense(gname, t, spec, ps, cpu=cpu)
 
     # PP gather
     if ps.pp_size > 1:
@@ -548,24 +712,32 @@ def export_hf_weights(
             yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
 
 
-def _gather_dense(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch.Tensor:
+def _gather_dense(
+    name: str, tensor: torch.Tensor, spec: HFWeights, ps, *, cpu: bool = True
+) -> torch.Tensor:
     """Gather a dense (non-expert) param across TP."""
     custom_gather = getattr(spec, "gather_dense", None)
     if callable(custom_gather):
         gathered = custom_gather(name, tensor, ps)
         if gathered is not None:
-            return _to_cpu(gathered)
+            return _maybe_cpu(gathered, cpu=cpu)
 
     tp_info = spec.tp_spec(name)
     if tp_info is not None and ps.tp_size > 1:
         split_d, tp_or_etp = tp_info
         if tp_or_etp == 0:
             tensor = allgather_concat(tensor, ps.tp_size, ps.tp_group, dim=split_d)
-    return _to_cpu(tensor)
+    return _maybe_cpu(tensor, cpu=cpu)
 
 
 def _gather_expert(
-    name: str, tensor: torch.Tensor, spec: HFWeights, ps, out: dict[str, torch.Tensor]
+    name: str,
+    tensor: torch.Tensor,
+    spec: HFWeights,
+    ps,
+    out: dict[str, torch.Tensor],
+    *,
+    cpu: bool = True,
 ) -> None:
     """Gather an expert param across ETP + EP."""
     tensor = _gather_expert_etp(name, tensor, spec, ps)
@@ -578,9 +750,9 @@ def _gather_expert(
         _ep_all_gather(ep_gathered, tensor.contiguous(), ps.ep_group)
         for ep_rank, ep_tensor in enumerate(ep_gathered):
             global_idx = ep_rank * n_local + local_idx
-            out[set_expert_idx(name, global_idx)] = _to_cpu(ep_tensor)
+            out[set_expert_idx(name, global_idx)] = _maybe_cpu(ep_tensor, cpu=cpu)
     else:
-        out[name] = _to_cpu(tensor)
+        out[name] = _maybe_cpu(tensor, cpu=cpu)
 
 
 def _gather_expert_etp(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch.Tensor:
@@ -600,7 +772,13 @@ def _expert_group_key(name: str) -> str:
 
 
 def _gather_expert_group(
-    entries: list[tuple[int, str, torch.Tensor]], spec: HFWeights, ps, out: dict[str, torch.Tensor]
+    entries: list[tuple[int, str, torch.Tensor]],
+    spec: HFWeights,
+    ps,
+    out: dict[str, torch.Tensor],
+    *,
+    cpu: bool = True,
+    buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
 ) -> None:
     """Gather local experts in one EP collective per layer/kind."""
     prepared = [
@@ -612,40 +790,54 @@ def _gather_expert_group(
         packed_name = packed_group_name(prepared[0][1])
         if packed_name is not None:
             if ps.ep_size <= 1 or ps.ep_group is None:
-                out[packed_name] = _to_cpu(
-                    torch.stack([tensor.contiguous() for _, _, tensor in prepared], dim=0)
+                out[packed_name] = _maybe_cpu(
+                    torch.stack([tensor.contiguous() for _, _, tensor in prepared], dim=0),
+                    cpu=cpu,
                 )
                 return
 
             sample = prepared[0][2]
-            packed = torch.empty((spec.num_experts, *sample.shape), dtype=sample.dtype, device="cpu")
+            packed = torch.empty(
+                (spec.num_experts, *sample.shape),
+                dtype=sample.dtype,
+                device="cpu" if cpu else sample.device,
+            )
             for batch_start in range(0, len(prepared), 4):
                 batch = prepared[batch_start : batch_start + 4]
                 stacked = torch.stack([tensor.contiguous() for _, _, tensor in batch], dim=0)
-                ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
-                _ep_all_gather(ep_gathered, stacked, ps.ep_group)
+                ep_gathered = bucketed_all_gather_into_tensor(
+                    [(packed_name, stacked)],
+                    group=ps.ep_group,
+                    group_size=ps.ep_size,
+                    buffer_max_size_bytes=buffer_max_size_bytes,
+                )[0][2]
                 for ep_rank, ep_tensor in enumerate(ep_gathered):
                     for batch_idx, (local_idx, _, _) in enumerate(batch):
-                        _copy_to_cpu(
+                        _copy_export_tensor(
                             packed[ep_rank * (spec.num_experts // ps.ep_size) + local_idx],
                             ep_tensor[batch_idx],
+                            cpu=cpu,
                         )
             out[packed_name] = packed
             return
 
     if ps.ep_size <= 1 or ps.ep_group is None:
         for _, name, tensor in prepared:
-            out[name] = _to_cpu(tensor)
+            out[name] = _maybe_cpu(tensor, cpu=cpu)
         return
 
     n_local = spec.num_experts // ps.ep_size
     stacked = torch.stack([tensor.contiguous() for _, _, tensor in prepared], dim=0)
-    ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
-    _ep_all_gather(ep_gathered, stacked, ps.ep_group)
+    ep_gathered = bucketed_all_gather_into_tensor(
+        [(entries[0][1], stacked)],
+        group=ps.ep_group,
+        group_size=ps.ep_size,
+        buffer_max_size_bytes=buffer_max_size_bytes,
+    )[0][2]
     for ep_rank, ep_tensor in enumerate(ep_gathered):
         for slot, (local_idx, name, _) in enumerate(prepared):
             global_idx = ep_rank * n_local + local_idx
-            out[set_expert_idx(name, global_idx)] = _to_cpu(ep_tensor[slot])
+            out[set_expert_idx(name, global_idx)] = _maybe_cpu(ep_tensor[slot], cpu=cpu)
 
 
 def save_hf_weights(
