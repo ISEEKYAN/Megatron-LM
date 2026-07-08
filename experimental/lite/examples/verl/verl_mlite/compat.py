@@ -9,11 +9,138 @@ import importlib.util
 import os
 import sys
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
 _BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+
+
+class _SyncBucketProducer:
+    """Pack one sender bucket at a time into a reusable staging tensor."""
+
+    def __init__(self, weights, staging, bucket_size: int):
+        self._weights = iter(weights)
+        self._staging = staging
+        self._bucket_size = bucket_size
+        self._pending = None
+        self._exhausted = False
+
+    def next_bucket(self):
+        import torch
+
+        if self._staging.device.type == "cuda":
+            torch.cuda.set_device(self._staging.device)
+        if self._exhausted:
+            return "eof", None, None, 0, None
+
+        offset = 0
+        bucket_meta = {}
+        while True:
+            try:
+                if self._pending is None:
+                    name, weight = next(self._weights)
+                else:
+                    name, weight = self._pending
+                    self._pending = None
+            except StopIteration:
+                self._exhausted = True
+                if not bucket_meta:
+                    return "eof", None, None, 0, None
+                break
+
+            if offset + weight.nbytes > self._bucket_size and bucket_meta:
+                self._pending = (name, weight)
+                break
+            if weight.nbytes > self._bucket_size:
+                return "direct", name, weight, 0, None
+
+            bucket_meta[name] = {
+                "name": name,
+                "shape": weight.shape,
+                "dtype": weight.dtype,
+                "offset": offset,
+                "handle": None,
+            }
+            self._staging[offset : offset + weight.nbytes].copy_(
+                weight.view(-1).view(torch.uint8), non_blocking=True
+            )
+            offset += weight.nbytes
+            if offset == self._bucket_size:
+                break
+
+        ready = None
+        if self._staging.device.type == "cuda":
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(self._staging.device))
+        return "bucket", bucket_meta, None, offset, ready
+
+
+def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
+    """Overlap synchronous weight production with the receiver's bucket ACK."""
+    if getattr(sender_cls, "_mlite_weight_prefetch_patch", False):
+        return False
+
+    original_async_send_weights = sender_cls.async_send_weights
+
+    async def prefetched_async_send_weights(self, weights):
+        import torch
+
+        if not isinstance(weights, Iterable) or hasattr(weights, "__aiter__") or self.use_shm:
+            return await original_async_send_weights(self, weights)
+
+        executor = None
+        try:
+            self._init_socket()
+            self._init_buffer()
+            if self.buffer.device.type != "cuda" and not getattr(
+                self, "_mlite_prefetch_allow_cpu", False
+            ):
+                raise RuntimeError("MLite sender prefetch requires a CUDA IPC buffer")
+
+            staging = torch.empty_like(self.buffer)
+            producer = _SyncBucketProducer(weights, staging, self.bucket_size)
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlite-weight-prefetch")
+
+            def submit_next():
+                context = copy_context()
+                return executor.submit(context.run, producer.next_bucket)
+
+            future = submit_next()
+            while True:
+                kind, metadata_or_name, direct_weight, used_bytes, ready = future.result()
+                if kind == "eof":
+                    self.socket.send_pyobj({"bucket_meta": {}, "is_last": True})
+                    self.socket.recv()
+                    break
+                if kind == "direct":
+                    self._direct_send_large_weight(metadata_or_name, direct_weight)
+                    future = submit_next()
+                    continue
+
+                if ready is not None:
+                    ready.synchronize()
+                self.buffer[:used_bytes].copy_(staging[:used_bytes], non_blocking=True)
+                if self.buffer.device.type == "cuda":
+                    torch.cuda.synchronize(self.buffer.device)
+
+                # Staging is safe to reuse only after its contents reached the IPC
+                # buffer. Starting production here hides it behind the old ACK wait.
+                future = submit_next()
+                self.socket.send_pyobj(
+                    {"bucket_meta": metadata_or_name, "is_last": False}
+                )
+                self.socket.recv()
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+            self._cleanup()
+
+    sender_cls.async_send_weights = prefetched_async_send_weights
+    sender_cls._mlite_weight_prefetch_patch = True
+    return True
 
 
 def _weight_sync_probe_enabled() -> bool:
@@ -109,11 +236,16 @@ class _SenderPatchLoader(importlib.abc.Loader):
 
     def exec_module(self, module) -> None:
         self._loader.exec_module(module)
-        _instrument_bucketed_weight_sender(module.BucketedWeightSender)
+        _install_bucketed_sender_prefetch(module.BucketedWeightSender)
+        if _weight_sync_probe_enabled():
+            _instrument_bucketed_weight_sender(module.BucketedWeightSender)
 
 
 class _SenderPatchFinder(importlib.abc.MetaPathFinder):
     _mlite_weight_sync_probe_finder = True
+
+    def __init__(self):
+        self._mlite_weight_sync_probe_requested = False
 
     def find_spec(self, fullname, path, target=None):
         if fullname != _BUCKETED_SENDER_MODULE:
@@ -124,17 +256,35 @@ class _SenderPatchFinder(importlib.abc.MetaPathFinder):
         return spec
 
 
-def _patch_bucketed_weight_sender() -> bool:
-    if not _weight_sync_probe_enabled():
-        return False
-
+def _patch_bucketed_weight_transfer() -> bool:
     module = sys.modules.get(_BUCKETED_SENDER_MODULE)
     if module is not None:
-        return _instrument_bucketed_weight_sender(module.BucketedWeightSender)
+        return _install_bucketed_sender_prefetch(module.BucketedWeightSender)
     if any(getattr(finder, "_mlite_weight_sync_probe_finder", False) for finder in sys.meta_path):
         return False
     sys.meta_path.insert(0, _SenderPatchFinder())
     return True
+
+
+def _patch_bucketed_weight_sender() -> bool:
+    """Install production prefetch plus optional probe instrumentation."""
+    changed = _patch_bucketed_weight_transfer()
+    if not _weight_sync_probe_enabled():
+        return changed
+
+    module = sys.modules.get(_BUCKETED_SENDER_MODULE)
+    if module is not None:
+        changed = _instrument_bucketed_weight_sender(module.BucketedWeightSender) or changed
+    else:
+        finder = next(
+            finder
+            for finder in sys.meta_path
+            if getattr(finder, "_mlite_weight_sync_probe_finder", False)
+        )
+        if not finder._mlite_weight_sync_probe_requested:
+            finder._mlite_weight_sync_probe_requested = True
+            changed = True
+    return changed
 
 
 def _patch_transformers_rope_ignore_keys() -> None:
