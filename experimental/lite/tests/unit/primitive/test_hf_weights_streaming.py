@@ -128,18 +128,20 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
             self.dim = dim
 
     class Mesh:
-        @staticmethod
-        def get_group(mesh_dim):
+        def __init__(self, group) -> None:
+            self.group = group
+
+        def get_group(self, mesh_dim):
             assert mesh_dim == 0
-            return "fsdp"
+            return self.group
 
     class FakeDTensor:
-        def __init__(self, local, shape, shard_dim):
+        def __init__(self, local, shape, shard_dim, group):
             self._local = local
             self.shape = shape
             self.device = local.device
             self.dtype = local.dtype
-            self.device_mesh = Mesh()
+            self.device_mesh = Mesh(group)
             self.placements = (Shard(shard_dim),)
 
         def to_local(self):
@@ -148,12 +150,28 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
         def full_tensor(self):
             raise AssertionError("per-parameter full_tensor must not be used")
 
-    first = FakeDTensor(torch.arange(6, dtype=torch.float32).reshape(2, 3), (4, 3), 0)
-    second = FakeDTensor(torch.arange(4, dtype=torch.float32).reshape(2, 2), (2, 4), 1)
+    first_group = object()
+    equivalent_group = object()
+    single_rank_group = object()
+    first = FakeDTensor(
+        torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        (4, 3),
+        0,
+        first_group,
+    )
+    single = FakeDTensor(
+        torch.arange(3, dtype=torch.float32), (3,), 0, single_rank_group
+    )
+    second = FakeDTensor(
+        torch.arange(4, dtype=torch.float32).reshape(2, 2),
+        (2, 4),
+        1,
+        equivalent_group,
+    )
     calls = []
 
     def fake_all_gather_into_tensor(output, tensor, group=None):
-        assert group == "fsdp"
+        assert group is first_group
         calls.append(tensor.clone())
         output[: tensor.numel()].copy_(tensor)
         output[tensor.numel() :].copy_(tensor + 100)
@@ -161,17 +179,27 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
     monkeypatch.setattr(
         "megatron.lite.primitive.ckpt.hf_weights.DTensor", FakeDTensor
     )
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_world_size",
+        lambda group: 1 if group is single_rank_group else 2,
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_process_group_ranks",
+        lambda group: [0] if group is single_rank_group else [0, 1],
+    )
     monkeypatch.setattr(
         torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
     )
 
     outputs = list(
         _iter_bucketed_materialized_tensors(
-            [
-                ("first", first),
-                ("plain", torch.tensor([7.0])),
-                ("second", second),
+                [
+                    ("first", first),
+                    ("plain", torch.tensor([7.0])),
+                    ("single", single),
+                    ("second", second),
             ],
             buffer_max_size_bytes=1024,
         )
@@ -179,7 +207,8 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
     materialized = dict(outputs)
 
     assert len(calls) == 1
-    assert [name for name, _ in outputs] == ["plain", "first", "second"]
+    assert [name for name, _ in outputs] == ["plain", "single", "first", "second"]
+    assert materialized["single"] is single.to_local()
     assert torch.equal(
         materialized["first"],
         torch.cat([first.to_local(), first.to_local() + 100], dim=0),

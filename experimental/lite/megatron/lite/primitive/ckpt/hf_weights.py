@@ -348,10 +348,12 @@ def _iter_bucketed_materialized_tensors(
     metadata: list[tuple[int, tuple[int, ...]]] = []
     bucket_bytes = 0
     bucket_group = None
+    bucket_group_ranks: tuple[int, ...] | None = None
     bucket_group_size = 1
 
     def _flush_bucket():
-        nonlocal bucket, metadata, bucket_bytes, bucket_group, bucket_group_size
+        nonlocal bucket, metadata, bucket_bytes
+        nonlocal bucket_group, bucket_group_ranks, bucket_group_size
         if not bucket:
             return
         with get_weight_sync_probe().measure(
@@ -377,6 +379,7 @@ def _iter_bucketed_materialized_tensors(
         metadata = []
         bucket_bytes = 0
         bucket_group = None
+        bucket_group_ranks = None
         bucket_group_size = 1
         yield from outputs
 
@@ -398,6 +401,10 @@ def _iter_bucketed_materialized_tensors(
         shard_dim = int(shard_dim) % len(global_shape) if global_shape else -1
         group = tensor.device_mesh.get_group(0)
         group_size = dist.get_world_size(group)
+        if group_size <= 1:
+            yield name, local
+            continue
+        group_ranks = tuple(dist.get_process_group_ranks(group))
         evenly_sharded = (
             shard_dim >= 0
             and global_shape[shard_dim] % group_size == 0
@@ -413,7 +420,7 @@ def _iter_bucketed_materialized_tensors(
         incompatible = bool(bucket) and (
             local.dtype != bucket[0][1].dtype
             or local.device != bucket[0][1].device
-            or group != bucket_group
+            or group_ranks != bucket_group_ranks
             or group_size != bucket_group_size
             or bucket_bytes + local_bytes > per_rank_limit
         )
@@ -423,8 +430,10 @@ def _iter_bucketed_materialized_tensors(
         bucket.append((name, local))
         metadata.append((shard_dim, global_shape))
         bucket_bytes += local_bytes
-        bucket_group = group
-        bucket_group_size = group_size
+        if bucket_group is None:
+            bucket_group = group
+            bucket_group_ranks = group_ranks
+            bucket_group_size = group_size
         if bucket_bytes >= per_rank_limit:
             yield from _flush_bucket()
 
