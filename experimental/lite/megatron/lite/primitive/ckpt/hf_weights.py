@@ -512,6 +512,34 @@ def _iter_bucketed_materialized_tensors(
 
         local_bytes = local.numel() * local.element_size()
         per_rank_limit = max(buffer_max_size_bytes // group_size, 1)
+        if local_bytes > per_rank_limit:
+            yield from _flush_bucket()
+            local_extent = local.shape[shard_dim]
+            bytes_per_extent = local_bytes // local_extent
+            chunk_extent = max(per_rank_limit // bytes_per_extent, 1)
+            full = torch.empty(global_shape, dtype=local.dtype, device=local.device)
+            with get_weight_sync_probe().measure(
+                "fsdp_gather", device=local.device
+            ) as sample:
+                for offset in range(0, local_extent, chunk_extent):
+                    extent = min(chunk_extent, local_extent - offset)
+                    local_chunk = local.narrow(shard_dim, offset, extent)
+                    _, _, gathered_chunks = bucketed_all_gather_into_tensor(
+                        [(name, local_chunk)],
+                        group=group,
+                        group_size=group_size,
+                        buffer_max_size_bytes=buffer_max_size_bytes,
+                    )[0]
+                    for rank, gathered_chunk in enumerate(gathered_chunks):
+                        full.narrow(
+                            shard_dim,
+                            rank * local_extent + offset,
+                            extent,
+                        ).copy_(gathered_chunk)
+                sample.nbytes = _tensor_nbytes(full)
+            yield name, full
+            continue
+
         incompatible = bool(bucket) and (
             local.dtype != bucket[0][1].dtype
             or local.device != bucket[0][1].device
