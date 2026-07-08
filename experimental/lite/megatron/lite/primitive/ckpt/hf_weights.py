@@ -292,6 +292,41 @@ def bucketed_all_gather_into_tensor(
     max_chunk_numel = max(1, per_rank_buffer_bytes // element_size)
     flat_shards = [tensor.reshape(-1) for _, tensor in bucket]
     numel_per_tensor = [tensor.numel() for tensor in flat_shards]
+    total_numel = sum(numel_per_tensor)
+
+    # Normal export buckets are capped before entering this function, so they
+    # fit in one collective. Keep the rank-major receive buffer alive through
+    # returned views instead of allocating and copying ``num_tensors * world``
+    # temporary shards. Oversized single tensors use the bounded chunked path
+    # below.
+    if total_numel <= max_chunk_numel:
+        send_buffer = torch.empty(total_numel, dtype=dtype, device=device)
+        send_views = list(send_buffer.split(numel_per_tensor))
+        torch._foreach_copy_(send_views, flat_shards)
+        recv_buffer = torch.empty(group_size * total_numel, dtype=dtype, device=device)
+        dist.all_gather_into_tensor(recv_buffer, send_buffer, group=group)
+
+        offsets = []
+        offset = 0
+        for numel in numel_per_tensor:
+            offsets.append(offset)
+            offset += numel
+        return [
+            (
+                name,
+                tensor,
+                [
+                    recv_buffer[
+                        rank * total_numel + offsets[idx] : rank * total_numel
+                        + offsets[idx]
+                        + numel_per_tensor[idx]
+                    ].view_as(tensor)
+                    for rank in range(group_size)
+                ],
+            )
+            for idx, (name, tensor) in enumerate(bucket)
+        ]
+
     gathered_shards_by_rank = [
         [torch.empty_like(tensor) for _, tensor in bucket] for _ in range(group_size)
     ]
@@ -343,40 +378,57 @@ def _iter_bucketed_materialized_tensors(
     *,
     buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Materialize adjacent FSDP DTensors through bounded flat gathers."""
+    """Materialize sharded DTensors through bounded, layout-aware flat gathers.
+
+    Replicated DTensors and plain tensors are already complete on every DP rank,
+    so they bypass collectives.  They remain in the pending stream until the
+    current sharded bucket is flushed, which preserves parameter order without
+    breaking a flat bucket at every replicated parameter.
+    """
     bucket: list[tuple[str, torch.Tensor]] = []
     metadata: list[tuple[int, tuple[int, ...]]] = []
+    pending: list[tuple[str, torch.Tensor | None, int | None]] = []
     bucket_bytes = 0
     bucket_group = None
     bucket_group_ranks: tuple[int, ...] | None = None
     bucket_group_size = 1
 
     def _flush_bucket():
-        nonlocal bucket, metadata, bucket_bytes
+        nonlocal bucket, metadata, pending, bucket_bytes
         nonlocal bucket_group, bucket_group_ranks, bucket_group_size
-        if not bucket:
+        if not pending:
             return
-        with get_weight_sync_probe().measure(
-            "fsdp_gather", device=bucket[0][1].device
-        ) as sample:
-            gathered = bucketed_all_gather_into_tensor(
-                bucket,
-                group=bucket_group,
-                group_size=bucket_group_size,
-                buffer_max_size_bytes=buffer_max_size_bytes,
-            )
-            outputs = []
-            for (name, _, shards), (shard_dim, global_shape) in zip(
-                gathered, metadata, strict=True
-            ):
-                full = torch.cat(shards, dim=shard_dim)
-                if tuple(full.shape) != global_shape:
-                    slices = tuple(slice(0, size) for size in global_shape)
-                    full = full[slices]
-                outputs.append((name, full))
-            sample.nbytes = sum(_tensor_nbytes(tensor) for _, tensor in outputs)
+        materialized: list[torch.Tensor] = []
+        if bucket:
+            with get_weight_sync_probe().measure(
+                "fsdp_gather", device=bucket[0][1].device
+            ) as sample:
+                gathered = bucketed_all_gather_into_tensor(
+                    bucket,
+                    group=bucket_group,
+                    group_size=bucket_group_size,
+                    buffer_max_size_bytes=buffer_max_size_bytes,
+                )
+                for (_, _, shards), (shard_dim, global_shape) in zip(
+                    gathered, metadata, strict=True
+                ):
+                    full = torch.cat(shards, dim=shard_dim)
+                    if tuple(full.shape) != global_shape:
+                        slices = tuple(slice(0, size) for size in global_shape)
+                        full = full[slices]
+                    materialized.append(full)
+                sample.nbytes = sum(_tensor_nbytes(tensor) for tensor in materialized)
+
+        outputs = []
+        for name, local_tensor, bucket_idx in pending:
+            if bucket_idx is None:
+                assert local_tensor is not None
+                outputs.append((name, local_tensor))
+            else:
+                outputs.append((name, materialized[bucket_idx]))
         bucket = []
         metadata = []
+        pending = []
         bucket_bytes = 0
         bucket_group = None
         bucket_group_ranks = None
@@ -385,13 +437,27 @@ def _iter_bucketed_materialized_tensors(
 
     for name, tensor in named_tensors:
         if DTensor is None or not isinstance(tensor, DTensor):
-            yield name, tensor
+            if bucket:
+                pending.append((name, tensor, None))
+            else:
+                yield name, tensor
             continue
 
         placements = tuple(tensor.placements)
         placement = placements[0] if len(placements) == 1 else None
         shard_dim = getattr(placement, "dim", None)
-        if placement is None or type(placement).__name__ != "Shard" or shard_dim is None:
+        if placement is not None and type(placement).__name__ == "Replicate":
+            local = tensor.to_local()
+            if bucket:
+                pending.append((name, local, None))
+            else:
+                yield name, local
+            continue
+        if (
+            placement is None
+            or type(placement).__name__ != "Shard"
+            or shard_dim is None
+        ):
             yield from _flush_bucket()
             yield name, _materialize_dtensor(tensor)
             continue
@@ -402,7 +468,10 @@ def _iter_bucketed_materialized_tensors(
         group = tensor.device_mesh.get_group(0)
         group_size = dist.get_world_size(group)
         if group_size <= 1:
-            yield name, local
+            if bucket:
+                pending.append((name, local, None))
+            else:
+                yield name, local
             continue
         group_ranks = tuple(dist.get_process_group_ranks(group))
         evenly_sharded = (
@@ -429,6 +498,7 @@ def _iter_bucketed_materialized_tensors(
 
         bucket.append((name, local))
         metadata.append((shard_dim, global_shape))
+        pending.append((name, None, len(bucket) - 1))
         bucket_bytes += local_bytes
         if bucket_group is None:
             bucket_group = group
@@ -759,9 +829,15 @@ def export_hf_weights(
                     )
                     yield to_global_layer_name(name, layer_map), tensor
 
+        native_params = _iter_native_params()
         materialized_params = (
-            (name, _materialize_dtensor(tensor))
-            for name, tensor in _iter_native_params()
+            _iter_bucketed_materialized_tensors(
+                native_params, buffer_max_size_bytes=buffer_max_size_bytes
+            )
+            if not cpu and limit is None
+            else (
+                (name, _materialize_dtensor(tensor)) for name, tensor in native_params
+            )
         )
         for gname, tensor in materialized_params:
             gathered_one: dict[str, torch.Tensor] = {}

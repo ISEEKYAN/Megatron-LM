@@ -122,6 +122,44 @@ def test_bucketed_all_gather_rejects_mixed_dtype_bucket() -> None:
         raise AssertionError("mixed dtype bucket was accepted")
 
 
+def test_flat_gather_fast_path_returns_recv_views_without_per_tensor_allocations(
+    monkeypatch,
+) -> None:
+    bucket = [
+        ("first", torch.arange(4, dtype=torch.float32).reshape(2, 2)),
+        ("second", torch.arange(6, dtype=torch.float32).reshape(2, 3).t()),
+    ]
+    assert not bucket[1][1].is_contiguous()
+
+    def fake_all_gather_into_tensor(output, tensor, group=None):
+        assert group == "dp"
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor + 100)
+
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
+    )
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.torch.empty_like",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("fast path must not allocate tensor-by-rank shards")
+        ),
+    )
+
+    gathered = bucketed_all_gather_into_tensor(
+        bucket, group="dp", group_size=2, buffer_max_size_bytes=1024
+    )
+
+    assert torch.equal(gathered[0][2][0], bucket[0][1])
+    assert torch.equal(gathered[0][2][1], bucket[0][1] + 100)
+    assert torch.equal(gathered[1][2][0], bucket[1][1])
+    assert torch.equal(gathered[1][2][1], bucket[1][1] + 100)
+    assert (
+        gathered[0][2][0].untyped_storage().data_ptr()
+        == gathered[1][2][1].untyped_storage().data_ptr()
+    )
+
+
 def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
     class Shard:
         def __init__(self, dim: int) -> None:
@@ -195,11 +233,11 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
 
     outputs = list(
         _iter_bucketed_materialized_tensors(
-                [
-                    ("first", first),
-                    ("plain", torch.tensor([7.0])),
-                    ("single", single),
-                    ("second", second),
+            [
+                ("first", first),
+                ("plain", torch.tensor([7.0])),
+                ("single", single),
+                ("second", second),
             ],
             buffer_max_size_bytes=1024,
         )
@@ -207,7 +245,7 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
     materialized = dict(outputs)
 
     assert len(calls) == 1
-    assert [name for name, _ in outputs] == ["plain", "single", "first", "second"]
+    assert [name for name, _ in outputs] == ["first", "plain", "single", "second"]
     assert materialized["single"] is single.to_local()
     assert torch.equal(
         materialized["first"],
@@ -217,6 +255,177 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
         materialized["second"],
         torch.cat([second.to_local(), second.to_local() + 100], dim=1),
     )
+
+
+def test_replicated_dtensor_uses_local_tensor_without_collective(monkeypatch) -> None:
+    class Replicate:
+        pass
+
+    class FakeDTensor:
+        def __init__(self, local):
+            self._local = local
+            self.shape = local.shape
+            self.device = local.device
+            self.dtype = local.dtype
+            self.placements = (Replicate(),)
+
+        def to_local(self):
+            return self._local
+
+        def full_tensor(self):
+            raise AssertionError("replicated parameters must not call full_tensor")
+
+    local = torch.arange(5, dtype=torch.float32)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.DTensor", FakeDTensor
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("replicated parameters must not be gathered")
+        ),
+    )
+
+    outputs = list(
+        _iter_bucketed_materialized_tensors([("replicated", FakeDTensor(local))])
+    )
+
+    assert outputs[0][0] == "replicated"
+    assert outputs[0][1] is local
+
+
+def test_gpu_export_uses_flat_fsdp_gather_but_cpu_export_keeps_legacy_path(
+    monkeypatch,
+) -> None:
+    class Shard:
+        dim = 0
+
+    class Mesh:
+        @staticmethod
+        def get_group(mesh_dim):
+            assert mesh_dim == 0
+            return "fsdp"
+
+    full_tensor_calls = []
+
+    class FakeDTensor:
+        def __init__(self, local):
+            self._local = local
+            self.shape = (local.shape[0] * 2, *local.shape[1:])
+            self.device = local.device
+            self.dtype = local.dtype
+            self.device_mesh = Mesh()
+            self.placements = (Shard(),)
+
+        @property
+        def data(self):
+            return self
+
+        def detach(self):
+            return self
+
+        def to_local(self):
+            return self._local
+
+        def full_tensor(self):
+            full_tensor_calls.append(self)
+            return torch.cat([self._local, self._local + 100], dim=0)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.params = [
+                FakeDTensor(torch.arange(4, dtype=torch.float32).reshape(2, 2)),
+                FakeDTensor(torch.arange(3, dtype=torch.float32).reshape(1, 3)),
+            ]
+
+        def named_parameters(self, *args, **kwargs):
+            del args, kwargs
+            yield "first", self.params[0]
+            yield "second", self.params[1]
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def is_expert(name):
+            return False
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+    gather_calls = []
+
+    def fake_all_gather_into_tensor(output, tensor, group=None):
+        assert group == "fsdp"
+        gather_calls.append(tensor.clone())
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor + 100)
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.DTensor", FakeDTensor
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda group: [0, 1]
+    )
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
+    )
+
+    resident = dict(
+        export_hf_weights(Model(), Spec(), ps, cpu=False, buffer_max_size_bytes=1024)
+    )
+
+    assert len(gather_calls) == 1
+    assert full_tensor_calls == []
+    assert resident["first"].device.type == "cpu"
+    assert resident["second"].device.type == "cpu"
+
+    gather_calls.clear()
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    filtered = list(
+        export_hf_weights(
+            Model(),
+            Spec(),
+            ps,
+            cpu=False,
+            rank0_only=True,
+            buffer_max_size_bytes=1024,
+        )
+    )
+
+    assert filtered == []
+    assert len(gather_calls) == 1
+    assert full_tensor_calls == []
+
+    gather_calls.clear()
+    staged = dict(export_hf_weights(Model(), Spec(), ps, cpu=True))
+
+    assert gather_calls == []
+    assert len(full_tensor_calls) == 2
+    assert staged.keys() == resident.keys()
+    assert all(torch.equal(staged[name], resident[name]) for name in staged)
 
 
 def test_export_batches_adjacent_tp_weights_into_one_flat_collective(
