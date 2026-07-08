@@ -145,12 +145,6 @@ def test_flat_gather_fast_path_returns_recv_views_without_per_tensor_allocations
             AssertionError("fast path must not allocate tensor-by-rank shards")
         ),
     )
-    monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights.torch._foreach_copy_",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("send fast path must use one cat pack")
-        ),
-    )
 
     gathered = bucketed_all_gather_into_tensor(
         bucket, group="dp", group_size=2, buffer_max_size_bytes=1024
@@ -263,7 +257,7 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
     )
 
 
-def test_fsdp_dim0_materialization_uses_one_cat_and_nonzero_dim_stays_correct(
+def test_fsdp_materialization_uses_one_flat_output_without_per_tensor_cat(
     monkeypatch,
 ) -> None:
     class Shard:
@@ -290,22 +284,13 @@ def test_fsdp_dim0_materialization_uses_one_cat_and_nonzero_dim_stays_correct(
 
     first = FakeDTensor(torch.arange(4).reshape(2, 2), (4, 2), 0)
     second = FakeDTensor(torch.arange(6).reshape(2, 3), (2, 6), 1)
-    third = FakeDTensor(torch.arange(3).reshape(1, 3), (2, 3), 0)
     expected_first = torch.cat([first.to_local(), first.to_local() + 100], dim=0)
     expected_second = torch.cat([second.to_local(), second.to_local() + 100], dim=1)
-    expected_third = torch.cat([third.to_local(), third.to_local() + 100], dim=0)
-    original_cat = torch.cat
-    materialize_cat_calls = []
 
-    def record_cat(tensors, *args, **kwargs):
-        materialize_cat_calls.append((len(tensors), kwargs.get("out")))
-        return original_cat(tensors, *args, **kwargs)
-
-    def fake_bucketed_gather(bucket, **kwargs):
-        del kwargs
-        return [
-            (name, tensor, [tensor, tensor + 100]) for name, tensor in bucket
-        ]
+    def fake_all_gather_into_tensor(output, tensor, group=None):
+        assert group == "fsdp"
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor + 100)
 
     monkeypatch.setattr(
         "megatron.lite.primitive.ckpt.hf_weights.DTensor", FakeDTensor
@@ -315,30 +300,26 @@ def test_fsdp_dim0_materialization_uses_one_cat_and_nonzero_dim_stays_correct(
         torch.distributed, "get_process_group_ranks", lambda group: [0, 1]
     )
     monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights.torch.cat",
-        record_cat,
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
     )
     monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights.bucketed_all_gather_into_tensor",
-        fake_bucketed_gather,
+        "megatron.lite.primitive.ckpt.hf_weights.torch.cat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("flat FSDP materialization must not call torch.cat")
+        ),
     )
 
     outputs = dict(
         _iter_bucketed_materialized_tensors(
-            [("first", first), ("second", second), ("third", third)],
-            buffer_max_size_bytes=1024,
+            [("first", first), ("second", second)], buffer_max_size_bytes=1024
         )
     )
 
-    assert len(materialize_cat_calls) == 1
-    assert materialize_cat_calls[0][0] == 4
-    assert materialize_cat_calls[0][1] is not None
     assert torch.equal(outputs["first"], expected_first)
     assert torch.equal(outputs["second"], expected_second)
-    assert torch.equal(outputs["third"], expected_third)
     assert (
         outputs["first"].untyped_storage().data_ptr()
-        == outputs["third"].untyped_storage().data_ptr()
+        == outputs["second"].untyped_storage().data_ptr()
     )
 
 

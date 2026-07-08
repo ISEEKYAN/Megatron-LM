@@ -301,7 +301,8 @@ def bucketed_all_gather_into_tensor(
     # below.
     if total_numel <= max_chunk_numel:
         send_buffer = torch.empty(total_numel, dtype=dtype, device=device)
-        torch.cat(flat_shards, out=send_buffer)
+        send_views = list(send_buffer.split(numel_per_tensor))
+        torch._foreach_copy_(send_views, flat_shards)
         recv_buffer = torch.empty(group_size * total_numel, dtype=dtype, device=device)
         dist.all_gather_into_tensor(recv_buffer, send_buffer, group=group)
 
@@ -397,7 +398,7 @@ def _iter_bucketed_materialized_tensors(
         nonlocal bucket_group, bucket_group_ranks, bucket_group_size
         if not pending:
             return
-        materialized: list[torch.Tensor | None] = [None] * len(bucket)
+        materialized: list[torch.Tensor] = []
         if bucket:
             with get_weight_sync_probe().measure(
                 "fsdp_gather", device=bucket[0][1].device
@@ -408,85 +409,41 @@ def _iter_bucketed_materialized_tensors(
                     group_size=bucket_group_size,
                     buffer_max_size_bytes=buffer_max_size_bytes,
                 )
-                global_numels = [
+                total_global_numel = sum(
                     local_tensor.numel() * bucket_group_size
                     for _, local_tensor in bucket
-                ]
-                dim0_numel = sum(
-                    global_numel
-                    for global_numel, (shard_dim, _) in zip(
-                        global_numels, metadata, strict=True
-                    )
-                    if shard_dim == 0
                 )
-                nonzero_dim_numel = sum(global_numels) - dim0_numel
-                dim0_buffer = (
-                    torch.empty(
-                        dim0_numel,
-                        dtype=bucket[0][1].dtype,
-                        device=bucket[0][1].device,
-                    )
-                    if dim0_numel
-                    else None
+                materialized_buffer = torch.empty(
+                    total_global_numel,
+                    dtype=bucket[0][1].dtype,
+                    device=bucket[0][1].device,
                 )
-                nonzero_dim_buffer = (
-                    torch.empty(
-                        nonzero_dim_numel,
-                        dtype=bucket[0][1].dtype,
-                        device=bucket[0][1].device,
-                    )
-                    if nonzero_dim_numel
-                    else None
-                )
-                dim0_sources: list[torch.Tensor] = []
-                nonzero_dim_sources: list[torch.Tensor] = []
-                nonzero_dim_destinations: list[torch.Tensor] = []
-                dim0_offset = 0
-                nonzero_dim_offset = 0
-                for idx, ((_, _, shards), (shard_dim, global_shape)) in enumerate(
-                    zip(gathered, metadata, strict=True)
+                source_views: list[torch.Tensor] = []
+                destination_views: list[torch.Tensor] = []
+                materialized_offset = 0
+                for (_, _, shards), (shard_dim, global_shape) in zip(
+                    gathered, metadata, strict=True
                 ):
-                    global_numel = global_numels[idx]
-                    if shard_dim == 0:
-                        assert dim0_buffer is not None
-                        full = dim0_buffer[
-                            dim0_offset : dim0_offset + global_numel
-                        ].view(global_shape)
-                        dim0_sources.extend(shard.reshape(-1) for shard in shards)
-                        dim0_offset += global_numel
-                        materialized[idx] = full
-                        continue
-
-                    assert nonzero_dim_buffer is not None
-                    full = nonzero_dim_buffer[
-                        nonzero_dim_offset : nonzero_dim_offset + global_numel
+                    global_numel = 1
+                    for size in global_shape:
+                        global_numel *= size
+                    full = materialized_buffer[
+                        materialized_offset : materialized_offset + global_numel
                     ].view(global_shape)
                     local_extent = shards[0].shape[shard_dim]
                     for rank, shard in enumerate(shards):
-                        nonzero_dim_sources.append(shard)
-                        nonzero_dim_destinations.append(
+                        source_views.append(shard)
+                        destination_views.append(
                             full.narrow(
                                 shard_dim,
                                 rank * local_extent,
                                 local_extent,
                             )
                         )
-                    nonzero_dim_offset += global_numel
-                    materialized[idx] = full
-                if dim0_sources:
-                    assert dim0_buffer is not None
-                    torch.cat(dim0_sources, out=dim0_buffer)
-                if nonzero_dim_sources:
-                    torch._foreach_copy_(
-                        nonzero_dim_destinations, nonzero_dim_sources
-                    )
-                sample.nbytes = (
-                    _tensor_nbytes(dim0_buffer) if dim0_buffer is not None else 0
-                ) + (
-                    _tensor_nbytes(nonzero_dim_buffer)
-                    if nonzero_dim_buffer is not None
-                    else 0
-                )
+                    materialized.append(full)
+                    materialized_offset += global_numel
+                torch._foreach_copy_(destination_views, source_views)
+                sample.nbytes = _tensor_nbytes(materialized_buffer)
 
         outputs = []
         for name, local_tensor, bucket_idx in pending:
@@ -494,9 +451,7 @@ def _iter_bucketed_materialized_tensors(
                 assert local_tensor is not None
                 outputs.append((name, local_tensor))
             else:
-                materialized_tensor = materialized[bucket_idx]
-                assert materialized_tensor is not None
-                outputs.append((name, materialized_tensor))
+                outputs.append((name, materialized[bucket_idx]))
         bucket = []
         metadata = []
         pending = []
