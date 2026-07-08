@@ -745,7 +745,10 @@ def export_hf_weights(
                     else {}
                 )
                 for name, param in base_chunk.named_parameters():
-                    yield to_global_layer_name(name, layer_map), param.data.detach()
+                    tensor = _cast_export_tensor(
+                        param.data.detach(), resolved_export_dtype
+                    )
+                    yield to_global_layer_name(name, layer_map), tensor
 
         native_params = _iter_native_params()
         materialized_params = (

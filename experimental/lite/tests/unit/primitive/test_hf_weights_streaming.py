@@ -250,6 +250,58 @@ def test_export_batches_adjacent_tp_weights_into_one_flat_collective(
     )
 
 
+def test_export_casts_local_shards_before_collective(monkeypatch) -> None:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.arange(4, dtype=torch.float32).reshape(2, 2))
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def is_expert(name):
+            return False
+
+        @staticmethod
+        def tp_spec(name):
+            return (0, 0)
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 2,
+            "tp_group": "tp",
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+
+    def fake_all_gather_into_tensor(output, tensor, group=None):
+        assert group == "tp"
+        assert tensor.dtype == torch.bfloat16
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor + 10)
+
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
+    )
+
+    exported = dict(
+        export_hf_weights(Model(), Spec(), ps, export_dtype=torch.bfloat16)
+    )
+
+    assert exported["weight"].dtype == torch.bfloat16
+
+
 def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
     class ExpertGroup(nn.Module):
         def __init__(self, offset: int) -> None:
