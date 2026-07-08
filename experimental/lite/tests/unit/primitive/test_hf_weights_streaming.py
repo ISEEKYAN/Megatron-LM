@@ -18,6 +18,7 @@ if importlib.util.find_spec("safetensors") is None:
     sys.modules["safetensors.torch"] = safetensors_torch
 
 from megatron.lite.primitive.ckpt.hf_weights import (
+    _iter_bucketed_materialized_tensors,
     bucketed_all_gather_into_tensor,
     export_hf_weights,
 )
@@ -121,6 +122,67 @@ def test_bucketed_all_gather_rejects_mixed_dtype_bucket() -> None:
         raise AssertionError("mixed dtype bucket was accepted")
 
 
+def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
+    class Shard:
+        def __init__(self, dim: int) -> None:
+            self.dim = dim
+
+    class Mesh:
+        @staticmethod
+        def get_group(mesh_dim):
+            assert mesh_dim == 0
+            return "fsdp"
+
+    class FakeDTensor:
+        def __init__(self, local, shape, shard_dim):
+            self._local = local
+            self.shape = shape
+            self.device = local.device
+            self.dtype = local.dtype
+            self.device_mesh = Mesh()
+            self.placements = (Shard(shard_dim),)
+
+        def to_local(self):
+            return self._local
+
+        def full_tensor(self):
+            raise AssertionError("per-parameter full_tensor must not be used")
+
+    first = FakeDTensor(torch.arange(6, dtype=torch.float32).reshape(2, 3), (4, 3), 0)
+    second = FakeDTensor(torch.arange(4, dtype=torch.float32).reshape(2, 2), (2, 4), 1)
+    calls = []
+
+    def fake_all_gather_into_tensor(output, tensor, group=None):
+        assert group == "fsdp"
+        calls.append(tensor.clone())
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor + 100)
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.DTensor", FakeDTensor
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
+    )
+
+    materialized = dict(
+        _iter_bucketed_materialized_tensors(
+            [("first", first), ("second", second)], buffer_max_size_bytes=1024
+        )
+    )
+
+    assert len(calls) == 1
+    assert torch.equal(
+        materialized["first"],
+        torch.cat([first.to_local(), first.to_local() + 100], dim=0),
+    )
+    assert torch.equal(
+        materialized["second"],
+        torch.cat([second.to_local(), second.to_local() + 100], dim=1),
+    )
+
+
 def test_export_batches_adjacent_tp_weights_into_one_flat_collective(
     monkeypatch,
 ) -> None:
@@ -199,6 +261,11 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
             self.second = nn.Module()
             self.second.experts = ExpertGroup(1000)
 
+        def named_parameters(self, *args, **kwargs):
+            for item in super().named_parameters(*args, **kwargs):
+                visited.append(item[0])
+                yield item
+
     class Spec:
         num_experts = 4
 
@@ -232,21 +299,13 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
             "etp_group": None,
         },
     )()
-    materialized = []
-
-    def record_materialize(tensor):
-        materialized.append(tensor)
-        return tensor
+    visited = []
 
     def fake_all_gather_into_tensor(output, tensor, group=None):
         assert group == "ep"
         output[: tensor.numel()].copy_(tensor)
         output[tensor.numel() :].copy_(tensor + 100)
 
-    monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights._materialize_dtensor",
-        record_materialize,
-    )
     monkeypatch.setattr(
         torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
     )
@@ -257,7 +316,7 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
     name, tensor = next(stream)
 
     assert name == "first.experts.packed"
-    assert len(materialized) == 2
+    assert len(visited) == 2
     expected_local = [
         torch.arange(4, dtype=torch.float32),
         torch.arange(4, dtype=torch.float32) + 10,

@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -338,6 +338,100 @@ def bucketed_all_gather_into_tensor(
     ]
 
 
+def _iter_bucketed_materialized_tensors(
+    named_tensors: Iterable[tuple[str, torch.Tensor]],
+    *,
+    buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Materialize adjacent FSDP DTensors through bounded flat gathers."""
+    bucket: list[tuple[str, torch.Tensor]] = []
+    metadata: list[tuple[int, tuple[int, ...]]] = []
+    bucket_bytes = 0
+    bucket_group = None
+    bucket_group_size = 1
+
+    def _flush_bucket():
+        nonlocal bucket, metadata, bucket_bytes, bucket_group, bucket_group_size
+        if not bucket:
+            return
+        with get_weight_sync_probe().measure(
+            "fsdp_gather", device=bucket[0][1].device
+        ) as sample:
+            gathered = bucketed_all_gather_into_tensor(
+                bucket,
+                group=bucket_group,
+                group_size=bucket_group_size,
+                buffer_max_size_bytes=buffer_max_size_bytes,
+            )
+            outputs = []
+            for (name, _, shards), (shard_dim, global_shape) in zip(
+                gathered, metadata, strict=True
+            ):
+                full = torch.cat(shards, dim=shard_dim)
+                if tuple(full.shape) != global_shape:
+                    slices = tuple(slice(0, size) for size in global_shape)
+                    full = full[slices]
+                outputs.append((name, full))
+            sample.nbytes = sum(_tensor_nbytes(tensor) for _, tensor in outputs)
+        bucket = []
+        metadata = []
+        bucket_bytes = 0
+        bucket_group = None
+        bucket_group_size = 1
+        yield from outputs
+
+    for name, tensor in named_tensors:
+        if DTensor is None or not isinstance(tensor, DTensor):
+            yield from _flush_bucket()
+            yield name, tensor
+            continue
+
+        placements = tuple(tensor.placements)
+        placement = placements[0] if len(placements) == 1 else None
+        shard_dim = getattr(placement, "dim", None)
+        if placement is None or type(placement).__name__ != "Shard" or shard_dim is None:
+            yield from _flush_bucket()
+            yield name, _materialize_dtensor(tensor)
+            continue
+
+        local = tensor.to_local()
+        global_shape = tuple(int(size) for size in tensor.shape)
+        shard_dim = int(shard_dim) % len(global_shape) if global_shape else -1
+        group = tensor.device_mesh.get_group(0)
+        group_size = dist.get_world_size(group)
+        evenly_sharded = (
+            shard_dim >= 0
+            and global_shape[shard_dim] % group_size == 0
+            and local.shape[shard_dim] * group_size == global_shape[shard_dim]
+        )
+        if not evenly_sharded:
+            yield from _flush_bucket()
+            yield name, _materialize_dtensor(tensor)
+            continue
+
+        local_bytes = local.numel() * local.element_size()
+        per_rank_limit = max(buffer_max_size_bytes // group_size, 1)
+        incompatible = bool(bucket) and (
+            local.dtype != bucket[0][1].dtype
+            or local.device != bucket[0][1].device
+            or group != bucket_group
+            or group_size != bucket_group_size
+            or bucket_bytes + local_bytes > per_rank_limit
+        )
+        if incompatible:
+            yield from _flush_bucket()
+
+        bucket.append((name, local))
+        metadata.append((shard_dim, global_shape))
+        bucket_bytes += local_bytes
+        bucket_group = group
+        bucket_group_size = group_size
+        if bucket_bytes >= per_rank_limit:
+            yield from _flush_bucket()
+
+    yield from _flush_bucket()
+
+
 def _maybe_cpu(tensor: torch.Tensor, *, cpu: bool) -> torch.Tensor:
     return _to_cpu(tensor) if cpu else tensor
 
@@ -640,67 +734,73 @@ def export_hf_weights(
                         del packed_expert_buffers[packed_name]
                         yield from _iter_mapped({packed_name: packed_tensor})
 
-        for chunk in chunks:
-            base_chunk = unwrap_model(chunk)
-            layer_map = (
-                {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
-                if hasattr(base_chunk, "layer_indices")
-                else {}
-            )
-            for name, param in base_chunk.named_parameters():
-                gname = to_global_layer_name(name, layer_map)
-                tensor = _materialize_dtensor(param.data.detach())
+        def _iter_native_params():
+            for chunk in chunks:
+                base_chunk = unwrap_model(chunk)
+                layer_map = (
+                    {
+                        i: base_chunk.layer_indices[i]
+                        for i in range(len(base_chunk.layer_indices))
+                    }
+                    if hasattr(base_chunk, "layer_indices")
+                    else {}
+                )
+                for name, param in base_chunk.named_parameters():
+                    yield to_global_layer_name(name, layer_map), param.data.detach()
 
-                gathered_one: dict[str, torch.Tensor] = {}
-                if spec.is_expert(gname):
-                    yield from _flush_dense_bucket()
-                    if limit is None:
-                        tensor = _gather_expert_etp(gname, tensor, spec, ps)
-                        tensor_bytes = tensor.numel() * tensor.element_size()
-                        should_flush = bool(expert_bucket) and (
-                            tensor.dtype != expert_bucket[0][1].dtype
-                            or expert_bucket_bytes + tensor_bytes
-                            > expert_bucket_limit_bytes
-                        )
-                        if should_flush:
-                            yield from _flush_expert_bucket()
-                        expert_bucket.append((gname, tensor))
-                        expert_bucket_bytes += tensor_bytes
-                        exported_params += 1
-                        if expert_bucket_bytes >= expert_bucket_limit_bytes:
-                            yield from _flush_expert_bucket()
-                        continue
-                    _gather_expert(gname, tensor, spec, ps, gathered_one, cpu=cpu)
-                else:
-                    yield from _flush_expert_bucket()
-                    tp_info = spec.tp_spec(gname)
-                    is_tp = tp_info is not None and tp_info[1] == 0 and ps.tp_size > 1
-                    if is_tp:
-                        tensor_bytes = tensor.numel() * tensor.element_size()
-                        should_flush = bool(dense_bucket) and (
-                            tensor.dtype != dense_bucket[0][1].dtype
-                            or dense_bucket_bytes + tensor_bytes > dense_bucket_limit_bytes
-                        )
-                        if should_flush:
-                            yield from _flush_dense_bucket()
-                        dense_bucket.append((gname, tensor))
-                        dense_bucket_bytes += tensor_bytes
-                        exported_params += 1
-                        if dense_bucket_bytes >= dense_bucket_limit_bytes:
-                            yield from _flush_dense_bucket()
-                        if limit is not None and exported_params >= limit:
-                            yield from _flush_dense_bucket()
-                            return
-                        continue
+        materialized_params = _iter_bucketed_materialized_tensors(
+            _iter_native_params(), buffer_max_size_bytes=buffer_max_size_bytes
+        )
+        for gname, tensor in materialized_params:
+            gathered_one: dict[str, torch.Tensor] = {}
+            if spec.is_expert(gname):
+                yield from _flush_dense_bucket()
+                if limit is None:
+                    tensor = _gather_expert_etp(gname, tensor, spec, ps)
+                    tensor_bytes = tensor.numel() * tensor.element_size()
+                    should_flush = bool(expert_bucket) and (
+                        tensor.dtype != expert_bucket[0][1].dtype
+                        or expert_bucket_bytes + tensor_bytes > expert_bucket_limit_bytes
+                    )
+                    if should_flush:
+                        yield from _flush_expert_bucket()
+                    expert_bucket.append((gname, tensor))
+                    expert_bucket_bytes += tensor_bytes
+                    exported_params += 1
+                    if expert_bucket_bytes >= expert_bucket_limit_bytes:
+                        yield from _flush_expert_bucket()
+                    continue
+                _gather_expert(gname, tensor, spec, ps, gathered_one, cpu=cpu)
+            else:
+                yield from _flush_expert_bucket()
+                tp_info = spec.tp_spec(gname)
+                is_tp = tp_info is not None and tp_info[1] == 0 and ps.tp_size > 1
+                if is_tp:
+                    tensor_bytes = tensor.numel() * tensor.element_size()
+                    should_flush = bool(dense_bucket) and (
+                        tensor.dtype != dense_bucket[0][1].dtype
+                        or dense_bucket_bytes + tensor_bytes > dense_bucket_limit_bytes
+                    )
+                    if should_flush:
+                        yield from _flush_dense_bucket()
+                    dense_bucket.append((gname, tensor))
+                    dense_bucket_bytes += tensor_bytes
+                    exported_params += 1
+                    if dense_bucket_bytes >= dense_bucket_limit_bytes:
+                        yield from _flush_dense_bucket()
+                    if limit is not None and exported_params >= limit:
+                        yield from _flush_dense_bucket()
+                        return
+                    continue
 
-                    yield from _flush_dense_bucket()
-                    gathered_one[gname] = _maybe_cpu(tensor, cpu=cpu)
+                yield from _flush_dense_bucket()
+                gathered_one[gname] = _maybe_cpu(tensor, cpu=cpu)
 
-                exported_params += 1
-                yield from _iter_mapped(gathered_one)
+            exported_params += 1
+            yield from _iter_mapped(gathered_one)
 
-                if limit is not None and exported_params >= limit:
-                    return
+            if limit is not None and exported_params >= limit:
+                return
 
         yield from _flush_dense_bucket()
         yield from _flush_expert_bucket()
