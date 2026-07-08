@@ -89,7 +89,7 @@ def tiny_config() -> dict[str, Any]:
         "num_hash_layers": 1,
         "num_attention_heads": 8,
         "num_key_value_heads": 1,
-        "head_dim": 128,
+        "head_dim": 512,
         "qk_rope_head_dim": 64,
         "q_lora_rank": 128,
         "o_lora_rank": 128,

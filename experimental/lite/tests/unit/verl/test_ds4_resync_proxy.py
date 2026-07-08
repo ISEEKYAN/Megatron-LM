@@ -32,6 +32,8 @@ def test_proxy_config_covers_vllm_ds4_constructor_fields() -> None:
     assert required <= config.keys()
     assert config["hidden_act"] == "silu"
     assert config["topk_method"] == "noaux_tc"
+    assert config["head_dim"] == 512
+    assert config["qk_rope_head_dim"] == 64
     assert config["rope_parameters"]["rope_type"] != "default"
     assert (
         config["rope_parameters"]["factor"]
