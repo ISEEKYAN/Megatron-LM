@@ -409,15 +409,41 @@ def _iter_bucketed_materialized_tensors(
                     group_size=bucket_group_size,
                     buffer_max_size_bytes=buffer_max_size_bytes,
                 )
+                total_global_numel = sum(
+                    local_tensor.numel() * bucket_group_size
+                    for _, local_tensor in bucket
+                )
+                materialized_buffer = torch.empty(
+                    total_global_numel,
+                    dtype=bucket[0][1].dtype,
+                    device=bucket[0][1].device,
+                )
+                source_views: list[torch.Tensor] = []
+                destination_views: list[torch.Tensor] = []
+                materialized_offset = 0
                 for (_, _, shards), (shard_dim, global_shape) in zip(
                     gathered, metadata, strict=True
                 ):
-                    full = torch.cat(shards, dim=shard_dim)
-                    if tuple(full.shape) != global_shape:
-                        slices = tuple(slice(0, size) for size in global_shape)
-                        full = full[slices]
+                    global_numel = 1
+                    for size in global_shape:
+                        global_numel *= size
+                    full = materialized_buffer[
+                        materialized_offset : materialized_offset + global_numel
+                    ].view(global_shape)
+                    local_extent = shards[0].shape[shard_dim]
+                    for rank, shard in enumerate(shards):
+                        source_views.append(shard)
+                        destination_views.append(
+                            full.narrow(
+                                shard_dim,
+                                rank * local_extent,
+                                local_extent,
+                            )
+                        )
                     materialized.append(full)
-                sample.nbytes = sum(_tensor_nbytes(tensor) for tensor in materialized)
+                    materialized_offset += global_numel
+                torch._foreach_copy_(destination_views, source_views)
+                sample.nbytes = _tensor_nbytes(materialized_buffer)
 
         outputs = []
         for name, local_tensor, bucket_idx in pending:

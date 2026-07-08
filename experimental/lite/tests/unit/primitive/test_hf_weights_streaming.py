@@ -257,6 +257,72 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
     )
 
 
+def test_fsdp_materialization_uses_one_flat_output_without_per_tensor_cat(
+    monkeypatch,
+) -> None:
+    class Shard:
+        def __init__(self, dim):
+            self.dim = dim
+
+    class Mesh:
+        @staticmethod
+        def get_group(mesh_dim):
+            assert mesh_dim == 0
+            return "fsdp"
+
+    class FakeDTensor:
+        def __init__(self, local, shape, shard_dim):
+            self._local = local
+            self.shape = shape
+            self.device = local.device
+            self.dtype = local.dtype
+            self.device_mesh = Mesh()
+            self.placements = (Shard(shard_dim),)
+
+        def to_local(self):
+            return self._local
+
+    first = FakeDTensor(torch.arange(4).reshape(2, 2), (4, 2), 0)
+    second = FakeDTensor(torch.arange(6).reshape(2, 3), (2, 6), 1)
+    expected_first = torch.cat([first.to_local(), first.to_local() + 100], dim=0)
+    expected_second = torch.cat([second.to_local(), second.to_local() + 100], dim=1)
+
+    def fake_all_gather_into_tensor(output, tensor, group=None):
+        assert group == "fsdp"
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor + 100)
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.DTensor", FakeDTensor
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda group: [0, 1]
+    )
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
+    )
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.torch.cat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("flat FSDP materialization must not call torch.cat")
+        ),
+    )
+
+    outputs = dict(
+        _iter_bucketed_materialized_tensors(
+            [("first", first), ("second", second)], buffer_max_size_bytes=1024
+        )
+    )
+
+    assert torch.equal(outputs["first"], expected_first)
+    assert torch.equal(outputs["second"], expected_second)
+    assert (
+        outputs["first"].untyped_storage().data_ptr()
+        == outputs["second"].untyped_storage().data_ptr()
+    )
+
+
 def test_replicated_dtensor_uses_local_tensor_without_collective(monkeypatch) -> None:
     class Replicate:
         pass
