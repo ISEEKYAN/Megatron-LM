@@ -238,6 +238,7 @@ class Qwen35Layer(nn.Module):
         use_thd: bool = False,
         deterministic: bool = False,
         gdn_cp_mode: str = "replicated",
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -259,6 +260,7 @@ class Qwen35Layer(nn.Module):
                 zero_centered_gamma=True,
                 qkv_layout="mcore",
                 mrope_section=_qwen_mrope_section(config),
+                apply_rope_fusion=apply_rope_fusion,
             )
         else:
             self.linear_attn = GatedDeltaNet(
@@ -342,6 +344,7 @@ class Qwen35Model(nn.Module):
         mtp_detach_encoder: bool = False,
         mount_vision_model: bool = False,
         gdn_cp_mode: str = "replicated",
+        apply_rope_fusion: bool = True,
     ):
         super().__init__()
         del attention_backend_override
@@ -384,6 +387,7 @@ class Qwen35Model(nn.Module):
                     use_thd=use_thd,
                     deterministic=getattr(train_config, "deterministic", False),
                     gdn_cp_mode=gdn_cp_mode,
+                    apply_rope_fusion=apply_rope_fusion,
                 )
                 for idx in self.layer_indices
             ]
@@ -422,6 +426,7 @@ class Qwen35Model(nn.Module):
                         use_thd=use_thd,
                         deterministic=getattr(train_config, "deterministic", False),
                         gdn_cp_mode=gdn_cp_mode,
+                        apply_rope_fusion=apply_rope_fusion,
                     ),
                     detach_encoder=mtp_detach_encoder,
                 )
