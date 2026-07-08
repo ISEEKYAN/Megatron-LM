@@ -1,4 +1,5 @@
 import os
+import sys
 
 
 def test_proxy_config_covers_vllm_ds4_constructor_fields() -> None:
@@ -110,3 +111,15 @@ def test_proxy_handoff_removes_torchrun_state(monkeypatch) -> None:
     assert calls == ["destroy", "sync", "empty"]
     assert all(name not in os.environ for name in ds4_resync_proxy._TORCHRUN_ENVIRONMENT)
     assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
+
+
+def test_proxy_isolates_vllm_warmup_from_unrelated_models(monkeypatch) -> None:
+    from examples.verl import ds4_resync_proxy
+
+    module_name = "vllm.model_executor.warmup.minimax_m3_msa_warmup"
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    ds4_resync_proxy._isolate_vllm_warmup_from_unrelated_models()
+
+    shim = sys.modules[module_name]
+    assert shim.minimax_m3_msa_warmup(object()) is None

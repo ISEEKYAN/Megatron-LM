@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
+import types
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +66,14 @@ def _handoff_to_vllm() -> None:
     # The proxy does not need a second EngineCore process. Keeping execution in
     # this process avoids nesting vLLM multiprocessing under a job launcher.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+
+def _isolate_vllm_warmup_from_unrelated_models() -> None:
+    """Avoid importing optional MiniMax dependencies in a DS4-only proxy."""
+    module_name = "vllm.model_executor.warmup.minimax_m3_msa_warmup"
+    shim = types.ModuleType(module_name)
+    shim.minimax_m3_msa_warmup = lambda worker: None
+    sys.modules[module_name] = shim
 
 
 def tiny_config() -> dict[str, Any]:
@@ -357,6 +367,7 @@ def run(output_dir: Path) -> None:
 
     checkpoint_diff = _dequantized_checkpoint_diff(direct_path, resync_path)
     _handoff_to_vllm()
+    _isolate_vllm_warmup_from_unrelated_models()
     from vllm import LLM
 
     os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "0"
