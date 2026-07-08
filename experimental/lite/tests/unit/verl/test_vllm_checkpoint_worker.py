@@ -55,3 +55,18 @@ def test_checkpoint_bucket_reload_does_not_finalize_failed_partial_update() -> N
         )
 
     assert events == ["begin"]
+
+
+def test_checkpoint_path_reload_uses_vllm_native_checkpoint_lifecycle() -> None:
+    from verl_mlite.rollout.vllm_worker import VllmCheckpointWorkerExtension
+
+    calls = []
+    extension = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            reload_weights=lambda **kwargs: calls.append(kwargs),
+        )
+    )
+
+    VllmCheckpointWorkerExtension.reload_checkpoint_from_path(extension, "/tmp/resync")
+
+    assert calls == [{"weights_path": "/tmp/resync", "is_checkpoint_format": True}]

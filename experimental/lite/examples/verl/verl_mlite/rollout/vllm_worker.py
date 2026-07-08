@@ -81,5 +81,9 @@ class VllmCheckpointWorkerExtension(vLLMColocateWorkerExtension):
         )
         reload_checkpoint_buckets(self.model_runner, receiver.receive_weights)
 
+    def reload_checkpoint_from_path(self, path: str) -> None:
+        """Reload a serialized checkpoint directory for validation or recovery."""
+        self.model_runner.reload_weights(weights_path=path, is_checkpoint_format=True)
+
 
 __all__ = ["VllmCheckpointWorkerExtension", "reload_checkpoint_buckets"]
