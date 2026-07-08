@@ -76,6 +76,14 @@ def _isolate_vllm_warmup_from_unrelated_models() -> None:
     sys.modules[module_name] = shim
 
 
+def _use_triton_ds4_cache_gather(cache_utils=None) -> None:
+    """Use vLLM's equivalent fallback for a CuTe-DSL dynamic-shape bug."""
+    if cache_utils is None:
+        from vllm.models.deepseek_v4.common.ops import cache_utils
+
+    cache_utils.has_cutedsl = lambda: False
+
+
 def tiny_config() -> dict[str, Any]:
     return {
         "architectures": ["DeepseekV4ForCausalLM"],
@@ -370,6 +378,7 @@ def run(output_dir: Path) -> None:
     _isolate_vllm_warmup_from_unrelated_models()
     from vllm import LLM
 
+    _use_triton_ds4_cache_gather()
     os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "0"
     llm = LLM(
         model=str(direct_path),

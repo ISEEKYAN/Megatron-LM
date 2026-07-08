@@ -1,5 +1,6 @@
 import os
 import sys
+from types import SimpleNamespace
 
 
 def test_proxy_config_covers_vllm_ds4_constructor_fields() -> None:
@@ -125,3 +126,12 @@ def test_proxy_isolates_vllm_warmup_from_unrelated_models(monkeypatch) -> None:
 
     shim = sys.modules[module_name]
     assert shim.minimax_m3_msa_warmup(object()) is None
+
+
+def test_proxy_selects_vllm_triton_cache_gather_fallback() -> None:
+    from examples.verl import ds4_resync_proxy
+
+    cache_utils = SimpleNamespace(has_cutedsl=lambda: True)
+    ds4_resync_proxy._use_triton_ds4_cache_gather(cache_utils)
+
+    assert cache_utils.has_cutedsl() is False
