@@ -34,7 +34,7 @@ class _SyncBucketProducer:
         if self._staging.device.type == "cuda":
             torch.cuda.set_device(self._staging.device)
         if self._exhausted:
-            return "eof", None, None, 0, None
+            return "eof", None, None, 0, None, True
 
         offset = 0
         bucket_meta = {}
@@ -48,14 +48,14 @@ class _SyncBucketProducer:
             except StopIteration:
                 self._exhausted = True
                 if not bucket_meta:
-                    return "eof", None, None, 0, None
+                    return "eof", None, None, 0, None, True
                 break
 
             if offset + weight.nbytes > self._bucket_size and bucket_meta:
                 self._pending = (name, weight)
                 break
             if weight.nbytes > self._bucket_size:
-                return "direct", name, weight, 0, None
+                return "direct", name, weight, 0, None, False
 
             bucket_meta[name] = {
                 "name": name,
@@ -75,7 +75,7 @@ class _SyncBucketProducer:
         if self._staging.device.type == "cuda":
             ready = torch.cuda.Event()
             ready.record(torch.cuda.current_stream(self._staging.device))
-        return "bucket", bucket_meta, None, offset, ready
+        return "bucket", bucket_meta, None, offset, ready, self._exhausted
 
 
 def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
@@ -110,7 +110,9 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
 
             future = submit_next()
             while True:
-                kind, metadata_or_name, direct_weight, used_bytes, ready = future.result()
+                kind, metadata_or_name, direct_weight, used_bytes, ready, is_last = (
+                    future.result()
+                )
                 if kind == "eof":
                     self.socket.send_pyobj({"bucket_meta": {}, "is_last": True})
                     self.socket.recv()
@@ -126,13 +128,16 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
                 if self.buffer.device.type == "cuda":
                     torch.cuda.synchronize(self.buffer.device)
 
-                # Staging is safe to reuse only after its contents reached the IPC
-                # buffer. Starting production here hides it behind the old ACK wait.
-                future = submit_next()
                 self.socket.send_pyobj(
-                    {"bucket_meta": metadata_or_name, "is_last": False}
+                    {"bucket_meta": metadata_or_name, "is_last": is_last}
                 )
+                if not is_last:
+                    # Staging is safe to reuse only after its contents reached the
+                    # IPC buffer. Production now overlaps the old ACK wait.
+                    future = submit_next()
                 self.socket.recv()
+                if is_last:
+                    break
         finally:
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)

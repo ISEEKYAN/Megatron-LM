@@ -147,7 +147,7 @@ def test_prefetch_builds_next_bucket_while_receiver_ack_is_blocked():
     assert not waiter.is_alive()
 
 
-def test_prefetch_preserves_bucket_payloads_and_uses_empty_terminal_bucket():
+def test_prefetch_preserves_payloads_and_marks_partial_terminal_bucket():
     sender_cls = _prefetch_sender_class()
     assert _install_bucketed_sender_prefetch(sender_cls)
     sender = sender_cls()
@@ -160,8 +160,8 @@ def test_prefetch_preserves_bucket_payloads_and_uses_empty_terminal_bucket():
     asyncio.run(sender.async_send_weights(weights))
 
     messages = _data_messages(sender)
-    assert [list(message["bucket_meta"]) for message in messages] == [["a", "b"], ["c"], []]
-    assert [message["is_last"] for message in messages] == [False, False, True]
+    assert [list(message["bucket_meta"]) for message in messages] == [["a", "b"], ["c"]]
+    assert [message["is_last"] for message in messages] == [False, True]
     assert messages[0]["payload"].tolist() == torch.cat(
         [weights[0][1].view(torch.uint8), weights[1][1].view(torch.uint8)]
     ).tolist()
@@ -205,7 +205,6 @@ def test_prefetch_preserves_direct_send_for_oversized_weight():
     assert [list(message["bucket_meta"]) for message in messages] == [
         ["large"],
         ["small"],
-        [],
     ]
     assert messages[0]["bucket_meta"]["large"]["handle"] == ("direct", "large")
 
@@ -253,8 +252,8 @@ def test_prefetch_composes_with_probe_instrumentation(monkeypatch, capsys):
         if line.startswith("MLITE_WEIGHT_SYNC_PROBE ")
     )
     report = json.loads(line.split(" ", 1)[1])
-    # IPC init, one data bucket, and the compatible empty terminal bucket.
-    assert report["stages"]["handshake"]["calls"] == 6
+    # IPC init plus one partial terminal data bucket.
+    assert report["stages"]["handshake"]["calls"] == 4
     assert report["stages"]["mbridge_gather"]["calls"] == 1
     assert report["stages"]["mbridge_gather"]["bytes"] == 4
 
