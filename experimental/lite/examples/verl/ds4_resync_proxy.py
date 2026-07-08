@@ -11,11 +11,59 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.distributed as dist
+
+
+_TORCHRUN_ENVIRONMENT = (
+    "RANK",
+    "LOCAL_RANK",
+    "WORLD_SIZE",
+    "LOCAL_WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "GROUP_RANK",
+    "ROLE_RANK",
+    "ROLE_WORLD_SIZE",
+    "TORCHELASTIC_RUN_ID",
+    "TORCHELASTIC_RESTART_COUNT",
+    "TORCHELASTIC_MAX_RESTARTS",
+    "TORCHELASTIC_ERROR_FILE",
+)
+
+
+def _initialize_single_gpu_process_group() -> None:
+    """Initialize MLite without requiring an outer torchrun launcher."""
+    if dist.is_initialized():
+        if dist.get_world_size() != 1:
+            raise ValueError("The proxy requires exactly one distributed rank")
+        return
+    torch.cuda.set_device(0)
+    rendezvous_dir = Path(tempfile.mkdtemp(prefix="ds4-resync-proxy-"))
+    dist.init_process_group(
+        "nccl",
+        init_method=(rendezvous_dir / "store").as_uri(),
+        rank=0,
+        world_size=1,
+        device_id=torch.device("cuda:0"),
+    )
+
+
+def _handoff_to_vllm() -> None:
+    """Release MLite distributed state before vLLM owns the single GPU."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    for name in _TORCHRUN_ENVIRONMENT:
+        os.environ.pop(name, None)
+    # The proxy does not need a second EngineCore process. Keeping execution in
+    # this process avoids nesting vLLM multiprocessing under a job launcher.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 
 def tiny_config() -> dict[str, Any]:
@@ -279,8 +327,6 @@ def _fsync_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def run(output_dir: Path) -> None:
-    from vllm import LLM
-
     output_dir.mkdir(parents=True, exist_ok=True)
     direct_path = output_dir / "direct-checkpoint"
     resync_path = output_dir / "resync-checkpoint"
@@ -303,7 +349,9 @@ def run(output_dir: Path) -> None:
     torch.cuda.empty_cache()
 
     checkpoint_diff = _dequantized_checkpoint_diff(direct_path, resync_path)
-    dist.destroy_process_group()
+    _handoff_to_vllm()
+    from vllm import LLM
+
     os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "0"
     llm = LLM(
         model=str(direct_path),
@@ -351,11 +399,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    if not dist.is_initialized():
-        dist.init_process_group("nccl")
-    if dist.get_world_size() != 1:
-        raise ValueError("The proxy requires exactly one distributed rank")
-    torch.cuda.set_device(0)
+    _initialize_single_gpu_process_group()
     run(args.output_dir)
 
 
