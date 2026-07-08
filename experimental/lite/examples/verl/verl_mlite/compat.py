@@ -7,7 +7,9 @@ import importlib.abc
 import importlib.machinery
 import importlib.util
 import os
+import queue
 import sys
+import threading
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
@@ -19,20 +21,19 @@ _BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_tra
 
 
 class _SyncBucketProducer:
-    """Pack one sender bucket at a time into a reusable staging tensor."""
+    """Pack one sender bucket at a time into a caller-owned staging slot."""
 
-    def __init__(self, weights, staging, bucket_size: int):
+    def __init__(self, weights, bucket_size: int):
         self._weights = iter(weights)
-        self._staging = staging
         self._bucket_size = bucket_size
         self._pending = None
         self._exhausted = False
 
-    def next_bucket(self):
+    def next_bucket(self, staging):
         import torch
 
-        if self._staging.device.type == "cuda":
-            torch.cuda.set_device(self._staging.device)
+        if staging.device.type == "cuda":
+            torch.cuda.set_device(staging.device)
         if self._exhausted:
             return "eof", None, None, 0, None, True
 
@@ -64,7 +65,7 @@ class _SyncBucketProducer:
                 "offset": offset,
                 "handle": None,
             }
-            self._staging[offset : offset + weight.nbytes].copy_(
+            staging[offset : offset + weight.nbytes].copy_(
                 weight.view(-1).view(torch.uint8), non_blocking=True
             )
             offset += weight.nbytes
@@ -72,9 +73,9 @@ class _SyncBucketProducer:
                 break
 
         ready = None
-        if self._staging.device.type == "cuda":
+        if staging.device.type == "cuda":
             ready = torch.cuda.Event()
-            ready.record(torch.cuda.current_stream(self._staging.device))
+            ready.record(torch.cuda.current_stream(staging.device))
         return "bucket", bucket_meta, None, offset, ready, self._exhausted
 
 
@@ -92,6 +93,10 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
             return await original_async_send_weights(self, weights)
 
         executor = None
+        stop = threading.Event()
+        free_slots = None
+        ready_results = None
+        held_slot = None
         try:
             self._init_socket()
             self._init_buffer()
@@ -100,45 +105,91 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
             ):
                 raise RuntimeError("MLite sender prefetch requires a CUDA IPC buffer")
 
-            staging = torch.empty_like(self.buffer)
-            producer = _SyncBucketProducer(weights, staging, self.bucket_size)
+            staging_slots = [torch.empty_like(self.buffer) for _ in range(2)]
+            producer = _SyncBucketProducer(weights, self.bucket_size)
+            free_slots = queue.Queue(maxsize=2)
+            ready_results = queue.Queue(maxsize=2)
+            for slot_index in range(2):
+                free_slots.put_nowait(slot_index)
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlite-weight-prefetch")
 
-            def submit_next():
-                context = copy_context()
-                return executor.submit(context.run, producer.next_bucket)
+            def put_ready(result):
+                while not stop.is_set():
+                    try:
+                        ready_results.put(result, timeout=0.05)
+                        return True
+                    except queue.Full:
+                        continue
+                return False
 
-            future = submit_next()
+            def produce():
+                slot_index = None
+                try:
+                    while not stop.is_set():
+                        try:
+                            slot_index = free_slots.get(timeout=0.05)
+                        except queue.Empty:
+                            continue
+                        result = producer.next_bucket(staging_slots[slot_index])
+                        if not put_ready((*result, slot_index)):
+                            return
+                        slot_index = None
+                        kind, *_, is_last = result
+                        if kind == "eof" or is_last:
+                            return
+                except BaseException as exc:
+                    put_ready(("error", exc, None, 0, None, True, slot_index))
+
+            context = copy_context()
+            worker_future = executor.submit(context.run, produce)
             while True:
-                kind, metadata_or_name, direct_weight, used_bytes, ready, is_last = (
-                    future.result()
+                try:
+                    result = ready_results.get(timeout=0.1)
+                except queue.Empty:
+                    if worker_future.done():
+                        worker_future.result()
+                        raise RuntimeError("MLite weight prefetch stopped without a terminal result")
+                    continue
+
+                kind, metadata_or_name, direct_weight, used_bytes, ready, is_last, held_slot = (
+                    result
                 )
+                if kind == "error":
+                    raise metadata_or_name
                 if kind == "eof":
+                    free_slots.put_nowait(held_slot)
+                    held_slot = None
                     self.socket.send_pyobj({"bucket_meta": {}, "is_last": True})
                     self.socket.recv()
                     break
                 if kind == "direct":
+                    free_slots.put_nowait(held_slot)
+                    held_slot = None
                     self._direct_send_large_weight(metadata_or_name, direct_weight)
-                    future = submit_next()
                     continue
 
                 if ready is not None:
                     ready.synchronize()
+                staging = staging_slots[held_slot]
                 self.buffer[:used_bytes].copy_(staging[:used_bytes], non_blocking=True)
                 if self.buffer.device.type == "cuda":
                     torch.cuda.synchronize(self.buffer.device)
+                free_slots.put_nowait(held_slot)
+                held_slot = None
 
                 self.socket.send_pyobj(
                     {"bucket_meta": metadata_or_name, "is_last": is_last}
                 )
-                if not is_last:
-                    # Staging is safe to reuse only after its contents reached the
-                    # IPC buffer. Production now overlaps the old ACK wait.
-                    future = submit_next()
                 self.socket.recv()
                 if is_last:
                     break
         finally:
+            stop.set()
+            if held_slot is not None and free_slots is not None:
+                try:
+                    free_slots.put_nowait(held_slot)
+                except queue.Full:
+                    pass
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
             self._cleanup()

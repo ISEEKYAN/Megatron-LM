@@ -39,10 +39,18 @@ class _Sender:
 
 
 class _RecordingSocket:
-    def __init__(self, sender, *, block_data_recv=None, release_data_recv=None):
+    def __init__(
+        self,
+        sender,
+        *,
+        block_data_recv=None,
+        release_data_recv=None,
+        fail_data_recv=False,
+    ):
         self.sender = sender
         self.block_data_recv = block_data_recv
         self.release_data_recv = release_data_recv
+        self.fail_data_recv = fail_data_recv
         self.messages = []
         self.recv_calls = 0
 
@@ -55,6 +63,8 @@ class _RecordingSocket:
 
     def recv(self):
         self.recv_calls += 1
+        if self.recv_calls == 2 and self.fail_data_recv:
+            raise RuntimeError("receiver failed")
         if self.recv_calls == 2 and self.block_data_recv is not None:
             self.block_data_recv.set()
             assert self.release_data_recv.wait(timeout=5)
@@ -120,16 +130,21 @@ def _prefetch_sender_class():
     )
 
 
-def test_prefetch_builds_next_bucket_while_receiver_ack_is_blocked():
+def test_prefetch_builds_third_bucket_while_first_ack_is_blocked():
     ack_blocked = threading.Event()
     release_ack = threading.Event()
-    third_weight_requested = threading.Event()
+    third_bucket_entered = threading.Event()
+    fourth_bucket_entered = threading.Event()
+    observed_third_bucket = threading.Event()
+    observed_bounded_window = threading.Event()
 
     def weights():
-        yield "a", torch.arange(3, dtype=torch.float32)
-        yield "b", torch.arange(3, dtype=torch.float32) + 10
-        third_weight_requested.set()
-        yield "c", torch.arange(1, dtype=torch.float32) + 20
+        yield "a", torch.arange(4, dtype=torch.float32)
+        yield "b", torch.arange(4, dtype=torch.float32) + 10
+        third_bucket_entered.set()
+        yield "c", torch.arange(4, dtype=torch.float32) + 20
+        fourth_bucket_entered.set()
+        yield "d", torch.arange(4, dtype=torch.float32) + 30
 
     sender_cls = _prefetch_sender_class()
     assert _install_bucketed_sender_prefetch(sender_cls)
@@ -137,7 +152,10 @@ def test_prefetch_builds_next_bucket_while_receiver_ack_is_blocked():
 
     def release_after_prefetch():
         assert ack_blocked.wait(timeout=5)
-        assert third_weight_requested.wait(timeout=5)
+        if third_bucket_entered.wait(timeout=1):
+            observed_third_bucket.set()
+        if not fourth_bucket_entered.is_set():
+            observed_bounded_window.set()
         release_ack.set()
 
     waiter = threading.Thread(target=release_after_prefetch)
@@ -145,6 +163,32 @@ def test_prefetch_builds_next_bucket_while_receiver_ack_is_blocked():
     asyncio.run(sender.async_send_weights(weights()))
     waiter.join(timeout=5)
     assert not waiter.is_alive()
+    assert observed_third_bucket.is_set()
+    assert observed_bounded_window.is_set()
+
+
+def test_prefetch_allocates_exactly_two_staging_slots(monkeypatch):
+    allocations = []
+    original_empty_like = torch.empty_like
+
+    def tracked_empty_like(tensor):
+        result = original_empty_like(tensor)
+        allocations.append(result)
+        return result
+
+    monkeypatch.setattr(torch, "empty_like", tracked_empty_like)
+    sender_cls = _prefetch_sender_class()
+    assert _install_bucketed_sender_prefetch(sender_cls)
+    sender = sender_cls()
+
+    asyncio.run(
+        sender.async_send_weights(
+            [(str(index), torch.arange(4, dtype=torch.float32)) for index in range(4)]
+        )
+    )
+
+    assert len(allocations) == 2
+    assert allocations[0].data_ptr() != allocations[1].data_ptr()
 
 
 def test_prefetch_preserves_payloads_and_marks_partial_terminal_bucket():
@@ -185,6 +229,21 @@ def test_prefetch_empty_weights_and_producer_failure_cleanup():
     with pytest.raises(RuntimeError, match="producer failed"):
         asyncio.run(broken_sender.async_send_weights(broken_weights()))
     assert broken_sender.cleaned
+
+
+def test_prefetch_receiver_failure_stops_full_producer_queue_and_cleans_up():
+    sender_cls = _prefetch_sender_class()
+    assert _install_bucketed_sender_prefetch(sender_cls)
+    sender = sender_cls(fail_data_recv=True)
+
+    with pytest.raises(RuntimeError, match="receiver failed"):
+        asyncio.run(
+            sender.async_send_weights(
+                [(str(index), torch.arange(4, dtype=torch.float32)) for index in range(8)]
+            )
+        )
+
+    assert sender.cleaned
 
 
 def test_prefetch_preserves_direct_send_for_oversized_weight():
