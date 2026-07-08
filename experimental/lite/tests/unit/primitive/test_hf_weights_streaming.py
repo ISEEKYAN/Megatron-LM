@@ -222,7 +222,8 @@ def test_oversized_fsdp_shard_is_gathered_in_shard_dimension_chunks(
         def to_local(self):
             return self._local
 
-    local = torch.arange(10, dtype=torch.float32).reshape(2, 5)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    local = torch.arange(10, dtype=torch.float32, device=device).reshape(2, 5)
     calls = []
 
     def fake_all_gather_into_tensor(output, tensor, group=None):
