@@ -179,3 +179,89 @@ def test_export_batches_adjacent_tp_weights_into_one_flat_collective(
         exported["second"],
         torch.cat([torch.arange(3).reshape(1, 3), torch.arange(3).reshape(1, 3) + 10]),
     )
+
+
+def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
+    class ExpertGroup(nn.Module):
+        def __init__(self, offset: int) -> None:
+            super().__init__()
+            for idx in range(2):
+                self.register_parameter(
+                    f"weight{idx}",
+                    nn.Parameter(torch.arange(4, dtype=torch.float32) + offset + idx * 10),
+                )
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first = nn.Module()
+            self.first.experts = ExpertGroup(0)
+            self.second = nn.Module()
+            self.second.experts = ExpertGroup(1000)
+
+    class Spec:
+        num_experts = 4
+
+        @staticmethod
+        def is_expert(name):
+            return ".experts." in name
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+        @staticmethod
+        def packed_expert_group_name(name):
+            return name.rsplit(".weight", 1)[0] + ".packed"
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            assert name.endswith(".packed")
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 2,
+            "ep_group": "ep",
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+    materialized = []
+
+    def record_materialize(tensor):
+        materialized.append(tensor)
+        return tensor
+
+    def fake_all_gather_into_tensor(output, tensor, group=None):
+        assert group == "ep"
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor + 100)
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights._materialize_dtensor",
+        record_materialize,
+    )
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
+    )
+
+    stream = export_hf_weights(
+        Model(), Spec(), ps, cpu=False, buffer_max_size_bytes=64
+    )
+    name, tensor = next(stream)
+
+    assert name == "first.experts.packed"
+    assert len(materialized) == 2
+    expected_local = [
+        torch.arange(4, dtype=torch.float32),
+        torch.arange(4, dtype=torch.float32) + 10,
+    ]
+    assert torch.equal(
+        tensor, torch.stack(expected_local + [value + 100 for value in expected_local])
+    )
