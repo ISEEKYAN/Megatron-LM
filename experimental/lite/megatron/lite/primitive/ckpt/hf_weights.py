@@ -759,16 +759,9 @@ def export_hf_weights(
                     )
                     yield to_global_layer_name(name, layer_map), tensor
 
-        native_params = _iter_native_params()
         materialized_params = (
-            _iter_bucketed_materialized_tensors(
-                native_params, buffer_max_size_bytes=buffer_max_size_bytes
-            )
-            if limit is None
-            else (
-                (name, _materialize_dtensor(tensor))
-                for name, tensor in native_params
-            )
+            (name, _materialize_dtensor(tensor))
+            for name, tensor in _iter_native_params()
         )
         for gname, tensor in materialized_params:
             gathered_one: dict[str, torch.Tensor] = {}
@@ -786,7 +779,10 @@ def export_hf_weights(
                     expert_bucket.append((gname, tensor))
                     expert_bucket_bytes += tensor_bytes
                     exported_params += 1
-                    if expert_bucket_bytes >= expert_bucket_limit_bytes:
+                    if (
+                        len(expert_bucket) >= 4
+                        or expert_bucket_bytes >= expert_bucket_limit_bytes
+                    ):
                         yield from _flush_expert_bucket()
                     continue
                 _gather_expert(gname, tensor, spec, ps, gathered_one, cpu=cpu)
