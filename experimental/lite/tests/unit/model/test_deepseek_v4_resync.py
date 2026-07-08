@@ -108,10 +108,15 @@ def test_deepseek_config_preserves_checkpoint_quantization_contract() -> None:
         "ignored_layers": ["head"],
     }
     config = DeepseekV4Config._from_hf_dict(
-        {"expert_dtype": "fp4", "quantization_config": quantization_config}
+        {
+            "expert_dtype": "fp4",
+            "topk_method": "noaux_tc",
+            "quantization_config": quantization_config,
+        }
     )
 
     assert config.expert_dtype == "fp4"
+    assert config.topk_method == "noaux_tc"
     assert config.quantization_config == quantization_config
 
 

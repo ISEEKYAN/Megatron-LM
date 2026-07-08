@@ -90,6 +90,7 @@ def tiny_config() -> dict[str, Any]:
         "routed_scaling_factor": 1.0,
         "norm_topk_prob": True,
         "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc",
         "swiglu_limit": 0.0,
         "max_position_embeddings": 512,
         "rope_theta": 10000.0,

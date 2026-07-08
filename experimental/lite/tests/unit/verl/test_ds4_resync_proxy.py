@@ -22,12 +22,14 @@ def test_proxy_config_covers_vllm_ds4_constructor_fields() -> None:
         "num_hidden_layers",
         "rms_norm_eps",
         "swiglu_limit",
+        "topk_method",
         "vocab_size",
     }
 
     config = tiny_config()
     assert required <= config.keys()
     assert config["hidden_act"] == "silu"
+    assert config["topk_method"] == "noaux_tc"
 
 
 def test_proxy_impl_config_is_concrete_and_uses_local_attention() -> None:
