@@ -381,8 +381,6 @@ class MegatronLiteEngine(BaseEngine):
             for key in ("limit", "include_mtp_only", "include_local_prefixes")
             if key in kwargs
         }
-        export_kwargs["cpu"] = False
-        export_kwargs["buffer_max_size_bytes"] = 2 * 1024**3
         if self.engine_config.model_name == "qwen3_5":
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:

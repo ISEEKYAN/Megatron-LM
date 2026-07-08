@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import sys
 import types
 
@@ -22,6 +23,10 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     bucketed_all_gather_into_tensor,
     export_hf_weights,
 )
+
+
+def test_export_defaults_to_device_resident_tensors() -> None:
+    assert inspect.signature(export_hf_weights).parameters["cpu"].default is False
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -64,7 +69,7 @@ def test_gpu_resident_export_is_bitwise_equal_to_legacy_cpu_export() -> None:
     model = Model()
 
     legacy = dict(export_hf_weights(model, Spec(), ps, cpu=True))
-    resident = dict(export_hf_weights(model, Spec(), ps, cpu=False))
+    resident = dict(export_hf_weights(model, Spec(), ps))
 
     assert legacy.keys() == resident.keys()
     assert legacy["weight"].device.type == "cpu"

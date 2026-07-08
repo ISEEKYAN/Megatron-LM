@@ -763,7 +763,7 @@ def export_hf_weights(
     limit: int | None = None,
     rank0_only: bool = False,
     export_dtype: str | torch.dtype | None = None,
-    cpu: bool = True,
+    cpu: bool = False,
     buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Export model weights as HF-format (name, tensor) pairs.
@@ -1059,7 +1059,11 @@ def save_hf_weights(
 ) -> None:
     """Export + write to safetensors."""
     rank = dist.get_rank() if dist.is_initialized() else 0
-    out = dict(export_hf_weights(model, spec, ps, vocab_size=vocab_size, rank0_only=True))
+    out = dict(
+        export_hf_weights(
+            model, spec, ps, vocab_size=vocab_size, rank0_only=True, cpu=True
+        )
+    )
     if rank == 0 and out:
         save_safetensors(out, hf_path)
     if dist.is_initialized():
