@@ -23,6 +23,7 @@ from megatron.lite.primitive.optimizers.mfsdp.grad_norm import (
 )
 from megatron.lite.primitive.optimizers.mfsdp.metadata import (
     ensure_mfsdp_tp_partition_attrs,
+    normalize_mfsdp_expert_tensor_parallel_attrs,
 )
 from megatron.lite.primitive.optimizers.mfsdp.param_sync import (
     MFSdpModule,
@@ -64,8 +65,19 @@ class _StandaloneOptimizer:
         self.grad_norm_accum_dtype = resolve_torch_dtype(grad_norm_accum_dtype)
         self.expert_params = list(expert_params)
         self._expert_param_ids = {id(param) for param in self.expert_params}
+        self.tp_replicated_params = [
+            param
+            for param in self.params
+            if id(param) not in self._expert_param_ids
+            and bool(getattr(param, "sequence_parallel", False))
+            and not bool(getattr(param, "shared", False))
+        ]
+        self._tp_replicated_param_ids = {
+            id(param) for param in self.tp_replicated_params
+        }
         self.expert_grad_scale = float(expert_grad_scale)
         self._expert_grads_scaled = False
+        self._tp_replicated_grads_synced = False
         self._offloaded_state_devices: dict[tuple[int, str], torch.device] = {}
 
     @property
@@ -75,8 +87,10 @@ class _StandaloneOptimizer:
     def zero_grad(self) -> None:
         self.optimizer.zero_grad(set_to_none=True)
         self._expert_grads_scaled = False
+        self._tp_replicated_grads_synced = False
 
     def step(self) -> tuple[bool, float, int]:
+        self._sync_tp_replicated_grads_once()
         self._scale_expert_grads_once()
         grad_norm = self.clip_grad_norm()
         if not math.isfinite(grad_norm):
@@ -85,16 +99,36 @@ class _StandaloneOptimizer:
         return True, grad_norm, 0
 
     def clip_grad_norm(self) -> float:
+        self._sync_tp_replicated_grads_once()
         self._scale_expert_grads_once()
         dense_params = [
-            param for param in self.params if id(param) not in self._expert_param_ids
+            param
+            for param in self.params
+            if id(param) not in self._expert_param_ids
+            and id(param) not in self._tp_replicated_param_ids
+            and _include_dense_param_in_norm(param, getattr(self.ps, "tp_group", None))
         ]
-        dense_sq = local_grad_sq_sum(dense_params, dtype=self.grad_norm_accum_dtype)
+        default_device = self.params[0].device if self.params else torch.device("cpu")
+        dense_sq = local_grad_sq_sum(
+            dense_params,
+            dtype=self.grad_norm_accum_dtype,
+            default_device=default_device,
+        )
+        dense_dp_group = getattr(self.ps, "dp_cp_group", None) or getattr(
+            self.ps, "dp_group", None
+        )
         _sum_if_distributed(
             dense_sq,
-            getattr(self.ps, "dp_cp_group", None) or getattr(self.ps, "dp_group", None),
+            dense_dp_group,
         )
         _sum_if_distributed(dense_sq, getattr(self.ps, "tp_group", None))
+
+        tp_replicated_sq = local_grad_sq_sum(
+            self.tp_replicated_params,
+            dtype=self.grad_norm_accum_dtype,
+            default_device=dense_sq.device,
+        )
+        _sum_if_distributed(tp_replicated_sq, dense_dp_group)
 
         expert_sq = local_grad_sq_sum(
             self.expert_params,
@@ -102,7 +136,13 @@ class _StandaloneOptimizer:
             default_device=dense_sq.device,
         )
         _sum_if_distributed(expert_sq, getattr(self.ps, "ep_dp_group", None))
-        total_sq = dense_sq + expert_sq.to(dense_sq.device)
+        _sum_if_distributed(expert_sq, getattr(self.ps, "etp_group", None))
+        _sum_if_distributed(expert_sq, getattr(self.ps, "ep_group", None))
+        total_sq = (
+            dense_sq
+            + tp_replicated_sq.to(dense_sq.device)
+            + expert_sq.to(dense_sq.device)
+        )
         _sum_if_distributed(total_sq, getattr(self.ps, "pp_group", None))
         total_norm = total_sq.sqrt()
         if bool(torch.isfinite(total_norm).item()) and self.clip_grad > 0.0:
@@ -145,11 +185,40 @@ class _StandaloneOptimizer:
                     param.grad.mul_(self.expert_grad_scale)
         self._expert_grads_scaled = True
 
+    def _sync_tp_replicated_grads_once(self) -> None:
+        if self._tp_replicated_grads_synced:
+            return
+        group = getattr(self.ps, "tp_group", None)
+        for param in self.tp_replicated_params:
+            if param.grad is not None:
+                _all_reduce_grad_if_distributed(param.grad, group)
+        self._tp_replicated_grads_synced = True
+
 
 def _sum_if_distributed(value: torch.Tensor, group: dist.ProcessGroup | None) -> None:
     if group is None or not dist.is_initialized() or dist.get_world_size(group) <= 1:
         return
     all_reduce_scalar_(value, op=dist.ReduceOp.SUM, group=group)
+
+
+def _all_reduce_grad_if_distributed(
+    grad: torch.Tensor, group: dist.ProcessGroup | None
+) -> None:
+    if group is None or not dist.is_initialized() or dist.get_world_size(group) <= 1:
+        return
+    dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
+
+
+def _include_dense_param_in_norm(
+    param: nn.Parameter, tp_group: dist.ProcessGroup | None
+) -> bool:
+    if bool(getattr(param, "shared", False)):
+        return False
+    if bool(getattr(param, "tensor_model_parallel", False)):
+        return True
+    if tp_group is None or not dist.is_initialized():
+        return True
+    return dist.get_rank(tp_group) == 0
 
 
 class MFSdpOptimizer:
@@ -234,6 +303,12 @@ def build_mfsdp_stack(
     else:
         wrapped_chunks = []
         for chunk in model_chunks:
+            _mark_mfsdp_parallel_attrs(
+                chunk,
+                classifier,
+                tp_size=int(getattr(engine_cfg.parallel, "tp", 1) or 1),
+                etp_size=int(getattr(engine_cfg.parallel, "etp", 1) or 1),
+            )
             ensure_mfsdp_tp_partition_attrs(chunk)
             wrapped_chunks.append(
                 MFSdpModule(
@@ -279,6 +354,37 @@ def build_mfsdp_stack(
     optimizer = MFSdpOptimizer(standalone_optimizer, native_chunks)
     attach_mfsdp_checkpoint_metadata(optimizer, ps=ps, is_expert=classifier)
     return wrapped_chunks, optimizer
+
+
+def _mark_mfsdp_parallel_attrs(
+    model: nn.Module,
+    classifier: ExpertClassifierFn,
+    *,
+    tp_size: int,
+    etp_size: int,
+) -> None:
+    """Preserve MLite TP/SP ownership metadata on standalone optimizer shards."""
+    sp_param_ids = {id(param) for param in getattr(model, "sp_params", ())}
+    for name, param in model.named_parameters():
+        if not hasattr(param, "allreduce"):
+            param.allreduce = not classifier(name)
+        if id(param) in sp_param_ids:
+            param.sequence_parallel = True
+            param.tensor_model_parallel = False
+            continue
+        if tp_size <= 1 or param.ndim <= 1 or classifier(name):
+            continue
+        if bool(getattr(param, "average_gradients_across_tp_domain", False)):
+            continue
+        if bool(getattr(param, "sequence_parallel", False)):
+            continue
+        if not hasattr(param, "tensor_model_parallel"):
+            param.tensor_model_parallel = True
+    normalize_mfsdp_expert_tensor_parallel_attrs(
+        model,
+        classifier,
+        etp_size=etp_size,
+    )
 
 
 def build_mfsdp_training_optimizer(
