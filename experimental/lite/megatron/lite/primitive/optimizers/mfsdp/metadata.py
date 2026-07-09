@@ -161,11 +161,11 @@ def ensure_mfsdp_tp_partition_attrs(model: nn.Module) -> None:
     Setting the mode on every Megatron Lite/TE dense TP weight changes Megatron-FSDP's
     model-buffer initialization path and has to be enabled only after a
     topology-specific precision gate proves it safe. Attention row-projection
-    weights are intentionally kept on the local-shard path: assigning
-    ``_tensor_parallel_mode="row"`` currently hangs Qwen3MoE 4n32g before the
-    first optimizer step. For the remaining local TP
-    shards, the M-FSDP primitive marks them so it skips only the incorrect
-    duplicate-TP broadcast.
+    weights are intentionally kept on the local-shard path: assigning an
+    explicit row mode to every tensor-parallel projection changes buffer layout
+    and can hang large TP x EP topologies before the first optimizer step. For
+    the remaining local TP shards, the M-FSDP primitive marks them so it skips
+    only the incorrect duplicate-TP broadcast.
     """
     _ensure_mfsdp_tp_partition_attrs(model, set_tp_mode_for_all=False)
 

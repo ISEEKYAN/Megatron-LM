@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import copy
 from dataclasses import dataclass
+import inspect
 import os
 from pathlib import Path
 import subprocess
@@ -102,6 +103,33 @@ def test_mfsdp_is_standalone_without_vendored_mcore_or_fsdp2_dependencies():
     assert violations == []
 
 
+def test_mfsdp_primitive_has_no_model_specific_knowledge():
+    package = Path(mfsdp_config.__file__).parent
+    violations = []
+    for source_path in package.rglob("*.py"):
+        source = source_path.read_text()
+        for forbidden in ("_SUPPORTED_MODELS", "model_name", "Qwen3", "qwen3"):
+            if forbidden in source:
+                relative_path = source_path.relative_to(package)
+                violations.append(f"{relative_path}: {forbidden}")
+
+    assert violations == []
+    assert (
+        "model_name"
+        not in inspect.signature(
+            mfsdp_optimizer.build_mfsdp_training_optimizer
+        ).parameters
+    )
+
+
+def test_mfsdp_config_validation_does_not_require_or_filter_model_name():
+    engine_cfg = _engine_cfg()
+    mfsdp_config.validate_mfsdp_config(engine_cfg)
+
+    engine_cfg.model_name = "arbitrary_2d_transformer"
+    mfsdp_config.validate_mfsdp_config(engine_cfg)
+
+
 def test_mfsdp_imports_when_megatron_core_is_blocked():
     script = """
 import builtins
@@ -140,7 +168,6 @@ class _FakeDDPConfig:
 
 def _engine_cfg(**overrides):
     cfg = SimpleNamespace(
-        model_name="qwen3_5",
         parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
         optimizer=SimpleNamespace(optimizer="adam", override_optimizer_config={}),
     )
@@ -301,7 +328,6 @@ def test_mfsdp_marks_sequence_parallel_shards_for_tp_gradient_sync():
         [model],
         model_cfg=SimpleNamespace(),
         engine_cfg=SimpleNamespace(
-            model_name="qwen3_5",
             parallel=ParallelConfig(tp=2, ep=1, etp=1, pp=1, vpp=1, cp=1),
             optimizer=opt,
         ),
@@ -477,7 +503,6 @@ def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
         override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
     )
     engine_cfg = SimpleNamespace(
-        model_name="qwen3_5",
         parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
         optimizer=opt,
     )
@@ -587,7 +612,6 @@ def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
         [candidate],
         model_cfg=SimpleNamespace(),
         engine_cfg=SimpleNamespace(
-            model_name="qwen3_5",
             parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
             optimizer=opt,
         ),
@@ -658,7 +682,6 @@ def test_mfsdp_materializes_root_params_used_without_calling_their_leaf_module()
         [candidate],
         model_cfg=SimpleNamespace(),
         engine_cfg=SimpleNamespace(
-            model_name="qwen3_5",
             parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
             optimizer=opt,
         ),
@@ -712,7 +735,6 @@ def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
         [model],
         model_cfg=SimpleNamespace(),
         engine_cfg=SimpleNamespace(
-            model_name="qwen3_5",
             parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
             optimizer=opt,
         ),
@@ -778,7 +800,6 @@ def _run_mfsdp_gloo_parity(rank: int, world_size: int, init_file: str) -> None:
             override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
         )
         engine_cfg = SimpleNamespace(
-            model_name="qwen3_5",
             parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
             optimizer=opt,
         )

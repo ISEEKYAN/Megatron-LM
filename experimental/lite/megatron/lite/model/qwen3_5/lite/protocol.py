@@ -265,7 +265,6 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
                 model_cfg=model_cfg,
                 impl_cfg=impl_cfg,
                 ps=ps,
-                model_name="qwen3_5",
                 is_expert=is_expert_param,
                 fsdp_unit_modules=(Qwen35Layer,),
                 deterministic=deterministic,
