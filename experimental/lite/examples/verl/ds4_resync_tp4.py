@@ -93,7 +93,9 @@ def compare_distributions(
 
 def copy_checkpoint_metadata(source: Path, output: Path) -> None:
     for path in source.iterdir():
-        if path.is_file() and path.suffix != ".safetensors":
+        if path.is_dir():
+            shutil.copytree(path, output / path.name, dirs_exist_ok=True)
+        elif path.suffix != ".safetensors":
             shutil.copy2(path, output / path.name)
 
 

@@ -32,11 +32,18 @@ run_container() {
 
 run_container "CUDA_VISIBLE_DEVICES=0 python -m examples.verl.ds4_resync_tp4 \
   convert --source '${CHECKPOINT_DIR}' --output '${RESYNC_DIR}'"
-run_container "python -m examples.verl.ds4_resync_tp4 collect \
-  --model '${CHECKPOINT_DIR}' --output '${OUTPUT_DIR}/direct.pt'"
+if [[ "${SKIP_DIRECT:-0}" == 1 ]]; then
+  [[ -s "${OUTPUT_DIR}/direct.pt" ]] || {
+    echo "SKIP_DIRECT requires an existing non-empty direct.pt" >&2
+    exit 5
+  }
+  echo "DS4_TP4_DIRECT_REUSED=${OUTPUT_DIR}/direct.pt"
+else
+  run_container "python -m examples.verl.ds4_resync_tp4 collect \
+    --model '${CHECKPOINT_DIR}' --output '${OUTPUT_DIR}/direct.pt'"
+fi
 run_container "python -m examples.verl.ds4_resync_tp4 collect \
   --model '${RESYNC_DIR}' --output '${OUTPUT_DIR}/resync.pt'"
 run_container "CUDA_VISIBLE_DEVICES=0 python -m examples.verl.ds4_resync_tp4 \
   compare --reference '${OUTPUT_DIR}/direct.pt' \
   --candidate '${OUTPUT_DIR}/resync.pt' --output '${OUTPUT_DIR}/report.json'"
-
