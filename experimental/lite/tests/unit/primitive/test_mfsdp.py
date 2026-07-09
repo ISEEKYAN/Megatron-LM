@@ -45,6 +45,17 @@ class _GlooModel(torch.nn.Module):
         return self.out(self.unit1(self.unit0(value)))
 
 
+class _DirectParamModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.unit = _GlooUnit(4, 4)
+        self.projection = torch.nn.Linear(4, 3, bias=False)
+
+    def forward(self, value):
+        hidden = self.unit(value)
+        return torch.nn.functional.linear(hidden, self.projection.weight)
+
+
 def test_mfsdp_has_no_megatron_core_imports():
     package = Path(mfsdp_config.__file__).parent
     violations = []
@@ -481,6 +492,142 @@ def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
     assert saved_model.keys() == restored_model.keys()
     for name, value in saved_model.items():
         assert torch.equal(value, restored_model[name]), name
+
+
+def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
+    torch.manual_seed(321)
+    reference = _GlooModel()
+    candidate = copy.deepcopy(reference)
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        etp_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1000.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    reference_optimizer = torch.optim.AdamW(
+        reference.parameters(),
+        lr=opt.lr,
+        betas=(opt.adam_beta1, opt.adam_beta2),
+        eps=opt.adam_eps,
+        weight_decay=opt.weight_decay,
+        foreach=False,
+    )
+    chunks, candidate_optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [candidate],
+        model_cfg=SimpleNamespace(),
+        engine_cfg=SimpleNamespace(
+            model_name="qwen3_5",
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_GlooUnit,),
+    )
+    microbatches = [
+        (torch.randn(3, 4), torch.randn(3, 2)),
+        (torch.randn(2, 4), torch.randn(2, 2)),
+    ]
+
+    reference_optimizer.zero_grad()
+    candidate_optimizer.zero_grad()
+    for microbatch_idx, (value, target) in enumerate(microbatches):
+        reference_loss = torch.nn.functional.mse_loss(reference(value), target)
+        (reference_loss / len(microbatches)).backward()
+
+        candidate_loss = torch.nn.functional.mse_loss(chunks[0](value), target)
+        if microbatch_idx == len(microbatches) - 1:
+            candidate_optimizer.grad_sync_enabled = True
+        (candidate_loss / len(microbatches)).backward()
+
+    mfsdp_optimizer.finalize_mfsdp_grads(chunks, candidate_optimizer)
+
+    reference_grads = {
+        name: param.grad.detach().reshape(-1)
+        for name, param in reference.named_parameters()
+    }
+    candidate_grads = {
+        candidate_optimizer.param_names[id(param)].removeprefix("chunk0.module."): (
+            param.grad.detach().reshape(-1)
+        )
+        for param in candidate_optimizer.params
+    }
+    assert reference_grads.keys() == candidate_grads.keys()
+    for name, reference_grad in reference_grads.items():
+        assert torch.equal(reference_grad, candidate_grads[name]), name
+
+
+def test_mfsdp_materializes_root_params_used_without_calling_their_leaf_module():
+    torch.manual_seed(654)
+    reference = _DirectParamModel()
+    candidate = copy.deepcopy(reference)
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        etp_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1000.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [candidate],
+        model_cfg=SimpleNamespace(),
+        engine_cfg=SimpleNamespace(
+            model_name="qwen3_5",
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_GlooUnit,),
+    )
+
+    value = torch.randn(2, 4)
+    reference_output = reference(value)
+    candidate_output = chunks[0](value)
+    assert torch.equal(reference_output, candidate_output)
+
+    reference_output.square().mean().backward()
+    candidate_output.square().mean().backward()
+    mfsdp_optimizer.finalize_mfsdp_grads(chunks, optimizer)
+    projection_shard = next(
+        param
+        for param in optimizer.params
+        if optimizer.param_names[id(param)].endswith("projection.weight")
+    )
+    assert torch.equal(
+        reference.projection.weight.grad.reshape(-1), projection_shard.grad.reshape(-1)
+    )
 
 
 def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
