@@ -17,7 +17,7 @@ def attach_mfsdp_checkpoint_metadata(
     ps: Any,
     is_expert: Callable[[str], bool],
 ) -> None:
-    """Attach Megatron Lite checkpoint metadata to an MCore optimizer and its leaves."""
+    """Attach Megatron Lite checkpoint metadata to an optimizer and its leaves."""
     for target in _optimizer_and_leaves(optimizer):
         setattr(target, MFSDP_CHECKPOINT_PS_ATTR, ps)
         setattr(target, MFSDP_CHECKPOINT_EXPERT_CLASSIFIER_ATTR, is_expert)
@@ -106,11 +106,6 @@ def replace_trailing_expert_idx(name: str, idx: int) -> str:
     return re.sub(r"weight\d+$", f"weight{idx}", name)
 
 
-def normalize_mcore_fsdp_param_name(name: str) -> str:
-    prefix = "module.module."
-    return name[len(prefix) :] if name.startswith(prefix) else name
-
-
 def _optimizer_and_leaves(optimizer: Any) -> tuple[Any, ...]:
     leaves = getattr(optimizer, "chained_optimizers", None)
     if leaves is None:
@@ -122,7 +117,6 @@ __all__ = [
     "attach_mfsdp_checkpoint_metadata",
     "canonicalize_expert_checkpoint_key",
     "expert_local_counts",
-    "normalize_mcore_fsdp_param_name",
     "optimizer_checkpoint_expert_classifier",
     "optimizer_checkpoint_parallel_state",
 ]
