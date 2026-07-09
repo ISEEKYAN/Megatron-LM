@@ -70,6 +70,8 @@ srun --nodes=1 --gres=gpu:2 \
   --container-workdir="$REPO_ROOT" \
   bash -lc '
     set -euo pipefail
+    export PATH=/usr/local/bin:/usr/bin:/bin
+    hash -r
     export MLITE_SM90_SITE=/path/to/sm90-overlay/lib/python3.12/site-packages
     export DS4_VLLM_SITE=/path/to/ds4-vllm-thin/lib/python3.12/site-packages
     export DS4_VLLM_SHIM=/path/to/ds4-vllm-thin/abi_shim/libvllm_torch212_abi_shim.so
@@ -78,6 +80,12 @@ srun --nodes=1 --gres=gpu:2 \
     bash experimental/lite/examples/verl/scripts/run_deepseek_v4_hopper_smoke.sh rollout-probe
   '
 ```
+
+Reset `PATH` after entering the container. Slurm can preserve a login-node
+Miniforge path; if that path wins, Torch may appear importable while the
+container's Transformer Engine extension cannot be found. Record
+`command -v python` and `command -v torchrun` in the job log when diagnosing an
+environment failure.
 
 The training command must print
 `NON_SKIP_VERL_MLITE_RUNTIME_THD_CP_SMOKE_PASSED` with finite `loss`, positive
