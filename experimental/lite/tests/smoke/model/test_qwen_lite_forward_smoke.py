@@ -246,6 +246,10 @@ def test_qwen35_tp2_tp4_mixed_attention_parity_and_backward():
     tp4_logits = tp4_model(input_ids=input_ids)["logits"].float()
     tp4_output = tp4_model(input_ids=input_ids, labels=labels)
 
+    if dist.get_rank() == 0:
+        logits_max_abs = (tp4_logits - tp2_logits).abs().max().item()
+        loss_abs = (tp4_output["loss"].float() - tp2_loss).abs().item()
+        print(f"QWEN35_TP_PARITY logits_max_abs={logits_max_abs:.8g} loss_abs={loss_abs:.8g}")
     torch.testing.assert_close(tp4_logits, tp2_logits, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(tp4_output["loss"].float(), tp2_loss, atol=1e-3, rtol=1e-3)
     tp4_output["loss"].backward()
