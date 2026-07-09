@@ -26,6 +26,7 @@ class DeepseekV4Config:
     routed_scaling_factor: float = 1.5
     norm_topk_prob: bool = True
     scoring_func: str = "sqrtsoftplus"
+    topk_method: str = "noaux_tc"
     swiglu_limit: float = 10.0
     max_position_embeddings: int = 1_048_576
     rope_theta: float = 10_000.0
@@ -47,6 +48,8 @@ class DeepseekV4Config:
     mtp_loss_scaling_factor: float = 0.1
     rms_norm_eps: float = 1e-6
     initializer_range: float = 0.02
+    expert_dtype: str = "fp4"
+    quantization_config: dict[str, Any] = field(default_factory=dict)
 
     @property
     def num_experts(self) -> int:

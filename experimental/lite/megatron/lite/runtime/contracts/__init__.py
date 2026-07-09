@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     )
     from megatron.lite.runtime.contracts.handle import ModelHandle
     from megatron.lite.runtime.contracts.loss import LossContext
+    from megatron.lite.runtime.contracts.weights import ResyncFormat
 
 __all__ = [
     "MegatronLiteConfig",
@@ -42,6 +43,7 @@ __all__ = [
     "PackedBatch",
     "ParallelConfig",
     "RuntimeConfig",
+    "ResyncFormat",
     "TrainBatch",
 ]
 
@@ -60,6 +62,7 @@ def __getattr__(name: str):
         "PackedBatch": "megatron.lite.runtime.contracts.data",
         "ParallelConfig": "megatron.lite.runtime.contracts.config",
         "RuntimeConfig": "megatron.lite.runtime.contracts.config",
+        "ResyncFormat": "megatron.lite.runtime.contracts.weights",
         "TrainBatch": "megatron.lite.runtime.contracts.data",
     }
     if name in _lazy:

@@ -379,7 +379,11 @@ class MegatronLiteEngine(BaseEngine):
             for key in ("limit", "include_mtp_only", "include_local_prefixes")
             if key in kwargs
         }
-        if self.engine_config.model_name == "qwen3_5":
+        if self.engine_config.resync_format is not None:
+            export_kwargs["target"] = self.engine_config.resync_format
+            if self.engine_config.resync_config:
+                export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
+        elif self.engine_config.model_name == "qwen3_5":
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
@@ -537,7 +541,16 @@ class MegatronLiteEngine(BaseEngine):
             ),
             optimizer=self._build_mlite_optimizer_config(),
             attention_backend_override=self.engine_config.attention_backend_override,
-            router_aux_loss_coef=self.engine_config.router_aux_loss_coef,
+            # verl's megatron backend hard-disables the load-balancing objective
+            # for RL (config_converter: moe_router_load_balancing_type='none',
+            # "turn off aux_loss as it hurts perf in RL"). Default to the same
+            # semantics instead of falling through to the HF checkpoint's
+            # nonzero router_aux_loss_coef; an explicit engine value still wins.
+            router_aux_loss_coef=(
+                0.0
+                if self.engine_config.router_aux_loss_coef is None
+                else self.engine_config.router_aux_loss_coef
+            ),
             load_hf_weights=self.engine_config.load_hf_weights,
             impl_cfg=self._build_impl_cfg(),
         )
