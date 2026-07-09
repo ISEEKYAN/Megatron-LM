@@ -70,6 +70,9 @@ fi
 } > "${site}/gb200_vllm_overlay.pth"
 source "${overlay}/bin/activate"
 export FLASH_MLA_DISABLE_SM90=1
+# CUDA 13 installs libcudacxx below include/cccl. NVCC discovers it, but the
+# host C++ compilation of FlashMLA's API translation unit does not.
+export CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl:${CPLUS_INCLUDE_PATH:-}
 export MAX_JOBS=${MAX_JOBS:-32}
 export NVCC_THREADS=${NVCC_THREADS:-2}
 python -m pip install --no-build-isolation --no-deps "${flashmla_src}"

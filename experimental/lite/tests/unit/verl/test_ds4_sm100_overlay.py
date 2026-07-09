@@ -63,6 +63,7 @@ def test_sm100_overlay_build_is_pinned_and_does_not_mutate_rollout_overlay() -> 
     assert "MLITE_OVERLAY=" in versions
     assert "VLLM_OVERLAY=" in versions
     assert "FLASH_MLA_DISABLE_SM90=1" in build
+    assert "CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl" in build
     assert (
         'python -m pip install --no-build-isolation --no-deps "${flashmla_src}"'
         in build
