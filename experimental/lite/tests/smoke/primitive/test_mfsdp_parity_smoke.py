@@ -19,7 +19,12 @@ from megatron.lite.primitive.optimizers.mfsdp import build_mfsdp_training_optimi
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+pytestmark = [
+    pytest.mark.mlite,
+    pytest.mark.smoke,
+    pytest.mark.gpu,
+    pytest.mark.distributed,
+]
 
 _MFSDP_SHARDING_STRATEGY = "optim_grads_params"
 
@@ -45,15 +50,51 @@ class TinyDenseModel(nn.Module):
         return self.out(self.unit1(self.unit0(x)))
 
 
+class TinyExperts(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(8, 8, bias=False)
+
+    def forward(self, x):
+        return torch.nn.functional.gelu(self.linear(x))
+
+
+class TinyParallelModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.unit = TinyUnit()
+        self.experts = TinyExperts()
+        self.tp_bias = nn.Parameter(torch.zeros(8))
+        self.sp_params = [self.tp_bias]
+        self.out = nn.Linear(8, 4, bias=False)
+        self.unit.linear.weight.tensor_model_parallel = True
+        self.unit.linear.weight.partition_dim = 0
+        self.out.weight.tensor_model_parallel = True
+        self.out.weight.partition_dim = 1
+
+    def forward(self, x):
+        hidden = self.unit(x) + self.tp_bias
+        return self.out(self.experts(hidden))
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _single_node_cuda_dist():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if not torch.cuda.is_available():
+        if world_size > 1:
+            pytest.fail(
+                "Distributed M-FSDP parity was launched without visible CUDA devices."
+            )
         pytest.skip("CUDA is required for M-FSDP parity smoke tests.")
     if not fsdp2_available():
+        if world_size > 1:
+            pytest.fail("Distributed M-FSDP parity requires PyTorch FSDP2 fully_shard.")
         pytest.skip("Installed PyTorch does not expose FSDP2 fully_shard.")
-    if int(os.environ.get("WORLD_SIZE", "1")) < 2:
-        pytest.skip("M-FSDP sharding parity smoke requires at least 2 distributed ranks.")
-    if int(os.environ.get("WORLD_SIZE", "1")) > 8:
+    if world_size < 2:
+        pytest.skip(
+            "M-FSDP sharding parity smoke requires at least 2 distributed ranks."
+        )
+    if world_size > 8:
         pytest.skip("Megatron Lite smoke tests are capped at single-node 8 GPUs.")
 
     os.environ.setdefault("RANK", "0")
@@ -65,6 +106,14 @@ def _single_node_cuda_dist():
     os.environ.setdefault("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
 
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    if int(os.environ["RANK"]) == 0:
+        print(
+            "[MFSDP_ENV] "
+            f"torch={torch.__version__} "
+            f"cuda_devices={torch.cuda.device_count()} "
+            f"fsdp2_available={fsdp2_available()}",
+            flush=True,
+        )
     _install_transformer_engine_import_stub_if_needed()
     created_pg = False
     if not dist.is_initialized():
@@ -92,7 +141,9 @@ def _install_transformer_engine_import_stub_if_needed() -> None:
     for name in list(sys.modules):
         if name == "transformer_engine" or name.startswith("transformer_engine."):
             sys.modules.pop(name, None)
-        if name == "transformer_engine_torch" or name.startswith("transformer_engine_torch."):
+        if name == "transformer_engine_torch" or name.startswith(
+            "transformer_engine_torch."
+        ):
             sys.modules.pop(name, None)
 
     sys.modules["transformer_engine"] = None
@@ -119,39 +170,54 @@ def _optimizer_cfg() -> OptimizerConfig:
         adam_beta2=0.999,
         adam_eps=1.0e-8,
     )
-    cfg.override_optimizer_config = {"mfsdp_sharding_strategy": _MFSDP_SHARDING_STRATEGY}
+    cfg.override_optimizer_config = {
+        "mfsdp_sharding_strategy": _MFSDP_SHARDING_STRATEGY
+    }
     return cfg
 
 
-def _new_model(seed: int) -> nn.Module:
+def _new_model(seed: int, model_type: type[nn.Module]) -> nn.Module:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    return TinyDenseModel().cuda().to(torch.bfloat16)
+    return model_type().cuda().to(torch.bfloat16)
 
 
-def _parallel_state() -> Any:
-    return init_parallel(ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1))
+def _parallel_state(config: ParallelConfig) -> Any:
+    return init_parallel(config)
 
 
-def _build_fsdp2_pair(seed: int):
-    ps = _parallel_state()
-    chunks = [_new_model(seed)]
+def _build_fsdp2_pair(
+    seed: int,
+    *,
+    parallel: ParallelConfig,
+    model_type: type[nn.Module] = TinyDenseModel,
+    expert_classifier=None,
+):
+    ps = _parallel_state(parallel)
+    chunks = [_new_model(seed, model_type)]
     optimizer = build_fsdp2_training_optimizer(
         chunks,
         _optimizer_cfg(),
         ps,
         unit_modules=(TinyUnit,),
+        expert_classifier=expert_classifier,
         deterministic=True,
         use_fp32_master=True,
     )
     return chunks, optimizer, None
 
 
-def _build_mfsdp_pair(seed: int):
-    ps = _parallel_state()
-    chunks = [_new_model(seed)]
+def _build_mfsdp_pair(
+    seed: int,
+    *,
+    parallel: ParallelConfig,
+    model_type: type[nn.Module] = TinyDenseModel,
+    expert_classifier=None,
+):
+    ps = _parallel_state(parallel)
+    chunks = [_new_model(seed, model_type)]
     impl_cfg = SimpleNamespace(
-        parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+        parallel=parallel,
         optimizer_config=_optimizer_cfg(),
     )
     optimizer, finalize = build_mfsdp_training_optimizer(
@@ -160,7 +226,7 @@ def _build_mfsdp_pair(seed: int):
         impl_cfg=impl_cfg,
         ps=ps,
         model_name="qwen3_5",
-        is_expert=lambda _name: False,
+        is_expert=expert_classifier or (lambda _name: False),
         fsdp_unit_modules=(TinyUnit,),
         deterministic=True,
     )
@@ -175,8 +241,9 @@ def _train_once(chunks, optimizer, finalize, x: torch.Tensor, target: torch.Tens
     if finalize is not None:
         finalize()
     success, grad_norm, _num_zeros = optimizer.step()
+    grads = _named_optimizer_grads(optimizer)
     optimizer.zero_grad()
-    return bool(success), float(loss.detach().cpu()), float(grad_norm)
+    return bool(success), float(loss.detach().cpu()), float(grad_norm), grads
 
 
 def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -198,7 +265,62 @@ def _named_model_tensors(chunks) -> dict[str, torch.Tensor]:
     return params
 
 
-def _assert_param_sets_equal(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> float:
+def _canonical_optimizer_name(name: str) -> str:
+    chunk_name, separator, remainder = name.partition(".")
+    if separator and chunk_name.startswith("chunk") and chunk_name[5:].isdigit():
+        chunk_index = chunk_name[5:]
+        name = f"{chunk_index}.{remainder}"
+    return name.replace("_orig_mod.", "").replace("module.", "")
+
+
+def _named_optimizer_grads(optimizer) -> dict[str, torch.Tensor]:
+    model_chunks = getattr(optimizer, "model_chunks", None)
+    if model_chunks is not None:
+        return _named_mfsdp_optimizer_grads(model_chunks)
+
+    grads: dict[str, torch.Tensor] = {}
+    for param in optimizer.params:
+        if param.grad is None:
+            continue
+        name = _canonical_optimizer_name(optimizer.param_names[id(param)])
+        grads[name] = _full_tensor(param.grad.detach()).cpu().float().clone()
+    return grads
+
+
+def _named_mfsdp_optimizer_grads(model_chunks) -> dict[str, torch.Tensor]:
+    grads: dict[str, torch.Tensor] = {}
+    for chunk_index, chunk in enumerate(model_chunks):
+        for bucket in chunk.param_sync.buckets:
+            rank_major = torch.empty_like(bucket.grad_comm_buffer)
+            if bucket.world_size == 1:
+                rank_major.copy_(bucket.grad_shard_buffer)
+            else:
+                dist.all_gather_into_tensor(
+                    rank_major,
+                    bucket.grad_shard_buffer,
+                    group=bucket.process_group,
+                )
+            for spec in bucket.specs:
+                full_grad = torch.zeros(
+                    spec.padded_numel,
+                    dtype=bucket.grad_dtype,
+                    device=bucket.device,
+                )
+                for rank in range(bucket.world_size):
+                    source_offset = rank * bucket.local_numel + spec.local_offset
+                    destination_offset = rank * spec.shard_numel
+                    full_grad.narrow(0, destination_offset, spec.shard_numel).copy_(
+                        rank_major.narrow(0, source_offset, spec.shard_numel)
+                    )
+                grads[f"{chunk_index}.{spec.name}"] = (
+                    full_grad[: spec.numel].view(spec.shape).cpu().float().clone()
+                )
+    return grads
+
+
+def _assert_tensor_sets_equal(
+    lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]
+) -> float:
     assert lhs.keys() == rhs.keys()
     max_abs = 0.0
     for name in lhs:
@@ -208,19 +330,36 @@ def _assert_param_sets_equal(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.
     return max_abs
 
 
+def _dense_parallel_config() -> ParallelConfig:
+    return ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1)
+
+
+def _tp_ep_parallel_config() -> ParallelConfig:
+    return ParallelConfig(tp=2, ep=2, etp=1, pp=1, vpp=1, cp=1)
+
+
+def _is_tiny_expert(name: str) -> bool:
+    return name.startswith("experts.")
+
+
 def test_mfsdp_matches_fsdp2_tiny_dense_single_step():
     torch.manual_seed(2026 + dist.get_rank())
     torch.cuda.manual_seed_all(2026 + dist.get_rank())
     x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
     target = torch.randn(4, 4, device="cuda", dtype=torch.bfloat16)
 
-    fsdp2_chunks, fsdp2_optimizer, fsdp2_finalize = _build_fsdp2_pair(seed=1234)
-    mfsdp_chunks, mfsdp_optimizer, mfsdp_finalize = _build_mfsdp_pair(seed=1234)
+    parallel = _dense_parallel_config()
+    fsdp2_chunks, fsdp2_optimizer, fsdp2_finalize = _build_fsdp2_pair(
+        seed=1234, parallel=parallel
+    )
+    mfsdp_chunks, mfsdp_optimizer, mfsdp_finalize = _build_mfsdp_pair(
+        seed=1234, parallel=parallel
+    )
 
-    fsdp2_success, fsdp2_loss, fsdp2_grad_norm = _train_once(
+    fsdp2_success, fsdp2_loss, fsdp2_grad_norm, fsdp2_grads = _train_once(
         fsdp2_chunks, fsdp2_optimizer, fsdp2_finalize, x, target
     )
-    mfsdp_success, mfsdp_loss, mfsdp_grad_norm = _train_once(
+    mfsdp_success, mfsdp_loss, mfsdp_grad_norm, mfsdp_grads = _train_once(
         mfsdp_chunks, mfsdp_optimizer, mfsdp_finalize, x, target
     )
 
@@ -228,9 +367,11 @@ def test_mfsdp_matches_fsdp2_tiny_dense_single_step():
     assert mfsdp_success
     assert fsdp2_loss == mfsdp_loss
     assert fsdp2_grad_norm == mfsdp_grad_norm
-    max_param_abs = _assert_param_sets_equal(
+    max_grad_abs = _assert_tensor_sets_equal(fsdp2_grads, mfsdp_grads)
+    max_param_abs = _assert_tensor_sets_equal(
         _named_model_tensors(fsdp2_chunks), _named_model_tensors(mfsdp_chunks)
     )
+    assert max_grad_abs == 0.0
     assert max_param_abs == 0.0
 
     if dist.get_rank() == 0:
@@ -242,6 +383,61 @@ def test_mfsdp_matches_fsdp2_tiny_dense_single_step():
             f"loss_mfsdp={mfsdp_loss:.8f} "
             f"grad_norm_fsdp2={fsdp2_grad_norm:.8f} "
             f"grad_norm_mfsdp={mfsdp_grad_norm:.8f} "
+            f"max_grad_abs_diff={max_grad_abs:.8e} "
+            f"max_param_abs_diff={max_param_abs:.8e}",
+            flush=True,
+        )
+
+
+def test_mfsdp_matches_fsdp2_tp_ep_single_step():
+    torch.manual_seed(3026 + dist.get_rank())
+    torch.cuda.manual_seed_all(3026 + dist.get_rank())
+    x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+    target = torch.randn(4, 4, device="cuda", dtype=torch.bfloat16)
+    parallel = _tp_ep_parallel_config()
+
+    fsdp2_chunks, fsdp2_optimizer, fsdp2_finalize = _build_fsdp2_pair(
+        seed=2345,
+        parallel=parallel,
+        model_type=TinyParallelModel,
+        expert_classifier=_is_tiny_expert,
+    )
+    mfsdp_chunks, mfsdp_optimizer, mfsdp_finalize = _build_mfsdp_pair(
+        seed=2345,
+        parallel=parallel,
+        model_type=TinyParallelModel,
+        expert_classifier=_is_tiny_expert,
+    )
+
+    fsdp2_success, fsdp2_loss, fsdp2_grad_norm, fsdp2_grads = _train_once(
+        fsdp2_chunks, fsdp2_optimizer, fsdp2_finalize, x, target
+    )
+    mfsdp_success, mfsdp_loss, mfsdp_grad_norm, mfsdp_grads = _train_once(
+        mfsdp_chunks, mfsdp_optimizer, mfsdp_finalize, x, target
+    )
+
+    assert fsdp2_success
+    assert mfsdp_success
+    assert fsdp2_loss == mfsdp_loss
+    assert fsdp2_grad_norm == mfsdp_grad_norm
+    max_grad_abs = _assert_tensor_sets_equal(fsdp2_grads, mfsdp_grads)
+    max_param_abs = _assert_tensor_sets_equal(
+        _named_model_tensors(fsdp2_chunks), _named_model_tensors(mfsdp_chunks)
+    )
+    assert max_grad_abs == 0.0
+    assert max_param_abs == 0.0
+
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_PARITY] "
+            f"world_size={dist.get_world_size()} "
+            "topology=tp2_ep2 "
+            f"strategy={_MFSDP_SHARDING_STRATEGY} "
+            f"loss_fsdp2={fsdp2_loss:.8f} "
+            f"loss_mfsdp={mfsdp_loss:.8f} "
+            f"grad_norm_fsdp2={fsdp2_grad_norm:.8f} "
+            f"grad_norm_mfsdp={mfsdp_grad_norm:.8f} "
+            f"max_grad_abs_diff={max_grad_abs:.8e} "
             f"max_param_abs_diff={max_param_abs:.8e}",
             flush=True,
         )
