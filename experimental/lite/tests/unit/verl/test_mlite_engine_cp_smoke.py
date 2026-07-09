@@ -170,15 +170,35 @@ def _optimizer_config() -> SimpleNamespace:
 
 
 @pytest.mark.parametrize(
-    ("model_name", "model_type", "write_config", "vocab_size", "lengths"),
+    (
+        "model_name",
+        "model_type",
+        "write_config",
+        "vocab_size",
+        "lengths",
+        "optimizer_backend",
+    ),
     [
-        ("kimi_k2", "deepseek_v3", _write_kimi_config, 128, [5, 7, 9]),
-        ("glm5", "glm_moe_dsa", _write_glm5_config, 32, [16, 20, 24]),
-        ("deepseek_v4", "deepseek_v4", _write_deepseek_v4_config, 128, [16, 20, 24]),
+        ("kimi_k2", "deepseek_v3", _write_kimi_config, 128, [5, 7, 9], None),
+        ("glm5", "glm_moe_dsa", _write_glm5_config, 32, [16, 20, 24], None),
+        (
+            "deepseek_v4",
+            "deepseek_v4",
+            _write_deepseek_v4_config,
+            128,
+            [16, 20, 24],
+            "dist_opt",
+        ),
     ],
 )
 def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
-    tmp_path, model_name, model_type, write_config, vocab_size, lengths
+    tmp_path,
+    model_name,
+    model_type,
+    write_config,
+    vocab_size,
+    lengths,
+    optimizer_backend,
 ):
     torch = pytest.importorskip("torch")
     dist = pytest.importorskip("torch.distributed")
@@ -207,7 +227,7 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
             cp=world,
             impl_cfg={
                 "use_thd": True,
-                "optimizer": None,
+                "optimizer": optimizer_backend,
                 "deterministic": False,
                 "mtp_enable": False,
             },
@@ -223,9 +243,16 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
         config.load_hf_weights = False
         return config
 
-    engine._build_mlite_config = MethodType(_build_config_without_loading_weights, engine)
+    engine._build_mlite_config = MethodType(
+        _build_config_without_loading_weights, engine
+    )
     engine.initialize()
     engine.optimizer_zero_grad()
+    params_before_step = (
+        [param.detach().clone() for param in engine.module.parameters()]
+        if optimizer_backend is not None
+        else []
+    )
 
     input_ids = torch.nested.as_nested_tensor(
         [
@@ -265,11 +292,50 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     assert result.model_output.log_probs is not None
     grad_norm = torch.zeros((), dtype=torch.float32, device=device)
     for param in engine.module.parameters():
-        if param.grad is not None:
-            grad_norm = grad_norm + param.grad.detach().float().norm()
+        grad = param.grad
+        if grad is None:
+            grad = getattr(param, "main_grad", None)
+        if grad is not None:
+            grad_norm = grad_norm + grad.detach().float().norm()
     dist.all_reduce(grad_norm, op=dist.ReduceOp.SUM)
     assert torch.isfinite(grad_norm)
     assert grad_norm.item() > 0.0
+
+    optimizer_grad_norm = None
+    param_delta = None
+    checkpoint_roundtrip = False
+    if optimizer_backend is not None:
+        optimizer_grad_norm = torch.as_tensor(
+            engine.optimizer_step(), device=device
+        ).float()
+        engine.lr_scheduler_step()
+        assert torch.isfinite(optimizer_grad_norm)
+        assert optimizer_grad_norm.item() > 0.0
+
+        param_delta = torch.zeros((), dtype=torch.float32, device=device)
+        for before, after in zip(
+            params_before_step, engine.module.parameters(), strict=True
+        ):
+            param_delta = param_delta + (after.detach() - before).float().abs().sum()
+        dist.all_reduce(param_delta, op=dist.ReduceOp.SUM)
+        assert torch.isfinite(param_delta)
+        assert param_delta.item() > 0.0
+
+        checkpoint_payload = [str(tmp_path / "checkpoint") if rank == 0 else None]
+        dist.broadcast_object_list(checkpoint_payload, src=0)
+        checkpoint_path = checkpoint_payload[0]
+        engine.save_checkpoint(checkpoint_path, global_step=1)
+        params_after_step = [
+            param.detach().clone() for param in engine.module.parameters()
+        ]
+        with torch.no_grad():
+            next(engine.module.parameters()).add_(1)
+        engine.load_checkpoint(checkpoint_path)
+        for expected, actual in zip(
+            params_after_step, engine.module.parameters(), strict=True
+        ):
+            assert torch.equal(expected, actual.detach())
+        checkpoint_roundtrip = True
 
     verl_output = engine._build_verl_model_output(
         raw_output={"log_probs": result.model_output.log_probs},
@@ -279,10 +345,21 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     assert [int(x) for x in nested_log_probs.offsets().diff().cpu()] == lengths
 
     if rank == 0:
-        print(
-            "NON_SKIP_VERL_MLITE_RUNTIME_THD_CP_SMOKE_PASSED "
-            f"model={model_name} "
-            f"world_size={world} lengths={lengths} "
-            f"loss={float(result.model_output.loss.detach().item()):.6e} "
-            f"grad_norm_sum={float(grad_norm.item()):.6e}"
-        )
+        fields = [
+            "NON_SKIP_VERL_MLITE_RUNTIME_THD_CP_SMOKE_PASSED",
+            f"model={model_name}",
+            f"world_size={world}",
+            f"lengths={lengths}",
+            f"loss={float(result.model_output.loss.detach().item()):.6e}",
+            f"grad_norm_sum={float(grad_norm.item()):.6e}",
+        ]
+        if optimizer_backend is not None:
+            fields.extend(
+                [
+                    f"optimizer={optimizer_backend}",
+                    f"optimizer_grad_norm={float(optimizer_grad_norm.item()):.6e}",
+                    f"param_delta_sum={float(param_delta.item()):.6e}",
+                    f"checkpoint_roundtrip={'bitwise' if checkpoint_roundtrip else 'failed'}",
+                ]
+            )
+        print(" ".join(fields))
