@@ -64,6 +64,9 @@ def test_sm100_overlay_build_is_pinned_and_does_not_mutate_rollout_overlay() -> 
     assert "FLASHMLA_COMMIT=a6ec2ba7bd0a7dff98b3f4d3e6b52b159c48d78b" in versions
     assert "MLITE_OVERLAY=" in versions
     assert "VLLM_OVERLAY=" in versions
+    assert "#SBATCH --partition=cpu" in build
+    assert "#SBATCH --gpus-per-node" not in build
+    assert "torch.cuda.get_device_capability" not in build
     assert "FLASH_MLA_DISABLE_SM90=1" in build
     assert "CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl" in build
     assert "flashmla-a6ec-standalone-import.patch" in build
@@ -75,7 +78,7 @@ def test_sm100_overlay_build_is_pinned_and_does_not_mutate_rollout_overlay() -> 
     )
     assert "gb200_vllm_overlay.pth" in build
     assert "nvidia_cutlass_dsl/python_packages" in build
-    assert "python -m examples.verl.ds4_sm100_env probe" in build
+    assert "python -m examples.verl.ds4_sm100_env inspect" in build
     assert 'source "${VLLM_OVERLAY}/bin/activate"' not in build
     assert "cp -r" not in build
     assert ".whl" not in build

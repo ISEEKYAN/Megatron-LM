@@ -52,6 +52,33 @@ def validate_dependency_contract(
     }
 
 
+def inspect() -> dict[str, str | bool]:
+    """Import the installed kernel packages without requiring a GPU device."""
+    from cudnn.deepseek_sparse_attention.indexer_forward._interface import (
+        indexer_fwd as indexer_fwd_sm100,
+    )
+    from flash_mla import flash_mla_sparse_fwd
+
+    cudnn_frontend_version = version("nvidia-cudnn-frontend")
+    if _version_tuple(cudnn_frontend_version) < _MIN_CUDNN_FRONTEND:
+        raise RuntimeError(
+            "DS4 SM100 requires nvidia-cudnn-frontend >=1.26.0, "
+            f"got {cudnn_frontend_version}"
+        )
+    if flash_mla_sparse_fwd is None:
+        raise RuntimeError("FlashMLA does not export flash_mla_sparse_fwd")
+    if indexer_fwd_sm100 is None:
+        raise RuntimeError("cudnn-frontend does not export indexer_fwd_sm100")
+    report = {
+        "cudnn_frontend": cudnn_frontend_version,
+        "flash_mla_sparse_fwd": True,
+        "indexer_fwd_sm100": True,
+    }
+    print(json.dumps(report, sort_keys=True), flush=True)
+    print("DS4_SM100_DSA_BUILD_READY", flush=True)
+    return report
+
+
 def probe() -> dict[str, str | bool]:
     """Import the production dependencies and verify MLite selects SM100."""
     import torch
@@ -118,12 +145,15 @@ def verify_payload(payload: Path, *, expected_prompts: int) -> dict[str, int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("inspect")
     subparsers.add_parser("probe")
     verify_parser = subparsers.add_parser("verify-payload")
     verify_parser.add_argument("--payload", type=Path, required=True)
     verify_parser.add_argument("--expected-prompts", type=int, default=36)
     args = parser.parse_args()
-    if args.command == "probe":
+    if args.command == "inspect":
+        inspect()
+    elif args.command == "probe":
         probe()
     else:
         verify_payload(args.payload, expected_prompts=args.expected_prompts)

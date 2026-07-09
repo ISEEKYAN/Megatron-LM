@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=mlite-dsa-sm100-build
 #SBATCH --account=coreai_devtech_all
-#SBATCH --partition=batch
+#SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=64
-#SBATCH --time=04:00:00
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=128G
+#SBATCH --time=01:00:00
 #SBATCH --output=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/llmrl/gb200-vllm-ds4/logs/mlite-dsa-sm100-build-%j.log
 
 set -euo pipefail
@@ -64,9 +64,7 @@ import torch
 
 print(f"NGC_TORCH={torch.__version__}")
 print(f"NGC_CUDA={torch.version.cuda}")
-print(f"GPU={torch.cuda.get_device_name(0)}")
-print(f"GPU_CAPABILITY={torch.cuda.get_device_capability(0)}")
-assert torch.cuda.get_device_capability(0)[0] == 10
+assert torch.version.cuda == "13.3"
 PY
 
 if [[ ! -x "${overlay}/bin/python" ]]; then
@@ -86,7 +84,7 @@ export NVCC_THREADS=${NVCC_THREADS:-2}
 python -m pip install --force-reinstall --no-build-isolation --no-deps "${flashmla_src}"
 
 export PYTHONPATH="${mlite_src}/experimental/lite:${PYTHONPATH:-}"
-python -m examples.verl.ds4_sm100_env probe
+python -m examples.verl.ds4_sm100_env inspect
 {
   printf 'FLASHMLA_COMMIT=%s\n' "${flashmla_commit}"
   python - <<'PY'

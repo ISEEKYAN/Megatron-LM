@@ -198,12 +198,14 @@ export DS4_SM100_SCRIPT_DIR="${MLITE_SRC}/experimental/lite/examples/verl/slurm"
 sbatch --export=ALL "${DS4_SM100_SCRIPT_DIR}/build_ds4_sm100_overlay.sbatch"
 ```
 
-The build runs `examples.verl.ds4_sm100_env probe` on a Slurm-allocated GB200
-and fails unless FlashMLA exports `flash_mla_sparse_fwd`, cuDNN Frontend exports
-the SM100 indexer entry, and MLite selects that entry for compute capability
-10.0. After the build succeeds, the formal forward launcher loads the pinned
-official DeepSeek-V4-Flash checkpoint into an EP4 MLite BF16 master and evaluates
-the same 36 teacher-forced math prompts used by `ds4_resync_tp4.py`:
+The build runs on the Slurm CPU partition and calls
+`examples.verl.ds4_sm100_env inspect`; it fails unless FlashMLA exports
+`flash_mla_sparse_fwd` and cuDNN Frontend exports the SM100 indexer entry. It
+does not reserve a GPU merely to compile the overlay. After the build succeeds,
+the formal forward launcher allocates four GB200 GPUs, verifies that MLite
+selects the SM100 entry for compute capability 10.0, loads the pinned official
+DeepSeek-V4-Flash checkpoint into an EP4 MLite BF16 master, and evaluates the
+same 36 teacher-forced math prompts used by `ds4_resync_tp4.py`:
 
 ```bash
 export OUTPUT_DIR=/lustre/path/to/new-output-directory
