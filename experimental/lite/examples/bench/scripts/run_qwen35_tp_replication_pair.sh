@@ -26,6 +26,7 @@ COMMON_ARGS=(
   --truncate-layers "${TRUNCATE_LAYERS:-8}"
   --disable-mtp
   --same-data-across-dp
+  --impl-cfg-json '{"mount_vision_model": false}'
 )
 
 run_tp() {
