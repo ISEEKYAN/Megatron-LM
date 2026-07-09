@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import ast
 import copy
-from dataclasses import dataclass
 import inspect
 import os
 from pathlib import Path
@@ -16,13 +15,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from megatron.lite.primitive.optimizers import get_optimizer_backend
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
-from megatron.lite.primitive.optimizers.mfsdp import grad_norm as mfsdp_grad_norm
 from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
-from megatron.lite.primitive.optimizers.mfsdp.patches import (
-    should_skip_tp_duplicate_sync,
-)
 from megatron.lite.runtime.contracts.config import ParallelConfig
 
 
@@ -55,6 +49,20 @@ class _DirectParamModel(torch.nn.Module):
     def forward(self, value):
         hidden = self.unit(value)
         return torch.nn.functional.linear(hidden, self.projection.weight)
+
+
+def _optimizer_params(optimizer) -> list[torch.nn.Parameter]:
+    return optimizer._inner_optimizer.params
+
+
+def _optimizer_named_shards(optimizer) -> dict[str, torch.nn.Parameter]:
+    result = {}
+    for chunk in optimizer._model_chunks:
+        for bucket in chunk.param_sync.buckets:
+            for spec in bucket.specs:
+                assert spec.shard_param is not None
+                result[spec.name] = spec.shard_param
+    return result
 
 
 def test_mfsdp_has_no_megatron_core_imports():
@@ -130,6 +138,86 @@ def test_mfsdp_config_validation_does_not_require_or_filter_model_name():
     mfsdp_config.validate_mfsdp_config(engine_cfg)
 
 
+def test_mfsdp_has_no_legacy_test_only_production_surface():
+    package = Path(mfsdp_config.__file__).parent
+    forbidden_modules = {
+        "backend.py",
+        "checkpoint_keys.py",
+        "metadata.py",
+        "patches.py",
+    }
+    forbidden_top_level = {
+        "config.py": {
+            "_collect_mfsdp_overrides",
+            "_distributed_optimizer_instance_override",
+            "_validate_ddp_knob_value",
+            "build_mfsdp_ddp_config",
+            "coerce_dtype",
+            "split_mfsdp_overrides",
+            "validate_mfsdp_topology_optimizer_combo",
+        },
+        "grad_norm.py": {
+            "CanonicalGradNormMegatronFSDPOptimizer",
+            "GradNormBreakdown",
+            "_clip_mfsdp_grads_by_total_norm",
+            "_leaf_optimizers",
+            "_sum_if_distributed",
+            "_unique_parameters",
+            "compute_mfsdp_grad_norm",
+        },
+        "optimizer.py": {
+            "_default_expert_classifier",
+            "finalize_mfsdp_grads",
+        },
+    }
+    forbidden_methods = {
+        "optimizer.py": {"sync_model_weights_to_main_weights"},
+        "param_sync.py": {"install_optimized_model_weights"},
+    }
+
+    violations = []
+    for module_name in sorted(forbidden_modules):
+        if (package / module_name).exists():
+            violations.append(f"obsolete module still exists: {module_name}")
+    for module_name, names in forbidden_top_level.items():
+        tree = ast.parse((package / module_name).read_text())
+        defined = {
+            node.name
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef | ast.ClassDef)
+        }
+        violations.extend(
+            f"test-only definition: {module_name}:{name}"
+            for name in sorted(defined & names)
+        )
+    for module_name, names in forbidden_methods.items():
+        tree = ast.parse((package / module_name).read_text())
+        defined = {
+            child.name
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            for child in node.body
+            if isinstance(child, ast.FunctionDef)
+        }
+        violations.extend(
+            f"test-only method: {module_name}:{name}"
+            for name in sorted(defined & names)
+        )
+
+    stack_params = inspect.signature(mfsdp_optimizer.build_mfsdp_stack).parameters
+    training_params = inspect.signature(
+        mfsdp_optimizer.build_mfsdp_training_optimizer
+    ).parameters
+    for name in ("model_cfg", "proto", "skip_fsdp_wrap"):
+        if name in stack_params:
+            violations.append(f"unused build_mfsdp_stack argument: {name}")
+    for name in ("model_cfg", "deterministic"):
+        if name in training_params:
+            violations.append(f"unused build_mfsdp_training_optimizer argument: {name}")
+
+    assert violations == []
+
+
 def test_mfsdp_imports_when_megatron_core_is_blocked():
     script = """
 import builtins
@@ -150,22 +238,6 @@ import megatron.lite.primitive.optimizers.mfsdp
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
-@dataclass
-class _FakeDDPConfig:
-    use_distributed_optimizer: bool = False
-    use_megatron_fsdp: bool = False
-    data_parallel_sharding_strategy: str = "no_shard"
-    bucket_size: int | None = None
-    overlap_grad_reduce: bool = False
-    overlap_param_gather: bool = False
-    num_distributed_optimizer_instances: int = 1
-    nccl_ub: bool = False
-    fsdp_double_buffer: bool = False
-    megatron_fsdp_main_params_dtype: torch.dtype | None = None
-    megatron_fsdp_main_grads_dtype: torch.dtype | None = None
-    megatron_fsdp_grad_comm_dtype: torch.dtype | None = None
-
-
 def _engine_cfg(**overrides):
     cfg = SimpleNamespace(
         parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
@@ -176,47 +248,6 @@ def _engine_cfg(**overrides):
     return cfg
 
 
-def test_mfsdp_backend_registry_resolves_backend():
-    backend = get_optimizer_backend("mfsdp")
-
-    assert backend.name == "megatron_fsdp"
-    assert backend.runtime_backend == "megatron_fsdp"
-
-
-def test_mfsdp_config_lowers_aliases_and_preserves_optimizer_keys():
-    opt = SimpleNamespace(
-        override_optimizer_config={
-            "mfsdp_sharding_strategy": "optim_grads",
-            "bucket_size": 1234,
-            "adam_beta1": 0.8,
-        }
-    )
-
-    opt_overrides, ddp_overrides = mfsdp_config.split_mfsdp_overrides(
-        opt,
-        _FakeDDPConfig,
-    )
-
-    assert opt_overrides == {"adam_beta1": 0.8}
-    assert ddp_overrides["data_parallel_sharding_strategy"] == "optim_grads"
-    assert ddp_overrides["bucket_size"] == 1234
-
-    cfg = mfsdp_config.build_mfsdp_ddp_config(
-        _FakeDDPConfig,
-        {
-            "megatron_fsdp_main_params_dtype": "bf16",
-            "megatron_fsdp_grad_comm_dtype": "torch.float16",
-        },
-    )
-
-    assert cfg.use_distributed_optimizer is True
-    assert cfg.use_megatron_fsdp is True
-    assert cfg.data_parallel_sharding_strategy == "optim_grads_params"
-    assert cfg.megatron_fsdp_main_params_dtype is torch.bfloat16
-    assert cfg.megatron_fsdp_main_grads_dtype is None
-    assert cfg.megatron_fsdp_grad_comm_dtype is torch.float16
-
-
 def test_mfsdp_config_rejects_unsupported_optimizer():
     engine_cfg = _engine_cfg(
         optimizer=SimpleNamespace(optimizer="adamw", override_optimizer_config={})
@@ -225,77 +256,24 @@ def test_mfsdp_config_rejects_unsupported_optimizer():
         mfsdp_config.validate_mfsdp_config(engine_cfg)
 
 
-def test_mfsdp_grad_clip_scales_unique_grads_and_decoupled_grads():
-    shared = torch.nn.Parameter(torch.ones(2))
-    shared.grad = torch.ones(2)
-    other = torch.nn.Parameter(torch.ones(2))
-    other.grad = torch.ones(2)
-    decoupled = torch.nn.Parameter(torch.ones(2))
-    decoupled.grad = torch.ones(2)
-    decoupled.decoupled_grad = torch.ones(2)
-
-    class _Leaf:
-        def __init__(self, params, *, use_decoupled_grad=False):
-            self.is_stub_optimizer = False
-            self.config = SimpleNamespace(
-                clip_grad=1.0,
-                use_precision_aware_optimizer_no_fp8_or_ds_fp8=use_decoupled_grad,
-            )
-            self.param_groups = [{"params": params}]
-
-        def get_parameters(self):
-            return []
-
-    optimizer = SimpleNamespace(
-        chained_optimizers=[
-            _Leaf([shared, other]),
-            _Leaf([shared]),
-            _Leaf([decoupled], use_decoupled_grad=True),
-        ],
-    )
-
-    mfsdp_grad_norm._clip_mfsdp_grads_by_total_norm(optimizer, grad_norm=4.0)
-
-    assert torch.allclose(shared.grad, torch.full_like(shared.grad, 0.25))
-    assert torch.allclose(other.grad, torch.full_like(other.grad, 0.25))
-    assert torch.equal(decoupled.grad, torch.ones(2))
-    assert torch.allclose(
-        decoupled.decoupled_grad, torch.full_like(decoupled.grad, 0.25)
-    )
-
-
-def test_mfsdp_metadata_infers_tp_partition_attrs_for_known_weights():
-    class _Leaf(torch.nn.Module):
-        def __init__(self, *, param_name: str = "weight"):
-            super().__init__()
-            param = torch.nn.Parameter(torch.randn(4, 3))
-            param.tensor_model_parallel = True
-            setattr(self, param_name, param)
-
-    class _Layer(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.attn = torch.nn.Module()
-            self.attn.qkv = torch.nn.Module()
-            self.attn.qkv.linear = _Leaf()
-            self.attn.proj = torch.nn.Module()
-            self.attn.proj.linear = _Leaf()
-            self.moe = torch.nn.Module()
-            self.moe.experts = torch.nn.Module()
-            self.moe.experts.fc1 = _Leaf(param_name="weight0")
-            self.moe.experts.fc2 = _Leaf(param_name="weight0")
-
+def test_mfsdp_parallel_metadata_uses_topology_and_explicit_classifier():
     model = torch.nn.Module()
-    model.layers = torch.nn.ModuleList([_Layer()])
+    model.dense_matrix = torch.nn.Parameter(torch.ones(4, 4))
+    model.routed_matrix = torch.nn.Parameter(torch.ones(4, 4))
+    model.replicated_matrix = torch.nn.Parameter(torch.ones(4, 4))
+    model.replicated_matrix.average_gradients_across_tp_domain = True
 
-    mfsdp_optimizer.ensure_mfsdp_tp_partition_attrs(model)
+    mfsdp_optimizer._mark_mfsdp_parallel_attrs(
+        model,
+        lambda name: name == "routed_matrix",
+        tp_size=2,
+        etp_size=1,
+    )
 
-    layer = model.layers[0]
-    assert layer.attn.qkv.linear.weight.partition_dim == 0
-    assert layer.attn.proj.linear.weight.partition_dim == 1
-    assert layer.moe.experts.fc1.weight0.partition_dim == 0
-    assert layer.moe.experts.fc2.weight0.partition_dim == 1
-    assert should_skip_tp_duplicate_sync(layer.attn.qkv.linear.weight)
+    assert model.dense_matrix.tensor_model_parallel is True
+    assert model.routed_matrix.tensor_model_parallel is False
+    assert model.routed_matrix.allreduce is False
+    assert model.replicated_matrix.tensor_model_parallel is False
 
 
 def test_mfsdp_marks_sequence_parallel_shards_for_tp_gradient_sync():
@@ -326,7 +304,6 @@ def test_mfsdp_marks_sequence_parallel_shards_for_tp_gradient_sync():
 
     _chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [model],
-        model_cfg=SimpleNamespace(),
         engine_cfg=SimpleNamespace(
             parallel=ParallelConfig(tp=2, ep=1, etp=1, pp=1, vpp=1, cp=1),
             optimizer=opt,
@@ -336,11 +313,7 @@ def test_mfsdp_marks_sequence_parallel_shards_for_tp_gradient_sync():
         fsdp_unit_modules=(_GlooUnit,),
     )
 
-    out_shard = next(
-        param
-        for param in optimizer.params
-        if optimizer.param_names[id(param)].endswith("out.weight")
-    )
+    out_shard = _optimizer_named_shards(optimizer)["out.weight"]
     assert out_shard.sequence_parallel is True
     assert out_shard.tensor_model_parallel is False
     assert optimizer._inner_optimizer.tp_replicated_params == [out_shard]
@@ -362,7 +335,6 @@ def test_mfsdp_syncs_average_gradients_across_tp_domain_params(monkeypatch):
     adapter = mfsdp_optimizer._StandaloneOptimizer(
         torch.optim.SGD([vision_param], lr=0.0),
         [vision_param],
-        {id(vision_param): "vision.weight"},
         ps=SimpleNamespace(
             dp_cp_group=None,
             dp_group=None,
@@ -435,7 +407,6 @@ def test_mfsdp_standalone_step_covers_tp_and_expert_norm_domains(monkeypatch):
     adapter = mfsdp_optimizer._StandaloneOptimizer(
         torch.optim.SGD([dense, tp_replicated, expert], lr=0.0),
         [dense, tp_replicated, expert],
-        {id(dense): "dense", id(tp_replicated): "sp", id(expert): "expert"},
         ps=ps,
         clip_grad=0.0,
         grad_norm_accum_dtype=torch.float32,
@@ -517,7 +488,6 @@ def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
     )
     chunks, candidate_optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [candidate],
-        model_cfg=SimpleNamespace(),
         engine_cfg=engine_cfg,
         ps=ps,
         is_expert=lambda _name: False,
@@ -531,17 +501,15 @@ def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
 
     candidate_optimizer.zero_grad()
     torch.nn.functional.mse_loss(chunks[0](value), target).backward()
-    mfsdp_optimizer.finalize_mfsdp_grads(chunks, candidate_optimizer)
+    candidate_optimizer.finish_grad_sync()
 
     reference_grads = {
         name: param.grad.detach().reshape(-1)
         for name, param in reference.named_parameters()
     }
     candidate_grads = {
-        candidate_optimizer.param_names[id(param)].removeprefix(
-            "chunk0.module."
-        ): param.grad.detach().reshape(-1)
-        for param in candidate_optimizer.params
+        name: param.grad.detach().reshape(-1)
+        for name, param in _optimizer_named_shards(candidate_optimizer).items()
     }
     assert reference_grads.keys() == candidate_grads.keys()
     for name, reference_grad in reference_grads.items():
@@ -567,7 +535,6 @@ def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
         for param in chunks[0].parameters():
             param.add_(7.0)
     chunks[0].load_state_dict(saved_model)
-    assert candidate_optimizer.sync_model_weights_to_main_weights()
     restored_model = chunks[0].state_dict()
     assert saved_model.keys() == restored_model.keys()
     for name, value in saved_model.items():
@@ -610,7 +577,6 @@ def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
     )
     chunks, candidate_optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [candidate],
-        model_cfg=SimpleNamespace(),
         engine_cfg=SimpleNamespace(
             parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
             optimizer=opt,
@@ -635,17 +601,15 @@ def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
             candidate_optimizer.grad_sync_enabled = True
         (candidate_loss / len(microbatches)).backward()
 
-    mfsdp_optimizer.finalize_mfsdp_grads(chunks, candidate_optimizer)
+    candidate_optimizer.finish_grad_sync()
 
     reference_grads = {
         name: param.grad.detach().reshape(-1)
         for name, param in reference.named_parameters()
     }
     candidate_grads = {
-        candidate_optimizer.param_names[id(param)].removeprefix("chunk0.module."): (
-            param.grad.detach().reshape(-1)
-        )
-        for param in candidate_optimizer.params
+        name: param.grad.detach().reshape(-1)
+        for name, param in _optimizer_named_shards(candidate_optimizer).items()
     }
     assert reference_grads.keys() == candidate_grads.keys()
     for name, reference_grad in reference_grads.items():
@@ -680,7 +644,6 @@ def test_mfsdp_materializes_root_params_used_without_calling_their_leaf_module()
     )
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [candidate],
-        model_cfg=SimpleNamespace(),
         engine_cfg=SimpleNamespace(
             parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
             optimizer=opt,
@@ -697,12 +660,8 @@ def test_mfsdp_materializes_root_params_used_without_calling_their_leaf_module()
 
     reference_output.square().mean().backward()
     candidate_output.square().mean().backward()
-    mfsdp_optimizer.finalize_mfsdp_grads(chunks, optimizer)
-    projection_shard = next(
-        param
-        for param in optimizer.params
-        if optimizer.param_names[id(param)].endswith("projection.weight")
-    )
+    optimizer.finish_grad_sync()
+    projection_shard = _optimizer_named_shards(optimizer)["projection.weight"]
     assert torch.equal(
         reference.projection.weight.grad.reshape(-1), projection_shard.grad.reshape(-1)
     )
@@ -733,7 +692,6 @@ def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
     )
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [model],
-        model_cfg=SimpleNamespace(),
         engine_cfg=SimpleNamespace(
             parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
             optimizer=opt,
@@ -743,7 +701,8 @@ def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
         fsdp_unit_modules=(_GlooUnit,),
     )
 
-    assert all(param.dtype is torch.float32 for param in optimizer.params)
+    optimizer_params = _optimizer_params(optimizer)
+    assert all(param.dtype is torch.float32 for param in optimizer_params)
     assert all(
         param.dtype is torch.bfloat16 for _name, param in chunks[0].named_parameters()
     )
@@ -752,17 +711,17 @@ def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
         for bucket in chunks[0].param_sync.buckets
     )
 
-    before = [param.detach().clone() for param in optimizer.params]
+    before = [param.detach().clone() for param in optimizer_params]
     value = torch.randn(3, 4, dtype=torch.bfloat16)
     optimizer.zero_grad()
     chunks[0](value).float().square().mean().backward()
-    mfsdp_optimizer.finalize_mfsdp_grads(chunks, optimizer)
+    optimizer.finish_grad_sync()
     success, grad_norm, _ = optimizer.step()
 
     assert success
     assert grad_norm > 0.0
-    assert all(param.dtype is torch.float32 for param in optimizer.params)
-    assert any(not torch.equal(old, new) for old, new in zip(before, optimizer.params))
+    assert all(param.dtype is torch.float32 for param in optimizer_params)
+    assert any(not torch.equal(old, new) for old, new in zip(before, optimizer_params))
     assert torch.isfinite(chunks[0](value).float()).all()
 
 
@@ -814,7 +773,6 @@ def _run_mfsdp_gloo_parity(rank: int, world_size: int, init_file: str) -> None:
         )
         chunks, candidate_optimizer = mfsdp_optimizer.build_mfsdp_stack(
             [candidate],
-            model_cfg=SimpleNamespace(),
             engine_cfg=engine_cfg,
             ps=ps,
             is_expert=lambda _name: False,
@@ -832,7 +790,7 @@ def _run_mfsdp_gloo_parity(rank: int, world_size: int, init_file: str) -> None:
             assert param.grad is not None
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
             param.grad.div_(world_size)
-        mfsdp_optimizer.finalize_mfsdp_grads(chunks, candidate_optimizer)
+        candidate_optimizer.finish_grad_sync()
 
         reference_norm = torch.linalg.vector_norm(
             torch.cat([param.grad.reshape(-1) for param in reference.parameters()])

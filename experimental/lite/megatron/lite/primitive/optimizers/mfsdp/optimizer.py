@@ -12,18 +12,11 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from megatron.lite.primitive.optimizers.mfsdp.checkpoint_keys import (
-    attach_mfsdp_checkpoint_metadata,
-)
 from megatron.lite.primitive.optimizers.mfsdp.config import validate_mfsdp_config
 from megatron.lite.primitive.optimizers.mfsdp.grad_norm import (
     all_reduce_scalar_,
     local_grad_sq_sum,
     resolve_torch_dtype,
-)
-from megatron.lite.primitive.optimizers.mfsdp.metadata import (
-    ensure_mfsdp_tp_partition_attrs,
-    normalize_mfsdp_expert_tensor_parallel_attrs,
 )
 from megatron.lite.primitive.optimizers.mfsdp.param_sync import (
     MFSdpModule,
@@ -38,10 +31,6 @@ def _override(opt: Any, name: str, default: Any) -> Any:
     return values.get(name, getattr(opt, name, default))
 
 
-def _default_expert_classifier(name: str) -> bool:
-    return "experts" in name and "router" not in name and "shared" not in name
-
-
 class _StandaloneOptimizer:
     """Torch optimizer adapter with M-FSDP-aware norm and state movement."""
 
@@ -49,7 +38,6 @@ class _StandaloneOptimizer:
         self,
         optimizer: torch.optim.Optimizer,
         params: list[nn.Parameter],
-        param_names: dict[int, str],
         *,
         ps: Any,
         clip_grad: float,
@@ -59,7 +47,6 @@ class _StandaloneOptimizer:
     ) -> None:
         self.optimizer = optimizer
         self.params = params
-        self.param_names = param_names
         self.ps = ps
         self.clip_grad = float(clip_grad)
         self.grad_norm_accum_dtype = resolve_torch_dtype(grad_norm_accum_dtype)
@@ -242,11 +229,7 @@ class MFSdpOptimizer:
 
     def __init__(self, optimizer: Any, model_chunks: list[MFSdpModule]) -> None:
         self._inner_optimizer = optimizer
-        self.optimizer = optimizer.optimizer
-        self.params = optimizer.params
-        self.param_names = optimizer.param_names
-        self.model_chunks = model_chunks
-        self._mc_pg_collection = None
+        self._model_chunks = model_chunks
         self._grad_sync_enabled = False
 
     @property
@@ -256,7 +239,7 @@ class MFSdpOptimizer:
     @grad_sync_enabled.setter
     def grad_sync_enabled(self, enabled: bool) -> None:
         self._grad_sync_enabled = bool(enabled)
-        for chunk in self.model_chunks:
+        for chunk in self._model_chunks:
             chunk.param_sync.set_grad_sync_enabled(self._grad_sync_enabled)
 
     @property
@@ -266,11 +249,11 @@ class MFSdpOptimizer:
     def zero_grad(self) -> None:
         self.grad_sync_enabled = False
         self._inner_optimizer.zero_grad()
-        for chunk in self.model_chunks:
+        for chunk in self._model_chunks:
             chunk.zero_grad_buffer()
 
     def finish_grad_sync(self) -> None:
-        for chunk in self.model_chunks:
+        for chunk in self._model_chunks:
             chunk.finish_grad_sync()
 
     def clip_grad_norm(self) -> float:
@@ -278,7 +261,7 @@ class MFSdpOptimizer:
 
     def step(self) -> tuple[bool, float, int]:
         result = self._inner_optimizer.step()
-        for chunk in self.model_chunks:
+        for chunk in self._model_chunks:
             chunk.param_sync.release_all()
         self.grad_sync_enabled = False
         return result
@@ -295,29 +278,19 @@ class MFSdpOptimizer:
     def load_state_to_device(self) -> None:
         self._inner_optimizer.load_state_to_device()
 
-    def sync_model_weights_to_main_weights(self) -> bool:
-        """Copy materialized model weights into the FP32 optimizer shards."""
-        for chunk in self.model_chunks:
-            chunk.param_sync.copy_full_parameters_to_shards()
-        return bool(self.model_chunks)
-
 
 def build_mfsdp_stack(
     model_chunks: list[nn.Module],
     *,
-    model_cfg,
     engine_cfg,
     ps,
     is_expert: ExpertClassifierFn | None = None,
-    proto=None,
     fsdp_unit_modules: tuple[type[nn.Module] | str, ...] | None = None,
-    skip_fsdp_wrap: bool = False,
 ):
     """Wrap chunks with the native M-FSDP path and build its local optimizer."""
-    del model_cfg, proto
     validate_mfsdp_config(engine_cfg)
     opt = engine_cfg.optimizer
-    classifier = is_expert or _default_expert_classifier
+    classifier = is_expert or (lambda _name: False)
     strategy = _override(opt, "mfsdp_sharding_strategy", "optim_grads_params")
     if strategy != "optim_grads_params":
         raise ValueError(
@@ -325,33 +298,27 @@ def build_mfsdp_stack(
             "mfsdp_sharding_strategy='optim_grads_params' only."
         )
 
-    if skip_fsdp_wrap:
-        wrapped_chunks = list(model_chunks)
-    else:
-        wrapped_chunks = []
-        for chunk in model_chunks:
-            _mark_mfsdp_parallel_attrs(
+    wrapped_chunks = []
+    for chunk in model_chunks:
+        _mark_mfsdp_parallel_attrs(
+            chunk,
+            classifier,
+            tp_size=int(getattr(engine_cfg.parallel, "tp", 1) or 1),
+            etp_size=int(getattr(engine_cfg.parallel, "etp", 1) or 1),
+        )
+        wrapped_chunks.append(
+            MFSdpModule(
                 chunk,
-                classifier,
-                tp_size=int(getattr(engine_cfg.parallel, "tp", 1) or 1),
-                etp_size=int(getattr(engine_cfg.parallel, "etp", 1) or 1),
+                dense_process_group=getattr(ps, "dp_cp_group", None)
+                or getattr(ps, "dp_group", None),
+                expert_process_group=getattr(ps, "ep_dp_group", None),
+                is_expert=classifier,
+                unit_modules=fsdp_unit_modules,
+                average_gradients=bool(_override(opt, "average_in_collective", True)),
             )
-            ensure_mfsdp_tp_partition_attrs(chunk)
-            wrapped_chunks.append(
-                MFSdpModule(
-                    chunk,
-                    dense_process_group=getattr(ps, "dp_cp_group", None)
-                    or getattr(ps, "dp_group", None),
-                    expert_process_group=getattr(ps, "ep_dp_group", None),
-                    is_expert=classifier,
-                    unit_modules=fsdp_unit_modules,
-                    average_gradients=bool(
-                        _override(opt, "average_in_collective", True)
-                    ),
-                )
-            )
+        )
 
-    params, param_groups, param_names, expert_params = _build_param_groups(
+    params, param_groups, expert_params = _build_param_groups(
         wrapped_chunks,
         classifier=classifier,
         weight_decay=float(getattr(opt, "weight_decay", 0.01)),
@@ -361,7 +328,6 @@ def build_mfsdp_stack(
     standalone_optimizer = _StandaloneOptimizer(
         torch_optimizer,
         params,
-        param_names,
         ps=ps,
         clip_grad=float(getattr(opt, "clip_grad", 1.0)),
         grad_norm_accum_dtype=_override(opt, "grad_norm_accum_dtype", "float32"),
@@ -373,13 +339,9 @@ def build_mfsdp_stack(
             else 1.0
         ),
     )
-    native_chunks = [
-        chunk for chunk in wrapped_chunks if isinstance(chunk, MFSdpModule)
-    ]
-    for chunk in native_chunks:
+    for chunk in wrapped_chunks:
         mark_optimizer_built(chunk)
-    optimizer = MFSdpOptimizer(standalone_optimizer, native_chunks)
-    attach_mfsdp_checkpoint_metadata(optimizer, ps=ps, is_expert=classifier)
+    optimizer = MFSdpOptimizer(standalone_optimizer, wrapped_chunks)
     return wrapped_chunks, optimizer
 
 
@@ -390,42 +352,45 @@ def _mark_mfsdp_parallel_attrs(
     tp_size: int,
     etp_size: int,
 ) -> None:
-    """Preserve MLite TP/SP ownership metadata on standalone optimizer shards."""
+    """Preserve explicit TP/SP ownership metadata on standalone optimizer shards."""
     sp_param_ids = {id(param) for param in getattr(model, "sp_params", ())}
     for name, param in model.named_parameters():
+        expert = classifier(name)
         if not hasattr(param, "allreduce"):
-            param.allreduce = not classifier(name)
+            param.allreduce = not expert
         if id(param) in sp_param_ids:
             param.sequence_parallel = True
             param.tensor_model_parallel = False
             continue
-        if tp_size <= 1 or param.ndim <= 1 or classifier(name):
-            continue
         if bool(getattr(param, "average_gradients_across_tp_domain", False)):
+            param.tensor_model_parallel = False
             continue
         if bool(getattr(param, "sequence_parallel", False)):
+            param.tensor_model_parallel = False
             continue
-        if not hasattr(param, "tensor_model_parallel"):
+        if expert:
+            if etp_size <= 1 or param.ndim <= 1:
+                param.tensor_model_parallel = False
+            elif not hasattr(param, "tensor_model_parallel"):
+                param.tensor_model_parallel = True
+            continue
+        if (
+            tp_size > 1
+            and param.ndim > 1
+            and not hasattr(param, "tensor_model_parallel")
+        ):
             param.tensor_model_parallel = True
-    normalize_mfsdp_expert_tensor_parallel_attrs(
-        model,
-        classifier,
-        etp_size=etp_size,
-    )
 
 
 def build_mfsdp_training_optimizer(
     model_chunks: list[nn.Module],
     *,
-    model_cfg,
     impl_cfg,
     ps,
     is_expert: ExpertClassifierFn | None = None,
     fsdp_unit_modules: tuple[type[nn.Module] | str, ...] | None = None,
-    deterministic: bool | None = None,
 ):
     """Build the native M-FSDP stack from an ``ImplConfig``."""
-    del deterministic
     opt = impl_cfg.optimizer_config
     if opt is None:
         opt = SimpleNamespace(
@@ -446,7 +411,6 @@ def build_mfsdp_training_optimizer(
     )
     model_chunks[:], optimizer = build_mfsdp_stack(
         model_chunks,
-        model_cfg=model_cfg,
         engine_cfg=engine_cfg,
         ps=ps,
         is_expert=is_expert,
@@ -454,15 +418,9 @@ def build_mfsdp_training_optimizer(
     )
 
     def finalize_grads() -> None:
-        finalize_mfsdp_grads(model_chunks, optimizer)
+        optimizer.finish_grad_sync()
 
     return optimizer, finalize_grads
-
-
-def finalize_mfsdp_grads(model_chunks: list[nn.Module], optimizer: Any) -> None:
-    """Finish bucket reduce-scatter work before the optimizer update."""
-    del model_chunks
-    optimizer.finish_grad_sync()
 
 
 def _build_param_groups(
@@ -474,22 +432,19 @@ def _build_param_groups(
 ) -> tuple[
     list[nn.Parameter],
     list[dict[str, Any]],
-    dict[int, str],
     list[nn.Parameter],
 ]:
     params: list[nn.Parameter] = []
     decay_params: list[nn.Parameter] = []
     no_decay_params: list[nn.Parameter] = []
     expert_params: list[nn.Parameter] = []
-    param_names: dict[int, str] = {}
     seen: set[int] = set()
-    for chunk_idx, chunk in enumerate(model_chunks):
+    for chunk in model_chunks:
         for name, param in chunk.named_parameters():
             if not param.requires_grad or id(param) in seen:
                 continue
             seen.add(id(param))
             params.append(param)
-            param_names[id(param)] = f"chunk{chunk_idx}.{name}"
             normalized_name = name.removeprefix("module.")
             if classifier(normalized_name):
                 expert_params.append(param)
@@ -513,7 +468,7 @@ def _build_param_groups(
         )
     if not param_groups:
         raise ValueError("M-FSDP found no trainable parameters.")
-    return params, param_groups, param_names, expert_params
+    return params, param_groups, expert_params
 
 
 def _build_torch_optimizer(
@@ -542,11 +497,3 @@ def _build_torch_optimizer(
             momentum=float(getattr(opt, "sgd_momentum", 0.9)),
         )
     raise ValueError(f"Unsupported M-FSDP optimizer: {optimizer_name!r}.")
-
-
-__all__ = [
-    "MFSdpOptimizer",
-    "build_mfsdp_stack",
-    "build_mfsdp_training_optimizer",
-    "finalize_mfsdp_grads",
-]

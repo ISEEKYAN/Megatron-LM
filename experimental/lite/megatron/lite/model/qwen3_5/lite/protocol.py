@@ -248,12 +248,10 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
             optimizer, finalize = build_mfsdp_training_optimizer(
                 chunks,
-                model_cfg=model_cfg,
                 impl_cfg=impl_cfg,
                 ps=ps,
                 is_expert=is_expert_param,
                 fsdp_unit_modules=(Qwen35Layer,),
-                deterministic=deterministic,
             )
             return {"optimizer": optimizer, "finalize_grads": finalize}
 

@@ -146,7 +146,6 @@ class ParamBucket:
                     requires_grad=spec.full_param.requires_grad,
                 )
                 _copy_parameter_metadata(spec.full_param, shard_param)
-                shard_param._mfsdp_model_param_dtype = spec.full_param.dtype
                 shard_param._mfsdp_original_ndim = spec.full_param.ndim
                 spec.shard_param = shard_param
                 spec.full_param.data = full_view[: spec.numel].view(spec.shape)
@@ -341,11 +340,8 @@ class ParamBucket:
 class ParamSyncPipeline:
     """Schedule bucket all-gathers around module compute in both directions."""
 
-    def __init__(
-        self, buckets: list[ParamBucket], owners: dict[int, list[int]]
-    ) -> None:
+    def __init__(self, buckets: list[ParamBucket]) -> None:
         self.buckets = buckets
-        self.owners = owners
         self._forward_cursor = 0
         self._backward_cursor = len(buckets) - 1
 
@@ -446,7 +442,7 @@ class MFSdpModule(nn.Module):
             unit_modules=unit_modules,
             average_gradients=average_gradients,
         )
-        self.param_sync = ParamSyncPipeline(buckets, owners)
+        self.param_sync = ParamSyncPipeline(buckets)
         for owner_id, bucket_ids in owners.items():
             owner = _module_by_id(module, owner_id)
             owner.register_forward_pre_hook(
@@ -488,9 +484,6 @@ class MFSdpModule(nn.Module):
             self.param_sync.materialize_all()
         elif self.param_sync.buckets:
             self.param_sync.buckets[0].launch_param_gather()
-
-    def install_optimized_model_weights(self) -> None:
-        self.param_sync.materialize_all()
 
     def named_parameters(self, *args, **kwargs) -> Iterator[tuple[str, nn.Parameter]]:
         if not self._expose_sharded_parameters:
@@ -665,6 +658,3 @@ def _free_storage(tensor: torch.Tensor) -> None:
     storage = tensor.untyped_storage()
     if storage.nbytes() != 0:
         storage.resize_(0)
-
-
-__all__ = ["MFSdpModule", "ParamBucket", "ParamSyncPipeline", "mark_optimizer_built"]
