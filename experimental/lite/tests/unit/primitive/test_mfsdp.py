@@ -17,6 +17,7 @@ import torch.multiprocessing as mp
 
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
 from megatron.lite.primitive.optimizers.mfsdp import allocator as mfsdp_allocator
+from megatron.lite.primitive.optimizers.mfsdp import buffer as mfsdp_buffer
 from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
 from megatron.lite.primitive.optimizers import get_optimizer_backend
 from megatron.lite.runtime.contracts.config import ParallelConfig
@@ -663,6 +664,40 @@ def test_mfsdp_bucket_policy_splits_one_unit_without_splitting_parameters():
         ["weight1"],
         ["weight2"],
     ]
+
+
+def test_mfsdp_empty_uneven_shard_stays_inside_local_buffer(monkeypatch):
+    monkeypatch.setattr(mfsdp_buffer, "group_size", lambda _group: 4)
+    monkeypatch.setattr(mfsdp_buffer, "group_rank", lambda _group: 0)
+    model = torch.nn.Module()
+    model.weight0 = torch.nn.Parameter(torch.arange(4.0))
+    model.weight1 = torch.nn.Parameter(torch.arange(4.0))
+    groups = mfsdp_buffer.MFSDPProcessGroups(
+        dense_dp=None,
+        expert_dp=None,
+        dense_ag=None,
+        expert_ag=None,
+        tp=None,
+        etp=None,
+        ep=None,
+        pp=None,
+    )
+    config = mfsdp_config.MFSDPConfig(bucket_size=None)
+
+    buffers = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=groups,
+        config=config,
+        is_expert=lambda _name: False,
+        unit_modules=(),
+    )
+
+    bucket = buffers.buckets[0]
+    assert bucket.local_numel == 2
+    assert bucket.specs[1].shard_numel == 0
+    assert bucket.specs[1].local_offset == bucket.local_numel
+    assert bucket.specs[1].shard_param is not None
+    assert bucket.specs[1].shard_param.numel() == 0
 
 
 def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
