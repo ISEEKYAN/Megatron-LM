@@ -233,12 +233,24 @@ class MFSdpOptimizer:
         self.param_names = optimizer.param_names
         self.model_chunks = model_chunks
         self._mc_pg_collection = None
+        self._grad_sync_enabled = False
+
+    @property
+    def grad_sync_enabled(self) -> bool:
+        return self._grad_sync_enabled
+
+    @grad_sync_enabled.setter
+    def grad_sync_enabled(self, enabled: bool) -> None:
+        self._grad_sync_enabled = bool(enabled)
+        for chunk in self.model_chunks:
+            chunk.param_sync.set_grad_sync_enabled(self._grad_sync_enabled)
 
     @property
     def param_groups(self):
         return self._inner_optimizer.param_groups
 
     def zero_grad(self) -> None:
+        self.grad_sync_enabled = False
         self._inner_optimizer.zero_grad()
         for chunk in self.model_chunks:
             chunk.zero_grad_buffer()
@@ -254,6 +266,7 @@ class MFSdpOptimizer:
         result = self._inner_optimizer.step()
         for chunk in self.model_chunks:
             chunk.param_sync.release_all()
+        self.grad_sync_enabled = False
         return result
 
     def state_dict(self) -> dict[str, Any]:

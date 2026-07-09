@@ -126,6 +126,7 @@ class ParamBucket:
         self._param_gather_work: Any | None = None
         self._grad_reduce_work: Any | None = None
         self._grad_reduce_launched = False
+        self.grad_sync_enabled = False
         self._full_ready = True
         self._grad_ready_ids: set[int] = set()
         self._initialize_parameters()
@@ -260,10 +261,19 @@ class ParamBucket:
             if param.grad is None:
                 return
             self._grad_ready_ids.add(id(spec))
-            if len(self._grad_ready_ids) == len(self.specs):
+            if self.grad_sync_enabled and len(self._grad_ready_ids) == len(self.specs):
                 self.launch_grad_reduce()
 
         return grad_ready
+
+    def set_grad_sync_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled and not self.grad_sync_enabled:
+            # Earlier microbatches may have populated the ready set while their
+            # gradients accumulated locally. Only hooks from the final
+            # microbatch may trigger the overlapping reduce-scatter.
+            self._grad_ready_ids.clear()
+        self.grad_sync_enabled = enabled
 
     def launch_grad_reduce(self, *, force: bool = False) -> None:
         if self._grad_reduce_launched:
@@ -322,6 +332,7 @@ class ParamBucket:
             self._grad_reduce_work.wait()
             self._grad_reduce_work = None
         self._grad_reduce_launched = False
+        self.grad_sync_enabled = False
         self._grad_ready_ids.clear()
         for spec in self.specs:
             spec.full_param.grad = None
@@ -385,6 +396,10 @@ class ParamSyncPipeline:
     def reset_grad_state(self) -> None:
         for bucket in self.buckets:
             bucket.reset_grad_state()
+
+    def set_grad_sync_enabled(self, enabled: bool) -> None:
+        for bucket in self.buckets:
+            bucket.set_grad_sync_enabled(enabled)
 
     def copy_full_parameters_to_shards(self) -> None:
         for bucket in self.buckets:
@@ -582,7 +597,11 @@ def _parameter_owner(
         candidate = module_by_name[candidate_name]
         if isinstance(candidate, unit_types):
             return candidate
-    return parent
+    # Parameters outside an explicit FSDP unit belong to the root unit. Some
+    # model paths (for example fused linear cross entropy) read a leaf module's
+    # weight directly without invoking that leaf, so its pre-hook cannot be the
+    # materialization boundary.
+    return module_by_name[""]
 
 
 def _resolve_module_types(
