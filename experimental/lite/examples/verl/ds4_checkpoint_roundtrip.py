@@ -160,32 +160,39 @@ def _measure_pair(
     weight: torch.Tensor,
     scale: torch.Tensor,
     *,
-    expert_dtype: str,
+    source_expert_dtype: str,
+    target_expert_dtype: str,
     block_shape: tuple[int, int],
     device: torch.device,
 ) -> dict[str, Any]:
     weight = weight.to(device)
     scale = scale.to(device)
-    if expert_dtype == "fp4" and is_routed_expert(name):
+    routed_expert = is_routed_expert(name)
+    if source_expert_dtype == "fp4" and routed_expert:
         if weight.dtype != torch.int8:
             raise ValueError(
                 f"MXFP4 tensor {name} has unsupported dtype {weight.dtype}"
             )
-        kind = "mxfp4"
+        source_kind = "mxfp4"
         original = dequantize_mxfp4(weight, scale)
-        requantized, requantized_scale = quantize_mxfp4(original.to(torch.bfloat16))
-        restored = dequantize_mxfp4(requantized, requantized_scale)
     else:
         if weight.dtype != torch.float8_e4m3fn:
             raise ValueError(
                 f"block-FP8 tensor {name} has unsupported dtype {weight.dtype}"
             )
-        kind = "block_fp8"
+        source_kind = "block_fp8"
         original = dequantize_block_fp8(weight, scale, block_shape)
+
+    if target_expert_dtype == "fp4" and routed_expert:
+        target_kind = "mxfp4"
+        requantized, requantized_scale = quantize_mxfp4(original.to(torch.bfloat16))
+        restored = dequantize_mxfp4(requantized, requantized_scale)
+    else:
+        target_kind = "block_fp8"
         requantized, requantized_scale = quantize_block_fp8(
             original.to(torch.bfloat16),
             block_shape,
-            scale_format="float32" if expert_dtype == "fp8" else "e8m0",
+            scale_format="float32" if target_expert_dtype == "fp8" else "e8m0",
         )
         restored = dequantize_block_fp8(requantized, requantized_scale, block_shape)
 
@@ -193,22 +200,29 @@ def _measure_pair(
     source_l2_sq = float(original.square().sum().item())
     diff_l2_sq = float(difference.square().sum().item())
     relative_l2 = math.sqrt(diff_l2_sq / source_l2_sq) if source_l2_sq else 0.0
-    scale_mismatched, scale_total = _byte_mismatch(scale, requantized_scale)
-    weight_mismatched, weight_total = _byte_mismatch(weight, requantized)
-    return {
-        "diff_l2_sq": diff_l2_sq,
-        "kind": kind,
-        "max_abs": float(difference.abs().max().item()),
-        "relative_l2": relative_l2,
-        "scale_byte_mismatch": {
+    serialization_comparable = source_expert_dtype == target_expert_dtype
+    if serialization_comparable:
+        scale_mismatched, scale_total = _byte_mismatch(scale, requantized_scale)
+        weight_mismatched, weight_total = _byte_mismatch(weight, requantized)
+        scale_byte_mismatch = {
             "mismatched": scale_mismatched,
             "total": scale_total,
-        },
-        "source_l2_sq": source_l2_sq,
-        "weight_byte_mismatch": {
+        }
+        weight_byte_mismatch = {
             "mismatched": weight_mismatched,
             "total": weight_total,
-        },
+        }
+    else:
+        scale_byte_mismatch = None
+        weight_byte_mismatch = None
+    return {
+        "diff_l2_sq": diff_l2_sq,
+        "kind": f"{source_kind}_to_{target_kind}",
+        "max_abs": float(difference.abs().max().item()),
+        "relative_l2": relative_l2,
+        "scale_byte_mismatch": scale_byte_mismatch,
+        "source_l2_sq": source_l2_sq,
+        "weight_byte_mismatch": weight_byte_mismatch,
     }
 
 
@@ -237,24 +251,36 @@ def _aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         "tensor_count": len(records),
     }
     for field in ("scale_byte_mismatch", "weight_byte_mismatch"):
-        mismatched = sum(record[field]["mismatched"] for record in records)
-        total = sum(record[field]["total"] for record in records)
-        output[field] = {
-            "mismatched": mismatched,
-            "rate": mismatched / total if total else 0.0,
-            "total": total,
-        }
+        comparable = [record[field] for record in records if record[field] is not None]
+        if not comparable:
+            output[field] = None
+        else:
+            mismatched = sum(record["mismatched"] for record in comparable)
+            total = sum(record["total"] for record in comparable)
+            output[field] = {
+                "mismatched": mismatched,
+                "rate": mismatched / total if total else 0.0,
+                "total": total,
+            }
     return output
 
 
-def run_roundtrip(checkpoint: str | Path, *, device: str = "cpu") -> dict[str, Any]:
+def run_roundtrip(
+    checkpoint: str | Path,
+    *,
+    device: str = "cpu",
+    target_expert_dtype: str | None = None,
+) -> dict[str, Any]:
     checkpoint = Path(checkpoint)
     config = json.loads((checkpoint / "config.json").read_text())
-    expert_dtype = config.get("expert_dtype") or (
+    source_expert_dtype = config.get("expert_dtype") or (
         config.get("quantization_config") or {}
     ).get("expert_dtype", "fp4")
-    if expert_dtype not in {"fp4", "fp8"}:
-        raise ValueError(f"unsupported expert_dtype={expert_dtype!r}")
+    target_expert_dtype = target_expert_dtype or source_expert_dtype
+    if source_expert_dtype not in {"fp4", "fp8"}:
+        raise ValueError(f"unsupported source expert_dtype={source_expert_dtype!r}")
+    if target_expert_dtype not in {"fp4", "fp8"}:
+        raise ValueError(f"unsupported target expert_dtype={target_expert_dtype!r}")
     raw_block_shape = (config.get("quantization_config") or {}).get(
         "weight_block_size", [128, 128]
     )
@@ -291,7 +317,8 @@ def run_roundtrip(checkpoint: str | Path, *, device: str = "cpu") -> dict[str, A
                     name,
                     handle.get_tensor(name),
                     handle.get_tensor(_scale_name(name)),
-                    expert_dtype=expert_dtype,
+                    source_expert_dtype=source_expert_dtype,
+                    target_expert_dtype=target_expert_dtype,
                     block_shape=block_shape,
                     device=target_device,
                 )
@@ -299,9 +326,9 @@ def run_roundtrip(checkpoint: str | Path, *, device: str = "cpu") -> dict[str, A
                 record["name"] = name
                 records.append(record)
 
+    kinds = sorted({record["kind"] for record in records})
     by_kind = {
-        kind: [record for record in records if record["kind"] == kind]
-        for kind in ("block_fp8", "mxfp4")
+        kind: [record for record in records if record["kind"] == kind] for kind in kinds
     }
     layers: dict[str, Any] = {}
     for layer in sorted({record["layer"] for record in records}):
@@ -309,12 +336,14 @@ def run_roundtrip(checkpoint: str | Path, *, device: str = "cpu") -> dict[str, A
             kind: _aggregate(
                 [record for record in by_kind[kind] if record["layer"] == layer]
             )
-            for kind in ("block_fp8", "mxfp4")
+            for kind in kinds
         }
     return {
         "audit": audit,
         "checkpoint": str(checkpoint.resolve()),
-        "expert_dtype": expert_dtype,
+        "schema_version": 2,
+        "source_expert_dtype": source_expert_dtype,
+        "target_expert_dtype": target_expert_dtype,
         "layers": layers,
         "shard_count": len(shards),
         "summary": {kind: _aggregate(by_kind[kind]) for kind in by_kind},
@@ -328,8 +357,13 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--target-expert-dtype", choices=("fp4", "fp8"))
     args = parser.parse_args()
-    report = run_roundtrip(args.checkpoint, device=args.device)
+    report = run_roundtrip(
+        args.checkpoint,
+        device=args.device,
+        target_expert_dtype=args.target_expert_dtype,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report["summary"], sort_keys=True))

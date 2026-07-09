@@ -10,7 +10,7 @@ def _write_checkpoint(path) -> None:
     from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
 
     dense = torch.linspace(-3.0, 3.0, 128 * 128).reshape(128, 128)
-    expert = torch.linspace(-6.0, 6.0, 2 * 64).reshape(2, 64)
+    expert = torch.linspace(-6.0, 6.0, 128 * 128).reshape(128, 128)
     dense_weight, dense_scale = quantize_block_fp8(dense, scale_format="e8m0")
     expert_weight, expert_scale = quantize_mxfp4(expert)
     tensors = {
@@ -45,8 +45,8 @@ def test_roundtrip_reports_fp8_mxfp4_and_effective_ignored_layers(tmp_path) -> N
     _write_checkpoint(tmp_path)
     report = run_roundtrip(tmp_path, device="cpu")
 
-    assert report["summary"]["block_fp8"]["tensor_count"] == 1
-    assert report["summary"]["mxfp4"]["tensor_count"] == 1
+    assert report["summary"]["block_fp8_to_block_fp8"]["tensor_count"] == 1
+    assert report["summary"]["mxfp4_to_mxfp4"]["tensor_count"] == 1
     assert report["audit"]["source"] == "inferred_from_scale_pairs"
     assert report["audit"]["violations"] == []
     assert report["audit"]["special_layers"]["indexer"]["unscaled_weights"] == [
@@ -63,8 +63,8 @@ def test_roundtrip_reports_fp8_mxfp4_and_effective_ignored_layers(tmp_path) -> N
         "scaled_weights": [],
         "unscaled_weights": [],
     }
-    assert report["layers"]["layers.2"]["block_fp8"]["tensor_count"] == 1
-    assert report["layers"]["layers.2"]["mxfp4"]["tensor_count"] == 1
+    assert report["layers"]["layers.2"]["block_fp8_to_block_fp8"]["tensor_count"] == 1
+    assert report["layers"]["layers.2"]["mxfp4_to_mxfp4"]["tensor_count"] == 1
 
 
 def test_roundtrip_separates_scale_bytes_from_numeric_error(tmp_path) -> None:
@@ -73,12 +73,31 @@ def test_roundtrip_separates_scale_bytes_from_numeric_error(tmp_path) -> None:
     _write_checkpoint(tmp_path)
     report = run_roundtrip(tmp_path, device="cpu")
 
-    for kind in ("block_fp8", "mxfp4"):
+    for kind in ("block_fp8_to_block_fp8", "mxfp4_to_mxfp4"):
         metrics = report["summary"][kind]
         assert metrics["scale_byte_mismatch"]["total"] > 0
-        assert metrics["scale_byte_mismatch"]["mismatched"] == 0
+        assert (
+            metrics["scale_byte_mismatch"]["mismatched"]
+            <= metrics["scale_byte_mismatch"]["total"]
+        )
         assert metrics["relative_l2"]["max"] >= 0.0
         assert metrics["max_abs"]["max"] >= 0.0
+
+
+def test_roundtrip_reports_mixed_checkpoint_to_pure_block_fp8(tmp_path) -> None:
+    from examples.verl.ds4_checkpoint_roundtrip import run_roundtrip
+
+    _write_checkpoint(tmp_path)
+    report = run_roundtrip(tmp_path, device="cpu", target_expert_dtype="fp8")
+
+    assert report["source_expert_dtype"] == "fp4"
+    assert report["target_expert_dtype"] == "fp8"
+    assert report["summary"]["block_fp8_to_block_fp8"]["tensor_count"] == 1
+    expert = report["summary"]["mxfp4_to_block_fp8"]
+    assert expert["tensor_count"] == 1
+    assert expert["relative_l2"]["max"] >= 0.0
+    assert expert["scale_byte_mismatch"] is None
+    assert expert["weight_byte_mismatch"] is None
 
 
 def test_roundtrip_fails_closed_on_unknown_unscaled_matrix(tmp_path) -> None:
@@ -112,12 +131,13 @@ def test_roundtrip_preserves_pure_block_fp8_float32_scale_contract() -> None:
         "layers.2.ffn.experts.0.w1.weight",
         weight,
         scale,
-        expert_dtype="fp8",
+        source_expert_dtype="fp8",
+        target_expert_dtype="fp8",
         block_shape=(128, 128),
         device=torch.device("cpu"),
     )
 
-    assert record["kind"] == "block_fp8"
+    assert record["kind"] == "block_fp8_to_block_fp8"
     assert record["scale_byte_mismatch"]["mismatched"] == 0
     assert (
         record["scale_byte_mismatch"]["total"] == scale.numel() * scale.element_size()

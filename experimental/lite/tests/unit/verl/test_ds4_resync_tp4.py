@@ -117,8 +117,8 @@ def test_three_arm_comparison_reports_fp32_bf16_and_dapo_gate() -> None:
     from examples.verl.ds4_resync_tp4 import compare_three_arms
 
     base = torch.log_softmax(torch.tensor([[1.0, 2.0, 3.0]]), dim=-1)
-    direct = [{"token_ids": torch.tensor([2]), "logprobs": base}]
-    resync = [
+    cold = [{"token_ids": torch.tensor([2]), "logprobs": base}]
+    online = [
         {
             "token_ids": torch.tensor([2]),
             "logprobs": torch.log_softmax(torch.tensor([[1.0, 2.0, 3.0001]]), dim=-1),
@@ -131,14 +131,14 @@ def test_three_arm_comparison_reports_fp32_bf16_and_dapo_gate() -> None:
         }
     ]
 
-    report = compare_three_arms(direct, resync, mlite, minimum_prompts=1)
+    report = compare_three_arms(cold, online, mlite, minimum_prompts=1)
 
     assert set(report["pairs"]) == {
-        "vllm_direct__vllm_resync",
-        "vllm_direct__mlite_bf16",
-        "vllm_resync__mlite_bf16",
+        "vllm_fp8_cold__vllm_fp8_online",
+        "mlite_bf16__vllm_fp8_cold",
+        "mlite_bf16__vllm_fp8_online",
     }
-    pair = report["pairs"]["vllm_direct__vllm_resync"]
+    pair = report["pairs"]["vllm_fp8_cold__vllm_fp8_online"]
     assert pair["fp32"]["max_ratio_deviation"] > 0
     assert pair["bf16_rounded"]["max_ratio_deviation"] >= 0
     assert report["gate"]["acceptable"] is True
@@ -173,16 +173,18 @@ def test_copy_checkpoint_metadata_recurses_but_excludes_weights(tmp_path) -> Non
     (source / "inference").mkdir()
     (source / "inference" / "model.py").write_text("class Model: pass\n")
     (source / "model.safetensors").write_bytes(b"weights")
+    (source / "model.safetensors.index.json").write_text('{"stale": true}')
     copy_checkpoint_metadata(source, output)
     assert (output / "config.json").read_text() == "{}"
     assert (output / "inference" / "model.py").read_text() == "class Model: pass\n"
     assert not (output / "model.safetensors").exists()
+    assert not (output / "model.safetensors.index.json").exists()
 
 
-def test_convert_materializes_pure_fp8_expert_checkpoint(tmp_path) -> None:
-    from safetensors.torch import load_file, save_file
+def test_runtime_export_writes_pure_fp8_shards_and_index(tmp_path) -> None:
+    from safetensors.torch import load_file
 
-    from examples.verl.ds4_resync_tp4 import convert
+    from examples.verl.ds4_resync_tp4 import write_exported_checkpoint
     from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
 
     source = tmp_path / "source"
@@ -197,29 +199,79 @@ def test_convert_materializes_pure_fp8_expert_checkpoint(tmp_path) -> None:
         },
     }
     (source / "config.json").write_text(json.dumps(config))
+    (source / "model.safetensors.index.json").write_text('{"stale": true}')
     dense = torch.linspace(-2.0, 2.0, 128 * 128).reshape(128, 128)
     expert = torch.linspace(-4.0, 4.0, 128 * 128).reshape(128, 128)
     dense_weight, dense_scale = quantize_block_fp8(dense, scale_format="float32")
     expert_weight, expert_scale = quantize_block_fp8(expert, scale_format="float32")
-    save_file(
-        {
-            "layers.2.attn.wo.weight": dense_weight,
-            "layers.2.attn.wo.scale": dense_scale,
-            "layers.2.ffn.experts.0.w1.weight": expert_weight,
-            "layers.2.ffn.experts.0.w1.scale": expert_scale,
-        },
-        source / "model.safetensors",
+    weights = iter(
+        [
+            ("layers.2.attn.wo.weight", dense_weight),
+            ("layers.2.attn.wo.scale", dense_scale),
+            ("layers.2.ffn.experts.0.w1.weight", expert_weight),
+            ("layers.2.ffn.experts.0.w1.scale", expert_scale),
+        ]
     )
 
-    convert(source, output, "cpu")
+    write_exported_checkpoint(
+        weights,
+        source,
+        output,
+        max_shard_bytes=dense_weight.numel() * dense_weight.element_size() + 1,
+    )
 
     converted_config = json.loads((output / "config.json").read_text())
-    tensors = load_file(output / "model.safetensors")
+    index = json.loads((output / "model.safetensors.index.json").read_text())
     assert converted_config["expert_dtype"] == "fp8"
+    assert converted_config["quantization_config"]["scale_fmt"] == "float32"
+    assert len(set(index["weight_map"].values())) >= 2
+    tensors = {}
+    for shard in set(index["weight_map"].values()):
+        tensors.update(load_file(output / shard))
     assert tensors["layers.2.attn.wo.weight"].dtype == torch.float8_e4m3fn
     assert tensors["layers.2.attn.wo.scale"].dtype == torch.float32
     assert tensors["layers.2.ffn.experts.0.w1.weight"].dtype == torch.float8_e4m3fn
     assert tensors["layers.2.ffn.experts.0.w1.scale"].dtype == torch.float32
+
+
+def test_pure_fp8_export_hook_changes_export_contract_only() -> None:
+    from types import SimpleNamespace
+
+    from examples.verl.ds4_resync_tp4 import configure_pure_block_fp8_export
+
+    model_config = SimpleNamespace(
+        expert_dtype="fp4",
+        quantization_config={
+            "quant_method": "fp8",
+            "scale_fmt": "ue8m0",
+            "weight_block_size": [128, 128],
+        },
+    )
+
+    configured = configure_pure_block_fp8_export(model_config)
+
+    assert configured is model_config
+    assert configured.expert_dtype == "fp8"
+    assert configured.quantization_config == {
+        "expert_dtype": "fp8",
+        "quant_method": "fp8",
+        "scale_fmt": "float32",
+        "weight_block_size": [128, 128],
+    }
+
+
+def test_formal_sbatch_uses_mixed_source_for_mlite_and_fp8_artifact_for_vllm() -> None:
+    script = (
+        __import__("pathlib").Path(__file__).parents[3]
+        / "examples/verl/slurm/run_ds4_resync_tp4.sbatch"
+    ).read_text()
+
+    assert "collect-mlite" in script
+    assert "--model '${CHECKPOINT_DIR}'" in script
+    assert "--fp8-output '${RESYNC_DIR}'" in script
+    assert "collect --model '${RESYNC_DIR}'" in script
+    assert "--resync-model '${RESYNC_DIR}'" in script
+    assert "convert --source" not in script
 
 
 def test_model_vocab_size_includes_non_tokenizer_slots() -> None:

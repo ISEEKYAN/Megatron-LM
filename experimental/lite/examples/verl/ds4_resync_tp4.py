@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Full-checkpoint DeepSeek-V4 TP4 resync parity validation."""
+"""Validate DS4 mixed-checkpoint MLite BF16 export against a pure-FP8 rollout."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import copy
 import json
 import os
 import shutil
+from collections.abc import Iterable
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -21,6 +21,7 @@ _DAPO_MAX_RATIO_LIMIT = 0.05
 _DAPO_P99_KL_LIMIT = 1e-4
 _DAPO_CLIP_LOW = 0.8
 _DAPO_CLIP_HIGH = 1.2
+_DEFAULT_MAX_SHARD_BYTES = 5 * 1024**3
 
 
 def math_prompts() -> list[str]:
@@ -82,6 +83,18 @@ def pure_block_fp8_config(config: dict[str, Any]) -> dict[str, Any]:
     quantization["expert_dtype"] = "fp8"
     quantization["scale_fmt"] = "float32"
     return result
+
+
+def configure_pure_block_fp8_export(model_config: Any) -> Any:
+    """Keep the loaded BF16 master intact while selecting pure FP8 serialization."""
+    quantization = copy.deepcopy(getattr(model_config, "quantization_config", None))
+    if not isinstance(quantization, dict) or not quantization:
+        raise ValueError("DeepSeek-V4 pure FP8 export requires quantization_config")
+    model_config.expert_dtype = "fp8"
+    quantization["expert_dtype"] = "fp8"
+    quantization["scale_fmt"] = "float32"
+    model_config.quantization_config = quantization
+    return model_config
 
 
 def payload_row(
@@ -185,21 +198,25 @@ def compare_distributions(
 
 
 def compare_three_arms(
-    vllm_direct: list[dict[str, torch.Tensor]],
-    vllm_resync: list[dict[str, torch.Tensor]],
+    vllm_fp8_cold: list[dict[str, torch.Tensor]],
+    vllm_fp8_online: list[dict[str, torch.Tensor]],
     mlite_bf16: list[dict[str, torch.Tensor]],
     *,
     minimum_prompts: int = 32,
 ) -> dict[str, Any]:
-    if len(vllm_direct) < minimum_prompts:
+    if len(vllm_fp8_cold) < minimum_prompts:
         raise ValueError(
             f"three-arm parity requires at least {minimum_prompts} prompts, "
-            f"got {len(vllm_direct)}"
+            f"got {len(vllm_fp8_cold)}"
         )
     pairs = {
-        "vllm_direct__vllm_resync": compare_distributions(vllm_direct, vllm_resync),
-        "vllm_direct__mlite_bf16": compare_distributions(vllm_direct, mlite_bf16),
-        "vllm_resync__mlite_bf16": compare_distributions(vllm_resync, mlite_bf16),
+        "vllm_fp8_cold__vllm_fp8_online": compare_distributions(
+            vllm_fp8_cold, vllm_fp8_online
+        ),
+        "mlite_bf16__vllm_fp8_cold": compare_distributions(mlite_bf16, vllm_fp8_cold),
+        "mlite_bf16__vllm_fp8_online": compare_distributions(
+            mlite_bf16, vllm_fp8_online
+        ),
     }
     failures = []
     for name, pair in pairs.items():
@@ -213,7 +230,12 @@ def compare_three_arms(
         if metrics["clipping_boundary_crossings"]:
             failures.append(f"{name}: clipping boundary crossings")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
+        "arm_semantics": {
+            "mlite_bf16": "official mixed checkpoint loaded into the MLite BF16 master",
+            "vllm_fp8_cold": "pure block-FP8 artifact exported from that BF16 master",
+            "vllm_fp8_online": "the same pure block-FP8 export reloaded online",
+        },
         "pairs": pairs,
         "gate": {
             "acceptable": not failures,
@@ -233,8 +255,74 @@ def copy_checkpoint_metadata(source: Path, output: Path) -> None:
     for path in source.iterdir():
         if path.is_dir():
             shutil.copytree(path, output / path.name, dirs_exist_ok=True)
-        elif path.suffix != ".safetensors":
+        elif (
+            path.suffix != ".safetensors"
+            and path.name != "model.safetensors.index.json"
+        ):
             shutil.copy2(path, output / path.name)
+
+
+def write_exported_checkpoint(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    source: Path,
+    output: Path,
+    *,
+    max_shard_bytes: int = _DEFAULT_MAX_SHARD_BYTES,
+) -> None:
+    """Write a bounded-memory runtime export as indexed safetensor shards."""
+    from safetensors.torch import save_file
+
+    if max_shard_bytes <= 0:
+        raise ValueError("max_shard_bytes must be positive")
+    output.mkdir(parents=True, exist_ok=False)
+    copy_checkpoint_metadata(source, output)
+    source_config = json.loads((source / "config.json").read_text())
+    (output / "config.json").write_text(
+        json.dumps(pure_block_fp8_config(source_config), indent=2, sort_keys=True)
+        + "\n"
+    )
+
+    pending: list[tuple[Path, list[str], int]] = []
+    bucket: dict[str, torch.Tensor] = {}
+    bucket_bytes = 0
+    seen: set[str] = set()
+
+    def flush() -> None:
+        nonlocal bucket, bucket_bytes
+        if not bucket:
+            return
+        path = output / f"model-{len(pending) + 1:05d}.safetensors"
+        save_file(bucket, path)
+        pending.append((path, list(bucket), bucket_bytes))
+        bucket = {}
+        bucket_bytes = 0
+
+    for name, tensor in weights:
+        if name in seen:
+            raise ValueError(f"duplicate exported checkpoint tensor: {name}")
+        seen.add(name)
+        tensor = tensor.detach().to(device="cpu").contiguous()
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        if bucket and bucket_bytes + tensor_bytes > max_shard_bytes:
+            flush()
+        bucket[name] = tensor
+        bucket_bytes += tensor_bytes
+    flush()
+    if not pending:
+        raise ValueError("MLite runtime export produced no checkpoint tensors")
+
+    weight_map: dict[str, str] = {}
+    total_size = 0
+    shard_count = len(pending)
+    for index, (temporary, names, shard_bytes) in enumerate(pending, 1):
+        filename = f"model-{index:05d}-of-{shard_count:05d}.safetensors"
+        temporary.replace(output / filename)
+        weight_map.update(dict.fromkeys(names, filename))
+        total_size += shard_bytes
+    index = {"metadata": {"total_size": total_size}, "weight_map": weight_map}
+    (output / "model.safetensors.index.json").write_text(
+        json.dumps(index, indent=2, sort_keys=True) + "\n"
+    )
 
 
 def model_vocab_size(config: Any, tokenizer: Any) -> int:
@@ -267,6 +355,14 @@ def require_pure_block_fp8_checkpoint(model: Path) -> None:
     if expert_dtype != "fp8":
         raise ValueError(
             f"formal DS4 parity requires expert_dtype='fp8', got {expert_dtype!r}"
+        )
+
+
+def require_mixed_flash_checkpoint(model: Path) -> None:
+    expert_dtype = _checkpoint_expert_dtype(model)
+    if expert_dtype != "fp4":
+        raise ValueError(
+            f"formal DS4 MLite source requires expert_dtype='fp4', got {expert_dtype!r}"
         )
 
 
@@ -328,23 +424,23 @@ def collect(
     rows = _collect_vllm_rows(llm, tokenizer, vocab_size)
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(rows, output)
-    print(f"DS4_TP4_DIRECT_COLLECT_COMPLETE={output}", flush=True)
+    print(f"DS4_TP4_FP8_COLD_COLLECT_COMPLETE={output}", flush=True)
     if resync_model is not None and resync_output is not None:
         reload_resync_checkpoint(llm, resync_model)
         resync_rows = _collect_vllm_rows(llm, tokenizer, vocab_size)
         torch.save(resync_rows, resync_output)
-        print(f"DS4_TP4_ONLINE_RESYNC_COMPLETE={resync_output}", flush=True)
+        print(f"DS4_TP4_FP8_ONLINE_RELOAD_COMPLETE={resync_output}", flush=True)
 
 
-def collect_mlite(model: Path, output: Path) -> None:
-    """Run official full-model MLite BF16 forward on four EP ranks."""
+def collect_mlite(model: Path, output: Path, fp8_output: Path) -> None:
+    """Load official mixed weights into MLite, run BF16 forward, and export FP8."""
     from transformers import AutoConfig, AutoTokenizer
 
     from megatron.lite.runtime import RuntimeConfig, create_runtime
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
     from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
 
-    require_pure_block_fp8_checkpoint(model)
+    require_mixed_flash_checkpoint(model)
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
@@ -365,6 +461,7 @@ def collect_mlite(model: Path, output: Path) -> None:
         parallel=ParallelConfig(tp=1, etp=1, ep=4, pp=1, vpp=1, cp=1),
         attention_backend_override="fused",
         load_hf_weights=True,
+        model_config_hook=configure_pure_block_fp8_export,
         impl_cfg={
             "optimizer": None,
             "mtp_enable": False,
@@ -407,71 +504,26 @@ def collect_mlite(model: Path, output: Path) -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         torch.save(rows, output)
         print(f"DS4_MLITE_BF16_FORWARD_COMPLETE={output}", flush=True)
+
+    weights = runtime.export_weights(
+        handle,
+        target="vllm_checkpoint",
+        export_dtype="bfloat16",
+        rank0_only=True,
+    )
+    if dist.get_rank() == 0:
+        write_exported_checkpoint(weights, model, fp8_output)
+        print(f"DS4_MLITE_PURE_FP8_EXPORT_COMPLETE={fp8_output}", flush=True)
+    else:
+        for _ in weights:
+            raise AssertionError("rank0_only MLite export yielded on a nonzero rank")
     dist.barrier()
 
 
-def convert(source: Path, output: Path, device: str) -> None:
-    """Materialize the MLite BF16 -> pure block-FP8 arm one shard at a time."""
-    from safetensors import safe_open
-    from safetensors.torch import save_file
-
-    from examples.verl.ds4_checkpoint_roundtrip import _checkpoint_index, _scale_name
-    from megatron.lite.model.deepseek_v4.lite.resync import (
-        export_resync_weights,
-        is_routed_expert,
-    )
-    from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
-    from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
-
-    source_config = json.loads((source / "config.json").read_text())
-    target_config = pure_block_fp8_config(source_config)
-    config = SimpleNamespace(**target_config)
-    quantization = source_config["quantization_config"]
-    block_shape = tuple(quantization.get("weight_block_size", (128, 128)))
-    source_expert_dtype = source_config.get("expert_dtype", "fp4")
-    weight_map, shards = _checkpoint_index(source)
-    names = set(weight_map)
-    output.mkdir(parents=True, exist_ok=True)
-    copy_checkpoint_metadata(source, output)
-    (output / "config.json").write_text(
-        json.dumps(target_config, indent=2, sort_keys=True) + "\n"
-    )
-    target_device = torch.device(device)
-    for shard_index, shard in enumerate(shards, 1):
-        converted: dict[str, torch.Tensor] = {}
-        with safe_open(source / shard, framework="pt", device="cpu") as handle:
-            metadata = handle.metadata()
-            for name in handle.keys():
-                if name.endswith(".scale"):
-                    continue
-                tensor = handle.get_tensor(name)
-                scale_name = _scale_name(name) if name.endswith(".weight") else ""
-                if scale_name not in names:
-                    converted[name] = tensor
-                    continue
-                scale = handle.get_tensor(scale_name)
-                if source_expert_dtype == "fp4" and is_routed_expert(name):
-                    bf16 = dequantize_mxfp4(
-                        tensor.to(target_device), scale.to(target_device)
-                    ).to(torch.bfloat16)
-                else:
-                    bf16 = dequantize_block_fp8(
-                        tensor.to(target_device), scale.to(target_device), block_shape
-                    ).to(torch.bfloat16)
-                for out_name, out_tensor in export_resync_weights(
-                    [(name, bf16)], config
-                ):
-                    converted[out_name] = out_tensor.cpu()
-                del bf16
-        save_file(converted, output / shard, metadata=metadata)
-        print(f"DS4_RESYNC_SHARD={shard_index}/{len(shards)}:{shard}", flush=True)
-    print("DS4_RESYNC_CHECKPOINT_COMPLETE", flush=True)
-
-
-def compare(reference: Path, candidate: Path, mlite: Path, output: Path) -> None:
+def compare(cold: Path, online: Path, mlite: Path, output: Path) -> None:
     report = compare_three_arms(
-        torch.load(reference, weights_only=True),
-        torch.load(candidate, weights_only=True),
+        torch.load(cold, weights_only=True),
+        torch.load(online, weights_only=True),
         torch.load(mlite, weights_only=True),
     )
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
@@ -492,13 +544,10 @@ def main() -> None:
     mlite_parser = subparsers.add_parser("collect-mlite")
     mlite_parser.add_argument("--model", type=Path, required=True)
     mlite_parser.add_argument("--output", type=Path, required=True)
-    convert_parser = subparsers.add_parser("convert")
-    convert_parser.add_argument("--source", type=Path, required=True)
-    convert_parser.add_argument("--output", type=Path, required=True)
-    convert_parser.add_argument("--device", default="cuda:0")
+    mlite_parser.add_argument("--fp8-output", type=Path, required=True)
     compare_parser = subparsers.add_parser("compare")
-    compare_parser.add_argument("--reference", type=Path, required=True)
-    compare_parser.add_argument("--candidate", type=Path, required=True)
+    compare_parser.add_argument("--cold", type=Path, required=True)
+    compare_parser.add_argument("--online", type=Path, required=True)
     compare_parser.add_argument("--mlite", type=Path, required=True)
     compare_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -513,11 +562,9 @@ def main() -> None:
             resync_output=args.resync_output,
         )
     elif args.command == "collect-mlite":
-        collect_mlite(args.model, args.output)
-    elif args.command == "convert":
-        convert(args.source, args.output, args.device)
+        collect_mlite(args.model, args.output, args.fp8_output)
     else:
-        compare(args.reference, args.candidate, args.mlite, args.output)
+        compare(args.cold, args.online, args.mlite, args.output)
 
 
 if __name__ == "__main__":

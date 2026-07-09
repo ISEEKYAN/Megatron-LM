@@ -34,9 +34,9 @@ run_container() {
 }
 
 if [[ "${COMPARE_ONLY:-0}" == 1 ]]; then
-  [[ -s "${OUTPUT_DIR}/direct.pt" && -s "${OUTPUT_DIR}/resync.pt" \
+  [[ -s "${OUTPUT_DIR}/cold-load.pt" && -s "${OUTPUT_DIR}/online-reload.pt" \
     && -s "${OUTPUT_DIR}/mlite.pt" ]] || {
-    echo "COMPARE_ONLY requires non-empty direct.pt, resync.pt, and mlite.pt" >&2
+    echo "COMPARE_ONLY requires cold-load.pt, online-reload.pt, and mlite.pt" >&2
     exit 6
   }
 else
@@ -45,25 +45,24 @@ else
     exit 5
   }
   run_container "${MLITE_OVERLAY}" \
-    "CUDA_VISIBLE_DEVICES=0 python -m examples.verl.ds4_resync_tp4 \
-      verify --model '${CHECKPOINT_DIR}'"
-  run_container "${MLITE_OVERLAY}" \
     "CUDA_VISIBLE_DEVICES=0 python -m examples.verl.ds4_checkpoint_roundtrip \
-      --checkpoint '${CHECKPOINT_DIR}' --output '${OUTPUT_DIR}/weight-report.json'"
-  run_container "${MLITE_OVERLAY}" \
-    "CUDA_VISIBLE_DEVICES=0 python -m examples.verl.ds4_resync_tp4 \
-      convert --source '${CHECKPOINT_DIR}' --output '${RESYNC_DIR}'"
-  run_container "${VLLM_OVERLAY}" \
-    "python -m examples.verl.ds4_resync_tp4 collect \
-      --model '${CHECKPOINT_DIR}' --output '${OUTPUT_DIR}/direct.pt' \
-      --resync-model '${RESYNC_DIR}' --resync-output '${OUTPUT_DIR}/resync.pt'"
+      --checkpoint '${CHECKPOINT_DIR}' --target-expert-dtype fp8 \
+      --output '${OUTPUT_DIR}/weight-report.json'"
   run_container "${MLITE_OVERLAY}" \
     "python -m torch.distributed.run --standalone --nproc_per_node=4 \
       -m examples.verl.ds4_resync_tp4 collect-mlite \
-      --model '${CHECKPOINT_DIR}' --output '${OUTPUT_DIR}/mlite.pt'"
+      --model '${CHECKPOINT_DIR}' --output '${OUTPUT_DIR}/mlite.pt' \
+      --fp8-output '${RESYNC_DIR}'"
+  run_container "${MLITE_OVERLAY}" \
+    "CUDA_VISIBLE_DEVICES=0 python -m examples.verl.ds4_resync_tp4 \
+      verify --model '${RESYNC_DIR}'"
+  run_container "${VLLM_OVERLAY}" \
+    "python -m examples.verl.ds4_resync_tp4 collect --model '${RESYNC_DIR}' \
+      --output '${OUTPUT_DIR}/cold-load.pt' --resync-model '${RESYNC_DIR}' \
+      --resync-output '${OUTPUT_DIR}/online-reload.pt'"
 fi
 run_container "${MLITE_OVERLAY}" \
   "CUDA_VISIBLE_DEVICES=0 python -m examples.verl.ds4_resync_tp4 \
-    compare --reference '${OUTPUT_DIR}/direct.pt' \
-    --candidate '${OUTPUT_DIR}/resync.pt' --mlite '${OUTPUT_DIR}/mlite.pt' \
+    compare --cold '${OUTPUT_DIR}/cold-load.pt' \
+    --online '${OUTPUT_DIR}/online-reload.pt' --mlite '${OUTPUT_DIR}/mlite.pt' \
     --output '${OUTPUT_DIR}/report.json'"
