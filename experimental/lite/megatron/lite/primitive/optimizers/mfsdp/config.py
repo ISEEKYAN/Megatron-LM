@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any
+
+import torch
 
 _SUPPORTED_OPTIMIZERS = {"adam", "sgd"}
 _REQUIRED_DDP_KNOB_VALUES = {
@@ -15,6 +18,115 @@ _UNSUPPORTED_OPTIMIZATION_KNOBS = {
     "use_hsdp",
     "hsdp",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class MFSDPConfig:
+    """Narrow configuration owned by the standalone M-FSDP primitive.
+
+    The fields are the subset of Megatron-FSDP that MLite exercises.  Keeping
+    this contract local avoids importing the much broader MCore DDP config and
+    makes unsupported sharding modes fail before any buffers are allocated.
+    """
+
+    sharding_strategy: str = "optim_grads_params"
+    bucket_size: int | None = 40_000_000
+    overlap_grad_reduce: bool = True
+    overlap_param_gather: bool = True
+    average_gradients: bool = True
+    main_params_dtype: torch.dtype = torch.float32
+    main_grads_dtype: torch.dtype = torch.float32
+    grad_comm_dtype: torch.dtype = torch.float32
+    nccl_ub: bool = False
+    fsdp_double_buffer: bool = False
+    disable_symmetric_registration: bool = False
+    all_gather_in_start_param_sync: bool = True
+
+
+def build_mfsdp_config(opt: Any) -> MFSDPConfig:
+    """Lower runtime optimizer options into the supported M-FSDP surface."""
+    values = dict(getattr(opt, "override_optimizer_config", None) or {})
+
+    def option(name: str, default: Any, *aliases: str) -> Any:
+        for key in (name, *aliases):
+            if key in values:
+                return values[key]
+            if hasattr(opt, key):
+                value = getattr(opt, key)
+                if value is not None:
+                    return value
+        return default
+
+    strategy = str(
+        option(
+            "mfsdp_sharding_strategy",
+            "optim_grads_params",
+            "data_parallel_sharding_strategy",
+            "megatron_fsdp_sharding_strategy",
+        )
+    )
+    if strategy != "optim_grads_params":
+        raise ValueError(
+            "The standalone M-FSDP path supports only "
+            "data_parallel_sharding_strategy='optim_grads_params'."
+        )
+    raw_bucket_size = option(
+        "bucket_size", 40_000_000, "suggested_communication_unit_size"
+    )
+    bucket_size = None if raw_bucket_size is None else int(raw_bucket_size)
+    if bucket_size is not None and bucket_size <= 0:
+        raise ValueError("M-FSDP bucket_size must be a positive element count or None.")
+
+    main_params_dtype = _coerce_dtype(
+        option("megatron_fsdp_main_params_dtype", torch.float32),
+        name="megatron_fsdp_main_params_dtype",
+    )
+    main_grads_dtype = _coerce_dtype(
+        option("megatron_fsdp_main_grads_dtype", torch.float32),
+        name="megatron_fsdp_main_grads_dtype",
+    )
+    grad_comm_dtype = _coerce_dtype(
+        option("megatron_fsdp_grad_comm_dtype", main_grads_dtype),
+        name="megatron_fsdp_grad_comm_dtype",
+    )
+    nccl_ub = bool(option("nccl_ub", False))
+    return MFSDPConfig(
+        sharding_strategy=strategy,
+        bucket_size=bucket_size,
+        overlap_grad_reduce=bool(option("overlap_grad_reduce", True)),
+        overlap_param_gather=bool(option("overlap_param_gather", True)),
+        average_gradients=bool(option("average_in_collective", True)),
+        main_params_dtype=main_params_dtype,
+        main_grads_dtype=main_grads_dtype,
+        grad_comm_dtype=grad_comm_dtype,
+        nccl_ub=nccl_ub,
+        fsdp_double_buffer=bool(option("fsdp_double_buffer", False)) or nccl_ub,
+        disable_symmetric_registration=bool(
+            option("disable_symmetric_registration", False)
+        ),
+        all_gather_in_start_param_sync=bool(
+            option("fsdp_all_gather_in_start_param_sync", True)
+        ),
+    )
+
+
+def _coerce_dtype(value: Any, *, name: str) -> torch.dtype:
+    if isinstance(value, torch.dtype):
+        return value
+    if value is None:
+        return torch.float32
+    normalized = str(value).lower().removeprefix("torch.")
+    mapping = {
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+    }
+    if normalized not in mapping:
+        raise ValueError(f"{name} has unsupported dtype {value!r}.")
+    return mapping[normalized]
 
 
 def validate_mfsdp_config(engine_cfg) -> None:

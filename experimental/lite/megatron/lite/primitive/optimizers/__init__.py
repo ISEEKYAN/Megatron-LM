@@ -8,6 +8,7 @@ import importlib
 BACKENDS = {
     "dist_opt": "megatron.lite.primitive.optimizers.megatron_wrap",
     "fsdp2": "megatron.lite.primitive.optimizers.fsdp2",
+    "mfsdp": "megatron.lite.primitive.optimizers.mfsdp.backend",
 }
 
 
