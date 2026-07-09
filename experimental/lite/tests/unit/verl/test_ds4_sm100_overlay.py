@@ -5,6 +5,7 @@ import pytest
 
 _EXAMPLES = Path(__file__).parents[3] / "examples/verl"
 _SLURM = _EXAMPLES / "slurm"
+_PATCHES = _EXAMPLES / "patches"
 
 
 def test_sm100_dependency_contract_requires_blackwell_and_expected_exports() -> None:
@@ -64,9 +65,12 @@ def test_sm100_overlay_build_is_pinned_and_does_not_mutate_rollout_overlay() -> 
     assert "VLLM_OVERLAY=" in versions
     assert "FLASH_MLA_DISABLE_SM90=1" in build
     assert "CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl" in build
+    assert "flashmla-a6ec-standalone-import.patch" in build
+    assert 'git -C "${FLASHMLA_SRC}" apply --check' in build
+    assert "--force-reinstall" in build
     assert (
-        'python -m pip install --no-build-isolation --no-deps "${flashmla_src}"'
-        in build
+        "python -m pip install --force-reinstall --no-build-isolation --no-deps "
+        '"${flashmla_src}"' in build
     )
     assert "gb200_vllm_overlay.pth" in build
     assert "nvidia_cutlass_dsl/python_packages" in build
@@ -74,6 +78,14 @@ def test_sm100_overlay_build_is_pinned_and_does_not_mutate_rollout_overlay() -> 
     assert 'source "${VLLM_OVERLAY}/bin/activate"' not in build
     assert "cp -r" not in build
     assert ".whl" not in build
+
+
+def test_flashmla_patch_only_removes_the_broken_optional_export() -> None:
+    patch = (_PATCHES / "flashmla-a6ec-standalone-import.patch").read_text()
+
+    assert "-    flash_mla_with_kvcache_fp8," in patch
+    assert "flash_mla_sparse_fwd" not in patch
+    assert patch.count("diff --git") == 1
 
 
 def test_formal_mlite_forward_launcher_probes_then_runs_same_prompt_driver() -> None:

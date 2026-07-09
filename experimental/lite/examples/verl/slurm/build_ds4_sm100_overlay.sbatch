@@ -36,6 +36,14 @@ git -C "${FLASHMLA_SRC}" fetch origin "${FLASHMLA_COMMIT}"
 git -C "${FLASHMLA_SRC}" checkout --detach "${FLASHMLA_COMMIT}"
 git -C "${FLASHMLA_SRC}" submodule update --init csrc/cutlass
 [[ "$(git -C "${FLASHMLA_SRC}" rev-parse HEAD)" == "${FLASHMLA_COMMIT}" ]]
+FLASHMLA_PATCH=${MLITE_SRC}/experimental/lite/examples/verl/patches/flashmla-a6ec-standalone-import.patch
+[[ -f "${FLASHMLA_PATCH}" ]] || { echo "missing FlashMLA patch: ${FLASHMLA_PATCH}" >&2; exit 6; }
+if git -C "${FLASHMLA_SRC}" apply --reverse --check "${FLASHMLA_PATCH}" 2>/dev/null; then
+  echo "FlashMLA standalone import patch already applied"
+else
+  git -C "${FLASHMLA_SRC}" apply --check "${FLASHMLA_PATCH}"
+  git -C "${FLASHMLA_SRC}" apply "${FLASHMLA_PATCH}"
+fi
 
 srun --mpi=pmix --export=ALL --no-container-mount-home \
   --container-image="${BASE_SQSH}" \
@@ -75,7 +83,7 @@ export FLASH_MLA_DISABLE_SM90=1
 export CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl:${CPLUS_INCLUDE_PATH:-}
 export MAX_JOBS=${MAX_JOBS:-32}
 export NVCC_THREADS=${NVCC_THREADS:-2}
-python -m pip install --no-build-isolation --no-deps "${flashmla_src}"
+python -m pip install --force-reinstall --no-build-isolation --no-deps "${flashmla_src}"
 
 export PYTHONPATH="${mlite_src}/experimental/lite:${PYTHONPATH:-}"
 python -m examples.verl.ds4_sm100_env probe
