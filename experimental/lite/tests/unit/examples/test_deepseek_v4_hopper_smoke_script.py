@@ -13,10 +13,17 @@ SCRIPT = LITE_ROOT / "examples/verl/scripts/run_deepseek_v4_hopper_smoke.sh"
 def _fake_environment(tmp_path: Path) -> dict[str, str]:
     sm90_site = tmp_path / "sm90/site-packages"
     thin_site = tmp_path / "thin/site-packages"
+    megatron_root = tmp_path / "Megatron-LM"
     verl_root = tmp_path / "verl"
     shim = tmp_path / "thin/abi_shim/libvllm_torch212_abi_shim.so"
 
-    for path in (sm90_site, thin_site, verl_root, shim.parent):
+    for path in (
+        sm90_site,
+        thin_site,
+        megatron_root / "megatron/core",
+        verl_root,
+        shim.parent,
+    ):
         path.mkdir(parents=True, exist_ok=True)
     shim.touch()
 
@@ -39,6 +46,7 @@ def _fake_environment(tmp_path: Path) -> dict[str, str]:
         {
             "DS4_VLLM_SHIM": str(shim),
             "DS4_VLLM_SITE": str(thin_site),
+            "MEGATRON_ROOT": str(megatron_root),
             "MLITE_SM90_SITE": str(sm90_site),
             "VERL_ROOT": str(verl_root),
         }
@@ -70,6 +78,7 @@ def test_training_check_uses_sm90_stack_without_rollout_thin_overlay(tmp_path):
     )
     assert str(tmp_path / "sm90/site-packages") in pythonpath
     assert str(tmp_path / "thin/site-packages") not in pythonpath
+    assert str(tmp_path / "Megatron-LM") in pythonpath
 
 
 def test_rollout_check_prepends_thin_overlay_and_abi_shim(tmp_path):
@@ -116,3 +125,15 @@ def test_rollout_check_rejects_missing_vllm_overlay(tmp_path):
 
     assert result.returncode != 0
     assert "DS4_VLLM_SITE is not a directory" in result.stderr
+
+
+def test_training_check_rejects_missing_megatron_core(tmp_path):
+    result = _run(
+        tmp_path,
+        "training",
+        CHECK_ONLY="1",
+        MEGATRON_ROOT=str(tmp_path / "missing"),
+    )
+
+    assert result.returncode != 0
+    assert "MEGATRON_ROOT is not a directory" in result.stderr

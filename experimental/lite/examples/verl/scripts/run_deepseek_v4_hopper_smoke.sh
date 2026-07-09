@@ -40,14 +40,17 @@ require_package_metadata() {
 }
 
 : "${MLITE_SM90_SITE:?set MLITE_SM90_SITE to the SM90 training overlay site-packages}"
+: "${MEGATRON_ROOT:?set MEGATRON_ROOT to a compatible Megatron Core source checkout}"
 : "${VERL_ROOT:?set VERL_ROOT to the VERL source checkout}"
 require_directory MLITE_SM90_SITE "${MLITE_SM90_SITE}"
+require_directory MEGATRON_ROOT "${MEGATRON_ROOT}"
+require_directory MEGATRON_ROOT/megatron/core "${MEGATRON_ROOT}/megatron/core"
 require_directory VERL_ROOT "${VERL_ROOT}"
 require_package_metadata "${MLITE_SM90_SITE}" 'flash_mla-*.dist-info'
 require_package_metadata "${MLITE_SM90_SITE}" 'nvidia_cudnn_frontend-*.dist-info'
 require_package_metadata "${MLITE_SM90_SITE}" 'nvidia_cutlass_dsl-*.dist-info'
 
-COMMON_PYTHONPATH="${MLITE_SM90_SITE}/nvidia_cutlass_dsl/python_packages:${MLITE_SM90_SITE}:${VERL_ROOT}:${EXAMPLE_ROOT}:${LITE_ROOT}:${REPO_ROOT}"
+COMMON_PYTHONPATH="${MLITE_SM90_SITE}/nvidia_cutlass_dsl/python_packages:${MLITE_SM90_SITE}:${VERL_ROOT}:${MEGATRON_ROOT}:${EXAMPLE_ROOT}:${LITE_ROOT}:${REPO_ROOT}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export PYTHONNOUSERSITE=1
 

@@ -42,8 +42,14 @@ Set these paths to the local installation:
 export MLITE_SM90_SITE=/path/to/sm90-overlay/lib/python3.12/site-packages
 export DS4_VLLM_SITE=/path/to/ds4-vllm-thin/lib/python3.12/site-packages
 export DS4_VLLM_SHIM=/path/to/ds4-vllm-thin/abi_shim/libvllm_torch212_abi_shim.so
+export MEGATRON_ROOT=/path/to/compatible/Megatron-LM
 export VERL_ROOT=/path/to/verl
 ```
+
+`MEGATRON_ROOT` is required even when the MLite delivery branch contains only
+`experimental/lite`: the distributed optimizer and checkpoint path import
+`megatron.core`. Use a committed checkout compatible with the MLite baseline;
+do not point a validation job at a mutable shared worktree.
 
 Check only file layout and package metadata on the login node. These commands
 do not import a GPU library:
@@ -75,6 +81,7 @@ srun --nodes=1 --gres=gpu:2 \
     export MLITE_SM90_SITE=/path/to/sm90-overlay/lib/python3.12/site-packages
     export DS4_VLLM_SITE=/path/to/ds4-vllm-thin/lib/python3.12/site-packages
     export DS4_VLLM_SHIM=/path/to/ds4-vllm-thin/abi_shim/libvllm_torch212_abi_shim.so
+    export MEGATRON_ROOT=/path/to/compatible/Megatron-LM
     export VERL_ROOT=/path/to/verl
     NPROC_PER_NODE=2 bash experimental/lite/examples/verl/scripts/run_deepseek_v4_hopper_smoke.sh training
     bash experimental/lite/examples/verl/scripts/run_deepseek_v4_hopper_smoke.sh rollout-probe
@@ -100,7 +107,7 @@ rollout test when changing vLLM, Torch, CUDA, or the ABI library.
 | Surface | H100 / SM90 | GB200 / SM100 | Reuse rule |
 | --- | --- | --- | --- |
 | Base container | NGC PyTorch 26.04, Torch 2.12, CUDA 13.2 | Use the Blackwell-qualified container and its Torch/CUDA pair | Do not copy binary extensions between the containers. |
-| MLite model, protocol, optimizer, checkpoint format | Shared | Shared | Reuse Python model/runtime code and serialized contracts. |
+| MLite model, Megatron Core, optimizer, checkpoint format | Shared source contracts | Shared source contracts | Pin both MLite and Megatron Core commits for every run. |
 | FlashMLA | SM90 build (`1.0.0+b7643bd`) | SM100 build with the Blackwell kernels | Rebuild or install the architecture-qualified wheel. |
 | cuDNN DSA indexer | SM90 interface from the 1.25.0 stack | SM100 indexer/top-k backend | Do not satisfy an SM100 import with the SM90 module. |
 | CUTLASS DSL | 4.5.2 SM90 package path precedes system packages | Use the version pinned by the Blackwell stack | Preserve package ordering, but not the compiled artifacts. |
