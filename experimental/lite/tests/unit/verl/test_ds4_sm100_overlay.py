@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,34 @@ def test_flashmla_patch_only_removes_the_broken_optional_export() -> None:
     assert "-    flash_mla_with_kvcache_fp8," in patch
     assert "flash_mla_sparse_fwd" not in patch
     assert patch.count("diff --git") == 1
+
+
+def test_flashmla_patch_applies_to_the_pinned_package(tmp_path: Path) -> None:
+    package = tmp_path / "flash_mla"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        '__version__ = "1.0.0"\n\n'
+        "from flash_mla.flash_mla_interface import (\n"
+        "    get_mla_metadata,\n"
+        "    flash_mla_with_kvcache,\n"
+        "    flash_mla_with_kvcache_fp8,\n"
+        "    flash_attn_varlen_func,\n"
+        "    flash_attn_varlen_qkvpacked_func,\n"
+        "    flash_attn_varlen_kvpacked_func,\n"
+        "    flash_mla_sparse_fwd\n"
+        ")\n"
+    )
+
+    subprocess.run(
+        [
+            "git",
+            "apply",
+            "--check",
+            str(_PATCHES / "flashmla-a6ec-standalone-import.patch"),
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
 
 
 def test_formal_mlite_forward_launcher_probes_then_runs_same_prompt_driver() -> None:
