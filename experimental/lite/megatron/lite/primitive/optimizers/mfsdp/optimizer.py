@@ -1,47 +1,35 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Megatron-FSDP wrap backend for Megatron Lite.
+"""Self-contained Megatron-FSDP optimizer construction for Megatron Lite.
 
-This primitive intentionally stays thin: Megatron Lite owns model construction,
-HF loading, and the runtime loop; Megatron-Core owns the FSDP wrapper,
-ParamAndGradBuffer, and DistributedOptimizer integration.
+The model wrapper and communication pipelines are the vendored M-FSDP
+implementation in :mod:`.impl`.  The only code shared with the FSDP2 backend
+is its backend-neutral AdamW/gradient adapter; this module never enters the
+FSDP2 ``fully_shard`` training path.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
-import torch.nn as nn  # pyright: ignore[reportMissingImports]
+import torch.nn as nn
 
-from megatron.lite.primitive.optimizers.megatron_wrap import (
-    _build_transformer_config,
-    _ensure_mc_mpu_parallel_state,
-    _mark_mc_parallel_attrs,
-    build_mc_optimizer_config,
-)
-from megatron.lite.primitive.optimizers.mfsdp.config import (
-    build_mfsdp_ddp_config,
-    split_mfsdp_overrides,
-    validate_mfsdp_config,
-    validate_optimizer_name,
-)
+from megatron.lite.primitive.optimizers.fsdp2.optimizer import build_fsdp2_adamw
 from megatron.lite.primitive.optimizers.mfsdp.checkpoint_keys import (
     attach_mfsdp_checkpoint_metadata,
 )
-from megatron.lite.primitive.optimizers.mfsdp.grad_norm import (
-    CanonicalGradNormMegatronFSDPOptimizer,
+from megatron.lite.primitive.optimizers.mfsdp.config import validate_mfsdp_config
+from megatron.lite.primitive.optimizers.mfsdp.impl.fully_shard import (
+    fully_shard_model,
+    fully_shard_optimizer,
 )
-from megatron.lite.primitive.optimizers.mfsdp.metadata import (
-    ensure_mfsdp_tp_partition_attrs,
-    normalize_mfsdp_expert_tensor_parallel_attrs,
-)
-from megatron.lite.primitive.optimizers.mfsdp.patches import (
-    install_mfsdp_tp_duplicate_sync_patch,
-)
-from megatron.lite.primitive.optimizers.mfsdp.process_groups import (
-    build_mfsdp_pg_collection,
-    install_mfsdp_mesh_patch,
-)
+from megatron.lite.primitive.optimizers.mfsdp.metadata import ensure_mfsdp_tp_partition_attrs
 from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
+
+
+def _override(opt: Any, name: str, default: Any) -> Any:
+    values = dict(getattr(opt, "override_optimizer_config", None) or {})
+    return values.get(name, getattr(opt, name, default))
 
 
 def build_mfsdp_stack(
@@ -55,100 +43,63 @@ def build_mfsdp_stack(
     fsdp_unit_modules: tuple[type[nn.Module] | str, ...] | None = None,
     skip_fsdp_wrap: bool = False,
 ):
-    """Wrap model chunks with Megatron-FSDP and build the matching optimizer."""
-    from megatron.core.distributed import (  # pyright: ignore[reportMissingImports]
-        DistributedDataParallelConfig,
-        FullyShardedDataParallel,
-    )
-    from megatron.core.distributed.finalize_model_grads import (  # pyright: ignore[reportMissingImports]
-        finalize_model_grads,
-    )
-    from megatron.core.optimizer import (
-        get_megatron_optimizer,  # pyright: ignore[reportMissingImports]
-    )
-    from megatron.core.transformer.enums import ModelType  # pyright: ignore[reportMissingImports]
-
+    """Wrap chunks with the local M-FSDP implementation and build AdamW."""
+    del model_cfg, proto
     validate_mfsdp_config(engine_cfg)
-    install_mfsdp_mesh_patch()
-    install_mfsdp_tp_duplicate_sync_patch()
-
-    p = engine_cfg.parallel
     opt = engine_cfg.optimizer
-    opt_overrides, ddp_overrides = split_mfsdp_overrides(
-        opt,
-        DistributedDataParallelConfig,
-    )
-
-    mc_transformer_cfg = _build_transformer_config(model_cfg, engine_cfg)
-    mc_transformer_cfg.finalize_model_grads_func = finalize_model_grads
-    if is_expert is not None:
-        is_expert_param = is_expert
-    elif proto is not None and hasattr(proto, "EXPERT_CLASSIFIER"):
-        is_expert_param = proto.EXPERT_CLASSIFIER
-    else:
-        is_expert_param = default_expert_classifier
-
-    _ensure_mc_mpu_parallel_state(engine_cfg)
-    use_mpu_groups = bool(getattr(engine_cfg, "deterministic", False))
-    pg_collection = None if use_mpu_groups else build_mfsdp_pg_collection(ps, engine_cfg)
+    classifier = is_expert or default_expert_classifier
 
     if skip_fsdp_wrap:
         wrapped_chunks = list(model_chunks)
     else:
-        ddp_config = build_mfsdp_ddp_config(DistributedDataParallelConfig, ddp_overrides)
-        wrapped_chunks = []
-        unit_modules = list(fsdp_unit_modules) if fsdp_unit_modules is not None else None
-        for chunk_idx, chunk in enumerate(model_chunks):
-            chunk.model_type = ModelType.encoder_or_decoder
-            _mark_mc_parallel_attrs(chunk, is_expert_param, tp_size=p.tp)
-            normalize_mfsdp_expert_tensor_parallel_attrs(
+        wrapped_chunks = [
+            fully_shard_model(
                 chunk,
-                is_expert_param,
-                etp_size=int(p.etp or 1),
+                fsdp_unit_modules=fsdp_unit_modules,
+                zero_dp_strategy=_override(
+                    opt, "mfsdp_sharding_strategy", "optim_grads_params"
+                ),
+                grad_reduce_in_fp32=bool(_override(opt, "grad_reduce_in_fp32", False)),
+                preserve_fp32_weights=bool(_override(opt, "preserve_fp32_weights", True)),
+                overlap_grad_reduce=bool(_override(opt, "overlap_grad_reduce", True)),
+                overlap_param_gather=bool(_override(opt, "overlap_param_gather", True)),
+                check_for_nan_in_grad=bool(_override(opt, "check_for_nan_in_grad", True)),
+                average_in_collective=bool(_override(opt, "average_in_collective", False)),
+                disable_bucketing=index > 0,
             )
-            ensure_mfsdp_tp_partition_attrs(chunk)
-            wrapped_chunks.append(
-                FullyShardedDataParallel(
-                    mc_transformer_cfg,
-                    ddp_config,
-                    chunk,
-                    fsdp_unit_modules=unit_modules,
-                    disable_bucketing=(chunk_idx > 0),
-                    pg_collection=pg_collection,
-                )
-            )
+            for index, chunk in enumerate(model_chunks)
+        ]
 
-    opt_config = build_mc_optimizer_config(
+    expert_params = []
+    dense_params = []
+    for chunk in wrapped_chunks:
+        for name, param in chunk.named_parameters():
+            (expert_params if classifier(name) else dense_params).append(param)
+
+    optimizer = build_fsdp2_adamw(
+        wrapped_chunks,
         opt,
-        override_optimizer_config=opt_overrides or None,
-    )
-    validate_optimizer_name(opt_config.optimizer)
-    opt_config.use_distributed_optimizer = True
-    if skip_fsdp_wrap or use_mpu_groups:
-        optimizer = get_megatron_optimizer(config=opt_config, model_chunks=wrapped_chunks)
-        optimizer._mc_pg_collection = None  # pyright: ignore[reportAttributeAccessIssue]
-    else:
-        optimizer = get_megatron_optimizer(
-            config=opt_config,
-            model_chunks=wrapped_chunks,
-            use_gloo_process_groups=False,
-            pg_collection=pg_collection,
-        )
-        optimizer._mc_pg_collection = pg_collection  # pyright: ignore[reportAttributeAccessIssue]
-    optimizer_leaves = getattr(optimizer, "chained_optimizers", None)
-    for optimizer_owner in (optimizer, *tuple(optimizer_leaves or ())):
-        if not hasattr(optimizer_owner, "model_chunks"):
-            optimizer_owner.model_chunks = wrapped_chunks  # pyright: ignore[reportAttributeAccessIssue]
-    attach_mfsdp_checkpoint_metadata(optimizer, ps=ps, is_expert=is_expert_param)
-    param_is_expert, param_names = _build_wrapped_param_metadata(wrapped_chunks, is_expert_param)
-    optimizer = CanonicalGradNormMegatronFSDPOptimizer(
-        optimizer,
         ps,
-        model_chunks=wrapped_chunks,
-        param_is_expert=param_is_expert,
-        param_names=param_names,
+        expert_sharded_grad_params=expert_params,
+        expert_sharded_grad_scale=(
+            float(ps.expert_dp_size) / float(ps.dp_cp_size)
+            if expert_params and ps.dp_cp_size
+            else 1.0
+        ),
+        expert_sharded_grad_norm_group=ps.ep_dp_group if expert_params else None,
+        grad_norm_accum_dtype=_override(opt, "grad_norm_accum_dtype", "float32"),
+        adamw_foreach=False,
+        # M-FSDP already exposes its distributed FP32 optimization weights;
+        # creating a second FSDP2-style master copy would detach the optimizer
+        # from the wrapper's parameter-install lifecycle.
+        use_fp32_master=False,
     )
-    attach_mfsdp_checkpoint_metadata(optimizer, ps=ps, is_expert=is_expert_param)
+    if not skip_fsdp_wrap:
+        fully_shard_optimizer(optimizer.optimizer)
+
+    optimizer._mc_pg_collection = None
+    optimizer.model_chunks = wrapped_chunks
+    attach_mfsdp_checkpoint_metadata(optimizer, ps=ps, is_expert=classifier)
     return wrapped_chunks, optimizer
 
 
@@ -163,7 +114,8 @@ def build_mfsdp_training_optimizer(
     fsdp_unit_modules: tuple[type[nn.Module] | str, ...] | None = None,
     deterministic: bool | None = None,
 ):
-    """Build the Megatron-FSDP stack from a Megatron Lite ImplConfig."""
+    """Build the local M-FSDP stack from an ``ImplConfig``."""
+    del deterministic
     opt = impl_cfg.optimizer_config
     if opt is None:
         opt = SimpleNamespace(
@@ -177,16 +129,10 @@ def build_mfsdp_training_optimizer(
             adam_beta2=None,
             adam_eps=None,
         )
-    if deterministic is None:
-        from megatron.lite.primitive.deterministic import deterministic_requested
-
-        deterministic = deterministic_requested()
-
     engine_cfg = SimpleNamespace(
         model_name=model_name,
         parallel=impl_cfg.parallel,
         optimizer=opt,
-        deterministic=bool(deterministic),
     )
     model_chunks[:], optimizer = build_mfsdp_stack(
         model_chunks,
@@ -204,29 +150,12 @@ def build_mfsdp_training_optimizer(
 
 
 def finalize_mfsdp_grads(model_chunks: list[nn.Module], optimizer) -> None:
-    """Run Megatron-Core gradient finalization for Megatron-FSDP chunks."""
-    from megatron.core.distributed.finalize_model_grads import (  # pyright: ignore[reportMissingImports]
-        finalize_model_grads,
-    )
-
-    finalize_model_grads(model_chunks, pg_collection=optimizer._mc_pg_collection)
-
-
-def _build_wrapped_param_metadata(
-    model_chunks: list[nn.Module],
-    is_expert_param: ExpertClassifierFn,
-) -> tuple[dict[int, bool], dict[int, str]]:
-    param_is_expert: dict[int, bool] = {}
-    param_names: dict[int, str] = {}
+    """Finish M-FSDP reduce-scatter work before the optimizer update."""
+    del optimizer
     for chunk in model_chunks:
-        for name, param in chunk.named_parameters():
-            param_is_expert[id(param)] = bool(is_expert_param(name)) or not getattr(
-                param,
-                "allreduce",
-                True,
-            )
-            param_names[id(param)] = name
-    return param_is_expert, param_names
+        finish_grad_sync = getattr(chunk, "finish_grad_sync", None)
+        if callable(finish_grad_sync):
+            finish_grad_sync()
 
 
 __all__ = [

@@ -198,13 +198,13 @@ def _named_model_tensors(chunks) -> dict[str, torch.Tensor]:
     return params
 
 
-def _assert_param_sets_close(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> float:
+def _assert_param_sets_equal(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> float:
     assert lhs.keys() == rhs.keys()
     max_abs = 0.0
     for name in lhs:
         diff = (lhs[name] - rhs[name]).abs()
         max_abs = max(max_abs, float(diff.max().item()))
-        torch.testing.assert_close(lhs[name], rhs[name], atol=5.0e-3, rtol=5.0e-3, msg=name)
+        assert torch.equal(lhs[name], rhs[name]), name
     return max_abs
 
 
@@ -226,11 +226,12 @@ def test_mfsdp_matches_fsdp2_tiny_dense_single_step():
 
     assert fsdp2_success
     assert mfsdp_success
-    assert fsdp2_loss == pytest.approx(mfsdp_loss, abs=1.0e-6, rel=1.0e-6)
-    assert fsdp2_grad_norm == pytest.approx(mfsdp_grad_norm, abs=5.0e-3, rel=5.0e-3)
-    max_param_abs = _assert_param_sets_close(
+    assert fsdp2_loss == mfsdp_loss
+    assert fsdp2_grad_norm == mfsdp_grad_norm
+    max_param_abs = _assert_param_sets_equal(
         _named_model_tensors(fsdp2_chunks), _named_model_tensors(mfsdp_chunks)
     )
+    assert max_param_abs == 0.0
 
     if dist.get_rank() == 0:
         print(

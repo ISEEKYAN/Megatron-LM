@@ -81,32 +81,11 @@ def _wrap_make_fsdp_dtensor(make_fsdp_dtensor: Callable[..., Any]) -> Callable[.
 
 
 def install_mfsdp_tp_duplicate_sync_patch() -> None:
-    """Guard MCore duplicate-TP sync for marked Megatron Lite local TP shards.
-
-    Megatron Lite modules keep their local TP shards as normal tensors. Current
-    MCore-FSDP uses ``tensor_model_parallel`` plus ``partition_dim`` to choose
-    TP-sharded DTensor placement, but some duplicate-TP sync paths can still be
-    forced for params marked as duplicated. The patch is intentionally narrow:
-    it only changes that sync decision for params marked by this primitive and
-    leaves MCore DTensor placement untouched.
-    """
-    from megatron.core.distributed.fsdp.src.megatron_fsdp import (  # pyright: ignore[reportMissingImports]
-        param_and_grad_buffer,
-    )
-
-    make_fsdp_dtensor = param_and_grad_buffer.make_fsdp_dtensor
-    install_mfsdp_start_param_sync_patch()
-    if bool(getattr(make_fsdp_dtensor, _PATCHED_ATTR, False)):
-        install_mfsdp_param_sync_debug_patch(param_and_grad_buffer)
-        return
-    param_and_grad_buffer.make_fsdp_dtensor = _wrap_make_fsdp_dtensor(make_fsdp_dtensor)
-    install_mfsdp_param_sync_debug_patch(param_and_grad_buffer)
+    """Compatibility no-op: the local implementation owns these call sites."""
 
 
 def install_mfsdp_start_param_sync_patch() -> None:
-    from megatron.core.distributed.fsdp.src.megatron_fsdp import (  # pyright: ignore[reportMissingImports]
-        megatron_fsdp,
-    )
+    from megatron.lite.primitive.optimizers.mfsdp.impl import megatron_fsdp
 
     fsdp_cls = megatron_fsdp.MegatronFSDP
     start_param_sync = fsdp_cls.start_param_sync

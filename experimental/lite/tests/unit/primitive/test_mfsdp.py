@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ast
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +17,40 @@ from megatron.lite.primitive.optimizers.mfsdp import grad_norm as mfsdp_grad_nor
 from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
 from megatron.lite.primitive.optimizers.mfsdp.patches import should_skip_tp_duplicate_sync
 from megatron.lite.runtime.contracts.config import ParallelConfig
+
+
+def test_mfsdp_has_no_megatron_core_imports():
+    package = Path(mfsdp_config.__file__).parent
+    violations = []
+    for source_path in package.rglob("*.py"):
+        tree = ast.parse(source_path.read_text(), filename=str(source_path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                modules = [node.module or ""]
+            else:
+                continue
+            for module in modules:
+                if module == "megatron.core" or module.startswith("megatron.core."):
+                    relative_path = source_path.relative_to(package)
+                    violations.append(f"{relative_path}:{node.lineno}: {module}")
+
+    assert violations == []
+
+
+def test_mfsdp_imports_when_megatron_core_is_blocked():
+    script = """
+import builtins
+original_import = builtins.__import__
+def guarded_import(name, *args, **kwargs):
+    if name == 'megatron.core' or name.startswith('megatron.core.'):
+        raise RuntimeError(f'forbidden import: {name}')
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+import megatron.lite.primitive.optimizers.mfsdp
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
 
 
 @dataclass
