@@ -30,3 +30,19 @@ def test_distribution_comparison_reports_kl_and_selected_token_delta() -> None:
     assert report["max_abs"] > 0
     assert report["max_kl"] > 0
     assert report["max_selected_token_logprob_delta"] >= 0
+
+
+def test_copy_checkpoint_metadata_ignores_directories(tmp_path) -> None:
+    from examples.verl.ds4_resync_tp4 import copy_checkpoint_metadata
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    (source / "config.json").write_text("{}")
+    (source / "inference").mkdir()
+    (source / "model.safetensors").write_bytes(b"weights")
+    copy_checkpoint_metadata(source, output)
+    assert (output / "config.json").read_text() == "{}"
+    assert not (output / "inference").exists()
+    assert not (output / "model.safetensors").exists()

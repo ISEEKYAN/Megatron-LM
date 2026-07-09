@@ -91,6 +91,12 @@ def compare_distributions(
     }
 
 
+def copy_checkpoint_metadata(source: Path, output: Path) -> None:
+    for path in source.iterdir():
+        if path.is_file() and path.suffix != ".safetensors":
+            shutil.copy2(path, output / path.name)
+
+
 def _dense_logprobs(entries: list[Any], vocab_size: int) -> torch.Tensor:
     rows = []
     for entry in entries:
@@ -161,9 +167,7 @@ def convert(source: Path, output: Path, device: str) -> None:
     weight_map, shards = _checkpoint_index(source)
     names = set(weight_map)
     output.mkdir(parents=True, exist_ok=True)
-    for path in source.iterdir():
-        if path.suffix != ".safetensors":
-            shutil.copy2(path, output / path.name)
+    copy_checkpoint_metadata(source, output)
     target_device = torch.device(device)
     for shard_index, shard in enumerate(shards, 1):
         converted: dict[str, torch.Tensor] = {}
