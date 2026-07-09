@@ -113,6 +113,69 @@ def test_online_resync_uses_native_checkpoint_reload_lifecycle(tmp_path) -> None
     assert calls == [("reload_checkpoint_from_path", (str(tmp_path),), None)]
 
 
+def test_engine_weight_fingerprints_report_layerwise_exact_reload() -> None:
+    from examples.verl.ds4_resync_tp4 import compare_engine_weight_fingerprints
+
+    cold = [
+        [
+            {
+                "name": "model.layers.2.mlp.experts.w13_weight",
+                "kind": "parameter",
+                "dtype": "float8_e4m3fn",
+                "shape": [4, 8],
+                "nbytes": 32,
+                "sha256": "a" * 64,
+            },
+            {
+                "name": "model.layers.2.mlp.experts.w13_weight_scale_inv",
+                "kind": "parameter",
+                "dtype": "float32",
+                "shape": [1],
+                "nbytes": 4,
+                "sha256": "b" * 64,
+            },
+        ]
+    ]
+    online = json.loads(json.dumps(cold))
+
+    report = compare_engine_weight_fingerprints(cold, online)
+
+    assert report["exact_match"] is True
+    assert report["tensor_count"] == 2
+    assert report["mismatch_count"] == 0
+    layer = report["layers"]["layers.2"]
+    assert layer["exact_match"] is True
+    assert layer["implied_dequantized_max_abs"] == 0.0
+    assert layer["implied_dequantized_relative_l2"] == 0.0
+    assert report["workers"][0]["cold_sha256"] == report["workers"][0]["online_sha256"]
+
+
+def test_engine_weight_fingerprints_report_mismatch_without_fake_numeric_diff() -> None:
+    from examples.verl.ds4_resync_tp4 import compare_engine_weight_fingerprints
+
+    cold = [
+        [
+            {
+                "name": "model.layers.7.self_attn.q_proj.weight",
+                "kind": "parameter",
+                "dtype": "float8_e4m3fn",
+                "shape": [2, 2],
+                "nbytes": 4,
+                "sha256": "c" * 64,
+            }
+        ]
+    ]
+    online = json.loads(json.dumps(cold))
+    online[0][0]["sha256"] = "d" * 64
+
+    report = compare_engine_weight_fingerprints(cold, online)
+
+    assert report["exact_match"] is False
+    assert report["mismatch_count"] == 1
+    assert report["layers"]["layers.7"]["implied_dequantized_max_abs"] is None
+    assert report["mismatch_examples"][0]["name"].endswith("q_proj.weight")
+
+
 def test_three_arm_comparison_reports_fp32_bf16_and_dapo_gate() -> None:
     from examples.verl.ds4_resync_tp4 import compare_three_arms
 
@@ -153,6 +216,29 @@ def test_three_arm_comparison_rejects_token_misalignment() -> None:
 
     with pytest.raises(ValueError, match="tokenized prompts differ"):
         compare_three_arms(direct, resync, direct, minimum_prompts=1)
+
+
+def test_final_compare_requires_and_embeds_engine_weight_parity(tmp_path) -> None:
+    from examples.verl.ds4_resync_tp4 import compare
+
+    row = {
+        "token_ids": torch.tensor([2]),
+        "logprobs": torch.log_softmax(torch.tensor([[1.0, 2.0, 3.0]]), dim=-1),
+    }
+    rows = [row for _ in range(32)]
+    arms = [tmp_path / name for name in ("cold.pt", "online.pt", "mlite.pt")]
+    for arm in arms:
+        torch.save(rows, arm)
+    weights = tmp_path / "weights.json"
+    weights.write_text(json.dumps({"exact_match": True, "mismatch_count": 0}))
+    output = tmp_path / "report.json"
+
+    compare(*arms, weights, output)
+
+    assert json.loads(output.read_text())["engine_weights"]["exact_match"] is True
+    weights.write_text(json.dumps({"exact_match": False, "mismatch_count": 1}))
+    with pytest.raises(ValueError, match="exact parity"):
+        compare(*arms, weights, output)
 
 
 def test_percentile_uses_exact_order_statistic() -> None:
@@ -271,6 +357,9 @@ def test_formal_sbatch_uses_mixed_source_for_mlite_and_fp8_artifact_for_vllm() -
     assert "--fp8-output '${RESYNC_DIR}'" in script
     assert "collect --model '${RESYNC_DIR}'" in script
     assert "--resync-model '${RESYNC_DIR}'" in script
+    assert "--weight-output '${OUTPUT_DIR}/engine-weight-report.json'" in script
+    assert '-s "${OUTPUT_DIR}/engine-weight-report.json"' in script
+    assert "--weights '${OUTPUT_DIR}/engine-weight-report.json'" in script
     assert "convert --source" not in script
 
 

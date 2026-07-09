@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
+import re
 import shutil
 from collections.abc import Iterable
 from pathlib import Path
@@ -22,6 +24,7 @@ _DAPO_P99_KL_LIMIT = 1e-4
 _DAPO_CLIP_LOW = 0.8
 _DAPO_CLIP_HIGH = 1.2
 _DEFAULT_MAX_SHARD_BYTES = 5 * 1024**3
+_FINGERPRINT_MISMATCH_EXAMPLES = 100
 
 
 def math_prompts() -> list[str]:
@@ -83,6 +86,125 @@ def pure_block_fp8_config(config: dict[str, Any]) -> dict[str, Any]:
     quantization["expert_dtype"] = "fp8"
     quantization["scale_fmt"] = "float32"
     return result
+
+
+def _fingerprint_layer(name: str) -> str:
+    match = re.search(r"(?:^|\.)(layers|mtp)\.(\d+)(?:\.|$)", name)
+    return f"{match.group(1)}.{match.group(2)}" if match else "global"
+
+
+def _fingerprint_set_digest(records: Iterable[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for record in sorted(records, key=lambda item: (item["name"], item["kind"])):
+        digest.update(
+            json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def compare_engine_weight_fingerprints(
+    cold_workers: list[list[dict[str, Any]]],
+    online_workers: list[list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Compare vLLM TP shards before and after the native reload lifecycle."""
+    if len(cold_workers) != len(online_workers) or not cold_workers:
+        raise ValueError(
+            "cold and online engine worker counts must match and be nonzero"
+        )
+
+    mismatch_count = 0
+    mismatch_examples = []
+    tensor_count = 0
+    byte_count = 0
+    workers = []
+    layers: dict[str, dict[str, Any]] = {}
+    layer_records: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for worker_index, (cold_records, online_records) in enumerate(
+        zip(cold_workers, online_workers, strict=True)
+    ):
+        cold = {record["name"]: record for record in cold_records}
+        online = {record["name"]: record for record in online_records}
+        if len(cold) != len(cold_records) or len(online) != len(online_records):
+            raise ValueError("engine fingerprint records contain duplicate names")
+        worker_mismatches = 0
+        for name in sorted(cold.keys() | online.keys()):
+            cold_record = cold.get(name)
+            online_record = online.get(name)
+            source = cold_record or online_record
+            assert source is not None
+            layer_name = _fingerprint_layer(name)
+            layer = layers.setdefault(
+                layer_name,
+                {"tensor_count": 0, "byte_count": 0, "mismatch_count": 0},
+            )
+            per_layer = layer_records.setdefault(layer_name, {"cold": [], "online": []})
+            if cold_record is not None:
+                tensor_count += 1
+                byte_count += int(cold_record["nbytes"])
+                layer["tensor_count"] += 1
+                layer["byte_count"] += int(cold_record["nbytes"])
+                per_layer["cold"].append({"worker": worker_index, **cold_record})
+            if online_record is not None:
+                per_layer["online"].append({"worker": worker_index, **online_record})
+            differing_fields = []
+            if cold_record is None or online_record is None:
+                differing_fields = ["presence"]
+            else:
+                differing_fields = [
+                    field
+                    for field in ("kind", "dtype", "shape", "nbytes", "sha256")
+                    if cold_record[field] != online_record[field]
+                ]
+            if differing_fields:
+                mismatch_count += 1
+                worker_mismatches += 1
+                layer["mismatch_count"] += 1
+                if len(mismatch_examples) < _FINGERPRINT_MISMATCH_EXAMPLES:
+                    mismatch_examples.append(
+                        {
+                            "worker": worker_index,
+                            "name": name,
+                            "differing_fields": differing_fields,
+                        }
+                    )
+        workers.append(
+            {
+                "worker": worker_index,
+                "tensor_count": len(cold_records),
+                "mismatch_count": worker_mismatches,
+                "cold_sha256": _fingerprint_set_digest(cold_records),
+                "online_sha256": _fingerprint_set_digest(online_records),
+            }
+        )
+
+    for layer_name, layer in layers.items():
+        exact = layer["mismatch_count"] == 0
+        layer["exact_match"] = exact
+        layer["cold_sha256"] = _fingerprint_set_digest(
+            layer_records[layer_name]["cold"]
+        )
+        layer["online_sha256"] = _fingerprint_set_digest(
+            layer_records[layer_name]["online"]
+        )
+        layer["implied_dequantized_max_abs"] = 0.0 if exact else None
+        layer["implied_dequantized_relative_l2"] = 0.0 if exact else None
+
+    return {
+        "schema_version": 1,
+        "worker_count": len(cold_workers),
+        "tensor_count": tensor_count,
+        "byte_count": byte_count,
+        "exact_match": mismatch_count == 0,
+        "mismatch_count": mismatch_count,
+        "mismatch_examples": mismatch_examples,
+        "layers": dict(sorted(layers.items())),
+        "workers": workers,
+        "metric_basis": (
+            "Bitwise-identical engine weights and scales imply zero deterministic "
+            "dequantized diff; non-identical states are not assigned a numeric diff."
+        ),
+    }
 
 
 def configure_pure_block_fp8_export(model_config: Any) -> Any:
@@ -390,12 +512,21 @@ def reload_resync_checkpoint(llm: Any, model: Path) -> None:
     llm.collective_rpc("reload_checkpoint_from_path", args=(str(model),), timeout=None)
 
 
+def collect_engine_weight_fingerprints(llm: Any) -> list[list[dict[str, Any]]]:
+    """Collect one deterministic state manifest from every vLLM TP worker."""
+    records = llm.collective_rpc("checkpoint_state_fingerprints", timeout=None)
+    if not isinstance(records, list) or not records:
+        raise ValueError("vLLM returned no engine weight fingerprints")
+    return records
+
+
 def collect(
     model: Path,
     output: Path,
     *,
     resync_model: Path | None = None,
     resync_output: Path | None = None,
+    weight_output: Path | None = None,
 ) -> None:
     from transformers import AutoConfig, AutoTokenizer
     from vllm import LLM
@@ -403,6 +534,8 @@ def collect(
     require_pure_block_fp8_checkpoint(model)
     if (resync_model is None) != (resync_output is None):
         raise ValueError("resync_model and resync_output must be provided together")
+    if (resync_model is None) != (weight_output is None):
+        raise ValueError("weight_output is required exactly when resync_model is set")
     if resync_model is not None:
         require_pure_block_fp8_checkpoint(resync_model)
     config = AutoConfig.from_pretrained(model, trust_remote_code=True)
@@ -421,12 +554,24 @@ def collect(
             "verl_mlite.rollout.vllm_worker.VllmCheckpointPathWorkerExtension"
         ),
     )
+    cold_weights = (
+        collect_engine_weight_fingerprints(llm) if resync_model is not None else None
+    )
     rows = _collect_vllm_rows(llm, tokenizer, vocab_size)
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(rows, output)
     print(f"DS4_TP4_FP8_COLD_COLLECT_COMPLETE={output}", flush=True)
     if resync_model is not None and resync_output is not None:
         reload_resync_checkpoint(llm, resync_model)
+        online_weights = collect_engine_weight_fingerprints(llm)
+        assert cold_weights is not None and weight_output is not None
+        weight_report = compare_engine_weight_fingerprints(cold_weights, online_weights)
+        weight_output.write_text(
+            json.dumps(weight_report, indent=2, sort_keys=True) + "\n"
+        )
+        print(f"DS4_TP4_ENGINE_WEIGHT_REPORT={weight_output}", flush=True)
+        if not weight_report["exact_match"]:
+            raise AssertionError("vLLM cold-load and online-reload weights differ")
         resync_rows = _collect_vllm_rows(llm, tokenizer, vocab_size)
         torch.save(resync_rows, resync_output)
         print(f"DS4_TP4_FP8_ONLINE_RELOAD_COMPLETE={resync_output}", flush=True)
@@ -520,12 +665,22 @@ def collect_mlite(model: Path, output: Path, fp8_output: Path) -> None:
     dist.barrier()
 
 
-def compare(cold: Path, online: Path, mlite: Path, output: Path) -> None:
+def compare(
+    cold: Path,
+    online: Path,
+    mlite: Path,
+    weights: Path,
+    output: Path,
+) -> None:
+    weight_report = json.loads(weights.read_text())
+    if not weight_report.get("exact_match"):
+        raise ValueError("engine weight report is missing cold-vs-online exact parity")
     report = compare_three_arms(
         torch.load(cold, weights_only=True),
         torch.load(online, weights_only=True),
         torch.load(mlite, weights_only=True),
     )
+    report["engine_weights"] = weight_report
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report, sort_keys=True), flush=True)
     print("DS4_TP4_PARITY_COMPLETE", flush=True)
@@ -541,6 +696,7 @@ def main() -> None:
     collect_parser.add_argument("--output", type=Path, required=True)
     collect_parser.add_argument("--resync-model", type=Path)
     collect_parser.add_argument("--resync-output", type=Path)
+    collect_parser.add_argument("--weight-output", type=Path)
     mlite_parser = subparsers.add_parser("collect-mlite")
     mlite_parser.add_argument("--model", type=Path, required=True)
     mlite_parser.add_argument("--output", type=Path, required=True)
@@ -549,6 +705,7 @@ def main() -> None:
     compare_parser.add_argument("--cold", type=Path, required=True)
     compare_parser.add_argument("--online", type=Path, required=True)
     compare_parser.add_argument("--mlite", type=Path, required=True)
+    compare_parser.add_argument("--weights", type=Path, required=True)
     compare_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "verify":
@@ -560,11 +717,12 @@ def main() -> None:
             args.output,
             resync_model=args.resync_model,
             resync_output=args.resync_output,
+            weight_output=args.weight_output,
         )
     elif args.command == "collect-mlite":
         collect_mlite(args.model, args.output, args.fp8_output)
     else:
-        compare(args.cold, args.online, args.mlite, args.output)
+        compare(args.cold, args.online, args.mlite, args.weights, args.output)
 
 
 if __name__ == "__main__":

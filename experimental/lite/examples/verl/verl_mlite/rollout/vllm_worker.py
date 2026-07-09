@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from typing import Any
 
@@ -42,6 +43,51 @@ def reload_checkpoint_buckets(
     finalize(model, _runner_model_config(model_runner))
 
 
+def _tensor_sha256(tensor: Any, *, chunk_bytes: int) -> str:
+    """Hash one device tensor without materializing the full value on the host."""
+    import torch
+
+    if chunk_bytes <= 0:
+        raise ValueError("chunk_bytes must be positive")
+    value = tensor.detach()
+    if value.device.type == "meta":
+        raise ValueError("cannot fingerprint a meta tensor")
+    if not value.is_contiguous():
+        value = value.contiguous()
+    byte_view = value.view(torch.uint8).reshape(-1)
+    digest = hashlib.sha256()
+    for start in range(0, byte_view.numel(), chunk_bytes):
+        host = byte_view[start : start + chunk_bytes].cpu().numpy()
+        digest.update(host.tobytes())
+    return digest.hexdigest()
+
+
+def checkpoint_state_fingerprints(
+    model_runner: Any,
+    *,
+    chunk_bytes: int = 64 * 1024**2,
+) -> list[dict[str, Any]]:
+    """Return deterministic fingerprints for all model parameters and buffers."""
+    model = _runner_model(model_runner)
+    state = [
+        *(("parameter", name, tensor) for name, tensor in model.named_parameters()),
+        *(("buffer", name, tensor) for name, tensor in model.named_buffers()),
+    ]
+    records = []
+    for kind, name, tensor in sorted(state, key=lambda item: (item[1], item[0])):
+        records.append(
+            {
+                "name": name,
+                "kind": kind,
+                "dtype": str(tensor.dtype).removeprefix("torch."),
+                "shape": list(tensor.shape),
+                "nbytes": tensor.numel() * tensor.element_size(),
+                "sha256": _tensor_sha256(tensor, chunk_bytes=chunk_bytes),
+            }
+        )
+    return records
+
+
 class VllmCheckpointPathWorkerExtension:
     """Minimal vLLM-only extension used by the single-GPU proxy."""
 
@@ -53,5 +99,13 @@ class VllmCheckpointPathWorkerExtension:
         """Reload a serialized checkpoint directory for validation or recovery."""
         self.model_runner.reload_weights(weights_path=path, is_checkpoint_format=True)
 
+    def checkpoint_state_fingerprints(self) -> list[dict[str, Any]]:
+        """Fingerprint the loaded TP shard for cold-vs-online validation."""
+        return checkpoint_state_fingerprints(self.model_runner)
 
-__all__ = ["VllmCheckpointPathWorkerExtension", "reload_checkpoint_buckets"]
+
+__all__ = [
+    "VllmCheckpointPathWorkerExtension",
+    "checkpoint_state_fingerprints",
+    "reload_checkpoint_buckets",
+]

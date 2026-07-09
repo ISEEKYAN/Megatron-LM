@@ -35,8 +35,9 @@ run_container() {
 
 if [[ "${COMPARE_ONLY:-0}" == 1 ]]; then
   [[ -s "${OUTPUT_DIR}/cold-load.pt" && -s "${OUTPUT_DIR}/online-reload.pt" \
-    && -s "${OUTPUT_DIR}/mlite.pt" ]] || {
-    echo "COMPARE_ONLY requires cold-load.pt, online-reload.pt, and mlite.pt" >&2
+    && -s "${OUTPUT_DIR}/mlite.pt" \
+    && -s "${OUTPUT_DIR}/engine-weight-report.json" ]] || {
+    echo "COMPARE_ONLY requires three logprob artifacts and engine-weight-report.json" >&2
     exit 6
   }
 else
@@ -59,10 +60,12 @@ else
   run_container "${VLLM_OVERLAY}" \
     "python -m examples.verl.ds4_resync_tp4 collect --model '${RESYNC_DIR}' \
       --output '${OUTPUT_DIR}/cold-load.pt' --resync-model '${RESYNC_DIR}' \
-      --resync-output '${OUTPUT_DIR}/online-reload.pt'"
+      --resync-output '${OUTPUT_DIR}/online-reload.pt' \
+      --weight-output '${OUTPUT_DIR}/engine-weight-report.json'"
 fi
 run_container "${MLITE_OVERLAY}" \
   "CUDA_VISIBLE_DEVICES=0 python -m examples.verl.ds4_resync_tp4 \
     compare --cold '${OUTPUT_DIR}/cold-load.pt' \
     --online '${OUTPUT_DIR}/online-reload.pt' --mlite '${OUTPUT_DIR}/mlite.pt' \
+    --weights '${OUTPUT_DIR}/engine-weight-report.json' \
     --output '${OUTPUT_DIR}/report.json'"
