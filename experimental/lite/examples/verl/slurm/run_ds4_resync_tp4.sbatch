@@ -18,6 +18,7 @@ MLITE_SRC=${MLITE_SRC:?set MLITE_SRC}
 MLITE_COMMIT=${MLITE_COMMIT:?set MLITE_COMMIT}
 OUTPUT_DIR=${OUTPUT_DIR:?set OUTPUT_DIR}
 RESYNC_DIR=${OUTPUT_DIR}/resync-checkpoint
+VLLM_COMPLETE=${OUTPUT_DIR}/DS4_TP4_VLLM_COMPLETE
 
 [[ "$(git -C "${MLITE_SRC}" rev-parse HEAD)" == "${MLITE_COMMIT}" ]] || {
   echo "MLite source is not at ${MLITE_COMMIT}" >&2
@@ -42,7 +43,8 @@ if [[ "${COMPARE_ONLY:-0}" == 1 ]]; then
   [[ -s "${OUTPUT_DIR}/cold-load.pt" && -s "${OUTPUT_DIR}/online-reload.pt" \
     && -s "${OUTPUT_DIR}/mlite.pt" \
     && -s "${OUTPUT_DIR}/engine-weight-report.json" \
-    && -s "${OUTPUT_DIR}/export-coverage.json" ]] || {
+    && -s "${OUTPUT_DIR}/export-coverage.json" \
+    && -s "${VLLM_COMPLETE}" ]] || {
     echo "COMPARE_ONLY requires three logprob artifacts and both weight reports" >&2
     exit 6
   }
@@ -69,6 +71,12 @@ else
       --output '${OUTPUT_DIR}/cold-load.pt' --resync-model '${RESYNC_DIR}' \
       --resync-output '${OUTPUT_DIR}/online-reload.pt' \
       --weight-output '${OUTPUT_DIR}/engine-weight-report.json'"
+  [[ -s "${OUTPUT_DIR}/cold-load.pt" && -s "${OUTPUT_DIR}/online-reload.pt" \
+    && -s "${OUTPUT_DIR}/engine-weight-report.json" \
+    && -s "${VLLM_COMPLETE}" ]] || {
+    echo "vLLM collect exited without durable completion artifacts" >&2
+    exit 8
+  }
 fi
 run_container "${MLITE_OVERLAY}" \
   "CUDA_VISIBLE_DEVICES=0 python -m examples.verl.ds4_resync_tp4 \

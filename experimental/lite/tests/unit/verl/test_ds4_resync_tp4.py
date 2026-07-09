@@ -385,10 +385,41 @@ def test_formal_sbatch_uses_mixed_source_for_mlite_and_fp8_artifact_for_vllm() -
     assert "--weight-output '${OUTPUT_DIR}/engine-weight-report.json'" in script
     assert '-s "${OUTPUT_DIR}/engine-weight-report.json"' in script
     assert '-s "${OUTPUT_DIR}/export-coverage.json"' in script
+    assert 'DS4_TP4_VLLM_COMPLETE' in script
     assert "--weights '${OUTPUT_DIR}/engine-weight-report.json'" in script
     assert "MLITE_COMMIT=${MLITE_COMMIT:?set MLITE_COMMIT}" in script
     assert 'git -C "${MLITE_SRC}" rev-parse HEAD' in script
     assert "convert --source" not in script
+
+
+def test_durable_vllm_completion_fsyncs_artifacts_and_exits(
+    tmp_path, monkeypatch
+) -> None:
+    import examples.verl.ds4_resync_tp4 as module
+
+    artifacts = [tmp_path / "cold.pt", tmp_path / "online.pt"]
+    for artifact in artifacts:
+        artifact.write_bytes(b"payload")
+    marker = tmp_path / "DS4_TP4_VLLM_COMPLETE"
+
+    def fake_exit(code: int) -> None:
+        raise SystemExit(code)
+
+    monkeypatch.setattr(module.os, "_exit", fake_exit)
+    with pytest.raises(SystemExit) as exc:
+        module.durable_vllm_completion(artifacts, marker)
+
+    assert exc.value.code == 0
+    assert marker.read_text() == "complete\n"
+
+
+def test_durable_vllm_completion_rejects_missing_artifact(tmp_path) -> None:
+    from examples.verl.ds4_resync_tp4 import durable_vllm_completion
+
+    with pytest.raises(ValueError, match="missing or empty"):
+        durable_vllm_completion(
+            [tmp_path / "missing.pt"], tmp_path / "DS4_TP4_VLLM_COMPLETE"
+        )
 
 
 def test_model_vocab_size_includes_non_tokenizer_slots() -> None:

@@ -25,6 +25,7 @@ _DAPO_CLIP_LOW = 0.8
 _DAPO_CLIP_HIGH = 1.2
 _DEFAULT_MAX_SHARD_BYTES = 5 * 1024**3
 _FINGERPRINT_MISMATCH_EXAMPLES = 100
+_VLLM_COMPLETE_MARKER = "DS4_TP4_VLLM_COMPLETE"
 
 
 def math_prompts() -> list[str]:
@@ -536,6 +537,24 @@ def collect_engine_weight_fingerprints(llm: Any) -> list[list[dict[str, Any]]]:
     return records
 
 
+def durable_vllm_completion(artifacts: Iterable[Path], marker: Path) -> None:
+    """Persist successful vLLM outputs before bypassing its broken teardown."""
+    paths = list(artifacts)
+    missing = [path for path in paths if not path.is_file() or path.stat().st_size == 0]
+    if missing:
+        raise ValueError(f"vLLM completion artifacts are missing or empty: {missing}")
+    for path in paths:
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    with marker.open("w") as handle:
+        handle.write("complete\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    print(f"{_VLLM_COMPLETE_MARKER}={marker}", flush=True)
+    os._exit(0)
+
+
 def collect(
     model: Path,
     output: Path,
@@ -591,6 +610,12 @@ def collect(
         resync_rows = _collect_vllm_rows(llm, tokenizer, vocab_size)
         torch.save(resync_rows, resync_output)
         print(f"DS4_TP4_FP8_ONLINE_RELOAD_COMPLETE={resync_output}", flush=True)
+    artifacts = [output]
+    if resync_output is not None and weight_output is not None:
+        artifacts.extend((resync_output, weight_output))
+    durable_vllm_completion(
+        artifacts, output.parent / _VLLM_COMPLETE_MARKER
+    )
 
 
 def collect_mlite(
