@@ -165,9 +165,15 @@ def compare_step_traces(
 
 
 def compare_correctness_artifacts(
-    baseline: dict[str, Any], candidate: dict[str, Any]
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    loss_atol: float = 0.0,
+    loss_rtol: float = 0.0,
+    tensor_atol: float = 0.0,
+    tensor_rtol: float = 0.0,
 ) -> dict[str, Any]:
-    """Strict bitwise comparison for deterministic correctness artifacts."""
+    """Compare deterministic artifacts, with explicit opt-in numeric tolerances."""
     base_steps = baseline.get("steps", [])
     cand_steps = candidate.get("steps", [])
     sample_count = min(len(base_steps), len(cand_steps))
@@ -175,9 +181,11 @@ def compare_correctness_artifacts(
 
     max_loss_abs = 0.0
     max_grad_norm_abs = 0.0
+    max_tensor_abs = 0.0
     mismatches: list[dict[str, Any]] = []
 
     def _tensor_fingerprint_matches(base: Any, cand: Any) -> bool:
+        nonlocal max_tensor_abs
         if base == cand:
             return True
         if not isinstance(base, dict) or not isinstance(cand, dict):
@@ -186,7 +194,24 @@ def compare_correctness_artifacts(
             return False
         base_bf16 = base.get("sha256_as_bf16")
         cand_bf16 = cand.get("sha256_as_bf16")
-        return bool(base_bf16 and base_bf16 == cand_bf16)
+        if base_bf16 and base_bf16 == cand_bf16:
+            return True
+        if tensor_atol <= 0.0 and tensor_rtol <= 0.0:
+            return False
+        base_values = base.get("values")
+        cand_values = cand.get("values")
+        if not isinstance(base_values, list) or not isinstance(cand_values, list):
+            return False
+        if len(base_values) != len(cand_values):
+            return False
+        local_max = max(
+            (abs(float(base_value) - float(cand_value))
+             for base_value, cand_value in zip(base_values, cand_values, strict=True)),
+            default=0.0,
+        )
+        max_tensor_abs = max(max_tensor_abs, local_max)
+        reference_max = max((abs(float(value)) for value in base_values), default=0.0)
+        return local_max <= tensor_atol + tensor_rtol * reference_max
 
     base_eval = baseline.get("eval_logits")
     cand_eval = candidate.get("eval_logits")
@@ -204,9 +229,14 @@ def compare_correctness_artifacts(
         if math.isfinite(grad_abs):
             max_grad_norm_abs = max(max_grad_norm_abs, grad_abs)
 
-        for field in ("loss", "grad_norm", "post_step_weights", "update_successful", "num_zeros"):
-            if base.get(field) != cand.get(field):
-                mismatches.append({"step": idx, "field": field})
+        loss_matches = base.get("loss") == cand.get("loss")
+        if not loss_matches and (loss_atol > 0.0 or loss_rtol > 0.0):
+            loss_matches = loss_abs <= loss_atol + loss_rtol * abs(float(base["loss"]["value"]))
+        if not loss_matches:
+            mismatches.append({"step": idx, "field": "loss"})
+        for field_name in ("grad_norm", "post_step_weights", "update_successful", "num_zeros"):
+            if base.get(field_name) != cand.get(field_name):
+                mismatches.append({"step": idx, "field": field_name})
         if not _tensor_fingerprint_matches(base.get("logits"), cand.get("logits")):
             mismatches.append({"step": idx, "field": "logits"})
 
@@ -224,7 +254,14 @@ def compare_correctness_artifacts(
         "passed": lengths_match and not mismatches,
         "max_loss_abs": max_loss_abs,
         "max_grad_norm_abs": max_grad_norm_abs,
+        "max_tensor_abs": max_tensor_abs,
         "tensor_fingerprint_rule": "raw_sha256_or_bf16_canonical_sha256",
+        "numeric_tolerance": {
+            "loss_atol": loss_atol,
+            "loss_rtol": loss_rtol,
+            "tensor_atol": tensor_atol,
+            "tensor_rtol": tensor_rtol,
+        },
         "mismatches": mismatches,
     }
 

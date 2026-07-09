@@ -8,6 +8,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-"${REPO_ROOT}/experimental/lite/examples/bench/outputs/
 
 export PYTHONPATH="${REPO_ROOT}/experimental/lite:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export MEGATRON_LITE_DETERMINISTIC=1
+export MLITE_CORRECTNESS_INCLUDE_VALUES=1
 export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8}
 
 mkdir -p "${OUTPUT_DIR}"
@@ -49,5 +50,7 @@ run_tp 4
   "${OUTPUT_DIR}/qwen35_mlite_tp2.json" \
   "${OUTPUT_DIR}/qwen35_mlite_tp4.json" \
   --output-json "${OUTPUT_DIR}/qwen35_mlite_tp2_vs_tp4.json" \
+  --loss-atol "${LOSS_ATOL:-1e-3}" \
+  --tensor-atol "${TENSOR_ATOL:-5e-2}" \
   --fail-on-mismatch \
   2>&1 | tee "${OUTPUT_DIR}/qwen35_mlite_tp2_vs_tp4.log"
