@@ -22,7 +22,7 @@ def test_hopper_resync_runner_covers_training_fp8_proxy_and_rollout_probe() -> N
     script = SCRIPT.read_text()
 
     assert '"${HOPPER_SMOKE}" training' in script
-    assert 'PYTHONPATH="${COMMON_PYTHONPATH}' in script
+    assert 'PYTHONPATH="${LITE_ROOT}:${COMMON_PYTHONPATH}' in script
     assert 'python "${EXAMPLE_ROOT}/ds4_hopper_resync_proxy.py"' in script
     assert '"${HOPPER_SMOKE}" rollout-probe' in script
     assert "CUDA_VISIBLE_DEVICES=0" in script
