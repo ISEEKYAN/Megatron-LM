@@ -179,6 +179,43 @@ format: MXFP4 E2M1 with UE8M0 scales for `expert_dtype=fp4`, or block-FP8 with
 FP32 scales for `expert_dtype=fp8`. Router, normalization, compressor, and other
 unscaled checkpoint families remain unquantized.
 
+### GB200 MLite DSA overlay
+
+The GB200 training-side environment reuses the validated NGC PyTorch 26.06 and
+vLLM rollout overlay without modifying it. The build in
+`slurm/build_ds4_sm100_overlay.sbatch` creates a separate thin MLite overlay,
+exposes the rollout overlay's cuDNN Frontend 1.26 and CUTLASS DSL packages, and
+compiles the pinned FlashMLA sparse-forward extension for SM100 only. It does
+not reuse an H100 wheel or ABI shim.
+
+Set `MLITE_SRC` to a remote checkout of this repository and export its exact
+commit before submitting the build:
+
+```bash
+export MLITE_SRC=/lustre/path/to/Megatron-LM-ds4-sm100
+export MLITE_COMMIT="$(git -C "${MLITE_SRC}" rev-parse HEAD)"
+export DS4_SM100_SCRIPT_DIR="${MLITE_SRC}/experimental/lite/examples/verl/slurm"
+sbatch --export=ALL "${DS4_SM100_SCRIPT_DIR}/build_ds4_sm100_overlay.sbatch"
+```
+
+The build runs `examples.verl.ds4_sm100_env probe` on a Slurm-allocated GB200
+and fails unless FlashMLA exports `flash_mla_sparse_fwd`, cuDNN Frontend exports
+the SM100 indexer entry, and MLite selects that entry for compute capability
+10.0. After the build succeeds, the formal forward launcher loads the pinned
+official DeepSeek-V4-Flash checkpoint into an EP4 MLite BF16 master and evaluates
+the same 36 teacher-forced math prompts used by `ds4_resync_tp4.py`:
+
+```bash
+export OUTPUT_DIR=/lustre/path/to/new-output-directory
+sbatch --export=ALL "${DS4_SM100_SCRIPT_DIR}/run_ds4_mlite_bf16_forward.sbatch"
+```
+
+Success requires `DS4_SM100_DSA_ENV_READY`,
+`DS4_MLITE_BF16_FORWARD_COMPLETE`, `DS4_MLITE_BF16_PAYLOAD_VERIFIED`, and
+`DS4_MLITE_SM100_FORWARD_OK` in the Slurm log, plus a zero job and step exit
+code. The launcher also writes the pure block-FP8 export consumed by the
+rollout parity job; it does not evaluate or preserve MXFP4 inference weights.
+
 ## Smoke / Dry-Run Checks
 
 Checked on this branch on 2026-06-07. These checks cover shell syntax,
