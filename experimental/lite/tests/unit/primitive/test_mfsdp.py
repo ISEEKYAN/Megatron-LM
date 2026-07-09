@@ -85,6 +85,26 @@ def test_mfsdp_has_no_megatron_core_imports():
     assert violations == []
 
 
+def test_mfsdp_standalone_smoke_has_no_megatron_core_imports():
+    smoke_path = (
+        Path(__file__).parents[2] / "smoke" / "primitive" / "test_mfsdp_parity_smoke.py"
+    )
+    tree = ast.parse(smoke_path.read_text(), filename=str(smoke_path))
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module or ""]
+        else:
+            continue
+        for module in modules:
+            if module == "megatron.core" or module.startswith("megatron.core."):
+                violations.append(f"{smoke_path.name}:{node.lineno}: {module}")
+
+    assert violations == []
+
+
 def test_mfsdp_is_standalone_without_vendored_mcore_or_fsdp2_dependencies():
     package = Path(mfsdp_config.__file__).parent
 

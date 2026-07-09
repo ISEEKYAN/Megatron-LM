@@ -156,14 +156,8 @@ def _single_node_cuda_dist():
         dist.init_process_group(backend="nccl", init_method="env://")
         created_pg = True
     yield
-    try:
-        from megatron.core import parallel_state as mpu
-
-        if mpu.is_initialized():
-            mpu.destroy_model_parallel()
-    finally:
-        if created_pg and dist.is_initialized():
-            dist.destroy_process_group()
+    if created_pg and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def _install_transformer_engine_import_stub_if_needed() -> None:
