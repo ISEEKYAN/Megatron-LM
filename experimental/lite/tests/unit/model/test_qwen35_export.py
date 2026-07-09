@@ -370,6 +370,43 @@ def test_qwen35_export_unpacks_full_attention_q_gate() -> None:
     assert torch.equal(exported["model.language_model.layers.0.self_attn.v_proj.weight"], value)
 
 
+def test_qwen35_full_attention_tp4_shards_roundtrip_with_two_kv_heads() -> None:
+    cfg = _tiny_config()
+    cfg.num_attention_heads = 8
+    cfg.num_key_value_heads = 2
+    hidden = cfg.hidden_size
+    q_gate = torch.arange(cfg.num_attention_heads * 2 * cfg.head_dim * hidden).reshape(
+        -1, hidden
+    )
+    key = torch.arange(
+        q_gate.numel(), q_gate.numel() + cfg.num_key_value_heads * cfg.head_dim * hidden
+    ).reshape(-1, hidden)
+    value = torch.arange(
+        key[-1, -1] + 1,
+        key[-1, -1] + 1 + cfg.num_key_value_heads * cfg.head_dim * hidden,
+    ).reshape(-1, hidden)
+
+    packed = _merge_full_attn_qkvg(q_gate, key, value, cfg=cfg)
+    tp4_shards = packed.chunk(4, dim=0)
+    gathered = torch.cat(tp4_shards, dim=0)
+    exported = dict(
+        Qwen35WeightSpec(cfg).native_to_hf(
+            "layers.0.full_attn.qkv.linear.weight", gathered
+        )
+    )
+
+    assert all(shard.shape == tp4_shards[0].shape for shard in tp4_shards)
+    assert torch.equal(
+        exported["model.language_model.layers.0.self_attn.q_proj.weight"], q_gate
+    )
+    assert torch.equal(
+        exported["model.language_model.layers.0.self_attn.k_proj.weight"], key
+    )
+    assert torch.equal(
+        exported["model.language_model.layers.0.self_attn.v_proj.weight"], value
+    )
+
+
 def test_qwen35_export_maps_linear_attention_to_hf_checkpoint_names() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)
