@@ -5,12 +5,14 @@ set -euo pipefail
 readonly PINNED_MEGATRON_REVISION=d64ba4ccb1e3e878c15171c9cc58d5d3b46bf4d5
 readonly PINNED_EMERGING_REVISION=b309e2f01cda75dc96a6dc1a2355a7b3b64b5e16
 
-REPO_ROOT=${REPO_ROOT:-$(git rev-parse --show-toplevel)}
+VALIDATE_PINNED_REVISIONS_ONLY=${VALIDATE_PINNED_REVISIONS_ONLY:-0}
+if [[ "${VALIDATE_PINNED_REVISIONS_ONLY}" != 0 && "${VALIDATE_PINNED_REVISIONS_ONLY}" != 1 ]]; then
+  echo "VALIDATE_PINNED_REVISIONS_ONLY must be 0 or 1" >&2
+  exit 2
+fi
+
 MEGATRON_ROOT=${MEGATRON_ROOT:?set MEGATRON_ROOT to the pinned Megatron checkout}
 EMERGING_ROOT=${EMERGING_ROOT:?set EMERGING_ROOT to the pinned Emerging-Optimizers checkout}
-HF_PATH=${HF_PATH:?set HF_PATH to the fixed HuggingFace Qwen3.5 checkpoint}
-OUTPUT_DIR=${OUTPUT_DIR:?set OUTPUT_DIR to a persistent artifact directory}
-MLITE_CONTAINER_IMAGE=${MLITE_CONTAINER_IMAGE:?record the Slurm container image path}
 
 actual_megatron_revision=$(git -C "${MEGATRON_ROOT}" rev-parse HEAD)
 actual_emerging_revision=$(git -C "${EMERGING_ROOT}" rev-parse HEAD)
@@ -22,6 +24,16 @@ if [[ "${actual_emerging_revision}" != "${PINNED_EMERGING_REVISION}" ]]; then
   echo "Emerging-Optimizers revision mismatch: ${actual_emerging_revision}" >&2
   exit 2
 fi
+if [[ "${VALIDATE_PINNED_REVISIONS_ONLY}" == 1 ]]; then
+  echo "Pinned Megatron revision verified: ${actual_megatron_revision}"
+  echo "Pinned Emerging-Optimizers revision verified: ${actual_emerging_revision}"
+  exit 0
+fi
+
+REPO_ROOT=${REPO_ROOT:-$(git rev-parse --show-toplevel)}
+HF_PATH=${HF_PATH:?set HF_PATH to the fixed HuggingFace Qwen3.5 checkpoint}
+OUTPUT_DIR=${OUTPUT_DIR:?set OUTPUT_DIR to a persistent artifact directory}
+MLITE_CONTAINER_IMAGE=${MLITE_CONTAINER_IMAGE:?record the Slurm container image path}
 if [[ ! -f "${HF_PATH}/config.json" ]]; then
   echo "Qwen3.5 checkpoint is missing config.json: ${HF_PATH}" >&2
   exit 2
