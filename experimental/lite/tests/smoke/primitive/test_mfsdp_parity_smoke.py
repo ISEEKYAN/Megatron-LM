@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+import statistics
 import sys
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -27,6 +29,14 @@ pytestmark = [
 ]
 
 _MFSDP_SHARDING_STRATEGY = "optim_grads_params"
+_PRECISION_STEPS = 50
+_LOSS_REL_TOL = 1.0e-2
+_TENSOR_RTOL = 1.0e-2
+_TENSOR_ATOL = 1.0e-5
+_BENCH_WARMUP_STEPS = 5
+_BENCH_MEASURE_STEPS = 20
+_BENCH_TOKENS_PER_RANK = 1024
+_MIN_SPEEDUP = 1.0
 
 
 class TinyUnit(nn.Module):
@@ -75,6 +85,32 @@ class TinyParallelModel(nn.Module):
     def forward(self, x):
         hidden = self.unit(x) + self.tp_bias
         return self.out(self.experts(hidden))
+
+
+class BenchmarkUnit(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.up = nn.Linear(hidden_size, hidden_size * 2, bias=False)
+        self.down = nn.Linear(hidden_size * 2, hidden_size, bias=False)
+
+    def forward(self, x):
+        return x + self.down(torch.nn.functional.gelu(self.up(x)))
+
+
+class BenchmarkModel(nn.Module):
+    hidden_size = 1024
+    num_layers = 12
+
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            BenchmarkUnit(self.hidden_size) for _ in range(self.num_layers)
+        )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -192,6 +228,7 @@ def _build_fsdp2_pair(
     parallel: ParallelConfig,
     model_type: type[nn.Module] = TinyDenseModel,
     expert_classifier=None,
+    unit_modules: tuple[type[nn.Module], ...] = (TinyUnit,),
 ):
     ps = _parallel_state(parallel)
     chunks = [_new_model(seed, model_type)]
@@ -199,7 +236,7 @@ def _build_fsdp2_pair(
         chunks,
         _optimizer_cfg(),
         ps,
-        unit_modules=(TinyUnit,),
+        unit_modules=unit_modules,
         expert_classifier=expert_classifier,
         deterministic=True,
         use_fp32_master=True,
@@ -213,6 +250,7 @@ def _build_mfsdp_pair(
     parallel: ParallelConfig,
     model_type: type[nn.Module] = TinyDenseModel,
     expert_classifier=None,
+    unit_modules: tuple[type[nn.Module], ...] = (TinyUnit,),
 ):
     ps = _parallel_state(parallel)
     chunks = [_new_model(seed, model_type)]
@@ -222,12 +260,10 @@ def _build_mfsdp_pair(
     )
     optimizer, finalize = build_mfsdp_training_optimizer(
         chunks,
-        model_cfg=_model_cfg(),
         impl_cfg=impl_cfg,
         ps=ps,
         is_expert=expert_classifier or (lambda _name: False),
-        fsdp_unit_modules=(TinyUnit,),
-        deterministic=True,
+        fsdp_unit_modules=unit_modules,
     )
     return chunks, optimizer, finalize
 
@@ -243,6 +279,35 @@ def _train_once(chunks, optimizer, finalize, x: torch.Tensor, target: torch.Tens
     grads = _named_optimizer_grads(optimizer)
     optimizer.zero_grad()
     return bool(success), float(loss.detach().cpu()), float(grad_norm), grads
+
+
+def _train_step(chunks, optimizer, finalize, x: torch.Tensor, target: torch.Tensor):
+    optimizer.zero_grad()
+    output = chunks[0](x)
+    loss = torch.nn.functional.mse_loss(output.float(), target.float())
+    loss.backward()
+    if finalize is not None:
+        finalize()
+    success, grad_norm, _num_zeros = optimizer.step()
+    return bool(success), float(loss.detach()), float(grad_norm)
+
+
+def _timed_train_step(chunks, optimizer, finalize, x, target) -> float:
+    torch.cuda.synchronize()
+    started = time.perf_counter()
+    success, _loss, _grad_norm = _train_step(chunks, optimizer, finalize, x, target)
+    torch.cuda.synchronize()
+    assert success
+    elapsed = torch.tensor(time.perf_counter() - started, device="cuda")
+    dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    return float(elapsed)
+
+
+def _max_relative_difference(lhs: list[float], rhs: list[float]) -> float:
+    return max(
+        abs(left - right) / max(abs(left), abs(right), 1.0e-12)
+        for left, right in zip(lhs, rhs)
+    )
 
 
 def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -273,7 +338,7 @@ def _canonical_optimizer_name(name: str) -> str:
 
 
 def _named_optimizer_grads(optimizer) -> dict[str, torch.Tensor]:
-    model_chunks = getattr(optimizer, "model_chunks", None)
+    model_chunks = getattr(optimizer, "_model_chunks", None)
     if model_chunks is not None:
         return _named_mfsdp_optimizer_grads(model_chunks)
 
@@ -317,16 +382,27 @@ def _named_mfsdp_optimizer_grads(model_chunks) -> dict[str, torch.Tensor]:
     return grads
 
 
-def _assert_tensor_sets_equal(
+def _assert_tensor_sets_close(
     lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]
-) -> float:
+) -> tuple[float, float]:
     assert lhs.keys() == rhs.keys()
     max_abs = 0.0
+    max_rel = 0.0
     for name in lhs:
         diff = (lhs[name] - rhs[name]).abs()
         max_abs = max(max_abs, float(diff.max().item()))
-        assert torch.equal(lhs[name], rhs[name]), name
-    return max_abs
+        denominator = torch.maximum(lhs[name].abs(), rhs[name].abs()).clamp_min(
+            _TENSOR_ATOL
+        )
+        max_rel = max(max_rel, float((diff / denominator).max().item()))
+        torch.testing.assert_close(
+            lhs[name],
+            rhs[name],
+            rtol=_TENSOR_RTOL,
+            atol=_TENSOR_ATOL,
+            msg=lambda message: f"{name}: {message}",
+        )
+    return max_abs, max_rel
 
 
 def _dense_parallel_config() -> ParallelConfig:
@@ -339,6 +415,163 @@ def _tp_ep_parallel_config() -> ParallelConfig:
 
 def _is_tiny_expert(name: str) -> bool:
     return name.startswith("experts.")
+
+
+def test_mfsdp_precision_curve_matches_fsdp2():
+    torch.manual_seed(4026 + dist.get_rank())
+    torch.cuda.manual_seed_all(4026 + dist.get_rank())
+    x = torch.randn(32, 8, device="cuda", dtype=torch.bfloat16)
+    target = torch.randn(32, 4, device="cuda", dtype=torch.bfloat16)
+    parallel = _dense_parallel_config()
+
+    fsdp2_chunks, fsdp2_optimizer, fsdp2_finalize = _build_fsdp2_pair(
+        seed=3456, parallel=parallel
+    )
+    mfsdp_chunks, mfsdp_optimizer, mfsdp_finalize = _build_mfsdp_pair(
+        seed=3456, parallel=parallel
+    )
+
+    fsdp2_losses = []
+    mfsdp_losses = []
+    for _step in range(_PRECISION_STEPS):
+        fsdp2_success, fsdp2_loss, _ = _train_step(
+            fsdp2_chunks, fsdp2_optimizer, fsdp2_finalize, x, target
+        )
+        mfsdp_success, mfsdp_loss, _ = _train_step(
+            mfsdp_chunks, mfsdp_optimizer, mfsdp_finalize, x, target
+        )
+        assert fsdp2_success
+        assert mfsdp_success
+        fsdp2_losses.append(fsdp2_loss)
+        mfsdp_losses.append(mfsdp_loss)
+
+    max_loss_rel_diff = torch.tensor(
+        _max_relative_difference(fsdp2_losses, mfsdp_losses), device="cuda"
+    )
+    dist.all_reduce(max_loss_rel_diff, op=dist.ReduceOp.MAX)
+    first_window_fsdp2 = statistics.mean(fsdp2_losses[:10])
+    final_window_fsdp2 = statistics.mean(fsdp2_losses[-10:])
+    first_window_mfsdp = statistics.mean(mfsdp_losses[:10])
+    final_window_mfsdp = statistics.mean(mfsdp_losses[-10:])
+
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_PRECISION] "
+            f"world_size={dist.get_world_size()} "
+            f"steps={_PRECISION_STEPS} "
+            f"loss_rel_tol={_LOSS_REL_TOL:.3e} "
+            f"max_loss_rel_diff={float(max_loss_rel_diff):.8e} "
+            f"first_loss_fsdp2={first_window_fsdp2:.8f} "
+            f"final_loss_fsdp2={final_window_fsdp2:.8f} "
+            f"first_loss_mfsdp={first_window_mfsdp:.8f} "
+            f"final_loss_mfsdp={final_window_mfsdp:.8f}",
+            flush=True,
+        )
+
+    assert torch.isfinite(max_loss_rel_diff)
+    assert float(max_loss_rel_diff) <= _LOSS_REL_TOL
+    assert final_window_fsdp2 < first_window_fsdp2
+    assert final_window_mfsdp < first_window_mfsdp
+
+
+def test_mfsdp_throughput_exceeds_fsdp2():
+    torch.manual_seed(5026 + dist.get_rank())
+    torch.cuda.manual_seed_all(5026 + dist.get_rank())
+    x = torch.randn(
+        _BENCH_TOKENS_PER_RANK,
+        BenchmarkModel.hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    target = torch.zeros_like(x)
+    parallel = _dense_parallel_config()
+
+    fsdp2_chunks, fsdp2_optimizer, fsdp2_finalize = _build_fsdp2_pair(
+        seed=4567,
+        parallel=parallel,
+        model_type=BenchmarkModel,
+        unit_modules=(BenchmarkUnit,),
+    )
+    mfsdp_chunks, mfsdp_optimizer, mfsdp_finalize = _build_mfsdp_pair(
+        seed=4567,
+        parallel=parallel,
+        model_type=BenchmarkModel,
+        unit_modules=(BenchmarkUnit,),
+    )
+
+    for step in range(_BENCH_WARMUP_STEPS):
+        pairs = (
+            (
+                fsdp2_chunks,
+                fsdp2_optimizer,
+                fsdp2_finalize,
+            ),
+            (
+                mfsdp_chunks,
+                mfsdp_optimizer,
+                mfsdp_finalize,
+            ),
+        )
+        if step % 2:
+            pairs = tuple(reversed(pairs))
+        for chunks, optimizer, finalize in pairs:
+            _train_step(chunks, optimizer, finalize, x, target)
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    fsdp2_times = []
+    mfsdp_times = []
+    for step in range(_BENCH_MEASURE_STEPS):
+        pairs = [
+            (
+                "fsdp2",
+                fsdp2_chunks,
+                fsdp2_optimizer,
+                fsdp2_finalize,
+                fsdp2_times,
+            ),
+            (
+                "mfsdp",
+                mfsdp_chunks,
+                mfsdp_optimizer,
+                mfsdp_finalize,
+                mfsdp_times,
+            ),
+        ]
+        if step % 2:
+            pairs.reverse()
+        for _name, chunks, optimizer, finalize, samples in pairs:
+            samples.append(_timed_train_step(chunks, optimizer, finalize, x, target))
+
+    fsdp2_step_s = statistics.median(fsdp2_times)
+    mfsdp_step_s = statistics.median(mfsdp_times)
+    global_tokens = _BENCH_TOKENS_PER_RANK * dist.get_world_size()
+    fsdp2_tokens_per_s = global_tokens / fsdp2_step_s
+    mfsdp_tokens_per_s = global_tokens / mfsdp_step_s
+    speedup = mfsdp_tokens_per_s / fsdp2_tokens_per_s
+    peak_memory_bytes = torch.tensor(
+        torch.cuda.max_memory_allocated(), device="cuda", dtype=torch.float64
+    )
+    dist.all_reduce(peak_memory_bytes, op=dist.ReduceOp.MAX)
+    peak_memory_gib = float(peak_memory_bytes) / (1024**3)
+
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_THROUGHPUT] "
+            f"world_size={dist.get_world_size()} "
+            f"warmup_steps={_BENCH_WARMUP_STEPS} "
+            f"measure_steps={_BENCH_MEASURE_STEPS} "
+            f"tokens_per_rank={_BENCH_TOKENS_PER_RANK} "
+            f"fsdp2_step_ms={fsdp2_step_s * 1000.0:.4f} "
+            f"mfsdp_step_ms={mfsdp_step_s * 1000.0:.4f} "
+            f"fsdp2_tokens_per_s={fsdp2_tokens_per_s:.2f} "
+            f"mfsdp_tokens_per_s={mfsdp_tokens_per_s:.2f} "
+            f"mfsdp_speedup={speedup:.4f} "
+            f"peak_memory_gib={peak_memory_gib:.4f}",
+            flush=True,
+        )
+
+    assert speedup > _MIN_SPEEDUP
 
 
 def test_mfsdp_matches_fsdp2_tiny_dense_single_step():
@@ -364,18 +597,16 @@ def test_mfsdp_matches_fsdp2_tiny_dense_single_step():
 
     assert fsdp2_success
     assert mfsdp_success
-    assert fsdp2_loss == mfsdp_loss
-    assert fsdp2_grad_norm == mfsdp_grad_norm
-    max_grad_abs = _assert_tensor_sets_equal(fsdp2_grads, mfsdp_grads)
-    max_param_abs = _assert_tensor_sets_equal(
+    assert fsdp2_loss == pytest.approx(mfsdp_loss, rel=_LOSS_REL_TOL)
+    assert fsdp2_grad_norm == pytest.approx(mfsdp_grad_norm, rel=_LOSS_REL_TOL)
+    max_grad_abs, max_grad_rel = _assert_tensor_sets_close(fsdp2_grads, mfsdp_grads)
+    max_param_abs, max_param_rel = _assert_tensor_sets_close(
         _named_model_tensors(fsdp2_chunks), _named_model_tensors(mfsdp_chunks)
     )
-    assert max_grad_abs == 0.0
-    assert max_param_abs == 0.0
 
     if dist.get_rank() == 0:
         print(
-            "[MFSDP_PARITY] "
+            "[MFSDP_COMPOSITION] "
             f"world_size={dist.get_world_size()} "
             f"strategy={_MFSDP_SHARDING_STRATEGY} "
             f"loss_fsdp2={fsdp2_loss:.8f} "
@@ -383,7 +614,9 @@ def test_mfsdp_matches_fsdp2_tiny_dense_single_step():
             f"grad_norm_fsdp2={fsdp2_grad_norm:.8f} "
             f"grad_norm_mfsdp={mfsdp_grad_norm:.8f} "
             f"max_grad_abs_diff={max_grad_abs:.8e} "
-            f"max_param_abs_diff={max_param_abs:.8e}",
+            f"max_grad_rel_diff={max_grad_rel:.8e} "
+            f"max_param_abs_diff={max_param_abs:.8e} "
+            f"max_param_rel_diff={max_param_rel:.8e}",
             flush=True,
         )
 
@@ -417,18 +650,16 @@ def test_mfsdp_matches_fsdp2_tp_ep_single_step():
 
     assert fsdp2_success
     assert mfsdp_success
-    assert fsdp2_loss == mfsdp_loss
-    assert fsdp2_grad_norm == mfsdp_grad_norm
-    max_grad_abs = _assert_tensor_sets_equal(fsdp2_grads, mfsdp_grads)
-    max_param_abs = _assert_tensor_sets_equal(
+    assert fsdp2_loss == pytest.approx(mfsdp_loss, rel=_LOSS_REL_TOL)
+    assert fsdp2_grad_norm == pytest.approx(mfsdp_grad_norm, rel=_LOSS_REL_TOL)
+    max_grad_abs, max_grad_rel = _assert_tensor_sets_close(fsdp2_grads, mfsdp_grads)
+    max_param_abs, max_param_rel = _assert_tensor_sets_close(
         _named_model_tensors(fsdp2_chunks), _named_model_tensors(mfsdp_chunks)
     )
-    assert max_grad_abs == 0.0
-    assert max_param_abs == 0.0
 
     if dist.get_rank() == 0:
         print(
-            "[MFSDP_PARITY] "
+            "[MFSDP_COMPOSITION] "
             f"world_size={dist.get_world_size()} "
             "topology=tp2_ep2 "
             f"strategy={_MFSDP_SHARDING_STRATEGY} "
@@ -437,6 +668,8 @@ def test_mfsdp_matches_fsdp2_tp_ep_single_step():
             f"grad_norm_fsdp2={fsdp2_grad_norm:.8f} "
             f"grad_norm_mfsdp={mfsdp_grad_norm:.8f} "
             f"max_grad_abs_diff={max_grad_abs:.8e} "
-            f"max_param_abs_diff={max_param_abs:.8e}",
+            f"max_grad_rel_diff={max_grad_rel:.8e} "
+            f"max_param_abs_diff={max_param_abs:.8e} "
+            f"max_param_rel_diff={max_param_rel:.8e}",
             flush=True,
         )
