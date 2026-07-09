@@ -8,10 +8,14 @@ Supports sequence parallel, context parallel, and THD (packed sequences).
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import transformer_engine.pytorch as te
 
-from megatron.lite.primitive.modules.gqa_utils import split_grouped_qkvg
+from megatron.lite.primitive.modules.gqa_utils import (
+    split_grouped_qkvg,
+    split_grouped_qkvg_for_tp,
+)
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
 from megatron.lite.primitive.parallel import ColumnParallelLinear, ParallelState, RowParallelLinear
@@ -31,6 +35,33 @@ _KEPT_PSP_FIELDS = (
     "max_seqlen_q",
     "max_seqlen_kv",
 )
+
+
+class _AllGatherLastDimWithGradReduce(torch.autograd.Function):
+    """All-gather TP activations; reduce-scatter their gradients."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, group) -> torch.Tensor:
+        ctx.group = group
+        ctx.tp_size = dist.get_world_size(group)
+        chunks = [torch.empty_like(x) for _ in range(ctx.tp_size)]
+        dist.all_gather(chunks, x.contiguous(), group=group)
+        return torch.cat(chunks, dim=-1).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        local_width = ensure_divisible(grad_output.shape[-1], ctx.tp_size)
+        flat_grad = grad_output.reshape(-1, grad_output.shape[-1])
+        packed_grad = torch.cat(
+            flat_grad.split(local_width, dim=-1), dim=0
+        ).contiguous()
+        local_grad = torch.empty(
+            (flat_grad.shape[0], local_width),
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        dist.reduce_scatter_tensor(local_grad, packed_grad, group=ctx.group)
+        return local_grad.reshape(*grad_output.shape[:-1], local_width), None
 
 
 class GQAttention(nn.Module):
@@ -62,7 +93,14 @@ class GQAttention(nn.Module):
     ):
         super().__init__()
         self.num_heads_local = ensure_divisible(num_attention_heads, ps.tp_size)
-        self.num_kv_heads_local = ensure_divisible(num_key_value_heads, ps.tp_size)
+        self._replicate_kv = num_key_value_heads < ps.tp_size
+        if self._replicate_kv:
+            ensure_divisible(ps.tp_size, num_key_value_heads)
+            self.num_kv_heads_local = 1
+        else:
+            self.num_kv_heads_local = ensure_divisible(num_key_value_heads, ps.tp_size)
+        self.num_heads = num_attention_heads
+        self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
         self.ps = ps
         self._output_gate = output_gate
@@ -176,6 +214,8 @@ class GQAttention(nn.Module):
         qkv = self.qkv(x)
         if self.qkv_lora is not None:
             qkv = qkv + self.qkv_lora(self._qkv_lora_input(x))
+        if self._replicate_kv:
+            qkv = _AllGatherLastDimWithGradReduce.apply(qkv, self.ps.tp_group)
         q, gate, k, v = self._split_qkv(qkv)
 
         is_thd = packed_seq_params is not None
@@ -282,6 +322,31 @@ class GQAttention(nn.Module):
         nq, nkv, hd = self.num_heads_local, self.num_kv_heads_local, self.head_dim
         lead = qkv.shape[:-1]
         if self._qkv_layout == "mcore":
+            if self._replicate_kv:
+                if self._output_gate:
+                    return split_grouped_qkvg_for_tp(
+                        qkv,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        head_dim=hd,
+                        tp_rank=self.ps.tp_rank,
+                        tp_size=self.ps.tp_size,
+                    )
+
+                replicas_per_kv_head = ensure_divisible(
+                    self.ps.tp_size, self.num_kv_heads
+                )
+                q_heads_per_group = ensure_divisible(self.num_heads, self.num_kv_heads)
+                group_width = (q_heads_per_group + 2) * hd
+                kv_group_rank = self.ps.tp_rank // replicas_per_kv_head
+                q_rank_in_group = self.ps.tp_rank % replicas_per_kv_head
+                qkv = qkv.narrow(-1, kv_group_rank * group_width, group_width)
+                qkv = qkv.view(*lead, 1, group_width)
+                q, k, v = qkv.split([q_heads_per_group * hd, hd, hd], dim=-1)
+                q = q.reshape(*lead, q_heads_per_group, hd)
+                q_start = q_rank_in_group * nq
+                return q[..., q_start : q_start + nq, :], None, k, v
+
             q_per_group = ensure_divisible(nq, nkv)
             if self._output_gate:
                 return split_grouped_qkvg(qkv, num_heads=nq, num_kv_heads=nkv, head_dim=hd)
