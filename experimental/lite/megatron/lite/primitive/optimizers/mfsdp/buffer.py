@@ -111,8 +111,14 @@ class ParamBucket:
             intersection_begin = max(spec_begin, local_begin)
             intersection_end = min(spec_end, local_end)
             spec.shard_numel = max(0, intersection_end - intersection_begin)
-            spec.local_offset = max(0, intersection_begin - local_begin)
-            spec.param_offset = max(0, intersection_begin - spec_begin)
+            spec.local_offset = min(
+                self.local_numel,
+                max(0, intersection_begin - local_begin),
+            )
+            spec.param_offset = min(
+                spec.numel,
+                max(0, intersection_begin - spec_begin),
+            )
             offset = spec_end
 
         self.main_param_buffer = torch.zeros(
