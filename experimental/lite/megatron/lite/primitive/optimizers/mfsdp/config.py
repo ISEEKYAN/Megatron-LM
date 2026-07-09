@@ -1,10 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Megatron-FSDP config lowering and validation.
-
-This module is the isolation boundary for MCore-specific optimizer/DDP config
-shape. The runtime-facing primitive should stay close to FSDP2, while this
-module owns Megatron-FSDP's supported surface and fail-fast checks.
-"""
+"""Standalone Megatron-FSDP config lowering and validation."""
 
 from __future__ import annotations
 
@@ -21,7 +16,12 @@ _SUPPORTED_MODELS = {
     "qwen3_5_mcore_hybrid",
 }
 _SUPPORTED_OPTIMIZERS = {"adam", "sgd"}
-_SUPPORTED_SHARDING_STRATEGIES = {"no_shard", "optim", "optim_grads", "optim_grads_params"}
+_SUPPORTED_SHARDING_STRATEGIES = {
+    "no_shard",
+    "optim",
+    "optim_grads",
+    "optim_grads_params",
+}
 _REQUIRED_DDP_KNOB_VALUES = {
     "use_distributed_optimizer": True,
     "use_megatron_fsdp": True,
@@ -90,7 +90,9 @@ def validate_mfsdp_config(engine_cfg) -> None:
     validate_optimization_knobs(opt)
     validate_mfsdp_topology_optimizer_combo(engine_cfg.parallel, opt)
     if os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1":
-        raise ValueError("Megatron-FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.")
+        raise ValueError(
+            "Megatron-FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset."
+        )
 
 
 def validate_mfsdp_topology(parallel_cfg, *, model_name: str | None = None) -> None:
@@ -99,9 +101,7 @@ def validate_mfsdp_topology(parallel_cfg, *, model_name: str | None = None) -> N
     vpp = int(getattr(parallel_cfg, "vpp", 1) or 1)
 
     if vpp > 1 and pp <= 1:
-        raise ValueError(
-            "optimizer_impl='megatron_fsdp' requires pp>1 when vpp>1."
-        )
+        raise ValueError("optimizer_impl='megatron_fsdp' requires pp>1 when vpp>1.")
 
 
 def validate_mfsdp_topology_optimizer_combo(parallel_cfg, opt) -> None:
@@ -115,7 +115,11 @@ def validate_mfsdp_topology_optimizer_combo(parallel_cfg, opt) -> None:
     if _invalid_distributed_optimizer_instances(instances):
         return
     normalized_instances = _distributed_optimizer_instance_override(instances)
-    if normalized_instances is not None and normalized_instances > 1 and (pp > 1 or vpp > 1):
+    if (
+        normalized_instances is not None
+        and normalized_instances > 1
+        and (pp > 1 or vpp > 1)
+    ):
         raise ValueError(
             "optimizer_impl='megatron_fsdp' does not support "
             "num_distributed_optimizer_instances>1 with pp/vpp yet."
@@ -146,7 +150,7 @@ def split_mfsdp_overrides(
                     raise ValueError(
                         "Megatron-Core DistributedDataParallelConfig does not support "
                         f"{ddp_key!r} in this environment."
-                )
+                    )
                 ddp_overrides[ddp_key] = normalized
         elif ddp_key in ddp_fields:
             _validate_ddp_knob_value(ddp_key, value)
@@ -171,8 +175,8 @@ def split_mfsdp_overrides(
 def validate_optimizer_name(optimizer_name: str) -> None:
     if optimizer_name not in _SUPPORTED_OPTIMIZERS:
         raise ValueError(
-            "optimizer_impl='megatron_fsdp' supports only adam/sgd through "
-            f"Megatron-Core DistributedOptimizer, got {optimizer_name!r}."
+            "optimizer_impl='megatron_fsdp' supports only adam/sgd, "
+            f"got {optimizer_name!r}."
         )
 
 
@@ -190,7 +194,9 @@ def _collect_mfsdp_overrides(opt, ddp_fields: set[str]) -> dict[str, Any]:
     return raw_overrides
 
 
-def validate_precision_aware_disabled(opt, opt_overrides: dict[str, Any] | None = None) -> None:
+def validate_precision_aware_disabled(
+    opt, opt_overrides: dict[str, Any] | None = None
+) -> None:
     precision_aware = getattr(opt, "use_precision_aware_optimizer", None)
     raw_overrides = dict(getattr(opt, "override_optimizer_config", None) or {})
     if "use_precision_aware_optimizer" in raw_overrides:
@@ -207,8 +213,10 @@ def validate_precision_aware_disabled(opt, opt_overrides: dict[str, Any] | None 
         )
 
 
-def validate_optimization_knobs(opt, opt_overrides: dict[str, Any] | None = None) -> None:
-    """Validate Phase 3.4 optimization knobs before lowering into MCore config."""
+def validate_optimization_knobs(
+    opt, opt_overrides: dict[str, Any] | None = None
+) -> None:
+    """Validate optimizer and communication knobs before construction."""
     values = dict(getattr(opt, "override_optimizer_config", None) or {})
     if opt_overrides:
         values.update(opt_overrides)
@@ -253,7 +261,7 @@ def build_mfsdp_ddp_config(ddp_config_cls, overrides: dict[str, Any]):
     missing = sorted(required_fields - ddp_fields)
     if missing:
         raise ValueError(
-            "Installed Megatron-Core DistributedDataParallelConfig is missing "
+            "The supplied distributed-data-parallel config is missing "
             f"required Megatron-FSDP fields: {missing}."
         )
     kwargs: dict[str, Any] = {
@@ -282,7 +290,9 @@ def build_mfsdp_ddp_config(ddp_config_cls, overrides: dict[str, Any]):
     for key in _DTYPE_DDP_KEYS:
         if key in kwargs:
             kwargs[key] = coerce_dtype(kwargs.get(key), key=key)
-    supported_kwargs = {key: value for key, value in kwargs.items() if key in ddp_fields}
+    supported_kwargs = {
+        key: value for key, value in kwargs.items() if key in ddp_fields
+    }
     return ddp_config_cls(**supported_kwargs)
 
 
@@ -305,7 +315,9 @@ def coerce_dtype(value: Any, *, key: str) -> torch.dtype | None:
         }
         if dtype_name in mapping:
             return mapping[dtype_name]
-    raise ValueError(f"{key} must be a torch.dtype, None, or dtype string, got {value!r}.")
+    raise ValueError(
+        f"{key} must be a torch.dtype, None, or dtype string, got {value!r}."
+    )
 
 
 def _validate_ddp_knob_value(key: str, value: Any) -> None:
@@ -321,7 +333,14 @@ def _truthy_feature_value(value: Any) -> bool:
         return False
     if isinstance(value, int | float) and value == 0:
         return False
-    if isinstance(value, str) and value.lower() in {"", "0", "false", "none", "null", "off"}:
+    if isinstance(value, str) and value.lower() in {
+        "",
+        "0",
+        "false",
+        "none",
+        "null",
+        "off",
+    }:
         return False
     return True
 
@@ -330,7 +349,12 @@ def _cuda_alloc_conf_expands_segments() -> bool:
     value = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
     for item in value.split(","):
         key, _, raw = item.strip().partition(":")
-        if key.lower() == "expandable_segments" and raw.lower() in {"1", "true", "yes", "on"}:
+        if key.lower() == "expandable_segments" and raw.lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
             return True
     return False
 

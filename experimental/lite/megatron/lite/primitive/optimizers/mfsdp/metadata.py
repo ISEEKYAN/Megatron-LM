@@ -1,7 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MCore-FSDP metadata adapters for Megatron Lite-owned module implementations."""
+"""Tensor-parallel metadata for the standalone M-FSDP implementation."""
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
@@ -10,7 +12,8 @@ from megatron.lite.primitive.optimizers.mfsdp.patches import (
     mark_skip_tp_duplicate_sync,
     set_mfsdp_param_name,
 )
-from megatron.lite.primitive.protocols import ExpertClassifierFn
+
+ExpertClassifierFn = Callable[[str], bool]
 
 
 _COLUMN_PARALLEL_WEIGHT_SUFFIXES: tuple[str, ...] = (
@@ -44,7 +47,7 @@ _ROW_PARALLEL_WEIGHT_SUFFIXES: tuple[str, ...] = (
     ".o_proj.weight",
 )
 
-_MANUAL_MCORE_TP_MODE_WEIGHT_SUFFIXES: tuple[str, ...] = (
+_EXPLICIT_TP_MODE_WEIGHT_SUFFIXES: tuple[str, ...] = (
     "embed.embedding.weight",
     "mtp_embed.embedding.weight",
     "head.col.linear.weight",
@@ -63,24 +66,23 @@ def _matches_weight_suffix(name: str, suffix: str) -> bool:
 
 
 def _infer_tp_partition_dim(name: str) -> int | None:
-    """Infer Megatron Lite-owned TP weight partition dim for MCore-FSDP metadata."""
+    """Infer the TP partition dimension of a Megatron Lite-owned weight."""
     if any(
         _matches_weight_suffix(name, suffix)
         for suffix in _COLUMN_PARALLEL_WEIGHT_SUFFIXES
     ):
         return 0
     if any(
-        _matches_weight_suffix(name, suffix)
-        for suffix in _ROW_PARALLEL_WEIGHT_SUFFIXES
+        _matches_weight_suffix(name, suffix) for suffix in _ROW_PARALLEL_WEIGHT_SUFFIXES
     ):
         return 1
     return None
 
 
-def _requires_manual_mcore_tp_mode(name: str) -> bool:
+def _requires_explicit_tp_mode(name: str) -> bool:
     return any(
         _matches_weight_suffix(name, suffix)
-        for suffix in _MANUAL_MCORE_TP_MODE_WEIGHT_SUFFIXES
+        for suffix in _EXPLICIT_TP_MODE_WEIGHT_SUFFIXES
     )
 
 
@@ -95,7 +97,7 @@ def normalize_mfsdp_expert_tensor_parallel_attrs(
     ``_mark_mc_parallel_attrs`` only knows dense TP size and conservatively marks
     every unmarked 2D param as tensor-parallel. Megatron Lite's routed experts are sharded by
     EP and optionally ETP; when ETP=1 they must not carry dense TP metadata or
-    MCore-FSDP may scatter/gather optimizer main weights with the wrong mesh.
+    M-FSDP may scatter/gather optimizer shards with the wrong process group.
     """
     etp_size = max(int(etp_size), 1)
     for name, param in model.named_parameters():
@@ -120,7 +122,7 @@ def normalize_mfsdp_expert_tensor_parallel_attrs(
             param.tensor_model_parallel = False
             _clear_tp_attrs(param)
             continue
-        _set_tp_attrs(param, partition_dim, set_mcore_mode=True)
+        _set_tp_attrs(param, partition_dim, set_tp_mode=True)
 
 
 def _clear_attr(obj, attr: str) -> None:
@@ -135,44 +137,43 @@ def _clear_tp_attrs(param) -> None:
     clear_skip_tp_duplicate_sync(param)
 
 
-def _set_tp_attrs(param, partition_dim: int, *, set_mcore_mode: bool) -> None:
+def _set_tp_attrs(param, partition_dim: int, *, set_tp_mode: bool) -> None:
     param.tensor_model_parallel = True
     param.partition_dim = int(partition_dim)
     param.partition_stride = getattr(param, "partition_stride", 1)
     mark_skip_tp_duplicate_sync(param)
-    if set_mcore_mode:
+    if set_tp_mode:
         param._tensor_parallel_mode = "column" if int(partition_dim) == 0 else "row"
     else:
         _clear_attr(param, "_tensor_parallel_mode")
 
 
 def ensure_mfsdp_tp_partition_attrs(model: nn.Module) -> None:
-    """Fill MCore-FSDP TP metadata for Megatron Lite-owned tensor-parallel params.
+    """Fill M-FSDP metadata for Megatron Lite-owned tensor-parallel params.
 
-    MCore-native TP layers already set a precise partition dimension. Megatron Lite's
+    Existing TP layers already set a precise partition dimension. Megatron Lite's
     custom column/vocab layers are output/vocab sharded (dim 0), while Megatron Lite's
     row-parallel projection weights are input sharded (dim 1). The partition
-    attrs are enough for current MCore-FSDP to build TP-sharded DTensors, while
-    the local patch below only guards duplicate-TP sync paths for marked Megatron Lite
-    local shards.
+    attrs are enough for M-FSDP to identify TP-sharded tensors, while the local
+    metadata below guards duplicate-TP sync paths for marked local shards.
 
     This pass is deliberately conservative with ``_tensor_parallel_mode``.
     Setting the mode on every Megatron Lite/TE dense TP weight changes Megatron-FSDP's
     model-buffer initialization path and has to be enabled only after a
     topology-specific precision gate proves it safe. Attention row-projection
-    weights are intentionally kept on the local-shard path: assigning MCore
+    weights are intentionally kept on the local-shard path: assigning
     ``_tensor_parallel_mode="row"`` currently hangs Qwen3MoE 4n32g before the
     first optimizer step. For the remaining local TP
-    shards, the M-FSDP primitive marks them so its MCore patch skips only the
-    incorrect duplicate-TP broadcast.
+    shards, the M-FSDP primitive marks them so it skips only the incorrect
+    duplicate-TP broadcast.
     """
-    _ensure_mfsdp_tp_partition_attrs(model, set_mcore_mode_for_all=False)
+    _ensure_mfsdp_tp_partition_attrs(model, set_tp_mode_for_all=False)
 
 
 def _ensure_mfsdp_tp_partition_attrs(
     model: nn.Module,
     *,
-    set_mcore_mode_for_all: bool,
+    set_tp_mode_for_all: bool,
 ) -> None:
     for name, param in model.named_parameters():
         set_mfsdp_param_name(param, name)
@@ -195,9 +196,7 @@ def _ensure_mfsdp_tp_partition_attrs(
         _set_tp_attrs(
             param,
             partition_dim,
-            set_mcore_mode=(
-                set_mcore_mode_for_all or _requires_manual_mcore_tp_mode(name)
-            ),
+            set_tp_mode=(set_tp_mode_for_all or _requires_explicit_tp_mode(name)),
         )
 
 

@@ -1,8 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
-from dataclasses import dataclass
 import ast
+import copy
+from dataclasses import dataclass
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -10,13 +12,37 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from megatron.lite.primitive.optimizers import get_optimizer_backend
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
 from megatron.lite.primitive.optimizers.mfsdp import grad_norm as mfsdp_grad_norm
 from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
-from megatron.lite.primitive.optimizers.mfsdp.patches import should_skip_tp_duplicate_sync
+from megatron.lite.primitive.optimizers.mfsdp.patches import (
+    should_skip_tp_duplicate_sync,
+)
 from megatron.lite.runtime.contracts.config import ParallelConfig
+
+
+class _GlooUnit(torch.nn.Module):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.linear = torch.nn.Linear(in_features, out_features, bias=False)
+
+    def forward(self, value):
+        return torch.nn.functional.gelu(self.linear(value))
+
+
+class _GlooModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.unit0 = _GlooUnit(4, 5)
+        self.unit1 = _GlooUnit(5, 3)
+        self.out = torch.nn.Linear(3, 2, bias=False)
+
+    def forward(self, value):
+        return self.out(self.unit1(self.unit0(value)))
 
 
 def test_mfsdp_has_no_megatron_core_imports():
@@ -39,12 +65,44 @@ def test_mfsdp_has_no_megatron_core_imports():
     assert violations == []
 
 
+def test_mfsdp_is_standalone_without_vendored_mcore_or_fsdp2_dependencies():
+    package = Path(mfsdp_config.__file__).parent
+
+    assert not list((package / "impl").glob("*.py")), (
+        "Do not vendor the MCore FSDP implementation."
+    )
+    violations = []
+    for source_path in package.rglob("*.py"):
+        tree = ast.parse(source_path.read_text(), filename=str(source_path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                modules = [node.module or ""]
+            else:
+                continue
+            for module in modules:
+                if module.startswith("megatron.") and not module.startswith(
+                    "megatron.lite.primitive.optimizers.mfsdp"
+                ):
+                    relative_path = source_path.relative_to(package)
+                    violations.append(f"{relative_path}:{node.lineno}: {module}")
+
+    assert violations == []
+
+
 def test_mfsdp_imports_when_megatron_core_is_blocked():
     script = """
 import builtins
 original_import = builtins.__import__
 def guarded_import(name, *args, **kwargs):
-    if name == 'megatron.core' or name.startswith('megatron.core.'):
+    forbidden = (
+        name == 'megatron.core'
+        or name.startswith('megatron.core.')
+        or name == 'megatron.lite.primitive.optimizers.fsdp2'
+        or name.startswith('megatron.lite.primitive.optimizers.fsdp2.')
+    )
+    if forbidden:
         raise RuntimeError(f'forbidden import: {name}')
     return original_import(name, *args, **kwargs)
 builtins.__import__ = guarded_import
@@ -163,7 +221,9 @@ def test_mfsdp_grad_clip_scales_unique_grads_and_decoupled_grads():
     assert torch.allclose(shared.grad, torch.full_like(shared.grad, 0.25))
     assert torch.allclose(other.grad, torch.full_like(other.grad, 0.25))
     assert torch.equal(decoupled.grad, torch.ones(2))
-    assert torch.allclose(decoupled.decoupled_grad, torch.full_like(decoupled.grad, 0.25))
+    assert torch.allclose(
+        decoupled.decoupled_grad, torch.full_like(decoupled.grad, 0.25)
+    )
 
 
 def test_mfsdp_metadata_infers_tp_partition_attrs_for_known_weights():
@@ -198,3 +258,272 @@ def test_mfsdp_metadata_infers_tp_partition_attrs_for_known_weights():
     assert layer.moe.experts.fc1.weight0.partition_dim == 0
     assert layer.moe.experts.fc2.weight0.partition_dim == 1
     assert should_skip_tp_duplicate_sync(layer.attn.qkv.linear.weight)
+
+
+def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
+    class _Unit(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(4, 4, bias=False)
+
+        def forward(self, value):
+            return torch.nn.functional.gelu(self.linear(value))
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.unit0 = _Unit()
+            self.unit1 = _Unit()
+            self.out = torch.nn.Linear(4, 2, bias=False)
+
+        def forward(self, value):
+            return self.out(self.unit1(self.unit0(value)))
+
+    torch.manual_seed(123)
+    reference = _Model()
+    candidate = copy.deepcopy(reference)
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1000.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    engine_cfg = SimpleNamespace(
+        model_name="qwen3_5",
+        parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+        optimizer=opt,
+    )
+
+    reference_optimizer = torch.optim.AdamW(
+        reference.parameters(),
+        lr=opt.lr,
+        betas=(opt.adam_beta1, opt.adam_beta2),
+        eps=opt.adam_eps,
+        weight_decay=opt.weight_decay,
+        foreach=False,
+    )
+    chunks, candidate_optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [candidate],
+        model_cfg=SimpleNamespace(),
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+
+    value = torch.randn(3, 4)
+    target = torch.randn(3, 2)
+    reference_optimizer.zero_grad()
+    torch.nn.functional.mse_loss(reference(value), target).backward()
+
+    candidate_optimizer.zero_grad()
+    torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+    mfsdp_optimizer.finalize_mfsdp_grads(chunks, candidate_optimizer)
+
+    reference_grads = {
+        name: param.grad.detach().reshape(-1)
+        for name, param in reference.named_parameters()
+    }
+    candidate_grads = {
+        candidate_optimizer.param_names[id(param)].removeprefix(
+            "chunk0.module."
+        ): param.grad.detach().reshape(-1)
+        for param in candidate_optimizer.params
+    }
+    assert reference_grads.keys() == candidate_grads.keys()
+    for name, reference_grad in reference_grads.items():
+        assert torch.equal(reference_grad, candidate_grads[name]), name
+
+    reference_optimizer.step()
+    success, _grad_norm, _num_zeros = candidate_optimizer.step()
+    assert success
+
+    reference_params = dict(reference.named_parameters())
+    candidate_params = {
+        name.removeprefix("module."): param
+        for name, param in chunks[0].named_parameters()
+    }
+    assert reference_params.keys() == candidate_params.keys()
+    for name, reference_param in reference_params.items():
+        assert torch.equal(reference_param, candidate_params[name]), name
+
+    saved_model = {
+        name: value.clone() for name, value in chunks[0].state_dict().items()
+    }
+    with torch.no_grad():
+        for param in chunks[0].parameters():
+            param.add_(7.0)
+    chunks[0].load_state_dict(saved_model)
+    assert candidate_optimizer.sync_model_weights_to_main_weights()
+    restored_model = chunks[0].state_dict()
+    assert saved_model.keys() == restored_model.keys()
+    for name, value in saved_model.items():
+        assert torch.equal(value, restored_model[name]), name
+
+
+def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
+    model = _GlooModel().to(torch.bfloat16)
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        model_cfg=SimpleNamespace(),
+        engine_cfg=SimpleNamespace(
+            model_name="qwen3_5",
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_GlooUnit,),
+    )
+
+    assert all(param.dtype is torch.float32 for param in optimizer.params)
+    assert all(
+        param.dtype is torch.bfloat16 for _name, param in chunks[0].named_parameters()
+    )
+    assert all(
+        bucket.grad_shard_buffer.dtype is torch.float32
+        for bucket in chunks[0].param_sync.buckets
+    )
+
+    before = [param.detach().clone() for param in optimizer.params]
+    value = torch.randn(3, 4, dtype=torch.bfloat16)
+    optimizer.zero_grad()
+    chunks[0](value).float().square().mean().backward()
+    mfsdp_optimizer.finalize_mfsdp_grads(chunks, optimizer)
+    success, grad_norm, _ = optimizer.step()
+
+    assert success
+    assert grad_norm > 0.0
+    assert all(param.dtype is torch.float32 for param in optimizer.params)
+    assert any(not torch.equal(old, new) for old, new in zip(before, optimizer.params))
+    assert torch.isfinite(chunks[0](value).float()).all()
+
+
+def _run_mfsdp_gloo_parity(rank: int, world_size: int, init_file: str) -> None:
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        torch.manual_seed(456)
+        reference = _GlooModel()
+        candidate = copy.deepcopy(reference)
+        ps = SimpleNamespace(
+            dp_cp_group=dist.group.WORLD,
+            dp_group=dist.group.WORLD,
+            ep_dp_group=dist.group.WORLD,
+            ep_group=None,
+            tp_group=None,
+            pp_group=None,
+            dp_cp_size=world_size,
+            expert_dp_size=world_size,
+        )
+        opt = SimpleNamespace(
+            optimizer="adam",
+            lr=1.0e-3,
+            min_lr=0.0,
+            weight_decay=0.0,
+            clip_grad=1000.0,
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_eps=1.0e-8,
+            override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+        )
+        engine_cfg = SimpleNamespace(
+            model_name="qwen3_5",
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        )
+
+        reference_optimizer = torch.optim.AdamW(
+            reference.parameters(),
+            lr=opt.lr,
+            betas=(opt.adam_beta1, opt.adam_beta2),
+            eps=opt.adam_eps,
+            weight_decay=opt.weight_decay,
+            foreach=False,
+        )
+        chunks, candidate_optimizer = mfsdp_optimizer.build_mfsdp_stack(
+            [candidate],
+            model_cfg=SimpleNamespace(),
+            engine_cfg=engine_cfg,
+            ps=ps,
+            is_expert=lambda _name: False,
+            fsdp_unit_modules=(_GlooUnit,),
+        )
+
+        torch.manual_seed(900 + rank)
+        value = torch.randn(3, 4)
+        target = torch.randn(3, 2)
+        reference_optimizer.zero_grad()
+        torch.nn.functional.mse_loss(reference(value), target).backward()
+        candidate_optimizer.zero_grad()
+        torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+        for param in reference.parameters():
+            assert param.grad is not None
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad.div_(world_size)
+        mfsdp_optimizer.finalize_mfsdp_grads(chunks, candidate_optimizer)
+
+        reference_norm = torch.linalg.vector_norm(
+            torch.cat([param.grad.reshape(-1) for param in reference.parameters()])
+        ).item()
+        reference_optimizer.step()
+        candidate_success, candidate_norm, _ = candidate_optimizer.step()
+        assert candidate_success
+        assert reference_norm == candidate_norm
+
+        reference_params = dict(reference.named_parameters())
+        candidate_params = {
+            name.removeprefix("module."): param
+            for name, param in chunks[0].named_parameters()
+        }
+        assert reference_params.keys() == candidate_params.keys()
+        for name, reference_param in reference_params.items():
+            assert torch.equal(reference_param, candidate_params[name]), name
+    finally:
+        dist.destroy_process_group()
+
+
+def test_mfsdp_cpu_two_rank_gloo_matches_replicated_reference(tmp_path):
+    init_file = str(tmp_path / "mfsdp-gloo-init")
+    mp.spawn(_run_mfsdp_gloo_parity, args=(2, init_file), nprocs=2, join=True)
