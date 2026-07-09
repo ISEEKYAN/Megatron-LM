@@ -23,9 +23,12 @@ COMMON_ARGS=(
   --num-microbatches 1
   --seq-len "${SEQ_LEN:-32}"
   --seed "${SEED:-42}"
-  --truncate-layers "${TRUNCATE_LAYERS:-8}"
+  --truncate-layers "${TRUNCATE_LAYERS:-4}"
   --disable-mtp
   --same-data-across-dp
+  --no-optimizer
+  --skip-optimizer-build
+  --skip-weight-hash
   --impl-cfg-json '{"mount_vision_model": false}'
 )
 
