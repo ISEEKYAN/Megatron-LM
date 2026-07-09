@@ -41,8 +41,9 @@ run_container() {
 if [[ "${COMPARE_ONLY:-0}" == 1 ]]; then
   [[ -s "${OUTPUT_DIR}/cold-load.pt" && -s "${OUTPUT_DIR}/online-reload.pt" \
     && -s "${OUTPUT_DIR}/mlite.pt" \
-    && -s "${OUTPUT_DIR}/engine-weight-report.json" ]] || {
-    echo "COMPARE_ONLY requires three logprob artifacts and engine-weight-report.json" >&2
+    && -s "${OUTPUT_DIR}/engine-weight-report.json" \
+    && -s "${OUTPUT_DIR}/export-coverage.json" ]] || {
+    echo "COMPARE_ONLY requires three logprob artifacts and both weight reports" >&2
     exit 6
   }
 else
@@ -58,7 +59,8 @@ else
     "python -m torch.distributed.run --standalone --nproc_per_node=4 \
       -m examples.verl.ds4_resync_tp4 collect-mlite \
       --model '${CHECKPOINT_DIR}' --output '${OUTPUT_DIR}/mlite.pt' \
-      --fp8-output '${RESYNC_DIR}'"
+      --fp8-output '${RESYNC_DIR}' \
+      --coverage-output '${OUTPUT_DIR}/export-coverage.json'"
   run_container "${MLITE_OVERLAY}" \
     "CUDA_VISIBLE_DEVICES=0 python -m examples.verl.ds4_resync_tp4 \
       verify --model '${RESYNC_DIR}'"
@@ -73,4 +75,5 @@ run_container "${MLITE_OVERLAY}" \
     compare --cold '${OUTPUT_DIR}/cold-load.pt' \
     --online '${OUTPUT_DIR}/online-reload.pt' --mlite '${OUTPUT_DIR}/mlite.pt' \
     --weights '${OUTPUT_DIR}/engine-weight-report.json' \
+    --coverage '${OUTPUT_DIR}/export-coverage.json' \
     --output '${OUTPUT_DIR}/report.json'"

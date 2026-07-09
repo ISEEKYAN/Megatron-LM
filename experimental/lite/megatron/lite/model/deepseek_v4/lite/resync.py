@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
 import torch
@@ -39,12 +39,20 @@ def is_release_unquantized_weight(name: str) -> bool:
     return False
 
 
-def _quantization_contract(config: Any) -> tuple[str, tuple[int, int], tuple[str, ...]]:
+def _quantization_contract(
+    config: Any, resync_config: Mapping[str, Any] | None = None
+) -> tuple[str, tuple[int, int], tuple[str, ...]]:
     quant_config = getattr(config, "quantization_config", None)
     if not isinstance(quant_config, dict) or not quant_config:
         raise ValueError("DeepSeek-V4 checkpoint resync requires quantization_config")
-    expert_dtype = getattr(config, "expert_dtype", None) or quant_config.get(
-        "expert_dtype", "fp4"
+    options = dict(resync_config or {})
+    unsupported = sorted(options.keys() - {"expert_dtype"})
+    if unsupported:
+        raise ValueError(f"unsupported DeepSeek-V4 resync_config keys: {unsupported}")
+    expert_dtype = (
+        options.get("expert_dtype")
+        or getattr(config, "expert_dtype", None)
+        or quant_config.get("expert_dtype", "fp4")
     )
     if expert_dtype not in _EXPERT_DTYPES:
         raise ValueError(
@@ -66,10 +74,13 @@ def _quantization_contract(config: Any) -> tuple[str, tuple[int, int], tuple[str
 
 
 def export_resync_weights(
-    weights: Iterable[tuple[str, torch.Tensor]], config: Any
+    weights: Iterable[tuple[str, torch.Tensor]],
+    config: Any,
+    *,
+    resync_config: Mapping[str, Any] | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Convert gathered DS4 BF16 weights to original checkpoint representation."""
-    expert_dtype, block_shape, ignored = _quantization_contract(config)
+    expert_dtype, block_shape, ignored = _quantization_contract(config, resync_config)
     fp8_scale_format = "e8m0" if expert_dtype == "fp4" else "float32"
 
     for name, tensor in weights:

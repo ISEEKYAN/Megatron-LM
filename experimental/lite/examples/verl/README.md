@@ -164,8 +164,8 @@ By default, GSM8K GRPO artifacts are written under
 
 ### Serialized checkpoint weight resync
 
-Quantized inference models must receive weights in the same serialized format
-as their original checkpoint. Set the MLite actor engine's
+Quantized inference models must receive weights in the serialized format
+declared by their rollout checkpoint configuration. Set the MLite actor engine's
 `resync_format=vllm_checkpoint` and select
 `verl_mlite.rollout.verl_worker.VllmCheckpointWorkerExtension` through vLLM's
 `worker_extension_cls` engine argument. The extension streams all IPC buckets
@@ -178,6 +178,12 @@ block-FP8 linear weights and keeps routed experts in the checkpoint's declared
 format: MXFP4 E2M1 with UE8M0 scales for `expert_dtype=fp4`, or block-FP8 with
 FP32 scales for `expert_dtype=fp8`. Router, normalization, compressor, and other
 unscaled checkpoint families remain unquantized.
+
+To load the mixed DeepSeek-V4 Flash checkpoint into the BF16 training master
+but resync every quantized rollout matrix, including routed experts, as block
+FP8, set `resync_config.expert_dtype=fp8` alongside
+`resync_format=vllm_checkpoint`. The generic engine passes this model-owned
+option through without interpreting DeepSeek-V4 tensor families.
 
 ## Smoke / Dry-Run Checks
 

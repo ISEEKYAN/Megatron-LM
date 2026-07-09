@@ -231,14 +231,25 @@ def test_final_compare_requires_and_embeds_engine_weight_parity(tmp_path) -> Non
         torch.save(rows, arm)
     weights = tmp_path / "weights.json"
     weights.write_text(json.dumps({"exact_match": True, "mismatch_count": 0}))
+    coverage = tmp_path / "coverage.json"
+    coverage.write_text(
+        json.dumps(
+            {
+                "exact_match": True,
+                "source_tensor_count": 4,
+                "exported_tensor_count": 4,
+            }
+        )
+    )
     output = tmp_path / "report.json"
 
-    compare(*arms, weights, output)
+    compare(*arms, weights, coverage, output)
 
     assert json.loads(output.read_text())["engine_weights"]["exact_match"] is True
+    assert json.loads(output.read_text())["export_coverage"]["exact_match"] is True
     weights.write_text(json.dumps({"exact_match": False, "mismatch_count": 1}))
     with pytest.raises(ValueError, match="exact parity"):
-        compare(*arms, weights, output)
+        compare(*arms, weights, coverage, output)
 
 
 def test_percentile_uses_exact_order_statistic() -> None:
@@ -285,22 +296,24 @@ def test_runtime_export_writes_pure_fp8_shards_and_index(tmp_path) -> None:
         },
     }
     (source / "config.json").write_text(json.dumps(config))
-    (source / "model.safetensors.index.json").write_text('{"stale": true}')
     dense = torch.linspace(-2.0, 2.0, 128 * 128).reshape(128, 128)
     expert = torch.linspace(-4.0, 4.0, 128 * 128).reshape(128, 128)
     dense_weight, dense_scale = quantize_block_fp8(dense, scale_format="float32")
     expert_weight, expert_scale = quantize_block_fp8(expert, scale_format="float32")
-    weights = iter(
-        [
-            ("layers.2.attn.wo.weight", dense_weight),
-            ("layers.2.attn.wo.scale", dense_scale),
-            ("layers.2.ffn.experts.0.w1.weight", expert_weight),
-            ("layers.2.ffn.experts.0.w1.scale", expert_scale),
-        ]
+    exported_tensors = [
+        ("layers.2.attn.wo.weight", dense_weight),
+        ("layers.2.attn.wo.scale", dense_scale),
+        ("layers.2.ffn.experts.0.w1.weight", expert_weight),
+        ("layers.2.ffn.experts.0.w1.scale", expert_scale),
+    ]
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": dict.fromkeys(dict(exported_tensors), "source.safetensors")}
+        )
     )
 
-    write_exported_checkpoint(
-        weights,
+    coverage = write_exported_checkpoint(
+        iter(exported_tensors),
         source,
         output,
         max_shard_bytes=dense_weight.numel() * dense_weight.element_size() + 1,
@@ -318,32 +331,43 @@ def test_runtime_export_writes_pure_fp8_shards_and_index(tmp_path) -> None:
     assert tensors["layers.2.attn.wo.scale"].dtype == torch.float32
     assert tensors["layers.2.ffn.experts.0.w1.weight"].dtype == torch.float8_e4m3fn
     assert tensors["layers.2.ffn.experts.0.w1.scale"].dtype == torch.float32
+    assert coverage == {
+        "exact_match": True,
+        "exported_tensor_count": 4,
+        "source_tensor_count": 4,
+    }
 
 
-def test_pure_fp8_export_hook_changes_export_contract_only() -> None:
-    from types import SimpleNamespace
+def test_runtime_export_rejects_incomplete_mlite_weight_mapping(tmp_path) -> None:
+    from examples.verl.ds4_resync_tp4 import write_exported_checkpoint
 
-    from examples.verl.ds4_resync_tp4 import configure_pure_block_fp8_export
-
-    model_config = SimpleNamespace(
-        expert_dtype="fp4",
-        quantization_config={
-            "quant_method": "fp8",
-            "scale_fmt": "ue8m0",
-            "weight_block_size": [128, 128],
-        },
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "expert_dtype": "fp4",
+                "quantization_config": {"weight_block_size": [128, 128]},
+            }
+        )
+    )
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "layers.2.attn.wo.weight": "source.safetensors",
+                    "layers.2.attn.wo.scale": "source.safetensors",
+                }
+            }
+        )
     )
 
-    configured = configure_pure_block_fp8_export(model_config)
-
-    assert configured is model_config
-    assert configured.expert_dtype == "fp8"
-    assert configured.quantization_config == {
-        "expert_dtype": "fp8",
-        "quant_method": "fp8",
-        "scale_fmt": "float32",
-        "weight_block_size": [128, 128],
-    }
+    with pytest.raises(ValueError, match="MLite export tensor coverage differs"):
+        write_exported_checkpoint(
+            iter([("layers.2.attn.wo.weight", torch.ones(128, 128))]),
+            source,
+            tmp_path / "output",
+        )
 
 
 def test_formal_sbatch_uses_mixed_source_for_mlite_and_fp8_artifact_for_vllm() -> None:
@@ -355,10 +379,12 @@ def test_formal_sbatch_uses_mixed_source_for_mlite_and_fp8_artifact_for_vllm() -
     assert "collect-mlite" in script
     assert "--model '${CHECKPOINT_DIR}'" in script
     assert "--fp8-output '${RESYNC_DIR}'" in script
+    assert "--coverage-output '${OUTPUT_DIR}/export-coverage.json'" in script
     assert "collect --model '${RESYNC_DIR}'" in script
     assert "--resync-model '${RESYNC_DIR}'" in script
     assert "--weight-output '${OUTPUT_DIR}/engine-weight-report.json'" in script
     assert '-s "${OUTPUT_DIR}/engine-weight-report.json"' in script
+    assert '-s "${OUTPUT_DIR}/export-coverage.json"' in script
     assert "--weights '${OUTPUT_DIR}/engine-weight-report.json'" in script
     assert "MLITE_COMMIT=${MLITE_COMMIT:?set MLITE_COMMIT}" in script
     assert 'git -C "${MLITE_SRC}" rev-parse HEAD' in script

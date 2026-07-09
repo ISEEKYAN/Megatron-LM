@@ -143,9 +143,17 @@ def test_resync_format_is_validated_without_model_specific_engine_logic() -> Non
     with pytest.raises(ValueError, match="resync_format"):
         _engine_config(resync_format="fp8")
 
+    with pytest.raises(ValueError, match="resync_config requires resync_format"):
+        _engine_config(resync_config={"expert_dtype": "fp8"})
+
 
 def test_checkpoint_resync_format_is_forwarded_to_model_export(monkeypatch) -> None:
-    engine = _engine(engine_config=_engine_config(resync_format="vllm_checkpoint"))
+    engine = _engine(
+        engine_config=_engine_config(
+            resync_format="vllm_checkpoint",
+            resync_config={"expert_dtype": "fp8"},
+        )
+    )
     calls = []
 
     class Runtime:
@@ -161,7 +169,16 @@ def test_checkpoint_resync_format_is_forwarded_to_model_export(monkeypatch) -> N
 
     assert list(weights) == []
     assert metadata is None
-    assert calls == [(engine.handle, {"target": "vllm_checkpoint", "export_dtype": "bfloat16"})]
+    assert calls == [
+        (
+            engine.handle,
+            {
+                "target": "vllm_checkpoint",
+                "resync_config": {"expert_dtype": "fp8"},
+                "export_dtype": "bfloat16",
+            },
+        )
+    ]
 
 
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:

@@ -57,6 +57,60 @@ def test_flash_base_resync_keeps_w1_w3_separate_with_128x128_scales() -> None:
     assert not any("w13" in name for name in exported)
 
 
+def test_mixed_source_resync_can_override_experts_to_pure_block_fp8() -> None:
+    from megatron.lite.model.deepseek_v4.lite.resync import export_resync_weights
+
+    name = "layers.0.ffn.experts.0.w1.weight"
+    exported = dict(
+        export_resync_weights(
+            [(name, torch.ones(256, 128))],
+            _config(expert_dtype="fp4"),
+            resync_config={"expert_dtype": "fp8"},
+        )
+    )
+
+    assert exported[name].dtype == torch.float8_e4m3fn
+    assert exported[f"{name[:-7]}.scale"].dtype == torch.float32
+
+
+def test_resync_override_rejects_unknown_model_options() -> None:
+    from megatron.lite.model.deepseek_v4.lite.resync import export_resync_weights
+
+    with pytest.raises(ValueError, match="unsupported DeepSeek-V4 resync_config"):
+        dict(
+            export_resync_weights(
+                [("layers.0.attn.wq.weight", torch.ones(128, 128))],
+                _config(),
+                resync_config={"model_name": "deepseek_v4"},
+            )
+        )
+
+
+def test_checkpoint_export_forwards_pure_fp8_resync_override(monkeypatch) -> None:
+    from megatron.lite.model.deepseek_v4.lite import checkpoint
+
+    name = "layers.0.ffn.experts.0.w1.weight"
+    source = torch.ones(256, 128)
+    monkeypatch.setattr(
+        checkpoint,
+        "_export_unquantized_weights",
+        lambda *_args, **_kwargs: iter([(name, source)]),
+    )
+
+    exported = dict(
+        checkpoint.export_hf_weights(
+            None,
+            _config(expert_dtype="fp4"),
+            None,
+            target="vllm_checkpoint",
+            resync_config={"expert_dtype": "fp8"},
+        )
+    )
+
+    assert exported[name].dtype == torch.float8_e4m3fn
+    assert exported[f"{name[:-7]}.scale"].dtype == torch.float32
+
+
 def test_production_expert_shapes_match_flash_and_base_checkpoint_layouts() -> None:
     from megatron.lite.model.deepseek_v4.lite.resync import export_resync_weights
 

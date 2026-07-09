@@ -381,6 +381,8 @@ class MegatronLiteEngine(BaseEngine):
         }
         if self.engine_config.resync_format is not None:
             export_kwargs["target"] = self.engine_config.resync_format
+            if self.engine_config.resync_config:
+                export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
         elif self.engine_config.model_name == "qwen3_5":
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:

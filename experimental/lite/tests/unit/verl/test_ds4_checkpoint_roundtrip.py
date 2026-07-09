@@ -120,6 +120,36 @@ def test_roundtrip_fails_closed_on_unknown_unscaled_matrix(tmp_path) -> None:
         run_roundtrip(tmp_path, device="cpu")
 
 
+def test_roundtrip_rejects_configured_ignored_weight_with_scale(tmp_path) -> None:
+    from examples.verl.ds4_checkpoint_roundtrip import run_roundtrip
+    from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+
+    weight, scale = quantize_block_fp8(
+        torch.ones(128, 128), scale_format="e8m0"
+    )
+    save_file(
+        {
+            "layers.2.attn.wo.weight": weight,
+            "layers.2.attn.wo.scale": scale,
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "expert_dtype": "fp4",
+                "quantization_config": {
+                    "weight_block_size": [128, 128],
+                    "ignored_layers": ["layers.2.attn.wo"],
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="ignored checkpoint weights unexpectedly have scales"):
+        run_roundtrip(tmp_path, device="cpu")
+
+
 def test_roundtrip_preserves_pure_block_fp8_float32_scale_contract() -> None:
     from examples.verl.ds4_checkpoint_roundtrip import _measure_pair
     from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8

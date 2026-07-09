@@ -207,18 +207,6 @@ def compare_engine_weight_fingerprints(
     }
 
 
-def configure_pure_block_fp8_export(model_config: Any) -> Any:
-    """Keep the loaded BF16 master intact while selecting pure FP8 serialization."""
-    quantization = copy.deepcopy(getattr(model_config, "quantization_config", None))
-    if not isinstance(quantization, dict) or not quantization:
-        raise ValueError("DeepSeek-V4 pure FP8 export requires quantization_config")
-    model_config.expert_dtype = "fp8"
-    quantization["expert_dtype"] = "fp8"
-    quantization["scale_fmt"] = "float32"
-    model_config.quantization_config = quantization
-    return model_config
-
-
 def payload_row(
     token_ids: list[int] | torch.Tensor, logprobs: torch.Tensor
 ) -> dict[str, torch.Tensor]:
@@ -384,13 +372,26 @@ def copy_checkpoint_metadata(source: Path, output: Path) -> None:
             shutil.copy2(path, output / path.name)
 
 
+def checkpoint_tensor_names(source: Path) -> set[str]:
+    """Read the authoritative tensor-name set from an indexed checkpoint."""
+    index_path = source / "model.safetensors.index.json"
+    if not index_path.is_file():
+        raise FileNotFoundError(
+            f"checkpoint coverage requires an index file: {index_path}"
+        )
+    weight_map = json.loads(index_path.read_text()).get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"checkpoint index has no non-empty weight_map: {index_path}")
+    return set(weight_map)
+
+
 def write_exported_checkpoint(
     weights: Iterable[tuple[str, torch.Tensor]],
     source: Path,
     output: Path,
     *,
     max_shard_bytes: int = _DEFAULT_MAX_SHARD_BYTES,
-) -> None:
+) -> dict[str, Any]:
     """Write a bounded-memory runtime export as indexed safetensor shards."""
     from safetensors.torch import save_file
 
@@ -433,6 +434,20 @@ def write_exported_checkpoint(
     if not pending:
         raise ValueError("MLite runtime export produced no checkpoint tensors")
 
+    source_names = checkpoint_tensor_names(source)
+    missing = sorted(source_names - seen)
+    unexpected = sorted(seen - source_names)
+    if missing or unexpected:
+        raise ValueError(
+            "MLite export tensor coverage differs from the source checkpoint: "
+            f"missing={missing[:20]}, unexpected={unexpected[:20]}"
+        )
+    coverage = {
+        "exact_match": True,
+        "source_tensor_count": len(source_names),
+        "exported_tensor_count": len(seen),
+    }
+
     weight_map: dict[str, str] = {}
     total_size = 0
     shard_count = len(pending)
@@ -445,6 +460,7 @@ def write_exported_checkpoint(
     (output / "model.safetensors.index.json").write_text(
         json.dumps(index, indent=2, sort_keys=True) + "\n"
     )
+    return coverage
 
 
 def model_vocab_size(config: Any, tokenizer: Any) -> int:
@@ -577,7 +593,9 @@ def collect(
         print(f"DS4_TP4_FP8_ONLINE_RELOAD_COMPLETE={resync_output}", flush=True)
 
 
-def collect_mlite(model: Path, output: Path, fp8_output: Path) -> None:
+def collect_mlite(
+    model: Path, output: Path, fp8_output: Path, coverage_output: Path
+) -> None:
     """Load official mixed weights into MLite, run BF16 forward, and export FP8."""
     from transformers import AutoConfig, AutoTokenizer
 
@@ -606,7 +624,6 @@ def collect_mlite(model: Path, output: Path, fp8_output: Path) -> None:
         parallel=ParallelConfig(tp=1, etp=1, ep=4, pp=1, vpp=1, cp=1),
         attention_backend_override="fused",
         load_hf_weights=True,
-        model_config_hook=configure_pure_block_fp8_export,
         impl_cfg={
             "optimizer": None,
             "mtp_enable": False,
@@ -654,11 +671,16 @@ def collect_mlite(model: Path, output: Path, fp8_output: Path) -> None:
         handle,
         target="vllm_checkpoint",
         export_dtype="bfloat16",
+        resync_config={"expert_dtype": "fp8"},
         rank0_only=True,
     )
     if dist.get_rank() == 0:
-        write_exported_checkpoint(weights, model, fp8_output)
+        coverage = write_exported_checkpoint(weights, model, fp8_output)
+        coverage_output.write_text(
+            json.dumps(coverage, indent=2, sort_keys=True) + "\n"
+        )
         print(f"DS4_MLITE_PURE_FP8_EXPORT_COMPLETE={fp8_output}", flush=True)
+        print(f"DS4_MLITE_EXPORT_COVERAGE={coverage_output}", flush=True)
     else:
         for _ in weights:
             raise AssertionError("rank0_only MLite export yielded on a nonzero rank")
@@ -670,17 +692,22 @@ def compare(
     online: Path,
     mlite: Path,
     weights: Path,
+    coverage: Path,
     output: Path,
 ) -> None:
     weight_report = json.loads(weights.read_text())
     if not weight_report.get("exact_match"):
         raise ValueError("engine weight report is missing cold-vs-online exact parity")
+    coverage_report = json.loads(coverage.read_text())
+    if not coverage_report.get("exact_match"):
+        raise ValueError("MLite export coverage is not exact")
     report = compare_three_arms(
         torch.load(cold, weights_only=True),
         torch.load(online, weights_only=True),
         torch.load(mlite, weights_only=True),
     )
     report["engine_weights"] = weight_report
+    report["export_coverage"] = coverage_report
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report, sort_keys=True), flush=True)
     print("DS4_TP4_PARITY_COMPLETE", flush=True)
@@ -701,11 +728,13 @@ def main() -> None:
     mlite_parser.add_argument("--model", type=Path, required=True)
     mlite_parser.add_argument("--output", type=Path, required=True)
     mlite_parser.add_argument("--fp8-output", type=Path, required=True)
+    mlite_parser.add_argument("--coverage-output", type=Path, required=True)
     compare_parser = subparsers.add_parser("compare")
     compare_parser.add_argument("--cold", type=Path, required=True)
     compare_parser.add_argument("--online", type=Path, required=True)
     compare_parser.add_argument("--mlite", type=Path, required=True)
     compare_parser.add_argument("--weights", type=Path, required=True)
+    compare_parser.add_argument("--coverage", type=Path, required=True)
     compare_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "verify":
@@ -720,9 +749,18 @@ def main() -> None:
             weight_output=args.weight_output,
         )
     elif args.command == "collect-mlite":
-        collect_mlite(args.model, args.output, args.fp8_output)
+        collect_mlite(
+            args.model, args.output, args.fp8_output, args.coverage_output
+        )
     else:
-        compare(args.cold, args.online, args.mlite, args.weights, args.output)
+        compare(
+            args.cold,
+            args.online,
+            args.mlite,
+            args.weights,
+            args.coverage,
+            args.output,
+        )
 
 
 if __name__ == "__main__":

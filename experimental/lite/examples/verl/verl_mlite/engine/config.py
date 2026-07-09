@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,6 +32,7 @@ class MegatronLiteEngineConfig(EngineConfig):
     cross_entropy_fusion: bool | None = None
     export_dtype: str | None = "bfloat16"
     resync_format: str | None = None
+    resync_config: dict[str, Any] = field(default_factory=dict)
     load_hf_weights: bool = True
     impl_cfg: dict[str, Any] = field(default_factory=dict)
 
@@ -46,3 +48,8 @@ class MegatronLiteEngineConfig(EngineConfig):
             from megatron.lite.runtime.contracts.weights import ResyncFormat
 
             self.resync_format = ResyncFormat.parse(self.resync_format).value
+        if not isinstance(self.resync_config, Mapping):
+            raise TypeError("resync_config must be a mapping")
+        self.resync_config = dict(self.resync_config)
+        if self.resync_config and self.resync_format is None:
+            raise ValueError("resync_config requires resync_format")
