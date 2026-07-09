@@ -103,7 +103,6 @@ manifest = {
     "seq_len": 8,
     "truncate_layers": 1,
     "keep_experts": 2,
-    "mount_vision_model": False,
     "optimizer": "adam",
     "optimizer_backend": "dist_opt",
     "reference_backend": "mbridge",
@@ -113,45 +112,7 @@ output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 print(json.dumps(manifest, sort_keys=True))
 PY
 
-common_args=(
-  --hf-path "${HF_PATH}"
-  --model-name qwen3_5
-  --tp "${TP}"
-  --etp "${ETP}"
-  --ep "${EP}"
-  --pp "${PP}"
-  --cp "${CP}"
-  --steps "${STEPS}"
-  --num-microbatches "${NUM_MICROBATCHES}"
-  --seq-len "${SEQ_LEN}"
-  --seed "${SEED}"
-  --truncate-layers "${TRUNCATE_LAYERS}"
-  --keep-experts "${KEEP_EXPERTS}"
-  --disable-mtp
-  --same-data-across-dp
-)
-
-# The validated Adam×DistOpt gate predates deterministic bench's vision-mount default.
-# Keep the text-only baseline explicit so this rerun does not add a new parameter family.
-torchrun --nproc_per_node "${NPROC}" \
-  "${REPO_ROOT}/experimental/lite/examples/bench/correctness.py" run \
-  --backend mlite "${common_args[@]}" \
-  --impl-cfg-json '{"mount_vision_model": false}' \
-  --output-json "${OUTPUT_DIR}/qwen35_mlite_correctness.json" \
-  2>&1 | tee "${OUTPUT_DIR}/qwen35_mlite_correctness.log"
-
-torchrun --nproc_per_node "${NPROC}" \
-  "${REPO_ROOT}/experimental/lite/examples/bench/correctness.py" run \
-  --backend mbridge "${common_args[@]}" \
-  --output-json "${OUTPUT_DIR}/qwen35_mbridge_correctness.json" \
-  2>&1 | tee "${OUTPUT_DIR}/qwen35_mbridge_correctness.log"
-
-python "${REPO_ROOT}/experimental/lite/examples/bench/correctness.py" compare \
-  "${OUTPUT_DIR}/qwen35_mlite_correctness.json" \
-  "${OUTPUT_DIR}/qwen35_mbridge_correctness.json" \
-  --output-json "${OUTPUT_DIR}/qwen35_correctness_compare.json" \
-  --fail-on-mismatch \
-  2>&1 | tee "${OUTPUT_DIR}/qwen35_correctness_compare.log"
+bash "${REPO_ROOT}/experimental/lite/examples/bench/scripts/run_qwen35_correctness_pair.sh"
 
 sha256sum \
   "${OUTPUT_DIR}/runtime_manifest.json" \
