@@ -45,12 +45,20 @@ else
   git -C "${FLASHMLA_SRC}" apply "${FLASHMLA_PATCH}"
 fi
 
+# setuptools discovers a vcs_versioning file finder from the inherited vLLM
+# overlay.  On Lustre, its recursive git scan can time out before FlashMLA's
+# metadata is generated.  Build from an archive-like tree without VCS metadata.
+FLASHMLA_BUILD_SRC=$(mktemp -d "${ROOT}/src/flashmla-build.XXXXXX")
+trap 'rm -rf "${FLASHMLA_BUILD_SRC}"' EXIT
+tar --exclude-vcs -C "${FLASHMLA_SRC}" -cf - . | tar -C "${FLASHMLA_BUILD_SRC}" -xf -
+[[ ! -e "${FLASHMLA_BUILD_SRC}/.git" ]]
+
 srun --mpi=pmix --export=ALL --no-container-mount-home \
   --container-image="${BASE_SQSH}" \
   --container-mounts=/lustre:/lustre \
   --container-workdir="${MLITE_SRC}" \
   bash -s -- "${MLITE_OVERLAY}" "${MLITE_SITE}" "${VLLM_SITE}" \
-    "${FLASHMLA_SRC}" "${MLITE_SRC}" "${FLASHMLA_COMMIT}" <<'BUILD'
+    "${FLASHMLA_BUILD_SRC}" "${MLITE_SRC}" "${FLASHMLA_COMMIT}" <<'BUILD'
 set -euo pipefail
 overlay=$1
 site=$2

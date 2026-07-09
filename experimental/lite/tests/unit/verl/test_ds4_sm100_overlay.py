@@ -71,6 +71,9 @@ def test_sm100_overlay_build_is_pinned_and_does_not_mutate_rollout_overlay() -> 
     assert "CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl" in build
     assert "flashmla-a6ec-standalone-import.patch" in build
     assert 'git -C "${FLASHMLA_SRC}" apply --check' in build
+    assert 'mktemp -d "${ROOT}/src/flashmla-build.XXXXXX"' in build
+    assert "tar --exclude-vcs" in build
+    assert '"${FLASHMLA_BUILD_SRC}" "${MLITE_SRC}"' in build
     assert "--force-reinstall" in build
     assert (
         "python -m pip install --force-reinstall --no-build-isolation --no-deps "
