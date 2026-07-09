@@ -349,25 +349,28 @@ using actual encoded bytes and a configured safety margin rather than a global
 model-level guess. Metadata, encode time, and apply time are included in the
 decision benchmark.
 
-### Interaction with two-slot prefetch
+### Interaction with proposed two-slot transport
 
-The validated veRL compatibility path in
-[`compat.py`](../examples/verl/verl_mlite/compat.py) already uses two bounded
-staging slots to overlap synchronous production with receiver ACKs.
-Incremental payloads should occupy those same slots; they must not add a third
-unbounded queue. A slot owns its payload until ACK, after which it can be reused
-and its shadow transition can be committed.
+The separate Miles/SGLang two-slot producer/consumer transport is not
+implemented in the current tree. Today `RawHFWeightUpdater` iterates
+`_export_weight_chunks` synchronously, accumulates receiver references and
+colocated live tensors, and waits for acknowledgements only after every chunk
+has been submitted. The incremental prototype must not assume that export and
+transport already overlap.
 
-Those two slots overlap buckets within one synchronization; they are recycled
-after ACK and are not a cross-step copy of the previous model. The acknowledged
-shadow or change-recording mechanism above remains separate state with its own
-memory accounting.
+The two proposals should compose without creating another queue. At most two
+in-flight slots may exist. A slot owns its exported bucket, encoded payload,
+receiver references, and pending shadow transition until every receiver ACKs.
+Only then may the sender commit that receiver's new base version and reuse the
+slot. A timeout or failed receiver leaves its shadow unadvanced and forces a
+dense resync before that receiver serves the target version.
 
-The separate Miles/SGLang two-slot transport work is not implemented yet. This
-design does not claim that veRL's compatibility-layer prefetch automatically
-covers the distributed Miles/SGLang leg. That leg needs its own ordering,
-weight-version, termination, and failure tests before enabling incremental
-payloads.
+Until the bounded transport lands and is validated independently, the lossless
+prototype should encode and apply buckets serially and report its peak live
+memory without claiming overlap. The future colocated and distributed legs both
+need chunk-order, weight-version, termination, and failure tests. The
+acknowledged cross-step shadow remains separately accounted state; it is not one
+of the two transient transport slots.
 
 ### BF16 to block-FP8 resync
 
