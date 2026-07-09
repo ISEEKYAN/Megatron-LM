@@ -260,6 +260,113 @@ def test_mfsdp_metadata_infers_tp_partition_attrs_for_known_weights():
     assert should_skip_tp_duplicate_sync(layer.attn.qkv.linear.weight)
 
 
+def test_mfsdp_marks_sequence_parallel_shards_for_tp_gradient_sync():
+    model = _GlooModel()
+    model.sp_params = [model.out.weight]
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        etp_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+
+    _chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        model_cfg=SimpleNamespace(),
+        engine_cfg=SimpleNamespace(
+            model_name="qwen3_5",
+            parallel=ParallelConfig(tp=2, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_GlooUnit,),
+    )
+
+    out_shard = next(
+        param
+        for param in optimizer.params
+        if optimizer.param_names[id(param)].endswith("out.weight")
+    )
+    assert out_shard.sequence_parallel is True
+    assert out_shard.tensor_model_parallel is False
+    assert optimizer._inner_optimizer.tp_replicated_params == [out_shard]
+
+
+def test_mfsdp_standalone_step_covers_tp_and_expert_norm_domains(monkeypatch):
+    dense = torch.nn.Parameter(torch.ones(1))
+    dense.grad = torch.ones(1)
+    tp_replicated = torch.nn.Parameter(torch.ones(1))
+    tp_replicated.sequence_parallel = True
+    tp_replicated.grad = torch.ones(1)
+    expert = torch.nn.Parameter(torch.ones(1))
+    expert.grad = torch.ones(1)
+    ps = SimpleNamespace(
+        dp_cp_group="dense_dp",
+        dp_group=None,
+        ep_dp_group="expert_dp",
+        ep_group="expert",
+        etp_group="expert_tp",
+        tp_group="tensor",
+        pp_group="pipeline",
+    )
+    scalar_reductions = []
+    grad_reductions = []
+
+    def record_scalar_reduction(_value, group):
+        scalar_reductions.append(group)
+
+    def record_grad_reduction(grad, group):
+        grad_reductions.append(group)
+        grad.mul_(2.0)
+
+    monkeypatch.setattr(mfsdp_optimizer, "_sum_if_distributed", record_scalar_reduction)
+    monkeypatch.setattr(
+        mfsdp_optimizer, "_all_reduce_grad_if_distributed", record_grad_reduction
+    )
+    adapter = mfsdp_optimizer._StandaloneOptimizer(
+        torch.optim.SGD([dense, tp_replicated, expert], lr=0.0),
+        [dense, tp_replicated, expert],
+        {id(dense): "dense", id(tp_replicated): "sp", id(expert): "expert"},
+        ps=ps,
+        clip_grad=0.0,
+        grad_norm_accum_dtype=torch.float32,
+        expert_params=[expert],
+        expert_grad_scale=1.0,
+    )
+
+    success, grad_norm, _ = adapter.step()
+
+    assert success
+    assert grad_norm == pytest.approx((1.0 + 4.0 + 1.0) ** 0.5)
+    assert grad_reductions == ["tensor"]
+    assert scalar_reductions == [
+        "dense_dp",
+        "tensor",
+        "dense_dp",
+        "expert_dp",
+        "expert_tp",
+        "expert",
+        "pipeline",
+    ]
+
+
 def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
     class _Unit(torch.nn.Module):
         def __init__(self):
