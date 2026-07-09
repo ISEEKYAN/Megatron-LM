@@ -183,7 +183,9 @@ def test_qwen35_tp2_tp4_mixed_attention_parity_and_backward():
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=4,
-        vocab_size=64,
+        # Production Qwen3.5 needs no TP vocab padding. Keep the proxy aligned
+        # so HF save/load does not intentionally zero synthetic padding rows.
+        vocab_size=128,
         num_experts=2,
         num_experts_per_tok=1,
         moe_intermediate_size=8,
