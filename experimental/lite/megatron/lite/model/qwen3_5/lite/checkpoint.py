@@ -49,8 +49,10 @@ def PLACEMENT_FN(param_name: str) -> list:
         return [Replicate(), Replicate(), Replicate(), Shard(1)]
     if "embed" in param_name or "head" in param_name:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
-    if "conv1d" in param_name or "dt_bias" in param_name or "A_log" in param_name:
+    if "conv1d" in param_name:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
+    if "dt_bias" in param_name or "A_log" in param_name:
+        return [Replicate(), Replicate(), Replicate(), Replicate()]
     return [Replicate(), Replicate(), Replicate(), Replicate()]
 
 
@@ -75,9 +77,12 @@ def _tp_linear_attn_in_proj(
     b: torch.Tensor,
     a: torch.Tensor,
     *,
+    cfg: Qwen35Config,
     ps: ParallelState,
 ) -> torch.Tensor:
     """Shard each GDN projection independently, then pack the local layout."""
+    if _linear_attn_head_replication(cfg, ps.tp_size):
+        return _tp(torch.cat([q, k, v, z, b, a], dim=0), ps.tp_rank, ps.tp_size)
     return torch.cat(
         [
             _tp(q, ps.tp_rank, ps.tp_size),
@@ -94,6 +99,8 @@ def _tp_linear_attn_in_proj(
 def _tp_linear_attn_conv1d(
     tensor: torch.Tensor, *, cfg: Qwen35Config, ps: ParallelState
 ) -> torch.Tensor:
+    if _linear_attn_head_replication(cfg, ps.tp_size):
+        return _tp(tensor, ps.tp_rank, ps.tp_size)
     qk_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
     v_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
     q, k, v = tensor.split([qk_dim, qk_dim, v_dim], dim=0)
@@ -109,6 +116,13 @@ def _tp_linear_attn_conv1d(
 
 def _zero_centered_gamma_from_hf(tensor: torch.Tensor) -> torch.Tensor:
     return tensor - 1
+
+
+def _linear_attn_head_replication(cfg: Qwen35Config, tp_size: int) -> bool:
+    return (
+        cfg.linear_num_key_heads < tp_size
+        or cfg.linear_num_value_heads < tp_size
+    )
 
 
 def _get(reader: SafeTensorReader, name: str) -> torch.Tensor:
@@ -222,6 +236,8 @@ def _merge_linear_attn_in_proj_tp_shards(
     shards: list[torch.Tensor], *, cfg: Qwen35Config
 ) -> torch.Tensor:
     world_size = len(shards)
+    if _linear_attn_head_replication(cfg, world_size):
+        return torch.cat(shards, dim=0).contiguous()
     qk_dim = ensure_divisible(cfg.linear_num_key_heads * cfg.linear_key_head_dim, world_size)
     v_dim = ensure_divisible(cfg.linear_num_value_heads * cfg.linear_value_head_dim, world_size)
     value_heads = ensure_divisible(cfg.linear_num_value_heads, world_size)
@@ -242,6 +258,8 @@ def _merge_linear_attn_conv1d_tp_shards(
     shards: list[torch.Tensor], *, cfg: Qwen35Config
 ) -> torch.Tensor:
     world_size = len(shards)
+    if _linear_attn_head_replication(cfg, world_size):
+        return torch.cat(shards, dim=0).contiguous()
     qk_dim = ensure_divisible(cfg.linear_num_key_heads * cfg.linear_key_head_dim, world_size)
     v_dim = ensure_divisible(cfg.linear_num_value_heads * cfg.linear_value_head_dim, world_size)
 
@@ -555,8 +573,6 @@ class Qwen35WeightSpec:
             native_name.endswith(suffix)
             for suffix in (
                 ".linear_attn.conv1d.weight",
-                ".linear_attn.dt_bias",
-                ".linear_attn.A_log",
             )
         ):
             return (0, 0)
@@ -597,18 +613,14 @@ def _load_linear_attn(
     a = _get(reader, f"{hf_prefix}.in_proj_a.weight")
 
     out[f"{local_prefix}.linear_attn.in_proj.linear.weight"] = _tp_linear_attn_in_proj(
-        q, k, v, z, b, a, ps=ps
+        q, k, v, z, b, a, cfg=cfg, ps=ps
     )
     out[f"{local_prefix}.linear_attn.in_proj.linear.layer_norm_weight"] = input_ln
     out[f"{local_prefix}.linear_attn.conv1d.weight"] = _tp_linear_attn_conv1d(
         _get(reader, f"{hf_prefix}.conv1d.weight"), cfg=cfg, ps=ps
     )
-    out[f"{local_prefix}.linear_attn.dt_bias"] = _tp(
-        _get(reader, f"{hf_prefix}.dt_bias"), ps.tp_rank, ps.tp_size
-    )
-    out[f"{local_prefix}.linear_attn.A_log"] = _tp(
-        _get(reader, f"{hf_prefix}.A_log"), ps.tp_rank, ps.tp_size
-    )
+    out[f"{local_prefix}.linear_attn.dt_bias"] = _get(reader, f"{hf_prefix}.dt_bias")
+    out[f"{local_prefix}.linear_attn.A_log"] = _get(reader, f"{hf_prefix}.A_log")
     out[f"{local_prefix}.linear_attn.norm.weight"] = _zero_centered_gamma_from_hf(
         _get(reader, f"{hf_prefix}.norm.weight")
     )

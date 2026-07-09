@@ -8,7 +8,6 @@ Supports sequence parallel, context parallel, and THD (packed sequences).
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import transformer_engine.pytorch as te
 
@@ -18,7 +17,12 @@ from megatron.lite.primitive.modules.gqa_utils import (
 )
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
-from megatron.lite.primitive.parallel import ColumnParallelLinear, ParallelState, RowParallelLinear
+from megatron.lite.primitive.parallel import (
+    ColumnParallelLinear,
+    ParallelState,
+    RowParallelLinear,
+    all_gather_last_dim_with_grad_reduce,
+)
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.rope import _apply_rotary_pos_emb_bshd, _apply_rotary_pos_emb_thd
 from megatron.lite.primitive.utils.rotary import RotaryEmbedding
@@ -35,33 +39,6 @@ _KEPT_PSP_FIELDS = (
     "max_seqlen_q",
     "max_seqlen_kv",
 )
-
-
-class _AllGatherLastDimWithGradReduce(torch.autograd.Function):
-    """All-gather TP activations; reduce-scatter their gradients."""
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, group) -> torch.Tensor:
-        ctx.group = group
-        ctx.tp_size = dist.get_world_size(group)
-        chunks = [torch.empty_like(x) for _ in range(ctx.tp_size)]
-        dist.all_gather(chunks, x.contiguous(), group=group)
-        return torch.cat(chunks, dim=-1).contiguous()
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        local_width = ensure_divisible(grad_output.shape[-1], ctx.tp_size)
-        flat_grad = grad_output.reshape(-1, grad_output.shape[-1])
-        packed_grad = torch.cat(
-            flat_grad.split(local_width, dim=-1), dim=0
-        ).contiguous()
-        local_grad = torch.empty(
-            (flat_grad.shape[0], local_width),
-            dtype=grad_output.dtype,
-            device=grad_output.device,
-        )
-        dist.reduce_scatter_tensor(local_grad, packed_grad, group=ctx.group)
-        return local_grad.reshape(*grad_output.shape[:-1], local_width), None
 
 
 class GQAttention(nn.Module):
@@ -215,7 +192,7 @@ class GQAttention(nn.Module):
         if self.qkv_lora is not None:
             qkv = qkv + self.qkv_lora(self._qkv_lora_input(x))
         if self._replicate_kv:
-            qkv = _AllGatherLastDimWithGradReduce.apply(qkv, self.ps.tp_group)
+            qkv = all_gather_last_dim_with_grad_reduce(qkv, self.ps.tp_group)
         q, gate, k, v = self._split_qkv(qkv)
 
         is_thd = packed_seq_params is not None

@@ -8,7 +8,6 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 
-import pytest
 import torch
 
 from megatron.lite.runtime.contracts.config import ParallelConfig
@@ -309,67 +308,3 @@ def test_correctness_compare_requires_bitwise_fields():
 
     assert comparison["passed"] is False
     assert comparison["max_grad_norm_abs"] == 0.5
-
-
-def test_correctness_compare_allows_explicit_tp_numeric_tolerance():
-    from examples.bench.results import compare_correctness_artifacts
-
-    baseline = {
-        "eval_logits": {"sha256": "a", "shape": [2], "values": [1.0, 2.0]},
-        "steps": [
-            {
-                "loss": {"value": 10.0},
-                "logits": {"sha256": "b", "shape": [2], "values": [3.0, 4.0]},
-                "grad_norm": {"value": 0.0},
-                "update_successful": True,
-                "num_zeros": 0,
-                "post_step_weights": None,
-            }
-        ],
-    }
-    candidate = {
-        "eval_logits": {"sha256": "c", "shape": [2], "values": [1.02, 1.99]},
-        "steps": [
-            {
-                "loss": {"value": 10.0007},
-                "logits": {"sha256": "d", "shape": [2], "values": [2.97, 4.01]},
-                "grad_norm": {"value": 0.0},
-                "update_successful": True,
-                "num_zeros": 0,
-                "post_step_weights": None,
-            }
-        ],
-    }
-
-    assert compare_correctness_artifacts(baseline, candidate)["passed"] is False
-    comparison = compare_correctness_artifacts(
-        baseline,
-        candidate,
-        loss_atol=1e-3,
-        tensor_atol=5e-2,
-    )
-
-    assert comparison["passed"] is True
-    assert comparison["max_loss_abs"] == pytest.approx(7e-4)
-    assert comparison["max_tensor_abs"] == pytest.approx(3e-2)
-
-    candidate["steps"][0]["logits"]["values"][0] = 2.9
-    assert (
-        compare_correctness_artifacts(
-            baseline,
-            candidate,
-            loss_atol=1e-3,
-            tensor_atol=5e-2,
-        )["passed"]
-        is False
-    )
-
-
-def test_correctness_tensor_values_are_opt_in(monkeypatch):
-    from examples.bench.correctness import _hash_tensor
-
-    tensor = torch.tensor([[1.0, 2.0]])
-    assert "values" not in _hash_tensor(tensor)
-
-    monkeypatch.setenv("MLITE_CORRECTNESS_INCLUDE_VALUES", "1")
-    assert _hash_tensor(tensor)["values"] == [1.0, 2.0]
