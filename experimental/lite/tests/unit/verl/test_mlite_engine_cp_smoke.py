@@ -292,8 +292,11 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     assert result.model_output.log_probs is not None
     grad_norm = torch.zeros((), dtype=torch.float32, device=device)
     for param in engine.module.parameters():
-        if param.grad is not None:
-            grad_norm = grad_norm + param.grad.detach().float().norm()
+        grad = param.grad
+        if grad is None:
+            grad = getattr(param, "main_grad", None)
+        if grad is not None:
+            grad_norm = grad_norm + grad.detach().float().norm()
     dist.all_reduce(grad_norm, op=dist.ReduceOp.SUM)
     assert torch.isfinite(grad_norm)
     assert grad_norm.item() > 0.0
