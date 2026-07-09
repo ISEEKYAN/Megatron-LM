@@ -487,6 +487,7 @@ def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelSta
 
     spec = DeepseekV4WeightSpec(config)
     rank0_only = bool(kwargs.get("rank0_only", False))
+    cpu = bool(kwargs.get("cpu", False))
     export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
     yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
 
@@ -507,7 +508,8 @@ def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelSta
             global_name = to_global_layer_name(name, layer_map)
             if not _router_buffer_matches_layer_kind(global_name, config):
                 continue
-            for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer.detach().cpu()):
+            export_buffer = buffer.detach().cpu() if cpu else buffer.detach()
+            for hf_name, hf_tensor in spec.native_to_hf(global_name, export_buffer):
                 yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
 
 
@@ -539,7 +541,8 @@ def save_hf_weights(model, path: str, config: DeepseekV4Config, ps: ParallelStat
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
 
     rank = dist.get_rank() if dist.is_initialized() else 0
-    out = dict(export_hf_weights(model, config, ps, rank0_only=True, **kwargs))
+    kwargs.pop("cpu", None)
+    out = dict(export_hf_weights(model, config, ps, rank0_only=True, cpu=True, **kwargs))
     if rank == 0 and out:
         save_safetensors(out, path)
     if dist.is_initialized():
