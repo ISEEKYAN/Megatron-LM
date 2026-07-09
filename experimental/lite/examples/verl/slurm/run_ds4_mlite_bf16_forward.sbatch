@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
-#SBATCH --time=06:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/llmrl/gb200-vllm-ds4/logs/ds4-mlite-bf16-sm100-%j.log
 
 set -euo pipefail

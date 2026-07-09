@@ -137,6 +137,7 @@ def test_formal_mlite_forward_launcher_probes_then_runs_same_prompt_driver() -> 
     script = (_SLURM / "run_ds4_mlite_bf16_forward.sbatch").read_text()
 
     assert "#SBATCH --gpus-per-node=4" in script
+    assert "#SBATCH --time=04:00:00" in script
     assert "python -m examples.verl.ds4_sm100_env probe" in script
     assert "python -m torch.distributed.run --standalone --nproc_per_node=4" in script
     assert "-m examples.verl.ds4_resync_tp4 collect-mlite" in script
