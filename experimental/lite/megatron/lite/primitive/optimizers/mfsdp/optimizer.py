@@ -12,13 +12,24 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from megatron.lite.primitive.optimizers.mfsdp.config import validate_mfsdp_config
+from megatron.lite.primitive.optimizers.mfsdp.config import (
+    build_mfsdp_config,
+    validate_mfsdp_config,
+)
+from megatron.lite.primitive.optimizers.mfsdp.fully_shard import fully_shard_model
+from megatron.lite.primitive.optimizers.mfsdp.fused_ops import build_optimizer
 from megatron.lite.primitive.optimizers.mfsdp.grad_norm import (
     all_reduce_scalar_,
     local_grad_sq_sum,
     resolve_torch_dtype,
 )
-from megatron.lite.primitive.optimizers.mfsdp.param_sync import (
+from megatron.lite.primitive.optimizers.mfsdp.metadata import (
+    annotate_parallel_parameters,
+)
+from megatron.lite.primitive.optimizers.mfsdp.process_groups import (
+    build_mfsdp_process_groups,
+)
+from megatron.lite.primitive.optimizers.mfsdp.wrapper import (
     MFSdpModule,
     mark_optimizer_built,
 )
@@ -291,12 +302,8 @@ def build_mfsdp_stack(
     validate_mfsdp_config(engine_cfg)
     opt = engine_cfg.optimizer
     classifier = is_expert or (lambda _name: False)
-    strategy = _override(opt, "mfsdp_sharding_strategy", "optim_grads_params")
-    if strategy != "optim_grads_params":
-        raise ValueError(
-            "The self-contained M-FSDP path currently supports "
-            "mfsdp_sharding_strategy='optim_grads_params' only."
-        )
+    config = build_mfsdp_config(opt)
+    groups = build_mfsdp_process_groups(ps)
 
     wrapped_chunks = []
     for chunk in model_chunks:
@@ -307,14 +314,12 @@ def build_mfsdp_stack(
             etp_size=int(getattr(engine_cfg.parallel, "etp", 1) or 1),
         )
         wrapped_chunks.append(
-            MFSdpModule(
+            fully_shard_model(
                 chunk,
-                dense_process_group=getattr(ps, "dp_cp_group", None)
-                or getattr(ps, "dp_group", None),
-                expert_process_group=getattr(ps, "ep_dp_group", None),
+                groups=groups,
+                config=config,
                 is_expert=classifier,
                 unit_modules=fsdp_unit_modules,
-                average_gradients=bool(_override(opt, "average_in_collective", True)),
             )
         )
 
@@ -352,34 +357,13 @@ def _mark_mfsdp_parallel_attrs(
     tp_size: int,
     etp_size: int,
 ) -> None:
-    """Preserve explicit TP/SP ownership metadata on standalone optimizer shards."""
-    sp_param_ids = {id(param) for param in getattr(model, "sp_params", ())}
-    for name, param in model.named_parameters():
-        expert = classifier(name)
-        if not hasattr(param, "allreduce"):
-            param.allreduce = not expert
-        if id(param) in sp_param_ids:
-            param.sequence_parallel = True
-            param.tensor_model_parallel = False
-            continue
-        if bool(getattr(param, "average_gradients_across_tp_domain", False)):
-            param.tensor_model_parallel = False
-            continue
-        if bool(getattr(param, "sequence_parallel", False)):
-            param.tensor_model_parallel = False
-            continue
-        if expert:
-            if etp_size <= 1 or param.ndim <= 1:
-                param.tensor_model_parallel = False
-            elif not hasattr(param, "tensor_model_parallel"):
-                param.tensor_model_parallel = True
-            continue
-        if (
-            tp_size > 1
-            and param.ndim > 1
-            and not hasattr(param, "tensor_model_parallel")
-        ):
-            param.tensor_model_parallel = True
+    """Compatibility entry point for the active metadata normalization pass."""
+    annotate_parallel_parameters(
+        model,
+        classifier,
+        tp_size=tp_size,
+        etp_size=etp_size,
+    )
 
 
 def build_mfsdp_training_optimizer(
@@ -474,26 +458,4 @@ def _build_param_groups(
 def _build_torch_optimizer(
     param_groups: list[dict[str, Any]], opt: Any
 ) -> torch.optim.Optimizer:
-    optimizer_name = getattr(opt, "optimizer", "adam")
-    lr = float(getattr(opt, "lr", 1.0e-4))
-    weight_decay = float(getattr(opt, "weight_decay", 0.01))
-    if optimizer_name == "adam":
-        beta1 = getattr(opt, "adam_beta1", None)
-        beta2 = getattr(opt, "adam_beta2", None)
-        eps = getattr(opt, "adam_eps", None)
-        return torch.optim.AdamW(
-            param_groups,
-            lr=lr,
-            weight_decay=weight_decay,
-            betas=(0.9 if beta1 is None else beta1, 0.999 if beta2 is None else beta2),
-            eps=1.0e-8 if eps is None else eps,
-            foreach=False,
-        )
-    if optimizer_name == "sgd":
-        return torch.optim.SGD(
-            param_groups,
-            lr=lr,
-            weight_decay=weight_decay,
-            momentum=float(getattr(opt, "sgd_momentum", 0.9)),
-        )
-    raise ValueError(f"Unsupported M-FSDP optimizer: {optimizer_name!r}.")
+    return build_optimizer(param_groups, opt)

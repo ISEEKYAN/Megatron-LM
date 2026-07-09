@@ -349,7 +349,11 @@ def _named_mfsdp_optimizer_grads(model_chunks) -> dict[str, torch.Tensor]:
     grads: dict[str, torch.Tensor] = {}
     for chunk_index, chunk in enumerate(model_chunks):
         for bucket in chunk.param_sync.buckets:
-            rank_major = torch.empty_like(bucket.grad_comm_buffer)
+            rank_major = torch.empty(
+                bucket.full_numel,
+                dtype=bucket.main_grad_buffer.dtype,
+                device=bucket.device,
+            )
             if bucket.world_size == 1:
                 rank_major.copy_(bucket.grad_shard_buffer)
             else:
@@ -359,19 +363,12 @@ def _named_mfsdp_optimizer_grads(model_chunks) -> dict[str, torch.Tensor]:
                     group=bucket.process_group,
                 )
             for spec in bucket.specs:
-                full_grad = torch.zeros(
-                    spec.padded_numel,
-                    dtype=bucket.grad_dtype,
-                    device=bucket.device,
-                )
-                for rank in range(bucket.world_size):
-                    source_offset = rank * bucket.local_numel + spec.local_offset
-                    destination_offset = rank * spec.shard_numel
-                    full_grad.narrow(0, destination_offset, spec.shard_numel).copy_(
-                        rank_major.narrow(0, source_offset, spec.shard_numel)
-                    )
                 grads[f"{chunk_index}.{spec.name}"] = (
-                    full_grad[: spec.numel].view(spec.shape).cpu().float().clone()
+                    rank_major.narrow(0, spec.full_offset, spec.numel)
+                    .view(spec.shape)
+                    .cpu()
+                    .float()
+                    .clone()
                 )
     return grads
 

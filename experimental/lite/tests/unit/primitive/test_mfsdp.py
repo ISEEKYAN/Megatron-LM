@@ -16,7 +16,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
+from megatron.lite.primitive.optimizers.mfsdp import allocator as mfsdp_allocator
 from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
+from megatron.lite.primitive.optimizers import get_optimizer_backend
 from megatron.lite.runtime.contracts.config import ParallelConfig
 
 
@@ -158,20 +160,44 @@ def test_mfsdp_config_validation_does_not_require_or_filter_model_name():
     mfsdp_config.validate_mfsdp_config(engine_cfg)
 
 
+def test_mfsdp_reference_rewrite_modules_are_live():
+    package = Path(mfsdp_config.__file__).parent
+    required_modules = {
+        "allocator.py",
+        "backend.py",
+        "buffer.py",
+        "fully_shard.py",
+        "metadata.py",
+        "mixed_precision.py",
+        "patches.py",
+        "pipeline.py",
+        "process_groups.py",
+        "uneven_dtensor.py",
+        "wrapper.py",
+    }
+    missing = sorted(
+        name for name in required_modules if not (package / name).is_file()
+    )
+    assert missing == []
+
+    # These are production edges, not files kept alive only by tests.  The
+    # optimizer constructs the wrapper, and the wrapper owns the M-FSDP buffer
+    # plus both communication pipelines.
+    optimizer_source = (package / "optimizer.py").read_text()
+    wrapper_source = (package / "wrapper.py").read_text()
+    assert "mfsdp.wrapper" in optimizer_source
+    assert "ParamAndGradBuffer" in wrapper_source
+    assert "AllGatherPipeline" in wrapper_source
+    assert "GradReducePipeline" in wrapper_source
+
+
 def test_mfsdp_has_no_legacy_test_only_production_surface():
     package = Path(mfsdp_config.__file__).parent
-    forbidden_modules = {
-        "backend.py",
-        "checkpoint_keys.py",
-        "metadata.py",
-        "patches.py",
-    }
     forbidden_top_level = {
         "config.py": {
             "_collect_mfsdp_overrides",
             "_distributed_optimizer_instance_override",
             "_validate_ddp_knob_value",
-            "build_mfsdp_ddp_config",
             "coerce_dtype",
             "split_mfsdp_overrides",
             "validate_mfsdp_topology_optimizer_combo",
@@ -192,13 +218,9 @@ def test_mfsdp_has_no_legacy_test_only_production_surface():
     }
     forbidden_methods = {
         "optimizer.py": {"sync_model_weights_to_main_weights"},
-        "param_sync.py": {"install_optimized_model_weights"},
     }
 
     violations = []
-    for module_name in sorted(forbidden_modules):
-        if (package / module_name).exists():
-            violations.append(f"obsolete module still exists: {module_name}")
     for module_name, names in forbidden_top_level.items():
         tree = ast.parse((package / module_name).read_text())
         defined = {
@@ -274,6 +296,41 @@ def test_mfsdp_config_rejects_unsupported_optimizer():
     )
     with pytest.raises(ValueError, match="adam/sgd"):
         mfsdp_config.validate_mfsdp_config(engine_cfg)
+
+
+def test_mfsdp_config_enables_double_buffer_for_nccl_user_buffers():
+    config = mfsdp_config.build_mfsdp_config(
+        SimpleNamespace(
+            override_optimizer_config={
+                "mfsdp_sharding_strategy": "optim_grads_params",
+                "nccl_ub": True,
+            }
+        )
+    )
+
+    assert config.nccl_ub is True
+    assert config.fsdp_double_buffer is True
+
+
+def test_mfsdp_nccl_user_buffer_falls_back_when_apex_is_missing(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def missing_apex(_name):
+        raise ImportError("optional allocator missing")
+
+    monkeypatch.setattr(mfsdp_allocator.importlib, "import_module", missing_apex)
+    user_buffer = mfsdp_allocator.NCCLUserBuffer(
+        enabled=True,
+        groups=(),
+        symmetric=True,
+    )
+
+    assert user_buffer.active is False
+
+
+def test_mfsdp_backend_is_registered():
+    backend = get_optimizer_backend("mfsdp")
+    assert backend.name == "mfsdp"
 
 
 def test_mfsdp_parallel_metadata_uses_topology_and_explicit_classifier():
@@ -561,6 +618,53 @@ def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
         assert torch.equal(value, restored_model[name]), name
 
 
+def test_mfsdp_bucket_policy_splits_one_unit_without_splitting_parameters():
+    model = torch.nn.Module()
+    model.weight0 = torch.nn.Parameter(torch.ones(4))
+    model.weight1 = torch.nn.Parameter(torch.ones(4))
+    model.weight2 = torch.nn.Parameter(torch.ones(4))
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        etp_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="sgd",
+        lr=0.0,
+        weight_decay=0.0,
+        clip_grad=0.0,
+        override_optimizer_config={
+            "mfsdp_sharding_strategy": "optim_grads_params",
+            "bucket_size": 4,
+        },
+    )
+
+    chunks, _optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(),
+    )
+
+    buckets = chunks[0].param_sync.buckets
+    assert len(buckets) == 3
+    assert [[spec.name for spec in bucket.specs] for bucket in buckets] == [
+        ["weight0"],
+        ["weight1"],
+        ["weight2"],
+    ]
+
+
 def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
     torch.manual_seed(321)
     reference = _GlooModel()
@@ -730,12 +834,27 @@ def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
         bucket.grad_shard_buffer.dtype is torch.float32
         for bucket in chunks[0].param_sync.buckets
     )
+    for bucket in chunks[0].param_sync.buckets:
+        main_storage = bucket.main_param_buffer.untyped_storage().data_ptr()
+        assert all(
+            spec.shard_param is not None
+            and spec.shard_param.untyped_storage().data_ptr() == main_storage
+            for spec in bucket.specs
+        )
 
     before = [param.detach().clone() for param in optimizer_params]
     value = torch.randn(3, 4, dtype=torch.bfloat16)
     optimizer.zero_grad()
     chunks[0](value).float().square().mean().backward()
     optimizer.finish_grad_sync()
+    for bucket in chunks[0].param_sync.buckets:
+        grad_storage = bucket.main_grad_buffer.untyped_storage().data_ptr()
+        assert all(
+            spec.shard_param is not None
+            and spec.shard_param.grad is not None
+            and spec.shard_param.grad.untyped_storage().data_ptr() == grad_storage
+            for spec in bucket.specs
+        )
     success, grad_norm, _ = optimizer.step()
 
     assert success
