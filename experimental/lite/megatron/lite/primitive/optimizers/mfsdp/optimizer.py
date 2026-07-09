@@ -420,7 +420,6 @@ def build_mfsdp_training_optimizer(
     model_cfg,
     impl_cfg,
     ps,
-    model_name: str,
     is_expert: ExpertClassifierFn | None = None,
     fsdp_unit_modules: tuple[type[nn.Module] | str, ...] | None = None,
     deterministic: bool | None = None,
@@ -442,7 +441,6 @@ def build_mfsdp_training_optimizer(
             override_optimizer_config={},
         )
     engine_cfg = SimpleNamespace(
-        model_name=model_name,
         parallel=impl_cfg.parallel,
         optimizer=opt,
     )

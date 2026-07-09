@@ -9,12 +9,6 @@ from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
 
-_SUPPORTED_MODELS = {
-    "qwen3_moe",
-    "qwen3_moe_mcore_hybrid",
-    "qwen3_5",
-    "qwen3_5_mcore_hybrid",
-}
 _SUPPORTED_OPTIMIZERS = {"adam", "sgd"}
 _SUPPORTED_SHARDING_STRATEGIES = {
     "no_shard",
@@ -78,12 +72,7 @@ _OPTIMIZER_BASE_KEYS = {
 
 def validate_mfsdp_config(engine_cfg) -> None:
     """Validate the supported surface for optimizer='megatron_fsdp'."""
-    if engine_cfg.model_name not in _SUPPORTED_MODELS:
-        raise ValueError(
-            "optimizer_impl='megatron_fsdp' currently supports only qwen3_moe "
-            "and qwen3_5 variants."
-        )
-    validate_mfsdp_topology(engine_cfg.parallel, model_name=engine_cfg.model_name)
+    validate_mfsdp_topology(engine_cfg.parallel)
     opt = engine_cfg.optimizer
     validate_optimizer_name(getattr(opt, "optimizer", "adam"))
     validate_precision_aware_disabled(opt)
@@ -95,7 +84,7 @@ def validate_mfsdp_config(engine_cfg) -> None:
         )
 
 
-def validate_mfsdp_topology(parallel_cfg, *, model_name: str | None = None) -> None:
+def validate_mfsdp_topology(parallel_cfg) -> None:
     """Validate supported topology surfaces for Megatron-FSDP."""
     pp = int(getattr(parallel_cfg, "pp", 1) or 1)
     vpp = int(getattr(parallel_cfg, "vpp", 1) or 1)

@@ -225,7 +225,6 @@ def _build_mfsdp_pair(
         model_cfg=_model_cfg(),
         impl_cfg=impl_cfg,
         ps=ps,
-        model_name="qwen3_5",
         is_expert=expert_classifier or (lambda _name: False),
         fsdp_unit_modules=(TinyUnit,),
         deterministic=True,

@@ -257,7 +257,6 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
                 model_cfg=model_cfg,
                 impl_cfg=impl_cfg,
                 ps=ps,
-                model_name="qwen3_moe",
                 is_expert=is_expert_param,
                 fsdp_unit_modules=(TransformerLayer,),
                 deterministic=deterministic,
