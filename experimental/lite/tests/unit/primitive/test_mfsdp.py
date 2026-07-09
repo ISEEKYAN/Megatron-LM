@@ -320,6 +320,61 @@ def test_mfsdp_marks_sequence_parallel_shards_for_tp_gradient_sync():
     assert optimizer._inner_optimizer.tp_replicated_params == [out_shard]
 
 
+def test_mfsdp_syncs_average_gradients_across_tp_domain_params(monkeypatch):
+    vision_param = torch.nn.Parameter(torch.ones(1))
+    vision_param.average_gradients_across_tp_domain = True
+    vision_param.grad = torch.ones(1)
+    tp_group = object()
+    reduced = []
+
+    def record_grad_reduction(grad, group, *, average=False):
+        reduced.append((grad, group, average))
+
+    monkeypatch.setattr(
+        mfsdp_optimizer, "_all_reduce_grad_if_distributed", record_grad_reduction
+    )
+    adapter = mfsdp_optimizer._StandaloneOptimizer(
+        torch.optim.SGD([vision_param], lr=0.0),
+        [vision_param],
+        {id(vision_param): "vision.weight"},
+        ps=SimpleNamespace(
+            dp_cp_group=None,
+            dp_group=None,
+            ep_dp_group=None,
+            ep_group=None,
+            etp_group=None,
+            tp_group=tp_group,
+            pp_group=None,
+        ),
+        clip_grad=0.0,
+        grad_norm_accum_dtype=torch.float32,
+        expert_params=[],
+        expert_grad_scale=1.0,
+    )
+
+    adapter.step()
+
+    assert adapter.tp_replicated_params == [vision_param]
+    assert reduced == [(vision_param.grad, tp_group, True)]
+
+
+def test_mfsdp_tp_gradient_average_divides_the_collective_sum(monkeypatch):
+    grad = torch.ones(2)
+    group = object()
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda _group: 2)
+    monkeypatch.setattr(
+        dist,
+        "all_reduce",
+        lambda value, *, op, group: value.mul_(2.0),
+    )
+
+    mfsdp_optimizer._all_reduce_grad_if_distributed(grad, group, average=True)
+
+    assert torch.equal(grad, torch.ones_like(grad))
+
+
 def test_mfsdp_standalone_step_covers_tp_and_expert_norm_domains(monkeypatch):
     dense = torch.nn.Parameter(torch.ones(1))
     dense.grad = torch.ones(1)
@@ -343,7 +398,7 @@ def test_mfsdp_standalone_step_covers_tp_and_expert_norm_domains(monkeypatch):
     def record_scalar_reduction(_value, group):
         scalar_reductions.append(group)
 
-    def record_grad_reduction(grad, group):
+    def record_grad_reduction(grad, group, *, average=False):
         grad_reductions.append(group)
         grad.mul_(2.0)
 

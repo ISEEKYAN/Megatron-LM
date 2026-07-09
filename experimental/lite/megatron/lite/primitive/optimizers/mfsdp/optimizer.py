@@ -69,7 +69,10 @@ class _StandaloneOptimizer:
             param
             for param in self.params
             if id(param) not in self._expert_param_ids
-            and bool(getattr(param, "sequence_parallel", False))
+            and (
+                bool(getattr(param, "sequence_parallel", False))
+                or bool(getattr(param, "average_gradients_across_tp_domain", False))
+            )
             and not bool(getattr(param, "shared", False))
         ]
         self._tp_replicated_param_ids = {
@@ -191,7 +194,13 @@ class _StandaloneOptimizer:
         group = getattr(self.ps, "tp_group", None)
         for param in self.tp_replicated_params:
             if param.grad is not None:
-                _all_reduce_grad_if_distributed(param.grad, group)
+                _all_reduce_grad_if_distributed(
+                    param.grad,
+                    group,
+                    average=bool(
+                        getattr(param, "average_gradients_across_tp_domain", False)
+                    ),
+                )
         self._tp_replicated_grads_synced = True
 
 
@@ -202,11 +211,16 @@ def _sum_if_distributed(value: torch.Tensor, group: dist.ProcessGroup | None) ->
 
 
 def _all_reduce_grad_if_distributed(
-    grad: torch.Tensor, group: dist.ProcessGroup | None
+    grad: torch.Tensor,
+    group: dist.ProcessGroup | None,
+    *,
+    average: bool = False,
 ) -> None:
     if group is None or not dist.is_initialized() or dist.get_world_size(group) <= 1:
         return
     dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
+    if average:
+        grad.div_(dist.get_world_size(group))
 
 
 def _include_dense_param_in_norm(
