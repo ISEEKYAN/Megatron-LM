@@ -11,12 +11,9 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
-try:
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-        preprocess_state_dict_for_uneven_dtensor,
-    )
-except Exception:  # pragma: no cover - optional Megatron-Core integration.
-    preprocess_state_dict_for_uneven_dtensor = None
+from megatron.lite.primitive.optimizers.mfsdp.uneven_dtensor import (
+    preprocess_state_dict_for_uneven_dtensor,
+)
 
 from megatron.lite.primitive.optimizers.mfsdp.checkpoint_keys import (
     canonicalize_expert_checkpoint_key,

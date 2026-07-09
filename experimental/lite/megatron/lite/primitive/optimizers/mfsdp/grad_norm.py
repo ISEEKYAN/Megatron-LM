@@ -770,24 +770,15 @@ def _grad_for_norm(param: torch.Tensor, optimizer: Any) -> torch.Tensor | None:
 
 
 def _include_param_in_norm(param: torch.Tensor, tp_group: Any) -> bool:
-    from megatron.core.tensor_parallel import (  # pyright: ignore[reportMissingImports]
-        param_is_not_tensor_parallel_duplicate,
-    )
-    from megatron.core.transformer.module import (  # pyright: ignore[reportMissingImports]
-        param_is_not_shared,
-    )
-
-    return bool(param_is_not_shared(param)) and bool(
-        param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
-    )
+    if bool(getattr(param, "shared", False)):
+        return False
+    if bool(getattr(param, "tensor_model_parallel", False)):
+        return True
+    return tp_group is None or tp_group.rank() == 0
 
 
 def _include_shared_param_in_norm(param: torch.Tensor) -> bool:
-    from megatron.core.transformer.module import (  # pyright: ignore[reportMissingImports]
-        param_is_not_shared,
-    )
-
-    return bool(param_is_not_shared(param))
+    return not bool(getattr(param, "shared", False))
 
 
 def _is_tp_replicated_grad_param(param: torch.Tensor, is_expert: bool) -> bool:
@@ -1078,12 +1069,8 @@ def _to_local_grad(grad: Any) -> torch.Tensor | None:
     local_tensor = getattr(grad, "_local_tensor", None)
     if local_tensor is not None:
         return local_tensor
-    try:
-        from megatron.core.utils import to_local_if_dtensor  # pyright: ignore[reportMissingImports]
-
-        return to_local_if_dtensor(grad)
-    except Exception:
-        return grad
+    to_local = getattr(grad, "to_local", None)
+    return to_local() if callable(to_local) else grad
 
 
 def _grad_sq_sum(grad: torch.Tensor) -> torch.Tensor:
