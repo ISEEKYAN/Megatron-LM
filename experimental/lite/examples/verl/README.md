@@ -185,6 +185,9 @@ FP8, set `resync_config.expert_dtype=fp8` alongside
 `resync_format=vllm_checkpoint`. The generic engine passes this model-owned
 option through without interpreting DeepSeek-V4 tensor families.
 
+For the H100/SM90 environment, short BF16 training, and the official-checkpoint
+tensor resync proxy, follow [the Hopper runbook](../../docs/deepseek-v4-hopper.md).
+
 ## Smoke / Dry-Run Checks
 
 Checked on this branch on 2026-06-07. These checks cover shell syntax,

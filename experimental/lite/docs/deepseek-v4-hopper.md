@@ -108,6 +108,59 @@ resolution and checks the `DeepseekV4ForCausalLM` registry entry; it must print
 `DS4_HOPPER_VLLM_ENV_PROBE_PASSED`. The probe does not replace a full-checkpoint
 rollout test when changing vLLM, Torch, CUDA, or the ABI library.
 
+## BF16 training to pure-FP8 resync proxy
+
+The official DeepSeek-V4 Flash checkpoint is a mixed artifact: scaled dense
+matrices use block FP8 and routed experts use MXFP4. The training master must
+load those values into BF16, while rollout resync must export every quantized
+matrix, including routed experts, as block FP8 with FP32 scales. Do not use an
+FP4 or MXFP4 rollout arm.
+
+For a bounded H100 validation, use
+`examples/verl/slurm/run_ds4_hopper_resync.sbatch`. It composes three checks in
+one two-GPU allocation:
+
+1. the two-rank MLite DS4 CP smoke performs a BF16 forward/backward,
+   distributed-optimizer step, and bitwise checkpoint reload;
+2. `ds4_hopper_resync_proxy.py` reads one scaled dense matrix and one routed
+   expert matrix directly from the official mixed checkpoint, dequantizes a
+   block-aligned crop to BF16, runs four deterministic optimizer steps, and
+   sends both updated matrices through the production DS4
+   `export_resync_weights(..., expert_dtype="fp8")` path;
+3. the vLLM thin profile resolves the CUDA extension ABI and DS4 registry.
+
+Prepare immutable MLite, MCore, and VERL snapshots on the login node, then
+submit with paths exported explicitly:
+
+```bash
+export BASE_IMAGE=/path/to/pytorch_26.04-py3.sqsh
+export MLITE_SRC=/path/to/committed/Megatron-LM
+export MLITE_COMMIT=$(git -C "$MLITE_SRC" rev-parse HEAD)
+export MEGATRON_ROOT=/path/to/committed/Megatron-LM-core
+export VERL_ROOT=/path/to/committed/verl
+export MLITE_SM90_SITE=/path/to/sm90-overlay/lib/python3.12/site-packages
+export DS4_VLLM_SITE=/path/to/ds4-vllm-thin/lib/python3.12/site-packages
+export DS4_VLLM_SHIM=/path/to/ds4-vllm-thin/abi_shim/libvllm_torch212_abi_shim.so
+export CHECKPOINT_DIR=/path/to/official/DeepSeek-V4-Flash
+export OUTPUT_DIR=/path/to/fresh/results
+sbatch experimental/lite/examples/verl/slurm/run_ds4_hopper_resync.sbatch
+```
+
+The proxy stores both arms' full distributions as FP32 tensors. Its JSON report
+also recomputes metrics after BF16 rounding and records per-weight relative L2
+and maximum error, KL, selected-token log-probability delta, importance-ratio
+deviation, clipping crossings, training loss/gradient/update evidence, and
+component timings. A successful run ends with
+`DS4_HOPPER_TRAIN_RESYNC_PASSED` and retains `report.json`,
+`bf16-trained.pt`, and `fp8-export.pt`.
+
+This is intentionally a mechanism proxy. It preserves official checkpoint
+encodings and the production resync adapter, but it does not execute the full
+model or vLLM's full-model FP8 kernels. Do not use it to override a failed or
+missing full-model comparison on Blackwell. Performance numbers are useful
+only for repeated runs of this exact proxy; compare neither its four-step
+matrix loop nor the CP smoke wall time with a differently shaped GB200 run.
+
 ## Hopper and Blackwell differences
 
 | Surface | H100 / SM90 | GB200 / SM100 | Reuse rule |
