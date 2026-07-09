@@ -55,6 +55,13 @@ def math_prompts() -> list[str]:
     return [f"Solve briefly: what is {case}?" for case in cases]
 
 
+def percentile(values: torch.Tensor, quantile: float) -> float:
+    if values.ndim != 1 or not values.numel():
+        raise ValueError("percentile requires a non-empty flat tensor")
+    rank = max(1, min(values.numel(), int(quantile * values.numel() + 0.999999)))
+    return float(torch.kthvalue(values, rank).values)
+
+
 def compare_distributions(
     reference: list[dict[str, torch.Tensor]],
     candidate: list[dict[str, torch.Tensor]],
@@ -83,11 +90,11 @@ def compare_distributions(
         "prompt_count": len(reference),
         "token_count": token_count,
         "max_abs": float(all_delta.max()),
-        "p99_abs": float(torch.quantile(all_delta, 0.99)),
+        "p99_abs": percentile(all_delta, 0.99),
         "max_kl": float(all_kl.max()),
-        "p99_kl": float(torch.quantile(all_kl, 0.99)),
+        "p99_kl": percentile(all_kl, 0.99),
         "max_selected_token_logprob_delta": float(all_selected.max()),
-        "p99_selected_token_logprob_delta": float(torch.quantile(all_selected, 0.99)),
+        "p99_selected_token_logprob_delta": percentile(all_selected, 0.99),
     }
 
 
