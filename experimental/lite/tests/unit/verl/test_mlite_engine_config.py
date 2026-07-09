@@ -182,7 +182,9 @@ def test_checkpoint_resync_format_is_forwarded_to_model_export(monkeypatch) -> N
 
 
 def test_online_weight_export_uses_device_resident_runtime_defaults() -> None:
-    engine = _engine(engine_config=_engine_config(export_dtype="bfloat16"))
+    engine = _engine(
+        engine_config=_engine_config(model_name="qwen3_5", export_dtype="bfloat16")
+    )
     captured = {}
 
     class Runtime:
