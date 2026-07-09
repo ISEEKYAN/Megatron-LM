@@ -125,13 +125,16 @@ def test_gqa_kv_replication_selects_distinct_queries_and_reuses_kv():
 
 
 def test_gqa_kv_replication_backward_reduce_scatters_duplicate_gradients(monkeypatch):
-    from megatron.lite.primitive.modules import gqa
+    from megatron.lite.primitive.parallel import linear
+    from megatron.lite.primitive.parallel.linear import (
+        all_gather_last_dim_with_grad_reduce,
+    )
 
     tp_size = 4
     tp_rank = 1
     group = object()
 
-    monkeypatch.setattr(gqa.dist, "get_world_size", lambda _group: tp_size)
+    monkeypatch.setattr(linear.dist, "get_world_size", lambda _group: tp_size)
 
     def fake_all_gather(outputs, local, *, group):
         del group
@@ -151,11 +154,11 @@ def test_gqa_kv_replication_backward_reduce_scatters_duplicate_gradients(monkeyp
             total.add_(pack_for_reduce_scatter(remote_grad))
         output.copy_(total.chunk(tp_size, dim=0)[tp_rank])
 
-    monkeypatch.setattr(gqa.dist, "all_gather", fake_all_gather)
-    monkeypatch.setattr(gqa.dist, "reduce_scatter_tensor", fake_reduce_scatter)
+    monkeypatch.setattr(linear.dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(linear.dist, "reduce_scatter_tensor", fake_reduce_scatter)
 
     local = torch.tensor([[1.0, 2.0]], requires_grad=True)
-    gathered = gqa._AllGatherLastDimWithGradReduce.apply(local, group)
+    gathered = all_gather_last_dim_with_grad_reduce(local, group)
     gathered.backward(local_grad)
 
     expected = sum(

@@ -6,11 +6,14 @@ import torch.nn as nn
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import (
+    PLACEMENT_FN,
     Qwen35WeightSpec,
     _merge_full_attn_qkvg,
     _merge_gate_up_tp_shards,
     _merge_linear_attn_conv1d_tp_shards,
     _merge_linear_attn_in_proj_tp_shards,
+    _tp_linear_attn_conv1d,
+    _tp_linear_attn_in_proj,
     export_hf_weights,
 )
 from megatron.lite.model.qwen3_5.lite.protocol import ImplConfig
@@ -485,6 +488,55 @@ def test_qwen35_export_reorders_linear_attention_conv1d_tp_shards() -> None:
     merged = _merge_linear_attn_conv1d_tp_shards(shards, cfg=cfg)
 
     assert torch.equal(merged, full)
+
+
+def test_qwen35_linear_attention_tp4_replicated_heads_roundtrip() -> None:
+    cfg = _tiny_config()
+    hidden = cfg.hidden_size
+    qk_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
+    v_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
+    parts = [
+        torch.arange(offset, offset + rows * hidden).reshape(rows, hidden)
+        for offset, rows in zip(
+            (0, 100, 200, 300, 400, 500),
+            (qk_dim, qk_dim, v_dim, v_dim, cfg.linear_num_value_heads, cfg.linear_num_value_heads),
+            strict=True,
+        )
+    ]
+    full_in_proj = torch.cat(parts, dim=0)
+    parallel_states = [SimpleNamespace(tp_size=4, tp_rank=rank) for rank in range(4)]
+    in_proj_shards = [
+        _tp_linear_attn_in_proj(*parts, cfg=cfg, ps=ps) for ps in parallel_states
+    ]
+
+    conv_parts = [
+        torch.arange(offset, offset + rows * cfg.linear_conv_kernel_dim, dtype=torch.float32).reshape(
+            rows, 1, cfg.linear_conv_kernel_dim
+        )
+        for offset, rows in zip((0, 100, 200), (qk_dim, qk_dim, v_dim), strict=True)
+    ]
+    full_conv = torch.cat(conv_parts, dim=0)
+    conv_shards = [
+        _tp_linear_attn_conv1d(full_conv, cfg=cfg, ps=ps) for ps in parallel_states
+    ]
+
+    assert all(shard.shape == (5, hidden) for shard in in_proj_shards)
+    assert torch.equal(
+        _merge_linear_attn_in_proj_tp_shards(in_proj_shards, cfg=cfg), full_in_proj
+    )
+    assert all(shard.shape == (3, 1, cfg.linear_conv_kernel_dim) for shard in conv_shards)
+    assert torch.equal(
+        _merge_linear_attn_conv1d_tp_shards(conv_shards, cfg=cfg), full_conv
+    )
+
+
+def test_qwen35_linear_attention_state_is_tp_replicated() -> None:
+    spec = Qwen35WeightSpec(_tiny_config())
+
+    assert type(PLACEMENT_FN("layers.0.linear_attn.dt_bias")[-1]).__name__ == "Replicate"
+    assert type(PLACEMENT_FN("layers.0.linear_attn.A_log")[-1]).__name__ == "Replicate"
+    assert spec.tp_spec("layers.0.linear_attn.dt_bias") is None
+    assert spec.tp_spec("layers.0.linear_attn.A_log") is None
 
 
 def test_qwen35_export_uses_mbridge_conv1d_tp_gather(monkeypatch) -> None:

@@ -33,6 +33,7 @@ faithful mirror of the upstream packing-aware reshuffle.
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
@@ -46,6 +47,7 @@ from megatron.lite.primitive.parallel import (
     ColumnParallelLinear,
     ParallelState,
     RowParallelLinear,
+    all_gather_last_dim_with_grad_reduce,
 )
 from megatron.lite.primitive.parallel.cp import (
     all_to_all_hidden_shards,
@@ -87,6 +89,21 @@ _CONV_PAD_ALIGNMENT = 4096
 _CP_MODES = {"headwise", "chunkwise"}
 
 
+class _ReplicatedParameterWithGradReduce(torch.autograd.Function):
+    """Keep a replicated TP parameter in sync by reducing its gradient."""
+
+    @staticmethod
+    def forward(ctx, param: torch.Tensor, group) -> torch.Tensor:
+        ctx.group = group
+        return param
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad = grad_output.contiguous()
+        dist.all_reduce(grad, group=ctx.group)
+        return grad, None
+
+
 class GatedDeltaNet(nn.Module):
     """Native Gated DeltaNet with head-parallel / chunkwise CP support."""
 
@@ -117,8 +134,28 @@ class GatedDeltaNet(nn.Module):
         self.dk = linear_key_head_dim
         self.dv = linear_value_head_dim
         self.v_heads_per_k_head = ensure_divisible(self.num_v_heads, self.num_k_heads)
-        self.num_k_heads_local = ensure_divisible(self.num_k_heads, ps.tp_size)
-        self.num_v_heads_local = ensure_divisible(self.num_v_heads, ps.tp_size)
+        self._replicate_heads = (
+            self.num_k_heads < ps.tp_size or self.num_v_heads < ps.tp_size
+        )
+        if self._replicate_heads:
+            if ps.cp_size > 1:
+                raise NotImplementedError(
+                    "GatedDeltaNet TP head replication is not yet validated with CP>1."
+                )
+            for name, num_heads in (
+                ("linear_num_key_heads", self.num_k_heads),
+                ("linear_num_value_heads", self.num_v_heads),
+            ):
+                if num_heads % ps.tp_size != 0 and ps.tp_size % num_heads != 0:
+                    raise ValueError(
+                        f"{name} ({num_heads}) must be a multiple or divisor of "
+                        f"TP size ({ps.tp_size})."
+                    )
+            self.num_k_heads_local = self.num_k_heads
+            self.num_v_heads_local = self.num_v_heads
+        else:
+            self.num_k_heads_local = ensure_divisible(self.num_k_heads, ps.tp_size)
+            self.num_v_heads_local = ensure_divisible(self.num_v_heads, ps.tp_size)
         self.qk_dim = self.num_k_heads * self.dk
         self.v_dim = self.num_v_heads * self.dv
         self.qk_dim_local = self.num_k_heads_local * self.dk
@@ -134,7 +171,11 @@ class GatedDeltaNet(nn.Module):
             eps=rms_norm_eps,
             zero_centered_gamma=True,
         )
-        conv_dim_local = self.qk_dim_local * 2 + self.v_dim_local
+        conv_dim_local = (
+            ensure_divisible(self.qk_dim * 2 + self.v_dim, ps.tp_size)
+            if self._replicate_heads
+            else self.qk_dim_local * 2 + self.v_dim_local
+        )
         self.conv_dim_local = conv_dim_local
         self.conv1d = nn.Conv1d(
             in_channels=conv_dim_local,
@@ -145,10 +186,14 @@ class GatedDeltaNet(nn.Module):
             padding=linear_conv_kernel_dim - 1,
         )
         self.dt_bias = nn.Parameter(
-            torch.ones(self.num_v_heads_local, dtype=torch.float32)
+            torch.ones(self.num_v_heads, dtype=torch.float32)
+            if self._replicate_heads
+            else torch.ones(self.num_v_heads_local, dtype=torch.float32)
         )
         self.A_log = nn.Parameter(
-            torch.zeros(self.num_v_heads_local, dtype=torch.float32)
+            torch.zeros(self.num_v_heads, dtype=torch.float32)
+            if self._replicate_heads
+            else torch.zeros(self.num_v_heads_local, dtype=torch.float32)
         )
         self.norm = te.RMSNorm(self.dv, eps=rms_norm_eps, zero_centered_gamma=True)
         self.o_proj = RowParallelLinear(self.v_dim, hidden_size, ps, bias=False)
@@ -176,6 +221,8 @@ class GatedDeltaNet(nn.Module):
         del position_ids
         is_packed = packed_seq_params is not None
         qkvzba = self.in_proj(x).transpose(0, 1).contiguous()
+        if self._replicate_heads:
+            qkvzba = all_gather_last_dim_with_grad_reduce(qkvzba, self.ps.tp_group)
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params) if is_packed else None
 
         headwise = False
@@ -239,6 +286,9 @@ class GatedDeltaNet(nn.Module):
             ],
             dim=-1,
         )
+        if self._replicate_heads:
+            conv_width = ensure_divisible(qkv.shape[-1], self.ps.tp_size)
+            qkv = qkv.narrow(-1, self.ps.tp_rank * conv_width, conv_width).contiguous()
 
         qkv = self._causal_conv1d(
             qkv,
@@ -248,9 +298,13 @@ class GatedDeltaNet(nn.Module):
             cp_div=cp_div,
             cp_context=cp_context,
         )
+        if self._replicate_heads:
+            qkv = all_gather_last_dim_with_grad_reduce(qkv, self.ps.tp_group)
         query, key, value, gate, beta, alpha = self._prepare_qkv(
             qkv, gate, beta, alpha, batch, seq_len, cp_div
         )
+        if self._replicate_heads:
+            A_log, dt_bias = self._state_parameters_for_tp()
         g, beta = self._compute_g_and_beta(A_log, dt_bias, alpha, beta)
         out, _ = self._gated_delta_rule(
             query,
@@ -265,7 +319,14 @@ class GatedDeltaNet(nn.Module):
         )
 
         out = self._apply_gated_norm(out, gate)
-        out = out.reshape(batch, seq_len, self.v_dim_local // cp_div)
+        out = out.reshape(
+            batch,
+            seq_len,
+            self.v_dim if self._replicate_heads else self.v_dim_local // cp_div,
+        )
+        if self._replicate_heads:
+            out_width = ensure_divisible(self.v_dim, self.ps.tp_size)
+            out = out.narrow(-1, self.ps.tp_rank * out_width, out_width).contiguous()
         if self.ps.cp_size > 1:
             if chunkwise:
                 # Inverse of the pre-recurrence reshuffle: restore the Megatron
@@ -276,6 +337,12 @@ class GatedDeltaNet(nn.Module):
             batch, seq_len = out.shape[:2]
         out = out.transpose(0, 1).contiguous()
         return self.o_proj(out)
+
+    def _state_parameters_for_tp(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return replicated GDN state with a TP gradient all-reduce."""
+        A_log = _ReplicatedParameterWithGradReduce.apply(self.A_log, self.ps.tp_group)
+        dt_bias = _ReplicatedParameterWithGradReduce.apply(self.dt_bias, self.ps.tp_group)
+        return A_log, dt_bias
 
     # ------------------------------------------------------------------ CP: headwise
     def _headwise_cp2hp(
