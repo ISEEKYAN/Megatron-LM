@@ -46,3 +46,15 @@ def test_copy_checkpoint_metadata_ignores_directories(tmp_path) -> None:
     assert (output / "config.json").read_text() == "{}"
     assert not (output / "inference").exists()
     assert not (output / "model.safetensors").exists()
+
+
+def test_model_vocab_size_includes_non_tokenizer_slots() -> None:
+    from examples.verl.ds4_resync_tp4 import model_vocab_size
+
+    class Config:
+        vocab_size = 129280
+
+    class Tokenizer:
+        vocab_size = 128000
+
+    assert model_vocab_size(Config(), Tokenizer()) == 129280

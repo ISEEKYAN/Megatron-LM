@@ -97,6 +97,13 @@ def copy_checkpoint_metadata(source: Path, output: Path) -> None:
             shutil.copy2(path, output / path.name)
 
 
+def model_vocab_size(config: Any, tokenizer: Any) -> int:
+    size = int(config.vocab_size)
+    if size < int(tokenizer.vocab_size):
+        raise ValueError("model vocabulary is smaller than tokenizer vocabulary")
+    return size
+
+
 def _dense_logprobs(entries: list[Any], vocab_size: int) -> torch.Tensor:
     rows = []
     for entry in entries:
@@ -110,11 +117,13 @@ def _dense_logprobs(entries: list[Any], vocab_size: int) -> torch.Tensor:
 
 
 def collect(model: Path, output: Path) -> None:
-    from transformers import AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
     from vllm import LLM, SamplingParams
 
     prompts = math_prompts()
+    config = AutoConfig.from_pretrained(model, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    vocab_size = model_vocab_size(config, tokenizer)
     llm = LLM(
         model=str(model),
         tensor_parallel_size=4,
@@ -122,7 +131,7 @@ def collect(model: Path, output: Path) -> None:
         kv_cache_dtype="fp8",
         max_model_len=512,
         max_num_seqs=1,
-        max_logprobs=tokenizer.vocab_size,
+        max_logprobs=vocab_size,
         gpu_memory_utilization=0.90,
     )
     params = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=-1)
@@ -138,7 +147,7 @@ def collect(model: Path, output: Path) -> None:
         rows.append(
             {
                 "token_ids": torch.tensor(token_ids[1:], dtype=torch.int32),
-                "logprobs": _dense_logprobs(entries[1:], tokenizer.vocab_size).half(),
+                "logprobs": _dense_logprobs(entries[1:], vocab_size).half(),
             }
         )
     output.parent.mkdir(parents=True, exist_ok=True)
