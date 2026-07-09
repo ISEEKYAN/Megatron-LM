@@ -57,6 +57,7 @@ def test_sm100_dependency_contract_fails_closed(
 def test_sm100_overlay_build_is_pinned_and_does_not_mutate_rollout_overlay() -> None:
     versions = (_SLURM / "ds4_sm100_versions.env").read_text()
     build = (_SLURM / "build_ds4_sm100_overlay.sbatch").read_text()
+    normalized_build = " ".join(build.split())
 
     assert "NGC_IMAGE=docker://nvcr.io#nvidia/pytorch:26.06-py3" in versions
     assert "VLLM_COMMIT=cd0de48d0883ecb8e1ef350a99baa0c158f58e82" in versions
@@ -73,6 +74,15 @@ def test_sm100_overlay_build_is_pinned_and_does_not_mutate_rollout_overlay() -> 
     assert 'git -C "${FLASHMLA_SRC}" apply --check' in build
     assert 'mktemp -d "${ROOT}/src/flashmla-build.XXXXXX"' in build
     assert "tar --exclude-vcs" in build
+    assert "--exclude=csrc/cutlass" in build
+    assert (
+        'setup.py flash_mla csrc | tar -C "${FLASHMLA_BUILD_SRC}" -xf -'
+        in normalized_build
+    )
+    assert (
+        "include tools/util/include | tar -C "
+        '"${FLASHMLA_BUILD_SRC}/csrc/cutlass" -xf -' in normalized_build
+    )
     assert '"${FLASHMLA_BUILD_SRC}" "${MLITE_SRC}"' in build
     assert "--force-reinstall" in build
     assert (

@@ -47,10 +47,15 @@ fi
 
 # setuptools discovers a vcs_versioning file finder from the inherited vLLM
 # overlay.  On Lustre, its recursive git scan can time out before FlashMLA's
-# metadata is generated.  Build from an archive-like tree without VCS metadata.
+# metadata is generated.  Build from a minimal archive-like tree without VCS
+# metadata, stale build objects, or unused CUTLASS examples and documentation.
 FLASHMLA_BUILD_SRC=$(mktemp -d "${ROOT}/src/flashmla-build.XXXXXX")
 trap 'rm -rf "${FLASHMLA_BUILD_SRC}"' EXIT
-tar --exclude-vcs -C "${FLASHMLA_SRC}" -cf - . | tar -C "${FLASHMLA_BUILD_SRC}" -xf -
+tar --exclude-vcs --exclude=csrc/cutlass -C "${FLASHMLA_SRC}" -cf - \
+  setup.py flash_mla csrc | tar -C "${FLASHMLA_BUILD_SRC}" -xf -
+mkdir -p "${FLASHMLA_BUILD_SRC}/csrc/cutlass"
+tar --exclude-vcs -C "${FLASHMLA_SRC}/csrc/cutlass" -cf - \
+  include tools/util/include | tar -C "${FLASHMLA_BUILD_SRC}/csrc/cutlass" -xf -
 [[ ! -e "${FLASHMLA_BUILD_SRC}/.git" ]]
 
 srun --mpi=pmix --export=ALL --no-container-mount-home \
