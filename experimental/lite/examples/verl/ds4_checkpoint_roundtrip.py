@@ -183,7 +183,9 @@ def _measure_pair(
         kind = "block_fp8"
         original = dequantize_block_fp8(weight, scale, block_shape)
         requantized, requantized_scale = quantize_block_fp8(
-            original.to(torch.bfloat16), block_shape, scale_format="e8m0"
+            original.to(torch.bfloat16),
+            block_shape,
+            scale_format="float32" if expert_dtype == "fp8" else "e8m0",
         )
         restored = dequantize_block_fp8(requantized, requantized_scale, block_shape)
 

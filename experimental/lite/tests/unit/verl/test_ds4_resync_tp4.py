@@ -1,3 +1,6 @@
+import json
+
+import pytest
 import torch
 
 
@@ -27,9 +30,129 @@ def test_distribution_comparison_reports_kl_and_selected_token_delta() -> None:
     ]
     report = compare_distributions(reference, candidate)
     assert report["token_count"] == 1
-    assert report["max_abs"] > 0
-    assert report["max_kl"] > 0
-    assert report["max_selected_token_logprob_delta"] >= 0
+    assert report["fp32"]["max_abs"] > 0
+    assert report["fp32"]["max_kl"] > 0
+    assert report["fp32"]["max_selected_token_logprob_delta"] >= 0
+    assert report["bf16_rounded"]["max_abs"] > 0
+    assert report["bf16_rounded"]["max_ratio_deviation"] >= 0
+
+
+def test_payload_row_preserves_fp32_artifact_precision() -> None:
+    from examples.verl.ds4_resync_tp4 import payload_row
+
+    row = payload_row(
+        [3, 7],
+        torch.log_softmax(torch.tensor([[1.0, 2.0], [3.0, 4.0]]), dim=-1),
+    )
+
+    assert row["token_ids"].dtype == torch.int32
+    assert row["logprobs"].dtype == torch.float32
+
+
+def test_distribution_comparison_rejects_old_fp16_artifact() -> None:
+    from examples.verl.ds4_resync_tp4 import compare_distributions
+
+    fp32 = torch.log_softmax(torch.tensor([[1.0, 2.0]]), dim=-1)
+    reference = [{"token_ids": torch.tensor([1]), "logprobs": fp32}]
+    candidate = [{"token_ids": torch.tensor([1]), "logprobs": fp32.half()}]
+
+    with pytest.raises(ValueError, match="must be FP32"):
+        compare_distributions(reference, candidate)
+
+
+def test_mlite_teacher_forcing_uses_previous_position_for_each_prompt_token() -> None:
+    from examples.verl.ds4_resync_tp4 import mlite_payload_row
+
+    logits = torch.tensor(
+        [
+            [
+                [3.0, 1.0, 0.0, -1.0],
+                [0.0, 4.0, 1.0, -2.0],
+                [1.0, 0.0, 5.0, -3.0],
+            ]
+        ]
+    )
+    row = mlite_payload_row([0, 1, 2], logits)
+
+    assert row["token_ids"].tolist() == [1, 2]
+    torch.testing.assert_close(
+        row["logprobs"], torch.log_softmax(logits[0, :-1].float(), dim=-1)
+    )
+
+
+def test_pure_fp8_config_overrides_mixed_checkpoint_experts() -> None:
+    from examples.verl.ds4_resync_tp4 import pure_block_fp8_config
+
+    config = pure_block_fp8_config(
+        {
+            "expert_dtype": "fp4",
+            "quantization_config": {
+                "quant_method": "fp8",
+                "scale_fmt": "ue8m0",
+                "weight_block_size": [128, 128],
+            },
+        }
+    )
+
+    assert config["expert_dtype"] == "fp8"
+    assert config["quantization_config"]["expert_dtype"] == "fp8"
+    assert config["quantization_config"]["scale_fmt"] == "float32"
+
+
+def test_online_resync_uses_native_checkpoint_reload_lifecycle(tmp_path) -> None:
+    from examples.verl.ds4_resync_tp4 import reload_resync_checkpoint
+
+    calls = []
+
+    class LLM:
+        def collective_rpc(self, method, *, args, timeout):
+            calls.append((method, args, timeout))
+
+    reload_resync_checkpoint(LLM(), tmp_path)
+
+    assert calls == [("reload_checkpoint_from_path", (str(tmp_path),), None)]
+
+
+def test_three_arm_comparison_reports_fp32_bf16_and_dapo_gate() -> None:
+    from examples.verl.ds4_resync_tp4 import compare_three_arms
+
+    base = torch.log_softmax(torch.tensor([[1.0, 2.0, 3.0]]), dim=-1)
+    direct = [{"token_ids": torch.tensor([2]), "logprobs": base}]
+    resync = [
+        {
+            "token_ids": torch.tensor([2]),
+            "logprobs": torch.log_softmax(torch.tensor([[1.0, 2.0, 3.0001]]), dim=-1),
+        }
+    ]
+    mlite = [
+        {
+            "token_ids": torch.tensor([2]),
+            "logprobs": torch.log_softmax(torch.tensor([[1.0, 2.0, 2.9999]]), dim=-1),
+        }
+    ]
+
+    report = compare_three_arms(direct, resync, mlite, minimum_prompts=1)
+
+    assert set(report["pairs"]) == {
+        "vllm_direct__vllm_resync",
+        "vllm_direct__mlite_bf16",
+        "vllm_resync__mlite_bf16",
+    }
+    pair = report["pairs"]["vllm_direct__vllm_resync"]
+    assert pair["fp32"]["max_ratio_deviation"] > 0
+    assert pair["bf16_rounded"]["max_ratio_deviation"] >= 0
+    assert report["gate"]["acceptable"] is True
+
+
+def test_three_arm_comparison_rejects_token_misalignment() -> None:
+    from examples.verl.ds4_resync_tp4 import compare_three_arms
+
+    logprobs = torch.log_softmax(torch.tensor([[1.0, 2.0, 3.0]]), dim=-1)
+    direct = [{"token_ids": torch.tensor([2]), "logprobs": logprobs}]
+    resync = [{"token_ids": torch.tensor([1]), "logprobs": logprobs}]
+
+    with pytest.raises(ValueError, match="tokenized prompts differ"):
+        compare_three_arms(direct, resync, direct, minimum_prompts=1)
 
 
 def test_percentile_uses_exact_order_statistic() -> None:
@@ -54,6 +177,49 @@ def test_copy_checkpoint_metadata_recurses_but_excludes_weights(tmp_path) -> Non
     assert (output / "config.json").read_text() == "{}"
     assert (output / "inference" / "model.py").read_text() == "class Model: pass\n"
     assert not (output / "model.safetensors").exists()
+
+
+def test_convert_materializes_pure_fp8_expert_checkpoint(tmp_path) -> None:
+    from safetensors.torch import load_file, save_file
+
+    from examples.verl.ds4_resync_tp4 import convert
+    from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    config = {
+        "expert_dtype": "fp8",
+        "quantization_config": {
+            "quant_method": "fp8",
+            "scale_fmt": "float32",
+            "weight_block_size": [128, 128],
+        },
+    }
+    (source / "config.json").write_text(json.dumps(config))
+    dense = torch.linspace(-2.0, 2.0, 128 * 128).reshape(128, 128)
+    expert = torch.linspace(-4.0, 4.0, 128 * 128).reshape(128, 128)
+    dense_weight, dense_scale = quantize_block_fp8(dense, scale_format="float32")
+    expert_weight, expert_scale = quantize_block_fp8(expert, scale_format="float32")
+    save_file(
+        {
+            "layers.2.attn.wo.weight": dense_weight,
+            "layers.2.attn.wo.scale": dense_scale,
+            "layers.2.ffn.experts.0.w1.weight": expert_weight,
+            "layers.2.ffn.experts.0.w1.scale": expert_scale,
+        },
+        source / "model.safetensors",
+    )
+
+    convert(source, output, "cpu")
+
+    converted_config = json.loads((output / "config.json").read_text())
+    tensors = load_file(output / "model.safetensors")
+    assert converted_config["expert_dtype"] == "fp8"
+    assert tensors["layers.2.attn.wo.weight"].dtype == torch.float8_e4m3fn
+    assert tensors["layers.2.attn.wo.scale"].dtype == torch.float32
+    assert tensors["layers.2.ffn.experts.0.w1.weight"].dtype == torch.float8_e4m3fn
+    assert tensors["layers.2.ffn.experts.0.w1.scale"].dtype == torch.float32
 
 
 def test_model_vocab_size_includes_non_tokenizer_slots() -> None:

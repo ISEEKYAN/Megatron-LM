@@ -99,3 +99,26 @@ def test_roundtrip_fails_closed_on_unknown_unscaled_matrix(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="unrecognized unscaled checkpoint weights"):
         run_roundtrip(tmp_path, device="cpu")
+
+
+def test_roundtrip_preserves_pure_block_fp8_float32_scale_contract() -> None:
+    from examples.verl.ds4_checkpoint_roundtrip import _measure_pair
+    from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+
+    source = torch.linspace(-3.0, 3.0, 128 * 128).reshape(128, 128)
+    weight, scale = quantize_block_fp8(source, scale_format="float32")
+
+    record = _measure_pair(
+        "layers.2.ffn.experts.0.w1.weight",
+        weight,
+        scale,
+        expert_dtype="fp8",
+        block_shape=(128, 128),
+        device=torch.device("cpu"),
+    )
+
+    assert record["kind"] == "block_fp8"
+    assert record["scale_byte_mismatch"]["mismatched"] == 0
+    assert (
+        record["scale_byte_mismatch"]["total"] == scale.numel() * scale.element_size()
+    )

@@ -4,13 +4,23 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import torch
+import torch.distributed as dist
+
+
+_DAPO_P99_RATIO_LIMIT = 0.01
+_DAPO_MAX_RATIO_LIMIT = 0.05
+_DAPO_P99_KL_LIMIT = 1e-4
+_DAPO_CLIP_LOW = 0.8
+_DAPO_CLIP_HIGH = 1.2
 
 
 def math_prompts() -> list[str]:
@@ -62,39 +72,160 @@ def percentile(values: torch.Tensor, quantile: float) -> float:
     return float(torch.kthvalue(values, rank).values)
 
 
-def compare_distributions(
+def pure_block_fp8_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return a checkpoint config whose quantized matrices all use block FP8."""
+    result = copy.deepcopy(config)
+    quantization = result.setdefault("quantization_config", {})
+    if not quantization:
+        raise ValueError("DeepSeek-V4 pure FP8 conversion requires quantization_config")
+    result["expert_dtype"] = "fp8"
+    quantization["expert_dtype"] = "fp8"
+    quantization["scale_fmt"] = "float32"
+    return result
+
+
+def payload_row(
+    token_ids: list[int] | torch.Tensor, logprobs: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Build one token-aligned payload row without reducing FP32 precision."""
+    ids = torch.as_tensor(token_ids, dtype=torch.int32).cpu()
+    values = logprobs.detach().to(dtype=torch.float32, device="cpu")
+    if values.ndim != 2 or values.shape[0] != ids.numel():
+        raise ValueError("token ids and logprob rows are not aligned")
+    return {"token_ids": ids, "logprobs": values}
+
+
+def mlite_payload_row(
+    token_ids: list[int] | torch.Tensor, logits: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Align MLite position i logits with the prompt token at position i + 1."""
+    ids = torch.as_tensor(token_ids, dtype=torch.int64)
+    if logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[1] != ids.numel():
+        raise ValueError("MLite logits are not aligned with the prompt tokens")
+    logprobs = torch.log_softmax(logits[0, :-1].float(), dim=-1)
+    return payload_row(ids[1:], logprobs)
+
+
+def _bf16_rounded_logprobs(values: torch.Tensor) -> torch.Tensor:
+    rounded = values.to(torch.bfloat16).float()
+    return rounded - torch.logsumexp(rounded, dim=-1, keepdim=True)
+
+
+def _distribution_metrics(
     reference: list[dict[str, torch.Tensor]],
     candidate: list[dict[str, torch.Tensor]],
+    *,
+    bf16_rounded: bool,
 ) -> dict[str, float | int]:
-    if len(reference) != len(candidate):
-        raise ValueError("prompt result counts differ")
-    deltas, kls, selected = [], [], []
+    deltas, kls, selected_deltas = [], [], []
     token_count = 0
     for left, right in zip(reference, candidate, strict=True):
-        ref = left["logprobs"].float()
-        cand = right["logprobs"].float()
+        stored_ref = left["logprobs"]
+        stored_cand = right["logprobs"]
+        if stored_ref.dtype != torch.float32 or stored_cand.dtype != torch.float32:
+            raise ValueError("stored logprob artifacts must be FP32")
+        ref = stored_ref.float()
+        cand = stored_cand.float()
         ids = left["token_ids"].long()
         if ref.shape != cand.shape or ids.shape != ref.shape[:-1]:
             raise ValueError("token-aligned distribution shapes differ")
         if not torch.equal(ids, right["token_ids"].long()):
             raise ValueError("tokenized prompts differ between arms")
+        if bf16_rounded:
+            ref = _bf16_rounded_logprobs(ref)
+            cand = _bf16_rounded_logprobs(cand)
         delta = cand - ref
         deltas.append(delta.abs().flatten())
         kls.append((ref.exp() * (ref - cand)).sum(dim=-1).flatten())
-        selected.append(delta.gather(-1, ids.unsqueeze(-1)).abs().flatten())
+        selected_deltas.append(delta.gather(-1, ids.unsqueeze(-1)).flatten())
         token_count += ids.numel()
     all_delta = torch.cat(deltas)
     all_kl = torch.cat(kls)
-    all_selected = torch.cat(selected)
+    all_selected_delta = torch.cat(selected_deltas)
+    selected_abs = all_selected_delta.abs()
+    ratio_deviation = (all_selected_delta.clamp(-80, 80).exp() - 1.0).abs()
+    clip_crossings = int(
+        (
+            (all_selected_delta < torch.log(torch.tensor(_DAPO_CLIP_LOW)))
+            | (all_selected_delta > torch.log(torch.tensor(_DAPO_CLIP_HIGH)))
+        )
+        .sum()
+        .item()
+    )
     return {
-        "prompt_count": len(reference),
-        "token_count": token_count,
         "max_abs": float(all_delta.max()),
         "p99_abs": percentile(all_delta, 0.99),
         "max_kl": float(all_kl.max()),
         "p99_kl": percentile(all_kl, 0.99),
-        "max_selected_token_logprob_delta": float(all_selected.max()),
-        "p99_selected_token_logprob_delta": percentile(all_selected, 0.99),
+        "max_selected_token_logprob_delta": float(selected_abs.max()),
+        "p99_selected_token_logprob_delta": percentile(selected_abs, 0.99),
+        "max_ratio_deviation": float(ratio_deviation.max()),
+        "p99_ratio_deviation": percentile(ratio_deviation, 0.99),
+        "clipping_boundary_crossings": clip_crossings,
+        "token_count": token_count,
+    }
+
+
+def compare_distributions(
+    reference: list[dict[str, torch.Tensor]],
+    candidate: list[dict[str, torch.Tensor]],
+) -> dict[str, Any]:
+    if len(reference) != len(candidate):
+        raise ValueError("prompt result counts differ")
+    if not reference:
+        raise ValueError("at least one prompt result is required")
+    fp32 = _distribution_metrics(reference, candidate, bf16_rounded=False)
+    bf16 = _distribution_metrics(reference, candidate, bf16_rounded=True)
+    return {
+        "prompt_count": len(reference),
+        "token_count": fp32["token_count"],
+        "fp32": fp32,
+        "bf16_rounded": bf16,
+    }
+
+
+def compare_three_arms(
+    vllm_direct: list[dict[str, torch.Tensor]],
+    vllm_resync: list[dict[str, torch.Tensor]],
+    mlite_bf16: list[dict[str, torch.Tensor]],
+    *,
+    minimum_prompts: int = 32,
+) -> dict[str, Any]:
+    if len(vllm_direct) < minimum_prompts:
+        raise ValueError(
+            f"three-arm parity requires at least {minimum_prompts} prompts, "
+            f"got {len(vllm_direct)}"
+        )
+    pairs = {
+        "vllm_direct__vllm_resync": compare_distributions(vllm_direct, vllm_resync),
+        "vllm_direct__mlite_bf16": compare_distributions(vllm_direct, mlite_bf16),
+        "vllm_resync__mlite_bf16": compare_distributions(vllm_resync, mlite_bf16),
+    }
+    failures = []
+    for name, pair in pairs.items():
+        metrics = pair["fp32"]
+        if metrics["p99_ratio_deviation"] > _DAPO_P99_RATIO_LIMIT:
+            failures.append(f"{name}: p99 ratio deviation")
+        if metrics["max_ratio_deviation"] > _DAPO_MAX_RATIO_LIMIT:
+            failures.append(f"{name}: max ratio deviation")
+        if metrics["p99_kl"] > _DAPO_P99_KL_LIMIT:
+            failures.append(f"{name}: p99 KL")
+        if metrics["clipping_boundary_crossings"]:
+            failures.append(f"{name}: clipping boundary crossings")
+    return {
+        "schema_version": 2,
+        "pairs": pairs,
+        "gate": {
+            "acceptable": not failures,
+            "failures": failures,
+            "thresholds": {
+                "p99_ratio_deviation": _DAPO_P99_RATIO_LIMIT,
+                "max_ratio_deviation": _DAPO_MAX_RATIO_LIMIT,
+                "p99_kl": _DAPO_P99_KL_LIMIT,
+                "clip_interval": [_DAPO_CLIP_LOW, _DAPO_CLIP_HIGH],
+                "clipping_boundary_crossings": 0,
+            },
+        },
     }
 
 
@@ -125,11 +256,59 @@ def _dense_logprobs(entries: list[Any], vocab_size: int) -> torch.Tensor:
     return torch.stack(rows)
 
 
-def collect(model: Path, output: Path) -> None:
-    from transformers import AutoConfig, AutoTokenizer
-    from vllm import LLM, SamplingParams
+def _checkpoint_expert_dtype(model: Path) -> str:
+    config = json.loads((model / "config.json").read_text())
+    quantization = config.get("quantization_config") or {}
+    return str(config.get("expert_dtype") or quantization.get("expert_dtype", "fp4"))
 
-    prompts = math_prompts()
+
+def require_pure_block_fp8_checkpoint(model: Path) -> None:
+    expert_dtype = _checkpoint_expert_dtype(model)
+    if expert_dtype != "fp8":
+        raise ValueError(
+            f"formal DS4 parity requires expert_dtype='fp8', got {expert_dtype!r}"
+        )
+
+
+def _collect_vllm_rows(llm: Any, tokenizer: Any, vocab_size: int) -> list[dict]:
+    from vllm import SamplingParams
+
+    params = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=-1)
+    rows = []
+    for prompt in math_prompts():
+        token_ids = tokenizer.encode(prompt, add_special_tokens=True)
+        result = llm.generate(
+            [{"prompt_token_ids": token_ids}], params, use_tqdm=False
+        )[0]
+        entries = result.prompt_logprobs
+        if entries is None or len(entries) != len(token_ids):
+            raise ValueError("vLLM prompt logprobs are not token-aligned")
+        rows.append(
+            payload_row(token_ids[1:], _dense_logprobs(entries[1:], vocab_size))
+        )
+    return rows
+
+
+def reload_resync_checkpoint(llm: Any, model: Path) -> None:
+    """Inject a checkpoint through vLLM's native layerwise reload lifecycle."""
+    llm.collective_rpc("reload_checkpoint_from_path", args=(str(model),), timeout=None)
+
+
+def collect(
+    model: Path,
+    output: Path,
+    *,
+    resync_model: Path | None = None,
+    resync_output: Path | None = None,
+) -> None:
+    from transformers import AutoConfig, AutoTokenizer
+    from vllm import LLM
+
+    require_pure_block_fp8_checkpoint(model)
+    if (resync_model is None) != (resync_output is None):
+        raise ValueError("resync_model and resync_output must be provided together")
+    if resync_model is not None:
+        require_pure_block_fp8_checkpoint(resync_model)
     config = AutoConfig.from_pretrained(model, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     vocab_size = model_vocab_size(config, tokenizer)
@@ -142,30 +321,97 @@ def collect(model: Path, output: Path) -> None:
         max_num_seqs=1,
         max_logprobs=vocab_size,
         gpu_memory_utilization=0.90,
+        worker_extension_cls=(
+            "verl_mlite.rollout.vllm_worker.VllmCheckpointPathWorkerExtension"
+        ),
     )
-    params = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=-1)
-    rows = []
-    for prompt in prompts:
-        token_ids = tokenizer.encode(prompt, add_special_tokens=True)
-        result = llm.generate(
-            [{"prompt_token_ids": token_ids}], params, use_tqdm=False
-        )[0]
-        entries = result.prompt_logprobs
-        if entries is None or len(entries) != len(token_ids):
-            raise ValueError("vLLM prompt logprobs are not token-aligned")
-        rows.append(
-            {
-                "token_ids": torch.tensor(token_ids[1:], dtype=torch.int32),
-                "logprobs": _dense_logprobs(entries[1:], vocab_size).half(),
-            }
-        )
+    rows = _collect_vllm_rows(llm, tokenizer, vocab_size)
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(rows, output)
-    print(f"DS4_TP4_COLLECT_COMPLETE={output}", flush=True)
+    print(f"DS4_TP4_DIRECT_COLLECT_COMPLETE={output}", flush=True)
+    if resync_model is not None and resync_output is not None:
+        reload_resync_checkpoint(llm, resync_model)
+        resync_rows = _collect_vllm_rows(llm, tokenizer, vocab_size)
+        torch.save(resync_rows, resync_output)
+        print(f"DS4_TP4_ONLINE_RESYNC_COMPLETE={resync_output}", flush=True)
+
+
+def collect_mlite(model: Path, output: Path) -> None:
+    """Run official full-model MLite BF16 forward on four EP ranks."""
+    from transformers import AutoConfig, AutoTokenizer
+
+    from megatron.lite.runtime import RuntimeConfig, create_runtime
+    from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
+    from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
+
+    require_pure_block_fp8_checkpoint(model)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl")
+    world_size = dist.get_world_size()
+    if world_size != 4:
+        raise ValueError(
+            f"formal MLite parity requires EP4, got world_size={world_size}"
+        )
+
+    config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    vocab_size = model_vocab_size(config, tokenizer)
+    backend_config = MegatronLiteConfig(
+        model_name="deepseek_v4",
+        impl="lite",
+        hf_path=str(model),
+        parallel=ParallelConfig(tp=1, etp=1, ep=4, pp=1, vpp=1, cp=1),
+        attention_backend_override="fused",
+        load_hf_weights=True,
+        impl_cfg={
+            "optimizer": None,
+            "mtp_enable": False,
+            "mtp_enable_train": False,
+            "use_deepep": False,
+        },
+    )
+    runtime = create_runtime(
+        RuntimeConfig(backend="mlite", hf_path=str(model), backend_cfg=backend_config)
+    )
+    handle = runtime.build_model()
+    rows = []
+    with torch.inference_mode(), runtime.eval_mode(handle):
+        for prompt in math_prompts():
+            token_ids = tokenizer.encode(prompt, add_special_tokens=True)
+            tokens = torch.tensor(token_ids, dtype=torch.long, device="cuda")
+            batch = PackedBatch(
+                input_ids=tokens,
+                labels=None,
+                seq_lens=torch.tensor(
+                    [len(token_ids)], dtype=torch.int32, device="cuda"
+                ),
+            )
+            result = runtime.forward_backward(
+                handle,
+                iter([batch]),
+                loss_fn=None,
+                num_microbatches=1,
+                forward_only=True,
+            )
+            logits = result.model_output.vocab_parallel_logits
+            if logits is None or logits.shape[-1] != vocab_size:
+                raise ValueError(
+                    "MLite full-model forward did not return full-vocabulary logits"
+                )
+            if dist.get_rank() == 0:
+                rows.append(mlite_payload_row(token_ids, logits))
+
+    if dist.get_rank() == 0:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(rows, output)
+        print(f"DS4_MLITE_BF16_FORWARD_COMPLETE={output}", flush=True)
+    dist.barrier()
 
 
 def convert(source: Path, output: Path, device: str) -> None:
-    """Materialize the MLite BF16 -> checkpoint-format arm one shard at a time."""
+    """Materialize the MLite BF16 -> pure block-FP8 arm one shard at a time."""
     from safetensors import safe_open
     from safetensors.torch import save_file
 
@@ -177,15 +423,19 @@ def convert(source: Path, output: Path, device: str) -> None:
     from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
     from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 
-    config_dict = json.loads((source / "config.json").read_text())
-    config = SimpleNamespace(**config_dict)
-    quantization = config_dict["quantization_config"]
+    source_config = json.loads((source / "config.json").read_text())
+    target_config = pure_block_fp8_config(source_config)
+    config = SimpleNamespace(**target_config)
+    quantization = source_config["quantization_config"]
     block_shape = tuple(quantization.get("weight_block_size", (128, 128)))
-    expert_dtype = config_dict.get("expert_dtype", "fp4")
+    source_expert_dtype = source_config.get("expert_dtype", "fp4")
     weight_map, shards = _checkpoint_index(source)
     names = set(weight_map)
     output.mkdir(parents=True, exist_ok=True)
     copy_checkpoint_metadata(source, output)
+    (output / "config.json").write_text(
+        json.dumps(target_config, indent=2, sort_keys=True) + "\n"
+    )
     target_device = torch.device(device)
     for shard_index, shard in enumerate(shards, 1):
         converted: dict[str, torch.Tensor] = {}
@@ -200,7 +450,7 @@ def convert(source: Path, output: Path, device: str) -> None:
                     converted[name] = tensor
                     continue
                 scale = handle.get_tensor(scale_name)
-                if expert_dtype == "fp4" and is_routed_expert(name):
+                if source_expert_dtype == "fp4" and is_routed_expert(name):
                     bf16 = dequantize_mxfp4(
                         tensor.to(target_device), scale.to(target_device)
                     ).to(torch.bfloat16)
@@ -218,10 +468,11 @@ def convert(source: Path, output: Path, device: str) -> None:
     print("DS4_RESYNC_CHECKPOINT_COMPLETE", flush=True)
 
 
-def compare(reference: Path, candidate: Path, output: Path) -> None:
-    report = compare_distributions(
+def compare(reference: Path, candidate: Path, mlite: Path, output: Path) -> None:
+    report = compare_three_arms(
         torch.load(reference, weights_only=True),
         torch.load(candidate, weights_only=True),
+        torch.load(mlite, weights_only=True),
     )
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report, sort_keys=True), flush=True)
@@ -231,9 +482,16 @@ def compare(reference: Path, candidate: Path, output: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    verify_parser = subparsers.add_parser("verify")
+    verify_parser.add_argument("--model", type=Path, required=True)
     collect_parser = subparsers.add_parser("collect")
     collect_parser.add_argument("--model", type=Path, required=True)
     collect_parser.add_argument("--output", type=Path, required=True)
+    collect_parser.add_argument("--resync-model", type=Path)
+    collect_parser.add_argument("--resync-output", type=Path)
+    mlite_parser = subparsers.add_parser("collect-mlite")
+    mlite_parser.add_argument("--model", type=Path, required=True)
+    mlite_parser.add_argument("--output", type=Path, required=True)
     convert_parser = subparsers.add_parser("convert")
     convert_parser.add_argument("--source", type=Path, required=True)
     convert_parser.add_argument("--output", type=Path, required=True)
@@ -241,14 +499,25 @@ def main() -> None:
     compare_parser = subparsers.add_parser("compare")
     compare_parser.add_argument("--reference", type=Path, required=True)
     compare_parser.add_argument("--candidate", type=Path, required=True)
+    compare_parser.add_argument("--mlite", type=Path, required=True)
     compare_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.command == "collect":
-        collect(args.model, args.output)
+    if args.command == "verify":
+        require_pure_block_fp8_checkpoint(args.model)
+        print(f"DS4_PURE_BLOCK_FP8_CHECKPOINT={args.model}", flush=True)
+    elif args.command == "collect":
+        collect(
+            args.model,
+            args.output,
+            resync_model=args.resync_model,
+            resync_output=args.resync_output,
+        )
+    elif args.command == "collect-mlite":
+        collect_mlite(args.model, args.output)
     elif args.command == "convert":
         convert(args.source, args.output, args.device)
     else:
-        compare(args.reference, args.candidate, args.output)
+        compare(args.reference, args.candidate, args.mlite, args.output)
 
 
 if __name__ == "__main__":
