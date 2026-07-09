@@ -362,6 +362,9 @@ class DeepseekV4Model(nn.Module):
                     for idx in range(config.num_nextn_predict_layers)
                 ]
             )
+        # DS4 does not support TP/SP, but optimizer primitives require the
+        # same explicit model contract as the other native families.
+        self.sp_params: list[nn.Parameter] = []
 
     def set_input_tensor(self, input_tensor):
         if isinstance(input_tensor, list):

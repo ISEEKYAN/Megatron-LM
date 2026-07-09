@@ -88,8 +88,9 @@ def build_model_config(source: str | Path | dict, **overrides) -> DeepseekV4Conf
     else:
         cfg = DeepseekV4Config.from_hf(str(source))
     for key, value in overrides.items():
-        if hasattr(cfg, key):
-            setattr(cfg, key, value)
+        if key not in cfg.__dataclass_fields__:
+            raise ValueError(f"Unknown DeepseekV4Config override: {key}")
+        setattr(cfg, key, value)
     return cfg
 
 
@@ -178,7 +179,7 @@ def _base_model_forward_kwargs(batch: PackedBatch):
     if batch.loss_mask is not None:
         kwargs["loss_mask"] = _as_batch_row(batch.loss_mask)
     add_loss_context_kwargs(kwargs)
-    position_ids = _normalize_ds4_position_ids(getattr(batch, "position_ids", None))
+    position_ids = _normalize_ds4_position_ids(batch.position_ids)
     if position_ids is not None:
         kwargs["position_ids"] = position_ids
     return kwargs
@@ -319,12 +320,7 @@ def _configure_attention_backend(chunks: list[nn.Module], *, backend: str | None
 
 
 def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
-    model = getattr(chunk, "model", None)
-    if model is None:
-        return []
-    layers = list(getattr(model, "layers", {}).values())
-    mtp_layers = list(getattr(model, "mtp", []))
-    return [*layers, *mtp_layers]
+    return [*chunk.layers.values(), *chunk.mtp]
 
 
 def _validate_parallel_scope(p: ParallelConfig) -> None:

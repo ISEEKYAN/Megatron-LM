@@ -54,16 +54,15 @@ def is_expert_param(name: str) -> bool:
 
 def _maybe(module_name: str):
     def getter(layer):
-        module = getattr(layer, module_name, None)
-        return module
+        return getattr(layer, module_name)
 
     return getter
 
 
 def _moe_module(name: str):
     def getter(layer):
-        moe = getattr(layer, "moe", None)
-        return getattr(moe, name, None) if moe is not None else None
+        moe = layer.moe
+        return getattr(moe, name) if moe is not None else None
 
     return getter
 
@@ -111,8 +110,9 @@ def build_model_config(source: str | Path | dict, **overrides) -> Glm5Config:
     else:
         cfg = Glm5Config.from_hf(str(source))
     for key, value in overrides.items():
-        if hasattr(cfg, key):
-            setattr(cfg, key, value)
+        if key not in cfg.__dataclass_fields__:
+            raise ValueError(f"Unknown Glm5Config override: {key}")
+        setattr(cfg, key, value)
     return cfg
 
 
@@ -192,7 +192,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
         if impl_cfg.mtp_use_repeated_layer is not None:
             model_cfg.mtp_use_repeated_layer = impl_cfg.mtp_use_repeated_layer
-    elif hasattr(model_cfg, "num_nextn_predict_layers"):
+    else:
         model_cfg.num_nextn_predict_layers = 0
 
     from megatron.lite.model.glm5.lite.model import Glm5Model
@@ -325,8 +325,7 @@ def save_hf_weights(chunks, path: str, model_cfg: Glm5Config, ps: ParallelState,
 
 
 def vocab_size(model_cfg) -> int | None:
-    cfg = getattr(model_cfg, "text_config", model_cfg)
-    return getattr(cfg, "vocab_size", None)
+    return model_cfg.vocab_size
 
 
 __all__ = [

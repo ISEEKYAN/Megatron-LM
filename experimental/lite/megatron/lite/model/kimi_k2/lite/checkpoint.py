@@ -492,20 +492,20 @@ def load_hf_weights(model: nn.Module, path: str, config: KimiK2Config, ps: Paral
 
     prefix = _text_prefix(reader)
 
-    if getattr(base_model, "embed", None) is not None:
+    if base_model.embed is not None:
         out["embed.embedding.weight"] = _load_vocab(
             reader, f"{prefix}.embed_tokens.weight", config, ps
         )
-    if getattr(base_model, "mtp_embed", None) is not None:
+    if base_model.mtp_embed is not None:
         out["mtp_embed.embedding.weight"] = _load_vocab(
             reader,
             f"{prefix}.embed_tokens.weight",
             config,
             ps,
         )
-    if getattr(base_model, "norm", None) is not None:
+    if base_model.norm is not None:
         out["norm.weight"] = _get(reader, f"{prefix}.norm.weight")
-    if getattr(base_model, "head", None) is not None:
+    if base_model.head is not None:
         out["head.col.linear.weight"] = _load_vocab(
             reader, _lm_head_name(reader, prefix), config, ps
         )
@@ -548,7 +548,7 @@ def load_hf_weights(model: nn.Module, path: str, config: KimiK2Config, ps: Paral
                 ps=ps,
             )
 
-    mtp = getattr(base_model, "mtp", None)
+    mtp = base_model.mtp
     if mtp is not None:
         for local_idx, _mtp_layer in enumerate(mtp.layers):
             global_idx = config.num_hidden_layers + local_idx
@@ -626,11 +626,9 @@ def export_hf_weights(model, config: KimiK2Config, ps: ParallelState, **kwargs):
     chunks = list(model) if isinstance(model, list | nn.ModuleList) else [model]
     for chunk in chunks:
         base_chunk = unwrap_model(chunk)
-        layer_map = (
-            {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
-            if hasattr(base_chunk, "layer_indices")
-            else {}
-        )
+        layer_map = {
+            i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))
+        }
         for name, buffer in base_chunk.named_buffers():
             if not name.endswith(".moe.router.expert_bias"):
                 continue

@@ -320,11 +320,7 @@ def load_hf_weights(
     base_model = unwrap_model(model)
     state = base_model.state_dict()
     # local pipeline position -> global layer index (identity at PP=1)
-    layer_map = (
-        {i: base_model.layer_indices[i] for i in range(len(base_model.layer_indices))}
-        if hasattr(base_model, "layer_indices")
-        else {}
-    )
+    layer_map = {i: base_model.layer_indices[i] for i in range(len(base_model.layer_indices))}
     loaded = 0
     missing: list[str] = []
     for name, target in state.items():
@@ -482,11 +478,7 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
     chunks = list(model) if isinstance(model, list | nn.ModuleList) else [model]
     for chunk in chunks:
         base_chunk = unwrap_model(chunk)
-        layer_map = (
-            {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
-            if hasattr(base_chunk, "layer_indices")
-            else {}
-        )
+        layer_map = {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
         for name, buffer in base_chunk.named_buffers():
             # Persistent router buffers carried into HF: hash-layer ``tid2eid``
             # and the (made-persistent for non-hash layers) ``expert_bias``.

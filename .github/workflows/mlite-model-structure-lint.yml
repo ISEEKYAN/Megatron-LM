@@ -1,0 +1,22 @@
+name: MLite model structure lint
+
+on:
+  pull_request:
+    paths:
+      - "experimental/lite/**"
+      - ".github/workflows/mlite-model-structure-lint.yml"
+  push:
+    paths:
+      - "experimental/lite/**"
+      - ".github/workflows/mlite-model-structure-lint.yml"
+
+jobs:
+  model-structure-fallbacks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Reject defensive fallbacks on MLite-owned model structure
+        run: python experimental/lite/tools/check_model_structure_fallbacks.py

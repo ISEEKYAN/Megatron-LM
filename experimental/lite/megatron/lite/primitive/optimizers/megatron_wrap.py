@@ -56,7 +56,7 @@ def _ensure_dist_opt_mpu_parallel_state(engine_cfg) -> None:
         context_parallel_size=p.cp,
         expert_model_parallel_size=p.ep,
         expert_tensor_parallel_size=_effective_etp(p),
-        create_gloo_process_groups=bool(getattr(engine_cfg, "deterministic", False)),
+        create_gloo_process_groups=bool(engine_cfg.deterministic),
     )
 
 
@@ -141,7 +141,7 @@ def build_dist_opt_stack(
         is_expert_param = proto.EXPERT_CLASSIFIER
     else:
         is_expert_param = default_expert_classifier
-    use_mpu_groups = bool(getattr(engine_cfg, "deterministic", False))
+    use_mpu_groups = bool(engine_cfg.deterministic)
     if use_mpu_groups:
         _ensure_dist_opt_mpu_parallel_state(engine_cfg)
     pg_collection = None if use_mpu_groups else _build_pg_collection(ps, engine_cfg)
@@ -292,7 +292,7 @@ def _mark_dist_opt_parallel_attrs(
     TP-replicated, and must NOT have `tensor_model_parallel=True`). Blind
     override would cause dist_opt grad-norm to over-count replicated params.
     """
-    sp_param_ids = {id(param) for param in getattr(model, "sp_params", [])}
+    sp_param_ids = {id(param) for param in model.sp_params}
     for name, param in model.named_parameters():
         # Megatron-Core uses `allreduce=False` to route expert params into expert-DP buffers.
         if not hasattr(param, "allreduce"):
@@ -311,7 +311,7 @@ def _mark_dist_opt_parallel_attrs(
             if not hasattr(param, "tensor_model_parallel"):
                 param.tensor_model_parallel = True
 
-    for param in getattr(model, "sp_params", []):
+    for param in model.sp_params:
         if not hasattr(param, "sequence_parallel"):
             param.sequence_parallel = True
         param.allreduce = True

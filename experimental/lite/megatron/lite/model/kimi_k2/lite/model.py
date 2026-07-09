@@ -310,7 +310,7 @@ class MoELayer(nn.Module):
             dispatched,
             tpe,
             permuted_probs,
-            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
+            tokens_per_expert_list=self.dispatcher._local_tpe_list,
         )
         routed_out = self.dispatcher.combine(expert_out)
         shared_out = self.shared_expert(x)
@@ -596,7 +596,7 @@ class KimiK2Model(nn.Module):
         if layout.has_embed:
             self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
 
-        recompute_modules = getattr(train_config, "recompute_modules", [])
+        recompute_modules = train_config.recompute_modules
         moe_act_recompute = "moe_act" in recompute_modules and "moe" not in recompute_modules
         self.layers = nn.ModuleList(
             [

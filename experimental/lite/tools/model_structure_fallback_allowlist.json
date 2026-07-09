@@ -1,0 +1,117 @@
+{
+  "entries": [
+    {
+      "signature": "experimental/lite/examples/verl/verl_mlite/engine/mlite_engine.py:MegatronLiteEngine._build_impl_cfg:getattr-default:self.engine_config:cross_entropy_fusion",
+      "reason": "veRL configuration boundary supports schema versions that predate the optional cross-entropy fusion setting."
+    },
+    {
+      "signature": "experimental/lite/examples/verl/verl_mlite/engine/mlite_engine.py:MegatronLiteEngine._build_impl_cfg:getattr-default:self.model_config:mtp",
+      "reason": "veRL configuration boundary supports model schemas with and without the optional MTP section."
+    },
+    {
+      "signature": "experimental/lite/examples/verl/verl_mlite/engine/mlite_engine.py:MegatronLiteEngine._mtp_enable_train:getattr-default:self.model_config:mtp",
+      "reason": "veRL configuration boundary supports model schemas with and without the optional MTP section."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/primitive/ckpt/hf_weights.py:load_hf_weights:hasattr:base_model:layer_indices",
+      "reason": "Generic checkpoint boundary accepts pipeline-aware native models and plain external torch modules."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/primitive/ckpt/hf_weights.py:export_hf_weights:hasattr:base_chunk:layer_indices",
+      "reason": "Generic checkpoint boundary accepts pipeline-aware native models and plain external torch modules.",
+      "count": 2
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/deepseek_v4/lite/protocol.py:_configure_attention_backend:hasattr:module:attention_backend",
+      "reason": "Capability boundary while traversing heterogeneous torch modules; only attention implementations expose this knob."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/glm5/config.py:Glm5Config.from_hf_config:hasattr:hf_config:to_dict",
+      "reason": "Hugging Face configuration boundary accepts both PretrainedConfig objects and mapping-like test doubles."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/lite/model.py:SharedExpert._set_grad_fn_sequence_sr:getattr-default:tensor:grad_fn",
+      "reason": "PyTorch autograd boundary where leaf tensors intentionally have no grad_fn object."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/lite/model.py:SharedExpert._set_grad_fn_sequence_sr:hasattr:grad_fn:_set_sequence_nr",
+      "reason": "Private PyTorch autograd capability differs across supported torch versions."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/lite/model.py:_iter_auto_model_class_refs:getattr-default:hf_config:auto_map",
+      "reason": "Hugging Face config boundary; native checkpoints legitimately omit the remote-code auto_map field."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/lite/model.py:_resolve_hf_vision_cls:getattr-default:model_cls:HfVisionClass",
+      "reason": "Remote Hugging Face model-class boundary validates an optional vendor-provided vision class."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/lite/model.py:_hook_fp32_rotary_emb:hasattr:submodule:inv_freq",
+      "reason": "Transformers module capability boundary while visiting a heterogeneous external vision tower."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/lite/model.py:_hook_fp32_rotary_emb._hook:hasattr:mod:_inv_freq_fp32_original",
+      "reason": "Transformers forward-hook boundary guards state installed only on rotary embedding submodules."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/lite/model.py:_build_native_vision_model:getattr-default:hf_config:vision_config",
+      "reason": "Hugging Face config boundary distinguishes text-only checkpoints from multimodal checkpoints."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/lite/model.py:_build_native_vision_model:getattr-default:hf_config:auto_map",
+      "reason": "Hugging Face config boundary selects native registry versus remote-code model construction."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/lite/model.py:_build_native_vision_model:hasattr:hf_vision_cls:_from_config",
+      "reason": "External Transformers class-construction API differs between remote-code model implementations."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/stats.py:num_floating_point_operations:getattr-default:model_cfg:text_config",
+      "reason": "Benchmark adapter boundary accepts native config, nested Hugging Face config, and dictionaries."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/stats.py:num_floating_point_operations._get:getattr-default:cfg:<dynamic:name>",
+      "reason": "Benchmark adapter reads optional fields from multiple external and native configuration representations."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/stats.py:activated_params:getattr-default:model_cfg:text_config",
+      "reason": "Benchmark adapter boundary accepts native config, nested Hugging Face config, and dictionaries."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_5/stats.py:activated_params._get:getattr-default:cfg:<dynamic:name>",
+      "reason": "Benchmark adapter reads optional fields from multiple external and native configuration representations."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_moe/config.py:Qwen3MoEConfig.from_hf_config:hasattr:hf_config:to_dict",
+      "reason": "Hugging Face configuration boundary accepts both PretrainedConfig objects and mapping-like test doubles."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_moe/lite/lora_adapter.py:_unwrap_model:hasattr:current:module",
+      "reason": "Distributed-wrapper boundary supports bare modules plus FSDP/DDP-style module wrappers."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_moe/lite/lora_adapter.py:_is_rank_partitioned_lora_a:getattr-default:lora:rank_partitioned_a",
+      "reason": "LoRA adapter boundary supports dense, expert, shared-expert, and rank-partitioned module variants."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_moe/lite/lora_adapter.py:_is_rank_partitioned_lora_a:getattr-default:lora:rank",
+      "reason": "LoRA adapter boundary infers rank for legacy modules that expose tensors but no rank metadata."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_moe/lite/lora_adapter.py:_is_output_partitioned_lora_b:getattr-default:lora:output_partitioned_b",
+      "reason": "LoRA adapter boundary supports module variants with explicit flags and legacy shape-only metadata."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_moe/lite/lora_adapter.py:_is_output_partitioned_lora_b:getattr-default:lora:out_features",
+      "reason": "LoRA adapter boundary falls back to shape inference for legacy modules without output metadata."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/qwen3_moe/lite/lora_adapter.py:_expert_lora_is_shared:getattr-default:lora:shared_across_experts",
+      "reason": "LoRA adapter boundary supports both explicit shared-expert metadata and legacy tensor layouts."
+    },
+    {
+      "signature": "experimental/lite/megatron/lite/model/registry.py:resolve_model_type_from_hf:hasattr:source:model_type",
+      "reason": "Public registry boundary accepts paths, dictionaries, and external Hugging Face config objects."
+    }
+  ]
+}

@@ -111,7 +111,7 @@ def add_loss_context_kwargs(kwargs: dict[str, Any], *, include_return_log_probs:
 
 
 def add_cross_entropy_fusion(kwargs: dict[str, Any], model) -> None:
-    kwargs["use_fused_kernels"] = bool(getattr(model, "cross_entropy_fusion", False))
+    kwargs["use_fused_kernels"] = bool(model.cross_entropy_fusion)
 
 
 def set_cross_entropy_fusion(chunks: list, enabled: bool) -> None:

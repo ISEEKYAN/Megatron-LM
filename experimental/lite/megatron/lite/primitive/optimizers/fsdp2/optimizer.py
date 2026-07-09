@@ -541,7 +541,7 @@ def _restore_model_param_dtypes(
 def _collect_tp_replicated_grad_param_names(chunks: Iterable[nn.Module]) -> list[tuple[int, str]]:
     names: list[tuple[int, str]] = []
     for chunk_idx, chunk in enumerate(chunks):
-        sp_param_ids = {id(param) for param in getattr(chunk, "sp_params", ())}
+        sp_param_ids = {id(param) for param in chunk.sp_params}
         if not sp_param_ids:
             continue
         for name, param in chunk.named_parameters():
@@ -568,7 +568,7 @@ def _collect_tp_replicated_grad_params(
             seen.add(id(param))
         return params
     for chunk in chunk_list:
-        for param in getattr(chunk, "sp_params", ()):
+        for param in chunk.sp_params:
             if not param.requires_grad or id(param) in seen:
                 continue
             params.append(param)

@@ -225,11 +225,7 @@ def _iter_native_lora_modules(chunks: list[nn.Module] | tuple[nn.Module, ...]):
 def _infer_native_alpha(chunks: list[nn.Module] | tuple[nn.Module, ...]) -> int | None:
     alphas: set[int] = set()
     for module in _iter_native_lora_modules(chunks):
-        rank = getattr(module, "rank", None)
-        scale = getattr(module, "scale", None)
-        if rank is None or scale is None:
-            continue
-        alphas.add(int(round(float(scale) * int(rank))))
+        alphas.add(int(round(float(module.scale) * int(module.rank))))
     if not alphas:
         return None
     if len(alphas) != 1:

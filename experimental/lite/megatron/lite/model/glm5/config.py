@@ -103,6 +103,8 @@ class Glm5Config:
     topk_group: int = 1
     routed_scaling_factor: float = 2.5
     norm_topk_prob: bool = True
+    aux_loss_alpha: float = 0.0
+    tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 1
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool = False

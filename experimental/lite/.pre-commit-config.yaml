@@ -14,3 +14,9 @@ repos:
     additional_dependencies: ["black==24.4.2"]
     files: ^experimental/lite/.*\.py$
     args: ["--skip-magic-trailing-comma", "--skip-string-normalization"]
+  - id: mlite-model-structure-fallbacks
+    name: MLite model structure fallback guard
+    entry: python experimental/lite/tools/check_model_structure_fallbacks.py
+    language: system
+    pass_filenames: false
+    files: ^experimental/lite/(.*\.py|tools/model_structure_fallback_allowlist\.json)$

@@ -704,13 +704,13 @@ def load_hf_weights(model: nn.Module, path: str, config: Qwen35Config, ps: Paral
     out: dict[str, torch.Tensor] = {}
 
     prefix = "model.language_model"
-    if getattr(base_model, "embed", None) is not None:
+    if base_model.embed is not None:
         out["embed.embedding.weight"] = _load_vocab(
             reader, f"{prefix}.embed_tokens.weight", config, ps
         )
-    if getattr(base_model, "norm", None) is not None:
+    if base_model.norm is not None:
         out["norm.weight"] = _get(reader, f"{prefix}.norm.weight")
-    if getattr(base_model, "head", None) is not None:
+    if base_model.head is not None:
         out["head.col.linear.weight"] = _load_vocab(reader, "lm_head.weight", config, ps)
 
     for local_idx, global_idx in enumerate(base_model.layer_indices):

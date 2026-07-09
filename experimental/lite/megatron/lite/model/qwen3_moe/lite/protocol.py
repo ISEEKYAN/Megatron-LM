@@ -115,8 +115,9 @@ def build_model_config(source: str | Path | dict, **overrides) -> Qwen3MoEConfig
     else:
         cfg = Qwen3MoEConfig.from_hf(str(source))
     for k, v in overrides.items():
-        if hasattr(cfg, k):
-            setattr(cfg, k, v)
+        if k not in cfg.__dataclass_fields__:
+            raise ValueError(f"Unknown Qwen3MoEConfig override: {k}")
+        setattr(cfg, k, v)
     return cfg
 
 
@@ -327,4 +328,4 @@ def export_hf_weights(
 
 
 def vocab_size(model_cfg: Qwen3MoEConfig) -> int | None:
-    return getattr(model_cfg, "vocab_size", None)
+    return model_cfg.vocab_size

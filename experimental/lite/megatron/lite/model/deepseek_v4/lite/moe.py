@@ -87,7 +87,7 @@ class DeepseekV4MoE(nn.Module):
             dispatched,
             tpe,
             permuted_probs,
-            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
+            tokens_per_expert_list=self.dispatcher._local_tpe_list,
         )
         out = self.dispatcher.combine(out)
         if self.shared_experts is not None:

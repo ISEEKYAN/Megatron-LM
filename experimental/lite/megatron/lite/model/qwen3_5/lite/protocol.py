@@ -70,8 +70,8 @@ class ImplConfig:
 
 
 def _full_attn_module(layer, name: str):
-    full_attn = getattr(layer, "full_attn", None)
-    return getattr(full_attn, name, None) if full_attn is not None else None
+    full_attn = layer.full_attn
+    return getattr(full_attn, name) if full_attn is not None else None
 
 
 MODULE_MAP = {
@@ -92,8 +92,9 @@ def build_model_config(source: str | Path | dict, **overrides) -> Qwen35Config:
     else:
         cfg = Qwen35Config.from_hf(str(source))
     for k, v in overrides.items():
-        if hasattr(cfg, k):
-            setattr(cfg, k, v)
+        if k not in cfg.__dataclass_fields__:
+            raise ValueError(f"Unknown Qwen35Config override: {k}")
+        setattr(cfg, k, v)
     return cfg
 
 
@@ -297,5 +298,4 @@ def save_hf_weights(
 
 
 def vocab_size(model_cfg) -> int | None:
-    cfg = getattr(model_cfg, "text_config", model_cfg)
-    return getattr(cfg, "vocab_size", None)
+    return model_cfg.vocab_size

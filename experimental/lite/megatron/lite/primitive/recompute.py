@@ -198,6 +198,11 @@ def apply_recompute(
     """Wrap specified sub-modules with activation checkpointing for recomputation."""
     if not module_names:
         return
+    if not layers:
+        raise ValueError(
+            "non-empty activation policy was configured, but the model exposes "
+            "no transformer layers"
+        )
     no_rng = no_rng_modules or set()
     for layer in layers:
         if "full" in module_names:
@@ -214,6 +219,11 @@ def apply_offload(layers: nn.ModuleList, module_names: list[str], module_map: Mo
     """Wrap specified sub-modules with activation offloading to CPU."""
     if not module_names:
         return
+    if not layers:
+        raise ValueError(
+            "non-empty activation policy was configured, but the model exposes "
+            "no transformer layers"
+        )
     try:
         from torch.utils.checkpoint import CheckpointPolicy  # noqa: F401
     except ImportError:

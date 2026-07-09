@@ -245,7 +245,7 @@ class Glm5SigmoidTopKRouter(nn.Module):
         self.topk = config.num_experts_per_tok
         self.num_experts = config.n_routed_experts
         # GLM-5 has no aux_loss_alpha HF field; default the coefficient to 0.
-        self.aux_loss_coeff = getattr(config, "aux_loss_alpha", 0.0)
+        self.aux_loss_coeff = config.aux_loss_alpha
         self.scaling_factor = config.routed_scaling_factor
         self.num_groups = config.n_group if (config.n_group and config.n_group > 1) else None
         self.group_topk = config.topk_group if self.num_groups is not None else None
@@ -425,7 +425,7 @@ class MoELayer(nn.Module):
             dispatched,
             tpe,
             permuted_probs,
-            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
+            tokens_per_expert_list=self.dispatcher._local_tpe_list,
         )
         routed_out = self.dispatcher.combine(expert_out)
         shared_out = self.shared_expert(x)
@@ -697,16 +697,14 @@ class Glm5Model(nn.Module):
         self.post_process = layout.has_head
         # GLM-5 does not tie embeddings (no tie_word_embeddings HF field); the
         # attribute is preserved for the dist-opt / distckpt interface.
-        self.share_embeddings_and_output_weights = bool(
-            getattr(config, "tie_word_embeddings", False)
-        )
+        self.share_embeddings_and_output_weights = bool(config.tie_word_embeddings)
         self.vision_model: nn.Module | None = None
 
         self.embed: VocabParallelEmbedding | None = None
         if layout.has_embed:
             self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
 
-        recompute_modules = getattr(train_config, "recompute_modules", [])
+        recompute_modules = train_config.recompute_modules
         moe_act_recompute = "moe_act" in recompute_modules and "moe" not in recompute_modules
         self.layers = nn.ModuleList(
             [
