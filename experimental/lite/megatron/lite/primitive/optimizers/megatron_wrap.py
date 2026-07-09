@@ -121,7 +121,9 @@ def build_dist_opt_optimizer_config(
     for name in native_fields:
         if name in core_fields and hasattr(opt, name):
             args[name] = getattr(opt, name)
-    if offload > 0:
+    if legacy_offload is not None and offload > 0:
+        # Preserve the legacy alias semantics. Canonical Megatron fields above are
+        # otherwise forwarded verbatim, including an explicitly disabled overlap.
         args["optimizer_offload_fraction"] = offload
         args["overlap_cpu_optimizer_d2h_h2d"] = True
         args["optimizer_cpu_offload"] = True
