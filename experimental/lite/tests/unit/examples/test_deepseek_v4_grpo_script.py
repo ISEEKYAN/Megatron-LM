@@ -102,7 +102,9 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "export CC=/usr/bin/gcc" in script
     assert "export CXX=/usr/bin/g++" in script
     assert "Error in sitecustomize" in script
+    assert "Failed to import Triton kernels" in script
     assert "Traceback" in script
+    assert '> "${RUN_ROOT}/resolved-config.yaml" 2>&1' in script
     assert 'RESUME_MODE="${resume_mode}"' in script
     assert 'run_phase phase1 "${PHASE1_STEPS}" disable' in script
     assert 'run_phase resume "${TOTAL_STEPS}" auto' in script

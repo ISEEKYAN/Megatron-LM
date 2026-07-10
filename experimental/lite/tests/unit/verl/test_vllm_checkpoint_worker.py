@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import torch
@@ -61,6 +62,28 @@ def test_vllm_thin_finder_routes_only_the_vllm_top_level(tmp_path) -> None:
     spec = finder.find_spec("vllm", None, None)
     assert spec is not None
     assert spec.origin == str(package / "__init__.py")
+
+
+def test_vllm_triton_kernels_alias_prefers_vendored_package(monkeypatch) -> None:
+    from verl_mlite import compat
+
+    external = SimpleNamespace(__file__="/base/triton_kernels/__init__.py")
+    vendored = SimpleNamespace(__file__="/rollout/vllm/third_party/triton_kernels/__init__.py")
+    monkeypatch.setenv("VERL_MLITE_VLLM_SITE", "/rollout")
+    monkeypatch.setitem(sys.modules, "triton_kernels", external)
+    monkeypatch.setattr(
+        compat.importlib,
+        "import_module",
+        lambda name: (
+            vendored
+            if name == "vllm.third_party.triton_kernels"
+            else (_ for _ in ()).throw(AssertionError(name))
+        ),
+    )
+
+    assert compat._install_vllm_triton_kernels_alias()
+    assert sys.modules["triton_kernels"] is vendored
+    assert not compat._install_vllm_triton_kernels_alias()
 
 
 def test_checkpoint_bucket_reload_has_one_lifecycle_for_all_buckets() -> None:

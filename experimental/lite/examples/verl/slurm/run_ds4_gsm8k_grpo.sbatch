@@ -136,7 +136,7 @@ if [[ "${CONFIG_ONLY}" == "1" ]]; then
       ROLLOUT_TP="${ROLLOUT_TP}" \
       TOTAL_TRAINING_STEPS="${PHASE1_STEPS}" \
       bash "${MLITE_SRC}/experimental/lite/examples/verl/scripts/run_deepseek_v4_gsm8k_grpo.sh" \
-      > "${RUN_ROOT}/resolved-config.yaml"
+      > "${RUN_ROOT}/resolved-config.yaml" 2>&1
     python - "${RUN_ROOT}/resolved-config.yaml" <<'PY'
 import sys
 
@@ -151,7 +151,11 @@ required = [
 missing = [marker for marker in required if marker not in config]
 if missing:
     raise SystemExit(f"resolved DS4 GRPO config is missing markers: {missing}")
-for forbidden in ("Error in sitecustomize", "Traceback"):
+for forbidden in (
+    "Error in sitecustomize",
+    "Failed to import Triton kernels",
+    "Traceback",
+):
     if forbidden in config:
         raise SystemExit(f"resolved DS4 GRPO config contains initialization error: {forbidden}")
 PY

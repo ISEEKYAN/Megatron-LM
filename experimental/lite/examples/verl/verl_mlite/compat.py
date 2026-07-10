@@ -47,6 +47,17 @@ def _install_vllm_thin_finder() -> bool:
     return True
 
 
+def _install_vllm_triton_kernels_alias() -> bool:
+    """Prefer the rollout vLLM's complete vendored Triton kernel package."""
+    if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
+        return False
+    vendored = importlib.import_module("vllm.third_party.triton_kernels")
+    if sys.modules.get("triton_kernels") is vendored:
+        return False
+    sys.modules["triton_kernels"] = vendored
+    return True
+
+
 def _vllm_server_profile_env() -> dict[str, str]:
     """Build the dependency profile applied only to vLLM server Ray actors."""
     site = os.environ.get("VERL_MLITE_VLLM_SITE", "").strip()
@@ -474,6 +485,7 @@ def _patch_transformers_rope_ignore_keys() -> None:
 
 def apply_runtime_patches() -> None:
     _install_vllm_thin_finder()
+    _install_vllm_triton_kernels_alias()
     _patch_transformers_rope_ignore_keys()
     _patch_bucketed_weight_sender()
     _patch_vllm_server_profile()
