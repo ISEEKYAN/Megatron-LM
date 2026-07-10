@@ -20,6 +20,64 @@ from typing import Any
 _BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
 
 
+def _vllm_server_profile_env() -> dict[str, str]:
+    """Build the dependency profile applied only to vLLM server Ray actors."""
+    site = os.environ.get("VERL_MLITE_VLLM_SITE", "").strip()
+    if not site:
+        return {}
+    pythonpath = os.environ.get("PYTHONPATH", "").strip()
+    result = {
+        "PYTHONPATH": f"{site}:{pythonpath}" if pythonpath else site,
+        "PYTHONNOUSERSITE": "1",
+    }
+    shim = os.environ.get("VERL_MLITE_VLLM_LD_PRELOAD", "").strip()
+    existing_preload = os.environ.get("LD_PRELOAD", "").strip()
+    if shim:
+        result["LD_PRELOAD"] = f"{shim}:{existing_preload}" if existing_preload else shim
+    elif existing_preload:
+        result["LD_PRELOAD"] = existing_preload
+    return result
+
+
+class _RayActorClassProfile:
+    """Merge a process profile into one Ray actor class's ``runtime_env``."""
+
+    def __init__(self, actor_class: Any, env_vars: dict[str, str]):
+        self._actor_class = actor_class
+        self._env_vars = dict(env_vars)
+
+    def options(self, **kwargs: Any) -> Any:
+        runtime_env = dict(kwargs.get("runtime_env") or {})
+        env_vars = dict(runtime_env.get("env_vars") or {})
+        env_vars.update(self._env_vars)
+        runtime_env["env_vars"] = env_vars
+        kwargs["runtime_env"] = runtime_env
+        return self._actor_class.options(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._actor_class, name)
+
+
+def _patch_vllm_server_profile() -> bool:
+    profile = _vllm_server_profile_env()
+    if not profile:
+        return False
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
+
+    if getattr(vLLMReplica, "_verl_mlite_server_profile_patch", False):
+        return False
+    original_init = vLLMReplica.__init__
+
+    @wraps(original_init)
+    def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        self.server_class = _RayActorClassProfile(self.server_class, profile)
+
+    vLLMReplica.__init__ = patched_init
+    vLLMReplica._verl_mlite_server_profile_patch = True
+    return True
+
+
 class _SyncBucketProducer:
     """Pack one sender bucket at a time into a caller-owned staging slot."""
 
@@ -390,6 +448,7 @@ def _patch_transformers_rope_ignore_keys() -> None:
 def apply_runtime_patches() -> None:
     _patch_transformers_rope_ignore_keys()
     _patch_bucketed_weight_sender()
+    _patch_vllm_server_profile()
 
 
 def _load_verl_file(relative_path: str, module_name: str):

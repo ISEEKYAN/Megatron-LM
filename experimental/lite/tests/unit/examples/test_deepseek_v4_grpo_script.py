@@ -93,6 +93,10 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "TOTAL_STEPS" in script
     assert "CONFIG_ONLY" in script
     assert "DS4_GRPO_CONFIG_COMPOSE_PASSED" in script
+    assert 'VERL_MLITE_VLLM_SITE="${DS4_VLLM_SITE}"' in script
+    assert 'VERL_MLITE_VLLM_LD_PRELOAD="${DS4_VLLM_SHIM}"' in script
+    assert 'export PYTHONPATH="${MLITE_SM90_SITE}' in script
+    assert 'export LD_PRELOAD="${DS4_VLLM_SHIM}"' not in script
     assert 'RESUME_MODE="${resume_mode}"' in script
     assert 'run_phase phase1 "${PHASE1_STEPS}" disable' in script
     assert 'run_phase resume "${TOTAL_STEPS}" auto' in script

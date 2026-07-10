@@ -170,6 +170,9 @@ MTP training, full activation recomputation, and checkpoint-format block-FP8
 resync. The colocated vLLM workers use a dummy cold load with pure-FP8 Hugging
 Face overrides, then receive the actor's serialized block-FP8 stream through
 `VllmCheckpointWorkerExtension`; veRL's online FP8 quantizer remains disabled.
+The vLLM thin site and ABI shim are injected only into the vLLM server Ray
+actors. They must not be prepended to the trainer or MLite actor environment,
+which uses the pinned SM90 training profile and its Transformers version.
 
 `slurm/run_ds4_gsm8k_grpo.sbatch` builds a multi-node Ray cluster and runs two
 phases against one checkpoint directory. Phase one saves a bounded checkpoint;

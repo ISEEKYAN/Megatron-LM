@@ -3,6 +3,52 @@ from types import SimpleNamespace
 import torch
 
 
+def test_vllm_server_profile_isolated_to_ray_actor_options(monkeypatch) -> None:
+    from verl_mlite.compat import _RayActorClassProfile, _vllm_server_profile_env
+
+    monkeypatch.setenv("PYTHONPATH", "/training")
+    monkeypatch.setenv("LD_PRELOAD", "/training/base.so")
+    monkeypatch.setenv("VERL_MLITE_VLLM_SITE", "/rollout")
+    monkeypatch.setenv("VERL_MLITE_VLLM_LD_PRELOAD", "/rollout/shim.so")
+    profile = _vllm_server_profile_env()
+    calls = []
+
+    class ActorClass:
+        def options(self, **kwargs):
+            calls.append(kwargs)
+            return "configured-actor"
+
+    wrapped = _RayActorClassProfile(ActorClass(), profile)
+    result = wrapped.options(
+        name="server",
+        runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
+    )
+
+    assert result == "configured-actor"
+    assert calls == [
+        {
+            "name": "server",
+            "runtime_env": {
+                "env_vars": {
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                    "PYTHONPATH": "/rollout:/training",
+                    "LD_PRELOAD": "/rollout/shim.so:/training/base.so",
+                    "PYTHONNOUSERSITE": "1",
+                }
+            },
+        }
+    ]
+
+
+def test_vllm_server_profile_is_disabled_without_explicit_site(monkeypatch) -> None:
+    from verl_mlite.compat import _vllm_server_profile_env
+
+    monkeypatch.delenv("VERL_MLITE_VLLM_SITE", raising=False)
+    monkeypatch.delenv("VERL_MLITE_VLLM_LD_PRELOAD", raising=False)
+
+    assert _vllm_server_profile_env() == {}
+
+
 def test_checkpoint_bucket_reload_has_one_lifecycle_for_all_buckets() -> None:
     from verl_mlite.rollout.vllm_worker import reload_checkpoint_buckets
 
