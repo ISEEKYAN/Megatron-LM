@@ -153,8 +153,9 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
 
     assert "#SBATCH --nodes=16" in script
     assert "#SBATCH --gres=gpu:8" in script
-    assert "#SBATCH --partition=batch_large_long" in script
-    assert "#SBATCH --time=14-00:00:00" in script
+    directives = script.splitlines()
+    assert "#SBATCH --partition=batch" in directives
+    assert "#SBATCH --time=04:00:00" in directives
     assert 'git -C "${MLITE_SRC}" rev-parse HEAD' in script
     assert 'srun --nodes="${SLURM_NNODES}"' in script
     assert "MASTER_ADDR=$(hostname -i)" in script

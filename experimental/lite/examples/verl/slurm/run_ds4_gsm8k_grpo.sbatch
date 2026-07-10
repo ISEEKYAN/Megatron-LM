@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=ds4-grpo
 #SBATCH --account=coreai_devtech_all
-#SBATCH --partition=batch_large_long
+#SBATCH --partition=batch
 #SBATCH --nodes=16
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=0
-#SBATCH --time=14-00:00:00
+#SBATCH --time=04:00:00
 
 set -euo pipefail
 
