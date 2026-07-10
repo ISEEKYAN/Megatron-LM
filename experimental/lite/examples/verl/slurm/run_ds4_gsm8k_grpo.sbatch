@@ -47,8 +47,8 @@ done
 
 SCRIPT_PATH="${MLITE_SRC}/experimental/lite/examples/verl/slurm/run_ds4_gsm8k_grpo.sbatch"
 if [[ -z "${MASTER_ADDR:-}" ]]; then
-  readarray -t SLURM_HOSTS < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
-  MASTER_ADDR=${SLURM_HOSTS[0]}
+  MASTER_ADDR=$(hostname -i)
+  MASTER_ADDR=${MASTER_ADDR%% *}
 fi
 RAY_PORT=${RAY_PORT:-6379}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
@@ -117,12 +117,12 @@ export PYTHONPYCACHEPREFIX="${TMPDIR}/pycache"
 export TORCHINDUCTOR_CACHE_DIR="${TMPDIR}/torchinductor"
 export TRITON_CACHE_DIR="${TMPDIR}/triton"
 mkdir -p "${PYTHONPYCACHEPREFIX}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}"
-RAY_CLI=(python -m ray.scripts.scripts)
+RAY_CLI=(env VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python -m ray.scripts.scripts)
 "${RAY_CLI[@]}" --help >/dev/null
 
 NODE_RANK=${SLURM_PROCID}
 DONE_FILE="${RUN_ROOT}/.ray_done"
-RAY_TEMP_DIR="${TMPDIR}/ray"
+RAY_TEMP_DIR="/tmp/ds4-grpo-${SLURM_JOB_ID}-ray"
 RAY_LOG_DIR="${RUN_ROOT}/ray-logs/node-${NODE_RANK}"
 if [[ "${CONFIG_ONLY}" == "1" ]]; then
   if [[ "${NODE_RANK}" == "0" ]]; then
@@ -197,7 +197,6 @@ if [[ "${NODE_RANK}" != "0" ]]; then
     if "${RAY_CLI[@]}" start --address="${MASTER_ADDR}:${RAY_PORT}" \
       --num-gpus="${GPUS_PER_NODE}" \
       --node-ip-address="${NODE_ADDR}" \
-      --temp-dir="${RAY_TEMP_DIR}" \
       --disable-usage-stats; then
       break
     fi
@@ -278,7 +277,9 @@ names = [
     "MEGATRON_ROOT",
     "VERL_ROOT",
 ]
-print(json.dumps({"env_vars": {name: os.environ[name] for name in names}}))
+env = {name: os.environ[name] for name in names}
+env["VERL_MLITE_SKIP_RUNTIME_PATCHES"] = "0"
+print(json.dumps({"env_vars": env}))
 PY
 )
 
@@ -293,7 +294,7 @@ run_phase() {
   local log_file="${RUN_ROOT}/${phase}.log"
   local jsonl_file="${RUN_ROOT}/${phase}.jsonl"
   local cmd_file="${RUN_ROOT}/${phase}.cmd.sh"
-  ray job submit \
+  "${RAY_CLI[@]}" job submit \
     --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
     -- \

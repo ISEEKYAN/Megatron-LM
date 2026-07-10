@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,27 @@ LITE_ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE_ROOT = LITE_ROOT / "examples/verl"
 RUNNER = EXAMPLE_ROOT / "scripts/run_deepseek_v4_gsm8k_grpo.sh"
 SBATCH = EXAMPLE_ROOT / "slurm/run_ds4_gsm8k_grpo.sbatch"
+
+
+def test_sitecustomize_skips_application_patches_for_ray_infrastructure() -> None:
+    env = {
+        "PATH": os.environ["PATH"],
+        "PYTHONPATH": str(EXAMPLE_ROOT),
+        "VERL_MLITE_SKIP_RUNTIME_PATCHES": "1",
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; assert 'verl_mlite.compat' not in sys.modules",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_math_smoke_rows_follow_verl_gsm8k_schema() -> None:
@@ -86,13 +108,21 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "#SBATCH --time=14-00:00:00" in script
     assert 'git -C "${MLITE_SRC}" rev-parse HEAD' in script
     assert 'srun --nodes="${SLURM_NNODES}"' in script
-    assert "RAY_CLI=(python -m ray.scripts.scripts)" in script
+    assert "MASTER_ADDR=$(hostname -i)" in script
+    assert "MASTER_ADDR=${MASTER_ADDR%% *}" in script
+    assert (
+        "RAY_CLI=(env VERL_MLITE_SKIP_RUNTIME_PATCHES=1 "
+        "python -m ray.scripts.scripts)"
+    ) in script
     assert '"${RAY_CLI[@]}" --help' in script
     assert '"${RAY_CLI[@]}" start --head' in script
     assert '"${RAY_CLI[@]}" start --address="${MASTER_ADDR}:${RAY_PORT}"' in script
     assert "RAY_raylet_start_wait_time_s" in script
     assert '--temp-dir="${RAY_TEMP_DIR}"' in script
+    assert 'RAY_TEMP_DIR="/tmp/ds4-grpo-${SLURM_JOB_ID}-ray"' in script
     assert '"${RUN_ROOT}/ray-logs/node-${NODE_RANK}"' in script
+    assert '"${RAY_CLI[@]}" job submit' in script
+    assert 'env["VERL_MLITE_SKIP_RUNTIME_PATCHES"] = "0"' in script
     assert 'RAY_CLUSTER_NODES ${#alive[@]}' not in script
     assert "RAY_CLUSTER_NODES" in script
     assert "PHASE1_STEPS" in script
