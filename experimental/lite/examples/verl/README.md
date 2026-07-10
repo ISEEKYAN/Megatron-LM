@@ -162,6 +162,42 @@ so the MLite actor is wired up correctly without any extra worker-path knob.
 By default, GSM8K GRPO artifacts are written under
 `experimental/lite/examples/verl/outputs/qwen35_gsm8k_grpo`.
 
+## DeepSeek V4 GRPO on Slurm
+
+`scripts/run_deepseek_v4_gsm8k_grpo.sh` specializes the generic GRPO launcher
+for the native DeepSeek V4 actor. It fixes the actor to FSDP2, fused DSA, THD,
+MTP training, full activation recomputation, and checkpoint-format block-FP8
+resync. The colocated vLLM workers use a dummy cold load with pure-FP8 Hugging
+Face overrides, then receive the actor's serialized block-FP8 stream through
+`VllmCheckpointWorkerExtension`; veRL's online FP8 quantizer remains disabled.
+
+`slurm/run_ds4_gsm8k_grpo.sbatch` builds a multi-node Ray cluster and runs two
+phases against one checkpoint directory. Phase one saves a bounded checkpoint;
+phase two uses `resume_mode=auto` and must reach the requested final step. The
+job then validates continuous JSONL steps, finite reward and policy loss,
+positive actor gradient norm, reward variation, and positive per-GPU token
+throughput before printing `DS4_GRPO_RUN_COMPLETE`.
+
+The Slurm script creates deterministic arithmetic prompts in the canonical
+GSM8K parquet schema. This is a network-independent mechanism smoke dataset,
+not a claim to reproduce the public GSM8K benchmark distribution. Supply
+separate `TRAIN_FILES` and `VAL_FILES` when using the model wrapper directly
+for a benchmark run.
+
+The checked-in Slurm defaults describe the 128-GPU PP4/EP8/CP4 target. A
+64-GPU staircase run can override the allocation and topology at submission:
+
+```bash
+sbatch --nodes=8 --time=06:00:00 \
+  --export=ALL,ACTOR_PP=2,ACTOR_EP=8,ACTOR_CP=2,ROLLOUT_TP=16,PHASE1_STEPS=3,TOTAL_STEPS=6 \
+  experimental/lite/examples/verl/slurm/run_ds4_gsm8k_grpo.sbatch
+```
+
+The remaining required environment variables are fail-closed path contracts:
+`BASE_IMAGE`, `MLITE_SRC`, `MLITE_COMMIT`, `MEGATRON_ROOT`, `VERL_ROOT`,
+`MLITE_SM90_SITE`, `DS4_VLLM_SITE`, `DS4_VLLM_SHIM`, `CHECKPOINT_DIR`, and a
+fresh `RUN_ROOT`.
+
 ### Serialized checkpoint weight resync
 
 Quantized inference models must receive weights in the serialized format

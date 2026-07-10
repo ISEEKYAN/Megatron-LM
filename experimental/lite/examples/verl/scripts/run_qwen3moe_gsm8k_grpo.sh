@@ -84,6 +84,7 @@ DTYPE="${DTYPE:-bfloat16}"
 MLITE_MODEL_NAME="${MLITE_MODEL_NAME:-auto}"
 MLITE_IMPL="${MLITE_IMPL:-lite}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
+USE_FUSED_KERNELS="${USE_FUSED_KERNELS:-False}"
 # Optimizer backend:
 # - dist_opt (default): Megatron-Core DDP + distributed optimizer.
 # - fsdp2: Megatron Lite FSDP2 wrapper + optimizer.
@@ -185,7 +186,7 @@ DATA=(
 MODEL=(
   "actor_rollout_ref.model.path=${MODEL_PATH}"
   "actor_rollout_ref.model.trust_remote_code=True"
-  "actor_rollout_ref.model.use_fused_kernels=False"
+  "actor_rollout_ref.model.use_fused_kernels=${USE_FUSED_KERNELS}"
 )
 
 ACTOR=(
