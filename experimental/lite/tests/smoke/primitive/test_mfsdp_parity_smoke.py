@@ -1044,7 +1044,7 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
             dist.barrier()
             loss, grad_norm, trace, grads, params = _run_full_parallel_step(
                 handle,
-                batch_seed=8345,
+                batch_seed=8345 + step,
                 record_collectives=step == 0,
                 capture_diagnostics=step == 0,
             )
