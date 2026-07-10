@@ -593,7 +593,7 @@ class CompressedSparseAttention(nn.Module):
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         if attention_mask is not None:
-            raise NotImplementedError("DeepSeek V4 fused DSA CP supports causal masking only.")
+            raise NotImplementedError("Fused DSA CP supports causal masking only.")
 
         full_x = gather_contiguous_for_cp(
             x, cp_size=self.ps.cp_size, cp_group=self.ps.cp_group, seq_dim=1
@@ -661,7 +661,7 @@ class CompressedSparseAttention(nn.Module):
             padding_ok = bool(torch.count_nonzero(row[valid_len:]).item() == 0)
             if not prefix_ok or not padding_ok:
                 raise NotImplementedError(
-                    "DeepSeek V4 fused DSA CP requires one sequence per microbatch; "
+                    "Fused DSA CP requires one sequence per microbatch; "
                     "packed multi-sequence boundaries are unsupported."
                 )
 
@@ -679,7 +679,7 @@ class CompressedSparseAttention(nn.Module):
     ) -> torch.Tensor:
         if attention_mask is not None:
             raise NotImplementedError(
-                "DeepSeek V4 fused DSA path currently supports causal masking only."
+                "Fused DSA currently supports causal masking only."
             )
         dsa_kernels = _load_dsa_kernels()
         # The cuDNN SM90 indexer requires seqlen_q <= seqlen_k * ratio, but the
@@ -711,7 +711,7 @@ class CompressedSparseAttention(nn.Module):
             rope_theta=self.config.compress_rope_theta,
         )
         if compressed is None or index_comp is None:
-            raise RuntimeError("DeepSeek V4 fused DSA requires at least one compressed KV entry.")
+            raise RuntimeError("Fused DSA requires at least one compressed KV entry.")
         compressed_kv = compressed.squeeze(1)
         index_k = index_comp.squeeze(1).transpose(0, 1).contiguous()
         kv_full = torch.cat([kv.squeeze(1), compressed_kv], dim=1)
@@ -740,7 +740,7 @@ class CompressedSparseAttention(nn.Module):
         )
         indexer_topk = int(self.indexer.index_topk)
         if indexer_topk <= 0:
-            raise RuntimeError("DeepSeek V4 fused DSA requires positive indexer_topk.")
+            raise RuntimeError("Fused DSA requires positive indexer_topk.")
         window_idxs = _window_topk_indices(
             batch,
             seq_len,
