@@ -114,6 +114,71 @@ def test_vllm_triton_kernels_alias_prefers_vendored_package(monkeypatch) -> None
     assert not compat._install_vllm_triton_kernels_alias()
 
 
+def test_vllm_device_uuid_normalizes_physical_id_for_one_visible_gpu(
+    monkeypatch,
+) -> None:
+    from verl_mlite import compat
+
+    calls = []
+
+    def get_device_uuid(device_id):
+        calls.append(device_id)
+        return f"GPU-{device_id}"
+
+    utils = SimpleNamespace(get_device_uuid=get_device_uuid)
+    monkeypatch.setenv("VERL_MLITE_VLLM_SITE", "/rollout")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5")
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.utils",
+        utils,
+    )
+
+    assert compat._patch_verl_vllm_device_uuid()
+    assert not compat._patch_verl_vllm_device_uuid()
+    assert utils.get_device_uuid(5) == "GPU-0"
+    assert utils.get_device_uuid(0) == "GPU-0"
+    assert utils.get_device_uuid(3) == "GPU-3"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-opaque")
+    assert utils.get_device_uuid(5) == "GPU-5"
+    assert calls == [0, 0, 3, 5]
+
+
+def test_vllm_device_uuid_maps_physical_id_with_multiple_visible_gpus(
+    monkeypatch,
+) -> None:
+    from verl_mlite import compat
+
+    calls = []
+
+    def get_device_uuid(device_id):
+        calls.append(device_id)
+        return f"GPU-{device_id}"
+
+    utils = SimpleNamespace(get_device_uuid=get_device_uuid)
+    monkeypatch.setenv("VERL_MLITE_VLLM_SITE", "/rollout")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5")
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.utils",
+        utils,
+    )
+
+    assert compat._patch_verl_vllm_device_uuid()
+    assert utils.get_device_uuid(5) == "GPU-1"
+    assert utils.get_device_uuid(1) == "GPU-1"
+    assert utils.get_device_uuid(3) == "GPU-3"
+    assert calls == [1, 1, 3]
+
+
+def test_vllm_device_uuid_patch_requires_explicit_rollout_site(monkeypatch) -> None:
+    from verl_mlite import compat
+
+    monkeypatch.delenv("VERL_MLITE_VLLM_SITE", raising=False)
+
+    assert not compat._patch_verl_vllm_device_uuid()
+
+
 def test_checkpoint_bucket_reload_has_one_lifecycle_for_all_buckets() -> None:
     from verl_mlite.rollout.vllm_worker import reload_checkpoint_buckets
 

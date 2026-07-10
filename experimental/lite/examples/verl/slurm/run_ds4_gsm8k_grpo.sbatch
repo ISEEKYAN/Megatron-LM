@@ -77,6 +77,10 @@ if (( WORLD_SIZE % ROLLOUT_TP != 0 )); then
   echo "world_size=${WORLD_SIZE} must be divisible by rollout_tp=${ROLLOUT_TP}" >&2
   exit 2
 fi
+if (( RAY_ONLY == 1 && (SLURM_NNODES != 1 || GPUS_PER_NODE != 8) )); then
+  echo "RAY_ONLY requires one node with eight GPUs" >&2
+  exit 2
+fi
 
 if [[ "${IN_DS4_GRPO_CONTAINER:-0}" != "1" ]]; then
   [[ ! -e "${RUN_ROOT}" ]] || {
@@ -298,7 +302,92 @@ if [[ "${RAY_ONLY}" == "1" ]]; then
     --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
     -- \
-    python -c 'import os, ray, sys; from transformers import AutoConfig; assert os.environ["VERL_MLITE_SKIP_RUNTIME_PATCHES"] == "0"; assert "verl_mlite.compat" in sys.modules; hf_config = AutoConfig.from_pretrained(os.environ["CHECKPOINT_DIR"], trust_remote_code=True); assert hf_config.model_type == os.environ["VERL_MLITE_HF_CONFIG_MODEL_TYPE"]; print(f"DS4_RAY_HF_CONFIG_PASSED model_type={hf_config.model_type}", flush=True); ray.init(address="auto"); probe = ray.remote(num_gpus=1)(lambda: {name: os.environ.get(name) for name in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")}); visible = ray.get(probe.remote()); assert visible["CUDA_VISIBLE_DEVICES"], visible; assert not visible["HIP_VISIBLE_DEVICES"], visible; assert not visible["ROCR_VISIBLE_DEVICES"], visible; print("DS4_RAY_JOB_RUNTIME_ENV_PASSED", flush=True); print(f"DS4_RAY_GPU_ENV_PASSED {visible}", flush=True)'
+    python -c '
+import json
+import os
+import sys
+
+import ray
+from transformers import AutoConfig
+
+assert os.environ["VERL_MLITE_SKIP_RUNTIME_PATCHES"] == "0"
+assert "verl_mlite.compat" in sys.modules
+hf_config = AutoConfig.from_pretrained(
+    os.environ["CHECKPOINT_DIR"], trust_remote_code=True
+)
+assert hf_config.model_type == os.environ["VERL_MLITE_HF_CONFIG_MODEL_TYPE"]
+print(f"DS4_RAY_HF_CONFIG_PASSED model_type={hf_config.model_type}", flush=True)
+ray.init(address="auto")
+
+
+class DeviceProbe:
+    def inspect(self):
+        import torch
+
+        from verl.utils.device import get_device_id
+        from verl.workers.rollout.vllm_rollout.utils import get_device_uuid
+
+        accelerator_ids = [
+            str(value)
+            for value in ray.get_runtime_context()
+            .get_accelerator_ids()
+            .get("GPU", [])
+        ]
+        if len(accelerator_ids) != 1 or not accelerator_ids[0].isdigit():
+            raise AssertionError(
+                "accelerator id must be a decimal CUDA device id: "
+                f"{accelerator_ids}"
+            )
+        return {
+            "accelerator_ids": accelerator_ids,
+            "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "current_device": torch.cuda.current_device(),
+            "device_count": torch.cuda.device_count(),
+            "logical_device_uuid": get_device_uuid(get_device_id()),
+            "physical_device_uuid": get_device_uuid(int(accelerator_ids[0])),
+            "patch_applied": bool(
+                getattr(get_device_uuid, "_verl_mlite_visible_device_patch", False)
+            ),
+            "node_id": ray.get_runtime_context().get_node_id(),
+        }
+
+
+ProbeActor = ray.remote(num_gpus=1)(DeviceProbe)
+actors = [ProbeActor.remote() for _ in range(8)]
+records = ray.get([actor.inspect.remote() for actor in actors])
+assert len(records) == 8, records
+node_ids = [record["node_id"] for record in records]
+assert len(set(node_ids)) == 1, records
+physical_ids = []
+device_uuids = []
+for record in records:
+    accelerator_ids = record["accelerator_ids"]
+    assert len(accelerator_ids) == 1, records
+    physical_id = accelerator_ids[0]
+    visible_devices = record["visible_devices"]
+    assert visible_devices, records
+    visible_ids = {
+        value.strip() for value in visible_devices.split(",") if value.strip()
+    }
+    assert physical_id in visible_ids, records
+    assert 0 <= record["current_device"] < record["device_count"], records
+    assert record["patch_applied"], records
+    assert record["logical_device_uuid"], records
+    assert record["physical_device_uuid"], records
+    assert record["logical_device_uuid"] == record["physical_device_uuid"], records
+    physical_ids.append(physical_id)
+    device_uuids.append(record["physical_device_uuid"])
+assert len(set(physical_ids)) == 8, records
+assert len(set(device_uuids)) == 8, records
+print("DS4_RAY_JOB_RUNTIME_ENV_PASSED", flush=True)
+print(f"DS4_RAY_GPU_ENV_PASSED {json.dumps(records, sort_keys=True)}", flush=True)
+print(
+    "DS4_RAY_DEVICE_UUID_PROBE_PASSED actors=8 "
+    f"node_id={node_ids[0]} physical_ids={physical_ids} "
+    f"device_uuids={device_uuids}",
+    flush=True,
+)
+'
   echo "DS4_RAY_CLUSTER_PASSED nodes=${SLURM_NNODES} source=${MLITE_COMMIT}"
   exit 0
 fi

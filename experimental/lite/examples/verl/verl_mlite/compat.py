@@ -140,6 +140,41 @@ def _patch_vllm_server_profile() -> bool:
     return True
 
 
+def _normalize_vllm_visible_device_id(device_id: int) -> int:
+    """Translate a leaked physical CUDA id back to vLLM's visible-list index."""
+    visible_devices = [
+        value.strip()
+        for value in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if value.strip()
+    ]
+    if device_id < 0 or not visible_devices or device_id < len(visible_devices):
+        return device_id
+
+    physical_id = str(device_id)
+    if physical_id in visible_devices:
+        return visible_devices.index(physical_id)
+    return device_id
+
+
+def _patch_verl_vllm_device_uuid() -> bool:
+    """Keep VERL/vLLM UUID lookup on the Ray actor's visible CUDA device."""
+    if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
+        return False
+
+    utils = importlib.import_module("verl.workers.rollout.vllm_rollout.utils")
+    original_get_device_uuid = utils.get_device_uuid
+    if getattr(original_get_device_uuid, "_verl_mlite_visible_device_patch", False):
+        return False
+
+    @wraps(original_get_device_uuid)
+    def patched_get_device_uuid(device_id: int) -> str:
+        return original_get_device_uuid(_normalize_vllm_visible_device_id(device_id))
+
+    patched_get_device_uuid._verl_mlite_visible_device_patch = True
+    utils.get_device_uuid = patched_get_device_uuid
+    return True
+
+
 class _SyncBucketProducer:
     """Pack one sender bucket at a time into a caller-owned staging slot."""
 
@@ -511,6 +546,7 @@ def apply_runtime_patches() -> None:
     _register_opaque_hf_config()
     _install_vllm_thin_finder()
     _install_vllm_triton_kernels_alias()
+    _patch_verl_vllm_device_uuid()
     _patch_transformers_rope_ignore_keys()
     _patch_bucketed_weight_sender()
     _patch_vllm_server_profile()

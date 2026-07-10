@@ -222,6 +222,32 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "DRY_RUN=0" in script
 
 
+def test_ds4_grpo_ray_only_probes_every_local_device_uuid_mapping() -> None:
+    script = SBATCH.read_text()
+
+    assert "RAY_ONLY requires one node with eight GPUs" in script
+    assert "class DeviceProbe:" in script
+    assert "ray.remote(num_gpus=1)(DeviceProbe)" in script
+    assert "for _ in range(8)" in script
+    assert "get_accelerator_ids()" in script
+    assert 'os.environ.get("CUDA_VISIBLE_DEVICES")' in script
+    assert "torch.cuda.current_device()" in script
+    assert "torch.cuda.device_count()" in script
+    assert "get_device_uuid(get_device_id())" in script
+    assert "get_device_uuid(int(accelerator_ids[0]))" in script
+    assert 'record["accelerator_ids"]' in script
+    assert 'record["visible_devices"]' in script
+    assert 'record["logical_device_uuid"]' in script
+    assert 'record["physical_device_uuid"]' in script
+    assert (
+        'record["logical_device_uuid"] == record["physical_device_uuid"]' in script
+    )
+    assert "accelerator id must be a decimal CUDA device id" in script
+    assert "len(set(physical_ids)) == 8" in script
+    assert "len(set(device_uuids)) == 8" in script
+    assert "DS4_RAY_DEVICE_UUID_PROBE_PASSED actors=8" in script
+
+
 def test_ds4_grpo_readme_uses_the_smoke_partition_limit() -> None:
     readme = README.read_text()
 
