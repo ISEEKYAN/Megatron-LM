@@ -93,6 +93,7 @@ def classify_parameter_family(name: str) -> str:
             ".self_attn.",
             ".self_attention.",
             ".linear_attn.",
+            ".full_attn.",
             ".attention.",
             ".attn.",
             ".q_proj.",

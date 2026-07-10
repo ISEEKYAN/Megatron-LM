@@ -32,6 +32,7 @@ def test_classify_parameter_family_uses_exported_names() -> None:
         classify("model.0.module.layers.0.self_attention.linear_qkv.weight")
         == "attention"
     )
+    assert classify("model.module.layers.0.full_attn.qkv.linear.weight") == "attention"
     assert (
         classify("model.0.module.layers.0.self_attention.gdn.in_proj.weight") == "gdn"
     )
