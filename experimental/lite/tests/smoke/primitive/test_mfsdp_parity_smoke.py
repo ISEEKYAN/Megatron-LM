@@ -934,7 +934,7 @@ def _run_full_parallel_step(
     grads = _named_optimizer_grads(handle._optimizer) if capture_diagnostics else {}
     success, grad_norm, _num_zeros = runtime.optimizer_step(handle)
     assert success
-    params = _named_model_tensors(handle.model) if capture_diagnostics else {}
+    params = _named_model_tensors(handle._model) if capture_diagnostics else {}
     loss = result.model_output.loss
     assert loss is not None
     return (

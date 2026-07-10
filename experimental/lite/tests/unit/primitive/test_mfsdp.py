@@ -149,6 +149,8 @@ def test_mfsdp_full_parallel_signoff_is_single_node_50_step_curve():
     assert constants["_FULL_PARALLEL_CURVE_INTERVAL"] == 10
     assert "[MFSDP_FULL_PARALLEL_CURVE]" in smoke_source
     assert "[MFSDP_FULL_PARALLEL_STEP]" in smoke_source
+    assert "_named_model_tensors(handle._model)" in smoke_source
+    assert "_named_model_tensors(handle.model)" not in smoke_source
 
     runner_source = (tests_root / "run_mfsdp_hopper_validation.sh").read_text()
     assert "full-parallel mode requires NNODES=1 and NPROC_PER_NODE=8." in runner_source
