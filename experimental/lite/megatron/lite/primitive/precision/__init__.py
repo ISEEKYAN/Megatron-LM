@@ -1,0 +1,50 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Public entrypoints for the closed MLite precision primitive."""
+
+from megatron.lite.primitive.precision.contract import (
+    AuthoritativeSource,
+    MasterOwner,
+    ParameterContract,
+    PrecisionDType,
+    PrecisionImplementation,
+    PrimitiveCapability,
+    SemanticSite,
+    WeightStorage,
+)
+from megatron.lite.primitive.precision.coverage import (
+    CoverageEntry,
+    CoverageManifest,
+    PrecisionCoverage,
+)
+from megatron.lite.primitive.precision.hopper_blockwise import (
+    PRECISION_NAMES,
+    PrecisionPhase,
+    active_precision,
+    build_hopper_blockwise_recipe,
+    precision_forward_context,
+    precision_model_init_context,
+    resolve_precision,
+    validate_hopper_environment,
+)
+
+__all__ = [
+    "AuthoritativeSource",
+    "CoverageEntry",
+    "CoverageManifest",
+    "MasterOwner",
+    "PRECISION_NAMES",
+    "ParameterContract",
+    "PrecisionCoverage",
+    "PrecisionDType",
+    "PrecisionImplementation",
+    "PrecisionPhase",
+    "PrimitiveCapability",
+    "SemanticSite",
+    "WeightStorage",
+    "active_precision",
+    "build_hopper_blockwise_recipe",
+    "precision_forward_context",
+    "precision_model_init_context",
+    "resolve_precision",
+    "validate_hopper_environment",
+]
