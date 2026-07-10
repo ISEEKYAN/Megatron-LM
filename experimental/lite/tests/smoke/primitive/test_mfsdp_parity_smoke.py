@@ -891,13 +891,37 @@ class _MCoreReferenceOptimizer:
         self.optimizer.zero_grad(set_to_none=True)
         self.grad_sync_enabled = False
 
+    def _gather_fsdp_shard(self, tensor: torch.Tensor, param: nn.Parameter) -> torch.Tensor:
+        local = getattr(tensor, "_local_tensor", tensor)
+        wait = getattr(local, "wait", None)
+        if callable(wait):
+            local = wait()
+        local = local.detach().contiguous().view(-1)
+        expert = not bool(getattr(param, "allreduce", True))
+        group = self.ps.ep_dp_group if expert else self.ps.dp_cp_group
+        if group is not None and dist.get_world_size(group) > 1:
+            local_size = torch.tensor([local.numel()], device=local.device, dtype=torch.int64)
+            sizes = [torch.zeros_like(local_size) for _ in range(dist.get_world_size(group))]
+            dist.all_gather(sizes, local_size, group=group)
+            max_size = max(int(size.item()) for size in sizes)
+            padded = torch.zeros(max_size, device=local.device, dtype=local.dtype)
+            padded[: local.numel()].copy_(local)
+            shards = [torch.empty_like(padded) for _ in sizes]
+            dist.all_gather(shards, padded, group=group)
+            local = torch.cat(
+                [shard[: int(size.item())] for shard, size in zip(shards, sizes, strict=True)]
+            )
+        original = getattr(param, "orig_param", param)
+        assert local.numel() >= original.numel()
+        return local[: original.numel()].view(original.shape)
+
     def named_grad_tensors(self) -> dict[str, torch.Tensor]:
         grads = {}
         for param in self.params:
             if param.grad is None:
                 continue
             name = self.param_names[id(param)]
-            grads[name] = _full_tensor(param.grad.detach()).cpu().float().clone()
+            grads[name] = self._gather_fsdp_shard(param.grad, param).cpu().float().clone()
         return grads
 
     def named_state_tensors(self) -> dict[str, dict[str, torch.Tensor]]:
@@ -905,7 +929,7 @@ class _MCoreReferenceOptimizer:
         for param in self.params:
             state = self.optimizer.state.get(param, {})
             tensors = {
-                key: _full_tensor(value.detach()).cpu().float().clone()
+                key: self._gather_fsdp_shard(value, param).cpu().float().clone()
                 for key, value in state.items()
                 if key in {"exp_avg", "exp_avg_sq"} and isinstance(value, torch.Tensor)
             }
