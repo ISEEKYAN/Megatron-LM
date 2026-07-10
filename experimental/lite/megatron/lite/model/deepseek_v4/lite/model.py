@@ -52,9 +52,9 @@ from megatron.lite.primitive.parallel import (
     VocabParallelOutput,
     build_pipeline_chunk_layout,
     gather_from_sequence_parallel,
+    roll_contiguous_left_for_cp,
     scatter_to_sequence_parallel,
 )
-from megatron.lite.primitive.parallel.cp import roll_contiguous_left_for_cp
 from megatron.lite.primitive.parallel.mhc import (
     contract_mhc_hidden_for_pipeline,
     expand_mhc_hidden_for_pipeline,
