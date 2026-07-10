@@ -933,10 +933,25 @@ def _build_mcore_reference_optimizer(chunks, ps):
     assert source_sha256 == _MCORE_FULLY_SHARD_SHA256
     assert "megatron/core/distributed/fsdp" in source_path.as_posix()
 
+    print(
+        f"[MFSDP_BUILD] rank={dist.get_rank()} pp_rank={ps.pp_rank} "
+        "backend=mcore_mfsdp phase=mesh_start",
+        flush=True,
+    )
     dense_mesh, expert_mesh = _mcore_reference_meshes(ps)
+    print(
+        f"[MFSDP_BUILD] rank={dist.get_rank()} pp_rank={ps.pp_rank} "
+        "backend=mcore_mfsdp phase=mesh_done",
+        flush=True,
+    )
     wrapped_chunks = []
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks):
         _mark_mcore_reference_params(chunk, ps)
+        print(
+            f"[MFSDP_BUILD] rank={dist.get_rank()} pp_rank={ps.pp_rank} "
+            f"backend=mcore_mfsdp phase=wrap_start chunk={chunk_index}",
+            flush=True,
+        )
         wrapped_chunks.append(
             fully_shard_model(
                 module=chunk,
@@ -955,8 +970,18 @@ def _build_mcore_reference_optimizer(chunks, ps):
                 average_in_collective=True,
             )
         )
+        print(
+            f"[MFSDP_BUILD] rank={dist.get_rank()} pp_rank={ps.pp_rank} "
+            f"backend=mcore_mfsdp phase=wrap_done chunk={chunk_index}",
+            flush=True,
+        )
     chunks[:] = wrapped_chunks
 
+    print(
+        f"[MFSDP_BUILD] rank={dist.get_rank()} pp_rank={ps.pp_rank} "
+        "backend=mcore_mfsdp phase=optimizer_start",
+        flush=True,
+    )
     raw_optimizer = torch.optim.AdamW(
         [param for chunk in chunks for param in chunk.parameters()],
         lr=1.0e-3,
@@ -971,6 +996,11 @@ def _build_mcore_reference_optimizer(chunks, ps):
         for name, param in chunk.named_parameters():
             param_names[id(param)] = f"{chunk_idx}.{_canonical_optimizer_name(name)}"
     optimizer = _MCoreReferenceOptimizer(raw_optimizer, chunks, ps, param_names)
+    print(
+        f"[MFSDP_BUILD] rank={dist.get_rank()} pp_rank={ps.pp_rank} "
+        "backend=mcore_mfsdp phase=optimizer_done",
+        flush=True,
+    )
     if dist.get_rank() == 0:
         print(
             "[MFSDP_REFERENCE] "
@@ -1393,8 +1423,16 @@ def _run_full_parallel_precision(monkeypatch, *, batch_mode: str):
     handles = {}
     initial_params = {}
     for backend in _PRECISION_BACKENDS:
+        print(
+            f"[MFSDP_BUILD] rank={dist.get_rank()} backend={backend} phase=handle_start",
+            flush=True,
+        )
         handles[backend], initial_params[backend] = _build_full_parallel_handle(
             backend, seed=7345
+        )
+        print(
+            f"[MFSDP_BUILD] rank={dist.get_rank()} backend={backend} phase=handle_done",
+            flush=True,
         )
     mcore_handle = handles["mcore_mfsdp"]
     mfsdp_handle = handles["mfsdp"]
