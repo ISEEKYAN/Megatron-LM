@@ -253,7 +253,7 @@ python "${MLITE_SRC}/experimental/lite/examples/verl/prepare_math_smoke_data.py"
   --train-size "${TRAIN_SIZE:-64}" \
   --test-size "${TEST_SIZE:-16}"
 
-RUNTIME_ENV_JSON=$(python - <<'PY'
+RUNTIME_ENV_JSON=$(VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python - <<'PY'
 import json
 import os
 

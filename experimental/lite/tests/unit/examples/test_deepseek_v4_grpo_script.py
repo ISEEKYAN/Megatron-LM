@@ -122,6 +122,7 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert 'RAY_TEMP_DIR="/tmp/ds4-grpo-${SLURM_JOB_ID}-ray"' in script
     assert '"${RUN_ROOT}/ray-logs/node-${NODE_RANK}"' in script
     assert '"${RAY_CLI[@]}" job submit' in script
+    assert "RUNTIME_ENV_JSON=$(VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python" in script
     assert 'env["VERL_MLITE_SKIP_RUNTIME_PATCHES"] = "0"' in script
     assert 'RAY_CLUSTER_NODES ${#alive[@]}' not in script
     assert "RAY_CLUSTER_NODES" in script
