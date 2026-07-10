@@ -119,7 +119,7 @@ def _write_deepseek_v4_config(path) -> None:
         "qk_rope_head_dim": 16,
         "o_lora_rank": 32,
         "o_groups": 2,
-        "index_head_dim": 64,
+        "index_head_dim": 128,
         "index_n_heads": 8,
         "index_topk": 4,
         "moe_intermediate_size": 32,
