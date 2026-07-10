@@ -202,7 +202,7 @@ def _model_cfg() -> SimpleNamespace:
     )
 
 
-def _optimizer_cfg() -> OptimizerConfig:
+def _optimizer_cfg(*, use_fused_optimizer: bool = True) -> OptimizerConfig:
     cfg = OptimizerConfig(
         optimizer="adam",
         lr=1.0e-3,
@@ -214,7 +214,8 @@ def _optimizer_cfg() -> OptimizerConfig:
         adam_eps=1.0e-8,
     )
     cfg.override_optimizer_config = {
-        "mfsdp_sharding_strategy": _MFSDP_SHARDING_STRATEGY
+        "mfsdp_sharding_strategy": _MFSDP_SHARDING_STRATEGY,
+        "use_fused_optimizer": use_fused_optimizer,
     }
     return cfg
 
@@ -755,7 +756,7 @@ def _build_full_parallel_handle(backend: str, *, seed: int):
     impl_cfg = protocol.ImplConfig(
         parallel=parallel,
         optimizer=backend,
-        optimizer_config=_optimizer_cfg(),
+        optimizer_config=_optimizer_cfg(use_fused_optimizer=False),
         use_deepep=False,
         use_thd=True,
         deterministic=True,
@@ -1020,11 +1021,6 @@ def test_mfsdp_matches_fsdp2_full_parallel_short_train(monkeypatch):
     dist.all_reduce(max_loss_rel_diff, op=dist.ReduceOp.MAX)
     dist.all_reduce(max_grad_norm_rel_diff, op=dist.ReduceOp.MAX)
 
-    assert float(max_loss_rel_diff) <= _LOSS_REL_TOL
-    assert float(max_grad_norm_rel_diff) <= _LOSS_REL_TOL
-    assert losses["fsdp2"][-1] < losses["fsdp2"][0]
-    assert losses["mfsdp"][-1] < losses["mfsdp"][0]
-
     if dist.get_rank() == 0:
         ps = fsdp2_handle._parallel_state
         print(
@@ -1051,3 +1047,8 @@ def test_mfsdp_matches_fsdp2_full_parallel_short_train(monkeypatch):
                 f"sequence={' > '.join(trace[:96])}",
                 flush=True,
             )
+
+    assert float(max_loss_rel_diff) <= _LOSS_REL_TOL
+    assert float(max_grad_norm_rel_diff) <= _LOSS_REL_TOL
+    assert losses["fsdp2"][-1] < losses["fsdp2"][0]
+    assert losses["mfsdp"][-1] < losses["mfsdp"][0]
