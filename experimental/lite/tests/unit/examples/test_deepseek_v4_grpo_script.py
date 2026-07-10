@@ -213,6 +213,14 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     )
     assert 'VERL_MLITE_VLLM_SITE="${DS4_VLLM_SITE}"' in script
     assert 'VERL_MLITE_VLLM_LD_PRELOAD="${DS4_VLLM_SHIM}"' in script
+    assert "DS4_WEIGHT_SYNC_PROFILE_DISABLED" in script
+    probe_unset = "unset MLITE_WEIGHT_SYNC_PROBE MLITE_WEIGHT_SYNC_PROBE_BACKEND"
+    assert probe_unset in script
+    assert script.index(probe_unset) < script.index(
+        'if [[ "${IMPORT_ONLY}" == "1" ]]'
+    )
+    assert "weight_sync_probe=" in import_program
+    assert "skip_runtime_patches=" in import_program
     assert "export VERL_MLITE_HF_CONFIG_MODEL_TYPE=deepseek_v4" in script
     assert '"VERL_MLITE_HF_CONFIG_MODEL_TYPE",' in script
     assert '"CHECKPOINT_DIR",' in script

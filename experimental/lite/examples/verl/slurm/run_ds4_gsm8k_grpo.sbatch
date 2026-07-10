@@ -110,6 +110,11 @@ if [[ "${IN_DS4_GRPO_CONTAINER:-0}" != "1" ]]; then
     env IN_DS4_GRPO_CONTAINER=1 bash "${SCRIPT_PATH}"
 fi
 
+if [[ -n "${MLITE_WEIGHT_SYNC_PROBE:-}" || -n "${MLITE_WEIGHT_SYNC_PROBE_BACKEND:-}" ]]; then
+  echo "DS4_WEIGHT_SYNC_PROFILE_DISABLED"
+fi
+unset MLITE_WEIGHT_SYNC_PROBE MLITE_WEIGHT_SYNC_PROBE_BACKEND
+
 export PATH=/usr/local/bin:/usr/bin:/bin
 hash -r
 export CC=/usr/bin/gcc
@@ -169,6 +174,8 @@ print(
     "DS4_SERVER_IMPORT_STATE "
     f"sitecustomize={getattr(startup_sitecustomize, '__file__', None)} "
     f"compat={compat.__file__} "
+    f"weight_sync_probe={os.environ.get('MLITE_WEIGHT_SYNC_PROBE')} "
+    f"skip_runtime_patches={os.environ.get('VERL_MLITE_SKIP_RUNTIME_PATCHES')} "
     f"alias_before={alias_before} explicit_patch_result={explicit_patch_result} "
     f"alias_after_explicit_patch={alias_after_explicit_patch}",
     flush=True,
