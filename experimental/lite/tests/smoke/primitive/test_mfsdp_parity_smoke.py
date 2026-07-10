@@ -869,6 +869,7 @@ class _MCoreReferenceOptimizer:
         self.param_names = dict(param_names)
         self.captured_grads = captured_grads
         self.raw_params = raw_params
+        self.moment_states: dict[str, dict[str, torch.Tensor]] = {}
         self.params = [
             param for group in optimizer.param_groups for param in group["params"]
         ]
@@ -894,30 +895,6 @@ class _MCoreReferenceOptimizer:
         self.captured_grads.clear()
         self.grad_sync_enabled = False
 
-    def _gather_fsdp_shard(self, tensor: torch.Tensor, param: nn.Parameter) -> torch.Tensor:
-        local = getattr(tensor, "_local_tensor", tensor)
-        wait = getattr(local, "wait", None)
-        if callable(wait):
-            local = wait()
-        local = local.detach().contiguous().view(-1)
-        expert = not bool(getattr(param, "allreduce", True))
-        group = self.ps.ep_dp_group if expert else self.ps.dp_cp_group
-        if group is not None and dist.get_world_size(group) > 1:
-            local_size = torch.tensor([local.numel()], device=local.device, dtype=torch.int64)
-            sizes = [torch.zeros_like(local_size) for _ in range(dist.get_world_size(group))]
-            dist.all_gather(sizes, local_size, group=group)
-            max_size = max(int(size.item()) for size in sizes)
-            padded = torch.zeros(max_size, device=local.device, dtype=local.dtype)
-            padded[: local.numel()].copy_(local)
-            shards = [torch.empty_like(padded) for _ in sizes]
-            dist.all_gather(shards, padded, group=group)
-            local = torch.cat(
-                [shard[: int(size.item())] for shard, size in zip(shards, sizes, strict=True)]
-            )
-        original = getattr(param, "orig_param", param)
-        assert local.numel() >= original.numel()
-        return local[: original.numel()].view(original.shape)
-
     def named_grad_tensors(self) -> dict[str, torch.Tensor]:
         grads = {}
         for name, captured in self.captured_grads.items():
@@ -932,17 +909,35 @@ class _MCoreReferenceOptimizer:
         return grads
 
     def named_state_tensors(self) -> dict[str, dict[str, torch.Tensor]]:
-        states = {}
+        sample_count = 0
         for param in self.params:
             state = self.optimizer.state.get(param, {})
-            tensors = {
-                key: self._gather_fsdp_shard(value, param).cpu().float().clone()
-                for key, value in state.items()
-                if key in {"exp_avg", "exp_avg_sq"} and isinstance(value, torch.Tensor)
+            name = self.param_names[id(param)]
+            if sample_count >= _OPTIMIZER_STATE_SAMPLE_COUNT:
+                continue
+            for state_name in ("exp_avg", "exp_avg_sq"):
+                value = state.get(state_name)
+                if not isinstance(value, torch.Tensor):
+                    continue
+                local = getattr(value, "_local_tensor", value)
+                wait = getattr(local, "wait", None)
+                if callable(wait):
+                    local = wait()
+                sample = local.detach().float().reshape(-1)[:3].cpu().tolist()
+                print(
+                    "[MFSDP_OPTIMIZER_LOCAL_STATE] "
+                    f"rank={dist.get_rank()} tensor={name} state={state_name} "
+                    f"sample={sample}",
+                    flush=True,
+                )
+            sample_count += 1
+        return {
+            name: {
+                state_name: value.cpu().float().clone()
+                for state_name, value in state.items()
             }
-            if tensors:
-                states[self.param_names[id(param)]] = tensors
-        return states
+            for name, state in self.moment_states.items()
+        }
 
     def _grad_norm(self, grads: dict[str, torch.Tensor]) -> float:
         total = torch.zeros((), device="cuda", dtype=torch.float64)
@@ -975,6 +970,16 @@ class _MCoreReferenceOptimizer:
                 if param.grad is not None:
                     local_grad = getattr(param.grad, "_local_tensor", param.grad)
                     local_grad.mul_(scale)
+            for grad in grads.values():
+                grad.mul_(scale)
+        beta1, beta2 = self.optimizer.param_groups[0]["betas"]
+        for name, grad in grads.items():
+            state = self.moment_states.setdefault(
+                name,
+                {"exp_avg": torch.zeros_like(grad), "exp_avg_sq": torch.zeros_like(grad)},
+            )
+            state["exp_avg"].mul_(beta1).add_(grad, alpha=1.0 - beta1)
+            state["exp_avg_sq"].mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
         self.optimizer.step()
         self.grad_sync_enabled = False
         return True, grad_norm, 0
