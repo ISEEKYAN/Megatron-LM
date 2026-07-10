@@ -18,6 +18,30 @@ from pathlib import Path
 from typing import Any
 
 _BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+_REGISTERED_HF_CONFIG_TYPES: set[str] = set()
+
+
+def _register_opaque_hf_config() -> bool:
+    """Let VERL preserve config fields for an MLite-owned model type."""
+    model_type = os.environ.get("VERL_MLITE_HF_CONFIG_MODEL_TYPE", "").strip()
+    if not model_type or model_type in _REGISTERED_HF_CONFIG_TYPES:
+        return False
+
+    from transformers import AutoConfig, PretrainedConfig
+
+    config_cls = type(
+        "MLiteOpaqueConfig",
+        (PretrainedConfig,),
+        {"model_type": model_type},
+    )
+    try:
+        AutoConfig.register(model_type, config_cls)
+    except ValueError:
+        # A newer Transformers already owns this model type.
+        _REGISTERED_HF_CONFIG_TYPES.add(model_type)
+        return False
+    _REGISTERED_HF_CONFIG_TYPES.add(model_type)
+    return True
 
 
 class _VllmThinFinder(importlib.abc.MetaPathFinder):
@@ -484,6 +508,7 @@ def _patch_transformers_rope_ignore_keys() -> None:
 
 
 def apply_runtime_patches() -> None:
+    _register_opaque_hf_config()
     _install_vllm_thin_finder()
     _install_vllm_triton_kernels_alias()
     _patch_transformers_rope_ignore_keys()

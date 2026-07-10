@@ -4,6 +4,34 @@ from types import SimpleNamespace
 import torch
 
 
+def test_unknown_hf_model_type_is_registered_as_opaque_config(monkeypatch) -> None:
+    from verl_mlite import compat
+
+    registrations = []
+
+    class PretrainedConfig:
+        pass
+
+    class AutoConfig:
+        @classmethod
+        def register(cls, model_type, config_cls):
+            registrations.append((model_type, config_cls))
+
+    monkeypatch.setenv("VERL_MLITE_HF_CONFIG_MODEL_TYPE", "deepseek_v4")
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoConfig=AutoConfig, PretrainedConfig=PretrainedConfig),
+    )
+    monkeypatch.setattr(compat, "_REGISTERED_HF_CONFIG_TYPES", set())
+
+    assert compat._register_opaque_hf_config()
+    assert not compat._register_opaque_hf_config()
+    assert registrations[0][0] == "deepseek_v4"
+    assert issubclass(registrations[0][1], PretrainedConfig)
+    assert registrations[0][1].model_type == "deepseek_v4"
+
+
 def test_vllm_server_profile_isolated_to_ray_actor_options(monkeypatch) -> None:
     from verl_mlite.compat import _RayActorClassProfile, _vllm_server_profile_env
 

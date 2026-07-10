@@ -108,6 +108,7 @@ export PYTHONNOUSERSITE=1
 export RAY_raylet_start_wait_time_s="${RAY_RAYLET_START_WAIT_TIME_S:-180}"
 export VLLM_USE_V1=1
 export VERL_VLLM_FP8_QUANT_ENABLED=0
+export VERL_MLITE_HF_CONFIG_MODEL_TYPE=deepseek_v4
 export VERL_MLITE_VLLM_SITE="${DS4_VLLM_SITE}"
 export VERL_MLITE_VLLM_LD_PRELOAD="${DS4_VLLM_SHIM}"
 export LD_PRELOAD="${DS4_VLLM_SHIM}"
@@ -274,6 +275,7 @@ names = [
     "PYTHONNOUSERSITE",
     "VLLM_USE_V1",
     "VERL_VLLM_FP8_QUANT_ENABLED",
+    "VERL_MLITE_HF_CONFIG_MODEL_TYPE",
     "VERL_MLITE_VLLM_SITE",
     "VERL_MLITE_VLLM_LD_PRELOAD",
     "MLITE_SM90_SITE",
@@ -281,6 +283,7 @@ names = [
     "DS4_VLLM_SHIM",
     "MEGATRON_ROOT",
     "VERL_ROOT",
+    "CHECKPOINT_DIR",
     "HF_HOME",
     "HF_DATASETS_CACHE",
 ]
@@ -295,7 +298,7 @@ if [[ "${RAY_ONLY}" == "1" ]]; then
     --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
     -- \
-    python -c 'import os, ray, sys; assert os.environ["VERL_MLITE_SKIP_RUNTIME_PATCHES"] == "0"; assert "verl_mlite.compat" in sys.modules; ray.init(address="auto"); probe = ray.remote(num_gpus=1)(lambda: {name: os.environ.get(name) for name in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")}); visible = ray.get(probe.remote()); assert visible["CUDA_VISIBLE_DEVICES"], visible; assert not visible["HIP_VISIBLE_DEVICES"], visible; assert not visible["ROCR_VISIBLE_DEVICES"], visible; print("DS4_RAY_JOB_RUNTIME_ENV_PASSED", flush=True); print(f"DS4_RAY_GPU_ENV_PASSED {visible}", flush=True)'
+    python -c 'import os, ray, sys; from transformers import AutoConfig; assert os.environ["VERL_MLITE_SKIP_RUNTIME_PATCHES"] == "0"; assert "verl_mlite.compat" in sys.modules; hf_config = AutoConfig.from_pretrained(os.environ["CHECKPOINT_DIR"], trust_remote_code=True); assert hf_config.model_type == os.environ["VERL_MLITE_HF_CONFIG_MODEL_TYPE"]; print(f"DS4_RAY_HF_CONFIG_PASSED model_type={hf_config.model_type}", flush=True); ray.init(address="auto"); probe = ray.remote(num_gpus=1)(lambda: {name: os.environ.get(name) for name in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")}); visible = ray.get(probe.remote()); assert visible["CUDA_VISIBLE_DEVICES"], visible; assert not visible["HIP_VISIBLE_DEVICES"], visible; assert not visible["ROCR_VISIBLE_DEVICES"], visible; print("DS4_RAY_JOB_RUNTIME_ENV_PASSED", flush=True); print(f"DS4_RAY_GPU_ENV_PASSED {visible}", flush=True)'
   echo "DS4_RAY_CLUSTER_PASSED nodes=${SLURM_NNODES} source=${MLITE_COMMIT}"
   exit 0
 fi
