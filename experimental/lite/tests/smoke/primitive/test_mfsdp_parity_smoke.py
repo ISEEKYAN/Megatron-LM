@@ -19,7 +19,10 @@ from megatron.lite.primitive.optimizers.fsdp2 import (
 )
 from megatron.lite.primitive.optimizers.mfsdp import build_mfsdp_training_optimizer
 from megatron.lite.primitive.parallel import init_parallel
+from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
+from megatron.lite.runtime.contracts.data import PackedBatch
+from megatron.lite.runtime.contracts.handle import ModelHandle
 
 pytestmark = [
     pytest.mark.mlite,
@@ -37,6 +40,10 @@ _BENCH_WARMUP_STEPS = 5
 _BENCH_MEASURE_STEPS = 20
 _BENCH_TOKENS_PER_RANK = 1024
 _MIN_SPEEDUP = 1.0
+_FULL_PARALLEL_WORLD_SIZE = 16
+_FULL_PARALLEL_STEPS = 3
+_FULL_PARALLEL_MICROBATCHES = 2
+_FULL_PARALLEL_SEQ_LEN = 64
 
 
 class TinyUnit(nn.Module):
@@ -114,7 +121,7 @@ class BenchmarkModel(nn.Module):
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _single_node_cuda_dist():
+def _cuda_dist():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if not torch.cuda.is_available():
         if world_size > 1:
@@ -130,8 +137,10 @@ def _single_node_cuda_dist():
         pytest.skip(
             "M-FSDP sharding parity smoke requires at least 2 distributed ranks."
         )
-    if world_size > 8:
-        pytest.skip("Megatron Lite smoke tests are capped at single-node 8 GPUs.")
+    if world_size > _FULL_PARALLEL_WORLD_SIZE:
+        pytest.skip(
+            "M-FSDP smoke tests support at most the dedicated 16-rank full-parallel signoff."
+        )
 
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
@@ -146,6 +155,8 @@ def _single_node_cuda_dist():
         print(
             "[MFSDP_ENV] "
             f"torch={torch.__version__} "
+            f"world_size={world_size} "
+            f"slurm_nnodes={os.environ.get('SLURM_NNODES', '1')} "
             f"cuda_devices={torch.cuda.device_count()} "
             f"fsdp2_available={fsdp2_available()}",
             flush=True,
@@ -260,6 +271,49 @@ def _build_mfsdp_pair(
         fsdp_unit_modules=unit_modules,
     )
     return chunks, optimizer, finalize
+
+
+def _qualified_type(value: Any) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _optimizer_chain(optimizer: Any) -> tuple[str, ...]:
+    chain = []
+    seen = set()
+    current = optimizer
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(_qualified_type(current))
+        current = getattr(current, "_inner_optimizer", None) or getattr(
+            current, "optimizer", None
+        )
+    return tuple(chain)
+
+
+def _assert_distinct_backend_identities(
+    fsdp2_optimizer: Any, mfsdp_optimizer: Any
+) -> None:
+    fsdp2_chain = _optimizer_chain(fsdp2_optimizer)
+    mfsdp_chain = _optimizer_chain(mfsdp_optimizer)
+    assert fsdp2_chain[0].startswith("megatron.lite.primitive.optimizers.fsdp2."), (
+        fsdp2_chain
+    )
+    assert mfsdp_chain[0].startswith("megatron.lite.primitive.optimizers.mfsdp."), (
+        mfsdp_chain
+    )
+    assert fsdp2_chain[0] != mfsdp_chain[0]
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_BACKEND] "
+            f"configured=fsdp2 optimizer_chain={' > '.join(fsdp2_chain)}",
+            flush=True,
+        )
+        print(
+            "[MFSDP_BACKEND] "
+            f"configured=mfsdp optimizer_chain={' > '.join(mfsdp_chain)}",
+            flush=True,
+        )
 
 
 def _train_once(chunks, optimizer, finalize, x: torch.Tensor, target: torch.Tensor):
@@ -421,6 +475,7 @@ def test_mfsdp_precision_curve_matches_fsdp2():
     mfsdp_chunks, mfsdp_optimizer, mfsdp_finalize = _build_mfsdp_pair(
         seed=3456, parallel=parallel
     )
+    _assert_distinct_backend_identities(fsdp2_optimizer, mfsdp_optimizer)
 
     fsdp2_losses = []
     mfsdp_losses = []
@@ -489,6 +544,7 @@ def test_mfsdp_throughput_exceeds_fsdp2():
         model_type=BenchmarkModel,
         unit_modules=(BenchmarkUnit,),
     )
+    _assert_distinct_backend_identities(fsdp2_optimizer, mfsdp_optimizer)
 
     for step in range(_BENCH_WARMUP_STEPS):
         pairs = (
@@ -664,3 +720,298 @@ def test_mfsdp_matches_fsdp2_tp_ep_single_step():
             f"max_param_rel_diff={max_param_rel:.8e}",
             flush=True,
         )
+
+
+def _full_parallel_config() -> ParallelConfig:
+    return ParallelConfig(tp=2, ep=2, etp=1, pp=2, vpp=1, cp=2)
+
+
+def _tiny_qwen3_moe_config():
+    from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+
+    return Qwen3MoEConfig(
+        num_hidden_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        vocab_size=64,
+        num_experts=4,
+        num_experts_per_tok=1,
+        moe_intermediate_size=8,
+        max_position_embeddings=4096,
+        layer_types=["full_attention", "full_attention"],
+    )
+
+
+def _build_full_parallel_handle(backend: str, *, seed: int):
+    from megatron.lite.model.qwen3_moe.lite import protocol
+
+    parallel = _full_parallel_config()
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    impl_cfg = protocol.ImplConfig(
+        parallel=parallel,
+        optimizer=backend,
+        optimizer_config=_optimizer_cfg(),
+        use_deepep=False,
+        use_thd=True,
+        deterministic=True,
+    )
+    model_cfg = _tiny_qwen3_moe_config()
+    bundle = protocol.build_model(model_cfg, impl_cfg=impl_cfg)
+    initial_params = _named_model_tensors(bundle.chunks)
+    assert bundle.extras.get("optimizer_backend") == backend
+    post_load_hook = bundle.extras.get("post_model_load_hook")
+    assert callable(post_load_hook), (
+        f"{backend} did not expose its production post-load hook."
+    )
+    updates = post_load_hook()
+    assert isinstance(updates, dict)
+    optimizer = updates.get("optimizer", bundle.optimizer)
+    finalize_grads = updates.get("finalize_grads", bundle.finalize_grads)
+    assert optimizer is not None
+
+    extras = dict(bundle.extras)
+    extras.update(
+        {
+            "model_chunks": bundle.chunks,
+            "model_cfg": model_cfg,
+            "forward_step": bundle.forward_step,
+            "finalize_grads": finalize_grads,
+        }
+    )
+    handle = ModelHandle(
+        model=bundle.chunks,
+        optimizer=optimizer,
+        parallel_state=bundle.parallel_state,
+        config=SimpleNamespace(parallel=parallel),
+        _extras=extras,
+    )
+    return handle, initial_params
+
+
+def _fixed_packed_batches(vocab_size: int, *, seed: int) -> list[PackedBatch]:
+    batches = []
+    for microbatch in range(_FULL_PARALLEL_MICROBATCHES):
+        generator = torch.Generator(device="cuda").manual_seed(seed + microbatch)
+        batches.append(
+            PackedBatch(
+                input_ids=torch.randint(
+                    0,
+                    vocab_size,
+                    (_FULL_PARALLEL_SEQ_LEN,),
+                    device="cuda",
+                    generator=generator,
+                ),
+                labels=torch.randint(
+                    0,
+                    vocab_size,
+                    (_FULL_PARALLEL_SEQ_LEN,),
+                    device="cuda",
+                    generator=generator,
+                ),
+                seq_lens=torch.tensor(
+                    [_FULL_PARALLEL_SEQ_LEN], dtype=torch.int64, device="cuda"
+                ),
+            )
+        )
+    return batches
+
+
+_COMM_TOKENS = (
+    "all_gather",
+    "allgather",
+    "reduce_scatter",
+    "reducescatter",
+    "all_reduce",
+    "allreduce",
+    "all_to_all",
+    "alltoall",
+    "broadcast",
+    "send",
+    "recv",
+)
+
+
+def _collective_sequence(profiler) -> tuple[str, ...]:
+    sequence = []
+    for event in profiler.events():
+        name = str(event.name)
+        lowered = name.lower()
+        if lowered.startswith(("aten::", "autograd::")):
+            continue
+        if any(token in lowered for token in _COMM_TOKENS):
+            sequence.append(name)
+    return tuple(sequence)
+
+
+def _contains_collective(sequence: tuple[str, ...], *tokens: str) -> bool:
+    return any(any(token in name.lower() for token in tokens) for name in sequence)
+
+
+def _run_full_parallel_step(
+    handle: ModelHandle, *, batch_seed: int, profile_collectives: bool
+) -> tuple[float, float, tuple[str, ...]]:
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime.zero_grad(handle)
+    batches = _fixed_packed_batches(64, seed=batch_seed)
+    profiler = None
+    if profile_collectives:
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profiler:
+            result = runtime.forward_backward(
+                handle,
+                iter(batches),
+                None,
+                num_microbatches=_FULL_PARALLEL_MICROBATCHES,
+            )
+        torch.cuda.synchronize()
+    else:
+        result = runtime.forward_backward(
+            handle, iter(batches), None, num_microbatches=_FULL_PARALLEL_MICROBATCHES
+        )
+
+    success, grad_norm, _num_zeros = runtime.optimizer_step(handle)
+    assert success
+    loss = result.model_output.loss
+    assert loss is not None
+    sequence = _collective_sequence(profiler) if profiler is not None else ()
+    return float(loss.detach().float().cpu()), float(grad_norm), sequence
+
+
+def _max_snapshot_abs_diff(
+    lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]
+) -> float:
+    assert lhs.keys() == rhs.keys()
+    assert lhs
+    return max(float((lhs[name] - rhs[name]).abs().max()) for name in lhs)
+
+
+def test_mfsdp_matches_fsdp2_full_parallel_short_train(monkeypatch):
+    if dist.get_world_size() != _FULL_PARALLEL_WORLD_SIZE:
+        pytest.skip(
+            "M-FSDP TP2/EP2/PP2/CP2 signoff requires exactly 16 ranks across two nodes."
+        )
+
+    if int(os.environ.get("SLURM_NNODES", "0")) != 2:
+        pytest.fail("M-FSDP full-parallel signoff requires exactly two Slurm nodes.")
+
+    try:
+        import transformer_engine.pytorch as te
+    except (ImportError, OSError) as exc:
+        pytest.fail(
+            f"full-parallel M-FSDP signoff requires real Transformer Engine: {exc}"
+        )
+    assert hasattr(te, "Linear"), "full-parallel signoff requires real TE Linear."
+
+    from megatron.lite.model import protocol_utils
+
+    cp_splits = []
+    original_prepare_cp = protocol_utils.prepare_packed_thd_kwargs_for_context_parallel
+
+    def record_cp_split(model, kwargs):
+        full_tokens = int(kwargs["input_ids"].numel())
+        result = original_prepare_cp(model, kwargs)
+        local_tokens = int(kwargs["input_ids"].numel())
+        cp_splits.append((full_tokens, local_tokens))
+        return result
+
+    monkeypatch.setattr(
+        protocol_utils,
+        "prepare_packed_thd_kwargs_for_context_parallel",
+        record_cp_split,
+    )
+
+    fsdp2_handle, fsdp2_initial = _build_full_parallel_handle("fsdp2", seed=7345)
+    mfsdp_handle, mfsdp_initial = _build_full_parallel_handle("mfsdp", seed=7345)
+    _assert_distinct_backend_identities(
+        fsdp2_handle._optimizer, mfsdp_handle._optimizer
+    )
+
+    for handle in (fsdp2_handle, mfsdp_handle):
+        ps = handle._parallel_state
+        assert (ps.tp_size, ps.ep_size, ps.etp_size, ps.pp_size, ps.cp_size) == (
+            2,
+            2,
+            1,
+            2,
+            2,
+        )
+
+    initial_max_abs = torch.tensor(
+        _max_snapshot_abs_diff(fsdp2_initial, mfsdp_initial), device="cuda"
+    )
+    dist.all_reduce(initial_max_abs, op=dist.ReduceOp.MAX)
+    assert float(initial_max_abs) == 0.0
+
+    losses = {"fsdp2": [], "mfsdp": []}
+    grad_norms = {"fsdp2": [], "mfsdp": []}
+    traces = {}
+    for step in range(_FULL_PARALLEL_STEPS):
+        for backend, handle in (("fsdp2", fsdp2_handle), ("mfsdp", mfsdp_handle)):
+            dist.barrier()
+            loss, grad_norm, trace = _run_full_parallel_step(
+                handle, batch_seed=8345, profile_collectives=step == 0
+            )
+            losses[backend].append(loss)
+            grad_norms[backend].append(grad_norm)
+            if trace:
+                traces[backend] = trace
+
+    for backend in ("fsdp2", "mfsdp"):
+        trace = traces.get(backend, ())
+        assert trace, f"{backend} profiler recorded no distributed collectives."
+        assert _contains_collective(trace, "all_gather", "allgather")
+        assert _contains_collective(trace, "reduce_scatter", "reducescatter")
+
+    assert cp_splits
+    assert all(
+        full_tokens == 2 * local_tokens for full_tokens, local_tokens in cp_splits
+    )
+
+    max_loss_rel_diff = torch.tensor(
+        _max_relative_difference(losses["fsdp2"], losses["mfsdp"]), device="cuda"
+    )
+    max_grad_norm_rel_diff = torch.tensor(
+        _max_relative_difference(grad_norms["fsdp2"], grad_norms["mfsdp"]),
+        device="cuda",
+    )
+    dist.all_reduce(max_loss_rel_diff, op=dist.ReduceOp.MAX)
+    dist.all_reduce(max_grad_norm_rel_diff, op=dist.ReduceOp.MAX)
+
+    assert float(max_loss_rel_diff) <= _LOSS_REL_TOL
+    assert float(max_grad_norm_rel_diff) <= _LOSS_REL_TOL
+    assert losses["fsdp2"][-1] < losses["fsdp2"][0]
+    assert losses["mfsdp"][-1] < losses["mfsdp"][0]
+
+    if dist.get_rank() == 0:
+        ps = fsdp2_handle._parallel_state
+        print(
+            "[MFSDP_FULL_PARALLEL] "
+            "topology=tp2_ep2_etp1_pp2_cp2 "
+            f"world_size={dist.get_world_size()} "
+            f"dp_cp_size={ps.dp_cp_size} "
+            f"microbatches={_FULL_PARALLEL_MICROBATCHES} "
+            f"steps={_FULL_PARALLEL_STEPS} "
+            f"initial_max_abs_diff={float(initial_max_abs):.8e} "
+            f"max_loss_rel_diff={float(max_loss_rel_diff):.8e} "
+            f"max_grad_norm_rel_diff={float(max_grad_norm_rel_diff):.8e} "
+            f"fsdp2_losses={','.join(f'{value:.8f}' for value in losses['fsdp2'])} "
+            f"mfsdp_losses={','.join(f'{value:.8f}' for value in losses['mfsdp'])} "
+            f"cp_split={cp_splits[0][0]}->{cp_splits[0][1]} "
+            f"cp_split_calls={len(cp_splits)}",
+            flush=True,
+        )
+        for backend in ("fsdp2", "mfsdp"):
+            trace = traces[backend]
+            print(
+                "[MFSDP_COMM_TRACE] "
+                f"backend={backend} events={len(trace)} "
+                f"sequence={' > '.join(trace[:96])}",
+                flush=True,
+            )

@@ -485,6 +485,10 @@ class MegatronLiteRuntime(RuntimeBase):
             model_chunks = handle._extras.get("model_chunks", [handle._model])
             pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
             pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
+
+            def enable_optimizer_grad_sync() -> None:
+                handle._optimizer.grad_sync_enabled = True
+
             try:
                 outputs = forward_backward_pipelining(
                     pipeline_forward_step,
@@ -493,6 +497,9 @@ class MegatronLiteRuntime(RuntimeBase):
                     SimpleNamespace(num_microbatches=num_microbatches),
                     ps,
                     tensor_shape=tensor_shape,
+                    grad_sync_fn=(
+                        enable_optimizer_grad_sync if handle._optimizer is not None else None
+                    ),
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),
                     loss_fn=pipeline_loss_fn,
                     forward_only=forward_only,
