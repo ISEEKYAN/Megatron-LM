@@ -141,13 +141,17 @@ export TRITON_CACHE_DIR="${TMPDIR}/triton"
 export HF_HOME="${RUN_ROOT}/hf-cache"
 export HF_DATASETS_CACHE="${HF_HOME}/datasets"
 export VLLM_CACHE_ROOT="${RUN_ROOT}/vllm-cache"
+export TILELANG_CACHE_DIR="${RUN_ROOT}/tilelang-cache"
+export TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"
 unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
 mkdir -p \
   "${PYTHONPYCACHEPREFIX}" \
   "${TORCHINDUCTOR_CACHE_DIR}" \
   "${TRITON_CACHE_DIR}" \
   "${HF_DATASETS_CACHE}" \
-  "${VLLM_CACHE_ROOT}"
+  "${VLLM_CACHE_ROOT}" \
+  "${TILELANG_CACHE_DIR}" \
+  "${TILELANG_TMP_DIR}"
 
 if [[ "${IMPORT_ONLY}" == "1" ]]; then
   env \
@@ -281,9 +285,14 @@ if missing:
     raise SystemExit(f"resolved DS4 GRPO config is missing markers: {missing}")
 if "custom_chat_template: null" in config:
     raise SystemExit("resolved DS4 GRPO config has no chat template")
-cache_root = os.environ["VLLM_CACHE_ROOT"]
-if not os.path.isdir(cache_root):
-    raise SystemExit(f"vLLM cache root was not created: {cache_root}")
+cache_roots = {
+    "vLLM": os.environ["VLLM_CACHE_ROOT"],
+    "TileLang": os.environ["TILELANG_CACHE_DIR"],
+    "TileLang tmp": os.environ["TILELANG_TMP_DIR"],
+}
+for cache_name, cache_root in cache_roots.items():
+    if not os.path.isdir(cache_root):
+        raise SystemExit(f"{cache_name} cache root was not created: {cache_root}")
 for forbidden in (
     "Error in sitecustomize",
     "Failed to import Triton kernels",
@@ -292,7 +301,7 @@ for forbidden in (
     if forbidden in config:
         raise SystemExit(f"resolved DS4 GRPO config contains initialization error: {forbidden}")
 PY
-    echo "DS4_GRPO_CONFIG_COMPOSE_PASSED source=${MLITE_COMMIT} vllm_cache_root=${VLLM_CACHE_ROOT}"
+    echo "DS4_GRPO_CONFIG_COMPOSE_PASSED source=${MLITE_COMMIT} vllm_cache_root=${VLLM_CACHE_ROOT} tilelang_cache_dir=${TILELANG_CACHE_DIR}"
   fi
   exit 0
 fi
@@ -387,6 +396,8 @@ names = [
     "VLLM_DEEP_GEMM_WARMUP",
     "PYTORCH_CUDA_ALLOC_CONF",
     "VLLM_CACHE_ROOT",
+    "TILELANG_CACHE_DIR",
+    "TILELANG_TMP_DIR",
     "VERL_VLLM_FP8_QUANT_ENABLED",
     "VERL_MLITE_HF_CONFIG_MODEL_TYPE",
     "VERL_MLITE_VLLM_SITE",

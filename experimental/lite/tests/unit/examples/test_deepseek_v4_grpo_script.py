@@ -194,6 +194,7 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert '"gpu_memory_utilization: 0.6"' in script
     assert "os.path.isdir(cache_root)" in script
     assert "vllm_cache_root=${VLLM_CACHE_ROOT}" in script
+    assert "tilelang_cache_dir=${TILELANG_CACHE_DIR}" in script
     assert '"use_legacy_worker_impl: disable"' in script
     assert '"custom_chat_template: null"' in script
     assert '"<｜User｜>"' in script
@@ -239,12 +240,16 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert ':${DS4_VLLM_SITE}:' in script
     assert 'export LD_PRELOAD="${DS4_VLLM_SHIM}"' in script
     assert 'export VLLM_CACHE_ROOT="${RUN_ROOT}/vllm-cache"' in script
+    assert 'export TILELANG_CACHE_DIR="${RUN_ROOT}/tilelang-cache"' in script
+    assert 'export TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"' in script
     assert 'export VLLM_WORKER_MULTIPROC_METHOD="spawn"' in script
     assert 'export VLLM_DEEP_GEMM_WARMUP="skip"' in script
     assert 'export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"' in script
     assert '"${VLLM_CACHE_ROOT}"' in script
     for name in (
         "VLLM_CACHE_ROOT",
+        "TILELANG_CACHE_DIR",
+        "TILELANG_TMP_DIR",
         "VLLM_WORKER_MULTIPROC_METHOD",
         "VLLM_DEEP_GEMM_WARMUP",
         "PYTORCH_CUDA_ALLOC_CONF",
