@@ -36,7 +36,7 @@ case "${MODE}" in
       echo "te-proxy mode requires NNODES=1 and NPROC_PER_NODE=8." >&2
       exit 2
     fi
-    TEST_EXPR="transformer_engine_benchmark_false_double_buffer"
+    TEST_EXPR="transformer_engine_benchmark_double_buffer_modes"
     ;;
   *)
     echo "usage: $0 {throughput|full-parallel|te-proxy}" >&2

@@ -620,16 +620,21 @@ def test_mfsdp_transformer_engine_rmsnorm_backward():
         print("[MFSDP_TE_RMSNORM] backward=passed", flush=True)
 
 
-def test_mfsdp_transformer_engine_benchmark_false_double_buffer():
+@pytest.mark.parametrize("fsdp_double_buffer", [False, True])
+def test_mfsdp_transformer_engine_benchmark_double_buffer_modes(
+    fsdp_double_buffer: bool,
+):
     parallel = _dense_parallel_config()
     chunks, optimizer, finalize = _build_mfsdp_pair(
         seed=3211,
         parallel=parallel,
         model_type=TransformerEngineBenchmarkModel,
         unit_modules=(TransformerEngineBenchmarkUnit,),
-        mfsdp_overrides={"fsdp_double_buffer": False},
+        mfsdp_overrides={"fsdp_double_buffer": fsdp_double_buffer},
     )
-    assert all(not chunk.mfsdp_config.fsdp_double_buffer for chunk in chunks)
+    assert all(
+        chunk.mfsdp_config.fsdp_double_buffer is fsdp_double_buffer for chunk in chunks
+    )
     x = torch.randn(
         64,
         TransformerEngineBenchmarkModel.hidden_size,
@@ -653,7 +658,7 @@ def test_mfsdp_transformer_engine_benchmark_false_double_buffer():
         print(
             "[MFSDP_TE_PROXY] "
             "benchmark_unit=true te_linear=true te_rmsnorm=true "
-            "fsdp_double_buffer=false "
+            f"fsdp_double_buffer={str(fsdp_double_buffer).lower()} "
             f"loss={loss:.8f} grad_norm={grad_norm:.8f} "
             f"peak_memory_gib={float(peak_memory_gib):.4f}",
             flush=True,
