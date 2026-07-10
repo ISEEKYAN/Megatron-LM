@@ -5,26 +5,33 @@ performance claim. The research was completed without running GPU code. Public
 references and repository state were observed on 2026-07-10.
 
 Code snapshots used for the source reading are mLoRA `89aa53fb`, PEFT
-`79f4c362`, Punica `591b5989`, vLLM `c227aaa3`, and LoRAFusion `c48d7fdb`.
+`79f4c362`, Punica `591b5989`, vLLM `c227aaa3`, SkyRL `ccc181e2`, and
+LoRAFusion `c48d7fdb`. The MLite PR references were read on 2026-07-10 and
+are open, stacked proposals rather than behavior available in this checkout.
 
 ## Decision Summary
 
-Multi-LoRA training should be an additive, model-neutral extension of MLite's
-existing LoRA primitives. One frozen base model executes a fused input batch;
-each sequence selects exactly one independently trainable adapter. The first
-implementation should preserve the following properties:
+"Multi-LoRA training" has two independent axes that must not share one vague
+flag: multi-tenant lifecycle management and mixed-adapter batch execution.
+MLite should first add a time-sliced tenant store around the existing
+single-LoRA training path, plus named-adapter passthrough to a multi-LoRA vLLM
+rollout pool. A later adapter-bank primitive may execute a fused training batch
+where each sequence selects one adapter. Both profiles preserve the following
+properties:
 
 - Existing single-LoRA configuration and checkpoint behavior remain valid.
-- Adapter selection is explicit batch metadata. It is not process-global
-  mutable state and is not inferred from model names, dataset names, or parameter
-  names.
+- Tenant selection is an explicit runtime call in the time-sliced profile and
+  explicit batch metadata in the mixed-batch profile. It is never inferred
+  from model names, dataset names, or parameter names.
 - The eager implementation is the correctness reference. A future fused kernel
   implements the same primitive contract and retains an unfused fallback.
-- Losses are normalized per adapter before being summed. Merely averaging over
-  the fused batch would change each independent job's effective gradient scale.
+- Mixed-batch losses are normalized per adapter before being summed. Merely
+  averaging over the fused batch would change each independent job's effective
+  gradient scale. The time-sliced profile reuses the isolated single-adapter
+  loss unchanged.
 - All adapters in the first closed profile use the same rank, targets, dtype,
-  dropout, optimizer configuration, and step cadence. Heterogeneous jobs are a
-  later scheduling feature, not an implicit extension of the first API.
+  dropout, optimizer algorithm, and parallel layout, but own their optimizer
+  and step state. Heterogeneous shapes are a later scheduling feature.
 - Model code only selects and composes primitives. Adapter storage, routing,
   gradient isolation, and execution backends belong below the model layer.
 - MoE dispatch may carry a generic token sidecar, but the dispatcher must not
@@ -34,42 +41,48 @@ implementation should preserve the following properties:
   and incompatible adapter configurations fail before forward. Silent routing
   to the base model or to adapter zero is forbidden.
 
-The recommended first production profile is:
+The recommended first production profile is deliberately the smaller
+SkyRL-style lifecycle profile:
 
 ```text
 one frozen Qwen3-MoE base
-+ K statically declared LoRA adapters
-+ one adapter per sequence
-+ homogeneous rank/targets/dropout/dtype
-+ every adapter steps once per fused global step
-+ eager segmented execution
++ K registered tenant slots in pinned CPU memory
++ exactly one live GPU adapter during a training call
++ independent gradient, FP32 master, optimizer, and step state per tenant
++ homogeneous rank/targets/dropout/dtype and parallel layout
++ named adapter revisions sent to a multi-LoRA vLLM rollout pool
 + attention projections first
 ```
 
-The first distributed expansion should add MoE expert targets through generic
-routing sidecars, then TP/SP, PP/VPP, THD/CP, and optimizer backends under
-separate validation gates. Dynamic adapter loading, weighted adapter mixtures,
-heterogeneous ranks, independent per-adapter clocks, and a fused kernel are not
-part of the first delivery.
+This profile gains multi-tenant experiment throughput without claiming fused
+training: training remains one adapter at a time. A second profile can add a
+static in-GPU adapter bank, per-sequence routing, per-adapter loss normalization,
+and eventually a fused kernel. Weighted adapter mixtures and heterogeneous
+ranks remain out of scope for both initial profiles.
 
 ## Scope and Terminology
 
 "Multi-LoRA training" is overloaded in the ecosystem. This proposal uses it to
-mean **concurrent training of independent adapters that share a frozen base
-model**. If sequence `s` selects adapter `k(s)`, a linear surface computes:
+mean **concurrent lifecycle management of independently trained adapters that
+share a frozen base model**. It distinguishes two execution modes:
+
+- **time-sliced training** swaps a complete tenant state into one stable live
+  adapter and invokes the existing single-LoRA path; and
+- **mixed-batch training** keeps a bank live and routes each sequence to one
+  adapter. If sequence `s` selects adapter `k(s)`, a linear surface computes:
 
 ```text
 Y_s = X_s W^T + scale[k(s)] * dropout(X_s) A[k(s)]^T B[k(s)]^T
 ```
 
 `W` is shared and frozen. Each pair `A[k], B[k]` is independently trainable.
-The proposal does not mean:
+Neither mode means:
 
 - activating and summing several adapters for one token;
 - learning a router over LoRA experts, as in mixture-of-adapter methods;
 - merging adapters into the base weights;
-- switching one process-wide active adapter between sequential jobs; or
-- serving many already-trained adapters.
+- mutating an untracked process-global active adapter; or
+- treating multi-LoRA serving as proof that training backward is correct.
 
 Those are distinct semantics and should not be hidden behind the same config
 keys. Serving systems are useful kernel and slot-management references, but
@@ -121,33 +134,63 @@ isolated-job reference. This equivalence additionally requires the frozen-base
 forward to be sequence-separable. Batch-level MoE capacity, token dropping, or
 auxiliary losses can couple jobs and need their own declared semantics.
 
-MLite currently creates one optimizer for the model bundle. This can support a
-homogeneous first profile where every adapter steps together. It does not yet
-represent independent learning rates, schedulers, accumulation windows, or
-completion times.
+MLite currently creates one optimizer for the model bundle. That can support a
+homogeneous mixed-batch bank where every adapter steps together. The selected
+time-sliced profile instead has to snapshot and restore all optimizer and clock
+state; MLite does not yet expose that tenant lifecycle contract.
 
 ### Adapter I/O path
 
 [`model/qwen3_moe/lite/lora_adapter.py`][mlite-lora-io] maps one native adapter
 to and from a PEFT-style checkpoint. It correctly owns Qwen-specific name and
 shape conversion, but it currently assumes one adapter configuration and has
-explicit PP/ETP export limits. A bank must orchestrate multiple calls to this
-model-owned mapping; the generic LoRA primitive must not learn Qwen checkpoint
-names.
+explicit PP/ETP export limits. A tenant store or bank must orchestrate multiple
+calls to this model-owned mapping; the generic LoRA primitive must not learn
+Qwen checkpoint names.
+
+### Adjacent MLite LoRA proposals
+
+Three open, stacked MLite PRs define constraints that a multi-tenant design
+must preserve. They are design inputs, not current-main capabilities:
+
+- [PR #73][mlite-pr-73] adds OLoRA-tail initialization. It derives low-rank
+  factors from a minor singular subspace, subtracts the initial LoRA delta from
+  the frozen base, and broadcasts factors before sharding so all ranks share
+  one residual write-back. The important multi-tenant consequence is that the
+  in-memory base may no longer equal the rollout engine's canonical base.
+- [PR #75][mlite-pr-75] adds dense merged-weight rollout sync. It materializes
+  `base + scale * B @ A`, including DTensor materialization, and automatically
+  selects this path when LoRA is active. This fixes single-tenant policy sync,
+  but updating a shared vLLM base with one tenant's merged weights would clobber
+  every other tenant.
+- [PR #78][mlite-pr-78] extends `merge_lora` to generic MoE export with local
+  grouped and shared expert deltas, while excluding adapter-only tensors from
+  the ordinary HF stream. It establishes the expert mapping required for
+  merged fallback, not a named-adapter multi-tenant transport.
+
+Therefore rollout export needs two explicit contracts. `merged_weights` keeps
+the #75/#78 single-tenant path. `named_adapter_revision` sends a PEFT-style
+delta relative to a declared canonical base and is the only first-profile path
+that can coexist in one vLLM multi-LoRA pool. OLoRA-tail cannot silently use the
+latter: `W0 - D0 + Dt` is not the ordinary rank-`r` delta `Dt` relative to
+`W0`. Until a checked conversion or a shared residual-shifted base deployment
+exists, OLoRA-tail plus concurrent named-adapter rollout must fail loudly.
 
 ### Existing gaps that Multi-LoRA exposes
 
-The current single-adapter path leaves five design gaps that should be fixed or
+The current single-adapter path leaves six design gaps that should be fixed or
 made explicit during implementation:
 
-1. `freeze_non_lora_params` classifies parameters by substrings. A bank should
-   expose its trainable parameters structurally instead of teaching generic
+1. `freeze_non_lora_params` classifies parameters by substrings. Runtime stores
+   and banks should enumerate state structurally instead of teaching generic
    optimizer code a larger naming convention.
 2. Adapter identity is absent from the typed forward path.
 3. The loss path has no per-adapter denominator or metrics.
 4. Expert token permutation does not carry arbitrary sidecar metadata.
 5. Adapter save/load has no bank manifest, stable slot identity, or optimizer
    state ownership per adapter.
+6. Rollout export does not distinguish a tenant-safe named adapter revision
+   from a merged full-policy update that mutates the shared serving base.
 
 ## Reference Survey
 
@@ -156,11 +199,13 @@ must be separated by responsibility.
 
 | Reference | What is reusable | What is not evidence for MLite |
 | --- | --- | --- |
+| Trajectory C-LoRA / SkyRL | Warm multi-tenant service split: vLLM mixes named adapters during inference while training time-slices one live adapter; pinned-CPU `AdapterStore` isolates parameters, gradients, FP32 masters, optimizer moments, and step counters. | It does not fuse multiple adapters in one training forward/backward, and its store is coupled to Megatron DDP/DistributedOptimizer internals. |
+| Mind Lab MinT | Treat a versioned adapter revision plus base identity as the durable policy unit; separate catalog, CPU, and GPU working sets; move adapter-only revisions through train, rollout, evaluation, serving, and rollback. | Its scale and throughput results do not establish MLite compatibility, and adapter-only handoff requires an identical canonical base. |
 | Megatron Bridge LoRA | Megatron target naming, module matching, single-adapter training structure, and the rule that PEFT is configured separately from the base architecture. | It exposes one PEFT configuration, not mixed-adapter batch training. |
 | Hugging Face PEFT | Adapter-name keyed parameter banks and a clear mixed-batch eager decomposition into per-adapter sub-batches. | Its documentation states that mixed-adapter batches are inference-only. It is not a training reference. |
 | mLoRA | A real training reference: one shared base, contiguous per-adapter batch ranges, custom autograd, isolated A/B gradients, and multiple training tasks. | Its Python loop and global FP32 adapter policy do not establish Megatron TP/PP/EP correctness. |
 | ASPEN / BatchFusion | Fusing job batches over one frozen base and treating scheduling as separate from adapter math. | Reported performance does not transfer to MLite models, hardware, or distributed layouts. |
-| Punica and S-LoRA | Segment/slot metadata, grouped low-rank operations, heterogeneous adapter batching, and avoiding base-weight duplication. | They are serving systems. Punica's SGMV path has no training backward contract. |
+| Punica and S-LoRA | Two useful layouts: BGMV selects a stacked weight bank per row; SGMV uses contiguous segment offsets plus weight pointers. Both avoid base-weight duplication. | They are serving systems. Punica's SGMV/BGMV paths have no training backward, optimizer, or dropout contract. |
 | vLLM | Stable adapter IDs, active slots, mapping tensors, capacity limits, and explicit MoE adapter layouts. | Its model manager and kernels target serving, caching, and request scheduling. |
 | LoRAFusion | Training-specific graph splitting: retain high-performance GEMMs and fuse memory-bound operations around LoRA forward/backward; adaptive multi-job microbatching is separate from the kernel. | Its speedups require fresh MLite measurement and precision evidence. |
 | tLoRA | A useful future model for heterogeneous ranks, nano-batches, shared-super-model planning, and per-job progress constraints. | It is a 2026 research design, not a settled MLite or Megatron interface. |
@@ -183,7 +228,65 @@ Both reinforce the proposed data representation, while LoRAFusion is the more
 relevant source for a later training kernel because it covers forward/backward
 memory traffic rather than only serving-time matrix-vector operations.
 
-## Primitive Principle and Invariants
+### C-LoRA and the fixed SkyRL implementation
+
+Trajectory's C-LoRA report and its linked SkyRL commit `ccc181e2` are the
+closest reference for the first lifecycle profile. vLLM keeps all active LoRAs
+resident and mixes their decode tokens in one inference batch. Training is
+different: exactly one adapter is live, one tenant runs a
+`forward_backward`, and the next tenant is swapped in.
+
+The report attributes a 2.81x improvement in final completion time for eight
+experiments to the warm, cross-job system, while first-experiment time and
+per-step latency become worse. Those source-reported results motivate measuring
+throughput and latency separately; they are not performance evidence for MLite.
+
+SkyRL's [`AdapterStore`][skyrl-adapter-store] snapshots the live adapter's DDP
+parameter and gradient buffers, FP32 master parameters, per-parameter optimizer
+state, and optimizer param-group scalar state into pinned CPU tensors. The last
+item matters because a shared Adam `step` would corrupt bias correction across
+tenants. A homogeneous signature covers rank, alpha, targets, adapter type, and
+TP/PP/EP sizes; DP barriers bracket copies into stable live tensors. Its
+[end-to-end tests][skyrl-multi-lora-test] interleave two clients and check
+training, optimizer-clock, deletion, weight-sync, and sampling isolation.
+
+MLite should borrow the state inventory, immutable signature, stable live
+buffers, barriers, and isolation tests. It should not copy SkyRL's substring
+test for parameter ownership or import Megatron DDP internals into a generic
+primitive. Each optimizer backend must expose a structural tenant-state
+adapter, and an unsupported backend must reject registration.
+
+### Mind Lab candidate resolution: MinT
+
+The relevant Mind Lab source found for this study is the May 2026
+[MinT paper][mint-paper]. MinT keeps expensive base deployments resident and
+moves versioned LoRA adapter revisions through rollout, update, export,
+evaluation, serving, and rollback. Its most useful abstraction for MLite is not
+the reported scale; it is the separation of durable policy addressability from
+bounded CPU/GPU working sets.
+
+MLite can borrow an identity tuple such as `(base_digest, adapter_name,
+revision)` and keep catalog, training residency, and rollout residency separate.
+The MinT adapter-only handoff is not universally valid: PR #73's residual base
+write-back is a concrete counterexample unless conversion or base identity
+accounts for it. This report therefore treats MinT as a control-plane and
+revision-format reference, not as precision evidence.
+
+### Punica BGMV versus SGMV
+
+Punica's [`bgmv` interface][punica-ops] stores a homogeneous bank in one tensor
+and selects `weights[adapter_id[i], layer]` for each row. Its LoRA helper invokes
+the kernel twice with a rank-sized temporary. This layout is attractive for a
+static, homogeneous MLite bank and fixed-capacity CUDA Graph buffers.
+
+Punica's SGMV interface instead accepts contiguous segment offsets and a
+pointer per segment. It matches MLite's proposed `AdapterSegments` and can
+represent separately allocated adapters, but pointer lifetime, repeated-slot
+gradient accumulation, and capture stability are harder. Neither Punica path
+has a training backward; MLite needs independent `dX`, `dA`, and `dB` evidence
+before either name can describe a training backend.
+
+## Candidate B Primitive Principle and Invariants
 
 The proposed primitive is an **adapter bank plus an explicit selection**. Its
 principle is:
@@ -205,9 +308,10 @@ The following invariants are required before choosing implementation details.
   packing, CP slicing, SP gather/scatter, PP handoff, and MoE permutation.
 - Selection metadata never requires gradients and never contributes to the
   checkpointed trainable state.
-- The first profile requires homogeneous rank and targets so adapter tensors can
-  share one shape contract. Later heterogeneous ranks use explicit offsets or
-  rank buckets, never padding hidden behind configuration normalization.
+- The first bank profile requires homogeneous rank and targets so adapter
+  tensors can share one shape contract. Later heterogeneous ranks use explicit
+  offsets or rank buckets, never padding hidden behind configuration
+  normalization.
 
 ### Forward and backward invariants
 
@@ -222,8 +326,8 @@ The following invariants are required before choosing implementation details.
   participation requires it; it must not leave an ambiguous `None` gradient
   that causes rank-dependent optimizer or reduction behavior.
 - Per-adapter loss normalization matches isolated training. Gradient clipping
-  semantics are declared: the first profile may clip the joint bank globally,
-  but must not claim equivalence to independently clipped jobs.
+  semantics are declared: the first bank profile may clip the joint bank
+  globally, but must not claim equivalence to independently clipped jobs.
 - Replica loss scaling matches the gradient collective. For example, if DDP
   averages gradients across `D` replicas, rank `r` contributes
   `D * local_loss_sum[k] / global_valid_tokens[k]`; the subsequent average then
@@ -234,14 +338,70 @@ The following invariants are required before choosing implementation details.
 - Adapter names are user-facing identities; integer slots are execution details.
 - Slot assignment is deterministic from a saved manifest and identical on all
   participating ranks.
-- All adapters are registered before DDP/FSDP wrapping, optimizer construction,
-  CUDA Graph capture, and checkpoint restore in the first profile.
+- Candidate B registers all bank parameters before DDP/FSDP wrapping, optimizer
+  construction, CUDA Graph capture, and checkpoint restore. Candidate A creates
+  one live adapter before wrapping and later slots only copy state with the same
+  immutable signature; it never inserts new parameters.
 - Base parameters remain frozen and are stored once.
 - Optimizer and scheduler state ownership is explicit. A synchronized optimizer
   is one profile; independent optimizer clocks are a different runtime profile.
 - Eager execution remains independently callable after a fused backend is added.
 
-## Proposed Public and Internal Interfaces
+## Candidate APIs and Decision
+
+The design was evaluated as three API shapes rather than treating the first
+plausible interface as settled.
+
+| Candidate | Public shape | Strengths | Costs and decision |
+| --- | --- | --- | --- |
+| A. Tenant handles over a time-sliced store | `runtime.create_adapter(spec) -> AdapterHandle`; every `forward_backward`, `optim_step`, save, and sample call is made through that handle. | Smallest change; reuses the complete single-LoRA forward; preserves independent clocks; maps directly to SkyRL and named vLLM adapters. | Selected first. Swap cost must be measured, and each optimizer backend needs an explicit state adapter. It is multi-tenant training, not fused training. |
+| B. Static adapter bank plus batch route | `MultiLoraConfig` declares all slots and `AdapterBatchRoute` selects one slot per sequence. | Shares the base forward across tenants and supplies the eager reference/ABI for a future grouped or fused kernel. | Second profile. It expands loss, MoE sidecar, distributed unused-gradient, checkpoint, and scheduling contracts at once. |
+| C. General pluggable `AdapterProvider` | A provider callback resolves arbitrary adapter state during every layer forward. | Could hide stores, banks, paging, and kernels behind one nominal interface. | Rejected. It puts lifecycle policy on the hot primitive path, obscures static registration and graph capture, and creates an abstraction before two working backends exist. |
+
+### Candidate A: explicit tenant handles
+
+The user-facing runtime should bind every operation to a stable identity rather
+than exposing a mutable `set_active_adapter()` call:
+
+```python
+@dataclass(frozen=True)
+class LoraTenantSpec:
+    name: str
+    lora: LoraConfig
+    optimizer: OptimizerConfig
+
+
+@dataclass(frozen=True)
+class AdapterRevision:
+    base_digest: str
+    adapter_name: str
+    revision: int
+    format: Literal["named_adapter_revision", "merged_weights"]
+
+
+class AdapterHandle:
+    def forward_backward(self, batch: PackedBatch) -> ModelOutput: ...
+    def optim_step(self) -> OptimizerResult: ...
+    def save(self, path: Path) -> AdapterRevision: ...
+    def export_for_rollout(self, mode: str) -> AdapterRevision: ...
+```
+
+`AdapterHandle` delegates to the runtime, which verifies its tenant ID, swaps
+that tenant into stable live tensors if necessary, and then invokes the current
+single-LoRA protocol. Forward code never reads a process-global active ID.
+Create/delete/swap are runtime lifecycle operations; LoRA math remains a
+primitive and model-specific PEFT mapping remains in the model composition
+layer.
+
+The internal `AdapterStore` owns a backend-neutral slot manifest and delegates
+actual tensor enumeration to a narrow optimizer-backend state codec. The codec
+must enumerate adapter parameters structurally and include gradients, FP32
+masters, moments, scalar counters, and scheduler/accumulation state. FSDP2,
+`dist_opt`, mFSDP, or Muon are accepted only when their codec and isolation test
+exist. This prevents a generic store from importing model names or guessing
+state from parameter substrings.
+
+### Candidate B: static mixed-batch bank
 
 The user configuration should distinguish one adapter from a bank without
 turning every existing model config into an adapter scheduler.
@@ -276,6 +436,10 @@ The exact names are provisional, but the distinctions are not:
 - `execution` selects an implementation of the same primitive. `fused_required`
   fails if unavailable; it does not silently fall back and invalidate a
   performance experiment.
+
+Candidate B is not required to ship Candidate A. It becomes admissible only
+after the tenant-store path has an isolated correctness baseline and profiling
+shows training-side base sharing is worth the larger composition surface.
 
 ### Batch route
 
@@ -349,8 +513,8 @@ must not silently change the backward scalar.
 
 ### Optimizer contract
 
-For the first profile, one optimizer owns all adapter parameters and steps all
-of them together. Construction receives structurally enumerated trainable
+For Candidate B's first bank profile, one optimizer owns all adapter parameters
+and steps all of them together. Construction receives structurally enumerated trainable
 parameters from the banks. The optimizer primitive remains unaware of Qwen or
 adapter names.
 
@@ -360,7 +524,46 @@ That cannot be emulated safely by setting absent gradients to `None` inside one
 ordinary optimizer: weight decay, momentum clocks, gradient clipping, and
 scheduler progress would still differ from isolated jobs.
 
+### Rollout control plane
+
+Candidate A should pass adapter revisions through the existing application
+boundary rather than merge rollout policy into the LoRA primitive:
+
+```text
+AdapterHandle.export_for_rollout("named_adapter_revision")
+  -> {base_digest, adapter_name, revision, PEFT tensors}
+  -> rollout.load_lora_adapter(adapter_name, revision_path)
+  -> rollout.generate(..., model=adapter_name)
+```
+
+The serving pool predeclares `max_loras`, `max_cpu_loras`, rank, and base
+identity. A monotonic revision prevents stale updates from overwriting a newer
+tenant. Reloading tenant A must preserve in-flight or subsequent generation for
+tenant B; SkyRL's [serving tests][skyrl-serving-test] provide the relevant
+control-plane shape, though MLite still needs its own integration evidence.
+
+`merged_weights` remains an explicit single-tenant fallback implemented by the
+#75/#78 export path. It pauses or otherwise synchronizes the full-base update
+under the existing rollout contract and cannot share one mutable base with
+other named tenants. The API must never auto-switch between full merged sync
+and adapter-only sync based only on `rank > 0`, because OLoRA-tail/base identity
+and multi-tenant safety require an explicit reviewed choice.
+
 ## End-to-End Data Flow
+
+Candidate A's first-profile flow is:
+
+```text
+tenant request -> AdapterHandle
+  -> runtime verifies signature and revision
+  -> AdapterStore snapshots current live state and restores requested slot
+  -> existing single-LoRA build/forward/backward/optimizer step
+  -> updated tenant state is snapshotted on the next switch or save
+  -> named adapter revision is exported relative to the declared rollout base
+  -> vLLM loads/reloads that name and generate(model=name) selects it
+```
+
+Candidate B's later mixed-batch flow is:
 
 ```text
 dataset/collator
@@ -388,13 +591,14 @@ an expected change surface, not permission to modify all files in one patch.
 
 | Layer | Expected files | Responsibility |
 | --- | --- | --- |
+| Runtime tenant lifecycle | `runtime/` contracts and the selected backend adapter | Explicit handles, create/delete/swap, stable live buffers, slot manifest, and backend state codec; no model-name knowledge. |
 | Primitive contract | `primitive/modules/lora.py` plus focused helper/module files if needed | Config union, bank, route validation, eager segmented forward/backward, structural trainable-parameter enumeration. |
 | Generic MoE routing | `primitive/modules/dispatcher.py` and dispatcher utilities | Optional sidecar permutation/all-to-all/combine with no LoRA-specific branch or names. |
 | Attention/expert composition | `primitive/modules/gqa.py`, `primitive/modules/experts.py` | Select single adapter versus bank; pass compiled routing explicitly. |
 | Model protocol | `model/qwen3_moe/lite/model.py`, `protocol.py` | Extract typed route, compose banks, normalize per-adapter loss, expose manifest hooks. |
 | Adapter I/O | `model/qwen3_moe/lite/lora_adapter.py` | Reuse one-adapter PEFT mapping per named slot; preserve model-specific tensor mapping. |
 | Runtime optimizer boundary | optimizer adapters only if required by evidence | Ensure static registration, zero-gradient/collective behavior, and state ownership without model lists. |
-| Application adapters | VERL/Miles/bench only in follow-up patches | Populate route metadata and synchronize/export named adapters through stable protocol APIs. |
+| Application adapters | VERL/Miles/bench only in follow-up patches | Carry tenant identity; load/reload a named vLLM adapter and generate with `model=name`; retain explicit single-tenant merged-weight sync. |
 | Validation | unit primitive/model/runtime tests, then committed distributed smoke scripts | Isolated reference parity, integration, parallel composition, checkpoint round-trip, and later performance. |
 
 Two tempting changes are explicitly rejected:
@@ -408,28 +612,29 @@ Two tempting changes are explicitly rejected:
 
 "Compatible" below means the proposed contract has a path to preserve the
 feature. It is not a claim that current MLite already supports the combination.
-Every row needs its own implementation evidence.
+Every row needs its own implementation evidence. "Store" refers to Candidate A
+and "bank" to Candidate B; support in one does not imply support in the other.
 
-| Feature | Contract and required work | First profile |
+| Feature | Contract and required work | Initial disposition |
 | --- | --- | --- |
-| Single LoRA | Normalize the legacy config to one bank slot internally or keep the current direct fast path; prove output, gradients, and PEFT I/O unchanged. | Required regression gate. |
-| TP + SP | Reuse each current `LinearLoRA` sharding rule. Segment metadata must describe the gathered logical sequence order; it is replicated control data, not independently sharded adapter state. | Follow-up distributed gate. |
-| DP | All ranks must register identical banks. Either require the same active slot set per synchronized step or materialize zero grads before collectives; reduce each adapter denominator consistently. | Restricted homogeneous active set. |
-| PP/VPP | Pass route metadata to every stage and keep deterministic slot identity across chunks. Interleaved stages forbid global active-adapter state. Bank manifests aggregate stage-local parameters. | PP=1 initially. |
-| EP/ETP + MoE | Adapter IDs must follow token duplication, expert permutation, all-to-all/DeepEP dispatch, padding, and local expert regrouping. Add a generic dispatcher sidecar rather than LoRA-aware dispatcher code. | Attention targets only initially. |
-| THD sequence packing | Public route stays per sequence; compile token segments from `seq_lens/cu_seqlens` after sequence grouping. Padding and loss masks never create adapter tokens. | Supported by design after CPU route tests. |
-| Static CP | Derive each CP rank's local token/segment view with the same zigzag/layout transform as activations and labels. Adapter identity is constant across all shards of one sequence. | CP=1 initially. |
+| Single LoRA | Store keeps the current direct path as its one live slot. Bank either normalizes legacy config to one slot or keeps the direct fast path. Prove output, gradients, update, and PEFT I/O unchanged. | Required regression gate. |
+| TP + SP | Store: all ranks swap the same tenant and the backend codec preserves each LoRA shard plus TP metadata. Bank: reuse current sharding and describe the gathered logical sequence order with replicated route metadata. | Follow-up distributed gate per profile. |
+| DP | Store: DP barriers bracket snapshot/restore and state shards restore deterministically. Bank: all ranks register identical slots and either share the active set or materialize zero grads; denominators match gradient reduction. | Restricted homogeneous signature/active set. |
+| PP/VPP | Store: a handle triggers the same tenant swap on every stage before a pipeline schedule begins. Bank: pass route metadata to every stage and keep deterministic slot identity across chunks; interleaved stages forbid global active state. | PP=1 initially; store and bank need separate PP2 gates. |
+| EP/ETP + MoE | Store: the backend codec includes local expert adapter and optimizer shards while the live model reuses current routing. Bank: IDs follow token duplication, permutation, all-to-all/DeepEP, padding, and regrouping through a generic dispatcher sidecar. | Attention targets only initially. |
+| THD sequence packing | Store: swapping occurs outside forward, so the live adapter reuses the current single-LoRA THD path. Bank: public route stays per sequence and compiles token segments from `seq_lens/cu_seqlens`; padding/loss masks never create adapter tokens. | Store only after a single-LoRA THD regression; bank after route tests. |
+| Static CP | Store: no new route tensor, but all ranks must swap the same tenant before CP collectives. Bank: derive each CP rank's local token/segment view with the same zigzag/layout transform as activations and labels. | CP=1 initially; CP2 is a separate gate for each profile. |
 | Dynamic CP | Recompile local segments after the selected CP layout. Changing groups/shapes also interacts with graph banks and must fail outside declared profiles. | Deferred. |
-| MTP | Every predicted-token branch inherits its parent sequence adapter. Per-adapter MTP numerators and denominators must follow the same label rolling and loss mask as the main loss. | Deferred validation gate. |
-| Activation recompute | The route is an immutable explicit input. Dropout needs deterministic RNG preservation; a fused autograd path must document saved versus recomputed tensors. | Dropout=0 in first parity gate. |
-| Offload | Banks are declared before wrapping. Parameter/optimizer offload must preserve slot identity and must not reload adapters inside forward. | No dynamic adapter paging. |
-| `dist_opt` | Preserve current TP metadata on every adapter tensor; validate absent-gradient finalization and global clipping. One optimizer is compatible only with synchronized adapter steps. | Follow-up optimizer gate. |
-| FSDP2 / future mFSDP | Register banks before wrapping and verify sharded parameters, mixed DTensor/Tensor optimizer groups, checkpoint state, and unused-slot gradients. Dynamic module insertion after wrap is invalid. | Deferred backend gate. |
-| Muon | Algorithm choice stays orthogonal to the bank. LoRA matrices are 2-D, but eligibility, state, weight decay, and per-adapter clock semantics require an explicit policy and parity tests. | Not enabled by default. |
-| FP8 | Precision policy remains independent. A safe first combination keeps adapter math/weights in BF16 while the base may use FP8; FP8 adapter math needs its own recipe and independent precision evidence. | BF16 adapter branch only. |
-| CUDA Graphs | Predeclare capacity, keep routing as fixed-shape device tensors, avoid Python dispatch during replay, and capture only after bank/optimizer construction. Dynamic load or changing segment count needs bounds/graph banks. | Eager only. |
-| Checkpoint / PEFT I/O | Save a bank manifest and one standard PEFT adapter directory per name. Do not invent a combined tensor format as the only export. Resume also restores slot mapping and optimizer state. | Required before production. |
-| VERL / Miles RL | Carry adapter identity from rollout/sample metadata into `PackedBatch`; keep policy loss normalization per adapter and export/sync named adapter weights through protocol hooks. | Separate application patch. |
+| MTP | Store reuses the live single adapter for all predicted-token branches. Bank makes every branch inherit its parent sequence adapter, with per-adapter numerators/denominators following main-loss label rolling and masks. | Deferred validation gate. |
+| Activation recompute | Store forbids tenant swaps inside a forward/backward schedule. Bank route is immutable explicit input. Both preserve dropout RNG; a fused autograd path documents saved versus recomputed tensors. | Dropout=0 in first parity gate. |
+| Offload | Store: pinned-CPU tenant slots are lifecycle state, not forward-time paging, and copies finish before train calls. Bank: all parameters are declared before wrapping. Existing parameter/optimizer offload must preserve slot identity in either profile. | No adapter reload inside forward. |
+| `dist_opt` | Store: its codec preserves deterministic state partitions, master ownership, and param sync so a restored tenant update equals an isolated update. Bank: preserve TP metadata, absent-gradient finalization, and global clipping; one optimizer supports only synchronized slot steps. | Follow-up optimizer gate. |
+| FSDP2 / future mFSDP | Store: its codec copies real sharded params, gradients, masters, optimizer/scalar state and proves materialized params plus updates match an isolated reference; insertion after wrapping is invalid. Bank: register all slots before wrapping and validate unused-slot gradients and checkpoint state. | Fail registration until the selected backend codec and save/resume isolation test exist. |
+| Muon | Algorithm choice stays orthogonal. Store: snapshot all Muon per-matrix state and per-tenant clocks; never classify models or parameters by name. Bank: declare eligibility, state, weight decay, global clipping, and step-mask semantics for every LoRA matrix. | Fail loudly in the first profile; no fallback to Adam or shared clocks. |
+| FP8 | Precision policy remains independent. A safe first combination keeps adapter params, gradients, masters, and store copies in BF16/FP32 while the frozen base may use FP8; FP8 adapter math needs its own recipe and independent precision evidence. | BF16 adapter branch only; FP8 base is a later controlled-variable gate. |
+| CUDA Graphs | Store: copy tenant state into stable live addresses outside capture and replay only a fixed-shape single-adapter graph. Bank: predeclare capacity, use fixed-shape device route buffers, and avoid Python dispatch. Dynamic allocation/pointer changes invalidate capture. | Eager only; graph use fails until address and replay isolation are tested. |
+| Checkpoint / PEFT I/O | Save a tenant manifest and one standard PEFT adapter directory per name. Store resume restores complete tenant state; bank resume also restores deterministic slot mapping. Do not make a combined tensor format the only export. | Required before production. |
+| VERL / Miles RL | Store: bind trainer and rollout calls to one tenant handle and sync a named revision through protocol hooks. Bank: carry adapter identity into `PackedBatch` and keep policy loss normalization per adapter. The rollout backend is transport, not the precision reference. | Separate application patch and end-to-end gate. |
 
 ### Important interaction details
 
@@ -447,8 +652,8 @@ can later carry other token metadata and does not mention adapters or models.
 
 #### DP sparsity affects collectives and loss semantics
 
-One DP rank may have no samples for adapter `k` while another does. A missing
-gradient is not automatically equivalent to a zero gradient in DDP, dist-opt,
+In Candidate B, one DP rank may have no samples for adapter `k` while another
+does. A missing gradient is not automatically equivalent to a zero gradient in DDP, dist-opt,
 FSDP, or optimizer state progression. The simplest first distributed contract
 requires the same active adapter set on every replica. A later sparse contract
 must explicitly materialize/reduce zeros and test deadlock, weight decay, and
@@ -468,22 +673,22 @@ multi-job objective or must stay out of the independent-job profile.
 Different datasets may have different batch sizes, accumulation windows,
 learning rates, schedulers, or completion points. A shared base and segmented
 kernel do not solve scheduling. LoRAFusion and tLoRA both separate multi-job
-batch scheduling from LoRA operator fusion. MLite should do the same: first
-prove one synchronized profile, then add a runtime scheduler with explicit
-per-job progress and fairness contracts.
+batch scheduling from LoRA operator fusion. MLite should do the same: Candidate
+A owns independent clocks at the runtime/store boundary; Candidate B first
+proves one synchronized bank before adding step masks or scheduling policy.
 
 ## Checkpoint and Manifest Design
 
-A bank checkpoint should contain a small manifest next to ordinary distributed
-model/optimizer state:
+A tenant store or bank checkpoint should contain a small manifest next to
+ordinary distributed model/optimizer state:
 
 ```json
 {
-  "format": "mlite_lora_bank_v1",
+  "format": "mlite_lora_tenants_v1",
   "base_model": "<identity or digest>",
   "slots": [
-    {"slot": 0, "name": "math", "config": "math/adapter_config.json"},
-    {"slot": 1, "name": "code", "config": "code/adapter_config.json"}
+    {"slot": 0, "name": "math", "revision": 7, "config": "math/adapter_config.json"},
+    {"slot": 1, "name": "code", "revision": 3, "config": "code/adapter_config.json"}
   ]
 }
 ```
@@ -491,16 +696,21 @@ model/optimizer state:
 The manifest is illustrative, not a frozen schema. Required invariants are:
 
 - names and slots are unique;
+- revisions are monotonic per name and bind to the base digest;
 - base model identity and adapter target/rank metadata are validated;
 - rank-local distributed state and user-facing PEFT state are separate formats;
+- Candidate A restores tenant optimizer/scheduler/accumulation state, not only
+  adapter tensors;
 - saving one adapter produces a standard one-adapter PEFT directory;
 - loading a bank never relies on directory iteration order;
 - strict load reports missing/unexpected tensors per adapter; and
 - PP/EP/ETP coverage is measured before removing current export restrictions.
 
-Dynamic hot loading is deferred because adding parameters after optimizer and
-distributed wrapping changes ownership. A later serving-style cache can be a
-different inference/runtime capability without weakening the training contract.
+Candidate A may create a CPU slot at a safe runtime boundary only by cloning the
+existing immutable live signature; it does not add parameters. New shapes or
+targets after optimizer/distributed wrapping are forbidden. Candidate B defers
+all dynamic loading because adding parameters changes ownership. A later
+serving-style cache remains a separate runtime capability.
 
 ## Future Fused Kernel
 
@@ -543,6 +753,24 @@ segments may repeat a slot, so `dA/dB` accumulation needs deterministic or
 reviewed numerical semantics. Heterogeneous ranks should initially be bucketed
 by rank; a pointer/offset ABI can follow only after measurement.
 
+### SGMV/BGMV feasibility and relative effort
+
+Punica's names describe serving-forward layouts, not drop-in training kernels.
+Their usefulness and missing work are different:
+
+| Direction | Useful starting point | Missing training contract | Relative scope |
+| --- | --- | --- | --- |
+| Homogeneous BGMV-style bank | Stacked `[slot, layer, ...]` A/B tensors plus one slot ID per row; static capacity is graph-friendly. | Backward for `dX/dA/dB`, repeated-ID reductions, dropout RNG, TP/SP layout, accumulation dtype, optimizer-visible gradients. | **L**: one primitive/backend series after the eager reference; forward alone is not a deliverable. |
+| Segmented SGMV-style bank | Contiguous token ranges plus pointer/offset tables; naturally matches grouped sequences and separately allocated adapters. | Everything above plus pointer lifetime, heterogeneous-rank buckets, segment sorting/inverse maps, capture-stable metadata, and safe accumulation when one slot appears in several segments. | **XL**: defer until homogeneous profiling shows a real need. |
+| Distributed feature integration | Either kernel behind the same bank primitive. | TP/SP, PP/VPP, EP/MoE sidecars, THD/CP, FSDP/`dist_opt`, checkpoint, recompute, and end-to-end precision/performance evidence. | **XL**, split by feature gates rather than one kernel PR. |
+
+Here **L** means multiple reviewable implementation/validation slices and
+**XL** means a follow-on campaign across primitive, distributed, and
+application boundaries. These are scope classes, not calendar or speedup
+claims. Candidate A does not require either kernel; fusion starts only after a
+Candidate B eager profile is correct and profiling attributes material step
+time to segmented LoRA work.
+
 ### Staged backend plan
 
 1. **Eager segmented reference.** Loop over contiguous adapter segments using
@@ -580,6 +808,24 @@ This zero-GPU study provides no speedup, memory, or kernel-support claim.
 
 Validation should follow the strongest available reference in layers.
 
+### Tenant-store and rollout contract tests
+
+1. Enumerate the selected optimizer backend's complete tenant state and prove a
+   snapshot/restore round-trip for parameters, gradients, masters, moments,
+   scalar step counters, scheduler state, and accumulation state.
+2. Interleave identical tenants `A0, B0, A1, B1`; isolated loss, parameters,
+   and optimizer state must match at each corresponding step. Then change only
+   B's data and prove A is unchanged.
+3. Reject mismatched rank, targets, dtype, dropout, optimizer algorithm, and
+   parallel layout before the first swap. Delete one tenant and continue the
+   other without rebuilding the base model.
+4. Export two named revisions relative to the same base, load both into vLLM,
+   alternate `model=A/B`, reload A, and prove B is unchanged. Reject stale
+   revision numbers and base-digest mismatches.
+5. Exercise `merged_weights` separately and prove it cannot be selected for a
+   concurrent named-adapter pool. OLoRA-tail plus adapter-only export must hit
+   the declared fail-loud gate until a conversion reference exists.
+
 ### CPU and single-process contract tests
 
 1. Compare `K=1` bank execution with current `LinearLoRA` forward, `dX`, `dA`,
@@ -606,6 +852,8 @@ non-skipped job evidence. A minimal matrix is:
 
 | Gate | Composition | Required comparison |
 | --- | --- | --- |
+| Store lifecycle | Two tenants on the selected optimizer backend, then TP2/PP2 variants | Interleaved calls versus two isolated single-LoRA jobs, including complete state, save/resume, and deletion. |
+| Named rollout | Two tenant revisions on one vLLM base | A/B routing, A reload while B remains unchanged, stale revision and wrong-base rejection; no merged-base mutation. |
 | TP/SP | TP2 with two adapters and unequal sequence lengths | Isolated single-adapter runs versus fused bank, including grads and one optimizer step. |
 | PP/VPP | PP2, then PP2+VPP2 with interleaved microbatches | Same slot on every stage; output/loss/grads and checkpoint resume. |
 | EP/MoE | EP2 with both adapters crossing ranks, then DeepEP if available | Sidecar permutation parity, expert A/B grads, no fallback to attention-only. |
@@ -613,10 +861,11 @@ non-skipped job evidence. A minimal matrix is:
 | Optimizer | `dist_opt`, FSDP2, then any mFSDP profile | Step-1 parameters, optimizer state, zero-local-sample behavior, save/resume. |
 | Feature composition | MTP, recompute, BF16-adapter + FP8-base, CUDA Graph when implemented | Independent baseline first, then feature-on comparison with no silent eager fallback. |
 
-The production path must construct the bank from config, carry routing through
-`protocol.forward`, run forward/backward, finalize gradients, call
-`optimizer.step`, and save/resume. A unit-only bank or test wrapper is not
-delivery evidence.
+Candidate A's production path must resolve the handle, complete a coordinated
+state swap, run the existing protocol through forward/backward/optimizer step,
+and save/resume the correct tenant. Candidate B must construct the bank from
+config, carry routing through `protocol.forward`, finalize gradients, step, and
+save/resume. A unit-only store/bank or test wrapper is not delivery evidence.
 
 ### Performance protocol for a later kernel task
 
@@ -638,13 +887,17 @@ interpreting speedups. A serving decode benchmark is not a training benchmark.
 To keep primitive boundaries reviewable, implementation should land as small
 capabilities rather than a model-by-feature cross product:
 
-1. Config, typed route, eager linear bank, and first-principles CPU tests.
-2. Qwen attention composition, per-adapter loss, legacy single-LoRA regression,
-   and one real forward/backward/step path.
-3. Named adapter I/O, bank manifest, optimizer state, and resume.
-4. Generic MoE sidecar plus grouped expert bank and EP validation.
-5. TP/SP, PP/VPP, THD/CP, optimizer-backend, MTP/recompute/FP8 composition gates.
-6. Profiling and only then a grouped or fused kernel behind the same primitive.
+1. Explicit tenant handles, a static registry, one optimizer-backend state
+   codec, and first-principles snapshot/restore/isolation tests.
+2. Named adapter revision I/O, vLLM load/reload/model routing, base-digest and
+   stale-revision gates, plus explicit separation from #75/#78 merged sync.
+3. Store manifest, per-tenant checkpoint/resume, one real
+   forward/backward/optimizer-step path, and legacy single-LoRA regression.
+4. Typed route, eager linear bank, per-adapter loss, Qwen attention composition,
+   and isolated mixed-batch parity as the second profile.
+5. Generic MoE sidecar plus grouped expert bank and EP validation.
+6. TP/SP, PP/VPP, THD/CP, optimizer-backend, MTP/recompute/FP8 composition gates.
+7. Profiling and only then a grouped or fused kernel behind the same primitive.
 
 Each slice must remove superseded helpers and exports. Test-only callers do not
 make a production-unreachable function live. Primitive code must remain free of
@@ -655,21 +908,30 @@ model-family names and application-specific routing policy.
 - Weighted sums or learned mixtures of several adapters per token.
 - DoRA, QLoRA, LoRA variants, or arbitrary PEFT injection.
 - Heterogeneous ranks/targets/dtypes inside one execution bank.
-- Independent optimizer/scheduler/accumulation clocks.
-- Online job admission, fairness, paging, eviction, or hot loading.
+- Online admission during a training call, fairness policy, eviction, or
+  arbitrary hot loading after distributed wrapping.
 - Adapter merge/unmerge during training.
 - A CUDA/Triton kernel or any performance claim.
 - Declaring all feature combinations supported from static tests.
 
 ## References
 
+- [Trajectory C-LoRA field report][trajectory-c-lora], SkyRL's fixed
+  [`AdapterStore` implementation][skyrl-adapter-store],
+  [multi-LoRA end-to-end tests][skyrl-multi-lora-test], and
+  [serving isolation tests][skyrl-serving-test]
+- [Mind Lab MinT paper][mint-paper]
+- MLite [PR #73 OLoRA-tail][mlite-pr-73],
+  [PR #75 merged rollout sync][mlite-pr-75], and
+  [PR #78 MoE merged export][mlite-pr-78]
 - [Megatron Bridge LoRA API][bridge-lora] and [PEFT training guide][bridge-peft]
 - [Hugging Face PEFT mixed-adapter implementation][peft-mixed-forward] and
   [mixed-batch caveats][peft-mixed-caveats]
 - [mLoRA repository][mlora-repo], [training operator][mlora-lora-function], and
   [VLDB 2025 paper][mlora-paper]
 - [ASPEN / BatchFusion paper][aspen-paper]
-- [Punica repository and SGMV overview][punica]
+- [Punica repository and SGMV overview][punica] plus the pinned
+  [BGMV/SGMV Python contracts][punica-ops]
 - [S-LoRA MLSys 2024 paper][slora]
 - [vLLM LoRA feature guide][vllm-lora] and [adapter manager source][vllm-manager]
 - [LoRAFusion paper][lorafusion-paper] and [artifact repository][lorafusion-repo]
@@ -681,6 +943,14 @@ model-family names and application-specific routing policy.
 [mlite-protocol]: ../megatron/lite/model/qwen3_moe/lite/protocol.py
 [mlite-data]: ../megatron/lite/runtime/contracts/data.py
 [mlite-lora-io]: ../megatron/lite/model/qwen3_moe/lite/lora_adapter.py
+[trajectory-c-lora]: https://trajectory.ai/field-notes/multi-lora-training-for-continual-learning
+[skyrl-adapter-store]: https://github.com/NovaSky-AI/SkyRL/blob/ccc181e27c04b9f02fe1f7d30483aad96902d7a5/skyrl/backends/skyrl_train/workers/megatron/adapter_store.py
+[skyrl-multi-lora-test]: https://github.com/NovaSky-AI/SkyRL/blob/ccc181e27c04b9f02fe1f7d30483aad96902d7a5/tests/tinker/skyrl_train/test_multi_lora_megatron.py
+[skyrl-serving-test]: https://github.com/NovaSky-AI/SkyRL/blob/ccc181e27c04b9f02fe1f7d30483aad96902d7a5/tests/backends/skyrl_train/gpu/gpu_ci/inference_servers/test_multi_lora_serving.py
+[mint-paper]: https://arxiv.org/abs/2605.13779
+[mlite-pr-73]: https://github.com/ISEEKYAN/Megatron-LM/pull/73
+[mlite-pr-75]: https://github.com/ISEEKYAN/Megatron-LM/pull/75
+[mlite-pr-78]: https://github.com/ISEEKYAN/Megatron-LM/pull/78
 [bridge-lora]: https://docs.nvidia.com/nemo/megatron-bridge/latest/apidocs/bridge/bridge.peft.lora.html
 [bridge-peft]: https://docs.nvidia.com/nemo/megatron-bridge/latest/training/peft.html
 [peft-mixed-forward]: https://github.com/huggingface/peft/blob/79f4c362248d3b3b4bc2ed24704ed3183528c53f/src/peft/tuners/lora/layer.py
@@ -690,6 +960,7 @@ model-family names and application-specific routing policy.
 [mlora-paper]: https://www.vldb.org/pvldb/vol18/p1948-tang.pdf
 [aspen-paper]: https://arxiv.org/abs/2312.02515
 [punica]: https://github.com/punica-ai/punica/tree/591b59899f0a20760821785d06b331c8a2e5cb86
+[punica-ops]: https://github.com/punica-ai/punica/blob/591b59899f0a20760821785d06b331c8a2e5cb86/src/punica/ops/__init__.py
 [slora]: https://proceedings.mlsys.org/paper_files/paper/2024/file/906419cd502575b617cc489a1a696a67-Paper-Conference.pdf
 [vllm-lora]: https://docs.vllm.ai/en/stable/features/lora/
 [vllm-manager]: https://github.com/vllm-project/vllm/blob/c227aaa3f8edd02dae4583e27246430eebabfb25/vllm/lora/model_manager.py
