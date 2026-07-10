@@ -1042,6 +1042,24 @@ def test_mfsdp_releases_full_parameters_and_preserves_storage_aliases_on_move():
 
     chunk = chunks[0]
     optimizer_params = list(_optimizer_params(optimizer))
+    expected_shapes = {
+        spec.name: spec.shape
+        for bucket in chunk.param_sync.buckets
+        for spec in bucket.specs
+    }
+    assert all(
+        spec.full_param.numel() == 0
+        for bucket in chunk.param_sync.buckets
+        for spec in bucket.specs
+    )
+
+    with chunk.full_parameter_context():
+        actual_shapes = {
+            name.removeprefix("module."): param.shape
+            for name, param in chunk.named_parameters()
+        }
+        assert actual_shapes == expected_shapes
+
     assert all(
         spec.full_param.numel() == 0
         for bucket in chunk.param_sync.buckets

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -124,6 +125,16 @@ class MegatronFSDP(nn.Module):
             torch.device(device),
             load_grad=load_grad,
         )
+
+    @contextmanager
+    def full_parameter_context(self):
+        """Materialize full parameters for model-level export consumers."""
+        self.param_sync.materialize_all()
+        try:
+            yield
+        finally:
+            self.param_sync.release_all()
+            self.param_sync.discard_full_parameter_views()
 
     def named_parameters(self, *args, **kwargs) -> Iterator[tuple[str, nn.Parameter]]:
         if not self._expose_sharded_parameters:

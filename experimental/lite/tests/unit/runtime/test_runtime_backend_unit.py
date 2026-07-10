@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import types
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -304,6 +305,44 @@ def test_runtime_to_prefers_model_specific_storage_hook():
         (torch.device("cpu"), True),
         (torch.device("cuda"), False),
     ]
+
+
+class FullParameterExportModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.full_parameters_active = False
+
+    @contextmanager
+    def full_parameter_context(self):
+        self.full_parameters_active = True
+        try:
+            yield
+        finally:
+            self.full_parameters_active = False
+
+
+class FullParameterExportProtocol:
+    @staticmethod
+    def export_hf_weights(chunks, _model_cfg, _parallel_state, **_kwargs):
+        assert chunks[0].full_parameters_active
+        yield "weight", torch.ones(1)
+
+
+def test_runtime_export_keeps_model_full_parameter_context_active():
+    model = FullParameterExportModel()
+    handle = ModelHandle(
+        model=model,
+        parallel_state=types.SimpleNamespace(),
+        _extras={
+            "model_chunks": [model],
+            "protocol": FullParameterExportProtocol(),
+            "model_cfg": types.SimpleNamespace(),
+        },
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    assert list(runtime.export_weights(handle)) == [("weight", torch.ones(1))]
+    assert model.full_parameters_active is False
 
 
 class _FakeStorage:

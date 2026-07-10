@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from dataclasses import fields as dc_fields
 from datetime import timedelta
 from itertools import chain
@@ -350,11 +351,17 @@ class MegatronLiteRuntime(RuntimeBase):
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
 
-        if proto and hasattr(proto, "export_hf_weights"):
-            yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
-        else:
+        with ExitStack() as stack:
             for chunk in model_chunks:
-                yield from chunk.named_parameters()
+                full_parameter_context = getattr(chunk, "full_parameter_context", None)
+                if callable(full_parameter_context):
+                    stack.enter_context(full_parameter_context())
+
+            if proto and hasattr(proto, "export_hf_weights"):
+                yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
+            else:
+                for chunk in model_chunks:
+                    yield from chunk.named_parameters()
 
     # ── Memory ──
 

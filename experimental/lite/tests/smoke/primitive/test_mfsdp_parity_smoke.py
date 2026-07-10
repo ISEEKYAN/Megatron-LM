@@ -522,6 +522,28 @@ def test_mfsdp_runtime_offload_roundtrip_preserves_training_storage():
 
     for expected, actual in zip(before, after):
         assert torch.equal(expected, actual)
+
+    expected_shapes = {
+        spec.name: spec.shape
+        for chunk in chunks
+        for bucket in chunk.param_sync.buckets
+        for spec in bucket.specs
+    }
+
+    class FullShapeExportProtocol:
+        @staticmethod
+        def export_hf_weights(export_chunks, _model_cfg, _parallel_state, **_kwargs):
+            for name, param in export_chunks[0].module.named_parameters():
+                assert param.shape == expected_shapes[name]
+                yield name, param.detach().clone()
+
+    handle._extras.update(
+        protocol=FullShapeExportProtocol(),
+        model_cfg=SimpleNamespace(),
+    )
+    exported = dict(runtime.export_weights(handle))
+    assert {name: tensor.shape for name, tensor in exported.items()} == expected_shapes
+
     success, _loss, _grad_norm = _train_step(chunks, optimizer, finalize, x, target)
     assert success
     if dist.get_rank() == 0:
