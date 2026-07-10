@@ -391,6 +391,23 @@ def test_formal_sbatch_uses_mixed_source_for_mlite_and_fp8_artifact_for_vllm() -
     assert "convert --source" not in script
 
 
+def test_mlite_load_only_command_stops_after_runtime_build() -> None:
+    source = (
+        __import__("pathlib").Path(__file__).parents[3]
+        / "examples/verl/ds4_resync_tp4.py"
+    ).read_text()
+
+    assert 'subparsers.add_parser("load-mlite")' in source
+    assert "DS4_MLITE_LOAD_ONLY_COMPLETE" in source
+    load_function = source[source.index("def load_mlite(") : source.index("def collect_mlite(")]
+    assert "forward_backward" not in load_function
+    assert "export_weights" not in load_function
+    load_branch = source[source.index('elif args.command == "load-mlite"') :]
+    assert load_branch.index("load_mlite(args.model)") < load_branch.index(
+        'elif args.command == "collect-mlite"'
+    )
+
+
 def test_model_vocab_size_includes_non_tokenizer_slots() -> None:
     from examples.verl.ds4_resync_tp4 import model_vocab_size
 

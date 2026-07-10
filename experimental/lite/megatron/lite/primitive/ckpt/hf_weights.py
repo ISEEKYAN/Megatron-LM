@@ -14,8 +14,9 @@ import json
 import os
 import re
 from collections.abc import Generator, Iterable
+from contextlib import ExitStack
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 import torch.distributed as dist
@@ -146,11 +147,36 @@ class HFWeights(Protocol):
 
 
 class SafeTensorReader:
-    """Read individual tensors from an HF safetensors directory."""
+    """Read individual tensors from an HF safetensors directory.
+
+    The default one-shot API preserves the historical open/read/close
+    behaviour.  Used as a context manager, the reader keeps one lazy mmap
+    handle per referenced shard and closes every handle on exit.  Long model
+    loads should use the context form to avoid reopening the same multi-GB
+    shard for every tensor.
+    """
 
     def __init__(self, path: str):
         self.path = Path(path)
         self.index = self._load_index()
+        self._stack: ExitStack | None = None
+        self._handles: dict[Path, Any] = {}
+
+    def __enter__(self) -> SafeTensorReader:
+        if self._stack is not None:
+            raise RuntimeError("SafeTensorReader context cannot be entered twice")
+        self._stack = ExitStack()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        del exc_type, exc, traceback
+        self.close()
+
+    def close(self) -> None:
+        stack, self._stack = self._stack, None
+        self._handles.clear()
+        if stack is not None:
+            stack.close()
 
     def _load_index(self) -> dict[str, str]:
         idx_file = self.path / "model.safetensors.index.json"
@@ -164,6 +190,14 @@ class SafeTensorReader:
             filepath = self.path / self.index[name]
         else:
             filepath = self.path / "model.safetensors"
+        if self._stack is not None:
+            handle = self._handles.get(filepath)
+            if handle is None:
+                handle = self._stack.enter_context(
+                    safe_open(str(filepath), framework="pt", device="cpu")
+                )
+                self._handles[filepath] = handle
+            return handle.get_tensor(name)
         with safe_open(str(filepath), framework="pt", device="cpu") as f:
             return f.get_tensor(name)
 

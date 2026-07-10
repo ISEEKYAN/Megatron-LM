@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import json
 import sys
 import types
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -19,10 +21,74 @@ if importlib.util.find_spec("safetensors") is None:
     sys.modules["safetensors.torch"] = safetensors_torch
 
 from megatron.lite.primitive.ckpt.hf_weights import (
+    SafeTensorReader,
     _iter_bucketed_materialized_tensors,
     bucketed_all_gather_into_tensor,
     export_hf_weights,
 )
+
+
+def test_safetensor_reader_context_reuses_each_shard_handle(
+    monkeypatch, tmp_path
+) -> None:
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "first": "shard-a.safetensors",
+                    "second": "shard-a.safetensors",
+                    "third": "shard-b.safetensors",
+                }
+            }
+        )
+    )
+    events = []
+
+    class FakeHandle:
+        def __init__(self, filename: str) -> None:
+            self.filename = filename
+
+        def __enter__(self):
+            events.append(("open", self.filename))
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            del exc_type, exc, traceback
+            events.append(("close", self.filename))
+
+        def get_tensor(self, name: str) -> torch.Tensor:
+            events.append(("get", self.filename, name))
+            return torch.tensor(len(name))
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.safe_open",
+        lambda path, **kwargs: FakeHandle(Path(path).name),
+    )
+
+    with SafeTensorReader(str(tmp_path)) as reader:
+        assert reader.get_tensor("first").item() == 5
+        assert reader.get_tensor("second").item() == 6
+        assert reader.get_tensor("first").item() == 5
+        assert reader.get_tensor("third").item() == 5
+
+    assert events.count(("open", "shard-a.safetensors")) == 1
+    assert events.count(("open", "shard-b.safetensors")) == 1
+    assert events.count(("close", "shard-a.safetensors")) == 1
+    assert events.count(("close", "shard-b.safetensors")) == 1
+
+    events.clear()
+    reader.get_tensor("first")
+    reader.get_tensor("first")
+    assert events.count(("open", "shard-a.safetensors")) == 2
+    assert events.count(("close", "shard-a.safetensors")) == 2
+
+    events.clear()
+    with pytest.raises(RuntimeError, match="stop loading"):
+        with reader:
+            reader.get_tensor("first")
+            raise RuntimeError("stop loading")
+    assert events.count(("open", "shard-a.safetensors")) == 1
+    assert events.count(("close", "shard-a.safetensors")) == 1
 
 
 def test_export_defaults_to_device_resident_tensors() -> None:

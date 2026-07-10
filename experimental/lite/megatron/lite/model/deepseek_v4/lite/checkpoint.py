@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 
 import torch
 import torch.distributed as dist
@@ -235,7 +236,10 @@ def _scale_to_float(scale: torch.Tensor) -> torch.Tensor:
     if scale.dtype.is_floating_point:
         return scale.float()
     if scale.dtype == torch.uint8:
-        return torch.pow(torch.tensor(2.0, dtype=torch.float32), scale.float() - 127.0)
+        return torch.pow(
+            torch.tensor(2.0, dtype=torch.float32, device=scale.device),
+            scale.float() - 127.0,
+        )
     return scale.float()
 
 
@@ -292,6 +296,8 @@ def _copy_param(
     scale: torch.Tensor | None = None,
 ) -> None:
     if scale is not None:
+        tensor = tensor.to(device=param.device)
+        scale = scale.to(device=param.device)
         tensor = _dequantize_scaled_tensor(tensor, scale, param.shape)
     elif param.dtype.is_floating_point and not tensor.dtype.is_floating_point:
         raise RuntimeError(
@@ -301,15 +307,63 @@ def _copy_param(
     param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
 
 
-def _read_hf_tensor(
-    reader: SafeTensorReader, hf_name: str, target_shape: torch.Size | tuple[int, ...]
-) -> torch.Tensor:
-    scale_name = _scale_name_for_hf_name(hf_name)
-    tensor = reader.get_tensor(hf_name)
-    scale = reader.get_tensor(scale_name) if _has(reader, scale_name) else None
-    if scale is not None:
-        return _dequantize_scaled_tensor(tensor, scale, torch.Size(target_shape))
-    return tensor
+def _copy_hf_tensors(
+    reader: SafeTensorReader,
+    target: nn.Parameter | torch.Tensor,
+    hf_names: list[str],
+) -> None:
+    if len(hf_names) == 1:
+        destinations = [target]
+    elif len(hf_names) == 2:
+        first = target.shape[0] // 2
+        destinations = [target[:first], target[first:]]
+    else:
+        raise ValueError(f"Expected one or two HF tensors, got {hf_names}")
+
+    for destination, hf_name in zip(destinations, hf_names, strict=True):
+        scale_name = _scale_name_for_hf_name(hf_name)
+        scale = reader.get_tensor(scale_name) if _has(reader, scale_name) else None
+        _copy_param(destination, reader.get_tensor(hf_name), scale=scale)
+
+
+def _replica_group_for_state_key(name: str, ps: ParallelState):
+    if EXPERT_CLASSIFIER(name):
+        return getattr(ps, "ep_dp_group", None)
+    return getattr(ps, "dp_cp_group", None)
+
+
+def _replica_source_group_rank(name: str, ps: ParallelState) -> int:
+    if not EXPERT_CLASSIFIER(name):
+        return 0
+    expert_dp_size = int(getattr(ps, "expert_dp_size", 1))
+    if expert_dp_size < 1:
+        raise ValueError(f"Invalid expert_dp_size={expert_dp_size}")
+    return int(getattr(ps, "ep_rank", 0)) % expert_dp_size
+
+
+def _copy_replicated_hf_tensors(
+    reader: SafeTensorReader,
+    target: nn.Parameter | torch.Tensor,
+    hf_names: list[str],
+    *,
+    group,
+    source_group_rank: int = 0,
+) -> bool:
+    """Read once per replica group, then broadcast the full local parameter."""
+    if group is None or not dist.is_initialized() or dist.get_world_size(group) <= 1:
+        _copy_hf_tensors(reader, target, hf_names)
+        return True
+
+    group_ranks = dist.get_process_group_ranks(group)
+    if not 0 <= source_group_rank < len(group_ranks):
+        raise ValueError(
+            f"source_group_rank={source_group_rank} is outside group size {len(group_ranks)}"
+        )
+    is_reader = dist.get_rank(group) == source_group_rank
+    if is_reader:
+        _copy_hf_tensors(reader, target, hf_names)
+    dist.broadcast(target.data, src=group_ranks[source_group_rank], group=group)
+    return is_reader
 
 
 def load_hf_weights(
@@ -330,7 +384,6 @@ def load_hf_weights(
     if (ps.tp_size, ps.etp_size) != (1, 1):
         raise NotImplementedError("DeepSeek V4 direct HF load currently supports only TP=ETP=1.")
 
-    reader = SafeTensorReader(path)
     base_model = unwrap_model(model)
     state = base_model.state_dict()
     # local pipeline position -> global layer index (identity at PP=1)
@@ -340,33 +393,38 @@ def load_hf_weights(
         else {}
     )
     loaded = 0
+    local_reads = 0
     missing: list[str] = []
-    for name, target in state.items():
-        if _is_native_metadata_key(name):
-            continue
-        global_name = to_global_layer_name(name, layer_map)
-        hf_names = _hf_names_for_state_key(_to_global_expert_name(global_name, config, ps), config)
-        if not hf_names or not all(_has(reader, hf_name) for hf_name in hf_names):
-            missing.append(name)
-            continue
-        if len(hf_names) == 2:
-            first = target.shape[0] // 2
-            tensor = torch.cat(
-                [
-                    _read_hf_tensor(reader, hf_names[0], (first, *target.shape[1:])),
-                    _read_hf_tensor(
-                        reader, hf_names[1], (target.shape[0] - first, *target.shape[1:])
-                    ),
-                ],
-                dim=0,
+    load_started = time.monotonic()
+    with SafeTensorReader(path) as reader:
+        for name, target in state.items():
+            if _is_native_metadata_key(name):
+                continue
+            global_name = to_global_layer_name(name, layer_map)
+            hf_names = _hf_names_for_state_key(
+                _to_global_expert_name(global_name, config, ps), config
             )
-            target.data.copy_(tensor.to(device=target.device, dtype=target.dtype))
-        else:
-            scale_name = _scale_name_for_hf_name(hf_names[0])
-            scale = reader.get_tensor(scale_name) if _has(reader, scale_name) else None
-            _copy_param(target, reader.get_tensor(hf_names[0]), scale=scale)
-        loaded += 1
+            if not hf_names or not all(_has(reader, hf_name) for hf_name in hf_names):
+                missing.append(name)
+                continue
+            local_reads += int(
+                _copy_replicated_hf_tensors(
+                    reader,
+                    target,
+                    hf_names,
+                    group=_replica_group_for_state_key(name, ps),
+                    source_group_rank=_replica_source_group_rank(name, ps),
+                )
+            )
+            loaded += 1
 
+    if local_reads:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(
+            "[megatron.lite] DeepSeek V4 checkpoint reader complete "
+            f"rank={rank} local_tensors={local_reads} elapsed_seconds={time.monotonic() - load_started:.3f}",
+            flush=True,
+        )
     log_rank0(f"DeepSeek V4 native loaded {loaded} tensors from {path}")
     for name in missing:
         log_rank0(f"WARNING: DeepSeek V4 checkpoint tensor missing: {name}")

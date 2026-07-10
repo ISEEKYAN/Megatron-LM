@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -593,15 +594,10 @@ def collect(
         print(f"DS4_TP4_FP8_ONLINE_RELOAD_COMPLETE={resync_output}", flush=True)
 
 
-def collect_mlite(
-    model: Path, output: Path, fp8_output: Path, coverage_output: Path
-) -> None:
-    """Load official mixed weights into MLite, run BF16 forward, and export FP8."""
-    from transformers import AutoConfig, AutoTokenizer
-
+def _build_mlite_runtime(model: Path):
     from megatron.lite.runtime import RuntimeConfig, create_runtime
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-    from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
+    from megatron.lite.runtime.contracts import ParallelConfig
 
     require_mixed_flash_checkpoint(model)
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -614,9 +610,6 @@ def collect_mlite(
             f"formal MLite parity requires EP4, got world_size={world_size}"
         )
 
-    config = AutoConfig.from_pretrained(model, trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    vocab_size = model_vocab_size(config, tokenizer)
     backend_config = MegatronLiteConfig(
         model_name="deepseek_v4",
         impl="lite",
@@ -634,7 +627,36 @@ def collect_mlite(
     runtime = create_runtime(
         RuntimeConfig(backend="mlite", hf_path=str(model), backend_cfg=backend_config)
     )
-    handle = runtime.build_model()
+    return runtime, runtime.build_model()
+
+
+def load_mlite(model: Path) -> None:
+    """Build and load the official mixed checkpoint, then exit without forward/export."""
+    started = time.monotonic()
+    _, handle = _build_mlite_runtime(model)
+    if dist.get_rank() == 0:
+        print(
+            "DS4_MLITE_LOAD_ONLY_COMPLETE "
+            f"elapsed_seconds={time.monotonic() - started:.3f} "
+            f"peak_allocated_bytes={torch.cuda.max_memory_allocated()}",
+            flush=True,
+        )
+    dist.barrier()
+    del handle
+
+
+def collect_mlite(
+    model: Path, output: Path, fp8_output: Path, coverage_output: Path
+) -> None:
+    """Load official mixed weights into MLite, run BF16 forward, and export FP8."""
+    from transformers import AutoConfig, AutoTokenizer
+
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    vocab_size = model_vocab_size(config, tokenizer)
+    runtime, handle = _build_mlite_runtime(model)
     rows = []
     with torch.inference_mode(), runtime.eval_mode(handle):
         for prompt in math_prompts():
@@ -724,6 +746,8 @@ def main() -> None:
     collect_parser.add_argument("--resync-model", type=Path)
     collect_parser.add_argument("--resync-output", type=Path)
     collect_parser.add_argument("--weight-output", type=Path)
+    load_mlite_parser = subparsers.add_parser("load-mlite")
+    load_mlite_parser.add_argument("--model", type=Path, required=True)
     mlite_parser = subparsers.add_parser("collect-mlite")
     mlite_parser.add_argument("--model", type=Path, required=True)
     mlite_parser.add_argument("--output", type=Path, required=True)
@@ -748,6 +772,8 @@ def main() -> None:
             resync_output=args.resync_output,
             weight_output=args.weight_output,
         )
+    elif args.command == "load-mlite":
+        load_mlite(args.model)
     elif args.command == "collect-mlite":
         collect_mlite(
             args.model, args.output, args.fp8_output, args.coverage_output
