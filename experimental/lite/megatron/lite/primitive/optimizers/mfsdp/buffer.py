@@ -276,6 +276,7 @@ class ParamSpec:
     local_offset: int = 0
     param_offset: int = 0
     shard_param: nn.Parameter | None = None
+    retain_full_storage_through_backward: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,6 +310,9 @@ class ParamBucket:
         self.rank = group_rank(process_group)
         self.config = config
         self.allocator = allocator
+        self.retain_full_storage_through_backward = all(
+            spec.retain_full_storage_through_backward for spec in specs
+        )
         self.device = specs[0].full_param.device
         compute_dtype = specs[0].full_param.dtype
         self.policy = MixedPrecisionPolicy(
@@ -707,16 +711,21 @@ class ParamAndGradBuffer:
                 expert_by_param_id[id(param)] = bool(is_expert(name))
             spec.bindings.append(ParamBinding(parent, attribute))
 
-        grouped: dict[tuple[int, bool, torch.dtype, torch.device], list[ParamSpec]] = (
-            defaultdict(list)
-        )
-        owner_for_key: dict[tuple[int, bool, torch.dtype, torch.device], nn.Module] = {}
+        grouped: dict[
+            tuple[int, bool, bool, torch.dtype, torch.device], list[ParamSpec]
+        ] = defaultdict(list)
+        owner_for_key: dict[
+            tuple[int, bool, bool, torch.dtype, torch.device], nn.Module
+        ] = {}
         for param_id, spec in specs_by_id.items():
             owner = owner_by_param_id[param_id]
             expert = expert_by_param_id[param_id]
+            retain_full_storage = len(spec.shape) == 1
+            spec.retain_full_storage_through_backward = retain_full_storage
             key = (
                 module_order[id(owner)],
                 expert,
+                retain_full_storage,
                 spec.full_param.dtype,
                 spec.full_param.device,
             )
@@ -726,7 +735,7 @@ class ParamAndGradBuffer:
         buckets: list[ParamBucket] = []
         owners: dict[int, list[int]] = defaultdict(list)
         for key in sorted(grouped, key=lambda item: item[0]):
-            _owner_order, expert, _dtype, _device = key
+            _owner_order, expert, _retain_full_storage, _dtype, _device = key
             owner = owner_for_key[key]
             for partition in _split_specs(grouped[key], self.config.bucket_size):
                 bucket_id = len(buckets)
@@ -1001,7 +1010,9 @@ class CommunicationPipelines:
             self.buckets[bucket_id].release_full_parameters()
 
     def end_forward(self) -> None:
-        self.all_gather.release_all()
+        for bucket in self.buckets:
+            if not bucket.retain_full_storage_through_backward:
+                bucket.release_full_parameters()
 
     def materialize_all(self) -> None:
         self.all_gather.materialize_all()

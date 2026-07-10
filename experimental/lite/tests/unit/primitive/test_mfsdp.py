@@ -59,7 +59,7 @@ class _OpaqueWeightFunction(torch.autograd.Function):
         ctx.owner = owner
         ctx.expected_weight_shape = owner.weight.shape
         ctx.input_shape = value.shape
-        return torch.nn.functional.linear(value, owner.weight)
+        return value * owner.weight
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -75,7 +75,7 @@ class _OpaqueWeightFunction(torch.autograd.Function):
 class _OpaqueWeightUnit(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.randn(3, 4))
+        self.weight = torch.nn.Parameter(torch.randn(4))
 
     def forward(self, value):
         return _OpaqueWeightFunction.apply(value, self)
@@ -1226,7 +1226,7 @@ def test_mfsdp_keeps_full_parameter_bindings_for_opaque_backward():
     value = torch.randn(2, 4, requires_grad=True)
     output = chunks[0](value)
 
-    assert model.weight is not full_weight
+    assert model.weight is full_weight
     output.sum().backward()
     assert model.weight is not full_weight
     assert chunks[0].param_sync.buckets[0]._full_lease is None
