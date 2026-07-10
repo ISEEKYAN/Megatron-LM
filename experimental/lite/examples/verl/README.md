@@ -191,7 +191,7 @@ The checked-in Slurm defaults describe the 128-GPU PP4/EP8/CP4 target. A
 64-GPU staircase run can override the allocation and topology at submission:
 
 ```bash
-sbatch --nodes=8 --time=06:00:00 \
+sbatch --partition=batch --nodes=8 --time=04:00:00 \
   --export=ALL,ACTOR_PP=2,ACTOR_EP=8,ACTOR_CP=2,ROLLOUT_TP=16,PHASE1_STEPS=3,TOTAL_STEPS=6 \
   experimental/lite/examples/verl/slurm/run_ds4_gsm8k_grpo.sbatch
 ```

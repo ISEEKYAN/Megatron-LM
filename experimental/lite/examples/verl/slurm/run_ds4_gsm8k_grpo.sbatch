@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=ds4-grpo
 #SBATCH --account=coreai_devtech_all
-#SBATCH --partition=batch
+#SBATCH --partition=batch_large_long
 #SBATCH --nodes=16
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8

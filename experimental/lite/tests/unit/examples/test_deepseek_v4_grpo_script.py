@@ -14,6 +14,7 @@ import pytest
 
 LITE_ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE_ROOT = LITE_ROOT / "examples/verl"
+README = EXAMPLE_ROOT / "README.md"
 RUNNER = EXAMPLE_ROOT / "scripts/run_deepseek_v4_gsm8k_grpo.sh"
 SBATCH = EXAMPLE_ROOT / "slurm/run_ds4_gsm8k_grpo.sbatch"
 DATASET_MODULE = EXAMPLE_ROOT / "verl_mlite/dataset.py"
@@ -152,6 +153,7 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
 
     assert "#SBATCH --nodes=16" in script
     assert "#SBATCH --gres=gpu:8" in script
+    assert "#SBATCH --partition=batch_large_long" in script
     assert "#SBATCH --time=14-00:00:00" in script
     assert 'git -C "${MLITE_SRC}" rev-parse HEAD' in script
     assert 'srun --nodes="${SLURM_NNODES}"' in script
@@ -217,6 +219,12 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "metrics-report.json" in script
     assert "DS4_GRPO_RUN_COMPLETE" in script
     assert "DRY_RUN=0" in script
+
+
+def test_ds4_grpo_readme_uses_the_smoke_partition_limit() -> None:
+    readme = README.read_text()
+
+    assert "sbatch --partition=batch --nodes=8 --time=04:00:00" in readme
 
 
 def test_ds4_grpo_metrics_validator_requires_real_update_and_throughput(
