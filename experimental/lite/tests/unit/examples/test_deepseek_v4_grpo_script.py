@@ -108,6 +108,7 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
     assert "VllmCheckpointWorkerExtension" in command
     assert "hf_overrides.expert_dtype=fp8" in command
     assert "actor_rollout_ref.rollout.tensor_model_parallel_size=16" in command
+    assert "actor_rollout_ref.rollout.gpu_memory_utilization=0.60" in command
     assert "actor_rollout_ref.rollout.load_format=dummy" in command
     assert "trainer.total_training_steps=3" in command
     assert "trainer.use_legacy_worker_impl=disable" in command
@@ -190,6 +191,9 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "IMPORT_ONLY" in script
     assert "RAY_ONLY" in script
     assert "DS4_GRPO_CONFIG_COMPOSE_PASSED" in script
+    assert '"gpu_memory_utilization: 0.6"' in script
+    assert "os.path.isdir(cache_root)" in script
+    assert "vllm_cache_root=${VLLM_CACHE_ROOT}" in script
     assert '"use_legacy_worker_impl: disable"' in script
     assert '"custom_chat_template: null"' in script
     assert '"<｜User｜>"' in script
@@ -234,6 +238,18 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert 'export PYTHONPATH="${MLITE_SM90_SITE}' in script
     assert ':${DS4_VLLM_SITE}:' in script
     assert 'export LD_PRELOAD="${DS4_VLLM_SHIM}"' in script
+    assert 'export VLLM_CACHE_ROOT="${RUN_ROOT}/vllm-cache"' in script
+    assert 'export VLLM_WORKER_MULTIPROC_METHOD="spawn"' in script
+    assert 'export VLLM_DEEP_GEMM_WARMUP="skip"' in script
+    assert 'export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"' in script
+    assert '"${VLLM_CACHE_ROOT}"' in script
+    for name in (
+        "VLLM_CACHE_ROOT",
+        "VLLM_WORKER_MULTIPROC_METHOD",
+        "VLLM_DEEP_GEMM_WARMUP",
+        "PYTORCH_CUDA_ALLOC_CONF",
+    ):
+        assert f'"{name}",' in script
     assert "unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES" in script
     assert 'export HF_HOME="${RUN_ROOT}/hf-cache"' in script
     assert 'export HF_DATASETS_CACHE="${HF_HOME}/datasets"' in script

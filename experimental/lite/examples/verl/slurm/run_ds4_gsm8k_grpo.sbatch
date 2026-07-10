@@ -125,6 +125,9 @@ export NCCL_NVLS_ENABLE=0
 export PYTHONNOUSERSITE=1
 export RAY_raylet_start_wait_time_s="${RAY_RAYLET_START_WAIT_TIME_S:-180}"
 export VLLM_USE_V1=1
+export VLLM_WORKER_MULTIPROC_METHOD="spawn"
+export VLLM_DEEP_GEMM_WARMUP="skip"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export VERL_VLLM_FP8_QUANT_ENABLED=0
 export VERL_MLITE_HF_CONFIG_MODEL_TYPE=deepseek_v4
 export VERL_MLITE_VLLM_SITE="${DS4_VLLM_SITE}"
@@ -137,12 +140,14 @@ export TORCHINDUCTOR_CACHE_DIR="${TMPDIR}/torchinductor"
 export TRITON_CACHE_DIR="${TMPDIR}/triton"
 export HF_HOME="${RUN_ROOT}/hf-cache"
 export HF_DATASETS_CACHE="${HF_HOME}/datasets"
+export VLLM_CACHE_ROOT="${RUN_ROOT}/vllm-cache"
 unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
 mkdir -p \
   "${PYTHONPYCACHEPREFIX}" \
   "${TORCHINDUCTOR_CACHE_DIR}" \
   "${TRITON_CACHE_DIR}" \
-  "${HF_DATASETS_CACHE}"
+  "${HF_DATASETS_CACHE}" \
+  "${VLLM_CACHE_ROOT}"
 
 if [[ "${IMPORT_ONLY}" == "1" ]]; then
   env \
@@ -252,6 +257,7 @@ if [[ "${CONFIG_ONLY}" == "1" ]]; then
       bash "${MLITE_SRC}/experimental/lite/examples/verl/scripts/run_deepseek_v4_gsm8k_grpo.sh" \
       > "${RUN_ROOT}/resolved-config.yaml" 2>&1
     python - "${RUN_ROOT}/resolved-config.yaml" <<'PY'
+import os
 import sys
 
 config = open(sys.argv[1], encoding="utf-8").read()
@@ -265,6 +271,7 @@ required = [
     "custom_chat_template:",
     "name: ChatTemplateRLHFDataset",
     "verl_mlite/dataset.py",
+    "gpu_memory_utilization: 0.6",
     "chat_template:",
     "<｜User｜>",
     "<｜Assistant｜>",
@@ -274,6 +281,9 @@ if missing:
     raise SystemExit(f"resolved DS4 GRPO config is missing markers: {missing}")
 if "custom_chat_template: null" in config:
     raise SystemExit("resolved DS4 GRPO config has no chat template")
+cache_root = os.environ["VLLM_CACHE_ROOT"]
+if not os.path.isdir(cache_root):
+    raise SystemExit(f"vLLM cache root was not created: {cache_root}")
 for forbidden in (
     "Error in sitecustomize",
     "Failed to import Triton kernels",
@@ -282,7 +292,7 @@ for forbidden in (
     if forbidden in config:
         raise SystemExit(f"resolved DS4 GRPO config contains initialization error: {forbidden}")
 PY
-    echo "DS4_GRPO_CONFIG_COMPOSE_PASSED source=${MLITE_COMMIT}"
+    echo "DS4_GRPO_CONFIG_COMPOSE_PASSED source=${MLITE_COMMIT} vllm_cache_root=${VLLM_CACHE_ROOT}"
   fi
   exit 0
 fi
@@ -373,6 +383,10 @@ names = [
     "NCCL_NVLS_ENABLE",
     "PYTHONNOUSERSITE",
     "VLLM_USE_V1",
+    "VLLM_WORKER_MULTIPROC_METHOD",
+    "VLLM_DEEP_GEMM_WARMUP",
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "VLLM_CACHE_ROOT",
     "VERL_VLLM_FP8_QUANT_ENABLED",
     "VERL_MLITE_HF_CONFIG_MODEL_TYPE",
     "VERL_MLITE_VLLM_SITE",
