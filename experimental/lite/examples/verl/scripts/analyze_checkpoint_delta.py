@@ -61,7 +61,7 @@ def classify_parameter_family(name: str) -> str:
     """Classify an exported parameter name for reporting, not dispatch."""
 
     lowered = name.lower()
-    if "vision_model" in lowered or ".vision." in lowered:
+    if "vision_model" in lowered or ".vision." in lowered or ".visual." in lowered:
         return "vision"
     if ".gdn." in lowered or (".module." in lowered and ".linear_attn." in lowered):
         return "gdn"

@@ -47,6 +47,7 @@ def test_classify_parameter_family_uses_exported_names() -> None:
     assert classify("model.layers.0.input_layernorm.weight") == "norm"
     assert classify("model.layers.0.self_attn.q_norm.weight") == "norm"
     assert classify("model.vision_model.blocks.0.mlp.linear_fc1.weight") == "vision"
+    assert classify("model.visual.blocks.0.mlp.linear_fc1.weight") == "vision"
     assert classify("lm_head.weight") == "head"
     assert classify("model.module.output_layer.weight") == "head"
     assert classify("model.1.module.head.col.linear.weight") == "head"
