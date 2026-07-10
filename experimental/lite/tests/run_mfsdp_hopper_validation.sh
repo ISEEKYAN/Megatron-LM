@@ -31,8 +31,15 @@ case "${MODE}" in
     fi
     TEST_EXPR="full_parallel_precision_curve"
     ;;
+  functional)
+    if [[ "${NNODES}" != "1" || "${NPROC_PER_NODE}" != "8" ]]; then
+      echo "functional mode requires NNODES=1 and NPROC_PER_NODE=8." >&2
+      exit 2
+    fi
+    TEST_EXPR="checkpoint_export_offload_resume"
+    ;;
   *)
-    echo "usage: $0 {throughput|full-parallel}" >&2
+    echo "usage: $0 {throughput|full-parallel|functional}" >&2
     exit 2
     ;;
 esac
@@ -53,11 +60,24 @@ else
   )
 fi
 
-python -m torch.distributed.run "${DIST_ARGS[@]}" \
-  -m pytest \
-  -c /dev/null \
-  --rootdir="${ROOT}" \
-  --confcutdir="${ROOT}" \
-  -q -s -rs \
-  experimental/lite/tests/smoke/primitive/test_mfsdp_parity_smoke.py \
-  -k "${TEST_EXPR}"
+run_pytest() {
+  python -m torch.distributed.run "${DIST_ARGS[@]}" \
+    -m pytest \
+    -c /dev/null \
+    --rootdir="${ROOT}" \
+    --confcutdir="${ROOT}" \
+    -q -s -rs \
+    experimental/lite/tests/smoke/primitive/test_mfsdp_parity_smoke.py \
+    -k "${TEST_EXPR}"
+}
+
+if [[ "${MODE}" == "functional" ]]; then
+  export MLITE_MFSDP_FUNCTIONAL_DIR="${MLITE_MFSDP_FUNCTIONAL_DIR:-${TMPDIR:-/tmp}/mlite-mfsdp-functional-${SLURM_JOB_ID}}"
+  mkdir -p "${MLITE_MFSDP_FUNCTIONAL_DIR}"
+  export MLITE_MFSDP_FUNCTIONAL_PHASE=save
+  run_pytest
+  export MLITE_MFSDP_FUNCTIONAL_PHASE=resume
+  run_pytest
+else
+  run_pytest
+fi

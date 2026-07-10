@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import gc
 import os
 import statistics
 import sys
@@ -867,6 +868,7 @@ def _build_full_parallel_handle(backend: str, *, seed: int):
             "model_cfg": model_cfg,
             "forward_step": bundle.forward_step,
             "finalize_grads": finalize_grads,
+            "protocol": protocol,
         }
     )
     handle = ModelHandle(
@@ -1012,6 +1014,264 @@ def _max_snapshot_abs_diff(
     assert lhs.keys() == rhs.keys()
     assert lhs
     return max(float((lhs[name] - rhs[name]).abs().max()) for name in lhs)
+
+
+class _CheckpointScheduler:
+    def __init__(self):
+        self.step_count = 0
+
+    def step(self):
+        self.step_count += 1
+
+    def state_dict(self):
+        return {"step_count": self.step_count}
+
+    def load_state_dict(self, state_dict):
+        self.step_count = int(state_dict["step_count"])
+
+
+def _mfsdp_persistent_snapshot(
+    handle: ModelHandle,
+) -> dict[str, dict[str, torch.Tensor]]:
+    model = {}
+    grads = {}
+    param_names = {}
+    for chunk_index, chunk in enumerate(handle._optimizer._model_chunks):
+        for bucket in chunk.param_sync.buckets:
+            bucket_name = f"{chunk_index}.{bucket.bucket_id}"
+            model[bucket_name] = bucket.main_param_buffer.detach().cpu().clone()
+            grads[bucket_name] = bucket.main_grad_buffer.detach().cpu().clone()
+            for spec in bucket.specs:
+                assert spec.shard_param is not None
+                param_names[id(spec.shard_param)] = f"{chunk_index}.{spec.name}"
+
+    optimizer = {}
+    inner = handle._optimizer._inner_optimizer.optimizer
+    for param, state in inner.state.items():
+        param_name = param_names[id(param)]
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                optimizer[f"{param_name}.{key}"] = value.detach().cpu().clone()
+    return {"model": model, "grads": grads, "optimizer": optimizer}
+
+
+def _assert_snapshot_equal(actual, expected, label: str) -> None:
+    assert actual.keys() == expected.keys(), f"{label} snapshot sections differ"
+    for section in actual:
+        assert actual[section].keys() == expected[section].keys(), (
+            f"{label} {section} keys differ"
+        )
+        for name, tensor in actual[section].items():
+            reference = expected[section][name]
+            assert tensor.dtype == reference.dtype, f"{label} {name} dtype changed"
+            assert torch.equal(tensor, reference), f"{label} {name} value changed"
+
+
+def _assert_mfsdp_storage_aliases(handle: ModelHandle, device: str) -> None:
+    for chunk in handle._optimizer._model_chunks:
+        for bucket in chunk.param_sync.buckets:
+            assert bucket.device.type == device
+            assert bucket.main_param_buffer.device.type == device
+            assert bucket.main_grad_buffer.device.type == device
+            param_storage = bucket.main_param_buffer.untyped_storage().data_ptr()
+            grad_storage = bucket.main_grad_buffer.untyped_storage().data_ptr()
+            for spec in bucket.specs:
+                assert spec.shard_param is not None
+                assert spec.shard_param.device.type == device
+                assert spec.shard_param.untyped_storage().data_ptr() == param_storage
+                if spec.shard_param.grad is not None:
+                    assert spec.shard_param.grad.device.type == device
+                    assert (
+                        spec.shard_param.grad.untyped_storage().data_ptr()
+                        == grad_storage
+                    )
+
+
+def _assert_full_parameters_released(handle: ModelHandle) -> None:
+    assert all(
+        spec.full_param.numel() == 0
+        for chunk in handle._optimizer._model_chunks
+        for bucket in chunk.param_sync.buckets
+        for spec in bucket.specs
+    )
+
+
+def _optimizer_state_devices(handle: ModelHandle) -> dict[str, str]:
+    devices = {}
+    inner = handle._optimizer._inner_optimizer.optimizer
+    for param_index, state in enumerate(inner.state.values()):
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                devices[f"{param_index}.{key}"] = value.device.type
+    return devices
+
+
+def _validate_uneven_shards(handle: ModelHandle) -> tuple[int, int]:
+    uneven_specs = 0
+    total_specs = 0
+    for chunk in handle._optimizer._model_chunks:
+        for bucket in chunk.param_sync.buckets:
+            local = {
+                spec.name: (spec.numel, spec.shard_numel, spec.param_offset)
+                for spec in bucket.specs
+            }
+            gathered = [None] * bucket.world_size
+            dist.all_gather_object(gathered, local, group=bucket.process_group)
+            for spec in bucket.specs:
+                rows = [rank_state[spec.name] for rank_state in gathered]
+                shard_sizes = [row[1] for row in rows]
+                assert sum(shard_sizes) == spec.numel
+                assert all(row[0] == spec.numel for row in rows)
+                total_specs += 1
+                uneven_specs += len(set(shard_sizes)) > 1
+    assert uneven_specs > 0, "functional checkpoint must cover uneven M-FSDP shards"
+    return uneven_specs, total_specs
+
+
+def _functional_oracle_path(run_dir: str) -> str:
+    return os.path.join(run_dir, f"oracle_rank_{dist.get_rank():05d}.pt")
+
+
+def test_mfsdp_checkpoint_export_offload_resume():
+    """Two-process M-FSDP DCP/resume + rollout export + offload combination gate."""
+    phase = os.environ.get("MLITE_MFSDP_FUNCTIONAL_PHASE")
+    run_dir = os.environ.get("MLITE_MFSDP_FUNCTIONAL_DIR")
+    if phase not in {"save", "resume"} or not run_dir:
+        pytest.skip("run through run_mfsdp_hopper_validation.sh functional")
+    if dist.get_world_size() != _FULL_PARALLEL_WORLD_SIZE:
+        pytest.fail("M-FSDP functional signoff requires exactly 8 ranks")
+
+    handle, _initial = _build_full_parallel_handle(
+        "mfsdp", seed=7345 if phase == "save" else 9999
+    )
+    scheduler = _CheckpointScheduler()
+    handle._lr_scheduler = scheduler
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    checkpoint_root = os.path.join(run_dir, "checkpoint")
+    uneven_specs, total_specs = _validate_uneven_shards(handle)
+
+    if phase == "save":
+        loss1, grad1, _ = _run_full_parallel_step(
+            handle, batch_seed=12001, record_collectives=False
+        )
+        scheduler.step()
+        runtime.save_checkpoint(handle, checkpoint_root, step=1, use_dcp=True)
+        _assert_full_parameters_released(handle)
+        checkpoint_snapshot = _mfsdp_persistent_snapshot(handle)
+        expected_rng = torch.rand(16, device="cuda").cpu()
+
+        loss2, grad2, _ = _run_full_parallel_step(
+            handle, batch_seed=12002, record_collectives=False
+        )
+        scheduler.step()
+        uninterrupted_snapshot = _mfsdp_persistent_snapshot(handle)
+        uninterrupted_export = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in runtime.export_weights(handle)
+        }
+        assert uninterrupted_export
+        _assert_full_parameters_released(handle)
+        torch.save(
+            {
+                "checkpoint_snapshot": checkpoint_snapshot,
+                "expected_rng": expected_rng,
+                "loss2": loss2,
+                "grad2": grad2,
+                "uninterrupted_snapshot": uninterrupted_snapshot,
+                "scheduler": scheduler.state_dict(),
+                "export": uninterrupted_export,
+            },
+            _functional_oracle_path(run_dir),
+        )
+        dist.barrier()
+        if dist.get_rank() == 0:
+            from torch.distributed.checkpoint import FileSystemReader
+
+            metadata = FileSystemReader(
+                os.path.join(checkpoint_root, "step_1")
+            ).read_metadata()
+            keys = sorted(metadata.state_dict_metadata)
+            assert "step" in keys
+            assert any(key.startswith("model_pp") for key in keys)
+            print(
+                "[MFSDP_FUNCTIONAL_SAVE] "
+                f"backend={handle._extras['optimizer_backend']} dcp_keys={len(keys)} "
+                f"uneven_specs={uneven_specs}/{total_specs} "
+                f"loss1={loss1:.8f} grad1={grad1:.8f} export_tensors={len(uninterrupted_export)}",
+                flush=True,
+            )
+        return
+
+    oracle = torch.load(
+        _functional_oracle_path(run_dir), map_location="cpu", weights_only=False
+    )
+    assert runtime.load_checkpoint(handle, checkpoint_root, use_dcp=True) == 1
+    assert scheduler.step_count == 1
+    _assert_full_parameters_released(handle)
+    _assert_snapshot_equal(
+        _mfsdp_persistent_snapshot(handle), oracle["checkpoint_snapshot"], "loaded"
+    )
+    assert torch.equal(torch.rand(16, device="cuda").cpu(), oracle["expected_rng"])
+
+    before_offload = _mfsdp_persistent_snapshot(handle)
+    cuda_state_devices = _optimizer_state_devices(handle)
+    assert {
+        device
+        for key, device in cuda_state_devices.items()
+        if not key.endswith(".step")
+    } == {"cuda"}
+    runtime.to(handle, "cpu", model=True, optimizer=True, grad=True)
+    _assert_mfsdp_storage_aliases(handle, "cpu")
+    assert set(_optimizer_state_devices(handle).values()) == {"cpu"}
+    runtime.to(handle, "cuda", model=True, optimizer=True, grad=True)
+    _assert_mfsdp_storage_aliases(handle, "cuda")
+    assert _optimizer_state_devices(handle) == cuda_state_devices
+    _assert_snapshot_equal(
+        _mfsdp_persistent_snapshot(handle), before_offload, "offload-roundtrip"
+    )
+
+    loss2, grad2, _ = _run_full_parallel_step(
+        handle, batch_seed=12002, record_collectives=False
+    )
+    scheduler.step()
+    assert loss2 == pytest.approx(oracle["loss2"], rel=0.0, abs=0.0)
+    assert grad2 == pytest.approx(oracle["grad2"], rel=0.0, abs=0.0)
+    assert scheduler.state_dict() == oracle["scheduler"]
+    _assert_snapshot_equal(
+        _mfsdp_persistent_snapshot(handle),
+        oracle["uninterrupted_snapshot"],
+        "resumed-step",
+    )
+
+    allocations = []
+    for _ in range(3):
+        exported = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in runtime.export_weights(handle)
+        }
+        assert exported.keys() == oracle["export"].keys()
+        for name, tensor in exported.items():
+            reference = oracle["export"][name]
+            assert tensor.dtype == reference.dtype
+            assert torch.equal(tensor, reference), f"export mismatch: {name}"
+        _assert_full_parameters_released(handle)
+        del exported
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        allocations.append(torch.cuda.memory_allocated())
+    assert max(allocations) - min(allocations) <= 16 * 1024 * 1024
+
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_FUNCTIONAL_RESUME] "
+            f"backend={handle._extras['optimizer_backend']} step=2 "
+            f"loss={loss2:.8f} grad={grad2:.8f} "
+            f"optimizer_tensors={len(cuda_state_devices)} export_tensors={len(oracle['export'])} "
+            f"export_allocated_bytes={','.join(str(value) for value in allocations)} "
+            f"uneven_specs={uneven_specs}/{total_specs}",
+            flush=True,
+        )
 
 
 def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import fields as dc_fields
 from datetime import timedelta
 from itertools import chain
@@ -15,9 +15,17 @@ import torch
 import torch.distributed as dist
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
+from megatron.lite.runtime.contracts.data import (
+    ForwardResult,
+    ModelOutputs,
+    PackedBatch,
+)
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from megatron.lite.runtime.contracts.loss import get_loss_context, split_loss_context, use_loss_context
+from megatron.lite.runtime.contracts.loss import (
+    get_loss_context,
+    split_loss_context,
+    use_loss_context,
+)
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
@@ -25,14 +33,22 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     init_fields = {f.name for f in dc_fields(proto.ImplConfig) if f.init}
     # Only forward impl_cfg keys this model's ImplConfig declares: the connector
     # may pass knobs (e.g. cross_entropy_fusion) that some models don't model.
-    impl_cfg_kwargs = {key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields}
+    impl_cfg_kwargs = {
+        key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields
+    }
     impl_cfg_kwargs["parallel"] = rt_cfg.parallel
     if (
         "attention_backend_override" in init_fields
         and impl_cfg_kwargs.get("attention_backend_override") is None
     ):
-        impl_cfg_kwargs["attention_backend_override"] = rt_cfg.attention_backend_override
-    if "hf_path" in init_fields and impl_cfg_kwargs.get("hf_path") in (None, "") and rt_cfg.hf_path:
+        impl_cfg_kwargs["attention_backend_override"] = (
+            rt_cfg.attention_backend_override
+        )
+    if (
+        "hf_path" in init_fields
+        and impl_cfg_kwargs.get("hf_path") in (None, "")
+        and rt_cfg.hf_path
+    ):
         impl_cfg_kwargs["hf_path"] = rt_cfg.hf_path
     # Thread the user-level OptimizerConfig so the protocol can pass it to
     # optimizer primitives without reading runtime internals.
@@ -68,9 +84,13 @@ def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
     os.environ["NVTE_UNFUSED_ATTN"] = unfused
 
 
-def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tuple[int, int, int]:
+def _infer_pipeline_tensor_shape(
+    batch: PackedBatch, model_cfg: Any, ps
+) -> tuple[int, int, int]:
     if model_cfg is None or not hasattr(model_cfg, "hidden_size"):
-        raise ValueError("Megatron Lite pipeline runtime requires model_cfg.hidden_size.")
+        raise ValueError(
+            "Megatron Lite pipeline runtime requires model_cfg.hidden_size."
+        )
     if not isinstance(batch, PackedBatch):
         raise TypeError("Megatron Lite pipeline runtime requires PackedBatch inputs.")
 
@@ -82,7 +102,9 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
         batch_size = int(input_ids.size(0))
         local_seq_len = int(input_ids.size(1))
     else:
-        raise ValueError(f"Unsupported input_ids rank for pipeline runtime: {input_ids.dim()}.")
+        raise ValueError(
+            f"Unsupported input_ids rank for pipeline runtime: {input_ids.dim()}."
+        )
 
     if local_seq_len < 1:
         raise ValueError("Pipeline tensor shape requires non-empty sequence.")
@@ -96,7 +118,11 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
     # (each sequence padded to align = tp * (2*cp if cp>1 else 1)) then divide by CP*TP.
     seq_lens = getattr(batch, "seq_lens", None)
     if seq_lens is not None and cp_size * tp_size > 1:
-        sl = seq_lens if isinstance(seq_lens, torch.Tensor) else torch.as_tensor(seq_lens)
+        sl = (
+            seq_lens
+            if isinstance(seq_lens, torch.Tensor)
+            else torch.as_tensor(seq_lens)
+        )
         sl = sl.to(torch.int64).reshape(-1)
         align = tp_size * (2 * cp_size if cp_size > 1 else 1)
         padded = sl + (align - sl % align) % align
@@ -211,9 +237,15 @@ class MegatronLiteRuntime(RuntimeBase):
 
         # ── load HF weights (optional) ──
         loaded_hf_weights = False
-        if rt_cfg.load_hf_weights and rt_cfg.hf_path and hasattr(proto, "load_hf_weights"):
+        if (
+            rt_cfg.load_hf_weights
+            and rt_cfg.hf_path
+            and hasattr(proto, "load_hf_weights")
+        ):
             for chunk in bundle.chunks:
-                proto.load_hf_weights(chunk, rt_cfg.hf_path, model_cfg, bundle.parallel_state)
+                proto.load_hf_weights(
+                    chunk, rt_cfg.hf_path, model_cfg, bundle.parallel_state
+                )
             loaded_hf_weights = True
 
         post_load_hook = bundle.extras.pop("post_model_load_hook", None)
@@ -229,7 +261,9 @@ class MegatronLiteRuntime(RuntimeBase):
                 extra_updates = post_load_updates.get("extras")
                 if extra_updates:
                     if not isinstance(extra_updates, dict):
-                        raise TypeError("post_model_load_hook extras update must be a dict.")
+                        raise TypeError(
+                            "post_model_load_hook extras update must be a dict."
+                        )
                     bundle.extras.update(extra_updates)
 
         if loaded_hf_weights and bundle.optimizer is not None:
@@ -238,7 +272,9 @@ class MegatronLiteRuntime(RuntimeBase):
                 reload_model_params()
 
         if bundle.forward_step is None:
-            raise ValueError("Megatron Lite model bundles must provide a typed forward_step.")
+            raise ValueError(
+                "Megatron Lite model bundles must provide a typed forward_step."
+            )
 
         p = rt_cfg.parallel
         model = bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks
@@ -262,7 +298,10 @@ class MegatronLiteRuntime(RuntimeBase):
 
     def _load_protocol(self, rt_cfg: MegatronLiteConfig):
         """Load and return the model protocol module."""
-        from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES, resolve_runtime_model_name
+        from megatron.lite.model.registry import (
+            TRAIN_RUNTIME_MODULES,
+            resolve_runtime_model_name,
+        )
 
         try:
             runtime_key = resolve_runtime_model_name(rt_cfg.model_name, rt_cfg.impl)
@@ -282,7 +321,9 @@ class MegatronLiteRuntime(RuntimeBase):
 
         for fn_name in ("build_model_config", "build_model"):
             if not callable(getattr(proto, fn_name, None)):
-                raise ValueError(f"Protocol module {mod_path} missing required function: {fn_name}")
+                raise ValueError(
+                    f"Protocol module {mod_path} missing required function: {fn_name}"
+                )
         if not hasattr(proto, "ImplConfig"):
             raise ValueError(f"Protocol module {mod_path} missing ImplConfig class")
 
@@ -293,6 +334,7 @@ class MegatronLiteRuntime(RuntimeBase):
     def save_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> None:
         from megatron.lite.primitive.ckpt import save_training_checkpoint
 
+        optimizer_backend = _optimizer_backend(handle)
         step = kwargs.pop("step", None)
         if step is None:
             step = kwargs.pop("iteration", None)
@@ -301,25 +343,29 @@ class MegatronLiteRuntime(RuntimeBase):
         use_dcp = bool(kwargs.pop("use_dcp", True))
         save_rng = bool(kwargs.pop("save_rng", True))
         get_placements, is_expert = _checkpoint_hooks(handle)
-        save_training_checkpoint(
-            _checkpoint_model(handle, use_dcp=use_dcp),
-            handle._optimizer,
-            int(step),
-            path,
-            _checkpoint_parallel_config(handle),
-            handle._parallel_state,
-            get_placements=kwargs.pop("get_placements", get_placements),
-            is_expert=kwargs.pop("is_expert", is_expert),
-            use_dcp=use_dcp,
-            save_rng=save_rng,
-            save_model=kwargs.pop("save_model", True),
-            save_optimizer=kwargs.pop("save_optimizer", True),
-            **kwargs,
-        )
+        with _materialized_model_parameters(handle):
+            save_training_checkpoint(
+                _checkpoint_model(handle, use_dcp=use_dcp),
+                handle._optimizer,
+                int(step),
+                path,
+                _checkpoint_parallel_config(handle),
+                handle._parallel_state,
+                get_placements=kwargs.pop("get_placements", get_placements),
+                is_expert=kwargs.pop("is_expert", is_expert),
+                use_dcp=use_dcp,
+                save_rng=save_rng,
+                save_model=kwargs.pop("save_model", True),
+                save_optimizer=kwargs.pop("save_optimizer", True),
+                optimizer_backend=optimizer_backend,
+                lr_scheduler=handle._lr_scheduler,
+                **kwargs,
+            )
 
     def load_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> int:
         from megatron.lite.primitive.ckpt import load_training_checkpoint
 
+        optimizer_backend = _optimizer_backend(handle)
         use_dcp = bool(kwargs.pop("use_dcp", True))
         load_rng = bool(kwargs.pop("load_rng", True))
         update_legacy_format = bool(
@@ -329,36 +375,44 @@ class MegatronLiteRuntime(RuntimeBase):
             )
         )
         get_placements, is_expert = _checkpoint_hooks(handle)
-        return load_training_checkpoint(
-            _checkpoint_model(handle, use_dcp=use_dcp),
-            handle._optimizer,
-            path,
-            _checkpoint_parallel_config(handle),
-            handle._parallel_state,
-            get_placements=kwargs.pop("get_placements", get_placements),
-            is_expert=kwargs.pop("is_expert", is_expert),
-            use_dcp=use_dcp,
-            load_rng=load_rng,
-            load_parameter_state_update_legacy_format=update_legacy_format,
-            load_model=kwargs.pop("load_model", True),
-            load_optimizer=kwargs.pop("load_optimizer", True),
-            **kwargs,
-        )
+        with _materialized_model_parameters(handle):
+            step = load_training_checkpoint(
+                _checkpoint_model(handle, use_dcp=use_dcp),
+                handle._optimizer,
+                path,
+                _checkpoint_parallel_config(handle),
+                handle._parallel_state,
+                get_placements=kwargs.pop("get_placements", get_placements),
+                is_expert=kwargs.pop("is_expert", is_expert),
+                use_dcp=use_dcp,
+                load_rng=load_rng,
+                load_parameter_state_update_legacy_format=update_legacy_format,
+                load_model=kwargs.pop("load_model", True),
+                load_optimizer=kwargs.pop("load_optimizer", True),
+                optimizer_backend=optimizer_backend,
+                lr_scheduler=handle._lr_scheduler,
+                **kwargs,
+            )
+            sync_model = getattr(
+                optimizer_backend, "sync_model_weights_to_main_weights", None
+            )
+            if callable(sync_model) and handle._optimizer is not None:
+                sync_model(handle._optimizer)
+        return step
 
-    def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
+    def export_weights(
+        self, handle: ModelHandle, **kwargs
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         model_chunks = handle._extras.get("model_chunks", [handle._model])
         proto = handle._extras.get("protocol")
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
 
-        with ExitStack() as stack:
-            for chunk in model_chunks:
-                full_parameter_context = getattr(chunk, "full_parameter_context", None)
-                if callable(full_parameter_context):
-                    stack.enter_context(full_parameter_context())
-
+        with _materialized_model_parameters(handle):
             if proto and hasattr(proto, "export_hf_weights"):
-                yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
+                yield from proto.export_hf_weights(
+                    model_chunks, model_cfg, ps, **kwargs
+                )
             else:
                 for chunk in model_chunks:
                     yield from chunk.named_parameters()
@@ -438,7 +492,9 @@ class MegatronLiteRuntime(RuntimeBase):
             from types import SimpleNamespace
 
             from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
-            from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
+            from megatron.lite.primitive.parallel.pipeline import (
+                forward_backward_pipelining,
+            )
 
             first_item = next(data_iter)
             first_batch, _loss_context = split_loss_context(first_item)
@@ -448,7 +504,9 @@ class MegatronLiteRuntime(RuntimeBase):
             )
             model_chunks = handle._extras.get("model_chunks", [handle._model])
             pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
-            pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
+            pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(
+                forward_step, loss_fn
+            )
 
             def enable_optimizer_grad_sync() -> None:
                 handle._optimizer.grad_sync_enabled = True
@@ -461,7 +519,9 @@ class MegatronLiteRuntime(RuntimeBase):
                 ps,
                 tensor_shape=tensor_shape,
                 grad_sync_fn=(
-                    enable_optimizer_grad_sync if handle._optimizer is not None else None
+                    enable_optimizer_grad_sync
+                    if handle._optimizer is not None
+                    else None
                 ),
                 pre_forward_hook=handle._extras.get("pre_forward_hook"),
                 loss_fn=pipeline_loss_fn,
@@ -479,7 +539,9 @@ class MegatronLiteRuntime(RuntimeBase):
                 dtype=torch.float32,
             )
             if ps.pp_group is not None and ps.pp_global_ranks is not None:
-                dist.broadcast(loss_payload, src=ps.pp_global_ranks[-1], group=ps.pp_group)
+                dist.broadcast(
+                    loss_payload, src=ps.pp_global_ranks[-1], group=ps.pp_group
+                )
             out = {"loss": loss_payload[1]} if bool(loss_payload[0].item()) else {}
         else:
             out = run_microbatch_loop(
@@ -527,12 +589,20 @@ class MegatronLiteRuntime(RuntimeBase):
             if hasattr(chunk, "zero_grad_buffer"):
                 chunk.zero_grad_buffer()
         if handle._optimizer is not None:
-            handle._optimizer.zero_grad()
+            backend = _optimizer_backend(handle)
+            if backend is None:
+                handle._optimizer.zero_grad()
+            else:
+                backend.zero_grad(handle._optimizer)
 
     def optimizer_step(self, handle: ModelHandle) -> tuple[bool, float, int | None]:
         if handle._optimizer is None:
             return True, 0.0, 0
-        update_successful, grad_norm, num_zeros = handle._optimizer.step()
+        backend = _optimizer_backend(handle)
+        if backend is None:
+            update_successful, grad_norm, num_zeros = handle._optimizer.step()
+        else:
+            update_successful, grad_norm, num_zeros = backend.step(handle._optimizer)
         return update_successful, float(grad_norm), num_zeros
 
     def lr_scheduler_step(self, handle: ModelHandle) -> float | list[float]:
@@ -591,10 +661,33 @@ def _checkpoint_model(handle: ModelHandle, *, use_dcp: bool):
 
 
 def _checkpoint_hooks(handle: ModelHandle):
-    from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
+    from megatron.lite.primitive.protocols import (
+        default_expert_classifier,
+        default_placement_fn,
+    )
 
     proto = handle._extras.get("protocol")
     return (
         getattr(proto, "PLACEMENT_FN", default_placement_fn),
         getattr(proto, "EXPERT_CLASSIFIER", default_expert_classifier),
     )
+
+
+def _optimizer_backend(handle: ModelHandle):
+    backend_name = handle._extras.get("optimizer_backend")
+    if backend_name in (None, "none"):
+        return None
+    from megatron.lite.primitive.optimizers import get_optimizer_backend
+
+    return get_optimizer_backend(backend_name)
+
+
+@contextmanager
+def _materialized_model_parameters(handle: ModelHandle):
+    """Keep generic runtime consumers inside each wrapper's full-param lease."""
+    with ExitStack() as stack:
+        for chunk in handle._extras.get("model_chunks", [handle._model]):
+            full_parameter_context = getattr(chunk, "full_parameter_context", None)
+            if callable(full_parameter_context):
+                stack.enter_context(full_parameter_context())
+        yield

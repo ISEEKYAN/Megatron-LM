@@ -45,6 +45,8 @@ def save_training_checkpoint(
     save_rng: bool = True,
     save_model: bool = True,
     save_optimizer: bool = True,
+    optimizer_backend=None,
+    lr_scheduler=None,
 ) -> None:
     """Save training checkpoint using DTensor + DCP for automatic resharding."""
     if path is None and isinstance(step, str):
@@ -56,14 +58,30 @@ def save_training_checkpoint(
     if use_dcp is None:
         use_dcp = True
     if not use_dcp:
-        _save_local_training_checkpoint(model, optimizer, step, path, save_rng=save_rng)
+        _save_local_training_checkpoint(
+            model,
+            optimizer,
+            step,
+            path,
+            save_rng=save_rng,
+            save_model=save_model,
+            save_optimizer=save_optimizer,
+            optimizer_backend=optimizer_backend,
+            lr_scheduler=lr_scheduler,
+        )
         return
     if _supports_dist_opt_distckpt(model, optimizer):
         ckpt_path = os.path.join(path, f"step_{step}")
         os.makedirs(ckpt_path, exist_ok=True)
         _save_dist_opt_checkpoint(
-            model, optimizer, step, ckpt_path, save_model=save_model, save_optimizer=save_optimizer
+            model,
+            optimizer,
+            step,
+            ckpt_path,
+            save_model=save_model,
+            save_optimizer=save_optimizer,
         )
+        _save_scheduler_checkpoint(lr_scheduler, ckpt_path)
         if save_rng:
             _save_rng_sidecar(ckpt_path)
         log_rank0(f"Saved dist_opt checkpoint at step {step} to {ckpt_path}")
@@ -84,13 +102,18 @@ def save_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(param, mesh, placements)
+            state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(
+                param, mesh, placements
+            )
 
     ckpt_path = os.path.join(path, f"step_{step}")
     os.makedirs(ckpt_path, exist_ok=True)
     dcp.save(state_dict, checkpoint_id=ckpt_path)
     if save_optimizer:
-        _save_optimizer_checkpoint(optimizer, ckpt_path)
+        _save_optimizer_checkpoint(
+            optimizer, ckpt_path, optimizer_backend=optimizer_backend
+        )
+    _save_scheduler_checkpoint(lr_scheduler, ckpt_path)
     if save_rng:
         _save_rng_sidecar(ckpt_path)
     log_rank0(f"Saved training checkpoint at step {step} to {ckpt_path}")
@@ -110,6 +133,8 @@ def load_training_checkpoint(
     load_parameter_state_update_legacy_format: bool = False,
     load_model: bool = True,
     load_optimizer: bool = True,
+    optimizer_backend=None,
+    lr_scheduler=None,
 ) -> int:
     """Load training checkpoint with automatic resharding across different parallel configs."""
     if use_dcp is None:
@@ -121,12 +146,21 @@ def load_training_checkpoint(
             path,
             load_rng=load_rng,
             load_parameter_state_update_legacy_format=load_parameter_state_update_legacy_format,
+            load_model=load_model,
+            load_optimizer=load_optimizer,
+            optimizer_backend=optimizer_backend,
+            lr_scheduler=lr_scheduler,
         )
     ckpt_path = _resolve_step_checkpoint_path(path)
     if _supports_dist_opt_distckpt(model, optimizer):
         step = _load_dist_opt_checkpoint(
-            model, optimizer, ckpt_path, load_model=load_model, load_optimizer=load_optimizer
+            model,
+            optimizer,
+            ckpt_path,
+            load_model=load_model,
+            load_optimizer=load_optimizer,
         )
+        _load_scheduler_checkpoint(lr_scheduler, ckpt_path)
         if load_rng:
             _load_rng_sidecar(ckpt_path)
         log_rank0(f"Loaded dist_opt checkpoint from {path} at step {step}")
@@ -161,7 +195,10 @@ def load_training_checkpoint(
                     _copy_tensor_(param, t)
 
     if load_optimizer:
-        _load_optimizer_checkpoint(optimizer, ckpt_path)
+        _load_optimizer_checkpoint(
+            optimizer, ckpt_path, optimizer_backend=optimizer_backend
+        )
+    _load_scheduler_checkpoint(lr_scheduler, ckpt_path)
 
     step = state_dict.get("step", 0)
     if load_rng:
@@ -175,14 +212,17 @@ def _resolve_step_checkpoint_path(path: str) -> str:
         return path
 
     step_dirs = sorted(
-        [d for d in os.listdir(path) if d.startswith("step_")], key=lambda d: int(d.split("_")[1])
+        [d for d in os.listdir(path) if d.startswith("step_")],
+        key=lambda d: int(d.split("_")[1]),
     )
     if step_dirs:
         return os.path.join(path, step_dirs[-1])
     return path
 
 
-def _supports_dist_opt_distckpt(model: nn.Module | Iterable[nn.Module], optimizer) -> bool:
+def _supports_dist_opt_distckpt(
+    model: nn.Module | Iterable[nn.Module], optimizer
+) -> bool:
     try:
         from megatron.lite.primitive.ckpt.distckpt import supports_dist_opt_distckpt
     except ModuleNotFoundError as exc:
@@ -205,7 +245,12 @@ def _save_dist_opt_checkpoint(
     from megatron.lite.primitive.ckpt.distckpt import save_dist_opt_checkpoint
 
     save_dist_opt_checkpoint(
-        model, optimizer, step, path, save_model=save_model, save_optimizer=save_optimizer
+        model,
+        optimizer,
+        step,
+        path,
+        save_model=save_model,
+        save_optimizer=save_optimizer,
     )
 
 
@@ -229,29 +274,75 @@ def _optimizer_checkpoint_path(path: str) -> str:
     return os.path.join(path, f"optimizer_rank_{rank}.pt")
 
 
-def _save_optimizer_checkpoint(optimizer, path: str) -> None:
+def _scheduler_checkpoint_path(path: str) -> str:
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    return os.path.join(path, f"scheduler_rank_{rank}.pt")
+
+
+def _save_optimizer_checkpoint(optimizer, path: str, *, optimizer_backend=None) -> None:
     if optimizer is None:
         log_rank0("Skipping optimizer checkpoint save because optimizer is None")
         return
     state_dict_fn = getattr(optimizer, "state_dict", None)
     if not callable(state_dict_fn):
-        raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide state_dict().")
-    torch.save(state_dict_fn(), _optimizer_checkpoint_path(path))
+        raise TypeError(
+            f"Optimizer {type(optimizer).__name__} does not provide state_dict()."
+        )
+    state = (
+        optimizer_backend.state_dict(optimizer)
+        if optimizer_backend is not None
+        else state_dict_fn()
+    )
+    torch.save(state, _optimizer_checkpoint_path(path))
 
 
-def _load_optimizer_checkpoint(optimizer, path: str) -> None:
+def _load_optimizer_checkpoint(optimizer, path: str, *, optimizer_backend=None) -> None:
     if optimizer is None:
         log_rank0("Skipping optimizer checkpoint load because optimizer is None")
         return
     ckpt_path = _optimizer_checkpoint_path(path)
     if not os.path.exists(ckpt_path):
-        log_rank0(f"No optimizer checkpoint found at {ckpt_path}; loading model state only")
-        return
+        raise FileNotFoundError(
+            f"Optimizer checkpoint is required but missing: {ckpt_path}. "
+            "Pass load_optimizer=False for an intentional model-only load."
+        )
     load_state_dict_fn = getattr(optimizer, "load_state_dict", None)
     if not callable(load_state_dict_fn):
-        raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide load_state_dict().")
+        raise TypeError(
+            f"Optimizer {type(optimizer).__name__} does not provide load_state_dict()."
+        )
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    load_state_dict_fn(state)
+    if optimizer_backend is not None:
+        optimizer_backend.load_state_dict(optimizer, state)
+    else:
+        load_state_dict_fn(state)
+
+
+def _save_scheduler_checkpoint(lr_scheduler, path: str) -> None:
+    if lr_scheduler is None:
+        return
+    state_dict_fn = getattr(lr_scheduler, "state_dict", None)
+    if not callable(state_dict_fn):
+        raise TypeError(
+            f"LR scheduler {type(lr_scheduler).__name__} does not provide state_dict()."
+        )
+    torch.save(state_dict_fn(), _scheduler_checkpoint_path(path))
+
+
+def _load_scheduler_checkpoint(lr_scheduler, path: str) -> None:
+    if lr_scheduler is None:
+        return
+    ckpt_path = _scheduler_checkpoint_path(path)
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"LR scheduler checkpoint is required but missing: {ckpt_path}"
+        )
+    load_state_dict_fn = getattr(lr_scheduler, "load_state_dict", None)
+    if not callable(load_state_dict_fn):
+        raise TypeError(
+            f"LR scheduler {type(lr_scheduler).__name__} does not provide load_state_dict()."
+        )
+    load_state_dict_fn(torch.load(ckpt_path, map_location="cpu", weights_only=False))
 
 
 def _model_chunks(model: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:
@@ -281,7 +372,9 @@ def _is_dtensor_like(tensor: Any) -> bool:
     )
 
 
-def _dcp_tensor_from_param(param: torch.Tensor, mesh: DeviceMesh, placements: list) -> DTensor:
+def _dcp_tensor_from_param(
+    param: torch.Tensor, mesh: DeviceMesh, placements: list
+) -> DTensor:
     if _is_dtensor_like(param):
         return _dtensor_from_dtensor_like_param(param, _to_local_tensor(param).detach())
     return DTensor.from_local(_to_local_tensor(param).detach(), mesh, placements)
@@ -291,11 +384,17 @@ def _empty_dcp_tensor_like_param(
     param: torch.Tensor, mesh: DeviceMesh, placements: list
 ) -> DTensor:
     if _is_dtensor_like(param):
-        return _dtensor_from_dtensor_like_param(param, torch.empty_like(_to_local_tensor(param)))
-    return DTensor.from_local(torch.empty_like(_to_local_tensor(param)), mesh, placements)
+        return _dtensor_from_dtensor_like_param(
+            param, torch.empty_like(_to_local_tensor(param))
+        )
+    return DTensor.from_local(
+        torch.empty_like(_to_local_tensor(param)), mesh, placements
+    )
 
 
-def _dtensor_from_dtensor_like_param(param: torch.Tensor, local_tensor: torch.Tensor) -> DTensor:
+def _dtensor_from_dtensor_like_param(
+    param: torch.Tensor, local_tensor: torch.Tensor
+) -> DTensor:
     return DTensor.from_local(
         local_tensor,
         param.device_mesh,
@@ -307,7 +406,9 @@ def _dtensor_from_dtensor_like_param(param: torch.Tensor, local_tensor: torch.Te
 
 def _copy_tensor_(target: torch.Tensor, src: torch.Tensor) -> None:
     local_target = _to_local_tensor(target)
-    local_src = _to_local_tensor(src).to(device=local_target.device, dtype=local_target.dtype)
+    local_src = _to_local_tensor(src).to(
+        device=local_target.device, dtype=local_target.dtype
+    )
     if isinstance(local_target, torch.Tensor) and local_target is not target:
         local_target.copy_(local_src)
     else:
@@ -351,7 +452,9 @@ def _local_checkpoint_file(path: str | os.PathLike[str]) -> Path:
 
 
 def _local_optimizer_parameter_state_file(ckpt_file: Path) -> Path:
-    return ckpt_file.with_name(f"{ckpt_file.stem}.optimizer_parameter_state{ckpt_file.suffix}")
+    return ckpt_file.with_name(
+        f"{ckpt_file.stem}.optimizer_parameter_state{ckpt_file.suffix}"
+    )
 
 
 def _rank_suffix() -> str:
@@ -387,7 +490,9 @@ def _get_cuda_rng_tracker_states() -> dict[str, torch.Tensor]:
     from megatron.core import tensor_parallel
 
     states = tensor_parallel.get_cuda_rng_tracker().get_states()
-    return {name: _cpu_clone(state) for name, state in states.items() if state is not None}
+    return {
+        name: _cpu_clone(state) for name, state in states.items() if state is not None
+    }
 
 
 def _get_rng_state() -> dict[str, Any]:
@@ -414,7 +519,9 @@ def _restore_cuda_rng_tracker_states(states: dict[str, torch.Tensor]) -> None:
         }
         tracker.set_states(restored)
     except Exception as exc:
-        raise RuntimeError("Failed to restore Megatron tensor-parallel RNG tracker state.") from exc
+        raise RuntimeError(
+            "Failed to restore Megatron tensor-parallel RNG tracker state."
+        ) from exc
 
 
 def _restore_rng_state(state: dict[str, Any] | None) -> None:
@@ -450,28 +557,45 @@ def _save_local_training_checkpoint(
     path: str,
     *,
     save_rng: bool = True,
+    save_model: bool = True,
+    save_optimizer: bool = True,
+    optimizer_backend=None,
+    lr_scheduler=None,
 ) -> None:
     chunks = _model_chunks(model)
     ckpt_file = _local_checkpoint_file(path)
     ckpt_file.parent.mkdir(parents=True, exist_ok=True)
     save_parameter_state = getattr(optimizer, "save_parameter_state", None)
     optimizer_parameter_state_file = (
-        _local_optimizer_parameter_state_file(ckpt_file) if callable(save_parameter_state) else None
+        _local_optimizer_parameter_state_file(ckpt_file)
+        if callable(save_parameter_state)
+        else None
     )
     state = {
         "format": "megatron_lite.local_training.v1",
         "step": int(step),
-        "model": [_chunk_tensor_state(chunk) for chunk in chunks],
-        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "model": [_chunk_tensor_state(chunk) for chunk in chunks]
+        if save_model
+        else None,
+        "optimizer": (
+            optimizer_backend.state_dict(optimizer)
+            if save_optimizer
+            and optimizer is not None
+            and optimizer_backend is not None
+            else optimizer.state_dict()
+            if save_optimizer and optimizer is not None
+            else None
+        ),
         "optimizer_parameter_state": (
             optimizer_parameter_state_file.name
-            if optimizer_parameter_state_file is not None
+            if save_optimizer and optimizer_parameter_state_file is not None
             else None
         ),
         "rng_state": _get_rng_state() if save_rng else None,
+        "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
     }
     torch.save(state, ckpt_file)
-    if optimizer_parameter_state_file is not None:
+    if save_optimizer and optimizer_parameter_state_file is not None:
         save_parameter_state(str(optimizer_parameter_state_file))
     log_rank0(f"Saved local training checkpoint at step {step} to {ckpt_file}")
 
@@ -483,19 +607,29 @@ def _load_local_training_checkpoint(
     *,
     load_rng: bool = True,
     load_parameter_state_update_legacy_format: bool = False,
+    load_model: bool = True,
+    load_optimizer: bool = True,
+    optimizer_backend=None,
+    lr_scheduler=None,
 ) -> int:
     ckpt_file = _local_checkpoint_file(path)
     state = torch.load(ckpt_file, map_location="cpu", weights_only=False)
     if state.get("format") != "megatron_lite.local_training.v1":
         raise RuntimeError(f"Unsupported local checkpoint format in {ckpt_file}")
-    chunks = _model_chunks(model)
-    chunk_states = state.get("model")
-    if not isinstance(chunk_states, list) or len(chunk_states) != len(chunks):
-        raise RuntimeError("Checkpoint model chunk count does not match target model.")
-    for chunk, chunk_state in zip(chunks, chunk_states, strict=True):
-        _load_chunk_tensor_state(chunk, chunk_state)
-    if optimizer is not None and state.get("optimizer") is not None:
-        optimizer.load_state_dict(state["optimizer"])
+    if load_model:
+        chunks = _model_chunks(model)
+        chunk_states = state.get("model")
+        if not isinstance(chunk_states, list) or len(chunk_states) != len(chunks):
+            raise RuntimeError(
+                "Checkpoint model chunk count does not match target model."
+            )
+        for chunk, chunk_state in zip(chunks, chunk_states, strict=True):
+            _load_chunk_tensor_state(chunk, chunk_state)
+    if load_optimizer and optimizer is not None and state.get("optimizer") is not None:
+        if optimizer_backend is not None:
+            optimizer_backend.load_state_dict(optimizer, state["optimizer"])
+        else:
+            optimizer.load_state_dict(state["optimizer"])
         parameter_state_name = state.get("optimizer_parameter_state")
         load_parameter_state = getattr(optimizer, "load_parameter_state", None)
         if parameter_state_name is not None and callable(load_parameter_state):
@@ -507,6 +641,16 @@ def _load_local_training_checkpoint(
             reload_model_params = getattr(optimizer, "reload_model_params", None)
             if callable(reload_model_params):
                 reload_model_params()
+    elif load_optimizer and optimizer is not None:
+        raise RuntimeError(
+            "Checkpoint does not contain optimizer state; pass load_optimizer=False "
+            "through the DCP path for an intentional model-only load."
+        )
+    if lr_scheduler is not None:
+        scheduler_state = state.get("lr_scheduler")
+        if scheduler_state is None:
+            raise RuntimeError("Checkpoint does not contain LR scheduler state.")
+        lr_scheduler.load_state_dict(scheduler_state)
     if load_rng:
         _restore_rng_state(state.get("rng_state"))
     step = int(state.get("step", 0))
@@ -556,7 +700,9 @@ def _ag(data, size, group, dim=0):
     return allgather_concat(data, size, group, dim)
 
 
-def canonicalize_qkv_for_dcp(model, num_attention_heads, num_key_value_heads, head_dim, ps):
+def canonicalize_qkv_for_dcp(
+    model, num_attention_heads, num_key_value_heads, head_dim, ps
+):
     """Rearrange fused QKV from interleaved-TP to canonical (Q|K|V) for DCP save."""
     if ps.tp_size <= 1:
         return
@@ -579,7 +725,9 @@ def canonicalize_qkv_for_dcp(model, num_attention_heads, num_key_value_heads, he
         param.data.copy_(canon.chunk(ps.tp_size, dim=0)[ps.tp_rank])
 
 
-def decanon_qkv_after_dcp(model, num_attention_heads, num_key_value_heads, head_dim, ps):
+def decanon_qkv_after_dcp(
+    model, num_attention_heads, num_key_value_heads, head_dim, ps
+):
     """Reverse of canonicalize_qkv_for_dcp."""
     if ps.tp_size <= 1:
         return

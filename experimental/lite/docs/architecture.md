@@ -47,6 +47,15 @@ factory receives the sharded main-parameter groups and optimizer config and
 must return a `torch.optim.Optimizer`-compatible object. It must not wrap the
 model or replace the M-FSDP all-gather/reduce-scatter lifecycle.
 
+M-FSDP training checkpoints materialize model parameters only for the duration
+of the DCP save/load call, then restore the sharded steady state. Model tensors
+use DCP and may be reloaded across ranks when the model placement contract is
+unchanged. Optimizer state is a rank-local sidecar because standalone M-FSDP
+flattens parameters into runtime buckets; it therefore requires the same
+M-FSDP bucket layout and does not promise cross-backend or cross-topology
+optimizer-state compatibility. Missing optimizer or scheduler state fails
+loudly unless the caller explicitly requests a model-only load.
+
 ## Current Deliberate Omissions
 
 This package currently includes only the lite model implementation path. It

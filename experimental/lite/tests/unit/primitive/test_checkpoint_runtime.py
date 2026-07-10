@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import random
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -25,7 +26,9 @@ class TinyMLP(nn.Module):
         return self.layers(x)
 
 
-def _step(model: nn.Module, optimizer: torch.optim.Optimizer, x: torch.Tensor, y: torch.Tensor):
+def _step(
+    model: nn.Module, optimizer: torch.optim.Optimizer, x: torch.Tensor, y: torch.Tensor
+):
     optimizer.zero_grad(set_to_none=True)
     loss = torch.nn.functional.mse_loss(model(x), y)
     loss.backward()
@@ -113,7 +116,9 @@ class DistOptLike:
         self.parameter_save_calls += 1
         torch.save({"parameter_save_calls": self.parameter_save_calls}, filename)
 
-    def load_parameter_state(self, filename: str, *, update_legacy_format: bool = False):
+    def load_parameter_state(
+        self, filename: str, *, update_legacy_format: bool = False
+    ):
         state = torch.load(filename, weights_only=False)
         self.parameter_load_calls = int(state["parameter_save_calls"])
         self.update_legacy_format = update_legacy_format
@@ -130,11 +135,16 @@ def test_runtime_local_checkpoint_uses_optimizer_parameter_state_contract(tmp_pa
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     runtime.save_checkpoint(
-        ModelHandle(model=model, optimizer=optimizer), str(tmp_path), step=7, use_dcp=False
+        ModelHandle(model=model, optimizer=optimizer),
+        str(tmp_path),
+        step=7,
+        use_dcp=False,
     )
 
     loaded_model = TinyMLP()
-    loaded_optimizer = DistOptLike(torch.optim.AdamW(loaded_model.parameters(), lr=1.0e-3))
+    loaded_optimizer = DistOptLike(
+        torch.optim.AdamW(loaded_model.parameters(), lr=1.0e-3)
+    )
 
     assert (
         runtime.load_checkpoint(
@@ -183,17 +193,45 @@ def test_runtime_local_checkpoint_restores_rng_state(tmp_path):
     torch.testing.assert_close(torch.rand(4), expected_torch, atol=0.0, rtol=0.0)
 
 
+def test_runtime_local_checkpoint_restores_lr_scheduler_state(tmp_path):
+    model = TinyMLP()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+    optimizer.step()
+    scheduler.step()
+    expected = copy.deepcopy(scheduler.state_dict())
+    handle = ModelHandle(
+        model=model,
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    runtime.save_checkpoint(handle, str(tmp_path), step=1, use_dcp=False)
+    optimizer.step()
+    scheduler.step()
+    assert scheduler.state_dict() != expected
+    assert runtime.load_checkpoint(handle, str(tmp_path), use_dcp=False) == 1
+
+    assert scheduler.state_dict() == expected
+
+
 def test_runtime_local_checkpoint_uses_rank_specific_files_when_distributed(tmp_path):
     model = TinyMLP()
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
     with (
         patch("megatron.lite.primitive.ckpt.dcp.dist.is_available", return_value=True),
-        patch("megatron.lite.primitive.ckpt.dcp.dist.is_initialized", return_value=True),
+        patch(
+            "megatron.lite.primitive.ckpt.dcp.dist.is_initialized", return_value=True
+        ),
         patch("megatron.lite.primitive.ckpt.dcp.dist.get_rank", return_value=3),
     ):
         runtime.save_checkpoint(
-            ModelHandle(model=model, optimizer=None), str(tmp_path), step=11, use_dcp=False
+            ModelHandle(model=model, optimizer=None),
+            str(tmp_path),
+            step=11,
+            use_dcp=False,
         )
         assert (tmp_path / "training_state_rank_00003.pt").exists()
         assert not (tmp_path / "training_state.pt").exists()
@@ -222,7 +260,9 @@ def test_primitive_explicit_dcp_saves_optimizer_rank_sidecar(tmp_path):
     parallel = ParallelConfig(tp=1, ep=1, pp=1, cp=1)
 
     with (
-        patch("megatron.lite.primitive.ckpt.dcp._build_meshes", return_value=(None, None)),
+        patch(
+            "megatron.lite.primitive.ckpt.dcp._build_meshes", return_value=(None, None)
+        ),
         patch(
             "megatron.lite.primitive.ckpt.dcp.DTensor.from_local",
             side_effect=lambda tensor, *args, **kwargs: tensor,
@@ -230,7 +270,13 @@ def test_primitive_explicit_dcp_saves_optimizer_rank_sidecar(tmp_path):
         patch("megatron.lite.primitive.ckpt.dcp.dcp.save") as dcp_save_mock,
     ):
         save_training_checkpoint(
-            model, optimizer, 12, str(tmp_path), parallel, object(), use_dcp=True
+            model,
+            optimizer,
+            12,
+            str(tmp_path),
+            parallel,
+            SimpleNamespace(pp_size=1, pp_rank=0),
+            use_dcp=True,
         )
 
     dcp_save_mock.assert_called_once()
@@ -248,7 +294,9 @@ def test_runtime_dcp_checkpoint_threads_parallel_config_and_protocol_hooks(tmp_p
     def expert_classifier(name: str):
         return name.endswith("expert")
 
-    proto = SimpleNamespace(PLACEMENT_FN=placement_fn, EXPERT_CLASSIFIER=expert_classifier)
+    proto = SimpleNamespace(
+        PLACEMENT_FN=placement_fn, EXPERT_CLASSIFIER=expert_classifier
+    )
     handle = ModelHandle(
         model=[model],
         optimizer=None,
@@ -289,3 +337,83 @@ def test_runtime_dcp_checkpoint_threads_parallel_config_and_protocol_hooks(tmp_p
     assert load_kwargs["is_expert"] is expert_classifier
     assert load_kwargs["use_dcp"] is True
     assert load_kwargs["load_rng"] is True
+
+
+class _CheckpointContextModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(2))
+        self.full_parameters_active = False
+
+    @contextmanager
+    def full_parameter_context(self):
+        assert not self.full_parameters_active
+        self.full_parameters_active = True
+        try:
+            yield
+        finally:
+            self.full_parameters_active = False
+
+
+class _CheckpointBackend:
+    def __init__(self):
+        self.synced = False
+
+    def sync_model_weights_to_main_weights(self, optimizer):
+        assert optimizer == "optimizer"
+        self.synced = True
+        return True
+
+
+def test_runtime_checkpoint_uses_registered_backend_and_full_parameter_context(
+    tmp_path,
+):
+    model = _CheckpointContextModel()
+    scheduler = SimpleNamespace(state_dict=lambda: {"step": 1})
+    backend = _CheckpointBackend()
+    handle = ModelHandle(
+        model=model,
+        optimizer="optimizer",
+        lr_scheduler=scheduler,
+        parallel_state=object(),
+        config=SimpleNamespace(parallel=ParallelConfig()),
+        _extras={
+            "model_chunks": [model],
+            "optimizer_backend": "mfsdp",
+        },
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    def fake_save(*args, **kwargs):
+        assert model.full_parameters_active
+        assert kwargs["optimizer_backend"] is backend
+        assert kwargs["lr_scheduler"] is scheduler
+
+    def fake_load(*args, **kwargs):
+        assert model.full_parameters_active
+        assert kwargs["optimizer_backend"] is backend
+        assert kwargs["lr_scheduler"] is scheduler
+        assert not backend.synced
+        return 1
+
+    with (
+        patch(
+            "megatron.lite.primitive.optimizers.get_optimizer_backend",
+            return_value=backend,
+        ) as get_backend,
+        patch(
+            "megatron.lite.primitive.ckpt.save_training_checkpoint",
+            side_effect=fake_save,
+        ),
+        patch(
+            "megatron.lite.primitive.ckpt.load_training_checkpoint",
+            side_effect=fake_load,
+        ),
+    ):
+        runtime.save_checkpoint(handle, str(tmp_path), step=1)
+        assert not model.full_parameters_active
+        assert runtime.load_checkpoint(handle, str(tmp_path)) == 1
+
+    assert get_backend.call_count == 2
+    assert backend.synced
+    assert not model.full_parameters_active
