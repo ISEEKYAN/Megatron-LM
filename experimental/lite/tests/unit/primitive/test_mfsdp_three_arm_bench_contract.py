@@ -67,3 +67,12 @@ def test_runner_is_slurm_only_and_exposes_both_signoff_modes():
     assert 'three-arm' in source
     assert 'ablation' in source
     assert 'NPROC_PER_NODE:-8' in source
+
+
+def test_mcore_arm_preserves_named_tp_dimension_in_both_meshes():
+    source = BENCH.read_text()
+
+    assert 'mesh_dim_names=("dp_cp", "tp")' in source
+    assert 'tp_dim="tp"' in source
+    assert "_dense_dp_tp_rank_mesh(ps)" in source
+    assert "_expert_dp_tp_rank_mesh(ps)" in source

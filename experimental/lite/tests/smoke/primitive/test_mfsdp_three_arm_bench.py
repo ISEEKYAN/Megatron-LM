@@ -258,6 +258,44 @@ def _build_mlite_arm(
     return _Arm(name, handle, lambda: _mlite_feature_probe(handle, probe_counts))
 
 
+def _dense_dp_tp_rank_mesh(ps) -> list[list[int]]:
+    """Match MLite's dense rank order for one pipeline stage."""
+    return [
+        [
+            ((ps.pp_rank * ps.dp_size + dp_rank) * ps.cp_size + cp_rank)
+            * ps.tp_size
+            + tp_rank
+            for tp_rank in range(ps.tp_size)
+        ]
+        for dp_rank in range(ps.dp_size)
+        for cp_rank in range(ps.cp_size)
+    ]
+
+
+def _expert_dp_tp_rank_mesh(ps) -> list[list[int]]:
+    """Match MLite's expert rank order for the current PP and EP slice."""
+    return [
+        [
+            ((ps.pp_rank * ps.expert_dp_size + expert_dp_rank) * ps.ep_size + ps.ep_rank)
+            * ps.etp_size
+            + etp_rank
+            for etp_rank in range(ps.etp_size)
+        ]
+        for expert_dp_rank in range(ps.expert_dp_size)
+    ]
+
+
+def _rank_local_singleton_group():
+    """Create the trivial ETP dimension in a globally consistent order."""
+    selected = None
+    for rank in range(dist.get_world_size()):
+        group = dist.new_group(ranks=[rank])
+        if rank == dist.get_rank():
+            selected = group
+    assert selected is not None
+    return selected
+
+
 def _build_mcore_arm(*, seed: int) -> _Arm:
     from torch.distributed.device_mesh import DeviceMesh
 
@@ -272,11 +310,21 @@ def _build_mcore_arm(*, seed: int) -> _Arm:
 
     bundle, _impl_cfg = _new_bundle(None, seed=seed)
     ps = bundle.parallel_state
+    assert ps.dp_cp_group is not None
+    assert ps.tp_group is not None
+    assert ps.ep_dp_group is not None
+    expert_tp_group = ps.etp_group or _rank_local_singleton_group()
     dense_mesh = DeviceMesh.from_group(
-        ps.dp_cp_group, "cuda", mesh_dim_names=("fsdp",)
+        [ps.dp_cp_group, ps.tp_group],
+        "cuda",
+        mesh=_dense_dp_tp_rank_mesh(ps),
+        mesh_dim_names=("dp_cp", "tp"),
     )
     expert_mesh = DeviceMesh.from_group(
-        ps.ep_dp_group, "cuda", mesh_dim_names=("fsdp",)
+        [ps.ep_dp_group, expert_tp_group],
+        "cuda",
+        mesh=_expert_dp_tp_rank_mesh(ps),
+        mesh_dim_names=("dp_cp", "tp"),
     )
     wrapped_chunks = []
     torch_optimizers = []
@@ -299,8 +347,8 @@ def _build_mcore_arm(*, seed: int) -> _Arm:
             chunk,
             optimizer,
             device_mesh=dense_mesh,
-            dp_shard_dim="fsdp",
-            tp_dim=None,
+            dp_shard_dim="dp_cp",
+            tp_dim="tp",
             expt_device_mesh=expert_mesh,
             fsdp_group_ag=ps.dp_cp_group,
             expt_fsdp_group_ag=ps.ep_dp_group,
