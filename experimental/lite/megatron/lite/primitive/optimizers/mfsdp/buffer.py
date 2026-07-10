@@ -153,6 +153,9 @@ class TemporaryBufferAllocator:
         # Dynamic storage is reclaimed when the lease drops its final reference.
         return None
 
+    def release_cached(self) -> None:
+        """Drop allocator-owned communication storage before a device move."""
+
 
 class DoubleBufferAllocator(TemporaryBufferAllocator):
     """Two persistent communication slots per dtype/device/group key."""
@@ -212,6 +215,12 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
     def release(self, lease: BufferLease) -> None:
         if lease.slot is not None:
             self._busy.get(lease.key, set()).discard(lease.slot)
+
+    def release_cached(self) -> None:
+        if any(self._busy.values()):
+            raise RuntimeError("Cannot release active M-FSDP communication buffers.")
+        self._slots.clear()
+        self._busy.clear()
 
 
 def build_temporary_allocator(
@@ -435,7 +444,62 @@ class ParamBucket:
             dtype=self.policy.compute_dtype,
             device=self.device,
         )
+
         self._full_ready = False
+
+    def discard_full_parameter_views(self) -> None:
+        """Release full-parameter references after autograd no longer needs them."""
+        empty = torch.empty(
+            0,
+            dtype=self.policy.compute_dtype,
+            device=self.device,
+        )
+        with torch.no_grad():
+            for spec in self.specs:
+                spec.full_param.data = empty
+
+    def move_model_state(self, device: torch.device, *, load_grad: bool) -> None:
+        """Move persistent sharded storage without breaking optimizer aliases."""
+        device = torch.device(device)
+        self.release_full_parameters()
+        self.discard_full_parameter_views()
+        if self._grad_reduce_launched:
+            self.wait_grad_reduce()
+        self.allocator.release_cached()
+
+        grad_present = {
+            id(spec): spec.shard_param is not None and spec.shard_param.grad is not None
+            for spec in self.specs
+        }
+        self.main_param_buffer = self.main_param_buffer.to(device)
+        self.main_grad_buffer = self.main_grad_buffer.to(device)
+        self.grad_shard_buffer = self.main_grad_buffer
+        self.local_compute_buffer = self.local_compute_buffer.to(device)
+        self.local_grad_comm_buffer = self.local_grad_comm_buffer.to(device)
+        self.device = device
+        self.full_buffer = torch.empty(
+            0,
+            dtype=self.policy.compute_dtype,
+            device=device,
+        )
+
+        with torch.no_grad():
+            for spec in self.specs:
+                assert spec.shard_param is not None
+                spec.shard_param.data = self.main_param_buffer.narrow(
+                    0,
+                    spec.local_offset,
+                    spec.shard_numel,
+                )
+                if load_grad and grad_present[id(spec)]:
+                    spec.shard_param.grad = self.main_grad_buffer.narrow(
+                        0,
+                        spec.local_offset,
+                        spec.shard_numel,
+                    ).view_as(spec.shard_param)
+                else:
+                    spec.shard_param.grad = None
+                spec.full_param.data = self.full_buffer
 
     def prepare_grad_reduce(
         self, *, force: bool = False
@@ -831,6 +895,9 @@ class AllGatherPipeline:
         for bucket in self.buckets:
             bucket.release_full_parameters()
 
+    def reset_device(self, device: torch.device) -> None:
+        self.comm_stream = CommunicationStream(device)
+
 
 class GradReducePipeline:
     """Launch ready reduce-scatter buckets on a communication stream."""
@@ -879,6 +946,9 @@ class GradReducePipeline:
         for bucket in self.buckets:
             bucket.set_grad_sync_enabled(enabled)
 
+    def reset_device(self, device: torch.device) -> None:
+        self.comm_stream = CommunicationStream(device)
+
 
 class CommunicationPipelines:
     """Join parameter all-gather and gradient reduce-scatter pipelines."""
@@ -908,6 +978,17 @@ class CommunicationPipelines:
 
     def release_all(self) -> None:
         self.all_gather.release_all()
+
+    def discard_full_parameter_views(self) -> None:
+        for bucket in self.buckets:
+            bucket.discard_full_parameter_views()
+
+    def move_model_state(self, device: torch.device, *, load_grad: bool) -> None:
+        device = torch.device(device)
+        for bucket in self.buckets:
+            bucket.move_model_state(device, load_grad=load_grad)
+        self.all_gather.reset_device(device)
+        self.grad_reduce.reset_device(device)
 
     def finish_grad_sync(self) -> None:
         self.grad_reduce.finish()

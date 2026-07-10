@@ -72,6 +72,7 @@ class MegatronFSDP(nn.Module):
                 )
             )
         self.param_sync.release_all()
+        self.param_sync.discard_full_parameter_views()
 
     def forward(self, *args, **kwargs):
         self.param_sync.begin_forward()
@@ -111,6 +112,18 @@ class MegatronFSDP(nn.Module):
 
     def zero_grad_buffer(self) -> None:
         self.param_sync.reset_grad_state()
+
+    def move_model_state(
+        self,
+        device: torch.device | str,
+        *,
+        load_grad: bool = True,
+    ) -> None:
+        """Move M-FSDP-owned storage while preserving optimizer parameter aliases."""
+        self.param_sync.move_model_state(
+            torch.device(device),
+            load_grad=load_grad,
+        )
 
     def named_parameters(self, *args, **kwargs) -> Iterator[tuple[str, nn.Parameter]]:
         if not self._expose_sharded_parameters:

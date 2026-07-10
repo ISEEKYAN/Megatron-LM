@@ -1006,6 +1006,65 @@ def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
     assert torch.isfinite(chunks[0](value).float()).all()
 
 
+def test_mfsdp_releases_full_parameters_and_preserves_storage_aliases_on_move():
+    model = _GlooModel()
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_GlooUnit,),
+    )
+
+    chunk = chunks[0]
+    optimizer_params = list(_optimizer_params(optimizer))
+    assert all(
+        spec.full_param.numel() == 0
+        for bucket in chunk.param_sync.buckets
+        for spec in bucket.specs
+    )
+
+    chunk.move_model_state(torch.device("cpu"), load_grad=True)
+
+    assert all(
+        before is after
+        for before, after in zip(optimizer_params, _optimizer_params(optimizer))
+    )
+    for bucket in chunk.param_sync.buckets:
+        main_storage = bucket.main_param_buffer.untyped_storage().data_ptr()
+        assert bucket.device.type == "cpu"
+        assert bucket.main_grad_buffer.device.type == "cpu"
+        assert all(
+            spec.shard_param is not None
+            and spec.shard_param.untyped_storage().data_ptr() == main_storage
+            for spec in bucket.specs
+        )
+
+
 def _run_mfsdp_gloo_parity(rank: int, world_size: int, init_file: str) -> None:
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     dist.init_process_group(

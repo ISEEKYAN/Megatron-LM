@@ -472,6 +472,62 @@ def _is_tiny_expert(name: str) -> bool:
     return name.startswith("experts.")
 
 
+def test_mfsdp_runtime_offload_roundtrip_preserves_training_storage():
+    parallel = _dense_parallel_config()
+    chunks, optimizer, finalize = _build_mfsdp_pair(seed=2345, parallel=parallel)
+    x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+    target = torch.randn(4, 4, device="cuda", dtype=torch.bfloat16)
+    success, _loss, _grad_norm = _train_step(chunks, optimizer, finalize, x, target)
+    assert success
+
+    before = [
+        bucket.main_param_buffer.detach().cpu().clone()
+        for chunk in chunks
+        for bucket in chunk.param_sync.buckets
+    ]
+    handle = ModelHandle(
+        model=chunks[0],
+        optimizer=optimizer,
+        _extras={"model_chunks": chunks},
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime.to(handle, "cpu", model=True, optimizer=True, grad=True)
+
+    for chunk in chunks:
+        for bucket in chunk.param_sync.buckets:
+            main_storage = bucket.main_param_buffer.untyped_storage().data_ptr()
+            assert bucket.device.type == "cpu"
+            assert bucket.main_grad_buffer.device.type == "cpu"
+            assert all(
+                spec.shard_param is not None
+                and spec.shard_param.device.type == "cpu"
+                and spec.shard_param.untyped_storage().data_ptr() == main_storage
+                for spec in bucket.specs
+            )
+
+    runtime.to(handle, "cuda", model=True, optimizer=True, grad=True)
+    after = []
+    for chunk in chunks:
+        for bucket in chunk.param_sync.buckets:
+            main_storage = bucket.main_param_buffer.untyped_storage().data_ptr()
+            assert bucket.device.type == "cuda"
+            assert bucket.main_grad_buffer.device.type == "cuda"
+            assert all(
+                spec.shard_param is not None
+                and spec.shard_param.device.type == "cuda"
+                and spec.shard_param.untyped_storage().data_ptr() == main_storage
+                for spec in bucket.specs
+            )
+            after.append(bucket.main_param_buffer.detach().cpu())
+
+    for expected, actual in zip(before, after):
+        assert torch.equal(expected, actual)
+    success, _loss, _grad_norm = _train_step(chunks, optimizer, finalize, x, target)
+    assert success
+    if dist.get_rank() == 0:
+        print("[MFSDP_OFFLOAD] roundtrip=passed training_continues=true", flush=True)
+
+
 def test_mfsdp_precision_curve_matches_fsdp2():
     torch.manual_seed(4026 + dist.get_rank())
     torch.cuda.manual_seed_all(4026 + dist.get_rank())

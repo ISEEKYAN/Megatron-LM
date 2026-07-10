@@ -280,6 +280,32 @@ def test_runtime_to_prefers_optimizer_specific_offload_hooks():
     assert optimizer.calls == ["offload", "load"]
 
 
+class HookedModelStorage(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls: list[tuple[torch.device, bool]] = []
+
+    def move_model_state(self, device, *, load_grad: bool = True):
+        self.calls.append((torch.device(device), load_grad))
+
+    def to(self, *_args, **_kwargs):
+        raise AssertionError("models with private storage must use move_model_state")
+
+
+def test_runtime_to_prefers_model_specific_storage_hook():
+    model = HookedModelStorage()
+    handle = ModelHandle(model=model, optimizer=None, _extras={"model_chunks": [model]})
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    runtime.to(handle, "cpu", model=True, optimizer=False, grad=True)
+    runtime.to(handle, "cuda", model=True, optimizer=False, grad=False)
+
+    assert model.calls == [
+        (torch.device("cpu"), True),
+        (torch.device("cuda"), False),
+    ]
+
+
 class _FakeStorage:
     def __init__(self, size: int):
         self._size = size

@@ -273,6 +273,7 @@ class MFSdpOptimizer:
         result = self._inner_optimizer.step()
         for chunk in self._model_chunks:
             chunk.param_sync.release_all()
+            chunk.param_sync.discard_full_parameter_views()
         self.grad_sync_enabled = False
         return result
 
