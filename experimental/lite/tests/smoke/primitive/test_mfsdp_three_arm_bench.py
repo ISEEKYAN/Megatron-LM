@@ -259,14 +259,13 @@ def _build_mlite_arm(
     return _Arm(name, handle, lambda: _mlite_feature_probe(handle, probe_counts))
 
 
-def _dense_dp_tp_rank_mesh(ps) -> list[list[int]]:
-    """Match MLite's dense rank order for one pipeline stage."""
+def _dense_dp_local_tp_rank_mesh(ps) -> list[list[int]]:
+    """Keep MLite-owned TP shards local while MCore shards over DP x CP."""
     return [
         [
             ((ps.pp_rank * ps.dp_size + dp_rank) * ps.cp_size + cp_rank)
             * ps.tp_size
-            + tp_rank
-            for tp_rank in range(ps.tp_size)
+            + ps.tp_rank
         ]
         for dp_rank in range(ps.dp_size)
         for cp_rank in range(ps.cp_size)
@@ -318,11 +317,12 @@ def _build_mcore_arm(*, seed: int) -> _Arm:
     assert ps.dp_cp_group is not None
     assert ps.tp_group is not None
     assert ps.ep_dp_group is not None
-    expert_tp_group = ps.etp_group or _rank_local_singleton_group()
+    local_tp_group = _rank_local_singleton_group()
+    expert_tp_group = ps.etp_group or local_tp_group
     dense_mesh = DeviceMesh.from_group(
-        [ps.dp_cp_group, ps.tp_group],
+        [ps.dp_cp_group, local_tp_group],
         "cuda",
-        mesh=_dense_dp_tp_rank_mesh(ps),
+        mesh=_dense_dp_local_tp_rank_mesh(ps),
         mesh_dim_names=("dp_cp", "tp"),
     )
     expert_mesh = DeviceMesh.from_group(

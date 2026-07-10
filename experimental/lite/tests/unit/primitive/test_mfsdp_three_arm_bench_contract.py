@@ -74,9 +74,10 @@ def test_mcore_arm_preserves_named_tp_dimension_in_both_meshes():
 
     assert 'mesh_dim_names=("dp_cp", "tp")' in source
     assert 'tp_dim="tp"' in source
-    assert "_dense_dp_tp_rank_mesh(ps)" in source
+    assert "_dense_dp_local_tp_rank_mesh(ps)" in source
     assert "_expert_dp_tp_rank_mesh(ps)" in source
     assert "use_local_synchronization=True" in source
+    assert "[ps.dp_cp_group, local_tp_group]" in source
 
 
 def test_arm_construction_is_synchronized_before_next_global_group_sequence():
