@@ -134,6 +134,8 @@ def test_mfsdp_precision_signoff_uses_mcore_primary_and_full_tensor_evidence():
     assert "def ps(self)" in smoke_source
     assert "_gather_fsdp_shard" in smoke_source
     assert "dist.all_gather(sizes, local_size, group=group)" in smoke_source
+    assert "captured_grads" in smoke_source
+    assert "param.register_hook(capture_grad)" in smoke_source
     assert 'batch_mode="matched"' in smoke_source
     assert 'batch_mode="fixed"' in smoke_source
     assert "fixed-batch)" in runner_source

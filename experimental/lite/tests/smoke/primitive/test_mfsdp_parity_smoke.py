@@ -862,11 +862,13 @@ class _MCoreReferenceOptimizer:
 
     name = "mcore_mfsdp"
 
-    def __init__(self, optimizer, model_chunks, ps, param_names):
+    def __init__(self, optimizer, model_chunks, ps, param_names, captured_grads, raw_params):
         self.optimizer = optimizer
         self.model_chunks = list(model_chunks)
         self.ps = ps
         self.param_names = dict(param_names)
+        self.captured_grads = captured_grads
+        self.raw_params = raw_params
         self.params = [
             param for group in optimizer.param_groups for param in group["params"]
         ]
@@ -889,6 +891,7 @@ class _MCoreReferenceOptimizer:
 
     def zero_grad(self) -> None:
         self.optimizer.zero_grad(set_to_none=True)
+        self.captured_grads.clear()
         self.grad_sync_enabled = False
 
     def _gather_fsdp_shard(self, tensor: torch.Tensor, param: nn.Parameter) -> torch.Tensor:
@@ -917,11 +920,15 @@ class _MCoreReferenceOptimizer:
 
     def named_grad_tensors(self) -> dict[str, torch.Tensor]:
         grads = {}
-        for param in self.params:
-            if param.grad is None:
-                continue
-            name = self.param_names[id(param)]
-            grads[name] = self._gather_fsdp_shard(param.grad, param).cpu().float().clone()
+        for name, captured in self.captured_grads.items():
+            grad = captured.clone()
+            param = self.raw_params[name]
+            expert = not bool(getattr(param, "allreduce", True))
+            group = self.ps.ep_dp_group if expert else self.ps.dp_cp_group
+            if group is not None and dist.get_world_size(group) > 1:
+                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
+            grad.div_(self.ps.dp_cp_size)
+            grads[name] = grad.cpu().float().clone()
         return grads
 
     def named_state_tensors(self) -> dict[str, dict[str, torch.Tensor]]:
@@ -1069,10 +1076,27 @@ def _build_mcore_reference_optimizer(chunks, ps):
     )
     fully_shard_optimizer(raw_optimizer, preproc_state_dict_for_dcp_ckpt=False)
     param_names = {}
+    raw_params = {}
+    captured_grads = {}
     for chunk_idx, chunk in enumerate(chunks):
         for name, param in chunk.named_parameters():
             param_names[id(param)] = f"{chunk_idx}.{_canonical_optimizer_name(name)}"
-    optimizer = _MCoreReferenceOptimizer(raw_optimizer, chunks, ps, param_names)
+        for name, param in chunk.raw_param.items():
+            canonical_name = f"{chunk_idx}.{_canonical_optimizer_name(name)}"
+            raw_params[canonical_name] = param
+
+            def capture_grad(grad, *, captured_name=canonical_name):
+                value = grad.detach().float()
+                previous = captured_grads.get(captured_name)
+                captured_grads[captured_name] = (
+                    value.clone() if previous is None else previous.add(value)
+                )
+                return grad
+
+            param.register_hook(capture_grad)
+    optimizer = _MCoreReferenceOptimizer(
+        raw_optimizer, chunks, ps, param_names, captured_grads, raw_params
+    )
     chunks[:] = [_MCoreRuntimeChunk(chunk) for chunk in chunks]
     print(
         f"[MFSDP_BUILD] rank={dist.get_rank()} pp_rank={ps.pp_rank} "
