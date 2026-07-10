@@ -17,7 +17,9 @@ were still on delivery branches at the time of the study are called out as
 
 ## Decision summary
 
-The seven names are not seven peers. They belong to five ownership domains:
+The seven names are not seven peer user options. The following ownership
+domains are useful for reading the source and locating coordination seams; they
+are not a proposed public configuration schema:
 
 | Domain | Features | State it owns |
 | --- | --- | --- |
@@ -27,17 +29,29 @@ The seven names are not seven peers. They belong to five ownership domains:
 | Sequence layout | BSHD, THD, static CP, dynamic CP | token layout, positions/masks, `PackedSeqParams`, per-microbatch CP group |
 | Execution capture | eager, partial/layer CUDA Graph, full iteration, optimizer graph | static addresses, graph signature, warmup/replay order, graph-safe hooks |
 
-The recommended architecture is therefore a **construction-time capability
-compiler** with two deliberately different tools:
+The support and reuse units are deliberately different:
 
-1. typed capability contracts describe ownership and interactions across the
-   five domains; and
-2. small closed, named profiles freeze high-risk choices *inside one domain*.
+1. A **primitive** is an independently validated unit of math, parallel
+   semantics, or runtime behavior. Reusing one does not promise that it composes
+   with every other primitive.
+2. A **`(model_name, impl)` pair** is the unit of curated assembly and
+   end-to-end support. One model may have several implementations, but MLite
+   should not create an implementation for every feature-product cell.
+3. An implementation config contains only a small set of policies that change
+   the user contract, such as FP8 strategy, optimizer strategy, or
+   recompute/offload policy. THD layout, CUDA Graphs, fusion, and overlap must
+   not become five independent public feature axes merely because the source
+   analysis separates their owners.
+4. A semantics-preserving refinement such as CUDA Graph capture, fusion, or
+   overlap becomes part of the implementation's default path only after
+   correctness and performance qualification over its stated envelope. Its
+   `off` path is a correctness oracle, A/B control, and debugging aid rather
+   than an ordinary user-selected implementation mode.
 
-Do not create a global profile for every cross product, and do not add model
-names to a primitive allowlist. A model is eligible when its composed
-primitives produce complete capability evidence. The compiler must reject an
-unproven combination before model execution.
+Support is therefore explicit and selective. A needed combination is assembled
+in a concrete model implementation and qualified end to end; an unneeded or
+unqualified combination remains unsupported even when no mathematical hard
+conflict appears in the pairwise analysis.
 
 ## Classification used below
 
@@ -45,8 +59,10 @@ unproven combination before model execution.
   same time. No permanent hard conflict was found among these seven features.
 - **Needs coordination** means the features share state, a process group, a
   shape/address contract, or an ordering boundary.
-- **Orthogonal** means neither feature needs to inspect the other. Both may
-  still depend on a generic lower layer, such as the parameter backend.
+- **Orthogonal** means neither feature needs to inspect the other at the
+  surveyed implementation stage. It is local evidence, not a timeless or
+  transitive support promise. Both may still depend on a generic lower layer,
+  such as the parameter backend.
 
 “Current guard” is reported separately. A source-level rejection is evidence
 of the current implementation envelope, not proof of a mathematical conflict.
@@ -59,34 +75,35 @@ implementation.
 
 | Pair | Mechanism classification | Interaction and source evidence | Current envelope |
 | --- | --- | --- | --- |
-| Muon × M-FSDP | **Needs coordination** | Muon orthogonalizes a logical 2-D matrix, including TP-aware Newton-Schulz ([`emerging_optimizers.py:185-209`][mcore-muon-ns]); a sharding backend owns when that matrix is materialized. The MLite M-FSDP seam injects an optimizer factory after main-parameter grouping ([`fused_ops.py:21-34`][mlite-mfsdp-factory]), but a real Muon factory still needs an explicit gather/NS/reshard or distributed-NS contract. | MCore rejects emerging optimizers with both Torch-FSDP2 and M-FSDP ([`arguments.py:1883-1890`][mcore-emerging-fsdp-guard]). The MLite branch exposes the seam but does not prove Muon through it. |
+| Muon × M-FSDP | **Needs coordination** | Muon orthogonalizes a logical 2-D matrix, including TP-aware Newton-Schulz ([`emerging_optimizers.py:185-209`][mcore-muon-ns]); a sharding backend owns when that matrix is materialized. The surveyed MLite M-FSDP code accepts an optimizer factory after main-parameter grouping ([`fused_ops.py:21-34`][mlite-mfsdp-factory]), but a concrete Muon integration still needs an explicit gather/NS/reshard or distributed-NS contract. | MCore rejects emerging optimizers with both Torch-FSDP2 and M-FSDP ([`arguments.py:1883-1890`][mcore-emerging-fsdp-guard]). The MLite branch exposes a construction seam but does not prove Muon through it. |
 | Muon × CUDA Graph | **Needs coordination** | Forward/backward graphing can remain optimizer-agnostic, but optimizer graphing is a separate capability. MCore only marks Adam `capturable` ([`optimizer/__init__.py:545-553`][mcore-adam-capturable]) and wraps `optimizer.step` separately from the FWD/BWD schedule ([`training.py:3871-3890`][mcore-graph-wrappers]). | FWD/BWD graphing is not inherently blocked by Muon. The current optimizer-graph implementation is Adam-only; Muon optimizer capture is unqualified. |
 | Muon × FP8 | **Needs coordination** | FP8 compute may use a high-precision authoritative master that Muon updates. The contract must identify compute storage, main gradient, master owner, and gather dtype ([`contract.py:59-80`][mlite-parameter-contract]). Muon must never orthogonalize an opaque FP8 storage shard. | MCore explicitly rejects FP8/FP4 *parameter gather* for LayerWise Muon while allowing FP8 compute with parameters persisted in BF16 ([`arguments.py:1896-1900`][mcore-muon-fp8-guard]). |
-| Muon × THD | **Orthogonal** | THD changes token layout and attention metadata ([`packed_seq_params.py:11-30`][mcore-packed-seq]); Muon selects and updates parameters. Neither implementation reads the other's state. | Supported in principle through any backend that already gives Muon correct accumulated gradients. A composition test is still required; no special Muon×THD lowering is justified. |
+| Muon × THD | **Orthogonal** | THD changes token layout and attention metadata ([`packed_seq_params.py:11-30`][mcore-packed-seq]); Muon selects and updates parameters. Neither implementation reads the other's state. | No pair-specific lowering is justified at this stage. This is not a support claim: a selected model implementation must still qualify the complete lifecycle, and adding a refinement such as graph capture invalidates this scoped orthogonality evidence. |
 | Muon × static CP | **Needs coordination** | Muon math only needs the parameter's TP metadata, but its parameter backend must reduce gradients over the correct DP×CP ownership domain. MCore sizes LayerWise/DistOpt layouts from `dp_cp` ([`training.py:1996-2015`][mcore-muon-layout]); MLite represents `dp_cp_group` explicitly ([`state.py:13-35`][mlite-parallel-state]). | Not a Muon algorithm conflict. The optimizer lowering, not Muon, must own CP-aware gradient and master-parameter placement. |
 | Muon × dynamic CP | **Needs coordination** | Dynamic CP changes the CP subgroup per microbatch but keeps a fixed outer DP×CP rank pool ([`model_parallel_config.py:83-103`][mcore-dynamic-cp-config]). Muon should remain unaware; the runtime must guarantee per-token loss normalization and reduce the accumulated gradient over the stable optimizer ownership domain. | MCore does not reject this pair directly, but dynamic CP requires per-token loss and its scheduler ([`arguments.py:1560-1585`][mcore-dynamic-cp-guards]). No dedicated Muon qualification was found. |
 | M-FSDP × CUDA Graph | **Needs coordination** | Both own parameter addresses and hook timing. MCore enables a graph-safe M-FSDP mode and moves full-iteration all-gather out of the wrong phase ([`training.py:2346-2361`][mcore-mfsdp-cg-setup]). TE graph capture later reinstalls parameter pre-forward hooks manually ([`training.py:4045-4056`][mcore-cg-manual-hooks]). | Supported only for the qualified scopes. Partial TE capture still requires persistent buffers and correct hook phase; “CUDA Graph on” cannot imply every scope works. |
 | M-FSDP × FP8 | **Needs coordination** | M-FSDP owns high-precision masters, low-precision materialization, all-gather buffers, and FP8 transpose-cache lifetime. The upstream implementation has explicit FP8 buffer/quantization paths ([`param_and_grad_buffer.py:3112-3261`][mcore-mfsdp-fp8-buffers]). | MCore supports selected combinations. MLite's in-flight blockwise contract fixes FP32 master/state and BF16 parameter all-gather ([`hopper_blockwise.py:52-61`][mlite-blockwise-param-contract]); a backend must consume that record rather than infer from tensor classes. |
-| M-FSDP × THD | **Orthogonal** | M-FSDP shards parameters and optimizer state; THD owns input packing and attention boundaries. MLite's shared packer produces model forward kwargs before optimizer behavior is involved ([`protocol_utils.py:54-88`][mlite-thd-forward]). | No direct pair guard was found. Any CUDA Graph or dynamic-CP addition creates a third-domain interaction and must be reviewed separately. |
+| M-FSDP × THD | **Orthogonal** | M-FSDP shards parameters and optimizer state; THD owns input packing and attention boundaries. MLite's shared packer produces model forward kwargs before optimizer behavior is involved ([`protocol_utils.py:54-88`][mlite-thd-forward]). | No direct pair guard was found. A concrete implementation still needs end-to-end qualification; adding CUDA Graph or dynamic CP invalidates the pair-only evidence and requires requalification. |
 | M-FSDP × static CP | **Needs coordination** | CP ranks participate in parameter-gradient ownership. MLite FSDP2 already builds its mesh from `dp_cp_group` ([`wrap.py:80-95`][mlite-fsdp2-dpcp]); the in-flight M-FSDP branch similarly selects dense DP from `dp_cp_group` ([`config.py:97-112`][mlite-mfsdp-groups]). | MCore warns that TP/CP and FSDP want different `CUDA_DEVICE_MAX_CONNECTIONS` settings on Hopper and earlier ([`arguments.py:1636-1651`][mcore-fsdp-cp-warning]). Correctness can compose; performance policy needs an explicit choice. |
 | M-FSDP × dynamic CP | **Needs coordination** | Dynamic CP reassigns ranks between data and context work per microbatch, while M-FSDP assumes a stable parameter-shard and gradient-reduction ownership domain. A viable design must separate the stable parameter group from the selected attention CP subgroup. | MCore currently rejects the combination with the exact guard “Dynamic context parallelism not supported with Megatron FSDP” ([`arguments.py:1560-1566`][mcore-dynamic-cp-guards]). This is a current lowering conflict, not evidence of permanent impossibility. |
-| CUDA Graph × FP8 | **Needs coordination** | This is a real shared-state interaction. Local replay restores the FP8 recipe/group, controls first-microbatch weight-cache updates, and performs delayed-scaling reduction after backward ([`cuda_graphs.py:620-680`][mcore-cg-fp8-replay]). TE capture passes recipe, weight caching, per-layer enablement, and the TP/CP amax group ([`cuda_graphs.py:2542-2580`][mcore-te-cg-fp8]). | Supported for qualified TE/MCore scopes and recipes. A graph profile must consume the precision plan; it must not invent a second FP8 switch. |
-| CUDA Graph × THD | **Needs coordination** | Graph replay requires a stable tensor/non-tensor signature; THD carries variable `cu_seqlens`, maxima, and optional metadata. MCore requires max padding for THD graphing ([`transformer_config.py:3173-3186`][mcore-thd-cg-guard]) and derives a bounded microbatch count ([`cuda_graphs.py:2291-2365`][mcore-thd-cg-bound]). | Bounded/padded THD is supportable. Truly unbounded THD needs a graph bank, explicit eager profile, or fail-loud overflow; silent truncation is invalid. |
+| CUDA Graph × FP8 | **Needs coordination** | This is a real shared-state interaction. Local replay restores the FP8 recipe/group, controls first-microbatch weight-cache updates, and performs delayed-scaling reduction after backward ([`cuda_graphs.py:620-680`][mcore-cg-fp8-replay]). TE capture passes recipe, weight caching, per-layer enablement, and the TP/CP amax group ([`cuda_graphs.py:2542-2580`][mcore-te-cg-fp8]). | Supported for qualified TE/MCore scopes and recipes. A model implementation's graph setup must consume its selected precision strategy; it must not invent a second FP8 switch. |
+| CUDA Graph × THD | **Needs coordination** | Graph replay requires a stable tensor/non-tensor signature; THD carries variable `cu_seqlens`, maxima, and optional metadata. MCore requires max padding for THD graphing ([`transformer_config.py:3173-3186`][mcore-thd-cg-guard]) and derives a bounded microbatch count ([`cuda_graphs.py:2291-2365`][mcore-thd-cg-bound]). | Bounded/padded THD is supportable. An implementation that cannot bound THD must report graph capture as not applicable with a reason, or fail loudly if it had declared the input applicable; silent truncation or silent eager replay is invalid. |
 | CUDA Graph × static CP | **Needs coordination** | CP group identity and local shapes become part of the graph signature. FP8 graph capture also includes CP in the amax reduction group ([`cuda_graphs.py:2571-2578`][mcore-te-cg-fp8]). | Static CP can compose when the group and shapes do not change between capture and replay. |
 | CUDA Graph × dynamic CP | **Needs coordination** | A per-microbatch CP subgroup changes group identity, local shape, and THD metadata. The current TE helper binds `dp`, `dp_cp`, and `pp` groups at construction ([`cuda_graphs.py:1822-1837`][mcore-te-helper-groups]); therefore dynamic CP needs a graph bank/signature keyed by local CP size and group, not one global graph. | The argument layer requires THD max padding when graphing dynamic packing ([`arguments.py:1620-1634`][mcore-thd-cg-args]), but the surveyed helper has no complete per-microbatch graph-bank contract. Treat the combination as unsettled, not silently supported. |
-| FP8 × THD | **Orthogonal** | Precision coverage is attached to semantic GEMM sites, whereas THD changes sequence representation. The in-flight MLite profile names attention projections, dense MLPs, and MoE experts without referring to BSHD/THD ([`hopper_blockwise.py:28-49`][mlite-blockwise-sites]). | Orthogonal without CUDA Graph. Kernel-specific shape support still belongs to the primitive claim and must be tested. |
-| FP8 × static CP | **Needs coordination** | Delayed-scaling FP8 may reduce amax over TP×CP, while parameter storage/all-gather remains optimizer-owned. MCore exposes `tp_only_amax_red` and explicitly documents the TP-CP domain ([`transformer_config.py:644-651`][mcore-fp8-cp-config]). | Supported for qualified recipes/operators. MLite's first in-flight Hopper profiles deliberately require `cp=1` ([`config.py:97-112`][mlite-blockwise-current-guards]); that is a closed-profile boundary, not a general FP8 limitation. |
-| FP8 × dynamic CP | **Needs coordination** | Dynamic CP selects a per-microbatch CP group inside attention ([`transformer_engine.py:1797-1818`][mcore-te-dynamic-cp]); any non-local FP8 scale reduction must use a group consistent with that execution. Blockwise local scales reduce, but do not erase, operator eligibility and parameter-ownership concerns. | No complete MLite contract exists. A delayed-scaling profile needs dynamic group handling; a local-scale profile still needs explicit coverage evidence. |
+| FP8 × THD | **Orthogonal** | Precision coverage is attached to semantic GEMM sites, whereas THD changes sequence representation. The in-flight MLite FP8 strategy names attention projections, dense MLPs, and MoE experts without referring to BSHD/THD ([`hopper_blockwise.py:28-49`][mlite-blockwise-sites]). | Orthogonal only at the surveyed pre-graph stage. Kernel-specific shape support still belongs to primitive evidence, and adding graph capture or another refinement requires the model implementation to requalify the complete path. |
+| FP8 × static CP | **Needs coordination** | Delayed-scaling FP8 may reduce amax over TP×CP, while parameter storage/all-gather remains optimizer-owned. MCore exposes `tp_only_amax_red` and explicitly documents the TP-CP domain ([`transformer_config.py:644-651`][mcore-fp8-cp-config]). | Supported for qualified recipes/operators. MLite's first in-flight Hopper strategies deliberately require `cp=1` ([`config.py:97-112`][mlite-blockwise-current-guards]); that is an initial strategy boundary, not a general FP8 limitation. |
+| FP8 × dynamic CP | **Needs coordination** | Dynamic CP selects a per-microbatch CP group inside attention ([`transformer_engine.py:1797-1818`][mcore-te-dynamic-cp]); any non-local FP8 scale reduction must use a group consistent with that execution. Blockwise local scales reduce, but do not erase, operator eligibility and parameter-ownership concerns. | No complete MLite integration exists. A delayed-scaling strategy needs dynamic group handling; a local-scale strategy still needs explicit coverage evidence. |
 | THD × static CP | **Needs coordination** | The two features intentionally meet at one boundary: THD owns packing and `cu_seqlens`; CP owns zigzag rank partition. MLite performs the split in the shared protocol-forward helper ([`thd.py:192-230`][mlite-thd-cp-split]), matching the `primitive.module.thd`/`primitive.parallel.cp` skill contract. | MLite baseline supports static THD+CP paths. The split must not be duplicated inside model functions. |
 | THD × dynamic CP | **Needs coordination** | Dynamic CP depends on packed variable-length work and carries `local_cp_size` plus `cp_group` in `PackedSeqParams` ([`packed_seq_params.py:18-30`][mcore-packed-seq]). Its scheduler is forced to `default_dynamic_cp` ([`model_parallel_config.py:502-515`][mcore-dynamic-cp-validation]). | MCore has an implementation. MLite baseline has no dynamic-CP groups or scheduler and reports a fixed `cp_range` ([`runtime.py:242-259`][mlite-fixed-cp-range]). |
-| static CP × dynamic CP | **Needs coordination** | Dynamic CP does not run beside an unrelated second CP topology: the configured DP×CP domain is the maximum rank pool, and runtime chooses subgroup sizes from it ([`parallel_state.py:921-948`][mcore-dynamic-cp-groups]). | Static `context_parallel_size` remains the maximum geometry. The compiler must prevent two independent owners of CP groups and expose dynamic CP as a sequence-layout strategy, not a second parallel dimension. |
+| static CP × dynamic CP | **Needs coordination** | Dynamic CP does not run beside an unrelated second CP topology: the configured DP×CP domain is the maximum rank pool, and runtime chooses subgroup sizes from it ([`parallel_state.py:921-948`][mcore-dynamic-cp-groups]). | Static `context_parallel_size` remains the maximum geometry. A concrete implementation must keep one owner for CP groups and treat dynamic CP as a sequence-layout strategy, not a second parallel dimension. |
 
 ### Matrix conclusion
 
-The absence of a permanent hard-conflict cell is not permission to enable all
-cross products. Eleven pairs share real state or ownership, and several are
-actively rejected by current code. “Needs coordination” must become an
-executable construction-time contract before a combination is supported.
+The count is **18 needs-coordination, 3 orthogonal, and 0 permanent hard
+conflicts**. The absence of a hard-conflict cell is not permission to enable all
+cross products. Several pairs are actively rejected by current code, and even
+an orthogonal pair is supported only after a selected `(model_name, impl)` has
+qualified the full path in which it appears.
 
 ## How Megatron `dev` composes the features
 
@@ -114,7 +131,9 @@ Megatron uses a layered but partly duplicated flow:
    runtime wrappers and hooks.
 
 This is more disciplined than scattering every feature through model classes,
-but validation remains procedural rather than capability-based.
+but it is still one concrete implementation's procedural assembly and
+validation. It is not evidence that the same fields should become MLite-wide
+user axes or a universal capability system.
 
 ### Supported and explicitly guarded combinations
 
@@ -157,8 +176,8 @@ the runtime assembler orders their hand-off.
 
 - Typed dataclass fields separate transformer, distributed, and optimizer
   ownership.
-- CUDA Graph backend, coverage, and optimizer graph are separate axes rather
-  than one overloaded boolean.
+- CUDA Graph backend, coverage, and optimizer graph have distinct internal
+  ownership rather than one overloaded boolean.
 - Important unsupported combinations fail before training with actionable
   error text.
 - The production training assembler owns hook/capture ordering; graph support
@@ -174,23 +193,25 @@ the runtime assembler orders their hand-off.
   `cuda_graph_impl` through THD padding rules
   ([`arguments.py:1560-1563`][mcore-dynamic-cp-guards],
   [`arguments.py:1620-1634`][mcore-thd-cg-args]).
-- Validation mutates other feature axes: M-FSDP turns on `use_custom_fsdp` and
+- Validation mutates other feature settings: M-FSDP turns on `use_custom_fsdp` and
   distributed optimizer, while an emerging optimizer turns
   `use_distributed_optimizer` back off in favor of LayerWise
   ([`arguments.py:1239-1258`][mcore-mfsdp-args],
   [`arguments.py:1872-1886`][mcore-muon-args]). The final state depends on
   validation order.
-- Capability is often inferred from broad flags and parameter-name patterns.
+- Eligibility is often inferred from broad flags and parameter-name patterns.
   The Muon path still tags QKV and experts by names
   ([`optimizer/__init__.py:777-799`][mcore-muon-name-routing]). That is practical
   in MCore's controlled model tree but is the wrong boundary for MLite
   primitives.
 - Central assertions describe current support, but they do not explain which
-  component owns the missing contract. This encourages adding another
-  cross-feature `if` instead of defining a reusable seam.
+  component owns the missing behavior. This encourages adding another
+  cross-feature `if` instead of keeping the concrete implementation boundary
+  reviewable.
 
-MLite should borrow the ownership split and production assembler, not copy the
-full procedural validator.
+MLite should borrow concrete ownership lessons, fail-loud guards, and production
+hook ordering. It should not copy the full validator or generalize it into an
+MLite-wide dispatcher.
 
 ## MLite's current state and composition rules
 
@@ -199,44 +220,47 @@ full procedural validator.
 | Skill category | Composition invariant used by this design |
 | --- | --- |
 | `basic` | Pick the strongest checkable reference, freeze unrelated variables, use the smallest falsifiable proxy, and require end-to-end evidence before delivery ([`basic.constitution`][skill-constitution], [`basic.find_reference`][skill-reference]). |
-| `primitive` | Every primitive declares math/parallel semantics, shape/dtype/rank rules, state/process-group ownership, valid and invalid combinations, and adjacent composition tests ([`primitive.contract`][skill-primitive-contract]). Selection must reject hidden coupling ([`primitive.select_for_compose`][skill-select]). |
+| `primitive` | Every primitive declares math/parallel semantics, shape/dtype/rank rules, state/process-group ownership, valid and invalid combinations, and adjacent composition tests ([`primitive.principle`][skill-principle], [`primitive.contract`][skill-primitive-contract]). Selection must reject hidden coupling ([`primitive.select_for_compose`][skill-select]). |
 | `model-compose` | A model selects already-validated primitives and preserves runtime/model/primitive boundaries; model precision is validated after composition ([`model_compose.build_model`][skill-build-model]). |
 | `application` | Runtime success is not correctness evidence; build/train/save/load and independent precision comparison remain required ([`application.runtime`][skill-runtime]). |
-| `perf` | Performance evidence is invalid without a stable workload and precision evidence; fusion must name coupled primitives and retain an unfused reference ([`perf.measure`][skill-measure], [`perf.fusion`][skill-fusion]). |
+| `perf` | Performance evidence is invalid without a stable workload and precision evidence; fusion must name coupled primitives, retain an unfused reference, and rerun precision plus measurement after each candidate change ([`perf.measure`][skill-measure], [`perf.fusion`][skill-fusion], [`perf.optimize`][skill-optimize]). |
 | `insight` | Add a primitive progressively from principle to proxy to distributed composition to performance, and split work rather than widening one procedure indefinitely ([`insight.progressive_primitive_design`][skill-progressive], [`insight.scope_control`][skill-scope]). |
 
-The common philosophy is “add capabilities, do not multiply model variants.”
-It also implies a fail-loud compiler: unsupported combinations stay explicit
+These skills establish two different proof levels. A primitive proves its own
+invariants and selected adjacent composition; `model_compose.build_model` then
+requires a model-level precision result after concrete assembly. Neither proof
+level promises arbitrary combinations. Unsupported combinations stay explicit
 rather than taking an unmeasured fallback.
 
 ### Baseline inventory
 
 | Surface | Baseline behavior | Composition consequence |
 | --- | --- | --- |
-| Common config | `MegatronLiteConfig` owns parallel and optimizer records, but feature-specific keys still enter model-local `impl_cfg` ([`config.py:24-47`][mlite-runtime-config]). | There is no single typed feature plan today. Adding more untyped keys would make validation order-dependent. |
-| Build lifecycle | Runtime builds the protocol/model/optimizer, loads weights, executes post-load replacement, reloads optimizer masters, then returns the handle ([`runtime.py:170-259`][mlite-build]). | Capability compilation must happen after final modules, masters, and hooks exist, but before the first production step/capture. |
+| Registry | The runtime resolves a concrete protocol from `(model_name, impl)` and fails when that pair is not registered ([`registry.py:20-68,134-140`][mlite-model-registry]). | The existing pair is the natural support-promise boundary. Multiple curated impls fit without creating one per feature combination. |
+| Common config | `MegatronLiteConfig` already owns `model_name`, `impl`, parallel and optimizer records, while implementation-specific keys enter model-local `impl_cfg` ([`config.py:24-47`][mlite-runtime-config]). | Keep `ImplConfig` narrow: only policies that alter this implementation's user contract belong there. Do not mirror every internal primitive or refinement as a public key. |
+| Build lifecycle | Runtime resolves the protocol from `(model_name, impl)`, builds its model/optimizer, loads weights, executes post-load replacement, reloads optimizer masters, then returns the handle ([`runtime.py:170-259`][mlite-build]). | A qualified refinement that depends on final modules, masters, or hooks must be installed by this concrete build path after those objects exist and before the first production step. |
 | THD + CP | Shared protocol code pads and CP-splits THD at the immediate forward boundary ([`protocol_utils.py:54-100`][mlite-thd-forward]); primitive code owns zigzag split/reconstruction ([`thd.py:71-147`][mlite-thd-zigzag]). | This is the good precedent: model protocols call a shared primitive; attention consumes already-local metadata. |
 | Static groups | `ParallelState` creates fixed TP/EP/CP/PP/DP/DP×CP groups ([`state.py:57-155`][mlite-static-groups]). | Dynamic CP cannot be represented by the current state alone. Runtime also reports a fixed `cp_range`, confirming that it is not implemented. |
 | FSDP2 | FSDP2 owns `fully_shard`, mixed precision, prefetch, and DP×CP mesh; its optimizer currently accepts Adam/AdamW only ([`wrap.py:138-194`][mlite-fsdp2-wrap], [`optimizer.py:285-340`][mlite-fsdp2-adam]). | Optimizer algorithm and parameter backend are not yet independently selectable on this path. |
 | dist-opt | The wrapper constructs MCore DDP/optimizer and explicit process groups, but the model protocol still passes a `model_name` that is stored and never consumed ([`megatron_wrap.py:198-240`][mlite-distopt-model-name]). | This is dead interface and leaked upper-layer knowledge. Do not generalize it into feature or model allowlists; remove it in the implementation that next touches the seam. |
-| FP8 remnants | Models contain FP8 branches, but production protocols pass `fp8=False` (for example [`qwen3_moe/protocol.py:174-186`][mlite-qwen-fp8-off]). | Test-fed, production-unreachable FP8 branches are debt, not a supported capability. The closed-profile migration must remove unreachable exports/branches rather than preserve a second path. |
-| CUDA Graph / dynamic CP | No baseline config, controller, capture/replay, dynamic subgroup registry, or scheduler exists under `megatron.lite`. | Both are new capabilities; forwarding MCore flags would not implement their contracts. |
+| FP8 remnants | Models contain FP8 branches, but the surveyed Qwen3-MoE production protocol passes `fp8=False` ([`qwen3_moe/protocol.py:174-186`][mlite-qwen-fp8-off]). | Test-fed, production-unreachable branches are debt, not support. A selected FP8 strategy must replace or activate a production path and remove the dead alternative. |
+| CUDA Graph / dynamic CP | No baseline config, controller, capture/replay, dynamic subgroup registry, or scheduler exists under `megatron.lite`. | Forwarding MCore flags would not implement either behavior. They need concrete integration and qualification in a selected model implementation before being declared applicable. |
 
 The static layering test already enforces the desired direction and explicitly
 checks that primitives are model-name agnostic
-([`test_layering_contracts.py:190-235`][mlite-layering-test]). The new compiler
-should extend this architecture rather than weaken it.
+([`test_layering_contracts.py:190-235`][mlite-layering-test]). New model
+implementations and refinements must preserve that direction.
 
 ### In-flight precedents and what is reusable
 
-#### Closed Hopper FP8 profiles
+#### Closed Hopper FP8 strategies
 
 The in-flight implementation has the strongest reusable contract:
 
 - `PrecisionImplementation` is immutable and combines a closed recipe, typed
   semantic coverage, and one `ParameterContract`
   ([`contract.py:59-80`][mlite-parameter-contract]).
-- Only two named Hopper profiles exist; recipe, target, and storage mode cannot
+- Only two named Hopper strategies exist; recipe, target, and storage mode cannot
   be arbitrarily multiplied ([`hopper_blockwise.py:28-49`][mlite-blockwise-sites],
   [`hopper_blockwise.py:131-159`][mlite-blockwise-profiles]).
 - Runtime rejects ad-hoc precision keys and unsupported adjacent features
@@ -244,12 +268,14 @@ The in-flight implementation has the strongest reusable contract:
 - Coverage is typed by semantic site and object identity; names are diagnostic,
   not selection rules ([`hopper-blockwise-fp8-contract.md:204-227`][mlite-fp8-coverage-design]).
 
-Reusable: immutable contracts, exact coverage sealing, separate compute/master
-ownership, closed profiles, and fail-loud preflight.
+Reusable within implementations that select this FP8 user policy: immutable
+contracts, exact coverage sealing, separate compute/master ownership, closed
+strategies, and fail-loud preflight.
 
 Not reusable as a universal abstraction: `ParameterContract` alone does not
-describe graph signatures, sequence layout, or optimizer algorithm math. It
-should be one input to the capability compiler, not a god object.
+describe graph signatures, sequence layout, optimizer algorithm math, or a
+model implementation's support envelope. It must remain local to the concrete
+precision/parameter integration that consumes it.
 
 #### Standalone M-FSDP optimizer factory
 
@@ -257,14 +283,15 @@ The in-flight M-FSDP implementation narrows its own config and process groups
 ([`config.py:26-112`][mlite-mfsdp-config]) and accepts an optimizer factory over
 already-created parameter groups ([`fused_ops.py:21-34`][mlite-mfsdp-factory]).
 
-Reusable: the parameter backend owns sharding/communication while an injected
-algorithm owns update math; process groups are supplied explicitly rather than
-read from model names or global MCore state.
+Reusable lesson: keep parameter sharding/communication separate from update
+math, and supply process groups explicitly rather than reading model names or
+global MCore state. The surveyed factory is an implementation fact, not a
+recommendation for an MLite-wide optimizer factory.
 
-Limit: “already-sharded parameters” is not sufficient for Muon. The seam needs
-a typed algorithm requirement such as `requires_logical_matrix=True` and a
-backend lowering that supplies gather/NS/reshard or distributed NS. Otherwise
-the factory is syntactically pluggable but semantically incomplete.
+Limit: “already-sharded parameters” is not sufficient for Muon. A concrete
+Muon+M-FSDP implementation must explicitly supply gather/NS/reshard or
+distributed NS for the logical matrix. Otherwise the factory is syntactically
+pluggable but semantically incomplete.
 
 #### Compact Muon lowering
 
@@ -277,8 +304,8 @@ The in-flight Muon work improves the boundary in two ways:
   ([`megatron_wrap.py:107-128`][mlite-muon-lowering],
   [`megatron_wrap.py:272-345`][mlite-muon-compose]).
 
-Reusable: a backend-specific lowering transaction that validates before
-mutation and consumes semantic metadata.
+Reusable within a selected implementation: a backend-specific lowering
+transaction that validates before mutation and consumes semantic metadata.
 
 Limit: the current lowering remains pinned to one MCore contract and initializes
 residual global MCore state. It is a backend adapter, not the common feature
@@ -286,180 +313,156 @@ model.
 
 ## Architecture alternatives
 
-### Alternative A: Megatron-style centralized validation
+### Alternative A: Megatron-style centralized feature validation
 
-Add every field to `MegatronLiteConfig.__post_init__` and write pairwise
-assertions there.
+Add every internal feature field to `MegatronLiteConfig.__post_init__` and grow
+pairwise assertions there. This starts small, but the common config soon knows
+model construction, optimizer hooks, per-microbatch metadata, and every current
+feature list. It becomes a hidden all-in-one implementation and remains
+order-dependent. Reject this alternative.
 
-| Property | Assessment |
-| --- | --- |
-| Change surface | Small initially: common config plus existing model protocols. |
-| Maintenance | Poor after the first few features; rules span model construction, optimizer hooks, and per-microbatch metadata that config cannot observe. |
-| Explosion control | Rejects known pairs, but grows roughly with pair/tuple interactions and validation order. |
-| MLite fit | Better than scattered flags, but conflicts with primitive-owned invariants and typed composition evidence. |
-
-This is useful as the final user-error aggregation point, not as the source of
-truth. The common config should invoke owners' validators and report their
-results, not know every internal feature rule.
-
-### Alternative B: one global closed profile registry
+### Alternative B: one global combination registry
 
 Expose names such as `muon_mfsdp_fp8_thd_cp_graph` and make each name a tested
-bundle.
+bundle. This hides the Cartesian product in names without removing it from
+implementation or evidence. The two closed Hopper FP8 strategies are valid
+because they freeze tightly coupled precision choices that change the user
+contract; they do not justify system-wide combination profiles. Reject this
+alternative.
 
-| Property | Assessment |
-| --- | --- |
-| Change surface | A profile registry plus branches in every owner. |
-| Maintenance | Very poor: every newly qualified axis creates renamed bundles or implicit inheritance. |
-| Explosion control | Hides the Cartesian product from syntax but not from implementation or evidence. |
-| MLite fit | Closed FP8 profiles fit MLite, but a global bundle profile does not. |
+### Alternative C: curated model implementations with qualified refinements
 
-Closed profiles work when they freeze tightly coupled choices inside one
-capability family. They become a naming disguise for combinatorial explosion
-when they encode the whole system.
+This is the recommendation, and it already matches MLite's registry boundary:
 
-### Alternative C: typed capabilities + construction-time compiler + local closed profiles
+| Unit | Responsibility | What it does not promise |
+| --- | --- | --- |
+| Primitive | Preserve one math/parallel/runtime contract and its own validation evidence. | Arbitrary composition with every other primitive. |
+| `(model_name, impl)` | Select and explicitly assemble concrete primitives; own forward, backward, grad finalization, optimizer step, save/load, and performance qualification. | One implementation per Cartesian-product cell. |
+| `ImplConfig` policy | Represent a small choice that changes this implementation's user contract, such as FP8, optimizer, or recompute/offload strategy. | Independent switches for every layout, kernel, capture, fusion, and overlap detail. |
+| Qualified refinement | Improve the concrete implementation without changing its semantics, over a measured applicability envelope. | A normal user-facing mode or a silent fallback path. |
 
-This is the recommendation.
+The implementation may keep narrow records at real ownership boundaries, such
+as the in-flight FP8 `ParameterContract`, but MLite should not introduce a
+global capability spec, compiler, abstract factory, or manifest that decides
+all models and features. A little explicit assembly duplicated across model
+implementations is cheaper and more reviewable than a shared helper that
+branches on `impl`, model names, or feature lists.
 
-| Property | Assessment |
-| --- | --- |
-| Change surface | One common compiler/manifest, narrow records owned by precision, sequence, graph, parameter backend, and optimizer algorithm, plus primitive claims. |
-| Maintenance | Linear in new capability owners; a new feature declares requirements and only names the domains it coordinates with. |
-| Explosion control | Profiles close high-risk local choices; the compiler rejects unproven cross-products from exact evidence. |
-| MLite fit | Directly follows `primitive.contract`, `select_for_compose`, layering tests, and the FP8 coverage precedent. |
+### What belongs in `ImplConfig`
 
-The public shape should remain small:
+The test is whether a choice changes the user's contract for that specific
+implementation:
 
-```python
-MegatronLiteConfig(
-    optimizer=OptimizerConfig(algorithm="muon", backend="mfsdp"),
-    precision="hopper_blockwise_bf16_weight",
-    sequence="thd_dynamic_cp_padded",
-    cuda_graph="off",
-)
-```
+- FP8 recipe/storage strategy changes numerical and checkpoint behavior, so a
+  closed choice such as `hopper_blockwise_bf16_weight` or
+  `hopper_blockwise_fp8_weight` may be a user policy.
+- Optimizer strategy and recompute/offload policy change update or memory
+  behavior, so they may be user policies within the implementation's supported
+  set.
+- THD packing, a particular fusion, overlap schedule, or CUDA Graph capture
+  scope is normally implementation machinery. It should not become an
+  independent public axis merely because it has a separate internal owner.
 
-These strings resolve to immutable records. Users cannot construct arbitrary
-recipe × target × storage × graph-scope policies.
+This rule does not require deleting every existing `impl_cfg` field in this
+research task. It is the boundary for future implementation evolution.
 
-Internally, owners exchange narrow contracts:
+### Qualification and defaulting of refinements
 
-```python
-@dataclass(frozen=True)
-class OptimizerAlgorithmRequirements:
-    logical_parameter_rank: int | None
-    needs_full_logical_parameter: bool
-    state_dtypes: tuple[DType, ...]
-    capturable_step: bool
+A refinement enters the default implementation only when all of the following
+hold over a stated envelope:
 
-@dataclass(frozen=True)
-class ParameterBackendCapabilities:
-    materialization: Literal["replicated", "gathered", "distributed"]
-    master_owner: str
-    stable_compute_addresses: bool
-    graph_safe_hook_phases: frozenset[str]
+1. it preserves the implementation's semantics through forward, backward,
+   gradient finalization, optimizer step, and save/load;
+2. it is performance-qualified with a fixed workload, warmup, repeats, and
+   memory evidence, and is monotonically no worse within that envelope; and
+3. its applicability can be decided and reported without asking a primitive to
+   know the model or implementation name.
 
-@dataclass(frozen=True)
-class SequenceLayoutContract:
-    format: Literal["bshd", "thd"]
-    cp_group_policy: Literal["static", "per_microbatch"]
-    shape_signature: ShapeSignature
+CUDA Graph capture, fusion, and communication overlap follow this rule. Once
+qualified, they are default implementation behavior. Their `off` path remains
+available only as a correctness oracle, controlled A/B, or debugging tool. A
+new refinement invalidates the old composition proof: all lifecycle and
+performance evidence must be rerun for the refined stage.
 
-@dataclass(frozen=True)
-class GraphRequirements:
-    boundary: str
-    signature: ShapeSignature
-    required_hook_phases: frozenset[str]
-    precision_state_interface: str | None
-```
+Applicability is observable per implementation and stage:
 
-The compiler runs one bounded transaction:
+- `enabled`: the input is inside the qualified envelope and the refinement ran;
+- `partial`: only a documented subgraph or stage is qualified, and the boundary
+  is reported; or
+- `not-applicable`: the input is outside the envelope, with an actionable
+  reason.
 
-1. resolve each closed profile and reject unknown/ad-hoc keys;
-2. collect exact requirements and capability claims from constructed
-   production primitives;
-3. lower optimizer algorithm requirements through the selected parameter
-   backend and seal master/state ownership;
-4. build sequence groups and bind THD/CP metadata ownership;
-5. bind precision coverage and contexts;
-6. after final weights, optimizer masters, and hooks exist, compile the graph
-   plan and coverage/signature manifest; and
-7. reject every uncovered requirement, duplicate owner, unstable address, or
-   unsupported interaction before the first training step.
+If an input was declared applicable and capture or setup then fails, execution
+must raise an error. Silently continuing in eager mode would turn a qualified
+default into unmeasured behavior.
 
-The result is attached to `ModelHandle`; primitives do not import runtime or
-model packages.
+## Initial implementation boundaries and handoff
 
-## Initial compatibility cells and named profiles
+The pairwise matrix is a risk map for implementations that are actually needed;
+it is not a backlog to populate. Near-term work should use these boundaries:
 
-Profiles are local to a capability family. The five names below are enough to
-guide near-term work without claiming their cross product.
-
-| Profile | Family and status | Frozen meaning | Initial compatibility boundary |
+| Workstream | Correct placement | Surveyed or initial boundary | Do not build |
 | --- | --- | --- | --- |
-| `hopper_blockwise_bf16_weight` | precision; in flight | Hopper blockwise FP8 compute at attention-projection/dense/expert sites, BF16 compute-weight storage, FP32 master/state, BF16 parameter gather | CP=1, PP=1, no CUDA Graph or dynamic CP in the first contract; Muon/M-FSDP require consuming `ParameterContract`. |
-| `hopper_blockwise_fp8_weight` | precision; in flight | Same semantic coverage, FP8 E4M3 compute-weight storage, FP32 authoritative master/state | Same current boundary; stronger checkpoint and optimizer-master evidence required. |
-| `te_partial_fixed_bshd_attention` | graph; proposed first graph profile | TE partial-layer capture of fixed-shape BSHD attention; eager optimizer and eager unselected regions | PP=1, THD off, dynamic CP off; static CP starts at 1. FP8 deferred until the precision-state interface is implemented. |
-| `thd_dynamic_cp_padded` | sequence; proposed | THD with max-aligned tensors, `default_dynamic_cp`, per-microbatch CP group/signature, per-token loss | Requires dynamic group registry and scheduler. M-FSDP and CUDA Graph remain rejected until their separate lowerings exist. Muon remains backend-mediated. |
-| `mfsdp_muon_gather_ns` | optimizer/backend; proposed | M-FSDP parameter/state sharding with bounded full-matrix gather → Muon NS → reshard; scalar params use Adam | No optimizer graph; FP8 parameter gather off initially; static CP allowed only after DP×CP reduction evidence; dynamic CP deferred. |
+| Hopper blockwise FP8 | Closed user policy inside the selected `ImplConfig`; reuse its concrete precision and parameter contracts. | The in-flight strategies cover attention projection, dense MLP, and experts; require CP=1 and PP=1 and exclude CUDA Graph/dynamic CP in their first contract. FP8-weight storage needs stronger checkpoint/master evidence. | A global recipe × target × storage matcher or a cross-feature profile. |
+| Muon + M-FSDP | Explicit assembly in each model implementation that needs it, reusing stable Muon math and parameter-sharding primitives. | Supply bounded full-matrix gather → NS → reshard or distributed NS; start without optimizer graph or FP8 parameter gather; static CP waits for DP×CP reduction evidence and dynamic CP remains unsupported. | A universal optimizer factory or an implementation merely because this matrix has no hard-conflict cell. |
+| THD + static CP | Existing shared THD/CP primitives called explicitly by model protocol forward paths. | Preserve one owner for packing and zigzag partition; validate the selected model implementation end to end. | Model-local copies of split logic or a helper that dispatches on model names. |
+| Dynamic CP | Add only to a model/runtime implementation with a demonstrated workload need. | Requires max-aligned THD, per-token loss, a dynamic group registry, and scheduler. M-FSDP and CUDA Graph remain not applicable until separately integrated and qualified. | A second independent CP dimension or a global sequence profile. |
+| CUDA Graph | Semantics-preserving performance refinement of a concrete implementation. | A first qualification may be partial and narrow, for example fixed-shape BSHD attention with eager unselected regions. FP8, THD, PP, M-FSDP hooks, and dynamic CP expand the envelope only after full requalification. | A normal `cuda_graph=on/off` user policy, a named global graph profile, or silent eager fallback after declared-applicable capture failure. |
 
-An ordinary `bf16` + eager + static THD/CP configuration remains the baseline,
-not another combinatorial profile.
-
-The compiler can already determine these cells without GPU execution:
-
-- `hopper_blockwise_*` + ad-hoc recipe/target/storage keys: reject;
-- `hopper_blockwise_*` + first-profile CUDA Graph/CP/dynamic CP: reject;
-- `te_partial_fixed_bshd_attention` + THD/dynamic CP/PP>1: reject;
-- `thd_dynamic_cp_padded` + missing max bound/per-token loss/scheduler: reject;
-- `mfsdp_muon_gather_ns` + missing logical-matrix materialization or FP8
-  parameter gather: reject;
-- Muon + THD, or M-FSDP + THD, with no graph/dynamic-CP third feature:
-  admit after their independent primitive evidence is present.
+The current BF16/eager implementation remains the correctness reference while
+graph support is unqualified. It is not a second product profile. Likewise,
+Muon×THD and M-FSDP×THD need no pair-specific lowering, but that observation
+does not admit either pair until a selected implementation has end-to-end
+evidence.
 
 ## Implementation and review guardrails
 
-1. **No model names below model composition.** Primitive selection uses typed
-   semantic claims. Paths/names are diagnostics only.
+1. **No model names below model composition.** Primitive selection uses semantic
+   contracts. Paths and names are diagnostics only.
 2. **No dead compatibility surface.** Production-unreachable branches, exports,
    factories, or config fields must be removed; tests do not make them live.
-3. **No silent fallback.** An explicitly named profile either binds complete
-   production coverage or fails before training. A future eager-fallback graph
-   profile must be separately named and report fallback counts.
-4. **One owner per state item.** FP32 master, quantizer state, CP group, graph
+3. **No hidden all-in-one helper.** Share stable concrete primitives, subgraphs,
+   and model-independent runtime code. If a helper branches on implementation,
+   model, or feature lists, move that assembly back to the concrete model
+   implementation.
+4. **No silent fallback.** Report `enabled`, `partial`, or `not-applicable` with
+   reasons. A declared-applicable setup failure is an error, not eager success.
+5. **One owner per state item.** FP32 master, quantizer state, CP group, graph
    buffers, and optimizer state each have exactly one owner.
-5. **Compile after construction, validate before mutation.** Backend lowerings
-   validate their complete contract before wrapping modules; graph compilation
-   waits until weights, masters, and hooks are final.
-6. **Keep graph scopes separate.** FWD/BWD graph support never implies optimizer
-   graph support.
-7. **Third-order interactions are explicit.** Pairwise admission is necessary,
-   not sufficient. CUDA Graph + FP8 + M-FSDP must pass the hook/precision/address
-   contract demonstrated by Megatron's real assembler.
-8. **Evidence follows the MLite skills.** Each primitive has a single-device or
-   single-node proxy, an independent reference, controlled variables, an
-   adjacent composition test, and a production end-to-end path.
+6. **Validate before mutation; refine after construction.** Backend assembly
+   validates its concrete assumptions before wrapping modules; graph setup waits
+   until weights, masters, and hooks are final.
+7. **Keep graph scopes separate.** Forward/backward graph support never implies
+   optimizer graph support.
+8. **Treat orthogonality as scoped evidence.** It belongs to one implementation
+   stage. Any new refinement invalidates it and triggers full requalification.
+9. **Evidence follows the MLite skills.** Primitive evidence remains independent;
+   a supported `(model_name, impl)` additionally needs production end-to-end and
+   performance evidence.
 
 ## Validation plan for later implementations
 
-This study is intentionally zero-GPU. A later implementation should build the
-evidence ladder in this order:
+This study is intentionally zero-GPU. A later implementation should build only
+the evidence required by an actual model/workload need:
 
-1. CPU/static: profile parsing, unknown-key rejection, exact requirement/claim
-   matching, duplicate/missing owner failures, layering test, and dead-export
-   scan.
-2. Primitive proxy: eager BF16 reference for forward/backward/update; then one
-   axis at a time for precision, parameter backend, sequence layout, and graph.
-3. Adjacent pairs: all admitted cells in the pairwise matrix, with the other
-   five axes frozen.
-4. High-risk triples: at minimum CUDA Graph×FP8×parameter backend,
-   THD×dynamic-CP×graph signature, and Muon×M-FSDP×precision master ownership.
-5. Production composition: real `build_model` → `protocol.forward` → backward →
-   grad finalize → optimizer step → save/load, non-skip and with an independent
-   reference.
-6. Performance: only after precision evidence, with fixed workload, warmup,
-   repeats, memory buckets, and explicit graph/profile coverage.
+1. CPU/static: narrow `ImplConfig` policy parsing and rejection, layering tests,
+   dead-export scans, and checks that shared helpers contain no model/impl/feature
+   dispatch.
+2. Primitive proxy: eager BF16 reference for each changed primitive's
+   forward/backward/update contract, plus its selected adjacent composition.
+3. Concrete implementation: real `build_model` → `protocol.forward` → backward →
+   grad finalize → optimizer step → save/load, non-skip and with the strongest
+   independent reference available.
+4. Refinement qualification: run the same lifecycle with the candidate enabled,
+   compare against the `off` oracle, then measure fixed-workload step time,
+   throughput, and memory. Record the applicability envelope and status.
+5. Interaction expansion: test only demanded pairs/triples from the matrix, with
+   unrelated variables frozen. At minimum, any demanded CUDA Graph×FP8×parameter
+   backend, THD×dynamic-CP×graph, or Muon×M-FSDP×precision path needs explicit
+   hook/state/ownership evidence.
+6. Invalidation: after every new capture, fusion, overlap, or other refinement,
+   rerun forward through save/load plus performance; old orthogonality and
+   end-to-end results do not carry over automatically.
 
 ## Source links
 
@@ -512,6 +515,7 @@ evidence ladder in this order:
 [mlite-fixed-cp-range]: ../megatron/lite/runtime/backends/mlite/runtime.py#L242-L259
 [mlite-runtime-config]: ../megatron/lite/runtime/backends/mlite/config.py#L24-L47
 [mlite-build]: ../megatron/lite/runtime/backends/mlite/runtime.py#L170-L259
+[mlite-model-registry]: ../megatron/lite/model/registry.py#L20-L140
 [mlite-thd-zigzag]: ../megatron/lite/primitive/parallel/thd.py#L71-L147
 [mlite-static-groups]: ../megatron/lite/primitive/parallel/state.py#L57-L155
 [mlite-fsdp2-wrap]: ../megatron/lite/primitive/optimizers/fsdp2/wrap.py#L138-L194
@@ -539,11 +543,13 @@ evidence ladder in this order:
 
 [skill-constitution]: ../skills/basic/constitution.md
 [skill-reference]: ../skills/basic/find-reference.md
+[skill-principle]: ../skills/primitive/principle.md
 [skill-primitive-contract]: ../skills/primitive/contract.md
 [skill-select]: ../skills/primitive/select-for-compose.md
 [skill-build-model]: ../skills/model-compose/build-model.md
 [skill-runtime]: ../skills/application/runtime.md
 [skill-measure]: ../skills/perf/measure.md
 [skill-fusion]: ../skills/perf/fusion.md
+[skill-optimize]: ../skills/perf/optimize.md
 [skill-progressive]: ../skills/insight/progressive-primitive-design.md
 [skill-scope]: ../skills/insight/scope-control.md
