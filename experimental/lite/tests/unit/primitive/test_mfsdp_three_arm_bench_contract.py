@@ -92,3 +92,13 @@ def test_fixed_batches_use_current_packed_batch_contract():
 
     assert "seq_lens=torch.tensor([64]" in source
     assert "cu_seqlens=" not in source
+
+
+def test_mcore_arm_keeps_wrapper_forward_and_matches_gradient_sync_boundary():
+    source = BENCH.read_text()
+
+    assert "class _MCorePipelineChunk" in source
+    assert "return self._wrapped(*args, **kwargs)" in source
+    assert "sync_model_each_microbatch=False" in source
+    assert "adapter.finish_grad_sync" in source
+    assert "sync_grad_before_optimizer_step=False" in source

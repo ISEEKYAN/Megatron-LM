@@ -61,6 +61,24 @@ class _Arm:
     feature_probe: Callable[[], dict[str, Any]]
 
 
+class _MCorePipelineChunk(torch.nn.Module):
+    """Keep MCore's FSDP forward in the MLite pipeline execution path."""
+
+    def __init__(self, wrapped: torch.nn.Module):
+        super().__init__()
+        self._wrapped = wrapped
+        self.ps = wrapped.module.ps
+        self.cross_entropy_fusion = bool(
+            getattr(wrapped.module, "cross_entropy_fusion", False)
+        )
+
+    def set_input_tensor(self, input_tensor) -> None:
+        self._wrapped.module.set_input_tensor(input_tensor)
+
+    def forward(self, *args, **kwargs):
+        return self._wrapped(*args, **kwargs)
+
+
 class _MCoreOptimizerAdapter:
     """Expose the MLite runtime tuple contract without changing Torch AdamW."""
 
@@ -76,6 +94,10 @@ class _MCoreOptimizerAdapter:
     def zero_grad(self) -> None:
         self.optimizer.zero_grad()
 
+    def finish_grad_sync(self) -> None:
+        for chunk in self._model_chunks:
+            chunk.finish_grad_sync()
+
     def step(self) -> tuple[bool, float, int]:
         local_sq = torch.zeros((), device="cuda", dtype=torch.float32)
         for group in self.optimizer.param_groups:
@@ -83,7 +105,7 @@ class _MCoreOptimizerAdapter:
                 if param.grad is not None:
                     grad = to_local_tensor(param.grad)
                     local_sq.add_(grad.detach().float().square().sum())
-        self.optimizer.step()
+        self.optimizer.step(sync_grad_before_optimizer_step=False)
         return True, float(local_sq.sqrt()), 0
 
 
@@ -367,18 +389,18 @@ def _build_mcore_arm(*, seed: int) -> _Arm:
             ),
             overlap_grad_reduce=True,
             overlap_param_gather=True,
-            sync_model_each_microbatch=True,
+            sync_model_each_microbatch=False,
             preproc_state_dict_for_dcp_ckpt=False,
             average_in_collective=True,
         )
         wrapped_chunks.append(wrapped)
         torch_optimizers.append(optimizer)
     assert len(torch_optimizers) == 1
-    bundle.chunks[:] = wrapped_chunks
     adapter = _MCoreOptimizerAdapter(torch_optimizers[0], wrapped_chunks)
-    handle = _model_handle(bundle, adapter, None)
+    bundle.chunks[:] = [_MCorePipelineChunk(chunk) for chunk in wrapped_chunks]
+    handle = _model_handle(bundle, adapter, adapter.finish_grad_sync)
     _synchronize_arm_build("mcore_mfsdp")
-    return _Arm("mcore_mfsdp", handle, lambda: _mcore_feature_probe(handle))
+    return _Arm("mcore_mfsdp", handle, lambda: _mcore_feature_probe(adapter))
 
 
 def _fixed_batches(*, seed: int) -> list[PackedBatch]:
@@ -619,8 +641,8 @@ def _mlite_feature_probe(
     }
 
 
-def _mcore_feature_probe(handle: ModelHandle) -> dict[str, Any]:
-    chunk = handle._extras["model_chunks"][0]
+def _mcore_feature_probe(adapter: _MCoreOptimizerAdapter) -> dict[str, Any]:
+    chunk = adapter._model_chunks[0]
     return {
         "implementation": f"{type(chunk).__module__}.{type(chunk).__qualname__}",
         "bucket_count": len(chunk.param_and_grad_buffer.parameter_groups),
