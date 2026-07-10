@@ -101,7 +101,8 @@ if [[ "${IN_DS4_GRPO_CONTAINER:-0}" != "1" ]]; then
   export MASTER_ADDR RAY_PORT RAY_DASHBOARD_PORT GPUS_PER_NODE
   export PHASE1_STEPS TOTAL_STEPS CONFIG_ONLY IMPORT_ONLY RAY_ONLY
   export ACTOR_TP ACTOR_PP ACTOR_CP ACTOR_EP ROLLOUT_TP
-  exec srun --nodes="${SLURM_NNODES}" \
+  exec srun --export=ALL \
+    --nodes="${SLURM_NNODES}" \
     --ntasks="${SLURM_NNODES}" \
     --ntasks-per-node=1 \
     --container-image="${BASE_IMAGE}" \
