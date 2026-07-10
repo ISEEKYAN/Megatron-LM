@@ -828,6 +828,35 @@ def _mark_mcore_reference_params(module: nn.Module, ps) -> None:
             param._tp_duplicated = True
 
 
+@contextmanager
+def _mcore_stage_local_dtensor_validation(module: nn.Module, ps):
+    """Scope DTensor metadata checks to the model-parallel group.
+
+    PyTorch's check_tensor_meta uses WORLD even when DTensor.from_local receives
+    a stage-local DeviceMesh. Pipeline stages legitimately have different
+    parameter counts, so validate the same metadata on TP/ETP first and suppress
+    only the redundant WORLD check while NVIDIA MCore constructs its DTensors.
+    """
+    from torch.distributed.tensor import _api as dtensor_api
+
+    for _name, param in module.named_parameters():
+        expert = not bool(getattr(param, "allreduce", True))
+        group = ps.etp_group if expert else ps.tp_group
+        if group is None or dist.get_world_size(group) == 1:
+            continue
+        local_metadata = (param.dtype, param.requires_grad)
+        gathered = [None] * dist.get_world_size(group)
+        dist.all_gather_object(gathered, local_metadata, group=group)
+        assert all(metadata == local_metadata for metadata in gathered)
+
+    original_check_tensor_meta = dtensor_api.check_tensor_meta
+    dtensor_api.check_tensor_meta = lambda *_args, **_kwargs: None
+    try:
+        yield
+    finally:
+        dtensor_api.check_tensor_meta = original_check_tensor_meta
+
+
 class _MCoreReferenceOptimizer:
     """Adapt NVIDIA MCore's standalone M-FSDP API to the smoke runtime contract."""
 
@@ -951,24 +980,25 @@ def _build_mcore_reference_optimizer(chunks, ps):
             f"backend=mcore_mfsdp phase=wrap_start chunk={chunk_index}",
             flush=True,
         )
-        wrapped_chunks.append(
-            fully_shard_model(
-                module=chunk,
-                device_mesh=dense_mesh,
-                dp_shard_dim="dp_cp",
-                tp_dim="tp",
-                expt_device_mesh=expert_mesh,
-                fsdp_unit_modules=(TransformerLayer,),
-                zero_dp_strategy="optim_grads_params",
-                grad_reduce_in_fp32=True,
-                preserve_fp32_weights=True,
-                overlap_grad_reduce=True,
-                overlap_param_gather=True,
-                sync_model_each_microbatch=False,
-                preproc_state_dict_for_dcp_ckpt=False,
-                average_in_collective=True,
+        with _mcore_stage_local_dtensor_validation(chunk, ps):
+            wrapped_chunks.append(
+                fully_shard_model(
+                    module=chunk,
+                    device_mesh=dense_mesh,
+                    dp_shard_dim="dp_cp",
+                    tp_dim="tp",
+                    expt_device_mesh=expert_mesh,
+                    fsdp_unit_modules=(TransformerLayer,),
+                    zero_dp_strategy="optim_grads_params",
+                    grad_reduce_in_fp32=True,
+                    preserve_fp32_weights=True,
+                    overlap_grad_reduce=True,
+                    overlap_param_gather=True,
+                    sync_model_each_microbatch=False,
+                    preproc_state_dict_for_dcp_ckpt=False,
+                    average_in_collective=True,
+                )
             )
-        )
         print(
             f"[MFSDP_BUILD] rank={dist.get_rank()} pp_rank={ps.pp_rank} "
             f"backend=mcore_mfsdp phase=wrap_done chunk={chunk_index}",
@@ -1004,6 +1034,7 @@ def _build_mcore_reference_optimizer(chunks, ps):
         print(
             "[MFSDP_REFERENCE] "
             "primary=mcore_mfsdp "
+            "dtensor_validation=stage_local_tp_etp "
             f"commit={_MCORE_REFERENCE_COMMIT} "
             f"source_sha256={source_sha256} "
             f"source={source_path}",

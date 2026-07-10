@@ -127,6 +127,8 @@ def test_mfsdp_precision_signoff_uses_mcore_primary_and_full_tensor_evidence():
     assert "[MFSDP_FIRST_THRESHOLD_EXCEEDANCE]" in smoke_source
     assert "dist.barrier()" in smoke_source
     assert "phase=all_ranks_done" in smoke_source
+    assert "_mcore_stage_local_dtensor_validation" in smoke_source
+    assert "dtensor_api.check_tensor_meta" in smoke_source
     assert 'batch_mode="matched"' in smoke_source
     assert 'batch_mode="fixed"' in smoke_source
     assert "fixed-batch)" in runner_source
