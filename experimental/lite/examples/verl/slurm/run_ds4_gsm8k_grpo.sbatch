@@ -116,7 +116,13 @@ export TMPDIR="/tmp/ds4-grpo-${SLURM_JOB_ID}-${SLURM_PROCID}"
 export PYTHONPYCACHEPREFIX="${TMPDIR}/pycache"
 export TORCHINDUCTOR_CACHE_DIR="${TMPDIR}/torchinductor"
 export TRITON_CACHE_DIR="${TMPDIR}/triton"
-mkdir -p "${PYTHONPYCACHEPREFIX}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}"
+export HF_HOME="${RUN_ROOT}/hf-cache"
+export HF_DATASETS_CACHE="${HF_HOME}/datasets"
+mkdir -p \
+  "${PYTHONPYCACHEPREFIX}" \
+  "${TORCHINDUCTOR_CACHE_DIR}" \
+  "${TRITON_CACHE_DIR}" \
+  "${HF_DATASETS_CACHE}"
 RAY_CLI=(env VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python -m ray.scripts.scripts)
 "${RAY_CLI[@]}" --help >/dev/null
 
@@ -266,6 +272,8 @@ names = [
     "DS4_VLLM_SHIM",
     "MEGATRON_ROOT",
     "VERL_ROOT",
+    "HF_HOME",
+    "HF_DATASETS_CACHE",
 ]
 env = {name: os.environ[name] for name in names}
 env["VERL_MLITE_SKIP_RUNTIME_PATCHES"] = "0"

@@ -143,6 +143,10 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert 'export PYTHONPATH="${MLITE_SM90_SITE}' in script
     assert ':${DS4_VLLM_SITE}:' in script
     assert 'export LD_PRELOAD="${DS4_VLLM_SHIM}"' in script
+    assert 'export HF_HOME="${RUN_ROOT}/hf-cache"' in script
+    assert 'export HF_DATASETS_CACHE="${HF_HOME}/datasets"' in script
+    assert '"HF_HOME",' in script
+    assert '"HF_DATASETS_CACHE",' in script
     assert "export CC=/usr/bin/gcc" in script
     assert "export CXX=/usr/bin/g++" in script
     assert "Error in sitecustomize" in script
