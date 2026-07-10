@@ -5,6 +5,7 @@ import os
 import statistics
 import sys
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,6 +13,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from megatron.lite.primitive.optimizers.fsdp2 import (
     build_fsdp2_training_optimizer,
@@ -834,16 +836,58 @@ _COMM_TOKENS = (
 )
 
 
-def _collective_sequence(profiler) -> tuple[str, ...]:
+class _CollectiveDispatchTap(TorchDispatchMode):
+    def __init__(self, sequence: list[str]):
+        super().__init__()
+        self.sequence = sequence
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        del types
+        name = str(func)
+        if any(token in name.lower() for token in _COMM_TOKENS):
+            self.sequence.append(f"dispatch::{name}")
+        return func(*args, **(kwargs or {}))
+
+
+@contextmanager
+def _record_collectives():
     sequence = []
-    for event in profiler.events():
-        name = str(event.name)
-        lowered = name.lower()
-        if lowered.startswith(("aten::", "autograd::")):
+    originals = {}
+    api_names = (
+        "all_gather",
+        "all_gather_into_tensor",
+        "_all_gather_base",
+        "reduce_scatter",
+        "reduce_scatter_tensor",
+        "_reduce_scatter_base",
+        "all_reduce",
+        "all_to_all",
+        "all_to_all_single",
+        "broadcast",
+        "batch_isend_irecv",
+        "isend",
+        "irecv",
+        "send",
+        "recv",
+    )
+    for name in api_names:
+        original = getattr(dist, name, None)
+        if original is None:
             continue
-        if any(token in lowered for token in _COMM_TOKENS):
-            sequence.append(name)
-    return tuple(sequence)
+        originals[name] = original
+
+        def wrapped(*args, _name=name, _original=original, **kwargs):
+            sequence.append(f"python::torch.distributed.{_name}")
+            return _original(*args, **kwargs)
+
+        setattr(dist, name, wrapped)
+
+    try:
+        with _CollectiveDispatchTap(sequence):
+            yield sequence
+    finally:
+        for name, original in originals.items():
+            setattr(dist, name, original)
 
 
 def _contains_collective(sequence: tuple[str, ...], *tokens: str) -> bool:
@@ -851,19 +895,14 @@ def _contains_collective(sequence: tuple[str, ...], *tokens: str) -> bool:
 
 
 def _run_full_parallel_step(
-    handle: ModelHandle, *, batch_seed: int, profile_collectives: bool
+    handle: ModelHandle, *, batch_seed: int, record_collectives: bool
 ) -> tuple[float, float, tuple[str, ...]]:
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     runtime.zero_grad(handle)
     batches = _fixed_packed_batches(64, seed=batch_seed)
-    profiler = None
-    if profile_collectives:
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ]
-        ) as profiler:
+    sequence = []
+    if record_collectives:
+        with _record_collectives() as sequence:
             result = runtime.forward_backward(
                 handle,
                 iter(batches),
@@ -880,8 +919,7 @@ def _run_full_parallel_step(
     assert success
     loss = result.model_output.loss
     assert loss is not None
-    sequence = _collective_sequence(profiler) if profiler is not None else ()
-    return float(loss.detach().float().cpu()), float(grad_norm), sequence
+    return float(loss.detach().float().cpu()), float(grad_norm), tuple(sequence)
 
 
 def _max_snapshot_abs_diff(
@@ -956,7 +994,7 @@ def test_mfsdp_matches_fsdp2_full_parallel_short_train(monkeypatch):
         for backend, handle in (("fsdp2", fsdp2_handle), ("mfsdp", mfsdp_handle)):
             dist.barrier()
             loss, grad_norm, trace = _run_full_parallel_step(
-                handle, batch_seed=8345, profile_collectives=step == 0
+                handle, batch_seed=8345, record_collectives=step == 0
             )
             losses[backend].append(loss)
             grad_norms[backend].append(grad_norm)
@@ -965,7 +1003,7 @@ def test_mfsdp_matches_fsdp2_full_parallel_short_train(monkeypatch):
 
     for backend in ("fsdp2", "mfsdp"):
         trace = traces.get(backend, ())
-        assert trace, f"{backend} profiler recorded no distributed collectives."
+        assert trace, f"{backend} tap recorded no distributed collectives."
         assert _contains_collective(trace, "all_gather", "allgather")
         assert _contains_collective(trace, "reduce_scatter", "reducescatter")
 
@@ -1011,7 +1049,7 @@ def test_mfsdp_matches_fsdp2_full_parallel_short_train(monkeypatch):
             trace = traces[backend]
             print(
                 "[MFSDP_COMM_TRACE] "
-                f"backend={backend} events={len(trace)} "
+                f"backend={backend} phase=forward_backward events={len(trace)} "
                 f"sequence={' > '.join(trace[:96])}",
                 flush=True,
             )
