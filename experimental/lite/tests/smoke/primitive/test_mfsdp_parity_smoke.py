@@ -949,6 +949,26 @@ class _MCoreReferenceOptimizer:
         return True, grad_norm, 0
 
 
+class _MCoreRuntimeChunk(nn.Module):
+    """Keep MLite's generic unwrapping from bypassing MegatronFSDP.forward."""
+
+    def __init__(self, wrapped: nn.Module):
+        super().__init__()
+        object.__setattr__(self, "_wrapped", wrapped)
+
+    def forward(self, *args, **kwargs):
+        return self._wrapped(*args, **kwargs)
+
+    def set_input_tensor(self, input_tensor) -> None:
+        self._wrapped.module.set_input_tensor(input_tensor)
+
+    def named_parameters(self, *args, **kwargs):
+        return self._wrapped.named_parameters(*args, **kwargs)
+
+    def parameters(self, *args, **kwargs):
+        return self._wrapped.parameters(*args, **kwargs)
+
+
 def _build_mcore_reference_optimizer(chunks, ps):
     from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
         fully_shard_model,
@@ -1025,6 +1045,7 @@ def _build_mcore_reference_optimizer(chunks, ps):
         for name, param in chunk.named_parameters():
             param_names[id(param)] = f"{chunk_idx}.{_canonical_optimizer_name(name)}"
     optimizer = _MCoreReferenceOptimizer(raw_optimizer, chunks, ps, param_names)
+    chunks[:] = [_MCoreRuntimeChunk(chunk) for chunk in chunks]
     print(
         f"[MFSDP_BUILD] rank={dist.get_rank()} pp_rank={ps.pp_rank} "
         "backend=mcore_mfsdp phase=optimizer_done",

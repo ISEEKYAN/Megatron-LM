@@ -129,6 +129,8 @@ def test_mfsdp_precision_signoff_uses_mcore_primary_and_full_tensor_evidence():
     assert "phase=all_ranks_done" in smoke_source
     assert "_mcore_stage_local_dtensor_validation" in smoke_source
     assert "dtensor_api.check_tensor_meta" in smoke_source
+    assert "_MCoreRuntimeChunk" in smoke_source
+    assert "bypassing MegatronFSDP.forward" in smoke_source
     assert 'batch_mode="matched"' in smoke_source
     assert 'batch_mode="fixed"' in smoke_source
     assert "fixed-batch)" in runner_source
