@@ -286,14 +286,11 @@ def _expert_dp_tp_rank_mesh(ps) -> list[list[int]]:
 
 
 def _rank_local_singleton_group():
-    """Create the trivial ETP dimension in a globally consistent order."""
-    selected = None
-    for rank in range(dist.get_world_size()):
-        group = dist.new_group(ranks=[rank])
-        if rank == dist.get_rank():
-            selected = group
-    assert selected is not None
-    return selected
+    """Create a disjoint trivial ETP dimension without global synchronization."""
+    return dist.new_group(
+        ranks=[dist.get_rank()],
+        use_local_synchronization=True,
+    )
 
 
 def _build_mcore_arm(*, seed: int) -> _Arm:

@@ -76,3 +76,4 @@ def test_mcore_arm_preserves_named_tp_dimension_in_both_meshes():
     assert 'tp_dim="tp"' in source
     assert "_dense_dp_tp_rank_mesh(ps)" in source
     assert "_expert_dp_tp_rank_mesh(ps)" in source
+    assert "use_local_synchronization=True" in source
