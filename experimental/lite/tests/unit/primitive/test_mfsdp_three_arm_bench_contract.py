@@ -85,3 +85,10 @@ def test_arm_construction_is_synchronized_before_next_global_group_sequence():
     source = BENCH.read_text()
 
     assert source.count("_synchronize_arm_build(") >= 3
+
+
+def test_fixed_batches_use_current_packed_batch_contract():
+    source = BENCH.read_text()
+
+    assert "seq_lens=torch.tensor([64]" in source
+    assert "cu_seqlens=" not in source

@@ -393,8 +393,7 @@ def _fixed_batches(*, seed: int) -> list[PackedBatch]:
                 labels=torch.randint(
                     0, 64, (64,), generator=generator, device="cuda"
                 ),
-                cu_seqlens=torch.tensor([0, 64], device="cuda", dtype=torch.int32),
-                max_seqlen=64,
+                seq_lens=torch.tensor([64], device="cuda", dtype=torch.int32),
             )
         )
     return result
