@@ -29,10 +29,19 @@ case "${MODE}" in
       echo "full-parallel mode requires NNODES=1 and NPROC_PER_NODE=8." >&2
       exit 2
     fi
-    TEST_EXPR="full_parallel_precision_curve"
+    : "${MLITE_MCORE_COMMIT:?full-parallel mode requires MLITE_MCORE_COMMIT}"
+    TEST_EXPR="three_arm_full_parallel_precision"
+    ;;
+  fixed-batch)
+    if [[ "${NNODES}" != "1" || "${NPROC_PER_NODE}" != "8" ]]; then
+      echo "fixed-batch mode requires NNODES=1 and NPROC_PER_NODE=8." >&2
+      exit 2
+    fi
+    : "${MLITE_MCORE_COMMIT:?fixed-batch mode requires MLITE_MCORE_COMMIT}"
+    TEST_EXPR="fixed_batch_full_parallel_regression"
     ;;
   *)
-    echo "usage: $0 {throughput|full-parallel}" >&2
+    echo "usage: $0 {throughput|full-parallel|fixed-batch}" >&2
     exit 2
     ;;
 esac

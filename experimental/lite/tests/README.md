@@ -36,7 +36,7 @@ Current matrix:
 | Data/recompute/train-step primitives | `unit/primitive/test_ops_data_trainstep_unit.py` | model/runtime smoke exercises training loop integration |
 | DDP + distributed optimizer | `unit/primitive/test_checkpoint_unit.py`, `unit/primitive/test_checkpoint_runtime.py` | `smoke/primitive/test_distopt_checkpoint_smoke.py` |
 | FSDP2 config/wrap/offload | `unit/primitive/test_fsdp2_unit.py` | `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
-| M-FSDP precision/performance | `unit/primitive/test_mfsdp.py`, `unit/runtime/test_runtime_backend_unit.py` | `smoke/primitive/test_mfsdp_parity_smoke.py` via `run_mfsdp_hopper_validation.sh` (8-GPU throughput; 8-GPU TP2/EP2/ETP1/PP2/CP2 50-step precision curve) |
+| M-FSDP precision/performance | `unit/primitive/test_mfsdp.py`, `unit/runtime/test_runtime_backend_unit.py` | `smoke/primitive/test_mfsdp_parity_smoke.py` via `run_mfsdp_hopper_validation.sh` (8-GPU throughput; 8-GPU TP2/EP2/ETP1/PP2/CP2 50-step NVIDIA MCore M-FSDP primary + MLite FSDP2 secondary precision references; separate fixed-batch drift regression) |
 | FSDP2 save/load resume | `unit/primitive/test_checkpoint_unit.py`, `unit/primitive/test_checkpoint_runtime.py` | `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
 | Checkpoint restore vs direct training | `unit/primitive/test_checkpoint_unit.py`, `unit/primitive/test_checkpoint_runtime.py` | FSDP2 and distopt checkpoint smokes cover distributed restore paths |
 | Runtime backend registry/config | `unit/primitive/test_runtime_config_unit.py`, `unit/runtime/test_runtime_backend_unit.py` | covered through checkpoint/model handles |

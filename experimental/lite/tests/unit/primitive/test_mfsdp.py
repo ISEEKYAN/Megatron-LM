@@ -111,24 +111,23 @@ def test_mfsdp_has_no_megatron_core_imports():
     assert violations == []
 
 
-def test_mfsdp_standalone_smoke_has_no_megatron_core_imports():
+def test_mfsdp_precision_signoff_uses_mcore_primary_and_full_tensor_evidence():
     smoke_path = (
         Path(__file__).parents[2] / "smoke" / "primitive" / "test_mfsdp_parity_smoke.py"
     )
-    tree = ast.parse(smoke_path.read_text(), filename=str(smoke_path))
-    violations = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            modules = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            modules = [node.module or ""]
-        else:
-            continue
-        for module in modules:
-            if module == "megatron.core" or module.startswith("megatron.core."):
-                violations.append(f"{smoke_path.name}:{node.lineno}: {module}")
+    smoke_source = smoke_path.read_text()
+    runner_source = (smoke_path.parents[2] / "run_mfsdp_hopper_validation.sh").read_text()
 
-    assert violations == []
+    assert "_MCORE_REFERENCE_COMMIT" in smoke_source
+    assert "megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard" in smoke_source
+    assert '_PRECISION_BACKENDS = ("mcore_mfsdp", "mfsdp", "fsdp2")' in smoke_source
+    assert "_PRECISION_CHECKPOINT_STEPS = (1, 10, 20, 30, 40, 50)" in smoke_source
+    assert "[MFSDP_TENSOR_EVIDENCE]" in smoke_source
+    assert "[MFSDP_OPTIMIZER_STATE]" in smoke_source
+    assert "[MFSDP_FIRST_THRESHOLD_EXCEEDANCE]" in smoke_source
+    assert 'batch_mode="matched"' in smoke_source
+    assert 'batch_mode="fixed"' in smoke_source
+    assert "fixed-batch)" in runner_source
 
 
 def test_mfsdp_full_parallel_signoff_is_single_node_50_step_curve():
@@ -146,9 +145,10 @@ def test_mfsdp_full_parallel_signoff_is_single_node_50_step_curve():
 
     assert constants["_FULL_PARALLEL_WORLD_SIZE"] == 8
     assert constants["_FULL_PARALLEL_STEPS"] == 50
-    assert constants["_FULL_PARALLEL_CURVE_INTERVAL"] == 10
     assert "[MFSDP_FULL_PARALLEL_CURVE]" in smoke_source
-    assert "batch_seed=8345 + step" in smoke_source
+    assert 'batch_mode == "matched"' in smoke_source
+    assert "8345 + (step if" in smoke_source
+    assert "_PRECISION_CHECKPOINT_STEPS" in smoke_source
 
     runner_source = (tests_root / "run_mfsdp_hopper_validation.sh").read_text()
     assert "full-parallel mode requires NNODES=1 and NPROC_PER_NODE=8." in runner_source
