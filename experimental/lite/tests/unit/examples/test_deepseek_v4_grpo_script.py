@@ -152,7 +152,11 @@ def test_chat_template_dataset_sets_controller_tokenizer_before_loading(
 
 def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     script = SBATCH.read_text()
+    import_program = script.split("    python - <<'PY'\n", 1)[1].split(
+        "\nPY\n  exit 0\nfi", 1
+    )[0]
 
+    ast.parse(import_program)
     assert "#SBATCH --nodes=16" in script
     assert "#SBATCH --gres=gpu:8" in script
     directives = script.splitlines()
@@ -181,6 +185,7 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "PHASE1_STEPS" in script
     assert "TOTAL_STEPS" in script
     assert "CONFIG_ONLY" in script
+    assert "IMPORT_ONLY" in script
     assert "RAY_ONLY" in script
     assert "DS4_GRPO_CONFIG_COMPOSE_PASSED" in script
     assert '"use_legacy_worker_impl: disable"' in script
@@ -191,6 +196,10 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "DS4_RAY_JOB_RUNTIME_ENV_PASSED" in script
     assert "DS4_RAY_GPU_ENV_PASSED" in script
     assert "DS4_RAY_HF_CONFIG_PASSED" in script
+    assert "DS4_SERVER_IMPORT_PASSED" in script
+    assert script.index('if [[ "${IMPORT_ONLY}" == "1" ]]') < script.index(
+        "RAY_CLI=("
+    )
     assert script.index("RUNTIME_ENV_JSON=$(") < script.index(
         'if [[ "${RAY_ONLY}" == "1" ]]'
     )

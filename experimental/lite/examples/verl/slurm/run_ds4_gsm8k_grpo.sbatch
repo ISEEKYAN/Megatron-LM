@@ -56,6 +56,7 @@ GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 PHASE1_STEPS=${PHASE1_STEPS:-3}
 TOTAL_STEPS=${TOTAL_STEPS:-6}
 CONFIG_ONLY=${CONFIG_ONLY:-0}
+IMPORT_ONLY=${IMPORT_ONLY:-0}
 RAY_ONLY=${RAY_ONLY:-0}
 ACTOR_TP=${ACTOR_TP:-1}
 ACTOR_PP=${ACTOR_PP:-4}
@@ -81,6 +82,14 @@ if (( RAY_ONLY == 1 && (SLURM_NNODES != 1 || GPUS_PER_NODE != 8) )); then
   echo "RAY_ONLY requires one node with eight GPUs" >&2
   exit 2
 fi
+if (( IMPORT_ONLY == 1 && SLURM_NNODES != 1 )); then
+  echo "IMPORT_ONLY requires one CPU node" >&2
+  exit 2
+fi
+if (( CONFIG_ONLY + IMPORT_ONLY + RAY_ONLY > 1 )); then
+  echo "CONFIG_ONLY, IMPORT_ONLY, and RAY_ONLY are mutually exclusive" >&2
+  exit 2
+fi
 
 if [[ "${IN_DS4_GRPO_CONTAINER:-0}" != "1" ]]; then
   [[ ! -e "${RUN_ROOT}" ]] || {
@@ -90,7 +99,7 @@ if [[ "${IN_DS4_GRPO_CONTAINER:-0}" != "1" ]]; then
   export BASE_IMAGE MLITE_SRC MLITE_COMMIT MEGATRON_ROOT VERL_ROOT
   export MLITE_SM90_SITE DS4_VLLM_SITE DS4_VLLM_SHIM CHECKPOINT_DIR RUN_ROOT
   export MASTER_ADDR RAY_PORT RAY_DASHBOARD_PORT GPUS_PER_NODE
-  export PHASE1_STEPS TOTAL_STEPS CONFIG_ONLY RAY_ONLY
+  export PHASE1_STEPS TOTAL_STEPS CONFIG_ONLY IMPORT_ONLY RAY_ONLY
   export ACTOR_TP ACTOR_PP ACTOR_CP ACTOR_EP ROLLOUT_TP
   exec srun --nodes="${SLURM_NNODES}" \
     --ntasks="${SLURM_NNODES}" \
@@ -129,6 +138,48 @@ mkdir -p \
   "${TORCHINDUCTOR_CACHE_DIR}" \
   "${TRITON_CACHE_DIR}" \
   "${HF_DATASETS_CACHE}"
+
+if [[ "${IMPORT_ONLY}" == "1" ]]; then
+  env \
+    PYTHONPATH="${DS4_VLLM_SITE}:${PYTHONPATH}" \
+    VERL_MLITE_SKIP_RUNTIME_PATCHES=0 \
+    python - <<'PY'
+import os
+import sys
+
+import transformers
+import vllm
+from transformers import AutoModelForImageTextToText, AutoModelForVision2Seq
+from verl.utils.model import update_model_config
+from verl.workers.config import HFModelConfig
+from verl.workers.rollout.vllm_rollout.vllm_async_server import (
+    vLLMHttpServer,
+    vLLMReplica,
+)
+
+rollout_site = os.path.realpath(os.environ["DS4_VLLM_SITE"])
+assert "verl_mlite.compat" in sys.modules
+assert AutoModelForVision2Seq is AutoModelForImageTextToText
+assert callable(update_model_config)
+assert HFModelConfig is not None
+assert vLLMHttpServer is not None
+assert getattr(vLLMReplica, "_verl_mlite_server_profile_patch", False)
+assert transformers.__version__ == "5.12.1"
+assert vllm.__version__ == "0.20.2"
+for module in (transformers, vllm):
+    assert os.path.commonpath(
+        [os.path.realpath(module.__file__), rollout_site]
+    ) == rollout_site
+print(
+    "DS4_SERVER_IMPORT_PASSED "
+    f"transformers={transformers.__version__} vllm={vllm.__version__} "
+    f"transformers_origin={transformers.__file__} vllm_origin={vllm.__file__}",
+    flush=True,
+)
+PY
+  exit 0
+fi
+
 RAY_CLI=(env VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python -m ray.scripts.scripts)
 "${RAY_CLI[@]}" --help >/dev/null
 
