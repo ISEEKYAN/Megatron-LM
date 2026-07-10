@@ -279,7 +279,9 @@ def _build_mlite_arm(
     handle = _model_handle(bundle, optimizer, finalize)
     probe_counts = _install_mlite_probe_counts(handle) if backend == "mfsdp" else {}
     _synchronize_arm_build(name)
-    return _Arm(name, handle, lambda: _mlite_feature_probe(handle, probe_counts))
+    if backend == "mfsdp":
+        return _Arm(name, handle, lambda: _mlite_feature_probe(handle, probe_counts))
+    return _Arm(name, handle, lambda: _fsdp2_feature_probe(handle))
 
 
 def _dense_dp_local_tp_rank_mesh(ps) -> list[list[int]]:
@@ -650,6 +652,22 @@ def _mcore_feature_probe(adapter: _MCoreOptimizerAdapter) -> dict[str, Any]:
         "rs_overlap": bool(chunk.ddp_config.overlap_grad_reduce),
         "double_buffer": bool(chunk.ddp_config.fsdp_double_buffer),
         "nccl_ub": bool(chunk.ddp_config.nccl_ub),
+    }
+
+
+def _fsdp2_feature_probe(handle: ModelHandle) -> dict[str, Any]:
+    from torch.distributed.tensor import DTensor
+
+    chunks = handle._extras["model_chunks"]
+    parameters = [param for chunk in chunks for param in chunk.parameters()]
+    return {
+        "implementation": sorted(
+            {f"{type(chunk).__module__}.{type(chunk).__qualname__}" for chunk in chunks}
+        ),
+        "dtensor_parameter_count": sum(
+            isinstance(param, DTensor) for param in parameters
+        ),
+        "mfsdp_feature_ablation": "N/A: FSDP2 control arm",
     }
 
 

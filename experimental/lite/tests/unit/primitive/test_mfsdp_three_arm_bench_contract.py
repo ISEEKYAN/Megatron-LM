@@ -102,3 +102,11 @@ def test_mcore_arm_keeps_wrapper_forward_and_matches_gradient_sync_boundary():
     assert "sync_model_each_microbatch=False" in source
     assert "adapter.finish_grad_sync" in source
     assert "sync_grad_before_optimizer_step=False" in source
+
+
+def test_fsdp2_does_not_use_mfsdp_only_feature_probe():
+    source = BENCH.read_text()
+
+    assert "def _fsdp2_feature_probe" in source
+    assert "if backend == \"mfsdp\"" in source
+    assert "lambda: _fsdp2_feature_probe(handle)" in source
