@@ -49,7 +49,7 @@ export VERL_VLLM_FP8_QUANT_ENABLED=0
 export RUN_NAME="${RUN_NAME:-ds4_gsm8k_grpo_pp${ACTOR_PP}_ep${ACTOR_EP}_cp${ACTOR_CP}_rtp${ROLLOUT_TP}}"
 
 exec bash "${GRPO_RUNNER}" \
-  "actor_rollout_ref.actor.engine.cross_entropy_fusion=True" \
+  "+actor_rollout_ref.actor.engine.cross_entropy_fusion=True" \
   "actor_rollout_ref.actor.engine.resync_format=vllm_checkpoint" \
   "+actor_rollout_ref.actor.engine.resync_config.expert_dtype=fp8" \
   "+actor_rollout_ref.actor.engine.impl_cfg.recompute=full" \

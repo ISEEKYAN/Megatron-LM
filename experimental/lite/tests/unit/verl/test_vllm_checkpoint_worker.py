@@ -49,6 +49,20 @@ def test_vllm_server_profile_is_disabled_without_explicit_site(monkeypatch) -> N
     assert _vllm_server_profile_env() == {}
 
 
+def test_vllm_thin_finder_routes_only_the_vllm_top_level(tmp_path) -> None:
+    from verl_mlite.compat import _VllmThinFinder
+
+    package = tmp_path / "vllm"
+    package.mkdir()
+    (package / "__init__.py").write_text("ORIGIN = 'thin'\n")
+    finder = _VllmThinFinder(str(tmp_path))
+
+    assert finder.find_spec("transformers", None, None) is None
+    spec = finder.find_spec("vllm", None, None)
+    assert spec is not None
+    assert spec.origin == str(package / "__init__.py")
+
+
 def test_checkpoint_bucket_reload_has_one_lifecycle_for_all_buckets() -> None:
     from verl_mlite.rollout.vllm_worker import reload_checkpoint_buckets
 

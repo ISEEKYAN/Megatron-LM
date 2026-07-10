@@ -104,7 +104,8 @@ export VLLM_USE_V1=1
 export VERL_VLLM_FP8_QUANT_ENABLED=0
 export VERL_MLITE_VLLM_SITE="${DS4_VLLM_SITE}"
 export VERL_MLITE_VLLM_LD_PRELOAD="${DS4_VLLM_SHIM}"
-export PYTHONPATH="${MLITE_SM90_SITE}/nvidia_cutlass_dsl/python_packages:${MLITE_SM90_SITE}:${VERL_ROOT}:${MEGATRON_ROOT}:${MLITE_SRC}/experimental/lite/examples/verl:${MLITE_SRC}/experimental/lite:${MLITE_SRC}"
+export LD_PRELOAD="${DS4_VLLM_SHIM}"
+export PYTHONPATH="${MLITE_SM90_SITE}/nvidia_cutlass_dsl/python_packages:${MLITE_SM90_SITE}:${DS4_VLLM_SITE}:${VERL_ROOT}:${MEGATRON_ROOT}:${MLITE_SRC}/experimental/lite/examples/verl:${MLITE_SRC}/experimental/lite:${MLITE_SRC}"
 export TMPDIR="/tmp/ds4-grpo-${SLURM_JOB_ID}-${SLURM_PROCID}"
 export PYTHONPYCACHEPREFIX="${TMPDIR}/pycache"
 export TORCHINDUCTOR_CACHE_DIR="${TMPDIR}/torchinductor"
@@ -227,6 +228,7 @@ import os
 names = [
     "PYTHONPATH",
     "PATH",
+    "LD_PRELOAD",
     "CUDA_DEVICE_MAX_CONNECTIONS",
     "NCCL_NVLS_ENABLE",
     "PYTHONNOUSERSITE",

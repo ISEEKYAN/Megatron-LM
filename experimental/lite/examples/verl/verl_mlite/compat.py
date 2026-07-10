@@ -20,6 +20,33 @@ from typing import Any
 _BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
 
 
+class _VllmThinFinder(importlib.abc.MetaPathFinder):
+    """Resolve only the top-level ``vllm`` package from a rollout site."""
+
+    _verl_mlite_vllm_thin_finder = True
+
+    def __init__(self, site: str):
+        self._site = site
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname != "vllm":
+            return None
+        return importlib.machinery.PathFinder.find_spec(fullname, [self._site], target)
+
+
+def _install_vllm_thin_finder() -> bool:
+    site = os.environ.get("VERL_MLITE_VLLM_SITE", "").strip()
+    if not site:
+        return False
+    if any(
+        getattr(finder, "_verl_mlite_vllm_thin_finder", False)
+        for finder in sys.meta_path
+    ):
+        return False
+    sys.meta_path.insert(0, _VllmThinFinder(site))
+    return True
+
+
 def _vllm_server_profile_env() -> dict[str, str]:
     """Build the dependency profile applied only to vLLM server Ray actors."""
     site = os.environ.get("VERL_MLITE_VLLM_SITE", "").strip()
@@ -446,6 +473,7 @@ def _patch_transformers_rope_ignore_keys() -> None:
 
 
 def apply_runtime_patches() -> None:
+    _install_vllm_thin_finder()
     _patch_transformers_rope_ignore_keys()
     _patch_bucketed_weight_sender()
     _patch_vllm_server_profile()

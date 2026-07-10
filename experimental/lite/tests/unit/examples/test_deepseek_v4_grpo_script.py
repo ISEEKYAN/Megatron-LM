@@ -67,6 +67,7 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
     assert "actor_rollout_ref.actor.engine.impl_cfg.recompute=full" in command
     assert "actor_rollout_ref.actor.engine.impl_cfg.mtp_enable_train=True" in command
     assert "actor_rollout_ref.model.use_fused_kernels=True" in command
+    assert "+actor_rollout_ref.actor.engine.cross_entropy_fusion=True" in command
     assert "actor_rollout_ref.actor.engine.resync_format=vllm_checkpoint" in command
     assert "actor_rollout_ref.actor.engine.resync_config.expert_dtype=fp8" in command
     assert "VllmCheckpointWorkerExtension" in command
@@ -96,7 +97,8 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert 'VERL_MLITE_VLLM_SITE="${DS4_VLLM_SITE}"' in script
     assert 'VERL_MLITE_VLLM_LD_PRELOAD="${DS4_VLLM_SHIM}"' in script
     assert 'export PYTHONPATH="${MLITE_SM90_SITE}' in script
-    assert 'export LD_PRELOAD="${DS4_VLLM_SHIM}"' not in script
+    assert ':${DS4_VLLM_SITE}:' in script
+    assert 'export LD_PRELOAD="${DS4_VLLM_SHIM}"' in script
     assert 'RESUME_MODE="${resume_mode}"' in script
     assert 'run_phase phase1 "${PHASE1_STEPS}" disable' in script
     assert 'run_phase resume "${TOTAL_STEPS}" auto' in script
