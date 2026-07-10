@@ -731,14 +731,14 @@ def _tiny_qwen3_moe_config():
 
     return Qwen3MoEConfig(
         num_hidden_layers=2,
-        hidden_size=16,
+        hidden_size=256,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=4,
+        head_dim=64,
         vocab_size=64,
         num_experts=4,
         num_experts_per_tok=1,
-        moe_intermediate_size=8,
+        moe_intermediate_size=64,
         max_position_embeddings=4096,
         layer_types=["full_attention", "full_attention"],
     )
