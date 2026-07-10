@@ -611,6 +611,7 @@ run_phase() {
       MODEL_PATH="${CHECKPOINT_DIR}" \
       TRAIN_FILES="${DATA_DIR}/train.parquet" \
       VAL_FILES="${DATA_DIR}/test.parquet" \
+      HYDRA_RUN_DIR="${RUN_ROOT}/hydra/${phase}" \
       OUTPUT_ROOT="${VERL_OUTPUT}" \
       CKPT_DIR="${CKPT_DIR}" \
       LOG_FILE="${log_file}" \

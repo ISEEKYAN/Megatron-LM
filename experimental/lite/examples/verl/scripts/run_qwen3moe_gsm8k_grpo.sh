@@ -150,12 +150,13 @@ if [[ "${MLITE_VPP_SIZE}" == "null" ]]; then
 fi
 
 RUN_NAME="${RUN_NAME:-qwen35_gsm8k_grpo_mlite_${INFER_BACKEND}_tp${ACTOR_TP}_pp${ACTOR_PP}_cp${ACTOR_CP}_ep${ACTOR_EP}}"
+HYDRA_RUN_DIR="${HYDRA_RUN_DIR:-${OUTPUT_ROOT}/hydra/${RUN_NAME}}"
 CKPT_DIR="${CKPT_DIR:-${OUTPUT_ROOT}/checkpoints/${RUN_NAME}}"
 LOG_FILE="${LOG_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.log}"
 JSONL_FILE="${JSONL_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.jsonl}"
 CMD_FILE="${CMD_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.cmd.sh}"
 
-mkdir -p "${OUTPUT_ROOT}" "${CKPT_DIR}" "$(dirname "${LOG_FILE}")" "$(dirname "${JSONL_FILE}")" "$(dirname "${CMD_FILE}")"
+mkdir -p "${OUTPUT_ROOT}" "${HYDRA_RUN_DIR}" "${CKPT_DIR}" "$(dirname "${LOG_FILE}")" "$(dirname "${JSONL_FILE}")" "$(dirname "${CMD_FILE}")"
 export VERL_FILE_LOGGER_PATH="${JSONL_FILE}"
 
 CACHE_ROOT="${VERL_MLITE_CACHE_ROOT:-${TMPDIR:-/tmp}/verl_mlite}"
@@ -298,6 +299,7 @@ COMMAND=(
   python3
   -m
   verl.trainer.main_ppo
+  "hydra.run.dir=${HYDRA_RUN_DIR}"
   "hydra.searchpath=[pkg://verl_mlite.config]"
   "${ALGORITHM[@]}"
   "${DATA[@]}"

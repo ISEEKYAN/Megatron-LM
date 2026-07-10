@@ -66,6 +66,7 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
         "TRAIN_FILES": str(tmp_path / "train.parquet"),
         "VAL_FILES": str(tmp_path / "test.parquet"),
         "OUTPUT_ROOT": str(tmp_path / "output"),
+        "HYDRA_RUN_DIR": str(tmp_path / "hydra/phase1"),
         "CKPT_DIR": str(tmp_path / "checkpoints"),
         "NNODES": "8",
         "NGPUS_PER_NODE": "8",
@@ -110,6 +111,7 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
     assert "actor_rollout_ref.rollout.load_format=dummy" in command
     assert "trainer.total_training_steps=3" in command
     assert "trainer.use_legacy_worker_impl=disable" in command
+    assert f"hydra.run.dir={tmp_path / 'hydra/phase1'}" in command
     assert "--cfg job" in command
 
 
@@ -242,6 +244,7 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "Traceback" in script
     assert '> "${RUN_ROOT}/resolved-config.yaml" 2>&1' in script
     assert 'RESUME_MODE="${resume_mode}"' in script
+    assert 'HYDRA_RUN_DIR="${RUN_ROOT}/hydra/${phase}"' in script
     assert 'run_phase phase1 "${PHASE1_STEPS}" disable' in script
     assert 'run_phase resume "${TOTAL_STEPS}" auto' in script
     assert "DS4_GRPO_PHASE1_COMPLETE" in script
