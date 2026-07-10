@@ -56,6 +56,7 @@ GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 PHASE1_STEPS=${PHASE1_STEPS:-3}
 TOTAL_STEPS=${TOTAL_STEPS:-6}
 CONFIG_ONLY=${CONFIG_ONLY:-0}
+RAY_ONLY=${RAY_ONLY:-0}
 ACTOR_TP=${ACTOR_TP:-1}
 ACTOR_PP=${ACTOR_PP:-4}
 ACTOR_CP=${ACTOR_CP:-4}
@@ -85,7 +86,8 @@ if [[ "${IN_DS4_GRPO_CONTAINER:-0}" != "1" ]]; then
   export BASE_IMAGE MLITE_SRC MLITE_COMMIT MEGATRON_ROOT VERL_ROOT
   export MLITE_SM90_SITE DS4_VLLM_SITE DS4_VLLM_SHIM CHECKPOINT_DIR RUN_ROOT
   export MASTER_ADDR RAY_PORT RAY_DASHBOARD_PORT GPUS_PER_NODE
-  export PHASE1_STEPS TOTAL_STEPS CONFIG_ONLY ACTOR_TP ACTOR_PP ACTOR_CP ACTOR_EP ROLLOUT_TP
+  export PHASE1_STEPS TOTAL_STEPS CONFIG_ONLY RAY_ONLY
+  export ACTOR_TP ACTOR_PP ACTOR_CP ACTOR_EP ROLLOUT_TP
   exec srun --nodes="${SLURM_NNODES}" \
     --ntasks="${SLURM_NNODES}" \
     --ntasks-per-node=1 \
@@ -103,6 +105,7 @@ export CPATH=/usr/include:/usr/include/x86_64-linux-gnu
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_NVLS_ENABLE=0
 export PYTHONNOUSERSITE=1
+export RAY_raylet_start_wait_time_s="${RAY_RAYLET_START_WAIT_TIME_S:-180}"
 export VLLM_USE_V1=1
 export VERL_VLLM_FP8_QUANT_ENABLED=0
 export VERL_MLITE_VLLM_SITE="${DS4_VLLM_SITE}"
@@ -119,6 +122,8 @@ RAY_CLI=(python -m ray.scripts.scripts)
 
 NODE_RANK=${SLURM_PROCID}
 DONE_FILE="${RUN_ROOT}/.ray_done"
+RAY_TEMP_DIR="${TMPDIR}/ray"
+RAY_LOG_DIR="${RUN_ROOT}/ray-logs/node-${NODE_RANK}"
 if [[ "${CONFIG_ONLY}" == "1" ]]; then
   if [[ "${NODE_RANK}" == "0" ]]; then
     mkdir -p "${RUN_ROOT}"
@@ -166,6 +171,14 @@ PY
   exit 0
 fi
 
+mkdir -p "${RAY_TEMP_DIR}" "${RAY_LOG_DIR}"
+
+archive_ray_logs() {
+  if [[ -d "${RAY_TEMP_DIR}/session_latest/logs" ]]; then
+    cp -a "${RAY_TEMP_DIR}/session_latest/logs/." "${RAY_LOG_DIR}/" || true
+  fi
+}
+
 "${RAY_CLI[@]}" stop --force >/dev/null 2>&1 || true
 
 cleanup() {
@@ -173,6 +186,7 @@ cleanup() {
     touch "${DONE_FILE}" 2>/dev/null || true
   fi
   "${RAY_CLI[@]}" stop --force >/dev/null 2>&1 || true
+  archive_ray_logs
 }
 trap cleanup EXIT
 
@@ -183,6 +197,7 @@ if [[ "${NODE_RANK}" != "0" ]]; then
     if "${RAY_CLI[@]}" start --address="${MASTER_ADDR}:${RAY_PORT}" \
       --num-gpus="${GPUS_PER_NODE}" \
       --node-ip-address="${NODE_ADDR}" \
+      --temp-dir="${RAY_TEMP_DIR}" \
       --disable-usage-stats; then
       break
     fi
@@ -203,6 +218,7 @@ mkdir -p "${RUN_ROOT}"
   --node-ip-address="${MASTER_ADDR}" \
   --port="${RAY_PORT}" \
   --num-gpus="${GPUS_PER_NODE}" \
+  --temp-dir="${RAY_TEMP_DIR}" \
   --disable-usage-stats \
   --dashboard-host=0.0.0.0 \
   --dashboard-port="${RAY_DASHBOARD_PORT}"
@@ -226,6 +242,11 @@ while True:
     time.sleep(2)
 ray.shutdown()
 PY
+
+if [[ "${RAY_ONLY}" == "1" ]]; then
+  echo "DS4_RAY_CLUSTER_PASSED nodes=${SLURM_NNODES} source=${MLITE_COMMIT}"
+  exit 0
+fi
 
 DATA_DIR="${RUN_ROOT}/data"
 python "${MLITE_SRC}/experimental/lite/examples/verl/prepare_math_smoke_data.py" \

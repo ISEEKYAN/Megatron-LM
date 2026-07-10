@@ -90,12 +90,17 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert '"${RAY_CLI[@]}" --help' in script
     assert '"${RAY_CLI[@]}" start --head' in script
     assert '"${RAY_CLI[@]}" start --address="${MASTER_ADDR}:${RAY_PORT}"' in script
+    assert "RAY_raylet_start_wait_time_s" in script
+    assert '--temp-dir="${RAY_TEMP_DIR}"' in script
+    assert '"${RUN_ROOT}/ray-logs/node-${NODE_RANK}"' in script
     assert 'RAY_CLUSTER_NODES ${#alive[@]}' not in script
     assert "RAY_CLUSTER_NODES" in script
     assert "PHASE1_STEPS" in script
     assert "TOTAL_STEPS" in script
     assert "CONFIG_ONLY" in script
+    assert "RAY_ONLY" in script
     assert "DS4_GRPO_CONFIG_COMPOSE_PASSED" in script
+    assert "DS4_RAY_CLUSTER_PASSED" in script
     assert 'VERL_MLITE_VLLM_SITE="${DS4_VLLM_SITE}"' in script
     assert 'VERL_MLITE_VLLM_LD_PRELOAD="${DS4_VLLM_SHIM}"' in script
     assert 'export PYTHONPATH="${MLITE_SM90_SITE}' in script
