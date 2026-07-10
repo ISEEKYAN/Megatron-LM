@@ -132,6 +132,10 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "RAY_ONLY" in script
     assert "DS4_GRPO_CONFIG_COMPOSE_PASSED" in script
     assert "DS4_RAY_CLUSTER_PASSED" in script
+    assert "DS4_RAY_JOB_RUNTIME_ENV_PASSED" in script
+    assert script.index("RUNTIME_ENV_JSON=$(") < script.index(
+        'if [[ "${RAY_ONLY}" == "1" ]]'
+    )
     assert 'VERL_MLITE_VLLM_SITE="${DS4_VLLM_SITE}"' in script
     assert 'VERL_MLITE_VLLM_LD_PRELOAD="${DS4_VLLM_SHIM}"' in script
     assert 'export PYTHONPATH="${MLITE_SM90_SITE}' in script

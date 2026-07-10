@@ -242,17 +242,6 @@ while True:
 ray.shutdown()
 PY
 
-if [[ "${RAY_ONLY}" == "1" ]]; then
-  echo "DS4_RAY_CLUSTER_PASSED nodes=${SLURM_NNODES} source=${MLITE_COMMIT}"
-  exit 0
-fi
-
-DATA_DIR="${RUN_ROOT}/data"
-python "${MLITE_SRC}/experimental/lite/examples/verl/prepare_math_smoke_data.py" \
-  --output-dir "${DATA_DIR}" \
-  --train-size "${TRAIN_SIZE:-64}" \
-  --test-size "${TEST_SIZE:-16}"
-
 RUNTIME_ENV_JSON=$(VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python - <<'PY'
 import json
 import os
@@ -282,6 +271,22 @@ env["VERL_MLITE_SKIP_RUNTIME_PATCHES"] = "0"
 print(json.dumps({"env_vars": env}))
 PY
 )
+
+if [[ "${RAY_ONLY}" == "1" ]]; then
+  "${RAY_CLI[@]}" job submit \
+    --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
+    --runtime-env-json="${RUNTIME_ENV_JSON}" \
+    -- \
+    python -c 'import os, sys; assert os.environ["VERL_MLITE_SKIP_RUNTIME_PATCHES"] == "0"; assert "verl_mlite.compat" in sys.modules; print("DS4_RAY_JOB_RUNTIME_ENV_PASSED", flush=True)'
+  echo "DS4_RAY_CLUSTER_PASSED nodes=${SLURM_NNODES} source=${MLITE_COMMIT}"
+  exit 0
+fi
+
+DATA_DIR="${RUN_ROOT}/data"
+python "${MLITE_SRC}/experimental/lite/examples/verl/prepare_math_smoke_data.py" \
+  --output-dir "${DATA_DIR}" \
+  --train-size "${TRAIN_SIZE:-64}" \
+  --test-size "${TEST_SIZE:-16}"
 
 CKPT_DIR="${RUN_ROOT}/checkpoints"
 VERL_OUTPUT="${RUN_ROOT}/verl"
