@@ -191,17 +191,22 @@ from transformers import AutoModelForVision2Seq
 from verl.utils.model import update_model_config
 from verl.workers.config import HFModelConfig
 from verl.workers.rollout.vllm_rollout.vllm_async_server import (
+    run_headless,
     vLLMHttpServer,
     vLLMReplica,
 )
 
 rollout_site = os.path.realpath(os.environ["DS4_VLLM_SITE"])
+headless_api_server_count_patch = bool(
+    getattr(run_headless, "_verl_mlite_api_server_count_patch", False)
+)
 assert "verl_mlite.compat" in sys.modules
 assert AutoModelForVision2Seq is AutoModelForImageTextToText
 assert callable(update_model_config)
 assert HFModelConfig is not None
 assert vLLMHttpServer is not None
 assert getattr(vLLMReplica, "_verl_mlite_server_profile_patch", False)
+assert headless_api_server_count_patch
 assert transformers.__version__ == "5.12.1"
 assert vllm.__version__ == "0.20.2"
 for module in (transformers, vllm):
@@ -211,6 +216,7 @@ for module in (transformers, vllm):
 print(
     "DS4_SERVER_IMPORT_PASSED "
     f"transformers={transformers.__version__} vllm={vllm.__version__} "
+    f"headless_api_server_count_patch={headless_api_server_count_patch} "
     f"transformers_origin={transformers.__file__} vllm_origin={vllm.__file__}",
     flush=True,
 )

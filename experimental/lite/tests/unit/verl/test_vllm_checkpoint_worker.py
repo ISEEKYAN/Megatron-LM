@@ -111,6 +111,53 @@ def test_vllm_server_profile_keeps_shared_rollout_dependencies_on_thin_site(
     )
 
 
+def test_verl_vllm_headless_defaults_missing_api_server_count(monkeypatch) -> None:
+    from verl_mlite import compat
+
+    calls = []
+
+    def run_headless(args):
+        calls.append(args.api_server_count)
+        return "started"
+
+    server_module = SimpleNamespace(run_headless=run_headless)
+    monkeypatch.setenv("VERL_MLITE_VLLM_SITE", "/rollout")
+    monkeypatch.setattr(
+        compat.importlib,
+        "import_module",
+        lambda name: (
+            server_module
+            if name == compat._VLLM_ASYNC_SERVER_MODULE
+            else (_ for _ in ()).throw(AssertionError(name))
+        ),
+    )
+
+    assert compat._patch_verl_vllm_headless_api_server_count()
+    missing = SimpleNamespace(api_server_count=None)
+    explicit = SimpleNamespace(api_server_count=1)
+    assert server_module.run_headless(missing) == "started"
+    assert server_module.run_headless(explicit) == "started"
+    assert calls == [0, 1]
+    assert missing.api_server_count == 0
+    assert explicit.api_server_count == 1
+    assert not compat._patch_verl_vllm_headless_api_server_count()
+
+
+def test_verl_vllm_headless_patch_requires_explicit_rollout_site(
+    monkeypatch,
+) -> None:
+    from verl_mlite import compat
+
+    monkeypatch.delenv("VERL_MLITE_VLLM_SITE", raising=False)
+    monkeypatch.setattr(
+        compat.importlib,
+        "import_module",
+        lambda name: (_ for _ in ()).throw(AssertionError(name)),
+    )
+
+    assert not compat._patch_verl_vllm_headless_api_server_count()
+
+
 def test_transformers_vision2seq_alias_uses_v5_replacement(monkeypatch) -> None:
     from verl_mlite import compat
 

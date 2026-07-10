@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import Any
 
 _BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+_VLLM_ASYNC_SERVER_MODULE = (
+    "verl.workers.rollout.vllm_rollout.vllm_async_server"
+)
 _VLLM_ROLLOUT_CONSUMER_MODULE = (
     "verl.workers.rollout.vllm_rollout.vllm_rollout"
 )
@@ -141,14 +144,41 @@ class _RayActorClassProfile:
         return getattr(self._actor_class, name)
 
 
+def _patch_verl_vllm_headless_api_server_count() -> bool:
+    """Normalize vLLM's headless API server count for VERL's direct caller."""
+    if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
+        return False
+
+    server_module = importlib.import_module(_VLLM_ASYNC_SERVER_MODULE)
+    original_run_headless = server_module.run_headless
+    if getattr(
+        original_run_headless,
+        "_verl_mlite_api_server_count_patch",
+        False,
+    ):
+        return False
+
+    @wraps(original_run_headless)
+    def patched_run_headless(args: Any) -> Any:
+        if getattr(args, "api_server_count", None) is None:
+            args.api_server_count = 0
+        return original_run_headless(args)
+
+    patched_run_headless._verl_mlite_api_server_count_patch = True
+    server_module.run_headless = patched_run_headless
+    return True
+
+
 def _patch_vllm_server_profile() -> bool:
     profile = _vllm_server_profile_env()
     if not profile:
         return False
-    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
+    changed = _patch_verl_vllm_headless_api_server_count()
+    server_module = importlib.import_module(_VLLM_ASYNC_SERVER_MODULE)
+    vLLMReplica = server_module.vLLMReplica
 
     if getattr(vLLMReplica, "_verl_mlite_server_profile_patch", False):
-        return False
+        return changed
     original_init = vLLMReplica.__init__
 
     @wraps(original_init)

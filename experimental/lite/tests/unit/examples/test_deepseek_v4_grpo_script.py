@@ -221,6 +221,8 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     )
     assert "weight_sync_probe=" in import_program
     assert "skip_runtime_patches=" in import_program
+    assert "headless_api_server_count_patch=" in import_program
+    assert "_verl_mlite_api_server_count_patch" in import_program
     assert "transformers_id=" in import_program
     assert "transformers_version=" in import_program
     assert "vllm_site=" in import_program
