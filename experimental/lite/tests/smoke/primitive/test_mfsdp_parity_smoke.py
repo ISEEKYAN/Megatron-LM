@@ -437,7 +437,7 @@ def _named_mfsdp_optimizer_grads(model_chunks) -> dict[str, torch.Tensor]:
     return grads
 
 
-def _assert_tensor_sets_close(
+def _tensor_set_max_differences(
     lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]
 ) -> tuple[float, float]:
     assert lhs.keys() == rhs.keys()
@@ -450,6 +450,14 @@ def _assert_tensor_sets_close(
             _TENSOR_ATOL
         )
         max_rel = max(max_rel, float((diff / denominator).max().item()))
+    return max_abs, max_rel
+
+
+def _assert_tensor_sets_close(
+    lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]
+) -> tuple[float, float]:
+    max_abs, max_rel = _tensor_set_max_differences(lhs, rhs)
+    for name in lhs:
         torch.testing.assert_close(
             lhs[name],
             rhs[name],
@@ -1033,10 +1041,10 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
                 step_one_params[backend] = params
 
         if step == 0:
-            grad_abs, grad_rel = _assert_tensor_sets_close(
+            grad_abs, grad_rel = _tensor_set_max_differences(
                 step_one_grads["fsdp2"], step_one_grads["mfsdp"]
             )
-            param_abs, param_rel = _assert_tensor_sets_close(
+            param_abs, param_rel = _tensor_set_max_differences(
                 step_one_params["fsdp2"], step_one_params["mfsdp"]
             )
             step_one_diffs = torch.tensor(
