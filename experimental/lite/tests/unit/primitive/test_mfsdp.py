@@ -67,6 +67,30 @@ def _optimizer_named_shards(optimizer) -> dict[str, torch.nn.Parameter]:
     return result
 
 
+def test_mfsdp_zero_grad_supports_fused_optimizer_contract():
+    class NoArgZeroGradOptimizer:
+        def __init__(self):
+            self.called = False
+
+        def zero_grad(self):
+            self.called = True
+
+    fused_optimizer = NoArgZeroGradOptimizer()
+    adapter = mfsdp_optimizer._StandaloneOptimizer(
+        fused_optimizer,
+        [],
+        ps=SimpleNamespace(),
+        clip_grad=0.0,
+        grad_norm_accum_dtype=torch.float32,
+        expert_params=[],
+        expert_grad_scale=1.0,
+    )
+
+    adapter.zero_grad()
+
+    assert fused_optimizer.called is True
+
+
 def test_mfsdp_has_no_megatron_core_imports():
     package = Path(mfsdp_config.__file__).parent
     violations = []
