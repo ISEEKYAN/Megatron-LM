@@ -86,8 +86,10 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "#SBATCH --time=14-00:00:00" in script
     assert 'git -C "${MLITE_SRC}" rev-parse HEAD' in script
     assert 'srun --nodes="${SLURM_NNODES}"' in script
-    assert 'ray start --head' in script
-    assert 'ray start --address="${MASTER_ADDR}:${RAY_PORT}"' in script
+    assert "RAY_CLI=(python -m ray.scripts.scripts)" in script
+    assert '"${RAY_CLI[@]}" --help' in script
+    assert '"${RAY_CLI[@]}" start --head' in script
+    assert '"${RAY_CLI[@]}" start --address="${MASTER_ADDR}:${RAY_PORT}"' in script
     assert 'RAY_CLUSTER_NODES ${#alive[@]}' not in script
     assert "RAY_CLUSTER_NODES" in script
     assert "PHASE1_STEPS" in script

@@ -114,6 +114,8 @@ export PYTHONPYCACHEPREFIX="${TMPDIR}/pycache"
 export TORCHINDUCTOR_CACHE_DIR="${TMPDIR}/torchinductor"
 export TRITON_CACHE_DIR="${TMPDIR}/triton"
 mkdir -p "${PYTHONPYCACHEPREFIX}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}"
+RAY_CLI=(python -m ray.scripts.scripts)
+"${RAY_CLI[@]}" --help >/dev/null
 
 NODE_RANK=${SLURM_PROCID}
 DONE_FILE="${RUN_ROOT}/.ray_done"
@@ -164,13 +166,13 @@ PY
   exit 0
 fi
 
-ray stop --force >/dev/null 2>&1 || true
+"${RAY_CLI[@]}" stop --force >/dev/null 2>&1 || true
 
 cleanup() {
   if [[ "${NODE_RANK}" == "0" ]]; then
     touch "${DONE_FILE}" 2>/dev/null || true
   fi
-  ray stop --force >/dev/null 2>&1 || true
+  "${RAY_CLI[@]}" stop --force >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -178,7 +180,7 @@ if [[ "${NODE_RANK}" != "0" ]]; then
   NODE_ADDR=$(hostname -i)
   NODE_ADDR=${NODE_ADDR%% *}
   for attempt in $(seq 1 150); do
-    if ray start --address="${MASTER_ADDR}:${RAY_PORT}" \
+    if "${RAY_CLI[@]}" start --address="${MASTER_ADDR}:${RAY_PORT}" \
       --num-gpus="${GPUS_PER_NODE}" \
       --node-ip-address="${NODE_ADDR}" \
       --disable-usage-stats; then
@@ -197,7 +199,7 @@ if [[ "${NODE_RANK}" != "0" ]]; then
 fi
 
 mkdir -p "${RUN_ROOT}"
-ray start --head \
+"${RAY_CLI[@]}" start --head \
   --node-ip-address="${MASTER_ADDR}" \
   --port="${RAY_PORT}" \
   --num-gpus="${GPUS_PER_NODE}" \
