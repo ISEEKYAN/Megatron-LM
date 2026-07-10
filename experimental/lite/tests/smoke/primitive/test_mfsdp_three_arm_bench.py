@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
 import statistics
@@ -293,6 +294,22 @@ def _rank_local_singleton_group():
     )
 
 
+def _mcore_setup_watchdog(phase: str) -> None:
+    print(
+        f"[MFSDP_SETUP] rank={dist.get_rank()} phase={phase}",
+        flush=True,
+    )
+    faulthandler.dump_traceback_later(60.0, repeat=False)
+
+
+def _mcore_setup_complete(phase: str) -> None:
+    faulthandler.cancel_dump_traceback_later()
+    print(
+        f"[MFSDP_SETUP] rank={dist.get_rank()} phase={phase}:complete",
+        flush=True,
+    )
+
+
 def _build_mcore_arm(*, seed: int) -> _Arm:
     from torch.distributed.device_mesh import DeviceMesh
 
@@ -305,12 +322,17 @@ def _build_mcore_arm(*, seed: int) -> _Arm:
         annotate_parallel_parameters,
     )
 
+    _mcore_setup_watchdog("bundle")
     bundle, _impl_cfg = _new_bundle(None, seed=seed)
+    _mcore_setup_complete("bundle")
     ps = bundle.parallel_state
     assert ps.dp_cp_group is not None
     assert ps.tp_group is not None
     assert ps.ep_dp_group is not None
+    _mcore_setup_watchdog("expert_singleton")
     expert_tp_group = ps.etp_group or _rank_local_singleton_group()
+    _mcore_setup_complete("expert_singleton")
+    _mcore_setup_watchdog("device_meshes")
     dense_mesh = DeviceMesh.from_group(
         [ps.dp_cp_group, ps.tp_group],
         "cuda",
@@ -323,9 +345,11 @@ def _build_mcore_arm(*, seed: int) -> _Arm:
         mesh=_expert_dp_tp_rank_mesh(ps),
         mesh_dim_names=("dp_cp", "tp"),
     )
+    _mcore_setup_complete("device_meshes")
     wrapped_chunks = []
     torch_optimizers = []
     for chunk in bundle.chunks:
+        _mcore_setup_watchdog("fully_shard")
         annotate_parallel_parameters(
             chunk,
             is_expert_param,
@@ -364,6 +388,7 @@ def _build_mcore_arm(*, seed: int) -> _Arm:
         )
         wrapped_chunks.append(wrapped)
         torch_optimizers.append(optimizer)
+        _mcore_setup_complete("fully_shard")
     assert len(torch_optimizers) == 1
     bundle.chunks[:] = wrapped_chunks
     adapter = _MCoreOptimizerAdapter(torch_optimizers[0], wrapped_chunks)
