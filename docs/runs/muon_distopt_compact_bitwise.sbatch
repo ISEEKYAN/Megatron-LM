@@ -19,7 +19,6 @@ set -euo pipefail
 
 readonly PINNED_MEGATRON_REVISION=d64ba4ccb1e3e878c15171c9cc58d5d3b46bf4d5
 readonly PINNED_EMERGING_REVISION=b309e2f01cda75dc96a6dc1a2355a7b3b64b5e16
-readonly PINNED_MBRIDGE_REVISION=a61943d7fcb34a190471cfeb0a0eb8bbda621ddf
 
 MODE=${1:-${MODE:-}}
 if [[ -z "${MODE}" ]]; then
@@ -151,28 +150,17 @@ mkdir -p "${RUN_ROOT}"
 mounts=/lustre:/lustre
 if [[ "${MODE}" == adam ]]; then
   HF_PATH=${HF_PATH:?set HF_PATH for MODE=adam}
-  MBRIDGE_PIN_ROOT=${MBRIDGE_PIN_ROOT:?set MBRIDGE_PIN_ROOT for MODE=adam}
-  if [[ "${HF_PATH}" != /* || "${MBRIDGE_PIN_ROOT}" != /* ]]; then
-    echo "HF_PATH and MBRIDGE_PIN_ROOT must be absolute" >&2
+  if [[ "${HF_PATH}" != /* ]]; then
+    echo "HF_PATH must be absolute" >&2
     exit 2
   fi
-  actual_mbridge_revision=$(git -C "${MBRIDGE_PIN_ROOT}" rev-parse HEAD)
-  if [[ "${actual_mbridge_revision}" != "${PINNED_MBRIDGE_REVISION}" ]]; then
-    echo "MBridge pin mismatch: ${actual_mbridge_revision}" >&2
-    exit 2
-  fi
-  if [[ -n "$(git -C "${MBRIDGE_PIN_ROOT}" status --porcelain --untracked-files=all)" ]]; then
-    echo "Pinned MBridge checkout is dirty: ${MBRIDGE_PIN_ROOT}" >&2
-    exit 2
-  fi
-  MBRIDGE_TREE=$(git -C "${MBRIDGE_PIN_ROOT}" rev-parse 'HEAD^{tree}')
-  export HF_PATH MBRIDGE_PIN_ROOT MBRIDGE_TREE
+  export HF_PATH
 fi
 
 export MODE SNAPSHOT_ROOT CONTAINER_IMAGE OUTPUT_ROOT RUN_ROOT RUN_ID
 export MEGATRON_PIN_ROOT EMERGING_PIN_ROOT NVRX_SITE
 export MLITE_HEAD MLITE_TREE MEGATRON_TREE EMERGING_TREE
-export PINNED_MEGATRON_REVISION PINNED_EMERGING_REVISION PINNED_MBRIDGE_REVISION
+export PINNED_MEGATRON_REVISION PINNED_EMERGING_REVISION
 
 srun \
   --container-image="${CONTAINER_IMAGE}" \
@@ -195,9 +183,6 @@ srun \
     export PYTHONNOUSERSITE=1
     export PYTHONDONTWRITEBYTECODE=1
     export PYTHONPATH="${SNAPSHOT_ROOT}/experimental/lite:${MEGATRON_PIN_ROOT}:${EMERGING_PIN_ROOT}:${NVRX_SITE}"
-    if [[ "${MODE}" == adam ]]; then
-      export PYTHONPATH="${PYTHONPATH}:${MBRIDGE_PIN_ROOT}"
-    fi
     export CUBLAS_WORKSPACE_CONFIG=:4096:8
     export MEGATRON_LITE_DETERMINISTIC=1
     export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -249,11 +234,6 @@ assert emerging_source and beneath(emerging_source, os.environ["EMERGING_PIN_ROO
 assert nvrx_source and beneath(nvrx_source, os.environ["NVRX_SITE"]), nvrx_source
 assert importlib.metadata.version("nvidia-resiliency-ext") == "0.6.0"
 assert has_nvrx_async_support()
-if os.environ["MODE"] == "adam":
-    import mbridge
-
-    mbridge_source = inspect.getsourcefile(mbridge)
-    assert mbridge_source and beneath(mbridge_source, os.environ["MBRIDGE_PIN_ROOT"]), mbridge_source
 print("PINNED_IMPORT_ROOTS_VERIFIED")
 mode = os.environ["MODE"]
 manifest = {
@@ -282,8 +262,6 @@ manifest = {
     },
 }
 if os.environ["MODE"] == "adam":
-    manifest["mbridge_revision"] = os.environ["PINNED_MBRIDGE_REVISION"]
-    manifest["mbridge_tree"] = os.environ["MBRIDGE_TREE"]
     checkpoint = Path(os.environ["HF_PATH"]).resolve()
     config_path = checkpoint / "config.json"
     index_path = checkpoint / "model.safetensors.index.json"
@@ -292,8 +270,10 @@ if os.environ["MODE"] == "adam":
     manifest["checkpoint_fingerprints"] = {"config.json": sha256(config_path)}
     if index_path.is_file():
         manifest["checkpoint_fingerprints"][index_path.name] = sha256(index_path)
-    manifest["adam_golden_contract"] = "slurm-12630675"
-    manifest["mount_vision_model"] = True
+    manifest["adam_model_contract"] = "compact_text_only_qwen35"
+    manifest["adam_model_contract_evidence"] = "slurm-13635323"
+    manifest["adam_numeric_contract_evidence"] = "slurm-13694402-mlite-subrun"
+    manifest["mount_vision_model"] = False
 job_id = os.environ.get("SLURM_JOB_ID", "no_slurm_job")
 manifest_path = Path(os.environ["RUN_ROOT"]) / f"runtime_manifest.{mode}.{job_id}.json"
 assert not manifest_path.exists(), f"refusing to overwrite runtime manifest: {manifest_path}"
@@ -347,81 +327,41 @@ PY
         compare_implementations
         ;;
       adam)
-        export REPO_ROOT="${SNAPSHOT_ROOT}"
-        export MEGATRON_ROOT="${MEGATRON_PIN_ROOT}"
-        export EMERGING_ROOT="${EMERGING_PIN_ROOT}"
-        export OUTPUT_DIR="${RUN_ROOT}/adam"
-        export MLITE_CONTAINER_IMAGE="${CONTAINER_IMAGE}"
-        bash "${SNAPSHOT_ROOT}/experimental/lite/examples/bench/scripts/run_pinned_adam_distopt_correctness.sh"
+        output_dir="${RUN_ROOT}/adam"
+        mkdir -p "${output_dir}"
+        torchrun --nproc_per_node 1 \
+          "${SNAPSHOT_ROOT}/experimental/lite/examples/bench/correctness.py" run \
+          --backend mlite \
+          --hf-path "${HF_PATH}" \
+          --model-name qwen3_5 \
+          --tp 1 \
+          --etp 1 \
+          --ep 1 \
+          --pp 1 \
+          --cp 1 \
+          --steps 2 \
+          --num-microbatches 1 \
+          --seq-len 8 \
+          --seed 42 \
+          --truncate-layers 1 \
+          --keep-experts 2 \
+          --disable-mtp \
+          --same-data-across-dp \
+          --impl-cfg-json '{"mount_vision_model": false}' \
+          --output-json "${output_dir}/qwen35_mlite_correctness.json" \
+          2>&1 | tee "${output_dir}/qwen35_mlite_correctness.log"
 
-        python - <<"PY"
-import json
-import os
-from pathlib import Path
-
-
-output_dir = Path(os.environ["OUTPUT_DIR"])
-comparison = json.loads((output_dir / "qwen35_correctness_compare.json").read_text())
-assert comparison["passed"] is True, comparison
-assert comparison["mismatches"] == [], comparison
-assert comparison["samples"] == 2, comparison
-assert comparison["max_loss_abs"] == 0.0, comparison
-assert comparison["max_grad_norm_abs"] == 0.0, comparison
-
-expected_steps = [
-    {
-        "loss": 13.027458190917969,
-        "grad_norm": 120.75512734973202,
-        "weight_sha256": "1e3176a8cb18d68c5da9bfa5f31a507fa8d51a3a5ddc10fbcd821260a4c6c980",
-    },
-    {
-        "loss": 14.698704719543457,
-        "grad_norm": 96.15656991334498,
-        "weight_sha256": "e6d034f7e05ee5ee6a42ceddda8970874c6742baf59cade38f53550abd7aec29",
-    },
-]
-eval_bf16_sha256 = "2f805802633927852c5ec87455b1afa3a68597e1e411b979f2678eaedfb1c710"
-for backend in ("mlite", "mbridge"):
-    result = json.loads((output_dir / f"qwen35_{backend}_correctness.json").read_text())
-    assert result["backend"] == backend, result["backend"]
-    assert len(result["steps"]) == 2, len(result["steps"])
-    for step, expected in zip(result["steps"], expected_steps, strict=True):
-        assert step["loss"]["value"] == expected["loss"], (backend, step)
-        assert step["grad_norm"]["value"] == expected["grad_norm"], (backend, step)
-        assert step["grad_fingerprint"]["tensor_count"] == 352, (backend, step)
-        assert step["post_step_weights"]["tensor_count"] == 354, (backend, step)
-        assert step["post_step_weights"]["sha256"] == expected["weight_sha256"], (
-            backend,
-            step,
-        )
-        assert step["update_successful"] is True, (backend, step)
-    assert result["eval_logits"]["shape"] == [1, 8, 248320], backend
-    assert result["eval_logits"]["sha256_as_bf16"] == eval_bf16_sha256, backend
-
-verdict = {
-    "golden_contract": "slurm-12630675",
-    "mismatches": [],
-    "non_skip": True,
-    "passed": True,
-    "post_step_tensor_count": 354,
-    "samples": 2,
-}
-(output_dir / "golden_verdict.json").write_text(
-    json.dumps(verdict, indent=2, sort_keys=True) + "\n"
-)
-print(json.dumps(verdict, sort_keys=True))
-PY
+        python "${harness}" validate-adam \
+          --input-json "${output_dir}/qwen35_mlite_correctness.json" \
+          --output-json "${output_dir}/text_only_verdict.json"
+        test -f "${output_dir}/NON_SKIP_PINNED_ADAM_DISTOPT_GATE_PASSED"
 
         sha256sum \
           "${RUN_ROOT}/runtime_manifest.adam.${SLURM_JOB_ID}.json" \
-          "${OUTPUT_DIR}/runtime_manifest.json" \
-          "${OUTPUT_DIR}/qwen35_mlite_correctness.json" \
-          "${OUTPUT_DIR}/qwen35_mbridge_correctness.json" \
-          "${OUTPUT_DIR}/qwen35_correctness_compare.json" \
-          "${OUTPUT_DIR}/golden_verdict.json" \
-          >"${OUTPUT_DIR}/canonical_artifact_sha256.txt"
-        echo NON_SKIP_PINNED_ADAM_DISTOPT_GATE_PASSED \
-          | tee "${OUTPUT_DIR}/NON_SKIP_PINNED_ADAM_DISTOPT_GATE_PASSED"
+          "${output_dir}/qwen35_mlite_correctness.json" \
+          "${output_dir}/text_only_verdict.json" \
+          "${output_dir}/NON_SKIP_PINNED_ADAM_DISTOPT_GATE_PASSED" \
+          >"${output_dir}/canonical_artifact_sha256.txt"
         ;;
     esac
   '

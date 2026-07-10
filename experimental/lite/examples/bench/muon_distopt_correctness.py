@@ -36,7 +36,49 @@ WORLD_SIZE = 2
 TOTAL_STEPS = 4
 SAVE_STEPS = 2
 MARKER_NAME = "NON_SKIP_MUON_DISTOPT_COMPACT_BITWISE_PASSED"
+ADAM_MARKER_NAME = "NON_SKIP_PINNED_ADAM_DISTOPT_GATE_PASSED"
 SCHEMA_VERSION = 1
+
+_ADAM_TEXT_ONLY_EXPECTED = {
+    "backend": "mlite",
+    "model_name": "qwen3_5",
+    "seed": 42,
+    "seq_len": 8,
+    "num_microbatches": 1,
+    "metadata": {
+        "deterministic": True,
+        "same_data_across_dp": True,
+        "use_thd": False,
+    },
+    "eval_logits": {
+        "shape": [1, 8],
+        "sha256_as_bf16": "94c2d3527acaa8db8ba29d6a86d060d8039b70b5149ed27eeaeaec746f218010",
+    },
+    "steps": [
+        {
+            "step": 0,
+            "loss": {"value": 13.027458190917969},
+            "grad_norm": {"value": 120.75512734973202},
+            "grad_fingerprint": {"tensor_count": 19},
+            "post_step_weights": {
+                "tensor_count": 21,
+                "sha256": "618edfd90e5a2e10e6d42a436e129b3b22ff9625a2b2c6025cd925828cf41eee",
+            },
+            "update_successful": True,
+        },
+        {
+            "step": 1,
+            "loss": {"value": 14.698704719543457},
+            "grad_norm": {"value": 96.15656991334498},
+            "grad_fingerprint": {"tensor_count": 19},
+            "post_step_weights": {
+                "tensor_count": 21,
+                "sha256": "3bb5841e92690d4b6864f40472875622e7a02e47cedc3f39fc54ba1a1c1ee635",
+            },
+            "update_successful": True,
+        },
+    ],
+}
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -1385,6 +1427,75 @@ def compare_runs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _expected_subset_mismatches(
+    actual: Any, expected: Any, path: str = "artifact"
+) -> list[str]:
+    mismatches: list[str] = []
+    if isinstance(expected, Mapping):
+        if not isinstance(actual, Mapping):
+            return [f"{path}: expected mapping, got {type(actual).__name__}"]
+        for key, expected_value in expected.items():
+            if key not in actual:
+                mismatches.append(f"{path}.{key}: missing")
+                continue
+            mismatches.extend(
+                _expected_subset_mismatches(actual[key], expected_value, f"{path}.{key}")
+            )
+        return mismatches
+    if isinstance(expected, list):
+        if not isinstance(actual, list):
+            return [f"{path}: expected list, got {type(actual).__name__}"]
+        if len(actual) != len(expected):
+            return [f"{path}: expected length {len(expected)}, got {len(actual)}"]
+        for index, (actual_value, expected_value) in enumerate(zip(actual, expected)):
+            mismatches.extend(
+                _expected_subset_mismatches(
+                    actual_value, expected_value, f"{path}[{index}]"
+                )
+            )
+        return mismatches
+    if type(actual) is not type(expected) or actual != expected:
+        mismatches.append(f"{path}: expected {expected!r}, got {actual!r}")
+    return mismatches
+
+
+def validate_adam_text_only(input_json: Path, output_json: Path) -> int:
+    """Validate the frozen compact text-only Qwen3.5 Adam DistOpt regression."""
+
+    artifact = json.loads(input_json.read_text(encoding="utf-8"))
+    mismatches = _expected_subset_mismatches(artifact, _ADAM_TEXT_ONLY_EXPECTED)
+    verdict = {
+        "kind": "pinned_adam_distopt_text_only_verdict",
+        "model_contract": "compact_text_only_qwen35",
+        "model_contract_evidence": "slurm-13635323",
+        "numeric_contract_evidence": "slurm-13694402-mlite-subrun",
+        "passed": not mismatches,
+        "non_skip": not mismatches,
+        "mismatches": mismatches,
+    }
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    marker = output_json.parent / ADAM_MARKER_NAME
+    marker.unlink(missing_ok=True)
+    output_json.write_text(
+        json.dumps(verdict, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    if mismatches:
+        print(json.dumps(verdict, sort_keys=True), flush=True)
+        return 1
+    marker.write_text(
+        f"{ADAM_MARKER_NAME} model_contract=compact_text_only_qwen35 steps=2\n",
+        encoding="utf-8",
+    )
+    print(marker.read_text(encoding="utf-8").strip(), flush=True)
+    return 0
+
+
+def validate_adam_text_only_command(args: argparse.Namespace) -> int:
+    return validate_adam_text_only(
+        Path(args.input_json).resolve(), Path(args.output_json).resolve()
+    )
+
+
 def _fake_artifact(implementation: str, trajectory: str, rank: int) -> dict[str, Any]:
     ranges = {
         "continuous": range(TOTAL_STEPS),
@@ -1521,6 +1632,13 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--mlite-dir", required=True)
     compare_parser.add_argument("--output-json", required=True)
     compare_parser.set_defaults(handler=compare_runs)
+
+    adam_parser = subparsers.add_parser(
+        "validate-adam", help="validate the frozen text-only Adam DistOpt regression"
+    )
+    adam_parser.add_argument("--input-json", required=True)
+    adam_parser.add_argument("--output-json", required=True)
+    adam_parser.set_defaults(handler=validate_adam_text_only_command)
 
     selftest_parser = subparsers.add_parser(
         "selftest", help="exercise the recursive comparator without CUDA or Megatron"

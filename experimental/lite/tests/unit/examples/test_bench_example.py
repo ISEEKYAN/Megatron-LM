@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from contextlib import nullcontext
@@ -17,6 +18,80 @@ from megatron.lite.runtime.contracts.handle import ModelHandle
 _LITE_ROOT = str(Path(__file__).resolve().parents[3])
 sys.path = [path for path in sys.path if path != _LITE_ROOT]
 sys.path.insert(0, _LITE_ROOT)
+
+
+def _text_only_adam_artifact() -> dict:
+    return {
+        "backend": "mlite",
+        "model_name": "qwen3_5",
+        "seed": 42,
+        "seq_len": 8,
+        "num_microbatches": 1,
+        "metadata": {
+            "deterministic": True,
+            "same_data_across_dp": True,
+            "use_thd": False,
+        },
+        "eval_logits": {
+            "shape": [1, 8],
+            "sha256_as_bf16": "94c2d3527acaa8db8ba29d6a86d060d8039b70b5149ed27eeaeaec746f218010",
+        },
+        "steps": [
+            {
+                "step": 0,
+                "loss": {"value": 13.027458190917969},
+                "grad_norm": {"value": 120.75512734973202},
+                "grad_fingerprint": {"tensor_count": 19},
+                "post_step_weights": {
+                    "tensor_count": 21,
+                    "sha256": "618edfd90e5a2e10e6d42a436e129b3b22ff9625a2b2c6025cd925828cf41eee",
+                },
+                "update_successful": True,
+            },
+            {
+                "step": 1,
+                "loss": {"value": 14.698704719543457},
+                "grad_norm": {"value": 96.15656991334498},
+                "grad_fingerprint": {"tensor_count": 19},
+                "post_step_weights": {
+                    "tensor_count": 21,
+                    "sha256": "3bb5841e92690d4b6864f40472875622e7a02e47cedc3f39fc54ba1a1c1ee635",
+                },
+                "update_successful": True,
+            },
+        ],
+    }
+
+
+def test_compact_muon_harness_accepts_text_only_adam_contract(tmp_path):
+    from examples.bench.muon_distopt_correctness import validate_adam_text_only
+
+    input_json = tmp_path / "adam.json"
+    output_json = tmp_path / "verdict.json"
+    input_json.write_text(json.dumps(_text_only_adam_artifact()), encoding="utf-8")
+
+    assert validate_adam_text_only(input_json, output_json) == 0
+    verdict = json.loads(output_json.read_text(encoding="utf-8"))
+    assert verdict["passed"] is True
+    assert verdict["non_skip"] is True
+    assert verdict["model_contract"] == "compact_text_only_qwen35"
+    assert (tmp_path / "NON_SKIP_PINNED_ADAM_DISTOPT_GATE_PASSED").is_file()
+
+
+def test_compact_muon_harness_rejects_text_only_adam_drift(tmp_path):
+    from examples.bench.muon_distopt_correctness import validate_adam_text_only
+
+    artifact = copy.deepcopy(_text_only_adam_artifact())
+    artifact["steps"][1]["post_step_weights"]["sha256"] = "0" * 64
+    input_json = tmp_path / "adam.json"
+    output_json = tmp_path / "verdict.json"
+    input_json.write_text(json.dumps(artifact), encoding="utf-8")
+
+    assert validate_adam_text_only(input_json, output_json) == 1
+    verdict = json.loads(output_json.read_text(encoding="utf-8"))
+    assert verdict["passed"] is False
+    assert any("steps[1].post_step_weights.sha256" in item for item in verdict["mismatches"])
+    assert not (tmp_path / "NON_SKIP_PINNED_ADAM_DISTOPT_GATE_PASSED").exists()
 
 
 def test_bench_builds_mlite_runtime_config_with_model_hook():
