@@ -1016,6 +1016,20 @@ def _max_snapshot_abs_diff(
     return max(float((lhs[name] - rhs[name]).abs().max()) for name in lhs)
 
 
+def _run_full_parallel_backward(handle: ModelHandle, *, batch_seed: int) -> float:
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime.zero_grad(handle)
+    result = runtime.forward_backward(
+        handle,
+        iter(_fixed_packed_batches(64, seed=batch_seed)),
+        None,
+        num_microbatches=_FULL_PARALLEL_MICROBATCHES,
+    )
+    loss = result.model_output.loss
+    assert loss is not None
+    return float(loss.detach().float().cpu())
+
+
 class _CheckpointScheduler:
     def __init__(self):
         self.step_count = 0
@@ -1157,7 +1171,11 @@ def test_mfsdp_checkpoint_export_offload_resume():
         scheduler.step()
         runtime.save_checkpoint(handle, checkpoint_root, step=1, use_dcp=True)
         _assert_full_parameters_released(handle)
-        checkpoint_snapshot = _mfsdp_persistent_snapshot(handle)
+        checkpoint_state = _mfsdp_persistent_snapshot(handle)
+        checkpoint_snapshot = {
+            "model": checkpoint_state["model"],
+            "optimizer": checkpoint_state["optimizer"],
+        }
         expected_rng = torch.rand(16, device="cuda").cpu()
 
         loss2, grad2, _ = _run_full_parallel_step(
@@ -1208,12 +1226,18 @@ def test_mfsdp_checkpoint_export_offload_resume():
     assert runtime.load_checkpoint(handle, checkpoint_root, use_dcp=True) == 1
     assert scheduler.step_count == 1
     _assert_full_parameters_released(handle)
+    loaded_state = _mfsdp_persistent_snapshot(handle)
     _assert_snapshot_equal(
-        _mfsdp_persistent_snapshot(handle), oracle["checkpoint_snapshot"], "loaded"
+        {"model": loaded_state["model"], "optimizer": loaded_state["optimizer"]},
+        oracle["checkpoint_snapshot"],
+        "loaded",
     )
+    assert all(not torch.count_nonzero(grad) for grad in loaded_state["grads"].values())
     assert torch.equal(torch.rand(16, device="cuda").cpu(), oracle["expected_rng"])
 
+    _run_full_parallel_backward(handle, batch_seed=12500)
     before_offload = _mfsdp_persistent_snapshot(handle)
+    assert any(torch.count_nonzero(grad) for grad in before_offload["grads"].values())
     cuda_state_devices = _optimizer_state_devices(handle)
     assert {
         device
