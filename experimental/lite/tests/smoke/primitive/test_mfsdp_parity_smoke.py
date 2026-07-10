@@ -203,7 +203,11 @@ def _model_cfg() -> SimpleNamespace:
     )
 
 
-def _optimizer_cfg(*, use_fused_optimizer: bool = True) -> OptimizerConfig:
+def _optimizer_cfg(
+    *,
+    use_fused_optimizer: bool = True,
+    fsdp2_use_fp32_master: bool = True,
+) -> OptimizerConfig:
     cfg = OptimizerConfig(
         optimizer="adam",
         lr=1.0e-3,
@@ -217,6 +221,7 @@ def _optimizer_cfg(*, use_fused_optimizer: bool = True) -> OptimizerConfig:
     cfg.override_optimizer_config = {
         "mfsdp_sharding_strategy": _MFSDP_SHARDING_STRATEGY,
         "use_fused_optimizer": use_fused_optimizer,
+        "fsdp2_use_fp32_master": fsdp2_use_fp32_master,
     }
     return cfg
 
@@ -763,7 +768,10 @@ def _build_full_parallel_handle(backend: str, *, seed: int):
     impl_cfg = protocol.ImplConfig(
         parallel=parallel,
         optimizer=backend,
-        optimizer_config=_optimizer_cfg(use_fused_optimizer=False),
+        optimizer_config=_optimizer_cfg(
+            use_fused_optimizer=False,
+            fsdp2_use_fp32_master=False,
+        ),
         use_deepep=False,
         use_thd=True,
         deterministic=True,
@@ -974,6 +982,8 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
     _assert_distinct_backend_identities(
         fsdp2_handle._optimizer, mfsdp_handle._optimizer
     )
+    assert _optimizer_chain(fsdp2_handle._optimizer)[-1] == "torch.optim.adamw.AdamW"
+    assert _optimizer_chain(mfsdp_handle._optimizer)[-1] == "torch.optim.adamw.AdamW"
 
     for handle in (fsdp2_handle, mfsdp_handle):
         ps = handle._parallel_state

@@ -148,6 +148,8 @@ def test_mfsdp_full_parallel_signoff_is_single_node_50_step_curve():
     assert constants["_FULL_PARALLEL_STEPS"] == 50
     assert constants["_FULL_PARALLEL_CURVE_INTERVAL"] == 10
     assert "[MFSDP_FULL_PARALLEL_CURVE]" in smoke_source
+    assert '"fsdp2_use_fp32_master": fsdp2_use_fp32_master' in smoke_source
+    assert "fsdp2_use_fp32_master=False" in smoke_source
 
     runner_source = (tests_root / "run_mfsdp_hopper_validation.sh").read_text()
     assert "full-parallel mode requires NNODES=1 and NPROC_PER_NODE=8." in runner_source
