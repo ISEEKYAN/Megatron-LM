@@ -20,6 +20,7 @@ RUNNER = EXAMPLE_ROOT / "scripts/run_deepseek_v4_gsm8k_grpo.sh"
 SBATCH = EXAMPLE_ROOT / "slurm/run_ds4_gsm8k_grpo.sbatch"
 DATASET_MODULE = EXAMPLE_ROOT / "verl_mlite/dataset.py"
 ENGINE_MODULE = EXAMPLE_ROOT / "verl_mlite/engine/mlite_engine.py"
+VLLM_LOAD_ONLY_MODULE = EXAMPLE_ROOT / "deepseek_v4_rollout_load_only.py"
 
 
 def test_sitecustomize_skips_application_patches_for_ray_infrastructure() -> None:
@@ -317,6 +318,58 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "metrics-report.json" in script
     assert "DS4_GRPO_RUN_COMPLETE" in script
     assert "DRY_RUN=0" in script
+
+
+def test_ds4_grpo_sbatch_has_bounded_vllm_load_only_gate() -> None:
+    script = SBATCH.read_text()
+    load_program = VLLM_LOAD_ONLY_MODULE.read_text()
+
+    ast.parse(load_program)
+    assert 'if [[ "${VLLM_LOAD_ONLY}" == "1" ]]' in script
+    assert "VLLM_LOAD_ONLY requires one node with eight GPUs" in script
+    assert "deepseek_v4_rollout_load_only.py" in script
+    assert "tensor_parallel_size=rollout_tp" in load_program
+    assert 'load_format="dummy"' in load_program
+    assert '"expert_dtype": "fp8"' in load_program
+    assert "DS4_VLLM_LOAD_ONLY_PASSED" in load_program
+
+
+def test_ds4_vllm_load_only_uses_production_fp8_shape(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    checkpoint_dir = tmp_path / "mixed-model"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "config.json").write_text(json.dumps({"o_groups": 8}))
+    calls = []
+
+    class FakeLLM:
+        def __init__(self, **kwargs) -> None:
+            calls.append(kwargs)
+
+    vllm = types.ModuleType("vllm")
+    vllm.LLM = FakeLLM
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setenv("CHECKPOINT_DIR", str(checkpoint_dir))
+    monkeypatch.setenv("ROLLOUT_TP", "8")
+
+    spec = importlib.util.spec_from_file_location(
+        "ds4_vllm_load_only_test", VLLM_LOAD_ONLY_MODULE
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.main()
+
+    assert calls[0]["tensor_parallel_size"] == 8
+    assert calls[0]["load_format"] == "dummy"
+    assert calls[0]["hf_overrides"]["expert_dtype"] == "fp8"
+    assert calls[0]["hf_overrides"]["quantization_config"]["weight_block_size"] == [
+        128,
+        128,
+    ]
+    assert "DS4_VLLM_LOAD_ONLY_PASSED rollout_tp=8 o_groups=8 local_groups=1" in (
+        capsys.readouterr().out
+    )
 
 
 def test_ds4_grpo_ray_only_probes_every_local_device_uuid_mapping() -> None:

@@ -184,6 +184,8 @@ throughput before printing `DS4_GRPO_RUN_COMPLETE`.
 The rollout tensor-parallel size defaults to 8 and must divide the checkpoint's
 `o_groups`. This keeps every vLLM rank responsible for at least one output BMM
 group during FP8 dummy initialization.
+Set `VLLM_LOAD_ONLY=1` on a one-node, eight-GPU allocation to run that dummy
+FP8 initialization without constructing the MLite actor or starting RL.
 
 The Slurm script creates deterministic arithmetic prompts in the canonical
 GSM8K parquet schema. This is a network-independent mechanism smoke dataset,
