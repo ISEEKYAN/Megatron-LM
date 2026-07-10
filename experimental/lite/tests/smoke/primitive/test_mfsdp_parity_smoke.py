@@ -932,7 +932,6 @@ def _build_mcore_reference_optimizer(chunks, ps):
     assert os.environ.get("MLITE_MCORE_COMMIT") == _MCORE_REFERENCE_COMMIT
     assert source_sha256 == _MCORE_FULLY_SHARD_SHA256
     assert "megatron/core/distributed/fsdp" in source_path.as_posix()
-
     print(
         f"[MFSDP_BUILD] rank={dist.get_rank()} pp_rank={ps.pp_rank} "
         "backend=mcore_mfsdp phase=mesh_start",
@@ -1432,6 +1431,15 @@ def _run_full_parallel_precision(monkeypatch, *, batch_mode: str):
         )
         print(
             f"[MFSDP_BUILD] rank={dist.get_rank()} backend={backend} phase=handle_done",
+            flush=True,
+        )
+        # Every init_parallel() call creates process groups collectively over WORLD.
+        # Pipeline stages have different parameter sets and therefore finish wrapper
+        # construction at different times; rendezvous before any rank creates the
+        # next reference arm's groups.
+        dist.barrier()
+        print(
+            f"[MFSDP_BUILD] rank={dist.get_rank()} backend={backend} phase=all_ranks_done",
             flush=True,
         )
     mcore_handle = handles["mcore_mfsdp"]

@@ -125,6 +125,8 @@ def test_mfsdp_precision_signoff_uses_mcore_primary_and_full_tensor_evidence():
     assert "[MFSDP_TENSOR_EVIDENCE]" in smoke_source
     assert "[MFSDP_OPTIMIZER_STATE]" in smoke_source
     assert "[MFSDP_FIRST_THRESHOLD_EXCEEDANCE]" in smoke_source
+    assert "dist.barrier()" in smoke_source
+    assert "phase=all_ranks_done" in smoke_source
     assert 'batch_mode="matched"' in smoke_source
     assert 'batch_mode="fixed"' in smoke_source
     assert "fixed-batch)" in runner_source
