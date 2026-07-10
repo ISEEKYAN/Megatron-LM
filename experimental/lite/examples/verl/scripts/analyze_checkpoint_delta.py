@@ -63,7 +63,7 @@ def classify_parameter_family(name: str) -> str:
     lowered = name.lower()
     if "vision_model" in lowered or ".vision." in lowered:
         return "vision"
-    if ".gdn." in lowered:
+    if ".gdn." in lowered or (".module." in lowered and ".linear_attn." in lowered):
         return "gdn"
     if (
         lowered.endswith("lm_head.weight")
@@ -79,6 +79,7 @@ def classify_parameter_family(name: str) -> str:
         ".router." in lowered
         or ".mlp.gate." in lowered
         or "shared_expert_gate" in lowered
+        or "shared_gate" in lowered
         or lowered.endswith("router.weight")
     ):
         return "router"
