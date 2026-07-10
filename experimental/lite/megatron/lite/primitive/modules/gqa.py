@@ -15,6 +15,7 @@ from megatron.lite.primitive.modules.gqa_utils import split_grouped_qkvg
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
 from megatron.lite.primitive.parallel import ColumnParallelLinear, ParallelState, RowParallelLinear
+from megatron.lite.primitive.precision import PrecisionCoverage, SemanticSite
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.rope import _apply_rotary_pos_emb_bshd, _apply_rotary_pos_emb_thd
 from megatron.lite.primitive.utils.rotary import RotaryEmbedding
@@ -59,6 +60,7 @@ class GQAttention(nn.Module):
         qkv_layout: str = "flat",
         lora_config: LoraConfig | dict | None = None,
         mrope_section: list[int] | None = None,
+        precision_coverage: PrecisionCoverage | None = None,
     ):
         super().__init__()
         self.num_heads_local = ensure_divisible(num_attention_heads, ps.tp_size)
@@ -73,6 +75,16 @@ class GQAttention(nn.Module):
             raise ValueError(f"Unsupported qkv_layout={qkv_layout!r}")
         self._qkv_layout = qkv_layout
         self._mrope_section = list(mrope_section) if mrope_section is not None else None
+        lora = normalize_lora_config(lora_config)
+        if precision_coverage is not None and lora.enabled:
+            raise ValueError(
+                "LoRA attention side paths are not covered by the closed Hopper profiles."
+            )
+        precision_site = (
+            SemanticSite.ATTENTION_PROJECTION
+            if precision_coverage is not None
+            else None
+        )
 
         # Declaration order follows MC's `SelfAttention` submodule order
         # (linear_proj → linear_qkv → q_layernorm → k_layernorm). `named_
@@ -81,7 +93,14 @@ class GQAttention(nn.Module):
         # Mismatched order would put bucket boundaries in different places,
         # producing different per-rank fp32 master shard layouts and
         # non-bitwise step-1 divergence.
-        self.proj = RowParallelLinear(num_attention_heads * head_dim, hidden_size, ps, bias=False)
+        self.proj = RowParallelLinear(
+            num_attention_heads * head_dim,
+            hidden_size,
+            ps,
+            bias=False,
+            precision_coverage=precision_coverage,
+            precision_site=precision_site,
+        )
         q_cols = num_attention_heads * (2 if output_gate else 1)
         qkv_size = (q_cols + 2 * num_key_value_heads) * head_dim
         self.qkv = ColumnParallelLinear(
@@ -92,6 +111,8 @@ class GQAttention(nn.Module):
             normalization="RMSNorm",
             eps=rms_norm_eps,
             zero_centered_gamma=zero_centered_gamma,
+            precision_coverage=precision_coverage,
+            precision_site=precision_site,
         )
         self.q_norm = te.RMSNorm(
             head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
@@ -100,7 +121,6 @@ class GQAttention(nn.Module):
             head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
         )
 
-        lora = normalize_lora_config(lora_config)
         self.qkv_lora: LinearLoRA | None = None
         self.proj_lora: LinearLoRA | None = None
         if lora.enabled and lora.targets_module("linear_qkv"):
