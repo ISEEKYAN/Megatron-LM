@@ -148,8 +148,42 @@ import os
 import sys
 
 import transformers
+from transformers import AutoModelForImageTextToText
+
+alias_name = "AutoModelForVision2Seq"
+startup_sitecustomize = sys.modules.get("sitecustomize")
+alias_before = (
+    vars(transformers).get(alias_name) is AutoModelForImageTextToText
+    or getattr(transformers, "_objects", {}).get(alias_name)
+    is AutoModelForImageTextToText
+)
+from verl_mlite import compat
+
+explicit_patch_result = compat._patch_transformers_vision2seq_alias()
+alias_after_explicit_patch = (
+    vars(transformers).get(alias_name) is AutoModelForImageTextToText
+    or getattr(transformers, "_objects", {}).get(alias_name)
+    is AutoModelForImageTextToText
+)
+print(
+    "DS4_SERVER_IMPORT_STATE "
+    f"sitecustomize={getattr(startup_sitecustomize, '__file__', None)} "
+    f"compat={compat.__file__} "
+    f"alias_before={alias_before} explicit_patch_result={explicit_patch_result} "
+    f"alias_after_explicit_patch={alias_after_explicit_patch}",
+    flush=True,
+)
+assert startup_sitecustomize is not None, "sitecustomize did not load at startup"
+expected_sitecustomize = os.path.join(
+    os.environ["MLITE_SRC"], "experimental/lite/examples/verl/sitecustomize.py"
+)
+assert os.path.realpath(startup_sitecustomize.__file__) == os.path.realpath(
+    expected_sitecustomize
+), (startup_sitecustomize.__file__, expected_sitecustomize)
+assert alias_before, "sitecustomize did not preserve the Transformers v5 alias"
+
 import vllm
-from transformers import AutoModelForImageTextToText, AutoModelForVision2Seq
+from transformers import AutoModelForVision2Seq
 from verl.utils.model import update_model_config
 from verl.workers.config import HFModelConfig
 from verl.workers.rollout.vllm_rollout.vllm_async_server import (

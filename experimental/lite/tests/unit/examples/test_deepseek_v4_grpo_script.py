@@ -196,7 +196,15 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "DS4_RAY_JOB_RUNTIME_ENV_PASSED" in script
     assert "DS4_RAY_GPU_ENV_PASSED" in script
     assert "DS4_RAY_HF_CONFIG_PASSED" in script
+    assert "DS4_SERVER_IMPORT_STATE" in script
     assert "DS4_SERVER_IMPORT_PASSED" in script
+    assert "import sitecustomize" not in import_program
+    assert import_program.index('sys.modules.get("sitecustomize")') < (
+        import_program.index("compat._patch_transformers_vision2seq_alias()")
+    )
+    assert import_program.index('"DS4_SERVER_IMPORT_STATE "') < (
+        import_program.index("assert startup_sitecustomize is not None")
+    )
     assert script.index('if [[ "${IMPORT_ONLY}" == "1" ]]') < script.index(
         "RAY_CLI=("
     )
