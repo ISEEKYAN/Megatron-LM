@@ -865,8 +865,6 @@ def _record_collectives():
         "all_to_all_single",
         "broadcast",
         "batch_isend_irecv",
-        "isend",
-        "irecv",
         "send",
         "recv",
     )
