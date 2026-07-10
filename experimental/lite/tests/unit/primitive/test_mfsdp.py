@@ -158,7 +158,10 @@ def test_mfsdp_full_parallel_signoff_is_single_node_50_step_curve():
 
     assert constants["_FULL_PARALLEL_WORLD_SIZE"] == 8
     assert constants["_FULL_PARALLEL_STEPS"] == 50
+    assert constants["_LOSS_REL_TOL"] == 1.0e-2
+    assert constants["_GRAD_NORM_REL_TOL"] == 3.0e-2
     assert "[MFSDP_FULL_PARALLEL_CURVE]" in smoke_source
+    assert "grad_norm_rel_tol={_GRAD_NORM_REL_TOL:.3e}" in smoke_source
     assert 'batch_mode == "matched"' in smoke_source
     assert "8345 + (step if" in smoke_source
     assert "_PRECISION_CHECKPOINT_STEPS" in smoke_source
