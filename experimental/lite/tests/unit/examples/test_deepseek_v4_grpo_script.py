@@ -46,6 +46,7 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
         "ACTOR_CP": "2",
         "ROLLOUT_TP": "16",
         "TOTAL_TRAINING_STEPS": "3",
+        "COMPOSE_ONLY": "1",
         "DRY_RUN": "1",
     }
     result = subprocess.run(
@@ -73,6 +74,7 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
     assert "actor_rollout_ref.rollout.tensor_model_parallel_size=16" in command
     assert "actor_rollout_ref.rollout.load_format=dummy" in command
     assert "trainer.total_training_steps=3" in command
+    assert "--cfg job" in command
 
 
 def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
@@ -89,6 +91,8 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "RAY_CLUSTER_NODES" in script
     assert "PHASE1_STEPS" in script
     assert "TOTAL_STEPS" in script
+    assert "CONFIG_ONLY" in script
+    assert "DS4_GRPO_CONFIG_COMPOSE_PASSED" in script
     assert 'RESUME_MODE="${resume_mode}"' in script
     assert 'run_phase phase1 "${PHASE1_STEPS}" disable' in script
     assert 'run_phase resume "${TOTAL_STEPS}" auto' in script

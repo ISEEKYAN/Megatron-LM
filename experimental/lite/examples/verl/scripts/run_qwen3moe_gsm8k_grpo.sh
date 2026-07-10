@@ -118,6 +118,7 @@ LOGGER="${LOGGER:-[console,file]}"
 # Recent VERL always uses the unified engine workers; the launcher sets no
 # worker-path override.
 DRY_RUN="${DRY_RUN:-0}"
+COMPOSE_ONLY="${COMPOSE_ONLY:-0}"
 EXTRA_ARGS=("$@")
 
 if [[ "${INFER_BACKEND}" != "vllm" && "${INFER_BACKEND}" != "sglang" && "${INFER_BACKEND}" != "trtllm" ]]; then
@@ -305,6 +306,10 @@ COMMAND=(
   "${TRAINER[@]}"
   "${EXTRA_ARGS[@]}"
 )
+
+if [[ "${COMPOSE_ONLY}" == "1" ]]; then
+  COMMAND+=(--cfg job)
+fi
 
 printf '%q ' "${COMMAND[@]}" > "${CMD_FILE}"
 printf '\n' >> "${CMD_FILE}"

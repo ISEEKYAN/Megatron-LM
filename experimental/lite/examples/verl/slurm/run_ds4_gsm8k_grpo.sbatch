@@ -55,6 +55,7 @@ RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 PHASE1_STEPS=${PHASE1_STEPS:-3}
 TOTAL_STEPS=${TOTAL_STEPS:-6}
+CONFIG_ONLY=${CONFIG_ONLY:-0}
 ACTOR_TP=${ACTOR_TP:-1}
 ACTOR_PP=${ACTOR_PP:-4}
 ACTOR_CP=${ACTOR_CP:-4}
@@ -84,7 +85,7 @@ if [[ "${IN_DS4_GRPO_CONTAINER:-0}" != "1" ]]; then
   export BASE_IMAGE MLITE_SRC MLITE_COMMIT MEGATRON_ROOT VERL_ROOT
   export MLITE_SM90_SITE DS4_VLLM_SITE DS4_VLLM_SHIM CHECKPOINT_DIR RUN_ROOT
   export MASTER_ADDR RAY_PORT RAY_DASHBOARD_PORT GPUS_PER_NODE
-  export PHASE1_STEPS TOTAL_STEPS ACTOR_TP ACTOR_PP ACTOR_CP ACTOR_EP ROLLOUT_TP
+  export PHASE1_STEPS TOTAL_STEPS CONFIG_ONLY ACTOR_TP ACTOR_PP ACTOR_CP ACTOR_EP ROLLOUT_TP
   exec srun --nodes="${SLURM_NNODES}" \
     --ntasks="${SLURM_NNODES}" \
     --ntasks-per-node=1 \
@@ -111,6 +112,46 @@ mkdir -p "${PYTHONPYCACHEPREFIX}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_D
 
 NODE_RANK=${SLURM_PROCID}
 DONE_FILE="${RUN_ROOT}/.ray_done"
+if [[ "${CONFIG_ONLY}" == "1" ]]; then
+  if [[ "${NODE_RANK}" == "0" ]]; then
+    mkdir -p "${RUN_ROOT}"
+    COMPOSE_ONLY=1 \
+      DRY_RUN=0 \
+      MODEL_PATH="${CHECKPOINT_DIR}" \
+      TRAIN_FILES="${RUN_ROOT}/train.parquet" \
+      VAL_FILES="${RUN_ROOT}/test.parquet" \
+      OUTPUT_ROOT="${RUN_ROOT}/output" \
+      CKPT_DIR="${RUN_ROOT}/checkpoints" \
+      NNODES="${SLURM_NNODES}" \
+      NGPUS_PER_NODE="${GPUS_PER_NODE}" \
+      ACTOR_TP="${ACTOR_TP}" \
+      ACTOR_PP="${ACTOR_PP}" \
+      ACTOR_CP="${ACTOR_CP}" \
+      ACTOR_EP="${ACTOR_EP}" \
+      ROLLOUT_TP="${ROLLOUT_TP}" \
+      TOTAL_TRAINING_STEPS="${PHASE1_STEPS}" \
+      bash "${MLITE_SRC}/experimental/lite/examples/verl/scripts/run_deepseek_v4_gsm8k_grpo.sh" \
+      > "${RUN_ROOT}/resolved-config.yaml"
+    python - "${RUN_ROOT}/resolved-config.yaml" <<'PY'
+import sys
+
+config = open(sys.argv[1], encoding="utf-8").read()
+required = [
+    "strategy: mlite",
+    "model_name: deepseek_v4",
+    "resync_format: vllm_checkpoint",
+    "expert_dtype: fp8",
+    "recompute: full",
+]
+missing = [marker for marker in required if marker not in config]
+if missing:
+    raise SystemExit(f"resolved DS4 GRPO config is missing markers: {missing}")
+PY
+    echo "DS4_GRPO_CONFIG_COMPOSE_PASSED source=${MLITE_COMMIT}"
+  fi
+  exit 0
+fi
+
 ray stop --force >/dev/null 2>&1 || true
 
 cleanup() {
