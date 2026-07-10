@@ -12,6 +12,14 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from megatron.lite.primitive.precision import (
+    PrecisionCoverage,
+    PrecisionImplementation,
+    precision_forward_context,
+    precision_model_init_context,
+    resolve_precision,
+    validate_hopper_environment,
+)
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
@@ -19,7 +27,13 @@ from megatron.lite.runtime.contracts.handle import ModelHandle
 from megatron.lite.runtime.contracts.loss import get_loss_context, split_loss_context, use_loss_context
 
 
-def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
+def _build_impl_cfg(
+    proto,
+    rt_cfg: MegatronLiteConfig,
+    *,
+    precision_implementation: PrecisionImplementation | None = None,
+    precision_coverage: PrecisionCoverage | None = None,
+):
     """Construct typed impl config, backfilling hf_path + optimizer_config."""
     init_fields = {f.name for f in dc_fields(proto.ImplConfig) if f.init}
     # Only forward impl_cfg keys this model's ImplConfig declares: the connector
@@ -41,6 +55,25 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
         and getattr(rt_cfg, "optimizer", None) is not None
     ):
         impl_cfg_kwargs["optimizer_config"] = rt_cfg.optimizer
+    if precision_implementation is not None:
+        injection_fields = {
+            "precision_coverage",
+            "precision_implementation",
+            "precision_parameter_contract",
+        }
+        missing = sorted(injection_fields.difference(init_fields))
+        if missing:
+            raise ValueError(
+                f"Protocol ImplConfig must declare precision injection fields {missing} "
+                f"for {precision_implementation.name}."
+            )
+        if precision_coverage is None:
+            raise ValueError("A typed precision coverage collector is required.")
+        impl_cfg_kwargs["precision_implementation"] = precision_implementation
+        impl_cfg_kwargs["precision_parameter_contract"] = (
+            precision_implementation.parameter_contract
+        )
+        impl_cfg_kwargs["precision_coverage"] = precision_coverage
     return proto.ImplConfig(**impl_cfg_kwargs)
 
 
@@ -180,6 +213,13 @@ class MegatronLiteRuntime(RuntimeBase):
         else:
             rt_cfg = self._cfg
 
+        precision_implementation = resolve_precision(rt_cfg.precision)
+        precision_coverage = None
+        if precision_implementation is not None:
+            validate_hopper_environment()
+            precision_implementation.recipe_factory()
+            precision_coverage = PrecisionCoverage(precision_implementation)
+
         # ── init distributed ──
         if not dist.is_initialized():
             dist.init_process_group("nccl", timeout=timedelta(minutes=10))
@@ -195,10 +235,19 @@ class MegatronLiteRuntime(RuntimeBase):
 
         # ── escape hatch: model takes over ──
         if hasattr(proto, "create_runtime"):
+            if precision_implementation is not None:
+                raise ValueError(
+                    "Closed Hopper precision profiles require the standard MLite typed runtime path."
+                )
             return proto.create_runtime(rt_cfg.hf_path, rt_cfg).build_model()
 
         # ── construct impl_cfg (parallel injected) ──
-        impl_cfg = _build_impl_cfg(proto, rt_cfg)
+        impl_cfg = _build_impl_cfg(
+            proto,
+            rt_cfg,
+            precision_implementation=precision_implementation,
+            precision_coverage=precision_coverage,
+        )
 
         # ── build model config ──
         model_cfg = proto.build_model_config(rt_cfg.hf_path)
@@ -206,7 +255,31 @@ class MegatronLiteRuntime(RuntimeBase):
             model_cfg = rt_cfg.model_config_hook(model_cfg)
 
         # ── build model (model owns ps + optimizer + everything) ──
-        bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
+        if precision_implementation is None:
+            bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
+        else:
+            with precision_model_init_context(precision_implementation):
+                bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
+                assert precision_coverage is not None
+                precision_manifest = precision_coverage.manifest
+
+            reserved = {
+                "precision_coverage",
+                "precision_implementation",
+                "precision_parameter_contract",
+            }
+            collisions = sorted(reserved.intersection(bundle.extras))
+            if collisions:
+                raise ValueError(
+                    f"Model bundle cannot override runtime precision keys {collisions}."
+                )
+            bundle.extras.update(
+                {
+                    "precision_coverage": precision_manifest,
+                    "precision_implementation": precision_implementation,
+                    "precision_parameter_contract": precision_implementation.parameter_contract,
+                }
+            )
 
         # ── load HF weights (optional) ──
         loaded_hf_weights = False
@@ -416,6 +489,14 @@ class MegatronLiteRuntime(RuntimeBase):
         from megatron.lite.primitive.train_step import run_microbatch_loop
 
         forward_step = handle._extras["forward_step"]
+        precision_implementation = handle._extras.get("precision_implementation")
+        if precision_implementation is not None:
+            unwrapped_forward_step = forward_step
+
+            def forward_step(model, batch):
+                with precision_forward_context(precision_implementation):
+                    return unwrapped_forward_step(model, batch)
+
         if num_microbatches < 1:
             raise ValueError("num_microbatches must be >= 1")
 

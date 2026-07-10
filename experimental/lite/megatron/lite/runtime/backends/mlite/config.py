@@ -8,6 +8,32 @@ from typing import Any
 
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, pick_fields
 
+_AD_HOC_PRECISION_KEYS = frozenset(
+    {
+        "format",
+        "fp8",
+        "fp8_format",
+        "fp8_recipe",
+        "recipe",
+        "target",
+        "targets",
+        "weight_dtype",
+    }
+)
+_HOPPER_UNSUPPORTED_FEATURES = frozenset(
+    {
+        "cuda_graph",
+        "fp8_communication",
+        "fp8_param_gather",
+        "lora",
+        "mxfp8",
+        "use_cuda_graph",
+    }
+)
+_PRECISION_INJECTION_KEYS = frozenset(
+    {"precision_coverage", "precision_implementation", "precision_parameter_contract"}
+)
+
 
 @dataclass(slots=True)
 class DebugConfig:
@@ -42,6 +68,7 @@ class MegatronLiteConfig:
     attention_backend_override: str | None = "flash"
     router_aux_loss_coef: float | None = None
     load_hf_weights: bool = True
+    precision: str = "bf16"
 
     # ── impl-specific (each impl reads its own keys) ──
     impl_cfg: dict[str, Any] = field(default_factory=dict)
@@ -52,6 +79,47 @@ class MegatronLiteConfig:
     # ── bench-only hook: mutate model_cfg after build (e.g. expert truncation) ──
     model_config_hook: Any = None
 
+    def __post_init__(self) -> None:
+        from megatron.lite.primitive.precision import resolve_precision
+
+        implementation = resolve_precision(self.precision)
+        forbidden = sorted(_AD_HOC_PRECISION_KEYS.intersection(self.impl_cfg))
+        if forbidden:
+            raise ValueError(
+                "Precision is configured only through the three closed precision names; "
+                f"remove impl_cfg keys {forbidden}."
+            )
+        injected = sorted(_PRECISION_INJECTION_KEYS.intersection(self.impl_cfg))
+        if injected:
+            raise ValueError(
+                f"Runtime-owned precision injection keys cannot be configured: {injected}."
+            )
+        if implementation is None:
+            return
+        if self.parallel.pp != 1 or self.parallel.cp != 1:
+            raise ValueError(
+                f"{implementation.name} currently requires pp=1 and cp=1; got "
+                f"pp={self.parallel.pp}, cp={self.parallel.cp}."
+            )
+        unsupported = sorted(
+            key
+            for key in _HOPPER_UNSUPPORTED_FEATURES
+            if bool(self.impl_cfg.get(key, False))
+        )
+        if unsupported:
+            raise ValueError(
+                f"{implementation.name} does not support impl_cfg features {unsupported}."
+            )
+        if self.optimizer.use_precision_aware_optimizer:
+            raise ValueError(
+                f"{implementation.name} does not support lower-precision optimizer state."
+            )
+        optimizer_overrides = getattr(self.optimizer, "override_optimizer_config", {})
+        if isinstance(optimizer_overrides, dict) and optimizer_overrides.get(
+            "fp8_param_gather", False
+        ):
+            raise ValueError(f"{implementation.name} does not support fp8_param_gather.")
+
     @classmethod
     def from_dict(cls, hf_path: str, cfg: dict[str, Any]) -> MegatronLiteConfig:
         """Construct MegatronLiteConfig from a flat dict (legacy / OmegaConf path)."""
@@ -60,6 +128,21 @@ class MegatronLiteConfig:
                 "MegatronLiteConfig no longer accepts `num_microbatches`; "
                 "pass it to Runtime.forward_backward(..., num_microbatches=...) instead"
             )
+        ad_hoc = sorted(_AD_HOC_PRECISION_KEYS.intersection(cfg))
+        if ad_hoc:
+            raise ValueError(
+                "Precision is configured only through the three closed precision names; "
+                f"remove keys {ad_hoc}."
+            )
+        requested_precision = cfg.get("precision", "bf16")
+        if requested_precision != "bf16":
+            unsupported = sorted(
+                key for key in _HOPPER_UNSUPPORTED_FEATURES if bool(cfg.get(key, False))
+            )
+            if unsupported:
+                raise ValueError(
+                    f"{requested_precision} does not support configuration features {unsupported}."
+                )
         parallel = ParallelConfig(**pick_fields(ParallelConfig, cfg))
 
         opt_d = cfg.get("optimizer", {})
