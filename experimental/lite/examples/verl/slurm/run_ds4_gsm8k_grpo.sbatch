@@ -97,6 +97,9 @@ fi
 
 export PATH=/usr/local/bin:/usr/bin:/bin
 hash -r
+export CC=/usr/bin/gcc
+export CXX=/usr/bin/g++
+export CPATH=/usr/include:/usr/include/x86_64-linux-gnu
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_NVLS_ENABLE=0
 export PYTHONNOUSERSITE=1
@@ -148,6 +151,9 @@ required = [
 missing = [marker for marker in required if marker not in config]
 if missing:
     raise SystemExit(f"resolved DS4 GRPO config is missing markers: {missing}")
+for forbidden in ("Error in sitecustomize", "Traceback"):
+    if forbidden in config:
+        raise SystemExit(f"resolved DS4 GRPO config contains initialization error: {forbidden}")
 PY
     echo "DS4_GRPO_CONFIG_COMPOSE_PASSED source=${MLITE_COMMIT}"
   fi
@@ -228,6 +234,9 @@ import os
 names = [
     "PYTHONPATH",
     "PATH",
+    "CC",
+    "CXX",
+    "CPATH",
     "LD_PRELOAD",
     "CUDA_DEVICE_MAX_CONNECTIONS",
     "NCCL_NVLS_ENABLE",

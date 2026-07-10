@@ -99,6 +99,10 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert 'export PYTHONPATH="${MLITE_SM90_SITE}' in script
     assert ':${DS4_VLLM_SITE}:' in script
     assert 'export LD_PRELOAD="${DS4_VLLM_SHIM}"' in script
+    assert "export CC=/usr/bin/gcc" in script
+    assert "export CXX=/usr/bin/g++" in script
+    assert "Error in sitecustomize" in script
+    assert "Traceback" in script
     assert 'RESUME_MODE="${resume_mode}"' in script
     assert 'run_phase phase1 "${PHASE1_STEPS}" disable' in script
     assert 'run_phase resume "${TOTAL_STEPS}" auto' in script
