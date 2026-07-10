@@ -68,7 +68,7 @@ class NCCLUserBuffer:
                 pool = module.create_nccl_mem_pool()
             self.module = module
             self.pool = pool
-        except (ImportError, AttributeError, RuntimeError, TypeError) as error:
+        except (ImportError, AttributeError, RuntimeError, TypeError, ValueError) as error:
             self._disable(f"NCCL user-buffer allocation unavailable: {error}")
 
     def allocation_context(self, group: dist.ProcessGroup | None):
@@ -76,7 +76,7 @@ class NCCLUserBuffer:
             return nullcontext()
         try:
             return self.module.nccl_mem(self.pool, group=group)
-        except (AttributeError, RuntimeError, TypeError) as error:
+        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
             self._disable(f"NCCL user-buffer context failed: {error}")
             return nullcontext()
 
@@ -89,7 +89,7 @@ class NCCLUserBuffer:
                     torch.device("cuda", torch.cuda.current_device())
                 )
                 backend.register_mem_pool(self.pool)
-            except (AttributeError, RuntimeError, TypeError) as error:
+            except (AttributeError, RuntimeError, TypeError, ValueError) as error:
                 self._disable(f"NCCL user-buffer group registration failed: {error}")
                 return
 
@@ -142,7 +142,7 @@ class TemporaryBufferAllocator:
                 tensor = torch.empty(numel, dtype=dtype, device=device)
             if registered:
                 self.user_buffer.register_additional_groups()
-        except (RuntimeError, TypeError) as error:
+        except (RuntimeError, TypeError, ValueError) as error:
             if self.user_buffer is not None:
                 self.user_buffer._disable(f"Registered allocation failed: {error}")
             tensor = torch.empty(numel, dtype=dtype, device=device)

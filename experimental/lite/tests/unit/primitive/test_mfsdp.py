@@ -436,6 +436,33 @@ def test_mfsdp_nccl_user_buffer_falls_back_when_apex_is_missing(monkeypatch):
     assert user_buffer.active is False
 
 
+def test_mfsdp_nccl_user_buffer_falls_back_when_symmetric_pool_is_unsupported(
+    monkeypatch,
+):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def unsupported_pool(*, symmetric):
+        assert symmetric is True
+        raise ValueError("symmetric mempool requires a newer Torch")
+
+    allocator = SimpleNamespace(
+        init=lambda: None,
+        create_nccl_mem_pool=unsupported_pool,
+    )
+    monkeypatch.setattr(
+        mfsdp_buffer.importlib,
+        "import_module",
+        lambda _name: allocator,
+    )
+    user_buffer = mfsdp_buffer.NCCLUserBuffer(
+        enabled=True,
+        groups=(),
+        symmetric=True,
+    )
+
+    assert user_buffer.active is False
+
+
 def test_mfsdp_backend_is_registered():
     backend = get_optimizer_backend("mfsdp")
     assert backend.name == "mfsdp"
