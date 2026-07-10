@@ -46,6 +46,11 @@ from megatron.lite.primitive.modules.lora import (
     trainable_param_stats,
 )
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
+from megatron.lite.primitive.precision import (
+    ParameterContract,
+    PrecisionCoverage,
+    PrecisionImplementation,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
@@ -89,6 +94,9 @@ class ImplConfig:
     mtp_use_repeated_layer: bool | None = None
     deterministic: bool = True
     lora: LoraConfig | dict | None = None
+    precision_coverage: PrecisionCoverage | None = None
+    precision_implementation: PrecisionImplementation | None = None
+    precision_parameter_contract: ParameterContract | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +158,44 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     """
     p = impl_cfg.parallel
     lora_config = normalize_lora_config(impl_cfg.lora)
+    precision_fields = (
+        impl_cfg.precision_coverage,
+        impl_cfg.precision_implementation,
+        impl_cfg.precision_parameter_contract,
+    )
+    if any(field is not None for field in precision_fields) and not all(
+        field is not None for field in precision_fields
+    ):
+        raise ValueError("Runtime precision injection must provide all three typed fields.")
+    if impl_cfg.precision_implementation is not None:
+        precision_coverage = impl_cfg.precision_coverage
+        precision_parameter_contract = impl_cfg.precision_parameter_contract
+        if precision_coverage is None or precision_parameter_contract is None:
+            raise ValueError(
+                "Runtime precision injection must provide all three typed fields."
+            )
+        if (
+            precision_coverage.implementation is not impl_cfg.precision_implementation
+        ):
+            raise ValueError("Precision coverage and implementation do not match.")
+        if (
+            precision_parameter_contract
+            is not impl_cfg.precision_implementation.parameter_contract
+        ):
+            raise ValueError("Precision parameter contract does not match implementation.")
+        unsupported = []
+        if impl_cfg.recompute:
+            unsupported.append("recompute")
+        if impl_cfg.offload:
+            unsupported.append("offload")
+        if impl_cfg.mtp_enable:
+            unsupported.append("mtp")
+        if lora_config.enabled:
+            unsupported.append("lora")
+        if unsupported:
+            raise ValueError(
+                f"Closed Hopper precision profiles do not cover {unsupported}."
+            )
 
     # ── validation ──
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
@@ -177,7 +223,6 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     model_kwargs: dict[str, Any] = dict(
         use_deepep=impl_cfg.use_deepep,
-        fp8=False,
         recompute_modules=recompute_spec,
         router_bias_rate=impl_cfg.router_bias_rate,
         use_thd=impl_cfg.use_thd,
@@ -185,6 +230,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
         lora_config=lora_config,
+        precision_coverage=impl_cfg.precision_coverage,
     )
 
     vpp = None if p.vpp == 1 else p.vpp
@@ -198,6 +244,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
                 .to(torch.bfloat16)
                 .cuda()
             )
+
+    if impl_cfg.precision_coverage is not None:
+        impl_cfg.precision_coverage.seal()
 
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 

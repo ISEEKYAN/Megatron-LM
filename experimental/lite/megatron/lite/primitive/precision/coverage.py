@@ -123,6 +123,12 @@ class PrecisionCoverage:
         self._claims.append(_Claim(owner, site, capability, diagnostic))
 
     @property
+    def implementation(self) -> PrecisionImplementation:
+        """Return the closed implementation this collector is bound to."""
+
+        return self._implementation
+
+    @property
     def manifest(self) -> CoverageManifest:
         if self._manifest is None:
             raise RuntimeError(
