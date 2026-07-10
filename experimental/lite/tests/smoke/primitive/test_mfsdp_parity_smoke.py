@@ -437,19 +437,36 @@ def _named_mfsdp_optimizer_grads(model_chunks) -> dict[str, torch.Tensor]:
     return grads
 
 
-def _tensor_set_max_differences(
+def _tensor_set_worst_differences(
     lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]
-) -> tuple[float, float]:
+) -> tuple[float, float, str, str]:
     assert lhs.keys() == rhs.keys()
     max_abs = 0.0
     max_rel = 0.0
+    max_abs_name = ""
+    max_rel_name = ""
     for name in lhs:
         diff = (lhs[name] - rhs[name]).abs()
-        max_abs = max(max_abs, float(diff.max().item()))
+        current_abs = float(diff.max().item())
+        if current_abs > max_abs:
+            max_abs = current_abs
+            max_abs_name = name
         denominator = torch.maximum(lhs[name].abs(), rhs[name].abs()).clamp_min(
             _TENSOR_ATOL
         )
-        max_rel = max(max_rel, float((diff / denominator).max().item()))
+        current_rel = float((diff / denominator).max().item())
+        if current_rel > max_rel:
+            max_rel = current_rel
+            max_rel_name = name
+    return max_abs, max_rel, max_abs_name, max_rel_name
+
+
+def _tensor_set_max_differences(
+    lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]
+) -> tuple[float, float]:
+    max_abs, max_rel, _max_abs_name, _max_rel_name = _tensor_set_worst_differences(
+        lhs, rhs
+    )
     return max_abs, max_rel
 
 
@@ -1041,11 +1058,24 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
                 step_one_params[backend] = params
 
         if step == 0:
-            grad_abs, grad_rel = _tensor_set_max_differences(
-                step_one_grads["fsdp2"], step_one_grads["mfsdp"]
+            grad_abs, grad_rel, grad_abs_name, grad_rel_name = (
+                _tensor_set_worst_differences(
+                    step_one_grads["fsdp2"], step_one_grads["mfsdp"]
+                )
             )
-            param_abs, param_rel = _tensor_set_max_differences(
-                step_one_params["fsdp2"], step_one_params["mfsdp"]
+            param_abs, param_rel, param_abs_name, param_rel_name = (
+                _tensor_set_worst_differences(
+                    step_one_params["fsdp2"], step_one_params["mfsdp"]
+                )
+            )
+            print(
+                "[MFSDP_FULL_PARALLEL_WORST] "
+                f"rank={dist.get_rank()} step=1 "
+                f"grad_abs_name={grad_abs_name} grad_abs_diff={grad_abs:.8e} "
+                f"grad_rel_name={grad_rel_name} grad_rel_diff={grad_rel:.8e} "
+                f"param_abs_name={param_abs_name} param_abs_diff={param_abs:.8e} "
+                f"param_rel_name={param_rel_name} param_rel_diff={param_rel:.8e}",
+                flush=True,
             )
             step_one_diffs = torch.tensor(
                 [grad_abs, grad_rel, param_abs, param_rel], device="cuda"
