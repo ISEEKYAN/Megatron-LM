@@ -294,6 +294,7 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
         "TILELANG_TMP_DIR",
         "VLLM_WORKER_MULTIPROC_METHOD",
         "VLLM_DEEP_GEMM_WARMUP",
+        "VLLM_NO_USAGE_STATS",
         "PYTORCH_CUDA_ALLOC_CONF",
     ):
         assert f'"{name}",' in script
@@ -327,6 +328,7 @@ def test_ds4_grpo_sbatch_has_bounded_vllm_load_only_gate() -> None:
     ast.parse(load_program)
     assert 'if [[ "${VLLM_LOAD_ONLY}" == "1" ]]' in script
     assert "VLLM_LOAD_ONLY requires one node with eight GPUs" in script
+    assert "env -u VLLM_LOAD_ONLY" in script
     assert "deepseek_v4_rollout_load_only.py" in script
     assert "tensor_parallel_size=rollout_tp" in load_program
     assert 'load_format="dummy"' in load_program

@@ -133,6 +133,7 @@ export RAY_raylet_start_wait_time_s="${RAY_RAYLET_START_WAIT_TIME_S:-180}"
 export VLLM_USE_V1=1
 export VLLM_WORKER_MULTIPROC_METHOD="spawn"
 export VLLM_DEEP_GEMM_WARMUP="skip"
+export VLLM_NO_USAGE_STATS=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export VERL_VLLM_FP8_QUANT_ENABLED=0
 export VERL_MLITE_HF_CONFIG_MODEL_TYPE=deepseek_v4
@@ -240,7 +241,7 @@ PY
 fi
 
 if [[ "${VLLM_LOAD_ONLY}" == "1" ]]; then
-  env \
+  env -u VLLM_LOAD_ONLY \
     PYTHONPATH="${DS4_VLLM_SITE}:${PYTHONPATH}" \
     python experimental/lite/examples/verl/deepseek_v4_rollout_load_only.py
   exit 0
@@ -431,6 +432,7 @@ names = [
     "VLLM_USE_V1",
     "VLLM_WORKER_MULTIPROC_METHOD",
     "VLLM_DEEP_GEMM_WARMUP",
+    "VLLM_NO_USAGE_STATS",
     "PYTORCH_CUDA_ALLOC_CONF",
     "VLLM_CACHE_ROOT",
     "TILELANG_CACHE_DIR",
