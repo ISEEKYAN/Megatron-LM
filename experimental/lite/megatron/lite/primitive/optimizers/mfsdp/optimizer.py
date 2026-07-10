@@ -85,7 +85,7 @@ class _StandaloneOptimizer:
         return self.optimizer.param_groups
 
     def zero_grad(self) -> None:
-        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer.zero_grad()
         self._expert_grads_scaled = False
         self._tp_replicated_grads_synced = False
 
