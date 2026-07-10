@@ -448,6 +448,45 @@ def test_mfsdp_config_enables_double_buffer_for_nccl_user_buffers():
     assert config.fsdp_double_buffer is True
 
 
+def test_mfsdp_disables_param_prefetch_across_intersecting_parallel_groups():
+    config = mfsdp_config.MFSDPConfig(overlap_param_gather=True)
+    ps = SimpleNamespace(
+        tp_size=1,
+        ep_size=8,
+        etp_size=1,
+        cp_size=4,
+        dp_cp_size=32,
+        expert_dp_size=4,
+    )
+
+    ordered = mfsdp_optimizer._order_param_gathers_for_parallel_collectives(
+        config,
+        ps,
+    )
+
+    assert ordered.overlap_param_gather is False
+    assert config.overlap_param_gather is True
+
+
+def test_mfsdp_keeps_param_prefetch_for_pure_data_parallelism():
+    config = mfsdp_config.MFSDPConfig(overlap_param_gather=True)
+    ps = SimpleNamespace(
+        tp_size=1,
+        ep_size=1,
+        etp_size=1,
+        cp_size=1,
+        dp_cp_size=8,
+        expert_dp_size=8,
+    )
+
+    ordered = mfsdp_optimizer._order_param_gathers_for_parallel_collectives(
+        config,
+        ps,
+    )
+
+    assert ordered is config
+
+
 def test_mfsdp_nccl_user_buffer_falls_back_when_apex_is_missing(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
