@@ -22,6 +22,7 @@ from megatron.lite.runtime.backends.mlite.runtime import (
     _pipeline_callbacks,
 )
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
+from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
 from megatron.lite.runtime.contracts.loss import LossContext, get_loss_context, use_loss_context
 
@@ -63,6 +64,60 @@ def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
 
     assert seen == [("wrapped", context), ("presplit", context)]
     assert metrics == {"batch": "presplit", "source": "source"}
+
+
+def test_pipeline_runtime_enables_optimizer_grad_sync_on_last_microbatch(monkeypatch):
+    from megatron.lite.primitive.parallel import pipeline as pipeline_module
+
+    optimizer = types.SimpleNamespace(grad_sync_enabled=False)
+    observed_callbacks = []
+
+    def fake_pipeline(*_args, grad_sync_fn=None, **_kwargs):
+        assert callable(grad_sync_fn)
+        assert optimizer.grad_sync_enabled is False
+        grad_sync_fn()
+        observed_callbacks.append(optimizer.grad_sync_enabled)
+        return [{"loss": torch.ones(())}]
+
+    monkeypatch.setattr(pipeline_module, "forward_backward_pipelining", fake_pipeline)
+
+    original_tensor = torch.tensor
+
+    def cpu_tensor(data, *args, **kwargs):
+        kwargs.pop("device", None)
+        return original_tensor(data, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", cpu_tensor)
+    parallel_state = types.SimpleNamespace(
+        pp_size=2,
+        pp_group=None,
+        pp_global_ranks=None,
+        tp_size=1,
+        cp_size=1,
+    )
+    model = nn.Linear(1, 1, bias=False)
+    handle = ModelHandle(
+        model=model,
+        optimizer=optimizer,
+        parallel_state=parallel_state,
+        _extras={
+            "forward_step": lambda _model, _batch: {"loss": torch.ones(())},
+            "model_chunks": [model],
+            "model_cfg": types.SimpleNamespace(hidden_size=1),
+        },
+    )
+    batch = PackedBatch(
+        input_ids=torch.ones(4, dtype=torch.long),
+        labels=torch.ones(4, dtype=torch.long),
+        seq_lens=torch.tensor([4]),
+    )
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
+        handle,
+        iter([batch, batch]),
+        None,
+        num_microbatches=2,
+    )
+    assert observed_callbacks == [True]
 
 
 def test_runtime_config_defaults_to_mlite_backend():
