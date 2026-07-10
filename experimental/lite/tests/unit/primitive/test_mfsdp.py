@@ -17,6 +17,7 @@ import torch.multiprocessing as mp
 
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
 from megatron.lite.primitive.optimizers.mfsdp import buffer as mfsdp_buffer
+from megatron.lite.primitive.optimizers.mfsdp import backend as mfsdp_backend
 from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
 from megatron.lite.primitive.optimizers import get_optimizer_backend
 from megatron.lite.runtime.contracts.config import ParallelConfig
@@ -439,6 +440,41 @@ def test_mfsdp_nccl_user_buffer_falls_back_when_apex_is_missing(monkeypatch):
 def test_mfsdp_backend_is_registered():
     backend = get_optimizer_backend("mfsdp")
     assert backend.name == "mfsdp"
+
+
+def test_mfsdp_backend_checkpoint_restores_fp32_main_parameters_without_rebinding():
+    params = [
+        torch.nn.Parameter(torch.tensor([0.999, 2.001], dtype=torch.float32)),
+        torch.nn.Parameter(torch.tensor([-3.125], dtype=torch.float32)),
+    ]
+
+    class FakeOptimizer:
+        def __init__(self):
+            self._inner_optimizer = SimpleNamespace(params=params)
+            self._model_chunks = []
+            self.loaded_state = None
+
+        def state_dict(self):
+            return {"state": {0: {"step": torch.tensor(1)}}}
+
+        def load_state_dict(self, state_dict):
+            self.loaded_state = state_dict
+
+    optimizer = FakeOptimizer()
+    aliases = tuple(id(param) for param in params)
+    expected = [param.detach().clone() for param in params]
+    state = mfsdp_backend.BACKEND.state_dict(optimizer)
+
+    for param in params:
+        param.data.zero_()
+    mfsdp_backend.BACKEND.load_state_dict(optimizer, state)
+    assert mfsdp_backend.BACKEND.sync_model_weights_to_main_weights(optimizer)
+
+    assert optimizer.loaded_state == state["optimizer"]
+    assert tuple(id(param) for param in params) == aliases
+    for param, reference in zip(params, expected, strict=True):
+        assert param.dtype == torch.float32
+        assert torch.equal(param, reference)
 
 
 def test_mfsdp_parallel_metadata_uses_topology_and_explicit_classifier():
