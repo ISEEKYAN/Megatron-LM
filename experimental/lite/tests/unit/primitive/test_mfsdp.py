@@ -108,6 +108,16 @@ class _ForwardReleaseModel(torch.nn.Module):
         return self.probe(self.unit1(self.unit0(value)))
 
 
+class _UnevenForwardReleaseModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.unit0 = _GlooUnit(4, 4)
+        self.unit1 = _GlooUnit(4, 8)
+
+    def forward(self, value):
+        return torch.cat((self.unit0(value), self.unit1(value)), dim=-1)
+
+
 def _optimizer_params(optimizer) -> list[torch.nn.Parameter]:
     return optimizer._inner_optimizer.params
 
@@ -991,6 +1001,49 @@ def test_mfsdp_releases_nonopaque_bucket_after_owner_forward():
     allocator = chunk.param_and_grad_buffer.allocator
     assert isinstance(allocator, mfsdp_buffer.DoubleBufferAllocator)
     assert len(allocator._slots) == 1
+    output.sum().backward()
+
+
+def test_mfsdp_double_buffer_does_not_mix_unequal_unit_layouts():
+    model = _UnevenForwardReleaseModel()
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        etp_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, _optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_GlooUnit,),
+    )
+
+    output = chunks[0](torch.randn(2, 4, requires_grad=True))
+
+    allocator = chunks[0].param_and_grad_buffer.allocator
+    assert isinstance(allocator, mfsdp_buffer.DoubleBufferAllocator)
+    assert len(allocator._slots) == 2
     output.sum().backward()
 
 

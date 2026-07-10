@@ -299,6 +299,7 @@ class ParamBucket:
         gather_group: dist.ProcessGroup | None,
         config: MFSDPConfig,
         allocator: TemporaryBufferAllocator,
+        allocator_layout_key: tuple[Any, ...],
     ) -> None:
         if not specs:
             raise ValueError("An M-FSDP parameter bucket cannot be empty.")
@@ -310,6 +311,7 @@ class ParamBucket:
         self.rank = group_rank(process_group)
         self.config = config
         self.allocator = allocator
+        self.allocator_layout_key = allocator_layout_key
         self.retain_full_storage_through_backward = all(
             spec.retain_full_storage_through_backward for spec in specs
         )
@@ -427,7 +429,11 @@ class ParamBucket:
                 dtype=self.policy.compute_dtype,
                 device=self.device,
                 group=self.gather_group,
-                key=("param", id(self.gather_group)),
+                key=(
+                    "param",
+                    id(self.gather_group),
+                    self.allocator_layout_key,
+                ),
             )
             self.full_buffer = self._full_lease.tensor
         self.local_compute_buffer.copy_(self.main_param_buffer)
@@ -538,7 +544,11 @@ class ParamBucket:
             dtype=self.policy.grad_comm_dtype,
             device=self.device,
             group=self.process_group,
-            key=("grad", id(self.process_group)),
+            key=(
+                "grad",
+                id(self.process_group),
+                self.allocator_layout_key,
+            ),
         )
         grad_input = self._grad_lease.tensor
         grad_input.zero_()
@@ -738,7 +748,10 @@ class ParamAndGradBuffer:
         for key in sorted(grouped, key=lambda item: item[0]):
             _owner_order, expert, _retain_full_storage, _dtype, _device = key
             owner = owner_for_key[key]
-            for partition in _split_specs(grouped[key], self.config.bucket_size):
+            partitions = _split_specs(grouped[key], self.config.bucket_size)
+            owner_type = type(owner)
+            owner_layout = f"{owner_type.__module__}.{owner_type.__qualname__}"
+            for partition_index, partition in enumerate(partitions):
                 bucket_id = len(buckets)
                 buckets.append(
                     ParamBucket(
@@ -748,6 +761,14 @@ class ParamAndGradBuffer:
                         gather_group=self.groups.gather_group(expert=expert),
                         config=self.config,
                         allocator=self.allocator,
+                        allocator_layout_key=(
+                            owner_layout,
+                            expert,
+                            _retain_full_storage,
+                            partition_index,
+                            len(partitions),
+                            sum(spec.numel for spec in partition),
+                        ),
                     )
                 )
                 owners[id(owner)].append(bucket_id)

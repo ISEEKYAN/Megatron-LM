@@ -140,6 +140,12 @@ class TransformerEngineBenchmarkUnit(nn.Module):
         import transformer_engine.pytorch as te
 
         self.block = BenchmarkUnit(hidden_size)
+        self.te_projection = te.Linear(
+            hidden_size,
+            hidden_size,
+            bias=False,
+            params_dtype=torch.bfloat16,
+        )
         self.norm = te.RMSNorm(
             hidden_size,
             eps=1.0e-6,
@@ -147,7 +153,7 @@ class TransformerEngineBenchmarkUnit(nn.Module):
         )
 
     def forward(self, x):
-        return self.norm(self.block(x))
+        return self.norm(self.te_projection(self.block(x)))
 
 
 class TransformerEngineBenchmarkModel(nn.Module):
@@ -646,7 +652,8 @@ def test_mfsdp_transformer_engine_benchmark_false_double_buffer():
     if dist.get_rank() == 0:
         print(
             "[MFSDP_TE_PROXY] "
-            "benchmark_unit=true te_rmsnorm=true fsdp_double_buffer=false "
+            "benchmark_unit=true te_linear=true te_rmsnorm=true "
+            "fsdp_double_buffer=false "
             f"loss={loss:.8f} grad_norm={grad_norm:.8f} "
             f"peak_memory_gib={float(peak_memory_gib):.4f}",
             flush=True,
