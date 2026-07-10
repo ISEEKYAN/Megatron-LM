@@ -1146,6 +1146,19 @@ def _functional_oracle_path(run_dir: str) -> str:
     return os.path.join(run_dir, f"oracle_rank_{dist.get_rank():05d}.pt")
 
 
+def _export_weight_snapshot(
+    runtime: MegatronLiteRuntime, handle: ModelHandle
+) -> dict[str, torch.Tensor]:
+    exported_items = [
+        (name, tensor.detach().cpu().clone())
+        for name, tensor in runtime.export_weights(handle)
+    ]
+    names = [name for name, _tensor in exported_items]
+    assert names
+    assert len(names) == len(set(names)), "HF export returned duplicate tensor names"
+    return dict(exported_items)
+
+
 def test_mfsdp_checkpoint_export_offload_resume():
     """Two-process M-FSDP DCP/resume + rollout export + offload combination gate."""
     phase = os.environ.get("MLITE_MFSDP_FUNCTIONAL_PHASE")
@@ -1352,6 +1365,33 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
     )
     dist.all_reduce(initial_max_abs, op=dist.ReduceOp.MAX)
     assert float(initial_max_abs) == 0.0
+
+    # The matched seed gives both independent backends the same complete model
+    # weights. Compare the production rollout-facing HF export entry point; an
+    # M-FSDP-only repeat would not catch a systematic TP/EP/PP gather error.
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    fsdp2_export = _export_weight_snapshot(runtime, fsdp2_handle)
+    mfsdp_export = _export_weight_snapshot(runtime, mfsdp_handle)
+    assert mfsdp_export.keys() == fsdp2_export.keys()
+    export_max_abs_diff = 0.0
+    for name, tensor in mfsdp_export.items():
+        reference = fsdp2_export[name]
+        assert tensor.dtype == reference.dtype, f"export dtype mismatch: {name}"
+        assert tensor.shape == reference.shape, f"export shape mismatch: {name}"
+        assert torch.equal(tensor, reference), f"export value mismatch: {name}"
+        export_max_abs_diff = max(
+            export_max_abs_diff,
+            float((tensor.float() - reference.float()).abs().max()),
+        )
+    _assert_full_parameters_released(mfsdp_handle)
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_EXPORT_PARITY] "
+            "reference=fsdp2 source=matched_seed entry=runtime.export_weights "
+            f"tensors={len(mfsdp_export)} max_abs_diff={export_max_abs_diff:.8e}",
+            flush=True,
+        )
+    del fsdp2_export, mfsdp_export
 
     losses = {"fsdp2": [], "mfsdp": []}
     grad_norms = {"fsdp2": [], "mfsdp": []}
