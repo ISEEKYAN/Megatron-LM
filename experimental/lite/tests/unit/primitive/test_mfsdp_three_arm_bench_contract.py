@@ -30,6 +30,7 @@ def test_three_arm_bench_freezes_comparable_protocol():
 
     assert values["_MCORE_COMMIT"] == "00309a0199dc590060aa0995b6f4a371d8db9761"
     assert values["_MLITE_BASE_COMMIT"] == "62295f9b306d70a8180e907b7c51b3ef293ea007"
+    assert values["_BENCHMARK_COMMIT"] == "5338da72e102214745d4feacc445a152c512c30a"
     assert values["_ARMS"] == ("mcore_mfsdp", "mlite_mfsdp", "mlite_fsdp2")
     assert values["_TOPOLOGY"] == (2, 2, 1, 2, 2)
     assert values["_WARMUP_STEPS"] >= 5
