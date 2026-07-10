@@ -642,6 +642,7 @@ class ParamBucket:
             if self.grad_sync_enabled and self.grad_ready_callback is not None:
                 self.grad_ready_callback(self)
             self.release_full_parameters()
+            self.discard_full_parameter_views()
             if not self.grad_sync_enabled:
                 self._grad_ready_ids.clear()
 
@@ -1007,12 +1008,15 @@ class CommunicationPipelines:
 
     def release_backward_ids(self, bucket_ids: Iterable[int]) -> None:
         for bucket_id in bucket_ids:
-            self.buckets[bucket_id].release_full_parameters()
+            bucket = self.buckets[bucket_id]
+            bucket.release_full_parameters()
+            bucket.discard_full_parameter_views()
 
     def end_forward(self) -> None:
         for bucket in self.buckets:
             if not bucket.retain_full_storage_through_backward:
                 bucket.release_full_parameters()
+                bucket.discard_full_parameter_views()
 
     def materialize_all(self) -> None:
         self.all_gather.materialize_all()

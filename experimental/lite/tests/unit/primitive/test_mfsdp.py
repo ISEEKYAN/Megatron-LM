@@ -971,6 +971,12 @@ def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
         assert all(
             bucket._full_lease is None for bucket in chunks[0].param_sync.buckets
         )
+        assert all(
+            spec.full_param.numel() == 0
+            for bucket in chunks[0].param_sync.buckets
+            if not bucket.retain_full_storage_through_backward
+            for spec in bucket.specs
+        )
 
     candidate_optimizer.finish_grad_sync()
 
