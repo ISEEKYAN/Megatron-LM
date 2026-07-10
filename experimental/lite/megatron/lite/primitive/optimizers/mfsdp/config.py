@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.distributed as dist
+import torch.nn as nn
 
 _SUPPORTED_OPTIMIZERS = {"adam", "sgd"}
 _REQUIRED_DDP_KNOB_VALUES = {
@@ -41,6 +44,126 @@ class MFSDPConfig:
     fsdp_double_buffer: bool = False
     disable_symmetric_registration: bool = False
     all_gather_in_start_param_sync: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class MixedPrecisionPolicy:
+    """Dtype policy for compute, persistent main parameters, and gradients."""
+
+    compute_dtype: torch.dtype
+    main_params_dtype: torch.dtype = torch.float32
+    main_grads_dtype: torch.dtype = torch.float32
+    grad_comm_dtype: torch.dtype = torch.float32
+
+    def __post_init__(self) -> None:
+        for name in (
+            "compute_dtype",
+            "main_params_dtype",
+            "main_grads_dtype",
+            "grad_comm_dtype",
+        ):
+            dtype = getattr(self, name)
+            if not torch.empty((), dtype=dtype).is_floating_point():
+                raise ValueError(f"M-FSDP {name} must be floating point, got {dtype}.")
+
+
+@dataclass(frozen=True, slots=True)
+class MFSDPProcessGroups:
+    """Process groups explicitly supplied by MLite composition."""
+
+    dense_dp: dist.ProcessGroup | None
+    expert_dp: dist.ProcessGroup | None
+    dense_ag: dist.ProcessGroup | None
+    expert_ag: dist.ProcessGroup | None
+    tp: dist.ProcessGroup | None
+    etp: dist.ProcessGroup | None
+    ep: dist.ProcessGroup | None
+    pp: dist.ProcessGroup | None
+
+    def data_group(self, *, expert: bool) -> dist.ProcessGroup | None:
+        return self.expert_dp if expert else self.dense_dp
+
+    def gather_group(self, *, expert: bool) -> dist.ProcessGroup | None:
+        return self.expert_ag if expert else self.dense_ag
+
+    def registration_groups(self) -> tuple[dist.ProcessGroup, ...]:
+        groups: list[dist.ProcessGroup] = []
+        for group in (self.dense_dp, self.expert_dp, self.dense_ag, self.expert_ag):
+            if group is not None and all(group is not existing for existing in groups):
+                groups.append(group)
+        return tuple(groups)
+
+
+def build_mfsdp_process_groups(ps: Any) -> MFSDPProcessGroups:
+    """Read groups already owned by MLite; never initialize global MCore state."""
+    dense_dp = getattr(ps, "dp_cp_group", None) or getattr(ps, "dp_group", None)
+    expert_dp = getattr(ps, "ep_dp_group", None) or dense_dp
+    dense_ag = getattr(ps, "dp_cp_ag_group", None) or getattr(ps, "dp_ag_group", None)
+    expert_ag = getattr(ps, "ep_dp_ag_group", None)
+    return MFSDPProcessGroups(
+        dense_dp=dense_dp,
+        expert_dp=expert_dp,
+        dense_ag=dense_ag or dense_dp,
+        expert_ag=expert_ag or expert_dp,
+        tp=getattr(ps, "tp_group", None),
+        etp=getattr(ps, "etp_group", None),
+        ep=getattr(ps, "ep_group", None),
+        pp=getattr(ps, "pp_group", None),
+    )
+
+
+def group_size(group: dist.ProcessGroup | None) -> int:
+    if group is None or not dist.is_available() or not dist.is_initialized():
+        return 1
+    return dist.get_world_size(group)
+
+
+def group_rank(group: dist.ProcessGroup | None) -> int:
+    if group is None or not dist.is_available() or not dist.is_initialized():
+        return 0
+    return dist.get_rank(group)
+
+
+SKIP_TP_DUPLICATE_SYNC_ATTR = "_mlite_mfsdp_skip_tp_duplicate_sync"
+PARAM_NAME_ATTR = "_mlite_mfsdp_param_name"
+
+
+def annotate_parallel_parameters(
+    module: nn.Module,
+    is_expert: Callable[[str], bool],
+    *,
+    tp_size: int,
+    etp_size: int,
+) -> None:
+    """Normalize parameter ownership from topology and explicit attributes."""
+    sequence_parallel_ids = {id(param) for param in getattr(module, "sp_params", ())}
+    for name, param in module.named_parameters():
+        setattr(param, PARAM_NAME_ATTR, name)
+        expert = bool(is_expert(name))
+        param._mfsdp_is_expert = expert
+        if not hasattr(param, "allreduce"):
+            param.allreduce = not expert
+
+        replicated = bool(
+            id(param) in sequence_parallel_ids
+            or getattr(param, "sequence_parallel", False)
+            or getattr(param, "average_gradients_across_tp_domain", False)
+            or getattr(param, "shared", False)
+        )
+        if id(param) in sequence_parallel_ids:
+            param.sequence_parallel = True
+        active_tp_size = max(int(etp_size if expert else tp_size), 1)
+        explicitly_sharded = bool(getattr(param, "tensor_model_parallel", False))
+        sharded = (
+            not replicated
+            and param.ndim > 1
+            and (explicitly_sharded or active_tp_size > 1)
+        )
+        param.tensor_model_parallel = sharded
+        if sharded:
+            setattr(param, SKIP_TP_DUPLICATE_SYNC_ATTR, True)
+        elif hasattr(param, SKIP_TP_DUPLICATE_SYNC_ATTR):
+            delattr(param, SKIP_TP_DUPLICATE_SYNC_ATTR)
 
 
 def build_mfsdp_config(opt: Any) -> MFSDPConfig:
@@ -129,11 +252,18 @@ def _coerce_dtype(value: Any, *, name: str) -> torch.dtype:
     return mapping[normalized]
 
 
-def validate_mfsdp_config(engine_cfg) -> None:
+def validate_mfsdp_config(
+    engine_cfg,
+    *,
+    has_optimizer_factory: bool = False,
+) -> None:
     """Validate the supported surface for optimizer='megatron_fsdp'."""
     validate_mfsdp_topology(engine_cfg.parallel)
     opt = engine_cfg.optimizer
-    validate_optimizer_name(getattr(opt, "optimizer", "adam"))
+    validate_optimizer_name(
+        getattr(opt, "optimizer", "adam"),
+        has_optimizer_factory=has_optimizer_factory,
+    )
     validate_optimization_knobs(opt)
     if os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1":
         raise ValueError(
@@ -150,11 +280,16 @@ def validate_mfsdp_topology(parallel_cfg) -> None:
         raise ValueError("optimizer_impl='megatron_fsdp' requires pp>1 when vpp>1.")
 
 
-def validate_optimizer_name(optimizer_name: str) -> None:
-    if optimizer_name not in _SUPPORTED_OPTIMIZERS:
+def validate_optimizer_name(
+    optimizer_name: str,
+    *,
+    has_optimizer_factory: bool = False,
+) -> None:
+    if optimizer_name not in _SUPPORTED_OPTIMIZERS and not has_optimizer_factory:
         raise ValueError(
             "optimizer_impl='megatron_fsdp' supports only adam/sgd, "
-            f"got {optimizer_name!r}."
+            f"got {optimizer_name!r}; provide optimizer_factory for an optional "
+            "algorithm such as Muon."
         )
 
 

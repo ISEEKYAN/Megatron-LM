@@ -12,9 +12,11 @@ persistent local main buffers.
 from __future__ import annotations
 
 import importlib
+import logging
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,20 +24,209 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from megatron.lite.primitive.optimizers.mfsdp.allocator import (
-    BufferLease,
-    TemporaryBufferAllocator,
-    build_temporary_allocator,
-)
-from megatron.lite.primitive.optimizers.mfsdp.config import MFSDPConfig
-from megatron.lite.primitive.optimizers.mfsdp.mixed_precision import (
-    MixedPrecisionPolicy,
-)
-from megatron.lite.primitive.optimizers.mfsdp.process_groups import (
+from megatron.lite.primitive.optimizers.mfsdp.config import (
+    MFSDPConfig,
     MFSDPProcessGroups,
+    MixedPrecisionPolicy,
     group_rank,
     group_size,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class NCCLUserBuffer:
+    """Best-effort Apex NCCL memory-pool adapter."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        groups: tuple[dist.ProcessGroup, ...],
+        symmetric: bool,
+    ) -> None:
+        self.enabled = bool(enabled and torch.cuda.is_available())
+        self.groups = groups
+        self.symmetric = symmetric
+        self.module: Any | None = None
+        self.pool: Any | None = None
+        self._warned = False
+        if self.enabled:
+            self._initialize()
+
+    @property
+    def active(self) -> bool:
+        return self.module is not None and self.pool is not None
+
+    def _initialize(self) -> None:
+        try:
+            module = importlib.import_module("apex.contrib.nccl_allocator")
+            module.init()
+            try:
+                pool = module.create_nccl_mem_pool(symmetric=self.symmetric)
+            except TypeError:
+                pool = module.create_nccl_mem_pool()
+            self.module = module
+            self.pool = pool
+        except (ImportError, AttributeError, RuntimeError, TypeError) as error:
+            self._disable(f"NCCL user-buffer allocation unavailable: {error}")
+
+    def allocation_context(self, group: dist.ProcessGroup | None):
+        if not self.active or group is None:
+            return nullcontext()
+        try:
+            return self.module.nccl_mem(self.pool, group=group)
+        except (AttributeError, RuntimeError, TypeError) as error:
+            self._disable(f"NCCL user-buffer context failed: {error}")
+            return nullcontext()
+
+    def register_additional_groups(self) -> None:
+        if not self.active or len(self.groups) < 2:
+            return
+        for group in self.groups[1:]:
+            try:
+                backend = group._get_backend(
+                    torch.device("cuda", torch.cuda.current_device())
+                )
+                backend.register_mem_pool(self.pool)
+            except (AttributeError, RuntimeError, TypeError) as error:
+                self._disable(f"NCCL user-buffer group registration failed: {error}")
+                return
+
+    def _disable(self, reason: str) -> None:
+        self.module = None
+        self.pool = None
+        if not self._warned:
+            logger.warning("%s; using Torch communication buffers.", reason)
+            self._warned = True
+
+
+@dataclass(slots=True)
+class BufferLease:
+    tensor: torch.Tensor
+    owner: "TemporaryBufferAllocator"
+    key: tuple[Any, ...]
+    slot: int | None = None
+    registered: bool = False
+    _released: bool = False
+
+    def release(self) -> None:
+        if not self._released:
+            self.owner.release(self)
+            self._released = True
+
+
+class TemporaryBufferAllocator:
+    """Allocate communication storage and release it at the pipeline boundary."""
+
+    def __init__(self, user_buffer: NCCLUserBuffer | None = None) -> None:
+        self.user_buffer = user_buffer
+
+    def allocate(
+        self,
+        numel: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        group: dist.ProcessGroup | None,
+        key: tuple[Any, ...],
+    ) -> BufferLease:
+        context = (
+            self.user_buffer.allocation_context(group)
+            if self.user_buffer is not None
+            else nullcontext()
+        )
+        registered = bool(self.user_buffer is not None and self.user_buffer.active)
+        try:
+            with context:
+                tensor = torch.empty(numel, dtype=dtype, device=device)
+            if registered:
+                self.user_buffer.register_additional_groups()
+        except (RuntimeError, TypeError) as error:
+            if self.user_buffer is not None:
+                self.user_buffer._disable(f"Registered allocation failed: {error}")
+            tensor = torch.empty(numel, dtype=dtype, device=device)
+            registered = False
+        return BufferLease(tensor=tensor, owner=self, key=key, registered=registered)
+
+    def release(self, lease: BufferLease) -> None:
+        # Dynamic storage is reclaimed when the lease drops its final reference.
+        return None
+
+
+class DoubleBufferAllocator(TemporaryBufferAllocator):
+    """Two persistent communication slots per dtype/device/group key."""
+
+    def __init__(self, user_buffer: NCCLUserBuffer | None = None) -> None:
+        super().__init__(user_buffer)
+        self._slots: dict[tuple[Any, ...], list[torch.Tensor | None]] = {}
+        self._busy: dict[tuple[Any, ...], set[int]] = {}
+
+    def allocate(
+        self,
+        numel: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        group: dist.ProcessGroup | None,
+        key: tuple[Any, ...],
+    ) -> BufferLease:
+        pool_key = (*key, dtype, device)
+        slots = self._slots.setdefault(pool_key, [None, None])
+        busy = self._busy.setdefault(pool_key, set())
+        for slot in range(2):
+            if slot in busy:
+                continue
+            tensor = slots[slot]
+            if tensor is None or tensor.numel() < numel:
+                lease = super().allocate(
+                    numel,
+                    dtype=dtype,
+                    device=device,
+                    group=group,
+                    key=pool_key,
+                )
+                tensor = lease.tensor
+                slots[slot] = tensor
+                registered = lease.registered
+            else:
+                registered = bool(
+                    self.user_buffer is not None and self.user_buffer.active
+                )
+            busy.add(slot)
+            return BufferLease(
+                tensor=tensor.narrow(0, 0, numel),
+                owner=self,
+                key=pool_key,
+                slot=slot,
+                registered=registered,
+            )
+        return super().allocate(
+            numel,
+            dtype=dtype,
+            device=device,
+            group=group,
+            key=pool_key,
+        )
+
+    def release(self, lease: BufferLease) -> None:
+        if lease.slot is not None:
+            self._busy.get(lease.key, set()).discard(lease.slot)
+
+
+def build_temporary_allocator(
+    config: MFSDPConfig,
+    groups: tuple[dist.ProcessGroup, ...],
+) -> TemporaryBufferAllocator:
+    user_buffer = NCCLUserBuffer(
+        enabled=config.nccl_ub,
+        groups=groups,
+        symmetric=not config.disable_symmetric_registration,
+    )
+    allocator_type = (
+        DoubleBufferAllocator if config.fsdp_double_buffer else TemporaryBufferAllocator
+    )
+    return allocator_type(user_buffer)
 
 
 @dataclass(frozen=True, slots=True)
@@ -535,9 +726,228 @@ def _storage_pointer(tensor: torch.Tensor) -> int:
         return 0
 
 
+class CommunicationStream:
+    """Launch collectives on a dedicated CUDA stream when CUDA is available."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.stream: torch.cuda.Stream | None = None
+        if device.type == "cuda":
+            with torch.cuda.device(device):
+                self.stream = torch.cuda.Stream(device=device, priority=-1)
+
+    def launch(
+        self,
+        callback: Callable[[], Any | None],
+        tensors: Iterable[torch.Tensor],
+    ) -> Any | None:
+        if self.stream is None:
+            return callback()
+        current = torch.cuda.current_stream(self.device)
+        self.stream.wait_stream(current)
+        with torch.cuda.stream(self.stream):
+            work = callback()
+            for tensor in tensors:
+                tensor.record_stream(self.stream)
+        return work
+
+    def wait_for_current(self) -> None:
+        if self.stream is not None:
+            torch.cuda.current_stream(self.device).wait_stream(self.stream)
+
+
+class AllGatherPipeline:
+    """Prefetch parameter buckets in forward and reverse-backward order."""
+
+    def __init__(self, buckets: list[ParamBucket]) -> None:
+        self.buckets = buckets
+        self.overlap = bool(buckets and buckets[0].config.overlap_param_gather)
+        device = buckets[0].device if buckets else torch.device("cpu")
+        self.comm_stream = CommunicationStream(device)
+        self._forward_cursor = 0
+        self._backward_cursor = len(buckets) - 1
+
+    def async_bucket_gather(self, bucket_id: int, bwd: bool = False) -> None:
+        bucket = self.buckets[bucket_id]
+        if bucket._full_ready or bucket._param_gather_work is not None:
+            return
+        output, local = bucket.prepare_param_gather()
+
+        def collective():
+            if bucket.world_size == 1:
+                output.copy_(local)
+                return None
+            return dist.all_gather_into_tensor(
+                output,
+                local,
+                group=bucket.gather_group,
+                async_op=True,
+            )
+
+        work = self.comm_stream.launch(collective, (output, local))
+        bucket.mark_param_gather_launched(work)
+
+    def wait_bucket_ready(self, bucket_id: int, bwd: bool = False) -> None:
+        bucket = self.buckets[bucket_id]
+        if not bucket._full_ready and bucket._param_gather_work is None:
+            self.async_bucket_gather(bucket_id, bwd=bwd)
+        self.comm_stream.wait_for_current()
+        bucket.wait_param_gather()
+
+    def begin_forward(self) -> None:
+        self.release_all()
+        self._forward_cursor = 0
+        if self.buckets and self.overlap:
+            self.async_bucket_gather(0)
+
+    def acquire_forward(self, bucket_ids: Iterable[int]) -> None:
+        for bucket_id in bucket_ids:
+            self.wait_bucket_ready(bucket_id)
+            self.buckets[bucket_id].install_full_parameters()
+            self._forward_cursor = max(self._forward_cursor, bucket_id + 1)
+            if self.overlap and self._forward_cursor < len(self.buckets):
+                self.async_bucket_gather(self._forward_cursor)
+
+    def begin_backward(self) -> None:
+        self._backward_cursor = len(self.buckets) - 1
+        if self.buckets and self.overlap:
+            self.async_bucket_gather(self._backward_cursor, bwd=True)
+
+    def acquire_backward(self, bucket: ParamBucket) -> None:
+        bucket_id = bucket.bucket_id
+        self.wait_bucket_ready(bucket_id, bwd=True)
+        self._backward_cursor = min(self._backward_cursor, bucket_id - 1)
+        if self.overlap and self._backward_cursor >= 0:
+            self.async_bucket_gather(self._backward_cursor, bwd=True)
+
+    def materialize_all(self) -> None:
+        for bucket in self.buckets:
+            self.async_bucket_gather(bucket.bucket_id)
+        for bucket in self.buckets:
+            self.wait_bucket_ready(bucket.bucket_id)
+            bucket.install_full_parameters()
+
+    def release_all(self) -> None:
+        for bucket in self.buckets:
+            bucket.release_full_parameters()
+
+
+class GradReducePipeline:
+    """Launch ready reduce-scatter buckets on a communication stream."""
+
+    def __init__(self, buckets: list[ParamBucket]) -> None:
+        self.buckets = buckets
+        device = buckets[0].device if buckets else torch.device("cpu")
+        self.comm_stream = CommunicationStream(device)
+        for bucket in buckets:
+            if bucket.config.overlap_grad_reduce:
+                bucket.grad_ready_callback = self.reduce_gradients
+
+    def reduce_gradients(self, bucket: ParamBucket, *, force: bool = False) -> None:
+        tensors = bucket.prepare_grad_reduce(force=force)
+        if tensors is None:
+            return
+        output, grad_input = tensors
+
+        def collective():
+            if bucket.world_size == 1:
+                output.copy_(grad_input)
+                return None
+            return dist.reduce_scatter_tensor(
+                output,
+                grad_input,
+                op=dist.ReduceOp.SUM,
+                group=bucket.process_group,
+                async_op=True,
+            )
+
+        work = self.comm_stream.launch(collective, (output, grad_input))
+        bucket.mark_grad_reduce_launched(work)
+
+    def finish(self) -> None:
+        for bucket in reversed(self.buckets):
+            self.reduce_gradients(bucket, force=True)
+        self.comm_stream.wait_for_current()
+        for bucket in self.buckets:
+            bucket.wait_grad_reduce()
+
+    def reset(self) -> None:
+        for bucket in self.buckets:
+            bucket.reset_grad_state()
+
+    def set_enabled(self, enabled: bool) -> None:
+        for bucket in self.buckets:
+            bucket.set_grad_sync_enabled(enabled)
+
+
+class CommunicationPipelines:
+    """Join parameter all-gather and gradient reduce-scatter pipelines."""
+
+    def __init__(self, buckets: list[ParamBucket]) -> None:
+        self.buckets = buckets
+        self.all_gather = AllGatherPipeline(buckets)
+        self.grad_reduce = GradReducePipeline(buckets)
+
+    def begin_forward(self) -> None:
+        self.all_gather.begin_forward()
+
+    def acquire_forward(self, bucket_ids: Iterable[int]) -> None:
+        self.all_gather.acquire_forward(bucket_ids)
+
+    def begin_backward(self) -> None:
+        self.all_gather.begin_backward()
+
+    def acquire_backward(self, bucket: ParamBucket) -> None:
+        self.all_gather.acquire_backward(bucket)
+
+    def end_forward(self) -> None:
+        self.all_gather.release_all()
+
+    def materialize_all(self) -> None:
+        self.all_gather.materialize_all()
+
+    def release_all(self) -> None:
+        self.all_gather.release_all()
+
+    def finish_grad_sync(self) -> None:
+        self.grad_reduce.finish()
+
+    def reset_grad_state(self) -> None:
+        self.grad_reduce.reset()
+
+    def set_grad_sync_enabled(self, enabled: bool) -> None:
+        self.grad_reduce.set_enabled(enabled)
+
+    def copy_full_parameters_to_shards(self) -> None:
+        for bucket in self.buckets:
+            bucket.copy_full_parameters_to_shards()
+        self.release_all()
+
+    def pack_saved_tensor(self, tensor: torch.Tensor) -> torch.Tensor | SavedParamView:
+        for bucket in self.buckets:
+            view = bucket.saved_view(tensor)
+            if view is not None:
+                return view
+        return tensor
+
+    def unpack_saved_tensor(self, value: torch.Tensor | SavedParamView) -> torch.Tensor:
+        if isinstance(value, SavedParamView):
+            self.acquire_backward(value.bucket)
+            return value.bucket.restore_saved_view(value)
+        return value
+
+
 __all__ = [
+    "AllGatherPipeline",
+    "BufferLease",
+    "CommunicationPipelines",
+    "CommunicationStream",
+    "DoubleBufferAllocator",
+    "GradReducePipeline",
+    "NCCLUserBuffer",
     "ParamAndGradBuffer",
     "ParamBucket",
     "ParamSpec",
     "SavedParamView",
+    "TemporaryBufferAllocator",
 ]

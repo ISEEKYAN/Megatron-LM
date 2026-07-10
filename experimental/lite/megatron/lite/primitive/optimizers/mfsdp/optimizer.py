@@ -13,21 +13,20 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.lite.primitive.optimizers.mfsdp.config import (
+    annotate_parallel_parameters,
     build_mfsdp_config,
+    build_mfsdp_process_groups,
     validate_mfsdp_config,
 )
 from megatron.lite.primitive.optimizers.mfsdp.fully_shard import fully_shard_model
-from megatron.lite.primitive.optimizers.mfsdp.fused_ops import build_optimizer
+from megatron.lite.primitive.optimizers.mfsdp.fused_ops import (
+    OptimizerFactory,
+    build_optimizer,
+)
 from megatron.lite.primitive.optimizers.mfsdp.grad_norm import (
     all_reduce_scalar_,
     local_grad_sq_sum,
     resolve_torch_dtype,
-)
-from megatron.lite.primitive.optimizers.mfsdp.metadata import (
-    annotate_parallel_parameters,
-)
-from megatron.lite.primitive.optimizers.mfsdp.process_groups import (
-    build_mfsdp_process_groups,
 )
 from megatron.lite.primitive.optimizers.mfsdp.wrapper import (
     MFSdpModule,
@@ -297,9 +296,13 @@ def build_mfsdp_stack(
     ps,
     is_expert: ExpertClassifierFn | None = None,
     fsdp_unit_modules: tuple[type[nn.Module] | str, ...] | None = None,
+    optimizer_factory: OptimizerFactory | None = None,
 ):
     """Wrap chunks with the native M-FSDP path and build its local optimizer."""
-    validate_mfsdp_config(engine_cfg)
+    validate_mfsdp_config(
+        engine_cfg,
+        has_optimizer_factory=optimizer_factory is not None,
+    )
     opt = engine_cfg.optimizer
     classifier = is_expert or (lambda _name: False)
     config = build_mfsdp_config(opt)
@@ -329,7 +332,11 @@ def build_mfsdp_stack(
         weight_decay=float(getattr(opt, "weight_decay", 0.01)),
         apply_wd_to_qk_layernorm=bool(getattr(opt, "apply_wd_to_qk_layernorm", False)),
     )
-    torch_optimizer = _build_torch_optimizer(param_groups, opt)
+    torch_optimizer = _build_optimizer_algorithm(
+        param_groups,
+        opt,
+        optimizer_factory=optimizer_factory,
+    )
     standalone_optimizer = _StandaloneOptimizer(
         torch_optimizer,
         params,
@@ -373,8 +380,9 @@ def build_mfsdp_training_optimizer(
     ps,
     is_expert: ExpertClassifierFn | None = None,
     fsdp_unit_modules: tuple[type[nn.Module] | str, ...] | None = None,
+    optimizer_factory: OptimizerFactory | None = None,
 ):
-    """Build the native M-FSDP stack from an ``ImplConfig``."""
+    """Build M-FSDP with Adam by default or an injected optimizer algorithm."""
     opt = impl_cfg.optimizer_config
     if opt is None:
         opt = SimpleNamespace(
@@ -399,6 +407,7 @@ def build_mfsdp_training_optimizer(
         ps=ps,
         is_expert=is_expert,
         fsdp_unit_modules=fsdp_unit_modules,
+        optimizer_factory=optimizer_factory,
     )
 
     def finalize_grads() -> None:
@@ -455,7 +464,14 @@ def _build_param_groups(
     return params, param_groups, expert_params
 
 
-def _build_torch_optimizer(
-    param_groups: list[dict[str, Any]], opt: Any
+def _build_optimizer_algorithm(
+    param_groups: list[dict[str, Any]],
+    opt: Any,
+    *,
+    optimizer_factory: OptimizerFactory | None = None,
 ) -> torch.optim.Optimizer:
-    return build_optimizer(param_groups, opt)
+    return build_optimizer(
+        param_groups,
+        opt,
+        optimizer_factory=optimizer_factory,
+    )
