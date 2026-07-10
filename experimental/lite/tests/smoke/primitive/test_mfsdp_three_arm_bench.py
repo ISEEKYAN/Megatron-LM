@@ -499,15 +499,26 @@ def _percentile(values: list[float], quantile: float) -> float:
     return ordered[index]
 
 
+def _trace_benchmark(phase: str, step: int, arm: str, state: str) -> None:
+    if os.environ.get("MLITE_BENCH_TRACE") == "1":
+        print(
+            f"[MFSDP_TRACE] rank={dist.get_rank()} phase={phase} step={step} "
+            f"arm={arm} state={state}",
+            flush=True,
+        )
+
+
 def _benchmark(arms: list[_Arm], *, seed: int) -> dict[str, Any]:
     assert len({arm.name for arm in arms}) == len(arms)
     precision_losses = {arm.name: [] for arm in arms}
     for step in range(_PRECISION_STEPS):
         ordered = arms[step % len(arms) :] + arms[: step % len(arms)]
         for arm in ordered:
+            _trace_benchmark("precision", step, arm.name, "start")
             loss, _forward_ms, _fb_ms, _optimizer_ms = _run_step(
                 arm, seed=seed + step
             )
+            _trace_benchmark("precision", step, arm.name, "done")
             precision_losses[arm.name].append(loss)
 
     reference = precision_losses[arms[0].name]
@@ -524,7 +535,9 @@ def _benchmark(arms: list[_Arm], *, seed: int) -> dict[str, Any]:
     for step in range(_WARMUP_STEPS):
         ordered = arms[step % len(arms) :] + arms[: step % len(arms)]
         for arm in ordered:
+            _trace_benchmark("warmup", step, arm.name, "start")
             _run_step(arm, seed=seed + 100 + step)
+            _trace_benchmark("warmup", step, arm.name, "done")
 
     samples = {
         arm.name: {
@@ -540,10 +553,12 @@ def _benchmark(arms: list[_Arm], *, seed: int) -> dict[str, Any]:
     for step in range(_MEASURE_STEPS):
         ordered = arms[step % len(arms) :] + arms[: step % len(arms)]
         for arm in ordered:
+            _trace_benchmark("measure", step, arm.name, "start")
             torch.cuda.reset_peak_memory_stats()
             _loss, forward_ms, fb_ms, optimizer_ms = _run_step(
                 arm, seed=seed + 1000 + step
             )
+            _trace_benchmark("measure", step, arm.name, "done")
             samples[arm.name]["forward_ms"].append(forward_ms)
             samples[arm.name]["backward_schedule_ms"].append(
                 max(fb_ms - forward_ms, 0.0)
@@ -560,6 +575,9 @@ def _benchmark(arms: list[_Arm], *, seed: int) -> dict[str, Any]:
         arm_samples = samples[arm.name]
         step_ms = arm_samples["step_ms"]
         p50 = statistics.median(step_ms)
+        _trace_benchmark("profile", 0, arm.name, "start")
+        communication_ms = _profile_communication_cuda_ms(arm, seed=seed + 2000)
+        _trace_benchmark("profile", 0, arm.name, "done")
         metrics[arm.name] = {
             "step_ms_p50": p50,
             "step_ms_p95": _percentile(step_ms, 0.95),
@@ -574,9 +592,7 @@ def _benchmark(arms: list[_Arm], *, seed: int) -> dict[str, Any]:
                 arm_samples["backward_schedule_ms"]
             ),
             "optimizer_ms_p50": statistics.median(arm_samples["optimizer_ms"]),
-            "communication_cuda_kernel_ms_overlapped": _profile_communication_cuda_ms(
-                arm, seed=seed + 2000
-            ),
+            "communication_cuda_kernel_ms_overlapped": communication_ms,
             "communication_time_note": (
                 "sum of profiled collective CUDA kernels; kernels may overlap compute"
             ),
@@ -726,7 +742,15 @@ def test_mfsdp_three_arm_torch_adamw_benchmark():
 def test_mlite_mfsdp_feature_ablation():
     results = {}
     cache = {}
-    for feature, states in _MLITE_ABLATIONS.items():
+    requested_feature = os.environ.get("MLITE_ABLATION_FEATURE")
+    if requested_feature is not None and requested_feature not in _MLITE_ABLATIONS:
+        raise ValueError(f"Unknown MLITE_ABLATION_FEATURE: {requested_feature}")
+    ablations = (
+        {requested_feature: _MLITE_ABLATIONS[requested_feature]}
+        if requested_feature is not None
+        else _MLITE_ABLATIONS
+    )
+    for feature, states in ablations.items():
         results[feature] = {}
         off_overrides = _ablation_overrides(feature, False)
         on_overrides = _ablation_overrides(feature, True)
@@ -781,16 +805,20 @@ def test_mlite_mfsdp_feature_ablation():
                 "metrics": metrics,
             }
 
-    for feature in ("bucket", "ag_overlap", "rs_overlap", "double_buffer"):
+    required_measured = ("bucket", "ag_overlap", "rs_overlap", "double_buffer")
+    for feature in required_measured:
+        if feature not in results:
+            continue
         assert results[feature]["false"]["status"] == "measured"
         assert results[feature]["true"]["status"] == "measured"
-    off_bucket_count = results["bucket"]["false"]["metrics"]["feature_probe"][
-        "bucket_count"
-    ]
-    on_bucket_count = results["bucket"]["true"]["metrics"]["feature_probe"][
-        "bucket_count"
-    ]
-    assert on_bucket_count > off_bucket_count
+    if "bucket" in results:
+        off_bucket_count = results["bucket"]["false"]["metrics"]["feature_probe"][
+            "bucket_count"
+        ]
+        on_bucket_count = results["bucket"]["true"]["metrics"]["feature_probe"][
+            "bucket_count"
+        ]
+        assert on_bucket_count > off_bucket_count
     if dist.get_rank() == 0:
         print(
             "[MFSDP_ABLATION] "
