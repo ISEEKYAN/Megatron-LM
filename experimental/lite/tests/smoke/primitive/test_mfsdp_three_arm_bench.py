@@ -31,7 +31,7 @@ pytestmark = [
 
 _MCORE_COMMIT = "00309a0199dc590060aa0995b6f4a371d8db9761"
 _MLITE_BASE_COMMIT = "62295f9b306d70a8180e907b7c51b3ef293ea007"
-_BENCHMARK_COMMIT = "5338da72e102214745d4feacc445a152c512c30a"
+_BENCHMARK_PROTOCOL_COMMIT = "5338da72e102214745d4feacc445a152c512c30a"
 _ARMS = ("mcore_mfsdp", "mlite_mfsdp", "mlite_fsdp2")
 _TOPOLOGY = (2, 2, 1, 2, 2)
 _WARMUP_STEPS = 5
@@ -117,12 +117,15 @@ def _assert_source_contract() -> None:
     observed = Path(marker).read_text().strip()
     if observed != _MCORE_COMMIT:
         pytest.fail(f"MCore source mismatch: expected {_MCORE_COMMIT}, got {observed}.")
-    observed_benchmark = os.environ.get("MLITE_COMMIT")
-    if observed_benchmark != _BENCHMARK_COMMIT:
+    observed_benchmark = os.environ.get("MLITE_PROTOCOL_COMMIT")
+    if observed_benchmark != _BENCHMARK_PROTOCOL_COMMIT:
         pytest.fail(
-            "Benchmark source mismatch: "
-            f"expected {_BENCHMARK_COMMIT}, got {observed_benchmark}."
+            "Benchmark protocol mismatch: "
+            f"expected {_BENCHMARK_PROTOCOL_COMMIT}, got {observed_benchmark}."
         )
+    archive_sha256 = os.environ.get("MLITE_ARCHIVE_SHA256", "")
+    if len(archive_sha256) != 64 or any(c not in "0123456789abcdef" for c in archive_sha256):
+        pytest.fail("MLITE_ARCHIVE_SHA256 must bind the staged source archive.")
 
 
 def _parallel_config() -> ParallelConfig:
@@ -611,7 +614,8 @@ def test_mfsdp_three_arm_torch_adamw_benchmark():
                 {
                     "mcore_commit": _MCORE_COMMIT,
                     "mlite_commit": _MLITE_BASE_COMMIT,
-                    "benchmark_commit": _BENCHMARK_COMMIT,
+                    "benchmark_protocol_commit": _BENCHMARK_PROTOCOL_COMMIT,
+                    "source_archive_sha256": os.environ["MLITE_ARCHIVE_SHA256"],
                     "optimizer": _OPTIMIZER,
                     "topology": "tp2_ep2_etp1_pp2_cp2",
                     "warmup_steps": _WARMUP_STEPS,
@@ -699,7 +703,8 @@ def test_mlite_mfsdp_feature_ablation():
             + json.dumps(
                 {
                     "mlite_commit": _MLITE_BASE_COMMIT,
-                    "benchmark_commit": _BENCHMARK_COMMIT,
+                    "benchmark_protocol_commit": _BENCHMARK_PROTOCOL_COMMIT,
+                    "source_archive_sha256": os.environ["MLITE_ARCHIVE_SHA256"],
                     "optimizer": _OPTIMIZER,
                     "topology": "tp2_ep2_etp1_pp2_cp2",
                     "results": results,

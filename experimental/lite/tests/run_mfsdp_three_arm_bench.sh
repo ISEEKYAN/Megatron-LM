@@ -17,7 +17,8 @@ if [[ "${SLURM_NNODES:-0}" != "1" || "${NPROC_PER_NODE}" != "8" ]]; then
 fi
 : "${MCORE_SOURCE_ROOT:?point to NVIDIA Megatron-LM commit 00309a source}"
 : "${MCORE_COMMIT_FILE:?point to the staged MCore commit marker}"
-: "${MLITE_COMMIT:?set the staged MLite base commit}"
+: "${MLITE_PROTOCOL_COMMIT:?set the benchmark protocol commit}"
+: "${MLITE_ARCHIVE_SHA256:?set the staged source archive SHA-256}"
 
 case "${MODE}" in
   three-arm)
