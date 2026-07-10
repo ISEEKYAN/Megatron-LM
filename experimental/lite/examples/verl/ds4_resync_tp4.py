@@ -594,7 +594,20 @@ def collect(
         print(f"DS4_TP4_FP8_ONLINE_RELOAD_COMPLETE={resync_output}", flush=True)
 
 
-def _build_mlite_runtime(model: Path):
+def _validate_mlite_load_topology(
+    world_size: int, *, pp: int, ep: int, cp: int
+) -> None:
+    if min(pp, ep, cp) < 1:
+        raise ValueError(f"MLite load topology axes must be positive, got pp={pp}, ep={ep}, cp={cp}")
+    expected_world_size = pp * ep * cp
+    if world_size != expected_world_size:
+        raise ValueError(
+            f"MLite load topology pp={pp}, ep={ep}, cp={cp} requires "
+            f"world_size={expected_world_size}, got {world_size}"
+        )
+
+
+def _build_mlite_runtime(model: Path, *, pp: int = 1, ep: int = 4, cp: int = 1):
     from megatron.lite.runtime import RuntimeConfig, create_runtime
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
     from megatron.lite.runtime.contracts import ParallelConfig
@@ -605,16 +618,13 @@ def _build_mlite_runtime(model: Path):
     if not dist.is_initialized():
         dist.init_process_group("nccl")
     world_size = dist.get_world_size()
-    if world_size != 4:
-        raise ValueError(
-            f"formal MLite parity requires EP4, got world_size={world_size}"
-        )
+    _validate_mlite_load_topology(world_size, pp=pp, ep=ep, cp=cp)
 
     backend_config = MegatronLiteConfig(
         model_name="deepseek_v4",
         impl="lite",
         hf_path=str(model),
-        parallel=ParallelConfig(tp=1, etp=1, ep=4, pp=1, vpp=1, cp=1),
+        parallel=ParallelConfig(tp=1, etp=1, ep=ep, pp=pp, vpp=1, cp=cp),
         attention_backend_override="fused",
         load_hf_weights=True,
         impl_cfg={
@@ -630,13 +640,14 @@ def _build_mlite_runtime(model: Path):
     return runtime, runtime.build_model()
 
 
-def load_mlite(model: Path) -> None:
+def load_mlite(model: Path, *, pp: int = 1, ep: int = 4, cp: int = 1) -> None:
     """Build and load the official mixed checkpoint, then exit without forward/export."""
     started = time.monotonic()
-    _, handle = _build_mlite_runtime(model)
+    _, handle = _build_mlite_runtime(model, pp=pp, ep=ep, cp=cp)
     if dist.get_rank() == 0:
         print(
             "DS4_MLITE_LOAD_ONLY_COMPLETE "
+            f"topology=pp{pp}ep{ep}cp{cp} "
             f"elapsed_seconds={time.monotonic() - started:.3f} "
             f"peak_allocated_bytes={torch.cuda.max_memory_allocated()}",
             flush=True,
@@ -748,6 +759,9 @@ def main() -> None:
     collect_parser.add_argument("--weight-output", type=Path)
     load_mlite_parser = subparsers.add_parser("load-mlite")
     load_mlite_parser.add_argument("--model", type=Path, required=True)
+    load_mlite_parser.add_argument("--pp", type=int, default=1)
+    load_mlite_parser.add_argument("--ep", type=int, default=4)
+    load_mlite_parser.add_argument("--cp", type=int, default=1)
     mlite_parser = subparsers.add_parser("collect-mlite")
     mlite_parser.add_argument("--model", type=Path, required=True)
     mlite_parser.add_argument("--output", type=Path, required=True)
@@ -773,7 +787,7 @@ def main() -> None:
             weight_output=args.weight_output,
         )
     elif args.command == "load-mlite":
-        load_mlite(args.model)
+        load_mlite(args.model, pp=args.pp, ep=args.ep, cp=args.cp)
     elif args.command == "collect-mlite":
         collect_mlite(
             args.model, args.output, args.fp8_output, args.coverage_output

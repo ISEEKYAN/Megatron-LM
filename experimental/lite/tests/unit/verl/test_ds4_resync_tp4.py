@@ -398,14 +398,29 @@ def test_mlite_load_only_command_stops_after_runtime_build() -> None:
     ).read_text()
 
     assert 'subparsers.add_parser("load-mlite")' in source
+    assert 'load_mlite_parser.add_argument("--pp", type=int, default=1)' in source
+    assert 'load_mlite_parser.add_argument("--ep", type=int, default=4)' in source
+    assert 'load_mlite_parser.add_argument("--cp", type=int, default=1)' in source
     assert "DS4_MLITE_LOAD_ONLY_COMPLETE" in source
     load_function = source[source.index("def load_mlite(") : source.index("def collect_mlite(")]
     assert "forward_backward" not in load_function
     assert "export_weights" not in load_function
     load_branch = source[source.index('elif args.command == "load-mlite"') :]
-    assert load_branch.index("load_mlite(args.model)") < load_branch.index(
+    assert load_branch.index(
+        "load_mlite(args.model, pp=args.pp, ep=args.ep, cp=args.cp)"
+    ) < load_branch.index(
         'elif args.command == "collect-mlite"'
     )
+
+
+def test_mlite_load_only_topology_requires_exact_world_size() -> None:
+    from examples.verl.ds4_resync_tp4 import _validate_mlite_load_topology
+
+    _validate_mlite_load_topology(8, pp=2, ep=4, cp=1)
+    with pytest.raises(ValueError, match="requires world_size=8"):
+        _validate_mlite_load_topology(4, pp=2, ep=4, cp=1)
+    with pytest.raises(ValueError, match="positive"):
+        _validate_mlite_load_topology(8, pp=0, ep=4, cp=1)
 
 
 def test_model_vocab_size_includes_non_tokenizer_slots() -> None:
