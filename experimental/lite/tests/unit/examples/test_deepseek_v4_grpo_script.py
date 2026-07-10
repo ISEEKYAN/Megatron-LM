@@ -184,6 +184,7 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert '"<｜Assistant｜>"' in script
     assert "DS4_RAY_CLUSTER_PASSED" in script
     assert "DS4_RAY_JOB_RUNTIME_ENV_PASSED" in script
+    assert "DS4_RAY_GPU_ENV_PASSED" in script
     assert script.index("RUNTIME_ENV_JSON=$(") < script.index(
         'if [[ "${RAY_ONLY}" == "1" ]]'
     )
@@ -192,6 +193,7 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert 'export PYTHONPATH="${MLITE_SM90_SITE}' in script
     assert ':${DS4_VLLM_SITE}:' in script
     assert 'export LD_PRELOAD="${DS4_VLLM_SHIM}"' in script
+    assert "unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES" in script
     assert 'export HF_HOME="${RUN_ROOT}/hf-cache"' in script
     assert 'export HF_DATASETS_CACHE="${HF_HOME}/datasets"' in script
     assert '"HF_HOME",' in script
