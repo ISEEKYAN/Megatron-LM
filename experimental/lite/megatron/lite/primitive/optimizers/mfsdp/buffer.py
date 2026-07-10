@@ -164,6 +164,7 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
         super().__init__(user_buffer)
         self._slots: dict[tuple[Any, ...], list[torch.Tensor | None]] = {}
         self._busy: dict[tuple[Any, ...], set[int]] = {}
+        self._reuse_events: dict[tuple[Any, ...], list[Any | None]] = {}
 
     def allocate(
         self,
@@ -177,6 +178,7 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
         pool_key = (*key, dtype, device)
         slots = self._slots.setdefault(pool_key, [None, None])
         busy = self._busy.setdefault(pool_key, set())
+        reuse_events = self._reuse_events.setdefault(pool_key, [None, None])
         for slot in range(2):
             if slot in busy:
                 continue
@@ -196,6 +198,8 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
                 registered = bool(
                     self.user_buffer is not None and self.user_buffer.active
                 )
+            _wait_for_reuse_event(reuse_events[slot], tensor)
+            reuse_events[slot] = None
             busy.add(slot)
             return BufferLease(
                 tensor=tensor.narrow(0, 0, numel),
@@ -214,6 +218,8 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
 
     def release(self, lease: BufferLease) -> None:
         if lease.slot is not None:
+            events = self._reuse_events.setdefault(lease.key, [None, None])
+            events[lease.slot] = _record_reuse_event(lease.tensor)
             self._busy.get(lease.key, set()).discard(lease.slot)
 
     def release_cached(self) -> None:
@@ -221,6 +227,20 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
             raise RuntimeError("Cannot release active M-FSDP communication buffers.")
         self._slots.clear()
         self._busy.clear()
+        self._reuse_events.clear()
+
+
+def _record_reuse_event(tensor: torch.Tensor) -> Any | None:
+    if tensor.device.type != "cuda":
+        return None
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream(tensor.device))
+    return event
+
+
+def _wait_for_reuse_event(event: Any | None, tensor: torch.Tensor) -> None:
+    if event is not None:
+        torch.cuda.current_stream(tensor.device).wait_event(event)
 
 
 def build_temporary_allocator(

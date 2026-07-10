@@ -874,6 +874,41 @@ def test_mfsdp_empty_uneven_shard_stays_inside_local_buffer(monkeypatch):
     assert bucket.specs[1].shard_param.numel() == 0
 
 
+def test_mfsdp_double_buffer_waits_before_reusing_released_slot(monkeypatch):
+    allocator = mfsdp_buffer.DoubleBufferAllocator()
+    recorded_event = object()
+    waits = []
+    monkeypatch.setattr(
+        mfsdp_buffer,
+        "_record_reuse_event",
+        lambda _tensor: recorded_event,
+    )
+    monkeypatch.setattr(
+        mfsdp_buffer,
+        "_wait_for_reuse_event",
+        lambda event, _tensor: waits.append(event),
+    )
+
+    first = allocator.allocate(
+        8,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        group=None,
+        key=("param", 0),
+    )
+    first.release()
+    second = allocator.allocate(
+        8,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        group=None,
+        key=("param", 0),
+    )
+
+    assert second.slot == first.slot
+    assert waits == [None, recorded_event]
+
+
 def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
     torch.manual_seed(321)
     reference = _GlooModel()
