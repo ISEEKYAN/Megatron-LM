@@ -19,7 +19,7 @@ OUTPUT_DIR=${OUTPUT_DIR:?set OUTPUT_DIR}
 RESYNC_DIR=${OUTPUT_DIR}/resync-checkpoint
 
 mkdir -p "${OUTPUT_DIR}"
-export PYTHONPATH="${MLITE_SRC}/experimental/lite:${PYTHONPATH:-}"
+export PYTHONPATH="${MLITE_SRC}/experimental/lite/examples/verl:${MLITE_SRC}/experimental/lite:${PYTHONPATH:-}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 unset VLLM_DEEP_GEMM_WARMUP || true
 
