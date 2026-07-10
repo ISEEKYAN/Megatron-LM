@@ -31,6 +31,9 @@ def test_classify_parameter_family_uses_exported_names() -> None:
         classify("model.0.module.layers.0.self_attention.linear_qkv.weight")
         == "attention"
     )
+    assert (
+        classify("model.0.module.layers.0.self_attention.gdn.in_proj.weight") == "gdn"
+    )
     assert classify("model.layers.0.mlp.experts.3.down_proj.weight") == "expert"
     assert classify("model.layers.0.mlp.gate.weight") == "router"
     assert classify("model.layers.0.mlp.shared_expert_gate.weight") == "router"
@@ -40,6 +43,7 @@ def test_classify_parameter_family_uses_exported_names() -> None:
     assert classify("model.vision_model.blocks.0.mlp.linear_fc1.weight") == "vision"
     assert classify("lm_head.weight") == "head"
     assert classify("model.module.output_layer.weight") == "head"
+    assert classify("model.1.module.head.col.linear.weight") == "head"
 
 
 def test_tensor_delta_statistics_counts_exact_and_thresholded_changes() -> None:

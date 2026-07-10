@@ -63,7 +63,13 @@ def classify_parameter_family(name: str) -> str:
     lowered = name.lower()
     if "vision_model" in lowered or ".vision." in lowered:
         return "vision"
-    if lowered.endswith("lm_head.weight") or "output_layer" in lowered:
+    if ".gdn." in lowered:
+        return "gdn"
+    if (
+        lowered.endswith("lm_head.weight")
+        or "output_layer" in lowered
+        or ".head." in lowered
+    ):
         return "head"
     if any(token in lowered for token in ("embed_tokens", "word_embeddings", "wte")):
         return "embedding"
