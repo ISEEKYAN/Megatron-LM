@@ -8,8 +8,6 @@ loss computation).
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
@@ -33,7 +31,100 @@ from megatron.lite.primitive.parallel import (
     roll_packed_thd_left,
     scatter_to_sequence_parallel,
 )
-from megatron.lite.primitive.utils import build_fp8_recipe
+from megatron.lite.primitive.precision import (
+    PrecisionCoverage,
+    PrimitiveCapability,
+    SemanticSite,
+)
+
+
+def _declare_layer_precision_requirements(
+    layer: nn.Module, coverage: PrecisionCoverage
+) -> None:
+    """Declare the concrete selected and fixed-BF16 sites in one Qwen layer."""
+
+    layer_idx = getattr(layer, "layer_idx", "unknown")
+    coverage.require(
+        layer.attn.qkv,
+        SemanticSite.ATTENTION_PROJECTION,
+        frozenset({PrimitiveCapability.TE_LAYERNORM_LINEAR}),
+        diagnostic=f"layer {layer_idx} attention qkv projection",
+    )
+    coverage.require(
+        layer.attn.proj,
+        SemanticSite.ATTENTION_PROJECTION,
+        frozenset({PrimitiveCapability.TE_LINEAR}),
+        diagnostic=f"layer {layer_idx} attention output projection",
+    )
+    coverage.require(
+        layer.moe.experts.fc1,
+        SemanticSite.MOE_EXPERT,
+        frozenset({PrimitiveCapability.TE_GROUPED_LINEAR}),
+        diagnostic=f"layer {layer_idx} expert fc1",
+    )
+    coverage.require(
+        layer.moe.experts.fc2,
+        SemanticSite.MOE_EXPERT,
+        frozenset({PrimitiveCapability.TE_GROUPED_LINEAR}),
+        diagnostic=f"layer {layer_idx} expert fc2",
+    )
+    coverage.require(
+        layer.attn.qkv,
+        SemanticSite.NORM,
+        diagnostic=f"layer {layer_idx} fused pre-attention RMSNorm",
+    )
+    coverage.require(
+        layer.attn.core_attn,
+        SemanticSite.ATTENTION_CORE,
+        diagnostic=f"layer {layer_idx} attention core",
+    )
+    coverage.require(
+        layer.attn.q_norm,
+        SemanticSite.NORM,
+        diagnostic=f"layer {layer_idx} q norm",
+    )
+    coverage.require(
+        layer.attn.k_norm,
+        SemanticSite.NORM,
+        diagnostic=f"layer {layer_idx} k norm",
+    )
+    coverage.require(
+        layer.mlp_norm,
+        SemanticSite.NORM,
+        diagnostic=f"layer {layer_idx} pre-MoE RMSNorm",
+    )
+    coverage.require(
+        layer.moe.router,
+        SemanticSite.ROUTER,
+        diagnostic=f"layer {layer_idx} router",
+    )
+
+
+def _declare_model_precision_requirements(
+    model: nn.Module, coverage: PrecisionCoverage
+) -> None:
+    """Declare typed coverage from the explicit Qwen3-MoE composition."""
+
+    for layer in model.layers:
+        _declare_layer_precision_requirements(layer, coverage)
+    if model.embed is not None:
+        coverage.require(
+            model.embed,
+            SemanticSite.EMBEDDING,
+            diagnostic="input embedding",
+        )
+    if model.norm is not None:
+        coverage.require(
+            model.norm,
+            SemanticSite.NORM,
+            diagnostic="final RMSNorm",
+        )
+    if model.head is not None:
+        coverage.require(
+            model.head,
+            SemanticSite.LM_HEAD,
+            diagnostic="vocabulary head",
+        )
 
 # ---------------------------------------------------------------------------
 # MoE Layer (thin assembly over megatron.lite.primitive.modules)
@@ -48,9 +139,9 @@ class MoELayer(nn.Module):
         *,
         use_deepep: bool = True,
         router_bias_rate: float = 0.0,
-        fp8: bool = False,
         moe_act_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        precision_coverage: PrecisionCoverage | None = None,
     ):
         super().__init__()
         # Match Qwen3-MoE's `load_balancing_type="none"` setting: no aux loss.
@@ -58,7 +149,11 @@ class MoELayer(nn.Module):
             config, ps, router_bias_rate=router_bias_rate, compute_aux_loss=False
         )
         self.experts = Experts(
-            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute, lora_config=lora_config
+            config,
+            ps,
+            moe_act_recompute=moe_act_recompute,
+            lora_config=lora_config,
+            precision_coverage=precision_coverage,
         )
         self.dispatcher = TokenDispatcher(
             config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
@@ -122,10 +217,10 @@ class TransformerLayer(nn.Module):
         *,
         use_deepep: bool = True,
         router_bias_rate: float = 0.0,
-        fp8: bool = False,
         moe_act_recompute: bool = False,
         use_thd: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        precision_coverage: PrecisionCoverage | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -146,6 +241,7 @@ class TransformerLayer(nn.Module):
             use_thd=use_thd,
             qkv_layout="mcore",
             lora_config=lora_config,
+            precision_coverage=precision_coverage,
         )
         self.mlp_norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.moe = MoELayer(
@@ -153,9 +249,9 @@ class TransformerLayer(nn.Module):
             ps,
             use_deepep=use_deepep,
             router_bias_rate=router_bias_rate,
-            fp8=fp8,
             moe_act_recompute=moe_act_recompute,
             lora_config=lora_config,
+            precision_coverage=precision_coverage,
         )
 
     def forward(
@@ -208,7 +304,6 @@ class MultiTokenPredictionLayer(nn.Module):
         embedding: VocabParallelEmbedding,
         use_deepep: bool,
         router_bias_rate: float,
-        fp8: bool,
         moe_act_recompute: bool,
         use_thd: bool,
         detach_encoder: bool,
@@ -229,7 +324,6 @@ class MultiTokenPredictionLayer(nn.Module):
             config.num_hidden_layers + layer_idx,
             use_deepep=use_deepep,
             router_bias_rate=router_bias_rate,
-            fp8=fp8,
             moe_act_recompute=moe_act_recompute,
             use_thd=use_thd,
             lora_config=lora_config,
@@ -281,7 +375,6 @@ class MultiTokenPredictionBlock(nn.Module):
         embedding: VocabParallelEmbedding,
         use_deepep: bool,
         router_bias_rate: float,
-        fp8: bool,
         moe_act_recompute: bool,
         use_thd: bool,
         detach_encoder: bool,
@@ -301,7 +394,6 @@ class MultiTokenPredictionBlock(nn.Module):
                     embedding=embedding,
                     use_deepep=use_deepep,
                     router_bias_rate=router_bias_rate,
-                    fp8=fp8,
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     detach_encoder=detach_encoder,
@@ -353,7 +445,6 @@ class Qwen3MoEModel(nn.Module):
         vpp_chunk_id: int | None = None,
         *,
         use_deepep: bool = False,
-        fp8: bool = False,
         recompute_modules: list[str] | None = None,
         router_bias_rate: float = 0.0,
         use_thd: bool = False,
@@ -361,11 +452,15 @@ class Qwen3MoEModel(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        precision_coverage: PrecisionCoverage | None = None,
     ):
         super().__init__()
+        if precision_coverage is not None and mtp_enable:
+            raise ValueError(
+                "MTP is not covered by the closed Hopper precision profiles."
+            )
         self.config = config
         self.ps = ps
-        self.fp8 = fp8
         self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self._input_tensor: torch.Tensor | None = None
@@ -391,10 +486,10 @@ class Qwen3MoEModel(nn.Module):
                     idx,
                     use_deepep=use_deepep,
                     router_bias_rate=router_bias_rate,
-                    fp8=fp8,
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     lora_config=lora_config,
+                    precision_coverage=precision_coverage,
                 )
                 for idx in self.layer_indices
             ]
@@ -419,13 +514,15 @@ class Qwen3MoEModel(nn.Module):
                 embedding=mtp_embedding,
                 use_deepep=use_deepep,
                 router_bias_rate=router_bias_rate,
-                fp8=fp8,
                 moe_act_recompute=moe_act_recompute,
                 use_thd=use_thd,
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
                 lora_config=lora_config,
             )
+
+        if precision_coverage is not None:
+            _declare_model_precision_requirements(self, precision_coverage)
 
         self.sp_params: list[nn.Parameter] = []
         if ps.tp_size > 1:
@@ -460,20 +557,13 @@ class Qwen3MoEModel(nn.Module):
             assert hidden_states is not None
             h = hidden_states
 
-        fp8_ctx = (
-            te.fp8_autocast(enabled=True, fp8_recipe=build_fp8_recipe())
-            if self.fp8
-            else nullcontext()
-        )
-
-        with fp8_ctx:
-            if self.embed is not None:
-                h = scatter_to_sequence_parallel(h, self.ps)
-            for layer in self.layers:
-                h = layer(h, position_ids=position_ids, packed_seq_params=packed_seq_params)
-            # Head path is SP-aware: norm runs on SP-sharded [S/tp, B, H] and
-            # head's internal all-gather happens inside VocabParallelOutput.
-            # Mirrors MC GPTModel's final_layernorm → output_layer(sp=True).
+        if self.embed is not None:
+            h = scatter_to_sequence_parallel(h, self.ps)
+        for layer in self.layers:
+            h = layer(h, position_ids=position_ids, packed_seq_params=packed_seq_params)
+        # Head path is SP-aware: norm runs on SP-sharded [S/tp, B, H] and
+        # head's internal all-gather happens inside VocabParallelOutput.
+        # Mirrors MC GPTModel's final_layernorm → output_layer(sp=True).
 
         output = {"hidden_states": h}
 

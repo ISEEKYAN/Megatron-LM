@@ -281,6 +281,35 @@ def precision_forward_context(
     return _precision_context(PrecisionPhase.FORWARD, implementation)
 
 
+def precision_site_forward_context(
+    implementation: PrecisionImplementation,
+    site: SemanticSite,
+) -> AbstractContextManager[None]:
+    """Open TE FP8 autocast for one selected semantic GEMM site only."""
+
+    if not isinstance(site, SemanticSite):
+        raise TypeError("precision site must be a SemanticSite")
+    active = active_precision(PrecisionPhase.FORWARD)
+    if active is not implementation:
+        raise RuntimeError(
+            "precision primitive is bound to a different runtime forward context"
+        )
+    if site in implementation.bf16_sites:
+        raise ValueError(f"fixed BF16 site {site.value} cannot enter FP8 autocast")
+    if site not in implementation.fp8_sites:
+        raise ValueError(
+            f"site {site.value} is not selected by {implementation.name}"
+        )
+
+    import transformer_engine.pytorch as te
+
+    return te.fp8_autocast(
+        enabled=True,
+        fp8_recipe=implementation.recipe_factory(),
+        fp8_group=None,
+    )
+
+
 def active_precision(phase: PrecisionPhase) -> PrecisionImplementation:
     """Return the runtime-bound implementation for an exact lifecycle phase."""
 

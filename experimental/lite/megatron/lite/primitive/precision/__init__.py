@@ -23,6 +23,7 @@ from megatron.lite.primitive.precision.hopper_blockwise import (
     build_hopper_blockwise_recipe,
     precision_forward_context,
     precision_model_init_context,
+    precision_site_forward_context,
     resolve_precision,
     validate_hopper_environment,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "build_hopper_blockwise_recipe",
     "precision_forward_context",
     "precision_model_init_context",
+    "precision_site_forward_context",
     "resolve_precision",
     "validate_hopper_environment",
 ]
