@@ -264,8 +264,6 @@ if [[ "${CONFIG_ONLY}" == "1" ]]; then
 import os
 import sys
 
-from tilelang import env as tilelang_env
-
 config = open(sys.argv[1], encoding="utf-8").read()
 required = [
     "strategy: mlite",
@@ -287,15 +285,6 @@ if missing:
     raise SystemExit(f"resolved DS4 GRPO config is missing markers: {missing}")
 if "custom_chat_template: null" in config:
     raise SystemExit("resolved DS4 GRPO config has no chat template")
-for name, resolved_path in {
-    "TILELANG_CACHE_DIR": tilelang_env.TILELANG_CACHE_DIR,
-    "TILELANG_TMP_DIR": tilelang_env.TILELANG_TMP_DIR,
-}.items():
-    expected_path = os.environ[name]
-    if os.path.realpath(resolved_path) != os.path.realpath(expected_path):
-        raise SystemExit(
-            f"TileLang resolved {name}={resolved_path}, expected {expected_path}"
-        )
 cache_roots = {
     "vLLM": os.environ["VLLM_CACHE_ROOT"],
     "TileLang": os.environ["TILELANG_CACHE_DIR"],
@@ -311,6 +300,30 @@ for forbidden in (
 ):
     if forbidden in config:
         raise SystemExit(f"resolved DS4 GRPO config contains initialization error: {forbidden}")
+PY
+    env \
+      PYTHONPATH="${DS4_VLLM_SITE}:${PYTHONPATH}" \
+      VERL_MLITE_SKIP_RUNTIME_PATCHES=1 \
+      python - <<'PY'
+import os
+
+from tilelang import env as tilelang_env
+
+for name, resolved_path in {
+    "TILELANG_CACHE_DIR": tilelang_env.TILELANG_CACHE_DIR,
+    "TILELANG_TMP_DIR": tilelang_env.TILELANG_TMP_DIR,
+}.items():
+    expected_path = os.environ[name]
+    if os.path.realpath(resolved_path) != os.path.realpath(expected_path):
+        raise SystemExit(
+            f"TileLang resolved {name}={resolved_path}, expected {expected_path}"
+        )
+print(
+    "DS4_TILELANG_CACHE_PREFLIGHT_PASSED "
+    f"cache={tilelang_env.TILELANG_CACHE_DIR} "
+    f"tmp={tilelang_env.TILELANG_TMP_DIR}",
+    flush=True,
+)
 PY
     echo "DS4_GRPO_CONFIG_COMPOSE_PASSED source=${MLITE_COMMIT} vllm_cache_root=${VLLM_CACHE_ROOT} tilelang_cache_dir=${TILELANG_CACHE_DIR}"
   fi

@@ -196,6 +196,7 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "from tilelang import env as tilelang_env" in script
     assert "tilelang_env.TILELANG_CACHE_DIR" in script
     assert "tilelang_env.TILELANG_TMP_DIR" in script
+    assert "DS4_TILELANG_CACHE_PREFLIGHT_PASSED" in script
     assert "vllm_cache_root=${VLLM_CACHE_ROOT}" in script
     assert "tilelang_cache_dir=${TILELANG_CACHE_DIR}" in script
     assert '"use_legacy_worker_impl: disable"' in script
