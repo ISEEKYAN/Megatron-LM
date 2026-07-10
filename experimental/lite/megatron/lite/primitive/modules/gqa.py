@@ -93,6 +93,23 @@ class GQAttention(nn.Module):
             eps=rms_norm_eps,
             zero_centered_gamma=zero_centered_gamma,
         )
+        if self._qkv_layout == "mcore":
+            q_projection_size = ensure_divisible(
+                self.num_heads_local, self.num_kv_heads_local
+            ) * self.head_dim
+            if self._output_gate:
+                qkv_split_shapes = [
+                    q_projection_size,
+                    q_projection_size,
+                    self.head_dim,
+                    self.head_dim,
+                ]
+            else:
+                qkv_split_shapes = [q_projection_size, self.head_dim, self.head_dim]
+            qkv_weight = self.qkv.linear.weight
+            if qkv_weight.dim() == 2 and qkv_weight.shape[0] % sum(qkv_split_shapes) == 0:
+                qkv_weight.is_qkv = True
+                qkv_weight.qkv_split_shapes = qkv_split_shapes
         self.q_norm = te.RMSNorm(
             head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
         )

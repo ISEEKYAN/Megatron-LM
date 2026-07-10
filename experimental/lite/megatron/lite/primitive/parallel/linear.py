@@ -285,6 +285,7 @@ class VocabParallelEmbedding(nn.Module):
         self.vocab_start = self.tp_rank * self.local_vocab
         self.vocab_end = self.vocab_start + self.local_vocab
         self.embedding = nn.Embedding(self.local_vocab, hidden_size)
+        self.embedding.weight.is_embedding_or_output_parameter = True
         self.tp_group = ps.tp_group
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -354,6 +355,7 @@ class VocabParallelOutput(nn.Module):
         # GPTModel where final_layernorm runs on SP-sharded hiddens and
         # output_layer gathers internally + reduce-scatters on backward).
         self.col = _ColForLMHead(hidden_size, padded_vocab, ps, backend=backend, sp=ps.tp_size > 1)
+        self.col.linear.weight.is_embedding_or_output_parameter = True
         self.padded_vocab = padded_vocab
         self.local_vocab = padded_vocab // ps.tp_size
         self.vocab_size = vocab_size

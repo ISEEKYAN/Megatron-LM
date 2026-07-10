@@ -33,6 +33,7 @@ def test_tp_vocab_embedding_and_output_single_rank_contract(transformer_engine_i
     assert pad_vocab_for_tp(129, 2) == 256
 
     embedding = VocabParallelEmbedding(5, 3, ps, deterministic=True)
+    assert embedding.embedding.weight.is_embedding_or_output_parameter is True
     with torch.no_grad():
         values = torch.arange(embedding.local_vocab * 3, dtype=torch.float32).view(
             embedding.local_vocab, 3
@@ -46,6 +47,7 @@ def test_tp_vocab_embedding_and_output_single_rank_contract(transformer_engine_i
     torch.testing.assert_close(output[:, 0], values[input_ids[0]])
 
     head = VocabParallelOutput(5, 3, ps)
+    assert head.col.linear.weight.is_embedding_or_output_parameter is True
     logits = head(torch.ones(2, 1, 3, dtype=torch.bfloat16))
     gathered = head.gather(logits)
 

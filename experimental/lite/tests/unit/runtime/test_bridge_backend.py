@@ -106,6 +106,26 @@ def test_bridge_builds_mcore_ddp_config_object(monkeypatch):
     assert ddp_config.bucket_size == 1024
 
 
+def test_bridge_muon_optimizer_requires_complete_lowering(monkeypatch):
+    from megatron.lite.runtime.backends.bridge.config import BridgeConfig
+    from megatron.lite.runtime.backends.bridge.runtime import _build_optimizer
+    from megatron.lite.runtime.contracts.config import OptimizerConfig
+
+    def unexpected_optimizer_build(**_kwargs):
+        pytest.fail("Bridge must reject Muon before calling Megatron optimizer")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.optimizer",
+        types.SimpleNamespace(get_megatron_optimizer=unexpected_optimizer_build),
+    )
+
+    with pytest.raises(ValueError, match="complete.*lowering"):
+        _build_optimizer(
+            [], BridgeConfig(optimizer=OptimizerConfig(optimizer="muon"))
+        )
+
+
 def test_bridge_deterministic_provider_sets_te_env(monkeypatch):
     from megatron.lite.runtime.backends.bridge.config import BridgeConfig
     from megatron.lite.runtime.backends.bridge.runtime import _configure_provider
