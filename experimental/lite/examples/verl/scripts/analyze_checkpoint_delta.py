@@ -84,6 +84,7 @@ def classify_parameter_family(name: str) -> str:
         token in lowered
         for token in (
             ".self_attn.",
+            ".self_attention.",
             ".linear_attn.",
             ".attention.",
             ".attn.",

@@ -27,6 +27,10 @@ def test_classify_parameter_family_uses_exported_names() -> None:
     assert classify("model.embed_tokens.weight") == "embedding"
     assert classify("model.layers.0.self_attn.q_proj.weight") == "attention"
     assert classify("model.layers.0.linear_attn.in_proj_qkv.weight") == "attention"
+    assert (
+        classify("model.0.module.layers.0.self_attention.linear_qkv.weight")
+        == "attention"
+    )
     assert classify("model.layers.0.mlp.experts.3.down_proj.weight") == "expert"
     assert classify("model.layers.0.mlp.gate.weight") == "router"
     assert classify("model.layers.0.mlp.shared_expert_gate.weight") == "router"
