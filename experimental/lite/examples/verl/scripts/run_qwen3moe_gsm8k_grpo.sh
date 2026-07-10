@@ -115,8 +115,8 @@ RESUME_MODE="${RESUME_MODE:-auto}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
 LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-10}"
 LOGGER="${LOGGER:-[console,file]}"
-# Recent VERL always uses the unified engine workers; the launcher sets no
-# worker-path override.
+# MLite is an EngineRegistry backend and therefore requires VERL's unified
+# engine worker path instead of the legacy strategy-specific dispatcher.
 DRY_RUN="${DRY_RUN:-0}"
 COMPOSE_ONLY="${COMPOSE_ONLY:-0}"
 EXTRA_ARGS=("$@")
@@ -276,6 +276,7 @@ fi
 
 TRAINER=(
   "critic.enable=False"
+  "trainer.use_legacy_worker_impl=disable"
   "trainer.balance_batch=True"
   "trainer.logger=${LOGGER}"
   "trainer.project_name=${PROJECT_NAME}"

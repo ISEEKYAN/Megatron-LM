@@ -97,6 +97,7 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
     assert "actor_rollout_ref.rollout.tensor_model_parallel_size=16" in command
     assert "actor_rollout_ref.rollout.load_format=dummy" in command
     assert "trainer.total_training_steps=3" in command
+    assert "trainer.use_legacy_worker_impl=disable" in command
     assert "--cfg job" in command
 
 
@@ -131,6 +132,7 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "CONFIG_ONLY" in script
     assert "RAY_ONLY" in script
     assert "DS4_GRPO_CONFIG_COMPOSE_PASSED" in script
+    assert '"use_legacy_worker_impl: disable"' in script
     assert "DS4_RAY_CLUSTER_PASSED" in script
     assert "DS4_RAY_JOB_RUNTIME_ENV_PASSED" in script
     assert script.index("RUNTIME_ENV_JSON=$(") < script.index(

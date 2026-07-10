@@ -154,6 +154,7 @@ required = [
     "resync_format: vllm_checkpoint",
     "expert_dtype: fp8",
     "recompute: full",
+    "use_legacy_worker_impl: disable",
 ]
 missing = [marker for marker in required if marker not in config]
 if missing:
