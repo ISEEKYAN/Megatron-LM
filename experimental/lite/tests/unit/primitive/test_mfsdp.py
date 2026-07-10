@@ -16,7 +16,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
-from megatron.lite.primitive.optimizers.mfsdp import allocator as mfsdp_allocator
 from megatron.lite.primitive.optimizers.mfsdp import buffer as mfsdp_buffer
 from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
 from megatron.lite.primitive.optimizers import get_optimizer_backend
@@ -134,6 +133,25 @@ def test_mfsdp_is_standalone_without_vendored_mcore_or_fsdp2_dependencies():
     assert violations == []
 
 
+def test_mfsdp_source_layout_is_bounded():
+    package = Path(mfsdp_config.__file__).parent
+    modules = {path.name for path in package.glob("*.py")}
+
+    assert modules == {
+        "__init__.py",
+        "backend.py",
+        "buffer.py",
+        "config.py",
+        "fully_shard.py",
+        "fused_ops.py",
+        "grad_norm.py",
+        "optimizer.py",
+        "wrapper.py",
+    }
+    assert len(modules) <= 9
+    assert not (package / "impl").exists()
+
+
 def test_mfsdp_primitive_has_no_model_specific_knowledge():
     package = Path(mfsdp_config.__file__).parent
     violations = []
@@ -164,16 +182,13 @@ def test_mfsdp_config_validation_does_not_require_or_filter_model_name():
 def test_mfsdp_reference_rewrite_modules_are_live():
     package = Path(mfsdp_config.__file__).parent
     required_modules = {
-        "allocator.py",
         "backend.py",
         "buffer.py",
+        "config.py",
         "fully_shard.py",
-        "metadata.py",
-        "mixed_precision.py",
-        "patches.py",
-        "pipeline.py",
-        "process_groups.py",
-        "uneven_dtensor.py",
+        "fused_ops.py",
+        "grad_norm.py",
+        "optimizer.py",
         "wrapper.py",
     }
     missing = sorted(
@@ -299,6 +314,51 @@ def test_mfsdp_config_rejects_unsupported_optimizer():
         mfsdp_config.validate_mfsdp_config(engine_cfg)
 
 
+def test_mfsdp_accepts_an_optional_optimizer_factory():
+    model = _GlooModel()
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        etp_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="muon",
+        lr=1.0e-3,
+        weight_decay=0.0,
+        clip_grad=1.0,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    calls = []
+
+    def optimizer_factory(param_groups, optimizer_config):
+        calls.append((param_groups, optimizer_config))
+        return torch.optim.SGD(param_groups, lr=optimizer_config.lr)
+
+    chunks = [model]
+    optimizer, finalize_grads = mfsdp_optimizer.build_mfsdp_training_optimizer(
+        chunks,
+        impl_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer_config=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_GlooUnit,),
+        optimizer_factory=optimizer_factory,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1] is opt
+    assert isinstance(optimizer._inner_optimizer.optimizer, torch.optim.SGD)
+    finalize_grads()
+
+
 def test_mfsdp_config_enables_double_buffer_for_nccl_user_buffers():
     config = mfsdp_config.build_mfsdp_config(
         SimpleNamespace(
@@ -319,8 +379,8 @@ def test_mfsdp_nccl_user_buffer_falls_back_when_apex_is_missing(monkeypatch):
     def missing_apex(_name):
         raise ImportError("optional allocator missing")
 
-    monkeypatch.setattr(mfsdp_allocator.importlib, "import_module", missing_apex)
-    user_buffer = mfsdp_allocator.NCCLUserBuffer(
+    monkeypatch.setattr(mfsdp_buffer.importlib, "import_module", missing_apex)
+    user_buffer = mfsdp_buffer.NCCLUserBuffer(
         enabled=True,
         groups=(),
         symmetric=True,

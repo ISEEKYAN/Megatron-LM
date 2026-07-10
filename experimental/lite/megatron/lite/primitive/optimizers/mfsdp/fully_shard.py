@@ -7,8 +7,10 @@ from collections.abc import Callable, Iterable
 
 import torch.nn as nn
 
-from megatron.lite.primitive.optimizers.mfsdp.config import MFSDPConfig
-from megatron.lite.primitive.optimizers.mfsdp.process_groups import MFSDPProcessGroups
+from megatron.lite.primitive.optimizers.mfsdp.config import (
+    MFSDPConfig,
+    MFSDPProcessGroups,
+)
 from megatron.lite.primitive.optimizers.mfsdp.wrapper import MegatronFSDP
 
 

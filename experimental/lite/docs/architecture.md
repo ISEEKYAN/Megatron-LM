@@ -37,6 +37,16 @@ The model protocol owns:
 - Model-specific optimizer construction.
 - HF checkpoint load/export mapping.
 
+## M-FSDP Optimizer Algorithm Seam
+
+The M-FSDP primitive owns parameter, gradient, and optimizer-state sharding;
+the optimizer algorithm is an orthogonal injection point. Adam is the default,
+and SGD is built in. A caller may pass `optimizer_factory` to
+`build_mfsdp_training_optimizer` for an optional algorithm such as Muon. The
+factory receives the sharded main-parameter groups and optimizer config and
+must return a `torch.optim.Optimizer`-compatible object. It must not wrap the
+model or replace the M-FSDP all-gather/reduce-scatter lifecycle.
+
 ## Current Deliberate Omissions
 
 This package currently includes only the lite model implementation path. It

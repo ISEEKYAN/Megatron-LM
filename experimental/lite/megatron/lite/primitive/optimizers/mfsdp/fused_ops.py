@@ -5,17 +5,34 @@ from __future__ import annotations
 
 import importlib
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import torch
 
 logger = logging.getLogger(__name__)
 
+OptimizerFactory = Callable[
+    [list[dict[str, Any]], Any],
+    torch.optim.Optimizer,
+]
+
 
 def build_optimizer(
     param_groups: list[dict[str, Any]],
     opt: Any,
+    *,
+    optimizer_factory: OptimizerFactory | None = None,
 ) -> torch.optim.Optimizer:
+    """Build the optimizer algorithm independently from M-FSDP sharding.
+
+    ``optimizer_factory`` receives already-sharded main parameter groups (FP32
+    by default) plus the original optimizer config. Optional algorithms such as
+    Muon can regroup them without changing the M-FSDP communication path.
+    """
+    if optimizer_factory is not None:
+        return optimizer_factory(param_groups, opt)
+
     optimizer_name = str(getattr(opt, "optimizer", "adam"))
     lr = float(getattr(opt, "lr", 1.0e-4))
     weight_decay = float(getattr(opt, "weight_decay", 0.01))
@@ -103,4 +120,4 @@ def _has_cuda_params(param_groups: list[dict[str, Any]]) -> bool:
     )
 
 
-__all__ = ["build_optimizer"]
+__all__ = ["OptimizerFactory", "build_optimizer"]
