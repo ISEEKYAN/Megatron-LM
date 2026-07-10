@@ -76,6 +76,8 @@ def classify_parameter_family(name: str) -> str:
         return "router"
     if any(token in lowered for token in (".experts.", ".expert.", "shared_expert")):
         return "expert"
+    if "norm" in lowered:
+        return "norm"
     if any(
         token in lowered
         for token in (
@@ -90,8 +92,6 @@ def classify_parameter_family(name: str) -> str:
         )
     ):
         return "attention"
-    if "norm" in lowered:
-        return "norm"
     if any(token in lowered for token in (".mlp.", "feed_forward", ".ffn.")):
         return "dense_mlp"
     return "other"
@@ -178,7 +178,11 @@ def _block_fp8_target_statistics(
     exact_changed_count: int,
 ) -> dict[str, object]:
     family = classify_parameter_family(name)
-    if family not in set(quantized_families):
+    if (
+        family not in set(quantized_families)
+        or not name.endswith(".weight")
+        or before.ndim < 2
+    ):
         dtype_name = _target_dtype_name(before.dtype)
         return _direct_target_statistics(
             exact_changed_count,

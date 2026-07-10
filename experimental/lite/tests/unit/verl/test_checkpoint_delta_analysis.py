@@ -32,6 +32,7 @@ def test_classify_parameter_family_uses_exported_names() -> None:
     assert classify("model.layers.0.mlp.shared_expert_gate.weight") == "router"
     assert classify("model.layers.0.mlp.shared_expert.gate_proj.weight") == "expert"
     assert classify("model.layers.0.input_layernorm.weight") == "norm"
+    assert classify("model.layers.0.self_attn.q_norm.weight") == "norm"
     assert classify("lm_head.weight") == "head"
     assert classify("model.module.output_layer.weight") == "head"
 
