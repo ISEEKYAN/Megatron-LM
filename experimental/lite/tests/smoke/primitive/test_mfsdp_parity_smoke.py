@@ -939,6 +939,13 @@ class _MCoreReferenceOptimizer:
             for name, state in self.moment_states.items()
         }
 
+    def prepare_model_snapshot(self) -> None:
+        for chunk in self.model_chunks:
+            chunk._replace_param_with_raw_if_needed()
+            chunk.all_gather_and_wait_parameters_ready(
+                params=list(chunk.module.parameters()), prefetch=False
+            )
+
     def _grad_norm(self, grads: dict[str, torch.Tensor]) -> float:
         total = torch.zeros((), device="cuda", dtype=torch.float64)
         params_by_name = {
@@ -1613,14 +1620,35 @@ def _run_full_parallel_precision(monkeypatch, *, batch_mode: str):
                 )
 
         if checkpoint:
+            if dist.get_rank() == 0:
+                print(
+                    f"[MFSDP_CHECKPOINT_PHASE] step={step_number} phase=params_start",
+                    flush=True,
+                )
+            for backend in _PRECISION_BACKENDS:
+                prepare_snapshot = getattr(
+                    handles[backend]._optimizer, "prepare_model_snapshot", None
+                )
+                if callable(prepare_snapshot):
+                    prepare_snapshot()
             param_snapshots = {
                 backend: _named_model_tensors(handles[backend]._extras["model_chunks"])
                 for backend in _PRECISION_BACKENDS
             }
+            if dist.get_rank() == 0:
+                print(
+                    f"[MFSDP_CHECKPOINT_PHASE] step={step_number} phase=states_start",
+                    flush=True,
+                )
             state_snapshots = {
                 backend: _named_optimizer_states(handles[backend]._optimizer)
                 for backend in _PRECISION_BACKENDS
             }
+            if dist.get_rank() == 0:
+                print(
+                    f"[MFSDP_CHECKPOINT_PHASE] step={step_number} phase=evidence_start",
+                    flush=True,
+                )
             for reference_name in ("mcore_mfsdp", "fsdp2"):
                 for kind, snapshots in (
                     ("gradient", grad_snapshots),

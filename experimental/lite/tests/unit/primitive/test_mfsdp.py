@@ -136,6 +136,8 @@ def test_mfsdp_precision_signoff_uses_mcore_primary_and_full_tensor_evidence():
     assert "param.register_hook(capture_grad)" in smoke_source
     assert "moment_states" in smoke_source
     assert "[MFSDP_OPTIMIZER_LOCAL_STATE]" in smoke_source
+    assert "prepare_model_snapshot" in smoke_source
+    assert "all_gather_and_wait_parameters_ready" in smoke_source
     assert 'batch_mode="matched"' in smoke_source
     assert 'batch_mode="fixed"' in smoke_source
     assert "fixed-batch)" in runner_source
