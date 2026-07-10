@@ -25,11 +25,11 @@ case "${MODE}" in
     TEST_EXPR="throughput_exceeds_fsdp2"
     ;;
   full-parallel)
-    if [[ "${NNODES}" != "2" || "${NPROC_PER_NODE}" != "8" ]]; then
-      echo "full-parallel mode requires NNODES=2 and NPROC_PER_NODE=8." >&2
+    if [[ "${NNODES}" != "1" || "${NPROC_PER_NODE}" != "8" ]]; then
+      echo "full-parallel mode requires NNODES=1 and NPROC_PER_NODE=8." >&2
       exit 2
     fi
-    TEST_EXPR="full_parallel_short_train"
+    TEST_EXPR="full_parallel_precision_curve"
     ;;
   *)
     echo "usage: $0 {throughput|full-parallel}" >&2

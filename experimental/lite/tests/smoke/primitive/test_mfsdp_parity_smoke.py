@@ -42,8 +42,9 @@ _BENCH_WARMUP_STEPS = 5
 _BENCH_MEASURE_STEPS = 20
 _BENCH_TOKENS_PER_RANK = 1024
 _MIN_SPEEDUP = 1.0
-_FULL_PARALLEL_WORLD_SIZE = 16
-_FULL_PARALLEL_STEPS = 3
+_FULL_PARALLEL_WORLD_SIZE = 8
+_FULL_PARALLEL_STEPS = 50
+_FULL_PARALLEL_CURVE_INTERVAL = 10
 _FULL_PARALLEL_MICROBATCHES = 2
 _FULL_PARALLEL_SEQ_LEN = 64
 
@@ -141,7 +142,7 @@ def _cuda_dist():
         )
     if world_size > _FULL_PARALLEL_WORLD_SIZE:
         pytest.skip(
-            "M-FSDP smoke tests support at most the dedicated 16-rank full-parallel signoff."
+            "M-FSDP smoke tests support at most the dedicated 8-rank full-parallel signoff."
         )
 
     os.environ.setdefault("RANK", "0")
@@ -354,11 +355,17 @@ def _timed_train_step(chunks, optimizer, finalize, x, target) -> float:
     return float(elapsed)
 
 
-def _max_relative_difference(lhs: list[float], rhs: list[float]) -> float:
-    return max(
+def _relative_difference_curve(lhs: list[float], rhs: list[float]) -> list[float]:
+    assert len(lhs) == len(rhs)
+    assert lhs
+    return [
         abs(left - right) / max(abs(left), abs(right), 1.0e-12)
         for left, right in zip(lhs, rhs)
-    )
+    ]
+
+
+def _max_relative_difference(lhs: list[float], rhs: list[float]) -> float:
+    return max(_relative_difference_curve(lhs, rhs))
 
 
 def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -929,14 +936,12 @@ def _max_snapshot_abs_diff(
     return max(float((lhs[name] - rhs[name]).abs().max()) for name in lhs)
 
 
-def test_mfsdp_matches_fsdp2_full_parallel_short_train(monkeypatch):
+def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
     if dist.get_world_size() != _FULL_PARALLEL_WORLD_SIZE:
-        pytest.skip(
-            "M-FSDP TP2/EP2/PP2/CP2 signoff requires exactly 16 ranks across two nodes."
-        )
+        pytest.skip("M-FSDP TP2/EP2/ETP1/PP2/CP2 signoff requires exactly 8 ranks.")
 
-    if int(os.environ.get("SLURM_NNODES", "0")) != 2:
-        pytest.fail("M-FSDP full-parallel signoff requires exactly two Slurm nodes.")
+    if int(os.environ.get("SLURM_NNODES", "0")) != 1:
+        pytest.fail("M-FSDP full-parallel signoff requires exactly one Slurm node.")
 
     try:
         import transformer_engine.pytorch as te
@@ -1011,15 +1016,18 @@ def test_mfsdp_matches_fsdp2_full_parallel_short_train(monkeypatch):
         full_tokens == 2 * local_tokens for full_tokens, local_tokens in cp_splits
     )
 
-    max_loss_rel_diff = torch.tensor(
-        _max_relative_difference(losses["fsdp2"], losses["mfsdp"]), device="cuda"
-    )
-    max_grad_norm_rel_diff = torch.tensor(
-        _max_relative_difference(grad_norms["fsdp2"], grad_norms["mfsdp"]),
+    loss_rel_curve = torch.tensor(
+        _relative_difference_curve(losses["fsdp2"], losses["mfsdp"]),
         device="cuda",
     )
-    dist.all_reduce(max_loss_rel_diff, op=dist.ReduceOp.MAX)
-    dist.all_reduce(max_grad_norm_rel_diff, op=dist.ReduceOp.MAX)
+    grad_norm_rel_curve = torch.tensor(
+        _relative_difference_curve(grad_norms["fsdp2"], grad_norms["mfsdp"]),
+        device="cuda",
+    )
+    dist.all_reduce(loss_rel_curve, op=dist.ReduceOp.MAX)
+    dist.all_reduce(grad_norm_rel_curve, op=dist.ReduceOp.MAX)
+    max_loss_rel_diff = loss_rel_curve.max()
+    max_grad_norm_rel_diff = grad_norm_rel_curve.max()
 
     if dist.get_rank() == 0:
         ps = fsdp2_handle._parallel_state
@@ -1039,6 +1047,22 @@ def test_mfsdp_matches_fsdp2_full_parallel_short_train(monkeypatch):
             f"cp_split_calls={len(cp_splits)}",
             flush=True,
         )
+        for curve_index in range(
+            _FULL_PARALLEL_CURVE_INTERVAL - 1,
+            _FULL_PARALLEL_STEPS,
+            _FULL_PARALLEL_CURVE_INTERVAL,
+        ):
+            print(
+                "[MFSDP_FULL_PARALLEL_CURVE] "
+                f"step={curve_index + 1} "
+                f"loss_rel_diff={float(loss_rel_curve[curve_index]):.8e} "
+                f"grad_norm_rel_diff={float(grad_norm_rel_curve[curve_index]):.8e} "
+                f"loss_fsdp2={losses['fsdp2'][curve_index]:.8f} "
+                f"loss_mfsdp={losses['mfsdp'][curve_index]:.8f} "
+                f"grad_norm_fsdp2={grad_norms['fsdp2'][curve_index]:.8f} "
+                f"grad_norm_mfsdp={grad_norms['mfsdp'][curve_index]:.8f}",
+                flush=True,
+            )
         for backend in ("fsdp2", "mfsdp"):
             trace = traces[backend]
             print(
@@ -1048,6 +1072,8 @@ def test_mfsdp_matches_fsdp2_full_parallel_short_train(monkeypatch):
                 flush=True,
             )
 
+    assert torch.isfinite(loss_rel_curve).all()
+    assert torch.isfinite(grad_norm_rel_curve).all()
     assert float(max_loss_rel_diff) <= _LOSS_REL_TOL
     assert float(max_grad_norm_rel_diff) <= _LOSS_REL_TOL
     assert losses["fsdp2"][-1] < losses["fsdp2"][0]

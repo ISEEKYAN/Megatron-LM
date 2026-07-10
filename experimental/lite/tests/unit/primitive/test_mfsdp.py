@@ -131,6 +131,28 @@ def test_mfsdp_standalone_smoke_has_no_megatron_core_imports():
     assert violations == []
 
 
+def test_mfsdp_full_parallel_signoff_is_single_node_50_step_curve():
+    tests_root = Path(__file__).parents[2]
+    smoke_path = tests_root / "smoke" / "primitive" / "test_mfsdp_parity_smoke.py"
+    smoke_source = smoke_path.read_text()
+    smoke_tree = ast.parse(smoke_source, filename=str(smoke_path))
+    constants = {}
+    for node in smoke_tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant):
+            constants[target.id] = node.value.value
+
+    assert constants["_FULL_PARALLEL_WORLD_SIZE"] == 8
+    assert constants["_FULL_PARALLEL_STEPS"] == 50
+    assert constants["_FULL_PARALLEL_CURVE_INTERVAL"] == 10
+    assert "[MFSDP_FULL_PARALLEL_CURVE]" in smoke_source
+
+    runner_source = (tests_root / "run_mfsdp_hopper_validation.sh").read_text()
+    assert "full-parallel mode requires NNODES=1 and NPROC_PER_NODE=8." in runner_source
+
+
 def test_mfsdp_is_standalone_without_vendored_mcore_or_fsdp2_dependencies():
     package = Path(mfsdp_config.__file__).parent
 
