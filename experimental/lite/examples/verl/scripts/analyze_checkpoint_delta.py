@@ -109,6 +109,10 @@ def _layer_depth(index: int | None, layer_count: int) -> str:
     return ("shallow", "middle", "deep")[bucket]
 
 
+def _is_weight_tensor_name(name: str) -> bool:
+    return name.endswith(".weight") or re.search(r"\.weight\d+$", name) is not None
+
+
 def _quantize_block_fp8(
     tensor: torch.Tensor, block_shape: tuple[int, int]
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -180,7 +184,7 @@ def _block_fp8_target_statistics(
     family = classify_parameter_family(name)
     if (
         family not in set(quantized_families)
-        or not name.endswith(".weight")
+        or not _is_weight_tensor_name(name)
         or before.ndim < 2
     ):
         dtype_name = _target_dtype_name(before.dtype)

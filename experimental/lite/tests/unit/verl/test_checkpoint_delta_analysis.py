@@ -115,6 +115,22 @@ def test_tensor_delta_statistics_keeps_unquantized_head_in_target_format() -> No
     assert fp8["serialized_bytes"] == stats["dense_bytes"]
 
 
+def test_tensor_delta_statistics_quantizes_dcp_local_expert_weight_name() -> None:
+    before = torch.zeros((2, 2), dtype=torch.bfloat16)
+    after = before.clone()
+    after[0, 0] = 1.0
+
+    stats = delta_analysis.tensor_delta_statistics(
+        "model.module.layers.0.moe.experts.fc1.weight4",
+        before,
+        after,
+        fp8_block_shape=(2, 2),
+    )
+
+    assert stats["family"] == "expert"
+    assert stats["target_formats"]["block_fp8"]["kind"] == "quantized"
+
+
 def test_analyze_safetensor_checkpoints_aggregates_families_and_bytes(tmp_path) -> None:
     before = tmp_path / "before"
     after = tmp_path / "after"
