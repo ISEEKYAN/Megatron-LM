@@ -89,6 +89,10 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
     assert "actor_rollout_ref.actor.engine.impl_cfg.recompute=full" in command
     assert "actor_rollout_ref.actor.engine.impl_cfg.mtp_enable_train=True" in command
     assert "actor_rollout_ref.model.use_fused_kernels=True" in command
+    assert "actor_rollout_ref.model.custom_chat_template=" in command
+    runner = RUNNER.read_text()
+    assert "<｜User｜>" in runner
+    assert "<｜Assistant｜>" in runner
     assert "+actor_rollout_ref.actor.engine.cross_entropy_fusion=True" in command
     assert "actor_rollout_ref.actor.engine.resync_format=vllm_checkpoint" in command
     assert "actor_rollout_ref.actor.engine.resync_config.expert_dtype=fp8" in command
@@ -133,6 +137,9 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "RAY_ONLY" in script
     assert "DS4_GRPO_CONFIG_COMPOSE_PASSED" in script
     assert '"use_legacy_worker_impl: disable"' in script
+    assert '"custom_chat_template: null"' in script
+    assert '"<｜User｜>"' in script
+    assert '"<｜Assistant｜>"' in script
     assert "DS4_RAY_CLUSTER_PASSED" in script
     assert "DS4_RAY_JOB_RUNTIME_ENV_PASSED" in script
     assert script.index("RUNTIME_ENV_JSON=$(") < script.index(

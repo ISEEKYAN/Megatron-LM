@@ -161,10 +161,15 @@ required = [
     "expert_dtype: fp8",
     "recompute: full",
     "use_legacy_worker_impl: disable",
+    "custom_chat_template:",
+    "<｜User｜>",
+    "<｜Assistant｜>",
 ]
 missing = [marker for marker in required if marker not in config]
 if missing:
     raise SystemExit(f"resolved DS4 GRPO config is missing markers: {missing}")
+if "custom_chat_template: null" in config:
+    raise SystemExit("resolved DS4 GRPO config has no chat template")
 for forbidden in (
     "Error in sitecustomize",
     "Failed to import Triton kernels",

@@ -48,7 +48,19 @@ export VLLM_USE_V1="${VLLM_USE_V1:-1}"
 export VERL_VLLM_FP8_QUANT_ENABLED=0
 export RUN_NAME="${RUN_NAME:-ds4_gsm8k_grpo_pp${ACTOR_PP}_ep${ACTOR_EP}_cp${ACTOR_CP}_rtp${ROLLOUT_TP}}"
 
+DS4_CHAT_TEMPLATE='{{ bos_token }}{% for message in messages %}'
+DS4_CHAT_TEMPLATE+='{% if message["role"] == "user" %}'
+DS4_CHAT_TEMPLATE+='{{ "<｜User｜>" + message["content"] }}'
+DS4_CHAT_TEMPLATE+='{% elif message["role"] == "assistant" %}'
+DS4_CHAT_TEMPLATE+='{{ "<｜Assistant｜>" + message["content"] + eos_token }}'
+DS4_CHAT_TEMPLATE+='{% else %}'
+DS4_CHAT_TEMPLATE+='{{ raise_exception("unsupported chat role: " + message["role"]) }}'
+DS4_CHAT_TEMPLATE+='{% endif %}{% endfor %}'
+DS4_CHAT_TEMPLATE+='{% if add_generation_prompt %}{{ "<｜Assistant｜>" }}{% endif %}'
+readonly DS4_CHAT_TEMPLATE
+
 exec bash "${GRPO_RUNNER}" \
+  "actor_rollout_ref.model.custom_chat_template='${DS4_CHAT_TEMPLATE}'" \
   "+actor_rollout_ref.actor.engine.cross_entropy_fusion=True" \
   "actor_rollout_ref.actor.engine.resync_format=vllm_checkpoint" \
   "+actor_rollout_ref.actor.engine.resync_config.expert_dtype=fp8" \
