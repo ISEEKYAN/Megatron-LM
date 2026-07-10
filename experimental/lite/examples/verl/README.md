@@ -181,6 +181,10 @@ job then validates continuous JSONL steps, finite reward and policy loss,
 positive actor gradient norm, reward variation, and positive per-GPU token
 throughput before printing `DS4_GRPO_RUN_COMPLETE`.
 
+The rollout tensor-parallel size defaults to 8 and must divide the checkpoint's
+`o_groups`. This keeps every vLLM rank responsible for at least one output BMM
+group during FP8 dummy initialization.
+
 The Slurm script creates deterministic arithmetic prompts in the canonical
 GSM8K parquet schema. This is a network-independent mechanism smoke dataset,
 not a claim to reproduce the public GSM8K benchmark distribution. Supply
@@ -193,7 +197,7 @@ allocation and topology at submission:
 
 ```bash
 sbatch --partition=batch --nodes=8 --time=04:00:00 \
-  --export=ALL,ACTOR_PP=2,ACTOR_EP=8,ACTOR_CP=2,ROLLOUT_TP=16,PHASE1_STEPS=3,TOTAL_STEPS=6 \
+  --export=ALL,ACTOR_PP=2,ACTOR_EP=8,ACTOR_CP=2,ROLLOUT_TP=8,PHASE1_STEPS=3,TOTAL_STEPS=6 \
   experimental/lite/examples/verl/slurm/run_ds4_gsm8k_grpo.sbatch
 ```
 

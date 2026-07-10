@@ -60,9 +60,14 @@ def test_math_smoke_rows_follow_verl_gsm8k_schema() -> None:
 
 
 def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> None:
+    model_path = tmp_path / "mixed-model"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4", "o_groups": 8})
+    )
     env = {
         **os.environ,
-        "MODEL_PATH": str(tmp_path / "mixed-model"),
+        "MODEL_PATH": str(model_path),
         "TRAIN_FILES": str(tmp_path / "train.parquet"),
         "VAL_FILES": str(tmp_path / "test.parquet"),
         "OUTPUT_ROOT": str(tmp_path / "output"),
@@ -73,7 +78,7 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
         "ACTOR_PP": "2",
         "ACTOR_EP": "8",
         "ACTOR_CP": "2",
-        "ROLLOUT_TP": "16",
+        "ROLLOUT_TP": "8",
         "TOTAL_TRAINING_STEPS": "3",
         "COMPOSE_ONLY": "1",
         "DRY_RUN": "1",
@@ -107,13 +112,45 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
     assert "actor_rollout_ref.actor.engine.resync_config.expert_dtype=fp8" in command
     assert "VllmCheckpointWorkerExtension" in command
     assert "hf_overrides.expert_dtype=fp8" in command
-    assert "actor_rollout_ref.rollout.tensor_model_parallel_size=16" in command
+    assert "DS4_ROLLOUT_TP_PREFLIGHT_PASSED" in command
+    assert "actor_rollout_ref.rollout.tensor_model_parallel_size=8" in command
     assert "actor_rollout_ref.rollout.gpu_memory_utilization=0.60" in command
     assert "actor_rollout_ref.rollout.load_format=dummy" in command
     assert "trainer.total_training_steps=3" in command
     assert "trainer.use_legacy_worker_impl=disable" in command
     assert f"hydra.run.dir={tmp_path / 'hydra/phase1'}" in command
     assert "--cfg job" in command
+
+
+def test_ds4_grpo_rejects_rollout_tp_larger_than_output_groups(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "mixed-model"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4", "o_groups": 8})
+    )
+    env = {
+        **os.environ,
+        "MODEL_PATH": str(model_path),
+        "TRAIN_FILES": str(tmp_path / "train.parquet"),
+        "VAL_FILES": str(tmp_path / "test.parquet"),
+        "OUTPUT_ROOT": str(tmp_path / "output"),
+        "ROLLOUT_TP": "16",
+        "COMPOSE_ONLY": "1",
+        "DRY_RUN": "1",
+    }
+
+    result = subprocess.run(
+        ["bash", str(RUNNER)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "o_groups=8 must be divisible by rollout_tp=16" in result.stderr
 
 
 def test_chat_template_dataset_sets_controller_tokenizer_before_loading(

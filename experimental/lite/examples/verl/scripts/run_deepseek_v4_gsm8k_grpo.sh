@@ -38,7 +38,7 @@ export PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-512}"
 export ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU="${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-512}"
 export ROLLOUT_N="${ROLLOUT_N:-4}"
 export ROLLOUT_MODE="async"
-export ROLLOUT_TP="${ROLLOUT_TP:-16}"
+export ROLLOUT_TP="${ROLLOUT_TP:-8}"
 export ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-384}"
 export ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-32}"
 export ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}"
@@ -48,6 +48,38 @@ export LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-0}"
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
 export VERL_VLLM_FP8_QUANT_ENABLED=0
 export RUN_NAME="${RUN_NAME:-ds4_gsm8k_grpo_pp${ACTOR_PP}_ep${ACTOR_EP}_cp${ACTOR_CP}_rtp${ROLLOUT_TP}}"
+
+python - "${MODEL_PATH}/config.json" "${ROLLOUT_TP}" <<'PY'
+import json
+import sys
+
+config_path, rollout_tp_text = sys.argv[1:]
+try:
+    rollout_tp = int(rollout_tp_text)
+except ValueError as error:
+    raise SystemExit(f"rollout_tp must be an integer, got {rollout_tp_text!r}") from error
+if rollout_tp < 1:
+    raise SystemExit(f"rollout_tp must be positive, got {rollout_tp}")
+
+try:
+    with open(config_path, encoding="utf-8") as config_file:
+        config = json.load(config_file)
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"cannot read DeepSeek V4 config {config_path}: {error}") from error
+
+o_groups = config.get("o_groups")
+if not isinstance(o_groups, int) or o_groups < 1:
+    raise SystemExit(f"DeepSeek V4 config has invalid o_groups={o_groups!r}")
+if o_groups % rollout_tp != 0:
+    raise SystemExit(
+        f"DeepSeek V4 o_groups={o_groups} must be divisible by rollout_tp={rollout_tp}"
+    )
+print(
+    "DS4_ROLLOUT_TP_PREFLIGHT_PASSED "
+    f"o_groups={o_groups} rollout_tp={rollout_tp} local_groups={o_groups // rollout_tp}",
+    flush=True,
+)
+PY
 
 DS4_CHAT_TEMPLATE='{{ bos_token }}{% for message in messages %}'
 DS4_CHAT_TEMPLATE+='{% if message["role"] == "user" %}'
