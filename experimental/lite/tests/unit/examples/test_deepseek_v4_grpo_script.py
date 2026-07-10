@@ -112,6 +112,7 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
     assert "actor_rollout_ref.actor.engine.resync_format=vllm_checkpoint" in command
     assert "actor_rollout_ref.actor.engine.resync_config.expert_dtype=fp8" in command
     assert "VllmCheckpointWorkerExtension" in command
+    assert "engine_kwargs.vllm.disable_custom_all_reduce=True" in command
     assert "hf_overrides.expert_dtype=fp8" in command
     assert "DS4_ROLLOUT_TP_PREFLIGHT_PASSED" in command
     assert "actor_rollout_ref.rollout.tensor_model_parallel_size=8" in command
@@ -364,6 +365,7 @@ def test_ds4_vllm_load_only_uses_production_fp8_shape(
 
     assert calls[0]["tensor_parallel_size"] == 8
     assert calls[0]["load_format"] == "dummy"
+    assert calls[0]["disable_custom_all_reduce"] is True
     assert calls[0]["hf_overrides"]["expert_dtype"] == "fp8"
     assert calls[0]["hf_overrides"]["quantization_config"]["weight_block_size"] == [
         128,

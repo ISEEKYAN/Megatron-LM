@@ -104,6 +104,7 @@ exec bash "${GRPO_RUNNER}" \
   "+actor_rollout_ref.actor.engine.impl_cfg.mtp_enable=True" \
   "+actor_rollout_ref.actor.engine.impl_cfg.mtp_enable_train=True" \
   "actor_rollout_ref.rollout.load_format=dummy" \
+  "+actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=True" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.worker_extension_cls=verl_mlite.rollout.verl_worker.VllmCheckpointWorkerExtension" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.expert_dtype=fp8" \

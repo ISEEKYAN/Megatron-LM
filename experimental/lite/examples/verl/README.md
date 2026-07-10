@@ -186,6 +186,9 @@ The rollout tensor-parallel size defaults to 8 and must divide the checkpoint's
 group during FP8 dummy initialization.
 Set `VLLM_LOAD_ONLY=1` on a one-node, eight-GPU allocation to run that dummy
 FP8 initialization without constructing the MLite actor or starting RL.
+Both the gate and the full rollout disable vLLM custom all-reduce so TP8
+communication uses NCCL; this does not change the training-side fused DSA
+attention path.
 
 The Slurm script creates deterministic arithmetic prompts in the canonical
 GSM8K parquet schema. This is a network-independent mechanism smoke dataset,

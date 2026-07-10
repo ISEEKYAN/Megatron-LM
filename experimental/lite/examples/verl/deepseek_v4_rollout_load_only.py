@@ -34,6 +34,7 @@ def main() -> None:
         max_model_len=384,
         max_num_seqs=32,
         max_num_batched_tokens=4096,
+        disable_custom_all_reduce=True,
         gpu_memory_utilization=float(
             os.environ.get("ROLLOUT_GPU_MEMORY_UTILIZATION", "0.60")
         ),
