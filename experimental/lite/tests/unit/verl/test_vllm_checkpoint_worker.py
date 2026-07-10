@@ -163,18 +163,18 @@ def test_transformers_vision2seq_alias_requires_v5_replacement(monkeypatch) -> N
     assert not hasattr(transformers, "AutoModelForVision2Seq")
 
 
-def test_transformers_alias_precedes_verl_importing_runtime_patches() -> None:
+def test_transformers_alias_is_restored_after_verl_vllm_imports() -> None:
     from verl_mlite import compat
 
     source = inspect.getsource(compat.apply_runtime_patches)
+    alias_call = "_patch_transformers_vision2seq_alias()"
+    uuid_call = "_patch_verl_vllm_device_uuid()"
 
-    assert source.index("_patch_transformers_vision2seq_alias()") < source.index(
-        "_register_opaque_hf_config()"
-    )
-    assert source.index("_patch_transformers_vision2seq_alias()") < source.index(
-        "_patch_verl_vllm_device_uuid()"
-    )
-    assert source.index("_patch_transformers_vision2seq_alias()") < source.index(
+    assert source.count(alias_call) == 2
+    assert source.index(alias_call) < source.index("_register_opaque_hf_config()")
+    assert source.index(alias_call) < source.index(uuid_call)
+    assert source.index(uuid_call) < source.rindex(alias_call)
+    assert source.rindex(alias_call) < source.index(
         "_patch_vllm_server_profile()"
     )
 
@@ -189,18 +189,26 @@ def test_runtime_patch_trace_reports_alias_lifetime(monkeypatch, capsys) -> None
         def __getattr__(self, name):
             raise AssertionError(f"trace triggered lazy lookup: {name}")
 
-    transformers = TransformersModule(AutoModelForImageTextToText=replacement)
-    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    initial_transformers = TransformersModule(
+        AutoModelForImageTextToText=replacement
+    )
+    replacement_transformers = TransformersModule(
+        AutoModelForImageTextToText=replacement
+    )
+    monkeypatch.setitem(sys.modules, "transformers", initial_transformers)
     monkeypatch.setenv("VERL_MLITE_RUNTIME_PATCH_TRACE", "1")
 
     def patch_alias():
         calls.append("transformers_alias")
-        transformers.AutoModelForVision2Seq = replacement
+        module = sys.modules["transformers"]
+        module.AutoModelForVision2Seq = vars(module)[
+            "AutoModelForImageTextToText"
+        ]
         return True
 
-    def remove_alias():
-        calls.append("vllm_triton_kernels_alias")
-        del transformers.AutoModelForVision2Seq
+    def replace_transformers():
+        calls.append("verl_vllm_device_uuid")
+        sys.modules["transformers"] = replacement_transformers
         return True
 
     monkeypatch.setattr(compat, "_patch_transformers_vision2seq_alias", patch_alias)
@@ -218,9 +226,13 @@ def test_runtime_patch_trace_reports_alias_lifetime(monkeypatch, capsys) -> None
     monkeypatch.setattr(
         compat, "_install_vllm_thin_finder", unchanged("vllm_thin_finder")
     )
-    monkeypatch.setattr(compat, "_install_vllm_triton_kernels_alias", remove_alias)
     monkeypatch.setattr(
-        compat, "_patch_verl_vllm_device_uuid", unchanged("verl_vllm_device_uuid")
+        compat,
+        "_install_vllm_triton_kernels_alias",
+        unchanged("vllm_triton_kernels_alias"),
+    )
+    monkeypatch.setattr(
+        compat, "_patch_verl_vllm_device_uuid", replace_transformers
     )
     monkeypatch.setattr(
         compat,
@@ -251,16 +263,31 @@ def test_runtime_patch_trace_reports_alias_lifetime(monkeypatch, capsys) -> None
         "03.vllm_thin_finder",
         "04.vllm_triton_kernels_alias",
         "05.verl_vllm_device_uuid",
-        "06.transformers_rope_ignore_keys",
-        "07.bucketed_weight_sender",
-        "08.vllm_server_profile",
-        "09.end",
+        "06.transformers_alias_after_uuid",
+        "07.transformers_rope_ignore_keys",
+        "08.bucketed_weight_sender",
+        "09.vllm_server_profile",
+        "10.end",
     ]
     assert records[1]["changed"] is True
     assert records[1]["alias_source"] == "namespace"
     assert records[1]["alias_is_replacement"] is True
-    assert records[4]["alias_source"] == "absent"
-    assert calls == [record["step"].split(".", 1)[1] for record in records[1:-1]]
+    assert records[5]["transformers_id"] == id(replacement_transformers)
+    assert records[5]["alias_source"] == "absent"
+    assert records[6]["changed"] is True
+    assert records[6]["alias_source"] == "namespace"
+    assert records[6]["alias_is_replacement"] is True
+    assert calls == [
+        "transformers_alias",
+        "opaque_hf_config",
+        "vllm_thin_finder",
+        "vllm_triton_kernels_alias",
+        "verl_vllm_device_uuid",
+        "transformers_alias",
+        "transformers_rope_ignore_keys",
+        "bucketed_weight_sender",
+        "vllm_server_profile",
+    ]
 
 
 def test_runtime_patch_trace_is_silent_by_default(monkeypatch, capsys) -> None:

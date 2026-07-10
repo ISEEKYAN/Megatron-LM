@@ -635,13 +635,17 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("04.vllm_triton_kernels_alias", result)
     result = _patch_verl_vllm_device_uuid()
     _trace_runtime_patch("05.verl_vllm_device_uuid", result)
+    # Importing VERL's vLLM utilities can rebuild Transformers' lazy top-level
+    # module, which drops compatibility attributes installed on the old module.
+    result = _patch_transformers_vision2seq_alias()
+    _trace_runtime_patch("06.transformers_alias_after_uuid", result)
     result = _patch_transformers_rope_ignore_keys()
-    _trace_runtime_patch("06.transformers_rope_ignore_keys", result)
+    _trace_runtime_patch("07.transformers_rope_ignore_keys", result)
     result = _patch_bucketed_weight_sender()
-    _trace_runtime_patch("07.bucketed_weight_sender", result)
+    _trace_runtime_patch("08.bucketed_weight_sender", result)
     result = _patch_vllm_server_profile()
-    _trace_runtime_patch("08.vllm_server_profile", result)
-    _trace_runtime_patch("09.end")
+    _trace_runtime_patch("09.vllm_server_profile", result)
+    _trace_runtime_patch("10.end")
 
 
 def _load_verl_file(relative_path: str, module_name: str):
