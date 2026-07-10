@@ -74,6 +74,22 @@ def _install_vllm_thin_finder() -> bool:
     return True
 
 
+def _patch_transformers_vision2seq_alias() -> bool:
+    """Restore the Transformers 4 vision auto-class name removed in v5."""
+    if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
+        return False
+
+    import transformers
+
+    if hasattr(transformers, "AutoModelForVision2Seq"):
+        return False
+    replacement = getattr(transformers, "AutoModelForImageTextToText", None)
+    if replacement is None:
+        return False
+    transformers.AutoModelForVision2Seq = replacement
+    return True
+
+
 def _install_vllm_triton_kernels_alias() -> bool:
     """Prefer the rollout vLLM's complete vendored Triton kernel package."""
     if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
@@ -91,6 +107,8 @@ def _vllm_server_profile_env() -> dict[str, str]:
     if not site:
         return {}
     pythonpath = os.environ.get("PYTHONPATH", "").strip()
+    # Keep vLLM's dependency closure on the thin site. The scoped compatibility
+    # alias above lets VERL import against that site's Transformers v5 build.
     result = {
         "PYTHONPATH": f"{site}:{pythonpath}" if pythonpath else site,
         "PYTHONNOUSERSITE": "1",
@@ -560,6 +578,7 @@ def _patch_transformers_rope_ignore_keys() -> None:
 
 
 def apply_runtime_patches() -> None:
+    _patch_transformers_vision2seq_alias()
     _register_opaque_hf_config()
     _install_vllm_thin_finder()
     _install_vllm_triton_kernels_alias()

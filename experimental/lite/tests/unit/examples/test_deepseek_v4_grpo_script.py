@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -225,10 +226,28 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
 
 def test_ds4_grpo_ray_only_probes_every_local_device_uuid_mapping() -> None:
     script = SBATCH.read_text()
+    ray_program = script.split("    python -c '\n", 1)[1].split(
+        "\n'\n  echo \"DS4_RAY_CLUSTER_PASSED", 1
+    )[0]
 
+    ast.parse(ray_program)
+    assert "'" not in ray_program
     assert "RAY_ONLY requires one node with eight GPUs" in script
     assert "class DeviceProbe:" in script
+    assert "_RayActorClassProfile" in script
+    assert "_vllm_server_profile_env" in script
+    assert "from verl.workers.config import HFModelConfig" in script
     assert "ray.remote(num_gpus=1)(DeviceProbe)" in script
+    assert "_RayActorClassProfile(" in script
+    assert "AutoModelForImageTextToText, AutoModelForVision2Seq" in script
+    assert "import compressed_tensors" in script
+    assert "import outlines_core" in script
+    assert "import tvm_ffi" in script
+    assert "import xgrammar" in script
+    assert "import transformers" in script
+    assert "import vllm" in script
+    assert "vLLMHttpServer" in script
+    assert "vLLMReplica" in script
     assert "for _ in range(8)" in script
     assert "get_accelerator_ids()" in script
     assert 'os.environ.get("CUDA_VISIBLE_DEVICES")' in script
@@ -244,12 +263,19 @@ def test_ds4_grpo_ray_only_probes_every_local_device_uuid_mapping() -> None:
     assert 'record["visible_devices"]' in script
     assert 'record["logical_device_uuid"]' in script
     assert 'record["physical_device_uuid"]' in script
+    assert 'record["transformers_origin"]' in script
+    assert 'record["vllm_origin"]' in script
+    assert 'record["dependency_origins"]' in script
+    assert 'record["dependency_versions"]' in script
+    assert 'record["server_profile_patch_applied"]' in script
+    assert 'record["pythonpath"]' in script
     assert (
         'record["logical_device_uuid"] == record["physical_device_uuid"]' in script
     )
     assert "accelerator id must be a decimal CUDA device id" in script
     assert "len(set(physical_ids)) == 8" in script
     assert "len(set(device_uuids)) == 8" in script
+    assert "DS4_RAY_SERVER_PROFILE_PASSED" in script
     assert "DS4_RAY_DEVICE_UUID_PROBE_PASSED actors=8" in script
 
 

@@ -1,3 +1,4 @@
+import inspect
 import sys
 from types import SimpleNamespace
 
@@ -32,7 +33,9 @@ def test_unknown_hf_model_type_is_registered_as_opaque_config(monkeypatch) -> No
     assert registrations[0][1].model_type == "deepseek_v4"
 
 
-def test_vllm_server_profile_isolated_to_ray_actor_options(monkeypatch) -> None:
+def test_vllm_server_profile_keeps_rollout_dependency_closure_first(
+    monkeypatch,
+) -> None:
     from verl_mlite.compat import _RayActorClassProfile, _vllm_server_profile_env
 
     monkeypatch.setenv("PYTHONPATH", "/training")
@@ -67,6 +70,112 @@ def test_vllm_server_profile_isolated_to_ray_actor_options(monkeypatch) -> None:
             },
         }
     ]
+
+
+def test_vllm_server_profile_keeps_shared_rollout_dependencies_on_thin_site(
+    monkeypatch, tmp_path
+) -> None:
+    from verl_mlite import compat
+
+    training_site = tmp_path / "training"
+    rollout_site = tmp_path / "rollout"
+    for site in (training_site, rollout_site):
+        (site / "transformers").mkdir(parents=True)
+        (site / "transformers/__init__.py").write_text("")
+        (site / "vllm").mkdir()
+        (site / "vllm/__init__.py").write_text("")
+        (site / "compressed_tensors").mkdir()
+        (site / "compressed_tensors/__init__.py").write_text("")
+
+    monkeypatch.setenv("PYTHONPATH", str(training_site))
+    monkeypatch.setenv("VERL_MLITE_VLLM_SITE", str(rollout_site))
+    profile = compat._vllm_server_profile_env()
+    search_path = profile["PYTHONPATH"].split(compat.os.pathsep)
+
+    transformers_spec = compat.importlib.machinery.PathFinder.find_spec(
+        "transformers", search_path
+    )
+    vllm_spec = compat._VllmThinFinder(str(rollout_site)).find_spec("vllm", None, None)
+    dependency_spec = compat.importlib.machinery.PathFinder.find_spec(
+        "compressed_tensors", search_path
+    )
+
+    assert transformers_spec is not None
+    assert transformers_spec.origin == str(rollout_site / "transformers/__init__.py")
+    assert vllm_spec is not None
+    assert vllm_spec.origin == str(rollout_site / "vllm/__init__.py")
+    assert dependency_spec is not None
+    assert dependency_spec.origin == str(
+        rollout_site / "compressed_tensors/__init__.py"
+    )
+
+
+def test_transformers_vision2seq_alias_uses_v5_replacement(monkeypatch) -> None:
+    from verl_mlite import compat
+
+    replacement = object()
+    transformers = SimpleNamespace(AutoModelForImageTextToText=replacement)
+    monkeypatch.setenv("VERL_MLITE_VLLM_SITE", "/rollout")
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    assert compat._patch_transformers_vision2seq_alias()
+    assert transformers.AutoModelForVision2Seq is replacement
+    assert not compat._patch_transformers_vision2seq_alias()
+
+
+def test_transformers_vision2seq_alias_preserves_v4_class(monkeypatch) -> None:
+    from verl_mlite import compat
+
+    original = object()
+    transformers = SimpleNamespace(
+        AutoModelForVision2Seq=original,
+        AutoModelForImageTextToText=object(),
+    )
+    monkeypatch.setenv("VERL_MLITE_VLLM_SITE", "/rollout")
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    assert not compat._patch_transformers_vision2seq_alias()
+    assert transformers.AutoModelForVision2Seq is original
+
+
+def test_transformers_vision2seq_alias_requires_explicit_rollout_site(
+    monkeypatch,
+) -> None:
+    from verl_mlite import compat
+
+    transformers = SimpleNamespace(AutoModelForImageTextToText=object())
+    monkeypatch.delenv("VERL_MLITE_VLLM_SITE", raising=False)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    assert not compat._patch_transformers_vision2seq_alias()
+    assert not hasattr(transformers, "AutoModelForVision2Seq")
+
+
+def test_transformers_vision2seq_alias_requires_v5_replacement(monkeypatch) -> None:
+    from verl_mlite import compat
+
+    transformers = SimpleNamespace()
+    monkeypatch.setenv("VERL_MLITE_VLLM_SITE", "/rollout")
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    assert not compat._patch_transformers_vision2seq_alias()
+    assert not hasattr(transformers, "AutoModelForVision2Seq")
+
+
+def test_transformers_alias_precedes_verl_importing_runtime_patches() -> None:
+    from verl_mlite import compat
+
+    source = inspect.getsource(compat.apply_runtime_patches)
+
+    assert source.index("_patch_transformers_vision2seq_alias()") < source.index(
+        "_register_opaque_hf_config()"
+    )
+    assert source.index("_patch_transformers_vision2seq_alias()") < source.index(
+        "_patch_verl_vllm_device_uuid()"
+    )
+    assert source.index("_patch_transformers_vision2seq_alias()") < source.index(
+        "_patch_vllm_server_profile()"
+    )
 
 
 def test_vllm_server_profile_is_disabled_without_explicit_site(monkeypatch) -> None:

@@ -309,6 +309,8 @@ import sys
 
 import ray
 from transformers import AutoConfig
+from verl_mlite.compat import _RayActorClassProfile, _vllm_server_profile_env
+from verl.workers.config import HFModelConfig
 
 assert os.environ["VERL_MLITE_SKIP_RUNTIME_PATCHES"] == "0"
 assert "verl_mlite.compat" in sys.modules
@@ -321,11 +323,46 @@ ray.init(address="auto")
 
 
 class DeviceProbe:
-    def inspect(self):
-        import torch
+    def __init__(self, model_config_cls):
+        self.model_config_cls = model_config_cls
 
+    def inspect(self):
+        import compressed_tensors
+        import numba
+        import outlines_core
+        import torch
+        import transformers
+        import tvm_ffi
+        import vllm
+        import xgrammar
+
+        from importlib.metadata import distributions
+        from transformers import AutoModelForImageTextToText, AutoModelForVision2Seq
         from verl.utils.device import get_device_id
+        from verl.utils.model import update_model_config
+        from verl.workers.rollout.vllm_rollout.vllm_async_server import (
+            vLLMHttpServer,
+            vLLMReplica,
+        )
         from verl.workers.rollout.vllm_rollout.vllm_rollout import get_device_uuid
+
+        assert AutoModelForVision2Seq is AutoModelForImageTextToText
+        assert callable(update_model_config)
+        assert self.model_config_cls.__name__ == "HFModelConfig"
+        assert vLLMHttpServer is not None
+        assert getattr(vLLMReplica, "_verl_mlite_server_profile_patch", False)
+
+        rollout_site = os.path.realpath(os.environ["DS4_VLLM_SITE"])
+        training_site = os.path.realpath(os.environ["MLITE_SM90_SITE"])
+
+        def site_versions(site):
+            return {
+                distribution.metadata["Name"].lower().replace("_", "-"): distribution.version
+                for distribution in distributions(path=[site])
+                if distribution.metadata["Name"]
+            }
+
+        rollout_versions = site_versions(rollout_site)
 
         accelerator_ids = [
             str(value)
@@ -348,16 +385,54 @@ class DeviceProbe:
             "patch_applied": bool(
                 getattr(get_device_uuid, "_verl_mlite_visible_device_patch", False)
             ),
+            "server_profile_patch_applied": bool(
+                getattr(vLLMReplica, "_verl_mlite_server_profile_patch", False)
+            ),
+            "dependency_origins": {
+                "compressed_tensors": compressed_tensors.__file__,
+                "numba": numba.__file__,
+                "outlines_core": outlines_core.__file__,
+                "tvm_ffi": tvm_ffi.__file__,
+                "xgrammar": xgrammar.__file__,
+            },
+            "dependency_versions": {
+                "apache-tvm-ffi": rollout_versions["apache-tvm-ffi"],
+                "compressed-tensors": rollout_versions["compressed-tensors"],
+                "numba": rollout_versions["numba"],
+                "outlines-core": rollout_versions["outlines-core"],
+                "transformers": rollout_versions["transformers"],
+                "vllm": rollout_versions["vllm"],
+                "xgrammar": rollout_versions["xgrammar"],
+            },
+            "pythonpath": os.environ.get("PYTHONPATH"),
+            "transformers_origin": transformers.__file__,
+            "vllm_origin": vllm.__file__,
+            "training_site": training_site,
+            "rollout_site": rollout_site,
             "node_id": ray.get_runtime_context().get_node_id(),
         }
 
 
-ProbeActor = ray.remote(num_gpus=1)(DeviceProbe)
-actors = [ProbeActor.remote() for _ in range(8)]
+ProbeActor = _RayActorClassProfile(
+    ray.remote(num_gpus=1)(DeviceProbe),
+    _vllm_server_profile_env(),
+)
+actors = [ProbeActor.options().remote(HFModelConfig) for _ in range(8)]
 records = ray.get([actor.inspect.remote() for actor in actors])
 assert len(records) == 8, records
 node_ids = [record["node_id"] for record in records]
 assert len(set(node_ids)) == 1, records
+training_site = os.path.realpath(os.environ["MLITE_SM90_SITE"])
+rollout_site = os.path.realpath(os.environ["DS4_VLLM_SITE"])
+expected_dependency_versions = {
+    "apache-tvm-ffi": "0.1.9",
+    "compressed-tensors": "0.15.0.1",
+    "numba": "0.65.0",
+    "outlines-core": "0.2.14",
+    "transformers": "5.12.1",
+    "vllm": "0.20.2",
+    "xgrammar": "0.2.2",
+}
 physical_ids = []
 device_uuids = []
 for record in records:
@@ -372,14 +447,44 @@ for record in records:
     assert physical_id in visible_ids, records
     assert 0 <= record["current_device"] < record["device_count"], records
     assert record["patch_applied"], records
+    assert record["server_profile_patch_applied"], records
     assert record["logical_device_uuid"], records
     assert record["physical_device_uuid"], records
     assert record["logical_device_uuid"] == record["physical_device_uuid"], records
+    pythonpath = record["pythonpath"]
+    assert pythonpath, records
+    pythonpath_entries = [
+        os.path.realpath(entry)
+        for entry in pythonpath.split(os.pathsep)
+        if entry
+    ]
+    assert pythonpath_entries.index(rollout_site) < pythonpath_entries.index(
+        training_site
+    ), records
+    assert os.path.commonpath(
+        [os.path.realpath(record["transformers_origin"]), rollout_site]
+    ) == rollout_site, records
+    assert os.path.commonpath(
+        [os.path.realpath(record["vllm_origin"]), rollout_site]
+    ) == rollout_site, records
+    for dependency_origin in record["dependency_origins"].values():
+        assert os.path.commonpath(
+            [os.path.realpath(dependency_origin), rollout_site]
+        ) == rollout_site, records
+    assert record["dependency_versions"] == expected_dependency_versions, records
     physical_ids.append(physical_id)
     device_uuids.append(record["physical_device_uuid"])
 assert len(set(physical_ids)) == 8, records
 assert len(set(device_uuids)) == 8, records
+transformers_origin = records[0]["transformers_origin"]
+vllm_origin = records[0]["vllm_origin"]
 print("DS4_RAY_JOB_RUNTIME_ENV_PASSED", flush=True)
+print(
+    "DS4_RAY_SERVER_PROFILE_PASSED "
+    f"transformers_origin={transformers_origin} "
+    f"vllm_origin={vllm_origin}",
+    flush=True,
+)
 print(f"DS4_RAY_GPU_ENV_PASSED {json.dumps(records, sort_keys=True)}", flush=True)
 print(
     "DS4_RAY_DEVICE_UUID_PROBE_PASSED actors=8 "
