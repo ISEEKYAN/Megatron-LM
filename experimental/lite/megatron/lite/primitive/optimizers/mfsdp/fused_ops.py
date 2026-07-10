@@ -40,6 +40,12 @@ def build_optimizer(
     use_fused = bool(values.get("use_fused_optimizer", True)) and _has_cuda_params(
         param_groups
     )
+    if use_fused and _has_shared_param_storage(param_groups):
+        logger.warning(
+            "Apex fused optimizer is unsafe for M-FSDP parameters that share "
+            "flat storage; using the Torch optimizer fallback."
+        )
+        use_fused = False
     if use_fused:
         fused = _build_apex_optimizer(
             optimizer_name,
@@ -118,6 +124,24 @@ def _has_cuda_params(param_groups: list[dict[str, Any]]) -> bool:
         for group in param_groups
         for param in group["params"]
     )
+
+
+def _has_shared_param_storage(param_groups: list[dict[str, Any]]) -> bool:
+    """Return whether distinct optimizer parameters alias one flat storage."""
+    storages: set[tuple[str, int | None, int]] = set()
+    for group in param_groups:
+        for param in group["params"]:
+            if not isinstance(param, torch.Tensor):
+                continue
+            key = (
+                param.device.type,
+                param.device.index,
+                param.untyped_storage().data_ptr(),
+            )
+            if key in storages:
+                return True
+            storages.add(key)
+    return False
 
 
 __all__ = ["OptimizerFactory", "build_optimizer"]

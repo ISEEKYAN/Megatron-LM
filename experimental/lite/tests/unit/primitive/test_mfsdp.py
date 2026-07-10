@@ -17,6 +17,7 @@ import torch.multiprocessing as mp
 
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
 from megatron.lite.primitive.optimizers.mfsdp import buffer as mfsdp_buffer
+from megatron.lite.primitive.optimizers.mfsdp import fused_ops as mfsdp_fused_ops
 from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
 from megatron.lite.primitive.optimizers import get_optimizer_backend
 from megatron.lite.runtime.contracts.config import ParallelConfig
@@ -416,6 +417,35 @@ def _engine_cfg(**overrides):
     for key, value in overrides.items():
         setattr(cfg, key, value)
     return cfg
+
+
+def test_mfsdp_flat_shared_storage_skips_apex_fused_optimizer(monkeypatch):
+    flat = torch.zeros(8)
+    params = [
+        torch.nn.Parameter(flat.narrow(0, 0, 4)),
+        torch.nn.Parameter(flat.narrow(0, 4, 4)),
+    ]
+    param_groups = [{"params": params, "weight_decay": 0.01}]
+    config = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-6,
+        weight_decay=0.01,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"use_fused_optimizer": True},
+    )
+    monkeypatch.setattr(mfsdp_fused_ops, "_has_cuda_params", lambda _groups: True)
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("Apex fused optimizer cannot own flat shared storage")
+
+    monkeypatch.setattr(mfsdp_fused_ops, "_build_apex_optimizer", fail_if_called)
+
+    optimizer = mfsdp_fused_ops.build_optimizer(param_groups, config)
+
+    assert isinstance(optimizer, torch.optim.AdamW)
+    assert optimizer.defaults["foreach"] is False
 
 
 def test_mfsdp_config_rejects_unsupported_optimizer():
