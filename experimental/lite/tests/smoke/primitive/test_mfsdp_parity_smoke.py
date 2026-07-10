@@ -437,44 +437,19 @@ def _named_mfsdp_optimizer_grads(model_chunks) -> dict[str, torch.Tensor]:
     return grads
 
 
-def _tensor_set_worst_differences(
-    lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]
-) -> tuple[float, float, str, str]:
-    assert lhs.keys() == rhs.keys()
-    max_abs = 0.0
-    max_rel = 0.0
-    max_abs_name = ""
-    max_rel_name = ""
-    for name in lhs:
-        diff = (lhs[name] - rhs[name]).abs()
-        current_abs = float(diff.max().item())
-        if current_abs > max_abs:
-            max_abs = current_abs
-            max_abs_name = name
-        denominator = torch.maximum(lhs[name].abs(), rhs[name].abs()).clamp_min(
-            _TENSOR_ATOL
-        )
-        current_rel = float((diff / denominator).max().item())
-        if current_rel > max_rel:
-            max_rel = current_rel
-            max_rel_name = name
-    return max_abs, max_rel, max_abs_name, max_rel_name
-
-
-def _tensor_set_max_differences(
-    lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]
-) -> tuple[float, float]:
-    max_abs, max_rel, _max_abs_name, _max_rel_name = _tensor_set_worst_differences(
-        lhs, rhs
-    )
-    return max_abs, max_rel
-
-
 def _assert_tensor_sets_close(
     lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]
 ) -> tuple[float, float]:
-    max_abs, max_rel = _tensor_set_max_differences(lhs, rhs)
+    assert lhs.keys() == rhs.keys()
+    max_abs = 0.0
+    max_rel = 0.0
     for name in lhs:
+        diff = (lhs[name] - rhs[name]).abs()
+        max_abs = max(max_abs, float(diff.max().item()))
+        denominator = torch.maximum(lhs[name].abs(), rhs[name].abs()).clamp_min(
+            _TENSOR_ATOL
+        )
+        max_rel = max(max_rel, float((diff / denominator).max().item()))
         torch.testing.assert_close(
             lhs[name],
             rhs[name],
@@ -926,18 +901,8 @@ def _contains_collective(sequence: tuple[str, ...], *tokens: str) -> bool:
 
 
 def _run_full_parallel_step(
-    handle: ModelHandle,
-    *,
-    batch_seed: int,
-    record_collectives: bool,
-    capture_diagnostics: bool,
-) -> tuple[
-    float,
-    float,
-    tuple[str, ...],
-    dict[str, torch.Tensor],
-    dict[str, torch.Tensor],
-]:
+    handle: ModelHandle, *, batch_seed: int, record_collectives: bool
+) -> tuple[float, float, tuple[str, ...]]:
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     runtime.zero_grad(handle)
     batches = _fixed_packed_batches(64, seed=batch_seed)
@@ -956,19 +921,11 @@ def _run_full_parallel_step(
             handle, iter(batches), None, num_microbatches=_FULL_PARALLEL_MICROBATCHES
         )
 
-    grads = _named_optimizer_grads(handle._optimizer) if capture_diagnostics else {}
     success, grad_norm, _num_zeros = runtime.optimizer_step(handle)
     assert success
-    params = _named_model_tensors(handle._model) if capture_diagnostics else {}
     loss = result.model_output.loss
     assert loss is not None
-    return (
-        float(loss.detach().float().cpu()),
-        float(grad_norm),
-        tuple(sequence),
-        grads,
-        params,
-    )
+    return float(loss.detach().float().cpu()), float(grad_norm), tuple(sequence)
 
 
 def _max_snapshot_abs_diff(
@@ -1037,60 +994,18 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
     losses = {"fsdp2": [], "mfsdp": []}
     grad_norms = {"fsdp2": [], "mfsdp": []}
     traces = {}
-    step_one_grads = {}
-    step_one_params = {}
     for step in range(_FULL_PARALLEL_STEPS):
         for backend, handle in (("fsdp2", fsdp2_handle), ("mfsdp", mfsdp_handle)):
             dist.barrier()
-            loss, grad_norm, trace, grads, params = _run_full_parallel_step(
+            loss, grad_norm, trace = _run_full_parallel_step(
                 handle,
                 batch_seed=8345 + step,
                 record_collectives=step == 0,
-                capture_diagnostics=step == 0,
             )
             losses[backend].append(loss)
             grad_norms[backend].append(grad_norm)
             if trace:
                 traces[backend] = trace
-            if grads:
-                step_one_grads[backend] = grads
-            if params:
-                step_one_params[backend] = params
-
-        if step == 0:
-            grad_abs, grad_rel, grad_abs_name, grad_rel_name = (
-                _tensor_set_worst_differences(
-                    step_one_grads["fsdp2"], step_one_grads["mfsdp"]
-                )
-            )
-            param_abs, param_rel, param_abs_name, param_rel_name = (
-                _tensor_set_worst_differences(
-                    step_one_params["fsdp2"], step_one_params["mfsdp"]
-                )
-            )
-            print(
-                "[MFSDP_FULL_PARALLEL_WORST] "
-                f"rank={dist.get_rank()} step=1 "
-                f"grad_abs_name={grad_abs_name} grad_abs_diff={grad_abs:.8e} "
-                f"grad_rel_name={grad_rel_name} grad_rel_diff={grad_rel:.8e} "
-                f"param_abs_name={param_abs_name} param_abs_diff={param_abs:.8e} "
-                f"param_rel_name={param_rel_name} param_rel_diff={param_rel:.8e}",
-                flush=True,
-            )
-            step_one_diffs = torch.tensor(
-                [grad_abs, grad_rel, param_abs, param_rel], device="cuda"
-            )
-            dist.all_reduce(step_one_diffs, op=dist.ReduceOp.MAX)
-            if dist.get_rank() == 0:
-                print(
-                    "[MFSDP_FULL_PARALLEL_STEP] "
-                    "step=1 "
-                    f"max_grad_abs_diff={float(step_one_diffs[0]):.8e} "
-                    f"max_grad_rel_diff={float(step_one_diffs[1]):.8e} "
-                    f"max_param_abs_diff={float(step_one_diffs[2]):.8e} "
-                    f"max_param_rel_diff={float(step_one_diffs[3]):.8e}",
-                    flush=True,
-                )
 
     for backend in ("fsdp2", "mfsdp"):
         trace = traces.get(backend, ())
