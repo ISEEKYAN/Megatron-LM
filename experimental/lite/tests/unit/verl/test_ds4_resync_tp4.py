@@ -389,6 +389,7 @@ def test_formal_sbatch_uses_mixed_source_for_mlite_and_fp8_artifact_for_vllm() -
     assert "--weights '${OUTPUT_DIR}/engine-weight-report.json'" in script
     assert "MLITE_COMMIT=${MLITE_COMMIT:?set MLITE_COMMIT}" in script
     assert 'git -C "${MLITE_SRC}" rev-parse HEAD' in script
+    assert 'export PYTHONPATH="${MLITE_SRC}/experimental/lite/examples/verl:' in script
     assert "convert --source" not in script
 
 

@@ -25,7 +25,7 @@ VLLM_COMPLETE=${OUTPUT_DIR}/DS4_TP4_VLLM_COMPLETE
   exit 7
 }
 mkdir -p "${OUTPUT_DIR}"
-export PYTHONPATH="${MLITE_SRC}/experimental/lite:${PYTHONPATH:-}"
+export PYTHONPATH="${MLITE_SRC}/experimental/lite/examples/verl:${MLITE_SRC}/experimental/lite:${PYTHONPATH:-}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 unset VLLM_DEEP_GEMM_WARMUP || true
 
