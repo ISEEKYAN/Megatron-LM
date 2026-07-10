@@ -171,6 +171,42 @@ def test_vllm_device_uuid_maps_physical_id_with_multiple_visible_gpus(
     assert calls == [1, 1, 3]
 
 
+def test_vllm_device_uuid_patch_repairs_loaded_consumer_alias(monkeypatch) -> None:
+    from verl_mlite import compat
+
+    calls = []
+
+    def get_device_uuid(device_id):
+        calls.append(device_id)
+        return f"GPU-{device_id}"
+
+    utils = SimpleNamespace(get_device_uuid=get_device_uuid)
+    consumer = SimpleNamespace(get_device_uuid=get_device_uuid)
+    monkeypatch.setenv("VERL_MLITE_VLLM_SITE", "/rollout")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5")
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.utils",
+        utils,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.vllm_rollout",
+        consumer,
+    )
+
+    assert compat._patch_verl_vllm_device_uuid()
+    assert consumer.get_device_uuid is utils.get_device_uuid
+    assert consumer.get_device_uuid(5) == "GPU-0"
+
+    consumer.get_device_uuid = get_device_uuid
+    assert compat._patch_verl_vllm_device_uuid()
+    assert consumer.get_device_uuid is utils.get_device_uuid
+    assert consumer.get_device_uuid(5) == "GPU-0"
+    assert not compat._patch_verl_vllm_device_uuid()
+    assert calls == [0, 0]
+
+
 def test_vllm_device_uuid_patch_requires_explicit_rollout_site(monkeypatch) -> None:
     from verl_mlite import compat
 

@@ -18,6 +18,7 @@ README = EXAMPLE_ROOT / "README.md"
 RUNNER = EXAMPLE_ROOT / "scripts/run_deepseek_v4_gsm8k_grpo.sh"
 SBATCH = EXAMPLE_ROOT / "slurm/run_ds4_gsm8k_grpo.sbatch"
 DATASET_MODULE = EXAMPLE_ROOT / "verl_mlite/dataset.py"
+ENGINE_MODULE = EXAMPLE_ROOT / "verl_mlite/engine/mlite_engine.py"
 
 
 def test_sitecustomize_skips_application_patches_for_ray_infrastructure() -> None:
@@ -233,6 +234,10 @@ def test_ds4_grpo_ray_only_probes_every_local_device_uuid_mapping() -> None:
     assert 'os.environ.get("CUDA_VISIBLE_DEVICES")' in script
     assert "torch.cuda.current_device()" in script
     assert "torch.cuda.device_count()" in script
+    assert (
+        "from verl.workers.rollout.vllm_rollout.vllm_rollout import "
+        "get_device_uuid" in script
+    )
     assert "get_device_uuid(get_device_id())" in script
     assert "get_device_uuid(int(accelerator_ids[0]))" in script
     assert 'record["accelerator_ids"]' in script
@@ -246,6 +251,16 @@ def test_ds4_grpo_ray_only_probes_every_local_device_uuid_mapping() -> None:
     assert "len(set(physical_ids)) == 8" in script
     assert "len(set(device_uuids)) == 8" in script
     assert "DS4_RAY_DEVICE_UUID_PROBE_PASSED actors=8" in script
+
+
+def test_mlite_engine_reapplies_vllm_device_uuid_patch_before_registration() -> None:
+    engine = ENGINE_MODULE.read_text()
+
+    assert "_patch_verl_vllm_device_uuid" in engine
+    assert (
+        engine.index("_patch_verl_vllm_device_uuid()")
+        < engine.index("load_verl_engine_api()")
+    )
 
 
 def test_ds4_grpo_readme_uses_the_smoke_partition_limit() -> None:

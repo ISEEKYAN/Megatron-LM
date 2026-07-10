@@ -325,7 +325,7 @@ class DeviceProbe:
         import torch
 
         from verl.utils.device import get_device_id
-        from verl.workers.rollout.vllm_rollout.utils import get_device_uuid
+        from verl.workers.rollout.vllm_rollout.vllm_rollout import get_device_uuid
 
         accelerator_ids = [
             str(value)

@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import Any
 
 _BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+_VLLM_ROLLOUT_CONSUMER_MODULE = (
+    "verl.workers.rollout.vllm_rollout.vllm_rollout"
+)
 _REGISTERED_HF_CONFIG_TYPES: set[str] = set()
 
 
@@ -163,16 +166,30 @@ def _patch_verl_vllm_device_uuid() -> bool:
 
     utils = importlib.import_module("verl.workers.rollout.vllm_rollout.utils")
     original_get_device_uuid = utils.get_device_uuid
+    changed = False
     if getattr(original_get_device_uuid, "_verl_mlite_visible_device_patch", False):
-        return False
+        patched_get_device_uuid = original_get_device_uuid
+    else:
+        @wraps(original_get_device_uuid)
+        def patched_get_device_uuid(device_id: int) -> str:
+            return original_get_device_uuid(
+                _normalize_vllm_visible_device_id(device_id)
+            )
 
-    @wraps(original_get_device_uuid)
-    def patched_get_device_uuid(device_id: int) -> str:
-        return original_get_device_uuid(_normalize_vllm_visible_device_id(device_id))
+        patched_get_device_uuid._verl_mlite_visible_device_patch = True
+        utils.get_device_uuid = patched_get_device_uuid
+        changed = True
 
-    patched_get_device_uuid._verl_mlite_visible_device_patch = True
-    utils.get_device_uuid = patched_get_device_uuid
-    return True
+    # Importing the leaf ``utils`` module first executes the package __init__,
+    # which can bind the original helper into this consumer before we replace it.
+    consumer = sys.modules.get(_VLLM_ROLLOUT_CONSUMER_MODULE)
+    if (
+        consumer is not None
+        and getattr(consumer, "get_device_uuid", None) is not patched_get_device_uuid
+    ):
+        consumer.get_device_uuid = patched_get_device_uuid
+        changed = True
+    return changed
 
 
 class _SyncBucketProducer:
