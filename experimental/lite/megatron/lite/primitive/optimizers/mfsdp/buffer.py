@@ -409,6 +409,31 @@ class ParamBucket:
         self.local_compute_buffer.copy_(self.main_param_buffer)
         return self.full_buffer, self.local_compute_buffer
 
+    def materialize_main_parameters(self) -> None:
+        """Gather persistent main-parameter shards without compute-dtype casting."""
+        if self._full_lease is not None or self._param_gather_work is not None:
+            raise RuntimeError(
+                "Cannot materialize M-FSDP main parameters while a gather is active."
+            )
+        self._full_lease = self.allocator.allocate(
+            self.full_numel,
+            dtype=self.policy.main_params_dtype,
+            device=self.device,
+            group=self.gather_group,
+            key=("main-param", self.bucket_id),
+        )
+        self.full_buffer = self._full_lease.tensor
+        if self.world_size == 1:
+            self.full_buffer.copy_(self.main_param_buffer)
+        else:
+            dist.all_gather_into_tensor(
+                self.full_buffer,
+                self.main_param_buffer,
+                group=self.gather_group,
+            )
+        self._full_ready = True
+        self.install_full_parameters()
+
     def mark_param_gather_launched(self, work: Any | None) -> None:
         self._param_gather_work = work
 
@@ -891,6 +916,11 @@ class AllGatherPipeline:
             self.wait_bucket_ready(bucket.bucket_id)
             bucket.install_full_parameters()
 
+    def materialize_main_parameters(self) -> None:
+        self.release_all()
+        for bucket in self.buckets:
+            bucket.materialize_main_parameters()
+
     def release_all(self) -> None:
         for bucket in self.buckets:
             bucket.release_full_parameters()
@@ -975,6 +1005,9 @@ class CommunicationPipelines:
 
     def materialize_all(self) -> None:
         self.all_gather.materialize_all()
+
+    def materialize_main_parameters(self) -> None:
+        self.all_gather.materialize_main_parameters()
 
     def release_all(self) -> None:
         self.all_gather.release_all()

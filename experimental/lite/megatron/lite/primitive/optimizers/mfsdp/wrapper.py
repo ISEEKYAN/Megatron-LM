@@ -128,8 +128,8 @@ class MegatronFSDP(nn.Module):
 
     @contextmanager
     def full_parameter_context(self):
-        """Materialize full parameters for model-level export consumers."""
-        self.param_sync.materialize_all()
+        """Materialize full persistent parameters for model-level consumers."""
+        self.param_sync.materialize_main_parameters()
         try:
             yield
         finally:

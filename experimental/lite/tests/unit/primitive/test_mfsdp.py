@@ -1043,7 +1043,7 @@ def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
 
 
 def test_mfsdp_releases_full_parameters_and_preserves_storage_aliases_on_move():
-    model = _GlooModel()
+    model = _GlooModel().to(torch.bfloat16)
     ps = SimpleNamespace(
         dp_cp_group=None,
         dp_group=None,
@@ -1095,6 +1095,9 @@ def test_mfsdp_releases_full_parameters_and_preserves_storage_aliases_on_move():
             for name, param in chunk.named_parameters()
         }
         assert actual_shapes == expected_shapes
+        assert all(
+            param.dtype is torch.float32 for _name, param in chunk.named_parameters()
+        )
 
     assert all(
         spec.full_param.numel() == 0
