@@ -136,19 +136,21 @@ def _quantize_block_fp8(
     block_m, block_k = block_shape
     if block_m <= 0 or block_k <= 0:
         raise ValueError(f"block shape must be positive, got {block_shape}")
-    if tensor.shape[-2] % block_m or tensor.shape[-1] % block_k:
-        raise ValueError(
-            f"tensor trailing shape {tuple(tensor.shape[-2:])} must be divisible by "
-            f"block shape {block_shape}"
-        )
 
     source = tensor.float()
     *leading, rows, columns = source.shape
-    blocked = source.reshape(
+    padded_rows = math.ceil(rows / block_m) * block_m
+    padded_columns = math.ceil(columns / block_k) * block_k
+    if (padded_rows, padded_columns) == (rows, columns):
+        padded = source
+    else:
+        padded = source.new_zeros(*leading, padded_rows, padded_columns)
+        padded[..., :rows, :columns] = source
+    blocked = padded.reshape(
         *leading,
-        rows // block_m,
+        padded_rows // block_m,
         block_m,
-        columns // block_k,
+        padded_columns // block_k,
         block_k,
     )
     amax = blocked.abs().amax(dim=(-3, -1))
@@ -157,6 +159,7 @@ def _quantize_block_fp8(
     expanded = scale.repeat_interleave(block_m, dim=-2).repeat_interleave(
         block_k, dim=-1
     )
+    expanded = expanded[..., :rows, :columns]
     weight = (source / expanded).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
     return weight, scale
 

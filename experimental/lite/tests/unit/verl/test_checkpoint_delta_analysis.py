@@ -115,6 +115,43 @@ def test_tensor_delta_statistics_measures_real_block_fp8_target_format() -> None
     assert fp8["changed_value_fraction"] == 0.0
 
 
+def test_block_fp8_density_counts_weight_and_fp32_scale_bytes() -> None:
+    before = torch.tensor([[0.5, 1.0], [0.25, -1.0]], dtype=torch.bfloat16)
+    after = before.clone()
+    after[0, 1] = 2.0
+
+    stats = delta_analysis.tensor_delta_statistics(
+        "model.layers.0.self_attn.q_proj.weight",
+        before,
+        after,
+        fp8_block_shape=(2, 2),
+    )
+
+    fp8 = stats["target_formats"]["block_fp8"]
+    assert fp8["serialized_bytes"] == 8
+    assert fp8["scale_numel"] == 1
+    assert fp8["scale_changed_count"] == 1
+    assert fp8["changed_value_bytes"] == fp8["weight_changed_count"] + 4
+
+
+def test_block_fp8_serializes_partial_edge_blocks() -> None:
+    before = torch.arange(6, dtype=torch.bfloat16).reshape(3, 2)
+    after = before.clone()
+    after[-1, -1] = 6.0
+
+    stats = delta_analysis.tensor_delta_statistics(
+        "model.layers.0.self_attn.q_proj.weight",
+        before,
+        after,
+        fp8_block_shape=(2, 2),
+    )
+
+    fp8 = stats["target_formats"]["block_fp8"]
+    assert fp8["weight_numel"] == 6
+    assert fp8["scale_numel"] == 2
+    assert fp8["serialized_bytes"] == 14
+
+
 def test_tensor_delta_statistics_keeps_unquantized_head_in_target_format() -> None:
     before = torch.zeros((2, 2), dtype=torch.bfloat16)
     after = before.clone()
