@@ -53,6 +53,34 @@ class _DirectParamModel(torch.nn.Module):
         return torch.nn.functional.linear(hidden, self.projection.weight)
 
 
+class _OpaqueWeightFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, owner):
+        ctx.owner = owner
+        ctx.expected_weight_shape = owner.weight.shape
+        ctx.input_shape = value.shape
+        return torch.nn.functional.linear(value, owner.weight)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        assert ctx.owner.weight.shape == ctx.expected_weight_shape
+        grad_input = torch.zeros(
+            ctx.input_shape,
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        return grad_input, None
+
+
+class _OpaqueWeightUnit(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(3, 4))
+
+    def forward(self, value):
+        return _OpaqueWeightFunction.apply(value, self)
+
+
 def _optimizer_params(optimizer) -> list[torch.nn.Parameter]:
     return optimizer._inner_optimizer.params
 
@@ -1081,6 +1109,44 @@ def test_mfsdp_releases_full_parameters_and_preserves_storage_aliases_on_move():
             and spec.shard_param.untyped_storage().data_ptr() == main_storage
             for spec in bucket.specs
         )
+
+
+def test_mfsdp_keeps_full_parameter_bindings_for_opaque_backward():
+    model = _OpaqueWeightUnit()
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, _optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_OpaqueWeightUnit,),
+    )
+
+    value = torch.randn(2, 4, requires_grad=True)
+    chunks[0](value).sum().backward()
 
 
 def _run_mfsdp_gloo_parity(rank: int, world_size: int, init_file: str) -> None:

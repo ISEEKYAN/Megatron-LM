@@ -70,6 +70,17 @@ class TinyDenseModel(nn.Module):
         return self.out(self.unit1(self.unit0(x)))
 
 
+class TinyTransformerEngineRMSNorm(nn.Module):
+    def __init__(self):
+        super().__init__()
+        import transformer_engine.pytorch as te
+
+        self.norm = te.RMSNorm(8, eps=1.0e-6, zero_centered_gamma=True)
+
+    def forward(self, x):
+        return self.norm(x)
+
+
 class TinyExperts(nn.Module):
     def __init__(self):
         super().__init__()
@@ -548,6 +559,26 @@ def test_mfsdp_runtime_offload_roundtrip_preserves_training_storage():
     assert success
     if dist.get_rank() == 0:
         print("[MFSDP_OFFLOAD] roundtrip=passed training_continues=true", flush=True)
+
+
+def test_mfsdp_transformer_engine_rmsnorm_backward():
+    parallel = _dense_parallel_config()
+    chunks, optimizer, finalize = _build_mfsdp_pair(
+        seed=3210,
+        parallel=parallel,
+        model_type=TinyTransformerEngineRMSNorm,
+        unit_modules=(TinyTransformerEngineRMSNorm,),
+    )
+    x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+    target = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+
+    success, loss, grad_norm = _train_step(chunks, optimizer, finalize, x, target)
+
+    assert success
+    assert torch.isfinite(torch.tensor(loss))
+    assert torch.isfinite(torch.tensor(grad_norm))
+    if dist.get_rank() == 0:
+        print("[MFSDP_TE_RMSNORM] backward=passed", flush=True)
 
 
 def test_mfsdp_precision_curve_matches_fsdp2():

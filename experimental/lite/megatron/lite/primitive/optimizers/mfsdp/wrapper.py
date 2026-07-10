@@ -77,6 +77,15 @@ class MegatronFSDP(nn.Module):
 
     def forward(self, *args, **kwargs):
         self.param_sync.begin_forward()
+        keep_full_parameters = False
+
+        def attach_backward(tensor: torch.Tensor) -> torch.Tensor:
+            nonlocal keep_full_parameters
+            if not tensor.requires_grad:
+                return tensor
+            keep_full_parameters = True
+            return _BeginBackward.apply(tensor, self.param_sync)
+
         try:
             with saved_tensors_hooks(
                 self.param_sync.pack_saved_tensor,
@@ -85,15 +94,12 @@ class MegatronFSDP(nn.Module):
                 output = self.module(*args, **kwargs)
                 output = tree_map_only(
                     torch.Tensor,
-                    lambda tensor: (
-                        _BeginBackward.apply(tensor, self.param_sync)
-                        if tensor.requires_grad
-                        else tensor
-                    ),
+                    attach_backward,
                     output,
                 )
         finally:
-            self.param_sync.end_forward()
+            if not keep_full_parameters:
+                self.param_sync.end_forward()
         return output
 
     def start_param_sync(self, *_args, force_sync: bool = False, **_kwargs) -> None:
