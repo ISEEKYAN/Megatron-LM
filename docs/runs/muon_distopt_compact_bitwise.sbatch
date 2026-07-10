@@ -329,6 +329,7 @@ PY
       adam)
         output_dir="${RUN_ROOT}/adam"
         mkdir -p "${output_dir}"
+        impl_cfg_json="{\"mount_vision_model\": false}"
         torchrun --nproc_per_node 1 \
           "${SNAPSHOT_ROOT}/experimental/lite/examples/bench/correctness.py" run \
           --backend mlite \
@@ -347,7 +348,7 @@ PY
           --keep-experts 2 \
           --disable-mtp \
           --same-data-across-dp \
-          --impl-cfg-json '{"mount_vision_model": false}' \
+          --impl-cfg-json "${impl_cfg_json}" \
           --output-json "${output_dir}/qwen35_mlite_correctness.json" \
           2>&1 | tee "${output_dir}/qwen35_mlite_correctness.log"
 

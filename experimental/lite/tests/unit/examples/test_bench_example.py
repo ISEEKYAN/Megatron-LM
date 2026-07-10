@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -92,6 +93,18 @@ def test_compact_muon_harness_rejects_text_only_adam_drift(tmp_path):
     assert verdict["passed"] is False
     assert any("steps[1].post_step_weights.sha256" in item for item in verdict["mismatches"])
     assert not (tmp_path / "NON_SKIP_PINNED_ADAM_DISTOPT_GATE_PASSED").exists()
+
+
+def test_compact_muon_sbatch_keeps_json_inside_outer_shell_quote():
+    sbatch = Path(__file__).resolve().parents[5] / "docs/runs/muon_distopt_compact_bitwise.sbatch"
+    text = sbatch.read_text(encoding="utf-8")
+
+    assert 'impl_cfg_json="{\\"mount_vision_model\\": false}"' in text
+    assert '--impl-cfg-json "${impl_cfg_json}"' in text
+    assert "--impl-cfg-json '{" not in text
+    inner = text.partition("/bin/bash -c '\n")[2].rsplit("\n  '\n", 1)[0]
+    parsed = subprocess.run(["bash", "-n"], input=inner, text=True, capture_output=True)
+    assert parsed.returncode == 0, parsed.stderr
 
 
 def test_bench_builds_mlite_runtime_config_with_model_hook():
