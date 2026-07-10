@@ -427,7 +427,7 @@ class ParamBucket:
                 dtype=self.policy.compute_dtype,
                 device=self.device,
                 group=self.gather_group,
-                key=("param", self.bucket_id),
+                key=("param", id(self.gather_group)),
             )
             self.full_buffer = self._full_lease.tensor
         self.local_compute_buffer.copy_(self.main_param_buffer)
@@ -538,7 +538,7 @@ class ParamBucket:
             dtype=self.policy.grad_comm_dtype,
             device=self.device,
             group=self.process_group,
-            key=("grad", self.bucket_id),
+            key=("grad", id(self.process_group)),
         )
         grad_input = self._grad_lease.tensor
         grad_input.zero_()
@@ -1011,6 +1011,13 @@ class CommunicationPipelines:
             bucket = self.buckets[bucket_id]
             bucket.release_full_parameters()
             bucket.discard_full_parameter_views()
+
+    def release_forward_ids(self, bucket_ids: Iterable[int]) -> None:
+        for bucket_id in bucket_ids:
+            bucket = self.buckets[bucket_id]
+            if not bucket.retain_full_storage_through_backward:
+                bucket.release_full_parameters()
+                bucket.discard_full_parameter_views()
 
     def end_forward(self) -> None:
         for bucket in self.buckets:

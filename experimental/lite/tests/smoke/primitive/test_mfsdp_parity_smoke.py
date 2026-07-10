@@ -134,6 +134,33 @@ class BenchmarkModel(nn.Module):
         return x
 
 
+class TransformerEngineBenchmarkUnit(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        import transformer_engine.pytorch as te
+
+        self.block = BenchmarkUnit(hidden_size)
+        self.norm = te.RMSNorm(
+            hidden_size,
+            eps=1.0e-6,
+            zero_centered_gamma=True,
+        )
+
+    def forward(self, x):
+        return self.norm(self.block(x))
+
+
+class TransformerEngineBenchmarkModel(nn.Module):
+    hidden_size = 1024
+
+    def __init__(self):
+        super().__init__()
+        self.unit = TransformerEngineBenchmarkUnit(self.hidden_size)
+
+    def forward(self, x):
+        return self.unit(x)
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _cuda_dist():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -214,7 +241,11 @@ def _model_cfg() -> SimpleNamespace:
     )
 
 
-def _optimizer_cfg(*, use_fused_optimizer: bool = True) -> OptimizerConfig:
+def _optimizer_cfg(
+    *,
+    use_fused_optimizer: bool = True,
+    mfsdp_overrides: dict[str, object] | None = None,
+) -> OptimizerConfig:
     cfg = OptimizerConfig(
         optimizer="adam",
         lr=1.0e-3,
@@ -229,6 +260,7 @@ def _optimizer_cfg(*, use_fused_optimizer: bool = True) -> OptimizerConfig:
         "mfsdp_sharding_strategy": _MFSDP_SHARDING_STRATEGY,
         "use_fused_optimizer": use_fused_optimizer,
     }
+    cfg.override_optimizer_config.update(mfsdp_overrides or {})
     return cfg
 
 
@@ -271,12 +303,13 @@ def _build_mfsdp_pair(
     model_type: type[nn.Module] = TinyDenseModel,
     expert_classifier=None,
     unit_modules: tuple[type[nn.Module], ...] = (TinyUnit,),
+    mfsdp_overrides: dict[str, object] | None = None,
 ):
     ps = _parallel_state(parallel)
     chunks = [_new_model(seed, model_type)]
     impl_cfg = SimpleNamespace(
         parallel=parallel,
-        optimizer_config=_optimizer_cfg(),
+        optimizer_config=_optimizer_cfg(mfsdp_overrides=mfsdp_overrides),
     )
     optimizer, finalize = build_mfsdp_training_optimizer(
         chunks,
@@ -579,6 +612,45 @@ def test_mfsdp_transformer_engine_rmsnorm_backward():
     assert torch.isfinite(torch.tensor(grad_norm))
     if dist.get_rank() == 0:
         print("[MFSDP_TE_RMSNORM] backward=passed", flush=True)
+
+
+def test_mfsdp_transformer_engine_benchmark_false_double_buffer():
+    parallel = _dense_parallel_config()
+    chunks, optimizer, finalize = _build_mfsdp_pair(
+        seed=3211,
+        parallel=parallel,
+        model_type=TransformerEngineBenchmarkModel,
+        unit_modules=(TransformerEngineBenchmarkUnit,),
+        mfsdp_overrides={"fsdp_double_buffer": False},
+    )
+    assert all(not chunk.mfsdp_config.fsdp_double_buffer for chunk in chunks)
+    x = torch.randn(
+        64,
+        TransformerEngineBenchmarkModel.hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    target = torch.randn_like(x)
+    torch.cuda.reset_peak_memory_stats()
+
+    success, loss, grad_norm = _train_step(chunks, optimizer, finalize, x, target)
+
+    peak_memory_gib = torch.tensor(
+        torch.cuda.max_memory_allocated() / (1024**3),
+        device="cuda",
+    )
+    dist.all_reduce(peak_memory_gib, op=dist.ReduceOp.MAX)
+    assert success
+    assert torch.isfinite(torch.tensor(loss))
+    assert torch.isfinite(torch.tensor(grad_norm))
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_TE_PROXY] "
+            "benchmark_unit=true te_rmsnorm=true fsdp_double_buffer=false "
+            f"loss={loss:.8f} grad_norm={grad_norm:.8f} "
+            f"peak_memory_gib={float(peak_memory_gib):.4f}",
+            flush=True,
+        )
 
 
 def test_mfsdp_precision_curve_matches_fsdp2():

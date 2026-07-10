@@ -31,8 +31,15 @@ case "${MODE}" in
     fi
     TEST_EXPR="full_parallel_precision_curve"
     ;;
+  te-proxy)
+    if [[ "${NNODES}" != "1" || "${NPROC_PER_NODE}" != "8" ]]; then
+      echo "te-proxy mode requires NNODES=1 and NPROC_PER_NODE=8." >&2
+      exit 2
+    fi
+    TEST_EXPR="transformer_engine_benchmark_false_double_buffer"
+    ;;
   *)
-    echo "usage: $0 {throughput|full-parallel}" >&2
+    echo "usage: $0 {throughput|full-parallel|te-proxy}" >&2
     exit 2
     ;;
 esac

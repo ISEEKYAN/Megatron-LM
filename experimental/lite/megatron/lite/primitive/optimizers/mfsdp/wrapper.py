@@ -117,9 +117,8 @@ class MegatronFSDP(nn.Module):
                     args,
                 )
 
-            owner.register_forward_pre_hook(prepare_forward)
-            owner.register_forward_hook(
-                lambda _module, _args, output, ids=ids: tree_map_only(
+            def finish_forward(_module, _args, output, ids=ids):
+                output = tree_map_only(
                     torch.Tensor,
                     lambda tensor: (
                         _AcquireBackward.apply(tensor, self.param_sync, ids)
@@ -128,7 +127,11 @@ class MegatronFSDP(nn.Module):
                     ),
                     output,
                 )
-            )
+                self.param_sync.release_forward_ids(ids)
+                return output
+
+            owner.register_forward_pre_hook(prepare_forward)
+            owner.register_forward_hook(finish_forward)
         self.param_sync.release_all()
         self.param_sync.discard_full_parameter_views()
 

@@ -81,6 +81,33 @@ class _OpaqueWeightUnit(torch.nn.Module):
         return _OpaqueWeightFunction.apply(value, self)
 
 
+class _ForwardLeaseProbe(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.pipeline = None
+        self.active_nonopaque_buckets = None
+
+    def forward(self, value):
+        assert self.pipeline is not None
+        self.active_nonopaque_buckets = sum(
+            bucket._full_lease is not None
+            for bucket in self.pipeline.buckets
+            if not bucket.retain_full_storage_through_backward
+        )
+        return value
+
+
+class _ForwardReleaseModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.unit0 = _GlooUnit(4, 4)
+        self.unit1 = _GlooUnit(4, 4)
+        self.probe = _ForwardLeaseProbe()
+
+    def forward(self, value):
+        return self.probe(self.unit1(self.unit0(value)))
+
+
 def _optimizer_params(optimizer) -> list[torch.nn.Parameter]:
     return optimizer._inner_optimizer.params
 
@@ -445,6 +472,18 @@ def test_mfsdp_config_enables_double_buffer_for_nccl_user_buffers():
     )
 
     assert config.nccl_ub is True
+    assert config.fsdp_double_buffer is True
+
+
+def test_mfsdp_config_enables_double_buffer_by_default():
+    config = mfsdp_config.build_mfsdp_config(
+        SimpleNamespace(
+            override_optimizer_config={
+                "mfsdp_sharding_strategy": "optim_grads_params",
+            }
+        )
+    )
+
     assert config.fsdp_double_buffer is True
 
 
@@ -907,6 +946,52 @@ def test_mfsdp_double_buffer_waits_before_reusing_released_slot(monkeypatch):
 
     assert second.slot == first.slot
     assert waits == [None, recorded_event]
+
+
+def test_mfsdp_releases_nonopaque_bucket_after_owner_forward():
+    model = _ForwardReleaseModel()
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        etp_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, _optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_GlooUnit,),
+    )
+    chunk = chunks[0]
+    model.probe.pipeline = chunk.param_sync
+
+    output = chunk(torch.randn(2, 4, requires_grad=True))
+
+    assert model.probe.active_nonopaque_buckets == 0
+    allocator = chunk.param_and_grad_buffer.allocator
+    assert isinstance(allocator, mfsdp_buffer.DoubleBufferAllocator)
+    assert len(allocator._slots) == 1
+    output.sum().backward()
 
 
 def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
