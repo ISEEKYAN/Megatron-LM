@@ -121,7 +121,7 @@ def _write_deepseek_v4_config(path) -> None:
         "o_groups": 2,
         "index_head_dim": 128,
         "index_n_heads": 64,
-        "index_topk": 4,
+        "index_topk": 512,
         "moe_intermediate_size": 32,
         "n_routed_experts": 4,
         "n_shared_experts": 1,
