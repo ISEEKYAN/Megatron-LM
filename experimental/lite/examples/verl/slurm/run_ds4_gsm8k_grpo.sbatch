@@ -162,6 +162,9 @@ required = [
     "recompute: full",
     "use_legacy_worker_impl: disable",
     "custom_chat_template:",
+    "name: ChatTemplateRLHFDataset",
+    "verl_mlite/dataset.py",
+    "chat_template:",
     "<｜User｜>",
     "<｜Assistant｜>",
 ]

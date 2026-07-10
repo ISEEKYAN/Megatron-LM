@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -L)"
 GRPO_RUNNER="${SCRIPT_DIR}/run_qwen3moe_gsm8k_grpo.sh"
+DATASET_MODULE="${SCRIPT_DIR}/../verl_mlite/dataset.py"
 
 : "${MODEL_PATH:?set MODEL_PATH to the official mixed DeepSeek V4 checkpoint}"
 : "${TRAIN_FILES:?set TRAIN_FILES to a GSM8K-schema training parquet}"
@@ -60,6 +61,9 @@ DS4_CHAT_TEMPLATE+='{% if add_generation_prompt %}{{ "<｜Assistant｜>" }}{% en
 readonly DS4_CHAT_TEMPLATE
 
 exec bash "${GRPO_RUNNER}" \
+  "data.custom_cls.path=${DATASET_MODULE}" \
+  "data.custom_cls.name=ChatTemplateRLHFDataset" \
+  "+data.chat_template='${DS4_CHAT_TEMPLATE}'" \
   "actor_rollout_ref.model.custom_chat_template='${DS4_CHAT_TEMPLATE}'" \
   "+actor_rollout_ref.actor.engine.cross_entropy_fusion=True" \
   "actor_rollout_ref.actor.engine.resync_format=vllm_checkpoint" \

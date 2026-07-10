@@ -1,10 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,7 @@ LITE_ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE_ROOT = LITE_ROOT / "examples/verl"
 RUNNER = EXAMPLE_ROOT / "scripts/run_deepseek_v4_gsm8k_grpo.sh"
 SBATCH = EXAMPLE_ROOT / "slurm/run_ds4_gsm8k_grpo.sbatch"
+DATASET_MODULE = EXAMPLE_ROOT / "verl_mlite/dataset.py"
 
 
 def test_sitecustomize_skips_application_patches_for_ray_infrastructure() -> None:
@@ -90,6 +93,8 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
     assert "actor_rollout_ref.actor.engine.impl_cfg.mtp_enable_train=True" in command
     assert "actor_rollout_ref.model.use_fused_kernels=True" in command
     assert "actor_rollout_ref.model.custom_chat_template=" in command
+    assert "data.custom_cls.name=ChatTemplateRLHFDataset" in command
+    assert "data.chat_template=" in command
     runner = RUNNER.read_text()
     assert "<｜User｜>" in runner
     assert "<｜Assistant｜>" in runner
@@ -103,6 +108,43 @@ def test_ds4_grpo_dry_run_freezes_fused_fsdp_and_fp8_resync(tmp_path: Path) -> N
     assert "trainer.total_training_steps=3" in command
     assert "trainer.use_legacy_worker_impl=disable" in command
     assert "--cfg job" in command
+
+
+def test_chat_template_dataset_sets_controller_tokenizer_before_loading(
+    monkeypatch,
+) -> None:
+    class StubRLHFDataset:
+        def __init__(self, *args, **kwargs) -> None:
+            self.base_args = args
+            self.base_kwargs = kwargs
+
+    for name in ("verl", "verl.utils", "verl.utils.dataset"):
+        module = types.ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+    rl_dataset = types.ModuleType("verl.utils.dataset.rl_dataset")
+    rl_dataset.RLHFDataset = StubRLHFDataset
+    monkeypatch.setitem(sys.modules, "verl.utils.dataset.rl_dataset", rl_dataset)
+
+    spec = importlib.util.spec_from_file_location("ds4_test_dataset", DATASET_MODULE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    tokenizer = types.SimpleNamespace(chat_template=None)
+    processor = types.SimpleNamespace(chat_template=None)
+    dataset = module.ChatTemplateRLHFDataset(
+        "train.parquet",
+        tokenizer,
+        {"chat_template": "template"},
+        processor=processor,
+        max_samples=8,
+    )
+
+    assert tokenizer.chat_template == "template"
+    assert processor.chat_template == "template"
+    assert dataset.base_args == ("train.parquet", tokenizer, {"chat_template": "template"})
+    assert dataset.base_kwargs == {"processor": processor, "max_samples": 8}
 
 
 def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
