@@ -264,6 +264,8 @@ if [[ "${CONFIG_ONLY}" == "1" ]]; then
 import os
 import sys
 
+from tilelang import env as tilelang_env
+
 config = open(sys.argv[1], encoding="utf-8").read()
 required = [
     "strategy: mlite",
@@ -285,6 +287,15 @@ if missing:
     raise SystemExit(f"resolved DS4 GRPO config is missing markers: {missing}")
 if "custom_chat_template: null" in config:
     raise SystemExit("resolved DS4 GRPO config has no chat template")
+for name, resolved_path in {
+    "TILELANG_CACHE_DIR": tilelang_env.TILELANG_CACHE_DIR,
+    "TILELANG_TMP_DIR": tilelang_env.TILELANG_TMP_DIR,
+}.items():
+    expected_path = os.environ[name]
+    if os.path.realpath(resolved_path) != os.path.realpath(expected_path):
+        raise SystemExit(
+            f"TileLang resolved {name}={resolved_path}, expected {expected_path}"
+        )
 cache_roots = {
     "vLLM": os.environ["VLLM_CACHE_ROOT"],
     "TileLang": os.environ["TILELANG_CACHE_DIR"],

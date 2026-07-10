@@ -193,6 +193,9 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "DS4_GRPO_CONFIG_COMPOSE_PASSED" in script
     assert '"gpu_memory_utilization: 0.6"' in script
     assert "os.path.isdir(cache_root)" in script
+    assert "from tilelang import env as tilelang_env" in script
+    assert "tilelang_env.TILELANG_CACHE_DIR" in script
+    assert "tilelang_env.TILELANG_TMP_DIR" in script
     assert "vllm_cache_root=${VLLM_CACHE_ROOT}" in script
     assert "tilelang_cache_dir=${TILELANG_CACHE_DIR}" in script
     assert '"use_legacy_worker_impl: disable"' in script
