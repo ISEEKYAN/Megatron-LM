@@ -956,6 +956,10 @@ class _MCoreRuntimeChunk(nn.Module):
         super().__init__()
         object.__setattr__(self, "_wrapped", wrapped)
 
+    @property
+    def ps(self):
+        return self._wrapped.module.ps
+
     def forward(self, *args, **kwargs):
         return self._wrapped(*args, **kwargs)
 
