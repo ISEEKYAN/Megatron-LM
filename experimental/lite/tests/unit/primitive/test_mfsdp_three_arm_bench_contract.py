@@ -41,6 +41,7 @@ def test_three_arm_bench_freezes_comparable_protocol():
     assert values["_OPTIMIZER"] == "torch.optim.AdamW"
     assert values["_COMPUTE_DTYPE"] == "bfloat16"
     assert values["_MAIN_PARAM_DTYPE"] == "bfloat16"
+    assert '"fsdp2_use_fp32_shards": False' in BENCH.read_text()
 
 
 def test_mlite_ablation_matrix_names_every_required_feature():

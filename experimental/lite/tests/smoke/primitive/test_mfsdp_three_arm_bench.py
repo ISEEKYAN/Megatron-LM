@@ -169,6 +169,7 @@ def _optimizer_config(overrides: dict[str, Any] | None = None) -> OptimizerConfi
         "megatron_fsdp_main_grads_dtype": torch.bfloat16,
         "megatron_fsdp_grad_comm_dtype": torch.bfloat16,
         "fsdp2_use_fp32_master": False,
+        "fsdp2_use_fp32_shards": False,
         "adamw_foreach": False,
         "fsdp2_use_te_fused_adam": False,
         **(overrides or {}),
