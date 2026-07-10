@@ -10,6 +10,10 @@ from megatron.lite.primitive.modules.attention.cp import (
     compress_contiguous_chunks_for_cp,
     iter_cp_sources,
 )
+from megatron.lite.primitive.parallel.cp import (
+    contiguous_slice_for_cp,
+    gather_contiguous_for_cp,
+)
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils.rotary import (
     _yarn_find_correction_range,
@@ -290,6 +294,17 @@ class CompressedSparseAttention(nn.Module):
     ) -> torch.Tensor:
         if self.ps.cp_size > 1 and attention_mask is not None:
             raise ValueError("CP expects attention_mask=None; masks are derived from position_ids.")
+        use_sparse_backend = self.attention_backend not in {"local", "eager", "torch"}
+        if (
+            use_sparse_backend
+            and self.ps.cp_size > 1
+            and self.compress_ratio == 4
+            and self.compressor is not None
+            and self.indexer is not None
+        ):
+            return self._forward_fused_dsa_cp(
+                x, position_ids=position_ids, attention_mask=attention_mask
+            )
         batch, seq_len, _ = x.shape
         attention_rope_theta = (
             self.config.compress_rope_theta if self.compress_ratio > 1 else self.config.rope_theta
@@ -311,7 +326,6 @@ class CompressedSparseAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
         q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
-        use_sparse_backend = self.attention_backend not in {"local", "eager", "torch"}
         if (
             use_sparse_backend
             and self.compress_ratio == 4
@@ -319,7 +333,7 @@ class CompressedSparseAttention(nn.Module):
             and self.compressor is not None
             and self.indexer is not None
         ):
-            return self._forward_fused_dsa_cp1(
+            return self._forward_fused_dsa_full(
                 x,
                 q,
                 q_low,
@@ -571,7 +585,87 @@ class CompressedSparseAttention(nn.Module):
         )
         return self._project_context(context, cos, sin)
 
-    def _forward_fused_dsa_cp1(
+    def _forward_fused_dsa_cp(
+        self,
+        x: torch.Tensor,
+        *,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if attention_mask is not None:
+            raise NotImplementedError("DeepSeek V4 fused DSA CP supports causal masking only.")
+
+        full_x = gather_contiguous_for_cp(
+            x, cp_size=self.ps.cp_size, cp_group=self.ps.cp_group, seq_dim=1
+        )
+        full_position_ids = gather_contiguous_for_cp(
+            position_ids.to(dtype=torch.long),
+            cp_size=self.ps.cp_size,
+            cp_group=self.ps.cp_group,
+            seq_dim=1,
+        )
+        self._validate_fused_sequence_positions(full_position_ids)
+
+        batch, seq_len, _ = full_x.shape
+        attention_rope_theta = (
+            self.config.compress_rope_theta
+            if self.compress_ratio > 1
+            else self.config.rope_theta
+        )
+        full_cos, full_sin = build_compressed_rope_cos_sin(
+            full_position_ids,
+            self.rope_head_dim,
+            attention_rope_theta,
+            config=self.config,
+            use_yarn=self.compress_ratio > 1,
+            device=full_x.device,
+            dtype=full_x.dtype,
+        )
+        full_q_low = self.q_norm(self.wq_a(full_x))
+        full_q = (
+            self.wq_b(full_q_low)
+            .view(batch, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        full_q = full_q * torch.rsqrt(
+            full_q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
+        ).to(dtype=full_q.dtype)
+        full_kv = (
+            self.kv_norm(self.wkv(full_x))
+            .view(batch, seq_len, 1, self.head_dim)
+            .transpose(1, 2)
+        )
+        full_q = apply_partial_rope(full_q, full_cos, full_sin, self.rope_head_dim)
+        full_kv = apply_partial_rope(full_kv, full_cos, full_sin, self.rope_head_dim)
+        full_output = self._forward_fused_dsa_full(
+            full_x,
+            full_q,
+            full_q_low,
+            full_kv,
+            position_ids=full_position_ids,
+            cos=full_cos,
+            sin=full_sin,
+            attention_mask=None,
+        )
+        return contiguous_slice_for_cp(
+            full_output, self.ps.cp_rank, self.ps.cp_size, seq_dim=1
+        )
+
+    @staticmethod
+    def _validate_fused_sequence_positions(position_ids: torch.Tensor) -> None:
+        """Reject packed multi-sequence batches the fused kernel cannot mask."""
+        for row in position_ids:
+            valid_len = int(row.max().item()) + 1 if row.numel() else 0
+            expected = torch.arange(valid_len, device=row.device, dtype=row.dtype)
+            prefix_ok = torch.equal(row[:valid_len], expected)
+            padding_ok = bool(torch.count_nonzero(row[valid_len:]).item() == 0)
+            if not prefix_ok or not padding_ok:
+                raise NotImplementedError(
+                    "DeepSeek V4 fused DSA CP requires one sequence per microbatch; "
+                    "packed multi-sequence boundaries are unsupported."
+                )
+
+    def _forward_fused_dsa_full(
         self,
         x: torch.Tensor,
         q: torch.Tensor,
@@ -583,8 +677,6 @@ class CompressedSparseAttention(nn.Module):
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self.ps.cp_size != 1:
-            raise NotImplementedError("DeepSeek V4 fused DSA path currently supports CP=1 only.")
         if attention_mask is not None:
             raise NotImplementedError(
                 "DeepSeek V4 fused DSA path currently supports causal masking only."

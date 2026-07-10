@@ -163,7 +163,7 @@ def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
         "loss_mask": packed.loss_mask,
         "position_ids": packed.position_ids,
         "packed_seq_params": packed.packed_seq_params,
-        "enable_mtp": False,
+        "enable_mtp": True,
     }
     add_loss_context_kwargs(kwargs)
     _prepare_packed_contiguous_cp_kwargs(model, kwargs)

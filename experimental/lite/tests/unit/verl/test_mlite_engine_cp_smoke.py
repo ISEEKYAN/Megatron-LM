@@ -39,7 +39,7 @@ def _write_kimi_config(path) -> None:
         "model_type": "deepseek_v3",
         "num_hidden_layers": 2,
         "hidden_size": 64,
-        "num_attention_heads": 4,
+        "num_attention_heads": 8,
         "num_key_value_heads": 4,
         "vocab_size": 128,
         "intermediate_size": 96,
@@ -111,24 +111,24 @@ def _write_deepseek_v4_config(path) -> None:
         "hidden_size": 128,
         "num_attention_heads": 4,
         "num_key_value_heads": 1,
-        "head_dim": 32,
+        "head_dim": 64,
         "vocab_size": 128,
         "max_position_embeddings": 128,
         "initializer_range": 0.02,
-        "q_lora_rank": 64,
+        "q_lora_rank": 32,
         "qk_rope_head_dim": 16,
-        "o_lora_rank": 64,
-        "o_groups": 4,
-        "index_head_dim": 16,
-        "index_n_heads": 4,
+        "o_lora_rank": 32,
+        "o_groups": 2,
+        "index_head_dim": 64,
+        "index_n_heads": 8,
         "index_topk": 4,
         "moe_intermediate_size": 32,
         "n_routed_experts": 4,
         "n_shared_experts": 1,
         "num_experts_per_tok": 2,
         "num_hash_layers": 1,
-        "num_nextn_predict_layers": 0,
-        "compress_ratios": [4, 4],
+        "num_nextn_predict_layers": 1,
+        "compress_ratios": [4, 4, 4],
         "compress_rope_theta": 160000.0,
         "hc_mult": 2,
         "hc_eps": 1e-6,
@@ -186,13 +186,14 @@ def _optimizer_config() -> SimpleNamespace:
             "deepseek_v4",
             _write_deepseek_v4_config,
             128,
-            [16, 20, 24],
+            [64],
             "dist_opt",
         ),
     ],
 )
 def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     tmp_path,
+    monkeypatch,
     model_name,
     model_type,
     write_config,
@@ -216,6 +217,33 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     hf_path = tmp_path / f"tiny-{model_name}"
     write_config(hf_path)
 
+    route_hits = None
+    if model_name == "deepseek_v4":
+        from megatron.lite.model.deepseek_v4.lite import model as ds4_model
+        from megatron.lite.primitive.modules.attention import csa as csa_module
+
+        route_hits = SimpleNamespace(fused=0, dense=0, mtp=0)
+        kernels = csa_module._load_dsa_kernels()
+        original_fused = kernels.fused_indexer_sparse_attn
+        original_dense = csa_module.iter_cp_sources
+        original_mtp = ds4_model.DeepseekV4MTPLayer.forward
+
+        def trace_fused(*args, **kwargs):
+            route_hits.fused += 1
+            return original_fused(*args, **kwargs)
+
+        def trace_dense(*args, **kwargs):
+            route_hits.dense += 1
+            yield from original_dense(*args, **kwargs)
+
+        def trace_mtp(*args, **kwargs):
+            route_hits.mtp += 1
+            return original_mtp(*args, **kwargs)
+
+        monkeypatch.setattr(kernels, "fused_indexer_sparse_attn", trace_fused)
+        monkeypatch.setattr(csa_module, "iter_cp_sources", trace_dense)
+        monkeypatch.setattr(ds4_model.DeepseekV4MTPLayer, "forward", trace_mtp)
+
     engine = MegatronLiteEngine(
         model_config=SimpleNamespace(
             local_path=str(hf_path),
@@ -229,9 +257,11 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
                 "use_thd": True,
                 "optimizer": optimizer_backend,
                 "deterministic": False,
-                "mtp_enable": False,
+                "mtp_enable": model_name == "deepseek_v4",
+                "mtp_enable_train": model_name == "deepseek_v4",
+                "recompute": "full" if model_name == "deepseek_v4" else [],
             },
-            use_fused_kernels=False,
+            use_fused_kernels=model_name == "deepseek_v4",
         ),
         optimizer_config=_optimizer_config(),
         checkpoint_config={},
@@ -290,6 +320,10 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
 
     assert torch.isfinite(result.model_output.loss)
     assert result.model_output.log_probs is not None
+    if route_hits is not None:
+        assert route_hits.fused > 0
+        assert route_hits.dense == 0
+        assert route_hits.mtp > 0
     grad_norm = torch.zeros((), dtype=torch.float32, device=device)
     for param in engine.module.parameters():
         grad = param.grad
@@ -345,6 +379,13 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     assert [int(x) for x in nested_log_probs.offsets().diff().cpu()] == lengths
 
     if rank == 0:
+        if route_hits is not None:
+            print(
+                "NON_FALLBACK_DS4_FUSED_DSA_CP_MTP_ROUTE_PASSED "
+                f"fused_indexer_sparse_attn_calls={route_hits.fused} "
+                f"dense_iter_cp_sources_calls={route_hits.dense} "
+                f"mtp_forward_calls={route_hits.mtp} recompute=full"
+            )
         fields = [
             "NON_SKIP_VERL_MLITE_RUNTIME_THD_CP_SMOKE_PASSED",
             f"model={model_name}",
