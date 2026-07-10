@@ -1,4 +1,5 @@
 import inspect
+import json
 import sys
 from types import SimpleNamespace
 
@@ -176,6 +177,101 @@ def test_transformers_alias_precedes_verl_importing_runtime_patches() -> None:
     assert source.index("_patch_transformers_vision2seq_alias()") < source.index(
         "_patch_vllm_server_profile()"
     )
+
+
+def test_runtime_patch_trace_reports_alias_lifetime(monkeypatch, capsys) -> None:
+    from verl_mlite import compat
+
+    replacement = object()
+    calls = []
+
+    class TransformersModule(SimpleNamespace):
+        def __getattr__(self, name):
+            raise AssertionError(f"trace triggered lazy lookup: {name}")
+
+    transformers = TransformersModule(AutoModelForImageTextToText=replacement)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setenv("VERL_MLITE_RUNTIME_PATCH_TRACE", "1")
+
+    def patch_alias():
+        calls.append("transformers_alias")
+        transformers.AutoModelForVision2Seq = replacement
+        return True
+
+    def remove_alias():
+        calls.append("vllm_triton_kernels_alias")
+        del transformers.AutoModelForVision2Seq
+        return True
+
+    monkeypatch.setattr(compat, "_patch_transformers_vision2seq_alias", patch_alias)
+
+    def unchanged(name, result=True):
+        def patch():
+            calls.append(name)
+            return result
+
+        return patch
+
+    monkeypatch.setattr(
+        compat, "_register_opaque_hf_config", unchanged("opaque_hf_config")
+    )
+    monkeypatch.setattr(
+        compat, "_install_vllm_thin_finder", unchanged("vllm_thin_finder")
+    )
+    monkeypatch.setattr(compat, "_install_vllm_triton_kernels_alias", remove_alias)
+    monkeypatch.setattr(
+        compat, "_patch_verl_vllm_device_uuid", unchanged("verl_vllm_device_uuid")
+    )
+    monkeypatch.setattr(
+        compat,
+        "_patch_transformers_rope_ignore_keys",
+        unchanged("transformers_rope_ignore_keys", None),
+    )
+    monkeypatch.setattr(
+        compat, "_patch_bucketed_weight_sender", unchanged("bucketed_weight_sender")
+    )
+    monkeypatch.setattr(
+        compat, "_patch_vllm_server_profile", unchanged("vllm_server_profile")
+    )
+
+    compat.apply_runtime_patches()
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    prefix = "VERL_MLITE_RUNTIME_PATCH_TRACE "
+    records = [
+        json.loads(line.removeprefix(prefix))
+        for line in captured.err.splitlines()
+        if line.startswith(prefix)
+    ]
+    assert [record["step"] for record in records] == [
+        "00.begin",
+        "01.transformers_alias",
+        "02.opaque_hf_config",
+        "03.vllm_thin_finder",
+        "04.vllm_triton_kernels_alias",
+        "05.verl_vllm_device_uuid",
+        "06.transformers_rope_ignore_keys",
+        "07.bucketed_weight_sender",
+        "08.vllm_server_profile",
+        "09.end",
+    ]
+    assert records[1]["changed"] is True
+    assert records[1]["alias_source"] == "namespace"
+    assert records[1]["alias_is_replacement"] is True
+    assert records[4]["alias_source"] == "absent"
+    assert calls == [record["step"].split(".", 1)[1] for record in records[1:-1]]
+
+
+def test_runtime_patch_trace_is_silent_by_default(monkeypatch, capsys) -> None:
+    from verl_mlite import compat
+
+    monkeypatch.delenv("VERL_MLITE_RUNTIME_PATCH_TRACE", raising=False)
+    compat._trace_runtime_patch("disabled", False)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_vllm_server_profile_is_disabled_without_explicit_site(monkeypatch) -> None:

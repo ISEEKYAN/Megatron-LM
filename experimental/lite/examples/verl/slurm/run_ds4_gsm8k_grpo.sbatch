@@ -148,6 +148,7 @@ if [[ "${IMPORT_ONLY}" == "1" ]]; then
   env \
     PYTHONPATH="${DS4_VLLM_SITE}:${PYTHONPATH}" \
     VERL_MLITE_SKIP_RUNTIME_PATCHES=0 \
+    VERL_MLITE_RUNTIME_PATCH_TRACE=1 \
     python - <<'PY'
 import os
 import sys
@@ -164,20 +165,16 @@ alias_before = (
 )
 from verl_mlite import compat
 
-explicit_patch_result = compat._patch_transformers_vision2seq_alias()
-alias_after_explicit_patch = (
-    vars(transformers).get(alias_name) is AutoModelForImageTextToText
-    or getattr(transformers, "_objects", {}).get(alias_name)
-    is AutoModelForImageTextToText
-)
 print(
     "DS4_SERVER_IMPORT_STATE "
     f"sitecustomize={getattr(startup_sitecustomize, '__file__', None)} "
     f"compat={compat.__file__} "
+    f"transformers_id={id(transformers)} "
+    f"transformers_version={transformers.__version__} "
+    f"vllm_site={os.environ.get('VERL_MLITE_VLLM_SITE')} "
     f"weight_sync_probe={os.environ.get('MLITE_WEIGHT_SYNC_PROBE')} "
     f"skip_runtime_patches={os.environ.get('VERL_MLITE_SKIP_RUNTIME_PATCHES')} "
-    f"alias_before={alias_before} explicit_patch_result={explicit_patch_result} "
-    f"alias_after_explicit_patch={alias_after_explicit_patch}",
+    f"alias_before={alias_before}",
     flush=True,
 )
 assert startup_sitecustomize is not None, "sitecustomize did not load at startup"

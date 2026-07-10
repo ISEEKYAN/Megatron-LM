@@ -577,15 +577,71 @@ def _patch_transformers_rope_ignore_keys() -> None:
         cls._verl_mlite_rope_ignore_keys_patch = True
 
 
+def _trace_runtime_patch(stage: str, result: Any = None) -> None:
+    """Report patch ordering only for an explicitly traced startup."""
+    if os.environ.get("VERL_MLITE_RUNTIME_PATCH_TRACE") != "1":
+        return
+
+    import json
+
+    transformers = sys.modules.get("transformers")
+    module_vars = vars(transformers) if transformers is not None else {}
+    objects = module_vars.get("_objects")
+    missing = object()
+
+    def raw_binding(name: str) -> tuple[Any, str]:
+        if name in module_vars:
+            return module_vars[name], "namespace"
+        if isinstance(objects, dict) and name in objects:
+            return objects[name], "_objects"
+        return missing, "absent"
+
+    alias, alias_source = raw_binding("AutoModelForVision2Seq")
+    replacement, replacement_source = raw_binding(
+        "AutoModelForImageTextToText"
+    )
+    payload = {
+        "alias_is_replacement": (
+            alias is not missing
+            and replacement is not missing
+            and alias is replacement
+        ),
+        "alias_source": alias_source,
+        "changed": result,
+        "event": "runtime_patch",
+        "pid": os.getpid(),
+        "replacement_source": replacement_source,
+        "step": stage,
+        "transformers_file": module_vars.get("__file__"),
+        "transformers_id": id(transformers) if transformers is not None else None,
+        "transformers_loaded": transformers is not None,
+    }
+    sys.stderr.write(
+        "VERL_MLITE_RUNTIME_PATCH_TRACE "
+        f"{json.dumps(payload, sort_keys=True)}\n"
+    )
+    sys.stderr.flush()
+
+
 def apply_runtime_patches() -> None:
-    _patch_transformers_vision2seq_alias()
-    _register_opaque_hf_config()
-    _install_vllm_thin_finder()
-    _install_vllm_triton_kernels_alias()
-    _patch_verl_vllm_device_uuid()
-    _patch_transformers_rope_ignore_keys()
-    _patch_bucketed_weight_sender()
-    _patch_vllm_server_profile()
+    _trace_runtime_patch("00.begin")
+    result = _patch_transformers_vision2seq_alias()
+    _trace_runtime_patch("01.transformers_alias", result)
+    result = _register_opaque_hf_config()
+    _trace_runtime_patch("02.opaque_hf_config", result)
+    result = _install_vllm_thin_finder()
+    _trace_runtime_patch("03.vllm_thin_finder", result)
+    result = _install_vllm_triton_kernels_alias()
+    _trace_runtime_patch("04.vllm_triton_kernels_alias", result)
+    result = _patch_verl_vllm_device_uuid()
+    _trace_runtime_patch("05.verl_vllm_device_uuid", result)
+    result = _patch_transformers_rope_ignore_keys()
+    _trace_runtime_patch("06.transformers_rope_ignore_keys", result)
+    result = _patch_bucketed_weight_sender()
+    _trace_runtime_patch("07.bucketed_weight_sender", result)
+    result = _patch_vllm_server_profile()
+    _trace_runtime_patch("08.vllm_server_profile", result)
+    _trace_runtime_patch("09.end")
 
 
 def _load_verl_file(relative_path: str, module_name: str):

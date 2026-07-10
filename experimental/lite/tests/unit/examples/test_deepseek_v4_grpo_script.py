@@ -199,9 +199,7 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "DS4_SERVER_IMPORT_STATE" in script
     assert "DS4_SERVER_IMPORT_PASSED" in script
     assert "import sitecustomize" not in import_program
-    assert import_program.index('sys.modules.get("sitecustomize")') < (
-        import_program.index("compat._patch_transformers_vision2seq_alias()")
-    )
+    assert "compat._patch_transformers_vision2seq_alias()" not in import_program
     assert import_program.index('"DS4_SERVER_IMPORT_STATE "') < (
         import_program.index("assert startup_sitecustomize is not None")
     )
@@ -221,6 +219,11 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     )
     assert "weight_sync_probe=" in import_program
     assert "skip_runtime_patches=" in import_program
+    assert "transformers_id=" in import_program
+    assert "transformers_version=" in import_program
+    assert "vllm_site=" in import_program
+    assert script.count("VERL_MLITE_RUNTIME_PATCH_TRACE=1") == 1
+    assert '"VERL_MLITE_RUNTIME_PATCH_TRACE",' not in script
     assert "export VERL_MLITE_HF_CONFIG_MODEL_TYPE=deepseek_v4" in script
     assert '"VERL_MLITE_HF_CONFIG_MODEL_TYPE",' in script
     assert '"CHECKPOINT_DIR",' in script
