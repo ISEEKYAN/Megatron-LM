@@ -107,6 +107,7 @@ def _dsa_fwd_flash_mla(
 
     kv_3d = kv.unsqueeze(1)  # (total_S_kv, 1, D)  h_kv=1
     indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
+    extended_kwargs = {"indexer_topk": indexer_topk} if indexer_topk > 0 else {}
 
     with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
         res = _flash_mla_sparse_fwd(
@@ -117,7 +118,7 @@ def _dsa_fwd_flash_mla(
             d_v=d_v,
             attn_sink=attn_sink,
             topk_length=topk_length,
-            indexer_topk=indexer_topk,
+            **extended_kwargs,
         )
         if indexer_topk > 0:
             out, _max_logits, lse, lse_indexer = res
@@ -823,7 +824,6 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         sq, b, np_, d = query.shape
         skv = kv_full.shape[0]
         n_comp = k_indexer.shape[0]
-        idx_nh, idx_hd = q_indexer.shape[2], q_indexer.shape[3]
 
         requested_topk = indexer_topk
         effective_topk = min(requested_topk, n_comp)
