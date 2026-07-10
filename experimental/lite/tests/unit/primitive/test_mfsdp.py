@@ -933,6 +933,9 @@ def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
         if microbatch_idx == len(microbatches) - 1:
             candidate_optimizer.grad_sync_enabled = True
         (candidate_loss / len(microbatches)).backward()
+        assert all(
+            bucket._full_lease is None for bucket in chunks[0].param_sync.buckets
+        )
 
     candidate_optimizer.finish_grad_sync()
 
@@ -1152,6 +1155,7 @@ def test_mfsdp_releases_full_parameters_and_preserves_storage_aliases_on_move():
 
 def test_mfsdp_keeps_full_parameter_bindings_for_opaque_backward():
     model = _OpaqueWeightUnit()
+    full_weight = model.weight
     ps = SimpleNamespace(
         dp_cp_group=None,
         dp_group=None,
@@ -1185,7 +1189,12 @@ def test_mfsdp_keeps_full_parameter_bindings_for_opaque_backward():
     )
 
     value = torch.randn(2, 4, requires_grad=True)
-    chunks[0](value).sum().backward()
+    output = chunks[0](value)
+
+    assert model.weight is not full_weight
+    output.sum().backward()
+    assert model.weight is not full_weight
+    assert chunks[0].param_sync.buckets[0]._full_lease is None
 
 
 def _run_mfsdp_gloo_parity(rank: int, world_size: int, init_file: str) -> None:

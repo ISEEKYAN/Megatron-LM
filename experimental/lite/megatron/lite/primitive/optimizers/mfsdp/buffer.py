@@ -613,12 +613,13 @@ class ParamBucket:
             if param.grad is None:
                 return
             self._grad_ready_ids.add(id(spec))
-            if (
-                self.grad_sync_enabled
-                and len(self._grad_ready_ids) == len(self.specs)
-                and self.grad_ready_callback is not None
-            ):
+            if len(self._grad_ready_ids) != len(self.specs):
+                return
+            if self.grad_sync_enabled and self.grad_ready_callback is not None:
                 self.grad_ready_callback(self)
+            self.release_full_parameters()
+            if not self.grad_sync_enabled:
+                self._grad_ready_ids.clear()
 
         return grad_ready
 
@@ -880,6 +881,7 @@ class AllGatherPipeline:
     def acquire_backward(self, bucket: ParamBucket) -> None:
         bucket_id = bucket.bucket_id
         self.wait_bucket_ready(bucket_id, bwd=True)
+        bucket.install_full_parameters()
         self._backward_cursor = min(self._backward_cursor, bucket_id - 1)
         if self.overlap and self._backward_cursor >= 0:
             self.async_bucket_gather(self._backward_cursor, bwd=True)
@@ -969,6 +971,14 @@ class CommunicationPipelines:
 
     def acquire_backward(self, bucket: ParamBucket) -> None:
         self.all_gather.acquire_backward(bucket)
+
+    def acquire_backward_ids(self, bucket_ids: Iterable[int]) -> None:
+        for bucket_id in reversed(tuple(bucket_ids)):
+            self.all_gather.acquire_backward(self.buckets[bucket_id])
+
+    def release_backward_ids(self, bucket_ids: Iterable[int]) -> None:
+        for bucket_id in bucket_ids:
+            self.buckets[bucket_id].release_full_parameters()
 
     def end_forward(self) -> None:
         self.all_gather.release_all()

@@ -39,6 +39,42 @@ class _BeginBackward(torch.autograd.Function):
         return grad, None
 
 
+class _AcquireBackward(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        pipeline: CommunicationPipelines,
+        bucket_ids: tuple[int, ...],
+    ) -> torch.Tensor:
+        ctx.pipeline = pipeline
+        ctx.bucket_ids = bucket_ids
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        ctx.pipeline.acquire_backward_ids(ctx.bucket_ids)
+        return grad, None, None
+
+
+class _ReleaseBackward(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        pipeline: CommunicationPipelines,
+        bucket_ids: tuple[int, ...],
+    ) -> torch.Tensor:
+        ctx.pipeline = pipeline
+        ctx.bucket_ids = bucket_ids
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        ctx.pipeline.release_backward_ids(ctx.bucket_ids)
+        return grad, None, None
+
+
 class MegatronFSDP(nn.Module):
     """Wrap a module with bucketed sharding and communication overlap."""
 
@@ -67,9 +103,30 @@ class MegatronFSDP(nn.Module):
         self.grad_reduce_pipeline: GradReducePipeline = self.param_sync.grad_reduce
         for owner_id, bucket_ids in self.param_and_grad_buffer.owners.items():
             owner = _module_by_id(module, owner_id)
-            owner.register_forward_pre_hook(
-                lambda _module, _args, ids=tuple(bucket_ids): (
-                    self.param_sync.acquire_forward(ids)
+            ids = tuple(bucket_ids)
+
+            def prepare_forward(_module, args, ids=ids):
+                self.param_sync.acquire_forward(ids)
+                return tree_map_only(
+                    torch.Tensor,
+                    lambda tensor: (
+                        _ReleaseBackward.apply(tensor, self.param_sync, ids)
+                        if tensor.requires_grad
+                        else tensor
+                    ),
+                    args,
+                )
+
+            owner.register_forward_pre_hook(prepare_forward)
+            owner.register_forward_hook(
+                lambda _module, _args, output, ids=ids: tree_map_only(
+                    torch.Tensor,
+                    lambda tensor: (
+                        _AcquireBackward.apply(tensor, self.param_sync, ids)
+                        if tensor.requires_grad
+                        else tensor
+                    ),
+                    output,
                 )
             )
         self.param_sync.release_all()
@@ -77,13 +134,10 @@ class MegatronFSDP(nn.Module):
 
     def forward(self, *args, **kwargs):
         self.param_sync.begin_forward()
-        keep_full_parameters = False
 
         def attach_backward(tensor: torch.Tensor) -> torch.Tensor:
-            nonlocal keep_full_parameters
             if not tensor.requires_grad:
                 return tensor
-            keep_full_parameters = True
             return _BeginBackward.apply(tensor, self.param_sync)
 
         try:
@@ -98,8 +152,7 @@ class MegatronFSDP(nn.Module):
                     output,
                 )
         finally:
-            if not keep_full_parameters:
-                self.param_sync.end_forward()
+            self.param_sync.end_forward()
         return output
 
     def start_param_sync(self, *_args, force_sync: bool = False, **_kwargs) -> None:
