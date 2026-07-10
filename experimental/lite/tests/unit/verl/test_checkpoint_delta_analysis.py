@@ -168,6 +168,41 @@ def test_tensor_delta_statistics_keeps_unquantized_head_in_target_format() -> No
     assert fp8["serialized_bytes"] == stats["dense_bytes"]
 
 
+def test_tensor_delta_statistics_keeps_conv_weight_out_of_block_fp8() -> None:
+    before = torch.zeros((2, 1, 2), dtype=torch.bfloat16)
+    after = before.clone()
+    after[0, 0, 0] = 1.0
+
+    stats = delta_analysis.tensor_delta_statistics(
+        "model.layers.0.linear_attn.conv1d.weight",
+        before,
+        after,
+        fp8_block_shape=(2, 2),
+    )
+
+    fp8 = stats["target_formats"]["block_fp8"]
+    assert fp8["kind"] == "passthrough_bf16"
+    assert fp8["serialized_bytes"] == stats["dense_bytes"]
+
+
+def test_tensor_delta_statistics_quantizes_packed_expert_matrices() -> None:
+    before = torch.zeros((2, 2, 2), dtype=torch.bfloat16)
+    after = before.clone()
+    after[0, 0, 0] = 1.0
+
+    stats = delta_analysis.tensor_delta_statistics(
+        "model.layers.0.mlp.experts.gate_up_proj",
+        before,
+        after,
+        fp8_block_shape=(2, 2),
+    )
+
+    fp8 = stats["target_formats"]["block_fp8"]
+    assert fp8["kind"] == "quantized"
+    assert fp8["weight_numel"] == 8
+    assert fp8["scale_numel"] == 2
+
+
 def test_tensor_delta_statistics_quantizes_dcp_local_expert_weight_name() -> None:
     before = torch.zeros((2, 2), dtype=torch.bfloat16)
     after = before.clone()

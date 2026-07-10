@@ -124,6 +124,16 @@ def _is_weight_tensor_name(name: str) -> bool:
     return name.endswith(".weight") or re.search(r"\.weight\d+$", name) is not None
 
 
+def _is_block_fp8_weight(name: str, tensor: torch.Tensor, family: str) -> bool:
+    if tensor.ndim == 2:
+        return _is_weight_tensor_name(name)
+    return (
+        family == "expert"
+        and tensor.ndim == 3
+        and name.endswith((".experts.gate_up_proj", ".experts.down_proj"))
+    )
+
+
 def _quantize_block_fp8(
     tensor: torch.Tensor, block_shape: tuple[int, int]
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -196,10 +206,8 @@ def _block_fp8_target_statistics(
     exact_changed_count: int,
 ) -> dict[str, object]:
     family = classify_parameter_family(name)
-    if (
-        family not in set(quantized_families)
-        or not _is_weight_tensor_name(name)
-        or before.ndim < 2
+    if family not in set(quantized_families) or not _is_block_fp8_weight(
+        name, before, family
     ):
         dtype_name = _target_dtype_name(before.dtype)
         return _direct_target_statistics(
