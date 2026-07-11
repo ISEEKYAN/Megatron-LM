@@ -37,22 +37,33 @@ all-gather, lower-precision optimizer state, FP8 communication, arbitrary
 target combinations, model allowlists, and model-local FP8 implementations are
 out of scope.
 
-## Frozen Independent Reference
+## Independent Reference
 
 Parity uses direct upstream source, not Megatron Lite through a second runtime
 path:
 
 - Megatron-Core commit
   [`cf2f07d7b1315c96c05554c670c43207c6783e5e`][mcore-commit];
-- Transformer Engine commit
-  [`8b9968255eb879e6e390f427836906b29aad64d2`][te-commit], which reports
-  version `2.18.0.dev0`; and
+- the canonical training image's released Transformer Engine `2.15.0`, whose
+  blockwise kernels (Linear, LayerNormLinear, GroupedLinear) run forward and
+  backward under `Float8BlockScaling` -- verified by a read-only capability
+  inventory on that image (SM90, CUDA 13.2, cuBLAS 13.4, block scaling
+  supported, all mandatory ops ran); and
 - an NVIDIA Hopper GPU with compute capability exactly 9.0.
 
+Blockwise FP8 runs on the same image that runs BF16 -- there is no FP8-only
+build overlay. The runtime gate pins the released Transformer Engine version
+`2.15.0`; requiring an exact build SHA would recreate a special-environment
+requirement, so the build SHA is recorded for provenance only and the
+capability preflight below is the fail-loud safety net. The [te-commit] link
+and the `[te-*]` source citations point at readable upstream source for the
+blockwise recipe, quantization, and grouped-GEMM APIs; TE 2.15 implements the
+same blockwise contract, which the inventory confirms at runtime.
+
 The reference driver must import Megatron-Core from the frozen checkout and
-Transformer Engine from a build of the frozen TE commit. A package version
-string alone is insufficient. The driver must assert both source revisions
-before allocating model state.
+Transformer Engine from the canonical image. A package version string is
+matched against `2.15.0`; the driver must assert the Megatron-Core revision and
+the TE version before allocating model state.
 
 ### Environment seal
 
@@ -77,11 +88,11 @@ The image is qualified only if all of the following preflight checks pass:
 
 1. `torch.cuda.get_device_capability()` is `(9, 0)`. Blackwell emulation is not
    accepted by these Hopper-named profiles.
-2. TE's `check_fp8_block_scaling_support()` succeeds. At the frozen TE commit,
+2. TE's `check_fp8_block_scaling_support()` succeeds. On canonical TE 2.15,
    this requires CUDA 12.9 or newer in addition to SM90.
-3. The TE build and runtime cuBLAS versions are both at least 13.4. The frozen
-   TE GroupedLinear implementation requires that version for blockwise FP8
-   grouped GEMM, and MoE is mandatory in this release.
+3. The runtime cuBLAS version is at least 13.4. TE 2.15's GroupedLinear
+   implementation requires that version for blockwise FP8 grouped GEMM, and MoE
+   is mandatory in this release.
 4. `NVTE_FP8_BLOCK_SCALING_FP32_SCALES` is absent or `0`,
    `NVTE_BACKWARD_OVERRIDE` is absent, and the constructed recipe equals the
    frozen recipe below.
