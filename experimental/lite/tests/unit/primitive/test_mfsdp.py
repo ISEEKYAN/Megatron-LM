@@ -18,7 +18,6 @@ import torch.multiprocessing as mp
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
 from megatron.lite.primitive.optimizers.mfsdp import buffer as mfsdp_buffer
 from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
-from megatron.lite.primitive.optimizers import get_optimizer_backend
 from megatron.lite.runtime.contracts.config import ParallelConfig
 
 
@@ -186,7 +185,6 @@ def test_mfsdp_source_layout_is_bounded():
 
     assert modules == {
         "__init__.py",
-        "backend.py",
         "buffer.py",
         "config.py",
         "fully_shard.py",
@@ -229,7 +227,6 @@ def test_mfsdp_config_validation_does_not_require_or_filter_model_name():
 def test_mfsdp_reference_rewrite_modules_are_live():
     package = Path(mfsdp_config.__file__).parent
     required_modules = {
-        "backend.py",
         "buffer.py",
         "config.py",
         "fully_shard.py",
@@ -434,11 +431,6 @@ def test_mfsdp_nccl_user_buffer_falls_back_when_apex_is_missing(monkeypatch):
     )
 
     assert user_buffer.active is False
-
-
-def test_mfsdp_backend_is_registered():
-    backend = get_optimizer_backend("mfsdp")
-    assert backend.name == "mfsdp"
 
 
 def test_mfsdp_parallel_metadata_uses_topology_and_explicit_classifier():
