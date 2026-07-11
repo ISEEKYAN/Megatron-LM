@@ -339,6 +339,27 @@ print(
     flush=True,
 )
 PY
+    env \
+      VERL_FILE_LOGGER_PATH="${RUN_ROOT}/file-logger-preflight.jsonl" \
+      VERL_MLITE_SKIP_RUNTIME_PATCHES=1 \
+      python - <<'PY'
+import json
+import os
+
+from verl.utils.tracking import FileLogger
+
+logger = FileLogger("ds4-preflight", "file-logger")
+logger.log({"writable": True}, step=0)
+logger.finish()
+with open(os.environ["VERL_FILE_LOGGER_PATH"], encoding="utf-8") as log_file:
+    record = json.loads(log_file.read())
+assert record == {"step": 0, "data": {"writable": True}}, record
+print(
+    "DS4_FILE_LOGGER_PREFLIGHT_PASSED "
+    f"path={os.environ['VERL_FILE_LOGGER_PATH']}",
+    flush=True,
+)
+PY
     echo "DS4_GRPO_CONFIG_COMPOSE_PASSED source=${MLITE_COMMIT} vllm_cache_root=${VLLM_CACHE_ROOT} tilelang_cache_dir=${TILELANG_CACHE_DIR}"
   fi
   exit 0
@@ -455,6 +476,18 @@ env["VERL_MLITE_SKIP_RUNTIME_PATCHES"] = "0"
 print(json.dumps({"env_vars": env}))
 PY
 )
+
+runtime_env_with_file_logger_path() {
+  python - "${RUNTIME_ENV_JSON}" "$1" <<'PY'
+import json
+import sys
+
+runtime_env = json.loads(sys.argv[1])
+env_vars = runtime_env.setdefault("env_vars", {})
+env_vars["VERL_FILE_LOGGER_PATH"] = sys.argv[2]
+print(json.dumps(runtime_env))
+PY
+}
 
 if [[ "${RAY_ONLY}" == "1" ]]; then
   "${RAY_CLI[@]}" job submit \
@@ -674,16 +707,7 @@ run_phase() {
   local jsonl_file="${RUN_ROOT}/${phase}.jsonl"
   local cmd_file="${RUN_ROOT}/${phase}.cmd.sh"
   local phase_runtime_env_json
-  phase_runtime_env_json=$(python - "${RUNTIME_ENV_JSON}" "${jsonl_file}" <<'PY'
-import json
-import sys
-
-runtime_env = json.loads(sys.argv[1])
-env_vars = runtime_env.setdefault("env_vars", {})
-env_vars["VERL_FILE_LOGGER_PATH"] = sys.argv[2]
-print(json.dumps(runtime_env))
-PY
-)
+  phase_runtime_env_json=$(runtime_env_with_file_logger_path "${jsonl_file}")
   "${RAY_CLI[@]}" job submit \
     --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
     --runtime-env-json="${phase_runtime_env_json}" \
