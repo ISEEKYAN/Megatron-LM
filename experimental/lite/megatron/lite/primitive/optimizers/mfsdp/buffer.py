@@ -363,10 +363,14 @@ class ParamBucket:
             dtype=self.policy.compute_dtype,
             device=self.device,
         )
-        self.local_grad_comm_buffer = torch.empty(
-            self.local_numel,
-            dtype=self.policy.grad_comm_dtype,
-            device=self.device,
+        self.local_grad_comm_buffer = (
+            self.main_grad_buffer
+            if self.policy.grad_comm_dtype == self.policy.main_grads_dtype
+            else torch.empty(
+                self.local_numel,
+                dtype=self.policy.grad_comm_dtype,
+                device=self.device,
+            )
         )
         self.full_buffer = torch.empty(0, dtype=compute_dtype, device=self.device)
         self._full_lease: BufferLease | None = None
@@ -502,10 +506,15 @@ class ParamBucket:
             for spec in self.specs
         }
         self.main_param_buffer = self.main_param_buffer.to(device)
+        grad_comm_shares_main = self.local_grad_comm_buffer is self.main_grad_buffer
         self.main_grad_buffer = self.main_grad_buffer.to(device)
         self.grad_shard_buffer = self.main_grad_buffer
         self.local_compute_buffer = self.local_compute_buffer.to(device)
-        self.local_grad_comm_buffer = self.local_grad_comm_buffer.to(device)
+        self.local_grad_comm_buffer = (
+            self.main_grad_buffer
+            if grad_comm_shares_main
+            else self.local_grad_comm_buffer.to(device)
+        )
         self.device = device
         self.full_buffer = torch.empty(
             0,

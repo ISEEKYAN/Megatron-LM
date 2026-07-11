@@ -1285,6 +1285,63 @@ def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
     assert torch.isfinite(chunks[0](value).float()).all()
 
 
+def test_mfsdp_reuses_main_grad_storage_for_matching_comm_dtype():
+    model = _GlooModel().to(torch.bfloat16)
+    groups = mfsdp_buffer.MFSDPProcessGroups(
+        dense_dp=None,
+        expert_dp=None,
+        dense_ag=None,
+        expert_ag=None,
+        tp=None,
+        etp=None,
+        ep=None,
+        pp=None,
+    )
+    buffers = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=groups,
+        config=mfsdp_config.MFSDPConfig(
+            main_grads_dtype=torch.float32,
+            grad_comm_dtype=torch.float32,
+        ),
+        is_expert=lambda _name: False,
+        unit_modules=(_GlooUnit,),
+    )
+
+    for bucket in buffers.buckets:
+        assert bucket.local_grad_comm_buffer is bucket.main_grad_buffer
+        bucket.move_model_state(torch.device("cpu"), load_grad=False)
+        assert bucket.local_grad_comm_buffer is bucket.main_grad_buffer
+
+
+def test_mfsdp_keeps_distinct_grad_comm_storage_for_mixed_dtypes():
+    model = _GlooModel().to(torch.bfloat16)
+    groups = mfsdp_buffer.MFSDPProcessGroups(
+        dense_dp=None,
+        expert_dp=None,
+        dense_ag=None,
+        expert_ag=None,
+        tp=None,
+        etp=None,
+        ep=None,
+        pp=None,
+    )
+    buffers = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=groups,
+        config=mfsdp_config.MFSDPConfig(
+            main_grads_dtype=torch.float32,
+            grad_comm_dtype=torch.bfloat16,
+        ),
+        is_expert=lambda _name: False,
+        unit_modules=(_GlooUnit,),
+    )
+
+    for bucket in buffers.buckets:
+        assert bucket.local_grad_comm_buffer is not bucket.main_grad_buffer
+        assert bucket.local_grad_comm_buffer.dtype == torch.bfloat16
+
+
 def test_mfsdp_releases_full_parameters_and_preserves_storage_aliases_on_move():
     model = _GlooModel()
     ps = SimpleNamespace(
