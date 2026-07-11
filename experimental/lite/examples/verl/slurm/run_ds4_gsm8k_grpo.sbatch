@@ -673,9 +673,20 @@ run_phase() {
   local log_file="${RUN_ROOT}/${phase}.log"
   local jsonl_file="${RUN_ROOT}/${phase}.jsonl"
   local cmd_file="${RUN_ROOT}/${phase}.cmd.sh"
+  local phase_runtime_env_json
+  phase_runtime_env_json=$(python - "${RUNTIME_ENV_JSON}" "${jsonl_file}" <<'PY'
+import json
+import sys
+
+runtime_env = json.loads(sys.argv[1])
+env_vars = runtime_env.setdefault("env_vars", {})
+env_vars["VERL_FILE_LOGGER_PATH"] = sys.argv[2]
+print(json.dumps(runtime_env))
+PY
+)
   "${RAY_CLI[@]}" job submit \
     --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
-    --runtime-env-json="${RUNTIME_ENV_JSON}" \
+    --runtime-env-json="${phase_runtime_env_json}" \
     -- \
     env \
       MODEL_PATH="${CHECKPOINT_DIR}" \
