@@ -182,7 +182,7 @@ def _tensor_tree_hash(value: Any) -> str:
             tensor = node.detach().cpu().contiguous()
             digest.update(str(tensor.dtype).encode())
             digest.update(str(tuple(tensor.shape)).encode())
-            digest.update(tensor.view(torch.uint8).numpy().tobytes())
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
         elif isinstance(node, Mapping):
             for key in sorted(node, key=str):
                 digest.update(repr(key).encode())
@@ -1859,6 +1859,11 @@ def _fake_artifact(implementation: str, trajectory: str, rank: int) -> dict[str,
 
 
 def comparator_selftest(_args: argparse.Namespace) -> int:
+    scalar_state = {"step": torch.tensor(1, dtype=torch.int64)}
+    _require(
+        _tensor_tree_hash(scalar_state) == _tensor_tree_hash(_clone_cpu(scalar_state)),
+        "Scalar optimizer state hash is not stable",
+    )
     with tempfile.TemporaryDirectory(prefix="muon_distopt_compare_") as directory:
         root = Path(directory)
         upstream = root / "upstream"
