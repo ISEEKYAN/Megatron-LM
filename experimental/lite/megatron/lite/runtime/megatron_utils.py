@@ -12,6 +12,7 @@ Sources:
 from __future__ import annotations
 
 import gc
+from collections.abc import MutableMapping
 from typing import Any
 
 import torch
@@ -151,56 +152,123 @@ def load_model_to_gpu(model_list: list, load_grad: bool = True) -> None:
 
 
 def offload_optimizer(optimizer) -> None:
-    """Offload optimizer states to CPU."""
-    from megatron.core.optimizer import ChainedOptimizer
+    """Recursively offload every tensor in a composed optimizer's runtime state."""
+    if getattr(optimizer, "_mlite_offloaded_optimizer_state", None):
+        return
 
-    for _opt in _iter_opts(optimizer, ChainedOptimizer):
-        if _opt.optimizer is not None:
-            hdo = _opt.optimizer
-            if all(
-                hasattr(hdo, a) for a in ("sub_optimizers", "inner_param_to_orig_param", "state")
-            ):
-                for sub_opt in hdo.sub_optimizers:
-                    for param, state in sub_opt.state.items():
-                        for k, v in state.items():
-                            if not isinstance(v, torch.Tensor):
-                                continue
-                            orig_param = hdo.inner_param_to_orig_param.get(param, param)
-                            hdo.state[orig_param][k] = state[k] = v.to("cpu")
-            else:
-                for v in _opt.optimizer.state.values():
-                    if "exp_avg" in v:
-                        v["exp_avg"] = v["exp_avg"].to("cpu", non_blocking=True)
-                    if "exp_avg_sq" in v:
-                        v["exp_avg_sq"] = v["exp_avg_sq"].to("cpu", non_blocking=True)
+    moved: dict[int, tuple[torch.Tensor, torch.device]] = {}
+    roots = []
+    for state in _iter_optimizer_state_mappings(optimizer):
+        for key, value in list(state.items()):
+            state[key], devices = _offload_tensor_tree(value, moved)
+            if devices is not None:
+                roots.append((state, key, devices))
+    optimizer._mlite_offloaded_optimizer_state = roots
 
     gc.collect()
     torch.cuda.empty_cache()
 
 
 def load_optimizer(optimizer) -> None:
-    """Load optimizer states back to GPU."""
-    from megatron.core.optimizer import ChainedOptimizer
+    """Restore only state tensors moved by :func:`offload_optimizer`."""
+    roots = getattr(optimizer, "_mlite_offloaded_optimizer_state", None)
+    if not roots:
+        return
 
-    for _opt in _iter_opts(optimizer, ChainedOptimizer):
-        if _opt.optimizer is not None:
-            if hasattr(_opt.optimizer, "_move_new_state_to_right_device"):
-                _opt.optimizer._move_new_state_to_right_device()
-            else:
-                for v in _opt.optimizer.state.values():
-                    if "exp_avg" in v:
-                        v["exp_avg"] = v["exp_avg"].to("cuda", non_blocking=True)
-                    if "exp_avg_sq" in v:
-                        v["exp_avg_sq"] = v["exp_avg_sq"].to("cuda", non_blocking=True)
+    restored: dict[tuple[int, str], torch.Tensor] = {}
+    for state, key, devices in roots:
+        state[key] = _restore_tensor_tree(state[key], devices, restored)
+    optimizer._mlite_offloaded_optimizer_state = []
 
     gc.collect()
     torch.cuda.empty_cache()
 
 
-def _iter_opts(optimizer, chained_cls):
-    if isinstance(optimizer, chained_cls):
-        return optimizer.chained_optimizers
-    return [optimizer]
+def _iter_optimizer_state_mappings(optimizer):
+    """Yield unique torch-style state mappings from nested optimizer facades."""
+    seen_nodes: set[int] = set()
+    seen_states: set[int] = set()
+    pending = [optimizer]
+    while pending:
+        node = pending.pop()
+        if node is None or id(node) in seen_nodes:
+            continue
+        seen_nodes.add(id(node))
+
+        state = getattr(node, "state", None)
+        if isinstance(state, MutableMapping) and id(state) not in seen_states:
+            seen_states.add(id(state))
+            yield state
+
+        for attribute in ("chained_optimizers", "sub_optimizers"):
+            children = getattr(node, attribute, None)
+            if children is not None:
+                pending.extend(children)
+        try:
+            wrapped = getattr(node, "optimizer", None)
+        except (AssertionError, AttributeError, RuntimeError, ValueError):
+            wrapped = None
+        if wrapped is not None:
+            pending.append(wrapped)
+
+
+def _offload_tensor_tree(value, moved):
+    if isinstance(value, torch.Tensor):
+        if value.device.type == "cpu":
+            return value, None
+        cached = moved.get(id(value))
+        if cached is None:
+            cached = (value.to("cpu", non_blocking=True), value.device)
+            moved[id(value)] = cached
+        return cached[0], ("tensor", cached[1])
+    if isinstance(value, MutableMapping):
+        devices = {}
+        for key, item in list(value.items()):
+            value[key], item_devices = _offload_tensor_tree(item, moved)
+            if item_devices is not None:
+                devices[key] = item_devices
+        return value, ("mapping", devices) if devices else None
+    if isinstance(value, list):
+        devices = {}
+        for index, item in enumerate(value):
+            value[index], item_devices = _offload_tensor_tree(item, moved)
+            if item_devices is not None:
+                devices[index] = item_devices
+        return value, ("list", devices) if devices else None
+    if isinstance(value, tuple):
+        items = []
+        devices = {}
+        for index, item in enumerate(value):
+            item, item_devices = _offload_tensor_tree(item, moved)
+            items.append(item)
+            if item_devices is not None:
+                devices[index] = item_devices
+        rebuilt = type(value)(*items) if hasattr(value, "_fields") else type(value)(items)
+        return rebuilt, ("tuple", devices) if devices else None
+    return value, None
+
+
+def _restore_tensor_tree(value, devices, restored):
+    kind, children = devices
+    if kind == "tensor":
+        cache_key = (id(value), str(children))
+        if cache_key not in restored:
+            restored[cache_key] = value.to(children, non_blocking=True)
+        return restored[cache_key]
+    if kind == "mapping":
+        for key, item_devices in children.items():
+            value[key] = _restore_tensor_tree(value[key], item_devices, restored)
+        return value
+    if kind == "list":
+        for index, item_devices in children.items():
+            value[index] = _restore_tensor_tree(value[index], item_devices, restored)
+        return value
+    if kind == "tuple":
+        items = list(value)
+        for index, item_devices in children.items():
+            items[index] = _restore_tensor_tree(items[index], item_devices, restored)
+        return type(value)(*items) if hasattr(value, "_fields") else type(value)(items)
+    raise RuntimeError(f"Unknown optimizer state tree kind: {kind}")
 
 
 # ======================================================================

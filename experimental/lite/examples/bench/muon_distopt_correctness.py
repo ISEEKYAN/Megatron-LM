@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import inspect
 import json
 import os
@@ -171,6 +172,84 @@ def _clone_cpu(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_clone_cpu(item) for item in value)
     return copy.deepcopy(value)
+
+
+def _tensor_tree_hash(value: Any) -> str:
+    digest = hashlib.sha256()
+
+    def visit(node: Any) -> None:
+        if isinstance(node, torch.Tensor):
+            tensor = node.detach().cpu().contiguous()
+            digest.update(str(tensor.dtype).encode())
+            digest.update(str(tuple(tensor.shape)).encode())
+            digest.update(tensor.view(torch.uint8).numpy().tobytes())
+        elif isinstance(node, Mapping):
+            for key in sorted(node, key=str):
+                digest.update(repr(key).encode())
+                visit(node[key])
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                visit(item)
+        else:
+            digest.update(repr(node).encode())
+
+    visit(value)
+    return digest.hexdigest()
+
+
+def _tensor_tree_devices(value: Any) -> list[str]:
+    devices: list[str] = []
+    if isinstance(value, torch.Tensor):
+        devices.append(str(value.device))
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            devices.extend(_tensor_tree_devices(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            devices.extend(_tensor_tree_devices(item))
+    return devices
+
+
+def _reference_move_tensor_tree(value: Any, destination: str, original=None):
+    """Independent pinned-upstream extension for runtime state round-trips."""
+    if isinstance(value, torch.Tensor):
+        if original is None:
+            if value.device.type == destination:
+                return value, None
+            return value.to(destination), str(value.device)
+        return value.to(original), original
+    if isinstance(value, dict):
+        specs = {} if original is None else original
+        keys = list(value) if original is None else list(specs)
+        for key in keys:
+            item = value[key]
+            item_spec = None if original is None else specs[key]
+            value[key], result = _reference_move_tensor_tree(item, destination, item_spec)
+            if original is None and result is not None:
+                specs[key] = result
+        return value, specs
+    if isinstance(value, list):
+        specs = {} if original is None else original
+        indexes = range(len(value)) if original is None else specs
+        for index in indexes:
+            item = value[index]
+            item_spec = None if original is None else specs[index]
+            value[index], result = _reference_move_tensor_tree(item, destination, item_spec)
+            if original is None and result is not None:
+                specs[index] = result
+        return value, specs
+    if isinstance(value, tuple):
+        specs = {} if original is None else original
+        items = list(value)
+        indexes = range(len(value)) if original is None else specs
+        for index in indexes:
+            item_spec = None if original is None else specs[index]
+            item, result = _reference_move_tensor_tree(items[index], destination, item_spec)
+            items[index] = item
+            if original is None and result is not None:
+                specs[index] = result
+        return type(value)(items), specs
+    return value, None
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -899,6 +978,74 @@ def _restore_adam_state(
                 group["step"] = int(saved_step.item())
 
 
+def _runtime_state_roundtrip(
+    stack: Stack, view: OptimizerIntrospection, implementation: str
+) -> dict[str, Any]:
+    state_roots = [view.raw_muon.state, view.dist_opt.optimizer.state]
+    before = {
+        "muon": _snapshot_muon_state(view),
+        "adam": _snapshot_adam_state(view),
+    }
+    before_hash = _tensor_tree_hash(before)
+    before_devices = [device for root in state_roots for device in _tensor_tree_devices(root)]
+    _require(any(device.startswith("cuda") for device in before_devices), "No CUDA state to offload")
+
+    if implementation == "upstream":
+        specs = []
+        for root in state_roots:
+            _, spec = _reference_move_tensor_tree(root, "cpu")
+            specs.append(spec)
+    else:
+        from megatron.lite.runtime.megatron_utils import offload_optimizer
+
+        offload_optimizer(stack.optimizer)
+        specs = None
+
+    offloaded_devices = [
+        device for root in state_roots for device in _tensor_tree_devices(root)
+    ]
+    _require(
+        not any(device.startswith("cuda") for device in offloaded_devices),
+        "At least one optimizer tensor state remained on CUDA after offload",
+    )
+    _require(
+        _tensor_tree_hash({"muon": _snapshot_muon_state(view), "adam": _snapshot_adam_state(view)})
+        == before_hash,
+        "Optimizer state hash changed during CPU offload",
+    )
+
+    if implementation == "upstream":
+        for root, spec in zip(state_roots, specs):
+            _reference_move_tensor_tree(root, "cuda", spec)
+    else:
+        from megatron.lite.runtime.megatron_utils import load_optimizer
+
+        load_optimizer(stack.optimizer)
+
+    restored_devices = [
+        device for root in state_roots for device in _tensor_tree_devices(root)
+    ]
+    after = {
+        "muon": _snapshot_muon_state(view),
+        "adam": _snapshot_adam_state(view),
+    }
+    after_hash = _tensor_tree_hash(after)
+    _require(after_hash == before_hash, "Optimizer state hash changed across offload/onload")
+    _require(
+        restored_devices == before_devices,
+        f"Optimizer state devices changed across roundtrip: {before_devices} -> {restored_devices}",
+    )
+    return {
+        "before_hash": before_hash,
+        "offloaded_hash": before_hash,
+        "after_hash": after_hash,
+        "before_devices": before_devices,
+        "offloaded_devices": offloaded_devices,
+        "restored_devices": restored_devices,
+        "reference_extension": implementation == "upstream",
+    }
+
+
 def _install_muon_capture(
     view: OptimizerIntrospection,
 ) -> tuple[dict[str, dict[str, torch.Tensor]], Callable[[], None]]:
@@ -1056,6 +1203,8 @@ def _run_steps(
     device: torch.device,
     start: int,
     end: int,
+    implementation: str,
+    runtime_roundtrip: bool = False,
 ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 
@@ -1063,6 +1212,7 @@ def _run_steps(
     expected_local_muon = set(view.muon_main_to_name.values())
     steps: dict[int, dict[str, Any]] = {}
     step_time_ms: dict[int, float] = {}
+    roundtrip_evidence = None
     wrapped = stack.wrapped_chunks[0]
     torch.cuda.reset_peak_memory_stats(device)
     for step in range(start, end):
@@ -1136,6 +1286,8 @@ def _run_steps(
             "muon_state": muon_state,
             "adam_state": adam_state,
         }
+        if runtime_roundtrip and step == SAVE_STEPS - 1:
+            roundtrip_evidence = _runtime_state_roundtrip(stack, view, implementation)
     measured_times = [
         value for step, value in step_time_ms.items() if step >= PERFORMANCE_WARMUP_STEPS
     ]
@@ -1147,6 +1299,7 @@ def _run_steps(
         "measured_step_count": len(measured_times),
         "peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
         "peak_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+        "runtime_state_roundtrip": roundtrip_evidence,
     }
 
 
@@ -1176,7 +1329,7 @@ def run_one(args: argparse.Namespace) -> int:
 
         output_dir = Path(args.output_dir).resolve()
         checkpoint_dir = Path(args.checkpoint_dir).resolve()
-        if args.trajectory == "continuous":
+        if args.trajectory in {"continuous", "offload"}:
             start, end = 0, TOTAL_STEPS
         elif args.trajectory == "save":
             start, end = 0, SAVE_STEPS
@@ -1186,7 +1339,18 @@ def run_one(args: argparse.Namespace) -> int:
             )
             start, end = SAVE_STEPS, TOTAL_STEPS
 
-        steps, performance = _run_steps(stack, view, rank, device, start, end)
+        steps, performance = _run_steps(
+            stack,
+            view,
+            rank,
+            device,
+            start,
+            end,
+            args.implementation,
+            # The save trajectory also round-trips immediately before checkpointing,
+            # so resume proves checkpoint compatibility with restored runtime state.
+            runtime_roundtrip=args.trajectory in {"offload", "save"},
+        )
         artifact = {
             "kind": "muon_distopt_bitwise_rank_artifact",
             "implementation": args.implementation,
@@ -1363,6 +1527,7 @@ def _load_artifact(root: Path, trajectory: str, rank: int, implementation: str) 
         raise ValueError(f"{path}: lowering order mismatch")
     expected_steps = {
         "continuous": set(range(TOTAL_STEPS)),
+        "offload": set(range(TOTAL_STEPS)),
         "save": set(range(SAVE_STEPS)),
         "resume": set(range(SAVE_STEPS, TOTAL_STEPS)),
     }[trajectory]
@@ -1390,7 +1555,7 @@ def _compare_directories(upstream_dir: Path, mlite_dir: Path) -> dict[str, Any]:
 
     try:
         for implementation, root in (("upstream", upstream_dir), ("mlite", mlite_dir)):
-            for trajectory in ("continuous", "save", "resume"):
+            for trajectory in ("continuous", "offload", "save", "resume"):
                 artifacts[implementation][trajectory] = {
                     rank: _load_artifact(root, trajectory, rank, implementation)
                     for rank in range(WORLD_SIZE)
@@ -1428,8 +1593,33 @@ def _compare_directories(upstream_dir: Path, mlite_dir: Path) -> dict[str, Any]:
                 saved["metadata"],
                 resumed["metadata"],
             )
+            offloaded = artifacts[implementation]["offload"][rank]
+            compare(
+                f"{implementation}.rank{rank}.offload_vs_continuous",
+                _normalized(continuous),
+                _normalized(offloaded),
+            )
+            for evidence_trajectory in ("offload", "save"):
+                evidence = artifacts[implementation][evidence_trajectory][rank][
+                    "performance"
+                ].get("runtime_state_roundtrip")
+                if not evidence or not (
+                    evidence["before_hash"]
+                    == evidence["offloaded_hash"]
+                    == evidence["after_hash"]
+                ):
+                    mismatches.append(
+                        {
+                            "path": (
+                                f"{implementation}.rank{rank}.{evidence_trajectory}."
+                                "runtime_state_roundtrip"
+                            ),
+                            "kind": "invariant",
+                            "error": "missing or unequal state hashes",
+                        }
+                    )
 
-    for trajectory in ("continuous", "save", "resume"):
+    for trajectory in ("continuous", "offload", "save", "resume"):
         for rank in range(WORLD_SIZE):
             compare(
                 f"upstream_vs_mlite.{trajectory}.rank{rank}",
@@ -1438,7 +1628,7 @@ def _compare_directories(upstream_dir: Path, mlite_dir: Path) -> dict[str, Any]:
             )
 
     for implementation in ("upstream", "mlite"):
-        for trajectory in ("continuous", "save", "resume"):
+        for trajectory in ("continuous", "offload", "save", "resume"):
             rank_zero = artifacts[implementation][trajectory][0]
             rank_one = artifacts[implementation][trajectory][1]
             before = len(mismatches)
@@ -1586,6 +1776,7 @@ def validate_adam_text_only_command(args: argparse.Namespace) -> int:
 def _fake_artifact(implementation: str, trajectory: str, rank: int) -> dict[str, Any]:
     ranges = {
         "continuous": range(TOTAL_STEPS),
+        "offload": range(TOTAL_STEPS),
         "save": range(SAVE_STEPS),
         "resume": range(SAVE_STEPS, TOTAL_STEPS),
     }
@@ -1654,6 +1845,15 @@ def _fake_artifact(implementation: str, trajectory: str, rank: int) -> dict[str,
             "instrumented_step_time_mean_ms": 0.0,
             "peak_memory_allocated_bytes": 0,
             "peak_memory_reserved_bytes": 0,
+            "runtime_state_roundtrip": (
+                {
+                    "before_hash": "fixture",
+                    "offloaded_hash": "fixture",
+                    "after_hash": "fixture",
+                }
+                if trajectory in {"offload", "save"}
+                else None
+            ),
         },
     }
 
@@ -1664,7 +1864,7 @@ def comparator_selftest(_args: argparse.Namespace) -> int:
         upstream = root / "upstream"
         mlite = root / "mlite"
         for implementation, output in (("upstream", upstream), ("mlite", mlite)):
-            for trajectory in ("continuous", "save", "resume"):
+            for trajectory in ("continuous", "offload", "save", "resume"):
                 for rank in range(WORLD_SIZE):
                     path = _artifact_path(output, trajectory, rank)
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1714,7 +1914,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="run one implementation and trajectory")
     run_parser.add_argument("--implementation", required=True, choices=("upstream", "mlite"))
     run_parser.add_argument(
-        "--trajectory", required=True, choices=("continuous", "save", "resume")
+        "--trajectory", required=True, choices=("continuous", "offload", "save", "resume")
     )
     run_parser.add_argument("--output-dir", required=True)
     run_parser.add_argument("--checkpoint-dir", required=True)

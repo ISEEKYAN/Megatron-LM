@@ -225,6 +225,65 @@ def test_runtime_to_prefers_optimizer_specific_offload_hooks():
     assert optimizer.calls == ["offload", "load"]
 
 
+def test_megatron_optimizer_offload_recurses_all_chained_tensor_state(monkeypatch):
+    from megatron.lite.runtime.megatron_utils import load_optimizer, offload_optimizer
+
+    class FakeRawOptimizer:
+        def __init__(self, state):
+            self.state = state
+
+    class FakeOptimizerWrapper:
+        def __init__(self, state):
+            self.optimizer = FakeRawOptimizer(state)
+
+    class FakeChainedOptimizer:
+        def __init__(self, children):
+            self.chained_optimizers = children
+
+    core_optimizer = types.ModuleType("megatron.core.optimizer")
+    core_optimizer.ChainedOptimizer = FakeChainedOptimizer
+    monkeypatch.setitem(sys.modules, "megatron.core.optimizer", core_optimizer)
+
+    muon_momentum = torch.empty(3, device="meta")
+    adam_m = torch.empty(2, device="meta")
+    adam_v = torch.empty(2, device="meta")
+    nested_aux = torch.empty(1, device="meta")
+    optimizer = FakeChainedOptimizer(
+        [
+            FakeOptimizerWrapper(
+                {object(): {"momentum_buffer": muon_momentum, "nested": ({"aux": nested_aux},)}}
+            ),
+            FakeOptimizerWrapper(
+                {object(): {"exp_avg": adam_m, "exp_avg_sq": [adam_v], "step": 1}}
+            ),
+        ]
+    )
+    moves = []
+
+    def fake_to(tensor, device, *args, **kwargs):
+        moves.append((id(tensor), str(device), kwargs.get("non_blocking")))
+        return tensor
+
+    monkeypatch.setattr(torch.Tensor, "to", fake_to, raising=True)
+
+    offload_optimizer(optimizer)
+    assert {(tensor_id, device) for tensor_id, device, _ in moves} == {
+        (id(muon_momentum), "cpu"),
+        (id(adam_m), "cpu"),
+        (id(adam_v), "cpu"),
+        (id(nested_aux), "cpu"),
+    }
+
+    moves.clear()
+    load_optimizer(optimizer)
+    assert {(tensor_id, device) for tensor_id, device, _ in moves} == {
+        (id(muon_momentum), "meta"),
+        (id(adam_m), "meta"),
+        (id(adam_v), "meta"),
+        (id(nested_aux), "meta"),
+    }
+
+
 class _FakeStorage:
     def __init__(self, size: int):
         self._size = size

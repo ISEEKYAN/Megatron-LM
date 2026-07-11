@@ -58,7 +58,11 @@ def validate_dist_opt_config(engine_cfg) -> None:
         )
     )
     if offload_requested:
-        raise ValueError("Muon optimizer offload is deferred to the dedicated offload lowering.")
+        raise ValueError(
+            "Muon update-time optimizer offload is unsupported: pinned Megatron d64ba4ccb "
+            "does not provide a complete LayerWise paired reference. Runtime state "
+            "offload remains available through runtime.to(cpu/cuda)."
+        )
 
 
 def _validate_muon_padded_expert_fallback(model_chunks: list[nn.Module]) -> None:

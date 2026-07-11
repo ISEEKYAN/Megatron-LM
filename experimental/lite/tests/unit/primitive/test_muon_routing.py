@@ -359,7 +359,7 @@ def test_muon_accepts_padded_layout_and_standard_overlap(optimizer_overrides) ->
     [
         ({"overlap_param_gather_with_optimizer_step": True}, "optimizer step"),
         ({"optimizer_cpu_offload": True}, "offload"),
-        ({"optimizer_offload_fraction": 0.5}, "offload"),
+        ({"optimizer_offload_fraction": 1.0}, "update-time optimizer offload"),
         ({"offload_optimizer_states": True}, "offload"),
         ({"fp8_param_gather": True}, "fp8_param_gather"),
         ({"fp4_param_gather": True}, "fp4_param_gather"),

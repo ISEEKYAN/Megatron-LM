@@ -301,6 +301,11 @@ PY
         --checkpoint-dir "${checkpoint_dir}"
       torchrun --standalone --nproc_per_node=2 "${harness}" run \
         --implementation "${implementation}" \
+        --trajectory offload \
+        --output-dir "${output_dir}" \
+        --checkpoint-dir "${checkpoint_dir}"
+      torchrun --standalone --nproc_per_node=2 "${harness}" run \
+        --implementation "${implementation}" \
         --trajectory save \
         --output-dir "${output_dir}" \
         --checkpoint-dir "${checkpoint_dir}"
