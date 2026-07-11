@@ -112,7 +112,9 @@ class SyntheticMixedModel(nn.Module):
     """Mixed model: embedding/output/bias/norm use Adam; four matrices use Muon."""
 
     vocab_size = 16
-    hidden_size = 8
+    # Four 10x10 Muon matrices produce real shard-alignment padding at DP=2
+    # (unlike 8x8 matrices, which accidentally align to 64 elements exactly).
+    hidden_size = 10
 
     def __init__(self) -> None:
         super().__init__()
@@ -704,6 +706,16 @@ def _route_metadata(stack: Stack, view: OptimizerIntrospection, rank: int) -> di
                 "layout_dp_overlap_end": int(max(overlap_start, overlap_end)),
             }
     _require(set(layout_offsets) == set(route), "Buffer layout does not cover all parameters")
+    if _layer_wise_layout() == "padded":
+        _require(
+            layout_totals["muon_padding_numel"] > 0,
+            "Padded acceptance proxy did not exercise LayerWise alignment padding",
+        )
+    else:
+        _require(
+            layout_totals["muon_padding_numel"] == 0,
+            "Compact acceptance proxy unexpectedly padded a LayerWise buffer",
+        )
 
     adam_signature = []
     for name, model_parameter in view.adam_name_to_model_param.items():

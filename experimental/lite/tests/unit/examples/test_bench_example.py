@@ -108,7 +108,11 @@ def test_compact_muon_sbatch_keeps_json_inside_outer_shell_quote():
 
 
 def test_muon_harness_contract_is_scoped_to_layout_and_overlap(monkeypatch):
-    from examples.bench.muon_distopt_correctness import _contract
+    from examples.bench.muon_distopt_correctness import (
+        WORLD_SIZE,
+        SyntheticMixedModel,
+        _contract,
+    )
 
     monkeypatch.setenv("MUON_LAYOUT", "padded")
     monkeypatch.setenv("MUON_OVERLAP", "on")
@@ -117,6 +121,9 @@ def test_muon_harness_contract_is_scoped_to_layout_and_overlap(monkeypatch):
     assert contract["layer_wise_layout"] == "padded"
     assert contract["overlap_grad_reduce"] is True
     assert contract["overlap_param_gather"] is True
+    muon_parameter_numel = 4 * SyntheticMixedModel.hidden_size**2
+    assert muon_parameter_numel == 400
+    assert muon_parameter_numel % (WORLD_SIZE * 64) != 0
 
 
 def test_muon_sbatch_runs_all_layout_overlap_configurations():
