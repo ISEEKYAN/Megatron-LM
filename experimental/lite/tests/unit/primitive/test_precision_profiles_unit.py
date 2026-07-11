@@ -129,7 +129,7 @@ def test_hopper_recipe_matches_the_frozen_transformer_engine_mapping(monkeypatch
 def _valid_hopper_environment(**overrides):
     values = {
         "compute_capability": (9, 0),
-        "transformer_engine_version": "2.18.0.dev0",
+        "transformer_engine_version": "2.15.0+42b84005",
         "cuda_version": (12, 9),
         "cublas_version": 130400,
         "block_scaling_supported": True,
@@ -144,8 +144,8 @@ def _valid_hopper_environment(**overrides):
     [
         ({"compute_capability": (8, 9)}, "SM90"),
         ({"compute_capability": (10, 0)}, "SM90"),
-        ({"transformer_engine_version": "2.17.0"}, "2.18.0.dev0"),
-        ({"transformer_engine_version": "2.18.0.dev0+deadbee"}, "8b99682"),
+        ({"transformer_engine_version": "2.17.0"}, "2.15.0"),
+        ({"transformer_engine_version": "2.18.0.dev0+8b99682"}, "2.15.0"),
         ({"cuda_version": (12, 8)}, "CUDA 12.9"),
         ({"cublas_version": 130300}, "cuBLAS 13.4"),
         (
@@ -177,11 +177,14 @@ def test_hopper_environment_fails_loud_on_reference_mismatch(
 @pytest.mark.parametrize(
     "version",
     [
-        "2.18.0.dev0+8b99682",
-        "2.18.0.dev0+8b9968255eb879e6e390f427836906b29aad64d2",
+        # The released version is the contract; any build tag on it is accepted
+        # so FP8 needs no bespoke build -- it runs on the canonical BF16 image.
+        "2.15.0",
+        "2.15.0+42b84005",
+        "2.15.0+deadbeef",
     ],
 )
-def test_hopper_environment_accepts_the_frozen_reference(monkeypatch, version):
+def test_hopper_environment_accepts_the_canonical_reference(monkeypatch, version):
     from megatron.lite.primitive.precision import hopper_blockwise
 
     environment = _valid_hopper_environment(transformer_engine_version=version)

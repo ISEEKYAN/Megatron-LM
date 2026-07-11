@@ -14,22 +14,22 @@ set -euo pipefail
 
 RUN_ROOT=${RUN_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/work/codex/fp8-primitives-c9c00dfac-cw}
 BASE_IMAGE=${BASE_IMAGE:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/pytorch_26.04-py3.sqsh}
-OVERLAY=${OVERLAY:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/te-8b9968255-cu132-py312-overlay-r7}
 
+# The canonical training image ships Transformer Engine 2.15 with the blockwise
+# kernels this parity needs (verified by te215-blockwise-inventory). No FP8-only
+# overlay: parity runs against the image's native TE, the same one BF16 uses.
 srun --ntasks=1 \
   --container-image="$BASE_IMAGE" \
   --container-mounts=/lustre:/lustre \
   --container-workdir="$RUN_ROOT" \
   bash -lc 'set -euo pipefail
     RUN_ROOT=${RUN_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/work/codex/fp8-primitives-c9c00dfac-cw}
-    OVERLAY=${OVERLAY:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/te-8b9968255-cu132-py312-overlay-r7}
-    OVERLAY_SITE="$OVERLAY/lib/python3.12/site-packages"
     RUN_DIR="$RUN_ROOT/run-primitive-parity-${SLURM_JOB_ID}"
     REFERENCE_ROOT="$RUN_DIR/mcore-reference"
     OUTPUT="$RUN_ROOT/results/primitive-parity-${SLURM_JOB_ID}"
 
-    export PATH="$OVERLAY/bin:/usr/local/bin:/usr/bin:/bin"
-    export PYTHONPATH="$OVERLAY_SITE:$RUN_DIR/experimental/lite:$REFERENCE_ROOT"
+    export PATH="/usr/local/bin:/usr/bin:/bin"
+    export PYTHONPATH="$RUN_DIR/experimental/lite:$REFERENCE_ROOT"
     unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_EXE CONDA_PYTHON_EXE
     unset CONDA_BUILD_CROSS_COMPILATION CONDA_BUILD_SYSROOT CONDA_SHLVL
     unset CONDA_TOOLCHAIN_BUILD CONDA_TOOLCHAIN_HOST
@@ -51,7 +51,6 @@ srun --ntasks=1 \
     export CUDA_DEVICE_MAX_CONNECTIONS=1
     unset NVTE_FP8_BLOCK_SCALING_FP32_SCALES NVTE_BACKWARD_OVERRIDE
 
-    test -f "$OVERLAY/BUILD_OK"
     test -f "$RUN_ROOT/hopper_blockwise_primitive_parity.py"
     test "$(sha256sum "$RUN_ROOT/mcore-cf2f07d7.tar.gz" | cut -d " " -f 1)" = "c08272b18d171553f2dcd04937d27e77d3a6be223860726be7c56fcc90c558b1"
     mkdir -p "$RUN_DIR" "$REFERENCE_ROOT" "$OUTPUT" \
