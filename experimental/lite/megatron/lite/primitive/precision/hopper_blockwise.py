@@ -21,9 +21,14 @@ from megatron.lite.primitive.precision.contract import (
     WeightStorage,
 )
 
-FROZEN_TRANSFORMER_ENGINE_VERSION = "2.18.0.dev0"
-FROZEN_TRANSFORMER_ENGINE_COMMIT = "8b9968255eb879e6e390f427836906b29aad64d2"
-_FROZEN_TRANSFORMER_ENGINE_SHORT_COMMIT = FROZEN_TRANSFORMER_ENGINE_COMMIT[:7]
+# The canonical training image ships a released Transformer Engine. Blockwise
+# FP8 runs on the same image that runs BF16 -- no FP8-only overlay -- so the gate
+# pins the released version validated on that image, not a bespoke build commit.
+# Requiring an exact build SHA would recreate a special-environment requirement;
+# the real fail-loud safety net is the capability probe below (SM90, block
+# scaling support, cuBLAS, CUDA). The build tag is recorded for provenance only.
+CANONICAL_TRANSFORMER_ENGINE_VERSION = "2.15.0"
+CANONICAL_TRANSFORMER_ENGINE_BUILD_TAG = "42b84005"
 
 PRECISION_NAMES = (
     "bf16",
@@ -197,7 +202,7 @@ def _probe_hopper_environment() -> _HopperEnvironment:
 
 
 def validate_hopper_environment() -> _HopperEnvironment:
-    """Fail before model allocation unless the frozen Hopper environment is present."""
+    """Fail before model allocation unless the canonical Hopper environment is present."""
 
     _validate_recipe_environment()
     environment = _probe_hopper_environment()
@@ -207,19 +212,11 @@ def validate_hopper_environment() -> _HopperEnvironment:
             f"{environment.compute_capability}."
         )
 
-    version, separator, local = environment.transformer_engine_version.partition("+")
-    if version != FROZEN_TRANSFORMER_ENGINE_VERSION:
+    version, _separator, _local = environment.transformer_engine_version.partition("+")
+    if version != CANONICAL_TRANSFORMER_ENGINE_VERSION:
         raise RuntimeError(
             "Hopper blockwise FP8 requires Transformer Engine "
-            f"{FROZEN_TRANSFORMER_ENGINE_VERSION}; found {environment.transformer_engine_version}."
-        )
-    if separator and (
-        len(local) < len(_FROZEN_TRANSFORMER_ENGINE_SHORT_COMMIT)
-        or not FROZEN_TRANSFORMER_ENGINE_COMMIT.startswith(local)
-    ):
-        raise RuntimeError(
-            "Hopper blockwise FP8 requires Transformer Engine commit "
-            f"{_FROZEN_TRANSFORMER_ENGINE_SHORT_COMMIT}; found local version {local!r}."
+            f"{CANONICAL_TRANSFORMER_ENGINE_VERSION}; found {environment.transformer_engine_version}."
         )
     if environment.cuda_version < (12, 9):
         raise RuntimeError(
