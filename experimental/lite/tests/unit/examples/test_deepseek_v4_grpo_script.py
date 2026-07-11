@@ -227,9 +227,13 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert "PHASE1_STEPS" in script
     assert "TOTAL_STEPS" in script
     assert "CONFIG_ONLY" in script
+    assert "CONFIG_TARGET_NNODES" in script
+    assert "CONFIG_TARGET_GPUS_PER_NODE" in script
+    assert "CONFIG_ONLY requires one CPU-only node" in script
     assert "IMPORT_ONLY" in script
     assert "RAY_ONLY" in script
     assert "DS4_GRPO_CONFIG_COMPOSE_PASSED" in script
+    assert "DS4_GRPO_CONFIG_RUNTIME_ENV_PASSED" in script
     assert '"gpu_memory_utilization: 0.6"' in script
     assert "os.path.isdir(cache_root)" in script
     assert "from tilelang import env as tilelang_env" in script
@@ -316,6 +320,7 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert 'VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python - "$1" "$2"' in script
     assert 'env_vars["VERL_FILE_LOGGER_PATH"] = sys.argv[2]' in script
     assert 'phase_runtime_env_json=$(runtime_env_with_file_logger_path "${RUNTIME_ENV_JSON}" "${jsonl_file}")' in script
+    assert 'config_runtime_env_json=$(runtime_env_with_file_logger_path "${RUNTIME_ENV_JSON}" "${config_jsonl_file}")' in script
     assert '--runtime-env-json="${phase_runtime_env_json}"' in script
     assert "DS4_FILE_LOGGER_PREFLIGHT_PASSED" in script
     assert "DS4_FILE_LOGGER_RUNTIME_ENV_PREFLIGHT_PASSED" in script
@@ -428,7 +433,7 @@ def test_ds4_vllm_checkpoint_sync_probe_uses_all_workers(
     assert "DS4_VLLM_CHECKPOINT_SYNC_PASSED workers=8" in capsys.readouterr().out
 
 
-def test_ds4_grpo_ray_only_probes_every_local_device_uuid_mapping() -> None:
+def test_ds4_grpo_ray_only_probes_each_node_for_the_multinode_proxy() -> None:
     script = SBATCH.read_text()
     ray_program = script.split("    python -c '\n", 1)[1].split(
         "\n'\n  echo \"DS4_RAY_CLUSTER_PASSED", 1
@@ -436,7 +441,7 @@ def test_ds4_grpo_ray_only_probes_every_local_device_uuid_mapping() -> None:
 
     ast.parse(ray_program)
     assert "'" not in ray_program
-    assert "RAY_ONLY requires one node with eight GPUs" in script
+    assert "RAY_ONLY requires one or two nodes with eight GPUs per node" in script
     assert "class DeviceProbe:" in script
     assert "_RayActorClassProfile" in script
     assert "_vllm_server_profile_env" in script
@@ -452,7 +457,8 @@ def test_ds4_grpo_ray_only_probes_every_local_device_uuid_mapping() -> None:
     assert "import vllm" in script
     assert "vLLMHttpServer" in script
     assert "vLLMReplica" in script
-    assert "for _ in range(8)" in script
+    assert "actor_count = expected_nodes * gpus_per_node" in script
+    assert "for _ in range(actor_count)" in script
     assert "get_accelerator_ids()" in script
     assert 'os.environ.get("CUDA_VISIBLE_DEVICES")' in script
     assert "torch.cuda.current_device()" in script
@@ -477,10 +483,28 @@ def test_ds4_grpo_ray_only_probes_every_local_device_uuid_mapping() -> None:
         'record["logical_device_uuid"] == record["physical_device_uuid"]' in script
     )
     assert "accelerator id must be a decimal CUDA device id" in script
-    assert "len(set(physical_ids)) == 8" in script
-    assert "len(set(device_uuids)) == 8" in script
+    assert "node_records = {}" in script
+    assert "assert len(node_records) == expected_nodes, records" in script
+    assert "assert len(node_physical_ids) == gpus_per_node, records" in script
+    assert "assert len(set(device_uuids)) == actor_count, records" in script
     assert "DS4_RAY_SERVER_PROFILE_PASSED" in script
-    assert "DS4_RAY_DEVICE_UUID_PROBE_PASSED actors=8" in script
+    assert "DS4_RAY_MULTINODE_PROXY_PASSED" in script
+
+
+def test_ds4_grpo_config_only_runtime_env_job_program_is_valid_python() -> None:
+    script = SBATCH.read_text()
+    config_block = script.split('config_runtime_env_json=', 1)[1]
+    config_program = config_block.split("    python -c '\n", 1)[1].split(
+        "\n'\n  python - ", 1
+    )[0]
+
+    ast.parse(config_program)
+    assert "'" not in config_program
+    assert "DS4_GRPO_CONFIG_RUNTIME_ENV_PASSED" in config_program
+    assert 'os.environ["VERL_MLITE_SKIP_RUNTIME_PATCHES"] == "0"' in config_program
+    assert 'os.environ["RUN_ROOT"]' in config_program
+    assert 'os.environ["CONFIG_TARGET_NNODES"]' in config_program
+    assert 'os.environ["CONFIG_TARGET_GPUS_PER_NODE"]' in config_program
 
 
 def test_mlite_engine_reapplies_vllm_device_uuid_patch_before_registration() -> None:

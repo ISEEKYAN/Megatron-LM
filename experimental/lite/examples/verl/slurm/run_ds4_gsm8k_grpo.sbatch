@@ -53,6 +53,8 @@ fi
 RAY_PORT=${RAY_PORT:-6379}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+CONFIG_TARGET_NNODES=${CONFIG_TARGET_NNODES:-16}
+CONFIG_TARGET_GPUS_PER_NODE=${CONFIG_TARGET_GPUS_PER_NODE:-8}
 PHASE1_STEPS=${PHASE1_STEPS:-3}
 TOTAL_STEPS=${TOTAL_STEPS:-6}
 CONFIG_ONLY=${CONFIG_ONLY:-0}
@@ -80,8 +82,12 @@ if (( WORLD_SIZE % ROLLOUT_TP != 0 )); then
   echo "world_size=${WORLD_SIZE} must be divisible by rollout_tp=${ROLLOUT_TP}" >&2
   exit 2
 fi
-if (( RAY_ONLY == 1 && (SLURM_NNODES != 1 || GPUS_PER_NODE != 8) )); then
-  echo "RAY_ONLY requires one node with eight GPUs" >&2
+if (( RAY_ONLY == 1 && (SLURM_NNODES < 1 || SLURM_NNODES > 2 || GPUS_PER_NODE != 8) )); then
+  echo "RAY_ONLY requires one or two nodes with eight GPUs per node" >&2
+  exit 2
+fi
+if (( CONFIG_ONLY == 1 && (SLURM_NNODES != 1 || GPUS_PER_NODE != 0) )); then
+  echo "CONFIG_ONLY requires one CPU-only node with GPUS_PER_NODE=0" >&2
   exit 2
 fi
 if (( VLLM_LOAD_ONLY == 1 && (SLURM_NNODES != 1 || GPUS_PER_NODE != 8) )); then
@@ -109,6 +115,7 @@ if [[ "${IN_DS4_GRPO_CONTAINER:-0}" != "1" ]]; then
   export BASE_IMAGE MLITE_SRC MLITE_COMMIT MEGATRON_ROOT VERL_ROOT
   export MLITE_SM90_SITE DS4_VLLM_SITE DS4_VLLM_SHIM CHECKPOINT_DIR RUN_ROOT
   export MASTER_ADDR RAY_PORT RAY_DASHBOARD_PORT GPUS_PER_NODE
+  export CONFIG_TARGET_NNODES CONFIG_TARGET_GPUS_PER_NODE
   export PHASE1_STEPS TOTAL_STEPS CONFIG_ONLY IMPORT_ONLY RAY_ONLY VLLM_LOAD_ONLY
   export VLLM_CHECKPOINT_SYNC_PROBE
   export ACTOR_TP ACTOR_PP ACTOR_CP ACTOR_EP ROLLOUT_TP
@@ -282,8 +289,8 @@ if [[ "${CONFIG_ONLY}" == "1" ]]; then
       VAL_FILES="${RUN_ROOT}/test.parquet" \
       OUTPUT_ROOT="${RUN_ROOT}/output" \
       CKPT_DIR="${RUN_ROOT}/checkpoints" \
-      NNODES="${SLURM_NNODES}" \
-      NGPUS_PER_NODE="${GPUS_PER_NODE}" \
+      NNODES="${CONFIG_TARGET_NNODES}" \
+      NGPUS_PER_NODE="${CONFIG_TARGET_GPUS_PER_NODE}" \
       ACTOR_TP="${ACTOR_TP}" \
       ACTOR_PP="${ACTOR_PP}" \
       ACTOR_CP="${ACTOR_CP}" \
@@ -398,7 +405,6 @@ print(
 PY
     echo "DS4_GRPO_CONFIG_COMPOSE_PASSED source=${MLITE_COMMIT} vllm_cache_root=${VLLM_CACHE_ROOT} tilelang_cache_dir=${TILELANG_CACHE_DIR}"
   fi
-  exit 0
 fi
 
 mkdir -p "${RAY_TEMP_DIR}" "${RAY_LOG_DIR}"
@@ -633,11 +639,14 @@ ProbeActor = _RayActorClassProfile(
     ray.remote(num_gpus=1)(DeviceProbe),
     _vllm_server_profile_env(),
 )
-actors = [ProbeActor.options().remote(HFModelConfig) for _ in range(8)]
+expected_nodes = int(os.environ["SLURM_NNODES"])
+gpus_per_node = int(os.environ["GPUS_PER_NODE"])
+actor_count = expected_nodes * gpus_per_node
+actors = [ProbeActor.options().remote(HFModelConfig) for _ in range(actor_count)]
 records = ray.get([actor.inspect.remote() for actor in actors])
-assert len(records) == 8, records
+assert len(records) == actor_count, records
 node_ids = [record["node_id"] for record in records]
-assert len(set(node_ids)) == 1, records
+assert len(set(node_ids)) == expected_nodes, records
 training_site = os.path.realpath(os.environ["MLITE_SM90_SITE"])
 rollout_site = os.path.realpath(os.environ["DS4_VLLM_SITE"])
 expected_dependency_versions = {
@@ -651,6 +660,7 @@ expected_dependency_versions = {
 }
 physical_ids = []
 device_uuids = []
+node_records = {}
 for record in records:
     accelerator_ids = record["accelerator_ids"]
     assert len(accelerator_ids) == 1, records
@@ -690,8 +700,12 @@ for record in records:
     assert record["dependency_versions"] == expected_dependency_versions, records
     physical_ids.append(physical_id)
     device_uuids.append(record["physical_device_uuid"])
-assert len(set(physical_ids)) == 8, records
-assert len(set(device_uuids)) == 8, records
+    node_records.setdefault(record["node_id"], []).append(physical_id)
+assert len(node_records) == expected_nodes, records
+for node_physical_ids in node_records.values():
+    assert len(node_physical_ids) == gpus_per_node, records
+    assert len(set(node_physical_ids)) == gpus_per_node, records
+assert len(set(device_uuids)) == actor_count, records
 transformers_origin = records[0]["transformers_origin"]
 vllm_origin = records[0]["vllm_origin"]
 print("DS4_RAY_JOB_RUNTIME_ENV_PASSED", flush=True)
@@ -703,13 +717,57 @@ print(
 )
 print(f"DS4_RAY_GPU_ENV_PASSED {json.dumps(records, sort_keys=True)}", flush=True)
 print(
-    "DS4_RAY_DEVICE_UUID_PROBE_PASSED actors=8 "
-    f"node_id={node_ids[0]} physical_ids={physical_ids} "
+    "DS4_RAY_MULTINODE_PROXY_PASSED "
+    f"nodes={expected_nodes} actors={actor_count} "
+    f"node_physical_ids={json.dumps(node_records, sort_keys=True)} "
     f"device_uuids={device_uuids}",
     flush=True,
 )
 '
   echo "DS4_RAY_CLUSTER_PASSED nodes=${SLURM_NNODES} source=${MLITE_COMMIT}"
+  exit 0
+fi
+
+if [[ "${CONFIG_ONLY}" == "1" ]]; then
+  config_jsonl_file="${RUN_ROOT}/config-only-runtime-env.jsonl"
+  config_runtime_env_json=$(runtime_env_with_file_logger_path "${RUNTIME_ENV_JSON}" "${config_jsonl_file}")
+  "${RAY_CLI[@]}" job submit \
+    --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
+    --runtime-env-json="${config_runtime_env_json}" \
+    -- \
+    python -c '
+import json
+import os
+
+from verl.utils.tracking import FileLogger
+
+config_path = os.path.join(os.environ["RUN_ROOT"], "resolved-config.yaml")
+config = open(config_path, encoding="utf-8").read()
+required = ["strategy: mlite", "model_name: deepseek_v4", "recompute: full"]
+missing = [marker for marker in required if marker not in config]
+assert not missing, missing
+assert os.environ["VERL_MLITE_SKIP_RUNTIME_PATCHES"] == "0"
+logger = FileLogger("ds4-config-only", "file-logger")
+logger.log({"config_runtime_env": True}, step=0)
+logger.finish()
+target_nodes = os.environ["CONFIG_TARGET_NNODES"]
+target_gpus_per_node = os.environ["CONFIG_TARGET_GPUS_PER_NODE"]
+print(
+    "DS4_GRPO_CONFIG_RUNTIME_ENV_PASSED "
+    f"target_nodes={target_nodes} "
+    f"target_gpus_per_node={target_gpus_per_node}",
+    flush=True,
+)
+'
+  python - "${config_jsonl_file}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as log_file:
+    record = json.loads(log_file.read())
+assert record == {"step": 0, "data": {"config_runtime_env": True}}, record
+PY
+  echo "DS4_GRPO_CONFIG_ONLY_COMPLETE target_nodes=${CONFIG_TARGET_NNODES} target_gpus_per_node=${CONFIG_TARGET_GPUS_PER_NODE}"
   exit 0
 fi
 
