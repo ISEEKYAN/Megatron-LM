@@ -16,6 +16,7 @@ from megatron.lite.primitive.optimizers.fsdp2.optimizer import (
     FSDP2Optimizer,
     FSDP2OptimizerBackend,
     build_fsdp2_adamw,
+    build_fsdp2_muon,
     build_fsdp2_training_optimizer,
 )
 from megatron.lite.primitive.optimizers.fsdp2.wrap import (
@@ -37,6 +38,7 @@ __all__ = [
     "FSDP2OptimizerBackend",
     "all_reduce_scalar_",
     "build_fsdp2_adamw",
+    "build_fsdp2_muon",
     "build_fsdp2_training_optimizer",
     "build_fsdp2_device_mesh",
     "build_fsdp2_process_group_mesh",
