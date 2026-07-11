@@ -411,7 +411,13 @@ def test_ds4_vllm_checkpoint_sync_probe_uses_all_workers(
     class LLM:
         def collective_rpc(self, method, **kwargs):
             calls.append((method, kwargs))
-            if callable(method):
+            # vLLM v1 msgpack-serializes RPC targets: only string method names
+            # cross the wire; a callable is rejected with a serialization error.
+            if not isinstance(method, str):
+                raise TypeError(
+                    f"Object of type {type(method).__name__} is not serializable"
+                )
+            if method == "_get_zmq_handle":
                 return [f"ipc:///tmp/worker-{index}" for index in range(8)]
             return [None] * 8
 
@@ -419,6 +425,7 @@ def test_ds4_vllm_checkpoint_sync_probe_uses_all_workers(
     module.probe_checkpoint_sync(LLM(), worker_count=8)
 
     assert sorted(sends) == [f"ipc:///tmp/worker-{index}" for index in range(8)]
+    assert calls[0] == ("_get_zmq_handle", {"timeout": 300})
     assert calls[1] == (
         "update_weights_from_ipc",
         {

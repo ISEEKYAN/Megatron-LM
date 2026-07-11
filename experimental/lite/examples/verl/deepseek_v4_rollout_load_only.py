@@ -10,10 +10,6 @@ from threading import Event
 from pathlib import Path
 
 
-def _checkpoint_ipc_handle(worker):
-    return worker._get_zmq_handle()
-
-
 def _send_empty_checkpoint_bucket(handle: str, ready: Event) -> None:
     from multiprocessing.shared_memory import SharedMemory
 
@@ -40,7 +36,7 @@ def _send_empty_checkpoint_bucket(handle: str, ready: Event) -> None:
 
 
 def probe_checkpoint_sync(llm, *, worker_count: int) -> None:
-    handles = llm.collective_rpc(_checkpoint_ipc_handle, timeout=300)
+    handles = llm.collective_rpc("_get_zmq_handle", timeout=300)
     if len(handles) != worker_count or len(set(handles)) != worker_count:
         raise RuntimeError(
             f"expected {worker_count} unique checkpoint IPC handles, got {handles}"
