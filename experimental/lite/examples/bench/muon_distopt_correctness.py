@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Pinned, bitwise Muon x compact DistOpt correctness harness.
+"""Pinned, bitwise Muon x DistOpt layout and overlap correctness harness.
 
 The reference path deliberately spells out the Megatron-Core lowering order.  The
 MLite path enters through ``build_dist_opt_stack``.  Both paths use the same tiny
@@ -20,6 +20,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -35,9 +36,9 @@ PINNED_EMERGING_REVISION = "b309e2f01cda75dc96a6dc1a2355a7b3b64b5e16"
 WORLD_SIZE = 2
 TOTAL_STEPS = 4
 SAVE_STEPS = 2
-MARKER_NAME = "NON_SKIP_MUON_DISTOPT_COMPACT_BITWISE_PASSED"
+MARKER_NAME = "NON_SKIP_MUON_DISTOPT_BITWISE_PASSED"
 ADAM_MARKER_NAME = "NON_SKIP_PINNED_ADAM_DISTOPT_GATE_PASSED"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _ADAM_TEXT_ONLY_EXPECTED = {
     "backend": "mlite",
@@ -173,6 +174,18 @@ def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
+def _layer_wise_layout() -> str:
+    layout = os.environ.get("MUON_LAYOUT", "compact").lower()
+    _require(layout in {"compact", "padded"}, f"Unsupported MUON_LAYOUT={layout}")
+    return layout
+
+
+def _overlap_enabled() -> bool:
+    overlap = os.environ.get("MUON_OVERLAP", "off").lower()
+    _require(overlap in {"off", "on"}, f"Unsupported MUON_OVERLAP={overlap}")
+    return overlap == "on"
+
+
 def _stable_model_state(model: nn.Module) -> dict[str, torch.Tensor]:
     return {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
 
@@ -268,8 +281,8 @@ def _core_optimizer_config():
         params_dtype=torch.bfloat16,
         use_distributed_optimizer=False,
         use_layer_wise_distributed_optimizer=True,
-        use_layer_wise_param_layout=False,
-        overlap_param_gather=False,
+        use_layer_wise_param_layout=_layer_wise_layout() == "padded",
+        overlap_param_gather=_overlap_enabled(),
         overlap_param_gather_with_optimizer_step=False,
         muon_momentum=0.95,
         muon_split_qkv=True,
@@ -385,9 +398,9 @@ def _build_upstream_stack(device: torch.device, ps: SimpleNamespace) -> Stack:
     pg_collection = _pg_collection_from_parallel_state(ps)
     ddp_config = DistributedDataParallelConfig(
         use_distributed_optimizer=True,
-        use_layer_wise_param_layout=False,
-        overlap_grad_reduce=False,
-        overlap_param_gather=False,
+        use_layer_wise_param_layout=_layer_wise_layout() == "padded",
+        overlap_grad_reduce=_overlap_enabled(),
+        overlap_param_gather=_overlap_enabled(),
         grad_reduce_in_fp32=True,
     )
 
@@ -446,9 +459,9 @@ def _build_mlite_stack(device: torch.device, ps: SimpleNamespace) -> Stack:
         muon_tp_mode="blockwise",
         muon_extra_scale_factor=1.0,
         muon_scalar_optimizer="adam",
-        use_layer_wise_param_layout=False,
-        overlap_grad_reduce=False,
-        overlap_param_gather=False,
+        use_layer_wise_param_layout=_layer_wise_layout() == "padded",
+        overlap_grad_reduce=_overlap_enabled(),
+        overlap_param_gather=_overlap_enabled(),
         overlap_param_gather_with_optimizer_step=False,
     )
     engine_config = SimpleNamespace(
@@ -625,7 +638,25 @@ def _route_metadata(stack: Stack, view: OptimizerIntrospection, rank: int) -> di
     full_layout = getattr(wrapped, "full_param_layout", None)
     _require(full_layout is not None, "DDP did not retain the explicit full_param_layout")
     layout_offsets: dict[str, dict[str, Any]] = {}
+    layout_totals = {
+        "parameter_numel": 0,
+        "buffer_numel": 0,
+        "padding_numel": 0,
+        "muon_parameter_numel": 0,
+        "muon_buffer_numel": 0,
+        "muon_padding_numel": 0,
+    }
     for buffer_key, layout in full_layout.layouts.items():
+        parameter_numel = sum(int(value) for value in layout.per_bucket_numel_unpadded)
+        buffer_numel = sum(int(end - start) for start, end in layout.bucket_indices)
+        _require(buffer_numel >= parameter_numel, "Buffer layout is smaller than its parameters")
+        layout_totals["parameter_numel"] += parameter_numel
+        layout_totals["buffer_numel"] += buffer_numel
+        layout_totals["padding_numel"] += buffer_numel - parameter_numel
+        if buffer_key.is_managed_by_layer_wise_optimizer:
+            layout_totals["muon_parameter_numel"] += parameter_numel
+            layout_totals["muon_buffer_numel"] += buffer_numel
+            layout_totals["muon_padding_numel"] += buffer_numel - parameter_numel
         for parameter, (start, end, bucket_id) in layout.param_index_map.items():
             _require(parameter in names, "Buffer layout contains an unnamed parameter")
             name = names[parameter]
@@ -635,10 +666,16 @@ def _route_metadata(stack: Stack, view: OptimizerIntrospection, rank: int) -> di
             dp_size = WORLD_SIZE
             _require((bucket_end - bucket_start) % dp_size == 0, f"Unshardable bucket for {name}")
             if buffer_key.is_managed_by_layer_wise_optimizer:
-                _require(
-                    bucket_end - bucket_start == bucket_numel_unpadded,
-                    f"Muon buffer for {name} is padded instead of compact",
-                )
+                if _layer_wise_layout() == "compact":
+                    _require(
+                        bucket_end - bucket_start == bucket_numel_unpadded,
+                        f"Muon buffer for {name} is padded instead of compact",
+                    )
+                else:
+                    _require(
+                        bucket_end - bucket_start >= bucket_numel_unpadded,
+                        f"Padded Muon buffer for {name} is smaller than its parameters",
+                    )
             shard_size = (bucket_end - bucket_start) // dp_size
             local_start = bucket_start + rank * shard_size
             local_end = local_start + shard_size
@@ -691,6 +728,7 @@ def _route_metadata(stack: Stack, view: OptimizerIntrospection, rank: int) -> di
         "route": route,
         "whole_matrix_owner": owners,
         "buffer_layout_offsets": layout_offsets,
+        "layout_totals": layout_totals,
         "optimizer_signature": {
             "chain": [type(child).__name__ for child in stack.optimizer.chained_optimizers],
             "local_muon": [
@@ -915,7 +953,10 @@ def _contract() -> dict[str, Any]:
         "context_parallel_size": 1,
         "expert_parallel_size": 1,
         "parameter_dtype": "bfloat16",
-        "compact_layer_wise_layout": True,
+        "layer_wise_layout": _layer_wise_layout(),
+        "overlap_grad_reduce": _overlap_enabled(),
+        "overlap_param_gather": _overlap_enabled(),
+        "overlap_param_gather_with_optimizer_step": False,
         "total_steps": TOTAL_STEPS,
         "save_steps": SAVE_STEPS,
         "runtime_identity": _runtime_identity(),
@@ -998,14 +1039,18 @@ def _run_steps(
     device: torch.device,
     start: int,
     end: int,
-) -> dict[int, dict[str, Any]]:
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 
     capture, reset_capture = _install_muon_capture(view)
     expected_local_muon = set(view.muon_main_to_name.values())
     steps: dict[int, dict[str, Any]] = {}
+    step_time_ms: dict[int, float] = {}
     wrapped = stack.wrapped_chunks[0]
+    torch.cuda.reset_peak_memory_stats(device)
     for step in range(start, end):
+        torch.cuda.synchronize(device)
+        step_start = time.perf_counter()
         stack.optimizer.zero_grad(set_to_none=True)
         wrapped.zero_grad_buffer()
         reset_capture()
@@ -1021,7 +1066,14 @@ def _run_steps(
         local_optimizer_grad = _snapshot_local_optimizer_grads(view)
         update_successful = stack.optimizer.step_with_ready_grads()
         _require(bool(update_successful), f"Optimizer update failed at step {step}")
+        if _overlap_enabled():
+            # The production overlap contract completes param all-gathers from
+            # forward pre-hooks. Exercise that path before recording synchronized
+            # parameters; this probe forward does not mutate optimizer state.
+            with torch.no_grad():
+                wrapped(input_tensor)
         torch.cuda.synchronize(device)
+        step_time_ms[step] = (time.perf_counter() - step_start) * 1000.0
 
         _require(
             set(capture["pre_ns_momentum"]) == expected_local_muon,
@@ -1067,7 +1119,13 @@ def _run_steps(
             "muon_state": muon_state,
             "adam_state": adam_state,
         }
-    return steps
+    return steps, {
+        "instrumented_step_time_ms": step_time_ms,
+        "instrumented_step_time_mean_ms": sum(step_time_ms.values())
+        / max(len(step_time_ms), 1),
+        "peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+        "peak_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+    }
 
 
 def run_one(args: argparse.Namespace) -> int:
@@ -1106,9 +1164,9 @@ def run_one(args: argparse.Namespace) -> int:
             )
             start, end = SAVE_STEPS, TOTAL_STEPS
 
-        steps = _run_steps(stack, view, rank, device, start, end)
+        steps, performance = _run_steps(stack, view, rank, device, start, end)
         artifact = {
-            "kind": "compact_muon_distopt_bitwise_rank_artifact",
+            "kind": "muon_distopt_bitwise_rank_artifact",
             "implementation": args.implementation,
             "trajectory": args.trajectory,
             "rank": rank,
@@ -1116,6 +1174,7 @@ def run_one(args: argparse.Namespace) -> int:
             "metadata": metadata,
             "lowering_order": list(stack.lowering_order),
             "steps": steps,
+            "performance": performance,
         }
         output_path = _artifact_path(output_dir, args.trajectory, rank)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1389,6 +1448,12 @@ def _compare_directories(upstream_dir: Path, mlite_dir: Path) -> dict[str, Any]:
         **counters,
         "checks": checks,
         "mismatches": mismatches,
+        "performance": {
+            implementation: artifacts[implementation]["continuous"][0].get(
+                "performance", {}
+            )
+            for implementation in ("upstream", "mlite")
+        },
     }
 
 
@@ -1414,7 +1479,7 @@ def compare_runs(args: argparse.Namespace) -> int:
         Path(args.upstream_dir).resolve(), Path(args.mlite_dir).resolve()
     )
     report = {
-        "kind": "compact_muon_distopt_bitwise_comparison",
+        "kind": "muon_distopt_bitwise_comparison",
         "contract": _contract(),
         "upstream_dir": str(Path(args.upstream_dir).resolve()),
         "mlite_dir": str(Path(args.mlite_dir).resolve()),
@@ -1538,7 +1603,7 @@ def _fake_artifact(implementation: str, trajectory: str, rank: int) -> dict[str,
             },
         }
     return {
-        "kind": "compact_muon_distopt_bitwise_rank_artifact",
+        "kind": "muon_distopt_bitwise_rank_artifact",
         "implementation": implementation,
         "trajectory": trajectory,
         "rank": rank,
@@ -1562,6 +1627,12 @@ def _fake_artifact(implementation: str, trajectory: str, rank: int) -> dict[str,
             "mlite": ["build_dist_opt_stack"],
         }[implementation],
         "steps": steps,
+        "performance": {
+            "instrumented_step_time_ms": {},
+            "instrumented_step_time_mean_ms": 0.0,
+            "peak_memory_allocated_bytes": 0,
+            "peak_memory_reserved_bytes": 0,
+        },
     }
 
 

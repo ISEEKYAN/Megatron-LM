@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#SBATCH --job-name=muon-distopt-bitwise
+#SBATCH --job-name=muon-distopt-layout-overlap
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:2
@@ -8,6 +8,8 @@
 #SBATCH --partition=batch
 #SBATCH --time=00:40:00
 
+# This recipe retains its historical filename so the validated compact setup stays
+# discoverable; MODE=all now covers compact/padded x overlap off/on.
 # SNAPSHOT_ROOT must be a read-only `git archive` of MLITE_HEAD.  After extraction,
 # write MLITE_HEAD to .mlite-source-head and `git rev-parse HEAD^{tree}` to
 # .mlite-source-tree, then create .mlite-source-sha256 with:
@@ -261,6 +263,13 @@ manifest = {
         "ep": 1,
     },
 }
+if os.environ["MODE"] == "all":
+    manifest["muon_configurations"] = [
+        "compact_off",
+        "compact_on",
+        "padded_off",
+        "padded_on",
+    ]
 if os.environ["MODE"] == "adam":
     checkpoint = Path(os.environ["HF_PATH"]).resolve()
     config_path = checkpoint / "config.json"
@@ -308,7 +317,7 @@ PY
         --upstream-dir "${upstream_dir}" \
         --mlite-dir "${mlite_dir}" \
         --output-json "${RUN_ROOT}/comparison.json"
-      test -f "${RUN_ROOT}/NON_SKIP_MUON_DISTOPT_COMPACT_BITWISE_PASSED"
+      test -f "${RUN_ROOT}/NON_SKIP_MUON_DISTOPT_BITWISE_PASSED"
     }
 
     case "${MODE}" in
@@ -322,9 +331,19 @@ PY
         compare_implementations
         ;;
       all)
-        run_implementation upstream "${upstream_dir}" "${upstream_checkpoint_dir}"
-        run_implementation mlite "${mlite_dir}" "${mlite_checkpoint_dir}"
-        compare_implementations
+        for config in compact_off compact_on padded_off padded_on; do
+          export MUON_LAYOUT=${config%_*}
+          export MUON_OVERLAP=${config#*_}
+          config_root="${RUN_ROOT}/${config}"
+          upstream_dir="${config_root}/upstream"
+          mlite_dir="${config_root}/mlite"
+          upstream_checkpoint_dir="${config_root}/checkpoints/upstream"
+          mlite_checkpoint_dir="${config_root}/checkpoints/mlite"
+          mkdir -p "${config_root}"
+          run_implementation upstream "${upstream_dir}" "${upstream_checkpoint_dir}"
+          run_implementation mlite "${mlite_dir}" "${mlite_checkpoint_dir}"
+          RUN_ROOT="${config_root}" compare_implementations
+        done
         ;;
       adam)
         output_dir="${RUN_ROOT}/adam"

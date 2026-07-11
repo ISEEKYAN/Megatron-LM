@@ -38,12 +38,6 @@ def validate_dist_opt_config(engine_cfg) -> None:
     opt = engine_cfg.optimizer
     if str(opt.optimizer).lower() != "muon":
         return
-    if bool(_optimizer_value(opt, "use_layer_wise_param_layout", False)):
-        raise ValueError("Muon padded LayerWise layout is deferred; use compact layout.")
-    if bool(_optimizer_value(opt, "overlap_grad_reduce", False)):
-        raise ValueError("Muon compact lowering does not yet support overlap_grad_reduce.")
-    if bool(_optimizer_value(opt, "overlap_param_gather", False)):
-        raise ValueError("Muon compact lowering does not yet support overlap_param_gather.")
     if bool(_optimizer_value(opt, "overlap_param_gather_with_optimizer_step", False)):
         raise ValueError("Muon does not support parameter gather overlap with optimizer step.")
     if bool(_optimizer_value(opt, "fp8_param_gather", False)):
@@ -65,6 +59,27 @@ def validate_dist_opt_config(engine_cfg) -> None:
     )
     if offload_requested:
         raise ValueError("Muon optimizer offload is deferred to the dedicated offload lowering.")
+
+
+def _validate_muon_padded_expert_fallback(model_chunks: list[nn.Module]) -> None:
+    """Reject the expert Adam fallback missing from the pinned padded upstream path."""
+
+    unsupported = [
+        f"chunk{chunk_idx}.{name}"
+        for chunk_idx, chunk in enumerate(model_chunks)
+        for name, param in chunk.named_parameters()
+        if param.requires_grad
+        and not bool(getattr(param, "allreduce", True))
+        and not bool(getattr(param, "is_managed_by_layer_wise_optimizer", False))
+    ]
+    if unsupported:
+        names = ", ".join(unsupported[:4])
+        if len(unsupported) > 4:
+            names += f", ... ({len(unsupported)} total)"
+        raise ValueError(
+            "Muon padded layout does not support non-emerging expert-parallel "
+            f"parameters in pinned Megatron d64ba4ccb: {names}. Use compact layout."
+        )
 
 
 def _effective_etp(parallel) -> int:
@@ -329,6 +344,8 @@ def build_dist_opt_stack(
             for chunk in model_chunks:
                 _mark_dist_opt_parallel_attrs(chunk, is_expert_param, tp_size=p.tp)
             tag_params_for_buffer_routing(model_chunks)
+            if ddp_config.use_layer_wise_param_layout:
+                _validate_muon_padded_expert_fallback(model_chunks)
 
             data_parallel_world_size = pg_collection.dp_cp.size()
             expert_data_parallel_world_size = pg_collection.expt_dp.size()

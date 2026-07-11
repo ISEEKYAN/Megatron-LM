@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.primitive.optimizers.megatron_wrap import (
+    _validate_muon_padded_expert_fallback,
     _build_pg_collection,
     build_dist_opt_optimizer_config,
     build_dist_opt_stack,
@@ -155,7 +156,13 @@ def test_routing_does_not_infer_qkv_metadata_from_module_internals() -> None:
     assert not getattr(model.attn.qkv.linear.weight, "is_qkv", False)
 
 
-def test_compact_dist_opt_lowering_follows_upstream_order(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("padded", "overlap"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_dist_opt_lowering_follows_upstream_order_for_layout_and_overlap(
+    monkeypatch, padded: bool, overlap: bool
+) -> None:
     model = _SyntheticModel()
     events: list[str] = []
     owner_group = SimpleNamespace(size=lambda: 2)
@@ -251,8 +258,10 @@ def test_compact_dist_opt_lowering_follows_upstream_order(monkeypatch) -> None:
             assert bucket_size is None
             assert data_parallel_world_size == 2
             assert expert_data_parallel_world_size == 1
-            assert ddp_config.use_layer_wise_param_layout is False
-            return "compact-layout"
+            assert ddp_config.use_layer_wise_param_layout is padded
+            assert ddp_config.overlap_grad_reduce is overlap
+            assert ddp_config.overlap_param_gather is overlap
+            return "padded-layout" if padded else "compact-layout"
 
     layer_wise_module = types.ModuleType("megatron.core.optimizer.layer_wise_optimizer")
     layer_wise_module.LayerWiseDistributedOptimizer = FakeLayerWiseDistributedOptimizer
@@ -271,6 +280,8 @@ def test_compact_dist_opt_lowering_follows_upstream_order(monkeypatch) -> None:
         events.append("optimizer")
         assert config.use_distributed_optimizer is False
         assert config.use_layer_wise_distributed_optimizer is True
+        assert config.use_layer_wise_param_layout is padded
+        assert config.overlap_param_gather is overlap
         assert config.muon_num_ns_steps == 7
         assert isinstance(model_chunks[0], FakeDistributedDataParallel)
         assert kwargs == {
@@ -291,7 +302,12 @@ def test_compact_dist_opt_lowering_follows_upstream_order(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "megatron.core.transformer.enums", enum_module)
 
     parallel = SimpleNamespace(vpp=1, pp=1, tp=1, ep=1, etp=1, cp=1)
-    optimizer_config = OptimizerConfig(optimizer="muon")
+    optimizer_config = OptimizerConfig(
+        optimizer="muon",
+        use_layer_wise_param_layout=padded,
+        overlap_grad_reduce=overlap,
+        overlap_param_gather=overlap,
+    )
     optimizer_config.override_optimizer_config = {"muon_num_ns_steps": 7}
     engine_config = SimpleNamespace(
         parallel=parallel,
@@ -308,18 +324,39 @@ def test_compact_dist_opt_lowering_follows_upstream_order(monkeypatch) -> None:
     )
 
     assert events == ["metadata", "mpu", "buffer_route", "layout", "ddp", "optimizer"]
-    assert wrapped[0].full_param_layout == "compact-layout"
+    assert wrapped[0].full_param_layout == (
+        "padded-layout" if padded else "compact-layout"
+    )
     assert wrapped[0].pg_collection is pg_collection
     assert optimizer is facade
     assert optimizer._dist_opt_pg_collection is pg_collection
 
 
 @pytest.mark.parametrize(
+    "optimizer_overrides",
+    [
+        {"use_layer_wise_param_layout": True},
+        {"overlap_grad_reduce": True},
+        {"overlap_param_gather": True},
+        {
+            "use_layer_wise_param_layout": True,
+            "overlap_grad_reduce": True,
+            "overlap_param_gather": True,
+        },
+    ],
+)
+def test_muon_accepts_padded_layout_and_standard_overlap(optimizer_overrides) -> None:
+    optimizer = SimpleNamespace(optimizer="muon", **optimizer_overrides)
+    engine_config = SimpleNamespace(
+        parallel=SimpleNamespace(vpp=1, pp=1), optimizer=optimizer
+    )
+
+    validate_dist_opt_config(engine_config)
+
+
+@pytest.mark.parametrize(
     ("optimizer_overrides", "message"),
     [
-        ({"use_layer_wise_param_layout": True}, "padded"),
-        ({"overlap_grad_reduce": True}, "overlap_grad_reduce"),
-        ({"overlap_param_gather": True}, "overlap_param_gather"),
         ({"overlap_param_gather_with_optimizer_step": True}, "optimizer step"),
         ({"optimizer_cpu_offload": True}, "offload"),
         ({"optimizer_offload_fraction": 0.5}, "offload"),
@@ -329,7 +366,7 @@ def test_compact_dist_opt_lowering_follows_upstream_order(monkeypatch) -> None:
         ({"use_precision_aware_optimizer": True}, "precision-aware"),
     ],
 )
-def test_compact_muon_rejects_deferred_layout_overlap_and_offload(
+def test_muon_rejects_cross_step_overlap_offload_and_low_precision_gather(
     optimizer_overrides, message
 ) -> None:
     optimizer = SimpleNamespace(optimizer="muon", **optimizer_overrides)
@@ -344,14 +381,12 @@ def test_compact_muon_rejects_deferred_layout_overlap_and_offload(
 @pytest.mark.parametrize(
     ("optimizer_overrides", "message"),
     [
-        ({"overlap_grad_reduce": True}, "overlap_grad_reduce"),
-        ({"overlap_param_gather": True}, "overlap_param_gather"),
         ({"optimizer_cpu_offload": True}, "offload"),
         ({"fp8_param_gather": True}, "fp8_param_gather"),
         ({"fp4_param_gather": True}, "fp4_param_gather"),
     ],
 )
-def test_compact_muon_rejects_runtime_optimizer_overrides(
+def test_muon_rejects_unsupported_runtime_optimizer_overrides(
     optimizer_overrides, message
 ) -> None:
     runtime_config = MegatronLiteConfig.from_dict(
@@ -370,6 +405,36 @@ def test_compact_muon_rejects_runtime_optimizer_overrides(
 
     with pytest.raises(ValueError, match=message):
         validate_dist_opt_config(engine_config)
+
+
+def test_padded_muon_rejects_non_emerging_expert_fallback() -> None:
+    model = _SyntheticModel()
+    expert_bias = nn.Parameter(torch.zeros(4))
+    model.experts[0].register_parameter("bias", expert_bias)
+    for name, parameter in model.named_parameters():
+        parameter.allreduce = not name.startswith("experts.")
+        parameter.is_managed_by_layer_wise_optimizer = (
+            parameter.dim() == 2
+            and not getattr(parameter, "is_embedding_or_output_parameter", False)
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="padded.*non-emerging expert-parallel.*experts.0.bias",
+    ):
+        _validate_muon_padded_expert_fallback([model])
+
+
+def test_padded_muon_accepts_dense_and_emerging_expert_matrices() -> None:
+    model = _SyntheticModel()
+    for name, parameter in model.named_parameters():
+        parameter.allreduce = not name.startswith("experts.")
+        parameter.is_managed_by_layer_wise_optimizer = (
+            parameter.dim() == 2
+            and not getattr(parameter, "is_embedding_or_output_parameter", False)
+        )
+
+    _validate_muon_padded_expert_fallback([model])
 
 
 def test_prewrapped_muon_rejection_does_not_mutate_model_metadata() -> None:

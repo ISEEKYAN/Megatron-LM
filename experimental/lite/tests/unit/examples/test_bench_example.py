@@ -107,6 +107,27 @@ def test_compact_muon_sbatch_keeps_json_inside_outer_shell_quote():
     assert parsed.returncode == 0, parsed.stderr
 
 
+def test_muon_harness_contract_is_scoped_to_layout_and_overlap(monkeypatch):
+    from examples.bench.muon_distopt_correctness import _contract
+
+    monkeypatch.setenv("MUON_LAYOUT", "padded")
+    monkeypatch.setenv("MUON_OVERLAP", "on")
+    contract = _contract()
+
+    assert contract["layer_wise_layout"] == "padded"
+    assert contract["overlap_grad_reduce"] is True
+    assert contract["overlap_param_gather"] is True
+
+
+def test_muon_sbatch_runs_all_layout_overlap_configurations():
+    sbatch = Path(__file__).resolve().parents[5] / "docs/runs/muon_distopt_compact_bitwise.sbatch"
+    text = sbatch.read_text(encoding="utf-8")
+
+    assert 'for config in compact_off compact_on padded_off padded_on; do' in text
+    assert 'export MUON_LAYOUT=${config%_*}' in text
+    assert 'export MUON_OVERLAP=${config#*_}' in text
+
+
 def test_bench_builds_mlite_runtime_config_with_model_hook():
     from examples.bench.bench import BenchCliConfig, build_runtime_config
     from megatron.lite.model.qwen3_5.config import Qwen35Config
