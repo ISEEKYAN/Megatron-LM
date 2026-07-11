@@ -556,7 +556,7 @@ class MegatronLiteEngine(BaseEngine):
         impl_cfg["use_thd"] = True
         cross_entropy_fusion = getattr(self.engine_config, "cross_entropy_fusion", None)
         if cross_entropy_fusion is None:
-            cross_entropy_fusion = getattr(self.engine_config, "use_fused_kernels", False)
+            cross_entropy_fusion = getattr(self.model_config, "use_fused_kernels", False)
         impl_cfg.setdefault("cross_entropy_fusion", bool(cross_entropy_fusion))
         mtp_cfg = getattr(self.model_config, "mtp", None)
         if mtp_cfg is not None:

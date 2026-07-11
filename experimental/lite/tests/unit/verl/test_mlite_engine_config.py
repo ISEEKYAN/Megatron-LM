@@ -33,11 +33,17 @@ def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
 
 
 def _engine(
-    *, engine_config: MegatronLiteEngineConfig, optimizer_config: SimpleNamespace | None = None
+    *,
+    engine_config: MegatronLiteEngineConfig,
+    optimizer_config: SimpleNamespace | None = None,
+    use_fused_kernels: bool = False,
 ) -> MegatronLiteEngine:
     return MegatronLiteEngine(
         model_config=SimpleNamespace(
-            local_path="/tmp/qwen35", hf_config={"model_type": "qwen3_5_moe"}, mtp=None
+            local_path="/tmp/qwen35",
+            hf_config={"model_type": "qwen3_5_moe"},
+            mtp=None,
+            use_fused_kernels=use_fused_kernels,
         ),
         engine_config=engine_config,
         optimizer_config=optimizer_config or _optimizer_config(),
@@ -136,6 +142,24 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
     assert config.attention_backend_override == "flash"
     assert config.impl_cfg["use_thd"] is True
     assert config.impl_cfg["deterministic"] is False
+
+
+def test_model_fused_kernel_setting_enables_linear_cross_entropy() -> None:
+    engine = _engine(
+        engine_config=_engine_config(),
+        use_fused_kernels=True,
+    )
+
+    assert engine._build_impl_cfg()["cross_entropy_fusion"] is True
+
+
+def test_explicit_cross_entropy_setting_overrides_model_fused_kernels() -> None:
+    engine = _engine(
+        engine_config=_engine_config(cross_entropy_fusion=False),
+        use_fused_kernels=True,
+    )
+
+    assert engine._build_impl_cfg()["cross_entropy_fusion"] is False
 
 
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
