@@ -483,6 +483,16 @@ def _dense_logprobs(entries: list[Any], vocab_size: int) -> torch.Tensor:
     return torch.stack(rows)
 
 
+def _formal_mlite_impl_config() -> dict[str, Any]:
+    """Build every release component while keeping the parity forward loss-free."""
+    return {
+        "optimizer": None,
+        "mtp_enable": True,
+        "mtp_enable_train": False,
+        "use_deepep": False,
+    }
+
+
 def _checkpoint_expert_dtype(model: Path) -> str:
     config = json.loads((model / "config.json").read_text())
     quantization = config.get("quantization_config") or {}
@@ -649,12 +659,7 @@ def collect_mlite(
         parallel=ParallelConfig(tp=1, etp=1, ep=4, pp=1, vpp=1, cp=1),
         attention_backend_override="fused",
         load_hf_weights=True,
-        impl_cfg={
-            "optimizer": None,
-            "mtp_enable": False,
-            "mtp_enable_train": False,
-            "use_deepep": False,
-        },
+        impl_cfg=_formal_mlite_impl_config(),
     )
     runtime = create_runtime(
         RuntimeConfig(backend="mlite", hf_path=str(model), backend_cfg=backend_config)

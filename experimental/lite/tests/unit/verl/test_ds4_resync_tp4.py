@@ -395,6 +395,14 @@ def test_formal_sbatch_uses_mixed_source_for_mlite_and_fp8_artifact_for_vllm() -
     assert "convert --source" not in script
 
 
+def test_formal_mlite_export_keeps_mtp_parameters_for_exact_checkpoint_coverage() -> None:
+    from examples.verl.ds4_resync_tp4 import _formal_mlite_impl_config
+
+    config = _formal_mlite_impl_config()
+    assert config["mtp_enable"] is True
+    assert config["mtp_enable_train"] is False
+
+
 def test_durable_vllm_completion_fsyncs_artifacts_and_exits(
     tmp_path, monkeypatch
 ) -> None:
