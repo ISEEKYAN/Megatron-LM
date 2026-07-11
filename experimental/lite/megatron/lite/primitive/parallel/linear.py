@@ -40,15 +40,20 @@ def _validate_blockwise_features(
             )
 
 
-def _bind_bf16_weight_precision(
+def _validate_bf16_weight_precision(
     coverage: PrecisionCoverage | None,
-    owner: object,
     site: SemanticSite | None,
-    capability: PrimitiveCapability,
     *,
     in_features: int,
     out_features: int,
 ) -> PrecisionImplementation | None:
+    """Validate one TP linear site against the active model-init profile.
+
+    Returns the bound implementation (or ``None`` when precision is unmanaged).
+    The capability claim itself is registered by the caller after the TE module
+    is constructed, so coverage can bind to the real TE primitive instance.
+    """
+
     if coverage is None:
         if site is not None:
             raise ValueError("precision_site requires a typed precision coverage collector")
@@ -66,7 +71,6 @@ def _bind_bf16_weight_precision(
     if site not in implementation.fp8_sites:
         raise ValueError(f"site {site.value} is not an FP8 GEMM site")
     _validate_blockwise_features(in_features, out_features, site)
-    coverage.claim(owner, site, capability)
     return implementation
 
 
@@ -278,11 +282,9 @@ class ColumnParallelLinear(nn.Module):
             if normalization is not None
             else PrimitiveCapability.TE_LINEAR
         )
-        self._precision_implementation = _bind_bf16_weight_precision(
+        self._precision_implementation = _validate_bf16_weight_precision(
             precision_coverage,
-            self,
             precision_site,
-            capability,
             in_features=in_features,
             out_features=self.local_out,
         )
@@ -311,6 +313,8 @@ class ColumnParallelLinear(nn.Module):
                 tp_group=ps.tp_group,
                 tp_size=ps.tp_size,
             )
+        if self._precision_implementation is not None:
+            precision_coverage.claim(self, precision_site, capability, self.linear)
         self.gather_output = gather_output
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -343,11 +347,9 @@ class RowParallelLinear(nn.Module):
         self.use_sp = ps.tp_size > 1
         self.local_in = ensure_divisible(in_features, ps.tp_size)
         self._precision_site = precision_site
-        self._precision_implementation = _bind_bf16_weight_precision(
+        self._precision_implementation = _validate_bf16_weight_precision(
             precision_coverage,
-            self,
             precision_site,
-            PrimitiveCapability.TE_LINEAR,
             in_features=self.local_in,
             out_features=out_features,
         )
@@ -361,6 +363,10 @@ class RowParallelLinear(nn.Module):
             tp_group=ps.tp_group,
             tp_size=ps.tp_size,
         )
+        if self._precision_implementation is not None:
+            precision_coverage.claim(
+                self, precision_site, PrimitiveCapability.TE_LINEAR, self.linear
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with _linear_precision_context(

@@ -15,6 +15,23 @@ from megatron.lite.primitive.precision.hopper_blockwise import (
     active_precision,
 )
 
+# Each FP8 capability may only be claimed by the exact Transformer Engine GEMM
+# primitive that implements it. Resolving the class lazily keeps this module
+# importable on hosts without Transformer Engine (CPU unit tests).
+_CAPABILITY_TE_ATTR: dict[PrimitiveCapability, str] = {
+    PrimitiveCapability.TE_LINEAR: "Linear",
+    PrimitiveCapability.TE_LAYERNORM_LINEAR: "LayerNormLinear",
+    PrimitiveCapability.TE_GROUPED_LINEAR: "GroupedLinear",
+}
+
+
+def _te_primitive_type(capability: PrimitiveCapability) -> type:
+    """Return the TE primitive class that a capability must be backed by."""
+
+    import transformer_engine.pytorch as te  # local import: keep CPU import-safety
+
+    return getattr(te, _CAPABILITY_TE_ATTR[capability])
+
 
 @dataclass(frozen=True, slots=True)
 class _Requirement:
@@ -111,15 +128,35 @@ class PrecisionCoverage:
         owner: object,
         site: SemanticSite,
         capability: PrimitiveCapability,
+        primitive: object = None,
         *,
         diagnostic: str = "",
     ) -> None:
-        """Claim one exact concrete site from a typed reusable primitive."""
+        """Claim one exact concrete site, backed by a real TE primitive.
+
+        ``owner`` is the identity matched against the declared requirement.
+        ``primitive`` is the object whose type must actually implement the
+        capability; it defaults to ``owner`` for primitives that expose the TE
+        module directly (dense MLP, MoE experts) and is passed explicitly by
+        wrappers whose owner is not itself the TE module (TP linears). The
+        type check makes a capability unforgeable: a non-TE module (e.g. a raw
+        ``torch.nn.Linear`` or an SDPA/matmul owner) cannot masquerade as an
+        FP8-capable GEMM site.
+        """
 
         self._ensure_collecting()
         self._validate_owner_site(owner, site)
         if not isinstance(capability, PrimitiveCapability):
             raise TypeError("coverage capability must be a PrimitiveCapability")
+        witness = owner if primitive is None else primitive
+        expected = _te_primitive_type(capability)
+        if not isinstance(witness, expected):
+            actual = type(witness)
+            raise TypeError(
+                f"capability {capability.value} at {site.value} must be backed by a "
+                f"real transformer_engine.pytorch.{_CAPABILITY_TE_ATTR[capability]} "
+                f"primitive; got {actual.__module__}.{actual.__qualname__}"
+            )
         self._claims.append(_Claim(owner, site, capability, diagnostic))
 
     @property
