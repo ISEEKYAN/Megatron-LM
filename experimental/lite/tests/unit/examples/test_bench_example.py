@@ -121,6 +121,8 @@ def test_muon_harness_contract_is_scoped_to_layout_and_overlap(monkeypatch):
     assert contract["layer_wise_layout"] == "padded"
     assert contract["overlap_grad_reduce"] is True
     assert contract["overlap_param_gather"] is True
+    assert contract["total_steps"] == 12
+    assert contract["performance_protocol"] == {"warmup_steps": 2, "measured_steps": 10}
     muon_parameter_numel = 4 * SyntheticMixedModel.hidden_size**2
     assert muon_parameter_numel == 400
     assert muon_parameter_numel % (WORLD_SIZE * 64) != 0

@@ -34,8 +34,9 @@ import torch.nn.functional as F
 PINNED_MEGATRON_REVISION = "d64ba4ccb1e3e878c15171c9cc58d5d3b46bf4d5"
 PINNED_EMERGING_REVISION = "b309e2f01cda75dc96a6dc1a2355a7b3b64b5e16"
 WORLD_SIZE = 2
-TOTAL_STEPS = 4
-SAVE_STEPS = 2
+TOTAL_STEPS = 12
+SAVE_STEPS = 6
+PERFORMANCE_WARMUP_STEPS = 2
 MARKER_NAME = "NON_SKIP_MUON_DISTOPT_BITWISE_PASSED"
 ADAM_MARKER_NAME = "NON_SKIP_PINNED_ADAM_DISTOPT_GATE_PASSED"
 SCHEMA_VERSION = 2
@@ -971,6 +972,10 @@ def _contract() -> dict[str, Any]:
         "overlap_param_gather_with_optimizer_step": False,
         "total_steps": TOTAL_STEPS,
         "save_steps": SAVE_STEPS,
+        "performance_protocol": {
+            "warmup_steps": PERFORMANCE_WARMUP_STEPS,
+            "measured_steps": TOTAL_STEPS - PERFORMANCE_WARMUP_STEPS,
+        },
         "runtime_identity": _runtime_identity(),
         "optimizer": {
             "name": "muon",
@@ -1131,10 +1136,15 @@ def _run_steps(
             "muon_state": muon_state,
             "adam_state": adam_state,
         }
+    measured_times = [
+        value for step, value in step_time_ms.items() if step >= PERFORMANCE_WARMUP_STEPS
+    ]
     return steps, {
         "instrumented_step_time_ms": step_time_ms,
         "instrumented_step_time_mean_ms": sum(step_time_ms.values())
         / max(len(step_time_ms), 1),
+        "measured_step_time_mean_ms": sum(measured_times) / max(len(measured_times), 1),
+        "measured_step_count": len(measured_times),
         "peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
         "peak_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
     }
