@@ -250,6 +250,18 @@ fi
 RAY_CLI=(env VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python -m ray.scripts.scripts)
 "${RAY_CLI[@]}" --help >/dev/null
 
+runtime_env_with_file_logger_path() {
+  VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python - "$1" "$2" <<'PY'
+import json
+import sys
+
+runtime_env = json.loads(sys.argv[1])
+env_vars = runtime_env.setdefault("env_vars", {})
+env_vars["VERL_FILE_LOGGER_PATH"] = sys.argv[2]
+print(json.dumps(runtime_env))
+PY
+}
+
 NODE_RANK=${SLURM_PROCID}
 DONE_FILE="${RUN_ROOT}/.ray_done"
 RAY_TEMP_DIR="/tmp/ds4-grpo-${SLURM_JOB_ID}-ray"
@@ -357,6 +369,24 @@ assert record == {"step": 0, "data": {"writable": True}}, record
 print(
     "DS4_FILE_LOGGER_PREFLIGHT_PASSED "
     f"path={os.environ['VERL_FILE_LOGGER_PATH']}",
+    flush=True,
+)
+PY
+    FILE_LOGGER_PATH="${RUN_ROOT}/phase1.jsonl"
+    FILE_LOGGER_RUNTIME_ENV_JSON=$(runtime_env_with_file_logger_path \
+      '{"env_vars": {"sentinel": "preserved"}}' "${FILE_LOGGER_PATH}")
+    VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python - \
+      "${FILE_LOGGER_RUNTIME_ENV_JSON}" "${FILE_LOGGER_PATH}" <<'PY'
+import json
+import sys
+
+runtime_env = json.loads(sys.argv[1])
+env_vars = runtime_env["env_vars"]
+assert env_vars["sentinel"] == "preserved", env_vars
+assert env_vars["VERL_FILE_LOGGER_PATH"] == sys.argv[2], env_vars
+print(
+    "DS4_FILE_LOGGER_RUNTIME_ENV_PREFLIGHT_PASSED "
+    f"path={env_vars['VERL_FILE_LOGGER_PATH']}",
     flush=True,
 )
 PY
@@ -476,18 +506,6 @@ env["VERL_MLITE_SKIP_RUNTIME_PATCHES"] = "0"
 print(json.dumps({"env_vars": env}))
 PY
 )
-
-runtime_env_with_file_logger_path() {
-  python - "${RUNTIME_ENV_JSON}" "$1" <<'PY'
-import json
-import sys
-
-runtime_env = json.loads(sys.argv[1])
-env_vars = runtime_env.setdefault("env_vars", {})
-env_vars["VERL_FILE_LOGGER_PATH"] = sys.argv[2]
-print(json.dumps(runtime_env))
-PY
-}
 
 if [[ "${RAY_ONLY}" == "1" ]]; then
   "${RAY_CLI[@]}" job submit \
@@ -707,7 +725,7 @@ run_phase() {
   local jsonl_file="${RUN_ROOT}/${phase}.jsonl"
   local cmd_file="${RUN_ROOT}/${phase}.cmd.sh"
   local phase_runtime_env_json
-  phase_runtime_env_json=$(runtime_env_with_file_logger_path "${jsonl_file}")
+  phase_runtime_env_json=$(runtime_env_with_file_logger_path "${RUNTIME_ENV_JSON}" "${jsonl_file}")
   "${RAY_CLI[@]}" job submit \
     --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
     --runtime-env-json="${phase_runtime_env_json}" \

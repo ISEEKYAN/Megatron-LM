@@ -313,10 +313,12 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert 'RESUME_MODE="${resume_mode}"' in script
     assert 'HYDRA_RUN_DIR="${RUN_ROOT}/hydra/${phase}"' in script
     assert "runtime_env_with_file_logger_path()" in script
+    assert 'VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python - "$1" "$2"' in script
     assert 'env_vars["VERL_FILE_LOGGER_PATH"] = sys.argv[2]' in script
-    assert 'phase_runtime_env_json=$(runtime_env_with_file_logger_path "${jsonl_file}")' in script
+    assert 'phase_runtime_env_json=$(runtime_env_with_file_logger_path "${RUNTIME_ENV_JSON}" "${jsonl_file}")' in script
     assert '--runtime-env-json="${phase_runtime_env_json}"' in script
     assert "DS4_FILE_LOGGER_PREFLIGHT_PASSED" in script
+    assert "DS4_FILE_LOGGER_RUNTIME_ENV_PREFLIGHT_PASSED" in script
     assert 'run_phase phase1 "${PHASE1_STEPS}" disable' in script
     assert 'run_phase resume "${TOTAL_STEPS}" auto' in script
     assert "DS4_GRPO_PHASE1_COMPLETE" in script
