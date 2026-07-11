@@ -5,6 +5,7 @@ import ast
 from pathlib import Path
 
 import pytest
+import torch.nn as nn
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
@@ -104,6 +105,20 @@ def test_qwen_lite_protocols_build_configs_from_hf_dicts(transformer_engine_impo
     assert qwen35_cfg.vocab_size == 128
     assert qwen35_cfg.layer_type_at(0) == "linear_attention"
     assert qwen35_cfg.layer_type_at(1) == "full_attention"
+
+
+def test_cross_entropy_fusion_survives_module_wrapping():
+    from megatron.lite.model.protocol_utils import add_cross_entropy_fusion
+
+    inner = nn.Linear(2, 2)
+    inner.cross_entropy_fusion = True
+    wrapper = nn.Module()
+    wrapper.module = inner
+    kwargs = {}
+
+    add_cross_entropy_fusion(kwargs, wrapper)
+
+    assert kwargs["use_fused_kernels"] is True
 
 
 def test_qwen_lite_protocols_reexport_checkpoint_hook_names():
