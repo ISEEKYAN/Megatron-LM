@@ -342,6 +342,10 @@ def test_ds4_grpo_sbatch_has_bounded_vllm_load_only_gate() -> None:
     assert 'load_format="dummy"' in load_program
     assert '"expert_dtype": "fp8"' in load_program
     assert "DS4_VLLM_LOAD_ONLY_PASSED" in load_program
+    assert "VLLM_CHECKPOINT_SYNC_PROBE" in script
+    assert "VllmCheckpointWorkerExtension" in load_program
+    assert '"base_sync_done": True' in load_program
+    assert "DS4_VLLM_CHECKPOINT_SYNC_PASSED" in load_program
 
 
 def test_ds4_vllm_load_only_uses_production_fp8_shape(
@@ -381,6 +385,47 @@ def test_ds4_vllm_load_only_uses_production_fp8_shape(
     assert "DS4_VLLM_LOAD_ONLY_PASSED rollout_tp=8 o_groups=8 local_groups=1" in (
         capsys.readouterr().out
     )
+
+
+def test_ds4_vllm_checkpoint_sync_probe_uses_all_workers(
+    monkeypatch, capsys
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "ds4_vllm_sync_probe_test", VLLM_LOAD_ONLY_MODULE
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    sends = []
+    calls = []
+
+    def send(handle, ready):
+        sends.append(handle)
+        ready.set()
+
+    class LLM:
+        def collective_rpc(self, method, **kwargs):
+            calls.append((method, kwargs))
+            if callable(method):
+                return [f"ipc:///tmp/worker-{index}" for index in range(8)]
+            return [None] * 8
+
+    monkeypatch.setattr(module, "_send_empty_checkpoint_bucket", send)
+    module.probe_checkpoint_sync(LLM(), worker_count=8)
+
+    assert sorted(sends) == [f"ipc:///tmp/worker-{index}" for index in range(8)]
+    assert calls[1] == (
+        "update_weights_from_ipc",
+        {
+            "timeout": 300,
+            "kwargs": {
+                "peft_config": None,
+                "base_sync_done": True,
+                "use_shm": True,
+            },
+        },
+    )
+    assert "DS4_VLLM_CHECKPOINT_SYNC_PASSED workers=8" in capsys.readouterr().out
 
 
 def test_ds4_grpo_ray_only_probes_every_local_device_uuid_mapping() -> None:

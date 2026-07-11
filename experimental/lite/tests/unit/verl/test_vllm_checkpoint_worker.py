@@ -550,6 +550,70 @@ def test_checkpoint_bucket_reload_does_not_finalize_failed_partial_update() -> N
     assert events == ["begin"]
 
 
+def test_checkpoint_ipc_worker_accepts_non_peft_full_sync(monkeypatch) -> None:
+    from verl_mlite.rollout import verl_worker
+
+    calls = []
+
+    def upstream_update(extension, **kwargs):
+        calls.append(("upstream", kwargs))
+        verl_worker.VllmCheckpointWorkerExtension._update_weights(
+            extension,
+            [("weight", object())],
+            peft_config=kwargs["peft_config"],
+            base_sync_done=kwargs["base_sync_done"],
+        )
+
+    monkeypatch.setattr(
+        verl_worker,
+        "_UPSTREAM_UPDATE_WEIGHTS_FROM_IPC",
+        upstream_update,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        verl_worker,
+        "reload_checkpoint_buckets",
+        lambda runner, receive: receive(
+            lambda weights: calls.append(("load", runner, weights))
+        ),
+    )
+    extension = SimpleNamespace(
+        device=torch.device("cpu"),
+        model_runner=object(),
+    )
+
+    for base_sync_done in (False, True):
+        verl_worker.VllmCheckpointWorkerExtension.update_weights_from_ipc(
+            extension,
+            peft_config=None,
+            base_sync_done=base_sync_done,
+            use_shm=True,
+        )
+
+    assert [call[0] for call in calls] == ["upstream", "load"] * 2
+    assert calls[0][1] == {
+        "peft_config": None,
+        "base_sync_done": False,
+        "use_shm": True,
+    }
+    assert calls[2][1]["base_sync_done"] is True
+
+
+def test_checkpoint_ipc_worker_rejects_all_peft_syncs() -> None:
+    import pytest
+
+    from verl_mlite.rollout.verl_worker import VllmCheckpointWorkerExtension
+
+    extension = SimpleNamespace(device=torch.device("cpu"))
+    for base_sync_done in (False, True):
+        with pytest.raises(NotImplementedError, match="PEFT"):
+            VllmCheckpointWorkerExtension.update_weights_from_ipc(
+                extension,
+                peft_config={"r": 8},
+                base_sync_done=base_sync_done,
+            )
+
+
 def test_checkpoint_path_reload_uses_vllm_native_checkpoint_lifecycle() -> None:
     from verl_mlite.rollout.vllm_worker import VllmCheckpointPathWorkerExtension
 

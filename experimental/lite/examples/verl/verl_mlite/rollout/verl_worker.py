@@ -12,6 +12,10 @@ except ModuleNotFoundError:
 
 from verl_mlite.rollout.vllm_worker import reload_checkpoint_buckets
 
+_UPSTREAM_UPDATE_WEIGHTS_FROM_IPC = getattr(
+    vLLMColocateWorkerExtension, "update_weights_from_ipc", None
+)
+
 
 class VllmCheckpointWorkerExtension(vLLMColocateWorkerExtension):
     """Consume serialized checkpoint tensors without veRL online quantization."""
@@ -30,21 +34,44 @@ class VllmCheckpointWorkerExtension(vLLMColocateWorkerExtension):
         base_sync_done: bool = False,
         use_shm: bool = False,
     ) -> None:
-        if peft_config or base_sync_done:
+        if peft_config:
             raise NotImplementedError(
-                "checkpoint-format resync does not support LoRA delta updates"
+                "checkpoint-format resync does not support PEFT/LoRA weight updates"
             )
-
-        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
-            BucketedWeightReceiver,
-        )
-
         if self.device is None:
             raise RuntimeError("vLLM worker device is not initialized")
-        receiver = BucketedWeightReceiver(
-            zmq_handle=self._get_zmq_handle(), device=self.device, use_shm=use_shm
-        )
-        reload_checkpoint_buckets(self.model_runner, receiver.receive_weights)
+        if _UPSTREAM_UPDATE_WEIGHTS_FROM_IPC is None:
+            raise RuntimeError("veRL vLLM IPC weight synchronization is unavailable")
+
+        def receive(load_bucket) -> None:
+            self._checkpoint_load_bucket = load_bucket
+            try:
+                _UPSTREAM_UPDATE_WEIGHTS_FROM_IPC(
+                    self,
+                    peft_config=None,
+                    base_sync_done=base_sync_done,
+                    use_shm=use_shm,
+                )
+            finally:
+                del self._checkpoint_load_bucket
+
+        reload_checkpoint_buckets(self.model_runner, receive)
+
+    def _update_weights(
+        self,
+        weights,
+        peft_config: dict | None,
+        base_sync_done: bool,
+    ) -> None:
+        del base_sync_done
+        if peft_config:
+            raise NotImplementedError(
+                "checkpoint-format resync does not support PEFT/LoRA weight updates"
+            )
+        load_bucket = getattr(self, "_checkpoint_load_bucket", None)
+        if load_bucket is None:
+            raise RuntimeError("checkpoint reload lifecycle is not initialized")
+        load_bucket(weights)
 
 
 __all__ = ["VllmCheckpointWorkerExtension"]
