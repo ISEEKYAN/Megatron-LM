@@ -1,9 +1,19 @@
-# Hopper blockwise Transformer Engine overlay
+# Hopper blockwise Transformer Engine overlay (SUPERSEDED)
 
-This run record builds the frozen Transformer Engine source used by the Hopper
-blockwise precision profiles. The build is intentionally separate from GPU
-validation: compilation runs on a CPU Slurm node, while import and kernel
-validation run on an H100 Slurm node.
+> **Superseded.** This overlay is no longer used. A read-only capability
+> inventory (`hopper-blockwise-te215-inventory`) showed the canonical training
+> image's native Transformer Engine 2.15 already runs every mandatory blockwise
+> primitive forward and backward under `Float8BlockScaling`. Blockwise FP8 now
+> runs on the same image as BF16 with no FP8-only overlay, and the primitive
+> parity re-anchored to native TE 2.15 (job `13756286`) reproduces the overlay's
+> manifest byte-for-byte. This record is retained only for build-recipe
+> provenance (CUDA 13.2 TE-from-source on `pytorch_26.04-py3.sqsh`); nothing in
+> the shipped profiles or the parity harness depends on it.
+
+This run record builds a pinned Transformer Engine source that an earlier
+iteration used for the Hopper blockwise precision profiles. The build is
+intentionally separate from GPU validation: compilation runs on a CPU Slurm
+node, while import and kernel validation run on an H100 Slurm node.
 
 ## Frozen inputs
 
