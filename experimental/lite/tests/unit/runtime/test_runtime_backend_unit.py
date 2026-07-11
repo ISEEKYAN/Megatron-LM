@@ -244,7 +244,23 @@ def _patch_cpu_precision_build(monkeypatch, runtime, proto):
     monkeypatch.setattr(torch.cuda, "manual_seed", lambda _seed: None)
 
 
-def _precision_protocol(*, seal: bool, events: list[str]):
+def _te_linear_witness(transformer_engine_import_stub, monkeypatch):
+    """Install a stub TE Linear class and return a real instance of it.
+
+    ``PrecisionCoverage.claim`` requires a genuine TE primitive instance, so the
+    fabricated production-path protocol must present one instead of a bare
+    ``object()``.
+    """
+
+    transformer_engine_import_stub()
+    import transformer_engine.pytorch as te
+
+    linear_type = type("FakeTELinear", (object,), {"__init__": lambda self: None})
+    monkeypatch.setattr(te, "Linear", linear_type, raising=False)
+    return linear_type()
+
+
+def _precision_protocol(*, seal: bool, events: list[str], projection_witness: object):
     from megatron.lite.primitive.bundle import ModelBundle
     from megatron.lite.primitive.precision import (
         PrecisionPhase,
@@ -280,6 +296,7 @@ def _precision_protocol(*, seal: bool, events: list[str]):
                 projection,
                 SemanticSite.ATTENTION_PROJECTION,
                 PrimitiveCapability.TE_LINEAR,
+                projection_witness,
             )
             impl_cfg.precision_coverage.require(
                 core, SemanticSite.ATTENTION_CORE, diagnostic="unit attention core"
@@ -305,10 +322,11 @@ def _precision_protocol(*, seal: bool, events: list[str]):
 
 
 def test_runtime_injects_and_seals_precision_on_the_production_build_and_forward_path(
-    monkeypatch,
+    monkeypatch, transformer_engine_import_stub
 ):
     events: list[str] = []
-    proto = _precision_protocol(seal=True, events=events)
+    witness = _te_linear_witness(transformer_engine_import_stub, monkeypatch)
+    proto = _precision_protocol(seal=True, events=events, projection_witness=witness)
     cfg = MegatronLiteConfig(
         model_name="unit",
         precision="hopper_blockwise_bf16_weight",
@@ -340,8 +358,11 @@ def test_runtime_injects_and_seals_precision_on_the_production_build_and_forward
     assert events == [implementation.name]
 
 
-def test_runtime_rejects_unsealed_precision_coverage(monkeypatch):
-    proto = _precision_protocol(seal=False, events=[])
+def test_runtime_rejects_unsealed_precision_coverage(
+    monkeypatch, transformer_engine_import_stub
+):
+    witness = _te_linear_witness(transformer_engine_import_stub, monkeypatch)
+    proto = _precision_protocol(seal=False, events=[], projection_witness=witness)
     cfg = MegatronLiteConfig(
         model_name="unit",
         precision="hopper_blockwise_bf16_weight",

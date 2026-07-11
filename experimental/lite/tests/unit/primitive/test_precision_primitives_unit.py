@@ -233,6 +233,72 @@ def test_non_te_dense_requirement_fails_coverage_instead_of_falling_back():
             coverage.seal()
 
 
+def test_precision_coverage_rejects_forged_capability_from_non_te_owner(
+    transformer_engine_import_stub, monkeypatch
+):
+    """A non-TE module cannot masquerade as an FP8-capable GEMM primitive.
+
+    Regression for the claim-forgery gap: a bare ``nn.Linear`` could previously
+    ``require`` an FP8 site and ``claim`` a TE capability, and ``seal`` returned
+    a manifest instead of failing loud. The claim now binds the capability to a
+    genuine TE primitive instance and rejects any other owner/witness.
+    """
+
+    transformer_engine_import_stub()
+    import transformer_engine.pytorch as te
+
+    # A distinct, constructible TE Linear so the *legitimate* path still seals,
+    # proving the guard rejects only the non-TE owner, not every claim.
+    te_linear_type = type("FakeTELinear", (object,), {"__init__": lambda self: None})
+    monkeypatch.setattr(te, "Linear", te_linear_type, raising=False)
+
+    from megatron.lite.primitive.precision import (
+        PrecisionCoverage,
+        PrimitiveCapability,
+        SemanticSite,
+        precision_model_init_context,
+        resolve_precision,
+    )
+
+    implementation = resolve_precision("hopper_blockwise_bf16_weight")
+    assert implementation is not None
+    coverage = PrecisionCoverage(implementation)
+    forged_owner = nn.Linear(128, 128, bias=False)
+
+    with precision_model_init_context(implementation):
+        coverage.require(
+            forged_owner,
+            SemanticSite.DENSE_MLP,
+            frozenset({PrimitiveCapability.TE_LINEAR}),
+            diagnostic="forged non-te linear",
+        )
+        # Owner-as-witness (default) is rejected: the owner is a raw nn.Linear.
+        with pytest.raises(TypeError, match="must be backed by a real"):
+            coverage.claim(
+                forged_owner, SemanticSite.DENSE_MLP, PrimitiveCapability.TE_LINEAR
+            )
+        # An explicit non-TE witness is rejected as well.
+        with pytest.raises(TypeError, match="must be backed by a real"):
+            coverage.claim(
+                forged_owner,
+                SemanticSite.DENSE_MLP,
+                PrimitiveCapability.TE_LINEAR,
+                forged_owner,
+            )
+        # The genuine TE primitive witness is accepted for the same site.
+        coverage.claim(
+            forged_owner,
+            SemanticSite.DENSE_MLP,
+            PrimitiveCapability.TE_LINEAR,
+            te_linear_type(),
+        )
+        manifest = coverage.seal()
+
+    assert [entry.capability for entry in manifest.entries] == [
+        PrimitiveCapability.TE_LINEAR
+    ]
+
+
 def test_gqa_binds_both_projection_linears_to_attention_projection(
     transformer_engine_import_stub, monkeypatch
 ):

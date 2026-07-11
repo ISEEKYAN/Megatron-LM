@@ -229,9 +229,40 @@ def _coverage_types():
     return implementation, PrecisionCoverage, PrimitiveCapability, SemanticSite
 
 
-def test_typed_coverage_seals_exact_selected_sites_and_bf16_exclusions():
+def _install_te_witnesses(transformer_engine_import_stub, monkeypatch):
+    """Install stub TE classes and return real instances usable as claim witnesses.
+
+    ``PrecisionCoverage.claim`` binds each capability to a genuine TE primitive
+    instance, so coverage-algebra tests must present real TE-typed witnesses
+    rather than bare ``object()`` claims.
+    """
+
+    transformer_engine_import_stub()
+    import transformer_engine.pytorch as te
+
+    class _FakeTEModule:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    linear_type = type("FakeTELinear", (_FakeTEModule,), {})
+    layernorm_type = type("FakeTELayerNormLinear", (_FakeTEModule,), {})
+    grouped_type = type("FakeTEGroupedLinear", (_FakeTEModule,), {})
+    monkeypatch.setattr(te, "Linear", linear_type, raising=False)
+    monkeypatch.setattr(te, "LayerNormLinear", layernorm_type, raising=False)
+    monkeypatch.setattr(te, "GroupedLinear", grouped_type, raising=False)
+    return SimpleNamespace(
+        linear=linear_type(),
+        layernorm_linear=layernorm_type(),
+        grouped=grouped_type(),
+    )
+
+
+def test_typed_coverage_seals_exact_selected_sites_and_bf16_exclusions(
+    transformer_engine_import_stub, monkeypatch
+):
     from megatron.lite.primitive.precision import precision_model_init_context
 
+    witnesses = _install_te_witnesses(transformer_engine_import_stub, monkeypatch)
     implementation, PrecisionCoverage, Capability, Site = _coverage_types()
     attention_projection = object()
     attention_core = object()
@@ -249,6 +280,7 @@ def test_typed_coverage_seals_exact_selected_sites_and_bf16_exclusions():
             attention_projection,
             Site.ATTENTION_PROJECTION,
             Capability.TE_LINEAR,
+            witnesses.linear,
             diagnostic="TE column parallel linear",
         )
         coverage.require(
@@ -290,9 +322,12 @@ def test_typed_coverage_requires_the_runtime_model_init_context():
         ("bf16_claim", "fixed BF16"),
     ],
 )
-def test_typed_coverage_fails_loud_for_incomplete_or_ambiguous_binding(case, message):
+def test_typed_coverage_fails_loud_for_incomplete_or_ambiguous_binding(
+    case, message, transformer_engine_import_stub, monkeypatch
+):
     from megatron.lite.primitive.precision import precision_model_init_context
 
+    witnesses = _install_te_witnesses(transformer_engine_import_stub, monkeypatch)
     implementation, PrecisionCoverage, Capability, Site = _coverage_types()
     covered = object()
     coverage = PrecisionCoverage(implementation)
@@ -312,18 +347,22 @@ def test_typed_coverage_fails_loud_for_incomplete_or_ambiguous_binding(case, mes
                 diagnostic="dense mlp duplicate",
             )
         elif case == "duplicate_claim":
-            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR)
-            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR)
+            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR, witnesses.linear)
+            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR, witnesses.linear)
         elif case == "incompatible":
-            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_GROUPED_LINEAR)
+            coverage.claim(
+                covered, Site.DENSE_MLP, Capability.TE_GROUPED_LINEAR, witnesses.grouped
+            )
         elif case == "unconsumed":
-            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR)
-            coverage.claim(object(), Site.MOE_EXPERT, Capability.TE_GROUPED_LINEAR)
+            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR, witnesses.linear)
+            coverage.claim(
+                object(), Site.MOE_EXPERT, Capability.TE_GROUPED_LINEAR, witnesses.grouped
+            )
         elif case == "bf16_claim":
-            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR)
+            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR, witnesses.linear)
             core = object()
             coverage.require(core, Site.ATTENTION_CORE)
-            coverage.claim(core, Site.ATTENTION_CORE, Capability.TE_LINEAR)
+            coverage.claim(core, Site.ATTENTION_CORE, Capability.TE_LINEAR, witnesses.linear)
 
         with pytest.raises(ValueError, match=message):
             coverage.seal()
