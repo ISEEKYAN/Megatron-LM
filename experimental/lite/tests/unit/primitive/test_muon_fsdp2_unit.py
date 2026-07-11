@@ -280,3 +280,75 @@ def test_muon_state_dict_roundtrip_resumes_identically():
         opt_b.step()
 
     assert torch.allclose(w_b.detach(), w_ref.detach(), atol=1e-6)
+
+
+def test_muon_bf16_model_dtype_keeps_fp32_master_and_rounds_param():
+    # Promoted params run in fp32 but carry the original bf16 model dtype; the
+    # master stays fp32 while the param mirrors a bf16-rounded copy each step.
+    torch.manual_seed(3)
+    param = torch.nn.Parameter(torch.randn(8, 12, dtype=torch.float32))
+    param._fsdp2_model_param_dtype = torch.bfloat16
+    param.grad = torch.randn(8, 12, dtype=torch.float32)
+
+    opt = FP32Muon([{"params": [param], "weight_decay": 0.01}], lr=0.1, momentum=0.9,
+                   weight_decay=0.01)
+    master = opt.state[param]["master_param"]
+    assert master is not param  # promoted -> master is a separate fp32 clone
+    assert master.dtype is torch.float32
+
+    opt.step()
+    # Param mirrors the bf16-rounded master (round-trip through bf16 is idempotent).
+    rounded = master.to(torch.bfloat16).to(torch.float32)
+    assert torch.equal(param.detach(), rounded)
+    assert master.dtype is torch.float32
+
+
+def _build_muon_adam_facade(weight_init, norm_init):
+    from megatron.lite.primitive.optimizers.fsdp2.adamw import FP32AdamW
+    from megatron.lite.primitive.optimizers.fsdp2.optimizer import FSDP2Optimizer
+
+    weight = torch.nn.Parameter(weight_init.clone())
+    norm = torch.nn.Parameter(norm_init.clone())
+    muon = FP32Muon([{"params": [weight], "weight_decay": 0.02}], lr=0.1, momentum=0.9,
+                    weight_decay=0.02)
+    adam = FP32AdamW([{"params": [norm], "weight_decay": 0.0}], lr=0.1, weight_decay=0.0,
+                     betas=(0.9, 0.999), eps=1e-8)
+    chained = build_muon_chained_optimizer(muon, adam)
+    facade = FSDP2Optimizer(chained, [weight, norm], ps=None, clip_grad=1.0)
+    return weight, norm, facade
+
+
+def test_facade_checkpoint_and_offload_roundtrip_with_mixed_state():
+    # Mixed state: one Muon matrix + one Adam fallback vector, driven through the
+    # real FSDP2Optimizer facade (step / grad-norm / state / offload).
+    torch.manual_seed(11)
+    weight_init = torch.randn(8, 12)
+    norm_init = torch.randn(12)
+    weight_grads = [torch.randn(8, 12) for _ in range(3)]
+    norm_grads = [torch.randn(12) for _ in range(3)]
+
+    # Reference: 3 uninterrupted facade steps.
+    w_ref, n_ref, opt_ref = _build_muon_adam_facade(weight_init, norm_init)
+    for wg, ng in zip(weight_grads, norm_grads, strict=True):
+        w_ref.grad, n_ref.grad = wg.clone(), ng.clone()
+        opt_ref.step()
+
+    # Interrupted: 1 step, offload+reload state (runtime offload; CPU no-op but
+    # exercises the shared movement path over the Muon child), checkpoint, resume.
+    w_a, n_a, opt_a = _build_muon_adam_facade(weight_init, norm_init)
+    w_a.grad, n_a.grad = weight_grads[0].clone(), norm_grads[0].clone()
+    opt_a.step()
+    opt_a.offload_state_to_cpu()
+    opt_a.load_state_to_device()
+    ckpt = opt_a.state_dict()
+
+    w_b, n_b, opt_b = _build_muon_adam_facade(
+        w_a.detach().clone(), n_a.detach().clone()
+    )
+    opt_b.load_state_dict(ckpt)
+    for wg, ng in zip(weight_grads[1:], norm_grads[1:], strict=True):
+        w_b.grad, n_b.grad = wg.clone(), ng.clone()
+        opt_b.step()
+
+    assert torch.allclose(w_b.detach(), w_ref.detach(), atol=1e-6)
+    assert torch.allclose(n_b.detach(), n_ref.detach(), atol=1e-6)
