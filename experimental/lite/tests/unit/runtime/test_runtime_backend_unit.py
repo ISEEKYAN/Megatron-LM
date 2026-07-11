@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.runtime import create_runtime
+from megatron.lite.primitive.optimizers.mfsdp.optimizer import MFSdpOptimizer
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.backends.mlite.runtime import (
     MegatronLiteRuntime,
@@ -66,10 +67,17 @@ def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
     assert metrics == {"batch": "presplit", "source": "source"}
 
 
-def test_pipeline_runtime_enables_optimizer_grad_sync_on_last_microbatch(monkeypatch):
+def test_pipeline_runtime_enables_mfsdp_grad_reduce_on_last_microbatch(monkeypatch):
     from megatron.lite.primitive.parallel import pipeline as pipeline_module
 
-    optimizer = types.SimpleNamespace(grad_sync_enabled=False)
+    grad_sync_transitions = []
+    param_sync = types.SimpleNamespace(
+        set_grad_sync_enabled=grad_sync_transitions.append,
+    )
+    optimizer = MFSdpOptimizer(
+        optimizer=types.SimpleNamespace(),
+        model_chunks=[types.SimpleNamespace(param_sync=param_sync)],
+    )
     observed_callbacks = []
 
     def fake_pipeline(*_args, grad_sync_fn=None, **_kwargs):
@@ -118,6 +126,7 @@ def test_pipeline_runtime_enables_optimizer_grad_sync_on_last_microbatch(monkeyp
         num_microbatches=2,
     )
     assert observed_callbacks == [True]
+    assert grad_sync_transitions == [True]
 
 
 def test_runtime_config_defaults_to_mlite_backend():
