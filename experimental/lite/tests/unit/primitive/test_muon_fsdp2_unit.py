@@ -335,6 +335,8 @@ def test_facade_checkpoint_and_offload_roundtrip_with_mixed_state():
 
     # Interrupted: 1 step, offload+reload state (runtime offload; CPU no-op but
     # exercises the shared movement path over the Muon child), checkpoint, resume.
+    # The real GPU->CPU->GPU DTensor offload lifecycle of the Muon master +
+    # momentum state is verified on CUDA in ``test_muon_fsdp2_offload_gpu.py``.
     w_a, n_a, opt_a = _build_muon_adam_facade(weight_init, norm_init)
     w_a.grad, n_a.grad = weight_grads[0].clone(), norm_grads[0].clone()
     opt_a.step()
