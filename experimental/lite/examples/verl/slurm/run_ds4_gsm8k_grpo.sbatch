@@ -514,6 +514,13 @@ names = [
     "HF_DATASETS_CACHE",
 ]
 env = {name: os.environ[name] for name in names}
+# Opt-in resync smoke/memlog controls are read by the actor's engine
+# (os.environ); propagate them into the Ray actor env only when set so the
+# 8-GPU proxy gets its fail-fast verdict + JSONL curve, while the production
+# run (vars unset) stays a no-op.
+for name in ("MLITE_RESYNC_SMOKE_EXIT_AFTER", "MLITE_RESYNC_MEMLOG_PATH"):
+    if os.environ.get(name):
+        env[name] = os.environ[name]
 env["VERL_MLITE_SKIP_RUNTIME_PATCHES"] = "0"
 print(json.dumps({"env_vars": env}))
 PY

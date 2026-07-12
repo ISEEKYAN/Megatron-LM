@@ -514,6 +514,58 @@ def test_ds4_grpo_config_only_runtime_env_job_program_is_valid_python() -> None:
     assert 'os.environ["CONFIG_TARGET_GPUS_PER_NODE"]' in config_program
 
 
+def _extract_runtime_env_program() -> str:
+    script = SBATCH.read_text()
+    block = script.split(
+        "RUNTIME_ENV_JSON=$(VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python - <<'PY'\n", 1
+    )[1]
+    return block.split("\nPY\n", 1)[0]
+
+
+def _run_runtime_env_generator(extra_env: dict) -> dict:
+    program = _extract_runtime_env_program()
+    tree = ast.parse(program)
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and any(getattr(t, "id", None) == "names" for t in node.targets)
+            and isinstance(node.value, ast.List)
+        ):
+            names = [ast.literal_eval(elt) for elt in node.value.elts]
+    assert names, "could not locate the runtime-env name whitelist"
+    env = {name: f"val-{name}" for name in names}
+    env.update(extra_env)
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    return json.loads(result.stdout)["env_vars"]
+
+
+def test_runtime_env_propagates_resync_smoke_controls_only_when_set() -> None:
+    # Production run (vars unset): the actor env must not carry the opt-in
+    # smoke/memlog keys, so the resync protocol stays a no-op.
+    baseline = _run_runtime_env_generator({})
+    assert "MLITE_RESYNC_SMOKE_EXIT_AFTER" not in baseline
+    assert "MLITE_RESYNC_MEMLOG_PATH" not in baseline
+    assert baseline["VERL_MLITE_SKIP_RUNTIME_PATCHES"] == "0"
+
+    # 8-GPU proxy (vars set): they must reach the Ray actor os.environ so the
+    # fail-fast verdict + JSONL curve fire.
+    proxy = _run_runtime_env_generator(
+        {
+            "MLITE_RESYNC_SMOKE_EXIT_AFTER": "1",
+            "MLITE_RESYNC_MEMLOG_PATH": "/tmp/curve.jsonl",
+        }
+    )
+    assert proxy["MLITE_RESYNC_SMOKE_EXIT_AFTER"] == "1"
+    assert proxy["MLITE_RESYNC_MEMLOG_PATH"] == "/tmp/curve.jsonl"
+
+
 def test_mlite_engine_reapplies_vllm_device_uuid_patch_before_registration() -> None:
     engine = ENGINE_MODULE.read_text()
 
