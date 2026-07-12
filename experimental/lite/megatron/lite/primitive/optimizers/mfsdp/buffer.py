@@ -914,9 +914,20 @@ class AllGatherPipeline:
 
     def wait_bucket_ready(self, bucket_id: int, bwd: bool = False) -> None:
         bucket = self.buckets[bucket_id]
-        if not bucket._full_ready and bucket._param_gather_work is None:
+        if self.overlap and not bucket._full_ready and bucket._param_gather_work is None:
+            # Prefetch/overlap path: launch the dense all-gather ahead of use on the
+            # dedicated priority communication stream.
             self.async_bucket_gather(bucket_id, bwd=bwd)
         self.comm_stream.wait_for_current()
+        # When overlap is disabled (the guard forces this for any CP>=2 + DP-sharded
+        # config, see optimizer._order_param_gathers_for_parallel_collectives), do NOT
+        # launch on the side comm stream. Let wait_param_gather issue the all-gather on
+        # the current compute stream instead, so dense_ag (gather_group == dp_cp_ag_group)
+        # is enqueued in program order alongside the model's CP collectives (cp_group).
+        # Those two process groups intersect; launching them from different streams lets
+        # their NCCL enqueue order diverge across ranks on multi-node runs -> collective
+        # deadlock (invisible on single-node NVLink proxies). Program-order serialization
+        # on one stream mirrors how FSDP2 avoids the same hazard.
         bucket.wait_param_gather()
 
     def begin_forward(self) -> None:
