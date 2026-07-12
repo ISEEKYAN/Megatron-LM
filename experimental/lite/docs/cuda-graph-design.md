@@ -671,7 +671,7 @@ experimental, runtime-level construct and must never appear in
 `MegatronLiteConfig.impl_cfg` or any model `ImplConfig` schema. Model
 implementations select no capture profile, target, or granularity.
 
-### D. Default-on Capability Compiler with Diagnostic Override (Recommended)
+### D. Default-on Explicit Assembly with Diagnostic Override (Recommended)
 
 Normal construction contains no CUDA Graph coverage, backend, target, FP8, or
 optimizer-graph choice:
