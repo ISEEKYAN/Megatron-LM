@@ -547,6 +547,37 @@ def test_mfsdp_disables_param_prefetch_across_intersecting_parallel_groups():
     assert config.overlap_param_gather is True
 
 
+def test_mfsdp_serializes_dense_gather_on_compute_stream_when_overlap_disabled():
+    """When the guard disables overlap (CP>=2 + DP-sharded), wait_bucket_ready must not
+    prefetch the dense all-gather on the dedicated side stream. It routes through
+    wait_param_gather, which issues dense_ag on the current compute stream in program
+    order with the intersecting CP collectives (dp_cp_ag_group ∩ cp_group) so their NCCL
+    enqueue order cannot diverge across ranks and deadlock on multi-node runs."""
+    calls: list[str] = []
+
+    class _ProbeBucket:
+        def __init__(self, overlap: bool) -> None:
+            self.config = SimpleNamespace(overlap_param_gather=overlap)
+            self.device = torch.device("cpu")
+            self._full_ready = False
+            self._param_gather_work = None
+
+        def wait_param_gather(self) -> None:
+            calls.append("wait_param_gather")
+            self._full_ready = True
+
+    disabled = mfsdp_buffer.AllGatherPipeline([_ProbeBucket(overlap=False)])
+    disabled.async_bucket_gather = lambda *_a, **_k: calls.append("async_bucket_gather")
+    disabled.wait_bucket_ready(0)
+    assert calls == ["wait_param_gather"]
+
+    calls.clear()
+    enabled = mfsdp_buffer.AllGatherPipeline([_ProbeBucket(overlap=True)])
+    enabled.async_bucket_gather = lambda *_a, **_k: calls.append("async_bucket_gather")
+    enabled.wait_bucket_ready(0)
+    assert calls == ["async_bucket_gather", "wait_param_gather"]
+
+
 def test_mfsdp_keeps_param_prefetch_for_pure_data_parallelism():
     config = mfsdp_config.MFSDPConfig(overlap_param_gather=True)
     ps = SimpleNamespace(
