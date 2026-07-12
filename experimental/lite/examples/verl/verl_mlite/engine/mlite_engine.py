@@ -441,8 +441,10 @@ class MegatronLiteEngine(BaseEngine):
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         resync["curve"].append(cuda_mem_snapshot("resync/export_begin"))
+        exported = False
         try:
             yield from weights
+            exported = True
         finally:
             resync["curve"].append(cuda_mem_snapshot("resync/export_end"))
             if resync["grad_resident"]:
@@ -451,6 +453,34 @@ class MegatronLiteEngine(BaseEngine):
                 self.to("cuda", model=False, optimizer=True, grad=False)
             resync["curve"].append(cuda_mem_snapshot("resync/restore"))
             self._emit_resync_curve(resync)
+            if exported:
+                self._maybe_smoke_exit_after_resync()
+
+    def _maybe_smoke_exit_after_resync(self) -> None:
+        """Fail-fast smoke hook: exit cleanly after N successful resyncs.
+
+        Opt-in via ``MLITE_RESYNC_SMOKE_EXIT_AFTER=<n>``. Once the colocated
+        resync all-gather peak has survived on every rank, there is no reason
+        to keep the proxy running through generation/training — this lets the
+        8-GPU proxy report a verdict at the first resync instead of after a
+        full step. Off by default, so the production run is unaffected.
+        """
+        threshold = os.environ.get("MLITE_RESYNC_SMOKE_EXIT_AFTER")
+        if not threshold:
+            return
+        self._resync_smoke_count = getattr(self, "_resync_smoke_count", 0) + 1
+        if self._resync_smoke_count < int(threshold):
+            return
+        # Synchronize so no rank exits while a peer is mid-export (which would
+        # otherwise strand the survivors on the next collective).
+        if dist.is_initialized():
+            dist.barrier()
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(
+            f"MLITE_RESYNC_SMOKE_COMPLETE rank={rank} syncs={self._resync_smoke_count}",
+            flush=True,
+        )
+        raise SystemExit(0)
 
     def _emit_resync_curve(self, resync: dict) -> None:
         """Emit the resync memory curve (stdout marker + optional JSONL file)."""

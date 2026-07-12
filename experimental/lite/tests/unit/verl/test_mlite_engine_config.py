@@ -307,6 +307,43 @@ def test_resync_memory_protocol_is_noop_when_state_already_offloaded(monkeypatch
     assert to_calls == []
 
 
+def test_resync_smoke_exit_after_first_successful_sync(monkeypatch) -> None:
+    """MLITE_RESYNC_SMOKE_EXIT_AFTER exits cleanly once the peak survives."""
+    monkeypatch.setenv("MLITE_RESYNC_SMOKE_EXIT_AFTER", "1")
+    engine = _engine(engine_config=_engine_config(param_offload=False))
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            return iter([("w", torch.zeros(1))])
+
+    engine.runtime = Runtime()
+    engine.handle = _fake_handle()
+    engine._initial_sync_cache_cleared = True
+
+    weights, _ = engine.get_per_tensor_param()
+    with pytest.raises(SystemExit) as excinfo:
+        list(weights)
+    assert excinfo.value.code == 0
+
+
+def test_resync_no_smoke_exit_without_env(monkeypatch) -> None:
+    monkeypatch.delenv("MLITE_RESYNC_SMOKE_EXIT_AFTER", raising=False)
+    engine = _engine(engine_config=_engine_config(param_offload=False))
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            return iter([("w", torch.zeros(1))])
+
+    engine.runtime = Runtime()
+    engine.handle = _fake_handle()
+    engine._initial_sync_cache_cleared = True
+
+    weights, _ = engine.get_per_tensor_param()
+    assert [name for name, _ in weights] == ["w"]
+
+
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
     optimizer = SimpleNamespace(param_groups=[{"lr": 0.0, "weight_decay": 0.1}])
     opt = SimpleNamespace(
