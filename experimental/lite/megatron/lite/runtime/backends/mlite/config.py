@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from megatron.lite.primitive.cuda_graph import CudaGraphDebugMode
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, pick_fields
 
 
@@ -42,6 +43,18 @@ class MegatronLiteConfig:
     attention_backend_override: str | None = "flash"
     router_aux_loss_coef: float | None = None
     load_hf_weights: bool = True
+
+    # ── CUDA Graph diagnostic override (common runtime boundary) ──
+    # The absence of an override means "apply the strongest CUDA Graph coverage
+    # qualified for this exact model/runtime plan". ``OFF`` is a diagnostic escape
+    # hatch only (eager correctness oracle / A-B baseline / debugging); it is NOT
+    # a peer user-selectable feature and does not select coverage. Capture
+    # granularity, backend, targets, pools, and optimizer-graph choice are
+    # resolved by the runtime's explicit assembly of the controller, never by a
+    # per-model field. ``CudaGraphProfile``/``CudaGraphTarget`` selection surfaces
+    # are hard-walled: they must never appear in ``impl_cfg`` or any model
+    # ``ImplConfig`` (see ``docs/cuda-graph-design.md`` §API Alternatives).
+    cuda_graph_debug: CudaGraphDebugMode = CudaGraphDebugMode.AUTO
 
     # ── impl-specific (each impl reads its own keys) ──
     impl_cfg: dict[str, Any] = field(default_factory=dict)
@@ -83,13 +96,29 @@ class MegatronLiteConfig:
             if k in cfg and k not in impl_cfg:
                 impl_cfg[k] = cfg[k]
 
-        skip = {"parallel", "optimizer", "impl_cfg", "debug"}
+        # Hard-wall the CG selection surface: profile/target/granularity must not
+        # leak in via impl_cfg. Only the diagnostic override is honored, coerced
+        # from a string ("auto"/"off") if given.
+        for banned in ("cuda_graph_profile", "cuda_graph_target", "cuda_graph"):
+            if banned in impl_cfg:
+                raise ValueError(
+                    f"impl_cfg must not carry CUDA Graph selection surface {banned!r}: "
+                    "capture profile/target/granularity are resolved by the runtime's "
+                    "explicit assembly, not a model field. Use `cuda_graph_debug` for "
+                    "the diagnostic OFF override only."
+                )
+        cg_debug = cfg.get("cuda_graph_debug")
+        if isinstance(cg_debug, str):
+            cg_debug = CudaGraphDebugMode(cg_debug.lower())
+
+        skip = {"parallel", "optimizer", "impl_cfg", "debug", "cuda_graph_debug"}
         return cls(
             **{k: v for k, v in pick_fields(cls, cfg).items() if k not in skip},
             hf_path=hf_path,
             parallel=parallel,
             optimizer=optimizer,
             impl_cfg=impl_cfg,
+            **({"cuda_graph_debug": cg_debug} if cg_debug is not None else {}),
         )
 
 

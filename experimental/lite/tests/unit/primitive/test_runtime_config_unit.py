@@ -75,3 +75,29 @@ def test_create_runtime_uses_mlite_backend_registry():
 
     assert type(runtime).__name__ == "MegatronLiteRuntime"
     assert runtime.tier == "rl_best"
+
+
+def test_cuda_graph_debug_defaults_to_auto():
+    from megatron.lite.primitive.cuda_graph import CudaGraphDebugMode
+
+    cfg = MegatronLiteConfig(model_name="qwen3_5")
+    # Absence of override => strongest qualified coverage is applied by runtime.
+    assert cfg.cuda_graph_debug is CudaGraphDebugMode.AUTO
+
+
+def test_cuda_graph_debug_off_coerced_from_string():
+    from megatron.lite.primitive.cuda_graph import CudaGraphDebugMode
+
+    cfg = MegatronLiteConfig.from_dict(
+        "/models/qwen", {"model_name": "qwen3_5", "cuda_graph_debug": "off"}
+    )
+    assert cfg.cuda_graph_debug is CudaGraphDebugMode.OFF
+
+
+@pytest.mark.parametrize("banned", ["cuda_graph", "cuda_graph_profile", "cuda_graph_target"])
+def test_cuda_graph_selection_surface_is_hard_walled_from_impl_cfg(banned):
+    # Capture profile/target/granularity must never leak into impl_cfg.
+    with pytest.raises(ValueError, match="CUDA Graph selection surface"):
+        MegatronLiteConfig.from_dict(
+            "/models/qwen", {"model_name": "qwen3_5", "impl_cfg": {banned: True}}
+        )
