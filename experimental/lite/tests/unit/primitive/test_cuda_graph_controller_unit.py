@@ -194,3 +194,30 @@ def test_vpp_gt_1_is_rejected():
             num_microbatches=4,
             num_model_chunks=2,
         )
+
+
+# ---- #4359 decompose / reconstruct round-trip -------------------------------
+
+
+def test_decompose_reconstruct_round_trip_preserves_contract():
+    from megatron.lite.primitive.cuda_graph import (
+        decompose_packed_seq_params,
+        reconstruct_packed_seq_params,
+    )
+
+    src = _packed(token_capacity=16, max_sequences=3)
+    tensor_kwargs, static_meta = decompose_packed_seq_params(src)
+    # cu_seqlens tensors are threaded as graph inputs; metadata stays static.
+    assert "cu_seqlens_q" in tensor_kwargs
+    assert static_meta["max_seqlen_q"] == 8
+    assert static_meta["qkv_format"] == "thd"
+
+    rebuilt = reconstruct_packed_seq_params(tensor_kwargs, static_meta)
+    assert rebuilt.max_seqlen_q == src.max_seqlen_q
+    assert rebuilt.max_seqlen_kv == src.max_seqlen_kv
+    assert torch.equal(rebuilt.cu_seqlens_q, src.cu_seqlens_q)
+    # The reconstructed object replays against the same signature as the source.
+    hs = torch.zeros(16, 32)
+    assert build_replay_signature(hs, src, cp_size=1).matches(
+        build_replay_signature(hs, rebuilt, cp_size=1)
+    )

@@ -188,6 +188,11 @@ class _DeepEPCombine(torch.autograd.Function):
 
 class TokenDispatcher:
 
+    # Structural marker read by the CUDA Graph controller
+    # (``primitive.cuda_graph.inspect_chunk_moe_dispatch``). It lets the
+    # model-neutral controller find a dispatcher without importing model names.
+    is_moe_dispatcher: bool = True
+
     def __init__(
         self, num_experts: int, hidden_size: int, ps: ParallelState, *, use_deepep: bool = True
     ):
@@ -195,6 +200,17 @@ class TokenDispatcher:
         self.num_experts = num_experts
         self.ep_size = ps.ep_size
         self.num_local_experts = ensure_divisible(num_experts, ps.ep_size)
+
+        # CUDA Graph safety: this dropless dispatcher derives its all-to-all split
+        # sizes from a live token count via ``.item()``/``.tolist()``/``.cpu()``
+        # (host syncs in dispatch/combine), so it is NOT graph-safe. A future
+        # fixed-capacity / device-driven mode (upstream #5258 contract: static
+        # per-rank token budget, on-device per-expert padding + tail-zeroing, a
+        # device overflow flag read only OUTSIDE capture) would flip this to True.
+        # Until that mode is GPU-qualified, the controller reports the whole chunk
+        # ``not-applicable`` (never a silent eager step masquerading as a captured
+        # chunk — AC#2).
+        self._cuda_graph_safe: bool = False
 
         self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
         if self.use_deepep:
@@ -216,6 +232,15 @@ class TokenDispatcher:
             self._restore_by_ranks = (
                 chunk_idxs.reshape(self.num_local_experts, self.ep_size).T.ravel().tolist()
             )
+
+    @property
+    def cuda_graph_safe(self) -> bool:
+        """Whether this dispatcher's dispatch/combine is CUDA-graph replay-safe.
+
+        False for the dropless dynamic path (host-synced A2A split sizes). See
+        the note in ``__init__`` on the fixed-capacity mode that would set it.
+        """
+        return self._cuda_graph_safe
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_scores: torch.Tensor, topk_indices: torch.Tensor

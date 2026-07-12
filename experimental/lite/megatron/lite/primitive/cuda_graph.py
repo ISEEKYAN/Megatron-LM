@@ -240,6 +240,50 @@ def build_replay_signature(
     )
 
 
+def decompose_packed_seq_params(packed_seq_params):
+    """Split ``PackedSeqParams`` into graph-threaded tensors + static metadata.
+
+    A CUDA graph boundary cannot safely depend on an arbitrary Python dataclass,
+    so upstream #4359 decomposes ``PackedSeqParams`` into tensor kwargs and
+    reconstructs the object *inside* the graphed callable. ``max_seqlen_q/kv`` and
+    the other non-tensor fields come from static config, not a device-to-host
+    read during capture.
+
+    Returns:
+        ``(tensor_kwargs, static_meta)`` where ``tensor_kwargs`` maps a field
+        name to a live ``torch.Tensor`` (these are the graph inputs whose values
+        may change per replay while address/shape/dtype stay fixed), and
+        ``static_meta`` maps a field name to a fixed non-tensor value plus the
+        static ``cp_group`` handle (reattached on reconstruction, never captured).
+    """
+    tensor_kwargs = {}
+    for name in _PACKED_SEQ_TENSOR_FIELDS:
+        t = getattr(packed_seq_params, name, None)
+        if t is not None:
+            tensor_kwargs[name] = t
+    static_meta = {name: getattr(packed_seq_params, name, None) for name in _PACKED_SEQ_STATIC_FIELDS}
+    # cp_group is a process-group handle: static per capture, kept out of the
+    # tensor signature and reattached verbatim on reconstruction.
+    static_meta["cp_group"] = getattr(packed_seq_params, "cp_group", None)
+    return tensor_kwargs, static_meta
+
+
+def reconstruct_packed_seq_params(tensor_kwargs, static_meta):
+    """Rebuild a ``PackedSeqParams`` inside the graphed callable (#4359).
+
+    The inverse of :func:`decompose_packed_seq_params`. Only the decomposed
+    tensor kwargs and static metadata are used; nothing is read from the host.
+    """
+    from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
+
+    fields = {}
+    fields.update({k: v for k, v in tensor_kwargs.items()})
+    fields.update({k: v for k, v in static_meta.items()})
+    # PackedSeqParams re-derives seq_idx in __post_init__ when total_tokens is
+    # set; pass the decomposed seq_idx through only if the source had one.
+    return PackedSeqParams(**{k: v for k, v in fields.items() if k in PackedSeqParams.__dataclass_fields__})
+
+
 def assert_fused_rope_thd(packed_seq_params) -> None:
     """Fail loud if THD RoPE would host-sync instead of using fused metadata.
 
@@ -518,5 +562,7 @@ __all__ = [
     "ChunkGraphSafety",
     "build_replay_signature",
     "assert_fused_rope_thd",
+    "decompose_packed_seq_params",
+    "reconstruct_packed_seq_params",
     "inspect_chunk_moe_dispatch",
 ]
