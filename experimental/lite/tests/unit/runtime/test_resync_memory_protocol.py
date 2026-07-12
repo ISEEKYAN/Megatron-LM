@@ -70,12 +70,15 @@ def test_optimizer_states_on_gpu_detects_resident_moments() -> None:
     assert optimizer_states_on_gpu(opt) is False
 
 
-def test_optimizer_states_on_gpu_true_when_moment_on_cuda(monkeypatch) -> None:
-    class _CudaTensor:
-        is_cuda = True
+def test_optimizer_states_on_gpu_true_when_moment_on_cuda() -> None:
+    import pytest
 
-    # Bypass the ChainedOptimizer import path with a plain (non-chained) optimizer.
-    state = {"p": {"exp_avg": _CudaTensor(), "exp_avg_sq": _CudaTensor()}}
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA to place a real moment tensor on GPU")
+
+    moment = torch.zeros(1, device="cuda")
+    # Plain (non-chained) optimizer with a resident Adam moment tensor.
+    state = {"p": {"exp_avg": moment, "exp_avg_sq": moment}}
     opt = types.SimpleNamespace(optimizer=types.SimpleNamespace(state=state))
     assert optimizer_states_on_gpu(opt) is True
 
