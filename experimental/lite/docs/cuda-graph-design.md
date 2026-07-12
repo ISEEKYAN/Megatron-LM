@@ -30,20 +30,21 @@ primitives**, not a new family of graphed model implementations. In particular:
 
 MLite production training is THD-only, so a BSHD bring-up profile would not
 qualify a production path. The recommended first implementation is
-**TE-backed, layer-wise partial capture of max-aligned THD attention**, gated
-first by a real packing-utilization cost model and then by eager parity and
-end-to-end tokens/s. Within its qualified envelope it is enabled
-automatically; other configurations report why they are partial or not
-applicable. Dense MLP is the next target only when max-alignment remains a net
-win on the same production distribution.
+**TE-backed, chunk-wise capture of the max-aligned THD `TransformerBlock`**,
+shipped directly rather than staged behind a separate layer-wise partial
+delivery. It is gated first by a real packing-utilization cost model and then
+by eager parity and end-to-end tokens/s. Within its qualified envelope the
+whole chunk is enabled automatically; a chunk that still holds a graph-unsafe
+region (for example dropless dynamic MoE dispatch) reports `partial` for the
+stable sub-regions it can still capture, or `not-applicable`, with structured
+reasons.
 BF16/FP8 compute and optimizer choice remain user policy; CUDA Graph changes
 only launch/replay, and MLite owns compatibility across precision, optimizer,
-parallel backend, and capture coverage. The planned ceiling is chunk-wise
-capture after the upstream contract settles. MLite should not implement
-full-iteration capture: its extra coverage is not worth the optimizer and
-whole-loop static-state complexity for this runtime. Dynamic CP, dynamic MoE,
-and optimizer capture remain separate implementation qualification gates, not
-public feature switches.
+parallel backend, and capture coverage. Chunk-wise is the MLite granularity
+ceiling: MLite should not implement full-iteration capture, whose extra
+coverage is not worth the optimizer and whole-loop static-state complexity for
+this runtime. Dynamic CP, dynamic MoE, and optimizer capture remain separate
+implementation qualification gates, not public feature switches.
 
 CUDA Graph is a semantics-preserving, monotonically stronger optimization:
 once a broader coverage level is qualified for an implementation, it replaces
@@ -279,8 +280,12 @@ validation, but it is still an open PR rather than settled `dev` behavior.
 
 **Pitfalls.** One graph-unsafe operation invalidates the entire chunk. It has a
 larger debugging blast radius, more complicated PP slot planning, harder FSDP
-hook ownership, and unresolved FP8/FP4 dynamic-slot details. It should not be
-independently reimplemented in MLite before the upstream contract settles.
+hook ownership, and unresolved FP8/FP4 dynamic-slot details. Because MLite
+ships this granularity directly, these become the qualification gates the first
+delivery must clear rather than reasons to defer: reuse #5258's slot/memory
+contract instead of reinventing it, capture only where the whole chunk is
+graph-safe, and report `partial`/`not-applicable` (never a silent eager retry)
+when a chunk still holds a dynamic region.
 
 ### Full-iteration
 
@@ -320,11 +325,12 @@ obtain useful coverage without padding the entire model to worst case.
 **Memory.** Smaller regions retain less state per graph, though more boundaries
 mean more graph objects, copies, and replay launches.
 
-**Best fit.** MLite's first delivery: model-neutral attention primitives with
-fixed input signatures, plus PP=1 initially. Dense MLP can use the same
-capability after attention proves the production path. Partial capture also provides
-the foundation for later PP slot planning without committing to chunk/full-loop
-capture.
+**Best fit.** The fallback coverage inside MLite's chunk-wise delivery: when a
+`TransformerBlock` still holds a dynamic region (dropless MoE dispatch or an
+unfused RoPE path), capture the model-neutral static sub-callables — attention
+with a fixed input signature, dense MLP — and leave the dynamic work eager,
+reporting `partial` with reasons. It is a degraded coverage outcome of the same
+controller, not a separate earlier delivery that MLite builds first.
 
 **Pitfalls.** Coverage can silently become empty after a model refactor unless
 construction emits and validates a manifest. FP8 amax/weight-cache state and
@@ -442,19 +448,23 @@ same decomposition/reconstruction approach and records a concrete caveat:
 unfused THD RoPE paths that call `.tolist()`/`.item()` on device metadata are
 not graph-safe, while the fused RoPE path is the validated candidate.
 
-For MLite the first layer-wise partial boundary is therefore:
+For MLite the first chunk-wise boundary is therefore:
 
-- **graphable after qualification:** TE-backed THD attention with fixed token
-  capacity and maximum sequence count, tensorized `cu_seqlens`, static CP
-  group, fixed optional-field presence, and fused/vectorized RoPE; QKV/output
-  projections and layer norm may join only when their padded activation shapes
-  and backward state satisfy the same signature;
+- **graphable after qualification:** the TE-backed THD `TransformerBlock` —
+  attention, QKV/output projections, layer norms, and dense MLP — captured as
+  one forward/backward pair per live PP/VPP slot, with fixed token capacity and
+  maximum sequence count, tensorized `cu_seqlens`, static CP group, fixed
+  optional-field presence, and fused/vectorized RoPE; every op inside the chunk
+  must satisfy the same replay signature or the chunk is not enabled;
 - **eager by design:** rollout packing/binning, construction and end-padding of
   `PackedTHDBatch`, loss/unpack, logging, and graph-bank selection;
 - **eager until separately qualified:** MLite's current THD/CP helpers that use
   Python loops or `.item()` ([`parallel/thd.py:451-595`][mlite-thd-pack]),
-  dynamic CP group selection, custom unfused/MRoPE paths, GDN/DSA kernels,
-  dynamic MoE dispatch/experts, and optimizer/FSDP hooks.
+  dynamic CP group selection, custom unfused/MRoPE paths, GDN/DSA kernels, and
+  optimizer/FSDP hooks. Dropless dynamic MoE dispatch keeps the whole chunk from
+  qualifying; such a chunk drops to `partial` (its static attention/MLP
+  sub-regions) or `not-applicable` until a pad-to-capacity or device-driven
+  dispatcher is qualified.
 
 MLite already supplies `max_seqlen_q/kv` from the packed protocol, so the graph
 path must reject the GQA fallback that derives a Python integer from
@@ -497,11 +507,18 @@ Before implementation qualification, a CPU-only pass over the existing
 production rollout cache must record `T`, `M`, sequence count, all `l_j`, and
 the already-present alignment padding for every packed microbatch. Report
 p50/p95/p99 for `U`, `M/T-1`, and `P^2/sum(l_j^2)`, plus estimated persistent
-buffer bytes. The decision is not “padding below an arbitrary percentage.” The
-TE partial graph qualifies only if identical-useful-token A/B measurement shows
-that launch savings exceed padding cost in median and tail step time while
-preserving loss, gradients, RNG, and update parity. Until that histogram exists,
-the net value of max-aligned THD is explicitly **unknown**.
+buffer bytes. The decision is not “padding below an arbitrary percentage.” The net value of
+max-aligned THD is defined by a measured criterion, not asserted in advance.
+The chunk-wise graph qualifies if and only if, on the retained production
+rollout distribution, an identical-useful-token A/B measurement shows captured
+step time strictly below the diagnostic-off eager baseline at both p50 and
+p95/p99, while loss, gradients, RNG advancement, and one optimizer update stay
+at parity. Operationally the gate is `replay_step_time < eager_step_time` at p50
+and p95 with every parity check green; anything else fails and MLite leaves that
+envelope `not-applicable`. The CPU-only padding ledger above plus this GPU A/B
+are that measurement protocol — the net value is measurement-pending until both
+are run, and MLite ships no capture it has not passed. It is never assumed
+positive or negative in advance.
 
 ### Static-subgraph alternatives and corrected recommendation
 
@@ -518,14 +535,19 @@ dist-opt/FSDP hooks, and NCCL order must be qualified for the user's optimizer
 and backend. Its likely smaller launch-only gain does not justify making it the
 first path or exposing `optimizer_graph=True`.
 
-The corrected first envelope is therefore **BF16, TE-backed, layer-wise partial
-THD attention, fixed CP topology, fixed max token/sequence capacity, fused
-RoPE, and dynamic packing/MoE outside capture**. Start with a PP=1 primitive
-proxy, but the delivery gate is the production PP schedule and real rollout
-length distribution. Add dense MLP only after the padding ledger remains net
-positive; then add the MLite PP slot adapter and, at the final planned
-granularity, chunk-wise capture informed by open [#5258][pr-5258]. MLite stops
-at chunk-wise and does not build full-iteration capture.
+The corrected first envelope is therefore **BF16, TE-backed, chunk-wise capture
+of the max-aligned THD `TransformerBlock`, fixed CP topology, fixed max
+token/sequence capacity, fused RoPE, and dynamic packing/MoE outside capture**,
+informed by open [#5258][pr-5258] and reusing its slot/memory contract rather
+than reinventing it. MLite does not build a separate layer-wise partial
+delivery first; layer-wise partial exists only as the degraded `partial`
+coverage a chunk falls back to when part of it is not graph-safe. Start with a
+PP=1 primitive proxy for the eager-parity oracle, but the delivery gate is the
+production PP schedule and the real rollout length distribution. A chunk that
+still contains dropless dynamic MoE dispatch qualifies only for its static
+attention/MLP sub-regions until a pad-to-capacity or device-driven dispatcher is
+separately qualified. MLite stops at chunk-wise and does not build
+full-iteration capture.
 
 ## Design Invariants from the MLite Skills
 
@@ -574,13 +596,15 @@ The resulting non-negotiable invariants are:
    bypass optimizer behavior, and users do not select optimizer graphing
    independently.
 8. The primitive layer contains no model imports, model-name predicates, or
-   model-specific allowlists. Eligibility comes from composed capabilities.
+   model-specific allowlists. Eligibility is decided structurally — whether the
+   concrete composed primitives satisfy the replay signature — not by a
+   capability registry or a model lookup.
 9. Qualification emits exactly one observable aggregate state: `enabled` when
    the strongest verified coverage applies, `partial` when a stable subset is
    captured, or `not-applicable` when no region qualifies. `partial` and
    `not-applicable` include stable reason codes for excluded regions.
 10. Dynamic shape, THD, dynamic CP, MoE, optimizer, FSDP, and NCCL constraints
-    may restrict full or optimizer capture. The compiler prefers a qualified
+    may restrict full or optimizer capture. The controller prefers a qualified
     stable subgraph; it never turns a capture/replay exception into an eager
     execution path.
 
@@ -615,8 +639,8 @@ CudaGraphPolicy(
 
 This is expressive but rejected. It exposes a large product of combinations
 and transfers MLite's compatibility problem to users. Pool selection, graph
-banks, backend choice, optimizer capture, and coverage belong behind a compiled
-capability plan.
+banks, backend choice, optimizer capture, and coverage are resolved by the
+runtime's explicit assembly, not exposed as a user-facing product.
 
 ### C. Closed User-selectable Profiles (Transitional, Rejected Long Term)
 
@@ -638,11 +662,14 @@ cfg = MegatronLiteConfig(model_name="auto", cuda_graph=graph)
 ```
 
 This is a useful bring-up scaffold because it can force one narrow experiment,
-but it should not become the stable API. It incorrectly makes `OFF` and
+but it must not become the stable API. It incorrectly makes `OFF` and
 `PARTIAL_LAYER` peer feature choices, asks users to select implementation
 coverage, and would require profile migration every time MLite qualifies a
-stronger default. If retained during development, it must remain experimental
-and must not leak into model `ImplConfig` schemas.
+stronger default. The `CudaGraphProfile`/`CudaGraphTarget` selection surface is
+therefore hard-walled: if retained at all during development it stays an
+experimental, runtime-level construct and must never appear in
+`MegatronLiteConfig.impl_cfg` or any model `ImplConfig` schema. Model
+implementations select no capture profile, target, or granularity.
 
 ### D. Default-on Capability Compiler with Diagnostic Override (Recommended)
 
@@ -684,58 +711,64 @@ safe region, so the step is intentionally eager. Reason codes include dynamic
 shape/signature, THD metadata, dynamic CP group, dynamic MoE routing,
 unqualified optimizer/FSDP hooks, and unqualified NCCL graph behavior.
 
-Suggested internal flow:
+Suggested internal flow — explicit assembly, not a capability compiler. The
+runtime knows it is building chunk-wise THD capture, so it wires the controller
+directly to the concrete objects it already holds. There is no capability
+registry, capability collector, or generic policy compiler:
 
 ```python
 # Runtime, after final model/optimizer/hooks and weight load:
-plan = compile_cuda_graph_policy(
-    capabilities=collect_cuda_graph_capabilities(bundle.chunks),
+controller = CudaGraphController(
+    chunks=bundle.transformer_blocks,   # the concrete graphed callables
+    schedule=bundle.pp_schedule,        # supplies live-slot capture/replay order
     precision=handle.precision_plan,
     optimizer=handle.optimizer_plan,
     parallel_state=bundle.parallel_state,
     debug=cfg.cuda_graph_debug,
 )
-coverage = bind_cuda_graph_plan(bundle.chunks, plan)
-status = plan.validate_and_report(coverage)
+
+# The controller checks each chunk's replay signature directly and records
+# coverage: a fully graph-safe chunk is captured whole (enabled); one that still
+# holds a dynamic region captures its static sub-regions (partial) or none
+# (not-applicable). Nothing is discovered through an abstract interface.
+status = controller.qualify_and_bind()
 
 # Production forward/backward path:
 controller.warmup_or_replay(
-    schedule=mlite_schedule,
+    schedule=bundle.pp_schedule,
     model_call=production_forward,
     batch_signature=batch_signature,
 )
 ```
 
-Reusable primitives expose a small protocol rather than importing the runtime:
-
-```python
-class CudaGraphCapability(Protocol):
-    target: CudaGraphTarget
-
-    def graph_callable(self) -> Callable: ...
-    def graph_signature(self, sample) -> GraphSignature: ...
-```
-
-The controller owns graphs, persistent buffers, capture order, RNG
-registration, and TE coordination. A model only becomes eligible by composing
-capable primitives. The compiler, not the user, resolves CG × FP8 × optimizer ×
-parallel-backend compatibility.
+There is no `CudaGraphCapability` protocol and no capability collector. The
+runtime already holds the constructed `TransformerBlock` chunks, the precision
+plan, the optimizer plan, and the parallel state, so it assembles the
+controller from those concrete objects explicitly. The controller owns graphs,
+persistent buffers, capture order, RNG registration, and TE coordination, and
+checks each chunk's replay signature directly. Eligibility is not declared by a
+primitive implementing an interface; it is decided by whether the concrete chunk
+the runtime already built satisfies the signature. The runtime, not the user,
+resolves CG × FP8 × optimizer × parallel-backend compatibility by wiring the
+plans it holds.
 
 ## Proposed Ownership and Failure Contract
 
 ### Minimal owned surface
 
-- `megatron/lite/primitive/cuda_graph.py`: internal semantic targets,
-  capability protocol, compiled plan, signatures, controller, coverage/status
-  manifest, reason codes, and TE adapter;
+- `megatron/lite/primitive/cuda_graph.py`: internal semantic targets, the
+  chunk-wise controller, replay signatures, coverage/status manifest, reason
+  codes, and TE adapter — no capability protocol and no generic policy compiler;
 - `runtime/backends/mlite/config.py`: at most one common diagnostic override;
   no per-model profile, target, backend, or optimizer-graph field;
-- `runtime/backends/mlite/runtime.py`: compile/bind after model construction and
+- `runtime/backends/mlite/runtime.py`: explicitly assemble and bind the
+  controller from the constructed chunks after model construction and
   weight/optimizer finalization; invoke warmup/capture/replay from the real
   `forward_backward` path;
 - `primitive/train_step.py`: PP=1 microbatch slot identity and capture boundary;
 - later `primitive/parallel/pipeline.py`: MLite schedule order/slot adapter;
-- existing attention/dense primitives: semantic capability declarations only.
+- existing `TransformerBlock` and attention/dense primitives: wired directly
+  into the controller by the runtime; they declare no capability interface.
 
 No model registry entry, model-name allowlist, FP8 recipe builder, or duplicate
 model implementation is needed.
@@ -744,8 +777,8 @@ model implementation is needed.
 
 - Graph objects, static IO buffers, TE callable wrappers, and registered RNG
   state live in one controller per `ModelHandle`.
-- Graphs are device- and rank-local. Process groups are inputs to compilation,
-  not globally rediscovered during replay.
+- Graphs are device- and rank-local. Process groups are inputs to controller
+  assembly, not globally rediscovered during replay.
 - The replay signature contains shape, stride, dtype, device, requires-grad,
   optional tensor presence, and reviewed static metadata.
 - BF16/FP8 public outputs preserve the eager dtype contract. Raw internal FP8
@@ -776,9 +809,9 @@ The coverage manifest must show exactly which calls remain eager and why.
 
 The following are fatal implementation or runtime failures:
 
-- an unknown diagnostic value or inconsistent capability declaration;
-- missing, overlapping, or duplicate ownership for a region selected by the
-  compiled plan;
+- an unknown diagnostic value or an inconsistent chunk/signature declaration;
+- missing, overlapping, or duplicate ownership for a region the controller
+  selected;
 - failure to provide FP8 state coordination for a precision combination that
   the implementation declared qualified;
 - failure to preserve optimizer/FSDP/NCCL hook phase or address stability for
@@ -798,17 +831,17 @@ eagerly.
 
 | Variant | Recommendation | Reason |
 | --- | --- | --- |
-| Partial layer | **Build first, narrowly and select automatically.** Fixed-capacity THD attention, TE backend, fused RoPE, fixed CP; qualify PP=1 first and production PP next. | Smallest production-relevant capability; keeps packing/dynamic MoE eager; creates tensorized metadata, coverage, and signature infrastructure needed by every later mode. |
-| Whole layer | **Promote automatically when qualified.** Dense/static layers only, then PP after schedule-slot evidence. | More coverage with the same controller, but every operation in the layer must satisfy the signature and RNG contract. It supersedes narrower coverage inside the same envelope. |
-| Chunk-wise | **Planned ceiling, after layer-wise evidence.** Track upstream #5258 and reuse its settled slot/memory contract. | It captures inter-layer/dispatcher gaps and much of the remaining CPU pressure without taking ownership of the entire training iteration. |
+| Chunk-wise | **Build first and directly.** Max-aligned THD `TransformerBlock`, TE backend, fused RoPE, fixed CP; reuse #5258's slot/memory contract; qualify PP=1 proxy first, production PP as the delivery gate. | It captures inter-layer/dispatcher gaps and the bulk of CPU-bound launch pressure in one graph pair per slot; MLite ships this granularity rather than staging a narrower layer-wise delivery first. |
+| Partial (fallback coverage) | **Do not build as a separate delivery.** It is the degraded outcome of the same chunk-wise controller: capture static attention/MLP sub-regions when a chunk still holds a dynamic region. | Keeps packing/dynamic MoE eager and still yields a `partial` result with reasons; it is a coverage state of the chunk-wise path, not an earlier milestone. |
 | Full-iteration | **Do not implement in MLite.** Use the Bridge/MCore backend if this feature is required. | The incremental gain beyond chunk-wise does not justify whole-loop static state, disabled checks, and the largest correctness/memory blast radius. |
 | Optimizer graph | **Separate future implementation task, not a user CG toggle.** | Backend-specific capturable optimizer, master weights, clipping, overflow, and FSDP/dist-opt behavior need their own contract. Once qualified for the user-selected optimizer/backend, MLite enables it and reports the resulting coverage. |
 
 The proposed boundary is deliberately conservative. Coverage expands only
-after correctness and performance qualification. If partial layer capture does
-not show a meaningful measured gain, MLite should leave that envelope
-`not-applicable` rather than make users manage a non-beneficial feature.
-Chunk-wise is a separately measured ceiling; full-iteration is out of scope.
+after correctness and performance qualification. If chunk-wise capture does not
+show a meaningful measured gain on the production rollout distribution, MLite
+should leave that envelope `not-applicable` rather than make users manage a
+non-beneficial feature. Chunk-wise is the granularity ceiling; full-iteration is
+out of scope.
 
 ## Validation Contract for a Later Implementation
 
@@ -828,7 +861,7 @@ leave the following evidence.
 - Verify the primitive imports no model package and contains no model-name
   predicates.
 - Mock TE availability/version, precision coordination, signature creation,
-  and capture-plan selection without importing CUDA-only state.
+  and controller assembly/coverage recording without importing CUDA-only state.
 - Unit-test MLite microbatch slot/order derivation independently of GPU capture.
 
 ### Primitive GPU reference
@@ -845,17 +878,18 @@ microbatch count, and optimizer state. Compare:
 - eager execution plus observable reasons for statically excluded targets, and
   fail-loud behavior for any bound target that fails capture or replay.
 
-The first useful case is one max-aligned THD attention primitive in BF16 with
-tensorized metadata and fused RoPE, followed by the production PP composition.
-Dense MLP and then one reviewed FP8 recipe widen the same capability only after
-the padding ledger stays net positive. If bitwise comparison is impossible,
-the threshold and reason require explicit review; a default tolerance is not
-automatic acceptance.
+The first useful case is one max-aligned THD `TransformerBlock` chunk in BF16
+with tensorized metadata and fused RoPE at PP=1 (reduced layer/expert count per
+`basic.constitution`), followed by the production PP composition. One reviewed
+FP8 recipe widens the same path only after the padding ledger stays net
+positive. If bitwise comparison is impossible, the threshold and reason require
+explicit review; a default tolerance is not automatic acceptance.
 
 ### Composition and end to end
 
-- Start with a real PP=1 production model path whose automatically selected
-  primitives are present; do not hard-code its model name in the capability.
+- Start with a real PP=1 production model path whose graphed `TransformerBlock`
+  chunks are present; do not hard-code its model name in the controller or
+  signature.
 - Compare normal automatic graphing vs the diagnostic-off oracle from identical
   checkpoints and input streams for loss, gradients, updated weights, logits,
   and RNG state.
@@ -895,39 +929,40 @@ baseline, correctness/update comparison, and exact coverage/status manifest.
    retained rollout cache and report utilization, token-linear padding tax,
    dummy-tail attention indicator, and persistent bytes. A synthetic BSHD case
    cannot pass this gate.
-3. **PP=1 BF16 partial THD attention capture.** Qualify TE with fixed token and
+3. **PP=1 BF16 chunk-wise THD capture.** Qualify TE whole-`TransformerBlock`
+   capture (attention, projections, norms, dense MLP) with fixed token and
    sequence-count capacity, tensorized `cu_seqlens`, fixed CP topology, fused
-   RoPE, and bitwise eager parity. Known bound mismatches report
+   RoPE, and bitwise eager parity, reusing #5258's slot/memory contract. A chunk
+   still holding a dynamic region reports `partial` (static sub-regions) or
    `not-applicable`; capture/replay failures are fatal.
 4. **MLite PP schedule adapter and production composition.** Derive
    capture/replay order and live slots from `primitive.parallel.pipeline`, then
    prove correctness and a net tokens/s gain on the same rollout distribution.
    Validate PP and VPP separately.
-5. **Static CP and padded MoE coverage.** Add only after their process-group and
-   shape contracts pass composition tests; otherwise preserve useful stable
-   subgraphs and report `partial` with reasons.
-6. **Dense MLP, FP8 coordination, and THD graph banks.** Automatically widen
-   coverage only if the padding ledger stays net positive. Consume the existing
-   precision plan, prove amax/cache/update timing, and add bounded graph-bank
-   eligibility without a CG-specific FP8 toggle. Bound/signature misses are
-   explicit plan outcomes; capture/replay failures remain fatal.
-7. **Whole-layer, then chunk-wise ceiling.** Promote the strongest qualified
-   coverage only where partial capture leaves a measured launch-bound gap and
-   the wider contract is semantics-preserving. Reuse the settled #5258
-   schedule/slot contract; do not proceed to full-iteration capture.
-8. **Qualify optimizer graphs independently.** Preserve the user's optimizer
+5. **Static CP and padded/device-driven MoE coverage.** Add only after their
+   process-group and shape contracts pass composition tests, so a MoE
+   `TransformerBlock` can qualify for whole-chunk capture; otherwise preserve
+   useful stable subgraphs and report `partial` with reasons.
+6. **FP8 coordination and THD graph banks.** Automatically widen coverage only if
+   the padding ledger stays net positive. Consume the existing precision plan,
+   prove amax/cache/update timing, and add bounded graph-bank eligibility without
+   a CG-specific FP8 toggle. Bound/signature misses are explicit outcomes;
+   capture/replay failures remain fatal. Chunk-wise remains the ceiling; do not
+   proceed to full-iteration capture.
+7. **Qualify optimizer graphs independently.** Preserve the user's optimizer
    choice, prove backend-specific master-weight/clipping/overflow/hooks, then
    let MLite select optimizer capture automatically for qualified combinations.
-   Chunk-wise and optimizer work each require their own design and evidence
-   gate even though they are not user toggles; full-iteration is not planned.
+   Optimizer work requires its own design and evidence gate even though it is not
+   a user toggle; full-iteration is not planned.
 
 ## Decisions Requested
 
 The following architecture decisions do not require GPU data:
 
 1. Approve capture granularity and coverage as separate concepts.
-2. Approve a model-neutral capability/coverage contract and reject CG model
-   variants or model allowlists.
+2. Approve a model-neutral coverage/status contract, assembled explicitly by the
+   runtime, and reject CG model variants, model allowlists, or a generic
+   capability protocol/policy compiler.
 3. Approve CUDA Graph as a default-on, semantics-preserving progressive
    optimization: no long-term `OFF` / `PARTIAL_LAYER` peer profiles; off is a
    diagnostic oracle only.
@@ -935,17 +970,18 @@ The following architecture decisions do not require GPU data:
    structured reasons, planned eager execution for statically ineligible
    regions, and fatal unexpected capture/replay failures.
 5. Approve TE callable graphing as the first internal backend and fixed-capacity
-   max-aligned THD attention as the first qualified envelope, with a real
-   rollout-distribution padding ledger before GPU implementation evidence;
-   BSHD-only qualification is insufficient.
+   max-aligned THD chunk-wise `TransformerBlock` capture as the first qualified
+   envelope (shipped directly, without a separate layer-wise partial delivery),
+   with a real rollout-distribution padding ledger and A/B step-time criterion
+   before GPU implementation evidence; BSHD-only qualification is insufficient.
 6. Keep FP8 precision and optimizer selection as user policy, while assigning
    CG × FP8 × optimizer × parallel-backend compatibility and automatic graph
    selection to MLite.
-7. Approve chunk-wise as the MLite granularity ceiling and reject
-   full-iteration implementation. Defer dynamic THD/CP/MoE,
-   FSDP2/dist-opt/NCCL, and optimizer graph qualification to separate measured
-   gates; prefer stable partial coverage whenever wider coverage is not yet
-   qualified.
+7. Approve chunk-wise as the MLite granularity floor and ceiling — the first and
+   only forward/backward granularity MLite builds — and reject full-iteration
+   implementation. Defer dynamic THD/CP/MoE, FSDP2/dist-opt/NCCL, and optimizer
+   graph qualification to separate measured gates; fall back to stable partial
+   sub-region coverage whenever whole-chunk coverage is not yet qualified.
 
 ## Source Links
 
