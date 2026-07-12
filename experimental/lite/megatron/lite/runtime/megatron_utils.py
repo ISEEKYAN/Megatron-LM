@@ -204,6 +204,84 @@ def _iter_opts(optimizer, chained_cls):
 
 
 # ======================================================================
+# Resync memory protocol — evict training-only state before weight export
+# ======================================================================
+#
+# The rollout weight sync materialises full-precision parameters on the GPU
+# (a per-tensor all-gather across TP/EP/PP). When the actor's optimizer moment
+# tensors and gradient buffers are still resident, that export peak collides
+# with training-only memory and can OOM colocated ranks. These helpers let the
+# export path evict optimizer + grad before the gather and restore whatever
+# device state it found on entry once the export generator is exhausted.
+
+
+def optimizer_states_on_gpu(optimizer) -> bool:
+    """True if any optimizer moment tensor is currently resident on GPU."""
+    if optimizer is None:
+        return False
+    from megatron.core.optimizer import ChainedOptimizer
+
+    for _opt in _iter_opts(optimizer, ChainedOptimizer):
+        inner = getattr(_opt, "optimizer", None)
+        if inner is None or not hasattr(inner, "state"):
+            continue
+        for state in inner.state.values():
+            if not isinstance(state, dict):
+                continue
+            for key in ("exp_avg", "exp_avg_sq"):
+                value = state.get(key)
+                if isinstance(value, torch.Tensor) and value.is_cuda:
+                    return True
+    return False
+
+
+def _iter_ddp_grad_buffers(model_list: list):
+    for model_chunk in model_list:
+        if not _is_megatron_ddp(model_chunk):
+            continue
+        for buffers in (model_chunk.buffers, model_chunk.expert_parallel_buffers):
+            for buffer in buffers:
+                yield buffer
+
+
+def model_grads_resident(model_list: list) -> bool:
+    """True if any DDP grad buffer currently holds GPU storage."""
+    for buffer in _iter_ddp_grad_buffers(model_list):
+        if buffer.grad_data.storage().size() > 0:
+            return True
+    return False
+
+
+def free_grad_buffers(model_list: list) -> None:
+    """Release DDP grad-buffer GPU storage, recording size for later restore.
+
+    Mirrors the gradient half of :func:`offload_model_to_cpu` without touching
+    the parameter buffers, so params can stay resident for the weight export
+    while gradient memory is reclaimed. Restore with
+    ``load_model_to_gpu(model_list, load_grad=True)``.
+    """
+    for buffer in _iter_ddp_grad_buffers(model_list):
+        if buffer.grad_data.storage().size() > 0:
+            buffer.grad_data_size = buffer.grad_data.storage().size()
+            buffer.grad_data.storage().resize_(0)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def cuda_mem_snapshot(tag: str) -> dict:
+    """Capture current/peak CUDA allocation (GiB) for a resync memory curve."""
+    if not torch.cuda.is_available():
+        return {"tag": tag, "allocated_gib": 0.0, "reserved_gib": 0.0, "max_allocated_gib": 0.0}
+    scale = 1024**3
+    return {
+        "tag": tag,
+        "allocated_gib": torch.cuda.memory_allocated() / scale,
+        "reserved_gib": torch.cuda.memory_reserved() / scale,
+        "max_allocated_gib": torch.cuda.max_memory_allocated() / scale,
+    }
+
+
+# ======================================================================
 # Checkpoint helpers
 # ======================================================================
 

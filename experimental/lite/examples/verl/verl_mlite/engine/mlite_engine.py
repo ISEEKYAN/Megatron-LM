@@ -376,6 +376,14 @@ class MegatronLiteEngine(BaseEngine):
 
     def get_per_tensor_param(self, **kwargs):
         self._require_initialized()
+        model_chunks = self.handle._extras.get("model_chunks", [self.handle._model])
+        # Resync memory protocol: evict training-only state (optimizer moments
+        # + gradient buffers) from the GPU before materialising full parameters
+        # for the rollout weight sync, so the export all-gather peak does not
+        # collide with it. Whatever device state we find on entry is restored
+        # once the export generator is exhausted (see _stream_resync_export),
+        # keeping VERL's offload bookkeeping intact.
+        resync = self._begin_resync_memory_scope(model_chunks)
         if self.is_param_offload_enabled:
             self.to("cuda", model=True, optimizer=False, grad=False)
         if not getattr(self, "_initial_sync_cache_cleared", False):
@@ -394,7 +402,81 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
-        return self.runtime.export_weights(self.handle, **export_kwargs), None
+        weights = self.runtime.export_weights(self.handle, **export_kwargs)
+        return self._stream_resync_export(weights, model_chunks, resync), None
+
+    def _begin_resync_memory_scope(self, model_chunks: list) -> dict:
+        """Offload optimizer + free grad buffers ahead of a weight export.
+
+        Records which state was resident on entry so :meth:`_stream_resync_export`
+        can restore it after the export generator is consumed.
+        """
+        from megatron.lite.runtime.megatron_utils import (
+            cuda_mem_snapshot,
+            free_grad_buffers,
+            model_grads_resident,
+            optimizer_states_on_gpu,
+        )
+
+        opt_resident = optimizer_states_on_gpu(self.handle._optimizer)
+        grad_resident = model_grads_resident(model_chunks)
+        curve = [cuda_mem_snapshot("resync/enter")]
+        if opt_resident:
+            self.to("cpu", model=False, optimizer=True, grad=False)
+            curve.append(cuda_mem_snapshot("resync/after_optimizer_offload"))
+        if grad_resident:
+            free_grad_buffers(model_chunks)
+            curve.append(cuda_mem_snapshot("resync/after_grad_free"))
+        return {"opt_resident": opt_resident, "grad_resident": grad_resident, "curve": curve}
+
+    def _stream_resync_export(self, weights, model_chunks: list, resync: dict):
+        """Yield the export stream, then restore evicted training state.
+
+        The generator body runs lazily in the consumer's context, so the
+        optimizer/grad restore happens after the export all-gather is fully
+        drained — exactly when the memory it needs has been released.
+        """
+        from megatron.lite.runtime.megatron_utils import cuda_mem_snapshot, load_model_to_gpu
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        resync["curve"].append(cuda_mem_snapshot("resync/export_begin"))
+        try:
+            yield from weights
+        finally:
+            resync["curve"].append(cuda_mem_snapshot("resync/export_end"))
+            if resync["grad_resident"]:
+                load_model_to_gpu(model_chunks, load_grad=True)
+            if resync["opt_resident"]:
+                self.to("cuda", model=False, optimizer=True, grad=False)
+            resync["curve"].append(cuda_mem_snapshot("resync/restore"))
+            self._emit_resync_curve(resync)
+
+    def _emit_resync_curve(self, resync: dict) -> None:
+        """Emit the resync memory curve (stdout marker + optional JSONL file)."""
+        curve = resync["curve"]
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        peak = max((s.get("max_allocated_gib", s["allocated_gib"]) for s in curve), default=0.0)
+        summary = " ".join(f"{s['tag']}={s['allocated_gib']:.3f}" for s in curve)
+        print(
+            f"MLITE_RESYNC_MEMCURVE rank={rank} "
+            f"opt_offloaded={resync['opt_resident']} grad_freed={resync['grad_resident']} "
+            f"{summary} export_peak_max_alloc_gib={peak:.3f}",
+            flush=True,
+        )
+        path = os.environ.get("MLITE_RESYNC_MEMLOG_PATH")
+        if path:
+            import json
+
+            record = {
+                "rank": rank,
+                "opt_offloaded": resync["opt_resident"],
+                "grad_freed": resync["grad_resident"],
+                "export_peak_max_alloc_gib": peak,
+                "curve": curve,
+            }
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record) + "\n")
 
     def get_data_parallel_size(self):
         if self.handle is None:

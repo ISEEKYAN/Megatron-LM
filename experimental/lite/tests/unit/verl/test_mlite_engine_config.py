@@ -51,6 +51,14 @@ def _engine_config(**kwargs) -> MegatronLiteEngineConfig:
     return MegatronLiteEngineConfig(**values)
 
 
+def _fake_handle(*, model_chunks=None, optimizer=None) -> SimpleNamespace:
+    """Minimal ModelHandle stand-in for the resync memory protocol."""
+    return SimpleNamespace(
+        _extras={"model_chunks": model_chunks if model_chunks is not None else []},
+        _optimizer=optimizer,
+    )
+
+
 @pytest.mark.parametrize("num_microbatches", [1, 4])
 def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     engine = _engine(engine_config=_engine_config())
@@ -162,7 +170,7 @@ def test_checkpoint_resync_format_is_forwarded_to_model_export(monkeypatch) -> N
             return iter(())
 
     engine.runtime = Runtime()
-    engine.handle = object()
+    engine.handle = _fake_handle()
     monkeypatch.setattr("verl_mlite.engine.mlite_engine.aggressive_empty_cache", lambda **_: None)
 
     weights, metadata = engine.get_per_tensor_param()
@@ -195,7 +203,7 @@ def test_online_weight_export_uses_device_resident_runtime_defaults() -> None:
             return iter(())
 
     engine.runtime = Runtime()
-    engine.handle = object()
+    engine.handle = _fake_handle()
     engine._initial_sync_cache_cleared = True
 
     weights, metadata = engine.get_per_tensor_param(limit=3)
@@ -210,6 +218,93 @@ def test_online_weight_export_uses_device_resident_runtime_defaults() -> None:
             "target": "vllm",
         },
     }
+
+
+def test_resync_memory_protocol_evicts_before_export_and_restores_after(monkeypatch) -> None:
+    """Optimizer/grad are evicted before the gather and restored after drain."""
+    import megatron.lite.runtime.megatron_utils as mu
+
+    engine = _engine(
+        engine_config=_engine_config(param_offload=True, optimizer_offload=True)
+    )
+    events: list[str] = []
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            def gen():
+                events.append("export:begin")
+                yield ("w0", torch.zeros(1))
+                events.append("export:end")
+
+            return gen()
+
+    engine.runtime = Runtime()
+    engine.handle = _fake_handle(optimizer=object(), model_chunks=[object()])
+    engine._initial_sync_cache_cleared = True
+
+    monkeypatch.setattr(mu, "optimizer_states_on_gpu", lambda opt: True)
+    monkeypatch.setattr(mu, "model_grads_resident", lambda chunks: True)
+    monkeypatch.setattr(mu, "free_grad_buffers", lambda chunks: events.append("free_grad"))
+    monkeypatch.setattr(
+        mu,
+        "load_model_to_gpu",
+        lambda chunks, load_grad=True: events.append(f"reload_grad={load_grad}"),
+    )
+
+    def fake_to(device, model=True, optimizer=True, grad=True):
+        events.append(f"to:{device}:model={model}:opt={optimizer}:grad={grad}")
+
+    engine.to = fake_to
+
+    weights, metadata = engine.get_per_tensor_param()
+    assert metadata is None
+
+    # Eviction happens eagerly, before the lazy export body runs.
+    assert "to:cpu:model=False:opt=True:grad=False" in events
+    assert "free_grad" in events
+    assert "export:begin" not in events
+
+    drained = list(weights)
+    assert [name for name, _ in drained] == ["w0"]
+
+    # After the export generator drains: grad reload then optimizer restore.
+    assert events.index("export:end") < events.index("reload_grad=True")
+    assert events.index("reload_grad=True") < events.index(
+        "to:cuda:model=False:opt=True:grad=False"
+    )
+
+
+def test_resync_memory_protocol_is_noop_when_state_already_offloaded(monkeypatch) -> None:
+    """When optimizer/grad are already off-GPU, no eviction/restore is issued."""
+    import megatron.lite.runtime.megatron_utils as mu
+
+    engine = _engine(engine_config=_engine_config(param_offload=False))
+    to_calls: list[str] = []
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            return iter([("w", torch.zeros(1))])
+
+    engine.runtime = Runtime()
+    engine.handle = _fake_handle()
+    engine._initial_sync_cache_cleared = True
+
+    monkeypatch.setattr(mu, "optimizer_states_on_gpu", lambda opt: False)
+    monkeypatch.setattr(mu, "model_grads_resident", lambda chunks: False)
+
+    def fail_reload(*_args, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("no grad reload expected when nothing was freed")
+
+    monkeypatch.setattr(mu, "load_model_to_gpu", fail_reload)
+    engine.to = lambda device, **kwargs: to_calls.append(device)
+
+    weights, _ = engine.get_per_tensor_param()
+    assert [name for name, _ in weights] == ["w"]
+    # is_param_offload default is False here, so no reload-to-cuda was issued and
+    # no optimizer offload/restore round-trip occurred.
+    assert to_calls == []
 
 
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
