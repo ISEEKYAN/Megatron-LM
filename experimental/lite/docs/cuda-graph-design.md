@@ -473,6 +473,62 @@ available for a model, the safe first boundary narrows to the TE THD attention
 core and reports the RoPE/projection exclusions as `partial`; it does not catch
 a failed whole-attention capture and retry eagerly.
 
+### How upstream captures dropless MoE dispatch (#5258)
+
+The bayan-selected first-delivery plan puts a MoE `TransformerBlock` chunk fully
+inside one graph, so the dropless dispatch must become graph-safe rather than
+being left eager. The open [#5258][pr-5258] chunk-CG branch already solves this
+for the `HybridEP` dispatcher, and MLite reuses that contract instead of
+inventing one. The mechanism is neither "exclude MoE" nor "capture arbitrary
+dynamic dispatch": it is **fixed per-rank token capacity plus device-driven
+per-expert padding, with an on-device overflow flag read only outside capture.**
+
+1. **Static per-rank token budget.** When THD packing and CUDA graphs are both
+   on, the dispatcher derives its A2A token count from static config, not from a
+   live token count: `_get_static_hybridep_thd_num_tokens` returns
+   `max_seqlen_per_dp_cp_rank` (divided by `tensor_model_parallel_size` under
+   sequence parallelism) rounded up to `HYBRIDEP_TOKEN_ALIGNMENT`
+   ([`token_dispatcher.py:54-75`][mcore-5258-static-tokens], alignment constant
+   from `moe.fused_a2a`). Every rank in the MoE group therefore issues the same,
+   compile-time-known A2A shape.
+2. **Fail-loud over-capacity.** `_HybridEPManager.setup_metadata` pads
+   `routing_map`/`probs` up to the static budget, and raises when the real token
+   count exceeds it — the padded contract is enforced, never silently truncated
+   ([`token_dispatcher.py:1122-1160`][mcore-5258-setup-metadata]).
+3. **Device-side per-expert padding, no host reads in the captured region.**
+   With `moe_expert_rank_capacity_factor` set, split sizes are padded to the
+   pre-sized buffer entirely on device (`_pad_tokens_per_expert_to_num_permuted_tokens`,
+   [`token_dispatcher.py:78-95`][mcore-5258-pad-experts]) and the unused tail is
+   zeroed with a device mask (`_zero_hybridep_padding`,
+   [`token_dispatcher.py:97-110`][mcore-5258-zero-pad]). No `.item()`/`.tolist()`
+   on dispatch metadata happens inside the graphed region.
+4. **Overflow as a device flag, checked outside capture.** The only capacity
+   signal that reaches the host is a boolean overflow flag kept as a device
+   tensor (`self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')`,
+   set from `over_budget = self.handle[-1] != 0`,
+   [`token_dispatcher.py:1114,1226-1227`][mcore-5258-overflow]). The runner reads
+   it after replay to discard and eagerly rerun an over-budget microbatch; the
+   graph body stays shape-static.
+5. **Slot planning is separate and reusable.** #5258's PP/VPP `(chunk, slot)`
+   scheduling lives in a config-only planner
+   ([`chunk_cuda_graphs.py`][mcore-5258-slots]: `ChunkCudaGraphSlotPlan`,
+   `ChunkCudaGraphRuntimeSlots` FIFO allocator) that MLite mirrors for its own
+   custom schedule; it carries no MoE dispatch logic.
+
+**MLite gap for `qwen3_5/lite`.** The current MLite dispatcher is DeepEP-style
+and derives every A2A split on the host: `.item()`
+([`dispatcher.py:287,329,520,524`][mlite-dispatcher-item]), `.tolist()`
+([`dispatcher.py:214,217,346,354,364`][mlite-dispatcher-tolist]), and
+`.cpu().tolist()` ([`dispatcher.py:481`][mlite-dispatcher-cpu]). None of that is
+graph-safe. The selected fixed-capacity path (option A) therefore gives the MLite
+dispatcher a static-capacity/device-driven mode that copies the #5258 *contract*
+— static per-rank budget from `max_seqlen_per_dp_cp_rank`, on-device split
+padding and tail-zeroing, a device overflow flag with an eager rerun, and zero
+host reads in the captured span — rather than porting the HybridEP fused kernel
+itself (MLite keeps its own dispatch primitive). This is the one hard-core piece
+that stays with a senior implementer; the surrounding capture/slot/THD plumbing
+is decomposed into the T3-executable subtasks under this task.
+
 ### Max-alignment cost model
 
 For one CP-local packed microbatch, let:
@@ -538,16 +594,20 @@ first path or exposing `optimizer_graph=True`.
 The corrected first envelope is therefore **BF16, TE-backed, chunk-wise capture
 of the max-aligned THD `TransformerBlock`, fixed CP topology, fixed max
 token/sequence capacity, fused RoPE, and dynamic packing/MoE outside capture**,
-informed by open [#5258][pr-5258] and reusing its slot/memory contract rather
-than reinventing it. MLite does not build a separate layer-wise partial
-delivery first; layer-wise partial exists only as the degraded `partial`
+informed by open [#5258][pr-5258] and reusing its slot/memory *and dispatch*
+contract rather than reinventing it. MLite does not build a separate layer-wise
+partial delivery first; layer-wise partial exists only as the degraded `partial`
 coverage a chunk falls back to when part of it is not graph-safe. Start with a
 PP=1 primitive proxy for the eager-parity oracle, but the delivery gate is the
-production PP schedule and the real rollout length distribution. A chunk that
-still contains dropless dynamic MoE dispatch qualifies only for its static
-attention/MLP sub-regions until a pad-to-capacity or device-driven dispatcher is
-separately qualified. MLite stops at chunk-wise and does not build
-full-iteration capture.
+production PP schedule and the real rollout length distribution. Because the
+first-delivery model is a dropless MoE (`qwen3_5/lite`), this phase commits to
+**option A** (bayan, 2026-07-12): the MLite dispatcher gains a fixed-capacity /
+device-driven mode following the #5258 contract in "How upstream captures
+dropless MoE dispatch" above, so the whole MoE `TransformerBlock` chunk is
+graph-safe. Silently leaving dropless dispatch eager inside a chunk is
+prohibited (AC#2); `partial` remains only the honest fallback when the
+fixed-capacity mode is not yet qualified for a given composition. MLite stops at
+chunk-wise and does not build full-iteration capture.
 
 ## Design Invariants from the MLite Skills
 
@@ -1023,6 +1083,16 @@ The following architecture decisions do not require GPU data:
 [mlite-thd-sync]: ../megatron/lite/primitive/parallel/thd.py#L71-L129
 [mlite-thd-pack]: ../megatron/lite/primitive/parallel/thd.py#L451-L595
 [mlite-gqa-thd]: ../megatron/lite/primitive/modules/gqa.py#L204-L213
+[mlite-dispatcher-item]: ../megatron/lite/primitive/modules/dispatcher.py#L287
+[mlite-dispatcher-tolist]: ../megatron/lite/primitive/modules/dispatcher.py#L346
+[mlite-dispatcher-cpu]: ../megatron/lite/primitive/modules/dispatcher.py#L481
+
+[mcore-5258-static-tokens]: https://github.com/NVIDIA/Megatron-LM/blob/3b5dd928d2fc7f9a27be399b279bbdb014b0d645/megatron/core/transformer/moe/token_dispatcher.py#L54-L75
+[mcore-5258-pad-experts]: https://github.com/NVIDIA/Megatron-LM/blob/3b5dd928d2fc7f9a27be399b279bbdb014b0d645/megatron/core/transformer/moe/token_dispatcher.py#L78-L95
+[mcore-5258-zero-pad]: https://github.com/NVIDIA/Megatron-LM/blob/3b5dd928d2fc7f9a27be399b279bbdb014b0d645/megatron/core/transformer/moe/token_dispatcher.py#L97-L110
+[mcore-5258-setup-metadata]: https://github.com/NVIDIA/Megatron-LM/blob/3b5dd928d2fc7f9a27be399b279bbdb014b0d645/megatron/core/transformer/moe/token_dispatcher.py#L1122-L1160
+[mcore-5258-overflow]: https://github.com/NVIDIA/Megatron-LM/blob/3b5dd928d2fc7f9a27be399b279bbdb014b0d645/megatron/core/transformer/moe/token_dispatcher.py#L1114-L1227
+[mcore-5258-slots]: https://github.com/NVIDIA/Megatron-LM/blob/3b5dd928d2fc7f9a27be399b279bbdb014b0d645/megatron/core/transformer/chunk_cuda_graphs.py
 
 [pr-5258]: https://github.com/NVIDIA/Megatron-LM/pull/5258
 [pr-4359]: https://github.com/NVIDIA/Megatron-LM/pull/4359
