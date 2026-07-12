@@ -26,7 +26,7 @@ def test_mlite_config_defaults_are_stable():
 
 @pytest.mark.parametrize(
     "precision",
-    ["bf16", "hopper_blockwise_bf16_weight", "hopper_blockwise_fp8_weight"],
+    ["bf16", "hopper_blockwise_bf16_weight"],
 )
 def test_mlite_config_round_trips_closed_precision_names(precision):
     direct = MegatronLiteConfig(model_name="qwen3_moe", precision=precision)
@@ -41,8 +41,19 @@ def test_mlite_config_round_trips_closed_precision_names(precision):
 def test_mlite_config_rejects_unknown_precision_name_at_construction():
     with pytest.raises(ValueError, match="hopper_blockwise_bf16_weight"):
         MegatronLiteConfig(precision="blockwise")
-    with pytest.raises(ValueError, match="hopper_blockwise_fp8_weight"):
+    with pytest.raises(ValueError, match="hopper_blockwise_bf16_weight"):
         MegatronLiteConfig.from_dict("/models/qwen", {"precision": "fp8"})
+
+
+def test_mlite_config_rejects_reserved_unimplemented_fp8_weight_profile():
+    # The reserved FP8-weight profile is not sold as usable: selecting it fails
+    # loud at config construction rather than advertising a working profile.
+    with pytest.raises(NotImplementedError, match="not implemented"):
+        MegatronLiteConfig(precision="hopper_blockwise_fp8_weight")
+    with pytest.raises(NotImplementedError, match="not implemented"):
+        MegatronLiteConfig.from_dict(
+            "/models/qwen", {"precision": "hopper_blockwise_fp8_weight"}
+        )
 
 
 @pytest.mark.parametrize(
@@ -80,7 +91,7 @@ def test_hopper_profiles_reject_unvalidated_parallel_combinations(parallel):
 def test_hopper_profiles_reject_unvalidated_runtime_features(impl_cfg):
     with pytest.raises(ValueError, match="does not support"):
         MegatronLiteConfig(
-            precision="hopper_blockwise_fp8_weight",
+            precision="hopper_blockwise_bf16_weight",
             impl_cfg=impl_cfg,
         )
 
@@ -90,7 +101,7 @@ def test_hopper_profiles_reject_fp8_parameter_gather_in_optimizer_overrides():
         MegatronLiteConfig.from_dict(
             "/models/qwen",
             {
-                "precision": "hopper_blockwise_fp8_weight",
+                "precision": "hopper_blockwise_bf16_weight",
                 "optimizer": {
                     "override_optimizer_config": {"fp8_param_gather": True}
                 },

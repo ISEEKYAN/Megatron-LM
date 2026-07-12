@@ -16,6 +16,13 @@ The only new public configuration values are:
 - `hopper_blockwise_bf16_weight`
 - `hopper_blockwise_fp8_weight`
 
+Implementation status: `hopper_blockwise_bf16_weight` is implemented. The
+`hopper_blockwise_fp8_weight` profile (FP8 parameter storage) is the closed
+design's declared-but-pending second profile: resolving it fails loud with a
+`NotImplementedError` rather than being advertised as usable, and FP8-weight
+initialization is tracked as a separate follow-up. The rest of this document
+describes both profiles as the frozen design contract.
+
 `bf16` remains the default and preserves the current behavior. No public
 `recipe`, `format`, `target`, `weight_dtype`, rule list, ordered matcher, or
 model-specific FP8 configuration is part of this release.
@@ -47,23 +54,26 @@ path:
 - the canonical training image's released Transformer Engine `2.15.0`, whose
   blockwise kernels (Linear, LayerNormLinear, GroupedLinear) run forward and
   backward under `Float8BlockScaling` -- verified by a read-only capability
-  inventory on that image (SM90, CUDA 13.2, cuBLAS 13.4, block scaling
+  inventory on that image (SM90, CUDA 13.2, cuBLAS 13.4 present, block scaling
   supported, all mandatory ops ran); and
-- an NVIDIA Hopper GPU with compute capability exactly 9.0.
+- an NVIDIA GPU on which TE's blockwise-FP8 capability probe passes.
 
 Blockwise FP8 runs on the same image that runs BF16 -- there is no FP8-only
-build overlay. The runtime gate pins the released Transformer Engine version
-`2.15.0`; requiring an exact build SHA would recreate a special-environment
-requirement, so the build SHA is recorded for provenance only and the
-capability preflight below is the fail-loud safety net. The [te-commit] link
-and the `[te-*]` source citations point at readable upstream source for the
-blockwise recipe, quantization, and grouped-GEMM APIs; TE 2.15 implements the
-same blockwise contract, which the inventory confirms at runtime.
+build overlay. The runtime gate is deliberately *not* a hard pin on an exact
+device class, TE version, or CUDA/cuBLAS threshold: the single authoritative
+gate is TE's own `check_fp8_block_scaling_support()` capability probe. Pinning
+exact versions would recreate a special-environment requirement (whatever runs
+BF16 must run FP8) and could reject a newer or different accelerator where BF16
+is fine. The released TE `2.15.0` is the version the parity evidence was
+recorded against; it is kept as provenance, and a probed toolchain that differs
+from it emits a fail-loud provenance warning but is not blocked. The `[te-*]`
+source citations point at readable upstream source (pinned to the `v2.15` tag)
+for the blockwise recipe, quantization, and grouped-GEMM APIs.
 
 The reference driver must import Megatron-Core from the frozen checkout and
-Transformer Engine from the canonical image. A package version string is
-matched against `2.15.0`; the driver must assert the Megatron-Core revision and
-the TE version before allocating model state.
+Transformer Engine from the canonical image. It records the Megatron-Core
+revision and the TE version for provenance and asserts TE's capability probe
+before allocating model state.
 
 ### Environment seal
 
@@ -86,17 +96,20 @@ comparison.
 
 The image is qualified only if all of the following preflight checks pass:
 
-1. `torch.cuda.get_device_capability()` is `(9, 0)`. Blackwell emulation is not
-   accepted by these Hopper-named profiles.
-2. TE's `check_fp8_block_scaling_support()` succeeds. On canonical TE 2.15,
-   this requires CUDA 12.9 or newer in addition to SM90.
-3. The runtime cuBLAS version is at least 13.4. TE 2.15's GroupedLinear
-   implementation requires that version for blockwise FP8 grouped GEMM, and MoE
-   is mandatory in this release.
-4. `NVTE_FP8_BLOCK_SCALING_FP32_SCALES` is absent or `0`,
+1. TE's `check_fp8_block_scaling_support()` succeeds. This capability probe is
+   the single authoritative gate -- the same one the runtime uses -- and it
+   determines device/toolchain support (SM, CUDA, cuBLAS, block scaling)
+   directly rather than through hard-coded version thresholds.
+2. The device class, CUDA, cuBLAS, and TE versions are recorded in the
+   environment manifest for provenance and diagnosis, not enforced as
+   independent hard gates: whatever image runs BF16 must run FP8, so an exact SM
+   class, TE version, or CUDA/cuBLAS threshold is deliberately not pinned. The
+   canonical qualification image reported SM90, CUDA 13.2, cuBLAS 13.4, and TE
+   2.15.0; TE 2.15's grouped-GEMM path itself requires cuBLAS 13.3+.
+3. `NVTE_FP8_BLOCK_SCALING_FP32_SCALES` is absent or `0`,
    `NVTE_BACKWARD_OVERRIDE` is absent, and the constructed recipe equals the
    frozen recipe below.
-5. The reference linear and grouped-linear probes execute, rather than skip or
+4. The reference linear and grouped-linear probes execute, rather than skip or
    fall back to a non-blockwise kernel.
 
 There is no pre-qualified image assumed by this document. The first image that
@@ -190,12 +203,16 @@ optimizer master when MLite owns it.
 
 ## Public and Internal API Boundary
 
-The public runtime field is a string with exactly three accepted values:
+The public runtime field is a string. Two values are currently usable; the
+third names the closed design's reserved second profile, which is not yet
+implemented and therefore fails loud (a `NotImplementedError`) rather than being
+sold as usable:
 
 ```python
 MegatronLiteConfig(precision="bf16")
 MegatronLiteConfig(precision="hopper_blockwise_bf16_weight")
-MegatronLiteConfig(precision="hopper_blockwise_fp8_weight")
+# Reserved, not yet implemented -- raises NotImplementedError at resolution:
+# MegatronLiteConfig(precision="hopper_blockwise_fp8_weight")
 ```
 
 Internally, the precision package may share only the following narrow typed
@@ -318,9 +335,9 @@ model construction, or checkpoint load as indicated below.
 
 | Condition | Required failure |
 | --- | --- |
-| unknown profile or any ad-hoc recipe/format/target value | config error listing the three accepted profile names |
-| device is not SM90, TE revision differs, CUDA is below 12.9 | environment error before model allocation |
-| compile-time or runtime cuBLAS is below 13.4 | environment error identifying mandatory MoE GroupedLinear support |
+| unknown profile or any ad-hoc recipe/format/target value | config error listing the accepted profile names |
+| reserved `hopper_blockwise_fp8_weight` (FP8 parameter storage) is requested | not-implemented error at resolution; the pending second profile is never sold as usable |
+| TE's `check_fp8_block_scaling_support()` reports no blockwise FP8 support | environment error before model allocation, quoting TE's reason and the recorded toolchain (device, TE, CUDA, cuBLAS) |
 | recipe differs, FP8 DPA/MHA is enabled, or scale/backward env overrides are set | environment/recipe mismatch error |
 | selected shape violates blockwise rules | construction error with semantic site and shape |
 | missing, duplicate, or incompatible typed coverage | construction error before optimizer creation |
@@ -427,9 +444,10 @@ kernel path skipped.
 
 ### Phase 0: CPU and static contract
 
-- Parse and round-trip all three public names.
-- Assert the exact recipe mapping and both `ParameterContract` records with
-  mocked TE capability results.
+- Parse and round-trip the two usable public names, and assert the reserved
+  `hopper_blockwise_fp8_weight` name fails loud (`NotImplementedError`).
+- Assert the exact recipe mapping and the `hopper_blockwise_bf16_weight`
+  `ParameterContract` record with mocked TE capability results.
 - Reject every unsupported combination in the failure table.
 - Exercise missing, duplicate, incompatible, and unconsumed typed coverage.
 - Assert the precision package imports no model package and contains no model
@@ -529,12 +547,14 @@ sufficient.
   Adam states to FP32 in [`optimizer_config.py`][mcore-optimizer].
 - TE freezes block dimensions, format, split accumulation, scale behavior, and
   the FP8-attention rejection in [`recipe/__init__.py`][te-recipe].
-- TE freezes the SM90/CUDA 12.9 capability check in
-  [`quantization.py`][te-quantization] and declares blockwise recipe state
-  stateless in [`Float8BlockScalingRecipeState`][te-state].
-- TE requires cuBLAS 13.4 for blockwise GroupedLinear in
-  [`cublaslt_grouped_gemm.cu`][te-grouped] and checks the runtime version in
-  the same implementation's [scale-pointer setup][te-grouped-runtime].
+- TE owns the blockwise FP8 capability check (device, CUDA, cuBLAS, and block
+  scaling support) in [`check_fp8_block_scaling_support`][te-quantization] and
+  declares blockwise recipe state stateless in
+  [`Float8BlockScalingRecipeState`][te-state].
+- TE requires cuBLAS 13.3+ for blockwise GroupedLinear (the
+  `CUBLAS_GROUPED_GEMM_VERSION` guard in [`cublaslt_grouped_gemm.cu`][te-grouped])
+  and enforces it at runtime in
+  [`check_grouped_gemm_requirements`][te-grouped-runtime].
 - TE defines high-precision-source preservation for FP8 compute weights in
   [`quantization.py`][te-model-init].
 
@@ -545,10 +565,10 @@ sufficient.
 [mcore-block]: https://github.com/NVIDIA/Megatron-LM/blob/cf2f07d7b1315c96c05554c670c43207c6783e5e/megatron/core/transformer/transformer_block.py#L600-L664
 [mcore-moe]: https://github.com/NVIDIA/Megatron-LM/blob/cf2f07d7b1315c96c05554c670c43207c6783e5e/megatron/core/transformer/moe/moe_utils.py#L1340-L1374
 [mcore-optimizer]: https://github.com/NVIDIA/Megatron-LM/blob/cf2f07d7b1315c96c05554c670c43207c6783e5e/megatron/core/optimizer/optimizer_config.py#L184-L207
-[te-commit]: https://github.com/NVIDIA/TransformerEngine/commit/8b9968255eb879e6e390f427836906b29aad64d2
-[te-recipe]: https://github.com/NVIDIA/TransformerEngine/blob/8b9968255eb879e6e390f427836906b29aad64d2/transformer_engine/common/recipe/__init__.py#L388-L475
-[te-quantization]: https://github.com/NVIDIA/TransformerEngine/blob/8b9968255eb879e6e390f427836906b29aad64d2/transformer_engine/pytorch/quantization.py#L175-L245
-[te-grouped]: https://github.com/NVIDIA/TransformerEngine/blob/8b9968255eb879e6e390f427836906b29aad64d2/transformer_engine/common/gemm/cublaslt_grouped_gemm.cu#L35-L48
-[te-grouped-runtime]: https://github.com/NVIDIA/TransformerEngine/blob/8b9968255eb879e6e390f427836906b29aad64d2/transformer_engine/common/gemm/cublaslt_grouped_gemm.cu#L920-L957
-[te-model-init]: https://github.com/NVIDIA/TransformerEngine/blob/8b9968255eb879e6e390f427836906b29aad64d2/transformer_engine/pytorch/quantization.py#L837-L924
-[te-state]: https://github.com/NVIDIA/TransformerEngine/blob/8b9968255eb879e6e390f427836906b29aad64d2/transformer_engine/pytorch/quantization.py#L1526-L1575
+[te-commit]: https://github.com/NVIDIA/TransformerEngine/tree/v2.15
+[te-recipe]: https://github.com/NVIDIA/TransformerEngine/blob/v2.15/transformer_engine/common/recipe/__init__.py#L346-L436
+[te-quantization]: https://github.com/NVIDIA/TransformerEngine/blob/v2.15/transformer_engine/pytorch/quantization.py#L120-L127
+[te-grouped]: https://github.com/NVIDIA/TransformerEngine/blob/v2.15/transformer_engine/common/gemm/cublaslt_grouped_gemm.cu#L35-L48
+[te-grouped-runtime]: https://github.com/NVIDIA/TransformerEngine/blob/v2.15/transformer_engine/common/gemm/cublaslt_grouped_gemm.cu#L302-L309
+[te-model-init]: https://github.com/NVIDIA/TransformerEngine/blob/v2.15/transformer_engine/pytorch/quantization.py#L745-L808
+[te-state]: https://github.com/NVIDIA/TransformerEngine/blob/v2.15/transformer_engine/pytorch/quantization.py#L1218-L1322

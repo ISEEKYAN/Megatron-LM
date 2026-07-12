@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -21,19 +22,26 @@ from megatron.lite.primitive.precision.contract import (
     WeightStorage,
 )
 
-# The canonical training image ships a released Transformer Engine. Blockwise
-# FP8 runs on the same image that runs BF16 -- no FP8-only overlay -- so the gate
-# pins the released version validated on that image, not a bespoke build commit.
-# Requiring an exact build SHA would recreate a special-environment requirement;
-# the real fail-loud safety net is the capability probe below (SM90, block
-# scaling support, cuBLAS, CUDA). The build tag is recorded for provenance only.
+# The canonical training image ships a released Transformer Engine on which the
+# parity evidence was recorded. Blockwise FP8 runs on the *same* image that runs
+# BF16 -- no FP8-only overlay -- so this version is recorded for provenance, not
+# used as a hard runtime gate. The only authoritative runtime gate is Transformer
+# Engine's own capability probe (``check_fp8_block_scaling_support``); pinning an
+# exact TE/CUDA/SM version would recreate a special-environment requirement and
+# could reject FP8 on a newer or different accelerator where BF16 runs fine. A
+# probed toolchain that differs from this canonical version emits a fail-loud
+# provenance warning but is not blocked.
 CANONICAL_TRANSFORMER_ENGINE_VERSION = "2.15.0"
-CANONICAL_TRANSFORMER_ENGINE_BUILD_TAG = "42b84005"
+
+# Reserved name for the second closed profile (FP8 parameter storage). The closed
+# design declares it, but its FP8-weight initialization is not implemented in this
+# build, so it is not offered as a usable precision: resolving it fails loud
+# instead of advertising a profile no primitive can construct.
+_RESERVED_FP8_WEIGHT_NAME = "hopper_blockwise_fp8_weight"
 
 PRECISION_NAMES = (
     "bf16",
     "hopper_blockwise_bf16_weight",
-    "hopper_blockwise_fp8_weight",
 )
 
 _FP8_SITES = frozenset(
@@ -140,17 +148,17 @@ HOPPER_BLOCKWISE_BF16_WEIGHT = PrecisionImplementation(
     bf16_sites=_BF16_SITES,
     parameter_contract=_parameter_contract(WeightStorage.BF16),
 )
-HOPPER_BLOCKWISE_FP8_WEIGHT = PrecisionImplementation(
-    name="hopper_blockwise_fp8_weight",
-    recipe_factory=build_hopper_blockwise_recipe,
-    fp8_sites=_FP8_SITES,
-    bf16_sites=_BF16_SITES,
-    parameter_contract=_parameter_contract(WeightStorage.FP8_BLOCKWISE_E4M3),
-)
 
 
 def resolve_precision(name: str) -> PrecisionImplementation | None:
-    """Resolve one of the three accepted public precision names."""
+    """Resolve one of the accepted public precision names.
+
+    ``bf16`` disables managed precision. ``hopper_blockwise_bf16_weight`` is the
+    single implemented blockwise profile. ``hopper_blockwise_fp8_weight`` is a
+    reserved-but-unimplemented profile (FP8 parameter storage,
+    ``WeightStorage.FP8_BLOCKWISE_E4M3``); requesting it fails loud rather than
+    handing back a profile that no primitive can construct.
+    """
 
     if not isinstance(name, str):
         raise TypeError("precision must be a string")
@@ -158,8 +166,14 @@ def resolve_precision(name: str) -> PrecisionImplementation | None:
         return None
     if name == HOPPER_BLOCKWISE_BF16_WEIGHT.name:
         return HOPPER_BLOCKWISE_BF16_WEIGHT
-    if name == HOPPER_BLOCKWISE_FP8_WEIGHT.name:
-        return HOPPER_BLOCKWISE_FP8_WEIGHT
+    if name == _RESERVED_FP8_WEIGHT_NAME:
+        raise NotImplementedError(
+            f"{_RESERVED_FP8_WEIGHT_NAME} (FP8 parameter storage, "
+            f"{WeightStorage.FP8_BLOCKWISE_E4M3.value}) is not implemented in this "
+            "build; only hopper_blockwise_bf16_weight is available. FP8-weight "
+            "initialization is a declared-but-pending second profile tracked as a "
+            "separate follow-up."
+        )
     accepted = ", ".join(PRECISION_NAMES)
     raise ValueError(f"precision must be one of: {accepted}; got {name!r}")
 
@@ -201,39 +215,57 @@ def _probe_hopper_environment() -> _HopperEnvironment:
     )
 
 
-def validate_hopper_environment() -> _HopperEnvironment:
-    """Fail before model allocation unless the canonical Hopper environment is present."""
+def _warn_on_unvalidated_toolchain(environment: _HopperEnvironment) -> None:
+    """Emit a non-blocking provenance warning when the toolchain is not canonical.
 
-    _validate_recipe_environment()
-    environment = _probe_hopper_environment()
-    if environment.compute_capability != (9, 0):
-        raise RuntimeError(
-            "Hopper blockwise FP8 requires exactly SM90; found compute capability "
-            f"{environment.compute_capability}."
-        )
+    Honours the environment rule "whatever runs BF16 must run FP8": a differing
+    Transformer Engine version is *not* a hard gate (the capability probe already
+    proved blockwise FP8 works), but it is surfaced loudly so a run on an
+    unvalidated toolchain is never silent.
+    """
 
     version, _separator, _local = environment.transformer_engine_version.partition("+")
     if version != CANONICAL_TRANSFORMER_ENGINE_VERSION:
-        raise RuntimeError(
-            "Hopper blockwise FP8 requires Transformer Engine "
-            f"{CANONICAL_TRANSFORMER_ENGINE_VERSION}; found {environment.transformer_engine_version}."
+        warnings.warn(
+            "Blockwise FP8 is running on Transformer Engine "
+            f"{environment.transformer_engine_version}, which differs from the "
+            f"canonical validated version {CANONICAL_TRANSFORMER_ENGINE_VERSION}. "
+            "The capability probe succeeded so this is allowed, but parity evidence "
+            "was recorded against the canonical version.",
+            RuntimeWarning,
+            stacklevel=2,
         )
-    if environment.cuda_version < (12, 9):
-        raise RuntimeError(
-            "Hopper blockwise FP8 requires CUDA 12.9 or newer; found "
-            f"{environment.cuda_version[0]}.{environment.cuda_version[1]}."
-        )
-    if environment.cublas_version < 130400:
-        raise RuntimeError(
-            "Hopper blockwise FP8 MoE requires cuBLAS 13.4 or newer; found encoded version "
-            f"{environment.cublas_version}."
-        )
+
+
+def validate_hopper_environment() -> _HopperEnvironment:
+    """Fail loud before model allocation unless this environment supports blockwise FP8.
+
+    The single authoritative gate is Transformer Engine's own capability probe
+    (``check_fp8_block_scaling_support`` inside ``_probe_hopper_environment``).
+    There is deliberately no hard pin on an exact device class, TE version, or
+    CUDA/cuBLAS threshold: blockwise FP8 must run on the same canonical image
+    that runs BF16, and version pins would recreate a special-environment
+    requirement and could reject FP8 on a newer or different accelerator where
+    BF16 is fine. When the probe rejects the environment we fail loud with its
+    concrete reason plus the recorded toolchain for diagnosis.
+    """
+
+    _validate_recipe_environment()
+    environment = _probe_hopper_environment()
     if not environment.block_scaling_supported:
         reason = (
             environment.unsupported_reason
-            or "Transformer Engine rejected block scaling"
+            or "Transformer Engine reported no blockwise FP8 support"
         )
-        raise RuntimeError(f"Hopper blockwise FP8 is unavailable: {reason}")
+        raise RuntimeError(
+            "Blockwise FP8 is unavailable in this environment: "
+            f"{reason} (device compute capability "
+            f"{environment.compute_capability[0]}.{environment.compute_capability[1]}, "
+            f"Transformer Engine {environment.transformer_engine_version}, "
+            f"CUDA {environment.cuda_version[0]}.{environment.cuda_version[1]}, "
+            f"cuBLASLt {environment.cublas_version})."
+        )
+    _warn_on_unvalidated_toolchain(environment)
     return environment
 
 

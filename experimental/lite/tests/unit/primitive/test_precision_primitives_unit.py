@@ -155,7 +155,7 @@ def test_tp_te_linear_primitives_claim_capability_and_enter_scoped_context(
     ]
 
 
-def test_bf16_weight_linear_binding_fails_loud_for_shape_or_fp8_weight_profile(
+def test_bf16_weight_linear_binding_fails_loud_for_bad_shape(
     transformer_engine_import_stub, monkeypatch
 ):
     transformer_engine_import_stub()
@@ -169,8 +169,7 @@ def test_bf16_weight_linear_binding_fails_loud_for_shape_or_fp8_weight_profile(
 
     monkeypatch.setattr(linear.te, "Linear", _FakeLinear)
     bf16_weight = resolve_precision("hopper_blockwise_bf16_weight")
-    fp8_weight = resolve_precision("hopper_blockwise_fp8_weight")
-    assert bf16_weight is not None and fp8_weight is not None
+    assert bf16_weight is not None
 
     with precision_model_init_context(bf16_weight):
         with pytest.raises(ValueError, match="divisible by 128"):
@@ -181,15 +180,17 @@ def test_bf16_weight_linear_binding_fails_loud_for_shape_or_fp8_weight_profile(
                 precision_coverage=PrecisionCoverage(bf16_weight),
                 precision_site=SemanticSite.ATTENTION_PROJECTION,
             )
-    with precision_model_init_context(fp8_weight):
-        with pytest.raises(NotImplementedError, match="FP8-weight"):
-            linear.ColumnParallelLinear(
-                128,
-                128,
-                _parallel_state(),
-                precision_coverage=PrecisionCoverage(fp8_weight),
-                precision_site=SemanticSite.ATTENTION_PROJECTION,
-            )
+
+
+def test_reserved_fp8_weight_profile_is_not_sold_as_a_working_profile():
+    # The FP8-weight profile is declared by the closed design but its FP8
+    # parameter initialization is not implemented in this build. It must fail
+    # loud at resolution instead of being handed back and then dying deep inside
+    # linear construction.
+    from megatron.lite.primitive.precision import resolve_precision
+
+    with pytest.raises(NotImplementedError, match="not implemented"):
+        resolve_precision("hopper_blockwise_fp8_weight")
 
 
 def test_unbound_te_linear_preserves_bf16_path_without_precision_context(

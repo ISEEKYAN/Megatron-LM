@@ -12,7 +12,7 @@ import pytest
 pytestmark = pytest.mark.mlite
 
 
-def test_precision_resolver_exposes_only_the_closed_profiles():
+def test_precision_resolver_exposes_only_the_implemented_profile():
     from megatron.lite.primitive.precision import (
         AuthoritativeSource,
         MasterOwner,
@@ -23,18 +23,17 @@ def test_precision_resolver_exposes_only_the_closed_profiles():
         resolve_precision,
     )
 
+    # The reserved FP8-weight name is not advertised as usable: only the two
+    # implemented names are offered, and requesting the reserved profile fails
+    # loud instead of returning an unbuildable implementation.
     assert PRECISION_NAMES == (
         "bf16",
         "hopper_blockwise_bf16_weight",
-        "hopper_blockwise_fp8_weight",
     )
     assert resolve_precision("bf16") is None
 
     bf16_weight = resolve_precision("hopper_blockwise_bf16_weight")
-    fp8_weight = resolve_precision("hopper_blockwise_fp8_weight")
     assert bf16_weight is not None
-    assert fp8_weight is not None
-    assert bf16_weight.recipe_factory is fp8_weight.recipe_factory
     assert bf16_weight.fp8_sites == frozenset(
         {
             SemanticSite.ATTENTION_PROJECTION,
@@ -52,19 +51,20 @@ def test_precision_resolver_exposes_only_the_closed_profiles():
         }
     )
     assert bf16_weight.parameter_contract.compute_weight is WeightStorage.BF16
-    assert (
-        fp8_weight.parameter_contract.compute_weight is WeightStorage.FP8_BLOCKWISE_E4M3
-    )
-    for implementation in (bf16_weight, fp8_weight):
-        contract = implementation.parameter_contract
-        assert contract.authoritative_load_source is AuthoritativeSource.HIGH_PRECISION
-        assert contract.master_parameter is PrecisionDType.FP32
-        assert contract.main_gradient is PrecisionDType.FP32
-        assert contract.optimizer_state is PrecisionDType.FP32
-        assert contract.parameter_all_gather is PrecisionDType.BF16
-        assert contract.master_owner is MasterOwner.MLITE_OPTIMIZER
-        with pytest.raises(FrozenInstanceError):
-            contract.master_parameter = PrecisionDType.BF16
+    contract = bf16_weight.parameter_contract
+    assert contract.authoritative_load_source is AuthoritativeSource.HIGH_PRECISION
+    assert contract.master_parameter is PrecisionDType.FP32
+    assert contract.main_gradient is PrecisionDType.FP32
+    assert contract.optimizer_state is PrecisionDType.FP32
+    assert contract.parameter_all_gather is PrecisionDType.BF16
+    assert contract.master_owner is MasterOwner.MLITE_OPTIMIZER
+    with pytest.raises(FrozenInstanceError):
+        contract.master_parameter = PrecisionDType.BF16
+
+    # The reserved second profile is a declared-but-pending follow-up: it fails
+    # loud rather than being sold as a working profile.
+    with pytest.raises(NotImplementedError, match="not implemented"):
+        resolve_precision("hopper_blockwise_fp8_weight")
 
     with pytest.raises(ValueError, match="bf16.*hopper_blockwise_bf16_weight"):
         resolve_precision("blockwise")
@@ -139,52 +139,74 @@ def _valid_hopper_environment(**overrides):
     return SimpleNamespace(**values)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"compute_capability": (8, 9)}, "SM90"),
-        ({"compute_capability": (10, 0)}, "SM90"),
-        ({"transformer_engine_version": "2.17.0"}, "2.15.0"),
-        ({"transformer_engine_version": "2.18.0.dev0+8b99682"}, "2.15.0"),
-        ({"cuda_version": (12, 8)}, "CUDA 12.9"),
-        ({"cublas_version": 130300}, "cuBLAS 13.4"),
-        (
-            {
-                "block_scaling_supported": False,
-                "unsupported_reason": "kernel unavailable",
-            },
-            "kernel unavailable",
-        ),
-    ],
-)
-def test_hopper_environment_fails_loud_on_reference_mismatch(
-    monkeypatch, overrides, message
-):
+def test_hopper_environment_fails_loud_when_te_capability_probe_rejects(monkeypatch):
+    # The single authoritative gate is Transformer Engine's own capability probe.
+    # When it rejects the environment we fail loud with its concrete reason and
+    # the recorded toolchain for diagnosis.
     from megatron.lite.primitive.precision import hopper_blockwise
 
     monkeypatch.setattr(
         hopper_blockwise,
         "_probe_hopper_environment",
-        lambda: _valid_hopper_environment(**overrides),
+        lambda: _valid_hopper_environment(
+            block_scaling_supported=False, unsupported_reason="kernel unavailable"
+        ),
     )
     monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
     monkeypatch.delenv("NVTE_BACKWARD_OVERRIDE", raising=False)
 
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(RuntimeError, match="kernel unavailable"):
         hopper_blockwise.validate_hopper_environment()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # Iron-law environment rule: whatever runs BF16 must run FP8. A newer or
+        # different device class, TE version, CUDA, or cuBLAS is *not* a hard
+        # gate -- if TE's capability probe says blockwise FP8 works, it runs.
+        {"compute_capability": (8, 9)},
+        {"compute_capability": (10, 0)},
+        {"transformer_engine_version": "2.17.0"},
+        {"transformer_engine_version": "2.18.0.dev0+8b99682"},
+        {"cuda_version": (12, 8)},
+        {"cublas_version": 130300},
+    ],
+)
+def test_hopper_environment_gates_on_capability_not_version(monkeypatch, overrides):
+    from megatron.lite.primitive.precision import hopper_blockwise
+
+    environment = _valid_hopper_environment(**overrides)
+    monkeypatch.setattr(
+        hopper_blockwise, "_probe_hopper_environment", lambda: environment
+    )
+    monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
+    monkeypatch.delenv("NVTE_BACKWARD_OVERRIDE", raising=False)
+
+    # A non-canonical toolchain is allowed but surfaced loudly (never silent).
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        if overrides.get("transformer_engine_version"):
+            with pytest.raises(RuntimeWarning, match="canonical validated version"):
+                hopper_blockwise.validate_hopper_environment()
+            warnings.simplefilter("ignore", RuntimeWarning)
+        assert hopper_blockwise.validate_hopper_environment() is environment
 
 
 @pytest.mark.parametrize(
     "version",
     [
-        # The released version is the contract; any build tag on it is accepted
-        # so FP8 needs no bespoke build -- it runs on the canonical BF16 image.
+        # The canonical released version passes without any provenance warning.
         "2.15.0",
         "2.15.0+42b84005",
         "2.15.0+deadbeef",
     ],
 )
 def test_hopper_environment_accepts_the_canonical_reference(monkeypatch, version):
+    import warnings
+
     from megatron.lite.primitive.precision import hopper_blockwise
 
     environment = _valid_hopper_environment(transformer_engine_version=version)
@@ -194,7 +216,9 @@ def test_hopper_environment_accepts_the_canonical_reference(monkeypatch, version
     monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
     monkeypatch.delenv("NVTE_BACKWARD_OVERRIDE", raising=False)
 
-    assert hopper_blockwise.validate_hopper_environment() is environment
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        assert hopper_blockwise.validate_hopper_environment() is environment
 
 
 @pytest.mark.parametrize(
