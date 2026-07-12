@@ -33,6 +33,20 @@ from megatron.lite.primitive.precision.contract import (
 # provenance warning but is not blocked.
 CANONICAL_TRANSFORMER_ENGINE_VERSION = "2.15.0"
 
+# Minimum cuBLASLt version for the blockwise *GroupedLinear* (MoE expert) path.
+# TE guards grouped GEMM with ``CUBLAS_GROUPED_GEMM_VERSION`` and requires cuBLAS
+# >= 13.3, a requirement the general block-scaling capability probe does not
+# cover: an environment can pass ``check_fp8_block_scaling_support`` (blockwise
+# Linear/LayerNormLinear work) while grouped GEMM crashes for lack of the grouped
+# kernel. A MoE FP8 profile therefore gates this requirement independently and
+# fails loud before allocation instead of dying inside the grouped GEMM. Encoded
+# like ``tex.get_cublasLt_version()`` (major*10000 + minor*100 + patch): 13.3 ->
+# 130300; the canonical qualification image reports 130401 (cuBLAS 13.4.1). This
+# is *not* a device/CUDA/TE version pin (that hard gate was removed): it is TE's
+# own grouped-GEMM hard requirement, scoped to profiles that select MoE experts.
+# Source: TransformerEngine v2.15 common/gemm/cublaslt_grouped_gemm.cu.
+CUBLAS_GROUPED_GEMM_MIN_VERSION = 130300
+
 # Reserved name for the second closed profile (FP8 parameter storage). The closed
 # design declares it, but its FP8-weight initialization is not implemented in this
 # build, so it is not offered as a usable precision: resolving it fails loud
@@ -237,17 +251,26 @@ def _warn_on_unvalidated_toolchain(environment: _HopperEnvironment) -> None:
         )
 
 
-def validate_hopper_environment() -> _HopperEnvironment:
+def validate_hopper_environment(
+    implementation: PrecisionImplementation | None = None,
+) -> _HopperEnvironment:
     """Fail loud before model allocation unless this environment supports blockwise FP8.
 
-    The single authoritative gate is Transformer Engine's own capability probe
+    The primary authoritative gate is Transformer Engine's own capability probe
     (``check_fp8_block_scaling_support`` inside ``_probe_hopper_environment``).
     There is deliberately no hard pin on an exact device class, TE version, or
-    CUDA/cuBLAS threshold: blockwise FP8 must run on the same canonical image
-    that runs BF16, and version pins would recreate a special-environment
-    requirement and could reject FP8 on a newer or different accelerator where
-    BF16 is fine. When the probe rejects the environment we fail loud with its
-    concrete reason plus the recorded toolchain for diagnosis.
+    CUDA/cuBLAS threshold for the general blockwise path: blockwise FP8 must run
+    on the same canonical image that runs BF16, and version pins would recreate a
+    special-environment requirement and could reject FP8 on a newer or different
+    accelerator where BF16 is fine. When the probe rejects the environment we
+    fail loud with its concrete reason plus the recorded toolchain for diagnosis.
+
+    When ``implementation`` selects MoE experts (blockwise ``GroupedLinear``),
+    one additional TE-owned requirement is gated: the grouped GEMM needs cuBLAS
+    >= ``CUBLAS_GROUPED_GEMM_MIN_VERSION``, which the block-scaling probe does not
+    cover. This is not a reintroduced device/CUDA pin; it is TE's own grouped
+    hard requirement, so a MoE FP8 run on an under-versioned cuBLAS fails loud
+    here rather than crashing inside the grouped GEMM.
     """
 
     _validate_recipe_environment()
@@ -264,6 +287,20 @@ def validate_hopper_environment() -> _HopperEnvironment:
             f"Transformer Engine {environment.transformer_engine_version}, "
             f"CUDA {environment.cuda_version[0]}.{environment.cuda_version[1]}, "
             f"cuBLASLt {environment.cublas_version})."
+        )
+    if (
+        implementation is not None
+        and SemanticSite.MOE_EXPERT in implementation.fp8_sites
+        and environment.cublas_version < CUBLAS_GROUPED_GEMM_MIN_VERSION
+    ):
+        raise RuntimeError(
+            "Blockwise FP8 MoE experts require Transformer Engine's grouped GEMM, "
+            f"which needs cuBLAS >= {CUBLAS_GROUPED_GEMM_MIN_VERSION} "
+            "(CUBLAS_GROUPED_GEMM_VERSION guard); this environment reports cuBLASLt "
+            f"{environment.cublas_version}. The block-scaling probe can pass for "
+            "blockwise Linear/LayerNormLinear while GroupedLinear crashes, so the "
+            f"MoE FP8 profile {implementation.name!r} is gated here rather than left "
+            "to fail inside the grouped GEMM."
         )
     _warn_on_unvalidated_toolchain(environment)
     return environment

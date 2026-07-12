@@ -222,7 +222,7 @@ class MegatronLiteRuntime(RuntimeBase):
         precision_implementation = resolve_precision(rt_cfg.precision)
         precision_coverage = None
         if precision_implementation is not None:
-            validate_hopper_environment()
+            validate_hopper_environment(precision_implementation)
             precision_implementation.recipe_factory()
             precision_coverage = PrecisionCoverage(precision_implementation)
 
