@@ -60,7 +60,7 @@ from megatron.lite.primitive.parallel import (
     roll_packed_thd_left,
     scatter_to_sequence_parallel,
 )
-from megatron.lite.primitive.utils import build_fp8_recipe
+from megatron.lite.model._legacy_fp8 import build_fp8_recipe
 from megatron.lite.primitive.utils.moe import (
     compute_routing_scores_for_aux_loss,
     router_gating_linear,

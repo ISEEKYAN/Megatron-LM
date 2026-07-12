@@ -17,7 +17,6 @@ from megatron.lite.primitive.precision import (
     PrecisionPhase,
     PrimitiveCapability,
     SemanticSite,
-    WeightStorage,
     active_precision,
     precision_site_forward_context,
 )
@@ -50,6 +49,9 @@ def _validate_bf16_weight_precision(
     """Validate one TP linear site against the active model-init profile.
 
     Returns the bound implementation (or ``None`` when precision is unmanaged).
+    The only resolvable blockwise profile stores BF16 compute weights, so this
+    path always sees ``WeightStorage.BF16``; the reserved FP8-weight profile
+    fails loud earlier at ``resolve_precision`` and never reaches construction.
     The capability claim itself is registered by the caller after the TE module
     is constructed, so coverage can bind to the real TE primitive instance.
     """
@@ -63,11 +65,6 @@ def _validate_bf16_weight_precision(
     implementation = active_precision(PrecisionPhase.MODEL_INIT)
     if coverage.implementation is not implementation:
         raise RuntimeError("precision coverage is bound to a different implementation")
-    if implementation.parameter_contract.compute_weight is not WeightStorage.BF16:
-        raise NotImplementedError(
-            "FP8-weight parameter initialization is not implemented by the "
-            "BF16-weight TE primitive path."
-        )
     if site not in implementation.fp8_sites:
         raise ValueError(f"site {site.value} is not an FP8 GEMM site")
     _validate_blockwise_features(in_features, out_features, site)
