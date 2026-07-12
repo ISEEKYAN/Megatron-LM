@@ -100,12 +100,20 @@ The image is qualified only if all of the following preflight checks pass:
    the single authoritative gate -- the same one the runtime uses -- and it
    determines device/toolchain support (SM, CUDA, cuBLAS, block scaling)
    directly rather than through hard-coded version thresholds.
-2. The device class, CUDA, cuBLAS, and TE versions are recorded in the
-   environment manifest for provenance and diagnosis, not enforced as
-   independent hard gates: whatever image runs BF16 must run FP8, so an exact SM
-   class, TE version, or CUDA/cuBLAS threshold is deliberately not pinned. The
+2. The device class, CUDA, and TE versions are recorded in the environment
+   manifest for provenance and diagnosis, not enforced as independent hard
+   gates: whatever image runs BF16 must run FP8, so an exact SM class, TE
+   version, or general CUDA/cuBLAS threshold is deliberately not pinned. The
    canonical qualification image reported SM90, CUDA 13.2, cuBLAS 13.4, and TE
-   2.15.0; TE 2.15's grouped-GEMM path itself requires cuBLAS 13.3+.
+   2.15.0. The one exception is scoped and TE-owned: a profile selecting MoE
+   experts additionally gates the grouped-GEMM cuBLAS requirement, because TE
+   2.15's blockwise `GroupedLinear` path requires cuBLAS 13.3+
+   (`CUBLAS_GROUPED_GEMM_VERSION`) and `check_fp8_block_scaling_support()` does
+   not cover it. The runtime fails loud on an under-versioned cuBLAS
+   (`CUBLAS_GROUPED_GEMM_MIN_VERSION`, encoded like `get_cublasLt_version()` as
+   `130300`) rather than crashing inside the grouped GEMM. This is not a
+   reintroduced device/CUDA pin: it is the grouped path's own hard requirement,
+   scoped to MoE profiles, and the canonical image (cuBLAS 130401) satisfies it.
 3. `NVTE_FP8_BLOCK_SCALING_FP32_SCALES` is absent or `0`,
    `NVTE_BACKWARD_OVERRIDE` is absent, and the constructed recipe equals the
    frozen recipe below.
@@ -338,6 +346,7 @@ model construction, or checkpoint load as indicated below.
 | unknown profile or any ad-hoc recipe/format/target value | config error listing the accepted profile names |
 | reserved `hopper_blockwise_fp8_weight` (FP8 parameter storage) is requested | not-implemented error at resolution; the pending second profile is never sold as usable |
 | TE's `check_fp8_block_scaling_support()` reports no blockwise FP8 support | environment error before model allocation, quoting TE's reason and the recorded toolchain (device, TE, CUDA, cuBLAS) |
+| MoE-expert profile on cuBLAS below the grouped-GEMM requirement (`< CUBLAS_GROUPED_GEMM_MIN_VERSION`) | environment error before model allocation; the grouped path is gated instead of crashing inside `GroupedLinear` |
 | recipe differs, FP8 DPA/MHA is enabled, or scale/backward env overrides are set | environment/recipe mismatch error |
 | selected shape violates blockwise rules | construction error with semantic site and shape |
 | missing, duplicate, or incompatible typed coverage | construction error before optimizer creation |

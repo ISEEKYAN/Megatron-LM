@@ -237,21 +237,27 @@ def test_non_te_dense_requirement_fails_coverage_instead_of_falling_back():
 def test_precision_coverage_rejects_forged_capability_from_non_te_owner(
     transformer_engine_import_stub, monkeypatch
 ):
-    """A non-TE module cannot masquerade as an FP8-capable GEMM primitive.
+    """A non-TE owner cannot forge FP8 coverage, and no owner can borrow a witness.
 
-    Regression for the claim-forgery gap: a bare ``nn.Linear`` could previously
-    ``require`` an FP8 site and ``claim`` a TE capability, and ``seal`` returned
-    a manifest instead of failing loud. The claim now binds the capability to a
-    genuine TE primitive instance and rejects any other owner/witness.
+    Regression for two claim-forgery gaps: (1) a bare ``nn.Linear`` could
+    ``require`` an FP8 site and ``claim`` a TE capability and ``seal`` returned a
+    manifest instead of failing loud; (2) an *unrelated* genuine TE instance
+    could be borrowed as a witness to seal a foreign owner, passing the type
+    check without proving that owner's GEMM is really a TE primitive. The claim
+    now requires the witness to be the owner itself or one of its registered
+    submodules, and to be a genuine TE primitive type.
     """
 
     transformer_engine_import_stub()
     import transformer_engine.pytorch as te
 
-    # A distinct, constructible TE Linear so the *legitimate* path still seals,
-    # proving the guard rejects only the non-TE owner, not every claim.
-    te_linear_type = type("FakeTELinear", (object,), {"__init__": lambda self: None})
-    monkeypatch.setattr(te, "Linear", te_linear_type, raising=False)
+    # te.Linear is an ``nn.Module`` in production; model the stub the same way so
+    # a legitimately-registered submodule witness is reachable via ``modules()``.
+    class FakeTELinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+    monkeypatch.setattr(te, "Linear", FakeTELinear, raising=False)
 
     from megatron.lite.primitive.precision import (
         PrecisionCoverage,
@@ -263,9 +269,10 @@ def test_precision_coverage_rejects_forged_capability_from_non_te_owner(
 
     implementation = resolve_precision("hopper_blockwise_bf16_weight")
     assert implementation is not None
-    coverage = PrecisionCoverage(implementation)
     forged_owner = nn.Linear(128, 128, bias=False)
 
+    # ── every forgery attempt is rejected ──
+    coverage = PrecisionCoverage(implementation)
     with precision_model_init_context(implementation):
         coverage.require(
             forged_owner,
@@ -286,12 +293,37 @@ def test_precision_coverage_rejects_forged_capability_from_non_te_owner(
                 PrimitiveCapability.TE_LINEAR,
                 forged_owner,
             )
-        # The genuine TE primitive witness is accepted for the same site.
+        # A borrowed *genuine* TE instance for a foreign owner is rejected: it is
+        # neither the owner nor a submodule registered on it, so it cannot be
+        # borrowed to seal an unrelated owner.
+        with pytest.raises(TypeError, match="neither the coverage owner"):
+            coverage.claim(
+                forged_owner,
+                SemanticSite.DENSE_MLP,
+                PrimitiveCapability.TE_LINEAR,
+                FakeTELinear(),
+            )
+
+    # ── the legitimate path still seals: the owner owns the TE witness ──
+    class OwnerWithTE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = FakeTELinear()
+
+    legit_owner = OwnerWithTE()
+    coverage = PrecisionCoverage(implementation)
+    with precision_model_init_context(implementation):
+        coverage.require(
+            legit_owner,
+            SemanticSite.DENSE_MLP,
+            frozenset({PrimitiveCapability.TE_LINEAR}),
+            diagnostic="registered te linear",
+        )
         coverage.claim(
-            forged_owner,
+            legit_owner,
             SemanticSite.DENSE_MLP,
             PrimitiveCapability.TE_LINEAR,
-            te_linear_type(),
+            legit_owner.linear,
         )
         manifest = coverage.seal()
 

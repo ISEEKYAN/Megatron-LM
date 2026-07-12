@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch.nn as nn
 
 pytestmark = pytest.mark.mlite
 
@@ -240,6 +241,42 @@ def test_hopper_environment_rejects_recipe_overrides(monkeypatch, name, value):
         hopper_blockwise.validate_hopper_environment()
 
 
+def test_hopper_environment_gates_grouped_cublas_only_for_moe_profiles(monkeypatch):
+    # BLOCKER regression (FP8-CUBLAS-GATE): the general block-scaling probe does
+    # not cover TE's grouped-GEMM cuBLAS requirement, so a MoE FP8 profile must
+    # gate it independently or risk crashing inside GroupedLinear. The gate is
+    # scoped to profiles that select MoE experts; it is not a general device/
+    # CUDA/TE version pin, so the no-profile probe still ignores cuBLAS.
+    from megatron.lite.primitive.precision import hopper_blockwise
+    from megatron.lite.primitive.precision.hopper_blockwise import (
+        CUBLAS_GROUPED_GEMM_MIN_VERSION,
+        HOPPER_BLOCKWISE_BF16_WEIGHT,
+    )
+
+    monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
+    monkeypatch.delenv("NVTE_BACKWARD_OVERRIDE", raising=False)
+
+    under = _valid_hopper_environment(
+        cublas_version=CUBLAS_GROUPED_GEMM_MIN_VERSION - 1
+    )
+    monkeypatch.setattr(hopper_blockwise, "_probe_hopper_environment", lambda: under)
+    # A MoE-expert profile fails loud on the under-versioned cuBLAS ...
+    with pytest.raises(RuntimeError, match="grouped GEMM"):
+        hopper_blockwise.validate_hopper_environment(HOPPER_BLOCKWISE_BF16_WEIGHT)
+    # ... while the no-profile probe does not apply the grouped requirement.
+    assert hopper_blockwise.validate_hopper_environment() is under
+
+    # At exactly the minimum grouped cuBLAS version, the MoE profile passes.
+    at_min = _valid_hopper_environment(
+        cublas_version=CUBLAS_GROUPED_GEMM_MIN_VERSION
+    )
+    monkeypatch.setattr(hopper_blockwise, "_probe_hopper_environment", lambda: at_min)
+    assert (
+        hopper_blockwise.validate_hopper_environment(HOPPER_BLOCKWISE_BF16_WEIGHT)
+        is at_min
+    )
+
+
 def _coverage_types():
     from megatron.lite.primitive.precision import (
         PrecisionCoverage,
@@ -257,16 +294,19 @@ def _install_te_witnesses(transformer_engine_import_stub, monkeypatch):
     """Install stub TE classes and return real instances usable as claim witnesses.
 
     ``PrecisionCoverage.claim`` binds each capability to a genuine TE primitive
-    instance, so coverage-algebra tests must present real TE-typed witnesses
-    rather than bare ``object()`` claims.
+    instance that must also be the owner itself or one of its registered
+    submodules, so coverage-algebra tests must present real TE-typed witnesses
+    bound to their owner rather than bare ``object()`` claims. TE GEMM primitives
+    are ``nn.Module`` instances in production, so the stubs subclass ``nn.Module``
+    and register as submodules of an owner.
     """
 
     transformer_engine_import_stub()
     import transformer_engine.pytorch as te
 
-    class _FakeTEModule:
+    class _FakeTEModule(nn.Module):
         def __init__(self, *args, **kwargs):
-            pass
+            super().__init__()
 
     linear_type = type("FakeTELinear", (_FakeTEModule,), {})
     layernorm_type = type("FakeTELayerNormLinear", (_FakeTEModule,), {})
@@ -281,6 +321,21 @@ def _install_te_witnesses(transformer_engine_import_stub, monkeypatch):
     )
 
 
+class _TEOwner(nn.Module):
+    """A model-composition owner that registers its TE GEMM primitives as submodules.
+
+    Mirrors the real binding: dense MLP / MoE experts pass the TE module as owner,
+    while a TP-linear wrapper owns a registered ``self.linear`` submodule. A claim's
+    witness must be reachable from the owner, so tests build owners this way rather
+    than borrowing an unrelated primitive.
+    """
+
+    def __init__(self, **primitives):
+        super().__init__()
+        for name, primitive in primitives.items():
+            setattr(self, name, primitive)
+
+
 def test_typed_coverage_seals_exact_selected_sites_and_bf16_exclusions(
     transformer_engine_import_stub, monkeypatch
 ):
@@ -288,7 +343,9 @@ def test_typed_coverage_seals_exact_selected_sites_and_bf16_exclusions(
 
     witnesses = _install_te_witnesses(transformer_engine_import_stub, monkeypatch)
     implementation, PrecisionCoverage, Capability, Site = _coverage_types()
-    attention_projection = object()
+    # Owner-as-witness: the projection GEMM owner *is* the TE linear (dense/expert
+    # pattern). BF16 sites carry no claim, so their owner identity is opaque.
+    attention_projection = witnesses.linear
     attention_core = object()
     router = object()
     coverage = PrecisionCoverage(implementation)
@@ -353,7 +410,10 @@ def test_typed_coverage_fails_loud_for_incomplete_or_ambiguous_binding(
 
     witnesses = _install_te_witnesses(transformer_engine_import_stub, monkeypatch)
     implementation, PrecisionCoverage, Capability, Site = _coverage_types()
-    covered = object()
+    # Owner carries both its TE linear and grouped GEMM as registered submodules,
+    # so every claim presents a witness genuinely bound to its owner and the only
+    # defect under test is the coverage-algebra one named by ``case``.
+    covered = _TEOwner(linear=witnesses.linear, grouped=witnesses.grouped)
     coverage = PrecisionCoverage(implementation)
 
     with precision_model_init_context(implementation):
@@ -371,22 +431,23 @@ def test_typed_coverage_fails_loud_for_incomplete_or_ambiguous_binding(
                 diagnostic="dense mlp duplicate",
             )
         elif case == "duplicate_claim":
-            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR, witnesses.linear)
-            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR, witnesses.linear)
+            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR, covered.linear)
+            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR, covered.linear)
         elif case == "incompatible":
             coverage.claim(
-                covered, Site.DENSE_MLP, Capability.TE_GROUPED_LINEAR, witnesses.grouped
+                covered, Site.DENSE_MLP, Capability.TE_GROUPED_LINEAR, covered.grouped
             )
         elif case == "unconsumed":
-            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR, witnesses.linear)
+            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR, covered.linear)
+            extra = _TEOwner(grouped=type(witnesses.grouped)())
             coverage.claim(
-                object(), Site.MOE_EXPERT, Capability.TE_GROUPED_LINEAR, witnesses.grouped
+                extra, Site.MOE_EXPERT, Capability.TE_GROUPED_LINEAR, extra.grouped
             )
         elif case == "bf16_claim":
-            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR, witnesses.linear)
-            core = object()
+            coverage.claim(covered, Site.DENSE_MLP, Capability.TE_LINEAR, covered.linear)
+            core = _TEOwner(linear=type(witnesses.linear)())
             coverage.require(core, Site.ATTENTION_CORE)
-            coverage.claim(core, Site.ATTENTION_CORE, Capability.TE_LINEAR, witnesses.linear)
+            coverage.claim(core, Site.ATTENTION_CORE, Capability.TE_LINEAR, core.linear)
 
         with pytest.raises(ValueError, match=message):
             coverage.seal()

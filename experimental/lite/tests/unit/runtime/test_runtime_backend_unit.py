@@ -228,7 +228,7 @@ def _patch_cpu_precision_build(monkeypatch, runtime, proto):
     monkeypatch.setattr(runtime, "_load_protocol", lambda _cfg: proto)
     monkeypatch.setattr(
         "megatron.lite.runtime.backends.mlite.runtime.validate_hopper_environment",
-        lambda: SimpleNamespace(compute_capability=(9, 0)),
+        lambda *_args, **_kwargs: SimpleNamespace(compute_capability=(9, 0)),
     )
     monkeypatch.setattr(
         hopper_blockwise, "_build_hopper_blockwise_recipe", lambda: SimpleNamespace()
@@ -284,7 +284,9 @@ def _precision_protocol(*, seal: bool, events: list[str], projection_witness: ob
                 impl_cfg.precision_parameter_contract
                 is implementation.parameter_contract
             )
-            projection = object()
+            # Owner-as-witness: the projection GEMM owner *is* the TE linear, as in
+            # the dense/expert production path, so the claim's witness is bound.
+            projection = projection_witness
             core = object()
             impl_cfg.precision_coverage.require(
                 projection,

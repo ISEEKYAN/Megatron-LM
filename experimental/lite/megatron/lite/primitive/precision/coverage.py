@@ -33,6 +33,29 @@ def _te_primitive_type(capability: PrimitiveCapability) -> type:
     return getattr(te, _CAPABILITY_TE_ATTR[capability])
 
 
+def _witness_belongs_to_owner(owner: object, witness: object) -> bool:
+    """True only when ``witness`` is ``owner`` itself or a submodule registered on it.
+
+    Closes the borrowed-witness hole: the primitive type check alone proves only
+    that *some* real TE instance exists, not that *this* owner's GEMM is that
+    instance. A caller could otherwise hand an unrelated ``te.Linear`` as witness
+    to seal a foreign owner (e.g. a raw ``nn.Linear``) and forge coverage. Every
+    genuine claim keeps the witness bound to the owner: dense MLP and MoE experts
+    pass the TE module itself as owner (witness is owner), while a TP-linear
+    wrapper passes its own registered ``self.linear`` submodule as witness. TE
+    GEMM primitives are ``nn.Module`` instances, so an authentic witness is
+    always reachable from the owner via ``nn.Module.modules()``.
+    """
+
+    if witness is owner:
+        return True
+    import torch  # local import: keep this module import-safe without torch at import time
+
+    if not isinstance(owner, torch.nn.Module):
+        return False
+    return any(module is witness for module in owner.modules())
+
+
 @dataclass(frozen=True, slots=True)
 class _Requirement:
     owner: object
@@ -149,6 +172,14 @@ class PrecisionCoverage:
         if not isinstance(capability, PrimitiveCapability):
             raise TypeError("coverage capability must be a PrimitiveCapability")
         witness = owner if primitive is None else primitive
+        if not _witness_belongs_to_owner(owner, witness):
+            actual = type(witness)
+            raise TypeError(
+                f"capability {capability.value} at {site.value} witness "
+                f"{actual.__module__}.{actual.__qualname__} is neither the coverage "
+                "owner nor one of its registered submodules; a claim cannot borrow an "
+                "unrelated primitive instance to seal a foreign owner"
+            )
         expected = _te_primitive_type(capability)
         if not isinstance(witness, expected):
             actual = type(witness)
