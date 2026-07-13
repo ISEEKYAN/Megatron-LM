@@ -44,6 +44,31 @@
 - 因此：**升级 vLLM 不是 128 卡 resync-OOM 的已证银弹**。上游 changelog 里我能找到的 DS4 修复（#44914 init-OOM、#25113 ray-CVD）都不直接命中「resync all_gather 峰值 + colocated 兄弟」这个已坐实机制。
 - 但升级仍**独立值得**，理由有三：(a) 0.20.2 是 wheel+ABI-shim 的脆弱最低版，0.21.0+ 有 DS4 稳定化与 OOM 修复；(b) ray executor 路径（bayan 定的 C 臂唯一路线）在新版 + 正确 Ray cluster 起法下更可能通；(c) 与已验证的 GB200 栈（cd0de48）对齐，去掉 ABI shim。
 
+## ④ bayan 22:40 定版：查 q35 的 vllm023 镜像版本（零-GPU，回答步骤①）
+
+bayan 22:40 定版：**在 qwen3.5 的 vllm023 镜像基础上做 overlay，老镜像(NGC26.04/0.20.2)不看**；步骤①=零 GPU 先查 vllm023 里 vLLM 是否 ≥0.20，若是则 overlay 只补 DS4 训练侧件、抄 1.1.22.3 GB200 配方对齐 H100。
+
+**镜像实体**：`$ROOT/rl-mlite/containers/vllm023-aarch64-dev1.sqsh`（`$ROOT=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan`，在 **oci-hsg** lustre，cw 侧不可见）。被 kernel_rollout `docs/runs/codex/20260707-rft-vs-dapo-math/{gb200,env-probe}.sbatch` 引用。
+
+**env-probe 实测版本**（job **4240565**，`vllm023-aarch64` 内 `import vllm`）：
+```
+python=3.12.3   torch=2.11.0+cu130   torch_cuda=13.0   cuda_devices=4
+vllm=0.23.1.dev8+gd50b2a282   flashinfer-python=0.6.12
+```
+→ **vLLM 0.23.1.dev ≥ 0.20 ✓，原生带 `DeepseekV4ForCausalLM` registry**（DS4 落地于 0.20.0）。bayan 步骤① 的「是否 ≥0.20」= **是**。
+
+**但步骤① 的隐含前提被证伪——存在架构墙：**
+1. 该镜像是 **aarch64（ARM）**，torch cu130，服务对象 = **Qwen3-8B-Base DAPO colocated verl FSDP RL，跑在 GB200/oci-hsg**（jobs 424xxxx 七位，`gpus-per-node=4`，`param_offload/optimizer_offload=True`，`gpu_memory_utilization=0.90`，rc=0 无 resync 兄弟 OOM）。这就是 bayan 说的「q35 已验证栈」——它是 **GB200/aarch64**。
+2. 本任务 128 卡 DS4 RL 一直跑在 **cw H100 / x86_64 / SM90**（jobs 1387xxxx 八位，`gpu:8/node`，`run_ds4_hopper_resync` + SM90 overlay + x86 pypi 0.20.2 wheel + ABI shim）。
+3. **aarch64 sqsh 无法在 cw x86 H100 上 srun**。所以「在 vllm023 镜像基础上 overlay + 对齐 H100」不是一个连贯操作——要么留在 aarch64/GB200（换集群），要么在 x86 H100 上**重建** vLLM 0.23 recipe（源码构建，不是复用镜像）。
+4. 即便留在 GB200，vllm023（0.23.1.dev/torch2.11/cu130）≠ 现有 DS4-GB200 overlay（TASK-1.1.22.1 的 vLLM cd0de48/torch2.13/NGC26.06，job4281662 已 GPU 证），两个 vLLM/torch 栈仍需二选一对齐。
+
+**顺带证伪一个诱人猜想（offload 差异不是 q35 不 OOM 的原因）**：DS4 harness `run_deepseek_v4_gsm8k_grpo.sh` 默认已 `PARAM_OFFLOAD=True`/`OPTIMIZER_OFFLOAD=True`，与 q35 DAPO 一致。故 q35 不 OOM **不是**因为它 offload 而 DS4 没 offload——两者都 offload。resync 兄弟 OOM 仍是 update_weights 跨 TP all_gather 真权重峰值（与 8 卡 A/B 的 REFUTE 结论一致），与 param offload 正交，换镜像不必然消掉。
+
+**决策墙（human 裁，α/β 二选一，均属新构建/换集群，非本 128 跑节点内活）：**
+- **[α·推荐] 128 卡 DS4 RL 移到 GB200/oci-hsg**——字面「回到已验证栈」：q35 colocated RL（vllm023-aarch64）与 DS4 overlay（cd0de48）**两条 GPU 已证栈都在 GB200**。128×GB200=32 节点。仍需在 vllm023(0.23.1) vs DS4-overlay(cd0de48) 间定一个 vLLM；resync 兄弟 OOM 机制不因换 arch 自动消失，需带上 resync 驻留控制。
+- **[β] 留 cw H100/x86，源码重建 vLLM 0.23 for SM90**——不是复用 vllm023 镜像（arch 不符），是照它的 0.23.1/torch 配方在 x86 H100 上现搭 overlay + DSA 训练栈重验。周期长、脆弱路（wheel/shim 或换 NGC 容器）。
+
 ## 建议（供 bayan 裁，均需 human 定版本/预算——属新构建工作，非本 128 跑节点内活）
 
 - **目标版本**：对齐 GB200 已 GPU 验证的 vLLM `cd0de48`（或至少 v0.21.0）。复用 `scripts/gb200-vllm-ds4/` 配方，改造到 cw H100。
