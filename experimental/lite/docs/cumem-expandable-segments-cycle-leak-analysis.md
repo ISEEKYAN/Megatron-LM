@@ -37,6 +37,36 @@ Branch C 的 proxy(20 cycle、细采样)就是为了把这两族分开。
 
 本文因此把假设分成两族(§3),proxy 判别树(§5)按曲线形状定案。
 
+### 1.5 已有数据的逐周期差分(AC#1,零-GPU,挖 job 13888949 / 13898028 已 distill 的 MEMLOG)
+
+原始 per-cycle 设备级 `nvidia-smi memory.csv` / procmem 探针**在 cw lustre**,未同步回本
+worktree(本地遍历确认无);可挖的是父任务 log 已 distill 的离散快照。它们**不足以给出
+干净的 GiB/cycle 设备级斜率**,但足以做**关键归因判别**:
+
+**(a) actor torch 侧 = 有界(plateau),泄漏不在这。**(定量)
+- job 13898028(0.7 收口炮):actor `alloc` 37.66→45.73→45.73、`reserved` 39.78→49.41→49.42
+  GiB(step1→3)。第 2 步 Adam 态首次物化 +~8 GiB 后 **plateau**,step3 与 step2 逐位持平。
+- job 13888949(SMOKE):actor per-minute 峰 57.6→58.7→58.4→58.1、torch reserved 40→49
+  后 plateau。
+- ⇒ **两炮 actor-进程 torch caching allocator 均 plateau**;每周期净增长**不在 actor torch
+  视角**(父任务 DoubleBuffer 作用域化 133413497 把这条锁死,单测计数归零、正确、必要)。
+
+**(b) 设备级(nvidia-smi)> torch 视角,且死点周期号对峰值不变 = 累积成分在 torch 视角以下。**
+- 死点两炮同为 **cycle-4** 同址 `cumem_allocator.cpp:139`;gmu 0.6→0.7 把设备峰从 ~58 抬到
+  78.99 GiB(@05:28:36 gpu1)**只抬峰、不改死点周期号**(bayan 05:41 坐实)。
+- 判读:若纯 headroom/thin-margin,改变可用余量应移动死点 cycle;死点固定在 4 ⇒ 存在一个
+  **每周期推进、在固定 cycle 数触顶**的累积量,且它**活在 torch caching allocator 视角之下**
+  (actor torch 已 plateR 却仍在 cycle-4 顶穿 80)——正是 cumem 物理块 / expandable 段 /
+  untracked alloc 这一层(§2、§3),**不是** actor 张量泄漏。
+
+**(c) 分辨率边界(诚实声明)。** 4 个 cycle、per-step/per-minute 粗采样,**无法**把
+"~1 GiB/cycle 单调 leak" 与 "均值持平+碎片方差涨" 分开——这正是 §4 proxy(**20 cycle、
+awake/asleep/woke 三相细采样**)存在的理由,也是 AC#1 "量化设备级 GiB/cycle" 的**干净数只能
+由 proxy 或 cw-side 原始 CSV 给**的数据边界(类比父任务 repo-only recon 边界,不捏造占位数)。
+
+**AC#1 结论**:归因已判别到 **torch 视角以下的 cumem×expandable 层**(排除 actor torch
+泄漏);精确 GiB/cycle 由 §4 proxy A0 曲线补齐。
+
 ---
 
 ## 2. 机制грунт:vLLM cumem sleep/wake 与 expandable_segments 的已文档化冲突
@@ -202,12 +232,31 @@ A0 net-growth 斜率 > 噪声带?
 
 ---
 
-## 6. 本帧边界 / 下一帧闸
+## 6. 交付物 / 本帧边界 / 下一帧闸
 
-- **本帧(零-GPU)完成**:出了可证伪假设(§3)+ 机制грунт(§2,vLLM 自证的
-  expandable×cumem 不兼容)+ proxy 判别设计(§4–5)。达成 bayan "分析先行→出假设" 的 gate。
-- **下一帧(proxy 烧小卡)= 独立 frame**,前置:①核 cw 容器 vLLM 版本(assert vs toggle);
-  ②复用 kernel_rollout `docs/runs/` sbatch 先例搭最小 colocated harness;③按 §4 A0→A1 跑。
-  因涉 GPU burn(即便小)+ 可能推翻父任务 Branch A 方向 ⇒ **标"待 moe 门 / 待 bayan 裁
-  proxy 预算与方向冲突"**,不擅自烧卡、不擅自 revert 已批准的 expandable_segments 方向。
-- **收口**:proxy 定案 → 修 → 同载具验证斜率归零 → 回 32/128 收口(守 gmu 0.7)。
+**本帧交付(零-GPU,全部 commit 进交付仓):**
+- 本分析文档(§1–5):机制грунт + AC#1 已有数据差分 + 可证伪假设 + proxy 判别设计/树。
+- **便宜实验载具已实现**(AC#3 的下一帧变成纯执行,不用现搭):
+  `examples/verl/cumem_cycle_probe/` —
+  - `cumem_cycle_probe.py`:vLLM-only sleep/wake ×N,per-cycle awake/asleep/woke 三相采
+    nvidia-smi 设备驻留 + torch memory_stats(reserved/allocated/碎片/segments)。stdlib+vLLM,
+    `--help` 无需 CUDA(py_compile/help 已过)。
+  - `run_cumem_cycle_probe.sbatch`:复用 kernel_rollout 已验证 vllm023 容器配方,**单卡**
+    背靠背跑 **A0(expandable:True)/A1(:False)** 决定性对照,gmu 固定 0.7,预算 <1 GPU-h。
+  - `README.md`:判别读法(A0 爬升+A1 平 ⇒ H1;均值平+碎片涨 ⇒ F1;asleep 爬 ⇒ H2)。
+- **层级化便宜实验计划**(便宜先行,按需升级):Exp-1 idle sleep/wake A0/A1(最便宜、最决定
+  性)→ 若 A0 也平则 Exp-2 `--reload-weights`(近似 update_weights,仍 vLLM-only)→ 若仍平
+  则 Exp-3 全 colocated actor+vLLM proxy(需 verl/mfsdp,较重)。
+
+**下一帧(跑 Exp-1)= 独立 frame,两道前置闸(本 doer 不擅自越过):**
+1. **预算解冻**:bayan 05:41 "预算冻结到 Branch C 出假设";假设已出(本帧)⇒ 解冻**前置条件
+   已满足**,但实际烧卡(即便 <1 GPU-h)需 operator/bayan 点火,且是新 frame。
+2. **方向冲突裁决(moe 门)**:本文核心发现——**父任务 Branch A 全局 expandable_segments:True
+   很可能是因而非解**——与已 bayan 批准的 "primary lever" 方向冲突。若 A0/A1 证实,收口 run
+   需**不设全局 expandable_segments**,这是对已批准决策的推翻,属 human/moe 裁量,**本 doer
+   不擅自 revert 已批准代码/harness 方向**。
+3. **点火前必填**:cw/oci 容器 vLLM 版本 + commit(assert vs toggle,决定机制读法);小 proxy
+   模型落 lustre(`$MODEL/config.json`)。
+
+**收口**:Exp 定案 → 修法方向(§5 判别树,守 gmu 0.7 铁律、零 backend 分支)→ 同载具验证
+斜率归零 → 回 32/128 收口。
