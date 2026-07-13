@@ -38,12 +38,16 @@ SLEEP_LEVEL=${SLEEP_LEVEL:-1}
 GMU=${GMU:-0.7}
 RELOAD_WEIGHTS=${RELOAD_WEIGHTS:-0}   # set 1 for the escalation arm
 EVID=$ROOT/kernel-rollout/branchc-cumem/evidence
-# This worktree's probe script, mounted read-only into the container.
-PROBE=${PROBE:-$(cd "$(dirname "$0")" && pwd)/cumem_cycle_probe.py}
+# Per-run cache root on lustre (container root FS is too small for CUDA-graph compile).
+CACHE=${CACHE:-$ROOT/kernel-rollout/branchc-cumem/cache/${SLURM_JOB_ID:-manual}}
+# Probe script sits next to this sbatch in the submit dir. In a batch job $0 is
+# Slurm's spool copy, so derive from SLURM_SUBMIT_DIR (we submit from the stage dir).
+PROBE=${PROBE:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}/cumem_cycle_probe.py}
 
-test -r "$IMAGE"
-test -f "$MODEL/config.json"
-test -f "$PROBE"
+echo "IMAGE=$IMAGE"; echo "MODEL=$MODEL"; echo "PROBE=$PROBE"; echo "CACHE=$CACHE"
+test -r "$IMAGE"            || { echo "FATAL: image not readable: $IMAGE" >&2; exit 2; }
+test -f "$MODEL/config.json" || { echo "FATAL: model config missing: $MODEL" >&2; exit 2; }
+test -f "$PROBE"           || { echo "FATAL: probe script missing: $PROBE" >&2; exit 2; }
 mkdir -p "$EVID"
 
 RELOAD_FLAG=""
@@ -60,6 +64,15 @@ for ARM_CONF in "A0:expandable_segments:True" "A1:expandable_segments:False"; do
       set -euo pipefail
       export PYTHONNOUSERSITE=1
       export PYTORCH_CUDA_ALLOC_CONF='$CONF'
+      # The container root FS is tiny; CUDA-graph torch.compile writes to
+      # ~/.cache and blows up with ENOSPC. Redirect HOME + all caches onto
+      # lustre (same fix family as DS4 flashinfer ENOSPC). CUDA graphs stay ON.
+      export HOME='$CACHE/home'
+      export XDG_CACHE_HOME='$CACHE/xdg'
+      export VLLM_CACHE_ROOT='$CACHE/vllm'
+      export TORCHINDUCTOR_CACHE_DIR='$CACHE/inductor'
+      export TRITON_CACHE_DIR='$CACHE/triton'
+      mkdir -p \"\$HOME\" \"\$XDG_CACHE_HOME\" \"\$VLLM_CACHE_ROOT\" \"\$TORCHINDUCTOR_CACHE_DIR\" \"\$TRITON_CACHE_DIR\"
       # vLLM 0.23 is an editable install rooted at /vllm inside this container;
       # run from a neutral cwd so the /vllm source is not namespace-shadowed.
       cd /tmp
