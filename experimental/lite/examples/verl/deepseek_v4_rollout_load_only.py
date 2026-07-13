@@ -193,10 +193,24 @@ def main() -> None:
     o_groups = config.get("o_groups")
     if not isinstance(o_groups, int) or o_groups < 1:
         raise RuntimeError(f"DeepSeek V4 config has invalid o_groups={o_groups!r}")
-    if rollout_tp < 1 or o_groups % rollout_tp != 0:
-        raise RuntimeError(
-            f"DeepSeek V4 o_groups={o_groups} must be divisible by "
-            f"positive rollout_tp={rollout_tp}"
+    # The o_groups/rollout_tp guard is our own preflight, not a vLLM constraint.
+    # Set DS4_ALLOW_TP_OVERSPLIT=1 to bypass it and let vLLM itself decide whether
+    # a tp>o_groups sharding is loadable (e.g. probing rollout_tp=16 against
+    # o_groups=8). Default keeps the guard fail-fast.
+    allow_oversplit = os.environ.get("DS4_ALLOW_TP_OVERSPLIT", "0") == "1"
+    if rollout_tp < 1:
+        raise RuntimeError(f"positive rollout_tp required, got {rollout_tp}")
+    if o_groups % rollout_tp != 0:
+        if not allow_oversplit:
+            raise RuntimeError(
+                f"DeepSeek V4 o_groups={o_groups} must be divisible by "
+                f"positive rollout_tp={rollout_tp}"
+            )
+        print(
+            "DS4_VLLM_LOAD_ONLY_OVERSPLIT_PROBE "
+            f"o_groups={o_groups} rollout_tp={rollout_tp} "
+            "(guard bypassed via DS4_ALLOW_TP_OVERSPLIT=1; letting vLLM decide)",
+            flush=True,
         )
 
     import time
