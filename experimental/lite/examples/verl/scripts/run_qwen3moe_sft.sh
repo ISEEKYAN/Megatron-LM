@@ -79,14 +79,12 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 # - fsdp2: Megatron Lite FSDP2 wrapper + optimizer.
 MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-dist_opt}"
 
-LR="${LR:-1e-5}"
-MIN_LR="${MIN_LR:-${LR}}"
-WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
-BETAS="${BETAS:-[0.9,0.95]}"
-CLIP_GRAD="${CLIP_GRAD:-1.0}"
-LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
-LR_DECAY_STYLE="${LR_DECAY_STYLE:-constant}"
-
+# Optimizer hyperparameters (lr / min_lr / betas / weight_decay / clip_grad /
+# warmup / decay style) are NOT set here. They live in the verl_mlite config
+# (optim/mlite_sft.yaml, which extends optim@megatron) so the resolved config has
+# a single source of truth; override explicitly via the trailing EXTRA_ARGS
+# passthrough when needed. betas now inherits the verl upstream default
+# [0.9, 0.999] instead of a launcher-baked [0.9, 0.95].
 PARAM_OFFLOAD="${PARAM_OFFLOAD:-False}"
 OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-True}"
 GRAD_OFFLOAD="${GRAD_OFFLOAD:-False}"
@@ -129,8 +127,9 @@ CKPT_DIR="${CKPT_DIR:-${OUTPUT_ROOT}/checkpoints/${RUN_NAME}}"
 LOG_FILE="${LOG_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.log}"
 JSONL_FILE="${JSONL_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.jsonl}"
 CMD_FILE="${CMD_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.cmd.sh}"
+RESOLVED_CONFIG_FILE="${RESOLVED_CONFIG_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.resolved.yaml}"
 
-mkdir -p "${OUTPUT_ROOT}" "${CKPT_DIR}" "$(dirname "${LOG_FILE}")" "$(dirname "${JSONL_FILE}")" "$(dirname "${CMD_FILE}")"
+mkdir -p "${OUTPUT_ROOT}" "${CKPT_DIR}" "$(dirname "${LOG_FILE}")" "$(dirname "${JSONL_FILE}")" "$(dirname "${CMD_FILE}")" "$(dirname "${RESOLVED_CONFIG_FILE}")"
 export VERL_FILE_LOGGER_PATH="${JSONL_FILE}"
 
 CACHE_ROOT="${VERL_MLITE_CACHE_ROOT:-${TMPDIR:-/tmp}/verl_mlite}"
@@ -154,15 +153,7 @@ COMMON_ARGS=(
   "model=hf_model"
   "model.path=${MODEL_PATH}"
   "model.trust_remote_code=${TRUST_REMOTE_CODE}"
-  "optim=megatron"
-  "optim.lr=${LR}"
-  "optim.min_lr=${MIN_LR}"
-  "optim.weight_decay=${WEIGHT_DECAY}"
-  "optim.betas=${BETAS}"
-  "optim.clip_grad=${CLIP_GRAD}"
-  "optim.lr_warmup_steps=${LR_WARMUP_STEPS}"
-  "optim.lr_warmup_init=0"
-  "optim.lr_decay_style=${LR_DECAY_STYLE}"
+  "optim=mlite_sft"
   "trainer.logger=[console,file]"
   "trainer.project_name=${PROJECT_NAME}"
   "trainer.experiment_name=${RUN_NAME}"
@@ -234,6 +225,23 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   printf '%q ' "${COMMAND[@]}"
   printf '\n'
   exit 0
+fi
+
+# Dump the Hydra-resolved config to the output dir as run-alignment evidence.
+# Uses a single-process (no torchrun) `--cfg job --resolve` compose, which is
+# CPU-cheap and never launches training. Kept non-fatal so a resolver hiccup
+# never blocks the real run.
+if [[ "${DUMP_RESOLVED_CONFIG:-1}" == "1" ]]; then
+  RESOLVE_COMMAND=(
+    python3 -m verl_mlite.launch verl.trainer.sft_trainer
+    "${COMMON_ARGS[@]}"
+    "${BACKEND_ARGS[@]}"
+    "${EXTRA_ARGS[@]}"
+    --cfg job --resolve
+  )
+  "${RESOLVE_COMMAND[@]}" > "${RESOLVED_CONFIG_FILE}" 2>/dev/null \
+    && echo "[${BACKEND}] resolved_config=${RESOLVED_CONFIG_FILE}" \
+    || echo "[${BACKEND}] resolved_config dump skipped (hydra --cfg failed)" >&2
 fi
 
 echo "[${BACKEND}] output_root=${OUTPUT_ROOT}"

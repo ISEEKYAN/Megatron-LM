@@ -1,0 +1,17 @@
+# Megatron optimizer config for the Qwen3-MoE SFT example (run_qwen3moe_sft.sh).
+# Extends verl's upstream `optim/megatron` and carries the SFT example's training
+# hyperparameters, which used to be baked into the launcher shell as CLI
+# overrides. Moving them here gives the resolved config a single source of truth;
+# the launcher only handles environment/orchestration. Values reproduce the
+# example's prior behaviour EXCEPT betas: it is intentionally left unset so it
+# inherits the upstream default [0.9, 0.999] (the launcher previously smuggled
+# [0.9, 0.95]). clip_grad / lr_decay_style / lr_warmup_init already match
+# upstream and are inherited unchanged.
+defaults:
+  - megatron
+  - _self_
+
+lr: 1e-5
+min_lr: 1e-5
+weight_decay: 0.1
+lr_warmup_steps: 0
