@@ -50,7 +50,9 @@ run() {  # <mlite_src> -- <cmd...>
       export PATH=/usr/local/bin:/usr/bin:/bin; hash -r
       unset CONDA_DEFAULT_ENV CONDA_PREFIX PYTHONHOME VIRTUAL_ENV ROCR_VISIBLE_DEVICES || true
       export PYTHONNOUSERSITE=1
-      export PYTHONPATH='${src}/experimental/lite':\${PYTHONPATH:-}
+      # Optional CSA-CP MCore prefix (only the DS4 arm sets MROOT; qwen's env is
+      # left identical across the A/B legs so the timing comparison stays clean).
+      export PYTHONPATH='${MROOT:-}':'${src}/experimental/lite':\${PYTHONPATH:-}
       export TMPDIR=/tmp/ppab-\${SLURM_JOB_ID}
       export TORCHINDUCTOR_CACHE_DIR=\${TMPDIR}/ti TRITON_CACHE_DIR=\${TMPDIR}/triton
       export CUDA_DEVICE_MAX_CONNECTIONS=1 NCCL_NVLS_ENABLE=0
@@ -62,7 +64,9 @@ run() {  # <mlite_src> -- <cmd...>
 # GPU arms fire first (炮响优先); each is non-fatal so one failure never starves
 # the others — the final verdict reads whatever JSON landed.
 echo "==== arm 1: DS4 pp2 export streaming peak (NEW) ===="
-run "${MLITE_NEW}" -- \
+# DS4's merged CSA path imports megatron.core.transformer.experimental_attention_variant,
+# absent from the container's baked MCore — prepend a CSA-CP MCore checkout if provided.
+MROOT="${MEGATRON_CSA:-}" run "${MLITE_NEW}" -- \
   "torchrun --standalone --nproc_per_node=8 -m examples.verl.pp_export_sensitize \
      --model deepseek_v4 --tag new --out '${OUTPUT_DIR}/ds4_new.json'" || echo "ARM1 rc=$?"
 

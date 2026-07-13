@@ -210,16 +210,39 @@ def main() -> None:
         tp=parallel.tp, ep=parallel.ep, etp=parallel.etp, pp=parallel.pp, cp=parallel.cp
     )
 
-    dist.barrier()
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    t0 = time.perf_counter()
-    weights = dict(
-        protocol.export_hf_weights(chunks, cfg, ps, rank0_only=True, cpu=True)
-    )
-    torch.cuda.synchronize()
-    wall = time.perf_counter() - t0
-    peak_mib = torch.cuda.max_memory_allocated() / (1024 * 1024)
+    def _one_export() -> tuple[dict, float, float]:
+        dist.barrier()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        t0 = time.perf_counter()
+        w = dict(
+            protocol.export_hf_weights(chunks, cfg, ps, rank0_only=True, cpu=True)
+        )
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        return w, dt, torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+    # Warm up (discard first passes: NCCL/CUDA context + collective warmup would
+    # otherwise dominate a tiny-model wall and drown the mechanism's real cost),
+    # then take the median of several timed reps so a single cold-jitter sample
+    # cannot found a spurious speed verdict.
+    n_warmup = int(os.environ.get("MLITE_EXPORT_WARMUP", "2"))
+    n_reps = int(os.environ.get("MLITE_EXPORT_REPS", "7"))
+    for _ in range(n_warmup):
+        _one_export()
+    walls: list[float] = []
+    peaks: list[float] = []
+    weights: dict = {}
+    for _ in range(n_reps):
+        weights, dt, pk = _one_export()
+        walls.append(dt)
+        peaks.append(pk)
+    walls_sorted = sorted(walls)
+    wall = walls_sorted[len(walls_sorted) // 2]  # median
+    peak_mib = max(peaks)
+    result["wall_min_s"] = round(min(walls), 5)
+    result["wall_all_s"] = [round(x, 5) for x in walls]
+    result["reps"] = n_reps
 
     # PP-completeness: rank 0 must carry every decoder layer (all stages gathered).
     layers_ok = True
@@ -237,8 +260,8 @@ def main() -> None:
 
     fp, n = _fingerprint(weights) if rank == 0 else ("", 0)
     result.update(
-        wall_s=round(wall, 4),
-        peak_mib=round(peak_mib, 2),
+        wall_s=round(wall, 5),
+        peak_mib=round(peak_mib, 4),
         n_tensors=n,
         fingerprint=fp,
         layers_ok=layers_ok,
