@@ -1,197 +1,266 @@
-# DeepSeek-V4 CSA Context-Parallel: Faithful-Port Research
+# DeepSeek-V4 CSA Context-Parallel: Faithful-Port Research (v2)
 
-Status: research deliverable (回炉调研). Scope: characterize the current MLite
-DS4 CSA CP delivery, reconstruct Megatron's fused DS4 CP mechanism from primary
-source, and specify the faithful-port plan. **Does not** include GPU
-implementation/verification — see "Structural constraints" and "Open reconciliation".
+Status: research deliverable (回炉调研, second pass). **This version supersedes
+v1.** v1 read a *stale* vendored Megatron copy and concluded the cross-CP
+semantics were "invisible" (an unresolved A/B reading). That conclusion was
+wrong: the merged upstream now contains an explicit, fully-materialized,
+memory-bounded DS4 CSA CP path. bayan's directive ("你读的参考是过期的——最新
+NVIDIA Megatron dev 已 merge 了 DS4 CP") is confirmed by primary source; the A/B
+tension is **resolved**.
 
-References are line numbers on branch `dev-mlite-7-deepseek-v4`:
-- Megatron reference: `megatron/core/transformer/experimental_attention_variant/csa.py`
-  and `.../deepseek_v4_hybrid_attention.py`, `.../dsa_kernels.py`.
-- MLite port: `experimental/lite/megatron/lite/primitive/modules/attention/csa.py`
-  (CSA), `.../attention/dsa.py` (sibling DSA), `.../attention/cp.py` (CP helpers).
+Scope: (1) characterize the current MLite DS4 CSA CP delivery ("the hack"),
+(2) reconstruct the **merged** upstream fused DS4 CSA CP from primary source with
+fresh line numbers, (3) specify the faithful-port plan and its real scope.
+**Does not** include GPU implementation/verification — that is the downstream
+implementation task on `dev-mlite-7-deepseek-v4`.
+
+## References
+
+- **Upstream faithful reference**: `NVIDIA/Megatron-LM` branch `dev`, tip
+  `fd1121b8f` (fetched 2026-07-13; commit date 2026-07-09). Files under
+  `megatron/core/transformer/experimental_attention_variant/`:
+  `csa.py`, **`csa_cp_utils.py` (NEW)**, **`csa_cp_layout_kernels.py` (NEW)**,
+  `deepseek_v4_hybrid_attention.py`, `dsa.py`, `dsa_kernels.py`.
+  The two NEW modules are exactly the merged CP path that v1's stale reference
+  lacked; upstream also ships unit tests `test_csa_cp_utils.py`,
+  `test_csa_cp_layout_kernels.py`.
+- **MLite port (the hack)**: branch `dev-mlite-7-deepseek-v4`,
+  `experimental/lite/megatron/lite/primitive/modules/attention/csa.py` (CSA),
+  `.../attention/dsa.py` (sibling DSA — *not* on the DS4 path, see §6),
+  `.../attention/cp.py` (CP helpers).
 
 ---
 
 ## 1. What the current MLite CSA delivers (the "hack")
 
-`experimental/lite/.../attention/csa.py`, class forward dispatch (L284–341):
+`experimental/lite/.../attention/csa.py`, `forward` (L284):
 
-- `cp_size == 1` → fused sparse kernels:
-  - `_forward_fused_dsa_cp1` (L574) calls `dsa_kernels.fused_indexer_sparse_attn`
-    (training) / `indexer_topk` + `dsa_sparse_attn` (eval). This is a real fused
-    DS4 sparse path and is **correct and kept**.
-  - `_forward_fused_sparse_no_indexer_cp1` (L502) for the no-indexer case.
-- `cp_size > 1` → **dense masked-softmax fallback** (L342–484):
-  - `iter_cp_sources` (from `cp.py`) does `all_gather` of the **full dense KV**
-    across every CP rank (`_all_gather_cp`, `cp.py` L9),
-  - then builds `dense_scores` via `torch.einsum` + `masked_fill(-inf)` +
-    `torch.softmax` over the **entire gathered sequence** (L342–464).
+- `cp_size == 1` → real fused sparse path (`_forward_fused_dsa_cp1` L574 →
+  `dsa_kernels.fused_indexer_sparse_attn` / `indexer_topk` + `dsa_sparse_attn`).
+  **Correct and kept.**
+- `cp_size > 1` → **dense masked-softmax fallback** (L342–464):
+  - `iter_cp_sources` (`cp.py` L13) → `_all_gather_cp` (`cp.py` L9–10) does a
+    `torch.distributed.nn.functional.all_gather` of the **full dense KV** across
+    every CP rank,
+  - builds `dense_scores` via `torch.einsum` + `masked_fill(-inf)` + `torch.softmax`
+    over the **entire gathered sequence** (L342–464).
   - `_forward_fused_dsa_cp1` additionally **hard-raises**
     `NotImplementedError("DeepSeek V4 fused DSA path currently supports CP=1 only.")`
     (L586–587).
 
-Consequence (matches memory `ds4-csa-cp-dense-miscopy` and the 128-card resync
-OOM): under CP>1 the sparse structure is discarded and the path materializes an
-`O(S²/cp)` dense score matrix + a full-sequence KV all-gather, defeating the
-memory saving CP is supposed to buy. bayan's characterization ("丢了 fused DS4
-CP，换成 all-gather 全量 KV + dense fallback") is confirmed by primary source.
-
-MLite skills read: this violates **perf.fusion** ("fusion must not replace
-precision validation" — here fusion is entirely *dropped* for CP>1) and the
-**primitive.contract** `what_must_match_reference` invariant (the primitive no
-longer matches the Megatron sparse semantics it claims to port).
+**Consequence.** Under CP>1 the sparse structure is discarded: the path
+materializes an `(L_local × S_total)` = `O(S²/cp)` dense score matrix plus a
+full-sequence KV all-gather (`O(S)` rows/rank). This defeats the memory saving CP
+exists to buy and matches the 128-card resync OOM (memory
+`ds4-csa-cp-dense-miscopy`, `ds4-128card-resync-oom`).
 
 ---
 
-## 2. What Megatron's fused DS4 CP actually does (primary source)
+## 2. What the **merged** upstream fused DS4 CSA CP does (primary source)
 
-Reconstructed call chain for `DSv4HybridAttention.forward`
-(`deepseek_v4_hybrid_attention.py` L222):
+The merged path is a THD-packed (variable-length, `bsz=1`) context-parallel
+branch that is **memory-bounded** — it never all-gathers full dense KV and never
+builds a dense score matrix. Call chain:
 
-1. `get_query_key_value_tensors` (L511) → `qkv_up_proj_and_rope_apply` (L608):
-   produces `query`, `key`, `value` that are the **local CP-shard** tensors.
-   CP enters **only** through RoPE: `apply_rotary_pos_emb(..., cp_group=self.pg_collection.cp)`
-   (L631/652 fused, L685/703 unfused) — i.e. RoPE position indices are corrected
-   for the CP-sharded (zigzag) layout, nothing else.
-2. `core_attention(...)` = `CompressedSparseAttention.forward` (`csa.py` L905):
-   - `_build_kv_full` (L654) = `torch.cat([kv, compressed_kv])` on the **local**
-     `kv` — **no cross-CP gather** (L942, L667–677).
-   - dispatch (L964–975) to fused paths: `_forward_fused_indexer_training`
-     (`fused_indexer_sparse_attn`), `_forward_fused_indexer_inference`
-     (`indexer_topk` + `dsa_sparse_attn`), `_forward_fused_no_indexer`, or the
-     unfused `unfused_compressed_sparse_attn` (L779). **None** pass a `cp_group`
-     to the sparse kernels.
-3. Inverse RoPE after attention, again CP only via `cp_group` (L365/380).
+### 2a. Wrapper: `deepseek_v4_hybrid_attention.py::forward` (L222)
 
-**Verified by exhaustive grep**: there is **no `all_gather` / cross-CP KV gather
-anywhere** in `csa.py` or `deepseek_v4_hybrid_attention.py`, and **no `cp` /
-`all_gather` / `ring`** references in `dsa_kernels.py`. Megatron's "fused DS4 CP"
-= *the fused sparse kernels operating on the local shard, with CP applied purely
-at the RoPE-position level.* It never builds a dense score matrix and never
-gathers full dense KV.
+- Preconditions for CP>1 (L267–271): `qkv_format == 'thd'` **and** a
+  **contiguous** CP partition (`cp_partition_mode == "contiguous"`); otherwise
+  raises. (No zigzag layout on this path — contiguous row blocks per rank.)
+- Computes a **bounded left-boundary window** of hidden rows via
+  `cp_utils.exchange_cp_boundary_hidden(hidden_states, compress_ratio,
+  csa_window_size, cp_group)` (L276–281).
+- `get_query_key_value_tensors(..., boundary_hidden=...)` (L288) additionally
+  returns a projected **`boundary_kv`** (the boundary rows run through the KV
+  projection; L296–300, projection at L668–754).
+- Passes `boundary_hidden` + `boundary_kv` into `core_attention(...)`
+  (L314–325).
 
----
+### 2b. Boundary exchange: `csa_cp_utils.py`
 
-## 3. The primary-source tension the guide must reconcile
+- `_LeftBoundaryExchange(torch.autograd.Function)` (L123–187): a **P2P**
+  (`batch_isend_irecv`) exchange of only the fixed left-boundary window from the
+  previous rank, with a matching gradient scatter in `backward`.
+- `exchange_cp_boundary_hidden` (L190–201): window size
+  `d_window = max(csa_window_size, d_comp)` where `d_comp = 8 if ratio==4 else
+  ratio` (L197–198). **Bounded** — independent of sequence length.
 
-The guide's premise is "faithfully copy Megatron's already-implemented fused DS4
-CP." But the primary source shows Megatron's fused path, under CP>1:
+### 2c. Core CP branch: `csa.py::_forward_thd_cp` (L2279–2557)
 
-- applies CP **only** to RoPE positions, and
-- runs the sparse kernel on **local** `kv_full` with **no cross-CP KV exchange**.
+Dispatched from `forward` (L1836–1844: `thd` + `cp.size() > 1` → `_forward_thd_cp`,
+else `_forward_thd`).
 
-For standard causal attention with sequence-sharded CP, a query on rank *r* must
-attend to compressed/window KV that lives on *other* ranks. Megatron's visible
-code performs no such cross-rank KV movement in this attention module and no CP
-comm inside `dsa_kernels`. Two readings are possible and the code alone cannot
-decide between them:
+1. `global_start = cp_rank * l_local`; `kv_local` is this rank's local KV
+   (`L/cp` rows) (L2310–2311); `boundary_kv` squeezed (L2317); `d_window` from
+   boundary (L2318).
+2. Build fixed-capacity compressor input from local + boundary hidden via
+   `cp_utils.prepare_cp_compressor_input(x, boundary_hidden, ...)` (L2349–2359),
+   which calls the Triton `CompressorInputCompact` kernel
+   (`csa_cp_layout_kernels.py` L648) and returns `seq_to_rank_row` (the
+   sequence-major↔rank-major compressed-row map).
+3. Indexer path (L2361–2433): compress the indexer K locally, **all-gather the
+   *compressed* indexer K rank-major** (`gather_from_sequence_parallel_region`,
+   L2410–2412) — gather is in **compressed space** (`S/ratio`), reindex to
+   sequence-major via `seq_to_rank_row`, then `cp_utils.compute_cp_indexer_topk`
+   (L2421–2433) produces local-Q/full-(compressed-)K top-k.
+4. Attention compressed KV (L2436–2445): compress KV locally, **all-gather
+   compressed KV rank-major** — again compressed space (`S/ratio`).
+5. **`kv_full_thd = torch.cat((boundary_kv, kv_local, compressed_kv_rank_major),
+   dim=0)`** (L2450). The three sources are: boundary window (`d_window`, bounded)
+   + local KV (`S/cp`) + full **compressed** KV (`S/ratio`). **No full dense KV.**
+6. `csa_cp_layout_kernels.build_attention_indices` (L751; called L2462–2476)
+   lowers logical top-k ids into physical rows of `kv_full_thd`.
+7. Sparse attention on the top-k indices: `dsa_sparse_attn` (fused, L2544) or
+   `unfused_compressed_sparse_attn` (L2554). Indexer-loss training variant at
+   L2477–2540.
 
-- **(A) Cross-CP KV movement lives below the visible layer** — e.g. inside the
-  compiled `dsa_kernels` (ring/all-gather not expressed in Python), or Megatron's
-  CP framework feeds this attention a non-sequence-sharded input. If so, a
-  faithful MLite port needs that same kernel-level capability, which the MLite
-  `dsa_kernels` (`experimental/lite/.../primitive/kernels/dsa_kernels.py`) must be
-  confirmed to have. This is the load-bearing unknown.
-- **(B) Megatron's fused DS4 path is not yet a correct cross-CP sparse attention**
-  (RoPE-CP threading is defensive; true CP>1 sparse correctness is unproven in
-  this file). If so, "faithfully copying" it yields a path that is *fused* but not
-  *correct* for CP>1 — and MLite's dense-reconstruct fallback is in fact the
-  house **correctness-first** convention (see §4), not a botched copy.
+### 2d. Memory bound (the whole point)
 
-This tension is exactly why the task is 回炉调研: it must not be forced through
-by writing kernel CP code that cannot be verified here (§5).
-
----
-
-## 4. MLite house convention: the sibling DSA path does the *same* dense fallback
-
-Important context for the "hack" label. The sibling `DynamicSparseAttention`
-(`dsa.py` L323, docstring "Correctness-first DSA attention path") handles CP>1 by
-the **identical** strategy the CSA path is being faulted for:
-
-- `_gather_cp_inputs` → `_forward_dense_full` → `zigzag_slice_for_cp` (L432–470),
-- i.e. all-gather the full inputs across CP, compute the **dense** full attention,
-  then slice the local shard back out.
-
-So MLite's established, reviewed convention for CP>1 sparse attention is
-gather-full + dense-reconstruct. This aligns with knowledge `K-0141`
-("若对齐路径实际走 dense 重建而非 fused 稀疏路径，结论只能声明 dense-vs-dense")
-and `K-0002` (route DSA through the shared primitive + core fused path). The CSA
-CP>1 fallback is therefore not an isolated mistake by one author — it is the
-same correctness-first pattern the whole MLite sparse-attention family uses.
-bayan's ruling changes that policy **for the DS4/CSA path specifically**; the
-faithful port must replace the convention, and by symmetry the sibling DSA path
-faces the same question.
+Per-rank KV working set on the merged path:
+`d_window + S/cp + S/ratio` rows, and attention is sparse over top-k
+(`O(L_local · topk)`), **not** `O(S²/cp)`. With `ratio=4`, `d_window≈window`,
+this is dramatically below the hack's dense matrix. This is the memory-factor
+saving the AC demands, and it is achievable by construction — unlike the hack.
 
 ---
 
-## 5. Structural constraints (why this is a report, not a verified fix)
+## 3. A/B tension: RESOLVED
 
-1. **Code not in this worktree.** This task's branch
-   `feature/megatron-fused-ds4-cp-mlite-hack` contains only the old
-   "Keep only experimental lite" snapshot: **no** `deepseek_v4/`, **no** CSA
-   port, **no** Megatron reference. All DS4 code lives on `dev-mlite-7-deepseek-v4`
-   (the branch the cancelled sibling TASK-1.2.12.1 named as the landing target).
-   A faithful *code* port cannot be authored/committed meaningfully here.
-2. **Verification needs GPU + Slurm on the real branch.** The AC ("CP1 vs CP4
-   memory curve真降 + Megatron parity") requires multi-GPU Slurm runs
-   (task profile GPU rule) on `dev-mlite-7-deepseek-v4`. Not reproducible in this
-   worktree.
-3. **Load-bearing unknown (§3).** The faithful-port shape depends on whether MLite
-   `dsa_kernels` can do cross-CP sparse attention the way Megatron relies on — an
-   unresolved fact that determines feasibility.
+v1 could not decide between (A) "cross-CP semantics hidden below the visible
+layer / in compiled kernels" and (B) "fused CP is RoPE-only, CP>1 sparse
+correctness unproven." Both are now settled by the merged source:
 
----
-
-## 6. Faithful-port plan (conditional on §3 reconciliation)
-
-Assuming reading (A) — Megatron's kernels/layout carry cross-CP semantics and the
-MLite kernels can match:
-
-1. **Delete the dense fallback**: remove `csa.py` L342–484 (dense masked-softmax)
-   and the `iter_cp_sources` full-KV gather usage; drop `_gather_cp_sources`.
-2. **Make the fused path CP-aware exactly like Megatron**: unify the `cp_size==1`
-   and `cp_size>1` cases into one fused dispatch. Thread `cp_group`/`cp_rank`/
-   `cp_size` through RoPE only (mirror `_apply_rope(..., cp_group=...)` and the
-   `apply_rotary_pos_emb(cp_group=...)` calls in the Megatron reference); keep
-   `kv_full` local; call `fused_indexer_sparse_attn` / `indexer_topk` +
-   `dsa_sparse_attn` unchanged, **provided** those MLite kernels supply the same
-   cross-CP behavior Megatron's do.
-3. **Remove the `NotImplementedError` CP-1-only guard** (L586–587) once (2) holds.
-4. **primitive.contract compliance**: document `process_groups_or_device_placement`
-   (which tensors stay sharded, where cp_group enters), `what_must_match_reference`
-   (bitwise/near-bitwise vs Megatron fused), `forward_backward_update_details`
-   (indexer loss + backward under CP), and `failure_modes`.
-
-If reading (B) holds, the faithful port is **not** yet definable — escalate to
-re-scope (either fix Megatron's fused CP first, or keep correctness-first dense
-reconstruct as the sanctioned interim and only tighten the numerical claim).
+- **Reading A is essentially correct, but the mechanism is explicit, not hidden.**
+  Cross-CP KV movement is real and lives in plain Python: a bounded P2P
+  boundary exchange (`_LeftBoundaryExchange`) + **compressed-space** rank-major
+  all-gathers (`gather_from_sequence_parallel_region` on `S/ratio` rows) +
+  fixed-capacity layout kernels (`csa_cp_layout_kernels.py`). It is *not* buried
+  in `dsa_kernels`, and it is *not* a full dense all-gather.
+- **Reading B is refuted.** CP>1 sparse correctness is not "unproven RoPE
+  threading" — it is a first-class, unit-tested path (`test_csa_cp_utils.py`,
+  `test_csa_cp_layout_kernels.py`). The load-bearing unknown v1 flagged ("do the
+  MLite `dsa_kernels` carry cross-CP capability?") **dissolves**: upstream does
+  the cross-CP work *outside* the sparse kernel, in the new utils/layout modules;
+  the sparse kernel itself stays local and unchanged. So the port does not depend
+  on any hidden kernel capability — it depends on porting the utils/layout code.
 
 ---
 
-## 7. Verification plan (for the implementation task on `dev-mlite-7-deepseek-v4`)
+## 4. Faithful-port plan (and its **real** scope)
 
-Per `K-0141`, `K-0053`, and the GPU双闸 rules:
+The faithful port is **not** the "~30-line dispatch unification" v1 floated. It
+is a port of the three merged upstream pieces plus wrapper wiring, and a deletion
+of the dense fallback:
+
+1. **Port `csa_cp_utils.py`** (≈399 lines): `_thd_cp_position_ids` + fused/unfused
+   THD-CP RoPE wrappers (L25–115), `_LeftBoundaryExchange` +
+   `exchange_cp_boundary_hidden` (L123–201), `prepare_cp_compressor_input`
+   (L209–273), `_build_cp_indexer_layout` + `compute_cp_indexer_topk` (L276–399).
+2. **Port `csa_cp_layout_kernels.py`** (≈840 lines, Triton + autograd):
+   `CompressorInputCompact` (L648) and `build_attention_indices` (L751) with their
+   fwd/bwd Triton launchers. Must reconcile with MLite's own `dsa_kernels`/kernel
+   conventions.
+3. **Port `_forward_thd_cp`** into MLite `csa.py` (≈280 lines, L2279–2557) and
+   wire `forward` to dispatch `thd + cp_size>1 → _forward_thd_cp` (mirror upstream
+   L1836–1844).
+4. **Wire the wrapper**: MLite's DS4 attention wrapper must compute
+   `boundary_hidden` (call `exchange_cp_boundary_hidden`), produce `boundary_kv`
+   in the KV projection, and thread both into `core_attention` — mirror
+   `deepseek_v4_hybrid_attention.py` L267–325 (incl. the `qkv_format=='thd'` +
+   contiguous-partition preconditions).
+5. **Delete the hack**: remove MLite `csa.py` dense fallback L342–464 and the
+   `iter_cp_sources` full-KV gather usage; remove the `NotImplementedError`
+   CP-1-only guard (L586–587). Decide whether `cp.py::iter_cp_sources` /
+   `_all_gather_cp` become dead code (they may still serve the sibling DSA — §6).
+6. **primitive.contract compliance** (MLite skills): document
+   `process_groups_or_device_placement` (boundary P2P + compressed-space
+   rank-major gather; what stays sharded), `what_must_match_reference`
+   (near-bitwise vs upstream fused `_forward_thd_cp`), `forward_backward_update_details`
+   (indexer loss + `_LeftBoundaryExchange.backward` grad scatter under CP), and
+   `failure_modes` (non-contiguous partition, `bsz>1`, `local_rows < d_window`).
+
+**Scope callout for bayan**: this is ~1200+ lines of ported kernel/layout/CP
+code + wrapper rewrite, not a dispatch tweak. It is a genuine port, and the
+Triton layout kernels (`csa_cp_layout_kernels.py`) are the hardest part to get
+bit-faithful. Sizing the implementation task accordingly is recommended.
+
+---
+
+## 5. THD-CP preconditions the port must carry (parity contract)
+
+Upstream restricts the CP path; a faithful port must enforce the same, else it
+silently diverges:
+
+- `qkv_format == 'thd'` required for CP>1 (else raise) — wrapper L267–268.
+- **contiguous** CP partition (not zigzag) — wrapper L270–271.
+- `bsz == 1` on the indexer path — `_forward_thd_cp` L2364–2367.
+- `local_rows >= d_window` — `_LeftBoundaryExchange.forward` L134–138.
+
+---
+
+## 6. Sibling DSA: upstream unifies by CSA-ownership, so DSA is **not** in scope
+
+bayan asked whether the sibling DSA path changes in lockstep, "上游怎么统一我们
+怎么统一." Primary source answer:
+
+- **Upstream `dsa.py` has no boundary-exchange THD-CP path.** It carries no
+  `_forward_thd_cp`, no `exchange_cp_boundary`, no rank-major KV all-gather; its
+  only CP touch is RoPE `cp_group` + the indexer-loss `pg_collection`. All DS4 CP
+  machinery lives in **`csa.py`** (CSA embeds the indexer). Upstream `dsa.py` is a
+  separate GPT-DSA variant (cf. `test_dsa_gpt_mamba_equivalence.py`).
+- **MLite DS4 uses CSA, not DSA.** `deepseek_v4/lite/model.py` L42 imports
+  `CompressedSparseAttention` (csa.py); the sibling `dsa.py` (`_all_gather_cp`
+  L201, "Correctness-first" L320, `zigzag_slice_for_cp`) is **not on the DS4 hot
+  path**.
+
+**Conclusion**: the faithful DS4 CP fix is a CSA-only change. The sibling
+`dsa.py` dense reconstruct has no upstream faithful-port counterpart to copy and
+is not exercised by DS4 — it should be left as the correctness-first interim
+(addressed separately if/when a DSA-based model needs bounded CP), **not**
+force-changed by this task. This narrows v1's "by symmetry the sibling faces the
+same question" — symmetry does not apply, because upstream did not unify them.
+
+---
+
+## 7. Structural constraints (why this is a report, not a verified fix)
+
+1. **Code not in this worktree.** Branch
+   `feature/megatron-fused-ds4-cp-mlite-hack` holds only the old "Keep only
+   experimental lite" snapshot: no `deepseek_v4/`, no CSA port. All DS4 code +
+   the port target live on `dev-mlite-7-deepseek-v4`. A faithful *code* port must
+   be authored/committed there.
+2. **Verification needs GPU + Slurm.** The AC (CP1 vs CP4 memory curve真降 +
+   upstream parity) requires multi-GPU Slurm on `dev-mlite-7-deepseek-v4` (task
+   profile GPU rule). Not reproducible here.
+
+---
+
+## 8. Verification plan (for the implementation task on `dev-mlite-7-deepseek-v4`)
 
 1. **Memory-factor AC**: CP1 vs CP4 activation-memory curve on ≥8 GPU (or
-   physically-justified proxy), showing real per-rank reduction by ~CP factor —
-   the dense fallback cannot pass this by construction.
-2. **Parity AC**: fused CP4 vs Megatron fused CP4 on the same config; if the
-   comparison path is dense reconstruct, the result may only be claimed as
-   *dense-vs-dense* bitwise, **not** as fused-precision proof (`K-0141`).
-3. **Non-determinism**: run-to-run accept-with-proof + fused-vs-unfused on the
-   deterministic path for the certifiable portion (`K-0053`).
+   physically-justified proxy). The merged path predicts per-rank KV
+   `≈ d_window + S/cp + S/ratio`; the hack cannot pass this by construction. Show
+   the CP-factor reduction.
+2. **Parity AC**: MLite `_forward_thd_cp` (CP4) vs upstream Megatron fused
+   `_forward_thd_cp` (CP4) on the same config — this is now a **fused-vs-fused**
+   comparison (v1's "dense-vs-dense only" caveat no longer binds), targeting
+   near-bitwise. Also fused-vs-unfused within MLite (`dsa_sparse_attn` vs
+   `unfused_compressed_sparse_attn`).
+3. **Boundary/backward correctness**: verify `_LeftBoundaryExchange.backward`
+   grad scatter and indexer-loss reduction (`reduce_group=cp_group`) under CP.
 4. **Gate discipline**: CONFIG_ONLY init-chain gate + 8-card proxy before any
-   large job; py-spy within 5 min of RUNNING (GPU铁律).
+   large job; py-spy within 5 min of RUNNING (GPU铁律); two review.moe gates
+   (pre-GPU + pre-Done).
 
 ---
 
-## 8. Recommendation
+## 9. Recommendation
 
-Deliver this research + reconcile §3 with bayan before opening an implementation
-task on `dev-mlite-7-deepseek-v4`. The single blocking question: **does Megatron's
-fused DS4 CP achieve cross-CP sparse correctness inside `dsa_kernels`/CP-layout
-(reading A), and do the MLite `dsa_kernels` provide the same — or is the fused CP
-RoPE-only and cross-CP correctness still open (reading B)?** The answer sets
-whether the faithful port is a ~30-line dispatch unification (A) or a re-scope (B).
+The A/B blocker is gone. Open an implementation task on
+`dev-mlite-7-deepseek-v4` to **port** upstream `csa_cp_utils.py` +
+`csa_cp_layout_kernels.py` + `_forward_thd_cp` + wrapper boundary wiring, and
+**delete** the MLite dense fallback. Size it as a ~1200-line port (Triton layout
+kernels are the critical-path risk), CSA-only (sibling DSA out of scope), verified
+by the §8 plan under Slurm. This is a faithful port of a real, merged, bounded CP
+implementation — no streaming-softmax/unfused-gather substitute, exactly as the
+guide requires.
