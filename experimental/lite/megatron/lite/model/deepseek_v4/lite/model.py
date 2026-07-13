@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -100,10 +101,19 @@ class DeepseekV4CSAAttention(nn.Module):
         self.ps = ps
         self.self_attn = CompressedSparseAttention(config, layer_idx=layer_idx, ps=ps)
 
-    def forward(self, x: torch.Tensor, *, position_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, *, position_ids: torch.Tensor, packed_seq_params: Any = None
+    ) -> torch.Tensor:
         # Skeleton feeds SBHD [S, B, H]; CSA needs batch-first [B, S, H].
+        # packed_seq_params (cu_seqlens etc.) passes through unchanged: the THD
+        # token axis lives in S, so the [S, B] <-> [B, S] transpose leaves it alone.
         x_bsh = x.transpose(0, 1).contiguous()
-        out_bsh = self.self_attn(x_bsh, position_ids=position_ids, attention_mask=None)
+        out_bsh = self.self_attn(
+            x_bsh,
+            position_ids=position_ids,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
+        )
         # Back to SBHD [S, B, H] for the skeleton.
         return out_bsh.transpose(0, 1).contiguous()
 
@@ -151,13 +161,18 @@ class DeepseekV4Layer(nn.Module):
         *,
         position_ids: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        packed_seq_params: Any = None,
     ) -> torch.Tensor:
         # x is SBHD mHC [S, B, hc_mult, H].  HyperConnection collapses the
         # streams to a 3-D [S, B, H] pre-mix, the sub-block runs SBHD, and
         # HyperConnection.post recombines into the 4-D residual streams.
         residual = x
         attn_in, post, comb = self.attn_hc(x)
-        attn_out = self.self_attn(self.input_layernorm(attn_in), position_ids=position_ids)
+        attn_out = self.self_attn(
+            self.input_layernorm(attn_in),
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+        )
         x = HyperConnection.post(attn_out, residual, post, comb)
 
         residual = x
@@ -403,6 +418,7 @@ class DeepseekV4Model(nn.Module):
         use_fused_kernels: bool = False,
         calculate_entropy: bool = False,
         enable_mtp: bool = True,
+        packed_seq_params: Any = None,
     ) -> dict:
         # THD-packed inputs may arrive 1-D ([total_tokens]); VocabParallelEmbedding
         # and the dense skeleton expect [B, S], so add the batch row (matches the
@@ -433,7 +449,12 @@ class DeepseekV4Model(nn.Module):
         )
         with fp8_ctx:
             for layer in self.layers.values():
-                h = layer(h, position_ids=position_ids, input_ids=input_ids)
+                h = layer(
+                    h,
+                    position_ids=position_ids,
+                    input_ids=input_ids,
+                    packed_seq_params=packed_seq_params,
+                )
 
         output: dict = {"hidden_states": fold_mhc_hidden_for_pipeline(h)}
         if self.lm_head is None or self.norm is None or self.hc_head is None:
