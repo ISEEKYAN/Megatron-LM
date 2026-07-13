@@ -514,11 +514,13 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
 def _pp2_stream_fixture(monkeypatch, *, rank=0, pp_rank=0, cpu=False, rank0_only=False):
     """Fake pp_size=2 streaming export scaffold.
 
-    The R path replaces the legacy `all_gather_object(full_dict)` with a
-    lightweight metadata `all_gather_object` + one-at-a-time `broadcast` per PP
-    stage. This fixture drives one rank of a pp2 world: the local stage owns
-    ``weight``; the remote stage owns ``weight2`` (value = local + 100). Returns
-    ``(recorded, remote_weight, local_weight, run)``.
+    The R path lazily gathers the own stage and streams the PP dimension in
+    bounded buckets: per stage it broadcasts one bucket's (name, shape, dtype)
+    header (``broadcast_object_list``, empty header = end-of-stage) then the
+    tensors one at a time (``broadcast``). This fixture drives one rank of a pp2
+    world: the local stage owns ``weight``; the remote stage owns ``weight2``
+    (value = local + 100). Returns ``(recorded, remote_weight, local_weight,
+    run)``.
     """
     local_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     remote_weight = local_weight + 100
@@ -562,21 +564,26 @@ def _pp2_stream_fixture(monkeypatch, *, rank=0, pp_rank=0, cpu=False, rank0_only
     )()
 
     recorded = {
-        "meta_group": None,
+        "obj_groups": [],
+        "obj_srcs": [],
         "bcast_groups": [],
         "bcast_srcs": [],
         "empty_shapes": [],
         "max_live_empty": 0,
     }
-    remote_meta = [("weight2", (2, 3), torch.float32)]
-
-    def fake_all_gather_object(all_meta, local_meta, group=None):
-        recorded["meta_group"] = group
-        all_meta[pp_rank] = local_meta
-        all_meta[1 - pp_rank] = remote_meta
-
-    remote_iter = iter([remote_weight])
     my_global = ps.pp_global_ranks[pp_rank]
+
+    # The remote stage streams one non-empty bucket [(weight2, ...)] then an
+    # empty header (end-of-stage). Consumed only during receiver turns.
+    remote_headers = iter([[("weight2", (2, 3), torch.float32)], []])
+    remote_iter = iter([remote_weight])
+
+    def fake_broadcast_object_list(object_list, src=None, group=None, device=None):
+        recorded["obj_groups"].append(group)
+        recorded["obj_srcs"].append(src)
+        if src != my_global:  # receiver: pull the remote stage's next header
+            object_list[0] = next(remote_headers)
+        # else: this rank is the source; object_list is already populated.
 
     def fake_broadcast(tensor, src=None, group=None):
         recorded["bcast_groups"].append(group)
@@ -595,7 +602,9 @@ def _pp2_stream_fixture(monkeypatch, *, rank=0, pp_rank=0, cpu=False, rank0_only
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: rank)
-    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(
+        torch.distributed, "broadcast_object_list", fake_broadcast_object_list
+    )
     monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
     monkeypatch.setattr(
         "megatron.lite.primitive.ckpt.hf_weights.torch.empty", spy_empty
@@ -616,9 +625,9 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
 
     exported = run()
 
-    # Metadata exchange and every tensor broadcast ride the NCCL pp_group — the
+    # Every header exchange and tensor broadcast rides the NCCL pp_group — the
     # gloo pp_cpu_group is never used (R does not offload to CPU).
-    assert recorded["meta_group"] == "nccl-pp"
+    assert set(recorded["obj_groups"]) == {"nccl-pp"}
     assert recorded["bcast_groups"] == ["nccl-pp", "nccl-pp"]
     # Streamed output is bitwise-equal to the legacy materialized full dict.
     assert exported.keys() == {"weight", "weight2"}
@@ -631,11 +640,11 @@ def test_pp_export_holds_one_inflight_buffer(monkeypatch) -> None:
 
     run()
 
-    # Exactly one remote param is allocated (the source pops its own tensor from
-    # the resident stage dict), so peak residency is (own stage) + one buffer.
+    # Exactly one remote param is allocated (the source broadcasts straight from
+    # its bounded bucket), so peak residency is (one bucket) + one recv buffer.
     assert recorded["empty_shapes"] == [(2, 3)]
     assert recorded["max_live_empty"] == 1
-    # broadcast sources: our stage (global rank 0) then the remote stage (rank 1).
+    # tensor broadcast sources: our stage (global rank 0) then remote stage (1).
     assert recorded["bcast_srcs"] == [0, 1]
 
 
@@ -657,7 +666,7 @@ def test_pp_export_cpu_still_broadcasts_over_nccl(monkeypatch) -> None:
 
 def test_pp_export_rank0_only_participates_but_yields_nothing(monkeypatch) -> None:
     # A non-zero rank under rank0_only must still join every collective
-    # (metadata all_gather + both broadcasts) but emit no params.
+    # (header exchange + both tensor broadcasts) but emit no params.
     recorded, _, _, run = _pp2_stream_fixture(
         monkeypatch, rank=1, pp_rank=1, rank0_only=True
     )
@@ -665,5 +674,92 @@ def test_pp_export_rank0_only_participates_but_yields_nothing(monkeypatch) -> No
     exported = run()
 
     assert exported == {}
-    assert recorded["meta_group"] == "nccl-pp"
+    assert set(recorded["obj_groups"]) == {"nccl-pp"}
     assert len(recorded["bcast_groups"]) == 2
+
+
+def test_pp_export_never_materializes_the_whole_stage(monkeypatch) -> None:
+    """Residency guard: the own stage is gathered lazily, one bounded bucket at
+    a time — the whole stage is never built before the first yield.
+
+    With ``buffer_max_size_bytes`` forcing one param per bucket, pulling the very
+    first streamed param must have visited exactly one of the stage's three
+    parameters (had the legacy path pre-built the stage dict, all three would be
+    visited before anything yielded).
+    """
+    visited: list[str] = []
+    params = {
+        "weight_a": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        "weight_b": torch.arange(6, dtype=torch.float32).reshape(2, 3) + 10,
+        "weight_c": torch.arange(6, dtype=torch.float32).reshape(2, 3) + 20,
+    }
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            for name, value in params.items():
+                self.register_parameter(name, nn.Parameter(value.clone()))
+
+        def named_parameters(self, *args, **kwargs):
+            for item in super().named_parameters(*args, **kwargs):
+                visited.append(item[0])
+                yield item
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def is_expert(name):
+            return False
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 2,
+            "pp_rank": 0,
+            "pp_global_ranks": [0, 1],
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+            "pp_group": "nccl-pp",
+            "pp_cpu_group": "gloo-pp",
+        },
+    )()
+
+    my_global = 0
+
+    def fake_broadcast_object_list(object_list, src=None, group=None, device=None):
+        if src != my_global:
+            object_list[0] = []  # never reached: we stop after the first param
+
+    def fake_broadcast(tensor, src=None, group=None):
+        pass  # source (rank 0) broadcasts straight from its bucket
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        torch.distributed, "broadcast_object_list", fake_broadcast_object_list
+    )
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+
+    # buffer_max_size_bytes=1 caps every bucket at a single parameter.
+    stream = export_hf_weights(Model(), Spec(), ps, buffer_max_size_bytes=1)
+    first_name, first_tensor = next(stream)
+
+    assert first_name == "weight_a"
+    assert torch.equal(first_tensor, params["weight_a"])
+    # Only the first parameter has been pulled from the lazy generator; the
+    # remaining two stay untouched — the stage was never fully materialized.
+    assert visited == ["weight_a"]
