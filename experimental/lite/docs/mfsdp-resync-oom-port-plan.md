@@ -20,6 +20,88 @@ Historical (pre-00:30) gating context retained below for provenance.
 
 ---
 
+# 32-card SMOKE result — job 13888949 (2026-07-13 02:14–02:37)
+
+**Verdict: Branch B is a real PARTIAL win but did NOT close the收口 run. SMOKE
+NOT fully passed. Budget exhausted (~12.2 GPU-h on one attempt). Fork escalated to
+bayan.**
+
+Config: `q35_mfsdp_dapo_fd760e969_smoke`, 4-node/32-card, mlite HEAD `fd760e969`
+(Branch B `resync_export.py`), `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+(A) + `MLITE_RESYNC_EXPORT_EMPTY_CACHE_GIB=4` (B, ON), TP1·PP1·CP4·EP8, vLLM
+`gpu_memory_utilization=0.7` (deliberately unchanged to isolate Branch B),
+GEN_TP4, `--time=00:25:00`, FR full-on. Ended FAILED (rc 1) at 02:37:39.
+
+## What Branch B bought (measured, not asserted)
+
+| | pre-fix baseline 13838501 (c17a05eff only) | Branch B 13888949 (fd760e969) |
+|---|---|---|
+| completed training steps | **0** | **3** (stable loss 0.9999→1.0001→1.0000) |
+| resync (wake_up) cycles survived | 0 — OOM at **first** wake_up | **3** succeeded, OOM at ~4th |
+| CP4 dense-gather deadlock | (fixed, held) | **held** — 3× through update_actor, FR dump **empty** (no hang) |
+| failure site | vLLM `wake_up` cumem_allocator.cpp:139 | **same** site, but 3 cycles later |
+
+So `c17a05eff` (deadlock) + Branch B (empty_cache-before-wake) together moved the
+run from "dies on cycle 0" to "3 healthy resync cycles then OOM on cycle 4." The
+deadlock fix and Branch B both work; they are **not sufficient alone**.
+
+## Empirical per-card residency table (bayan's demanded itemization — now measured)
+
+From the per-process residency probe (`.procmem.csv`, one GPU shown) at the failing
+wake_up (02:37:20) — this is phase C of §① and it is **thin-margin, not a leak**:
+
+| process | GPU MiB @ failing wake | note |
+|---|---|---|
+| actor `WorkerDict.actor_rollout` | **~58,100** (≈56.7 GiB) | export materialize peak during update_weights |
+| vLLM `Worker_TP*` (asleep) | ~4,200 (≈4.1 GiB) | slept weights, not yet remapped |
+| **used / free (nvidia-smi)** | **~62.6 GiB used / ~18 GiB free** | out of 80 GiB |
+| vLLM wake needs (remap) | ~19 GiB (seen post-crash update_weights) | 18 free < 19 needed ⇒ **OOM by ≈1 GiB** |
+
+**Actor export peak is BOUNDED, not creeping** — per-minute actor-process peak over
+the four resyncs: 02:28→57.6, 02:31→58.7, 02:34→58.4, 02:37→58.1 GiB. torch
+`max_memory_reserved` plateaued 40→49 GiB (allocated plateaued 37.6→45.7 by step 2).
+Cycles 1–3 succeeded at the *same* ~58 GiB actor peak that cycle 4 OOMed at → the
+system sits **right at the 80 GiB cliff**; fragmentation/transient timing tips
+cycle 4 over. (`cpu_memory` grew 150→250→275 GiB — host-side offload accumulation,
+not the GPU killer.)
+
+**DS4 21:05 sibling-buffer hypothesis: REFUTED here.** Each GPU shows exactly ONE
+actor + ONE vLLM worker; no 7×2.5 GiB stray sibling P2P buffers. `device_count()==1`
+effectively holds. That lever does not apply to this run.
+
+## Why this is a fork for bayan (not an autonomous retry)
+
+1. **Budget exhausted.** Attempt-1 did NOT fast-fail (it ran 3 healthy steps before
+   OOM at 22:57), so it spent **~12.2 GPU-h** of the ≤16 budget — leaving ~3.8
+   GPU-h, too little for a second 32-card 25-min attempt. Protocol §③ assumed a
+   hang would fast-fail at ~3.7 GPU-h; a *slow* healthy-then-OOM path broke that
+   assumption. A second attempt needs a fresh budget grant.
+2. **Failure criterion ② says do NOT blind-retry a wake_up OOM** — re-derive the
+   table (done above) first. The table shows a **bounded thin margin**, which points
+   at cheap levers, but choosing one changes the moe-approved protocol.
+3. The candidate levers trade off differently and touch bayan's stated constraints
+   (throughput gate, no-backend-branch red line, two-gate/two-round process):
+
+   - **(A) Lower vLLM `gpu_memory_utilization` 0.7 → ~0.5–0.6** (harness config, no
+     code). *Recommended.* The margin is ~1 GiB and the actor peak is bounded, so
+     shrinking vLLM's KV reservation almost certainly buys the headroom. Cost: some
+     rollout throughput (must then check the ≤20% resync/throughput gate). This is
+     the textbook colocated-OOM fix and was explicitly held back to isolate Branch B.
+   - **(B) Branch B-deeper: streaming per-bucket export** to cut the ~58 GiB
+     materialize peak. Heavy — multi-file primitive change across runtime→primitive,
+     carries the live MoE expert use-after-free hazard (see pre-check §), and needs
+     its own pre-GPU moe gate. Only if (A) can't hold throughput.
+   - **(C) Investigate fragmentation** (vLLM cumem vs torch expandable_segments
+     interaction) — the same-peak-different-outcome across cycles suggests
+     driver-level fragmentation; a targeted fix could be cheaper than (B).
+
+Recommendation to bayan: grant a small budget for **one (A) attempt** (gmu 0.7→0.55)
+since the margin is thin and bounded; fall back to (C)/(B) only if (A) trades too
+much throughput. Do NOT declare the task done — SMOKE's wake_up-OOM criterion is
+unmet.
+
+---
+
 # Pre-GPU 门 round-2 补全 (bayan 2026-07-13 01:12 reject 的四项)
 
 Round-1 pre-GPU moe 门 reject 了三个 BLOCKER(全是协议补全)+ 一条 bayan 架构红线
