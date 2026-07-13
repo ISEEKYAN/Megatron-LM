@@ -197,9 +197,16 @@ export TRITON_CACHE_DIR="${JIT_CACHE_ROOT}/triton"
 export VLLM_CACHE_ROOT="${JIT_CACHE_ROOT}/vllm"
 export TILELANG_CACHE_DIR="${JIT_CACHE_ROOT}/tilelang"
 export FLASHINFER_WORKSPACE_BASE="${JIT_CACHE_ROOT}/flashinfer"
-# TileLang scratch (the temp build dir) is NOT a reusable artifact — concurrent
-# ranks would clobber each other's in-flight compiles — so it stays per-job.
-export TILELANG_TMP_DIR="${TMPDIR}/tilelang-tmp"
+# TileLang scratch (the temp build dir) must live on the SAME filesystem as
+# TILELANG_CACHE_DIR: tilelang persists a compiled kernel by os.replace()-ing the
+# staged source from TILELANG_TMP_DIR into the cache, and os.replace across
+# filesystems raises OSError(EXDEV) "Invalid cross-device link", which silently
+# defeats cache persistence (every rank then recompiles every run — job 13888695
+# showed exactly this with tmp on the node-local /tmp vs cache on lustre).
+# Concurrent ranks do NOT clobber each other because tilelang stages under unique
+# per-invocation subdirs (pid+uuid), so keeping tmp under the shared lustre cache
+# root is safe.
+export TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"
 export HF_HOME="${RUN_ROOT}/hf-cache"
 export HF_DATASETS_CACHE="${HF_HOME}/datasets"
 # Redirect HOME onto the (spacious, writable) lustre RUN_ROOT. The inherited
