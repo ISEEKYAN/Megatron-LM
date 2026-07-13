@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+from dataclasses import dataclass
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
@@ -12,6 +14,76 @@ from megatron.lite.primitive.modules.moe import _AllToAll
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.moe import permute, unpermute
+
+# Token count alignment for the static-capacity A2A shape. #5258 pulls this from
+# ``moe.fused_a2a`` (``HYBRIDEP_TOKEN_ALIGNMENT``); MLite keeps its own dispatch
+# primitive, so the alignment is a plain contract constant here.
+_DEFAULT_TOKEN_ALIGNMENT = 8
+
+
+def _align_up(value: int, alignment: int) -> int:
+    if alignment <= 1:
+        return int(value)
+    return ((int(value) + alignment - 1) // alignment) * alignment
+
+
+@dataclass(frozen=True)
+class StaticCapacityConfig:
+    """Fixed-capacity / device-driven dispatch contract (mirrors upstream #5258).
+
+    This is the MLite side of the "How upstream captures dropless MoE dispatch"
+    contract: a fixed per-rank token budget plus device-driven per-expert padding
+    so the whole MoE ``TransformerBlock`` chunk is CUDA-graph safe. MLite copies the
+    *contract* (static shapes, on-device padding/tail-zero, a device overflow flag
+    read only outside capture) and reuses its own permute/unpermute primitive rather
+    than porting the HybridEP fused kernel.
+
+    Attributes:
+        num_tokens: static per-rank input token count ``M`` (derived from
+            ``max_seqlen_per_dp_cp_rank``, divided by TP under sequence parallelism,
+            aligned up). Every EP rank issues the same compile-time-known A2A shape.
+        expert_capacity: per-expert, per-source-rank token budget ``C``. Dispatch and
+            combine buffers are pre-sized to ``num_experts * C``; a routed count above
+            ``C`` for any expert raises the device overflow flag (fail-loud, no silent
+            truncation of the training signal — the runner reruns the microbatch eager).
+    """
+
+    num_tokens: int
+    expert_capacity: int
+
+
+def compute_static_capacity(
+    *,
+    max_seqlen_per_dp_cp_rank: int,
+    num_experts: int,
+    moe_router_topk: int,
+    tensor_model_parallel_size: int = 1,
+    sequence_parallel: bool = False,
+    capacity_factor: float = 1.0,
+    token_alignment: int = _DEFAULT_TOKEN_ALIGNMENT,
+) -> StaticCapacityConfig:
+    """Resolve the #5258 static-capacity contract from static config only.
+
+    Returns the per-rank token budget ``M`` and per-expert capacity ``C``. All inputs
+    come from static model/parallel config (no device-to-host read), so this may run
+    ahead of capture. ``C`` is sized from the routed load ``M * topk / num_experts``
+    scaled by ``capacity_factor``; the runtime detects the rare over-``C`` microbatch
+    via the device overflow flag and reruns it eager (dropless is preserved by the
+    eager fallback, never by dropping tokens inside the graph).
+    """
+    if max_seqlen_per_dp_cp_rank <= 0:
+        raise ValueError("max_seqlen_per_dp_cp_rank must be positive")
+    if capacity_factor <= 0:
+        raise ValueError("capacity_factor must be positive")
+
+    num_tokens = int(max_seqlen_per_dp_cp_rank)
+    if sequence_parallel and tensor_model_parallel_size > 1:
+        num_tokens = ensure_divisible(num_tokens, tensor_model_parallel_size)
+    num_tokens = _align_up(num_tokens, token_alignment)
+
+    per_expert = math.ceil(capacity_factor * num_tokens * moe_router_topk / num_experts)
+    expert_capacity = _align_up(per_expert, token_alignment)
+    return StaticCapacityConfig(num_tokens=num_tokens, expert_capacity=expert_capacity)
 
 try:
     import deep_ep  # pyright: ignore[reportMissingImports]
@@ -196,6 +268,7 @@ class TokenDispatcher:
         *,
         use_deepep: bool = True,
         moe_permute_fusion: bool | None = None,
+        static_capacity: StaticCapacityConfig | None = None,
     ):
         self.ps = ps
         self.num_experts = num_experts
@@ -205,7 +278,18 @@ class TokenDispatcher:
             _use_moe_permute_fusion() if moe_permute_fusion is None else bool(moe_permute_fusion)
         )
 
-        self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
+        # Fixed-capacity / device-driven dispatch (mirrors #5258). When configured it
+        # replaces the host-driven A2A path with static shapes so the MoE chunk is
+        # CUDA-graph safe; it is mutually exclusive with the DeepEP kernel path.
+        self.static_capacity = static_capacity
+        self._over_budget: torch.Tensor | None = None
+
+        self.use_deepep = (
+            use_deepep
+            and deep_ep is not None
+            and ps.ep_size > 1
+            and static_capacity is None
+        )
         if self.use_deepep:
             assert ps.tp_ep_group is not None
             self.buffer = _build_deepep_buffer(ps.tp_ep_group, hidden_size)
@@ -214,6 +298,7 @@ class TokenDispatcher:
         self._restore_shape: tuple | None = None
         self._input_splits: list[int] | None = None
         self._output_splits: list[int] | None = None
+        self._static_splits: list[int] | None = None
         self._handle = None
         self._deepep_event = None
 
@@ -229,6 +314,8 @@ class TokenDispatcher:
     def dispatch(
         self, hidden_states: torch.Tensor, topk_scores: torch.Tensor, topk_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if self.static_capacity is not None:
+            return self._dispatch_static(hidden_states, topk_scores, topk_indices)
         if self.ep_size <= 1:
             return self._dispatch_local(hidden_states, topk_scores, topk_indices)
         if self.use_deepep:
@@ -239,6 +326,8 @@ class TokenDispatcher:
         return dispatched, tpe, sorted_scores
 
     def combine(self, expert_output: torch.Tensor) -> torch.Tensor:
+        if self.static_capacity is not None:
+            return self._combine_static(expert_output)
         if self.ep_size <= 1:
             return self._combine_local(expert_output)
         if self.use_deepep:
@@ -322,6 +411,181 @@ class TokenDispatcher:
         self._row_id_map = None
         self._restore_shape = None
         return result
+
+    # ------------------------------------------------------------------
+    # Static-capacity / device-driven dispatch (mirrors upstream #5258).
+    #
+    # Every tensor shape below is compile-time known and no ``.item()`` /
+    # ``.tolist()`` / ``.cpu()`` runs on dispatch metadata, so the whole MoE chunk
+    # is CUDA-graph safe. The only host-visible capacity signal is a boolean device
+    # flag (``self._over_budget``); ``raise_if_over_budget`` reads it exclusively
+    # OUTSIDE the captured region.
+    # ------------------------------------------------------------------
+
+    @property
+    def over_budget(self) -> torch.Tensor | None:
+        """Device boolean flag set during the last static dispatch (or ``None``).
+
+        Stays on device; never read to host inside a captured region. The runner
+        checks it after replay to discard and eagerly rerun an over-budget
+        microbatch.
+        """
+        return self._over_budget
+
+    def raise_if_over_budget(self) -> None:
+        """Host-side fail-loud check for the static-capacity contract.
+
+        Must be called only OUTSIDE the captured region (it performs a device→host
+        read). Raises when the last dispatch routed more tokens to some expert than
+        the static ``expert_capacity`` budget, so over-capacity never silently
+        truncates the training signal.
+        """
+        if self._over_budget is None:
+            return
+        if bool(self._over_budget.item()):
+            cfg = self.static_capacity
+            raise RuntimeError(
+                "Static-capacity MoE dispatch over budget: a routed expert exceeded "
+                f"expert_capacity={cfg.expert_capacity if cfg else '?'} "
+                "(num_tokens="
+                f"{cfg.num_tokens if cfg else '?'}). Rerun this microbatch eager "
+                "or raise moe_expert_rank_capacity_factor."
+            )
+
+    def _build_capacity_routing(self, topk_scores, topk_indices, num_tokens, num_experts, device):
+        """Device-side routing_map / probs_2d build plus the device overflow flag.
+
+        No host reads: the overflow flag is computed with ``(counts > C).any()`` and
+        left on device.
+        """
+        routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool, device=device)
+        routing_map.scatter_(1, topk_indices, True)
+        probs_2d = torch.zeros(num_tokens, num_experts, dtype=topk_scores.dtype, device=device)
+        probs_2d.scatter_(1, topk_indices, topk_scores)
+
+        capacity = self.static_capacity.expert_capacity
+        counts = routing_map.sum(dim=0)
+        self._over_budget = (counts > capacity).any()
+        return routing_map, probs_2d
+
+    def _dispatch_static(self, hidden_states, topk_scores, topk_indices):
+        cfg = self.static_capacity
+        t, _h = hidden_states.shape
+        e = self.num_experts
+        c = cfg.expert_capacity
+        device = hidden_states.device
+
+        if t != cfg.num_tokens:
+            raise ValueError(
+                "Static-capacity dispatch requires a fixed token count "
+                f"num_tokens={cfg.num_tokens}, got {t}. Pad the input to the static "
+                "budget (max-aligned THD) before dispatch."
+            )
+
+        routing_map, probs_2d = self._build_capacity_routing(
+            topk_scores, topk_indices, t, e, device
+        )
+
+        # Pad-to-capacity permute: fixed [E*C, H] buffer, grouped by global expert.
+        # ``drop_and_pad`` keeps the first C tokens per expert (all routed tokens when
+        # under budget); padding slots carry prob 0 so they are numerically inert.
+        num_out = e * c
+        permuted, permuted_probs, sorted_indices = permute(
+            hidden_states,
+            routing_map,
+            probs=probs_2d,
+            num_out_tokens=num_out,
+            # drop_and_pad is only honored by the argsort (non-fused) permute path;
+            # the fused kernel ignores it, so force the correctness path here.
+            fused=False,
+            drop_and_pad=True,
+        )[:3]
+        self._row_id_map = sorted_indices
+        self._restore_shape = hidden_states.shape
+
+        nle = self.num_local_experts
+        if self.ep_size <= 1:
+            # No A2A: each local expert already holds its C-token slot.
+            self._local_tpe_list = [c] * nle
+            tokens_per_expert = torch.full((nle,), c, dtype=torch.int64, device=device)
+            return permuted, tokens_per_expert, permuted_probs
+
+        # Static, symmetric all-to-all: every rank sends/receives exactly nle*C tokens
+        # per peer. Splits are compile-time constants (no host read of any count).
+        rank_split = [nle * c] * self.ep_size
+        self._static_splits = rank_split
+        recv_flat = _AllToAll.apply(permuted, rank_split, rank_split, self.ps.ep_group)
+        recv_scores = _AllToAll.apply(
+            permuted_probs.unsqueeze(-1), rank_split, rank_split, self.ps.ep_group
+        )
+
+        # Reorder recv layout (src_rank, local_expert) -> (local_expert, src_rank) with
+        # a pure reshape/permute (static, autograd-safe, no host read).
+        dispatched = self._regroup_ranks_to_experts(recv_flat, self.ep_size, nle, c)
+        permuted_probs_out = self._regroup_ranks_to_experts(recv_scores, self.ep_size, nle, c)
+
+        # Each local expert receives exactly ep_size*C tokens (C from every source rank).
+        per_local = self.ep_size * c
+        self._local_tpe_list = [per_local] * nle
+        tokens_per_expert = torch.full((nle,), per_local, dtype=torch.int64, device=device)
+        return dispatched, tokens_per_expert, permuted_probs_out.squeeze(-1)
+
+    @staticmethod
+    def _regroup_ranks_to_experts(flat, ep_size, num_local_experts, capacity):
+        # flat: [ep_size * num_local_experts * capacity, ...] ordered (rank, local_expert)
+        # -> [num_local_experts * ep_size * capacity, ...] ordered (local_expert, rank)
+        tail = flat.shape[1:]
+        reshaped = flat.view(ep_size, num_local_experts, capacity, *tail)
+        regrouped = reshaped.permute(1, 0, 2, *range(3, reshaped.dim())).contiguous()
+        return regrouped.reshape(num_local_experts * ep_size * capacity, *tail)
+
+    @staticmethod
+    def _regroup_experts_to_ranks(flat, ep_size, num_local_experts, capacity):
+        # Inverse of _regroup_ranks_to_experts.
+        tail = flat.shape[1:]
+        reshaped = flat.view(num_local_experts, ep_size, capacity, *tail)
+        regrouped = reshaped.permute(1, 0, 2, *range(3, reshaped.dim())).contiguous()
+        return regrouped.reshape(ep_size * num_local_experts * capacity, *tail)
+
+    def _combine_static(self, expert_output):
+        cfg = self.static_capacity
+        c = cfg.expert_capacity
+        nle = self.num_local_experts
+
+        if self.ep_size <= 1:
+            result = unpermute(
+                expert_output,
+                self._row_id_map,
+                restore_shape=self._restore_shape,
+                # drop_and_pad row_id_map has duplicate/padding indices; the argsort
+                # (non-fused) scatter-add path handles them, a bijection-assuming
+                # fused kernel may not.
+                fused=False,
+            )
+            self._reset_static_state()
+            return result
+
+        # Inverse reorder, then symmetric A2A back to the source ranks.
+        rank_grouped = self._regroup_experts_to_ranks(expert_output, self.ep_size, nle, c)
+        combined = _AllToAll.apply(
+            rank_grouped, self._static_splits, self._static_splits, self.ps.ep_group
+        )
+        result = unpermute(
+            combined,
+            self._row_id_map,
+            restore_shape=self._restore_shape,
+            fused=False,
+        )
+        self._reset_static_state()
+        return result
+
+    def _reset_static_state(self):
+        self._row_id_map = None
+        self._restore_shape = None
+        self._local_tpe_list = None
+        self._static_splits = None
+        # ``_over_budget`` is intentionally retained until the next dispatch so the
+        # runner can call ``raise_if_over_budget`` after combine/replay.
 
     def _dispatch_alltoall(self, hidden_states, topk_scores, topk_indices):
         t, h = hidden_states.shape
@@ -586,4 +850,4 @@ class TokenDispatcher:
         return combined
 
 
-__all__ = ["TokenDispatcher"]
+__all__ = ["StaticCapacityConfig", "TokenDispatcher", "compute_static_capacity"]
