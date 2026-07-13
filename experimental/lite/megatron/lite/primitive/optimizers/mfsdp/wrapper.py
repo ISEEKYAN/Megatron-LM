@@ -191,8 +191,13 @@ class MegatronFSDP(nn.Module):
     @contextmanager
     def full_parameter_context(self):
         """Materialize full parameters for model-level export consumers."""
-        self.param_sync.materialize_all()
+        # Enter the try before materialize_all so that a partial materialize
+        # (e.g. an all-gather that pins some allocator slots and then raises)
+        # still routes through release_cached_buffers in the finally; otherwise
+        # an exception during materialization would leak the persistent
+        # double-buffer slots that this context exists to reclaim.
         try:
+            self.param_sync.materialize_all()
             yield
         finally:
             self.param_sync.release_all()

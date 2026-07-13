@@ -1132,6 +1132,38 @@ def test_mfsdp_full_parameter_export_returns_cached_buffers_to_driver():
     assert not any(allocator._busy.values())
 
 
+def test_mfsdp_full_parameter_export_releases_cached_buffers_when_materialize_raises():
+    # The scoped-release finally must fire on *any* exit, including a failure
+    # during materialize_all itself: materialize can pin allocator slots and
+    # then raise (e.g. an all-gather error), and if that path skipped
+    # release_cached_buffers the persistent double-buffer slots would leak
+    # across the next colocated consumer's turn -- the resync-OOM bug. Prove
+    # the try scope covers materialize so the slots are returned to the driver.
+    chunk = _build_export_release_chunk()
+    allocator = chunk.param_and_grad_buffer.allocator
+    assert isinstance(allocator, mfsdp_buffer.DoubleBufferAllocator)
+
+    real_materialize_all = chunk.param_sync.materialize_all
+
+    def _materialize_then_raise() -> None:
+        # Pin the real full-parameter slots, then fail mid-export.
+        real_materialize_all()
+        assert _retained_buffer_count(allocator) == len(chunk.param_sync.buckets)
+        raise RuntimeError("injected materialize failure")
+
+    chunk.param_sync.materialize_all = _materialize_then_raise
+
+    with pytest.raises(RuntimeError, match="injected materialize failure"):
+        with chunk.full_parameter_context():
+            pass  # never reached; materialize_all raises first
+
+    # Despite the exception on the materialize path, the finally returned the
+    # pinned slots to the driver -- no export buffer survives the failed context.
+    assert _retained_buffer_count(allocator) == 0
+    assert len(allocator._slots) == 0
+    assert not any(allocator._busy.values())
+
+
 def test_mfsdp_double_buffer_does_not_mix_unequal_unit_layouts():
     model = _UnevenForwardReleaseModel()
     ps = SimpleNamespace(
