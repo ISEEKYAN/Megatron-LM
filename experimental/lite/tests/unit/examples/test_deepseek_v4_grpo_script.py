@@ -302,7 +302,9 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert 'export VLLM_CACHE_ROOT="${JIT_CACHE_ROOT}/vllm"' in script
     assert 'export TILELANG_CACHE_DIR="${JIT_CACHE_ROOT}/tilelang"' in script
     assert 'export FLASHINFER_WORKSPACE_BASE="${JIT_CACHE_ROOT}/flashinfer"' in script
-    assert 'export TILELANG_TMP_DIR="${TMPDIR}/tilelang-tmp"' in script
+    # TILELANG_TMP_DIR must share the cache filesystem so the kernel os.replace
+    # persists (node-local /tmp caused EXDEV, silently defeating cache reuse).
+    assert 'export TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"' in script
     assert 'export VLLM_WORKER_MULTIPROC_METHOD="spawn"' in script
     assert 'export VLLM_DEEP_GEMM_WARMUP="skip"' in script
     assert 'export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"' in script
@@ -359,17 +361,40 @@ def test_ds4_grpo_sbatch_has_bounded_vllm_load_only_gate() -> None:
 
     ast.parse(load_program)
     assert 'if [[ "${VLLM_LOAD_ONLY}" == "1" ]]' in script
-    assert "VLLM_LOAD_ONLY requires one node with eight GPUs" in script
+    assert "VLLM_LOAD_ONLY requires one or two nodes with eight GPUs per node" in script
     assert "env -u VLLM_LOAD_ONLY" in script
     assert "deepseek_v4_rollout_load_only.py" in script
-    assert "tensor_parallel_size=rollout_tp" in load_program
-    assert 'load_format="dummy"' in load_program
+    assert '"tensor_parallel_size": rollout_tp' in load_program
+    assert '"load_format": "dummy"' in load_program
     assert '"expert_dtype": "fp8"' in load_program
     assert "DS4_VLLM_LOAD_ONLY_PASSED" in load_program
     assert "VLLM_CHECKPOINT_SYNC_PROBE" in script
     assert "VllmCheckpointWorkerExtension" in load_program
     assert '"base_sync_done": True' in load_program
     assert "DS4_VLLM_CHECKPOINT_SYNC_PASSED" in load_program
+
+
+def test_ds4_grpo_sbatch_supports_two_node_load_only_over_ray() -> None:
+    """The rollout_tp=16 vs o_groups=8 oversplit probe needs a tp>8 span, which is
+    only reachable across two nodes through the Ray executor. Assert the sbatch
+    keeps the single-node bare-python path fenced to one node and submits the
+    two-node load-only run as a Ray job with the Ray backend + oversplit knobs."""
+    script = SBATCH.read_text()
+
+    # Single-node bare-python path stays fenced to one node.
+    assert 'if [[ "${VLLM_LOAD_ONLY}" == "1" && "${SLURM_NNODES}" == "1" ]]' in script
+    # Two-node load-only is required to use the Ray backend (bare python can't span nodes).
+    assert (
+        "two-node VLLM_LOAD_ONLY requires MLITE_VLLM_DISTRIBUTED_EXECUTOR_BACKEND=ray"
+        in script
+    )
+    # The checkpoint-sync probe binds per-worker IPC handles locally, so it stays single-node.
+    assert "VLLM_CHECKPOINT_SYNC_PROBE requires a single node" in script
+    # The two-node branch submits the load-only script as a Ray job and forwards the
+    # oversplit bypass + rollout_tp so vLLM itself decides tp>o_groups loadability.
+    assert "DS4_VLLM_LOAD_ONLY_RAY_COMPLETE" in script
+    assert "DS4_ALLOW_TP_OVERSPLIT" in script
+    assert "MLITE_VLLM_DISTRIBUTED_EXECUTOR_BACKEND" in script
 
 
 def test_ds4_vllm_load_only_uses_production_fp8_shape(
@@ -406,8 +431,9 @@ def test_ds4_vllm_load_only_uses_production_fp8_shape(
         128,
         128,
     ]
-    assert "DS4_VLLM_LOAD_ONLY_PASSED rollout_tp=8 o_groups=8 local_groups=1" in (
-        capsys.readouterr().out
+    assert (
+        "DS4_VLLM_LOAD_ONLY_PASSED backend=mp(default) rollout_tp=8 o_groups=8 local_groups=1"
+        in capsys.readouterr().out
     )
 
 

@@ -99,12 +99,25 @@ if (( CONFIG_ONLY == 1 && (SLURM_NNODES != 1 || GPUS_PER_NODE != 0) )); then
   echo "CONFIG_ONLY requires one CPU-only node with GPUS_PER_NODE=0" >&2
   exit 2
 fi
-if (( VLLM_LOAD_ONLY == 1 && (SLURM_NNODES != 1 || GPUS_PER_NODE != 8) )); then
-  echo "VLLM_LOAD_ONLY requires one node with eight GPUs" >&2
+if (( VLLM_LOAD_ONLY == 1 && (SLURM_NNODES < 1 || SLURM_NNODES > 2 || GPUS_PER_NODE != 8) )); then
+  echo "VLLM_LOAD_ONLY requires one or two nodes with eight GPUs per node" >&2
   exit 2
 fi
 if (( VLLM_CHECKPOINT_SYNC_PROBE == 1 && VLLM_LOAD_ONLY != 1 )); then
   echo "VLLM_CHECKPOINT_SYNC_PROBE requires VLLM_LOAD_ONLY=1" >&2
+  exit 2
+fi
+# The single-node load-only path runs a bare python process (no Ray), so a
+# tensor-parallel span > one node (e.g. rollout_tp=16 across two nodes) is only
+# reachable through the Ray executor. Require the checkpoint-sync probe to stay
+# single-node, and require the two-node load-only run to use the Ray backend.
+if (( VLLM_CHECKPOINT_SYNC_PROBE == 1 && SLURM_NNODES != 1 )); then
+  echo "VLLM_CHECKPOINT_SYNC_PROBE requires a single node" >&2
+  exit 2
+fi
+if (( VLLM_LOAD_ONLY == 1 && SLURM_NNODES == 2 )) \
+  && [[ "${MLITE_VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-}" != "ray" ]]; then
+  echo "two-node VLLM_LOAD_ONLY requires MLITE_VLLM_DISTRIBUTED_EXECUTOR_BACKEND=ray" >&2
   exit 2
 fi
 if (( IMPORT_ONLY == 1 && SLURM_NNODES != 1 )); then
@@ -308,7 +321,8 @@ PY
   exit 0
 fi
 
-if [[ "${VLLM_LOAD_ONLY}" == "1" ]]; then
+if [[ "${VLLM_LOAD_ONLY}" == "1" && "${SLURM_NNODES}" == "1" ]]; then
+  # Single-node load-only: a bare python process (no Ray) suffices for tp<=8.
   env -u VLLM_LOAD_ONLY \
     PYTHONPATH="${DS4_VLLM_SITE}:${PYTHONPATH}" \
     python experimental/lite/examples/verl/deepseek_v4_rollout_load_only.py
@@ -794,6 +808,48 @@ print(
 )
 '
   echo "DS4_RAY_CLUSTER_PASSED nodes=${SLURM_NNODES} source=${MLITE_COMMIT}"
+  exit 0
+fi
+
+if [[ "${VLLM_LOAD_ONLY}" == "1" ]]; then
+  # Two-node load-only (tp>8, e.g. the rollout_tp=16 vs o_groups=8 oversplit
+  # probe): the Ray cluster is up, so submit the bare load-only script as a Ray
+  # job with the Ray executor backend. vLLM places its tp workers across the
+  # cluster's GPUs. The oversplit guard bypass (DS4_ALLOW_TP_OVERSPLIT) plus
+  # the load-only rollout knobs are read from the job env, so augment the shared
+  # runtime env with them and prepend the DS4 vLLM overlay to PYTHONPATH (mirrors
+  # the single-node path so the rollout site's vllm/transformers win).
+  LOAD_ONLY_RUNTIME_ENV_JSON=$(VERL_MLITE_SKIP_RUNTIME_PATCHES=1 python - \
+    "${RUNTIME_ENV_JSON}" "${DS4_VLLM_SITE}" <<'PY'
+import json
+import os
+import sys
+
+runtime_env = json.loads(sys.argv[1])
+rollout_site = sys.argv[2]
+env_vars = runtime_env.setdefault("env_vars", {})
+existing = env_vars.get("PYTHONPATH", os.environ.get("PYTHONPATH", ""))
+env_vars["PYTHONPATH"] = os.pathsep.join([rollout_site, existing]) if existing else rollout_site
+for name in (
+    "ROLLOUT_TP",
+    "CHECKPOINT_DIR",
+    "ROLLOUT_GPU_MEMORY_UTILIZATION",
+    "DS4_ALLOW_TP_OVERSPLIT",
+    "MLITE_VLLM_DISTRIBUTED_EXECUTOR_BACKEND",
+    "MLITE_VLLM_RESIDENCY_PROBE",
+):
+    value = os.environ.get(name)
+    if value:
+        env_vars[name] = value
+print(json.dumps(runtime_env))
+PY
+)
+  "${RAY_CLI[@]}" job submit \
+    --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
+    --runtime-env-json="${LOAD_ONLY_RUNTIME_ENV_JSON}" \
+    -- \
+    python "${MLITE_SRC}/experimental/lite/examples/verl/deepseek_v4_rollout_load_only.py"
+  echo "DS4_VLLM_LOAD_ONLY_RAY_COMPLETE nodes=${SLURM_NNODES} rollout_tp=${ROLLOUT_TP}"
   exit 0
 fi
 
