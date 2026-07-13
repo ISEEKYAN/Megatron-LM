@@ -769,7 +769,7 @@ class CompressedSparseAttention(nn.Module):
 
         # TE-THD convention: query (total, np, hn); key (total, 1, 1, hn); x/qr (total, 1, *).
         query_thd = q.squeeze(0).transpose(0, 1).contiguous()  # (total, np, hn)
-        key_thd = kv.permute(2, 0, 1, 3).unsqueeze(-2).contiguous()  # (total, 1, 1, hn)
+        key_thd = kv.permute(2, 0, 1, 3).contiguous()  # (total, 1, 1, hn)
         x_thd = x.transpose(0, 1).contiguous()  # (total, 1, hidden)
         qr_thd = q_low.transpose(0, 1).contiguous()  # (total, 1, q_lora_rank)
 
