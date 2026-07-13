@@ -133,3 +133,115 @@ def test_all_warmup_no_extra_recv_when_no_steady():
     assert problems == []
     # rank1 receives exactly num_microbatches, never over-receives.
     assert recvs[1] == 2
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Retained-input buffer-aliasing invariant
+#
+# ``_1f1b_schedule`` retains each received forward input in ``input_tensors``
+# until its backward pass, but every recv reuses the single ``_fwd_recv_buf``.
+# If the P2P helper returns that buffer directly (``clone_recv=False``), all
+# retained inputs alias one storage, so a later ``irecv`` overwrites an earlier
+# microbatch's activation/autograd leaf -> corrupted grads. The shipped fix
+# passes ``clone_recv=True``, giving every microbatch a distinct retained
+# tensor. This model replays the retain/pop order of the real schedule (warmup
+# prefetch + steady 1F1B + cooldown drain) and checks that each input, when its
+# backward runs, still holds the microbatch it was forwarded with.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class _Buf:
+    """Mutable stand-in for the shared ``_fwd_recv_buf``; ``gen`` = last recv."""
+
+    def __init__(self):
+        self.gen = None
+
+
+def _simulate_input_identity(pp_size: int, num_microbatches: int, *, clone: bool):
+    """Replay input retention for every non-first stage; return corruption list.
+
+    ``clone=True`` models ``clone_recv=True`` (retained input frozen at recv);
+    ``clone=False`` models returning the shared buffer (retained input reads the
+    buffer's live, later-overwritten value).
+    """
+    problems: list[str] = []
+
+    for r in range(1, pp_size):  # only non-first stages retain forward inputs
+        is_last = r == pp_size - 1
+        num_warmup = min(pp_size - r - 1, num_microbatches)
+        num_steady = num_microbatches - num_warmup
+
+        buf = _Buf()
+        state = {"recv_gen": 0, "fwd_gen": None, "fwd_stored": None}
+        input_tensors: list[tuple[int, tuple]] = []
+
+        def do_recv():
+            state["recv_gen"] += 1
+            g = state["recv_gen"]
+            buf.gen = g
+            state["fwd_gen"] = g
+            state["fwd_stored"] = ("frozen", g) if clone else ("live", buf)
+
+        def read(stored):
+            kind, val = stored
+            return val if kind == "frozen" else val.gen
+
+        # ── Warmup ── (mirrors: capture current_input, forward, then recv-next)
+        for k in range(num_warmup):
+            if k == 0:
+                do_recv()
+            used_gen = state["fwd_gen"]
+            current = state["fwd_stored"]  # captured BEFORE the recv-next below
+            need_recv_next = (k + 1) < num_microbatches
+            if not is_last:
+                if need_recv_next:
+                    do_recv()
+            elif need_recv_next:
+                do_recv()
+            input_tensors.append((used_gen, current))
+
+        # ── Steady ── (forward, retain, then backward on oldest, then recv-next)
+        for k in range(num_steady):
+            if k == 0 and num_warmup == 0:
+                do_recv()
+            used_gen = state["fwd_gen"]
+            input_tensors.append((used_gen, state["fwd_stored"]))
+            exp, stored = input_tensors.pop(0)
+            got = read(stored)
+            if got != exp:
+                problems.append(f"r{r} steady k={k}: retained input mb{exp} read as mb{got}")
+            if k < num_steady - 1:
+                do_recv()
+
+        # ── Cooldown ── (drain remaining backwards)
+        for k in range(num_warmup):
+            exp, stored = input_tensors.pop(0)
+            got = read(stored)
+            if got != exp:
+                problems.append(f"r{r} cooldown k={k}: retained input mb{exp} read as mb{got}")
+
+    return problems
+
+
+@pytest.mark.parametrize("pp_size,num_microbatches", _CONFIGS)
+def test_clone_recv_keeps_retained_inputs_uncorrupted(pp_size, num_microbatches):
+    """With clone_recv (shipped), every retained input survives buffer reuse."""
+    problems = _simulate_input_identity(pp_size, num_microbatches, clone=True)
+    assert problems == [], f"pp={pp_size} nmb={num_microbatches}: {problems}"
+
+
+@pytest.mark.parametrize(
+    "pp_size,num_microbatches",
+    [(3, 2), (3, 4), (4, 3), (4, 8), (8, 4)],
+)
+def test_missing_clone_recv_corrupts_retained_inputs(pp_size, num_microbatches):
+    """Without clone_recv a middle stage's retained input is overwritten by a
+    later recv into the shared buffer -- the defect the moe panel flagged.
+
+    These configs all have a middle stage that retains an input across a
+    subsequent forward recv (pp>=3, num_microbatches>=2)."""
+    problems = _simulate_input_identity(pp_size, num_microbatches, clone=False)
+    assert problems, (
+        f"pp={pp_size} nmb={num_microbatches}: missing-clone aliasing no longer "
+        f"corrupts retained inputs; the clone_recv guard may be gone"
+    )

@@ -292,6 +292,13 @@ def _1f1b_schedule(
         return inp_t.grad if inp_t is not None else None
 
     def _p2p(send_fwd=None, send_bwd=None, recv_fwd=False, recv_bwd=False):
+        # clone_recv=True: received forward inputs are retained in
+        # ``input_tensors`` until their backward pass, but every recv reuses the
+        # single ``_fwd_recv_buf``. Returning the buffer directly would alias all
+        # retained inputs to one storage, so a later irecv overwrites an earlier
+        # microbatch's activation/autograd leaf -> corrupted grads. Cloning gives
+        # each microbatch a distinct retained tensor, matching the sibling
+        # schedules (``clone_recv=True``) and Megatron's fresh-tensor-per-recv.
         return _send_recv_pipeline(
             send_fwd,
             send_bwd,
@@ -301,6 +308,7 @@ def _1f1b_schedule(
             tensor_shape,
             fwd_recv_buf=_fwd_recv_buf,
             bwd_recv_buf=_bwd_recv_buf,
+            clone_recv=True,
         )
 
     # ── Warmup: pure forward passes ──
