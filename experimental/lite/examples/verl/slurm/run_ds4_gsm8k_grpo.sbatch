@@ -18,7 +18,12 @@ MEGATRON_ROOT=${MEGATRON_ROOT:?set MEGATRON_ROOT to a compatible MCore snapshot}
 VERL_ROOT=${VERL_ROOT:?set VERL_ROOT to a committed VERL snapshot}
 MLITE_SM90_SITE=${MLITE_SM90_SITE:?set MLITE_SM90_SITE to the SM90 training overlay}
 DS4_VLLM_SITE=${DS4_VLLM_SITE:?set DS4_VLLM_SITE to the DS4 vLLM thin overlay}
-DS4_VLLM_SHIM=${DS4_VLLM_SHIM:?set DS4_VLLM_SHIM to the Torch/vLLM ABI shim}
+# DS4_VLLM_SHIM is the Torch/vLLM ABI LD_PRELOAD shim required by the cw
+# H100/NGC26.04 thin-0.20.2 overlay. On a natively-built overlay (e.g. the GB200
+# cd0de48/NGC26.06 build) there is no ABI gap, so the shim is optional: leave it
+# empty and no LD_PRELOAD is injected. It stays exported (possibly empty) because
+# the Ray runtime-env snapshot indexes os.environ["DS4_VLLM_SHIM"] directly.
+DS4_VLLM_SHIM=${DS4_VLLM_SHIM:-}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:?set CHECKPOINT_DIR to the official mixed checkpoint}
 RUN_ROOT=${RUN_ROOT:?set RUN_ROOT to a fresh result directory}
 
@@ -29,13 +34,17 @@ for path in \
   "${VERL_ROOT}" \
   "${MLITE_SM90_SITE}" \
   "${DS4_VLLM_SITE}" \
-  "${DS4_VLLM_SHIM}" \
   "${CHECKPOINT_DIR}"; do
   [[ -e "${path}" ]] || {
     echo "required DS4 GRPO path does not exist: ${path}" >&2
     exit 2
   }
 done
+# The ABI shim is only checked when supplied (native overlays leave it empty).
+if [[ -n "${DS4_VLLM_SHIM}" && ! -e "${DS4_VLLM_SHIM}" ]]; then
+  echo "DS4_VLLM_SHIM set but does not exist: ${DS4_VLLM_SHIM}" >&2
+  exit 2
+fi
 [[ "$(git -C "${MLITE_SRC}" rev-parse HEAD)" == "${MLITE_COMMIT}" ]] || {
   echo "MLite source is not at ${MLITE_COMMIT}" >&2
   exit 7
