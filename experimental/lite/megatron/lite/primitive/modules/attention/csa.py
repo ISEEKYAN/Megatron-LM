@@ -324,6 +324,10 @@ class CompressedSparseAttention(nn.Module):
         *,
         layer_idx: int,
         ps: ParallelState,
+        apply_dsa_kernel_fusion: bool = True,
+        dsa_indexer_loss_coeff: float = 0.0,
+        dsa_indexer_use_sparse_loss: bool = False,
+        calculate_per_token_loss: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -335,12 +339,15 @@ class CompressedSparseAttention(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.softmax_scale = self.head_dim**-0.5
         self.num_heads_per_group = config.num_attention_heads // config.o_groups
-        # DSv4 THD-CP faithfulness: these knobs are absent from the lite DS4 config;
-        # thread them with Core-matching defaults. ``apply_dsa_kernel_fusion=False``
-        # selects the differentiable unfused sparse-attention / indexer-loss path
-        # (Core's ``_unfused_indexer_sparse_attn_from_topk``), which is the lite
-        # default backend (``self.attention_backend == "torch"``).
-        self.apply_dsa_kernel_fusion = getattr(config, "apply_dsa_kernel_fusion", False)
+        # Kernel / indexer-loss knobs are implementation config (not part of the
+        # HF model config), threaded as constructor arguments like GLM-5's DSA.
+        # Fused DSA kernels are the production default; the unfused sparse-attn /
+        # indexer-loss path (Core's ``_unfused_indexer_sparse_attn_from_topk``) is
+        # a debug fallback selected via ``apply_dsa_kernel_fusion=False``.
+        self.apply_dsa_kernel_fusion = apply_dsa_kernel_fusion
+        self.dsa_indexer_loss_coeff = dsa_indexer_loss_coeff
+        self.dsa_indexer_use_sparse_loss = dsa_indexer_use_sparse_loss
+        self.calculate_per_token_loss = calculate_per_token_loss
         # MTP layers use layer_idx == num_hidden_layers (+i), which is past the
         # per-decoder-layer compress_ratios list (length num_hidden_layers); fall
         # back to the last real layer's ratio so the MTP CSA still builds.
@@ -853,10 +860,10 @@ class CompressedSparseAttention(nn.Module):
         k_indexer_rank_major = k_indexer_seq_major = None
         ratio = self.compress_ratio
         indexer = self.indexer
-        indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
+        indexer_loss_coeff = self.dsa_indexer_loss_coeff or 0.0
         training_with_grad = self.training and torch.is_grad_enabled()
-        sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", True)
-        calculate_per_token_loss = getattr(self.config, "calculate_per_token_loss", False)
+        sparse_indexer_loss = self.dsa_indexer_use_sparse_loss
+        calculate_per_token_loss = self.calculate_per_token_loss
 
         if self.compressor is not None and ratio > 1:
             compressed_lens = torch.div(
@@ -1029,7 +1036,7 @@ class CompressedSparseAttention(nn.Module):
                     loss=indexer_loss,
                     layer_number=self.layer_idx,
                     num_layers=self.config.num_hidden_layers
-                    + (getattr(self.config, "num_nextn_predict_layers", 0) or 0),
+                    + self.config.num_nextn_predict_layers,
                     reduce_group=cp_group,
                 )
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
