@@ -50,9 +50,11 @@ run() {  # <mlite_src> -- <cmd...>
       export PATH=/usr/local/bin:/usr/bin:/bin; hash -r
       unset CONDA_DEFAULT_ENV CONDA_PREFIX PYTHONHOME VIRTUAL_ENV ROCR_VISIBLE_DEVICES || true
       export PYTHONNOUSERSITE=1
-      # Optional CSA-CP MCore prefix (only the DS4 arm sets MROOT; qwen's env is
-      # left identical across the A/B legs so the timing comparison stays clean).
-      export PYTHONPATH='${MROOT:-}':'${src}/experimental/lite':\${PYTHONPATH:-}
+      # Our experimental/lite MUST come first so megatron.lite resolves to this
+      # checkout's (streaming) code; megatron is a PEP-420 namespace package, so
+      # an optional fresh CSA-CP MCore (MROOT, only the DS4 arm sets it) merges
+      # its megatron.core into the same namespace without shadowing megatron.lite.
+      export PYTHONPATH='${src}/experimental/lite':'${MROOT:-}':\${PYTHONPATH:-}
       export TMPDIR=/tmp/ppab-\${SLURM_JOB_ID}
       export TORCHINDUCTOR_CACHE_DIR=\${TMPDIR}/ti TRITON_CACHE_DIR=\${TMPDIR}/triton
       export CUDA_DEVICE_MAX_CONNECTIONS=1 NCCL_NVLS_ENABLE=0
