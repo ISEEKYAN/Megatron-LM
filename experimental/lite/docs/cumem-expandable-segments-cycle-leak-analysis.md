@@ -1,10 +1,41 @@
 # Colocated RL per-cycle VRAM net-growth — cumem × expandable_segments 根因分析 (Branch C)
 
-Status: **零-GPU 分析先行,出假设 (2026-07-13).** 本文是 Branch C 的第一交付:把
-"每周期净增长"从父任务 (TASK-1.13.8) 的 "thin-margin, not a leak" 结论重新审到
-vLLM cumem 分配器 × PyTorch `expandable_segments` 的**已文档化不兼容**上,给出可证伪
-假设 + proxy 小模型复现/判别实验设计。**不烧大卡**;proxy 实验(0.6B~4B,1 节点,
-sleep/wake ×20)是下一帧,由本文的假设与判别树驱动。
+Status: **零-GPU 分析出假设 → Exp-1 已跑,决定性结果已回填 (2026-07-13).** 本文是
+Branch C 的交付:把"每周期净增长"从父任务 (TASK-1.13.8) 的 "thin-margin, not a leak"
+结论重新审到 vLLM cumem 分配器 × PyTorch `expandable_segments` 的**已文档化不兼容**上,
+给出可证伪假设 + proxy 复现/判别实验,并**已实测**。
+
+> ## ★ Exp-1 决定性结果 (job 13905350, rc=0, 3:19, <1 GPU-h, 2026-07-13) ★
+>
+> **载具**:vLLM 0.23.1.dev0+g0fc695fc6 (cw `verl.vllm023.sqsh`, editable @/vllm),
+> 小 proxy 模型 Qwen3-0.6B (真权重 dense qwen3),单卡 H100,`enable_sleep_mode=True`,
+> **gmu 0.7(铁律未降)**,CUDA graphs ON,idle sleep(level 1)/wake ×20,零 verl/mfsdp。
+> 原始 CSV:`examples/verl/cumem_cycle_probe/results/exp1-13905350-{A0,A1}.csv`。
+>
+> **结果:A0(expandable:True)与 A1(expandable:False)双臂,cycle-2 起逐位恒定,0 MiB/cycle。**
+>
+> | arm | expandable | awake (MiB) | asleep (MiB) | cycle2→20 drift |
+> |-----|-----------|-------------|--------------|-----------------|
+> | A0  | **True**  | 57641(恒)  | 2001(恒)    | **0 MiB** (bit-exact) |
+> | A1  | **False** | 57599(恒)  | 1959(恒)    | **0 MiB** (bit-exact) |
+>
+> - cycle-1 awake 偏高(A0=59777/A1=59763)是首轮 torch.compile/CUDA-graph 暖机瞬态,
+>   cycle-2 起即落到恒定值——**非累积**。
+> - A0−A1 稳态差 = **42 MiB 一次性**(expandable 的 VA 记账小额 overhead),**不逐周期累积**。
+>
+> **判定(见 §5 判别树"全平"分支)**:在**隔离的 vLLM idle sleep/wake 路径**上,
+> 文档化的 cumem×expandable 不兼容**不产生每周期泄漏**——H1/H2/H3/H4/F1 **在此范围内被否证**。
+> 真实 32/128 卡 run 的每周期净增长**不来自 vLLM 自身的 sleep/wake cumem 循环**,
+> 矛头须转向**训练侧进程(actor/mfsdp)的 expandable×cumem 交互**或 **update_weights 权重传输路径**
+> ——与 bayan 07:12 guide③(vLLM worker 内部本就强制 allocator False,矛头对准训练侧)一致。
+>
+> **对 Branch A 方向冲突的影响**:在 vLLM 侧,`expandable_segments:True` **不是**每周期增长之因
+> (双臂皆平,仅 42 MiB 一次性差)。故"expandable:True 是泄漏之因"这一疑虑**在 vLLM 侧被证伪**;
+> 但**全局/训练侧 scope 仍未实测**(本探针仅测 vLLM 侧)。是否推翻 Branch A 已批 lever =
+> 需一个训练侧 expandable×cumem 探针补测后由 human/moe 终裁(见 §6 下一帧)。
+
+**下一帧(未做)**:训练侧(actor 进程持 Adam/optimizer state + expandable)× vLLM colocate 的
+per-cycle 探针,或 update_weights 权重传输路径的显存差分——这才是真实 leak 的所在层。
 
 参考源(fetch 于 2026-07-13):
 - vLLM `device_allocator/cumem.py` @ `main` —
@@ -14,10 +45,11 @@ sleep/wake ×20)是下一帧,由本文的假设与判别树驱动。
 - vllm-ascend PR #9242 (Make expandable segments compatible with CuMemAllocator memory pool)
 - PyTorch tracking issue: pytorch/pytorch#147851 (expandable segments × fixed-address memory pool)
 
-> ⚠ **待补的新鲜度数据(点火前必填):cw 容器里的 vLLM 版本 + commit**。判别机制强依赖
-> 该版本是否已带 "pool context 内临时关 expandable_segments" 的 toggle(见 §2.2)。
-> 旧版是 **硬 assert**(直接 crash),新版是 **动态 toggle**(静默、只在 pool context 内关)。
-> proxy run 第一步 `python -c "import vllm; print(vllm.__version__)"` + grep cumem.py 落账。
+> ✅ **新鲜度数据(已落账,Exp-1)**:cw `verl.vllm023.sqsh` 内 vLLM =
+> `0.23.1.dev0+g0fc695fc6.d20260616`(editable @/vllm)。这是**新版 pool-context 动态
+> toggle**族(非旧版硬 assert)——Exp-1 双臂无 crash 即佐证:expandable:True 下 sleep/wake
+> 全程正常,进一步说明新版已在 cumem pool context 内动态处理 expandable,不再是 §2.2 的硬冲突。
+> 这也解释了为何 vLLM idle 路径**双臂皆平**:该版本已消化了文档化的不兼容。
 
 ---
 
@@ -215,7 +247,11 @@ for cycle in 1..20:
 
 ```
 A0 net-growth 斜率 > 噪声带?
-├─ 否(均值持平,largest-free-block/reserved-allocated 单调恶化)
+├─ 全平(awake 与 asleep 皆逐位恒定,无碎片恶化)  ⟵ ★ Exp-1 实测落此叶 ★
+│     ⇒ vLLM idle sleep/wake 路径**无泄漏、无碎片**(此版本已消化 cumem×expandable 冲突)。
+│        判定:每周期净增长**不在 vLLM 自身**;转查【训练侧 actor/mfsdp 进程的 expandable×cumem】
+│        与【update_weights 权重传输路径】。expandable:True 在 vLLM 侧非泄漏之因(仅 42MiB 一次性)。
+├─ 否但碎片恶化(均值持平,largest-free-block/reserved-allocated 单调恶化)
 │     ⇒ Fragmentation 族 (F1)。修法:碎片治理——但 expandable_segments 本身与 cumem
 │        fixed-address 冲突,方向是【收口 run 关 expandable_segments,靠 cumem toggle +
 │        empty_cache 时序】而非全局开 expandable。父任务"thin margin"成立但可控。
@@ -248,15 +284,19 @@ A0 net-growth 斜率 > 噪声带?
   性)→ 若 A0 也平则 Exp-2 `--reload-weights`(近似 update_weights,仍 vLLM-only)→ 若仍平
   则 Exp-3 全 colocated actor+vLLM proxy(需 verl/mfsdp,较重)。
 
-**下一帧(跑 Exp-1)= 独立 frame,两道前置闸(本 doer 不擅自越过):**
-1. **预算解冻**:bayan 05:41 "预算冻结到 Branch C 出假设";假设已出(本帧)⇒ 解冻**前置条件
-   已满足**,但实际烧卡(即便 <1 GPU-h)需 operator/bayan 点火,且是新 frame。
-2. **方向冲突裁决(moe 门)**:本文核心发现——**父任务 Branch A 全局 expandable_segments:True
-   很可能是因而非解**——与已 bayan 批准的 "primary lever" 方向冲突。若 A0/A1 证实,收口 run
-   需**不设全局 expandable_segments**,这是对已批准决策的推翻,属 human/moe 裁量,**本 doer
-   不擅自 revert 已批准代码/harness 方向**。
-3. **点火前必填**:cw/oci 容器 vLLM 版本 + commit(assert vs toggle,决定机制读法);小 proxy
-   模型落 lustre(`$MODEL/config.json`)。
+**Exp-1 已执行(2026-07-13,job 13905350,rc=0,bayan 07:12 解冻批准):**
+- 两道前置闸均已穿越:①预算解冻(bayan 07:12 批 <1 GPU-h);②新鲜度落账(vLLM 0.23.1.dev0)。
+- 结果见文首 ★ 决定性结果 ★:**双臂全平,0 MiB/cycle**,落 §5 判别树"全平"叶。
+- 原始曲线 commit 进交付仓:`examples/verl/cumem_cycle_probe/results/exp1-13905350-{A0,A1}.csv`。
 
-**收口**:Exp 定案 → 修法方向(§5 判别树,守 gmu 0.7 铁律、零 backend 分支)→ 同载具验证
-斜率归零 → 回 32/128 收口。
+**方向冲突裁决(仍需 human/moe 门,数据先行已就绪):**
+- Exp-1 证伪了"vLLM 侧 expandable:True 是每周期泄漏之因"(双臂皆平)。但**全局/训练侧 scope 未测**——
+  Branch A 的 lever 是**全局**施加,训练侧 actor 进程(持 Adam optimizer state,~35B×fp32 首步物化)
+  的 expandable×cumem 交互仍是未测变量。**是否推翻 Branch A 已批 lever = 需训练侧探针补测后 bayan 终裁。**
+
+**下一帧(未做,新 frame)= 训练侧 per-cycle 探针:**
+- 目标层:actor/mfsdp 进程 × vLLM colocate 的 per-cycle 设备驻留差分,或 update_weights 权重
+  传输路径的显存差分。这才是真实 32/128 卡 leak 的所在层(Exp-1 已排除 vLLM 自身)。
+- 需 verl/mfsdp(较重,非纯 vLLM),建议作为独立子任务,由 bayan 定预算与是否走小 proxy actor。
+
+**收口**:训练侧探针定位 → 修法方向(守 gmu 0.7 铁律、零 backend 分支)→ 同载具验证 → 回 32/128 收口。
