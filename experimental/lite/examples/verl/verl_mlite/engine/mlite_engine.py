@@ -427,7 +427,12 @@ class MegatronLiteEngine(BaseEngine):
         if grad_resident:
             free_grad_buffers(model_chunks)
             curve.append(cuda_mem_snapshot("resync/after_grad_free"))
-        return {"opt_resident": opt_resident, "grad_resident": grad_resident, "curve": curve}
+        return {
+            "opt_resident": opt_resident,
+            "grad_resident": grad_resident,
+            "curve": curve,
+            "worst_tensor": {"name": None, "peak_bytes": 0},
+        }
 
     def _stream_resync_export(self, weights, model_chunks: list, resync: dict):
         """Yield the export stream, then restore evicted training state.
@@ -443,7 +448,28 @@ class MegatronLiteEngine(BaseEngine):
         resync["curve"].append(cuda_mem_snapshot("resync/export_begin"))
         exported = False
         try:
-            yield from weights
+            # Per-tensor residency control: after every exported tensor has been
+            # consumed by the colocated vLLM worker, drop our reference and
+            # release the caching-allocator blocks so the next tensor's export
+            # all-gather does not stack on top of the previous one. The peak
+            # allocation captured for each tensor (its materialisation happens in
+            # ``next(weights)`` just before the yield) is tracked so a failed run
+            # pins the single-tensor lower bound instead of only reporting the
+            # aggregate peak. Runs only during resync export, never in a hot
+            # loop.
+            for item in weights:
+                if torch.cuda.is_available():
+                    peak = torch.cuda.max_memory_allocated()
+                    if peak > resync["worst_tensor"]["peak_bytes"]:
+                        resync["worst_tensor"] = {
+                            "name": item[0] if isinstance(item, tuple) else None,
+                            "peak_bytes": peak,
+                        }
+                yield item
+                del item
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
             exported = True
         finally:
             resync["curve"].append(cuda_mem_snapshot("resync/export_end"))
@@ -486,12 +512,22 @@ class MegatronLiteEngine(BaseEngine):
         """Emit the resync memory curve (stdout marker + optional JSONL file)."""
         curve = resync["curve"]
         rank = dist.get_rank() if dist.is_initialized() else 0
-        peak = max((s.get("max_allocated_gib", s["allocated_gib"]) for s in curve), default=0.0)
+        worst = resync["worst_tensor"]
+        worst_gib = worst["peak_bytes"] / (1024**3)
+        # Per-tensor empty_cache resets peak stats between tensors, so the
+        # curve snapshots understate the true export peak; the worst single
+        # tensor is the real lower bound and must dominate the reported peak.
+        curve_peak = max(
+            (s.get("max_allocated_gib", s["allocated_gib"]) for s in curve),
+            default=0.0,
+        )
+        peak = max(curve_peak, worst_gib)
         summary = " ".join(f"{s['tag']}={s['allocated_gib']:.3f}" for s in curve)
         print(
             f"MLITE_RESYNC_MEMCURVE rank={rank} "
             f"opt_offloaded={resync['opt_resident']} grad_freed={resync['grad_resident']} "
-            f"{summary} export_peak_max_alloc_gib={peak:.3f}",
+            f"{summary} worst_tensor={worst['name']} worst_tensor_peak_gib={worst_gib:.3f} "
+            f"export_peak_max_alloc_gib={peak:.3f}",
             flush=True,
         )
         path = os.environ.get("MLITE_RESYNC_MEMLOG_PATH")
@@ -502,6 +538,8 @@ class MegatronLiteEngine(BaseEngine):
                 "rank": rank,
                 "opt_offloaded": resync["opt_resident"],
                 "grad_freed": resync["grad_resident"],
+                "worst_tensor": worst["name"],
+                "worst_tensor_peak_gib": worst_gib,
                 "export_peak_max_alloc_gib": peak,
                 "curve": curve,
             }

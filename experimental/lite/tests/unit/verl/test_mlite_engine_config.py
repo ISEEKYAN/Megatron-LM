@@ -344,6 +344,75 @@ def test_resync_no_smoke_exit_without_env(monkeypatch) -> None:
     assert [name for name, _ in weights] == ["w"]
 
 
+def test_resync_export_empty_caches_and_tracks_worst_tensor_per_tensor(monkeypatch) -> None:
+    """Per-tensor residency control: after each exported tensor is consumed the
+    caching allocator is reclaimed and the worst single-tensor peak is tracked,
+    so a failed colocated resync pins the single-tensor lower bound."""
+    engine = _engine(engine_config=_engine_config(param_offload=False))
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            return iter(
+                [("a", torch.zeros(1)), ("b", torch.zeros(2)), ("c", torch.zeros(3))]
+            )
+
+    engine.runtime = Runtime()
+    engine.handle = _fake_handle()
+    engine._initial_sync_cache_cleared = True
+
+    calls = {"empty_cache": 0, "reset_peak": 0}
+    # peak established when each tensor is produced (b is the worst)
+    peaks = iter([10, 40, 25])
+    current = {"peak": 10}
+
+    class _FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def empty_cache():
+            calls["empty_cache"] += 1
+
+        @staticmethod
+        def reset_peak_memory_stats():
+            calls["reset_peak"] += 1
+            current["peak"] = next(peaks, 0)
+
+        @staticmethod
+        def max_memory_allocated():
+            return current["peak"]
+
+        @staticmethod
+        def memory_allocated():
+            return 0
+
+        @staticmethod
+        def memory_reserved():
+            return 0
+
+    import verl_mlite.engine.mlite_engine as me
+
+    monkeypatch.setattr(me.torch, "cuda", _FakeCuda)
+
+    printed: list[str] = []
+    monkeypatch.setattr(
+        "builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a))
+    )
+
+    weights, _ = engine.get_per_tensor_param()
+    drained = list(weights)
+
+    assert [name for name, _ in drained] == ["a", "b", "c"]
+    assert [t.numel() for _, t in drained] == [1, 2, 3]
+    # one empty_cache per exported tensor; one reset at export_begin + one/tensor
+    assert calls["empty_cache"] == 3
+    assert calls["reset_peak"] == 4
+    curve_line = next(p for p in printed if "MLITE_RESYNC_MEMCURVE" in p)
+    assert "worst_tensor=b" in curve_line
+
+
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
     optimizer = SimpleNamespace(param_groups=[{"lr": 0.0, "weight_decay": 0.1}])
     opt = SimpleNamespace(
