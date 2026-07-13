@@ -79,6 +79,7 @@ _MODEL_FORWARD_KEYS = (
     "temperature",
     "calculate_entropy",
     "enable_mtp",
+    "packed_seq_params",
 )
 
 
@@ -167,7 +168,6 @@ def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
     }
     add_loss_context_kwargs(kwargs)
     _prepare_packed_contiguous_cp_kwargs(model, kwargs)
-    kwargs.pop("packed_seq_params", None)
     return {key: value for key, value in kwargs.items() if key in _MODEL_FORWARD_KEYS}
 
 
