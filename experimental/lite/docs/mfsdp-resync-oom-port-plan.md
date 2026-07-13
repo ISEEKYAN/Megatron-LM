@@ -2,10 +2,14 @@
 
 Status: **prepared, gated on DS4 (TASK-1.1.12) validating the resync-memory recipe.**
 Do NOT burn GPU on this until DS4 confirms which branch below actually holds.
-DS4's recipe was settled 2026-07-12 20:48 (see below): `expandable_segments` is the
-PRIMARY lever ⇒ Branch A (env-only, applied on the cw harness — no repo patch) is
-the leading and likely sole port. Branch B (mfsdp code) stays UNWRITTEN by design
-until DS4 proves A insufficient.
+DS4's recipe: `expandable_segments` is the PRIMARY lever (20:48) ⇒ Branch A
+(env-only, applied on the cw harness — no repo patch) is the leading and likely
+sole port; Branch B (mfsdp code) stays UNWRITTEN by design until DS4 proves A
+insufficient. **20:54 correction folded in**: per-tensor `empty_cache` hard-OFF,
+and a mandatory pre-ignition memory-budget gate (`<80 GiB/card with headroom`,
+optim state *empirically* off-GPU) that OUR colocated收口 run must also pass —
+see §"DS4 20:54 correction" and execution step 2. DS4 is still In Progress / NOT
+green as of 2026-07-12.
 
 ## Where we are
 
@@ -66,9 +70,28 @@ The DS4 relaunch recipe bayan approved is:
 
 Port only what DS4 validates green, and carry the same wall-time gate.
 
-Status note (2026-07-12): DS4 (TASK-1.1.12) is still In Review; the 20:48 recipe
-was a "must-change-before-ignition" correction, so it had **not yet been validated
-green** when this plan was last touched. This task stays gated until it is.
+### DS4 20:54 correction (supersedes 20:48 on two points)
+
+bayan scancelled DS4 job 13870979 (止损) and corrected the recipe again at
+2026-07-12 20:54. Two deltas that reshape this plan:
+
+1. **Per-tensor `empty_cache` is hard-OFF** — reconfirmed (thousands of tensors
+   would 等死). `expandable_segments` + instrumentation stay. Our Branch B is
+   already threshold-batched (≥4 GiB), not per-tensor, so this only *strengthens*
+   the existing ordering — do NOT resurrect per-tensor cleanup.
+2. **NEW pre-ignition memory-budget gate** — before burning ANY card, itemize the
+   per-card residency and prove `< 80 GiB with headroom`. bayan's algorithm:
+   - rollout side: vLLM per-card weight (e.g. FP8+TP16 ⇒ ≈300GB/16 ≈ 19 GiB);
+   - training side: actor weight after parallel sharding, **+ optim state proven
+     *empirically* CPU-offloaded (not by reading a flag — verify it is not GPU
+     resident; last time an `opt_offloaded=False` field's semantics were unclear),
+     + activations + NCCL buffers, each itemized;
+   - sum `< 80 GiB` with headroom = the only green-light to ignite; log the table.
+
+Status note (2026-07-12): DS4 (TASK-1.1.12) is **still In Progress, NOT green** —
+20:48 and 20:54 were both "must-change-before-ignition" corrections and the last
+job was scancelled before completing; a DS4 worker resumed at 20:54 to produce the
+budget analysis. This task stays gated until DS4 validates a recipe green.
 
 ## Port plan — two branches
 
@@ -166,14 +189,31 @@ MoE use-after-free pitfall, not a mechanical edit.
 1. Wait for DS4 (TASK-1.1.12) to go green, then read its validated recipe +
    evidence (incl. measured resync wall-time overhead). Expect Branch A
    (`expandable_segments`) to be the answer since it is DS4's primary lever.
-2. Apply the minimal port:
+2. **Pre-ignition memory-budget gate (mandatory, per DS4 20:54)** — before
+   launching the 32-card收口 run, produce and log the per-card residency table for
+   OUR colocated site and prove `< 80 GiB with headroom`:
+   - vLLM per-card rollout weight (at the收口 run's actual TP/quant);
+   - actor weight after mfsdp sharding at TP1·PP1·CP4·EP8·DP2;
+   - **⚠ offload tension**: mfsdp DAPO config currently ships param/optim/grad
+     offload **OFF** (`config/engine/mlite.yaml`, see §"materialization peak"). The
+     gate demands optim state be *empirically* off-GPU — so either flip offload ON
+     for the收口 run and verify residency, or budget the full resident optim state
+     and confirm the sum still clears 80 GiB. Do NOT trust the flag; measure.
+   - export materialization peak (≈69–77 GiB if `materialize_all` stays) +
+     activations + NCCL buffers, itemized.
+   Sum < 80 GiB with headroom is the only green-light. If the table itself shows
+   Branch A (`expandable_segments`, a fragmentation fix, not a residency fix)
+   cannot close an *absolute*-residency overflow, that is the signal Branch B
+   (streaming export to cut the materialization peak) is required — decide from the
+   table BEFORE burning the card, not after another OOM.
+3. Apply the minimal port:
    - Branch A: add the env line to the cw DAPO mfsdp harness at launch time
      (no repo patch). This is the default plan.
-   - Branch B (only if A proves insufficient on the收口 run): opt-in,
+   - Branch B (only if the budget table or A's result proves it needed): opt-in,
      default-off, threshold-batched streaming export + GPU verify the peak drops
      AND wall-time overhead ≤20%. Do NOT pre-write this speculatively — its shape
      depends on DS4's threshold/wall-time evidence and it carries the live MoE
      use-after-free hazard documented above.
-3. Re-run the 32-card DAPO E2E收口 (fix `c17a05eff` + FR + watchdog, budget ≤16
+4. Re-run the 32-card DAPO E2E收口 (fix `c17a05eff` + FR + watchdog, budget ≤16
    GPU-h) for curves/throughput vs existing DAPO. Register via
    `vicky work execute remote-job` to avoid auto-submit/reap.
