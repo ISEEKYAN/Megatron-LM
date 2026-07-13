@@ -594,7 +594,15 @@ env = {name: os.environ[name] for name in names}
 # (os.environ); propagate them into the Ray actor env only when set so the
 # 8-GPU proxy gets its fail-fast verdict + JSONL curve, while the production
 # run (vars unset) stays a no-op.
-for name in ("MLITE_RESYNC_SMOKE_EXIT_AFTER", "MLITE_RESYNC_MEMLOG_PATH"):
+# MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD is the S qualification-smoke knob: it moves
+# the pp>1 resync export gathered dict off GPU (bounded resync peak). Forward it
+# only when set so kimi/glm5/qwen and the production DS4 run stay on the default
+# GPU export path.
+for name in (
+    "MLITE_RESYNC_SMOKE_EXIT_AFTER",
+    "MLITE_RESYNC_MEMLOG_PATH",
+    "MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD",
+):
     if os.environ.get(name):
         env[name] = os.environ[name]
 env["VERL_MLITE_SKIP_RUNTIME_PATCHES"] = "0"

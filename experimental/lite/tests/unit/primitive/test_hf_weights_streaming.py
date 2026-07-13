@@ -509,3 +509,106 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
     assert torch.equal(
         tensor, torch.stack(expected_local + [value + 100 for value in expected_local])
     )
+
+
+def _pp2_export_fixture(monkeypatch, *, pp_cpu_group):
+    """Fake pp_size=2 export scaffold; returns (recorded, run) where run() invokes
+    export and `recorded` captures the all_gather_object group + _gather_dense cpu."""
+    import megatron.lite.primitive.ckpt.hf_weights as hw
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.arange(6, dtype=torch.float32).reshape(2, 3))
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def is_expert(name):
+            return False
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 2,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+            "pp_group": "nccl-pp",
+            "pp_cpu_group": pp_cpu_group,
+        },
+    )()
+
+    recorded = {"group": None, "gather_cpu": None}
+
+    real_gather_dense = hw._gather_dense
+
+    def spy_gather_dense(name, tensor, spec, ps, *, cpu=True):
+        recorded["gather_cpu"] = cpu
+        return real_gather_dense(name, tensor, spec, ps, cpu=cpu)
+
+    def fake_all_gather_object(all_states, obj, group=None):
+        recorded["group"] = group
+        all_states[0] = obj
+        all_states[1] = {"weight2": next(iter(obj.values()))}
+
+    monkeypatch.setattr(hw, "_gather_dense", spy_gather_dense)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
+
+    def run():
+        return dict(export_hf_weights(Model(), Spec(), ps))
+
+    return recorded, run
+
+
+def test_pp_export_defaults_to_nccl_group_and_device_resident(monkeypatch) -> None:
+    monkeypatch.delenv("MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD", raising=False)
+    recorded, run = _pp2_export_fixture(monkeypatch, pp_cpu_group="gloo-pp")
+
+    exported = run()
+
+    # Default path unchanged: NCCL pp_group, cpu follows the caller default (False).
+    assert recorded["group"] == "nccl-pp"
+    assert recorded["gather_cpu"] is False
+    assert exported.keys() == {"weight", "weight2"}
+
+
+def test_pp_export_cpu_offload_routes_over_gloo_and_forces_cpu(monkeypatch) -> None:
+    monkeypatch.setenv("MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD", "1")
+    recorded, run = _pp2_export_fixture(monkeypatch, pp_cpu_group="gloo-pp")
+
+    exported = run()
+
+    # S engaged: PP gather rides the gloo pp_cpu_group (bytes stay off GPU) and
+    # the resident gathered dict is forced to CPU.
+    assert recorded["group"] == "gloo-pp"
+    assert recorded["gather_cpu"] is True
+    assert exported.keys() == {"weight", "weight2"}
+
+
+def test_pp_export_cpu_offload_falls_back_when_no_gloo_group(monkeypatch) -> None:
+    monkeypatch.setenv("MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD", "1")
+    recorded, run = _pp2_export_fixture(monkeypatch, pp_cpu_group=None)
+
+    exported = run()
+
+    # No gloo pp_cpu_group available -> stay on the default NCCL path (no crash),
+    # gather_cpu falls back to the caller default (False).
+    assert recorded["group"] == "nccl-pp"
+    assert recorded["gather_cpu"] is False
+    assert exported.keys() == {"weight", "weight2"}

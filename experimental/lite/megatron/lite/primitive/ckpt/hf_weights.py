@@ -602,6 +602,28 @@ def _maybe_cpu(tensor: torch.Tensor, *, cpu: bool) -> torch.Tensor:
     return _to_cpu(tensor) if cpu else tensor
 
 
+# Env-gated CPU offload for the pp>1 export path. Default OFF: the pp>1 branch
+# accumulates the full local model shard in a GPU-resident `gathered` dict
+# (cpu=False) and then `all_gather_object` over the NCCL pp_group re-materializes
+# every PP shard as pickled bytes on GPU — together this is the resync export
+# peak (~36.5 GiB/rank observed for DS4 128-card). When this flag is set, the
+# gathered dict is kept on CPU AND the PP gather is routed over the gloo
+# `pp_cpu_group`, so neither the resident dict nor the pickled byte buffers touch
+# GPU. Quantization/copies fall to CPU (slower) — intended only for the DS4
+# qualification smoke, which is perf-agnostic; the default path is unchanged so
+# kimi/glm5/qwen do not regress.
+_EXPORT_PP_CPU_OFFLOAD_ENV = "MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD"
+
+
+def _export_pp_cpu_offload_enabled() -> bool:
+    return os.getenv(_EXPORT_PP_CPU_OFFLOAD_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def remap_layer_index(name: str, global_to_local: dict[int, int]) -> str | None:
     if not global_to_local:
         return name
@@ -985,6 +1007,17 @@ def export_hf_weights(
         yield from _flush_expert_bucket()
         return
 
+    # S (env-gated): keep the pp>1 gathered dict off GPU and route the PP gather
+    # over the gloo pp_cpu_group so the resync export peak (~36.5 GiB/rank) is
+    # bounded. Only engages when pp>1 and a gloo pp_cpu_group is available; else
+    # the default GPU path is used unchanged.
+    pp_cpu_offload = (
+        ps.pp_size > 1
+        and _export_pp_cpu_offload_enabled()
+        and getattr(ps, "pp_cpu_group", None) is not None
+    )
+    gather_cpu = cpu or pp_cpu_offload
+
     gathered: dict[str, torch.Tensor] = {}
     for chunk in chunks:
         base_chunk = unwrap_model(chunk)
@@ -999,14 +1032,15 @@ def export_hf_weights(
             t = _materialize_dtensor(param.data.detach())
 
             if spec.is_expert(gname):
-                _gather_expert(gname, t, spec, ps, gathered, cpu=cpu)
+                _gather_expert(gname, t, spec, ps, gathered, cpu=gather_cpu)
             else:
-                gathered[gname] = _gather_dense(gname, t, spec, ps, cpu=cpu)
+                gathered[gname] = _gather_dense(gname, t, spec, ps, cpu=gather_cpu)
 
     # PP gather
     if ps.pp_size > 1:
+        pp_gather_group = ps.pp_cpu_group if pp_cpu_offload else ps.pp_group
         all_states: list[dict | None] = [None] * ps.pp_size
-        dist.all_gather_object(all_states, gathered, group=ps.pp_group)
+        dist.all_gather_object(all_states, gathered, group=pp_gather_group)
         gathered = {}
         for s in all_states:
             if s is not None:

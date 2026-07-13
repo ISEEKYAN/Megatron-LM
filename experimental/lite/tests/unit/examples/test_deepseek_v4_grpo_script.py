@@ -597,18 +597,22 @@ def test_runtime_env_propagates_resync_smoke_controls_only_when_set() -> None:
     baseline = _run_runtime_env_generator({})
     assert "MLITE_RESYNC_SMOKE_EXIT_AFTER" not in baseline
     assert "MLITE_RESYNC_MEMLOG_PATH" not in baseline
+    assert "MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD" not in baseline
     assert baseline["VERL_MLITE_SKIP_RUNTIME_PATCHES"] == "0"
 
     # 8-GPU proxy (vars set): they must reach the Ray actor os.environ so the
-    # fail-fast verdict + JSONL curve fire.
+    # fail-fast verdict + JSONL curve fire, and S (pp>1 export CPU offload)
+    # actually engages inside the actor engine.
     proxy = _run_runtime_env_generator(
         {
             "MLITE_RESYNC_SMOKE_EXIT_AFTER": "1",
             "MLITE_RESYNC_MEMLOG_PATH": "/tmp/curve.jsonl",
+            "MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD": "1",
         }
     )
     assert proxy["MLITE_RESYNC_SMOKE_EXIT_AFTER"] == "1"
     assert proxy["MLITE_RESYNC_MEMLOG_PATH"] == "/tmp/curve.jsonl"
+    assert proxy["MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD"] == "1"
 
 
 def test_mlite_engine_reapplies_vllm_device_uuid_patch_before_registration() -> None:
