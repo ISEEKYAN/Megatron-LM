@@ -245,3 +245,197 @@ def test_missing_clone_recv_corrupts_retained_inputs(pp_size, num_microbatches):
         f"pp={pp_size} nmb={num_microbatches}: missing-clone aliasing no longer "
         f"corrupts retained inputs; the clone_recv guard may be gone"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Real-function CPU execution harness
+#
+# The tests above model the *decisions* of ``_1f1b_schedule``; the tests below
+# execute the **actual** ``_1f1b_schedule`` -- its real warmup/steady/cooldown
+# control flow, real forward/backward, real buffer reuse and real ``clone_recv``
+# path -- one rank at a time on CPU. Two things are stubbed, nothing is
+# re-implemented:
+#   1. ``torch.empty(..., device="cuda")`` (the pre-allocated recv buffers) is
+#      redirected to CPU via a thin shim, so the schedule needs no GPU.
+#   2. ``_send_recv_pipeline`` is replaced by an in-process spy that mirrors the
+#      real helper's recv tail exactly (write fresh data into the shared buffer,
+#      then ``clone()`` iff ``clone_recv``) and records what the schedule asked
+#      for. There is no live peer, so each rank runs independently and the spy
+#      supplies the received tensor.
+#
+# This directly exercises: (a) the warmup->steady prefetch fix -- a missing
+# prefetch would make the schedule forward a non-first stage on a ``None`` input;
+# (b) the ``clone_recv=True`` fix -- with real cloning each retained microbatch
+# input gets distinct storage, and the ``force_no_clone`` control shows the
+# real schedule aliasing them when the clone is removed.
+# ══════════════════════════════════════════════════════════════════════════
+from types import SimpleNamespace  # noqa: E402
+
+import torch  # noqa: E402
+
+from megatron.lite.primitive.parallel import pipeline as _pl  # noqa: E402
+
+_SHAPE = (2, 3)
+
+
+def _mk_activation():
+    """A differentiable leaf activation the schedule can send/retain/backward."""
+    return torch.ones(_SHAPE, dtype=_pl._PIPELINE_TENSOR_DTYPE, requires_grad=True)
+
+
+def _run_real_schedule_for_rank(pp_size, num_microbatches, rank, *, force_no_clone, mp):
+    """Execute the real ``_1f1b_schedule`` for a single ``rank`` on CPU.
+
+    Returns a record: fwd send/recv counts, the ``clone_recv`` flag seen on each
+    fwd recv, the ``data_ptr`` of the fwd input each forward consumed, and
+    whether any non-first forward ran on a ``None`` input.
+    """
+    is_first = rank == 0
+    is_last = rank == pp_size - 1
+    ps = SimpleNamespace(
+        pp_size=pp_size, pp_rank=rank, pp_is_first=is_first, pp_is_last=is_last
+    )
+    rec = {"sends": 0, "recvs": 0, "clone_flags": [], "fwd_input_ptrs": [], "none_input": False}
+    recv_n = {"v": 0}
+
+    orig_empty = torch.empty
+
+    def _empty_cpu(*a, **k):
+        if k.get("device") == "cuda":
+            k = {**k, "device": "cpu"}
+        return orig_empty(*a, **k)
+
+    mp.setattr(torch, "empty", _empty_cpu)
+
+    def _spy_send_recv(
+        send_fwd, send_bwd, recv_fwd, recv_bwd, ps_, tensor_shape,
+        *, fwd_recv_buf=None, bwd_recv_buf=None, batch_p2p=True, clone_recv=False,
+    ):
+        if send_fwd is not None:
+            rec["sends"] += 1
+        fwd_buf = None
+        bwd_buf = None
+        if recv_fwd:
+            rec["recvs"] += 1
+            rec["clone_flags"].append(clone_recv)
+            recv_n["v"] += 1
+            fwd_buf = (
+                fwd_recv_buf
+                if fwd_recv_buf is not None
+                else orig_empty(tensor_shape, dtype=_pl._PIPELINE_TENSOR_DTYPE, device="cpu")
+            )
+            # ``.data`` write mirrors irecv's raw-storage fill (bypasses autograd),
+            # so reusing a grad-requiring buffer behaves like the real P2P recv.
+            fwd_buf.data.fill_(float(recv_n["v"]))
+            # Mirror _send_recv_pipeline's recv tail exactly.
+            if clone_recv and not force_no_clone:
+                fwd_buf = fwd_buf.clone()
+            fwd_buf.grad = None
+            fwd_buf.requires_grad_()
+        if recv_bwd:
+            bwd_buf = (
+                bwd_recv_buf
+                if bwd_recv_buf is not None
+                else orig_empty(tensor_shape, dtype=_pl._PIPELINE_TENSOR_DTYPE, device="cpu")
+            )
+            if clone_recv and not force_no_clone:
+                bwd_buf = bwd_buf.clone()
+        return fwd_buf, bwd_buf
+
+    mp.setattr(_pl, "_send_recv_pipeline", _spy_send_recv)
+
+    def forward_step_fn(model, batch):  # first stage entry
+        return {"hidden_states": _mk_activation()}
+
+    class _MidModel:
+        def __call__(self, hidden_states=None, position_ids=None, packed_seq_params=None, **kw):
+            if hidden_states is None:
+                rec["none_input"] = True
+                hidden_states = _mk_activation()
+            else:
+                rec["fwd_input_ptrs"].append(hidden_states.data_ptr())
+            return {"hidden_states": hidden_states * 1.0}  # keep it differentiable
+
+    class _LastModel:
+        def __call__(self, input_ids=None, hidden_states=None, **kw):
+            if hidden_states is None:
+                rec["none_input"] = True
+                hidden_states = _mk_activation()
+            else:
+                rec["fwd_input_ptrs"].append(hidden_states.data_ptr())
+            return {"loss": hidden_states.sum()}
+
+    model = _LastModel() if is_last else _MidModel()
+    data_iter = iter([{} for _ in range(num_microbatches)])
+    _pl._1f1b_schedule(
+        forward_step_fn, model, data_iter, num_microbatches,
+        SimpleNamespace(), ps, _SHAPE,
+        grad_sync_fn=None, pre_forward_hook=None, loss_fn=None,
+    )
+    return rec
+
+
+_REAL_CONFIGS = [(3, 1), (3, 2), (3, 3), (3, 4), (4, 2), (4, 3), (4, 8), (8, 4)]
+
+
+@pytest.mark.parametrize("pp_size,num_microbatches", _REAL_CONFIGS)
+def test_real_1f1b_schedule_runs_clean_on_cpu(pp_size, num_microbatches, monkeypatch):
+    """Running the actual ``_1f1b_schedule`` for every rank: no stage forwards on
+    a None input, fwd send/recv counts balance across adjacent stages, and every
+    fwd recv requests ``clone_recv=True``. Covers num_microbatches < pp_size."""
+    recs = []
+    for rank in range(pp_size):
+        with monkeypatch.context() as m:
+            recs.append(
+                _run_real_schedule_for_rank(
+                    pp_size, num_microbatches, rank, force_no_clone=False, mp=m
+                )
+            )
+    for r in range(pp_size):
+        assert not recs[r]["none_input"], f"pp={pp_size} nmb={num_microbatches} rank{r}: forward on None input"
+    for r in range(pp_size - 1):
+        assert recs[r]["sends"] == recs[r + 1]["recvs"], (
+            f"pp={pp_size} nmb={num_microbatches}: r{r} sends={recs[r]['sends']} "
+            f"!= r{r+1} recvs={recs[r+1]['recvs']}"
+        )
+    for r in range(1, pp_size):
+        assert recs[r]["recvs"] == num_microbatches, (
+            f"pp={pp_size} nmb={num_microbatches} rank{r}: recvs={recs[r]['recvs']}"
+        )
+        assert recs[r]["clone_flags"] and all(recs[r]["clone_flags"]), (
+            f"pp={pp_size} nmb={num_microbatches} rank{r}: schedule did not request clone_recv on every fwd recv"
+        )
+
+
+@pytest.mark.parametrize("pp_size,num_microbatches", [(3, 2), (3, 4), (4, 3), (4, 8), (8, 4)])
+def test_real_schedule_clone_gives_distinct_retained_inputs(pp_size, num_microbatches, monkeypatch):
+    """A middle stage of the real schedule holds input k while the recv feeding
+    input k+1 lands, so consecutive inputs are simultaneously live and must not
+    alias. With the shipped ``clone_recv=True`` every consecutive pair differs.
+
+    (Whole-run distinctness is *not* asserted: once a retained input is popped
+    and backward-ed, its clone is freed and the allocator legitimately reuses
+    that storage for a later, non-overlapping microbatch.)"""
+    with monkeypatch.context() as m:
+        rec = _run_real_schedule_for_rank(pp_size, num_microbatches, 1, force_no_clone=False, mp=m)
+    ptrs = rec["fwd_input_ptrs"]
+    assert len(ptrs) == num_microbatches
+    collisions = [i for i in range(len(ptrs) - 1) if ptrs[i] == ptrs[i + 1]]
+    assert not collisions, (
+        f"pp={pp_size} nmb={num_microbatches}: consecutive live inputs share "
+        f"storage at indices {collisions}; clone_recv should keep them distinct. ptrs={ptrs}"
+    )
+
+
+@pytest.mark.parametrize("pp_size,num_microbatches", [(3, 2), (4, 3), (8, 4)])
+def test_real_schedule_without_clone_aliases_retained_inputs(pp_size, num_microbatches, monkeypatch):
+    """Positive control: strip the clone from the transport and the real schedule
+    aliases its retained inputs to the one shared buffer -- the corruption the
+    ``clone_recv=True`` fix prevents. Proves the harness actually detects it."""
+    with monkeypatch.context() as m:
+        rec = _run_real_schedule_for_rank(pp_size, num_microbatches, 1, force_no_clone=True, mp=m)
+    ptrs = rec["fwd_input_ptrs"]
+    assert len(set(ptrs)) == 1, (
+        f"pp={pp_size} nmb={num_microbatches}: without clone every retained input "
+        f"should alias the one shared buffer, got data_ptrs {ptrs}"
+    )
