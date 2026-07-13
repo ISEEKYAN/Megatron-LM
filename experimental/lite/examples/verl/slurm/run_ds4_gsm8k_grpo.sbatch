@@ -147,7 +147,15 @@ if [[ -n "${MLITE_WEIGHT_SYNC_PROBE:-}" || -n "${MLITE_WEIGHT_SYNC_PROBE_BACKEND
 fi
 unset MLITE_WEIGHT_SYNC_PROBE MLITE_WEIGHT_SYNC_PROBE_BACKEND
 
-export PATH=/usr/local/bin:/usr/bin:/bin
+# Pin the CUDA toolkit to the container's coherent CUDA 13.0 install. Without
+# this, TileLang's find_cuda_path() falls back to the pip-floating
+# nvidia/cu13 package (a different nvcc minor, e.g. 13.2) whose compiler is
+# incompatible with the cccl headers shipped alongside /usr/local/cuda, and the
+# DS4 mhc_pre_tilelang runtime nvcc JIT compile fails with
+# "CUDA compiler and CUDA toolkit headers are incompatible".
+export CUDA_HOME=/usr/local/cuda
+export CUDA_PATH=/usr/local/cuda
+export PATH=/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin
 hash -r
 export CC=/usr/bin/gcc
 export CXX=/usr/bin/g++
@@ -498,6 +506,8 @@ import os
 names = [
     "PYTHONPATH",
     "PATH",
+    "CUDA_HOME",
+    "CUDA_PATH",
     "CC",
     "CXX",
     "CPATH",
