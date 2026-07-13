@@ -763,3 +763,152 @@ def test_pp_export_never_materializes_the_whole_stage(monkeypatch) -> None:
     # Only the first parameter has been pulled from the lazy generator; the
     # remaining two stay untouched — the stage was never fully materialized.
     assert visited == ["weight_a"]
+
+
+def test_expert_export_never_materializes_the_whole_expert_set(monkeypatch) -> None:
+    """Residency guard: the EP (expert) export path streams bounded buckets and
+    never materializes the whole expert set on any rank before it starts
+    yielding.
+
+    This mirrors DS4's production expert path: unpacked experts
+    (``packed_expert_group_name`` returns ``None``) are gathered EP-rank by
+    EP-rank in buckets capped at ``buffer_max_size_bytes // ep_size`` (and at
+    most four local params per collective — hf_weights.py ``_flush_expert_bucket``
+    / the ``len(expert_bucket) >= 4`` flush trigger).  A regression that reverted
+    to whole-set materialization — collecting every local expert (and its EP
+    all-gather output) into one dict before the first yield, the shape of both
+    upstreams' in-memory EP gather (mbridge ``_flush_ep_bucket`` expands the
+    gathered bucket into an ``etp_bucket`` sized to the full expert set;
+    NVIDIA Megatron-Bridge ``gather_from_ep_ranks`` all-gathers each expert with
+    no per-rank byte cap) — would make this test RED: it would fire every EP
+    collective (one per local expert) before a single param streamed out, and
+    the peak count of gathered-but-not-yet-yielded expert tensors would equal the
+    whole local set rather than one bounded bucket.
+    """
+    num_local_experts = 16  # per EP rank; 2 EP ranks -> 32 experts total
+    ep_size = 2
+    num_experts_total = num_local_experts * ep_size
+
+    class ExpertGroup(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            for idx in range(num_local_experts):
+                self.register_parameter(
+                    f"weight{idx}",
+                    nn.Parameter(torch.arange(8, dtype=torch.float32) + idx * 100),
+                )
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mlp = nn.Module()
+            self.mlp.experts = ExpertGroup()
+
+    class Spec:
+        num_experts = num_experts_total
+
+        @staticmethod
+        def is_expert(name):
+            return ".experts." in name
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+        @staticmethod
+        def packed_expert_group_name(name):
+            return None  # DS4: unpacked, each expert emitted as its own key
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": ep_size,
+            "ep_group": "ep",
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+
+    # Track the number of EP collectives fired and the peak count of gathered
+    # expert shards that are alive but not yet yielded.
+    state = {"gathers": 0, "gathered_since_yield": 0, "peak_gathered": 0}
+
+    def fake_all_gather_into_tensor(output, tensor, group=None):
+        assert group == "ep"
+        state["gathers"] += 1
+        # Each collective gathers one bounded bucket (<=4 local params); count
+        # how many local params rode this collective.
+        per_param = tensor.numel() // 4  # 8 elements/param, fp32
+        n_params_in_bucket = max(1, tensor.numel() // 8)
+        state["gathered_since_yield"] += n_params_in_bucket
+        state["peak_gathered"] = max(
+            state["peak_gathered"], state["gathered_since_yield"]
+        )
+        del per_param
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor + 1000)
+
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
+    )
+
+    # buffer_max_size_bytes // ep_size caps each bucket well below the whole
+    # local set: 8 elements * 4 bytes = 32 B/param, cap 128 B/rank -> 4 params
+    # per bucket (also hits the len>=4 flush).
+    buffer_max_size_bytes = 256
+    per_rank_cap_bytes = buffer_max_size_bytes // ep_size  # 128 B
+    max_params_per_bucket = 4  # len(expert_bucket) >= 4 flush trigger
+
+    stream = export_hf_weights(
+        Model(), Spec(), ps, cpu=False, buffer_max_size_bytes=buffer_max_size_bytes
+    )
+
+    yielded = 0
+    gathers_before_first_yield = None
+    outputs = {}
+    for name, tensor in stream:
+        if gathers_before_first_yield is None:
+            gathers_before_first_yield = state["gathers"]
+        outputs[name] = tensor
+        yielded += 1
+        # After every yield the bucket has been flushed and its shards released,
+        # so residency resets.
+        state["gathered_since_yield"] = 0
+
+    # (1) Streaming, not whole-set: the first param streamed out after only one
+    # bounded bucket's worth of collectives — NOT after gathering every local
+    # expert. Whole-set materialization would make this == num_local_experts.
+    assert gathers_before_first_yield == 1, gathers_before_first_yield
+    assert gathers_before_first_yield < num_local_experts
+
+    # (2) Peak residency stays bounded by one bucket (<= 4 local params), never
+    # the whole local expert set. This is the "整组物化必红" assertion.
+    assert state["peak_gathered"] <= max_params_per_bucket, state["peak_gathered"]
+    assert state["peak_gathered"] < num_local_experts
+
+    # (3) Total collectives = ceil(local experts / bucket cap), i.e. the path
+    # actually chunked instead of one giant gather.
+    import math
+
+    assert state["gathers"] == math.ceil(num_local_experts / max_params_per_bucket)
+
+    # (4) Correctness: every global expert key is present and carries the right
+    # value (local from rank 0, local+1000 from rank 1).
+    assert len(outputs) == num_experts_total
+    for local_idx in range(num_local_experts):
+        base = torch.arange(8, dtype=torch.float32) + local_idx * 100
+        # ep_rank 0 -> global == local_idx; ep_rank 1 -> global == num_local + local
+        assert torch.equal(
+            outputs[f"mlp.experts.weight{local_idx}"], base
+        )
+        assert torch.equal(
+            outputs[f"mlp.experts.weight{num_local_experts + local_idx}"], base + 1000
+        )
