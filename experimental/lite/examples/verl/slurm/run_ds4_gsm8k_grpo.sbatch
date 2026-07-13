@@ -71,17 +71,6 @@ IMPORT_ONLY=${IMPORT_ONLY:-0}
 RAY_ONLY=${RAY_ONLY:-0}
 VLLM_LOAD_ONLY=${VLLM_LOAD_ONLY:-0}
 VLLM_CHECKPOINT_SYNC_PROBE=${VLLM_CHECKPOINT_SYNC_PROBE:-0}
-# WARMUP_ONLY runs a single tiny GRPO step (rollout generate + actor train +
-# weight resync) on a small 2-node geometry solely to populate the persistent
-# JIT/compile cache (TileLang / flashinfer / Triton / Inductor / vLLM). Because
-# the cache is keyed by kernel shape (head_dim / block / dtype), not by world
-# size, warming it on 16 GPUs with the same TP1/EP8/ROLLOUT_TP8 per-rank shapes
-# lets the subsequent 128- and 16-rank jobs hit the cache instead of each rank
-# recompiling. It stops after the step (no checkpoint, no resume phase) and
-# writes a byte-level cache manifest + compile-phase wall time so reuse can be
-# measured before/after (bayan 2026-07-13 04:12, warmup independent frame).
-WARMUP_ONLY=${WARMUP_ONLY:-0}
-WARMUP_STEPS=${WARMUP_STEPS:-1}
 ACTOR_TP=${ACTOR_TP:-1}
 ACTOR_PP=${ACTOR_PP:-4}
 ACTOR_CP=${ACTOR_CP:-4}
@@ -135,16 +124,8 @@ if (( IMPORT_ONLY == 1 && SLURM_NNODES != 1 )); then
   echo "IMPORT_ONLY requires one CPU node" >&2
   exit 2
 fi
-if (( WARMUP_ONLY == 1 && (SLURM_NNODES < 1 || SLURM_NNODES > 2 || GPUS_PER_NODE != 8) )); then
-  echo "WARMUP_ONLY requires one or two nodes with eight GPUs per node" >&2
-  exit 2
-fi
-if (( WARMUP_ONLY == 1 && WARMUP_STEPS < 1 )); then
-  echo "WARMUP_ONLY requires WARMUP_STEPS>=1 so a full rollout+train+resync runs" >&2
-  exit 2
-fi
-if (( CONFIG_ONLY + IMPORT_ONLY + RAY_ONLY + VLLM_LOAD_ONLY + WARMUP_ONLY > 1 )); then
-  echo "CONFIG_ONLY, IMPORT_ONLY, RAY_ONLY, VLLM_LOAD_ONLY, and WARMUP_ONLY are mutually exclusive" >&2
+if (( CONFIG_ONLY + IMPORT_ONLY + RAY_ONLY + VLLM_LOAD_ONLY > 1 )); then
+  echo "CONFIG_ONLY, IMPORT_ONLY, RAY_ONLY, and VLLM_LOAD_ONLY are mutually exclusive" >&2
   exit 2
 fi
 
@@ -158,7 +139,6 @@ if [[ "${IN_DS4_GRPO_CONTAINER:-0}" != "1" ]]; then
   export MASTER_ADDR RAY_PORT RAY_DASHBOARD_PORT GPUS_PER_NODE
   export CONFIG_TARGET_NNODES CONFIG_TARGET_GPUS_PER_NODE
   export PHASE1_STEPS TOTAL_STEPS CONFIG_ONLY IMPORT_ONLY RAY_ONLY VLLM_LOAD_ONLY
-  export WARMUP_ONLY WARMUP_STEPS
   export VLLM_CHECKPOINT_SYNC_PROBE
   export ACTOR_TP ACTOR_PP ACTOR_CP ACTOR_EP ROLLOUT_TP
   # Load-only diagnostics (C1 ray-executor arm + GPU-0 sibling residency probe); empty
@@ -964,69 +944,6 @@ run_phase() {
       DRY_RUN=0 \
       bash "${MLITE_SRC}/experimental/lite/examples/verl/scripts/run_deepseek_v4_gsm8k_grpo.sh"
 }
-
-if [[ "${WARMUP_ONLY}" == "1" ]]; then
-  # JIT-cache warm-up: run a single GRPO step so that rollout generation
-  # (vLLM/flashinfer), actor training (TileLang mhc/hc + grouped-GEMM), and the
-  # weight resync export all compile their kernels once and persist them under
-  # the shared JIT_CACHE_ROOT. WARMUP_STEPS<SAVE_FREQ(=PHASE1_STEPS) so no
-  # checkpoint is written; there is no resume phase. The subsequent 128- and
-  # 16-rank jobs point JIT_CACHE_ROOT/JIT_CACHE_TAG at the same directory and
-  # skip the compile step entirely.
-  echo "DS4_JIT_WARMUP_START steps=${WARMUP_STEPS} world=${WORLD_SIZE} actor_mp=${ACTOR_MODEL_PARALLEL} actor_tp=${ACTOR_TP} pp=${ACTOR_PP} cp=${ACTOR_CP} ep=${ACTOR_EP} rollout_tp=${ROLLOUT_TP} cache_root=${JIT_CACHE_ROOT}"
-  warmup_start=${SECONDS}
-  run_phase warmup "${WARMUP_STEPS}" disable
-  warmup_elapsed=$((SECONDS - warmup_start))
-  echo "DS4_JIT_WARMUP_COMPILE_SECONDS ${warmup_elapsed}"
-
-  # Byte-level cache manifest: proves the kernels really landed on lustre (not a
-  # silently-defeated EXDEV rename), and records per-cache byte counts so the
-  # warm/cold compile-time delta can be measured across jobs.
-  warmup_manifest_file="${RUN_ROOT}/jit-cache-manifest.txt"
-  warmup_total_bytes=0
-  warmup_total_files=0
-  {
-    echo "# DS4 JIT warm-up cache manifest"
-    echo "# generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) job=${SLURM_JOB_ID}"
-    echo "# jit_cache_root=${JIT_CACHE_ROOT} jit_cache_tag=${JIT_CACHE_TAG}"
-    echo "# geometry world=${WORLD_SIZE} actor_tp=${ACTOR_TP} pp=${ACTOR_PP} cp=${ACTOR_CP} ep=${ACTOR_EP} rollout_tp=${ROLLOUT_TP}"
-    echo "# compile_seconds=${warmup_elapsed}"
-    echo "# --- per-cache summary ---"
-  } > "${warmup_manifest_file}"
-  for warmup_pair in \
-    "tilelang:${TILELANG_CACHE_DIR}" \
-    "flashinfer:${FLASHINFER_WORKSPACE_BASE}" \
-    "triton:${TRITON_CACHE_DIR}" \
-    "torchinductor:${TORCHINDUCTOR_CACHE_DIR}" \
-    "vllm:${VLLM_CACHE_ROOT}" \
-    "xdg:${XDG_CACHE_HOME}"; do
-    warmup_name="${warmup_pair%%:*}"
-    warmup_dir="${warmup_pair#*:}"
-    if [[ -d "${warmup_dir}" ]]; then
-      warmup_bytes=$(find "${warmup_dir}" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')
-      warmup_files=$(find "${warmup_dir}" -type f 2>/dev/null | wc -l)
-    else
-      warmup_bytes=0
-      warmup_files=0
-    fi
-    printf '%-14s files=%-8s bytes=%s dir=%s\n' \
-      "${warmup_name}" "${warmup_files}" "${warmup_bytes}" "${warmup_dir}" \
-      >> "${warmup_manifest_file}"
-    warmup_total_bytes=$((warmup_total_bytes + warmup_bytes))
-    warmup_total_files=$((warmup_total_files + warmup_files))
-  done
-  {
-    echo "# --- full listing (bytes<TAB>path) ---"
-    find "${JIT_CACHE_ROOT}" -type f -printf '%s\t%p\n' 2>/dev/null | sort -k2
-  } >> "${warmup_manifest_file}"
-  if (( warmup_total_bytes == 0 )); then
-    echo "DS4_JIT_WARMUP_EMPTY cache_root=${JIT_CACHE_ROOT} — no kernel artifacts persisted (warm-up did not populate the cache)" >&2
-    exit 8
-  fi
-  echo "DS4_JIT_WARMUP_MANIFEST path=${warmup_manifest_file} cache_root=${JIT_CACHE_ROOT} total_files=${warmup_total_files} total_bytes=${warmup_total_bytes}"
-  echo "DS4_JIT_WARMUP_COMPLETE steps=${WARMUP_STEPS} compile_seconds=${warmup_elapsed} total_bytes=${warmup_total_bytes} cache_root=${JIT_CACHE_ROOT}"
-  exit 0
-fi
 
 echo "DS4_GRPO_PHASE1_START steps=${PHASE1_STEPS} world=${WORLD_SIZE} actor_mp=${ACTOR_MODEL_PARALLEL} rollout_tp=${ROLLOUT_TP}"
 run_phase phase1 "${PHASE1_STEPS}" disable
