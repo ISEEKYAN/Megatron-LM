@@ -14,16 +14,15 @@
 This study builds on two earlier MLite studies and the shipped MLite Muon
 implementation:
 
-- **Megatron interface study** — `experimental/lite/docs/muon_optimizer.md`
-  (TASK-1.13.2), pinned to NVIDIA/Megatron-LM `dev`
+- **Megatron interface study** — `experimental/lite/docs/muon_optimizer.md`,
+  pinned to NVIDIA/Megatron-LM `dev`
   `d64ba4ccb1e3e878c15171c9cc58d5d3b46bf4d5` (fetched 2026-07-09) and
   NVIDIA-NeMo/Emerging-Optimizers v0.3.0 `b309e2f01cda75dc96a6dc1a2355a7b3b64b5e16`.
-- **Post-training recipe study** — `experimental/lite/docs/muon_post_training.md`
-  (TASK-1.13.6).
+- **Post-training recipe study** — `experimental/lite/docs/muon_post_training.md`.
 - **Shipped MLite Muon** — branch
   `feature/muon-adam-distopt-fsdp2` (integration HEAD `a872cd34d`; native
   contract commit `e4e96814f`). Its numerical acceptance evidence is in
-  `docs/runs/muon_distopt_compact_bitwise_evidence.md` (TASK-1.13.5.4).
+  `docs/runs/muon_distopt_compact_bitwise_evidence.md`.
 
 Conventions (`ZeRO-1`/`DistOpt`, `ZeRO-3`/`FSDP2`, `TP sharding`) are used as
 defined in `muon_optimizer.md`.
@@ -85,20 +84,21 @@ drives **Megatron-native Muon** — MLite is strictly ahead of public verl on th
 axis, and there is no upstream verl Muon-on-Megatron design to borrow from.
 
 
-## 2. Megatron-LM upstream: delta vs. the 1.13.2 baseline
+## 2. Megatron-LM upstream: delta vs. the pinned `d64ba4ccb` baseline
 
-**Headline: the delta is essentially zero.** The 1.13.2 study pinned `dev` at
+**Headline: the delta is essentially zero.** The interface study
+(`muon_optimizer.md`) pinned `dev` at
 `d64ba4ccb` on 2026-07-09. The current `dev` HEAD is
 `fd1121b8ff7e3a4f83a28d35aed172d7bc0260e1` (also dated 2026-07-09). Every
 Muon-relevant source file is **byte-for-byte identical** between the two SHAs
 (verified by fetching raw source at both explicit SHAs and diffing):
 `megatron/training/arguments.py`, `core/optimizer/emerging_optimizers.py`,
 `core/optimizer/layer_wise_optimizer.py`, `core/optimizer/optimizer_config.py`,
-`core/optimizer/__init__.py`, and `pyproject.toml`. So the 1.13.2 baseline sits
-at (or within a day of) the current dev tip for Muon purposes, and nothing below
-has moved.
+`core/optimizer/__init__.py`, and `pyproject.toml`. So the pinned `d64ba4ccb`
+baseline sits at (or within a day of) the current dev tip for Muon purposes, and
+nothing below has moved.
 
-| 1.13.2 finding | Current dev tip (`fd1121b8`) |
+| Baseline (`d64ba4ccb`) finding | Current dev tip (`fd1121b8`) |
 | --- | --- |
 | Emerging-Optimizers pinned at v0.3.0 (`b309e2f`) via `pyproject.toml:203` | **Unchanged** — still `rev = "v0.3.0"` |
 | `muon_scalar_optimizer` declared (`adam`/`lion`) but hard-coded to adam | **Unchanged** — `arguments.py:3274-3279` still `choices=['adam','lion']`; Lion is an unused import (`emerging_optimizers.py:34`); routing hard-codes `{'optimizer':'adam'}` (`emerging_optimizers.py:86,440,452`). Still **not wired**. |
@@ -317,12 +317,13 @@ The DistOpt lowering is validated **bitwise** against upstream, not merely
     future `mfsdp` backend must reuse the same algorithm/routing contract and add
     an uneven-DTensor gather/reshard, not a third Muon implementation.
 
-### Post-training / RL recipe alignment (cross-check with 1.13.5.4)
+### Post-training / RL recipe alignment (cross-check with the DistOpt validation)
 
 12. The recipe (`muon_post_training.md`) is deliberately conservative: **AdamW is
     the production recommendation for RL**, and the Muon RL row is a bounded
     experiment with stop-gates (RLVR collapse and Adam→Muon mismatch papers
-    postdate the pre-training recipes). This is consistent with 1.13.5.4, whose
+    postdate the pre-training recipes). This is consistent with the DistOpt
+    bitwise-validation study (`muon_distopt_compact_bitwise_evidence.md`), whose
     acceptance is *numerical parity* ("not worse than Megatron Muon = bitwise"),
     **not** an efficacy claim that Muon improves RL. The two artifacts agree:
     MLite has proven the Muon *implementation* is correct, not that Muon is the
@@ -340,4 +341,3 @@ The DistOpt lowering is validated **bitwise** against upstream, not merely
   parity bitwise.
 - **AC#4 (borrow list):** items 1–12 above. Highest-value follow-ups: FSDP2
   large-model parity (#10) and DistOpt Muon offload for RL resharding (#9).
-
