@@ -1,5 +1,15 @@
 # DS4 128-GPU resync OOM — GPU0 sibling-residency root cause + memory budget
 
+> **⚠️ CORRECTION (2026-07-12, jobs `13874307`/`13874308`): the §2 root-cause
+> hypothesis below is REFUTED by direct measurement.** An 8-GPU load-only A/B
+> experiment shows the vLLM TP8 rollout, on its own, leaves **exactly one process
+> per GPU and zero sibling residency on GPU 0** — both at baseline and with
+> `NCCL_P2P_DISABLE=1`. If the siblings were a static vLLM-TP-init /
+> shared-visibility CUDA context (§2), the baseline would already show 7 of them.
+> It does not. The 7×2.51 GiB siblings are therefore **triggered by the real
+> colocated resync weight-gather traffic**, which load-only does not exercise.
+> Read §7 first; treat §2/§4/§5 as the (now-superseded) initial hypothesis.
+
 Scope: TASK-1.1.12. Directed diagnosis of the 7×2.51 GiB sibling residency on GPU 0
 that OOMs the first colocated weight resync of the DS4 128-GPU run.
 Evidence: cw job `13840020` (`smoke128-b67cd7684-r2`, ROLLOUT_TP8 / util 0.60 /
@@ -120,3 +130,58 @@ Option A vs B before any 128-GPU relaunch.
    → ship Option B (env-only, no colocated-contract risk).
 3. Else → implement Option A with explicit validation that the actor↔vLLM UUID handoff
    still resolves, plus tighten the `DeviceProbe` to assert single-device visibility.
+
+## 7. Empirical result — the §5 experiment REFUTES §2 (2026-07-12)
+
+Ran the §5 8-GPU load-only diagnostic at HEAD `0b00a4028` (`MLITE_VLLM_RESIDENCY_PROBE=1`,
+`VLLM_LOAD_ONLY=1`, 1 node × 8 GPU, ROLLOUT_TP8, util 0.60), two arms:
+
+| Arm | Job | Result: per-GPU processes | GPU-0 siblings |
+|---|---|---|---|
+| A — baseline (full-node visibility) | `13874307` | **1 process per GPU** (own TP worker, ~50226 MiB) | **0** |
+| B — `NCCL_P2P_DISABLE=1` | `13874308` | **1 process per GPU** (~49352 MiB) | **0** |
+
+Both arms `DS4_VLLM_LOAD_ONLY_PASSED`. Confirmed by two independent methods (the
+`post_init` residency probe **and** a live `nvidia-smi --overlap` snapshot taken both
+mid-init and after the KV-cache profiling forward pass). Every GPU carries only its own
+rank; nothing lands on a peer GPU.
+
+### What this means
+
+- **§2 is refuted.** The 7×2.51 GiB siblings are **not** a static artifact of vLLM
+  TP-init under shared `CUDA_VISIBLE_DEVICES`. If they were, arm A (identical vLLM TP8,
+  full visibility) would already show 7 siblings on GPU 0. It shows zero. The
+  profiling forward pass runs a real TP all-reduce and still leaves no peer residency.
+- **The leak is resync-traffic-triggered.** The only thing the real 128-GPU run does
+  that load-only does not is the actual colocated weight resync — `vllm_rollout.py
+  update_weights(..., base_sync_done=True) → torch.distributed.all_gather` over **real**
+  weight tensors across the TP group (plus the colocated actor's CUDA-IPC handoff).
+  The load-only `VLLM_CHECKPOINT_SYNC_PROBE` sends only empty buckets (`tensors=0`), so
+  it never gathers real weights and never opens the peer buffers.
+- **Load-only is structurally blind to this leak** — the same blind spot flagged before
+  the first 128-GPU burn (`VLLM_LOAD_ONLY` marker `tensors=0`). The A/B/C harness is
+  cheap and faithful to vLLM *init*, but the failure is at *resync*.
+- **Arm C (per-worker visibility isolation) was not built.** It targets the refuted
+  init-visibility mechanism; there is nothing for it to isolate in load-only. There is
+  also no built-in per-TP-worker isolation switch in vLLM 0.20.2 — `CUDA_VISIBLE_DEVICES`
+  is set per **DP** rank only (`v1/engine/core.py:1934`, `v1/engine/utils.py:261`); TP
+  workers deliberately share full-node visibility so the TP NCCL group can form.
+- Minor corroborating detail: arm B used ~874 MiB **less** per GPU than arm A. NCCL P2P
+  buffers do exist, but in the load-only forward path they are allocated on the rank's
+  **own** GPU, not as cross-GPU residency on GPU 0.
+
+### Next faithful step (needs a decision — see task escalation)
+
+To observe *where* the siblings form we need a path that runs the real resync
+all_gather over real weights. Candidates, in rough cost order:
+
+1. **Instrument the real 128-GPU run**: snapshot GPU-0 per-process residency
+   immediately before and after the first resync all_gather (SMOKE_EXIT_AFTER=1), to
+   confirm the buffers appear *at* the gather and measure their exact size — and, in the
+   same run, A/B `NCCL_P2P_DISABLE=1` on the actual failing path.
+2. **A resync-exercising colocated proxy** that actually gathers real weights across a
+   TP group (the FSDP-actor 8-GPU proxy does not fit — established — but a reduced
+   colocated config that reaches a real resync might).
+3. If the buffers are confirmed to be NCCL all_gather P2P buffers, the levers are
+   `NCCL_P2P_DISABLE` / `NCCL_BUFFSIZE` / bucketing the gather — none of which is the
+   visibility-isolation of the old Option A.
