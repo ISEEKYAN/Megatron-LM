@@ -316,7 +316,13 @@ def _1f1b_schedule(
         hidden = out.get("hidden_states")
         loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
 
-        need_recv_next = not ps.pp_is_first and k < num_warmup - 1
+        # Non-first stages must prefetch the fwd_input for the next forward pass
+        # whenever one remains in this iteration -- this covers both the next
+        # warmup step and the warmup->steady transition (the first steady step,
+        # for which the steady loop only self-receives when num_warmup == 0).
+        # Mirrors Megatron's `if num_microbatches_remaining > 0: recv_forward()`
+        # guard between the warmup loop and the 1F1B steady loop.
+        need_recv_next = not ps.pp_is_first and (k + 1) < num_microbatches
         if not ps.pp_is_last:
             fwd_input, _ = _p2p(send_fwd=hidden, recv_fwd=need_recv_next)
         elif need_recv_next:
