@@ -59,25 +59,31 @@ run() {  # <mlite_src> -- <cmd...>
     "
 }
 
-echo "==== arm 3: CPU streaming-equivalence unit regression ===="
-run "${MLITE_NEW}" -- \
-  "python -m pytest -q tests/unit/primitive/test_hf_weights_streaming.py \
-     -k pp_export 2>&1 | tail -30"
-
+# GPU arms fire first (炮响优先); each is non-fatal so one failure never starves
+# the others — the final verdict reads whatever JSON landed.
 echo "==== arm 1: DS4 pp2 export streaming peak (NEW) ===="
 run "${MLITE_NEW}" -- \
   "torchrun --standalone --nproc_per_node=8 -m examples.verl.pp_export_sensitize \
-     --model deepseek_v4 --tag new --out '${OUTPUT_DIR}/ds4_new.json'"
+     --model deepseek_v4 --tag new --out '${OUTPUT_DIR}/ds4_new.json'" || echo "ARM1 rc=$?"
 
 echo "==== arm 2a: qwen3.5 pp2 export NEW (streaming) ===="
 run "${MLITE_NEW}" -- \
   "torchrun --standalone --nproc_per_node=8 -m examples.verl.pp_export_sensitize \
-     --model qwen3_5 --tag new --out '${OUTPUT_DIR}/qwen_new.json'"
+     --model qwen3_5 --tag new --out '${OUTPUT_DIR}/qwen_new.json'" || echo "ARM2a rc=$?"
 
 echo "==== arm 2b: qwen3.5 pp2 export OLD (all_gather_object) ===="
 run "${MLITE_OLD}" -- \
   "torchrun --standalone --nproc_per_node=8 -m examples.verl.pp_export_sensitize \
-     --model qwen3_5 --tag old --out '${OUTPUT_DIR}/qwen_old.json'"
+     --model qwen3_5 --tag old --out '${OUTPUT_DIR}/qwen_old.json'" || echo "ARM2b rc=$?"
+
+# arm 3 last: the pp_export unit tests are CPU-designed (they compare CPU params
+# against device-resident export output), so hide CUDA to match the login-host
+# CPU run; non-fatal.
+echo "==== arm 3: CPU streaming-equivalence unit regression (CUDA hidden) ===="
+run "${MLITE_NEW}" -- \
+  "CUDA_VISIBLE_DEVICES= python -m pytest -q \
+     tests/unit/primitive/test_hf_weights_streaming.py -k pp_export 2>&1 | tail -30" \
+  || echo "ARM3 rc=$?"
 
 echo "==== A/B verdict ===="
 python3 - "${OUTPUT_DIR}" <<'PY'
