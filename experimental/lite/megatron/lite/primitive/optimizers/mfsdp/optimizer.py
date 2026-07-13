@@ -437,6 +437,8 @@ def _build_param_groups(
             if not param.requires_grad or id(param) in seen:
                 continue
             seen.add(id(param))
+            if param.numel() == 0:
+                continue
             params.append(param)
             normalized_name = name.removeprefix("module.")
             if classifier(normalized_name):

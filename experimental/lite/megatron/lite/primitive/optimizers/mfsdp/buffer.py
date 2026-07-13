@@ -820,6 +820,13 @@ class AllGatherPipeline:
         if self.overlap and self._backward_cursor >= 0:
             self.async_bucket_gather(self._backward_cursor, bwd=True)
 
+    def install_backward_all(self) -> None:
+        for bucket in self.buckets:
+            self.async_bucket_gather(bucket.bucket_id, bwd=True)
+        for bucket in self.buckets:
+            self.wait_bucket_ready(bucket.bucket_id, bwd=True)
+            bucket.install_full_parameters()
+
     def materialize_all(self) -> None:
         for bucket in self.buckets:
             self.async_bucket_gather(bucket.bucket_id)
@@ -899,6 +906,9 @@ class CommunicationPipelines:
 
     def acquire_backward(self, bucket: ParamBucket) -> None:
         self.all_gather.acquire_backward(bucket)
+
+    def install_backward_all(self) -> None:
+        self.all_gather.install_backward_all()
 
     def end_forward(self) -> None:
         self.all_gather.release_all()

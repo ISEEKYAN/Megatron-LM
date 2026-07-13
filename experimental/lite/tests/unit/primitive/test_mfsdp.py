@@ -799,6 +799,71 @@ def test_mfsdp_empty_uneven_shard_stays_inside_local_buffer(monkeypatch):
     assert bucket.specs[1].shard_param.numel() == 0
 
 
+def test_mfsdp_optimizer_excludes_empty_local_shards(monkeypatch):
+    monkeypatch.setattr(mfsdp_buffer, "group_size", lambda _group: 4)
+    monkeypatch.setattr(mfsdp_buffer, "group_rank", lambda _group: 0)
+
+    model = torch.nn.Module()
+    model.weight0 = torch.nn.Parameter(torch.randn(4))
+    model.weight1 = torch.nn.Parameter(torch.randn(4))
+    model.weight2 = torch.nn.Parameter(torch.randn(4))
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        etp_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1000.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={
+            "mfsdp_sharding_strategy": "optim_grads_params",
+            "bucket_size": None,
+        },
+    )
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(),
+    )
+
+    # rank 0 owns only weight0's aligned slot; weight1/weight2 shards are empty.
+    specs = chunks[0].param_sync.buckets[0].specs
+    empty_specs = [spec for spec in specs if spec.shard_param.numel() == 0]
+    assert empty_specs, "test layout should leave at least one empty local shard"
+
+    optimizer_param_ids = {
+        id(param)
+        for group in optimizer.param_groups
+        for param in group["params"]
+    }
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            assert param.numel() > 0
+    # Empty shards are excluded from the optimizer but still bound for layout.
+    for spec in empty_specs:
+        assert id(spec.shard_param) not in optimizer_param_ids
+    for spec in specs:
+        if spec.shard_param.numel() > 0:
+            assert id(spec.shard_param) in optimizer_param_ids
+
+
 def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
     torch.manual_seed(321)
     reference = _GlooModel()
@@ -922,6 +987,99 @@ def test_mfsdp_materializes_root_params_used_without_calling_their_leaf_module()
     projection_shard = _optimizer_named_shards(optimizer)["projection.weight"]
     assert torch.equal(
         reference.projection.weight.grad.reshape(-1), projection_shard.grad.reshape(-1)
+    )
+
+
+def test_mfsdp_rebinds_full_parameters_for_backward_live_attribute_reads():
+    observed_backward_shapes: list[tuple[int, ...]] = []
+
+    class _LiveWeightFn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value, weight, module):
+            ctx.module = module
+            ctx.save_for_backward(value)
+            return value @ weight.t()
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            (value,) = ctx.saved_tensors
+            # Read the weight live off the module, exactly like TE ops-based
+            # RMSNorm reads ``self.weight`` in its backward.
+            weight = ctx.module.weight
+            observed_backward_shapes.append(tuple(weight.shape))
+            grad_value = grad_output @ weight
+            grad_weight = grad_output.t() @ value
+            return grad_value, grad_weight, None
+
+    class _LiveWeightUnit(torch.nn.Module):
+        def __init__(self, in_features: int, out_features: int):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.randn(out_features, in_features)
+            )
+
+        def forward(self, value):
+            return _LiveWeightFn.apply(value, self.weight, self)
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.unit = _LiveWeightUnit(4, 4)
+
+        def forward(self, value):
+            return self.unit(value)
+
+    torch.manual_seed(321)
+    reference = _Model()
+    candidate = copy.deepcopy(reference)
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1000.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [candidate],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_LiveWeightUnit,),
+    )
+
+    value = torch.randn(2, 4)
+    reference_output = reference(value)
+    candidate_output = chunks[0](value)
+    assert torch.equal(reference_output, candidate_output)
+
+    candidate_output.square().mean().backward()
+
+    # The live read during backward must have seen the full 2D weight, not the
+    # 1D shard installed by reshard-after-forward.
+    assert observed_backward_shapes == [(4, 4)]
+
+    optimizer.finish_grad_sync()
+    weight_shard = _optimizer_named_shards(optimizer)["unit.weight"]
+    reference(value).square().mean().backward()
+    assert torch.equal(
+        reference.unit.weight.grad.reshape(-1), weight_shard.grad.reshape(-1)
     )
 
 
