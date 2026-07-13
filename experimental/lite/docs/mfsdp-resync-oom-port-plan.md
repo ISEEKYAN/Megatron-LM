@@ -2,6 +2,10 @@
 
 Status: **prepared, gated on DS4 (TASK-1.1.12) validating the resync-memory recipe.**
 Do NOT burn GPU on this until DS4 confirms which branch below actually holds.
+DS4's recipe was settled 2026-07-12 20:48 (see below): `expandable_segments` is the
+PRIMARY lever ⇒ Branch A (env-only, applied on the cw harness — no repo patch) is
+the leading and likely sole port. Branch B (mfsdp code) stays UNWRITTEN by design
+until DS4 proves A insufficient.
 
 ## Where we are
 
@@ -20,7 +24,7 @@ Do NOT burn GPU on this until DS4 confirms which branch below actually holds.
 Export path for resync:
 
 - `mlite_engine.get_per_tensor_param` (engine/mlite_engine.py:370)
-  → `runtime.export_weights` (backends/mlite/runtime.py:348)
+  → `runtime.export_weights` (runtime/backends/mlite/runtime.py:348)
   → enters `chunk.full_parameter_context()` for **every** model chunk inside one
     `ExitStack`, up front, holding them all for the whole generator lifetime.
 - `full_parameter_context` (primitive/optimizers/mfsdp/wrapper.py:191-199) calls
@@ -42,29 +46,59 @@ so the actor is fully resident even before export materialization.
   DS4 config (job 13840020 FAILED, first resync still OOM by ~128 MiB; MEMCURVE
   showed grads not GPU-resident → free-grad lever empirically no-op). Do NOT port
   the free-grad protocol.
-- bayan's live candidates for DS4 (deciding tonight, 2026-07-12): (a)
-  `expandable_segments`, (b) per-tensor `empty_cache` during export. Port only the
-  branch DS4 validates green.
+
+### DS4 recipe as SETTLED by bayan 2026-07-12 20:48 (supersedes earlier candidates)
+
+Per-tensor `empty_cache` was **rejected** — each call carries a device sync +
+allocator compaction, and thousands of params would blow up resync wall time.
+The DS4 relaunch recipe bayan approved is:
+
+1. **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` = the PRIMARY lever**
+   (it is the proper fix for fragmentation / materialization peak; pure env, not a
+   config knob). Run this + instrumentation FIRST, with no per-tensor cleanup, as
+   the baseline.
+2. **Threshold-batched `empty_cache` only** — call once per **≥4 GiB of
+   accumulated dropped references**; small tensors never trigger it. (Not
+   per-tensor.)
+3. **`resync` wall time is an acceptance gate**: instrument resync wall time;
+   >20% overhead vs. the no-(2) baseline = **fail**. Memory AND speed both must
+   hold — no robbing Peter to pay Paul.
+
+Port only what DS4 validates green, and carry the same wall-time gate.
+
+Status note (2026-07-12): DS4 (TASK-1.1.12) is still In Review; the 20:48 recipe
+was a "must-change-before-ignition" correction, so it had **not yet been validated
+green** when this plan was last touched. This task stays gated until it is.
 
 ## Port plan — two branches
 
-### Branch A — `expandable_segments` suffices (zero mfsdp code)
+### Branch A — `expandable_segments` suffices (zero mfsdp code) — LEADING
 
-If DS4 shows `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` alone lets the
-transient export/wake peak fit (it attacks fragmentation, not absolute residency):
+This is now DS4's **primary** lever (20:48), so it is also the leading — and most
+likely sole — mfsdp port. It attacks fragmentation / materialization peak, not
+absolute residency.
 
-- The "port" is a single launch-env line in the cw DAPO harness
-  (`qwen35_dapo_mfsdp_*`), matching the `CUDA_DEVICE_MAX_CONNECTIONS="2"` env
-  pattern. No repo primitive change.
-- Cheapest, most likely-first-to-try. Verify on the 32-card收口 run itself.
+- The "port" is a single launch-env line
+  (`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`) in the cw DAPO mfsdp
+  harness (`qwen35_dapo_mfsdp_*`), matching the `CUDA_DEVICE_MAX_CONNECTIONS="2"`
+  env pattern. **These harness scripts live on the cw cluster, NOT in this repo**,
+  so there is no repo-side patch to stage for Branch A — it is applied at launch
+  time on the收口 run. No mfsdp primitive change.
+- Cheapest, most likely-first-to-try. Verify on the 32-card收口 run itself, and
+  record resync wall time (the DS4 ≤20% overhead gate applies here too).
 
-### Branch B — per-tensor `empty_cache` needed (mfsdp primitive change)
+### Branch B — threshold-batched `empty_cache` needed (mfsdp primitive change)
 
-If Branch A is insufficient, the mfsdp analogue of DS4's "逐tensor empty_cache"
-is to stop materializing **all** params at once:
+Only if Branch A is insufficient. NOTE the DS4 20:48 correction reshapes this:
+the analogue is **NOT** per-tensor `empty_cache` (rejected as too slow) but
+**threshold-batched** release — stop materializing **all** params at once, and
+call `empty_cache` at most once per ≥4 GiB of released material, never per small
+tensor. Any Branch-B change must clear the same resync wall-time gate (≤20%
+overhead vs. Branch-A baseline).
 
-- Restructure the export so each chunk/bucket is materialized, yielded to the
-  vLLM consumer, released, and `empty_cache`'d **before** the next — instead of
+- Restructure the export so chunks/buckets are materialized, yielded to the
+  vLLM consumer, and released as we go — with a single `empty_cache` fired only
+  after cumulative released bytes cross the ≥4 GiB threshold — instead of
   `materialize_all()` up front in `full_parameter_context`.
 - Touch points: `param_sync.materialize_all` / a new streaming
   `materialize_iter` in mfsdp `param_sync`, consumed by
@@ -115,7 +149,8 @@ Viable Branch-B shapes (whichever DS4 evidence justifies):
    as it is complete instead of deferring all groups to the end.
    Dense weights get per-chunk release for free in either shape.
 
-Architectural note: current `runtime.export_weights` (runtime.py:354-361) opens
+Architectural note: current `runtime.export_weights`
+(runtime/backends/mlite/runtime.py:354-361) opens
 **every** chunk's `full_parameter_context` up front in one `ExitStack`, holding
 all chunks resident for the whole generator. Streaming requires moving context
 management **into** the export generator's per-chunk loop — a refactor crossing
@@ -128,8 +163,17 @@ MoE use-after-free pitfall, not a mechanical edit.
 
 ## Execution sequence (once DS4 green)
 
-1. Read DS4's validated recipe + evidence; pick Branch A or B.
-2. Apply the minimal port (A: harness env; B: opt-in streaming export + GPU verify).
+1. Wait for DS4 (TASK-1.1.12) to go green, then read its validated recipe +
+   evidence (incl. measured resync wall-time overhead). Expect Branch A
+   (`expandable_segments`) to be the answer since it is DS4's primary lever.
+2. Apply the minimal port:
+   - Branch A: add the env line to the cw DAPO mfsdp harness at launch time
+     (no repo patch). This is the default plan.
+   - Branch B (only if A proves insufficient on the收口 run): opt-in,
+     default-off, threshold-batched streaming export + GPU verify the peak drops
+     AND wall-time overhead ≤20%. Do NOT pre-write this speculatively — its shape
+     depends on DS4's threshold/wall-time evidence and it carries the live MoE
+     use-after-free hazard documented above.
 3. Re-run the 32-card DAPO E2E收口 (fix `c17a05eff` + FR + watchdog, budget ≤16
    GPU-h) for curves/throughput vs existing DAPO. Register via
    `vicky work execute remote-job` to avoid auto-submit/reap.
