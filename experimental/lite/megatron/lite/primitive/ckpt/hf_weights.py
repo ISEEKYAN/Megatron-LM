@@ -602,28 +602,6 @@ def _maybe_cpu(tensor: torch.Tensor, *, cpu: bool) -> torch.Tensor:
     return _to_cpu(tensor) if cpu else tensor
 
 
-# Env-gated CPU offload for the pp>1 export path. Default OFF: the pp>1 branch
-# accumulates the full local model shard in a GPU-resident `gathered` dict
-# (cpu=False) and then `all_gather_object` over the NCCL pp_group re-materializes
-# every PP shard as pickled bytes on GPU — together this is the resync export
-# peak (~36.5 GiB/rank observed for DS4 128-card). When this flag is set, the
-# gathered dict is kept on CPU AND the PP gather is routed over the gloo
-# `pp_cpu_group`, so neither the resident dict nor the pickled byte buffers touch
-# GPU. Quantization/copies fall to CPU (slower) — intended only for the DS4
-# qualification smoke, which is perf-agnostic; the default path is unchanged so
-# kimi/glm5/qwen do not regress.
-_EXPORT_PP_CPU_OFFLOAD_ENV = "MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD"
-
-
-def _export_pp_cpu_offload_enabled() -> bool:
-    return os.getenv(_EXPORT_PP_CPU_OFFLOAD_ENV, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
 def remap_layer_index(name: str, global_to_local: dict[int, int]) -> str | None:
     if not global_to_local:
         return name
@@ -1007,17 +985,21 @@ def export_hf_weights(
         yield from _flush_expert_bucket()
         return
 
-    # S (env-gated): keep the pp>1 gathered dict off GPU and route the PP gather
-    # over the gloo pp_cpu_group so the resync export peak (~36.5 GiB/rank) is
-    # bounded. Only engages when pp>1 and a gloo pp_cpu_group is available; else
-    # the default GPU path is used unchanged.
-    pp_cpu_offload = (
-        ps.pp_size > 1
-        and _export_pp_cpu_offload_enabled()
-        and getattr(ps, "pp_cpu_group", None) is not None
-    )
-    gather_cpu = cpu or pp_cpu_offload
+    # R (streaming PP export). The pp>1 path must honor the export_hf_weights
+    # streaming contract: never materialize the whole model on any rank. The
+    # legacy path built this rank's local-stage `gathered` dict and then
+    # `all_gather_object`'d it across the pp_group, which pickled every PP
+    # stage's dict onto every rank (~235 GiB/rank host, ~36.5 GiB/rank GPU for
+    # DS4-128) before the first yield — an all-model materialization that broke
+    # the contract and drove the resync OOM. Instead we keep only this rank's
+    # local stage resident (TP/ETP/EP already collapsed, ~1/pp of the model) and
+    # stream the PP dimension: each stage broadcasts its params one at a time
+    # over the pp_group; every rank yields+releases each param as it arrives, so
+    # peak residency is (own stage) + (one in-flight param). pp=1 and every
+    # non-PP model (kimi/glm5/qwen) never reach this branch and are untouched.
+    gather_cpu = cpu
 
+    # This rank's single-PP-stage gathered dict (PP not yet collapsed).
     gathered: dict[str, torch.Tensor] = {}
     for chunk in chunks:
         base_chunk = unwrap_model(chunk)
@@ -1036,30 +1018,45 @@ def export_hf_weights(
             else:
                 gathered[gname] = _gather_dense(gname, t, spec, ps, cpu=gather_cpu)
 
-    # PP gather
-    if ps.pp_size > 1:
-        pp_gather_group = ps.pp_cpu_group if pp_cpu_offload else ps.pp_group
-        all_states: list[dict | None] = [None] * ps.pp_size
-        dist.all_gather_object(all_states, gathered, group=pp_gather_group)
-        gathered = {}
-        for s in all_states:
-            if s is not None:
-                gathered.update(s)
+    # Stream the PP dimension. Exchange only lightweight metadata
+    # (name, shape, dtype) up front so receivers can size their buffers; the
+    # tensors themselves ride one-at-a-time broadcasts. The broadcast always runs
+    # on GPU over the NCCL pp_group — CPU residency (cpu=True save path) is
+    # applied per param *after* receipt, so a gloo pp_cpu_group is not required.
+    local_meta = [
+        (native_name, tuple(tensor.shape), tensor.dtype)
+        for native_name, tensor in gathered.items()
+    ]
+    all_meta: list[list | None] = [None] * ps.pp_size
+    dist.all_gather_object(all_meta, local_meta, group=ps.pp_group)
 
+    bcast_device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
     rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank0_only and rank != 0:
-        return
+    emit = not (rank0_only and rank != 0)
 
-    # Vocab trim
-    if vocab_size is not None:
-        for key in list(gathered.keys()):
-            if "embed" in key or "head" in key:
-                gathered[key] = gathered[key][:vocab_size]
-
-    # Convert Megatron Lite names → HF names via spec
-    for native_name, tensor in gathered.items():
-        for hf_name, hf_tensor in _native_to_hf(spec, native_name, tensor):
-            yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
+    for src_pp in range(ps.pp_size):
+        src_global = ps.pp_global_ranks[src_pp]
+        for native_name, shape, dtype in all_meta[src_pp] or []:
+            if src_pp == ps.pp_rank:
+                # Pop as we go so the source dict shrinks while streaming.
+                tensor = gathered.pop(native_name).to(bcast_device).contiguous()
+            else:
+                tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
+            dist.broadcast(tensor, src=src_global, group=ps.pp_group)
+            if not emit:
+                del tensor
+                continue
+            tensor = _maybe_cpu(tensor, cpu=gather_cpu)
+            if vocab_size is not None and ("embed" in native_name or "head" in native_name):
+                tensor = tensor[:vocab_size]
+            for hf_name, hf_tensor in _native_to_hf(spec, native_name, tensor):
+                yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
+            del tensor
+    return
 
 
 def _gather_dense(

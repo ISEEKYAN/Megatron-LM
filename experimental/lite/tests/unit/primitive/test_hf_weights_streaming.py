@@ -511,15 +511,22 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
     )
 
 
-def _pp2_export_fixture(monkeypatch, *, pp_cpu_group):
-    """Fake pp_size=2 export scaffold; returns (recorded, run) where run() invokes
-    export and `recorded` captures the all_gather_object group + _gather_dense cpu."""
-    import megatron.lite.primitive.ckpt.hf_weights as hw
+def _pp2_stream_fixture(monkeypatch, *, rank=0, pp_rank=0, cpu=False, rank0_only=False):
+    """Fake pp_size=2 streaming export scaffold.
+
+    The R path replaces the legacy `all_gather_object(full_dict)` with a
+    lightweight metadata `all_gather_object` + one-at-a-time `broadcast` per PP
+    stage. This fixture drives one rank of a pp2 world: the local stage owns
+    ``weight``; the remote stage owns ``weight2`` (value = local + 100). Returns
+    ``(recorded, remote_weight, local_weight, run)``.
+    """
+    local_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    remote_weight = local_weight + 100
 
     class Model(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.weight = nn.Parameter(torch.arange(6, dtype=torch.float32).reshape(2, 3))
+            self.weight = nn.Parameter(local_weight.clone())
 
     class Spec:
         num_experts = 0
@@ -541,6 +548,8 @@ def _pp2_export_fixture(monkeypatch, *, pp_cpu_group):
         (),
         {
             "pp_size": 2,
+            "pp_rank": pp_rank,
+            "pp_global_ranks": [0, 1],
             "tp_size": 1,
             "tp_group": None,
             "ep_size": 1,
@@ -548,67 +557,113 @@ def _pp2_export_fixture(monkeypatch, *, pp_cpu_group):
             "etp_size": 1,
             "etp_group": None,
             "pp_group": "nccl-pp",
-            "pp_cpu_group": pp_cpu_group,
+            "pp_cpu_group": "gloo-pp",
         },
     )()
 
-    recorded = {"group": None, "gather_cpu": None}
+    recorded = {
+        "meta_group": None,
+        "bcast_groups": [],
+        "bcast_srcs": [],
+        "empty_shapes": [],
+        "max_live_empty": 0,
+    }
+    remote_meta = [("weight2", (2, 3), torch.float32)]
 
-    real_gather_dense = hw._gather_dense
+    def fake_all_gather_object(all_meta, local_meta, group=None):
+        recorded["meta_group"] = group
+        all_meta[pp_rank] = local_meta
+        all_meta[1 - pp_rank] = remote_meta
 
-    def spy_gather_dense(name, tensor, spec, ps, *, cpu=True):
-        recorded["gather_cpu"] = cpu
-        return real_gather_dense(name, tensor, spec, ps, cpu=cpu)
+    remote_iter = iter([remote_weight])
+    my_global = ps.pp_global_ranks[pp_rank]
 
-    def fake_all_gather_object(all_states, obj, group=None):
-        recorded["group"] = group
-        all_states[0] = obj
-        all_states[1] = {"weight2": next(iter(obj.values()))}
+    def fake_broadcast(tensor, src=None, group=None):
+        recorded["bcast_groups"].append(group)
+        recorded["bcast_srcs"].append(src)
+        if src != my_global:  # receiver: fill from the remote stage
+            tensor.copy_(next(remote_iter))
 
-    monkeypatch.setattr(hw, "_gather_dense", spy_gather_dense)
+    real_empty = torch.empty
+
+    def spy_empty(*args, **kwargs):
+        if args and not isinstance(args[0], int):
+            recorded["empty_shapes"].append(tuple(args[0]))
+            # One in-flight broadcast buffer at a time = bounded peak.
+            recorded["max_live_empty"] = max(recorded["max_live_empty"], 1)
+        return real_empty(*args, **kwargs)
+
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: rank)
     monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.torch.empty", spy_empty
+    )
 
     def run():
-        return dict(export_hf_weights(Model(), Spec(), ps))
+        return dict(
+            export_hf_weights(
+                Model(), Spec(), ps, cpu=cpu, rank0_only=rank0_only
+            )
+        )
 
-    return recorded, run
-
-
-def test_pp_export_defaults_to_nccl_group_and_device_resident(monkeypatch) -> None:
-    monkeypatch.delenv("MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD", raising=False)
-    recorded, run = _pp2_export_fixture(monkeypatch, pp_cpu_group="gloo-pp")
-
-    exported = run()
-
-    # Default path unchanged: NCCL pp_group, cpu follows the caller default (False).
-    assert recorded["group"] == "nccl-pp"
-    assert recorded["gather_cpu"] is False
-    assert exported.keys() == {"weight", "weight2"}
+    return recorded, remote_weight, local_weight, run
 
 
-def test_pp_export_cpu_offload_routes_over_gloo_and_forces_cpu(monkeypatch) -> None:
-    monkeypatch.setenv("MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD", "1")
-    recorded, run = _pp2_export_fixture(monkeypatch, pp_cpu_group="gloo-pp")
+def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> None:
+    recorded, remote_weight, local_weight, run = _pp2_stream_fixture(monkeypatch)
 
     exported = run()
 
-    # S engaged: PP gather rides the gloo pp_cpu_group (bytes stay off GPU) and
-    # the resident gathered dict is forced to CPU.
-    assert recorded["group"] == "gloo-pp"
-    assert recorded["gather_cpu"] is True
+    # Metadata exchange and every tensor broadcast ride the NCCL pp_group — the
+    # gloo pp_cpu_group is never used (R does not offload to CPU).
+    assert recorded["meta_group"] == "nccl-pp"
+    assert recorded["bcast_groups"] == ["nccl-pp", "nccl-pp"]
+    # Streamed output is bitwise-equal to the legacy materialized full dict.
     assert exported.keys() == {"weight", "weight2"}
+    assert torch.equal(exported["weight"], local_weight)
+    assert torch.equal(exported["weight2"], remote_weight)
 
 
-def test_pp_export_cpu_offload_falls_back_when_no_gloo_group(monkeypatch) -> None:
-    monkeypatch.setenv("MEGATRON_LITE_EXPORT_PP_CPU_OFFLOAD", "1")
-    recorded, run = _pp2_export_fixture(monkeypatch, pp_cpu_group=None)
+def test_pp_export_holds_one_inflight_buffer(monkeypatch) -> None:
+    recorded, _, _, run = _pp2_stream_fixture(monkeypatch)
+
+    run()
+
+    # Exactly one remote param is allocated (the source pops its own tensor from
+    # the resident stage dict), so peak residency is (own stage) + one buffer.
+    assert recorded["empty_shapes"] == [(2, 3)]
+    assert recorded["max_live_empty"] == 1
+    # broadcast sources: our stage (global rank 0) then the remote stage (rank 1).
+    assert recorded["bcast_srcs"] == [0, 1]
+
+
+def test_pp_export_cpu_still_broadcasts_over_nccl(monkeypatch) -> None:
+    recorded, remote_weight, local_weight, run = _pp2_stream_fixture(
+        monkeypatch, cpu=True
+    )
 
     exported = run()
 
-    # No gloo pp_cpu_group available -> stay on the default NCCL path (no crash),
-    # gather_cpu falls back to the caller default (False).
-    assert recorded["group"] == "nccl-pp"
-    assert recorded["gather_cpu"] is False
-    assert exported.keys() == {"weight", "weight2"}
+    # cpu=True routes final residency to host but the broadcast stays on the
+    # NCCL pp_group (no gloo dependency); output is still correct.
+    assert recorded["bcast_groups"] == ["nccl-pp", "nccl-pp"]
+    assert exported["weight"].device.type == "cpu"
+    assert exported["weight2"].device.type == "cpu"
+    assert torch.equal(exported["weight"], local_weight)
+    assert torch.equal(exported["weight2"], remote_weight)
+
+
+def test_pp_export_rank0_only_participates_but_yields_nothing(monkeypatch) -> None:
+    # A non-zero rank under rank0_only must still join every collective
+    # (metadata all_gather + both broadcasts) but emit no params.
+    recorded, _, _, run = _pp2_stream_fixture(
+        monkeypatch, rank=1, pp_rank=1, rank0_only=True
+    )
+
+    exported = run()
+
+    assert exported == {}
+    assert recorded["meta_group"] == "nccl-pp"
+    assert len(recorded["bcast_groups"]) == 2
