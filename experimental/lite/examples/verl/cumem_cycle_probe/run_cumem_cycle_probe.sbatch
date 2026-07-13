@@ -26,10 +26,13 @@
 set -euo pipefail
 
 ROOT=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan
-IMAGE=${VLLM_IMAGE:-$ROOT/rl-mlite/containers/vllm023-aarch64-dev1.sqsh}
+# Proven native vLLM 0.23 container (x86_64/H100) — same image used as BASE_IMAGE in
+# code/runtime/ds4-rl-1bd87fe4c/loadonly-native-vllm023.fire.sh (TASK-1.1.12).
+IMAGE=${VLLM_IMAGE:-$ROOT/code/verl_optimize/verl.vllm023.sqsh}
 # A small proxy model — leak mechanism is model-independent (bayan). Override with
 # --export=ALL,MODEL=... ; must exist on lustre inside the container mount.
-MODEL=${MODEL:-$ROOT/kernel-rollout/branchc-cumem/models/Qwen3-0.6B}
+# Qwen3-0.6B: real dense qwen3 weights (1.5GB safetensors), vLLM-supported.
+MODEL=${MODEL:-$ROOT/code/models/Qwen3-0.6B}
 CYCLES=${CYCLES:-20}
 SLEEP_LEVEL=${SLEEP_LEVEL:-1}
 GMU=${GMU:-0.7}
@@ -57,6 +60,9 @@ for ARM_CONF in "A0:expandable_segments:True" "A1:expandable_segments:False"; do
       set -euo pipefail
       export PYTHONNOUSERSITE=1
       export PYTORCH_CUDA_ALLOC_CONF='$CONF'
+      # vLLM 0.23 is an editable install rooted at /vllm inside this container;
+      # run from a neutral cwd so the /vllm source is not namespace-shadowed.
+      cd /tmp
       python3 '$PROBE' \
         --model '$MODEL' \
         --cycles '$CYCLES' \
