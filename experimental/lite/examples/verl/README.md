@@ -211,6 +211,58 @@ The remaining required environment variables are fail-closed path contracts:
 `MLITE_SM90_SITE`, `DS4_VLLM_SITE`, `DS4_VLLM_SHIM`, `CHECKPOINT_DIR`, and a
 fresh `RUN_ROOT`.
 
+### JIT-cache warm-up (rollout preflight)
+
+The DeepSeek-V4 rollout path JIT-compiles kernels the first time an engine is
+built (vLLM/flashinfer and the TileLang `mhc` sparse-attention kernels). At 128
+ranks, every rank recompiling from cold is a launch-time disaster, so the caches
+are persisted on lustre under a container+SM-keyed `JIT_CACHE_ROOT`
+(`${RUN_ROOT%/*}/jit_cache/${JIT_CACHE_TAG}`, default tag `vllm023-sm90`) that is
+shared across jobs. Because the artifacts are keyed by kernel shape
+(head_dim/block/dtype), not world size, the rollout kernels compiled once with
+`ROLLOUT_TP=8` are reused by every 128- and 16-rank job that points
+`JIT_CACHE_ROOT`/`JIT_CACHE_TAG` at the same directory. The `TILELANG_TMP_DIR`
+EXDEV fix keeps TileLang's `os.replace` staging on the same lustre filesystem so
+the compiled kernels actually land rather than silently failing to persist.
+
+Warm the rollout cache with a single-node, 8-GPU load-only run. `VLLM_LOAD_ONLY=1`
+builds the vLLM engine (`load_format=dummy`, `enforce_eager`, `ROLLOUT_TP=8`) and
+lets its profile run drive the rollout kernel compilation, without starting any
+actor/training worker — so it fits one node instead of requiring the full
+colocated GRPO geometry (which does not fit a 16-GPU allocation):
+
+```bash
+sbatch --partition=batch --nodes=1 --gres=gpu:8 --time=00:30:00 \
+  --export=ALL,VLLM_LOAD_ONLY=1,GPUS_PER_NODE=8,ROLLOUT_TP=8,ACTOR_EP=8,JIT_CACHE_TAG=vllm023-sm90 \
+  experimental/lite/examples/verl/slurm/run_ds4_gsm8k_grpo.sbatch
+```
+
+On success it prints `DS4_VLLM_LOAD_ONLY_PASSED ... rollout_tp=8` and
+`DS4_VLLM_LOAD_ONLY_TIMING ... init_seconds=<n>` (the cold engine-init wall time,
+which drops sharply once the cache is warm). Verify the cache actually grew by
+listing it before and after — the TileLang directory goes from empty to the
+compiled `mhc` kernels (`executable.so` + generated `.cu` + `params.pkl`):
+
+```bash
+find "${JIT_CACHE_ROOT}/tilelang" -type f -printf '%s\t%p\n' | sort -k2
+```
+
+This warm-up covers only the **rollout-side** kernels. The training-side kernels
+(TileLang attention backward, grouped-GEMM, Inductor) depend on the actor
+`PP`/`CP` topology, so they are not compiled by the rollout-only load-only run
+(`enforce_eager` also skips Inductor). They are warmed as a side effect of the
+first full run and persist in the same shared cache, so the compile cost is paid
+once rather than per launch.
+
+Preflight for the subsequent 128-/16-rank jobs: submit them with the same
+`JIT_CACHE_TAG` (and `JIT_CACHE_ROOT` if overridden) as the warm-up, and confirm
+the rollout cache is warm before launch:
+
+```bash
+find "${JIT_CACHE_ROOT}/tilelang" -type f -name '*.so' | grep -q . || \
+  echo "rollout JIT cache is cold — run a VLLM_LOAD_ONLY=1 warm-up first" >&2
+```
+
 ### Serialized checkpoint weight resync
 
 Quantized inference models must receive weights in the serialized format
