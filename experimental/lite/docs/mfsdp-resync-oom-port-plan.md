@@ -77,6 +77,55 @@ is to stop materializing **all** params at once:
 - This is a correctness-sensitive primitive edit → follow MLite skills
   (primitive/perf), keep invariants, and it CANNOT ship without a real GPU run.
 
+#### Branch B correctness pre-check — DONE (static, 2026-07-12, no GPU)
+
+Traced the real export generator
+`primitive/ckpt/hf_weights.py::export_hf_weights` (protocol.py:306 →
+checkpoint.py:752 → this). DAPO mfsdp config is **PP1 + MoE (qwen3_5,
+`num_experts`, ran EP8)**, so the PP≤1 branch (hf_weights.py:419-466) is the live
+path. Two distinct retention behaviours:
+
+- **Dense params** (attn/router/norms): iterated per chunk via
+  `base_chunk.named_parameters()`, gathered one-at-a-time by `_gather_dense`
+  (`allgather_concat` → a *new* `torch.cat` tensor, independent of the mfsdp
+  buffer) and **yielded immediately**. No cross-chunk retention → per-chunk
+  materialize/iterate/release/`empty_cache` is SAFE for dense weights.
+- **Expert params** (MoE, active here): when `limit is None` they are
+  **accumulated across ALL chunks** into `expert_groups` (hf_weights.py:421-440)
+  and gathered only at the end (458-465). Each accumulated entry is
+  `_materialize_dtensor(param.data.detach())`. For **mfsdp** params
+  `_materialize_dtensor` (hf_weights.py:32-46) is a **pass-through** — it only
+  `full_tensor()`s a *DTensor* (FSDP2); mfsdp's `materialize_all()` populates
+  `param.data` in place, so the stored tensor is a **view into the mfsdp
+  materialized buffer**, NOT an independent copy. `full_parameter_context`'s
+  `finally` (wrapper.py:198) calls `release_all()` +
+  `discard_full_parameter_views()`, which frees that buffer.
+
+**Conclusion:** naive per-chunk release is UNSAFE for the expert path — releasing
+chunk *i*'s mfsdp buffer before the final `expert_groups` gather would invalidate
+the retained `param.data.detach()` views (use-after-free / wrong data). This IS
+the "cross-chunk fusion" hazard the plan warned about, and it is real for MoE.
+
+Viable Branch-B shapes (whichever DS4 evidence justifies):
+1. **Clone-on-extract**: `.clone()` (or `_gather_expert` immediately) each expert
+   tensor at accumulation so it survives its chunk's release. Adds a transient
+   expert-sized copy — smaller than holding the full mfsdp all-gather buffer, but
+   verify it actually lowers the peak vs. just holding one chunk.
+2. **Incremental per-group expert gather**: gather+yield each expert group as soon
+   as it is complete instead of deferring all groups to the end.
+   Dense weights get per-chunk release for free in either shape.
+
+Architectural note: current `runtime.export_weights` (runtime.py:354-361) opens
+**every** chunk's `full_parameter_context` up front in one `ExitStack`, holding
+all chunks resident for the whole generator. Streaming requires moving context
+management **into** the export generator's per-chunk loop — a refactor crossing
+the runtime → primitive → model boundary. Keep it behind a default-off env and
+GPU-verify the peak actually drops before enabling.
+
+This pre-check strengthens the "try Branch A (`expandable_segments`, zero code)
+first" ordering: Branch B is a genuine multi-file primitive change with a live
+MoE use-after-free pitfall, not a mechanical edit.
+
 ## Execution sequence (once DS4 green)
 
 1. Read DS4's validated recipe + evidence; pick Branch A or B.
