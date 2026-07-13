@@ -1,7 +1,9 @@
 # M-FSDP DAPO E2E resync OOM — port plan (TASK-1.13.8)
 
 Status: **DS4 gate LIFTED (bayan 2026-07-13 00:30) — Branch B implemented in the
-verl layer, CPU/unit green; ready for the 32-card E2E收口 run.**
+verl layer, CPU/unit green. Pre-GPU 门 round-1 reject 的四项(bayan 01:12)已补齐,见
+§"Pre-GPU 门 round-2 补全" — 待 round-2 pre-GPU moe 门,门过即由 operator 点火 32-card
+E2E 收口 run.**
 
 bayan 00:30 解禁: the "wait for DS4" gate is void — our OOM is mfsdp's own
 (actor won't yield to vLLM wake), fixable entirely in our own code. Branch B is
@@ -15,6 +17,117 @@ matters if the 32-card residency probe shows the transient export peak (not the
 handoff) is the OOM.
 
 Historical (pre-00:30) gating context retained below for provenance.
+
+---
+
+# Pre-GPU 门 round-2 补全 (bayan 2026-07-13 01:12 reject 的四项)
+
+Round-1 pre-GPU moe 门 reject 了三个 BLOCKER(全是协议补全)+ 一条 bayan 架构红线
+(01:09, 另发)。四项在此补齐;补齐即过 round-2(两轮封顶)后由 operator/巡检点火。
+
+## ① Per-rank 显存包络表 (BLOCKER 补全)
+
+Gate rule (bayan 2026-07-12 20:54): **每一相位的 per-card residency 必须 itemize 并证
+`< 80 GiB with headroom`**,否则不点火。失败模式是 wake_up OOM,所以按**相位**列表(而
+非单一求和)才对症——OOM 发生在 export 之后 vLLM 醒来那一刻(phase C),不是稳态。
+
+数据边界(2026-07-12 repo-only recon 已核,commit 122d4b333):**本表不能纯从 repo
+faithfully 预算**。repo 默认 `engine/mlite.yaml` 出厂 `tp/pp/cp/ep=1`、offload OFF;收口
+run 的真实并行切分 + vLLM rollout TP/quant 由 **cw harness 在 launch 时**给定(不在本
+repo,见 Branch A);且 bayan 20:54 gate **要求 optim-state residency 经验实测**(不是读
+flag)。故三行里有两行(rollout weight、经验 optim residency)需 cw-side + GPU 数据,点火前
+在此不可得。**禁止捏造 placeholder 数字"过门"**——这些行在 cw ignition-prep 时按下方
+recipe 实测填入,填表本身是点火前的一道 gate 步。
+
+| Row (per card) | Phase A 稳态训练 | Phase B export 瞬时峰值 | Phase C vLLM wake | 数值 / 实测 recipe |
+|---|---|---|---|---|
+| actor sharded weight (mfsdp) | ✔ | ✔ | ✔ | 静态 ≈ **8.6 GiB** (sharded, 见 §materialization peak) |
+| export full-param materialize | — | ✔ | — | 静态 ≈ **69 GiB** (34.6B BF16, `materialize_all`);drain+empty_cache 后归还 driver |
+| optim state (Adam moments+master) | ✔ | ✔ | ✔(除非 offload) | **实测**:repo 默认 offload OFF;cw 端 `nvidia-smi --query-compute-apps` 逐进程确认是否 GPU-resident;要么 flip offload ON 并验证 off-GPU,要么把 resident 全量计入并证 phase-A/B 仍 <80 |
+| grad buffer | ✔ | ✔ | ✔ | **实测**(同上;repo grad_offload OFF) |
+| activations | ✔ | ✔ | ✔ | **实测** peak(microbatch 已定,cw 端读 `max_memory_allocated`) |
+| NCCL / P2P buffers | ✔ | ✔ | ✔ | **先审 DS4 21:05 行**:确认每 actor `torch.cuda.device_count()==1`(仅自卡),否则 7 兄弟各 ~2.5 GiB 虚增(§"DS4 21:05 diagnostic");审通过后填实测 |
+| vLLM rollout weight | — | — | ✔ | **实测**:`model_bytes × quant ÷ rollout_TP`(cw harness 定 TP/quant,如 FP8+TP16 ⇒ ≈19 GiB) |
+
+**Green-light 判据(逐相位,全部满足才点火):**
+- Phase A(稳态,vLLM asleep):sharded weight + optim + grad + activations + NCCL `< 80 GiB` with headroom。
+- Phase B(export 瞬时峰,vLLM asleep):+ 69 GiB full-param materialize `< 80 GiB`。静态已知
+  sharded 8.6 + full 69 ≈ **77.6 GiB**——headroom 极薄,optim/grad/activations/NCCL 任何一
+  行非零都可能越 80 → **这是 Branch B(流式导出砍 materialize 峰)是否必需的判据**:若
+  phase-B 表越 80,`expandable_segments`(碎片修复,非绝对占用修复)救不了,必须上 Branch B。
+- Phase C(export drain + empty_cache 之后,vLLM wake):actor 已回落到 ~phase-A + vLLM weight
+  `< 80 GiB`。**这正是 21f14c2a5 修的相位**——empty_cache 把 69 GiB 交回 driver,vLLM cumem
+  才能 wake。此行越 80 = 修复未生效,FR/py-spy 留栈定案。
+
+表在 cw ignition-prep 组装(逐进程 residency 探针 dump,commit 0b00a4028 harness 移植进收口
+run);三行实测数到位、逐相位 <80 才是唯一 green-light。
+
+## ② SMOKE 判据 (BLOCKER 补全,写死)
+
+SMOKE = 点火后的 go/no-go,判两件事关闭 + 早期曲线不发散;**非** full-length 曲线收口
+(后者是任务 AC,见下"边界")。
+
+- **完成定义(completion):** job 到 RUNNING 后,在 --time 硬顶内完成 **≥1 个完整
+  actor→rollout resync 周期 + ≥5 个 training step**,且:①无 CP4 dense-gather deadlock
+  (已由 c17a05eff 验证守住,回归确认);②无 vLLM `wake_up` CUDA OOM(21f14c2a5 修的相位);
+  ③FR dump 为空(无 hang)。三者齐 = SMOKE 完成。
+- **完整性 + parity 判据:** SMOKE window 内 loss / reward / grad-norm 曲线与**既有 DAPO
+  baseline**(同 data/seed,FSDP2 或既有 optimizer backend)**同向不发散**——前 5 step 逐点相对
+  偏差 ≤ 既有 backend-间 run-to-run 抖动带(非 bitwise;mfsdp≠FSDP2 数值路径)。吞吐(tokens/s)
+  记录并与 baseline 比,SMOKE 阶段只报不卡(<20% 退化为 CAVEAT,严重退化再议)。resync wall
+  time 记录并对齐 DS4 ≤20% overhead gate(memory 不能拿 speed 换)。
+- **超时(timeout):** sbatch `--time` 硬顶(见 ③)+ 脚本内 per-step watchdog;RUNNING+5min
+  必上机诊断(GPU 铁律),hang/OOM 即 scancel 留栈,禁等超时白烧。
+- **失败准则(failure):** ①hang → FR/py-spy 栈 = 根因判决书,scancel,log,不盲 retry;
+  ②wake_up OOM → 显存表 phase-C 估错,**不 retry**,回 §① 重推表(大概率 Branch B);
+  ③曲线发散超抖动带 → 数值回归,block 交人,不当"跑通";④deadlock 复发 → c17a05eff 回归失效,
+  block。任一失败都先问"哪道闸本该拦住",不是加卡重跑。
+- **边界:** SMOKE 绿 ≠ 任务收口。full-length 曲线/吞吐对照(任务 AC)是 SMOKE 绿之后的
+  follow-on 长跑,若 30-min 硬顶容不下完整 rollout(CP4 rollout 历史观测 ~26min,见
+  `[[mfsdp-cp4-diagnostic-budget-conflict]]`),SMOKE 用**缩量 config**(cw harness 调
+  `max_response_len` / `n_samples`)把一个 resync+train 周期压进硬顶,先关两个失败模式;完整
+  曲线另请预算,由 bayan grant。这条写明以防"SMOKE 通=收口"的误判。
+
+## ③ 16 GPU-h 上限可执行化 (BLOCKER 补全)
+
+bayan 定收口 = 32 卡,预算 ≤16 GPU-h。落到可执行:
+
+- **sbatch `--time` 硬顶:** 16 GPU-h ÷ 32 card = 0.5 h/card = **30 min wall 绝对上限**。点火
+  attempt 用 `--time=00:25:00`(= 13.3 GPU-h,留 5min RUNNING-诊断-scancel 的白烧余量)。脚本
+  内再加 per-step watchdog 自杀,不只靠 --time。
+- **重试次数上限:** **≤2 attempts 总计**,round-2 后交 human(与两轮封顶同调)。且 code-level
+  OOM/hang **不盲 retry**——必先按 §②失败准则根因(FR/py-spy),第二炮只给"transient infra 失败"
+  或"表/config 已按根因修正"的情形;两炮累计 GPU-h 必 ≤16(attempt-1 若 RUNNING+5min 诊断即
+  scancel 只花 ~3.7 GPU-h,给 attempt-2 留 25-min 满跑余量)。
+- **分 rank / 分 job 记账(GPU 铁律台账):** 每 job 在任务 log 记
+  `job id / 申请时刻 / RUNNING 时刻 / 首次诊断时刻 / 结论 / 花费 GPU-h`;逐进程 residency 探针
+  (§①,commit 0b00a4028)按 rank dump 落 evidence。台账缺失 = review 直接 reject。
+
+## ④ verl 集成层无 backend 条件分支 (bayan 2026-07-13 01:09 红线 — compliance 证据)
+
+红线:optimizer backend 必须对集成层透明,diff 里出现 `if backend==mfsdp` = BLOCKER。合法只两
+形态:(a) 通用卫生动作(所有 backend 一视同仁,FSDP2 同走且不劣化);(b) 收进 mfsdp release
+协议内部。**本实现是 (a),证据如下:**
+
+- `MegatronLiteEngine.get_per_tensor_param`(engine/mlite_engine.py:374)**无条件**用
+  `stream_export_with_empty_cache` 包住 `self.runtime.export_weights` 的返回生成器——**没有任何
+  optimizer-backend 分支**。该 engine 以 `backend="mlite"`(device/engine backend,非 optimizer
+  backend)注册(mlite_engine.py:249),是 mlite 所有 optimizer 后端(mfsdp / dist_opt / fsdp2)
+  的唯一 export 入口。
+- `runtime.export_weights`(runtime/backends/mlite/runtime.py:348)用 `getattr(chunk,
+  "full_parameter_context", None)` **duck-typing** 派发,也无 `if backend==...`。整条 export 路径
+  backend-agnostic。
+- `stream_export_with_empty_cache`(resync_export.py:48)只按**导出字节数 + allocator 状态**触发
+  flush——这两个量对每个 backend 同构存在,wrapper 从不 inspect optimizer 类型。FSDP2 走同一
+  wrapper:其 export 同样 materialize→release,drain 后 empty_cache 是**同一有益的 colocated-wake
+  卫生**(把 freed 段交回 driver),**行为不劣化**;成本 = 每 ≥4 GiB 一次 device sync(相对 export
+  all-gather 可忽略),且 env `MLITE_RESYNC_EXPORT_EMPTY_CACHE_GIB=0` 可整体关。
+- primitive(megatron_lite export)**零改动**;`resync_export.py` / docstring 里的 "M-FSDP" 字样是
+  **描述性**(解释为何 colocated wake 需要 flush),非运行时条件。RL-colocation 关注点放 verl 层、
+  不入 vLLM-agnostic primitive,正是分层正确(bayan 反复点名 primitive 感知 vLLM = auto-reject)。
+
+结论:diff 无 backend 条件分支,符合红线合法形态 (a);FSDP2 路径同走同一 wrapper 且不劣化,
+满足"显存对齐 fsdp2 让位合同"的验收条件。
 
 ## Where we are
 
