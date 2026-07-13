@@ -302,6 +302,40 @@ def _weight_fingerprint(rt, handle) -> dict[str, Any]:
     return result
 
 
+def _cuda_graph_qualify_probe(handle, cfg) -> dict[str, Any]:
+    """Structural CUDA-graph qualification over the real, runtime-built chunks.
+
+    Opt-in via ``MLITE_CG_QUALIFY_PROBE=1``; default no-op (zero regression). This
+    reuses the proven model-build path so ``qualify()`` is exercised against the
+    exact chunks the runtime assembles — the on-GPU counterpart to the CPU unit
+    tests, which can only feed synthetic chunks. Never disturbs the training run.
+    """
+    from megatron.lite.primitive.cuda_graph import CudaGraphController
+
+    chunks = _model_chunks(handle)
+    controller = CudaGraphController(
+        chunks=chunks,
+        num_warmup_microbatches=cfg.warmup,
+        num_microbatches=cfg.num_microbatches,
+    )
+    status = controller.qualify()
+    verdict = {
+        "num_chunks": len(chunks),
+        "num_slots": controller.num_slots,
+        "state": status.state,
+        "implementation": status.implementation,
+        "captured": [dict(region=c.region, chunk_id=c.chunk_id, num_slots=c.num_slots) for c in status.captured],
+        "excluded": [dict(region=e.region, code=e.code.name, detail=e.detail) for e in status.excluded],
+    }
+    out_path = os.environ.get("MLITE_CG_QUALIFY_PROBE_OUT")
+    if out_path and _distributed_rank() == 0:
+        with open(out_path, "w", encoding="utf-8") as stream:
+            json.dump(verdict, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+    print("CG_QUALIFY_PROBE " + json.dumps(verdict, sort_keys=True))
+    return verdict
+
+
 def _forward_logits(rt, handle, batch: Any) -> torch.Tensor | None:
     result = rt.forward_backward(
         handle,
@@ -326,6 +360,8 @@ def run_backend(
     rt_cfg = build_runtime_config(cfg)
     rt = create_runtime(rt_cfg)
     handle = rt.build_model()
+    if os.environ.get("MLITE_CG_QUALIFY_PROBE") == "1":
+        _cuda_graph_qualify_probe(handle, cfg)
     session_cfg = build_session_config(cfg)
 
     eval_iter = _make_data_iter(handle, session_cfg)
