@@ -1,9 +1,12 @@
 # M-FSDP DAPO E2E resync OOM — port plan (TASK-1.13.8)
 
-Status: **DS4 gate LIFTED (bayan 2026-07-13 00:30) — Branch B implemented in the
-verl layer, CPU/unit green. Pre-GPU 门 round-1 reject 的四项(bayan 01:12)已补齐,见
-§"Pre-GPU 门 round-2 补全" — 待 round-2 pre-GPU moe 门,门过即由 operator 点火 32-card
-E2E 收口 run.**
+Status: **Root-cause fix landed (bayan 2026-07-13 03:30) — the persistent
+`DoubleBufferAllocator` retention of the export buffer is the real bug; the export
+buffer is now scoped to `full_parameter_context` and returned to the driver on exit
+(see §"Scoped export-buffer lifetime fix (bayan 03:30)"). CPU/unit green (41 passed).
+Awaiting pre-GPU quick gate → gmu 0.7 收口炮. The 0.6 data 炮 curves are kept as a
+comparison baseline. Prior Branch B (verl-layer empty_cache) + round-2 gate history
+retained below for provenance.**
 
 bayan 00:30 解禁: the "wait for DS4" gate is void — our OOM is mfsdp's own
 (actor won't yield to vLLM wake), fixable entirely in our own code. Branch B is
@@ -17,6 +20,51 @@ matters if the 32-card residency probe shows the transient export peak (not the
 handoff) is the OOM.
 
 Historical (pre-00:30) gating context retained below for provenance.
+
+---
+
+# Scoped export-buffer lifetime fix (bayan 03:30)
+
+bayan 2026-07-13 03:30 拍板:**`DoubleBufferAllocator` 持久持有导出缓冲 = 真 bug,修**。
+不是可选优化(旧 Branch-B kill-switch 框架作废),是根因修复:导出缓冲的生命周期必须
+**作用域化到 export**,`full_parameter_context` 退出时把缓冲归还/释放给 driver,**不得跨
+wake 存留**。零 backend 分支。
+
+**What was wrong.** `fsdp_double_buffer`(默认)把 all-gather 缓冲钉在
+`DoubleBufferAllocator` 的两个持久 slot 里,好在训练一步内多次 acquire/release 复用。
+但一次 *full-parameter export* 把整个 34.6B 稠密模型物化进这些 slot 后,`release_all()`
+只把 lease 标记为空闲——slot 字典**仍持活引用**。torch 的 caching allocator(以及
+`empty_cache`/`expandable_segments`)永远无法在还有活引用时把那段存储交回 driver,于是
+它跨过下一个 colocated consumer(醒来的 vLLM engine cumem allocator)的回合并饿死它。
+这就是 resync wake_up OOM 的根因缓冲。
+
+**The fix (form (b), inside mfsdp's own release protocol — 对齐 bayan 01:09 红线).**
+`MegatronFSDP.full_parameter_context` 的 `finally` 里,在 `release_all()` +
+`discard_full_parameter_views()` 之后**无条件**调 `param_sync.release_cached_buffers()`
+(`CommunicationPipelines.release_cached_buffers` 遍历 buckets、按 `id(allocator)` 去重、
+调既有的 `DoubleBufferAllocator.release_cached()` 清空 `_slots`/`_busy`/`_reuse_events`)。
+export 结束缓冲计数归零;slot 在下次 export 透明重建。与 FSDP2 的 `full_tensor` 路径
+(不留持久缓冲)对齐——这才是"显存对齐 fsdp2"验收的正题。
+
+**No kill-switch, no backend branch.** 删掉了旧的 `MLITE_EXPORT_RELEASE_CACHED` env
+开关(它给"重开 bug"留了后门,与"不得跨 wake 存留"矛盾)。释放无条件。export 每
+rollout 周期一次(`get_per_tensor_param` 唯一 caller),重建成本摊到整个 rollout+train
+周期 ⇒ 可忽略,无吞吐理由保留 A/B 开关。
+
+**Unit test (bayan 要求"导出后缓冲计数归零").**
+`test_mfsdp_full_parameter_export_returns_cached_buffers_to_driver`:导出中
+`_retained_buffer_count(allocator) == len(buckets)`;退出后 `== 0` 且 `_slots` 空、
+无 busy slot。全量 `tests/unit/primitive/test_mfsdp.py` **41 passed**,wrapper import OK。
+
+**drop-ref 是必要非充分——与 verl 层 empty_cache 互补,非冗余(待 pre-GPU 门判定).**
+mfsdp 的 scoped release 只是**丢引用**,让存储变为可回收;把物理内存真正交回 driver
+供 vLLM cumem 复用,仍需 `empty_cache` 或 `expandable_segments`。收口 run 两者都带:
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` + verl 层的
+`stream_export_with_empty_cache`(commit 21f14c2a5,mlite engine 通用导出路径,**无
+`if backend==mfsdp` 分支**,form-(a),已过 round-2 门)。二者关系:mfsdp drop-ref 是
+根因修(此前 empty_cache 对被钉住的 slot 是 no-op),expandable_segments/empty_cache 是
+return-to-driver 机制。**开放问题**:drop-ref + expandable_segments 是否已足够、verl 层
+empty_cache 是否变冗余,需 pre-GPU 门/GPU 实验判定;本次不擅自 revert 已批准代码。
 
 ---
 
@@ -124,7 +172,7 @@ recipe 实测填入,填表本身是点火前的一道 gate 步。
 | Row (per card) | Phase A 稳态训练 | Phase B export 瞬时峰值 | Phase C vLLM wake | 数值 / 实测 recipe |
 |---|---|---|---|---|
 | actor sharded weight (mfsdp) | ✔ | ✔ | ✔ | 静态 ≈ **8.6 GiB** (sharded, 见 §materialization peak) |
-| export full-param materialize | — | ✔ | — | 静态 ≈ **69 GiB** (34.6B BF16, `materialize_all`);drain+empty_cache 后归还 driver |
+| export full-param materialize | — | ✔ | — | 静态 ≈ **69 GiB** (34.6B BF16, `materialize_all`);export 退出时 mfsdp scoped `release_cached_buffers()` 丢引用 + expandable_segments/empty_cache 归还 driver(见 §"Scoped export-buffer lifetime fix") |
 | optim state (Adam moments+master) | ✔ | ✔ | ✔(除非 offload) | **实测**:repo 默认 offload OFF;cw 端 `nvidia-smi --query-compute-apps` 逐进程确认是否 GPU-resident;要么 flip offload ON 并验证 off-GPU,要么把 resident 全量计入并证 phase-A/B 仍 <80 |
 | grad buffer | ✔ | ✔ | ✔ | **实测**(同上;repo grad_offload OFF) |
 | activations | ✔ | ✔ | ✔ | **实测** peak(microbatch 已定,cw 端读 `max_memory_allocated`) |
@@ -137,9 +185,10 @@ recipe 实测填入,填表本身是点火前的一道 gate 步。
   sharded 8.6 + full 69 ≈ **77.6 GiB**——headroom 极薄,optim/grad/activations/NCCL 任何一
   行非零都可能越 80 → **这是 Branch B(流式导出砍 materialize 峰)是否必需的判据**:若
   phase-B 表越 80,`expandable_segments`(碎片修复,非绝对占用修复)救不了,必须上 Branch B。
-- Phase C(export drain + empty_cache 之后,vLLM wake):actor 已回落到 ~phase-A + vLLM weight
-  `< 80 GiB`。**这正是 21f14c2a5 修的相位**——empty_cache 把 69 GiB 交回 driver,vLLM cumem
-  才能 wake。此行越 80 = 修复未生效,FR/py-spy 留栈定案。
+- Phase C(export 退出 + 归还 driver 之后,vLLM wake):actor 已回落到 ~phase-A + vLLM weight
+  `< 80 GiB`。**这正是根因修的相位**——mfsdp scoped `release_cached_buffers()` 丢掉被钉住的
+  持久 slot 引用(否则 empty_cache 对它是 no-op),再由 expandable_segments/empty_cache 把
+  69 GiB 交回 driver,vLLM cumem 才能 wake。此行越 80 = 修复未生效,FR/py-spy 留栈定案。
 
 表在 cw ignition-prep 组装(逐进程 residency 探针 dump,commit 0b00a4028 harness 移植进收口
 run);三行实测数到位、逐相位 <80 才是唯一 green-light。

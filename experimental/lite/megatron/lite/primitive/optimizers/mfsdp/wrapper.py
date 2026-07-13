@@ -197,6 +197,20 @@ class MegatronFSDP(nn.Module):
         finally:
             self.param_sync.release_all()
             self.param_sync.discard_full_parameter_views()
+            # Scope the export all-gather storage to this context. A
+            # full-parameter export materializes the whole (unsharded) model;
+            # under fsdp_double_buffer those all-gather buffers otherwise stay
+            # pinned in the allocator's persistent slots after release_all, so
+            # torch's caching allocator (and empty_cache / expandable_segments)
+            # can never hand that storage back to the driver -- it lives across
+            # the next colocated consumer's turn (e.g. a sleeping vLLM engine
+            # waking for RL weight resync) and starves it. That persistent
+            # cross-context retention is the resync-OOM bug; the export buffer's
+            # lifetime must end with the export. Returning the cached slots to
+            # the driver here makes the export release bounded like FSDP2's
+            # full_tensor path (which retains no persistent buffer); the slots
+            # are transparently re-allocated on the next export.
+            self.param_sync.release_cached_buffers()
 
     def named_parameters(self, *args, **kwargs) -> Iterator[tuple[str, nn.Parameter]]:
         if not self._expose_sharded_parameters:

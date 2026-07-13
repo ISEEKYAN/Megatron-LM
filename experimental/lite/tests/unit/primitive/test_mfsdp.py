@@ -1065,6 +1065,73 @@ def test_mfsdp_releases_nonopaque_bucket_after_owner_forward():
     output.sum().backward()
 
 
+def _build_export_release_chunk():
+    model = _ForwardReleaseModel()
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        etp_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, _optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_GlooUnit,),
+    )
+    return chunks[0]
+
+
+def _retained_buffer_count(allocator) -> int:
+    return sum(
+        sum(tensor is not None for tensor in slots)
+        for slots in allocator._slots.values()
+    )
+
+
+def test_mfsdp_full_parameter_export_returns_cached_buffers_to_driver():
+    # A full-parameter export materializes the whole (unsharded) model into the
+    # allocator's persistent double-buffer slots. Its lifetime is scoped to the
+    # export context: on exit the retained storage must be returned to the
+    # driver so a colocated consumer (e.g. a waking vLLM engine) can reclaim it.
+    chunk = _build_export_release_chunk()
+    allocator = chunk.param_and_grad_buffer.allocator
+    assert isinstance(allocator, mfsdp_buffer.DoubleBufferAllocator)
+
+    with chunk.full_parameter_context():
+        # Each bucket materialized its full-parameter buffer into a persistent
+        # slot (identical-layout buckets share a pool_key's two slots).
+        assert _retained_buffer_count(allocator) == len(chunk.param_sync.buckets)
+
+    # release_cached_buffers dropped the pinned slots so torch's caching
+    # allocator (empty_cache / expandable_segments) can hand the storage back;
+    # no export buffer survives the context (the resync-OOM bug was this
+    # storage persisting across the next consumer's turn).
+    assert _retained_buffer_count(allocator) == 0
+    assert len(allocator._slots) == 0
+    assert not any(allocator._busy.values())
+
+
 def test_mfsdp_double_buffer_does_not_mix_unequal_unit_layouts():
     model = _UnevenForwardReleaseModel()
     ps = SimpleNamespace(
