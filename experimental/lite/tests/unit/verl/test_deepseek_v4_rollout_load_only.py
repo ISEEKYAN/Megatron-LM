@@ -5,7 +5,9 @@ sibling vLLM TP-rank leak onto GPU 0 (see docs/ds4-resync-gpu0-sibling-residency
 Only the pure ``_parse_compute_apps`` accounting is exercised here; it is split from
 the ``nvidia-smi`` subprocess call precisely so it is testable without a GPU."""
 
-from deepseek_v4_rollout_load_only import _parse_compute_apps
+from pathlib import Path
+
+from deepseek_v4_rollout_load_only import _parse_compute_apps, build_llm_kwargs
 
 
 def test_parse_compute_apps_attributes_siblings_to_gpu0() -> None:
@@ -43,3 +45,43 @@ def test_parse_compute_apps_skips_unknown_and_malformed() -> None:
     residency = _parse_compute_apps(csv_text, uuid_to_index)
     assert set(residency) == {0}
     assert residency[0] == [(100, 512), (101, 0)]
+
+
+def _base_env() -> dict[str, str]:
+    return {"CHECKPOINT_DIR": "/models/DeepSeek-V4-Flash", "ROLLOUT_TP": "8"}
+
+
+def test_build_llm_kwargs_default_omits_executor_backend() -> None:
+    # No MLITE_VLLM_DISTRIBUTED_EXECUTOR_BACKEND -> vLLM keeps its default (multiproc).
+    kwargs = build_llm_kwargs(
+        _base_env(), checkpoint_dir=Path("/ckpt"), rollout_tp=8, sync_probe=False
+    )
+    assert "distributed_executor_backend" not in kwargs
+    assert kwargs["model"] == "/ckpt"
+    assert kwargs["tensor_parallel_size"] == 8
+    assert "worker_extension_cls" not in kwargs
+
+
+def test_build_llm_kwargs_passes_ray_backend_through() -> None:
+    # C1 arm: the ray executor is a pure env flip over the baseline multiproc arm.
+    env = _base_env() | {"MLITE_VLLM_DISTRIBUTED_EXECUTOR_BACKEND": "ray"}
+    kwargs = build_llm_kwargs(
+        env, checkpoint_dir=Path("/ckpt"), rollout_tp=8, sync_probe=False
+    )
+    assert kwargs["distributed_executor_backend"] == "ray"
+
+
+def test_build_llm_kwargs_blank_backend_is_omitted() -> None:
+    # A stray/empty export must not force an invalid empty backend onto vLLM.
+    env = _base_env() | {"MLITE_VLLM_DISTRIBUTED_EXECUTOR_BACKEND": "  "}
+    kwargs = build_llm_kwargs(
+        env, checkpoint_dir=Path("/ckpt"), rollout_tp=8, sync_probe=False
+    )
+    assert "distributed_executor_backend" not in kwargs
+
+
+def test_build_llm_kwargs_sync_probe_adds_worker_extension() -> None:
+    kwargs = build_llm_kwargs(
+        _base_env(), checkpoint_dir=Path("/ckpt"), rollout_tp=8, sync_probe=True
+    )
+    assert kwargs["worker_extension_cls"].endswith("VllmCheckpointWorkerExtension")

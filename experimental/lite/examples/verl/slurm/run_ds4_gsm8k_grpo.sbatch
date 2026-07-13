@@ -119,6 +119,10 @@ if [[ "${IN_DS4_GRPO_CONTAINER:-0}" != "1" ]]; then
   export PHASE1_STEPS TOTAL_STEPS CONFIG_ONLY IMPORT_ONLY RAY_ONLY VLLM_LOAD_ONLY
   export VLLM_CHECKPOINT_SYNC_PROBE
   export ACTOR_TP ACTOR_PP ACTOR_CP ACTOR_EP ROLLOUT_TP
+  # Load-only diagnostics (C1 ray-executor arm + GPU-0 sibling residency probe); empty
+  # backend => vLLM keeps its default multiproc executor (bayan 2026-07-12 22:05).
+  export MLITE_VLLM_RESIDENCY_PROBE="${MLITE_VLLM_RESIDENCY_PROBE:-}"
+  export MLITE_VLLM_DISTRIBUTED_EXECUTOR_BACKEND="${MLITE_VLLM_DISTRIBUTED_EXECUTOR_BACKEND:-}"
   exec srun --export=ALL \
     --nodes="${SLURM_NNODES}" \
     --ntasks="${SLURM_NNODES}" \

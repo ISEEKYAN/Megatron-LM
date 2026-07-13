@@ -97,6 +97,55 @@ def dump_gpu_residency(tag: str) -> None:
         )
 
 
+def build_llm_kwargs(
+    env: dict[str, str], *, checkpoint_dir: Path, rollout_tp: int, sync_probe: bool
+) -> dict:
+    """Assemble the ``vllm.LLM`` constructor kwargs from the environment.
+
+    Split from ``main`` so the executor-backend / sync-probe wiring is unit-testable
+    without a GPU. ``MLITE_VLLM_DISTRIBUTED_EXECUTOR_BACKEND`` (e.g. ``ray``) is passed
+    straight through to vLLM's ``distributed_executor_backend`` when set, so the C1
+    ray-executor arm is a pure env flip over the baseline multiproc arm; when unset,
+    the kwarg is omitted and vLLM keeps its default (multiproc under
+    ``VLLM_USE_V1=1``).
+    """
+    kwargs = {
+        "model": str(checkpoint_dir),
+        "tensor_parallel_size": rollout_tp,
+        "load_format": "dummy",
+        "trust_remote_code": True,
+        "dtype": "bfloat16",
+        "max_model_len": 384,
+        "max_num_seqs": 32,
+        "max_num_batched_tokens": 4096,
+        "disable_custom_all_reduce": True,
+        "gpu_memory_utilization": float(
+            env.get("ROLLOUT_GPU_MEMORY_UTILIZATION", "0.60")
+        ),
+        "kv_cache_dtype": "fp8",
+        "enforce_eager": True,
+        "disable_log_stats": True,
+        "hf_overrides": {
+            "expert_dtype": "fp8",
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "scale_fmt": "float32",
+                "weight_block_size": [128, 128],
+            },
+        },
+    }
+    backend = env.get("MLITE_VLLM_DISTRIBUTED_EXECUTOR_BACKEND", "").strip()
+    if backend:
+        kwargs["distributed_executor_backend"] = backend
+    if sync_probe:
+        kwargs["worker_extension_cls"] = (
+            "verl_mlite.rollout.verl_worker.VllmCheckpointWorkerExtension"
+        )
+    return kwargs
+
+
 def probe_checkpoint_sync(llm, *, worker_count: int) -> None:
     handles = llm.collective_rpc("_get_zmq_handle", timeout=300)
     if len(handles) != worker_count or len(set(handles)) != worker_count:
@@ -150,42 +199,27 @@ def main() -> None:
             f"positive rollout_tp={rollout_tp}"
         )
 
+    import time
+
     from vllm import LLM
 
     sync_probe = os.environ.get("VLLM_CHECKPOINT_SYNC_PROBE", "0") == "1"
-    llm_kwargs = {}
-    if sync_probe:
-        llm_kwargs["worker_extension_cls"] = (
-            "verl_mlite.rollout.verl_worker.VllmCheckpointWorkerExtension"
-        )
+    llm_kwargs = build_llm_kwargs(
+        dict(os.environ),
+        checkpoint_dir=checkpoint_dir,
+        rollout_tp=rollout_tp,
+        sync_probe=sync_probe,
+    )
+    backend = llm_kwargs.get("distributed_executor_backend", "mp(default)")
 
-    llm = LLM(
-        model=str(checkpoint_dir),
-        tensor_parallel_size=rollout_tp,
-        load_format="dummy",
-        trust_remote_code=True,
-        dtype="bfloat16",
-        max_model_len=384,
-        max_num_seqs=32,
-        max_num_batched_tokens=4096,
-        disable_custom_all_reduce=True,
-        gpu_memory_utilization=float(
-            os.environ.get("ROLLOUT_GPU_MEMORY_UTILIZATION", "0.60")
-        ),
-        kv_cache_dtype="fp8",
-        enforce_eager=True,
-        disable_log_stats=True,
-        hf_overrides={
-            "expert_dtype": "fp8",
-            "quantization_config": {
-                "activation_scheme": "dynamic",
-                "fmt": "e4m3",
-                "quant_method": "fp8",
-                "scale_fmt": "float32",
-                "weight_block_size": [128, 128],
-            },
-        },
-        **llm_kwargs,
+    init_start = time.monotonic()
+    llm = LLM(**llm_kwargs)
+    init_seconds = time.monotonic() - init_start
+    # Init wall time so the C1 ray arm can be compared against the multiproc baseline
+    # for "no timing degradation" (bayan 2026-07-12 22:05).
+    print(
+        f"DS4_VLLM_LOAD_ONLY_TIMING backend={backend} init_seconds={init_seconds:.1f}",
+        flush=True,
     )
     if os.environ.get("MLITE_VLLM_RESIDENCY_PROBE") == "1":
         dump_gpu_residency("post_init")
@@ -195,7 +229,7 @@ def main() -> None:
             dump_gpu_residency("post_sync")
     print(
         "DS4_VLLM_LOAD_ONLY_PASSED "
-        f"rollout_tp={rollout_tp} o_groups={o_groups} "
+        f"backend={backend} rollout_tp={rollout_tp} o_groups={o_groups} "
         f"local_groups={o_groups // rollout_tp}",
         flush=True,
     )
