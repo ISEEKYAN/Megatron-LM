@@ -951,47 +951,106 @@ def export_hf_weights(
         yield from _flush_expert_bucket()
         return
 
-    gathered: dict[str, torch.Tensor] = {}
-    for chunk in chunks:
-        base_chunk = unwrap_model(chunk)
-        # Map local layer indices to global for PP
-        layer_map = (
-            {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
-            if hasattr(base_chunk, "layer_indices")
-            else {}
-        )
-        for name, param in base_chunk.named_parameters():
-            gname = to_global_layer_name(name, layer_map)
-            t = _materialize_dtensor(param.data.detach())
+    # R (streaming PP export). The pp>1 path must honor the export_hf_weights
+    # streaming contract: never materialize the whole model — nor the whole
+    # local PP stage — on any rank. The legacy path built this rank's local-stage
+    # `gathered` dict and then `all_gather_object`'d it across the pp_group, which
+    # pickled every PP stage's dict onto every rank (~235 GiB/rank host,
+    # ~36.5 GiB/rank GPU for DS4-128) before the first yield — an all-model
+    # materialization that broke the contract and drove the resync OOM. Even
+    # pre-building only this rank's own stage (TP/ETP/EP collapsed, EP *expands*
+    # experts to the full set, ~1/pp of the model) still pins ~9 GiB/rank up
+    # front, so it too violates the contract.
+    #
+    # Instead we lazily gather the own stage and stream the PP dimension in
+    # bounded buckets: each stage, in turn, gathers just enough params to fill
+    # one `buffer_max_size_bytes` bucket, broadcasts that bucket's
+    # (name, shape, dtype) header over the pp_group, then broadcasts the tensors
+    # one at a time; every rank yields+releases each param as it arrives. The
+    # own-stage generator is advanced only during this rank's source turn, so
+    # peak residency is one bucket + one in-flight param — never the whole stage.
+    # An empty header marks end-of-stage. Post-gather shapes cannot be predicted
+    # up front (models may supply a custom `gather_dense`), so the header rides
+    # inline rather than via a precomputed metadata exchange. Broadcasts always
+    # run on the NCCL pp_group; cpu=True (save path) residency is applied per
+    # param *after* receipt, so no gloo pp_cpu_group is required. pp=1 and every
+    # non-PP model (kimi/glm5/qwen) never reach this branch and are untouched.
+    gather_cpu = cpu
+    emit = not (rank0_only and rank != 0)
+    bcast_device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
 
-            if spec.is_expert(gname):
-                _gather_expert(gname, t, spec, ps, gathered, cpu=cpu)
-            else:
-                gathered[gname] = _gather_dense(gname, t, spec, ps, cpu=cpu)
+    def _iter_own_gathered() -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Lazily yield this PP stage's fully TP/ETP/EP-collapsed params.
 
-    # PP gather
-    if ps.pp_size > 1:
-        all_states: list[dict | None] = [None] * ps.pp_size
-        dist.all_gather_object(all_states, gathered, group=ps.pp_group)
-        gathered = {}
-        for s in all_states:
-            if s is not None:
-                gathered.update(s)
+        Advanced only during this rank's source turn, so at most one bucket of
+        gathered params is ever resident — the whole stage is never built.
+        """
+        for chunk in chunks:
+            base_chunk = unwrap_model(chunk)
+            layer_map = (
+                {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
+                if hasattr(base_chunk, "layer_indices")
+                else {}
+            )
+            for name, param in base_chunk.named_parameters():
+                gname = to_global_layer_name(name, layer_map)
+                t = _materialize_dtensor(param.data.detach())
+                if spec.is_expert(gname):
+                    one: dict[str, torch.Tensor] = {}
+                    _gather_expert(gname, t, spec, ps, one, cpu=False)
+                    for gathered_name, gathered_tensor in one.items():
+                        yield gathered_name, gathered_tensor
+                else:
+                    yield gname, _gather_dense(gname, t, spec, ps, cpu=False)
 
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank0_only and rank != 0:
-        return
-
-    # Vocab trim
-    if vocab_size is not None:
-        for key in list(gathered.keys()):
-            if "embed" in key or "head" in key:
-                gathered[key] = gathered[key][:vocab_size]
-
-    # Convert Megatron Lite names → HF names via spec
-    for native_name, tensor in gathered.items():
+    def _emit_param(native_name: str, tensor: torch.Tensor):
+        tensor = _maybe_cpu(tensor, cpu=gather_cpu)
+        if vocab_size is not None and ("embed" in native_name or "head" in native_name):
+            tensor = tensor[:vocab_size]
         for hf_name, hf_tensor in _native_to_hf(spec, native_name, tensor):
             yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
+
+    own = _iter_own_gathered()
+    for src_pp in range(ps.pp_size):
+        src_global = ps.pp_global_ranks[src_pp]
+        is_source = src_pp == ps.pp_rank
+        while True:
+            bucket: list[tuple[str, torch.Tensor]] = []
+            if is_source:
+                # Fill one bounded bucket from the lazy own-stage generator.
+                bucket_bytes = 0
+                for gathered_name, gathered_tensor in own:
+                    gathered_tensor = gathered_tensor.to(bcast_device).contiguous()
+                    bucket.append((gathered_name, gathered_tensor))
+                    bucket_bytes += _tensor_nbytes(gathered_tensor)
+                    if bucket_bytes >= buffer_max_size_bytes:
+                        break
+                header: list[Any] = [
+                    [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in bucket]
+                ]
+            else:
+                header = [None]
+            dist.broadcast_object_list(
+                header, src=src_global, group=ps.pp_group, device=bcast_device
+            )
+            entries = header[0]
+            if not entries:
+                break  # empty header = end of this stage's stream
+            for idx, (native_name, shape, dtype) in enumerate(entries):
+                if is_source:
+                    tensor = bucket[idx][1]
+                else:
+                    tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
+                dist.broadcast(tensor, src=src_global, group=ps.pp_group)
+                if emit:
+                    yield from _emit_param(native_name, tensor)
+                del tensor
+            del bucket
+    return
 
 
 def _gather_dense(
