@@ -211,6 +211,58 @@ The remaining required environment variables are fail-closed path contracts:
 `MLITE_SM90_SITE`, `DS4_VLLM_SITE`, `DS4_VLLM_SHIM`, `CHECKPOINT_DIR`, and a
 fresh `RUN_ROOT`.
 
+### JIT-cache warm-up (preflight)
+
+The DeepSeek-V4 rollout and training paths JIT-compile kernels at launch
+(vLLM/flashinfer, TileLang `mhc`/`hc`, grouped-GEMM, Triton, Inductor). At 128
+ranks each recompiling is a launch-time disaster, so the caches are persisted on
+lustre under a container+SM-keyed `JIT_CACHE_ROOT`
+(`${RUN_ROOT%/*}/jit_cache/${JIT_CACHE_TAG}`, default tag `vllm023-sm90`) that is
+shared across jobs. Because the artifacts are keyed by kernel shape
+(head_dim/block/dtype), not world size, the cache can be warmed once on 16 GPUs
+with the same per-rank `ACTOR_TP=1`/`ACTOR_EP=8`/`ROLLOUT_TP=8` shapes and then
+reused by every 128- and 16-rank job that points `JIT_CACHE_ROOT`/`JIT_CACHE_TAG`
+at the same directory.
+
+Run the warm-up as a bounded, two-node smoke that executes a single GRPO step
+(rollout generate + actor train + weight resync export), then stops without a
+checkpoint or resume phase:
+
+```bash
+sbatch --partition=batch --nodes=2 --time=01:00:00 \
+  --export=ALL,WARMUP_ONLY=1,WARMUP_STEPS=1,ACTOR_TP=1,ACTOR_PP=2,ACTOR_CP=1,ACTOR_EP=8,ROLLOUT_TP=8,JIT_CACHE_TAG=vllm023-sm90 \
+  experimental/lite/examples/verl/slurm/run_ds4_gsm8k_grpo.sbatch
+```
+
+`ACTOR_TP=1×ACTOR_PP=2×ACTOR_CP=1×ACTOR_EP=8 = 16` fits the two-node (16-GPU)
+allocation while keeping the `TP1`/`EP8` per-rank shapes and both pipeline
+endpoints (embedding + `lm_head`/MTP) that the 128-GPU `PP4/EP8/CP4` run compiles;
+`CP`/`PP` degree changes the number of kernel invocations, not the compiled
+kernel identity, and the `TILELANG_TMP_DIR` EXDEV fix keeps the `os.replace`
+persistence on the same lustre filesystem so the artifacts actually land.
+
+On success the warm-up prints `DS4_JIT_WARMUP_COMPILE_SECONDS <n>` (the cold
+compile wall time to compare against a later warm job) and
+`DS4_JIT_WARMUP_MANIFEST path=<run>/jit-cache-manifest.txt total_files=<n>
+total_bytes=<n>`, and writes a byte-level per-cache manifest + full file listing
+to `${RUN_ROOT}/jit-cache-manifest.txt`. It fails closed with
+`DS4_JIT_WARMUP_EMPTY` (exit 8) if nothing was persisted, which proves the run
+really wrote kernels to durable storage rather than silently recompiling.
+
+Preflight for the subsequent 128-/16-rank jobs: submit them with the same
+`JIT_CACHE_TAG` (and `JIT_CACHE_ROOT` if overridden) as the warm-up, and confirm
+the cache is warm before launch, e.g.:
+
+```bash
+test -s "${JIT_CACHE_ROOT}/tilelang" && \
+  find "${JIT_CACHE_ROOT}" -type f | head -1 | grep -q . || \
+  echo "JIT cache is cold — run WARMUP_ONLY=1 first" >&2
+```
+
+A definitive "16 covers 128" verdict is the compile-phase wall time of the first
+full 128-rank job collapsing versus its cold baseline; the warm-up itself only
+guarantees the model-config-derived kernel set is populated.
+
 ### Serialized checkpoint weight resync
 
 Quantized inference models must receive weights in the serialized format
