@@ -1,15 +1,20 @@
 # M-FSDP DAPO E2E resync OOM — port plan (TASK-1.13.8)
 
-Status: **prepared, gated on DS4 (TASK-1.1.12) validating the resync-memory recipe.**
-Do NOT burn GPU on this until DS4 confirms which branch below actually holds.
-DS4's recipe: `expandable_segments` is the PRIMARY lever (20:48) ⇒ Branch A
-(env-only, applied on the cw harness — no repo patch) is the leading and likely
-sole port; Branch B (mfsdp code) stays UNWRITTEN by design until DS4 proves A
-insufficient. **20:54 correction folded in**: per-tensor `empty_cache` hard-OFF,
-and a mandatory pre-ignition memory-budget gate (`<80 GiB/card with headroom`,
-optim state *empirically* off-GPU) that OUR colocated收口 run must also pass —
-see §"DS4 20:54 correction" and execution step 2. DS4 is still In Progress / NOT
-green as of 2026-07-12.
+Status: **DS4 gate LIFTED (bayan 2026-07-13 00:30) — Branch B implemented in the
+verl layer, CPU/unit green; ready for the 32-card E2E收口 run.**
+
+bayan 00:30 解禁: the "wait for DS4" gate is void — our OOM is mfsdp's own
+(actor won't yield to vLLM wake), fixable entirely in our own code. Branch B is
+implemented (see §"Implemented (2026-07-13)"): threshold-batched `empty_cache`
+draining the export so the released all-gather buffer is returned to the driver
+**before vLLM wakes**, plus the `expandable_segments` launch env. The deeper
+per-bucket streaming refactor (the MoE use-after-free hazard below) stays
+DEFERRED — the observed OOM is at wake_up *after* export drains, which the
+empty_cache-before-wake fix targets directly; the per-bucket peak reduction only
+matters if the 32-card residency probe shows the transient export peak (not the
+handoff) is the OOM.
+
+Historical (pre-00:30) gating context retained below for provenance.
 
 ## Where we are
 
@@ -22,6 +27,43 @@ green as of 2026-07-12.
   (`ray_trainer.py:1672 update_weights`). This is colocated memory contention,
   same family as DS4 128-card resync OOM (`[[ds4-128card-resync-oom]]`), NOT the
   CP4 deadlock.
+
+## Implemented (2026-07-13) — Branch B, verl layer
+
+Fix landed in the **verl integration layer** (not the megatron_lite export
+primitive) — the empty-cache-before-vLLM-wake concern is RL-colocation-specific,
+so putting it in `runtime.export_weights` would be a layering violation. Files:
+
+- `examples/verl/verl_mlite/resync_export.py` (new, stdlib-only so it is CPU
+  unit-testable without a verl/CUDA runtime):
+  - `stream_export_with_empty_cache(gen, threshold_bytes, empty_cache_fn)` —
+    drains the export generator, firing `empty_cache_fn` once per
+    `threshold_bytes` of cumulative exported material **and once more after the
+    generator drains** (its `finally`, i.e. the runtime `ExitStack` →
+    `release_all()`, has by then freed the M-FSDP all-gather buffer). That final
+    flush returns the freed segments to the driver so the colocated vLLM cumem
+    allocator can reclaim them on `wake_up` — closing the observed OOM.
+  - `resync_export_empty_cache_threshold_bytes()` — ≥4 GiB default (DS4 recipe),
+    env `MLITE_RESYNC_EXPORT_EMPTY_CACHE_GIB` (`0` disables).
+- `examples/verl/verl_mlite/engine/mlite_engine.py::get_per_tensor_param` wraps
+  the returned export generator with the above, `empty_cache_fn =
+  aggressive_empty_cache(force_sync=True)`.
+- `tests/unit/verl/test_mlite_engine_resync_export.py` — 10 CPU tests: export
+  transparency (correctness), flush-per-threshold + final-drain flush counts,
+  disabled pass-through, early-abort still flushes, env parsing. `10 passed`.
+
+**Why empty_cache is the fix, not per-bucket streaming:** the 32-card run
+completed the export (transient peak sharded≈8.6 + full≈69 ≈ 77.6 GiB fit) and
+OOMed at vLLM `wake_up` *afterward*. `release_all()` returns memory only to
+torch's caching allocator; vLLM's separate cumem allocator cannot see it, so
+without an `empty_cache` between export-drain and wake the 69 GiB stays pinned.
+`get_per_tensor_param` only ran `aggressive_empty_cache` once (guarded, at the
+*start* of the first sync) — never after export. This wrapper fills that gap.
+
+`expandable_segments`: a launch-env line
+(`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`) applied on the cw harness at
+the收口 run (no repo patch — the harness lives cw-side, per Branch A). Defense in
+depth for fragmentation.
 
 ## The mfsdp materialization peak (concrete site)
 

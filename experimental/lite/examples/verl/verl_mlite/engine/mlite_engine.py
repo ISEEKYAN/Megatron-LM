@@ -26,6 +26,10 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl_mlite.compat import load_verl_engine_api
+from verl_mlite.resync_export import (
+    resync_export_empty_cache_threshold_bytes,
+    stream_export_with_empty_cache,
+)
 
 try:
     # Recent VERL wraps per-step metric values in a Metric aggregator that
@@ -383,7 +387,16 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
-        return self.runtime.export_weights(self.handle, **export_kwargs), None
+        generator = self.runtime.export_weights(self.handle, **export_kwargs)
+        # Drain the export with a threshold-batched empty_cache so the released
+        # M-FSDP all-gather buffer is returned to the driver before the colocated
+        # vLLM wakes (avoids the resync wake_up OOM). See TASK-1.13.8.
+        streamed = stream_export_with_empty_cache(
+            generator,
+            resync_export_empty_cache_threshold_bytes(),
+            lambda: aggressive_empty_cache(force_sync=True),
+        )
+        return streamed, None
 
     def get_data_parallel_size(self):
         if self.handle is None:
