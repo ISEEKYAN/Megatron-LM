@@ -261,6 +261,27 @@ def test_static_over_budget_flag_and_raise():
         disp.raise_if_over_budget()
 
 
+def test_static_dispatch_zeros_capacity_tail():
+    """The per-expert unused tail is zeroed on device (contract: tail-zero)."""
+    num_tokens, hidden, num_experts, topk = 16, 4, 8, 1
+    # topk=1, few tokens => most experts have counts < capacity => real padding tail.
+    scores, indices = _make_routing(num_tokens, num_experts, topk, seed=11)
+    x = torch.randn(num_tokens, hidden)
+    ps = _ps_single()
+    cap = 8
+    cfg = StaticCapacityConfig(num_tokens=num_tokens, expert_capacity=cap)
+    disp = TokenDispatcher(num_experts, hidden, ps, use_deepep=False, static_capacity=cfg)
+    dispatched, tpe, probs = disp.dispatch(x, scores, indices)
+
+    counts = torch.zeros(num_experts, dtype=torch.long)
+    counts.scatter_add_(0, indices.reshape(-1), torch.ones(num_tokens * topk, dtype=torch.long))
+    assert int(counts.min()) < cap  # ensure some real padding exists to test
+    for e in range(num_experts):
+        tail = dispatched[e * cap + int(counts[e]) : (e + 1) * cap]
+        assert torch.count_nonzero(tail) == 0, f"expert {e} tail not zeroed"
+        assert torch.count_nonzero(probs[e * cap + int(counts[e]) : (e + 1) * cap]) == 0
+
+
 def test_static_under_budget_no_raise():
     num_tokens, hidden, num_experts, topk = 32, 8, 8, 2
     scores, indices = _make_routing(num_tokens, num_experts, topk, seed=2)

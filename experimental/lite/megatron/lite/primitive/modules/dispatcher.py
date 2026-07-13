@@ -466,7 +466,26 @@ class TokenDispatcher:
         capacity = self.static_capacity.expert_capacity
         counts = routing_map.sum(dim=0)
         self._over_budget = (counts > capacity).any()
-        return routing_map, probs_2d
+        return routing_map, probs_2d, counts
+
+    def _zero_capacity_tail(self, permuted, permuted_probs, counts):
+        """Zero the unused per-expert tail entirely on device (no host read).
+
+        ``drop_and_pad`` fills a slot beyond an expert's routed count with a real
+        (unrouted) token whose prob is already 0; explicitly zeroing the hidden and
+        prob tail makes the padded contract literal (matches #5258 ``_zero_hybridep_padding``)
+        and removes any ``0 * inf`` hazard on the inert rows. Numerically inert for
+        the parity path since the tail probs are 0 regardless.
+        """
+        c = self.static_capacity.expert_capacity
+        num_out = permuted.size(0)
+        slot = torch.arange(num_out, device=permuted.device)
+        pos_in_expert = slot % c
+        expert_of_slot = slot // c
+        valid = pos_in_expert < counts.index_select(0, expert_of_slot)
+        permuted = permuted * valid.unsqueeze(1).to(permuted.dtype)
+        permuted_probs = permuted_probs * valid.to(permuted_probs.dtype)
+        return permuted, permuted_probs
 
     def _dispatch_static(self, hidden_states, topk_scores, topk_indices):
         cfg = self.static_capacity
@@ -482,7 +501,7 @@ class TokenDispatcher:
                 "budget (max-aligned THD) before dispatch."
             )
 
-        routing_map, probs_2d = self._build_capacity_routing(
+        routing_map, probs_2d, counts = self._build_capacity_routing(
             topk_scores, topk_indices, t, e, device
         )
 
@@ -500,6 +519,7 @@ class TokenDispatcher:
             fused=False,
             drop_and_pad=True,
         )[:3]
+        permuted, permuted_probs = self._zero_capacity_tail(permuted, permuted_probs, counts)
         self._row_id_map = sorted_indices
         self._restore_shape = hidden_states.shape
 
