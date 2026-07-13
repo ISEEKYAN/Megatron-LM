@@ -344,10 +344,13 @@ def test_resync_no_smoke_exit_without_env(monkeypatch) -> None:
     assert [name for name, _ in weights] == ["w"]
 
 
-def test_resync_export_empty_caches_and_tracks_worst_tensor_per_tensor(monkeypatch) -> None:
-    """Per-tensor residency control: after each exported tensor is consumed the
-    caching allocator is reclaimed and the worst single-tensor peak is tracked,
-    so a failed colocated resync pins the single-tensor lower bound."""
+def test_resync_export_drops_refs_and_tracks_worst_tensor_per_tensor(monkeypatch) -> None:
+    """Per-tensor residency control: after each exported tensor is consumed its
+    reference is dropped (so the caching-allocator block is reusable) and peak
+    stats are reset per tensor to attribute the worst single-tensor peak. We do
+    NOT call ``empty_cache`` per tensor (device sync + compaction would balloon
+    the resync wall time, bayan 2026-07-12 20:54); ``expandable_segments`` is the
+    residency lever instead."""
     engine = _engine(engine_config=_engine_config(param_offload=False))
 
     class Runtime:
@@ -406,8 +409,9 @@ def test_resync_export_empty_caches_and_tracks_worst_tensor_per_tensor(monkeypat
 
     assert [name for name, _ in drained] == ["a", "b", "c"]
     assert [t.numel() for _, t in drained] == [1, 2, 3]
-    # one empty_cache per exported tensor; one reset at export_begin + one/tensor
-    assert calls["empty_cache"] == 3
+    # empty_cache is never called per tensor (too slow); reset_peak runs once at
+    # export_begin plus once per exported tensor (instrumentation, cheap).
+    assert calls["empty_cache"] == 0
     assert calls["reset_peak"] == 4
     curve_line = next(p for p in printed if "MLITE_RESYNC_MEMCURVE" in p)
     assert "worst_tensor=b" in curve_line

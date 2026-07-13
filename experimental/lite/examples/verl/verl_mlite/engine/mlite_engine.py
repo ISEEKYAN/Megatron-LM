@@ -449,14 +449,17 @@ class MegatronLiteEngine(BaseEngine):
         exported = False
         try:
             # Per-tensor residency control: after every exported tensor has been
-            # consumed by the colocated vLLM worker, drop our reference and
-            # release the caching-allocator blocks so the next tensor's export
-            # all-gather does not stack on top of the previous one. The peak
-            # allocation captured for each tensor (its materialisation happens in
-            # ``next(weights)`` just before the yield) is tracked so a failed run
-            # pins the single-tensor lower bound instead of only reporting the
-            # aggregate peak. Runs only during resync export, never in a hot
-            # loop.
+            # consumed by the colocated vLLM worker, drop our reference so the
+            # caching-allocator block is free for the next tensor to reuse.
+            # We deliberately do NOT call ``torch.cuda.empty_cache()`` here: the
+            # export streams thousands of tensors and empty_cache carries a
+            # device sync + allocator compaction each call, which balloons the
+            # resync wall time (bayan 2026-07-12 20:54). ``expandable_segments``
+            # (set in the sbatch env, propagated into the Ray actor) is the
+            # residency lever instead — it lets freed segments be reused across
+            # export tensors without stranding them to fragmentation. Peak stats
+            # are reset per tensor (cheap; no sync) so a failed run can attribute
+            # the worst single-tensor peak instead of only the aggregate.
             for item in weights:
                 if torch.cuda.is_available():
                     peak = torch.cuda.max_memory_allocated()
@@ -468,7 +471,6 @@ class MegatronLiteEngine(BaseEngine):
                 yield item
                 del item
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
                     torch.cuda.reset_peak_memory_stats()
             exported = True
         finally:
@@ -514,9 +516,9 @@ class MegatronLiteEngine(BaseEngine):
         rank = dist.get_rank() if dist.is_initialized() else 0
         worst = resync["worst_tensor"]
         worst_gib = worst["peak_bytes"] / (1024**3)
-        # Per-tensor empty_cache resets peak stats between tensors, so the
-        # curve snapshots understate the true export peak; the worst single
-        # tensor is the real lower bound and must dominate the reported peak.
+        # Peak stats are reset per exported tensor, so the coarse curve
+        # snapshots understate the true export peak; the worst single tensor is
+        # the real lower bound and must dominate the reported peak.
         curve_peak = max(
             (s.get("max_allocated_gib", s["allocated_gib"]) for s in curve),
             default=0.0,
@@ -525,7 +527,8 @@ class MegatronLiteEngine(BaseEngine):
         summary = " ".join(f"{s['tag']}={s['allocated_gib']:.3f}" for s in curve)
         print(
             f"MLITE_RESYNC_MEMCURVE rank={rank} "
-            f"opt_offloaded={resync['opt_resident']} grad_freed={resync['grad_resident']} "
+            f"opt_resident_on_entry={resync['opt_resident']} "
+            f"grad_resident_on_entry={resync['grad_resident']} "
             f"{summary} worst_tensor={worst['name']} worst_tensor_peak_gib={worst_gib:.3f} "
             f"export_peak_max_alloc_gib={peak:.3f}",
             flush=True,
@@ -536,8 +539,8 @@ class MegatronLiteEngine(BaseEngine):
 
             record = {
                 "rank": rank,
-                "opt_offloaded": resync["opt_resident"],
-                "grad_freed": resync["grad_resident"],
+                "opt_resident_on_entry": resync["opt_resident"],
+                "grad_resident_on_entry": resync["grad_resident"],
                 "worst_tensor": worst["name"],
                 "worst_tensor_peak_gib": worst_gib,
                 "export_peak_max_alloc_gib": peak,
