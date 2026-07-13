@@ -206,6 +206,18 @@ MoE use-after-free pitfall, not a mechanical edit.
    cannot close an *absolute*-residency overflow, that is the signal Branch B
    (streaming export to cut the materialization peak) is required — decide from the
    table BEFORE burning the card, not after another OOM.
+   - **Data-availability boundary (verified 2026-07-12, repo-only recon):** this
+     table CANNOT be faithfully pre-computed from this worktree. The repo default
+     `engine/mlite.yaml` ships `tp/pp/cp/ep=1` and offload OFF; the收口 run's real
+     parallel sizing AND the vLLM rollout TP/quant are set by the **cw harness at
+     launch time** (not in this repo, per Branch A), and bayan's gate requires the
+     optim-state residency be measured *empirically on the target config*, not read
+     from a flag. So two of the three rows (rollout weight, empirical optim
+     residency) need cw-side + GPU data that is unavailable pre-ignition here.
+     Assemble the table at ignition-prep time on the cw side — do NOT fabricate
+     placeholder numbers to "pass" the gate. The only rows knowable now are the
+     static ones already in this doc (export materialization peak ≈69–77 GiB;
+     ≈34.6B BF16 dense actor weight before sharding).
 3. Apply the minimal port:
    - Branch A: add the env line to the cw DAPO mfsdp harness at launch time
      (no repo patch). This is the default plan.
