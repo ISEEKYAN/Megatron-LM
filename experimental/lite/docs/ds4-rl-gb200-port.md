@@ -88,3 +88,82 @@ explicitly pre-authorized this smoke as immediately executable.
 - [ ] GB200 CONFIG_ONLY fire script + launch (gate 1).
 - [ ] gpu:4 guard edit for 8-GPU proxy (gates 2–3).
 - [ ] 32-card smoke (gate 4).
+
+---
+
+# cw/H100 native-vLLM-0.23 route (2026-07-13, bayan 拆墙令 → cw = 主战场)
+
+bayan (2026-07-12 22:40 → 07-13 00:24) reversed the GB200-first plan: the
+"architecture wall" is void — q35 colocated RL has always run on cw/H100 x86
+(1.13.8 mfsdp DAPO jobs). Directive: base the DS4 rollout on the **proven q35
+image** and add only the DS4 training pieces as a thin overlay; cw is the main
+battlefield, α/β (128-card cluster) closed onto cw.
+
+## Base image = the q35 `verl.vllm023.sqsh` (native vLLM 0.23)
+
+`/home/bayan/code/verl_optimize/verl.vllm023.sqsh` (cw host path, x86, 28.9 GB,
+Jun 26; TASK-1.1.15.2 locked). Zero-GPU `unsquashfs` audit — it already provides
+the **entire** DS4 stack except one kernel:
+
+- python 3.12, **torch 2.11.0+cu130**, **vllm 0.23.1.dev0** (registry lists
+  `DeepseekV4ForCausalLM` — native DS4, empirically confirmed).
+- transformer_engine 2.15.0, megatron_core 0.16.1, flash_attn 2.8.3, apex,
+  nvidia_cutlass_dsl 4.5.2 (cu13), tilelang 0.1.9.
+- `cudnn 1.25.0` with `deepseek_sparse_attention` (DSA) incl. `dsa_*_sm90`
+  (Hopper) + `dsa_*_sm100`.
+- **Missing: `flash_mla`** — the one DS4 training/rollout kernel not in base.
+
+## Thin sm90 overlay = flash_mla only (ABI-verified, NO rebuild)
+
+The old fat cw overlay `mlite-2604-verl-dsa-sm90-overlay` is UNUSABLE as-is: it
+is a full venv that bundles its own **vllm 0.12.0**, which — because the sbatch
+*prepends* `MLITE_SM90_SITE` to PYTHONPATH — would shadow the base's native
+0.23. Its `flash_mla/cuda*.so` links `libcudart.so.13` (CUDA 13, same major as
+base) and it carries no torch (no torch shadow).
+
+Extracted **only** `flash_mla/` + dist-info into a thin overlay:
+`/lustre/.../users/bayan/llmrl/ds4-cw-thin/mlite-ds4-flashmla-sm90-cu13/lib/python3.12/site-packages`
+(33 MB). Zero-GPU import probe inside the base container (Slurm cpu_short job
+**13882421, rc=0**): `import flash_mla` + all symbols OK under torch 2.11+cu130;
+`vllm` resolves to base `/vllm/vllm` (unshadowed); DSA imports from base. →
+**flash_mla is ABI-compatible; no recompile needed.**
+
+## cw pointer map (native route)
+
+| var | value |
+|---|---|
+| BASE_IMAGE | `/home/bayan/code/verl_optimize/verl.vllm023.sqsh` |
+| MLITE_SM90_SITE | `$B/llmrl/ds4-cw-thin/mlite-ds4-flashmla-sm90-cu13/lib/python3.12/site-packages` (thin: flash_mla only) |
+| DS4_VLLM_SITE | **empty** (base is native vLLM 0.23; no rollout overlay) |
+| DS4_VLLM_SHIM | empty (native) |
+| MEGATRON_ROOT | `$B/code/runtime/ds4-hopper-15d86c49d/mcore` (or a resync-* checkout matching MLITE_SRC's mcore contract) |
+| VERL_ROOT | `$B/code/runtime/ds4-hopper-15d86c49d/verl` |
+| CHECKPOINT_DIR | official DeepSeek-V4-Flash mixed checkpoint (verify tokenizer_mode=deepseek_v4) |
+| account / partition | `coreai_devtech_all` / gpu `batch*`, cpu `cpu_short` |
+
+## Remaining work: harness gate-suite re-baselining (NEXT FRAME, pre-GPU moe门)
+
+The sbatch `run_ds4_gsm8k_grpo.sbatch` is **hardcoded to the deleted 0.20.2
+overlay** in three embedded gate blocks — this is NOT a pointer swap:
+
+1. `DS4_VLLM_SITE` is mandatory (`:?`) + existence-checked + PYTHONPATH-prepended
+   (lines 20/36/166/169/191/271/357). Native route needs it **optional/empty**:
+   when empty, don't inject it into PYTHONPATH and treat rollout site = base.
+2. **Server-import block** (~240-260, IMPORT_ONLY): asserts
+   `transformers==5.12.1`, `vllm==0.20.2`, and `commonpath(module, rollout_site)
+   == rollout_site` (i.e. vllm/transformers loaded *from* the overlay). Must
+   accept base 0.23 loaded from `/vllm` / base dist-packages.
+3. **Device-probe block** (~597-719, GPU-gated `ray.remote(num_gpus=1)`):
+   `expected_dependency_versions` pins the whole 0.20.2 set and asserts every
+   dep + PYTHONPATH ordering resolves under `rollout_site`. **GPU-only
+   validation.**
+
+Base pinset to re-baseline against (zero-GPU audited): apache-tvm-ffi 0.1.9,
+**compressed-tensors 0.17.0** (was 0.15.0.1), numba 0.65.0, outlines-core
+0.2.14, **transformers 5.3.0** (was 5.12.1 — a *downgrade*; must confirm
+DeepseekV4 config/tokenizer support in 5.3.0), **vllm 0.23.1.dev0** (was
+0.20.2), xgrammar 0.2.2.
+
+Gate sequence after re-baselining: zero-GPU CONFIG_ONLY → 8-GPU (1×8) load-only
++ residency + resync-smoke → 32/128-card. The re-baselined sbatch gates GPU runs
+→ route it through the pre-GPU moe门 before firing GPU jobs.
