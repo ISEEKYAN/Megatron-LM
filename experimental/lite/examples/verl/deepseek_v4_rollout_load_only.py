@@ -35,6 +35,68 @@ def _send_empty_checkpoint_bucket(handle: str, ready: Event) -> None:
         shared.unlink()
 
 
+def _parse_compute_apps(csv_text: str, uuid_to_index: dict[str, int]) -> dict[int, list[tuple[int, int]]]:
+    """Parse ``nvidia-smi --query-compute-apps=gpu_uuid,pid,used_gpu_memory`` CSV
+    (``noheader,nounits``) into ``{gpu_index: [(pid, mib), ...]}``.
+
+    Split from the subprocess call so the residency accounting is unit-testable
+    without a GPU. Lines whose GPU uuid is unknown or that are malformed are
+    skipped rather than raising, so a partial ``nvidia-smi`` snapshot still yields
+    the residency it can attribute.
+    """
+    residency: dict[int, list[tuple[int, int]]] = {}
+    for line in csv_text.strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 3:
+            continue
+        uuid, pid, mem = parts
+        index = uuid_to_index.get(uuid)
+        if index is None:
+            continue
+        mem_fields = mem.split()
+        mib = int(mem_fields[0]) if mem_fields and mem_fields[0].isdigit() else 0
+        residency.setdefault(index, []).append((int(pid), mib))
+    return residency
+
+
+def dump_gpu_residency(tag: str) -> None:
+    """Emit per-GPU per-process residency so the 8-GPU load-only A/B/C experiment
+    can read whether the sibling vLLM TP ranks leak a CUDA context onto peer GPUs
+    (root cause of the 128-GPU resync GPU0 OOM; see
+    docs/ds4-resync-gpu0-sibling-residency.md). Opt-in via
+    ``MLITE_VLLM_RESIDENCY_PROBE=1`` — never runs on the hot path.
+    """
+    import subprocess
+
+    uuid_csv = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+        text=True,
+    )
+    uuid_to_index: dict[str, int] = {}
+    for line in uuid_csv.strip().splitlines():
+        fields = [part.strip() for part in line.split(",")]
+        if len(fields) == 2 and fields[0].isdigit():
+            uuid_to_index[fields[1]] = int(fields[0])
+    apps_csv = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid,pid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+    )
+    residency = _parse_compute_apps(apps_csv, uuid_to_index)
+    for index in sorted(residency):
+        procs = residency[index]
+        total_mib = sum(mib for _, mib in procs)
+        detail = " ".join(f"{pid}:{mib}MiB" for pid, mib in procs)
+        print(
+            f"MLITE_RESIDENCY_PROBE tag={tag} gpu={index} nproc={len(procs)} "
+            f"total_mib={total_mib} {detail}",
+            flush=True,
+        )
+
+
 def probe_checkpoint_sync(llm, *, worker_count: int) -> None:
     handles = llm.collective_rpc("_get_zmq_handle", timeout=300)
     if len(handles) != worker_count or len(set(handles)) != worker_count:
@@ -125,8 +187,12 @@ def main() -> None:
         },
         **llm_kwargs,
     )
+    if os.environ.get("MLITE_VLLM_RESIDENCY_PROBE") == "1":
+        dump_gpu_residency("post_init")
     if sync_probe:
         probe_checkpoint_sync(llm, worker_count=rollout_tp)
+        if os.environ.get("MLITE_VLLM_RESIDENCY_PROBE") == "1":
+            dump_gpu_residency("post_sync")
     print(
         "DS4_VLLM_LOAD_ONLY_PASSED "
         f"rollout_tp={rollout_tp} o_groups={o_groups} "
