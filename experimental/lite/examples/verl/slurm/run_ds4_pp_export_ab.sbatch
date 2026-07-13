@@ -38,8 +38,9 @@ mkdir -p "${OUTPUT_DIR}"
 cp "${MLITE_NEW}/experimental/lite/examples/verl/pp_export_sensitize.py" \
    "${MLITE_OLD}/experimental/lite/examples/verl/pp_export_sensitize.py"
 
-run() {  # <mlite_src> <extra_env...> -- <cmd...>
+run() {  # <mlite_src> -- <cmd...>
   local src=$1; shift
+  [[ "${1:-}" == "--" ]] && shift
   srun --mpi=pmix --export=ALL --no-container-mount-home \
     --container-image="${BASE_IMAGE}" \
     --container-mounts=/lustre:/lustre \
