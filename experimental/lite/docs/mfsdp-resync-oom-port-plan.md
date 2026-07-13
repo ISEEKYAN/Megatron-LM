@@ -88,10 +88,34 @@ bayan scancelled DS4 job 13870979 (止损) and corrected the recipe again at
      + activations + NCCL buffers, each itemized;
    - sum `< 80 GiB` with headroom = the only green-light to ignite; log the table.
 
+### DS4 21:05 diagnostic — sibling-rank NCCL/CUDA buffer residency (HYPOTHESIS, not yet confirmed)
+
+While assembling the 20:54 budget table, DS4 (job r2) observed **7 sibling ranks
+each holding ≈2.51 GiB resident (≈17.5 GiB/card of "stray" occupancy)**. bayan's
+2026-07-12 21:05 targeted diagnosis (top priority on DS4): this is **almost
+certainly an NCCL-buffer / CUDA-context problem, prime suspect a
+`CUDA_VISIBLE_DEVICES` / Ray `num_gpus` misconfig** — if each actor process sees
+all 8 local GPUs instead of only its own, NCCL/CUDA builds a context + P2P buffers
+on *every* visible device, so exactly 7 siblings each pin a buffer. If confirmed
+and fixed, that reclaims ~17.5 GiB/card and **flips the budget table outright**.
+
+**Why this is in OUR plan (transfer, not copy):** our 32-card收口 run uses the
+**same colocated verl/Ray actor↔vLLM architecture** (`ray_trainer.py:1672
+update_weights`, vLLM `wake_up` — see §"Where we are"), so this visibility hazard
+is a generic property of that colocation, not a DS4-only path. It therefore
+belongs in OUR pre-ignition gate as a **watch item**: before believing any
+per-card residency row, first verify each actor's `CUDA_VISIBLE_DEVICES` /
+`torch.cuda.device_count()` is 1 (its own card), and check whether the colocated
+vLLM↔actor CUDA-IPC weight sync *intentionally* needs cross-process visibility
+(if shared-on-purpose, the lever is `NCCL_P2P` / cumem, not visibility). Do NOT
+port a "fix" yet — it is an unconfirmed DS4 hypothesis; treat it as the first row
+to audit when the budget table is assembled cw-side at ignition-prep time.
+
 Status note (2026-07-12): DS4 (TASK-1.1.12) is **still In Progress, NOT green** —
-20:48 and 20:54 were both "must-change-before-ignition" corrections and the last
-job was scancelled before completing; a DS4 worker resumed at 20:54 to produce the
-budget analysis. This task stays gated until DS4 validates a recipe green.
+20:48 and 20:54 were both "must-change-before-ignition" corrections, the last job
+(13870979) was scancelled, and 21:05 opened a fresh sibling-residency diagnostic
+that may再 reshape the budget analysis. This task stays gated until DS4 validates a
+recipe green.
 
 ## Port plan — two branches
 
@@ -200,7 +224,10 @@ MoE use-after-free pitfall, not a mechanical edit.
      for the收口 run and verify residency, or budget the full resident optim state
      and confirm the sum still clears 80 GiB. Do NOT trust the flag; measure.
    - export materialization peak (≈69–77 GiB if `materialize_all` stays) +
-     activations + NCCL buffers, itemized.
+     activations + NCCL buffers, itemized. **Audit the NCCL-buffer row FIRST per
+     the DS4 21:05 diagnostic** (§"DS4 21:05 diagnostic"): confirm each actor sees
+     only its own GPU (`CUDA_VISIBLE_DEVICES` / `device_count()==1`) so stray
+     sibling-rank P2P buffers (~2.5 GiB each) aren't silently inflating the table.
    Sum < 80 GiB with headroom is the only green-light. If the table itself shows
    Branch A (`expandable_segments`, a fragmentation fix, not a residency fix)
    cannot close an *absolute*-residency overflow, that is the signal Branch B
