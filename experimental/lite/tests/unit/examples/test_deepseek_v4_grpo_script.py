@@ -286,14 +286,33 @@ def test_ds4_grpo_sbatch_is_multinode_resumable_and_fail_closed() -> None:
     assert 'export PYTHONPATH="${MLITE_SM90_SITE}' in script
     assert ':${DS4_VLLM_SITE}:' in script
     assert 'export LD_PRELOAD="${DS4_VLLM_SHIM}"' in script
-    assert 'export VLLM_CACHE_ROOT="${RUN_ROOT}/vllm-cache"' in script
-    assert 'export TILELANG_CACHE_DIR="${RUN_ROOT}/tilelang-cache"' in script
-    assert 'export TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"' in script
+    # Persistent, container+SM-keyed JIT/compile cache root shared across jobs so
+    # the 128-rank run does not recompile flashinfer/TileLang/Inductor per rank
+    # (bayan 2026-07-13 01:31). Lives under RUN_ROOT's parent so it survives the
+    # fresh-per-run RUN_ROOT rotation; reusable-artifact caches point at it while
+    # the non-reusable TileLang scratch stays per-job under TMPDIR.
+    assert 'JIT_CACHE_TAG="${JIT_CACHE_TAG:-vllm023-sm90}"' in script
+    assert (
+        'JIT_CACHE_ROOT="${JIT_CACHE_ROOT:-${RUN_ROOT%/*}/jit_cache/${JIT_CACHE_TAG}}"'
+        in script
+    )
+    assert 'export XDG_CACHE_HOME="${JIT_CACHE_ROOT}/xdg"' in script
+    assert 'export TORCHINDUCTOR_CACHE_DIR="${JIT_CACHE_ROOT}/torchinductor"' in script
+    assert 'export TRITON_CACHE_DIR="${JIT_CACHE_ROOT}/triton"' in script
+    assert 'export VLLM_CACHE_ROOT="${JIT_CACHE_ROOT}/vllm"' in script
+    assert 'export TILELANG_CACHE_DIR="${JIT_CACHE_ROOT}/tilelang"' in script
+    assert 'export FLASHINFER_WORKSPACE_BASE="${JIT_CACHE_ROOT}/flashinfer"' in script
+    assert 'export TILELANG_TMP_DIR="${TMPDIR}/tilelang-tmp"' in script
     assert 'export VLLM_WORKER_MULTIPROC_METHOD="spawn"' in script
     assert 'export VLLM_DEEP_GEMM_WARMUP="skip"' in script
     assert 'export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"' in script
     assert '"${VLLM_CACHE_ROOT}"' in script
+    assert '"${FLASHINFER_WORKSPACE_BASE}"' in script
     for name in (
+        "XDG_CACHE_HOME",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TRITON_CACHE_DIR",
+        "FLASHINFER_WORKSPACE_BASE",
         "VLLM_CACHE_ROOT",
         "TILELANG_CACHE_DIR",
         "TILELANG_TMP_DIR",

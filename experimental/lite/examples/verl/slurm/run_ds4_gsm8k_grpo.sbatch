@@ -177,30 +177,48 @@ export LD_PRELOAD="${DS4_VLLM_SHIM}"
 export PYTHONPATH="${MLITE_SM90_SITE}/nvidia_cutlass_dsl/python_packages:${MLITE_SM90_SITE}:${DS4_VLLM_SITE}:${VERL_ROOT}:${MEGATRON_ROOT}:${MLITE_SRC}/experimental/lite/examples/verl:${MLITE_SRC}/experimental/lite:${MLITE_SRC}"
 export TMPDIR="/tmp/ds4-grpo-${SLURM_JOB_ID}-${SLURM_PROCID}"
 export PYTHONPYCACHEPREFIX="${TMPDIR}/pycache"
-export TORCHINDUCTOR_CACHE_DIR="${TMPDIR}/torchinductor"
-export TRITON_CACHE_DIR="${TMPDIR}/triton"
+# Persistent JIT/compile cache root on lustre, shared across jobs so the
+# flashinfer / TileLang / Inductor / Triton / vLLM compile step runs once
+# (a warm-up) and every subsequent job — critically all 128 ranks of the full
+# PP4EP8CP4 run — hits the cache instead of recompiling. 128 ranks each
+# recompiling flashinfer+tilelang is a launch-time disaster (bayan 2026-07-13
+# 01:31). The root is keyed by container build + SM arch so artifacts built for
+# an incompatible toolchain/architecture never collide; the submit wrapper sets
+# JIT_CACHE_TAG per container+cluster (e.g. vllm023-sm90 for the cw H100
+# verl.vllm023 base). JIT_CACHE_ROOT may be overridden wholesale. It lives under
+# RUN_ROOT's parent, so it persists while the fresh-per-run RUN_ROOT (line ~120
+# refuses reuse) rotates. mkdir -p is idempotent and concurrency-safe across the
+# 128 ranks that share it.
+JIT_CACHE_TAG="${JIT_CACHE_TAG:-vllm023-sm90}"
+JIT_CACHE_ROOT="${JIT_CACHE_ROOT:-${RUN_ROOT%/*}/jit_cache/${JIT_CACHE_TAG}}"
+export XDG_CACHE_HOME="${JIT_CACHE_ROOT}/xdg"
+export TORCHINDUCTOR_CACHE_DIR="${JIT_CACHE_ROOT}/torchinductor"
+export TRITON_CACHE_DIR="${JIT_CACHE_ROOT}/triton"
+export VLLM_CACHE_ROOT="${JIT_CACHE_ROOT}/vllm"
+export TILELANG_CACHE_DIR="${JIT_CACHE_ROOT}/tilelang"
+export FLASHINFER_WORKSPACE_BASE="${JIT_CACHE_ROOT}/flashinfer"
+# TileLang scratch (the temp build dir) is NOT a reusable artifact — concurrent
+# ranks would clobber each other's in-flight compiles — so it stays per-job.
+export TILELANG_TMP_DIR="${TMPDIR}/tilelang-tmp"
 export HF_HOME="${RUN_ROOT}/hf-cache"
 export HF_DATASETS_CACHE="${HF_HOME}/datasets"
-export VLLM_CACHE_ROOT="${RUN_ROOT}/vllm-cache"
-export TILELANG_CACHE_DIR="${RUN_ROOT}/tilelang-cache"
-export TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"
 # Redirect HOME onto the (spacious, writable) lustre RUN_ROOT. The inherited
-# HOME=/home/bayan is not mounted inside the container, so ~/.cache writers fall
-# back to the container's tiny /root overlay and blow up with "[Errno 28] No
-# space left on device" (flashinfer JITs its sampling op into
-# ~/.cache/flashinfer). Pointing HOME at lustre routes every ~/.cache/* consumer
-# to durable storage.
+# HOME=/home/bayan is not mounted inside the container, so any residual ~/.cache
+# writer that ignores XDG_CACHE_HOME falls back to the container's tiny /root
+# overlay and blows up with "[Errno 28] No space left on device". Pointing HOME
+# at lustre routes every remaining ~/.cache/* consumer to durable storage.
 export HOME="${RUN_ROOT}/home"
-export FLASHINFER_WORKSPACE_BASE="${HOME}/.cache/flashinfer"
 unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
 mkdir -p \
   "${PYTHONPYCACHEPREFIX}" \
+  "${XDG_CACHE_HOME}" \
   "${TORCHINDUCTOR_CACHE_DIR}" \
   "${TRITON_CACHE_DIR}" \
   "${HF_DATASETS_CACHE}" \
   "${VLLM_CACHE_ROOT}" \
   "${TILELANG_CACHE_DIR}" \
   "${TILELANG_TMP_DIR}" \
+  "${FLASHINFER_WORKSPACE_BASE}" \
   "${HOME}/.cache"
 
 if [[ "${IMPORT_ONLY}" == "1" ]]; then
@@ -516,9 +534,12 @@ names = [
     "PYTHONPATH",
     "PATH",
     "HOME",
+    "XDG_CACHE_HOME",
     "CUDA_HOME",
     "CUDA_PATH",
     "FLASHINFER_WORKSPACE_BASE",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "TRITON_CACHE_DIR",
     "CC",
     "CXX",
     "CPATH",
