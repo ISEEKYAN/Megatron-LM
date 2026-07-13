@@ -184,6 +184,14 @@ export HF_DATASETS_CACHE="${HF_HOME}/datasets"
 export VLLM_CACHE_ROOT="${RUN_ROOT}/vllm-cache"
 export TILELANG_CACHE_DIR="${RUN_ROOT}/tilelang-cache"
 export TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"
+# Redirect HOME onto the (spacious, writable) lustre RUN_ROOT. The inherited
+# HOME=/home/bayan is not mounted inside the container, so ~/.cache writers fall
+# back to the container's tiny /root overlay and blow up with "[Errno 28] No
+# space left on device" (flashinfer JITs its sampling op into
+# ~/.cache/flashinfer). Pointing HOME at lustre routes every ~/.cache/* consumer
+# to durable storage.
+export HOME="${RUN_ROOT}/home"
+export FLASHINFER_WORKSPACE_BASE="${HOME}/.cache/flashinfer"
 unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
 mkdir -p \
   "${PYTHONPYCACHEPREFIX}" \
@@ -192,7 +200,8 @@ mkdir -p \
   "${HF_DATASETS_CACHE}" \
   "${VLLM_CACHE_ROOT}" \
   "${TILELANG_CACHE_DIR}" \
-  "${TILELANG_TMP_DIR}"
+  "${TILELANG_TMP_DIR}" \
+  "${HOME}/.cache"
 
 if [[ "${IMPORT_ONLY}" == "1" ]]; then
   env \
@@ -506,8 +515,10 @@ import os
 names = [
     "PYTHONPATH",
     "PATH",
+    "HOME",
     "CUDA_HOME",
     "CUDA_PATH",
+    "FLASHINFER_WORKSPACE_BASE",
     "CC",
     "CXX",
     "CPATH",
