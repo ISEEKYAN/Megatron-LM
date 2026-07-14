@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import json
 import sys
 import types
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -19,10 +21,12 @@ if importlib.util.find_spec("safetensors") is None:
     sys.modules["safetensors.torch"] = safetensors_torch
 
 from megatron.lite.primitive.ckpt.hf_weights import (
+    SafeTensorReader,
     _iter_bucketed_materialized_tensors,
     bucketed_all_gather_into_tensor,
     export_hf_weights,
 )
+
 
 
 def test_export_defaults_to_device_resident_tensors() -> None:
@@ -443,3 +447,136 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
     assert torch.equal(
         tensor, torch.stack(expected_local + [value + 100 for value in expected_local])
     )
+
+
+def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> None:
+    """Streamed pp2 export must be bitwise-equal to the legacy materialized
+    dict, with every header/tensor exchange on the NCCL pp_group."""
+    local_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    remote_weight = local_weight + 100
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(local_weight.clone())
+
+    class Spec:
+        num_experts = 0
+        is_expert = staticmethod(lambda name: False)
+        tp_spec = staticmethod(lambda name: None)
+        native_to_hf = staticmethod(lambda name, tensor: [(name, tensor)])
+
+    ps = type("ParallelState", (), {
+        "pp_size": 2, "pp_rank": 0, "pp_global_ranks": [0, 1],
+        "tp_size": 1, "tp_group": None, "ep_size": 1, "ep_group": None,
+        "etp_size": 1, "etp_group": None,
+        "pp_group": "nccl-pp", "pp_cpu_group": "gloo-pp",
+    })()
+
+    groups = []
+    remote_headers = iter([[("weight2", (2, 3), torch.float32)], []])
+    remote_tensors = iter([remote_weight])
+
+    def fake_broadcast_object_list(object_list, src=None, group=None, device=None):
+        groups.append(group)
+        if src != 0:
+            object_list[0] = next(remote_headers)
+
+    def fake_broadcast(tensor, src=None, group=None):
+        groups.append(group)
+        if src != 0:
+            tensor.copy_(next(remote_tensors))
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list",
+                        fake_broadcast_object_list)
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+
+    exported = dict(export_hf_weights(Model(), Spec(), ps))
+
+    assert set(groups) == {"nccl-pp"}
+    assert exported.keys() == {"weight", "weight2"}
+    assert torch.equal(exported["weight"], local_weight)
+    assert torch.equal(exported["weight2"], remote_weight)
+
+
+
+def test_pp_export_never_materializes_the_whole_stage(monkeypatch) -> None:
+    """Residency guard: with one-param buckets, pulling the first streamed param
+    must visit exactly one of three stage params — the legacy path would have
+    visited all three before yielding anything."""
+    visited: list[str] = []
+    params = {
+        "weight_a": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        "weight_b": torch.arange(6, dtype=torch.float32).reshape(2, 3) + 10,
+        "weight_c": torch.arange(6, dtype=torch.float32).reshape(2, 3) + 20,
+    }
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            for name, value in params.items():
+                self.register_parameter(name, nn.Parameter(value.clone()))
+
+        def named_parameters(self, *args, **kwargs):
+            for item in super().named_parameters(*args, **kwargs):
+                visited.append(item[0])
+                yield item
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def is_expert(name):
+            return False
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 2,
+            "pp_rank": 0,
+            "pp_global_ranks": [0, 1],
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+            "pp_group": "nccl-pp",
+            "pp_cpu_group": "gloo-pp",
+        },
+    )()
+
+    my_global = 0
+
+    def fake_broadcast_object_list(object_list, src=None, group=None, device=None):
+        if src != my_global:
+            object_list[0] = []  # never reached: we stop after the first param
+
+    def fake_broadcast(tensor, src=None, group=None):
+        pass  # source (rank 0) broadcasts straight from its bucket
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        torch.distributed, "broadcast_object_list", fake_broadcast_object_list
+    )
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+
+    # buffer_max_size_bytes=1 caps every bucket at a single parameter.
+    stream = export_hf_weights(Model(), Spec(), ps, buffer_max_size_bytes=1)
+    first_name, first_tensor = next(stream)
+
+    assert first_name == "weight_a"
+    assert torch.equal(first_tensor, params["weight_a"])
+    assert visited == ["weight_a"]
