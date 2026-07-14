@@ -40,6 +40,14 @@ if (( product != expected )); then
   exit 2
 fi
 
-echo "Q35_FSDP2_PP2_STEP1 geo=TP${TP}PP${PP}CP${CP}EP${EP} steps=${TOTAL_TRAINING_STEPS} batch=${TRAIN_BATCH_SIZE} seqlen=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) rollout_tp=${GEN_TP}"
+export USE_THD=${USE_THD:-False}
+export USE_FUSED_KERNELS=${USE_FUSED_KERNELS:-False}
+export FILTER_OVERLONG=${FILTER_OVERLONG:-False}
 
-exec bash "$BASE_SCRIPT"
+echo "Q35_FSDP2_PP2_STEP1 geo=TP${TP}PP${PP}CP${CP}EP${EP} steps=${TOTAL_TRAINING_STEPS} batch=${TRAIN_BATCH_SIZE} seqlen=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) rollout_tp=${GEN_TP} use_thd=${USE_THD} fused=${USE_FUSED_KERNELS}"
+
+# Extra hydra overrides: PP2+THD 在 job13941926 触发 2206/2213 token 不齐→FSDP2 _local_tensor 次生错误。
+exec bash "$BASE_SCRIPT" \
+  "actor_rollout_ref.actor.engine.impl_cfg.use_thd=${USE_THD}" \
+  "actor_rollout_ref.model.use_fused_kernels=${USE_FUSED_KERNELS}" \
+  "data.filter_overlong_prompts=${FILTER_OVERLONG}"
