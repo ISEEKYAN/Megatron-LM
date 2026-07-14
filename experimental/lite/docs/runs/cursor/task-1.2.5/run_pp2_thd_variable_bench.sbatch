@@ -18,8 +18,12 @@ REPO_ROOT=${REPO_ROOT:-/home/scratch.bayan_gpu/code/llmrl/vicky-llmrl/.vicky/wor
 IMG=${IMG:-$BASE/env/pytorch_26.04-py3.sqsh}
 DSA_SITE=${DSA_SITE:-$BASE/mlite-2604-dsa-overlay/lib/python3.12/site-packages}
 WORK_DIR=$REPO_ROOT/experimental/lite/docs/runs/cursor/task-1.2.5
-OUTPUT_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/llmrl_runs/task-1.2.5/output
-mkdir -p "$(dirname "$SLURM_OUTPUT")" "$OUTPUT_DIR"
+if [[ -d /lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan ]]; then
+  OUTPUT_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/llmrl_runs/task-1.2.5/output
+else
+  OUTPUT_DIR=$WORK_DIR/output
+fi
+mkdir -p "$OUTPUT_DIR"
 
 submit_ts=$(date -Is)
 echo "PP2_THD_VAR_BENCH_JOB job=$SLURM_JOB_ID submit=$submit_ts repo=$REPO_ROOT image=$IMG"
