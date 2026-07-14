@@ -21,22 +21,33 @@ export PYTHONPATH="/vllm:$RUN_DIR:$CP_SITE:$MLITE_REPO/experimental/lite/example
 export RUNTIME_PYTHONPATH="/vllm:$RUN_DIR:$CP_SITE:$MLITE_REPO/experimental/lite/examples/verl:$MLITE_REPO/experimental/lite:$MLITE_REPO:$VERL"
 export LD_LIBRARY_PATH="$CP_SITE/tvm_ffi/lib:${LD_LIBRARY_PATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TRITON_CACHE_DIR="/tmp/triton-q35pp2-${SLURM_JOB_ID:-x}-${SLURMD_NODENAME:-0}"
-export TORCHINDUCTOR_CACHE_DIR="/tmp/torchinductor-q35pp2-${SLURM_JOB_ID:-x}-${SLURMD_NODENAME:-0}"
-export PYTHONPYCACHEPREFIX="/tmp/pycache-q35pp2-${SLURM_JOB_ID:-x}-${SLURMD_NODENAME:-0}"
+# TASK-1.13.20: job13945545 died ENOSPC — vLLM usage_stats (HOME/.config/vllm) and
+# flashinfer/tilelang JIT compilation filled the node-local disk (/tmp + container HOME).
+# Redirect ALL scratch caches to a per-job lustre dir (bayan 2026-07-14 guide; matches the
+# established mfsdp cache-$SLURM_JOB_ID convention: run_dir/cache-<jobid>/{triton,inductor,tmp}).
+CACHE="$RUN_DIR/cache-${SLURM_JOB_ID:-manual}"
+export CACHE
+export HOME="$CACHE/home"
+export XDG_CACHE_HOME="$CACHE/xdg-cache"
+export TMPDIR="$CACHE/tmp"
+export TRITON_CACHE_DIR="$CACHE/triton"
+export TORCHINDUCTOR_CACHE_DIR="$CACHE/inductor"
+export PYTHONPYCACHEPREFIX="$CACHE/pycache"
+export VLLM_CACHE_ROOT="$CACHE/vllm"
+export FLASHINFER_WORKSPACE_BASE="$CACHE/flashinfer"
+export TILELANG_CACHE_DIR="$CACHE/tilelang"
+# The usage-stats write (usage_lib._write_to_file) was the exact ENOSPC crash site; disable it.
+export VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
 export HF_HOME="$RUN_DIR/hf-home"
 export HF_DATASETS_CACHE="$RUN_DIR/hf-datasets-cache"
 export NCCL_NVLS_ENABLE=0 VLLM_ALLREDUCE_USE_SYMM_MEM=0
 export VLLM_WORKER_MULTIPROC_METHOD=spawn RAY_memory_monitor_refresh_ms=0 HYDRA_FULL_ERROR=1
-mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$PYTHONPYCACHEPREFIX" "$HF_HOME" "$HF_DATASETS_CACHE" "$RUN_DIR/logs" "$RUN_DIR/output" "$SCRIPT_DIR"
+mkdir -p "$HOME" "$XDG_CACHE_HOME" "$TMPDIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" \
+  "$PYTHONPYCACHEPREFIX" "$VLLM_CACHE_ROOT" "$FLASHINFER_WORKSPACE_BASE" "$TILELANG_CACHE_DIR" \
+  "$HF_HOME" "$HF_DATASETS_CACHE" "$RUN_DIR/logs" "$RUN_DIR/output" "$SCRIPT_DIR"
 
-tmp_available_kb=$(df -Pk /tmp | awk 'END {print $4}')
-tmp_required_kb=$((20 * 1024 * 1024))
-echo "Q35_PP2_TMP_CAPACITY node=${SLURMD_NODENAME:-unknown} available_kb=$tmp_available_kb required_kb=$tmp_required_kb"
-if (( tmp_available_kb < tmp_required_kb )); then
-  echo "Q35_PP2_TMP_CAPACITY_FAILED node=${SLURMD_NODENAME:-unknown}" >&2
-  exit 75
-fi
+cache_available_kb=$(df -Pk "$CACHE" | awk 'END {print $4}')
+echo "Q35_PP2_CACHE_REDIRECT node=${SLURMD_NODENAME:-unknown} cache=$CACHE lustre_available_kb=$cache_available_kb"
 
 mlite_head=$(git -C "$MLITE_REPO" rev-parse HEAD 2>/dev/null || echo missing)
 verl_head=$(git -C "$VERL" rev-parse HEAD 2>/dev/null || echo missing)

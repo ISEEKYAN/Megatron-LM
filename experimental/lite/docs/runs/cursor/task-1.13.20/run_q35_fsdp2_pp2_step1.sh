@@ -49,9 +49,32 @@ export ROLLOUT_LOAD_FORMAT=${ROLLOUT_LOAD_FORMAT:-dummy}
 echo "Q35_FSDP2_PP2_STEP1 geo=TP${TP}PP${PP}CP${CP}EP${EP} steps=${TOTAL_TRAINING_STEPS} batch=${TRAIN_BATCH_SIZE} seqlen=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) rollout_tp=${GEN_TP} fused=${USE_FUSED_KERNELS} dynamic_bsz=${USE_DYNAMIC_BSZ} load_format=${ROLLOUT_LOAD_FORMAT}"
 
 # job13941926: RoPE 2206 vs 2213 under PP2+THD+fused; job13942665: use_thd=False rejected by engine.
+# job13945545 (dummy): ENOSPC — node-local caches filled the disk before update_weights.
 # job1394xxxx (dummy): target update_weights ActorUnavailableError at step-0 init sync.
+
+# TASK-1.13.20: force the per-job lustre cache dirs into the Ray runtime_env so vLLM worker
+# actors inherit them too. run_dapo_h100_fsdp2.sh hardcodes TRITON_CACHE_DIR=/tmp/triton-g0b
+# into runtime_env.env_vars, which otherwise overrides the node-script env for the actors and
+# re-fills node-local disk (job13945545 ENOSPC root cause). These land after ${RAY_ENV[@]} in
+# the base harness ARGS, and hydra `++` overrides-or-adds each leaf (last wins).
+CACHE="${CACHE:-$RUN_DIR/cache-${SLURM_JOB_ID:-manual}}"
+RE=ray_kwargs.ray_init.runtime_env.env_vars
+CACHE_OVERRIDES=(
+  "++${RE}.TRITON_CACHE_DIR=$CACHE/triton"
+  "++${RE}.TORCHINDUCTOR_CACHE_DIR=$CACHE/inductor"
+  "++${RE}.VLLM_CACHE_ROOT=$CACHE/vllm"
+  "++${RE}.XDG_CACHE_HOME=$CACHE/xdg-cache"
+  "++${RE}.HOME=$CACHE/home"
+  "++${RE}.TMPDIR=$CACHE/tmp"
+  "++${RE}.FLASHINFER_WORKSPACE_BASE=$CACHE/flashinfer"
+  "++${RE}.TILELANG_CACHE_DIR=$CACHE/tilelang"
+  "++${RE}.VLLM_NO_USAGE_STATS=1"
+  "++${RE}.DO_NOT_TRACK=1"
+)
+
 exec bash "$BASE_SCRIPT" \
   "actor_rollout_ref.model.use_fused_kernels=${USE_FUSED_KERNELS}" \
   "actor_rollout_ref.actor.use_dynamic_bsz=${USE_DYNAMIC_BSZ}" \
   "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${USE_DYNAMIC_BSZ}" \
-  "actor_rollout_ref.rollout.load_format=${ROLLOUT_LOAD_FORMAT}"
+  "actor_rollout_ref.rollout.load_format=${ROLLOUT_LOAD_FORMAT}" \
+  "${CACHE_OVERRIDES[@]}"
