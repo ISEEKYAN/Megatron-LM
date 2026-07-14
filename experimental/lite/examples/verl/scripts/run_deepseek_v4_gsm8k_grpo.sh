@@ -113,4 +113,5 @@ exec bash "${GRPO_RUNNER}" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.quant_method=fp8" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.scale_fmt=float32" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.weight_block_size=[128,128]" \
+  "actor_rollout_ref.actor.engine.load_hf_weights=${ENGINE_LOAD_HF_WEIGHTS:-True}" \
   "$@"
