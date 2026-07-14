@@ -107,6 +107,7 @@ exec bash "${GRPO_RUNNER}" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=True" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.worker_extension_cls=verl_mlite.rollout.verl_worker.VllmCheckpointWorkerExtension" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8" \
+  "+actor_rollout_ref.rollout.engine_kwargs.vllm.moe_backend=flashinfer_cutlass" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.expert_dtype=fp8" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.activation_scheme=dynamic" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.fmt=e4m3" \
