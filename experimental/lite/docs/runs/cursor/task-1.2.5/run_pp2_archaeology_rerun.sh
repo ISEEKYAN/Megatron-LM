@@ -33,6 +33,14 @@ fi
 # is a supplemental site-packages (custom kernels, no TE) layered via PYTHONPATH.
 export PATH="/usr/local/bin:/usr/bin:/bin"
 unset PYTHONHOME
+# --export=ALL also leaks the host conda toolchain: CC/CXX point at
+# miniforge's x86_64-conda-linux-gnu-cc, which torch-inductor/Triton invoke
+# directly (bypassing PATH) to JIT-compile cuda_utils and then fail. Scrub the
+# conda env and pin the compiler to the container's gcc so JIT builds succeed.
+unset CC CXX FC CPP CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_EXE CONDA_PYTHON_EXE CONDA_PROMPT_MODIFIER
+export CC=/usr/bin/gcc CXX=/usr/bin/g++
+export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-/tmp/inductor_cache_$$}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-/tmp/triton_cache_$$}
 export PYTHONPATH="$DSA_SITE:$REPO_ROOT/experimental/lite:$CORE_TREE"
 export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8}
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=${NVTE_ALLOW_NONDETERMINISTIC_ALGO:-0}
