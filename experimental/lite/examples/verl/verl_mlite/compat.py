@@ -129,19 +129,52 @@ def _install_vllm_thin_finder() -> bool:
 
 
 def _patch_transformers_vision2seq_alias() -> bool:
-    """Restore the Transformers 4 vision auto-class name removed in v5."""
-    if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
-        return False
+    """Restore the Transformers 4 vision auto-class name removed in v5.
 
+    VERL's ``verl.utils.model`` does a top-level ``from transformers import
+    AutoModelForVision2Seq`` that every training/rollout worker hits regardless
+    of the rollout overlay. Under the single torch2.12/cu13 stack the alias must
+    apply unconditionally (transformers v5 is the only world now), so this is no
+    longer gated on ``VERL_MLITE_VLLM_SITE`` (the retired fat/thin split env).
+
+    A one-shot attribute set on the top-level module does NOT survive: importing
+    VERL's vLLM utilities re-execs Transformers' ``_LazyModule`` and rebuilds a
+    fresh instance whose ``_class_to_module`` map has no ``AutoModelForVision2Seq``
+    entry, so the injected attribute is dropped and the ``from transformers
+    import`` line fails again. We therefore patch the ``_LazyModule`` *class*'s
+    ``__getattr__`` so every instance -- current and any rebuilt one -- resolves
+    the removed name to ``AutoModelForImageTextToText``.
+    """
     import transformers
 
-    if hasattr(transformers, "AutoModelForVision2Seq"):
-        return False
-    replacement = getattr(transformers, "AutoModelForImageTextToText", None)
-    if replacement is None:
-        return False
-    transformers.AutoModelForVision2Seq = replacement
-    return True
+    try:
+        from transformers.utils import import_utils as _iu
+
+        lazy_cls = _iu._LazyModule
+    except Exception:  # pragma: no cover - transformers internals moved
+        lazy_cls = None
+
+    if lazy_cls is not None and not getattr(
+        lazy_cls, "_mlite_vision2seq_patched", False
+    ):
+        _orig_getattr = lazy_cls.__getattr__
+
+        def _getattr_with_vision2seq_alias(self, name):
+            if name == "AutoModelForVision2Seq":
+                return _orig_getattr(self, "AutoModelForImageTextToText")
+            return _orig_getattr(self, name)
+
+        lazy_cls.__getattr__ = _getattr_with_vision2seq_alias
+        lazy_cls._mlite_vision2seq_patched = True
+
+    # Belt-and-suspenders: also expose it on the current module object so code
+    # that does ``hasattr(transformers, "AutoModelForVision2Seq")`` short-circuits.
+    if not hasattr(transformers, "AutoModelForVision2Seq"):
+        replacement = getattr(transformers, "AutoModelForImageTextToText", None)
+        if replacement is not None:
+            transformers.AutoModelForVision2Seq = replacement
+            return True
+    return lazy_cls is not None
 
 
 def _install_vllm_triton_kernels_alias() -> bool:
