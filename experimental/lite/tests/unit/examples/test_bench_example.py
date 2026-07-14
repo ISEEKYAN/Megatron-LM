@@ -8,6 +8,7 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 
+import pytest
 import torch
 
 from megatron.lite.runtime.contracts.config import ParallelConfig
@@ -145,6 +146,74 @@ class _FakeRuntime:
 
     def lr_scheduler_step(self, handle):
         return 0.0
+
+
+def test_bench_builds_session_with_variable_microbatch_seq_lens():
+    from examples.bench.bench import BenchCliConfig, build_session_config
+
+    cfg = BenchCliConfig(
+        num_microbatches=2,
+        microbatch_seq_lens_json="[[2206],[2213]]",
+        use_thd=True,
+    )
+    session = build_session_config(cfg)
+    assert session.microbatch_seq_lens == [[2206], [2213]]
+    assert session.num_microbatches == 2
+    assert session.use_thd is True
+
+
+def test_bench_rejects_mismatched_microbatch_schedule():
+    from examples.bench.bench import BenchCliConfig, build_session_config
+
+    cfg = BenchCliConfig(
+        num_microbatches=3,
+        microbatch_seq_lens_json="[[2206],[2213]]",
+    )
+    with pytest.raises(ValueError, match="num_microbatches"):
+        build_session_config(cfg)
+
+
+def test_variable_packed_batches_yield_expected_shapes():
+    from examples.bench.session import _infinite_variable_packed_batches
+
+    batches = list(
+        _infinite_variable_packed_batches(
+            64,
+            [[2206], [1100, 1113]],
+            device="cpu",
+            seed=7,
+        )
+    )[:2]
+    assert batches[0].seq_lens.tolist() == [2206]
+    assert batches[0].input_ids.numel() == 2206
+    assert batches[1].seq_lens.tolist() == [1100, 1113]
+    assert batches[1].input_ids.numel() == 2213
+
+
+def test_pretrain_session_rejects_schedule_length_mismatch():
+    from examples.bench.session import PretrainSessionConfig, run_pretrain_session
+
+    handle = ModelHandle(
+        model=object(),
+        optimizer=object(),
+        parallel_state=None,
+        config=type(
+            "Cfg", (), {"model_name": "fake", "impl": "lite", "parallel": ParallelConfig()}
+        )(),
+        _extras={"optimizer_backend": "fake"},
+    )
+    with pytest.raises(ValueError, match="microbatch_seq_lens length"):
+        run_pretrain_session(
+            _FakeRuntime(),
+            handle,
+            PretrainSessionConfig(
+                steps=1,
+                num_microbatches=2,
+                microbatch_seq_lens=[[8]],
+                device="cpu",
+            ),
+            data_iter=iter([{}]),
+        )
 
 
 def test_pretrain_session_runs_with_fake_runtime_on_cpu():

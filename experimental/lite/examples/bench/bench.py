@@ -64,6 +64,7 @@ class BenchCliConfig:
     override_transformer_json: str = "{}"
     override_optimizer_json: str = "{}"
     impl_cfg_json: str = "{}"
+    microbatch_seq_lens_json: str = ""
     dry_run: bool = False
     output_json: str | None = None
 
@@ -76,6 +77,32 @@ def _json_mapping(raw: str, *, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{name} must be a JSON object.")
     return value
+
+
+def _microbatch_seq_lens(raw: str) -> list[list[int]] | None:
+    if not raw.strip():
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"microbatch_seq_lens_json must be valid JSON: {exc}") from exc
+    if not isinstance(value, list) or not value:
+        raise ValueError("microbatch_seq_lens_json must be a non-empty JSON array.")
+    schedule: list[list[int]] = []
+    for idx, item in enumerate(value):
+        if not isinstance(item, list) or not item:
+            raise ValueError(
+                f"microbatch_seq_lens_json[{idx}] must be a non-empty array of positive ints."
+            )
+        row: list[int] = []
+        for length in item:
+            if not isinstance(length, int) or length < 1:
+                raise ValueError(
+                    f"microbatch_seq_lens_json[{idx}] has invalid length {length!r}."
+                )
+            row.append(length)
+        schedule.append(row)
+    return schedule
 
 
 def _parallel_config(cfg: BenchCliConfig) -> ParallelConfig:
@@ -306,6 +333,12 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
 
 
 def build_session_config(cfg: BenchCliConfig) -> PretrainSessionConfig:
+    microbatch_seq_lens = _microbatch_seq_lens(cfg.microbatch_seq_lens_json)
+    if microbatch_seq_lens is not None and cfg.num_microbatches != len(microbatch_seq_lens):
+        raise ValueError(
+            "When microbatch_seq_lens_json is set, num_microbatches must equal "
+            f"len(schedule): {cfg.num_microbatches} != {len(microbatch_seq_lens)}."
+        )
     return PretrainSessionConfig(
         steps=cfg.steps,
         warmup=cfg.warmup,
@@ -316,6 +349,7 @@ def build_session_config(cfg: BenchCliConfig) -> PretrainSessionConfig:
         use_thd=cfg.use_thd,
         same_data_across_dp=cfg.same_data_across_dp,
         no_optimizer=cfg.no_optimizer,
+        microbatch_seq_lens=microbatch_seq_lens,
     )
 
 
@@ -417,6 +451,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--override-transformer-json", default="{}")
     parser.add_argument("--override-optimizer-json", default="{}")
     parser.add_argument("--impl-cfg-json", default="{}")
+    parser.add_argument(
+        "--microbatch-seq-lens-json",
+        default="",
+        help=(
+            "JSON array of per-microbatch packed sequence lengths, e.g. "
+            '\'[[2206],[2213]]\' or \'[[1100,1106],[1100,1113]]\'. '
+            "Requires --num-microbatches to match array length."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-json", default=None)
     return parser

@@ -27,6 +27,11 @@ class PretrainSessionConfig:
     use_thd: bool = False
     same_data_across_dp: bool = False
     no_optimizer: bool = False
+    # Per-microbatch packed sequence lengths. Each inner list is one microbatch's
+    # per-sample token counts (variable sample count + variable lengths). When set,
+    # ``num_microbatches`` must equal ``len(microbatch_seq_lens)`` and ``seq_len`` is
+    # ignored for data generation (still used for FLOP estimates when uniform).
+    microbatch_seq_lens: list[list[int]] | None = None
 
 
 def _is_cuda_device(device: str) -> bool:
@@ -88,9 +93,48 @@ def _infinite_packed_batches(
         )
 
 
+def _infinite_variable_packed_batches(
+    vocab_size: int,
+    microbatch_seq_lens: list[list[int]],
+    *,
+    device: str,
+    seed: int,
+):
+    """Yield PackedBatch microbatches with per-step variable seq/sample counts."""
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    if not microbatch_seq_lens:
+        raise ValueError("microbatch_seq_lens must be non-empty.")
+    for schedule in microbatch_seq_lens:
+        if not schedule or any(length < 1 for length in schedule):
+            raise ValueError(
+                f"Each microbatch schedule must have positive lengths, got {schedule!r}."
+            )
+
+    g = torch.Generator(device=device).manual_seed(seed)
+    step = 0
+    while True:
+        schedule = microbatch_seq_lens[step % len(microbatch_seq_lens)]
+        step += 1
+        seq_lens = torch.tensor(schedule, dtype=torch.int64, device=device)
+        total = int(seq_lens.sum().item())
+        yield PackedBatch(
+            input_ids=torch.randint(0, vocab_size, (total,), device=device, generator=g),
+            labels=torch.randint(0, vocab_size, (total,), device=device, generator=g),
+            seq_lens=seq_lens,
+        )
+
+
 def _make_data_iter(handle: ModelHandle, cfg: PretrainSessionConfig):
     data_seed = cfg.seed if cfg.same_data_across_dp else cfg.seed + handle.dp_rank
     vocab_size = _resolve_vocab_size(handle)
+    if cfg.microbatch_seq_lens is not None:
+        return _infinite_variable_packed_batches(
+            vocab_size,
+            cfg.microbatch_seq_lens,
+            device=cfg.device,
+            seed=data_seed,
+        )
     return _infinite_packed_batches(vocab_size, cfg.seq_len, device=cfg.device, seed=data_seed)
 
 
@@ -166,12 +210,21 @@ def run_pretrain_session(
         raise ValueError("warmup must satisfy 0 <= warmup < steps")
     if cfg.num_microbatches < 1:
         raise ValueError("num_microbatches must be >= 1")
+    if cfg.microbatch_seq_lens is not None:
+        if len(cfg.microbatch_seq_lens) != cfg.num_microbatches:
+            raise ValueError(
+                "microbatch_seq_lens length must match num_microbatches: "
+                f"{len(cfg.microbatch_seq_lens)} != {cfg.num_microbatches}."
+            )
 
     if data_iter is None:
         data_iter = _make_data_iter(handle, cfg)
 
     world_size = _world_size()
-    tokens_per_step = cfg.num_microbatches * cfg.seq_len * world_size
+    if cfg.microbatch_seq_lens is not None:
+        tokens_per_step = sum(sum(schedule) for schedule in cfg.microbatch_seq_lens) * world_size
+    else:
+        tokens_per_step = cfg.num_microbatches * cfg.seq_len * world_size
     step_flops, activated_params = _resolve_step_flops(handle, cfg)
 
     step_traces: list[StepTrace] = []
@@ -255,7 +308,12 @@ def run_pretrain_session(
         tok_per_s=tok_per_s,
         tok_per_s_per_gpu=tok_per_s / world_size,
         tflops_per_gpu=avg_tflops,
-        metadata={"warmup": cfg.warmup, "device": cfg.device, "use_thd": cfg.use_thd},
+        metadata={
+            "warmup": cfg.warmup,
+            "device": cfg.device,
+            "use_thd": cfg.use_thd,
+            "microbatch_seq_lens": cfg.microbatch_seq_lens,
+        },
     )
 
 
