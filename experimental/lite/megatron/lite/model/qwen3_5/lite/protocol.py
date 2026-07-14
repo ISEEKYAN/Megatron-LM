@@ -66,7 +66,10 @@ class ImplConfig:
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
     mount_vision_model: bool = False
-    gdn_cp_mode: str = "replicated"
+    # GatedDeltaNet context-parallel mode: "headwise" (default, head-parallel a2a;
+    # bitwise-exact vs CP-off and memory-sharded) or "replicated" (all-gather, exact
+    # but full sequence replicated on every rank).
+    gdn_cp_mode: str = "headwise"
 
 
 def _full_attn_module(layer, name: str):

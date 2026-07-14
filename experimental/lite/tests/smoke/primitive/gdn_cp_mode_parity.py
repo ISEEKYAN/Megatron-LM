@@ -2,31 +2,28 @@
 """Qwen3.5 GatedDeltaNet CP-mode precision parity proxy.
 
 Matrix (baseline = CP off / full sequence, cp_size=1):
-  gdn_cp_mode in {"replicated"(default), "sharded"} x CP in {off, on(cp2/cp4)}
+  gdn_cp_mode in {"headwise"(default), "replicated"} x CP in {off, on(cp2/cp4)}
 
 Design
 ------
 The primitive input is SBHD ``x = [seq, batch, hidden]``; CP shards along the
 seq dim (dim 0) with the Megatron **zigzag** layout. Each rank feeds its zigzag
-shard; the module internally reconstructs / ring-processes the sequence and
+shard; the module internally head-parallelises / reconstructs the sequence and
 returns the rank-local zigzag shard of the output.
 
-- ``replicated`` (default, correctness-first): all-gather qkvzba, reconstruct the
-  full sequence, run the FLA kernel WITHOUT ``cp_context`` (full local seq), then
-  zigzag-slice the output. Should be ~bitwise identical to the CP-off reference.
-- ``sharded`` (FLA cp_context ring): zigzag->contiguous chunk swap, run the FLA
-  kernel WITH ``cp_context`` (cross-rank state-passing ring), swap the output back.
-  A genuinely different algorithm; parity vs the full-seq reference is the question.
+- ``headwise`` (default): head-parallel all-to-all. Each rank ends up with the
+  full sequence for ``1/cp`` of the heads (plus the matching conv1d/A_log/dt_bias
+  slices), runs the ordinary full-sequence recurrence, then all-to-alls back. Heads
+  are independent -> **bitwise identical** to the CP-off reference, memory sharded.
+- ``replicated``: all-gather qkvzba, reconstruct the full sequence, run every head
+  on every rank, then zigzag-slice the output. Also bitwise identical to CP-off, but
+  every rank materialises the full sequence for all heads (worst memory).
 
 Reference = a cp_size=1 module (identical weights) run on the FULL sequence on
 rank 0. For every rank we compare its CP output to the zigzag slice of the
 reference output (forward), and likewise for the input gradient; weight grads are
-CP-all-reduced then compared to the reference weight grads.
-
-If ``sharded`` deviates materially we additionally localize the deviation to a
-stage (input swap / conv1d / gated_delta_rule / output swap) by capturing the
-per-stage tensors of the sharded module and diffing against the replicated
-module's equivalent full-seq stage (re-sliced to the same rank-local zigzag view).
+CP-all-reduced then compared to the reference weight grads. Both modes are expected
+to be bitwise-exact (max_abs == 0) vs the reference.
 
 Run under: torchrun --nproc_per_node={2,4} gdn_cp_mode_parity.py
 """
@@ -105,52 +102,6 @@ def _diff(a, b):
     return max_abs, max_rel, scale.item()
 
 
-class _StageTap:
-    """Monkeypatch a sharded GDN module to capture per-stage tensors."""
-
-    def __init__(self, module):
-        self.m = module
-        self.caps = {}
-        self._orig = {}
-
-    def __enter__(self):
-        m = self.m
-        for name in ("_cp_swap_qkvzba", "_causal_conv1d", "_gated_delta_rule"):
-            self._orig[name] = getattr(m, name)
-
-        swaps = {"n": 0}
-        orig_swap = self._orig["_cp_swap_qkvzba"]
-        orig_conv = self._orig["_causal_conv1d"]
-        orig_rule = self._orig["_gated_delta_rule"]
-
-        def swap_wrap(*a, **kw):
-            out = orig_swap(*a, **kw)
-            key = "swap_in" if swaps["n"] == 0 else "swap_out"
-            swaps["n"] += 1
-            self.caps[key] = out.detach().clone()
-            return out
-
-        def conv_wrap(*a, **kw):
-            out = orig_conv(*a, **kw)
-            self.caps["conv"] = out.detach().clone()
-            return out
-
-        def rule_wrap(*a, **kw):
-            out = orig_rule(*a, **kw)
-            self.caps["rule"] = out[0].detach().clone()
-            return out
-
-        m._cp_swap_qkvzba = swap_wrap
-        m._causal_conv1d = conv_wrap
-        m._gated_delta_rule = rule_wrap
-        return self
-
-    def __exit__(self, *exc):
-        for name, fn in self._orig.items():
-            setattr(self.m, name, fn)
-        return False
-
-
 def run_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world):
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
 
@@ -168,7 +119,7 @@ def run_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world):
     ref_in_grad_full = None
     ref_wgrads = None
 
-    for cp_mode in ("replicated", "sharded"):
+    for cp_mode in ("headwise", "replicated"):
         cp_mod = _make_gdn(cp_size, cp_rank, cp_group, cp_mode).to(device=device, dtype=DTYPE)
         _randomize_and_broadcast(cp_mod)
 
@@ -257,40 +208,6 @@ def run_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world):
     return results
 
 
-def localize_sharded(cp_size, cp_rank, cp_group, cp1_group, device, rank):
-    """Stage-level localization: run replicated and sharded on identical weights &
-    input, capture the sharded module's per-stage tensors and compare the final
-    outputs. Emits per-stage magnitudes so a deviation can be attributed."""
-    from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
-
-    sh = _make_gdn(cp_size, cp_rank, cp_group, "sharded").to(device=device, dtype=DTYPE)
-    _randomize_and_broadcast(sh)
-    rep = _make_gdn(cp_size, cp_rank, cp_group, "replicated").to(device=device, dtype=DTYPE)
-    rep.load_state_dict(sh.state_dict())
-
-    torch.manual_seed(SEED + 7)
-    full_x = torch.randn(SEQ, BATCH, HIDDEN, device=device, dtype=DTYPE)
-    dist.broadcast(full_x, src=0)
-    local_x = zigzag_slice_for_cp(full_x, cp_rank, cp_size, seq_dim=0)
-
-    with torch.no_grad():
-        rep_out = rep(local_x.clone())
-        with _StageTap(sh) as tap:
-            sh_out = sh(local_x.clone())
-
-    a, r, s = _diff(sh_out, rep_out)
-    caps = tap.caps
-    if cp_rank == 0:
-        stage_shapes = {k: tuple(v.shape) for k, v in caps.items()}
-        print(
-            f"GDN_CP_LOCALIZE cp={cp_size} sharded_vs_replicated_out "
-            f"max_abs={a:.3e} max_rel={r:.3e} scale={s:.3e} stages={sorted(caps)} "
-            f"shapes={stage_shapes}",
-            flush=True,
-        )
-    dist.barrier()
-
-
 def main():
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -307,14 +224,9 @@ def main():
     if rank == 0:
         import megatron.lite.primitive.modules.gated_delta_net as g
 
-        print(
-            f"GDN_CP_ENV world={world} HAS_FLA={g._HAS_FLA} "
-            f"build_cp_context={'yes' if g._fla_build_cp_context is not None else 'no'}",
-            flush=True,
-        )
+        print(f"GDN_CP_ENV world={world} HAS_FLA={g._HAS_FLA}", flush=True)
 
     run_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world)
-    localize_sharded(cp_size, cp_rank, cp_group, cp1_group, device, rank)
 
     dist.barrier()
     dist.destroy_process_group()

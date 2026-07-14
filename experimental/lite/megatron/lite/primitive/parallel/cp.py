@@ -350,10 +350,100 @@ def split_packed_for_cp(
     return new_ids, new_pos, new_cu, max(new_lengths)
 
 
+def build_headwise_section_perm(
+    split_sections: tuple[int, ...] | list[int],
+    cp_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Permutation over the hidden dim so a single contiguous ``1/cp`` slice equals
+    the concatenation of each section's ``k``-th contiguous block.
+
+    ``qkvzba`` is a concatenation of independently-headed sections (q, k, v, z,
+    beta, alpha). Head-parallel CP wants each rank to own ``1/cp`` heads of *every*
+    section. Applying this permutation before a plain hidden-scatter all-to-all makes
+    rank ``k``'s contiguous hidden shard hold section-block ``k`` of each section, so
+    the per-section split downstream (and the matching parameter slicing) is exact.
+
+    Mirrors upstream Megatron ``_build_head_perm_for_split_sections``.
+    """
+    assert all(
+        s % cp_size == 0 for s in split_sections
+    ), f"split_sections {tuple(split_sections)} must each be divisible by cp_size={cp_size}."
+    offset = 0
+    parts = []
+    for s in split_sections:
+        parts.append(
+            torch.arange(offset, offset + s, device=device, dtype=torch.long).view(cp_size, -1)
+        )
+        offset += s
+    return torch.cat(parts, dim=-1).view(-1)
+
+
+def get_parameter_local_cp_headwise(
+    param: torch.Tensor,
+    dim: int,
+    cp_size: int,
+    cp_rank: int,
+    split_sections: Optional[list[int]] = None,
+) -> torch.Tensor:
+    """Return this CP rank's head-wise slice of a parameter.
+
+    With ``split_sections`` the parameter is first split into sections along ``dim``,
+    each section is sliced to its rank-``cp_rank`` contiguous block, and the blocks are
+    re-concatenated — matching :func:`build_headwise_section_perm`. Slicing happens in
+    the forward path so gradients flow back to the full (cp_size=1) parameter.
+
+    Mirrors upstream Megatron ``get_parameter_local_cp_headwise``.
+    """
+    if cp_size <= 1:
+        return param
+    if split_sections is not None:
+        pieces = torch.split(param, split_sections, dim=dim)
+        return torch.cat(
+            [get_parameter_local_cp_headwise(p, dim, cp_size, cp_rank) for p in pieces],
+            dim=dim,
+        )
+    dim_size = param.size(dim)
+    assert (
+        dim_size % cp_size == 0
+    ), f"parameter dim {dim} size {dim_size} not divisible by cp_size={cp_size}."
+    slices: list[slice] = [slice(None)] * param.dim()
+    block = dim_size // cp_size
+    slices[dim] = slice(cp_rank * block, (cp_rank + 1) * block)
+    return param[tuple(slices)]
+
+
+def all_to_all_hidden_shards(
+    send_parts: list[torch.Tensor],
+    cp_group: dist.ProcessGroup | None,
+) -> list[torch.Tensor]:
+    """Even all-to-all over a CP group: ``send_parts[j]`` is delivered to rank ``j``;
+    the returned ``recv[i]`` is the tensor rank ``i`` sent to this rank.
+
+    All parts must share the same shape and dtype. Autograd-aware via
+    ``torch.distributed.nn.functional.all_to_all_single``.
+    """
+    cp_size = dist.get_world_size(cp_group) if cp_group is not None else 1
+    if cp_size <= 1:
+        return [send_parts[0]]
+    assert len(send_parts) == cp_size, (len(send_parts), cp_size)
+    ref = send_parts[0]
+    send = torch.stack([p.contiguous() for p in send_parts], dim=0)  # [cp, *shape]
+    flat = send.reshape(cp_size, -1).contiguous()
+    from torch.distributed.nn.functional import all_to_all_single
+
+    recv_flat = all_to_all_single(torch.empty_like(flat), flat, group=cp_group)
+    recv = recv_flat.reshape(cp_size, *ref.shape)
+    return [recv[i] for i in range(cp_size)]
+
+
 __all__ = [
+    "all_to_all_hidden_shards",
+    "build_headwise_section_perm",
     "contiguous_position_ids_for_cp",
     "contiguous_slice_for_cp",
     "contiguous_to_zigzag_chunks",
+    "get_parameter_local_cp_headwise",
     "split_packed_for_cp",
     "zigzag_to_contiguous_chunks",
     "zigzag_reconstruct_from_cp_parts",
