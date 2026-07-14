@@ -65,7 +65,8 @@ CACHE_OVERRIDES=(
   "++${RE}.VLLM_CACHE_ROOT=$CACHE/vllm"
   "++${RE}.XDG_CACHE_HOME=$CACHE/xdg-cache"
   "++${RE}.HOME=$CACHE/home"
-  "++${RE}.TMPDIR=$CACHE/tmp"
+  # NB: TMPDIR intentionally NOT redirected — Ray's AF_UNIX plasma socket path would
+  # exceed the 107-byte limit on the long lustre prefix (job13950787). Keep node /tmp.
   "++${RE}.FLASHINFER_WORKSPACE_BASE=$CACHE/flashinfer"
   "++${RE}.TILELANG_CACHE_DIR=$CACHE/tilelang"
   "++${RE}.VLLM_NO_USAGE_STATS=1"

@@ -29,7 +29,10 @@ CACHE="$RUN_DIR/cache-${SLURM_JOB_ID:-manual}"
 export CACHE
 export HOME="$CACHE/home"
 export XDG_CACHE_HOME="$CACHE/xdg-cache"
-export TMPDIR="$CACHE/tmp"
+# NB: do NOT redirect TMPDIR onto lustre — Ray places its plasma_store AF_UNIX
+# socket under $TMPDIR/ray/session_*/sockets/ and the long lustre prefix blows the
+# 107-byte unix-socket path limit (job13950787). TMPDIR was never the ENOSPC culprit
+# (that was usage_stats + JIT under HOME); leave it at the short node-local /tmp default.
 export TRITON_CACHE_DIR="$CACHE/triton"
 export TORCHINDUCTOR_CACHE_DIR="$CACHE/inductor"
 export PYTHONPYCACHEPREFIX="$CACHE/pycache"
@@ -42,7 +45,7 @@ export HF_HOME="$RUN_DIR/hf-home"
 export HF_DATASETS_CACHE="$RUN_DIR/hf-datasets-cache"
 export NCCL_NVLS_ENABLE=0 VLLM_ALLREDUCE_USE_SYMM_MEM=0
 export VLLM_WORKER_MULTIPROC_METHOD=spawn RAY_memory_monitor_refresh_ms=0 HYDRA_FULL_ERROR=1
-mkdir -p "$HOME" "$XDG_CACHE_HOME" "$TMPDIR" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" \
+mkdir -p "$HOME" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" \
   "$PYTHONPYCACHEPREFIX" "$VLLM_CACHE_ROOT" "$FLASHINFER_WORKSPACE_BASE" "$TILELANG_CACHE_DIR" \
   "$HF_HOME" "$HF_DATASETS_CACHE" "$RUN_DIR/logs" "$RUN_DIR/output" "$SCRIPT_DIR"
 
