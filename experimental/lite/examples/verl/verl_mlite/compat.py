@@ -761,6 +761,46 @@ def _patch_transformers_rope_ignore_keys() -> None:
         cls._verl_mlite_rope_ignore_keys_patch = True
 
 
+def _patch_transformers_apply_chat_template_return_dict() -> bool:
+    """Restore Transformers v4's ``apply_chat_template`` list-of-ids return type.
+
+    In Transformers v5 the ``return_dict`` default of
+    ``PreTrainedTokenizerBase.apply_chat_template`` flipped from ``False`` to
+    ``True``, so a ``tokenize=True`` call now yields a ``BatchEncoding`` mapping
+    (``{"input_ids": [...], "attention_mask": [...]}``) instead of a bare
+    ``list[int]``. VERL's agent loop
+    (``verl.experimental.agent_loop.agent_loop.AgentLoop.apply_chat_template``)
+    was written against v4 and treats the result as a token-id list: it forwards
+    the value straight into ``TokensPrompt(prompt_token_ids=...)``. vLLM's input
+    validator then evaluates ``max(prompt_ids)`` over the mapping's *keys*,
+    yielding the string ``"input_ids"`` and crashing the rollout with
+    ``TypeError: '>' not supported between instances of 'str' and 'int'``
+    (job 13961728, single torch2.12/cu13 stack). We default ``return_dict`` back
+    to ``False`` whenever the caller does not set it explicitly, restoring the v4
+    contract while leaving callers that request a dict untouched. When
+    ``tokenize=False`` Transformers already forces ``return_dict=False``, so this
+    only affects the tokenizing path.
+    """
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+    except Exception:  # pragma: no cover - transformers internals moved
+        return False
+
+    original = PreTrainedTokenizerBase.apply_chat_template
+    if getattr(original, "_verl_mlite_return_dict_default_patch", False):
+        return False
+
+    @wraps(original)
+    def patched(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if "return_dict" not in kwargs:
+            kwargs["return_dict"] = False
+        return original(self, *args, **kwargs)
+
+    patched._verl_mlite_return_dict_default_patch = True
+    PreTrainedTokenizerBase.apply_chat_template = patched
+    return True
+
+
 def _trace_runtime_patch(stage: str, result: Any = None) -> None:
     """Report patch ordering only for an explicitly traced startup."""
     if os.environ.get("VERL_MLITE_RUNTIME_PATCH_TRACE") != "1":
@@ -825,6 +865,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("06.transformers_alias_after_uuid", result)
     result = _patch_transformers_rope_ignore_keys()
     _trace_runtime_patch("07.transformers_rope_ignore_keys", result)
+    result = _patch_transformers_apply_chat_template_return_dict()
+    _trace_runtime_patch("07b.transformers_apply_chat_template_return_dict", result)
     result = _patch_bucketed_weight_sender()
     _trace_runtime_patch("08.bucketed_weight_sender", result)
     result = _patch_vllm_server_profile()
