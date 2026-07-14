@@ -361,7 +361,13 @@ class MegatronLiteRuntime(RuntimeBase):
                 yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
             else:
                 for chunk in model_chunks:
-                    yield from chunk.named_parameters()
+                    # Prefer the bounded-bucket stream (M-FSDP) so the raw-param
+                    # fallback does not pre-materialize the whole model either.
+                    streamer = getattr(chunk, "stream_full_parameters", None)
+                    if callable(streamer):
+                        yield from streamer()
+                    else:
+                        yield from chunk.named_parameters()
 
     # ── Memory ──
 

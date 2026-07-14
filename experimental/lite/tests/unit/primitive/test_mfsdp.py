@@ -1110,18 +1110,23 @@ def _retained_buffer_count(allocator) -> int:
 
 
 def test_mfsdp_full_parameter_export_returns_cached_buffers_to_driver():
-    # A full-parameter export materializes the whole (unsharded) model into the
-    # allocator's persistent double-buffer slots. Its lifetime is scoped to the
-    # export context: on exit the retained storage must be returned to the
-    # driver so a colocated consumer (e.g. a waking vLLM engine) can reclaim it.
+    # A full-parameter export materializes the (unsharded) model into the
+    # allocator's persistent double-buffer slots -- now one bucket at a time via
+    # the bounded stream, which reuses a slot across buckets rather than pinning
+    # the whole model. Its lifetime is scoped to the export context: on exit the
+    # retained storage must be returned to the driver so a colocated consumer
+    # (e.g. a waking vLLM engine) can reclaim it.
     chunk = _build_export_release_chunk()
     allocator = chunk.param_and_grad_buffer.allocator
     assert isinstance(allocator, mfsdp_buffer.DoubleBufferAllocator)
 
     with chunk.full_parameter_context():
-        # Each bucket materialized its full-parameter buffer into a persistent
-        # slot (identical-layout buckets share a pool_key's two slots).
-        assert _retained_buffer_count(allocator) == len(chunk.param_sync.buckets)
+        # Draining the bounded stream materializes every bucket in turn; the
+        # double-buffer retains the reused slot(s) in its pool after each
+        # per-bucket release, so at least one slot is cached inside the context.
+        consumed = list(chunk.stream_full_parameters())
+        assert len(consumed) == len(list(chunk.module.named_parameters()))
+        assert _retained_buffer_count(allocator) >= 1
 
     # release_cached_buffers dropped the pinned slots so torch's caching
     # allocator (empty_cache / expandable_segments) can hand the storage back;
@@ -1132,33 +1137,24 @@ def test_mfsdp_full_parameter_export_returns_cached_buffers_to_driver():
     assert not any(allocator._busy.values())
 
 
-def test_mfsdp_full_parameter_export_releases_cached_buffers_when_materialize_raises():
-    # The scoped-release finally must fire on *any* exit, including a failure
-    # during materialize_all itself: materialize can pin allocator slots and
-    # then raise (e.g. an all-gather error), and if that path skipped
-    # release_cached_buffers the persistent double-buffer slots would leak
-    # across the next colocated consumer's turn -- the resync-OOM bug. Prove
-    # the try scope covers materialize so the slots are returned to the driver.
+def test_mfsdp_full_parameter_export_releases_cached_buffers_when_export_raises():
+    # The scoped-release finally must fire on *any* exit, including a consumer
+    # failure mid-export after buckets have pinned allocator slots. If that path
+    # skipped release_cached_buffers the persistent double-buffer slots would
+    # leak across the next colocated consumer's turn -- the resync-OOM bug.
     chunk = _build_export_release_chunk()
     allocator = chunk.param_and_grad_buffer.allocator
     assert isinstance(allocator, mfsdp_buffer.DoubleBufferAllocator)
 
-    real_materialize_all = chunk.param_sync.materialize_all
-
-    def _materialize_then_raise() -> None:
-        # Pin the real full-parameter slots, then fail mid-export.
-        real_materialize_all()
-        assert _retained_buffer_count(allocator) == len(chunk.param_sync.buckets)
-        raise RuntimeError("injected materialize failure")
-
-    chunk.param_sync.materialize_all = _materialize_then_raise
-
-    with pytest.raises(RuntimeError, match="injected materialize failure"):
+    with pytest.raises(RuntimeError, match="injected export failure"):
         with chunk.full_parameter_context():
-            pass  # never reached; materialize_all raises first
+            # Pin the real full-parameter slots, then fail mid-export.
+            chunk.param_sync.materialize_all()
+            assert _retained_buffer_count(allocator) == len(chunk.param_sync.buckets)
+            raise RuntimeError("injected export failure")
 
-    # Despite the exception on the materialize path, the finally returned the
-    # pinned slots to the driver -- no export buffer survives the failed context.
+    # Despite the exception, the finally returned the pinned slots to the driver
+    # -- no export buffer survives the failed context.
     assert _retained_buffer_count(allocator) == 0
     assert len(allocator._slots) == 0
     assert not any(allocator._busy.values())
@@ -1683,3 +1679,94 @@ def _run_mfsdp_gloo_parity(rank: int, world_size: int, init_file: str) -> None:
 def test_mfsdp_cpu_two_rank_gloo_matches_replicated_reference(tmp_path):
     init_file = str(tmp_path / "mfsdp-gloo-init")
     mp.spawn(_run_mfsdp_gloo_parity, args=(2, init_file), nprocs=2, join=True)
+
+
+def _build_single_rank_mfsdp_chunk():
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, _optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_GlooModel()],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_GlooUnit,),
+    )
+    return chunks[0]
+
+
+def test_mfsdp_stream_full_parameters_bounds_residency_to_one_bucket():
+    """The bounded-bucket export stream never materializes >1 bucket at once.
+
+    materialize_all pins every bucket's full-parameter lease simultaneously (the
+    whole-model transient peak this fix removes); the streaming export must keep
+    at most one bucket's lease live and release it before advancing.
+    """
+    torch.manual_seed(1234)
+    chunk = _build_single_rank_mfsdp_chunk()
+    buckets = chunk.param_sync.buckets
+    assert len(buckets) >= 2, "need multiple buckets to exercise the bound"
+
+    def _live_leases() -> int:
+        return sum(bucket._full_lease is not None for bucket in buckets)
+
+    seen = 0
+    for _name, _param in chunk.stream_full_parameters():
+        assert _live_leases() <= 1, "streaming must not pin more than one bucket"
+        seen += 1
+    assert seen >= 1
+    # Every bucket is released once the stream drains.
+    assert _live_leases() == 0
+    assert all(bucket._full_lease is None for bucket in buckets)
+
+
+def test_mfsdp_stream_full_parameters_matches_materialized_names_and_values():
+    """Streamed (name, full_param) pairs equal the whole-model materialize path.
+
+    Guards against name-mapping drift and (critically) against the cloned
+    yielded tensors aliasing bucket storage that the per-bucket release hands
+    back: values are read *after* the stream fully drains, so a stale alias
+    would surface as corrupted data.
+    """
+    torch.manual_seed(1234)
+    chunk = _build_single_rank_mfsdp_chunk()
+
+    # Reference: whole-model materialize, then read the inner-module params.
+    chunk.param_sync.materialize_all()
+    reference = {
+        name: param.data.detach().clone()
+        for name, param in chunk.module.named_parameters()
+    }
+    chunk.param_sync.release_all()
+    chunk.param_sync.discard_full_parameter_views()
+
+    # Candidate: retain every streamed tensor past the stream's lifetime so a
+    # released-bucket alias (missing clone) would corrupt the retained values.
+    streamed = {name: param.data for name, param in chunk.stream_full_parameters()}
+
+    assert set(streamed) == set(reference)
+    for name, ref in reference.items():
+        got = streamed[name]
+        assert got.shape == ref.shape, name
+        assert torch.equal(got, ref), name

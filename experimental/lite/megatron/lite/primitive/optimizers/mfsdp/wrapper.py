@@ -188,16 +188,63 @@ class MegatronFSDP(nn.Module):
             load_grad=load_grad,
         )
 
+    def stream_full_parameters(self) -> Iterator[tuple[str, nn.Parameter]]:
+        """Yield ``(name, full_param)`` one bucket at a time for export.
+
+        The bounded-bucket counterpart to ``materialize_all``: an exporter that
+        walks parameters one at a time (see the shared HF exporter's
+        ``export_hf_weights``) can consume this stream instead of pre-gathering
+        the whole model, capping the transient full-parameter footprint at a
+        single bucket rather than the whole unsharded model. This is the
+        materialization side of the DS4 resync bounded-export protocol and
+        mirrors FSDP2's per-parameter ``full_tensor`` gather, which shows no
+        export memory peak.
+
+        Each yielded parameter's ``.data`` is cloned off the bucket's gather
+        buffer before the bucket is released, so a consumer that retains the
+        tensor past the bucket's lifetime (e.g. the exporter buffers expert
+        shards for a per-layer EP collective) keeps a private allocation and
+        never aliases storage that the release has handed back to the allocator.
+        """
+        # Names are resolved against the currently-installed (sharded) params,
+        # which is the module state on entry and after each bucket release.
+        name_by_shard_id = {
+            id(param): name for name, param in self.module.named_parameters()
+        }
+        covered: set[str] = set()
+        for bucket in self.param_sync.stream_materialize_buckets():
+            for spec in bucket.specs:
+                name = name_by_shard_id.get(id(spec.shard_param))
+                if name is None:
+                    continue
+                covered.add(name)
+                full_param = spec.full_param
+                full_param.data = full_param.data.clone()
+                yield name, full_param
+        # Parameters (and any params not owned by an M-FSDP bucket) that the
+        # bucket walk did not cover -- emit them from the restored sharded view.
+        for name, param in self.module.named_parameters():
+            if name not in covered:
+                yield name, param
+
     @contextmanager
     def full_parameter_context(self):
-        """Materialize full parameters for model-level export consumers."""
-        # Enter the try before materialize_all so that a partial materialize
-        # (e.g. an all-gather that pins some allocator slots and then raises)
-        # still routes through release_cached_buffers in the finally; otherwise
-        # an exception during materialization would leak the persistent
-        # double-buffer slots that this context exists to reclaim.
+        """Scope a full-parameter export; parameters materialize on demand.
+
+        Historically this all-gathered the whole model up front
+        (``materialize_all``), producing a transient full-model peak. Export
+        consumers now stream via ``stream_full_parameters`` (bounded to a single
+        bucket), so this context no longer pre-materializes; it only guarantees
+        the export all-gather storage is scoped to the export and handed back to
+        the driver on exit. A consumer that still reads ``named_parameters``
+        directly (rather than streaming) transparently falls back to the
+        wrapper's own ``materialize_all`` there, so correctness is unchanged.
+        """
+        # The try/finally still wraps the whole body so any partial
+        # materialization performed by the consumer routes through
+        # release_cached_buffers below (which reclaims the persistent
+        # double-buffer slots a colocated vLLM wake_up needs handed back).
         try:
-            self.param_sync.materialize_all()
             yield
         finally:
             self.param_sync.release_all()

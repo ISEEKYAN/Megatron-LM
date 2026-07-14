@@ -389,6 +389,22 @@ def _resolve_param_name(name: str, state_dict: dict) -> str | None:
     return None
 
 
+def _iter_export_named_parameters(chunk: nn.Module, base_chunk: nn.Module):
+    """Source ``(name, full_param)`` pairs for export, bounded when possible.
+
+    Backends whose wrapper exposes ``stream_full_parameters`` (M-FSDP) gather
+    the unsharded parameters one bucket at a time, capping the transient export
+    footprint at a single bucket instead of the whole model. Everything else --
+    FSDP2 ``DTensor`` params (gathered lazily by ``_materialize_dtensor``) and
+    plain manually-sharded params -- falls back to ``named_parameters``.
+    """
+    streamer = getattr(chunk, "stream_full_parameters", None)
+    if callable(streamer):
+        yield from streamer()
+    else:
+        yield from base_chunk.named_parameters()
+
+
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,
@@ -426,7 +442,7 @@ def export_hf_weights(
                 if hasattr(base_chunk, "layer_indices")
                 else {}
             )
-            for name, param in base_chunk.named_parameters():
+            for name, param in _iter_export_named_parameters(chunk, base_chunk):
                 gname = to_global_layer_name(name, layer_map)
                 tensor = _materialize_dtensor(param.data.detach())
 
@@ -474,7 +490,7 @@ def export_hf_weights(
             if hasattr(base_chunk, "layer_indices")
             else {}
         )
-        for name, param in base_chunk.named_parameters():
+        for name, param in _iter_export_named_parameters(chunk, base_chunk):
             gname = to_global_layer_name(name, layer_map)
             t = _materialize_dtensor(param.data.detach())
 

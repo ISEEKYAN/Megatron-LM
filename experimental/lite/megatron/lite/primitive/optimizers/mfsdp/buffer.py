@@ -15,7 +15,7 @@ import importlib
 import logging
 import math
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -1068,6 +1068,31 @@ class CommunicationPipelines:
 
     def materialize_all(self) -> None:
         self.all_gather.materialize_all()
+
+    def stream_materialize_buckets(self) -> Iterator["ParamBucket"]:
+        """Materialize one bucket at a time, releasing each before the next.
+
+        ``materialize_all`` all-gathers *every* bucket into the persistent
+        double-buffer simultaneously, so the whole unsharded model is resident
+        at once -- a transient full-model peak (tens of GiB/rank) that lands on
+        top of steady-state and drives the colocated resync OOM. A
+        full-parameter *export* only ever reads one
+        parameter at a time, so it does not need the whole model resident; this
+        generator bounds the transient footprint to a single bucket by
+        gather → install → yield → release per bucket, mirroring FSDP2's
+        per-parameter ``full_tensor`` path (which retains no whole-model buffer
+        and shows no export peak). Consumers MUST finish reading a bucket's
+        parameters before requesting the next (plain iteration guarantees this).
+        """
+        for bucket in self.buckets:
+            self.all_gather.async_bucket_gather(bucket.bucket_id)
+            self.all_gather.wait_bucket_ready(bucket.bucket_id)
+            bucket.install_full_parameters()
+            try:
+                yield bucket
+            finally:
+                bucket.release_full_parameters()
+                bucket.discard_full_parameter_views()
 
     def release_all(self) -> None:
         self.all_gather.release_all()
