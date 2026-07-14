@@ -27,12 +27,16 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl_mlite.compat import load_verl_engine_api
 from verl_mlite.resync_export import (
+    format_host_census_line,
     format_resync_memcurve_line,
+    host_census_record,
     resync_export_empty_cache_threshold_bytes,
+    resync_hostcensus_enabled,
     resync_memcurve_enabled,
     resync_memcurve_memlog_path,
     resync_memcurve_record,
     stream_export_with_empty_cache,
+    summarize_host_storages,
 )
 
 try:
@@ -82,6 +86,43 @@ def _is_no_padding_pad_mode(pad_mode: Any) -> bool:
         or getattr(pad_mode, "value", None) == "no_padding"
         or str(pad_mode) in {"no_padding", "DatasetPadMode.NO_PADDING"}
     )
+
+
+def _read_process_rss_gib() -> float:
+    """Whole-process resident set (GiB) from ``/proc/self/status`` (Linux)."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024 / (1024**3)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+def _collect_host_tensor_storages() -> list[tuple[int, tuple[int, ...]]]:
+    """Deduplicated ``(nbytes, shape)`` of every live CPU tensor storage.
+
+    Walks ``gc`` for ``torch.Tensor`` instances on the CPU device and keys them
+    by storage ``data_ptr`` so aliased views over a single offload buffer (e.g.
+    every M-FSDP ``spec.shard_param`` narrowing ``main_param_buffer``) contribute
+    their storage exactly once. Only used inside the gated diagnostic census.
+    """
+    import gc
+
+    seen: dict[int, tuple[int, tuple[int, ...]]] = {}
+    for obj in gc.get_objects():
+        try:
+            if not isinstance(obj, torch.Tensor) or obj.device.type != "cpu":
+                continue
+            storage = obj.untyped_storage()
+            ptr = storage.data_ptr()
+            nbytes = storage.nbytes()
+        except Exception:
+            continue
+        if ptr and ptr not in seen:
+            seen[ptr] = (nbytes, tuple(obj.shape))
+    return list(seen.values())
 
 
 class _MegatronLiteLRScheduler:
@@ -377,6 +418,12 @@ class MegatronLiteEngine(BaseEngine):
 
     def get_per_tensor_param(self, **kwargs):
         self._require_initialized()
+        # Census the retained host footprint *before* reloading params to GPU,
+        # i.e. in the offloaded steady state where the monotonic host-RAM leak
+        # (TASK-1.13.8.6) accumulates. Off unless MLITE_RESYNC_HOSTCENSUS /
+        # MLITE_RESYNC_MEMLOG_PATH is set.
+        if resync_hostcensus_enabled():
+            self._record_host_census()
         if self.is_param_offload_enabled:
             self.to("cuda", model=True, optimizer=False, grad=False)
         if not getattr(self, "_initial_sync_cache_cleared", False):
@@ -454,6 +501,41 @@ class MegatronLiteEngine(BaseEngine):
             try:
                 with open(path, "a") as fh:
                     fh.write(json.dumps(resync_memcurve_record(rank, curve, worst)) + "\n")
+            except OSError:
+                pass
+
+    def _record_host_census(self) -> None:
+        """Census live host (CPU) tensor storages at this resync cycle boundary.
+
+        Point-names the monotonic host-RAM leak (TASK-1.13.8.6): a growing
+        ``host_tensor_total_gib`` across cycles means a retained CPU tensor
+        (offload buffer / optimizer state / export residue, ranked in ``top``);
+        RSS climbing while the tensor total stays flat means non-tensor host
+        memory (pinned-host pool / allocator fragmentation). Instrumentation
+        only — gated off by default; the gc walk runs solely in the diagnostic
+        run. Every rank emits (the SIGKILLed rank need not be rank 0).
+        """
+        self._resync_cycle = getattr(self, "_resync_cycle", -1) + 1
+        entries = _collect_host_tensor_storages()
+        summary = summarize_host_storages(entries)
+        rss_gib = _read_process_rss_gib()
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(
+            format_host_census_line(rank, self._resync_cycle, rss_gib, summary),
+            flush=True,
+        )
+        path = resync_memcurve_memlog_path()
+        if path:
+            import json
+
+            try:
+                with open(path, "a") as fh:
+                    fh.write(
+                        json.dumps(
+                            host_census_record(rank, self._resync_cycle, rss_gib, summary)
+                        )
+                        + "\n"
+                    )
             except OSError:
                 pass
 

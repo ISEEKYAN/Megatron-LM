@@ -32,6 +32,20 @@ _DEFAULT_RESYNC_EXPORT_EMPTY_CACHE_GIB = 4.0
 _RESYNC_MEMCURVE_ENV = "MLITE_RESYNC_MEMCURVE"
 _RESYNC_MEMLOG_PATH_ENV = "MLITE_RESYNC_MEMLOG_PATH"
 
+# HOSTCENSUS instrumentation (default off; enabled only when either env is set).
+# The device-side MEMCURVE probe attributes the transient GPU export peak, but a
+# *separate* monotonic host-RSS climb (M-FSDP arm 157→258→282 GiB/cycle, no
+# plateau; the FSDP2 arm holds a stable high plateau instead) drives an eventual
+# SIGKILL that no device probe can see. The available procmem.csv only records
+# the aggregate ``cpu_memory_used`` curve, not *which* allocation grows. This
+# probe censuses the live host (CPU) tensor storages at each resync cycle
+# boundary so a growing category can be point-named: if the host-tensor total
+# climbs, the leak is a retained CPU tensor (offload buffer / optimizer state /
+# export residue, ranked by size); if RSS climbs while the tensor total stays
+# flat, the leak is non-tensor host memory (pinned-host pool / allocator
+# fragmentation). See TASK-1.13.8.6.
+_RESYNC_HOSTCENSUS_ENV = "MLITE_RESYNC_HOSTCENSUS"
+
 
 def resync_export_empty_cache_threshold_bytes() -> int:
     """Bytes of exported material per ``empty_cache`` flush; ``<=0`` disables.
@@ -140,4 +154,78 @@ def resync_memcurve_record(rank: int, curve: list[dict], worst: dict) -> dict:
         "worst_tensor": worst.get("name"),
         "worst_tensor_peak_gib": worst.get("peak_bytes", 0) / (1024**3),
         "export_peak_max_alloc_gib": resync_memcurve_peak_gib(curve, worst),
+    }
+
+
+# ── HOSTCENSUS: per-cycle live host-tensor census (host RAM leak) ────────────
+#
+# The gc walk and torch storage reads (device.type, data_ptr, nbytes) stay in
+# the engine where torch is already imported; this module keeps only the pure
+# aggregation/formatting so it stays stdlib-only and CPU unit-testable. The
+# engine passes already-deduplicated ``(nbytes, shape)`` storage entries (one
+# per distinct CPU storage ``data_ptr``) so aliased views are never double
+# counted.
+
+
+def resync_hostcensus_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """True when host-tensor census emission is requested (default off).
+
+    Enabled by either ``MLITE_RESYNC_HOSTCENSUS`` (any non-empty value) or by
+    setting ``MLITE_RESYNC_MEMLOG_PATH`` (a JSONL sink implies you want the
+    census alongside the MEMCURVE records). Off by default so production resync
+    is unaffected (the gc walk is skipped entirely).
+    """
+    env = os.environ if env is None else env
+    return bool(env.get(_RESYNC_HOSTCENSUS_ENV) or env.get(_RESYNC_MEMLOG_PATH_ENV))
+
+
+def summarize_host_storages(
+    entries: list[tuple[int, tuple[int, ...]]], *, top_n: int = 8
+) -> dict:
+    """Aggregate deduplicated ``(nbytes, shape)`` host storages into a census.
+
+    ``entries`` must already be deduplicated by storage ``data_ptr`` (the engine
+    does this) so aliased parameter views over one offload buffer count once.
+    Returns the distinct-storage ``count``, ``total_gib``, and the ``top_n``
+    largest storages by bytes (a growing large storage across cycles point-names
+    the retained allocation).
+    """
+    total = sum(nbytes for nbytes, _ in entries)
+    ranked = sorted(entries, key=lambda item: item[0], reverse=True)[:top_n]
+    return {
+        "count": len(entries),
+        "total_gib": total / (1024**3),
+        "top": [{"nbytes": nbytes, "shape": list(shape)} for nbytes, shape in ranked],
+    }
+
+
+def format_host_census_line(rank: int, cycle: int, rss_gib: float, summary: dict) -> str:
+    """Single-line stdout marker grep-able as ``MLITE_RESYNC_HOSTCENSUS``.
+
+    ``rss_gib`` is the whole-process resident set (the quantity that SIGKILLs);
+    ``host_tensor_total_gib`` is the summed distinct CPU-tensor storage. RSS
+    climbing while the tensor total stays flat means the leak is non-tensor host
+    memory (pinned pool / fragmentation) rather than a retained tensor.
+    """
+    top = summary.get("top", [])
+    top_str = ",".join(
+        f"{entry['nbytes'] / (1024**3):.3f}GiB{tuple(entry['shape'])}" for entry in top[:4]
+    )
+    return (
+        f"MLITE_RESYNC_HOSTCENSUS rank={rank} cycle={cycle} "
+        f"rss_gib={rss_gib:.3f} host_tensor_count={summary.get('count', 0)} "
+        f"host_tensor_total_gib={summary.get('total_gib', 0.0):.3f} top={top_str}"
+    )
+
+
+def host_census_record(rank: int, cycle: int, rss_gib: float, summary: dict) -> dict:
+    """JSONL-serialisable per-rank host census for ``MLITE_RESYNC_MEMLOG_PATH``."""
+    return {
+        "kind": "hostcensus",
+        "rank": rank,
+        "cycle": cycle,
+        "rss_gib": rss_gib,
+        "host_tensor_count": summary.get("count", 0),
+        "host_tensor_total_gib": summary.get("total_gib", 0.0),
+        "top": summary.get("top", []),
     }
