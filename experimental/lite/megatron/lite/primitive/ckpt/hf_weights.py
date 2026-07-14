@@ -216,6 +216,18 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     return base_model
 
 
+def _materialize_full_parameters_if_available(chunks: list[nn.Module]) -> list[object]:
+    materialized: list[object] = []
+    for chunk in chunks:
+        for module in chunk.modules():
+            param_sync = getattr(module, "param_sync", None)
+            materialize = getattr(param_sync, "materialize_all", None)
+            if callable(materialize):
+                materialize()
+                materialized.append(param_sync)
+    return materialized
+
+
 def save_safetensors(
     tensors: dict[str, torch.Tensor], path: str, filename: str = "model.safetensors"
 ) -> None:
@@ -812,6 +824,27 @@ def export_hf_weights(
     else:
         chunks = [model]
 
+    param_syncs = _materialize_full_parameters_if_available(chunks)
+    try:
+        yield from _export_hf_weights_materialized(
+            chunks, spec, ps, vocab_size, limit, rank0_only, export_dtype
+        )
+    finally:
+        for param_sync in reversed(param_syncs):
+            release = getattr(param_sync, "release_all", None)
+            if callable(release):
+                release()
+
+
+def _export_hf_weights_materialized(
+    chunks: list[nn.Module],
+    spec: HFWeights,
+    ps,
+    vocab_size: int | None,
+    limit: int | None,
+    rank0_only: bool,
+    export_dtype: str | torch.dtype | None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
     rank = dist.get_rank() if dist.is_initialized() else 0
     resolved_export_dtype = _resolve_export_dtype(export_dtype)
 
