@@ -723,3 +723,99 @@ def test_qwen35_export_packs_base_expert_fc2_and_expert_metadata() -> None:
     assert spec.expert_global_id(native_name) == 2
     assert spec.expert_local_name(native_name, 0) == "layers.0.moe.experts.fc2.weight0"
     assert spec.tp_spec(native_name) == (1, 1)
+
+
+def test_export_prefers_stream_full_parameters_when_available() -> None:
+    """The bounded M-FSDP stream is the export source when the chunk exposes it.
+
+    Regression guard for the wiring: an earlier fix added
+    ``stream_full_parameters`` but the export entry must actually route through
+    it (rather than falling back to ``named_parameters``) for the bounded
+    materialization to take effect.
+    """
+    import megatron.lite.primitive.ckpt.hf_weights as hw
+
+    streamed = [("streamed_param", nn.Parameter(torch.zeros(1)))]
+
+    class Streamer:
+        def stream_full_parameters(self):
+            yield from streamed
+
+    class Base(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fallback_param = nn.Parameter(torch.ones(3))
+
+    got = list(hw._iter_export_named_parameters(Streamer(), Base()))
+    assert [name for name, _ in got] == ["streamed_param"]
+
+
+def test_export_falls_back_to_named_parameters_without_streamer() -> None:
+    import megatron.lite.primitive.ckpt.hf_weights as hw
+
+    class Base(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.only_param = nn.Parameter(torch.ones(3))
+
+    got = list(hw._iter_export_named_parameters(object(), Base()))
+    assert [name for name, _ in got] == ["only_param"]
+
+
+def test_qwen35_export_flushes_each_expert_group_before_walk_completes(monkeypatch) -> None:
+    """Each expert group is gathered (and its GPU full-tensors freed) as soon as
+    it is complete, not after the whole model has been materialized.
+
+    This is the residency bound that actually cuts the transient export peak:
+    the old code buffered every expert of every layer before its first EP
+    gather, so all expert full-tensors were resident at once. With the
+    incremental flush, layer 0's group is gathered after only layer 0's experts
+    have been materialized, so at most one group's tensors are ever live.
+    """
+    import megatron.lite.primitive.ckpt.hf_weights as hw
+
+    class TwoLayerExperts(nn.Module):
+        def __init__(self, config: Qwen35Config) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Module(), nn.Module()])
+            rows = config.moe_intermediate_size * 2
+            for layer in self.layers:
+                layer.moe = nn.Module()
+                layer.moe.experts = nn.Module()
+                layer.moe.experts.fc1 = nn.Module()
+                for expert_idx in range(config.num_experts):
+                    tensor = torch.arange(
+                        rows * config.hidden_size, dtype=torch.bfloat16
+                    ).reshape(rows, config.hidden_size)
+                    tensor = tensor + expert_idx * 1000
+                    layer.moe.experts.fc1.register_parameter(
+                        f"weight{expert_idx}", nn.Parameter(tensor)
+                    )
+
+    cfg = _tiny_config()
+    materialized = {"count": 0}
+    orig_materialize = hw._materialize_dtensor
+    orig_gather_group = hw._gather_expert_group
+    snapshots: list[int] = []
+
+    def spy_materialize(tensor):
+        materialized["count"] += 1
+        return orig_materialize(tensor)
+
+    def spy_gather_group(entries, spec, ps, out):
+        snapshots.append(materialized["count"])
+        return orig_gather_group(entries, spec, ps, out)
+
+    monkeypatch.setattr(hw, "_materialize_dtensor", spy_materialize)
+    monkeypatch.setattr(hw, "_gather_expert_group", spy_gather_group)
+
+    exported = dict(export_hf_weights(TwoLayerExperts(cfg), cfg, _single_rank_parallel_state()))
+
+    # 4 experts/layer × 2 layers. Incremental flush => layer-0 group gathered at
+    # 4 materializations, layer-1 group at 8. The old all-at-end code would have
+    # snapshotted [8, 8] (every expert resident before the first gather).
+    assert snapshots == [4, 8]
+    assert set(exported) == {
+        "model.language_model.layers.0.mlp.experts.gate_up_proj",
+        "model.language_model.layers.1.mlp.experts.gate_up_proj",
+    }
