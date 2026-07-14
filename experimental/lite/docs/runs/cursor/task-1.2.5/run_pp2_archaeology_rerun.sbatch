@@ -21,6 +21,9 @@ REPO_ROOT=${REPO_ROOT:-$BASE/megatron_lite/Megatron-LM}
 STAGING=${STAGING:-}
 IMG=${IMG:-$BASE/env/pytorch_26.04-py3.sqsh}
 DSA_SITE=${DSA_SITE:-$BASE/mlite-2604-dsa-overlay/lib/python3.12/site-packages}
+# Full Megatron-LM tree supplying megatron.core (this branch is a lite-only
+# skeleton). REPO_ROOT's experimental/lite is layered on top via PYTHONPATH.
+CORE_TREE=${CORE_TREE:-$BASE/megatron_lite/Megatron-LM}
 WORK_DIR=${WORK_DIR:-${STAGING:-$REPO_ROOT}/experimental/lite/docs/runs/cursor/task-1.2.5}
 OUTPUT_DIR=$BASE/llmrl_runs/task-1.2.5/output
 mkdir -p $BASE/llmrl_runs/task-1.2.5/logs "$OUTPUT_DIR"
@@ -28,7 +31,7 @@ mkdir -p $BASE/llmrl_runs/task-1.2.5/logs "$OUTPUT_DIR"
 # srun --export=ALL,VAR only forwards vars present in this shell's *environment*;
 # locally-assigned vars must be exported or they arrive empty in the container
 # (job 13946170 died at 44s on "DSA_SITE required" for exactly this reason).
-export REPO_ROOT STAGING IMG DSA_SITE WORK_DIR OUTPUT_DIR
+export REPO_ROOT STAGING IMG DSA_SITE CORE_TREE WORK_DIR OUTPUT_DIR
 
 submit_ts=$(date -Is)
 running_ts=$(date -Is)
@@ -40,7 +43,7 @@ srun \
   --container-image="$IMG" \
   --container-mounts=/lustre:/lustre \
   --container-workdir="$REPO_ROOT" \
-  --export=ALL,REPO_ROOT,STAGING,DSA_SITE,WORK_DIR,OUTPUT_DIR,WORLD_SIZE=8 \
+  --export=ALL,REPO_ROOT,STAGING,DSA_SITE,CORE_TREE,WORK_DIR,OUTPUT_DIR,WORLD_SIZE=8 \
   bash "$WORK_DIR/run_pp2_archaeology_rerun.sh"
 rc=$?
 set -e

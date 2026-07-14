@@ -6,6 +6,14 @@ set -euo pipefail
 REPO_ROOT=${REPO_ROOT:?REPO_ROOT required}
 STAGING=${STAGING:-}
 DSA_SITE=${DSA_SITE:?DSA_SITE required}
+# The mlite repo (this branch) is a *skeleton*: its root holds only
+# experimental/ + README, with no megatron/core. Per experimental/lite/README,
+# experimental/lite is meant to live inside a full Megatron-LM tree that supplies
+# megatron.core. CORE_TREE points at that host tree; PYTHONPATH namespace-merges
+# megatron.lite (from this branch, the code under test) with megatron.core (from
+# CORE_TREE). CORE_TREE's own megatron/ has no lite subdir, so megatron.lite
+# always resolves to REPO_ROOT — we test today's HEAD lite against the host core.
+CORE_TREE=${CORE_TREE:?CORE_TREE required (full Megatron-LM tree supplying megatron.core)}
 WORK_DIR=${WORK_DIR:-${STAGING:-$REPO_ROOT}/experimental/lite/docs/runs/cursor/task-1.2.5}
 OUTPUT_DIR=${OUTPUT_DIR:-$WORK_DIR/output}
 mkdir -p "$OUTPUT_DIR"
@@ -25,7 +33,7 @@ fi
 # is a supplemental site-packages (custom kernels, no TE) layered via PYTHONPATH.
 export PATH="/usr/local/bin:/usr/bin:/bin"
 unset PYTHONHOME
-export PYTHONPATH="$DSA_SITE:$REPO_ROOT/experimental/lite:$REPO_ROOT"
+export PYTHONPATH="$DSA_SITE:$REPO_ROOT/experimental/lite:$CORE_TREE"
 export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8}
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=${NVTE_ALLOW_NONDETERMINISTIC_ALGO:-0}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
