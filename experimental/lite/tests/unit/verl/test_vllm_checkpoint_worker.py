@@ -1,5 +1,6 @@
 import inspect
 import json
+import os
 import sys
 from types import SimpleNamespace
 
@@ -109,6 +110,61 @@ def test_vllm_server_profile_keeps_shared_rollout_dependencies_on_thin_site(
     assert dependency_spec.origin == str(
         rollout_site / "compressed_tensors/__init__.py"
     )
+
+
+def test_vllm_server_profile_scopes_fat_overlay_cuda_libs_to_actor(
+    monkeypatch, tmp_path
+) -> None:
+    """A native-CUDA fat overlay exposes its bundled cutlass + cu13 libs only to
+    the rollout actor, leaving the cu128 training driver's env untouched."""
+    from verl_mlite.compat import _vllm_server_profile_env
+
+    rollout_site = tmp_path / "rollout"
+    cutlass = rollout_site / "nvidia_cutlass_dsl" / "python_packages"
+    cutlass.mkdir(parents=True)
+    nccl_lib = rollout_site / "nvidia" / "nccl" / "lib"
+    nccl_lib.mkdir(parents=True)
+    torch_lib = rollout_site / "torch" / "lib"
+    torch_lib.mkdir(parents=True)
+
+    monkeypatch.setenv("PYTHONPATH", "/training")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/local/cuda/lib64")
+    monkeypatch.setenv("VERL_MLITE_VLLM_SITE", str(rollout_site))
+    monkeypatch.delenv("VERL_MLITE_VLLM_LD_PRELOAD", raising=False)
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+
+    profile = _vllm_server_profile_env()
+
+    assert profile["PYTHONPATH"] == os.pathsep.join(
+        [str(cutlass), str(rollout_site), "/training"]
+    )
+    assert profile["LD_LIBRARY_PATH"] == os.pathsep.join(
+        [str(nccl_lib), str(torch_lib), "/usr/local/cuda/lib64"]
+    )
+    # No shim for a self-consistent fat overlay.
+    assert "LD_PRELOAD" not in profile
+
+
+def test_vllm_server_profile_thin_overlay_adds_no_cuda_libs(
+    monkeypatch, tmp_path
+) -> None:
+    """A thin overlay without bundled cutlass/cu13 dirs contributes no extra
+    PYTHONPATH prefix and no LD_LIBRARY_PATH — the pre-0.25 behavior is intact."""
+    from verl_mlite.compat import _vllm_server_profile_env
+
+    rollout_site = tmp_path / "rollout"
+    rollout_site.mkdir()
+
+    monkeypatch.setenv("PYTHONPATH", "/training")
+    monkeypatch.setenv("VERL_MLITE_VLLM_SITE", str(rollout_site))
+    monkeypatch.delenv("VERL_MLITE_VLLM_LD_PRELOAD", raising=False)
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+
+    profile = _vllm_server_profile_env()
+
+    assert profile["PYTHONPATH"] == os.pathsep.join([str(rollout_site), "/training"])
+    assert "LD_LIBRARY_PATH" not in profile
 
 
 def test_verl_vllm_headless_defaults_missing_api_server_count(monkeypatch) -> None:

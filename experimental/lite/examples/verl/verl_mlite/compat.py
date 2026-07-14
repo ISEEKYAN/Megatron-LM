@@ -104,18 +104,65 @@ def _install_vllm_triton_kernels_alias() -> bool:
     return True
 
 
+def _vllm_site_pythonpath_prefixes(site: str) -> list[str]:
+    """Extra PYTHONPATH entries a rollout overlay needs ahead of its site root.
+
+    Fat overlays (e.g. the native vLLM 0.25 DS4 closure) ship cutlass-dsl under
+    ``nvidia_cutlass_dsl/python_packages`` via a ``.pth`` that is NOT processed
+    when the site is reached through ``PYTHONPATH`` rather than site-packages
+    import. Without an explicit prefix a stray conda cutlass shadows it and
+    flashinfer dies with ``cute.nvgpu.OperandMajorMode``. Thin overlays that lack
+    the directory contribute nothing, so this stays a no-op for them.
+    """
+    prefixes: list[str] = []
+    cutlass = os.path.join(site, "nvidia_cutlass_dsl", "python_packages")
+    if os.path.isdir(cutlass):
+        prefixes.append(cutlass)
+    return prefixes
+
+
+def _vllm_site_ld_library_path(site: str) -> list[str]:
+    """CUDA runtime lib dirs a rollout overlay bundles for its own torch build.
+
+    A native-CUDA overlay (torch 2.11+cu130) colocated inside a cu128 training
+    container must expose its bundled ``nvidia/*/lib`` and ``torch/lib`` to the
+    rollout actor's loader, but ONLY to that actor — the training driver keeps
+    the container's cu128 stack. Scoping this to the vLLM Ray-actor runtime env
+    (rather than a process-wide LD_LIBRARY_PATH) is what keeps the two CUDA
+    majors from colliding. Overlays whose torch matches the container ship no
+    such dirs, so this returns nothing and stays a no-op.
+    """
+    import glob
+
+    lib_dirs = sorted(glob.glob(os.path.join(site, "nvidia", "*", "lib")))
+    torch_lib = os.path.join(site, "torch", "lib")
+    if os.path.isdir(torch_lib):
+        lib_dirs.append(torch_lib)
+    return [d for d in lib_dirs if os.path.isdir(d)]
+
+
 def _vllm_server_profile_env() -> dict[str, str]:
     """Build the dependency profile applied only to vLLM server Ray actors."""
     site = os.environ.get("VERL_MLITE_VLLM_SITE", "").strip()
     if not site:
         return {}
     pythonpath = os.environ.get("PYTHONPATH", "").strip()
-    # Keep vLLM's dependency closure on the thin site. The scoped compatibility
-    # alias above lets VERL import against that site's Transformers v5 build.
+    # Keep vLLM's dependency closure on the rollout site. The scoped compatibility
+    # alias above lets VERL import against that site's Transformers v5 build. Fat
+    # overlays additionally need their bundled cutlass ahead of the site root.
+    pythonpath_entries = _vllm_site_pythonpath_prefixes(site) + [site]
+    if pythonpath:
+        pythonpath_entries.append(pythonpath)
     result = {
-        "PYTHONPATH": f"{site}:{pythonpath}" if pythonpath else site,
+        "PYTHONPATH": os.pathsep.join(pythonpath_entries),
         "PYTHONNOUSERSITE": "1",
     }
+    ld_library_entries = _vllm_site_ld_library_path(site)
+    if ld_library_entries:
+        existing_ld = os.environ.get("LD_LIBRARY_PATH", "").strip()
+        if existing_ld:
+            ld_library_entries.append(existing_ld)
+        result["LD_LIBRARY_PATH"] = os.pathsep.join(ld_library_entries)
     shim = os.environ.get("VERL_MLITE_VLLM_LD_PRELOAD", "").strip()
     existing_preload = os.environ.get("LD_PRELOAD", "").strip()
     if shim:
