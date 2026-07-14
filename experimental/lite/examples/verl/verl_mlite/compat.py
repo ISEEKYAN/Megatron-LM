@@ -49,7 +49,13 @@ def _vllm_importable() -> bool:
     global _VLLM_IMPORTABLE
     if _VLLM_IMPORTABLE is None:
         try:
-            importlib.import_module("vllm")
+            # A bare ``import vllm`` only runs the lazy PEP-562 package shell and
+            # succeeds even where the real engine is unusable, so force the same
+            # entrypoint VERL pulls (``from vllm import LLM``). Accessing ``LLM``
+            # triggers the lazy load of vllm.entrypoints -> vllm.config ->
+            # vllm.platforms -> ``vllm._C``, i.e. the exact chain that dies on the
+            # driver with libcudart.so.12 / the torch-ABI mismatch.
+            getattr(importlib.import_module("vllm"), "LLM")
             _VLLM_IMPORTABLE = True
         except Exception:
             _VLLM_IMPORTABLE = False
