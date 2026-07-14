@@ -26,6 +26,35 @@ _VLLM_ROLLOUT_CONSUMER_MODULE = (
 )
 _REGISTERED_HF_CONFIG_TYPES: set[str] = set()
 
+_VLLM_IMPORTABLE: bool | None = None
+
+
+def _vllm_importable() -> bool:
+    """Whether ``import vllm`` succeeds in THIS process.
+
+    A fat rollout overlay (native vLLM 0.25 = torch 2.11+cu130, Transformers v5)
+    can only be imported inside the vLLM rollout Ray actor, which is scoped to
+    the overlay's torch + CUDA libs via the compat vLLM-server profile. The
+    training driver and worker processes keep the container/SM90 stack, whose
+    vllm build is ABI/CUDA-incompatible with this container — importing it there
+    dies with e.g. ``libcudart.so.12: cannot open shared object file`` (SM90's
+    CUDA-12 vllm in a CUDA-13 container) or the Transformers-v4/v5 mismatch.
+    Every vllm-touching patch below is therefore a no-op wherever vllm is
+    unimportable, so importing verl_mlite on the driver (hydra config
+    validation instantiates the engine module tree, which used to eagerly import
+    the rollout vllm utils) and running apply_runtime_patches there no longer
+    crash on the rollout engine's vllm. The result is cached because the import
+    outcome is fixed per process and a failed attempt is slow to retry.
+    """
+    global _VLLM_IMPORTABLE
+    if _VLLM_IMPORTABLE is None:
+        try:
+            importlib.import_module("vllm")
+            _VLLM_IMPORTABLE = True
+        except Exception:
+            _VLLM_IMPORTABLE = False
+    return _VLLM_IMPORTABLE
+
 
 def _register_opaque_hf_config() -> bool:
     """Let VERL preserve config fields for an MLite-owned model type."""
@@ -112,6 +141,8 @@ def _patch_transformers_vision2seq_alias() -> bool:
 def _install_vllm_triton_kernels_alias() -> bool:
     """Prefer the rollout vLLM's complete vendored Triton kernel package."""
     if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
+        return False
+    if not _vllm_importable():
         return False
     vendored = importlib.import_module("vllm.third_party.triton_kernels")
     if sys.modules.get("triton_kernels") is vendored:
@@ -211,6 +242,8 @@ def _patch_verl_vllm_headless_api_server_count() -> bool:
     """Normalize vLLM's headless API server count for VERL's direct caller."""
     if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
         return False
+    if not _vllm_importable():
+        return False
 
     server_module = importlib.import_module(_VLLM_ASYNC_SERVER_MODULE)
     original_run_headless = server_module.run_headless
@@ -235,6 +268,8 @@ def _patch_verl_vllm_headless_api_server_count() -> bool:
 def _patch_vllm_server_profile() -> bool:
     profile = _vllm_server_profile_env()
     if not profile:
+        return False
+    if not _vllm_importable():
         return False
     changed = _patch_verl_vllm_headless_api_server_count()
     server_module = importlib.import_module(_VLLM_ASYNC_SERVER_MODULE)
@@ -273,6 +308,8 @@ def _normalize_vllm_visible_device_id(device_id: int) -> int:
 def _patch_verl_vllm_device_uuid() -> bool:
     """Keep VERL/vLLM UUID lookup on the Ray actor's visible CUDA device."""
     if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
+        return False
+    if not _vllm_importable():
         return False
 
     utils = importlib.import_module("verl.workers.rollout.vllm_rollout.utils")
