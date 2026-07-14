@@ -17,7 +17,15 @@ if [[ -n "$STAGING" ]]; then
     "$REPO_ROOT/experimental/lite/examples/bench/session.py"
 fi
 
-export PYTHONPATH="$DSA_SITE:$REPO_ROOT/experimental/lite:$REPO_ROOT:${PYTHONPATH:-}"
+# srun --export=ALL leaks the host login-node PATH into the container, which puts
+# bayan's host miniforge python3 (broken/uncompiled Transformer Engine) ahead of
+# the container's own python3.12. Pin PATH to the container toolchain so we use
+# /usr/bin/python3.12 + /usr/local/bin/torchrun with the container's working TE
+# (/usr/local/lib/python3.12/dist-packages/transformer_engine). The DSA overlay
+# is a supplemental site-packages (custom kernels, no TE) layered via PYTHONPATH.
+export PATH="/usr/local/bin:/usr/bin:/bin"
+unset PYTHONHOME
+export PYTHONPATH="$DSA_SITE:$REPO_ROOT/experimental/lite:$REPO_ROOT"
 export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8}
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=${NVTE_ALLOW_NONDETERMINISTIC_ALGO:-0}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
