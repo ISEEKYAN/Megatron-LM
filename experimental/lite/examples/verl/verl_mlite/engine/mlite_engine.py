@@ -27,7 +27,11 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl_mlite.compat import load_verl_engine_api
 from verl_mlite.resync_export import (
+    format_resync_memcurve_line,
     resync_export_empty_cache_threshold_bytes,
+    resync_memcurve_enabled,
+    resync_memcurve_memlog_path,
+    resync_memcurve_record,
     stream_export_with_empty_cache,
 )
 
@@ -396,7 +400,62 @@ class MegatronLiteEngine(BaseEngine):
             resync_export_empty_cache_threshold_bytes(),
             lambda: aggressive_empty_cache(force_sync=True),
         )
+        if resync_memcurve_enabled() and torch.cuda.is_available():
+            streamed = self._stream_resync_memcurve(streamed)
         return streamed, None
+
+    def _stream_resync_memcurve(self, streamed):
+        """Instrument the resync export stream to record its true per-cycle peak.
+
+        Off unless ``MLITE_RESYNC_MEMCURVE`` / ``MLITE_RESYNC_MEMLOG_PATH`` is
+        set, so production resync is unaffected. Ported from the DS4 resync
+        memory protocol: the coarse curve snapshots understate the transient
+        full-model all-gather peak, so ``max_memory_allocated`` is reset per
+        exported tensor and the worst single-tensor peak dominates the reported
+        ``export_peak_max_alloc_gib``. Every rank emits (the OOM rank need not be
+        the nvidia-smi–sampled head node). Instrumentation only — the export
+        semantics are untouched here (the streaming fix is a separate change).
+        """
+
+        def snapshot(tag: str) -> dict:
+            return {
+                "tag": tag,
+                "allocated_gib": torch.cuda.memory_allocated() / (1024**3),
+                "max_allocated_gib": torch.cuda.max_memory_allocated() / (1024**3),
+                "reserved_gib": torch.cuda.memory_reserved() / (1024**3),
+            }
+
+        curve = [snapshot("resync/enter")]
+        torch.cuda.reset_peak_memory_stats()
+        curve.append(snapshot("resync/export_begin"))
+        worst = {"name": None, "peak_bytes": 0}
+        try:
+            for item in streamed:
+                peak = torch.cuda.max_memory_allocated()
+                if peak > worst["peak_bytes"]:
+                    worst = {
+                        "name": item[0] if isinstance(item, tuple) else None,
+                        "peak_bytes": peak,
+                    }
+                yield item
+                del item
+                torch.cuda.reset_peak_memory_stats()
+        finally:
+            curve.append(snapshot("resync/export_end"))
+            self._emit_resync_memcurve(curve, worst)
+
+    def _emit_resync_memcurve(self, curve: list, worst: dict) -> None:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(format_resync_memcurve_line(rank, curve, worst), flush=True)
+        path = resync_memcurve_memlog_path()
+        if path:
+            import json
+
+            try:
+                with open(path, "a") as fh:
+                    fh.write(json.dumps(resync_memcurve_record(rank, curve, worst)) + "\n")
+            except OSError:
+                pass
 
     def get_data_parallel_size(self):
         if self.handle is None:

@@ -10,7 +10,14 @@ import torch
 from verl_mlite.resync_export import (
     _DEFAULT_RESYNC_EXPORT_EMPTY_CACHE_GIB,
     _RESYNC_EXPORT_EMPTY_CACHE_GIB_ENV,
+    _RESYNC_MEMCURVE_ENV,
+    _RESYNC_MEMLOG_PATH_ENV,
+    format_resync_memcurve_line,
     resync_export_empty_cache_threshold_bytes,
+    resync_memcurve_enabled,
+    resync_memcurve_memlog_path,
+    resync_memcurve_peak_gib,
+    resync_memcurve_record,
     stream_export_with_empty_cache,
 )
 
@@ -97,3 +104,64 @@ def test_threshold_bad_value_falls_back_to_default(monkeypatch):
     assert resync_export_empty_cache_threshold_bytes() == int(
         _DEFAULT_RESYNC_EXPORT_EMPTY_CACHE_GIB * (1024**3)
     )
+
+
+# ── MEMCURVE instrumentation (pure gating/formatting) ──────────────────────
+
+
+def test_memcurve_disabled_by_default():
+    assert resync_memcurve_enabled({}) is False
+
+
+def test_memcurve_enabled_by_flag_or_memlog_path():
+    assert resync_memcurve_enabled({_RESYNC_MEMCURVE_ENV: "1"}) is True
+    assert resync_memcurve_enabled({_RESYNC_MEMLOG_PATH_ENV: "/tmp/x.jsonl"}) is True
+    # An empty value must not enable (matches the empty-cache env's semantics).
+    assert resync_memcurve_enabled({_RESYNC_MEMCURVE_ENV: ""}) is False
+
+
+def test_memlog_path_returns_none_when_unset_or_empty():
+    assert resync_memcurve_memlog_path({}) is None
+    assert resync_memcurve_memlog_path({_RESYNC_MEMLOG_PATH_ENV: ""}) is None
+    assert resync_memcurve_memlog_path({_RESYNC_MEMLOG_PATH_ENV: "/a/b"}) == "/a/b"
+
+
+def _curve():
+    # export_begin low, a mid snapshot high, export_end back low — the coarse
+    # snapshots miss the true transient peak captured per-tensor in `worst`.
+    return [
+        {"tag": "resync/enter", "allocated_gib": 9.6, "max_allocated_gib": 9.6},
+        {"tag": "resync/export_begin", "allocated_gib": 9.6, "max_allocated_gib": 9.6},
+        {"tag": "resync/export_end", "allocated_gib": 9.7, "max_allocated_gib": 40.0},
+    ]
+
+
+def test_peak_is_dominated_by_worst_single_tensor():
+    # worst tensor peak (58 GiB) exceeds any coarse snapshot (40 GiB).
+    worst = {"name": "layers.0.mlp", "peak_bytes": 58 * (1024**3)}
+    assert resync_memcurve_peak_gib(_curve(), worst) == 58.0
+
+
+def test_peak_falls_back_to_snapshot_when_worst_is_smaller():
+    worst = {"name": None, "peak_bytes": 0}
+    assert resync_memcurve_peak_gib(_curve(), worst) == 40.0
+
+
+def test_format_line_is_grepable_and_reports_peak():
+    worst = {"name": "layers.0.mlp", "peak_bytes": 58 * (1024**3)}
+    line = format_resync_memcurve_line(3, _curve(), worst)
+    assert line.startswith("MLITE_RESYNC_MEMCURVE rank=3 ")
+    assert "resync/export_begin=9.600" in line
+    assert "worst_tensor=layers.0.mlp" in line
+    assert "export_peak_max_alloc_gib=58.000" in line
+
+
+def test_record_is_jsonl_serialisable():
+    import json
+
+    worst = {"name": "layers.0.mlp", "peak_bytes": 58 * (1024**3)}
+    rec = resync_memcurve_record(7, _curve(), worst)
+    assert rec["rank"] == 7
+    assert rec["worst_tensor"] == "layers.0.mlp"
+    assert rec["export_peak_max_alloc_gib"] == 58.0
+    json.dumps(rec)  # must not raise
