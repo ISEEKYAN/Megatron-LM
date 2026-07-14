@@ -7,6 +7,8 @@ import hashlib
 from collections.abc import Callable
 from typing import Any
 
+from verl_mlite.rollout.layer_cluster import LayerClusterBuffer
+
 
 def _runner_model(model_runner: Any) -> Any:
     get_model = getattr(model_runner, "get_model", None)
@@ -39,7 +41,13 @@ def reload_checkpoint_buckets(
 
     model = _runner_model(model_runner)
     initialize(model)
-    receive(model.load_weights)
+    # IPC byte buckets may split one HF layer across multiple ZMQ rounds.
+    # vLLM's layerwise reload defers processing until each submodule has received
+    # all of its weights; feeding multiple layers in one load_weights call leaves
+    # many submodules in the deferred staging state at once (r1-r11 receiver peak).
+    cluster = LayerClusterBuffer(model.load_weights)
+    receive(cluster.ingest_bucket)
+    cluster.finalize()
     finalize(model, _runner_model_config(model_runner))
 
 

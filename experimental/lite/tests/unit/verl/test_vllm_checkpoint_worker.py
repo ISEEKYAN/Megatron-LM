@@ -507,8 +507,8 @@ def test_checkpoint_bucket_reload_has_one_lifecycle_for_all_buckets() -> None:
     runner = SimpleNamespace(model=model, model_config=object())
 
     def receive(callback):
-        callback([("w1.weight", object()), ("w1.scale", object())])
-        callback([("w2.weight", object()), ("w2.scale", object())])
+        callback([("layers.0.attn.wq_a.weight", object()), ("layers.0.attn.wq_a.scale", object())])
+        callback([("layers.1.attn.wq_a.weight", object()), ("layers.1.attn.wq_a.scale", object())])
 
     reload_checkpoint_buckets(
         runner,
@@ -519,9 +519,43 @@ def test_checkpoint_bucket_reload_has_one_lifecycle_for_all_buckets() -> None:
 
     assert events == [
         ("begin", model),
-        ("load", ["w1.weight", "w1.scale"]),
-        ("load", ["w2.weight", "w2.scale"]),
+        ("load", ["layers.0.attn.wq_a.weight", "layers.0.attn.wq_a.scale"]),
+        ("load", ["layers.1.attn.wq_a.weight", "layers.1.attn.wq_a.scale"]),
         ("finish", model, runner.model_config),
+    ]
+
+
+def test_checkpoint_bucket_reload_splits_mixed_layer_ipc_buckets() -> None:
+    from verl_mlite.rollout.vllm_worker import reload_checkpoint_buckets
+
+    events = []
+
+    class Model:
+        def load_weights(self, weights):
+            events.append([name for name, _ in weights])
+
+    model = Model()
+    runner = SimpleNamespace(model=model, model_config=object())
+
+    def receive(callback):
+        callback(
+            [
+                ("layers.0.attn.wq_a.weight", object()),
+                ("layers.1.attn.wq_a.weight", object()),
+            ]
+        )
+        callback([("layers.1.attn.wq_a.scale", object())])
+
+    reload_checkpoint_buckets(
+        runner,
+        receive,
+        initialize=lambda _model: None,
+        finalize=lambda _model, _config: None,
+    )
+
+    assert events == [
+        ["layers.0.attn.wq_a.weight"],
+        ["layers.1.attn.wq_a.weight", "layers.1.attn.wq_a.scale"],
     ]
 
 

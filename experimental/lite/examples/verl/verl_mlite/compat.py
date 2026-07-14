@@ -244,10 +244,13 @@ class _SyncBucketProducer:
     """Pack one sender bucket at a time into a caller-owned staging slot."""
 
     def __init__(self, weights, bucket_size: int):
+        from verl_mlite.rollout.layer_cluster import resync_layer_cluster_key
+
         self._weights = iter(weights)
         self._bucket_size = bucket_size
         self._pending = None
         self._exhausted = False
+        self._layer_cluster_key = resync_layer_cluster_key
 
     def next_bucket(self, staging):
         import torch
@@ -259,6 +262,7 @@ class _SyncBucketProducer:
 
         offset = 0
         bucket_meta = {}
+        bucket_layer_key = None
         while True:
             try:
                 if self._pending is None:
@@ -272,12 +276,23 @@ class _SyncBucketProducer:
                     return "eof", None, None, 0, None, True
                 break
 
+            layer_key = self._layer_cluster_key(name)
+            if (
+                bucket_meta
+                and bucket_layer_key is not None
+                and layer_key != bucket_layer_key
+            ):
+                self._pending = (name, weight)
+                break
+
             if offset + weight.nbytes > self._bucket_size and bucket_meta:
                 self._pending = (name, weight)
                 break
             if weight.nbytes > self._bucket_size:
                 return "direct", name, weight, 0, None, False
 
+            if not bucket_meta:
+                bucket_layer_key = layer_key
             bucket_meta[name] = {
                 "name": name,
                 "shape": weight.shape,
