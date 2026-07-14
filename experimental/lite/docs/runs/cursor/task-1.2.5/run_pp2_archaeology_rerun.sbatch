@@ -15,12 +15,20 @@ WD_PID=$!
 
 BASE=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code
 REPO_ROOT=${REPO_ROOT:-$BASE/megatron_lite/Megatron-LM}
-STAGING=${STAGING:-$BASE/llmrl_runs/task-1.2.5/staging}
+# STAGING is optional: when empty the run script uses the harness/bench that
+# already live in REPO_ROOT (correct once REPO_ROOT is checked out to the branch
+# under test) and skips the staging copy-over.
+STAGING=${STAGING:-}
 IMG=${IMG:-$BASE/env/pytorch_26.04-py3.sqsh}
 DSA_SITE=${DSA_SITE:-$BASE/mlite-2604-dsa-overlay/lib/python3.12/site-packages}
-WORK_DIR=$STAGING/experimental/lite/docs/runs/cursor/task-1.2.5
+WORK_DIR=${WORK_DIR:-${STAGING:-$REPO_ROOT}/experimental/lite/docs/runs/cursor/task-1.2.5}
 OUTPUT_DIR=$BASE/llmrl_runs/task-1.2.5/output
 mkdir -p $BASE/llmrl_runs/task-1.2.5/logs "$OUTPUT_DIR"
+
+# srun --export=ALL,VAR only forwards vars present in this shell's *environment*;
+# locally-assigned vars must be exported or they arrive empty in the container
+# (job 13946170 died at 44s on "DSA_SITE required" for exactly this reason).
+export REPO_ROOT STAGING IMG DSA_SITE WORK_DIR OUTPUT_DIR
 
 submit_ts=$(date -Is)
 running_ts=$(date -Is)
