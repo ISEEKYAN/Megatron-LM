@@ -68,6 +68,22 @@ def _install_vllm_thin_finder() -> bool:
     site = os.environ.get("VERL_MLITE_VLLM_SITE", "").strip()
     if not site:
         return False
+    # A THIN overlay ships vllm but no torch: the container/training torch is
+    # shared, so this global meta-path finder can safely redirect EVERY process's
+    # ``import vllm`` (driver + rollout) to the overlay. A FAT overlay instead
+    # bundles its own torch (native vLLM 0.25 = torch 2.11+cu130) and a newer
+    # vllm whose hard Transformers-v5 requirement mismatches the training
+    # driver's Transformers-v4 stack. It must reach ONLY the rollout Ray actor,
+    # which acquires it through the scoped verl_mlite.compat vLLM-server profile
+    # (its site is prepended to that actor's PYTHONPATH). Installing a global
+    # finder for a fat overlay forces the driver's incidental ``import vllm``
+    # (verl config validation instantiates the rollout module tree) onto the fat
+    # vllm 0.25 and dies with "Support for Transformers v4 ... removed in vLLM
+    # v0.24.0" (job 13956329). The presence of bundled CUDA libs distinguishes a
+    # fat overlay, so skip the global finder for it and let the driver keep its
+    # own (container/SM90) vllm.
+    if _vllm_site_ld_library_path(site):
+        return False
     if any(
         getattr(finder, "_verl_mlite_vllm_thin_finder", False)
         for finder in sys.meta_path
