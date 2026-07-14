@@ -40,14 +40,13 @@ if (( product != expected )); then
   exit 2
 fi
 
-export USE_THD=${USE_THD:-False}
 export USE_FUSED_KERNELS=${USE_FUSED_KERNELS:-False}
-export FILTER_OVERLONG=${FILTER_OVERLONG:-False}
+export USE_DYNAMIC_BSZ=${USE_DYNAMIC_BSZ:-False}
 
-echo "Q35_FSDP2_PP2_STEP1 geo=TP${TP}PP${PP}CP${CP}EP${EP} steps=${TOTAL_TRAINING_STEPS} batch=${TRAIN_BATCH_SIZE} seqlen=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) rollout_tp=${GEN_TP} use_thd=${USE_THD} fused=${USE_FUSED_KERNELS}"
+echo "Q35_FSDP2_PP2_STEP1 geo=TP${TP}PP${PP}CP${CP}EP${EP} steps=${TOTAL_TRAINING_STEPS} batch=${TRAIN_BATCH_SIZE} seqlen=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) rollout_tp=${GEN_TP} fused=${USE_FUSED_KERNELS} dynamic_bsz=${USE_DYNAMIC_BSZ}"
 
-# Extra hydra overrides: PP2+THD 在 job13941926 触发 2206/2213 token 不齐→FSDP2 _local_tensor 次生错误。
+# job13941926: RoPE 2206 vs 2213 under PP2+THD+fused; job13942665: use_thd=False rejected by engine.
 exec bash "$BASE_SCRIPT" \
-  "actor_rollout_ref.actor.engine.impl_cfg.use_thd=${USE_THD}" \
   "actor_rollout_ref.model.use_fused_kernels=${USE_FUSED_KERNELS}" \
-  "data.filter_overlong_prompts=${FILTER_OVERLONG}"
+  "actor_rollout_ref.actor.use_dynamic_bsz=${USE_DYNAMIC_BSZ}" \
+  "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${USE_DYNAMIC_BSZ}"
