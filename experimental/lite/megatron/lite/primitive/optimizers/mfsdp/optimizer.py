@@ -34,6 +34,7 @@ from megatron.lite.primitive.optimizers.mfsdp.wrapper import (
 )
 
 ExpertClassifierFn = Callable[[str], bool]
+_MFSDP_PARAM_VALUES_KEY = "_mfsdp_param_values"
 
 
 def _override(opt: Any, name: str, default: Any) -> Any:
@@ -154,10 +155,22 @@ class _StandaloneOptimizer:
         return float(total_norm.float().item())
 
     def state_dict(self) -> dict[str, Any]:
-        return self.optimizer.state_dict()
+        state = self.optimizer.state_dict()
+        state[_MFSDP_PARAM_VALUES_KEY] = [
+            [param.detach().cpu().clone() for param in group["params"]]
+            for group in self.optimizer.param_groups
+        ]
+        return state
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.optimizer.load_state_dict(state_dict)
+        state = dict(state_dict)
+        param_values = state.pop(_MFSDP_PARAM_VALUES_KEY, None)
+        self.optimizer.load_state_dict(state)
+        if param_values is not None:
+            with torch.no_grad():
+                for group, group_values in zip(self.optimizer.param_groups, param_values, strict=True):
+                    for param, value in zip(group["params"], group_values, strict=True):
+                        param.copy_(value.to(device=param.device, dtype=param.dtype))
 
     def offload_state_to_cpu(self) -> None:
         self._offloaded_state_devices.clear()
@@ -437,6 +450,8 @@ def _build_param_groups(
             if not param.requires_grad or id(param) in seen:
                 continue
             seen.add(id(param))
+            if param.numel() == 0:
+                continue
             params.append(param)
             normalized_name = name.removeprefix("module.")
             if classifier(normalized_name):
