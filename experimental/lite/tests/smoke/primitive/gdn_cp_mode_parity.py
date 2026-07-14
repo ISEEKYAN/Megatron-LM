@@ -36,11 +36,13 @@ import traceback
 import torch
 import torch.distributed as dist
 
-# --- proxy geometry: real Qwen3.5 GDN head dims (dk=dv=128, conv=4), few heads ---
+# --- proxy geometry: REAL Qwen3.5 GDN head config (16 k / 32 v heads, dk=dv=128,
+# conv=4). Head counts are kept real (not truncated) because headwise CP shards
+# heads across ranks, so num_k_heads must stay divisible by cp_size (>=4 here). ---
 HIDDEN = 256
-NUM_K_HEADS = 2
+NUM_K_HEADS = 16
 K_HEAD_DIM = 128
-NUM_V_HEADS = 4
+NUM_V_HEADS = 32
 V_HEAD_DIM = 128
 CONV_KERNEL = 4
 RMS_EPS = 1e-6
