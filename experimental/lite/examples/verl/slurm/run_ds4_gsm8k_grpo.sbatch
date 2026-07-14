@@ -187,7 +187,15 @@ export VERL_MLITE_HF_CONFIG_MODEL_TYPE=deepseek_v4
 export VERL_MLITE_VLLM_SITE="${DS4_VLLM_SITE}"
 export VERL_MLITE_VLLM_LD_PRELOAD="${DS4_VLLM_SHIM}"
 export LD_PRELOAD="${DS4_VLLM_SHIM}"
-export PYTHONPATH="${MLITE_SM90_SITE}/nvidia_cutlass_dsl/python_packages:${MLITE_SM90_SITE}:${DS4_VLLM_SITE}:${VERL_ROOT}:${MEGATRON_ROOT}:${MLITE_SRC}/experimental/lite/examples/verl:${MLITE_SRC}/experimental/lite:${MLITE_SRC}"
+# The DS4 vLLM rollout overlay is NOT placed on the driver/training PYTHONPATH.
+# A thin overlay (torch ABI shim) bundles no torch, so putting it here was
+# harmless; a fat overlay (native vLLM 0.25 = torch 2.11+cu130) DOES bundle a
+# full torch that would shadow the container's cu128 torch for the training
+# workers, which have no cu130 libs on LD_LIBRARY_PATH and would crash. The
+# rollout Ray actor re-acquires the overlay (its site + cutlass + cu13 libs)
+# through the scoped verl_mlite.compat vLLM-server profile, so the rollout still
+# imports vllm/torch from the overlay while training keeps the container stack.
+export PYTHONPATH="${MLITE_SM90_SITE}/nvidia_cutlass_dsl/python_packages:${MLITE_SM90_SITE}:${VERL_ROOT}:${MEGATRON_ROOT}:${MLITE_SRC}/experimental/lite/examples/verl:${MLITE_SRC}/experimental/lite:${MLITE_SRC}"
 export TMPDIR="/tmp/ds4-grpo-${SLURM_JOB_ID}-${SLURM_PROCID}"
 export PYTHONPYCACHEPREFIX="${TMPDIR}/pycache"
 # Persistent JIT/compile cache root on lustre, shared across jobs so the
