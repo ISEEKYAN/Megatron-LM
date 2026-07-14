@@ -137,14 +137,11 @@ def run_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world):
         )
         cp_out = cp_mod(local_x)  # [S_local, B, H]
 
-        # gather cp outputs into full zigzag order for reporting is unnecessary;
-        # compare each rank's local out vs zigzag slice of ref out.
-        ref_local_out = None
+        # Compare each rank's local out vs the zigzag slice of the reference out.
         if rank == 0:
             ref_x = full_x.detach().requires_grad_(True)
             with torch.enable_grad():
                 ref_out = ref_mod(ref_x)
-            ref_local0 = zigzag_slice_for_cp(ref_out, 0, cp_size, seq_dim=0)
             # backward on reference with the zigzag-sliced cotangent (full)
             ref_out.backward(ref_cotangent)
             ref_in_grad_full = ref_x.grad.detach().clone()

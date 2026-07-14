@@ -1,97 +1,57 @@
 # Qwen3.5 GatedDeltaNet `gdn_cp_mode` parity proxy
 
-Answers TASK "qwen3.5 gdn_cp_mode=shared 精度问题": is the `sharded` CP execution
-strategy numerically consistent with the default `replicated` strategy and with
-CP-off, for the native Qwen3.5 GatedDeltaNet primitive?
+Answers TASK-1.1.7.1: provide a context-parallel GatedDeltaNet linear-attention
+that is **numerically exact** vs CP-off (so RL train/inference log-probs match),
+while still sharding per-head memory across CP ranks.
 
-## Mode mapping (aligned with `dead_ends/cp.md` history)
-| current `gdn_cp_mode` | strategy | history |
-| --- | --- | --- |
-| `replicated` (default) | all-gather full seq → compute full → zigzag-slice | correctness-first, ex-`legacy_full_gather` |
-| `sharded` | zigzag→contiguous swap → FLA `cp_context` ring → swap back | ex-`fla_allgather`, C2 state-passing family |
+## Modes (post-port)
+| `gdn_cp_mode` | strategy | numerics vs CP-off | memory |
+| --- | --- | --- | --- |
+| `headwise` (default) | head-parallel all-to-all: each rank holds the full seq for `1/cp` heads (+ matching conv1d/A_log/dt_bias slices), runs the ordinary full-seq recurrence, a2a back | **bitwise-exact** (heads independent) | per-head state/activations sharded across ranks |
+| `replicated` | all-gather full seq → compute every head on every rank → zigzag-slice | bitwise-exact | full seq for all heads on every rank (worst) |
 
-Task phrase "默认 cp vs shared cp" = `replicated` vs `sharded`.
+The former `sharded` mode (FLA `cp_context` chunkwise ring) was **removed**: its
+cross-rank chunk-state accumulation order differs from the reference, and under RL
+that bf16-reassociation gap amplified into a ~220× step-1 `ppo_kl` (train/inference
+log-prob mismatch). `headwise` is the upstream Megatron answer for exact + sharded.
+
+Ported from **NVIDIA/Megatron-LM@d1384c2d9** `megatron/core/ssm/gated_delta_net.py`
+(`linear_cp_mode='headwise'`: `tensor_a2a_cp2hp`/`hp2cp`, `_build_head_perm_for_split_sections`,
+`get_parameter_local_cp_headwise`). Fetched 2026-07-14.
 
 ## What the harness measures
 `tests/smoke/primitive/gdn_cp_mode_parity.py` builds a tiny **proxy** GDN
 (REAL head dims `dk=dv=128`, `conv_kernel=4`; only head COUNT + seq truncated,
 because dim=4 probes are non-representative per K-0125). Input is **SBHD**
-`x = [seq, batch, hidden]` (the primitive's native layout — `in_proj(x)` then
-`transpose(0,1)`), zigzag-sharded along the seq dim. Per CP size in `{2, 4}`:
+`x = [seq, batch, hidden]`, zigzag-sharded along the seq dim. Per CP size in `{2,4}`:
 
-1. CP-off reference: identical-weight `cp_size==1` module on the FULL sequence
-   (rank 0) — the baseline. Weights are randomized (incl. `A_log`/`dt_bias`, so
-   gating is non-trivial) and broadcast so every rank/mode shares them bitwise.
-2. `replicated` and `sharded` at that CP size, each rank fed its zigzag shard.
-3. Per-tensor diff (`max_abs` / `max_rel`) of:
-   - forward **output** vs the zigzag slice of the reference output,
-   - **input-activation grad** vs the zigzag slice of the reference input grad,
-   - **weight grads** — CP-all-reduced (sum over the CP group) then compared to
-     the reference weight grads (worst tensor reported).
-4. `localize_sharded`: taps the sharded module's per-stage tensors
-   (`swap_in` / `conv` / `rule` / `swap_out`) and diffs the sharded vs replicated
-   final output on identical weights+input.
+1. CP-off reference: identical-weight `cp_size==1` module on the FULL sequence.
+2. `headwise` and `replicated` at that CP size, each rank fed its zigzag shard.
+3. Per-tensor diff (`max_abs`/`max_rel`) of forward output, input-activation grad,
+   and CP-all-reduced weight grads, vs the reference (zigzag-sliced). Both modes are
+   expected bitwise-exact in forward (`max_abs == 0`); grads carry ordinary bf16
+   backward reassociation noise.
 
-## Results (job `13950929`, 8×H100 single node, COMPLETED rc=0, ~1.4 GPU-h)
+## CPU plumbing check (no GPU)
+`headwise`'s only new distributed code is the cp2hp/hp2cp redistribution. A CPU
+gloo CP4 round-trip test confirms it is **lossless / bitwise** (`cp2hp_max_abs=0`,
+`hp2cp_max_abs=0`) against the ground-truth full-sequence layout. Since the per-head
+conv/recurrence arithmetic is unchanged from the verified `replicated` path and
+heads are independent, a correct redistribution ⇒ `headwise == CP-off` bitwise.
 
-`fwd`/`in_grad`/`w_grad` are `max_rel` (bf16). Reference = CP-off full sequence.
-
-| CP | mode | fwd max_rel | in_grad max_rel | w_grad max_rel (worst) |
-| --- | --- | --- | --- | --- |
-| 2 | `replicated` | **0.000e+00** (bitwise) | 3.7e-3 | 5.7e-3 (`in_proj.linear.weight`) |
-| 2 | `sharded` | 7.96e-3 | 7.5e-3 | 1.4e-2 (`in_proj.linear.weight`) |
-| 4 | `replicated` | **0.000e+00** (bitwise) | 7.5e-3 | 5.7e-3 (`in_proj.linear.weight`) |
-| 4 | `sharded` | 7.96e-3 | 7.6e-3 | 1.98e-2 (`in_proj.linear.weight`) |
-
-`localize_sharded`: `sharded_vs_replicated_out` max_rel 6.9e-3 (CP2) / 8.9e-3 (CP4).
-
-Raw log: `evidence/slurm-13950929.completed.out`.
-
-## Verdict (AC #2 — where does `sharded` deviate, and is it a bug?)
-
-**`replicated` (default) is bitwise-exact in forward** (`max_abs = 0.000e+00`) at
-both CP2 and CP4 — its all-gather → full-seq compute → zigzag-slice path adds
-**zero** forward error; its ~4–6e-3 grad diffs are ordinary bf16 backward
-reassociation noise.
-
-**`sharded`'s deviation is NOT in any gather/split step:**
-- The zigzag↔contiguous swaps (`_cp_swap_qkvzba` → `_zigzag_contiguous_chunk_swap`)
-  are a **pure chunk-level all-to-all** — slice / cat / `all_to_all`, **zero
-  arithmetic** — so they are lossless by construction and cannot introduce numeric
-  error.
-- The `replicated` all-gather is empirically bitwise-exact (above).
-- Therefore the ~8e-3 forward deviation can only originate in the **FLA
-  `cp_context` chunked ring recurrence** (`_gated_delta_rule` / `_causal_conv1d`
-  with `cp_context`), which is a genuinely different arithmetic order than the
-  full-sequence kernel.
-
-**It is the bf16 rounding floor, not a correctness defect:**
-- 7.96e-3 max_rel ≈ 2 ULP of bf16 (bf16 eps ≈ 3.9e-3), the same order as
-  `replicated`'s own bf16 backward noise.
-- The forward deviation is **flat** across CP2 and CP4 (both 7.96e-3). A real
-  gather/split indexing bug would give O(1) relative error (wrong tokens) and
-  would **grow** with more ring hops; a flat ULP-floor deviation is reassociation
-  noise inherent to chunked cross-rank state passing.
-
-**Fix direction:** no code fix is required for correctness — `sharded` is
-numerically sound within bf16. If exact `replicated`-parity is ever needed
-(e.g. bitwise reproducibility), keep the ring but (a) confirm the FLA
-`cp_context` chunk-state accumulator runs in fp32 (state carry is the only place
-reassociation compounds), or (b) select `gdn_cp_mode="replicated"` for
-correctness-critical runs. The observed ~8e-3 is acceptable for training and is
-consistent with K-0125 (real Qwen3.5 GDN CP is numerically fine; earlier "CP
-issues" were env/overlay, not the ring math).
+## Results (GPU proxy A/B)
+_Pending the post-port GPU rerun (pre-GPU review gate first)._ Prior `replicated`
+baseline (job `13950929`) was bitwise-exact in forward at CP2/CP4; the rerun adds
+the `headwise` column and is expected bitwise-exact there too. Old `sharded` numbers
+(~7.96e-3 forward) are retired with the mode.
 
 ## Environment (reuse, do not reinvent — see durable `mlite_env_setup`, K-0123)
 - image: `verl.vllm023.sqsh` (qwen3.5 line canonical).
 - overlay: `qwen35-cp-overlay-20260613/site` on `PYTHONPATH` + `tvm_ffi/lib` on
-  `LD_LIBRARY_PATH` — REQUIRED for `sharded` (FLA/tilelang kernels). Without it
-  FLA reports "Please install tilelang"; that is an env gap, NOT a CP-ring hang.
-  (Job `13950849` FAILED here for exactly this reason before the overlay was added.)
+  `LD_LIBRARY_PATH` — provides FLA/tilelang kernels used by the non-deterministic
+  compute path. Without it FLA reports "Please install tilelang" (env gap, not a hang).
 
 ## Reproduce
-`run_gdn_cp_parity.sbatch` is the exact as-run recipe (self-contained; paths point
-at the `runtime/gdn-cpmode-parity-1171` workspace on cw lustre). It rsyncs the
-mlite worktree into `$R/mlite`, drops the harness at `$R/gdn_cp_mode_parity.py`,
-and runs CP2 then CP4 under `torchrun` in one `srun`. Grep the log for
-`GDN_CP_PARITY` (matrix), `GDN_CP_LOCALIZE` (stage report), `GDN_CP_PARITY_DONE`.
+`run_gdn_cp_parity.sbatch` is the as-run recipe: rsync the mlite worktree into
+`$R/mlite`, drop the harness at `$R/gdn_cp_mode_parity.py`, run CP2 then CP4 under
+`torchrun` in one `srun`. Grep the log for `GDN_CP_PARITY` and `GDN_CP_PARITY_DONE`.

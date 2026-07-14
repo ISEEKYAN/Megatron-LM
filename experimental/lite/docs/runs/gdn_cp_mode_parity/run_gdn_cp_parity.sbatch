@@ -50,7 +50,7 @@ CP_SITE=$CP_SITE,\
 PYTHONPATH=$PYP,\
 TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
      bash -c "export LD_LIBRARY_PATH=$CP_SITE/tvm_ffi/lib:\$LD_LIBRARY_PATH && cd $R && \
-       python -c 'import torch, fla; import fla.ops.cp as _c; from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet; print(\"IMPORTS_OK fla_cp\", hasattr(_c, \"build_cp_context\"))' && \
+       python -c 'import torch, fla; from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet; print(\"IMPORTS_OK\")' && \
        echo '=== CP2 ===' && \
        torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29531 $SCRIPT && \
        echo '=== CP4 ===' && \
