@@ -30,6 +30,7 @@ from verl_mlite.resync_export import (
     format_host_census_line,
     format_resync_memcurve_line,
     host_census_record,
+    offload_params_after_export,
     resync_export_empty_cache_threshold_bytes,
     resync_hostcensus_enabled,
     resync_memcurve_enabled,
@@ -449,6 +450,21 @@ class MegatronLiteEngine(BaseEngine):
         )
         if resync_memcurve_enabled() and torch.cuda.is_available():
             streamed = self._stream_resync_memcurve(streamed)
+        # Symmetric to the reload above (mirrors save_checkpoint / load_checkpoint):
+        # return the model to CPU and hard-drain once the caller has consumed the
+        # export, *before* the colocated vLLM wake_up. The colocated vLLM uses a
+        # separate (cumem) allocator on the same physical device; without this the
+        # M-FSDP export-peak footprint (~61 GiB on the busiest EP rank) stays
+        # resident and vLLM OOMs in create_and_map (cumem_allocator.cpp:139) with
+        # ~20 GiB free, whereas the fsdp2 baseline survives 12 cycles at 166 MiB
+        # free (TASK-1.13.8.6: the resync wake_up death is a release-ordering
+        # collision, not a leak — mfsdp/fsdp2 peak footprints are near-identical).
+        if self.is_param_offload_enabled:
+            streamed = offload_params_after_export(
+                streamed,
+                lambda: self.to("cpu", model=True, optimizer=False, grad=False),
+                lambda: aggressive_empty_cache(force_sync=True),
+            )
         return streamed, None
 
     def _stream_resync_memcurve(self, streamed):

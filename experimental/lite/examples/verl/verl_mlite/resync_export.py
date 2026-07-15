@@ -93,6 +93,29 @@ def stream_export_with_empty_cache(
         empty_cache_fn()
 
 
+def offload_params_after_export(
+    streamed: Iterator, offload_fn: Callable[[], None], drain_fn: Callable[[], None]
+) -> Iterator:
+    """Yield from ``streamed``, then offload params + drain once it is consumed.
+
+    ``get_per_tensor_param`` reloads the model to GPU for the export; in the
+    param-offload config the steady state is model-on-CPU, so the reload must be
+    undone once the caller finishes iterating — which is right before the
+    colocated vLLM ``wake_up``. vLLM's separate (cumem) allocator shares the
+    physical device, so a model left resident (plus any export-peak residue)
+    starves ``create_and_map`` and OOMs. Undoing it in the generator's
+    ``finally`` guarantees the ordering even if the consumer stops early or
+    raises. See TASK-1.13.8.6: the resync wake_up death is a release-ordering
+    collision (mfsdp OOMs at ~20 GiB free while the fsdp2 baseline survives at
+    166 MiB free), not a leak.
+    """
+    try:
+        yield from streamed
+    finally:
+        offload_fn()
+        drain_fn()
+
+
 # ── MEMCURVE: per-cycle resync export peak instrumentation ──────────────────
 #
 # The torch/CUDA reads (reset_peak_memory_stats, max_memory_allocated, …) stay

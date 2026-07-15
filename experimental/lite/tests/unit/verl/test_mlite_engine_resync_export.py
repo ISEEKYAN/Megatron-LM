@@ -22,6 +22,7 @@ from verl_mlite.resync_export import (
     resync_memcurve_memlog_path,
     resync_memcurve_peak_gib,
     resync_memcurve_record,
+    offload_params_after_export,
     stream_export_with_empty_cache,
     summarize_host_storages,
 )
@@ -80,6 +81,51 @@ def test_final_flush_fires_when_consumer_aborts_early():
     next(gen)  # consume one pair, then abandon
     gen.close()
     assert calls["n"] == 1
+
+
+def test_offload_after_export_is_transparent_and_offloads_on_drain():
+    """Every pair is yielded unchanged, then offload + drain fire once, in order."""
+    events = []
+    src = _pairs([1, 2, 3])
+    out = list(
+        offload_params_after_export(
+            iter(src),
+            lambda: events.append("offload"),
+            lambda: events.append("drain"),
+        )
+    )
+    assert [n for n, _ in out] == ["w0", "w1", "w2"]
+    assert events == ["offload", "drain"]  # ordering: model to CPU, then hard-drain
+
+
+def test_offload_after_export_fires_when_consumer_aborts_early():
+    """Model returns to CPU even if the consumer stops iterating mid-stream."""
+    events = []
+    src = _pairs([1, 1, 1])
+    gen = offload_params_after_export(
+        iter(src), lambda: events.append("offload"), lambda: events.append("drain")
+    )
+    next(gen)  # consume one pair, then abandon
+    gen.close()
+    assert events == ["offload", "drain"]
+
+
+def test_offload_after_export_offloads_even_when_stream_raises():
+    """A failure mid-export must not leave the model resident on the GPU."""
+    events = []
+
+    def boom():
+        yield ("w0", torch.zeros(1))
+        raise RuntimeError("export blew up")
+
+    gen = offload_params_after_export(
+        boom(), lambda: events.append("offload"), lambda: events.append("drain")
+    )
+    try:
+        list(gen)
+    except RuntimeError:
+        pass
+    assert events == ["offload", "drain"]
 
 
 def test_threshold_defaults_to_four_gib(monkeypatch):
