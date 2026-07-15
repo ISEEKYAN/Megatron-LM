@@ -21,6 +21,8 @@ derivation, no fixed fallback. These tests cover three layers:
 
 from __future__ import annotations
 
+import multiprocessing
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -299,3 +301,144 @@ def test_pp2_recv_shapes_match_each_microbatch():
     recorded_fwd2, recorded_bwd2, _ = _run_schedule(2, 1, VARLEN)
     assert recorded_fwd2 == fwd_shapes, (recorded_fwd2, fwd_shapes)
     assert recorded_bwd2 == []
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Tier-A: real gloo 2-process PP2, real _send_recv_pipeline, variable seq
+# ══════════════════════════════════════════════════════════════════════
+# The tests above mock the dist fabric. This tier runs the *actual*
+# ``_send_recv_pipeline`` across two real gloo processes (PP2: rank0=first stage,
+# rank1=last stage) feeding variable-length micro-batches S=[5, 3, 7] — the THD
+# dynamic-batch case. It is the zero-GPU isolation proof of the "Megatron way":
+#
+#   * NEW (``dynamic_shape=True``): the recv buffer is sized from the shape the
+#     sender puts on the wire, so every micro-batch — including the S=7 one that
+#     is larger than the first (S=5) — round-trips bitwise. 0 mismatch, 0 fallback.
+#   * OLD (fixed buffer sized from the first micro-batch, ``dynamic_shape=False``):
+#     the S=7 send overflows the S=5 recv buffer; gloo enforces the size and aborts
+#     the receiver (``op.preamble.length <= op.nbytes`` -> SIGABRT), surfacing as a
+#     spawn failure. NEW green, OLD red — exactly the shape_fn-free contract.
+#
+# gloo point-to-point does not support ``batch_isend_irecv``, so these drive the
+# direct isend/irecv path (``batch_p2p=False``); the shape-exchange logic is
+# identical either way. bf16 p2p is a CUDA/NCCL concern, orthogonal to buffer
+# sizing, so the tensor dtype is pinned to fp32 for the gloo fabric.
+
+_PP_H = 8
+_PP_VARLEN = [5, 3, 7]  # micro-batch seq lengths; 7 > first(5) is the overflow case
+
+
+def _pp_hidden(mb_idx: int, seqlen: int) -> torch.Tensor:
+    """Deterministic, rank-independent inter-stage hidden [S, 1, H] for a mb."""
+    gen = torch.Generator().manual_seed(20260715 + mb_idx)
+    return torch.randn(seqlen, 1, _PP_H, generator=gen)
+
+
+def _pp_state(rank: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        pp_size=2,
+        pp_rank=rank,
+        pp_is_first=(rank == 0),
+        pp_is_last=(rank == 1),
+        pp_prev_rank=rank - 1,
+        pp_next_rank=rank + 1,
+        pp_group=None,  # default (world) group == the PP group for world_size=2
+    )
+
+
+def _dynamic_shape_worker(rank, world, port, results):
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(world)
+    )
+    import torch.distributed as dist
+
+    from megatron.lite.primitive.parallel import pipeline as pl
+
+    pl._PIPELINE_TENSOR_DTYPE = torch.float32  # gloo-safe; buffer sizing is dtype-agnostic
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    try:
+        ps = _pp_state(rank)
+        detail = []
+        for i, s in enumerate(_PP_VARLEN):
+            if rank == 0:
+                hid = _pp_hidden(i, s)
+                pl._send_recv_pipeline(
+                    hid, None, False, False, ps, (1, 1, _PP_H),
+                    batch_p2p=False, dynamic_shape=True,
+                )
+            else:
+                fwd_buf, _ = pl._send_recv_pipeline(
+                    None, None, True, False, ps, (1, 1, _PP_H),
+                    batch_p2p=False, dynamic_shape=True,
+                )
+                expect = _pp_hidden(i, s)
+                shape_ok = tuple(fwd_buf.shape) == (s, 1, _PP_H)
+                bitwise_ok = bool(torch.equal(fwd_buf.detach().float(), expect.float()))
+                detail.append((s, shape_ok, bitwise_ok))
+        results.append((rank, detail))
+    finally:
+        dist.destroy_process_group()
+
+
+def _fixed_buffer_worker(rank, world, port, results):
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(world)
+    )
+    import torch.distributed as dist
+
+    from megatron.lite.primitive.parallel import pipeline as pl
+
+    pl._PIPELINE_TENSOR_DTYPE = torch.float32
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    try:
+        ps = _pp_state(rank)
+        first_len = _PP_VARLEN[0]  # fixed recv buffer sized from the FIRST mb (S=5)
+        overflow_idx, overflow_len = 2, _PP_VARLEN[2]  # the S=7 overflow mb
+        if rank == 0:
+            hid = _pp_hidden(overflow_idx, overflow_len)  # sends [7, 1, H]
+            pl._send_recv_pipeline(
+                hid, None, False, False, ps, (first_len, 1, _PP_H),
+                batch_p2p=False, dynamic_shape=False,
+            )
+        else:
+            fixed_buf = torch.empty(first_len, 1, _PP_H, dtype=torch.float32)  # only fits S=5
+            # Recv of the [7,1,H] send into the [5,1,H] buffer: gloo enforces the
+            # size and aborts the process. Reaching here without abort is the bug.
+            pl._send_recv_pipeline(
+                None, None, True, False, ps, (first_len, 1, _PP_H),
+                fwd_recv_buf=fixed_buf, batch_p2p=False, dynamic_shape=False,
+            )
+        results.append((rank, "no_abort"))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.distributed
+def test_dynamic_shape_variable_len_recv_gloo():
+    """NEW: dynamic shape-over-wire sizes each recv buffer correctly (0 mismatch)."""
+    import torch.multiprocessing as mp
+
+    mgr = multiprocessing.Manager()
+    results = mgr.list()
+    mp.spawn(_dynamic_shape_worker, args=(2, 29663, results), nprocs=2, join=True)
+    by_rank = dict(results)
+    assert set(by_rank) == {0, 1}, f"missing ranks: {list(by_rank)}"
+    recv_detail = by_rank[1]  # last stage recorded every fwd recv
+    assert len(recv_detail) == len(_PP_VARLEN), recv_detail
+    for s, shape_ok, bitwise_ok in recv_detail:
+        assert shape_ok, f"S={s}: recv buffer not sized from the wire"
+        assert bitwise_ok, f"S={s}: recv hidden not bitwise-equal to sent hidden"
+
+
+@pytest.mark.distributed
+def test_fixed_buffer_truncates_variable_len_gloo():
+    """OLD: a first-mb-sized fixed buffer overflows on the larger mb -> abort (red)."""
+    import torch.multiprocessing as mp
+
+    mgr = multiprocessing.Manager()
+    results = mgr.list()
+    # gloo enforces the recv size mismatch by aborting the receiver, which
+    # surfaces as a spawn failure. Green here (no abort) would mean silent
+    # truncation — the exact corruption the Megatron way removes.
+    with pytest.raises(Exception):
+        mp.spawn(_fixed_buffer_worker, args=(2, 29664, results), nprocs=2, join=True)

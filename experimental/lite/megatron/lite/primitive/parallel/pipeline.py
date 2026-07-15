@@ -391,6 +391,19 @@ _PIPELINE_TENSOR_DTYPE = torch.bfloat16
 _PIPELINE_SHAPE_NDIM = 3
 
 
+def _pipeline_device() -> "torch.device | int":
+    """Device for pipeline P2P buffers.
+
+    Returns ``torch.cuda.current_device()`` on GPU — byte-for-byte what the
+    production 1F1B path used before (``device="cuda"`` == the current device) —
+    and falls back to CPU when CUDA is unavailable, so the dynamic shape exchange
+    can be exercised under a gloo process group in unit tests without a GPU.
+    """
+    if torch.cuda.is_available():
+        return torch.cuda.current_device()
+    return torch.device("cpu")
+
+
 def _communicate_shapes(
     send_fwd: torch.Tensor | None,
     send_bwd: torch.Tensor | None,
@@ -416,7 +429,7 @@ def _communicate_shapes(
     Mirrors ``megatron.core.pipeline_parallel.p2p_communication.
     _P2PCommunicator._communicate_shapes``.
     """
-    device = torch.cuda.current_device()
+    device = _pipeline_device()
     recv_fwd_t = (
         torch.empty(_PIPELINE_SHAPE_NDIM, dtype=torch.int64, device=device) if recv_fwd else None
     )
@@ -467,7 +480,10 @@ def _communicate_shapes(
             req.wait()
     # Guard against the known batch_isend_irecv race before the buffers are read
     # (matches Megatron core's torch.cuda.synchronize() in _communicate_shapes).
-    if send_fwd_t is not None or send_bwd_t is not None or recv_fwd or recv_bwd:
+    # No-op / unavailable on CPU (gloo unit tests) — the race is CUDA-stream only.
+    if torch.cuda.is_available() and (
+        send_fwd_t is not None or send_bwd_t is not None or recv_fwd or recv_bwd
+    ):
         torch.cuda.synchronize()
 
     def _shape(t: torch.Tensor | None) -> tuple[int, ...] | None:
@@ -552,12 +568,12 @@ def _send_recv_pipeline(
         ops.append(dist.P2POp(dist.isend, t, ps.pp_next_rank, p2p_group))
     if recv_fwd:
         if dynamic_shape:
-            fwd_buf = torch.empty(recv_fwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device="cuda")
+            fwd_buf = torch.empty(recv_fwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
         else:
             fwd_buf = (
                 fwd_recv_buf
                 if fwd_recv_buf is not None
-                else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device="cuda")
+                else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
             )
         ops.append(dist.P2POp(dist.irecv, fwd_buf, ps.pp_prev_rank, p2p_group))
     if send_bwd is not None:
@@ -565,12 +581,12 @@ def _send_recv_pipeline(
         ops.append(dist.P2POp(dist.isend, t, ps.pp_prev_rank, p2p_group))
     if recv_bwd:
         if dynamic_shape:
-            bwd_buf = torch.empty(recv_bwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device="cuda")
+            bwd_buf = torch.empty(recv_bwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
         else:
             bwd_buf = (
                 bwd_recv_buf
                 if bwd_recv_buf is not None
-                else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device="cuda")
+                else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
             )
         ops.append(dist.P2POp(dist.irecv, bwd_buf, ps.pp_next_rank, p2p_group))
 
