@@ -442,9 +442,17 @@ class MegatronLiteRuntime(RuntimeBase):
             first_item = next(data_iter)
             first_batch, _loss_context = split_loss_context(first_item)
             data_iter = chain([first_item], data_iter)
-            tensor_shape = _infer_pipeline_tensor_shape(
-                first_batch, handle._extras.get("model_cfg"), ps
-            )
+            model_cfg = handle._extras.get("model_cfg")
+            tensor_shape = _infer_pipeline_tensor_shape(first_batch, model_cfg, ps)
+
+            # Under THD + dynamic batching each micro-batch packs a different token
+            # count, so the inter-stage P2P buffer must be sized per micro-batch;
+            # a single fixed ``tensor_shape`` (from the first batch) truncates the
+            # recv of later, larger micro-batches -> NCCL size mismatch / deadlock.
+            def _shape_fn(batch, _cfg=model_cfg, _ps=ps):
+                raw_batch, _ = split_loss_context(batch)
+                return _infer_pipeline_tensor_shape(raw_batch, _cfg, _ps)
+
             model_chunks = handle._extras.get("model_chunks", [handle._model])
             pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
             pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
@@ -458,6 +466,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 pre_forward_hook=handle._extras.get("pre_forward_hook"),
                 loss_fn=pipeline_loss_fn,
                 forward_only=forward_only,
+                shape_fn=_shape_fn,
             )
             out = _last_loss_output(outputs)
             loss_obj = out.get("loss") if out else None
