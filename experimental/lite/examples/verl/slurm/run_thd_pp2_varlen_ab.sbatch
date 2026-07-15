@@ -30,6 +30,10 @@
 #                into the container; run_qwen3moe_sft.sh puts it on PYTHONPATH from env.
 #   MEGATRON_ROOT compatible MCore snapshot (provides megatron.core; experimental/lite
 #                imports it and does NOT bundle a real megatron/core).
+#   MLITE_SM90_SITE canonical training overlay site-packages (provides transformers,
+#                torchdata; the container has NO transformers, so the SFT tokenizer/
+#                chat_template import dies with ModuleNotFoundError without it — job
+#                13990351 died here at 1:44). torch is NOT in the overlay (container).
 #   OUTPUT_DIR   fresh result directory
 set -euo pipefail
 
@@ -39,10 +43,12 @@ MLITE_OLD=${MLITE_OLD:?set MLITE_OLD to the pre-approach-A (76905da37^) checkout
 MODEL_PATH=${MODEL_PATH:?set MODEL_PATH to a small HF model dir (config+tokenizer)}
 VERL_ROOT=${VERL_ROOT:?set VERL_ROOT to a committed VERL snapshot (verl.trainer.sft_trainer)}
 MEGATRON_ROOT=${MEGATRON_ROOT:?set MEGATRON_ROOT to a compatible MCore snapshot (megatron.core)}
+MLITE_SM90_SITE=${MLITE_SM90_SITE:?set MLITE_SM90_SITE to the canonical training overlay site-packages (transformers)}
 OUTPUT_DIR=${OUTPUT_DIR:?set OUTPUT_DIR to a fresh result directory}
 # verl / mcore are not baked into the container; run_qwen3moe_sft.sh prepends them to
 # PYTHONPATH from the environment, so they must reach the container via srun --export=ALL.
-export VERL_ROOT MEGATRON_ROOT
+# MLITE_SM90_SITE (transformers) is threaded directly onto the container PYTHONPATH in run().
+export VERL_ROOT MEGATRON_ROOT MLITE_SM90_SITE
 
 # Knobs (defaults tuned for a 2-GPU PP2 decisive run).
 NPROC=${NPROC:-2}
@@ -58,7 +64,7 @@ LOAD_HF_WEIGHTS=${LOAD_HF_WEIGHTS:-False}
 ARM_TIMEOUT=${ARM_TIMEOUT:-600}   # a hung OLD arm is the red signal; bound it.
 
 for p in "${BASE_IMAGE}" "${MLITE_NEW}" "${MLITE_OLD}" "${MODEL_PATH}" \
-         "${VERL_ROOT}" "${MEGATRON_ROOT}"; do
+         "${VERL_ROOT}" "${MEGATRON_ROOT}" "${MLITE_SM90_SITE}"; do
   [[ -e "${p}" ]] || { echo "missing required path: ${p}" >&2; exit 2; }
 done
 mkdir -p "${OUTPUT_DIR}"
@@ -79,7 +85,12 @@ run() {  # <mlite_src> -- <cmd...>
       # experimental/lite of THIS arm's checkout must resolve first so
       # megatron.lite is that checkout's pipeline.py/runtime.py; megatron is a
       # PEP-420 namespace so an optional MCore (MROOT) merges without shadowing.
-      export PYTHONPATH='${src}/experimental/lite':'${MROOT:-}':\${PYTHONPATH:-}
+      # MLITE_SM90_SITE supplies transformers (tokenizer/chat_template); the
+      # container has none, so it MUST be on PYTHONPATH or the SFT launcher dies
+      # with ModuleNotFoundError: No module named 'transformers' (job 13990351).
+      # It carries no torch (container torch 2.12 wins), no megatron/lite (no
+      # shadow of the arm's pipeline.py), so tail placement is safe.
+      export PYTHONPATH='${src}/experimental/lite':'${MLITE_SM90_SITE}':'${MROOT:-}':\${PYTHONPATH:-}
       export TMPDIR=/tmp/thdpp-\${SLURM_JOB_ID}
       export TORCHINDUCTOR_CACHE_DIR=\${TMPDIR}/ti TRITON_CACHE_DIR=\${TMPDIR}/triton
       export CUDA_DEVICE_MAX_CONNECTIONS=1 NCCL_NVLS_ENABLE=0
@@ -97,9 +108,9 @@ if [[ ! -e "${DATA_DIR}/train.parquet" ]]; then
     || { echo "DATA_GEN rc=$?"; exit 3; }
 fi
 
-# Shared SFT launch knobs — the two arms differ only in the checkout they run in.
-arm() {  # <mlite_src> <run_name>  -> runs the SFT launcher with the shared knobs
-  local src=$1 run_name=$2
+# Shared SFT launch knobs — arms differ only in the checkout + pipeline degree.
+arm() {  # <mlite_src> <run_name> <pp> <nproc>  -> runs the SFT launcher
+  local src=$1 run_name=$2 pp=$3 nproc=$4
   MROOT="${MEGATRON_CSA:-}" \
   run "${src}" -- \
     "MODEL_PATH='${MODEL_PATH}' \
@@ -107,8 +118,8 @@ arm() {  # <mlite_src> <run_name>  -> runs the SFT launcher with the shared knob
      VAL_FILES='${DATA_DIR}/test.parquet' \
      OUTPUT_ROOT='${OUTPUT_DIR}/${run_name}' \
      RUN_NAME='${run_name}' \
-     NUM_GPUS=${NPROC} NPROC_PER_NODE=${NPROC} \
-     TP_SIZE=${TP_SIZE} PP_SIZE=${PP_SIZE} EP_SIZE=${EP_SIZE} ETP_SIZE=1 CP_SIZE=${CP_SIZE} \
+     NUM_GPUS=${nproc} NPROC_PER_NODE=${nproc} \
+     TP_SIZE=${TP_SIZE} PP_SIZE=${pp} EP_SIZE=${EP_SIZE} ETP_SIZE=1 CP_SIZE=${CP_SIZE} \
      USE_DYNAMIC_BSZ=True \
      TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} \
      MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU} MAX_LENGTH=${MAX_LENGTH} \
@@ -119,22 +130,68 @@ arm() {  # <mlite_src> <run_name>  -> runs the SFT launcher with the shared knob
 }
 
 # `set -e` must not abort on the (expected) OLD failure before we capture rc.
-echo "==== arm NEW (approach A HEAD) — expect GREEN (rc=0, loss finite) ===="
-NEW_RC=0; arm "${MLITE_NEW}" new || NEW_RC=$?
-echo "ARM_NEW_RC=${NEW_RC}"
+# arm 1 — NEW at PP2: the fix under test. Expect GREEN (rc=0, loss finite, no hang).
+echo "==== arm NEW_PP2 (approach A HEAD, PP=2) — expect GREEN ===="
+NEW_RC=0; arm "${MLITE_NEW}" new_pp2 "${PP_SIZE}" "${NPROC}" || NEW_RC=$?
+echo "ARM_NEW_PP2_RC=${NEW_RC}"
 
-echo "==== arm OLD (pre-approach-A) — expect RED (hang->timeout / NCCL size mismatch) ===="
-OLD_RC=0; arm "${MLITE_OLD}" old || OLD_RC=$?
-echo "ARM_OLD_RC=${OLD_RC}"
+# arm 2 — OLD at PP2: pre-fix. Expect RED (hang->timeout / NCCL size mismatch),
+# proving the variable-length data actually triggers the P2P buffer bug.
+echo "==== arm OLD_PP2 (pre-approach-A 76905da37^, PP=2) — expect RED ===="
+OLD_RC=0; arm "${MLITE_OLD}" old_pp2 "${PP_SIZE}" "${NPROC}" || OLD_RC=$?
+echo "ARM_OLD_PP2_RC=${OLD_RC}"
+
+# arm 3 — NEW at PP1 on a single process: NO inter-stage P2P at all, so it is the
+# trusted numerical reference. Same model, same data, DP=1 in both PP1 and PP2 =>
+# identical per-step global batch => per-step loss must match within fp tolerance.
+# A green-but-wrong-value NEW_PP2 (silent off-by-one in the recv<->mb mapping)
+# would diverge here even though rc=0. (bayan 20:15: 三臂数值一致性)
+echo "==== arm NEW_PP1 (approach A HEAD, PP=1, single process) — numerical reference ===="
+REF_RC=0; arm "${MLITE_NEW}" new_pp1 1 1 || REF_RC=$?
+echo "ARM_NEW_PP1_RC=${REF_RC}"
+
+echo "==== numerical parity: NEW_PP1 vs NEW_PP2 per-step train/loss ===="
+PARITY=UNKNOWN
+PP1_JSONL="${OUTPUT_DIR}/new_pp1/new_pp1.jsonl"
+PP2_JSONL="${OUTPUT_DIR}/new_pp2/new_pp2.jsonl"
+PARITY_TOL="${PARITY_TOL:-2e-3}"
+if [[ -f "${PP1_JSONL}" && -f "${PP2_JSONL}" ]]; then
+  PARITY=$(python3 - "${PP1_JSONL}" "${PP2_JSONL}" "${PARITY_TOL}" <<'PY'
+import json, sys
+def losses(p):
+    out={}
+    for line in open(p):
+        line=line.strip()
+        if not line: continue
+        try: o=json.loads(line)
+        except Exception: continue
+        d=o.get("data",{}); s=o.get("step")
+        for k in ("train/loss","loss"):
+            if k in d: out[s]=float(d[k]); break
+    return out
+a=losses(sys.argv[1]); b=losses(sys.argv[2]); tol=float(sys.argv[3])
+steps=sorted(set(a)&set(b))
+if not steps:
+    print("NO_COMMON_STEPS"); sys.exit(0)
+mx=max(abs(a[s]-b[s]) for s in steps)
+tag="MATCH" if mx<=tol else "DIVERGE"
+print("%s max_abs_diff=%.3e tol=%.1e steps=%d pp1=%s pp2=%s"%(
+    tag, mx, tol, len(steps),
+    ["%.6f"%a[s] for s in steps], ["%.6f"%b[s] for s in steps]))
+PY
+) || PARITY="PARITY_SCRIPT_ERROR"
+fi
+echo "THD_PP2_VARLEN_PARITY=${PARITY}"
 
 echo "==== verdict ===="
-# GREEN when NEW succeeds; the A/B is DECISIVE only if OLD also fails (proving the
-# data actually triggers the bug and the fix is what flipped it).
+# PRIMARY (P2P fix): DECISIVE only if NEW_PP2 green AND OLD_PP2 red (proving the
+# data triggers the bug and the fix is what flipped it). Numerical parity is a
+# secondary guard against a green-but-wrong-value fix.
 if [[ "${NEW_RC}" -eq 0 && "${OLD_RC}" -ne 0 ]]; then
-  echo "THD_PP2_VARLEN_VERDICT=PASS_DECISIVE (NEW green, OLD red)"
+  echo "THD_PP2_VARLEN_VERDICT=PASS_DECISIVE (NEW_PP2 green, OLD_PP2 red)"
 elif [[ "${NEW_RC}" -eq 0 && "${OLD_RC}" -eq 0 ]]; then
-  echo "THD_PP2_VARLEN_VERDICT=PASS_BUT_NONDECISIVE (OLD also green — data may not vary enough; inspect micro-batch token counts in the OLD log)"
+  echo "THD_PP2_VARLEN_VERDICT=PASS_BUT_NONDECISIVE (OLD_PP2 also green — data may not vary enough; inspect micro-batch token counts in the OLD log)"
 else
-  echo "THD_PP2_VARLEN_VERDICT=FAIL (NEW rc=${NEW_RC}) — inspect ${OUTPUT_DIR}/new"
+  echo "THD_PP2_VARLEN_VERDICT=FAIL (NEW_PP2 rc=${NEW_RC}) — inspect ${OUTPUT_DIR}/new_pp2"
 fi
 echo "DONE thd-pp2-varlen-ab job=${SLURM_JOB_ID} out=${OUTPUT_DIR}"
