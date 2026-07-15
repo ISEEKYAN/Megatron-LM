@@ -919,6 +919,83 @@ def _patch_verl_dsv4_mxfp4_check() -> bool:
     return True
 
 
+def _patch_verl_dsv4_fp8_process_weights() -> bool:
+    """Run ``process_weights_after_loading`` for FP8 MoE experts after RL resync.
+
+    verl #6473's DS4 post-load hook chain
+    (``update_weights_from_ipc`` -> ``process_quanted_weights_after_loading`` ->
+    ``process_deepseek_v4_weights_after_loading`` -> ``_process_moe_weights_after_loading``)
+    only shuffles MEGA-MoE and MXFP4 experts into the kernel runtime format, and
+    the whole chain is gated by ``quant_reload_state`` (the return of
+    ``_restore_moe_params_for_loading``). For a forced ``expert_dtype=fp8`` model
+    the routed experts use ``Fp8MoEMethod`` (block quant): there is no branch for
+    it, and ``_restore_moe_params_for_loading`` returns ``False`` (pure FP8), so
+    ``quant_reload_state`` is falsy and the entire post-load step is skipped. The
+    freshly-resynced FP8 expert weights then stay in checkpoint layout and never
+    get shuffled into the kernel runtime format (``Fp8MoEMethod._setup_kernel``),
+    so inference is silently wrong even though the load did not crash.
+
+    Wrap the ungated top-level ``vLLMColocateWorkerExtension.update_weights_from_ipc``
+    so that, after every resync completes, we call
+    ``module.quant_method.process_weights_after_loading(module)`` on each
+    ``Fp8MoEMethod`` MoE module. verl source is untouched; our side only.
+    """
+    if not _vllm_importable():
+        return False
+    try:
+        utils = importlib.import_module(
+            "verl.workers.rollout.vllm_rollout.utils"
+        )
+    except Exception:
+        return False
+    ext_cls = getattr(utils, "vLLMColocateWorkerExtension", None)
+    original = getattr(ext_cls, "update_weights_from_ipc", None)
+    if original is None or getattr(original, "_verl_mlite_fp8_process", False):
+        return True
+
+    @wraps(original)
+    def update_weights_from_ipc(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        try:
+            model = self.model_runner.model
+            # DS4-ONLY scope lock. ``update_weights_from_ipc`` is the shared
+            # colocated resync entry (qwen/glm/kimi/... all reach it), so the
+            # post-process below is fenced behind three guards; any non-DS4
+            # model fails ``is_deepseek_v4_model`` and returns immediately,
+            # completely untouched.
+            from verl.utils.vllm.vllm_dsv4_fp8_utils import is_deepseek_v4_model
+
+            if not is_deepseek_v4_model(model):
+                return result
+            from vllm.model_executor.layers.fused_moe.routed_experts import (
+                RoutedExperts,
+            )
+            from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+
+            processed = 0
+            for mod in model.modules():
+                if isinstance(mod, RoutedExperts) and isinstance(
+                    getattr(mod, "quant_method", None), Fp8MoEMethod
+                ):
+                    mod.quant_method.process_weights_after_loading(mod)
+                    processed += 1
+            if processed:
+                sys.stderr.write(
+                    "VERL_MLITE_FP8_PROCESS "
+                    f"ran process_weights_after_loading on {processed} "
+                    "DS4 RoutedExperts+Fp8MoEMethod module(s) after resync\n"
+                )
+                sys.stderr.flush()
+        except Exception as exc:  # never break the resync on a post-process error
+            sys.stderr.write(f"VERL_MLITE_FP8_PROCESS error: {exc!r}\n")
+            sys.stderr.flush()
+        return result
+
+    update_weights_from_ipc._verl_mlite_fp8_process = True
+    ext_cls.update_weights_from_ipc = update_weights_from_ipc
+    return True
+
+
 def apply_runtime_patches() -> None:
     _trace_runtime_patch("00.begin")
     result = _patch_transformers_vision2seq_alias()
@@ -943,6 +1020,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08.bucketed_weight_sender", result)
     result = _patch_verl_dsv4_mxfp4_check()
     _trace_runtime_patch("08b.verl_dsv4_mxfp4_check", result)
+    result = _patch_verl_dsv4_fp8_process_weights()
+    _trace_runtime_patch("08c.verl_dsv4_fp8_process_weights", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
     _trace_runtime_patch("10.end")

@@ -105,7 +105,8 @@ exec bash "${GRPO_RUNNER}" \
   "+data.chat_template='${DS4_CHAT_TEMPLATE}'" \
   "actor_rollout_ref.model.custom_chat_template='${DS4_CHAT_TEMPLATE}'" \
   "+actor_rollout_ref.actor.engine.cross_entropy_fusion=True" \
-  "actor_rollout_ref.actor.engine.resync_format=bf16" \
+  "actor_rollout_ref.actor.engine.resync_format=vllm_checkpoint" \
+  "+actor_rollout_ref.actor.engine.resync_config.expert_dtype=fp8" \
   "+actor_rollout_ref.actor.engine.impl_cfg.recompute=full" \
   "+actor_rollout_ref.actor.engine.impl_cfg.mtp_enable=True" \
   "+actor_rollout_ref.actor.engine.impl_cfg.mtp_enable_train=True" \
