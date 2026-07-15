@@ -369,6 +369,21 @@ class MegatronLiteRuntime(RuntimeBase):
                     else:
                         yield from chunk.named_parameters()
 
+    def release_export_scratch(self, handle: ModelHandle) -> None:
+        """Reclaim M-FSDP all-gather scratch before a colocated vLLM weight wake.
+
+        Loops the model chunks and asks each M-FSDP wrapper to hand its retained
+        double-buffer scratch back to the driver while keeping the sharded
+        weights resident (the export gather source that runs right after the
+        wake). No-op for chunks that do not expose the hook (non-M-FSDP
+        backends). See TASK-1.13.8.5.
+        """
+        model_chunks = handle._extras.get("model_chunks", [handle._model])
+        for chunk in model_chunks:
+            release = getattr(chunk, "release_export_scratch", None)
+            if callable(release):
+                release()
+
     # ── Memory ──
 
     def to(

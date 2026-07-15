@@ -49,6 +49,26 @@ def test_runtime_returns_loss_separately_from_microbatch_metrics():
     assert result.model_output.loss is not None
 
 
+def test_release_export_scratch_routes_to_mfsdp_chunks_and_skips_plain_ones():
+    """Pre-wake scratch release loops the chunks and no-ops non-M-FSDP ones."""
+    released = []
+
+    class _MFSDPChunk:
+        def release_export_scratch(self):
+            released.append(id(self))
+
+    mfsdp_a, mfsdp_b = _MFSDPChunk(), _MFSDPChunk()
+    handle = ModelHandle(
+        model=nn.Linear(1, 1, bias=False),
+        parallel_state=types.SimpleNamespace(pp_size=1),
+        _extras={"model_chunks": [mfsdp_a, nn.Linear(1, 1), mfsdp_b]},
+    )
+
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).release_export_scratch(handle)
+
+    assert released == [id(mfsdp_a), id(mfsdp_b)]
+
+
 def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
     context = LossContext(source_batch="source")
     seen = []

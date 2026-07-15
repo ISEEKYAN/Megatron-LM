@@ -719,6 +719,136 @@ def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
         assert torch.equal(value, restored_model[name]), name
 
 
+def _single_rank_mfsdp_stack():
+    """Build a trained single-rank M-FSDP stack for scratch-release tests."""
+
+    class _Unit(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(4, 4, bias=False)
+
+        def forward(self, value):
+            return torch.nn.functional.gelu(self.linear(value))
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.unit0 = _Unit()
+            self.unit1 = _Unit()
+            self.out = torch.nn.Linear(4, 2, bias=False)
+
+        def forward(self, value):
+            return self.out(self.unit1(self.unit0(value)))
+
+    torch.manual_seed(123)
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1000.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    # One real train step so the double-buffer allocator has cached scratch and
+    # the optimizer holds shard-aliased params in their steady sharded state.
+    value = torch.randn(3, 4)
+    target = torch.randn(3, 2)
+    optimizer.zero_grad()
+    torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+    optimizer.finish_grad_sync()
+    assert optimizer.step()[0]
+    return chunks[0], optimizer
+
+
+def test_mfsdp_release_export_scratch_keeps_weights_and_aliases():
+    chunk, _optimizer = _single_rank_mfsdp_stack()
+
+    # Byte-equivalent export reference: the full (materialized) parameters before
+    # the scratch release. Materializing installs full-parameter leases, so
+    # return to the sharded steady state (what the pre-wake production call sees,
+    # post optimizer.step) before releasing the scratch.
+    full_before = {
+        name: param.detach().clone() for name, param in chunk.named_parameters()
+    }
+    chunk.param_sync.release_all()
+    chunk.param_sync.discard_full_parameter_views()
+
+    # Record the sharded weight storage so we can prove it is not moved/rebuilt.
+    weight_storage = {
+        id(bucket): bucket.main_param_buffer.data_ptr()
+        for bucket in chunk.param_sync.buckets
+    }
+    weight_values = {
+        id(bucket): bucket.main_param_buffer.detach().clone()
+        for bucket in chunk.param_sync.buckets
+    }
+
+    chunk.release_export_scratch()
+
+    for bucket in chunk.param_sync.buckets:
+        # Sharded weights stay put (same storage, same values, still on CPU).
+        assert bucket.main_param_buffer.data_ptr() == weight_storage[id(bucket)]
+        assert bucket.main_param_buffer.device.type == "cpu"
+        assert torch.equal(bucket.main_param_buffer, weight_values[id(bucket)])
+        # The double-buffer scratch was handed back to the driver.
+        assert getattr(bucket.allocator, "_slots", {}) == {}
+        # Optimizer aliases still view the resident shard (no dangling storage).
+        for spec in bucket.specs:
+            assert spec.shard_param is not None
+            if spec.shard_numel:
+                expected = bucket.main_param_buffer.narrow(
+                    0, spec.local_offset, spec.shard_numel
+                )
+                assert spec.shard_param.data.data_ptr() == expected.data_ptr()
+            # Full-parameter views are dropped, not left aliasing freed scratch.
+            assert spec.full_param.data.numel() == 0
+
+    # Export after the release reproduces the pre-release parameters byte-for-byte.
+    full_after = {
+        name: param.detach().clone() for name, param in chunk.named_parameters()
+    }
+    assert full_before.keys() == full_after.keys()
+    for name in full_before:
+        assert torch.equal(full_before[name], full_after[name]), name
+
+
+def test_mfsdp_release_export_scratch_is_idempotent():
+    chunk, optimizer = _single_rank_mfsdp_stack()
+    chunk.release_export_scratch()
+    # A second release on already-sharded state must not raise (the busy-buffer
+    # guard passes: no collective is in flight) and must keep training usable.
+    chunk.release_export_scratch()
+    value = torch.randn(3, 4)
+    target = torch.randn(3, 2)
+    optimizer.zero_grad()
+    torch.nn.functional.mse_loss(chunk(value), target).backward()
+    optimizer.finish_grad_sync()
+    assert optimizer.step()[0]
+
+
 def test_mfsdp_bucket_policy_splits_one_unit_without_splitting_parameters():
     model = torch.nn.Module()
     model.weight0 = torch.nn.Parameter(torch.ones(4))
