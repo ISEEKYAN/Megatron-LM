@@ -8,6 +8,8 @@ grad_offload: false
 forward_only: false
 dtype: bfloat16
 export_dtype: bfloat16
+resync_format: null
+resync_config: {}
 load_hf_weights: true
 
 model_name: auto
