@@ -996,6 +996,44 @@ def _patch_verl_dsv4_fp8_process_weights() -> bool:
     return True
 
 
+def _patch_verl_logit_sim_probe() -> bool:
+    """Post-resync DS4 fp8 logit-similarity probe (env ``MLITE_LOGIT_SIM_PROBE=1``).
+
+    Wrap ``ActorRolloutRefWorker.update_weights`` (async, colocated resync entry).
+    After resync completes, run the probe: same fixed tokens through vLLM rollout
+    (fp8 resync'd weights) vs mlite ``compute_log_prob`` (bf16 actor) -> compare
+    per-token logprob similarity (locks the block-scale per-block pairing that the
+    static layout audit could not). Only patched when the env gate is on, so the
+    RL path is completely untouched otherwise. verl source untouched.
+    """
+    if os.environ.get("MLITE_LOGIT_SIM_PROBE", "0") != "1":
+        return False
+    try:
+        ew = importlib.import_module("verl.workers.engine_workers")
+    except Exception:
+        return False
+    cls = getattr(ew, "ActorRolloutRefWorker", None)
+    original = getattr(cls, "update_weights", None)
+    if original is None or getattr(original, "_verl_mlite_logit_sim", False):
+        return True
+
+    @wraps(original)
+    async def update_weights(self, *args, **kwargs):
+        result = await original(self, *args, **kwargs)
+        try:
+            from verl_mlite.logit_sim_probe import run_logit_sim_probe
+
+            run_logit_sim_probe(self)
+        except Exception as exc:  # never break resync on a probe wiring error
+            sys.stderr.write(f"VERL_MLITE_LOGIT_SIM_PROBE patch error: {exc!r}\n")
+            sys.stderr.flush()
+        return result
+
+    update_weights._verl_mlite_logit_sim = True
+    cls.update_weights = update_weights
+    return True
+
+
 def apply_runtime_patches() -> None:
     _trace_runtime_patch("00.begin")
     result = _patch_transformers_vision2seq_alias()
@@ -1022,6 +1060,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08b.verl_dsv4_mxfp4_check", result)
     result = _patch_verl_dsv4_fp8_process_weights()
     _trace_runtime_patch("08c.verl_dsv4_fp8_process_weights", result)
+    result = _patch_verl_logit_sim_probe()
+    _trace_runtime_patch("08d.verl_logit_sim_probe", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
     _trace_runtime_patch("10.end")
