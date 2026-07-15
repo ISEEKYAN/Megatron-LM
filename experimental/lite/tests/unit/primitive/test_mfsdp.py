@@ -185,6 +185,7 @@ def test_mfsdp_source_layout_is_bounded():
 
     assert modules == {
         "__init__.py",
+        "backend.py",
         "buffer.py",
         "config.py",
         "fully_shard.py",

@@ -26,6 +26,11 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
+from verl_mlite.resync_export import (
+    offload_params_after_export,
+    resync_export_empty_cache_threshold_bytes,
+    stream_export_with_empty_cache,
+)
 
 try:
     # Recent VERL wraps per-step metric values in a Metric aggregator that
@@ -389,7 +394,31 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
-        return self.runtime.export_weights(self.handle, **export_kwargs), None
+        generator = self.runtime.export_weights(self.handle, **export_kwargs)
+        # Drain the export with a threshold-batched empty_cache so the released
+        # M-FSDP all-gather buffer is returned to the driver before the colocated
+        # vLLM wakes (avoids the resync wake_up OOM). See TASK-1.13.8.
+        streamed = stream_export_with_empty_cache(
+            generator,
+            resync_export_empty_cache_threshold_bytes(),
+            lambda: aggressive_empty_cache(force_sync=True),
+        )
+        # Symmetric to the reload above (mirrors save_checkpoint / load_checkpoint):
+        # return the model to CPU and hard-drain once the caller has consumed the
+        # export, *before* the colocated vLLM wake_up. The colocated vLLM uses a
+        # separate (cumem) allocator on the same physical device; without this the
+        # M-FSDP export-peak footprint (~61 GiB on the busiest EP rank) stays
+        # resident and vLLM OOMs in create_and_map (cumem_allocator.cpp:139) with
+        # ~20 GiB free, whereas the fsdp2 baseline survives 12 cycles at 166 MiB
+        # free (TASK-1.13.8.6: the resync wake_up death is a release-ordering
+        # collision, not a leak — mfsdp/fsdp2 peak footprints are near-identical).
+        if self.is_param_offload_enabled:
+            streamed = offload_params_after_export(
+                streamed,
+                lambda: self.to("cpu", model=True, optimizer=False, grad=False),
+                lambda: aggressive_empty_cache(force_sync=True),
+            )
+        return streamed, None
 
     def get_data_parallel_size(self):
         if self.handle is None:
@@ -616,7 +645,7 @@ class MegatronLiteEngine(BaseEngine):
         impl_cfg["use_thd"] = True
         cross_entropy_fusion = getattr(self.engine_config, "cross_entropy_fusion", None)
         if cross_entropy_fusion is None:
-            cross_entropy_fusion = getattr(self.engine_config, "use_fused_kernels", False)
+            cross_entropy_fusion = getattr(self.model_config, "use_fused_kernels", False)
         impl_cfg.setdefault("cross_entropy_fusion", bool(cross_entropy_fusion))
         mtp_cfg = getattr(self.model_config, "mtp", None)
         if mtp_cfg is not None:

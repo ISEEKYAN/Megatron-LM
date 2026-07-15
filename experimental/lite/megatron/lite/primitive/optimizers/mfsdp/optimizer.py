@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable, Iterable
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,6 +15,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.lite.primitive.optimizers.mfsdp.config import (
+    MFSDPConfig,
     annotate_parallel_parameters,
     build_mfsdp_config,
     build_mfsdp_process_groups,
@@ -34,7 +37,8 @@ from megatron.lite.primitive.optimizers.mfsdp.wrapper import (
 )
 
 ExpertClassifierFn = Callable[[str], bool]
-_MFSDP_PARAM_VALUES_KEY = "_mfsdp_param_values"
+
+logger = logging.getLogger(__name__)
 
 
 def _override(opt: Any, name: str, default: Any) -> Any:
@@ -155,22 +159,10 @@ class _StandaloneOptimizer:
         return float(total_norm.float().item())
 
     def state_dict(self) -> dict[str, Any]:
-        state = self.optimizer.state_dict()
-        state[_MFSDP_PARAM_VALUES_KEY] = [
-            [param.detach().cpu().clone() for param in group["params"]]
-            for group in self.optimizer.param_groups
-        ]
-        return state
+        return self.optimizer.state_dict()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        state = dict(state_dict)
-        param_values = state.pop(_MFSDP_PARAM_VALUES_KEY, None)
-        self.optimizer.load_state_dict(state)
-        if param_values is not None:
-            with torch.no_grad():
-                for group, group_values in zip(self.optimizer.param_groups, param_values, strict=True):
-                    for param, value in zip(group["params"], group_values, strict=True):
-                        param.copy_(value.to(device=param.device, dtype=param.dtype))
+        self.optimizer.load_state_dict(state_dict)
 
     def offload_state_to_cpu(self) -> None:
         self._offloaded_state_devices.clear()
@@ -286,6 +278,7 @@ class MFSdpOptimizer:
         result = self._inner_optimizer.step()
         for chunk in self._model_chunks:
             chunk.param_sync.release_all()
+            chunk.param_sync.discard_full_parameter_views()
         self.grad_sync_enabled = False
         return result
 
@@ -319,6 +312,7 @@ def build_mfsdp_stack(
     opt = engine_cfg.optimizer
     classifier = is_expert or (lambda _name: False)
     config = build_mfsdp_config(opt)
+    config = _order_param_gathers_for_parallel_collectives(config, ps)
     groups = build_mfsdp_process_groups(ps)
 
     wrapped_chunks = []
@@ -368,6 +362,41 @@ def build_mfsdp_stack(
         mark_optimizer_built(chunk)
     optimizer = MFSdpOptimizer(standalone_optimizer, wrapped_chunks)
     return wrapped_chunks, optimizer
+
+
+def _order_param_gathers_for_parallel_collectives(
+    config: MFSDPConfig,
+    ps: Any,
+) -> MFSDPConfig:
+    """Avoid unordered async collectives across intersecting process groups.
+
+    The standalone overlap pipeline has no dependency handshake with model-side
+    TP/CP/EP/ETP collectives.  When parameter shards and model-parallel groups
+    both span ranks, prefetching the next bucket can enqueue collectives on
+    intersecting process groups in different orders.  Keep overlap for pure
+    data parallelism, but make multidimensional compositions use ordered bucket
+    gathers until that cross-group handshake exists.
+    """
+    if not config.overlap_param_gather:
+        return config
+
+    model_parallel_size = math.prod(
+        max(int(getattr(ps, name, 1) or 1), 1)
+        for name in ("tp_size", "cp_size", "ep_size", "etp_size")
+    )
+    sharded_group_size = max(
+        int(getattr(ps, "dp_cp_size", 1) or 1),
+        int(getattr(ps, "expert_dp_size", 1) or 1),
+    )
+    if model_parallel_size == 1 or sharded_group_size == 1:
+        return config
+
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.warning(
+            "Disabling M-FSDP parameter-gather overlap because parameter shards "
+            "and model-parallel collectives span intersecting process groups."
+        )
+    return replace(config, overlap_param_gather=False)
 
 
 def _mark_mfsdp_parallel_attrs(
@@ -450,8 +479,6 @@ def _build_param_groups(
             if not param.requires_grad or id(param) in seen:
                 continue
             seen.add(id(param))
-            if param.numel() == 0:
-                continue
             params.append(param)
             normalized_name = name.removeprefix("module.")
             if classifier(normalized_name):

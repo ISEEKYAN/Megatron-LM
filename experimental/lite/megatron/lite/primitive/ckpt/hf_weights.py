@@ -216,18 +216,6 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     return base_model
 
 
-def _materialize_full_parameters_if_available(chunks: list[nn.Module]) -> list[object]:
-    materialized: list[object] = []
-    for chunk in chunks:
-        for module in chunk.modules():
-            param_sync = getattr(module, "param_sync", None)
-            materialize = getattr(param_sync, "materialize_all", None)
-            if callable(materialize):
-                materialize()
-                materialized.append(param_sync)
-    return materialized
-
-
 def save_safetensors(
     tensors: dict[str, torch.Tensor], path: str, filename: str = "model.safetensors"
 ) -> None:
@@ -798,6 +786,28 @@ def _merge_dense_shards(
     return torch.cat(shards, dim=split_dim)
 
 
+def _iter_export_named_parameters(chunk: nn.Module, base_chunk: nn.Module):
+    """Source ``(name, full_param)`` pairs for export, bounded when possible.
+
+    Backends whose wrapper exposes ``stream_full_parameters`` (M-FSDP) gather
+    the unsharded parameters one bucket at a time, capping the transient export
+    footprint at a single bucket instead of the whole model. Everything else --
+    FSDP2 ``DTensor`` params (gathered lazily by ``_materialize_dtensor``) and
+    plain manually-sharded params -- falls back to ``named_parameters``.
+    """
+    streamer = getattr(chunk, "stream_full_parameters", None)
+    if callable(streamer):
+        from megatron.lite.primitive.utils import log_rank0
+
+        log_rank0(
+            "[export] M-FSDP stream_full_parameters path active "
+            "(bounded per-bucket materialization)"
+        )
+        yield from streamer()
+    else:
+        yield from base_chunk.named_parameters()
+
+
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,
@@ -824,27 +834,6 @@ def export_hf_weights(
     else:
         chunks = [model]
 
-    param_syncs = _materialize_full_parameters_if_available(chunks)
-    try:
-        yield from _export_hf_weights_materialized(
-            chunks, spec, ps, vocab_size, limit, rank0_only, export_dtype
-        )
-    finally:
-        for param_sync in reversed(param_syncs):
-            release = getattr(param_sync, "release_all", None)
-            if callable(release):
-                release()
-
-
-def _export_hf_weights_materialized(
-    chunks: list[nn.Module],
-    spec: HFWeights,
-    ps,
-    vocab_size: int | None,
-    limit: int | None,
-    rank0_only: bool,
-    export_dtype: str | torch.dtype | None,
-) -> Generator[tuple[str, torch.Tensor], None, None]:
     rank = dist.get_rank() if dist.is_initialized() else 0
     resolved_export_dtype = _resolve_export_dtype(export_dtype)
 
@@ -861,7 +850,11 @@ def _export_hf_weights_materialized(
                 if hasattr(base_chunk, "layer_indices")
                 else {}
             )
-            for name, param in base_chunk.named_parameters():
+            # M-FSDP backends stream unsharded params one bounded bucket at a
+            # time via ``stream_full_parameters`` (capping the export peak);
+            # FSDP2 / manual shards fall back to ``named_parameters`` and are
+            # gathered lazily downstream by ``_materialize_dtensor``.
+            for name, param in _iter_export_named_parameters(chunk, base_chunk):
                 yield to_global_layer_name(name, layer_map), param.data.detach()
             if callable(is_export_buffer):
                 for name, buffer in base_chunk.named_buffers():

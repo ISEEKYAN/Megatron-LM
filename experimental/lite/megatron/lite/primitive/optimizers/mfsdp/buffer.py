@@ -15,7 +15,7 @@ import importlib
 import logging
 import math
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -153,6 +153,9 @@ class TemporaryBufferAllocator:
         # Dynamic storage is reclaimed when the lease drops its final reference.
         return None
 
+    def release_cached(self, *, force: bool = False) -> None:
+        """Drop allocator-owned communication storage before a device move."""
+
 
 class DoubleBufferAllocator(TemporaryBufferAllocator):
     """Two persistent communication slots per dtype/device/group key."""
@@ -161,6 +164,7 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
         super().__init__(user_buffer)
         self._slots: dict[tuple[Any, ...], list[torch.Tensor | None]] = {}
         self._busy: dict[tuple[Any, ...], set[int]] = {}
+        self._reuse_events: dict[tuple[Any, ...], list[Any | None]] = {}
 
     def allocate(
         self,
@@ -174,6 +178,7 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
         pool_key = (*key, dtype, device)
         slots = self._slots.setdefault(pool_key, [None, None])
         busy = self._busy.setdefault(pool_key, set())
+        reuse_events = self._reuse_events.setdefault(pool_key, [None, None])
         for slot in range(2):
             if slot in busy:
                 continue
@@ -193,6 +198,8 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
                 registered = bool(
                     self.user_buffer is not None and self.user_buffer.active
                 )
+            _wait_for_reuse_event(reuse_events[slot], tensor)
+            reuse_events[slot] = None
             busy.add(slot)
             return BufferLease(
                 tensor=tensor.narrow(0, 0, numel),
@@ -211,7 +218,35 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
 
     def release(self, lease: BufferLease) -> None:
         if lease.slot is not None:
+            events = self._reuse_events.setdefault(lease.key, [None, None])
+            events[lease.slot] = _record_reuse_event(lease.tensor)
             self._busy.get(lease.key, set()).discard(lease.slot)
+
+    def release_cached(self, *, force: bool = False) -> None:
+        # The busy check catches genuine misuse — releasing the cache while a
+        # collective is legitimately in flight — on the normal path. On an
+        # exception-driven teardown (``force=True``) a slot may be left busy by
+        # an aborted collective; raising here would replace the primary error
+        # (e.g. the OOM that triggered the teardown) with a misleading
+        # "active buffers" RuntimeError, so force-drop the cache instead.
+        if not force and any(self._busy.values()):
+            raise RuntimeError("Cannot release active M-FSDP communication buffers.")
+        self._slots.clear()
+        self._busy.clear()
+        self._reuse_events.clear()
+
+
+def _record_reuse_event(tensor: torch.Tensor) -> Any | None:
+    if tensor.device.type != "cuda":
+        return None
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream(tensor.device))
+    return event
+
+
+def _wait_for_reuse_event(event: Any | None, tensor: torch.Tensor) -> None:
+    if event is not None:
+        torch.cuda.current_stream(tensor.device).wait_event(event)
 
 
 def build_temporary_allocator(
@@ -247,6 +282,7 @@ class ParamSpec:
     local_offset: int = 0
     param_offset: int = 0
     shard_param: nn.Parameter | None = None
+    retain_full_storage_through_backward: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +305,7 @@ class ParamBucket:
         gather_group: dist.ProcessGroup | None,
         config: MFSDPConfig,
         allocator: TemporaryBufferAllocator,
+        allocator_layout_key: tuple[Any, ...],
     ) -> None:
         if not specs:
             raise ValueError("An M-FSDP parameter bucket cannot be empty.")
@@ -280,6 +317,10 @@ class ParamBucket:
         self.rank = group_rank(process_group)
         self.config = config
         self.allocator = allocator
+        self.allocator_layout_key = allocator_layout_key
+        self.retain_full_storage_through_backward = all(
+            spec.retain_full_storage_through_backward for spec in specs
+        )
         self.device = specs[0].full_param.device
         compute_dtype = specs[0].full_param.dtype
         self.policy = MixedPrecisionPolicy(
@@ -328,10 +369,14 @@ class ParamBucket:
             dtype=self.policy.compute_dtype,
             device=self.device,
         )
-        self.local_grad_comm_buffer = torch.empty(
-            self.local_numel,
-            dtype=self.policy.grad_comm_dtype,
-            device=self.device,
+        self.local_grad_comm_buffer = (
+            self.main_grad_buffer
+            if self.policy.grad_comm_dtype == self.policy.main_grads_dtype
+            else torch.empty(
+                self.local_numel,
+                dtype=self.policy.grad_comm_dtype,
+                device=self.device,
+            )
         )
         self.full_buffer = torch.empty(0, dtype=compute_dtype, device=self.device)
         self._full_lease: BufferLease | None = None
@@ -394,7 +439,11 @@ class ParamBucket:
                 dtype=self.policy.compute_dtype,
                 device=self.device,
                 group=self.gather_group,
-                key=("param", self.bucket_id),
+                key=(
+                    "param",
+                    id(self.gather_group),
+                    self.allocator_layout_key,
+                ),
             )
             self.full_buffer = self._full_lease.tensor
         self.local_compute_buffer.copy_(self.main_param_buffer)
@@ -435,7 +484,67 @@ class ParamBucket:
             dtype=self.policy.compute_dtype,
             device=self.device,
         )
+
         self._full_ready = False
+
+    def discard_full_parameter_views(self) -> None:
+        """Release full-parameter references after autograd no longer needs them."""
+        empty = torch.empty(
+            0,
+            dtype=self.policy.compute_dtype,
+            device=self.device,
+        )
+        with torch.no_grad():
+            for spec in self.specs:
+                spec.full_param.data = empty
+
+    def move_model_state(self, device: torch.device, *, load_grad: bool) -> None:
+        """Move persistent sharded storage without breaking optimizer aliases."""
+        device = torch.device(device)
+        self.release_full_parameters()
+        self.discard_full_parameter_views()
+        if self._grad_reduce_launched:
+            self.wait_grad_reduce()
+        self.allocator.release_cached()
+
+        grad_present = {
+            id(spec): spec.shard_param is not None and spec.shard_param.grad is not None
+            for spec in self.specs
+        }
+        self.main_param_buffer = self.main_param_buffer.to(device)
+        grad_comm_shares_main = self.local_grad_comm_buffer is self.main_grad_buffer
+        self.main_grad_buffer = self.main_grad_buffer.to(device)
+        self.grad_shard_buffer = self.main_grad_buffer
+        self.local_compute_buffer = self.local_compute_buffer.to(device)
+        self.local_grad_comm_buffer = (
+            self.main_grad_buffer
+            if grad_comm_shares_main
+            else self.local_grad_comm_buffer.to(device)
+        )
+        self.device = device
+        self.full_buffer = torch.empty(
+            0,
+            dtype=self.policy.compute_dtype,
+            device=device,
+        )
+
+        with torch.no_grad():
+            for spec in self.specs:
+                assert spec.shard_param is not None
+                spec.shard_param.data = self.main_param_buffer.narrow(
+                    0,
+                    spec.local_offset,
+                    spec.shard_numel,
+                )
+                if load_grad and grad_present[id(spec)]:
+                    spec.shard_param.grad = self.main_grad_buffer.narrow(
+                        0,
+                        spec.local_offset,
+                        spec.shard_numel,
+                    ).view_as(spec.shard_param)
+                else:
+                    spec.shard_param.grad = None
+                spec.full_param.data = self.full_buffer
 
     def prepare_grad_reduce(
         self, *, force: bool = False
@@ -450,7 +559,11 @@ class ParamBucket:
             dtype=self.policy.grad_comm_dtype,
             device=self.device,
             group=self.process_group,
-            key=("grad", self.bucket_id),
+            key=(
+                "grad",
+                id(self.process_group),
+                self.allocator_layout_key,
+            ),
         )
         grad_input = self._grad_lease.tensor
         grad_input.zero_()
@@ -549,12 +662,14 @@ class ParamBucket:
             if param.grad is None:
                 return
             self._grad_ready_ids.add(id(spec))
-            if (
-                self.grad_sync_enabled
-                and len(self._grad_ready_ids) == len(self.specs)
-                and self.grad_ready_callback is not None
-            ):
+            if len(self._grad_ready_ids) != len(self.specs):
+                return
+            if self.grad_sync_enabled and self.grad_ready_callback is not None:
                 self.grad_ready_callback(self)
+            self.release_full_parameters()
+            self.discard_full_parameter_views()
+            if not self.grad_sync_enabled:
+                self._grad_ready_ids.clear()
 
         return grad_ready
 
@@ -622,16 +737,21 @@ class ParamAndGradBuffer:
                 expert_by_param_id[id(param)] = bool(is_expert(name))
             spec.bindings.append(ParamBinding(parent, attribute))
 
-        grouped: dict[tuple[int, bool, torch.dtype, torch.device], list[ParamSpec]] = (
-            defaultdict(list)
-        )
-        owner_for_key: dict[tuple[int, bool, torch.dtype, torch.device], nn.Module] = {}
+        grouped: dict[
+            tuple[int, bool, bool, torch.dtype, torch.device], list[ParamSpec]
+        ] = defaultdict(list)
+        owner_for_key: dict[
+            tuple[int, bool, bool, torch.dtype, torch.device], nn.Module
+        ] = {}
         for param_id, spec in specs_by_id.items():
             owner = owner_by_param_id[param_id]
             expert = expert_by_param_id[param_id]
+            retain_full_storage = len(spec.shape) == 1
+            spec.retain_full_storage_through_backward = retain_full_storage
             key = (
                 module_order[id(owner)],
                 expert,
+                retain_full_storage,
                 spec.full_param.dtype,
                 spec.full_param.device,
             )
@@ -641,9 +761,12 @@ class ParamAndGradBuffer:
         buckets: list[ParamBucket] = []
         owners: dict[int, list[int]] = defaultdict(list)
         for key in sorted(grouped, key=lambda item: item[0]):
-            _owner_order, expert, _dtype, _device = key
+            _owner_order, expert, _retain_full_storage, _dtype, _device = key
             owner = owner_for_key[key]
-            for partition in _split_specs(grouped[key], self.config.bucket_size):
+            partitions = _split_specs(grouped[key], self.config.bucket_size)
+            owner_type = type(owner)
+            owner_layout = f"{owner_type.__module__}.{owner_type.__qualname__}"
+            for partition_index, partition in enumerate(partitions):
                 bucket_id = len(buckets)
                 buckets.append(
                     ParamBucket(
@@ -653,6 +776,14 @@ class ParamAndGradBuffer:
                         gather_group=self.groups.gather_group(expert=expert),
                         config=self.config,
                         allocator=self.allocator,
+                        allocator_layout_key=(
+                            owner_layout,
+                            expert,
+                            _retain_full_storage,
+                            partition_index,
+                            len(partitions),
+                            sum(spec.numel for spec in partition),
+                        ),
                     )
                 )
                 owners[id(owner)].append(bucket_id)
@@ -789,9 +920,20 @@ class AllGatherPipeline:
 
     def wait_bucket_ready(self, bucket_id: int, bwd: bool = False) -> None:
         bucket = self.buckets[bucket_id]
-        if not bucket._full_ready and bucket._param_gather_work is None:
+        if self.overlap and not bucket._full_ready and bucket._param_gather_work is None:
+            # Prefetch/overlap path: launch the dense all-gather ahead of use on the
+            # dedicated priority communication stream.
             self.async_bucket_gather(bucket_id, bwd=bwd)
         self.comm_stream.wait_for_current()
+        # When overlap is disabled (the guard forces this for any CP>=2 + DP-sharded
+        # config, see optimizer._order_param_gathers_for_parallel_collectives), do NOT
+        # launch on the side comm stream. Let wait_param_gather issue the all-gather on
+        # the current compute stream instead, so dense_ag (gather_group == dp_cp_ag_group)
+        # is enqueued in program order alongside the model's CP collectives (cp_group).
+        # Those two process groups intersect; launching them from different streams lets
+        # their NCCL enqueue order diverge across ranks on multi-node runs -> collective
+        # deadlock (invisible on single-node NVLink proxies). Program-order serialization
+        # on one stream mirrors how FSDP2 avoids the same hazard.
         bucket.wait_param_gather()
 
     def begin_forward(self) -> None:
@@ -816,16 +958,10 @@ class AllGatherPipeline:
     def acquire_backward(self, bucket: ParamBucket) -> None:
         bucket_id = bucket.bucket_id
         self.wait_bucket_ready(bucket_id, bwd=True)
+        bucket.install_full_parameters()
         self._backward_cursor = min(self._backward_cursor, bucket_id - 1)
         if self.overlap and self._backward_cursor >= 0:
             self.async_bucket_gather(self._backward_cursor, bwd=True)
-
-    def install_backward_all(self) -> None:
-        for bucket in self.buckets:
-            self.async_bucket_gather(bucket.bucket_id, bwd=True)
-        for bucket in self.buckets:
-            self.wait_bucket_ready(bucket.bucket_id, bwd=True)
-            bucket.install_full_parameters()
 
     def materialize_all(self) -> None:
         for bucket in self.buckets:
@@ -837,6 +973,9 @@ class AllGatherPipeline:
     def release_all(self) -> None:
         for bucket in self.buckets:
             bucket.release_full_parameters()
+
+    def reset_device(self, device: torch.device) -> None:
+        self.comm_stream = CommunicationStream(device)
 
 
 class GradReducePipeline:
@@ -886,6 +1025,9 @@ class GradReducePipeline:
         for bucket in self.buckets:
             bucket.set_grad_sync_enabled(enabled)
 
+    def reset_device(self, device: torch.device) -> None:
+        self.comm_stream = CommunicationStream(device)
+
 
 class CommunicationPipelines:
     """Join parameter all-gather and gradient reduce-scatter pipelines."""
@@ -907,17 +1049,101 @@ class CommunicationPipelines:
     def acquire_backward(self, bucket: ParamBucket) -> None:
         self.all_gather.acquire_backward(bucket)
 
-    def install_backward_all(self) -> None:
-        self.all_gather.install_backward_all()
+    def acquire_backward_ids(self, bucket_ids: Iterable[int]) -> None:
+        for bucket_id in reversed(tuple(bucket_ids)):
+            self.all_gather.acquire_backward(self.buckets[bucket_id])
+
+    def release_backward_ids(self, bucket_ids: Iterable[int]) -> None:
+        for bucket_id in bucket_ids:
+            bucket = self.buckets[bucket_id]
+            bucket.release_full_parameters()
+            bucket.discard_full_parameter_views()
+
+    def release_forward_ids(self, bucket_ids: Iterable[int]) -> None:
+        for bucket_id in bucket_ids:
+            bucket = self.buckets[bucket_id]
+            if not bucket.retain_full_storage_through_backward:
+                bucket.release_full_parameters()
+                bucket.discard_full_parameter_views()
 
     def end_forward(self) -> None:
-        self.all_gather.release_all()
+        for bucket in self.buckets:
+            if not bucket.retain_full_storage_through_backward:
+                bucket.release_full_parameters()
+                bucket.discard_full_parameter_views()
 
     def materialize_all(self) -> None:
         self.all_gather.materialize_all()
 
+    def stream_materialize_buckets(self) -> Iterator["ParamBucket"]:
+        """Materialize one bucket at a time, releasing each before the next.
+
+        ``materialize_all`` all-gathers *every* bucket into the persistent
+        double-buffer simultaneously, so the whole unsharded model is resident
+        at once -- a transient full-model peak (tens of GiB/rank) that lands on
+        top of steady-state and drives the colocated resync OOM. A
+        full-parameter *export* only ever reads one
+        parameter at a time, so it does not need the whole model resident; this
+        generator bounds the transient footprint to a single bucket by
+        gather → install → yield → release per bucket, mirroring FSDP2's
+        per-parameter ``full_tensor`` path (which retains no whole-model buffer
+        and shows no export peak). Consumers MUST finish reading a bucket's
+        parameters before requesting the next (plain iteration guarantees this).
+        """
+        for bucket in self.buckets:
+            self.all_gather.async_bucket_gather(bucket.bucket_id)
+            self.all_gather.wait_bucket_ready(bucket.bucket_id)
+            bucket.install_full_parameters()
+            try:
+                yield bucket
+            finally:
+                bucket.release_full_parameters()
+                bucket.discard_full_parameter_views()
+
     def release_all(self) -> None:
         self.all_gather.release_all()
+
+    def discard_full_parameter_views(self) -> None:
+        for bucket in self.buckets:
+            bucket.discard_full_parameter_views()
+
+    def release_cached_buffers(self, *, force: bool = False) -> None:
+        """Return retained double-buffer all-gather storage to the driver.
+
+        ``release_all`` only drops the pipeline's own references to the
+        full-parameter buffers. Under ``fsdp_double_buffer`` (the default) the
+        buffers stay pinned in ``DoubleBufferAllocator``'s persistent slots so
+        they can be reused across the many acquire/release cycles of a training
+        step -- torch's caching allocator (hence ``empty_cache`` and
+        ``expandable_segments``) can never return that storage to the driver
+        while a slot still references it. That reuse is desirable during
+        training but wrong after a *full-parameter export*: a colocated consumer
+        (e.g. a sleeping vLLM engine that must ``wake_up``) needs the
+        full-model-sized storage handed back to the driver. Dropping the cached
+        slots here makes the export release bounded -- matching FSDP2's
+        ``full_tensor`` path, which retains no persistent buffer. The slots are
+        transparently re-allocated on the next ``materialize``.
+
+        On the normal path this is called after ``release_all`` has drained
+        every lease, so no buffer is in flight and the allocator's busy check
+        passes. ``force=True`` (used when the export scope unwinds because of an
+        exception) bypasses that check so an aborted-collective busy slot does
+        not mask the primary error with a spurious "active buffers" raise.
+        """
+        seen: set[int] = set()
+        for bucket in self.buckets:
+            allocator = bucket.allocator
+            if id(allocator) in seen:
+                continue
+            seen.add(id(allocator))
+            allocator.release_cached(force=force)
+
+    def move_model_state(self, device: torch.device, *, load_grad: bool) -> None:
+        device = torch.device(device)
+        for bucket in self.buckets:
+            bucket.move_model_state(device, load_grad=load_grad)
+        self.all_gather.reset_device(device)
+        self.grad_reduce.reset_device(device)
 
     def finish_grad_sync(self) -> None:
         self.grad_reduce.finish()
