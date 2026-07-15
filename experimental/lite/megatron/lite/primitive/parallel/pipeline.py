@@ -558,6 +558,12 @@ def _send_recv_pipeline(
     # are ignored for receiving in this mode (shapes vary per micro-batch).
     recv_fwd_shape: tuple[int, ...] | None = None
     recv_bwd_shape: tuple[int, ...] | None = None
+    # TODO(perf): dynamic_shape allocates a fresh recv buffer per micro-batch
+    # (shapes vary, so a single fixed buffer cannot be reused). The CUDA caching
+    # allocator absorbs most of the cost, but variable shapes still fragment it.
+    # A future optimization could pre-allocate one max-sequence-length buffer and
+    # narrow into it (with clone_recv=True to avoid aliasing across micro-batches),
+    # or keep a per-shape buffer pool, to remove the per-recv allocation.
     if dynamic_shape:
         recv_fwd_shape, recv_bwd_shape = _communicate_shapes(
             send_fwd, send_bwd, recv_fwd, recv_bwd, ps, batch_p2p=batch_p2p
