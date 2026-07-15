@@ -17,329 +17,364 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-_BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+_VLLM_ASYNC_SERVER_MODULE = (
+    "verl.workers.rollout.vllm_rollout.vllm_async_server"
+)
+_VLLM_ROLLOUT_CONSUMER_MODULE = (
+    "verl.workers.rollout.vllm_rollout.vllm_rollout"
+)
+_REGISTERED_HF_CONFIG_TYPES: set[str] = set()
+
+_VLLM_IMPORTABLE: bool | None = None
 
 
-class _SyncBucketProducer:
-    """Pack one sender bucket at a time into a caller-owned staging slot."""
+def _vllm_importable() -> bool:
+    """Whether ``import vllm`` succeeds in THIS process.
 
-    def __init__(self, weights, bucket_size: int):
-        self._weights = iter(weights)
-        self._bucket_size = bucket_size
-        self._pending = None
-        self._exhausted = False
-
-    def next_bucket(self, staging):
-        import torch
-
-        if staging.device.type == "cuda":
-            torch.cuda.set_device(staging.device)
-        if self._exhausted:
-            return "eof", None, None, 0, None, True
-
-        offset = 0
-        bucket_meta = {}
-        while True:
-            try:
-                if self._pending is None:
-                    name, weight = next(self._weights)
-                else:
-                    name, weight = self._pending
-                    self._pending = None
-            except StopIteration:
-                self._exhausted = True
-                if not bucket_meta:
-                    return "eof", None, None, 0, None, True
-                break
-
-            if offset + weight.nbytes > self._bucket_size and bucket_meta:
-                self._pending = (name, weight)
-                break
-            if weight.nbytes > self._bucket_size:
-                return "direct", name, weight, 0, None, False
-
-            bucket_meta[name] = {
-                "name": name,
-                "shape": weight.shape,
-                "dtype": weight.dtype,
-                "offset": offset,
-                "handle": None,
-            }
-            staging[offset : offset + weight.nbytes].copy_(
-                weight.view(-1).view(torch.uint8), non_blocking=True
-            )
-            offset += weight.nbytes
-            if offset == self._bucket_size:
-                break
-
-        ready = None
-        if staging.device.type == "cuda":
-            ready = torch.cuda.Event()
-            ready.record(torch.cuda.current_stream(staging.device))
-        return "bucket", bucket_meta, None, offset, ready, self._exhausted
-
-
-def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
-    """Overlap synchronous weight production with the receiver's bucket ACK."""
-    if getattr(sender_cls, "_mlite_weight_prefetch_patch", False):
-        return False
-
-    original_async_send_weights = sender_cls.async_send_weights
-
-    async def prefetched_async_send_weights(self, weights):
-        import torch
-
-        if not isinstance(weights, Iterable) or hasattr(weights, "__aiter__") or self.use_shm:
-            return await original_async_send_weights(self, weights)
-
-        executor = None
-        stop = threading.Event()
-        free_slots = None
-        ready_results = None
-        held_slot = None
+    A fat rollout overlay (native vLLM 0.25 = torch 2.11+cu130, Transformers v5)
+    can only be imported inside the vLLM rollout Ray actor, which is scoped to
+    the overlay's torch + CUDA libs via the compat vLLM-server profile. The
+    training driver and worker processes keep the container/SM90 stack, whose
+    vllm build is ABI/CUDA-incompatible with this container — importing it there
+    dies with e.g. ``libcudart.so.12: cannot open shared object file`` (SM90's
+    CUDA-12 vllm in a CUDA-13 container) or the Transformers-v4/v5 mismatch.
+    Every vllm-touching patch below is therefore a no-op wherever vllm is
+    unimportable, so importing verl_mlite on the driver (hydra config
+    validation instantiates the engine module tree, which used to eagerly import
+    the rollout vllm utils) and running apply_runtime_patches there no longer
+    crash on the rollout engine's vllm. The result is cached because the import
+    outcome is fixed per process and a failed attempt is slow to retry.
+    """
+    global _VLLM_IMPORTABLE
+    if _VLLM_IMPORTABLE is None:
         try:
-            self._init_socket()
-            self._init_buffer()
-            if self.buffer.device.type != "cuda" and not getattr(
-                self, "_mlite_prefetch_allow_cpu", False
-            ):
-                raise RuntimeError("MLite sender prefetch requires a CUDA IPC buffer")
-
-            staging_slots = [torch.empty_like(self.buffer) for _ in range(2)]
-            producer = _SyncBucketProducer(weights, self.bucket_size)
-            free_slots = queue.Queue(maxsize=2)
-            ready_results = queue.Queue(maxsize=2)
-            for slot_index in range(2):
-                free_slots.put_nowait(slot_index)
-            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlite-weight-prefetch")
-
-            def put_ready(result):
-                while not stop.is_set():
-                    try:
-                        ready_results.put(result, timeout=0.05)
-                        return True
-                    except queue.Full:
-                        continue
-                return False
-
-            def produce():
-                slot_index = None
-                try:
-                    while not stop.is_set():
-                        try:
-                            slot_index = free_slots.get(timeout=0.05)
-                        except queue.Empty:
-                            continue
-                        result = producer.next_bucket(staging_slots[slot_index])
-                        if not put_ready((*result, slot_index)):
-                            return
-                        slot_index = None
-                        kind, *_, is_last = result
-                        if kind == "eof" or is_last:
-                            return
-                except BaseException as exc:
-                    put_ready(("error", exc, None, 0, None, True, slot_index))
-
-            context = copy_context()
-            worker_future = executor.submit(context.run, produce)
-            while True:
-                try:
-                    result = ready_results.get(timeout=0.1)
-                except queue.Empty:
-                    if worker_future.done():
-                        worker_future.result()
-                        raise RuntimeError("MLite weight prefetch stopped without a terminal result")
-                    continue
-
-                kind, metadata_or_name, direct_weight, used_bytes, ready, is_last, held_slot = (
-                    result
-                )
-                if kind == "error":
-                    raise metadata_or_name
-                if kind == "eof":
-                    free_slots.put_nowait(held_slot)
-                    held_slot = None
-                    self.socket.send_pyobj({"bucket_meta": {}, "is_last": True})
-                    self.socket.recv()
-                    break
-                if kind == "direct":
-                    free_slots.put_nowait(held_slot)
-                    held_slot = None
-                    self._direct_send_large_weight(metadata_or_name, direct_weight)
-                    continue
-
-                if ready is not None:
-                    ready.synchronize()
-                staging = staging_slots[held_slot]
-                self.buffer[:used_bytes].copy_(staging[:used_bytes], non_blocking=True)
-                if self.buffer.device.type == "cuda":
-                    torch.cuda.synchronize(self.buffer.device)
-                free_slots.put_nowait(held_slot)
-                held_slot = None
-
-                self.socket.send_pyobj(
-                    {"bucket_meta": metadata_or_name, "is_last": is_last}
-                )
-                self.socket.recv()
-                if is_last:
-                    break
-        finally:
-            stop.set()
-            if held_slot is not None and free_slots is not None:
-                try:
-                    free_slots.put_nowait(held_slot)
-                except queue.Full:
-                    pass
-            if executor is not None:
-                executor.shutdown(wait=True, cancel_futures=True)
-            self._cleanup()
-
-    sender_cls.async_send_weights = prefetched_async_send_weights
-    sender_cls._mlite_weight_prefetch_patch = True
-    return True
+            # A bare ``import vllm`` only runs the lazy PEP-562 package shell and
+            # succeeds even where the real engine is unusable, so force the same
+            # entrypoint VERL pulls (``from vllm import LLM``). Accessing ``LLM``
+            # triggers the lazy load of vllm.entrypoints -> vllm.config ->
+            # vllm.platforms -> ``vllm._C``, i.e. the exact chain that dies on the
+            # driver with libcudart.so.12 / the torch-ABI mismatch.
+            getattr(importlib.import_module("vllm"), "LLM")
+            _VLLM_IMPORTABLE = True
+        except Exception:
+            _VLLM_IMPORTABLE = False
+    return _VLLM_IMPORTABLE
 
 
-def _weight_sync_probe_enabled() -> bool:
-    return os.getenv("MLITE_WEIGHT_SYNC_PROBE", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _instrument_bucketed_weight_sender(sender_cls: type) -> bool:
-    """Patch veRL's sender only while the opt-in sync probe is enabled."""
-    if getattr(sender_cls, "_mlite_weight_sync_probe_patch", False):
+def _register_opaque_hf_config() -> bool:
+    """Let VERL preserve config fields for an MLite-owned model type."""
+    model_type = os.environ.get("VERL_MLITE_HF_CONFIG_MODEL_TYPE", "").strip()
+    if not model_type or model_type in _REGISTERED_HF_CONFIG_TYPES:
         return False
 
-    import torch
-    import torch.distributed as dist
-    from torch.utils._python_dispatch import TorchDispatchMode
+    from transformers import AutoConfig, PretrainedConfig
 
-    from megatron.lite.primitive.ckpt.weight_sync_probe import (
-        get_weight_sync_probe,
-        weight_sync_probe_session,
+    config_cls = type(
+        "MLiteOpaqueConfig",
+        (PretrainedConfig,),
+        {"model_type": model_type},
     )
-
-    probe = get_weight_sync_probe()
-    original_init_socket = sender_cls._init_socket
-    original_async_send_weights = sender_cls.async_send_weights
-
-    class _ProfiledSocket:
-        def __init__(self, socket):
-            self._socket = socket
-
-        def __getattr__(self, name):
-            return getattr(self._socket, name)
-
-        def send_pyobj(self, *args, **kwargs):
-            with probe.measure("handshake"):
-                return self._socket.send_pyobj(*args, **kwargs)
-
-        def recv(self, *args, **kwargs):
-            with probe.measure("handshake"):
-                return self._socket.recv(*args, **kwargs)
-
-    class _H2DCopyMode(TorchDispatchMode):
-        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-            kwargs = kwargs or {}
-            if func is torch.ops.aten.copy_.default and len(args) >= 2:
-                dst, src = args[:2]
-                if (
-                    isinstance(dst, torch.Tensor)
-                    and isinstance(src, torch.Tensor)
-                    and dst.device.type == "cuda"
-                    and src.device.type == "cpu"
-                ):
-                    with probe.measure("h2d", nbytes=src.nbytes, device=dst.device):
-                        return func(*args, **kwargs)
-            return func(*args, **kwargs)
-
-    def profiled_init_socket(self, *args, **kwargs):
-        result = original_init_socket(self, *args, **kwargs)
-        self.socket = _ProfiledSocket(self.socket)
-        return result
-
-    async def profiled_async_send_weights(self, weights):
-        backend = os.getenv("MLITE_WEIGHT_SYNC_PROBE_BACKEND", "unknown")
-        original_all_gather_into_tensor = dist.all_gather_into_tensor
-
-        def profiled_all_gather_into_tensor(output, tensor, *args, **kwargs):
-            with probe.measure("mbridge_gather", nbytes=output.nbytes, device=tensor.device):
-                return original_all_gather_into_tensor(output, tensor, *args, **kwargs)
-
-        with weight_sync_probe_session(backend), _H2DCopyMode():
-            dist.all_gather_into_tensor = profiled_all_gather_into_tensor
-            try:
-                return await original_async_send_weights(self, weights)
-            finally:
-                dist.all_gather_into_tensor = original_all_gather_into_tensor
-
-    sender_cls._init_socket = profiled_init_socket
-    sender_cls.async_send_weights = profiled_async_send_weights
-    sender_cls._mlite_weight_sync_probe_patch = True
+    try:
+        AutoConfig.register(model_type, config_cls)
+    except ValueError:
+        # A newer Transformers already owns this model type.
+        _REGISTERED_HF_CONFIG_TYPES.add(model_type)
+        return False
+    _REGISTERED_HF_CONFIG_TYPES.add(model_type)
     return True
 
 
-class _SenderPatchLoader(importlib.abc.Loader):
-    def __init__(self, loader: importlib.abc.Loader):
-        self._loader = loader
+class _VllmThinFinder(importlib.abc.MetaPathFinder):
+    """Resolve only the top-level ``vllm`` package from a rollout site."""
 
-    def create_module(self, spec):
-        create_module = getattr(self._loader, "create_module", None)
-        return create_module(spec) if create_module is not None else None
+    _verl_mlite_vllm_thin_finder = True
 
-    def exec_module(self, module) -> None:
-        self._loader.exec_module(module)
-        _install_bucketed_sender_prefetch(module.BucketedWeightSender)
-        if _weight_sync_probe_enabled():
-            _instrument_bucketed_weight_sender(module.BucketedWeightSender)
-
-
-class _SenderPatchFinder(importlib.abc.MetaPathFinder):
-    _mlite_weight_sync_probe_finder = True
-
-    def __init__(self):
-        self._mlite_weight_sync_probe_requested = False
+    def __init__(self, site: str):
+        self._site = site
 
     def find_spec(self, fullname, path, target=None):
-        if fullname != _BUCKETED_SENDER_MODULE:
+        if fullname != "vllm":
             return None
-        spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
-        if spec is not None and spec.loader is not None:
-            spec.loader = _SenderPatchLoader(spec.loader)
-        return spec
+        return importlib.machinery.PathFinder.find_spec(fullname, [self._site], target)
 
 
-def _patch_bucketed_weight_transfer() -> bool:
-    module = sys.modules.get(_BUCKETED_SENDER_MODULE)
-    if module is not None:
-        return _install_bucketed_sender_prefetch(module.BucketedWeightSender)
-    if any(getattr(finder, "_mlite_weight_sync_probe_finder", False) for finder in sys.meta_path):
+def _install_vllm_thin_finder() -> bool:
+    site = os.environ.get("VERL_MLITE_VLLM_SITE", "").strip()
+    if not site:
         return False
-    sys.meta_path.insert(0, _SenderPatchFinder())
+    # A THIN overlay ships vllm but no torch: the container/training torch is
+    # shared, so this global meta-path finder can safely redirect EVERY process's
+    # ``import vllm`` (driver + rollout) to the overlay. A FAT overlay instead
+    # bundles its own torch (native vLLM 0.25 = torch 2.11+cu130) and a newer
+    # vllm whose hard Transformers-v5 requirement mismatches the training
+    # driver's Transformers-v4 stack. It must reach ONLY the rollout Ray actor,
+    # which acquires it through the scoped verl_mlite.compat vLLM-server profile
+    # (its site is prepended to that actor's PYTHONPATH). Installing a global
+    # finder for a fat overlay forces the driver's incidental ``import vllm``
+    # (verl config validation instantiates the rollout module tree) onto the fat
+    # vllm 0.25 and dies with "Support for Transformers v4 ... removed in vLLM
+    # v0.24.0" (job 13956329). The presence of bundled CUDA libs distinguishes a
+    # fat overlay, so skip the global finder for it and let the driver keep its
+    # own (container/SM90) vllm.
+    if _vllm_site_ld_library_path(site):
+        return False
+    if any(
+        getattr(finder, "_verl_mlite_vllm_thin_finder", False)
+        for finder in sys.meta_path
+    ):
+        return False
+    sys.meta_path.insert(0, _VllmThinFinder(site))
     return True
 
 
-def _patch_bucketed_weight_sender() -> bool:
-    """Install production prefetch plus optional probe instrumentation."""
-    changed = _patch_bucketed_weight_transfer()
-    if not _weight_sync_probe_enabled():
-        return changed
+def _patch_transformers_vision2seq_alias() -> bool:
+    """Restore the Transformers 4 vision auto-class name removed in v5.
 
-    module = sys.modules.get(_BUCKETED_SENDER_MODULE)
-    if module is not None:
-        changed = _instrument_bucketed_weight_sender(module.BucketedWeightSender) or changed
+    VERL's ``verl.utils.model`` does a top-level ``from transformers import
+    AutoModelForVision2Seq`` that every training/rollout worker hits regardless
+    of the rollout overlay. Under the single torch2.12/cu13 stack the alias must
+    apply unconditionally (transformers v5 is the only world now), so this is no
+    longer gated on ``VERL_MLITE_VLLM_SITE`` (the retired fat/thin split env).
+
+    A one-shot attribute set on the top-level module does NOT survive: importing
+    VERL's vLLM utilities re-execs Transformers' ``_LazyModule`` and rebuilds a
+    fresh instance whose ``_class_to_module`` map has no ``AutoModelForVision2Seq``
+    entry, so the injected attribute is dropped and the ``from transformers
+    import`` line fails again. We therefore patch the ``_LazyModule`` *class*'s
+    ``__getattr__`` so every instance -- current and any rebuilt one -- resolves
+    the removed name to ``AutoModelForImageTextToText``.
+    """
+    import transformers
+
+    try:
+        from transformers.utils import import_utils as _iu
+
+        lazy_cls = _iu._LazyModule
+    except Exception:  # pragma: no cover - transformers internals moved
+        lazy_cls = None
+
+    if lazy_cls is not None and not getattr(
+        lazy_cls, "_mlite_vision2seq_patched", False
+    ):
+        _orig_getattr = lazy_cls.__getattr__
+
+        def _getattr_with_vision2seq_alias(self, name):
+            if name == "AutoModelForVision2Seq":
+                return _orig_getattr(self, "AutoModelForImageTextToText")
+            return _orig_getattr(self, name)
+
+        lazy_cls.__getattr__ = _getattr_with_vision2seq_alias
+        lazy_cls._mlite_vision2seq_patched = True
+
+    # Belt-and-suspenders: also expose it on the current module object so code
+    # that does ``hasattr(transformers, "AutoModelForVision2Seq")`` short-circuits.
+    if not hasattr(transformers, "AutoModelForVision2Seq"):
+        replacement = getattr(transformers, "AutoModelForImageTextToText", None)
+        if replacement is not None:
+            transformers.AutoModelForVision2Seq = replacement
+            return True
+    return lazy_cls is not None
+
+
+def _install_vllm_triton_kernels_alias() -> bool:
+    """Prefer the rollout vLLM's complete vendored Triton kernel package."""
+    if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
+        return False
+    if not _vllm_importable():
+        return False
+    vendored = importlib.import_module("vllm.third_party.triton_kernels")
+    if sys.modules.get("triton_kernels") is vendored:
+        return False
+    sys.modules["triton_kernels"] = vendored
+    return True
+
+
+def _vllm_site_pythonpath_prefixes(site: str) -> list[str]:
+    """Extra PYTHONPATH entries a rollout overlay needs ahead of its site root.
+
+    Fat overlays (e.g. the native vLLM 0.25 DS4 closure) ship cutlass-dsl under
+    ``nvidia_cutlass_dsl/python_packages`` via a ``.pth`` that is NOT processed
+    when the site is reached through ``PYTHONPATH`` rather than site-packages
+    import. Without an explicit prefix a stray conda cutlass shadows it and
+    flashinfer dies with ``cute.nvgpu.OperandMajorMode``. Thin overlays that lack
+    the directory contribute nothing, so this stays a no-op for them.
+    """
+    prefixes: list[str] = []
+    cutlass = os.path.join(site, "nvidia_cutlass_dsl", "python_packages")
+    if os.path.isdir(cutlass):
+        prefixes.append(cutlass)
+    return prefixes
+
+
+def _vllm_site_ld_library_path(site: str) -> list[str]:
+    """CUDA runtime lib dirs a rollout overlay bundles for its own torch build.
+
+    A native-CUDA overlay (torch 2.11+cu130) colocated inside a cu128 training
+    container must expose its bundled ``nvidia/*/lib`` and ``torch/lib`` to the
+    rollout actor's loader, but ONLY to that actor — the training driver keeps
+    the container's cu128 stack. Scoping this to the vLLM Ray-actor runtime env
+    (rather than a process-wide LD_LIBRARY_PATH) is what keeps the two CUDA
+    majors from colliding. Overlays whose torch matches the container ship no
+    such dirs, so this returns nothing and stays a no-op.
+    """
+    import glob
+
+    lib_dirs = sorted(glob.glob(os.path.join(site, "nvidia", "*", "lib")))
+    torch_lib = os.path.join(site, "torch", "lib")
+    if os.path.isdir(torch_lib):
+        lib_dirs.append(torch_lib)
+    return [d for d in lib_dirs if os.path.isdir(d)]
+
+
+def _vllm_server_profile_env() -> dict[str, str]:
+    """Build the dependency profile applied only to vLLM server Ray actors."""
+    site = os.environ.get("VERL_MLITE_VLLM_SITE", "").strip()
+    if not site:
+        return {}
+    pythonpath = os.environ.get("PYTHONPATH", "").strip()
+    # Keep vLLM's dependency closure on the rollout site. The scoped compatibility
+    # alias above lets VERL import against that site's Transformers v5 build. Fat
+    # overlays additionally need their bundled cutlass ahead of the site root.
+    pythonpath_entries = _vllm_site_pythonpath_prefixes(site) + [site]
+    if pythonpath:
+        pythonpath_entries.append(pythonpath)
+    result = {
+        "PYTHONPATH": os.pathsep.join(pythonpath_entries),
+        "PYTHONNOUSERSITE": "1",
+    }
+    ld_library_entries = _vllm_site_ld_library_path(site)
+    if ld_library_entries:
+        existing_ld = os.environ.get("LD_LIBRARY_PATH", "").strip()
+        if existing_ld:
+            ld_library_entries.append(existing_ld)
+        result["LD_LIBRARY_PATH"] = os.pathsep.join(ld_library_entries)
+    shim = os.environ.get("VERL_MLITE_VLLM_LD_PRELOAD", "").strip()
+    existing_preload = os.environ.get("LD_PRELOAD", "").strip()
+    if shim:
+        result["LD_PRELOAD"] = f"{shim}:{existing_preload}" if existing_preload else shim
+    elif existing_preload:
+        result["LD_PRELOAD"] = existing_preload
+    return result
+
+
+class _RayActorClassProfile:
+    """Merge a process profile into one Ray actor class's ``runtime_env``."""
+
+    def __init__(self, actor_class: Any, env_vars: dict[str, str]):
+        self._actor_class = actor_class
+        self._env_vars = dict(env_vars)
+
+    def options(self, **kwargs: Any) -> Any:
+        runtime_env = dict(kwargs.get("runtime_env") or {})
+        env_vars = dict(runtime_env.get("env_vars") or {})
+        env_vars.update(self._env_vars)
+        runtime_env["env_vars"] = env_vars
+        kwargs["runtime_env"] = runtime_env
+        return self._actor_class.options(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._actor_class, name)
+
+
+def _patch_verl_vllm_headless_api_server_count() -> bool:
+    """Normalize vLLM's headless API server count for VERL's direct caller."""
+    if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
+        return False
+    if not _vllm_importable():
+        return False
+
+    server_module = importlib.import_module(_VLLM_ASYNC_SERVER_MODULE)
+    original_run_headless = server_module.run_headless
+    if getattr(
+        original_run_headless,
+        "_verl_mlite_api_server_count_patch",
+        False,
+    ):
+        return False
+
+    @wraps(original_run_headless)
+    def patched_run_headless(args: Any) -> Any:
+        if getattr(args, "api_server_count", None) is None:
+            args.api_server_count = 0
+        return original_run_headless(args)
+
+    patched_run_headless._verl_mlite_api_server_count_patch = True
+    server_module.run_headless = patched_run_headless
+    return True
+
+
+def _patch_vllm_server_profile() -> bool:
+    profile = _vllm_server_profile_env()
+    if not profile:
+        return False
+    if not _vllm_importable():
+        return False
+    changed = _patch_verl_vllm_headless_api_server_count()
+    server_module = importlib.import_module(_VLLM_ASYNC_SERVER_MODULE)
+    vLLMReplica = server_module.vLLMReplica
+
+    if getattr(vLLMReplica, "_verl_mlite_server_profile_patch", False):
+        return changed
+    original_init = vLLMReplica.__init__
+
+    @wraps(original_init)
+    def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        self.server_class = _RayActorClassProfile(self.server_class, profile)
+
+    vLLMReplica.__init__ = patched_init
+    vLLMReplica._verl_mlite_server_profile_patch = True
+    return True
+
+
+def _normalize_vllm_visible_device_id(device_id: int) -> int:
+    """Translate a leaked physical CUDA id back to vLLM's visible-list index."""
+    visible_devices = [
+        value.strip()
+        for value in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if value.strip()
+    ]
+    if device_id < 0 or not visible_devices or device_id < len(visible_devices):
+        return device_id
+
+    physical_id = str(device_id)
+    if physical_id in visible_devices:
+        return visible_devices.index(physical_id)
+    return device_id
+
+
+def _patch_verl_vllm_device_uuid() -> bool:
+    """Keep VERL/vLLM UUID lookup on the Ray actor's visible CUDA device."""
+    if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
+        return False
+    if not _vllm_importable():
+        return False
+
+    utils = importlib.import_module("verl.workers.rollout.vllm_rollout.utils")
+    original_get_device_uuid = utils.get_device_uuid
+    changed = False
+    if getattr(original_get_device_uuid, "_verl_mlite_visible_device_patch", False):
+        patched_get_device_uuid = original_get_device_uuid
     else:
-        finder = next(
-            finder
-            for finder in sys.meta_path
-            if getattr(finder, "_mlite_weight_sync_probe_finder", False)
-        )
-        if not finder._mlite_weight_sync_probe_requested:
-            finder._mlite_weight_sync_probe_requested = True
-            changed = True
+        @wraps(original_get_device_uuid)
+        def patched_get_device_uuid(device_id: int) -> str:
+            return original_get_device_uuid(
+                _normalize_vllm_visible_device_id(device_id)
+            )
+
+        patched_get_device_uuid._verl_mlite_visible_device_patch = True
+        utils.get_device_uuid = patched_get_device_uuid
+        changed = True
+
+    # Importing the leaf ``utils`` module first executes the package __init__,
+    # which can bind the original helper into this consumer before we replace it.
+    consumer = sys.modules.get(_VLLM_ROLLOUT_CONSUMER_MODULE)
+    if (
+        consumer is not None
+        and getattr(consumer, "get_device_uuid", None) is not patched_get_device_uuid
+    ):
+        consumer.get_device_uuid = patched_get_device_uuid
+        changed = True
     return changed
 
 
@@ -387,9 +422,252 @@ def _patch_transformers_rope_ignore_keys() -> None:
         cls._verl_mlite_rope_ignore_keys_patch = True
 
 
+def _patch_transformers_apply_chat_template_return_dict() -> bool:
+    """Restore Transformers v4's ``apply_chat_template`` list-of-ids return type.
+
+    In Transformers v5 the ``return_dict`` default of
+    ``PreTrainedTokenizerBase.apply_chat_template`` flipped from ``False`` to
+    ``True``, so a ``tokenize=True`` call now yields a ``BatchEncoding`` mapping
+    (``{"input_ids": [...], "attention_mask": [...]}``) instead of a bare
+    ``list[int]``. VERL's agent loop
+    (``verl.experimental.agent_loop.agent_loop.AgentLoop.apply_chat_template``)
+    was written against v4 and treats the result as a token-id list: it forwards
+    the value straight into ``TokensPrompt(prompt_token_ids=...)``. vLLM's input
+    validator then evaluates ``max(prompt_ids)`` over the mapping's *keys*,
+    yielding the string ``"input_ids"`` and crashing the rollout with
+    ``TypeError: '>' not supported between instances of 'str' and 'int'``
+    (job 13961728, single torch2.12/cu13 stack). We default ``return_dict`` back
+    to ``False`` whenever the caller does not set it explicitly, restoring the v4
+    contract while leaving callers that request a dict untouched. When
+    ``tokenize=False`` Transformers already forces ``return_dict=False``, so this
+    only affects the tokenizing path.
+    """
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+    except Exception:  # pragma: no cover - transformers internals moved
+        return False
+
+    original = PreTrainedTokenizerBase.apply_chat_template
+    if getattr(original, "_verl_mlite_return_dict_default_patch", False):
+        return False
+
+    @wraps(original)
+    def patched(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if "return_dict" not in kwargs:
+            kwargs["return_dict"] = False
+        return original(self, *args, **kwargs)
+
+    patched._verl_mlite_return_dict_default_patch = True
+    PreTrainedTokenizerBase.apply_chat_template = patched
+    return True
+
+
+def _trace_runtime_patch(stage: str, result: Any = None) -> None:
+    """Report patch ordering only for an explicitly traced startup."""
+    if os.environ.get("VERL_MLITE_RUNTIME_PATCH_TRACE") != "1":
+        return
+
+    import json
+
+    transformers = sys.modules.get("transformers")
+    module_vars = vars(transformers) if transformers is not None else {}
+    objects = module_vars.get("_objects")
+    missing = object()
+
+    def raw_binding(name: str) -> tuple[Any, str]:
+        if name in module_vars:
+            return module_vars[name], "namespace"
+        if isinstance(objects, dict) and name in objects:
+            return objects[name], "_objects"
+        return missing, "absent"
+
+    alias, alias_source = raw_binding("AutoModelForVision2Seq")
+    replacement, replacement_source = raw_binding(
+        "AutoModelForImageTextToText"
+    )
+    payload = {
+        "alias_is_replacement": (
+            alias is not missing
+            and replacement is not missing
+            and alias is replacement
+        ),
+        "alias_source": alias_source,
+        "changed": result,
+        "event": "runtime_patch",
+        "pid": os.getpid(),
+        "replacement_source": replacement_source,
+        "step": stage,
+        "transformers_file": module_vars.get("__file__"),
+        "transformers_id": id(transformers) if transformers is not None else None,
+        "transformers_loaded": transformers is not None,
+    }
+    sys.stderr.write(
+        "VERL_MLITE_RUNTIME_PATCH_TRACE "
+        f"{json.dumps(payload, sort_keys=True)}\n"
+    )
+    sys.stderr.flush()
+
+
+def _patch_verl_dsv4_mxfp4_check() -> bool:
+    """Make verl's DeepSeek-V4 mxfp4 MoE check factory-aware for vLLM >= 0.24.
+
+    verl #6473 ships ``verl.utils.vllm.vllm_dsv4_fp8_utils._is_mxfp4_fused_moe_module``
+    as ``isinstance(module, FusedMoE) and isinstance(module.quant_method, Mxfp4MoEMethod)``.
+    That assumes ``FusedMoE`` is a class. vLLM 0.25.1 refactored ``FusedMoE`` into
+    a *factory function* (it returns a ``MoERunner``), so the first ``isinstance``
+    raises ``TypeError: isinstance() arg 2 must be a type``. This fires
+    unconditionally during the DS4 fp8 resync weight-prep
+    (``update_weights_from_ipc`` -> ``prepare_quanted_weights_for_loading`` ->
+    ``prepare_deepseek_v4_weights_for_loading`` -> ``_restore_moe_params_for_loading``).
+
+    Replace it with a version that keys off ``module.quant_method`` -- the real
+    mxfp4 discriminator (``Mxfp4MoEMethod`` is a proper class in 0.25.1) -- and
+    only then confirms a fused-MoE module via the real classes. DeepSeek-V4 uses
+    the fp8_ds_mla block layout, not mxfp4, so this returns ``False`` for it and
+    the resync proceeds. verl source is untouched; we override our side only.
+    """
+    if not _vllm_importable():
+        return False
+    try:
+        module = importlib.import_module("verl.utils.vllm.vllm_dsv4_fp8_utils")
+    except Exception:
+        return False
+    existing = getattr(module, "_is_mxfp4_fused_moe_module", None)
+    if getattr(existing, "_verl_mlite_factory_aware", False):
+        return True
+
+    def _is_mxfp4_fused_moe_module(candidate: Any) -> bool:
+        from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        quant_method = getattr(candidate, "quant_method", None)
+        is_mxfp4 = isinstance(quant_method, Mxfp4MoEMethod)
+        # Diagnostic (deduped by type pair): emit the real runtime module and
+        # quant_method types so we can confirm the MoE experts are fp8 (not the
+        # mxfp4 4-bit fallback). ``FusedMoE`` is a factory function on vLLM
+        # >= 0.24, so the original ``isinstance(module, FusedMoE)`` type guard is
+        # invalid; the quant_method is the definitive discriminator.
+        seen = _is_mxfp4_fused_moe_module.__dict__.setdefault("_diag_seen", set())
+        diag_key = (type(candidate).__name__, type(quant_method).__name__)
+        if diag_key not in seen:
+            seen.add(diag_key)
+            sys.stderr.write(
+                "VERL_MLITE_MXFP4_DIAG "
+                f"module={type(candidate).__module__}.{type(candidate).__name__} "
+                f"quant_method={type(quant_method).__module__}."
+                f"{type(quant_method).__name__} is_mxfp4={is_mxfp4}\n"
+            )
+            sys.stderr.flush()
+        return is_mxfp4
+
+    _is_mxfp4_fused_moe_module._verl_mlite_factory_aware = True
+    module._is_mxfp4_fused_moe_module = _is_mxfp4_fused_moe_module
+    return True
+
+
+def _patch_verl_dsv4_fp8_process_weights() -> bool:
+    """Run ``process_weights_after_loading`` for FP8 MoE experts after RL resync.
+
+    verl #6473's DS4 post-load hook chain
+    (``update_weights_from_ipc`` -> ``process_quanted_weights_after_loading`` ->
+    ``process_deepseek_v4_weights_after_loading`` -> ``_process_moe_weights_after_loading``)
+    only shuffles MEGA-MoE and MXFP4 experts into the kernel runtime format, and
+    the whole chain is gated by ``quant_reload_state`` (the return of
+    ``_restore_moe_params_for_loading``). For a forced ``expert_dtype=fp8`` model
+    the routed experts use ``Fp8MoEMethod`` (block quant): there is no branch for
+    it, and ``_restore_moe_params_for_loading`` returns ``False`` (pure FP8), so
+    ``quant_reload_state`` is falsy and the entire post-load step is skipped. The
+    freshly-resynced FP8 expert weights then stay in checkpoint layout and never
+    get shuffled into the kernel runtime format (``Fp8MoEMethod._setup_kernel``),
+    so inference is silently wrong even though the load did not crash.
+
+    Wrap the ungated top-level ``vLLMColocateWorkerExtension.update_weights_from_ipc``
+    so that, after every resync completes, we call
+    ``module.quant_method.process_weights_after_loading(module)`` on each
+    ``Fp8MoEMethod`` MoE module. verl source is untouched; our side only.
+    """
+    if not _vllm_importable():
+        return False
+    try:
+        utils = importlib.import_module(
+            "verl.workers.rollout.vllm_rollout.utils"
+        )
+    except Exception:
+        return False
+    ext_cls = getattr(utils, "vLLMColocateWorkerExtension", None)
+    original = getattr(ext_cls, "update_weights_from_ipc", None)
+    if original is None or getattr(original, "_verl_mlite_fp8_process", False):
+        return True
+
+    @wraps(original)
+    def update_weights_from_ipc(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        try:
+            model = self.model_runner.model
+            # DS4-ONLY scope lock. ``update_weights_from_ipc`` is the shared
+            # colocated resync entry (qwen/glm/kimi/... all reach it), so the
+            # post-process below is fenced behind three guards; any non-DS4
+            # model fails ``is_deepseek_v4_model`` and returns immediately,
+            # completely untouched.
+            from verl.utils.vllm.vllm_dsv4_fp8_utils import is_deepseek_v4_model
+
+            if not is_deepseek_v4_model(model):
+                return result
+            from vllm.model_executor.layers.fused_moe.routed_experts import (
+                RoutedExperts,
+            )
+            from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+
+            processed = 0
+            for mod in model.modules():
+                if isinstance(mod, RoutedExperts) and isinstance(
+                    getattr(mod, "quant_method", None), Fp8MoEMethod
+                ):
+                    mod.quant_method.process_weights_after_loading(mod)
+                    processed += 1
+            if processed:
+                sys.stderr.write(
+                    "VERL_MLITE_FP8_PROCESS "
+                    f"ran process_weights_after_loading on {processed} "
+                    "DS4 RoutedExperts+Fp8MoEMethod module(s) after resync\n"
+                )
+                sys.stderr.flush()
+        except Exception as exc:  # never break the resync on a post-process error
+            sys.stderr.write(f"VERL_MLITE_FP8_PROCESS error: {exc!r}\n")
+            sys.stderr.flush()
+        return result
+
+    update_weights_from_ipc._verl_mlite_fp8_process = True
+    ext_cls.update_weights_from_ipc = update_weights_from_ipc
+    return True
+
+
 def apply_runtime_patches() -> None:
-    _patch_transformers_rope_ignore_keys()
-    _patch_bucketed_weight_sender()
+    _trace_runtime_patch("00.begin")
+    result = _patch_transformers_vision2seq_alias()
+    _trace_runtime_patch("01.transformers_alias", result)
+    result = _register_opaque_hf_config()
+    _trace_runtime_patch("02.opaque_hf_config", result)
+    result = _install_vllm_thin_finder()
+    _trace_runtime_patch("03.vllm_thin_finder", result)
+    result = _install_vllm_triton_kernels_alias()
+    _trace_runtime_patch("04.vllm_triton_kernels_alias", result)
+    result = _patch_verl_vllm_device_uuid()
+    _trace_runtime_patch("05.verl_vllm_device_uuid", result)
+    # Importing VERL's vLLM utilities can rebuild Transformers' lazy top-level
+    # module, which drops compatibility attributes installed on the old module.
+    result = _patch_transformers_vision2seq_alias()
+    _trace_runtime_patch("06.transformers_alias_after_uuid", result)
+    result = _patch_transformers_rope_ignore_keys()
+    _trace_runtime_patch("07.transformers_rope_ignore_keys", result)
+    result = _patch_transformers_apply_chat_template_return_dict()
+    _trace_runtime_patch("07b.transformers_apply_chat_template_return_dict", result)
+    result = _patch_verl_dsv4_mxfp4_check()
+    _trace_runtime_patch("08b.verl_dsv4_mxfp4_check", result)
+    result = _patch_verl_dsv4_fp8_process_weights()
+    _trace_runtime_patch("08c.verl_dsv4_fp8_process_weights", result)
+    result = _patch_vllm_server_profile()
+    _trace_runtime_patch("09.vllm_server_profile", result)
+    _trace_runtime_patch("10.end")
 
 
 def _load_verl_file(relative_path: str, module_name: str):
