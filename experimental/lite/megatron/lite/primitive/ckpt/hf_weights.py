@@ -141,18 +141,6 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     return base_model
 
 
-def _materialize_full_parameters_if_available(chunks: list[nn.Module]) -> list[object]:
-    materialized: list[object] = []
-    for chunk in chunks:
-        for module in chunk.modules():
-            param_sync = getattr(module, "param_sync", None)
-            materialize = getattr(param_sync, "materialize_all", None)
-            if callable(materialize):
-                materialize()
-                materialized.append(param_sync)
-    return materialized
-
-
 def save_safetensors(
     tensors: dict[str, torch.Tensor], path: str, filename: str = "model.safetensors"
 ) -> None:
@@ -401,6 +389,28 @@ def _resolve_param_name(name: str, state_dict: dict) -> str | None:
     return None
 
 
+def _iter_export_named_parameters(chunk: nn.Module, base_chunk: nn.Module):
+    """Source ``(name, full_param)`` pairs for export, bounded when possible.
+
+    Backends whose wrapper exposes ``stream_full_parameters`` (M-FSDP) gather
+    the unsharded parameters one bucket at a time, capping the transient export
+    footprint at a single bucket instead of the whole model. Everything else --
+    FSDP2 ``DTensor`` params (gathered lazily by ``_materialize_dtensor``) and
+    plain manually-sharded params -- falls back to ``named_parameters``.
+    """
+    streamer = getattr(chunk, "stream_full_parameters", None)
+    if callable(streamer):
+        from megatron.lite.primitive.utils import log_rank0
+
+        log_rank0(
+            "[export] M-FSDP stream_full_parameters path active "
+            "(bounded per-bucket materialization)"
+        )
+        yield from streamer()
+    else:
+        yield from base_chunk.named_parameters()
+
+
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,
@@ -425,33 +435,25 @@ def export_hf_weights(
     else:
         chunks = [model]
 
-    param_syncs = _materialize_full_parameters_if_available(chunks)
-    try:
-        yield from _export_hf_weights_materialized(
-            chunks, spec, ps, vocab_size, limit, rank0_only, export_dtype
-        )
-    finally:
-        for param_sync in reversed(param_syncs):
-            release = getattr(param_sync, "release_all", None)
-            if callable(release):
-                release()
-
-
-def _export_hf_weights_materialized(
-    chunks: list[nn.Module],
-    spec: HFWeights,
-    ps,
-    vocab_size: int | None,
-    limit: int | None,
-    rank0_only: bool,
-    export_dtype: str | torch.dtype | None,
-) -> Generator[tuple[str, torch.Tensor], None, None]:
     rank = dist.get_rank() if dist.is_initialized() else 0
     resolved_export_dtype = _resolve_export_dtype(export_dtype)
 
     if ps.pp_size <= 1:
         exported_params = 0
         expert_groups: dict[str, list[tuple[int, str, torch.Tensor]]] = {}
+        # Expected local-expert count per group, so a group's full-tensors can be
+        # gathered to host and freed the instant it is complete instead of being
+        # held resident until the whole model has been walked. Holding every
+        # expert of the model on the GPU at once is what drove the transient
+        # export peak (a single ``experts.gate_up_proj`` group summed across all
+        # layers dominated the peak); streaming the sharded buckets alone cannot
+        # bound it because the consumer buffers the experts here for the per-layer
+        # EP collective. Counting up front (cheap; sharded ``named_parameters``,
+        # no gather) lets the walk flush each group exactly once, in the same
+        # deterministic order on every rank -- the EP/ETP collective sequence is
+        # unchanged, only its timing moves earlier.
+        expert_group_expected: dict[str, int] = {}
+        chunk_infos: list[tuple[nn.Module, nn.Module, dict]] = []
         for chunk in chunks:
             base_chunk = unwrap_model(chunk)
             layer_map = (
@@ -459,17 +461,39 @@ def _export_hf_weights_materialized(
                 if hasattr(base_chunk, "layer_indices")
                 else {}
             )
-            for name, param in base_chunk.named_parameters():
+            chunk_infos.append((chunk, base_chunk, layer_map))
+            for pname, _ in base_chunk.named_parameters():
+                gpn = to_global_layer_name(pname, layer_map)
+                if spec.is_expert(gpn):
+                    key = _expert_group_key(gpn)
+                    expert_group_expected[key] = expert_group_expected.get(key, 0) + 1
+
+        def _emit_expert_group(group_key: str):
+            gathered_group: dict[str, torch.Tensor] = {}
+            # Runs on every rank (the EP/ETP all-gather is collective); only rank
+            # 0 yields when ``rank0_only``. Popping frees this group's GPU
+            # full-tensors before the walk materializes the next group.
+            _gather_expert_group(expert_groups.pop(group_key), spec, ps, gathered_group)
+            if not rank0_only or rank == 0:
+                for native_name in sorted(gathered_group, key=parse_expert_idx):
+                    gathered_tensor = gathered_group[native_name]
+                    for hf_name, hf_tensor in spec.native_to_hf(native_name, gathered_tensor):
+                        yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
+
+        for chunk, base_chunk, layer_map in chunk_infos:
+            for name, param in _iter_export_named_parameters(chunk, base_chunk):
                 gname = to_global_layer_name(name, layer_map)
                 tensor = _materialize_dtensor(param.data.detach())
 
                 gathered_one: dict[str, torch.Tensor] = {}
                 if spec.is_expert(gname):
                     if limit is None:
-                        expert_groups.setdefault(_expert_group_key(gname), []).append(
-                            (parse_expert_idx(gname), gname, tensor)
-                        )
+                        key = _expert_group_key(gname)
+                        entries = expert_groups.setdefault(key, [])
+                        entries.append((parse_expert_idx(gname), gname, tensor))
                         exported_params += 1
+                        if len(entries) >= expert_group_expected.get(key, 0):
+                            yield from _emit_expert_group(key)
                         continue
                     _gather_expert(gname, tensor, spec, ps, gathered_one)
                 else:
@@ -488,14 +512,10 @@ def _export_hf_weights_materialized(
                 if limit is not None and exported_params >= limit:
                     return
 
+        # Defensive: an exact per-group count flushes every group inside the walk,
+        # so this only fires if a count was under-estimated (never in practice).
         for group_key in sorted(expert_groups):
-            gathered_group: dict[str, torch.Tensor] = {}
-            _gather_expert_group(expert_groups[group_key], spec, ps, gathered_group)
-            if not rank0_only or rank == 0:
-                for native_name in sorted(gathered_group, key=parse_expert_idx):
-                    gathered_tensor = gathered_group[native_name]
-                    for hf_name, hf_tensor in spec.native_to_hf(native_name, gathered_tensor):
-                        yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
+            yield from _emit_expert_group(group_key)
         return
 
     gathered: dict[str, torch.Tensor] = {}
@@ -507,7 +527,7 @@ def _export_hf_weights_materialized(
             if hasattr(base_chunk, "layer_indices")
             else {}
         )
-        for name, param in base_chunk.named_parameters():
+        for name, param in _iter_export_named_parameters(chunk, base_chunk):
             gname = to_global_layer_name(name, layer_map)
             t = _materialize_dtensor(param.data.detach())
 

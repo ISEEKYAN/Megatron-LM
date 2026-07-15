@@ -41,7 +41,7 @@ class MFSDPConfig:
     main_grads_dtype: torch.dtype = torch.float32
     grad_comm_dtype: torch.dtype = torch.float32
     nccl_ub: bool = False
-    fsdp_double_buffer: bool = False
+    fsdp_double_buffer: bool = True
     disable_symmetric_registration: bool = False
     all_gather_in_start_param_sync: bool = True
 
@@ -223,7 +223,7 @@ def build_mfsdp_config(opt: Any) -> MFSDPConfig:
         main_grads_dtype=main_grads_dtype,
         grad_comm_dtype=grad_comm_dtype,
         nccl_ub=nccl_ub,
-        fsdp_double_buffer=bool(option("fsdp_double_buffer", False)) or nccl_ub,
+        fsdp_double_buffer=bool(option("fsdp_double_buffer", True)) or nccl_ub,
         disable_symmetric_registration=bool(
             option("disable_symmetric_registration", False)
         ),

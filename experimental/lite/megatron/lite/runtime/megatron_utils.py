@@ -99,7 +99,10 @@ def _is_megatron_ddp(model_chunk: Any) -> bool:
 def offload_model_to_cpu(model_list: list) -> None:
     """Offload DDP model to CPU via buffer-resize (zero-copy on GPU side)."""
     for model_chunk in model_list:
-        if _is_megatron_ddp(model_chunk):
+        move_model_state = getattr(model_chunk, "move_model_state", None)
+        if callable(move_model_state):
+            move_model_state(torch.device("cpu"), load_grad=True)
+        elif _is_megatron_ddp(model_chunk):
             all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
             for buffers in all_buffers:
                 for buffer in buffers:
@@ -122,7 +125,13 @@ def offload_model_to_cpu(model_list: list) -> None:
 def load_model_to_gpu(model_list: list, load_grad: bool = True) -> None:
     """Load DDP model back to GPU from pinned CPU copy."""
     for model_chunk in model_list:
-        if _is_megatron_ddp(model_chunk):
+        move_model_state = getattr(model_chunk, "move_model_state", None)
+        if callable(move_model_state):
+            move_model_state(
+                torch.device("cuda"),
+                load_grad=load_grad,
+            )
+        elif _is_megatron_ddp(model_chunk):
             all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
             for buffers in all_buffers:
                 for buffer in buffers:
