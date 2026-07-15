@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
@@ -28,10 +28,18 @@ def forward_backward_pipelining(
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
     forward_only: bool = False,
-    shape_fn: Callable[[Any], tuple[int, ...]] | None = None,
 ) -> list[dict]:
     """
     Run forward and backward passes with pipeline parallelism.
+
+    Under THD + dynamic batching every micro-batch packs a different number of
+    tokens, so the inter-stage hidden — and therefore its P2P recv buffer — is a
+    different shape per micro-batch. Rather than deriving that shape locally from
+    the batch (which requires replicating the model's THD/CP/TP scatter and breaks
+    the moment those diverge), the 1F1B and forward-only schedules use Megatron's
+    dynamic shape exchange: before every inter-stage tensor transfer the sender
+    transmits the exact ``size()`` of the tensor it is about to send and the
+    receiver sizes its recv buffer from that. See ``_communicate_shapes``.
 
     Args:
         forward_step_fn: Callable(model, batch) -> output_dict with "loss" and "hidden_states"
@@ -39,15 +47,10 @@ def forward_backward_pipelining(
         data_iter: iterator yielding micro-batches
         config: training config
         ps: parallel state
-        tensor_shape: fallback shape of the inter-stage hidden state [S, B, H] when
-            ``shape_fn`` is not given or a micro-batch's shape cannot be derived.
-        shape_fn: Callable(batch) -> inter-stage hidden shape [S, B, H] for THAT
-            micro-batch. Under THD + dynamic batching each micro-batch packs a
-            different number of tokens, so the P2P buffer must be sized per
-            micro-batch; a single fixed ``tensor_shape`` truncates the received
-            hidden and mismatches the local labels. ``batch`` is the raw data-iter
-            item (``split_loss_context`` unwraps it). ``None`` keeps the legacy
-            fixed-shape behaviour (correct only when every micro-batch is equal length).
+        tensor_shape: nominal inter-stage hidden shape [S, B, H]. Used only by the
+            interleaved VPP schedule (fixed-shape); the 1F1B and forward-only
+            schedules ignore it and exchange the true per-micro-batch shape at
+            runtime.
         grad_sync_fn: called before the last micro-batch's backward to enable
                        overlapped gradient ReduceScatter in DistributedOptimizer.
 
@@ -91,7 +94,6 @@ def forward_backward_pipelining(
             tensor_shape,
             pre_forward_hook=pre_forward_hook,
             loss_fn=loss_fn,
-            shape_fn=shape_fn,
         )
 
     if len(model_chunks) > 1:
@@ -119,7 +121,6 @@ def forward_backward_pipelining(
         grad_sync_fn=grad_sync_fn,
         pre_forward_hook=pre_forward_hook,
         loss_fn=loss_fn,
-        shape_fn=shape_fn,
     )
 
 
@@ -236,18 +237,19 @@ def _1f1b_schedule(
     grad_sync_fn=None,
     pre_forward_hook=None,
     loss_fn=None,
-    shape_fn: Callable[[Any], tuple[int, ...]] | None = None,
 ):
     """
     1-Forward-1-Backward pipeline schedule using batch_isend_irecv.
 
     Communication is always done via combined send+recv to avoid deadlocks.
 
-    ``shape_fn(batch) -> [S, B, H]`` gives the inter-stage hidden shape for THAT
-    micro-batch. Under THD + dynamic batching each micro-batch packs a different
-    number of tokens, so a single fixed ``tensor_shape`` would truncate the recv
-    of the later, larger micro-batches (NCCL size mismatch -> deadlock). ``None``
-    keeps the legacy fixed-shape behaviour.
+    Under THD + dynamic batching each micro-batch packs a different number of
+    tokens, so a single fixed ``tensor_shape`` would truncate the recv of the
+    later, larger micro-batches (NCCL size mismatch -> deadlock). Every recv here
+    goes through ``_send_recv_pipeline(..., dynamic_shape=True)``: the sender first
+    transmits the exact ``size()`` of the hidden/grad it is about to send and the
+    receiver sizes its recv buffer from that. No local shape derivation, no fixed
+    ``tensor_shape`` fallback — a desync fails loud instead of silently truncating.
     """
     num_warmup = min(ps.pp_size - ps.pp_rank - 1, num_microbatches)
     num_steady = num_microbatches - num_warmup
@@ -261,42 +263,6 @@ def _1f1b_schedule(
     output_hiddens: list[torch.Tensor | None] = []
     losses: list[torch.Tensor | None] = []
     outputs: list[dict] = []
-
-    # Per-microbatch inter-stage recv shapes. Under THD + dynamic batching each
-    # micro-batch packs a different token count, so the inter-stage hidden — and
-    # therefore its P2P recv buffer — is a different shape per micro-batch.
-    if shape_fn is not None:
-        fwd_shapes = [tuple(shape_fn(mb_batch)) for mb_batch, _lc in batches]
-    else:
-        fwd_shapes = [tuple(tensor_shape)] * num_microbatches
-
-    def _numel(shape: tuple[int, ...]) -> int:
-        n = 1
-        for d in shape:
-            n *= int(d)
-        return n
-
-    # Fix 3: Pre-allocate ONE flat recv buffer sized to the LARGEST micro-batch;
-    # each recv takes an exact-shape view into it (no padding waste, identical
-    # buffer-reuse semantics as the legacy fixed buffer, but correctly sized).
-    _recv_numel = max((_numel(s) for s in fwd_shapes), default=_numel(tuple(tensor_shape)))
-    _fwd_recv_flat = (
-        torch.empty(_recv_numel, dtype=_PIPELINE_TENSOR_DTYPE, device="cuda")
-        if not ps.pp_is_first
-        else None
-    )
-    _bwd_recv_flat = (
-        torch.empty(_recv_numel, dtype=_PIPELINE_TENSOR_DTYPE, device="cuda")
-        if not ps.pp_is_last
-        else None
-    )
-
-    def _recv_view(
-        flat: torch.Tensor | None, shape: tuple[int, ...] | None
-    ) -> torch.Tensor | None:
-        if flat is None or shape is None:
-            return None
-        return flat[: _numel(shape)].view(shape)
 
     def _run_forward(input_tensor, batch, loss_context=None):
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
@@ -320,34 +286,24 @@ def _1f1b_schedule(
                 torch.autograd.backward(hid_t, grad_t)
         return inp_t.grad if inp_t is not None else None
 
-    def _p2p(
-        send_fwd=None,
-        send_bwd=None,
-        recv_fwd=False,
-        recv_bwd=False,
-        fwd_shape=None,
-        bwd_shape=None,
-    ):
-        # Exact-shape view into the shared flat buffer for THIS micro-batch's recv.
-        fwd_buf = _recv_view(_fwd_recv_flat, fwd_shape) if recv_fwd else None
-        bwd_buf = _recv_view(_bwd_recv_flat, bwd_shape) if recv_bwd else None
+    def _p2p(send_fwd=None, send_bwd=None, recv_fwd=False, recv_bwd=False):
+        # Megatron dynamic shape exchange: the recv buffer is sized from the shape
+        # the sender transmits, so no per-mb shape has to be tracked here.
         return _send_recv_pipeline(
             send_fwd,
             send_bwd,
             recv_fwd,
             recv_bwd,
             ps,
-            fwd_shape if fwd_shape is not None else tensor_shape,
-            fwd_recv_buf=fwd_buf,
-            bwd_recv_buf=bwd_buf,
+            tensor_shape,
+            dynamic_shape=True,
         )
 
     # ── Warmup: pure forward passes ──
     fwd_input: torch.Tensor | None = None
     for k in range(num_warmup):
         if not ps.pp_is_first and k == 0:
-            # Input for the mb about to be forwarded (batches[mb_idx]).
-            fwd_input, _ = _p2p(recv_fwd=True, fwd_shape=fwd_shapes[mb_idx])
+            fwd_input, _ = _p2p(recv_fwd=True)
 
         batch, loss_ctx = batches[mb_idx]
         mb_idx += 1
@@ -362,12 +318,10 @@ def _1f1b_schedule(
         # first steady input -> None input / unmatched send -> crash/NCCL hang on
         # PP >= 3. PP2 has no such stage, so this is a no-op there.
         need_recv_next = not ps.pp_is_first and (k < num_warmup - 1 or num_steady > 0)
-        # After ``mb_idx += 1`` this indexes the NEXT mb to forward.
-        next_fwd_shape = fwd_shapes[mb_idx] if need_recv_next else None
         if not ps.pp_is_last:
-            fwd_input, _ = _p2p(send_fwd=hidden, recv_fwd=need_recv_next, fwd_shape=next_fwd_shape)
+            fwd_input, _ = _p2p(send_fwd=hidden, recv_fwd=need_recv_next)
         elif need_recv_next:
-            fwd_input, _ = _p2p(recv_fwd=True, fwd_shape=next_fwd_shape)
+            fwd_input, _ = _p2p(recv_fwd=True)
 
         input_tensors.append(current_input if not ps.pp_is_first else None)
         output_hiddens.append(hidden)
@@ -381,7 +335,7 @@ def _1f1b_schedule(
             grad_sync_fn()
 
         if not ps.pp_is_first and k == 0 and num_warmup == 0:
-            fwd_input, _ = _p2p(recv_fwd=True, fwd_shape=fwd_shapes[mb_idx])
+            fwd_input, _ = _p2p(recv_fwd=True)
 
         batch, loss_ctx = batches[mb_idx]
         mb_idx += 1
@@ -396,10 +350,7 @@ def _1f1b_schedule(
 
         send_fwd = hidden if not ps.pp_is_last else None
         need_bwd = not ps.pp_is_last
-        # The bwd grad has the shape of the hidden this stage SENT for the oldest
-        # in-flight mb, i.e. the mb about to be backwarded (front of the queue).
-        bwd_shape = tuple(output_hiddens[0].shape) if need_bwd else None
-        _, bwd_grad = _p2p(send_fwd=send_fwd, recv_bwd=need_bwd, bwd_shape=bwd_shape)
+        _, bwd_grad = _p2p(send_fwd=send_fwd, recv_bwd=need_bwd)
 
         old_inp = input_tensors.pop(0)
         old_hid = output_hiddens.pop(0)
@@ -408,9 +359,7 @@ def _1f1b_schedule(
 
         send_bwd = in_grad if not ps.pp_is_first else None
         need_fwd = not ps.pp_is_first and k < num_steady - 1
-        # After ``mb_idx += 1`` this indexes the NEXT mb to forward.
-        next_fwd_shape = fwd_shapes[mb_idx] if need_fwd else None
-        fwd_input, _ = _p2p(send_bwd=send_bwd, recv_fwd=need_fwd, fwd_shape=next_fwd_shape)
+        fwd_input, _ = _p2p(send_bwd=send_bwd, recv_fwd=need_fwd)
 
     # ── Cooldown: drain remaining backwards ──
     for k in range(num_warmup):
@@ -418,9 +367,7 @@ def _1f1b_schedule(
             grad_sync_fn()
 
         need_bwd = not ps.pp_is_last
-        # Grad shape = hidden this stage sent for the oldest in-flight mb.
-        bwd_shape = tuple(output_hiddens[0].shape) if need_bwd else None
-        _, bwd_grad = _p2p(recv_bwd=need_bwd, bwd_shape=bwd_shape)
+        _, bwd_grad = _p2p(recv_bwd=need_bwd)
 
         old_inp = input_tensors.pop(0)
         old_hid = output_hiddens.pop(0)
@@ -438,6 +385,103 @@ def _1f1b_schedule(
 # Pipeline communication helpers
 # ══════════════════════════════════════════════════════════════════════
 _PIPELINE_TENSOR_DTYPE = torch.bfloat16
+# Inter-stage hidden states are rank-3 [S, B, H] (hc_mult is folded into H), so
+# the dynamic shape exchange transmits a fixed-length int64 vector of this size.
+# Matches megatron.core.pipeline_parallel.p2p_communication._communicate_shapes.
+_PIPELINE_SHAPE_NDIM = 3
+
+
+def _communicate_shapes(
+    send_fwd: torch.Tensor | None,
+    send_bwd: torch.Tensor | None,
+    recv_fwd: bool,
+    recv_bwd: bool,
+    ps: ParallelState,
+    *,
+    batch_p2p: bool = True,
+) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
+    """Exchange inter-stage tensor shapes before the tensor P2P (Megatron way).
+
+    Under THD variable-length packing every micro-batch is a different shape, so
+    the receiver cannot know the recv-buffer size a priori. Instead of deriving it
+    locally from the batch, the sender transmits the exact ``size()`` of the tensor
+    it is about to send and the receiver reads it here, then sizes its recv buffer
+    from the returned shape. The shape hop travels in the SAME direction as the
+    tensor hop it precedes (fwd -> next rank, bwd -> prev rank).
+
+    Returns ``(recv_fwd_shape, recv_bwd_shape)``; each is ``None`` when that
+    direction is not being received. A received dim <= 0 means the two stages
+    disagree on whether a transfer happens (protocol desync) -> raise, fail loud.
+
+    Mirrors ``megatron.core.pipeline_parallel.p2p_communication.
+    _P2PCommunicator._communicate_shapes``.
+    """
+    device = torch.cuda.current_device()
+    recv_fwd_t = (
+        torch.empty(_PIPELINE_SHAPE_NDIM, dtype=torch.int64, device=device) if recv_fwd else None
+    )
+    recv_bwd_t = (
+        torch.empty(_PIPELINE_SHAPE_NDIM, dtype=torch.int64, device=device) if recv_bwd else None
+    )
+    send_fwd_t = (
+        torch.tensor(tuple(send_fwd.size()), dtype=torch.int64, device=device)
+        if send_fwd is not None
+        else None
+    )
+    send_bwd_t = (
+        torch.tensor(tuple(send_bwd.size()), dtype=torch.int64, device=device)
+        if send_bwd is not None
+        else None
+    )
+
+    p2p_group = ps.pp_group
+
+    def _ops() -> list:
+        ops: list[dist.P2POp] = []
+        if send_fwd_t is not None:
+            ops.append(dist.P2POp(dist.isend, send_fwd_t, ps.pp_next_rank, p2p_group))
+        if recv_fwd_t is not None:
+            ops.append(dist.P2POp(dist.irecv, recv_fwd_t, ps.pp_prev_rank, p2p_group))
+        if send_bwd_t is not None:
+            ops.append(dist.P2POp(dist.isend, send_bwd_t, ps.pp_prev_rank, p2p_group))
+        if recv_bwd_t is not None:
+            ops.append(dist.P2POp(dist.irecv, recv_bwd_t, ps.pp_next_rank, p2p_group))
+        return ops
+
+    if batch_p2p:
+        ops = _ops()
+        if ops:
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
+    else:
+        reqs = []
+        if send_fwd_t is not None:
+            reqs.append(dist.isend(send_fwd_t, ps.pp_next_rank, group=p2p_group))
+        if recv_fwd_t is not None:
+            reqs.append(dist.irecv(recv_fwd_t, ps.pp_prev_rank, group=p2p_group))
+        if send_bwd_t is not None:
+            reqs.append(dist.isend(send_bwd_t, ps.pp_prev_rank, group=p2p_group))
+        if recv_bwd_t is not None:
+            reqs.append(dist.irecv(recv_bwd_t, ps.pp_next_rank, group=p2p_group))
+        for req in reqs:
+            req.wait()
+    # Guard against the known batch_isend_irecv race before the buffers are read
+    # (matches Megatron core's torch.cuda.synchronize() in _communicate_shapes).
+    if send_fwd_t is not None or send_bwd_t is not None or recv_fwd or recv_bwd:
+        torch.cuda.synchronize()
+
+    def _shape(t: torch.Tensor | None) -> tuple[int, ...] | None:
+        if t is None:
+            return None
+        shape = tuple(int(x) for x in t.tolist())
+        if any(d <= 0 for d in shape):
+            raise RuntimeError(
+                f"pipeline dynamic shape exchange received a non-positive dim {shape} "
+                f"(rank {dist.get_rank()}): the two stages disagree on the P2P transfer."
+            )
+        return shape
+
+    return _shape(recv_fwd_t), _shape(recv_bwd_t)
 
 
 def _deallocate_output_tensor(tensor: torch.Tensor | None) -> None:
@@ -474,8 +518,16 @@ def _send_recv_pipeline(
     bwd_recv_buf: torch.Tensor | None = None,
     batch_p2p: bool = True,
     clone_recv: bool = False,
+    dynamic_shape: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """P2P communication between pipeline stages."""
+    """P2P communication between pipeline stages.
+
+    ``dynamic_shape=True`` runs Megatron's dynamic shape exchange first: the recv
+    buffers are sized from the shape the sender transmits (``_communicate_shapes``)
+    rather than from the fixed ``tensor_shape`` / pre-allocated ``*_recv_buf``. This
+    is what makes THD variable-length PP correct — each micro-batch is a different
+    shape and no local derivation is needed.
+    """
     _dbg = int(os.environ.get("MEGATRON_LITE_PP_DEBUG", "0"))
     rank = dist.get_rank()
 
@@ -485,25 +537,41 @@ def _send_recv_pipeline(
 
     p2p_group = ps.pp_group
 
+    # Megatron dynamic shape exchange: learn the recv shapes from the senders
+    # before allocating recv buffers. The passed fwd/bwd_recv_buf and tensor_shape
+    # are ignored for receiving in this mode (shapes vary per micro-batch).
+    recv_fwd_shape: tuple[int, ...] | None = None
+    recv_bwd_shape: tuple[int, ...] | None = None
+    if dynamic_shape:
+        recv_fwd_shape, recv_bwd_shape = _communicate_shapes(
+            send_fwd, send_bwd, recv_fwd, recv_bwd, ps, batch_p2p=batch_p2p
+        )
+
     if send_fwd is not None:
         t = send_fwd.to(_PIPELINE_TENSOR_DTYPE)
         ops.append(dist.P2POp(dist.isend, t, ps.pp_next_rank, p2p_group))
     if recv_fwd:
-        fwd_buf = (
-            fwd_recv_buf
-            if fwd_recv_buf is not None
-            else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device="cuda")
-        )
+        if dynamic_shape:
+            fwd_buf = torch.empty(recv_fwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device="cuda")
+        else:
+            fwd_buf = (
+                fwd_recv_buf
+                if fwd_recv_buf is not None
+                else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device="cuda")
+            )
         ops.append(dist.P2POp(dist.irecv, fwd_buf, ps.pp_prev_rank, p2p_group))
     if send_bwd is not None:
         t = send_bwd.to(_PIPELINE_TENSOR_DTYPE)
         ops.append(dist.P2POp(dist.isend, t, ps.pp_prev_rank, p2p_group))
     if recv_bwd:
-        bwd_buf = (
-            bwd_recv_buf
-            if bwd_recv_buf is not None
-            else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device="cuda")
-        )
+        if dynamic_shape:
+            bwd_buf = torch.empty(recv_bwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device="cuda")
+        else:
+            bwd_buf = (
+                bwd_recv_buf
+                if bwd_recv_buf is not None
+                else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device="cuda")
+            )
         ops.append(dist.P2POp(dist.irecv, bwd_buf, ps.pp_next_rank, p2p_group))
 
     if ops:
@@ -596,18 +664,20 @@ def _forward_only_pipeline_schedule(
     *,
     pre_forward_hook=None,
     loss_fn=None,
-    shape_fn: Callable[[Any], tuple[int, ...]] | None = None,
 ):
-    """Simple PP/VPP forward-only schedule used for log-prob inference."""
+    """Simple PP/VPP forward-only schedule used for log-prob inference.
+
+    Uses Megatron dynamic shape exchange at every stage boundary so THD
+    variable-length micro-batches size their recv buffers from the sender's real
+    shape (``_send_recv_pipeline(..., dynamic_shape=True)``) instead of a fixed
+    ``tensor_shape``.
+    """
     num_chunks = len(model_chunks)
     total_stages = ps.pp_size * num_chunks
     outputs: list[dict] = []
 
     for _mb in range(num_microbatches):
         batch = next(data_iter)
-        # Per-mb inter-stage shape under THD dynamic batching; every recv inside
-        # this mb's stage loop must match the mb's own token count.
-        mb_shape = tuple(shape_fn(batch)) if shape_fn is not None else tensor_shape
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
         pending_activation: torch.Tensor | None = None
         last_output: dict | None = None
@@ -648,9 +718,10 @@ def _forward_only_pipeline_schedule(
                     recv_next,
                     False,
                     ps,
-                    mb_shape,
+                    tensor_shape,
                     batch_p2p=False,
                     clone_recv=True,
+                    dynamic_shape=True,
                 )
                 if recv_next:
                     pending_activation = fwd_buf

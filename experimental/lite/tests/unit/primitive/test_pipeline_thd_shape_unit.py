@@ -1,14 +1,22 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""CPU unit test for THD dynamic-batch P2P shapes in the 1F1B schedule.
+"""CPU unit tests for THD dynamic-batch P2P shapes in the pipeline layer.
 
 Under THD + dynamic batching every micro-batch packs a different token count, so
 the inter-stage hidden — and its P2P recv buffer — is a different shape per
-micro-batch. The legacy code sized ONE fixed buffer from the first batch, which
-truncated the recv of later, larger micro-batches (NCCL size mismatch -> hang).
+micro-batch. A single fixed buffer sized from the first batch truncates the recv
+of later, larger micro-batches (NCCL size mismatch -> hang).
 
-These tests drive the *real* ``_1f1b_schedule`` on a single rank with the actual
-dist transfer mocked out, asserting that each recv site is handed the exact shape
-of its own micro-batch (off-by-one in the recv<->mb map = silent deadlock on GPU).
+The fix is Megatron's *dynamic shape exchange*: before every inter-stage tensor
+transfer the sender transmits the exact ``size()`` of the tensor it is about to
+send, and the receiver sizes its recv buffer from that — no local shape
+derivation, no fixed fallback. These tests cover three layers:
+
+* ``_communicate_shapes`` — the shape hop itself (right ops, right return, fail
+  loud on a desync), with the dist fabric mocked.
+* ``_send_recv_pipeline(dynamic_shape=True)`` — the recv buffer is sized from the
+  exchanged shape, not the passed ``tensor_shape``.
+* ``_1f1b_schedule`` — every recv site consumes the peer-sent shape for its own
+  micro-batch (off-by-one in the recv<->mb map = silent deadlock on GPU).
 """
 
 from __future__ import annotations
@@ -17,6 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
 from megatron.lite.primitive.parallel import pipeline as pl
@@ -34,6 +43,138 @@ def _make_ps(pp_size: int, pp_rank: int) -> SimpleNamespace:
     )
 
 
+# ══════════════════════════════════════════════════════════════════════
+# _communicate_shapes: the dynamic shape hop
+# ══════════════════════════════════════════════════════════════════════
+class _FakeReq:
+    def wait(self):
+        return None
+
+
+class _FakeP2POp:
+    """Stand-in for dist.P2POp that needs no initialized process group."""
+
+    def __init__(self, op, tensor, peer, group=None, tag=0):
+        self.op = op
+        self.tensor = tensor
+        self.peer = peer
+        self.group = group
+
+
+def _install_fake_fabric(monkeypatch, incoming: dict[int, tuple[int, ...]]):
+    """Mock the dist layer so _communicate_shapes runs on CPU with a scripted peer.
+
+    ``incoming`` maps peer-rank -> the shape that peer "sent" us; irecv ops for
+    that peer are filled with it. Sends are recorded for assertion. Returns the
+    list that captures ``(peer, sent_shape)`` for every isend.
+    """
+    sends: list[tuple[int, tuple[int, ...]]] = []
+
+    def fake_batch_isend_irecv(ops):
+        for o in ops:
+            if o.op is dist.isend:
+                sends.append((o.peer, tuple(int(x) for x in o.tensor.tolist())))
+            elif o.op is dist.irecv:
+                o.tensor.copy_(torch.tensor(incoming[o.peer], dtype=torch.int64))
+        return [_FakeReq()]
+
+    monkeypatch.setattr(pl.torch.cuda, "current_device", lambda: "cpu", raising=False)
+    monkeypatch.setattr(pl.torch.cuda, "synchronize", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(pl.dist, "P2POp", _FakeP2POp, raising=False)
+    monkeypatch.setattr(pl.dist, "batch_isend_irecv", fake_batch_isend_irecv, raising=False)
+    return sends
+
+
+def test_communicate_shapes_middle_stage_send_and_recv(monkeypatch):
+    """A middle stage sends its hidden size forward and receives the prev shape."""
+    ps = _make_ps(4, 1)  # prev=0, next=2
+    send_fwd = torch.zeros(7, 1, 8)  # this stage forwards a [7,1,8] hidden
+    incoming = {0: (5, 1, 8)}  # the prev stage tells us the next mb is [5,1,8]
+    sends = _install_fake_fabric(monkeypatch, incoming)
+
+    recv_fwd_shape, recv_bwd_shape = pl._communicate_shapes(
+        send_fwd=send_fwd, send_bwd=None, recv_fwd=True, recv_bwd=False, ps=ps
+    )
+
+    assert recv_fwd_shape == (5, 1, 8)
+    assert recv_bwd_shape is None
+    # exactly one isend, to the NEXT rank, carrying send_fwd's true size
+    assert sends == [(ps.pp_next_rank, (7, 1, 8))]
+
+
+def test_communicate_shapes_backward_direction(monkeypatch):
+    """recv_bwd reads a shape from the NEXT rank; send_bwd goes to the PREV rank."""
+    ps = _make_ps(4, 1)
+    send_bwd = torch.zeros(9, 1, 8)
+    incoming = {2: (3, 1, 8)}  # grad shape arrives from the next rank
+    sends = _install_fake_fabric(monkeypatch, incoming)
+
+    recv_fwd_shape, recv_bwd_shape = pl._communicate_shapes(
+        send_fwd=None, send_bwd=send_bwd, recv_fwd=False, recv_bwd=True, ps=ps
+    )
+
+    assert recv_fwd_shape is None
+    assert recv_bwd_shape == (3, 1, 8)
+    assert sends == [(ps.pp_prev_rank, (9, 1, 8))]
+
+
+def test_communicate_shapes_fail_loud_on_desync(monkeypatch):
+    """A non-positive received dim (stage disagreement) must raise, not truncate."""
+    ps = _make_ps(2, 1)
+    incoming = {0: (0, 1, 8)}  # prev "sent" a zero dim -> protocol desync
+    _install_fake_fabric(monkeypatch, incoming)
+    monkeypatch.setattr(pl.dist, "get_rank", lambda: 1, raising=False)
+
+    with pytest.raises(RuntimeError, match="non-positive dim"):
+        pl._communicate_shapes(
+            send_fwd=None, send_bwd=None, recv_fwd=True, recv_bwd=False, ps=ps
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# _send_recv_pipeline(dynamic_shape=True): buffer sized from the exchange
+# ══════════════════════════════════════════════════════════════════════
+def test_send_recv_pipeline_sizes_recv_buffer_from_exchange(monkeypatch):
+    """The recv buffer is the EXCHANGED shape, not the passed tensor_shape."""
+    ps = _make_ps(4, 1)
+
+    # The exchange reports a [5,1,8] forward input regardless of tensor_shape.
+    monkeypatch.setattr(
+        pl, "_communicate_shapes", lambda *a, **k: ((5, 1, 8), None), raising=True
+    )
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_batch_isend_irecv(ops):
+        for o in ops:
+            if o.op is dist.irecv:
+                captured["fwd"] = o.tensor
+        return [_FakeReq()]
+
+    real_empty = torch.empty
+
+    def cpu_empty(*a, **kw):
+        kw.pop("device", None)
+        return real_empty(*a, **kw)
+
+    monkeypatch.setattr(pl.torch, "empty", cpu_empty, raising=False)
+    monkeypatch.setattr(pl.dist, "P2POp", _FakeP2POp, raising=False)
+    monkeypatch.setattr(pl.dist, "batch_isend_irecv", fake_batch_isend_irecv, raising=False)
+    monkeypatch.setattr(pl.dist, "get_rank", lambda: 1, raising=False)
+
+    fwd_buf, _ = pl._send_recv_pipeline(
+        None, None, True, False, ps,
+        (999, 1, 8),  # deliberately WRONG fixed shape; must be ignored
+        dynamic_shape=True,
+    )
+
+    assert tuple(fwd_buf.shape) == (5, 1, 8)
+    assert tuple(captured["fwd"].shape) == (5, 1, 8)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# _1f1b_schedule: recv<->microbatch mapping under variable shapes
+# ══════════════════════════════════════════════════════════════════════
 class _MockModel(torch.nn.Module):
     """Records the input_tensor set on it so we can catch a None/garbage input."""
 
@@ -48,47 +189,50 @@ class _MockModel(torch.nn.Module):
 
 
 def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
-    """Run _1f1b_schedule for one rank; return (recorded_fwd, recorded_bwd).
+    """Run the real _1f1b_schedule for one rank; return recorded recv shapes.
 
-    dist transfer is mocked: recv returns the buffer it was handed (proving the
-    caller sized it correctly). We record every recv's concrete shape.
+    ``_send_recv_pipeline`` is mocked to play the peer: it must be called with
+    ``dynamic_shape=True`` (the schedule tracks no shapes itself) and fabricates a
+    recv tensor of the peer-sent shape, pulled in transfer order. Recording those
+    shapes proves the schedule requests each recv for the right micro-batch.
     """
     ps = _make_ps(pp_size, pp_rank)
     num_mb = len(seq_lens)
     batches = [{"S": s} for s in seq_lens]
-
-    def shape_fn(batch):
-        return (int(batch["S"]), 1, hidden)
-
-    fwd_shapes = [shape_fn(b) for b in batches]
+    fwd_shapes = [(int(s), 1, hidden) for s in seq_lens]
 
     model = _MockModel(hidden)
     recorded_fwd: list[tuple[int, ...]] = []
     recorded_bwd: list[tuple[int, ...]] = []
+    # Forward inputs arrive in mb order; backward grads arrive oldest-first, which
+    # is also mb order — so both queues are just the per-mb shapes.
+    fwd_q = list(fwd_shapes)
+    bwd_q = list(fwd_shapes)
 
     def fake_srp(
         send_fwd, send_bwd, recv_fwd, recv_bwd, ps_, tensor_shape,
         *, fwd_recv_buf=None, bwd_recv_buf=None, batch_p2p=True, clone_recv=False,
+        dynamic_shape=False,
     ):
+        assert dynamic_shape, "1F1B schedule must use Megatron dynamic shape exchange"
+        assert fwd_recv_buf is None and bwd_recv_buf is None, (
+            "dynamic-shape recv must not pre-size a buffer"
+        )
         fwd_out = None
         bwd_out = None
         if recv_fwd:
-            assert fwd_recv_buf is not None, "recv_fwd must be handed a pre-sized buffer"
-            recorded_fwd.append(tuple(fwd_recv_buf.shape))
-            fwd_recv_buf.grad = None
-            fwd_recv_buf.requires_grad_()
-            fwd_out = fwd_recv_buf
+            shp = fwd_q.pop(0)
+            recorded_fwd.append(shp)
+            fwd_out = torch.ones(shp, requires_grad=True)  # peer-sent hidden
         if recv_bwd:
-            assert bwd_recv_buf is not None, "recv_bwd must be handed a pre-sized buffer"
-            recorded_bwd.append(tuple(bwd_recv_buf.shape))
-            # a grad tensor matching the sent-forward hidden of this mb
-            bwd_out = torch.ones_like(bwd_recv_buf)
+            shp = bwd_q.pop(0)
+            recorded_bwd.append(shp)
+            bwd_out = torch.ones(shp)  # peer-sent grad
         return fwd_out, bwd_out
 
     def forward_step_fn(m, batch):
         s = int(batch["S"])
         if ps.pp_is_first:
-            # first stage fabricates its own hidden from the (packed) input
             base = torch.ones(s, 1, hidden, requires_grad=True)
         else:
             inp = unwrap_model(m)._input_tensor
@@ -97,24 +241,14 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
                 f"input shape {tuple(inp.shape)} != expected {(s, 1, hidden)} for mb S={s}"
             )
             base = inp
-        # hidden carries this mb's exact inter-stage shape [S, 1, H]
         hidden_t = base * m.weight.sum()
         out = {"hidden_states": hidden_t}
         if ps.pp_is_last:
             out["loss"] = hidden_t.float().sum()
         return out
 
-    # Force CPU allocation for the flat recv buffers (module hard-codes cuda).
-    real_empty = torch.empty
-
-    def cpu_empty(*a, **kw):
-        kw.pop("device", None)
-        return real_empty(*a, **kw)
-
     orig_srp = pl._send_recv_pipeline
-    orig_empty = pl.torch.empty
     pl._send_recv_pipeline = fake_srp
-    pl.torch.empty = cpu_empty
     try:
         pl._1f1b_schedule(
             forward_step_fn,
@@ -124,11 +258,9 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
             SimpleNamespace(num_microbatches=num_mb),
             ps,
             fwd_shapes[0],
-            shape_fn=shape_fn,
         )
     finally:
         pl._send_recv_pipeline = orig_srp
-        pl.torch.empty = orig_empty
 
     return recorded_fwd, recorded_bwd, fwd_shapes
 
@@ -140,9 +272,7 @@ VARLEN = [5, 9, 3, 7]  # deliberately non-uniform, ascending & descending mix
 def test_middle_stage_recv_shapes_match_each_microbatch(pp_rank):
     """Every fwd/bwd recv on a middle stage is sized for its own micro-batch."""
     recorded_fwd, recorded_bwd, fwd_shapes = _run_schedule(4, pp_rank, VARLEN)
-    # A middle stage receives a forward input for every mb (in forward order)
     assert recorded_fwd == fwd_shapes, (recorded_fwd, fwd_shapes)
-    # and a backward grad for every mb (backward processes oldest-first == fwd order)
     assert recorded_bwd == fwd_shapes, (recorded_bwd, fwd_shapes)
 
 
@@ -160,11 +290,12 @@ def test_first_stage_recv_shapes_match_each_microbatch():
     assert recorded_bwd == fwd_shapes, (recorded_bwd, fwd_shapes)
 
 
-def test_legacy_fixed_shape_still_uniform_when_no_shape_fn():
-    """Without shape_fn the schedule keeps the single fixed tensor_shape."""
-    ps = _make_ps(4, 1)
-    uniform = [6, 6, 6, 6]
-    recorded_fwd, recorded_bwd, _ = _run_schedule(4, 1, uniform)
-    assert recorded_fwd == [(6, 1, 8)] * 4
-    assert recorded_bwd == [(6, 1, 8)] * 4
-    del ps
+def test_pp2_recv_shapes_match_each_microbatch():
+    """PP2 first stage: no fwd recv, one bwd grad per mb in mb order."""
+    recorded_fwd, recorded_bwd, fwd_shapes = _run_schedule(2, 0, VARLEN)
+    assert recorded_fwd == []
+    assert recorded_bwd == fwd_shapes, (recorded_bwd, fwd_shapes)
+    # PP2 last stage: one fwd input per mb, no bwd recv.
+    recorded_fwd2, recorded_bwd2, _ = _run_schedule(2, 1, VARLEN)
+    assert recorded_fwd2 == fwd_shapes, (recorded_fwd2, fwd_shapes)
+    assert recorded_bwd2 == []
