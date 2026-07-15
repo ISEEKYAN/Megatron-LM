@@ -15,7 +15,7 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
     save_hf_weights as _save_hf_weights_impl,
 )
-from megatron.lite.model.protocol_utils import add_loss_context_kwargs
+from megatron.lite.model.protocol_utils import add_loss_context_kwargs, nested_from_packed
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
@@ -127,23 +127,12 @@ def _infer_cp_local_seq_len(
     return seq_len // cp_size if seq_len % cp_size == 0 else seq_len
 
 
-def _nested_from_packed_tensor(tensor, seq_lens):
-    if tensor is None:
-        return None
-    if tensor.dim() == 2 and tensor.size(0) == 1:
-        tensor = tensor.squeeze(0)
-    if tensor.dim() != 1:
-        raise ValueError(f"PackedBatch tensor must be 1-D, got {tuple(tensor.shape)}.")
-
-    pieces = []
-    offset = 0
-    for length_t in seq_lens:
-        length = int(length_t.item())
-        pieces.append(tensor.narrow(0, offset, length))
-        offset += length
-    if offset != tensor.numel():
-        raise ValueError(f"PackedBatch sizes sum to {offset}, tensor has {tensor.numel()} tokens.")
-    return torch.nested.as_nested_tensor(pieces, layout=torch.jagged)
+# The 1-D-packed -> jagged-nested split is model-agnostic and lives in the shared
+# protocol_utils layer. DS4 only forks the *CP layout* pair (contiguous DSA, see
+# ``_prepare_packed_batch_kwargs`` below); this pre-CP primitive must not diverge,
+# so alias the shared implementation instead of re-copying it. Keeping the local
+# name preserves existing call sites and unit tests.
+_nested_from_packed_tensor = nested_from_packed
 
 
 def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
