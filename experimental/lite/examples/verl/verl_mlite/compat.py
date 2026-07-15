@@ -863,6 +863,59 @@ def _trace_runtime_patch(stage: str, result: Any = None) -> None:
     sys.stderr.flush()
 
 
+def _patch_verl_dsv4_mxfp4_check() -> bool:
+    """Make verl's DeepSeek-V4 mxfp4 MoE check factory-aware for vLLM >= 0.24.
+
+    verl #6473 ships ``verl.utils.vllm.vllm_dsv4_fp8_utils._is_mxfp4_fused_moe_module``
+    as ``isinstance(module, FusedMoE) and isinstance(module.quant_method, Mxfp4MoEMethod)``.
+    That assumes ``FusedMoE`` is a class. vLLM 0.25.1 refactored ``FusedMoE`` into
+    a *factory function* (it returns a ``MoERunner``), so the first ``isinstance``
+    raises ``TypeError: isinstance() arg 2 must be a type``. This fires
+    unconditionally during the DS4 fp8 resync weight-prep
+    (``update_weights_from_ipc`` -> ``prepare_quanted_weights_for_loading`` ->
+    ``prepare_deepseek_v4_weights_for_loading`` -> ``_restore_moe_params_for_loading``).
+
+    Replace it with a version that keys off ``module.quant_method`` -- the real
+    mxfp4 discriminator (``Mxfp4MoEMethod`` is a proper class in 0.25.1) -- and
+    only then confirms a fused-MoE module via the real classes. DeepSeek-V4 uses
+    the fp8_ds_mla block layout, not mxfp4, so this returns ``False`` for it and
+    the resync proceeds. verl source is untouched; we override our side only.
+    """
+    if not _vllm_importable():
+        return False
+    try:
+        module = importlib.import_module("verl.utils.vllm.vllm_dsv4_fp8_utils")
+    except Exception:
+        return False
+    existing = getattr(module, "_is_mxfp4_fused_moe_module", None)
+    if getattr(existing, "_verl_mlite_factory_aware", False):
+        return True
+
+    def _is_mxfp4_fused_moe_module(candidate: Any) -> bool:
+        from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        quant_method = getattr(candidate, "quant_method", None)
+        if not isinstance(quant_method, Mxfp4MoEMethod):
+            return False
+        # quant_method is mxfp4 -> confirm a fused-MoE module using the real
+        # classes; ``FusedMoE`` itself is a factory function on vLLM >= 0.24, so
+        # isinstance against it is invalid. If the classes cannot be resolved the
+        # mxfp4 quant_method alone is a sufficient signal.
+        try:
+            from vllm.model_executor.layers.fused_moe.layer import (
+                MoERunner,
+                RoutedExperts,
+            )
+
+            return isinstance(candidate, (MoERunner, RoutedExperts))
+        except Exception:
+            return True
+
+    _is_mxfp4_fused_moe_module._verl_mlite_factory_aware = True
+    module._is_mxfp4_fused_moe_module = _is_mxfp4_fused_moe_module
+    return True
+
+
 def apply_runtime_patches() -> None:
     _trace_runtime_patch("00.begin")
     result = _patch_transformers_vision2seq_alias()
@@ -885,6 +938,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("07b.transformers_apply_chat_template_return_dict", result)
     result = _patch_bucketed_weight_sender()
     _trace_runtime_patch("08.bucketed_weight_sender", result)
+    result = _patch_verl_dsv4_mxfp4_check()
+    _trace_runtime_patch("08b.verl_dsv4_mxfp4_check", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
     _trace_runtime_patch("10.end")
