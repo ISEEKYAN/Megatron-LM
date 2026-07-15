@@ -4,10 +4,14 @@ Scope: static source confirmation of why the 128-GPU real-weight (FP8) DeepSeek-
 RL run crashes during the vLLM weight resync, while random-init BF16 proxy runs of
 identical geometry stay green.
 
-## Exact locus (correction)
+## Locus (version-dependent file layout)
 
-The offset accumulation is **not** in `vllm_rollout.py`; it lives in the bucketed
-IPC transfer helper:
+The crash stack from the 128-GPU run named
+`verl/workers/rollout/vllm_rollout/utils.py:231` (`buffer[offset:offset+size].view(...)`).
+In the current `verl_flameagainst` tree that receive path has been refactored out of
+`utils.py` and now lives in the bucketed IPC transfer helper below. Same defect, different
+file layout across verl versions — confirm which verl the run actually used (container
+site-packages vs `verl_flameagainst`) before landing a patch.
 
 - Sender: `verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py`
   - line 151: `self.buffer[offset : offset + weight.nbytes].copy_(weight.view(-1).view(torch.uint8), ...)`
