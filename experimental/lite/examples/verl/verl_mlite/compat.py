@@ -895,21 +895,24 @@ def _patch_verl_dsv4_mxfp4_check() -> bool:
         from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
         quant_method = getattr(candidate, "quant_method", None)
-        if not isinstance(quant_method, Mxfp4MoEMethod):
-            return False
-        # quant_method is mxfp4 -> confirm a fused-MoE module using the real
-        # classes; ``FusedMoE`` itself is a factory function on vLLM >= 0.24, so
-        # isinstance against it is invalid. If the classes cannot be resolved the
-        # mxfp4 quant_method alone is a sufficient signal.
-        try:
-            from vllm.model_executor.layers.fused_moe.layer import (
-                MoERunner,
-                RoutedExperts,
+        is_mxfp4 = isinstance(quant_method, Mxfp4MoEMethod)
+        # Diagnostic (deduped by type pair): emit the real runtime module and
+        # quant_method types so we can confirm the MoE experts are fp8 (not the
+        # mxfp4 4-bit fallback). ``FusedMoE`` is a factory function on vLLM
+        # >= 0.24, so the original ``isinstance(module, FusedMoE)`` type guard is
+        # invalid; the quant_method is the definitive discriminator.
+        seen = _is_mxfp4_fused_moe_module.__dict__.setdefault("_diag_seen", set())
+        diag_key = (type(candidate).__name__, type(quant_method).__name__)
+        if diag_key not in seen:
+            seen.add(diag_key)
+            sys.stderr.write(
+                "VERL_MLITE_MXFP4_DIAG "
+                f"module={type(candidate).__module__}.{type(candidate).__name__} "
+                f"quant_method={type(quant_method).__module__}."
+                f"{type(quant_method).__name__} is_mxfp4={is_mxfp4}\n"
             )
-
-            return isinstance(candidate, (MoERunner, RoutedExperts))
-        except Exception:
-            return True
+            sys.stderr.flush()
+        return is_mxfp4
 
     _is_mxfp4_fused_moe_module._verl_mlite_factory_aware = True
     module._is_mxfp4_fused_moe_module = _is_mxfp4_fused_moe_module
