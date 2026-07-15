@@ -46,7 +46,14 @@ export ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}"
 export TEST_FREQ="${TEST_FREQ:--1}"
 export LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-0}"
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
-export VERL_VLLM_FP8_QUANT_ENABLED=0
+# Debridge (TASK-1.1.12): the hero path exports bf16 from mlite and lets the
+# verl-native vLLMColocateWorkerExtension quantize bf16->fp8 receiver-side via
+# quant_weights (gated by VERL_VLLM_FP8_QUANT_ENABLED=1 + is_fp8_model). Inherit
+# the sbatch's value (=1) instead of hard-clobbering to 0. Hard-0 was correct
+# only for the retired self-built VllmCheckpointWorkerExtension, which raised on
+# =1 because it shipped SENDER-side pre-quantized fp8; on the bf16 path a stray
+# 0 would leave the fp8 vLLM model fed unquantized bf16.
+export VERL_VLLM_FP8_QUANT_ENABLED="${VERL_VLLM_FP8_QUANT_ENABLED:-1}"
 export RUN_NAME="${RUN_NAME:-ds4_gsm8k_grpo_pp${ACTOR_PP}_ep${ACTOR_EP}_cp${ACTOR_CP}_rtp${ROLLOUT_TP}}"
 
 python - "${MODEL_PATH}/config.json" "${ROLLOUT_TP}" <<'PY'
