@@ -56,8 +56,21 @@ PP_SIZE=${PP_SIZE:-2}
 TP_SIZE=${TP_SIZE:-1}
 EP_SIZE=${EP_SIZE:-1}
 CP_SIZE=${CP_SIZE:-1}
-TOTAL_STEPS=${TOTAL_STEPS:-3}
+# bayan 21:06: run more steps so the PP1-vs-PP2 loss delta reveals whether it is
+# converging bf16 noise (< tol, shrinking) or a persistent/diverging real residual.
+TOTAL_STEPS=${TOTAL_STEPS:-16}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-32}
+# bayan 21:06: PP degree must be the ONLY variable across arms. Dynamic-bsz packs a
+# *different number of micro-batches* for PP1 vs PP2 (different token-budget slicing),
+# so their grad-accumulation differs and the loss offset is a packing artifact, not a
+# PP-fix signal. Turn dynamic-bsz OFF and fix micro_batch_size_per_gpu: with DP=1 in
+# both arms, num_micro_batches = TRAIN_BATCH_SIZE / MICRO_BATCH_SIZE is then identical
+# across PP1/PP2 (32/8 = 4 micro-batches: >= PP for a real 1F1B warmup->steady path).
+# THD no_padding still packs variable-length sequences inside each static micro-batch,
+# so per-micro-batch token counts still vary => the per-mb P2P shape bug is still armed.
+# Sweep num-mb via MICRO_BATCH_SIZE (32/16=2, 32/8=4, 32/4=8) to watch offset vs mb count.
+USE_DYNAMIC_BSZ=${USE_DYNAMIC_BSZ:-False}
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-8}
 MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-2048}
 MAX_LENGTH=${MAX_LENGTH:-4096}
 LOAD_HF_WEIGHTS=${LOAD_HF_WEIGHTS:-False}
@@ -104,7 +117,7 @@ echo "==== step 0: generate variable-length SFT data ===="
 if [[ ! -e "${DATA_DIR}/train.parquet" ]]; then
   MROOT="${MEGATRON_CSA:-}" run "${MLITE_NEW}" -- \
     "python -m examples.verl.prepare_varlen_sft_data --output-dir '${DATA_DIR}' \
-       --train-size ${VARLEN_TRAIN_SIZE:-128} --test-size ${VARLEN_TEST_SIZE:-16}" \
+       --train-size ${VARLEN_TRAIN_SIZE:-640} --test-size ${VARLEN_TEST_SIZE:-32}" \
     || { echo "DATA_GEN rc=$?"; exit 3; }
 fi
 
@@ -120,7 +133,8 @@ arm() {  # <mlite_src> <run_name> <pp> <nproc>  -> runs the SFT launcher
      RUN_NAME='${run_name}' \
      NUM_GPUS=${nproc} NPROC_PER_NODE=${nproc} \
      TP_SIZE=${TP_SIZE} PP_SIZE=${pp} EP_SIZE=${EP_SIZE} ETP_SIZE=1 CP_SIZE=${CP_SIZE} \
-     USE_DYNAMIC_BSZ=True \
+     USE_DYNAMIC_BSZ=${USE_DYNAMIC_BSZ} \
+     MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} \
      TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} \
      MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU} MAX_LENGTH=${MAX_LENGTH} \
      TOTAL_STEPS=${TOTAL_STEPS} SAVE_FREQ=-1 TEST_FREQ=-1 \
@@ -142,10 +156,11 @@ OLD_RC=0; arm "${MLITE_OLD}" old_pp2 "${PP_SIZE}" "${NPROC}" || OLD_RC=$?
 echo "ARM_OLD_PP2_RC=${OLD_RC}"
 
 # arm 3 — NEW at PP1 on a single process: NO inter-stage P2P at all, so it is the
-# trusted numerical reference. Same model, same data, DP=1 in both PP1 and PP2 =>
-# identical per-step global batch => per-step loss must match within fp tolerance.
-# A green-but-wrong-value NEW_PP2 (silent off-by-one in the recv<->mb mapping)
-# would diverge here even though rc=0. (bayan 20:15: 三臂数值一致性)
+# trusted numerical reference. Same model, same data, DP=1 in both PP1 and PP2, and
+# (bayan 21:06) static micro_batch_size => IDENTICAL num_micro_batches and grad-accum
+# structure across arms => per-step loss must match within fp tolerance, with PP degree
+# as the sole variable. A green-but-wrong-value NEW_PP2 (silent off-by-one in the
+# recv<->mb mapping) diverges here even though rc=0. (bayan 20:15/21:06: 三臂数值一致性)
 echo "==== arm NEW_PP1 (approach A HEAD, PP=1, single process) — numerical reference ===="
 REF_RC=0; arm "${MLITE_NEW}" new_pp1 1 1 || REF_RC=$?
 echo "ARM_NEW_PP1_RC=${REF_RC}"
