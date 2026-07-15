@@ -546,6 +546,25 @@ class ParamBucket:
                     spec.shard_param.grad = None
                 spec.full_param.data = self.full_buffer
 
+    def release_scratch_keep_weights(self) -> None:
+        """Drop the all-gather scratch while leaving the sharded weights resident.
+
+        This is ``move_model_state``'s scratch-release prologue without the
+        device move: release the full-parameter all-gather buffer, discard the
+        full-parameter views, drain any in-flight grad reduce, and hand the
+        allocator's cached double-buffer slots back to the driver -- but keep
+        ``main_param_buffer`` (and the optimizer-aliased shard views installed by
+        ``release_full_parameters``) on their current device. A colocated vLLM
+        weight-pool wake needs the transient full-model scratch back before it
+        can ``create_and_map``; the export that follows the wake gathers from the
+        resident shards, so the persistent weights must not move (TASK-1.13.8.5).
+        """
+        self.release_full_parameters()
+        self.discard_full_parameter_views()
+        if self._grad_reduce_launched:
+            self.wait_grad_reduce()
+        self.allocator.release_cached()
+
     def prepare_grad_reduce(
         self, *, force: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -1144,6 +1163,18 @@ class CommunicationPipelines:
             bucket.move_model_state(device, load_grad=load_grad)
         self.all_gather.reset_device(device)
         self.grad_reduce.reset_device(device)
+
+    def release_scratch_keep_weights(self) -> None:
+        """Reclaim every bucket's all-gather scratch, keeping weights resident.
+
+        Per-bucket counterpart to ``move_model_state`` that stops short of the
+        device move: it hands the retained double-buffer slots back to the driver
+        (what a colocated vLLM wake needs) but leaves the sharded weights and
+        their optimizer aliases in place as the export gather source. See
+        ``ParamBucket.release_scratch_keep_weights`` and TASK-1.13.8.5.
+        """
+        for bucket in self.buckets:
+            bucket.release_scratch_keep_weights()
 
     def finish_grad_sync(self) -> None:
         self.grad_reduce.finish()

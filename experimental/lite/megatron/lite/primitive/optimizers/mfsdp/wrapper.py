@@ -189,6 +189,24 @@ class MegatronFSDP(nn.Module):
             load_grad=load_grad,
         )
 
+    def release_export_scratch(self) -> None:
+        """Reclaim the training step's all-gather scratch before a colocated wake.
+
+        verl's ``update_weights`` wakes the sleeping vLLM weight pool
+        (``resume(['weights'])``) *before* exporting M-FSDP weights. At that
+        point the trainer still pins the training step's transient all-gather
+        scratch -- the persistent double-buffer slots plus any full-parameter
+        views -- on top of the sharded weights and optimizer state, and vLLM's
+        cumem ``create_and_map`` OOMs. Hand that scratch back to the driver
+        (keeping the sharded weights resident as the export gather source) and
+        drain the caching allocator so the wake has room. This is the pre-wake
+        counterpart to ``full_parameter_context``'s post-export
+        ``release_cached_buffers``. See TASK-1.13.8.5.
+        """
+        self.param_sync.release_scratch_keep_weights()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def stream_full_parameters(self) -> Iterator[tuple[str, nn.Parameter]]:
         """Yield ``(name, full_param)`` one bucket at a time for export.
 

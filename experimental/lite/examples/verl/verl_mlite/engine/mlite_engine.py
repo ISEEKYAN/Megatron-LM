@@ -451,7 +451,38 @@ class MegatronLiteEngine(BaseEngine):
         self._require_initialized()
         if model or not (optimizer or grad):
             super().to(device=device, model=model, optimizer=optimizer, grad=grad)
-        self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
+        # A training-side reload (gradient buffers requested) also restores any
+        # optimizer state parked on CPU by release_train_scratch_before_resync,
+        # so the Adam moments return before the next optimizer step even when
+        # optimizer_offload is off. The export reload uses grad=False and leaves
+        # them parked through generation; load_state_to_device is a no-op when
+        # nothing is parked (TASK-1.13.8.5).
+        reload_optimizer = optimizer or (device == "cuda" and grad)
+        self.runtime.to(self.handle, device, model=model, optimizer=reload_optimizer, grad=grad)
+
+    def release_train_scratch_before_resync(self) -> None:
+        """Free the post-train-step residual before the colocated vLLM weight wake.
+
+        verl's ``update_weights`` wakes the sleeping vLLM weight pool
+        (``rollout.resume(tags=["weights"])``) *before* it exports M-FSDP weights
+        via ``get_per_tensor_param``. At that moment the trainer still holds the
+        training step's optimizer Adam moments and the M-FSDP all-gather
+        double-buffer scratch, which collide with vLLM's cumem ``create_and_map``
+        (the resync wake OOM). The post-export ``offload_params_after_export``
+        runs too late to help this wake, so park the optimizer state on CPU and
+        hand the M-FSDP scratch back to the driver here, keeping the sharded
+        weights resident as the export gather source.
+
+        The optimizer park is reversible: gated on ``param_offload`` so the next
+        training-side reload (``to("cuda", ..., grad=True)``) is the guaranteed
+        restore point, and skipped when ``optimizer_offload`` already parks the
+        Adam moments at the train-step exit. See TASK-1.13.8.5.
+        """
+        self._require_initialized()
+        if self.is_param_offload_enabled and not self.is_optimizer_offload_enabled:
+            self.to("cpu", model=False, optimizer=True, grad=False)
+        self.runtime.release_export_scratch(self.handle)
+        aggressive_empty_cache(force_sync=True)
 
     def save_checkpoint(
         self,
