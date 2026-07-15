@@ -920,8 +920,35 @@ class MegatronLiteEngine(BaseEngine):
             return None
 
         loss_mask = micro_batch["loss_mask"]
+        input_lengths = input_ids.offsets().diff().tolist()
         if getattr(loss_mask, "is_nested", False):
-            return loss_mask
+            # VERL delivers ``response_mask`` / ``loss_mask`` as a *response-only*
+            # nested tensor (shape ``[bsz, response_len]``), while ``input_ids`` is
+            # the full ``[prompt; response]`` packed sequence. Returning it as-is
+            # left the packed loss_mask (sum of response lengths) shorter than the
+            # ``input_ids`` seq_lens, so ``_nested_from_packed_tensor`` narrowed a
+            # full-length slice out of a response-only buffer and crashed the
+            # actor-update step. Expand it here to the full sequence the same way
+            # the native Megatron path does (``_build_mtp_loss_mask_nested``):
+            # left-pad each row with prompt zeros and keep the whole valid response
+            # span (response_mask may carry internal zeros for tool outputs).
+            resp_offsets = loss_mask.offsets().tolist()
+            resp_values = loss_mask.values()
+            rows = []
+            for i, total in enumerate(input_lengths):
+                start, end = resp_offsets[i], resp_offsets[i + 1]
+                response_piece = resp_values[start:end]
+                prompt_len = total - (end - start)
+                if prompt_len < 0:
+                    raise ValueError(
+                        f"response loss mask has {end - start} tokens but packed input "
+                        f"sequence has {total} tokens"
+                    )
+                prompt_pad = torch.zeros(
+                    prompt_len, dtype=response_piece.dtype, device=response_piece.device
+                )
+                rows.append(torch.cat([prompt_pad, response_piece], dim=0))
+            return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
         rows = []
         for seq_ids, row_mask in zip(input_ids.unbind(0), loss_mask, strict=True):
