@@ -24,8 +24,12 @@
 #   BASE_IMAGE   canonical single-torch2.12 container (PP1 job13983827 stack)
 #   MLITE_NEW    checkout at approach-A HEAD (this branch)
 #   MLITE_OLD    checkout at 76905da37^ (== f9604ea84, pre-approach-A)
-#   MODEL_PATH   a small HF model dir (config+tokenizer; e.g. Qwen2.5-0.5B). Weights
+#   MODEL_PATH   a small HF model dir (config+tokenizer; e.g. tiny qwen3_moe). Weights
 #                optional — LOAD_HF_WEIGHTS defaults False (structural THD-PP test).
+#   VERL_ROOT    committed VERL snapshot (provides verl.trainer.sft_trainer). Not baked
+#                into the container; run_qwen3moe_sft.sh puts it on PYTHONPATH from env.
+#   MEGATRON_ROOT compatible MCore snapshot (provides megatron.core; experimental/lite
+#                imports it and does NOT bundle a real megatron/core).
 #   OUTPUT_DIR   fresh result directory
 set -euo pipefail
 
@@ -33,7 +37,12 @@ BASE_IMAGE=${BASE_IMAGE:?set BASE_IMAGE to the canonical single-torch2.12 contai
 MLITE_NEW=${MLITE_NEW:?set MLITE_NEW to the approach-A HEAD checkout}
 MLITE_OLD=${MLITE_OLD:?set MLITE_OLD to the pre-approach-A (76905da37^) checkout}
 MODEL_PATH=${MODEL_PATH:?set MODEL_PATH to a small HF model dir (config+tokenizer)}
+VERL_ROOT=${VERL_ROOT:?set VERL_ROOT to a committed VERL snapshot (verl.trainer.sft_trainer)}
+MEGATRON_ROOT=${MEGATRON_ROOT:?set MEGATRON_ROOT to a compatible MCore snapshot (megatron.core)}
 OUTPUT_DIR=${OUTPUT_DIR:?set OUTPUT_DIR to a fresh result directory}
+# verl / mcore are not baked into the container; run_qwen3moe_sft.sh prepends them to
+# PYTHONPATH from the environment, so they must reach the container via srun --export=ALL.
+export VERL_ROOT MEGATRON_ROOT
 
 # Knobs (defaults tuned for a 2-GPU PP2 decisive run).
 NPROC=${NPROC:-2}
@@ -48,7 +57,8 @@ MAX_LENGTH=${MAX_LENGTH:-4096}
 LOAD_HF_WEIGHTS=${LOAD_HF_WEIGHTS:-False}
 ARM_TIMEOUT=${ARM_TIMEOUT:-600}   # a hung OLD arm is the red signal; bound it.
 
-for p in "${BASE_IMAGE}" "${MLITE_NEW}" "${MLITE_OLD}" "${MODEL_PATH}"; do
+for p in "${BASE_IMAGE}" "${MLITE_NEW}" "${MLITE_OLD}" "${MODEL_PATH}" \
+         "${VERL_ROOT}" "${MEGATRON_ROOT}"; do
   [[ -e "${p}" ]] || { echo "missing required path: ${p}" >&2; exit 2; }
 done
 mkdir -p "${OUTPUT_DIR}"
