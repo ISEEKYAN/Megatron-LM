@@ -2,7 +2,12 @@
 """Qwen3.5 GatedDeltaNet CP-mode precision parity proxy.
 
 Matrix (baseline = CP off / full sequence, cp_size=1):
-  gdn_cp_mode in {"headwise"(default), "replicated"} x CP in {off, on(cp2/cp4)}
+  SBHD: gdn_cp_mode in {"headwise"(default), "replicated", "chunkwise"} x CP in {cp2/cp4}
+  packed THD: gdn_cp_mode="chunkwise" (the RL path) vs CP-off dense reference
+
+``headwise``/``replicated`` are bitwise-exact vs CP-off; ``chunkwise`` runs the FLA ring
+(cross-rank chunk-state reassociation) so it is expected at the bf16 floor, not bitwise.
+The packed THD arm exercises the packing-aware reshuffle the old ``sharded`` copy broke.
 
 Design
 ------
@@ -121,7 +126,10 @@ def run_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world):
     ref_in_grad_full = None
     ref_wgrads = None
 
-    for cp_mode in ("headwise", "replicated"):
+    # headwise/replicated are bitwise-exact vs CP-off (heads independent); chunkwise
+    # runs the FLA ring so it reassociates in bf16 and is expected at the bf16 floor,
+    # not bitwise (still orders of magnitude below the old packed-path O(1) corruption).
+    for cp_mode in ("headwise", "replicated", "chunkwise"):
         cp_mod = _make_gdn(cp_size, cp_rank, cp_group, cp_mode).to(device=device, dtype=DTYPE)
         _randomize_and_broadcast(cp_mod)
 
@@ -207,6 +215,85 @@ def run_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world):
     return results
 
 
+# Packed THD lengths (each divisible by 2*cp for cp in {2,4}); a sequence deliberately
+# spans the contiguous CP-rank boundary so the packing-aware reshuffle is exercised.
+PACKED_LENS = [1024, 512, 512]  # total 2048
+
+
+def run_packed_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world):
+    """Packed THD chunkwise parity: CP chunkwise vs CP-off dense reference.
+
+    This is the path RL actually runs (``impl_cfg.use_thd=True``) and the one the old
+    ``sharded`` copy corrupted. Reference = a cp1 module on the FULL packed sequence;
+    each CP rank is fed its zigzag shard + the *global* cu_seqlens. A correct
+    packing-aware reshuffle keeps the packed chunkwise output at the bf16 ring floor vs
+    the reference (was ~O(1) / 220x-ppo_kl before the fix).
+    """
+    from megatron.lite.primitive.parallel.thd import split_packed_to_cp_local
+    from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
+
+    lens = torch.tensor(PACKED_LENS, dtype=torch.int32, device=device)
+    cu = torch.zeros(len(PACKED_LENS) + 1, dtype=torch.int32, device=device)
+    torch.cumsum(lens, dim=0, out=cu[1:])
+    total = int(cu[-1].item())
+    max_seqlen = int(lens.max().item())
+
+    def _psp(cp_sz, cp_rk, grp):
+        extra = {}
+        if cp_sz > 1:
+            extra["local_cp_size"] = cp_sz
+            extra["cp_group"] = grp
+        return PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            cu_seqlens_q_padded=cu,
+            cu_seqlens_kv_padded=cu,
+            cp_rank=cp_rk,
+            **extra,
+        )
+
+    torch.manual_seed(SEED + 5)
+    full_x = torch.randn(total, BATCH, HIDDEN, device=device, dtype=DTYPE)
+    dist.broadcast(full_x, src=0)
+
+    cp_mod = _make_gdn(cp_size, cp_rank, cp_group, "chunkwise").to(device=device, dtype=DTYPE)
+    _randomize_and_broadcast(cp_mod)
+
+    ref_out_full = None
+    if rank == 0:
+        ref_mod = _make_gdn(1, 0, cp1_group, "chunkwise").to(device=device, dtype=DTYPE)
+        ref_mod.load_state_dict(cp_mod.state_dict())
+        with torch.no_grad():
+            ref_out_full = ref_mod(full_x, packed_seq_params=_psp(1, 0, cp1_group)).detach().clone()
+        del ref_mod
+    if ref_out_full is None:
+        ref_out_full = torch.empty(total, BATCH, HIDDEN, device=device, dtype=DTYPE)
+    dist.broadcast(ref_out_full, src=0)
+
+    local_x = split_packed_to_cp_local(
+        full_x, cu_seqlens_padded=cu, cp_size=cp_size, cp_rank=cp_rank, dim=0
+    ).contiguous()
+    with torch.no_grad():
+        cp_out = cp_mod(local_x, packed_seq_params=_psp(cp_size, cp_rank, cp_group))
+
+    expected_local = split_packed_to_cp_local(
+        ref_out_full, cu_seqlens_padded=cu, cp_size=cp_size, cp_rank=cp_rank, dim=0
+    )
+    f_abs, f_rel, f_scale = _diff(cp_out.detach(), expected_local)
+    if cp_rank == 0:
+        print(
+            f"GDN_CP_PACKED_PARITY mode=chunkwise cp={cp_size} lens={PACKED_LENS} "
+            f"fwd[max_abs={f_abs:.3e} max_rel={f_rel:.3e} scale={f_scale:.3e}]",
+            flush=True,
+        )
+    del cp_mod
+    torch.cuda.empty_cache()
+    dist.barrier()
+
+
 def main():
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -226,6 +313,7 @@ def main():
         print(f"GDN_CP_ENV world={world} HAS_FLA={g._HAS_FLA}", flush=True)
 
     run_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world)
+    run_packed_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world)
 
     dist.barrier()
     dist.destroy_process_group()
