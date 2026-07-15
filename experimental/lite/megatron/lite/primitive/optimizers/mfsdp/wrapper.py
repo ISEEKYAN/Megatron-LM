@@ -35,6 +35,7 @@ class _BeginBackward(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor, None]:
         ctx.pipeline.begin_backward()
+        ctx.pipeline.install_backward_all()
         return grad, None
 
 
