@@ -50,14 +50,22 @@ def _build_prompt_dataproto(worker):
     """[C1][C2] 建 prompt DataProto(input_ids 左 pad + mask + position_ids)。"""
     from verl.protocol import DataProto
 
-    # [C1] verl worker holds the tokenizer on model_config (HFModelConfig), not
-    # directly. Fall back to building it from the model path if absent.
+    # [C1] verl worker does not expose a tokenizer directly, and its
+    # HFModelConfig.tokenizer / .local_path can be None. Build from the model
+    # path: env CHECKPOINT_DIR (guaranteed exported by the submit) is the most
+    # reliable source; fall back to model_config attrs.
     mc = getattr(worker, "model_config", None)
     tok = getattr(mc, "tokenizer", None)
     if tok is None:
         from transformers import AutoTokenizer
 
-        path = getattr(mc, "local_path", None) or getattr(mc, "path", None)
+        path = (
+            os.environ.get("CHECKPOINT_DIR")
+            or getattr(mc, "local_path", None)
+            or getattr(mc, "path", None)
+        )
+        if not path:
+            raise RuntimeError("[C1] cannot resolve tokenizer path (CHECKPOINT_DIR unset)")
         tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     ids_list = [tok(p, add_special_tokens=False)["input_ids"] for p in _PROBE_PROMPTS]
