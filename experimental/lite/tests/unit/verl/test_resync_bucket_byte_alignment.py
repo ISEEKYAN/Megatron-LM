@@ -140,3 +140,54 @@ def test_padding_covers_mixed_dtype_buckets(dtypes, align) -> None:
     for name, offset, dtype, shape in meta:
         assert offset % dtype.itemsize == 0
         _receive(buffer, name, offset, dtype, shape)  # no raise
+
+
+def _receive_from_producer_meta(staging, bucket_meta):
+    """Model the receiver against the offsets the production sender recorded."""
+    for entry in bucket_meta.values():
+        offset = entry["offset"]
+        dtype = entry["dtype"]
+        shape = tuple(entry["shape"])
+        yield entry["name"], _receive(staging, entry["name"], offset, dtype, shape)
+
+
+def test_production_sender_pads_fp8_offsets_to_8_bytes() -> None:
+    """The real MLite sender (_SyncBucketProducer) applies Fix-A end to end.
+
+    Exercises the production packing path used at 128 GPUs (not the abstract
+    formula): a same-layer FP8+BF16 mix must land every recorded ``offset`` on
+    an 8-byte boundary so the receiver's ``view(dtype)`` never crashes, and the
+    round trip must be byte-exact.
+    """
+    from verl_mlite.compat import _SyncBucketProducer
+
+    # Two tensors that hash to the SAME layer-cluster key so they share a
+    # bucket: an odd-numel FP8 weight followed by a BF16 weight. Without Fix-A
+    # the BF16 tensor would land at odd offset 3 and crash the receiver.
+    fp8 = torch.arange(3, dtype=torch.int8).view(FP8)
+    bf16 = torch.tensor([1.5, -2.0, 0.25, 8.0], dtype=torch.bfloat16)
+    weights = [
+        ("model.layers.0.mlp.experts.w13.weight", fp8),
+        ("model.layers.0.mlp.experts.w13.weight_scale", bf16),
+    ]
+
+    producer = _SyncBucketProducer(list(weights), bucket_size=256)
+    staging = torch.zeros(256, dtype=torch.uint8)
+
+    kind, bucket_meta, _direct, used_bytes, _ready, _is_last = producer.next_bucket(
+        staging
+    )
+    assert kind == "bucket"
+    assert set(bucket_meta) == {name for name, _ in weights}
+
+    # Fix-A: the FP8 tensor at offset 0 has odd nbytes (3); the BF16 tensor must
+    # be pushed to the next 8-byte boundary instead of odd offset 3.
+    scale_entry = bucket_meta["model.layers.0.mlp.experts.w13.weight_scale"]
+    assert scale_entry["offset"] == 8
+    assert used_bytes >= 8 + bf16.nbytes
+
+    originals = dict(weights)
+    for name, received in _receive_from_producer_meta(staging, bucket_meta):
+        assert received.reshape(-1).view(torch.uint8).equal(
+            originals[name].reshape(-1).view(torch.uint8)
+        )

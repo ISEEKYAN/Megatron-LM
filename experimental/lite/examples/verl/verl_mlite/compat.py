@@ -424,6 +424,20 @@ class _SyncBucketProducer:
                 self._pending = (name, weight)
                 break
 
+            # Fix-A (resync IPC byte-alignment): pad every tensor's start
+            # offset up to an 8-byte boundary. The receiver reconstructs each
+            # tensor as ``buffer[offset:offset+size].view(dtype)``, and
+            # ``Tensor.view(dtype)`` requires the byte ``storage_offset`` to be
+            # divisible by ``dtype.itemsize``. A pure BF16/FP32 stream keeps
+            # every offset even, so it never trips (why the proxy stays green).
+            # But DS4 real-weight resync ships block-FP8 tensors (itemsize 1);
+            # an odd-numel FP8 tensor leaves ``offset`` odd and the *next*
+            # BF16/FP32 tensor in the same bucket crashes on the view. Aligning
+            # to 8 bytes covers every dtype we transport (fp8/bf16/fp16/fp32)
+            # and is byte-lossless — the receiver reads the padded offset we
+            # record in ``bucket_meta`` unchanged. See
+            # tests/unit/verl/test_resync_bucket_byte_alignment.py.
+            offset = (offset + 7) & ~7
             if offset + weight.nbytes > self._bucket_size and bucket_meta:
                 self._pending = (name, weight)
                 break
@@ -443,7 +457,9 @@ class _SyncBucketProducer:
                 weight.view(-1).view(torch.uint8), non_blocking=True
             )
             offset += weight.nbytes
-            if offset == self._bucket_size:
+            # Padding can push a full bucket a few bytes past exact equality, so
+            # break on ``>=`` rather than ``==``.
+            if offset >= self._bucket_size:
                 break
 
         ready = None
