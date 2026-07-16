@@ -201,7 +201,7 @@ class MegatronFSDP(nn.Module):
         (keeping the sharded weights resident as the export gather source) and
         drain the caching allocator so the wake has room. This is the pre-wake
         counterpart to ``full_parameter_context``'s post-export
-        ``release_cached_buffers``. See TASK-1.13.8.5.
+        ``release_cached_buffers``.
         """
         self.param_sync.release_scratch_keep_weights()
         if torch.cuda.is_available():

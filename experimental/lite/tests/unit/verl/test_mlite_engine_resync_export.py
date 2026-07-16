@@ -5,8 +5,7 @@ Covers the two pure generator wrappers wired into ``get_per_tensor_param`` so
 the M-FSDP all-gather buffer and the reloaded model are returned to the driver
 before the colocated vLLM ``wake_up`` (the resync wake_up OOM fix). The critical
 invariant is release *ordering*: the offload/drain must fire once the export
-stream is consumed, even on early-abort or mid-stream failure. GPU/verl-free —
-see TASK-1.13.8.
+stream is consumed, even on early-abort or mid-stream failure. GPU/verl-free.
 """
 import torch
 

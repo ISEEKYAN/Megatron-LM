@@ -24,7 +24,7 @@ Two thin generator wrappers enforce that ordering around the export stream:
 This is an RL-colocation concern and deliberately lives in the verl integration
 layer, never in the vLLM-agnostic megatron_lite export primitive (layering).
 Kept stdlib-only so the release-ordering invariant is CPU unit-testable without
-a verl or CUDA runtime. See TASK-1.13.8.
+a verl or CUDA runtime.
 """
 from __future__ import annotations
 

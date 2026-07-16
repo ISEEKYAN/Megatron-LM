@@ -7,7 +7,7 @@ teardown (``full_parameter_context`` unwinding because the export consumer
 raised, e.g. a downstream OOM) an aborted collective can leave a slot busy;
 raising there would replace the primary error with a misleading "active buffers"
 RuntimeError. ``force=True`` bypasses the guard so the cache is dropped and the
-primary exception survives. CPU-only — see TASK-1.13.8.5.
+primary exception survives. CPU-only.
 """
 import pytest
 

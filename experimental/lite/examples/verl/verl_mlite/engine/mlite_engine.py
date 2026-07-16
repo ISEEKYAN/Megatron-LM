@@ -244,15 +244,6 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
         assert self._runtime_ctx is not None
         self._runtime_ctx.__exit__(exc_type, exc_val, exc_tb)
         super().__exit__(exc_type, exc_val, exc_tb)
-        # After a clean training pass (update_actor), hand the post-step residual
-        # (M-FSDP all-gather scratch + parked optimizer state) back to the driver
-        # here, at the engine's own offload exit -- verl's fit loop runs this train
-        # context exit *before* it calls update_weights (rollout.resume(["weights"])),
-        # so the colocated vLLM weight wake no longer collides with the trainer's
-        # leftovers. Keeps the sharded weights resident as the export gather source.
-        # See TASK-1.13.8.5 (internalized from a former verl-called hook).
-        if self.mode == "train" and exc_type is None:
-            self.engine._release_train_scratch_before_resync()
         return False
 
 
@@ -399,8 +390,9 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
         generator = self.runtime.export_weights(self.handle, **export_kwargs)
         # Drain the export with a threshold-batched empty_cache so the released
-        # M-FSDP all-gather buffer is returned to the driver before the colocated
-        # vLLM wakes (avoids the resync wake_up OOM). See TASK-1.13.8.
+        # M-FSDP all-gather buffer is returned to the driver as the export streams,
+        # keeping the transient full-parameter footprint from stacking on top of a
+        # colocated inference weight pool.
         streamed = stream_export_with_empty_cache(
             generator,
             resync_export_empty_cache_threshold_bytes(),
@@ -408,13 +400,10 @@ class MegatronLiteEngine(BaseEngine):
         )
         # Symmetric to the reload above (mirrors save_checkpoint / load_checkpoint):
         # return the model to CPU and hard-drain once the caller has consumed the
-        # export, *before* the colocated vLLM wake_up. The colocated vLLM uses a
+        # export, before the colocated inference pool wakes. That pool uses a
         # separate (cumem) allocator on the same physical device; without this the
-        # M-FSDP export-peak footprint (~61 GiB on the busiest EP rank) stays
-        # resident and vLLM OOMs in create_and_map (cumem_allocator.cpp:139) with
-        # ~20 GiB free, whereas the fsdp2 baseline survives 12 cycles at 166 MiB
-        # free (TASK-1.13.8.6: the resync wake_up death is a release-ordering
-        # collision, not a leak — mfsdp/fsdp2 peak footprints are near-identical).
+        # M-FSDP export-peak footprint stays resident and the wake OOMs in
+        # create_and_map while the caching allocator still holds the freed blocks.
         if self.is_param_offload_enabled:
             streamed = offload_params_after_export(
                 streamed,
@@ -454,43 +443,7 @@ class MegatronLiteEngine(BaseEngine):
         self._require_initialized()
         if model or not (optimizer or grad):
             super().to(device=device, model=model, optimizer=optimizer, grad=grad)
-        # A training-side reload (gradient buffers requested) also restores any
-        # optimizer state parked on CPU by _release_train_scratch_before_resync,
-        # so the Adam moments return before the next optimizer step even when
-        # optimizer_offload is off. The export reload uses grad=False and leaves
-        # them parked through generation; load_state_to_device is a no-op when
-        # nothing is parked (TASK-1.13.8.5).
-        reload_optimizer = optimizer or (device == "cuda" and grad)
-        self.runtime.to(self.handle, device, model=model, optimizer=reload_optimizer, grad=grad)
-
-    def _release_train_scratch_before_resync(self) -> None:
-        """Free the post-train-step residual before the colocated vLLM weight wake.
-
-        verl's ``update_weights`` wakes the sleeping vLLM weight pool
-        (``rollout.resume(tags=["weights"])``) *before* it exports M-FSDP weights
-        via ``get_per_tensor_param``. At that moment the trainer still holds the
-        training step's optimizer Adam moments and the M-FSDP all-gather
-        double-buffer scratch, which collide with vLLM's cumem ``create_and_map``
-        (the resync wake OOM). The post-export ``offload_params_after_export``
-        runs too late to help this wake, so park the optimizer state on CPU and
-        hand the M-FSDP scratch back to the driver here, keeping the sharded
-        weights resident as the export gather source.
-
-        Called from ``_MegatronLiteModeCtx.__exit__`` on the training-mode context
-        exit -- the engine's own offload point at the end of ``update_actor`` --
-        so no verl-side hook is needed: the fit loop always runs this exit before
-        the subsequent ``update_weights`` wakes the rollout weight pool.
-
-        The optimizer park is reversible: gated on ``param_offload`` so the next
-        training-side reload (``to("cuda", ..., grad=True)``) is the guaranteed
-        restore point, and skipped when ``optimizer_offload`` already parks the
-        Adam moments at the train-step exit. See TASK-1.13.8.5.
-        """
-        self._require_initialized()
-        if self.is_param_offload_enabled and not self.is_optimizer_offload_enabled:
-            self.to("cpu", model=False, optimizer=True, grad=False)
-        self.runtime.release_export_scratch(self.handle)
-        aggressive_empty_cache(force_sync=True)
+        self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
 
     def save_checkpoint(
         self,

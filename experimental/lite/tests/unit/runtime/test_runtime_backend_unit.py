@@ -69,6 +69,114 @@ def test_release_export_scratch_routes_to_mfsdp_chunks_and_skips_plain_ones():
     assert released == [id(mfsdp_a), id(mfsdp_b)]
 
 
+class _RecordingChunk:
+    def __init__(self, log):
+        self._log = log
+
+    def release_export_scratch(self):
+        self._log.append("release_scratch")
+
+
+class _RecordingOptimizer:
+    def __init__(self, log):
+        self._log = log
+
+    def offload_state_to_cpu(self):
+        self._log.append("park_optimizer")
+
+    def load_state_to_device(self):
+        self._log.append("restore_optimizer")
+
+
+def _transfer_handle(log):
+    return ModelHandle(
+        model=_RecordingChunk(log),
+        optimizer=_RecordingOptimizer(log),
+        parallel_state=types.SimpleNamespace(pp_size=1),
+        _extras={"model_chunks": [_RecordingChunk(log)]},
+    )
+
+
+@pytest.fixture
+def _record_model_moves(monkeypatch):
+    """Record model offload/reload without touching real DDP/M-FSDP storage."""
+    import megatron.lite.runtime.megatron_utils as mu
+
+    def _make(tag):
+        def _fn(model_chunks, *args, **kwargs):
+            model_chunks[0]._log.append(tag)
+
+        return _fn
+
+    monkeypatch.setattr(mu, "offload_model_to_cpu", _make("offload_model"))
+    monkeypatch.setattr(mu, "load_model_to_gpu", _make("load_model"))
+
+
+def test_training_offload_parks_optimizer_and_releases_scratch(_record_model_moves):
+    # A training-side offload (model + grad) must vacate the optimizer even though
+    # the caller left optimizer=False, then hand the M-FSDP scratch back.
+    log = []
+    handle = _transfer_handle(log)
+
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(
+        handle, "cpu", model=True, optimizer=False, grad=True
+    )
+
+    assert log == ["offload_model", "park_optimizer", "release_scratch"]
+
+
+def test_training_offload_parks_optimizer_once_when_already_requested(_record_model_moves):
+    # optimizer=True must not double-park; still one offload + scratch release.
+    log = []
+    handle = _transfer_handle(log)
+
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(
+        handle, "cpu", model=True, optimizer=True, grad=True
+    )
+
+    assert log.count("park_optimizer") == 1
+    assert log == ["offload_model", "park_optimizer", "release_scratch"]
+
+
+def test_export_offload_keeps_optimizer_and_skips_scratch(_record_model_moves):
+    # An export/checkpoint offload (grad=False) moves only the model: the optimizer
+    # stays put and no pre-wake scratch release fires.
+    log = []
+    handle = _transfer_handle(log)
+
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(
+        handle, "cpu", model=True, optimizer=False, grad=False
+    )
+
+    assert log == ["offload_model"]
+
+
+def test_training_reload_restores_parked_optimizer(_record_model_moves):
+    # A training reload (grad=True) restores the parked optimizer even when the
+    # caller left optimizer=False.
+    log = []
+    handle = _transfer_handle(log)
+
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(
+        handle, "cuda", model=True, optimizer=False, grad=True
+    )
+
+    assert log == ["load_model", "restore_optimizer"]
+
+
+def test_export_reload_keeps_optimizer_parked(_record_model_moves):
+    # An export reload (grad=False, optimizer=False) reloads only the model and
+    # leaves the optimizer parked through generation.
+    log = []
+    handle = _transfer_handle(log)
+
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(
+        handle, "cuda", model=True, optimizer=False, grad=False
+    )
+
+    assert log == ["load_model"]
+
+
 def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
     context = LossContext(source_batch="source")
     seen = []

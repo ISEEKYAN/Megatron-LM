@@ -370,13 +370,13 @@ class MegatronLiteRuntime(RuntimeBase):
                         yield from chunk.named_parameters()
 
     def release_export_scratch(self, handle: ModelHandle) -> None:
-        """Reclaim M-FSDP all-gather scratch before a colocated vLLM weight wake.
+        """Reclaim M-FSDP all-gather scratch before a colocated weight wake.
 
         Loops the model chunks and asks each M-FSDP wrapper to hand its retained
         double-buffer scratch back to the driver while keeping the sharded
         weights resident (the export gather source that runs right after the
         wake). No-op for chunks that do not expose the hook (non-M-FSDP
-        backends). See TASK-1.13.8.5.
+        backends).
         """
         model_chunks = handle._extras.get("model_chunks", [handle._model])
         for chunk in model_chunks:
@@ -403,19 +403,45 @@ class MegatronLiteRuntime(RuntimeBase):
             offload_optimizer,
         )
 
+        # A training-side transfer carries gradient buffers (grad=True) and moves
+        # the model; export/checkpoint transfers pass grad=False. The training
+        # offload/reload is the point where a colocated inference weight pool is
+        # about to wake (offload) or has just released the device back to the
+        # trainer (reload), so it owns the pre-wake scratch release and the
+        # optimizer park/restore -- keyed only on this runtime's own transfer
+        # arguments, with no dependency on the calling engine.
+        training_transfer = model and grad
         if device == "cpu":
             if model:
                 offload_model_to_cpu(model_chunks)
-            if optimizer and handle._optimizer is not None:
+            # Park the optimizer on a training offload even when the caller left
+            # optimizer=False: the Adam moments must vacate the device before the
+            # colocated inference pool maps its weights, and the next training
+            # reload restores them. Export/checkpoint offloads (grad=False) keep
+            # the caller's optimizer choice.
+            if (optimizer or training_transfer) and handle._optimizer is not None:
                 offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
                 if callable(offload_state):
                     offload_state()
                 else:
                     offload_optimizer(handle._optimizer)
+            # Hand the M-FSDP all-gather scratch back to the driver and hard-drain
+            # the caching allocator so a colocated inference pool (a separate cumem
+            # allocator on the same device) can map the freed memory. No-op for
+            # non-M-FSDP chunks and when no scratch is held.
+            if training_transfer:
+                self.release_export_scratch(handle)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
         elif device == "cuda":
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
-            if optimizer and handle._optimizer is not None:
+            # A training reload (grad=True) restores any optimizer state parked by
+            # the training offload above, even when the caller left optimizer=False
+            # -- the export reload uses grad=False and keeps the moments parked
+            # through generation. The restore is a no-op when nothing is parked.
+            if (optimizer or training_transfer) and handle._optimizer is not None:
                 load_state = getattr(handle._optimizer, "load_state_to_device", None)
                 if callable(load_state):
                     load_state()
