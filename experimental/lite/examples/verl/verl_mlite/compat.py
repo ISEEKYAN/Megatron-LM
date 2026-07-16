@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import importlib.abc
 import importlib.machinery
 import importlib.util
@@ -835,6 +836,19 @@ def _patch_verl_dsv4_native_layerwise_reload() -> bool:
         finally:
             model_runner.model._verl_mlite_ds4_layerwise_reload_active = False
         restored_sinks = _restore_dsv4_attn_sink_padding(model_runner.model)
+        # ``load_quanted_weights`` clones IPC bucket views because vLLM's
+        # layerwise loader may retain them until a complete logical layer is
+        # available.  ``finalize_layerwise_processing`` drops those references,
+        # but PyTorch's caching allocator otherwise keeps the temporary device
+        # storage mapped.  In colocated sleep mode that storage competes with
+        # vLLM's cuMem weight mappings on the next wake-up and can OOM even
+        # though no live tensor owns it (observed on every rank of a 128-GPU
+        # DS4 run).  Release the now-dead staging blocks at the lifecycle
+        # boundary; doing this per IPC bucket would be both too early and slow.
+        gc.collect()
+        import torch
+
+        torch.cuda.empty_cache()
         sys.stderr.write(
             "VERL_MLITE_DSV4_LAYERWISE_RELOAD finalized native vLLM reload "
             f"attention_sinks_restored={restored_sinks}\n"

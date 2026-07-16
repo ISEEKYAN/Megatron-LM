@@ -61,6 +61,9 @@ def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:
         "_restore_dsv4_attn_sink_padding",
         lambda model: events.append(("restore-attention", model)) or 4,
     )
+    monkeypatch.setattr(
+        torch.cuda, "empty_cache", lambda: events.append("empty-device-cache")
+    )
     model = SimpleNamespace(is_ds4=True)
     config = SimpleNamespace(model_config=object())
     runner = SimpleNamespace(model=model, vllm_config=config)
@@ -83,6 +86,7 @@ def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:
         ("finalize", model, config.model_config),
         ("exit-config", config),
         ("restore-attention", model),
+        "empty-device-cache",
     ]
     assert reload_meta.SKIP_TENSORS == {
         "existing",
