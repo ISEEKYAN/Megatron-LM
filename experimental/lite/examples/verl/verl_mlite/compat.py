@@ -658,6 +658,9 @@ def _recreate_dense_fp8_linear_params(model) -> int:
         except Exception as _re:
             sys.stderr.write(f"VERL_MLITE_DENSE_RECREATE_SKIP {_name}: {_re!r}\n")
             sys.stderr.flush()
+            raise RuntimeError(
+                f"failed to recreate dense FP8 parameters for {_name}"
+            ) from _re
     return recreated
 
 
@@ -681,10 +684,15 @@ def _patch_verl_dsv4_prepare_recreates_dense() -> bool:
         state = original(model_runner, *args, **kwargs)
         try:
             from verl.utils.vllm.vllm_dsv4_fp8_utils import is_deepseek_v4_model
+            from vllm.config import set_current_vllm_config
 
             model = model_runner.model
             if is_deepseek_v4_model(model):
-                n = _recreate_dense_fp8_linear_params(model)
+                # Fp8LinearMethod.create_weights consults vLLM's process-global
+                # config. Online reload runs outside the cold model-loader
+                # context, so restore that context while recreating parameters.
+                with set_current_vllm_config(model_runner.vllm_config):
+                    n = _recreate_dense_fp8_linear_params(model)
                 if n:
                     sys.stderr.write(
                         f"VERL_MLITE_DENSE_RECREATE recreated {n} dense FP8 linear "
@@ -693,6 +701,7 @@ def _patch_verl_dsv4_prepare_recreates_dense() -> bool:
         except Exception as exc:
             sys.stderr.write(f"VERL_MLITE_DENSE_RECREATE error: {exc!r}\n")
             sys.stderr.flush()
+            raise
         return state
 
     prepare_quanted_weights_for_loading._verl_mlite_dense_recreate = True
