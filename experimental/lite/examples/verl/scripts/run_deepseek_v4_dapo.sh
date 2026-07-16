@@ -7,7 +7,7 @@
 #   - token-mean loss aggregation,
 #   - overlong reward shaping (soft length penalty).
 # Resync: mlite exports a pre-quantized block-fp8 checkpoint (resync_format=
-# vllm_checkpoint, expert_dtype=fp8) that vLLM loads directly via hf_overrides.
+# block_fp8, expert_dtype=fp8) that vLLM loads directly via hf_overrides.
 # Point MODEL_PATH / TRAIN_FILES / VAL_FILES at the DS4 checkpoint and a
 # dapo-math-style parquet; every value below is overridable from the environment.
 set -euo pipefail
@@ -68,7 +68,7 @@ export USE_KL_LOSS="${USE_KL_LOSS:-False}"
 export USE_KL_IN_REWARD="${USE_KL_IN_REWARD:-False}"
 
 # Resync: mlite exports a pre-quantized block-fp8 checkpoint (resync_format=
-# vllm_checkpoint, expert_dtype=fp8) that vLLM loads directly via hf_overrides.
+# block_fp8, expert_dtype=fp8) that vLLM loads directly via hf_overrides.
 # verl's receiver-side quant_weights early-returns for DeepSeek-V4 (it skips
 # quantization for DS4 and expects pre-quantized fp8), so VERL_VLLM_FP8_QUANT_
 # ENABLED is inert on this path for DS4 -- inherit the sbatch's value instead of
@@ -106,7 +106,7 @@ exec bash "${GRPO_RUNNER}" \
   "+data.chat_template='${DS4_CHAT_TEMPLATE}'" \
   "actor_rollout_ref.model.custom_chat_template='${DS4_CHAT_TEMPLATE}'" \
   "+actor_rollout_ref.actor.engine.cross_entropy_fusion=True" \
-  "actor_rollout_ref.actor.engine.resync_format=vllm_checkpoint" \
+  "actor_rollout_ref.actor.engine.resync_format=block_fp8" \
   "+actor_rollout_ref.actor.engine.resync_config.expert_dtype=fp8" \
   "+actor_rollout_ref.actor.engine.impl_cfg.recompute=full" \
   "+actor_rollout_ref.actor.engine.impl_cfg.mtp_enable=True" \

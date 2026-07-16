@@ -574,23 +574,23 @@ def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelSta
 def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
     """Export DS4 weights as HF or serialized vLLM-checkpoint pairs.
 
-    The default remains the ordinary HF/BF16 stream. ``vllm_checkpoint`` is a
+    The default remains the ordinary HF/BF16 stream. ``block_fp8`` is a
     model-owned adapter over that gathered stream; the runtime and veRL engine
     do not classify DS4 tensors.
     """
     target = kwargs.pop("target", "hf")
     resync_config = kwargs.pop("resync_config", None)
-    if target not in {"hf", "bf16", "vllm_checkpoint"}:
+    if target not in {"hf", "bf16", "block_fp8"}:
         raise ValueError(f"Unsupported DeepSeek-V4 export target: {target!r}")
     weights = _export_unquantized_weights(model, config, ps, **kwargs)
-    if target == "vllm_checkpoint":
+    if target == "block_fp8":
         from megatron.lite.model.deepseek_v4.lite.resync import export_resync_weights
 
         yield from export_resync_weights(weights, config, resync_config=resync_config)
     else:
         if resync_config:
             raise ValueError(
-                "DeepSeek-V4 resync_config requires target='vllm_checkpoint'"
+                "DeepSeek-V4 resync_config requires target='block_fp8'"
             )
         yield from weights
 

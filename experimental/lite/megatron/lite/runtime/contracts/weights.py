@@ -8,7 +8,7 @@ from enum import Enum
 
 class ResyncFormat(str, Enum):
     BF16 = "bf16"
-    VLLM_CHECKPOINT = "vllm_checkpoint"
+    BLOCK_FP8 = "block_fp8"
 
     @classmethod
     def parse(cls, value: "str | ResyncFormat") -> "ResyncFormat":
