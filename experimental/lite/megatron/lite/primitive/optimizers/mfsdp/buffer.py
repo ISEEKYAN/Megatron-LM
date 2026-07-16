@@ -1143,16 +1143,32 @@ class CommunicationPipelines:
             bucket.release_full_parameters()
             bucket.discard_full_parameter_views()
 
+    def _retain_through_backward(self, bucket: "ParamBucket") -> bool:
+        # A ``retain_full_storage_through_backward`` bucket keeps its gathered
+        # full-parameter buffer live past the forward so the matching backward
+        # can reuse it without re-gathering; the release is deferred to
+        # ``_ReleaseBackward`` (see wrapper.py). That deferral is only valid when
+        # a backward will actually run -- i.e. autograd is recording a graph.
+        # A grad-disabled forward (``torch.no_grad`` / ``inference_mode``, e.g.
+        # the DAPO rollout-correction logprob recompute) has no backward, so the
+        # deferred release would never fire and the bucket's full-parameter lease
+        # would stay pinned (its allocator slot ``busy``) until the next
+        # ``begin_forward``. Any intervening ``release_cached`` (a colocated vLLM
+        # wake / full-parameter export / ``move_model_state`` offload) would then
+        # trip the busy-buffer guard with a spurious "active buffers" raise. When
+        # grad is disabled, release these buckets eagerly like every other.
+        return bucket.retain_full_storage_through_backward and torch.is_grad_enabled()
+
     def release_forward_ids(self, bucket_ids: Iterable[int]) -> None:
         for bucket_id in bucket_ids:
             bucket = self.buckets[bucket_id]
-            if not bucket.retain_full_storage_through_backward:
+            if not self._retain_through_backward(bucket):
                 bucket.release_full_parameters()
                 bucket.discard_full_parameter_views()
 
     def end_forward(self) -> None:
         for bucket in self.buckets:
-            if not bucket.retain_full_storage_through_backward:
+            if not self._retain_through_backward(bucket):
                 bucket.release_full_parameters()
                 bucket.discard_full_parameter_views()
 
