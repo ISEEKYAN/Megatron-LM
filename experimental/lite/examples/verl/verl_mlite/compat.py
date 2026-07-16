@@ -585,6 +585,121 @@ def _restore_dsv4_attn_sink_padding(model: Any) -> int:
     return restored
 
 
+# ============================================================================
+# DS4 RL weight-resync: dense FP8 linear finalize (SHORT-TERM bridge)
+# ============================================================================
+# WHY THIS EXISTS / THE CLEAN DESIGN WE ARE NOT YET DOING:
+#   A resync should be "cold-load replayed with fresh weights": the only place
+#   that knows kernel-runtime layout (deepgemm ue8m0 requant, wo_a is_bmm 2D->3D,
+#   indexer wk fusion) is vLLM's native load_weights + process_weights_after_loading;
+#   resync should reuse it so rollout weights == cold-load weights bit-for-bit.
+#
+#   Clean 3-layer contract (target end state, NOT implemented here):
+#     1. producer (mlite): emit a neutral self-describing typed weight stream
+#        WeightSpec{dtype: bf16|fp8_e4m3|fp4_e2m1, quant, scale, scale_dtype};
+#        pick a *format* (bf16/block_fp8/block_fp4), never name a consumer.
+#     2. transport: format-agnostic byte-aligned buckets, carries (name,tensor,spec).
+#     3. consumer adapter: optional transcode (bf16->fp8 / fp4->fp8 = "verl does
+#        arbitrary quant") -> ONE uniform reset_weights_for_reload() over every quant
+#        module (MoE/dense/indexer) -> native load -> native process-all (once).
+#
+#   The current path instead rides verl #6473's is_fp8_model refit
+#   (load_quanted_weights -> _restore_moe_params / _prepare_linear_params /
+#   process_deepseek_v4_weights_after_loading), which finalizes only MoE and leaves
+#   dense attn/indexer FP8 linears in checkpoint layout != cold-load (verified:
+#   weight+scale sha differ, indexer.wq_b drift ~4.5%; sparse indexer amplifies into
+#   decode-only rollout divergence). #6473 is itself hacky and we do not want to
+#   extend it.
+#
+# TODO(upstream, remove this bridge once landed):
+#   * verl: file an issue proposing the neutral typed-stream contract + a single
+#     type-agnostic reset (not the per-quant-type _restore_moe/_prepare_linear refit).
+#   * vLLM: file a PR adding reset_weights_for_reload() (or make
+#     process_weights_after_loading idempotent/reversible) so RL refit can cleanly
+#     reuse the cold-load path.
+#
+# SHORT-TERM (below): recreate dense block-FP8 linear params to checkpoint layout
+# before the resync load (create_weights, uniform, incl wo_a is_bmm) so the single
+# post-load process matches cold-load. This is a bridge, scoped to DS4, additive.
+# ============================================================================
+def _recreate_dense_fp8_linear_params(model) -> int:
+    """Reset every dense block-FP8 LinearBase to fresh checkpoint-layout params so
+    the single post-load process_weights_after_loading matches cold load bit-for-bit
+    (see module block above). Returns the count recreated."""
+    import torch
+    try:
+        from vllm.model_executor.layers.linear import LinearBase
+        from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+    except Exception:
+        return 0
+    recreated = 0
+    for _name, layer in model.named_modules():
+        if not (isinstance(layer, LinearBase)
+                and isinstance(getattr(layer, "quant_method", None), Fp8LinearMethod)):
+            continue
+        qm = layer.quant_method
+        if not getattr(qm, "block_quant", False):
+            continue
+        old_w = getattr(layer, "weight", None)
+        wl = getattr(old_w, "weight_loader", None) if old_w is not None else None
+        if wl is None:
+            continue
+        try:
+            qm.create_weights(
+                layer,
+                input_size_per_partition=int(layer.input_size_per_partition),
+                output_partition_sizes=list(layer.output_partition_sizes),
+                input_size=int(layer.input_size),
+                output_size=int(layer.output_size),
+                params_dtype=getattr(layer, "orig_dtype", torch.bfloat16),
+                weight_loader=wl,
+            )
+            recreated += 1
+        except Exception as _re:
+            sys.stderr.write(f"VERL_MLITE_DENSE_RECREATE_SKIP {_name}: {_re!r}\n")
+            sys.stderr.flush()
+    return recreated
+
+
+def _patch_verl_dsv4_prepare_recreates_dense() -> bool:
+    """SHORT-TERM bridge: wrap prepare_quanted_weights_for_loading so DS4 dense
+    block-FP8 linears are recreated to checkpoint layout before every resync load,
+    pairing with the post-load dense process in _patch_verl_dsv4_fp8_process_weights.
+    See the module block above for the clean design + upstream TODOs."""
+    if not _vllm_importable():
+        return False
+    try:
+        mod = importlib.import_module("verl.utils.vllm.vllm_fp8_utils")
+    except Exception:
+        return False
+    original = getattr(mod, "prepare_quanted_weights_for_loading", None)
+    if original is None or getattr(original, "_verl_mlite_dense_recreate", False):
+        return True
+
+    @wraps(original)
+    def prepare_quanted_weights_for_loading(model_runner, *args, **kwargs):
+        state = original(model_runner, *args, **kwargs)
+        try:
+            from verl.utils.vllm.vllm_dsv4_fp8_utils import is_deepseek_v4_model
+
+            model = model_runner.model
+            if is_deepseek_v4_model(model):
+                n = _recreate_dense_fp8_linear_params(model)
+                if n:
+                    sys.stderr.write(
+                        f"VERL_MLITE_DENSE_RECREATE recreated {n} dense FP8 linear "
+                        "param set(s) to checkpoint layout before resync load\n")
+                    sys.stderr.flush()
+        except Exception as exc:
+            sys.stderr.write(f"VERL_MLITE_DENSE_RECREATE error: {exc!r}\n")
+            sys.stderr.flush()
+        return state
+
+    prepare_quanted_weights_for_loading._verl_mlite_dense_recreate = True
+    mod.prepare_quanted_weights_for_loading = prepare_quanted_weights_for_loading
+    return True
+
+
 def _patch_verl_dsv4_fp8_process_weights() -> bool:
     """Run ``process_weights_after_loading`` for FP8 MoE experts after RL resync.
 
@@ -1091,6 +1206,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08.bucketed_weight_sender", result)
     result = _patch_verl_dsv4_mxfp4_check()
     _trace_runtime_patch("08b.verl_dsv4_mxfp4_check", result)
+    result = _patch_verl_dsv4_prepare_recreates_dense()
+    _trace_runtime_patch("08c.verl_dsv4_prepare_recreates_dense", result)
     result = _patch_verl_dsv4_fp8_process_weights()
     _trace_runtime_patch("08c.verl_dsv4_fp8_process_weights", result)
     result = _patch_vllm_server_profile()
