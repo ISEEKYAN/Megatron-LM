@@ -54,6 +54,8 @@ TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
        echo '=== CP2 ===' && \
        torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29531 $SCRIPT && \
        echo '=== CP4 ===' && \
-       torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29532 $SCRIPT"
+       torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29532 $SCRIPT && \
+       echo '=== CP8 128k (variable-length packed, tot=131072) ===' && \
+       GDN_PARITY_128K=1 torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29533 $SCRIPT"
 
 echo "SBATCH_BODY_DONE rc=$?"

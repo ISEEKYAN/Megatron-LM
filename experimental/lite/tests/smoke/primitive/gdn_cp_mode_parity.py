@@ -8,6 +8,10 @@ Matrix (baseline = CP off / full sequence, cp_size=1):
 ``headwise``/``replicated`` are bitwise-exact vs CP-off; ``chunkwise`` runs the FLA ring
 (cross-rank chunk-state reassociation) so it is expected at the bf16 floor, not bitwise.
 The packed THD arm exercises the packing-aware reshuffle the old ``sharded`` copy broke.
+With ``GDN_PARITY_128K=1`` the script instead runs only the heavy variable-length arm
+(``run_packed_128k``): several unequal-length sequences packed to the real RL single-
+microbatch token budget of 131072, chunkwise CP (target CP8) vs the cp1 dense reference
+on fwd + in_grad + w_grad, plus a non-divisible-length rejection probe.
 
 Design
 ------
@@ -294,6 +298,206 @@ def run_packed_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world
     dist.barrier()
 
 
+# ---- 128k real-RL packed chunkwise parity (variable length + variable batch) ----
+# Each microbatch packs many *unequal* sequences to a total budget of 131072 tokens
+# (the real RL single-microbatch token budget). Lengths are all multiples of 64 so
+# they satisfy chunkwise's per-seq %(2*cp)==0 padding requirement for cp in {2,4,8}
+# and FLA's 64-wide chunking; the distributions deliberately include a long sequence
+# spanning many CP-rank contiguous chunk boundaries plus a tail of short sequences.
+TOTAL_128K = 131072
+
+
+def _make_packed_lens_128k(variant):
+    """Return a variable-length list (multiples of 64) summing exactly to TOTAL_128K.
+
+    ``variant`` picks a different "batch" shape (different sequence count/sizes) so we
+    exercise more than one real packing without changing the token budget.
+    """
+    if variant == 0:
+        # a few long boundary-crossers + a spread of mid/short lengths
+        palette = [16384, 12288, 10240, 8192, 6144, 4096, 3072, 2048, 1536, 1024, 768, 512]
+    else:
+        # many more, shorter sequences -> heavier packing / more boundary crossings
+        palette = [8192, 6144, 5120, 4096, 3072, 2560, 2048, 1536, 1024, 768, 512, 256]
+    raw = []
+    acc = 0
+    i = 0
+    while True:
+        item = palette[i % len(palette)]
+        if acc + item > TOTAL_128K:
+            break
+        raw.append(item)
+        acc += item
+        i += 1
+    rem = TOTAL_128K - acc
+    if rem > 0:
+        raw.append(rem)  # bounded below the overflowing palette entry, still a x64
+    assert sum(raw) == TOTAL_128K
+    assert all(n > 0 and n % 64 == 0 for n in raw)
+    return raw
+
+
+def _assert_reshuffle_rejects_nondivisible(cp_size, cp_rank, cp_group, device):
+    """Probe: a seq length not divisible by 2*cp must be rejected (padded-cu_seqlens
+    invariant), not silently mis-sharded. Runs once on the harness before parity."""
+    from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
+
+    if cp_size < 2:
+        return
+    bad = 2 * cp_size + 32  # 32 is not a multiple of 2*cp for cp>=2 -> must raise
+    cu = torch.tensor([0, bad], dtype=torch.int32, device=device)
+    x = torch.randn(bad, BATCH, HIDDEN, device=device, dtype=DTYPE)
+    local_x = x  # rank-local content is irrelevant; we only want the invariant to fire
+    mod = _make_gdn(cp_size, cp_rank, cp_group, "chunkwise").to(device=device, dtype=DTYPE)
+    _randomize_and_broadcast(mod)
+    psp = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+        max_seqlen_q=bad, max_seqlen_kv=bad,
+        cu_seqlens_q_padded=cu, cu_seqlens_kv_padded=cu,
+        cp_rank=cp_rank, local_cp_size=cp_size, cp_group=cp_group,
+    )
+    raised = False
+    try:
+        mod(local_x, packed_seq_params=psp)
+    except (AssertionError, ValueError, RuntimeError):
+        raised = True
+    del mod
+    torch.cuda.empty_cache()
+    if cp_rank == 0:
+        print(
+            f"GDN_CP_PACKED128K_NONDIV mode=chunkwise cp={cp_size} bad_len={bad} "
+            f"rejected={raised}",
+            flush=True,
+        )
+    dist.barrier()
+
+
+def run_packed_128k(cp_size, cp_rank, cp_group, cp1_group, device, rank, world):
+    """Variable-length 131072-token packed chunkwise parity vs CP-off dense reference.
+
+    fwd + in_grad + w_grad. Criterion: at the real RL token budget with variable-length
+    packing, packed chunkwise stays at the bf16 ring floor vs the cp1 reference (NOT the
+    old ~O(1) / 220x-ppo_kl corruption). Runs for whatever cp_size == world the launch
+    provides (target CP8).
+    """
+    from megatron.lite.primitive.parallel.thd import split_packed_to_cp_local
+    from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
+
+    _assert_reshuffle_rejects_nondivisible(cp_size, cp_rank, cp_group, device)
+
+    for variant in (0, 1):
+        lens = _make_packed_lens_128k(variant)
+        lens_t = torch.tensor(lens, dtype=torch.int32, device=device)
+        cu = torch.zeros(len(lens) + 1, dtype=torch.int32, device=device)
+        torch.cumsum(lens_t, dim=0, out=cu[1:])
+        total = int(cu[-1].item())
+        assert total == TOTAL_128K
+        max_seqlen = int(lens_t.max().item())
+
+        def _psp(cp_sz, cp_rk, grp):
+            extra = {}
+            if cp_sz > 1:
+                extra["local_cp_size"] = cp_sz
+                extra["cp_group"] = grp
+            return PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu,
+                cu_seqlens_kv=cu,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_kv=max_seqlen,
+                cu_seqlens_q_padded=cu,
+                cu_seqlens_kv_padded=cu,
+                cp_rank=cp_rk,
+                **extra,
+            )
+
+        torch.manual_seed(SEED + 11 + variant)
+        full_x = torch.randn(total, BATCH, HIDDEN, device=device, dtype=DTYPE)
+        dist.broadcast(full_x, src=0)
+        torch.manual_seed(SEED + 21 + variant)
+        full_cot = torch.randn(total, BATCH, HIDDEN, device=device, dtype=DTYPE)
+        dist.broadcast(full_cot, src=0)
+
+        cp_mod = _make_gdn(cp_size, cp_rank, cp_group, "chunkwise").to(device=device, dtype=DTYPE)
+        _randomize_and_broadcast(cp_mod)
+
+        # ---- reference (cp1, full sequence) on rank 0: fwd + in_grad + w_grad ----
+        ref_out_full = None
+        ref_in_grad_full = None
+        ref_wgrads = None
+        if rank == 0:
+            ref_mod = _make_gdn(1, 0, cp1_group, "chunkwise").to(device=device, dtype=DTYPE)
+            ref_mod.load_state_dict(cp_mod.state_dict())
+            ref_x = full_x.detach().requires_grad_(True)
+            with torch.enable_grad():
+                ref_out = ref_mod(ref_x, packed_seq_params=_psp(1, 0, cp1_group))
+            ref_out.backward(full_cot)
+            ref_out_full = ref_out.detach().clone()
+            ref_in_grad_full = ref_x.grad.detach().clone()
+            ref_wgrads = {n: (p.grad.detach().clone() if p.grad is not None else None)
+                          for n, p in ref_mod.named_parameters()}
+            del ref_mod, ref_out, ref_x
+            torch.cuda.empty_cache()
+        if ref_out_full is None:
+            ref_out_full = torch.empty(total, BATCH, HIDDEN, device=device, dtype=DTYPE)
+        if ref_in_grad_full is None:
+            ref_in_grad_full = torch.empty(total, BATCH, HIDDEN, device=device, dtype=DTYPE)
+        dist.broadcast(ref_out_full, src=0)
+        dist.broadcast(ref_in_grad_full, src=0)
+
+        # ---- CP chunkwise: local zigzag shard + global cu_seqlens ----
+        local_x = split_packed_to_cp_local(
+            full_x, cu_seqlens_padded=cu, cp_size=cp_size, cp_rank=cp_rank, dim=0
+        ).contiguous().detach().requires_grad_(True)
+        cp_out = cp_mod(local_x, packed_seq_params=_psp(cp_size, cp_rank, cp_group))
+
+        expected_out = split_packed_to_cp_local(
+            ref_out_full, cu_seqlens_padded=cu, cp_size=cp_size, cp_rank=cp_rank, dim=0
+        )
+        f_abs, f_rel, f_scale = _diff(cp_out.detach(), expected_out)
+
+        local_cot = split_packed_to_cp_local(
+            full_cot, cu_seqlens_padded=cu, cp_size=cp_size, cp_rank=cp_rank, dim=0
+        ).contiguous()
+        cp_out.backward(local_cot)
+        cp_in_grad = local_x.grad.detach().clone()
+        expected_in_grad = split_packed_to_cp_local(
+            ref_in_grad_full, cu_seqlens_padded=cu, cp_size=cp_size, cp_rank=cp_rank, dim=0
+        )
+        g_abs, g_rel, g_scale = _diff(cp_in_grad, expected_in_grad)
+
+        # weight grads: CP-all-reduce (sum) then compare on rank 0
+        for n, p in cp_mod.named_parameters():
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=cp_group)
+        w_abs = w_rel = 0.0
+        worst_w = None
+        if rank == 0:
+            for n, p in cp_mod.named_parameters():
+                rg = ref_wgrads.get(n)
+                if rg is None:
+                    rg = torch.zeros_like(p.grad)
+                a, r, _ = _diff(p.grad, rg)
+                if a > w_abs:
+                    w_abs, worst_w = a, n
+                w_rel = max(w_rel, r)
+
+        if cp_rank == 0:
+            print(
+                f"GDN_CP_PACKED128K_PARITY mode=chunkwise cp={cp_size} nseq={len(lens)} "
+                f"variant={variant} tot={total} "
+                f"fwd[max_abs={f_abs:.3e} max_rel={f_rel:.3e} scale={f_scale:.3e}] "
+                f"in_grad[max_abs={g_abs:.3e} max_rel={g_rel:.3e} scale={g_scale:.3e}] "
+                f"w_grad[max_abs={w_abs:.3e} max_rel={w_rel:.3e} worst={worst_w}] "
+                f"lens={lens}",
+                flush=True,
+            )
+        del cp_mod, local_x, cp_out
+        torch.cuda.empty_cache()
+        dist.barrier()
+
+
 def main():
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -312,8 +516,12 @@ def main():
 
         print(f"GDN_CP_ENV world={world} HAS_FLA={g._HAS_FLA}", flush=True)
 
-    run_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world)
-    run_packed_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world)
+    if os.environ.get("GDN_PARITY_128K") == "1":
+        # heavy CP8 variable-length 131072-token packed chunkwise parity only
+        run_packed_128k(cp_size, cp_rank, cp_group, cp1_group, device, rank, world)
+    else:
+        run_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world)
+        run_packed_matrix(cp_size, cp_rank, cp_group, cp1_group, device, rank, world)
 
     dist.barrier()
     dist.destroy_process_group()
