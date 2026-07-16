@@ -67,8 +67,10 @@ class ImplConfig:
     mtp_use_repeated_layer: bool | None = None
     mount_vision_model: bool = False
     # GatedDeltaNet context-parallel mode: "headwise" (default, head-parallel a2a;
-    # bitwise-exact vs CP-off and memory-sharded) or "replicated" (all-gather, exact
-    # but full sequence replicated on every rank).
+    # bitwise-exact vs CP-off and memory-sharded), "replicated" (all-gather, exact but
+    # full sequence replicated on every rank), or "chunkwise" (FLA ring; seq-shard +
+    # all heads, best memory; bf16-floor vs CP-off, faithful packing-aware mirror of
+    # upstream Megatron linear_cp_mode='chunkwise').
     gdn_cp_mode: str = "headwise"
 
 
