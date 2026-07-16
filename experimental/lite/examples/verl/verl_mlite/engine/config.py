@@ -27,6 +27,14 @@ class MegatronLiteEngineConfig(EngineConfig):
     cp: int = 1
 
     attention_backend_override: str | None = "flash"
+    # R3 router replay (arXiv:2606.02437 §3): attach RouterReplay to every MoE router
+    # at build so the engine can record rollout routing and replay it in training.
+    router_replay: bool = False
+    # Where the replayed routing comes from: "self_record" = trainer-side forward proxy
+    # (record_routed_experts); "rollout" = the serving engine's real routing riding the
+    # batch as `routed_experts` (verl enable_return_routed_experts), which closes the
+    # actual training-inference mismatch.
+    router_replay_source: str = "self_record"
     router_aux_loss_coef: float | None = None
     cross_entropy_fusion: bool | None = None
     export_dtype: str | None = "bfloat16"
@@ -39,5 +47,12 @@ class MegatronLiteEngineConfig(EngineConfig):
             raise ValueError(
                 f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}"
             )
+        if self.router_replay_source not in ("self_record", "rollout"):
+            raise ValueError(
+                "router_replay_source must be 'self_record' or 'rollout', "
+                f"got {self.router_replay_source!r}"
+            )
+        if self.router_replay_source == "rollout" and not self.router_replay:
+            raise ValueError("router_replay_source='rollout' requires router_replay=True.")
         if self.custom_backend_module:
             importlib.import_module(self.custom_backend_module)
