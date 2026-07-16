@@ -418,8 +418,10 @@ class MegatronLiteRuntime(RuntimeBase):
         *,
         num_microbatches: int = 1,
         forward_only: bool = False,
+        router_replay: Any = None,
     ) -> ForwardResult:
         from megatron.lite.primitive.train_step import run_microbatch_loop
+        from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
 
         forward_step = handle._extras["forward_step"]
         if num_microbatches < 1:
@@ -431,6 +433,11 @@ class MegatronLiteRuntime(RuntimeBase):
             data_iter = iter(data)
         else:
             data_iter = iter([data])
+
+        replay_driver = RouterReplayDriver.maybe_create(handle, router_replay)
+        if replay_driver is not None:
+            replay_driver.begin()
+            forward_step = replay_driver.wrap(forward_step)
 
         ps = handle._parallel_state
         if ps.pp_size > 1:
@@ -452,17 +459,21 @@ class MegatronLiteRuntime(RuntimeBase):
             model_chunks = handle._extras.get("model_chunks", [handle._model])
             pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
             pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
-            outputs = forward_backward_pipelining(
-                pipeline_forward_step,
-                pipeline_chunks,
-                data_iter,
-                SimpleNamespace(num_microbatches=num_microbatches),
-                ps,
-                tensor_shape=tensor_shape,
-                pre_forward_hook=handle._extras.get("pre_forward_hook"),
-                loss_fn=pipeline_loss_fn,
-                forward_only=forward_only,
-            )
+            try:
+                outputs = forward_backward_pipelining(
+                    pipeline_forward_step,
+                    pipeline_chunks,
+                    data_iter,
+                    SimpleNamespace(num_microbatches=num_microbatches),
+                    ps,
+                    tensor_shape=tensor_shape,
+                    pre_forward_hook=handle._extras.get("pre_forward_hook"),
+                    loss_fn=pipeline_loss_fn,
+                    forward_only=forward_only,
+                )
+            finally:
+                if replay_driver is not None:
+                    replay_driver.end()
             out = _last_loss_output(outputs)
             loss_obj = out.get("loss") if out else None
             if isinstance(loss_obj, torch.Tensor):
@@ -478,17 +489,21 @@ class MegatronLiteRuntime(RuntimeBase):
                 dist.broadcast(loss_payload, src=ps.pp_global_ranks[-1], group=ps.pp_group)
             out = {"loss": loss_payload[1]} if bool(loss_payload[0].item()) else {}
         else:
-            out = run_microbatch_loop(
-                handle._model,
-                data_iter,
-                num_microbatches,
-                forward_step,
-                optimizer=handle._optimizer if not forward_only else None,
-                dist_opt=not forward_only,
-                pre_forward_hook=handle._extras.get("pre_forward_hook"),
-                loss_fn=loss_fn,
-                forward_only=forward_only,
-            )
+            try:
+                out = run_microbatch_loop(
+                    handle._model,
+                    data_iter,
+                    num_microbatches,
+                    forward_step,
+                    optimizer=handle._optimizer if not forward_only else None,
+                    dist_opt=not forward_only,
+                    pre_forward_hook=handle._extras.get("pre_forward_hook"),
+                    loss_fn=loss_fn,
+                    forward_only=forward_only,
+                )
+            finally:
+                if replay_driver is not None:
+                    replay_driver.end()
 
         if not forward_only:
             finalize_grads = handle._extras.get("finalize_grads")

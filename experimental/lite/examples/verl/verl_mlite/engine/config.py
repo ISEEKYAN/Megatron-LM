@@ -33,6 +33,7 @@ class MegatronLiteEngineConfig(EngineConfig):
     export_dtype: str | None = "bfloat16"
     resync_format: str | None = None
     resync_config: dict[str, Any] = field(default_factory=dict)
+    router_replay_mode: str = "disabled"
     load_hf_weights: bool = True
     impl_cfg: dict[str, Any] = field(default_factory=dict)
 
@@ -57,3 +58,8 @@ class MegatronLiteEngineConfig(EngineConfig):
         object.__setattr__(self, "resync_config", dict(self.resync_config))
         if self.resync_config and self.resync_format is None:
             raise ValueError("resync_config requires resync_format")
+        if self.router_replay_mode not in ("disabled", "R3"):
+            raise ValueError(
+                "MegatronLiteEngine supports router_replay_mode='disabled' or 'R3', "
+                f"got {self.router_replay_mode!r}"
+            )

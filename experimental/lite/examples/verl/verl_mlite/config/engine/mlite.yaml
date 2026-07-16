@@ -10,6 +10,7 @@ dtype: bfloat16
 export_dtype: bfloat16
 resync_format: null
 resync_config: {}
+router_replay_mode: disabled
 load_hf_weights: true
 
 model_name: auto

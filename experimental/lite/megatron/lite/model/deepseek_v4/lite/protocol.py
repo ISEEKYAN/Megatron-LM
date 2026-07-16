@@ -15,7 +15,12 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
     save_hf_weights as _save_hf_weights_impl,
 )
-from megatron.lite.model.protocol_utils import add_loss_context_kwargs, nested_from_packed
+from megatron.lite.model.protocol_utils import (
+    add_loss_context_kwargs,
+    nested_from_packed,
+    pack_r3_replay_mask as _pack_r3_replay_mask,
+    pack_routed_experts as _pack_routed_experts,
+)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
@@ -257,6 +262,28 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
         cp_group=ps.cp_group if ps.cp_size > 1 else None,
     )
     return unpack_thd_to_nested(output, meta, contiguous=True)
+
+
+def pack_routed_experts(model: nn.Module, batch: PackedBatch, routed_experts):
+    """Pack R3 routes using DS4's contiguous CP token layout."""
+
+    return _pack_routed_experts(model, batch, routed_experts, contiguous=True)
+
+
+def pack_r3_replay_mask(model: nn.Module, batch: PackedBatch) -> torch.Tensor:
+    """Pack the causal R3 mask using DS4's contiguous CP token layout."""
+
+    return _pack_r3_replay_mask(model, batch, contiguous=True)
+
+
+def router_replay_roots(chunk: nn.Module) -> list[nn.Module]:
+    """Return main decoder layers only; rollout R3 has no MTP layer axis."""
+
+    model = getattr(chunk, "model", chunk)
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        return [chunk]
+    return list(layers.values())
 
 
 def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:

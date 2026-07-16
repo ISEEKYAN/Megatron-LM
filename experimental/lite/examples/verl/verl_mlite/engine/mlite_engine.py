@@ -692,12 +692,23 @@ class MegatronLiteEngine(BaseEngine):
         if loss_function is not None or forward_only:
             runtime_loss_fn = self._make_runtime_loss_fn(loss_function, num_micro_batches, reduced_outputs)
 
+        replay_specs = [
+            runtime_batch.routed_experts is not None
+            for runtime_batch, _loss_context in runtime_batches
+        ]
+        replay_enabled = self.engine_config.router_replay_mode == "R3"
+        if replay_enabled and not all(replay_specs):
+            raise ValueError(
+                "router_replay_mode='R3' requires routed_experts on every "
+                "actor micro-batch in a step."
+            )
         result = self.runtime.forward_backward(
             self.handle,
             iter(runtime_batches),
             loss_fn=runtime_loss_fn,
             num_microbatches=num_micro_batches,
             forward_only=forward_only,
+            router_replay={"action": "replay"} if replay_enabled else None,
         )
         if reduced_outputs is not None:
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
@@ -731,11 +742,18 @@ class MegatronLiteEngine(BaseEngine):
                 "MegatronLiteEngine supports only nested no-padding THD batches."
             )
         loss_mask = self._loss_mask_for_packing(micro_batch, input_ids)
+        routed_experts = micro_batch.get("routed_experts", None)
+        if routed_experts is not None and not getattr(routed_experts, "is_nested", False):
+            raise ValueError(
+                "R3 routed_experts must use VERL's jagged no-padding layout; "
+                f"got shape {tuple(routed_experts.shape)}."
+            )
         return PackedBatch(
             input_ids=input_ids.values().contiguous(),
             labels=input_ids.values().contiguous(),
             loss_mask=None if loss_mask is None else loss_mask.values().contiguous().float(),
             seq_lens=input_ids.offsets().diff().to(dtype=torch.int64),
+            routed_experts=routed_experts,
         )
 
     def _make_runtime_loss_context(
