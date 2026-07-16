@@ -244,6 +244,15 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
         assert self._runtime_ctx is not None
         self._runtime_ctx.__exit__(exc_type, exc_val, exc_tb)
         super().__exit__(exc_type, exc_val, exc_tb)
+        # After a clean training pass (update_actor), hand the post-step residual
+        # (M-FSDP all-gather scratch + parked optimizer state) back to the driver
+        # here, at the engine's own offload exit -- verl's fit loop runs this train
+        # context exit *before* it calls update_weights (rollout.resume(["weights"])),
+        # so the colocated vLLM weight wake no longer collides with the trainer's
+        # leftovers. Keeps the sharded weights resident as the export gather source.
+        # See TASK-1.13.8.5 (internalized from a former verl-called hook).
+        if self.mode == "train" and exc_type is None:
+            self.engine._release_train_scratch_before_resync()
         return False
 
 
@@ -446,7 +455,7 @@ class MegatronLiteEngine(BaseEngine):
         if model or not (optimizer or grad):
             super().to(device=device, model=model, optimizer=optimizer, grad=grad)
         # A training-side reload (gradient buffers requested) also restores any
-        # optimizer state parked on CPU by release_train_scratch_before_resync,
+        # optimizer state parked on CPU by _release_train_scratch_before_resync,
         # so the Adam moments return before the next optimizer step even when
         # optimizer_offload is off. The export reload uses grad=False and leaves
         # them parked through generation; load_state_to_device is a no-op when
@@ -454,7 +463,7 @@ class MegatronLiteEngine(BaseEngine):
         reload_optimizer = optimizer or (device == "cuda" and grad)
         self.runtime.to(self.handle, device, model=model, optimizer=reload_optimizer, grad=grad)
 
-    def release_train_scratch_before_resync(self) -> None:
+    def _release_train_scratch_before_resync(self) -> None:
         """Free the post-train-step residual before the colocated vLLM weight wake.
 
         verl's ``update_weights`` wakes the sleeping vLLM weight pool
@@ -466,6 +475,11 @@ class MegatronLiteEngine(BaseEngine):
         runs too late to help this wake, so park the optimizer state on CPU and
         hand the M-FSDP scratch back to the driver here, keeping the sharded
         weights resident as the export gather source.
+
+        Called from ``_MegatronLiteModeCtx.__exit__`` on the training-mode context
+        exit -- the engine's own offload point at the end of ``update_actor`` --
+        so no verl-side hook is needed: the fit loop always runs this exit before
+        the subsequent ``update_weights`` wakes the rollout weight pool.
 
         The optimizer park is reversible: gated on ``param_offload`` so the next
         training-side reload (``to("cuda", ..., grad=True)``) is the guaranteed
