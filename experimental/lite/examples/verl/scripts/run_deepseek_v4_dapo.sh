@@ -94,6 +94,11 @@ PY
 
 DEFAULT_CHAT_TEMPLATE='{% for message in messages %}{% if message["content"] is string %}{{ message["content"] }}{% else %}{% for content in message["content"] %}{% if content["type"] == "text" %}{{ content["text"] }}{% endif %}{% endfor %}{% endif %}{% if not loop.last %}{{ "\n\n" }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ "\n" }}{% endif %}'
 DS4_CHAT_TEMPLATE="${DEEPSEEK_V4_FLASH_CHAT_TEMPLATE:-${DEFAULT_CHAT_TEMPLATE}}"
+# Colocated vLLM captures graphs while the model still contains dummy weights.
+# Real actor weights arrive later through IPC, so those graphs are numerically
+# stale. Eager is the correctness default until capture can be deferred until
+# after the first weight sync and cache wake-up.
+ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-True}"
 
 ALGORITHM=( "algorithm.adv_estimator=grpo" "algorithm.use_kl_in_reward=${USE_KL_IN_REWARD}" "algorithm.kl_ctrl.kl_coef=${KL_COEF:-0.0}" "algorithm.rollout_correction.bypass_mode=${ROLLOUT_CORRECTION_BYPASS:-False}" "algorithm.norm_adv_by_std_in_grpo=False" )
 DATA=( "data.train_files=${TRAIN_FILES}" "data.val_files=${VAL_FILES}" "data.train_batch_size=${TRAIN_BATCH_SIZE}" "data.prompt_key=prompt" "data.return_raw_chat=True" "data.max_prompt_length=${MAX_PROMPT_LENGTH}" "data.max_response_length=${MAX_RESPONSE_LENGTH}" "data.filter_overlong_prompts=True" "data.truncation=error" "data.custom_cls.path=${DATASET_MODULE}" "data.custom_cls.name=ChatTemplateRLHFDataset" "+data.chat_template='${DS4_CHAT_TEMPLATE}'" "data.dataloader_num_workers=${DATALOADER_NUM_WORKERS:-8}" )
@@ -106,6 +111,7 @@ ROLLOUT=( "actor_rollout_ref.rollout.name=${INFER_BACKEND}" "actor_rollout_ref.r
 TRAINER=( "critic.enable=False" "trainer.balance_batch=True" "trainer.logger=${LOGGER}" "trainer.project_name=${PROJECT_NAME}" "trainer.experiment_name=${RUN_NAME}" "trainer.n_gpus_per_node=${NGPUS_PER_NODE}" "trainer.nnodes=${NNODES}" "trainer.save_freq=${SAVE_FREQ}" "trainer.test_freq=${TEST_FREQ}" "trainer.total_epochs=${TOTAL_EPOCHS}" "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}" "trainer.resume_mode=${RESUME_MODE}" "trainer.resume_from_path=${RESUME_FROM_PATH}" "trainer.default_local_dir=${CKPT_DIR}" "trainer.val_before_train=False" "trainer.log_val_generations=${LOG_VAL_GENERATIONS}" )
 REWARD=( "+reward.reward_kwargs.overlong_buffer_cfg.enable=True" "+reward.reward_kwargs.overlong_buffer_cfg.len=${OVERLONG_BUFFER_LEN}" "+reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${OVERLONG_PENALTY_FACTOR}" "+reward.reward_kwargs.overlong_buffer_cfg.log=False" )
 ROLLOUT+=( "actor_rollout_ref.rollout.enable_rollout_routing_replay=${ENABLE_ROLLOUT_ROUTING_REPLAY}" )
+ROLLOUT+=( "actor_rollout_ref.rollout.enforce_eager=${ROLLOUT_ENFORCE_EAGER}" )
 
 COMMAND=( python3 -m verl.trainer.main_ppo "hydra.searchpath=[pkg://verl_mlite.config]" "${ALGORITHM[@]}" "${DATA[@]}" "${MODEL[@]}" "${ACTOR[@]}" "${ROLLOUT[@]}" "${TRAINER[@]}" "${REWARD[@]}" "$@" )
 printf '%q ' "${COMMAND[@]}" > "${CMD_FILE}"; printf '\n' >> "${CMD_FILE}"
