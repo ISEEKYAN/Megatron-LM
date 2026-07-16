@@ -566,6 +566,25 @@ def _patch_verl_dsv4_mxfp4_check() -> bool:
     return True
 
 
+def _restore_dsv4_attn_sink_padding(model: Any) -> int:
+    """Restore the ``-inf`` FlashMLA sink padding erased by dummy loading."""
+    restored = 0
+    for module in model.modules():
+        sink = getattr(module, "attn_sink", None)
+        real_heads = getattr(module, "n_local_heads", None)
+        padded_heads = getattr(module, "padded_heads", None)
+        if sink is None or not isinstance(real_heads, int) or not isinstance(padded_heads, int):
+            continue
+        if sink.ndim != 1 or sink.numel() != padded_heads:
+            continue
+        if not 0 <= real_heads <= padded_heads:
+            continue
+        if real_heads < padded_heads:
+            sink.data[real_heads:].fill_(-float("inf"))
+            restored += 1
+    return restored
+
+
 def _patch_verl_dsv4_fp8_process_weights() -> bool:
     """Run ``process_weights_after_loading`` for FP8 MoE experts after RL resync.
 
@@ -614,6 +633,13 @@ def _patch_verl_dsv4_fp8_process_weights() -> bool:
 
             if not is_deepseek_v4_model(model):
                 return result
+            restored_sinks = _restore_dsv4_attn_sink_padding(model)
+            if restored_sinks:
+                sys.stderr.write(
+                    "VERL_MLITE_ATTN_SINK_PADDING "
+                    f"restored -inf padding on {restored_sinks} DS4 attention module(s)\n"
+                )
+                sys.stderr.flush()
             from vllm.model_executor.layers.fused_moe.routed_experts import (
                 RoutedExperts,
             )
@@ -626,6 +652,50 @@ def _patch_verl_dsv4_fp8_process_weights() -> bool:
                 ):
                     mod.quant_method.process_weights_after_loading(mod)
                     processed += 1
+            # FIX(bitwise): cold-load runs Fp8LinearMethod.process_weights_after_loading
+            # (deepgemm ue8m0 requant) on EVERY dense fp8 linear; the DS4 resync chain
+            # only processed MoE, leaving attn/indexer dense Fp8Linear weights in
+            # checkpoint layout (verified: weight+scale sha differ, indexer.wq_b value
+            # drift up to 4.5% -> sparse-index selects wrong KV -> decode divergence).
+            # Re-run native process on dense fp8 linears so resync == cold bitwise.
+            from vllm.model_executor.layers.linear import LinearBase
+            from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+            import traceback as _tb
+            dense_processed = 0
+            dense_skipped = 0
+            _first_err = None
+            for _dn, mod in model.named_modules():
+                if isinstance(mod, LinearBase) and isinstance(
+                    getattr(mod, "quant_method", None), Fp8LinearMethod
+                ):
+                    try:
+                        mod.quant_method.process_weights_after_loading(mod)
+                        dense_processed += 1
+                    except Exception as _de:
+                        dense_skipped += 1
+                        if _first_err is None:
+                            _first_err = (_dn, repr(_de), _tb.format_exc())
+            if dense_skipped and _first_err is not None:
+                sys.stderr.write(
+                    f"VERL_MLITE_FP8_PROCESS_DENSE_SKIP {dense_skipped} module(s) skipped; "
+                    f"first={_first_err[0]} err={_first_err[1]}\n{_first_err[2]}\n"
+                )
+                sys.stderr.flush()
+            if dense_processed:
+                sys.stderr.write(
+                    "VERL_MLITE_FP8_PROCESS_DENSE "
+                    f"ran process_weights_after_loading on {dense_processed} "
+                    "DS4 dense Fp8LinearMethod module(s) after resync\n"
+                )
+                sys.stderr.flush()
+            import os as _os2
+            if _os2.environ.get("MLITE_DBG_BIAS")=="1":
+                for _mn, _mm in model.named_modules():
+                    _eb=getattr(_mm,"e_score_correction_bias",None)
+                    if _eb is not None:
+                        try: sys.stderr.write(f"MLITE_DBG_VLLM_BIAS {_mn}.e_score_correction_bias absmax={float(_eb.abs().max()):.4f} nz={float((_eb!=0).float().mean()):.3f}\n")
+                        except Exception as _e: sys.stderr.write(f"MLITE_DBG_VLLM_BIAS {_mn} err {_e}\n")
+                sys.stderr.flush()
             if processed:
                 sys.stderr.write(
                     "VERL_MLITE_FP8_PROCESS "

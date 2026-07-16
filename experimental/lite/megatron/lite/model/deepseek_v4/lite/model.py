@@ -61,20 +61,30 @@ from megatron.lite.primitive.parallel.mhc import (
     fold_mhc_hidden_for_pipeline,
     unfold_mhc_hidden_from_pipeline,
 )
+from megatron.lite.primitive.parallel.thd import _roll_packed_thd_left_local
 from megatron.lite.primitive.utils import build_fp8_recipe
 
 
 def _roll_mtp_left(
     tensor: torch.Tensor,
     *,
+    packed_seq_params=None,
     dims: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shift labels/ids one position left (next-token target for MTP depth d).
 
-    DS4 inputs are dense ``[B, S]`` (TP=1, MTP runs only at CP==1), so -- unlike
-    Kimi -- there is no packed-THD branch here; a plain ``torch.roll`` on the
-    sequence dim suffices.
+    THD-packed inputs concatenate multiple sequences, so a plain ``torch.roll``
+    leaks the next sequence's first token across the boundary. Route through the
+    per-sequence THD-aware roll (contiguous cu_seqlens at CP==1, where DS4 MTP
+    runs) when packed_seq_params is available; fall back to plain roll otherwise.
     """
+    cu_seqlens = None if packed_seq_params is None else getattr(packed_seq_params, "cu_seqlens_q", None)
+    if cu_seqlens is not None:
+        # DS4 uses a CONTIGUOUS THD/CP layout (not TE/Megatron zigzag), so roll
+        # per-sequence via cu_seqlens directly -- never the zigzag reconstruction
+        # in roll_packed_thd_left (which GLM/Kimi use for their zigzag layout).
+        dim = dims if dims >= 0 else tensor.dim() + dims
+        return _roll_packed_thd_left_local(tensor, cu_seqlens_padded=cu_seqlens, dims=dim)
     dim = dims if dims >= 0 else tensor.dim() + dims
     rolled = torch.roll(tensor, shifts=-1, dims=dim)
     rolled.select(dim, -1).zero_()
@@ -479,7 +489,8 @@ class DeepseekV4Model(nn.Module):
             and self.ps.cp_size == 1
         )
         mtp_hidden_states = self._apply_mtp(
-            mtp_source, input_ids=input_ids, position_ids=position_ids, run_mtp=run_mtp
+            mtp_source, input_ids=input_ids, position_ids=position_ids, run_mtp=run_mtp,
+            packed_seq_params=packed_seq_params,
         )
         if mtp_hidden_states is not None:
             output["mtp_hidden_states"] = mtp_hidden_states
@@ -493,6 +504,7 @@ class DeepseekV4Model(nn.Module):
                 loss_mask=loss_mask,
                 temperature=temperature_value,
                 use_fused_kernels=use_fused_kernels,
+                packed_seq_params=packed_seq_params,
             )
             if mtp_result is not None:
                 hidden_for_head, mtp_loss = mtp_result
@@ -538,6 +550,7 @@ class DeepseekV4Model(nn.Module):
         input_ids: torch.Tensor | None,
         position_ids: torch.Tensor | None,
         run_mtp: bool,
+        packed_seq_params=None,
     ) -> list[torch.Tensor] | None:
         if not run_mtp:
             return None
@@ -549,7 +562,7 @@ class DeepseekV4Model(nn.Module):
         source = mtp_source
         outputs: list[torch.Tensor] = []
         for mtp_layer in self.mtp:
-            mtp_input_ids, _ = _roll_mtp_left(mtp_input_ids, dims=-1)
+            mtp_input_ids, _ = _roll_mtp_left(mtp_input_ids, packed_seq_params=packed_seq_params, dims=-1)
             source = mtp_layer(
                 input_ids=mtp_input_ids,
                 hidden_states=source,
@@ -567,6 +580,7 @@ class DeepseekV4Model(nn.Module):
         loss_mask: torch.Tensor | None,
         temperature: float,
         use_fused_kernels: bool,
+        packed_seq_params=None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         if mtp_hidden_states is None or not self.mtp_enable_train:
             return None
@@ -578,8 +592,8 @@ class DeepseekV4Model(nn.Module):
 
         mtp_loss_values = []
         for mtp_hidden in mtp_hidden_states:
-            mtp_labels, _ = _roll_mtp_left(mtp_labels, dims=-1)
-            mtp_loss_mask, num_tokens = _roll_mtp_left(mtp_loss_mask, dims=-1)
+            mtp_labels, _ = _roll_mtp_left(mtp_labels, packed_seq_params=packed_seq_params, dims=-1)
+            mtp_loss_mask, num_tokens = _roll_mtp_left(mtp_loss_mask, packed_seq_params=packed_seq_params, dims=-1)
             labels_sb = mtp_labels.transpose(0, 1).contiguous()
             mask_sb = mtp_loss_mask.transpose(0, 1).contiguous()
 
