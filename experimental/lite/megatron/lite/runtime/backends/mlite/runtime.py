@@ -362,6 +362,14 @@ class MegatronLiteRuntime(RuntimeBase):
             for chunk in model_chunks:
                 yield from chunk.named_parameters()
 
+    def release_export_scratch(self, handle: ModelHandle) -> None:
+        """Release retained full-parameter scratch before colocated rollout wake."""
+        model_chunks = handle._extras.get("model_chunks", [handle._model])
+        for chunk in model_chunks:
+            release = getattr(chunk, "release_export_scratch", None)
+            if callable(release):
+                release()
+
     # ── Memory ──
 
     def to(
@@ -381,19 +389,30 @@ class MegatronLiteRuntime(RuntimeBase):
             offload_optimizer,
         )
 
+        # A model+gradient transfer is the training context boundary.  On its
+        # CPU side the colocated rollout is about to map its sleeping weights;
+        # on its CUDA side training is taking the device back.  Keep the whole
+        # release/restore contract here rather than teaching VERL about backend
+        # scratch buffers or optimizer residency.
+        training_transfer = model and grad
         if device == "cpu":
             if model:
                 offload_model_to_cpu(model_chunks)
-            if optimizer and handle._optimizer is not None:
+            if (optimizer or training_transfer) and handle._optimizer is not None:
                 offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
                 if callable(offload_state):
                     offload_state()
                 else:
                     offload_optimizer(handle._optimizer)
+            if training_transfer:
+                self.release_export_scratch(handle)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
         elif device == "cuda":
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
-            if optimizer and handle._optimizer is not None:
+            if (optimizer or training_transfer) and handle._optimizer is not None:
                 load_state = getattr(handle._optimizer, "load_state_to_device", None)
                 if callable(load_state):
                     load_state()
