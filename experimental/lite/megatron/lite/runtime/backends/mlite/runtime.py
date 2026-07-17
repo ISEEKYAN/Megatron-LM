@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 from collections.abc import Callable, Iterator
 from dataclasses import fields as dc_fields
@@ -408,6 +409,12 @@ class MegatronLiteRuntime(RuntimeBase):
                 self.release_export_scratch(handle)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+                    # R3/full-recompute may leave CUDA tensors reachable only
+                    # through dead Python cycles until the next periodic GC.
+                    # vLLM remaps its sleeping weights immediately after this
+                    # boundary, so collect those cycles before asking the CUDA
+                    # allocator to return their now-unused blocks.
+                    gc.collect()
                     torch.cuda.empty_cache()
         elif device == "cuda":
             if model:

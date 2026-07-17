@@ -253,6 +253,10 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
     )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
+    monkeypatch.setattr(
+        "megatron.lite.runtime.backends.mlite.runtime.gc.collect",
+        lambda: events.append("collect"),
+    )
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty-cache"))
     chunk = Chunk()
     handle = ModelHandle(
@@ -270,6 +274,7 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
         "offload-optimizer",
         "release-scratch",
         "synchronize",
+        "collect",
         "empty-cache",
         "load-model",
         "load-optimizer",
