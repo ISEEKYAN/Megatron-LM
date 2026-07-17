@@ -23,12 +23,13 @@ SCRIPT = (
         "enable_r3",
         "expert_dtype",
         "moe_backend",
+        "scale_fmt",
         "router_mode",
         "rollout_replay",
     ),
     [
-        ("4", "True", "fp4", "marlin", "R3", "True"),
-        ("8", "False", "fp8", "flashinfer_cutlass", "disabled", "False"),
+        ("4", "True", "fp4", "marlin", "ue8m0", "R3", "True"),
+        ("8", "False", "fp8", "flashinfer_cutlass", "float32", "disabled", "False"),
     ],
 )
 def test_ds4_dapo_weight_and_r3_knobs(
@@ -37,6 +38,7 @@ def test_ds4_dapo_weight_and_r3_knobs(
     enable_r3: str,
     expert_dtype: str,
     moe_backend: str,
+    scale_fmt: str,
     router_mode: str,
     rollout_replay: str,
 ) -> None:
@@ -60,6 +62,7 @@ def test_ds4_dapo_weight_and_r3_knobs(
     assert f"resync_config.expert_dtype={expert_dtype}" in command
     assert f"hf_overrides.expert_dtype={expert_dtype}" in command
     assert f"moe_backend={moe_backend}" in command
+    assert f"quantization_config.scale_fmt={scale_fmt}" in command
     assert f"router_replay_mode={router_mode}" in command
     assert f"enable_rollout_routing_replay={rollout_replay}" in command
     assert "actor_rollout_ref.actor.engine.impl_cfg.optimizer=fsdp2" in command

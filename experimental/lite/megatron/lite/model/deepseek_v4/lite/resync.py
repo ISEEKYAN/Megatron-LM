@@ -81,7 +81,11 @@ def export_resync_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Convert gathered DS4 BF16 weights to original checkpoint representation."""
     expert_dtype, block_shape, ignored = _quantization_contract(config, resync_config)
-    fp8_scale_format = "e8m0"
+    # vLLM's FP8 expert online-reload path materializes block scales as
+    # float32 ``weight_scale_inv`` tensors.  Keep W8 resync scales in that
+    # representation; serializing them as UE8M0 causes a large online-reload
+    # regression even though W4/MXFP4 legitimately uses UE8M0 scales.
+    fp8_scale_format = "e8m0" if expert_dtype == "fp4" else "float32"
 
     for name, tensor in weights:
         if (
