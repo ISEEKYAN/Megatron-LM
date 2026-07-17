@@ -81,7 +81,7 @@ def export_resync_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Convert gathered DS4 BF16 weights to original checkpoint representation."""
     expert_dtype, block_shape, ignored = _quantization_contract(config, resync_config)
-    fp8_scale_format = "e8m0" if expert_dtype == "fp4" else "float32"
+    fp8_scale_format = "e8m0"
 
     for name, tensor in weights:
         if (
