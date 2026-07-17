@@ -7,6 +7,14 @@
 # token-mean loss aggregation; overlong reward shaping (soft length penalty).
 # Resync: dense weights use block FP8. ROLLOUT_WEIGHT_BITS selects routed-expert
 # MXFP4 (4) or block FP8 (8); vLLM loads both directly via hf_overrides.
+#
+# Validated hero dependency contract (cw H100, 2026-07-17):
+#   VERL: 6a937b63 + the local old-logprob diagnostic/fix snapshot
+#   Python 3.12; PyTorch 2.12.0a0 nv26.05; CUDA toolkit/runtime 13.2
+#   vLLM == 0.25.1; Transformer Engine >= 2.15.0
+#   nvidia-cudnn-frontend >= 1.27.0 (must expose q_causal_offsets)
+#   FlashInfer == 0.6.13; nvidia-cutlass-dsl == 4.5.2; TileLang == 0.1.9
+# Actual training runs validate this contract below. DRY_RUN skips imports.
 set -euo pipefail
 [[ "${VERBOSE:-0}" == "1" ]] && set -x
 
@@ -143,6 +151,98 @@ ROLLOUT+=( "actor_rollout_ref.rollout.enforce_eager=${ROLLOUT_ENFORCE_EAGER}" )
 COMMAND=( python3 -m verl.trainer.main_ppo "hydra.searchpath=[pkg://verl_mlite.config]" "${ALGORITHM[@]}" "${DATA[@]}" "${MODEL[@]}" "${ACTOR[@]}" "${ROLLOUT[@]}" "${TRAINER[@]}" "${REWARD[@]}" "$@" )
 printf '%q ' "${COMMAND[@]}" > "${CMD_FILE}"; printf '\n' >> "${CMD_FILE}"
 if [[ "${DRY_RUN:-0}" == "1" ]]; then printf '%q ' "${COMMAND[@]}"; printf '\n'; exit 0; fi
+
+export DS4_EXPECTED_VERL_COMMIT="${DS4_EXPECTED_VERL_COMMIT:-6a937b63}"
+python3 - <<'PY'
+from __future__ import annotations
+
+import importlib.metadata as metadata
+import inspect
+import os
+import subprocess
+import sys
+
+from packaging.version import Version
+
+
+def installed(name: str) -> str:
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError as exc:
+        raise SystemExit(f"DS4 dependency is missing: {name}") from exc
+
+
+exact = {
+    "vllm": "0.25.1",
+    "flashinfer-python": "0.6.13",
+    "nvidia-cutlass-dsl": "4.5.2",
+    "tilelang": "0.1.9",
+}
+minimum = {
+    "transformer-engine": "2.15.0",
+    "nvidia-cudnn-frontend": "1.27.0",
+}
+actual = {name: installed(name) for name in exact | minimum}
+bad_exact = {name: (actual[name], wanted) for name, wanted in exact.items() if Version(actual[name]) != Version(wanted)}
+bad_minimum = {
+    name: (actual[name], wanted)
+    for name, wanted in minimum.items()
+    if Version(actual[name]) < Version(wanted)
+}
+if bad_exact or bad_minimum:
+    raise SystemExit(
+        f"DS4 dependency contract mismatch: exact={bad_exact} minimum={bad_minimum}"
+    )
+if sys.version_info[:2] != (3, 12):
+    raise SystemExit(f"DS4 requires Python 3.12, got {sys.version}")
+
+import cudnn
+import torch
+import transformer_engine.pytorch as te
+from cudnn import DSA
+
+if not torch.__version__.startswith("2.12.0a0") or torch.version.cuda != "13.2":
+    raise SystemExit(
+        f"DS4 hero requires PyTorch 2.12 nv26.05 / CUDA 13.2, "
+        f"got torch={torch.__version__} cuda={torch.version.cuda}"
+    )
+if "q_causal_offsets" not in inspect.signature(DSA.indexer_forward_wrapper).parameters:
+    raise SystemExit(
+        "nvidia-cudnn-frontend lacks q_causal_offsets required by fused DSA CP"
+    )
+
+expected_verl = os.environ["DS4_EXPECTED_VERL_COMMIT"]
+declared_verl = os.environ.get("VERL_COMMIT")
+verl_root = os.environ.get("VERL_ROOT")
+if declared_verl is None and verl_root:
+    try:
+        declared_verl = subprocess.check_output(
+            ["git", "-C", verl_root, "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+if declared_verl is None:
+    raise SystemExit(
+        "VERL provenance is not verifiable; set VERL_COMMIT=6a937b63 "
+        "for the validated old-logprob snapshot"
+    )
+if not declared_verl.startswith(expected_verl):
+    raise SystemExit(
+        f"DS4 requires VERL {expected_verl}, got declared/git commit {declared_verl}"
+    )
+
+print(
+    "DS4_DEPENDENCY_CONTRACT_PASSED "
+    f"verl={declared_verl} python={sys.version.split()[0]} "
+    f"torch={torch.__version__} torch_cuda={torch.version.cuda} "
+    f"vllm={actual['vllm']} te={actual['transformer-engine']} "
+    f"cudnn_frontend={actual['nvidia-cudnn-frontend']} "
+    f"flashinfer={actual['flashinfer-python']} "
+    f"cutlass={actual['nvidia-cutlass-dsl']} tilelang={actual['tilelang']} "
+    f"te_origin={te.__file__} cudnn_origin={cudnn.__file__}",
+    flush=True,
+)
+PY
 echo "[ds4-dapo] weights=expert-w${ROLLOUT_WEIGHT_BITS}/dense-w8 r3=${ENABLE_R3} train=${TRAIN_FILES} val=${VAL_FILES} cmd=${CMD_FILE}"
 set +e; "${COMMAND[@]}" 2>&1 | tee "${LOG_FILE}"; cmd_rc="${PIPESTATUS[0]}"; set -e
 exit "${cmd_rc}"
