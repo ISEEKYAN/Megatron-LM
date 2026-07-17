@@ -28,6 +28,36 @@ from megatron.lite.primitive.ckpt.hf_weights import (
 )
 
 
+def test_safe_tensor_reader_context_reuses_and_closes_shard(monkeypatch, tmp_path) -> None:
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "shard.safetensors", "b": "shard.safetensors"}})
+    )
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("exit")
+
+        def get_tensor(self, name):
+            events.append(("get", name))
+            return torch.tensor([1 if name == "a" else 2])
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.safe_open",
+        lambda *args, **kwargs: Handle(),
+    )
+
+    with SafeTensorReader(str(tmp_path)) as reader:
+        assert reader.get_tensor("a").item() == 1
+        assert reader.get_tensor("b").item() == 2
+
+    assert events == ["enter", ("get", "a"), ("get", "b"), "exit"]
+
+
 
 def test_export_defaults_to_device_resident_tensors() -> None:
     assert inspect.signature(export_hf_weights).parameters["cpu"].default is False
