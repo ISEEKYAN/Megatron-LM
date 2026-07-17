@@ -69,6 +69,17 @@ def test_fsdp2_config_validates_empty_wrap_surface():
         FSDP2Config(wrap_root=False)
 
 
+def test_fsdp2_pipeline_preserves_reshard_after_forward_setting():
+    ps = SimpleNamespace(pp_size=4)
+
+    assert (
+        fsdp2_optimizer._fsdp2_unit_reshard_after_forward(
+            ps, reshard_after_forward=True
+        )
+        is True
+    )
+
+
 @pytest.mark.parametrize("field", ["mesh_dim_name", "device_type"])
 def test_fsdp2_config_rejects_empty_names(field: str):
     with pytest.raises(ValueError, match=field):

@@ -579,8 +579,6 @@ def _collect_tp_replicated_grad_params(
 def _fsdp2_unit_reshard_after_forward(
     ps: ParallelState, *, reshard_after_forward: bool | int | None
 ) -> bool | int | None:
-    if ps.pp_size > 1:
-        return False
     return reshard_after_forward
 
 
