@@ -1,17 +1,33 @@
 #!/usr/bin/env bash
 # DeepSeek-V4 DAPO launcher.
 #
-# The block below is the supported user surface. Everything after it is the
-# validated DS4/DAPO recipe. Pass one-off Hydra overrides as trailing arguments
-# instead of adding another environment variable.
+# Validated hero dependency contract (CW H100, 2026-07-17):
+#   VERL: 6a937b63
+#   Python: 3.12
+#   PyTorch: 2.12.0a0 nv26.05, CUDA 13.2
+#   vLLM: 0.25.1
+#   Transformer Engine: >= 2.15.0
+#   nvidia-cudnn-frontend: >= 1.27.0, with DSA q_causal_offsets
+#   FlashInfer: 0.6.13
+#   nvidia-cutlass-dsl: 4.5.2
+#   TileLang: 0.1.9
+#
+# validate_deepseek_v4_dapo.py enforces this contract before a real run.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Run configuration
+# Key experiment knobs
+# ---------------------------------------------------------------------------
+
+# Routed experts: W4 uses Marlin; W8 uses FlashInfer CUTLASS.
+ROLLOUT_WEIGHT_BITS="${ROLLOUT_WEIGHT_BITS:-8}"
+ENABLE_R3="${ENABLE_R3:-False}"
+
+# ---------------------------------------------------------------------------
+# Run inputs and geometry
 # ---------------------------------------------------------------------------
 
 : "${MODEL_PATH:?set MODEL_PATH to the official DeepSeek-V4 checkpoint}"
-
 DEFAULT_DAPO_DATA_DIR="/lustre/fs1/portfolios/coreai/projects"
 DEFAULT_DAPO_DATA_DIR+="/coreai_devtech_all/users/bayan/code/verl_update_mcore/data"
 DAPO_DATA_DIR="${DAPO_DATA_DIR:-${DEFAULT_DAPO_DATA_DIR}}"
@@ -25,10 +41,6 @@ ACTOR_PP="${ACTOR_PP:-4}"
 ACTOR_CP="${ACTOR_CP:-4}"
 ACTOR_EP="${ACTOR_EP:-8}"
 ROLLOUT_TP="${ROLLOUT_TP:-8}"
-
-# Routed experts: W4 uses Marlin; W8 uses FlashInfer CUTLASS.
-ROLLOUT_WEIGHT_BITS="${ROLLOUT_WEIGHT_BITS:-8}"
-ENABLE_R3="${ENABLE_R3:-False}"
 
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
