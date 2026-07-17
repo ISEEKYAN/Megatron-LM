@@ -223,6 +223,12 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     optimizer = None
     finalize_grads = None
     post_model_load_hook = None
+    if lora_config.olora_tail and impl_cfg.optimizer != "fsdp2":
+        raise ValueError(
+            "OLoRA-tail init requires the fsdp2 optimizer: it must run AFTER base weights "
+            "load (in the post-load hook), but dist_opt builds its param buffer before "
+            f"load. Got optimizer={impl_cfg.optimizer!r}."
+        )
     if impl_cfg.optimizer == "dist_opt":
         from megatron.lite.primitive.optimizers.megatron_wrap import (
             build_dist_opt_training_optimizer,
@@ -249,6 +255,15 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         def _post_model_load_hook():
             from megatron.lite.model.qwen3_moe.lite.model import TransformerLayer
             from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+
+            # OLoRA-tail (arXiv:2606.02437): SVD-minor-subspace adapter init from the now-loaded
+            # frozen base weights, with PiSSA-style residual so the model output is unchanged at
+            # init. MUST precede the optimizer build so it captures the OLoRA-initialized params.
+            if lora_config.olora_tail:
+                from megatron.lite.primitive.modules.lora import apply_olora_tail_init
+
+                for chunk in chunks:
+                    apply_olora_tail_init(chunk)
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 _EXPORTS = {
+    "DeltaMemConfig": ("megatron.lite.primitive.modules.delta_mem", "DeltaMemConfig"),
+    "DeltaMemory": ("megatron.lite.primitive.modules.delta_mem", "DeltaMemory"),
     "Experts": ("megatron.lite.primitive.modules.experts", "Experts"),
     "GatedDeltaNet": ("megatron.lite.primitive.modules.gated_delta_net", "GatedDeltaNet"),
     "GQAttention": ("megatron.lite.primitive.modules.gqa", "GQAttention"),
@@ -38,6 +40,8 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "DeltaMemConfig",
+    "DeltaMemory",
     "Experts",
     "GatedDeltaNet",
     "GQAttention",

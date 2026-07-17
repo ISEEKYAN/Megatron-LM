@@ -7,6 +7,7 @@ Megatron-style sharded linear surfaces, not arbitrary PEFT injection.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,11 +25,73 @@ _TARGET_ALIASES = {
 }
 
 
+def lora_scaling(rank: int, alpha: int | None, use_rslora: bool = False) -> float:
+    """LoRA scaling factor applied to ``B @ A``.
+
+    Standard LoRA uses ``alpha / rank``; rsLoRA (Kalajdzievski, 2023) uses
+    ``alpha / sqrt(rank)`` so the effective update magnitude stays rank-stable,
+    enabling learning-rate reuse across ranks.
+    """
+    numerator = float(rank if alpha is None else alpha)
+    return numerator / (math.sqrt(rank) if use_rslora else float(rank))
+
+
+def olora_tail_factors(weight: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """OLoRA-tail init factors ``(B0, A0)`` from a frozen base weight.
+
+    Per arXiv:2606.02437 (§4.1.2): let ``W0 = U Σ Vᵀ``; OLoRA-tail uses the singular
+    vectors of the **smallest** ``rank`` singular values (the minor / "tail" subspace)
+    with **NO** singular-value scaling: ``B0 = U₋ᵣ``, ``A0 = V₋ᵣᵀ``. The minor subspace
+    spans directions that are comparatively inert in the pretrained model, so the early
+    on-policy update stays inside the RL "KL leash"; dropping Σ (vs MiLoRA's
+    ``U₋ᵣΣ₋ᵣ^½`` / ``Σ₋ᵣ^½V₋ᵣᵀ``) avoids amplifying that early update.
+
+    ``weight`` is ``[out, in]``; returns ``B0 [out, rank]``, ``A0 [rank, in]``.
+    SVD is computed in float32 for stability regardless of the weight dtype.
+    """
+    w = weight.detach().to(torch.float32)
+    if w.dim() != 2:
+        raise ValueError(f"olora_tail_factors expects a 2D weight, got shape {tuple(w.shape)}.")
+    k = min(w.shape)
+    if rank > k:
+        raise ValueError(f"OLoRA-tail rank {rank} exceeds min(out, in) = {k}.")
+    # torch.linalg.svd returns S in DESCENDING order -> smallest r are the last r.
+    U, _S, Vh = torch.linalg.svd(w, full_matrices=False)
+    B0 = U[:, -rank:].contiguous()  # [out, rank]  left vectors of the smallest r values
+    A0 = Vh[-rank:, :].contiguous()  # [rank, in]   right vectors (V₋ᵣᵀ)
+    return B0, A0
+
+
+def olora_factors(weight: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Plain OLoRA init factors ``(B0, A0)`` from a frozen base weight.
+
+    Per OLoRA (arXiv:2406.01775, mirroring HF PEFT ``init_lora_weights="olora"``):
+    economy QR of the base weight, ``B0 = Q[:, :rank]`` (orthonormal columns),
+    ``A0 = R[:rank, :]``. Unlike olora_tail this seeds the adapter with the
+    *leading* (principal-leaning) content of W0 — the aggressive init that
+    arXiv:2606.02437 Fig. 13 shows collapsing under on-policy RL, kept here as
+    the contrast arm to OLoRA-tail.
+
+    ``weight`` is ``[out, in]``; returns ``B0 [out, rank]``, ``A0 [rank, in]``.
+    QR is computed in float32 for stability regardless of the weight dtype.
+    """
+    w = weight.detach().to(torch.float32)
+    if w.dim() != 2:
+        raise ValueError(f"olora_factors expects a 2D weight, got shape {tuple(w.shape)}.")
+    k = min(w.shape)
+    if rank > k:
+        raise ValueError(f"OLoRA rank {rank} exceeds min(out, in) = {k}.")
+    q, r = torch.linalg.qr(w, mode="reduced")
+    return q[:, :rank].contiguous(), r[:rank, :].contiguous()
+
+
 @dataclass(frozen=True)
 class LoraConfig:
     rank: int = 0
     alpha: int | None = None
     dropout: float = 0.0
+    use_rslora: bool = False
+    init: str = "default"  # "default" = kaiming(A)+zeros(B); "olora_tail" = minor-SVD init (post-load)
     target_modules: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_TARGET_MODULES)
 
     @property
@@ -36,12 +99,20 @@ class LoraConfig:
         return self.rank > 0
 
     @property
+    def olora_tail(self) -> bool:
+        return self.init == "olora_tail"
+
+    @property
     def scale(self) -> float:
-        return float(self.rank if self.alpha is None else self.alpha) / float(self.rank)
+        return lora_scaling(self.rank, self.alpha, self.use_rslora)
 
     def targets(self) -> set[str]:
         out = set()
         for target in self.target_modules:
+            # HF PEFT convention: "all-linear" targets every linear surface.
+            if target == "all-linear":
+                out.update(_DEFAULT_TARGET_MODULES)
+                continue
             out.add(_TARGET_ALIASES.get(target, target))
         return out
 
@@ -67,6 +138,10 @@ def normalize_lora_config(config: LoraConfig | dict[str, Any] | None) -> LoraCon
         values.pop("targets", None)
     if "target_modules" in values and not isinstance(values["target_modules"], tuple):
         values["target_modules"] = tuple(values["target_modules"])
+    if "init_lora_weights" in values and "init" not in values:  # HF PEFT field name
+        values["init"] = values.pop("init_lora_weights")
+    else:
+        values.pop("init_lora_weights", None)
     return LoraConfig(**values)
 
 
@@ -78,7 +153,11 @@ def freeze_non_lora_params(model: nn.Module) -> dict[str, int]:
     frozen_tensors = 0
     frozen_numel = 0
     for name, param in model.named_parameters():
-        if "lora" in name.lower() or "adapter" in name.lower():
+        if (
+            "lora" in name.lower()
+            or "adapter" in name.lower()
+            or "delta_mem" in name.lower()
+        ):
             param.requires_grad_(True)
             lora_tensors += 1
             lora_numel += param.numel()
@@ -92,6 +171,47 @@ def freeze_non_lora_params(model: nn.Module) -> dict[str, int]:
         "frozen_tensors": frozen_tensors,
         "frozen_numel": frozen_numel,
     }
+
+
+def apply_olora_tail_init(model: nn.Module) -> dict[str, int]:
+    """Apply OLoRA-tail init to every mlite LoRA adapter found under ``model``.
+
+    Pairs each adapter with its frozen base weight by the mlite attribute convention:
+    attention ``qkv_lora``/``proj_lora`` ← ``qkv.linear.weight``/``proj.linear.weight``;
+    expert ``fc1_lora``/``fc2_lora`` ← the GroupedLinear per-expert weights ``weight{e}``.
+    Must run AFTER base weights load and BEFORE the optimizer captures params (mlite's
+    fsdp2 ``post_model_load_hook``). tp=1 only — see ``LinearLoRA.olora_tail_init_``.
+    The expert path is best-effort: if the GroupedLinear weight layout is unrecognized
+    it is skipped (those adapters keep the standard zero-delta init, which also preserves
+    the layer's output at init, so mixing the two inits is safe).
+    """
+    n_attn = n_expert = 0
+    for module in model.modules():
+        qkv_lora = getattr(module, "qkv_lora", None)
+        if qkv_lora is not None and getattr(module, "qkv", None) is not None:
+            qkv_lora.olora_tail_init_(module.qkv.linear.weight)
+            n_attn += 1
+        proj_lora = getattr(module, "proj_lora", None)
+        if proj_lora is not None and getattr(module, "proj", None) is not None:
+            proj_lora.olora_tail_init_(module.proj.linear.weight)
+            n_attn += 1
+        for lora_attr, base_attr in (("fc1_lora", "fc1"), ("fc2_lora", "fc2")):
+            adapter = getattr(module, lora_attr, None)
+            base = getattr(module, base_attr, None)
+            n_local = int(getattr(module, "num_local_experts", 0) or 0)
+            if adapter is None or base is None or n_local <= 0:
+                continue
+            weights = []
+            for e in range(n_local):
+                w = getattr(base, f"weight{e}", None)
+                if w is None:
+                    weights = []
+                    break
+                weights.append(w)
+            if weights:
+                adapter.olora_tail_init_(weights)
+                n_expert += 1
+    return {"olora_attn_adapters": n_attn, "olora_expert_adapters": n_expert}
 
 
 def trainable_param_stats(model: nn.Module) -> dict[str, int]:
@@ -353,6 +473,7 @@ class LinearLoRA(nn.Module):
         *,
         alpha: int | None = None,
         dropout: float = 0.0,
+        use_rslora: bool = False,
         sequence_parallel_input: bool = False,
         row_parallel_output: bool = False,
         sequence_parallel_scatter_output: bool = False,
@@ -388,7 +509,8 @@ class LinearLoRA(nn.Module):
         else:
             self.rank_partition_size = 1
             self.local_rank = self.rank
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
+        self.scale = lora_scaling(rank, alpha, use_rslora)
+        self.use_rslora = bool(use_rslora)
         self.dropout_p = float(dropout)
         self.sequence_parallel_input = bool(sequence_parallel_input)
         self.row_parallel_output = bool(row_parallel_output)
@@ -459,6 +581,50 @@ class LinearLoRA(nn.Module):
             out = _scatter_sequence_parallel(out, self.tp_group, self.tp_rank)
         return out
 
+    @torch.no_grad()
+    def olora_tail_init_(self, base_weight: torch.Tensor) -> None:
+        """OLoRA-tail init (minor SVD subspace) — see ``_orthogonal_init_``."""
+        self._orthogonal_init_(base_weight, olora_tail_factors, "OLoRA-tail")
+
+    @torch.no_grad()
+    def olora_init_(self, base_weight: torch.Tensor) -> None:
+        """Plain OLoRA init (QR, principal-leaning) — see ``_orthogonal_init_``."""
+        self._orthogonal_init_(base_weight, olora_factors, "OLoRA")
+
+    @torch.no_grad()
+    def _orthogonal_init_(self, base_weight: torch.Tensor, factors_fn, kind: str) -> None:
+        """Orthogonal-factor init from the (loaded) frozen base weight, in place.
+
+        Sets ``lora_b/lora_a`` from ``factors_fn`` then subtracts
+        ``scale · B0 @ A0`` from ``base_weight`` (PiSSA-style residual) so the
+        layer output is UNCHANGED at init: ``W0 x = (W0 - scale·B0A0)x + scale·B0A0x``.
+        tp=1 only — a sharded base weight would need a distributed factorization.
+        """
+        tp_world = dist.get_world_size(self.tp_group) if self.tp_group is not None else 1
+        if self.rank_partitioned_a or self.output_partitioned_b or tp_world > 1:
+            raise NotImplementedError(
+                f"{kind} init supports tp=1 (unsharded base weight) only; "
+                f"got tp_world={tp_world}, rank_partitioned_a={self.rank_partitioned_a}, "
+                f"output_partitioned_b={self.output_partitioned_b}."
+            )
+        expected = (self.lora_b.shape[0], self.lora_a.shape[1])
+        if tuple(base_weight.shape) != expected:
+            raise ValueError(
+                f"{kind} base weight shape {tuple(base_weight.shape)} != expected {expected}."
+            )
+        b0, a0 = factors_fn(base_weight, self.rank)
+        # SVD factors carry sign/degeneracy ambiguity that differs across ranks.
+        # The init runs pre-sharding on replicated weights, but fsdp2 later shards
+        # lora_a/lora_b dim-0 across data-parallel ranks: the concatenated factors
+        # must reproduce the exact B0@A0 every rank's residual write-back used, so
+        # all ranks must hold identical factors.
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.broadcast(b0, src=0)
+            dist.broadcast(a0, src=0)
+        self.lora_b.copy_(b0.to(self.lora_b.dtype))
+        self.lora_a.copy_(a0.to(self.lora_a.dtype))
+        base_weight.sub_((b0 @ a0).to(base_weight.dtype), alpha=self.scale)
+
 
 class GroupedLinearLoRA(nn.Module):
     """Per-local-expert LoRA delta for `te.GroupedLinear` expert surfaces."""
@@ -472,13 +638,15 @@ class GroupedLinearLoRA(nn.Module):
         *,
         alpha: int | None = None,
         dropout: float = 0.0,
+        use_rslora: bool = False,
     ):
         super().__init__()
         if rank <= 0:
             raise ValueError("LoRA rank must be positive for GroupedLinearLoRA.")
         self.num_local_experts = int(num_local_experts)
         self.rank = int(rank)
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
+        self.scale = lora_scaling(rank, alpha, use_rslora)
+        self.use_rslora = bool(use_rslora)
         self.dropout_p = float(dropout)
         self.lora_a = nn.Parameter(torch.empty(num_local_experts, rank, in_features))
         self.lora_b = nn.Parameter(torch.empty(num_local_experts, out_features, rank))
@@ -520,13 +688,15 @@ class SharedGroupedLinearLoRA(nn.Module):
         *,
         alpha: int | None = None,
         dropout: float = 0.0,
+        use_rslora: bool = False,
     ):
         super().__init__()
         if rank <= 0:
             raise ValueError("LoRA rank must be positive for SharedGroupedLinearLoRA.")
         self.num_local_experts = int(num_local_experts)
         self.rank = int(rank)
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
+        self.scale = lora_scaling(rank, alpha, use_rslora)
+        self.use_rslora = bool(use_rslora)
         self.dropout_p = float(dropout)
         self.shared_across_experts = True
         self.lora_a = nn.Parameter(torch.empty(rank, in_features))
@@ -544,13 +714,43 @@ class SharedGroupedLinearLoRA(nn.Module):
         dropped = F.dropout(x, p=self.dropout_p, training=self.training) if self.dropout_p else x
         return dropped.matmul(self.lora_a.t()).matmul(self.lora_b.t()) * self.scale
 
+    @torch.no_grad()
+    def olora_tail_init_(self, expert_weights: list[torch.Tensor]) -> None:
+        """OLoRA-tail init for a single adapter SHARED across local experts.
+
+        Each expert has its own base weight, but the adapter is shared, so there is no
+        single ``W0``. We SVD the MEAN expert weight (the natural proxy for a shared
+        correction) for the minor factors, then subtract the SAME ``scale·B0@A0`` from
+        EVERY expert weight — which preserves each expert's output at init, because the
+        shared adapter adds that same delta back uniformly:
+        ``W_e x = (W_e - scale·B0A0)x + scale·B0A0x`` for every expert ``e``.
+        """
+        if not expert_weights:
+            raise ValueError("OLoRA-tail expert init requires at least one expert weight.")
+        expected = (self.lora_b.shape[0], self.lora_a.shape[1])
+        for w in expert_weights:
+            if tuple(w.shape) != expected:
+                raise ValueError(
+                    f"OLoRA-tail expert weight shape {tuple(w.shape)} != expected {expected}."
+                )
+        mean_w = torch.stack([w.detach().to(torch.float32) for w in expert_weights]).mean(dim=0)
+        b0, a0 = olora_tail_factors(mean_w, self.rank)
+        self.lora_b.copy_(b0.to(self.lora_b.dtype))
+        self.lora_a.copy_(a0.to(self.lora_a.dtype))
+        delta = (b0 @ a0) * self.scale
+        for w in expert_weights:
+            w.sub_(delta.to(w.dtype))
+
 
 __all__ = [
     "GroupedLinearLoRA",
     "LinearLoRA",
     "LoraConfig",
     "SharedGroupedLinearLoRA",
+    "apply_olora_tail_init",
     "freeze_non_lora_params",
     "normalize_lora_config",
+    "olora_tail_factors",
+    "olora_factors",
     "trainable_param_stats",
 ]
