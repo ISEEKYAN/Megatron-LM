@@ -19,20 +19,22 @@ set -euo pipefail
 # Key experiment knobs
 # ---------------------------------------------------------------------------
 
-# Routed experts: W4 uses Marlin; W8 uses FlashInfer CUTLASS.
+# Rollout routed-expert weights: choose 4 (MXFP4 + Marlin) or
+# 8 (FP8 + FlashInfer CUTLASS). Dense rollout weights remain FP8 in both modes.
 ROLLOUT_WEIGHT_BITS="${ROLLOUT_WEIGHT_BITS:-8}"
-ENABLE_R3="${ENABLE_R3:-False}"
+
+# Router replay (R3): record vLLM's routed-expert choices and replay them in
+# the actor when recomputing log-probs. Disable only for parity/debug A/B runs.
+ENABLE_R3="${ENABLE_R3:-True}"
 
 # ---------------------------------------------------------------------------
 # Run inputs and geometry
 # ---------------------------------------------------------------------------
 
 : "${MODEL_PATH:?set MODEL_PATH to the official DeepSeek-V4 checkpoint}"
-DEFAULT_DAPO_DATA_DIR="/lustre/fs1/portfolios/coreai/projects"
-DEFAULT_DAPO_DATA_DIR+="/coreai_devtech_all/users/bayan/code/verl_update_mcore/data"
-DAPO_DATA_DIR="${DAPO_DATA_DIR:-${DEFAULT_DAPO_DATA_DIR}}"
-TRAIN_FILES="${TRAIN_FILES:-${DAPO_DATA_DIR}/dapo-math-17k.parquet}"
-VAL_FILES="${VAL_FILES:-${DAPO_DATA_DIR}/aime-2024.parquet}"
+DAPO_DATA_DIR="${DAPO_DATA_DIR:-}"
+TRAIN_FILES="${TRAIN_FILES:-${DAPO_DATA_DIR:+${DAPO_DATA_DIR}/dapo-math-17k.parquet}}"
+VAL_FILES="${VAL_FILES:-${DAPO_DATA_DIR:+${DAPO_DATA_DIR}/aime-2024.parquet}}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-}"
 
 NNODES="${NNODES:-1}"
@@ -93,11 +95,13 @@ export VERL_VLLM_FP8_QUANT_ENABLED=1
 
 case "${ROLLOUT_WEIGHT_BITS}" in
   4)
+    ROLLOUT_RESYNC_FORMAT=mxfp4
     ROLLOUT_EXPERT_DTYPE=fp4
     ROLLOUT_MOE_BACKEND=marlin
     ROLLOUT_SCALE_FMT=ue8m0
     ;;
   8)
+    ROLLOUT_RESYNC_FORMAT=block_fp8
     ROLLOUT_EXPERT_DTYPE=fp8
     ROLLOUT_MOE_BACKEND=flashinfer_cutlass
     ROLLOUT_SCALE_FMT=float32
@@ -126,6 +130,9 @@ case "${ENABLE_R3,,}" in
     exit 2
     ;;
 esac
+
+: "${TRAIN_FILES:?set TRAIN_FILES or DAPO_DATA_DIR}"
+: "${VAL_FILES:?set VAL_FILES or DAPO_DATA_DIR}"
 
 MAX_SEQ_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 DEFAULT_RUN_NAME="ds4_dapo_pp${ACTOR_PP}_ep${ACTOR_EP}_cp${ACTOR_CP}"
@@ -234,7 +241,7 @@ ACTOR=(
   "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=fsdp2"
   "actor_rollout_ref.actor.engine.load_hf_weights=True"
   "+actor_rollout_ref.actor.engine.cross_entropy_fusion=True"
-  "actor_rollout_ref.actor.engine.resync_format=block_fp8"
+  "actor_rollout_ref.actor.engine.resync_format=${ROLLOUT_RESYNC_FORMAT}"
   "+actor_rollout_ref.actor.engine.resync_config.expert_dtype=${ROLLOUT_EXPERT_DTYPE}"
   "+actor_rollout_ref.actor.engine.impl_cfg.recompute=full"
   "+actor_rollout_ref.actor.engine.impl_cfg.mtp_enable=True"

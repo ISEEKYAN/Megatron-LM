@@ -43,6 +43,13 @@ from megatron.lite.primitive.ckpt.hf_weights import (
 )
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible, log_rank0
+from megatron.lite.runtime.contracts.weights import ResyncFormat
+
+
+_QUANTIZED_RESYNC_TARGETS = {
+    ResyncFormat.BLOCK_FP8.value,
+    ResyncFormat.MXFP4.value,
+}
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -618,23 +625,33 @@ def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelSta
 def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
     """Export DS4 weights as HF or serialized vLLM-checkpoint pairs.
 
-    The default remains the ordinary HF/BF16 stream. ``block_fp8`` is a
-    model-owned adapter over that gathered stream; the runtime and veRL engine
-    do not classify DS4 tensors.
+    The default remains the ordinary HF/BF16 stream. ``block_fp8`` and
+    ``mxfp4`` are model-owned adapters over that gathered stream; the runtime
+    and veRL engine do not classify individual DS4 tensors. ``mxfp4`` describes
+    the routed-expert representation; dense quantized weights remain block FP8.
     """
     target = kwargs.pop("target", "hf")
     resync_config = kwargs.pop("resync_config", None)
-    if target not in {"hf", "bf16", "block_fp8"}:
+    if target not in {"hf", ResyncFormat.BF16.value, *_QUANTIZED_RESYNC_TARGETS}:
         raise ValueError(f"Unsupported DeepSeek-V4 export target: {target!r}")
     weights = _export_unquantized_weights(model, config, ps, **kwargs)
-    if target == "block_fp8":
+    if target in _QUANTIZED_RESYNC_TARGETS:
         from megatron.lite.model.deepseek_v4.lite.resync import export_resync_weights
 
+        if target == ResyncFormat.MXFP4.value:
+            resync_config = dict(resync_config or {})
+            configured_dtype = resync_config.get("expert_dtype")
+            if configured_dtype not in {None, "fp4"}:
+                raise ValueError(
+                    "DeepSeek-V4 target='mxfp4' requires expert_dtype='fp4', "
+                    f"got {configured_dtype!r}"
+                )
+            resync_config["expert_dtype"] = "fp4"
         yield from export_resync_weights(weights, config, resync_config=resync_config)
     else:
         if resync_config:
             raise ValueError(
-                "DeepSeek-V4 resync_config requires target='block_fp8'"
+                "DeepSeek-V4 resync_config requires a quantized export target"
             )
         yield from weights
 

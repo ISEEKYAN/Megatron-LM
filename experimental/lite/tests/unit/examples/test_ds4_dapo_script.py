@@ -22,14 +22,24 @@ SCRIPT = (
         "weight_bits",
         "enable_r3",
         "expert_dtype",
+        "resync_format",
         "moe_backend",
         "scale_fmt",
         "router_mode",
         "rollout_replay",
     ),
     [
-        ("4", "True", "fp4", "marlin", "ue8m0", "R3", "True"),
-        ("8", "False", "fp8", "flashinfer_cutlass", "float32", "disabled", "False"),
+        ("4", "True", "fp4", "mxfp4", "marlin", "ue8m0", "R3", "True"),
+        (
+            "8",
+            "False",
+            "fp8",
+            "block_fp8",
+            "flashinfer_cutlass",
+            "float32",
+            "disabled",
+            "False",
+        ),
     ],
 )
 def test_ds4_dapo_weight_and_r3_knobs(
@@ -37,6 +47,7 @@ def test_ds4_dapo_weight_and_r3_knobs(
     weight_bits: str,
     enable_r3: str,
     expert_dtype: str,
+    resync_format: str,
     moe_backend: str,
     scale_fmt: str,
     router_mode: str,
@@ -60,6 +71,7 @@ def test_ds4_dapo_weight_and_r3_knobs(
     )
     command = result.stdout
     assert f"resync_config.expert_dtype={expert_dtype}" in command
+    assert f"engine.resync_format={resync_format}" in command
     assert f"hf_overrides.expert_dtype={expert_dtype}" in command
     assert f"moe_backend={moe_backend}" in command
     assert f"quantization_config.scale_fmt={scale_fmt}" in command
@@ -92,6 +104,8 @@ def test_ds4_dapo_rejects_invalid_feature_knob(
         "DRY_RUN": "1",
         name: value,
     }
-    result = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
+    result = subprocess.run(
+        ["bash", str(SCRIPT)], env=env, text=True, capture_output=True
+    )
     assert result.returncode == 2
     assert message in result.stderr
