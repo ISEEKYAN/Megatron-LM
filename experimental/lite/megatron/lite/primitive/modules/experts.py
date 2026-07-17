@@ -111,6 +111,7 @@ class Experts(nn.Module):
                 lora.rank,
                 alpha=lora.alpha,
                 dropout=lora.dropout,
+                use_rslora=lora.use_rslora,
             )
         if lora.enabled and lora.targets_module("linear_fc2"):
             self.fc2_lora = SharedGroupedLinearLoRA(
@@ -120,6 +121,7 @@ class Experts(nn.Module):
                 lora.rank,
                 alpha=lora.alpha,
                 dropout=lora.dropout,
+                use_rslora=lora.use_rslora,
             )
         if ps.tp_size > 1 and ps.ep_size == 1 and ps.etp_size == 1:
             tp_group = ps.tp_group
