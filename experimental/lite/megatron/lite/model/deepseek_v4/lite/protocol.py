@@ -337,9 +337,10 @@ def _configure_attention_backend(chunks: list[nn.Module], *, backend: str | None
 
 
 def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
-    model = getattr(chunk, "model", None)
-    if model is None:
-        return []
+    # Native DS4 chunks are DeepseekV4Model instances themselves. Keep support
+    # for wrapper-style chunks, but do not require a `.model` indirection or
+    # recompute/offload silently applies to zero transformer layers.
+    model = getattr(chunk, "model", chunk)
     layers = list(getattr(model, "layers", {}).values())
     mtp_layers = list(getattr(model, "mtp", []))
     return [*layers, *mtp_layers]
