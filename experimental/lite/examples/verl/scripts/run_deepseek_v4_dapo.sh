@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 # DeepSeek-V4 DAPO run -- SELF-CONTAINED (no delegation to any gsm8k/qwen runner).
-# Directly invokes verl.trainer.main_ppo with the DS4 geometry + fp8 resync + DAPO
+# Directly invokes verl.trainer.main_ppo with the DS4 geometry + quantized resync + DAPO
 # recipe. Standard DAPO data: dapo-math-17k (train) + aime-2024 (val).
 #
 # DAPO recipe: clip-higher (asymmetric PPO clip) + dual-clip; no KL (reward or loss);
 # token-mean loss aggregation; overlong reward shaping (soft length penalty).
-# Resync: mlite exports a pre-quantized block-fp8 checkpoint (resync_format=block_fp8,
-# expert_dtype=fp8) that vLLM loads directly via hf_overrides.
+# Resync: dense weights use block FP8. ROLLOUT_WEIGHT_BITS selects routed-expert
+# MXFP4 (4) or block FP8 (8); vLLM loads both directly via hf_overrides.
+#
+# Validated hero dependency contract (cw H100, 2026-07-17):
+#   VERL: 6a937b63 + the local old-logprob diagnostic/fix snapshot
+#   Python 3.12; PyTorch 2.12.0a0 nv26.05; CUDA toolkit/runtime 13.2
+#   vLLM == 0.25.1; Transformer Engine >= 2.15.0
+#   nvidia-cudnn-frontend >= 1.27.0 (must expose q_causal_offsets)
+#   FlashInfer == 0.6.13; nvidia-cutlass-dsl == 4.5.2; TileLang == 0.1.9
+# Actual training runs validate this contract below. DRY_RUN skips imports.
 set -euo pipefail
 [[ "${VERBOSE:-0}" == "1" ]] && set -x
 
@@ -63,6 +71,31 @@ CLIP_GRAD="${CLIP_GRAD:-1.0}"; LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"; LR_DECAY
 ENTROPY_COEFF="${ENTROPY_COEFF:-0}"; POLICY_LOSS_MODE="${POLICY_LOSS_MODE:-vanilla}"
 USE_KL_LOSS="${USE_KL_LOSS:-False}"; USE_KL_IN_REWARD="${USE_KL_IN_REWARD:-False}"
 
+# Rollout precision/R3 controls. ROLLOUT_WEIGHT_BITS refers to routed experts;
+# dense weights remain FP8 in both modes, matching the official DS4 contract.
+ROLLOUT_WEIGHT_BITS="${ROLLOUT_WEIGHT_BITS:-8}"
+ENABLE_R3="${ENABLE_R3:-False}"
+case "${ROLLOUT_WEIGHT_BITS}" in
+  4) ROLLOUT_EXPERT_DTYPE=fp4 ;;
+  8) ROLLOUT_EXPERT_DTYPE=fp8 ;;
+  *) echo "ROLLOUT_WEIGHT_BITS must be 4 or 8, got ${ROLLOUT_WEIGHT_BITS}" >&2; exit 2 ;;
+esac
+case "${ENABLE_R3,,}" in
+  true|1|yes|on)
+    ENABLE_R3=True
+    ROUTER_REPLAY_MODE=R3
+    ENABLE_ROLLOUT_ROUTING_REPLAY=True
+    R3_TAG=on
+    ;;
+  false|0|no|off)
+    ENABLE_R3=False
+    ROUTER_REPLAY_MODE=disabled
+    ENABLE_ROLLOUT_ROUTING_REPLAY=False
+    R3_TAG=off
+    ;;
+  *) echo "ENABLE_R3 must be a boolean, got ${ENABLE_R3}" >&2; exit 2 ;;
+esac
+
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-15}"; TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-null}"
 SAVE_FREQ="${SAVE_FREQ:-20}"; TEST_FREQ="${TEST_FREQ:-5}"; RESUME_MODE="${RESUME_MODE:-auto}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"; LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-10}"; LOGGER="${LOGGER:-[console,file]}"
@@ -76,7 +109,7 @@ LOSS_AGG_MODE="${LOSS_AGG_MODE:-token-mean}"; OVERLONG_BUFFER_LEN="${OVERLONG_BU
 MLITE_VPP_SIZE="${ACTOR_VPP}"; [[ "${MLITE_VPP_SIZE}" == "null" ]] && MLITE_VPP_SIZE=1
 case "${MLITE_OPTIMIZER_BACKEND}" in dist_opt) MLITE_IMPL_OPTIMIZER="dist_opt";; fsdp2) MLITE_IMPL_OPTIMIZER="fsdp2";; *) echo "bad MLITE_OPTIMIZER_BACKEND"; exit 1;; esac
 
-RUN_NAME="${RUN_NAME:-ds4_dapo_pp${ACTOR_PP}_ep${ACTOR_EP}_cp${ACTOR_CP}_rtp${ROLLOUT_TP}}"
+RUN_NAME="${RUN_NAME:-ds4_dapo_pp${ACTOR_PP}_ep${ACTOR_EP}_cp${ACTOR_CP}_rtp${ROLLOUT_TP}_w${ROLLOUT_WEIGHT_BITS}_r3${R3_TAG}}"
 CKPT_DIR="${CKPT_DIR:-${OUTPUT_ROOT}/checkpoints/${RUN_NAME}}"
 LOG_FILE="${LOG_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.log}"; JSONL_FILE="${JSONL_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.jsonl}"; CMD_FILE="${CMD_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.cmd.sh}"
 mkdir -p "${OUTPUT_ROOT}" "${CKPT_DIR}" "$(dirname "${LOG_FILE}")"
@@ -92,20 +125,124 @@ PY
 
 DEFAULT_CHAT_TEMPLATE='{% for message in messages %}{% if message["content"] is string %}{{ message["content"] }}{% else %}{% for content in message["content"] %}{% if content["type"] == "text" %}{{ content["text"] }}{% endif %}{% endfor %}{% endif %}{% if not loop.last %}{{ "\n\n" }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ "\n" }}{% endif %}'
 DS4_CHAT_TEMPLATE="${DEEPSEEK_V4_FLASH_CHAT_TEMPLATE:-${DEFAULT_CHAT_TEMPLATE}}"
+# Colocated vLLM captures graphs while the model still contains dummy weights.
+# Real actor weights arrive later through IPC, so those graphs are numerically
+# stale. Eager is the correctness default until capture can be deferred until
+# after the first weight sync and cache wake-up.
+ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-True}"
 
 ALGORITHM=( "algorithm.adv_estimator=grpo" "algorithm.use_kl_in_reward=${USE_KL_IN_REWARD}" "algorithm.kl_ctrl.kl_coef=${KL_COEF:-0.0}" "algorithm.rollout_correction.bypass_mode=${ROLLOUT_CORRECTION_BYPASS:-False}" "algorithm.norm_adv_by_std_in_grpo=False" )
 DATA=( "data.train_files=${TRAIN_FILES}" "data.val_files=${VAL_FILES}" "data.train_batch_size=${TRAIN_BATCH_SIZE}" "data.prompt_key=prompt" "data.return_raw_chat=True" "data.max_prompt_length=${MAX_PROMPT_LENGTH}" "data.max_response_length=${MAX_RESPONSE_LENGTH}" "data.filter_overlong_prompts=True" "data.truncation=error" "data.custom_cls.path=${DATASET_MODULE}" "data.custom_cls.name=ChatTemplateRLHFDataset" "+data.chat_template='${DS4_CHAT_TEMPLATE}'" "data.dataloader_num_workers=${DATALOADER_NUM_WORKERS:-8}" )
-MODEL=( "actor_rollout_ref.model.path=${MODEL_PATH}" "actor_rollout_ref.model.trust_remote_code=True" "actor_rollout_ref.model.use_fused_kernels=False" "actor_rollout_ref.model.custom_chat_template='${DS4_CHAT_TEMPLATE}'" )
-ACTOR=( "actor@actor_rollout_ref.actor=mlite_actor" "actor_rollout_ref.actor.optim.lr=${ACTOR_LR}" "actor_rollout_ref.actor.optim.weight_decay=${WEIGHT_DECAY}" "actor_rollout_ref.actor.optim.betas=${BETAS}" "actor_rollout_ref.actor.optim.clip_grad=${CLIP_GRAD}" "actor_rollout_ref.actor.optim.lr_warmup_steps=${LR_WARMUP_STEPS}" "actor_rollout_ref.actor.optim.lr_warmup_init=0" "actor_rollout_ref.actor.optim.lr_decay_style=${LR_DECAY_STYLE}" "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}" "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU}" "actor_rollout_ref.actor.use_dynamic_bsz=${USE_DYNAMIC_BSZ}" "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}" "actor_rollout_ref.actor.use_kl_loss=${USE_KL_LOSS}" "actor_rollout_ref.actor.kl_loss_coef=${KL_LOSS_COEF:-0.0}" "actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}" "actor_rollout_ref.actor.policy_loss.loss_mode=${POLICY_LOSS_MODE}" "actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO_LOW}" "actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO_HIGH}" "actor_rollout_ref.actor.clip_ratio_c=${CLIP_RATIO_C}" "actor_rollout_ref.actor.loss_agg_mode=${LOSS_AGG_MODE}" "actor_rollout_ref.actor.engine.dtype=${DTYPE}" "actor_rollout_ref.actor.engine.model_name=${MLITE_MODEL_NAME}" "actor_rollout_ref.actor.engine.impl=${MLITE_IMPL}" "actor_rollout_ref.actor.engine.tp=${ACTOR_TP}" "actor_rollout_ref.actor.engine.pp=${ACTOR_PP}" "actor_rollout_ref.actor.engine.vpp=${MLITE_VPP_SIZE}" "actor_rollout_ref.actor.engine.cp=${ACTOR_CP}" "actor_rollout_ref.actor.engine.ep=${ACTOR_EP}" "actor_rollout_ref.actor.engine.etp=${ACTOR_ETP}" "actor_rollout_ref.actor.engine.param_offload=${PARAM_OFFLOAD}" "actor_rollout_ref.actor.engine.optimizer_offload=${OPTIMIZER_OFFLOAD}" "actor_rollout_ref.actor.engine.grad_offload=${GRAD_OFFLOAD}" "actor_rollout_ref.actor.engine.attention_backend_override=${ATTENTION_BACKEND}" "actor_rollout_ref.actor.engine.impl_cfg.use_thd=True" "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=${MLITE_IMPL_OPTIMIZER}" "actor_rollout_ref.actor.engine.load_hf_weights=${ENGINE_LOAD_HF_WEIGHTS:-True}" "+actor_rollout_ref.actor.engine.cross_entropy_fusion=True" "actor_rollout_ref.actor.engine.resync_format=block_fp8" "+actor_rollout_ref.actor.engine.resync_config.expert_dtype=fp8" "+actor_rollout_ref.actor.engine.impl_cfg.recompute=full" "+actor_rollout_ref.actor.engine.impl_cfg.mtp_enable=True" "+actor_rollout_ref.actor.engine.impl_cfg.mtp_enable_train=True" )
+if [[ -n "${DATA_LABEL_KEY:-}" || -n "${DATA_DEFAULT_SOURCE:-}" ]]; then
+  [[ -n "${DATA_LABEL_KEY:-}" && -n "${DATA_DEFAULT_SOURCE:-}" ]] || { echo "DATA_LABEL_KEY and DATA_DEFAULT_SOURCE must be set together" >&2; exit 2; }
+  DATA+=( "+data.label_key=${DATA_LABEL_KEY}" "+data.default_data_source=${DATA_DEFAULT_SOURCE}" )
+fi
+MODEL=( "actor_rollout_ref.model.path=${MODEL_PATH}" "actor_rollout_ref.model.trust_remote_code=True" "actor_rollout_ref.model.use_fused_kernels=True" "actor_rollout_ref.model.custom_chat_template='${DS4_CHAT_TEMPLATE}'" )
+ACTOR=( "actor@actor_rollout_ref.actor=mlite_actor" "actor_rollout_ref.actor.optim.lr=${ACTOR_LR}" "actor_rollout_ref.actor.optim.weight_decay=${WEIGHT_DECAY}" "actor_rollout_ref.actor.optim.betas=${BETAS}" "actor_rollout_ref.actor.optim.clip_grad=${CLIP_GRAD}" "actor_rollout_ref.actor.optim.lr_warmup_steps=${LR_WARMUP_STEPS}" "actor_rollout_ref.actor.optim.lr_warmup_init=0" "actor_rollout_ref.actor.optim.lr_decay_style=${LR_DECAY_STYLE}" "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}" "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU}" "actor_rollout_ref.actor.use_dynamic_bsz=${USE_DYNAMIC_BSZ}" "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}" "actor_rollout_ref.actor.use_kl_loss=${USE_KL_LOSS}" "actor_rollout_ref.actor.kl_loss_coef=${KL_LOSS_COEF:-0.0}" "actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}" "actor_rollout_ref.actor.policy_loss.loss_mode=${POLICY_LOSS_MODE}" "actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO_LOW}" "actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO_HIGH}" "actor_rollout_ref.actor.clip_ratio_c=${CLIP_RATIO_C}" "actor_rollout_ref.actor.loss_agg_mode=${LOSS_AGG_MODE}" "actor_rollout_ref.actor.engine.dtype=${DTYPE}" "actor_rollout_ref.actor.engine.model_name=${MLITE_MODEL_NAME}" "actor_rollout_ref.actor.engine.impl=${MLITE_IMPL}" "actor_rollout_ref.actor.engine.tp=${ACTOR_TP}" "actor_rollout_ref.actor.engine.pp=${ACTOR_PP}" "actor_rollout_ref.actor.engine.vpp=${MLITE_VPP_SIZE}" "actor_rollout_ref.actor.engine.cp=${ACTOR_CP}" "actor_rollout_ref.actor.engine.ep=${ACTOR_EP}" "actor_rollout_ref.actor.engine.etp=${ACTOR_ETP}" "actor_rollout_ref.actor.engine.param_offload=${PARAM_OFFLOAD}" "actor_rollout_ref.actor.engine.optimizer_offload=${OPTIMIZER_OFFLOAD}" "actor_rollout_ref.actor.engine.grad_offload=${GRAD_OFFLOAD}" "actor_rollout_ref.actor.engine.attention_backend_override=${ATTENTION_BACKEND}" "actor_rollout_ref.actor.engine.impl_cfg.use_thd=True" "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=${MLITE_IMPL_OPTIMIZER}" "actor_rollout_ref.actor.engine.load_hf_weights=${ENGINE_LOAD_HF_WEIGHTS:-True}" "+actor_rollout_ref.actor.engine.cross_entropy_fusion=True" "actor_rollout_ref.actor.engine.resync_format=block_fp8" "+actor_rollout_ref.actor.engine.resync_config.expert_dtype=${ROLLOUT_EXPERT_DTYPE}" "+actor_rollout_ref.actor.engine.impl_cfg.recompute=full" "+actor_rollout_ref.actor.engine.impl_cfg.mtp_enable=True" "+actor_rollout_ref.actor.engine.impl_cfg.mtp_enable_train=True" )
+ACTOR+=( "actor_rollout_ref.actor.engine.router_replay_mode=${ROUTER_REPLAY_MODE}" )
 if [[ "${OPTIMIZER_OFFLOAD}" =~ ^(True|true|1)$ ]]; then ACTOR+=( "+actor_rollout_ref.actor.optim.override_optimizer_config.offload_fraction=${OPTIMIZER_STATE_OFFLOAD_FRACTION}" "+actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=${USE_PRECISION_AWARE_OPTIMIZER}" "+actor_rollout_ref.actor.optim.override_optimizer_config.decoupled_weight_decay=${DECOUPLED_WEIGHT_DECAY}" ); fi
 if [[ "${USE_KL_LOSS}" =~ ^(True|true|1)$ || "${USE_KL_IN_REWARD}" =~ ^(True|true|1)$ ]]; then ACTOR+=("ref@actor_rollout_ref.ref=mlite_ref"); fi
-ROLLOUT=( "actor_rollout_ref.rollout.name=${INFER_BACKEND}" "actor_rollout_ref.rollout.mode=${ROLLOUT_MODE}" "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}" "actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION}" "actor_rollout_ref.rollout.n=${ROLLOUT_N}" "actor_rollout_ref.rollout.calculate_log_probs=True" "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${USE_DYNAMIC_BSZ}" "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU}" "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" "actor_rollout_ref.rollout.prompt_length=${MAX_PROMPT_LENGTH}" "actor_rollout_ref.rollout.response_length=${MAX_RESPONSE_LENGTH}" "actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN}" "actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}" "actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}" "actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE}" "actor_rollout_ref.rollout.top_p=${ROLLOUT_TOP_P}" "actor_rollout_ref.rollout.top_k=${ROLLOUT_TOP_K}" "actor_rollout_ref.rollout.val_kwargs.temperature=${VAL_TEMPERATURE}" "actor_rollout_ref.rollout.val_kwargs.top_p=${VAL_TOP_P}" "actor_rollout_ref.rollout.val_kwargs.do_sample=${VAL_DO_SAMPLE}" "actor_rollout_ref.rollout.val_kwargs.n=${VAL_N}" "actor_rollout_ref.rollout.free_cache_engine=True" "actor_rollout_ref.rollout.load_format=dummy" "+actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=True" "+actor_rollout_ref.rollout.engine_kwargs.vllm.worker_extension_cls=verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension" "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8" "+actor_rollout_ref.rollout.engine_kwargs.vllm.moe_backend=flashinfer_cutlass" "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.expert_dtype=fp8" "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.activation_scheme=dynamic" "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.fmt=e4m3" "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.quant_method=fp8" "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.scale_fmt=float32" "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.weight_block_size=[128,128]" )
+ROLLOUT=( "actor_rollout_ref.rollout.name=${INFER_BACKEND}" "actor_rollout_ref.rollout.mode=${ROLLOUT_MODE}" "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}" "actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION}" "actor_rollout_ref.rollout.n=${ROLLOUT_N}" "actor_rollout_ref.rollout.calculate_log_probs=True" "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${USE_DYNAMIC_BSZ}" "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU}" "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" "actor_rollout_ref.rollout.prompt_length=${MAX_PROMPT_LENGTH}" "actor_rollout_ref.rollout.response_length=${MAX_RESPONSE_LENGTH}" "actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN}" "actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}" "actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}" "actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE}" "actor_rollout_ref.rollout.top_p=${ROLLOUT_TOP_P}" "actor_rollout_ref.rollout.top_k=${ROLLOUT_TOP_K}" "actor_rollout_ref.rollout.val_kwargs.temperature=${VAL_TEMPERATURE}" "actor_rollout_ref.rollout.val_kwargs.top_p=${VAL_TOP_P}" "actor_rollout_ref.rollout.val_kwargs.do_sample=${VAL_DO_SAMPLE}" "actor_rollout_ref.rollout.val_kwargs.n=${VAL_N}" "actor_rollout_ref.rollout.free_cache_engine=True" "actor_rollout_ref.rollout.load_format=dummy" "+actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=True" "+actor_rollout_ref.rollout.engine_kwargs.vllm.worker_extension_cls=verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension" "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8" "+actor_rollout_ref.rollout.engine_kwargs.vllm.moe_backend=flashinfer_cutlass" "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.expert_dtype=${ROLLOUT_EXPERT_DTYPE}" "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.activation_scheme=dynamic" "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.fmt=e4m3" "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.quant_method=fp8" "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.scale_fmt=ue8m0" "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides.quantization_config.weight_block_size=[128,128]" )
 TRAINER=( "critic.enable=False" "trainer.balance_batch=True" "trainer.logger=${LOGGER}" "trainer.project_name=${PROJECT_NAME}" "trainer.experiment_name=${RUN_NAME}" "trainer.n_gpus_per_node=${NGPUS_PER_NODE}" "trainer.nnodes=${NNODES}" "trainer.save_freq=${SAVE_FREQ}" "trainer.test_freq=${TEST_FREQ}" "trainer.total_epochs=${TOTAL_EPOCHS}" "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}" "trainer.resume_mode=${RESUME_MODE}" "trainer.resume_from_path=${RESUME_FROM_PATH}" "trainer.default_local_dir=${CKPT_DIR}" "trainer.val_before_train=False" "trainer.log_val_generations=${LOG_VAL_GENERATIONS}" )
 REWARD=( "+reward.reward_kwargs.overlong_buffer_cfg.enable=True" "+reward.reward_kwargs.overlong_buffer_cfg.len=${OVERLONG_BUFFER_LEN}" "+reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${OVERLONG_PENALTY_FACTOR}" "+reward.reward_kwargs.overlong_buffer_cfg.log=False" )
+ROLLOUT+=( "actor_rollout_ref.rollout.enable_rollout_routing_replay=${ENABLE_ROLLOUT_ROUTING_REPLAY}" )
+ROLLOUT+=( "actor_rollout_ref.rollout.enforce_eager=${ROLLOUT_ENFORCE_EAGER}" )
 
 COMMAND=( python3 -m verl.trainer.main_ppo "hydra.searchpath=[pkg://verl_mlite.config]" "${ALGORITHM[@]}" "${DATA[@]}" "${MODEL[@]}" "${ACTOR[@]}" "${ROLLOUT[@]}" "${TRAINER[@]}" "${REWARD[@]}" "$@" )
 printf '%q ' "${COMMAND[@]}" > "${CMD_FILE}"; printf '\n' >> "${CMD_FILE}"
 if [[ "${DRY_RUN:-0}" == "1" ]]; then printf '%q ' "${COMMAND[@]}"; printf '\n'; exit 0; fi
-echo "[ds4-dapo] self-contained; train=${TRAIN_FILES} val=${VAL_FILES} cmd=${CMD_FILE}"
+
+export DS4_EXPECTED_VERL_COMMIT="${DS4_EXPECTED_VERL_COMMIT:-6a937b63}"
+python3 - <<'PY'
+from __future__ import annotations
+
+import importlib.metadata as metadata
+import inspect
+import os
+import subprocess
+import sys
+
+from packaging.version import Version
+
+
+def installed(name: str) -> str:
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError as exc:
+        raise SystemExit(f"DS4 dependency is missing: {name}") from exc
+
+
+exact = {
+    "vllm": "0.25.1",
+    "flashinfer-python": "0.6.13",
+    "nvidia-cutlass-dsl": "4.5.2",
+    "tilelang": "0.1.9",
+}
+minimum = {
+    "transformer-engine": "2.15.0",
+    "nvidia-cudnn-frontend": "1.27.0",
+}
+actual = {name: installed(name) for name in exact | minimum}
+bad_exact = {name: (actual[name], wanted) for name, wanted in exact.items() if Version(actual[name]) != Version(wanted)}
+bad_minimum = {
+    name: (actual[name], wanted)
+    for name, wanted in minimum.items()
+    if Version(actual[name]) < Version(wanted)
+}
+if bad_exact or bad_minimum:
+    raise SystemExit(
+        f"DS4 dependency contract mismatch: exact={bad_exact} minimum={bad_minimum}"
+    )
+if sys.version_info[:2] != (3, 12):
+    raise SystemExit(f"DS4 requires Python 3.12, got {sys.version}")
+
+import cudnn
+import torch
+import transformer_engine.pytorch as te
+from cudnn import DSA
+
+if not torch.__version__.startswith("2.12.0a0") or torch.version.cuda != "13.2":
+    raise SystemExit(
+        f"DS4 hero requires PyTorch 2.12 nv26.05 / CUDA 13.2, "
+        f"got torch={torch.__version__} cuda={torch.version.cuda}"
+    )
+if "q_causal_offsets" not in inspect.signature(DSA.indexer_forward_wrapper).parameters:
+    raise SystemExit(
+        "nvidia-cudnn-frontend lacks q_causal_offsets required by fused DSA CP"
+    )
+
+expected_verl = os.environ["DS4_EXPECTED_VERL_COMMIT"]
+declared_verl = os.environ.get("VERL_COMMIT")
+verl_root = os.environ.get("VERL_ROOT")
+if declared_verl is None and verl_root:
+    try:
+        declared_verl = subprocess.check_output(
+            ["git", "-C", verl_root, "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+if declared_verl is None:
+    raise SystemExit(
+        "VERL provenance is not verifiable; set VERL_COMMIT=6a937b63 "
+        "for the validated old-logprob snapshot"
+    )
+if not declared_verl.startswith(expected_verl):
+    raise SystemExit(
+        f"DS4 requires VERL {expected_verl}, got declared/git commit {declared_verl}"
+    )
+
+print(
+    "DS4_DEPENDENCY_CONTRACT_PASSED "
+    f"verl={declared_verl} python={sys.version.split()[0]} "
+    f"torch={torch.__version__} torch_cuda={torch.version.cuda} "
+    f"vllm={actual['vllm']} te={actual['transformer-engine']} "
+    f"cudnn_frontend={actual['nvidia-cudnn-frontend']} "
+    f"flashinfer={actual['flashinfer-python']} "
+    f"cutlass={actual['nvidia-cutlass-dsl']} tilelang={actual['tilelang']} "
+    f"te_origin={te.__file__} cudnn_origin={cudnn.__file__}",
+    flush=True,
+)
+PY
+echo "[ds4-dapo] weights=expert-w${ROLLOUT_WEIGHT_BITS}/dense-w8 r3=${ENABLE_R3} train=${TRAIN_FILES} val=${VAL_FILES} cmd=${CMD_FILE}"
 set +e; "${COMMAND[@]}" 2>&1 | tee "${LOG_FILE}"; cmd_rc="${PIPESTATUS[0]}"; set -e
 exit "${cmd_rc}"

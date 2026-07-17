@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import importlib.abc
 import importlib.machinery
 import importlib.util
@@ -681,7 +682,6 @@ def _patch_verl_dsv4_prepare_recreates_dense() -> bool:
 
     @wraps(original)
     def prepare_quanted_weights_for_loading(model_runner, *args, **kwargs):
-        state = original(model_runner, *args, **kwargs)
         try:
             from verl.utils.vllm.vllm_dsv4_fp8_utils import is_deepseek_v4_model
             from vllm.config import set_current_vllm_config
@@ -702,33 +702,212 @@ def _patch_verl_dsv4_prepare_recreates_dense() -> bool:
             sys.stderr.write(f"VERL_MLITE_DENSE_RECREATE error: {exc!r}\n")
             sys.stderr.flush()
             raise
-        return state
+        # Ordering is part of the online-reload contract.  verl's DS4 prepare
+        # step wraps the *current* parameters and attaches loaders which accept
+        # already-local TP shards from IPC.  Recreating after that step replaces
+        # those wrapped parameters and silently restores the cold-load loader,
+        # which slices the local shard by TP a second time.  Reset first, then
+        # let verl attach its online loaders to the fresh checkpoint layout.
+        return original(model_runner, *args, **kwargs)
 
     prepare_quanted_weights_for_loading._verl_mlite_dense_recreate = True
     mod.prepare_quanted_weights_for_loading = prepare_quanted_weights_for_loading
     return True
 
 
+def _patch_verl_dsv4_fp8_prepare_state() -> bool:
+    """Keep pure-FP8 DS4 reload preparation outside the per-bucket loop.
+
+    VERL uses the truthiness of ``prepare_quanted_weights_for_loading`` to tell
+    ``_update_weights`` that preparation already ran once before IPC receive.
+    The DS4 helper returns only whether MXFP4/MegaMoE parameters were restored,
+    so a pure-FP8 model incorrectly returns ``False``. Each bucket then repeats
+    prepare/process and recreates dense parameters underneath earlier loads.
+    """
+    if not _vllm_importable():
+        return False
+    try:
+        fp8_utils = importlib.import_module("verl.utils.vllm.vllm_fp8_utils")
+    except Exception:
+        return False
+    original = getattr(fp8_utils, "prepare_quanted_weights_for_loading", None)
+    if original is None or getattr(original, "_verl_mlite_ds4_fp8_state", False):
+        return original is not None
+
+    @wraps(original)
+    def prepare_quanted_weights_for_loading(model_runner, *args, **kwargs):
+        state = original(model_runner, *args, **kwargs)
+        if state:
+            return state
+
+        model = model_runner.model
+        from verl.utils.vllm.vllm_dsv4_fp8_utils import is_deepseek_v4_model
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+        from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+
+        pure_fp8 = is_deepseek_v4_model(model) and any(
+            isinstance(module, RoutedExperts)
+            and isinstance(getattr(module, "quant_method", None), Fp8MoEMethod)
+            for module in model.modules()
+        )
+        if pure_fp8:
+            sys.stderr.write(
+                "VERL_MLITE_FP8_PREPARE_STATE promoted DS4 pure-FP8 reload "
+                "state to one-shot lifecycle\n"
+            )
+            sys.stderr.flush()
+            return True
+        return state
+
+    prepare_quanted_weights_for_loading._verl_mlite_ds4_fp8_state = True
+    fp8_utils.prepare_quanted_weights_for_loading = prepare_quanted_weights_for_loading
+    return True
+
+
+_DSV4_LAYERWISE_RELOAD_STATE = object()
+
+
+def _patch_verl_dsv4_native_layerwise_reload() -> bool:
+    """Use vLLM's native layerwise reload lifecycle for DS4 FP8 resync.
+
+    vLLM records checkpoint-layout metadata during model construction.  Its
+    layerwise reload API restores that layout, buffers complete logical layers,
+    runs each quant method's native finalizer exactly once, then copies results
+    back into the original kernel storage (preserving cudagraph references).
+    This is the supported reset/load/process contract; it replaces verl's DS4
+    boolean prepare state and our former dense recreation bridge.
+    """
+    if not _vllm_importable():
+        return False
+    try:
+        fp8_utils = importlib.import_module("verl.utils.vllm.vllm_fp8_utils")
+        dsv4_utils = importlib.import_module("verl.utils.vllm.vllm_dsv4_fp8_utils")
+        rollout_utils = importlib.import_module(
+            "verl.workers.rollout.vllm_rollout.utils"
+        )
+    except Exception:
+        return False
+    original_prepare = getattr(fp8_utils, "prepare_quanted_weights_for_loading", None)
+    original_process = getattr(fp8_utils, "process_quanted_weights_after_loading", None)
+    original_load = getattr(fp8_utils, "load_quanted_weights", None)
+    if original_prepare is None or original_process is None or original_load is None:
+        return False
+    if getattr(original_prepare, "_verl_mlite_ds4_layerwise", False):
+        return True
+
+    @wraps(original_prepare)
+    def prepare_quanted_weights_for_loading(model_runner, *args, **kwargs):
+        model = model_runner.model
+        if not dsv4_utils.is_deepseek_v4_model(model):
+            return original_prepare(model_runner, *args, **kwargs)
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
+        from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
+
+        # These DS4 buffers already live in kernel/runtime layout and are
+        # updated directly by VERL's buffer path (or restored below).  Keeping
+        # them out of the meta restore prevents ``copy_`` into a meta buffer
+        # from silently discarding router state between IPC buckets.
+        SKIP_TENSORS.update(
+            {"tid2eid", "expert_bias", "e_score_correction_bias", "attn_sink"}
+        )
+        with set_current_vllm_config(model_runner.vllm_config):
+            initialize_layerwise_reload(model)
+        model._verl_mlite_ds4_layerwise_reload_active = True
+        sys.stderr.write(
+            "VERL_MLITE_DSV4_LAYERWISE_RELOAD initialized native vLLM reload\n"
+        )
+        sys.stderr.flush()
+        return _DSV4_LAYERWISE_RELOAD_STATE
+
+    @wraps(original_process)
+    def process_quanted_weights_after_loading(model_runner, reload_state):
+        if reload_state is not _DSV4_LAYERWISE_RELOAD_STATE:
+            return original_process(model_runner, reload_state)
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
+
+        try:
+            with set_current_vllm_config(model_runner.vllm_config):
+                finalize_layerwise_processing(
+                    model_runner.model,
+                    model_runner.vllm_config.model_config,
+                )
+        finally:
+            model_runner.model._verl_mlite_ds4_layerwise_reload_active = False
+        restored_sinks = _restore_dsv4_attn_sink_padding(model_runner.model)
+        # ``load_quanted_weights`` clones IPC bucket views because vLLM's
+        # layerwise loader may retain them until a complete logical layer is
+        # available.  ``finalize_layerwise_processing`` drops those references,
+        # but PyTorch's caching allocator otherwise keeps the temporary device
+        # storage mapped.  In colocated sleep mode that storage competes with
+        # vLLM's cuMem weight mappings on the next wake-up and can OOM even
+        # though no live tensor owns it (observed on every rank of a 128-GPU
+        # DS4 run).  Release the now-dead staging blocks at the lifecycle
+        # boundary; doing this per IPC bucket would be both too early and slow.
+        gc.collect()
+        import torch
+
+        torch.cuda.empty_cache()
+        records = getattr(model_runner.model, "_verl_mlite_weight_fingerprint", None)
+        if records is not None:
+            from megatron.lite.primitive.ckpt.weight_sync_fingerprint import (
+                report_stream_fingerprint,
+            )
+
+            report_stream_fingerprint("receiver", 0, records)
+            del model_runner.model._verl_mlite_weight_fingerprint
+        sys.stderr.write(
+            "VERL_MLITE_DSV4_LAYERWISE_RELOAD finalized native vLLM reload "
+            f"attention_sinks_restored={restored_sinks}\n"
+        )
+        sys.stderr.flush()
+
+    @wraps(original_load)
+    def load_quanted_weights(weights, model_runner, *args, **kwargs):
+        model = model_runner.model
+        if getattr(model, "_verl_mlite_ds4_layerwise_reload_active", False):
+            weights = list(weights)
+            from megatron.lite.primitive.ckpt.weight_sync_fingerprint import (
+                tensor_fingerprint_record,
+                weight_sync_fingerprint_enabled,
+            )
+
+            if weight_sync_fingerprint_enabled():
+                records = getattr(model, "_verl_mlite_weight_fingerprint", None)
+                if records is None:
+                    records = []
+                    model._verl_mlite_weight_fingerprint = records
+                records.extend(
+                    tensor_fingerprint_record(name, tensor) for name, tensor in weights
+                )
+            # Layerwise reload may retain loader arguments across multiple IPC
+            # callbacks.  The receiver reuses its communication buffer after
+            # each callback, so persist every tensor until its logical layer is
+            # finalized instead of retaining a view into overwritten storage.
+            weights = [(name, tensor.clone()) for name, tensor in weights]
+        return original_load(weights, model_runner, *args, **kwargs)
+
+    prepare_quanted_weights_for_loading._verl_mlite_ds4_layerwise = True
+    process_quanted_weights_after_loading._verl_mlite_ds4_layerwise = True
+    load_quanted_weights._verl_mlite_ds4_layerwise = True
+    fp8_utils.prepare_quanted_weights_for_loading = prepare_quanted_weights_for_loading
+    fp8_utils.process_quanted_weights_after_loading = process_quanted_weights_after_loading
+    fp8_utils.load_quanted_weights = load_quanted_weights
+    # ``utils.py`` imports this function at module import time, so replacing the
+    # defining module alone would leave the live rollout callback on the stale
+    # binding and defeat cross-bucket tensor persistence.
+    rollout_utils.load_quanted_weights = load_quanted_weights
+    return True
+
+
 def _patch_verl_dsv4_fp8_process_weights() -> bool:
-    """Run ``process_weights_after_loading`` for FP8 MoE experts after RL resync.
+    """Restore the proven pre-dense-bridge DS4 post-reload behavior.
 
-    verl #6473's DS4 post-load hook chain
-    (``update_weights_from_ipc`` -> ``process_quanted_weights_after_loading`` ->
-    ``process_deepseek_v4_weights_after_loading`` -> ``_process_moe_weights_after_loading``)
-    only shuffles MEGA-MoE and MXFP4 experts into the kernel runtime format, and
-    the whole chain is gated by ``quant_reload_state`` (the return of
-    ``_restore_moe_params_for_loading``). For a forced ``expert_dtype=fp8`` model
-    the routed experts use ``Fp8MoEMethod`` (block quant): there is no branch for
-    it, and ``_restore_moe_params_for_loading`` returns ``False`` (pure FP8), so
-    ``quant_reload_state`` is falsy and the entire post-load step is skipped. The
-    freshly-resynced FP8 expert weights then stay in checkpoint layout and never
-    get shuffled into the kernel runtime format (``Fp8MoEMethod._setup_kernel``),
-    so inference is silently wrong even though the load did not crash.
-
-    Wrap the ungated top-level ``vLLMColocateWorkerExtension.update_weights_from_ipc``
-    so that, after every resync completes, we call
-    ``module.quant_method.process_weights_after_loading(module)`` on each
-    ``Fp8MoEMethod`` MoE module. verl source is untouched; our side only.
+    Pure-FP8 routed experts still need their native MoE finalize once after the
+    bucket stream, and attention sink padding must be restored.  Dense FP8
+    linears are intentionally *not* reset or re-finalized here: vLLM preserves
+    their RL reload loaders and an extra dense finalize is not idempotent.
     """
     if not _vllm_importable():
         return False
@@ -746,89 +925,34 @@ def _patch_verl_dsv4_fp8_process_weights() -> bool:
     @wraps(original)
     def update_weights_from_ipc(self, *args, **kwargs):
         result = original(self, *args, **kwargs)
-        try:
-            model = self.model_runner.model
-            # DS4-ONLY scope lock. ``update_weights_from_ipc`` is the shared
-            # colocated resync entry (qwen/glm/kimi/... all reach it), so the
-            # post-process below is fenced behind three guards; any non-DS4
-            # model fails ``is_deepseek_v4_model`` and returns immediately,
-            # completely untouched.
-            from verl.utils.vllm.vllm_dsv4_fp8_utils import is_deepseek_v4_model
+        model = self.model_runner.model
+        from verl.utils.vllm.vllm_dsv4_fp8_utils import is_deepseek_v4_model
 
-            if not is_deepseek_v4_model(model):
-                return result
-            restored_sinks = _restore_dsv4_attn_sink_padding(model)
-            if restored_sinks:
-                sys.stderr.write(
-                    "VERL_MLITE_ATTN_SINK_PADDING "
-                    f"restored -inf padding on {restored_sinks} DS4 attention module(s)\n"
-                )
-                sys.stderr.flush()
-            from vllm.model_executor.layers.fused_moe.routed_experts import (
-                RoutedExperts,
+        if not is_deepseek_v4_model(model):
+            return result
+        restored_sinks = _restore_dsv4_attn_sink_padding(model)
+        if restored_sinks:
+            sys.stderr.write(
+                "VERL_MLITE_ATTN_SINK_PADDING "
+                f"restored -inf padding on {restored_sinks} DS4 attention module(s)\n"
             )
-            from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+            sys.stderr.flush()
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+        from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
 
-            processed = 0
-            for mod in model.modules():
-                if isinstance(mod, RoutedExperts) and isinstance(
-                    getattr(mod, "quant_method", None), Fp8MoEMethod
-                ):
-                    mod.quant_method.process_weights_after_loading(mod)
-                    processed += 1
-            # FIX(bitwise): cold-load runs Fp8LinearMethod.process_weights_after_loading
-            # (deepgemm ue8m0 requant) on EVERY dense fp8 linear; the DS4 resync chain
-            # only processed MoE, leaving attn/indexer dense Fp8Linear weights in
-            # checkpoint layout (verified: weight+scale sha differ, indexer.wq_b value
-            # drift up to 4.5% -> sparse-index selects wrong KV -> decode divergence).
-            # Re-run native process on dense fp8 linears so resync == cold bitwise.
-            from vllm.model_executor.layers.linear import LinearBase
-            from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
-            import traceback as _tb
-            dense_processed = 0
-            dense_skipped = 0
-            _first_err = None
-            for _dn, mod in model.named_modules():
-                if isinstance(mod, LinearBase) and isinstance(
-                    getattr(mod, "quant_method", None), Fp8LinearMethod
-                ):
-                    try:
-                        mod.quant_method.process_weights_after_loading(mod)
-                        dense_processed += 1
-                    except Exception as _de:
-                        dense_skipped += 1
-                        if _first_err is None:
-                            _first_err = (_dn, repr(_de), _tb.format_exc())
-            if dense_skipped and _first_err is not None:
-                sys.stderr.write(
-                    f"VERL_MLITE_FP8_PROCESS_DENSE_SKIP {dense_skipped} module(s) skipped; "
-                    f"first={_first_err[0]} err={_first_err[1]}\n{_first_err[2]}\n"
-                )
-                sys.stderr.flush()
-            if dense_processed:
-                sys.stderr.write(
-                    "VERL_MLITE_FP8_PROCESS_DENSE "
-                    f"ran process_weights_after_loading on {dense_processed} "
-                    "DS4 dense Fp8LinearMethod module(s) after resync\n"
-                )
-                sys.stderr.flush()
-            import os as _os2
-            if _os2.environ.get("MLITE_DBG_BIAS")=="1":
-                for _mn, _mm in model.named_modules():
-                    _eb=getattr(_mm,"e_score_correction_bias",None)
-                    if _eb is not None:
-                        try: sys.stderr.write(f"MLITE_DBG_VLLM_BIAS {_mn}.e_score_correction_bias absmax={float(_eb.abs().max()):.4f} nz={float((_eb!=0).float().mean()):.3f}\n")
-                        except Exception as _e: sys.stderr.write(f"MLITE_DBG_VLLM_BIAS {_mn} err {_e}\n")
-                sys.stderr.flush()
-            if processed:
-                sys.stderr.write(
-                    "VERL_MLITE_FP8_PROCESS "
-                    f"ran process_weights_after_loading on {processed} "
-                    "DS4 RoutedExperts+Fp8MoEMethod module(s) after resync\n"
-                )
-                sys.stderr.flush()
-        except Exception as exc:  # never break the resync on a post-process error
-            sys.stderr.write(f"VERL_MLITE_FP8_PROCESS error: {exc!r}\n")
+        processed = 0
+        for module in model.modules():
+            if isinstance(module, RoutedExperts) and isinstance(
+                getattr(module, "quant_method", None), Fp8MoEMethod
+            ):
+                module.quant_method.process_weights_after_loading(module)
+                processed += 1
+        if processed:
+            sys.stderr.write(
+                "VERL_MLITE_FP8_PROCESS "
+                f"ran process_weights_after_loading on {processed} "
+                "DS4 RoutedExperts+Fp8MoEMethod module(s) after resync\n"
+            )
             sys.stderr.flush()
         return result
 
@@ -1056,6 +1180,15 @@ def _weight_sync_probe_enabled() -> bool:
     }
 
 
+def _weight_sync_fingerprint_enabled() -> bool:
+    return os.getenv("MLITE_WEIGHT_SYNC_FINGERPRINT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _instrument_bucketed_weight_sender(sender_cls: type) -> bool:
     """Patch veRL's sender only while the opt-in sync probe is enabled."""
     if getattr(sender_cls, "_mlite_weight_sync_probe_patch", False):
@@ -1111,6 +1244,20 @@ def _instrument_bucketed_weight_sender(sender_cls: type) -> bool:
 
     async def profiled_async_send_weights(self, weights):
         backend = os.getenv("MLITE_WEIGHT_SYNC_PROBE_BACKEND", "unknown")
+        from megatron.lite.primitive.ckpt.weight_sync_fingerprint import (
+            report_stream_fingerprint,
+            tensor_fingerprint_record,
+            weight_sync_fingerprint_enabled,
+        )
+
+        fingerprint_records = []
+
+        def fingerprinted_weights():
+            for name, tensor in weights:
+                if weight_sync_fingerprint_enabled():
+                    fingerprint_records.append(tensor_fingerprint_record(name, tensor))
+                yield name, tensor
+
         original_all_gather_into_tensor = dist.all_gather_into_tensor
 
         def profiled_all_gather_into_tensor(output, tensor, *args, **kwargs):
@@ -1120,7 +1267,11 @@ def _instrument_bucketed_weight_sender(sender_cls: type) -> bool:
         with weight_sync_probe_session(backend), _H2DCopyMode():
             dist.all_gather_into_tensor = profiled_all_gather_into_tensor
             try:
-                return await original_async_send_weights(self, weights)
+                result = await original_async_send_weights(self, fingerprinted_weights())
+                if weight_sync_fingerprint_enabled():
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                    report_stream_fingerprint("sender", rank, fingerprint_records)
+                return result
             finally:
                 dist.all_gather_into_tensor = original_all_gather_into_tensor
 
@@ -1141,7 +1292,7 @@ class _SenderPatchLoader(importlib.abc.Loader):
     def exec_module(self, module) -> None:
         self._loader.exec_module(module)
         _install_bucketed_sender_prefetch(module.BucketedWeightSender)
-        if _weight_sync_probe_enabled():
+        if _weight_sync_probe_enabled() or _weight_sync_fingerprint_enabled():
             _instrument_bucketed_weight_sender(module.BucketedWeightSender)
 
 
@@ -1173,7 +1324,7 @@ def _patch_bucketed_weight_transfer() -> bool:
 def _patch_bucketed_weight_sender() -> bool:
     """Install production prefetch plus optional probe instrumentation."""
     changed = _patch_bucketed_weight_transfer()
-    if not _weight_sync_probe_enabled():
+    if not (_weight_sync_probe_enabled() or _weight_sync_fingerprint_enabled()):
         return changed
 
     module = sys.modules.get(_BUCKETED_SENDER_MODULE)
@@ -1215,10 +1366,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08.bucketed_weight_sender", result)
     result = _patch_verl_dsv4_mxfp4_check()
     _trace_runtime_patch("08b.verl_dsv4_mxfp4_check", result)
-    result = _patch_verl_dsv4_prepare_recreates_dense()
-    _trace_runtime_patch("08c.verl_dsv4_prepare_recreates_dense", result)
-    result = _patch_verl_dsv4_fp8_process_weights()
-    _trace_runtime_patch("08c.verl_dsv4_fp8_process_weights", result)
+    result = _patch_verl_dsv4_native_layerwise_reload()
+    _trace_runtime_patch("08c.verl_dsv4_native_layerwise_reload", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
     _trace_runtime_patch("10.end")

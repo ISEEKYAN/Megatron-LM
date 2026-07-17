@@ -34,8 +34,14 @@ def _install_fake_reload_modules(monkeypatch, original):
 
 
 def test_dense_recreate_runs_under_model_runner_vllm_config(monkeypatch) -> None:
+    original_calls = []
+
+    def original(model_runner):
+        original_calls.append(("prepare", model_runner.model))
+        return "state"
+
     fp8_utils, events = _install_fake_reload_modules(
-        monkeypatch, lambda model_runner: "state"
+        monkeypatch, original
     )
     monkeypatch.setattr(
         compat,
@@ -51,6 +57,27 @@ def test_dense_recreate_runs_under_model_runner_vllm_config(monkeypatch) -> None
         ("recreate", runner.model),
         ("exit", runner.vllm_config),
     ]
+    assert original_calls == [("prepare", runner.model)]
+
+
+def test_dense_recreate_precedes_verl_online_loader_attachment(monkeypatch) -> None:
+    order = []
+
+    def original(model_runner):
+        order.append("attach-online-loaders")
+        return True
+
+    fp8_utils, _ = _install_fake_reload_modules(monkeypatch, original)
+    monkeypatch.setattr(
+        compat,
+        "_recreate_dense_fp8_linear_params",
+        lambda model: order.append("recreate") or 1,
+    )
+
+    assert compat._patch_verl_dsv4_prepare_recreates_dense()
+    runner = SimpleNamespace(model=object(), vllm_config=object())
+    assert fp8_utils.prepare_quanted_weights_for_loading(runner) is True
+    assert order == ["recreate", "attach-online-loaders"]
 
 
 def test_dense_recreate_failure_is_not_silently_ignored(monkeypatch) -> None:
