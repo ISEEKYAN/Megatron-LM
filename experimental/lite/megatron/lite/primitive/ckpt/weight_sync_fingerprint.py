@@ -34,11 +34,22 @@ def _sample_payload(name: str, tensor: torch.Tensor) -> tuple[bool, bytes]:
     if count == raw.numel():
         sample = raw
     else:
-        indices = torch.linspace(
-            0, raw.numel() - 1, count, dtype=torch.int64, device=raw.device
-        )
+        # ``torch.linspace(..., dtype=int64)`` computes through floating point
+        # on CUDA.  For multi-billion-byte expert tensors its rounded endpoint
+        # can become ``numel`` and trip ScatterGatherKernel's bounds assert.
+        # Integer arithmetic keeps every index in [0, numel - 1].
+        indices = _sample_indices(raw.numel(), count, device=raw.device)
         sample = raw.index_select(0, indices)
     return sampled, bytes(sample.cpu().tolist())
+
+
+def _sample_indices(numel: int, count: int, *, device=None) -> torch.Tensor:
+    if not 1 <= count <= numel:
+        raise ValueError(f"expected 1 <= count <= numel, got count={count}, numel={numel}")
+    if count == 1:
+        return torch.zeros(1, dtype=torch.int64, device=device)
+    positions = torch.arange(count, dtype=torch.int64, device=device)
+    return positions.mul_(numel - 1).floor_divide_(count - 1)
 
 
 def tensor_fingerprint_record(name: str, tensor: torch.Tensor) -> dict[str, object]:
