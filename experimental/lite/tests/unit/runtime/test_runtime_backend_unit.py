@@ -454,6 +454,29 @@ def test_native_model_move_helpers_do_not_require_megatron_core(monkeypatch):
     assert model.calls == ["cpu", "cuda"]
 
 
+def test_native_model_offload_reshards_fsdp2_before_cpu_move(monkeypatch):
+    import megatron.lite.runtime.megatron_utils as megatron_utils
+
+    model = _FakeNativeModel()
+    events = []
+
+    monkeypatch.setattr(
+        megatron_utils,
+        "_reshard_fsdp2_modules",
+        lambda model_chunk: events.append(("reshard", model_chunk)),
+    )
+    original_to = model.to
+
+    def tracked_to(device):
+        events.append(("to", device))
+        return original_to(device)
+
+    model.to = tracked_to
+    megatron_utils.offload_model_to_cpu([model])
+
+    assert events == [("reshard", model), ("to", "cpu")]
+
+
 def test_model_handle_dp_defaults():
     handle = ModelHandle(model=MagicMock())
 

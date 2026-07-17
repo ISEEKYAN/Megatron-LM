@@ -13,10 +13,12 @@ from megatron.lite.primitive.optimizers.fsdp2 import (
     FSDP2Config,
     build_fsdp2_adamw,
     build_fsdp2_device_mesh,
+    build_fsdp2_training_optimizer,
     fsdp2_available,
     wrap_fsdp2,
 )
 from megatron.lite.primitive.optimizers.fsdp2.adamw import iter_torch_optimizers, to_local_tensor
+from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
@@ -41,6 +43,37 @@ class TinyModel(nn.Module):
 
     def forward(self, x):
         return self.out(self.unit1(self.unit0(x)))
+
+
+class TinyExpertBank(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.up = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.down = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, x):
+        return self.down(torch.nn.functional.gelu(self.up(x)))
+
+
+class TinyMoEUnit(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.dense = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.experts = TinyExpertBank(hidden_size)
+
+    def forward(self, x):
+        return x + self.experts(self.dense(x))
+
+
+class TinyPipelineMoEModel(nn.Module):
+    def __init__(self, hidden_size: int = 64, num_units: int = 3):
+        super().__init__()
+        self.units = nn.ModuleList(TinyMoEUnit(hidden_size) for _ in range(num_units))
+
+    def forward(self, x):
+        for unit in self.units:
+            x = unit(x)
+        return x
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -159,3 +192,97 @@ def test_fsdp2_offload_fraction_keeps_optimizer_update_state_on_cpu_single_gpu()
     assert torch.isfinite(torch.tensor(grad_norm))
     assert _local_param_devices(model) == {"cuda"}
     assert _optimizer_state_devices(optimizer) == {"cpu"}
+
+
+@pytest.mark.gpu
+@pytest.mark.distributed
+def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
+    if dist.get_world_size() != 8:
+        pytest.skip("PP2+CP2+EP2/EDP2 coverage requires torchrun with exactly 8 ranks.")
+
+    ps = init_parallel(SimpleNamespace(tp=1, pp=2, cp=2, ep=2, etp=1, vpp=1))
+    assert ps.dp_cp_size == 4
+    assert ps.expert_dp_size == 2
+
+    torch.manual_seed(1234)
+    model = TinyPipelineMoEModel().cuda().to(dtype=torch.bfloat16)
+    expert_global_numels = {
+        name: param.numel()
+        for name, param in model.named_parameters()
+        if ".experts." in name
+    }
+    optimizer = build_fsdp2_training_optimizer(
+        [model],
+        SimpleNamespace(
+            optimizer="adam",
+            lr=1.0e-3,
+            weight_decay=0.0,
+            adam_beta1=0.9,
+            adam_beta2=0.95,
+            adam_eps=1.0e-8,
+            clip_grad=1.0,
+            offload_fraction=1.0,
+        ),
+        ps,
+        unit_modules=(TinyMoEUnit,),
+        leaf_module_names=(),
+        expert_classifier=lambda name: ".experts." in f".{name}",
+        reshard_after_forward=True,
+        forward_prefetch_depth=1,
+        backward_prefetch_depth=0,
+        use_fp32_shards=False,
+        use_fp32_master=True,
+    )
+
+    def assert_experts_are_local_shards(device: str) -> None:
+        named_params = dict(model.named_parameters())
+        for name, global_numel in expert_global_numels.items():
+            local = to_local_tensor(named_params[name].detach())
+            assert local.device.type == device
+            assert local.numel() == global_numel // ps.expert_dp_size
+
+    def assert_grad_devices(device: str) -> None:
+        grads = [param.grad for param in model.parameters()]
+        assert all(grad is not None for grad in grads)
+        assert {to_local_tensor(grad).device.type for grad in grads if grad is not None} == {
+            device
+        }
+
+    expert_forward_shard_checks = []
+
+    def check_expert_shard_after_forward(_module, _inputs, _output) -> None:
+        assert_experts_are_local_shards("cuda")
+        expert_forward_shard_checks.append(True)
+
+    hooks = [
+        unit.experts.register_forward_hook(check_expert_shard_after_forward)
+        for unit in model.units
+    ]
+
+    def train_backward(seed: int) -> None:
+        torch.manual_seed(seed)
+        x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
+        optimizer.zero_grad()
+        model(x).float().square().mean().backward()
+        torch.cuda.synchronize()
+        assert_experts_are_local_shards("cuda")
+        assert_grad_devices("cuda")
+
+    assert_experts_are_local_shards("cuda")
+    train_backward(4321)
+
+    handle = ModelHandle(
+        model=model, optimizer=optimizer, parallel_state=ps, _extras={"model_chunks": [model]}
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime.to(handle, "cpu", model=True, optimizer=True, grad=True)
+    assert_experts_are_local_shards("cpu")
+    assert_grad_devices("cpu")
+
+    runtime.to(handle, "cuda", model=True, optimizer=True, grad=True)
+    assert_experts_are_local_shards("cuda")
+    assert_grad_devices("cuda")
+    train_backward(4322)
+    assert len(expert_forward_shard_checks) == 2 * len(model.units)
+    for hook in hooks:
+        hook.remove()
