@@ -1180,6 +1180,15 @@ def _weight_sync_probe_enabled() -> bool:
     }
 
 
+def _weight_sync_fingerprint_enabled() -> bool:
+    return os.getenv("MLITE_WEIGHT_SYNC_FINGERPRINT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _instrument_bucketed_weight_sender(sender_cls: type) -> bool:
     """Patch veRL's sender only while the opt-in sync probe is enabled."""
     if getattr(sender_cls, "_mlite_weight_sync_probe_patch", False):
@@ -1283,7 +1292,7 @@ class _SenderPatchLoader(importlib.abc.Loader):
     def exec_module(self, module) -> None:
         self._loader.exec_module(module)
         _install_bucketed_sender_prefetch(module.BucketedWeightSender)
-        if _weight_sync_probe_enabled():
+        if _weight_sync_probe_enabled() or _weight_sync_fingerprint_enabled():
             _instrument_bucketed_weight_sender(module.BucketedWeightSender)
 
 
@@ -1315,7 +1324,7 @@ def _patch_bucketed_weight_transfer() -> bool:
 def _patch_bucketed_weight_sender() -> bool:
     """Install production prefetch plus optional probe instrumentation."""
     changed = _patch_bucketed_weight_transfer()
-    if not _weight_sync_probe_enabled():
+    if not (_weight_sync_probe_enabled() or _weight_sync_fingerprint_enabled()):
         return changed
 
     module = sys.modules.get(_BUCKETED_SENDER_MODULE)
