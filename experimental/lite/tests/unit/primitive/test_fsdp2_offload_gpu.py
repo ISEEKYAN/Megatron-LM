@@ -66,7 +66,7 @@ class TinyMoEUnit(nn.Module):
 
 
 class TinyPipelineMoEModel(nn.Module):
-    def __init__(self, hidden_size: int = 64, num_units: int = 3):
+    def __init__(self, hidden_size: int = 2048, num_units: int = 3):
         super().__init__()
         self.units = nn.ModuleList(TinyMoEUnit(hidden_size) for _ in range(num_units))
 
@@ -228,7 +228,7 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
         leaf_module_names=(),
         expert_classifier=lambda name: ".experts." in f".{name}",
         reshard_after_forward=True,
-        forward_prefetch_depth=1,
+        forward_prefetch_depth=0,
         backward_prefetch_depth=0,
         use_fp32_shards=False,
         use_fp32_master=True,
@@ -248,20 +248,30 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
             device
         }
 
-    expert_forward_shard_checks = []
+    expert_materialized_bytes = []
+    expert_resharded_bytes = []
+
+    def record_expert_materialized_memory(_module, _inputs) -> None:
+        torch.cuda.synchronize()
+        expert_materialized_bytes.append(torch.cuda.memory_allocated())
 
     def check_expert_shard_after_forward(_module, _inputs, _output) -> None:
+        torch.cuda.synchronize()
         assert_experts_are_local_shards("cuda")
-        expert_forward_shard_checks.append(True)
+        expert_resharded_bytes.append(torch.cuda.memory_allocated())
 
     hooks = [
-        unit.experts.register_forward_hook(check_expert_shard_after_forward)
+        hook
         for unit in model.units
+        for hook in (
+            unit.experts.up.register_forward_pre_hook(record_expert_materialized_memory),
+            unit.experts.register_forward_hook(check_expert_shard_after_forward),
+        )
     ]
 
     def train_backward(seed: int) -> None:
         torch.manual_seed(seed)
-        x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(4, 2048, device="cuda", dtype=torch.bfloat16)
         optimizer.zero_grad()
         model(x).float().square().mean().backward()
         torch.cuda.synchronize()
@@ -283,6 +293,15 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
     assert_experts_are_local_shards("cuda")
     assert_grad_devices("cuda")
     train_backward(4322)
-    assert len(expert_forward_shard_checks) == 2 * len(model.units)
+    assert len(expert_materialized_bytes) == 2 * len(model.units)
+    assert len(expert_resharded_bytes) == len(expert_materialized_bytes)
+    released_expert_bytes = sum(
+        (global_numel - global_numel // ps.expert_dp_size) * torch.bfloat16.itemsize
+        for global_numel in expert_global_numels.values()
+    ) // len(model.units)
+    for materialized, resharded in zip(
+        expert_materialized_bytes, expert_resharded_bytes, strict=True
+    ):
+        assert materialized - resharded >= released_expert_bytes
     for hook in hooks:
         hook.remove()
