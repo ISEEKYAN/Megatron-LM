@@ -582,9 +582,10 @@ def _fsdp2_unit_reshard_after_forward(
     return reshard_after_forward
 
 
-def _fsdp2_prefetch_depth(ps: ParallelState, *, default_depth: int) -> int:
-    if ps.pp_size > 1:
-        return 0
+def _fsdp2_prefetch_depth(_ps: ParallelState, *, default_depth: int) -> int:
+    # FSDP2 prefetch targets are constructed independently for each local
+    # model chunk.  They never cross a pipeline stage (or a VPP chunk), so PP
+    # does not require disabling parameter all-gather overlap.
     return default_depth
 
 

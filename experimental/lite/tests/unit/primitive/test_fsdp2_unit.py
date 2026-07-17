@@ -80,6 +80,13 @@ def test_fsdp2_pipeline_preserves_reshard_after_forward_setting():
     )
 
 
+@pytest.mark.parametrize("depth", [0, 1, 2])
+def test_fsdp2_pipeline_preserves_prefetch_depth(depth: int):
+    ps = SimpleNamespace(pp_size=4)
+
+    assert fsdp2_optimizer._fsdp2_prefetch_depth(ps, default_depth=depth) == depth
+
+
 @pytest.mark.parametrize("field", ["mesh_dim_name", "device_type"])
 def test_fsdp2_config_rejects_empty_names(field: str):
     with pytest.raises(ValueError, match=field):
