@@ -849,6 +849,14 @@ def _patch_verl_dsv4_native_layerwise_reload() -> bool:
         import torch
 
         torch.cuda.empty_cache()
+        records = getattr(model_runner.model, "_verl_mlite_weight_fingerprint", None)
+        if records is not None:
+            from megatron.lite.primitive.ckpt.weight_sync_fingerprint import (
+                report_stream_fingerprint,
+            )
+
+            report_stream_fingerprint("receiver", 0, records)
+            del model_runner.model._verl_mlite_weight_fingerprint
         sys.stderr.write(
             "VERL_MLITE_DSV4_LAYERWISE_RELOAD finalized native vLLM reload "
             f"attention_sinks_restored={restored_sinks}\n"
@@ -859,6 +867,20 @@ def _patch_verl_dsv4_native_layerwise_reload() -> bool:
     def load_quanted_weights(weights, model_runner, *args, **kwargs):
         model = model_runner.model
         if getattr(model, "_verl_mlite_ds4_layerwise_reload_active", False):
+            weights = list(weights)
+            from megatron.lite.primitive.ckpt.weight_sync_fingerprint import (
+                tensor_fingerprint_record,
+                weight_sync_fingerprint_enabled,
+            )
+
+            if weight_sync_fingerprint_enabled():
+                records = getattr(model, "_verl_mlite_weight_fingerprint", None)
+                if records is None:
+                    records = []
+                    model._verl_mlite_weight_fingerprint = records
+                records.extend(
+                    tensor_fingerprint_record(name, tensor) for name, tensor in weights
+                )
             # Layerwise reload may retain loader arguments across multiple IPC
             # callbacks.  The receiver reuses its communication buffer after
             # each callback, so persist every tensor until its logical layer is
@@ -1213,6 +1235,20 @@ def _instrument_bucketed_weight_sender(sender_cls: type) -> bool:
 
     async def profiled_async_send_weights(self, weights):
         backend = os.getenv("MLITE_WEIGHT_SYNC_PROBE_BACKEND", "unknown")
+        from megatron.lite.primitive.ckpt.weight_sync_fingerprint import (
+            report_stream_fingerprint,
+            tensor_fingerprint_record,
+            weight_sync_fingerprint_enabled,
+        )
+
+        fingerprint_records = []
+
+        def fingerprinted_weights():
+            for name, tensor in weights:
+                if weight_sync_fingerprint_enabled():
+                    fingerprint_records.append(tensor_fingerprint_record(name, tensor))
+                yield name, tensor
+
         original_all_gather_into_tensor = dist.all_gather_into_tensor
 
         def profiled_all_gather_into_tensor(output, tensor, *args, **kwargs):
@@ -1222,7 +1258,11 @@ def _instrument_bucketed_weight_sender(sender_cls: type) -> bool:
         with weight_sync_probe_session(backend), _H2DCopyMode():
             dist.all_gather_into_tensor = profiled_all_gather_into_tensor
             try:
-                return await original_async_send_weights(self, weights)
+                result = await original_async_send_weights(self, fingerprinted_weights())
+                if weight_sync_fingerprint_enabled():
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                    report_stream_fingerprint("sender", rank, fingerprint_records)
+                return result
             finally:
                 dist.all_gather_into_tensor = original_all_gather_into_tensor
 
