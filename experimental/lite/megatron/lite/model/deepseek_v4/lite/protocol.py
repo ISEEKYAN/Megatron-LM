@@ -492,13 +492,6 @@ def load_hf_weights(
     if not hf_path:
         return
     _load_hf_weights_impl(chunk, hf_path, model_cfg, ps)
-    import os as _os
-    if _os.environ.get("MLITE_DBG_BIAS") == "1":
-        import sys as _sys
-        for _n, _b in chunk.named_buffers():
-            if "expert_bias" in _n:
-                _sys.stderr.write(f"MLITE_DBG_BIAS load {_n} absmax={_b.abs().max().item():.4f} mean={_b.float().mean().item():.4f} nz={(_b!=0).float().mean().item():.3f} shape={tuple(_b.shape)}\n")
-        _sys.stderr.flush()
 
 
 def export_hf_weights(
