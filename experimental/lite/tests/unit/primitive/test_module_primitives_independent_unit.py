@@ -10,7 +10,9 @@ from megatron.lite.primitive.modules.lora import (
     LinearLoRA,
     SharedGroupedLinearLoRA,
     freeze_non_lora_params,
+    lora_scaling,
     normalize_lora_config,
+    olora_tail_factors,
     trainable_param_stats,
 )
 
@@ -46,6 +48,105 @@ def test_lora_config_aliases_and_trainable_param_accounting():
         "trainable_tensors": 2,
         "trainable_numel": model.lora_adapter.weight.numel() + model.lora_adapter.bias.numel(),
     }
+
+
+def test_rslora_uses_sqrt_rank_scaling():
+    # standard LoRA: alpha/rank; rsLoRA: alpha/sqrt(rank). rank=4, alpha=8 -> 2.0 vs 4.0.
+    assert lora_scaling(4, 8, use_rslora=False) == 2.0
+    assert lora_scaling(4, 8, use_rslora=True) == 4.0
+    assert lora_scaling(4, None, use_rslora=True) == 4 / (4**0.5)  # alpha defaults to rank
+
+    cfg = normalize_lora_config({"rank": 4, "alpha": 8, "use_rslora": True})
+    assert cfg.use_rslora
+    assert cfg.scale == 4.0
+    assert normalize_lora_config({"rank": 4, "alpha": 8}).scale == 2.0  # default off
+
+    assert LinearLoRA(2, 1, rank=4, alpha=8).scale == 2.0
+    assert LinearLoRA(2, 1, rank=4, alpha=8, use_rslora=True).scale == 4.0
+    assert SharedGroupedLinearLoRA(2, 2, 2, rank=4, alpha=8, use_rslora=True).scale == 4.0
+    assert GroupedLinearLoRA(2, 2, 2, rank=4, alpha=8, use_rslora=True).scale == 4.0
+
+    # modules record use_rslora so the adapter round-trip can invert scale->alpha correctly
+    assert LinearLoRA(2, 1, rank=4, alpha=8, use_rslora=True).use_rslora is True
+    assert LinearLoRA(2, 1, rank=4, alpha=8).use_rslora is False
+
+
+def test_rslora_forward_scales_delta_by_sqrt_rank():
+    # identical adapter weights, rsLoRA output = sqrt(rank) x standard output.
+    # alpha=8 != rank=4 so the std path is non-trivially scaled (2.0), not 1.0.
+    torch.manual_seed(0)
+    a = torch.randn(4, 3)
+    b = torch.randn(2, 4)
+    std = LinearLoRA(3, 2, rank=4, alpha=8, dropout=0.0)
+    rs = LinearLoRA(3, 2, rank=4, alpha=8, dropout=0.0, use_rslora=True)
+    with torch.no_grad():
+        for layer in (std, rs):
+            layer.lora_a.copy_(a)
+            layer.lora_b.copy_(b)
+    x = torch.randn(1, 3)
+    torch.testing.assert_close(rs(x), std(x) * (4**0.5))
+
+
+def test_olora_tail_factors_are_minor_subspace_without_sigma():
+    # B0=U_-r, A0=V_-r^T from the SMALLEST r singular values, orthonormal (no Sigma scaling).
+    torch.manual_seed(0)
+    out_f, in_f, rank = 16, 12, 3
+    w = torch.randn(out_f, in_f)
+    u, _s, vh = torch.linalg.svd(w, full_matrices=False)  # singular values descending
+    b0, a0 = olora_tail_factors(w, rank)
+
+    assert b0.shape == (out_f, rank)
+    assert a0.shape == (rank, in_f)
+    # orthonormal => NO singular-value scaling injected (unlike MiLoRA's Sigma^1/2)
+    torch.testing.assert_close(b0.t() @ b0, torch.eye(rank), atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(a0 @ a0.t(), torch.eye(rank), atol=1e-4, rtol=1e-4)
+    # spans the MINOR subspace (smallest r vectors), up to per-vector sign
+    torch.testing.assert_close(b0.abs(), u[:, -rank:].abs(), atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(a0.abs(), vh[-rank:, :].abs(), atol=1e-4, rtol=1e-4)
+    with pytest.raises(ValueError, match="exceeds"):
+        olora_tail_factors(w, rank=13)
+
+
+def test_linear_lora_olora_tail_preserves_init_output():
+    # PiSSA-style residual: effective output unchanged at init, but adapter delta is NON-zero.
+    torch.manual_seed(0)
+    in_f, out_f, rank = 12, 16, 3
+    layer = LinearLoRA(in_f, out_f, rank, alpha=6)  # scale = 6/3 = 2
+    w = torch.randn(out_f, in_f)
+    w0 = w.clone()
+    x = torch.randn(4, in_f)
+    base_out = x @ w0.t()
+
+    layer.olora_tail_init_(w)  # sets lora_a/b, subtracts scale*B0@A0 from w in place
+
+    effective = x @ w.t() + layer(x)  # residual base + adapter
+    torch.testing.assert_close(effective, base_out, atol=1e-4, rtol=1e-4)
+    assert layer.lora_b.abs().sum() > 0  # unlike standard zero-init B
+
+
+def test_shared_grouped_olora_tail_preserves_every_expert_output():
+    # one shared adapter; subtract same delta from each expert -> each expert output preserved.
+    torch.manual_seed(0)
+    n_exp, in_f, out_f, rank = 3, 12, 16, 2
+    layer = SharedGroupedLinearLoRA(n_exp, in_f, out_f, rank, alpha=4)  # scale = 2
+    ws = [torch.randn(out_f, in_f) for _ in range(n_exp)]
+    w0s = [w.clone() for w in ws]
+
+    layer.olora_tail_init_(ws)
+
+    x = torch.randn(5, in_f)
+    shared = (x @ layer.lora_a.t()) @ layer.lora_b.t() * layer.scale
+    for w_after, w0 in zip(ws, w0s, strict=True):
+        torch.testing.assert_close(x @ w_after.t() + shared, x @ w0.t(), atol=1e-4, rtol=1e-4)
+
+
+def test_olora_tail_init_rejects_tp_sharded_weight():
+    # tp>1 / partitioned surfaces need a distributed SVD; we guard against silent wrong init.
+    # rank must be divisible by the partition size (4 % 2 == 0) so construction succeeds and
+    # the guard — not the constructor — is what rejects the sharded surface.
+    layer = LinearLoRA(12, 16, rank=4, alpha=6, rank_partitioned_a=True, rank_partition_size=2)
+    with pytest.raises(NotImplementedError, match="tp=1"):
+        layer.olora_tail_init_(torch.randn(16, 12))
 
 
 def test_linear_lora_forward_backward_matches_low_rank_delta():
@@ -129,3 +230,25 @@ def test_gated_delta_static_helpers_are_finite_and_shape_stable(transformer_engi
     assert torch.isfinite(g).all()
     assert torch.isfinite(beta_sigmoid).all()
     assert torch.all(g < 0)
+
+
+def test_olora_plain_qr_factors_and_output_preservation():
+    """Plain OLoRA (QR, arXiv:2406.01775): orthonormal B0 and init-time output
+    preservation via the shared PiSSA-style residual write-back."""
+    import torch
+
+    from megatron.lite.primitive.modules.lora import LinearLoRA, olora_factors
+
+    torch.manual_seed(0)
+    w = torch.randn(64, 96)
+    b0, a0 = olora_factors(w, 8)
+    assert b0.shape == (64, 8) and a0.shape == (8, 96)
+    assert (b0.T @ b0 - torch.eye(8)).abs().max() < 1e-5
+
+    lora = LinearLoRA(96, 64, rank=8, alpha=32, use_rslora=True)
+    base = w.clone()
+    x = torch.randn(4, 96)
+    y_ref = x @ base.T
+    lora.olora_init_(base)
+    y = x @ base.T + lora(x)
+    assert (y - y_ref).abs().max() < 1e-3

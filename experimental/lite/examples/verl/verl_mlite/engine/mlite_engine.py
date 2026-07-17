@@ -389,6 +389,16 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
+        lora_cfg = (self._mlite_config.impl_cfg or {}).get("lora") if self._mlite_config else None
+        # Duck-typed: hydra hands us OmegaConf DictConfig for nested sections, which
+        # fails isinstance(dict) — that silently skipped merge_lora, so the rollout
+        # received the residual-shifted base WITHOUT the adapter delta (W0 - s*B0A0).
+        lora_rank = int(lora_cfg.get("rank", 0) or 0) if hasattr(lora_cfg, "get") else 0
+        if lora_rank > 0:
+            # Rollout weight sync must see the CURRENT policy (base + adapter);
+            # with OLoRA's PiSSA residual, adapter-only sync on the original
+            # base would be numerically wrong, so merged export is mandatory.
+            export_kwargs["merge_lora"] = True
         return self.runtime.export_weights(self.handle, **export_kwargs), None
 
     def get_data_parallel_size(self):
@@ -820,7 +830,20 @@ class MegatronLiteEngine(BaseEngine):
                 )
             full_mask = torch.zeros(seq_len, dtype=row_mask.dtype, device=row_mask.device)
             if response_tokens:
-                full_mask[-response_tokens:] = row_mask[:response_tokens]
+                head = row_mask[:response_tokens]
+                # This padded->packed fallback can only RELOCATE a contiguous
+                # all-ones response prefix to the packed tail. A mask with
+                # interior zeros (multi-turn / tool-use observation tokens)
+                # would be silently misaligned — training observation tokens
+                # and skipping real response tokens — so fail loudly instead.
+                if int(head.sum().item()) != response_tokens:
+                    raise ValueError(
+                        "packed loss_mask fallback requires the response mask to "
+                        "be a contiguous all-ones prefix of its nonzero span; got "
+                        "interior zeros (multi-turn/tool-use mask). Pass a nested/"
+                        "jagged loss_mask aligned to input_ids instead."
+                    )
+                full_mask[-response_tokens:] = head
             rows.append(full_mask)
         return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
