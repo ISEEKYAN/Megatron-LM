@@ -72,7 +72,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -L)"
 EXAMPLE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -L)"
 LITE_ROOT="$(cd "${EXAMPLE_ROOT}/../.." && pwd -L)"
 REPO_ROOT="$(cd "${LITE_ROOT}/../.." && pwd -L)"
-DATASET_MODULE="${EXAMPLE_ROOT}/verl_mlite/dataset.py"
 VALIDATOR="${SCRIPT_DIR}/validate_deepseek_v4_dapo.py"
 CHAT_TEMPLATE_FILE="${SCRIPT_DIR}/deepseek_v4_chat_template.jinja"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${EXAMPLE_ROOT}/outputs/ds4_dapo}"
@@ -169,6 +168,8 @@ ALGORITHM=(
   "algorithm.norm_adv_by_std_in_grpo=False"
 )
 
+# Use veRL's native RLHFDataset. Inputs must already follow its rule-reward
+# schema (prompt, data_source, and reward_model.ground_truth).
 DATA=(
   "data.train_files=${TRAIN_FILES}"
   "data.val_files=${VAL_FILES}"
@@ -179,22 +180,8 @@ DATA=(
   "data.max_response_length=${MAX_RESPONSE_LENGTH}"
   "data.filter_overlong_prompts=True"
   "data.truncation=error"
-  "data.custom_cls.path=${DATASET_MODULE}"
-  "data.custom_cls.name=ChatTemplateRLHFDataset"
-  "+data.chat_template='${DS4_CHAT_TEMPLATE}'"
   "data.dataloader_num_workers=8"
 )
-
-if [[ -n "${DATA_LABEL_KEY:-}" || -n "${DATA_DEFAULT_SOURCE:-}" ]]; then
-  if [[ -z "${DATA_LABEL_KEY:-}" || -z "${DATA_DEFAULT_SOURCE:-}" ]]; then
-    echo "DATA_LABEL_KEY and DATA_DEFAULT_SOURCE must be set together" >&2
-    exit 2
-  fi
-  DATA+=(
-    "+data.label_key=${DATA_LABEL_KEY}"
-    "+data.default_data_source=${DATA_DEFAULT_SOURCE}"
-  )
-fi
 
 MODEL=(
   "actor_rollout_ref.model.path=${MODEL_PATH}"
