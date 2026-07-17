@@ -62,6 +62,11 @@ def test_ds4_dapo_weight_and_r3_knobs(
     assert f"moe_backend={moe_backend}" in command
     assert f"router_replay_mode={router_mode}" in command
     assert f"enable_rollout_routing_replay={rollout_replay}" in command
+    assert "actor_rollout_ref.actor.engine.impl_cfg.optimizer=fsdp2" in command
+    assert "actor_rollout_ref.actor.engine.attention_backend_override=fused" in command
+    assert "actor_rollout_ref.rollout.enforce_eager=True" in command
+    assert "algorithm.rollout_correction.bypass_mode=False" in command
+    assert "data.max_response_length=6144" in command
 
 
 @pytest.mark.parametrize(
