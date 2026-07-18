@@ -642,10 +642,16 @@ def export_hf_weights(model, config: KimiK2Config, ps: ParallelState, **kwargs):
 
 
 def save_hf_weights(model, path: str, config: KimiK2Config, ps: ParallelState, **kwargs) -> None:
-    from megatron.lite.primitive.ckpt.hf_weights import save_hf_weights as _save
+    """Export + write sharded safetensors via ``stream_export_to_shards``."""
+    from megatron.lite.primitive.ckpt.hf_weights import stream_export_to_shards
 
     kwargs.pop("cpu", None)
-    _save(model, path, config, ps, export_fn=export_hf_weights, **kwargs)
+    shard_size_bytes = int(kwargs.pop("shard_size_bytes", 5 * 1024**3))
+    stream_export_to_shards(
+        export_hf_weights(model, config, ps, rank0_only=True, cpu=True, **kwargs),
+        path,
+        shard_size_bytes=shard_size_bytes,
+    )
 
 
 __all__ = [

@@ -13,8 +13,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
-import tempfile
 from collections.abc import Generator, Iterable
 from contextlib import ExitStack
 from pathlib import Path
@@ -1123,6 +1121,79 @@ def _gather_expert_etp(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> 
     return tensor
 
 
+def stream_export_to_shards(
+    export_iter: Iterable[tuple[str, torch.Tensor]],
+    path: str,
+    *,
+    shard_size_bytes: int = 5 * 1024**3,
+) -> None:
+    """Consume ``export_iter`` and write sharded safetensors on rank 0.
+
+    Flushes to disk once a shard reaches ``shard_size_bytes`` (default 5 GiB)
+    so rank 0's peak CPU RAM stays at ~one shard instead of the whole model.
+    Non-rank-0 still drains the iterator to drive collective communication
+    inside model-specific ``export_hf_weights`` implementations.
+
+    Emits ``model.safetensors`` when the export fits in a single shard, or
+    ``model-{i:05d}-of-{total:05d}.safetensors`` + ``model.safetensors.index.json``
+    when multiple shards are produced (HF-compatible layout).
+    """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0:
+        os.makedirs(path, exist_ok=True)
+
+    shard: dict[str, torch.Tensor] = {}
+    shard_bytes = 0
+    tmp_names: list[str] = []
+    shard_keys: list[list[str]] = []
+    total_size = 0
+
+    def _flush() -> None:
+        nonlocal shard, shard_bytes
+        if not shard:
+            return
+        tmp = f".model-shard-{len(tmp_names) + 1:05d}.safetensors"
+        save_safetensors(shard, path, filename=tmp)
+        tmp_names.append(tmp)
+        shard_keys.append(list(shard.keys()))
+        shard = {}
+        shard_bytes = 0
+
+    for name, tensor in export_iter:
+        if rank != 0:
+            continue
+        nbytes = _tensor_nbytes(tensor)
+        if shard and shard_bytes + nbytes > shard_size_bytes:
+            _flush()
+        shard[name] = tensor
+        shard_bytes += nbytes
+        total_size += nbytes
+
+    if rank == 0:
+        _flush()
+        total = len(tmp_names)
+        if total == 1:
+            os.rename(
+                os.path.join(path, tmp_names[0]),
+                os.path.join(path, "model.safetensors"),
+            )
+        elif total > 1:
+            weight_map: dict[str, str] = {}
+            for idx, (tmp, keys) in enumerate(zip(tmp_names, shard_keys), start=1):
+                final = f"model-{idx:05d}-of-{total:05d}.safetensors"
+                os.rename(os.path.join(path, tmp), os.path.join(path, final))
+                for k in keys:
+                    weight_map[k] = final
+            with open(os.path.join(path, "model.safetensors.index.json"), "w") as f:
+                json.dump(
+                    {"metadata": {"total_size": total_size}, "weight_map": weight_map},
+                    f,
+                )
+
+    if dist.is_initialized():
+        dist.barrier()
+
+
 def save_hf_weights(
     model: nn.Module | list[nn.Module],
     hf_path: str,
@@ -1131,147 +1202,12 @@ def save_hf_weights(
     *,
     vocab_size: int | None = None,
     shard_size_bytes: int = 5 * 1024**3,
-    **export_kwargs: Any,
 ) -> None:
-    """Stream an HF export into bounded safetensor shards.
-
-    ``export_hf_weights`` is deliberately a generator, but collecting it into a
-    dict here would still materialize the entire checkpoint on rank 0.  Keep
-    only one shard in memory, write into a temporary directory, and promote the
-    complete set of HF weight artifacts after the export succeeds.  Unrelated
-    files in ``hf_path`` (for example a training checkpoint or config.json) are
-    preserved.
-    """
-    if shard_size_bytes <= 0:
-        raise ValueError(f"shard_size_bytes must be positive, got {shard_size_bytes}")
-
-    rank = dist.get_rank() if dist.is_initialized() else 0
-
-    export_fn = export_kwargs.pop("export_fn", export_hf_weights)
-    export_kwargs.pop("rank0_only", None)
-    export_kwargs.pop("cpu", None)
-    export_call_kwargs = dict(export_kwargs)
-    export_call_kwargs.update(rank0_only=True, cpu=True)
-    if export_fn is export_hf_weights:
-        export_call_kwargs["vocab_size"] = vocab_size
-    exported = export_fn(model, spec, ps, **export_call_kwargs)
-
-    staging_path: Path | None = None
-    shard_paths: list[Path] = []
-    shard_names: list[list[str]] = []
-    weight_map: dict[str, str] = {}
-    total_size = 0
-    shard: dict[str, torch.Tensor] = {}
-    shard_size = 0
-
-    def flush_shard() -> None:
-        nonlocal shard, shard_size
-        if not shard:
-            return
-        assert staging_path is not None
-        shard_path = staging_path / f".shard-{len(shard_paths) + 1:05d}.safetensors"
-        save_safetensors(shard, str(staging_path), shard_path.name)
-        shard_paths.append(shard_path)
-        shard_names.append(list(shard))
-        shard = {}
-        shard_size = 0
-
-    try:
-        if rank == 0:
-            output_path = Path(hf_path)
-            staging_path = Path(
-                tempfile.mkdtemp(
-                    prefix=f".{output_path.name}.hf-staging-",
-                    dir=str(output_path.parent),
-                )
-            )
-
-        for name, tensor in exported:
-            if rank != 0:
-                continue
-            if name in weight_map:
-                raise ValueError(f"duplicate HF tensor key: {name}")
-            tensor_size = _tensor_nbytes(tensor)
-            if shard and shard_size + tensor_size > shard_size_bytes:
-                flush_shard()
-            weight_map[name] = ""
-            shard[name] = tensor
-            shard_size += tensor_size
-            total_size += tensor_size
-
-        if rank == 0:
-            flush_shard()
-            if shard_paths:
-                output_path = Path(hf_path)
-                shard_count = len(shard_paths)
-                for index, shard_path in enumerate(shard_paths, start=1):
-                    filename = (
-                        "model.safetensors"
-                        if shard_count == 1
-                        else f"model-{index:05d}-of-{shard_count:05d}.safetensors"
-                    )
-                    final_path = staging_path / filename
-                    os.replace(shard_path, final_path)
-                    for name in shard_names[index - 1]:
-                        weight_map[name] = filename
-
-                if shard_count > 1:
-                    (staging_path / "model.safetensors.index.json").write_text(
-                        json.dumps(
-                            {"metadata": {"total_size": total_size}, "weight_map": weight_map},
-                            indent=2,
-                            sort_keys=True,
-                        )
-                        + "\n"
-                    )
-
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                existing = list(output_path.iterdir()) if output_path.exists() else []
-                unrelated = any(
-                    not path.is_file()
-                    or (path.suffix != ".safetensors" and path.name != "model.safetensors.index.json")
-                    for path in existing
-                )
-                if not unrelated:
-                    backup_path = None
-                    if output_path.exists():
-                        backup_path = Path(
-                            tempfile.mkdtemp(
-                                prefix=f".{output_path.name}.hf-backup-",
-                                dir=str(output_path.parent),
-                            )
-                        )
-                        backup_path.rmdir()
-                        os.replace(output_path, backup_path)
-                    try:
-                        os.replace(staging_path, output_path)
-                        staging_path = None
-                    except Exception:
-                        if backup_path is not None and not output_path.exists():
-                            os.replace(backup_path, output_path)
-                        raise
-                    finally:
-                        if backup_path is not None and backup_path.exists():
-                            shutil.rmtree(backup_path)
-                else:
-                    managed_names = {
-                        path.name
-                        for path in existing
-                        if path.is_file()
-                        and (
-                            path.suffix == ".safetensors"
-                            or path.name == "model.safetensors.index.json"
-                        )
-                    }
-                    managed_names.update(path.name for path in staging_path.iterdir())
-                    for name in managed_names:
-                        old_path = output_path / name
-                        if old_path.exists():
-                            old_path.unlink()
-                    for path in staging_path.iterdir():
-                        os.replace(path, output_path / path.name)
-    finally:
-        if staging_path is not None and staging_path.exists():
-            shutil.rmtree(staging_path)
-    if dist.is_initialized():
-        dist.barrier()
+    """Export + write sharded safetensors via ``stream_export_to_shards``."""
+    stream_export_to_shards(
+        export_hf_weights(
+            model, spec, ps, vocab_size=vocab_size, rank0_only=True, cpu=True
+        ),
+        hf_path,
+        shard_size_bytes=shard_size_bytes,
+    )

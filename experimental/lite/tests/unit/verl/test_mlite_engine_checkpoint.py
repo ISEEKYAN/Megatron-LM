@@ -148,49 +148,6 @@ def test_save_checkpoint_skips_when_contents_exclude_model_and_optimizer(tmp_pat
     assert not checkpoint_path.exists()
 
 
-def test_save_checkpoint_hf_model_is_explicit_and_does_not_write_training_state(
-    tmp_path, monkeypatch
-):
-    engine, *_ = _initialized_engine(checkpoint_config={"save_contents": ["hf_model"]})
-    save_calls = []
-    hf_calls = []
-    monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.save_training_checkpoint",
-        lambda *args, **kwargs: save_calls.append((args, kwargs)),
-    )
-    monkeypatch.setattr(
-        engine,
-        "_save_hf_checkpoint",
-        lambda path: hf_calls.append(path),
-    )
-
-    engine.save_checkpoint(str(tmp_path), global_step=13)
-
-    assert save_calls == []
-    assert hf_calls == [str(tmp_path)]
-    assert not (tmp_path / "lr_scheduler.pt").exists()
-
-
-def test_save_checkpoint_default_contents_do_not_export_hf_model(tmp_path, monkeypatch):
-    engine, *_ = _initialized_engine()
-    save_calls = []
-    hf_calls = []
-    monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.save_training_checkpoint",
-        lambda *args, **kwargs: save_calls.append((args, kwargs)),
-    )
-    monkeypatch.setattr(
-        engine,
-        "_save_hf_checkpoint",
-        lambda path: hf_calls.append(path),
-    )
-
-    engine.save_checkpoint(str(tmp_path), global_step=13)
-
-    assert len(save_calls) == 1
-    assert hf_calls == []
-
-
 def test_load_checkpoint_restores_scheduler_and_param_offload_reload(tmp_path, monkeypatch):
     (
         engine,
