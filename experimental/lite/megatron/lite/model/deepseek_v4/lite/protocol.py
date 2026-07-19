@@ -15,9 +15,10 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
     save_hf_weights as _save_hf_weights_impl,
 )
+from megatron.lite.model.compose_kernel import ModelSpec, assemble
 from megatron.lite.model.protocol_utils import add_loss_context_kwargs
 from megatron.lite.primitive.bundle import ModelBundle
-from megatron.lite.primitive.parallel import ParallelState, init_parallel
+from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.parallel.cp import (
     contiguous_position_ids_for_cp,
     contiguous_slice_for_cp,
@@ -30,7 +31,6 @@ from megatron.lite.primitive.parallel.thd import (
     thd_pack_meta,
     unpack_thd_to_nested,
 )
-from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch, ParallelConfig
 
 
@@ -348,16 +348,19 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
         )
 
 
-def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+def _ds4_chunk_factory(
+    model_cfg: DeepseekV4Config,
+    impl_cfg: ImplConfig,
+    ps: ParallelState,
+    vpp_chunk_id: int | None,
+) -> nn.Module:
     from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Model
 
-    p = impl_cfg.parallel
-    _validate_parallel_scope(p)
-    _apply_mtp_config(model_cfg, impl_cfg)
+    # ``prepare`` (below) has already applied MTP config / validated scope, so
+    # ``model_cfg.num_nextn_predict_layers`` is authoritative here.
     mtp_enable = bool(impl_cfg.mtp_enable) and model_cfg.num_nextn_predict_layers > 0
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
-    ps = init_parallel(impl_cfg.parallel)
-    vpp = None if p.vpp == 1 else p.vpp
+    vpp = None if impl_cfg.parallel.vpp == 1 else impl_cfg.parallel.vpp
     train_cfg = SimpleNamespace(
         tp=ps.tp_size,
         ep=ps.ep_size,
@@ -368,106 +371,51 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         fp8=False,
         use_deepep=impl_cfg.use_deepep,
     )
-
-    def _chunk(i: int | None = None):
-        return (
-            DeepseekV4Model(
-                model_cfg,
-                train_cfg,
-                ps,
-                vpp_chunk_id=i,
-                use_deepep=impl_cfg.use_deepep,
-                use_thd=impl_cfg.use_thd,
-                hf_path=impl_cfg.hf_path,
-                attention_backend_override=impl_cfg.attention_backend_override,
-                mtp_enable=mtp_enable,
-                mtp_enable_train=mtp_enable_train,
-                mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
-            )
-            .to(torch.bfloat16)
-            .cuda()
-        )
-
-    chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
-    _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
-
-    recompute_spec = parse_recompute_spec(impl_cfg.recompute)
-    if recompute_spec:
-        for chunk in chunks:
-            apply_recompute(_iter_transformer_units(chunk), recompute_spec, MODULE_MAP)
-
-    if impl_cfg.offload:
-        from megatron.lite.primitive.recompute import apply_offload
-
-        for chunk in chunks:
-            apply_offload(_iter_transformer_units(chunk), impl_cfg.offload, MODULE_MAP)
-
-    optimizer = None
-    finalize_grads = None
-    post_model_load_hook = None
-    optimizer_backend = "none"
-    optimizer_name = _optimizer_backend_name(impl_cfg.optimizer)
-    if optimizer_name == "dist_opt":
-        from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
-        from megatron.lite.primitive.optimizers.megatron_wrap import (
-            build_dist_opt_training_optimizer,
-        )
-        from megatron.lite.runtime.megatron_utils import register_training_hooks
-
-        optimizer, finalize_grads = build_dist_opt_training_optimizer(
-            chunks,
-            model_cfg=model_cfg,
-            impl_cfg=impl_cfg,
-            ps=ps,
-            model_name="deepseek_v4",
-            is_expert=is_expert_param,
-            deterministic=impl_cfg.deterministic,
-        )
-        attach_model_sharded_state_dict(
-            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
-        )
-        register_training_hooks(chunks, optimizer)
-        optimizer_backend = "dist_opt"
-    elif optimizer_name == "fsdp2":
-        optimizer_backend = "fsdp2"
-
-        def _post_model_load_hook():
-            from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
-
-            return {
-                "optimizer": build_fsdp2_training_optimizer(
-                    chunks,
-                    impl_cfg.optimizer_config,
-                    ps,
-                    unit_modules=(DeepseekV4Layer,),
-                    expert_classifier=is_expert_param,
-                    deterministic=impl_cfg.deterministic,
-                    vpp=impl_cfg.parallel.vpp,
-                    leaf_module_names=(),
-                    use_fp32_shards=False,
-                )
-            }
-
-        post_model_load_hook = _post_model_load_hook
-    elif optimizer_name is None:
-        optimizer_backend = "none"
-    else:
-        raise ValueError(f"Unknown DeepSeek V4 lite optimizer: {impl_cfg.optimizer!r}.")
-
-    return ModelBundle(
-        chunks=chunks,
-        parallel_state=ps,
-        optimizer=optimizer,
-        finalize_grads=finalize_grads,
-        forward_step=_forward_step,
-        extras={
-            "model_cfg": model_cfg,
-            "optimizer_backend": optimizer_backend,
-            "post_model_load_hook": post_model_load_hook,
-            "pre_forward_hook": _make_aux_loss_hook(),
-        },
+    return DeepseekV4Model(
+        model_cfg,
+        train_cfg,
+        ps,
+        vpp_chunk_id=vpp_chunk_id,
+        use_deepep=impl_cfg.use_deepep,
+        use_thd=impl_cfg.use_thd,
+        hf_path=impl_cfg.hf_path,
+        attention_backend_override=impl_cfg.attention_backend_override,
+        mtp_enable=mtp_enable,
+        mtp_enable_train=mtp_enable_train,
+        mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
     )
+
+
+def _ds4_prepare(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig, ps: ParallelState) -> None:
+    _validate_parallel_scope(impl_cfg.parallel)
+    _apply_mtp_config(model_cfg, impl_cfg)
+
+
+def _ds4_fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
+    from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Layer
+
+    return (DeepseekV4Layer,)
+
+
+def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+    spec = ModelSpec(
+        name="deepseek_v4",
+        chunk_factory=_ds4_chunk_factory,
+        transformer_units=_iter_transformer_units,
+        module_map=MODULE_MAP,
+        forward_step=_forward_step,
+        expert_classifier=is_expert_param,
+        placement_fn=PLACEMENT_FN,
+        fsdp2_unit_modules=_ds4_fsdp2_unit_modules,
+        prepare=_ds4_prepare,
+        post_chunk_hook=lambda chunks, impl: _configure_attention_backend(
+            chunks, backend=impl.attention_backend_override
+        ),
+        pre_forward_hook_factory=_make_aux_loss_hook,
+        fsdp2_extra_kwargs={"use_fp32_shards": False},
+        optimizer_backend_name=_optimizer_backend_name,
+    )
+    return assemble(spec, model_cfg, impl_cfg)
 
 
 def load_hf_weights(
