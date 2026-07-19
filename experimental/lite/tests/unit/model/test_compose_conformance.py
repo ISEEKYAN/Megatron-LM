@@ -20,9 +20,10 @@ from types import SimpleNamespace
 import pytest
 
 LITE_ROOT = Path(__file__).resolve().parents[3]
-DS4_PROTOCOL = (
-    LITE_ROOT / "megatron" / "lite" / "model" / "deepseek_v4" / "lite" / "protocol.py"
-)
+MODEL_ROOT = LITE_ROOT / "megatron" / "lite" / "model"
+#: Every native model whose build_model must delegate to compose.assemble.
+MIGRATED_MODELS = ["deepseek_v4", "glm5", "kimi_k2", "qwen3_5", "qwen3_moe"]
+DS4_PROTOCOL = MODEL_ROOT / "deepseek_v4" / "lite" / "protocol.py"
 
 
 class _FakeChunk:
@@ -240,34 +241,108 @@ def test_pre_forward_hook_factory_populates_extras(monkeypatch):
     assert bundle.extras["pre_forward_hook"] is sentinel
 
 
+def test_extra_extras_merge_into_bundle(monkeypatch):
+    compose, spec, _ = _make_spec(
+        monkeypatch, extra_extras=lambda chunks, impl: {"lora_config": "L", "lora_stats": None}
+    )
+    bundle = compose.assemble(spec, model_cfg=SimpleNamespace(), impl_cfg=_fake_impl_cfg())
+    assert bundle.extras["lora_config"] == "L"
+    assert bundle.extras["lora_stats"] is None
+
+
+def test_extra_extras_run_before_optimizer(monkeypatch):
+    """qwen3_moe LoRA must freeze params (extra_extras) before the optimizer sees them."""
+    compose, _, _ = _make_spec(monkeypatch)
+    order = []
+    monkeypatch.setattr(
+        compose, "_wire_optimizer", lambda *a, **k: order.append("optimizer") or (None, None, None, "none")
+    )
+    _, spec, _ = _make_spec(
+        monkeypatch, extra_extras=lambda chunks, impl: order.append("extra_extras") or {}
+    )
+    monkeypatch.setattr(
+        compose, "_wire_optimizer", lambda *a, **k: order.append("optimizer") or (None, None, None, "none")
+    )
+    compose.assemble(spec, model_cfg=SimpleNamespace(), impl_cfg=_fake_impl_cfg())
+    assert order == ["extra_extras", "optimizer"]
+
+
+def test_register_hooks_false_skips_training_hooks(monkeypatch):
+    """qwen3_moe sets register_hooks=False; the dist_opt path must not register them."""
+    from megatron.lite.primitive.parallel import ParallelState
+    import types
+
+    _, spec, _ = _make_spec(monkeypatch, register_hooks=False)
+    calls = {"register": 0}
+    fake_mw = types.ModuleType("megatron.lite.primitive.optimizers.megatron_wrap")
+    fake_mw.build_dist_opt_training_optimizer = lambda *a, **k: ("OPT", "FIN")
+    fake_ckpt = types.ModuleType("megatron.lite.primitive.ckpt")
+    fake_ckpt.attach_model_sharded_state_dict = lambda *a, **k: None
+    fake_mu = types.ModuleType("megatron.lite.runtime.megatron_utils")
+    fake_mu.register_training_hooks = lambda *a, **k: calls.__setitem__("register", calls["register"] + 1)
+    import sys
+    monkeypatch.setitem(sys.modules, "megatron.lite.primitive.optimizers.megatron_wrap", fake_mw)
+    monkeypatch.setitem(sys.modules, "megatron.lite.primitive.ckpt", fake_ckpt)
+    monkeypatch.setitem(sys.modules, "megatron.lite.runtime.megatron_utils", fake_mu)
+    from megatron.lite.model import compose
+    compose._wire_optimizer(
+        spec, chunks=[_FakeChunk("c")], model_cfg=SimpleNamespace(),
+        impl_cfg=_fake_impl_cfg(optimizer="dist_opt"), ps=ParallelState()
+    )
+    assert calls["register"] == 0
+
+
+def test_fsdp2_deterministic_fn_overrides(monkeypatch):
+    """qwen3_5 forces deterministic=False for THD GatedDeltaNet fsdp2 wiring."""
+    from megatron.lite.primitive.parallel import ParallelState
+    import types, sys
+
+    _, spec, _ = _make_spec(monkeypatch, fsdp2_deterministic_fn=lambda impl: False)
+    seen = {}
+    fake_fsdp2 = types.ModuleType("megatron.lite.primitive.optimizers.fsdp2")
+    fake_fsdp2.build_fsdp2_training_optimizer = lambda *a, **k: seen.update(k) or "OPT"
+    monkeypatch.setitem(sys.modules, "megatron.lite.primitive.optimizers.fsdp2", fake_fsdp2)
+    from megatron.lite.model import compose
+    _, _, hook, backend = compose._wire_optimizer(
+        spec, chunks=[_FakeChunk("c")], model_cfg=SimpleNamespace(),
+        impl_cfg=_fake_impl_cfg(optimizer="fsdp2", parallel=SimpleNamespace(vpp=1)),
+        ps=ParallelState(),
+    )
+    assert backend == "fsdp2"
+    hook()  # trigger the lazy fsdp2 build
+    assert seen["deterministic"] is False
+
+
 # --------------------------------------------------------------------------
 # DS4 migration conformance: the protocol declares a spec + calls assemble.
 # --------------------------------------------------------------------------
 
 
-def _ds4_build_model_ast() -> ast.FunctionDef:
-    tree = ast.parse(DS4_PROTOCOL.read_text(encoding="utf-8"))
+def _build_model_ast(model: str) -> ast.FunctionDef:
+    protocol = MODEL_ROOT / model / "lite" / "protocol.py"
+    tree = ast.parse(protocol.read_text(encoding="utf-8"))
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == "build_model":
             return node
-    raise AssertionError("deepseek_v4 protocol has no build_model")
+    raise AssertionError(f"{model} protocol has no build_model")
 
 
-def test_ds4_build_model_delegates_to_kernel():
-    fn = _ds4_build_model_ast()
+@pytest.mark.parametrize("model", MIGRATED_MODELS)
+def test_build_model_delegates_to_kernel(model):
+    fn = _build_model_ast(model)
     calls = {
         node.func.id
         for node in ast.walk(fn)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
-    assert "ModelSpec" in calls, "build_model must declare a ModelSpec"
-    assert "assemble" in calls, "build_model must delegate to assemble"
+    assert "ModelSpec" in calls, f"{model} build_model must declare a ModelSpec"
+    assert "assemble" in calls, f"{model} build_model must delegate to assemble"
 
 
-def test_ds4_build_model_has_no_inline_assembly():
-    """The migrated build_model must not re-implement the shared body: no direct
-    init_parallel / apply_recompute / ModelBundle / chunk .cuda() loop."""
-    fn = _ds4_build_model_ast()
+@pytest.mark.parametrize("model", MIGRATED_MODELS)
+def test_build_model_has_no_inline_assembly(model):
+    """Migrated build_model must not re-implement the shared body."""
+    fn = _build_model_ast(model)
     banned = {"init_parallel", "apply_recompute", "apply_offload", "ModelBundle"}
     names = {
         node.func.id
@@ -275,19 +350,18 @@ def test_ds4_build_model_has_no_inline_assembly():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     leaked = banned & names
-    assert not leaked, f"build_model still inlines shared assembly: {leaked}"
+    assert not leaked, f"{model} build_model still inlines shared assembly: {leaked}"
 
 
-def test_ds4_build_model_is_small():
-    """Net-negative proof-of-absorption: the delegating build_model is a thin
-    declaration, not a 120-line body. Count executable statements (comments and
-    the specialization note do not count)."""
-    fn = _ds4_build_model_ast()
+@pytest.mark.parametrize("model", MIGRATED_MODELS)
+def test_build_model_is_small(model):
+    """Net-negative proof: the delegating build_model is a thin declaration."""
+    fn = _build_model_ast(model)
     stmt_lines = {
         node.lineno
         for node in ast.walk(fn)
         if isinstance(node, ast.stmt) and node is not fn
     }
     assert len(stmt_lines) < 20, (
-        f"build_model should be a thin delegator, got {len(stmt_lines)} statement lines"
+        f"{model} build_model should be a thin delegator, got {len(stmt_lines)} statement lines"
     )

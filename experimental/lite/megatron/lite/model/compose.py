@@ -1,23 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Absorbing model-composition kernel.
+"""Absorbing model-composition kernel: shared ``build_model`` body.
 
-Every native lite model repeated the same ``build_model`` body: build the (VPP)
-chunks, wrap recompute / offload, wire the ``dist_opt`` or ``fsdp2`` optimizer,
-attach the sharded state dict, and pack a :class:`ModelBundle`.  Only a handful
-of per-model choices differed.
-
-``assemble`` owns that shared body once.  A model declares its differences as a
-:class:`ModelSpec` and calls ``assemble(spec, model_cfg, impl_cfg)``; it no
-longer re-implements chunk construction, optimizer wiring, or bundle assembly.
-
-The single point where a model tells the kernel how to walk its transformer
-units is :attr:`ModelSpec.transformer_units` (issue #114): recompute, offload,
-and any future per-unit pass go through that one enumeration, never through an
-ad-hoc ``chunk.layers`` reach-in scattered across protocols.
-
-This module lives in the ``model`` layer (not ``primitive``): the dist_opt path
-registers training hooks via ``runtime.megatron_utils``, which the primitive
-layer is forbidden to import but the model layer may use.
+``assemble`` owns the body every native lite model repeated (VPP chunk build,
+recompute/offload, dist_opt/fsdp2 wiring, sharded-state-dict attach, ModelBundle
+packing). A model declares its deltas as a :class:`ModelSpec` and delegates.
+:attr:`ModelSpec.transformer_units` is the single #114 unit enumeration that
+recompute and offload both walk. Lives in the ``model`` layer because dist_opt
+registers hooks via ``runtime.megatron_utils`` (barred from ``primitive``).
 """
 
 from __future__ import annotations
@@ -38,32 +27,23 @@ from megatron.lite.primitive.recompute import (
     parse_recompute_spec,
 )
 
-# A model's build knobs live on its own ``ImplConfig`` dataclass; the kernel only
-# reads the fields shared by every model, so it takes ``impl_cfg`` structurally.
+# ``impl_cfg`` is a per-model ``ImplConfig``; the kernel reads only shared fields.
 ImplConfigLike = Any
 ModelConfigLike = Any
 
 
 @dataclass(frozen=True)
 class ModelSpec:
-    """Typed declaration of a model's composition deltas.
+    """Typed declaration of a model's composition deltas."""
 
-    The kernel drives the shared assembly; the model supplies only what is
-    genuinely model-specific through these fields.  Every callable receives the
-    already-built ``chunks`` / ``ps`` / ``impl_cfg`` so a model never re-derives
-    parallel state or re-reads ``impl_cfg`` outside its own hooks.
-    """
-
-    #: Model name used for optimizer bucketing / diagnostics.
+    #: Model name for optimizer bucketing / diagnostics.
     name: str
 
-    #: Build one chunk. ``vpp_chunk_id`` is ``None`` for a single (non-VPP)
-    #: chunk, else the chunk index. The kernel handles ``.to(bf16).cuda()``.
+    #: Build one chunk; ``vpp_chunk_id`` is ``None`` for a single chunk.
+    #: The kernel handles ``.to(bf16).cuda()``.
     chunk_factory: Callable[[ModelConfigLike, ImplConfigLike, ParallelState, int | None], nn.Module]
 
-    #: Enumerate the transformer units of a chunk that recompute / offload walk.
-    #: This is the single #114 unit enumeration — no protocol reaches into
-    #: ``chunk.layers`` directly.
+    #: Single #114 unit enumeration walked by recompute and offload.
     transformer_units: Callable[[nn.Module], Iterable[nn.Module]]
 
     #: ``{spec_name: accessor}`` for recompute / offload sub-module targeting.
@@ -83,24 +63,32 @@ class ModelSpec:
 
     # --- optional per-model hooks (default no-op) --------------------------
 
-    #: Mutate ``model_cfg`` / validate ``impl_cfg`` before any chunk is built
-    #: (parallel-scope gates, MTP config, aux-loss coefs, ...).
+    #: Mutate ``model_cfg`` / validate ``impl_cfg`` before any chunk is built.
     prepare: Callable[[ModelConfigLike, ImplConfigLike, ParallelState], None] | None = None
 
-    #: Run after all chunks are built (e.g. cross-entropy fusion toggles,
-    #: attention-backend configuration). Receives ``(chunks, impl_cfg)``.
+    #: Run after all chunks are built (cross-entropy fusion, attention backend).
     post_chunk_hook: Callable[[list[nn.Module], ImplConfigLike], None] | None = None
 
     #: ``pre_forward_hook(scale)`` stored on the bundle (aux-loss auto-scaler).
     pre_forward_hook_factory: Callable[[], Callable[[torch.Tensor], None]] | None = None
 
-    #: Extra kwargs forwarded to the fsdp2 optimizer builder (default: none).
+    #: Extra kwargs forwarded to the fsdp2 optimizer builder.
     fsdp2_extra_kwargs: dict[str, Any] = field(default_factory=dict)
 
-    #: Normalize ``impl_cfg.optimizer`` to a backend name. Defaults to identity
-    #: (models pass ``"dist_opt"`` / ``"fsdp2"`` / ``None`` directly). DS4 also
-    #: accepts an ``OptimizerConfig`` / dict and maps it to ``"dist_opt"``.
+    #: Normalize ``impl_cfg.optimizer`` to a backend name (identity by default).
     optimizer_backend_name: Callable[[Any], str | None] | None = None
+
+    #: Extra ``ModelBundle.extras`` entries, produced after recompute/offload and
+    #: *before* optimizer wiring (qwen3_moe LoRA must freeze params first).
+    extra_extras: Callable[[list[nn.Module], ImplConfigLike], dict[str, Any]] | None = None
+
+    #: Effective ``deterministic`` for fsdp2 wiring (qwen3_5 forces False for THD
+    #: GatedDeltaNet). Defaults to ``impl_cfg.deterministic``.
+    fsdp2_deterministic_fn: Callable[[ImplConfigLike], bool] | None = None
+
+    #: Register megatron grad-sync training hooks on the dist_opt path
+    #: (qwen3_moe opts out).
+    register_hooks: bool = True
 
 
 def _build_chunks(
@@ -156,7 +144,8 @@ def _wire_optimizer(
         attach_model_sharded_state_dict(
             chunks, ps, get_placements=spec.placement_fn, is_expert=spec.expert_classifier
         )
-        register_training_hooks(chunks, opt)
+        if spec.register_hooks:
+            register_training_hooks(chunks, opt)
         return opt, finalize_grads, None, "dist_opt"
 
     if optimizer == "fsdp2":
@@ -171,7 +160,11 @@ def _wire_optimizer(
                     ps,
                     unit_modules=spec.fsdp2_unit_modules(),
                     expert_classifier=spec.expert_classifier,
-                    deterministic=impl_cfg.deterministic,
+                    deterministic=(
+                        spec.fsdp2_deterministic_fn(impl_cfg)
+                        if spec.fsdp2_deterministic_fn is not None
+                        else impl_cfg.deterministic
+                    ),
                     vpp=impl_cfg.parallel.vpp,
                     leaf_module_names=(),
                     **spec.fsdp2_extra_kwargs,
@@ -206,6 +199,8 @@ def assemble(
 
     _apply_recompute_offload(spec, chunks, impl_cfg)
 
+    extra_extras = spec.extra_extras(chunks, impl_cfg) if spec.extra_extras is not None else {}
+
     optimizer, finalize_grads, post_model_load_hook, optimizer_backend = _wire_optimizer(
         spec, chunks, model_cfg, impl_cfg, ps
     )
@@ -217,6 +212,7 @@ def assemble(
     }
     if spec.pre_forward_hook_factory is not None:
         extras["pre_forward_hook"] = spec.pre_forward_hook_factory()
+    extras.update(extra_extras)
 
     return ModelBundle(
         chunks=chunks,

@@ -529,19 +529,14 @@ def test_glm5_impl_config_accepts_runtime_mtp_fields():
 def test_glm5_protocol_uses_mlite_optimizer_api():
     from megatron.lite.model.glm5.lite.protocol import ImplConfig
 
-    protocol_path = (
-        Path(__file__).resolve().parents[3]
-        / "megatron"
-        / "lite"
-        / "model"
-        / "glm5"
-        / "lite"
-        / "protocol.py"
-    )
-    protocol_text = protocol_path.read_text()
+    lite = Path(__file__).resolve().parents[3] / "megatron" / "lite"
+    protocol_text = (lite / "model" / "glm5" / "lite" / "protocol.py").read_text()
+    kernel_text = (lite / "model" / "compose.py").read_text()
 
     assert ImplConfig().optimizer == "dist_opt"
-    assert "build_dist_opt_training_optimizer" in protocol_text
+    # glm5 delegates to the shared kernel, which owns the dist_opt wiring.
+    assert "assemble(spec, model_cfg, impl_cfg)" in protocol_text
+    assert "build_dist_opt_training_optimizer" in kernel_text
 
 
 def test_glm5_lite_tiny_forward_backward(monkeypatch):
