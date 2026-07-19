@@ -10,6 +10,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+try:
+    from torch.distributed.tensor import DTensor
+except ImportError:  # pragma: no cover - supported Torch always has DTensor
+    DTensor = ()  # type: ignore[assignment]
+
 from megatron.lite.primitive.parallel.state import ParallelState
 
 
@@ -48,14 +53,23 @@ def _count_marked_modules(chunks: list[nn.Module], marker: str) -> int:
 
 
 def _expert_shard_ratio(chunks: list[nn.Module], parallel_state: ParallelState) -> str:
-    has_experts = any(
-        name == "experts" or name.endswith(".experts")
+    """Report observed routed-expert DTensor sharding, never topology intent."""
+    del parallel_state  # Placement is a property of the assembled parameters.
+    expert_params = [
+        parameter
         for chunk in chunks
-        for name, _module in chunk.named_modules()
+        for name, parameter in chunk.named_parameters()
+        if ".experts." in name or name.startswith("experts.")
+    ]
+    dtensor_experts = [parameter for parameter in expert_params if isinstance(parameter, DTensor)]
+    if not dtensor_experts:
+        return "n/a (no DTensor expert params)"
+
+    sharded = sum(
+        any(type(placement).__name__ == "Shard" for placement in parameter.placements)
+        for parameter in dtensor_experts
     )
-    if not has_experts:
-        return "n/a"
-    return f"1/{parallel_state.ep_size} (ep)"
+    return f"{sharded}/{len(dtensor_experts)} (DTensor placements)"
 
 
 def _optimizer_state_devices(optimizer: Any | None) -> str:

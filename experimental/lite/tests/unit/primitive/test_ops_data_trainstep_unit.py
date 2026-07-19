@@ -209,7 +209,7 @@ def test_model_bundle_reports_actual_memory_feature_effects(capsys):
     output = capsys.readouterr().out
     assert "recompute_wrapped=1" in output
     assert "activation_offload=unsupported" in output
-    assert "expert_shard_ratio=1/4 (ep)" in output
+    assert "expert_shard_ratio=n/a (no DTensor expert params)" in output
     assert "optimizer_state_devices=cpu" in output
 
 
