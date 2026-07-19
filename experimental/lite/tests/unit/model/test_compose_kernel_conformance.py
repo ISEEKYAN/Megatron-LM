@@ -176,7 +176,6 @@ def test_optimizer_backend_name_normalizer(monkeypatch):
         optimizer_backend_name=lambda opt: "dist_opt" if isinstance(opt, dict) else opt,
     )
     # A dict optimizer must be normalized to dist_opt (would otherwise raise).
-    dist_opt_calls = {}
     monkeypatch.setattr(
         compose_kernel,
         "_wire_optimizer",
@@ -281,7 +280,14 @@ def test_ds4_build_model_has_no_inline_assembly():
 
 def test_ds4_build_model_is_small():
     """Net-negative proof-of-absorption: the delegating build_model is a thin
-    declaration, not a 120-line body."""
+    declaration, not a 120-line body. Count executable statements (comments and
+    the specialization note do not count)."""
     fn = _ds4_build_model_ast()
-    span = fn.end_lineno - fn.lineno + 1
-    assert span < 40, f"build_model should be a thin delegator, got {span} lines"
+    stmt_lines = {
+        node.lineno
+        for node in ast.walk(fn)
+        if isinstance(node, ast.stmt) and node is not fn
+    }
+    assert len(stmt_lines) < 20, (
+        f"build_model should be a thin delegator, got {len(stmt_lines)} statement lines"
+    )

@@ -415,6 +415,23 @@ def _ds4_fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
 
 
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+    # The shared assembly (VPP chunk build, recompute/offload, dist_opt/fsdp2
+    # wiring, sharded-state-dict attach, ModelBundle packing) is absorbed by
+    # ``compose_kernel.assemble``. What stays DS4-specific (irreducible
+    # specialization, declared through the spec below):
+    #   * chunk_factory: DS4-only train_cfg + model kwargs (CSA / hash-MoE /
+    #     mHC 4-D hidden knobs) that no other model shares;
+    #   * transformer_units: DS4 walks ``chunk.layers.values() + chunk.mtp``
+    #     (ModuleDict + MTP list), not the ``chunk.layers`` ModuleList siblings
+    #     use -- this is the single #114 unit enumeration;
+    #   * prepare: TP/ETP=1 CSA scope gate + MTP-layer config;
+    #   * post_chunk_hook: CSA/DSA attention-backend configuration (DS4 has no
+    #     cross-entropy-fusion toggle, unlike the sibling models);
+    #   * fsdp2_extra_kwargs: ``use_fp32_shards=False`` (DS4-only);
+    #   * optimizer_backend_name: DS4 accepts an OptimizerConfig/dict as the
+    #     optimizer and maps it to dist_opt.
+    # HF weight load/export/save stay in checkpoint.py: they are pure weight-name
+    # mapping + fp4/fp8 dequant + expert-index math, not composition assembly.
     spec = ModelSpec(
         name="deepseek_v4",
         chunk_factory=_ds4_chunk_factory,
