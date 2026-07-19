@@ -303,17 +303,8 @@ def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None
 
 
 def _make_aux_loss_hook():
-    """Per-step hook that syncs the MTP auxiliary-loss backward scale to the main
-    loss scale (DP size / gradient accumulation), mirroring the sibling protocols
-    (kimi_k2 / glm5 / qwen3_5 / qwen3_moe).
-
-    DS4 only injects an MTP auxiliary loss: its MoE router is aux-loss-free
-    (``SigmoidTopKRouter(..., compute_aux_loss=False)``) and its CSA indexer runs
-    with ``sparse_loss=False``, so -- unlike GLM-5, which also scales the MoE-aux
-    and DSA-indexer losses -- only ``MTPLossAutoScaler`` needs scaling here.
-    Without this hook the injected MTP gradient keeps ``MTPLossAutoScaler``'s
-    class-default scale of 1.0 and is mis-weighted relative to the main loss.
-    """
+    # DS4 only injects an MTP aux loss (MoE router + CSA indexer are aux-free),
+    # so only MTPLossAutoScaler needs scaling (unlike GLM-5).
     from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 
     def hook(scale: torch.Tensor) -> None:
@@ -337,9 +328,7 @@ def _configure_attention_backend(chunks: list[nn.Module], *, backend: str | None
 
 
 def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
-    # Native DS4 chunks are DeepseekV4Model instances themselves. Keep support
-    # for wrapper-style chunks, but do not require a `.model` indirection or
-    # recompute/offload silently applies to zero transformer layers.
+    # #114 unit walk: DS4 uses layers.values()+mtp (ModuleDict + MTP list).
     model = getattr(chunk, "model", chunk)
     layers = list(getattr(model, "layers", {}).values())
     mtp_layers = list(getattr(model, "mtp", []))
@@ -347,11 +336,7 @@ def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
 
 
 def _validate_parallel_scope(p: ParallelConfig) -> None:
-    """DS4 CSA attention is not tensor-parallel-capable (documented TP=1 case).
-
-    PP / VPP / EP / CP are inherited from the Kimi skeleton and work; only
-    TP>1 / ETP>1 are unsupported.  Mirrors GLM-5's gate.
-    """
+    # DS4 CSA attention is TP=1/ETP=1 only (PP/VPP/EP/CP work).
     etp = 1 if p.etp is None else p.etp
     if p.tp > 1:
         raise NotImplementedError(
@@ -415,23 +400,10 @@ def _ds4_fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
 
 
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    # The shared assembly (VPP chunk build, recompute/offload, dist_opt/fsdp2
-    # wiring, sharded-state-dict attach, ModelBundle packing) is absorbed by
-    # ``compose.assemble``. What stays DS4-specific (irreducible
-    # specialization, declared through the spec below):
-    #   * chunk_factory: DS4-only train_cfg + model kwargs (CSA / hash-MoE /
-    #     mHC 4-D hidden knobs) that no other model shares;
-    #   * transformer_units: DS4 walks ``chunk.layers.values() + chunk.mtp``
-    #     (ModuleDict + MTP list), not the ``chunk.layers`` ModuleList siblings
-    #     use -- this is the single #114 unit enumeration;
-    #   * prepare: TP/ETP=1 CSA scope gate + MTP-layer config;
-    #   * post_chunk_hook: CSA/DSA attention-backend configuration (DS4 has no
-    #     cross-entropy-fusion toggle, unlike the sibling models);
-    #   * fsdp2_extra_kwargs: ``use_fp32_shards=False`` (DS4-only);
-    #   * optimizer_backend_name: DS4 accepts an OptimizerConfig/dict as the
-    #     optimizer and maps it to dist_opt.
-    # HF weight load/export/save stay in checkpoint.py: they are pure weight-name
-    # mapping + fp4/fp8 dequant + expert-index math, not composition assembly.
+    # DS4 specialization vs the shared kernel: CSA/hash-MoE chunk kwargs,
+    # layers.values()+mtp unit walk, TP=1 CSA gate, attention-backend hook,
+    # use_fp32_shards=False, OptimizerConfig->dist_opt normalizer. HF weight I/O
+    # stays in checkpoint.py.
     spec = ModelSpec(
         name="deepseek_v4",
         chunk_factory=_ds4_chunk_factory,
