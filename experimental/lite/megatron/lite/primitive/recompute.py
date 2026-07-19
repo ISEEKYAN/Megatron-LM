@@ -194,37 +194,59 @@ def apply_recompute(
     module_names: list[str],
     module_map: ModuleMap,
     no_rng_modules: set[str] | None = None,
-) -> None:
-    """Wrap specified sub-modules with activation checkpointing for recomputation."""
+) -> int:
+    """Wrap requested modules and return the number actually checkpointed.
+
+    A non-empty feature request which selects no module is a configuration
+    error.  Silently accepting it makes an OOM look unrelated to recompute.
+    """
     if not module_names:
-        return
+        return 0
     no_rng = no_rng_modules or set()
+    wrapped = 0
     for layer in layers:
         if "full" in module_names:
             wrap_checkpoint(layer)
+            wrapped += 1
         else:
             for mod_name in module_names:
                 if mod_name in module_map:
                     submod = module_map[mod_name](layer)
                     if submod is not None:
                         wrap_checkpoint(submod, preserve_rng_state=mod_name not in no_rng)
+                        wrapped += 1
+    if wrapped == 0:
+        raise ValueError(
+            f"recompute requested for {module_names!r}, but wrapped 0 modules. "
+            "Check transformer-unit enumeration and the model module map."
+        )
+    return wrapped
 
 
-def apply_offload(layers: nn.ModuleList, module_names: list[str], module_map: ModuleMap) -> None:
-    """Wrap specified sub-modules with activation offloading to CPU."""
+def apply_offload(layers: nn.ModuleList, module_names: list[str], module_map: ModuleMap) -> int:
+    """Wrap requested modules for activation offload and return the wrapped count."""
     if not module_names:
-        return
+        return 0
     try:
         from torch.utils.checkpoint import CheckpointPolicy  # noqa: F401
     except ImportError:
-        log_rank0("WARNING: torch.utils.checkpoint policy_fn not available, skipping offload")
-        return
+        raise RuntimeError(
+            "activation offload was requested but torch.utils.checkpoint policy_fn is unavailable"
+        ) from None
+    wrapped = 0
     for layer in layers:
         for mod_name in module_names:
             if mod_name in module_map:
                 submod = module_map[mod_name](layer)
                 if submod is not None:
                     wrap_offload(submod)
+                    wrapped += 1
+    if wrapped == 0:
+        raise ValueError(
+            f"activation offload requested for {module_names!r}, but wrapped 0 modules. "
+            "Check transformer-unit enumeration and the model module map."
+        )
+    return wrapped
 
 
 class CheckpointFunction(torch.autograd.Function):
@@ -246,7 +268,7 @@ class CheckpointFunction(torch.autograd.Function):
         # Save RNG states for deterministic recomputation.
         if preserve_rng_state:
             ctx.cpu_rng_state = torch.get_rng_state()
-            ctx.cuda_rng_state = torch.cuda.get_rng_state()
+            ctx.cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
 
         # Run forward without gradient tracking — discard intermediate activations.
         with torch.no_grad():
@@ -268,9 +290,10 @@ class CheckpointFunction(torch.autograd.Function):
         # Fork RNG: restore forward-time states, then reset to current after recompute.
         if ctx.preserve_rng_state:
             current_cpu_rng = torch.get_rng_state()
-            current_cuda_rng = torch.cuda.get_rng_state()
+            current_cuda_rng = torch.cuda.get_rng_state() if ctx.cuda_rng_state is not None else None
             torch.set_rng_state(ctx.cpu_rng_state)
-            torch.cuda.set_rng_state(ctx.cuda_rng_state)
+            if ctx.cuda_rng_state is not None:
+                torch.cuda.set_rng_state(ctx.cuda_rng_state)
 
         # Recompute forward pass with gradients enabled.
         detached = tuple(
@@ -283,7 +306,8 @@ class CheckpointFunction(torch.autograd.Function):
         # Restore RNG states.
         if ctx.preserve_rng_state:
             torch.set_rng_state(current_cpu_rng)
-            torch.cuda.set_rng_state(current_cuda_rng)
+            if current_cuda_rng is not None:
+                torch.cuda.set_rng_state(current_cuda_rng)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
@@ -339,6 +363,7 @@ def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> No
         return CheckpointFunction.apply(_fn, preserve_rng_state, *args)
 
     module.forward = _checkpointed_forward
+    module._megatron_lite_recompute_wrapped = True
 
 
 def wrap_offload(module: nn.Module) -> None:
@@ -351,6 +376,7 @@ def wrap_offload(module: nn.Module) -> None:
         )
 
     module.forward = _offloaded_forward
+    module._megatron_lite_offload_wrapped = True
 
 
 def log_rank0(msg: str) -> None:
