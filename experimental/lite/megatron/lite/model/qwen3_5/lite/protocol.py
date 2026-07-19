@@ -22,7 +22,7 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import EXPERT_CLASSIFIER, PLACE
 from megatron.lite.model.qwen3_5.lite.checkpoint import export_hf_weights as _export_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
-from megatron.lite.model.compose import ModelSpec, assemble
+from megatron.lite.model.compose import assemble
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.recompute import parse_recompute_spec
@@ -139,10 +139,6 @@ def _make_aux_loss_hook():
     return hook
 
 
-def _iter_transformer_units(chunk: nn.Module):
-    return chunk.layers
-
-
 def _effective_deterministic(model_cfg: Qwen35Config, impl_cfg: ImplConfig) -> bool:
     # THD GatedDeltaNet kernel is non-deterministic; force off in that case.
     if impl_cfg.use_thd and impl_cfg.deterministic and "linear_attention" in model_cfg.layer_types:
@@ -200,10 +196,12 @@ def _fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
 
 
 def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    spec = ModelSpec(
+    return assemble(
+        model_cfg,
+        impl_cfg,
         name="qwen3_5",
         chunk_factory=_chunk_factory,
-        transformer_units=_iter_transformer_units,
+        transformer_units=lambda chunk: chunk.layers,
         module_map=MODULE_MAP,
         forward_step=_forward_step if impl_cfg.use_thd else _forward_step_bshd,
         expert_classifier=is_expert_param,
@@ -214,9 +212,9 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
             chunks, impl.cross_entropy_fusion
         ),
         pre_forward_hook_factory=_make_aux_loss_hook,
+        # THD GatedDeltaNet kernel is non-deterministic; force off on that path.
         fsdp2_deterministic_fn=lambda impl: _effective_deterministic(model_cfg, impl),
     )
-    return assemble(spec, model_cfg, impl_cfg)
 
 
 def load_hf_weights(

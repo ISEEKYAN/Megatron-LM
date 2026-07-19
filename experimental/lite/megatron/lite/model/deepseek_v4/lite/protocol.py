@@ -21,7 +21,7 @@ from megatron.lite.model.protocol_utils import (
     pack_r3_replay_mask as _pack_r3_replay_mask,
     pack_routed_experts as _pack_routed_experts,
 )
-from megatron.lite.model.compose import ModelSpec, assemble
+from megatron.lite.model.compose import assemble
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.parallel.cp import (
@@ -303,8 +303,7 @@ def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None
 
 
 def _make_aux_loss_hook():
-    # DS4 only injects an MTP aux loss (MoE router + CSA indexer are aux-free),
-    # so only MTPLossAutoScaler needs scaling (unlike GLM-5).
+    # DS4 injects only an MTP aux loss (MoE router + CSA indexer are aux-free).
     from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 
     def hook(scale: torch.Tensor) -> None:
@@ -313,26 +312,18 @@ def _make_aux_loss_hook():
     return hook
 
 
-def _optimizer_backend_name(optimizer: Any) -> str | None:
-    if isinstance(optimizer, dict) or isinstance(optimizer, OptimizerConfig):
-        return "dist_opt"
-    return optimizer
-
-
-def _configure_attention_backend(chunks: list[nn.Module], *, backend: str | None) -> None:
-    backend_name = backend or "torch"
+def _configure_attention_backend(chunks: list[nn.Module], impl_cfg: ImplConfig) -> None:
+    backend = impl_cfg.attention_backend_override or "torch"
     for chunk in chunks:
         for module in chunk.modules():
             if hasattr(module, "attention_backend"):
-                module.attention_backend = backend_name
+                module.attention_backend = backend
 
 
 def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
     # #114 unit walk: DS4 uses layers.values()+mtp (ModuleDict + MTP list).
     model = getattr(chunk, "model", chunk)
-    layers = list(getattr(model, "layers", {}).values())
-    mtp_layers = list(getattr(model, "mtp", []))
-    return [*layers, *mtp_layers]
+    return [*getattr(model, "layers", {}).values(), *getattr(model, "mtp", [])]
 
 
 def _validate_parallel_scope(p: ParallelConfig) -> None:
@@ -400,11 +391,13 @@ def _ds4_fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
 
 
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    # DS4 specialization vs the shared kernel: CSA/hash-MoE chunk kwargs,
-    # layers.values()+mtp unit walk, TP=1 CSA gate, attention-backend hook,
-    # use_fp32_shards=False, OptimizerConfig->dist_opt normalizer. HF weight I/O
-    # stays in checkpoint.py.
-    spec = ModelSpec(
+    # DS4 deltas: CSA/hash-MoE chunk kwargs, layers.values()+mtp unit walk, TP=1
+    # CSA scope gate + MTP config (prepare), attention-backend post-hook,
+    # use_fp32_shards=False, OptimizerConfig->dist_opt normalizer. HF I/O stays
+    # in checkpoint.py.
+    return assemble(
+        model_cfg,
+        impl_cfg,
         name="deepseek_v4",
         chunk_factory=_ds4_chunk_factory,
         transformer_units=_iter_transformer_units,
@@ -414,14 +407,14 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         placement_fn=PLACEMENT_FN,
         fsdp2_unit_modules=_ds4_fsdp2_unit_modules,
         prepare=_ds4_prepare,
-        post_chunk_hook=lambda chunks, impl: _configure_attention_backend(
-            chunks, backend=impl.attention_backend_override
-        ),
+        post_chunk_hook=_configure_attention_backend,
         pre_forward_hook_factory=_make_aux_loss_hook,
         fsdp2_extra_kwargs={"use_fp32_shards": False},
-        optimizer_backend_name=_optimizer_backend_name,
+        # DS4 threads an OptimizerConfig/dict as ``optimizer`` -> dist_opt backend.
+        optimizer_backend_name=lambda opt: (
+            "dist_opt" if isinstance(opt, (dict, OptimizerConfig)) else opt
+        ),
     )
-    return assemble(spec, model_cfg, impl_cfg)
 
 
 def load_hf_weights(

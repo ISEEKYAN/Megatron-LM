@@ -1,10 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Qwen3MoE lite impl — reference model protocol. Copy + adapt for new models.
 
-Runtime calls: ``build_model_config(source, **overrides) -> ModelConfig`` and
-``build_model(model_cfg, *, impl_cfg) -> ModelBundle`` (declares a ModelSpec and
-delegates to ``compose.assemble``). Optional: ``load_hf_weights`` /
-``export_hf_weights`` / ``vocab_size``.
+Runtime calls ``build_model_config(source, **overrides)`` then
+``build_model(model_cfg, *, impl_cfg)`` (delegates to ``compose.assemble``).
 """
 
 from __future__ import annotations
@@ -26,7 +24,7 @@ from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
 from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
-from megatron.lite.model.compose import ModelSpec, assemble
+from megatron.lite.model.compose import assemble
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
@@ -60,7 +58,7 @@ class ImplConfig:
     """Lite impl knobs. Constructed by runtime from user config."""
 
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
-    optimizer: str | None = "dist_opt"  # None = no optimizer (inference)
+    optimizer: str | None = "dist_opt"
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
@@ -93,11 +91,6 @@ MODULE_MAP = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Required: build_model_config
-# ---------------------------------------------------------------------------
-
-
 def build_model_config(source: str | Path | dict, **overrides) -> Qwen3MoEConfig:
     """Build Qwen3MoE architecture config from HF source."""
     if isinstance(source, dict):
@@ -108,11 +101,6 @@ def build_model_config(source: str | Path | dict, **overrides) -> Qwen3MoEConfig
         if hasattr(cfg, k):
             setattr(cfg, k, v)
     return cfg
-
-
-# ---------------------------------------------------------------------------
-# Required: build_model
-# ---------------------------------------------------------------------------
 
 
 def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
@@ -129,10 +117,6 @@ def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     return unpack_thd_forward_output(model, batch, output)
-
-
-def _iter_transformer_units(chunk: nn.Module):
-    return chunk.layers
 
 
 def _prepare(model_cfg: Qwen3MoEConfig, impl_cfg: ImplConfig, ps: ParallelState) -> None:
@@ -200,13 +184,14 @@ def _lora_extras(chunks: list[nn.Module], impl_cfg: ImplConfig) -> dict[str, Any
 
 
 def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBundle:
-    # LoRA freeze + stats run in extra_extras (after recompute/offload, matching
-    # the original order, before the optimizer). qwen3_moe does NOT register the
-    # megatron grad-sync training hooks (register_hooks=False).
-    spec = ModelSpec(
+    # extra_extras (LoRA freeze+stats) runs before the optimizer sees params;
+    # register_hooks=False: qwen3_moe skips the megatron grad-sync hooks.
+    return assemble(
+        model_cfg,
+        impl_cfg,
         name="qwen3_moe",
         chunk_factory=_chunk_factory,
-        transformer_units=_iter_transformer_units,
+        transformer_units=lambda chunk: chunk.layers,
         module_map=MODULE_MAP,
         forward_step=_forward_step if impl_cfg.use_thd else _forward_step_bshd,
         expert_classifier=is_expert_param,
@@ -220,12 +205,6 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         extra_extras=_lora_extras,
         register_hooks=False,
     )
-    return assemble(spec, model_cfg, impl_cfg)
-
-
-# ---------------------------------------------------------------------------
-# Optional: load_hf_weights
-# ---------------------------------------------------------------------------
 
 
 def load_hf_weights(
@@ -245,11 +224,6 @@ def export_hf_weights(
 
     for chunk in chunks:
         yield from _export(chunk, model_cfg, ps, **kwargs)
-
-
-# ---------------------------------------------------------------------------
-# Tooling metadata (benchmark / debug)
-# ---------------------------------------------------------------------------
 
 
 def vocab_size(model_cfg: Qwen3MoEConfig) -> int | None:

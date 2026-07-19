@@ -535,7 +535,7 @@ def test_glm5_protocol_uses_mlite_optimizer_api():
 
     assert ImplConfig().optimizer == "dist_opt"
     # glm5 delegates to the shared kernel, which owns the dist_opt wiring.
-    assert "assemble(spec, model_cfg, impl_cfg)" in protocol_text
+    assert "assemble(" in protocol_text
     assert "build_dist_opt_training_optimizer" in kernel_text
 
 

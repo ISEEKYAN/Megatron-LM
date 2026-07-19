@@ -109,10 +109,9 @@ def test_kimi_k2_lite_optimizer_names_are_current():
     lite = Path(__file__).resolve().parents[3] / "megatron" / "lite"
     protocol_text = (lite / "model" / "kimi_k2" / "lite" / "protocol.py").read_text()
     # optimizer dispatch is absorbed by the shared kernel; kimi declares the
-    # default and delegates via ModelSpec + assemble.
+    # default and delegates via assemble() with inline deltas.
     assert 'optimizer: str | None = "dist_opt"' in protocol_text
-    assert "ModelSpec(" in protocol_text
-    assert "assemble(spec, model_cfg, impl_cfg)" in protocol_text
+    assert "assemble(" in protocol_text
     # The current dist_opt / fsdp2 branch names live in the kernel.
     kernel_text = (lite / "model" / "compose.py").read_text()
     assert 'optimizer == "dist_opt"' in kernel_text

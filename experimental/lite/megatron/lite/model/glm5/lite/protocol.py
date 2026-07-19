@@ -19,7 +19,7 @@ from megatron.lite.model.protocol_utils import (
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
-from megatron.lite.model.compose import ModelSpec, assemble
+from megatron.lite.model.compose import assemble
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.recompute import parse_recompute_spec
@@ -41,29 +41,17 @@ def is_expert_param(name: str) -> bool:
     return EXPERT_CLASSIFIER(name)
 
 
-def _maybe(module_name: str):
-    def getter(layer):
-        module = getattr(layer, module_name, None)
-        return module
-
-    return getter
-
-
-def _moe_module(name: str):
-    def getter(layer):
-        moe = getattr(layer, "moe", None)
-        return getattr(moe, name, None) if moe is not None else None
-
-    return getter
+def _moe_sub(name):
+    return lambda layer: getattr(getattr(layer, "moe", None), name, None)
 
 
 # GLM-5: attention entries target the DSA wrapper (Kimi uses MLA).
 MODULE_MAP = {
     "core_attn": lambda layer: layer.self_attention.self_attention,
-    "experts": _moe_module("experts"),
-    "moe": _maybe("moe"),
-    "router": _moe_module("router"),
-    "mlp": _maybe("mlp"),
+    "experts": _moe_sub("experts"),
+    "moe": lambda layer: getattr(layer, "moe", None),
+    "router": _moe_sub("router"),
+    "mlp": lambda layer: getattr(layer, "mlp", None),
     "mlp_norm": lambda layer: layer.mlp_norm,
     "attn_proj": lambda layer: layer.self_attention.self_attention.o_proj,
     "self_attn": lambda layer: layer.self_attention,
@@ -144,10 +132,6 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
         )
 
 
-def _iter_transformer_units(chunk: nn.Module):
-    return chunk.layers
-
-
 def _prepare(model_cfg: Glm5Config, impl_cfg: ImplConfig, ps: ParallelState) -> None:
     p = impl_cfg.parallel
     _validate_parallel_scope(p)
@@ -198,10 +182,12 @@ def _fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
 
 
 def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    spec = ModelSpec(
+    return assemble(
+        model_cfg,
+        impl_cfg,
         name="glm5",
         chunk_factory=_chunk_factory,
-        transformer_units=_iter_transformer_units,
+        transformer_units=lambda chunk: chunk.layers,
         module_map=MODULE_MAP,
         forward_step=_forward_step,
         expert_classifier=is_expert_param,
@@ -213,7 +199,6 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         ),
         pre_forward_hook_factory=_make_aux_loss_hook,
     )
-    return assemble(spec, model_cfg, impl_cfg)
 
 
 def load_hf_weights(
