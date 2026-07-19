@@ -390,11 +390,11 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     state = model.state_dict()
 
     assert torch.equal(
-        exported["model.layers.1.mlp.experts.2.gate_proj.weight"],
+        exported["model.layers.1.mlp.experts.2.gate_proj.weight"].detach().cpu(),
         state["layers.1.moe.experts.fc1.weight2"][: cfg.moe_intermediate_size].detach().cpu(),
     )
     assert torch.equal(
-        exported["model.layers.1.mlp.gate.e_score_correction_bias"],
+        exported["model.layers.1.mlp.gate.e_score_correction_bias"].detach().cpu(),
         state["layers.1.moe.router.expert_bias"].detach().cpu(),
     )
     assert "model.layers.1.mlp.experts.gate_up_proj" not in exported
