@@ -652,15 +652,10 @@ def export_hf_weights(model, config: Glm5Config, ps: ParallelState, **kwargs):
 
 
 def save_hf_weights(model, path: str, config: Glm5Config, ps: ParallelState, **kwargs) -> None:
-    from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
+    from megatron.lite.primitive.ckpt.hf_weights import save_hf_weights as _save
 
-    rank = dist.get_rank() if dist.is_initialized() else 0
     kwargs.pop("cpu", None)
-    out = dict(export_hf_weights(model, config, ps, rank0_only=True, cpu=True, **kwargs))
-    if rank == 0 and out:
-        save_safetensors(out, path)
-    if dist.is_initialized():
-        dist.barrier()
+    _save(model, path, config, ps, export_fn=export_hf_weights, **kwargs)
 
 
 __all__ = [

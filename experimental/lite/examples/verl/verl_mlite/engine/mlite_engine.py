@@ -436,9 +436,10 @@ class MegatronLiteEngine(BaseEngine):
         self._require_initialized()
 
         save_contents = self.checkpoint_config.get("save_contents", None)
+        save_hf_model = save_contents is not None and "hf_model" in save_contents
         save_model = save_contents is None or "model" in save_contents
         save_optimizer = save_contents is None or "optimizer" in save_contents
-        if not save_model and not save_optimizer:
+        if not save_model and not save_optimizer and not save_hf_model:
             if self._rank == 0:
                 print(
                     f"Skipping Megatron Lite checkpoint save at step {global_step}: save_contents={save_contents}"
@@ -449,33 +450,56 @@ class MegatronLiteEngine(BaseEngine):
 
         os.makedirs(local_path, exist_ok=True)
         placement_fn, expert_classifier = self._checkpoint_hooks()
-        reload_params_for_save = self.is_param_offload_enabled
+        reload_params_for_save = self.is_param_offload_enabled and (
+            save_model or save_optimizer or save_hf_model
+        )
         if reload_params_for_save:
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
         try:
-            save_training_checkpoint(
-                self.module,
-                self.handle._optimizer,
-                global_step,
-                local_path,
-                self.handle._config.parallel,
-                self.handle._parallel_state,
-                get_placements=placement_fn,
-                is_expert=expert_classifier,
-                save_model=save_model,
-                save_optimizer=save_optimizer,
-            )
-            if self.handle._lr_scheduler is not None and self._rank == 0:
-                torch.save(
-                    self.handle._lr_scheduler.state_dict(),
-                    os.path.join(local_path, _LR_SCHEDULER_STATE),
+            if save_model or save_optimizer:
+                save_training_checkpoint(
+                    self.module,
+                    self.handle._optimizer,
+                    global_step,
+                    local_path,
+                    self.handle._config.parallel,
+                    self.handle._parallel_state,
+                    get_placements=placement_fn,
+                    is_expert=expert_classifier,
+                    save_model=save_model,
+                    save_optimizer=save_optimizer,
                 )
-            if dist.is_initialized():
-                dist.barrier()
+                if self.handle._lr_scheduler is not None and self._rank == 0:
+                    torch.save(
+                        self.handle._lr_scheduler.state_dict(),
+                        os.path.join(local_path, _LR_SCHEDULER_STATE),
+                    )
+                if dist.is_initialized():
+                    dist.barrier()
+            if save_hf_model:
+                self._save_hf_checkpoint(local_path)
         finally:
             if reload_params_for_save:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
+
+    def _save_hf_checkpoint(self, local_path: str) -> None:
+        extras = self.handle._extras
+        protocol = extras.get("protocol")
+        save_hf_weights = getattr(protocol, "save_hf_weights", None)
+        if not callable(save_hf_weights):
+            raise RuntimeError(
+                f"MLite model protocol {protocol!r} does not expose save_hf_weights."
+            )
+        model_chunks = extras.get("model_chunks")
+        if model_chunks is None:
+            model_chunks = [self.handle._model]
+        save_hf_weights(
+            model_chunks,
+            local_path,
+            extras.get("model_cfg"),
+            self.handle._parallel_state,
+        )
 
     def load_checkpoint(
         self,

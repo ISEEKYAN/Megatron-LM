@@ -6,7 +6,6 @@ import inspect
 import json
 import sys
 import types
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -25,6 +24,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     _iter_bucketed_materialized_tensors,
     bucketed_all_gather_into_tensor,
     export_hf_weights,
+    save_hf_weights,
 )
 
 
@@ -61,6 +61,93 @@ def test_safe_tensor_reader_context_reuses_and_closes_shard(monkeypatch, tmp_pat
 
 def test_export_defaults_to_device_resident_tensors() -> None:
     assert inspect.signature(export_hf_weights).parameters["cpu"].default is False
+
+
+def test_save_hf_weights_streams_shards_and_replaces_stale_artifacts(tmp_path, monkeypatch):
+    import megatron.lite.primitive.ckpt.hf_weights as hf_weights
+
+    output = tmp_path / "huggingface"
+    output.mkdir()
+    (output / "config.json").write_text('{"model_type": "test"}')
+    (output / "model.safetensors").write_bytes(b"stale")
+    (output / "model-00002-of-00002.safetensors").write_bytes(b"stale")
+    (output / "model.safetensors.index.json").write_text(
+        '{"metadata": {}, "weight_map": {"stale": "model.safetensors"}}'
+    )
+    stage = tmp_path / "stage"
+
+    def fake_export(*args, **kwargs):
+        assert kwargs["rank0_only"] is True
+        assert kwargs["cpu"] is True
+        yield "first", torch.arange(2, dtype=torch.float32)
+        yield "second", torch.arange(2, dtype=torch.float32) + 10
+
+    monkeypatch.setattr(hf_weights, "export_hf_weights", fake_export)
+
+    save_hf_weights(
+        object(),
+        str(output),
+        object(),
+        object(),
+        shard_size_bytes=8,
+    )
+
+    assert sorted(path.name for path in output.iterdir()) == [
+        "config.json",
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+        "model.safetensors.index.json",
+    ]
+    assert (output / "config.json").read_text() == '{"model_type": "test"}'
+    index = __import__("json").loads(
+        (output / "model.safetensors.index.json").read_text()
+    )
+    assert index["weight_map"] == {
+        "first": "model-00001-of-00002.safetensors",
+        "second": "model-00002-of-00002.safetensors",
+    }
+    reader = SafeTensorReader(str(output))
+    assert torch.equal(reader.get_tensor("first"), torch.arange(2, dtype=torch.float32))
+    assert not stage.exists()
+
+
+def test_save_hf_weights_rejects_duplicate_keys(tmp_path, monkeypatch):
+    import megatron.lite.primitive.ckpt.hf_weights as hf_weights
+
+    def fake_export(*args, **kwargs):
+        yield "same", torch.ones(1)
+        yield "same", torch.zeros(1)
+
+    monkeypatch.setattr(hf_weights, "export_hf_weights", fake_export)
+
+    with pytest.raises(ValueError, match="duplicate HF tensor key"):
+        save_hf_weights(object(), str(tmp_path / "huggingface"), object(), object())
+
+
+def test_save_hf_weights_accepts_model_owned_exporter(tmp_path):
+    marker = object()
+    calls = []
+
+    def model_owned_export(model, spec, ps, **kwargs):
+        calls.append((model, spec, ps, kwargs))
+        yield "mapped", torch.ones(1)
+
+    save_hf_weights(
+        "model",
+        str(tmp_path / "huggingface"),
+        marker,
+        "parallel",
+        export_fn=model_owned_export,
+    )
+
+    assert calls == [
+        (
+            "model",
+            marker,
+            "parallel",
+            {"rank0_only": True, "cpu": True},
+        )
+    ]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
