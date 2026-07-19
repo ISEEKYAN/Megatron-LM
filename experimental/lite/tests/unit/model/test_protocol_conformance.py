@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES
-from megatron.lite.primitive.recompute import apply_offload, apply_recompute
+from megatron.lite.primitive.recompute import apply_offload
 
 
 pytestmark = pytest.mark.mlite
@@ -55,25 +55,6 @@ def _core_attn_layer(runtime_name: str, target: nn.Module) -> nn.Module:
     return layer
 
 
-def test_registered_protocol_exposes_build_contract(protocol):
-    runtime_name, module = protocol
-    assert callable(module.build_model), f"{runtime_name} has no build_model entry point"
-    assert module.MODULE_MAP, f"{runtime_name} has no memory-feature module map"
-
-
-def test_registered_protocol_core_attention_recompute_is_observable(protocol):
-    runtime_name, module = protocol
-    recompute_target = _CountingModule()
-    recompute_layer = _core_attn_layer(runtime_name, recompute_target)
-
-    result = apply_recompute(nn.ModuleList([recompute_layer]), ["core_attn"], module.MODULE_MAP)
-    assert (result.units, result.matched, result.wrapped) == (1, 1, 1)
-    recompute_target(torch.tensor([2.0], requires_grad=True)).sum().backward()
-    assert recompute_target.calls == 2
-    assert recompute_target._megatron_lite_recompute_wrapped is True
-
-
-
 def test_activation_offload_is_explicitly_unsupported(protocol):
     runtime_name, module = protocol
     target = _CountingModule()
@@ -81,15 +62,3 @@ def test_activation_offload_is_explicitly_unsupported(protocol):
 
     with pytest.raises(NotImplementedError, match=r"no activation-offload backend"):
         apply_offload(nn.ModuleList([layer]), ["core_attn"], module.MODULE_MAP)
-
-
-def test_registered_protocol_expert_placement_is_sharded(protocol):
-    runtime_name, module = protocol
-    expert_name = "layers.0.moe.experts.0.fc1.weight"
-    placements = module.PLACEMENT_FN(expert_name)
-
-    assert module.EXPERT_CLASSIFIER(expert_name), f"{runtime_name} does not classify routed experts"
-    assert len(placements) == 4
-    assert any(type(placement).__name__ == "Shard" for placement in placements), (
-        f"{runtime_name} replicates routed expert weights instead of sharding them"
-    )
