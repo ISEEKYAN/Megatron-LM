@@ -154,7 +154,8 @@ def test_recompute_parser_and_wrapper_replays_forward_on_backward():
         {"inner": lambda module: module.inner},
         no_rng_modules={"inner"},
     )
-    assert wrapped == 1
+    assert wrapped.wrapped == 1
+    assert wrapped.matched == 1
 
     x = torch.tensor([2.0, -3.0], requires_grad=True)
     layer.inner(x).sum().backward()
@@ -163,13 +164,26 @@ def test_recompute_parser_and_wrapper_replays_forward_on_backward():
     torch.testing.assert_close(x.grad, torch.tensor([4.0, -6.0]))
 
 
-def test_memory_feature_requests_fail_loud_when_no_module_was_wrapped():
+def test_memory_feature_requests_fail_loud_when_configuration_cannot_take_effect():
     empty_layers = nn.ModuleList()
 
-    with pytest.raises(ValueError, match=r"recompute requested.*wrapped 0 modules"):
+    with pytest.raises(ValueError, match=r"recompute requested.*0 transformer units"):
         apply_recompute(empty_layers, ["full"], {})
-    with pytest.raises(ValueError, match=r"activation offload requested.*wrapped 0 modules"):
+    with pytest.raises(NotImplementedError, match=r"no activation-offload backend"):
         apply_offload(empty_layers, ["full"], {})
+
+
+def test_recompute_reports_matches_and_does_not_double_wrap():
+    layer = nn.Module()
+    layer.inner = nn.Linear(2, 2)
+    layers = nn.ModuleList([layer])
+    module_map = {"inner": lambda module: module.inner}
+
+    first = apply_recompute(layers, ["inner"], module_map)
+    second = apply_recompute(layers, ["inner"], module_map)
+
+    assert (first.units, first.matched, first.wrapped) == (1, 1, 1)
+    assert (second.units, second.matched, second.wrapped) == (1, 1, 0)
 
 
 def test_model_bundle_reports_actual_memory_feature_effects(capsys):
@@ -194,7 +208,7 @@ def test_model_bundle_reports_actual_memory_feature_effects(capsys):
 
     output = capsys.readouterr().out
     assert "recompute_wrapped=1" in output
-    assert "activation_offload_wrapped=0" in output
+    assert "activation_offload=unsupported" in output
     assert "expert_shard_ratio=1/4 (ep)" in output
     assert "optimizer_state_devices=cpu" in output
 

@@ -32,13 +32,12 @@ class ModelBundle:
     def __post_init__(self) -> None:
         """Report the effective memory features at the shared protocol exit."""
         recompute_wrapped = _count_marked_modules(self.chunks, "_megatron_lite_recompute_wrapped")
-        offload_wrapped = _count_marked_modules(self.chunks, "_megatron_lite_offload_wrapped")
         expert_shard = _expert_shard_ratio(self.chunks, self.parallel_state)
         optimizer_devices = _optimizer_state_devices(self.optimizer)
         _log_rank0(
             "memory feature audit: "
             f"recompute_wrapped={recompute_wrapped}, "
-            f"activation_offload_wrapped={offload_wrapped}, "
+            "activation_offload=unsupported, "
             f"expert_shard_ratio={expert_shard}, "
             f"optimizer_state_devices={optimizer_devices}"
         )

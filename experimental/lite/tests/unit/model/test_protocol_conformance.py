@@ -65,21 +65,26 @@ def test_registered_protocol_wires_both_memory_features(protocol):
     assert "ModelBundle(" in source, f"{runtime_name} bypasses the startup feature audit"
 
 
-def test_registered_protocol_core_attention_recompute_and_offload_are_observable(protocol):
+def test_registered_protocol_core_attention_recompute_is_observable(protocol):
     runtime_name, module = protocol
     recompute_target = _CountingModule()
     recompute_layer = _core_attn_layer(runtime_name, recompute_target)
 
-    assert apply_recompute(nn.ModuleList([recompute_layer]), ["core_attn"], module.MODULE_MAP) == 1
+    result = apply_recompute(nn.ModuleList([recompute_layer]), ["core_attn"], module.MODULE_MAP)
+    assert (result.units, result.matched, result.wrapped) == (1, 1, 1)
     recompute_target(torch.tensor([2.0], requires_grad=True)).sum().backward()
     assert recompute_target.calls == 2
     assert recompute_target._megatron_lite_recompute_wrapped is True
 
-    offload_target = _CountingModule()
-    offload_layer = _core_attn_layer(runtime_name, offload_target)
-    assert apply_offload(nn.ModuleList([offload_layer]), ["core_attn"], module.MODULE_MAP) == 1
-    offload_target(torch.tensor([2.0], requires_grad=True)).sum().backward()
-    assert offload_target._megatron_lite_offload_wrapped is True
+
+
+def test_activation_offload_is_explicitly_unsupported(protocol):
+    runtime_name, module = protocol
+    target = _CountingModule()
+    layer = _core_attn_layer(runtime_name, target)
+
+    with pytest.raises(NotImplementedError, match=r"no activation-offload backend"):
+        apply_offload(nn.ModuleList([layer]), ["core_attn"], module.MODULE_MAP)
 
 
 def test_registered_protocol_expert_placement_is_sharded(protocol):
