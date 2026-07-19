@@ -10,6 +10,13 @@ Two layers, both CPU-only (no CUDA):
 * **Real delegation** — import each migrated protocol (TE stubbed) and actually
   call its ``build_model`` with ``assemble`` spied, asserting the model delegates
   and forwards a real per-model unit walk / module_map / hooks (not AST checks).
+
+DS4 caveat: its CSA zero-copies differentiable kernels from Megatron Core, a
+GPU/full-env dependency. So DS4 real delegation (``test_ds4_build_model_delegates_real``)
+honestly SKIPS via ``pytest.importorskip('megatron.core')`` on a CPU box and runs
+for real in the 1.23.6 merge-gate fixed env. A separate, explicitly-named static
+lint (``test_ds4_build_model_ast_lint``) cheaply guards the source-level shape but
+is NOT a runtime verification and must never stand in for the real check.
 """
 
 from __future__ import annotations
@@ -352,10 +359,15 @@ def test_transformer_units_single_enumeration(spied_assemble, model):
         assert units == layers
 
 
-def test_ds4_build_model_delegates_static(spied_assemble):
-    """DS4 real import needs Megatron Core (GPU/full env). Where it's unavailable
-    the executed path skips; guarantee DS4 coverage with a static delegation check
-    that DS4's build_model calls assemble and forwards its layers+mtp unit walk."""
+def test_ds4_build_model_ast_lint():
+    """STATIC LINT ONLY — NOT a runtime delegation check.
+
+    This parses ``deepseek_v4/lite/protocol.py`` and asserts (structurally) that
+    DS4's ``build_model`` calls ``assemble`` with the expected kwargs and does not
+    re-inline the shared body. It is *green on any box* (no megatron.core needed),
+    so it must never be treated as verification that DS4 actually delegates at
+    runtime — that is what ``test_ds4_build_model_delegates_real`` does. Keeping
+    this as an explicit lint guards against source-level regressions cheaply."""
     import ast
     from pathlib import Path
 
@@ -374,6 +386,30 @@ def test_ds4_build_model_delegates_static(spied_assemble):
     kwargs = {kw.arg for call in ast.walk(build)
               if isinstance(call, ast.Call) for kw in call.keywords if kw.arg}
     assert "transformer_units" in kwargs and "name" in kwargs
+
+
+def test_ds4_build_model_delegates_real(spied_assemble):
+    """DS4 delegation verified by *executing* build_model with assemble spied.
+
+    DS4 CSA zero-copies differentiable kernels from Megatron Core, a GPU/full-env
+    dependency (not a test stub). On a CPU box without megatron.core this honestly
+    SKIPS (``pytest.importorskip``) — it must NOT fall back to an AST scan, which
+    could pass an unverified delegation. Real DS4 conformance runs in the 1.23.6
+    merge-gate fixed env (MEGATRON_ROOT / megatron.core present); there build_model
+    executes and we assert it forwards the DS4 layers+mtp unit walk with no inlined
+    shared body."""
+    pytest.importorskip(
+        "megatron.core",
+        reason="DS4 real delegation needs megatron.core (full env only; runs in 1.23.6 merge-gate env)",
+    )
+    _protocol, captured = spied_assemble("deepseek_v4")
+    assert captured, "deepseek_v4 build_model did not call assemble"
+    deltas = captured["deltas"]
+    assert deltas["name"] == "deepseek_v4"
+    # DS4's forwarded unit walk enumerates model.layers.values()+mtp (not chunk.layers).
+    walk = deltas["transformer_units"]
+    chunk = SimpleNamespace(model=SimpleNamespace(layers={}, mtp=[]))
+    assert list(walk(chunk)) == []  # empty structure -> empty walk (walk shape exercised)
 
 
 def test_qwen3_5_deterministic_off_for_thd_gdn(spied_assemble):
