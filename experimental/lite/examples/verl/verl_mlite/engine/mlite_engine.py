@@ -484,14 +484,18 @@ class MegatronLiteEngine(BaseEngine):
     def _save_hf_checkpoint(self, local_path: str) -> None:
         proto = self.handle._extras.get("protocol")
         if proto is None or not hasattr(proto, "save_hf_weights"):
-            if self._rank == 0:
-                print(
-                    "Skipping hf_model save: model protocol does not expose save_hf_weights."
-                )
-            return
+            raise RuntimeError(
+                "hf_model save requested, but the model protocol does not expose "
+                "save_hf_weights; refusing to report a successful checkpoint save."
+            )
 
         model_chunks = self.handle._extras.get("model_chunks", [self.handle._model])
         model_cfg = self.handle._extras.get("model_cfg")
+        if model_cfg is None:
+            raise RuntimeError(
+                "hf_model save requested, but the runtime handle has no model_cfg; "
+                "the model-specific exporter cannot be called safely."
+            )
         ps = self.handle._parallel_state
         hf_local_path = os.path.join(local_path, "huggingface")
 

@@ -185,3 +185,25 @@ def test_load_checkpoint_restores_scheduler_and_param_offload_reload(tmp_path, m
     assert load_kwargs["is_expert"] is expert_classifier
     assert load_kwargs["load_model"] is True
     assert load_kwargs["load_optimizer"] is True
+
+
+def test_hf_model_save_fails_loudly_when_protocol_has_no_export(tmp_path):
+    engine, *_ = _initialized_engine(checkpoint_config={"save_contents": ["hf_model"]})
+    engine.handle._model = engine.module
+    engine.handle._extras["protocol"] = SimpleNamespace()
+
+    with pytest.raises(RuntimeError, match="does not expose save_hf_weights"):
+        engine.save_checkpoint(str(tmp_path), global_step=1)
+
+
+def test_hf_model_save_fails_loudly_when_model_config_is_missing(tmp_path):
+    engine, *_ = _initialized_engine(checkpoint_config={"save_contents": ["hf_model"]})
+    engine.handle._model = engine.module
+    calls = []
+    engine.handle._extras["protocol"] = SimpleNamespace(
+        save_hf_weights=lambda *args: calls.append(args)
+    )
+
+    with pytest.raises(RuntimeError, match="no model_cfg"):
+        engine.save_checkpoint(str(tmp_path), global_step=1)
+    assert calls == []

@@ -446,6 +446,14 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     )
 
 
+def test_glm5_hf_export_rejects_missing_model_config():
+    from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights
+    from megatron.lite.primitive.parallel import ParallelState
+
+    with pytest.raises(ValueError, match="non-null model config"):
+        next(export_hf_weights(None, None, ParallelState()))
+
+
 def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
     import torch
 
