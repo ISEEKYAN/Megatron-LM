@@ -815,6 +815,27 @@ def export_hf_weights(
     rank = dist.get_rank() if dist.is_initialized() else 0
     resolved_export_dtype = _resolve_export_dtype(export_dtype)
 
+    def _iter_native_tensors():
+        """Yield parameters plus model-declared persistent export buffers."""
+        is_export_buffer = getattr(spec, "is_export_buffer", None)
+        for chunk in chunks:
+            base_chunk = unwrap_model(chunk)
+            layer_map = (
+                {
+                    i: base_chunk.layer_indices[i]
+                    for i in range(len(base_chunk.layer_indices))
+                }
+                if hasattr(base_chunk, "layer_indices")
+                else {}
+            )
+            for name, param in base_chunk.named_parameters():
+                yield to_global_layer_name(name, layer_map), param.data.detach()
+            if callable(is_export_buffer):
+                for name, buffer in base_chunk.named_buffers():
+                    global_name = to_global_layer_name(name, layer_map)
+                    if is_export_buffer(global_name):
+                        yield global_name, buffer.detach()
+
     if ps.pp_size <= 1:
         exported_params = 0
         expert_bucket: list[tuple[str, torch.Tensor]] = []
@@ -898,24 +919,10 @@ def export_hf_weights(
                         del packed_expert_buffers[packed_name]
                         yield from _iter_mapped({packed_name: packed_tensor})
 
-        def _iter_native_params():
-            for chunk in chunks:
-                base_chunk = unwrap_model(chunk)
-                layer_map = (
-                    {
-                        i: base_chunk.layer_indices[i]
-                        for i in range(len(base_chunk.layer_indices))
-                    }
-                    if hasattr(base_chunk, "layer_indices")
-                    else {}
-                )
-                for name, param in base_chunk.named_parameters():
-                    tensor = _cast_export_tensor(
-                        param.data.detach(), resolved_export_dtype
-                    )
-                    yield to_global_layer_name(name, layer_map), tensor
-
-        native_params = _iter_native_params()
+        native_params = (
+            (name, _cast_export_tensor(tensor, resolved_export_dtype))
+            for name, tensor in _iter_native_tensors()
+        )
         materialized_params = (
             _iter_bucketed_materialized_tensors(
                 native_params, buffer_max_size_bytes=buffer_max_size_bytes
@@ -1003,23 +1010,15 @@ def export_hf_weights(
         Advanced only during this rank's source turn, so at most one bucket of
         gathered params is ever resident — the whole stage is never built.
         """
-        for chunk in chunks:
-            base_chunk = unwrap_model(chunk)
-            layer_map = (
-                {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
-                if hasattr(base_chunk, "layer_indices")
-                else {}
-            )
-            for name, param in base_chunk.named_parameters():
-                gname = to_global_layer_name(name, layer_map)
-                t = _materialize_dtensor(param.data.detach())
-                if spec.is_expert(gname):
-                    one: dict[str, torch.Tensor] = {}
-                    _gather_expert(gname, t, spec, ps, one, cpu=False)
-                    for gathered_name, gathered_tensor in one.items():
-                        yield gathered_name, gathered_tensor
-                else:
-                    yield gname, _gather_dense(gname, t, spec, ps, cpu=False)
+        for gname, tensor in _iter_native_tensors():
+            tensor = _materialize_dtensor(tensor)
+            if spec.is_expert(gname):
+                one: dict[str, torch.Tensor] = {}
+                _gather_expert(gname, tensor, spec, ps, one, cpu=False)
+                for gathered_name, gathered_tensor in one.items():
+                    yield gathered_name, gathered_tensor
+            else:
+                yield gname, _gather_dense(gname, tensor, spec, ps, cpu=False)
 
     def _emit_param(native_name: str, tensor: torch.Tensor):
         tensor = _maybe_cpu(tensor, cpu=gather_cpu)
@@ -1064,63 +1063,6 @@ def export_hf_weights(
                 del tensor
             del bucket
     return
-
-
-def stream_pp_tensors(
-    local_tensors: Iterable[tuple[str, torch.Tensor]],
-    ps,
-    *,
-    rank0_only: bool = False,
-    cpu: bool = False,
-) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Stream model-specific tensors from every PP stage in stage order.
-
-    The shared HF exporter handles parameters, but persistent model state such
-    as router expert bias is stored in buffers.  All ranks must participate in
-    the broadcasts even when only rank 0 emits tensors for checkpoint writing.
-    """
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    emit = not (rank0_only and rank != 0)
-    tensors = [(name, tensor.detach().contiguous()) for name, tensor in local_tensors]
-
-    if ps.pp_size <= 1:
-        if emit:
-            for name, tensor in tensors:
-                yield name, _maybe_cpu(tensor, cpu=cpu)
-        return
-    if not dist.is_initialized():
-        raise RuntimeError("PP tensor export requires initialized torch.distributed")
-
-    bcast_device = (
-        torch.device("cuda", torch.cuda.current_device())
-        if torch.cuda.is_available()
-        else torch.device("cpu")
-    )
-    for src_pp in range(ps.pp_size):
-        src_global = ps.pp_global_ranks[src_pp]
-        is_source = src_pp == ps.pp_rank
-        if is_source:
-            stage_tensors = [
-                (name, tensor.to(bcast_device).contiguous()) for name, tensor in tensors
-            ]
-            header: list[Any] = [
-                [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in stage_tensors]
-            ]
-        else:
-            stage_tensors = []
-            header = [None]
-        dist.broadcast_object_list(
-            header, src=src_global, group=ps.pp_group, device=bcast_device
-        )
-        for idx, (name, shape, dtype) in enumerate(header[0] or []):
-            tensor = (
-                stage_tensors[idx][1]
-                if is_source
-                else torch.empty(shape, dtype=dtype, device=bcast_device)
-            )
-            dist.broadcast(tensor, src=src_global, group=ps.pp_group)
-            if emit:
-                yield name, _maybe_cpu(tensor, cpu=cpu)
 
 
 def _gather_dense(
