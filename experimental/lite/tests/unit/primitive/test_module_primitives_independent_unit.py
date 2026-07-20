@@ -207,3 +207,64 @@ def test_gated_delta_replicated_state_reduces_tp_gradients(
 
     assert calls == [group]
     torch.testing.assert_close(state.grad, torch.tensor([5.0, 9.0]))
+
+
+def test_gated_delta_syncs_replicated_state_from_tp_rank_zero(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import gated_delta_net as gdn_module
+
+    class _FakeColumnParallelLinear(nn.Module):
+        def __init__(self, _in_features, out_features, ps, **_kwargs):
+            super().__init__()
+            self.local_out = out_features // ps.tp_size
+
+    class _FakeRowParallelLinear(nn.Module):
+        def __init__(self, in_features, _out_features, ps, **_kwargs):
+            super().__init__()
+            self.local_in = in_features // ps.tp_size
+
+    class _FakeRMSNorm(nn.Module):
+        def __init__(self, hidden_size, **_kwargs):
+            super().__init__()
+            self.hidden_size = hidden_size
+
+    monkeypatch.setattr(gdn_module, "ColumnParallelLinear", _FakeColumnParallelLinear)
+    monkeypatch.setattr(gdn_module, "RowParallelLinear", _FakeRowParallelLinear)
+    monkeypatch.setattr(gdn_module.te, "RMSNorm", _FakeRMSNorm)
+    monkeypatch.setattr(gdn_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(gdn_module.dist, "get_world_size", lambda _group: 4)
+    monkeypatch.setattr(gdn_module.dist, "get_process_group_ranks", lambda _group: (12, 13, 14, 15))
+    broadcasts = []
+    monkeypatch.setattr(
+        gdn_module.dist,
+        "broadcast",
+        lambda tensor, *, src, group: broadcasts.append((tensor, src, group)),
+    )
+
+    group = object()
+    ps = SimpleNamespace(
+        tp_size=4, tp_rank=1, tp_group=group, cp_size=1, cp_rank=0, cp_group=None
+    )
+    gdn = gdn_module.GatedDeltaNet(
+        hidden_size=8,
+        linear_num_key_heads=2,
+        linear_key_head_dim=2,
+        linear_num_value_heads=2,
+        linear_value_head_dim=2,
+        linear_conv_kernel_dim=2,
+        rms_norm_eps=1e-6,
+        ps=ps,
+    )
+
+    gdn.sync_tp_replicated_parameters()
+
+    assert [(src, sync_group) for _tensor, src, sync_group in broadcasts] == [
+        (12, group),
+        (12, group),
+    ]
+    assert [tensor.data_ptr() for tensor, _src, _group in broadcasts] == [
+        gdn.A_log.data_ptr(),
+        gdn.dt_bias.data_ptr(),
+    ]
