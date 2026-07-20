@@ -14,7 +14,9 @@ import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
 from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
+from megatron.lite.primitive.modules.attention.cp import iter_cp_sources
 from megatron.lite.primitive.parallel.cp import (
+    contiguous_position_ids_for_cp,
     get_thd_context_parallel_rank_indices,
     zigzag_reconstruct_from_cp_parts,
     zigzag_position_ids_for_cp,
@@ -31,7 +33,9 @@ if TYPE_CHECKING:
 
 def _fused_indexer_sparse_attn(*args, value_dim: int | None = None, **kwargs):
     try:
-        return _dsa_kernels.fused_indexer_sparse_attn(*args, value_dim=value_dim, **kwargs)
+        return _dsa_kernels.fused_indexer_sparse_attn(
+            *args, value_dim=value_dim, **kwargs
+        )
     except TypeError as exc:
         if "value_dim" not in str(exc):
             raise
@@ -67,7 +71,9 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
                 1.0, device=indexer_loss.device
             )
         indexer_loss_backward_scale = DSAIndexerLossAutoScaler.main_loss_backward_scale
-        scaled_indexer_loss_grad = torch.ones_like(indexer_loss) * indexer_loss_backward_scale
+        scaled_indexer_loss_grad = (
+            torch.ones_like(indexer_loss) * indexer_loss_backward_scale
+        )
         return grad_output, scaled_indexer_loss_grad
 
     @staticmethod
@@ -112,12 +118,19 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 def build_rope_cache(
-    *, dim: int, max_position_embeddings: int, rope_theta: float, device: torch.device | None = None
+    *,
+    dim: int,
+    max_position_embeddings: int,
+    rope_theta: float,
+    device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     inv_freq = 1.0 / (
-        rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        rope_theta
+        ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
     )
-    positions = torch.arange(max_position_embeddings, dtype=torch.float32, device=device)
+    positions = torch.arange(
+        max_position_embeddings, dtype=torch.float32, device=device
+    )
     freqs = torch.outer(positions, inv_freq)
     return freqs.cos(), freqs.sin()
 
@@ -128,13 +141,22 @@ def build_rotary_embeddings(
     device = position_ids.device
     inv_freq = 1.0 / (
         rope_theta
-        ** (torch.arange(0, dim, 2, dtype=torch.int64, device=device).to(torch.float32) / dim)
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.int64, device=device).to(torch.float32)
+            / dim
+        )
     )
-    inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+    inv_freq_expanded = (
+        inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+    )
     position_ids_expanded = position_ids[:, None, :].float()
-    device_type = device.type if isinstance(device.type, str) and device.type != "mps" else "cpu"
+    device_type = (
+        device.type if isinstance(device.type, str) and device.type != "mps" else "cpu"
+    )
     with torch.autocast(device_type=device_type, enabled=False):
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(
+            1, 2
+        )
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos()
         sin = emb.sin()
@@ -210,7 +232,9 @@ def _rotary_embeddings_from_cache(
     return cos.to(dtype=dtype), sin.to(dtype=dtype)
 
 
-def _all_gather_cp(tensor: torch.Tensor, *, cp_size: int, cp_group) -> list[torch.Tensor]:
+def _all_gather_cp(
+    tensor: torch.Tensor, *, cp_size: int, cp_group
+) -> list[torch.Tensor]:
     if cp_size <= 1:
         return [tensor]
     if cp_group is None:
@@ -239,15 +263,30 @@ def _packed_cp_layout(
     cp_size: int,
     cp_rank: int,
     device: torch.device,
+    layout: str = "zigzag",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return THD local-query positions and rank-major-to-global KV reorder."""
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.long)
-    per_rank = [
-        get_thd_context_parallel_rank_indices(cu_seqlens, cp_size, rank, "zigzag")
-        for rank in range(cp_size)
-    ]
-    rank_major_positions = torch.cat(per_rank)
-    return per_rank[cp_rank], torch.argsort(rank_major_positions)
+    if layout == "zigzag":
+        per_rank = [
+            get_thd_context_parallel_rank_indices(cu_seqlens, cp_size, rank, layout)
+            for rank in range(cp_size)
+        ]
+        rank_major_positions = torch.cat(per_rank)
+        return per_rank[cp_rank], torch.argsort(rank_major_positions)
+    if layout != "contiguous":
+        raise ValueError(f"Unsupported packed CP layout {layout!r}.")
+    total = int(cu_seqlens[-1].item())
+    if total % cp_size:
+        raise ValueError(
+            f"Packed sequential CP requires total tokens divisible by cp_size; "
+            f"got total={total}, cp_size={cp_size}."
+        )
+    query_positions = contiguous_position_ids_for_cp(
+        total, cp_rank, cp_size, device
+    ).flatten()
+    # Sequential shards are gathered in rank order, which is already global KV order.
+    return query_positions, torch.arange(total, device=device, dtype=torch.long)
 
 
 def _build_cp_causal_mask(
@@ -319,7 +358,9 @@ def _cp_indexer_loss(
     )
 
 
-def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
+def is_dsa_skip_topk_layer(
+    layer_number: int, skip_topk_offset: int, topk_freq: int
+) -> bool:
     """Return whether a 1-indexed layer reuses a previous DSA indexer top-k."""
     if layer_number < 1:
         raise ValueError(f"layer_number must be >= 1, got {layer_number}")
@@ -332,7 +373,9 @@ def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: 
     return (max(layer_number - skip_topk_offset, 0) % topk_freq) != 0
 
 
-def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> int:
+def source_dsa_compute_layer(
+    layer_number: int, skip_topk_offset: int, topk_freq: int
+) -> int:
     """Return the 1-indexed full/indexer layer used by ``layer_number``."""
     if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset, topk_freq):
         return layer_number
@@ -345,8 +388,14 @@ def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq
     return source_layer
 
 
-def dsa_indexer_type_for_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> str:
-    return "shared" if is_dsa_skip_topk_layer(layer_number, skip_topk_offset, topk_freq) else "full"
+def dsa_indexer_type_for_layer(
+    layer_number: int, skip_topk_offset: int, topk_freq: int
+) -> str:
+    return (
+        "shared"
+        if is_dsa_skip_topk_layer(layer_number, skip_topk_offset, topk_freq)
+        else "full"
+    )
 
 
 class DSAIndexShareState:
@@ -365,9 +414,7 @@ class DSAIndexShareState:
         self._resident_topk_by_layer: dict[
             tuple[int, Hashable | None], torch.Tensor
         ] = {}
-        self._cpu_topk_by_layer: dict[
-            tuple[int, Hashable | None], torch.Tensor
-        ] = {}
+        self._cpu_topk_by_layer: dict[tuple[int, Hashable | None], torch.Tensor] = {}
         self._sealed = False
 
     @staticmethod
@@ -468,11 +515,15 @@ def validate_dsa_index_share_pipeline_split(
         if indexer_types is not None and layer_idx < len(indexer_types):
             indexer_type = indexer_types[layer_idx]
         else:
-            indexer_type = dsa_indexer_type_for_layer(layer_idx + 1, skip_topk_offset, topk_freq)
+            indexer_type = dsa_indexer_type_for_layer(
+                layer_idx + 1, skip_topk_offset, topk_freq
+            )
         if indexer_type != "shared":
             continue
 
-        source_idx = source_dsa_compute_layer(layer_idx + 1, skip_topk_offset, topk_freq) - 1
+        source_idx = (
+            source_dsa_compute_layer(layer_idx + 1, skip_topk_offset, topk_freq) - 1
+        )
         if source_idx not in positions:
             raise ValueError(
                 "DSA IndexShare cannot cross pipeline stages: layer "
@@ -539,18 +590,31 @@ class DSAIndexer(nn.Module):
             )
         batch, seq_len, _ = x.shape
         cos, sin = _rotary_embeddings_from_cache(
-            cos, sin, position_ids, device=x.device, dtype=x.dtype, dim=self.qk_rope_head_dim
+            cos,
+            sin,
+            position_ids,
+            device=x.device,
+            dtype=x.dtype,
+            dim=self.qk_rope_head_dim,
         )
 
         q = self.wq_b(q_resid).view(batch, seq_len, self.num_heads, self.head_dim)
 
         k = self.k_norm(self.wk(x))
         if self.rope_first:
-            q_pe, q_nope = torch.split(q, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1)
-            k_pe, k_nope = torch.split(k, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1)
+            q_pe, q_nope = torch.split(
+                q, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1
+            )
+            k_pe, k_nope = torch.split(
+                k, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1
+            )
         else:
-            q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-            k_nope, k_pe = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            q_nope, q_pe = torch.split(
+                q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            k_nope, k_pe = torch.split(
+                k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
         q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)
         k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2)
         k_pe = k_pe.squeeze(2)
@@ -672,7 +736,9 @@ class DynamicSparseAttention(nn.Module):
         if indexer_type is None:
             indexer_type = inferred_indexer_type
         if indexer_type not in {"full", "shared"}:
-            raise ValueError(f"indexer_type must be 'full' or 'shared', got {indexer_type!r}")
+            raise ValueError(
+                f"indexer_type must be 'full' or 'shared', got {indexer_type!r}"
+            )
         if indexer_type != inferred_indexer_type:
             raise ValueError(
                 f"indexer_type={indexer_type!r} for layer {self.layer_number} does not match "
@@ -684,22 +750,32 @@ class DynamicSparseAttention(nn.Module):
         self.index_share_source_layer = source_dsa_compute_layer(
             self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
         )
-        latent_rms_norm_eps = rms_norm_eps if latent_rms_norm_eps is None else latent_rms_norm_eps
+        latent_rms_norm_eps = (
+            rms_norm_eps if latent_rms_norm_eps is None else latent_rms_norm_eps
+        )
         indexer_rope_interleaved = (
-            rope_interleaved if indexer_rope_interleaved is None else indexer_rope_interleaved
+            rope_interleaved
+            if indexer_rope_interleaved is None
+            else indexer_rope_interleaved
         )
 
         self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
         self.q_a_layernorm = RMSNorm(q_lora_rank, eps=latent_rms_norm_eps)
-        self.q_b_proj = nn.Linear(q_lora_rank, num_attention_heads * self.qk_head_dim, bias=False)
+        self.q_b_proj = nn.Linear(
+            q_lora_rank, num_attention_heads * self.qk_head_dim, bias=False
+        )
         self.kv_a_proj_with_mqa = nn.Linear(
             hidden_size, kv_lora_rank + qk_rope_head_dim, bias=False
         )
         self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=latent_rms_norm_eps)
         self.kv_b_proj = nn.Linear(
-            kv_lora_rank, num_attention_heads * (qk_nope_head_dim + v_head_dim), bias=False
+            kv_lora_rank,
+            num_attention_heads * (qk_nope_head_dim + v_head_dim),
+            bias=False,
         )
-        self.o_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, bias=False)
+        self.o_proj = nn.Linear(
+            num_attention_heads * v_head_dim, hidden_size, bias=False
+        )
         self.indexer: DSAIndexer | None = None
         if not self.skip_topk:
             self.indexer = DSAIndexer(
@@ -747,8 +823,12 @@ class DynamicSparseAttention(nn.Module):
                     index_share_state=index_share_state,
                 )
             if self.cp_size > 1:
-                x, position_ids = self._gather_packed_cp_inputs(x, position_ids, packed_seq_params)
-                cos, sin = self._gather_packed_cp_rotary(cos, sin, packed_seq_params, x.device)
+                x, position_ids = self._gather_packed_cp_inputs(
+                    x, position_ids, packed_seq_params
+                )
+                cos, sin = self._gather_packed_cp_rotary(
+                    cos, sin, packed_seq_params, x.device
+                )
             out = self._forward_packed_full(
                 x,
                 cos,
@@ -760,7 +840,9 @@ class DynamicSparseAttention(nn.Module):
             if self.cp_size > 1:
                 out = split_packed_to_cp_local(
                     out,
-                    cu_seqlens_padded=self._packed_cu_seqlens(packed_seq_params, x.device),
+                    cu_seqlens_padded=self._packed_cu_seqlens(
+                        packed_seq_params, x.device
+                    ),
                     cp_size=self.cp_size,
                     cp_rank=self.cp_rank,
                     dim=1,
@@ -846,9 +928,32 @@ class DynamicSparseAttention(nn.Module):
         return query, kv, v_up_weight, q_indexer, k_indexer, weights_indexer
 
     def _gather_projected_cp(
-        self, tensor: torch.Tensor, kv_reorder: torch.Tensor
+        self,
+        tensor: torch.Tensor,
+        kv_reorder: torch.Tensor,
+        *,
+        contiguous: bool = False,
     ) -> torch.Tensor:
-        parts = _all_gather_cp(tensor, cp_size=self.cp_size, cp_group=self.cp_group)
+        if not contiguous:
+            parts = _all_gather_cp(tensor, cp_size=self.cp_size, cp_group=self.cp_group)
+            rank_major = torch.cat(parts, dim=0)
+            return rank_major.index_select(0, kv_reorder)
+        local_positions = contiguous_position_ids_for_cp(
+            tensor.shape[0] * self.cp_size,
+            self.cp_rank,
+            self.cp_size,
+            tensor.device,
+        )
+        parts = [
+            source
+            for _rank, source, _positions in iter_cp_sources(
+                tensor,
+                local_positions,
+                cp_rank=self.cp_rank,
+                cp_size=self.cp_size,
+                cp_group=self.cp_group,
+            )
+        ]
         rank_major = torch.cat(parts, dim=0)
         return rank_major.index_select(0, kv_reorder)
 
@@ -992,68 +1097,49 @@ class DynamicSparseAttention(nn.Module):
                 "GLM5 THD+CP DSA expects batch-collapsed input [1, total, hidden]."
             )
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params, x.device)
+        cp_layout = getattr(packed_seq_params, "cp_layout", "zigzag")
         query_pos, kv_reorder = _packed_cp_layout(
             cu_seqlens,
             cp_size=self.cp_size,
             cp_rank=self.cp_rank,
             device=x.device,
+            layout=cp_layout,
         )
         if query_pos.numel() != x.shape[1]:
             raise RuntimeError(
-                "GLM5 THD+CP local token count does not match packed zigzag layout: "
-                f"x={x.shape[1]}, layout={query_pos.numel()}."
+                "GLM5 THD+CP local token count does not match packed CP layout: "
+                f"x={x.shape[1]}, layout={cp_layout!r}, expected={query_pos.numel()}."
             )
         query, kv_local, v_up_weight, q_idx, k_idx_local, idx_weights = (
             self._project_cp_inputs(x, cos, sin, position_ids)
         )
-        kv = self._gather_projected_cp(kv_local, kv_reorder)
+        use_contiguous_cp = cp_layout == "contiguous"
+        kv = self._gather_projected_cp(
+            kv_local, kv_reorder, contiguous=use_contiguous_cp
+        )
         k_idx = (
-            self._gather_projected_cp(k_idx_local, kv_reorder)
+            self._gather_projected_cp(
+                k_idx_local, kv_reorder, contiguous=use_contiguous_cp
+            )
             if k_idx_local is not None
             else None
         )
-        real_cu = getattr(packed_seq_params, "cu_seqlens_q", None)
-        if real_cu is None:
-            real_cu = cu_seqlens
-        real_cu = real_cu.to(device=x.device, dtype=torch.long)
-
-        output_pieces = []
-        local_rows = []
-        for segment in range(cu_seqlens.numel() - 1):
-            start = int(cu_seqlens[segment].item())
-            end = int(cu_seqlens[segment + 1].item())
-            selected = (query_pos >= start) & (query_pos < end)
-            rows = selected.nonzero().flatten()
-            if rows.numel() == 0:
-                continue
-            query_rel = query_pos.index_select(0, rows) - start
-            key_rel = torch.arange(end - start, device=x.device)
-            mask = _build_cp_causal_mask(query_rel, key_rel)
-            real_len = int((real_cu[segment + 1] - real_cu[segment]).item())
-            valid_rows = query_rel < real_len
-            valid_keys = key_rel < real_len
-            mask = torch.where(
-                valid_rows.unsqueeze(1) & valid_keys.unsqueeze(0),
-                mask,
-                torch.full_like(mask, float("-inf")),
-            )
-            output_pieces.append(
-                self._run_cp_sparse_segment(
-                    query.index_select(0, rows),
-                    kv[start:end],
-                    q_idx.index_select(0, rows) if q_idx is not None else None,
-                    k_idx[start:end] if k_idx is not None else None,
-                    idx_weights.index_select(0, rows) if idx_weights is not None else None,
-                    mask,
-                    index_share_state=index_share_state,
-                    index_share_cache_key=segment,
-                )
-            )
-            local_rows.append(rows)
-        if not output_pieces:
-            return x.new_empty(1, 0, self.o_proj.out_features)
-        row_order = torch.argsort(torch.cat(local_rows))
-        out = torch.cat(output_pieces, dim=0).index_select(0, row_order)
+        key_pos = torch.arange(kv.shape[0], device=x.device, dtype=torch.long)
+        mask = _build_cp_causal_mask(
+            query_pos,
+            key_pos,
+            cu_seqlens=cu_seqlens,
+        )
+        out = self._run_cp_sparse_segment(
+            query,
+            kv,
+            q_idx,
+            k_idx,
+            idx_weights,
+            mask,
+            index_share_state=index_share_state,
+            index_share_cache_key=None,
+        )
         return self._project_cp_output(out, v_up_weight)
 
     def _forward_packed_full(
@@ -1108,10 +1194,19 @@ class DynamicSparseAttention(nn.Module):
 
         batch, seq_len, _ = x.shape
         q_resid = self.q_a_layernorm(self.q_a_proj(x))
-        q = self.q_b_proj(q_resid).view(batch, seq_len, self.num_heads, self.qk_head_dim)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q = self.q_b_proj(q_resid).view(
+            batch, seq_len, self.num_heads, self.qk_head_dim
+        )
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
         cos, sin = _rotary_embeddings_from_cache(
-            cos, sin, position_ids, device=x.device, dtype=x.dtype, dim=self.qk_rope_head_dim
+            cos,
+            sin,
+            position_ids,
+            device=x.device,
+            dtype=x.dtype,
+            dim=self.qk_rope_head_dim,
         )
 
         q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)
@@ -1120,10 +1215,14 @@ class DynamicSparseAttention(nn.Module):
         query_states = torch.cat([q_nope, q_pe], dim=-1).transpose(0, 1).contiguous()
 
         kv_latent, k_pe = torch.split(
-            self.kv_a_proj_with_mqa(x), [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            self.kv_a_proj_with_mqa(x),
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
         )
         kv_latent = self.kv_a_layernorm(kv_latent)
-        k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2).squeeze(2)
+        k_pe = apply_rotary_pos_emb(
+            k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2
+        ).squeeze(2)
         kv_full = torch.cat([kv_latent, k_pe], dim=-1).transpose(0, 1).contiguous()
 
         topk_indices: torch.Tensor | None = None
@@ -1131,7 +1230,8 @@ class DynamicSparseAttention(nn.Module):
         if self.skip_topk:
             if index_share_state is None:
                 raise AssertionError(
-                    "DSA IndexShare shared layers require a per-forward " "DSAIndexShareState."
+                    "DSA IndexShare shared layers require a per-forward "
+                    "DSAIndexShareState."
                 )
             topk_indices = index_share_state.get_topk(
                 self.layer_number,
@@ -1147,8 +1247,14 @@ class DynamicSparseAttention(nn.Module):
         effective_indexer_topk = min(self.index_topk, seq_len)
 
         if self.training and torch.is_grad_enabled() and not self.skip_topk:
-            window_idxs = torch.empty(batch, seq_len, 0, device=x.device, dtype=torch.int32)
-            assert q_indexer is not None and k_indexer is not None and weights_indexer is not None
+            window_idxs = torch.empty(
+                batch, seq_len, 0, device=x.device, dtype=torch.int32
+            )
+            assert (
+                q_indexer is not None
+                and k_indexer is not None
+                and weights_indexer is not None
+            )
             if self.index_share_enabled:
                 out, indexer_loss, topk_indices = _fused_indexer_sparse_attn_with_topk(
                     query_states,
@@ -1198,7 +1304,9 @@ class DynamicSparseAttention(nn.Module):
         else:
             if topk_indices is None:
                 assert (
-                    q_indexer is not None and k_indexer is not None and weights_indexer is not None
+                    q_indexer is not None
+                    and k_indexer is not None
+                    and weights_indexer is not None
                 )
                 topk_indices, _ = _dsa_kernels.indexer_topk(
                     q_indexer,
@@ -1237,10 +1345,16 @@ class DynamicSparseAttention(nn.Module):
         kv_b = self.kv_b_proj.weight.view(
             self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
         )
-        return (kv_b[:, : self.qk_nope_head_dim, :], kv_b[:, self.qk_nope_head_dim :, :])
+        return (
+            kv_b[:, : self.qk_nope_head_dim, :],
+            kv_b[:, self.qk_nope_head_dim :, :],
+        )
 
     def _gather_cp_inputs(
-        self, x: torch.Tensor, position_ids: torch.Tensor, attention_mask: torch.Tensor | None
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         local_batch, local_seq = x.shape[:2]
         x_parts = _all_gather_cp(x, cp_size=self.cp_size, cp_group=self.cp_group)
@@ -1248,7 +1362,11 @@ class DynamicSparseAttention(nn.Module):
         full_seq = full_x.shape[1]
 
         full_position_ids = self._full_cp_position_ids(
-            position_ids, batch=local_batch, local_seq=local_seq, full_seq=full_seq, device=x.device
+            position_ids,
+            batch=local_batch,
+            local_seq=local_seq,
+            full_seq=full_seq,
+            device=x.device,
         )
         if attention_mask is not None:
             expected = (full_seq, full_seq)
@@ -1329,14 +1447,20 @@ class DynamicSparseAttention(nn.Module):
                 "GLM5 packed DynamicSparseAttention CP position_ids must be either local or full packed length, "
                 f"got {tuple(position_ids.shape)} for local_seq={local_seq}, full_seq={full_seq}."
             )
-        pos_parts = _all_gather_cp(position_ids, cp_size=self.cp_size, cp_group=self.cp_group)
+        pos_parts = _all_gather_cp(
+            position_ids, cp_size=self.cp_size, cp_group=self.cp_group
+        )
         full_position_ids = reconstruct_packed_from_cp_parts(
             pos_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
         )
         return full_x, full_position_ids
 
     def _gather_packed_cp_rotary(
-        self, cos: torch.Tensor, sin: torch.Tensor, packed_seq_params, device: torch.device
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        packed_seq_params,
+        device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if cos.dim() != 3 or sin.dim() != 3:
             return cos, sin
@@ -1360,7 +1484,9 @@ class DynamicSparseAttention(nn.Module):
         if cu_seqlens is None:
             cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
         if cu_seqlens is None:
-            raise ValueError("GLM5 packed DynamicSparseAttention requires packed cu_seqlens.")
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention requires packed cu_seqlens."
+            )
         return cu_seqlens.to(device=device, dtype=torch.int32)
 
     @staticmethod
