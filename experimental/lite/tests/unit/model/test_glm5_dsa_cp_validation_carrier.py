@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,24 @@ def _rank_result(*, cp1_memory: float = 100.0, cp2_memory: float = 60.0, hf_cosi
 
 def test_validation_accepts_independent_hf_parity_and_cp_memory_reduction():
     _VALIDATION._assert_validation([_rank_result()])
+
+
+def test_hf_parity_uses_glm52_dsa_reference_and_indexer_config():
+    source = inspect.getsource(_VALIDATION._hf_reference_logits)
+
+    assert "GlmMoeDsaConfig" in source
+    assert "GlmMoeDsaForCausalLM" in source
+    assert "DeepseekV3" not in source
+    for field in (
+        "index_topk",
+        "index_head_dim",
+        "index_n_heads",
+        "index_topk_freq",
+        "index_skip_topk_offset",
+        "indexer_types",
+    ):
+        assert f"{field}=" in source
+    assert 'indexer_types=["full", "full", "full", "shared"]' in source
 
 
 @pytest.mark.parametrize("cp2_memory", [100.0, 101.0])

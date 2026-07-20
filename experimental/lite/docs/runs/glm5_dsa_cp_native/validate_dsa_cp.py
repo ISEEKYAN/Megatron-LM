@@ -80,8 +80,8 @@ def _measure(module, x, cos, sin, position_ids, *, warmup: int, steps: int):
 
 def _hf_reference_logits(rank: int, world: int) -> float:
     """Compare CP-native GLM5 logits to the independent Transformers reference."""
-    from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
-    from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+    from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
 
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights
@@ -90,7 +90,7 @@ def _hf_reference_logits(rank: int, world: int) -> float:
     from megatron.lite.primitive.parallel.state import ParallelState
 
     cfg = Glm5Config(
-        num_hidden_layers=2,
+        num_hidden_layers=4,
         hidden_size=128,
         num_attention_heads=64,
         num_key_value_heads=64,
@@ -107,6 +107,10 @@ def _hf_reference_logits(rank: int, world: int) -> float:
         index_head_dim=128,
         index_n_heads=32,
         index_topk=512,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=["full", "full", "full", "shared"],
+        num_nextn_predict_layers=0,
         intermediate_size=20,
         moe_intermediate_size=6,
         first_k_dense_replace=1,
@@ -114,7 +118,7 @@ def _hf_reference_logits(rank: int, world: int) -> float:
         n_shared_experts=1,
         num_experts_per_tok=3,
     )
-    hf_cfg = DeepseekV3Config(
+    hf_cfg = GlmMoeDsaConfig(
         hidden_size=cfg.hidden_size,
         intermediate_size=cfg.intermediate_size,
         moe_intermediate_size=cfg.moe_intermediate_size,
@@ -130,6 +134,12 @@ def _hf_reference_logits(rank: int, world: int) -> float:
         qk_rope_head_dim=cfg.qk_rope_head_dim,
         v_head_dim=cfg.v_head_dim,
         qk_nope_head_dim=cfg.qk_nope_head_dim,
+        index_topk=cfg.index_topk,
+        index_head_dim=cfg.index_head_dim,
+        index_n_heads=cfg.index_n_heads,
+        index_topk_freq=cfg.index_topk_freq,
+        index_skip_topk_offset=cfg.index_skip_topk_offset,
+        indexer_types=cfg.indexer_types,
         n_group=cfg.n_group,
         topk_group=cfg.topk_group,
         num_experts_per_tok=cfg.num_experts_per_tok,
@@ -138,16 +148,14 @@ def _hf_reference_logits(rank: int, world: int) -> float:
         max_position_embeddings=cfg.max_position_embeddings,
         rms_norm_eps=cfg.rms_norm_eps,
         tie_word_embeddings=False,
-        rope_theta=cfg.rope_theta,
-        rope_scaling=None,
-        rope_interleave=cfg.rope_interleave,
+        rope_parameters={"rope_type": "default", "rope_theta": cfg.rope_theta},
         attention_bias=False,
         attention_dropout=0.0,
         use_cache=False,
     )
     device = torch.device("cuda", rank)
     torch.manual_seed(20260611)
-    reference = DeepseekV3ForCausalLM(hf_cfg).to(device=device, dtype=torch.bfloat16).eval()
+    reference = GlmMoeDsaForCausalLM(hf_cfg).to(device=device, dtype=torch.bfloat16).eval()
     with tempfile.TemporaryDirectory(prefix=f"glm5_hf_rank{rank}_") as hf_dir:
         save_safetensors(
             {name: tensor.detach().cpu().contiguous().clone() for name, tensor in reference.state_dict().items()},
