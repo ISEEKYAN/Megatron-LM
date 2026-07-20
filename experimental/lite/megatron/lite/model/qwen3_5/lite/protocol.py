@@ -158,6 +158,7 @@ def _build_dist_opt_optimizer(
 
 def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     from megatron.lite.model.qwen3_5.lite.model import Qwen35Model
+    from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
 
     p = impl_cfg.parallel
 
@@ -216,6 +217,14 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
             .cuda()
             for i in range(vpp)
         ]
+
+    # GDN state is physically replicated when TP exceeds its head count.
+    # Synchronize the initial copies before any optimizer/FSDP wrapping so a
+    # from-scratch model is TP-invariant just like a model loaded from HF.
+    for chunk in chunks:
+        for module in chunk.modules():
+            if isinstance(module, GatedDeltaNet):
+                module.sync_tp_replicated_parameters()
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
     if recompute_spec:
