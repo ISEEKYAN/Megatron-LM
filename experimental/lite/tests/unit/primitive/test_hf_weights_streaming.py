@@ -6,6 +6,7 @@ import inspect
 import json
 import sys
 import types
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -79,6 +80,56 @@ def test_stream_export_removes_stale_owned_files_when_reusing_directory(tmp_path
     assert not (tmp_path / "model.safetensors.index.json").exists()
     assert not (tmp_path / ".model-shard-00001.safetensors").exists()
 
+
+def test_stream_export_flushes_bounded_shards_and_writes_hf_index(
+    tmp_path, monkeypatch
+) -> None:
+    flushed = []
+
+    def fake_save_safetensors(tensors, path, *, filename):
+        flushed.append(
+            (list(tensors), sum(t.numel() * t.element_size() for t in tensors.values()))
+        )
+        (Path(path) / filename).touch()
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.save_safetensors",
+        fake_save_safetensors,
+    )
+    tensors = [(f"weight_{i}", torch.ones(2, dtype=torch.float32)) for i in range(3)]
+
+    stream_export_to_shards(iter(tensors), str(tmp_path), shard_size_bytes=8)
+
+    assert flushed == [(["weight_0"], 8), (["weight_1"], 8), (["weight_2"], 8)]
+    index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
+    assert index["metadata"] == {"total_size": 24}
+    assert index["weight_map"] == {
+        "weight_0": "model-00001-of-00003.safetensors",
+        "weight_1": "model-00002-of-00003.safetensors",
+        "weight_2": "model-00003-of-00003.safetensors",
+    }
+
+
+def test_stream_export_nonzero_rank_drains_iterator_for_collectives(
+    tmp_path, monkeypatch
+) -> None:
+    consumed = []
+    barriers = []
+
+    def export_iter():
+        for i in range(3):
+            consumed.append(i)
+            yield f"weight_{i}", torch.ones(1)
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(True))
+
+    stream_export_to_shards(export_iter(), str(tmp_path), shard_size_bytes=4)
+
+    assert consumed == [0, 1, 2]
+    assert barriers == [True]
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_export_defaults_to_device_resident_tensors() -> None:
