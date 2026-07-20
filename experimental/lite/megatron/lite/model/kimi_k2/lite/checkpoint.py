@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
@@ -614,17 +613,18 @@ def load_hf_weights(model: nn.Module, path: str, config: KimiK2Config, ps: Paral
 
 
 def export_hf_weights(model, config: KimiK2Config, ps: ParallelState, **kwargs):
-    from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        export_hf_weights as _export,
+        stream_pp_tensors,
+    )
 
     spec = KimiK2WeightSpec(config)
     rank0_only = bool(kwargs.get("rank0_only", False))
     cpu = bool(kwargs.get("cpu", False))
     export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
     yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank0_only and rank != 0:
-        return
     chunks = list(model) if isinstance(model, list | nn.ModuleList) else [model]
+    local_buffers: list[tuple[str, torch.Tensor]] = []
     for chunk in chunks:
         base_chunk = unwrap_model(chunk)
         layer_map = (
@@ -636,9 +636,11 @@ def export_hf_weights(model, config: KimiK2Config, ps: ParallelState, **kwargs):
             if not name.endswith(".moe.router.expert_bias"):
                 continue
             global_name = to_global_layer_name(name, layer_map)
-            export_buffer = buffer.detach().cpu() if cpu else buffer.detach()
-            for hf_name, hf_tensor in spec.native_to_hf(global_name, export_buffer):
-                yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
+            local_buffers.extend(spec.native_to_hf(global_name, buffer.detach()))
+    for hf_name, hf_tensor in stream_pp_tensors(
+        local_buffers, ps, rank0_only=rank0_only, cpu=cpu
+    ):
+        yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
 
 
 def save_hf_weights(model, path: str, config: KimiK2Config, ps: ParallelState, **kwargs) -> None:

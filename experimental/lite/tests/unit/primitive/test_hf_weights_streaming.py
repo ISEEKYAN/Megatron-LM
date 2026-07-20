@@ -6,7 +6,6 @@ import inspect
 import json
 import sys
 import types
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -26,6 +25,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     bucketed_all_gather_into_tensor,
     export_hf_weights,
     stream_export_to_shards,
+    stream_pp_tensors,
 )
 
 
@@ -552,6 +552,50 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
     assert exported.keys() == {"weight", "weight2"}
     assert torch.equal(exported["weight"], local_weight)
     assert torch.equal(exported["weight2"], remote_weight)
+
+
+def test_pp_model_specific_tensors_stream_from_every_stage(monkeypatch) -> None:
+    local_bias = torch.tensor([1.0, 2.0])
+    remote_bias = torch.tensor([3.0, 4.0])
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 2,
+            "pp_rank": 0,
+            "pp_global_ranks": [0, 1],
+            "pp_group": "nccl-pp",
+        },
+    )()
+    groups = []
+
+    def fake_broadcast_object_list(object_list, src=None, group=None, device=None):
+        groups.append(group)
+        if src == 1:
+            object_list[0] = [("stage1.router_bias", (2,), torch.float32)]
+
+    def fake_broadcast(tensor, src=None, group=None):
+        groups.append(group)
+        if src == 1:
+            tensor.copy_(remote_bias)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        torch.distributed, "broadcast_object_list", fake_broadcast_object_list
+    )
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+
+    exported = dict(
+        stream_pp_tensors(
+            [("stage0.router_bias", local_bias)], ps, rank0_only=True, cpu=True
+        )
+    )
+
+    assert set(groups) == {"nccl-pp"}
+    assert torch.equal(exported["stage0.router_bias"], local_bias)
+    assert torch.equal(exported["stage1.router_bias"], remote_bias)
 
 
 
