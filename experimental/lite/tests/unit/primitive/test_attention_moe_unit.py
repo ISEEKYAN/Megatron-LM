@@ -68,6 +68,109 @@ def test_gqa_split_grouped_qkvg_preserves_q_gate_kv_order():
     assert torch.equal(value, torch.tensor([[[10, 11], [22, 23]]]))
 
 
+def test_gqa_kv_replication_selects_distinct_queries_and_reuses_kv():
+    from megatron.lite.primitive.modules.gqa_utils import split_grouped_qkvg_for_tp
+
+    # Global MCore layout for 8 Q heads, 2 KV heads and an output gate:
+    # [q0..q3, g0..g3, k0, v0 | q4..q7, g4..g7, k1, v1].
+    qkvg = torch.tensor(
+        [
+            [
+                0,
+                1,
+                2,
+                3,
+                100,
+                101,
+                102,
+                103,
+                200,
+                300,
+                4,
+                5,
+                6,
+                7,
+                104,
+                105,
+                106,
+                107,
+                201,
+                301,
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    per_rank = [
+        split_grouped_qkvg_for_tp(
+            qkvg,
+            num_heads=8,
+            num_kv_heads=2,
+            head_dim=1,
+            tp_rank=rank,
+            tp_size=4,
+        )
+        for rank in range(4)
+    ]
+
+    expected_queries = [[0, 1], [2, 3], [4, 5], [6, 7]]
+    expected_gates = [[100, 101], [102, 103], [104, 105], [106, 107]]
+    expected_keys = [200, 200, 201, 201]
+    expected_values = [300, 300, 301, 301]
+    for rank, (query, gate, key, value) in enumerate(per_rank):
+        assert query.flatten().tolist() == expected_queries[rank]
+        assert gate.flatten().tolist() == expected_gates[rank]
+        assert key.item() == expected_keys[rank]
+        assert value.item() == expected_values[rank]
+
+
+def test_gqa_kv_replication_backward_reduce_scatters_duplicate_gradients(monkeypatch):
+    from megatron.lite.primitive.parallel import linear
+    from megatron.lite.primitive.parallel.linear import (
+        all_gather_last_dim_with_grad_reduce,
+    )
+
+    tp_size = 4
+    tp_rank = 1
+    group = object()
+
+    monkeypatch.setattr(linear.dist, "get_world_size", lambda _group: tp_size)
+
+    def fake_all_gather(outputs, local, *, group):
+        del group
+        for rank, output in enumerate(outputs):
+            output.copy_(local + rank * 10)
+
+    local_grad = torch.arange(8, dtype=torch.float32).reshape(1, 8)
+    remote_grads = [local_grad + rank * 100 for rank in range(1, tp_size)]
+
+    def pack_for_reduce_scatter(grad):
+        return torch.cat(grad.chunk(tp_size, dim=-1), dim=0)
+
+    def fake_reduce_scatter(output, packed_local_grad, *, group):
+        del group
+        total = packed_local_grad.clone()
+        for remote_grad in remote_grads:
+            total.add_(pack_for_reduce_scatter(remote_grad))
+        output.copy_(total.chunk(tp_size, dim=0)[tp_rank])
+
+    monkeypatch.setattr(linear.dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(linear.dist, "reduce_scatter_tensor", fake_reduce_scatter)
+
+    local = torch.tensor([[1.0, 2.0]], requires_grad=True)
+    gathered = all_gather_last_dim_with_grad_reduce(local, group)
+    gathered.backward(local_grad)
+
+    expected = sum(
+        (
+            grad[..., tp_rank * 2 : (tp_rank + 1) * 2]
+            for grad in [local_grad, *remote_grads]
+        ),
+        torch.zeros_like(local),
+    )
+    torch.testing.assert_close(local.grad, expected)
+
+
 def test_moe_aux_loss_auto_scaler_threads_scaled_aux_gradient():
     MoEAuxLossAutoScaler = _moe_aux_scaler()
     MoEAuxLossAutoScaler.set_loss_scale(torch.tensor([0.25]))
