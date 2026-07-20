@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
@@ -14,6 +15,7 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import (
     _merge_linear_attn_in_proj_tp_shards,
     _tp_linear_attn_conv1d,
     _tp_linear_attn_in_proj,
+    _tp_linear_attn_state,
     export_hf_weights,
 )
 from megatron.lite.model.qwen3_5.lite.protocol import ImplConfig
@@ -537,6 +539,22 @@ def test_qwen35_linear_attention_state_is_tp_replicated() -> None:
     assert type(PLACEMENT_FN("layers.0.linear_attn.A_log")[-1]).__name__ == "Replicate"
     assert spec.tp_spec("layers.0.linear_attn.dt_bias") is None
     assert spec.tp_spec("layers.0.linear_attn.A_log") is None
+
+
+def test_qwen35_linear_attention_state_load_matches_head_layout() -> None:
+    state = torch.arange(8)
+    replicated_cfg = _tiny_config()
+    sharded_cfg = replace(
+        replicated_cfg, linear_num_key_heads=8, linear_num_value_heads=8
+    )
+    ps = SimpleNamespace(tp_size=4, tp_rank=2)
+
+    assert torch.equal(
+        _tp_linear_attn_state(state, cfg=replicated_cfg, ps=ps), state
+    )
+    assert torch.equal(
+        _tp_linear_attn_state(state, cfg=sharded_cfg, ps=ps), state.chunk(4)[2]
+    )
 
 
 def test_qwen35_export_uses_mbridge_conv1d_tp_gather(monkeypatch) -> None:

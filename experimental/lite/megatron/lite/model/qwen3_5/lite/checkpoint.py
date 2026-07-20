@@ -125,6 +125,15 @@ def _linear_attn_head_replication(cfg: Qwen35Config, tp_size: int) -> bool:
     )
 
 
+def _tp_linear_attn_state(
+    tensor: torch.Tensor, *, cfg: Qwen35Config, ps: ParallelState
+) -> torch.Tensor:
+    """Keep GDN state whole only when its heads are physically replicated."""
+    if _linear_attn_head_replication(cfg, ps.tp_size):
+        return tensor
+    return _tp(tensor, ps.tp_rank, ps.tp_size)
+
+
 def _get(reader: SafeTensorReader, name: str) -> torch.Tensor:
     return reader.get_tensor(name)
 
@@ -321,6 +330,11 @@ class Qwen35WeightSpec:
             return _merge_linear_attn_conv1d_tp_shards(
                 _allgather_tp_shards(tensor, ps), cfg=self.config
             )
+        if native_name.endswith((".linear_attn.dt_bias", ".linear_attn.A_log")):
+            shards = _allgather_tp_shards(tensor, ps)
+            if _linear_attn_head_replication(self.config, ps.tp_size):
+                return shards[0]
+            return torch.cat(shards, dim=0).contiguous()
         if native_name.endswith(".moe.shared_expert.gate_up.linear.weight"):
             return _merge_gate_up_tp_shards(_allgather_tp_shards(tensor, ps))
         return None
@@ -332,6 +346,10 @@ class Qwen35WeightSpec:
             return _merge_linear_attn_in_proj_tp_shards(shards, cfg=self.config)
         if native_name.endswith(".linear_attn.conv1d.weight"):
             return _merge_linear_attn_conv1d_tp_shards(shards, cfg=self.config)
+        if native_name.endswith((".linear_attn.dt_bias", ".linear_attn.A_log")):
+            if _linear_attn_head_replication(self.config, len(shards)):
+                return shards[0]
+            return torch.cat(shards, dim=0).contiguous()
         if native_name.endswith(".moe.shared_expert.gate_up.linear.weight"):
             return _merge_gate_up_tp_shards(shards)
         return None
@@ -619,8 +637,12 @@ def _load_linear_attn(
     out[f"{local_prefix}.linear_attn.conv1d.weight"] = _tp_linear_attn_conv1d(
         _get(reader, f"{hf_prefix}.conv1d.weight"), cfg=cfg, ps=ps
     )
-    out[f"{local_prefix}.linear_attn.dt_bias"] = _get(reader, f"{hf_prefix}.dt_bias")
-    out[f"{local_prefix}.linear_attn.A_log"] = _get(reader, f"{hf_prefix}.A_log")
+    out[f"{local_prefix}.linear_attn.dt_bias"] = _tp_linear_attn_state(
+        _get(reader, f"{hf_prefix}.dt_bias"), cfg=cfg, ps=ps
+    )
+    out[f"{local_prefix}.linear_attn.A_log"] = _tp_linear_attn_state(
+        _get(reader, f"{hf_prefix}.A_log"), cfg=cfg, ps=ps
+    )
     out[f"{local_prefix}.linear_attn.norm.weight"] = _zero_centered_gamma_from_hf(
         _get(reader, f"{hf_prefix}.norm.weight")
     )
