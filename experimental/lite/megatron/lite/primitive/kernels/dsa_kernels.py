@@ -578,6 +578,42 @@ def indexer_topk(
     return topk_indices, topk_length
 
 
+def _cudnn_topk_block(
+    dsa_namespace, scores: Tensor, width: int
+) -> Tuple[Tensor, Tensor]:
+    """Run cuDNN radix top-k with physical storage matching its compile bucket.
+
+    cuDNN Frontend v1.26 compiles ``indexer_top_k_wrapper`` for the next
+    power-of-two column bucket while ``seq_lens`` carries each row's logical
+    width.  Give ragged THD rows the corresponding physical ``-inf`` tail so
+    vectorized loads cannot leave the allocation; keep ``seq_lens`` and
+    ``top_k`` at the logical K width so padding can never become a valid pick.
+    """
+    logical_cols = scores.shape[-1]
+    bucket_cols = 1 << (logical_cols - 1).bit_length()
+    if bucket_cols != logical_cols:
+        scores = torch.nn.functional.pad(
+            scores, (0, bucket_cols - logical_cols), value=float("-inf")
+        )
+    scores = scores.contiguous()
+    seq_lens = torch.full(
+        (scores.shape[0],), logical_cols, device=scores.device, dtype=torch.int32
+    )
+    result = dsa_namespace.indexer_top_k_wrapper(
+        scores,
+        seq_lens,
+        top_k=width,
+        next_n=1,
+        return_val=False,
+    )
+    indices = result["indices"]
+    valid = (indices >= 0) & (indices < logical_cols)
+    safe_indices = indices.clamp(min=0, max=logical_cols - 1).long()
+    values = torch.gather(scores[:, :logical_cols], -1, safe_indices)
+    values = torch.where(valid, values, torch.full_like(values, float("-inf")))
+    return values, torch.where(valid, indices, torch.full_like(indices, -1))
+
+
 def indexer_topk_with_mask(
     q_indexer: Tensor,
     k_indexer: Tensor,
@@ -617,18 +653,13 @@ def indexer_topk_with_mask(
         if scores.is_cuda:
             _ensure_dsa_namespace()
             flat_scores = scores.reshape(b * sq, end - start).contiguous()
-            seq_lens = torch.full(
-                (b * sq,), end - start, device=scores.device, dtype=torch.int32
-            )
-            result = _DSA.indexer_top_k_wrapper(
+            values, indices = _cudnn_topk_block(
+                _DSA,
                 flat_scores,
-                seq_lens,
-                top_k=block_width,
-                next_n=1,
-                return_val=False,
+                block_width,
             )
-            indices = result["indices"].view(b, sq, block_width)
-            values = torch.gather(scores, -1, indices.clamp_min(0).long())
+            values = values.view(b, sq, block_width)
+            indices = indices.view(b, sq, block_width)
         else:
             values, indices = torch.topk(scores, k=block_width, dim=-1)
         indices = indices + start
