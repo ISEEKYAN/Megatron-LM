@@ -318,7 +318,7 @@ def _index_scores_and_topk(
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Kernel-routed CP indexer over local Q and gathered projected K."""
-    return _dsa_kernels.indexer_topk_with_mask(
+    result = _dsa_kernels.indexer_topk_with_mask(
         q,
         k,
         weights,
@@ -326,6 +326,13 @@ def _index_scores_and_topk(
         mask,
         indexer_softmax_scale=scale,
     )
+    if q.is_cuda:
+        # cuDNN FE 1.27's decode-varlen wrapper owns an asynchronous scratch
+        # buffer that is not returned to PyTorch.  Finish that launch before
+        # compactify can reuse the allocation; CUDA_LAUNCH_BLOCKING previously
+        # hid this lifetime bug during the focused THD run.
+        torch.cuda.current_stream(q.device).synchronize()
+    return result
 
 
 def _cp_indexer_loss(
