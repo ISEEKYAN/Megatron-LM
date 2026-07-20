@@ -568,11 +568,17 @@ def indexer_topk_with_mask(
     mask: Tensor,
     indexer_softmax_scale: float = 1.0,
 ) -> Tuple[Tensor, Tensor]:
-    """Score local CP queries against gathered K with an explicit validity mask.
+    """Score CP local-Q against global-K with an explicit position mask.
 
-    The score kernel and radix top-K remain in the kernel layer; the explicit
-    mask carries dense zigzag or packed-THD global coordinates that cannot be
-    represented by the legacy ``ratio``-only causal contract.
+    This is deliberately local rather than a zero-copy wrapper around Megatron
+    Core's experimental DSA helpers.  At NVIDIA/Megatron-LM dev@1378a4806,
+    ``fused_qk_topk_naive_thd`` assumes contiguous, aligned Q/K segments,
+    reconstructs the causal mask from segment length plus ``ratio``, and
+    clamps top-k to the segment K length.  GLM5 CP zigzag instead needs an
+    explicit mask from interleaved local-Q positions to full-sequence global-K
+    positions, with top-k spanning global-K rather than the local contiguous
+    segment.  Keep this helper until Core can express that contract without
+    changing CP semantics.
     """
     q_bshd, k_bsd, _w_bsh, w_bsh_scaled = _sbhd_to_bshd_indexer_inputs(
         q_indexer, k_indexer, weights, indexer_softmax_scale
@@ -637,7 +643,18 @@ def cp_indexer_loss(
     sparse_loss: bool,
     calculate_per_token_loss: bool,
 ) -> Tensor:
-    """Blockwise Core-compatible KL for local-Q/global-K CP masking."""
+    """Compute the IndexShare KL for CP local-Q/global-K explicit masking.
+
+    This fills the same Core gap as :func:`indexer_topk_with_mask`: NVIDIA
+    Megatron-LM dev@1378a4806's
+    ``fwd_fused_indexer_loss_naive_thd`` and
+    ``bwd_fused_indexer_loss_naive_thd`` assume continuous, aligned Q/K
+    segments and build their causal mask from segment lengths plus ``ratio``.
+    They cannot represent GLM5 CP-zigzag's explicit local-Q/global-K position
+    mask, and their paired top-k path must not reduce global-K coverage to the
+    local contiguous segment.  Retain this implementation while preserving
+    that CP contract.
+    """
     if loss_coeff == 0:
         return (q_indexer.sum() + k_indexer.sum() + weights.sum()) * 0.0
 
