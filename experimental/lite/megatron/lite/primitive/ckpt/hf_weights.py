@@ -1066,6 +1066,63 @@ def export_hf_weights(
     return
 
 
+def stream_pp_tensors(
+    local_tensors: Iterable[tuple[str, torch.Tensor]],
+    ps,
+    *,
+    rank0_only: bool = False,
+    cpu: bool = False,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Stream model-specific tensors from every PP stage in stage order.
+
+    The shared HF exporter handles parameters, but persistent model state such
+    as router expert bias is stored in buffers.  All ranks must participate in
+    the broadcasts even when only rank 0 emits tensors for checkpoint writing.
+    """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    emit = not (rank0_only and rank != 0)
+    tensors = [(name, tensor.detach().contiguous()) for name, tensor in local_tensors]
+
+    if ps.pp_size <= 1:
+        if emit:
+            for name, tensor in tensors:
+                yield name, _maybe_cpu(tensor, cpu=cpu)
+        return
+    if not dist.is_initialized():
+        raise RuntimeError("PP tensor export requires initialized torch.distributed")
+
+    bcast_device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+    for src_pp in range(ps.pp_size):
+        src_global = ps.pp_global_ranks[src_pp]
+        is_source = src_pp == ps.pp_rank
+        if is_source:
+            stage_tensors = [
+                (name, tensor.to(bcast_device).contiguous()) for name, tensor in tensors
+            ]
+            header: list[Any] = [
+                [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in stage_tensors]
+            ]
+        else:
+            stage_tensors = []
+            header = [None]
+        dist.broadcast_object_list(
+            header, src=src_global, group=ps.pp_group, device=bcast_device
+        )
+        for idx, (name, shape, dtype) in enumerate(header[0] or []):
+            tensor = (
+                stage_tensors[idx][1]
+                if is_source
+                else torch.empty(shape, dtype=dtype, device=bcast_device)
+            )
+            dist.broadcast(tensor, src=src_global, group=ps.pp_group)
+            if emit:
+                yield name, _maybe_cpu(tensor, cpu=cpu)
+
+
 def _gather_dense(
     name: str, tensor: torch.Tensor, spec: HFWeights, ps, *, cpu: bool = True
 ) -> torch.Tensor:
