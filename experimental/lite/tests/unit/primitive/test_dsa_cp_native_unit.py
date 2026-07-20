@@ -67,6 +67,18 @@ def test_cp_causal_mask_blocks_future_and_cross_packed_sequence_keys():
     assert valid[2].nonzero().flatten().tolist() == list(range(8, 16))
 
 
+def test_ragged_packed_kv_is_physically_aligned_without_changing_valid_rows():
+    from megatron.lite.primitive.kernels.dsa_kernels import _pad_sparse_kv_rows
+
+    kv = torch.arange(520 * 3, dtype=torch.float32).view(520, 3)
+    padded = _pad_sparse_kv_rows(kv, 128)
+
+    assert padded.shape == (640, 3)
+    assert torch.equal(padded[:520], kv)
+    assert torch.count_nonzero(padded[520:]) == 0
+    assert _pad_sparse_kv_rows(padded, 128) is padded
+
+
 def test_dense_cp_native_collective_only_receives_projected_kv_and_indexer_k():
     from megatron.lite.primitive.modules.attention.dsa import DynamicSparseAttention
 

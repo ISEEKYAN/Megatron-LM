@@ -77,6 +77,21 @@ def _get_topk_alignment() -> int:
     return 128
 
 
+def _pad_sparse_kv_rows(kv: Tensor, alignment: int) -> Tensor:
+    """Pad a ragged KV tail for FlashMLA without changing logical indices.
+
+    CP+THD invokes sparse attention once per packed segment.  Unlike the dense
+    path, a segment can end at an arbitrary row (for example 520), while the
+    SM90/SM100 FlashMLA sparse kernels load KV in aligned blocks.  Keep logical
+    top-k indices in the original range and append unreachable zero rows only
+    to make the physical KV allocation block-aligned.
+    """
+    pad_rows = (-kv.shape[0]) % alignment
+    if pad_rows == 0:
+        return kv
+    return torch.cat((kv, kv.new_zeros((pad_rows, *kv.shape[1:]))), dim=0)
+
+
 def _dsa_fwd_flash_mla(
     q: Tensor,
     kv: Tensor,
@@ -105,6 +120,9 @@ def _dsa_fwd_flash_mla(
         pad_width = TopK_padded - TopK
         topk_idxs = torch.nn.functional.pad(topk_idxs, (0, pad_width), value=-1)
 
+    # Packed CP segments can have ragged KV lengths.  The top-k values remain
+    # in the logical (unpadded) range, so these extra rows are unreachable.
+    kv = _pad_sparse_kv_rows(kv, _get_topk_alignment())
     kv_3d = kv.unsqueeze(1)  # (total_S_kv, 1, D)  h_kv=1
     indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
 
