@@ -526,7 +526,8 @@ def test_glm5_impl_config_accepts_runtime_mtp_fields():
     assert cfg.num_nextn_predict_layers == 1
 
 
-def test_glm5_protocol_uses_mlite_optimizer_api():
+def test_glm5_protocol_uses_mlite_optimizer_api(transformer_engine_import_stub):
+    transformer_engine_import_stub()
     from megatron.lite.model.glm5.lite.protocol import ImplConfig
 
     lite = Path(__file__).resolve().parents[3] / "megatron" / "lite"
@@ -534,9 +535,12 @@ def test_glm5_protocol_uses_mlite_optimizer_api():
     kernel_text = (lite / "model" / "compose.py").read_text()
 
     assert ImplConfig().optimizer == "dist_opt"
-    # glm5 delegates to the shared kernel, which owns the dist_opt wiring.
-    assert "assemble(" in protocol_text
+    # glm5 keeps an explicit build_model and wires dist_opt via the shared
+    # compose toolbox helper, which owns build_dist_opt_training_optimizer.
+    assert "wire_dist_opt(" in protocol_text
+    assert 'optimizer == "dist_opt"' in protocol_text
     assert "build_dist_opt_training_optimizer" in kernel_text
+    assert "build_dist_opt_training_optimizer" not in protocol_text
 
 
 def test_glm5_lite_tiny_forward_backward(monkeypatch):

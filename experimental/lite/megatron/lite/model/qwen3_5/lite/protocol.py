@@ -22,9 +22,14 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import EXPERT_CLASSIFIER, PLACE
 from megatron.lite.model.qwen3_5.lite.checkpoint import export_hf_weights as _export_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
-from megatron.lite.model.compose import assemble
+from megatron.lite.model.compose import (
+    apply_recompute_offload,
+    build_vpp_chunks,
+    make_fsdp2_post_load_hook,
+    wire_dist_opt,
+)
 from megatron.lite.primitive.bundle import ModelBundle
-from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
@@ -146,7 +151,7 @@ def _effective_deterministic(model_cfg: Qwen35Config, impl_cfg: ImplConfig) -> b
     return impl_cfg.deterministic
 
 
-def _prepare(model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState) -> None:
+def _prepare(model_cfg: Qwen35Config, impl_cfg: ImplConfig) -> None:
     p = impl_cfg.parallel
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
@@ -196,24 +201,67 @@ def _fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
 
 
 def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    return assemble(
-        model_cfg,
-        impl_cfg,
-        name="qwen3_5",
-        chunk_factory=_chunk_factory,
-        transformer_units=lambda chunk: chunk.layers,
-        module_map=MODULE_MAP,
-        forward_step=_forward_step if impl_cfg.use_thd else _forward_step_bshd,
-        expert_classifier=is_expert_param,
-        placement_fn=PLACEMENT_FN,
-        fsdp2_unit_modules=_fsdp2_unit_modules,
-        prepare=_prepare,
-        post_chunk_hook=lambda chunks, impl: set_cross_entropy_fusion(
-            chunks, impl.cross_entropy_fusion
-        ),
-        pre_forward_hook_factory=_make_aux_loss_hook,
+    _prepare(model_cfg, impl_cfg)
+
+    ps = init_parallel(impl_cfg.parallel)
+    chunks = build_vpp_chunks(_chunk_factory, model_cfg, impl_cfg, ps)
+    set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
+
+    # #114: recompute and offload walk the same transformer_units (chunk.layers).
+    apply_recompute_offload(
+        chunks,
+        lambda chunk: chunk.layers,
+        MODULE_MAP,
+        recompute=impl_cfg.recompute,
+        offload=impl_cfg.offload,
+    )
+
+    optimizer = None
+    finalize_grads = None
+    post_model_load_hook = None
+    if impl_cfg.optimizer == "dist_opt":
+        # dist_opt uses the raw impl flag (pre-refactor behavior). The THD
+        # GatedDeltaNet determinism override applies to the chunk build and
+        # fsdp2 wiring, not to the dist_opt master-shard reduction.
+        optimizer, finalize_grads = wire_dist_opt(
+            chunks,
+            model_cfg,
+            impl_cfg,
+            ps,
+            name="qwen3_5",
+            is_expert=is_expert_param,
+            placement_fn=PLACEMENT_FN,
+            deterministic=impl_cfg.deterministic,
+        )
+        optimizer_backend = "dist_opt"
+    elif impl_cfg.optimizer == "fsdp2":
         # THD GatedDeltaNet kernel is non-deterministic; force off on that path.
-        fsdp2_deterministic_fn=lambda impl: _effective_deterministic(model_cfg, impl),
+        post_model_load_hook = make_fsdp2_post_load_hook(
+            chunks,
+            impl_cfg,
+            ps,
+            unit_modules=_fsdp2_unit_modules(),
+            expert_classifier=is_expert_param,
+            deterministic=_effective_deterministic(model_cfg, impl_cfg),
+        )
+        optimizer_backend = "fsdp2"
+    elif impl_cfg.optimizer is None:
+        optimizer_backend = "none"
+    else:
+        raise ValueError(f"Unknown qwen3_5 lite optimizer: {impl_cfg.optimizer!r}.")
+
+    return ModelBundle(
+        chunks=chunks,
+        parallel_state=ps,
+        optimizer=optimizer,
+        finalize_grads=finalize_grads,
+        forward_step=_forward_step if impl_cfg.use_thd else _forward_step_bshd,
+        extras={
+            "model_cfg": model_cfg,
+            "pre_forward_hook": _make_aux_loss_hook(),
+            "optimizer_backend": optimizer_backend,
+            "post_model_load_hook": post_model_load_hook,
+        },
     )
 
 

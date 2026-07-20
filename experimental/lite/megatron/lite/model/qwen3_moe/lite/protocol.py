@@ -2,7 +2,9 @@
 """Qwen3MoE lite impl — reference model protocol. Copy + adapt for new models.
 
 Runtime calls ``build_model_config(source, **overrides)`` then
-``build_model(model_cfg, *, impl_cfg)`` (delegates to ``compose.assemble``).
+``build_model(model_cfg, *, impl_cfg)``. ``build_model`` is explicit and calls the
+shared ``compose`` toolbox helpers (build_vpp_chunks / apply_recompute_offload /
+wire_dist_opt / make_fsdp2_post_load_hook) for the mechanics common to all models.
 """
 
 from __future__ import annotations
@@ -24,8 +26,14 @@ from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
 from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
-from megatron.lite.model.compose import assemble
+from megatron.lite.model.compose import (
+    apply_recompute_offload,
+    build_vpp_chunks,
+    make_fsdp2_post_load_hook,
+    wire_dist_opt,
+)
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     freeze_non_lora_params,
@@ -119,7 +127,7 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     return unpack_thd_forward_output(model, batch, output)
 
 
-def _prepare(model_cfg: Qwen3MoEConfig, impl_cfg: ImplConfig, ps: ParallelState) -> None:
+def _prepare(model_cfg: Qwen3MoEConfig, impl_cfg: ImplConfig) -> None:
     p = impl_cfg.parallel
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
@@ -161,17 +169,30 @@ def _fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
     return (TransformerLayer,)
 
 
-def _pre_forward_hook_factory():
+def _pre_forward_hook(loss_scale):
     from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 
-    def hook(loss_scale):
-        MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
-        MTPLossAutoScaler.set_loss_scale(loss_scale)
-
-    return hook
+    MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
+    MTPLossAutoScaler.set_loss_scale(loss_scale)
 
 
-def _lora_extras(chunks: list[nn.Module], impl_cfg: ImplConfig) -> dict[str, Any]:
+def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBundle:
+    _prepare(model_cfg, impl_cfg)
+
+    ps = init_parallel(impl_cfg.parallel)
+    chunks = build_vpp_chunks(_chunk_factory, model_cfg, impl_cfg, ps)
+    set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
+
+    # #114: recompute and offload walk the same transformer_units (chunk.layers).
+    apply_recompute_offload(
+        chunks,
+        lambda chunk: chunk.layers,
+        MODULE_MAP,
+        recompute=impl_cfg.recompute,
+        offload=impl_cfg.offload,
+    )
+
+    # LoRA freeze+stats must run before the optimizer sees params.
     lora_config = normalize_lora_config(impl_cfg.lora)
     lora_stats = None
     if lora_config.enabled:
@@ -180,30 +201,53 @@ def _lora_extras(chunks: list[nn.Module], impl_cfg: ImplConfig) -> dict[str, Any
             freeze_stats = freeze_non_lora_params(chunk)
             trainable_stats = trainable_param_stats(chunk)
             lora_stats["chunks"].append({**freeze_stats, **trainable_stats})
-    return {"lora_config": lora_config, "lora_stats": lora_stats}
 
+    optimizer = None
+    finalize_grads = None
+    post_model_load_hook = None
+    if impl_cfg.optimizer == "dist_opt":
+        # register_hooks=False: qwen3_moe skips the megatron grad-sync hooks.
+        optimizer, finalize_grads = wire_dist_opt(
+            chunks,
+            model_cfg,
+            impl_cfg,
+            ps,
+            name="qwen3_moe",
+            is_expert=is_expert_param,
+            placement_fn=PLACEMENT_FN,
+            deterministic=impl_cfg.deterministic,
+            register_hooks=False,
+        )
+        optimizer_backend = "dist_opt"
+    elif impl_cfg.optimizer == "fsdp2":
+        post_model_load_hook = make_fsdp2_post_load_hook(
+            chunks,
+            impl_cfg,
+            ps,
+            unit_modules=_fsdp2_unit_modules(),
+            expert_classifier=is_expert_param,
+            deterministic=impl_cfg.deterministic,
+        )
+        optimizer_backend = "fsdp2"
+    elif impl_cfg.optimizer is None:
+        optimizer_backend = "none"
+    else:
+        raise ValueError(f"Unknown qwen3_moe lite optimizer: {impl_cfg.optimizer!r}.")
 
-def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBundle:
-    # extra_extras (LoRA freeze+stats) runs before the optimizer sees params;
-    # register_hooks=False: qwen3_moe skips the megatron grad-sync hooks.
-    return assemble(
-        model_cfg,
-        impl_cfg,
-        name="qwen3_moe",
-        chunk_factory=_chunk_factory,
-        transformer_units=lambda chunk: chunk.layers,
-        module_map=MODULE_MAP,
+    return ModelBundle(
+        chunks=chunks,
+        parallel_state=ps,
+        optimizer=optimizer,
+        finalize_grads=finalize_grads,
         forward_step=_forward_step if impl_cfg.use_thd else _forward_step_bshd,
-        expert_classifier=is_expert_param,
-        placement_fn=PLACEMENT_FN,
-        fsdp2_unit_modules=_fsdp2_unit_modules,
-        prepare=_prepare,
-        post_chunk_hook=lambda chunks, impl: set_cross_entropy_fusion(
-            chunks, impl.cross_entropy_fusion
-        ),
-        pre_forward_hook_factory=_pre_forward_hook_factory,
-        extra_extras=_lora_extras,
-        register_hooks=False,
+        extras={
+            "model_cfg": model_cfg,
+            "pre_forward_hook": _pre_forward_hook,
+            "optimizer_backend": optimizer_backend,
+            "post_model_load_hook": post_model_load_hook,
+            "lora_config": lora_config,
+            "lora_stats": lora_stats,
+        },
     )
 
 

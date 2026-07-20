@@ -21,9 +21,14 @@ from megatron.lite.model.protocol_utils import (
     pack_r3_replay_mask as _pack_r3_replay_mask,
     pack_routed_experts as _pack_routed_experts,
 )
-from megatron.lite.model.compose import assemble
+from megatron.lite.model.compose import (
+    apply_recompute_offload,
+    build_vpp_chunks,
+    make_fsdp2_post_load_hook,
+    wire_dist_opt,
+)
 from megatron.lite.primitive.bundle import ModelBundle
-from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
     contiguous_position_ids_for_cp,
     contiguous_slice_for_cp,
@@ -379,7 +384,7 @@ def _ds4_chunk_factory(
     )
 
 
-def _ds4_prepare(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig, ps: ParallelState) -> None:
+def _ds4_prepare(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
     _validate_parallel_scope(impl_cfg.parallel)
     _apply_mtp_config(model_cfg, impl_cfg)
 
@@ -391,29 +396,75 @@ def _ds4_fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
 
 
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    # DS4 deltas: CSA/hash-MoE chunk kwargs, layers.values()+mtp unit walk, TP=1
-    # CSA scope gate + MTP config (prepare), attention-backend post-hook,
-    # use_fp32_shards=False, OptimizerConfig->dist_opt normalizer. HF I/O stays
-    # in checkpoint.py.
-    return assemble(
-        model_cfg,
-        impl_cfg,
-        name="deepseek_v4",
-        chunk_factory=_ds4_chunk_factory,
-        transformer_units=_iter_transformer_units,
-        module_map=MODULE_MAP,
+    # DS4 deltas vs the shared toolbox: CSA/hash-MoE chunk kwargs, the
+    # layers.values()+mtp unit walk (#114), the TP=1 CSA scope gate + MTP config,
+    # the attention-backend post-chunk hook, fsdp2 use_fp32_shards=False, and the
+    # OptimizerConfig/dict -> dist_opt backend normalization. HF I/O stays in
+    # checkpoint.py.
+    _ds4_prepare(model_cfg, impl_cfg)
+
+    ps = init_parallel(impl_cfg.parallel)
+    chunks = build_vpp_chunks(_ds4_chunk_factory, model_cfg, impl_cfg, ps)
+    _configure_attention_backend(chunks, impl_cfg)
+
+    # #114: recompute and offload walk the same unit enumeration
+    # (layers.values()+mtp), driven through the one _iter_transformer_units.
+    apply_recompute_offload(
+        chunks,
+        _iter_transformer_units,
+        MODULE_MAP,
+        recompute=impl_cfg.recompute,
+        offload=impl_cfg.offload,
+    )
+
+    # DS4 threads an OptimizerConfig/dict as ``optimizer`` -> dist_opt backend.
+    optimizer_choice = impl_cfg.optimizer
+    if isinstance(optimizer_choice, (dict, OptimizerConfig)):
+        optimizer_choice = "dist_opt"
+
+    optimizer = None
+    finalize_grads = None
+    post_model_load_hook = None
+    if optimizer_choice == "dist_opt":
+        optimizer, finalize_grads = wire_dist_opt(
+            chunks,
+            model_cfg,
+            impl_cfg,
+            ps,
+            name="deepseek_v4",
+            is_expert=is_expert_param,
+            placement_fn=PLACEMENT_FN,
+            deterministic=impl_cfg.deterministic,
+        )
+        optimizer_backend = "dist_opt"
+    elif optimizer_choice == "fsdp2":
+        post_model_load_hook = make_fsdp2_post_load_hook(
+            chunks,
+            impl_cfg,
+            ps,
+            unit_modules=_ds4_fsdp2_unit_modules(),
+            expert_classifier=is_expert_param,
+            deterministic=impl_cfg.deterministic,
+            use_fp32_shards=False,
+        )
+        optimizer_backend = "fsdp2"
+    elif optimizer_choice is None:
+        optimizer_backend = "none"
+    else:
+        raise ValueError(f"Unknown deepseek_v4 lite optimizer: {optimizer_choice!r}.")
+
+    return ModelBundle(
+        chunks=chunks,
+        parallel_state=ps,
+        optimizer=optimizer,
+        finalize_grads=finalize_grads,
         forward_step=_forward_step,
-        expert_classifier=is_expert_param,
-        placement_fn=PLACEMENT_FN,
-        fsdp2_unit_modules=_ds4_fsdp2_unit_modules,
-        prepare=_ds4_prepare,
-        post_chunk_hook=_configure_attention_backend,
-        pre_forward_hook_factory=_make_aux_loss_hook,
-        fsdp2_extra_kwargs={"use_fp32_shards": False},
-        # DS4 threads an OptimizerConfig/dict as ``optimizer`` -> dist_opt backend.
-        optimizer_backend_name=lambda opt: (
-            "dist_opt" if isinstance(opt, (dict, OptimizerConfig)) else opt
-        ),
+        extras={
+            "model_cfg": model_cfg,
+            "pre_forward_hook": _make_aux_loss_hook(),
+            "optimizer_backend": optimizer_backend,
+            "post_model_load_hook": post_model_load_hook,
+        },
     )
 
 

@@ -108,14 +108,17 @@ def test_kimi_k2_lite_uses_shared_mla_primitive():
 def test_kimi_k2_lite_optimizer_names_are_current():
     lite = Path(__file__).resolve().parents[3] / "megatron" / "lite"
     protocol_text = (lite / "model" / "kimi_k2" / "lite" / "protocol.py").read_text()
-    # optimizer dispatch is absorbed by the shared kernel; kimi declares the
-    # default and delegates via assemble() with inline deltas.
+    # kimi keeps an explicit build_model that dispatches on the optimizer and
+    # wires dist_opt / fsdp2 via the shared compose toolbox helpers.
     assert 'optimizer: str | None = "dist_opt"' in protocol_text
-    assert "assemble(" in protocol_text
-    # The current dist_opt / fsdp2 branch names live in the kernel.
+    assert 'optimizer == "dist_opt"' in protocol_text
+    assert 'optimizer == "fsdp2"' in protocol_text
+    assert "wire_dist_opt(" in protocol_text
+    assert "make_fsdp2_post_load_hook(" in protocol_text
+    # The low-level dist_opt build lives in the shared toolbox, not re-inlined here.
     kernel_text = (lite / "model" / "compose.py").read_text()
-    assert 'optimizer == "dist_opt"' in kernel_text
-    assert 'optimizer == "fsdp2"' in kernel_text
+    assert "build_dist_opt_training_optimizer" in kernel_text
+    assert "build_dist_opt_training_optimizer" not in protocol_text
     for forbidden in ("m" + "c_full", 'optimizer == "m' + 'c"'):
         assert forbidden not in protocol_text and forbidden not in kernel_text
 

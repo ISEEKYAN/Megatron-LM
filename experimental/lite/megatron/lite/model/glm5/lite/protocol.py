@@ -19,9 +19,14 @@ from megatron.lite.model.protocol_utils import (
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
-from megatron.lite.model.compose import assemble
+from megatron.lite.model.compose import (
+    apply_recompute_offload,
+    build_vpp_chunks,
+    make_fsdp2_post_load_hook,
+    wire_dist_opt,
+)
 from megatron.lite.primitive.bundle import ModelBundle
-from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
@@ -132,7 +137,7 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
         )
 
 
-def _prepare(model_cfg: Glm5Config, impl_cfg: ImplConfig, ps: ParallelState) -> None:
+def _prepare(model_cfg: Glm5Config, impl_cfg: ImplConfig) -> None:
     p = impl_cfg.parallel
     _validate_parallel_scope(p)
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
@@ -182,22 +187,63 @@ def _fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
 
 
 def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    return assemble(
-        model_cfg,
-        impl_cfg,
-        name="glm5",
-        chunk_factory=_chunk_factory,
-        transformer_units=lambda chunk: chunk.layers,
-        module_map=MODULE_MAP,
+    _prepare(model_cfg, impl_cfg)
+
+    ps = init_parallel(impl_cfg.parallel)
+    chunks = build_vpp_chunks(_chunk_factory, model_cfg, impl_cfg, ps)
+    set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
+
+    # #114: recompute and offload walk the same transformer_units (chunk.layers).
+    apply_recompute_offload(
+        chunks,
+        lambda chunk: chunk.layers,
+        MODULE_MAP,
+        recompute=impl_cfg.recompute,
+        offload=impl_cfg.offload,
+    )
+
+    optimizer = None
+    finalize_grads = None
+    post_model_load_hook = None
+    if impl_cfg.optimizer == "dist_opt":
+        optimizer, finalize_grads = wire_dist_opt(
+            chunks,
+            model_cfg,
+            impl_cfg,
+            ps,
+            name="glm5",
+            is_expert=is_expert_param,
+            placement_fn=PLACEMENT_FN,
+            deterministic=impl_cfg.deterministic,
+        )
+        optimizer_backend = "dist_opt"
+    elif impl_cfg.optimizer == "fsdp2":
+        post_model_load_hook = make_fsdp2_post_load_hook(
+            chunks,
+            impl_cfg,
+            ps,
+            unit_modules=_fsdp2_unit_modules(),
+            expert_classifier=is_expert_param,
+            deterministic=impl_cfg.deterministic,
+        )
+        optimizer_backend = "fsdp2"
+    elif impl_cfg.optimizer is None:
+        optimizer_backend = "none"
+    else:
+        raise ValueError(f"Unknown glm5 lite optimizer: {impl_cfg.optimizer!r}.")
+
+    return ModelBundle(
+        chunks=chunks,
+        parallel_state=ps,
+        optimizer=optimizer,
+        finalize_grads=finalize_grads,
         forward_step=_forward_step,
-        expert_classifier=is_expert_param,
-        placement_fn=PLACEMENT_FN,
-        fsdp2_unit_modules=_fsdp2_unit_modules,
-        prepare=_prepare,
-        post_chunk_hook=lambda chunks, impl: set_cross_entropy_fusion(
-            chunks, impl.cross_entropy_fusion
-        ),
-        pre_forward_hook_factory=_make_aux_loss_hook,
+        extras={
+            "model_cfg": model_cfg,
+            "pre_forward_hook": _make_aux_loss_hook(),
+            "optimizer_backend": optimizer_backend,
+            "post_model_load_hook": post_model_load_hook,
+        },
     )
 
 
