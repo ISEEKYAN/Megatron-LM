@@ -24,6 +24,7 @@ from megatron.lite.primitive.parallel.thd import (
     thd_pack_meta,
     unpack_thd_to_nested,
 )
+from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
 from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.loss import get_loss_context
 
@@ -51,9 +52,7 @@ def nested_from_packed(tensor: torch.Tensor | None, seq_lens: torch.Tensor):
     return torch.nested.as_nested_tensor(pieces, layout=torch.jagged)
 
 
-def pack_thd_forward_kwargs(
-    model, batch: PackedBatch, *, sequence_alignment: int = 1
-) -> dict[str, Any]:
+def pack_thd_forward_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
     """Pad + zigzag-CP-split a raw THD batch into model forward kwargs.
 
     Pads each sequence to the TE/zigzag alignment, then CP-splits tokens,
@@ -74,27 +73,23 @@ def pack_thd_forward_kwargs(
         roll_labels=batch.labels is not None,
         loss_mask=nested_from_packed(batch.loss_mask, seq_lens),
         roll_loss_mask=batch.loss_mask is not None,
-        sequence_alignment=sequence_alignment,
     )
+    max_seqlen = int(packed.padded_lengths.max().item()) if packed.padded_lengths.numel() else 0
     # pack_nested_thd already returns [1, T] token rows; do not unsqueeze again.
     kwargs: dict[str, Any] = {
         "input_ids": packed.input_ids,
         "labels": packed.labels,
         "loss_mask": packed.loss_mask,
         "position_ids": packed.position_ids,
-        "packed_seq_params": packed.packed_seq_params,
+        "packed_seq_params": PackedSeqParams.from_cu_seqlens(
+            packed.cu_seqlens_padded, max_seqlen=max_seqlen
+        ),
     }
     prepare_packed_thd_kwargs_for_context_parallel(model, kwargs)
     return kwargs
 
 
-def unpack_thd_forward_output(
-    model,
-    batch: PackedBatch,
-    output: torch.Tensor,
-    *,
-    sequence_alignment: int = 1,
-) -> torch.Tensor:
+def unpack_thd_forward_output(model, batch: PackedBatch, output: torch.Tensor) -> torch.Tensor:
     """Reverse a zigzag-CP THD model output back to jagged true-length form."""
     ps = _parallel_state(model)
     meta = thd_pack_meta(
@@ -102,7 +97,6 @@ def unpack_thd_forward_output(
         tp_size=ps.tp_size,
         cp_size=ps.cp_size,
         cp_group=ps.cp_group if ps.cp_size > 1 else None,
-        sequence_alignment=sequence_alignment,
     )
     return unpack_thd_to_nested(output, meta, contiguous=False)
 

@@ -745,22 +745,6 @@ def test_glm5_protocol_allows_cp_only_parallel_scope():
         _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=2, cp=1, pp=1, vpp=1))
 
 
-def test_glm5_protocol_requests_cudnn_dsa_sequence_alignment():
-    protocol_path = (
-        Path(__file__).resolve().parents[3]
-        / "megatron"
-        / "lite"
-        / "model"
-        / "glm5"
-        / "lite"
-        / "protocol.py"
-    )
-    source = protocol_path.read_text()
-
-    assert "GLM5_DSA_SEQUENCE_ALIGNMENT = 512" in source
-    assert source.count("sequence_alignment=GLM5_DSA_SEQUENCE_ALIGNMENT") == 2
-
-
 def test_glm5_impl_config_accepts_runtime_mtp_fields():
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.protocol import ImplConfig
