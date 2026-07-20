@@ -756,6 +756,71 @@ def test_glm5_impl_config_accepts_runtime_mtp_fields():
     assert cfg.num_nextn_predict_layers == 1
 
 
+def test_glm5_dsa_execution_policy_lives_in_impl_config_only(
+    transformer_engine_import_stub,
+):
+    from dataclasses import fields
+
+    transformer_engine_import_stub()
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite.protocol import ImplConfig
+
+    architecture_fields = {field.name for field in fields(Glm5Config)}
+
+    assert {
+        "dsa_cp_mode",
+        "dsa_indexer_loss_coeff",
+        "dsa_indexer_use_sparse_loss",
+        "calculate_per_token_loss",
+    }.isdisjoint(architecture_fields)
+    assert ImplConfig().dsa_cp_mode == "native"
+    assert ImplConfig().dsa_indexer_loss_coeff == 0.0
+    assert ImplConfig().dsa_indexer_use_sparse_loss is False
+    assert ImplConfig().calculate_per_token_loss is False
+    assert ImplConfig(dsa_cp_mode="legacy_gather_all").dsa_cp_mode == "legacy_gather_all"
+
+
+def test_glm5_production_cp_path_has_no_zigzag_layout():
+    lite_root = Path(__file__).resolve().parents[3] / "megatron" / "lite"
+    model_text = (lite_root / "model" / "glm5" / "lite" / "model.py").read_text()
+    dsa_text = (lite_root / "primitive" / "modules" / "attention" / "dsa.py").read_text()
+
+    assert "zigzag" not in model_text
+    assert "zigzag" not in dsa_text
+
+
+def test_glm5_attention_receives_impl_dsa_policy(monkeypatch, transformer_engine_import_stub):
+    import torch.nn as nn
+
+    transformer_engine_import_stub()
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite import model as model_module
+    from megatron.lite.primitive.parallel import ParallelState
+
+    captured = {}
+
+    class FakeDSA(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            captured.update(kwargs)
+
+    monkeypatch.setattr(model_module, "DynamicSparseAttention", FakeDSA)
+    model_module.Glm5DSAAttention(
+        Glm5Config(**_tiny_config_kwargs()),
+        ParallelState(cp_size=2, cp_rank=0),
+        0,
+        dsa_cp_mode="legacy_gather_all",
+        dsa_indexer_loss_coeff=0.25,
+        dsa_indexer_use_sparse_loss=True,
+        calculate_per_token_loss=True,
+    )
+
+    assert captured["cp_mode"] == "legacy_gather_all"
+    assert captured["indexer_loss_coeff"] == 0.25
+    assert captured["indexer_use_sparse_loss"] is True
+    assert captured["calculate_per_token_loss"] is True
+
+
 def test_glm5_protocol_uses_mlite_optimizer_api():
     from megatron.lite.model.glm5.lite.protocol import ImplConfig
 

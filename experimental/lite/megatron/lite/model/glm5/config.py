@@ -13,10 +13,6 @@ from megatron.lite.primitive.config import load_hf_config_dict
 _HF_FIELDS = frozenset(
     {
         "attention_dropout",
-        "calculate_per_token_loss",
-        "dsa_indexer_loss_coeff",
-        "dsa_indexer_use_sparse_loss",
-        "dsa_cp_mode",
         "first_k_dense_replace",
         "head_dim",
         "hidden_size",
@@ -124,10 +120,6 @@ class Glm5Config:
     indexer_rope_interleave: bool = False
     indexer_rope_first: bool = True
     indexer_use_hadamard: bool = False
-    dsa_indexer_loss_coeff: float = 0.0
-    dsa_indexer_use_sparse_loss: bool = False
-    dsa_cp_mode: str = "native"
-    calculate_per_token_loss: bool = False
     rope_interleave: bool = False
     rope_theta: float = 1_000_000.0
     latent_rms_norm_eps: float = 1e-6
@@ -210,11 +202,6 @@ class Glm5Config:
         check(
             self.index_skip_topk_offset >= 0,
             "index_skip_topk_offset must be >= 0",
-        )
-        check(self.dsa_indexer_loss_coeff >= 0.0, "dsa_indexer_loss_coeff must be >= 0")
-        check(
-            self.dsa_cp_mode in {"native", "legacy_gather_all"},
-            "dsa_cp_mode must be 'native' or 'legacy_gather_all'",
         )
         check(
             self.num_key_value_heads == self.num_attention_heads,

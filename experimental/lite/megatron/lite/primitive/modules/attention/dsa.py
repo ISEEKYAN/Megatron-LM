@@ -17,14 +17,7 @@ from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 from megatron.lite.primitive.modules.attention.cp import iter_cp_sources
 from megatron.lite.primitive.parallel.cp import (
     contiguous_position_ids_for_cp,
-    get_thd_context_parallel_rank_indices,
-    zigzag_reconstruct_from_cp_parts,
-    zigzag_position_ids_for_cp,
-    zigzag_slice_for_cp,
-)
-from megatron.lite.primitive.parallel.thd import (
-    reconstruct_packed_from_cp_parts,
-    split_packed_to_cp_local,
+    contiguous_slice_for_cp,
 )
 
 if TYPE_CHECKING:
@@ -247,14 +240,12 @@ def _all_gather_cp(
 def _dense_cp_layout(
     *, local_seq: int, cp_size: int, cp_rank: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return local-query positions and rank-major-to-global KV reorder."""
+    """Return contiguous local-query positions and global KV order."""
     full_seq = local_seq * cp_size
-    per_rank = [
-        zigzag_position_ids_for_cp(full_seq, rank, cp_size, device).flatten()
-        for rank in range(cp_size)
-    ]
-    rank_major_positions = torch.cat(per_rank)
-    return per_rank[cp_rank], torch.argsort(rank_major_positions)
+    query_positions = contiguous_position_ids_for_cp(
+        full_seq, cp_rank, cp_size, device
+    ).flatten()
+    return query_positions, torch.arange(full_seq, device=device, dtype=torch.long)
 
 
 def _packed_cp_layout(
@@ -263,19 +254,9 @@ def _packed_cp_layout(
     cp_size: int,
     cp_rank: int,
     device: torch.device,
-    layout: str = "zigzag",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return THD local-query positions and rank-major-to-global KV reorder."""
+    """Return contiguous THD local-query positions and global KV order."""
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.long)
-    if layout == "zigzag":
-        per_rank = [
-            get_thd_context_parallel_rank_indices(cu_seqlens, cp_size, rank, layout)
-            for rank in range(cp_size)
-        ]
-        rank_major_positions = torch.cat(per_rank)
-        return per_rank[cp_rank], torch.argsort(rank_major_positions)
-    if layout != "contiguous":
-        raise ValueError(f"Unsupported packed CP layout {layout!r}.")
     total = int(cu_seqlens[-1].item())
     if total % cp_size:
         raise ValueError(
@@ -845,14 +826,8 @@ class DynamicSparseAttention(nn.Module):
                 index_share_state=index_share_state,
             )
             if self.cp_size > 1:
-                out = split_packed_to_cp_local(
-                    out,
-                    cu_seqlens_padded=self._packed_cu_seqlens(
-                        packed_seq_params, x.device
-                    ),
-                    cp_size=self.cp_size,
-                    cp_rank=self.cp_rank,
-                    dim=1,
+                out = contiguous_slice_for_cp(
+                    out, self.cp_rank, self.cp_size, seq_dim=1
                 )
             return out
 
@@ -876,7 +851,7 @@ class DynamicSparseAttention(nn.Module):
             x, cos, sin, position_ids, index_share_state=index_share_state
         )
         if cp_restore:
-            out = zigzag_slice_for_cp(out, self.cp_rank, self.cp_size, seq_dim=1)
+            out = contiguous_slice_for_cp(out, self.cp_rank, self.cp_size, seq_dim=1)
         return out
 
     def _project_cp_inputs(
@@ -938,13 +913,7 @@ class DynamicSparseAttention(nn.Module):
         self,
         tensor: torch.Tensor,
         kv_reorder: torch.Tensor,
-        *,
-        contiguous: bool = False,
     ) -> torch.Tensor:
-        if not contiguous:
-            parts = _all_gather_cp(tensor, cp_size=self.cp_size, cp_group=self.cp_group)
-            rank_major = torch.cat(parts, dim=0)
-            return rank_major.index_select(0, kv_reorder)
         local_positions = contiguous_position_ids_for_cp(
             tensor.shape[0] * self.cp_size,
             self.cp_rank,
@@ -1104,13 +1073,17 @@ class DynamicSparseAttention(nn.Module):
                 "GLM5 THD+CP DSA expects batch-collapsed input [1, total, hidden]."
             )
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params, x.device)
-        cp_layout = getattr(packed_seq_params, "cp_layout", "zigzag")
+        cp_layout = getattr(packed_seq_params, "cp_layout", "contiguous")
+        if cp_layout != "contiguous":
+            raise ValueError(
+                "GLM5 THD+CP DSA requires contiguous allgather-CP layout, "
+                f"got {cp_layout!r}."
+            )
         query_pos, kv_reorder = _packed_cp_layout(
             cu_seqlens,
             cp_size=self.cp_size,
             cp_rank=self.cp_rank,
             device=x.device,
-            layout=cp_layout,
         )
         if query_pos.numel() != x.shape[1]:
             raise RuntimeError(
@@ -1120,14 +1093,9 @@ class DynamicSparseAttention(nn.Module):
         query, kv_local, v_up_weight, q_idx, k_idx_local, idx_weights = (
             self._project_cp_inputs(x, cos, sin, position_ids)
         )
-        use_contiguous_cp = cp_layout == "contiguous"
-        kv = self._gather_projected_cp(
-            kv_local, kv_reorder, contiguous=use_contiguous_cp
-        )
+        kv = self._gather_projected_cp(kv_local, kv_reorder)
         k_idx = (
-            self._gather_projected_cp(
-                k_idx_local, kv_reorder, contiguous=use_contiguous_cp
-            )
+            self._gather_projected_cp(k_idx_local, kv_reorder)
             if k_idx_local is not None
             else None
         )
@@ -1365,7 +1333,7 @@ class DynamicSparseAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         local_batch, local_seq = x.shape[:2]
         x_parts = _all_gather_cp(x, cp_size=self.cp_size, cp_group=self.cp_group)
-        full_x = zigzag_reconstruct_from_cp_parts(x_parts, seq_dim=1)
+        full_x = torch.cat(x_parts, dim=1)
         full_seq = full_x.shape[1]
 
         full_position_ids = self._full_cp_position_ids(
@@ -1401,8 +1369,8 @@ class DynamicSparseAttention(nn.Module):
         cos_parts = _all_gather_cp(cos, cp_size=self.cp_size, cp_group=self.cp_group)
         sin_parts = _all_gather_cp(sin, cp_size=self.cp_size, cp_group=self.cp_group)
         return (
-            zigzag_reconstruct_from_cp_parts(cos_parts, seq_dim=1),
-            zigzag_reconstruct_from_cp_parts(sin_parts, seq_dim=1),
+            torch.cat(cos_parts, dim=1),
+            torch.cat(sin_parts, dim=1),
         )
 
     def _full_cp_position_ids(
@@ -1431,7 +1399,7 @@ class DynamicSparseAttention(nn.Module):
             cp_size=self.cp_size,
             cp_group=self.cp_group,
         )
-        return zigzag_reconstruct_from_cp_parts(pos_parts, seq_dim=1)
+        return torch.cat(pos_parts, dim=1)
 
     def _gather_packed_cp_inputs(
         self, x: torch.Tensor, position_ids: torch.Tensor, packed_seq_params
@@ -1440,9 +1408,7 @@ class DynamicSparseAttention(nn.Module):
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params, x.device)
         full_seq = int(cu_seqlens[-1].item())
         x_parts = _all_gather_cp(x, cp_size=self.cp_size, cp_group=self.cp_group)
-        full_x = reconstruct_packed_from_cp_parts(
-            x_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
-        )
+        full_x = torch.cat(x_parts, dim=1)
 
         if position_ids.dim() == 1:
             position_ids = position_ids.unsqueeze(0)
@@ -1457,9 +1423,7 @@ class DynamicSparseAttention(nn.Module):
         pos_parts = _all_gather_cp(
             position_ids, cp_size=self.cp_size, cp_group=self.cp_group
         )
-        full_position_ids = reconstruct_packed_from_cp_parts(
-            pos_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
-        )
+        full_position_ids = torch.cat(pos_parts, dim=1)
         return full_x, full_position_ids
 
     def _gather_packed_cp_rotary(
@@ -1477,12 +1441,8 @@ class DynamicSparseAttention(nn.Module):
             return cos, sin
         cos_parts = _all_gather_cp(cos, cp_size=self.cp_size, cp_group=self.cp_group)
         sin_parts = _all_gather_cp(sin, cp_size=self.cp_size, cp_group=self.cp_group)
-        full_cos = reconstruct_packed_from_cp_parts(
-            cos_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
-        )
-        full_sin = reconstruct_packed_from_cp_parts(
-            sin_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
-        )
+        full_cos = torch.cat(cos_parts, dim=1)
+        full_sin = torch.cat(sin_parts, dim=1)
         return full_cos, full_sin
 
     @staticmethod

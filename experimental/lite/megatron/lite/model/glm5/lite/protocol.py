@@ -100,6 +100,10 @@ class ImplConfig:
     cross_entropy_fusion: bool = False
     hf_path: str = ""
     attention_backend_override: str | None = None
+    dsa_cp_mode: str = "native"
+    dsa_indexer_loss_coeff: float = 0.0
+    dsa_indexer_use_sparse_loss: bool = False
+    calculate_per_token_loss: bool = False
     router_aux_loss_coef: float | None = None
     router_bias_rate: float = 0.0
     deterministic: bool = True
@@ -109,6 +113,15 @@ class ImplConfig:
     mtp_detach_encoder: bool = False
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.dsa_cp_mode not in {"native", "legacy_gather_all"}:
+            raise ValueError(
+                "dsa_cp_mode must be 'native' or 'legacy_gather_all', "
+                f"got {self.dsa_cp_mode!r}"
+            )
+        if self.dsa_indexer_loss_coeff < 0.0:
+            raise ValueError("dsa_indexer_loss_coeff must be >= 0")
 
 
 def build_model_config(source: str | Path | dict, **overrides) -> Glm5Config:
@@ -273,6 +286,10 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         use_thd=impl_cfg.use_thd,
         hf_path=impl_cfg.hf_path,
         attention_backend_override=impl_cfg.attention_backend_override,
+        dsa_cp_mode=impl_cfg.dsa_cp_mode,
+        dsa_indexer_loss_coeff=impl_cfg.dsa_indexer_loss_coeff,
+        dsa_indexer_use_sparse_loss=impl_cfg.dsa_indexer_use_sparse_loss,
+        calculate_per_token_loss=impl_cfg.calculate_per_token_loss,
         mtp_enable=mtp_enable,
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,

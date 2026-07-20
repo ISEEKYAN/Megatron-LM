@@ -60,8 +60,8 @@ from megatron.lite.primitive.parallel import (
     gather_from_sequence_parallel,
     roll_packed_thd_left,
     scatter_to_sequence_parallel,
-    zigzag_position_ids_for_cp,
 )
+from megatron.lite.primitive.parallel.cp import contiguous_position_ids_for_cp
 from megatron.lite.primitive.utils import build_fp8_recipe
 from megatron.lite.primitive.utils.moe import (
     compute_routing_scores_for_aux_loss,
@@ -162,7 +162,17 @@ class Glm5DSAAttention(nn.Module):
     The Kimi skeleton therefore never observes the batch-first interior.
     """
 
-    def __init__(self, config: Glm5Config, ps: ParallelState, layer_idx: int):
+    def __init__(
+        self,
+        config: Glm5Config,
+        ps: ParallelState,
+        layer_idx: int,
+        *,
+        dsa_cp_mode: str = "native",
+        dsa_indexer_loss_coeff: float = 0.0,
+        dsa_indexer_use_sparse_loss: bool = False,
+        calculate_per_token_loss: bool = False,
+    ):
         super().__init__()
         self.ps = ps
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -189,13 +199,13 @@ class Glm5DSAAttention(nn.Module):
             index_topk_freq=config.index_topk_freq,
             index_skip_topk_offset=config.index_skip_topk_offset,
             indexer_type=config.dsa_indexer_type(layer_idx),
-            indexer_loss_coeff=config.dsa_indexer_loss_coeff,
-            indexer_use_sparse_loss=config.dsa_indexer_use_sparse_loss,
-            calculate_per_token_loss=config.calculate_per_token_loss,
+            indexer_loss_coeff=dsa_indexer_loss_coeff,
+            indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+            calculate_per_token_loss=calculate_per_token_loss,
             cp_size=ps.cp_size,
             cp_rank=ps.cp_rank,
             cp_group=ps.cp_group,
-            cp_mode=config.dsa_cp_mode,
+            cp_mode=dsa_cp_mode,
         )
 
     def forward(
@@ -214,7 +224,7 @@ class Glm5DSAAttention(nn.Module):
                     "GLM5 packed DSA requires explicit per-sequence position_ids."
                 )
             if self.ps.cp_size > 1:
-                position_ids = zigzag_position_ids_for_cp(
+                position_ids = contiguous_position_ids_for_cp(
                     seq_len * self.ps.cp_size,
                     self.ps.cp_rank,
                     self.ps.cp_size,
@@ -485,6 +495,10 @@ class Glm5Layer(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         use_thd: bool = False,
+        dsa_cp_mode: str = "native",
+        dsa_indexer_loss_coeff: float = 0.0,
+        dsa_indexer_use_sparse_loss: bool = False,
+        calculate_per_token_loss: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -493,7 +507,15 @@ class Glm5Layer(nn.Module):
         # The wrapper preserves the SBHD self_attention(x, packed_seq_params=)
         # contract so this layer's forward stays identical to Kimi's.
         del use_thd  # DSA derives its own THD handling from packed_seq_params.
-        self.self_attention = Glm5DSAAttention(config, ps, layer_idx)
+        self.self_attention = Glm5DSAAttention(
+            config,
+            ps,
+            layer_idx,
+            dsa_cp_mode=dsa_cp_mode,
+            dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
+            dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+            calculate_per_token_loss=calculate_per_token_loss,
+        )
         if config.is_moe_layer(layer_idx):
             self.mlp_norm: nn.Module | None = te.RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -561,6 +583,10 @@ class Glm5MTPLayer(nn.Module):
         moe_act_recompute: bool,
         use_thd: bool,
         detach_encoder: bool,
+        dsa_cp_mode: str,
+        dsa_indexer_loss_coeff: float,
+        dsa_indexer_use_sparse_loss: bool,
+        calculate_per_token_loss: bool,
     ):
         super().__init__()
         self.ps = ps
@@ -584,6 +610,10 @@ class Glm5MTPLayer(nn.Module):
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
             use_thd=use_thd,
+            dsa_cp_mode=dsa_cp_mode,
+            dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
+            dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+            calculate_per_token_loss=calculate_per_token_loss,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -641,6 +671,10 @@ class Glm5MTPBlock(nn.Module):
         use_thd: bool,
         detach_encoder: bool,
         repeated_layer: bool,
+        dsa_cp_mode: str,
+        dsa_indexer_loss_coeff: float,
+        dsa_indexer_use_sparse_loss: bool,
+        calculate_per_token_loss: bool,
     ):
         super().__init__()
         self.num_layers = config.num_nextn_predict_layers
@@ -659,6 +693,10 @@ class Glm5MTPBlock(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     detach_encoder=detach_encoder,
+                    dsa_cp_mode=dsa_cp_mode,
+                    dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
+                    dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+                    calculate_per_token_loss=calculate_per_token_loss,
                 )
                 for idx in range(layers_to_build)
             ]
@@ -753,6 +791,10 @@ class Glm5Model(nn.Module):
         use_thd: bool = False,
         hf_path: str = "",
         attention_backend_override: str | None = None,
+        dsa_cp_mode: str = "native",
+        dsa_indexer_loss_coeff: float = 0.0,
+        dsa_indexer_use_sparse_loss: bool = False,
+        calculate_per_token_loss: bool = False,
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
@@ -824,6 +866,10 @@ class Glm5Model(nn.Module):
                     fp8=train_config.fp8,
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
+                    dsa_cp_mode=dsa_cp_mode,
+                    dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
+                    dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+                    calculate_per_token_loss=calculate_per_token_loss,
                 )
                 for idx in self.layer_indices
             ]
@@ -853,6 +899,10 @@ class Glm5Model(nn.Module):
                 use_thd=use_thd,
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
+                dsa_cp_mode=dsa_cp_mode,
+                dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+                calculate_per_token_loss=calculate_per_token_loss,
             )
 
         self.sp_params: list[nn.Parameter] = []

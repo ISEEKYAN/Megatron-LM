@@ -26,12 +26,12 @@ def test_dense_cp_layout_keeps_local_queries_and_restores_global_kv_order():
         device=torch.device("cpu"),
     )
 
-    assert query_positions.tolist() == [0, 1, 6, 7]
-    gathered_positions = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5])
+    assert query_positions.tolist() == [0, 1, 2, 3]
+    gathered_positions = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7])
     assert gathered_positions.index_select(0, kv_reorder).tolist() == list(range(8))
 
 
-def test_packed_cp_layout_uses_per_sequence_zigzag_coordinates():
+def test_packed_cp_layout_uses_contiguous_global_coordinates():
     from megatron.lite.primitive.modules.attention.dsa import _packed_cp_layout
 
     cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
@@ -42,10 +42,8 @@ def test_packed_cp_layout_uses_per_sequence_zigzag_coordinates():
         device=torch.device("cpu"),
     )
 
-    assert query_positions.tolist() == [0, 1, 6, 7, 8, 9, 14, 15]
-    gathered_positions = torch.tensor(
-        [0, 1, 6, 7, 8, 9, 14, 15, 2, 3, 4, 5, 10, 11, 12, 13]
-    )
+    assert query_positions.tolist() == list(range(8))
+    gathered_positions = torch.arange(16)
     assert gathered_positions.index_select(0, kv_reorder).tolist() == list(range(16))
 
 
