@@ -581,35 +581,43 @@ def indexer_topk(
 def _cudnn_topk_block(
     dsa_namespace, scores: Tensor, width: int
 ) -> Tuple[Tensor, Tensor]:
-    """Run cuDNN radix top-k with physical storage matching its compile bucket.
-
-    cuDNN Frontend v1.26 compiles ``indexer_top_k_wrapper`` for the next
-    power-of-two column bucket while ``seq_lens`` carries each row's logical
-    width.  Give ragged THD rows the corresponding physical ``-inf`` tail so
-    vectorized loads cannot leave the allocation; keep ``seq_lens`` and
-    ``top_k`` at the logical K width so padding can never become a valid pick.
-    """
-    logical_cols = scores.shape[-1]
-    bucket_cols = 1 << (logical_cols - 1).bit_length()
-    if bucket_cols != logical_cols:
-        scores = torch.nn.functional.pad(
-            scores, (0, bucket_cols - logical_cols), value=float("-inf")
-        )
+    """Run cuDNN radix top-k and validate its varlen shape contract."""
+    num_cols = scores.shape[-1]
     scores = scores.contiguous()
     seq_lens = torch.full(
-        (scores.shape[0],), logical_cols, device=scores.device, dtype=torch.int32
+        (scores.shape[0],), num_cols, device=scores.device, dtype=torch.int32
     )
+    next_n = 1
+    min_seq_len = int(seq_lens.min().item())
+    max_seq_len = int(seq_lens.max().item())
+    print(
+        "MLite DSA indexer_top_k contract: "
+        f"input_values.shape={tuple(scores.shape)}, "
+        f"seq_lens.min={min_seq_len}, seq_lens.max={max_seq_len}, "
+        f"top_k={width}, next_n={next_n}",
+        flush=True,
+    )
+    if scores.shape[0] != seq_lens.numel() * next_n:
+        raise RuntimeError(
+            "cuDNN indexer_top_k row contract violated: "
+            f"n_rows={scores.shape[0]}, seq_lens={seq_lens.numel()}, next_n={next_n}."
+        )
+    if min_seq_len < 0 or max_seq_len > num_cols:
+        raise RuntimeError(
+            "cuDNN indexer_top_k column contract violated: "
+            f"seq_lens range=[{min_seq_len}, {max_seq_len}], num_cols={num_cols}."
+        )
     result = dsa_namespace.indexer_top_k_wrapper(
         scores,
         seq_lens,
         top_k=width,
-        next_n=1,
+        next_n=next_n,
         return_val=False,
     )
     indices = result["indices"]
-    valid = (indices >= 0) & (indices < logical_cols)
-    safe_indices = indices.clamp(min=0, max=logical_cols - 1).long()
-    values = torch.gather(scores[:, :logical_cols], -1, safe_indices)
+    valid = (indices >= 0) & (indices < num_cols)
+    safe_indices = indices.clamp(min=0, max=num_cols - 1).long()
+    values = torch.gather(scores, -1, safe_indices)
     values = torch.where(valid, values, torch.full_like(values, float("-inf")))
     return values, torch.where(valid, indices, torch.full_like(indices, -1))
 

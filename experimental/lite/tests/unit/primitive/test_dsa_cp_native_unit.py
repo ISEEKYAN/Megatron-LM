@@ -80,7 +80,7 @@ def test_ragged_packed_kv_is_physically_aligned_without_changing_valid_rows():
     assert _pad_sparse_kv_rows(padded, 128) is padded
 
 
-def test_ragged_indexer_scores_pad_to_cudnn_compile_bucket_but_keep_logical_length():
+def test_ragged_indexer_scores_keep_physical_width_and_report_cudnn_contract(capsys):
     from megatron.lite.primitive.kernels.dsa_kernels import _cudnn_topk_block
 
     scores = torch.randn(3, 520)
@@ -92,12 +92,12 @@ def test_ragged_indexer_scores_pad_to_cudnn_compile_bucket_but_keep_logical_leng
     values, indices = _cudnn_topk_block(fake_dsa, scores, width=512)
 
     call = fake_dsa.indexer_top_k_wrapper.call_args
-    padded_scores, seq_lens = call.args
-    assert padded_scores.shape == (3, 1024)
-    assert torch.equal(padded_scores[:, :520], scores)
-    assert torch.isneginf(padded_scores[:, 520:]).all()
+    input_values, seq_lens = call.args
+    assert input_values.shape == (3, 520)
+    assert torch.equal(input_values, scores)
     assert seq_lens.tolist() == [520, 520, 520]
     assert call.kwargs == {"top_k": 512, "next_n": 1, "return_val": False}
+    assert "input_values.shape=(3, 520)" in capsys.readouterr().out
     assert values.shape == indices.shape == (3, 512)
     assert indices[0, -1] == -1
     assert torch.isneginf(values[0, -1])
