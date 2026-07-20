@@ -487,21 +487,31 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     state = model.state_dict()
 
     assert torch.equal(
-        exported["model.layers.1.mlp.experts.2.gate_proj.weight"].detach().cpu(),
-        state["layers.1.moe.experts.fc1.weight2"][: cfg.moe_intermediate_size].detach().cpu(),
+        exported["model.layers.1.mlp.experts.gate_up_proj"].detach().cpu(),
+        torch.stack(
+            [
+                state[f"layers.1.moe.experts.fc1.weight{expert_idx}"].detach().cpu()
+                for expert_idx in range(cfg.num_experts)
+            ]
+        ),
     )
     assert torch.equal(
         exported["model.layers.1.mlp.gate.e_score_correction_bias"].detach().cpu(),
         state["layers.1.moe.router.expert_bias"].detach().cpu(),
     )
-    assert "model.layers.1.mlp.experts.gate_up_proj" not in exported
+    assert "model.layers.1.mlp.experts.2.gate_proj.weight" not in exported
 
     hf_dir = tmp_path / "hf"
     save_hf_weights(model, str(hf_dir), cfg, ps)
     with safe_open(str(hf_dir / "model.safetensors"), framework="pt", device="cpu") as handle:
         assert torch.equal(
-            handle.get_tensor("model.layers.1.mlp.experts.2.down_proj.weight"),
-            state["layers.1.moe.experts.fc2.weight2"].detach().cpu(),
+            handle.get_tensor("model.layers.1.mlp.experts.down_proj"),
+            torch.stack(
+                [
+                    state[f"layers.1.moe.experts.fc2.weight{expert_idx}"].detach().cpu()
+                    for expert_idx in range(cfg.num_experts)
+                ]
+            ),
         )
         assert torch.equal(
             handle.get_tensor("model.layers.1.mlp.gate.e_score_correction_bias"),

@@ -283,19 +283,41 @@ def _load_experts(
     ps: ParallelState,
     reader: SafeTensorReader,
 ) -> None:
+    """Load both current GLM-5 fused experts and legacy per-expert weights.
+
+    ``GlmMoeDsaExperts`` stores routed experts as two tensors with an expert
+    axis: ``experts.gate_up_proj`` and ``experts.down_proj``.  Older MLite
+    exports used one ``gate_proj`` / ``up_proj`` / ``down_proj`` triplet per
+    expert, so retain that reader path for backwards-compatible checkpoints.
+    """
     num_local = ensure_divisible(cfg.num_experts, ps.ep_size)
     local_start = ps.ep_rank * num_local
+    fused_gate_up_name = f"{hf_mlp_prefix}.experts.gate_up_proj"
+    fused_down_name = f"{hf_mlp_prefix}.experts.down_proj"
+    has_fused_experts = _has(reader, fused_gate_up_name)
+    if has_fused_experts != _has(reader, fused_down_name):
+        raise KeyError(
+            "GLM-5 fused expert checkpoint must contain both "
+            f"{fused_gate_up_name} and {fused_down_name}."
+        )
+    fused_gate_up = _get(reader, fused_gate_up_name) if has_fused_experts else None
+    fused_down = _get(reader, fused_down_name) if has_fused_experts else None
     for local_idx in range(num_local):
         global_idx = local_start + local_idx
-        ep = f"{hf_mlp_prefix}.experts.{global_idx}"
-        fc1 = torch.cat(
-            [
-                _get(reader, f"{ep}.gate_proj.weight"),
-                _get(reader, f"{ep}.up_proj.weight"),
-            ],
-            dim=0,
-        )
-        fc2 = _get(reader, f"{ep}.down_proj.weight")
+        if has_fused_experts:
+            assert fused_gate_up is not None and fused_down is not None
+            fc1 = fused_gate_up[global_idx]
+            fc2 = fused_down[global_idx]
+        else:
+            ep = f"{hf_mlp_prefix}.experts.{global_idx}"
+            fc1 = torch.cat(
+                [
+                    _get(reader, f"{ep}.gate_proj.weight"),
+                    _get(reader, f"{ep}.up_proj.weight"),
+                ],
+                dim=0,
+            )
+            fc2 = _get(reader, f"{ep}.down_proj.weight")
         if ps.etp_size > 1:
             fc1 = _split_gate_up(fc1, ps.etp_rank, ps.etp_size)
             fc2 = _tp(fc2, ps.etp_rank, ps.etp_size, dim=1)
@@ -449,6 +471,11 @@ class Glm5WeightSpec:
         if suffix == "moe.shared_expert.down.linear.weight":
             return [(f"{mp}.shared_experts.down_proj.weight", tensor)]
 
+        if suffix == "moe.experts.gate_up_proj":
+            return [(f"{mp}.experts.gate_up_proj", tensor)]
+        if suffix == "moe.experts.down_proj":
+            return [(f"{mp}.experts.down_proj", tensor)]
+
         if ".moe.experts.fc1.weight" in native_name:
             expert_idx = parse_expert_idx(native_name)
             gate, up = tensor.chunk(2, dim=0)
@@ -461,6 +488,14 @@ class Glm5WeightSpec:
             return [(f"{mp}.experts.{expert_idx}.down_proj.weight", tensor)]
 
         return []
+
+    def packed_expert_group_name(self, native_name: str) -> str | None:
+        """Group local expert weights into HF's fused GLM-5 expert tensors."""
+        if ".moe.experts.fc1.weight" in native_name:
+            return native_name.rsplit(".fc1.weight", 1)[0] + ".gate_up_proj"
+        if ".moe.experts.fc2.weight" in native_name:
+            return native_name.rsplit(".fc2.weight", 1)[0] + ".down_proj"
+        return None
 
     def qkv_spec(self, native_name: str) -> tuple[int, int, int] | None:
         del native_name
