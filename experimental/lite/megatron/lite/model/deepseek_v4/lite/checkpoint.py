@@ -548,7 +548,10 @@ def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelSta
     router buffers (``tid2eid`` for hash layers, ``expert_bias`` for non-hash
     layers) which the parameter-only ``_export`` does not visit.
     """
-    from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        export_hf_weights as _export,
+        stream_pp_tensors,
+    )
 
     spec = DeepseekV4WeightSpec(config)
     rank0_only = bool(kwargs.get("rank0_only", False))
@@ -556,7 +559,6 @@ def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelSta
     export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
     yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
 
-    rank = dist.get_rank() if dist.is_initialized() else 0
     chunks = list(model) if isinstance(model, list | nn.ModuleList) else [model]
     local_buffers: list[tuple[str, torch.Tensor]] = []
     for chunk in chunks:
@@ -575,51 +577,15 @@ def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelSta
             for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer.detach()):
                 local_buffers.append((hf_name, hf_tensor.contiguous()))
 
-    emit = not (rank0_only and rank != 0)
-    if ps.pp_size <= 1:
-        if emit:
-            for hf_name, tensor in local_buffers:
-                tensor = tensor.cpu() if cpu else tensor
-                yield hf_name, _cast_export_tensor(tensor, export_dtype)
-        return
-
     # Router state is stored as buffers, so the parameter-only shared exporter
     # above cannot carry it across PP stages.  Every actor rank feeds one rollout
     # worker; yielding only this rank's local buffers leaves each online vLLM
-    # replica with router state for just one pipeline stage.  Stream every PP
-    # stage's buffers over the same PP group used for parameters so each rank
-    # emits a complete model without materializing the full checkpoint.
-    bcast_device = (
-        torch.device("cuda", torch.cuda.current_device())
-        if torch.cuda.is_available()
-        else torch.device("cpu")
-    )
-    for src_pp in range(ps.pp_size):
-        src_global = ps.pp_global_ranks[src_pp]
-        is_source = src_pp == ps.pp_rank
-        if is_source:
-            stage_buffers = [
-                (name, tensor.to(bcast_device).contiguous()) for name, tensor in local_buffers
-            ]
-            header = [
-                [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in stage_buffers]
-            ]
-        else:
-            stage_buffers = []
-            header = [None]
-        dist.broadcast_object_list(
-            header, src=src_global, group=ps.pp_group, device=bcast_device
-        )
-        for idx, (hf_name, shape, dtype) in enumerate(header[0]):
-            tensor = (
-                stage_buffers[idx][1]
-                if is_source
-                else torch.empty(shape, dtype=dtype, device=bcast_device)
-            )
-            dist.broadcast(tensor, src=src_global, group=ps.pp_group)
-            if emit:
-                output = tensor.cpu() if cpu else tensor
-                yield hf_name, _cast_export_tensor(output, export_dtype)
+    # replica with router state for just one pipeline stage.  The shared helper
+    # streams every PP stage's buffers so every rank emits a complete model.
+    for hf_name, hf_tensor in stream_pp_tensors(
+        local_buffers, ps, rank0_only=rank0_only, cpu=cpu
+    ):
+        yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
 
 
 def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
