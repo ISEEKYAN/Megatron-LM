@@ -96,13 +96,13 @@ case "${ROLLOUT_WEIGHT_BITS}" in
   4)
     ROLLOUT_RESYNC_FORMAT=mxfp4
     ROLLOUT_EXPERT_DTYPE=fp4
-    ROLLOUT_MOE_BACKEND=marlin
+    ROLLOUT_MOE_BACKEND="${ROLLOUT_MOE_BACKEND:-marlin}"
     ROLLOUT_SCALE_FMT=ue8m0
     ;;
   8)
     ROLLOUT_RESYNC_FORMAT=block_fp8
     ROLLOUT_EXPERT_DTYPE=fp8
-    ROLLOUT_MOE_BACKEND=flashinfer_cutlass
+    ROLLOUT_MOE_BACKEND="${ROLLOUT_MOE_BACKEND:-flashinfer_cutlass}"
     ROLLOUT_SCALE_FMT=float32
     ;;
   *)
@@ -239,7 +239,7 @@ ACTOR=(
 
 if [[ "${OPTIMIZER_OFFLOAD}" =~ ^(True|true|1)$ ]]; then
   ACTOR+=(
-    "+actor_rollout_ref.actor.optim.override_optimizer_config.offload_fraction=1.0"
+    "+actor_rollout_ref.actor.optim.override_optimizer_config.offload_fraction=${OFFLOAD_FRACTION:-1.0}"
     "+actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True"
     "+actor_rollout_ref.actor.optim.override_optimizer_config.decoupled_weight_decay=True"
   )
