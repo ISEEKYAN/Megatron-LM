@@ -105,6 +105,7 @@ def test_dense_cp_native_collective_only_receives_projected_kv_and_indexer_k():
     from megatron.lite.primitive.modules.attention.dsa import DynamicSparseAttention
 
     gathered_widths = []
+    gather_modes = []
     sentinel = torch.randn(1, 4, 64)
 
     def project_inputs(x, cos, sin, position_ids):
@@ -118,8 +119,9 @@ def test_dense_cp_native_collective_only_receives_projected_kv_and_indexer_k():
             torch.randn(4, 1, 2),
         )
 
-    def gather_projected(tensor, reorder):
+    def gather_projected(tensor, reorder, *, contiguous=False):
         gathered_widths.append(tensor.shape[-1])
+        gather_modes.append(contiguous)
         return torch.cat([tensor, tensor], dim=0).index_select(0, reorder)
 
     def run_sparse(query, kv, q_idx, k_idx, weights, mask, **kwargs):
@@ -148,7 +150,62 @@ def test_dense_cp_native_collective_only_receives_projected_kv_and_indexer_k():
 
     assert result is sentinel
     assert gathered_widths == [8, 4]
+    assert gather_modes == [False, False]
     assert x.shape[-1] not in gathered_widths
+
+
+def test_packed_cp_native_explicitly_selects_contiguous_projected_gather():
+    from megatron.lite.primitive.modules.attention.dsa import DynamicSparseAttention
+
+    gather_modes = []
+    sentinel = torch.randn(1, 4, 64)
+
+    def project_inputs(x, cos, sin, position_ids):
+        del x, cos, sin, position_ids
+        return (
+            torch.randn(4, 1, 2, 8),
+            torch.randn(4, 1, 8),
+            torch.randn(2, 2, 4),
+            torch.randn(4, 1, 2, 4),
+            torch.randn(4, 1, 4),
+            torch.randn(4, 1, 2),
+        )
+
+    def gather_projected(tensor, reorder, *, contiguous=False):
+        gather_modes.append(contiguous)
+        return torch.cat([tensor, tensor], dim=0).index_select(0, reorder)
+
+    def run_sparse(query, kv, q_idx, k_idx, weights, mask, **kwargs):
+        del q_idx, k_idx, weights, mask, kwargs
+        assert query.shape[0] == 4
+        assert kv.shape[0] == 8
+        return torch.randn(4, 1, 8)
+
+    fake = SimpleNamespace(
+        cp_size=2,
+        cp_rank=0,
+        _packed_cu_seqlens=lambda params, device: params.cu_seqlens_q.to(device),
+        _project_cp_inputs=project_inputs,
+        _gather_projected_cp=gather_projected,
+        _run_cp_sparse_segment=run_sparse,
+        _project_cp_output=lambda out, weight: sentinel,
+    )
+    params = SimpleNamespace(
+        cp_layout="contiguous",
+        cu_seqlens_q=torch.tensor([0, 8], dtype=torch.int32),
+    )
+    result = DynamicSparseAttention._forward_packed_cp_native(
+        fake,
+        torch.randn(1, 4, 64),
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
+        params,
+        index_share_state=None,
+    )
+
+    assert result is sentinel
+    assert gather_modes == [True, True]
 
 
 def test_cp_indexer_topk_respects_explicit_global_position_mask():

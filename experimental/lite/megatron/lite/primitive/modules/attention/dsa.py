@@ -913,7 +913,15 @@ class DynamicSparseAttention(nn.Module):
         self,
         tensor: torch.Tensor,
         kv_reorder: torch.Tensor,
+        *,
+        contiguous: bool = False,
     ) -> torch.Tensor:
+        if not contiguous:
+            parts = _all_gather_cp(
+                tensor, cp_size=self.cp_size, cp_group=self.cp_group
+            )
+            rank_major = torch.cat(parts, dim=0)
+            return rank_major.index_select(0, kv_reorder)
         local_positions = contiguous_position_ids_for_cp(
             tensor.shape[0] * self.cp_size,
             self.cp_rank,
@@ -1093,9 +1101,9 @@ class DynamicSparseAttention(nn.Module):
         query, kv_local, v_up_weight, q_idx, k_idx_local, idx_weights = (
             self._project_cp_inputs(x, cos, sin, position_ids)
         )
-        kv = self._gather_projected_cp(kv_local, kv_reorder)
+        kv = self._gather_projected_cp(kv_local, kv_reorder, contiguous=True)
         k_idx = (
-            self._gather_projected_cp(k_idx_local, kv_reorder)
+            self._gather_projected_cp(k_idx_local, kv_reorder, contiguous=True)
             if k_idx_local is not None
             else None
         )
