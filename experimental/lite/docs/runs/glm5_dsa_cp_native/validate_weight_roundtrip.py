@@ -21,7 +21,10 @@ def _config(*, index_share: bool):
         num_attention_heads=64,
         num_key_value_heads=64,
         head_dim=256,
-        vocab_size=32,
+        # Keep the logical vocabulary equal to MLite's 128-row padding
+        # granularity so every physical embedding/head row is represented in
+        # the HF checkpoint and a whole-state bitwise comparison is meaningful.
+        vocab_size=128,
         max_position_embeddings=520,
         initializer_range=0.002,
         q_lora_rank=16,
@@ -90,6 +93,12 @@ def _run_case(*, index_share: bool, device: torch.device) -> dict:
         .eval()
     )
     state = original.state_dict()
+    for vocab_weight in ("embed.embedding.weight", "head.col.linear.weight"):
+        if state[vocab_weight].shape[0] != cfg.vocab_size:
+            raise AssertionError(
+                f"{vocab_weight} contains checkpoint-invisible padding rows: "
+                f"shape={tuple(state[vocab_weight].shape)}, vocab={cfg.vocab_size}"
+            )
     source_indexer = "layers.2.self_attention.self_attention.indexer.wq_b.weight"
     shared_indexer = "layers.3.self_attention.self_attention.indexer.wq_b.weight"
     if source_indexer not in state:
