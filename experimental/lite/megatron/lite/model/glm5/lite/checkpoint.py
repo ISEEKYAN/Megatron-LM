@@ -30,10 +30,7 @@ from torch.distributed.tensor import Replicate, Shard
 from megatron.lite.model.glm5.config import Glm5Config
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
-    _cast_export_tensor,
-    _resolve_export_dtype,
     parse_expert_idx,
-    to_global_layer_name,
     unwrap_model,
 )
 from megatron.lite.primitive.parallel import ParallelState
@@ -348,6 +345,10 @@ class Glm5WeightSpec:
         del native_name
         return hf_tensors[0]
 
+    @staticmethod
+    def is_export_buffer(native_name: str) -> bool:
+        return native_name.endswith(".moe.router.expert_bias")
+
     # GLM-5 ONLY: DSA attention native suffix -> HF suffix.  The wrapper places
     # the DSA module under `self_attention.self_attention.*`; the HF model uses
     # `self_attn.*` with identical submodule names.
@@ -623,36 +624,12 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
 
 
 def export_hf_weights(model, config: Glm5Config, ps: ParallelState, **kwargs):
-    from megatron.lite.primitive.ckpt.hf_weights import (
-        export_hf_weights as _export,
-        stream_pp_tensors,
-    )
+    from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
 
     if config is None:
         raise ValueError("GLM5 HF export requires a non-null model config")
     spec = Glm5WeightSpec(config)
-    rank0_only = bool(kwargs.get("rank0_only", False))
-    cpu = bool(kwargs.get("cpu", False))
-    export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
     yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
-    chunks = list(model) if isinstance(model, list | nn.ModuleList) else [model]
-    local_buffers: list[tuple[str, torch.Tensor]] = []
-    for chunk in chunks:
-        base_chunk = unwrap_model(chunk)
-        layer_map = (
-            {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
-            if hasattr(base_chunk, "layer_indices")
-            else {}
-        )
-        for name, buffer in base_chunk.named_buffers():
-            if not name.endswith(".moe.router.expert_bias"):
-                continue
-            global_name = to_global_layer_name(name, layer_map)
-            local_buffers.extend(spec.native_to_hf(global_name, buffer.detach()))
-    for hf_name, hf_tensor in stream_pp_tensors(
-        local_buffers, ps, rank0_only=rank0_only, cpu=cpu
-    ):
-        yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
 
 
 def save_hf_weights(model, path: str, config: Glm5Config, ps: ParallelState, **kwargs) -> None:
