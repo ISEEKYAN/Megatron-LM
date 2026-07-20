@@ -47,11 +47,30 @@ def test_packed_cp_layout_uses_contiguous_global_coordinates():
     assert gathered_positions.index_select(0, kv_reorder).tolist() == list(range(16))
 
 
+def test_packed_cp_projected_kv_is_physically_aligned_for_cudnn_topk():
+    from megatron.lite.primitive.modules.attention.dsa import (
+        _pad_packed_cp_projected_kv,
+    )
+
+    kv = torch.arange(520 * 3, dtype=torch.float32).view(520, 1, 3)
+    index_k = torch.arange(520 * 2, dtype=torch.float32).view(520, 1, 2)
+
+    padded_kv, padded_index_k = _pad_packed_cp_projected_kv(kv, index_k)
+
+    assert padded_kv.shape == (1024, 1, 3)
+    assert padded_index_k is not None and padded_index_k.shape == (1024, 1, 2)
+    assert torch.equal(padded_kv[:520], kv)
+    assert torch.equal(padded_index_k[:520], index_k)
+    assert torch.count_nonzero(padded_kv[520:]) == 0
+    assert torch.count_nonzero(padded_index_k[520:]) == 0
+
+
 def test_cp_causal_mask_blocks_future_and_cross_packed_sequence_keys():
     from megatron.lite.primitive.modules.attention.dsa import _build_cp_causal_mask
 
     query_positions = torch.tensor([1, 8, 15], dtype=torch.long)
-    key_positions = torch.arange(16, dtype=torch.long)
+    # Keys beyond the final logical boundary model physically aligned CP padding.
+    key_positions = torch.arange(20, dtype=torch.long)
     cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
 
     mask = _build_cp_causal_mask(

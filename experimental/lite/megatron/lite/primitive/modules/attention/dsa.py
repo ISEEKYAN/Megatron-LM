@@ -24,6 +24,13 @@ if TYPE_CHECKING:
     from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
 
 
+# cuDNN FE 1.27's indexer_top_k decode-varlen kernel loads score columns in
+# 512-thread tiles. Packed CP aligns gathered projected KV once so the physical
+# score width cannot end in a partial tile; the causal mask preserves the
+# original logical sequence boundary.
+_CUDNN_DSA_TOPK_COLUMN_ALIGNMENT = 512
+
+
 def _fused_indexer_sparse_attn(*args, value_dim: int | None = None, **kwargs):
     try:
         return _dsa_kernels.fused_indexer_sparse_attn(
@@ -268,6 +275,29 @@ def _packed_cp_layout(
     ).flatten()
     # Sequential shards are gathered in rank order, which is already global KV order.
     return query_positions, torch.arange(total, device=device, dtype=torch.long)
+
+
+def _pad_packed_cp_projected_kv(
+    kv: torch.Tensor,
+    index_k: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Physically align gathered packed KV for cuDNN top-k score loads."""
+    logical_rows = kv.shape[0]
+    aligned_rows = (
+        (logical_rows + _CUDNN_DSA_TOPK_COLUMN_ALIGNMENT - 1)
+        // _CUDNN_DSA_TOPK_COLUMN_ALIGNMENT
+        * _CUDNN_DSA_TOPK_COLUMN_ALIGNMENT
+    )
+    pad_rows = aligned_rows - logical_rows
+    if pad_rows == 0:
+        return kv, index_k
+
+    kv = torch.cat((kv, kv.new_zeros((pad_rows, *kv.shape[1:]))), dim=0)
+    if index_k is not None:
+        index_k = torch.cat(
+            (index_k, index_k.new_zeros((pad_rows, *index_k.shape[1:]))), dim=0
+        )
+    return kv, index_k
 
 
 def _build_cp_causal_mask(
@@ -1107,6 +1137,8 @@ class DynamicSparseAttention(nn.Module):
             if k_idx_local is not None
             else None
         )
+        if kv.is_cuda and not self.skip_topk:
+            kv, k_idx = _pad_packed_cp_projected_kv(kv, k_idx)
         key_pos = torch.arange(kv.shape[0], device=x.device, dtype=torch.long)
         mask = _build_cp_causal_mask(
             query_pos,
