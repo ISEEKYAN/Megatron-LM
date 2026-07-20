@@ -626,6 +626,8 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
 def export_hf_weights(model, config: Glm5Config, ps: ParallelState, **kwargs):
     from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
 
+    if config is None:
+        raise ValueError("GLM5 HF export requires a non-null model config")
     spec = Glm5WeightSpec(config)
     rank0_only = bool(kwargs.get("rank0_only", False))
     cpu = bool(kwargs.get("cpu", False))

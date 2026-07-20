@@ -25,6 +25,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     _iter_bucketed_materialized_tensors,
     bucketed_all_gather_into_tensor,
     export_hf_weights,
+    stream_export_to_shards,
 )
 
 
@@ -56,6 +57,28 @@ def test_safe_tensor_reader_context_reuses_and_closes_shard(monkeypatch, tmp_pat
         assert reader.get_tensor("b").item() == 2
 
     assert events == ["enter", ("get", "a"), ("get", "b"), "exit"]
+
+
+def test_stream_export_removes_stale_owned_files_when_reusing_directory(tmp_path) -> None:
+    for name in (
+        "model.safetensors",
+        "model-00001-of-00002.safetensors",
+        "model.safetensors.index.json",
+        ".model-shard-00001.safetensors",
+    ):
+        (tmp_path / name).write_text("stale")
+    unrelated = tmp_path / "README.txt"
+    unrelated.write_text("keep")
+
+    stream_export_to_shards(
+        iter([("new", torch.ones(2))]), str(tmp_path), shard_size_bytes=1024
+    )
+
+    assert (tmp_path / "model.safetensors").exists()
+    assert unrelated.read_text() == "keep"
+    assert not (tmp_path / "model-00001-of-00002.safetensors").exists()
+    assert not (tmp_path / "model.safetensors.index.json").exists()
+    assert not (tmp_path / ".model-shard-00001.safetensors").exists()
 
 
 

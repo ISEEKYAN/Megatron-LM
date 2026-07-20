@@ -1141,6 +1141,17 @@ def stream_export_to_shards(
     rank = dist.get_rank() if dist.is_initialized() else 0
     if rank == 0:
         os.makedirs(path, exist_ok=True)
+        # Reusing an export directory must not leave stale shards or an index
+        # that describes a previous export.  Restrict cleanup to files owned by
+        # this writer; unrelated user files in the directory are preserved.
+        stale_patterns = (
+            re.compile(r"^model(?:-\d{5}-of-\d{5})?\.safetensors$"),
+            re.compile(r"^model\.safetensors\.index\.json$"),
+            re.compile(r"^\.model-shard-\d{5}\.safetensors$"),
+        )
+        for entry in os.listdir(path):
+            if any(pattern.fullmatch(entry) for pattern in stale_patterns):
+                os.remove(os.path.join(path, entry))
 
     shard: dict[str, torch.Tensor] = {}
     shard_bytes = 0
