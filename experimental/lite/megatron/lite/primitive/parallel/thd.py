@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from copy import copy
 from dataclasses import dataclass
+from math import lcm
 from typing import Any
 
 import torch
@@ -32,6 +33,7 @@ class PackedTHDBatch:
 
 def _make_packed_seq_params(
     *,
+    cu_seqlens: torch.Tensor,
     cu_seqlens_padded: torch.Tensor,
     max_seqlen: int,
     cp_size: int = 1,
@@ -45,8 +47,8 @@ def _make_packed_seq_params(
             extra_args["cp_group"] = cp_group
     return PackedSeqParams(
         qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         cu_seqlens_q_padded=cu_seqlens_padded,
@@ -279,15 +281,26 @@ def thd_pack_meta(
     cp_size: int = 1,
     cp_group: Any | None = None,
     contiguous: bool = False,
+    sequence_alignment: int = 1,
 ) -> ThdPackMeta:
     """Compute the padded THD layout for ``seq_lens`` without copying tokens.
 
     ``contiguous=False`` aligns to Megatron/TE zigzag CP (``2*cp``); ``True``
-    aligns to contiguous CP (``cp``). Mirrors :func:`pack_nested_thd` padding.
+    aligns to contiguous CP (``cp``). ``sequence_alignment`` adds an
+    operator-requested physical alignment through LCM without leaking operator
+    or model knowledge into this primitive. Mirrors :func:`pack_nested_thd`
+    padding.
     """
+    if sequence_alignment < 1:
+        raise ValueError(
+            f"sequence_alignment must be >= 1, got {sequence_alignment}"
+        )
     lengths = seq_lens.to(dtype=torch.int32)
     cp_align = (cp_size if contiguous else 2 * cp_size) if cp_size > 1 else 1
-    align_size = max(int(tp_size), 1) * cp_align
+    align_size = lcm(
+        max(int(tp_size), 1) * cp_align,
+        int(sequence_alignment),
+    )
     pad_size = (align_size - lengths % align_size) % align_size
     padded_lengths = lengths + pad_size
     cu_seqlens_padded = torch.zeros(
@@ -421,6 +434,7 @@ def pack_nested_thd(
     roll_labels: bool = False,
     loss_mask: torch.Tensor | None = None,
     roll_loss_mask: bool = False,
+    sequence_alignment: int = 1,
 ) -> PackedTHDBatch:
     """Pack a jagged no-padding batch into Megatron Lite's THD model input.
 
@@ -430,13 +444,18 @@ def pack_nested_thd(
     For CP>1 the local row uses Megatron/TE zigzag chunking unless
     ``split_cp=False``.  The latter keeps full packed tokens and plain
     ``PackedSeqParams`` while still padding each sample to CP-compatible
-    alignment, matching the external VERL runtime contract.
+    alignment, matching the external VERL runtime contract.  An optional
+    ``sequence_alignment`` is combined with TP/CP alignment through LCM.
     """
 
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}")
     if cp_rank < 0 or cp_rank >= cp_size:
         raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}")
+    if sequence_alignment < 1:
+        raise ValueError(
+            f"sequence_alignment must be >= 1, got {sequence_alignment}"
+        )
     if not getattr(input_ids, "is_nested", False):
         raise TypeError("pack_nested_thd expects a jagged NestedTensor input_ids.")
     if labels is not None and not getattr(labels, "is_nested", False):
@@ -448,13 +467,18 @@ def pack_nested_thd(
             "pack_nested_thd expects jagged NestedTensor loss_mask when loss_mask is provided."
         )
 
-    align_size = max(int(tp_size), 1) * (2 * cp_size if cp_size > 1 else 1)
+    align_size = lcm(
+        max(int(tp_size), 1) * (2 * cp_size if cp_size > 1 else 1),
+        int(sequence_alignment),
+    )
     device = input_ids.device
     offsets = input_ids.offsets().to(device=device)
     lengths = offsets.diff().to(dtype=torch.int32)
     pad_size = (align_size - lengths % align_size) % align_size
     padded_lengths = lengths + pad_size
 
+    cu_seqlens = torch.zeros(lengths.numel() + 1, dtype=torch.int32, device=device)
+    cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
     cu_seqlens_padded = torch.zeros(lengths.numel() + 1, dtype=torch.int32, device=device)
     cu_seqlens_padded[1:] = torch.cumsum(padded_lengths, dim=0)
     total_padded = int(cu_seqlens_padded[-1].item())
@@ -555,6 +579,7 @@ def pack_nested_thd(
         loss_mask=(packed_loss_mask.unsqueeze(0) if packed_loss_mask is not None else None),
         position_ids=position_ids.unsqueeze(0),
         packed_seq_params=_make_packed_seq_params(
+            cu_seqlens=cu_seqlens,
             cu_seqlens_padded=cu_seqlens_padded,
             max_seqlen=max_seqlen,
             cp_size=cp_size if split_cp else 1,

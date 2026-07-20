@@ -37,6 +37,11 @@ from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_s
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
+# cuDNN Frontend's DSA indexer top-k kernel consumes columns in 512-thread
+# tiles (``num_threads_per_cta``).  GLM5 requests this physical THD alignment;
+# the generic packing primitive only composes caller-provided alignments.
+GLM5_DSA_SEQUENCE_ALIGNMENT = 512
+
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
     return "experts" in name and "router" not in name and "shared" not in name
@@ -117,14 +122,23 @@ def build_model_config(source: str | Path | dict, **overrides) -> Glm5Config:
 
 
 def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
-    kwargs = pack_thd_forward_kwargs(model, batch)
+    kwargs = pack_thd_forward_kwargs(
+        model,
+        batch,
+        sequence_alignment=GLM5_DSA_SEQUENCE_ALIGNMENT,
+    )
     add_loss_context_kwargs(kwargs)
     add_cross_entropy_fusion(kwargs, model)
     return model(**kwargs)
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
-    return unpack_thd_forward_output(model, batch, output)
+    return unpack_thd_forward_output(
+        model,
+        batch,
+        output,
+        sequence_alignment=GLM5_DSA_SEQUENCE_ALIGNMENT,
+    )
 
 
 def _make_aux_loss_hook():
