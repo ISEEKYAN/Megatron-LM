@@ -201,6 +201,24 @@ class GatedDeltaNet(nn.Module):
         # for the non-packed chunkwise path, where both are static across forwards.
         self._chunkwise_cp_context_cache: dict[tuple, tuple[torch.Tensor, object]] = {}
 
+    def sync_tp_replicated_parameters(self) -> None:
+        """Broadcast replicated GDN state after from-scratch initialization.
+
+        ``A_log`` and ``dt_bias`` are full copies on every TP rank when the
+        number of GDN heads is smaller than TP.  Their gradients are reduced
+        in :meth:`_state_parameters_for_tp`, so their initial values must also
+        agree.  HF loading already provides identical state; this closes the
+        random-initialization path used by correctness and scratch training.
+        """
+        if not self._replicate_heads or self.ps.tp_group is None or self.ps.tp_size <= 1:
+            return
+        if not dist.is_initialized() or dist.get_world_size(self.ps.tp_group) <= 1:
+            return
+        source_rank = dist.get_process_group_ranks(self.ps.tp_group)[0]
+        with torch.no_grad():
+            for parameter in (self.A_log, self.dt_bias):
+                dist.broadcast(parameter.data, src=source_rank, group=self.ps.tp_group)
+
     # The six ``qkvzba`` sections and the three conv channel sections, in hidden order.
     def _qkvzba_sections(self) -> list[int]:
         return [
