@@ -15,7 +15,9 @@ import torch.nn as nn
 import transformer_engine.pytorch as te
 from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 from megatron.lite.primitive.parallel.cp import (
+    get_thd_context_parallel_rank_indices,
     zigzag_reconstruct_from_cp_parts,
+    zigzag_position_ids_for_cp,
     zigzag_slice_for_cp,
 )
 from megatron.lite.primitive.parallel.thd import (
@@ -216,6 +218,105 @@ def _all_gather_cp(tensor: torch.Tensor, *, cp_size: int, cp_group) -> list[torc
     from torch.distributed.nn.functional import all_gather
 
     return list(all_gather(tensor.contiguous(), group=cp_group))
+
+
+def _dense_cp_layout(
+    *, local_seq: int, cp_size: int, cp_rank: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return local-query positions and rank-major-to-global KV reorder."""
+    full_seq = local_seq * cp_size
+    per_rank = [
+        zigzag_position_ids_for_cp(full_seq, rank, cp_size, device).flatten()
+        for rank in range(cp_size)
+    ]
+    rank_major_positions = torch.cat(per_rank)
+    return per_rank[cp_rank], torch.argsort(rank_major_positions)
+
+
+def _packed_cp_layout(
+    cu_seqlens: torch.Tensor,
+    *,
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return THD local-query positions and rank-major-to-global KV reorder."""
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.long)
+    per_rank = [
+        get_thd_context_parallel_rank_indices(cu_seqlens, cp_size, rank, "zigzag")
+        for rank in range(cp_size)
+    ]
+    rank_major_positions = torch.cat(per_rank)
+    return per_rank[cp_rank], torch.argsort(rank_major_positions)
+
+
+def _build_cp_causal_mask(
+    query_positions: torch.Tensor,
+    key_positions: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Build the explicit local-Q/global-K causal validity mask used by DSA CP."""
+    query_positions = query_positions.to(dtype=torch.long)
+    key_positions = key_positions.to(device=query_positions.device, dtype=torch.long)
+    valid = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+    if cu_seqlens is not None:
+        cu_seqlens = cu_seqlens.to(device=query_positions.device, dtype=torch.long)
+        query_segments = torch.bucketize(query_positions, cu_seqlens[1:], right=True)
+        key_segments = torch.bucketize(key_positions, cu_seqlens[1:], right=True)
+        valid = valid & (query_segments.unsqueeze(1) == key_segments.unsqueeze(0))
+    zeros = torch.zeros((), device=query_positions.device, dtype=torch.float32)
+    return torch.where(valid, zeros, torch.full_like(zeros, float("-inf")))
+
+
+def _index_scores_and_topk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    mask: torch.Tensor,
+    topk: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Kernel-routed CP indexer over local Q and gathered projected K."""
+    return _dsa_kernels.indexer_topk_with_mask(
+        q,
+        k,
+        weights,
+        topk,
+        mask,
+        indexer_softmax_scale=scale,
+    )
+
+
+def _cp_indexer_loss(
+    q_indexer: torch.Tensor,
+    k_indexer: torch.Tensor,
+    weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    query: torch.Tensor,
+    kv: torch.Tensor,
+    *,
+    mask: torch.Tensor,
+    softmax_scale: float,
+    loss_coeff: float,
+    sparse_loss: bool,
+    calculate_per_token_loss: bool,
+) -> torch.Tensor:
+    """Kernel-layer KL target for explicit local-Q/global-K CP masking."""
+    return _dsa_kernels.cp_indexer_loss(
+        q_indexer,
+        k_indexer,
+        weights,
+        topk_indices,
+        query,
+        kv,
+        mask=mask,
+        softmax_scale=softmax_scale,
+        loss_coeff=loss_coeff,
+        sparse_loss=sparse_loss,
+        calculate_per_token_loss=calculate_per_token_loss,
+    )
 
 
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
@@ -533,12 +634,17 @@ class DynamicSparseAttention(nn.Module):
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_group=None,
+        cp_mode: str = "native",
     ):
         super().__init__()
         if cp_size < 1:
             raise ValueError(f"cp_size must be >= 1, got {cp_size}")
         if not 0 <= cp_rank < cp_size:
             raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}")
+        if cp_mode not in {"native", "legacy_gather_all"}:
+            raise ValueError(
+                "cp_mode must be 'native' or 'legacy_gather_all', " f"got {cp_mode!r}"
+            )
         self.num_heads = num_attention_heads
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
@@ -556,6 +662,7 @@ class DynamicSparseAttention(nn.Module):
         self.cp_size = cp_size
         self.cp_rank = cp_rank
         self.cp_group = cp_group
+        self.cp_mode = cp_mode
         self.layer_number = 1 if layer_number is None else layer_number
         self.index_topk_freq = index_topk_freq
         self.index_skip_topk_offset = index_skip_topk_offset
@@ -630,6 +737,15 @@ class DynamicSparseAttention(nn.Module):
                 "is not supported."
             )
         if packed_seq_params is not None:
+            if self.cp_size > 1 and self.cp_mode == "native":
+                return self._forward_packed_cp_native(
+                    x,
+                    cos,
+                    sin,
+                    position_ids,
+                    packed_seq_params,
+                    index_share_state=index_share_state,
+                )
             if self.cp_size > 1:
                 x, position_ids = self._gather_packed_cp_inputs(x, position_ids, packed_seq_params)
                 cos, sin = self._gather_packed_cp_rotary(cos, sin, packed_seq_params, x.device)
@@ -651,6 +767,15 @@ class DynamicSparseAttention(nn.Module):
                 )
             return out
 
+        if self.cp_size > 1 and self.cp_mode == "native":
+            return self._forward_dense_cp_native(
+                x,
+                cos,
+                sin,
+                position_ids,
+                index_share_state=index_share_state,
+            )
+
         cp_restore = self.cp_size > 1
         if cp_restore:
             x, position_ids, attention_mask = self._gather_cp_inputs(
@@ -664,6 +789,272 @@ class DynamicSparseAttention(nn.Module):
         if cp_restore:
             out = zigzag_slice_for_cp(out, self.cp_rank, self.cp_size, seq_dim=1)
         return out
+
+    def _project_cp_inputs(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Project rank-local hidden rows before any CP collective."""
+        batch, local_seq, _ = x.shape
+        q_resid = self.q_a_layernorm(self.q_a_proj(x))
+        q = self.q_b_proj(q_resid).view(
+            batch, local_seq, self.num_heads, self.qk_head_dim
+        )
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        local_cos, local_sin = _rotary_embeddings_from_cache(
+            cos,
+            sin,
+            position_ids,
+            device=x.device,
+            dtype=x.dtype,
+            dim=self.qk_rope_head_dim,
+        )
+        q_pe = apply_rotary_pos_emb(q_pe, local_cos, local_sin, unsqueeze_dim=2)
+        k_up_weight, v_up_weight = self._split_kv_b_weights()
+        q_nope = torch.einsum("bshd,hdr->bshr", q_nope, k_up_weight)
+        query = torch.cat([q_nope, q_pe], dim=-1).transpose(0, 1).contiguous()
+
+        kv_latent, k_pe = torch.split(
+            self.kv_a_proj_with_mqa(x),
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        kv_latent = self.kv_a_layernorm(kv_latent)
+        k_pe = apply_rotary_pos_emb(
+            k_pe.unsqueeze(2), local_cos, local_sin, unsqueeze_dim=2
+        ).squeeze(2)
+        kv = torch.cat([kv_latent, k_pe], dim=-1).transpose(0, 1).contiguous()
+
+        q_indexer = k_indexer = weights_indexer = None
+        if not self.skip_topk:
+            assert self.indexer is not None
+            q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
+                x.detach(), q_resid.detach(), local_cos, local_sin, position_ids
+            )
+        return query, kv, v_up_weight, q_indexer, k_indexer, weights_indexer
+
+    def _gather_projected_cp(
+        self, tensor: torch.Tensor, kv_reorder: torch.Tensor
+    ) -> torch.Tensor:
+        parts = _all_gather_cp(tensor, cp_size=self.cp_size, cp_group=self.cp_group)
+        rank_major = torch.cat(parts, dim=0)
+        return rank_major.index_select(0, kv_reorder)
+
+    def _run_cp_sparse_segment(
+        self,
+        query: torch.Tensor,
+        kv: torch.Tensor,
+        q_indexer: torch.Tensor | None,
+        k_indexer: torch.Tensor | None,
+        weights_indexer: torch.Tensor | None,
+        mask: torch.Tensor,
+        *,
+        index_share_state: DSAIndexShareState | None,
+        index_share_cache_key: Hashable | None,
+    ) -> torch.Tensor:
+        batch = query.shape[1]
+        topk_indices: torch.Tensor | None = None
+        if self.skip_topk:
+            if index_share_state is None:
+                raise AssertionError(
+                    "DSA IndexShare shared layers require a per-forward DSAIndexShareState."
+                )
+            topk_indices = index_share_state.get_topk(
+                self.layer_number,
+                self.index_share_source_layer,
+                sequence_key=index_share_cache_key,
+                device=query.device,
+            )
+        else:
+            assert q_indexer is not None and k_indexer is not None
+            assert weights_indexer is not None
+            _scores, topk_indices = _index_scores_and_topk(
+                q_indexer,
+                k_indexer,
+                weights_indexer,
+                mask=mask,
+                topk=self.index_topk,
+                scale=self.indexer_softmax_scale,
+            )
+            if self.index_share_enabled and index_share_state is not None:
+                index_share_state.save_topk(
+                    self.layer_number,
+                    topk_indices,
+                    sequence_key=index_share_cache_key,
+                )
+
+        flat_idxs, flat_tlen = _dsa_kernels.build_flat_topk_idxs(
+            topk_indices,
+            batch_size=batch,
+            seqlen_kv=kv.shape[0],
+            compact=True,
+        )
+        out = _dsa_kernels.dsa_sparse_attn(
+            query,
+            kv,
+            self.attn_sink.float(),
+            flat_idxs,
+            self.softmax_scale,
+            topk_length=flat_tlen,
+            value_dim=self.kv_lora_rank,
+        )
+        if self.training and torch.is_grad_enabled() and not self.skip_topk:
+            indexer_loss = _cp_indexer_loss(
+                q_indexer,
+                k_indexer,
+                weights_indexer,
+                topk_indices,
+                query.detach(),
+                kv.detach(),
+                mask=mask,
+                softmax_scale=self.softmax_scale,
+                loss_coeff=self.indexer_loss_coeff,
+                sparse_loss=self.indexer_use_sparse_loss,
+                calculate_per_token_loss=self.calculate_per_token_loss,
+            )
+            out = DSAIndexerLossAutoScaler.apply(out, indexer_loss)
+        return out
+
+    def _project_cp_output(
+        self, out: torch.Tensor, v_up_weight: torch.Tensor
+    ) -> torch.Tensor:
+        local_seq, batch = out.shape[:2]
+        out = out.view(local_seq, batch, self.num_heads, self.kv_lora_rank)
+        out = out.permute(1, 0, 2, 3).contiguous()
+        out = torch.einsum("bshr,hvr->bshv", out, v_up_weight)
+        out = out.reshape(batch, local_seq, self.num_heads * self.v_head_dim)
+        return self.o_proj(out)
+
+    def _forward_dense_cp_native(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        position_ids: torch.Tensor,
+        *,
+        index_share_state: DSAIndexShareState | None,
+    ) -> torch.Tensor:
+        query_pos, kv_reorder = _dense_cp_layout(
+            local_seq=x.shape[1],
+            cp_size=self.cp_size,
+            cp_rank=self.cp_rank,
+            device=x.device,
+        )
+        query, kv_local, v_up_weight, q_idx, k_idx_local, idx_weights = (
+            self._project_cp_inputs(x, cos, sin, position_ids)
+        )
+        kv = self._gather_projected_cp(kv_local, kv_reorder)
+        k_idx = (
+            self._gather_projected_cp(k_idx_local, kv_reorder)
+            if k_idx_local is not None
+            else None
+        )
+        mask = _build_cp_causal_mask(
+            query_pos,
+            torch.arange(kv.shape[0], device=x.device),
+        )
+        out = self._run_cp_sparse_segment(
+            query,
+            kv,
+            q_idx,
+            k_idx,
+            idx_weights,
+            mask,
+            index_share_state=index_share_state,
+            index_share_cache_key=None,
+        )
+        return self._project_cp_output(out, v_up_weight)
+
+    def _forward_packed_cp_native(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        position_ids: torch.Tensor,
+        packed_seq_params,
+        *,
+        index_share_state: DSAIndexShareState | None,
+    ) -> torch.Tensor:
+        if x.shape[0] != 1:
+            raise RuntimeError(
+                "GLM5 THD+CP DSA expects batch-collapsed input [1, total, hidden]."
+            )
+        cu_seqlens = self._packed_cu_seqlens(packed_seq_params, x.device)
+        query_pos, kv_reorder = _packed_cp_layout(
+            cu_seqlens,
+            cp_size=self.cp_size,
+            cp_rank=self.cp_rank,
+            device=x.device,
+        )
+        if query_pos.numel() != x.shape[1]:
+            raise RuntimeError(
+                "GLM5 THD+CP local token count does not match packed zigzag layout: "
+                f"x={x.shape[1]}, layout={query_pos.numel()}."
+            )
+        query, kv_local, v_up_weight, q_idx, k_idx_local, idx_weights = (
+            self._project_cp_inputs(x, cos, sin, position_ids)
+        )
+        kv = self._gather_projected_cp(kv_local, kv_reorder)
+        k_idx = (
+            self._gather_projected_cp(k_idx_local, kv_reorder)
+            if k_idx_local is not None
+            else None
+        )
+        real_cu = getattr(packed_seq_params, "cu_seqlens_q", None)
+        if real_cu is None:
+            real_cu = cu_seqlens
+        real_cu = real_cu.to(device=x.device, dtype=torch.long)
+
+        output_pieces = []
+        local_rows = []
+        for segment in range(cu_seqlens.numel() - 1):
+            start = int(cu_seqlens[segment].item())
+            end = int(cu_seqlens[segment + 1].item())
+            selected = (query_pos >= start) & (query_pos < end)
+            rows = selected.nonzero().flatten()
+            if rows.numel() == 0:
+                continue
+            query_rel = query_pos.index_select(0, rows) - start
+            key_rel = torch.arange(end - start, device=x.device)
+            mask = _build_cp_causal_mask(query_rel, key_rel)
+            real_len = int((real_cu[segment + 1] - real_cu[segment]).item())
+            valid_rows = query_rel < real_len
+            valid_keys = key_rel < real_len
+            mask = torch.where(
+                valid_rows.unsqueeze(1) & valid_keys.unsqueeze(0),
+                mask,
+                torch.full_like(mask, float("-inf")),
+            )
+            output_pieces.append(
+                self._run_cp_sparse_segment(
+                    query.index_select(0, rows),
+                    kv[start:end],
+                    q_idx.index_select(0, rows) if q_idx is not None else None,
+                    k_idx[start:end] if k_idx is not None else None,
+                    idx_weights.index_select(0, rows) if idx_weights is not None else None,
+                    mask,
+                    index_share_state=index_share_state,
+                    index_share_cache_key=segment,
+                )
+            )
+            local_rows.append(rows)
+        if not output_pieces:
+            return x.new_empty(1, 0, self.o_proj.out_features)
+        row_order = torch.argsort(torch.cat(local_rows))
+        out = torch.cat(output_pieces, dim=0).index_select(0, row_order)
+        return self._project_cp_output(out, v_up_weight)
 
     def _forward_packed_full(
         self,

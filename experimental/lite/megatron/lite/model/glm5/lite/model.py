@@ -195,6 +195,7 @@ class Glm5DSAAttention(nn.Module):
             cp_size=ps.cp_size,
             cp_rank=ps.cp_rank,
             cp_group=ps.cp_group,
+            cp_mode=config.dsa_cp_mode,
         )
 
     def forward(

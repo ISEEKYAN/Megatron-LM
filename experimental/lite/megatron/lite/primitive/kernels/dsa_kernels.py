@@ -560,6 +560,182 @@ def indexer_topk(
     return topk_indices, topk_length
 
 
+def indexer_topk_with_mask(
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights: Tensor,
+    topk: int,
+    mask: Tensor,
+    indexer_softmax_scale: float = 1.0,
+) -> Tuple[Tensor, Tensor]:
+    """Score local CP queries against gathered K with an explicit validity mask.
+
+    The score kernel and radix top-K remain in the kernel layer; the explicit
+    mask carries dense zigzag or packed-THD global coordinates that cannot be
+    represented by the legacy ``ratio``-only causal contract.
+    """
+    q_bshd, k_bsd, _w_bsh, w_bsh_scaled = _sbhd_to_bshd_indexer_inputs(
+        q_indexer, k_indexer, weights, indexer_softmax_scale
+    )
+    b, sq, _heads, _dim = q_bshd.shape
+    sk = k_bsd.shape[1]
+    mask = mask.to(device=q_bshd.device, dtype=torch.float32)
+    width = min(int(topk), sk)
+    best_values = None
+    best_indices = None
+    block_size = 2048
+    for start in range(0, sk, block_size):
+        end = min(start + block_size, sk)
+        scores = torch.einsum("bqhd,bkd->bqhk", q_bshd.float(), k_bsd[:, start:end].float())
+        scores = torch.relu(scores).mul(w_bsh_scaled.float().unsqueeze(-1)).sum(dim=2)
+        scores = scores + mask[:, start:end].unsqueeze(0)
+        block_width = min(width, end - start)
+        if scores.is_cuda:
+            _ensure_dsa_namespace()
+            flat_scores = scores.reshape(b * sq, end - start).contiguous()
+            seq_lens = torch.full(
+                (b * sq,), end - start, device=scores.device, dtype=torch.int32
+            )
+            result = _DSA.indexer_top_k_wrapper(
+                flat_scores,
+                seq_lens,
+                top_k=block_width,
+                next_n=1,
+                return_val=False,
+            )
+            indices = result["indices"].view(b, sq, block_width)
+            values = torch.gather(scores, -1, indices.clamp_min(0).long())
+        else:
+            values, indices = torch.topk(scores, k=block_width, dim=-1)
+        indices = indices + start
+        if best_values is not None:
+            values = torch.cat((best_values, values), dim=-1)
+            indices = torch.cat((best_indices, indices), dim=-1)
+            keep = min(width, values.shape[-1])
+            values, selected = torch.topk(values, k=keep, dim=-1)
+            indices = torch.gather(indices, -1, selected)
+        best_values, best_indices = values, indices
+    assert best_values is not None and best_indices is not None
+    values, indices = best_values, best_indices
+    indices = torch.where(torch.isfinite(values), indices, torch.full_like(indices, -1)).int()
+    if width < topk:
+        indices = torch.nn.functional.pad(indices, (0, topk - width), value=-1)
+    return q_bshd.new_empty(0), indices
+
+
+def cp_indexer_loss(
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights: Tensor,
+    topk_indices: Tensor,
+    query: Tensor,
+    kv: Tensor,
+    *,
+    mask: Tensor,
+    softmax_scale: float,
+    loss_coeff: float,
+    sparse_loss: bool,
+    calculate_per_token_loss: bool,
+) -> Tensor:
+    """Blockwise Core-compatible KL for local-Q/global-K CP masking."""
+    if loss_coeff == 0:
+        return (q_indexer.sum() + k_indexer.sum() + weights.sum()) * 0.0
+
+    q_bshd, k_bsd, _w_raw, w_scaled = _sbhd_to_bshd_indexer_inputs(
+        q_indexer, k_indexer, weights, 1.0
+    )
+    w_scaled = w_scaled.float() * float(q_indexer.shape[-1] ** -0.5)
+    q_attn = query.permute(1, 0, 2, 3).float()
+    kv_bkd = kv.permute(1, 0, 2).float()
+    valid = torch.isfinite(mask)
+    b, sq, _heads, _dim = q_bshd.shape
+    sk = k_bsd.shape[1]
+
+    if sparse_loss:
+        safe = topk_indices.clamp_min(0).long()
+        selected_k = torch.gather(
+            k_bsd.unsqueeze(1).expand(-1, sq, -1, -1),
+            2,
+            safe.unsqueeze(-1).expand(-1, -1, -1, k_bsd.shape[-1]),
+        )
+        index_logits = torch.einsum("bqhd,bqtd->bqht", q_bshd.float(), selected_k.float())
+        index_logits = torch.relu(index_logits).mul(w_scaled.unsqueeze(-1)).sum(dim=2)
+        selected_kv = torch.gather(
+            kv_bkd.unsqueeze(1).expand(-1, sq, -1, -1),
+            2,
+            safe.unsqueeze(-1).expand(-1, -1, -1, kv_bkd.shape[-1]),
+        )
+        attn_logits = torch.einsum("bqhd,bqtd->bqht", q_attn, selected_kv)
+        attn_logits = attn_logits * float(softmax_scale)
+        selected_valid = topk_indices >= 0
+        row_valid = selected_valid.any(dim=-1, keepdim=True)
+        index_logits = torch.where(row_valid, index_logits, torch.zeros_like(index_logits))
+        attn_logits = torch.where(
+            row_valid.unsqueeze(2), attn_logits, torch.zeros_like(attn_logits)
+        )
+        index_logits = index_logits.masked_fill(~selected_valid & row_valid, float("-inf"))
+        attn_logits = attn_logits.masked_fill(
+            ((~selected_valid) & row_valid).unsqueeze(2), float("-inf")
+        )
+        predict = torch.softmax(index_logits, dim=-1)
+        target = torch.softmax(attn_logits, dim=-1, dtype=torch.float32).mean(dim=2)
+        target = torch.where(row_valid, target, torch.zeros_like(target))
+        predict = torch.where(row_valid, predict, torch.zeros_like(predict))
+        kl_per_row = (
+            target * (torch.log(target + 1.0e-10) - torch.log(predict + 1.0e-10))
+        ).sum(dim=-1)
+    else:
+        block_size = 2048
+        index_lse = torch.full((b, sq), float("-inf"), device=query.device)
+        attn_lse = torch.full(
+            (b, sq, query.shape[2]), float("-inf"), device=query.device
+        )
+        for start in range(0, sk, block_size):
+            end = min(start + block_size, sk)
+            block_valid = valid[:, start:end].unsqueeze(0)
+            idx = torch.einsum(
+                "bqhd,bkd->bqhk", q_bshd.float(), k_bsd[:, start:end].float()
+            )
+            idx = torch.relu(idx).mul(w_scaled.unsqueeze(-1)).sum(dim=2)
+            idx = idx.masked_fill(~block_valid, float("-inf"))
+            attn = torch.einsum("bqhd,bkd->bqhk", q_attn, kv_bkd[:, start:end])
+            attn = (attn * float(softmax_scale)).masked_fill(
+                ~block_valid.unsqueeze(2), float("-inf")
+            )
+            index_lse = torch.logaddexp(index_lse, torch.logsumexp(idx, dim=-1))
+            attn_lse = torch.logaddexp(attn_lse, torch.logsumexp(attn, dim=-1))
+
+        row_valid = torch.isfinite(index_lse)
+        safe_index_lse = torch.where(row_valid, index_lse, torch.zeros_like(index_lse))
+        safe_attn_lse = torch.where(
+            row_valid.unsqueeze(-1), attn_lse, torch.zeros_like(attn_lse)
+        )
+        kl_per_row = torch.zeros((b, sq), device=query.device, dtype=torch.float32)
+        for start in range(0, sk, block_size):
+            end = min(start + block_size, sk)
+            block_valid = valid[:, start:end].unsqueeze(0)
+            idx = torch.einsum(
+                "bqhd,bkd->bqhk", q_bshd.float(), k_bsd[:, start:end].float()
+            )
+            idx = torch.relu(idx).mul(w_scaled.unsqueeze(-1)).sum(dim=2)
+            attn = torch.einsum("bqhd,bkd->bqhk", q_attn, kv_bkd[:, start:end])
+            attn = attn * float(softmax_scale)
+            idx = idx.masked_fill(~block_valid, float("-inf"))
+            attn = attn.masked_fill(~block_valid.unsqueeze(2), float("-inf"))
+            predict_log = idx - safe_index_lse.unsqueeze(-1)
+            predict_log = torch.where(block_valid, predict_log, torch.zeros_like(predict_log))
+            target = torch.exp(attn - safe_attn_lse.unsqueeze(-1)).mean(dim=2)
+            target = torch.where(block_valid, target, torch.zeros_like(target))
+            term = target * (torch.log(target + 1.0e-10) - predict_log)
+            kl_per_row = kl_per_row + torch.where(
+                block_valid, term, torch.zeros_like(term)
+            ).sum(dim=-1)
+        kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
+
+    reduced = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
+    return reduced * float(loss_coeff)
+
+
 # ---------------------------------------------------------------------------
 # Path B: fused indexer + sparse attention (training)
 # ---------------------------------------------------------------------------
@@ -823,7 +999,6 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         sq, b, np_, d = query.shape
         skv = kv_full.shape[0]
         n_comp = k_indexer.shape[0]
-        idx_nh, idx_hd = q_indexer.shape[2], q_indexer.shape[3]
 
         requested_topk = indexer_topk
         effective_topk = min(requested_topk, n_comp)
@@ -1218,9 +1393,11 @@ def fused_indexer_sparse_attn_with_topk(
 
 __all__ = [
     "build_flat_topk_idxs",
+    "cp_indexer_loss",
     "local_to_global_flat",
     "dsa_sparse_attn",
     "indexer_topk",
+    "indexer_topk_with_mask",
     "fused_indexer_sparse_attn",
     "fused_indexer_sparse_attn_with_topk",
 ]
