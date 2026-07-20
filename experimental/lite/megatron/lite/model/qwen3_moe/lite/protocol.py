@@ -1,20 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Qwen3MoE lite impl — model protocol for Megatron Lite runtime.
+"""Qwen3MoE lite impl — reference model protocol. Copy + adapt for new models.
 
-This file is the reference implementation of the Megatron Lite model protocol.
-New model authors: copy this file and adapt.
-
-Protocol convention (what runtime calls):
-  Required:
-    ImplConfig                                      — @dataclass, per-impl knobs
-    build_model_config(source, **overrides)          → ModelConfig
-    build_model(model_cfg, *, impl_cfg)              → ModelBundle
-  Optional (in ModelBundle.extras or module-level):
-    load_hf_weights(chunk, hf_path, model_cfg, ps)  — HF weight loading
-    export_hf_weights(chunks, model_cfg, ps)         — HF weight export
-    vocab_size(model_cfg) -> int                     — benchmark metadata
-  Escape hatch:
-    create_runtime(hf_path, cfg) -> Runtime          — fully override runtime
+Runtime calls ``build_model_config(source, **overrides)`` then
+``build_model(model_cfg, *, impl_cfg)``. ``build_model`` is explicit and calls the
+shared ``compose`` toolbox helpers (build_vpp_chunks / apply_recompute_offload /
+wire_dist_opt / make_fsdp2_post_load_hook) for the mechanics common to all models.
 """
 
 from __future__ import annotations
@@ -23,7 +13,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import torch
 import torch.nn as nn
 from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
@@ -37,15 +26,22 @@ from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
 from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
+from megatron.lite.model.compose import (
+    apply_recompute_offload,
+    build_vpp_chunks,
+    make_fsdp2_post_load_hook,
+    wire_dist_opt,
+)
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     freeze_non_lora_params,
     normalize_lora_config,
     trainable_param_stats,
 )
-from megatron.lite.primitive.parallel import ParallelState, init_parallel
-from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
+from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.recompute import parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
@@ -70,7 +66,7 @@ class ImplConfig:
     """Lite impl knobs. Constructed by runtime from user config."""
 
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
-    optimizer: str | None = "dist_opt"  # None = no optimizer (inference)
+    optimizer: str | None = "dist_opt"
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
@@ -103,11 +99,6 @@ MODULE_MAP = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Required: build_model_config
-# ---------------------------------------------------------------------------
-
-
 def build_model_config(source: str | Path | dict, **overrides) -> Qwen3MoEConfig:
     """Build Qwen3MoE architecture config from HF source."""
     if isinstance(source, dict):
@@ -118,11 +109,6 @@ def build_model_config(source: str | Path | dict, **overrides) -> Qwen3MoEConfig
         if hasattr(cfg, k):
             setattr(cfg, k, v)
     return cfg
-
-
-# ---------------------------------------------------------------------------
-# Required: build_model
-# ---------------------------------------------------------------------------
 
 
 def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
@@ -141,24 +127,13 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     return unpack_thd_forward_output(model, batch, output)
 
 
-def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBundle:
-    """Build lite Qwen3MoE: model, parallel state, optimizer — everything.
-
-    Model owns all construction. Runtime just consumes the ModelBundle.
-    """
+def _prepare(model_cfg: Qwen3MoEConfig, impl_cfg: ImplConfig) -> None:
     p = impl_cfg.parallel
-    lora_config = normalize_lora_config(impl_cfg.lora)
-
-    # ── validation ──
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
-
-    # ── override model config from impl_cfg ──
     if impl_cfg.router_aux_loss_coef is not None:
         model_cfg.router_aux_loss_coef = impl_cfg.router_aux_loss_coef
-    mtp_enable = bool(impl_cfg.mtp_enable)
-    mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
-    if mtp_enable:
+    if impl_cfg.mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
             raise ValueError("mtp_enable=True but HF config has no num_nextn_predict_layers.")
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
@@ -167,50 +142,58 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     else:
         model_cfg.num_nextn_predict_layers = 0
 
-    # ── parallel state (model creates its own) ──
-    ps = init_parallel(p)
-    deterministic = impl_cfg.deterministic
 
-    # ── build chunks ──
-    recompute_spec = parse_recompute_spec(impl_cfg.recompute)
+def _chunk_factory(
+    model_cfg: Qwen3MoEConfig, impl_cfg: ImplConfig, ps: ParallelState, vpp_chunk_id: int | None
+) -> nn.Module:
+    mtp_enable = bool(impl_cfg.mtp_enable)
+    vpp = None if impl_cfg.parallel.vpp == 1 else impl_cfg.parallel.vpp
     model_kwargs: dict[str, Any] = dict(
-        use_deepep=impl_cfg.use_deepep,
-        fp8=False,
-        recompute_modules=recompute_spec,
+        use_deepep=impl_cfg.use_deepep, fp8=False,
+        recompute_modules=parse_recompute_spec(impl_cfg.recompute),
         router_bias_rate=impl_cfg.router_bias_rate,
         use_thd=impl_cfg.use_thd,
         mtp_enable=mtp_enable,
-        mtp_enable_train=mtp_enable_train,
+        mtp_enable_train=mtp_enable and bool(impl_cfg.mtp_enable_train),
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
-        lora_config=lora_config,
+        lora_config=normalize_lora_config(impl_cfg.lora),
     )
-
-    vpp = None if p.vpp == 1 else p.vpp
     if vpp is None:
-        chunks = [Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
-    else:
-        chunks = []
-        for i in range(vpp):
-            chunks.append(
-                Qwen3MoEModel(model_cfg, ps, vpp=vpp, vpp_chunk_id=i, **model_kwargs)
-                .to(torch.bfloat16)
-                .cuda()
-            )
+        return Qwen3MoEModel(model_cfg, ps, **model_kwargs)
+    return Qwen3MoEModel(model_cfg, ps, vpp=vpp, vpp_chunk_id=vpp_chunk_id, **model_kwargs)
 
+
+def _fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
+    from megatron.lite.model.qwen3_moe.lite.model import TransformerLayer
+
+    return (TransformerLayer,)
+
+
+def _pre_forward_hook(loss_scale):
+    from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
+
+    MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
+    MTPLossAutoScaler.set_loss_scale(loss_scale)
+
+
+def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBundle:
+    _prepare(model_cfg, impl_cfg)
+
+    ps = init_parallel(impl_cfg.parallel)
+    chunks = build_vpp_chunks(_chunk_factory, model_cfg, impl_cfg, ps)
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
-    # ── recompute ──
-    if recompute_spec:
-        for chunk in chunks:
-            apply_recompute(chunk.layers, recompute_spec, MODULE_MAP)
+    # #114: recompute and offload walk the same transformer_units (chunk.layers).
+    apply_recompute_offload(
+        chunks,
+        lambda chunk: chunk.layers,
+        MODULE_MAP,
+        recompute=impl_cfg.recompute,
+        offload=impl_cfg.offload,
+    )
 
-    # ── offload ──
-    if impl_cfg.offload:
-        from megatron.lite.primitive.recompute import apply_offload
-
-        for chunk in chunks:
-            apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
-
+    # LoRA freeze+stats must run before the optimizer sees params.
+    lora_config = normalize_lora_config(impl_cfg.lora)
     lora_stats = None
     if lora_config.enabled:
         lora_stats = {"chunks": []}
@@ -219,64 +202,37 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             trainable_stats = trainable_param_stats(chunk)
             lora_stats["chunks"].append({**freeze_stats, **trainable_stats})
 
-    # ── optimizer (model chooses which primitive) ──
     optimizer = None
     finalize_grads = None
     post_model_load_hook = None
     if impl_cfg.optimizer == "dist_opt":
-        from megatron.lite.primitive.optimizers.megatron_wrap import (
-            build_dist_opt_training_optimizer,
-        )
-
-        optimizer, finalize_grads = build_dist_opt_training_optimizer(
+        # register_hooks=False: qwen3_moe skips the megatron grad-sync hooks.
+        optimizer, finalize_grads = wire_dist_opt(
             chunks,
-            model_cfg=model_cfg,
-            impl_cfg=impl_cfg,
-            ps=ps,
-            model_name="qwen3_moe",
+            model_cfg,
+            impl_cfg,
+            ps,
+            name="qwen3_moe",
             is_expert=is_expert_param,
-            deterministic=deterministic,
-        )
-        from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
-
-        attach_model_sharded_state_dict(
-            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
+            placement_fn=PLACEMENT_FN,
+            deterministic=impl_cfg.deterministic,
+            register_hooks=False,
         )
         optimizer_backend = "dist_opt"
     elif impl_cfg.optimizer == "fsdp2":
+        post_model_load_hook = make_fsdp2_post_load_hook(
+            chunks,
+            impl_cfg,
+            ps,
+            unit_modules=_fsdp2_unit_modules(),
+            expert_classifier=is_expert_param,
+            deterministic=impl_cfg.deterministic,
+        )
         optimizer_backend = "fsdp2"
-
-        def _post_model_load_hook():
-            from megatron.lite.model.qwen3_moe.lite.model import TransformerLayer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
-
-            return {
-                "optimizer": build_fsdp2_training_optimizer(
-                    chunks,
-                    impl_cfg.optimizer_config,
-                    ps,
-                    unit_modules=(TransformerLayer,),
-                    expert_classifier=is_expert_param,
-                    deterministic=deterministic,
-                    vpp=impl_cfg.parallel.vpp,
-                    # Non-layer params stay under the root FSDP2 unit. The fused
-                    # CE path reads head.col.linear.weight directly, and the
-                    # embedding path is also driven from model.forward().
-                    leaf_module_names=(),
-                )
-            }
-
-        post_model_load_hook = _post_model_load_hook
     elif impl_cfg.optimizer is None:
         optimizer_backend = "none"
     else:
         raise ValueError(f"Unknown qwen3_moe lite optimizer: {impl_cfg.optimizer!r}.")
-
-    from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
-
-    def _pre_forward_hook(loss_scale):
-        MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
-        MTPLossAutoScaler.set_loss_scale(loss_scale)
 
     return ModelBundle(
         chunks=chunks,
@@ -286,8 +242,6 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         forward_step=_forward_step if impl_cfg.use_thd else _forward_step_bshd,
         extras={
             "model_cfg": model_cfg,
-            # Lite's router uses megatron.lite's MoEAuxLossAutoScaler; hand the
-            # classmethod directly as the per-microbatch hook.
             "pre_forward_hook": _pre_forward_hook,
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
@@ -295,11 +249,6 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             "lora_stats": lora_stats,
         },
     )
-
-
-# ---------------------------------------------------------------------------
-# Optional: load_hf_weights
-# ---------------------------------------------------------------------------
 
 
 def load_hf_weights(
@@ -319,11 +268,6 @@ def export_hf_weights(
 
     for chunk in chunks:
         yield from _export(chunk, model_cfg, ps, **kwargs)
-
-
-# ---------------------------------------------------------------------------
-# Tooling metadata (benchmark / debug)
-# ---------------------------------------------------------------------------
 
 
 def vocab_size(model_cfg: Qwen3MoEConfig) -> int | None:

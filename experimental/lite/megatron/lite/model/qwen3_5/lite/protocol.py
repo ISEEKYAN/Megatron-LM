@@ -22,9 +22,15 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import EXPERT_CLASSIFIER, PLACE
 from megatron.lite.model.qwen3_5.lite.checkpoint import export_hf_weights as _export_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
+from megatron.lite.model.compose import (
+    apply_recompute_offload,
+    build_vpp_chunks,
+    make_fsdp2_post_load_hook,
+    wire_dist_opt,
+)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
-from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
+from megatron.lite.primitive.recompute import parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
@@ -138,37 +144,20 @@ def _make_aux_loss_hook():
     return hook
 
 
-def _build_dist_opt_optimizer(
-    chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState
-):
-    from megatron.lite.primitive.optimizers.megatron_wrap import (
-        build_dist_opt_training_optimizer,
-    )
-
-    return build_dist_opt_training_optimizer(
-        chunks,
-        model_cfg=model_cfg,
-        impl_cfg=impl_cfg,
-        ps=ps,
-        is_expert=is_expert_param,
-        model_name="qwen3_5",
-        deterministic=impl_cfg.deterministic,
-    )
+def _effective_deterministic(model_cfg: Qwen35Config, impl_cfg: ImplConfig) -> bool:
+    # THD GatedDeltaNet kernel is non-deterministic; force off in that case.
+    if impl_cfg.use_thd and impl_cfg.deterministic and "linear_attention" in model_cfg.layer_types:
+        return False
+    return impl_cfg.deterministic
 
 
-def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    from megatron.lite.model.qwen3_5.lite.model import Qwen35Model
-
+def _prepare(model_cfg: Qwen35Config, impl_cfg: ImplConfig) -> None:
     p = impl_cfg.parallel
-
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
-
     if impl_cfg.router_aux_loss_coef is not None:
         model_cfg.router_aux_loss_coef = impl_cfg.router_aux_loss_coef
-    mtp_enable = bool(impl_cfg.mtp_enable)
-    mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
-    if mtp_enable:
+    if impl_cfg.mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
             raise ValueError("mtp_enable=True but HF config has no num_nextn_predict_layers.")
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
@@ -177,93 +166,88 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     else:
         model_cfg.num_nextn_predict_layers = 0
 
-    ps = init_parallel(p)
-    recompute_spec = parse_recompute_spec(impl_cfg.recompute)
-    vpp = None if p.vpp == 1 else p.vpp
-    deterministic = impl_cfg.deterministic
-    if impl_cfg.use_thd and deterministic and "linear_attention" in model_cfg.layer_types:
-        deterministic = False
+
+def _chunk_factory(
+    model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState, vpp_chunk_id: int | None
+) -> nn.Module:
+    from megatron.lite.model.qwen3_5.lite.model import Qwen35Model
+
+    mtp_enable = bool(impl_cfg.mtp_enable)
+    vpp = None if impl_cfg.parallel.vpp == 1 else impl_cfg.parallel.vpp
     train_cfg = SimpleNamespace(
-        tp=ps.tp_size,
-        ep=ps.ep_size,
-        etp=ps.etp_size,
-        pp=ps.pp_size,
-        cp=ps.cp_size,
-        vpp=vpp,
-        use_deepep=impl_cfg.use_deepep,
-        fp8=False,
-        recompute_modules=recompute_spec,
-        deterministic=deterministic,
+        tp=ps.tp_size, ep=ps.ep_size, etp=ps.etp_size, pp=ps.pp_size, cp=ps.cp_size, vpp=vpp,
+        use_deepep=impl_cfg.use_deepep, fp8=False,
+        recompute_modules=parse_recompute_spec(impl_cfg.recompute),
+        deterministic=_effective_deterministic(model_cfg, impl_cfg),
     )
-    model_kwargs: dict[str, Any] = dict(
+    return Qwen35Model(
+        model_cfg, train_cfg, ps, vpp_chunk_id=vpp_chunk_id,
         router_bias_rate=impl_cfg.router_bias_rate,
         use_thd=impl_cfg.use_thd,
         hf_path=impl_cfg.hf_path,
         attention_backend_override=impl_cfg.attention_backend_override,
         mtp_enable=mtp_enable,
-        mtp_enable_train=mtp_enable_train,
+        mtp_enable_train=mtp_enable and bool(impl_cfg.mtp_enable_train),
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
         mount_vision_model=impl_cfg.mount_vision_model,
         gdn_cp_mode=impl_cfg.gdn_cp_mode,
     )
 
-    if vpp is None:
-        chunks = [Qwen35Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
-    else:
-        chunks = [
-            Qwen35Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **model_kwargs)
-            .to(torch.bfloat16)
-            .cuda()
-            for i in range(vpp)
-        ]
+
+def _fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
+    from megatron.lite.model.qwen3_5.lite.model import Qwen35Layer
+
+    return (Qwen35Layer,)
+
+
+def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+    _prepare(model_cfg, impl_cfg)
+
+    ps = init_parallel(impl_cfg.parallel)
+    chunks = build_vpp_chunks(_chunk_factory, model_cfg, impl_cfg, ps)
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
-    if recompute_spec:
-        for chunk in chunks:
-            apply_recompute(chunk.layers, recompute_spec, MODULE_MAP)
-
-    if impl_cfg.offload:
-        from megatron.lite.primitive.recompute import apply_offload
-
-        for chunk in chunks:
-            apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
+    # #114: recompute and offload walk the same transformer_units (chunk.layers).
+    apply_recompute_offload(
+        chunks,
+        lambda chunk: chunk.layers,
+        MODULE_MAP,
+        recompute=impl_cfg.recompute,
+        offload=impl_cfg.offload,
+    )
 
     optimizer = None
     finalize_grads = None
     post_model_load_hook = None
-    optimizer_backend = "none"
     if impl_cfg.optimizer == "dist_opt":
-        optimizer, finalize_grads = _build_dist_opt_optimizer(chunks, model_cfg, impl_cfg, ps)
-        from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
-        from megatron.lite.runtime.megatron_utils import register_training_hooks
-
-        attach_model_sharded_state_dict(
-            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
+        # dist_opt uses the raw impl flag (pre-refactor behavior). The THD
+        # GatedDeltaNet determinism override applies to the chunk build and
+        # fsdp2 wiring, not to the dist_opt master-shard reduction.
+        optimizer, finalize_grads = wire_dist_opt(
+            chunks,
+            model_cfg,
+            impl_cfg,
+            ps,
+            name="qwen3_5",
+            is_expert=is_expert_param,
+            placement_fn=PLACEMENT_FN,
+            deterministic=impl_cfg.deterministic,
         )
-        register_training_hooks(chunks, optimizer)
         optimizer_backend = "dist_opt"
     elif impl_cfg.optimizer == "fsdp2":
+        # THD GatedDeltaNet kernel is non-deterministic; force off on that path.
+        post_model_load_hook = make_fsdp2_post_load_hook(
+            chunks,
+            impl_cfg,
+            ps,
+            unit_modules=_fsdp2_unit_modules(),
+            expert_classifier=is_expert_param,
+            deterministic=_effective_deterministic(model_cfg, impl_cfg),
+        )
         optimizer_backend = "fsdp2"
-
-        def _post_model_load_hook():
-            from megatron.lite.model.qwen3_5.lite.model import Qwen35Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
-
-            return {
-                "optimizer": build_fsdp2_training_optimizer(
-                    chunks,
-                    impl_cfg.optimizer_config,
-                    ps,
-                    unit_modules=(Qwen35Layer,),
-                    expert_classifier=is_expert_param,
-                    deterministic=deterministic,
-                    vpp=impl_cfg.parallel.vpp,
-                    leaf_module_names=(),
-                )
-            }
-
-        post_model_load_hook = _post_model_load_hook
-    elif impl_cfg.optimizer is not None:
+    elif impl_cfg.optimizer is None:
+        optimizer_backend = "none"
+    else:
         raise ValueError(f"Unknown qwen3_5 lite optimizer: {impl_cfg.optimizer!r}.")
 
     return ModelBundle(
@@ -274,9 +258,9 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         forward_step=_forward_step if impl_cfg.use_thd else _forward_step_bshd,
         extras={
             "model_cfg": model_cfg,
+            "pre_forward_hook": _make_aux_loss_hook(),
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
-            "pre_forward_hook": _make_aux_loss_hook(),
         },
     )
 

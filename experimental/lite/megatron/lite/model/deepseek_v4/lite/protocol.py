@@ -21,6 +21,12 @@ from megatron.lite.model.protocol_utils import (
     pack_r3_replay_mask as _pack_r3_replay_mask,
     pack_routed_experts as _pack_routed_experts,
 )
+from megatron.lite.model.compose import (
+    apply_recompute_offload,
+    build_vpp_chunks,
+    make_fsdp2_post_load_hook,
+    wire_dist_opt,
+)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
@@ -35,7 +41,6 @@ from megatron.lite.primitive.parallel.thd import (
     thd_pack_meta,
     unpack_thd_to_nested,
 )
-from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch, ParallelConfig
 
 
@@ -303,17 +308,7 @@ def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None
 
 
 def _make_aux_loss_hook():
-    """Per-step hook that syncs the MTP auxiliary-loss backward scale to the main
-    loss scale (DP size / gradient accumulation), mirroring the sibling protocols
-    (kimi_k2 / glm5 / qwen3_5 / qwen3_moe).
-
-    DS4 only injects an MTP auxiliary loss: its MoE router is aux-loss-free
-    (``SigmoidTopKRouter(..., compute_aux_loss=False)``) and its CSA indexer runs
-    with ``sparse_loss=False``, so -- unlike GLM-5, which also scales the MoE-aux
-    and DSA-indexer losses -- only ``MTPLossAutoScaler`` needs scaling here.
-    Without this hook the injected MTP gradient keeps ``MTPLossAutoScaler``'s
-    class-default scale of 1.0 and is mis-weighted relative to the main loss.
-    """
+    # DS4 injects only an MTP aux loss (MoE router + CSA indexer are aux-free).
     from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 
     def hook(scale: torch.Tensor) -> None:
@@ -322,36 +317,22 @@ def _make_aux_loss_hook():
     return hook
 
 
-def _optimizer_backend_name(optimizer: Any) -> str | None:
-    if isinstance(optimizer, dict) or isinstance(optimizer, OptimizerConfig):
-        return "dist_opt"
-    return optimizer
-
-
-def _configure_attention_backend(chunks: list[nn.Module], *, backend: str | None) -> None:
-    backend_name = backend or "torch"
+def _configure_attention_backend(chunks: list[nn.Module], impl_cfg: ImplConfig) -> None:
+    backend = impl_cfg.attention_backend_override or "torch"
     for chunk in chunks:
         for module in chunk.modules():
             if hasattr(module, "attention_backend"):
-                module.attention_backend = backend_name
+                module.attention_backend = backend
 
 
 def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
-    # Native DS4 chunks are DeepseekV4Model instances themselves. Keep support
-    # for wrapper-style chunks, but do not require a `.model` indirection or
-    # recompute/offload silently applies to zero transformer layers.
+    # #114 unit walk: DS4 uses layers.values()+mtp (ModuleDict + MTP list).
     model = getattr(chunk, "model", chunk)
-    layers = list(getattr(model, "layers", {}).values())
-    mtp_layers = list(getattr(model, "mtp", []))
-    return [*layers, *mtp_layers]
+    return [*getattr(model, "layers", {}).values(), *getattr(model, "mtp", [])]
 
 
 def _validate_parallel_scope(p: ParallelConfig) -> None:
-    """DS4 CSA attention is not tensor-parallel-capable (documented TP=1 case).
-
-    PP / VPP / EP / CP are inherited from the Kimi skeleton and work; only
-    TP>1 / ETP>1 are unsupported.  Mirrors GLM-5's gate.
-    """
+    # DS4 CSA attention is TP=1/ETP=1 only (PP/VPP/EP/CP work).
     etp = 1 if p.etp is None else p.etp
     if p.tp > 1:
         raise NotImplementedError(
@@ -365,16 +346,19 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
         )
 
 
-def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+def _ds4_chunk_factory(
+    model_cfg: DeepseekV4Config,
+    impl_cfg: ImplConfig,
+    ps: ParallelState,
+    vpp_chunk_id: int | None,
+) -> nn.Module:
     from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Model
 
-    p = impl_cfg.parallel
-    _validate_parallel_scope(p)
-    _apply_mtp_config(model_cfg, impl_cfg)
+    # ``prepare`` (below) has already applied MTP config / validated scope, so
+    # ``model_cfg.num_nextn_predict_layers`` is authoritative here.
     mtp_enable = bool(impl_cfg.mtp_enable) and model_cfg.num_nextn_predict_layers > 0
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
-    ps = init_parallel(impl_cfg.parallel)
-    vpp = None if p.vpp == 1 else p.vpp
+    vpp = None if impl_cfg.parallel.vpp == 1 else impl_cfg.parallel.vpp
     train_cfg = SimpleNamespace(
         tp=ps.tp_size,
         ep=ps.ep_size,
@@ -385,92 +369,89 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         fp8=False,
         use_deepep=impl_cfg.use_deepep,
     )
+    return DeepseekV4Model(
+        model_cfg,
+        train_cfg,
+        ps,
+        vpp_chunk_id=vpp_chunk_id,
+        use_deepep=impl_cfg.use_deepep,
+        use_thd=impl_cfg.use_thd,
+        hf_path=impl_cfg.hf_path,
+        attention_backend_override=impl_cfg.attention_backend_override,
+        mtp_enable=mtp_enable,
+        mtp_enable_train=mtp_enable_train,
+        mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
+    )
 
-    def _chunk(i: int | None = None):
-        return (
-            DeepseekV4Model(
-                model_cfg,
-                train_cfg,
-                ps,
-                vpp_chunk_id=i,
-                use_deepep=impl_cfg.use_deepep,
-                use_thd=impl_cfg.use_thd,
-                hf_path=impl_cfg.hf_path,
-                attention_backend_override=impl_cfg.attention_backend_override,
-                mtp_enable=mtp_enable,
-                mtp_enable_train=mtp_enable_train,
-                mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
-            )
-            .to(torch.bfloat16)
-            .cuda()
-        )
 
-    chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
-    _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
+def _ds4_prepare(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
+    _validate_parallel_scope(impl_cfg.parallel)
+    _apply_mtp_config(model_cfg, impl_cfg)
 
-    recompute_spec = parse_recompute_spec(impl_cfg.recompute)
-    if recompute_spec:
-        for chunk in chunks:
-            apply_recompute(_iter_transformer_units(chunk), recompute_spec, MODULE_MAP)
 
-    if impl_cfg.offload:
-        from megatron.lite.primitive.recompute import apply_offload
+def _ds4_fsdp2_unit_modules() -> tuple[type[nn.Module], ...]:
+    from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Layer
 
-        for chunk in chunks:
-            apply_offload(_iter_transformer_units(chunk), impl_cfg.offload, MODULE_MAP)
+    return (DeepseekV4Layer,)
+
+
+def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+    # DS4 deltas vs the shared toolbox: CSA/hash-MoE chunk kwargs, the
+    # layers.values()+mtp unit walk (#114), the TP=1 CSA scope gate + MTP config,
+    # the attention-backend post-chunk hook, fsdp2 use_fp32_shards=False, and the
+    # OptimizerConfig/dict -> dist_opt backend normalization. HF I/O stays in
+    # checkpoint.py.
+    _ds4_prepare(model_cfg, impl_cfg)
+
+    ps = init_parallel(impl_cfg.parallel)
+    chunks = build_vpp_chunks(_ds4_chunk_factory, model_cfg, impl_cfg, ps)
+    _configure_attention_backend(chunks, impl_cfg)
+
+    # #114: recompute and offload walk the same unit enumeration
+    # (layers.values()+mtp), driven through the one _iter_transformer_units.
+    apply_recompute_offload(
+        chunks,
+        _iter_transformer_units,
+        MODULE_MAP,
+        recompute=impl_cfg.recompute,
+        offload=impl_cfg.offload,
+    )
+
+    # DS4 threads an OptimizerConfig/dict as ``optimizer`` -> dist_opt backend.
+    optimizer_choice = impl_cfg.optimizer
+    if isinstance(optimizer_choice, (dict, OptimizerConfig)):
+        optimizer_choice = "dist_opt"
 
     optimizer = None
     finalize_grads = None
     post_model_load_hook = None
-    optimizer_backend = "none"
-    optimizer_name = _optimizer_backend_name(impl_cfg.optimizer)
-    if optimizer_name == "dist_opt":
-        from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
-        from megatron.lite.primitive.optimizers.megatron_wrap import (
-            build_dist_opt_training_optimizer,
-        )
-        from megatron.lite.runtime.megatron_utils import register_training_hooks
-
-        optimizer, finalize_grads = build_dist_opt_training_optimizer(
+    if optimizer_choice == "dist_opt":
+        optimizer, finalize_grads = wire_dist_opt(
             chunks,
-            model_cfg=model_cfg,
-            impl_cfg=impl_cfg,
-            ps=ps,
-            model_name="deepseek_v4",
+            model_cfg,
+            impl_cfg,
+            ps,
+            name="deepseek_v4",
             is_expert=is_expert_param,
+            placement_fn=PLACEMENT_FN,
             deterministic=impl_cfg.deterministic,
         )
-        attach_model_sharded_state_dict(
-            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
-        )
-        register_training_hooks(chunks, optimizer)
         optimizer_backend = "dist_opt"
-    elif optimizer_name == "fsdp2":
+    elif optimizer_choice == "fsdp2":
+        post_model_load_hook = make_fsdp2_post_load_hook(
+            chunks,
+            impl_cfg,
+            ps,
+            unit_modules=_ds4_fsdp2_unit_modules(),
+            expert_classifier=is_expert_param,
+            deterministic=impl_cfg.deterministic,
+            use_fp32_shards=False,
+        )
         optimizer_backend = "fsdp2"
-
-        def _post_model_load_hook():
-            from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
-
-            return {
-                "optimizer": build_fsdp2_training_optimizer(
-                    chunks,
-                    impl_cfg.optimizer_config,
-                    ps,
-                    unit_modules=(DeepseekV4Layer,),
-                    expert_classifier=is_expert_param,
-                    deterministic=impl_cfg.deterministic,
-                    vpp=impl_cfg.parallel.vpp,
-                    leaf_module_names=(),
-                    use_fp32_shards=False,
-                )
-            }
-
-        post_model_load_hook = _post_model_load_hook
-    elif optimizer_name is None:
+    elif optimizer_choice is None:
         optimizer_backend = "none"
     else:
-        raise ValueError(f"Unknown DeepSeek V4 lite optimizer: {impl_cfg.optimizer!r}.")
+        raise ValueError(f"Unknown deepseek_v4 lite optimizer: {optimizer_choice!r}.")
 
     return ModelBundle(
         chunks=chunks,
@@ -480,9 +461,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         forward_step=_forward_step,
         extras={
             "model_cfg": model_cfg,
+            "pre_forward_hook": _make_aux_loss_hook(),
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
-            "pre_forward_hook": _make_aux_loss_hook(),
         },
     )
 
