@@ -47,15 +47,15 @@ def test_packed_cp_layout_uses_contiguous_global_coordinates():
     assert gathered_positions.index_select(0, kv_reorder).tolist() == list(range(16))
 
 
-def test_packed_cp_projected_kv_is_physically_aligned_for_cudnn_topk():
+def test_cp_projected_kv_is_physically_aligned_for_cudnn_topk():
     from megatron.lite.primitive.modules.attention.dsa import (
-        _pad_packed_cp_projected_kv,
+        _pad_cp_projected_kv,
     )
 
     kv = torch.arange(520 * 3, dtype=torch.float32).view(520, 1, 3)
     index_k = torch.arange(520 * 2, dtype=torch.float32).view(520, 1, 2)
 
-    padded_kv, padded_index_k = _pad_packed_cp_projected_kv(kv, index_k)
+    padded_kv, padded_index_k = _pad_cp_projected_kv(kv, index_k)
 
     assert padded_kv.shape == (1024, 1, 3)
     assert padded_index_k is not None and padded_index_k.shape == (1024, 1, 2)

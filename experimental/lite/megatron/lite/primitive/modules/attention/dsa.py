@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 
 # cuDNN FE 1.27's indexer_top_k decode-varlen kernel loads score columns in
-# 512-thread tiles. Packed CP aligns gathered projected KV once so the physical
+# 512-thread tiles. CP aligns gathered projected KV once so the physical
 # score width cannot end in a partial tile; the causal mask preserves the
 # original logical sequence boundary.
 _CUDNN_DSA_TOPK_COLUMN_ALIGNMENT = 512
@@ -277,11 +277,11 @@ def _packed_cp_layout(
     return query_positions, torch.arange(total, device=device, dtype=torch.long)
 
 
-def _pad_packed_cp_projected_kv(
+def _pad_cp_projected_kv(
     kv: torch.Tensor,
     index_k: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Physically align gathered packed KV for cuDNN top-k score loads."""
+    """Physically align gathered CP KV for cuDNN top-k score loads."""
     logical_rows = kv.shape[0]
     aligned_rows = (
         (logical_rows + _CUDNN_DSA_TOPK_COLUMN_ALIGNMENT - 1)
@@ -1080,6 +1080,8 @@ class DynamicSparseAttention(nn.Module):
             if k_idx_local is not None
             else None
         )
+        if kv.is_cuda and not self.skip_topk:
+            kv, k_idx = _pad_cp_projected_kv(kv, k_idx)
         mask = _build_cp_causal_mask(
             query_pos,
             torch.arange(kv.shape[0], device=x.device),
@@ -1138,7 +1140,7 @@ class DynamicSparseAttention(nn.Module):
             else None
         )
         if kv.is_cuda and not self.skip_topk:
-            kv, k_idx = _pad_packed_cp_projected_kv(kv, k_idx)
+            kv, k_idx = _pad_cp_projected_kv(kv, k_idx)
         key_pos = torch.arange(kv.shape[0], device=x.device, dtype=torch.long)
         mask = _build_cp_causal_mask(
             query_pos,

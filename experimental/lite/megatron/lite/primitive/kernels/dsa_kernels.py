@@ -636,9 +636,9 @@ def indexer_topk_with_mask(
     Core's experimental DSA helpers.  At NVIDIA/Megatron-LM dev@1378a4806,
     ``fused_qk_topk_naive_thd`` assumes contiguous, aligned Q/K segments,
     reconstructs the causal mask from segment length plus ``ratio``, and
-    clamps top-k to the segment K length.  GLM5 CP zigzag instead needs an
-    explicit mask from interleaved local-Q positions to full-sequence global-K
-    positions, with top-k spanning global-K rather than the local contiguous
+    clamps top-k to the segment K length.  GLM5 contiguous allgather-CP instead
+    needs an explicit mask from sequential local-Q positions to full-sequence
+    global-K positions, with top-k spanning global-K rather than the local
     segment.  Keep this helper until Core can express that contract without
     changing CP semantics.
     """
@@ -707,10 +707,10 @@ def cp_indexer_loss(
     ``fwd_fused_indexer_loss_naive_thd`` and
     ``bwd_fused_indexer_loss_naive_thd`` assume continuous, aligned Q/K
     segments and build their causal mask from segment lengths plus ``ratio``.
-    They cannot represent GLM5 CP-zigzag's explicit local-Q/global-K position
-    mask, and their paired top-k path must not reduce global-K coverage to the
-    local contiguous segment.  Retain this implementation while preserving
-    that CP contract.
+    They cannot represent GLM5 contiguous allgather-CP's explicit sequential
+    local-Q/global-K position mask, and their paired top-k path must not reduce
+    global-K coverage to the local segment.  Retain this implementation while
+    preserving that CP contract.
     """
     if loss_coeff == 0:
         return (q_indexer.sum() + k_indexer.sum() + weights.sum()) * 0.0
