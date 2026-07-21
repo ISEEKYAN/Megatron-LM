@@ -112,8 +112,10 @@ separation:
   (`_VanillaColParallelMatmul`, `te.Linear`, or `te.GroupedLinear`).
 * `model/qwen3_moe/lite/protocol.py` normalizes model-owned configuration,
   builds the model, then freezes non-adapter parameters **before** choosing
-  `dist_opt`, FSDP2, or M-FSDP.  The optimizer receives the ordinary model
-  parameter set and sees only the `requires_grad=True` adapter tensors.
+  its currently implemented `dist_opt`, FSDP2, or no-optimizer inference
+  path.  It has no M-FSDP branch at this baseline.  The optimizer receives the
+  ordinary model parameter set and sees only the `requires_grad=True` adapter
+  tensors.
 * `model/qwen3_moe/lite/lora_adapter.py` gathers/slices TP layouts and maps
   fused QKV/gated FC1 and experts to PEFT names.  It validates rank, alpha and
   targets on load, and writes `adapter_model.safetensors` plus PEFT metadata.
