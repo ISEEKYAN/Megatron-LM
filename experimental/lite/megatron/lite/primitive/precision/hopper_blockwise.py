@@ -47,15 +47,10 @@ CANONICAL_TRANSFORMER_ENGINE_VERSION = "2.15.0"
 # Source: TransformerEngine v2.15 common/gemm/cublaslt_grouped_gemm.cu.
 CUBLAS_GROUPED_GEMM_MIN_VERSION = 130300
 
-# Reserved name for the second closed profile (FP8 parameter storage). The closed
-# design declares it, but its FP8-weight initialization is not implemented in this
-# build, so it is not offered as a usable precision: resolving it fails loud
-# instead of advertising a profile no primitive can construct.
-_RESERVED_FP8_WEIGHT_NAME = "hopper_blockwise_fp8_weight"
-
 PRECISION_NAMES = (
     "bf16",
     "hopper_blockwise_bf16_weight",
+    "hopper_blockwise_fp8_weight",
 )
 
 _FP8_SITES = frozenset(
@@ -163,15 +158,21 @@ HOPPER_BLOCKWISE_BF16_WEIGHT = PrecisionImplementation(
     parameter_contract=_parameter_contract(WeightStorage.BF16),
 )
 
+HOPPER_BLOCKWISE_FP8_WEIGHT = PrecisionImplementation(
+    name="hopper_blockwise_fp8_weight",
+    recipe_factory=build_hopper_blockwise_recipe,
+    fp8_sites=_FP8_SITES,
+    bf16_sites=_BF16_SITES,
+    parameter_contract=_parameter_contract(WeightStorage.FP8_BLOCKWISE_E4M3),
+)
+
 
 def resolve_precision(name: str) -> PrecisionImplementation | None:
     """Resolve one of the accepted public precision names.
 
-    ``bf16`` disables managed precision. ``hopper_blockwise_bf16_weight`` is the
-    single implemented blockwise profile. ``hopper_blockwise_fp8_weight`` is a
-    reserved-but-unimplemented profile (FP8 parameter storage,
-    ``WeightStorage.FP8_BLOCKWISE_E4M3``); requesting it fails loud rather than
-    handing back a profile that no primitive can construct.
+    ``bf16`` disables managed precision. The two Hopper profiles share the
+    frozen recipe and typed coverage but differ only in selected GEMM weight
+    storage.
     """
 
     if not isinstance(name, str):
@@ -180,14 +181,8 @@ def resolve_precision(name: str) -> PrecisionImplementation | None:
         return None
     if name == HOPPER_BLOCKWISE_BF16_WEIGHT.name:
         return HOPPER_BLOCKWISE_BF16_WEIGHT
-    if name == _RESERVED_FP8_WEIGHT_NAME:
-        raise NotImplementedError(
-            f"{_RESERVED_FP8_WEIGHT_NAME} (FP8 parameter storage, "
-            f"{WeightStorage.FP8_BLOCKWISE_E4M3.value}) is not implemented in this "
-            "build; only hopper_blockwise_bf16_weight is available. FP8-weight "
-            "initialization is a declared-but-pending second profile tracked as a "
-            "separate follow-up."
-        )
+    if name == HOPPER_BLOCKWISE_FP8_WEIGHT.name:
+        return HOPPER_BLOCKWISE_FP8_WEIGHT
     accepted = ", ".join(PRECISION_NAMES)
     raise ValueError(f"precision must be one of: {accepted}; got {name!r}")
 
@@ -336,7 +331,31 @@ def precision_model_init_context(
 ) -> AbstractContextManager[PrecisionImplementation]:
     """Bind one implementation while model composition declares typed coverage."""
 
-    return _precision_context(PrecisionPhase.MODEL_INIT, implementation)
+    if implementation.parameter_contract.compute_weight is WeightStorage.BF16:
+        return _precision_context(PrecisionPhase.MODEL_INIT, implementation)
+    return _quantized_precision_model_init_context(implementation)
+
+
+@contextmanager
+def _quantized_precision_model_init_context(
+    implementation: PrecisionImplementation,
+) -> Iterator[PrecisionImplementation]:
+    """Construct TE FP8 parameters while retaining their FP32 source values.
+
+    TE owns quantization and FSDP hooks for its Float8Tensor.  MLite only owns
+    the subsequently-created FP32 optimizer master, so this deliberately does
+    not request TE optimizer masters.
+    """
+
+    from transformer_engine.pytorch.quantization import quantized_model_init
+
+    with quantized_model_init(
+        enabled=True,
+        recipe=implementation.recipe_factory(),
+        preserve_high_precision_init_val=True,
+    ):
+        with _precision_context(PrecisionPhase.MODEL_INIT, implementation) as active:
+            yield active
 
 
 def precision_forward_context(

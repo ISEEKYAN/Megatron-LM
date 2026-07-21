@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import types
+import dataclasses
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ import torch.nn as nn
 pytestmark = pytest.mark.mlite
 
 
-def test_precision_resolver_exposes_only_the_implemented_profile():
+def test_precision_resolver_exposes_both_closed_hopper_profiles():
     from megatron.lite.primitive.precision import (
         AuthoritativeSource,
         MasterOwner,
@@ -24,12 +25,10 @@ def test_precision_resolver_exposes_only_the_implemented_profile():
         resolve_precision,
     )
 
-    # The reserved FP8-weight name is not advertised as usable: only the two
-    # implemented names are offered, and requesting the reserved profile fails
-    # loud instead of returning an unbuildable implementation.
     assert PRECISION_NAMES == (
         "bf16",
         "hopper_blockwise_bf16_weight",
+        "hopper_blockwise_fp8_weight",
     )
     assert resolve_precision("bf16") is None
 
@@ -62,15 +61,70 @@ def test_precision_resolver_exposes_only_the_implemented_profile():
     with pytest.raises(FrozenInstanceError):
         contract.master_parameter = PrecisionDType.BF16
 
-    # The reserved second profile is a declared-but-pending follow-up: it fails
-    # loud rather than being sold as a working profile.
-    with pytest.raises(NotImplementedError, match="not implemented"):
-        resolve_precision("hopper_blockwise_fp8_weight")
+    fp8_weight = resolve_precision("hopper_blockwise_fp8_weight")
+    assert fp8_weight is not None
+    assert fp8_weight.parameter_contract.compute_weight is WeightStorage.FP8_BLOCKWISE_E4M3
+    assert fp8_weight.parameter_contract.master_owner is MasterOwner.MLITE_OPTIMIZER
 
-    with pytest.raises(ValueError, match="bf16.*hopper_blockwise_bf16_weight"):
+    with pytest.raises(ValueError, match="bf16.*hopper_blockwise_bf16_weight.*fp8_weight"):
         resolve_precision("blockwise")
     with pytest.raises(TypeError, match="string"):
         resolve_precision(None)
+
+
+def test_fp8_weight_model_init_uses_te_quantized_init_and_preserves_source(monkeypatch):
+    from contextlib import contextmanager
+
+    from megatron.lite.primitive.precision import (
+        PrecisionPhase,
+        active_precision,
+        precision_model_init_context,
+        resolve_precision,
+    )
+
+    calls = []
+
+    @contextmanager
+    def quantized_model_init(**kwargs):
+        calls.append(("enter", kwargs))
+        yield
+        calls.append(("exit", kwargs))
+
+    te = types.ModuleType("transformer_engine")
+    pytorch = types.ModuleType("transformer_engine.pytorch")
+    quantization = types.ModuleType("transformer_engine.pytorch.quantization")
+    quantization.quantized_model_init = quantized_model_init
+    te.pytorch = pytorch
+    pytorch.quantization = quantization
+    monkeypatch.setitem(sys.modules, "transformer_engine", te)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", pytorch)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.quantization", quantization)
+
+    implementation = resolve_precision("hopper_blockwise_fp8_weight")
+    assert implementation is not None
+    recipe = object()
+    implementation = dataclasses.replace(implementation, recipe_factory=lambda: recipe)
+    with precision_model_init_context(implementation):
+        assert active_precision(PrecisionPhase.MODEL_INIT) is implementation
+
+    assert calls == [
+        (
+            "enter",
+            {
+                "enabled": True,
+                "recipe": recipe,
+                "preserve_high_precision_init_val": True,
+            },
+        ),
+        (
+            "exit",
+            {
+                "enabled": True,
+                "recipe": recipe,
+                "preserve_high_precision_init_val": True,
+            },
+        ),
+    ]
 
 
 def test_hopper_recipe_matches_the_frozen_transformer_engine_mapping(monkeypatch):

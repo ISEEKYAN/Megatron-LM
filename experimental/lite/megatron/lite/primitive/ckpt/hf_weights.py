@@ -694,10 +694,28 @@ def load_hf_weights(
     for name, param in base_model.named_parameters():
         if name in loaded:
             param.data.copy_(loaded[name])
+            _replace_te_high_precision_init_val(param, loaded[name])
         elif "lora" in name.lower() or "adapter" in name.lower():
             continue
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
+
+
+def _replace_te_high_precision_init_val(param: nn.Parameter, source: torch.Tensor) -> None:
+    """Replace TE's construction value with the authoritative HF load tensor.
+
+    ``quantized_model_init(..., preserve_high_precision_init_val=True)`` retains
+    a CPU high-precision construction value solely to seed MLite's FP32 master.
+    HF loading happens later in this runtime, so leaving TE's random construction
+    value in place would create a master unrelated to the quantized compute
+    weight.  TE deliberately exposes this storage as a parameter attribute;
+    replace it only for parameters that opted into that API, never for BF16
+    parameters.
+    """
+
+    if not callable(getattr(param, "get_high_precision_init_val", None)):
+        return
+    param._high_precision_init_val = source.detach().to(device="cpu").clone()
 
 
 def _load_expert_weight(native_name, hf_names, reader, spec, ps, loaded, expert_gid, expert_shard):

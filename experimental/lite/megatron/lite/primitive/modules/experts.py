@@ -25,7 +25,6 @@ from megatron.lite.primitive.precision import (
     PrecisionPhase,
     PrimitiveCapability,
     SemanticSite,
-    WeightStorage,
     active_precision,
     precision_site_forward_context,
 )
@@ -256,11 +255,6 @@ class Experts(nn.Module):
         implementation = active_precision(PrecisionPhase.MODEL_INIT)
         if coverage.implementation is not implementation:
             raise RuntimeError("precision coverage is bound to a different implementation")
-        if implementation.parameter_contract.compute_weight is not WeightStorage.BF16:
-            raise NotImplementedError(
-                "FP8-weight GroupedLinear initialization is not implemented by the "
-                "BF16-weight expert primitive path."
-            )
         dimensions = (
             ("hidden_size", int(config.hidden_size)),
             (

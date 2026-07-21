@@ -182,15 +182,13 @@ def test_bf16_weight_linear_binding_fails_loud_for_bad_shape(
             )
 
 
-def test_reserved_fp8_weight_profile_is_not_sold_as_a_working_profile():
-    # The FP8-weight profile is declared by the closed design but its FP8
-    # parameter initialization is not implemented in this build. It must fail
-    # loud at resolution instead of being handed back and then dying deep inside
-    # linear construction.
-    from megatron.lite.primitive.precision import resolve_precision
+def test_fp8_weight_profile_is_resolved_for_te_quantized_initialization():
+    from megatron.lite.primitive.precision import WeightStorage, resolve_precision
 
-    with pytest.raises(NotImplementedError, match="not implemented"):
-        resolve_precision("hopper_blockwise_fp8_weight")
+    implementation = resolve_precision("hopper_blockwise_fp8_weight")
+
+    assert implementation is not None
+    assert implementation.parameter_contract.compute_weight is WeightStorage.FP8_BLOCKWISE_E4M3
 
 
 def test_unbound_te_linear_preserves_bf16_path_without_precision_context(
