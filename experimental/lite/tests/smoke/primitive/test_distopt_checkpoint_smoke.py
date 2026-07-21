@@ -131,7 +131,9 @@ def _build_sharded_model_and_dist_opt(parallel: ParallelConfig):
     engine_cfg = SimpleNamespace(
         model_name="tiny_topology_state",
         parallel=parallel,
-        optimizer=LiteOptimizerConfig(optimizer="adam", lr=1.0e-3, weight_decay=0.0),
+        optimizer=LiteOptimizerConfig(
+            optimizer_algorithm="adam", lr=1.0e-3, weight_decay=0.0
+        ),
         deterministic=False,
     )
     wrapped_chunks, optimizer = build_dist_opt_stack(

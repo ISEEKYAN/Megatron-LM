@@ -11,7 +11,7 @@ from megatron.lite.runtime.contracts import LossContext
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
     return SimpleNamespace(
-        optimizer="adam",
+        optimizer_algorithm="adam",
         lr=1e-6,
         min_lr=None,
         min_lr_ratio=None,
@@ -134,11 +134,11 @@ def test_verl_muon_overrides_route_to_native_contract() -> None:
             overlap_param_gather=True,
         ),
     )
-    engine.optimizer_config.optimizer = "muon"
+    engine.optimizer_config.optimizer_algorithm = "muon"
 
     optimizer = engine._build_mlite_optimizer_config()
 
-    assert optimizer.optimizer == "muon"
+    assert optimizer.optimizer_algorithm == "muon"
     assert optimizer.muon_momentum == 0.9
     assert optimizer.muon_num_ns_steps == 7
     assert optimizer.use_layer_wise_param_layout is True

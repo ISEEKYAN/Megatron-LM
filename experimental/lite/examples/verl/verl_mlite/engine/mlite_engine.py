@@ -653,7 +653,7 @@ class MegatronLiteEngine(BaseEngine):
             native_overrides["optimizer_cpu_offload"] = bool(override["optimizer_cpu_offload"])
 
         return MegatronLiteOptimizerConfig(
-            optimizer=optimizer_name,
+            optimizer_algorithm=optimizer_name,
             lr=self.optimizer_config.lr,
             min_lr=min_lr,
             clip_grad=self.optimizer_config.clip_grad,
@@ -689,7 +689,8 @@ class MegatronLiteEngine(BaseEngine):
         if lower == "muon":
             return "muon"
         raise ValueError(
-            f"MegatronLiteEngine supports optimizer='adam' or 'muon', got {optimizer_name!r}"
+            "MegatronLiteEngine supports optimizer_algorithm='adam' or 'muon', "
+            f"got {optimizer_name!r}"
         )
 
     def _extract_primary_module(self):

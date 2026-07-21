@@ -470,7 +470,7 @@ def build_fsdp2_training_optimizer(
 
     if opt is None:
         opt = SimpleNamespace(
-            optimizer="adam",
+            optimizer_algorithm="adam",
             lr=1e-4,
             weight_decay=0.01,
             clip_grad=1.0,
