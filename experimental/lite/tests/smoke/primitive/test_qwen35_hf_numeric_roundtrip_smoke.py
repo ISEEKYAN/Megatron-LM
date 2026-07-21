@@ -183,7 +183,10 @@ def test_qwen35_real_hf_load_export_matches_original(tmp_path):
 
     parallel = ParallelConfig(tp=tp, pp=pp, cp=cp, ep=ep, etp=1, vpp=1)
     impl = protocol.ImplConfig(
-        parallel=parallel, optimizer="dist_opt", use_deepep=False, deterministic=True
+        # This is a checkpoint I/O acceptance test: constructing dist-opt also
+        # allocates a full training parameter/gradient buffer.  That unrelated
+        # buffer exceeds a single H100 for the release model before load starts.
+        parallel=parallel, optimizer=None, use_deepep=False, deterministic=True
     )
     bundle = protocol.build_model(cfg, impl_cfg=impl)
     protocol.load_hf_weights(bundle.chunks[0], model_dir, cfg, bundle.parallel_state)
