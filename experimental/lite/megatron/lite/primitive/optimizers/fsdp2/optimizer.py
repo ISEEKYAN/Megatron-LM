@@ -27,6 +27,11 @@ from megatron.lite.primitive.optimizers.fsdp2.grad_clip import (
     resolve_torch_dtype,
     sharded_grad_sq_sum,
 )
+from megatron.lite.primitive.optimizers.fsdp2.muon import (
+    build_fp32_muon_child,
+    build_muon_chained_optimizer,
+    split_muon_and_fallback_params,
+)
 from megatron.lite.primitive.optimizers.fsdp2.state import (
     OffloadedStateEntry,
     move_offloaded_optimizer_state_to_device,
@@ -294,7 +299,7 @@ def build_fsdp2_adamw(
 ) -> FSDP2Optimizer:
     """Build AdamW from Megatron Lite's shared OptimizerConfig-like object."""
 
-    optimizer_name = getattr(opt, "optimizer", "adam")
+    optimizer_name = getattr(opt, "optimizer_algorithm", "adam")
     if optimizer_name not in {"adam", "adamw"}:
         raise ValueError(f"fsdp2 supports adam/adamw, got {optimizer_name!r}.")
 
@@ -324,6 +329,96 @@ def build_fsdp2_adamw(
     return FSDP2Optimizer(
         optimizer,
         params,
+        ps,
+        clip_grad=float(getattr(opt, "clip_grad", 1.0)),
+        replicated_grad_params=replicated_grad_params,
+        replicated_grad_sync_group=replicated_grad_sync_group,
+        replicated_grad_sync_divisor=replicated_grad_sync_divisor,
+        replicated_grad_norm_group=replicated_grad_norm_group,
+        expert_sharded_grad_params=expert_sharded_grad_params,
+        expert_sharded_grad_scale=expert_sharded_grad_scale,
+        expert_sharded_grad_norm_group=expert_sharded_grad_norm_group,
+        tp_replicated_grad_params=tp_replicated_grad_params,
+        tp_replicated_grad_sync_group=tp_replicated_grad_sync_group,
+        grad_norm_accum_dtype=grad_norm_accum_dtype,
+        param_names=param_names,
+    )
+
+
+def build_fsdp2_muon(
+    model_chunks: list[nn.Module],
+    opt,
+    ps: ParallelState,
+    *,
+    replicated_grad_params: Iterable[nn.Parameter] | None = None,
+    replicated_grad_sync_group: dist.ProcessGroup | None = None,
+    replicated_grad_sync_divisor: float | None = None,
+    replicated_grad_norm_group: dist.ProcessGroup | None = None,
+    expert_sharded_grad_params: Iterable[nn.Parameter] | None = None,
+    expert_sharded_grad_scale: float | None = None,
+    expert_sharded_grad_norm_group: dist.ProcessGroup | None = None,
+    tp_replicated_grad_params: Iterable[nn.Parameter] | None = None,
+    tp_replicated_grad_sync_group: dist.ProcessGroup | None = None,
+    grad_norm_accum_dtype: str | torch.dtype = torch.float32,
+    adamw_foreach: bool | str = "auto",
+    use_fp32_master: bool = True,
+    model_param_dtypes: dict[tuple[int, str], torch.dtype] | None = None,
+) -> FSDP2Optimizer:
+    """Build the Muon×AdamW facade from Megatron Lite's OptimizerConfig-like object.
+
+    Matrix params managed by Muon get an :class:`FP32Muon` child; the remaining
+    params (1D / bias / embedding / output) fall back to the same AdamW builder
+    used by the pure-AdamW path. Both children are FP32-master so the grad-norm
+    clip and offload/checkpoint helpers stay uniform under one facade.
+    """
+    muon_params, _fallback_params, muon_names = split_muon_and_fallback_params(model_chunks)
+    _muon_only, _muon_groups, _muon_name_map, muon_model_dtypes = _build_adamw_param_groups(
+        model_chunks,
+        weight_decay=float(getattr(opt, "weight_decay", 0.01)),
+        apply_wd_to_qk_layernorm=bool(getattr(opt, "apply_wd_to_qk_layernorm", False)),
+        model_param_dtypes=model_param_dtypes,
+        include_param=lambda p: bool(getattr(p, "is_managed_by_layer_wise_optimizer", False)),
+    )
+    fallback_params, fallback_groups, fallback_names, fallback_model_dtypes = (
+        _build_adamw_param_groups(
+            model_chunks,
+            weight_decay=float(getattr(opt, "weight_decay", 0.01)),
+            apply_wd_to_qk_layernorm=bool(getattr(opt, "apply_wd_to_qk_layernorm", False)),
+            model_param_dtypes=model_param_dtypes,
+            include_param=lambda p: not bool(
+                getattr(p, "is_managed_by_layer_wise_optimizer", False)
+            ),
+        )
+    )
+
+    all_params = muon_params + fallback_params
+    param_names = {**muon_names, **fallback_names}
+
+    muon_child = build_fp32_muon_child(muon_params, opt, model_param_dtypes=muon_model_dtypes)
+
+    fallback_optimizer = None
+    if fallback_params:
+        beta1 = getattr(opt, "adam_beta1", None)
+        beta2 = getattr(opt, "adam_beta2", None)
+        eps = getattr(opt, "adam_eps", None)
+        fallback_optimizer = build_adamw_optimizer(
+            fallback_groups,
+            all_params=fallback_params,
+            lr=float(getattr(opt, "lr", 1.0e-4)),
+            weight_decay=float(getattr(opt, "weight_decay", 0.01)),
+            betas=(0.9 if beta1 is None else beta1, 0.999 if beta2 is None else beta2),
+            eps=1.0e-8 if eps is None else eps,
+            foreach=adamw_foreach,
+            use_fp32_master=use_fp32_master,
+            cpu_update=False,
+            model_param_dtypes=fallback_model_dtypes,
+            opt=opt,
+        )
+
+    optimizer = build_muon_chained_optimizer(muon_child, fallback_optimizer)
+    return FSDP2Optimizer(
+        optimizer,
+        all_params,
         ps,
         clip_grad=float(getattr(opt, "clip_grad", 1.0)),
         replicated_grad_params=replicated_grad_params,
@@ -387,6 +482,19 @@ def build_fsdp2_training_optimizer(
         from megatron.lite.primitive.deterministic import deterministic_requested
 
         deterministic = deterministic_requested()
+
+    # Muon routing must be tagged before FSDP2 wrapping so ``fully_shard`` can
+    # preserve the per-param metadata (routing + QKV split) onto the DTensor
+    # shards. The tags are read back by ``build_fsdp2_muon`` after wrapping.
+    is_muon = str(getattr(opt, "optimizer_algorithm", "adam")).lower() == "muon"
+    if is_muon:
+        from megatron.lite.primitive.optimizers.muon_routing import tag_muon_parameter_metadata
+        from megatron.lite.primitive.protocols import default_expert_classifier
+
+        tag_muon_parameter_metadata(
+            model_chunks, is_expert_param=expert_classifier or default_expert_classifier
+        )
+
     effective_use_fp32_shards = (
         bool(use_fp32_shards)
         if use_fp32_shards is not None
@@ -456,7 +564,8 @@ def build_fsdp2_training_optimizer(
     tp_replicated_grad_params = _collect_tp_replicated_grad_params(
         model_chunks, param_names=tp_replicated_grad_param_names
     )
-    return build_fsdp2_adamw(
+    builder = build_fsdp2_muon if is_muon else build_fsdp2_adamw
+    return builder(
         model_chunks,
         opt,
         ps,
@@ -596,6 +705,7 @@ def _build_adamw_param_groups(
     weight_decay: float,
     apply_wd_to_qk_layernorm: bool,
     model_param_dtypes: dict[tuple[int, str], torch.dtype] | None = None,
+    include_param: Callable[[nn.Parameter], bool] | None = None,
 ) -> tuple[list[nn.Parameter], list[dict[str, Any]], dict[int, str], dict[int, torch.dtype]]:
     params: list[nn.Parameter] = []
     decay_params: list[nn.Parameter] = []
@@ -607,6 +717,8 @@ def _build_adamw_param_groups(
     for chunk_idx, chunk in enumerate(model_chunks):
         for name, param in chunk.named_parameters():
             if not param.requires_grad or id(param) in seen_param_ids:
+                continue
+            if include_param is not None and not include_param(param):
                 continue
             seen_param_ids.add(id(param))
             params.append(param)
@@ -676,5 +788,6 @@ __all__ = [
     "FSDP2OptimizerBackend",
     "FSDP2Optimizer",
     "build_fsdp2_adamw",
+    "build_fsdp2_muon",
     "build_fsdp2_training_optimizer",
 ]

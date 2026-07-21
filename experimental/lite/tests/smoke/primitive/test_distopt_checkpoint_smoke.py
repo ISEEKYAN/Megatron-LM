@@ -192,7 +192,9 @@ def _build_model_and_dist_opt():
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
     )
     optimizer = get_megatron_optimizer(
-        OptimizerConfig(optimizer="adam", lr=1.0e-3, bf16=True, use_distributed_optimizer=True),
+        OptimizerConfig(
+            optimizer_algorithm="adam", lr=1.0e-3, bf16=True, use_distributed_optimizer=True
+        ),
         [wrapped],
     )
     attach_model_sharded_state_dict([wrapped], _single_node_parallel_state())
