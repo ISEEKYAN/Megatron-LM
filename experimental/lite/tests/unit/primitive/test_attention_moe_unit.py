@@ -68,6 +68,48 @@ def test_gqa_split_grouped_qkvg_preserves_q_gate_kv_order():
     assert torch.equal(value, torch.tensor([[[10, 11], [22, 23]]]))
 
 
+@pytest.mark.parametrize(
+    ("output_gate", "split_shapes"),
+    [(False, [4, 2, 2]), (True, [4, 4, 2, 2])],
+)
+def test_gqa_owns_qkv_optimizer_metadata(monkeypatch, output_gate, split_shapes):
+    import megatron.lite.primitive.modules.gqa as gqa_module
+    from megatron.lite.primitive.modules.gqa import GQAttention
+    from megatron.lite.primitive.parallel import ParallelState
+
+    class _FakeParallelLinear(torch.nn.Module):
+        def __init__(self, in_features, out_features, _ps, **_kwargs):
+            super().__init__()
+            self.linear = torch.nn.Linear(in_features, out_features, bias=False)
+            self.local_in = in_features
+            self.local_out = out_features
+            self.use_sp = False
+
+    class _FakeUnary(torch.nn.Identity):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(gqa_module, "ColumnParallelLinear", _FakeParallelLinear)
+    monkeypatch.setattr(gqa_module, "RowParallelLinear", _FakeParallelLinear)
+    monkeypatch.setattr(gqa_module.te, "RMSNorm", _FakeUnary)
+    monkeypatch.setattr(gqa_module.te, "DotProductAttention", _FakeUnary)
+    monkeypatch.setattr(gqa_module, "RotaryEmbedding", _FakeUnary)
+
+    attention = GQAttention(
+        hidden_size=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=2,
+        ps=ParallelState(),
+        output_gate=output_gate,
+        qkv_layout="mcore",
+    )
+    attention.to(dtype=torch.bfloat16)
+
+    assert attention.qkv.linear.weight.is_qkv is True
+    assert attention.qkv.linear.weight.qkv_split_shapes == split_shapes
+
+
 def test_moe_aux_loss_auto_scaler_threads_scaled_aux_gradient():
     MoEAuxLossAutoScaler = _moe_aux_scaler()
     MoEAuxLossAutoScaler.set_loss_scale(torch.tensor([0.25]))

@@ -44,7 +44,9 @@ class OptimizerConfig:
     """
 
     # --- stable VERL fields ---
-    optimizer: str = "adam"
+    # Name the algorithm explicitly: ``optimizer`` is the enclosing config
+    # object throughout the runtime and ``optimizer.optimizer`` was ambiguous.
+    optimizer_algorithm: str = "adam"
     lr: float = 1e-3
     min_lr: float = 0.0
     clip_grad: float = 1.0
@@ -60,6 +62,33 @@ class OptimizerConfig:
     lr_wsd_decay_steps: int | None = None
     use_checkpoint_opt_param_scheduler: bool = False
 
+    # --- Megatron native Muon fields (Megatron-LM d64ba4ccb) ---
+    muon_momentum: float = 0.95
+    muon_split_qkv: bool = True
+    muon_nesterov: bool = False
+    muon_scale_mode: str = "spectral"
+    muon_fp32_matmul_prec: str = "medium"
+    muon_coefficient_type: str = "quintic"
+    muon_num_ns_steps: int = 5
+    muon_tp_mode: str = "blockwise"
+    muon_extra_scale_factor: float = 1.0
+    muon_scalar_optimizer: str = "adam"
+
+    # --- Megatron native LayerWise/DDP fields ---
+    use_layer_wise_param_layout: bool = False
+    overlap_grad_reduce: bool = False
+    overlap_param_gather: bool = False
+    overlap_param_gather_with_optimizer_step: bool = False
+
+    # --- Megatron native optimizer-offload fields ---
+    optimizer_cpu_offload: bool = False
+    optimizer_offload_fraction: float = 0.0
+    use_torch_optimizer_for_cpu_offload: bool = False
+    overlap_cpu_optimizer_d2h_h2d: bool = False
+    pin_cpu_grads: bool = True
+    pin_cpu_params: bool = True
+    offload_optimizer_states: bool = False
+
     # --- compatibility aliases ---
     adam_beta1: float | None = None
     adam_beta2: float | None = None
@@ -67,6 +96,28 @@ class OptimizerConfig:
     offload_fraction: float | None = None
     use_precision_aware_optimizer: bool | None = None
     decoupled_weight_decay: bool | None = None
+
+    def __post_init__(self) -> None:
+        """Normalize legacy aliases and reject ambiguous native contracts."""
+
+        if self.offload_fraction is not None:
+            if self.optimizer_offload_fraction not in (0.0, self.offload_fraction):
+                raise ValueError(
+                    "offload_fraction compatibility alias conflicts with "
+                    "optimizer_offload_fraction"
+                )
+            self.optimizer_offload_fraction = float(self.offload_fraction)
+        if not 0.0 <= self.optimizer_offload_fraction <= 1.0:
+            raise ValueError("optimizer_offload_fraction must be in [0, 1]")
+        if self.muon_scalar_optimizer != "adam":
+            raise ValueError("muon_scalar_optimizer currently supports only 'adam'")
+        if (
+            self.optimizer_algorithm.lower() == "muon"
+            and self.overlap_param_gather_with_optimizer_step
+        ):
+            raise ValueError(
+                "overlap_param_gather_with_optimizer_step is not supported with Muon"
+            )
 
 
 @dataclass
