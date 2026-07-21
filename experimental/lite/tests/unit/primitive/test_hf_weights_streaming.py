@@ -23,10 +23,69 @@ if importlib.util.find_spec("safetensors") is None:
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
     _iter_bucketed_materialized_tensors,
+    _iter_export_named_parameters,
     bucketed_all_gather_into_tensor,
     export_hf_weights,
     stream_export_to_shards,
 )
+
+
+class _FakeSharded(nn.Module):
+    """Unwrapped chunk: reports the full (sharded) parameter name set cheaply."""
+
+    def __init__(self, names):
+        super().__init__()
+        for name in names:
+            self.register_parameter(
+                name.replace(".", "_"), nn.Parameter(torch.zeros(2), requires_grad=False)
+            )
+        self._names = list(names)
+
+    def named_parameters(self, *args, **kwargs):  # noqa: D401 - test shim
+        return iter([(name, torch.ones(2)) for name in self._names])
+
+
+class _FakeStreamer:
+    """Wrapped chunk exposing a bounded ``stream_full_parameters``."""
+
+    def __init__(self, yielded_names):
+        self._yielded = list(yielded_names)
+
+    def stream_full_parameters(self):
+        for name in self._yielded:
+            yield name, torch.ones(2)
+
+
+def test_iter_export_falls_back_to_named_parameters_without_streamer() -> None:
+    base = _FakeSharded(["decoder.layers.0.self_attn.q_proj.weight", "lm_head.weight"])
+    chunk = base  # no stream_full_parameters attribute
+    out = [name for name, _ in _iter_export_named_parameters(chunk, base)]
+    assert out == ["decoder.layers.0.self_attn.q_proj.weight", "lm_head.weight"]
+
+
+def test_iter_export_stream_covers_bias_passes_completeness_guard() -> None:
+    names = ["decoder.layers.0.mlp.up_proj.weight", "decoder.layers.0.mlp.up_proj.bias"]
+    base = _FakeSharded(names)
+    chunk = _FakeStreamer(names)
+    out = [name for name, _ in _iter_export_named_parameters(chunk, base)]
+    assert sorted(out) == sorted(names)
+
+
+def test_iter_export_stream_dropping_bias_fails_loud() -> None:
+    names = ["decoder.layers.0.mlp.up_proj.weight", "decoder.layers.0.mlp.up_proj.bias"]
+    base = _FakeSharded(names)
+    # A bucket-identity mismatch would drop the bias from the stream entirely.
+    chunk = _FakeStreamer(["decoder.layers.0.mlp.up_proj.weight"])
+    with pytest.raises(RuntimeError, match="truncated weight shard"):
+        list(_iter_export_named_parameters(chunk, base))
+
+
+def test_iter_export_stream_unexpected_name_fails_loud() -> None:
+    names = ["decoder.layers.0.mlp.up_proj.weight"]
+    base = _FakeSharded(names)
+    chunk = _FakeStreamer(names + ["decoder.layers.0.mlp.up_proj.ghost"])
+    with pytest.raises(RuntimeError, match="unexpected="):
+        list(_iter_export_named_parameters(chunk, base))
 
 
 def test_safe_tensor_reader_context_reuses_and_closes_shard(monkeypatch, tmp_path) -> None:

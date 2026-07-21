@@ -360,6 +360,10 @@ class MegatronLiteRuntime(RuntimeBase):
 
         with ExitStack() as stack:
             for chunk in model_chunks:
+                # Duck-typed: a wrapper that must scope its export all-gather
+                # storage to the export (so the buffers are handed back to the
+                # driver on exit) exposes ``full_parameter_context``. Backends
+                # without it (no export-scoped scratch) skip this entirely.
                 full_parameter_context = getattr(chunk, "full_parameter_context", None)
                 if callable(full_parameter_context):
                     stack.enter_context(full_parameter_context())
@@ -368,8 +372,10 @@ class MegatronLiteRuntime(RuntimeBase):
                 yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
             else:
                 for chunk in model_chunks:
-                    # Prefer the bounded-bucket stream (M-FSDP) so the raw-param
-                    # fallback does not pre-materialize the whole model either.
+                    # Prefer the wrapper's bounded per-bucket stream when it
+                    # exposes ``stream_full_parameters`` (the mfsdp backend) so the
+                    # raw-param fallback does not pre-materialize the whole model;
+                    # otherwise emit named_parameters directly.
                     streamer = getattr(chunk, "stream_full_parameters", None)
                     if callable(streamer):
                         yield from streamer()
@@ -377,12 +383,14 @@ class MegatronLiteRuntime(RuntimeBase):
                         yield from chunk.named_parameters()
 
     def release_export_scratch(self, handle: ModelHandle) -> None:
-        """Reclaim M-FSDP all-gather scratch before a colocated vLLM weight wake.
+        """Reclaim a backend's export all-gather scratch before a colocated wake.
 
-        Loops the model chunks and asks each M-FSDP wrapper to hand its retained
-        double-buffer scratch back to the driver while keeping the sharded
-        weights resident (the export gather source that runs right after the
-        wake). No-op for chunks that do not expose the hook (non-M-FSDP backends).
+        Duck-typed capability dispatch: loops the model chunks and asks any
+        wrapper that exposes ``release_export_scratch`` to hand its retained
+        scratch back to the driver while keeping the sharded weights resident
+        (the export gather source that runs right after the vLLM weight wake).
+        No-op for chunks without the hook (e.g. fsdp2, which retains no scratch),
+        so the verl engine can call this unconditionally regardless of backend.
         """
         model_chunks = handle._extras.get("model_chunks", [handle._model])
         for chunk in model_chunks:
@@ -505,6 +513,10 @@ class MegatronLiteRuntime(RuntimeBase):
             pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
             pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
 
+            # Backend wiring (minimal): the 1F1B schedule calls grad_sync_fn at the
+            # point it should start reducing gradients (after the last microbatch's
+            # backward), letting an overlap-capable optimizer arm its DP grad
+            # reduction. Passed only when an optimizer is attached; None otherwise.
             def enable_optimizer_grad_sync() -> None:
                 handle._optimizer.grad_sync_enabled = True
 

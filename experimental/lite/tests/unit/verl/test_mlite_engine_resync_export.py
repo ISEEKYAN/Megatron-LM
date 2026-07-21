@@ -1,12 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Resync export release ordering: buffer/model handed to the driver before wake.
 
-Covers the two pure generator wrappers wired into ``get_per_tensor_param`` so
-the M-FSDP all-gather buffer and the reloaded model are returned to the driver
-before the colocated vLLM ``wake_up`` (the resync wake_up OOM fix). The critical
-invariant is release *ordering*: the offload/drain must fire once the export
-stream is consumed, even on early-abort or mid-stream failure. GPU/verl-free —
-see TASK-1.13.8.
+Covers the two pure, backend-agnostic generator wrappers wired into
+``get_per_tensor_param`` so the export allocator scratch and the reloaded model
+are returned to the driver before the colocated vLLM ``wake_up`` (the resync
+wake_up OOM fix). The critical invariant is release *ordering*: the offload/drain
+must fire once the export stream is consumed, even on early-abort or mid-stream
+failure. GPU/verl-free.
 """
 import torch
 

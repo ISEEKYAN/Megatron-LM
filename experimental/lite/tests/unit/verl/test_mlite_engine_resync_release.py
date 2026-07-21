@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Train-mode context exit hands the post-step residual back before the vLLM wake.
 
-The colocated resync OOM fix (TASK-1.13.8.5) is internalized: instead of a
-verl-called hook, the engine releases the M-FSDP all-gather scratch and parks the
+The colocated resync OOM fix is internalized: instead of a
+verl-called hook, the engine releases the backend export scratch and parks the
 optimizer at its own offload exit -- ``_MegatronLiteModeCtx.__exit__`` for the
 training-mode context, which verl's fit loop always runs at the end of
 ``update_actor`` and before the subsequent ``update_weights`` weight-pool wake.

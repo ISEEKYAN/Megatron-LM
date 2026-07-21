@@ -205,6 +205,12 @@ def add_loss_context_kwargs(kwargs: dict[str, Any], *, include_return_log_probs:
 
 
 def add_cross_entropy_fusion(kwargs: dict[str, Any], model) -> None:
+    # ``set_cross_entropy_fusion`` stamps the flag on the model chunk, but a
+    # forward may be dispatched with that chunk behind a wrapper (any wrapper
+    # that adds a ``.module`` layer -- DDP, fsdp2, or the mfsdp optimizer's
+    # module wrapper). Walk the ``.module`` chain so the flag is read wherever it
+    # was set instead of silently defaulting to off when the outermost object is
+    # a wrapper. Backend-agnostic: it only follows the standard ``.module`` alias.
     current = model
     visited: set[int] = set()
     while current is not None and id(current) not in visited:

@@ -557,7 +557,7 @@ class ParamBucket:
         ``release_full_parameters``) on their current device. A colocated vLLM
         weight-pool wake needs the transient full-model scratch back before it
         can ``create_and_map``; the export that follows the wake gathers from the
-        resident shards, so the persistent weights must not move (TASK-1.13.8.5).
+        resident shards, so the persistent weights must not move.
         """
         self.release_full_parameters()
         self.discard_full_parameter_views()
@@ -1171,7 +1171,7 @@ class CommunicationPipelines:
         device move: it hands the retained double-buffer slots back to the driver
         (what a colocated vLLM wake needs) but leaves the sharded weights and
         their optimizer aliases in place as the export gather source. See
-        ``ParamBucket.release_scratch_keep_weights`` and TASK-1.13.8.5.
+        ``ParamBucket.release_scratch_keep_weights``.
         """
         for bucket in self.buckets:
             bucket.release_scratch_keep_weights()

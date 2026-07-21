@@ -121,8 +121,14 @@ def _reshard_fsdp2_modules(model_chunk: Any) -> None:
 
 
 def offload_model_to_cpu(model_list: list) -> None:
-    """Offload DDP model to CPU via buffer-resize (zero-copy on GPU side)."""
+    """Offload model to CPU (buffer-resize for DDP; wrapper hook otherwise)."""
     for model_chunk in model_list:
+        # Extension point: any wrapper that self-manages its parameter/grad state
+        # storage (and therefore cannot be offloaded by the generic DDP
+        # buffer-resize or fsdp2 reshard paths below) opts in by exposing a
+        # ``move_model_state(device, load_grad=...)`` method. This is duck-typed,
+        # not an ``if backend == ...`` special-case; the mfsdp optimizer is the
+        # first consumer, and any future self-managed wrapper routes here for free.
         move_model_state = getattr(model_chunk, "move_model_state", None)
         if callable(move_model_state):
             move_model_state(torch.device("cpu"), load_grad=True)
@@ -148,8 +154,12 @@ def offload_model_to_cpu(model_list: list) -> None:
 
 
 def load_model_to_gpu(model_list: list, load_grad: bool = True) -> None:
-    """Load DDP model back to GPU from pinned CPU copy."""
+    """Load model back to GPU (pinned-copy for DDP; wrapper hook otherwise)."""
     for model_chunk in model_list:
+        # Mirror of offload_model_to_cpu: the same duck-typed extension point.
+        # A self-managing wrapper's move_model_state handles its own restore;
+        # mfsdp is the first consumer, everything else falls through to the
+        # generic DDP / fsdp2 reload below.
         move_model_state = getattr(model_chunk, "move_model_state", None)
         if callable(move_model_state):
             move_model_state(

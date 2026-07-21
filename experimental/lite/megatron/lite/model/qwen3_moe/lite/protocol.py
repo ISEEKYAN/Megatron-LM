@@ -246,6 +246,13 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         )
         optimizer_backend = "dist_opt"
     elif impl_cfg.optimizer == "mfsdp":
+        # build_model is the per-model optimizer dispatch/wiring point (dist_opt
+        # and fsdp2 branch here too). Symmetric with the fsdp2 branch below and
+        # not collapsible into optimizers/mfsdp/: the wrap granularity is
+        # architecture-specific -- the model must name its own transformer-layer
+        # class (fsdp_unit_modules), which only the model protocol knows. The
+        # optimizer construction is delegated to build_mfsdp_training_optimizer
+        # under optimizers/mfsdp/; only this model-specific wiring stays here.
         optimizer_backend = "mfsdp"
 
         def _post_model_load_hook():
