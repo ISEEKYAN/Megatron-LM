@@ -20,6 +20,7 @@ from megatron.lite.primitive.optimizers.fsdp2 import (
 from megatron.lite.primitive.optimizers.fsdp2.adamw import build_adamw_optimizer
 from megatron.lite.primitive.optimizers.fsdp2.wrap import build_fsdp2_shard_placement_fn
 from megatron.lite.primitive.parallel.state import ParallelState
+from megatron.lite.runtime.contracts.config import OptimizerConfig
 
 pytestmark = pytest.mark.mlite
 
@@ -100,6 +101,56 @@ def test_fsdp2_optimizer_offloads_dtensor_state_without_extra_knob(monkeypatch):
 
     assert calls == [True]
     assert not hasattr(optimizer, "optimizer_offload_dtensor_state")
+
+
+def test_fsdp2_adamw_default_algorithm_is_bitwise_unchanged() -> None:
+    """The renamed config field must preserve the default AdamW update exactly."""
+
+    torch.manual_seed(1234)
+    default_model = ToyModel()
+    explicit_adam_model = copy.deepcopy(default_model)
+    optimizer_kwargs = dict(
+        lr=0.125,
+        weight_decay=0.2,
+        adam_beta1=0.8,
+        adam_beta2=0.95,
+        adam_eps=1.0e-6,
+        clip_grad=100.0,
+    )
+    default_optimizer = fsdp2_optimizer.build_fsdp2_adamw(
+        [default_model],
+        OptimizerConfig(**optimizer_kwargs),
+        ParallelState(),
+        adamw_foreach=False,
+    )
+    explicit_adam_optimizer = fsdp2_optimizer.build_fsdp2_adamw(
+        [explicit_adam_model],
+        OptimizerConfig(optimizer_algorithm="adam", **optimizer_kwargs),
+        ParallelState(),
+        adamw_foreach=False,
+    )
+
+    for step, scale in enumerate((0.25, -0.5), start=1):
+        for default_param, explicit_adam_param in zip(
+            default_model.parameters(), explicit_adam_model.parameters(), strict=True
+        ):
+            grad = torch.full_like(default_param, scale * step)
+            default_param.grad = grad
+            explicit_adam_param.grad = grad.clone()
+        assert default_optimizer.step()[0]
+        assert explicit_adam_optimizer.step()[0]
+
+    for default_param, explicit_adam_param in zip(
+        default_model.parameters(), explicit_adam_model.parameters(), strict=True
+    ):
+        torch.testing.assert_close(default_param, explicit_adam_param, atol=0.0, rtol=0.0)
+        default_state = default_optimizer.optimizer.state[default_param]
+        explicit_adam_state = explicit_adam_optimizer.optimizer.state[explicit_adam_param]
+        for state_key in ("exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(
+                default_state[state_key], explicit_adam_state[state_key], atol=0.0, rtol=0.0
+            )
+        assert default_state["step"] == explicit_adam_state["step"]
 
 
 def test_fsdp2_shard_placement_prefers_first_divisible_dimension():
