@@ -15,6 +15,7 @@ from megatron.lite.primitive.optimizers.megatron_wrap import (
     _build_pg_collection,
     build_dist_opt_optimizer_config,
     build_dist_opt_stack,
+    build_dist_opt_training_optimizer,
     validate_dist_opt_config,
 )
 from megatron.lite.primitive.optimizers.muon_routing import tag_muon_parameter_metadata
@@ -100,6 +101,34 @@ def _install_fake_core_optimizer_config(
         sys.modules, "megatron.core.optimizer.optimizer_config", fake_module
     )
     return fake_core_config
+
+
+def test_dist_opt_training_optimizer_none_config_uses_canonical_adam_name(monkeypatch) -> None:
+    import megatron.lite.primitive.optimizers.megatron_wrap as wrap_module
+
+    captured = {}
+
+    def fake_build_dist_opt_stack(model_chunks, *, engine_cfg, **_kwargs):
+        captured["optimizer"] = engine_cfg.optimizer
+        return list(model_chunks), object()
+
+    monkeypatch.setattr(wrap_module, "build_dist_opt_stack", fake_build_dist_opt_stack)
+    model_chunks: list[nn.Module] = []
+    optimizer = build_dist_opt_training_optimizer(
+        model_chunks,
+        model_cfg=object(),
+        impl_cfg=SimpleNamespace(
+            optimizer_config=None,
+            parallel=SimpleNamespace(),
+        ),
+        ps=object(),
+        model_name="test",
+        deterministic=False,
+    )
+
+    assert optimizer is not None
+    assert captured["optimizer"].optimizer_algorithm == "adam"
+    assert not hasattr(captured["optimizer"], "optimizer")
 
 
 def test_central_routing_preserves_module_owned_optimizer_metadata() -> None:

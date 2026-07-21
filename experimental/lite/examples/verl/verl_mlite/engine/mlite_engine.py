@@ -682,7 +682,9 @@ class MegatronLiteEngine(BaseEngine):
 
     @staticmethod
     def _normalize_optimizer_name(config: OptimizerConfig) -> str:
-        optimizer_name = getattr(config, "optimizer_algorithm", "adam")
+        optimizer_name = getattr(config, "optimizer_algorithm", None)
+        if optimizer_name is None:
+            optimizer_name = getattr(config, "optimizer", "adam")
         lower = str(optimizer_name).lower()
         if "adam" in lower:
             return "adam"
