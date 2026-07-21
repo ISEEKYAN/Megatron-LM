@@ -275,6 +275,7 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             model_name=cfg.model_name,
             impl=cfg.impl,
             hf_path=cfg.hf_path,
+            seed=cfg.seed,
             parallel=parallel,
             optimizer=optimizer,
             load_hf_weights=not cfg.skip_load_hf_weights,
@@ -287,6 +288,7 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             raise ValueError(f"{cfg.backend} backend does not accept impl_cfg_json.")
         backend_cfg = BridgeConfig(
             model_name=cfg.model_name,
+            seed=cfg.seed,
             parallel=parallel,
             optimizer=optimizer,
             use_thd=cfg.use_thd,

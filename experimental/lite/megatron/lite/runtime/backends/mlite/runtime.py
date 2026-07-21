@@ -190,7 +190,7 @@ class MegatronLiteRuntime(RuntimeBase):
         if not dist.is_initialized():
             dist.init_process_group("nccl", timeout=timedelta(minutes=10))
         torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
-        torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed(rt_cfg.seed)
 
         # ── load model protocol module ──
         proto = self._load_protocol(rt_cfg)
