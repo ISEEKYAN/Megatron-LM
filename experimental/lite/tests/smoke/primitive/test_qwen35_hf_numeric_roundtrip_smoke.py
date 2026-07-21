@@ -21,8 +21,12 @@ wrong vs real HF would pass silently. This smoke closes that blind spot:
     both wrong vs forward semantics. Needs an 80GB GPU; loads only the first 8
     decoder layers to bound memory/time.
 
-Run single GPU:
+Run a small generated-checkpoint proxy on one GPU:
   torchrun --nproc_per_node=1 -m pytest tests/smoke/primitive/test_qwen35_hf_numeric_roundtrip_smoke.py
+
+Run the release-weight acceptance gate on 32 ranks (TP16, PP2):
+  QWEN35_HF_DIR=/path/to/Qwen3.5-35B-A3B QWEN35_TP=16 QWEN35_PP=2 \\
+  QWEN35_FULL_ROUNDTRIP=1 torchrun ... -m pytest ... -k real_hf_load_export
 """
 from __future__ import annotations
 
@@ -144,8 +148,6 @@ def test_qwen35_save_load_numeric_roundtrip(tmp_path):
     reason="set QWEN35_HF_DIR to a real Qwen3.5 HF checkpoint to run the ground-truth check.",
 )
 def test_qwen35_real_hf_load_export_matches_original(tmp_path):
-    if dist.get_world_size() != 1:
-        pytest.skip("ground-truth smoke runs single-rank (tp1).")
     import json
 
     from safetensors import safe_open
@@ -156,15 +158,21 @@ def test_qwen35_real_hf_load_export_matches_original(tmp_path):
 
     model_dir = os.environ["QWEN35_HF_DIR"]
     cfg = Qwen35Config.from_hf(model_dir)
-    n = min(8, cfg.num_hidden_layers)
-    cfg.num_hidden_layers = n
-    cfg.layer_types = cfg.layer_types[:n]
+    tp = int(os.environ.get("QWEN35_TP", "1"))
+    pp = int(os.environ.get("QWEN35_PP", "1"))
+    if dist.get_world_size() != tp * pp:
+        pytest.skip(f"requires WORLD_SIZE={tp * pp} for TP={tp}, PP={pp}.")
+    full_roundtrip = os.environ.get("QWEN35_FULL_ROUNDTRIP") == "1"
+    n = cfg.num_hidden_layers if full_roundtrip else min(8, cfg.num_hidden_layers)
+    if not full_roundtrip:
+        cfg.num_hidden_layers = n
+        cfg.layer_types = cfg.layer_types[:n]
     cfg.num_nextn_predict_layers = 0
     # Ensure both attention branches are actually exercised in the truncated model.
     assert "full_attention" in cfg.layer_types
     assert "linear_attention" in cfg.layer_types
 
-    parallel = ParallelConfig(tp=1, pp=1, cp=1, ep=1, etp=1, vpp=1)
+    parallel = ParallelConfig(tp=tp, pp=pp, cp=1, ep=1, etp=1, vpp=1)
     impl = protocol.ImplConfig(
         parallel=parallel, optimizer="dist_opt", use_deepep=False, deterministic=True
     )
@@ -175,20 +183,20 @@ def test_qwen35_real_hf_load_export_matches_original(tmp_path):
     os.makedirs(out_dir, exist_ok=True)
     protocol.save_hf_weights(bundle.chunks, out_dir, cfg, bundle.parallel_state)
 
-    orig_map = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))[
-        "weight_map"
-    ]
+    with open(os.path.join(model_dir, "model.safetensors.index.json")) as fh:
+        orig_map = json.load(fh)["weight_map"]
 
     def _orig(key):
         with safe_open(os.path.join(model_dir, orig_map[key]), framework="pt") as fh:
             return fh.get_tensor(key).float()
 
     exported = {}
-    for fn in os.listdir(out_dir):
-        if fn.endswith(".safetensors"):
-            with safe_open(os.path.join(out_dir, fn), framework="pt") as fh:
-                for key in fh.keys():
-                    exported[key] = fh.get_tensor(key).float()
+    if dist.get_rank() == 0:
+        for fn in os.listdir(out_dir):
+            if fn.endswith(".safetensors"):
+                with safe_open(os.path.join(out_dir, fn), framework="pt") as fh:
+                    for key in fh.keys():
+                        exported[key] = fh.get_tensor(key).float()
 
     # Derive the expected comparison set from the ORIGINAL weight map (not from
     # `exported`): otherwise a tensor the exporter silently drops would never be
@@ -211,14 +219,15 @@ def test_qwen35_real_hf_load_export_matches_original(tmp_path):
     }
     assert expected_keys, "no comparable tensors found in original weight map."
 
-    missing = expected_keys - set(exported)
-    assert not missing, "export missing tensors: " + ", ".join(sorted(missing))
+    if dist.get_rank() == 0:
+        missing = expected_keys - set(exported)
+        assert not missing, "export missing tensors: " + ", ".join(sorted(missing))
 
-    mism = []
-    for k in sorted(expected_keys):
-        o, e = _orig(k), exported[k]
-        if o.shape != e.shape:
-            mism.append(f"{k} shape {tuple(o.shape)} != {tuple(e.shape)}")
-        elif not torch.allclose(o, e, atol=2e-2, rtol=2e-2):  # bf16-cast export tolerance
-            mism.append(f"{k} max_abs_diff={(o - e).abs().max().item()}")
-    assert not mism, "lite export does not match original HF safetensors:\n" + "\n".join(mism)
+        mism = []
+        for k in sorted(expected_keys):
+            o, e = _orig(k), exported[k]
+            if o.shape != e.shape:
+                mism.append(f"{k} shape {tuple(o.shape)} != {tuple(e.shape)}")
+            elif not torch.allclose(o, e, atol=2e-2, rtol=2e-2):  # bf16-cast export tolerance
+                mism.append(f"{k} max_abs_diff={(o - e).abs().max().item()}")
+        assert not mism, "lite export does not match original HF safetensors:\n" + "\n".join(mism)
