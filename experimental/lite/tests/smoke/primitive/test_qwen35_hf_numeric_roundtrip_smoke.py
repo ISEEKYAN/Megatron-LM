@@ -24,8 +24,9 @@ wrong vs real HF would pass silently. This smoke closes that blind spot:
 Run a small generated-checkpoint proxy on one GPU:
   torchrun --nproc_per_node=1 -m pytest tests/smoke/primitive/test_qwen35_hf_numeric_roundtrip_smoke.py
 
-Run the release-weight acceptance gate on 32 ranks (TP16, PP2):
-  QWEN35_HF_DIR=/path/to/Qwen3.5-35B-A3B QWEN35_TP=16 QWEN35_PP=2 \\
+Run the release-weight acceptance gate on 32 ranks (TP2, CP8, EP8, PP2):
+  QWEN35_HF_DIR=/path/to/Qwen3.5-35B-A3B \\
+  QWEN35_TP=2 QWEN35_CP=8 QWEN35_EP=8 QWEN35_PP=2 \\
   QWEN35_FULL_ROUNDTRIP=1 torchrun ... -m pytest ... -k real_hf_load_export
 """
 from __future__ import annotations
@@ -159,9 +160,17 @@ def test_qwen35_real_hf_load_export_matches_original(tmp_path):
     model_dir = os.environ["QWEN35_HF_DIR"]
     cfg = Qwen35Config.from_hf(model_dir)
     tp = int(os.environ.get("QWEN35_TP", "1"))
+    cp = int(os.environ.get("QWEN35_CP", "1"))
+    ep = int(os.environ.get("QWEN35_EP", "1"))
     pp = int(os.environ.get("QWEN35_PP", "1"))
-    if dist.get_world_size() != tp * pp:
-        pytest.skip(f"requires WORLD_SIZE={tp * pp} for TP={tp}, PP={pp}.")
+    # EP overlays the dense TP×CP×PP topology: its process groups reshuffle
+    # the same ranks, rather than multiplying WORLD_SIZE.  Keep the topology
+    # explicit so the release check cannot silently fall back to EP/CP=1.
+    if dist.get_world_size() != tp * cp * pp:
+        pytest.skip(
+            f"requires WORLD_SIZE={tp * cp * pp} for TP={tp}, CP={cp}, PP={pp}."
+        )
+    assert cfg.num_experts % ep == 0, f"num_experts={cfg.num_experts} is not divisible by EP={ep}"
     full_roundtrip = os.environ.get("QWEN35_FULL_ROUNDTRIP") == "1"
     n = cfg.num_hidden_layers if full_roundtrip else min(8, cfg.num_hidden_layers)
     if not full_roundtrip:
@@ -172,7 +181,7 @@ def test_qwen35_real_hf_load_export_matches_original(tmp_path):
     assert "full_attention" in cfg.layer_types
     assert "linear_attention" in cfg.layer_types
 
-    parallel = ParallelConfig(tp=tp, pp=pp, cp=1, ep=1, etp=1, vpp=1)
+    parallel = ParallelConfig(tp=tp, pp=pp, cp=cp, ep=ep, etp=1, vpp=1)
     impl = protocol.ImplConfig(
         parallel=parallel, optimizer="dist_opt", use_deepep=False, deterministic=True
     )
