@@ -104,7 +104,7 @@ def _parallel_state() -> ParallelState:
 
 def _muon_opt(offload_fraction: float = 0.0) -> SimpleNamespace:
     return SimpleNamespace(
-        optimizer="muon",
+        optimizer_algorithm="muon",
         lr=1.0e-2,
         weight_decay=0.05,
         clip_grad=1.0,

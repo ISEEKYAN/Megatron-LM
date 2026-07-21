@@ -92,7 +92,7 @@ def _build_optimizer(model: nn.Module, ps: ParallelState, *, offload_fraction: f
     return build_fsdp2_adamw(
         [model],
         SimpleNamespace(
-            optimizer="adam",
+            optimizer_algorithm="adam",
             lr=1.0e-3,
             weight_decay=0.0,
             adam_beta1=0.9,
