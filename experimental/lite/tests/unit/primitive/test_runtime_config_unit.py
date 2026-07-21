@@ -26,7 +26,7 @@ def test_mlite_config_defaults_are_stable():
 
 @pytest.mark.parametrize(
     "precision",
-    ["bf16", "hopper_blockwise_bf16_weight"],
+    ["bf16", "hopper_blockwise_bf16_weight", "hopper_blockwise_fp8_weight"],
 )
 def test_mlite_config_round_trips_closed_precision_names(precision):
     direct = MegatronLiteConfig(model_name="qwen3_moe", precision=precision)
@@ -43,17 +43,6 @@ def test_mlite_config_rejects_unknown_precision_name_at_construction():
         MegatronLiteConfig(precision="blockwise")
     with pytest.raises(ValueError, match="hopper_blockwise_bf16_weight"):
         MegatronLiteConfig.from_dict("/models/qwen", {"precision": "fp8"})
-
-
-def test_mlite_config_rejects_reserved_unimplemented_fp8_weight_profile():
-    # The reserved FP8-weight profile is not sold as usable: selecting it fails
-    # loud at config construction rather than advertising a working profile.
-    with pytest.raises(NotImplementedError, match="not implemented"):
-        MegatronLiteConfig(precision="hopper_blockwise_fp8_weight")
-    with pytest.raises(NotImplementedError, match="not implemented"):
-        MegatronLiteConfig.from_dict(
-            "/models/qwen", {"precision": "hopper_blockwise_fp8_weight"}
-        )
 
 
 @pytest.mark.parametrize(

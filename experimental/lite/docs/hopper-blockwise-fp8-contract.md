@@ -211,16 +211,12 @@ optimizer master when MLite owns it.
 
 ## Public and Internal API Boundary
 
-The public runtime field is a string. Two values are currently usable; the
-third names the closed design's reserved second profile, which is not yet
-implemented and therefore fails loud (a `NotImplementedError`) rather than being
-sold as usable:
+The public runtime field is a string with exactly these three closed values:
 
 ```python
 MegatronLiteConfig(precision="bf16")
 MegatronLiteConfig(precision="hopper_blockwise_bf16_weight")
-# Reserved, not yet implemented -- raises NotImplementedError at resolution:
-# MegatronLiteConfig(precision="hopper_blockwise_fp8_weight")
+MegatronLiteConfig(precision="hopper_blockwise_fp8_weight")
 ```
 
 Internally, the precision package may share only the following narrow typed
@@ -344,7 +340,7 @@ model construction, or checkpoint load as indicated below.
 | Condition | Required failure |
 | --- | --- |
 | unknown profile or any ad-hoc recipe/format/target value | config error listing the accepted profile names |
-| reserved `hopper_blockwise_fp8_weight` (FP8 parameter storage) is requested | not-implemented error at resolution; the pending second profile is never sold as usable |
+| `hopper_blockwise_fp8_weight` (FP8 parameter storage) is requested | construct selected TE GEMMs under `quantized_model_init`; preserve the high-precision source for the single MLite FP32 master |
 | TE's `check_fp8_block_scaling_support()` reports no blockwise FP8 support | environment error before model allocation, quoting TE's reason and the recorded toolchain (device, TE, CUDA, cuBLAS) |
 | MoE-expert profile on cuBLAS below the grouped-GEMM requirement (`< CUBLAS_GROUPED_GEMM_MIN_VERSION`) | environment error before model allocation; the grouped path is gated instead of crashing inside `GroupedLinear` |
 | recipe differs, FP8 DPA/MHA is enabled, or scale/backward env overrides are set | environment/recipe mismatch error |
@@ -453,8 +449,8 @@ kernel path skipped.
 
 ### Phase 0: CPU and static contract
 
-- Parse and round-trip the two usable public names, and assert the reserved
-  `hopper_blockwise_fp8_weight` name fails loud (`NotImplementedError`).
+- Parse and round-trip all three public names, including the FP8-weight
+  profile's closed parameter contract.
 - Assert the exact recipe mapping and the `hopper_blockwise_bf16_weight`
   `ParameterContract` record with mocked TE capability results.
 - Reject every unsupported combination in the failure table.
