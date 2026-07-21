@@ -26,11 +26,6 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
-from verl_mlite.resync_export import (
-    offload_params_after_export,
-    resync_export_empty_cache_threshold_bytes,
-    stream_export_with_empty_cache,
-)
 
 try:
     # Recent VERL wraps per-step metric values in a Metric aggregator that
@@ -246,17 +241,6 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
         assert self._runtime_ctx is not None
         self._runtime_ctx.__exit__(exc_type, exc_val, exc_tb)
         super().__exit__(exc_type, exc_val, exc_tb)
-        # After a clean training pass (update_actor), hand the post-step residual
-        # (the backend's export all-gather scratch + parked optimizer state) back
-        # to the driver here, at the engine's own offload exit -- verl's fit loop
-        # runs this train context exit *before* it calls update_weights
-        # (rollout.resume(["weights"])), so the colocated vLLM weight wake no
-        # longer collides with the trainer's leftovers. Keeps the sharded weights
-        # resident as the export gather source. Backend-agnostic: the engine
-        # dispatches to the runtime by capability, so a backend with no scratch
-        # to release (e.g. fsdp2) runs the same exit as a no-op.
-        if self.mode == "train" and exc_type is None:
-            self.engine._release_train_scratch_before_resync()
         return False
 
 
@@ -405,31 +389,7 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
-        generator = self.runtime.export_weights(self.handle, **export_kwargs)
-        # Drain the export with a threshold-batched empty_cache so the allocator
-        # scratch the export stream frees is returned to the driver before the
-        # colocated vLLM wakes (avoids the resync wake_up OOM). Backend-agnostic:
-        # this only wraps the export generator with an empty_cache callback.
-        streamed = stream_export_with_empty_cache(
-            generator,
-            resync_export_empty_cache_threshold_bytes(),
-            lambda: aggressive_empty_cache(force_sync=True),
-        )
-        # Symmetric to the reload above (mirrors save_checkpoint / load_checkpoint):
-        # return the model to CPU and hard-drain once the caller has consumed the
-        # export, *before* the colocated vLLM wake_up. The colocated vLLM uses a
-        # separate (cumem) allocator on the same physical device; a model left
-        # resident (plus any export-peak residue) starves create_and_map
-        # (cumem_allocator.cpp) and OOMs on wake_up. This is a release-ordering
-        # collision, not a leak, so it applies to any offloaded backend -- the
-        # wrapper just defers the engine's own self.to(cpu) lifecycle.
-        if self.is_param_offload_enabled:
-            streamed = offload_params_after_export(
-                streamed,
-                lambda: self.to("cpu", model=True, optimizer=False, grad=False),
-                lambda: aggressive_empty_cache(force_sync=True),
-            )
-        return streamed, None
+        return self.runtime.export_weights(self.handle, **export_kwargs), None
 
     def get_data_parallel_size(self):
         if self.handle is None:
@@ -462,48 +422,7 @@ class MegatronLiteEngine(BaseEngine):
         self._require_initialized()
         if model or not (optimizer or grad):
             super().to(device=device, model=model, optimizer=optimizer, grad=grad)
-        # A training-side reload (gradient buffers requested) also restores any
-        # optimizer state parked on CPU by _release_train_scratch_before_resync,
-        # so the Adam moments return before the next optimizer step even when
-        # optimizer_offload is off. The export reload uses grad=False and leaves
-        # them parked through generation; the runtime reload is a no-op when
-        # nothing is parked.
-        reload_optimizer = optimizer or (device == "cuda" and grad)
-        self.runtime.to(self.handle, device, model=model, optimizer=reload_optimizer, grad=grad)
-
-    def _release_train_scratch_before_resync(self) -> None:
-        """Free the post-train-step residual before the colocated vLLM weight wake.
-
-        verl's ``update_weights`` wakes the sleeping vLLM weight pool
-        (``rollout.resume(tags=["weights"])``) *before* it exports the trained
-        weights. At that moment the trainer still holds the training step's
-        optimizer Adam moments and the backend's export all-gather scratch, which
-        collide with vLLM's cumem ``create_and_map`` (the resync wake OOM). The
-        post-export ``offload_params_after_export`` runs too late to help this
-        wake, so park the optimizer state on CPU and ask the runtime to hand the
-        backend's scratch back to the driver here, keeping the sharded weights
-        resident as the export gather source.
-
-        Backend-agnostic: the scratch release is dispatched through the runtime
-        by capability (``runtime.release_export_scratch``), so a backend with no
-        retained scratch -- e.g. fsdp2, whose per-parameter ``full_tensor`` gather
-        retains nothing -- runs this path as a no-op and needs no special-casing.
-
-        Called from ``_MegatronLiteModeCtx.__exit__`` on the training-mode context
-        exit -- the engine's own offload point at the end of ``update_actor`` --
-        so no verl-side hook is needed: the fit loop always runs this exit before
-        the subsequent ``update_weights`` wakes the rollout weight pool.
-
-        The optimizer park is reversible: gated on ``param_offload`` so the next
-        training-side reload (``to("cuda", ..., grad=True)``) is the guaranteed
-        restore point, and skipped when ``optimizer_offload`` already parks the
-        Adam moments at the train-step exit.
-        """
-        self._require_initialized()
-        if self.is_param_offload_enabled and not self.is_optimizer_offload_enabled:
-            self.to("cpu", model=False, optimizer=True, grad=False)
-        self.runtime.release_export_scratch(self.handle)
-        aggressive_empty_cache(force_sync=True)
+        self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
 
     def save_checkpoint(
         self,
@@ -697,7 +616,7 @@ class MegatronLiteEngine(BaseEngine):
         impl_cfg["use_thd"] = True
         cross_entropy_fusion = getattr(self.engine_config, "cross_entropy_fusion", None)
         if cross_entropy_fusion is None:
-            cross_entropy_fusion = getattr(self.model_config, "use_fused_kernels", False)
+            cross_entropy_fusion = getattr(self.engine_config, "use_fused_kernels", False)
         impl_cfg.setdefault("cross_entropy_fusion", bool(cross_entropy_fusion))
         mtp_cfg = getattr(self.model_config, "mtp", None)
         if mtp_cfg is not None:

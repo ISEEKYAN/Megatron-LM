@@ -6,7 +6,6 @@ from __future__ import annotations
 import gc
 import os
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack
 from dataclasses import fields as dc_fields
 from datetime import timedelta
 from itertools import chain
@@ -358,40 +357,14 @@ class MegatronLiteRuntime(RuntimeBase):
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
 
-        with ExitStack() as stack:
+        if proto and hasattr(proto, "export_hf_weights"):
+            yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
+        else:
             for chunk in model_chunks:
-                # Duck-typed: a wrapper that must scope its export all-gather
-                # storage to the export (so the buffers are handed back to the
-                # driver on exit) exposes ``full_parameter_context``. Backends
-                # without it (no export-scoped scratch) skip this entirely.
-                full_parameter_context = getattr(chunk, "full_parameter_context", None)
-                if callable(full_parameter_context):
-                    stack.enter_context(full_parameter_context())
-
-            if proto and hasattr(proto, "export_hf_weights"):
-                yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
-            else:
-                for chunk in model_chunks:
-                    # Prefer the wrapper's bounded per-bucket stream when it
-                    # exposes ``stream_full_parameters`` (the mfsdp backend) so the
-                    # raw-param fallback does not pre-materialize the whole model;
-                    # otherwise emit named_parameters directly.
-                    streamer = getattr(chunk, "stream_full_parameters", None)
-                    if callable(streamer):
-                        yield from streamer()
-                    else:
-                        yield from chunk.named_parameters()
+                yield from chunk.named_parameters()
 
     def release_export_scratch(self, handle: ModelHandle) -> None:
-        """Reclaim a backend's export all-gather scratch before a colocated wake.
-
-        Duck-typed capability dispatch: loops the model chunks and asks any
-        wrapper that exposes ``release_export_scratch`` to hand its retained
-        scratch back to the driver while keeping the sharded weights resident
-        (the export gather source that runs right after the vLLM weight wake).
-        No-op for chunks without the hook (e.g. fsdp2, which retains no scratch),
-        so the verl engine can call this unconditionally regardless of backend.
-        """
+        """Release retained full-parameter scratch before colocated rollout wake."""
         model_chunks = handle._extras.get("model_chunks", [handle._model])
         for chunk in model_chunks:
             release = getattr(chunk, "release_export_scratch", None)

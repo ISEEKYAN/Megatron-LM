@@ -3,9 +3,7 @@
 
 from __future__ import annotations
 
-import sys
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -199,9 +197,7 @@ class MegatronFSDP(nn.Module):
         views -- on top of the sharded weights and optimizer state, and vLLM's
         cumem ``create_and_map`` OOMs. Hand that scratch back to the driver
         (keeping the sharded weights resident as the export gather source) and
-        drain the caching allocator so the wake has room. This is the pre-wake
-        counterpart to ``full_parameter_context``'s post-export
-        ``release_cached_buffers``.
+        drain the caching allocator so the wake has room.
         """
         self.param_sync.release_scratch_keep_weights()
         if torch.cuda.is_available():
@@ -245,48 +241,6 @@ class MegatronFSDP(nn.Module):
         for name, param in self.module.named_parameters():
             if name not in covered:
                 yield name, param
-
-    @contextmanager
-    def full_parameter_context(self):
-        """Scope a full-parameter export; parameters materialize on demand.
-
-        Historically this all-gathered the whole model up front
-        (``materialize_all``), producing a transient full-model peak. Export
-        consumers now stream via ``stream_full_parameters`` (bounded to a single
-        bucket), so this context no longer pre-materializes; it only guarantees
-        the export all-gather storage is scoped to the export and handed back to
-        the driver on exit. A consumer that still reads ``named_parameters``
-        directly (rather than streaming) transparently falls back to the
-        wrapper's own ``materialize_all`` there, so correctness is unchanged.
-        """
-        # The try/finally still wraps the whole body so any partial
-        # materialization performed by the consumer routes through
-        # release_cached_buffers below (which reclaims the persistent
-        # double-buffer slots a colocated vLLM wake_up needs handed back).
-        try:
-            yield
-        finally:
-            self.param_sync.release_all()
-            self.param_sync.discard_full_parameter_views()
-            # If the export scope is unwinding because the consumer raised (e.g.
-            # a downstream OOM), a collective may have been left mid-flight; force
-            # the cached-buffer release so its busy-buffer guard does not replace
-            # the primary exception with a spurious "active buffers" RuntimeError.
-            unwinding = sys.exc_info()[0] is not None
-            # Scope the export all-gather storage to this context. A
-            # full-parameter export materializes the whole (unsharded) model;
-            # under fsdp_double_buffer those all-gather buffers otherwise stay
-            # pinned in the allocator's persistent slots after release_all, so
-            # torch's caching allocator (and empty_cache / expandable_segments)
-            # can never hand that storage back to the driver -- it lives across
-            # the next colocated consumer's turn (e.g. a sleeping vLLM engine
-            # waking for RL weight resync) and starves it. That persistent
-            # cross-context retention is the resync-OOM bug; the export buffer's
-            # lifetime must end with the export. Returning the cached slots to
-            # the driver here makes the export release bounded like FSDP2's
-            # full_tensor path (which retains no persistent buffer); the slots
-            # are transparently re-allocated on the next export.
-            self.param_sync.release_cached_buffers(force=unwinding)
 
     def named_parameters(self, *args, **kwargs) -> Iterator[tuple[str, nn.Parameter]]:
         if not self._expose_sharded_parameters:

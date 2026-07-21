@@ -1126,37 +1126,6 @@ class CommunicationPipelines:
         for bucket in self.buckets:
             bucket.discard_full_parameter_views()
 
-    def release_cached_buffers(self, *, force: bool = False) -> None:
-        """Return retained double-buffer all-gather storage to the driver.
-
-        ``release_all`` only drops the pipeline's own references to the
-        full-parameter buffers. Under ``fsdp_double_buffer`` (the default) the
-        buffers stay pinned in ``DoubleBufferAllocator``'s persistent slots so
-        they can be reused across the many acquire/release cycles of a training
-        step -- torch's caching allocator (hence ``empty_cache`` and
-        ``expandable_segments``) can never return that storage to the driver
-        while a slot still references it. That reuse is desirable during
-        training but wrong after a *full-parameter export*: a colocated consumer
-        (e.g. a sleeping vLLM engine that must ``wake_up``) needs the
-        full-model-sized storage handed back to the driver. Dropping the cached
-        slots here makes the export release bounded -- matching FSDP2's
-        ``full_tensor`` path, which retains no persistent buffer. The slots are
-        transparently re-allocated on the next ``materialize``.
-
-        On the normal path this is called after ``release_all`` has drained
-        every lease, so no buffer is in flight and the allocator's busy check
-        passes. ``force=True`` (used when the export scope unwinds because of an
-        exception) bypasses that check so an aborted-collective busy slot does
-        not mask the primary error with a spurious "active buffers" raise.
-        """
-        seen: set[int] = set()
-        for bucket in self.buckets:
-            allocator = bucket.allocator
-            if id(allocator) in seen:
-                continue
-            seen.add(id(allocator))
-            allocator.release_cached(force=force)
-
     def move_model_state(self, device: torch.device, *, load_grad: bool) -> None:
         device = torch.device(device)
         for bucket in self.buckets:
