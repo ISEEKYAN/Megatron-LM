@@ -33,6 +33,9 @@ class MegatronLiteConfig:
     model_name: str = "auto"
     impl: str = "lite"
     hf_path: str = ""
+    # Match the bridge runtime's model-parallel initialization seed.  The
+    # benchmark session uses the same value for its synthetic packed stream.
+    seed: int = 42
 
     # ── parallelism and optimizer ──
     parallel: ParallelConfig = field(default_factory=ParallelConfig)

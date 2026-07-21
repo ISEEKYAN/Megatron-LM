@@ -49,6 +49,27 @@ The dry-run output is JSON containing the resolved `RuntimeConfig` and session
 settings. Use it to confirm the two backend runs differ only on the intended
 axis.
 
+## Shared 8-GPU Muon Contract
+
+`full_parallel_contract.py` is the config-only gate shared by the Megatron,
+MLite DistOpt, and MLite FSDP2 Muon comparison arms.  It fixes the real
+`Qwen3.5-35B-A3B` model, BF16, model-initialization/data seed (1234), synthetic
+packed input order, tokens, scheduler horizon, and every Muon option.  Its primary topology is
+`TP2 x PP2 x EP2 x CP1 = 8` (DP=1).  CP remains an explicit `CP1` field; using
+CP2 as well as TP2/PP2/EP2 would require 16 ranks.
+
+This command invokes all three actual runtime config constructors but does not
+initialize distributed state or GPUs:
+
+```bash
+PYTHONPATH=experimental/lite:$PYTHONPATH \
+python experimental/lite/examples/bench/full_parallel_contract.py \
+  --hf-path /models/Qwen3.5-35B-A3B
+```
+
+The GPU precision and performance jobs must consume this contract rather than
+repeat their own flags.
+
 ## Pair Script
 
 ```bash
