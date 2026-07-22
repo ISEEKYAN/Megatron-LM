@@ -4,10 +4,12 @@ Two deliverables:
 
 1. **A/B loss trajectory** (`adamw` vs `muon`/dist_opt) on a real Qwen3-30B-A3B verl-SFT
    workload — bayan's "muon must be no worse than AdamW" criterion.
-2. **Megatron-native vs DistOpt-mlite Muon = construction identity, numerically
-   proven** — a real `torch.equal` receipt (job 14243791), replacing the earlier
-   prose-only "bitwise by construction" claim that the moe panel correctly rejected
-   as fabricated evidence (C-BITWISE-REDEFINED).
+2. **Megatron-native vs DistOpt-mlite Muon = construction identity, proven on REAL
+   multi-GPU (TP=2) distributed Newton-Schulz** — a `torch.equal` receipt under a live
+   TP process group (job 14245178, 2×H100). This replaces both the prose-only "bitwise
+   by construction" claim and the earlier *single-process* (`pg_collection=None`, job
+   14243791) receipt that the moe panel correctly rejected as not exercising the real
+   distributed path (C-BITWISE-REDEFINED / "not really multi-GPU").
 
 The **FSDP2 Muon arm is deferred** to TASK-1.13.5.5.6 (the emerging_optimizers rewrite):
 its current `newton_schulz_orthogonalize` is the hand-rolled version bayan directed us
@@ -49,44 +51,59 @@ runs the *true* cross-TP Newton-Schulz (`muon_tp_mode=distributed`, confirmed in
 live mcore `OptimizerConfig` dump) on Qwen3-30B-A3B at TP2 — 20 clean steps, no
 divergence.
 
-## 2. Megatron-native vs DistOpt-mlite = construction identity (torch.equal receipt)
+## 2. Megatron-native vs DistOpt-mlite = construction identity on REAL TP=2 distributed NS
 
-**Job 14243791** (`cpu_short`, in-container, `COMPLETED` rc=0:0, 35 s),
-`megatron_vs_distopt_identity.py`.
+**Job 14245178** (2×H100, 1 node, `COMPLETED` rc=0:0, 1:11),
+`tp_distributed_muon_identity.py` under `torchrun --nproc_per_node=2`.
 
 MLite's DistOpt Muon is **not a second implementation** of Megatron Muon. It lowers,
 through `build_dist_opt_optimizer_config`, into Megatron-Core's own
 `TensorParallelMuon` (`megatron/core/optimizer/emerging_optimizers.py`). There is no
-independent Megatron binary to diff — so this is a **construction identity**, and we
-prove it *numerically*, not by assertion:
+independent Megatron binary to diff — so this is a **construction identity**. Prior
+receipts proved it only in a single process (`pg_collection=None` → *local* NS), which
+the moe panel rejected as not testing multi-GPU. This receipt proves it on a **real TP
+process group**: `pg_collection.tp` is a live 2-rank NCCL `ProcessGroup`,
+`tp_mode="distributed"`, so orthogonalization runs genuine cross-rank `all_reduce`s
+inside `newton_schulz_tp`, on TP-sharded weights across 2 GPUs.
 
 ```
-[a] CONFIG_IDENTITY fields_checked=14 diffs=[]
-[a] CONFIG_IDENTITY_OK all fields equal (MLite lowering == native Megatron config)
-[b] UPDATE_IDENTITY torch.equal=True max_abs_delta=0.000e+00 weight_shape=(64, 48) steps=5
-[b] UPDATE_IDENTITY_OK final weights bit-identical (torch.equal)
-[c] NEG_CONTROL(num_ns_steps+1) torch.equal=False max_abs_delta=4.494e-05
-[c] NEG_CONTROL_OK update torch.equal is sensitive (perturbation -> nonzero delta)
+[env] world=2 tp_size=2 weight=(64,48) steps=5 tp_mode=distributed
+[A] CONFIG_IDENTITY fields_checked=14 OK diffs=[]
+[B] rank=0 shard_rows=(0, 32) torch.equal=True max_abs=0.000e+00
+[B] rank=1 shard_rows=(32, 64) torch.equal=True max_abs=0.000e+00
+[B] DISTRIBUTED_UPDATE_IDENTITY all_ranks_equal=True global_max_abs=0.000e+00 (real TP=2 distributed NS)
+[C1] DIST_vs_FULLREF max_abs=0.000e+00 tol=1e-04 OK (distributed == full-matrix NS within fp tol)
+[C2] NOPG_LOCAL_vs_FULLREF max_abs=7.281e-02 ratio_vs_dist=7.3e10x OK (pg=None diverges hugely -> cross-rank all_reduce genuinely mattered)
+[D] NEG_CONTROL(num_ns_steps+1) global_max_abs=4.470e-05 OK (torch.equal is sensitive)
 RESULT PASS
 ```
 
-- **(a) Config identity** — the Megatron-Core `OptimizerConfig` produced by the MLite
-  lowering (path A) is field-for-field equal to a hand-built native Megatron
-  `OptimizerConfig` (path B) across all 14 identity fields (every `muon_*` knob +
-  lr/weight_decay/clip). This is the regression guard the `muon_tp_mode` propagation
-  fix is about: had the lowering dropped any `muon_*` field, A ≠ B here.
-- **(b) Update identity (`torch.equal`)** — Megatron-Core's *native* `TensorParallelMuon`
-  is built from BOTH configs (via Megatron's own `_kwargs_from_config` mapper) and
-  stepped 5× on identical seeded params+grads. Final weights are **bit-identical**
-  (`torch.equal=True`, `max_abs_delta=0.0`). The MLite lowering perturbs the Megatron
-  Muon update by exactly zero.
-- **(c) Negative control** — perturbing `num_ns_steps` by 1 yields
-  `torch.equal=False`, `max_abs_delta=4.5e-5`, proving the (b) check is *sensitive*,
-  not a vacuous pass.
+- **(A) Config identity** — the mcore `OptimizerConfig` from the MLite lowering (path A)
+  is field-for-field equal to a hand-built native Megatron `OptimizerConfig` (path B)
+  across all 14 identity fields (every `muon_*` knob + lr/weight_decay/clip). Regression
+  guard for the `muon_tp_mode` propagation fix: had the lowering dropped a field, A ≠ B.
+- **(B) Distributed update identity (`torch.equal`)** — two *separate* native
+  `TensorParallelMuon` instances, one from config A and one from config B, **share the
+  same live TP process group** and step 5× on identical TP-sharded seeded params+grads.
+  On BOTH ranks the local shards are **bit-identical** (`torch.equal=True`,
+  all-reduced `global_max_abs=0.0`). This is measured *after real cross-rank
+  all_reduces on 2 GPUs* — not a single-process vacuity.
+- **(C) "Distributed is real"** — (C1) the distributed sharded result, gathered, equals
+  the single-process full-matrix NS reference (`max_abs=0.0`); (C2) running the *same*
+  sharded params with `pg_collection=None` (each rank orthogonalizes only its own shard,
+  no cross-rank) diverges from that reference by `7.3e10×` at the update level
+  (lr=1, wd=0, correlated row-blocks). So `pg=None` is a demonstrably *different, wrong*
+  computation — which is exactly why the pg≠None run in (B) is doing real distributed
+  work. This directly rebuts the rejected `pg_collection=None` shortcut.
+- **(D) Negative control** — perturbing `num_ns_steps` by 1 yields
+  `global_max_abs=4.5e-5`, proving (B)'s `torch.equal` is *sensitive*, not vacuous.
 
-**This is an honest construction-identity receipt, not a bitwise diff of two independent
-lowerings.** The only genuinely independent lowering (FSDP2 Muon) is deferred to
-TASK-1.13.5.5.6 and is not exercised here (per bayan 05:29/05:45).
+**Honest scope.** Because MLite dist_opt *is* emerging_optimizers (there is no second
+independent binary), `max_abs=0.0` is the *correct and expected* result — this is a
+construction identity proven numerically under real multi-GPU distributed Newton-Schulz,
+NOT a bitwise diff of two independent lowerings. The only genuinely independent lowering
+(FSDP2 Muon) is deferred to TASK-1.13.5.5.6 and is not exercised here (per bayan
+05:29/05:45/06:58).
 
 ## Correctness fix carried & proven: `muon_tp_mode` propagation
 
@@ -96,8 +113,9 @@ field**, so mcore fell back to its default `muon_tp_mode="blockwise"` (per-shard
 NS) — silently degrading a requested `distributed`. Fixed to forward all ten `muon_*`
 fields for muon. Proven three ways: 0-GPU init-chain gate (`requested=distributed →
 core=distributed`); live on GPU (job 14242992 mcore dump shows
-`muon_tp_mode='distributed'`); and the config-identity receipt above (job 14243791,
-part (a) — all `muon_*` fields survive the lowering).
+`muon_tp_mode='distributed'`); and the config-identity receipt above (job 14245178,
+part (A) — all `muon_*` fields survive the lowering, and part (B)/(C) confirm the
+`distributed` mode actually drives cross-rank Newton-Schulz on TP=2).
 
 ## Integration finding: CPU-offload `hybrid_optimizer` ⊥ distributed Muon
 

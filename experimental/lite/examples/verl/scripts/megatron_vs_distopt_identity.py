@@ -1,5 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Megatron-native Muon vs DistOpt-mlite Muon: real numerical identity receipt (AC#3(a)).
+"""SUPERSEDED single-process identity check — kept for provenance only.
+
+>>> This script runs in ONE process with `pg_collection=None` (local Newton-Schulz).
+>>> The moe panel correctly rejected that as not exercising the REAL distributed path.
+>>> The admissible receipt is now `tp_distributed_muon_identity.py`, which proves the
+>>> same construction identity under a live TP=2 process group with cross-rank
+>>> all_reduce (job 14245178). Prefer that; this file is NOT the evidence of record.
+
+Megatron-native Muon vs DistOpt-mlite Muon: real numerical identity receipt (AC#3(a)).
 
 Context (moe BLOCKER C-BITWISE-REDEFINED): the earlier delivery asserted a
 "bitwise by construction" verdict from prose alone ("same get_megatron_optimizer

@@ -1,8 +1,8 @@
 # Muon precision harness (real workload)
 
 Verifies MLite's **DistOpt Muon** — the A/B loss trajectory vs AdamW, and the
-Megatron-native-vs-DistOpt construction identity (`torch.equal` receipt) — on a real
-Qwen3-30B-A3B verl-SFT workload, on ≤8 H100 (CW). (The FSDP2 Muon arm is deferred to
+Megatron-native-vs-DistOpt construction identity (`torch.equal` receipt on real TP=2
+distributed Newton-Schulz) — on a real Qwen3-30B-A3B verl-SFT workload, on ≤8 H100 (CW). (The FSDP2 Muon arm is deferred to
 TASK-1.13.5.5.6; see verdicts below.) Uses the ready-made verl SFT launcher
 (`run_qwen3moe_sft.sh`) — no custom TP×PP×EP×CP harness — per the authoritative task
 guide.
@@ -36,14 +36,18 @@ is the hand-rolled version bayan directed us not to validate against. No FSDP2 p
 Verdicts:
 - **A/B (bayan's criterion): Muon must be no worse than AdamW** on the loss
   trajectory. Evidence = per-step JSONL loss from each GPU run.
-- **Megatron-native vs DistOpt-mlite = construction identity, numerically proven.**
-  MLite's dist_opt Muon lowers (via `build_dist_opt_optimizer_config`) into
-  Megatron-Core's own `TensorParallelMuon` — there is no independent Megatron binary to
-  diff. This is a *construction identity*, proven with a real `torch.equal` receipt (job
-  14243791, `megatron_vs_distopt_identity.py`): config field-identity (14 fields) +
-  native-`TensorParallelMuon` update `torch.equal` (max_abs=0.0 over 5 steps) +
-  sensitivity negative control. **Not** a bitwise diff of two independent lowerings; see
-  `three_arm_precision_RESULTS.md` §2.
+- **Megatron-native vs DistOpt-mlite = construction identity, proven on REAL TP=2
+  distributed Newton-Schulz.** MLite's dist_opt Muon lowers (via
+  `build_dist_opt_optimizer_config`) into Megatron-Core's own `TensorParallelMuon` —
+  there is no independent Megatron binary to diff. This is a *construction identity*,
+  proven with a `torch.equal` receipt under a **live 2-rank TP process group** (job
+  14245178, `tp_distributed_muon_identity.py`, 2×H100): config field-identity (14
+  fields) + cross-rank distributed update `torch.equal` (`all_ranks_equal`,
+  `global_max_abs=0.0` over 5 steps) + "distributed-is-real" control (pg=None diverges
+  7.3e10× at the update level) + sensitivity negative control. This supersedes the
+  earlier single-process (`pg_collection=None`) receipt (job 14243791,
+  `megatron_vs_distopt_identity.py`) the moe rejected as not multi-GPU. **Not** a bitwise
+  diff of two independent lowerings; see `three_arm_precision_RESULTS.md` §2.
 
 ## Correctness fix carried by this harness: `muon_tp_mode` propagation
 
