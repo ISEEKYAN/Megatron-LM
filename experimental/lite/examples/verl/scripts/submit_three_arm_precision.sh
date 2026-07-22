@@ -20,10 +20,20 @@ MLITE_REMOTE="${MLITE_REMOTE:-https://github.com/ISEEKYAN/Megatron-LM.git}"
 MEGATRON_ROOT="${MEGATRON_ROOT:-$BASE/runtime/ds4-csacp-parity-eaa5b486d/mcore}"
 IMG="${IMG:-$BASE/verl_optimize/verl.vllm023.sqsh}"
 VERL="${VERL:-$BASE/verl-main-latest}"
-MODEL_PATH="${MODEL_PATH:-/lustre/fsw/portfolios/coreai/users/bayan/code/models/Qwen3.5-35B-A3B}"
+# emerging_optimizers (Newton-Schulz kernels) for the dist_opt muon arm; the
+# container does not ship it (pip --target install staged on lustre).  Not needed
+# by the fsdp2 muon arm (self-contained) but harmless to thread through.
+EMERGING_OPT_SITE="${EMERGING_OPT_SITE:-$RUN_ROOT/emerging-opt-site-nodeps}"
+# Qwen3-30B-A3B (original Qwen3 MoE, model_type=qwen3_moe): standard attention,
+# NO GatedDeltaNet -> packed-THD needs no FLA causal conv (unlike Qwen3.5-35B-A3B).
+# This is the faithful FLA-free "non-3.5 Qwen3" proxy; muon three-arm parity is
+# model-agnostic (bayan redirect 2026-07-22).
+MODEL_PATH="${MODEL_PATH:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/models/Qwen3-30B-A3B}"
 DATA_DIR="${DATA_DIR:-$RUN_ROOT/data/gsm8k_sft}"
 TRAIN_FILES="${TRAIN_FILES:-$DATA_DIR/train.parquet}"
-ARMS="${ARMS:-adamw muon}"
+# Three arms: adamw (dist_opt baseline), muon (dist_opt distributed NS =
+# Megatron TensorParallel Muon), muon_fsdp2 (independent FSDP2 Muon lowering).
+ARMS="${ARMS:-adamw muon muon_fsdp2}"
 SBATCH="${SBATCH:-three_arm_precision_sft.sbatch}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -L)"
@@ -42,15 +52,15 @@ echo "[stage] mlite at $(git -C "$MLITE_REPO" rev-parse HEAD)"
 echo "===================== CONFIG DRY-RUN GATE ====================="
 echo "NOTE: proves each arm resolves the intended optimizer wiring."
 echo "      NOT a precision result; precision comes from GPU JSONL loss."
-for arm in adamw muon muon_local; do
+for arm in adamw muon muon_fsdp2; do
   case "$arm" in
-    adamw) oa=adamw; tp=distributed;;
-    muon) oa=muon; tp=distributed;;
-    muon_local) oa=muon; tp=blockwise;;
+    adamw) oa=adamw; tp=distributed; be=dist_opt;;
+    muon) oa=muon; tp=distributed; be=dist_opt;;
+    muon_fsdp2) oa=muon; tp=distributed; be=fsdp2;;
   esac
-  echo "----- arm=$arm -> optimizer_algorithm=$oa muon_tp_mode=$tp -----"
+  echo "----- arm=$arm -> optimizer_algorithm=$oa muon_tp_mode=$tp backend=$be -----"
   OUTPUT_ROOT="$(mktemp -d)" MODEL_PATH="$MODEL_PATH" TRAIN_FILES="$TRAIN_FILES" \
-    OPTIMIZER_ALGORITHM="$oa" MUON_TP_MODE="$tp" MLITE_OPTIMIZER_BACKEND=dist_opt \
+    OPTIMIZER_ALGORITHM="$oa" MUON_TP_MODE="$tp" MLITE_OPTIMIZER_BACKEND="$be" \
     DRY_RUN=1 bash "$SCRIPT_DIR/run_qwen3moe_sft.sh" \
     | tr ' ' '\n' | grep -E 'optim\.optimizer=|muon_tp_mode=|impl_cfg\.optimizer=' || true
 done
@@ -70,15 +80,31 @@ srun -A coreai_devtech_all -p cpu_short --nodes=1 --ntasks=1 --time=00:15:00 \
     export PYTHONPATH="/vllm:$MLITE_LITE/examples/verl:$MLITE_LITE:$VERL:$MEGATRON_ROOT"
     python3 - <<PY
 import megatron.core, megatron.lite
-from megatron.core.optimizer.muon import get_megatron_muon_optimizer
+from megatron.core.optimizer.muon import get_megatron_muon_optimizer  # noqa
+from megatron.core.optimizer.optimizer_config import OptimizerConfig as CoreOptimizerConfig
 from megatron.lite.runtime.contracts.config import OptimizerConfig
+from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_optimizer_config
 import verl_mlite.engine.mlite_engine  # noqa
 print("INIT_GATE core=", megatron.core.__file__)
-for arm,(oa,tp) in {"adamw":("adamw","distributed"),"muon":("muon","distributed"),"muon_local":("muon","blockwise")}.items():
+# 1) runtime-contract config carries the requested muon_tp_mode.
+for arm,(oa,tp,be) in {"adamw":("adamw","distributed","dist_opt"),
+                       "muon":("muon","distributed","dist_opt"),
+                       "muon_fsdp2":("muon","distributed","fsdp2")}.items():
     c = OptimizerConfig(optimizer=oa, muon_tp_mode=tp)
     assert c.optimizer_algorithm==oa, (arm,c.optimizer_algorithm)
     assert c.muon_tp_mode==tp, (arm,c.muon_tp_mode)
-    print(f"INIT_GATE_ARM_OK arm={arm} optimizer_algorithm={c.optimizer_algorithm} muon_tp_mode={c.muon_tp_mode}")
+    print(f"INIT_GATE_ARM_OK arm={arm} optimizer_algorithm={c.optimizer_algorithm} muon_tp_mode={c.muon_tp_mode} backend={be}")
+# 2) PROPAGATION FIX: the dist_opt lowering must forward muon_tp_mode into the
+#    Megatron-Core CoreOptimizerConfig (previously dropped -> silent blockwise).
+for tp in ("distributed","blockwise"):
+    rc = OptimizerConfig(optimizer="muon", muon_tp_mode=tp, lr=1e-5, weight_decay=0.1, clip_grad=1.0)
+    core = build_dist_opt_optimizer_config(rc)
+    assert core.optimizer=="muon", core.optimizer
+    assert core.muon_tp_mode==tp, f"PROPAGATION BUG: requested {tp}, core has {core.muon_tp_mode}"
+    print(f"INIT_GATE_PROPAGATION_OK requested_muon_tp_mode={tp} core_muon_tp_mode={core.muon_tp_mode}")
+# adam must NOT carry a muon_tp_mode override past default (harmless but checked).
+core_adam = build_dist_opt_optimizer_config(OptimizerConfig(optimizer="adamw", lr=1e-5, weight_decay=0.1, clip_grad=1.0))
+assert core_adam.optimizer in ("adam","adamw"), core_adam.optimizer
 print("INIT_GATE_OK")
 PY
   '
@@ -102,7 +128,7 @@ fi
 for arm in $ARMS; do
   out="$RUN_ROOT/logs/%x_%j_${arm}.out"
   jid=$(sbatch --parsable --output="$out" \
-    --export=ALL,ARM="$arm",BASE="$BASE",IMG="$IMG",MLITE_REPO="$MLITE_REPO",MEGATRON_ROOT="$MEGATRON_ROOT",VERL="$VERL",MODEL_PATH="$MODEL_PATH",RUN_ROOT="$RUN_ROOT",TRAIN_FILES="$TRAIN_FILES" \
+    --export=ALL,ARM="$arm",BASE="$BASE",IMG="$IMG",MLITE_REPO="$MLITE_REPO",MEGATRON_ROOT="$MEGATRON_ROOT",VERL="$VERL",MODEL_PATH="$MODEL_PATH",RUN_ROOT="$RUN_ROOT",TRAIN_FILES="$TRAIN_FILES",EMERGING_OPT_SITE="$EMERGING_OPT_SITE" \
     "$SCRIPT_DIR/$SBATCH")
   echo "SUBMITTED arm=$arm job=$jid -> $RUN_ROOT/logs (${out})"
 done

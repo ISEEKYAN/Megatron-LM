@@ -100,6 +100,28 @@ def build_dist_opt_optimizer_config(
         args["use_precision_aware_optimizer"] = opt.use_precision_aware_optimizer
     if getattr(opt, "decoupled_weight_decay", None) is not None:
         args["decoupled_weight_decay"] = opt.decoupled_weight_decay
+    # Muon contract: Megatron-Core's CoreOptimizerConfig owns the Muon knobs
+    # (muon_tp_mode, muon_momentum, ...) with their own defaults. The runtime
+    # contract config carries the caller's values, but they are NOT forwarded
+    # unless we copy them here -- otherwise mcore silently falls back to its
+    # default muon_tp_mode="blockwise" (the per-shard local Newton-Schulz
+    # approximation), degrading `muon_tp_mode=distributed` back to local NS.
+    if optimizer_algorithm == "muon":
+        for field in (
+            "muon_momentum",
+            "muon_split_qkv",
+            "muon_nesterov",
+            "muon_scale_mode",
+            "muon_fp32_matmul_prec",
+            "muon_coefficient_type",
+            "muon_num_ns_steps",
+            "muon_tp_mode",
+            "muon_extra_scale_factor",
+            "muon_scalar_optimizer",
+        ):
+            value = getattr(opt, field, None)
+            if value is not None:
+                args[field] = value
     if override_optimizer_config:
         overrides = dict(override_optimizer_config)
         declared_algorithm = overrides.pop("optimizer_algorithm", optimizer_algorithm)

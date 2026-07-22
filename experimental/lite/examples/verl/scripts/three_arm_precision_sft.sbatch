@@ -13,23 +13,34 @@ set -euo pipefail
 # =============================================================================
 # Three-arm precision harness for Muon on a REAL workload (AC#3).
 #
-# One SBATCH invocation runs exactly one ARM of a fixed same-contract Qwen3.5-35B
-# SFT run so that loss trajectories / weights can be compared across arms:
+# One SBATCH invocation runs exactly one ARM of a fixed same-contract Qwen3-30B-A3B
+# SFT run so that loss trajectories / weights can be compared across arms.
 #
-#   ARM=adamw   -> optimizer_algorithm=adamw, MLite dist_opt backend  (A/B baseline)
-#   ARM=muon    -> optimizer_algorithm=muon,  muon_tp_mode=distributed (DistOpt Muon
-#                  doing the *true* cross-TP Newton-Schulz, TP>1; this is the primary
-#                  DistOpt Muon arm bayan asked to verify on a real workload)
-#   ARM=muon_local -> optimizer_algorithm=muon, muon_tp_mode=blockwise (the per-shard
-#                  local NS approximation; blockwise is aliased to `duplicated` inside
-#                  megatron.core.optimizer.emerging_optimizers, i.e. NOT distributed).
-#                  Kept as a contrast arm so the distributed path is provably different.
+# MODEL PROXY (bayan redirect 2026-07-22): the muon three-arm precision claim is
+# model-agnostic (it is about Newton-Schulz on TP-sharded 2D weights), so we use
+# the *original* Qwen3 MoE (Qwen3-30B-A3B, model_type=qwen3_moe) instead of
+# Qwen3.5.  Qwen3-30B-A3B uses standard attention (NO GatedDeltaNet / linear
+# attention), so its packed-THD path does NOT require the FLA causal-conv kernel
+# that blocks Qwen3.5-35B-A3B in this container.  mlite has no dense qwen3 model
+# (registry maps only qwen3_moe/qwen2_moe), so this MoE is the faithful FLA-free
+# "non-3.5 Qwen3" proxy.
 #
-# NOTE on the optimizer implementation: MLite's dist_opt Muon forwards directly to
+#   ARM=adamw      -> optimizer_algorithm=adamw, MLite dist_opt backend  (A/B baseline)
+#   ARM=muon       -> optimizer_algorithm=muon,  dist_opt backend, muon_tp_mode=distributed
+#                  (DistOpt Muon doing the *true* cross-TP Newton-Schulz, TP>1; this
+#                  is the primary DistOpt Muon arm bayan asked to verify on a real
+#                  workload).  This IS Megatron-Core's TensorParallel Muon.
+#   ARM=muon_fsdp2 -> optimizer_algorithm=muon, MLite fsdp2 backend (the independent
+#                  in-repo FSDP2 Muon lowering: full-gather -> orthogonalize ->
+#                  reshard over the FSDP2 DTensor shards).  Compared to the dist_opt
+#                  arm within numerical tolerance (FSDP2 容差 parity).
+#
+# NOTE on the dist_opt implementation: MLite's dist_opt Muon forwards directly to
 # NVIDIA Megatron-Core `get_megatron_muon_optimizer` (megatron/core/optimizer/muon.py
 # -> emerging_optimizers.py).  So "MLite DistOpt Muon" IS Megatron's TensorParallel
-# Muon by construction; MEGATRON_ROOT must therefore point at an NVIDIA Megatron-Core
-# checkout that ships muon (the ISEEKYAN fork does not).
+# Muon by construction (Megatron vs DistOpt is bitwise the same code path);
+# MEGATRON_ROOT must therefore point at an NVIDIA Megatron-Core checkout that ships
+# muon (the ISEEKYAN fork does not).
 #
 # Everything else (model, data order, init, seed, tokens, LR schedule, warmup,
 # parallel geometry) is held identical by pinning it here.  This is a *training*
@@ -42,7 +53,7 @@ set -euo pipefail
 # (/vllm + verl_mlite deps); we only prepend the task's mlite checkout + verl src.
 # =============================================================================
 
-ARM="${ARM:?set ARM=adamw|muon|muon_mcore}"
+ARM="${ARM:?set ARM=adamw|muon|muon_fsdp2}"
 BASE="${BASE:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code}"
 IMG="${IMG:-$BASE/verl_optimize/verl.vllm023.sqsh}"
 # Task mlite checkout (this branch @ 7b3dc95e4, with the VERL Muon optimizer
@@ -51,7 +62,7 @@ MLITE_REPO="${MLITE_REPO:?set MLITE_REPO to the staged mlite checkout}"
 # NVIDIA Megatron-Core with megatron/core/optimizer/muon.py (dist_opt Muon impl).
 MEGATRON_ROOT="${MEGATRON_ROOT:-$BASE/runtime/ds4-csacp-parity-eaa5b486d/mcore}"
 VERL="${VERL:-$BASE/verl-main-latest}"
-MODEL_PATH="${MODEL_PATH:-/lustre/fsw/portfolios/coreai/users/bayan/code/models/Qwen3.5-35B-A3B}"
+MODEL_PATH="${MODEL_PATH:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/models/Qwen3-30B-A3B}"
 RUN_ROOT="${RUN_ROOT:?set RUN_ROOT for outputs}"
 
 # ---- fixed same-contract knobs (identical across the three arms) -------------
@@ -79,9 +90,9 @@ case "$ARM" in
     OPT_ALGO=adamw ; OPT_BACKEND=dist_opt ; MUON_TP_MODE=distributed ;;
   muon)
     OPT_ALGO=muon  ; OPT_BACKEND=dist_opt ; MUON_TP_MODE=distributed ;;
-  muon_local)
-    OPT_ALGO=muon  ; OPT_BACKEND=dist_opt ; MUON_TP_MODE=blockwise ;;
-  *) echo "Unknown ARM=$ARM (want adamw|muon|muon_local)" >&2 ; exit 2 ;;
+  muon_fsdp2)
+    OPT_ALGO=muon  ; OPT_BACKEND=fsdp2    ; MUON_TP_MODE=distributed ;;
+  *) echo "Unknown ARM=$ARM (want adamw|muon|muon_fsdp2)" >&2 ; exit 2 ;;
 esac
 
 TRAIN_FILES="${TRAIN_FILES:?set TRAIN_FILES to a verl messages-format parquet}"
