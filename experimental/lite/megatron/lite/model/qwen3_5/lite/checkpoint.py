@@ -716,14 +716,43 @@ def _load_experts(
         out[f"{local_prefix}.moe.experts.fc2.weight{local_idx}"] = fc2
 
 
+def _canonical_state_key(key: str) -> str:
+    """Map a QAT-parametrized state key back to its logical (pre-QAT) name.
+
+    ``torch.nn.utils.parametrize`` renames ``mod.weight`` to
+    ``mod.parametrizations.weight.original`` (the surviving BF16 master), while
+    HF checkpoints still reference the logical ``mod.weight``. Strip the
+    parametrization wrapper so loaded tensors resolve onto the master weight
+    instead of being silently dropped (which would train on random weights).
+    Only the ``.original`` master is rewritten; quantizer buffers such as
+    ``...parametrizations.weight.0.amax`` are left untouched.
+    """
+    marker = ".parametrizations."
+    if marker not in key or not key.endswith(".original"):
+        return key
+    head, rest = key.split(marker, 1)
+    attr = rest.split(".", 1)[0]
+    return f"{head}.{attr}"
+
+
 def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> None:
     state = model.state_dict()
+    # Logical (pre-QAT) name -> actual state key, so a checkpoint tensor named
+    # ``….weight`` still lands on ``….parametrizations.weight.original`` when the
+    # module has been wrapped by weight-only QAT.
+    canonical: dict[str, str] = {}
+    for key in state:
+        canonical.setdefault(_canonical_state_key(key), key)
     resolved: dict[str, torch.Tensor] = {}
     for name, tensor in loaded.items():
-        actual = name if name in state else None
-        if actual is None:
-            for key in state:
-                if name in key:
+        if name in state:
+            actual = name
+        elif name in canonical:
+            actual = canonical[name]
+        else:
+            actual = None
+            for logical, key in canonical.items():
+                if name in logical:
                     actual = key
                     break
         if actual is not None:
