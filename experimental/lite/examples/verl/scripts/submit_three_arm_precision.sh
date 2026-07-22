@@ -13,7 +13,7 @@ set -euo pipefail
 
 BASE="${BASE:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code}"
 RUN_ROOT="${RUN_ROOT:-$BASE/runtime/task-1-13-5-5-3-muon-precision}"
-MLITE_COMMIT="${MLITE_COMMIT:-7b3dc95e40964e75eaa8615c2ee613c9feb3a836}"
+MLITE_COMMIT="${MLITE_COMMIT:-02994a794d1df6d21ffa7e7a8c185b1cb5e7fd04}"
 MLITE_REPO="${MLITE_REPO:-$RUN_ROOT/mlite-${MLITE_COMMIT:0:9}}"
 MLITE_REMOTE="${MLITE_REMOTE:-https://github.com/ISEEKYAN/Megatron-LM.git}"
 # NVIDIA Megatron-Core that ships megatron/core/optimizer/muon.py (dist_opt Muon).
