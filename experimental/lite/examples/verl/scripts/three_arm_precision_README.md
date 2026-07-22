@@ -46,6 +46,16 @@ config assertion.
 
 The precision verdict itself only exists once the GPU arms have emitted loss.
 
+## External dependency: `emerging_optimizers` (muon arms only)
+
+Megatron-Core's dist_opt Muon calls into the external **`emerging_optimizers`**
+package (the Newton-Schulz kernels). The `verl.vllm023` container does **not** ship
+it, and the `adamw` arm does not need it. Provide it to the muon arms via
+`EMERGING_OPT_SITE` (a `pip install --target=<dir> emerging-optimizers` site), which
+the node script prepends to `PYTHONPATH`. Note: the parent Muon tasks exercised the
+in-repo **FSDP2** Muon (`primitive/optimizers/fsdp2/muon.py`), which is self-contained
+— the `dist_opt` Muon path is the one with this external dependency.
+
 ## Run
 
 ```bash

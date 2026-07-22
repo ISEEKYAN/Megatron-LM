@@ -17,6 +17,13 @@ export VERL_ROOT="$VERL"
 # prepends MEGATRON_ROOT last, so its megatron.core wins over the fork's.
 export MEGATRON_ROOT="${MEGATRON_ROOT:?set MEGATRON_ROOT to an NVIDIA mcore that ships megatron/core/optimizer/muon.py}"
 export PYTHONPATH="/vllm:$MLITE_LITE/examples/verl:$MLITE_LITE:$VERL:$MEGATRON_ROOT:${PYTHONPATH:-}"
+# Megatron-Core's dist_opt Muon requires the external `emerging_optimizers` package
+# (the actual Newton-Schulz kernels), which the verl.vllm023 container does NOT ship.
+# Point EMERGING_OPT_SITE at a site-packages dir that provides it (e.g. a pip
+# --target install) so the muon arms can construct the optimizer.
+if [[ -n "${EMERGING_OPT_SITE:-}" ]]; then
+  export PYTHONPATH="$EMERGING_OPT_SITE:$PYTHONPATH"
+fi
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_DEVICE_MAX_CONNECTIONS=1
