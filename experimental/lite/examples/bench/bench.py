@@ -262,9 +262,18 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
     optimizer = _optimizer_config(cfg)
     optimizer_overrides = _json_mapping(cfg.override_optimizer_json, name="override_optimizer_json")
 
+    # Lower the requested optimizer settings (algorithm, scheduler horizon, Muon
+    # hyperparameters) onto the single-source-of-truth ``OptimizerConfig`` for
+    # every backend. Stashing them only in a backend-specific override dict
+    # produces a config that *looks* like Muon while the real optimizer/scheduler
+    # builders still read ``optimizer_algorithm="adam"`` and an unset training
+    # horizon from the base config -- a false-green the moe panel flagged
+    # (algorithm conflict at ``build_dist_opt_optimizer_config`` + no LR
+    # scheduler because ``total_training_steps`` stays ``-1``).
+    for key, value in optimizer_overrides.items():
+        setattr(optimizer, key, value)
+
     if cfg.backend == "mlite":
-        for key, value in optimizer_overrides.items():
-            setattr(optimizer, key, value)
         impl_cfg = _json_mapping(cfg.impl_cfg_json, name="impl_cfg_json")
         impl_cfg.setdefault("use_thd", cfg.use_thd)
         if cfg.model_name == "qwen3_5":
@@ -299,7 +308,11 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             override_transformer_config=_json_mapping(
                 cfg.override_transformer_json, name="override_transformer_json"
             ),
-            override_optimizer_config=optimizer_overrides,
+            # Overrides are already lowered onto ``optimizer`` above; the
+            # Megatron-Core override surface must stay clean so
+            # ``build_dist_opt_optimizer_config`` does not see a declared
+            # algorithm that conflicts with the base config.
+            override_optimizer_config={},
             bridge_post_init=_make_bridge_post_init_hook(cfg),
         )
     else:

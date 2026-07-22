@@ -100,6 +100,27 @@ def build_dist_opt_optimizer_config(
         args["use_precision_aware_optimizer"] = opt.use_precision_aware_optimizer
     if getattr(opt, "decoupled_weight_decay", None) is not None:
         args["decoupled_weight_decay"] = opt.decoupled_weight_decay
+    if optimizer_algorithm == "muon":
+        # Forward the contract's Muon hyperparameters so declaring ``muon`` is not
+        # fake-green (built with Megatron-Core Muon defaults). Only forward keys
+        # this Megatron-Core build actually exposes so older cores that lack a
+        # given knob do not raise ``TypeError``.
+        core_fields = {field.name for field in fields(CoreOptimizerConfig)}
+        for muon_key in (
+            "muon_momentum",
+            "muon_nesterov",
+            "muon_scale_mode",
+            "muon_fp32_matmul_prec",
+            "muon_coefficient_type",
+            "muon_num_ns_steps",
+            "muon_tp_mode",
+            "muon_extra_scale_factor",
+            "muon_scalar_optimizer",
+            "muon_split_qkv",
+        ):
+            value = getattr(opt, muon_key, None)
+            if value is not None and muon_key in core_fields:
+                args[muon_key] = value
     if override_optimizer_config:
         overrides = dict(override_optimizer_config)
         declared_algorithm = overrides.pop("optimizer_algorithm", optimizer_algorithm)

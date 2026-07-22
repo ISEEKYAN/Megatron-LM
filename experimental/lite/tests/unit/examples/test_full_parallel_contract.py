@@ -44,6 +44,35 @@ def test_full_parallel_contract_builds_all_three_arms_without_gpu_init() -> None
         }
 
 
+def test_every_arm_lowers_muon_and_scheduler_onto_the_base_optimizer() -> None:
+    """Muon + the training horizon must live on the base OptimizerConfig.
+
+    Regression for the moe BLOCKERS: the megatron arm previously left
+    ``optimizer_algorithm="adam"`` / ``total_training_steps=-1`` on the base
+    config and hid Muon in a Megatron-Core override dict, so the real builders
+    would raise (algorithm conflict) or skip the LR scheduler while the dict-only
+    gate reported green.
+    """
+    from examples.bench.bench import build_runtime_config
+    from examples.bench.full_parallel_contract import (
+        FullParallelContract,
+        build_arm_configs,
+    )
+
+    contract = FullParallelContract(hf_path="/tmp/Qwen3.5-35B-A3B")
+    arms = build_arm_configs(contract)
+    for name, cli_cfg in arms.items():
+        backend_cfg = build_runtime_config(cli_cfg).backend_cfg
+        assert backend_cfg.optimizer.optimizer_algorithm == "muon", name
+        assert backend_cfg.optimizer.total_training_steps == contract.steps, name
+        assert backend_cfg.optimizer.muon_momentum == contract.muon_momentum, name
+
+    megatron_cfg = build_runtime_config(arms["megatron"]).backend_cfg
+    # The Megatron-Core override surface must stay clean: a declared algorithm
+    # there conflicts with the base config at build_dist_opt_optimizer_config.
+    assert megatron_cfg.override_optimizer_config == {}
+
+
 def test_full_parallel_contract_rejects_a_topology_that_is_not_eight_ranks() -> None:
     from examples.bench.full_parallel_contract import FullParallelContract
 

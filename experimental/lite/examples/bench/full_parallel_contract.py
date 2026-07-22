@@ -148,6 +148,29 @@ def build_arm_configs(contract: FullParallelContract) -> dict[str, BenchCliConfi
     }
 
 
+def _probe_megatron_optimizer_build(backend_cfg) -> None:
+    """Invoke the real Megatron-Core optimizer-config builder when it is importable.
+
+    On a bare CPU host Megatron-Core is unavailable and this is a no-op -- the
+    base-config assertions above already guard against the false-green. Wherever
+    Megatron-Core *is* importable (the GPU arms in the follow-up tasks), this
+    proves the megatron arm's config actually constructs instead of raising a
+    base-vs-override algorithm conflict.
+    """
+    try:
+        from megatron.lite.primitive.optimizers.megatron_wrap import (
+            build_dist_opt_optimizer_config,
+        )
+
+        build_dist_opt_optimizer_config(
+            backend_cfg.optimizer,
+            override_optimizer_config=backend_cfg.override_optimizer_config,
+        )
+    except (ImportError, ModuleNotFoundError):
+        # Megatron-Core not present (bare CPU gate); base-config checks stand.
+        return
+
+
 def config_only_gate(contract: FullParallelContract) -> dict[str, Any]:
     """Exercise all three real config constructors without distributed/GPU init."""
 
@@ -169,21 +192,31 @@ def config_only_gate(contract: FullParallelContract) -> dict[str, Any]:
             raise AssertionError(
                 f"{name} parallel contract drifted: {actual_parallel!r}"
             )
-        if name == "megatron":
-            optimizer = runtime_configs[name].backend_cfg.override_optimizer_config
-        else:
-            optimizer = runtime_configs[name].backend_cfg.optimizer
+        # Every arm must carry the contract on the *base* ``OptimizerConfig`` --
+        # the object the real optimizer/scheduler builders read. Checking a
+        # backend override dict instead would pass a config that raises (base
+        # ``adam`` vs override ``muon``) or silently skips the LR scheduler
+        # (``total_training_steps`` left at ``-1``) at real build time.
+        runtime_backend_cfg = runtime_configs[name].backend_cfg
+        optimizer = runtime_backend_cfg.optimizer
         expected_optimizer = contract.optimizer_overrides()
-        # The MLite constructor materializes the full OptimizerConfig (and
-        # therefore includes unrelated defaults); Megatron receives only its
-        # explicit override surface.  Every contractual key must still agree.
-        actual_optimizer = (
-            {key: optimizer.get(key) for key in expected_optimizer}
-            if isinstance(optimizer, dict)
-            else {key: getattr(optimizer, key) for key in expected_optimizer}
-        )
+        actual_optimizer = {key: getattr(optimizer, key) for key in expected_optimizer}
         if actual_optimizer != expected_optimizer:
             raise AssertionError(f"{name} optimizer contract drifted.")
+        # ``_build_lr_scheduler`` returns ``None`` when this is <= 0, so the arm
+        # would train with a frozen LR while claiming the contract's schedule.
+        if optimizer.total_training_steps <= 0:
+            raise AssertionError(
+                f"{name} scheduler horizon was not lowered onto the optimizer."
+            )
+        if name == "megatron":
+            override = runtime_backend_cfg.override_optimizer_config
+            if override:
+                raise AssertionError(
+                    "megatron arm must lower Muon onto the base optimizer, not a "
+                    "conflicting Megatron-Core override dict."
+                )
+            _probe_megatron_optimizer_build(runtime_backend_cfg)
 
     return {
         "contract": asdict(contract),
