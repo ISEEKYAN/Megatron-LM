@@ -68,9 +68,10 @@ class ImplConfig:
     mtp_use_repeated_layer: bool | None = None
     mount_vision_model: bool = False
     gdn_cp_mode: str = "replicated"
-    # Weight-only integer QAT (phase 1: int8 / int4). Default None = disabled =
-    # bit-identical model. Enabling the end-to-end (dist-opt placement of the
-    # renamed master param + packed export refit) is completed in the GPU leaf.
+    # Weight-only QAT: float fp8_e4m3 / mxfp4 (shipping target) or int8 / int4
+    # (validated skeleton). Default None = disabled = bit-identical model.
+    # Enabling the end-to-end (dist-opt placement of the renamed master param +
+    # packed export refit) is completed in the GPU leaf.
     qat: QATSpec | dict | None = None
 
 

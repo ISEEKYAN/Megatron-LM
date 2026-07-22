@@ -1,9 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Quantization-aware training (QAT) primitive for Megatron Lite.
 
-Phase 1 scope (see ``docs/qat_cross_framework_design.md``): weight-only integer
-QAT for ``int8`` (W8A16) and non-NVFP4 ``int4`` (W4A16-int). NVFP4 / MXFP4 / FP8
-and any activation quantization are deferred to later, separately gated leaves.
+Scope (see ``docs/qat_cross_framework_design.md``): weight-only QAT. Two family
+of formats share one STE + three-state skeleton:
+
+* **Integer** (validated skeleton, kept): ``int8`` (W8A16) and non-NVFP4
+  ``int4`` (W4A16-int) — max-calibrated affine/symmetric integer Q/DQ.
+* **Floating-point** (the shipping target): ``fp8_e4m3`` (W8A16, E4M3, aligned
+  with verl/ModelOpt fp8 weight fake-quant) and ``mxfp4`` (OCP microscaling
+  float4: E2M1 element + E8M0 power-of-two block scale, block=32). The float
+  encodings reuse torch's native ``float8_e4m3fn`` RNE cast and the OCP E2M1
+  grid — they are *not* home-grown bit layouts.
+
+NVFP4 (W4A16 / W4A4, NVIDIA per-block FP8 scale) stays deferred as a second
+FP4 option and is rejected loudly, never aliased onto MXFP4.
 
 The primitive enforces the three-state separation mandated by the design:
 
@@ -35,19 +45,32 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
 
-# Supported phase-1 formats -> number of integer bits. Free-form strings are
-# rejected; every enum must map to an exact quant/dequant contract.
+# Supported formats -> nominal bit-width. Free-form strings are rejected; every
+# enum must map to an exact quant/dequant contract.
 _FORMAT_BITS: dict[str, int] = {
     "int8": 8,
     "int4": 4,
+    "fp8_e4m3": 8,
+    "mxfp4": 4,
 }
 
-# Formats that are recognised as future work but explicitly not implemented in
-# phase 1. Selecting one is a loud error naming the deferral, never a silent
-# fallback to a different scale layout.
-_DEFERRED_FORMATS: frozenset[str] = frozenset(
-    {"nvfp4_w4a16", "nvfp4_w4a4", "mxfp4", "fp8", "fp8_e4m3"}
-)
+# Integer vs floating-point families (they share the STE/three-state skeleton
+# but have different scale layouts and encodings).
+_INT_FORMATS: frozenset[str] = frozenset({"int8", "int4"})
+_FLOAT_FORMATS: frozenset[str] = frozenset({"fp8_e4m3", "mxfp4"})
+
+# Canonicalising aliases accepted from configs.
+_FORMAT_ALIASES: dict[str, str] = {"fp8": "fp8_e4m3"}
+
+# MXFP4 is intrinsically a microscaling block format; OCP fixes the block to 32
+# elements sharing one E8M0 scale.
+_MXFP4_BLOCK: int = 32
+
+# Formats recognised as future work but explicitly not implemented here.
+# Selecting one is a loud error naming the deferral, never a silent fallback to
+# a different scale layout. NVFP4 uses a per-16 FP8(E4M3) block scale (not the
+# E8M0 power-of-two of MXFP4) and needs its own serializer + validation.
+_DEFERRED_FORMATS: frozenset[str] = frozenset({"nvfp4_w4a16", "nvfp4_w4a4"})
 
 # Module leaf-names that must never be weight-quantized (numerically fragile /
 # tiny). These are generic Megatron surface names, not model names.
@@ -80,29 +103,39 @@ class QATSpec:
     learnable_scales: bool = False  # LSQ future work; must be False in phase 1
 
     def __post_init__(self) -> None:
+        # Canonicalise aliases (e.g. "fp8" -> "fp8_e4m3") even when disabled so
+        # ``.format`` is always the exact contract key.
+        canonical = _FORMAT_ALIASES.get(self.format, self.format)
+        if canonical != self.format:
+            object.__setattr__(self, "format", canonical)
         if not self.enabled:
             return
         if self.format in _DEFERRED_FORMATS:
             raise ValueError(
-                f"QAT format {self.format!r} is deferred to a later leaf and not implemented "
-                "in phase 1 (int8/int4 only). It requires its own scale layout, export "
-                "serializer and validation; do not alias it onto integer QAT."
+                f"QAT format {self.format!r} is deferred and not implemented here. NVFP4 uses "
+                "a per-16 FP8(E4M3) block scale with its own serializer/validation; do not "
+                "alias it onto MXFP4's E8M0 scale."
             )
         if self.format not in _FORMAT_BITS:
             raise ValueError(
-                f"Unknown QAT format {self.format!r}; phase-1 supports {sorted(_FORMAT_BITS)}."
+                f"Unknown QAT format {self.format!r}; supported: {sorted(_FORMAT_BITS)}."
             )
         if self.activation_bits is not None:
             raise ValueError(
-                "activation quantization (W*A*) is not supported in phase 1; it needs a "
+                "activation quantization (W*A*) is not supported here; it needs a "
                 "calibration/observer-freeze protocol and cross-DP amax sync before enabling."
             )
         if self.learnable_scales:
-            raise ValueError("learnable_scales (LSQ) is deferred; phase 1 uses max calibration.")
+            raise ValueError("learnable_scales (LSQ) is deferred; this path uses max calibration.")
         if self.export_mode not in ("fake", "packed"):
             raise ValueError(f"export_mode must be 'fake' or 'packed', got {self.export_mode!r}.")
         if self.group_size < -1:
             raise ValueError(f"group_size must be >= -1, got {self.group_size}.")
+        if self.format == "mxfp4" and self.group_size != _MXFP4_BLOCK:
+            raise ValueError(
+                f"mxfp4 is a microscaling block format: group_size must be {_MXFP4_BLOCK} "
+                f"(OCP block), got {self.group_size}. Set group_size={_MXFP4_BLOCK}."
+            )
 
     @property
     def num_bits(self) -> int:
@@ -241,6 +274,10 @@ def fake_quantize_weight(weight: torch.Tensor, spec: QATSpec) -> torch.Tensor:
     """Differentiable (STE) fake-quantization of a 2D weight per ``spec``."""
     if weight.dim() != 2:
         raise ValueError(f"fake_quantize_weight expects a 2D [out, in] weight, got {tuple(weight.shape)}.")
+    if spec.format == "fp8_e4m3":
+        return _fp8_fake_quantize_weight(weight, spec)
+    if spec.format == "mxfp4":
+        return _mxfp4_fake_quantize_weight(weight, spec)
     scale, zero_point, qmin, qmax = _compute_qparams(
         weight, spec.num_bits, spec.group_size, spec.symmetric
     )
@@ -250,6 +287,139 @@ def fake_quantize_weight(weight: torch.Tensor, spec: QATSpec) -> torch.Tensor:
         w_hat = _FakeQuantizeSTE.apply(view, scale, zero_point, qmin, qmax, spec.ste_clip)
         return w_hat.reshape(out_features, in_features)
     return _FakeQuantizeSTE.apply(weight, scale, zero_point, qmin, qmax, spec.ste_clip)
+
+
+# ---------------------------------------------------------------------------
+# Floating-point quant/dequant numerics (fp8 E4M3; MXFP4 = E2M1 + E8M0)
+# ---------------------------------------------------------------------------
+
+# OCP E2M1 (float4) representable magnitudes and the round-to-nearest midpoints
+# between them. Magnitude index ``i`` (0..7) is the 3-bit code ``exp<<1 | mant``;
+# the full 4-bit E2M1 code is ``sign<<3 | i``. This is the OCP grid, not a
+# home-grown encoding.
+_E2M1_LEVELS: tuple[float, ...] = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_MIDPOINTS: tuple[float, ...] = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+_E2M1_MAX: float = 6.0
+# Largest binary exponent representable in E2M1 (floor(log2(6)) = 2); the OCP MX
+# shared-scale (Alg. 1) subtracts this so the block max lands in the top binade.
+_E2M1_EMAX: int = 2
+# E8M0 stores an unsigned biased exponent in [0, 254] (255 = NaN), i.e. powers
+# of two 2^e with e in [-127, 127]; bias 127.
+_E8M0_BIAS: int = 127
+_E8M0_EXP_MIN: int = -127
+_E8M0_EXP_MAX: int = 127
+
+
+def _fp8_e4m3_max() -> float:
+    return float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
+
+
+def _fp8_e4m3_qdq(x: torch.Tensor) -> torch.Tensor:
+    """Round a float32 tensor to E4M3 and back via torch's native RNE cast.
+
+    Saturates to +-448 (the E4M3 finite max) so out-of-range values do not
+    become NaN. This is exactly the encoding TE/ModelOpt use for fp8 weights.
+    """
+    fmax = _fp8_e4m3_max()
+    clamped = x.float().clamp(-fmax, fmax)
+    return clamped.to(torch.float8_e4m3fn).to(torch.float32)
+
+
+def _e2m1_round_index(a: torch.Tensor) -> torch.Tensor:
+    """Nearest E2M1 magnitude index (0..7) for a non-negative tensor, ties-to-even.
+
+    At an exact midpoint the two neighbours have opposite mantissa-LSB parity, so
+    rounding to the even neighbour == rounding down for an even lower index and up
+    for an odd one.
+    """
+    mids = torch.tensor(_E2M1_MIDPOINTS, dtype=torch.float32, device=a.device)
+    idx_lo = torch.bucketize(a, mids, right=False)  # rounds midpoints down
+    idx_hi = torch.bucketize(a, mids, right=True)  # rounds midpoints up
+    tie = idx_hi != idx_lo
+    return torch.where(tie & (idx_lo % 2 == 1), idx_hi, idx_lo)
+
+
+def _e2m1_qdq(x: torch.Tensor) -> torch.Tensor:
+    """Round a float32 tensor onto the OCP E2M1 grid (ties-to-even), signed."""
+    sign = torch.sign(x)
+    levels = torch.tensor(_E2M1_LEVELS, dtype=torch.float32, device=x.device)
+    return sign * levels[_e2m1_round_index(x.float().abs())]
+
+
+def _mx_shared_scale(block_amax: torch.Tensor) -> torch.Tensor:
+    """E8M0 per-block power-of-two scale (OCP Alg. 1) as float32.
+
+    ``e = clamp(floor(log2(amax)) - emax_elem, -127, 127)``; ``X = 2^e``. For an
+    all-zero block ``X = 1`` (its codes are all zero regardless).
+    """
+    tiny = torch.finfo(torch.float32).tiny
+    safe = block_amax.float().clamp_min(tiny)
+    exp = (torch.floor(torch.log2(safe)) - _E2M1_EMAX).clamp(_E8M0_EXP_MIN, _E8M0_EXP_MAX)
+    scale = torch.exp2(exp)
+    return torch.where(block_amax > 0, scale, torch.ones_like(scale))
+
+
+class _FloatFakeQuantSTE(torch.autograd.Function):
+    """Straight-through estimator for the float fake-quant paths.
+
+    ``w_hat`` is precomputed (under ``no_grad``) by the caller; forward returns
+    it and backward passes the gradient straight through to ``weight``, optionally
+    masked to the non-saturated region (matching the integer path's ``ste_clip``).
+    """
+
+    @staticmethod
+    def forward(ctx, weight, w_hat, sat_mask):  # type: ignore[override]
+        if sat_mask is not None:
+            ctx.save_for_backward(sat_mask)
+            ctx.clip = True
+        else:
+            ctx.clip = False
+        return w_hat
+
+    @staticmethod
+    def backward(ctx, grad_output):  # type: ignore[override]
+        if ctx.clip:
+            (mask,) = ctx.saved_tensors
+            grad_output = grad_output * mask.to(grad_output.dtype)
+        return grad_output, None, None
+
+
+def _grouped_view(weight: torch.Tensor, group_size: int) -> torch.Tensor:
+    """2D->grouped view whose scale broadcasts along the reduction axis."""
+    if group_size <= 0:  # per-tensor / per-channel keep 2D
+        return weight
+    out_features, in_features = weight.shape
+    if in_features % group_size != 0:
+        raise ValueError(f"group_size={group_size} does not divide in_features={in_features}.")
+    return weight.reshape(out_features, in_features // group_size, group_size)
+
+
+def _fp8_fake_quantize_weight(weight: torch.Tensor, spec: QATSpec) -> torch.Tensor:
+    """STE fake-quant to E4M3 with an amax/448 float scale (per group)."""
+    fmax = _fp8_e4m3_max()
+    eps = torch.finfo(torch.float32).tiny
+    amax = compute_amax(weight, spec.group_size).float()
+    scale = (amax / fmax).clamp_min(eps)
+    view = _grouped_view(weight, spec.group_size)
+    with torch.no_grad():
+        w_scaled = view.float() / scale
+        w_hat = (_fp8_e4m3_qdq(w_scaled) * scale).to(weight.dtype)
+        mask = (w_scaled.abs() <= fmax) if spec.ste_clip else None
+    out = _FloatFakeQuantSTE.apply(view, w_hat, mask)
+    return out.reshape(weight.shape)
+
+
+def _mxfp4_fake_quantize_weight(weight: torch.Tensor, spec: QATSpec) -> torch.Tensor:
+    """STE fake-quant to MXFP4 (E2M1 element, E8M0 block scale, block=32)."""
+    view = _grouped_view(weight, _MXFP4_BLOCK)
+    with torch.no_grad():
+        block_amax = view.float().abs().amax(dim=2, keepdim=True)
+        scale = _mx_shared_scale(block_amax)
+        w_scaled = view.float() / scale
+        w_hat = (_e2m1_qdq(w_scaled) * scale).to(weight.dtype)
+        mask = (w_scaled.abs() <= _E2M1_MAX) if spec.ste_clip else None
+    out = _FloatFakeQuantSTE.apply(view, w_hat, mask)
+    return out.reshape(weight.shape)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +434,10 @@ def quantize_weight(weight: torch.Tensor, spec: QATSpec) -> dict[str, torch.Tens
     affine, ``zero_point``. The training step never calls this; it exists for
     export / rollout refit and for the round-trip validation contract.
     """
+    if spec.format == "fp8_e4m3":
+        return _quantize_weight_fp8(weight, spec)
+    if spec.format == "mxfp4":
+        return _quantize_weight_mxfp4(weight)
     scale, zero_point, qmin, qmax = _compute_qparams(
         weight, spec.num_bits, spec.group_size, spec.symmetric
     )
@@ -280,8 +454,64 @@ def quantize_weight(weight: torch.Tensor, spec: QATSpec) -> dict[str, torch.Tens
     return out
 
 
+def _quantize_weight_fp8(weight: torch.Tensor, spec: QATSpec) -> dict[str, torch.Tensor]:
+    """Packed E4M3 deployment snapshot: fp8 codes + fp32 (amax/448) scale."""
+    fmax = _fp8_e4m3_max()
+    eps = torch.finfo(torch.float32).tiny
+    amax = compute_amax(weight, spec.group_size).float()
+    scale = (amax / fmax).clamp_min(eps)
+    view = _grouped_view(weight.detach(), spec.group_size)
+    codes = (view.float() / scale).clamp(-fmax, fmax).to(torch.float8_e4m3fn)
+    return {"qweight": codes.reshape(weight.shape), "scale": scale, "format": "fp8_e4m3"}
+
+
+def _quantize_weight_mxfp4(weight: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Packed MXFP4 snapshot: E2M1 nibbles (2/byte) + E8M0 scale byte per block.
+
+    ``qweight`` is ``uint8`` packed nibbles of the 4-bit codes ``sign<<3 | mag``;
+    ``scale`` is the biased E8M0 exponent (``uint8``) per 32-element block.
+    """
+    view = _grouped_view(weight.detach(), _MXFP4_BLOCK)  # [out, nblk, 32]
+    block_amax = view.float().abs().amax(dim=2, keepdim=True)
+    scale = _mx_shared_scale(block_amax)  # X = 2^e
+    w_scaled = view.float() / scale
+    mag = _e2m1_round_index(w_scaled.abs()).to(torch.int32)
+    sign_bit = (w_scaled < 0).to(torch.int32)
+    codes = ((sign_bit << 3) | mag).to(torch.int32)  # [out, nblk, 32], 0..15
+    packed = pack_int4(codes)  # [out, nblk, 16] uint8
+    e8m0 = (torch.log2(scale).round().to(torch.int32) + _E8M0_BIAS).to(torch.uint8)
+    return {"qweight": packed, "scale": e8m0, "format": "mxfp4"}
+
+
+def _dequantize_weight_fp8(packed: dict[str, torch.Tensor], spec: QATSpec) -> torch.Tensor:
+    codes = packed["qweight"]
+    scale = packed["scale"]
+    if spec.group_size > 0:
+        out_features, in_features = codes.shape
+        view = codes.reshape(out_features, in_features // spec.group_size, spec.group_size).float()
+        return (view * scale).reshape(out_features, in_features)
+    return codes.float() * scale
+
+
+def _dequantize_weight_mxfp4(packed: dict[str, torch.Tensor]) -> torch.Tensor:
+    packed_codes = packed["qweight"]  # [out, nblk, 16] uint8
+    e8m0 = packed["scale"]  # [out, nblk, 1] uint8
+    codes = unpack_int4(packed_codes, signed=False)  # [out, nblk, 32] int8, 0..15
+    mag = (codes & 0x7).to(torch.long)
+    sign = ((codes >> 3) & 0x1).float()
+    levels = torch.tensor(_E2M1_LEVELS, dtype=torch.float32, device=codes.device)
+    scale = torch.exp2((e8m0.float() - _E8M0_BIAS))
+    values = (1.0 - 2.0 * sign) * levels[mag] * scale
+    out_features, n_blk, block = values.shape
+    return values.reshape(out_features, n_blk * block)
+
+
 def dequantize_weight(packed: dict[str, torch.Tensor], spec: QATSpec) -> torch.Tensor:
     """Inverse of :func:`quantize_weight` — reconstruct the fake-quantized BF16 weight."""
+    if spec.format == "fp8_e4m3":
+        return _dequantize_weight_fp8(packed, spec)
+    if spec.format == "mxfp4":
+        return _dequantize_weight_mxfp4(packed)
     codes = packed["qweight"]
     scale = packed["scale"]
     out_features, in_features = codes.shape

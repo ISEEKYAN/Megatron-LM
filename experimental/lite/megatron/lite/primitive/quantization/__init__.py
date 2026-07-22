@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Quantization primitives for Megatron Lite (phase 1: integer weight-only QAT)."""
+"""Quantization primitives for Megatron Lite (weight-only QAT: fp8/mxfp4 + int8/int4)."""
 
 from __future__ import annotations
 

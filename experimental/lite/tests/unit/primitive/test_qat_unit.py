@@ -43,7 +43,8 @@ def test_spec_defaults_are_inert_and_normalize():
 
 
 def test_spec_rejects_deferred_and_unsupported_formats():
-    for fmt in ("nvfp4_w4a16", "mxfp4", "fp8"):
+    # NVFP4 stays deferred (needs its own per-16 FP8 block scale + serializer).
+    for fmt in ("nvfp4_w4a16", "nvfp4_w4a4"):
         with pytest.raises(ValueError, match="deferred"):
             QATSpec(enabled=True, format=fmt)
     with pytest.raises(ValueError, match="Unknown QAT format"):
@@ -54,6 +55,18 @@ def test_spec_rejects_deferred_and_unsupported_formats():
         QATSpec(enabled=True, learnable_scales=True)
     # disabled spec never validates format -> stays inert
     assert QATSpec(enabled=False, format="nvfp4_w4a16").enabled is False
+
+
+def test_float_format_aliases_and_mxfp4_block():
+    # "fp8" canonicalises to the exact E4M3 contract key.
+    assert QATSpec(enabled=True, format="fp8").format == "fp8_e4m3"
+    assert QATSpec(enabled=False, format="fp8").format == "fp8_e4m3"
+    assert normalize_qat_spec({"enabled": True, "format": "fp8"}).format == "fp8_e4m3"
+    # mxfp4 is a microscaling block format: group_size must be exactly 32.
+    for bad in (0, -1, 16, 64):
+        with pytest.raises(ValueError, match="microscaling block"):
+            QATSpec(enabled=True, format="mxfp4", group_size=bad)
+    assert QATSpec(enabled=True, format="mxfp4", group_size=32).num_bits == 4
 
 
 def test_targets_module_skips_ignore_patterns():
@@ -105,6 +118,75 @@ def test_affine_quant_reconstructs_range():
     # affine covers the asymmetric [-3,5] range; error <= one step
     step = (w.max() - w.min()) / 255
     assert torch.all((w - w_hat).abs() <= step + 1e-5)
+
+
+# --------------------------------------------------------------------------- fp8 / mxfp4
+
+
+@pytest.mark.parametrize("group_size", [0, -1, 32])
+def test_fp8_fake_quant_matches_native_e4m3_cast(group_size):
+    torch.manual_seed(10)
+    w = torch.randn(8, 64, dtype=torch.float32)
+    spec = QATSpec(enabled=True, format="fp8", group_size=group_size)
+    w_hat = fake_quantize_weight(w, spec)
+
+    fmax = float(torch.finfo(torch.float8_e4m3fn).max)
+    if group_size == 0:
+        scale = (w.abs().amax() / fmax).clamp_min(torch.finfo(torch.float32).tiny)
+        ref = (w / scale).clamp(-fmax, fmax).to(torch.float8_e4m3fn).float() * scale
+    elif group_size == -1:
+        scale = (w.abs().amax(dim=1, keepdim=True) / fmax).clamp_min(torch.finfo(torch.float32).tiny)
+        ref = (w / scale).clamp(-fmax, fmax).to(torch.float8_e4m3fn).float() * scale
+    else:
+        v = w.reshape(8, 64 // group_size, group_size)
+        scale = (v.abs().amax(dim=2, keepdim=True) / fmax).clamp_min(torch.finfo(torch.float32).tiny)
+        ref = ((v / scale).clamp(-fmax, fmax).to(torch.float8_e4m3fn).float() * scale).reshape(8, 64)
+    torch.testing.assert_close(w_hat, ref, rtol=0, atol=0)
+
+
+def test_fp8_amax_scaling_does_not_saturate():
+    # amax/448 scaling maps the peak weight exactly to 448 -> nothing clips.
+    torch.manual_seed(11)
+    w = torch.randn(4, 128)
+    spec = QATSpec(enabled=True, format="fp8", group_size=-1)
+    w_hat = fake_quantize_weight(w, spec)
+    # E4M3 has 3 mantissa bits: relative error <= 2^-4 of the local binade.
+    rel = (w - w_hat).abs() / w.abs().clamp_min(1e-6)
+    assert rel.max() < 0.07
+
+
+def test_mxfp4_matches_e2m1_grid_and_e8m0_scale():
+    torch.manual_seed(12)
+    w = torch.randn(4, 96, dtype=torch.float32)
+    spec = QATSpec(enabled=True, format="mxfp4", group_size=32)
+    w_hat = fake_quantize_weight(w, spec)
+
+    # independent reference: OCP E8M0 shared scale + E2M1 nearest (ties-to-even).
+    levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    mids = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+    v = w.reshape(4, 96 // 32, 32)
+    amax = v.abs().amax(dim=2, keepdim=True)
+    exp = (torch.floor(torch.log2(amax.clamp_min(torch.finfo(torch.float32).tiny))) - 2).clamp(-127, 127)
+    X = torch.exp2(exp)
+    a = (v / X).abs()
+    lo = torch.bucketize(a, mids, right=False)
+    hi = torch.bucketize(a, mids, right=True)
+    idx = torch.where((hi != lo) & (lo % 2 == 1), hi, lo)
+    ref = (torch.sign(v / X) * levels[idx] * X).reshape(4, 96)
+    torch.testing.assert_close(w_hat, ref, rtol=0, atol=0)
+    # every reconstructed value lies on grid*scale (a power of two multiple).
+    assert torch.isfinite(w_hat).all()
+
+
+def test_mxfp4_ste_zeroes_saturated_block_top():
+    # A block whose max scales above 6.0 saturates that element -> STE zeroes it.
+    w = torch.zeros(1, 32)
+    w[0, 0] = 6.25  # amax=6.25 -> floor(log2)=2 -> X=1 -> 6.25 > 6.0 (E2M1 max)
+    w[0, 1] = 1.0
+    wg = w.clone().requires_grad_(True)
+    fake_quantize_weight(wg, QATSpec(enabled=True, format="mxfp4", group_size=32)).sum().backward()
+    assert wg.grad[0, 0].item() == 0.0  # saturated top clipped
+    assert wg.grad[0, 1].item() == 1.0  # in-range passes through
 
 
 # --------------------------------------------------------------------------- STE
@@ -214,6 +296,73 @@ def test_export_roundtrip_matches_fake_quant(fmt, group_size):
     recon = dequantize_weight(packed, spec)
     # deploy dequant must equal the training fake-quant exactly (K-0150 maxdiff=0)
     torch.testing.assert_close(recon, fake_quantize_weight(w, spec), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "fmt,group_size",
+    [("fp8", 0), ("fp8", -1), ("fp8", 32), ("mxfp4", 32)],
+)
+def test_float_export_roundtrip_matches_fake_quant(fmt, group_size):
+    torch.manual_seed(13)
+    w = torch.randn(6, 64, dtype=torch.float32)
+    spec = QATSpec(enabled=True, format=fmt, group_size=group_size)
+    packed = quantize_weight(w, spec)
+    recon = dequantize_weight(packed, spec)
+    # deploy dequant must equal the training fake-quant exactly (K-0150 maxdiff=0)
+    torch.testing.assert_close(recon, fake_quantize_weight(w, spec), rtol=0, atol=0)
+
+
+def test_mxfp4_export_layout_is_packed_nibbles_and_e8m0_bytes():
+    torch.manual_seed(14)
+    w = torch.randn(6, 64, dtype=torch.float32)
+    spec = QATSpec(enabled=True, format="mxfp4", group_size=32)
+    packed = quantize_weight(w, spec)
+    assert packed["format"] == "mxfp4"
+    # 64 in-features / 32 block = 2 blocks; each block packs 32 nibbles -> 16 bytes
+    assert packed["qweight"].dtype == torch.uint8 and packed["qweight"].shape == (6, 2, 16)
+    assert packed["scale"].dtype == torch.uint8 and packed["scale"].shape == (6, 2, 1)
+
+
+def test_fp8_export_stores_native_fp8_codes():
+    torch.manual_seed(15)
+    w = torch.randn(6, 64, dtype=torch.float32)
+    spec = QATSpec(enabled=True, format="fp8", group_size=-1)
+    packed = quantize_weight(w, spec)
+    assert packed["format"] == "fp8_e4m3"
+    assert packed["qweight"].dtype == torch.float8_e4m3fn
+    assert packed["scale"].dtype == torch.float32
+
+
+def _toy_chunk_32aligned():
+    # in_features divisible by 32 so the mxfp4 block layout applies.
+    class Toy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = nn.Linear(64, 96, bias=False)
+            self.proj = nn.Linear(96, 64, bias=False)
+            self.lm_head = nn.Linear(64, 128, bias=False)
+
+        def forward(self, x):
+            return self.lm_head(self.proj(self.qkv(x)))
+
+    return Toy()
+
+
+@pytest.mark.parametrize("fmt,group_size", [("fp8", -1), ("mxfp4", 32)])
+def test_float_apply_preserves_master_and_flows_grad(fmt, group_size):
+    torch.manual_seed(16)
+    chunk = _toy_chunk_32aligned()
+    spec = QATSpec(enabled=True, format=fmt, group_size=group_size)
+    stats = apply_qat_to_chunks([chunk], spec)
+    assert stats["quantized_modules"] == 2  # qkv + proj, lm_head skipped
+    master = chunk.qkv.parametrizations.weight.original
+    assert master.requires_grad
+    # accessing .weight yields the fake-quantized W_hat, not the master
+    assert not torch.equal(chunk.qkv.weight, master)
+    x = torch.randn(4, 64)
+    chunk(x).sum().backward()
+    assert master.grad is not None
+    assert chunk.lm_head.weight.grad is not None  # untouched plain param
 
 
 def test_int4_pack_unpack_roundtrip():
