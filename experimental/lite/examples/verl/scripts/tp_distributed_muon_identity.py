@@ -148,6 +148,26 @@ def _full_grads(device, *, num_ns_bump=0):
             for _ in range(STEPS)]
 
 
+def _corr_grads(device):
+    """FULL grads whose two dim0 row-blocks are IDENTICAL (rank-deficient).
+
+    Used only by the "distributed is real" control (C). With duplicated row-blocks,
+    Newton-Schulz of the FULL matrix couples the blocks (shared normalization), so it
+    diverges *dramatically* from orthogonalizing each shard in isolation. This makes
+    the no-cross-rank case (pg=None per shard) an unmistakably WRONG answer -- exactly
+    the discriminator that proves the distributed path's all_reduce actually ran. (With
+    generic random grads the row-blocks are near-orthogonal, so block-wise ~ full and
+    the control is not discriminative; hence this purpose-built correlated input.)
+    """
+    ggen = torch.Generator().manual_seed(SEED + 7)
+    rows = OUT // 2
+    out = []
+    for _ in range(STEPS):
+        top = torch.randn(rows, IN, generator=ggen, dtype=torch.float32)
+        out.append(torch.cat([top, top], dim=0).to(device))  # bottom block == top block
+    return out
+
+
 def _build_muon(core_cfg, params, *, pg_collection):
     kwargs = _kwargs_from_config(TensorParallelMuon, "muon", core_cfg)  # includes tp_mode
     kwargs["is_qkv_fn"] = lambda p: False
@@ -278,22 +298,30 @@ def main() -> int:
         print(f"[B] DISTRIBUTED_UPDATE_IDENTITY all_ranks_equal={all_equal} "
               f"global_max_abs={global_max:.3e} (real TP={tp_size} distributed NS)")
 
-    # (C) DISTRIBUTED-IS-REAL evidence.
-    w_ref = _run_full_reference(core_a, device, grads=grads)          # single-proc full NS
-    wa_full = _gather_full(wa, tp_group, tp_size)                     # gather distributed
-    dist_vs_ref = (wa_full - w_ref).abs().max().item()
+    # (C) DISTRIBUTED-IS-REAL evidence, on a purpose-built correlated input (identical
+    # dim0 row-blocks) that maximally separates "did cross-rank NS" from "did not".
+    # Requires an even 2-way split; for tp_size!=2 we still report but relax C2.
+    grads_c = _corr_grads(device)
+    w_ref = _run_full_reference(core_a, device, grads=grads_c)        # single-proc full NS
+    wdc, _ = _run_sharded(core_a, pg_collection=pg, tp_rank=tp_rank, tp_size=tp_size,
+                          device=device, grads=grads_c)               # real distributed
+    wdc_full = _gather_full(wdc, tp_group, tp_size)
+    dist_vs_ref = (wdc_full - w_ref).abs().max().item()
     wl, _ = _run_local_shard_nopg(core_a, tp_rank=tp_rank, tp_size=tp_size,
-                                  device=device, grads=grads)         # pg=None per-shard
+                                  device=device, grads=grads_c)       # pg=None per-shard
     wl_full = _gather_full(wl, tp_group, tp_size)
     local_vs_ref = (wl_full - w_ref).abs().max().item()
     TOL = 1e-4
     c1_ok = dist_vs_ref < TOL                     # distributed reconstructs the full NS
-    c2_ok = local_vs_ref > 10 * TOL               # pg=None is a *different* computation
+    # pg=None must be a *dramatically* different (wrong) computation: both absolutely
+    # large and >>100x the distributed residual.
+    c2_ok = (local_vs_ref > 1e-2) and (local_vs_ref > 100 * max(dist_vs_ref, 1e-12))
     if is_head:
         print(f"[C1] DIST_vs_FULLREF max_abs={dist_vs_ref:.3e} tol={TOL:.0e} "
               f"{'OK (distributed == full-matrix NS within fp tol)' if c1_ok else 'FAIL'}")
         print(f"[C2] NOPG_LOCAL_vs_FULLREF max_abs={local_vs_ref:.3e} "
-              f"{'OK (pg=None diverges -> cross-rank all_reduce genuinely mattered)' if c2_ok else 'FAIL'}")
+              f"ratio_vs_dist={local_vs_ref / max(dist_vs_ref, 1e-12):.1f}x "
+              f"{'OK (pg=None diverges hugely -> cross-rank all_reduce genuinely mattered)' if c2_ok else 'FAIL'}")
 
     # (D) NEGATIVE CONTROL: perturb num_ns_steps -> distributed update MUST differ.
     core_d = _make_native_core_config(muon_num_ns_steps=HP["muon_num_ns_steps"] + 1)
