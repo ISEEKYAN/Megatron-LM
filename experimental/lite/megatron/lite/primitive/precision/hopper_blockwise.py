@@ -167,6 +167,46 @@ HOPPER_BLOCKWISE_FP8_WEIGHT = PrecisionImplementation(
 )
 
 
+# Optimizer backends whose parameter write-back can currently own FP8 *compute*
+# weights. The distributed optimizer needs the upstream Megatron
+# ``fp8_param_gather`` path to gather and re-quantize FP8 compute parameters
+# during its sharded update; that path is deliberately out of scope for the
+# closed Hopper profiles. A DistOpt run against an FP8-weight profile would
+# silently update only the BF16-gathered parameters while the FP8 compute
+# weights stay stale -- a run that looks FP8-trained but is not. Only FSDP2 keeps
+# the FP8 compute weights live through its per-parameter update today.
+FP8_WEIGHT_SUPPORTED_OPTIMIZERS = frozenset({"fsdp2"})
+
+
+def require_optimizer_supports_precision(
+    implementation: PrecisionImplementation, optimizer_backend: str
+) -> None:
+    """Fail loud on optimizer/precision combinations that cannot train correctly.
+
+    BF16-weight profiles work under every optimizer backend. FP8 *compute*
+    weights currently require the FSDP2 optimizer: the distributed-optimizer
+    write-back for FP8 weights depends on the upstream Megatron
+    ``fp8_param_gather`` path, which is out of scope for the closed Hopper
+    profiles. Constructing a distributed-optimizer run against an FP8-weight
+    profile is therefore rejected here instead of silently producing a run that
+    looks FP8-trained but leaves the FP8 compute weights stale.
+    """
+
+    if implementation.parameter_contract.compute_weight is WeightStorage.BF16:
+        return
+    if optimizer_backend in FP8_WEIGHT_SUPPORTED_OPTIMIZERS:
+        return
+    supported = ", ".join(sorted(FP8_WEIGHT_SUPPORTED_OPTIMIZERS))
+    raise ValueError(
+        f"{implementation.name} stores FP8 compute weights, which the "
+        f"{optimizer_backend!r} optimizer cannot train correctly: the "
+        "distributed-optimizer FP8 write-back requires the upstream Megatron "
+        "fp8_param_gather path, which is out of scope for the closed Hopper "
+        f"profiles. Use a supported optimizer ({supported}) for FP8-weight "
+        "training, or select the hopper_blockwise_bf16_weight profile."
+    )
+
+
 def resolve_precision(name: str) -> PrecisionImplementation | None:
     """Resolve one of the accepted public precision names.
 

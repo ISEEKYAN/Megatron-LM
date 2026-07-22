@@ -50,6 +50,7 @@ from megatron.lite.primitive.precision import (
     ParameterContract,
     PrecisionCoverage,
     PrecisionImplementation,
+    require_optimizer_supports_precision,
 )
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
@@ -195,6 +196,10 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         if unsupported:
             raise ValueError(
                 f"Closed Hopper precision profiles do not cover {unsupported}."
+            )
+        if impl_cfg.optimizer is not None:
+            require_optimizer_supports_precision(
+                impl_cfg.precision_implementation, impl_cfg.optimizer
             )
 
     # ── validation ──
