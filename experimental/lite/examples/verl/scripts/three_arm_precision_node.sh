@@ -60,11 +60,26 @@ export MLITE_OPTIMIZER_BACKEND="$OPT_BACKEND"
 export MUON_TP_MODE="$MUON_TP_MODE"
 # Megatron-Core's precision-aware optimizer (fp8/fp16 optimizer state) is adam-only
 # (`--use-precision-aware-optimizer only supported with adam`).  For the Muon arms we
-# keep optimizer offload for 35B memory but disable precision-aware state; this is an
-# optimizer-implementation detail, not a training hyperparameter, so the same-contract
-# (model/data/init/seed/tokens/LR) still holds across arms.
+# disable precision-aware state; this is an optimizer-implementation detail, not a
+# training hyperparameter, so the same-contract (model/data/init/seed/tokens/LR)
+# still holds across arms.
 if [[ "$OPT_ALGO" == "muon" ]]; then
   export USE_PRECISION_AWARE_OPTIMIZER=False
+fi
+# Megatron-Core's CPU-offload hybrid_optimizer (optimizer_cpu_offload=True) is
+# INCOMPATIBLE with the distributed Muon path in mcore@fd1121b: the distributed
+# TensorParallel Muon registers params the hybrid optimizer never maps, so the first
+# optimizer.step() raises `KeyError` in
+# hybrid_optimizer._sync_hdo_param_groups_to_sub_optimizers (param_to_inner_param).
+# (The adamw arm survives because adam params ARE in that map; this only surfaced
+# once the muon_tp_mode propagation fix let `distributed` actually reach mcore.)
+# So the dist_opt Muon arm runs with optimizer offload OFF (verified job 14242992:
+# 20 clean steps, 63 GiB/GPU peak).  Muon's optimizer state is smaller than Adam's
+# (matrix params keep one momentum buffer, not two adam moments), so 30B-A3B fits.
+# The fsdp2 Muon arm manages its own memory and is unaffected.  Offload on/off is a
+# memory-placement detail, not a training hyperparameter, so same-contract holds.
+if [[ "$OPT_ALGO" == "muon" && "$OPT_BACKEND" == "dist_opt" ]]; then
+  export OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-False}"
 fi
 export TOTAL_EPOCHS=1
 export SAVE_FREQ="$TOTAL_STEPS"
