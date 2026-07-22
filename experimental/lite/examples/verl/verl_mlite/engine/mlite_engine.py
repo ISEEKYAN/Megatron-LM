@@ -607,7 +607,7 @@ class MegatronLiteEngine(BaseEngine):
             lr_decay_style = getattr(self.optimizer_config, "lr_scheduler_type", "constant")
 
         return MegatronLiteOptimizerConfig(
-            optimizer=optimizer_name,
+            optimizer_algorithm=optimizer_name,
             lr=self.optimizer_config.lr,
             min_lr=min_lr,
             clip_grad=self.optimizer_config.clip_grad,
@@ -632,6 +632,16 @@ class MegatronLiteEngine(BaseEngine):
             offload_fraction=offload_fraction,
             use_precision_aware_optimizer=override.get("use_precision_aware_optimizer"),
             decoupled_weight_decay=override.get("decoupled_weight_decay"),
+            muon_momentum=override.get("muon_momentum", 0.95),
+            muon_split_qkv=override.get("muon_split_qkv", True),
+            muon_nesterov=override.get("muon_nesterov", False),
+            muon_scale_mode=override.get("muon_scale_mode", "spectral"),
+            muon_fp32_matmul_prec=override.get("muon_fp32_matmul_prec", "medium"),
+            muon_coefficient_type=override.get("muon_coefficient_type", "quintic"),
+            muon_num_ns_steps=override.get("muon_num_ns_steps", 5),
+            muon_tp_mode=override.get("muon_tp_mode", "blockwise"),
+            muon_extra_scale_factor=override.get("muon_extra_scale_factor", 1.0),
+            muon_scalar_optimizer=override.get("muon_scalar_optimizer", "adam"),
         )
 
     @staticmethod
@@ -640,8 +650,11 @@ class MegatronLiteEngine(BaseEngine):
         lower = str(optimizer_name).lower()
         if "adam" in lower:
             return "adam"
+        if lower == "muon":
+            return "muon"
         raise ValueError(
-            f"MegatronLiteEngine only supports Adam-style optimizers today, got {optimizer_name!r}"
+            "MegatronLiteEngine only supports Adam-style optimizers and Muon, "
+            f"got {optimizer_name!r}"
         )
 
     def _extract_primary_module(self):

@@ -480,3 +480,19 @@ def test_verl_sft_script_does_not_emit_optimizer_state_offload_when_disabled(tmp
     assert "engine.param_offload=False" in command
     assert "engine.optimizer_offload=False" in command
     assert "override_optimizer_config.offload_fraction" not in command
+
+
+def test_verl_sft_script_exposes_optimizer_algorithm_contract(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[3]
+        / "examples"
+        / "verl"
+        / "scripts"
+        / "run_qwen3moe_sft.sh"
+    )
+
+    command = _run_verl_sft_dry_run(script, tmp_path, OPTIMIZER_ALGORITHM="muon")
+
+    # VERL names this field ``optim.optimizer``; MegatronLiteEngine lowers it
+    # to the canonical runtime ``optimizer_algorithm`` contract.
+    assert "optim.optimizer=muon" in command

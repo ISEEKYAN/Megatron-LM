@@ -60,6 +60,10 @@ Useful knobs:
 - `PARAM_OFFLOAD`, `OPTIMIZER_OFFLOAD`, `GRAD_OFFLOAD`
 - `MLITE_MODEL_NAME=auto`, `MLITE_IMPL=lite`
 - `ATTENTION_BACKEND=flash`
+- `OPTIMIZER_ALGORITHM=adamw` (default) or `muon`; the latter is lowered to
+  MLite's canonical `optimizer_algorithm=muon` contract. Muon-specific knobs
+  are exposed as `MUON_*` environment variables (`MUON_MOMENTUM`,
+  `MUON_NUM_NS_STEPS`, and so on).
 - `DRY_RUN=1` to print the resolved `torchrun` command without launching
 
 FSDP2 supports two offload modes. `PARAM_OFFLOAD=True` and

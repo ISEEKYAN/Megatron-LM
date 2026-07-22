@@ -111,6 +111,22 @@ def test_optimizer_cpu_offload_alias_maps_to_full_offload_fraction() -> None:
     assert optimizer.offload_fraction == 1.0
 
 
+def test_optimizer_algorithm_muon_is_lowered_to_runtime_contract() -> None:
+    engine = _engine(
+        engine_config=_engine_config(),
+        optimizer_config=_optimizer_config(
+            optimizer="muon", muon_momentum=0.9, muon_num_ns_steps=7
+        ),
+    )
+
+    optimizer = engine._build_mlite_optimizer_config()
+
+    assert optimizer.optimizer_algorithm == "muon"
+    assert optimizer.optimizer is None
+    assert optimizer.muon_momentum == 0.9
+    assert optimizer.muon_num_ns_steps == 7
+
+
 def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
     engine = _engine(
         engine_config=_engine_config(
