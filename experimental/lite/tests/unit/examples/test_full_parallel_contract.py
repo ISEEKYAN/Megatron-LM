@@ -108,3 +108,139 @@ def test_full_parallel_contract_routes_muon_to_the_fsdp2_optimizer() -> None:
     )
 
     assert any(isinstance(child, FP32Muon) for child in optimizer.optimizer.optimizers)
+
+
+# ---------------------------------------------------------------------------
+# C-MLITE-SCHED-NULL regression: the mlite arms must build a real LR scheduler.
+#
+# Megatron-Core is absent on a bare CPU host, so ``OptimizerParamScheduler``
+# cannot be instantiated here. These tests inject a minimal stand-in module so
+# the *wiring* (mlite builds a scheduler, and stepping it advances the LR) is
+# proven on CPU rather than only asserted structurally.
+# ---------------------------------------------------------------------------
+
+
+class _FakeParamScheduler:
+    """Linear-warmup stand-in for megatron.core's OptimizerParamScheduler."""
+
+    def __init__(self, optimizer, *, init_lr, max_lr, min_lr, lr_warmup_steps, **_kwargs):
+        self.optimizer = optimizer
+        self.init_lr = init_lr
+        self.max_lr = max_lr
+        self.min_lr = min_lr
+        self.warmup = lr_warmup_steps
+        self.num_steps = 0
+        self._apply()
+
+    def _apply(self) -> None:
+        if self.warmup > 0 and self.num_steps < self.warmup:
+            lr = self.init_lr + (self.max_lr - self.init_lr) * self.num_steps / self.warmup
+        else:
+            lr = self.max_lr
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+
+    def step(self, increment: int = 1) -> None:
+        self.num_steps += increment
+        self._apply()
+
+
+class _StubOptimizerWithGroups:
+    def __init__(self) -> None:
+        self.param_groups = [{"lr": 0.0, "weight_decay": 0.0}]
+
+
+def _inject_fake_scheduler(monkeypatch) -> None:
+    import types
+
+    module = types.ModuleType("megatron.core.optimizer_param_scheduler")
+    module.OptimizerParamScheduler = _FakeParamScheduler
+    core = sys.modules.get("megatron.core")
+    if core is None:
+        core = types.ModuleType("megatron.core")
+        monkeypatch.setitem(sys.modules, "megatron.core", core)
+    monkeypatch.setitem(sys.modules, "megatron.core.optimizer_param_scheduler", module)
+
+
+def test_build_lr_scheduler_builds_a_real_lr_advancing_scheduler(monkeypatch) -> None:
+    _inject_fake_scheduler(monkeypatch)
+
+    from examples.bench.full_parallel_contract import FullParallelContract
+    from megatron.lite.primitive.optimizers.megatron_wrap import build_lr_scheduler
+    from megatron.lite.runtime.contracts.config import OptimizerConfig
+
+    contract = FullParallelContract(hf_path="/tmp/Qwen3.5-35B-A3B")
+    opt = OptimizerConfig(**contract.optimizer_overrides())
+    optimizer = _StubOptimizerWithGroups()
+
+    scheduler = build_lr_scheduler(optimizer, opt)
+    assert scheduler is not None
+
+    # Warmup must move the LR off its start value and toward ``max_lr``.
+    lr_start = optimizer.param_groups[0]["lr"]
+    scheduler.step(1)
+    lr_after_one = optimizer.param_groups[0]["lr"]
+    assert lr_after_one > lr_start
+    scheduler.step(1)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(contract.lr)
+
+
+def test_build_lr_scheduler_returns_none_when_horizon_unset() -> None:
+    """No horizon -> no scheduler; the runtime would freeze the LR (guard for it)."""
+    from megatron.lite.primitive.optimizers.megatron_wrap import build_lr_scheduler
+    from megatron.lite.runtime.contracts.config import OptimizerConfig
+
+    opt = OptimizerConfig(optimizer_algorithm="muon", total_training_steps=-1)
+    assert build_lr_scheduler(_StubOptimizerWithGroups(), opt) is None
+    assert build_lr_scheduler(None, opt) is None
+
+
+def test_mlite_runtime_resolves_a_scheduler_for_the_contract(monkeypatch) -> None:
+    """The mlite runtime path must build a scheduler (not the old ``None``)."""
+    _inject_fake_scheduler(monkeypatch)
+
+    from examples.bench.full_parallel_contract import FullParallelContract
+    from megatron.lite.runtime.backends.mlite.runtime import _resolve_lr_scheduler
+    from megatron.lite.runtime.contracts.config import OptimizerConfig
+
+    contract = FullParallelContract(hf_path="/tmp/Qwen3.5-35B-A3B")
+    opt = OptimizerConfig(**contract.optimizer_overrides())
+
+    scheduler = _resolve_lr_scheduler(_StubOptimizerWithGroups(), opt)
+    assert scheduler is not None
+    # No optimizer / no config -> nothing to schedule.
+    assert _resolve_lr_scheduler(None, opt) is None
+    assert _resolve_lr_scheduler(_StubOptimizerWithGroups(), None) is None
+
+
+def test_mlite_lr_scheduler_step_advances_lr_instead_of_returning_zero() -> None:
+    """``lr_scheduler_step`` must drive the real scheduler, not silently no-op."""
+    from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
+    from megatron.lite.runtime.contracts.handle import ModelHandle
+
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    optimizer = _StubOptimizerWithGroups()
+    scheduler = _FakeParamScheduler(
+        optimizer, init_lr=0.0, max_lr=1.0e-4, min_lr=1.0e-5, lr_warmup_steps=2
+    )
+    handle = ModelHandle(model=None, optimizer=optimizer, lr_scheduler=scheduler)
+
+    lr = runtime.lr_scheduler_step(handle)
+    assert lr == optimizer.param_groups[0]["lr"]
+    assert lr > 0.0
+
+    # Without a scheduler the arm would train frozen; the contract forbids that,
+    # but the method itself still degrades to 0.0 (and the gate/tests catch the
+    # missing scheduler upstream).
+    frozen_handle = ModelHandle(model=None, optimizer=optimizer, lr_scheduler=None)
+    assert runtime.lr_scheduler_step(frozen_handle) == 0.0
+
+
+def test_gate_probe_flags_a_frozen_lr_arm() -> None:
+    """The gate probe must fail loudly when an arm would drop its scheduler."""
+    from examples.bench.full_parallel_contract import _probe_lr_scheduler_would_build
+    from megatron.lite.runtime.contracts.config import OptimizerConfig
+
+    frozen = OptimizerConfig(optimizer_algorithm="muon", total_training_steps=-1)
+    with pytest.raises(AssertionError, match="frozen LR"):
+        _probe_lr_scheduler_would_build(frozen)

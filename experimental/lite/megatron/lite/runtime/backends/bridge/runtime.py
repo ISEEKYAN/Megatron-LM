@@ -426,36 +426,13 @@ def _build_optimizer(model_list: list, cfg: BridgeConfig):
 
 
 def _build_lr_scheduler(optimizer, cfg: BridgeConfig):
-    opt = cfg.optimizer
-    total_steps = opt.total_training_steps
-    if total_steps <= 0:
-        return None
+    # Delegate to the shared builder so every arm (this bridge, mbridge, and the
+    # Megatron Lite runtime) constructs the identical OptimizerParamScheduler
+    # from the identical OptimizerConfig -- the precondition for DistOpt-vs-
+    # Megatron bitwise LR parity.
+    from megatron.lite.primitive.optimizers.megatron_wrap import build_lr_scheduler
 
-    from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
-
-    warmup_steps = opt.lr_warmup_steps
-    if warmup_steps <= 0 and opt.lr_warmup_steps_ratio > 0:
-        warmup_steps = int(opt.lr_warmup_steps_ratio * total_steps)
-    warmup_steps = max(warmup_steps, 0)
-    decay_steps = opt.lr_decay_steps if opt.lr_decay_steps is not None else total_steps
-
-    return OptimizerParamScheduler(
-        optimizer,
-        init_lr=opt.lr_warmup_init,
-        max_lr=opt.lr,
-        min_lr=opt.min_lr,
-        lr_warmup_steps=warmup_steps,
-        lr_decay_steps=decay_steps,
-        lr_decay_style=opt.lr_decay_style,
-        start_wd=opt.weight_decay,
-        end_wd=opt.weight_decay,
-        wd_incr_steps=total_steps,
-        wd_incr_style=opt.weight_decay_incr_style,
-        use_checkpoint_opt_param_scheduler=opt.use_checkpoint_opt_param_scheduler,
-        override_opt_param_scheduler=not opt.use_checkpoint_opt_param_scheduler,
-        wsd_decay_steps=opt.lr_wsd_decay_steps,
-        lr_wsd_decay_style=opt.lr_wsd_decay_style,
-    )
+    return build_lr_scheduler(optimizer, cfg.optimizer)
 
 
 def _build_ddp_config(cfg: BridgeConfig):

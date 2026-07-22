@@ -171,6 +171,47 @@ def _probe_megatron_optimizer_build(backend_cfg) -> None:
         return
 
 
+class _StubOptimizer:
+    """Minimal optimizer stand-in for the scheduler-build probe.
+
+    ``build_lr_scheduler`` only touches ``param_groups`` inside
+    ``OptimizerParamScheduler``; the None-vs-build decision happens before that,
+    so a single dummy group is enough to exercise the branch the runtime takes.
+    """
+
+    def __init__(self) -> None:
+        self.param_groups = [{"lr": 0.0, "weight_decay": 0.0}]
+
+
+def _probe_lr_scheduler_would_build(optimizer_config) -> None:
+    """Prove the arm builds a real LR scheduler instead of freezing the LR.
+
+    Every arm's runtime lowers this same ``OptimizerConfig`` into the shared
+    ``build_lr_scheduler``. Checking only ``total_training_steps > 0`` is
+    false-green: the mlite arms used to hard-code ``lr_scheduler=None`` and drop
+    the schedule regardless. Here we call the exact builder the runtimes call.
+
+    * Returns a scheduler object -> the arm schedules its LR. Good.
+    * Returns ``None`` -> the arm would train with a frozen LR. Fail loudly.
+    * Raises ``ImportError`` -> Megatron-Core is absent (bare CPU gate), but the
+      code already passed the ``total_training_steps > 0`` guard and reached the
+      ``OptimizerParamScheduler`` import, i.e. it *would* build on the GPU arms.
+      The executable proof that the object constructs and steps the LR lives in
+      the unit tests (which inject a stub scheduler module).
+    """
+    from megatron.lite.primitive.optimizers.megatron_wrap import build_lr_scheduler
+
+    try:
+        scheduler = build_lr_scheduler(_StubOptimizer(), optimizer_config)
+    except (ImportError, ModuleNotFoundError):
+        return
+    if scheduler is None:
+        raise AssertionError(
+            "arm would train with a frozen LR: build_lr_scheduler returned None "
+            "for a contract with a real training horizon."
+        )
+
+
 def config_only_gate(contract: FullParallelContract) -> dict[str, Any]:
     """Exercise all three real config constructors without distributed/GPU init."""
 
@@ -203,12 +244,19 @@ def config_only_gate(contract: FullParallelContract) -> dict[str, Any]:
         actual_optimizer = {key: getattr(optimizer, key) for key in expected_optimizer}
         if actual_optimizer != expected_optimizer:
             raise AssertionError(f"{name} optimizer contract drifted.")
-        # ``_build_lr_scheduler`` returns ``None`` when this is <= 0, so the arm
-        # would train with a frozen LR while claiming the contract's schedule.
+        # The scheduler horizon must be lowered onto the optimizer *and* the arm
+        # must actually build a scheduler from it. ``build_lr_scheduler`` returns
+        # ``None`` when the horizon is <= 0, so the arm would train with a frozen
+        # LR while claiming the contract's schedule; the probe calls the exact
+        # builder each runtime uses (see ``_probe_lr_scheduler_would_build``).
         if optimizer.total_training_steps <= 0:
             raise AssertionError(
                 f"{name} scheduler horizon was not lowered onto the optimizer."
             )
+        try:
+            _probe_lr_scheduler_would_build(optimizer)
+        except AssertionError as exc:
+            raise AssertionError(f"{name}: {exc}") from exc
         if name == "megatron":
             override = runtime_backend_cfg.override_optimizer_config
             if override:

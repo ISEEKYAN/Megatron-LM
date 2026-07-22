@@ -122,6 +122,21 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
     return (local_seq_len, batch_size, int(model_cfg.hidden_size) * hc_mult)
 
 
+def _resolve_lr_scheduler(optimizer, opt_config):
+    """Build the shared LR scheduler for the Megatron Lite arm.
+
+    Both Megatron Lite optimizers (Megatron-Core dist_opt and the FSDP2
+    Muon/AdamW facade) expose ``param_groups`` whose ``lr`` is read every
+    step, so the same ``OptimizerParamScheduler`` the ``bridge``/``mbridge``
+    arms use drives them too.  Wiring this here is what stops the Megatron Lite
+    arms from silently training with a frozen LR (the ``lr_scheduler=None``
+    regression the contract gate now probes for).
+    """
+    from megatron.lite.primitive.optimizers.megatron_wrap import build_lr_scheduler
+
+    return build_lr_scheduler(optimizer, opt_config)
+
+
 def _last_loss_output(outputs: list[dict]) -> dict:
     for output in reversed(outputs):
         if output.get("loss") is not None:
@@ -247,10 +262,11 @@ class MegatronLiteRuntime(RuntimeBase):
 
         p = rt_cfg.parallel
         model = bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks
+        lr_scheduler = _resolve_lr_scheduler(bundle.optimizer, getattr(rt_cfg, "optimizer", None))
         return ModelHandle(
             model=model,
             optimizer=bundle.optimizer,
-            lr_scheduler=None,
+            lr_scheduler=lr_scheduler,
             parallel_state=bundle.parallel_state,
             config=rt_cfg,
             _extras={
@@ -528,9 +544,12 @@ class MegatronLiteRuntime(RuntimeBase):
         return update_successful, float(grad_norm), num_zeros
 
     def lr_scheduler_step(self, handle: ModelHandle) -> float | list[float]:
+        # OptimizerParamScheduler (shared with the bridge/mbridge arms) advances
+        # by an explicit increment and writes the new LR onto the optimizer's
+        # param groups; read it back the same way bridge does.
         if handle._lr_scheduler is not None:
-            handle._lr_scheduler.step()
-            return handle._lr_scheduler.get_last_lr()
+            handle._lr_scheduler.step(1)
+            return handle._optimizer.param_groups[0]["lr"]
         return 0.0
 
 

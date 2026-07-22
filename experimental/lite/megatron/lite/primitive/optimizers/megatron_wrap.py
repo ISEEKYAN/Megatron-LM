@@ -130,6 +130,56 @@ def build_dist_opt_optimizer_config(
     return CoreOptimizerConfig(**args)
 
 
+def build_lr_scheduler(optimizer, opt):
+    """Build the shared Megatron-Core ``OptimizerParamScheduler`` for any arm.
+
+    Single source of truth for the comparison contract's LR schedule.  Every
+    backend (Megatron-Core dist_opt via ``bridge``/``mbridge`` and the Megatron
+    Lite runtime for both its dist_opt and FSDP2 arms) constructs the *same*
+    scheduler from the *same* :class:`OptimizerConfig`, so the DistOpt arm stays
+    bitwise-comparable to the Megatron reference instead of running a divergent
+    (or, worse, absent) schedule.
+
+    Returns ``None`` only when there is nothing to schedule (no optimizer, or the
+    horizon was left unset at ``total_training_steps <= 0``).  Any caller that
+    lets this return ``None`` on a real training horizon would train with a
+    frozen LR -- the gate probes for exactly that regression.
+    """
+    if optimizer is None or opt is None:
+        return None
+    total_steps = int(opt.total_training_steps)
+    if total_steps <= 0:
+        return None
+
+    from megatron.core.optimizer_param_scheduler import (  # pyright: ignore[reportMissingImports]
+        OptimizerParamScheduler,
+    )
+
+    warmup_steps = opt.lr_warmup_steps
+    if warmup_steps <= 0 and opt.lr_warmup_steps_ratio > 0:
+        warmup_steps = int(opt.lr_warmup_steps_ratio * total_steps)
+    warmup_steps = max(warmup_steps, 0)
+    decay_steps = opt.lr_decay_steps if opt.lr_decay_steps is not None else total_steps
+
+    return OptimizerParamScheduler(
+        optimizer,
+        init_lr=opt.lr_warmup_init,
+        max_lr=opt.lr,
+        min_lr=opt.min_lr,
+        lr_warmup_steps=warmup_steps,
+        lr_decay_steps=decay_steps,
+        lr_decay_style=opt.lr_decay_style,
+        start_wd=opt.weight_decay,
+        end_wd=opt.weight_decay,
+        wd_incr_steps=total_steps,
+        wd_incr_style=opt.weight_decay_incr_style,
+        use_checkpoint_opt_param_scheduler=opt.use_checkpoint_opt_param_scheduler,
+        override_opt_param_scheduler=not opt.use_checkpoint_opt_param_scheduler,
+        wsd_decay_steps=opt.lr_wsd_decay_steps,
+        lr_wsd_decay_style=opt.lr_wsd_decay_style,
+    )
+
+
 def build_dist_opt_stack(
     model_chunks: list[nn.Module],
     *,
