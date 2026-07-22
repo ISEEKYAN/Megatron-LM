@@ -84,6 +84,7 @@ def _parallel_config(cfg: BenchCliConfig) -> ParallelConfig:
 
 def _optimizer_config(cfg: BenchCliConfig) -> OptimizerConfig:
     return OptimizerConfig(
+        optimizer_algorithm="adam",
         lr=cfg.optimizer_lr,
         weight_decay=cfg.optimizer_weight_decay,
         clip_grad=cfg.optimizer_clip_grad,

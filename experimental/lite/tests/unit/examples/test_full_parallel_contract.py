@@ -56,3 +56,26 @@ def test_full_parallel_contract_rejects_non_muon_optimizer() -> None:
 
     with pytest.raises(ValueError, match="requires Muon"):
         FullParallelContract(optimizer_algorithm="adam").validate()
+
+
+def test_full_parallel_contract_routes_muon_to_the_fsdp2_optimizer() -> None:
+    """The contract must build a real Muon child, never silently AdamW only."""
+    import torch
+
+    from megatron.lite.primitive.optimizers.fsdp2.optimizer import build_fsdp2_muon
+    from megatron.lite.primitive.optimizers.fsdp2.muon import FP32Muon
+    from megatron.lite.runtime.contracts.config import OptimizerConfig
+
+    class MatrixAndBias(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.matrix = torch.nn.Parameter(torch.randn(4, 4))
+            self.bias = torch.nn.Parameter(torch.randn(4))
+
+    model = MatrixAndBias()
+    model.matrix.is_managed_by_layer_wise_optimizer = True
+    optimizer = build_fsdp2_muon(
+        [model], OptimizerConfig(optimizer_algorithm="muon"), ps=None
+    )
+
+    assert any(isinstance(child, FP32Muon) for child in optimizer.optimizer.optimizers)

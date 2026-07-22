@@ -75,8 +75,9 @@ def build_dist_opt_optimizer_config(
     )
 
     offload = getattr(opt, "offload_fraction", None) or 0.0
+    optimizer_algorithm = str(getattr(opt, "optimizer_algorithm", "adam")).lower()
     args: dict[str, Any] = {
-        "optimizer": opt.optimizer,
+        "optimizer": optimizer_algorithm,
         "lr": opt.lr,
         "min_lr": getattr(opt, "min_lr", 0.0),
         "weight_decay": opt.weight_decay,
@@ -100,7 +101,11 @@ def build_dist_opt_optimizer_config(
     if getattr(opt, "decoupled_weight_decay", None) is not None:
         args["decoupled_weight_decay"] = opt.decoupled_weight_decay
     if override_optimizer_config:
-        args.update(override_optimizer_config)
+        overrides = dict(override_optimizer_config)
+        declared_algorithm = overrides.pop("optimizer_algorithm", optimizer_algorithm)
+        if str(declared_algorithm).lower() != optimizer_algorithm:
+            raise ValueError("override optimizer_algorithm conflicts with runtime contract")
+        args.update(overrides)
     return CoreOptimizerConfig(**args)
 
 
