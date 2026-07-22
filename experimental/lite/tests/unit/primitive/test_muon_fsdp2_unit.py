@@ -86,7 +86,7 @@ _MUON_KWARGS = dict(
 )
 
 
-def _shard_worker(rank, world_size, store_path, rows, cols, num_steps, split_shapes):
+def _shard_worker(rank, world_size, store_path, rows, cols, num_steps, split_shapes, matmul_prec):
     from torch.distributed import DeviceMesh
     from torch.distributed.tensor import distribute_tensor
 
@@ -119,7 +119,7 @@ def _shard_worker(rank, world_size, store_path, rows, cols, num_steps, split_sha
             coefficient_type=_MUON_KWARGS["coeff"],
             scale_mode=_MUON_KWARGS["scale_mode"],
             extra_scale_factor=_MUON_KWARGS["extra"],
-            fp32_matmul_prec=_MUON_KWARGS["matmul_prec"],
+            fp32_matmul_prec=matmul_prec,
         )
         for grad in grads:
             param.grad = distribute_tensor(grad.clone(), mesh, [placement])
@@ -129,8 +129,9 @@ def _shard_worker(rank, world_size, store_path, rows, cols, num_steps, split_sha
             full_weight, grads, split_shapes=split_shapes,
             **{k: _MUON_KWARGS[k] for k in
                ("lr", "momentum", "steps", "coeff", "scale_mode", "extra",
-                "nesterov", "decoupled", "matmul_prec")},
+                "nesterov", "decoupled")},
             wd=_MUON_KWARGS["weight_decay"],
+            matmul_prec=matmul_prec,
         )
         expected_local = distribute_tensor(oracle_master, mesh, [placement]).to_local()
         got_local = param.detach().to_local()
@@ -139,18 +140,21 @@ def _shard_worker(rank, world_size, store_path, rows, cols, num_steps, split_sha
             max_diff = (got_local - expected_local).abs().max().item()
             raise AssertionError(
                 f"rank {rank}/{world_size} shard mismatch (placement={placement}, "
-                f"shape=({rows},{cols}), split={split_shapes}): max_diff={max_diff}"
+                f"shape=({rows},{cols}), split={split_shapes}, prec={matmul_prec}): "
+                f"max_diff={max_diff}"
             )
     finally:
         dist.destroy_process_group()
 
 
-def _run_shard_case(world_size, rows, cols, num_steps, split_shapes):
+def _run_shard_case(world_size, rows, cols, num_steps, split_shapes, matmul_prec=None):
+    if matmul_prec is None:
+        matmul_prec = _MUON_KWARGS["matmul_prec"]
     with tempfile.TemporaryDirectory() as tmp:
         store_path = os.path.join(tmp, "store")
         mp.spawn(
             _shard_worker,
-            args=(world_size, store_path, rows, cols, num_steps, split_shapes),
+            args=(world_size, store_path, rows, cols, num_steps, split_shapes, matmul_prec),
             nprocs=world_size,
             join=True,
         )
@@ -179,6 +183,98 @@ def test_muon_sharded_qkv_split_matches_oracle(world_size):
     # Fused QKV weight: rows = num_query_groups * (q + k + v) head slices.
     # 2 groups * (4 + 2 + 2) = 16 rows, sharded over DP.
     _run_shard_case(world_size, rows=16, cols=12, num_steps=2, split_shapes=(4, 2, 2))
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_muon_distributed_ns_matches_full_matrix_oracle(world_size):
+    # rows >= cols and Shard(0) -> `_should_use_distributed_ns` is True, so the
+    # step routes through `newton_schulz_tp(tp_mode="distributed")` (the rewrite's
+    # whole point: no gather, NS split across ranks via all-reduce). This asserts
+    # the *distributed* NS path is per-value equal to the unsharded full-matrix
+    # oracle -- not just that it avoids the gather (that is checked separately in
+    # ``test_muon_distributed_ns_avoids_redundant_gather``). rows=16 is divisible
+    # by 2 and 4 so the row-shards stay even.
+    #
+    # We pin ``highest`` fp32 matmul precision here: the distributed NS reduces a
+    # per-rank Gram matrix via all-reduce, so its matmul/accumulation *order*
+    # differs from the single full-matrix NS the oracle runs. Under exact fp32
+    # both compute the identical Newton-Schulz iteration, so they agree to fp32
+    # round-off (~1e-6). See ``test_muon_distributed_ns_medium_precision_bounded``
+    # for the production ``medium`` precision case, where that different order
+    # combined with reduced-precision matmul produces a *bounded* ~1e-2 drift --
+    # the same benign divergence the Megatron distributed (DistOpt) arm has vs a
+    # naive reference, not an algorithmic error.
+    _run_shard_case(
+        world_size, rows=16, cols=8, num_steps=3, split_shapes=None, matmul_prec="highest"
+    )
+
+
+@pytest.mark.parametrize("world_size", [2])
+def test_muon_distributed_ns_medium_precision_bounded(world_size):
+    # Same distributed-NS route as above but at the production ``medium`` matmul
+    # precision. The distributed Gram all-reduce runs a different reduced-precision
+    # accumulation order than the oracle's single full-matrix NS, so the per-value
+    # match loosens from ~1e-6 (highest) to a *bounded* few-1e-2. This pins that
+    # the divergence is a reduced-precision artifact (bounded, expected), not an
+    # unbounded correctness failure. Threshold is generous but finite: a real bug
+    # (e.g. wrong transpose / partition_dim) would blow past it by orders.
+    with tempfile.TemporaryDirectory() as tmp:
+        store_path = os.path.join(tmp, "store")
+        mp.spawn(
+            _bounded_drift_worker,
+            args=(world_size, store_path),
+            nprocs=world_size,
+            join=True,
+        )
+
+
+def _bounded_drift_worker(rank, world_size, store_path):
+    from torch.distributed import DeviceMesh
+    from torch.distributed.tensor import distribute_tensor
+
+    from megatron.lite.primitive.optimizers.fsdp2.wrap import build_fsdp2_shard_placement_fn
+
+    store = dist.FileStore(store_path, world_size)
+    dist.init_process_group(backend="gloo", store=store, rank=rank, world_size=world_size)
+    try:
+        mesh = DeviceMesh.from_group(dist.group.WORLD, "cpu", mesh_dim_names=("dp",))
+        torch.manual_seed(20260711)
+        rows, cols, num_steps = 16, 8, 3
+        full_weight = torch.randn(rows, cols, dtype=torch.float32)
+        grads = [torch.randn(rows, cols, dtype=torch.float32) for _ in range(num_steps)]
+
+        placement = build_fsdp2_shard_placement_fn(world_size)(full_weight)
+        param = torch.nn.Parameter(distribute_tensor(full_weight.clone(), mesh, [placement]))
+        opt = FP32Muon(
+            [{"params": [param], "weight_decay": _MUON_KWARGS["weight_decay"]}],
+            lr=_MUON_KWARGS["lr"], momentum=_MUON_KWARGS["momentum"],
+            weight_decay=_MUON_KWARGS["weight_decay"],
+            use_decoupled_weight_decay=_MUON_KWARGS["decoupled"],
+            num_ns_steps=_MUON_KWARGS["steps"], coefficient_type=_MUON_KWARGS["coeff"],
+            scale_mode=_MUON_KWARGS["scale_mode"], extra_scale_factor=_MUON_KWARGS["extra"],
+            fp32_matmul_prec="medium",
+        )
+        for grad in grads:
+            param.grad = distribute_tensor(grad.clone(), mesh, [placement])
+            opt.step()
+
+        oracle_master = _oracle_muon(
+            full_weight, grads, split_shapes=None,
+            **{k: _MUON_KWARGS[k] for k in
+               ("lr", "momentum", "steps", "coeff", "scale_mode", "extra",
+                "nesterov", "decoupled")},
+            wd=_MUON_KWARGS["weight_decay"], matmul_prec="medium",
+        )
+        expected_local = distribute_tensor(oracle_master, mesh, [placement]).to_local()
+        got_local = param.detach().to_local()
+        max_diff = (got_local - expected_local).abs().max().item()
+        # Loose (few-1e-2) but finite: reduced-precision drift, not a broken algo.
+        assert max_diff < 5e-2, f"rank {rank}: unbounded distributed-NS drift {max_diff}"
+        # And it must be genuinely larger than the highest-precision agreement,
+        # confirming the gap is the reduced-precision matmul, not noise.
+        assert max_diff > 1e-4, f"rank {rank}: unexpectedly tight at medium ({max_diff})"
+    finally:
+        dist.destroy_process_group()
 
 
 def _distributed_ns_worker(rank, world_size, store_path):

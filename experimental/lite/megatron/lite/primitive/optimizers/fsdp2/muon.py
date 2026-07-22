@@ -15,7 +15,13 @@ Sharding contract (per 2D Muon-managed parameter):
   ``emerging_optimizers.newton_schulz_tp`` in **distributed** mode: the FSDP2
   DTensor mesh supplies ``tp_group``, the shard placement supplies
   ``partition_dim``, and NS work is split across ranks via all-reduce rather
-  than gathering the full matrix and redundantly re-running NS on every rank;
+  than gathering the full matrix and redundantly re-running NS on every rank.
+  In exact fp32 the distributed iteration equals the single full-matrix NS (it
+  reduces the same Gram matrix), so unit tests match an unsharded reference to
+  round-off (~1e-6) at ``highest`` matmul precision; at the production
+  ``medium`` precision the different reduction order yields a *bounded* ~1e-2
+  drift -- the same benign divergence the Megatron distributed (DistOpt) arm
+  has vs a naive reference, not an algorithmic error;
 * fused QKV weights that are not evenly split across complete query groups fall
   back to a bounded gather → per-head ``newton_schulz`` → reshard path (the
   gather is required for correct Q/K/V separation, not for NS redundancy).
