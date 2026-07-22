@@ -507,6 +507,38 @@ def test_typed_coverage_fails_loud_for_incomplete_or_ambiguous_binding(
             coverage.seal()
 
 
+@pytest.mark.parametrize("optimizer_backend", ["dist_opt", "adam", "megatron"])
+def test_fp8_weight_profile_rejects_optimizers_without_fp8_param_gather(optimizer_backend):
+    from megatron.lite.primitive.precision import (
+        FP8_WEIGHT_SUPPORTED_OPTIMIZERS,
+        require_optimizer_supports_precision,
+        resolve_precision,
+    )
+
+    assert FP8_WEIGHT_SUPPORTED_OPTIMIZERS == frozenset({"fsdp2"})
+    fp8_weight = resolve_precision("hopper_blockwise_fp8_weight")
+    # FP8 compute weights need the upstream Megatron fp8_param_gather write-back,
+    # absent from the closed profiles, so any optimizer that lacks it must fail
+    # loud instead of silently training BF16-gathered params.
+    with pytest.raises(ValueError, match="fp8_param_gather"):
+        require_optimizer_supports_precision(fp8_weight, optimizer_backend)
+
+
+def test_optimizer_precision_gate_allows_supported_combinations():
+    from megatron.lite.primitive.precision import (
+        require_optimizer_supports_precision,
+        resolve_precision,
+    )
+
+    fp8_weight = resolve_precision("hopper_blockwise_fp8_weight")
+    bf16_weight = resolve_precision("hopper_blockwise_bf16_weight")
+    # FSDP2 keeps FP8 compute weights live through its per-parameter update.
+    require_optimizer_supports_precision(fp8_weight, "fsdp2")
+    # A BF16-weight profile trains under every optimizer backend unchanged.
+    for backend in ("dist_opt", "fsdp2", "adam", "megatron"):
+        require_optimizer_supports_precision(bf16_weight, backend)
+
+
 def test_precision_package_stays_narrow_and_model_agnostic():
     root = Path(__file__).resolve().parents[3]
     precision_root = root / "megatron" / "lite" / "primitive" / "precision"

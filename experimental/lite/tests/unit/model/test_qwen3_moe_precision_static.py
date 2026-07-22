@@ -64,6 +64,39 @@ def test_qwen3_moe_rejects_partial_or_unvalidated_precision_composition(
         )
 
 
+def test_qwen3_moe_rejects_fp8_weight_with_distributed_optimizer(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import protocol
+    from megatron.lite.primitive.precision import PrecisionCoverage, resolve_precision
+
+    fp8_weight = resolve_precision("hopper_blockwise_fp8_weight")
+    assert fp8_weight is not None
+
+    def _fp8_impl_cfg(**overrides):
+        return protocol.ImplConfig(
+            precision_coverage=PrecisionCoverage(fp8_weight),
+            precision_implementation=fp8_weight,
+            precision_parameter_contract=fp8_weight.parameter_contract,
+            **overrides,
+        )
+
+    # BLOCKER regression (distopt-fp8-silent): FP8 compute weights need the
+    # upstream Megatron fp8_param_gather write-back, which the closed profiles do
+    # not ship. The distributed-optimizer path is qwen3_moe's default optimizer,
+    # so an FP8-weight run under it is *constructible*; build_model must reject it
+    # loudly instead of silently training BF16-gathered params while the FP8
+    # compute weights stay stale (a run that looks FP8-trained but is not).
+    assert protocol.ImplConfig().optimizer == "dist_opt"
+    with pytest.raises(ValueError, match="fp8_param_gather"):
+        protocol.build_model(SimpleNamespace(), impl_cfg=_fp8_impl_cfg())
+    with pytest.raises(ValueError, match="fp8_param_gather"):
+        protocol.build_model(
+            SimpleNamespace(), impl_cfg=_fp8_impl_cfg(optimizer="dist_opt")
+        )
+
+
 def test_qwen3_moe_composition_declares_every_selected_and_fixed_bf16_site(
     transformer_engine_import_stub,
 ):

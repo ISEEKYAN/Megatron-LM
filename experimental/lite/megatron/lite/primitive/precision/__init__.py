@@ -17,6 +17,7 @@ from megatron.lite.primitive.precision.coverage import (
     PrecisionCoverage,
 )
 from megatron.lite.primitive.precision.hopper_blockwise import (
+    FP8_WEIGHT_SUPPORTED_OPTIMIZERS,
     PRECISION_NAMES,
     PrecisionPhase,
     active_precision,
@@ -24,6 +25,7 @@ from megatron.lite.primitive.precision.hopper_blockwise import (
     precision_forward_context,
     precision_model_init_context,
     precision_site_forward_context,
+    require_optimizer_supports_precision,
     resolve_precision,
     validate_hopper_environment,
 )
@@ -32,6 +34,7 @@ __all__ = [
     "AuthoritativeSource",
     "CoverageEntry",
     "CoverageManifest",
+    "FP8_WEIGHT_SUPPORTED_OPTIMIZERS",
     "MasterOwner",
     "PRECISION_NAMES",
     "ParameterContract",
@@ -47,6 +50,7 @@ __all__ = [
     "precision_forward_context",
     "precision_model_init_context",
     "precision_site_forward_context",
+    "require_optimizer_supports_precision",
     "resolve_precision",
     "validate_hopper_environment",
 ]
