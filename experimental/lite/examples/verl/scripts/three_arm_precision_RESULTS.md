@@ -1,6 +1,13 @@
 # Muon precision results — Megatron-native vs DistOpt-mlite (AC#3)
 
-Two deliverables:
+> **★ Decisive AC#3(a) receipt (bayan 2026-07-22 07:51 gate): §3 below.** End-to-end
+> *training* bitwise identity — mcore-native vs MLite-DistOpt Muon, real
+> fwd→bwd→DDP→DistributedOptimizer→finalize→muon-step on 4×H100 (TP=2, DP=2),
+> `torch.equal` weights every step (`max_abs=0.0`) with a sensitive neg-control. Job
+> 14245957, rc=0. This closes the "验的是集成不是 kernel" requirement that §2 (config +
+> kernel identity) explicitly did not reach.
+
+Deliverables:
 
 1. **A/B loss trajectory** (`adamw` vs `muon`/dist_opt) on a real Qwen3-30B-A3B verl-SFT
    workload — bayan's "muon must be no worse than AdamW" criterion.
@@ -115,8 +122,8 @@ layout), the Megatron-Core `DistributedDataParallel` bucketing + `DistributedOpt
 master-grad sharding, and `finalize_dist_opt_grads`. Fully closing AC#3(a) per 07:03
 requires a real DDP+DistributedOptimizer training-step comparison — MLite's
 `build_dist_opt_stack` muon path vs a raw Megatron-Core `get_megatron_optimizer` build —
-on a small real model (scaffolding: `tests/smoke/primitive/test_qwen3_moe_distopt_checkpoint_smoke.py`),
-comparing weights with `torch.equal`. That harness is the next step (see task log).
+on a small real model, comparing weights with `torch.equal`. **That harness is now
+delivered and green — see §3 (job 14245957).**
 
 ## Correctness fix carried & proven: `muon_tp_mode` propagation
 
@@ -141,3 +148,67 @@ surfaced once the propagation fix let `distributed` reach mcore; blockwise never
 this path. Worked around by disabling optimizer offload for the dist_opt Muon arm
 (node script); muon's smaller optimizer state fits 30B-A3B on 8×H100 without offload.
 This is an upstream mcore composition bug worth a follow-up report.
+
+## 3. End-to-end TRAINING bitwise identity — mcore-native vs MLite-DistOpt (AC#3(a) decisive)
+
+**Job 14245957** (4×H100, 1 node, `COMPLETED` rc=0, elapsed 1:29),
+`distopt_e2e_training_identity.py` under `torchrun --nproc_per_node=4`, **TP=2, DP=2**.
+
+This is the receipt bayan's 07:51 gate demands: not an isolated optimizer/kernel test,
+but a **real training step** driven through both integration stacks and compared with
+`torch.equal` on the trained weights. It exercises the full grad-wiring chain MLite owns:
+
+    forward → backward → DDP grad bucketing/all-reduce (across DP=2)
+    → DistributedOptimizer master-grad sharding (across DP=2)
+    → finalize grads → distributed cross-TP muon Newton-Schulz → optimizer.step()
+
+**Two genuinely independent stacks** (no forced-same-object, no `pg_collection=None`):
+
+| arm | model wrap | optimizer build | grad finalize | process groups |
+|-----|-----------|-----------------|---------------|----------------|
+| **native** | raw mcore `DistributedDataParallel` | hand-built `OptimizerConfig(optimizer="muon",…)` → `get_megatron_optimizer` | `finalize_model_grads` | mpu globals |
+| **mlite** | `build_dist_opt_stack` (runs `_mark_dist_opt_parallel_attrs` + `build_dist_opt_optimizer_config` + `DistributedDataParallel` + `get_megatron_optimizer`) | (same, inside the stack) | `finalize_dist_opt_grads` | its own `pg_collection` from the lite `ParallelState` |
+
+Both arms start from an **identical weight init** (native's `state_dict` copied into the
+mlite model + `reload_model_params` before step 0 — verified `PRE-STEP max_abs=0`) and
+consume **identical per-`dp_rank` data**. Model: a real TP MLP (`w_col` column-parallel
+dim0 + `w_row` row-parallel dim1, both 2D `tensor_model_parallel` — the exact param shape
+the distributed muon Newton-Schulz and dist-opt grad-norm accounting target), forward
+does a genuine cross-TP `all_reduce` (row-parallel reduction) so real TP grads flow in
+backward.
+
+```
+[env] world=4 tp=2 dp=2 H=32 batch=8 steps=6 muon_tp_mode=distributed
+[init] PRE-STEP native-vs-mlite global_max_abs=0.000e+00 (expect 0)
+[step 0] loss native=0.002999 mlite=0.002999 | native-vs-mlite max_abs=0.000e+00 | neg-control(no-finalize) max_abs=2.075e-03
+[step 1] loss native=0.002341 mlite=0.002341 | native-vs-mlite max_abs=0.000e+00 | neg-control max_abs=2.441e-03
+[step 2] loss native=0.004355 mlite=0.004355 | native-vs-mlite max_abs=0.000e+00 | neg-control max_abs=3.174e-03
+[step 3] loss native=0.002489 mlite=0.002489 | native-vs-mlite max_abs=0.000e+00 | neg-control max_abs=3.906e-03
+[step 4] loss native=0.003841 mlite=0.003841 | native-vs-mlite max_abs=0.000e+00 | neg-control max_abs=4.395e-03
+[step 5] loss native=0.004893 mlite=0.004893 | native-vs-mlite max_abs=0.000e+00 | neg-control max_abs=4.883e-03
+[B] E2E_TRAINING_IDENTITY steps=6 all_steps_equal=True final_native_vs_mlite_max_abs=0.000e+00
+[D] NEG_CONTROL no-finalize final_max_abs=4.883e-03 diverged=True (proves torch.equal is sensitive to a grad-wiring defect)
+RESULT PASS
+```
+
+- **(B) End-to-end training identity** — after **every** one of 6 real training steps, the
+  MLite-DistOpt weights are **bit-identical** to the raw mcore-native weights
+  (`torch.equal`, DP-global-reduced `max_abs=0.0`), and the per-step losses match to 6
+  decimals. So MLite's `_mark_dist_opt_parallel_attrs` param tagging (grad-norm/clip
+  accounting), DDP bucket layout, `build_dist_opt_optimizer_config`,
+  `finalize_dist_opt_grads`, and the DistributedOptimizer master-grad sharding introduce
+  **zero** deviation from the canonical Megatron-Core stack. This is the integration
+  proof — not the kernel proof of §2 — that 07:03/07:51 asked for.
+- **(D) Negative control (non-vacuity)** — a third arm identical to `mlite` except its
+  grad-finalization is **dropped** (`finalize` no-op, so DP grads are never reduced)
+  **diverges** from native, growing from `2.1e-3` (step 0) to `4.9e-3` (step 5). This
+  proves the `torch.equal` in (B) is **sensitive** to a real grad-wiring defect — a
+  broken integration would have been caught as `max_abs > 0`, so (B)'s `0.0` is a
+  meaningful pass, not a vacuous one.
+
+**Scope of this receipt.** TP=2, DP=2, dense TP params (column+row parallel). It exercises
+the DDP+DistributedOptimizer+finalize+muon grad-wiring end to end on a real training step.
+It does **not** add EP/expert-param routing (single-node TP=2 has EP=1; expert `allreduce`
+routing is covered structurally by `test_distopt_checkpoint_smoke.py`) — a natural
+follow-up, not a gap in the dense grad-wiring claim this gate targets. The independent
+FSDP2 lowering remains deferred to TASK-1.13.5.5.6.
