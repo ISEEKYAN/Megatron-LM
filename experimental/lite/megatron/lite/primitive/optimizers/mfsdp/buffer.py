@@ -505,7 +505,7 @@ class ParamBucket:
         self.discard_full_parameter_views()
         if self._grad_reduce_launched:
             self.wait_grad_reduce()
-        self.allocator.release_cached()
+        self.allocator.release_cached(force=True)
 
         grad_present = {
             id(spec): spec.shard_param is not None and spec.shard_param.grad is not None
@@ -563,7 +563,7 @@ class ParamBucket:
         self.discard_full_parameter_views()
         if self._grad_reduce_launched:
             self.wait_grad_reduce()
-        self.allocator.release_cached()
+        self.allocator.release_cached(force=True)
 
     def prepare_grad_reduce(
         self, *, force: bool = False
