@@ -1,75 +1,92 @@
-# Three-arm Muon precision results — Qwen3-30B-A3B SFT (AC#3)
+# Muon precision results — Megatron-native vs DistOpt-mlite (AC#3)
 
-Real verl-SFT workload, Qwen3-30B-A3B (`qwen3_moe`, standard attention, no FLA),
-8×H100 CW, fixed same-contract: seed=1234, TP2/PP1/EP8/ETP1/CP1, LR 1e-5 constant,
-warmup 2, weight_decay 0.1, clip 1.0, 20 steps, gsm8k messages SFT, `load_hf_weights`
-(identical init). mlite `407d4a81d`, mcore `fd1121b`, container `verl.vllm023.sqsh`,
+Two deliverables:
+
+1. **A/B loss trajectory** (`adamw` vs `muon`/dist_opt) on a real Qwen3-30B-A3B verl-SFT
+   workload — bayan's "muon must be no worse than AdamW" criterion.
+2. **Megatron-native vs DistOpt-mlite Muon = construction identity, numerically
+   proven** — a real `torch.equal` receipt (job 14243791), replacing the earlier
+   prose-only "bitwise by construction" claim that the moe panel correctly rejected
+   as fabricated evidence (C-BITWISE-REDEFINED).
+
+The **FSDP2 Muon arm is deferred** to TASK-1.13.5.5.6 (the emerging_optimizers rewrite):
+its current `newton_schulz_orthogonalize` is the hand-rolled version bayan directed us
+not to validate against (C-FSDP2-OLD-NS). No FSDP2 parity is claimed here.
+
+Common contract: seed=1234, TP2/PP1/EP8/ETP1/CP1, LR 1e-5 constant, warmup 2,
+weight_decay 0.1, clip 1.0, 20 steps, gsm8k messages SFT, `load_hf_weights` (identical
+init). mlite `407d4a81d`, mcore `fd1121b`, container `verl.vllm023.sqsh`,
 `emerging_optimizers==0.3.0`.
 
-## Arms (real Slurm jobs, all `COMPLETED` rc=0)
+## 1. A/B loss trajectory (real Slurm jobs, all `COMPLETED` rc=0)
 
 | ARM | job | optimizer | backend | muon_tp_mode | offload | peak GiB/GPU |
 |-----|-----|-----------|---------|--------------|---------|--------------|
 | adamw | 14242814 | adamw | dist_opt | (n/a) | cpu | 31.3 |
 | muon | 14242992 | muon | dist_opt | **distributed** | off¹ | 63.3 |
-| muon_fsdp2 | 14242904 | muon | fsdp2 | distributed | (fsdp2) | 59.2 |
 
 ¹ dist_opt Muon runs with optimizer offload OFF — see "hybrid_optimizer" finding below.
 
-## Per-step train/loss
+| step | adamw | muon (dist_opt) | step | adamw | muon (dist_opt) |
+|-----:|------:|----------------:|-----:|------:|----------------:|
+| 1 | 1.51501 | 1.50559 | 11 | 0.38296 | 0.44719 |
+| 2 | 1.48806 | 1.48605 | 12 | 0.34175 | 0.38639 |
+| 3 | 1.19553 | 1.28226 | 13 | 0.34699 | 0.39779 |
+| 4 | 0.88977 | 1.03788 | 14 | 0.33217 | 0.36587 |
+| 5 | 0.73041 | 0.88960 | 15 | 0.34443 | 0.36991 |
+| 6 | 0.52778 | 0.74173 | 16 | 0.32186 | 0.34862 |
+| 7 | 0.45003 | 0.59071 | 17 | 0.29555 | 0.32391 |
+| 8 | 0.45170 | 0.58517 | 18 | 0.29563 | 0.32246 |
+| 9 | 0.34360 | 0.46311 | 19 | 0.33460 | 0.36785 |
+| 10 | 0.38468 | 0.46575 | 20 | 0.32339 | 0.35204 |
 
-| step | adamw | muon (dist_opt) | muon_fsdp2 | \|muon−fsdp2\| |
-|-----:|------:|----------------:|-----------:|---------------:|
-| 1 | 1.51501 | 1.50559 | 1.51049 | 0.00489 |
-| 2 | 1.48806 | 1.48605 | 1.48033 | 0.00572 |
-| 3 | 1.19553 | 1.28226 | 1.29881 | 0.01655 |
-| 4 | 0.88977 | 1.03788 | 1.09556 | 0.05768 |
-| 5 | 0.73041 | 0.88960 | 0.94445 | 0.05485 |
-| 6 | 0.52778 | 0.74173 | 0.79299 | 0.05127 |
-| 7 | 0.45003 | 0.59071 | 0.63331 | 0.04260 |
-| 8 | 0.45170 | 0.58517 | 0.62160 | 0.03643 |
-| 9 | 0.34360 | 0.46311 | 0.49151 | 0.02840 |
-| 10 | 0.38468 | 0.46575 | 0.48392 | 0.01817 |
-| 11 | 0.38296 | 0.44719 | 0.45460 | 0.00741 |
-| 12 | 0.34175 | 0.38639 | 0.39164 | 0.00525 |
-| 13 | 0.34699 | 0.39779 | 0.39668 | 0.00111 |
-| 14 | 0.33217 | 0.36587 | 0.36361 | 0.00226 |
-| 15 | 0.34443 | 0.36991 | 0.37084 | 0.00093 |
-| 16 | 0.32186 | 0.34862 | 0.34554 | 0.00308 |
-| 17 | 0.29555 | 0.32391 | 0.31900 | 0.00491 |
-| 18 | 0.29563 | 0.32246 | 0.31265 | 0.00981 |
-| 19 | 0.33460 | 0.36785 | 0.36327 | 0.00459 |
-| 20 | 0.32339 | 0.35204 | 0.34468 | 0.00735 |
+JSONL: `$RUN_ROOT/{adamw,muon}/q35_precision_*.jsonl`.
 
-JSONL: `$RUN_ROOT/{adamw,muon,muon_fsdp2}/q35_precision_*.jsonl`.
+**Verdict (A/B).** Muon is no worse than AdamW: both descend from ~1.51 to ~0.32–0.35
+at the same rate from an identical init; muon's final loss (0.352) sits a hair above
+adamw's (0.323) — a different-but-healthy optimizer, not a regression. DistOpt Muon
+runs the *true* cross-TP Newton-Schulz (`muon_tp_mode=distributed`, confirmed in the
+live mcore `OptimizerConfig` dump) on Qwen3-30B-A3B at TP2 — 20 clean steps, no
+divergence.
 
-## Verdicts
+## 2. Megatron-native vs DistOpt-mlite = construction identity (torch.equal receipt)
 
-1. **DistOpt Muon trains on a real parallel workload.** The `muon` arm ran the *true*
-   cross-TP Newton-Schulz (`muon_tp_mode=distributed`, confirmed in the live mcore
-   `OptimizerConfig` dump) on Qwen3-30B-A3B at TP2 — 20 clean steps, loss 1.51→0.35,
-   grad_norm ~2, no divergence. This fills the gap left by the earlier DP2/TP1 toy
-   bitwise check (which never exercised distributed NS at real scale).
+**Job 14243791** (`cpu_short`, in-container, `COMPLETED` rc=0:0, 35 s),
+`megatron_vs_distopt_identity.py`.
 
-2. **Muon is no worse than AdamW** (bayan's criterion). Both descend from ~1.51 to
-   ~0.32–0.35 at the same rate from an identical init; muon's final loss (0.352) sits
-   a hair above adamw's (0.323), consistent with a different-but-healthy optimizer, not
-   a regression. DistOpt Muon trains, converges, and does not blow up.
+MLite's DistOpt Muon is **not a second implementation** of Megatron Muon. It lowers,
+through `build_dist_opt_optimizer_config`, into Megatron-Core's own
+`TensorParallelMuon` (`megatron/core/optimizer/emerging_optimizers.py`). There is no
+independent Megatron binary to diff — so this is a **construction identity**, and we
+prove it *numerically*, not by assertion:
 
-3. **Megatron vs DistOpt = bitwise by construction.** MLite's dist_opt Muon *is*
-   Megatron-Core's TensorParallel Muon: `build_dist_opt_optimizer_config` →
-   `get_megatron_optimizer(optimizer="muon")` → `megatron/core/optimizer/muon.py` →
-   `emerging_optimizers`. There is no second binary to diff — the identity is the code
-   path itself, and the propagation fix (below) is what makes the *distributed* variant
-   actually reach it.
+```
+[a] CONFIG_IDENTITY fields_checked=14 diffs=[]
+[a] CONFIG_IDENTITY_OK all fields equal (MLite lowering == native Megatron config)
+[b] UPDATE_IDENTITY torch.equal=True max_abs_delta=0.000e+00 weight_shape=(64, 48) steps=5
+[b] UPDATE_IDENTITY_OK final weights bit-identical (torch.equal)
+[c] NEG_CONTROL(num_ns_steps+1) torch.equal=False max_abs_delta=4.494e-05
+[c] NEG_CONTROL_OK update torch.equal is sensitive (perturbation -> nonzero delta)
+RESULT PASS
+```
 
-4. **FSDP2 vs DistOpt = within tolerance.** `muon_fsdp2` is an *independent*
-   reimplementation (`primitive/optimizers/fsdp2/muon.py`, full-gather → orthogonalize
-   → reshard). From the same init it tracks the dist_opt Muon closely: max \|Δloss\| =
-   0.058 (a step-4 early transient), decaying to ≤0.01 by step 11 and staying there —
-   two independent lowerings of the same Muon math agree within tolerance. (An exact
-   bitwise match across a Megatron distributed-optimizer path and an FSDP2 DTensor path
-   is not expected; reduction order and sharding differ.)
+- **(a) Config identity** — the Megatron-Core `OptimizerConfig` produced by the MLite
+  lowering (path A) is field-for-field equal to a hand-built native Megatron
+  `OptimizerConfig` (path B) across all 14 identity fields (every `muon_*` knob +
+  lr/weight_decay/clip). This is the regression guard the `muon_tp_mode` propagation
+  fix is about: had the lowering dropped any `muon_*` field, A ≠ B here.
+- **(b) Update identity (`torch.equal`)** — Megatron-Core's *native* `TensorParallelMuon`
+  is built from BOTH configs (via Megatron's own `_kwargs_from_config` mapper) and
+  stepped 5× on identical seeded params+grads. Final weights are **bit-identical**
+  (`torch.equal=True`, `max_abs_delta=0.0`). The MLite lowering perturbs the Megatron
+  Muon update by exactly zero.
+- **(c) Negative control** — perturbing `num_ns_steps` by 1 yields
+  `torch.equal=False`, `max_abs_delta=4.5e-5`, proving the (b) check is *sensitive*,
+  not a vacuous pass.
+
+**This is an honest construction-identity receipt, not a bitwise diff of two independent
+lowerings.** The only genuinely independent lowering (FSDP2 Muon) is deferred to
+TASK-1.13.5.5.6 and is not exercised here (per bayan 05:29/05:45).
 
 ## Correctness fix carried & proven: `muon_tp_mode` propagation
 
@@ -77,9 +94,10 @@ JSONL: `$RUN_ROOT/{adamw,muon,muon_fsdp2}/q35_precision_*.jsonl`.
 mcore `OptimizerConfig` copying only lr/betas/offload and **dropped every `muon_*`
 field**, so mcore fell back to its default `muon_tp_mode="blockwise"` (per-shard *local*
 NS) — silently degrading a requested `distributed`. Fixed to forward all ten `muon_*`
-fields for muon. Proven on 0 GPU (init-chain gate: `requested=distributed →
-core=distributed`, `requested=blockwise → core=blockwise`) and live on GPU (job
-14242992 mcore dump shows `muon_tp_mode='distributed'`).
+fields for muon. Proven three ways: 0-GPU init-chain gate (`requested=distributed →
+core=distributed`); live on GPU (job 14242992 mcore dump shows
+`muon_tp_mode='distributed'`); and the config-identity receipt above (job 14243791,
+part (a) — all `muon_*` fields survive the lowering).
 
 ## Integration finding: CPU-offload `hybrid_optimizer` ⊥ distributed Muon
 

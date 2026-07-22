@@ -1,7 +1,9 @@
-# Three-arm Muon precision harness (real workload)
+# Muon precision harness (real workload)
 
-Verifies MLite's **DistOpt Muon** vs **FSDP2 Muon** on a real Qwen3-30B-A3B verl-SFT
-workload, on ≤8 H100 (CW). Uses the ready-made verl SFT launcher
+Verifies MLite's **DistOpt Muon** — the A/B loss trajectory vs AdamW, and the
+Megatron-native-vs-DistOpt construction identity (`torch.equal` receipt) — on a real
+Qwen3-30B-A3B verl-SFT workload, on ≤8 H100 (CW). (The FSDP2 Muon arm is deferred to
+TASK-1.13.5.5.6; see verdicts below.) Uses the ready-made verl SFT launcher
 (`run_qwen3moe_sft.sh`) — no custom TP×PP×EP×CP harness — per the authoritative task
 guide.
 
@@ -27,18 +29,21 @@ blocks Qwen3.5-35B-A3B's GatedDeltaNet in this container.
 |-----|-----------|---------|--------------|---------|
 | `adamw` | adamw | dist_opt | (n/a) | A/B baseline |
 | `muon` | muon | **dist_opt** | **distributed** | DistOpt Muon = Megatron-Core TensorParallel Muon doing *true* cross-TP Newton-Schulz (TP2) |
-| `muon_fsdp2` | muon | **fsdp2** | distributed | independent in-repo FSDP2 Muon lowering (full-gather → orthogonalize → reshard) |
+
+(The FSDP2 Muon arm is **deferred to TASK-1.13.5.5.6** — its current `newton_schulz_orthogonalize`
+is the hand-rolled version bayan directed us not to validate against. No FSDP2 parity is claimed here.)
 
 Verdicts:
 - **A/B (bayan's criterion): Muon must be no worse than AdamW** on the loss
   trajectory. Evidence = per-step JSONL loss from each GPU run.
-- **Megatron vs DistOpt = bitwise by construction.** MLite's dist_opt Muon forwards
-  directly to Megatron-Core `get_megatron_optimizer(optimizer="muon")`, so it *is*
-  Megatron's TensorParallel Muon (same code path). No separate "Megatron-native"
-  binary exists to diff — the identity is structural, corroborated by the loss.
-- **FSDP2 = tolerance.** `muon_fsdp2` is a separate reimplementation
-  (`primitive/optimizers/fsdp2/muon.py`), compared to the `muon` arm within numerical
-  tolerance on the loss trajectory.
+- **Megatron-native vs DistOpt-mlite = construction identity, numerically proven.**
+  MLite's dist_opt Muon lowers (via `build_dist_opt_optimizer_config`) into
+  Megatron-Core's own `TensorParallelMuon` — there is no independent Megatron binary to
+  diff. This is a *construction identity*, proven with a real `torch.equal` receipt (job
+  14243791, `megatron_vs_distopt_identity.py`): config field-identity (14 fields) +
+  native-`TensorParallelMuon` update `torch.equal` (max_abs=0.0 over 5 steps) +
+  sensitivity negative control. **Not** a bitwise diff of two independent lowerings; see
+  `three_arm_precision_RESULTS.md` §2.
 
 ## Correctness fix carried by this harness: `muon_tp_mode` propagation
 
