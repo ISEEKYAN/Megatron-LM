@@ -51,14 +51,17 @@ export LD_LIBRARY_PATH="$CP_SITE/tvm_ffi/lib:${LD_LIBRARY_PATH:-}"
 `CP_SITE` is prepended just after `/vllm` so the container's own `vllm` still
 wins, but `fla`/`tilelang`/`tvm_ffi` become importable. This is exactly what the
 known-good DAPO node script does (`qwen35_dapo_mfsdp_62295f9b3/
-run_dapo_h100_node_d62c5aa46.sh`, line 21 + `LD_LIBRARY_PATH`).
+run_dapo_h100_node_c17a05eff.sh`, lines 21-27: `CP_SITE` on `PYTHONPATH` +
+`LD_LIBRARY_PATH="$CP_SITE/tvm_ffi/lib"`).
 
 ## Provenance / known-good evidence
 
-- `run_dapo_h100_node_d62c5aa46.sh` — same container `verl.vllm023.sqsh`, same
-  `CP_SITE`, preflight `import fla; import tilelang` and ran full Qwen3.5 GDN THD
-  DAPO end-to-end (this is the config `three_arm_precision_sft.sbatch` cites as
-  its env source).
+- `qwen35_dapo_mfsdp_62295f9b3/run_dapo_h100_node_c17a05eff.sh` — same container
+  `verl.vllm023.sqsh`, same `CP_SITE`, preflight `import fla; import tilelang`
+  (`G0B_PREFLIGHT_OK ... fla.__version__ tilelang.__version__`) and ran full
+  Qwen3.5 GDN THD DAPO end-to-end (this is the config `three_arm_precision_sft.sbatch`
+  cites as its env source). Verified present on CW lustre 2026-07-22; the
+  `CP_SITE` wiring is lines 12/21-27 of that script.
 - K-0123 — `qwen35-cp-overlay-20260613/site` is the FLA GDN CP/THD overlay;
   without it FLA GDN falls back to an unavailable backend / "Please install
   tilelang". Slurm `13062707` COMPLETED with the overlay loaded.

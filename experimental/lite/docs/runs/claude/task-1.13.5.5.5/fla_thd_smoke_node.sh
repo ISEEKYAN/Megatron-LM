@@ -5,7 +5,7 @@
 # This is the three-arm precision node recipe (TASK-1.13.5.5.3) with the ONE
 # fix it was missing: the CP_SITE (fla + tilelang + tvm_ffi) wiring reused
 # verbatim from the known-good DAPO node script
-# (qwen35_dapo_mfsdp_62295f9b3/run_dapo_h100_node_d62c5aa46.sh).  Arm is pinned
+# (qwen35_dapo_mfsdp_62295f9b3/run_dapo_h100_node_c17a05eff.sh).  Arm is pinned
 # to adamw/dist_opt so the FLA fix is isolated from the separate muon /
 # emerging_optimizers path.
 set -euo pipefail
