@@ -192,9 +192,24 @@ class FP32AdamW:
                     "local shard; FP8 masters must be initialized from TE's local "
                     "preserved source, never by dequantizing the FP8 parameter."
                 )
-            return high_precision_init.to(
+            master_local = high_precision_init.to(
                 device="cpu" if self.cpu_update else local_param.device, dtype=torch.float32
             ).clone()
+            if self.cpu_update or not is_dtensor_like(param):
+                return master_local
+            # The FP8 param is a DTensor, but its preserved high-precision source is
+            # a plain local shard. Mirror the param's sharding so the master (and the
+            # exp_avg/exp_avg_sq derived from it) stay DTensors like the grad; a plain
+            # local master would collide with the DTensor grad in the AdamW update.
+            # Pass the param's exact global shape/stride so unevenly-sharded params
+            # round-trip correctly, and never dequantize the FP8 param to build it.
+            return dtensor_from_local(
+                master_local,
+                param.device_mesh,
+                param.placements,
+                shape=param.shape,
+                stride=param.stride(),
+            )
         if self.cpu_update:
             local_param = to_local_tensor(param.detach())
             return local_param.detach().to(device="cpu", dtype=torch.float32).clone()
