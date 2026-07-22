@@ -617,9 +617,16 @@ def apply_qat_to_chunks(chunks, spec: QATSpec | dict[str, Any] | None) -> dict[s
     """Apply weight-only QAT to every eligible linear in the model chunks.
 
     Opt-in and inert by default: with a disabled spec nothing is registered and
-    the model stays bit-identical. Must be called *after* chunk build / HF load
-    and *before* optimizer construction so the optimizer captures the master
-    ``weight.original`` parameter. Routers / lm_head / embeddings are skipped.
+    the model stays bit-identical. Must be called *before* optimizer
+    construction so the optimizer captures the master ``weight.original``
+    parameter. It may run either before or after HF weight load: the
+    parametrization renames ``mod.weight`` to ``mod.parametrizations.weight.original``,
+    so the checkpoint loader must map the logical ``….weight`` name onto the
+    ``.original`` master (see ``_canonical_state_key`` in the model checkpoint
+    module) and — when the optimizer is built pre-load — resync its fp32 master
+    after load (``reload_model_params``). The persistent ``amax`` buffer is
+    recomputed from the real weight on the first forward, so ordering never
+    poisons the quantizer statistic. Routers / lm_head / embeddings are skipped.
     """
     spec = normalize_qat_spec(spec)
     stats = {"quantized_modules": 0, "skipped_ignored": 0, "skipped_no_weight": 0}

@@ -381,3 +381,106 @@ def test_amax_buffer_shapes():
     assert compute_amax(w, 0).shape == torch.Size([])
     assert compute_amax(w, -1).shape == torch.Size([6, 1])
     assert compute_amax(w, 4).shape == torch.Size([6, 2, 1])
+
+
+# ------------------------------------------------------------ load-then-apply (QAT-HF-LOAD-MISS)
+#
+# Regression for the moe BLOCKER QAT-HF-LOAD-MISS: build_model applies QAT
+# (parametrize) before the runtime loads HF weights, so the checkpoint loader
+# must map the logical ``….weight`` name onto ``….parametrizations.weight.original``.
+# Without the mapping the master weight is silently never loaded and training
+# runs on random weights. These CPU tests import the real qwen3_5 checkpoint
+# loader and prove the master receives the real tensor for all four formats.
+
+from megatron.lite.model.qwen3_5.lite.checkpoint import (  # noqa: E402
+    _canonical_state_key,
+    _copy_loaded_state,
+)
+
+
+def _toy_linear_chunk(in_features: int = 64, out_features: int = 12):
+    """Toy chunk whose linears wrap the GEMM as ``.linear`` (like MLite parallel
+    linears), so ``_quantizable_weight_owner`` targets ``.linear.weight``."""
+
+    class _Owner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(in_features, out_features, bias=False)
+
+    class Toy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = _Owner()
+            self.proj = _Owner()
+
+    return Toy().to(torch.bfloat16)
+
+
+def test_canonical_state_key_strips_only_parametrization_original():
+    assert _canonical_state_key("a.b.linear.weight") == "a.b.linear.weight"
+    assert (
+        _canonical_state_key("a.b.linear.parametrizations.weight.original")
+        == "a.b.linear.weight"
+    )
+    # quantizer buffers keep their real name (must NOT collide with the master)
+    assert (
+        _canonical_state_key("a.b.linear.parametrizations.weight.0.amax")
+        == "a.b.linear.parametrizations.weight.0.amax"
+    )
+
+
+@pytest.mark.parametrize(
+    "fmt,group_size",
+    [("int8", -1), ("int4", -1), ("fp8_e4m3", -1), ("mxfp4", 32)],
+)
+def test_apply_before_load_still_loads_master_weight(fmt, group_size):
+    torch.manual_seed(7)
+    chunk = _toy_linear_chunk()
+    # 1) apply QAT (parametrize) BEFORE load, exactly as build_model does.
+    apply_qat_to_chunks([chunk], QATSpec(enabled=True, format=fmt, group_size=group_size))
+    assert parametrize.is_parametrized(chunk.qkv.linear, "weight")
+
+    # 2) load the HF-mapped state (keyed by the logical ``….linear.weight``).
+    real_qkv = torch.randn(12, 64, dtype=torch.bfloat16)
+    real_proj = torch.randn(12, 64, dtype=torch.bfloat16)
+    _copy_loaded_state(
+        chunk,
+        {"qkv.linear.weight": real_qkv, "proj.linear.weight": real_proj},
+    )
+
+    # 3) the BF16 master (.original) must hold the real weights — not random init.
+    m_qkv = chunk.qkv.linear.parametrizations.weight.original
+    m_proj = chunk.proj.linear.parametrizations.weight.original
+    torch.testing.assert_close(m_qkv, real_qkv, rtol=0, atol=0)
+    torch.testing.assert_close(m_proj, real_proj, rtol=0, atol=0)
+
+    # 4) the quantized view differs from the master (parametrization is live) and
+    #    a forward recomputes amax from the *real* (loaded) weight, not zeros.
+    assert not torch.equal(chunk.qkv.linear.weight, m_qkv)
+    _ = chunk.qkv.linear.weight  # trigger parametrization forward -> amax update
+    amax = chunk.qkv.linear.parametrizations.weight[0].amax
+    assert torch.all(amax > 0)
+
+
+def test_master_left_random_without_mapping_would_fail_naively():
+    """Guard: prove the loaded key does NOT substring-match the parametrized key,
+    i.e. the naive ``name in key`` path (the original bug) really misses it."""
+    torch.manual_seed(8)
+    chunk = _toy_linear_chunk()
+    apply_qat_to_chunks([chunk], QATSpec(enabled=True, format="int8", group_size=-1))
+    state_keys = list(chunk.state_dict().keys())
+    loaded_name = "qkv.linear.weight"
+    assert loaded_name not in state_keys  # not an exact key anymore
+    assert not any(loaded_name in k for k in state_keys)  # not a substring either
+    # but canonicalization recovers it
+    canon = {_canonical_state_key(k): k for k in state_keys}
+    assert canon[loaded_name] == "qkv.linear.parametrizations.weight.original"
+
+
+def test_load_unparametrized_module_unchanged_by_refactor():
+    """The _copy_loaded_state refactor must not regress the plain (non-QAT) path."""
+    torch.manual_seed(9)
+    chunk = _toy_linear_chunk()
+    real = torch.randn(12, 64, dtype=torch.bfloat16)
+    _copy_loaded_state(chunk, {"qkv.linear.weight": real})
+    torch.testing.assert_close(chunk.qkv.linear.weight, real, rtol=0, atol=0)
