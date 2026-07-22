@@ -90,7 +90,10 @@ mkdir -p "$OUTPUT_ROOT" "$RUN_ROOT/logs"
 
 echo "Q35_PRECISION_ARM job=${SLURM_JOB_ID:-none} arm=$ARM opt_algo=$OPT_ALGO backend=$OPT_BACKEND muon_tp_mode=$MUON_TP_MODE model=$MODEL_PATH steps=$TOTAL_STEPS seed=$SEED tp=$TP_SIZE pp=$PP_SIZE ep=$EP_SIZE"
 
-NODE_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/three_arm_precision_node.sh"
+# sbatch copies this file to a spool dir, so resolve the node script from the
+# staged mlite checkout rather than relative to the (copied) batch script.
+NODE_SCRIPT="$MLITE_REPO/experimental/lite/examples/verl/scripts/three_arm_precision_node.sh"
+[[ -f "$NODE_SCRIPT" ]] || { echo "node script missing: $NODE_SCRIPT" >&2; exit 3; }
 
 SA=(--container-image="$IMG" --container-mounts=/lustre:/lustre --export=ALL)
 export ARM OPT_ALGO OPT_BACKEND MUON_TP_MODE
