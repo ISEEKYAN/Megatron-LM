@@ -105,6 +105,19 @@ NOT a bitwise diff of two independent lowerings. The only genuinely independent 
 (FSDP2 Muon) is deferred to TASK-1.13.5.5.6 and is not exercised here (per bayan
 05:29/05:45/06:58).
 
+**Known limitation vs bayan 07:03 ("验的是集成不是 kernel").** This receipt exercises the
+*config-lowering* (`build_dist_opt_optimizer_config`) and the *distributed Newton-Schulz
+kernel* under a real TP process group — but it drives Megatron-Core's native
+`TensorParallelMuon` directly for BOTH arms. It therefore does **not** yet exercise the
+rest of MLite's DistOpt *integration wiring*: `_mark_dist_opt_parallel_attrs` (per-param
+`allreduce`/`tensor_model_parallel` tagging that governs grad-norm accounting and param
+layout), the Megatron-Core `DistributedDataParallel` bucketing + `DistributedOptimizer`
+master-grad sharding, and `finalize_dist_opt_grads`. Fully closing AC#3(a) per 07:03
+requires a real DDP+DistributedOptimizer training-step comparison — MLite's
+`build_dist_opt_stack` muon path vs a raw Megatron-Core `get_megatron_optimizer` build —
+on a small real model (scaffolding: `tests/smoke/primitive/test_qwen3_moe_distopt_checkpoint_smoke.py`),
+comparing weights with `torch.equal`. That harness is the next step (see task log).
+
 ## Correctness fix carried & proven: `muon_tp_mode` propagation
 
 `build_dist_opt_optimizer_config` (`primitive/optimizers/megatron_wrap.py`) built the
