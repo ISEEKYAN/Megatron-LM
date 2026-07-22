@@ -22,6 +22,37 @@ from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 
+class TinyFP8Model(nn.Module):
+    """A blockwise TE MLP whose parameters are constructed as FP8 weights."""
+
+    def __init__(self):
+        super().__init__()
+        from megatron.lite.primitive.modules.mlp import SwiGLUMLP
+        from megatron.lite.primitive.precision import (
+            PrecisionCoverage,
+            precision_model_init_context,
+            resolve_precision,
+        )
+
+        implementation = resolve_precision("hopper_blockwise_fp8_weight")
+        assert implementation is not None
+        coverage = PrecisionCoverage(implementation)
+        with precision_model_init_context(implementation):
+            self.mlp = SwiGLUMLP(
+                128,
+                128,
+                precision_coverage=coverage,
+            )
+            self.coverage_manifest = coverage.seal()
+        self.precision_implementation = implementation
+
+    def forward(self, x):
+        from megatron.lite.primitive.precision import precision_forward_context
+
+        with precision_forward_context(self.precision_implementation):
+            return self.mlp(x)
+
+
 class TinyUnit(nn.Module):
     def __init__(self):
         super().__init__()
@@ -106,6 +137,23 @@ def _build_optimizer(model: nn.Module, ps: ParallelState, *, offload_fraction: f
     )
 
 
+def _build_fp8_fsdp2_model() -> tuple[nn.Module, ParallelState, dict[str, torch.Tensor]]:
+    torch.manual_seed(1234)
+    model = TinyFP8Model().cuda().to(dtype=torch.bfloat16)
+    sources = {}
+    for name, param in model.named_parameters():
+        get_source = getattr(param, "get_high_precision_init_val", None)
+        assert callable(get_source), f"{name} is missing TE's preserved FP32 source"
+        source = get_source()
+        assert isinstance(source, torch.Tensor)
+        sources[name] = source.detach().float().cpu().clone()
+
+    ps = _parallel_state()
+    config = FSDP2Config(unit_modules=(type(model.mlp),), reshard_after_forward=True)
+    mesh = build_fsdp2_device_mesh(ps, config)
+    return wrap_fsdp2(model, ps, config, mesh=mesh), ps, sources
+
+
 def _local_param_devices(model: nn.Module) -> set[str]:
     return {to_local_tensor(param.detach()).device.type for param in model.parameters()}
 
@@ -159,3 +207,28 @@ def test_fsdp2_offload_fraction_keeps_optimizer_update_state_on_cpu_single_gpu()
     assert torch.isfinite(torch.tensor(grad_norm))
     assert _local_param_devices(model) == {"cuda"}
     assert _optimizer_state_devices(optimizer) == {"cpu"}
+
+
+def test_fsdp2_fp8_weight_uses_te_source_for_fp32_master_and_updates_single_gpu():
+    model, ps, sources = _build_fp8_fsdp2_model()
+    optimizer = _build_optimizer(model, ps, offload_fraction=0.0)
+
+    masters = {
+        name: optimizer.optimizer.state[param]["master_param"].detach().float().cpu()
+        for name, param in model.named_parameters()
+    }
+    assert masters.keys() == sources.keys()
+    for name in sources:
+        torch.testing.assert_close(masters[name], sources[name], atol=0.0, rtol=0.0)
+        assert getattr(model.get_parameter(name), "get_high_precision_init_val")() is None
+
+    x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    target = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    optimizer.zero_grad()
+    loss = torch.nn.functional.mse_loss(model(x).float(), target.float())
+    loss.backward()
+    success, grad_norm, _ = optimizer.step()
+
+    assert success
+    assert torch.isfinite(loss)
+    assert torch.isfinite(torch.tensor(grad_norm))
