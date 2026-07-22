@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,17 @@ sys.path = [path for path in sys.path if path != _LITE_ROOT]
 sys.path.insert(0, _LITE_ROOT)
 
 
-def test_full_parallel_contract_builds_all_three_arms_without_gpu_init() -> None:
+def test_full_parallel_contract_really_builds_all_three_arm_optimizers(monkeypatch) -> None:
+    """The gate must *construct* each arm's optimizer + scheduler, not diff config.
+
+    Megatron-Core is absent on a bare CPU host, so the builder surfaces
+    (``OptimizerConfig`` + ``OptimizerParamScheduler``) are injected. The dist_opt
+    arms then build a real ``muon`` Megatron-Core config, the FSDP2 arm builds a
+    real ``FP32Muon`` child, and every arm builds a non-``None`` LR scheduler --
+    the four false-greens the moe repeatedly caught.
+    """
+    _inject_fake_megatron_core(monkeypatch)
+
     from examples.bench.full_parallel_contract import (
         FullParallelContract,
         config_only_gate,
@@ -23,6 +34,15 @@ def test_full_parallel_contract_builds_all_three_arms_without_gpu_init() -> None
 
     assert artifact["topology"] == "TP2 x PP2 x EP2 x CP1 = 8 ranks (DP=1)"
     assert set(artifact["arms"]) == {"megatron", "distopt_mlite", "fsdp2_mlite"}
+
+    builds = artifact["arm_builds"]
+    assert builds["megatron"] == {"optimizer": "megatron_core:muon", "scheduler": "built"}
+    assert builds["distopt_mlite"] == {
+        "optimizer": "megatron_core:muon",
+        "scheduler": "built",
+    }
+    assert builds["fsdp2_mlite"] == {"optimizer": "fsdp2_muon", "scheduler": "built"}
+
     for arm in artifact["arms"].values():
         backend_cfg = arm["dry_run"]["runtime"]["backend_cfg"]
         assert backend_cfg["parallel"]["tp"] == 2
@@ -162,6 +182,67 @@ def _inject_fake_scheduler(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "megatron.core.optimizer_param_scheduler", module)
 
 
+@dataclass
+class _FakeCoreOptimizerConfig:
+    """Stand-in for megatron.core's OptimizerConfig.
+
+    ``build_dist_opt_optimizer_config`` inspects ``fields(...)`` to decide which
+    Muon knobs it may forward, so this must be a dataclass carrying the base and
+    Muon fields the builder constructs with.
+    """
+
+    optimizer: str = "adam"
+    lr: float = 0.0
+    min_lr: float = 0.0
+    weight_decay: float = 0.0
+    clip_grad: float = 0.0
+    use_distributed_optimizer: bool = False
+    bf16: bool = False
+    params_dtype: object = None
+    adam_beta1: float | None = None
+    adam_beta2: float | None = None
+    adam_eps: float | None = None
+    use_precision_aware_optimizer: bool | None = None
+    decoupled_weight_decay: bool | None = None
+    optimizer_offload_fraction: float | None = None
+    overlap_cpu_optimizer_d2h_h2d: bool | None = None
+    optimizer_cpu_offload: bool | None = None
+    muon_momentum: float | None = None
+    muon_nesterov: bool | None = None
+    muon_scale_mode: str | None = None
+    muon_fp32_matmul_prec: str | None = None
+    muon_coefficient_type: str | None = None
+    muon_num_ns_steps: int | None = None
+    muon_tp_mode: str | None = None
+    muon_extra_scale_factor: float | None = None
+    muon_scalar_optimizer: str | None = None
+    muon_split_qkv: bool | None = None
+
+
+def _inject_fake_core_optimizer_config(monkeypatch) -> None:
+    import types
+
+    core = sys.modules.get("megatron.core")
+    if core is None:
+        core = types.ModuleType("megatron.core")
+        monkeypatch.setitem(sys.modules, "megatron.core", core)
+    optimizer_pkg = sys.modules.get("megatron.core.optimizer")
+    if optimizer_pkg is None:
+        optimizer_pkg = types.ModuleType("megatron.core.optimizer")
+        monkeypatch.setitem(sys.modules, "megatron.core.optimizer", optimizer_pkg)
+    config_module = types.ModuleType("megatron.core.optimizer.optimizer_config")
+    config_module.OptimizerConfig = _FakeCoreOptimizerConfig
+    monkeypatch.setitem(
+        sys.modules, "megatron.core.optimizer.optimizer_config", config_module
+    )
+
+
+def _inject_fake_megatron_core(monkeypatch) -> None:
+    """Inject both Megatron-Core builder surfaces the real gate build depends on."""
+    _inject_fake_scheduler(monkeypatch)
+    _inject_fake_core_optimizer_config(monkeypatch)
+
+
 def test_build_lr_scheduler_builds_a_real_lr_advancing_scheduler(monkeypatch) -> None:
     _inject_fake_scheduler(monkeypatch)
 
@@ -236,11 +317,37 @@ def test_mlite_lr_scheduler_step_advances_lr_instead_of_returning_zero() -> None
     assert runtime.lr_scheduler_step(frozen_handle) == 0.0
 
 
-def test_gate_probe_flags_a_frozen_lr_arm() -> None:
-    """The gate probe must fail loudly when an arm would drop its scheduler."""
-    from examples.bench.full_parallel_contract import _probe_lr_scheduler_would_build
+def test_gate_flags_a_frozen_lr_arm() -> None:
+    """The gate build must fail loudly when an arm would drop its scheduler.
+
+    A ``total_training_steps<=0`` horizon makes ``build_lr_scheduler`` return
+    ``None`` *before* it touches Megatron-Core, so no fake injection is needed.
+    """
+    from examples.bench.full_parallel_contract import (
+        _StubOptimizer,
+        _build_scheduler_and_assert_advances,
+    )
     from megatron.lite.runtime.contracts.config import OptimizerConfig
 
     frozen = OptimizerConfig(optimizer_algorithm="muon", total_training_steps=-1)
     with pytest.raises(AssertionError, match="frozen LR"):
-        _probe_lr_scheduler_would_build(frozen)
+        _build_scheduler_and_assert_advances(_StubOptimizer(), frozen, name="megatron")
+
+
+def test_gate_fails_loud_when_megatron_core_is_absent(monkeypatch) -> None:
+    """Without the real builder surface the gate must raise, not pass config-only.
+
+    This is the root-cause guard: the old gate swallowed ``ImportError`` and fell
+    back to config diffing, so any path whose config disagreed with its real
+    builder passed green. Forcing the Megatron-Core optimizer-config import to
+    fail proves the gate now fails loud instead.
+    """
+    monkeypatch.setitem(sys.modules, "megatron.core.optimizer.optimizer_config", None)
+
+    from examples.bench.full_parallel_contract import (
+        FullParallelContract,
+        build_all_arms,
+    )
+
+    with pytest.raises((ImportError, ModuleNotFoundError)):
+        build_all_arms(FullParallelContract(hf_path="/tmp/Qwen3.5-35B-A3B"))

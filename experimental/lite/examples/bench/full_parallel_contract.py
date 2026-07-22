@@ -148,72 +148,169 @@ def build_arm_configs(contract: FullParallelContract) -> dict[str, BenchCliConfi
     }
 
 
-def _probe_megatron_optimizer_build(backend_cfg) -> None:
-    """Invoke the real Megatron-Core optimizer-config builder when it is importable.
-
-    On a bare CPU host Megatron-Core is unavailable and this is a no-op -- the
-    base-config assertions above already guard against the false-green. Wherever
-    Megatron-Core *is* importable (the GPU arms in the follow-up tasks), this
-    proves the megatron arm's config actually constructs instead of raising a
-    base-vs-override algorithm conflict.
-    """
-    try:
-        from megatron.lite.primitive.optimizers.megatron_wrap import (
-            build_dist_opt_optimizer_config,
-        )
-
-        build_dist_opt_optimizer_config(
-            backend_cfg.optimizer,
-            override_optimizer_config=backend_cfg.override_optimizer_config,
-        )
-    except (ImportError, ModuleNotFoundError):
-        # Megatron-Core not present (bare CPU gate); base-config checks stand.
-        return
-
-
 class _StubOptimizer:
-    """Minimal optimizer stand-in for the scheduler-build probe.
+    """Minimal optimizer stand-in whose ``param_groups`` a scheduler can drive.
 
-    ``build_lr_scheduler`` only touches ``param_groups`` inside
-    ``OptimizerParamScheduler``; the None-vs-build decision happens before that,
-    so a single dummy group is enough to exercise the branch the runtime takes.
+    ``build_lr_scheduler`` reads and writes ``param_groups[*]["lr"]``; a single
+    dummy group is enough to build the real ``OptimizerParamScheduler`` and prove
+    a step advances the LR for the dist_opt arms (whose real optimizer needs a
+    GPU/distributed init the CPU gate cannot perform).
     """
 
     def __init__(self) -> None:
         self.param_groups = [{"lr": 0.0, "weight_decay": 0.0}]
 
 
-def _probe_lr_scheduler_would_build(optimizer_config) -> None:
-    """Prove the arm builds a real LR scheduler instead of freezing the LR.
+def _tiny_muon_model():
+    """A minimal module with one Muon-managed matrix and an Adam-fallback bias.
+
+    ``build_fsdp2_muon`` routes the tagged matrix to an :class:`FP32Muon` child.
+    Building the FSDP2 optimizer on this tiny module runs the *actual* builder on
+    CPU (no GPU/distributed init), so the gate proves the FSDP2 arm constructs a
+    real Muon optimizer instead of silently falling back to AdamW.
+    """
+    import torch
+
+    class _TinyMatrixModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.matrix = torch.nn.Parameter(torch.randn(4, 4))
+            self.bias = torch.nn.Parameter(torch.randn(4))
+
+    model = _TinyMatrixModel()
+    model.matrix.is_managed_by_layer_wise_optimizer = True
+    return model
+
+
+def _build_scheduler_and_assert_advances(optimizer, opt_config, *, name: str):
+    """Build the shared LR scheduler and prove stepping it advances the LR.
 
     Every arm's runtime lowers this same ``OptimizerConfig`` into the shared
-    ``build_lr_scheduler``. Checking only ``total_training_steps > 0`` is
-    false-green: the mlite arms used to hard-code ``lr_scheduler=None`` and drop
-    the schedule regardless. Here we call the exact builder the runtimes call.
-
-    * Returns a scheduler object -> the arm schedules its LR. Good.
-    * Returns ``None`` -> the arm would train with a frozen LR. Fail loudly.
-    * Raises ``ImportError`` -> Megatron-Core is absent (bare CPU gate), but the
-      code already passed the ``total_training_steps > 0`` guard and reached the
-      ``OptimizerParamScheduler`` import, i.e. it *would* build on the GPU arms.
-      The executable proof that the object constructs and steps the LR lives in
-      the unit tests (which inject a stub scheduler module).
+    ``build_lr_scheduler``.  It returns ``None`` when the training horizon is
+    unset, which would silently freeze the LR (the ``lr_scheduler=None``
+    regression).  This builds the real scheduler and steps it, failing loud if it
+    is absent or inert.  ``ImportError`` is *not* swallowed: on a host without
+    Megatron-Core the gate must fail rather than pass config-only.
     """
     from megatron.lite.primitive.optimizers.megatron_wrap import build_lr_scheduler
 
-    try:
-        scheduler = build_lr_scheduler(_StubOptimizer(), optimizer_config)
-    except (ImportError, ModuleNotFoundError):
-        return
+    scheduler = build_lr_scheduler(optimizer, opt_config)
     if scheduler is None:
         raise AssertionError(
-            "arm would train with a frozen LR: build_lr_scheduler returned None "
-            "for a contract with a real training horizon."
+            f"{name}: build_lr_scheduler returned None -- the arm would train "
+            "with a frozen LR despite a real training horizon."
         )
+    lr_before = optimizer.param_groups[0]["lr"]
+    scheduler.step(1)
+    lr_after = optimizer.param_groups[0]["lr"]
+    if opt_config.lr_warmup_steps > 0 and not lr_after > lr_before:
+        raise AssertionError(
+            f"{name}: LR scheduler did not advance the LR during warmup "
+            f"({lr_before} -> {lr_after})."
+        )
+    return scheduler
+
+
+def _build_megatron_core_optimizer(opt_config, override, *, name: str):
+    """Really build the Megatron-Core ``OptimizerConfig`` for the dist_opt arms.
+
+    Both the ``megatron`` (mbridge) and ``distopt_mlite`` arms lower onto this
+    exact builder at real build time.  Constructing it proves the *base* config
+    carries ``optimizer="muon"`` (not ``adam``) and forwards the Muon
+    hyperparameters, instead of only asserting config fields agree.
+    """
+    from megatron.lite.primitive.optimizers.megatron_wrap import (
+        build_dist_opt_optimizer_config,
+    )
+
+    core_cfg = build_dist_opt_optimizer_config(
+        opt_config, override_optimizer_config=override
+    )
+    if str(core_cfg.optimizer).lower() != "muon":
+        raise AssertionError(
+            f"{name}: Megatron-Core optimizer built as {core_cfg.optimizer!r}, "
+            "not muon -- the base config lost the Muon algorithm."
+        )
+    if getattr(core_cfg, "muon_momentum", None) != opt_config.muon_momentum:
+        raise AssertionError(
+            f"{name}: Muon momentum was not forwarded to the Megatron-Core "
+            f"optimizer ({getattr(core_cfg, 'muon_momentum', None)!r})."
+        )
+    return core_cfg
+
+
+def _build_fsdp2_muon_optimizer(opt_config, *, name: str):
+    """Really build the FSDP2 Muon optimizer and assert it is not an AdamW fallback."""
+    from megatron.lite.primitive.optimizers.fsdp2.muon import FP32Muon
+    from megatron.lite.primitive.optimizers.fsdp2.optimizer import build_fsdp2_muon
+
+    optimizer = build_fsdp2_muon([_tiny_muon_model()], opt_config, ps=None)
+    if not any(isinstance(child, FP32Muon) for child in optimizer.optimizer.optimizers):
+        raise AssertionError(
+            f"{name}: FSDP2 optimizer built without an FP32Muon child -- it fell "
+            "back to AdamW despite the Muon contract."
+        )
+    return optimizer
+
+
+def build_all_arms(contract: FullParallelContract) -> dict[str, Any]:
+    """Really construct every arm's optimizer + LR scheduler; fail loud on any gap.
+
+    This is the decisive gate.  Diffing config fields lets any path whose config
+    disagrees with its real builder pass green (the repeated false-greens: base
+    ``adam`` under a Muon override, an unwritten scheduler horizon, an FSDP2 Muon
+    that falls back to AdamW, a ``None`` LR scheduler).  Here we call the exact
+    builders each runtime uses:
+
+    * ``megatron`` / ``distopt_mlite`` -> ``build_dist_opt_optimizer_config``
+      (asserts ``optimizer="muon"`` on the base config) + the shared scheduler.
+    * ``fsdp2_mlite`` -> ``build_fsdp2_muon`` (asserts a real ``FP32Muon`` child)
+      + the shared scheduler driven by that optimizer's own ``param_groups``.
+
+    A missing Megatron-Core raises here rather than being swallowed, so the CPU
+    proof injects the real builder surface (see the unit tests) and the GPU arms
+    use the genuine packages.
+    """
+    receipts: dict[str, dict[str, Any]] = {}
+    for name, cli_cfg in build_arm_configs(contract).items():
+        runtime_backend_cfg = build_runtime_config(cli_cfg).backend_cfg
+        opt_config = runtime_backend_cfg.optimizer
+        if opt_config.total_training_steps <= 0:
+            raise AssertionError(
+                f"{name}: scheduler horizon was not lowered onto the optimizer."
+            )
+        if opt_config.optimizer_algorithm != "muon":
+            raise AssertionError(
+                f"{name}: base optimizer_algorithm is "
+                f"{opt_config.optimizer_algorithm!r}, not muon."
+            )
+        if name == "fsdp2_mlite":
+            optimizer = _build_fsdp2_muon_optimizer(opt_config, name=name)
+            _build_scheduler_and_assert_advances(optimizer, opt_config, name=name)
+            receipts[name] = {"optimizer": "fsdp2_muon", "scheduler": "built"}
+        else:
+            override = getattr(runtime_backend_cfg, "override_optimizer_config", None)
+            if name == "megatron" and override:
+                raise AssertionError(
+                    "megatron arm must lower Muon onto the base optimizer, not a "
+                    "conflicting Megatron-Core override dict."
+                )
+            core_cfg = _build_megatron_core_optimizer(opt_config, override, name=name)
+            _build_scheduler_and_assert_advances(_StubOptimizer(), opt_config, name=name)
+            receipts[name] = {
+                "optimizer": f"megatron_core:{core_cfg.optimizer}",
+                "scheduler": "built",
+            }
+    return receipts
 
 
 def config_only_gate(contract: FullParallelContract) -> dict[str, Any]:
-    """Exercise all three real config constructors without distributed/GPU init."""
+    """Assemble the shared config and *really build* all three arms' optimizers.
+
+    The topology/config assembly is CPU-only, but the acceptance check is the
+    real build in :func:`build_all_arms` -- not a config diff.  ``build_all_arms``
+    fails loud if any arm cannot construct its optimizer or LR scheduler.
+    """
 
     arms = build_arm_configs(contract)
     plans = {name: build_dry_run_plan(cfg) for name, cfg in arms.items()}
@@ -234,41 +331,20 @@ def config_only_gate(contract: FullParallelContract) -> dict[str, Any]:
                 f"{name} parallel contract drifted: {actual_parallel!r}"
             )
         # Every arm must carry the contract on the *base* ``OptimizerConfig`` --
-        # the object the real optimizer/scheduler builders read. Checking a
-        # backend override dict instead would pass a config that raises (base
-        # ``adam`` vs override ``muon``) or silently skips the LR scheduler
-        # (``total_training_steps`` left at ``-1``) at real build time.
-        runtime_backend_cfg = runtime_configs[name].backend_cfg
-        optimizer = runtime_backend_cfg.optimizer
+        # the object the real optimizer/scheduler builders read.
+        optimizer = runtime_configs[name].backend_cfg.optimizer
         expected_optimizer = contract.optimizer_overrides()
         actual_optimizer = {key: getattr(optimizer, key) for key in expected_optimizer}
         if actual_optimizer != expected_optimizer:
             raise AssertionError(f"{name} optimizer contract drifted.")
-        # The scheduler horizon must be lowered onto the optimizer *and* the arm
-        # must actually build a scheduler from it. ``build_lr_scheduler`` returns
-        # ``None`` when the horizon is <= 0, so the arm would train with a frozen
-        # LR while claiming the contract's schedule; the probe calls the exact
-        # builder each runtime uses (see ``_probe_lr_scheduler_would_build``).
-        if optimizer.total_training_steps <= 0:
-            raise AssertionError(
-                f"{name} scheduler horizon was not lowered onto the optimizer."
-            )
-        try:
-            _probe_lr_scheduler_would_build(optimizer)
-        except AssertionError as exc:
-            raise AssertionError(f"{name}: {exc}") from exc
-        if name == "megatron":
-            override = runtime_backend_cfg.override_optimizer_config
-            if override:
-                raise AssertionError(
-                    "megatron arm must lower Muon onto the base optimizer, not a "
-                    "conflicting Megatron-Core override dict."
-                )
-            _probe_megatron_optimizer_build(runtime_backend_cfg)
+
+    # Decisive check: construct each arm's real optimizer + LR scheduler.
+    arm_builds = build_all_arms(contract)
 
     return {
         "contract": asdict(contract),
         "topology": "TP2 x PP2 x EP2 x CP1 = 8 ranks (DP=1)",
+        "arm_builds": arm_builds,
         "arms": {
             name: {
                 "backend": cfg.backend,

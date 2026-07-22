@@ -51,20 +51,36 @@ axis.
 
 ## Shared 8-GPU Muon Contract
 
-`full_parallel_contract.py` is the config-only gate shared by the Megatron,
-MLite DistOpt, and MLite FSDP2 Muon comparison arms.  It fixes the real
+`full_parallel_contract.py` is the shared build gate for the Megatron, MLite
+DistOpt, and MLite FSDP2 Muon comparison arms.  It fixes the real
 `Qwen3.5-35B-A3B` model, BF16, model-initialization/data seed (1234), synthetic
 packed input order, tokens, scheduler horizon, and every Muon option.  Its primary topology is
 `TP2 x PP2 x EP2 x CP1 = 8` (DP=1).  CP remains an explicit `CP1` field; using
 CP2 as well as TP2/PP2/EP2 would require 16 ranks.
 
-This command invokes all three actual runtime config constructors but does not
-initialize distributed state or GPUs:
+The gate does not diff config fields -- it *really builds* every arm's optimizer
+and LR scheduler via the exact builders each runtime uses
+(`build_all_arms`): the dist_opt arms construct a Megatron-Core `muon`
+`OptimizerConfig`, the FSDP2 arm constructs a real `FP32Muon` child, and every
+arm builds a non-`None` LR scheduler whose step advances the LR.  A build that
+cannot construct (e.g. Megatron-Core absent) fails loud rather than passing
+config-only.
+
+This command builds all three arms without distributed/GPU init, and therefore
+requires Megatron-Core to be importable (the training image / GPU host):
 
 ```bash
 PYTHONPATH=experimental/lite:$PYTHONPATH \
 python experimental/lite/examples/bench/full_parallel_contract.py \
   --hf-path /models/Qwen3.5-35B-A3B
+```
+
+The CPU pre-GPU proof is the unit gate, which injects the Megatron-Core builder
+surfaces so the real build runs on a bare CPU host:
+
+```bash
+PYTHONPATH=experimental/lite:$PYTHONPATH \
+python -m pytest experimental/lite/tests/unit/examples/test_full_parallel_contract.py
 ```
 
 The GPU precision and performance jobs must consume this contract rather than
