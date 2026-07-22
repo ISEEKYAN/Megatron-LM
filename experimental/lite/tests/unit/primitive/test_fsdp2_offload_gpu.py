@@ -270,8 +270,13 @@ def _fp8_step(model: nn.Module, optimizer, x: torch.Tensor, target: torch.Tensor
 
 
 def _fp32_masters(model: nn.Module, optimizer) -> dict[str, torch.Tensor]:
+    # FP8-weight masters are DTensors mirroring the sharded param, so localize
+    # the shard before comparing against plain-tensor references.
     return {
-        name: optimizer.optimizer.state[param]["master_param"].detach().float().cpu().clone()
+        name: to_local_tensor(optimizer.optimizer.state[param]["master_param"].detach())
+        .float()
+        .cpu()
+        .clone()
         for name, param in model.named_parameters()
     }
 
@@ -539,7 +544,9 @@ def test_fsdp2_fp8_weight_uses_te_source_for_fp32_master_and_updates_single_gpu(
     optimizer = _build_optimizer(model, ps, offload_fraction=0.0)
 
     masters = {
-        name: optimizer.optimizer.state[param]["master_param"].detach().float().cpu()
+        name: to_local_tensor(optimizer.optimizer.state[param]["master_param"].detach())
+        .float()
+        .cpu()
         for name, param in model.named_parameters()
     }
     assert masters.keys() == sources.keys()
