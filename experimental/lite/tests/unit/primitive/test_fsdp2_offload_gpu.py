@@ -239,6 +239,25 @@ def _optimizer_state_devices(optimizer) -> set[str]:
     return devices
 
 
+def _fp8_step(model: nn.Module, optimizer, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    optimizer.zero_grad()
+    loss = torch.nn.functional.mse_loss(model(x).float(), target.float())
+    loss.backward()
+    success, grad_norm, _ = optimizer.step()
+
+    assert success
+    assert torch.isfinite(loss)
+    assert torch.isfinite(torch.tensor(grad_norm))
+    return loss.detach()
+
+
+def _fp32_masters(model: nn.Module, optimizer) -> dict[str, torch.Tensor]:
+    return {
+        name: optimizer.optimizer.state[param]["master_param"].detach().float().cpu().clone()
+        for name, param in model.named_parameters()
+    }
+
+
 def test_fsdp2_runtime_model_and_optimizer_offload_roundtrip_single_gpu():
     model, ps = _build_fsdp2_model()
     optimizer = _build_optimizer(model, ps, offload_fraction=0.0)
@@ -512,11 +531,62 @@ def test_fsdp2_fp8_weight_uses_te_source_for_fp32_master_and_updates_single_gpu(
 
     x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
     target = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
-    optimizer.zero_grad()
-    loss = torch.nn.functional.mse_loss(model(x).float(), target.float())
-    loss.backward()
-    success, grad_norm, _ = optimizer.step()
+    _fp8_step(model, optimizer, x, target)
 
-    assert success
-    assert torch.isfinite(loss)
-    assert torch.isfinite(torch.tensor(grad_norm))
+
+def test_fsdp2_fp8_weight_local_checkpoint_resume_matches_uninterrupted_single_gpu(tmp_path):
+    direct_model, direct_ps, _ = _build_fp8_fsdp2_model()
+    direct_optimizer = _build_optimizer(direct_model, direct_ps, offload_fraction=0.0)
+    saved_model, saved_ps, _ = _build_fp8_fsdp2_model()
+    saved_optimizer = _build_optimizer(saved_model, saved_ps, offload_fraction=0.0)
+
+    torch.manual_seed(4321)
+    x0 = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    target0 = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    x1 = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    target1 = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+
+    torch.testing.assert_close(
+        _fp8_step(direct_model, direct_optimizer, x0, target0),
+        _fp8_step(saved_model, saved_optimizer, x0, target0),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime.save_checkpoint(
+        ModelHandle(
+            model=saved_model,
+            optimizer=saved_optimizer,
+            parallel_state=saved_ps,
+            _extras={"model_chunks": [saved_model]},
+        ),
+        str(tmp_path),
+        step=1,
+        use_dcp=False,
+    )
+
+    resumed_model, resumed_ps, _ = _build_fp8_fsdp2_model()
+    resumed_optimizer = _build_optimizer(resumed_model, resumed_ps, offload_fraction=0.0)
+    assert runtime.load_checkpoint(
+        ModelHandle(
+            model=resumed_model,
+            optimizer=resumed_optimizer,
+            parallel_state=resumed_ps,
+            _extras={"model_chunks": [resumed_model]},
+        ),
+        str(tmp_path),
+        use_dcp=False,
+    ) == 1
+
+    for name, master in _fp32_masters(saved_model, saved_optimizer).items():
+        torch.testing.assert_close(
+            _fp32_masters(resumed_model, resumed_optimizer)[name], master, atol=0.0, rtol=0.0
+        )
+
+    _fp8_step(direct_model, direct_optimizer, x1, target1)
+    _fp8_step(resumed_model, resumed_optimizer, x1, target1)
+    for name, master in _fp32_masters(direct_model, direct_optimizer).items():
+        torch.testing.assert_close(
+            _fp32_masters(resumed_model, resumed_optimizer)[name], master, atol=0.0, rtol=0.0
+        )
