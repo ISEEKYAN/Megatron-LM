@@ -161,11 +161,9 @@ def _corr_grads(device):
     """
     ggen = torch.Generator().manual_seed(SEED + 7)
     rows = OUT // 2
-    out = []
-    for _ in range(STEPS):
-        top = torch.randn(rows, IN, generator=ggen, dtype=torch.float32)
-        out.append(torch.cat([top, top], dim=0).to(device))  # bottom block == top block
-    return out
+    top = torch.randn(rows, IN, generator=ggen, dtype=torch.float32)
+    # single step (see C control): compare at the update level, not after tiny-lr SGD.
+    return [torch.cat([top, top], dim=0).to(device)]  # bottom block == top block
 
 
 def _build_muon(core_cfg, params, *, pg_collection):
@@ -301,13 +299,16 @@ def main() -> int:
     # (C) DISTRIBUTED-IS-REAL evidence, on a purpose-built correlated input (identical
     # dim0 row-blocks) that maximally separates "did cross-rank NS" from "did not".
     # Requires an even 2-way split; for tp_size!=2 we still report but relax C2.
-    grads_c = _corr_grads(device)
-    w_ref = _run_full_reference(core_a, device, grads=grads_c)        # single-proc full NS
-    wdc, _ = _run_sharded(core_a, pg_collection=pg, tp_rank=tp_rank, tp_size=tp_size,
+    grads_c = _corr_grads(device)  # single step, correlated blocks
+    # lr=1, weight_decay=0 so the post-step weight == w_init - orth_update: this exposes
+    # the orthogonalization divergence directly (tiny training lr would shrink it ~1e5x).
+    core_c = _make_native_core_config(lr=1.0, weight_decay=0.0)
+    w_ref = _run_full_reference(core_c, device, grads=grads_c)        # single-proc full NS
+    wdc, _ = _run_sharded(core_c, pg_collection=pg, tp_rank=tp_rank, tp_size=tp_size,
                           device=device, grads=grads_c)               # real distributed
     wdc_full = _gather_full(wdc, tp_group, tp_size)
     dist_vs_ref = (wdc_full - w_ref).abs().max().item()
-    wl, _ = _run_local_shard_nopg(core_a, tp_rank=tp_rank, tp_size=tp_size,
+    wl, _ = _run_local_shard_nopg(core_c, tp_rank=tp_rank, tp_size=tp_size,
                                   device=device, grads=grads_c)       # pg=None per-shard
     wl_full = _gather_full(wl, tp_group, tp_size)
     local_vs_ref = (wl_full - w_ref).abs().max().item()
