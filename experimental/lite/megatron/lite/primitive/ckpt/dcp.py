@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import random
 from collections.abc import Iterable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -80,15 +81,18 @@ def save_training_checkpoint(
     # the round-trip. Mirror distckpt's pp-aware keying: disjoint keyspace per stage.
     model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
-    if save_model:
-        for name, param in model.named_parameters():
-            placements = get_placements(name)
-            mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(param, mesh, placements)
-
     ckpt_path = os.path.join(path, f"step_{step}")
     os.makedirs(ckpt_path, exist_ok=True)
-    dcp.save(state_dict, checkpoint_id=ckpt_path)
+    with _checkpoint_full_parameter_context(optimizer, enabled=save_model):
+        if save_model:
+            for name, param in model.named_parameters():
+                placements = get_placements(name)
+                mesh = expert_mesh if is_expert(name) else dense_mesh
+                state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(
+                    param, mesh, placements
+                )
+
+        dcp.save(state_dict, checkpoint_id=ckpt_path)
     if save_optimizer:
         _save_optimizer_checkpoint(optimizer, ckpt_path)
     if save_rng:
@@ -142,23 +146,26 @@ def load_training_checkpoint(
     # disjoint keyspace so pp ranks don't read each other's colliding FQNs.
     model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
-    if load_model:
-        for name, param in model.named_parameters():
-            placements = get_placements(name)
-            mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _empty_dcp_tensor_like_param(
-                param, mesh, placements
-            )
+    with _checkpoint_full_parameter_context(
+        optimizer, enabled=load_model, sync_to_shards_on_exit=load_model
+    ):
+        if load_model:
+            for name, param in model.named_parameters():
+                placements = get_placements(name)
+                mesh = expert_mesh if is_expert(name) else dense_mesh
+                state_dict[f"{model_prefix}.{name}"] = _empty_dcp_tensor_like_param(
+                    param, mesh, placements
+                )
 
-    dcp.load(state_dict, checkpoint_id=ckpt_path)
+        dcp.load(state_dict, checkpoint_id=ckpt_path)
 
-    if load_model:
-        for name, param in model.named_parameters():
-            key = f"{model_prefix}.{name}"
-            if key in state_dict:
-                t = state_dict[key]
-                with torch.no_grad():
-                    _copy_tensor_(param, t)
+        if load_model:
+            for name, param in model.named_parameters():
+                key = f"{model_prefix}.{name}"
+                if key in state_dict:
+                    t = state_dict[key]
+                    with torch.no_grad():
+                        _copy_tensor_(param, t)
 
     if load_optimizer:
         _load_optimizer_checkpoint(optimizer, ckpt_path)
@@ -191,6 +198,21 @@ def _supports_dist_opt_distckpt(model: nn.Module | Iterable[nn.Module], optimize
         return False
 
     return supports_dist_opt_distckpt(model, optimizer)
+
+
+def _checkpoint_full_parameter_context(
+    optimizer,
+    *,
+    enabled: bool,
+    sync_to_shards_on_exit: bool = False,
+):
+    """Optimizer-provided full-parameter scope, when available."""
+    if not enabled:
+        return nullcontext()
+    context_fn = getattr(optimizer, "checkpoint_full_parameter_context", None)
+    if callable(context_fn):
+        return context_fn(sync_to_shards_on_exit=sync_to_shards_on_exit)
+    return nullcontext()
 
 
 def _save_dist_opt_checkpoint(

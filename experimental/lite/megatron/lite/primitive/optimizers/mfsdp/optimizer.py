@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -287,6 +288,20 @@ class MFSdpOptimizer:
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self._inner_optimizer.load_state_dict(state_dict)
+
+    @contextmanager
+    def checkpoint_full_parameter_context(self, *, sync_to_shards_on_exit: bool = False):
+        """Expose full parameters for DCP within a scoped M-FSDP lifecycle."""
+        for chunk in self._model_chunks:
+            chunk.param_sync.materialize_all()
+        try:
+            yield
+            if sync_to_shards_on_exit:
+                for chunk in self._model_chunks:
+                    chunk.param_sync.copy_full_parameters_to_shards()
+        finally:
+            for chunk in self._model_chunks:
+                chunk.param_sync.release_scratch_keep_weights()
 
     def offload_state_to_cpu(self) -> None:
         self._inner_optimizer.offload_state_to_cpu()
