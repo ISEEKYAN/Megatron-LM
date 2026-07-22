@@ -51,6 +51,14 @@ export LR MIN_LR LR_WARMUP_STEPS LR_DECAY_STYLE WEIGHT_DECAY CLIP_GRAD
 export OPTIMIZER_ALGORITHM="$OPT_ALGO"
 export MLITE_OPTIMIZER_BACKEND="$OPT_BACKEND"
 export MUON_TP_MODE="$MUON_TP_MODE"
+# Megatron-Core's precision-aware optimizer (fp8/fp16 optimizer state) is adam-only
+# (`--use-precision-aware-optimizer only supported with adam`).  For the Muon arms we
+# keep optimizer offload for 35B memory but disable precision-aware state; this is an
+# optimizer-implementation detail, not a training hyperparameter, so the same-contract
+# (model/data/init/seed/tokens/LR) still holds across arms.
+if [[ "$OPT_ALGO" == "muon" ]]; then
+  export USE_PRECISION_AWARE_OPTIMIZER=False
+fi
 export TOTAL_EPOCHS=1
 export SAVE_FREQ="$TOTAL_STEPS"
 export TEST_FREQ=-1
