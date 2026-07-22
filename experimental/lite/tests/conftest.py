@@ -15,6 +15,15 @@ for root in (REPO_ROOT, LITE_ROOT, VERL_EXAMPLE_ROOT):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
+_EMERGING_OPT_SITE = os.environ.get("EMERGING_OPT_SITE")
+if not _EMERGING_OPT_SITE:
+    _default_eo_site = Path(__file__).resolve().parents[5] / ".vicky" / "eo_site"
+    if _default_eo_site.is_dir():
+        _EMERGING_OPT_SITE = str(_default_eo_site)
+if _EMERGING_OPT_SITE and _EMERGING_OPT_SITE not in sys.path:
+    sys.path.insert(0, _EMERGING_OPT_SITE)
+    os.environ.setdefault("EMERGING_OPT_SITE", _EMERGING_OPT_SITE)
+
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "mlite: mark a test as Megatron Lite validation coverage")
