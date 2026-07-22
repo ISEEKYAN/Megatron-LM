@@ -299,7 +299,7 @@ def build_fsdp2_adamw(
 ) -> FSDP2Optimizer:
     """Build AdamW from Megatron Lite's shared OptimizerConfig-like object."""
 
-    optimizer_name = getattr(opt, "optimizer", "adam")
+    optimizer_name = getattr(opt, "optimizer_algorithm", "adam")
     if optimizer_name not in {"adam", "adamw"}:
         raise ValueError(f"fsdp2 supports adam/adamw, got {optimizer_name!r}.")
 
@@ -470,7 +470,7 @@ def build_fsdp2_training_optimizer(
 
     if opt is None:
         opt = SimpleNamespace(
-            optimizer="adam",
+            optimizer_algorithm="adam",
             lr=1e-4,
             weight_decay=0.01,
             clip_grad=1.0,
@@ -486,7 +486,7 @@ def build_fsdp2_training_optimizer(
     # Muon routing must be tagged before FSDP2 wrapping so ``fully_shard`` can
     # preserve the per-param metadata (routing + QKV split) onto the DTensor
     # shards. The tags are read back by ``build_fsdp2_muon`` after wrapping.
-    is_muon = str(getattr(opt, "optimizer", "adam")).lower() == "muon"
+    is_muon = str(getattr(opt, "optimizer_algorithm", "adam")).lower() == "muon"
     if is_muon:
         from megatron.lite.primitive.optimizers.muon_routing import tag_muon_parameter_metadata
         from megatron.lite.primitive.protocols import default_expert_classifier

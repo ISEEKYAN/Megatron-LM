@@ -44,7 +44,11 @@ class OptimizerConfig:
     """
 
     # --- stable VERL fields ---
-    optimizer: str = "adam"
+    # ``optimizer_algorithm`` is the runtime contract.  ``optimizer`` remains
+    # only as an input compatibility alias for callers predating the rename;
+    # backends must read the canonical field below.
+    optimizer_algorithm: str = "adam"
+    optimizer: str | None = None
     lr: float = 1e-3
     min_lr: float = 0.0
     clip_grad: float = 1.0
@@ -67,6 +71,25 @@ class OptimizerConfig:
     offload_fraction: float | None = None
     use_precision_aware_optimizer: bool | None = None
     decoupled_weight_decay: bool | None = None
+
+    # --- Muon contract ---
+    muon_momentum: float = 0.95
+    muon_split_qkv: bool = True
+    muon_nesterov: bool = False
+    muon_scale_mode: str = "spectral"
+    muon_fp32_matmul_prec: str = "medium"
+    muon_coefficient_type: str = "quintic"
+    muon_num_ns_steps: int = 5
+    muon_tp_mode: str = "blockwise"
+    muon_extra_scale_factor: float = 1.0
+    muon_scalar_optimizer: str = "adam"
+
+    def __post_init__(self) -> None:
+        if self.optimizer is not None:
+            if self.optimizer_algorithm != "adam" and self.optimizer_algorithm != self.optimizer:
+                raise ValueError("optimizer conflicts with optimizer_algorithm")
+            self.optimizer_algorithm = self.optimizer
+        self.optimizer_algorithm = self.optimizer_algorithm.lower()
 
 
 @dataclass
