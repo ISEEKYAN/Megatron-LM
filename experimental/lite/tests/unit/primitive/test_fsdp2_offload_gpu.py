@@ -32,6 +32,8 @@ class TinyFP8Model(nn.Module):
         from megatron.lite.primitive.modules.mlp import SwiGLUMLP
         from megatron.lite.primitive.precision import (
             PrecisionCoverage,
+            PrimitiveCapability,
+            SemanticSite,
             precision_model_init_context,
             resolve_precision,
         )
@@ -44,6 +46,22 @@ class TinyFP8Model(nn.Module):
                 128,
                 128,
                 precision_coverage=coverage,
+            )
+            # SwiGLUMLP claims its two dense_mlp GEMMs; the composing layer owns
+            # the matching requirements (mirrors _declare_layer_precision_requirements
+            # and the primitive-parity harness). Declare them against the same
+            # owner objects the primitive claimed, then seal.
+            coverage.require(
+                self.mlp.gate_up,
+                SemanticSite.DENSE_MLP,
+                frozenset({PrimitiveCapability.TE_LINEAR}),
+                diagnostic="dense mlp gate_up projection",
+            )
+            coverage.require(
+                self.mlp.down,
+                SemanticSite.DENSE_MLP,
+                frozenset({PrimitiveCapability.TE_LINEAR}),
+                diagnostic="dense mlp down projection",
             )
             self.coverage_manifest = coverage.seal()
         self.precision_implementation = implementation
