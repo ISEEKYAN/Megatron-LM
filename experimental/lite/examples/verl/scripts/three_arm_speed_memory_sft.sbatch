@@ -12,8 +12,9 @@ set -euo pipefail
 # AC#4: one SBATCH invocation = one arm (adamw / muon dist_opt / muon fsdp2).
 ARM="${ARM:?set ARM=adamw|muon|muon_fsdp2}"
 BASE="${BASE:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code}"
-BASE_IMAGE="${BASE_IMAGE:-$BASE/env/pytorch_26.04-py3.sqsh}"
-VERL_DSA_SITE="${VERL_DSA_SITE:-$BASE/mlite-2604-verl-dsa-sm90-overlay/lib/python3.12/site-packages}"
+BASE_IMAGE="${BASE_IMAGE:-$BASE/verl_optimize/verl.vllm023.sqsh}"
+# verl.vllm023 is self-contained (/vllm); prepend only task mlite + mcore + emerging.
+VERL_DSA_SITE="${VERL_DSA_SITE:-}"
 MLITE_REPO="${MLITE_REPO:?set MLITE_REPO}"
 MUON_SNAPSHOT="${MUON_SNAPSHOT:-$BASE/runtime/muon-mbridge-386bf7af6-r2}"
 MEGATRON_ROOT="${MEGATRON_ROOT:-$MUON_SNAPSHOT/megatron-d64}"

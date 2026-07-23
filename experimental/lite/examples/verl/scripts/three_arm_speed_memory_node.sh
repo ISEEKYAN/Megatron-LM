@@ -3,15 +3,24 @@
 set -euo pipefail
 
 export PATH="$(printf %s "$PATH" | tr : '\n' | grep -viE 'miniforge|/conda|/anaconda' | paste -sd: -)"
-unset PYTHONHOME CONDA_PREFIX CONDA_DEFAULT_ENV ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES || true
+unset PYTHONHOME CONDA_PREFIX CONDA_DEFAULT_ENV ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES CC CXX || true
 export PYTHONNOUSERSITE=1
+export PATH=/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin
+export CC=/usr/bin/gcc CXX=/usr/bin/g++
+export TORCHDYNAMO_DISABLE=1
+export TORCHINDUCTOR_COMPILE_THREADS=1
 
 MLITE_LITE="$MLITE_REPO/experimental/lite"
 export VERL_ROOT="$VERL"
 export MEGATRON_ROOT="${MEGATRON_ROOT:?set MEGATRON_ROOT}"
-export VERL_DSA_SITE="${VERL_DSA_SITE:?set VERL_DSA_SITE}"
-NVRX_VENV_SITE="${NVRX_VENV_SITE:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/runtime/muon-p0p1-4d2a5b1df-mb-f5d6e2e-v2/nvrx-only-venv/lib/python3.12/site-packages}"
-export PYTHONPATH="${NVRX_VENV_SITE}:${VERL_DSA_SITE}/nvidia_cutlass_dsl/python_packages:${VERL_DSA_SITE}:${MLITE_LITE}/examples/verl:${MLITE_LITE}:${VERL}:${EMERGING_OPT_ROOT:-}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
+if [[ -n "${VERL_DSA_SITE:-}" ]]; then
+  export PYTHONPATH="/vllm:${VERL_DSA_SITE}/nvidia_cutlass_dsl/python_packages:${VERL_DSA_SITE}:${MLITE_LITE}/examples/verl:${MLITE_LITE}:${VERL}:${EMERGING_OPT_ROOT:-}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
+else
+  export PYTHONPATH="/vllm:${MLITE_LITE}/examples/verl:${MLITE_LITE}:${VERL}:${EMERGING_OPT_ROOT:-}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
+fi
+if [[ -n "${NVRX_VENV_SITE:-}" ]]; then
+  export PYTHONPATH="${NVRX_VENV_SITE}:${PYTHONPATH}"
+fi
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_DEVICE_MAX_CONNECTIONS=1
