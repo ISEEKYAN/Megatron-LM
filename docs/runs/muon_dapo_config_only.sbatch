@@ -44,7 +44,6 @@ import mbridge
 with open(os.path.join(os.environ["MODEL_PATH"], "config.json")) as stream:
     assert json.load(stream)["model_type"] == "qwen3_moe"
 ray.init(
-    local_mode=True,
     include_dashboard=False,
     num_cpus=2,
     runtime_env={"env_vars": {"MUON_DAPO_CONFIG_GATE": "1"}},
