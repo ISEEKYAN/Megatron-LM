@@ -85,7 +85,7 @@ for optimizer in muon adam; do
     actor_rollout_ref.actor.optim.exp_avg_dtype=fp32
     actor_rollout_ref.actor.optim.exp_avg_sq_dtype=fp32
     trainer.total_training_steps=5
-    trainer.seed=42
+    actor_rollout_ref.actor.megatron.seed=42
     actor_rollout_ref.rollout.seed=42
     trainer.resume_mode=disable
     trainer.val_before_train=False

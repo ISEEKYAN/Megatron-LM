@@ -36,6 +36,7 @@ export VLLM_ALLREDUCE_USE_SYMM_MEM=0
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export RAY_memory_monitor_refresh_ms=0
 export HYDRA_FULL_ERROR=1
+export PYTHONHASHSEED=42
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HOME="${RUN_ROOT}/hf-home"
 export HF_DATASETS_CACHE="${RUN_ROOT}/hf-datasets-cache"
@@ -165,7 +166,7 @@ PY
     bash "${OFFICIAL_RUN}" \
       "${optim_args[@]}" \
       trainer.total_training_steps=${TOTAL_TRAINING_STEPS:-5} \
-      trainer.seed=42 \
+      actor_rollout_ref.actor.megatron.seed=42 \
       actor_rollout_ref.rollout.seed=42 \
       trainer.resume_mode=disable \
       trainer.resume_from_path=null \
