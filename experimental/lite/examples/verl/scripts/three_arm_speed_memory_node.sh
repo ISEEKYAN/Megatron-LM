@@ -34,7 +34,9 @@ from megatron.core.optimizer.muon import get_megatron_muon_optimizer  # noqa: F4
 from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_optimizer_config
 from megatron.lite.runtime.contracts.config import OptimizerConfig
 import verl_mlite.engine.mlite_engine  # noqa: F401
-core = build_dist_opt_optimizer_config(OptimizerConfig(optimizer="muon", muon_tp_mode="distributed", lr=1e-5, weight_decay=0.1, clip_grad=1.0))
+core = build_dist_opt_optimizer_config(
+    OptimizerConfig(optimizer_algorithm="muon", muon_tp_mode="distributed", lr=1e-5, weight_decay=0.1, clip_grad=1.0)
+)
 assert core.use_layer_wise_distributed_optimizer is True, core.use_layer_wise_distributed_optimizer
 print("Q3MOE_SPEED_MEM_IMPORT_OK layer_wise_dist_opt=", core.use_layer_wise_distributed_optimizer)
 PY
