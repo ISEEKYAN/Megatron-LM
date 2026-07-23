@@ -60,6 +60,9 @@ export MLITE_OPTIMIZER_BACKEND="$OPT_BACKEND"
 export MUON_TP_MODE="$MUON_TP_MODE"
 if [[ "$OPT_ALGO" == "muon" ]]; then
   export USE_PRECISION_AWARE_OPTIMIZER=False
+  # DistOpt Muon rejects generic CPU offload lowering; match AC#3 nooffload recipe.
+  export OPTIMIZER_OFFLOAD=False
+  export OPTIMIZER_STATE_OFFLOAD_FRACTION=0.0
 fi
 export TOTAL_EPOCHS=1
 export SAVE_FREQ="$TOTAL_STEPS"
