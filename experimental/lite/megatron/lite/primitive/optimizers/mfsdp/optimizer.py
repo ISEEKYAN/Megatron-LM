@@ -31,6 +31,7 @@ from megatron.lite.primitive.optimizers.mfsdp.grad_norm import (
     local_grad_sq_sum,
     resolve_torch_dtype,
 )
+from megatron.lite.primitive.optimizers.mfsdp.cpu_offload import CpuAdamGroup
 from megatron.lite.primitive.optimizers.mfsdp.wrapper import (
     MFSdpModule,
     mark_optimizer_built,
@@ -46,6 +47,26 @@ def _override(opt: Any, name: str, default: Any) -> Any:
     return values.get(name, getattr(opt, name, default))
 
 
+class _NullOptimizer:
+    """No-op GPU optimizer used when all parameters are CPU-offloaded."""
+
+    def __init__(self) -> None:
+        self.param_groups: list = []
+        self.state: dict = {}
+
+    def step(self) -> None:
+        pass
+
+    def zero_grad(self, *, set_to_none: bool = True) -> None:
+        pass
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"state": {}, "param_groups": []}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        pass
+
+
 class _StandaloneOptimizer:
     """Torch optimizer adapter with M-FSDP-aware norm and state movement."""
 
@@ -59,6 +80,7 @@ class _StandaloneOptimizer:
         grad_norm_accum_dtype: str | torch.dtype,
         expert_params: Iterable[nn.Parameter],
         expert_grad_scale: float,
+        cpu_group: CpuAdamGroup | None = None,
     ) -> None:
         self.optimizer = optimizer
         self.params = params
@@ -84,10 +106,14 @@ class _StandaloneOptimizer:
         self._expert_grads_scaled = False
         self._tp_replicated_grads_synced = False
         self._offloaded_state_devices: dict[tuple[int, str], torch.device] = {}
+        self.cpu_group = cpu_group
 
     @property
     def param_groups(self) -> list[dict[str, Any]]:
-        return self.optimizer.param_groups
+        groups = list(self.optimizer.param_groups)
+        if self.cpu_group is not None:
+            groups += list(self.cpu_group.param_groups)
+        return groups
 
     def zero_grad(self) -> None:
         self.optimizer.zero_grad()
@@ -101,6 +127,8 @@ class _StandaloneOptimizer:
         if not math.isfinite(grad_norm):
             return False, grad_norm, 0
         self.optimizer.step()
+        if self.cpu_group is not None:
+            self.cpu_group.step()
         return True, grad_norm, 0
 
     def clip_grad_norm(self) -> float:
@@ -159,10 +187,18 @@ class _StandaloneOptimizer:
         return float(total_norm.float().item())
 
     def state_dict(self) -> dict[str, Any]:
-        return self.optimizer.state_dict()
+        result: dict[str, Any] = {"gpu": self.optimizer.state_dict()}
+        if self.cpu_group is not None:
+            result["cpu"] = self.cpu_group.state_dict()
+        return result
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.optimizer.load_state_dict(state_dict)
+        if "gpu" in state_dict:
+            self.optimizer.load_state_dict(state_dict["gpu"])
+            if self.cpu_group is not None and "cpu" in state_dict:
+                self.cpu_group.load_state_dict(state_dict["cpu"])
+        else:
+            self.optimizer.load_state_dict(state_dict)
 
     def offload_state_to_cpu(self) -> None:
         self._offloaded_state_devices.clear()
@@ -172,6 +208,7 @@ class _StandaloneOptimizer:
                     continue
                 self._offloaded_state_devices[(id(param), str(key))] = value.device
                 state[key] = value.cpu()
+        # cpu_group state is already on CPU; nothing to move.
 
     def load_state_to_device(self) -> None:
         for param, state in self.optimizer.state.items():
@@ -180,6 +217,7 @@ class _StandaloneOptimizer:
                 if device is not None and isinstance(value, torch.Tensor):
                     state[key] = value.to(device)
         self._offloaded_state_devices.clear()
+        # cpu_group state remains on CPU.
 
     def _scale_expert_grads_once(self) -> None:
         if self._expert_grads_scaled:
@@ -339,11 +377,43 @@ def build_mfsdp_stack(
         weight_decay=float(getattr(opt, "weight_decay", 0.01)),
         apply_wd_to_qk_layernorm=bool(getattr(opt, "apply_wd_to_qk_layernorm", False)),
     )
-    torch_optimizer = _build_optimizer_algorithm(
-        param_groups,
-        opt,
-        optimizer_factory=optimizer_factory,
-    )
+    offload_fraction = float(getattr(opt, "offload_fraction", 0.0) or 0.0)
+    offload_fraction = max(0.0, min(1.0, offload_fraction))
+
+    if offload_fraction > 0.0:
+        gpu_param_groups, cpu_param_groups = _split_param_groups_by_fraction(
+            param_groups, offload_fraction
+        )
+        torch_optimizer = (
+            _build_optimizer_algorithm(
+                gpu_param_groups,
+                opt,
+                optimizer_factory=optimizer_factory,
+            )
+            if gpu_param_groups
+            else _NullOptimizer()
+        )
+        cpu_group = _build_cpu_adam_group(cpu_param_groups, opt)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            cpu_numel = sum(
+                p.numel() for g in cpu_param_groups for p in g["params"]
+            )
+            total_numel = sum(p.numel() for p in params)
+            logger.info(
+                "M-FSDP CPU optimizer offload: %.1f%% of parameter elements "
+                "(%d / %d) use CPU Adam; exp_avg + exp_avg_sq moved off GPU.",
+                100.0 * cpu_numel / max(total_numel, 1),
+                cpu_numel,
+                total_numel,
+            )
+    else:
+        torch_optimizer = _build_optimizer_algorithm(
+            param_groups,
+            opt,
+            optimizer_factory=optimizer_factory,
+        )
+        cpu_group = None
+
     standalone_optimizer = _StandaloneOptimizer(
         torch_optimizer,
         params,
@@ -357,6 +427,7 @@ def build_mfsdp_stack(
             if expert_params
             else 1.0
         ),
+        cpu_group=cpu_group,
     )
     for chunk in wrapped_chunks:
         mark_optimizer_built(chunk)
@@ -456,6 +527,55 @@ def build_mfsdp_training_optimizer(
         optimizer.finish_grad_sync()
 
     return optimizer, finalize_grads
+
+
+def _split_param_groups_by_fraction(
+    param_groups: list[dict[str, Any]],
+    offload_fraction: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split param groups so the first *offload_fraction* of numel goes to CPU."""
+    total_numel = sum(p.numel() for g in param_groups for p in g["params"])
+    cpu_numel_target = int(total_numel * offload_fraction)
+
+    gpu_groups: list[dict[str, Any]] = []
+    cpu_groups: list[dict[str, Any]] = []
+    cpu_numel_so_far = 0
+
+    for group in param_groups:
+        gpu_params: list[nn.Parameter] = []
+        cpu_params: list[nn.Parameter] = []
+        for param in group["params"]:
+            if cpu_numel_so_far < cpu_numel_target:
+                cpu_params.append(param)
+                cpu_numel_so_far += param.numel()
+            else:
+                gpu_params.append(param)
+        if gpu_params:
+            g = dict(group)
+            g["params"] = gpu_params
+            gpu_groups.append(g)
+        if cpu_params:
+            g = dict(group)
+            g["params"] = cpu_params
+            cpu_groups.append(g)
+
+    return gpu_groups, cpu_groups
+
+
+def _build_cpu_adam_group(
+    cpu_param_groups: list[dict[str, Any]],
+    opt: Any,
+) -> CpuAdamGroup:
+    lr = float(getattr(opt, "lr", 1.0e-4))
+    beta1 = getattr(opt, "adam_beta1", None)
+    beta2 = getattr(opt, "adam_beta2", None)
+    eps = getattr(opt, "adam_eps", None)
+    return CpuAdamGroup(
+        cpu_param_groups,
+        lr=lr,
+        betas=(0.9 if beta1 is None else beta1, 0.999 if beta2 is None else beta2),
+        eps=1.0e-8 if eps is None else eps,
+    )
 
 
 def _build_param_groups(
