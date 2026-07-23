@@ -83,6 +83,7 @@ for optimizer in muon adam; do
   args=(
     actor_rollout_ref.actor.optim.optimizer=${optimizer}
     actor_rollout_ref.actor.megatron.vanilla_mbridge=True
+    actor_rollout_ref.rollout.moe_tensor_parallel_size=null
     actor_rollout_ref.rollout.expert_parallel_size=4
     actor_rollout_ref.actor.optim.lr_warmup_steps=0
     actor_rollout_ref.actor.optim.lr_decay_style=constant
@@ -123,6 +124,7 @@ rollout = omega_conf_to_dataclass(config.actor_rollout_ref.rollout)
 assert rollout.tensor_model_parallel_size == 4
 assert rollout.data_parallel_size == 1
 assert rollout.expert_parallel_size == 4
+assert rollout.moe_tensor_parallel_size is None
 print("MUON_DAPO_ROLLOUT_CONFIG_OK", sys.argv[1])
 PY
 done
