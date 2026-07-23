@@ -1,0 +1,21 @@
+{
+  "passed": true,
+  "result": {
+    "allclose": true,
+    "atol": 0.01,
+    "captured_slots": 1,
+    "device": "NVIDIA H100 80GB HBM3",
+    "dtype": "torch.bfloat16",
+    "hidden": 2048,
+    "max_abs_diff": 0.0,
+    "num_slots": 1,
+    "output_shape": [
+      256,
+      2048
+    ],
+    "rtol": 0.01,
+    "stage": "capture_replay_te_linear",
+    "tokens": 256
+  },
+  "skipped": false
+}
