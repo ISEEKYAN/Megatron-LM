@@ -28,3 +28,7 @@ python summarize_three_arm_speed_memory.py \
   --run-root /lustre/.../runtime/task-1-13-5-5-4-speed-memory \
   --output three_arm_speed_memory_RESULTS.md
 ```
+
+The summarizer returns exit status 1 unless both Muon arms report lower peak
+allocated memory than AdamW. It reports the DistOpt/FSDP2 loss gap for review;
+this experiment has no separately specified numerical loss-gap threshold.

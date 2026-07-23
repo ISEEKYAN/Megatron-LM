@@ -85,6 +85,7 @@ def main() -> int:
         f"- DistOpt muon vs FSDP2 muon steady mean loss gap: **{loss_gap:.4f}**",
         f"- Muon peak memory < AdamW (both arms): **{mem_ok}** "
         f"(adamw={adam['peak_mem_gb']:.2f}GB, distopt={dist['peak_mem_gb']:.2f}GB, fsdp2={fsdp['peak_mem_gb']:.2f}GB)",
+        f"- Summary exit status: **{'PASS (0)' if mem_ok else 'FAIL (1)'}**",
         "",
     ]
     out = "\n".join(text)
@@ -92,7 +93,10 @@ def main() -> int:
         sys.stdout.write(out)
     else:
         Path(args.output).write_text(out)
-    return 0
+    # AC#4 requires both sharded Muon implementations to use less peak memory
+    # than AdamW.  The loss gap is reported for the precision review, but no
+    # numerical threshold was specified for this short experiment.
+    return 0 if mem_ok else 1
 
 
 if __name__ == "__main__":
