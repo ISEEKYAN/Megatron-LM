@@ -146,6 +146,16 @@ def test_verl_muon_overrides_route_to_native_contract() -> None:
     assert optimizer.overlap_param_gather is True
 
 
+def test_verl_optimizer_field_routes_muon_when_algorithm_unset() -> None:
+    engine = _engine(engine_config=_engine_config())
+    engine.optimizer_config.optimizer_algorithm = "adam"
+    engine.optimizer_config.optimizer = "muon"
+
+    optimizer = engine._build_mlite_optimizer_config()
+
+    assert optimizer.optimizer_algorithm == "muon"
+
+
 def test_optimizer_cpu_offload_alias_maps_to_full_offload_fraction() -> None:
     engine = _engine(
         engine_config=_engine_config(optimizer_offload=False),
