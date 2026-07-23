@@ -24,6 +24,7 @@ MODEL_PATH=${MODEL_PATH:-${CODE_ROOT}/models/Qwen3-30B-A3B}
 TRAIN_FILE=${TRAIN_FILE:-${CODE_ROOT}/verl_update_mcore/data/dapo-math-17k.parquet}
 VAL_FILE=${VAL_FILE:-${CODE_ROOT}/verl_update_mcore/data/aime-2024.parquet}
 OFFICIAL_RUN=${OFFICIAL_RUN:-${VERL_ROOT}/examples/grpo_trainer/run_qwen3_30b_a3b_megatron.sh}
+MAIN_V0=${MAIN_V0:-${RUN_ROOT}/harness/muon_dapo_main_v0.py}
 
 export PATH=/usr/local/bin:/usr/bin:/bin
 unset CONDA_DEFAULT_ENV CONDA_PREFIX PYTHONHOME VIRTUAL_ENV ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES || true
@@ -47,7 +48,7 @@ mkdir -p "${RUN_ROOT}" "${HF_HOME}" "${HF_DATASETS_CACHE}" "${TRITON_CACHE_DIR}"
 for path in \
   "${VERL_ROOT}" "${MLITE_ROOT}/experimental/lite" "${MEGATRON_ROOT}" \
   "${EMERGING_OPT_ROOT}" "${MBRIDGE_ROOT}" "${NVRX_SITE}" \
-  "${MODEL_PATH}/config.json" "${TRAIN_FILE}" "${VAL_FILE}" "${OFFICIAL_RUN}"; do
+  "${MODEL_PATH}/config.json" "${TRAIN_FILE}" "${VAL_FILE}" "${OFFICIAL_RUN}" "${MAIN_V0}"; do
   [[ -e "${path}" ]] || { echo "FATAL missing ${path}" >&2; exit 2; }
 done
 
@@ -61,7 +62,6 @@ import megatron.core
 import mbridge
 import ray
 import torch
-import transfer_queue
 import verl
 import vllm
 
@@ -79,7 +79,6 @@ print(
     f"emerging={emerging_optimizers.__file__}",
     f"mbridge={mbridge.__file__}",
     f"ray={ray.__version__}",
-    f"transfer_queue={transfer_queue.__file__}",
     flush=True,
 )
 PY
@@ -165,7 +164,10 @@ PY
       )
     fi
 
-    bash "${OFFICIAL_RUN}" \
+    patched_run=$(mktemp)
+    sed 's#python3 -m verl.trainer.main_ppo#python3 "${MAIN_V0}"#' "${OFFICIAL_RUN}" >"${patched_run}"
+    export MAIN_V0
+    bash "${patched_run}" \
       "${optim_args[@]}" \
       trainer.total_training_steps=${TOTAL_TRAINING_STEPS:-5} \
       actor_rollout_ref.actor.megatron.seed=42 \
@@ -176,6 +178,7 @@ PY
       trainer.logger='["console","file"]' \
       "trainer.default_local_dir=${arm_root}" \
       2>&1 | tee -a "${arm_root}/arm.log"
+    rm -f "${patched_run}"
     echo "MUON_DAPO_ARM_DONE optimizer=${optimizer} rc=0" | tee -a "${arm_root}/arm.log"
 
     ray status

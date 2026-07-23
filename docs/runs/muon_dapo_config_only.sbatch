@@ -20,6 +20,7 @@ MODEL_PATH=${MODEL_PATH:-${CODE_ROOT}/models/Qwen3-30B-A3B}
 TRAIN_FILE=${TRAIN_FILE:-${CODE_ROOT}/verl_update_mcore/data/dapo-math-17k.parquet}
 VAL_FILE=${VAL_FILE:-${CODE_ROOT}/verl_update_mcore/data/aime-2024.parquet}
 OFFICIAL_RUN=${OFFICIAL_RUN:-${VERL_ROOT}/examples/grpo_trainer/run_qwen3_30b_a3b_megatron.sh}
+MAIN_V0=${MAIN_V0:-${RUN_ROOT}/harness/muon_dapo_main_v0.py}
 
 mkdir -p "${RUN_ROOT}"
 srun --container-image="${CONTAINER_IMAGE}" --container-mounts=/lustre:/lustre --export=ALL \
@@ -35,12 +36,12 @@ python - <<"PY"
 import json
 import os
 import ray
-import transfer_queue
 import vllm
 import verl
 import megatron.core
 import emerging_optimizers
 import mbridge
+from verl.trainer.main_ppo_v0 import TaskRunner
 
 with open(os.path.join(os.environ["MODEL_PATH"], "config.json")) as stream:
     assert json.load(stream)["model_type"] == "qwen3_moe"
@@ -75,6 +76,9 @@ common=(
   ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU=4096 ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=1
   TOTAL_EPOCHS=1 SAVE_FREQ=-1 TEST_FREQ=-1
 )
+patched_run=$(mktemp)
+sed '"'"'s#python3 -m verl.trainer.main_ppo#python3 "${MAIN_V0}"#'"'"' "'"${OFFICIAL_RUN}"'" >"${patched_run}"
+export MAIN_V0="'"${MAIN_V0}"'"
 for optimizer in muon adam; do
   args=(
     actor_rollout_ref.actor.optim.optimizer=${optimizer}
@@ -102,9 +106,10 @@ for optimizer in muon adam; do
     )
   fi
   args+=(--cfg job --resolve)
-  env "${common[@]}" bash "'"${OFFICIAL_RUN}"'" "${args[@]}" >"'"${RUN_ROOT}"'/resolved-${optimizer}.yaml"
+  env "${common[@]}" bash "${patched_run}" "${args[@]}" >"'"${RUN_ROOT}"'/resolved-${optimizer}.yaml"
   grep -q "optimizer: ${optimizer}" "'"${RUN_ROOT}"'/resolved-${optimizer}.yaml"
   grep -q "reward_manager: dapo" "'"${RUN_ROOT}"'/resolved-${optimizer}.yaml"
 done
+rm -f "${patched_run}"
 echo "MUON_DAPO_CONFIG_ONLY_OK job=${SLURM_JOB_ID}"
 '
