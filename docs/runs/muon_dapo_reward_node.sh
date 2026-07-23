@@ -28,7 +28,7 @@ OFFICIAL_RUN=${OFFICIAL_RUN:-${VERL_ROOT}/examples/grpo_trainer/run_qwen3_30b_a3
 export PATH=/usr/local/bin:/usr/bin:/bin
 unset CONDA_DEFAULT_ENV CONDA_PREFIX PYTHONHOME VIRTUAL_ENV ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES || true
 export PYTHONNOUSERSITE=1
-export PYTHONPATH="${VERL_ROOT}:${MLITE_ROOT}/experimental/lite:${MEGATRON_ROOT}:${EMERGING_OPT_ROOT}:${MBRIDGE_ROOT}:${NVRX_SITE}"
+export PYTHONPATH="/vllm:${VERL_ROOT}:${MLITE_ROOT}/experimental/lite:${MEGATRON_ROOT}:${EMERGING_OPT_ROOT}:${MBRIDGE_ROOT}:${NVRX_SITE}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_NVLS_ENABLE=0
 export VLLM_USE_V1=1
@@ -61,6 +61,7 @@ import megatron.core
 import mbridge
 import ray
 import torch
+import transfer_queue
 import verl
 import vllm
 
@@ -78,6 +79,7 @@ print(
     f"emerging={emerging_optimizers.__file__}",
     f"mbridge={mbridge.__file__}",
     f"ray={ray.__version__}",
+    f"transfer_queue={transfer_queue.__file__}",
     flush=True,
 )
 PY

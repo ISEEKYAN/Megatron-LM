@@ -14,7 +14,7 @@ set -euo pipefail
 B=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan
 CODE_ROOT=${CODE_ROOT:-${B}/code}
 RUN_ROOT=${RUN_ROOT:-${CODE_ROOT}/runtime/muon-dapo-reward-ab-30b}
-CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/portfolios/coreai/users/bayan/code/megatron_lite/verl.complete.sqsh}
+CONTAINER_IMAGE=${CONTAINER_IMAGE:-${CODE_ROOT}/verl_optimize/verl.vllm023.sqsh}
 NODE_SCRIPT=${NODE_SCRIPT:-${RUN_ROOT}/harness/muon_dapo_reward_node.sh}
 mkdir -p "${RUN_ROOT}"
 

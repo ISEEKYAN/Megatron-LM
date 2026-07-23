@@ -15,7 +15,7 @@ CODE_ROOT=${CODE_ROOT:-${B}/code}
 RUN_ROOT=${RUN_ROOT:-${CODE_ROOT}/runtime/muon-dapo-reward-ab-30b}
 VERL_ROOT=${VERL_ROOT:-${CODE_ROOT}/verl_muon_sft}
 SNAPSHOT_ROOT=${SNAPSHOT_ROOT:-${CODE_ROOT}/runtime/muon-mbridge-386bf7af6-r2}
-CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/portfolios/coreai/users/bayan/code/megatron_lite/verl.complete.sqsh}
+CONTAINER_IMAGE=${CONTAINER_IMAGE:-${CODE_ROOT}/verl_optimize/verl.vllm023.sqsh}
 MODEL_PATH=${MODEL_PATH:-${CODE_ROOT}/models/Qwen3-30B-A3B}
 TRAIN_FILE=${TRAIN_FILE:-${CODE_ROOT}/verl_update_mcore/data/dapo-math-17k.parquet}
 VAL_FILE=${VAL_FILE:-${CODE_ROOT}/verl_update_mcore/data/aime-2024.parquet}
@@ -28,13 +28,14 @@ set -euo pipefail
 export PATH=/usr/local/bin:/usr/bin:/bin
 unset CONDA_DEFAULT_ENV CONDA_PREFIX PYTHONHOME VIRTUAL_ENV ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES || true
 export PYTHONNOUSERSITE=1
-export PYTHONPATH="'"${VERL_ROOT}"':'"${SNAPSHOT_ROOT}"'/mlite/experimental/lite:'"${SNAPSHOT_ROOT}"'/megatron-d64:'"${SNAPSHOT_ROOT}"'/emerging-optimizers:'"${SNAPSHOT_ROOT}"'/mbridge-f5d6e2e:'"${CODE_ROOT}"'/runtime/muon-p0p1-4d2a5b1df-mb-f5d6e2e-v2/nvrx-only-venv/lib/python3.12/site-packages"
+export PYTHONPATH="/vllm:'"${VERL_ROOT}"':'"${SNAPSHOT_ROOT}"'/mlite/experimental/lite:'"${SNAPSHOT_ROOT}"'/megatron-d64:'"${SNAPSHOT_ROOT}"'/emerging-optimizers:'"${SNAPSHOT_ROOT}"'/mbridge-f5d6e2e:'"${CODE_ROOT}"'/runtime/muon-p0p1-4d2a5b1df-mb-f5d6e2e-v2/nvrx-only-venv/lib/python3.12/site-packages"
 export MODEL_PATH="'"${MODEL_PATH}"'"
 
 python - <<"PY"
 import json
 import os
 import ray
+import transfer_queue
 import vllm
 import verl
 import megatron.core
