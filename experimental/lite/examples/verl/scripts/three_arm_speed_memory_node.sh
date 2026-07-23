@@ -10,7 +10,8 @@ MLITE_LITE="$MLITE_REPO/experimental/lite"
 export VERL_ROOT="$VERL"
 export MEGATRON_ROOT="${MEGATRON_ROOT:?set MEGATRON_ROOT}"
 export VERL_DSA_SITE="${VERL_DSA_SITE:?set VERL_DSA_SITE}"
-export PYTHONPATH="${VERL_DSA_SITE}/nvidia_cutlass_dsl/python_packages:${VERL_DSA_SITE}:${MLITE_LITE}/examples/verl:${MLITE_LITE}:${VERL}:${EMERGING_OPT_ROOT:-}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
+NVRX_VENV_SITE="${NVRX_VENV_SITE:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/runtime/muon-p0p1-4d2a5b1df-mb-f5d6e2e-v2/nvrx-only-venv/lib/python3.12/site-packages}"
+export PYTHONPATH="${NVRX_VENV_SITE}:${VERL_DSA_SITE}/nvidia_cutlass_dsl/python_packages:${VERL_DSA_SITE}:${MLITE_LITE}/examples/verl:${MLITE_LITE}:${VERL}:${EMERGING_OPT_ROOT:-}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_DEVICE_MAX_CONNECTIONS=1

@@ -14,6 +14,7 @@ EMERGING_OPT_ROOT="${EMERGING_OPT_ROOT:-$MUON_SNAPSHOT/emerging-optimizers}"
 BASE_IMAGE="${BASE_IMAGE:-$BASE/env/pytorch_26.04-py3.sqsh}"
 VERL_DSA_SITE="${VERL_DSA_SITE:-$BASE/mlite-2604-verl-dsa-sm90-overlay/lib/python3.12/site-packages}"
 VERL="${VERL:-$BASE/verl-main-latest}"
+NVRX_VENV_SITE="${NVRX_VENV_SITE:-$BASE/runtime/muon-p0p1-4d2a5b1df-mb-f5d6e2e-v2/nvrx-only-venv/lib/python3.12/site-packages}"
 MODEL_PATH="${MODEL_PATH:-$BASE/models/Qwen3-30B-A3B}"
 DATA_DIR="${DATA_DIR:-$BASE/runtime/task-1-13-5-5-3-muon-precision/data/gsm8k_sft}"
 TRAIN_FILES="${TRAIN_FILES:-$DATA_DIR/train.parquet}"
@@ -53,7 +54,7 @@ for arm in $ARMS; do
   jid=$(sbatch --parsable --output="$out" \
     --export=ALL,ARM="$arm",BASE="$BASE",RUN_ROOT="$RUN_ROOT",MLITE_REPO="$MLITE_REPO",\
 MUON_SNAPSHOT="$MUON_SNAPSHOT",MEGATRON_ROOT="$MEGATRON_ROOT",EMERGING_OPT_ROOT="$EMERGING_OPT_ROOT",\
-BASE_IMAGE="$BASE_IMAGE",VERL_DSA_SITE="$VERL_DSA_SITE",VERL="$VERL",MODEL_PATH="$MODEL_PATH",TRAIN_FILES="$TRAIN_FILES" \
+BASE_IMAGE="$BASE_IMAGE",VERL_DSA_SITE="$VERL_DSA_SITE",VERL="$VERL",NVRX_VENV_SITE="$NVRX_VENV_SITE",MODEL_PATH="$MODEL_PATH",TRAIN_FILES="$TRAIN_FILES" \
     "$SCRIPT_DIR/$SBATCH")
   echo "SUBMITTED arm=$arm job=$jid log=$out"
 done
