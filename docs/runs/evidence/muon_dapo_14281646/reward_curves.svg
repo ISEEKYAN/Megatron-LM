@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="480" viewBox="0 0 800 480">
+<rect width="100%" height="100%" fill="white"/>
+<line x1="60" y1="420" x2="740" y2="420" stroke="#222"/>
+<line x1="60" y1="60" x2="60" y2="420" stroke="#222"/>
+<text x="400.0" y="468" text-anchor="middle">DAPO training step</text>
+<text x="18" y="240.0" transform="rotate(-90 18 240.0)" text-anchor="middle">reward mean</text>
+<text x="60" y="42">reward range -1..-0.90625</text>
+<polyline points="60.00,420.00 230.00,180.00 400.00,420.00 570.00,300.00 740.00,60.00" fill="none" stroke="#0b84f3" stroke-width="3"/>
+<text x="640" y="60" fill="#0b84f3">muon</text>
+<polyline points="60.00,420.00 230.00,300.00 400.00,420.00 570.00,300.00 740.00,300.00" fill="none" stroke="#f97316" stroke-width="3"/>
+<text x="640" y="84" fill="#f97316">adam</text>
+</svg>

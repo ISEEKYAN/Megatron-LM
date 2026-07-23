@@ -22,6 +22,15 @@ def test_reward_curve_uses_verl_file_logger_shape(tmp_path):
     assert _module().reward_curve(path) == [(1, 0.25), (2, 0.375)]
 
 
+def test_reward_curve_uses_verl_console_shape(tmp_path):
+    path = tmp_path / "arm.log"
+    path.write_text(
+        "prefix step:1 - training/global_step:1 - critic/rewards/mean:-1.0 - suffix\n"
+        "prefix step:2 - training/global_step:2 - critic/rewards/mean:-0.9375 - suffix\n"
+    )
+    assert _module().reward_curve(path) == [(1, -1.0), (2, -0.9375)]
+
+
 def test_svg_contains_both_named_curves():
     rendered = _module().svg({"muon": [(1, 0.2), (2, 0.4)], "adam": [(1, 0.2), (2, 0.3)]})
     assert "muon" in rendered

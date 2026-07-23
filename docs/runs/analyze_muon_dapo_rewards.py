@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 REWARD_KEYS = (
@@ -12,6 +13,10 @@ REWARD_KEYS = (
     "critic/score/mean",
     "reward/mean",
     "train/reward",
+)
+CONSOLE_RE = re.compile(
+    r"\bstep:(?P<step>\d+)\b.*?\bcritic/rewards/mean:"
+    r"(?P<reward>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
 )
 
 
@@ -21,6 +26,9 @@ def reward_curve(path: Path) -> list[tuple[int, float]]:
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
+            match = CONSOLE_RE.search(line)
+            if match:
+                curve.append((int(match["step"]), float(match["reward"])))
             continue
         data = row.get("data", row)
         for key in REWARD_KEYS:

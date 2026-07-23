@@ -1,0 +1,30 @@
+{
+  "muon": {
+    "points": [
+      {"step": 1, "reward": -1.0},
+      {"step": 2, "reward": -0.9375},
+      {"step": 3, "reward": -1.0},
+      {"step": 4, "reward": -0.96875},
+      {"step": 5, "reward": -0.90625}
+    ],
+    "first": -1.0,
+    "last": -0.90625,
+    "gain": 0.09375
+  },
+  "adam": {
+    "points": [
+      {"step": 1, "reward": -1.0},
+      {"step": 2, "reward": -0.96875},
+      {"step": 3, "reward": -1.0},
+      {"step": 4, "reward": -0.96875},
+      {"step": 5, "reward": -0.96875}
+    ],
+    "first": -1.0,
+    "last": -0.96875,
+    "gain": 0.03125
+  },
+  "verdict": {
+    "muon_reward_increased": true,
+    "muon_gain_not_below_adam": true
+  }
+}
