@@ -41,6 +41,74 @@ def reward_curve(path: Path) -> list[tuple[int, float]]:
     return curve
 
 
+def summarize(curve: list[tuple[int, float]], window_size: int) -> dict[str, object]:
+    if window_size < 1 or 2 * window_size > len(curve):
+        raise ValueError(
+            f"window_size={window_size} requires at least {2 * window_size} points; "
+            f"found {len(curve)}"
+        )
+    steps = [step for step, _ in curve]
+    rewards = [reward for _, reward in curve]
+    first_window_mean = sum(rewards[:window_size]) / window_size
+    last_window_mean = sum(rewards[-window_size:]) / window_size
+    step_mean = sum(steps) / len(steps)
+    reward_mean = sum(rewards) / len(rewards)
+    denominator = sum((step - step_mean) ** 2 for step in steps)
+    if denominator == 0:
+        raise ValueError("reward curve steps must not all be identical")
+    linear_slope = (
+        sum(
+            (step - step_mean) * (reward - reward_mean)
+            for step, reward in curve
+        )
+        / denominator
+    )
+    return {
+        "points": [{"step": step, "reward": reward} for step, reward in curve],
+        "first": rewards[0],
+        "last": rewards[-1],
+        "gain": rewards[-1] - rewards[0],
+        "window_size": window_size,
+        "first_window_mean": first_window_mean,
+        "last_window_mean": last_window_mean,
+        "window_gain": last_window_mean - first_window_mean,
+        "linear_slope": linear_slope,
+    }
+
+
+def summarize_curves(
+    curves: dict[str, list[tuple[int, float]]], window_size: int | None = None
+) -> dict[str, object]:
+    minimum_points = min(len(curve) for curve in curves.values())
+    if window_size is None:
+        window_size = max(1, min(10, minimum_points // 3))
+    summary: dict[str, object] = {
+        name: summarize(curve, window_size) for name, curve in curves.items()
+    }
+    muon = summary["muon"]
+    adam = summary["adam"]
+    assert isinstance(muon, dict)
+    assert isinstance(adam, dict)
+    muon_reward_increased = (
+        muon["window_gain"] > 0 and muon["linear_slope"] > 0
+    )
+    muon_gain_not_below_adam = muon["window_gain"] >= adam["window_gain"]
+    muon_last_window_not_below_adam = (
+        muon["last_window_mean"] >= adam["last_window_mean"]
+    )
+    summary["verdict"] = {
+        "muon_reward_increased": muon_reward_increased,
+        "muon_gain_not_below_adam": muon_gain_not_below_adam,
+        "muon_last_window_not_below_adam": muon_last_window_not_below_adam,
+        "hard_gate_passed": (
+            muon_reward_increased
+            and muon_gain_not_below_adam
+            and muon_last_window_not_below_adam
+        ),
+    }
+    return summary
+
+
 def svg(curves: dict[str, list[tuple[int, float]]]) -> str:
     width, height, pad = 800, 480, 60
     xs = [x for curve in curves.values() for x, _ in curve]
@@ -84,22 +152,15 @@ def main() -> None:
     parser.add_argument("--muon", type=Path, required=True)
     parser.add_argument("--adam", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        help="points in the disjoint leading/trailing trend windows (default: auto)",
+    )
     args = parser.parse_args()
 
     curves = {"muon": reward_curve(args.muon), "adam": reward_curve(args.adam)}
-    summary = {
-        name: {
-            "points": [{"step": step, "reward": reward} for step, reward in curve],
-            "first": curve[0][1],
-            "last": curve[-1][1],
-            "gain": curve[-1][1] - curve[0][1],
-        }
-        for name, curve in curves.items()
-    }
-    summary["verdict"] = {
-        "muon_reward_increased": summary["muon"]["gain"] > 0,
-        "muon_gain_not_below_adam": summary["muon"]["gain"] >= summary["adam"]["gain"],
-    }
+    summary = summarize_curves(curves, args.window_size)
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "reward_curves.json").write_text(json.dumps(summary, indent=2) + "\n")
     (args.output / "reward_curves.svg").write_text(svg(curves))

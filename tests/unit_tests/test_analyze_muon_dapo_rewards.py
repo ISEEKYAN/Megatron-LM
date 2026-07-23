@@ -36,3 +36,42 @@ def test_svg_contains_both_named_curves():
     assert "muon" in rendered
     assert "adam" in rendered
     assert rendered.count("<polyline") == 2
+
+
+def test_summarize_uses_window_gain_and_linear_slope():
+    curve = [(step, float(step - 6)) for step in range(1, 11)]
+    summary = _module().summarize(curve, window_size=3)
+    assert summary["first_window_mean"] == -4.0
+    assert summary["last_window_mean"] == 3.0
+    assert summary["window_gain"] == 7.0
+    assert summary["linear_slope"] == 1.0
+
+
+def test_verdict_rejects_short_spike_followed_by_reward_collapse():
+    curves = {
+        "muon": [(step, reward) for step, reward in enumerate(
+            [-1.0, -0.9375, -1.0, -0.875] + [-1.0] * 26, start=1
+        )],
+        "adam": [(step, reward) for step, reward in enumerate(
+            [-1.0] * 10 + [-0.75] * 10 + [-0.25] * 10, start=1
+        )],
+    }
+    summary = _module().summarize_curves(curves, window_size=10)
+    assert summary["verdict"] == {
+        "muon_reward_increased": False,
+        "muon_gain_not_below_adam": False,
+        "muon_last_window_not_below_adam": False,
+        "hard_gate_passed": False,
+    }
+
+
+def test_verdict_accepts_sustained_muon_gain_not_below_adam():
+    curves = {
+        "muon": [(step, step / 10) for step in range(1, 31)],
+        "adam": [(step, step / 20) for step in range(1, 31)],
+    }
+    summary = _module().summarize_curves(curves, window_size=10)
+    assert summary["verdict"]["muon_reward_increased"]
+    assert summary["verdict"]["muon_gain_not_below_adam"]
+    assert summary["verdict"]["muon_last_window_not_below_adam"]
+    assert summary["verdict"]["hard_gate_passed"]
