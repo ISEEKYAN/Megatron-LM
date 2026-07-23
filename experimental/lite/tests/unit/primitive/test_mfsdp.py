@@ -188,13 +188,14 @@ def test_mfsdp_source_layout_is_bounded():
         "backend.py",
         "buffer.py",
         "config.py",
+        "cpu_offload.py",
         "fully_shard.py",
         "fused_ops.py",
         "grad_norm.py",
         "optimizer.py",
         "wrapper.py",
     }
-    assert len(modules) <= 9
+    assert len(modules) <= 10
     assert not (package / "impl").exists()
 
 
@@ -230,6 +231,7 @@ def test_mfsdp_reference_rewrite_modules_are_live():
     required_modules = {
         "buffer.py",
         "config.py",
+        "cpu_offload.py",
         "fully_shard.py",
         "fused_ops.py",
         "grad_norm.py",
@@ -717,6 +719,218 @@ def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
     assert saved_model.keys() == restored_model.keys()
     for name, value in saved_model.items():
         assert torch.equal(value, restored_model[name]), name
+
+
+def _build_offload_stack(offload_fraction: float):
+    class _Unit(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(4, 4, bias=False)
+
+        def forward(self, value):
+            return torch.nn.functional.gelu(self.linear(value))
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.unit0 = _Unit()
+            self.unit1 = _Unit()
+            self.out = torch.nn.Linear(4, 2, bias=False)
+
+        def forward(self, value):
+            return self.out(self.unit1(self.unit0(value)))
+
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1000.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        offload_fraction=offload_fraction,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    engine_cfg = SimpleNamespace(
+        parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+        optimizer=opt,
+    )
+    return _Model, _Unit, ps, engine_cfg
+
+
+def test_mfsdp_offload_fraction_keeps_optimizer_state_on_cpu():
+    _Model, _Unit, ps, engine_cfg = _build_offload_stack(offload_fraction=1.0)
+
+    torch.manual_seed(42)
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+
+    value = torch.randn(3, 4)
+    target = torch.randn(3, 2)
+    optimizer.zero_grad()
+    torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+    optimizer.finish_grad_sync()
+    success, _grad_norm, _ = optimizer.step()
+    assert success
+
+    inner = optimizer._inner_optimizer
+    cpu_group = inner.cpu_group
+    assert cpu_group is not None, "Expected cpu_group to be set for offload_fraction=1.0"
+
+    for cpu_p in cpu_group._cpu_params:
+        assert cpu_p.device.type == "cpu", "cpu_param should be on CPU"
+    cpu_opt_state = cpu_group._cpu_optimizer.state
+    for cpu_p in cpu_group._cpu_params:
+        if cpu_p in cpu_opt_state:
+            state = cpu_opt_state[cpu_p]
+            assert state["exp_avg"].device.type == "cpu"
+            assert state["exp_avg_sq"].device.type == "cpu"
+
+    for gpu_param in inner.params:
+        assert gpu_param.device.type != "cuda" or gpu_param.data is not None
+
+
+def test_mfsdp_offload_fraction_numerically_matches_no_offload():
+    _Model, _Unit, ps, engine_cfg_offload = _build_offload_stack(offload_fraction=1.0)
+    _, _, _, engine_cfg_gpu = _build_offload_stack(offload_fraction=0.0)
+
+    torch.manual_seed(77)
+    model_ref = _Model()
+    model_cpu = copy.deepcopy(model_ref)
+
+    chunks_ref, opt_ref = mfsdp_optimizer.build_mfsdp_stack(
+        [model_ref],
+        engine_cfg=engine_cfg_gpu,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    chunks_cpu, opt_cpu = mfsdp_optimizer.build_mfsdp_stack(
+        [model_cpu],
+        engine_cfg=engine_cfg_offload,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+
+    value = torch.randn(3, 4)
+    target = torch.randn(3, 2)
+
+    opt_ref.zero_grad()
+    torch.nn.functional.mse_loss(chunks_ref[0](value), target).backward()
+    opt_ref.finish_grad_sync()
+    success_ref, _norm_ref, _ = opt_ref.step()
+    assert success_ref
+
+    opt_cpu.zero_grad()
+    torch.nn.functional.mse_loss(chunks_cpu[0](value), target).backward()
+    opt_cpu.finish_grad_sync()
+    success_cpu, _norm_cpu, _ = opt_cpu.step()
+    assert success_cpu
+
+    ref_params = {
+        name.removeprefix("module."): param
+        for name, param in chunks_ref[0].named_parameters()
+    }
+    cpu_params = {
+        name.removeprefix("module."): param
+        for name, param in chunks_cpu[0].named_parameters()
+    }
+    assert ref_params.keys() == cpu_params.keys()
+    for name in ref_params:
+        assert torch.allclose(ref_params[name], cpu_params[name], atol=1e-5, rtol=1e-4), (
+            f"Parameter {name} diverges between GPU-only and CPU-offload runs"
+        )
+
+
+def test_mfsdp_offload_fraction_partial_splits_by_numel():
+    _Model, _Unit, ps, engine_cfg = _build_offload_stack(offload_fraction=0.5)
+
+    torch.manual_seed(7)
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+
+    inner = optimizer._inner_optimizer
+    cpu_group = inner.cpu_group
+    assert cpu_group is not None
+
+    total_numel = sum(p.numel() for p in inner.params)
+    cpu_numel = sum(p.numel() for p in cpu_group._gpu_params)
+    gpu_numel = total_numel - cpu_numel
+    assert cpu_numel > 0, "Expected some params to be CPU-offloaded at fraction=0.5"
+    assert gpu_numel > 0, "Expected some params to remain on GPU at fraction=0.5"
+    ratio = cpu_numel / total_numel
+    # The greedy split assigns whole params; exact ratio depends on model shape.
+    # For fraction=0.5 with 3 params of unequal size the ratio will be ≥0.4.
+    assert ratio >= 0.4, f"Expected substantial CPU offload at fraction=0.5, got {ratio:.2%}"
+    assert ratio <= 0.95, f"Expected some GPU params at fraction=0.5, got {ratio:.2%}"
+
+
+def test_mfsdp_offload_fraction_zero_has_no_cpu_group():
+    _Model, _Unit, ps, engine_cfg = _build_offload_stack(offload_fraction=0.0)
+
+    torch.manual_seed(9)
+    _chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    assert optimizer._inner_optimizer.cpu_group is None
+
+
+def test_mfsdp_offload_fraction_checkpoint_round_trips():
+    _Model, _Unit, ps, engine_cfg = _build_offload_stack(offload_fraction=1.0)
+
+    torch.manual_seed(55)
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+
+    value = torch.randn(3, 4)
+    target = torch.randn(3, 2)
+    optimizer.zero_grad()
+    torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+    optimizer.finish_grad_sync()
+    optimizer.step()
+
+    saved = optimizer.state_dict()
+    assert "gpu" in saved
+    assert "cpu" in saved
+
+    optimizer.load_state_dict(saved)
+
+    optimizer.zero_grad()
+    torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+    optimizer.finish_grad_sync()
+    success, _, _ = optimizer.step()
+    assert success
 
 
 def _single_rank_mfsdp_stack():
