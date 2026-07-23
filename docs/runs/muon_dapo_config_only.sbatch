@@ -94,7 +94,7 @@ for optimizer in muon adam; do
   if [[ ${optimizer} == muon ]]; then
     args+=(
       actor_rollout_ref.actor.optim.use_layer_wise_distributed_optimizer=True
-      actor_rollout_ref.actor.optim.use_layer_wise_param_layout=True
+      +actor_rollout_ref.actor.optim.use_layer_wise_param_layout=True
       actor_rollout_ref.actor.optim.muon_tp_mode=blockwise
       actor_rollout_ref.actor.optim.muon_scalar_optimizer=adam
       actor_rollout_ref.actor.optim.muon_num_ns_steps=5
