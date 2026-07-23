@@ -90,8 +90,6 @@ for optimizer in muon adam; do
     trainer.resume_mode=disable
     trainer.val_before_train=False
     "trainer.logger=[console,file]"
-    --cfg job
-    --resolve
   )
   if [[ ${optimizer} == muon ]]; then
     args+=(
@@ -102,6 +100,7 @@ for optimizer in muon adam; do
       actor_rollout_ref.actor.optim.muon_num_ns_steps=5
     )
   fi
+  args+=(--cfg job --resolve)
   env "${common[@]}" bash "'"${OFFICIAL_RUN}"'" "${args[@]}" >"'"${RUN_ROOT}"'/resolved-${optimizer}.yaml"
   grep -q "optimizer: ${optimizer}" "'"${RUN_ROOT}"'/resolved-${optimizer}.yaml"
   grep -q "reward_manager: dapo" "'"${RUN_ROOT}"'/resolved-${optimizer}.yaml"
