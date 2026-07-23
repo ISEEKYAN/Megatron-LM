@@ -61,7 +61,9 @@ def _capture_replay_stage(
         num_microbatches=1,
     )
     x_capture = base.detach().clone().requires_grad_(True)
-    controller._capture_slot(0, 0, module, (x_capture,), {})
+    # TE make_graphed_callables needs warmup iters to populate need_bwd_dw_graph;
+    # the controller default is 3 (job 13875020 failed with num_warmup_iters=0).
+    controller._capture_slot(0, 0, module, (x_capture,), None)
     graphed = controller.get_graphed(0, 0)
     if graphed is None:
         raise CudaGraphError("controller.get_graphed(0, 0) returned None after capture")

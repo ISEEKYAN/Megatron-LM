@@ -137,20 +137,48 @@ def test_qualify_enabled_when_all_chunks_graph_safe():
     assert status.state == "enabled"
     assert status.implementation == "te_chunk_wise"
     assert status.captured and isinstance(status.captured[0], CoverageEntry)
+    assert status.captured[0].region == "transformer_block"
     assert not status.excluded
 
 
-def test_qualify_not_applicable_when_moe_dynamic():
+def test_qualify_not_applicable_when_moe_dynamic_without_attention():
     ctrl = CudaGraphController(
         chunks=[_chunk(graph_safe_moe=False)],
         num_warmup_microbatches=0,
         num_microbatches=4,
     )
     status = ctrl.qualify()
-    # Single chunk, dropless MoE -> nothing captured whole -> not-applicable,
-    # never a silent eager step masquerading as a captured chunk.
+    # Dropless MoE + no discoverable attention region → nothing to capture.
     assert status.state == "not-applicable"
     assert status.excluded[0].code is ExclusionCode.DYNAMIC_MOE_ROUTING
+    assert not status.captured
+
+
+def test_qualify_partial_when_moe_dynamic_with_attention():
+    """bayan 2026-07-21 attn-only: MoE excluded, attention still partial-captured."""
+    disp = types.SimpleNamespace(is_moe_dispatcher=True, cuda_graph_safe=False)
+    attn = object()
+    chunk = types.SimpleNamespace(modules=lambda: [disp], full_attn=attn)
+    ctrl = CudaGraphController(
+        chunks=[chunk],
+        num_warmup_microbatches=0,
+        num_microbatches=4,
+    )
+    status = ctrl.qualify()
+    assert status.state == "partial"
+    assert status.implementation == "te_attn_partial"
+    assert status.captured[0].region == "attention"
+    assert status.excluded[0].code is ExclusionCode.DYNAMIC_MOE_ROUTING
+
+
+def test_resolve_attention_callable_walks_layers():
+    from megatron.lite.primitive.cuda_graph import resolve_attention_callable
+
+    attn = object()
+    layer = types.SimpleNamespace(full_attn=attn)
+    chunk = types.SimpleNamespace(layers=[layer])
+    assert resolve_attention_callable(chunk) is attn
+    assert resolve_attention_callable(types.SimpleNamespace()) is None
 
 
 def test_qualify_off_is_diagnostic_not_applicable():

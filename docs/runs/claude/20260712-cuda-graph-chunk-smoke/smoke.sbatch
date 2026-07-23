@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:8
 #SBATCH --account=coreai_devtech_all
 #SBATCH --partition=batch
-#SBATCH --time=00:25:00
+#SBATCH --time=00:15:00
 #
 # Chunk-wise CUDA Graph qualification smoke (TASK-1.21).
 #
@@ -64,7 +64,8 @@ srun \
 
     PY="${VENV_PY}"
     [[ -x "${PY}" ]] || PY=python
-    echo "=== python: ${PY} ==="; "${PY}" -c "import torch,transformer_engine; print('torch',torch.__version__,'gpus',torch.cuda.device_count())"
+    echo "=== python: ${PY} ==="
+    "${PY}" -c "import torch,transformer_engine as te; print(torch.__version__, torch.cuda.device_count(), getattr(te, '__version__', 'unknown'))"
 
     rc_a=0; rc_b=0; rc_c=0
 

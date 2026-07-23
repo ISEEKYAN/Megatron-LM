@@ -13,7 +13,8 @@ each chunk's replay signature is graph-safe:
 * ``enabled``        — the whole chunk is captured as one forward/backward graph
                        pair per live PP/VPP slot;
 * ``partial``        — a chunk still holds a dynamic region, so only its stable
-                       static sub-regions are captured;
+                       static sub-regions are captured (phase-1: attention
+                       QKV/RoPE/attn-core/out-proj; MoE/MLP/norm stay eager);
 * ``not-applicable`` — no region qualifies, so the step stays intentionally eager.
 
 There is **no** capability protocol, capability collector, or generic policy
@@ -343,15 +344,38 @@ class ChunkGraphSafety:
     exclusions: list = field(default_factory=list)
 
 
+def resolve_attention_callable(chunk) -> Optional[Any]:
+    """Return a structurally-discovered attention submodule for partial capture.
+
+    Phase-1 (bayan 2026-07-21) captures only the attention sub-region. Probe is
+    model-neutral: look for common attribute names on the chunk / its immediate
+    children. Never keys off a model name (primitive.principle / layering).
+    """
+    for name in ("full_attn", "self_attention", "attention", "linear_attn"):
+        mod = getattr(chunk, name, None)
+        if mod is not None:
+            return mod
+    # PP model chunks often expose layers; take the first attention hit.
+    layers = getattr(chunk, "layers", None)
+    if layers is None and hasattr(chunk, "decoder"):
+        layers = getattr(chunk.decoder, "layers", None)
+    if layers is not None:
+        for layer in layers:
+            found = resolve_attention_callable(layer)
+            if found is not None:
+                return found
+    return None
+
+
 def inspect_chunk_moe_dispatch(chunk) -> Optional[ExclusionReason]:
     """Return an exclusion if the chunk holds a graph-unsafe MoE dispatcher.
 
     A dropless dynamic MoE dispatcher derives its all-to-all split sizes from a
     live token count via ``.item()``/``.tolist()`` (host sync), which is not
-    graph-safe. Option A makes the dispatcher fixed-capacity / device-driven; a
-    dispatcher that has not opted into that static mode excludes the whole chunk
-    with a stable reason (AC#2: dropless dynamic MoE must never silently
-    masquerade as a captured chunk).
+    graph-safe. Phase-1 does **not** capture MoE: the dispatcher region is
+    excluded with a stable reason while attention may still be partial-captured
+    (AC#2: dropless dynamic MoE must never silently masquerade as a captured
+    whole-chunk graph).
 
     The dispatcher advertises graph-safety structurally via a
     ``cuda_graph_safe`` attribute/property (set by its static-capacity mode); the
@@ -359,7 +383,7 @@ def inspect_chunk_moe_dispatch(chunk) -> Optional[ExclusionReason]:
     """
     for module in chunk.modules() if hasattr(chunk, "modules") else []:
         # Structural, model-neutral probe: any dispatcher-like module that has
-        # not declared itself graph-safe excludes the chunk.
+        # not declared itself graph-safe excludes the moe_dispatch region.
         if getattr(module, "is_moe_dispatcher", False):
             if not bool(getattr(module, "cuda_graph_safe", False)):
                 return ExclusionReason(
@@ -367,8 +391,8 @@ def inspect_chunk_moe_dispatch(chunk) -> Optional[ExclusionReason]:
                     code=ExclusionCode.DYNAMIC_MOE_ROUTING,
                     detail=(
                         "MoE dispatcher is dropless/dynamic (host-synced A2A split "
-                        "sizes). Enable fixed-capacity device-driven dispatch to "
-                        "make the whole chunk graph-safe."
+                        "sizes). Phase-1 leaves MoE/MLP/norm eager; attention may "
+                        "still be partial-captured."
                     ),
                 )
     return None
@@ -483,15 +507,28 @@ class CudaGraphController:
         excluded: list[ExclusionReason] = []
         for chunk_id, chunk in enumerate(self.chunks):
             moe_exclusion = inspect_chunk_moe_dispatch(chunk)
+            attn = resolve_attention_callable(chunk)
             if moe_exclusion is not None:
-                # AC#2: a chunk with dropless dynamic MoE is not captured whole.
-                # It downgrades to partial (static attention/MLP sub-regions) —
-                # never a silent eager retry masquerading as a captured chunk.
+                # AC#2 + bayan 2026-07-21 attn-only: exclude MoE loudly, but still
+                # partial-capture the attention sub-region when one is present.
+                # Never a silent eager retry masquerading as a whole-chunk graph.
                 excluded.append(moe_exclusion)
+                if attn is not None:
+                    captured.append(
+                        CoverageEntry(
+                            region="attention",
+                            chunk_id=chunk_id,
+                            num_slots=self.num_slots,
+                        )
+                    )
                 continue
+            # Graph-safe (or MoE-free) chunk: whole-block path remains available
+            # for later phases; phase-1 runners still prefer the attention
+            # callable when present.
+            region = "attention" if attn is not None else "transformer_block"
             captured.append(
                 CoverageEntry(
-                    region="transformer_block",
+                    region=region,
                     chunk_id=chunk_id,
                     num_slots=self.num_slots,
                 )
@@ -504,9 +541,18 @@ class CudaGraphController:
         else:
             state = "not-applicable"
 
+        if not captured:
+            implementation = None
+        elif any(entry.region == "attention" for entry in captured):
+            # Phase-1 (attn-only): prefer the attention-partial implementation tag
+            # even when no MoE exclusion forced a partial downgrade.
+            implementation = "te_attn_partial"
+        else:
+            implementation = "te_chunk_wise"
+
         self._status = CudaGraphStatus(
             state=state,
-            implementation="te_chunk_wise" if captured else None,
+            implementation=implementation,
             captured=tuple(captured),
             excluded=tuple(excluded),
         )
@@ -522,12 +568,25 @@ class CudaGraphController:
         """Reset the live-slot FIFO at the start of a forward-backward pass."""
         self._runtime_slots.reset()
 
-    def _capture_slot(self, chunk_id: int, slot: int, callable_fn, sample_args, sample_kwargs):
+    def _capture_slot(
+        self,
+        chunk_id: int,
+        slot: int,
+        callable_fn,
+        sample_args,
+        sample_kwargs=None,
+        *,
+        num_warmup_iters: int = 3,
+    ):
         """Capture one (chunk, slot) forward/backward graph pair via TE.
 
         Imported lazily: ``make_graphed_callables`` needs CUDA + Transformer
         Engine, so this path is exercised only on GPU (8-card proxy / production
         PP). CPU unit tests cover the surrounding slot/qualify/signature logic.
+
+        ``num_warmup_iters`` defaults to TE's 3: a zero warmup leaves
+        ``need_bwd_dw_graph`` unpopulated and TE raises ``KeyError`` during
+        backward-graph capture (observed on job 13875020).
         """
         import torch  # local import: keep module import CPU-safe/fast
         from transformer_engine.pytorch import make_graphed_callables
@@ -535,11 +594,14 @@ class CudaGraphController:
         if not torch.cuda.is_available():  # defensive: never capture off-GPU
             raise CudaGraphError("CUDA is required to capture a chunk CUDA graph.")
 
+        if hasattr(callable_fn, "train"):
+            callable_fn.train()
+
         graphed = make_graphed_callables(
             callable_fn,
             sample_args,
-            sample_kwargs=sample_kwargs,
-            num_warmup_iters=0,
+            sample_kwargs=sample_kwargs if sample_kwargs else None,
+            num_warmup_iters=num_warmup_iters,
             allow_unused_input=True,
         )
         self._graphed[(chunk_id, slot)] = graphed
@@ -565,4 +627,5 @@ __all__ = [
     "decompose_packed_seq_params",
     "reconstruct_packed_seq_params",
     "inspect_chunk_moe_dispatch",
+    "resolve_attention_callable",
 ]
