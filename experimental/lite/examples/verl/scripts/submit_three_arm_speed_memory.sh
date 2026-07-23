@@ -25,8 +25,7 @@ mkdir -p "$RUN_ROOT/logs"
 
 echo "[preflight] mlite=$(git -C "$MLITE_REPO" rev-parse --short HEAD 2>/dev/null || echo MISSING)"
 echo "[preflight] mcore=$(git -C "$MEGATRON_ROOT" rev-parse --short HEAD 2>/dev/null || echo MISSING)"
-echo "[preflight] emerging=$(git -C "$EMERGING_OPT_ROOT" rev-parse --short HEAD 2>/dev/null || echo MISSING)"
-test -f "$MUON_SNAPSHOT/READY"
+echo "[preflight] emerging=$(test -d "$EMERGING_OPT_ROOT/emerging_optimizers" && echo present || echo MISSING)"
 test -f "$TRAIN_FILES"
 
 echo "===================== CONFIG DRY-RUN GATE ====================="
@@ -52,7 +51,7 @@ for arm in $ARMS; do
   out="$RUN_ROOT/logs/%x_%j_${arm}.out"
   jid=$(sbatch --parsable --output="$out" \
     --export=ALL,ARM="$arm",BASE="$BASE",RUN_ROOT="$RUN_ROOT",MLITE_REPO="$MLITE_REPO",\
-MUON_SNAPSHOT="$MUON_SNAPSHOT",MEGATRON_ROOT="$MEGATRON_ROOT",EMERGING_OPT_ROOT="$EMERGING_OPT_ROOT",\
+MEGATRON_ROOT="$MEGATRON_ROOT",EMERGING_OPT_ROOT="$EMERGING_OPT_ROOT",\
 BASE_IMAGE="$BASE_IMAGE",VERL_DSA_SITE="$VERL_DSA_SITE",VERL="$VERL",NVRX_VENV_SITE="$NVRX_VENV_SITE",MODEL_PATH="$MODEL_PATH",TRAIN_FILES="$TRAIN_FILES" \
     "$SCRIPT_DIR/$SBATCH")
   echo "SUBMITTED arm=$arm job=$jid log=$out"
