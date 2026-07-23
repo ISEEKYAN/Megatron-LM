@@ -82,6 +82,7 @@ export MAIN_V0="'"${MAIN_V0}"'"
 for optimizer in muon adam; do
   args=(
     actor_rollout_ref.actor.optim.optimizer=${optimizer}
+    actor_rollout_ref.actor.megatron.vanilla_mbridge=True
     actor_rollout_ref.actor.optim.lr_warmup_steps=0
     actor_rollout_ref.actor.optim.lr_decay_style=constant
     actor_rollout_ref.actor.optim.min_lr=1e-5
@@ -109,6 +110,7 @@ for optimizer in muon adam; do
   env "${common[@]}" bash "${patched_run}" "${args[@]}" >"'"${RUN_ROOT}"'/resolved-${optimizer}.yaml"
   grep -q "optimizer: ${optimizer}" "'"${RUN_ROOT}"'/resolved-${optimizer}.yaml"
   grep -q "reward_manager: dapo" "'"${RUN_ROOT}"'/resolved-${optimizer}.yaml"
+  test "$(grep -c "vanilla_mbridge: true" "'"${RUN_ROOT}"'/resolved-${optimizer}.yaml")" -ge 2
 done
 rm -f "${patched_run}"
 echo "MUON_DAPO_CONFIG_ONLY_OK job=${SLURM_JOB_ID}"
