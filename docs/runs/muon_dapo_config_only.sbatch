@@ -83,6 +83,7 @@ for optimizer in muon adam; do
   args=(
     actor_rollout_ref.actor.optim.optimizer=${optimizer}
     actor_rollout_ref.actor.megatron.vanilla_mbridge=True
+    actor_rollout_ref.rollout.expert_parallel_size=4
     actor_rollout_ref.actor.optim.lr_warmup_steps=0
     actor_rollout_ref.actor.optim.lr_decay_style=constant
     actor_rollout_ref.actor.optim.min_lr=1e-5
@@ -111,6 +112,19 @@ for optimizer in muon adam; do
   grep -q "optimizer: ${optimizer}" "'"${RUN_ROOT}"'/resolved-${optimizer}.yaml"
   grep -q "reward_manager: dapo" "'"${RUN_ROOT}"'/resolved-${optimizer}.yaml"
   test "$(grep -c "vanilla_mbridge: true" "'"${RUN_ROOT}"'/resolved-${optimizer}.yaml")" -ge 2
+  python - "'"${RUN_ROOT}"'/resolved-${optimizer}.yaml" <<"PY"
+import sys
+
+from omegaconf import OmegaConf
+from verl.utils.config import omega_conf_to_dataclass
+
+config = OmegaConf.load(sys.argv[1])
+rollout = omega_conf_to_dataclass(config.actor_rollout_ref.rollout)
+assert rollout.tensor_model_parallel_size == 4
+assert rollout.data_parallel_size == 1
+assert rollout.expert_parallel_size == 4
+print("MUON_DAPO_ROLLOUT_CONFIG_OK", sys.argv[1])
+PY
 done
 rm -f "${patched_run}"
 echo "MUON_DAPO_CONFIG_ONLY_OK job=${SLURM_JOB_ID}"

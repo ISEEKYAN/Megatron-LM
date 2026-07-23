@@ -143,6 +143,7 @@ PY
     optim_args=(
       "actor_rollout_ref.actor.optim.optimizer=${optimizer}"
       actor_rollout_ref.actor.megatron.vanilla_mbridge=True
+      "actor_rollout_ref.rollout.expert_parallel_size=${ROLLOUT_TP}"
       actor_rollout_ref.actor.optim.lr_warmup_steps=0
       actor_rollout_ref.actor.optim.lr_warmup_init=0
       actor_rollout_ref.actor.optim.lr_decay_style=constant
