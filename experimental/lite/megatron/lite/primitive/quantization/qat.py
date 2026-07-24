@@ -76,10 +76,12 @@ _DEFERRED_FORMATS: frozenset[str] = frozenset({"nvfp4_w4a16", "nvfp4_w4a4"})
 # tiny). These are generic Megatron surface names, not model names.
 _DEFAULT_IGNORE_PATTERNS: tuple[str, ...] = (
     "lm_head",
+    "head",  # VocabParallelOutput (qwen3_moe/lite uses ``head.col.linear``)
     "output_layer",
     "gate",  # MoE router gate
     "router",
     "embedding",
+    "embed",  # VocabParallelEmbedding wrapper (weight lives at ``embed.embedding``)
     "word_embeddings",
 )
 
@@ -556,6 +558,34 @@ def unpack_int4(packed: torch.Tensor, *, signed: bool = True) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def _compute_amax_tensor(weight: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Per-tensor or per-expert amax for 2D ``[out, in]`` or 3D ``[E, out, in]`` weights."""
+    if weight.dim() == 3:
+        return torch.stack(
+            [compute_amax(weight[i], group_size) for i in range(weight.shape[0])],
+            dim=0,
+        )
+    if weight.dim() != 2:
+        raise ValueError(
+            f"QAT weight fake-quant expects 2D or 3D stacked weights, got {tuple(weight.shape)}."
+        )
+    return compute_amax(weight, group_size)
+
+
+def _fake_quant_weight_tensor(weight: torch.Tensor, spec: QATSpec) -> torch.Tensor:
+    """Fake-quant a 2D linear weight or a 3D MoE stacked expert weight."""
+    if weight.dim() == 3:
+        return torch.stack(
+            [fake_quantize_weight(weight[i], spec) for i in range(weight.shape[0])],
+            dim=0,
+        )
+    if weight.dim() != 2:
+        raise ValueError(
+            f"QAT weight fake-quant expects 2D or 3D stacked weights, got {tuple(weight.shape)}."
+        )
+    return fake_quantize_weight(weight, spec)
+
+
 class WeightFakeQuant(nn.Module):
     """``torch.nn.utils.parametrize`` module that fake-quantizes a weight.
 
@@ -568,14 +598,16 @@ class WeightFakeQuant(nn.Module):
     def __init__(self, spec: QATSpec, weight_shape: torch.Size):
         super().__init__()
         self.spec = spec
-        amax = compute_amax(torch.zeros(weight_shape), spec.group_size)
+        amax = _compute_amax_tensor(torch.zeros(weight_shape), spec.group_size)
         # persistent so distckpt's named_buffers() loop saves/restores it.
         self.register_buffer("amax", amax.clone(), persistent=True)
 
     def forward(self, weight: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            self.amax.copy_(compute_amax(weight, self.spec.group_size).to(self.amax.dtype))
-        return fake_quantize_weight(weight, self.spec)
+            self.amax.copy_(
+                _compute_amax_tensor(weight, self.spec.group_size).to(self.amax.dtype)
+            )
+        return _fake_quant_weight_tensor(weight, self.spec)
 
 
 # ---------------------------------------------------------------------------
@@ -584,24 +616,25 @@ class WeightFakeQuant(nn.Module):
 
 
 def _quantizable_weight_owner(module: nn.Module) -> nn.Module | None:
-    """Return the sub-object that owns a 2D ``weight`` Parameter, if any.
+    """Return the sub-object that owns a quantizable ``weight`` Parameter, if any.
 
     MLite parallel linears wrap the real GEMM as ``module.linear`` (TE) whose
     ``.weight`` is the parameter; plain ``nn.Linear`` owns ``.weight`` directly.
-    Grouped expert linears expose 3D stacked weights and are handled by the
-    caller (skipped here in phase 1).
+    MoE ``te.GroupedLinear`` experts expose a 3D stacked ``[E, out, in]`` weight
+    on the module itself and are fake-quantized per expert slice.
     """
     inner = getattr(module, "linear", None)
     if isinstance(inner, nn.Module) and isinstance(getattr(inner, "weight", None), nn.Parameter):
-        if inner.weight.dim() == 2:
+        if inner.weight.dim() in (2, 3):
             return inner
-    if isinstance(getattr(module, "weight", None), nn.Parameter) and module.weight.dim() == 2:
+    weight = getattr(module, "weight", None)
+    if isinstance(weight, nn.Parameter) and weight.dim() in (2, 3):
         return module
     return None
 
 
 def apply_qat_to_module(module: nn.Module, spec: QATSpec) -> bool:
-    """Register weight fake-quant on a single module's 2D weight. Returns applied."""
+    """Register weight fake-quant on a module's 2D/3D weight. Returns applied."""
     owner = _quantizable_weight_owner(module)
     if owner is None:
         return False

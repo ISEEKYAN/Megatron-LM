@@ -252,10 +252,48 @@ class Qwen3MoEWeightSpec:
 # ---------------------------------------------------------------------------
 
 
+def _canonical_state_key(key: str) -> str:
+    """Map a QAT-parametrized state key back to its logical (pre-QAT) name.
+
+    ``torch.nn.utils.parametrize`` renames ``mod.weight`` to
+    ``mod.parametrizations.weight.original`` (the surviving BF16 master), while
+    HF checkpoints still reference the logical ``mod.weight``. Strip the
+    parametrization wrapper so loaded tensors resolve onto the master weight
+    instead of being silently dropped (which would train on random weights).
+    Only the ``.original`` master is rewritten; quantizer buffers such as
+    ``...parametrizations.weight.0.amax`` are left untouched.
+    """
+    marker = ".parametrizations."
+    if marker not in key or not key.endswith(".original"):
+        return key
+    head, rest = key.split(marker, 1)
+    attr = rest.split(".", 1)[0]
+    return f"{head}.{attr}"
+
+
+def _resolve_param_name_canonical(name: str, state_dict: dict) -> str | None:
+    """Resolve a logical checkpoint name onto a possibly QAT-parametrized key."""
+    canonical = {_canonical_state_key(key): key for key in state_dict}
+    if name in state_dict:
+        return name
+    if name in canonical:
+        return canonical[name]
+    for logical, key in canonical.items():
+        if name in logical:
+            return key
+    return None
+
+
 def load_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:
+    from megatron.lite.primitive.ckpt import hf_weights as hf_weights_module
     from megatron.lite.primitive.ckpt.hf_weights import load_hf_weights as _load
 
-    _load(model, path, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size)
+    original_resolve = hf_weights_module._resolve_param_name
+    hf_weights_module._resolve_param_name = _resolve_param_name_canonical
+    try:
+        _load(model, path, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size)
+    finally:
+        hf_weights_module._resolve_param_name = original_resolve
 
 
 def export_hf_weights(model, config: Qwen3MoEConfig, ps, **kwargs):
