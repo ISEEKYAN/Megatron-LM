@@ -8,6 +8,7 @@ import pytest
 import torch
 from megatron.lite.primitive.parallel.combined_1f1b import (
     Combined1F1BConfig,
+    Combined1F1BLayerPlan,
     Combined1F1BModelPlan,
     build_combined_1f1b_trace,
     run_combined_1f1b,
@@ -56,6 +57,47 @@ def test_combined_1f1b_driver_runs_adjacent_microbatches():
         ("backward", 3),
     ]
     assert outputs == [{"loss": 0}, {"loss": 1}, {"loss": 2}, {"loss": 3}]
+
+
+class _TraceNode:
+    def __init__(self, name, calls):
+        self.name = name
+        self.calls = calls
+
+    def forward(self, value):
+        self.calls.append(("forward", self.name))
+        return value
+
+    def backward(self, value):
+        self.calls.append(("backward", self.name))
+        return value
+
+
+def test_layer_pair_matches_megatron_combined_node_order():
+    calls = []
+    forward = Combined1F1BLayerPlan.__new__(Combined1F1BLayerPlan)
+    backward = Combined1F1BLayerPlan.__new__(Combined1F1BLayerPlan)
+    forward.nodes = tuple(
+        _TraceNode(f"f_{name}", calls)
+        for name in ("pre_dispatch", "dispatch", "experts", "combine")
+    )
+    backward.nodes = tuple(
+        _TraceNode(f"b_{name}", calls)
+        for name in ("pre_dispatch", "dispatch", "experts", "combine")
+    )
+
+    Combined1F1BLayerPlan.combined(forward, backward, object(), object())
+
+    assert calls == [
+        ("backward", "b_combine"),
+        ("forward", "f_pre_dispatch"),
+        ("backward", "b_experts"),
+        ("forward", "f_dispatch"),
+        ("backward", "b_dispatch"),
+        ("forward", "f_experts"),
+        ("forward", "f_combine"),
+        ("backward", "b_pre_dispatch"),
+    ]
 
 
 class _TinyModel(nn.Module):

@@ -62,6 +62,24 @@ Set `DRY_RUN=0` to run the benchmark under `torchrun`. Results are written to
 `experimental/lite/examples/bench/outputs/`. Set `REFERENCE_BACKEND=bridge` only
 when Megatron-Bridge is installed and `import megatron.bridge` succeeds.
 
+## Qwen3 EP-Overlap Pair
+
+The first combined-1F1B profile is deliberately narrow: Qwen3 MoE, PP=1,
+EP>1, the all-to-all dispatcher, at least two microbatches, no MTP, no
+recompute, and unfused permutation. Run the baseline and overlap arms with the
+same data and model shape:
+
+```bash
+HF_PATH=/models/Qwen3-30B-A3B \
+DRY_RUN=1 \
+bash experimental/lite/examples/bench/scripts/run_qwen3_ep_overlap_pair.sh
+```
+
+Set `DRY_RUN=0` inside an 8-GPU allocation to run the default EP=8 pair. The
+overlap arm sets only `overlap_moe_expert_parallel_comm=true`; the script writes
+separate JSON and log files for direct loss, gradient-norm, throughput, and
+memory comparison.
+
 ## Validated Run
 
 The following paired run completed on 2026-06-07 with 8x NVIDIA H100 80GB GPUs:

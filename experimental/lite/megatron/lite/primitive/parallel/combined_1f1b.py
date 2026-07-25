@@ -162,12 +162,12 @@ class Combined1F1BLayerPlan:
         f_pre, f_dispatch, f_experts, f_combine = forward_plan.nodes
         b_pre, b_dispatch, b_experts, b_combine = backward_plan.nodes
 
-        forward_inputs = f_pre.forward(forward_inputs)
         backward_grads = b_combine.backward(backward_grads)
-        forward_inputs = f_dispatch.forward(forward_inputs)
+        forward_inputs = f_pre.forward(forward_inputs)
         backward_grads = b_experts.backward(backward_grads)
-        forward_inputs = f_experts.forward(forward_inputs)
+        forward_inputs = f_dispatch.forward(forward_inputs)
         backward_grads = b_dispatch.backward(backward_grads)
+        forward_inputs = f_experts.forward(forward_inputs)
         forward_inputs = f_combine.forward(forward_inputs)
         backward_grads = b_pre.backward(backward_grads)
         return forward_inputs, backward_grads
