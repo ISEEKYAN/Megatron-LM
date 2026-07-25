@@ -147,7 +147,7 @@ def test_apply_lora_tp_layout_on_gqa_adapters():
         surface.tp_group = object()
         surface.local_out = 12
         surface.use_sp = True
-        surface.linear = nn.Linear(16, 12, bias=False)
+        surface.linear = nn.Linear(16, 12, bias=False, dtype=torch.bfloat16)
         surface.gather_output = False
         return surface
 
@@ -159,7 +159,7 @@ def test_apply_lora_tp_layout_on_gqa_adapters():
         surface.tp_group = object()
         surface.local_in = 12
         surface.use_sp = True
-        surface.linear = nn.Linear(12, 16, bias=False)
+        surface.linear = nn.Linear(12, 16, bias=False, dtype=torch.bfloat16)
         return surface
 
     class _MockAttn:
@@ -178,6 +178,8 @@ def test_apply_lora_tp_layout_on_gqa_adapters():
     assert attn.proj.weight is attn.proj.base.linear.weight
     qkv_adapter = attn.qkv.adapter
     proj_adapter = attn.proj.adapter
+    assert qkv_adapter.lora_a.dtype == torch.bfloat16
+    assert proj_adapter.lora_a.dtype == torch.bfloat16
     assert qkv_adapter.lora_a.shape == (2, 16)
     assert qkv_adapter.lora_b.shape == (12, 4)
     assert qkv_adapter.rank_partitioned_a is True

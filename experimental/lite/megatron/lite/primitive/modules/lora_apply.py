@@ -102,6 +102,13 @@ def _local_linear_features(module: nn.Module) -> tuple[int, int]:
     return next(iter(shapes))
 
 
+def _place_adapter_like(adapter: nn.Module, base: nn.Module) -> nn.Module:
+    reference = next(base.parameters(), None)
+    if reference is None:
+        raise ValueError(f"Cannot place LoRA adapter for parameterless {type(base).__name__}.")
+    return adapter.to(device=reference.device, dtype=reference.dtype)
+
+
 def _qkv_adapter_input_fn(base_qkv: nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
     linear = base_qkv.linear
     if not hasattr(linear, "layer_norm_weight"):
@@ -127,19 +134,22 @@ def _attach_gqa_qkv(attn, spec: LoraSpec) -> bool:
         return False
     ps = attn.ps
     local_in, local_out = _local_linear_features(attn.qkv)
-    adapter = LinearLoRA(
-        local_in,
-        local_out,
-        spec.rank,
-        alpha=spec.alpha,
-        dropout=spec.dropout,
-        use_rslora=spec.use_rslora,
-        sequence_parallel_input=attn.qkv.use_sp,
-        tp_group=ps.tp_group,
-        rank_partition_size=ps.tp_size,
-        rank_partitioned_a=ps.tp_size > 1,
-        a_tensor_model_parallel=ps.tp_size > 1,
-        b_tensor_model_parallel=ps.tp_size > 1,
+    adapter = _place_adapter_like(
+        LinearLoRA(
+            local_in,
+            local_out,
+            spec.rank,
+            alpha=spec.alpha,
+            dropout=spec.dropout,
+            use_rslora=spec.use_rslora,
+            sequence_parallel_input=attn.qkv.use_sp,
+            tp_group=ps.tp_group,
+            rank_partition_size=ps.tp_size,
+            rank_partitioned_a=ps.tp_size > 1,
+            a_tensor_model_parallel=ps.tp_size > 1,
+            b_tensor_model_parallel=ps.tp_size > 1,
+        ),
+        attn.qkv,
     )
     attn.qkv = LoRAWrappedLinear(
         attn.qkv, adapter, adapter_input_fn=_qkv_adapter_input_fn(attn.qkv)
@@ -154,21 +164,24 @@ def _attach_gqa_proj(attn, spec: LoraSpec) -> bool:
         return False
     ps = attn.ps
     local_in, local_out = _local_linear_features(attn.proj)
-    adapter = LinearLoRA(
-        local_in,
-        local_out,
-        spec.rank,
-        alpha=spec.alpha,
-        dropout=spec.dropout,
-        use_rslora=spec.use_rslora,
-        tp_group=ps.tp_group,
-        tp_rank=ps.tp_rank,
-        sequence_parallel_scatter_output=attn.proj.use_sp,
-        input_parallel_reduce=ps.tp_size > 1,
-        output_partition_size=ps.tp_size,
-        output_partitioned_b=ps.tp_size > 1,
-        a_tensor_model_parallel=ps.tp_size > 1,
-        b_tensor_model_parallel=ps.tp_size > 1,
+    adapter = _place_adapter_like(
+        LinearLoRA(
+            local_in,
+            local_out,
+            spec.rank,
+            alpha=spec.alpha,
+            dropout=spec.dropout,
+            use_rslora=spec.use_rslora,
+            tp_group=ps.tp_group,
+            tp_rank=ps.tp_rank,
+            sequence_parallel_scatter_output=attn.proj.use_sp,
+            input_parallel_reduce=ps.tp_size > 1,
+            output_partition_size=ps.tp_size,
+            output_partitioned_b=ps.tp_size > 1,
+            a_tensor_model_parallel=ps.tp_size > 1,
+            b_tensor_model_parallel=ps.tp_size > 1,
+        ),
+        attn.proj,
     )
     attn.proj = LoRAWrappedLinear(attn.proj, adapter)
     return True
@@ -182,14 +195,17 @@ def _attach_expert_fc(
     base = getattr(experts, attr)
     if isinstance(base, LoRAWrappedGroupedLinear):
         return False
-    adapter = SharedGroupedLinearLoRA(
-        experts.num_local_experts,
-        in_features,
-        out_features,
-        spec.rank,
-        alpha=spec.alpha,
-        dropout=spec.dropout,
-        use_rslora=spec.use_rslora,
+    adapter = _place_adapter_like(
+        SharedGroupedLinearLoRA(
+            experts.num_local_experts,
+            in_features,
+            out_features,
+            spec.rank,
+            alpha=spec.alpha,
+            dropout=spec.dropout,
+            use_rslora=spec.use_rslora,
+        ),
+        base,
     )
     setattr(experts, attr, LoRAWrappedGroupedLinear(base, adapter))
     return True
@@ -200,24 +216,30 @@ def _attach_swiglu_mlp(mlp, spec: LoraSpec) -> int:
     hidden = mlp.gate_up.in_features
     intermediate = mlp.down.in_features
     if spec.targets_module("linear_fc1") and not isinstance(mlp.gate_up, LoRAWrappedLinear):
-        adapter = LinearLoRA(
-            hidden,
-            mlp.gate_up.out_features,
-            spec.rank,
-            alpha=spec.alpha,
-            dropout=spec.dropout,
-            use_rslora=spec.use_rslora,
+        adapter = _place_adapter_like(
+            LinearLoRA(
+                hidden,
+                mlp.gate_up.out_features,
+                spec.rank,
+                alpha=spec.alpha,
+                dropout=spec.dropout,
+                use_rslora=spec.use_rslora,
+            ),
+            mlp.gate_up,
         )
         mlp.gate_up = LoRAWrappedLinear(mlp.gate_up, adapter)
         attached += 1
     if spec.targets_module("linear_fc2") and not isinstance(mlp.down, LoRAWrappedLinear):
-        adapter = LinearLoRA(
-            intermediate,
-            mlp.down.out_features,
-            spec.rank,
-            alpha=spec.alpha,
-            dropout=spec.dropout,
-            use_rslora=spec.use_rslora,
+        adapter = _place_adapter_like(
+            LinearLoRA(
+                intermediate,
+                mlp.down.out_features,
+                spec.rank,
+                alpha=spec.alpha,
+                dropout=spec.dropout,
+                use_rslora=spec.use_rslora,
+            ),
+            mlp.down,
         )
         mlp.down = LoRAWrappedLinear(mlp.down, adapter)
         attached += 1

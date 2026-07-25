@@ -54,5 +54,6 @@ exec srun --unbuffered --export=ALL \
     XDG_CACHE_HOME="${RUN_ROOT}/cache" \
     PYTHONPATH="${PYTHONPATH_IN}" \
     bash --noprofile --norc -c \
-      "export LD_LIBRARY_PATH=${QWEN35_FLA_SITE}/tvm_ffi/lib:\$LD_LIBRARY_PATH; \
+      "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader; \
+       export LD_LIBRARY_PATH=${QWEN35_FLA_SITE}/tvm_ffi/lib:\$LD_LIBRARY_PATH; \
        exec torchrun --standalone --nproc_per_node=1 ${SCRIPT}"
