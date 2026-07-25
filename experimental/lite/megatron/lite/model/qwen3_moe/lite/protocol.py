@@ -40,11 +40,11 @@ from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _lo
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.lora import (
-    LoraConfig,
-    freeze_non_lora_params,
-    normalize_lora_config,
-    trainable_param_stats,
+    LoraSpec,
+    apply_olora_tail_init,
+    normalize_lora_spec,
 )
+from megatron.lite.primitive.modules.lora_apply import apply_lora_to_chunks
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
@@ -88,7 +88,7 @@ class ImplConfig:
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
     deterministic: bool = True
-    lora: LoraConfig | dict | None = None
+    lora: LoraSpec | dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     Model owns all construction. Runtime just consumes the ModelBundle.
     """
     p = impl_cfg.parallel
-    lora_config = normalize_lora_config(impl_cfg.lora)
+    lora_spec = normalize_lora_spec(impl_cfg.lora)
 
     # ── validation ──
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
@@ -184,7 +184,6 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         mtp_enable=mtp_enable,
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
-        lora_config=lora_config,
     )
 
     vpp = None if p.vpp == 1 else p.vpp
@@ -213,13 +212,14 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         for chunk in chunks:
             apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
 
-    lora_stats = None
-    if lora_config.enabled:
-        lora_stats = {"chunks": []}
-        for chunk in chunks:
-            freeze_stats = freeze_non_lora_params(chunk)
-            trainable_stats = trainable_param_stats(chunk)
-            lora_stats["chunks"].append({**freeze_stats, **trainable_stats})
+    lora_stats = apply_lora_to_chunks(chunks, lora_spec, ps=ps)
+
+    olora_hook = None
+    if lora_spec.enabled and lora_spec.init == "olora_tail":
+
+        def olora_hook():
+            for chunk in chunks:
+                apply_olora_tail_init(chunk)
 
     # ── optimizer (model chooses which primitive) ──
     optimizer = None
@@ -252,6 +252,8 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             from megatron.lite.model.qwen3_moe.lite.model import TransformerLayer
             from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
+            if olora_hook is not None:
+                olora_hook()
             return {
                 "optimizer": build_fsdp2_training_optimizer(
                     chunks,
@@ -293,8 +295,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             "pre_forward_hook": _pre_forward_hook,
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
-            "lora_config": lora_config,
+            "lora_spec": lora_spec,
             "lora_stats": lora_stats,
+            "olora_hook": olora_hook,
         },
     )
 

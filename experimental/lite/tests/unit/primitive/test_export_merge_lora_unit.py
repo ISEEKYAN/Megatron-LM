@@ -1,0 +1,156 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""LoRA wrapper contract for the generic HF exporter."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn as nn
+
+from megatron.lite.primitive.ckpt.hf_weights import (
+    _is_adapter_param,
+    _lora_export_surfaces,
+    export_hf_weights,
+)
+from megatron.lite.primitive.modules.lora import LinearLoRA, SharedGroupedLinearLoRA
+from megatron.lite.primitive.modules.lora_apply import (
+    LoRAWrappedGroupedLinear,
+    LoRAWrappedLinear,
+)
+
+pytestmark = pytest.mark.mlite
+
+
+class _IdentitySpec:
+    num_experts = 2
+
+    def native_to_hf(self, native_name, tensor):
+        return [(native_name, tensor)]
+
+    def tp_spec(self, native_name):
+        return None
+
+    def is_expert(self, native_name):
+        return False
+
+
+def _single_rank_ps():
+    return SimpleNamespace(
+        tp_size=1,
+        tp_rank=0,
+        etp_size=1,
+        etp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        tp_group=None,
+        etp_group=None,
+        ep_group=None,
+        pp_group=None,
+    )
+
+
+class _Wrapped(nn.Module):
+    def __init__(self, out_features, in_features):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=False)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class _GroupedBase(nn.Module):
+    def __init__(self, num_experts, out_features, in_features, generator):
+        super().__init__()
+        for expert_idx in range(num_experts):
+            setattr(
+                self,
+                f"weight{expert_idx}",
+                nn.Parameter(torch.randn(out_features, in_features, generator=generator)),
+            )
+
+    def forward(self, x, splits):
+        del x, splits
+        raise AssertionError("Exporter tests do not call forward")
+
+
+class _TinyWrappedModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        generator = torch.Generator().manual_seed(0)
+        dense_adapter = LinearLoRA(8, 12, 2, alpha=4)
+        grouped_adapter = SharedGroupedLinearLoRA(2, 8, 16, 2, alpha=4)
+        with torch.no_grad():
+            dense_adapter.lora_b.copy_(
+                torch.randn(dense_adapter.lora_b.shape, generator=generator)
+            )
+            grouped_adapter.lora_b.copy_(
+                torch.randn(grouped_adapter.lora_b.shape, generator=generator)
+            )
+        self.qkv = LoRAWrappedLinear(_Wrapped(12, 8), dense_adapter)
+        self.experts = LoRAWrappedGroupedLinear(
+            _GroupedBase(2, 16, 8, generator), grouped_adapter
+        )
+
+
+def _export_dict(model, *, merge_lora):
+    return dict(
+        export_hf_weights(
+            model,
+            _IdentitySpec(),
+            _single_rank_ps(),
+            merge_lora=merge_lora,
+        )
+    )
+
+
+def test_wrapper_names_are_canonical_and_adapter_params_never_leak():
+    model = _TinyWrappedModel()
+    plain = _export_dict(model, merge_lora=False)
+
+    assert set(plain) == {
+        "qkv.linear.weight",
+        "experts.weight0",
+        "experts.weight1",
+    }
+    assert not any(_is_adapter_param(name) for name in plain)
+    assert not any(".base." in name for name in plain)
+
+
+def test_merge_lora_adds_dense_and_shared_expert_deltas():
+    model = _TinyWrappedModel()
+    plain = _export_dict(model, merge_lora=False)
+    merged = _export_dict(model, merge_lora=True)
+
+    dense_delta = model.qkv.adapter.materialized_delta_weight()
+    assert torch.equal(merged["qkv.linear.weight"], plain["qkv.linear.weight"] + dense_delta)
+
+    shared_delta = model.experts.adapter.materialized_delta_weight()
+    for expert_idx in range(2):
+        name = f"experts.weight{expert_idx}"
+        assert torch.equal(merged[name], plain[name] + shared_delta)
+
+
+def test_export_surface_map_covers_wrapper_base_weights():
+    model = _TinyWrappedModel()
+    canonical_names, delta_resolvers = _lora_export_surfaces(model)
+
+    assert canonical_names == {
+        "qkv.base.linear.weight": "qkv.linear.weight",
+        "experts.base.weight0": "experts.weight0",
+        "experts.base.weight1": "experts.weight1",
+    }
+    assert set(delta_resolvers) == {
+        "qkv.linear.weight",
+        "experts.weight0",
+        "experts.weight1",
+    }
+
+
+def test_static_delta_rejects_dropout():
+    adapter = SharedGroupedLinearLoRA(2, 8, 16, 2, alpha=4, dropout=0.1)
+    with pytest.raises(ValueError, match="dropout=0"):
+        adapter.materialized_delta_weight()

@@ -786,6 +786,68 @@ def _merge_dense_shards(
     return torch.cat(shards, dim=split_dim)
 
 
+_ADAPTER_NAME_MARKERS = (".adapter.", ".lora_", ".delta_mem")
+
+
+def _is_adapter_param(name: str) -> bool:
+    lowered = f".{name.lower()}"
+    return any(marker in lowered for marker in _ADAPTER_NAME_MARKERS)
+
+
+def _lora_export_surfaces(
+    base_chunk: nn.Module,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Return wrapper-transparent parameter names and optional LoRA deltas.
+
+    This primitive knows only the generic LoRA wrapper contract. Model-specific
+    native/HF naming remains owned by ``HFWeights``.
+    """
+    from megatron.lite.primitive.modules.lora_apply import (
+        LoRAWrappedGroupedLinear,
+        LoRAWrappedLinear,
+    )
+
+    canonical_names: dict[str, str] = {}
+    delta_resolvers: dict[str, Any] = {}
+    for module_name, module in base_chunk.named_modules():
+        if not isinstance(module, (LoRAWrappedLinear, LoRAWrappedGroupedLinear)):
+            continue
+        prefix = f"{module_name}." if module_name else ""
+        base_prefix = f"{prefix}base."
+        base_params = list(module.base.named_parameters())
+        for relative_name, _ in base_params:
+            canonical_names[f"{base_prefix}{relative_name}"] = f"{prefix}{relative_name}"
+
+        if isinstance(module, LoRAWrappedLinear):
+            owner = getattr(module.base, "linear", module.base)
+            weight = getattr(owner, "weight", None)
+            for relative_name, param in base_params:
+                if param is weight:
+                    delta_resolvers[f"{prefix}{relative_name}"] = (
+                        module.adapter.materialized_delta_weight
+                    )
+                    break
+            continue
+
+        for relative_name, _ in base_params:
+            match = re.fullmatch(r"weight(\d+)", relative_name)
+            if match is None:
+                continue
+            expert_idx = int(match.group(1))
+            delta_resolvers[f"{prefix}{relative_name}"] = (
+                lambda adapter=module.adapter, idx=expert_idx: (
+                    adapter.materialized_delta_weight(idx)
+                )
+            )
+    return canonical_names, delta_resolvers
+
+
+def _merged_param_tensor(tensor: torch.Tensor, resolver) -> torch.Tensor:
+    base = _materialize_dtensor(tensor)
+    delta = _materialize_dtensor(resolver())
+    return base + delta.to(dtype=base.dtype, device=base.device)
+
+
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,
@@ -797,13 +859,16 @@ def export_hf_weights(
     export_dtype: str | torch.dtype | None = None,
     cpu: bool = False,
     buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+    merge_lora: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Export model weights as HF-format (name, tensor) pairs.
 
     Gathers across TP/ETP/EP/PP so the output is the full unsharded HF state on
     every participating rank. RL weight sync needs every colocated rollout rank
     to receive weights; save paths can pass ``rank0_only=True`` to avoid
-    materializing duplicate writers.
+    materializing duplicate writers. LoRA wrappers are transparent to native
+    checkpoint names: adapter parameters are omitted, and ``merge_lora=True``
+    emits each adapted base weight with its current delta merged.
     """
     if isinstance(model, nn.ModuleList):
         chunks: list[nn.Module] = list(model)
@@ -820,6 +885,7 @@ def export_hf_weights(
         is_export_buffer = getattr(spec, "is_export_buffer", None)
         for chunk in chunks:
             base_chunk = unwrap_model(chunk)
+            canonical_names, delta_resolvers = _lora_export_surfaces(base_chunk)
             layer_map = (
                 {
                     i: base_chunk.layer_indices[i]
@@ -829,7 +895,14 @@ def export_hf_weights(
                 else {}
             )
             for name, param in base_chunk.named_parameters():
-                yield to_global_layer_name(name, layer_map), param.data.detach()
+                if _is_adapter_param(name):
+                    continue
+                canonical_name = canonical_names.get(name, name)
+                tensor = param.data.detach()
+                resolver = delta_resolvers.get(canonical_name)
+                if merge_lora and resolver is not None:
+                    tensor = _merged_param_tensor(tensor, resolver)
+                yield to_global_layer_name(canonical_name, layer_map), tensor
             if callable(is_export_buffer):
                 for name, buffer in base_chunk.named_buffers():
                     global_name = to_global_layer_name(name, layer_map)

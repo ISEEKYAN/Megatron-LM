@@ -18,7 +18,6 @@ from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.gqa import GQAttention
-from megatron.lite.primitive.modules.lora import LoraConfig
 from megatron.lite.primitive.modules.router import TopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
@@ -50,7 +49,6 @@ class MoELayer(nn.Module):
         router_bias_rate: float = 0.0,
         fp8: bool = False,
         moe_act_recompute: bool = False,
-        lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
         # Match Qwen3-MoE's `load_balancing_type="none"` setting: no aux loss.
@@ -58,7 +56,7 @@ class MoELayer(nn.Module):
             config, ps, router_bias_rate=router_bias_rate, compute_aux_loss=False
         )
         self.experts = Experts(
-            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute, lora_config=lora_config
+            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute
         )
         self.dispatcher = TokenDispatcher(
             config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
@@ -125,7 +123,6 @@ class TransformerLayer(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         use_thd: bool = False,
-        lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -145,7 +142,6 @@ class TransformerLayer(nn.Module):
             rope_theta=config.rope_theta,
             use_thd=use_thd,
             qkv_layout="mcore",
-            lora_config=lora_config,
         )
         self.mlp_norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.moe = MoELayer(
@@ -155,7 +151,6 @@ class TransformerLayer(nn.Module):
             router_bias_rate=router_bias_rate,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
-            lora_config=lora_config,
         )
 
     def forward(
@@ -212,7 +207,6 @@ class MultiTokenPredictionLayer(nn.Module):
         moe_act_recompute: bool,
         use_thd: bool,
         detach_encoder: bool,
-        lora_config: LoraConfig | dict | None,
     ):
         super().__init__()
         self.ps = ps
@@ -232,7 +226,6 @@ class MultiTokenPredictionLayer(nn.Module):
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
             use_thd=use_thd,
-            lora_config=lora_config,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -286,7 +279,6 @@ class MultiTokenPredictionBlock(nn.Module):
         use_thd: bool,
         detach_encoder: bool,
         repeated_layer: bool,
-        lora_config: LoraConfig | dict | None,
     ):
         super().__init__()
         self.num_layers = config.num_nextn_predict_layers
@@ -305,7 +297,6 @@ class MultiTokenPredictionBlock(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     detach_encoder=detach_encoder,
-                    lora_config=lora_config,
                 )
                 for idx in range(layers_to_build)
             ]
@@ -360,7 +351,6 @@ class Qwen3MoEModel(nn.Module):
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
-        lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
         self.config = config
@@ -394,7 +384,6 @@ class Qwen3MoEModel(nn.Module):
                     fp8=fp8,
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
-                    lora_config=lora_config,
                 )
                 for idx in self.layer_indices
             ]
@@ -424,7 +413,6 @@ class Qwen3MoEModel(nn.Module):
                 use_thd=use_thd,
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
-                lora_config=lora_config,
             )
 
         self.sp_params: list[nn.Parameter] = []
