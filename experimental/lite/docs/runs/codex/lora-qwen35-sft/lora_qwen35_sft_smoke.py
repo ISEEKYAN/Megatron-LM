@@ -125,7 +125,7 @@ def main() -> None:
     assert all("adapter" in name.lower() or "lora" in name.lower() for name in trainable_names)
 
     handle = ModelHandle(
-        model=chunks,
+        model=chunks[0],
         optimizer=bundle.optimizer,
         parallel_state=bundle.parallel_state,
         config=SimpleNamespace(parallel=parallel),
