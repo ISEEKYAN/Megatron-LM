@@ -146,6 +146,152 @@ def test_qwen_protocol_loads_canonical_weights_before_lora_attach(monkeypatch):
     assert torch.equal(lora_t0, base_t0)
 
 
+def test_tiny_qwen_hf_load_has_full_coverage_before_lora_attach(tmp_path, capsys):
+    from safetensors.torch import save_file
+
+    from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+    from megatron.lite.model.qwen3_moe.lite import protocol
+    from megatron.lite.primitive.modules.experts import Experts
+    from megatron.lite.primitive.modules.gqa import GQAttention
+
+    class _LinearSurface(nn.Module):
+        def __init__(self, in_features, out_features, *, layer_norm=False):
+            super().__init__()
+            self.linear = nn.Module()
+            self.linear.weight = nn.Parameter(torch.empty(out_features, in_features))
+            if layer_norm:
+                self.linear.layer_norm_weight = nn.Parameter(torch.empty(in_features))
+                self.linear.eps = 1e-6
+                self.linear.zero_centered_gamma = False
+            self.use_sp = False
+
+        def forward(self, x):
+            return torch.nn.functional.linear(x, self.linear.weight)
+
+    class _GroupedSurface(nn.Module):
+        def __init__(self, num_experts, in_features, out_features):
+            super().__init__()
+            for expert_idx in range(num_experts):
+                self.register_parameter(
+                    f"weight{expert_idx}",
+                    nn.Parameter(torch.empty(out_features, in_features)),
+                )
+
+    class _TinyQwenLoadProxy(nn.Module):
+        def __init__(self, cfg, ps):
+            super().__init__()
+            padded_vocab_size = 128
+            self.embed = nn.Module()
+            self.embed.embedding = nn.Embedding(padded_vocab_size, cfg.hidden_size)
+            self.norm = nn.Module()
+            self.norm.weight = nn.Parameter(torch.empty(cfg.hidden_size))
+            self.head = nn.Module()
+            self.head.col = nn.Module()
+            self.head.col.linear = nn.Linear(
+                cfg.hidden_size, padded_vocab_size, bias=False
+            )
+
+            layer = nn.Module()
+            layer.attn = GQAttention.__new__(GQAttention)
+            nn.Module.__init__(layer.attn)
+            layer.attn.ps = ps
+            layer.attn.qkv = _LinearSurface(
+                cfg.hidden_size, cfg.qkv_size, layer_norm=True
+            )
+            layer.attn.proj = _LinearSurface(cfg.hidden_size, cfg.hidden_size)
+            layer.attn.q_norm = nn.Module()
+            layer.attn.q_norm.weight = nn.Parameter(torch.empty(cfg.head_dim))
+            layer.attn.k_norm = nn.Module()
+            layer.attn.k_norm.weight = nn.Parameter(torch.empty(cfg.head_dim))
+
+            layer.mlp_norm = nn.Module()
+            layer.mlp_norm.weight = nn.Parameter(torch.empty(cfg.hidden_size))
+            layer.moe = nn.Module()
+            layer.moe.router = nn.Module()
+            layer.moe.router.gate = nn.Linear(
+                cfg.hidden_size, cfg.num_experts, bias=False
+            )
+            layer.moe.experts = Experts.__new__(Experts)
+            nn.Module.__init__(layer.moe.experts)
+            layer.moe.experts.num_local_experts = cfg.num_experts
+            layer.moe.experts.fc1 = _GroupedSurface(
+                cfg.num_experts, cfg.hidden_size, 2 * cfg.moe_intermediate_size
+            )
+            layer.moe.experts.fc2 = _GroupedSurface(
+                cfg.num_experts, cfg.moe_intermediate_size, cfg.hidden_size
+            )
+            self.layers = nn.ModuleList([layer])
+
+    cfg = Qwen3MoEConfig(
+        num_hidden_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=16,
+        num_experts=2,
+        num_experts_per_tok=1,
+        moe_intermediate_size=4,
+        layer_types=["full_attention"],
+    )
+    ps = SimpleNamespace(
+        tp_size=1,
+        tp_rank=0,
+        tp_group=None,
+        etp_size=1,
+        etp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+    )
+    chunk = _TinyQwenLoadProxy(cfg, ps).to(torch.bfloat16)
+    hf_state = {
+        "model.embed_tokens.weight": torch.full((16, 8), 0.01),
+        "model.norm.weight": torch.full((8,), 0.02),
+        "lm_head.weight": torch.full((16, 8), 0.03),
+        "model.layers.0.input_layernorm.weight": torch.full((8,), 0.04),
+        "model.layers.0.self_attn.q_proj.weight": torch.full((8, 8), 0.05),
+        "model.layers.0.self_attn.k_proj.weight": torch.full((4, 8), 0.06),
+        "model.layers.0.self_attn.v_proj.weight": torch.full((4, 8), 0.07),
+        "model.layers.0.self_attn.q_norm.weight": torch.full((4,), 0.08),
+        "model.layers.0.self_attn.k_norm.weight": torch.full((4,), 0.09),
+        "model.layers.0.self_attn.o_proj.weight": torch.full((8, 8), 0.10),
+        "model.layers.0.post_attention_layernorm.weight": torch.full((8,), 0.11),
+        "model.layers.0.mlp.gate.weight": torch.full((2, 8), 0.12),
+    }
+    for expert_idx in range(cfg.num_experts):
+        prefix = f"model.layers.0.mlp.experts.{expert_idx}"
+        hf_state[f"{prefix}.gate_proj.weight"] = torch.full((4, 8), 0.13)
+        hf_state[f"{prefix}.up_proj.weight"] = torch.full((4, 8), 0.14)
+        hf_state[f"{prefix}.down_proj.weight"] = torch.full((8, 4), 0.15)
+    save_file(hf_state, tmp_path / "model.safetensors")
+
+    protocol.load_hf_weights(chunk, str(tmp_path), cfg, ps)
+    assert "WARNING:" not in capsys.readouterr().out
+
+    x = torch.randn(3, cfg.hidden_size, dtype=torch.bfloat16)
+    with torch.no_grad():
+        qkv_t0 = chunk.layers[0].attn.qkv(x).clone()
+        proj_t0 = chunk.layers[0].attn.proj(x).clone()
+    stats = apply_lora_to_chunks(
+        [chunk],
+        LoraSpec(
+            enabled=True,
+            rank=2,
+            target_modules=(
+                "linear_qkv",
+                "linear_proj",
+                "linear_fc1",
+                "linear_fc2",
+            ),
+        ),
+        ps=ps,
+    )
+    assert stats["attached_modules"] == 4
+    with torch.no_grad():
+        assert torch.equal(chunk.layers[0].attn.qkv(x), qkv_t0)
+        assert torch.equal(chunk.layers[0].attn.proj(x), proj_t0)
+
+
 def test_qwen3_30b_lora_attachment_and_parameter_contract():
     from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 
