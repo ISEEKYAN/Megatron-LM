@@ -39,21 +39,20 @@ def _validate_blockwise_features(
             )
 
 
-def _validate_bf16_weight_precision(
+def _validate_blockwise_precision(
     coverage: PrecisionCoverage | None,
     site: SemanticSite | None,
     *,
     in_features: int,
     out_features: int,
 ) -> PrecisionImplementation | None:
-    """Validate one TP linear site against the active model-init profile.
+    """Validate one TP linear site against the active blockwise profile.
 
     Returns the bound implementation (or ``None`` when precision is unmanaged).
-    The only resolvable blockwise profile stores BF16 compute weights, so this
-    path always sees ``WeightStorage.BF16``; the reserved FP8-weight profile
-    fails loud earlier at ``resolve_precision`` and never reaches construction.
-    The capability claim itself is registered by the caller after the TE module
-    is constructed, so coverage can bind to the real TE primitive instance.
+    Both closed profiles use the same typed site coverage; their compute-weight
+    storage differs only at Transformer Engine parameter construction. The
+    capability claim itself is registered by the caller after the TE module is
+    constructed, so coverage can bind to the real TE primitive instance.
     """
 
     if coverage is None:
@@ -279,7 +278,7 @@ class ColumnParallelLinear(nn.Module):
             if normalization is not None
             else PrimitiveCapability.TE_LINEAR
         )
-        self._precision_implementation = _validate_bf16_weight_precision(
+        self._precision_implementation = _validate_blockwise_precision(
             precision_coverage,
             precision_site,
             in_features=in_features,
@@ -344,7 +343,7 @@ class RowParallelLinear(nn.Module):
         self.use_sp = ps.tp_size > 1
         self.local_in = ensure_divisible(in_features, ps.tp_size)
         self._precision_site = precision_site
-        self._precision_implementation = _validate_bf16_weight_precision(
+        self._precision_implementation = _validate_blockwise_precision(
             precision_coverage,
             precision_site,
             in_features=self.local_in,
