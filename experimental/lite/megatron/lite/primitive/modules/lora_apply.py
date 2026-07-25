@@ -47,7 +47,12 @@ class LoRAWrappedLinear(nn.Module):
         try:
             return super().__getattr__(name)
         except AttributeError:
-            return getattr(self.base, name)
+            base = super().__getattr__("base")
+            if name in {"weight", "parametrizations"}:
+                owner = _linear_weight_owner(base)
+                if owner is not None and hasattr(owner, name):
+                    return getattr(owner, name)
+            return getattr(base, name)
 
 
 class LoRAWrappedGroupedLinear(nn.Module):
@@ -67,6 +72,34 @@ class LoRAWrappedGroupedLinear(nn.Module):
             return super().__getattr__(name)
         except AttributeError:
             return getattr(self.base, name)
+
+
+def _linear_weight_owner(module: nn.Module) -> nn.Module | None:
+    inner = getattr(module, "linear", None)
+    if isinstance(inner, nn.Module) and isinstance(getattr(inner, "weight", None), nn.Parameter):
+        return inner
+    if isinstance(getattr(module, "weight", None), nn.Parameter):
+        return module
+    return None
+
+
+def _local_linear_features(module: nn.Module) -> tuple[int, int]:
+    """Return the local input/output dimensions from the real weight surface."""
+
+    owner = _linear_weight_owner(module)
+    candidates = (
+        [owner.weight]
+        if owner is not None
+        else [param for param in module.parameters(recurse=False) if param.ndim >= 2]
+    )
+    if not candidates:
+        candidates = [param for param in module.parameters() if param.ndim >= 2]
+    shapes = {(int(param.shape[-1]), int(param.shape[-2])) for param in candidates}
+    if len(shapes) != 1:
+        raise ValueError(
+            f"Cannot infer one local linear shape from {type(module).__name__}: {sorted(shapes)}"
+        )
+    return next(iter(shapes))
 
 
 def _qkv_adapter_input_fn(base_qkv: nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -93,9 +126,10 @@ def _attach_gqa_qkv(attn, spec: LoraSpec) -> bool:
     if isinstance(attn.qkv, LoRAWrappedLinear):
         return False
     ps = attn.ps
+    local_in, local_out = _local_linear_features(attn.qkv)
     adapter = LinearLoRA(
-        attn.qkv.local_in,
-        attn.qkv.local_out,
+        local_in,
+        local_out,
         spec.rank,
         alpha=spec.alpha,
         dropout=spec.dropout,
@@ -119,9 +153,10 @@ def _attach_gqa_proj(attn, spec: LoraSpec) -> bool:
     if isinstance(attn.proj, LoRAWrappedLinear):
         return False
     ps = attn.ps
+    local_in, local_out = _local_linear_features(attn.proj)
     adapter = LinearLoRA(
-        attn.proj.local_in,
-        attn.proj.local_out,
+        local_in,
+        local_out,
         spec.rank,
         alpha=spec.alpha,
         dropout=spec.dropout,
@@ -247,10 +282,8 @@ def apply_lora_to_chunks(
                 if _attach_gqa_proj(module, spec):
                     stats["attached_modules"] += 1
             elif isinstance(module, Experts):
-                config_hidden = module.fc1.in_features
-                fc1_out = module.fc1.out_features
-                fc2_in = module.fc2.in_features
-                fc2_out = module.fc2.out_features
+                config_hidden, fc1_out = _local_linear_features(module.fc1)
+                fc2_in, fc2_out = _local_linear_features(module.fc2)
                 if _attach_expert_fc(
                     module, "fc1", "linear_fc1", spec, in_features=config_hidden, out_features=fc1_out
                 ):

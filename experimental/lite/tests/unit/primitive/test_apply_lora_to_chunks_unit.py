@@ -136,31 +136,54 @@ def test_lora_wrapped_linear_forwards_base_attrs():
 
 
 def test_apply_lora_tp_layout_on_gqa_adapters():
-    from types import SimpleNamespace
-
+    from megatron.lite.primitive.parallel.linear import ColumnParallelLinear, RowParallelLinear
     from megatron.lite.primitive.modules.lora_apply import _attach_gqa_proj, _attach_gqa_qkv
 
-    class _MockLinearSurface:
-        def __init__(self, local_in: int, local_out: int):
-            self.local_in = local_in
-            self.local_out = local_out
-            self.use_sp = False
-            self.linear = SimpleNamespace()
+    def _column_surface():
+        surface = ColumnParallelLinear.__new__(ColumnParallelLinear)
+        nn.Module.__init__(surface)
+        surface.tp_size = 2
+        surface.tp_rank = 0
+        surface.tp_group = object()
+        surface.local_out = 12
+        surface.use_sp = True
+        surface.linear = nn.Linear(16, 12, bias=False)
+        surface.gather_output = False
+        return surface
+
+    def _row_surface():
+        surface = RowParallelLinear.__new__(RowParallelLinear)
+        nn.Module.__init__(surface)
+        surface.tp_size = 2
+        surface.tp_rank = 0
+        surface.tp_group = object()
+        surface.local_in = 12
+        surface.use_sp = True
+        surface.linear = nn.Linear(12, 16, bias=False)
+        return surface
 
     class _MockAttn:
         def __init__(self):
+            from types import SimpleNamespace
+
             self.ps = SimpleNamespace(tp_group=object(), tp_size=2, tp_rank=0)
-            self.qkv = _MockLinearSurface(16, 24)
-            self.proj = _MockLinearSurface(24, 16)
+            self.qkv = _column_surface()
+            self.proj = _row_surface()
 
     attn = _MockAttn()
     spec = LoraSpec(enabled=True, rank=4, target_modules=("linear_qkv", "linear_proj"))
     assert _attach_gqa_qkv(attn, spec)
     assert _attach_gqa_proj(attn, spec)
+    assert attn.qkv.weight is attn.qkv.base.linear.weight
+    assert attn.proj.weight is attn.proj.base.linear.weight
     qkv_adapter = attn.qkv.adapter
     proj_adapter = attn.proj.adapter
+    assert qkv_adapter.lora_a.shape == (2, 16)
+    assert qkv_adapter.lora_b.shape == (12, 4)
     assert qkv_adapter.rank_partitioned_a is True
     assert qkv_adapter.lora_a.tensor_model_parallel is True
     assert qkv_adapter.lora_b.tensor_model_parallel is True
+    assert proj_adapter.lora_a.shape == (4, 12)
+    assert proj_adapter.lora_b.shape == (8, 4)
     assert proj_adapter.input_parallel_reduce is True
     assert proj_adapter.output_partitioned_b is True
