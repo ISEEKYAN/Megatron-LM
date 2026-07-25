@@ -397,6 +397,16 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
+        lora_cfg = (self._mlite_config.impl_cfg or {}).get("lora") if self._mlite_config else None
+        # Duck-typed: hydra hands us OmegaConf DictConfig for nested sections, which
+        # fails isinstance(dict). ``enabled`` is the authoritative opt-in; rank
+        # alone must not mutate rollout export behavior.
+        lora_enabled = bool(lora_cfg.get("enabled", False)) if hasattr(lora_cfg, "get") else False
+        if lora_enabled:
+            # Rollout weight sync must see the CURRENT policy (base + adapter);
+            # with OLoRA's PiSSA residual, adapter-only sync on the original
+            # base would be numerically wrong, so merged export is mandatory.
+            export_kwargs["merge_lora"] = True
         weights = self.runtime.export_weights(self.handle, **export_kwargs)
         if self.engine_config.qat.get("enable", False):
             from verl.utils.modelopt import export_qat_weights

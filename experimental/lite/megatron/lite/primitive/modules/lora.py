@@ -16,6 +16,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 _DEFAULT_TARGET_MODULES = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
+_DEFAULT_IGNORE_PATTERNS = (
+    "lm_head",
+    "output_layer",
+    "router",
+    "gate",
+    "embedding",
+    "word_embeddings",
+)
 _TARGET_ALIASES = {
     "qkv": "linear_qkv",
     "proj": "linear_proj",
@@ -24,20 +32,26 @@ _TARGET_ALIASES = {
 }
 
 
+def lora_scaling(rank: int, alpha: int | None, *, use_rslora: bool = False) -> float:
+    effective_alpha = float(rank if alpha is None else alpha)
+    denom = float(rank) ** 0.5 if use_rslora else float(rank)
+    return effective_alpha / denom
+
+
 @dataclass(frozen=True)
-class LoraConfig:
+class LoraSpec:
+    enabled: bool = False
     rank: int = 0
     alpha: int | None = None
     dropout: float = 0.0
     target_modules: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_TARGET_MODULES)
-
-    @property
-    def enabled(self) -> bool:
-        return self.rank > 0
+    use_rslora: bool = False
+    init: str = "default"
+    ignore_patterns: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_IGNORE_PATTERNS)
 
     @property
     def scale(self) -> float:
-        return float(self.rank if self.alpha is None else self.alpha) / float(self.rank)
+        return lora_scaling(self.rank, self.alpha, use_rslora=self.use_rslora)
 
     def targets(self) -> set[str]:
         out = set()
@@ -50,16 +64,15 @@ class LoraConfig:
         return canonical in self.targets()
 
 
-def normalize_lora_config(config: LoraConfig | dict[str, Any] | None) -> LoraConfig:
+def normalize_lora_spec(config: LoraSpec | dict[str, Any] | None) -> LoraSpec:
     if config is None:
-        return LoraConfig()
-    if isinstance(config, LoraConfig):
+        return LoraSpec()
+    if isinstance(config, LoraSpec):
         return config
     if not isinstance(config, dict):
-        raise TypeError(f"LoRA config must be LoraConfig, dict, or None, got {type(config)!r}.")
+        raise TypeError(f"LoRA spec must be LoraSpec, dict, or None, got {type(config)!r}.")
     values = dict(config)
-    enabled = values.pop("enabled", None)
-    if enabled is False:
+    if values.get("enabled") is False:
         values["rank"] = 0
     if "targets" in values and "target_modules" not in values:
         values["target_modules"] = values.pop("targets")
@@ -67,7 +80,13 @@ def normalize_lora_config(config: LoraConfig | dict[str, Any] | None) -> LoraCon
         values.pop("targets", None)
     if "target_modules" in values and not isinstance(values["target_modules"], tuple):
         values["target_modules"] = tuple(values["target_modules"])
-    return LoraConfig(**values)
+    if "ignore_patterns" in values and not isinstance(values["ignore_patterns"], tuple):
+        values["ignore_patterns"] = tuple(values["ignore_patterns"])
+    return LoraSpec(**values)
+
+
+LoraConfig = LoraSpec
+normalize_lora_config = normalize_lora_spec
 
 
 def freeze_non_lora_params(model: nn.Module) -> dict[str, int]:
@@ -353,6 +372,7 @@ class LinearLoRA(nn.Module):
         *,
         alpha: int | None = None,
         dropout: float = 0.0,
+        use_rslora: bool = False,
         sequence_parallel_input: bool = False,
         row_parallel_output: bool = False,
         sequence_parallel_scatter_output: bool = False,
@@ -388,7 +408,8 @@ class LinearLoRA(nn.Module):
         else:
             self.rank_partition_size = 1
             self.local_rank = self.rank
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
+        self.use_rslora = bool(use_rslora)
+        self.scale = lora_scaling(rank, alpha, use_rslora=use_rslora)
         self.dropout_p = float(dropout)
         self.sequence_parallel_input = bool(sequence_parallel_input)
         self.row_parallel_output = bool(row_parallel_output)
@@ -459,53 +480,33 @@ class LinearLoRA(nn.Module):
             out = _scatter_sequence_parallel(out, self.tp_group, self.tp_rank)
         return out
 
+    def materialized_delta_weight(self) -> torch.Tensor:
+        if self.dropout_p != 0.0:
+            raise ValueError("materialized_delta_weight requires dropout=0.")
+        lora_a = self.lora_a
+        lora_b = self.lora_b
+        if hasattr(lora_a, "full_tensor"):
+            lora_a = lora_a.full_tensor()
+        if hasattr(lora_b, "full_tensor"):
+            lora_b = lora_b.full_tensor()
+        if self.rank_partitioned_a:
+            lora_a = _all_gather_last_dim_forward(
+                lora_a.t(), self.tp_group, self.rank_partition_size
+            ).t()
+        if self.output_partitioned_b:
+            lora_b = _all_gather_last_dim_forward(
+                lora_b.t(), self.tp_group, self.output_partition_size
+            ).t()
+        return (lora_b @ lora_a) * self.scale
 
-class GroupedLinearLoRA(nn.Module):
-    """Per-local-expert LoRA delta for `te.GroupedLinear` expert surfaces."""
-
-    def __init__(
-        self,
-        num_local_experts: int,
-        in_features: int,
-        out_features: int,
-        rank: int,
-        *,
-        alpha: int | None = None,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        if rank <= 0:
-            raise ValueError("LoRA rank must be positive for GroupedLinearLoRA.")
-        self.num_local_experts = int(num_local_experts)
-        self.rank = int(rank)
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
-        self.dropout_p = float(dropout)
-        self.lora_a = nn.Parameter(torch.empty(num_local_experts, rank, in_features))
-        self.lora_b = nn.Parameter(torch.empty(num_local_experts, out_features, rank))
-        nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
-        nn.init.zeros_(self.lora_b)
-
-    def forward(self, x: torch.Tensor, splits: list[int]) -> torch.Tensor:
-        if len(splits) != self.num_local_experts:
-            raise ValueError(
-                f"GroupedLinearLoRA expected {self.num_local_experts} splits, got {len(splits)}."
-            )
-        outputs = []
-        offset = 0
-        for expert_idx, size in enumerate(splits):
-            x_i = x[offset : offset + size]
-            if size == 0:
-                outputs.append(x_i.new_empty((0, self.lora_b.shape[1])))
-            else:
-                dropped = (
-                    F.dropout(x_i, p=self.dropout_p, training=self.training)
-                    if self.dropout_p
-                    else x_i
+    def olora_tail_init_(self, base_weight: torch.Tensor) -> None:
+        with torch.no_grad():
+            delta = self.materialized_delta_weight()
+            if base_weight.shape != delta.shape:
+                raise ValueError(
+                    f"OLoRA-tail base shape {base_weight.shape} != delta {delta.shape}."
                 )
-                h_i = dropped.matmul(self.lora_a[expert_idx].t())
-                outputs.append(h_i.matmul(self.lora_b[expert_idx].t()) * self.scale)
-            offset += size
-        return torch.cat(outputs, dim=0) if outputs else x.new_empty((0, self.lora_b.shape[1]))
+            base_weight.sub_(delta.to(base_weight.dtype))
 
 
 class SharedGroupedLinearLoRA(nn.Module):
@@ -520,13 +521,15 @@ class SharedGroupedLinearLoRA(nn.Module):
         *,
         alpha: int | None = None,
         dropout: float = 0.0,
+        use_rslora: bool = False,
     ):
         super().__init__()
         if rank <= 0:
             raise ValueError("LoRA rank must be positive for SharedGroupedLinearLoRA.")
         self.num_local_experts = int(num_local_experts)
         self.rank = int(rank)
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
+        self.use_rslora = bool(use_rslora)
+        self.scale = lora_scaling(rank, alpha, use_rslora=use_rslora)
         self.dropout_p = float(dropout)
         self.shared_across_experts = True
         self.lora_a = nn.Parameter(torch.empty(rank, in_features))
@@ -544,13 +547,58 @@ class SharedGroupedLinearLoRA(nn.Module):
         dropped = F.dropout(x, p=self.dropout_p, training=self.training) if self.dropout_p else x
         return dropped.matmul(self.lora_a.t()).matmul(self.lora_b.t()) * self.scale
 
+    def materialized_delta_weight(self, expert_idx: int = 0) -> torch.Tensor:
+        if self.dropout_p != 0.0:
+            raise ValueError("materialized_delta_weight requires dropout=0.")
+        del expert_idx
+        lora_a = self.lora_a
+        lora_b = self.lora_b
+        if hasattr(lora_a, "full_tensor"):
+            lora_a = lora_a.full_tensor()
+        if hasattr(lora_b, "full_tensor"):
+            lora_b = lora_b.full_tensor()
+        return (lora_b @ lora_a) * self.scale
+
+
+def _weight_owner(module: nn.Module) -> nn.Module | None:
+    inner = getattr(module, "linear", None)
+    if isinstance(inner, nn.Module) and isinstance(getattr(inner, "weight", None), nn.Parameter):
+        if inner.weight.dim() == 2:
+            return inner
+    if isinstance(getattr(module, "weight", None), nn.Parameter) and module.weight.dim() == 2:
+        return module
+    return None
+
+
+def apply_olora_tail_init(model: nn.Module) -> dict[str, int]:
+    from megatron.lite.primitive.modules.lora_apply import (
+        LoRAWrappedGroupedLinear,
+        LoRAWrappedLinear,
+    )
+
+    stats = {"initialized": 0, "skipped": 0}
+    for module in model.modules():
+        if isinstance(module, LoRAWrappedLinear):
+            owner = _weight_owner(module.base)
+            if owner is None:
+                stats["skipped"] += 1
+                continue
+            module.adapter.olora_tail_init_(owner.weight)
+            stats["initialized"] += 1
+        elif isinstance(module, LoRAWrappedGroupedLinear):
+            stats["skipped"] += 1
+    return stats
+
 
 __all__ = [
-    "GroupedLinearLoRA",
     "LinearLoRA",
     "LoraConfig",
+    "LoraSpec",
     "SharedGroupedLinearLoRA",
+    "apply_olora_tail_init",
     "freeze_non_lora_params",
+    "lora_scaling",
     "normalize_lora_config",
+    "normalize_lora_spec",
     "trainable_param_stats",
 ]

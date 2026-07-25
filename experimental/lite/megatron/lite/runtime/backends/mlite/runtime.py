@@ -238,6 +238,10 @@ class MegatronLiteRuntime(RuntimeBase):
                         raise TypeError("post_model_load_hook extras update must be a dict.")
                     bundle.extras.update(extra_updates)
 
+        olora_hook = bundle.extras.get("olora_hook")
+        if callable(olora_hook) and loaded_hf_weights:
+            olora_hook()
+
         if loaded_hf_weights and bundle.optimizer is not None:
             reload_model_params = getattr(bundle.optimizer, "reload_model_params", None)
             if callable(reload_model_params):
