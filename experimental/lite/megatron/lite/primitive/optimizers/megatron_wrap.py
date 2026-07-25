@@ -10,7 +10,26 @@ from typing import Any
 import torch  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
-from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
+from megatron.lite.primitive.protocols import (
+    ExpertClassifierFn,
+    default_expert_classifier,
+)
+
+
+def _optimizer_overrides(opt) -> dict[str, Any]:
+    overrides = getattr(opt, "override_optimizer_config", None)
+    if overrides is None:
+        return {}
+    if not isinstance(overrides, dict):
+        raise TypeError("override_optimizer_config must be a dict")
+    return overrides
+
+
+def _optimizer_value(opt, name: str, default=None):
+    overrides = _optimizer_overrides(opt)
+    if name in overrides:
+        return overrides[name]
+    return getattr(opt, name, default)
 
 
 def validate_dist_opt_config(engine_cfg) -> None:
@@ -19,8 +38,49 @@ def validate_dist_opt_config(engine_cfg) -> None:
     if p.vpp > 1 and p.pp == 1:
         raise ValueError("dist_opt requires pp>1 when vpp>1.")
 
+    opt = engine_cfg.optimizer
+    if str(opt.optimizer).lower() != "muon":
+        return
+    if bool(_optimizer_value(opt, "use_layer_wise_param_layout", False)):
+        raise ValueError(
+            "Muon padded LayerWise layout is deferred; use compact layout."
+        )
+    if bool(_optimizer_value(opt, "overlap_grad_reduce", False)):
+        raise ValueError(
+            "Muon compact lowering does not yet support overlap_grad_reduce."
+        )
+    if bool(_optimizer_value(opt, "overlap_param_gather", False)):
+        raise ValueError(
+            "Muon compact lowering does not yet support overlap_param_gather."
+        )
+    if bool(_optimizer_value(opt, "overlap_param_gather_with_optimizer_step", False)):
+        raise ValueError(
+            "Muon does not support parameter gather overlap with optimizer step."
+        )
+    if bool(_optimizer_value(opt, "fp8_param_gather", False)):
+        raise ValueError("Muon compact lowering does not support fp8_param_gather.")
+    if bool(_optimizer_value(opt, "fp4_param_gather", False)):
+        raise ValueError("Muon compact lowering does not support fp4_param_gather.")
+    if bool(_optimizer_value(opt, "use_precision_aware_optimizer", False)):
+        raise ValueError(
+            "Muon does not support the Adam-only precision-aware optimizer."
+        )
 
-validate_dist_opt_session = validate_dist_opt_config
+    offload_requested = any(
+        (
+            bool(_optimizer_value(opt, "optimizer_cpu_offload", False)),
+            float(_optimizer_value(opt, "optimizer_offload_fraction", 0.0) or 0.0)
+            > 0.0,
+            bool(_optimizer_value(opt, "use_torch_optimizer_for_cpu_offload", False)),
+            bool(_optimizer_value(opt, "overlap_cpu_optimizer_d2h_h2d", False)),
+            bool(_optimizer_value(opt, "offload_optimizer_states", False)),
+            float(_optimizer_value(opt, "offload_fraction", 0.0) or 0.0) > 0.0,
+        )
+    )
+    if offload_requested:
+        raise ValueError(
+            "Muon optimizer offload is deferred to the dedicated offload lowering."
+        )
 
 
 def _effective_etp(parallel) -> int:
@@ -61,7 +121,10 @@ def _ensure_dist_opt_mpu_parallel_state(engine_cfg) -> None:
 
 
 def build_dist_opt_optimizer_config(
-    opt, *, override_optimizer_config: dict[str, Any] | None = None
+    opt,
+    *,
+    override_optimizer_config: dict[str, Any] | None = None,
+    complete_muon_lowering: bool = False,
 ):
     """Build Megatron-Core OptimizerConfig from user's OptimizerConfig (duck-typed).
 
@@ -69,23 +132,71 @@ def build_dist_opt_optimizer_config(
 
     Works on either `runtime.contracts.config.OptimizerConfig` (real dataclass)
     or a `SimpleNamespace` with the same field names (legacy lite path).
+    Direct Muon callers are rejected because only ``build_dist_opt_stack`` owns
+    the required metadata, layout, and DDP lowering sequence.
     """
+    optimizer_name = str(opt.optimizer).lower()
+    use_muon = optimizer_name == "muon"
+    if use_muon and not complete_muon_lowering:
+        raise ValueError(
+            "Muon requires the complete metadata, layout, DDP, and optimizer lowering; "
+            "use build_dist_opt_stack instead of constructing its optimizer config directly."
+        )
+
     from megatron.core.optimizer.optimizer_config import (
         OptimizerConfig as CoreOptimizerConfig,  # pyright: ignore[reportMissingImports]
     )
 
-    offload = getattr(opt, "offload_fraction", None) or 0.0
+    legacy_offload = getattr(opt, "offload_fraction", None)
+    native_offload = getattr(opt, "optimizer_offload_fraction", None)
+    if legacy_offload is not None and native_offload not in (None, 0.0, legacy_offload):
+        raise ValueError(
+            "offload_fraction compatibility alias conflicts with optimizer_offload_fraction"
+        )
+    offload = native_offload if native_offload is not None else legacy_offload
+    offload = float(offload or 0.0)
     args: dict[str, Any] = {
-        "optimizer": opt.optimizer,
+        "optimizer": optimizer_name,
         "lr": opt.lr,
         "min_lr": getattr(opt, "min_lr", 0.0),
         "weight_decay": opt.weight_decay,
         "clip_grad": opt.clip_grad,
-        "use_distributed_optimizer": True,
+        # Megatron keeps this False for the LayerWise facade. DDP itself is still
+        # configured with use_distributed_optimizer=True so the Adam fallback gets
+        # its byte-sharded buffers.
+        "use_distributed_optimizer": not use_muon,
         "bf16": True,
         "params_dtype": torch.bfloat16,
     }
-    if offload > 0:
+    core_fields = {field.name for field in fields(CoreOptimizerConfig)}
+    native_fields = (
+        "muon_momentum",
+        "muon_split_qkv",
+        "muon_nesterov",
+        "muon_scale_mode",
+        "muon_fp32_matmul_prec",
+        "muon_coefficient_type",
+        "muon_num_ns_steps",
+        "muon_tp_mode",
+        "muon_extra_scale_factor",
+        "muon_scalar_optimizer",
+        "use_layer_wise_param_layout",
+        "overlap_param_gather",
+        "overlap_param_gather_with_optimizer_step",
+        "optimizer_cpu_offload",
+        "optimizer_offload_fraction",
+        "use_torch_optimizer_for_cpu_offload",
+        "overlap_cpu_optimizer_d2h_h2d",
+        "pin_cpu_grads",
+        "pin_cpu_params",
+        "offload_optimizer_states",
+    )
+    for name in native_fields:
+        if name in core_fields and hasattr(opt, name):
+            args[name] = getattr(opt, name)
+    if legacy_offload is not None and offload > 0:
+        # Preserve the legacy alias semantics. Canonical Megatron fields above are
+        # otherwise forwarded verbatim, including an explicitly disabled overlap.
         args["optimizer_offload_fraction"] = offload
         args["overlap_cpu_optimizer_d2h_h2d"] = True
         args["optimizer_cpu_offload"] = True
@@ -99,8 +210,47 @@ def build_dist_opt_optimizer_config(
         args["use_precision_aware_optimizer"] = opt.use_precision_aware_optimizer
     if getattr(opt, "decoupled_weight_decay", None) is not None:
         args["decoupled_weight_decay"] = opt.decoupled_weight_decay
+    if use_muon:
+        required_muon_fields = {
+            "muon_momentum",
+            "muon_split_qkv",
+            "muon_nesterov",
+            "muon_scale_mode",
+            "muon_fp32_matmul_prec",
+            "muon_coefficient_type",
+            "muon_num_ns_steps",
+            "muon_tp_mode",
+            "muon_extra_scale_factor",
+            "muon_scalar_optimizer",
+            "use_layer_wise_distributed_optimizer",
+            "use_layer_wise_param_layout",
+        }
+        missing = sorted(required_muon_fields - core_fields)
+        if missing:
+            raise RuntimeError(
+                "Muon requires the pinned Megatron d64ba4ccb optimizer contract; "
+                f"runtime is missing fields: {missing}"
+            )
+        args["use_layer_wise_distributed_optimizer"] = True
     if override_optimizer_config:
-        args.update(override_optimizer_config)
+        normalized_overrides = dict(override_optimizer_config)
+        if "optimizer" in normalized_overrides:
+            normalized_overrides["optimizer"] = str(
+                normalized_overrides["optimizer"]
+            ).lower()
+        lowering_owned = {
+            "optimizer",
+            "use_distributed_optimizer",
+            "use_layer_wise_distributed_optimizer",
+            "use_layer_wise_param_layout",
+        }
+        for name in lowering_owned.intersection(normalized_overrides):
+            value = normalized_overrides[name]
+            if name not in args or value != args[name]:
+                raise ValueError(
+                    f"override_optimizer_config cannot change lowering-owned field '{name}'"
+                )
+        args.update(normalized_overrides)
     return CoreOptimizerConfig(**args)
 
 
@@ -123,26 +273,54 @@ def build_dist_opt_stack(
             influences optimizer master-grad sharding, so callers that prewrap
             chunks own the DDP config compatibility.
     """
-    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-    from megatron.core.distributed.finalize_model_grads import finalize_model_grads
-    from megatron.core.optimizer import get_megatron_optimizer
-    from megatron.core.transformer.enums import ModelType
-
     validate_dist_opt_config(engine_cfg)
 
     p = engine_cfg.parallel
     opt = engine_cfg.optimizer
-
-    dist_opt_transformer_cfg = _build_transformer_config(model_cfg, engine_cfg)
-    dist_opt_transformer_cfg.finalize_model_grads_func = finalize_model_grads
     if is_expert is not None:
         is_expert_param = is_expert
     elif proto is not None and hasattr(proto, "EXPERT_CLASSIFIER"):
         is_expert_param = proto.EXPERT_CLASSIFIER
     else:
         is_expert_param = default_expert_classifier
-    use_mpu_groups = bool(getattr(engine_cfg, "deterministic", False))
-    if use_mpu_groups:
+
+    use_muon = str(opt.optimizer).lower() == "muon"
+    if use_muon and skip_ddp_wrap:
+        raise ValueError(
+            "Muon×dist_opt requires unwrapped model chunks for buffer routing."
+        )
+
+    # Validate and construct the complete Core optimizer contract before metadata,
+    # process-group, or DDP mutation. In particular, lowering-owned overrides must
+    # fail without leaving a partially wrapped model behind.
+    opt_config = build_dist_opt_optimizer_config(
+        opt,
+        override_optimizer_config=_optimizer_overrides(opt),
+        complete_muon_lowering=use_muon,
+    )
+
+    if use_muon:
+        from megatron.lite.primitive.optimizers.muon_routing import (
+            tag_muon_parameter_metadata,
+        )
+
+        tag_muon_parameter_metadata(model_chunks, is_expert_param=is_expert_param)
+
+    from megatron.core.distributed import (
+        DistributedDataParallel,
+        DistributedDataParallelConfig,
+    )
+    from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+    from megatron.core.optimizer import get_megatron_optimizer
+    from megatron.core.transformer.enums import ModelType
+
+    dist_opt_transformer_cfg = _build_transformer_config(model_cfg, engine_cfg)
+    dist_opt_transformer_cfg.finalize_model_grads_func = finalize_model_grads
+    use_mpu_groups = bool(getattr(engine_cfg, "deterministic", False)) and not use_muon
+    if use_muon or use_mpu_groups:
+        # Pinned LayerWise still consults the ambient MCore model-parallel group
+        # for grad statistics. Keep explicit pg_collection ownership below, but
+        # initialize this residual upstream dependency before the first step.
         _ensure_dist_opt_mpu_parallel_state(engine_cfg)
     pg_collection = None if use_mpu_groups else _build_pg_collection(ps, engine_cfg)
 
@@ -153,15 +331,53 @@ def build_dist_opt_stack(
         wrapped_chunks = list(model_chunks)
     else:
         ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=True, overlap_grad_reduce=False, grad_reduce_in_fp32=True
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=bool(
+                _optimizer_value(opt, "overlap_grad_reduce", False)
+            ),
+            overlap_param_gather=bool(
+                _optimizer_value(opt, "overlap_param_gather", False)
+            ),
+            use_layer_wise_param_layout=bool(
+                _optimizer_value(opt, "use_layer_wise_param_layout", False)
+            ),
+            grad_reduce_in_fp32=True,
         )
+        per_chunk_layouts = [None] * len(model_chunks)
+        if use_muon:
+            from megatron.core.optimizer.layer_wise_optimizer import (
+                LayerWiseDistributedOptimizer,
+                tag_params_for_buffer_routing,
+            )
+
+            for chunk in model_chunks:
+                _mark_dist_opt_parallel_attrs(chunk, is_expert_param, tp_size=p.tp)
+            tag_params_for_buffer_routing(model_chunks)
+
+            data_parallel_world_size = pg_collection.dp_cp.size()
+            expert_data_parallel_world_size = pg_collection.expt_dp.size()
+            for chunk_idx, chunk in enumerate(model_chunks):
+                params = [param for param in chunk.parameters() if param.requires_grad]
+                per_chunk_layouts[chunk_idx] = (
+                    LayerWiseDistributedOptimizer.compute_full_param_layout(
+                        params,
+                        None,
+                        data_parallel_world_size,
+                        ddp_config,
+                        expert_data_parallel_world_size=expert_data_parallel_world_size,
+                    )
+                )
+
         wrapped_chunks = []
         for chunk_idx, chunk in enumerate(model_chunks):
             chunk.model_type = ModelType.encoder_or_decoder
-            _mark_dist_opt_parallel_attrs(chunk, is_expert_param, tp_size=p.tp)
+            if not use_muon:
+                _mark_dist_opt_parallel_attrs(chunk, is_expert_param, tp_size=p.tp)
             ddp_kwargs = {}
             if pg_collection is not None:
                 ddp_kwargs["pg_collection"] = pg_collection
+            if per_chunk_layouts[chunk_idx] is not None:
+                ddp_kwargs["full_param_layout"] = per_chunk_layouts[chunk_idx]
             wrapped_chunks.append(
                 DistributedDataParallel(
                     dist_opt_transformer_cfg,
@@ -172,15 +388,13 @@ def build_dist_opt_stack(
                 )
             )
 
-    # Single-source-of-truth OptimizerConfig construction for native lite
-    # model protocols.
-    opt_config = build_dist_opt_optimizer_config(opt)
-
     # This branch falls back to Megatron-Core mpu globals for the optimizer's process
     # groups. Long term, this primitive should always pass its own
     # `pg_collection`.
     if skip_ddp_wrap or use_mpu_groups:
-        optimizer = get_megatron_optimizer(config=opt_config, model_chunks=wrapped_chunks)
+        optimizer = get_megatron_optimizer(
+            config=opt_config, model_chunks=wrapped_chunks
+        )
         optimizer._dist_opt_pg_collection = None  # pyright: ignore[reportAttributeAccessIssue]
     else:
         optimizer = get_megatron_optimizer(
@@ -189,9 +403,7 @@ def build_dist_opt_stack(
             use_gloo_process_groups=False,
             pg_collection=pg_collection,
         )
-        optimizer._dist_opt_pg_collection = (
-            pg_collection  # pyright: ignore[reportAttributeAccessIssue]
-        )
+        optimizer._dist_opt_pg_collection = pg_collection  # pyright: ignore[reportAttributeAccessIssue]
     return wrapped_chunks, optimizer
 
 
@@ -325,30 +537,22 @@ def _build_pg_collection(ps, engine_cfg):
 
     if ps.pp_group is None:
         raise ValueError("dist_opt requires a local pp_group.")
+    if ps.intra_dist_opt_group is None:
+        raise ValueError("dist_opt requires an explicit intra_dist_opt owner group.")
 
     def _dense_rank(tp_i: int, cp_i: int, dp_i: int, pp_i: int) -> int:
         return ((pp_i * ps.dp_size + dp_i) * ps.cp_size + cp_i) * ps.tp_size + tp_i
 
     def _expert_rank(etp_i: int, ep_i: int, edp_i: int, pp_i: int) -> int:
-        return ((pp_i * ps.expert_dp_size + edp_i) * ps.ep_size + ep_i) * ps.etp_size + etp_i
-
-    rank = dist.get_rank()
-    world = dist.get_world_size()
-
-    singleton_group = None
-    for singleton_rank in range(world):
-        group = dist.new_group([singleton_rank])
-        if rank == singleton_rank:
-            singleton_group = group
-    if singleton_group is None:
-        raise RuntimeError(
-            "Failed to construct singleton process group for optional dist_opt reductions."
-        )
+        return (
+            (pp_i * ps.expert_dp_size + edp_i) * ps.ep_size + ep_i
+        ) * ps.etp_size + etp_i
 
     if engine_cfg.parallel.pp == 1:
         mp_group = ps.tp_group
         tp_ep_pp_group = ps.tp_ep_group
     else:
+        rank = dist.get_rank()
         mp_group = None
         for dp_idx in range(ps.dp_size):
             for cp_idx in range(ps.cp_size):
@@ -374,7 +578,9 @@ def _build_pg_collection(ps, engine_cfg):
                 tp_ep_pp_group = group
 
         if mp_group is None or tp_ep_pp_group is None:
-            raise RuntimeError("Failed to construct dist_opt pipeline-aware process groups.")
+            raise RuntimeError(
+                "Failed to construct dist_opt pipeline-aware process groups."
+            )
 
     pg_kwargs = dict(
         tp=ps.tp_group,
@@ -388,14 +594,13 @@ def _build_pg_collection(ps, engine_cfg):
         expt_tp=ps.etp_group,
         tp_ep=ps.tp_ep_group,
         tp_ep_pp=tp_ep_pp_group,
-        # For dist_opt, grad stats are reduced over the full optimizer instance.
-        # With a single dist-opt instance in this benchmark proof, that is the global world group.
-        intra_dist_opt=dist.group.WORLD,
-        # ML models do not expose Megatron-Core's embedding/position-embedding sharing surface.
-        # Use singleton groups so optional embedding reductions become no-ops
-        # without falling back to the global MCore embedding group.
-        embd=singleton_group,
-        pos_embd=singleton_group,
+        # Optimizer-wide grad statistics use the explicit single-instance group.
+        # This is distinct from dense ``dp_cp`` and expert ``expt_dp`` owner domains.
+        intra_dist_opt=ps.intra_dist_opt_group,
+        # Native MLite models do not expose MCore's tied pipeline-embedding surface.
+        # ``None`` is the explicit ProcessGroupCollection contract for an unused group.
+        embd=None,
+        pos_embd=None,
     )
     supported_fields = {field.name for field in fields(ProcessGroupCollection)}
     return ProcessGroupCollection(
@@ -434,7 +639,9 @@ class DistOptBackend:
     def load_state_dict(self, optimizer: Any, state_dict: dict) -> None:
         optimizer.load_state_dict(state_dict)
 
-    def finalize_grads(self, finalize_fn, model_chunks: list[Any], optimizer: Any) -> None:
+    def finalize_grads(
+        self, finalize_fn, model_chunks: list[Any], optimizer: Any
+    ) -> None:
         finalize_fn(model_chunks, optimizer)
 
 
@@ -448,5 +655,4 @@ __all__ = [
     "build_dist_opt_training_optimizer",
     "finalize_dist_opt_grads",
     "validate_dist_opt_config",
-    "validate_dist_opt_session",
 ]

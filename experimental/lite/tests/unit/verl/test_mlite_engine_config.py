@@ -35,7 +35,9 @@ def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
 
 
 def _engine(
-    *, engine_config: MegatronLiteEngineConfig, optimizer_config: SimpleNamespace | None = None
+    *,
+    engine_config: MegatronLiteEngineConfig,
+    optimizer_config: SimpleNamespace | None = None,
 ) -> MegatronLiteEngine:
     return MegatronLiteEngine(
         model_config=SimpleNamespace(
@@ -118,7 +120,10 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     engine.get_data_parallel_group = lambda: None
 
     hook = engine._make_runtime_loss_fn(
-        lambda model_output, **_kwargs: (model_output["log_probs"] / num_microbatches, {}),
+        lambda model_output, **_kwargs: (
+            model_output["log_probs"] / num_microbatches,
+            {},
+        ),
         num_microbatches=num_microbatches,
         output_lst=outputs,
     )
@@ -127,7 +132,9 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
         (loss / num_microbatches).backward()
 
     torch.testing.assert_close(weight.grad, torch.tensor(3.0))
-    assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
+    assert [output["loss"] for output in outputs] == [
+        3.0 / num_microbatches
+    ] * num_microbatches
 
 
 def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> None:
@@ -156,6 +163,54 @@ def test_explicit_optimizer_offload_fraction_overrides_engine_default() -> None:
     optimizer = engine._build_mlite_optimizer_config()
 
     assert optimizer.offload_fraction == 0.25
+
+
+def test_canonical_optimizer_offload_fraction_is_preferred() -> None:
+    engine = _engine(
+        engine_config=_engine_config(optimizer_offload=True),
+        optimizer_config=_optimizer_config(optimizer_offload_fraction=0.25),
+    )
+
+    optimizer = engine._build_mlite_optimizer_config()
+
+    assert optimizer.optimizer_offload_fraction == 0.25
+
+
+def test_conflicting_optimizer_offload_alias_fails_loudly() -> None:
+    engine = _engine(
+        engine_config=_engine_config(),
+        optimizer_config=_optimizer_config(
+            offload_fraction=0.25, optimizer_offload_fraction=0.5
+        ),
+    )
+
+    with pytest.raises(
+        ValueError, match="offload_fraction.*optimizer_offload_fraction"
+    ):
+        engine._build_mlite_optimizer_config()
+
+
+def test_verl_muon_overrides_route_to_native_contract() -> None:
+    engine = _engine(
+        engine_config=_engine_config(),
+        optimizer_config=_optimizer_config(
+            muon_momentum=0.9,
+            muon_num_ns_steps=7,
+            use_layer_wise_param_layout=True,
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+        ),
+    )
+    engine.optimizer_config.optimizer = "muon"
+
+    optimizer = engine._build_mlite_optimizer_config()
+
+    assert optimizer.optimizer == "muon"
+    assert optimizer.muon_momentum == 0.9
+    assert optimizer.muon_num_ns_steps == 7
+    assert optimizer.use_layer_wise_param_layout is True
+    assert optimizer.overlap_grad_reduce is True
+    assert optimizer.overlap_param_gather is True
 
 
 def test_optimizer_cpu_offload_alias_maps_to_full_offload_fraction() -> None:

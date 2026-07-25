@@ -11,20 +11,23 @@ import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
 
-from megatron.lite.primitive.modules.gqa_utils import (
-    split_grouped_qkvg,
-    split_grouped_qkvg_for_tp,
+from megatron.lite.primitive.modules.gqa_utils import split_grouped_qkvg
+from megatron.lite.primitive.modules.lora import (
+    LinearLoRA,
+    LoraConfig,
+    normalize_lora_config,
 )
-from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
 from megatron.lite.primitive.parallel import (
     ColumnParallelLinear,
     ParallelState,
     RowParallelLinear,
-    all_gather_last_dim_with_grad_reduce,
 )
 from megatron.lite.primitive.utils import ensure_divisible
-from megatron.lite.primitive.utils.rope import _apply_rotary_pos_emb_bshd, _apply_rotary_pos_emb_thd
+from megatron.lite.primitive.utils.rope import (
+    _apply_rotary_pos_emb_bshd,
+    _apply_rotary_pos_emb_thd,
+)
 from megatron.lite.primitive.utils.rotary import RotaryEmbedding
 
 # Whitelist of MC PackedSeqParams fields accepted by TE DotProductAttention.forward().
@@ -70,14 +73,7 @@ class GQAttention(nn.Module):
     ):
         super().__init__()
         self.num_heads_local = ensure_divisible(num_attention_heads, ps.tp_size)
-        self._replicate_kv = num_key_value_heads < ps.tp_size
-        if self._replicate_kv:
-            ensure_divisible(ps.tp_size, num_key_value_heads)
-            self.num_kv_heads_local = 1
-        else:
-            self.num_kv_heads_local = ensure_divisible(num_key_value_heads, ps.tp_size)
-        self.num_heads = num_attention_heads
-        self.num_kv_heads = num_key_value_heads
+        self.num_kv_heads_local = ensure_divisible(num_key_value_heads, ps.tp_size)
         self.head_dim = head_dim
         self.ps = ps
         self._output_gate = output_gate
@@ -96,7 +92,9 @@ class GQAttention(nn.Module):
         # Mismatched order would put bucket boundaries in different places,
         # producing different per-rank fp32 master shard layouts and
         # non-bitwise step-1 divergence.
-        self.proj = RowParallelLinear(num_attention_heads * head_dim, hidden_size, ps, bias=False)
+        self.proj = RowParallelLinear(
+            num_attention_heads * head_dim, hidden_size, ps, bias=False
+        )
         q_cols = num_attention_heads * (2 if output_gate else 1)
         qkv_size = (q_cols + 2 * num_key_value_heads) * head_dim
         self.qkv = ColumnParallelLinear(
@@ -108,6 +106,27 @@ class GQAttention(nn.Module):
             eps=rms_norm_eps,
             zero_centered_gamma=zero_centered_gamma,
         )
+        if self._qkv_layout == "mcore":
+            q_projection_size = (
+                ensure_divisible(self.num_heads_local, self.num_kv_heads_local)
+                * self.head_dim
+            )
+            if self._output_gate:
+                qkv_split_shapes = [
+                    q_projection_size,
+                    q_projection_size,
+                    self.head_dim,
+                    self.head_dim,
+                ]
+            else:
+                qkv_split_shapes = [q_projection_size, self.head_dim, self.head_dim]
+            qkv_weight = self.qkv.linear.weight
+            if (
+                qkv_weight.dim() == 2
+                and qkv_weight.shape[0] % sum(qkv_split_shapes) == 0
+            ):
+                qkv_weight.is_qkv = True
+                qkv_weight.qkv_split_shapes = qkv_split_shapes
         self.q_norm = te.RMSNorm(
             head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
         )
@@ -186,13 +205,14 @@ class GQAttention(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
     ) -> torch.Tensor:
         qkv = self.qkv(x)
         if self.qkv_lora is not None:
             qkv = qkv + self.qkv_lora(self._qkv_lora_input(x))
-        if self._replicate_kv:
-            qkv = all_gather_last_dim_with_grad_reduce(qkv, self.ps.tp_group)
         q, gate, k, v = self._split_qkv(qkv)
 
         is_thd = packed_seq_params is not None
@@ -250,8 +270,12 @@ class GQAttention(nn.Module):
             local_seq_len = q.size(0)
             seq_len_for_rope = local_seq_len * self.ps.cp_size
             freqs = self.rotary(seq_len_for_rope)
-            q = _apply_rotary_pos_emb_bshd(q, freqs, rotary_interleaved=False, mscale=1.0)
-            k = _apply_rotary_pos_emb_bshd(k, freqs, rotary_interleaved=False, mscale=1.0)
+            q = _apply_rotary_pos_emb_bshd(
+                q, freqs, rotary_interleaved=False, mscale=1.0
+            )
+            k = _apply_rotary_pos_emb_bshd(
+                k, freqs, rotary_interleaved=False, mscale=1.0
+            )
         if self._use_fp32_rope:
             q, k = q.to(orig_dtype), k.to(orig_dtype)
 
@@ -274,7 +298,9 @@ class GQAttention(nn.Module):
             attn_out = self.core_attn(q, k, v, core_attention_bias_type="no_bias")
             if attn_out.dim() > x.dim():
                 shape = attn_out.shape
-                attn_out = attn_out.reshape(*shape[:-2], self.num_heads_local * self.head_dim)
+                attn_out = attn_out.reshape(
+                    *shape[:-2], self.num_heads_local * self.head_dim
+                )
 
         if gate is not None:
             gate_fp32 = gate.reshape(attn_out.shape).float().sigmoid()
@@ -299,34 +325,11 @@ class GQAttention(nn.Module):
         nq, nkv, hd = self.num_heads_local, self.num_kv_heads_local, self.head_dim
         lead = qkv.shape[:-1]
         if self._qkv_layout == "mcore":
-            if self._replicate_kv:
-                if self._output_gate:
-                    return split_grouped_qkvg_for_tp(
-                        qkv,
-                        num_heads=self.num_heads,
-                        num_kv_heads=self.num_kv_heads,
-                        head_dim=hd,
-                        tp_rank=self.ps.tp_rank,
-                        tp_size=self.ps.tp_size,
-                    )
-
-                replicas_per_kv_head = ensure_divisible(
-                    self.ps.tp_size, self.num_kv_heads
-                )
-                q_heads_per_group = ensure_divisible(self.num_heads, self.num_kv_heads)
-                group_width = (q_heads_per_group + 2) * hd
-                kv_group_rank = self.ps.tp_rank // replicas_per_kv_head
-                q_rank_in_group = self.ps.tp_rank % replicas_per_kv_head
-                qkv = qkv.narrow(-1, kv_group_rank * group_width, group_width)
-                qkv = qkv.view(*lead, 1, group_width)
-                q, k, v = qkv.split([q_heads_per_group * hd, hd, hd], dim=-1)
-                q = q.reshape(*lead, q_heads_per_group, hd)
-                q_start = q_rank_in_group * nq
-                return q[..., q_start : q_start + nq, :], None, k, v
-
             q_per_group = ensure_divisible(nq, nkv)
             if self._output_gate:
-                return split_grouped_qkvg(qkv, num_heads=nq, num_kv_heads=nkv, head_dim=hd)
+                return split_grouped_qkvg(
+                    qkv, num_heads=nq, num_kv_heads=nkv, head_dim=hd
+                )
 
             qkv = qkv.view(*lead, nkv, (q_per_group + 2) * hd)
             q = qkv[..., : q_per_group * hd].reshape(*lead, nq, hd)

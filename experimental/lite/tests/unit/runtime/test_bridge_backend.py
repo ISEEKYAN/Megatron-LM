@@ -96,7 +96,9 @@ def test_bridge_builds_mcore_ddp_config_object(monkeypatch):
     )
 
     ddp_config = _build_ddp_config(
-        BridgeConfig(override_ddp_config={"overlap_grad_reduce": True, "bucket_size": 1024})
+        BridgeConfig(
+            override_ddp_config={"overlap_grad_reduce": True, "bucket_size": 1024}
+        )
     )
 
     assert isinstance(ddp_config, _FakeDDPConfig)
@@ -104,6 +106,24 @@ def test_bridge_builds_mcore_ddp_config_object(monkeypatch):
     assert ddp_config.grad_reduce_in_fp32 is True
     assert ddp_config.overlap_grad_reduce is True
     assert ddp_config.bucket_size == 1024
+
+
+def test_bridge_muon_optimizer_requires_complete_lowering(monkeypatch):
+    from megatron.lite.runtime.backends.bridge.config import BridgeConfig
+    from megatron.lite.runtime.backends.bridge.runtime import _build_optimizer
+    from megatron.lite.runtime.contracts.config import OptimizerConfig
+
+    def unexpected_optimizer_build(**_kwargs):
+        pytest.fail("Bridge must reject Muon before calling Megatron optimizer")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.optimizer",
+        types.SimpleNamespace(get_megatron_optimizer=unexpected_optimizer_build),
+    )
+
+    with pytest.raises(ValueError, match="complete.*lowering"):
+        _build_optimizer([], BridgeConfig(optimizer=OptimizerConfig(optimizer="muon")))
 
 
 def test_bridge_deterministic_provider_sets_te_env(monkeypatch):
@@ -122,7 +142,9 @@ def test_bridge_deterministic_provider_sets_te_env(monkeypatch):
 
 
 def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
-    from megatron.lite.runtime.backends.bridge.runtime import _register_bridge_compat_aliases
+    from megatron.lite.runtime.backends.bridge.runtime import (
+        _register_bridge_compat_aliases,
+    )
 
     registered = []
 
@@ -146,7 +168,9 @@ def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
         get_model_bridge=_FakeDispatcher(),
         register_bridge_implementation=lambda **kwargs: registered.append(kwargs),
     )
-    mapping_registry_mod = types.SimpleNamespace(MegatronMappingRegistry=lambda *items: list(items))
+    mapping_registry_mod = types.SimpleNamespace(
+        MegatronMappingRegistry=lambda *items: list(items)
+    )
     param_mapping_mod = types.SimpleNamespace(
         AutoMapping=_FakeMapping,
         GDNConv1dMapping=_FakeMapping,
@@ -158,7 +182,9 @@ def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
         split_gdn_linear_weights=lambda *args, **kwargs: (None, None),
     )
     qwen_bridge_mod = types.SimpleNamespace(Qwen3NextBridge=_FakeQwen3NextBridge)
-    common_utils_mod = types.SimpleNamespace(extract_expert_number_from_param=lambda name: 0)
+    common_utils_mod = types.SimpleNamespace(
+        extract_expert_number_from_param=lambda name: 0
+    )
     gpt_mod = types.SimpleNamespace(GPTModel=object)
 
     monkeypatch.setitem(
@@ -167,15 +193,21 @@ def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
         types.SimpleNamespace(model_bridge=model_bridge),
     )
     monkeypatch.setitem(
-        sys.modules, "megatron.bridge.models.conversion.mapping_registry", mapping_registry_mod
+        sys.modules,
+        "megatron.bridge.models.conversion.mapping_registry",
+        mapping_registry_mod,
     )
     monkeypatch.setitem(
-        sys.modules, "megatron.bridge.models.conversion.param_mapping", param_mapping_mod
+        sys.modules,
+        "megatron.bridge.models.conversion.param_mapping",
+        param_mapping_mod,
     )
     monkeypatch.setitem(
         sys.modules, "megatron.bridge.models.qwen.qwen3_next_bridge", qwen_bridge_mod
     )
-    monkeypatch.setitem(sys.modules, "megatron.bridge.utils.common_utils", common_utils_mod)
+    monkeypatch.setitem(
+        sys.modules, "megatron.bridge.utils.common_utils", common_utils_mod
+    )
     monkeypatch.setitem(sys.modules, "megatron.core.models.gpt.gpt_model", gpt_mod)
 
     _register_bridge_compat_aliases()
@@ -184,7 +216,13 @@ def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeForCausalLM",
     ]
-    assert all(issubclass(item["bridge_class"], _FakeQwen3NextBridge) for item in registered)
+    assert all(
+        issubclass(item["bridge_class"], _FakeQwen3NextBridge) for item in registered
+    )
     assert all(item["bridge_class"] is not _FakeQwen3NextBridge for item in registered)
-    assert all("provider_bridge" in item["bridge_class"].__dict__ for item in registered)
-    assert all("mapping_registry" in item["bridge_class"].__dict__ for item in registered)
+    assert all(
+        "provider_bridge" in item["bridge_class"].__dict__ for item in registered
+    )
+    assert all(
+        "mapping_registry" in item["bridge_class"].__dict__ for item in registered
+    )
