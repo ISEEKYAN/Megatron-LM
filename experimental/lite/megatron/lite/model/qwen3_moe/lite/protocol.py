@@ -35,8 +35,13 @@ from megatron.lite.model.protocol_utils import (
 )
 from megatron.lite.model.qwen3_moe.common import is_expert_param
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
-from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
+from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+    EXPERT_CLASSIFIER,
+    PLACEMENT_FN,
+)
+from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+    load_hf_weights as _load_hf_weights_impl,
+)
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.lora import (
@@ -136,7 +141,9 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
 
 def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
     labels = batch.labels.reshape(1, -1) if batch.labels is not None else None
-    return model(input_ids=batch.input_ids.reshape(1, -1), labels=labels, packed_seq_params=None)
+    return model(
+        input_ids=batch.input_ids.reshape(1, -1), labels=labels, packed_seq_params=None
+    )
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
@@ -162,7 +169,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
     if mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
-            raise ValueError("mtp_enable=True but HF config has no num_nextn_predict_layers.")
+            raise ValueError(
+                "mtp_enable=True but HF config has no num_nextn_predict_layers."
+            )
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
         if impl_cfg.mtp_use_repeated_layer is not None:
             model_cfg.mtp_use_repeated_layer = impl_cfg.mtp_use_repeated_layer
@@ -188,7 +197,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
     vpp = None if p.vpp == 1 else p.vpp
     if vpp is None:
-        chunks = [Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
+        chunks = [
+            Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()
+        ]
     else:
         chunks = []
         for i in range(vpp):
@@ -212,48 +223,74 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         for chunk in chunks:
             apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
 
-    lora_stats = apply_lora_to_chunks(chunks, lora_spec, ps=ps)
+    # The HF loader resolves canonical parameter names from ``state_dict``.
+    # LoRA wrappers add a ``.base.`` component, so attaching here would make
+    # every wrapped base parameter invisible to the loader.  Keep disabled
+    # LoRA inert, and attach enabled LoRA in the post-load/pre-wrap hook below.
+    lora_stats = (
+        None if lora_spec.enabled else apply_lora_to_chunks(chunks, lora_spec, ps=ps)
+    )
 
-    olora_hook = None
-    if lora_spec.enabled and lora_spec.init == "olora_tail":
-
-        def olora_hook():
-            for chunk in chunks:
-                apply_olora_tail_init(chunk)
+    def _attach_lora_after_load():
+        nonlocal lora_stats
+        if lora_stats is None:
+            lora_stats = apply_lora_to_chunks(chunks, lora_spec, ps=ps)
+            if lora_spec.init == "olora_tail":
+                for chunk in chunks:
+                    apply_olora_tail_init(chunk)
+        return lora_stats
 
     # ── optimizer (model chooses which primitive) ──
     optimizer = None
     finalize_grads = None
     post_model_load_hook = None
     if impl_cfg.optimizer == "dist_opt":
-        from megatron.lite.primitive.optimizers.megatron_wrap import (
-            build_dist_opt_training_optimizer,
-        )
-
-        optimizer, finalize_grads = build_dist_opt_training_optimizer(
-            chunks,
-            model_cfg=model_cfg,
-            impl_cfg=impl_cfg,
-            ps=ps,
-            model_name="qwen3_moe",
-            is_expert=is_expert_param,
-            deterministic=deterministic,
-        )
-        from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
-
-        attach_model_sharded_state_dict(
-            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
-        )
         optimizer_backend = "dist_opt"
+
+        def _build_dist_opt():
+            from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
+            from megatron.lite.primitive.optimizers.megatron_wrap import (
+                build_dist_opt_training_optimizer,
+            )
+
+            built_optimizer, built_finalize_grads = build_dist_opt_training_optimizer(
+                chunks,
+                model_cfg=model_cfg,
+                impl_cfg=impl_cfg,
+                ps=ps,
+                model_name="qwen3_moe",
+                is_expert=is_expert_param,
+                deterministic=deterministic,
+            )
+            attach_model_sharded_state_dict(
+                chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
+            )
+            return built_optimizer, built_finalize_grads
+
+        if lora_spec.enabled:
+
+            def _post_model_load_hook():
+                stats = _attach_lora_after_load()
+                built_optimizer, built_finalize_grads = _build_dist_opt()
+                return {
+                    "optimizer": built_optimizer,
+                    "finalize_grads": built_finalize_grads,
+                    "extras": {"lora_stats": stats},
+                }
+
+            post_model_load_hook = _post_model_load_hook
+        else:
+            optimizer, finalize_grads = _build_dist_opt()
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 
         def _post_model_load_hook():
             from megatron.lite.model.qwen3_moe.lite.model import TransformerLayer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
 
-            if olora_hook is not None:
-                olora_hook()
+            stats = _attach_lora_after_load()
             return {
                 "optimizer": build_fsdp2_training_optimizer(
                     chunks,
@@ -267,12 +304,19 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
                     # CE path reads head.col.linear.weight directly, and the
                     # embedding path is also driven from model.forward().
                     leaf_module_names=(),
-                )
+                ),
+                "extras": {"lora_stats": stats},
             }
 
         post_model_load_hook = _post_model_load_hook
     elif impl_cfg.optimizer is None:
         optimizer_backend = "none"
+        if lora_spec.enabled:
+
+            def _post_model_load_hook():
+                return {"extras": {"lora_stats": _attach_lora_after_load()}}
+
+            post_model_load_hook = _post_model_load_hook
     else:
         raise ValueError(f"Unknown qwen3_moe lite optimizer: {impl_cfg.optimizer!r}.")
 
@@ -297,7 +341,6 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             "post_model_load_hook": post_model_load_hook,
             "lora_spec": lora_spec,
             "lora_stats": lora_stats,
-            "olora_hook": olora_hook,
         },
     )
 
@@ -320,17 +363,16 @@ def export_hf_weights(
     chunks: list[nn.Module], model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs
 ):
     """Export HF weights from model chunks."""
-    from megatron.lite.model.qwen3_moe.lite.checkpoint import export_hf_weights as _export
+    from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+        export_hf_weights as _export,
+    )
 
     for chunk in chunks:
         yield from _export(chunk, model_cfg, ps, **kwargs)
 
 
 def save_hf_weights(
-    chunks: list[nn.Module],
-    path: str,
-    model_cfg: Qwen3MoEConfig,
-    ps: ParallelState,
+    chunks: list[nn.Module], path: str, model_cfg: Qwen3MoEConfig, ps: ParallelState
 ) -> None:
     from megatron.lite.model.qwen3_moe.lite.checkpoint import save_hf_weights as _save
 

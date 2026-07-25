@@ -4,17 +4,17 @@
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
-
 from megatron.lite.primitive.modules.lora import (
     LinearLoRA,
     LoraSpec,
-    normalize_lora_spec,
     _weight_owner,
+    normalize_lora_spec,
 )
 from megatron.lite.primitive.modules.lora_apply import (
     LoRAWrappedLinear,
@@ -78,6 +78,105 @@ def test_apply_wraps_swiglu_and_freezes_base():
     assert stats["frozen_tensors"] > 0
 
 
+def test_qwen_protocol_loads_canonical_weights_before_lora_attach(monkeypatch):
+    """Regression for HF load seeing ``.base.`` names after early LoRA attach."""
+    from megatron.lite.model.qwen3_moe.lite import protocol
+
+    SwiGLUMLP = _swiglu_mlp()
+
+    class _CpuQwenProxy(nn.Module):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].mlp = SwiGLUMLP(8, 16)
+
+        def cuda(self):
+            return self
+
+    monkeypatch.setattr(protocol, "Qwen3MoEModel", _CpuQwenProxy)
+    monkeypatch.setattr(
+        protocol,
+        "init_parallel",
+        lambda _cfg: SimpleNamespace(
+            tp_size=1, ep_size=1, etp_size=1, pp_size=1, cp_size=1
+        ),
+    )
+    monkeypatch.setattr(protocol, "set_cross_entropy_fusion", lambda *_args: None)
+
+    cfg = SimpleNamespace(
+        router_aux_loss_coef=0.0,
+        num_nextn_predict_layers=0,
+        mtp_loss_scaling_factor=0.1,
+    )
+    bundle = protocol.build_model(
+        cfg,
+        impl_cfg=protocol.ImplConfig(
+            optimizer=None,
+            lora={
+                "enabled": True,
+                "rank": 2,
+                "target_modules": ("linear_fc1", "linear_fc2"),
+            },
+        ),
+    )
+    chunk = bundle.chunks[0]
+    mlp = chunk.layers[0].mlp
+
+    # Canonical checkpoint names must still exist at load time.
+    assert not isinstance(mlp.gate_up, LoRAWrappedLinear)
+    checkpoint = {
+        name: torch.full_like(param, 0.25) for name, param in chunk.state_dict().items()
+    }
+    incompatible = chunk.load_state_dict(checkpoint, strict=False)
+    assert incompatible.missing_keys == []
+    assert incompatible.unexpected_keys == []
+
+    x = torch.randn(4, 8, dtype=torch.bfloat16)
+    with torch.no_grad():
+        base_t0 = mlp(x).clone()
+
+    updates = bundle.extras["post_model_load_hook"]()
+    assert updates["extras"]["lora_stats"]["attached_modules"] == 2
+    assert isinstance(mlp.gate_up, LoRAWrappedLinear)
+    assert isinstance(mlp.down, LoRAWrappedLinear)
+    assert torch.count_nonzero(mlp.gate_up.adapter.lora_b) == 0
+    assert torch.count_nonzero(mlp.down.adapter.lora_b) == 0
+    with torch.no_grad():
+        lora_t0 = mlp(x)
+    assert torch.equal(lora_t0, base_t0)
+
+
+def test_qwen3_30b_lora_attachment_and_parameter_contract():
+    from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+
+    cfg = Qwen3MoEConfig()
+    rank = 16
+    target_ep = 8
+    targets = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
+
+    assert cfg.num_hidden_layers * len(targets) == 192
+    qkv_out = (cfg.num_attention_heads + 2 * cfg.num_key_value_heads) * cfg.head_dim
+    attention_lora = (
+        cfg.num_hidden_layers
+        * rank
+        * (cfg.hidden_size + qkv_out + cfg.hidden_size + cfg.hidden_size)
+    )
+    expert_lora = (
+        cfg.num_hidden_layers
+        * target_ep
+        * rank
+        * (
+            (cfg.hidden_size + 2 * cfg.moe_intermediate_size)
+            + (cfg.moe_intermediate_size + cfg.hidden_size)
+        )
+    )
+    trainable_numel = attention_lora + expert_lora
+    total_numel = 30_532_122_624
+
+    assert trainable_numel == 47_972_352
+    assert trainable_numel / total_numel == pytest.approx(0.0015712092012329002)
+
+
 class _IdentityWeightTransform(parametrize.Module):
     def forward(self, weight: torch.Tensor) -> torch.Tensor:
         return weight * 1.0
@@ -136,8 +235,14 @@ def test_lora_wrapped_linear_forwards_base_attrs():
 
 
 def test_apply_lora_tp_layout_on_gqa_adapters():
-    from megatron.lite.primitive.parallel.linear import ColumnParallelLinear, RowParallelLinear
-    from megatron.lite.primitive.modules.lora_apply import _attach_gqa_proj, _attach_gqa_qkv
+    from megatron.lite.primitive.modules.lora_apply import (
+        _attach_gqa_proj,
+        _attach_gqa_qkv,
+    )
+    from megatron.lite.primitive.parallel.linear import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+    )
 
     def _column_surface():
         surface = ColumnParallelLinear.__new__(ColumnParallelLinear)
