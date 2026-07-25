@@ -359,7 +359,11 @@ def test_engine_export_merges_lora_when_adapter_enabled(monkeypatch) -> None:
         engine._require_initialized = lambda: None
         # is_param_offload_enabled is a property over engine_config offload flags
         engine.engine_config = SimpleNamespace(
-            model_name="qwen2", export_dtype=None, param_offload=False
+            model_name="qwen2",
+            export_dtype=None,
+            param_offload=False,
+            resync_format=None,
+            resync_config=None,
         )
         engine._mlite_config = SimpleNamespace(impl_cfg={"lora": lora} if lora else {})
         engine.runtime = _FakeRuntime()
@@ -367,13 +371,13 @@ def test_engine_export_merges_lora_when_adapter_enabled(monkeypatch) -> None:
         return engine
 
     captured.clear()
-    make({"rank": 16, "alpha": 32}).get_per_tensor_param()
+    make({"enabled": True, "rank": 16, "alpha": 32}).get_per_tensor_param()
     assert captured.get("merge_lora") is True
 
     captured.clear()
-    make(None).get_per_tensor_param()
+    make({"enabled": False, "rank": 16}).get_per_tensor_param()
     assert "merge_lora" not in captured
 
     captured.clear()
-    make({"rank": 0}).get_per_tensor_param()
+    make({"rank": 16}).get_per_tensor_param()
     assert "merge_lora" not in captured
