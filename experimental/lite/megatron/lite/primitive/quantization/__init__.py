@@ -17,6 +17,12 @@ from megatron.lite.primitive.quantization.qat import (
     quantize_weight,
     unpack_int4,
 )
+from megatron.lite.primitive.quantization.recipe import (
+    QATRecipe,
+    QuantizerB,
+    RecipeContract,
+    recipe_contract,
+)
 
 __all__ = [
     "QATSpec",
@@ -31,4 +37,8 @@ __all__ = [
     "qat_state_dict",
     "quantize_weight",
     "unpack_int4",
+    "QATRecipe",
+    "QuantizerB",
+    "RecipeContract",
+    "recipe_contract",
 ]
