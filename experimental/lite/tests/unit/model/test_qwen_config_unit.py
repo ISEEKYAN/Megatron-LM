@@ -9,6 +9,7 @@ import pytest
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.registry import resolve_model_type_from_hf, resolve_runtime_model_name
+from megatron.lite.runtime.contracts.config import ParallelConfig
 
 pytestmark = pytest.mark.mlite
 
@@ -101,6 +102,20 @@ def test_qwen_lite_protocols_build_configs_from_hf_dicts(transformer_engine_impo
     )
 
     assert qwen3_cfg.vocab_size == 128
+    overlap_cfg = qwen3_protocol.ImplConfig(
+        parallel=ParallelConfig(ep=8),
+        overlap_moe_expert_parallel_comm=True,
+    )
+    assert overlap_cfg.overlap_moe_expert_parallel_comm is True
+    with pytest.raises(ValueError, match="alltoall"):
+        qwen3_protocol.build_model(
+            qwen3_cfg,
+            impl_cfg=qwen3_protocol.ImplConfig(
+                parallel=ParallelConfig(ep=8),
+                overlap_moe_expert_parallel_comm=True,
+                use_deepep=True,
+            ),
+        )
     assert qwen35_cfg.vocab_size == 128
     assert qwen35_cfg.layer_type_at(0) == "linear_attention"
     assert qwen35_cfg.layer_type_at(1) == "full_attention"

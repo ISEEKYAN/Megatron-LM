@@ -13,7 +13,6 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
-
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -24,6 +23,7 @@ from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entro
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
 from megatron.lite.primitive.parallel import (
+    Combined1F1BModelPlan,
     ParallelState,
     VanillaColumnParallelLinear,
     VocabParallelEmbedding,
@@ -58,7 +58,11 @@ class MoELayer(nn.Module):
             config, ps, router_bias_rate=router_bias_rate, compute_aux_loss=False
         )
         self.experts = Experts(
-            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute, lora_config=lora_config
+            config,
+            ps,
+            fp8=fp8,
+            moe_act_recompute=moe_act_recompute,
+            lora_config=lora_config,
         )
         self.dispatcher = TokenDispatcher(
             config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
@@ -72,7 +76,9 @@ class MoELayer(nn.Module):
             x_2d = x
 
         scores, indices = self.router(x_2d)
-        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_2d, scores, indices)
+        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(
+            x_2d, scores, indices
+        )
         del scores, indices
         self.dispatcher.wait_dispatch_event()
         expert_out = self.experts(
@@ -86,6 +92,37 @@ class MoELayer(nn.Module):
         del expert_out
 
         return combined.view(input_shape).to(x.dtype)
+
+    def combined_1f1b_callables(self):
+        """Return the all-to-all MoE nodes used by the combined schedule."""
+        if self.dispatcher.ep_size <= 1 or self.dispatcher.use_deepep:
+            raise RuntimeError(
+                "combined-1F1B requires EP > 1 with the alltoall dispatcher"
+            )
+
+        def preprocess(x):
+            scores, indices = self.router(x)
+            return self.dispatcher.alltoall_dispatch_preprocess(x, scores, indices)
+
+        def communicate(permuted, permuted_probs):
+            return self.dispatcher.alltoall_dispatch_communicate(
+                permuted, permuted_probs
+            )
+
+        def experts(dispatched, tokens_per_expert, permuted_probs):
+            return self.experts(
+                dispatched,
+                tokens_per_expert,
+                permuted_probs,
+                tokens_per_expert_list=None,
+            )
+
+        return (
+            preprocess,
+            communicate,
+            experts,
+            self.dispatcher.alltoall_combine_communicate,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +196,10 @@ class TransformerLayer(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
     ) -> torch.Tensor:
         residual = x
         h = self.attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
@@ -171,6 +211,37 @@ class TransformerLayer(nn.Module):
         x = residual + moe_out
 
         return x
+
+    def combined_1f1b_callables(
+        self, *, position_ids: torch.Tensor | None, packed_seq_params
+    ):
+        """Split the layer at EP communication boundaries, matching Megatron."""
+        moe_preprocess, dispatch, experts, combine = self.moe.combined_1f1b_callables()
+
+        def pre_dispatch(x):
+            residual = x
+            h = self.attn(
+                x, position_ids=position_ids, packed_seq_params=packed_seq_params
+            )
+            x = residual + h
+            residual = x
+            h = self.mlp_norm(x)
+            permuted, permuted_probs = moe_preprocess(h)
+            return residual, permuted, permuted_probs
+
+        def dispatch_node(residual, permuted, permuted_probs):
+            dispatched, tokens_per_expert, permuted_probs = dispatch(
+                permuted, permuted_probs
+            )
+            return residual, dispatched, tokens_per_expert, permuted_probs
+
+        def experts_node(residual, dispatched, tokens_per_expert, permuted_probs):
+            return residual, experts(dispatched, tokens_per_expert, permuted_probs)
+
+        def combine_node(residual, expert_output):
+            return residual + combine(expert_output)
+
+        return pre_dispatch, dispatch_node, experts_node, combine_node
 
 
 class MTPLossAutoScaler(torch.autograd.Function):
@@ -186,7 +257,9 @@ class MTPLossAutoScaler(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (mtp_loss,) = ctx.saved_tensors
-        scaled_mtp_grad = torch.ones_like(mtp_loss) * MTPLossAutoScaler.main_loss_backward_scale
+        scaled_mtp_grad = (
+            torch.ones_like(mtp_loss) * MTPLossAutoScaler.main_loss_backward_scale
+        )
         return grad_output, scaled_mtp_grad
 
     @staticmethod
@@ -221,7 +294,11 @@ class MultiTokenPredictionLayer(nn.Module):
         self.enorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = VanillaColumnParallelLinear(
-            config.hidden_size * 2, config.hidden_size, ps, sp=ps.tp_size > 1, gather_output=True
+            config.hidden_size * 2,
+            config.hidden_size,
+            ps,
+            sp=ps.tp_size > 1,
+            gather_output=True,
         )
         self.transformer_layer = TransformerLayer(
             config,
@@ -248,7 +325,9 @@ class MultiTokenPredictionLayer(nn.Module):
         attention_position_ids = (
             rotary_position_ids if rotary_position_ids is not None else position_ids
         )
-        input_ids, _ = roll_packed_thd_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
+        input_ids, _ = roll_packed_thd_left(
+            input_ids, packed_seq_params=packed_seq_params, dims=-1
+        )
         if position_ids is not None:
             position_ids, _ = roll_packed_thd_left(
                 position_ids, packed_seq_params=packed_seq_params, dims=-1
@@ -266,7 +345,9 @@ class MultiTokenPredictionLayer(nn.Module):
         hidden_states = self.eh_proj(hidden_states)
         hidden_states = scatter_to_sequence_parallel(hidden_states, self.ps)
         hidden_states = self.transformer_layer(
-            hidden_states, position_ids=attention_position_ids, packed_seq_params=packed_seq_params
+            hidden_states,
+            position_ids=attention_position_ids,
+            packed_seq_params=packed_seq_params,
         )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids
@@ -369,7 +450,9 @@ class Qwen3MoEModel(nn.Module):
         self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self._input_tensor: torch.Tensor | None = None
-        layout = build_pipeline_chunk_layout(config.num_hidden_layers, ps, vpp, vpp_chunk_id)
+        layout = build_pipeline_chunk_layout(
+            config.num_hidden_layers, ps, vpp, vpp_chunk_id
+        )
         self.layer_indices = layout.layer_indices
         has_embed = layout.has_embed
         has_head = layout.has_head
@@ -379,7 +462,9 @@ class Qwen3MoEModel(nn.Module):
 
         self.embed: VocabParallelEmbedding | None = None
         if has_embed:
-            self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+            self.embed = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, ps
+            )
 
         _recompute = recompute_modules or []
         moe_act_recompute = "moe_act" in _recompute and "moe" not in _recompute
@@ -411,7 +496,9 @@ class Qwen3MoEModel(nn.Module):
         if mtp_enable and config.num_nextn_predict_layers > 0 and self.head is not None:
             mtp_embedding = self.embed
             if mtp_embedding is None:
-                mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+                mtp_embedding = VocabParallelEmbedding(
+                    config.vocab_size, config.hidden_size, ps
+                )
                 self.mtp_embed = mtp_embedding
             self.mtp = MultiTokenPredictionBlock(
                 config,
@@ -434,9 +521,93 @@ class Qwen3MoEModel(nn.Module):
     def set_input_tensor(self, input_tensor):
         if isinstance(input_tensor, list):
             if len(input_tensor) > 1:
-                raise ValueError("Qwen3MoEModel expects a single pipeline input tensor.")
+                raise ValueError(
+                    "Qwen3MoEModel expects a single pipeline input tensor."
+                )
             input_tensor = input_tensor[0] if input_tensor else None
         self._input_tensor = input_tensor
+
+    def _preprocess_hidden(
+        self, *, input_ids: torch.Tensor | None, hidden_states: torch.Tensor | None
+    ) -> torch.Tensor:
+        if self.embed is not None:
+            if input_ids is None:
+                raise ValueError("input_ids are required on the embedding stage")
+            hidden = self.embed(input_ids)
+            return scatter_to_sequence_parallel(hidden, self.ps)
+        if hidden_states is None:
+            hidden_states = self._input_tensor
+        if hidden_states is None:
+            raise ValueError("hidden_states are required without an embedding")
+        return hidden_states
+
+    def _postprocess_hidden(
+        self,
+        hidden: torch.Tensor,
+        *,
+        input_ids: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+        packed_seq_params,
+        labels: torch.Tensor | None,
+        loss_mask: torch.Tensor | None,
+        temperature: float | torch.Tensor,
+        use_fused_kernels: bool,
+        calculate_entropy: bool,
+        return_log_probs: bool,
+    ) -> dict:
+        output = {"hidden_states": hidden}
+        if self.head is None:
+            return output
+
+        hidden_for_head = self.norm(hidden)
+        if labels is not None:
+            temperature_value = _temperature_to_float(temperature)
+            mtp_result = self._apply_mtp_loss(
+                hidden_for_head,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+                temperature=temperature_value,
+                use_fused_kernels=use_fused_kernels,
+            )
+            if mtp_result is not None:
+                hidden_for_head, mtp_loss = mtp_result
+                output["mtp_loss"] = mtp_loss
+            labels_sb = labels.transpose(0, 1).contiguous()
+            if use_fused_kernels:
+                hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
+                log_probs, entropy = linear_cross_entropy(
+                    hidden_full,
+                    self._head_weight_for_fused_ce(hidden_full),
+                    labels_sb,
+                    temperature_value,
+                    self.ps.tp_group,
+                )
+                token_loss = -log_probs
+                output["loss"] = token_loss.mean()
+                if return_log_probs:
+                    output["log_probs"] = log_probs.transpose(0, 1).contiguous()
+                if calculate_entropy:
+                    output["entropy"] = entropy.transpose(0, 1).contiguous()
+            else:
+                logits = self.head(hidden_for_head)
+                if temperature_value != 1.0:
+                    logits = logits / temperature_value
+                token_loss = vocab_parallel_cross_entropy(
+                    logits, labels_sb, self.ps.tp_group
+                )
+                output["loss"] = token_loss.mean()
+                if return_log_probs:
+                    output["log_probs"] = (-token_loss).transpose(0, 1).contiguous()
+                if calculate_entropy:
+                    entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
+                    output["entropy"] = entropy.transpose(0, 1).contiguous()
+        else:
+            logits = self.head(hidden_for_head)
+            output["logits"] = self.head.gather(logits)
+        return output
 
     def forward(
         self,
@@ -451,14 +622,7 @@ class Qwen3MoEModel(nn.Module):
         calculate_entropy: bool = False,
         return_log_probs: bool = True,
     ) -> dict:
-        if self.embed is not None:
-            assert input_ids is not None
-            h = self.embed(input_ids)
-        else:
-            if hidden_states is None:
-                hidden_states = self._input_tensor
-            assert hidden_states is not None
-            h = hidden_states
+        h = self._preprocess_hidden(input_ids=input_ids, hidden_states=hidden_states)
 
         fp8_ctx = (
             te.fp8_autocast(enabled=True, fp8_recipe=build_fp8_recipe())
@@ -467,67 +631,89 @@ class Qwen3MoEModel(nn.Module):
         )
 
         with fp8_ctx:
-            if self.embed is not None:
-                h = scatter_to_sequence_parallel(h, self.ps)
             for layer in self.layers:
-                h = layer(h, position_ids=position_ids, packed_seq_params=packed_seq_params)
+                h = layer(
+                    h, position_ids=position_ids, packed_seq_params=packed_seq_params
+                )
             # Head path is SP-aware: norm runs on SP-sharded [S/tp, B, H] and
             # head's internal all-gather happens inside VocabParallelOutput.
             # Mirrors MC GPTModel's final_layernorm → output_layer(sp=True).
 
-        output = {"hidden_states": h}
+        return self._postprocess_hidden(
+            h,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            labels=labels,
+            loss_mask=loss_mask,
+            temperature=temperature,
+            use_fused_kernels=use_fused_kernels,
+            calculate_entropy=calculate_entropy,
+            return_log_probs=return_log_probs,
+        )
 
-        if self.head is not None:
-            hidden_for_head = self.norm(h)
+    def build_combined_1f1b_plan(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        labels: torch.Tensor | None = None,
+        loss_mask: torch.Tensor | None = None,
+        temperature: float | torch.Tensor = 1.0,
+        use_fused_kernels: bool = False,
+        calculate_entropy: bool = False,
+        return_log_probs: bool = True,
+        num_microbatches: int,
+        external_loss=None,
+    ) -> Combined1F1BModelPlan:
+        """Build the narrow PP=1 all-to-all plan consumed by the scheduler."""
+        if self.embed is None or self.head is None:
+            raise ValueError("combined-1F1B first profile requires PP=1")
+        if self.mtp is not None:
+            raise ValueError("combined-1F1B first profile does not support MTP")
 
-            if labels is not None:
-                temperature_value = _temperature_to_float(temperature)
-                mtp_result = self._apply_mtp_loss(
-                    hidden_for_head,
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    labels=labels,
-                    loss_mask=loss_mask,
-                    packed_seq_params=packed_seq_params,
-                    temperature=temperature_value,
-                    use_fused_kernels=use_fused_kernels,
-                )
-                if mtp_result is not None:
-                    hidden_for_head, mtp_loss = mtp_result
-                    output["mtp_loss"] = mtp_loss
-                labels_sb = labels.transpose(0, 1).contiguous()
-                if use_fused_kernels:
-                    hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
-                    log_probs, entropy = linear_cross_entropy(
-                        hidden_full,
-                        self._head_weight_for_fused_ce(hidden_full),
-                        labels_sb,
-                        temperature_value,
-                        self.ps.tp_group,
-                    )
-                    token_loss = -log_probs
-                    output["loss"] = token_loss.mean()
-                    if return_log_probs:
-                        output["log_probs"] = log_probs.transpose(0, 1).contiguous()
-                    if calculate_entropy:
-                        output["entropy"] = entropy.transpose(0, 1).contiguous()
-                else:
-                    logits = self.head(hidden_for_head)
-                    if temperature_value != 1.0:
-                        logits = logits / temperature_value
-                    token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
-                    output["loss"] = token_loss.mean()
-                    if return_log_probs:
-                        output["log_probs"] = (-token_loss).transpose(0, 1).contiguous()
-                    if calculate_entropy:
-                        entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
-                        output["entropy"] = entropy.transpose(0, 1).contiguous()
+        layer_callables = [
+            layer.combined_1f1b_callables(
+                position_ids=position_ids, packed_seq_params=packed_seq_params
+            )
+            for layer in self.layers
+        ]
+        if self.fp8:
 
-            if labels is None:
-                logits = self.head(hidden_for_head)
-                output["logits"] = self.head.gather(logits)
+            def with_fp8(fn):
+                def wrapped(*args):
+                    with te.fp8_autocast(enabled=True, fp8_recipe=build_fp8_recipe()):
+                        return fn(*args)
 
-        return output
+                return wrapped
+
+            layer_callables = [
+                tuple(with_fp8(fn) for fn in callables) for callables in layer_callables
+            ]
+
+        return Combined1F1BModelPlan(
+            preprocess=lambda: self._preprocess_hidden(
+                input_ids=input_ids, hidden_states=hidden_states
+            ),
+            layer_callables=layer_callables,
+            postprocess=lambda hidden: self._postprocess_hidden(
+                hidden,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                labels=labels,
+                loss_mask=loss_mask,
+                temperature=temperature,
+                use_fused_kernels=use_fused_kernels,
+                calculate_entropy=calculate_entropy,
+                return_log_probs=return_log_probs,
+            ),
+            num_microbatches=num_microbatches,
+            external_loss=external_loss,
+            use_cuda=True,
+        )
 
     def _apply_mtp_loss(
         self,
@@ -586,12 +772,16 @@ class Qwen3MoEModel(nn.Module):
                 logits = self.head(mtp_hidden)
                 if temperature != 1.0:
                     logits = logits / temperature
-                token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                token_loss = vocab_parallel_cross_entropy(
+                    logits, labels_sb, self.ps.tp_group
+                )
             token_loss = token_loss * mask_sb.to(dtype=token_loss.dtype)
             num_tokens = num_tokens.to(dtype=token_loss.dtype).clamp_min(1.0)
             mtp_loss_values.append(token_loss.sum() / num_tokens)
 
-            mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
+            mtp_loss_scale = self.mtp_loss_scaling_factor / max(
+                len(mtp_hidden_states), 1
+            )
             hidden_states = MTPLossAutoScaler.apply(
                 hidden_states, mtp_loss_scale * token_loss / num_tokens
             )

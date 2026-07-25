@@ -15,9 +15,17 @@ import torch
 import torch.distributed as dist
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
+from megatron.lite.runtime.contracts.data import (
+    ForwardResult,
+    ModelOutputs,
+    PackedBatch,
+)
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from megatron.lite.runtime.contracts.loss import get_loss_context, split_loss_context, use_loss_context
+from megatron.lite.runtime.contracts.loss import (
+    get_loss_context,
+    split_loss_context,
+    use_loss_context,
+)
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
@@ -25,20 +33,28 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     init_fields = {f.name for f in dc_fields(proto.ImplConfig) if f.init}
     # Only forward impl_cfg keys this model's ImplConfig declares: the connector
     # may pass knobs (e.g. cross_entropy_fusion) that some models don't model.
-    impl_cfg_kwargs = {key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields}
+    impl_cfg_kwargs = {
+        key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields
+    }
     impl_cfg_kwargs["parallel"] = rt_cfg.parallel
     if (
         "attention_backend_override" in init_fields
         and impl_cfg_kwargs.get("attention_backend_override") is None
     ):
-        impl_cfg_kwargs["attention_backend_override"] = rt_cfg.attention_backend_override
+        impl_cfg_kwargs["attention_backend_override"] = (
+            rt_cfg.attention_backend_override
+        )
     if (
         "router_aux_loss_coef" in init_fields
         and impl_cfg_kwargs.get("router_aux_loss_coef") is None
         and rt_cfg.router_aux_loss_coef is not None
     ):
         impl_cfg_kwargs["router_aux_loss_coef"] = rt_cfg.router_aux_loss_coef
-    if "hf_path" in init_fields and impl_cfg_kwargs.get("hf_path") in (None, "") and rt_cfg.hf_path:
+    if (
+        "hf_path" in init_fields
+        and impl_cfg_kwargs.get("hf_path") in (None, "")
+        and rt_cfg.hf_path
+    ):
         impl_cfg_kwargs["hf_path"] = rt_cfg.hf_path
     # Thread the user-level OptimizerConfig so the protocol can pass it to
     # optimizer primitives without reading runtime internals.
@@ -74,9 +90,13 @@ def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
     os.environ["NVTE_UNFUSED_ATTN"] = unfused
 
 
-def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tuple[int, int, int]:
+def _infer_pipeline_tensor_shape(
+    batch: PackedBatch, model_cfg: Any, ps
+) -> tuple[int, int, int]:
     if model_cfg is None or not hasattr(model_cfg, "hidden_size"):
-        raise ValueError("Megatron Lite pipeline runtime requires model_cfg.hidden_size.")
+        raise ValueError(
+            "Megatron Lite pipeline runtime requires model_cfg.hidden_size."
+        )
     if not isinstance(batch, PackedBatch):
         raise TypeError("Megatron Lite pipeline runtime requires PackedBatch inputs.")
 
@@ -88,7 +108,9 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
         batch_size = int(input_ids.size(0))
         local_seq_len = int(input_ids.size(1))
     else:
-        raise ValueError(f"Unsupported input_ids rank for pipeline runtime: {input_ids.dim()}.")
+        raise ValueError(
+            f"Unsupported input_ids rank for pipeline runtime: {input_ids.dim()}."
+        )
 
     if local_seq_len < 1:
         raise ValueError("Pipeline tensor shape requires non-empty sequence.")
@@ -102,7 +124,11 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
     # (each sequence padded to align = tp * (2*cp if cp>1 else 1)) then divide by CP*TP.
     seq_lens = getattr(batch, "seq_lens", None)
     if seq_lens is not None and cp_size * tp_size > 1:
-        sl = seq_lens if isinstance(seq_lens, torch.Tensor) else torch.as_tensor(seq_lens)
+        sl = (
+            seq_lens
+            if isinstance(seq_lens, torch.Tensor)
+            else torch.as_tensor(seq_lens)
+        )
         sl = sl.to(torch.int64).reshape(-1)
         align = tp_size * (2 * cp_size if cp_size > 1 else 1)
         padded = sl + (align - sl % align) % align
@@ -217,9 +243,15 @@ class MegatronLiteRuntime(RuntimeBase):
 
         # ── load HF weights (optional) ──
         loaded_hf_weights = False
-        if rt_cfg.load_hf_weights and rt_cfg.hf_path and hasattr(proto, "load_hf_weights"):
+        if (
+            rt_cfg.load_hf_weights
+            and rt_cfg.hf_path
+            and hasattr(proto, "load_hf_weights")
+        ):
             for chunk in bundle.chunks:
-                proto.load_hf_weights(chunk, rt_cfg.hf_path, model_cfg, bundle.parallel_state)
+                proto.load_hf_weights(
+                    chunk, rt_cfg.hf_path, model_cfg, bundle.parallel_state
+                )
             loaded_hf_weights = True
 
         post_load_hook = bundle.extras.pop("post_model_load_hook", None)
@@ -235,7 +267,9 @@ class MegatronLiteRuntime(RuntimeBase):
                 extra_updates = post_load_updates.get("extras")
                 if extra_updates:
                     if not isinstance(extra_updates, dict):
-                        raise TypeError("post_model_load_hook extras update must be a dict.")
+                        raise TypeError(
+                            "post_model_load_hook extras update must be a dict."
+                        )
                     bundle.extras.update(extra_updates)
 
         if loaded_hf_weights and bundle.optimizer is not None:
@@ -244,7 +278,9 @@ class MegatronLiteRuntime(RuntimeBase):
                 reload_model_params()
 
         if bundle.forward_step is None:
-            raise ValueError("Megatron Lite model bundles must provide a typed forward_step.")
+            raise ValueError(
+                "Megatron Lite model bundles must provide a typed forward_step."
+            )
 
         p = rt_cfg.parallel
         model = bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks
@@ -268,7 +304,10 @@ class MegatronLiteRuntime(RuntimeBase):
 
     def _load_protocol(self, rt_cfg: MegatronLiteConfig):
         """Load and return the model protocol module."""
-        from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES, resolve_runtime_model_name
+        from megatron.lite.model.registry import (
+            TRAIN_RUNTIME_MODULES,
+            resolve_runtime_model_name,
+        )
 
         try:
             runtime_key = resolve_runtime_model_name(rt_cfg.model_name, rt_cfg.impl)
@@ -288,7 +327,9 @@ class MegatronLiteRuntime(RuntimeBase):
 
         for fn_name in ("build_model_config", "build_model"):
             if not callable(getattr(proto, fn_name, None)):
-                raise ValueError(f"Protocol module {mod_path} missing required function: {fn_name}")
+                raise ValueError(
+                    f"Protocol module {mod_path} missing required function: {fn_name}"
+                )
         if not hasattr(proto, "ImplConfig"):
             raise ValueError(f"Protocol module {mod_path} missing ImplConfig class")
 
@@ -351,7 +392,9 @@ class MegatronLiteRuntime(RuntimeBase):
             **kwargs,
         )
 
-    def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
+    def export_weights(
+        self, handle: ModelHandle, **kwargs
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         model_chunks = handle._extras.get("model_chunks", [handle._model])
         proto = handle._extras.get("protocol")
         model_cfg = handle._extras.get("model_cfg")
@@ -447,7 +490,9 @@ class MegatronLiteRuntime(RuntimeBase):
         router_replay: Any = None,
     ) -> ForwardResult:
         from megatron.lite.primitive.train_step import run_microbatch_loop
-        from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+        from megatron.lite.runtime.backends.mlite.router_replay import (
+            RouterReplayDriver,
+        )
 
         forward_step = handle._extras["forward_step"]
         if num_microbatches < 1:
@@ -466,11 +511,66 @@ class MegatronLiteRuntime(RuntimeBase):
             forward_step = replay_driver.wrap(forward_step)
 
         ps = handle._parallel_state
-        if ps.pp_size > 1:
+        combined_plan_factory = handle._extras.get("combined_1f1b_plan")
+        combined_outputs = None
+        if combined_plan_factory is not None and not forward_only:
+            if replay_driver is not None:
+                replay_driver.end()
+                raise ValueError("combined-1F1B does not yet support router replay")
+            from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
+            from megatron.lite.primitive.parallel.combined_1f1b import (
+                Combined1F1BConfig,
+                run_combined_1f1b,
+            )
+
+            Combined1F1BConfig(
+                num_microbatches=num_microbatches,
+                ep_size=ps.ep_size,
+                pp_size=ps.pp_size,
+                use_deepep=False,
+                recompute=handle._extras.get("combined_1f1b_recompute", ()),
+                moe_permute_fusion=(
+                    os.environ.get("MEGATRON_LITE_MOE_PERMUTE_FUSION", "0") == "1"
+                ),
+            ).validate()
+            model = unwrap_model(handle._model)
+            plans = []
+            pre_forward_hook = handle._extras.get("pre_forward_hook")
+            for _ in range(num_microbatches):
+                batch, loss_context = split_loss_context(next(data_iter))
+                if pre_forward_hook is not None:
+                    pre_forward_hook(
+                        torch.tensor(1.0 / num_microbatches, device="cuda")
+                    )
+                plans.append(
+                    combined_plan_factory(
+                        model,
+                        batch,
+                        num_microbatches=num_microbatches,
+                        loss_fn=loss_fn,
+                        loss_context=loss_context,
+                    )
+                )
+
+            def _enable_last_grad_sync():
+                if handle._optimizer is not None:
+                    handle._optimizer.grad_sync_enabled = True
+
+            try:
+                combined_outputs = run_combined_1f1b(
+                    plans, before_last_backward=_enable_last_grad_sync
+                )
+            finally:
+                if replay_driver is not None:
+                    replay_driver.end()
+            out = combined_outputs[-1]
+        elif ps.pp_size > 1:
             from types import SimpleNamespace
 
             from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
-            from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
+            from megatron.lite.primitive.parallel.pipeline import (
+                forward_backward_pipelining,
+            )
 
             first_item = next(data_iter)
             first_batch, _loss_context = split_loss_context(first_item)
@@ -484,7 +584,9 @@ class MegatronLiteRuntime(RuntimeBase):
 
             model_chunks = handle._extras.get("model_chunks", [handle._model])
             pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
-            pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
+            pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(
+                forward_step, loss_fn
+            )
             try:
                 outputs = forward_backward_pipelining(
                     pipeline_forward_step,
@@ -512,7 +614,9 @@ class MegatronLiteRuntime(RuntimeBase):
                 dtype=torch.float32,
             )
             if ps.pp_group is not None and ps.pp_global_ranks is not None:
-                dist.broadcast(loss_payload, src=ps.pp_global_ranks[-1], group=ps.pp_group)
+                dist.broadcast(
+                    loss_payload, src=ps.pp_global_ranks[-1], group=ps.pp_group
+                )
             out = {"loss": loss_payload[1]} if bool(loss_payload[0].item()) else {}
         else:
             try:
@@ -538,8 +642,16 @@ class MegatronLiteRuntime(RuntimeBase):
 
         loss_tensor = out.get("loss") if out else None
         metric_rows = out.get("_loss_fn_metrics", []) if out else []
+        if isinstance(metric_rows, dict):
+            metric_rows = [metric_rows]
         if ps.pp_size > 1:
             metric_rows += [item["metrics"] for item in outputs if item.get("metrics")]
+        if combined_outputs is not None:
+            metric_rows = [
+                item["_loss_fn_metrics"]
+                for item in combined_outputs
+                if item.get("_loss_fn_metrics")
+            ]
         metrics: dict = {}
         for row in metric_rows:
             for key, value in row.items():
@@ -628,7 +740,10 @@ def _checkpoint_model(handle: ModelHandle, *, use_dcp: bool):
 
 
 def _checkpoint_hooks(handle: ModelHandle):
-    from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
+    from megatron.lite.primitive.protocols import (
+        default_expert_classifier,
+        default_placement_fn,
+    )
 
     proto = handle._extras.get("protocol")
     return (

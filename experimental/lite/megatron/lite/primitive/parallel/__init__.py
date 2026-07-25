@@ -3,6 +3,15 @@
 
 from __future__ import annotations
 
+from megatron.lite.primitive.parallel.combined_1f1b import (
+    Combined1F1BConfig,
+    Combined1F1BLayerPlan,
+    Combined1F1BModelPlan,
+    Combined1F1BNode,
+    Combined1F1BPlan,
+    build_combined_1f1b_trace,
+    run_combined_1f1b,
+)
 from megatron.lite.primitive.parallel.cp import (
     contiguous_to_zigzag_chunks,
     split_packed_for_cp,
@@ -58,6 +67,11 @@ def __getattr__(name: str):
 
 __all__ = [
     "ColumnParallelLinear",
+    "Combined1F1BConfig",
+    "Combined1F1BLayerPlan",
+    "Combined1F1BModelPlan",
+    "Combined1F1BNode",
+    "Combined1F1BPlan",
     "contiguous_to_zigzag_chunks",
     "PackedSeqParams",
     "PackedTHDBatch",
@@ -68,6 +82,7 @@ __all__ = [
     "VocabParallelEmbedding",
     "VocabParallelOutput",
     "all_gather_last_dim_with_grad_reduce",
+    "build_combined_1f1b_trace",
     "build_pipeline_chunk_layout",
     "forward_backward_pipelining",
     "gather_for_non_sp_head",
@@ -81,6 +96,7 @@ __all__ = [
     "prepare_packed_thd_kwargs_for_context_parallel",
     "reconstruct_packed_from_cp_parts",
     "roll_packed_thd_left",
+    "run_combined_1f1b",
     "scatter_to_sequence_parallel",
     "split_packed_to_cp_local",
     "split_packed_for_cp",
