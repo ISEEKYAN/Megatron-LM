@@ -299,6 +299,7 @@ def allgather_concat(
     return torch.cat(gathered, dim=dim)
 
 
+@torch.no_grad()
 def bucketed_all_gather_into_tensor(
     bucket: list[tuple[str, torch.Tensor]],
     *,

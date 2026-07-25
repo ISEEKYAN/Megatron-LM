@@ -215,6 +215,28 @@ def test_bucketed_all_gather_uses_bounded_flat_buffers(monkeypatch) -> None:
     assert torch.equal(gathered[1][2][1], bucket[1][1] + 100)
 
 
+def test_bucketed_all_gather_disables_autograd(monkeypatch) -> None:
+    bucket = [("weight", torch.nn.Parameter(torch.arange(4, dtype=torch.float32)))]
+
+    def fake_all_gather_into_tensor(output, tensor, group=None):
+        assert torch.is_grad_enabled() is False
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor)
+
+    with torch.enable_grad():
+        gathered = bucketed_all_gather_into_tensor(
+            bucket,
+            group="tp",
+            group_size=2,
+            buffer_max_size_bytes=64,
+        )
+
+    assert torch.equal(gathered[0][2][0], bucket[0][1])
+    assert torch.equal(gathered[0][2][1], bucket[0][1])
+
+
 def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
     class Shard:
         def __init__(self, dim: int) -> None:
