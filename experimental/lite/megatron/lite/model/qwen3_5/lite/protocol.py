@@ -24,6 +24,8 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import export_hf_weights as _ex
 from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.modules.lora import LoraSpec, apply_olora_tail_init, normalize_lora_spec
+from megatron.lite.primitive.modules.lora_apply import apply_lora_to_chunks
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.quantization import (
     QATSpec,
@@ -78,6 +80,7 @@ class ImplConfig:
     # all heads, best memory; bf16-floor vs CP-off, faithful packing-aware mirror of
     # upstream Megatron linear_cp_mode='chunkwise').
     gdn_cp_mode: str = "headwise"
+    lora: LoraSpec | dict | None = None
     qat: QATSpec | dict | None = None
 
 
@@ -168,6 +171,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
 
     p = impl_cfg.parallel
+    lora_spec = normalize_lora_spec(impl_cfg.lora)
 
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
@@ -244,8 +248,16 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         for chunk in chunks:
             apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
 
-    # Parametrize before optimizer construction so it captures the BF16 master.
+    # Parametrize the base weight first, then install the LoRA wrapper outside it.
+    # Both transformations must precede optimizer/DDP construction.
     apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
+    lora_stats = apply_lora_to_chunks(chunks, lora_spec, ps=ps)
+
+    olora_hook = None
+    if lora_spec.enabled and lora_spec.init == "olora_tail":
+        def olora_hook():
+            for chunk in chunks:
+                apply_olora_tail_init(chunk)
 
     optimizer = None
     finalize_grads = None
@@ -268,6 +280,8 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
             from megatron.lite.model.qwen3_5.lite.model import Qwen35Layer
             from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
+            if olora_hook is not None:
+                olora_hook()
             return {
                 "optimizer": build_fsdp2_training_optimizer(
                     chunks,
@@ -296,6 +310,9 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
             "pre_forward_hook": _make_aux_loss_hook(),
+            "lora_spec": lora_spec,
+            "lora_stats": lora_stats,
+            "olora_hook": olora_hook,
         },
     )
 

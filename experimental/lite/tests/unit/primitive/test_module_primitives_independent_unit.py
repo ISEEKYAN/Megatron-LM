@@ -8,11 +8,11 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.primitive.modules.lora import (
-    GroupedLinearLoRA,
     LinearLoRA,
     SharedGroupedLinearLoRA,
     freeze_non_lora_params,
-    normalize_lora_config,
+    lora_scaling,
+    normalize_lora_spec,
     trainable_param_stats,
 )
 
@@ -20,16 +20,16 @@ pytestmark = pytest.mark.mlite
 
 
 def test_lora_config_aliases_and_trainable_param_accounting():
-    cfg = normalize_lora_config({"enabled": True, "rank": 2, "alpha": 6, "targets": ["qkv", "fc2"]})
+    cfg = normalize_lora_spec({"enabled": True, "rank": 2, "alpha": 6, "targets": ["qkv", "fc2"]})
 
     assert cfg.enabled
     assert cfg.scale == 3.0
     assert cfg.targets() == {"linear_qkv", "linear_fc2"}
     assert cfg.targets_module("qkv")
     assert cfg.targets_module("linear_fc2")
-    assert not normalize_lora_config({"enabled": False, "rank": 8}).enabled
-    with pytest.raises(TypeError, match="LoRA config"):
-        normalize_lora_config(object())
+    assert not normalize_lora_spec({"enabled": False, "rank": 8}).enabled
+    with pytest.raises(TypeError, match="LoRA spec"):
+        normalize_lora_spec(object())
 
     class TinyAdapterModel(nn.Module):
         def __init__(self):
@@ -64,18 +64,12 @@ def test_linear_lora_forward_backward_matches_low_rank_delta():
     torch.testing.assert_close(x.grad, torch.tensor([[8.0, 12.0, 0.0]]))
 
 
-def test_grouped_lora_respects_per_expert_splits():
-    layer = GroupedLinearLoRA(2, 2, 2, rank=1, alpha=1, dropout=0.0)
-    with torch.no_grad():
-        layer.lora_a.copy_(torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]]))
-        layer.lora_b.copy_(torch.tensor([[[2.0], [3.0]], [[5.0], [7.0]]]))
+def test_lora_scaling_rslora():
+    assert lora_scaling(4, 8, use_rslora=False) == 2.0
+    assert lora_scaling(4, 8, use_rslora=True) == 4.0
 
-    x = torch.tensor([[2.0, 9.0], [4.0, 1.0], [6.0, 3.0]])
-    output = layer(x, [1, 2])
-
-    torch.testing.assert_close(output, torch.tensor([[4.0, 6.0], [5.0, 7.0], [15.0, 21.0]]))
-    with pytest.raises(ValueError, match="expected 2 splits"):
-        layer(x, [3])
+    layer = LinearLoRA(3, 2, rank=4, alpha=8, dropout=0.0, use_rslora=True)
+    assert layer.scale == 4.0
 
 
 def test_shared_grouped_lora_uses_one_adapter_for_all_experts():
