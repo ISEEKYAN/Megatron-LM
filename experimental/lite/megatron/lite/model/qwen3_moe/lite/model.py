@@ -104,9 +104,9 @@ class MoELayer(nn.Module):
             scores, indices = self.router(x)
             return self.dispatcher.alltoall_dispatch_preprocess(x, scores, indices)
 
-        def communicate(permuted, permuted_probs):
+        def communicate(permuted, permuted_probs, tokens_per_expert):
             return self.dispatcher.alltoall_dispatch_communicate(
-                permuted, permuted_probs
+                permuted, permuted_probs, tokens_per_expert
             )
 
         def experts(dispatched, tokens_per_expert, permuted_probs):

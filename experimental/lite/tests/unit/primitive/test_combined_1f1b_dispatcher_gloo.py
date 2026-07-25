@@ -91,11 +91,13 @@ def _dispatcher_worker(rank, world_size, port, results):
         split = TokenDispatcher(
             num_experts=4, hidden_size=2, ps=ps, use_deepep=False
         )
-        permuted, permuted_probs = split.alltoall_dispatch_preprocess(
-            split_hidden, split_scores, indices_by_rank[rank]
+        permuted, permuted_probs, tokens_per_expert = (
+            split.alltoall_dispatch_preprocess(
+                split_hidden, split_scores, indices_by_rank[rank]
+            )
         )
         dispatched, split_tpe, split_probs = split.alltoall_dispatch_communicate(
-            permuted, permuted_probs
+            permuted, permuted_probs, tokens_per_expert
         )
         split_output = split.alltoall_combine_communicate(
             dispatched * split_probs.unsqueeze(-1)

@@ -350,10 +350,12 @@ class TokenDispatcher:
         return result
 
     def _dispatch_alltoall(self, hidden_states, topk_scores, topk_indices):
-        permuted, permuted_probs = self.alltoall_dispatch_preprocess(
+        permuted, permuted_probs, tokens_per_expert = self.alltoall_dispatch_preprocess(
             hidden_states, topk_scores, topk_indices
         )
-        return self.alltoall_dispatch_communicate(permuted, permuted_probs)
+        return self.alltoall_dispatch_communicate(
+            permuted, permuted_probs, tokens_per_expert
+        )
 
     def alltoall_dispatch_preprocess(self, hidden_states, topk_scores, topk_indices):
         """Prepare deterministic all-to-all metadata without issuing token exchange.
@@ -396,16 +398,24 @@ class TokenDispatcher:
         self._restore_shape = hidden_states.shape
 
         tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
-        tpe_by_rank = tokens_per_expert.view(self.ep_size, self.num_local_experts).sum(
-            dim=1
-        )
+        return permuted, permuted_probs, tokens_per_expert
+
+    def alltoall_dispatch_communicate(
+        self, permuted, permuted_probs, tokens_per_expert
+    ):
+        """Exchange layout metadata and prepared token/probability buffers."""
+        tpe_by_rank = tokens_per_expert.view(
+            self.ep_size, self.num_local_experts
+        ).sum(dim=1)
         self._input_splits = tpe_by_rank.tolist()
 
-        global_tpe_flat = tokens_per_expert.new_empty(self.ep_size * e)
+        global_tpe_flat = tokens_per_expert.new_empty(
+            self.ep_size * self.num_experts
+        )
         dist.all_gather_into_tensor(
             global_tpe_flat, tokens_per_expert, group=self.ps.ep_group
         )
-        global_tpe_2d = global_tpe_flat.view(self.ep_size, e)
+        global_tpe_2d = global_tpe_flat.view(self.ep_size, self.num_experts)
         ep_rank = dist.get_rank(group=self.ps.ep_group)
         my_start = ep_rank * self.num_local_experts
         recv_tpe_2d = global_tpe_2d[
@@ -413,10 +423,6 @@ class TokenDispatcher:
         ].contiguous()
         self._output_splits = recv_tpe_2d.sum(dim=1).tolist()
         self._recv_tpe_2d = recv_tpe_2d
-        return permuted, permuted_probs
-
-    def alltoall_dispatch_communicate(self, permuted, permuted_probs):
-        """Exchange prepared token/probability buffers on the caller's stream."""
         if (
             self._input_splits is None
             or self._output_splits is None
