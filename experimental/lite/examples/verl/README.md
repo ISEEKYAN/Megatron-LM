@@ -162,6 +162,39 @@ so the MLite actor is wired up correctly without any extra worker-path knob.
 By default, GSM8K GRPO artifacts are written under
 `experimental/lite/examples/verl/outputs/qwen35_gsm8k_grpo`.
 
+### FP4 QAT rollout resync
+
+The MLite engine can pass its BF16 HF-format weight stream through verl's
+online QAT exporter before vLLM resync. Keep the rollout quantization config
+fixed between the QAT-off and QAT-on arms; only the training-side
+`impl_cfg.qat.enabled` value should change.
+
+```yaml
+actor_rollout_ref:
+  actor:
+    engine:
+      qat:
+        enable: true
+        apply_modelopt_fake_quant: false
+        mode: mxfp4
+        group_size: 32
+        ignore_patterns:
+          - lm_head
+          - embed_tokens
+          - "re:.*mlp.gate$"
+      impl_cfg:
+        qat:
+          enabled: true
+          format: mxfp4
+          group_size: 32
+```
+
+`apply_modelopt_fake_quant: false` is required because MLite supplies the
+training fake quantization. The verl exporter still quantizes every BF16
+resync online. Use a compressed-tensors `mxfp4-pack-quantized` rollout config
+for MXFP4, or `nvfp4-pack-quantized` for NVFP4. Do not combine `engine.qat`
+with MLite's model-owned `resync_format`; that would quantize the stream twice.
+
 ## Smoke / Dry-Run Checks
 
 Checked on this branch on 2026-06-07. These checks cover shell syntax,

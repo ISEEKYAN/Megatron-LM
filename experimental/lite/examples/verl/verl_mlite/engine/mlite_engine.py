@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import os
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -389,7 +390,13 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
-        return self.runtime.export_weights(self.handle, **export_kwargs), None
+        weights = self.runtime.export_weights(self.handle, **export_kwargs)
+        if self.engine_config.qat.get("enable", False):
+            from verl.utils.modelopt import export_qat_weights
+
+            qat_config = SimpleNamespace(**self.engine_config.qat)
+            weights = export_qat_weights(weights, [self.module], qat_config, bridge=None)
+        return weights, None
 
     def get_data_parallel_size(self):
         if self.handle is None:
