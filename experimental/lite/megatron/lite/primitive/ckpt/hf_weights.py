@@ -1391,6 +1391,206 @@ def _merged_param_tensor(tensor: torch.Tensor, resolver) -> torch.Tensor:
     return base + delta.to(dtype=base.dtype, device=base.device)
 
 
+# vLLM's PEFT adapter namespace. ``parse_fine_tuned_lora_name``
+# (``vllm/lora/utils.py:127-168``) strips this prefix and requires the
+# ``.lora_A.weight`` / ``.lora_B.weight`` suffixes.
+VLLM_LORA_NAME_PREFIX = "base_model.model."
+
+
+def vllm_applied_lora_scaling(
+    rank: int, alpha: int | None, *, use_rslora: bool, packed_moe: bool
+) -> float:
+    """Scaling vLLM will itself apply to the factors we export.
+
+    Two consumer code paths, hence two formulas:
+
+    * non-MoE surfaces honour ``PEFTHelper.vllm_lora_scaling_factor``
+      (``vllm/lora/peft_helper.py:53-58``), which mirrors :func:`lora_scaling`
+      including the rsLoRA branch;
+    * FusedMoE surfaces are packed by ``PackedLoRALayerWeights.pack_moe``
+      (``vllm/lora/lora_weights.py:199-206``), which builds the packed weights
+      *without* a ``scaling=`` argument and therefore falls back to the
+      ``alpha / rank`` default (``lora_weights.py:121-124``). rsLoRA is dropped
+      on that path regardless of what ``peft_config`` declares.
+
+    Callers divide the training-side scale by this value to obtain the
+    compensation folded into ``lora_B``, so a consumer-side change shows up as a
+    changed formula here rather than as a stale hand-tuned constant.
+    """
+    resolved_alpha = float(rank if alpha is None else alpha)
+    if packed_moe:
+        return resolved_alpha / float(rank)
+    return resolved_alpha / (float(rank) ** 0.5 if use_rslora else float(rank))
+
+
+def _lora_adapter_surfaces(base_chunk: nn.Module) -> list[tuple[str, Any, bool]]:
+    """Return ``(canonical_weight_name, adapter, is_grouped)`` per LoRA surface.
+
+    ``canonical_weight_name`` is the wrapper-transparent native name of the base
+    weight the adapter targets, i.e. exactly the key ``HFWeights.native_to_hf``
+    understands. Grouped (MoE expert) surfaces are reported once; the adapter is
+    shared by every expert (:class:`SharedGroupedLinearLoRA`), so the caller
+    replays it across the model-declared expert range.
+    """
+    from megatron.lite.primitive.modules.lora_apply import (
+        LoRAWrappedGroupedLinear,
+        LoRAWrappedLinear,
+    )
+
+    surfaces: list[tuple[str, Any, bool]] = []
+    for module_name, module in base_chunk.named_modules():
+        if not isinstance(module, (LoRAWrappedLinear, LoRAWrappedGroupedLinear)):
+            continue
+        prefix = f"{module_name}." if module_name else ""
+        base_params = list(module.base.named_parameters())
+
+        if isinstance(module, LoRAWrappedLinear):
+            owner = getattr(module.base, "linear", module.base)
+            weight = getattr(owner, "weight", None)
+            for relative_name, param in base_params:
+                if param is weight:
+                    surfaces.append((f"{prefix}{relative_name}", module.adapter, False))
+                    break
+            continue
+
+        for relative_name, _ in base_params:
+            if re.fullmatch(r"weight(\d+)", relative_name) is None:
+                continue
+            surfaces.append((f"{prefix}{relative_name}", module.adapter, True))
+            break
+    return surfaces
+
+
+def _gather_lora_factors_across_tp(
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    native_name: str,
+    spec: HFWeights,
+    ps,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Undo the TP sharding that the merged path leaves in place.
+
+    ``materialized_lora_factors`` gathers only the adapter-internal partitions
+    (rank / output). The remaining sharding follows the *base weight*: a column
+    parallel weight (``split_dim == 0``) leaves ``lora_B`` split on its output
+    rows, and a row parallel weight (``split_dim == 1``) leaves ``lora_A`` split
+    on its input columns. Merged export never notices, because the sharded
+    product lines up with the sharded base weight and the caller gathers
+    afterwards. Adapter-only export ships the factors themselves, so the gather
+    has to happen here -- otherwise vLLM receives undersized tensors and its
+    ``[:, :shape1, :shape2].copy_()`` slice assignment fills only part of the
+    buffer, silently.
+    """
+    tp_info = spec.tp_spec(native_name)
+    if tp_info is None:
+        return lora_a, lora_b
+    split_dim, tp_or_etp = tp_info
+    world_size = ps.etp_size if tp_or_etp else ps.tp_size
+    group = ps.etp_group if tp_or_etp else ps.tp_group
+    if world_size <= 1:
+        return lora_a, lora_b
+
+    if split_dim == 0:
+        lora_b = allgather_concat(lora_b, world_size, group, dim=0)
+    elif split_dim == 1:
+        lora_a = allgather_concat(lora_a, world_size, group, dim=1)
+    else:
+        raise ValueError(
+            f"Unsupported TP split dim {split_dim} for LoRA surface {native_name!r}."
+        )
+    return lora_a, lora_b
+
+
+def export_hf_lora_adapter(
+    model: nn.Module | list[nn.Module],
+    spec: HFWeights,
+    ps,
+    *,
+    export_dtype: str | torch.dtype | None = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Export LoRA factors as vLLM/PEFT-named ``(name, tensor)`` pairs.
+
+    This is the adapter-only counterpart of :func:`export_hf_weights`. The base
+    weights are unchanged by LoRA training and are synced once, so steady-state
+    rollout refresh only needs these factors.
+
+    Fused native surfaces (``linear_qkv``, expert ``linear_fc1``) map to several
+    HF modules. Because the wrapper shares one ``lora_A`` and splits only the
+    output rows of ``lora_B``, slicing ``lora_B`` with the *same* rule the spec
+    uses for the base weight yields per-target adapters that are exactly
+    equivalent to the fused one -- so we reuse ``spec.native_to_hf`` itself as
+    the splitter instead of duplicating the packing convention here.
+
+    ``lora_B`` carries the compensation ``train_scale / vllm_scale`` so the
+    product of our factors and vLLM's own scaling reproduces the training-time
+    delta on every surface (see :func:`vllm_applied_lora_scaling`).
+    """
+    if isinstance(model, nn.ModuleList):
+        chunks: list[nn.Module] = list(model)
+    elif isinstance(model, list):
+        chunks = model
+    else:
+        chunks = [model]
+
+    resolved_export_dtype = _resolve_export_dtype(export_dtype)
+    num_experts = int(getattr(spec, "num_experts", 0) or 0)
+
+    def _cast(tensor: torch.Tensor) -> torch.Tensor:
+        materialized = _materialize_dtensor(tensor).detach()
+        if resolved_export_dtype is not None:
+            materialized = materialized.to(dtype=resolved_export_dtype)
+        return materialized.contiguous()
+
+    for chunk in chunks:
+        base_chunk = unwrap_model(chunk)
+        layer_map = (
+            {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
+            if hasattr(base_chunk, "layer_indices")
+            else {}
+        )
+        for canonical_name, adapter, is_grouped in _lora_adapter_surfaces(base_chunk):
+            lora_a, lora_b = adapter.materialized_lora_factors()
+            train_scale = float(adapter.scale)
+            consumer_scale = vllm_applied_lora_scaling(
+                int(adapter.rank),
+                getattr(adapter, "alpha", None),
+                use_rslora=bool(getattr(adapter, "use_rslora", False)),
+                packed_moe=is_grouped,
+            )
+            if consumer_scale == 0.0:
+                raise ValueError(
+                    f"vLLM-side LoRA scaling resolved to 0 for {canonical_name!r}; "
+                    "refusing to export an adapter whose scale cannot be compensated."
+                )
+            lora_a = _cast(lora_a)
+            lora_b = _cast(lora_b).mul(train_scale / consumer_scale)
+
+            global_name = to_global_layer_name(canonical_name, layer_map)
+            lora_a, lora_b = _gather_lora_factors_across_tp(
+                lora_a, lora_b, global_name, spec, ps
+            )
+            expert_range = range(num_experts) if is_grouped else range(1)
+            for expert_idx in expert_range:
+                native_name = (
+                    set_expert_idx(global_name, expert_idx) if is_grouped else global_name
+                )
+                for hf_name, lora_b_piece in spec.native_to_hf(native_name, lora_b):
+                    if not hf_name.endswith(".weight"):
+                        raise ValueError(
+                            f"LoRA surface {native_name!r} mapped to non-weight HF name "
+                            f"{hf_name!r}; adapter export needs a weight surface."
+                        )
+                    hf_module = hf_name[: -len(".weight")]
+                    yield (
+                        f"{VLLM_LORA_NAME_PREFIX}{hf_module}.lora_A.weight",
+                        lora_a,
+                    )
+                    yield (
+                        f"{VLLM_LORA_NAME_PREFIX}{hf_module}.lora_B.weight",
+                        lora_b_piece.contiguous(),
+                    )
+
+
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,
