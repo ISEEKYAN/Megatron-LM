@@ -40,6 +40,7 @@ class RouterReplayDriver:
         self._ps = None
         self._pp_offset = 0
         self._pp_total = 0
+        self._emitted_evidence = False
 
     def _replay_roots(self):
         selector = (
@@ -66,7 +67,9 @@ class RouterReplayDriver:
             attach_router_replay(root, reset=False) for root in self._replay_roots()
         )
         if self._num_routers == 0:
-            raise RuntimeError("router replay requested but the model has no MoE routers.")
+            raise RuntimeError(
+                "router replay requested but the model has no MoE routers."
+            )
         self._ps = parallel_state_from_model(self._chunks[-1])
         self._compute_pp_layout()
         if self.action == "record":
@@ -77,7 +80,9 @@ class RouterReplayDriver:
         if ps is None or ps.pp_size <= 1:
             self._pp_total = self._num_routers
             return
-        counts = [torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(ps.pp_size)]
+        counts = [
+            torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(ps.pp_size)
+        ]
         dist.all_gather(
             counts,
             torch.tensor([self._num_routers], dtype=torch.long, device="cuda"),
@@ -106,18 +111,26 @@ class RouterReplayDriver:
                 raise ValueError("R3 router replay requires batch.routed_experts.")
             routed = self._select_local_layers(routed)
             pack_routes = _protocol_fn(
-                self._protocol, "pack_routed_experts", protocol_utils.pack_routed_experts
+                self._protocol,
+                "pack_routed_experts",
+                protocol_utils.pack_routed_experts,
             )
             pack_mask = _protocol_fn(
-                self._protocol, "pack_r3_replay_mask", protocol_utils.pack_r3_replay_mask
+                self._protocol,
+                "pack_r3_replay_mask",
+                protocol_utils.pack_r3_replay_mask,
             )
             targets = pack_routes(model, batch, routed)
             replay_mask = pack_mask(model, batch)
             RouterReplay.set_replay_data(targets, replay_mask=replay_mask)
-            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+            RouterReplay.set_global_router_replay_action(
+                RouterReplayAction.REPLAY_FORWARD
+            )
+            RouterReplay.reset_replay_stats()
             try:
                 return forward_step(model, batch)
             finally:
+                self._emit_replay_evidence()
                 # Pipeline schedules may recompute checkpointed router forwards
                 # after one or more newer micro-batches have run.  Those calls
                 # must consume the saved per-microbatch FIFO, not the latest
@@ -127,6 +140,49 @@ class RouterReplayDriver:
                 )
 
         return stepped
+
+    def _emit_replay_evidence(self) -> None:
+        """Emit direct, machine-greppable proof that replay substituted routing.
+
+        Why this exists: ``batch.routed_experts is not None`` only proves the
+        rollout's routes *arrived*. It does not prove any routing decision was
+        overridden -- a build where the replay hook silently no-ops produces an
+        identical log. The only direct evidence is a count of substituted rows.
+
+        Liveness (this is the whole point): if replay ran but touched zero rows,
+        that is a fault and it says so. A probe that is silent when it is not
+        working teaches you to trust silence.
+        """
+        stats = RouterReplay.replay_stats()
+        if stats["calls"] == 0:
+            raise RuntimeError(
+                "R3_REPLAY_VOID: router replay forward completed without a single "
+                "select_indices call -- the RouterReplay hooks are not attached to "
+                "any router that actually ran. Replay is not happening."
+            )
+        if stats["rows"] == 0:
+            raise RuntimeError(
+                f"R3_REPLAY_VOID: replay ran ({stats['calls']} calls) but saw zero "
+                "routing rows. Replay is not happening."
+            )
+        frac = stats["changed"] / stats["rows"]
+        if not self._emitted_evidence:
+            self._emitted_evidence = True
+            print(
+                f"R3_REPLAY_EVIDENCE calls={stats['calls']} rows={stats['rows']} "
+                f"changed={stats['changed']} changed_frac={frac:.6f} "
+                f"routers={self._num_routers}",
+                flush=True,
+            )
+            if stats["changed"] == 0:
+                # Not fatal -- at step 0 the actor and the rollout share weights, so
+                # every replayed route can legitimately equal the live one. It is
+                # fatal-looking later, so make it loud rather than swallowing it.
+                print(
+                    "R3_REPLAY_WARN changed=0 on the first replayed step; this is "
+                    "expected only while actor and rollout weights are identical.",
+                    flush=True,
+                )
 
     def _select_local_layers(self, routed):
         ps = self._ps
