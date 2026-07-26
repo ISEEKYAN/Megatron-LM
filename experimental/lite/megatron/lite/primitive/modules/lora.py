@@ -47,12 +47,26 @@ class LoraSpec:
     target_modules: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_TARGET_MODULES)
     use_rslora: bool = False
     init: str = "default"
-    # How the rollout engine receives the adapter. ``adapter`` ships the LoRA
-    # factors and lets the inference engine apply them; ``merge`` folds the
-    # delta into the base weight in the rollout dtype, which silently rounds
-    # away sub-ulp updates and is kept only for inits whose base carries a
-    # residual (OLoRA/PiSSA).
-    rollout_sync: str = "adapter"
+    # How the rollout engine receives the adapter.
+    #
+    # ``merge`` folds the delta into the base weight in the rollout dtype. That
+    # silently rounds away sub-ulp updates (36% of adapted elements at lr=1e-5,
+    # ~70% at lr=3e-6 on a real r=128 checkpoint), so it is a known-lossy path.
+    #
+    # ``adapter`` ships the LoRA factors and lets the inference engine apply
+    # them. It is the path we want, but it is NOT yet correct on this stack:
+    # a 6-step A/B (merge job 14400157 vs adapter job 14400159, identical
+    # otherwise) showed the adapter arm producing a near-uniform policy from
+    # the very first sync -- entropy pinned at 7.0-7.5 nats and reward exactly
+    # -1.0 at every step, while the merge arm trained normally (reward
+    # -0.672 -> -0.047, entropy 0.212 -> 0.044). Rollout/actor pearson stayed
+    # at 0.66-0.92 rather than collapsing, i.e. the weights do arrive but with
+    # the wrong magnitude.
+    #
+    # Default stays ``merge`` until that is root-caused: the failure mode is a
+    # silently random rollout policy with no error anywhere, only a reward that
+    # never leaves -1.0.
+    rollout_sync: str = "merge"
     ignore_patterns: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_IGNORE_PATTERNS)
 
     @property

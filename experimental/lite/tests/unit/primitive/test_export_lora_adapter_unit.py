@@ -21,7 +21,8 @@ import torch.nn as nn
 
 from megatron.lite.primitive.ckpt.hf_weights import (
     VLLM_LORA_NAME_PREFIX,
-    expected_expert_adapter_tensors,
+    _iter_expert_adapter_placements,
+    expected_global_expert_count,
     export_hf_lora_adapter,
     guard_expert_adapter_completeness,
     vllm_applied_lora_scaling,
@@ -224,53 +225,157 @@ def test_rslora_compensation_is_actually_load_bearing():
     assert not torch.allclose(compensated, uncompensated)
 
 
-def test_expected_expert_tensor_count_follows_target_modules():
-    common = {"num_layers": 48, "num_experts": 128}
-    # linear_fc1 -> gate_proj + up_proj, linear_fc2 -> down_proj; x2 for A and B.
+
+
+
+def test_rollout_sync_defaults_to_merge_until_adapter_path_is_fixed():
+    """Pin the default so it cannot silently flip back.
+
+    The adapter path produced a near-uniform rollout policy (entropy ~7.2 nats,
+    reward pinned at -1.0) with no error raised -- job 14400159 vs the merge
+    control 14400157. A default flip is therefore a silent correctness
+    regression, which is exactly the class this suite exists to catch.
+    """
+    from megatron.lite.primitive.modules.lora import LoraSpec, normalize_lora_spec
+
+    assert LoraSpec().rollout_sync == "merge"
+    assert normalize_lora_spec({"enabled": True, "rank": 8}).rollout_sync == "merge"
+    assert normalize_lora_spec({"enabled": True, "rank": 8, "rollout_sync": "adapter"}).rollout_sync == "adapter"
+
+# --- expert identity under expert parallelism -------------------------------
+#
+# The adapter of an EP rank belongs to the experts that rank owns, and to no
+# others: each rank initializes its own lora_A and grows its own lora_B from its
+# own experts' gradients. Emitting a rank's adapter under the whole global expert
+# range keeps the tensor count exactly right while misattributing seven of every
+# eight experts, so these tests assert identity, not quantity.
+
+
+class _FakePS:
+    """Parallel state with EP only; gathering is simulated, no torch.distributed."""
+
+    def __init__(self, ep_size, ep_rank, shards):
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
+        self.ep_group = "fake" if ep_size > 1 else None
+        self._shards = shards
+
+
+def _placements(ps, num_experts, monkeypatch, rank_tag):
+    """Expert ids this rank emits, with the adapter identity it used."""
+    import megatron.lite.primitive.ckpt.hf_weights as hw
+
+    monkeypatch.setattr(
+        hw,
+        "_gather_lora_factors_across_ep",
+        lambda a, b, ps_: [(f"A{i}", f"B{i}") for i in range(ps_.ep_size)]
+        if ps_.ep_size > 1
+        else [(a, b)],
+    )
+    out = []
+    for name, a, b in hw._iter_expert_adapter_placements(
+        "layers.0.mlp.experts.fc1.weight0",
+        f"A{rank_tag}",
+        f"B{rank_tag}",
+        is_grouped=True,
+        num_experts=num_experts,
+        ps=ps,
+    ):
+        out.append((int(name.rsplit("weight", 1)[1]), a, b))
+    return out
+
+
+def test_each_ep_rank_emits_only_the_experts_it_owns(monkeypatch):
+    ep_size, num_experts = 8, 128
+    per_rank = num_experts // ep_size
+    for rank in range(ep_size):
+        got = _placements(_FakePS(ep_size, rank, None), num_experts, monkeypatch, rank)
+        by_identity = {}
+        for eid, a, b in got:
+            by_identity.setdefault((a, b), []).append(eid)
+        # every adapter identity lands exactly on its owning rank's contiguous block
+        for (a, _b), ids in by_identity.items():
+            owner = int(a[1:])
+            assert ids == list(range(owner * per_rank, (owner + 1) * per_rank)), (
+                f"adapter {a} placed on {ids[:4]}..., expected block of rank {owner}"
+            )
+
+
+def test_global_expert_ids_are_covered_exactly_once(monkeypatch):
+    ep_size, num_experts = 8, 128
+    got = _placements(_FakePS(ep_size, 0, None), num_experts, monkeypatch, 0)
+    ids = [eid for eid, _, _ in got]
+    assert sorted(ids) == list(range(num_experts))       # complete
+    assert len(ids) == len(set(ids))                     # no duplicates
+
+
+def test_coverage_guard_cannot_see_the_ep_broadcast_bug():
+    """Negative control that FAILED first, and what it taught.
+
+    The broadcast bug emits, from every EP rank, all 128 global expert ids using
+    that rank's own adapter. Within a single rank's stream that is one tensor per
+    expert -- identical to correct output. So the coverage guard passes, exactly
+    as the count guard did before it. Coverage is a real invariant (it catches
+    missing and duplicated ids) but it is not this one, and pretending otherwise
+    would leave the same blind spot one layer up.
+
+    Identity is defended instead by the self-check inside
+    ``_gather_lora_factors_across_ep`` (covered below), and by the placement
+    tests above.
+    """
+    num_experts = 128
+    broadcast_from_one_rank = [
+        (f"base_model.model.model.layers.0.mlp.experts.{eid}.gate_proj.lora_A.weight", None)
+        for eid in range(num_experts)
+    ]
+    # documents the limitation rather than asserting a capability it lacks
     assert (
-        expected_expert_adapter_tensors(
-            **common, target_modules=["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"]
-        )
-        == 48 * 128 * 3 * 2
-    )
-    # Attention-only LoRA has no expert surface at all.
-    assert (
-        expected_expert_adapter_tensors(
-            **common, target_modules=["linear_qkv", "linear_proj"]
-        )
-        == 0
-    )
-    # Dense models cannot derive a count; the guard must stay inert.
-    assert (
-        expected_expert_adapter_tensors(
-            num_layers=48, num_experts=None, target_modules=["linear_fc1"]
-        )
-        is None
+        len(list(guard_expert_adapter_completeness(iter(broadcast_from_one_rank), num_experts)))
+        == num_experts
     )
 
 
-def test_guard_passes_a_complete_expert_surface_through_untouched():
-    model = _TinyWrappedModel(use_rslora=True)
-    complete = list(export_hf_lora_adapter(model, _SplittingSpec(), _single_rank_ps()))
-    expected = expected_expert_adapter_tensors(
-        num_layers=1, num_experts=NUM_EXPERTS, target_modules=["linear_fc1"]
-    )
+def test_ep_gather_self_identity_check_fires_on_foreign_data(monkeypatch):
+    """The assertion that does defend expert identity."""
+    import megatron.lite.primitive.ckpt.hf_weights as hw
 
-    guarded = list(guard_expert_adapter_completeness(iter(complete), expected))
+    mine_a = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    mine_b = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    ps = _FakePS(2, 1, None)
 
-    assert [name for name, _ in guarded] == [name for name, _ in complete]
+    def _bad_gather(outputs, tensor, group):
+        for out in outputs:
+            out.fill_(-1.0)  # nobody's slot holds our data
+
+    monkeypatch.setattr(hw, "_ep_all_gather", _bad_gather)
+    with pytest.raises(RuntimeError, match="foreign data in our own slot"):
+        hw._gather_lora_factors_across_ep(mine_a, mine_b, ps)
+
+    def _good_gather(outputs, tensor, group):
+        for i, out in enumerate(outputs):
+            out.copy_(tensor if i == ps.ep_rank else torch.full_like(tensor, float(i)))
+
+    monkeypatch.setattr(hw, "_ep_all_gather", _good_gather)
+    shards = hw._gather_lora_factors_across_ep(mine_a, mine_b, ps)
+    assert len(shards) == 2
+    assert torch.equal(shards[ps.ep_rank][0], mine_a)
 
 
-def test_guard_raises_when_one_expert_tensor_goes_missing():
-    """The fail-loud path must actually fire, not just exist."""
-    model = _TinyWrappedModel(use_rslora=True)
-    complete = list(export_hf_lora_adapter(model, _SplittingSpec(), _single_rank_ps()))
-    expected = expected_expert_adapter_tensors(
-        num_layers=1, num_experts=NUM_EXPERTS, target_modules=["linear_fc1"]
-    )
+def test_guard_accepts_correct_coverage_and_still_catches_a_missing_expert():
+    num_experts = 128
+    good = [
+        (f"base_model.model.model.layers.0.mlp.experts.{eid}.gate_proj.lora_A.weight", None)
+        for eid in range(num_experts)
+    ]
+    assert len(list(guard_expert_adapter_completeness(iter(good), num_experts))) == num_experts
 
-    dropped_index = next(i for i, (name, _) in enumerate(complete) if ".experts." in name)
-    truncated = complete[:dropped_index] + complete[dropped_index + 1 :]
+    with pytest.raises(RuntimeError, match="exactly once"):
+        list(guard_expert_adapter_completeness(iter(good[:-1]), num_experts))
 
-    with pytest.raises(RuntimeError, match="expert tensors, expected"):
-        list(guard_expert_adapter_completeness(iter(truncated), expected))
+
+def test_expected_global_expert_count_tracks_target_modules():
+    assert expected_global_expert_count(num_experts=128, target_modules=["linear_fc1"]) == 128
+    assert expected_global_expert_count(
+        num_experts=128, target_modules=["linear_qkv", "linear_proj"]
+    ) is None
+    assert expected_global_expert_count(num_experts=None, target_modules=["linear_fc1"]) is None

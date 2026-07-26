@@ -919,51 +919,72 @@ def _lora_adapter_surfaces(base_chunk: nn.Module) -> list[tuple[str, Any, bool]]
     return surfaces
 
 
-def expected_expert_adapter_tensors(
-    *,
-    num_layers: int | None,
-    num_experts: int | None,
-    target_modules,
-) -> int | None:
-    """Expert adapter tensor count an adapter export must emit, or None.
+def expected_global_expert_count(*, num_experts: int | None, target_modules) -> int | None:
+    """Number of global experts an adapter export must cover, or None.
 
-    ``linear_fc1`` fans out to ``gate_proj`` + ``up_proj`` and ``linear_fc2`` to
-    ``down_proj``; every resulting HF module contributes one ``lora_A`` and one
-    ``lora_B`` tensor per expert.
+    Deliberately the *expert count*, not a tensor count. The tensor count is the
+    weaker invariant: it stays correct while every rank attributes its adapter to
+    experts it does not own, which is precisely the failure this guard exists to
+    catch.
     """
-    if not num_layers or not num_experts:
+    if not num_experts:
         return None
     targets = set(target_modules or ())
-    modules_per_expert = (2 if "linear_fc1" in targets else 0) + (
-        1 if "linear_fc2" in targets else 0
-    )
-    if modules_per_expert == 0:
-        return 0
-    return int(num_layers) * int(num_experts) * modules_per_expert * 2
+    if not ({"linear_fc1", "linear_fc2"} & targets):
+        return None
+    return int(num_experts)
 
 
-def guard_expert_adapter_completeness(stream, expected: int | None):
-    """Pass tensors through, raising if the expert surface is incomplete.
+_EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
 
-    vLLM resolves adapter tensors by name and *silently* zeroes any module it
-    cannot find (``vllm/lora/models.py:719-720`` skips the module, then
-    ``:393-396`` calls ``reset_lora``). VERL's ``TensorLoRARequest`` path bypasses
-    vLLM's own name validation entirely, so a naming drift would quietly degrade
-    the rollout policy to the bare base model. Counting the expert surfaces we
-    emit converts that silent failure class into a crash.
+
+def guard_expert_adapter_completeness(stream, expected_experts: int | None):
+    """Pass tensors through, raising unless every global expert is covered once.
+
+    This guards two distinct invariants, and it needs both:
+
+    * **coverage** -- vLLM resolves adapter tensors by name and *silently* zeroes
+      any module it cannot find (``vllm/lora/models.py:719-720`` skips, then
+      ``:393-396`` calls ``reset_lora``), and VERL's ``TensorLoRARequest`` path
+      bypasses vLLM's own name validation, so a missing expert degrades the
+      rollout policy with no error;
+    * **identity** -- an expert id appearing more than once means two different
+      adapters were attributed to the same expert, which is what an EP-broadcast
+      bug looks like.
+
+    The identity half exists because the earlier count-based version could not
+    see that class of bug at all: when every EP rank emitted the full global
+    expert range, the total came out exactly right while seven of every eight
+    experts carried another rank's adapter. A negative control could not have
+    caught that either -- dropping a tensor makes a count-based guard fire,
+    because counting is genuinely what it did. An assertion only defends the
+    invariant it actually measures.
     """
-    seen_expert = 0
+    seen: dict[int, int] = {}
     total = 0
     for name, tensor in stream:
         total += 1
-        if ".experts." in name:
-            seen_expert += 1
+        match = _EXPERT_ID_RE.search(name)
+        if match is not None:
+            expert_id = int(match.group(1))
+            seen[expert_id] = seen.get(expert_id, 0) + 1
         yield name, tensor
-    if expected is not None and seen_expert != expected:
+
+    if expected_experts is None:
+        return
+
+    missing = sorted(set(range(expected_experts)) - set(seen))
+    out_of_range = sorted(idx for idx in seen if idx >= expected_experts)
+    counts = set(seen.values())
+    if missing or out_of_range or len(counts) > 1:
         raise RuntimeError(
-            f"LoRA adapter export emitted {seen_expert} expert tensors, expected "
-            f"{expected} (total tensors={total}). vLLM would silently zero the "
-            "missing expert adapters, so refusing to sync."
+            "LoRA adapter export does not cover each global expert exactly once: "
+            f"covered={len(seen)}/{expected_experts} "
+            f"missing={missing[:8]}{'...' if len(missing) > 8 else ''} "
+            f"out_of_range={out_of_range[:8]}{'...' if len(out_of_range) > 8 else ''} "
+            f"tensors_per_expert={sorted(counts)} (total tensors={total}). "
+            "Uneven coverage means some experts would receive another rank's "
+            "adapter or none at all, and vLLM reports neither."
         )
 
 
@@ -1005,6 +1026,77 @@ def _gather_lora_factors_across_tp(
             f"Unsupported TP split dim {split_dim} for LoRA surface {native_name!r}."
         )
     return lora_a, lora_b
+
+
+def _gather_lora_factors_across_ep(lora_a, lora_b, ps) -> list[tuple[Any, Any]]:
+    """Return one ``(lora_a, lora_b)`` pair per expert-parallel rank.
+
+    A grouped adapter is shared only among the experts its own rank owns, never
+    globally: each EP rank initializes its own ``lora_a`` and grows its own
+    ``lora_b`` from its own experts' gradients, and expert gradients are not
+    reduced across EP. Base export already accounts for this -- it all-gathers
+    over ``ep_group`` and maps local expert indices to global ones. The adapter
+    export has to do the same; otherwise every rank claims the whole global
+    expert range for its own factors.
+    """
+    if ps.ep_size <= 1 or ps.ep_group is None:
+        return [(lora_a, lora_b)]
+    a_shards = [torch.empty_like(lora_a) for _ in range(ps.ep_size)]
+    b_shards = [torch.empty_like(lora_b) for _ in range(ps.ep_size)]
+    _ep_all_gather(a_shards, lora_a.contiguous(), ps.ep_group)
+    _ep_all_gather(b_shards, lora_b.contiguous(), ps.ep_group)
+
+    # Self-identity: our own slot must come back bit-identical. A stream-level
+    # coverage check cannot see this -- within one rank's output the broadcast
+    # bug and the correct mapping are indistinguishable, since both emit every
+    # global expert id exactly once. The difference is *which* adapter each id
+    # carries, and this is where that becomes checkable.
+    if not (
+        torch.equal(a_shards[ps.ep_rank], lora_a)
+        and torch.equal(b_shards[ps.ep_rank], lora_b)
+    ):
+        raise RuntimeError(
+            f"EP all-gather returned foreign data in our own slot {ps.ep_rank} "
+            f"(ep_size={ps.ep_size}); expert adapters would be attributed to the "
+            "wrong experts, which no count- or coverage-based check can detect."
+        )
+    return list(zip(a_shards, b_shards))
+
+
+def _iter_expert_adapter_placements(
+    global_name: str,
+    lora_a,
+    lora_b,
+    *,
+    is_grouped: bool,
+    num_experts: int,
+    ps,
+):
+    """Yield ``(native_name, lora_a, lora_b)`` with each adapter on its own experts.
+
+    Emitting a rank's adapter under every global expert id is silently wrong and
+    survives any count-based check, because the count comes out right: each rank
+    emits exactly the expected number of tensors, just attributed to experts it
+    does not own. Measured on a real EP=8 checkpoint, the eight adapters are
+    mutually near-orthogonal (pairwise relative difference ~1.41, cosine ~0), so
+    seven of every eight experts received a correctly scaled delta pointing in an
+    unrelated direction.
+    """
+    if not is_grouped:
+        yield global_name, lora_a, lora_b
+        return
+
+    shards = _gather_lora_factors_across_ep(lora_a, lora_b, ps)
+    if num_experts % len(shards) != 0:
+        raise ValueError(
+            f"num_experts={num_experts} is not divisible by ep_size={len(shards)}; "
+            "cannot map local expert indices to global ones."
+        )
+    experts_per_rank = num_experts // len(shards)
+    for ep_rank, (a_shard, b_shard) in enumerate(shards):
+        for local_idx in range(experts_per_rank):
+            global_idx = ep_rank * experts_per_rank + local_idx
+            yield set_expert_idx(global_name, global_idx), a_shard, b_shard
 
 
 def export_hf_lora_adapter(
@@ -1075,11 +1167,9 @@ def export_hf_lora_adapter(
             lora_a, lora_b = _gather_lora_factors_across_tp(
                 lora_a, lora_b, global_name, spec, ps
             )
-            expert_range = range(num_experts) if is_grouped else range(1)
-            for expert_idx in expert_range:
-                native_name = (
-                    set_expert_idx(global_name, expert_idx) if is_grouped else global_name
-                )
+            for native_name, lora_a, lora_b in _iter_expert_adapter_placements(
+                global_name, lora_a, lora_b, is_grouped=is_grouped, num_experts=num_experts, ps=ps
+            ):
                 for hf_name, lora_b_piece in spec.native_to_hf(native_name, lora_b):
                     if not hf_name.endswith(".weight"):
                         raise ValueError(
