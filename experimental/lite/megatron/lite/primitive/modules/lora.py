@@ -47,6 +47,12 @@ class LoraSpec:
     target_modules: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_TARGET_MODULES)
     use_rslora: bool = False
     init: str = "default"
+    # How the rollout engine receives the adapter. ``adapter`` ships the LoRA
+    # factors and lets the inference engine apply them; ``merge`` folds the
+    # delta into the base weight in the rollout dtype, which silently rounds
+    # away sub-ulp updates and is kept only for inits whose base carries a
+    # residual (OLoRA/PiSSA).
+    rollout_sync: str = "adapter"
     ignore_patterns: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_IGNORE_PATTERNS)
 
     @property
@@ -409,6 +415,7 @@ class LinearLoRA(nn.Module):
             self.rank_partition_size = 1
             self.local_rank = self.rank
         self.use_rslora = bool(use_rslora)
+        self.alpha = int(rank if alpha is None else alpha)
         self.scale = lora_scaling(rank, alpha, use_rslora=use_rslora)
         self.dropout_p = float(dropout)
         self.sequence_parallel_input = bool(sequence_parallel_input)
@@ -480,9 +487,16 @@ class LinearLoRA(nn.Module):
             out = _scatter_sequence_parallel(out, self.tp_group, self.tp_rank)
         return out
 
-    def materialized_delta_weight(self) -> torch.Tensor:
+    def materialized_lora_factors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return TP-gathered ``(lora_a, lora_b)`` with **no** scaling applied.
+
+        Adapter-only rollout sync ships the factors themselves, so the scale
+        must stay separable: the consumer (vLLM) applies its own scaling and the
+        exporter compensates for any mismatch. ``materialized_delta_weight`` is
+        the merged-export counterpart and multiplies ``self.scale`` back in.
+        """
         if self.dropout_p != 0.0:
-            raise ValueError("materialized_delta_weight requires dropout=0.")
+            raise ValueError("materialized_lora_factors requires dropout=0.")
         lora_a = self.lora_a
         lora_b = self.lora_b
         if hasattr(lora_a, "full_tensor"):
@@ -497,6 +511,10 @@ class LinearLoRA(nn.Module):
             lora_b = _all_gather_last_dim_forward(
                 lora_b.t(), self.tp_group, self.output_partition_size
             ).t()
+        return lora_a, lora_b
+
+    def materialized_delta_weight(self) -> torch.Tensor:
+        lora_a, lora_b = self.materialized_lora_factors()
         return (lora_b @ lora_a) * self.scale
 
     def olora_tail_init_(self, base_weight: torch.Tensor) -> None:
@@ -529,6 +547,7 @@ class SharedGroupedLinearLoRA(nn.Module):
         self.num_local_experts = int(num_local_experts)
         self.rank = int(rank)
         self.use_rslora = bool(use_rslora)
+        self.alpha = int(rank if alpha is None else alpha)
         self.scale = lora_scaling(rank, alpha, use_rslora=use_rslora)
         self.dropout_p = float(dropout)
         self.shared_across_experts = True
@@ -547,9 +566,17 @@ class SharedGroupedLinearLoRA(nn.Module):
         dropped = F.dropout(x, p=self.dropout_p, training=self.training) if self.dropout_p else x
         return dropped.matmul(self.lora_a.t()).matmul(self.lora_b.t()) * self.scale
 
-    def materialized_delta_weight(self, expert_idx: int = 0) -> torch.Tensor:
+    def materialized_lora_factors(
+        self, expert_idx: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(lora_a, lora_b)`` with **no** scaling applied.
+
+        The adapter is shared by every local expert, so ``expert_idx`` only
+        documents the caller's intent; the returned factors are identical for
+        all experts (see the class docstring).
+        """
         if self.dropout_p != 0.0:
-            raise ValueError("materialized_delta_weight requires dropout=0.")
+            raise ValueError("materialized_lora_factors requires dropout=0.")
         del expert_idx
         lora_a = self.lora_a
         lora_b = self.lora_b
@@ -557,6 +584,10 @@ class SharedGroupedLinearLoRA(nn.Module):
             lora_a = lora_a.full_tensor()
         if hasattr(lora_b, "full_tensor"):
             lora_b = lora_b.full_tensor()
+        return lora_a, lora_b
+
+    def materialized_delta_weight(self, expert_idx: int = 0) -> torch.Tensor:
+        lora_a, lora_b = self.materialized_lora_factors(expert_idx)
         return (lora_b @ lora_a) * self.scale
 
 

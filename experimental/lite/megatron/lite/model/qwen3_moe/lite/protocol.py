@@ -62,6 +62,7 @@ __all__ = [
     "build_model",
     "build_model_config",
     "export_hf_weights",
+    "export_hf_lora_adapter",
     "load_hf_weights",
     "save_hf_weights",
     "vocab_size",
@@ -369,6 +370,18 @@ def export_hf_weights(
 
     for chunk in chunks:
         yield from _export(chunk, model_cfg, ps, **kwargs)
+
+
+def export_hf_lora_adapter(
+    chunks: list[nn.Module], model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs
+):
+    """Export LoRA factors in vLLM/PEFT naming (adapter-only rollout sync)."""
+    from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+        export_hf_lora_adapter as _export_adapter,
+    )
+
+    for chunk in chunks:
+        yield from _export_adapter(chunk, model_cfg, ps, **kwargs)
 
 
 def save_hf_weights(

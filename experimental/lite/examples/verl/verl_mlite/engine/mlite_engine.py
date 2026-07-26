@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from enum import Enum
@@ -35,6 +36,8 @@ except Exception:  # pragma: no cover - older VERL without Metric
     _VerlMetric = None
 
 from .config import MegatronLiteEngineConfig
+
+logger = logging.getLogger(__name__)
 
 _patch_bucketed_weight_sender()
 
@@ -394,12 +397,127 @@ class MegatronLiteEngine(BaseEngine):
         # fails isinstance(dict). ``enabled`` is the authoritative opt-in; rank
         # alone must not mutate rollout export behavior.
         lora_enabled = bool(lora_cfg.get("enabled", False)) if hasattr(lora_cfg, "get") else False
-        if lora_enabled:
-            # Rollout weight sync must see the CURRENT policy (base + adapter);
-            # with OLoRA's PiSSA residual, adapter-only sync on the original
-            # base would be numerically wrong, so merged export is mandatory.
+        if not lora_enabled:
+            return self.runtime.export_weights(self.handle, **export_kwargs), None
+
+        merge_mode = self._lora_rollout_sync_is_merge(lora_cfg)
+        if merge_mode:
+            # Opt-in legacy path. Merging happens in the rollout dtype (bf16), so
+            # every adapter element smaller than half an ulp of the frozen base
+            # weight is rounded away: measured on a real r=128/alpha=256/rsLoRA
+            # checkpoint, 36% of elements at lr=1e-5 and ~70% at lr=3e-6 reach
+            # vLLM completely unchanged, and the resulting logit error is ~6000x
+            # larger than the adapter path. Keep this only where adapter-only is
+            # not representable (e.g. OLoRA/PiSSA, whose residual base makes
+            # adapter-only numerically wrong).
             export_kwargs["merge_lora"] = True
-        return self.runtime.export_weights(self.handle, **export_kwargs), None
+            return self.runtime.export_weights(self.handle, **export_kwargs), None
+
+        peft_config = self._build_vllm_peft_config(lora_cfg)
+        if not kwargs.get("base_sync_done", False):
+            # Phase 1: the frozen base, exported verbatim. LoRA training never
+            # touches it, so this runs once per rollout engine lifetime.
+            return self.runtime.export_weights(self.handle, **export_kwargs), peft_config
+
+        adapter_kwargs = {
+            key: export_kwargs[key] for key in ("export_dtype",) if key in export_kwargs
+        }
+        adapter_stream = self.runtime.export_lora_adapter(self.handle, **adapter_kwargs)
+        return self._checked_adapter_stream(adapter_stream), peft_config
+
+    @staticmethod
+    def _lora_rollout_sync_is_merge(lora_cfg) -> bool:
+        """Resolve the rollout sync mode; adapter-only is the default."""
+        mode = str(lora_cfg.get("rollout_sync", "adapter") or "adapter").lower()
+        if mode not in ("adapter", "merge"):
+            raise ValueError(
+                f"Unknown lora.rollout_sync={mode!r}; expected 'adapter' or 'merge'."
+            )
+        init = str(lora_cfg.get("init", "default") or "default").lower()
+        if init in ("olora", "pissa"):
+            # These initializations subtract the adapter's starting delta from the
+            # base weight, so the rollout base is *not* the pretrained weight and
+            # an adapter-only sync would apply the delta to the wrong operand.
+            if mode == "adapter":
+                logger.warning(
+                    "LoRA init=%s carries a residual base; forcing rollout_sync='merge' "
+                    "(adapter-only sync is numerically wrong for this init).",
+                    init,
+                )
+            return True
+        return mode == "merge"
+
+    def _build_vllm_peft_config(self, lora_cfg) -> dict:
+        """Build the ``peft_config`` vLLM's ``PEFTHelper`` consumes.
+
+        Built here rather than via VERL's ``build_peft_config_for_vllm`` because
+        that helper omits ``use_rslora``; ``PEFTHelper.from_dict`` silently drops
+        unknown keys and silently defaults the flag to False, which would make
+        vLLM apply ``alpha/rank`` while training used ``alpha/sqrt(rank)``. Only
+        the megatron->HF module-name table is reused from VERL.
+        """
+        from verl.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules
+
+        target_modules = list(
+            lora_cfg.get("target_modules", ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"])
+        )
+        exclude_modules = list(lora_cfg.get("exclude_modules", []) or [])
+        return {
+            "task_type": "CAUSAL_LM",
+            "r": int(lora_cfg.get("rank", 0)),
+            "lora_alpha": int(lora_cfg.get("alpha", 32)),
+            "use_rslora": bool(lora_cfg.get("use_rslora", False)),
+            "target_modules": convert_megatron_to_hf_target_modules(target_modules),
+            "exclude_modules": convert_megatron_to_hf_target_modules(exclude_modules),
+            "bias": "none",
+            "lora_dropout": float(lora_cfg.get("dropout", 0.0)),
+        }
+
+    def _checked_adapter_stream(self, stream):
+        """Fail loudly if the expert adapter surface is incomplete.
+
+        vLLM resolves adapter tensors by name and *silently* zeroes any module it
+        cannot find (``vllm/lora/models.py:719-720`` skips, then ``:393-396``
+        calls ``reset_lora``). VERL's ``TensorLoRARequest`` path bypasses vLLM's
+        own name validation entirely, so a naming drift would degrade the rollout
+        policy to the bare base model without a single warning. Counting the
+        expert surfaces we emit turns that silent class of failure into a crash.
+        """
+        expected = self._expected_expert_adapter_tensors()
+        seen_expert = 0
+        total = 0
+        for name, tensor in stream:
+            total += 1
+            if ".experts." in name:
+                seen_expert += 1
+            yield name, tensor
+        if expected is not None and seen_expert != expected:
+            raise RuntimeError(
+                "LoRA adapter export emitted "
+                f"{seen_expert} expert tensors, expected {expected} "
+                f"(total tensors={total}). vLLM would silently zero the missing "
+                "expert adapters, so refusing to sync."
+            )
+
+    def _expected_expert_adapter_tensors(self) -> int | None:
+        """Expected expert adapter tensor count, or None when not derivable."""
+        cfg = getattr(self, "_model_cfg", None) or self.handle._extras.get("model_cfg")
+        num_layers = getattr(cfg, "num_hidden_layers", None)
+        num_experts = getattr(cfg, "num_experts", None)
+        if not num_layers or not num_experts:
+            return None
+        lora_cfg = (self._mlite_config.impl_cfg or {}).get("lora") if self._mlite_config else None
+        targets = set(
+            lora_cfg.get("target_modules", []) if hasattr(lora_cfg, "get") else []
+        )
+        # linear_fc1 fans out to gate_proj+up_proj, linear_fc2 to down_proj; each
+        # HF module contributes one lora_A and one lora_B tensor per expert.
+        modules_per_expert = (2 if "linear_fc1" in targets else 0) + (
+            1 if "linear_fc2" in targets else 0
+        )
+        if modules_per_expert == 0:
+            return 0
+        return int(num_layers) * int(num_experts) * modules_per_expert * 2
 
     def get_data_parallel_size(self):
         if self.handle is None:

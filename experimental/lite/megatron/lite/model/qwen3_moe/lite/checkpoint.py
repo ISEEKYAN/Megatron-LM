@@ -266,6 +266,14 @@ def export_hf_weights(model, config: Qwen3MoEConfig, ps, **kwargs):
     )
 
 
+def export_hf_lora_adapter(model, config: Qwen3MoEConfig, ps, **kwargs):
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        export_hf_lora_adapter as _export_adapter,
+    )
+
+    yield from _export_adapter(model, Qwen3MoEWeightSpec(config), ps, **kwargs)
+
+
 def save_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import save_hf_weights as _save
 
