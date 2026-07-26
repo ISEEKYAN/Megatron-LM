@@ -382,11 +382,15 @@ class MegatronLiteEngine(BaseEngine):
             for key in ("limit", "include_mtp_only", "include_local_prefixes")
             if key in kwargs
         }
+        export_kwargs.update(
+            buffer_max_size_bytes=2 * 1024**3,
+            cpu=False,
+        )
         if self.engine_config.resync_format is not None:
             export_kwargs["target"] = self.engine_config.resync_format
             if self.engine_config.resync_config:
                 export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
-        elif self.engine_config.model_name == "qwen3_5":
+        else:
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
