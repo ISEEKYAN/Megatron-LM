@@ -161,31 +161,37 @@ def test_mxfp4_matches_e2m1_grid_and_e8m0_scale():
     spec = QATSpec(enabled=True, format="mxfp4", group_size=32)
     w_hat = fake_quantize_weight(w, spec)
 
-    # independent reference: OCP E8M0 shared scale + E2M1 nearest (ties-to-even).
+    # Independent reference: the E8M0 shared scale + E2M1 rounding that the
+    # rollout quantizer (ModelOpt MXFP4QTensor) uses -- ceil(log2(amax/6)) and
+    # ties-down. This test previously asserted OCP Alg. 1 (floor(log2 amax) - 2)
+    # plus ties-to-even, which is a *different* encoding and was what let the
+    # training/rollout mismatch ship. Bit-exactness against ModelOpt itself is
+    # covered by tests/unit/primitive/test_mxfp4_modelopt_parity_unit.py.
     levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     mids = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
     v = w.reshape(4, 96 // 32, 32)
     amax = v.abs().amax(dim=2, keepdim=True)
-    exp = (torch.floor(torch.log2(amax.clamp_min(torch.finfo(torch.float32).tiny))) - 2).clamp(-127, 127)
+    exp = torch.ceil(torch.maximum(torch.log2(amax / 6.0), torch.tensor(-127.0)))
     X = torch.exp2(exp)
-    a = (v / X).abs()
-    lo = torch.bucketize(a, mids, right=False)
-    hi = torch.bucketize(a, mids, right=True)
-    idx = torch.where((hi != lo) & (lo % 2 == 1), hi, lo)
+    idx = torch.bucketize((v / X).abs(), mids, right=False)
     ref = (torch.sign(v / X) * levels[idx] * X).reshape(4, 96)
     torch.testing.assert_close(w_hat, ref, rtol=0, atol=0)
     # every reconstructed value lies on grid*scale (a power of two multiple).
     assert torch.isfinite(w_hat).all()
 
 
-def test_mxfp4_ste_zeroes_saturated_block_top():
-    # A block whose max scales above 6.0 saturates that element -> STE zeroes it.
+def test_mxfp4_scale_never_saturates_so_ste_is_identity():
+    # The E8M0 scale is chosen as ceil(log2(amax/6)), so amax/X <= 6 always and
+    # nothing is ever clipped -- including the block maximum. The old Alg. 1 rule
+    # did clip it (amax/X could reach 8), and this test used to assert that the
+    # STE zeroed the block top's gradient. The deployed quantizer does not
+    # saturate, so training must not drop that gradient either.
     w = torch.zeros(1, 32)
-    w[0, 0] = 6.25  # amax=6.25 -> floor(log2)=2 -> X=1 -> 6.25 > 6.0 (E2M1 max)
+    w[0, 0] = 6.25  # amax=6.25 -> ceil(log2(6.25/6)) = 1 -> X=2 -> 3.125 <= 6
     w[0, 1] = 1.0
     wg = w.clone().requires_grad_(True)
     fake_quantize_weight(wg, QATSpec(enabled=True, format="mxfp4", group_size=32)).sum().backward()
-    assert wg.grad[0, 0].item() == 0.0  # saturated top clipped
+    assert wg.grad[0, 0].item() == 1.0  # block top is representable -> passes through
     assert wg.grad[0, 1].item() == 1.0  # in-range passes through
 
 

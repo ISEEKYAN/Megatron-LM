@@ -45,6 +45,20 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
 
+# MXFP4 numerics live in one place (see that module's docstring): the scale rule
+# and the element rounding are defined to be bit-identical to the ModelOpt
+# quantizer the rollout actually runs, so the error QAT compensates during
+# training is the error deployment actually makes.
+from megatron.lite.primitive.quantization.mxfp4 import (
+    E2M1_LEVELS as _E2M1_LEVELS,
+    E2M1_MAX as _E2M1_MAX,
+    E8M0_BIAS as _E8M0_BIAS,
+    MXFP4_BLOCK_SIZE as _MXFP4_BLOCK,
+    e2m1_round_index as _e2m1_round_index,
+    mx_shared_scale as _mx_shared_scale,
+    mx_shared_scale_exponent as _mx_shared_scale_exponent,
+)
+
 # Supported formats -> nominal bit-width. Free-form strings are rejected; every
 # enum must map to an exact quant/dequant contract.
 _FORMAT_BITS: dict[str, int] = {
@@ -63,8 +77,11 @@ _FLOAT_FORMATS: frozenset[str] = frozenset({"fp8_e4m3", "mxfp4"})
 _FORMAT_ALIASES: dict[str, str] = {"fp8": "fp8_e4m3"}
 
 # MXFP4 is intrinsically a microscaling block format; OCP fixes the block to 32
-# elements sharing one E8M0 scale.
-_MXFP4_BLOCK: int = 32
+# elements sharing one E8M0 scale. The block size, the E2M1 grid, the E8M0
+# shared-scale rule and the element rounding all live in
+# ``primitive.quantization.mxfp4`` — the single source of truth, defined to be
+# bit-identical to the ModelOpt quantizer the rollout actually runs. They are
+# imported above under the module-private aliases this file already used.
 
 # Formats recognised as future work but explicitly not implemented here.
 # Selecting one is a loud error naming the deferral, never a silent fallback to
@@ -295,23 +312,6 @@ def fake_quantize_weight(weight: torch.Tensor, spec: QATSpec) -> torch.Tensor:
 # Floating-point quant/dequant numerics (fp8 E4M3; MXFP4 = E2M1 + E8M0)
 # ---------------------------------------------------------------------------
 
-# OCP E2M1 (float4) representable magnitudes and the round-to-nearest midpoints
-# between them. Magnitude index ``i`` (0..7) is the 3-bit code ``exp<<1 | mant``;
-# the full 4-bit E2M1 code is ``sign<<3 | i``. This is the OCP grid, not a
-# home-grown encoding.
-_E2M1_LEVELS: tuple[float, ...] = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-_E2M1_MIDPOINTS: tuple[float, ...] = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
-_E2M1_MAX: float = 6.0
-# Largest binary exponent representable in E2M1 (floor(log2(6)) = 2); the OCP MX
-# shared-scale (Alg. 1) subtracts this so the block max lands in the top binade.
-_E2M1_EMAX: int = 2
-# E8M0 stores an unsigned biased exponent in [0, 254] (255 = NaN), i.e. powers
-# of two 2^e with e in [-127, 127]; bias 127.
-_E8M0_BIAS: int = 127
-_E8M0_EXP_MIN: int = -127
-_E8M0_EXP_MAX: int = 127
-
-
 def _fp8_e4m3_max() -> float:
     return float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
 
@@ -327,38 +327,15 @@ def _fp8_e4m3_qdq(x: torch.Tensor) -> torch.Tensor:
     return clamped.to(torch.float8_e4m3fn).to(torch.float32)
 
 
-def _e2m1_round_index(a: torch.Tensor) -> torch.Tensor:
-    """Nearest E2M1 magnitude index (0..7) for a non-negative tensor, ties-to-even.
-
-    At an exact midpoint the two neighbours have opposite mantissa-LSB parity, so
-    rounding to the even neighbour == rounding down for an even lower index and up
-    for an odd one.
-    """
-    mids = torch.tensor(_E2M1_MIDPOINTS, dtype=torch.float32, device=a.device)
-    idx_lo = torch.bucketize(a, mids, right=False)  # rounds midpoints down
-    idx_hi = torch.bucketize(a, mids, right=True)  # rounds midpoints up
-    tie = idx_hi != idx_lo
-    return torch.where(tie & (idx_lo % 2 == 1), idx_hi, idx_lo)
-
-
 def _e2m1_qdq(x: torch.Tensor) -> torch.Tensor:
-    """Round a float32 tensor onto the OCP E2M1 grid (ties-to-even), signed."""
+    """Round a float32 tensor onto the OCP E2M1 grid, signed.
+
+    Rounding (ties down) comes from ``mxfp4.e2m1_round_index`` so the training
+    graph sees exactly the grid the rollout quantizer produces.
+    """
     sign = torch.sign(x)
     levels = torch.tensor(_E2M1_LEVELS, dtype=torch.float32, device=x.device)
     return sign * levels[_e2m1_round_index(x.float().abs())]
-
-
-def _mx_shared_scale(block_amax: torch.Tensor) -> torch.Tensor:
-    """E8M0 per-block power-of-two scale (OCP Alg. 1) as float32.
-
-    ``e = clamp(floor(log2(amax)) - emax_elem, -127, 127)``; ``X = 2^e``. For an
-    all-zero block ``X = 1`` (its codes are all zero regardless).
-    """
-    tiny = torch.finfo(torch.float32).tiny
-    safe = block_amax.float().clamp_min(tiny)
-    exp = (torch.floor(torch.log2(safe)) - _E2M1_EMAX).clamp(_E8M0_EXP_MIN, _E8M0_EXP_MAX)
-    scale = torch.exp2(exp)
-    return torch.where(block_amax > 0, scale, torch.ones_like(scale))
 
 
 class _FloatFakeQuantSTE(torch.autograd.Function):
@@ -412,7 +389,19 @@ def _fp8_fake_quantize_weight(weight: torch.Tensor, spec: QATSpec) -> torch.Tens
 
 
 def _mxfp4_fake_quantize_weight(weight: torch.Tensor, spec: QATSpec) -> torch.Tensor:
-    """STE fake-quant to MXFP4 (E2M1 element, E8M0 block scale, block=32)."""
+    """STE fake-quant to MXFP4 (E2M1 element, E8M0 block scale, block=32).
+
+    Bit-identical to what the rollout serves: the scale and the element rounding
+    both come from ``primitive.quantization.mxfp4`` (see that module's docstring),
+    which mirrors ModelOpt ``MXFP4QTensor.quantize``. Locked by
+    ``tests/unit/primitive/test_mxfp4_modelopt_parity_unit.py``.
+
+    Note that with the ModelOpt scale rule ``amax / scale <= 6`` holds by
+    construction, so the ``ste_clip`` saturation mask is all-true for MXFP4. That
+    is correct rather than vestigial: the deployed quantizer does not saturate
+    either, so there is no out-of-range region whose gradient should be dropped.
+    The mask is kept so the code path stays uniform with fp8/int.
+    """
     view = _grouped_view(weight, _MXFP4_BLOCK)
     with torch.no_grad():
         block_amax = view.float().abs().amax(dim=2, keepdim=True)
@@ -475,13 +464,16 @@ def _quantize_weight_mxfp4(weight: torch.Tensor) -> dict[str, torch.Tensor]:
     """
     view = _grouped_view(weight.detach(), _MXFP4_BLOCK)  # [out, nblk, 32]
     block_amax = view.float().abs().amax(dim=2, keepdim=True)
-    scale = _mx_shared_scale(block_amax)  # X = 2^e
+    exponent = _mx_shared_scale_exponent(block_amax)  # e, so the scale is 2^e
+    scale = torch.exp2(exponent)
     w_scaled = view.float() / scale
     mag = _e2m1_round_index(w_scaled.abs()).to(torch.int32)
     sign_bit = (w_scaled < 0).to(torch.int32)
     codes = ((sign_bit << 3) | mag).to(torch.int32)  # [out, nblk, 32], 0..15
     packed = pack_int4(codes)  # [out, nblk, 16] uint8
-    e8m0 = (torch.log2(scale).round().to(torch.int32) + _E8M0_BIAS).to(torch.uint8)
+    # Encode from the exponent directly: at e = -127 the scale is a float32
+    # subnormal, so round-tripping it through log2 would be needlessly fragile.
+    e8m0 = (exponent.to(torch.int32) + _E8M0_BIAS).to(torch.uint8)
     return {"qweight": packed, "scale": e8m0, "format": "mxfp4"}
 
 
