@@ -1461,6 +1461,54 @@ def _lora_adapter_surfaces(base_chunk: nn.Module) -> list[tuple[str, Any, bool]]
     return surfaces
 
 
+def expected_expert_adapter_tensors(
+    *,
+    num_layers: int | None,
+    num_experts: int | None,
+    target_modules,
+) -> int | None:
+    """Expert adapter tensor count an adapter export must emit, or None.
+
+    ``linear_fc1`` fans out to ``gate_proj`` + ``up_proj`` and ``linear_fc2`` to
+    ``down_proj``; every resulting HF module contributes one ``lora_A`` and one
+    ``lora_B`` tensor per expert.
+    """
+    if not num_layers or not num_experts:
+        return None
+    targets = set(target_modules or ())
+    modules_per_expert = (2 if "linear_fc1" in targets else 0) + (
+        1 if "linear_fc2" in targets else 0
+    )
+    if modules_per_expert == 0:
+        return 0
+    return int(num_layers) * int(num_experts) * modules_per_expert * 2
+
+
+def guard_expert_adapter_completeness(stream, expected: int | None):
+    """Pass tensors through, raising if the expert surface is incomplete.
+
+    vLLM resolves adapter tensors by name and *silently* zeroes any module it
+    cannot find (``vllm/lora/models.py:719-720`` skips the module, then
+    ``:393-396`` calls ``reset_lora``). VERL's ``TensorLoRARequest`` path bypasses
+    vLLM's own name validation entirely, so a naming drift would quietly degrade
+    the rollout policy to the bare base model. Counting the expert surfaces we
+    emit converts that silent failure class into a crash.
+    """
+    seen_expert = 0
+    total = 0
+    for name, tensor in stream:
+        total += 1
+        if ".experts." in name:
+            seen_expert += 1
+        yield name, tensor
+    if expected is not None and seen_expert != expected:
+        raise RuntimeError(
+            f"LoRA adapter export emitted {seen_expert} expert tensors, expected "
+            f"{expected} (total tensors={total}). vLLM would silently zero the "
+            "missing expert adapters, so refusing to sync."
+        )
+
+
 def _gather_lora_factors_across_tp(
     lora_a: torch.Tensor,
     lora_b: torch.Tensor,
