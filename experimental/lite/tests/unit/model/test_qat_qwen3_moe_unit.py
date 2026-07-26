@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
@@ -12,6 +14,7 @@ import pytest
 from megatron.lite.model.qwen3_moe.lite.checkpoint import (
     _canonical_state_key,
     _resolve_param_name_canonical,
+    export_hf_weights,
 )
 from megatron.lite.primitive.quantization.qat import (
     QATSpec,
@@ -126,6 +129,55 @@ def test_qwen3_moe_canonical_state_key_maps_grouped_expert_master():
         real,
         rtol=0,
         atol=0,
+    )
+
+
+def test_qwen3_moe_mxfp4_resync_exports_compressed_tensors_stream(
+    monkeypatch,
+):
+    from megatron.lite.primitive.ckpt import hf_weights as hf_weights_module
+
+    expert = torch.arange(64, dtype=torch.float32).reshape(2, 32) - 31
+    router = torch.arange(64, dtype=torch.float32).reshape(2, 32)
+    source = [
+        ("model.layers.0.mlp.experts.0.gate_proj.weight", expert),
+        ("model.layers.0.self_attn.q_proj.weight", expert.clone()),
+        ("model.layers.0.mlp.gate.weight", router),
+        ("model.layers.0.input_layernorm.weight", torch.ones(32)),
+    ]
+    captured = {}
+
+    def fake_export(model, spec, ps, **kwargs):
+        captured["kwargs"] = kwargs
+        yield from source
+
+    monkeypatch.setattr(hf_weights_module, "export_hf_weights", fake_export)
+
+    exported = dict(
+        export_hf_weights(
+            object(),
+            SimpleNamespace(vocab_size=128),
+            object(),
+            target="mxfp4",
+            limit=4,
+        )
+    )
+
+    prefix = "model.layers.0.mlp.experts.0.gate_proj"
+    dense_prefix = "model.layers.0.self_attn.q_proj"
+    assert captured["kwargs"] == {"limit": 4, "vocab_size": 128}
+    assert exported[f"{prefix}.weight"].dtype == torch.uint8
+    assert exported[f"{prefix}.weight"].shape == (2, 16)
+    assert exported[f"{prefix}.weight_scale"].dtype == torch.uint8
+    assert exported[f"{prefix}.weight_scale"].shape == (2, 1)
+    assert exported[f"{dense_prefix}.weight"].dtype == torch.uint8
+    assert exported[f"{dense_prefix}.weight"].shape == (2, 16)
+    assert exported[f"{dense_prefix}.weight_scale"].dtype == torch.uint8
+    assert exported[f"{dense_prefix}.weight_scale"].shape == (2, 1)
+    assert torch.equal(exported["model.layers.0.mlp.gate.weight"], router)
+    assert torch.equal(
+        exported["model.layers.0.input_layernorm.weight"],
+        torch.ones(32),
     )
 
 
