@@ -474,50 +474,22 @@ class MegatronLiteEngine(BaseEngine):
         }
 
     def _checked_adapter_stream(self, stream):
-        """Fail loudly if the expert adapter surface is incomplete.
+        """Fail loudly if the expert adapter surface is incomplete."""
+        from megatron.lite.primitive.ckpt.hf_weights import (
+            expected_expert_adapter_tensors,
+            guard_expert_adapter_completeness,
+        )
 
-        vLLM resolves adapter tensors by name and *silently* zeroes any module it
-        cannot find (``vllm/lora/models.py:719-720`` skips, then ``:393-396``
-        calls ``reset_lora``). VERL's ``TensorLoRARequest`` path bypasses vLLM's
-        own name validation entirely, so a naming drift would degrade the rollout
-        policy to the bare base model without a single warning. Counting the
-        expert surfaces we emit turns that silent class of failure into a crash.
-        """
-        expected = self._expected_expert_adapter_tensors()
-        seen_expert = 0
-        total = 0
-        for name, tensor in stream:
-            total += 1
-            if ".experts." in name:
-                seen_expert += 1
-            yield name, tensor
-        if expected is not None and seen_expert != expected:
-            raise RuntimeError(
-                "LoRA adapter export emitted "
-                f"{seen_expert} expert tensors, expected {expected} "
-                f"(total tensors={total}). vLLM would silently zero the missing "
-                "expert adapters, so refusing to sync."
-            )
-
-    def _expected_expert_adapter_tensors(self) -> int | None:
-        """Expected expert adapter tensor count, or None when not derivable."""
         cfg = getattr(self, "_model_cfg", None) or self.handle._extras.get("model_cfg")
-        num_layers = getattr(cfg, "num_hidden_layers", None)
-        num_experts = getattr(cfg, "num_experts", None)
-        if not num_layers or not num_experts:
-            return None
         lora_cfg = (self._mlite_config.impl_cfg or {}).get("lora") if self._mlite_config else None
-        targets = set(
-            lora_cfg.get("target_modules", []) if hasattr(lora_cfg, "get") else []
+        expected = expected_expert_adapter_tensors(
+            num_layers=getattr(cfg, "num_hidden_layers", None),
+            num_experts=getattr(cfg, "num_experts", None),
+            target_modules=(
+                lora_cfg.get("target_modules", []) if hasattr(lora_cfg, "get") else []
+            ),
         )
-        # linear_fc1 fans out to gate_proj+up_proj, linear_fc2 to down_proj; each
-        # HF module contributes one lora_A and one lora_B tensor per expert.
-        modules_per_expert = (2 if "linear_fc1" in targets else 0) + (
-            1 if "linear_fc2" in targets else 0
-        )
-        if modules_per_expert == 0:
-            return 0
-        return int(num_layers) * int(num_experts) * modules_per_expert * 2
+        yield from guard_expert_adapter_completeness(stream, expected)
 
     def get_data_parallel_size(self):
         if self.handle is None:

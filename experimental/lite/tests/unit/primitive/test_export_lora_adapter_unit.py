@@ -21,7 +21,9 @@ import torch.nn as nn
 
 from megatron.lite.primitive.ckpt.hf_weights import (
     VLLM_LORA_NAME_PREFIX,
+    expected_expert_adapter_tensors,
     export_hf_lora_adapter,
+    guard_expert_adapter_completeness,
     vllm_applied_lora_scaling,
 )
 from megatron.lite.primitive.modules.lora import LinearLoRA, SharedGroupedLinearLoRA
@@ -220,3 +222,55 @@ def test_rslora_compensation_is_actually_load_bearing():
     ratio = (compensated.norm() / uncompensated.norm()).item()
     assert ratio == pytest.approx(math.sqrt(RANK), rel=1e-5)
     assert not torch.allclose(compensated, uncompensated)
+
+
+def test_expected_expert_tensor_count_follows_target_modules():
+    common = {"num_layers": 48, "num_experts": 128}
+    # linear_fc1 -> gate_proj + up_proj, linear_fc2 -> down_proj; x2 for A and B.
+    assert (
+        expected_expert_adapter_tensors(
+            **common, target_modules=["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"]
+        )
+        == 48 * 128 * 3 * 2
+    )
+    # Attention-only LoRA has no expert surface at all.
+    assert (
+        expected_expert_adapter_tensors(
+            **common, target_modules=["linear_qkv", "linear_proj"]
+        )
+        == 0
+    )
+    # Dense models cannot derive a count; the guard must stay inert.
+    assert (
+        expected_expert_adapter_tensors(
+            num_layers=48, num_experts=None, target_modules=["linear_fc1"]
+        )
+        is None
+    )
+
+
+def test_guard_passes_a_complete_expert_surface_through_untouched():
+    model = _TinyWrappedModel(use_rslora=True)
+    complete = list(export_hf_lora_adapter(model, _SplittingSpec(), _single_rank_ps()))
+    expected = expected_expert_adapter_tensors(
+        num_layers=1, num_experts=NUM_EXPERTS, target_modules=["linear_fc1"]
+    )
+
+    guarded = list(guard_expert_adapter_completeness(iter(complete), expected))
+
+    assert [name for name, _ in guarded] == [name for name, _ in complete]
+
+
+def test_guard_raises_when_one_expert_tensor_goes_missing():
+    """The fail-loud path must actually fire, not just exist."""
+    model = _TinyWrappedModel(use_rslora=True)
+    complete = list(export_hf_lora_adapter(model, _SplittingSpec(), _single_rank_ps()))
+    expected = expected_expert_adapter_tensors(
+        num_layers=1, num_experts=NUM_EXPERTS, target_modules=["linear_fc1"]
+    )
+
+    dropped_index = next(i for i, (name, _) in enumerate(complete) if ".experts." in name)
+    truncated = complete[:dropped_index] + complete[dropped_index + 1 :]
+
+    with pytest.raises(RuntimeError, match="expert tensors, expected"):
+        list(guard_expert_adapter_completeness(iter(truncated), expected))
