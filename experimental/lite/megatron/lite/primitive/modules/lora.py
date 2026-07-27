@@ -50,24 +50,26 @@ class LoraSpec:
     init: str = "default"
     # How the rollout engine receives the adapter.
     #
-    # ``merge`` folds the delta into the base weight in the rollout dtype. That
-    # silently rounds away sub-ulp updates (36% of adapted elements at lr=1e-5,
-    # ~70% at lr=3e-6 on a real r=128 checkpoint), so it is a known-lossy path.
+    # ``merge`` folds the delta into the base weight in the rollout dtype, which
+    # rounds away every update below half an ulp of the base weight. It is kept
+    # for initializations whose base is not the pretrained weight (OLoRA/PiSSA),
+    # where adapter-only sync would apply the delta to the wrong operand.
     #
     # ``adapter`` ships the LoRA factors and lets the inference engine apply
-    # them. It is the path we want, but it is NOT yet correct on this stack:
-    # a 6-step A/B (merge job 14400157 vs adapter job 14400159, identical
-    # otherwise) showed the adapter arm producing a near-uniform policy from
-    # the very first sync -- entropy pinned at 7.0-7.5 nats and reward exactly
-    # -1.0 at every step, while the merge arm trained normally (reward
-    # -0.672 -> -0.047, entropy 0.212 -> 0.044). Rollout/actor pearson stayed
-    # at 0.66-0.92 rather than collapsing, i.e. the weights do arrive but with
-    # the wrong magnitude.
+    # them. This is the default.
     #
-    # Default stays ``merge`` until that is root-caused: the failure mode is a
-    # silently random rollout policy with no error anywhere, only a reward that
-    # never leaves -1.0.
-    rollout_sync: str = "merge"
+    # NOTE: this field is declarative. The rollout export path resolves the mode
+    # from the raw engine config, not from this dataclass -- see
+    # ``MegatronLiteEngine._lora_rollout_sync_is_merge``. Keep the two defaults
+    # equal; tests/unit/verl/test_mlite_engine_lora_sync.py pins the resolver,
+    # which is the site that actually decides, and asserts the two agree.
+    #
+    # An earlier revision of this comment argued for a ``merge`` default from a
+    # run whose adapter arm produced a near-uniform policy. That failure was the
+    # rollout engine starting from random weights under ``load_format=dummy``
+    # plus an expert-parallel misattribution; both are fixed, so the argument no
+    # longer applies and is not restated here.
+    rollout_sync: str = "adapter"
     ignore_patterns: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_IGNORE_PATTERNS)
 
     @property

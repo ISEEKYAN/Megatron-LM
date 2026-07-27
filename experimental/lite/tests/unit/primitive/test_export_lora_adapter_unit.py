@@ -228,19 +228,25 @@ def test_rslora_compensation_is_actually_load_bearing():
 
 
 
-def test_rollout_sync_defaults_to_merge_until_adapter_path_is_fixed():
-    """Pin the default so it cannot silently flip back.
+def test_lora_spec_rollout_sync_is_declarative_and_round_trips():
+    """Pin the *declared* default and that an explicit value survives normalization.
 
-    The adapter path produced a near-uniform rollout policy (entropy ~7.2 nats,
-    reward pinned at -1.0) with no error raised -- job 14400159 vs the merge
-    control 14400157. A default flip is therefore a silent correctness
-    regression, which is exactly the class this suite exists to catch.
+    This test deliberately does not claim to pin rollout behaviour. Nothing in
+    the export path reads ``LoraSpec.rollout_sync``: the mode is resolved from
+    the raw engine config by ``MegatronLiteEngine._lora_rollout_sync_is_merge``,
+    pinned in tests/unit/verl/test_mlite_engine_lora_sync.py.
+
+    A previous version asserted a ``merge`` default here and read as a guarantee
+    of merged sync at runtime. It was not: the resolver defaulted to ``adapter``
+    the whole time, so this suite stayed green while every run took the other
+    path. The two defaults are now equal, and this test's job is to keep them
+    equal -- not to stand in for the resolver's.
     """
     from megatron.lite.primitive.modules.lora import LoraSpec, normalize_lora_spec
 
-    assert LoraSpec().rollout_sync == "merge"
-    assert normalize_lora_spec({"enabled": True, "rank": 8}).rollout_sync == "merge"
-    assert normalize_lora_spec({"enabled": True, "rank": 8, "rollout_sync": "adapter"}).rollout_sync == "adapter"
+    assert LoraSpec().rollout_sync == "adapter"
+    assert normalize_lora_spec({"enabled": True, "rank": 8}).rollout_sync == "adapter"
+    assert normalize_lora_spec({"enabled": True, "rank": 8, "rollout_sync": "merge"}).rollout_sync == "merge"
 
 # --- expert identity under expert parallelism -------------------------------
 #
