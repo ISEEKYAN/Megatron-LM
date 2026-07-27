@@ -21,6 +21,81 @@ def test_mlite_config_defaults_are_stable():
     assert cfg.parallel.cp == 1
     assert isinstance(cfg.optimizer, OptimizerConfig)
     assert isinstance(cfg.debug, DebugConfig)
+    assert cfg.precision == "bf16"
+
+
+@pytest.mark.parametrize(
+    "precision",
+    ["bf16", "hopper_blockwise_bf16_weight", "hopper_blockwise_fp8_weight"],
+)
+def test_mlite_config_round_trips_closed_precision_names(precision):
+    direct = MegatronLiteConfig(model_name="qwen3_moe", precision=precision)
+    parsed = MegatronLiteConfig.from_dict(
+        "/models/qwen", {"model_name": "qwen3_moe", "precision": precision}
+    )
+
+    assert direct.precision == precision
+    assert parsed.precision == precision
+
+
+def test_mlite_config_rejects_unknown_precision_name_at_construction():
+    with pytest.raises(ValueError, match="hopper_blockwise_bf16_weight"):
+        MegatronLiteConfig(precision="blockwise")
+    with pytest.raises(ValueError, match="hopper_blockwise_bf16_weight"):
+        MegatronLiteConfig.from_dict("/models/qwen", {"precision": "fp8"})
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"fp8_recipe": "blockwise"},
+        {"recipe": "blockwise"},
+        {"targets": ["attention"]},
+        {"weight_dtype": "fp8"},
+    ],
+)
+def test_mlite_config_rejects_ad_hoc_precision_overrides(override):
+    with pytest.raises(ValueError, match="closed precision names"):
+        MegatronLiteConfig.from_dict(
+            "/models/qwen",
+            {"precision": "hopper_blockwise_bf16_weight", **override},
+        )
+
+
+@pytest.mark.parametrize("parallel", [ParallelConfig(pp=2), ParallelConfig(cp=2)])
+def test_hopper_profiles_reject_unvalidated_parallel_combinations(parallel):
+    with pytest.raises(ValueError, match="pp=1 and cp=1"):
+        MegatronLiteConfig(precision="hopper_blockwise_bf16_weight", parallel=parallel)
+
+
+@pytest.mark.parametrize(
+    "impl_cfg",
+    [
+        {"cuda_graph": True},
+        {"fp8_param_gather": True},
+        {"fp8_communication": True},
+        {"mxfp8": True},
+    ],
+)
+def test_hopper_profiles_reject_unvalidated_runtime_features(impl_cfg):
+    with pytest.raises(ValueError, match="does not support"):
+        MegatronLiteConfig(
+            precision="hopper_blockwise_bf16_weight",
+            impl_cfg=impl_cfg,
+        )
+
+
+def test_hopper_profiles_reject_fp8_parameter_gather_in_optimizer_overrides():
+    with pytest.raises(ValueError, match="does not support fp8_param_gather"):
+        MegatronLiteConfig.from_dict(
+            "/models/qwen",
+            {
+                "precision": "hopper_blockwise_bf16_weight",
+                "optimizer": {
+                    "override_optimizer_config": {"fp8_param_gather": True}
+                },
+            },
+        )
 
 
 def test_mlite_config_from_dict_preserves_parallel_optimizer_and_impl_cfg():

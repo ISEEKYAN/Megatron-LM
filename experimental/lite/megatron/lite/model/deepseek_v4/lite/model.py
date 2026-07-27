@@ -62,7 +62,7 @@ from megatron.lite.primitive.parallel.mhc import (
     unfold_mhc_hidden_from_pipeline,
 )
 from megatron.lite.primitive.parallel.thd import _roll_packed_thd_left_local
-from megatron.lite.primitive.utils import build_fp8_recipe
+from megatron.lite.model._legacy_fp8 import build_fp8_recipe
 
 
 def _roll_mtp_left(

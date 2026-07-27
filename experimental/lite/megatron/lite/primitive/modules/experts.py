@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
@@ -19,6 +19,15 @@ from megatron.lite.primitive.modules.lora import (
     normalize_lora_config,
 )
 from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.precision import (
+    PrecisionCoverage,
+    PrecisionImplementation,
+    PrecisionPhase,
+    PrimitiveCapability,
+    SemanticSite,
+    active_precision,
+    precision_site_forward_context,
+)
 from megatron.lite.primitive.recompute import CheckpointWithoutOutput
 from megatron.lite.primitive.utils import ensure_divisible
 
@@ -78,9 +87,22 @@ class Experts(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        precision_coverage: PrecisionCoverage | None = None,
     ):
         super().__init__()
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
+        lora = normalize_lora_config(lora_config)
+        if precision_coverage is not None and lora.enabled:
+            raise ValueError(
+                "LoRA expert side paths are not covered by the closed Hopper profiles."
+            )
+        if precision_coverage is not None and fp8:
+            raise ValueError(
+                "model-threaded fp8 and typed precision coverage cannot be enabled together"
+            )
+        self._precision_implementation = self._bind_bf16_weight_precision(
+            precision_coverage, config=config, ps=ps
+        )
         self.fp8 = fp8
         self.moe_act_recompute = moe_act_recompute
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
@@ -100,7 +122,17 @@ class Experts(nn.Module):
             bias=False,
             params_dtype=torch.bfloat16,
         )
-        lora = normalize_lora_config(lora_config)
+        if precision_coverage is not None:
+            precision_coverage.claim(
+                self.fc1,
+                SemanticSite.MOE_EXPERT,
+                PrimitiveCapability.TE_GROUPED_LINEAR,
+            )
+            precision_coverage.claim(
+                self.fc2,
+                SemanticSite.MOE_EXPERT,
+                PrimitiveCapability.TE_GROUPED_LINEAR,
+            )
         self.fc1_lora: SharedGroupedLinearLoRA | None = None
         self.fc2_lora: SharedGroupedLinearLoRA | None = None
         if lora.enabled and lora.targets_module("linear_fc1"):
@@ -147,7 +179,7 @@ class Experts(nn.Module):
             else list(tokens_per_expert_list)
         )
         pad_mask = None
-        if self.fp8:
+        if self._precision_implementation is not None or self.fp8:
             x, permuted_probs, m_splits, pad_mask = self._fp8_pad(x, permuted_probs, m_splits)
 
         etp_real_len = x.shape[0]
@@ -182,20 +214,24 @@ class Experts(nn.Module):
         with _expert_nvtx_range("ep_experts.forward"):
             if self.moe_act_recompute and probs is not None:
                 act_ckpt = CheckpointWithoutOutput(preserve_rng_state=True)
-                fc1_out = self.fc1(x, m_splits)
+                with self._precision_context():
+                    fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
                 h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs, self.swiglu_limit)
-                out = self.fc2(h, m_splits)
+                with self._precision_context():
+                    out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
                 act_ckpt.discard_output_and_register_recompute(out)
             else:
-                fc1_out = self.fc1(x, m_splits)
+                with self._precision_context():
+                    fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
                 h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
-                out = self.fc2(h, m_splits)
+                with self._precision_context():
+                    out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
 
@@ -206,6 +242,44 @@ class Experts(nn.Module):
         if pad_mask is not None:
             out = out[pad_mask]
         return out
+
+    def _bind_bf16_weight_precision(
+        self,
+        coverage: PrecisionCoverage | None,
+        *,
+        config: Any,
+        ps: ParallelState,
+    ) -> PrecisionImplementation | None:
+        if coverage is None:
+            return None
+        implementation = active_precision(PrecisionPhase.MODEL_INIT)
+        if coverage.implementation is not implementation:
+            raise RuntimeError("precision coverage is bound to a different implementation")
+        dimensions = (
+            ("hidden_size", int(config.hidden_size)),
+            (
+                "fc1 output",
+                int(config.moe_intermediate_size * 2 // ps.etp_size),
+            ),
+            (
+                "fc2 input",
+                int(config.moe_intermediate_size // ps.etp_size),
+            ),
+        )
+        for label, value in dimensions:
+            if value % 128 != 0:
+                raise ValueError(
+                    f"MoE expert {label} must be divisible by 128 for Hopper "
+                    f"blockwise FP8; got {value}."
+                )
+        return implementation
+
+    def _precision_context(self):
+        if self._precision_implementation is None:
+            return nullcontext()
+        return precision_site_forward_context(
+            self._precision_implementation, SemanticSite.MOE_EXPERT
+        )
 
     @staticmethod
     def _fp8_pad(x, permuted_probs, m_splits):

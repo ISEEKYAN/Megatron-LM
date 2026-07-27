@@ -7,6 +7,7 @@ import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -173,6 +174,225 @@ def test_build_impl_cfg_preserves_explicit_impl_hf_path():
     impl_cfg = _build_impl_cfg(proto, cfg)
 
     assert impl_cfg.hf_path == "/models/impl"
+
+
+@dataclass
+class _PrecisionImplConfig:
+    parallel: object
+    precision_implementation: object = None
+    precision_parameter_contract: object = None
+    precision_coverage: object = None
+
+
+def test_build_impl_cfg_injects_typed_precision_contract_and_coverage():
+    from megatron.lite.primitive.precision import PrecisionCoverage, resolve_precision
+
+    proto = type("Proto", (), {"ImplConfig": _PrecisionImplConfig})
+    cfg = MegatronLiteConfig(precision="hopper_blockwise_bf16_weight")
+    implementation = resolve_precision(cfg.precision)
+    assert implementation is not None
+    coverage = PrecisionCoverage(implementation)
+
+    impl_cfg = _build_impl_cfg(
+        proto,
+        cfg,
+        precision_implementation=implementation,
+        precision_coverage=coverage,
+    )
+
+    assert impl_cfg.precision_implementation is implementation
+    assert impl_cfg.precision_parameter_contract is implementation.parameter_contract
+    assert impl_cfg.precision_coverage is coverage
+
+
+def test_build_impl_cfg_rejects_protocol_without_precision_injection_fields():
+    from megatron.lite.primitive.precision import PrecisionCoverage, resolve_precision
+
+    proto = type("Proto", (), {"ImplConfig": _FakeImplConfig})
+    cfg = MegatronLiteConfig(precision="hopper_blockwise_bf16_weight")
+    implementation = resolve_precision(cfg.precision)
+    assert implementation is not None
+
+    with pytest.raises(ValueError, match="precision_implementation"):
+        _build_impl_cfg(
+            proto,
+            cfg,
+            precision_implementation=implementation,
+            precision_coverage=PrecisionCoverage(implementation),
+        )
+
+
+def _patch_cpu_precision_build(monkeypatch, runtime, proto):
+    from megatron.lite.primitive.precision import hopper_blockwise
+
+    monkeypatch.setattr(runtime, "_load_protocol", lambda _cfg: proto)
+    monkeypatch.setattr(
+        "megatron.lite.runtime.backends.mlite.runtime.validate_hopper_environment",
+        lambda *_args, **_kwargs: SimpleNamespace(compute_capability=(9, 0)),
+    )
+    monkeypatch.setattr(
+        hopper_blockwise, "_build_hopper_blockwise_recipe", lambda: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        hopper_blockwise, "_validate_hopper_blockwise_recipe", lambda _recipe: None
+    )
+    monkeypatch.setattr(dist := torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
+    monkeypatch.setattr(torch.cuda, "manual_seed", lambda _seed: None)
+
+
+def _te_linear_witness(transformer_engine_import_stub, monkeypatch):
+    """Install a stub TE Linear class and return a real instance of it.
+
+    ``PrecisionCoverage.claim`` requires a genuine TE primitive instance, so the
+    fabricated production-path protocol must present one instead of a bare
+    ``object()``.
+    """
+
+    transformer_engine_import_stub()
+    import transformer_engine.pytorch as te
+
+    linear_type = type("FakeTELinear", (object,), {"__init__": lambda self: None})
+    monkeypatch.setattr(te, "Linear", linear_type, raising=False)
+    return linear_type()
+
+
+def _precision_protocol(*, seal: bool, events: list[str], projection_witness: object):
+    from megatron.lite.primitive.bundle import ModelBundle
+    from megatron.lite.primitive.precision import (
+        PrecisionPhase,
+        PrimitiveCapability,
+        SemanticSite,
+        active_precision,
+    )
+
+    class Proto:
+        ImplConfig = _PrecisionImplConfig
+
+        @staticmethod
+        def build_model_config(_source):
+            return SimpleNamespace(hidden_size=1)
+
+        @staticmethod
+        def build_model(_model_cfg, *, impl_cfg):
+            implementation = active_precision(PrecisionPhase.MODEL_INIT)
+            assert implementation is impl_cfg.precision_implementation
+            assert (
+                impl_cfg.precision_parameter_contract
+                is implementation.parameter_contract
+            )
+            # Owner-as-witness: the projection GEMM owner *is* the TE linear, as in
+            # the dense/expert production path, so the claim's witness is bound.
+            projection = projection_witness
+            core = object()
+            impl_cfg.precision_coverage.require(
+                projection,
+                SemanticSite.ATTENTION_PROJECTION,
+                frozenset({PrimitiveCapability.TE_LINEAR}),
+                diagnostic="unit projection",
+            )
+            impl_cfg.precision_coverage.claim(
+                projection,
+                SemanticSite.ATTENTION_PROJECTION,
+                PrimitiveCapability.TE_LINEAR,
+                projection_witness,
+            )
+            impl_cfg.precision_coverage.require(
+                core, SemanticSite.ATTENTION_CORE, diagnostic="unit attention core"
+            )
+            if seal:
+                impl_cfg.precision_coverage.seal()
+
+            model = nn.Linear(1, 1, bias=False)
+
+            def forward_step(module, batch):
+                events.append(active_precision(PrecisionPhase.FORWARD).name)
+                return {"logits": module(batch)}
+
+            ps = SimpleNamespace(pp_size=1, tp_size=1, cp_size=1)
+            return ModelBundle(
+                chunks=[model],
+                parallel_state=ps,
+                optimizer=None,
+                forward_step=forward_step,
+            )
+
+    return Proto
+
+
+def test_runtime_injects_and_seals_precision_on_the_production_build_and_forward_path(
+    monkeypatch, transformer_engine_import_stub
+):
+    events: list[str] = []
+    witness = _te_linear_witness(transformer_engine_import_stub, monkeypatch)
+    proto = _precision_protocol(seal=True, events=events, projection_witness=witness)
+    cfg = MegatronLiteConfig(
+        model_name="unit",
+        precision="hopper_blockwise_bf16_weight",
+        load_hf_weights=False,
+        attention_backend_override=None,
+    )
+    runtime = MegatronLiteRuntime("", cfg)
+    _patch_cpu_precision_build(monkeypatch, runtime, proto)
+
+    handle = runtime.build_model()
+    implementation = handle._extras["precision_implementation"]
+    assert implementation.name == "hopper_blockwise_bf16_weight"
+    assert (
+        handle._extras["precision_parameter_contract"]
+        is implementation.parameter_contract
+    )
+    assert (
+        handle._extras["precision_coverage"].implementation_name == implementation.name
+    )
+
+    result = runtime.forward_backward(
+        handle,
+        iter([torch.ones(1, 1)]),
+        None,
+        forward_only=True,
+    )
+
+    assert result.model_output.vocab_parallel_logits is not None
+    assert events == [implementation.name]
+
+
+def test_runtime_rejects_unsealed_precision_coverage(
+    monkeypatch, transformer_engine_import_stub
+):
+    witness = _te_linear_witness(transformer_engine_import_stub, monkeypatch)
+    proto = _precision_protocol(seal=False, events=[], projection_witness=witness)
+    cfg = MegatronLiteConfig(
+        model_name="unit",
+        precision="hopper_blockwise_bf16_weight",
+        load_hf_weights=False,
+        attention_backend_override=None,
+    )
+    runtime = MegatronLiteRuntime("", cfg)
+    _patch_cpu_precision_build(monkeypatch, runtime, proto)
+
+    with pytest.raises(RuntimeError, match="not sealed before optimizer"):
+        runtime.build_model()
+
+
+def test_runtime_runs_hopper_preflight_before_distributed_initialization(monkeypatch):
+    cfg = MegatronLiteConfig(precision="hopper_blockwise_bf16_weight")
+    runtime = MegatronLiteRuntime("", cfg)
+    init_process_group = MagicMock()
+    monkeypatch.setattr(torch.distributed, "init_process_group", init_process_group)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        "megatron.lite.runtime.backends.mlite.runtime.validate_hopper_environment",
+        MagicMock(side_effect=RuntimeError("preflight rejected environment")),
+    )
+
+    with pytest.raises(RuntimeError, match="preflight rejected environment"):
+        runtime.build_model()
+
+    init_process_group.assert_not_called()
 
 
 @pytest.mark.parametrize(

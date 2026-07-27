@@ -24,6 +24,55 @@ from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 
+class TinyFP8Model(nn.Module):
+    """A blockwise TE MLP whose parameters are constructed as FP8 weights."""
+
+    def __init__(self):
+        super().__init__()
+        from megatron.lite.primitive.modules.mlp import SwiGLUMLP
+        from megatron.lite.primitive.precision import (
+            PrecisionCoverage,
+            PrimitiveCapability,
+            SemanticSite,
+            precision_model_init_context,
+            resolve_precision,
+        )
+
+        implementation = resolve_precision("hopper_blockwise_fp8_weight")
+        assert implementation is not None
+        coverage = PrecisionCoverage(implementation)
+        with precision_model_init_context(implementation):
+            self.mlp = SwiGLUMLP(
+                128,
+                128,
+                precision_coverage=coverage,
+            )
+            # SwiGLUMLP claims its two dense_mlp GEMMs; the composing layer owns
+            # the matching requirements (mirrors _declare_layer_precision_requirements
+            # and the primitive-parity harness). Declare them against the same
+            # owner objects the primitive claimed, then seal.
+            coverage.require(
+                self.mlp.gate_up,
+                SemanticSite.DENSE_MLP,
+                frozenset({PrimitiveCapability.TE_LINEAR}),
+                diagnostic="dense mlp gate_up projection",
+            )
+            coverage.require(
+                self.mlp.down,
+                SemanticSite.DENSE_MLP,
+                frozenset({PrimitiveCapability.TE_LINEAR}),
+                diagnostic="dense mlp down projection",
+            )
+            self.coverage_manifest = coverage.seal()
+        self.precision_implementation = implementation
+
+    def forward(self, x):
+        from megatron.lite.primitive.precision import precision_forward_context
+
+        with precision_forward_context(self.precision_implementation):
+            return self.mlp(x)
+
+
 class TinyUnit(nn.Module):
     def __init__(self):
         super().__init__()
@@ -175,6 +224,23 @@ def _build_optimizer(model: nn.Module, ps: ParallelState, *, offload_fraction: f
     )
 
 
+def _build_fp8_fsdp2_model() -> tuple[nn.Module, ParallelState, dict[str, torch.Tensor]]:
+    torch.manual_seed(1234)
+    model = TinyFP8Model().cuda().to(dtype=torch.bfloat16)
+    sources = {}
+    for name, param in model.named_parameters():
+        get_source = getattr(param, "get_high_precision_init_val", None)
+        assert callable(get_source), f"{name} is missing TE's preserved FP32 source"
+        source = get_source()
+        assert isinstance(source, torch.Tensor)
+        sources[name] = source.detach().float().cpu().clone()
+
+    ps = _parallel_state()
+    config = FSDP2Config(unit_modules=(type(model.mlp),), reshard_after_forward=True)
+    mesh = build_fsdp2_device_mesh(ps, config)
+    return wrap_fsdp2(model, ps, config, mesh=mesh), ps, sources
+
+
 def _local_param_devices(model: nn.Module) -> set[str]:
     return {to_local_tensor(param.detach()).device.type for param in model.parameters()}
 
@@ -189,6 +255,30 @@ def _optimizer_state_devices(optimizer) -> set[str]:
                 if isinstance(value, torch.Tensor):
                     devices.add(to_local_tensor(value).device.type)
     return devices
+
+
+def _fp8_step(model: nn.Module, optimizer, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    optimizer.zero_grad()
+    loss = torch.nn.functional.mse_loss(model(x).float(), target.float())
+    loss.backward()
+    success, grad_norm, _ = optimizer.step()
+
+    assert success
+    assert torch.isfinite(loss)
+    assert torch.isfinite(torch.tensor(grad_norm))
+    return loss.detach()
+
+
+def _fp32_masters(model: nn.Module, optimizer) -> dict[str, torch.Tensor]:
+    # FP8-weight masters are DTensors mirroring the sharded param, so localize
+    # the shard before comparing against plain-tensor references.
+    return {
+        name: to_local_tensor(optimizer.optimizer.state[param]["master_param"].detach())
+        .float()
+        .cpu()
+        .clone()
+        for name, param in model.named_parameters()
+    }
 
 
 def test_fsdp2_runtime_model_and_optimizer_offload_roundtrip_single_gpu():
@@ -447,3 +537,81 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
 
     runtime.to(materialized_handle, "cuda", model=True, optimizer=False, grad=False)
     assert _local_param_devices(materialized_model) == {"cuda"}
+
+
+def test_fsdp2_fp8_weight_uses_te_source_for_fp32_master_and_updates_single_gpu():
+    model, ps, sources = _build_fp8_fsdp2_model()
+    optimizer = _build_optimizer(model, ps, offload_fraction=0.0)
+
+    masters = {
+        name: to_local_tensor(optimizer.optimizer.state[param]["master_param"].detach())
+        .float()
+        .cpu()
+        for name, param in model.named_parameters()
+    }
+    assert masters.keys() == sources.keys()
+    for name in sources:
+        torch.testing.assert_close(masters[name], sources[name], atol=0.0, rtol=0.0)
+        assert getattr(model.get_parameter(name), "get_high_precision_init_val")() is None
+
+    x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    target = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    _fp8_step(model, optimizer, x, target)
+
+
+def test_fsdp2_fp8_weight_local_checkpoint_resume_matches_uninterrupted_single_gpu(tmp_path):
+    direct_model, direct_ps, _ = _build_fp8_fsdp2_model()
+    direct_optimizer = _build_optimizer(direct_model, direct_ps, offload_fraction=0.0)
+    saved_model, saved_ps, _ = _build_fp8_fsdp2_model()
+    saved_optimizer = _build_optimizer(saved_model, saved_ps, offload_fraction=0.0)
+
+    torch.manual_seed(4321)
+    x0 = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    target0 = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    x1 = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    target1 = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+
+    torch.testing.assert_close(
+        _fp8_step(direct_model, direct_optimizer, x0, target0),
+        _fp8_step(saved_model, saved_optimizer, x0, target0),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime.save_checkpoint(
+        ModelHandle(
+            model=saved_model,
+            optimizer=saved_optimizer,
+            parallel_state=saved_ps,
+            _extras={"model_chunks": [saved_model]},
+        ),
+        str(tmp_path),
+        step=1,
+        use_dcp=False,
+    )
+
+    resumed_model, resumed_ps, _ = _build_fp8_fsdp2_model()
+    resumed_optimizer = _build_optimizer(resumed_model, resumed_ps, offload_fraction=0.0)
+    assert runtime.load_checkpoint(
+        ModelHandle(
+            model=resumed_model,
+            optimizer=resumed_optimizer,
+            parallel_state=resumed_ps,
+            _extras={"model_chunks": [resumed_model]},
+        ),
+        str(tmp_path),
+        use_dcp=False,
+    ) == 1
+
+    for name, master in _fp32_masters(saved_model, saved_optimizer).items():
+        torch.testing.assert_close(
+            _fp32_masters(resumed_model, resumed_optimizer)[name], master, atol=0.0, rtol=0.0
+        )
+
+    _fp8_step(direct_model, direct_optimizer, x1, target1)
+    _fp8_step(resumed_model, resumed_optimizer, x1, target1)
+    for name, master in _fp32_masters(direct_model, direct_optimizer).items():
+        torch.testing.assert_close(
+            _fp32_masters(resumed_model, resumed_optimizer)[name], master, atol=0.0, rtol=0.0
+        )

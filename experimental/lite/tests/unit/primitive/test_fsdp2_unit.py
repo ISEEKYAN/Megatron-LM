@@ -17,7 +17,7 @@ from megatron.lite.primitive.optimizers.fsdp2 import (
     clip_grads_with_sharded_norm_,
     fsdp2_available,
 )
-from megatron.lite.primitive.optimizers.fsdp2.adamw import build_adamw_optimizer
+from megatron.lite.primitive.optimizers.fsdp2.adamw import FP32AdamW, build_adamw_optimizer
 from megatron.lite.primitive.optimizers.fsdp2.wrap import build_fsdp2_shard_placement_fn
 from megatron.lite.primitive.parallel.state import ParallelState
 
@@ -199,6 +199,29 @@ def test_fsdp2_optimizer_offloads_dtensor_state_without_extra_knob(monkeypatch):
 
     assert calls == [True]
     assert not hasattr(optimizer, "optimizer_offload_dtensor_state")
+
+
+def test_fp32_adamw_uses_and_clears_te_high_precision_init_value():
+    """The optimizer master must never be reconstructed from an FP8 compute value."""
+
+    param = nn.Parameter(torch.tensor([9.0, -7.0], dtype=torch.bfloat16))
+    source = torch.tensor([1.125, -2.25], dtype=torch.bfloat16)
+    cleared = []
+
+    def get_high_precision_init_val():
+        return source
+
+    def clear_high_precision_init_val():
+        cleared.append(True)
+
+    param.get_high_precision_init_val = get_high_precision_init_val
+    param.clear_high_precision_init_val = clear_high_precision_init_val
+    optimizer = FP32AdamW(
+        [param], lr=1.0e-3, weight_decay=0.0, betas=(0.9, 0.999), eps=1.0e-8
+    )
+
+    torch.testing.assert_close(optimizer.state[param]["master_param"], source.float())
+    assert cleared == [True]
 
 
 def test_fsdp2_shard_placement_prefers_first_divisible_dimension():

@@ -41,7 +41,7 @@ from megatron.lite.primitive.parallel import (
     gather_from_sequence_parallel,
     scatter_to_sequence_parallel,
 )
-from megatron.lite.primitive.utils import build_fp8_recipe
+from megatron.lite.model._legacy_fp8 import build_fp8_recipe
 
 _SP_GRAD_SUFFIXES: tuple[str, ...] = (
     ".full_attn.qkv.linear.layer_norm_weight",

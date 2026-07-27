@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch  # pyright: ignore[reportMissingImports]
@@ -10,10 +11,93 @@ import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 import transformer_engine.pytorch as te  # pyright: ignore[reportMissingImports]
 
+from megatron.lite.primitive.precision import (
+    PrecisionCoverage,
+    PrecisionImplementation,
+    PrecisionPhase,
+    PrimitiveCapability,
+    SemanticSite,
+    active_precision,
+    precision_site_forward_context,
+)
 from megatron.lite.primitive.utils import ensure_divisible
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.parallel.state import ParallelState
+
+
+def _validate_blockwise_features(
+    in_features: int,
+    out_features: int,
+    site: SemanticSite,
+) -> None:
+    for label, value in (("input", in_features), ("output", out_features)):
+        if value % 128 != 0:
+            raise ValueError(
+                f"{site.value} {label} features must be divisible by 128 for "
+                f"Hopper blockwise FP8; got {value}."
+            )
+
+
+def _validate_blockwise_precision(
+    coverage: PrecisionCoverage | None,
+    site: SemanticSite | None,
+    *,
+    in_features: int,
+    out_features: int,
+) -> PrecisionImplementation | None:
+    """Validate one TP linear site against the active blockwise profile.
+
+    Returns the bound implementation (or ``None`` when precision is unmanaged).
+    Both closed profiles use the same typed site coverage; their compute-weight
+    storage differs only at Transformer Engine parameter construction. The
+    capability claim itself is registered by the caller after the TE module is
+    constructed, so coverage can bind to the real TE primitive instance.
+    """
+
+    if coverage is None:
+        if site is not None:
+            raise ValueError("precision_site requires a typed precision coverage collector")
+        return None
+    if site is None:
+        raise ValueError("precision_coverage requires an explicit semantic site")
+    implementation = active_precision(PrecisionPhase.MODEL_INIT)
+    if coverage.implementation is not implementation:
+        raise RuntimeError("precision coverage is bound to a different implementation")
+    if site not in implementation.fp8_sites:
+        raise ValueError(f"site {site.value} is not an FP8 GEMM site")
+    _validate_blockwise_features(in_features, out_features, site)
+    return implementation
+
+
+def _validate_blockwise_input(x: torch.Tensor, site: SemanticSite) -> None:
+    if x.dim() < 2:
+        raise ValueError(
+            f"{site.value} input rank must be at least 2 for Hopper blockwise FP8"
+        )
+    if x.shape[-1] % 128 != 0:
+        raise ValueError(
+            f"{site.value} input last dimension must be divisible by 128; "
+            f"got {x.shape[-1]}."
+        )
+    rows = x.numel() // x.shape[-1]
+    if rows % 128 != 0:
+        raise ValueError(
+            f"{site.value} input row product must be divisible by 128; got {rows}."
+        )
+
+
+def _linear_precision_context(
+    implementation: PrecisionImplementation | None,
+    site: SemanticSite | None,
+    x: torch.Tensor,
+):
+    if implementation is None:
+        return nullcontext()
+    if site is None:
+        raise RuntimeError("bound precision linear is missing its semantic site")
+    _validate_blockwise_input(x, site)
+    return precision_site_forward_context(implementation, site)
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +261,8 @@ class ColumnParallelLinear(nn.Module):
         eps: float = 1e-6,
         zero_centered_gamma: bool = False,
         sequence_parallel: bool | None = None,
+        precision_coverage: PrecisionCoverage | None = None,
+        precision_site: SemanticSite | None = None,
     ):
         super().__init__()
         self.tp_size = ps.tp_size
@@ -185,6 +271,18 @@ class ColumnParallelLinear(nn.Module):
         self.local_out = ensure_divisible(out_features, ps.tp_size)
         self.use_sp = (
             ps.tp_size > 1 and not gather_output if sequence_parallel is None else sequence_parallel
+        )
+        self._precision_site = precision_site
+        capability = (
+            PrimitiveCapability.TE_LAYERNORM_LINEAR
+            if normalization is not None
+            else PrimitiveCapability.TE_LINEAR
+        )
+        self._precision_implementation = _validate_blockwise_precision(
+            precision_coverage,
+            precision_site,
+            in_features=in_features,
+            out_features=self.local_out,
         )
         if normalization is not None:
             self.linear = te.LayerNormLinear(
@@ -211,10 +309,15 @@ class ColumnParallelLinear(nn.Module):
                 tp_group=ps.tp_group,
                 tp_size=ps.tp_size,
             )
+        if self._precision_implementation is not None:
+            precision_coverage.claim(self, precision_site, capability, self.linear)
         self.gather_output = gather_output
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.linear(x)
+        with _linear_precision_context(
+            self._precision_implementation, self._precision_site, x
+        ):
+            out = self.linear(x)
         if self.gather_output and self.tp_size > 1:
             out = _AllGatherLastDim.apply(out, self.tp_size, self.tp_group)
         return out
@@ -230,6 +333,8 @@ class RowParallelLinear(nn.Module):
         ps: ParallelState,
         bias: bool = False,
         input_is_parallel: bool = True,
+        precision_coverage: PrecisionCoverage | None = None,
+        precision_site: SemanticSite | None = None,
     ):
         super().__init__()
         self.tp_size = ps.tp_size
@@ -237,6 +342,13 @@ class RowParallelLinear(nn.Module):
         self.tp_group = ps.tp_group
         self.use_sp = ps.tp_size > 1
         self.local_in = ensure_divisible(in_features, ps.tp_size)
+        self._precision_site = precision_site
+        self._precision_implementation = _validate_blockwise_precision(
+            precision_coverage,
+            precision_site,
+            in_features=self.local_in,
+            out_features=out_features,
+        )
         self.linear = te.Linear(
             in_features,
             out_features,
@@ -247,9 +359,16 @@ class RowParallelLinear(nn.Module):
             tp_group=ps.tp_group,
             tp_size=ps.tp_size,
         )
+        if self._precision_implementation is not None:
+            precision_coverage.claim(
+                self, precision_site, PrimitiveCapability.TE_LINEAR, self.linear
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+        with _linear_precision_context(
+            self._precision_implementation, self._precision_site, x
+        ):
+            return self.linear(x)
 
 
 def pad_vocab_for_tp(vocab_size: int, tp_size: int) -> int:
@@ -258,8 +377,8 @@ def pad_vocab_for_tp(vocab_size: int, tp_size: int) -> int:
     Matches MC's `_vocab_size_with_padding(..., make_vocab_size_divisible_by=128)`:
     pad to 128-multiple for GEMM alignment, and also require tp-divisibility.
     For typical `tp_size ∈ {1,2,4,...,128}`, `lcm = 128` so a vocab already
-    divisible by 128 (e.g. Qwen3-MoE's 151936) stays unchanged — which is
-    what MC's `output_layer` sees. Using `128 * tp_size` instead would
+    divisible by 128 stays unchanged, matching MC's `output_layer`. Using
+    `128 * tp_size` instead would
     over-pad (e.g. 151936 -> 152064
     at tp=2), introducing 128 extra logits into the vocab-parallel cross-
     entropy log-sum-exp and driving a ~3e-4 loss drift.

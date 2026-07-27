@@ -81,6 +81,28 @@ def all_reduce_grad_(grad: torch.Tensor, *, group: dist.ProcessGroup) -> None:
     dist.all_reduce(local_grad, op=dist.ReduceOp.SUM, group=group)
 
 
+def _take_te_high_precision_init_val(param: nn.Parameter) -> torch.Tensor | None:
+    """Consume TE's preserved source exactly once when constructing an FP32 master."""
+
+    local = to_local_tensor(param)
+    targets = (local,) if local is param else (local, param)
+    for target in targets:
+        get_value = getattr(target, "get_high_precision_init_val", None)
+        if not callable(get_value):
+            continue
+        value = get_value()
+        if value is None:
+            continue
+        if not isinstance(value, torch.Tensor):
+            raise TypeError("TE high-precision initialization value must be a tensor.")
+        clear_value = getattr(target, "clear_high_precision_init_val", None)
+        if not callable(clear_value):
+            raise RuntimeError("TE FP8 parameter exposes no clear_high_precision_init_val method.")
+        clear_value()
+        return value
+    return None
+
+
 class ChainedOptimizer:
     def __init__(self, optimizers: Iterable[torch.optim.Optimizer]):
         self.optimizers = list(optimizers)
@@ -161,6 +183,33 @@ class FP32AdamW:
                 self._master_for_param[param] = master
 
     def _init_master_param(self, param: nn.Parameter) -> torch.Tensor:
+        high_precision_init = _take_te_high_precision_init_val(param)
+        if high_precision_init is not None:
+            local_param = to_local_tensor(param.detach())
+            if high_precision_init.shape != local_param.shape:
+                raise RuntimeError(
+                    "TE high-precision initialization value does not match this FSDP2 "
+                    "local shard; FP8 masters must be initialized from TE's local "
+                    "preserved source, never by dequantizing the FP8 parameter."
+                )
+            master_local = high_precision_init.to(
+                device="cpu" if self.cpu_update else local_param.device, dtype=torch.float32
+            ).clone()
+            if self.cpu_update or not is_dtensor_like(param):
+                return master_local
+            # The FP8 param is a DTensor, but its preserved high-precision source is
+            # a plain local shard. Mirror the param's sharding so the master (and the
+            # exp_avg/exp_avg_sq derived from it) stay DTensors like the grad; a plain
+            # local master would collide with the DTensor grad in the AdamW update.
+            # Pass the param's exact global shape/stride so unevenly-sharded params
+            # round-trip correctly, and never dequantize the FP8 param to build it.
+            return dtensor_from_local(
+                master_local,
+                param.device_mesh,
+                param.placements,
+                shape=param.shape,
+                stride=param.stride(),
+            )
         if self.cpu_update:
             local_param = to_local_tensor(param.detach())
             return local_param.detach().to(device="cpu", dtype=torch.float32).clone()
