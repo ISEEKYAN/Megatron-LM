@@ -427,10 +427,8 @@ def test_amax_buffer_shapes():
 # runs on random weights. These CPU tests import the real qwen3_5 checkpoint
 # loader and prove the master receives the real tensor for all four formats.
 
-from megatron.lite.model.qwen3_5.lite.checkpoint import (  # noqa: E402
-    _canonical_state_key,
-    _copy_loaded_state,
-)
+from megatron.lite.primitive.ckpt.hf_weights import _resolve_param_name  # noqa: E402
+from megatron.lite.primitive.quantization.qat import canonical_state_key  # noqa: E402
 
 
 def _toy_linear_chunk(in_features: int = 64, out_features: int = 12):
@@ -452,16 +450,28 @@ def _toy_linear_chunk(in_features: int = 64, out_features: int = 12):
 
 
 def test_canonical_state_key_strips_only_parametrization_original():
-    assert _canonical_state_key("a.b.linear.weight") == "a.b.linear.weight"
+    assert canonical_state_key("a.b.linear.weight") == "a.b.linear.weight"
     assert (
-        _canonical_state_key("a.b.linear.parametrizations.weight.original")
+        canonical_state_key("a.b.linear.parametrizations.weight.original")
         == "a.b.linear.weight"
     )
     # quantizer buffers keep their real name (must NOT collide with the master)
     assert (
-        _canonical_state_key("a.b.linear.parametrizations.weight.0.amax")
+        canonical_state_key("a.b.linear.parametrizations.weight.0.amax")
         == "a.b.linear.parametrizations.weight.0.amax"
     )
+
+
+def _copy_via_checkpoint_primitive(
+    model: nn.Module, loaded: dict[str, torch.Tensor]
+) -> None:
+    state = model.state_dict()
+    targets = dict(model.named_parameters(remove_duplicate=False))
+    targets.update(dict(model.named_buffers(remove_duplicate=False)))
+    for logical_name, tensor in loaded.items():
+        actual = _resolve_param_name(logical_name, state)
+        assert actual is not None
+        targets[actual].data.copy_(tensor)
 
 
 @pytest.mark.parametrize(
@@ -480,7 +490,7 @@ def test_apply_before_load_still_loads_master_weight(fmt, group_size):
     # 2) load the HF-mapped state (keyed by the logical ``….linear.weight``).
     real_qkv = torch.randn(12, 64, dtype=torch.bfloat16)
     real_proj = torch.randn(12, 64, dtype=torch.bfloat16)
-    _copy_loaded_state(
+    _copy_via_checkpoint_primitive(
         chunk,
         {"qkv.linear.weight": real_qkv, "proj.linear.weight": real_proj},
     )
@@ -510,14 +520,14 @@ def test_master_left_random_without_mapping_would_fail_naively():
     assert loaded_name not in state_keys  # not an exact key anymore
     assert not any(loaded_name in k for k in state_keys)  # not a substring either
     # but canonicalization recovers it
-    canon = {_canonical_state_key(k): k for k in state_keys}
+    canon = {canonical_state_key(k): k for k in state_keys}
     assert canon[loaded_name] == "qkv.linear.parametrizations.weight.original"
 
 
 def test_load_unparametrized_module_unchanged_by_refactor():
-    """The _copy_loaded_state refactor must not regress the plain (non-QAT) path."""
+    """The primitive resolver must not regress the plain (non-QAT) path."""
     torch.manual_seed(9)
     chunk = _toy_linear_chunk()
     real = torch.randn(12, 64, dtype=torch.bfloat16)
-    _copy_loaded_state(chunk, {"qkv.linear.weight": real})
+    _copy_via_checkpoint_primitive(chunk, {"qkv.linear.weight": real})
     torch.testing.assert_close(chunk.qkv.linear.weight, real, rtol=0, atol=0)
