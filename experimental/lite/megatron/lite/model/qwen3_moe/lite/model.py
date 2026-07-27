@@ -101,8 +101,9 @@ class MoELayer(nn.Module):
             )
 
         def preprocess(x):
-            scores, indices = self.router(x)
-            return self.dispatcher.alltoall_dispatch_preprocess(x, scores, indices)
+            x_2d = x.view(-1, x.size(-1)) if x.dim() == 3 else x
+            scores, indices = self.router(x_2d)
+            return self.dispatcher.alltoall_dispatch_preprocess(x_2d, scores, indices)
 
         def communicate(permuted, permuted_probs, tokens_per_expert):
             return self.dispatcher.alltoall_dispatch_communicate(
@@ -226,12 +227,12 @@ class TransformerLayer(nn.Module):
             x = residual + h
             residual = x
             h = self.mlp_norm(x)
-            permuted, permuted_probs = moe_preprocess(h)
-            return residual, permuted, permuted_probs
+            permuted, permuted_probs, tokens_per_expert = moe_preprocess(h)
+            return residual, permuted, permuted_probs, tokens_per_expert
 
-        def dispatch_node(residual, permuted, permuted_probs):
+        def dispatch_node(residual, permuted, permuted_probs, tokens_per_expert):
             dispatched, tokens_per_expert, permuted_probs = dispatch(
-                permuted, permuted_probs
+                permuted, permuted_probs, tokens_per_expert
             )
             return residual, dispatched, tokens_per_expert, permuted_probs
 
@@ -239,7 +240,8 @@ class TransformerLayer(nn.Module):
             return residual, experts(dispatched, tokens_per_expert, permuted_probs)
 
         def combine_node(residual, expert_output):
-            return residual + combine(expert_output)
+            combined = combine(expert_output).view_as(residual).to(residual.dtype)
+            return residual + combined
 
         return pre_dispatch, dispatch_node, experts_node, combine_node
 

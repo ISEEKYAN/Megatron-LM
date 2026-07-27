@@ -5,6 +5,8 @@ import ast
 from pathlib import Path
 
 import pytest
+import torch
+from torch import nn
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
@@ -119,6 +121,68 @@ def test_qwen_lite_protocols_build_configs_from_hf_dicts(transformer_engine_impo
     assert qwen35_cfg.vocab_size == 128
     assert qwen35_cfg.layer_type_at(0) == "linear_attention"
     assert qwen35_cfg.layer_type_at(1) == "full_attention"
+
+
+def test_qwen3_combined_1f1b_flattens_moe_tokens_and_restores_layer_shape(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+
+    from megatron.lite.model.qwen3_moe.lite.model import MoELayer, TransformerLayer
+
+    class _Router(nn.Module):
+        def forward(self, hidden):
+            assert hidden.shape == (6, 4)
+            return hidden.new_ones(6, 1), torch.zeros(
+                6, 1, dtype=torch.long, device=hidden.device
+            )
+
+    class _Dispatcher:
+        ep_size = 2
+        use_deepep = False
+
+        def alltoall_dispatch_preprocess(self, hidden, scores, indices):
+            assert hidden.shape == (6, 4)
+            assert scores.shape == indices.shape == (6, 1)
+            return hidden, scores, torch.tensor([3, 3])
+
+        def alltoall_dispatch_communicate(self, hidden, scores, tokens_per_expert):
+            return hidden, tokens_per_expert, scores
+
+        def alltoall_combine_communicate(self, expert_output):
+            return expert_output
+
+    class _Attention(nn.Module):
+        def forward(self, hidden, **_kwargs):
+            return torch.zeros_like(hidden)
+
+    class _Experts(nn.Module):
+        def forward(self, hidden, *_args, **_kwargs):
+            return hidden
+
+    moe = MoELayer.__new__(MoELayer)
+    nn.Module.__init__(moe)
+    moe.router = _Router()
+    moe.experts = _Experts()
+    moe.dispatcher = _Dispatcher()
+
+    layer = TransformerLayer.__new__(TransformerLayer)
+    nn.Module.__init__(layer)
+    layer.attn = _Attention()
+    layer.mlp_norm = nn.Identity()
+    layer.moe = moe
+
+    pre_dispatch, dispatch, experts, combine = layer.combined_1f1b_callables(
+        position_ids=None, packed_seq_params=None
+    )
+    hidden = torch.randn(3, 2, 4)
+    residual, permuted, probs, tokens_per_expert = pre_dispatch(hidden)
+    residual, dispatched, tokens_per_expert, probs = dispatch(
+        residual, permuted, probs, tokens_per_expert
+    )
+    residual, expert_output = experts(residual, dispatched, tokens_per_expert, probs)
+
+    assert combine(residual, expert_output).shape == hidden.shape
 
 
 def test_qwen_lite_protocols_reexport_checkpoint_hook_names():
