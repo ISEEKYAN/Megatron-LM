@@ -46,6 +46,16 @@ def test_bench_builds_mlite_runtime_config_with_model_hook():
     assert model_cfg.num_nextn_predict_layers == 0
 
 
+def test_qwen3_chunked_ep_pair_uses_deepep_and_explicit_chunks():
+    root = Path(__file__).resolve().parents[3]
+    script = root / "examples/bench/scripts/run_qwen3_chunked_ep_pair.sh"
+    text = script.read_text(encoding="utf-8")
+
+    assert text.count('"use_deepep":true') == 2
+    assert '"num_chunks_ep_a2a_overlap":2' in text
+    assert "overlap_moe_expert_parallel_comm" not in text
+
+
 def test_bench_mlite_deterministic_mounts_native_vision_not_mbridge(monkeypatch):
     from examples.bench.bench import BenchCliConfig, build_runtime_config
 

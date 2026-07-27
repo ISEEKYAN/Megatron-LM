@@ -82,6 +82,8 @@ class ImplConfig:
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
+    num_chunks_ep_a2a_overlap: int = 1
+    ep_chunk_bwd_num_chunks: int | None = None
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     router_aux_loss_coef: float | None = None
@@ -162,6 +164,24 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     # ── validation ──
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
+    if impl_cfg.num_chunks_ep_a2a_overlap < 1:
+        raise ValueError("num_chunks_ep_a2a_overlap must be >= 1")
+    if (
+        impl_cfg.ep_chunk_bwd_num_chunks is not None
+        and impl_cfg.ep_chunk_bwd_num_chunks < 1
+    ):
+        raise ValueError("ep_chunk_bwd_num_chunks must be >= 1")
+    chunked_ep = impl_cfg.num_chunks_ep_a2a_overlap > 1
+    if not chunked_ep and (impl_cfg.ep_chunk_bwd_num_chunks or 1) > 1:
+        raise ValueError(
+            "ep_chunk_bwd_num_chunks > 1 requires "
+            "num_chunks_ep_a2a_overlap > 1"
+        )
+    if chunked_ep:
+        if p.ep <= 1:
+            raise ValueError("ChunkedEP requires EP > 1")
+        if not impl_cfg.use_deepep:
+            raise ValueError("ChunkedEP requires DeepEP (use_deepep=True)")
 
     # ── override model config from impl_cfg ──
     if impl_cfg.router_aux_loss_coef is not None:
@@ -192,6 +212,8 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         mtp_enable=mtp_enable,
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
+        num_chunks_ep_a2a_overlap=impl_cfg.num_chunks_ep_a2a_overlap,
+        ep_chunk_bwd_num_chunks=impl_cfg.ep_chunk_bwd_num_chunks,
         lora_config=lora_config,
     )
 
@@ -210,9 +232,12 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
     # ── recompute ──
-    if recompute_spec:
+    layer_recompute_spec = recompute_spec
+    if chunked_ep and "moe" in recompute_spec:
+        layer_recompute_spec = [name for name in recompute_spec if name != "moe"]
+    if layer_recompute_spec:
         for chunk in chunks:
-            apply_recompute(chunk.layers, recompute_spec, MODULE_MAP)
+            apply_recompute(chunk.layers, layer_recompute_spec, MODULE_MAP)
 
     # ── offload ──
     if impl_cfg.offload:

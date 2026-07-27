@@ -79,7 +79,14 @@ class MegatronLiteConfig:
         for k in list(impl_cfg):
             if k in cfg:
                 impl_cfg[k] = cfg[k]
-        for k in ("recompute", "use_thd", "use_deepep", "precision_aware_opt"):
+        for k in (
+            "recompute",
+            "use_thd",
+            "use_deepep",
+            "num_chunks_ep_a2a_overlap",
+            "ep_chunk_bwd_num_chunks",
+            "precision_aware_opt",
+        ):
             if k in cfg and k not in impl_cfg:
                 impl_cfg[k] = cfg[k]
 

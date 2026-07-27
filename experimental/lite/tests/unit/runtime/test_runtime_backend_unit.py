@@ -116,6 +116,22 @@ def test_mlite_config_impl_cfg_optimizer_and_load_gate():
     assert cfg.model_config_hook is hook
 
 
+def test_mlite_config_accepts_explicit_chunked_ep_fields():
+    cfg = MegatronLiteConfig.from_dict(
+        "/models/qwen3",
+        {
+            "model_name": "qwen3_moe",
+            "use_deepep": True,
+            "num_chunks_ep_a2a_overlap": 2,
+            "ep_chunk_bwd_num_chunks": 3,
+        },
+    )
+
+    assert cfg.impl_cfg["use_deepep"] is True
+    assert cfg.impl_cfg["num_chunks_ep_a2a_overlap"] == 2
+    assert cfg.impl_cfg["ep_chunk_bwd_num_chunks"] == 3
+
+
 def test_mlite_config_from_dict_accepts_optimizer_override_config():
     cfg = MegatronLiteConfig.from_dict(
         "/models/Qwen3",

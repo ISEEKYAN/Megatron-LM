@@ -19,6 +19,7 @@ from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.gqa import GQAttention
 from megatron.lite.primitive.modules.lora import LoraConfig
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapMoELayer
 from megatron.lite.primitive.modules.router import TopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
@@ -125,6 +126,8 @@ class TransformerLayer(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         use_thd: bool = False,
+        num_chunks_ep_a2a_overlap: int = 1,
+        ep_chunk_bwd_num_chunks: int | None = None,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
@@ -148,15 +151,31 @@ class TransformerLayer(nn.Module):
             lora_config=lora_config,
         )
         self.mlp_norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.moe = MoELayer(
-            config,
-            ps,
-            use_deepep=use_deepep,
-            router_bias_rate=router_bias_rate,
-            fp8=fp8,
-            moe_act_recompute=moe_act_recompute,
-            lora_config=lora_config,
-        )
+        if num_chunks_ep_a2a_overlap > 1:
+            self.moe = EPChunkOverlapMoELayer(
+                config,
+                ps,
+                use_deepep=use_deepep,
+                router_bias_rate=router_bias_rate,
+                fp8=fp8,
+                moe_act_recompute=moe_act_recompute,
+                # Its custom backward rebuilds each chunk's forward graph.
+                moe_full_recompute=True,
+                num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
+                ep_chunk_bwd_num_chunks=ep_chunk_bwd_num_chunks,
+                lora_config=lora_config,
+                layer_idx=layer_idx,
+            )
+        else:
+            self.moe = MoELayer(
+                config,
+                ps,
+                use_deepep=use_deepep,
+                router_bias_rate=router_bias_rate,
+                fp8=fp8,
+                moe_act_recompute=moe_act_recompute,
+                lora_config=lora_config,
+            )
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
@@ -211,6 +230,8 @@ class MultiTokenPredictionLayer(nn.Module):
         fp8: bool,
         moe_act_recompute: bool,
         use_thd: bool,
+        num_chunks_ep_a2a_overlap: int,
+        ep_chunk_bwd_num_chunks: int | None,
         detach_encoder: bool,
         lora_config: LoraConfig | dict | None,
     ):
@@ -232,6 +253,8 @@ class MultiTokenPredictionLayer(nn.Module):
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
             use_thd=use_thd,
+            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
+            ep_chunk_bwd_num_chunks=ep_chunk_bwd_num_chunks,
             lora_config=lora_config,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -284,6 +307,8 @@ class MultiTokenPredictionBlock(nn.Module):
         fp8: bool,
         moe_act_recompute: bool,
         use_thd: bool,
+        num_chunks_ep_a2a_overlap: int,
+        ep_chunk_bwd_num_chunks: int | None,
         detach_encoder: bool,
         repeated_layer: bool,
         lora_config: LoraConfig | dict | None,
@@ -304,6 +329,8 @@ class MultiTokenPredictionBlock(nn.Module):
                     fp8=fp8,
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
+                    num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
+                    ep_chunk_bwd_num_chunks=ep_chunk_bwd_num_chunks,
                     detach_encoder=detach_encoder,
                     lora_config=lora_config,
                 )
@@ -360,6 +387,8 @@ class Qwen3MoEModel(nn.Module):
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
+        num_chunks_ep_a2a_overlap: int = 1,
+        ep_chunk_bwd_num_chunks: int | None = None,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
@@ -394,6 +423,8 @@ class Qwen3MoEModel(nn.Module):
                     fp8=fp8,
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
+                    num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
+                    ep_chunk_bwd_num_chunks=ep_chunk_bwd_num_chunks,
                     lora_config=lora_config,
                 )
                 for idx in self.layer_indices
@@ -422,6 +453,8 @@ class Qwen3MoEModel(nn.Module):
                 fp8=fp8,
                 moe_act_recompute=moe_act_recompute,
                 use_thd=use_thd,
+                num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
+                ep_chunk_bwd_num_chunks=ep_chunk_bwd_num_chunks,
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
                 lora_config=lora_config,

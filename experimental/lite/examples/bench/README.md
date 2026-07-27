@@ -62,6 +62,24 @@ Set `DRY_RUN=0` to run the benchmark under `torchrun`. Results are written to
 `experimental/lite/examples/bench/outputs/`. Set `REFERENCE_BACKEND=bridge` only
 when Megatron-Bridge is installed and `import megatron.bridge` succeeds.
 
+## Qwen3 ChunkedEP Pair
+
+This pair compares the synchronous Qwen3 MoE path with token-wise ChunkedEP.
+Both arms use the same model, data, optimizer, parallel shape, and DeepEP
+transport. The baseline sets `num_chunks_ep_a2a_overlap=1`; the candidate changes
+only the forward/backward chunk counts to two. ChunkedEP requires `EP>1` and
+`use_deepep=true`.
+
+```bash
+HF_PATH=/models/Qwen3-30B-A3B \
+DRY_RUN=1 \
+bash experimental/lite/examples/bench/scripts/run_qwen3_chunked_ep_pair.sh
+```
+
+Set `DRY_RUN=0` inside an 8-GPU allocation to run the default EP=8 pair. The
+script writes separate JSON and log files for direct loss, gradient-norm,
+throughput, and memory comparison.
+
 ## Validated Run
 
 The following paired run completed on 2026-06-07 with 8x NVIDIA H100 80GB GPUs:
