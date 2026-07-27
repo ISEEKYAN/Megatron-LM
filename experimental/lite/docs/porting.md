@@ -41,3 +41,33 @@ export PYTHONPATH=/path/to/Megatron-LM/experimental/lite:$PYTHONPATH
 
 A future integration step can decide whether to keep the experimental location
 or move the tree into the final package location.
+
+## KDA Operator
+
+External hybrid-model packages can reuse the model-independent Kimi Delta
+Attention recurrence without moving model configuration or layer schedules into
+Megatron Lite:
+
+```python
+from megatron.lite.primitive.ops.kda import kda
+
+output, final_state = kda(
+    q,
+    k,
+    v,
+    gate_logits,
+    beta_logits,
+    a_log=a_log,
+    dt_bias=dt_bias,
+    lower_bound=-5.0,
+    backend="auto",
+)
+```
+
+The tensors use `[batch, sequence, heads, head_dim]`; `beta_logits` omits the
+last dimension. CPU dispatch is a bounded differentiable oracle for tiny
+correctness tests. CUDA dispatch calls FLA `chunk_kda`, which provides the
+training-capable forward and backward path. Megatron Lite does not call the
+forward-only FlashKDA extension directly. Packed sequences are accepted only
+by the FLA backend; context-parallel state transfer is not implemented by this
+operator.
