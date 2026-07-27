@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from megatron.lite.primitive.parallel import combined_1f1b
 from megatron.lite.primitive.parallel.combined_1f1b import (
     Combined1F1BConfig,
     Combined1F1BLayerPlan,
@@ -57,6 +58,19 @@ def test_combined_1f1b_driver_runs_adjacent_microbatches():
         ("backward", 3),
     ]
     assert outputs == [{"loss": 0}, {"loss": 1}, {"loss": 2}, {"loss": 3}]
+
+
+def test_combined_1f1b_driver_joins_comm_stream_before_return(monkeypatch):
+    calls = []
+    plans = [_FakePlan(i, calls) for i in range(2)]
+    joins = []
+    monkeypatch.setattr(
+        combined_1f1b, "_join_comm_stream", lambda: joins.append("joined")
+    )
+
+    run_combined_1f1b(plans)
+
+    assert joins == ["joined"]
 
 
 class _TraceNode:

@@ -37,6 +37,12 @@ def _get_comm_stream():
     return _COMM_STREAM
 
 
+def _join_comm_stream() -> None:
+    """Make subsequent optimizer work wait for all scheduled EP communication."""
+    if _COMM_STREAM is not None:
+        torch.cuda.current_stream().wait_stream(_COMM_STREAM)
+
+
 class _ScheduleContext:
     """Per-microbatch dependency event with a process-wide ordered comm stream."""
 
@@ -345,6 +351,7 @@ def run_combined_1f1b(
             outputs.append(
                 plans[forward_mb].combined_forward_backward(plans[backward_mb])
             )
+    _join_comm_stream()
     return outputs
 
 
