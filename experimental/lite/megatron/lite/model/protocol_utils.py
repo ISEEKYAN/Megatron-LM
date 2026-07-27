@@ -48,7 +48,9 @@ def nested_from_packed(tensor: torch.Tensor | None, seq_lens: torch.Tensor):
         pieces.append(tensor.narrow(0, offset, length))
         offset += length
     if offset != tensor.numel():
-        raise ValueError(f"PackedBatch sizes sum to {offset}, tensor has {tensor.numel()} tokens.")
+        raise ValueError(
+            f"PackedBatch sizes sum to {offset}, tensor has {tensor.numel()} tokens."
+        )
     return torch.nested.as_nested_tensor(pieces, layout=torch.jagged)
 
 
@@ -74,7 +76,9 @@ def pack_thd_forward_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
         loss_mask=nested_from_packed(batch.loss_mask, seq_lens),
         roll_loss_mask=batch.loss_mask is not None,
     )
-    max_seqlen = int(packed.padded_lengths.max().item()) if packed.padded_lengths.numel() else 0
+    max_seqlen = (
+        int(packed.padded_lengths.max().item()) if packed.padded_lengths.numel() else 0
+    )
     # pack_nested_thd already returns [1, T] token rows; do not unsqueeze again.
     kwargs: dict[str, Any] = {
         "input_ids": packed.input_ids,
@@ -89,7 +93,9 @@ def pack_thd_forward_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
     return kwargs
 
 
-def unpack_thd_forward_output(model, batch: PackedBatch, output: torch.Tensor) -> torch.Tensor:
+def unpack_thd_forward_output(
+    model, batch: PackedBatch, output: torch.Tensor
+) -> torch.Tensor:
     """Reverse a zigzag-CP THD model output back to jagged true-length form."""
     ps = _parallel_state(model)
     meta = thd_pack_meta(
@@ -194,7 +200,9 @@ def pack_r3_replay_mask(
     ].bool()
 
 
-def add_loss_context_kwargs(kwargs: dict[str, Any], *, include_return_log_probs: bool = False) -> None:
+def add_loss_context_kwargs(
+    kwargs: dict[str, Any], *, include_return_log_probs: bool = False
+) -> None:
     loss_context = get_loss_context()
     if loss_context is None:
         return
@@ -204,8 +212,37 @@ def add_loss_context_kwargs(kwargs: dict[str, Any], *, include_return_log_probs:
         kwargs["return_log_probs"] = loss_context.return_log_probs
 
 
+def _resolve_cross_entropy_fusion(model) -> bool:
+    """Read the ``cross_entropy_fusion`` flag through any module wrappers.
+
+    ``set_cross_entropy_fusion`` runs at build time on the bare model chunks;
+    by the time ``_forward_step`` runs, the runtime has wrapped each chunk in a
+    data-parallel container. Megatron's ``_BaseDataParallel`` keeps the wrapped
+    module in ``self.module`` and does not proxy unknown attributes to it, so a
+    plain ``getattr(wrapper, "cross_entropy_fusion")`` misses the attribute
+    entirely and silently falls back to the default.
+
+    The consequence was invisible: the flag was set correctly, appeared as
+    ``True`` in every config dump, and the model still took the unfused branch —
+    materialising the full ``[tokens, vocab/tp]`` logits and upcasting them to
+    fp32. Walk the ``.module`` chain instead, checking each level's own
+    ``__dict__`` so an attribute on an inner chunk is found no matter how many
+    wrappers were added.
+    """
+
+    seen: set[int] = set()
+    current = model
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        own = getattr(current, "__dict__", None)
+        if isinstance(own, dict) and "cross_entropy_fusion" in own:
+            return bool(own["cross_entropy_fusion"])
+        current = getattr(current, "module", None)
+    return False
+
+
 def add_cross_entropy_fusion(kwargs: dict[str, Any], model) -> None:
-    kwargs["use_fused_kernels"] = bool(getattr(model, "cross_entropy_fusion", False))
+    kwargs["use_fused_kernels"] = _resolve_cross_entropy_fusion(model)
 
 
 def set_cross_entropy_fusion(chunks: list, enabled: bool) -> None:
@@ -214,6 +251,7 @@ def set_cross_entropy_fusion(chunks: list, enabled: bool) -> None:
 
 
 __all__ = [
+    "_resolve_cross_entropy_fusion",
     "add_cross_entropy_fusion",
     "add_loss_context_kwargs",
     "nested_from_packed",
