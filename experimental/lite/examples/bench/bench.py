@@ -11,10 +11,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any
+
+import torch
 
 _EXPERIMENTAL_LITE_ROOT = Path(__file__).resolve().parents[2]
 _REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -371,10 +374,19 @@ def _step_reporter(trace: StepTrace) -> None:
     print(" ".join(parts), flush=True)
 
 
+def _seed_benchmark(seed: int) -> None:
+    """Seed model construction as well as the separately seeded data iterator."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def run(cfg: BenchCliConfig) -> dict[str, Any]:
     if cfg.dry_run:
         return build_dry_run_plan(cfg)
 
+    _seed_benchmark(cfg.seed)
     rt_cfg = build_runtime_config(cfg)
     rt = create_runtime(rt_cfg)
     handle = rt.build_model()

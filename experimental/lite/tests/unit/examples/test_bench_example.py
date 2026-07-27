@@ -56,6 +56,17 @@ def test_qwen3_chunked_ep_pair_uses_deepep_and_explicit_chunks():
     assert "overlap_moe_expert_parallel_comm" not in text
 
 
+def test_bench_seed_is_applied_before_model_construction():
+    from examples.bench.bench import _seed_benchmark
+
+    _seed_benchmark(37)
+    first = torch.rand(8)
+    _seed_benchmark(37)
+    second = torch.rand(8)
+
+    assert torch.equal(first, second)
+
+
 def test_bench_mlite_deterministic_mounts_native_vision_not_mbridge(monkeypatch):
     from examples.bench.bench import BenchCliConfig, build_runtime_config
 
