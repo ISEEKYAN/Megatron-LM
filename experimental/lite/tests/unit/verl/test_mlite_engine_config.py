@@ -171,6 +171,28 @@ def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
     }
 
 
+def test_qwen3_moe_online_weight_export_does_not_pass_unsupported_target() -> None:
+    engine = _engine(engine_config=_engine_config())
+    engine.model_config.hf_config = {"model_type": "qwen3_moe"}
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            captured["kwargs"] = kwargs
+            return iter(())
+
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine._initial_sync_cache_cleared = True
+
+    weights, metadata = engine.get_per_tensor_param()
+
+    assert list(weights) == []
+    assert metadata is None
+    assert "target" not in captured["kwargs"]
+
+
 def test_online_qat_export_wraps_mlite_hf_weight_stream(monkeypatch) -> None:
     engine = _engine(
         engine_config=_engine_config(

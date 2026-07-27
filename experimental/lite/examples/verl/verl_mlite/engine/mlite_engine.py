@@ -390,7 +390,10 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = self.engine_config.resync_format
             if self.engine_config.resync_config:
                 export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
-        else:
+        elif self._resolve_model_name() == "qwen3_5":
+            # Qwen3.5 selects its vLLM checkpoint layout through target=.
+            # Qwen3-MoE's HF exporter has no target parameter, so forwarding
+            # this keyword there fails at the first online weight resync.
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
