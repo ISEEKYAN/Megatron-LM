@@ -436,6 +436,41 @@ def _real_tiny_model(model_name: str, monkeypatch):
 R3_SUPPORTED_MODEL_NAMES = MODEL_NAMES
 
 
+def test_model_load_optionality_is_explicit_and_explains_default_owner(
+    transformer_engine_import_stub,
+    monkeypatch,
+):
+    expected_optional = {
+        "kimi_k2": {
+            "layers.0.moe.router.expert_bias": "model constructor",
+        },
+        "glm5": {
+            "layers.0.moe.router.expert_bias": "model constructor",
+            "layers.0.self_attention.self_attention.indexer.k_norm.bias": (
+                "model constructor"
+            ),
+        },
+    }
+    for model_name, cases in expected_optional.items():
+        _protocol(model_name, transformer_engine_import_stub, monkeypatch)
+        checkpoint = importlib.import_module(
+            f"megatron.lite.model.{model_name}.lite.checkpoint"
+        )
+        spec_type = getattr(
+            checkpoint,
+            {"kimi_k2": "KimiK2WeightSpec", "glm5": "Glm5WeightSpec"}[model_name],
+        )
+        for native_name, expected_reason in cases.items():
+            assert expected_reason in spec_type.optional_for_load(native_name)
+        assert spec_type.optional_for_load("layers.0.required.weight") is None
+
+    _protocol("deepseek_v4", transformer_engine_import_stub, monkeypatch)
+    checkpoint = importlib.import_module(
+        "megatron.lite.model.deepseek_v4.lite.checkpoint"
+    )
+    assert not hasattr(checkpoint.DeepseekV4WeightSpec, "optional_for_load")
+
+
 @pytest.mark.parametrize("cp_rank", [0, 1])
 def test_glm5_r3_route_packing_matches_contiguous_forward_layout(
     cp_rank,
@@ -498,9 +533,9 @@ def test_supported_model_replay_roots_are_exact_decoder_layers(
 
     assert roots == expected
     assert len(roots) == len(case.chunk.model.layers)
-    assert roots != [case.chunk], (
-        "falling back to the whole chunk would include MTP routers"
-    )
+    assert roots != [
+        case.chunk
+    ], "falling back to the whole chunk would include MTP routers"
     if mtp_enabled:
         mtp_modules = set(case.chunk.model.mtp.modules())
         assert all(root not in mtp_modules for root in roots)
@@ -601,15 +636,14 @@ def test_every_model_uses_shared_canonical_state_key(
     transformer_engine_import_stub,
     monkeypatch,
 ):
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        canonical_state_key as loader_canonical_state_key,
+    )
     from megatron.lite.primitive.quantization.qat import canonical_state_key
 
     _protocol(model_name, transformer_engine_import_stub, monkeypatch)
-    checkpoint = importlib.import_module(
-        f"megatron.lite.model.{model_name}.lite.checkpoint"
-    )
-
-    assert checkpoint._canonical_state_key is canonical_state_key
-    assert checkpoint._canonical_state_key(key) == expected
+    assert loader_canonical_state_key is canonical_state_key
+    assert loader_canonical_state_key(key) == expected
 
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
@@ -620,13 +654,12 @@ def test_every_model_qat_off_canonicalization_is_identity_for_all_real_state_key
 ):
     _install_cpu_te_construction_stubs(transformer_engine_import_stub, monkeypatch)
     model = _real_tiny_model(model_name, monkeypatch)
-    checkpoint = importlib.import_module(
-        f"megatron.lite.model.{model_name}.lite.checkpoint"
-    )
+    from megatron.lite.primitive.ckpt.hf_weights import canonical_state_key
+
     state_keys = tuple(model.state_dict())
 
     assert state_keys
-    assert {checkpoint._canonical_state_key(key): key for key in state_keys} == {
+    assert {canonical_state_key(key): key for key in state_keys} == {
         key: key for key in state_keys
     }
 
@@ -688,3 +721,60 @@ def test_every_model_qat_quantizes_gate_up_but_not_router_gate(
     for layer in _layers(case.chunk):
         assert not parametrize.is_parametrized(layer.moe.router.gate, "weight")
         assert parametrize.is_parametrized(layer.mlp.gate_up, "weight")
+
+
+@pytest.mark.parametrize("model_name", MODEL_NAMES)
+def test_every_model_qat_expert_load_target_resolves_master_weight(
+    model_name: str,
+    transformer_engine_import_stub,
+    monkeypatch,
+):
+    _install_cpu_te_construction_stubs(transformer_engine_import_stub, monkeypatch)
+    model = _real_tiny_model(model_name, monkeypatch)
+    stats = apply_qat_to_chunks(
+        [model],
+        QATSpec(enabled=True, format="int8", group_size=-1),
+    )
+    assert stats["quantized_modules"] > 0
+
+    checkpoint = importlib.import_module(
+        f"megatron.lite.model.{model_name}.lite.checkpoint"
+    )
+    spec_type = {
+        "qwen3_moe": "Qwen3MoEWeightSpec",
+        "qwen3_5": "Qwen35WeightSpec",
+        "kimi_k2": "KimiK2WeightSpec",
+        "glm5": "Glm5WeightSpec",
+        "deepseek_v4": "DeepseekV4WeightSpec",
+    }[model_name]
+    spec = getattr(checkpoint, spec_type)(model.config)
+
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        _resolve_param_name,
+        canonical_state_key,
+    )
+
+    state = model.state_dict()
+    logical_state_keys = tuple(canonical_state_key(name) for name in state)
+    load_weight_map = getattr(spec, "load_weight_map", None)
+    weight_map = (
+        load_weight_map(model, model.ps, logical_state_keys)
+        if callable(load_weight_map)
+        else spec.weight_map()
+    )
+    expert_names = [
+        name
+        for name in weight_map
+        if spec.expert_global_id(name) is not None and not name.startswith("mtp.")
+    ]
+    assert expert_names
+
+    for native_name in expert_names:
+        global_id = spec.expert_global_id(native_name)
+        assert global_id is not None
+        local_name = spec.expert_local_name(native_name, global_id)
+        assert _resolve_param_name(local_name, state) is not None, (
+            model_name,
+            native_name,
+            local_name,
+        )
