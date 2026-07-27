@@ -46,6 +46,17 @@ def test_bench_builds_mlite_runtime_config_with_model_hook():
     assert model_cfg.num_nextn_predict_layers == 0
 
 
+def test_bench_seed_replays_cpu_model_initialization():
+    from examples.bench.bench import _seed_benchmark
+
+    _seed_benchmark(42)
+    first = torch.rand(8)
+    _seed_benchmark(42)
+    second = torch.rand(8)
+
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+
 def test_bench_mlite_deterministic_mounts_native_vision_not_mbridge(monkeypatch):
     from examples.bench.bench import BenchCliConfig, build_runtime_config
 

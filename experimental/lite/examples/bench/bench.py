@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
@@ -371,10 +372,19 @@ def _step_reporter(trace: StepTrace) -> None:
     print(" ".join(parts), flush=True)
 
 
+def _seed_benchmark(seed: int) -> None:
+    """Replay model initialization and data setup across separate A/B processes."""
+    import torch
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+
 def run(cfg: BenchCliConfig) -> dict[str, Any]:
     if cfg.dry_run:
         return build_dry_run_plan(cfg)
 
+    _seed_benchmark(cfg.seed)
     rt_cfg = build_runtime_config(cfg)
     rt = create_runtime(rt_cfg)
     handle = rt.build_model()
