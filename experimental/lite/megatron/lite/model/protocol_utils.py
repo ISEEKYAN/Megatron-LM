@@ -192,10 +192,11 @@ def pack_routed_experts(
 def pack_r3_replay_mask(
     model, batch: PackedBatch, *, contiguous: bool = False
 ) -> torch.Tensor:
-    """Pack the causal R3 mask built by the VERL connector.
+    """Pack a caller-provided causal R3 replay mask for the local layout.
 
-    VERL owns the mask semantics while this protocol owns only the model-local
-    THD/CP/TP layout conversion.
+    This helper performs only model-local THD/CP/TP layout conversion. The mask
+    semantics are defined by the caller and carried with the packed batch; a
+    missing mask fails loudly.
     """
 
     if batch.r3_replay_mask is None:
