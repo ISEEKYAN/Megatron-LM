@@ -137,9 +137,7 @@ def _make_aux_loss_hook():
 def _build_dist_opt_optimizer(
     chunks, model_cfg: KimiK2Config, impl_cfg: ImplConfig, ps: ParallelState
 ):
-    from megatron.lite.primitive.optimizers.megatron_wrap import (
-        build_dist_opt_training_optimizer,
-    )
+    from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_training_optimizer
 
     return build_dist_opt_training_optimizer(
         chunks,
@@ -165,9 +163,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
     if mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
-            raise ValueError(
-                "mtp_enable=True but HF config has no num_nextn_predict_layers."
-            )
+            raise ValueError("mtp_enable=True but HF config has no num_nextn_predict_layers.")
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
         if impl_cfg.mtp_use_repeated_layer is not None:
             model_cfg.mtp_use_repeated_layer = impl_cfg.mtp_use_repeated_layer
@@ -203,14 +199,16 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
     )
 
     if vpp is None:
-        chunks = [
-            KimiK2Model(model_cfg, train_cfg, ps, **model_kwargs)
-            .to(torch.bfloat16)
-            .cuda()
-        ]
+        chunks = [KimiK2Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
     else:
         chunks = [
-            KimiK2Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **model_kwargs)
+            KimiK2Model(
+                model_cfg,
+                train_cfg,
+                ps,
+                vpp_chunk_id=i,
+                **model_kwargs,
+            )
             .to(torch.bfloat16)
             .cuda()
             for i in range(vpp)
@@ -238,9 +236,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
     post_model_load_hook = None
     optimizer_backend = "none"
     if impl_cfg.optimizer == "dist_opt":
-        optimizer, finalize_grads = _build_dist_opt_optimizer(
-            chunks, model_cfg, impl_cfg, ps
-        )
+        optimizer, finalize_grads = _build_dist_opt_optimizer(chunks, model_cfg, impl_cfg, ps)
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
@@ -254,9 +250,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
         def _post_model_load_hook():
             from megatron.lite.model.kimi_k2.lite.model import KimiK2Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import (
-                build_fsdp2_training_optimizer,
-            )
+            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(
@@ -301,16 +295,12 @@ def load_hf_weights(
 
 
 def export_hf_weights(chunks, model_cfg: KimiK2Config, ps: ParallelState, **kwargs):
-    from megatron.lite.model.kimi_k2.lite.checkpoint import (
-        export_hf_weights as export_impl,
-    )
+    from megatron.lite.model.kimi_k2.lite.checkpoint import export_hf_weights as export_impl
 
     yield from export_impl(chunks, model_cfg, ps, **kwargs)
 
 
-def save_hf_weights(
-    chunks, path: str, model_cfg: KimiK2Config, ps: ParallelState
-) -> None:
+def save_hf_weights(chunks, path: str, model_cfg: KimiK2Config, ps: ParallelState) -> None:
     from megatron.lite.model.kimi_k2.lite.checkpoint import save_hf_weights as save_impl
 
     save_impl(chunks, path, model_cfg, ps)

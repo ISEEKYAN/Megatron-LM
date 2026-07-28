@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -83,7 +84,9 @@ class DeepseekV4MoE(EPChunkOverlapMoELayer):
         return self.gate(x)
 
     def _hash_route(
-        self, x: torch.Tensor, input_ids: torch.Tensor
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         logits = self.gate.gate(x).view(-1, self.gate.num_experts)
         if self.gate.score_function == "sqrtsoftplus":
@@ -103,9 +106,7 @@ class DeepseekV4MoE(EPChunkOverlapMoELayer):
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return (weights * self.route_scale).to(dtype=x.dtype), indices
 
-    def forward(
-        self, x: torch.Tensor, *, input_ids: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, input_ids: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.shape
         x_flat = x.reshape(-1, self.hidden_size)
         out = super().forward(x_flat, routing_input=input_ids)

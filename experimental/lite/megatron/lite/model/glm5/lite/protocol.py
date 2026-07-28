@@ -333,7 +333,13 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         ]
     else:
         chunks = [
-            Glm5Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **model_kwargs)
+            Glm5Model(
+                model_cfg,
+                train_cfg,
+                ps,
+                vpp_chunk_id=i,
+                **model_kwargs,
+            )
             .to(torch.bfloat16)
             .cuda()
             for i in range(vpp)

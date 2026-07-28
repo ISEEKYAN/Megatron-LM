@@ -6,11 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from megatron.lite.runtime.contracts.config import (
-    OptimizerConfig,
-    ParallelConfig,
-    pick_fields,
-)
+from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, pick_fields
 
 
 @dataclass(slots=True)
@@ -72,12 +68,8 @@ class MegatronLiteConfig:
             if isinstance(opt_d, dict)
             else OptimizerConfig()
         )
-        if isinstance(opt_d, dict) and isinstance(
-            opt_d.get("override_optimizer_config"), dict
-        ):
-            optimizer.override_optimizer_config = dict(
-                opt_d["override_optimizer_config"]
-            )
+        if isinstance(opt_d, dict) and isinstance(opt_d.get("override_optimizer_config"), dict):
+            optimizer.override_optimizer_config = dict(opt_d["override_optimizer_config"])
 
         # impl_cfg: merge nested dict + top-level overrides
         impl_cfg: dict[str, Any] = {}

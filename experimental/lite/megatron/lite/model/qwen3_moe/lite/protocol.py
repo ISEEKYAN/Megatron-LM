@@ -36,13 +36,8 @@ from megatron.lite.model.protocol_utils import (
 )
 from megatron.lite.model.qwen3_moe.common import is_expert_param
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.model.qwen3_moe.lite.checkpoint import (
-    EXPERT_CLASSIFIER,
-    PLACEMENT_FN,
-)
-from megatron.lite.model.qwen3_moe.lite.checkpoint import (
-    load_hf_weights as _load_hf_weights_impl,
-)
+from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
+from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.lora import (
@@ -154,9 +149,7 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
 
 def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
     labels = batch.labels.reshape(1, -1) if batch.labels is not None else None
-    return model(
-        input_ids=batch.input_ids.reshape(1, -1), labels=labels, packed_seq_params=None
-    )
+    return model(input_ids=batch.input_ids.reshape(1, -1), labels=labels, packed_seq_params=None)
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
@@ -177,6 +170,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     validate_ep_chunk_overlap_config(
         impl_cfg.num_chunks_ep_a2a_overlap, use_deepep=impl_cfg.use_deepep, ep_size=p.ep
     )
+
     # ── override model config from impl_cfg ──
     if impl_cfg.router_aux_loss_coef is not None:
         model_cfg.router_aux_loss_coef = impl_cfg.router_aux_loss_coef
@@ -184,9 +178,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
     if mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
-            raise ValueError(
-                "mtp_enable=True but HF config has no num_nextn_predict_layers."
-            )
+            raise ValueError("mtp_enable=True but HF config has no num_nextn_predict_layers.")
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
         if impl_cfg.mtp_use_repeated_layer is not None:
             model_cfg.mtp_use_repeated_layer = impl_cfg.mtp_use_repeated_layer
@@ -214,9 +206,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
     vpp = None if p.vpp == 1 else p.vpp
     if vpp is None:
-        chunks = [
-            Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()
-        ]
+        chunks = [Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
     else:
         chunks = []
         for i in range(vpp):
@@ -284,9 +274,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
         def _post_model_load_hook():
             from megatron.lite.model.qwen3_moe.lite.model import TransformerLayer
-            from megatron.lite.primitive.optimizers.fsdp2 import (
-                build_fsdp2_training_optimizer,
-            )
+            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(
@@ -353,16 +341,17 @@ def export_hf_weights(
     chunks: list[nn.Module], model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs
 ):
     """Export HF weights from model chunks."""
-    from megatron.lite.model.qwen3_moe.lite.checkpoint import (
-        export_hf_weights as _export,
-    )
+    from megatron.lite.model.qwen3_moe.lite.checkpoint import export_hf_weights as _export
 
     for chunk in chunks:
         yield from _export(chunk, model_cfg, ps, **kwargs)
 
 
 def save_hf_weights(
-    chunks: list[nn.Module], path: str, model_cfg: Qwen3MoEConfig, ps: ParallelState
+    chunks: list[nn.Module],
+    path: str,
+    model_cfg: Qwen3MoEConfig,
+    ps: ParallelState,
 ) -> None:
     from megatron.lite.model.qwen3_moe.lite.checkpoint import save_hf_weights as _save
 

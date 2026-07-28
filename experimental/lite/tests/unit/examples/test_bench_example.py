@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
+
 import torch
 
 from megatron.lite.runtime.contracts.config import ParallelConfig

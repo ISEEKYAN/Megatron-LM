@@ -162,12 +162,7 @@ class _DeepEPDispatch(torch.autograd.Function):
 
     @staticmethod
     def backward(
-        ctx,
-        grad_recv_hidden,
-        grad_recv_indices,
-        grad_recv_probs,
-        grad_recv_per_expert,
-        grad_handle,
+        ctx, grad_recv_hidden, grad_recv_indices, grad_recv_probs, grad_recv_per_expert, grad_handle
     ):
         del grad_recv_indices, grad_recv_per_expert, grad_handle
         previous_event = (
@@ -290,9 +285,7 @@ class TokenDispatcher:
         self.ep_size = ps.ep_size
         self.num_local_experts = ensure_divisible(num_experts, ps.ep_size)
         self.moe_permute_fusion = (
-            _use_moe_permute_fusion()
-            if moe_permute_fusion is None
-            else bool(moe_permute_fusion)
+            _use_moe_permute_fusion() if moe_permute_fusion is None else bool(moe_permute_fusion)
         )
 
         self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
@@ -314,21 +307,14 @@ class TokenDispatcher:
         if self.ep_size > 1 and self.num_local_experts > 1:
             chunk_idxs = torch.arange(self.ep_size * self.num_local_experts)
             self._sort_by_experts = (
-                chunk_idxs.reshape(self.ep_size, self.num_local_experts)
-                .T.ravel()
-                .tolist()
+                chunk_idxs.reshape(self.ep_size, self.num_local_experts).T.ravel().tolist()
             )
             self._restore_by_ranks = (
-                chunk_idxs.reshape(self.num_local_experts, self.ep_size)
-                .T.ravel()
-                .tolist()
+                chunk_idxs.reshape(self.num_local_experts, self.ep_size).T.ravel().tolist()
             )
 
     def dispatch(
-        self,
-        hidden_states: torch.Tensor,
-        topk_scores: torch.Tensor,
-        topk_indices: torch.Tensor,
+        self, hidden_states: torch.Tensor, topk_scores: torch.Tensor, topk_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if self.ep_size <= 1:
             return self._dispatch_local(hidden_states, topk_scores, topk_indices)

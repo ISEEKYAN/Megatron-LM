@@ -37,6 +37,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
+
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE
 from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
@@ -65,7 +66,10 @@ from megatron.lite.primitive.utils import build_fp8_recipe
 
 
 def _roll_mtp_left(
-    tensor: torch.Tensor, *, packed_seq_params=None, dims: int = -1
+    tensor: torch.Tensor,
+    *,
+    packed_seq_params=None,
+    dims: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shift labels/ids one position left (next-token target for MTP depth d).
 
@@ -74,19 +78,13 @@ def _roll_mtp_left(
     per-sequence THD-aware roll (contiguous cu_seqlens at CP==1, where DS4 MTP
     runs) when packed_seq_params is available; fall back to plain roll otherwise.
     """
-    cu_seqlens = (
-        None
-        if packed_seq_params is None
-        else getattr(packed_seq_params, "cu_seqlens_q", None)
-    )
+    cu_seqlens = None if packed_seq_params is None else getattr(packed_seq_params, "cu_seqlens_q", None)
     if cu_seqlens is not None:
         # DS4 uses a CONTIGUOUS THD/CP layout (not TE/Megatron zigzag), so roll
         # per-sequence via cu_seqlens directly -- never the zigzag reconstruction
         # in roll_packed_thd_left (which GLM/Kimi use for their zigzag layout).
         dim = dims if dims >= 0 else tensor.dim() + dims
-        return _roll_packed_thd_left_local(
-            tensor, cu_seqlens_padded=cu_seqlens, dims=dim
-        )
+        return _roll_packed_thd_left_local(tensor, cu_seqlens_padded=cu_seqlens, dims=dim)
     dim = dims if dims >= 0 else tensor.dim() + dims
     rolled = torch.roll(tensor, shifts=-1, dims=dim)
     rolled.select(dim, -1).zero_()
@@ -114,11 +112,7 @@ class DeepseekV4CSAAttention(nn.Module):
         self.self_attn = CompressedSparseAttention(config, layer_idx=layer_idx, ps=ps)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        position_ids: torch.Tensor,
-        packed_seq_params: Any = None,
+        self, x: torch.Tensor, *, position_ids: torch.Tensor, packed_seq_params: Any = None
     ) -> torch.Tensor:
         # Skeleton feeds SBHD [S, B, H]; CSA needs batch-first [B, S, H].
         # packed_seq_params (cu_seqlens etc.) passes through unchanged: the THD
@@ -159,9 +153,7 @@ class DeepseekV4Layer(nn.Module):
         self.layer_idx = layer_idx
         self.ps = ps
         self.input_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = te.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # DS4 ONLY: CSA attention behind the SBHD shim (Kimi builds MLA here).
         self.self_attn = DeepseekV4CSAAttention(config, layer_idx=layer_idx, ps=ps)
         # DS4 ONLY: hash-routed MoE family (shared Experts/Router/dispatcher).
@@ -206,12 +198,8 @@ class DeepseekV4Layer(nn.Module):
         # align with the flattened hidden.  The skeleton is SBHD, so the FFN
         # input flattens in (S, B) order; transpose input_ids [B, S] -> [S, B]
         # so its flatten matches.  (No-op semantics for non-hash layers.)
-        mlp_input_ids = (
-            None if input_ids is None else input_ids.transpose(0, 1).contiguous()
-        )
-        ffn_out = self.mlp(
-            self.post_attention_layernorm(ffn_in), input_ids=mlp_input_ids
-        )
+        mlp_input_ids = None if input_ids is None else input_ids.transpose(0, 1).contiguous()
+        ffn_out = self.mlp(self.post_attention_layernorm(ffn_in), input_ids=mlp_input_ids)
         return HyperConnection.post(ffn_out, residual, post, comb)
 
 
@@ -252,9 +240,7 @@ class DeepseekV4MTPLayer(DeepseekV4Layer):
         self.enorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hc_head = MultiHeadHyperConnectionHead(
-            config.hidden_size, config.hc_mult, config.hc_eps
-        )
+        self.hc_head = MultiHeadHyperConnectionHead(config.hidden_size, config.hc_mult, config.hc_eps)
 
     def forward(
         self,
@@ -272,12 +258,8 @@ class DeepseekV4MTPLayer(DeepseekV4Layer):
         embedded = self.enorm(embedded)
         # e_proj on the [S, B, H] embedding, broadcast across the hc_mult streams;
         # h_proj on the normed mHC hidden keeps the per-stream state.
-        projected = self.e_proj(embedded).unsqueeze(2) + self.h_proj(
-            self.hnorm(hidden_states)
-        )
-        return super().forward(
-            projected, position_ids=position_ids, input_ids=input_ids
-        )
+        projected = self.e_proj(embedded).unsqueeze(2) + self.h_proj(self.hnorm(hidden_states))
+        return super().forward(projected, position_ids=position_ids, input_ids=input_ids)
 
     def contract(self, x: torch.Tensor) -> torch.Tensor:
         # Collapse the hc_mult streams [S, B, hc_mult, H] -> [S, B, H].
@@ -373,9 +355,7 @@ class DeepseekV4Model(nn.Module):
 
         self.embed_tokens: VocabParallelEmbedding | None = None
         if layout.has_embed:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size, config.hidden_size, ps
-            )
+            self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
 
         # Key by LOCAL pipeline-stage position (0..len-1), not the global layer id,
         # so parameter names ("layers.{local}.…") follow the same convention as the
@@ -406,9 +386,7 @@ class DeepseekV4Model(nn.Module):
             self.hc_head = MultiHeadHyperConnectionHead(
                 config.hidden_size, config.hc_mult, config.hc_eps
             )
-            self.lm_head = VocabParallelOutput(
-                config.vocab_size, config.hidden_size, ps
-            )
+            self.lm_head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
 
         self.mtp_embed: VocabParallelEmbedding | None = None
         self.mtp: nn.ModuleList = nn.ModuleList()
@@ -437,9 +415,7 @@ class DeepseekV4Model(nn.Module):
     def set_input_tensor(self, input_tensor):
         if isinstance(input_tensor, list):
             if len(input_tensor) > 1:
-                raise ValueError(
-                    "DeepseekV4Model expects a single pipeline input tensor."
-                )
+                raise ValueError("DeepseekV4Model expects a single pipeline input tensor.")
             input_tensor = input_tensor[0] if input_tensor else None
         self._input_tensor = input_tensor
 
@@ -501,9 +477,7 @@ class DeepseekV4Model(nn.Module):
             )
 
         fp8_ctx = (
-            te.fp8_autocast(
-                enabled=True, fp8_recipe=build_fp8_recipe(self.train_config)
-            )
+            te.fp8_autocast(enabled=True, fp8_recipe=build_fp8_recipe(self.train_config))
             if self.train_config.fp8
             else nullcontext()
         )
@@ -526,9 +500,7 @@ class DeepseekV4Model(nn.Module):
         # Last stage: contract the mHC streams, then run head / MTP / loss
         # exactly as the Kimi skeleton does.
         mtp_source = h
-        hidden_for_head = contract_mhc_hidden_for_pipeline(
-            h, norm=self.norm, head=self.hc_head
-        )
+        hidden_for_head = contract_mhc_hidden_for_pipeline(h, norm=self.norm, head=self.hc_head)
 
         # MTP runs on the head stage (where self.mtp is built with a valid bound
         # embedding -- self.embed_tokens when present, else the self.mtp_embed
@@ -541,10 +513,7 @@ class DeepseekV4Model(nn.Module):
             and self.ps.cp_size == 1
         )
         mtp_hidden_states = self._apply_mtp(
-            mtp_source,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            run_mtp=run_mtp,
+            mtp_source, input_ids=input_ids, position_ids=position_ids, run_mtp=run_mtp,
             packed_seq_params=packed_seq_params,
         )
         if mtp_hidden_states is not None:
@@ -593,9 +562,7 @@ class DeepseekV4Model(nn.Module):
             output["logits"] = self.lm_head.gather(logits).transpose(0, 1).contiguous()
             if mtp_hidden_states is not None:
                 output["mtp_logits"] = [
-                    self.lm_head.gather(self.lm_head(mtp_hidden))
-                    .transpose(0, 1)
-                    .contiguous()
+                    self.lm_head.gather(self.lm_head(mtp_hidden)).transpose(0, 1).contiguous()
                     for mtp_hidden in mtp_hidden_states
                 ]
         return output
@@ -619,11 +586,11 @@ class DeepseekV4Model(nn.Module):
         source = mtp_source
         outputs: list[torch.Tensor] = []
         for mtp_layer in self.mtp:
-            mtp_input_ids, _ = _roll_mtp_left(
-                mtp_input_ids, packed_seq_params=packed_seq_params, dims=-1
-            )
+            mtp_input_ids, _ = _roll_mtp_left(mtp_input_ids, packed_seq_params=packed_seq_params, dims=-1)
             source = mtp_layer(
-                input_ids=mtp_input_ids, hidden_states=source, position_ids=position_ids
+                input_ids=mtp_input_ids,
+                hidden_states=source,
+                position_ids=position_ids,
             )
             outputs.append(mtp_layer.contract(source))
         return outputs
@@ -649,12 +616,8 @@ class DeepseekV4Model(nn.Module):
 
         mtp_loss_values = []
         for mtp_hidden in mtp_hidden_states:
-            mtp_labels, _ = _roll_mtp_left(
-                mtp_labels, packed_seq_params=packed_seq_params, dims=-1
-            )
-            mtp_loss_mask, num_tokens = _roll_mtp_left(
-                mtp_loss_mask, packed_seq_params=packed_seq_params, dims=-1
-            )
+            mtp_labels, _ = _roll_mtp_left(mtp_labels, packed_seq_params=packed_seq_params, dims=-1)
+            mtp_loss_mask, num_tokens = _roll_mtp_left(mtp_loss_mask, packed_seq_params=packed_seq_params, dims=-1)
             labels_sb = mtp_labels.transpose(0, 1).contiguous()
             mask_sb = mtp_loss_mask.transpose(0, 1).contiguous()
 
@@ -672,19 +635,16 @@ class DeepseekV4Model(nn.Module):
                 logits = self.lm_head(mtp_hidden)
                 if temperature != 1.0:
                     logits = logits / temperature
-                token_loss = vocab_parallel_cross_entropy(
-                    logits, labels_sb, self.ps.tp_group
-                )
+                token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
 
             token_loss = token_loss * mask_sb.to(dtype=token_loss.dtype)
             num_tokens = num_tokens.to(dtype=token_loss.dtype).clamp_min(1.0)
             mtp_loss_values.append(token_loss.sum() / num_tokens)
 
-            mtp_loss_scale = self.mtp_loss_scaling_factor / max(
-                len(mtp_hidden_states), 1
-            )
+            mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
             hidden_states = MTPLossAutoScaler.apply(
-                hidden_states, mtp_loss_scale * token_loss / num_tokens
+                hidden_states,
+                mtp_loss_scale * token_loss / num_tokens,
             )
 
         if not mtp_loss_values:
@@ -698,9 +658,7 @@ class DeepseekV4Model(nn.Module):
         assert self.lm_head is not None
         weight = self.lm_head.col.linear.weight
         return (
-            weight
-            if weight.dtype == hidden_states.dtype
-            else weight.to(dtype=hidden_states.dtype)
+            weight if weight.dtype == hidden_states.dtype else weight.to(dtype=hidden_states.dtype)
         )
 
 

@@ -387,6 +387,7 @@ def run(cfg: BenchCliConfig) -> dict[str, Any]:
         return build_dry_run_plan(cfg)
 
     _seed_benchmark(cfg.seed)
+
     rt_cfg = build_runtime_config(cfg)
     rt = create_runtime(rt_cfg)
     handle = rt.build_model()
