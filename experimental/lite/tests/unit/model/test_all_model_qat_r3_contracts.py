@@ -458,16 +458,24 @@ def test_glm5_r3_route_packing_matches_contiguous_forward_layout(
         input_ids=torch.arange(8),
         labels=torch.arange(8),
         seq_lens=torch.tensor([4, 4]),
+        r3_replay_mask=torch.tensor(
+            [True, False, True, False, False, True, False, True]
+        ),
     )
     routes = torch.arange(8).view(2, 4, 1, 1)
 
     glm5_routes = glm5.pack_routed_experts(model, batch, routes)
     deepseek_v4_routes = deepseek_v4.pack_routed_experts(model, batch, routes)
+    glm5_mask = glm5.pack_r3_replay_mask(model, batch)
+    deepseek_v4_mask = deepseek_v4.pack_r3_replay_mask(model, batch)
 
     expected = torch.arange(cp_rank * 4, (cp_rank + 1) * 4).view(4, 1)
     assert len(glm5_routes) == 1
     assert torch.equal(glm5_routes[0], expected)
     assert torch.equal(glm5_routes[0], deepseek_v4_routes[0])
+    route_token_ids = glm5_routes[0].squeeze(-1)
+    assert torch.equal(glm5_mask, batch.r3_replay_mask[route_token_ids])
+    assert torch.equal(glm5_mask, deepseek_v4_mask)
 
 
 @pytest.mark.parametrize("model_name", R3_SUPPORTED_MODEL_NAMES)

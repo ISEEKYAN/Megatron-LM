@@ -28,6 +28,7 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     nested_from_packed,
+    pack_r3_replay_mask as _pack_r3_replay_mask,
     pack_routed_experts as _pack_routed_experts,
     router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
@@ -203,6 +204,12 @@ def pack_routed_experts(model: nn.Module, batch: PackedBatch, routed_experts):
     """Pack R3 routes using GLM-5's contiguous CP token layout."""
 
     return _pack_routed_experts(model, batch, routed_experts, contiguous=True)
+
+
+def pack_r3_replay_mask(model: nn.Module, batch: PackedBatch) -> torch.Tensor:
+    """Pack the causal R3 mask using GLM-5's contiguous CP token layout."""
+
+    return _pack_r3_replay_mask(model, batch, contiguous=True)
 
 
 def _make_aux_loss_hook():

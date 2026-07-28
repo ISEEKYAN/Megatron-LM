@@ -196,6 +196,8 @@ def test_supported_moe_protocols_expose_mtp_safe_replay_roots(protocol_name):
     )
     source = protocol_path.read_text()
     assert "router_replay_roots" in source
+    if protocol_name in {"deepseek_v4", "glm5"}:
+        assert "def pack_r3_replay_mask" in source
 
 
 def test_r3_driver_begin_fails_loudly_when_model_has_no_moe_router():
