@@ -568,6 +568,43 @@ def test_real_tiny_model_replay_attachment_count_matches_decoder_layers(
 
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("layers.0.mlp.weight", "layers.0.mlp.weight"),
+        (
+            "layers.0.mlp.parametrizations.weight.original",
+            "layers.0.mlp.weight",
+        ),
+        (
+            "layers.0.mlp.parametrizations.weight.0.amax",
+            "layers.0.mlp.parametrizations.weight.0.amax",
+        ),
+        (
+            "model.decoder.layers.7.mlp.down_proj.parametrizations.weight.original",
+            "model.decoder.layers.7.mlp.down_proj.weight",
+        ),
+    ],
+)
+def test_every_model_uses_shared_canonical_state_key(
+    model_name: str,
+    key: str,
+    expected: str,
+    transformer_engine_import_stub,
+    monkeypatch,
+):
+    from megatron.lite.model.protocol_utils import canonical_state_key
+
+    _protocol(model_name, transformer_engine_import_stub, monkeypatch)
+    checkpoint = importlib.import_module(
+        f"megatron.lite.model.{model_name}.lite.checkpoint"
+    )
+
+    assert checkpoint._canonical_state_key is canonical_state_key
+    assert checkpoint._canonical_state_key(key) == expected
+
+
+@pytest.mark.parametrize("model_name", MODEL_NAMES)
 def test_every_model_qat_off_canonicalization_is_identity_for_all_real_state_keys(
     model_name: str,
     transformer_engine_import_stub,

@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import torch
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+from megatron.lite.model.protocol_utils import (
+    canonical_state_key as _canonical_state_key,
+)
 from megatron.lite.primitive.ckpt.dcp import (  # noqa: F401 — re-export
     canonicalize_fc1_for_dcp,
     canonicalize_qkv_for_dcp,
@@ -254,25 +257,6 @@ class Qwen3MoEWeightSpec:
 # ---------------------------------------------------------------------------
 # Convenience: standalone functions wrapping WeightSpec + generic loader
 # ---------------------------------------------------------------------------
-
-
-def _canonical_state_key(key: str) -> str:
-    """Map a QAT-parametrized state key back to its logical (pre-QAT) name.
-
-    ``torch.nn.utils.parametrize`` renames ``mod.weight`` to
-    ``mod.parametrizations.weight.original`` (the surviving BF16 master), while
-    HF checkpoints still reference the logical ``mod.weight``. Strip the
-    parametrization wrapper so loaded tensors resolve onto the master weight
-    instead of being silently dropped (which would train on random weights).
-    Only the ``.original`` master is rewritten; quantizer buffers such as
-    ``...parametrizations.weight.0.amax`` are left untouched.
-    """
-    marker = ".parametrizations."
-    if marker not in key or not key.endswith(".original"):
-        return key
-    head, rest = key.split(marker, 1)
-    attr = rest.split(".", 1)[0]
-    return f"{head}.{attr}"
 
 
 def _resolve_param_name_canonical(name: str, state_dict: dict) -> str | None:

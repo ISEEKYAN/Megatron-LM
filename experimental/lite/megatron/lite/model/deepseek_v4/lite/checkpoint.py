@@ -33,6 +33,9 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+from megatron.lite.model.protocol_utils import (
+    canonical_state_key as _canonical_state_key,
+)
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
     _cast_export_tensor,
@@ -50,16 +53,6 @@ _QUANTIZED_RESYNC_TARGETS = {
     ResyncFormat.BLOCK_FP8.value,
     ResyncFormat.MXFP4.value,
 }
-
-
-def _canonical_state_key(key: str) -> str:
-    """Map a parametrized QAT master back to its logical checkpoint name."""
-    marker = ".parametrizations."
-    if marker not in key or not key.endswith(".original"):
-        return key
-    head, rest = key.split(marker, 1)
-    attr = rest.split(".", 1)[0]
-    return f"{head}.{attr}"
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:

@@ -8,6 +8,9 @@ import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
 from megatron.lite.model.kimi_k2.config import KimiK2Config
+from megatron.lite.model.protocol_utils import (
+    canonical_state_key as _canonical_state_key,
+)
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
     parse_expert_idx,
@@ -291,16 +294,6 @@ def _load_experts(
             fc2 = _tp(fc2, ps.etp_rank, ps.etp_size, dim=1)
         out[f"{local_prefix}.moe.experts.fc1.weight{local_idx}"] = fc1
         out[f"{local_prefix}.moe.experts.fc2.weight{local_idx}"] = fc2
-
-
-def _canonical_state_key(key: str) -> str:
-    """Map a parametrized QAT master back to its logical checkpoint name."""
-    marker = ".parametrizations."
-    if marker not in key or not key.endswith(".original"):
-        return key
-    head, rest = key.split(marker, 1)
-    attr = rest.split(".", 1)[0]
-    return f"{head}.{attr}"
 
 
 def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> None:

@@ -33,6 +33,25 @@ def _parallel_state(model) -> ParallelState:
     return parallel_state_from_model(model) or ParallelState()
 
 
+def canonical_state_key(key: str) -> str:
+    """Map a QAT-parametrized state key back to its logical (pre-QAT) name.
+
+    ``torch.nn.utils.parametrize`` renames ``mod.weight`` to
+    ``mod.parametrizations.weight.original`` (the surviving BF16 master), while
+    HF checkpoints still reference the logical ``mod.weight``. Strip the
+    parametrization wrapper so loaded tensors resolve onto the master weight
+    instead of being silently dropped (which would train on random weights).
+    Only the ``.original`` master is rewritten; quantizer buffers such as
+    ``...parametrizations.weight.0.amax`` are left untouched.
+    """
+    marker = ".parametrizations."
+    if marker not in key or not key.endswith(".original"):
+        return key
+    head, rest = key.split(marker, 1)
+    attr = rest.split(".", 1)[0]
+    return f"{head}.{attr}"
+
+
 def router_replay_roots(chunk) -> list:
     """Select decoder layers for R3, excluding MTP-only routers.
 
