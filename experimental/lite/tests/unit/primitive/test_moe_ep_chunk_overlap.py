@@ -93,24 +93,6 @@ def test_chunked_ep_keeps_compute_on_the_autograd_caller_stream(
     assert "torch.cuda.current_stream(device)" in source
 
 
-def test_chunked_ep_accumulates_parameter_grads_inside_backward(
-    transformer_engine_import_stub,
-):
-    transformer_engine_import_stub()
-    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-        EPChunkOverlapOperator,
-        _FullRecomputeFused,
-    )
-
-    forward_source = inspect.getsource(_FullRecomputeFused.forward)
-    backward_source = inspect.getsource(_FullRecomputeFused.backward)
-    operator_source = inspect.getsource(EPChunkOverlapOperator._forward_impl)
-
-    assert "*params" not in forward_source
-    assert "*params" not in operator_source
-    assert "_accumulate_parameter_grads" in backward_source
-
-
 @pytest.mark.parametrize(
     "chunks,use_deepep,ep_size", [(1, False, 1), (1, True, 8), (2, True, 8)]
 )

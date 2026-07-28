@@ -166,8 +166,9 @@ class EPChunkOverlapOperator:
         x_2d = x.view(-1, x.size(-1)) if x.dim() == 3 else x
         chunks = 2
         if torch.is_grad_enabled():
+            params = tuple(self.router.parameters()) + tuple(self.experts.parameters())
             return _FullRecomputeFused.apply(
-                x_2d, routing_input, self, input_shape, x.dtype, chunks, chunks
+                x_2d, routing_input, self, input_shape, x.dtype, chunks, chunks, *params
             )
         ranges = ep_chunk_ranges(
             x_2d.size(0), chunks, weights_env="MEGATRON_LITE_EP_CHUNK_WEIGHTS"
@@ -652,10 +653,12 @@ class _FullRecomputeFused(torch.autograd.Function):
         input_dtype: torch.dtype,
         fwd_chunks: int,
         bwd_chunks: int,
+        *params: torch.Tensor,
     ) -> torch.Tensor:
-        del input_dtype
+        del params, input_dtype
         ctx.operator = operator
         ctx.bwd_chunks = bwd_chunks
+        ctx.num_router_params = len(tuple(operator.router.parameters()))
         ctx.has_routing_input = routing_input is not None
         saved_routing = (
             routing_input.detach()
@@ -679,11 +682,6 @@ class _FullRecomputeFused(torch.autograd.Function):
             grad_x, router_grads, expert_grads = operator._full_recompute_fused_backward(
                 x_saved, grad_2d, ctx.bwd_chunks
             )
-            _accumulate_parameter_grads(
-                tuple(operator.router.parameters())
-                + tuple(operator.experts.parameters()),
-                tuple(router_grads) + tuple(expert_grads),
-            )
         return (
             grad_x,
             None,
@@ -692,6 +690,8 @@ class _FullRecomputeFused(torch.autograd.Function):
             None,
             None,
             None,
+            *router_grads,
+            *expert_grads,
         )
 
 
@@ -756,21 +756,6 @@ def _materialize(
         torch.zeros_like(param) if grad is None else grad
         for param, grad in zip(params, accum, strict=True)
     ]
-
-
-def _accumulate_parameter_grads(
-    params: tuple[torch.Tensor, ...], grads: tuple[torch.Tensor | None, ...]
-) -> None:
-    active = [
-        (param, grad)
-        for param, grad in zip(params, grads, strict=True)
-        if param.requires_grad and grad is not None
-    ]
-    if active:
-        torch.autograd.backward(
-            tuple(param for param, _ in active),
-            tuple(grad for _, grad in active),
-        )
 
 
 __all__ = ["EPChunkOverlapOperator"]
