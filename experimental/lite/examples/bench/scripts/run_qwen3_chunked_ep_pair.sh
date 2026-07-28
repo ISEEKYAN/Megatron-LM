@@ -26,6 +26,7 @@ COMMON_ARGS=(
   --truncate-layers "${TRUNCATE_LAYERS:-8}"
   --keep-experts "${KEEP_EXPERTS:-8}"
   --disable-mtp
+  --use-thd
   --same-data-across-dp
   --skip-load-hf-weights
 )
@@ -34,6 +35,7 @@ run_arm() {
   local arm=$1
   local impl_cfg=$2
   local port=$3
+  local correctness_port=$4
   if [[ "${DRY_RUN}" == "1" ]]; then
     "${PYTHON_BIN}" "${REPO_ROOT}/experimental/lite/examples/bench/bench.py" \
       "${COMMON_ARGS[@]}" \
@@ -49,11 +51,30 @@ run_arm() {
     --impl-cfg-json "${impl_cfg}" \
     --output-json "${OUTPUT_DIR}/qwen3_chunked_ep_${arm}.json" \
     2>&1 | tee "${OUTPUT_DIR}/qwen3_chunked_ep_${arm}.log"
+
+  torchrun --nproc_per_node "${NPROC}" --master_port "${correctness_port}" \
+    "${REPO_ROOT}/experimental/lite/examples/bench/correctness.py" run \
+    "${COMMON_ARGS[@]}" \
+    --impl-cfg-json "${impl_cfg}" \
+    --steps "${CORRECTNESS_STEPS:-3}" \
+    --warmup 0 \
+    --output-json "${OUTPUT_DIR}/qwen3_chunked_ep_${arm}_correctness.json" \
+    2>&1 | tee "${OUTPUT_DIR}/qwen3_chunked_ep_${arm}_correctness.log"
 }
 
 run_arm baseline \
   '{"use_deepep":true,"num_chunks_ep_a2a_overlap":1}' \
-  "${MASTER_PORT_BASELINE:-31851}"
+  "${MASTER_PORT_BASELINE:-31851}" \
+  "${CORRECTNESS_PORT_BASELINE:-31951}"
 run_arm chunked \
   '{"use_deepep":true,"num_chunks_ep_a2a_overlap":2}' \
-  "${MASTER_PORT_CHUNKED:-31852}"
+  "${MASTER_PORT_CHUNKED:-31852}" \
+  "${CORRECTNESS_PORT_CHUNKED:-31952}"
+
+if [[ "${DRY_RUN}" != "1" ]]; then
+  "${PYTHON_BIN}" "${REPO_ROOT}/experimental/lite/examples/bench/correctness.py" compare \
+    "${OUTPUT_DIR}/qwen3_chunked_ep_baseline_correctness.json" \
+    "${OUTPUT_DIR}/qwen3_chunked_ep_chunked_correctness.json" \
+    --output-json "${OUTPUT_DIR}/qwen3_chunked_ep_correctness_compare.json" \
+    --fail-on-mismatch
+fi

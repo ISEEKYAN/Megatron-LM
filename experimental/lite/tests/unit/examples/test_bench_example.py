@@ -53,6 +53,10 @@ def test_qwen3_chunked_ep_pair_uses_deepep_and_explicit_chunks():
 
     assert text.count('"use_deepep":true') == 2
     assert '"num_chunks_ep_a2a_overlap":2' in text
+    assert "--use-thd" in text
+    assert "post_step_weights" not in text
+    assert "correctness.py" in text
+    assert "--fail-on-mismatch" in text
     assert "overlap_moe_expert_parallel_comm" not in text
 
 
