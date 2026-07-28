@@ -53,8 +53,7 @@ def _collect_sp_grad_params(model: nn.Module) -> list[nn.Parameter]:
     return [
         param
         for name, param in model.named_parameters()
-        if any(name.endswith(suffix) for suffix in _SP_GRAD_SUFFIXES)
-        or name == "norm.weight"
+        if any(name.endswith(suffix) for suffix in _SP_GRAD_SUFFIXES) or name == "norm.weight"
     ]
 
 
@@ -65,9 +64,7 @@ def _swiglu(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x1) * x2
 
 
-def _reduce_scatter_to_sequence_parallel(
-    x: torch.Tensor, ps: ParallelState
-) -> torch.Tensor:
+def _reduce_scatter_to_sequence_parallel(x: torch.Tensor, ps: ParallelState) -> torch.Tensor:
     if ps.tp_size == 1:
         return x
     return ReduceScatterDim0.apply(x, ps.tp_size, ps.tp_rank, ps.tp_group)
@@ -84,9 +81,7 @@ class DenseMLP(nn.Module):
             normalization="RMSNorm",
             eps=config.rms_norm_eps,
         )
-        self.down = RowParallelLinear(
-            config.intermediate_size, config.hidden_size, ps, bias=False
-        )
+        self.down = RowParallelLinear(config.intermediate_size, config.hidden_size, ps, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down(_swiglu(self.gate_up(x)))
@@ -139,9 +134,7 @@ class MoELayer(nn.Module):
     ):
         super().__init__()
         if fp8:
-            raise NotImplementedError(
-                "Kimi K2 lite MoE fp8 training is not implemented yet."
-            )
+            raise NotImplementedError("Kimi K2 lite MoE fp8 training is not implemented yet.")
         self.router = SigmoidTopKRouter(
             config,
             ps,
@@ -170,9 +163,7 @@ class MoELayer(nn.Module):
 
         flat_x = x.view(-1, x.size(-1))
         scores, indices = self.router(flat_x)
-        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(
-            flat_x, scores, indices
-        )
+        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(flat_x, scores, indices)
         del scores, indices
         self.dispatcher.wait_dispatch_event()
         expert_out = self.experts(
@@ -237,9 +228,7 @@ class KimiK2Layer(nn.Module):
             self.mlp = DenseMLP(config, ps)
 
     def forward(self, x: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
-        x = x + self.self_attention(
-            self.input_layernorm(x), packed_seq_params=packed_seq_params
-        )
+        x = x + self.self_attention(self.input_layernorm(x), packed_seq_params=packed_seq_params)
         if self.moe is not None:
             assert self.mlp_norm is not None
             mlp_input = self.mlp_norm(x)
@@ -255,9 +244,7 @@ def _roll_mtp_left(
     dims: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if packed_seq_params is not None:
-        return roll_packed_thd_left(
-            tensor, packed_seq_params=packed_seq_params, dims=dims
-        )
+        return roll_packed_thd_left(tensor, packed_seq_params=packed_seq_params, dims=dims)
     dim = dims if dims >= 0 else tensor.dim() + dims
     rolled = torch.roll(tensor, shifts=-1, dims=dim)
     rolled.select(dim, -1).zero_()
@@ -314,9 +301,7 @@ class KimiK2MTPLayer(nn.Module):
         packed_seq_params=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         del rotary_position_ids
-        input_ids, _ = _roll_mtp_left(
-            input_ids, packed_seq_params=packed_seq_params, dims=-1
-        )
+        input_ids, _ = _roll_mtp_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
         if position_ids is not None:
             position_ids, _ = _roll_mtp_left(
                 position_ids, packed_seq_params=packed_seq_params, dims=-1
@@ -333,9 +318,7 @@ class KimiK2MTPLayer(nn.Module):
         hidden_states = torch.cat((decoder_input, hidden_states), dim=-1)
         hidden_states = self.eh_proj(hidden_states)
         hidden_states = scatter_to_sequence_parallel(hidden_states, self.ps)
-        hidden_states = self.transformer_layer(
-            hidden_states, packed_seq_params=packed_seq_params
-        )
+        hidden_states = self.transformer_layer(hidden_states, packed_seq_params=packed_seq_params)
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids
 
@@ -471,14 +454,10 @@ class KimiK2Model(nn.Module):
 
         self.embed: VocabParallelEmbedding | None = None
         if layout.has_embed:
-            self.embed = VocabParallelEmbedding(
-                config.vocab_size, config.hidden_size, ps
-            )
+            self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
 
         recompute_modules = getattr(train_config, "recompute_modules", [])
-        moe_act_recompute = (
-            "moe_act" in recompute_modules and "moe" not in recompute_modules
-        )
+        moe_act_recompute = "moe_act" in recompute_modules and "moe" not in recompute_modules
         self.layers = nn.ModuleList(
             [
                 KimiK2Layer(
@@ -506,9 +485,7 @@ class KimiK2Model(nn.Module):
         if mtp_enable and config.num_nextn_predict_layers > 0 and layout.has_mtp:
             mtp_embedding = self.embed
             if mtp_embedding is None:
-                mtp_embedding = VocabParallelEmbedding(
-                    config.vocab_size, config.hidden_size, ps
-                )
+                mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
                 self.mtp_embed = mtp_embedding
             self.mtp = KimiK2MTPBlock(
                 config,
@@ -556,9 +533,7 @@ class KimiK2Model(nn.Module):
             h = hidden_states
 
         fp8_ctx = (
-            te.fp8_autocast(
-                enabled=True, fp8_recipe=build_fp8_recipe(self.train_config)
-            )
+            te.fp8_autocast(enabled=True, fp8_recipe=build_fp8_recipe(self.train_config))
             if self.train_config.fp8
             else nullcontext()
         )
@@ -596,9 +571,7 @@ class KimiK2Model(nn.Module):
                     output["mtp_loss"] = mtp_loss
                 labels_sb = labels.transpose(0, 1).contiguous()
                 if use_fused_kernels:
-                    hidden_full = gather_from_sequence_parallel(
-                        hidden_for_head, self.ps
-                    )
+                    hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
                     log_probs, entropy = linear_cross_entropy(
                         hidden_full,
                         self._head_weight_for_fused_ce(hidden_full),
@@ -614,9 +587,7 @@ class KimiK2Model(nn.Module):
                     logits = self.head(hidden_for_head)
                     if temperature_value != 1.0:
                         logits = logits / temperature_value
-                    loss = vocab_parallel_cross_entropy(
-                        logits, labels_sb, self.ps.tp_group
-                    )
+                    loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
                     output["loss"] = loss.mean()
                     output["log_probs"] = (-loss).transpose(0, 1).contiguous()
                     if calculate_entropy:
@@ -627,9 +598,7 @@ class KimiK2Model(nn.Module):
                 output["logits"] = self.head.gather(logits).transpose(0, 1).contiguous()
                 if mtp_hidden_states is not None:
                     output["mtp_logits"] = [
-                        self.head.gather(self.head(mtp_hidden))
-                        .transpose(0, 1)
-                        .contiguous()
+                        self.head.gather(self.head(mtp_hidden)).transpose(0, 1).contiguous()
                         for mtp_hidden in mtp_hidden_states
                     ]
         return output
@@ -705,17 +674,13 @@ class KimiK2Model(nn.Module):
                 logits = self.head(mtp_hidden)
                 if temperature != 1.0:
                     logits = logits / temperature
-                token_loss = vocab_parallel_cross_entropy(
-                    logits, labels_sb, self.ps.tp_group
-                )
+                token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
 
             token_loss = token_loss * mask_sb.to(dtype=token_loss.dtype)
             num_tokens = num_tokens.to(dtype=token_loss.dtype).clamp_min(1.0)
             mtp_loss_values.append(token_loss.sum() / num_tokens)
 
-            mtp_loss_scale = self.mtp_loss_scaling_factor / max(
-                len(mtp_hidden_states), 1
-            )
+            mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
             hidden_states = MTPLossAutoScaler.apply(
                 hidden_states,
                 mtp_loss_scale * token_loss / num_tokens,
@@ -732,9 +697,7 @@ class KimiK2Model(nn.Module):
         assert self.head is not None
         weight = self.head.col.linear.weight
         return (
-            weight
-            if weight.dtype == hidden_states.dtype
-            else weight.to(dtype=hidden_states.dtype)
+            weight if weight.dtype == hidden_states.dtype else weight.to(dtype=hidden_states.dtype)
         )
 
 

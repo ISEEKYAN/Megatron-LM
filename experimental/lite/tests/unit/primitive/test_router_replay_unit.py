@@ -9,14 +9,13 @@ import torch.nn as nn
 
 
 def test_replay_mask_uses_live_scores_and_keeps_native_unmasked_row():
-    from megatron.lite.primitive.modules.router_replay import (
-        RouterReplay,
-        RouterReplayAction,
-    )
+    from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
 
     RouterReplay.clear_global_router_replay_instances()
     replay = RouterReplay()
-    dense = torch.tensor([[0.1, 0.2, 0.7], [0.6, 0.3, 0.1]], requires_grad=True)
+    dense = torch.tensor(
+        [[0.1, 0.2, 0.7], [0.6, 0.3, 0.1]], requires_grad=True
+    )
     native_indices = torch.tensor([[2, 1], [0, 1]])
     native_scores = dense.gather(1, native_indices)
     target = torch.tensor([[0, 1], [2, 1]])
@@ -56,10 +55,7 @@ def test_replayed_sqrtsoftplus_scores_are_live_normalized_and_nonzero():
 
 
 def test_backward_replay_keeps_fifo_across_pipeline_warmup_forwards():
-    from megatron.lite.primitive.modules.router_replay import (
-        RouterReplay,
-        RouterReplayAction,
-    )
+    from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
 
     RouterReplay.clear_global_router_replay_instances()
     replay = RouterReplay()
@@ -81,10 +77,7 @@ def test_ds4_hash_router_records_and_replays_its_layer_column():
 
     pytest.importorskip("transformer_engine")
     from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE
-    from megatron.lite.primitive.modules.router_replay import (
-        RouterReplay,
-        RouterReplayAction,
-    )
+    from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
 
     RouterReplay.clear_global_router_replay_instances()
     module = DeepseekV4MoE.__new__(DeepseekV4MoE)
@@ -241,9 +234,7 @@ def test_r3_driver_replays_layer_order_and_causal_rows_end_to_end():
     driver.begin()
     try:
         stepped = driver.wrap(
-            lambda active_model, _batch: [
-                router(native) for router in active_model.routers
-            ]
+            lambda active_model, _batch: [router(native) for router in active_model.routers]
         )
         layer0, layer1 = stepped(model, batch)
     finally:
@@ -305,9 +296,7 @@ def test_r3_driver_accepts_next_token_routes_without_final_input_row():
     assert driver is not None
     driver.begin()
     try:
-        stepped = driver.wrap(
-            lambda active_model, _batch: active_model.routers[0](native)
-        )
+        stepped = driver.wrap(lambda active_model, _batch: active_model.routers[0](native))
         actual = stepped(model, batch)
     finally:
         driver.end()

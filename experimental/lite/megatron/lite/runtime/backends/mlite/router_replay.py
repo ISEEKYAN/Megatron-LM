@@ -70,9 +70,7 @@ class RouterReplayDriver:
             attach_router_replay(root, reset=False) for root in self._replay_roots()
         )
         if self._num_routers == 0:
-            raise RuntimeError(
-                "router replay requested but the model has no MoE routers."
-            )
+            raise RuntimeError("router replay requested but the model has no MoE routers.")
         self._ps = parallel_state_from_model(self._chunks[-1])
         self._compute_pp_layout()
         if self.action == "record":
@@ -83,9 +81,7 @@ class RouterReplayDriver:
         if ps is None or ps.pp_size <= 1:
             self._pp_total = self._num_routers
             return
-        counts = [
-            torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(ps.pp_size)
-        ]
+        counts = [torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(ps.pp_size)]
         dist.all_gather(
             counts,
             torch.tensor([self._num_routers], dtype=torch.long, device="cuda"),
@@ -114,21 +110,15 @@ class RouterReplayDriver:
                 raise ValueError("R3 router replay requires batch.routed_experts.")
             routed = self._select_local_layers(routed)
             pack_routes = _protocol_fn(
-                self._protocol,
-                "pack_routed_experts",
-                protocol_utils.pack_routed_experts,
+                self._protocol, "pack_routed_experts", protocol_utils.pack_routed_experts
             )
             pack_mask = _protocol_fn(
-                self._protocol,
-                "pack_r3_replay_mask",
-                protocol_utils.pack_r3_replay_mask,
+                self._protocol, "pack_r3_replay_mask", protocol_utils.pack_r3_replay_mask
             )
             targets = pack_routes(model, batch, routed)
             replay_mask = pack_mask(model, batch)
             RouterReplay.set_replay_data(targets, replay_mask=replay_mask)
-            RouterReplay.set_global_router_replay_action(
-                RouterReplayAction.REPLAY_FORWARD
-            )
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             RouterReplay.reset_replay_stats()
             try:
                 return forward_step(model, batch)

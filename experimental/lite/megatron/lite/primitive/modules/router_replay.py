@@ -131,9 +131,7 @@ class RouterReplay:
         else:
             return native_indices
         if target is None:
-            raise RuntimeError(
-                "router replay is active but no target indices were set."
-            )
+            raise RuntimeError("router replay is active but no target indices were set.")
 
         target = target.to(device=native_indices.device, dtype=torch.long)
         if target.shape != native_indices.shape:

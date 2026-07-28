@@ -34,9 +34,7 @@ def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
 
 
 def _engine(
-    *,
-    engine_config: MegatronLiteEngineConfig,
-    optimizer_config: SimpleNamespace | None = None,
+    *, engine_config: MegatronLiteEngineConfig, optimizer_config: SimpleNamespace | None = None
 ) -> MegatronLiteEngine:
     return MegatronLiteEngine(
         model_config=SimpleNamespace(
@@ -63,10 +61,7 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     engine.get_data_parallel_group = lambda: None
 
     hook = engine._make_runtime_loss_fn(
-        lambda model_output, **_kwargs: (
-            model_output["log_probs"] / num_microbatches,
-            {},
-        ),
+        lambda model_output, **_kwargs: (model_output["log_probs"] / num_microbatches, {}),
         num_microbatches=num_microbatches,
         output_lst=outputs,
     )
@@ -75,9 +70,7 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
         (loss / num_microbatches).backward()
 
     torch.testing.assert_close(weight.grad, torch.tensor(3.0))
-    assert [output["loss"] for output in outputs] == [
-        3.0 / num_microbatches
-    ] * num_microbatches
+    assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
 
 
 def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> None:

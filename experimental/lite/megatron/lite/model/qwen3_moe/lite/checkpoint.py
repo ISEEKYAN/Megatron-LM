@@ -84,9 +84,7 @@ class Qwen3MoEWeightSpec:
                     f"{lp}.attn.q_norm.weight": [f"{ap}.q_norm.weight"],
                     f"{lp}.attn.k_norm.weight": [f"{ap}.k_norm.weight"],
                     f"{lp}.attn.proj.linear.weight": [f"{ap}.o_proj.weight"],
-                    f"{lp}.mlp_norm.weight": [
-                        f"model.layers.{li}.post_attention_layernorm.weight"
-                    ],
+                    f"{lp}.mlp_norm.weight": [f"model.layers.{li}.post_attention_layernorm.weight"],
                     f"{lp}.moe.router.gate.weight": [f"{mp}.gate.weight"],
                 }
             )
@@ -95,9 +93,7 @@ class Qwen3MoEWeightSpec:
                     f"{mp}.experts.{e}.gate_proj.weight",
                     f"{mp}.experts.{e}.up_proj.weight",
                 ]
-                wm[f"{lp}.moe.experts._fc2_weight_{e}"] = [
-                    f"{mp}.experts.{e}.down_proj.weight"
-                ]
+                wm[f"{lp}.moe.experts._fc2_weight_{e}"] = [f"{mp}.experts.{e}.down_proj.weight"]
         for mi in range(c.num_nextn_predict_layers):
             hf_li = c.num_hidden_layers + mi
             hp = f"model.layers.{hf_li}"
@@ -111,9 +107,7 @@ class Qwen3MoEWeightSpec:
                     f"{lp}.hnorm.weight": [f"{hp}.hnorm.weight"],
                     f"{lp}.eh_proj.linear.weight": [f"{hp}.eh_proj.weight"],
                     f"{lp}.final_layernorm.weight": [f"{hp}.shared_head.norm.weight"],
-                    f"{tlp}.attn.qkv.linear.layer_norm_weight": [
-                        f"{hp}.input_layernorm.weight"
-                    ],
+                    f"{tlp}.attn.qkv.linear.layer_norm_weight": [f"{hp}.input_layernorm.weight"],
                     f"{tlp}.attn.qkv.linear.weight": [
                         f"{ap}.q_proj.weight",
                         f"{ap}.k_proj.weight",
@@ -131,14 +125,10 @@ class Qwen3MoEWeightSpec:
                     f"{mp}.experts.{e}.gate_proj.weight",
                     f"{mp}.experts.{e}.up_proj.weight",
                 ]
-                wm[f"{tlp}.moe.experts._fc2_weight_{e}"] = [
-                    f"{mp}.experts.{e}.down_proj.weight"
-                ]
+                wm[f"{tlp}.moe.experts._fc2_weight_{e}"] = [f"{mp}.experts.{e}.down_proj.weight"]
         return wm
 
-    def hf_to_native(
-        self, native_name: str, hf_tensors: list[torch.Tensor]
-    ) -> torch.Tensor:
+    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
         if len(hf_tensors) == 3 and "qkv" in native_name:
             # Match MCore SelfAttention's local qkv packing:
             # [q heads for kv-group 0, k0, v0, q heads for kv-group 1, k1, v1, ...].

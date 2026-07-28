@@ -65,14 +65,7 @@ def test_kimi_k2_config_reads_hf_fields():
 
 
 def test_kimi_k2_lite_does_not_import_wrappers_or_sibling_models():
-    root = (
-        Path(__file__).resolve().parents[3]
-        / "megatron"
-        / "lite"
-        / "model"
-        / "kimi_k2"
-        / "lite"
-    )
+    root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "kimi_k2" / "lite"
     forbidden = (
         "megatron.lite.model.qwen3_5",
         "megatron.lite.model.qwen3_moe",
@@ -89,14 +82,7 @@ def test_kimi_k2_lite_does_not_import_wrappers_or_sibling_models():
 
 
 def test_kimi_k2_lite_implementation_files_stay_small():
-    root = (
-        Path(__file__).resolve().parents[3]
-        / "megatron"
-        / "lite"
-        / "model"
-        / "kimi_k2"
-        / "lite"
-    )
+    root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "kimi_k2" / "lite"
     for name in ("model.py", "protocol.py", "checkpoint.py"):
         line_count = len((root / name).read_text().splitlines())
         assert line_count < 1000, f"{name} has {line_count} lines"
@@ -110,8 +96,7 @@ def test_kimi_k2_lite_uses_shared_mla_primitive():
     mla_text = primitive_mla.read_text()
 
     assert (
-        "from megatron.lite.primitive.modules.attention import MultiLatentAttention"
-        in model_text
+        "from megatron.lite.primitive.modules.attention import MultiLatentAttention" in model_text
     )
     assert not (model_root / "mla.py").exists()
     assert "class MultiLatentAttention" not in model_text
@@ -125,14 +110,7 @@ def test_kimi_k2_lite_uses_shared_mla_primitive():
 
 
 def test_kimi_k2_lite_optimizer_names_are_current():
-    root = (
-        Path(__file__).resolve().parents[3]
-        / "megatron"
-        / "lite"
-        / "model"
-        / "kimi_k2"
-        / "lite"
-    )
+    root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "kimi_k2" / "lite"
     protocol_text = (root / "protocol.py").read_text()
 
     assert 'optimizer: str | None = "dist_opt"' in protocol_text
@@ -184,10 +162,7 @@ def test_kimi_k2_impl_config_accepts_runtime_mtp_fields():
 
 
 def test_kimi_k2_mtp_and_pp_layout_rules_are_explicit():
-    from megatron.lite.primitive.parallel import (
-        ParallelState,
-        build_pipeline_chunk_layout,
-    )
+    from megatron.lite.primitive.parallel import ParallelState, build_pipeline_chunk_layout
 
     model_text = (
         Path(__file__).resolve().parents[3]
@@ -291,9 +266,7 @@ def test_kimi_k2_checkpoint_exports_hf_names():
         ("model.layers.2.shared_head.norm.weight", bias)
     ]
     mtp_export = dict(
-        spec.native_to_hf(
-            "mtp.layers.0.transformer_layer.mlp.gate_up.linear.weight", gate_up
-        )
+        spec.native_to_hf("mtp.layers.0.transformer_layer.mlp.gate_up.linear.weight", gate_up)
     )
     assert set(mtp_export) == {
         "model.layers.2.mlp.gate_proj.weight",
@@ -316,9 +289,7 @@ def test_kimi_k2_fp8_checkpoint_dequant_cpu_path():
             assert name == "w_scale_inv"
             return torch.full((1, 1), 2.0, dtype=torch.float32)
 
-    weight = torch.tensor([[1.0, -2.0], [3.0, -4.0]], dtype=torch.float32).to(
-        torch.float8_e4m3fn
-    )
+    weight = torch.tensor([[1.0, -2.0], [3.0, -4.0]], dtype=torch.float32).to(torch.float8_e4m3fn)
     out = _dequant_fp8_weight(Reader(), "w", weight)
 
     torch.testing.assert_close(out, weight.float() * 2.0)
@@ -353,9 +324,7 @@ def test_kimi_k2_int4_checkpoint_dequant_cpu_path():
             }[name]
 
     out = _get(Reader(), "w")
-    expected = torch.cat(
-        [values[:, :5].float() * 0.5, values[:, 5:].float() * 2.0], dim=1
-    )
+    expected = torch.cat([values[:, :5].float() * 0.5, values[:, 5:].float() * 2.0], dim=1)
 
     torch.testing.assert_close(out, expected)
 
