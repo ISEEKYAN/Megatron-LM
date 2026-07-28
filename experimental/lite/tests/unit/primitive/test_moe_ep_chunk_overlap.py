@@ -93,6 +93,16 @@ def test_chunked_ep_keeps_compute_on_the_autograd_caller_stream(
     assert "torch.cuda.current_stream(device)" in source
 
 
+def test_chunked_ep_accumulates_chunk_grads_in_place(transformer_engine_import_stub):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import _accumulate
+
+    source = inspect.getsource(_accumulate)
+
+    assert ".add_(grad)" in source
+    assert "accum[idx] + grad" not in source
+
+
 @pytest.mark.parametrize(
     "chunks,use_deepep,ep_size", [(1, False, 1), (1, True, 8), (2, True, 8)]
 )
