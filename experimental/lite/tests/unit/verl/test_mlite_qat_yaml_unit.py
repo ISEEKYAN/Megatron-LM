@@ -23,7 +23,11 @@ def test_default_yaml_keeps_export_and_training_qat_disabled() -> None:
         "apply_modelopt_fake_quant": False,
         "mode": "mxfp4",
         "group_size": 32,
-        "ignore_patterns": [],
+        "ignore_patterns": [
+            "lm_head",
+            "embed_tokens",
+            "re:.*mlp.gate$",
+        ],
     }
     assert config["impl_cfg"]["qat"] == {
         "enabled": False,

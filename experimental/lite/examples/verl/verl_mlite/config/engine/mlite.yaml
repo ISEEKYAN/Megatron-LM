@@ -14,7 +14,11 @@ qat:
   apply_modelopt_fake_quant: false  # Keep false when MLite supplies training fake quant.
   mode: mxfp4  # Export format understood by verl (for example, mxfp4).
   group_size: 32  # Quantization group width; MXFP4 uses 32.
-  ignore_patterns: []  # Module-name strings or "re:" regular expressions to skip.
+  # Required: verl has no built-in export ignore set; see ../../../../QAT.md.
+  ignore_patterns:
+    - lm_head
+    - embed_tokens
+    - "re:.*mlp.gate$"
 resync_format: null
 resync_config: {}
 router_replay_mode: disabled

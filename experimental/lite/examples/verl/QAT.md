@@ -26,6 +26,35 @@ impl_cfg = ImplConfig(
 
 The same fields can be supplied as YAML/Hydra data under `impl_cfg.qat`.
 
+Rollout export has a separate, verl-owned configuration under the engine's
+top-level `qat` key:
+
+```yaml
+qat:
+  enable: true
+  apply_modelopt_fake_quant: false
+  mode: mxfp4
+  group_size: 32
+  ignore_patterns:
+    - lm_head
+    - embed_tokens
+    - "re:.*mlp.gate$"
+```
+
+These three export ignore patterns are required for this MLite path. In the
+verl exporter used by this integration, a missing or empty `ignore_patterns`
+value becomes an empty list; there is no built-in export ignore set.
+Consequently, the HF-stream exporter otherwise quantizes every eligible
+`.weight` tensor other than norms, including the output head, embeddings, and
+router gate. Literal export patterns use substring/glob matching, and a
+`"re:"` prefix selects regular-expression matching.
+
+Do not confuse this with the training-side `QATSpec.ignore_patterns`.
+`QATSpec` has its own built-in defaults for embedding, output-head, and router
+path components and matches exact, case-insensitive dotted path components.
+Changing the training list does not change verl's export list, or vice versa;
+configure both owners explicitly as shown above.
+
 ## `QATSpec` fields
 
 | Field | Meaning |
