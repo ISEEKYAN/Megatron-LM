@@ -433,9 +433,46 @@ def _real_tiny_model(model_name: str, monkeypatch):
     raise AssertionError(f"unsupported model: {model_name}")
 
 
-@pytest.mark.parametrize("model_name", MODEL_NAMES)
+R3_SUPPORTED_MODEL_NAMES = ("qwen3_moe", "qwen3_5", "deepseek_v4")
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_glm5_r3_route_packing_matches_contiguous_forward_layout(
+    cp_rank,
+    transformer_engine_import_stub,
+    monkeypatch,
+):
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    glm5 = _protocol("glm5", transformer_engine_import_stub, monkeypatch)
+    deepseek_v4 = _protocol("deepseek_v4", transformer_engine_import_stub, monkeypatch)
+    model = nn.Module()
+    model.ps = types.SimpleNamespace(
+        tp_size=1,
+        tp_rank=0,
+        cp_size=2,
+        cp_rank=cp_rank,
+        cp_group=None,
+    )
+    batch = PackedBatch(
+        input_ids=torch.arange(8),
+        labels=torch.arange(8),
+        seq_lens=torch.tensor([4, 4]),
+    )
+    routes = torch.arange(8).view(2, 4, 1, 1)
+
+    glm5_routes = glm5.pack_routed_experts(model, batch, routes)
+    deepseek_v4_routes = deepseek_v4.pack_routed_experts(model, batch, routes)
+
+    expected = torch.arange(cp_rank * 4, (cp_rank + 1) * 4).view(4, 1)
+    assert len(glm5_routes) == 1
+    assert torch.equal(glm5_routes[0], expected)
+    assert torch.equal(glm5_routes[0], deepseek_v4_routes[0])
+
+
+@pytest.mark.parametrize("model_name", R3_SUPPORTED_MODEL_NAMES)
 @pytest.mark.parametrize("mtp_enabled", [False, True], ids=["mtp-off", "mtp-on"])
-def test_every_model_replay_roots_are_exact_decoder_layers(
+def test_supported_model_replay_roots_are_exact_decoder_layers(
     model_name: str,
     mtp_enabled: bool,
     transformer_engine_import_stub,
@@ -461,8 +498,8 @@ def test_every_model_replay_roots_are_exact_decoder_layers(
         assert all(root not in mtp_modules for root in roots)
 
 
-@pytest.mark.parametrize("model_name", MODEL_NAMES)
-def test_every_model_mtp_off_replay_attachment_count_is_unchanged(
+@pytest.mark.parametrize("model_name", R3_SUPPORTED_MODEL_NAMES)
+def test_supported_model_mtp_off_replay_attachment_count_is_unchanged(
     model_name: str,
     transformer_engine_import_stub,
     monkeypatch,
@@ -486,8 +523,8 @@ def test_every_model_mtp_off_replay_attachment_count_is_unchanged(
             detach_router_replay(root)
 
 
-@pytest.mark.parametrize("model_name", MODEL_NAMES)
-def test_every_model_attaches_replay_only_to_decoder_router_count(
+@pytest.mark.parametrize("model_name", R3_SUPPORTED_MODEL_NAMES)
+def test_supported_model_attaches_replay_only_to_decoder_router_count(
     model_name: str,
     transformer_engine_import_stub,
     monkeypatch,

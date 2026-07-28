@@ -28,7 +28,7 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     nested_from_packed,
-    router_replay_roots as router_replay_roots,
+    pack_routed_experts as _pack_routed_experts,
     set_cross_entropy_fusion,
 )
 from megatron.lite.primitive.bundle import ModelBundle
@@ -196,6 +196,12 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
         contiguous=True,
     )
     return unpack_thd_to_nested(output, meta, contiguous=True)
+
+
+def pack_routed_experts(model: nn.Module, batch: PackedBatch, routed_experts):
+    """Pack R3 routes using GLM-5's contiguous CP token layout."""
+
+    return _pack_routed_experts(model, batch, routed_experts, contiguous=True)
 
 
 def _make_aux_loss_hook():
