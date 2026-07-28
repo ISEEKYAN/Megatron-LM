@@ -42,6 +42,19 @@ def _ordered_topk_from_routing_map(
     return topk_scores, topk_indices
 
 
+def _reject_aux_loss_during_replay(router_replay: RouterReplay | None) -> None:
+    if (
+        router_replay is not None
+        and router_replay.router_replay_action
+        in (RouterReplayAction.REPLAY_FORWARD, RouterReplayAction.REPLAY_BACKWARD)
+    ):
+        raise RuntimeError(
+            "R3 router aux loss must be disabled: replay dispatches the supplied "
+            "expert indices, but the auxiliary load statistic is computed from "
+            "the native routing map."
+        )
+
+
 class TopKRouter(nn.Module):
     """TopK gating with optional high-precision router logits/probabilities."""
 
@@ -127,6 +140,7 @@ class TopKRouter(nn.Module):
             and torch.is_grad_enabled()
         )
         if apply_aux_loss:
+            _reject_aux_loss_during_replay(self.router_replay)
             routing_map, aux_scores = compute_routing_scores_for_aux_loss(
                 logits, self.topk, score_function="softmax", fused=self.moe_router_fusion
             )
@@ -252,6 +266,7 @@ class SigmoidTopKRouter(nn.Module):
             and torch.is_grad_enabled()
         )
         if apply_aux_loss:
+            _reject_aux_loss_during_replay(self.router_replay)
             _, aux_scores = compute_routing_scores_for_aux_loss(
                 logits, self.topk, score_function=self.score_function, fused=self.moe_router_fusion
             )
