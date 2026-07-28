@@ -26,6 +26,10 @@ set -euo pipefail
 # into an existing GRPO/DAPO script; every other setting is ordinary training
 # configuration. qat_off and qat_on must have byte-identical rollout settings;
 # their sole QAT difference is impl_cfg.qat.enabled.
+#
+# Prefixes must follow this branch's mlite.yaml schema, not the historical
+# harness spelling. This PR adds impl_cfg.qat defaults, while recompute may be
+# present in either schema shape, so those keys use ++ (add-or-override).
 qat_overrides_for_mode() {
     local mode="$1"
     QAT_OVERRIDES=()
@@ -37,25 +41,25 @@ qat_overrides_for_mode() {
             # MXFP4 rollout without fake quant: measures training/rollout mismatch.
             QAT_OVERRIDES+=(
                 "${MXFP4_ROLLOUT_OVERRIDES[@]}"
-                "+actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
+                "++actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
             )
             ;;
         qat_on)
             # MXFP4 rollout plus training-side MXFP4 fake quantization.
             QAT_OVERRIDES+=(
                 "${MXFP4_ROLLOUT_OVERRIDES[@]}"
-                "+actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
-                "+actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
-                "+actor_rollout_ref.actor.engine.impl_cfg.qat.group_size=32"
+                "++actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
+                "++actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+                "++actor_rollout_ref.actor.engine.impl_cfg.qat.group_size=32"
             )
             ;;
         r3)
             # qat_on plus router replay.
             QAT_OVERRIDES+=(
                 "${MXFP4_ROLLOUT_OVERRIDES[@]}"
-                "+actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
-                "+actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
-                "+actor_rollout_ref.actor.engine.impl_cfg.qat.group_size=32"
+                "++actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
+                "++actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+                "++actor_rollout_ref.actor.engine.impl_cfg.qat.group_size=32"
                 "++actor_rollout_ref.actor.engine.router_replay_mode=R3"
                 "actor_rollout_ref.rollout.enable_rollout_routing_replay=True"
             )
@@ -149,7 +153,7 @@ COMMON_OVERRIDES=(
     "actor_rollout_ref.actor.engine.tp=${ACTOR_TP}"
     "actor_rollout_ref.actor.engine.ep=${ACTOR_EP}"
     "actor_rollout_ref.actor.engine.cp=${ACTOR_CP}"
-    "+actor_rollout_ref.actor.engine.impl_cfg.recompute=full"
+    "++actor_rollout_ref.actor.engine.impl_cfg.recompute=full"
     "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}"
     "actor_rollout_ref.rollout.n=${N_RESPONSES}"
     "actor_rollout_ref.rollout.gpu_memory_utilization=0.6"
