@@ -27,9 +27,9 @@ set -euo pipefail
 # configuration. qat_off and qat_on must have byte-identical rollout settings;
 # their sole QAT difference is impl_cfg.qat.enabled.
 #
-# Prefixes must follow this branch's mlite.yaml schema, not the historical
-# harness spelling. This PR adds impl_cfg.qat defaults, while recompute may be
-# present in either schema shape, so those keys use ++ (add-or-override).
+# This wrapper must not repeat keys already supplied by its base launcher:
+# Hydra rejects a key set twice regardless of whether the second spelling uses
+# + or ++. Prefix choice only handles whether one setting exists in the schema.
 qat_overrides_for_mode() {
     local mode="$1"
     QAT_OVERRIDES=()
@@ -153,7 +153,6 @@ COMMON_OVERRIDES=(
     "actor_rollout_ref.actor.engine.tp=${ACTOR_TP}"
     "actor_rollout_ref.actor.engine.ep=${ACTOR_EP}"
     "actor_rollout_ref.actor.engine.cp=${ACTOR_CP}"
-    "++actor_rollout_ref.actor.engine.impl_cfg.recompute=full"
     "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}"
     "actor_rollout_ref.rollout.n=${N_RESPONSES}"
     "actor_rollout_ref.rollout.gpu_memory_utilization=0.6"
@@ -162,20 +161,9 @@ COMMON_OVERRIDES=(
     "actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}"
     "actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
     "algorithm.adv_estimator=grpo"
-    "algorithm.rollout_correction.bypass_mode=False"
-    "algorithm.rollout_correction.rollout_is=token"
-    "algorithm.rollout_correction.rollout_is_threshold=2.0"
-    "trainer.use_v1=True"
-    "algorithm.filter_groups.enable=True"
-    "algorithm.filter_groups.metric=acc"
-    "algorithm.filter_groups.max_inflight_gen_batches=1"
-    "actor_rollout_ref.actor.clip_ratio_low=0.2"
-    "actor_rollout_ref.actor.clip_ratio_high=0.28"
     "actor_rollout_ref.actor.loss_agg_mode=token-mean"
-    "++actor_rollout_ref.actor.engine.cross_entropy_fusion=True"
     "trainer.nnodes=${NNODES}"
     "trainer.n_gpus_per_node=${NGPUS_PER_NODE}"
-    "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}"
     "trainer.test_freq=${TEST_FREQ}"
     "trainer.save_freq=${SAVE_FREQ}"
     "trainer.project_name=${PROJECT_NAME}"
@@ -183,23 +171,7 @@ COMMON_OVERRIDES=(
     "trainer.default_local_dir=${OUTPUT_ROOT}/${MODE}"
 )
 
-EXTRA_OVERRIDES=("$@")
-for overrides_name in COMMON_OVERRIDES QAT_OVERRIDES EXTRA_OVERRIDES; do
-    declare -n overrides_ref="$overrides_name"
-    for index in "${!overrides_ref[@]}"; do
-        if [[ "${overrides_ref[$index]}" == +[a-z]* ]]; then
-            overrides_ref[$index]="+${overrides_ref[$index]}"
-        fi
-    done
-    unset -n overrides_ref
-done
-
-COMMAND=(
-    bash "$BASE_LAUNCHER"
-    "${COMMON_OVERRIDES[@]}"
-    "${QAT_OVERRIDES[@]}"
-    "${EXTRA_OVERRIDES[@]}"
-)
+COMMAND=(bash "$BASE_LAUNCHER" "${COMMON_OVERRIDES[@]}" "${QAT_OVERRIDES[@]}" "$@")
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
     printf '%q ' "${COMMAND[@]}"
     printf '\n'
