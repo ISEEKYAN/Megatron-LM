@@ -171,6 +171,20 @@ def test_every_moe_protocol_exposes_mtp_safe_replay_roots(protocol_name):
     assert "router_replay_roots" in source
 
 
+def test_r3_driver_begin_fails_loudly_when_model_has_no_moe_router():
+    from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+
+    model = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
+    handle = SimpleNamespace(
+        _model=model,
+        _extras={"model_chunks": [model], "protocol": None},
+    )
+    driver = RouterReplayDriver(handle, "replay")
+
+    with pytest.raises(RuntimeError, match="model has no MoE routers"):
+        driver.begin()
+
+
 def test_r3_driver_replays_layer_order_and_causal_rows_end_to_end():
     from megatron.lite.primitive.parallel import ParallelState
     from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
