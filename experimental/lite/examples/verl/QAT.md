@@ -41,6 +41,8 @@ The format evidence is intentionally separated:
 | `mxfp4` | OCP E2M1 with one E8M0 scale per 32 weights implemented. | CPU unit tested, bitwise-checked against ModelOpt over 99,090,432 real weight elements, and exercised by end-to-end RL. |
 | `nvfp4_w4a16`, `nvfp4_w4a4` | Deferred; selecting either raises `ValueError`. | Not supported by MLite QAT. |
 
+The 99,090,432-element parity result is a one-off offline validation whose environment and run identifiers are recorded in the PR description; the repository currently has no automated assertion for it, and a small real-weight subset could be preserved as a rerunnable test in the future.
+
 MXFP4 is the validated delivery in this change: it has ModelOpt parity over real
 weights and end-to-end RL evidence. The other format code paths exist but have
 not received end-to-end validation.
