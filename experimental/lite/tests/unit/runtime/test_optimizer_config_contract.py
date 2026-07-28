@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from megatron.lite.runtime.contracts.config import OptimizerConfig
@@ -60,3 +62,44 @@ def test_muon_scalar_optimizer_is_currently_adam_only() -> None:
 def test_muon_rejects_cross_step_param_gather_overlap() -> None:
     with pytest.raises(ValueError, match="overlap_param_gather_with_optimizer_step"):
         OptimizerConfig(optimizer="muon", overlap_param_gather_with_optimizer_step=True)
+
+
+def test_muon_extra_scale_factor_defaults_to_megatron_core_value() -> None:
+    assert OptimizerConfig(optimizer="muon").muon_extra_scale_factor == 1.0
+
+
+def test_muon_match_adamw_update_rms_resolves_closed_form() -> None:
+    config = OptimizerConfig(
+        optimizer="muon", adam_beta1=0.9, muon_match_adamw_update_rms=True
+    )
+
+    assert config.muon_extra_scale_factor == pytest.approx(
+        math.sqrt((1.0 - 0.9) / (1.0 + 0.9))
+    )
+    assert config.muon_extra_scale_factor == pytest.approx(0.229416, abs=1e-6)
+
+
+def test_muon_match_adamw_update_rms_tracks_beta1() -> None:
+    config = OptimizerConfig(
+        optimizer="muon", adam_beta1=0.95, muon_match_adamw_update_rms=True
+    )
+
+    assert config.muon_extra_scale_factor == pytest.approx(
+        math.sqrt((1.0 - 0.95) / (1.0 + 0.95))
+    )
+
+
+def test_muon_match_adamw_update_rms_conflicts_with_explicit_factor() -> None:
+    with pytest.raises(ValueError, match="muon_match_adamw_update_rms"):
+        OptimizerConfig(
+            optimizer="muon",
+            muon_match_adamw_update_rms=True,
+            muon_extra_scale_factor=0.4227,
+        )
+
+
+def test_muon_match_adamw_update_rms_rejects_out_of_range_beta1() -> None:
+    with pytest.raises(ValueError, match="beta1"):
+        OptimizerConfig(
+            optimizer="muon", adam_beta1=1.0, muon_match_adamw_update_rms=True
+        )

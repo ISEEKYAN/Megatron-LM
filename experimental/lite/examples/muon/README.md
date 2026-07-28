@@ -24,7 +24,26 @@ actor_rollout_ref:
       muon_num_ns_steps: 5
       muon_coefficient_type: quintic
       muon_fp32_matmul_prec: medium
+      muon_match_adamw_update_rms: true
 ```
+
+### Learning rate: Muon's effective step is `lr x muon_extra_scale_factor`
+
+An AdamW learning rate is **not** directly reusable. The Megatron-Core default
+`muon_extra_scale_factor = 1.0` is not AdamW-comparable: carrying an AdamW `lr`
+over unchanged yields roughly a **4.4x** larger effective step.
+
+`emerging_optimizers` gives the closed form for the factor that matches AdamW's
+update RMS norm:
+
+```
+muon_extra_scale_factor = sqrt((1 - beta1) / (1 + beta1))
+```
+
+where `beta1` is AdamW's first-moment coefficient—`0.229416` at
+`beta1 = 0.9`. Setting `muon_match_adamw_update_rms: true` derives the factor
+from `adam_beta1` and logs the resolved value on rank 0. Setting it together
+with an explicit `muon_extra_scale_factor` raises.
 
 Supported backends:
 

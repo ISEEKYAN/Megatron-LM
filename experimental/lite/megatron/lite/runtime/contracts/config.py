@@ -3,9 +3,31 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from dataclasses import fields as dc_fields
 from typing import TYPE_CHECKING, Any
+
+
+def _log_rank0(message: str) -> None:
+    """Print *message* once, on global rank 0 (or before dist init)."""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+            return
+    except Exception:  # pragma: no cover - torch is optional for pure config use
+        pass
+    print(message, flush=True)
+
+
+def adamw_rms_match_scale_factor(beta1: float) -> float:
+    """Return the Muon scale that matches AdamW's update RMS."""
+    if not 0.0 <= beta1 < 1.0:
+        raise ValueError(
+            f"beta1 must be in [0, 1) to match AdamW update RMS, got {beta1!r}"
+        )
+    return math.sqrt((1.0 - beta1) / (1.0 + beta1))
 
 
 def pick_fields(cls, src: dict[str, Any]) -> dict[str, Any]:
@@ -71,6 +93,8 @@ class OptimizerConfig:
     muon_tp_mode: str = "blockwise"
     muon_extra_scale_factor: float = 1.0
     muon_scalar_optimizer: str = "adam"
+    # Lite-side convenience: derive the native scale from AdamW beta1.
+    muon_match_adamw_update_rms: bool = False
 
     # --- Megatron native LayerWise/DDP fields ---
     use_layer_wise_param_layout: bool = False
@@ -109,6 +133,20 @@ class OptimizerConfig:
             raise ValueError("optimizer_offload_fraction must be in [0, 1]")
         if self.muon_scalar_optimizer != "adam":
             raise ValueError("muon_scalar_optimizer currently supports only 'adam'")
+        if self.muon_match_adamw_update_rms:
+            if self.muon_extra_scale_factor != 1.0:
+                raise ValueError(
+                    "muon_match_adamw_update_rms derives muon_extra_scale_factor from "
+                    "adam_beta1, but muon_extra_scale_factor was also set explicitly to "
+                    f"{self.muon_extra_scale_factor!r}. Set exactly one of the two."
+                )
+            beta1 = 0.9 if self.adam_beta1 is None else float(self.adam_beta1)
+            self.muon_extra_scale_factor = adamw_rms_match_scale_factor(beta1)
+            _log_rank0(
+                "muon_match_adamw_update_rms=True: muon_extra_scale_factor resolved to "
+                f"{self.muon_extra_scale_factor!r} from sqrt((1-beta1)/(1+beta1)) with "
+                f"beta1={beta1!r}"
+            )
         if (
             self.optimizer.lower() == "muon"
             and self.overlap_param_gather_with_optimizer_step
