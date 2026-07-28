@@ -17,8 +17,8 @@
 # the qat_off gap by about 38%, while remaining about 2.8x the BF16 baseline.
 #
 # The MXFP4 rollout is performed by vLLM compressed-tensors with
-# verl.utils.qat.vllm_patch. engine.qat.enable remains false: the separate verl
-# export_qat_weights path is not used by these arms.
+# verl.utils.qat.vllm_patch. The quantized arms enable the verl weight-export
+# and rollout QAT blocks with the same MXFP4 contract.
 
 set -euo pipefail
 
@@ -32,41 +32,32 @@ qat_overrides_for_mode() {
     case "$mode" in
         baseline)
             # BF16 training + BF16 rollout: the unquantized reference.
-            QAT_OVERRIDES+=(
-                "++actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
-                "++actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
-                "actor_rollout_ref.actor.engine.router_replay_mode=disabled"
-                "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
-            )
             ;;
         qat_off)
             # MXFP4 rollout without fake quant: measures training/rollout mismatch.
             QAT_OVERRIDES+=(
-                "++actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
-                "++actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
-                "actor_rollout_ref.rollout.quantization=mxfp4"
-                "actor_rollout_ref.actor.engine.router_replay_mode=disabled"
-                "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
+                "${MXFP4_ROLLOUT_OVERRIDES[@]}"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
             )
             ;;
         qat_on)
             # MXFP4 rollout plus training-side MXFP4 fake quantization.
             QAT_OVERRIDES+=(
-                "++actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
-                "++actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
-                "actor_rollout_ref.rollout.quantization=mxfp4"
-                "actor_rollout_ref.actor.engine.router_replay_mode=disabled"
-                "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
+                "${MXFP4_ROLLOUT_OVERRIDES[@]}"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.group_size=32"
             )
             ;;
         r3)
             # qat_on plus router replay.
             QAT_OVERRIDES+=(
-                "++actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
-                "++actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
-                "actor_rollout_ref.rollout.quantization=mxfp4"
-                "actor_rollout_ref.actor.engine.router_replay_mode=R3"
-                "actor_rollout_ref.rollout.enable_rollout_routing_replay=true"
+                "${MXFP4_ROLLOUT_OVERRIDES[@]}"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.group_size=32"
+                "++actor_rollout_ref.actor.engine.router_replay_mode=R3"
+                "actor_rollout_ref.rollout.enable_rollout_routing_replay=True"
             )
             ;;
     esac
@@ -92,6 +83,16 @@ case "$MODE" in
         exit 2
         ;;
 esac
+
+MXFP4_QUANTIZATION_CONFIG="${MXFP4_QUANTIZATION_CONFIG:-}"
+if [[ "$MODE" != baseline && -z "$MXFP4_QUANTIZATION_CONFIG" ]]; then
+    echo "Set MXFP4_QUANTIZATION_CONFIG to an mxfp4-pack-quantized vLLM config." >&2
+    exit 2
+fi
+MXFP4_ROLLOUT_OVERRIDES=(
+    "++actor_rollout_ref.actor.engine.qat={enable:true,apply_modelopt_fake_quant:false,mode:mxfp4,group_size:32,ignore_patterns:[lm_head,embed_tokens,'re:.*mlp.gate\$']}"
+    "++actor_rollout_ref.rollout.qat={enable:true,mode:mxfp4,group_size:32,quantization_config_path:'${MXFP4_QUANTIZATION_CONFIG}',ignore_patterns:[lm_head,embed_tokens,'re:.*mlp.gate\$']}"
+)
 qat_overrides_for_mode "$MODE"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -112,7 +113,7 @@ fi
 # Resource and recipe parameters are intentionally overridable.
 NNODES="${NNODES:-4}"
 NGPUS_PER_NODE="${NGPUS_PER_NODE:-8}"
-ROLLOUT_TP="${ROLLOUT_TP:-8}"
+ROLLOUT_TP="${ROLLOUT_TP:-4}"
 ACTOR_TP="${ACTOR_TP:-2}"
 ACTOR_EP="${ACTOR_EP:-8}"
 ACTOR_CP="${ACTOR_CP:-1}"
@@ -121,38 +122,59 @@ PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
 PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-1}"
 N_RESPONSES="${N_RESPONSES:-8}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-30}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-14336}"
+PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}"
+ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-16384}"
+ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-16}"
+ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-16384}"
+ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU="${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-16384}"
+ACTOR_LR="${ACTOR_LR:-1e-5}"
+SAVE_FREQ="${SAVE_FREQ:-5}"
+TEST_FREQ="${TEST_FREQ:-5}"
+PROJECT_NAME="${PROJECT_NAME:-mlite-qat}"
 
 COMMON_OVERRIDES=(
     "data.train_files=${TRAIN_FILES}"
     "data.val_files=${VAL_FILES}"
     "data.train_batch_size=${TRAIN_BATCH_SIZE}"
-    "data.max_prompt_length=2048"
-    "data.max_response_length=14336"
+    "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
+    "data.max_response_length=${MAX_RESPONSE_LENGTH}"
     "actor_rollout_ref.model.path=${MODEL_PATH}"
     "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}"
     "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PPO_MICRO_BATCH_SIZE}"
-    "actor_rollout_ref.actor.optim.lr=1e-5"
-    "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384"
+    "actor_rollout_ref.actor.optim.lr=${ACTOR_LR}"
+    "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}"
     "actor_rollout_ref.actor.engine.pp=1"
     "actor_rollout_ref.actor.engine.tp=${ACTOR_TP}"
     "actor_rollout_ref.actor.engine.ep=${ACTOR_EP}"
     "actor_rollout_ref.actor.engine.cp=${ACTOR_CP}"
-    "++actor_rollout_ref.actor.engine.impl_cfg.recompute=full"
+    "+actor_rollout_ref.actor.engine.impl_cfg.recompute=full"
     "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}"
     "actor_rollout_ref.rollout.n=${N_RESPONSES}"
     "actor_rollout_ref.rollout.gpu_memory_utilization=0.6"
-    "actor_rollout_ref.rollout.max_model_len=16384"
+    "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU}"
+    "actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN}"
+    "actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}"
+    "actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
     "algorithm.adv_estimator=grpo"
-    "algorithm.rollout_correction.bypass_mode=false"
+    "algorithm.rollout_correction.bypass_mode=False"
+    "algorithm.rollout_correction.rollout_is=token"
+    "algorithm.rollout_correction.rollout_is_threshold=2.0"
+    "trainer.use_v1=True"
+    "algorithm.filter_groups.enable=True"
+    "algorithm.filter_groups.metric=acc"
+    "algorithm.filter_groups.max_inflight_gen_batches=1"
     "actor_rollout_ref.actor.clip_ratio_low=0.2"
     "actor_rollout_ref.actor.clip_ratio_high=0.28"
     "actor_rollout_ref.actor.loss_agg_mode=token-mean"
+    "++actor_rollout_ref.actor.engine.cross_entropy_fusion=True"
     "trainer.nnodes=${NNODES}"
     "trainer.n_gpus_per_node=${NGPUS_PER_NODE}"
     "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}"
-    "trainer.test_freq=5"
-    "trainer.save_freq=5"
-    "trainer.project_name=mlite-qat"
+    "trainer.test_freq=${TEST_FREQ}"
+    "trainer.save_freq=${SAVE_FREQ}"
+    "trainer.project_name=${PROJECT_NAME}"
     "trainer.experiment_name=qwen3moe-mxfp4-${MODE}"
     "trainer.default_local_dir=${OUTPUT_ROOT}/${MODE}"
 )

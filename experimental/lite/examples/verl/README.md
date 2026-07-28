@@ -174,6 +174,7 @@ Run the generalized four-arm Qwen3-MoE recipe with:
 MODEL_PATH=Qwen/Qwen3-30B-A3B \
 TRAIN_FILES=/path/to/dapo-math-17k.parquet \
 VAL_FILES=/path/to/aime-2024.parquet \
+MXFP4_QUANTIZATION_CONFIG=/path/to/mxfp4_w4a16.json \
 bash experimental/lite/examples/verl/scripts/run_qwen3moe_mxfp4_qat.sh \
   --mode qat_on
 ```
@@ -181,9 +182,10 @@ bash experimental/lite/examples/verl/scripts/run_qwen3moe_mxfp4_qat.sh \
 Modes are `baseline`, `qat_off`, `qat_on`, and `r3`. The `qat_off` and
 `qat_on` arms deliberately keep rollout MXFP4 identical and change only
 training-side `impl_cfg.qat.enabled`. This recipe uses vLLM
-compressed-tensors plus `verl.utils.qat.vllm_patch`; it does not enable the
-separate verl `export_qat_weights` path. See [QAT.md](QAT.md) for the exact arm
-semantics, validation scope, safe exclusions, and optional exporter schema.
+compressed-tensors plus `verl.utils.qat.vllm_patch`, with paired
+`actor.engine.qat` export and `rollout.qat` configuration. See
+[QAT.md](QAT.md) for the exact arm semantics, validation scope, safe
+exclusions, and required MXFP4 JSON schema.
 
 ## Smoke / Dry-Run Checks
 

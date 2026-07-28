@@ -117,19 +117,19 @@ four-arm pin above.
 
 ### Which path produced the four-arm MXFP4 rollout?
 
-The four-arm experiment did **not** use `export_qat_weights`. Its frozen
-Megatron-LM revision had `qat: {}`, and `mlite_engine.py:401-408` called the
-exporter only when `qat.enable` was true. The launcher instead selected
-`rollout.quantization=mxfp4`. Runtime logs selected vLLM
-`CompressedTensorsW4A4Mxfp4`/Marlin and did not contain the verl exporter
-patch-injection markers.
+The quantized arms enabled both verl-owned QAT dictionaries:
 
-Therefore MLite supplied training fake quantization, while vLLM
-compressed-tensors plus `verl.utils.qat.vllm_patch` supplied rollout-side
-MXFP4. The exact verl revision also contains an optional MXFP4 online exporter,
-but the experiment did not enable or exercise it.
+- `actor.engine.qat` exported MXFP4 weights at synchronization time, with
+  `apply_modelopt_fake_quant=false` because MLite owned training fake quant.
+- `rollout.qat` configured vLLM compressed-tensors with the matching
+  `mxfp4-pack-quantized` JSON and installed `verl.utils.qat.vllm_patch`.
 
-## Alternative path: verl `export_qat_weights`
+They did **not** set `rollout.quantization=mxfp4`. That field is not the
+four-arm MXFP4 route. Runtime logs selected
+`CompressedTensorsW4A4Mxfp4`/Marlin through the paired exporter and rollout QAT
+configuration.
+
+## verl exporter and rollout QAT dictionaries
 
 The engine accepts an optional, verl-owned passthrough dictionary:
 
@@ -145,11 +145,9 @@ qat:
     - "re:.*mlp.gate$"
 ```
 
-This is not the MLite `QATSpec` schema and is absent from the shipped defaults
-apart from an inert `qat: {}` placeholder. The exact four-arm verl pin accepts
-both `mxfp4` and `w4a16`/NVFP4 here; check the selected verl revision because
-older revisions are NVFP4-only. The four-arm MXFP4 experiment did not use this
-path.
+This is not the MLite `QATSpec` schema. The exact four-arm verl pin accepts both
+`mxfp4` and `w4a16`/NVFP4 here; check the selected verl revision because older
+revisions are NVFP4-only.
 
 Exporter exclusions use HF names and support `"re:"` regular expressions;
 MLite training exclusions use exact Megatron dotted path components. Do not
@@ -179,27 +177,68 @@ BF16 baseline.
 
 Prepare verl-compatible parquet files from the public
 `BytedTsinghua-SIA/DAPO-Math-17k` and AIME 2024 datasets, then provide their
-paths:
+paths. Quantized modes also require a vLLM compressed-tensors JSON. Prepare it
+from the schema below and pass its path through
+`MXFP4_QUANTIZATION_CONFIG`:
+
+```json
+{
+  "quant_method": "compressed-tensors",
+  "format": "mxfp4-pack-quantized",
+  "quantization_status": "compressed",
+  "config_groups": {
+    "group_0": {
+      "format": "mxfp4-pack-quantized",
+      "targets": ["Linear"],
+      "weights": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": false,
+        "group_size": 32,
+        "num_bits": 4,
+        "observer": "minmax",
+        "observer_kwargs": {},
+        "strategy": "group",
+        "symmetric": true,
+        "type": "float"
+      },
+      "input_activations": null,
+      "output_activations": null
+    }
+  },
+  "ignore": ["lm_head", "re:.*mlp\\.gate$"],
+  "kv_cache_scheme": null,
+  "sparsity_config": {},
+  "transform_config": {},
+  "global_compression_ratio": null
+}
+```
+
+This is the JSON shape used by the measured run. Validate it against the
+selected compressed-tensors revision before launching. Then run:
 
 ```bash
 MODEL_PATH=Qwen/Qwen3-30B-A3B \
 TRAIN_FILES=/path/to/dapo-math-17k.parquet \
 VAL_FILES=/path/to/aime-2024.parquet \
+MXFP4_QUANTIZATION_CONFIG=/path/to/mxfp4_w4a16.json \
 NNODES=4 \
 NGPUS_PER_NODE=8 \
 bash experimental/lite/examples/verl/scripts/run_qwen3moe_mxfp4_qat.sh \
   --mode qat_on
 ```
 
-`TRAIN_FILES` and `VAL_FILES` are required. `MODEL_PATH`, node/GPU counts,
-parallelism, batch sizes, response count, step count, and output root are
-overridable environment variables. Use a local model snapshot for
-`MODEL_PATH` if the runtime cannot resolve the public Hub name.
+`TRAIN_FILES` and `VAL_FILES` are required.
+`MXFP4_QUANTIZATION_CONFIG` is additionally required for `qat_off`, `qat_on`,
+and `r3`. `MODEL_PATH`, node/GPU counts, parallelism, batch sizes, sequence
+lengths, response count, step count, and output root are overridable
+environment variables. Use a local model snapshot for `MODEL_PATH` if the
+runtime cannot resolve the public Hub name.
 
-The launcher uses Hydra's `++` form for backend-specific `impl_cfg.qat` and
-`impl_cfg.recompute` fields. These fields may already be declared by an
-installed `verl_mlite` config package or may be absent when MLite code is
-supplied through `PYTHONPATH`; add-or-override supports both runtime layouts.
+The Hydra prefix forms intentionally match the measured four-arm commands:
+`impl_cfg.recompute` and `impl_cfg.qat.*` use `+`, while the exporter,
+rollout-QAT, cross-entropy-fusion, and R3 engine fields use `++`. Do not
+normalize these prefixes without revalidating the full target config.
 
 Use `DRY_RUN=1` to inspect the resolved command without allocating GPUs. This
 checks argument construction only and is not evidence of a training run.
