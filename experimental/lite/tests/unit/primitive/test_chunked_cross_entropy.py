@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
-from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
+from megatron.lite.primitive.ops import cross_entropy
 
 pytestmark = pytest.mark.mlite
 
@@ -25,7 +25,7 @@ def _tp_worker(rank, world_size, port):
             full_logits.chunk(world_size, dim=-1)[rank].clone().requires_grad_()
         )
 
-        loss = vocab_parallel_cross_entropy(
+        loss = cross_entropy.vocab_parallel_cross_entropy(
             local_logits, labels, dist.group.WORLD, chunk_size=3
         )
         loss.sum().backward()
@@ -57,7 +57,7 @@ def test_chunked_cross_entropy_bounds_saved_fp32_state_and_matches_gradients():
         return tensor
 
     with torch.autograd.graph.saved_tensors_hooks(record_saved, lambda tensor: tensor):
-        loss = vocab_parallel_cross_entropy(logits, labels, chunk_size=3)
+        loss = cross_entropy.vocab_parallel_cross_entropy(logits, labels, chunk_size=3)
     loss.sum().backward()
 
     expected = F.cross_entropy(
