@@ -66,6 +66,92 @@ class _TinyChunk(nn.Module):
         self.model = _TinyModel(model_name, mtp_enabled=mtp_enabled)
 
 
+class _CpuTELinear(nn.Linear):
+    """State-dict-compatible TE Linear stand-in for CPU-only construction."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        bias: bool = True,
+        return_bias: bool = False,
+        **_kwargs,
+    ):
+        super().__init__(in_features, out_features, bias=bias)
+        self.return_bias = return_bias
+
+    def forward(self, x):
+        output = super().forward(x)
+        return (output, self.bias) if self.return_bias else output
+
+
+class _CpuTELayerNormLinear(nn.Module):
+    """Minimal TE LayerNormLinear parameter layout; forward is not exercised."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        bias: bool = True,
+        return_bias: bool = False,
+        zero_centered_gamma: bool = False,
+        **_kwargs,
+    ):
+        super().__init__()
+        self.layer_norm_weight = nn.Parameter(torch.zeros(in_features))
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.return_bias = return_bias
+        self.zero_centered_gamma = zero_centered_gamma
+
+
+class _CpuTERMSNorm(nn.Module):
+    """State-dict-compatible TE RMSNorm stand-in for CPU-only construction."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        zero_centered_gamma: bool = False,
+        **_kwargs,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.zero_centered_gamma = zero_centered_gamma
+
+
+class _CpuTEDotProductAttention(nn.Module):
+    def __init__(self, *_args, **_kwargs):
+        super().__init__()
+
+
+class _CpuTEGroupedLinear(nn.Module):
+    """TE GroupedLinear parameter names without requiring its CUDA kernels."""
+
+    def __init__(
+        self,
+        num_gemms: int,
+        in_features: int,
+        out_features: int,
+        *,
+        bias: bool = False,
+        **_kwargs,
+    ):
+        super().__init__()
+        for index in range(num_gemms):
+            self.register_parameter(
+                f"weight{index}",
+                nn.Parameter(torch.empty(out_features, in_features)),
+            )
+            if bias:
+                self.register_parameter(
+                    f"bias{index}",
+                    nn.Parameter(torch.zeros(out_features)),
+                )
+
+
 @dataclass(frozen=True)
 class _ModelCase:
     name: str
@@ -114,6 +200,239 @@ def _case(
     )
 
 
+def _install_cpu_te_construction_stubs(transformer_engine_import_stub, monkeypatch):
+    transformer_engine_import_stub()
+    te = importlib.import_module("transformer_engine.pytorch")
+    te_types = {
+        "Linear": _CpuTELinear,
+        "LayerNormLinear": _CpuTELayerNormLinear,
+        "RMSNorm": _CpuTERMSNorm,
+        "DotProductAttention": _CpuTEDotProductAttention,
+        "GroupedLinear": _CpuTEGroupedLinear,
+    }
+    for name, replacement in te_types.items():
+        monkeypatch.setattr(te, name, replacement, raising=False)
+    # Parameterized tests may have imported model/primitive modules under a
+    # previous fixture-owned TE stub. Patch every retained module-local ``te``
+    # reference as well as the current sys.modules entry.
+    for module in tuple(sys.modules.values()):
+        module_te = getattr(module, "te", None)
+        if not isinstance(module_te, types.ModuleType):
+            continue
+        if module_te.__name__ != "transformer_engine.pytorch":
+            continue
+        for name, replacement in te_types.items():
+            monkeypatch.setattr(module_te, name, replacement, raising=False)
+
+    te_root = importlib.import_module("transformer_engine")
+    monkeypatch.setattr(te_root, "__version__", "2.0.0")
+    te_tensor = types.ModuleType("transformer_engine.pytorch.tensor")
+    te_tensor.QuantizedTensor = torch.Tensor
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.tensor", te_tensor)
+    dsa = importlib.import_module("megatron.lite.primitive.modules.attention.dsa")
+    monkeypatch.setattr(dsa, "RMSNorm", _CpuTERMSNorm)
+
+
+def _install_csa_import_stubs(monkeypatch):
+    """Expose the Core CSA symbols needed to construct DS4 without GPU extras."""
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("CSA execution is outside this state-dict-only CPU test")
+
+    core = types.ModuleType("megatron.core")
+    tensor_parallel = types.ModuleType("megatron.core.tensor_parallel")
+    mappings = types.ModuleType("megatron.core.tensor_parallel.mappings")
+    mappings.gather_from_sequence_parallel_region = unavailable
+    transformer = types.ModuleType("megatron.core.transformer")
+    variants = types.ModuleType(
+        "megatron.core.transformer.experimental_attention_variant"
+    )
+    layout = types.ModuleType(
+        "megatron.core.transformer.experimental_attention_variant.csa_cp_layout_kernels"
+    )
+    cp_utils = types.ModuleType(
+        "megatron.core.transformer.experimental_attention_variant.csa_cp_utils"
+    )
+    core_csa = types.ModuleType(
+        "megatron.core.transformer.experimental_attention_variant.csa"
+    )
+    core_dsa = types.ModuleType(
+        "megatron.core.transformer.experimental_attention_variant.dsa"
+    )
+    dsa_kernels = types.ModuleType(
+        "megatron.core.transformer.experimental_attention_variant.dsa_kernels"
+    )
+    core_csa._unfused_indexer_sparse_attn_from_topk = unavailable
+    core_csa.unfused_compressed_sparse_attn = unavailable
+    core_dsa.DSAIndexerLossAutoScaler = torch.autograd.Function
+    core_dsa.DSAIndexerLossLoggingHelper = type("DSAIndexerLossLoggingHelper", (), {})
+    dsa_kernels.FusedIndexerSparseAttnFromTopkFunc = torch.autograd.Function
+    dsa_kernels.dsa_sparse_attn = unavailable
+    variants.csa_cp_layout_kernels = layout
+    variants.csa_cp_utils = cp_utils
+    modules = {
+        "megatron.core": core,
+        "megatron.core.tensor_parallel": tensor_parallel,
+        "megatron.core.tensor_parallel.mappings": mappings,
+        "megatron.core.transformer": transformer,
+        "megatron.core.transformer.experimental_attention_variant": variants,
+        "megatron.core.transformer.experimental_attention_variant.csa_cp_layout_kernels": layout,
+        "megatron.core.transformer.experimental_attention_variant.csa_cp_utils": cp_utils,
+        "megatron.core.transformer.experimental_attention_variant.csa": core_csa,
+        "megatron.core.transformer.experimental_attention_variant.dsa": core_dsa,
+        "megatron.core.transformer.experimental_attention_variant.dsa_kernels": dsa_kernels,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+def _train_config():
+    return types.SimpleNamespace(
+        tp=1,
+        ep=1,
+        etp=1,
+        pp=1,
+        cp=1,
+        vpp=None,
+        use_deepep=False,
+        fp8=False,
+        recompute_modules=[],
+        offload_modules=[],
+        deterministic=True,
+    )
+
+
+def _real_tiny_model(model_name: str, monkeypatch):
+    from megatron.lite.primitive.parallel import ParallelState
+
+    ps = ParallelState()
+    if model_name == "qwen3_moe":
+        from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+        from megatron.lite.model.qwen3_moe.lite.model import Qwen3MoEModel
+
+        config = Qwen3MoEConfig(
+            num_hidden_layers=2,
+            hidden_size=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
+            vocab_size=32,
+            num_experts=3,
+            num_experts_per_tok=1,
+            moe_intermediate_size=8,
+            max_position_embeddings=16,
+            layer_types=["full_attention", "full_attention"],
+        )
+        return Qwen3MoEModel(config, ps, use_deepep=False)
+    if model_name == "qwen3_5":
+        from megatron.lite.model.qwen3_5.config import Qwen35Config
+        from megatron.lite.model.qwen3_5.lite.model import Qwen35Model
+
+        config = Qwen35Config(
+            num_hidden_layers=2,
+            hidden_size=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
+            vocab_size=32,
+            num_experts=3,
+            num_experts_per_tok=1,
+            moe_intermediate_size=8,
+            shared_expert_intermediate_size=8,
+            max_position_embeddings=16,
+            partial_rotary_factor=1.0,
+            layer_types=["full_attention", "full_attention"],
+        )
+        return Qwen35Model(config, _train_config(), ps)
+    if model_name == "kimi_k2":
+        from megatron.lite.model.kimi_k2.config import KimiK2Config
+        from megatron.lite.model.kimi_k2.lite.model import KimiK2Model
+
+        config = KimiK2Config(
+            num_hidden_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=32,
+            intermediate_size=48,
+            moe_intermediate_size=8,
+            n_routed_experts=3,
+            n_shared_experts=1,
+            num_experts_per_tok=1,
+            n_group=1,
+            topk_group=1,
+            first_k_dense_replace=1,
+            q_lora_rank=8,
+            kv_lora_rank=8,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            max_position_embeddings=16,
+        )
+        return KimiK2Model(config, _train_config(), ps)
+    if model_name == "glm5":
+        from megatron.lite.model.glm5.config import Glm5Config
+        from megatron.lite.model.glm5.lite.model import Glm5Model
+
+        config = Glm5Config(
+            num_hidden_layers=2,
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=4,
+            vocab_size=32,
+            max_position_embeddings=16,
+            q_lora_rank=8,
+            kv_lora_rank=4,
+            qk_head_dim=8,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            index_head_dim=8,
+            index_n_heads=2,
+            index_topk=2,
+            intermediate_size=20,
+            moe_intermediate_size=6,
+            first_k_dense_replace=1,
+            n_routed_experts=3,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+        )
+        return Glm5Model(config, _train_config(), ps)
+    if model_name == "deepseek_v4":
+        _install_csa_import_stubs(monkeypatch)
+        from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+        from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Model
+
+        config = DeepseekV4Config(
+            vocab_size=32,
+            hidden_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=16,
+            o_lora_rank=16,
+            o_groups=2,
+            n_routed_experts=3,
+            n_shared_experts=1,
+            num_experts_per_tok=1,
+            max_position_embeddings=16,
+            compress_ratios=[4, 4],
+            sliding_window=4,
+            num_hash_layers=1,
+            hc_mult=2,
+            index_head_dim=8,
+            index_n_heads=4,
+            index_topk=4,
+            num_nextn_predict_layers=0,
+        )
+        return DeepseekV4Model(config, _train_config(), ps)
+    raise AssertionError(f"unsupported model: {model_name}")
+
+
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
 @pytest.mark.parametrize("mtp_enabled", [False, True], ids=["mtp-off", "mtp-on"])
 def test_every_model_replay_roots_are_exact_decoder_layers(
@@ -143,6 +462,31 @@ def test_every_model_replay_roots_are_exact_decoder_layers(
 
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
+def test_every_model_mtp_off_replay_attachment_count_is_unchanged(
+    model_name: str,
+    transformer_engine_import_stub,
+    monkeypatch,
+):
+    case = _case(
+        model_name,
+        transformer_engine_import_stub,
+        monkeypatch,
+        mtp_enabled=False,
+    )
+    old_count = attach_router_replay(case.chunk, reset=False)
+    detach_router_replay(case.chunk)
+
+    roots = case.protocol.router_replay_roots(case.chunk)
+    new_count = sum(attach_router_replay(root, reset=False) for root in roots)
+    try:
+        assert old_count == len(case.chunk.model.layers)
+        assert new_count == old_count
+    finally:
+        for root in roots:
+            detach_router_replay(root)
+
+
+@pytest.mark.parametrize("model_name", MODEL_NAMES)
 def test_every_model_attaches_replay_only_to_decoder_router_count(
     model_name: str,
     transformer_engine_import_stub,
@@ -168,6 +512,25 @@ def test_every_model_attaches_replay_only_to_decoder_router_count(
     finally:
         for root in roots:
             detach_router_replay(root)
+
+
+@pytest.mark.parametrize("model_name", MODEL_NAMES)
+def test_every_model_qat_off_canonicalization_is_identity_for_all_real_state_keys(
+    model_name: str,
+    transformer_engine_import_stub,
+    monkeypatch,
+):
+    _install_cpu_te_construction_stubs(transformer_engine_import_stub, monkeypatch)
+    model = _real_tiny_model(model_name, monkeypatch)
+    checkpoint = importlib.import_module(
+        f"megatron.lite.model.{model_name}.lite.checkpoint"
+    )
+    state_keys = tuple(model.state_dict())
+
+    assert state_keys
+    assert {checkpoint._canonical_state_key(key): key for key in state_keys} == {
+        key: key for key in state_keys
+    }
 
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
