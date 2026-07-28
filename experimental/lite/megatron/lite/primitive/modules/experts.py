@@ -137,6 +137,14 @@ class Experts(nn.Module):
 
                     param.register_hook(_ar)
 
+    def delayed_weight_grad_parameters(self) -> tuple[torch.Tensor, ...]:
+        """Return the TE weights whose gradients are produced by the delayed stores."""
+        return tuple(
+            getattr(linear, f"weight{idx}")
+            for linear in (self.fc1, self.fc2)
+            for idx in range(self.num_local_experts)
+        )
+
     def pop_delayed_weight_grads(self) -> dict[torch.Tensor, torch.Tensor]:
         """Execute one queued TE wgrad per grouped linear without touching ``.grad``."""
         grads: dict[torch.Tensor, torch.Tensor] = {}

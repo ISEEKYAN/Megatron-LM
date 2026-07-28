@@ -766,6 +766,7 @@ class TokenDispatcher:
             recv_per_expert[: self.num_local_experts], dtype=torch.int64, device=recv_hidden.device
         )
         local_tpe_list = [int(x) for x in recv_per_expert[: self.num_local_experts]]
+        local_tpe_sum = sum(local_tpe_list)
         rows = recv_hidden.size(0)
         recv_indices = recv_indices.to(torch.long)
         valid = recv_indices >= 0
@@ -843,10 +844,10 @@ class TokenDispatcher:
                 f"recv_per_expert_len={len(recv_per_expert)} "
                 f"recv_per_expert_sum={sum(int(x) for x in recv_per_expert)} "
                 f"recv_per_expert_head={recv_per_expert[: self.num_local_experts]} "
-                f"local_tpe_sum={int(local_tpe.sum().item())}",
+                f"local_tpe_sum={local_tpe_sum}",
                 flush=True,
             )
-        if int(local_tpe.sum().item()) != int(dispatched.shape[0]):
+        if local_tpe_sum != int(dispatched.shape[0]):
             ep_rank = dist.get_rank(group=self.ps.ep_group)
             raise RuntimeError(
                 "DeepEP dispatch metadata mismatch: "

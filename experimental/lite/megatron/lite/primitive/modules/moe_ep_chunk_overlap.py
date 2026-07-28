@@ -367,6 +367,11 @@ class EPChunkOverlapOperator:
         input_ready = torch.cuda.Event()
         input_ready.record(torch.cuda.current_stream(grad_2d.device))
         dispatcher = self.dispatcher
+        delayed_expert_params = self.experts.delayed_weight_grad_parameters()
+        delayed_expert_param_ids = {id(param) for param in delayed_expert_params}
+        eager_expert_params = tuple(
+            param for param in expert_params if id(param) not in delayed_expert_param_ids
+        )
         grad_x_chunks: list[torch.Tensor | None] = [None for _ in ranges]
         router_accum: list[torch.Tensor | None] = [None for _ in router_params]
         expert_accum: list[torch.Tensor | None] = [None for _ in expert_params]
@@ -528,12 +533,12 @@ class EPChunkOverlapOperator:
                             "EP chunk overlap expert graph was released."
                         )
                     if chunk.probs is None:
-                        expert_inputs = (chunk.dispatched, *expert_params)
+                        expert_inputs = (chunk.dispatched, *eager_expert_params)
                     else:
                         expert_inputs = (
                             chunk.dispatched,
                             chunk.probs,
-                            *expert_params,
+                            *eager_expert_params,
                         )
                     expert_grads = torch.autograd.grad(
                         expert_output,
@@ -546,18 +551,18 @@ class EPChunkOverlapOperator:
                         grad_dispatched = torch.zeros_like(chunk.dispatched)
                     if chunk.probs is None:
                         grad_probs = None
-                        param_grads = expert_grads[1:]
+                        eager_param_grads = expert_grads[1:]
                     else:
                         grad_probs = expert_grads[1]
                         if grad_probs is None:
                             grad_probs = torch.zeros_like(chunk.probs)
-                        param_grads = expert_grads[2:]
+                        eager_param_grads = expert_grads[2:]
                     chunk.dispatched = None
                     chunk.probs = None
                     chunk.expert_out = None
                     chunk.expert_out_edge = None
                     local_state.pop("grad_expert_out", None)
-                    local_state["param_grads"] = param_grads
+                    local_state["eager_param_grads"] = eager_param_grads
                     grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
                         chunk, grad_dispatched, grad_probs
                     )
@@ -585,11 +590,16 @@ class EPChunkOverlapOperator:
         for chunk, local_state in pending_dispatch_bwd:
             with torch.cuda.stream(compute_stream):
                 delayed_grads = self.experts.pop_delayed_weight_grads()
-                param_grads = tuple(
-                    delayed_grads.get(param, grad)
-                    for param, grad in zip(
-                        expert_params, local_state.pop("param_grads"), strict=True
+                eager_grads = dict(
+                    zip(
+                        eager_expert_params,
+                        local_state.pop("eager_param_grads"),
+                        strict=True,
                     )
+                )
+                param_grads = tuple(
+                    delayed_grads.get(param, eager_grads.get(param))
+                    for param in expert_params
                 )
                 _accumulate(expert_accum, expert_params, param_grads)
 

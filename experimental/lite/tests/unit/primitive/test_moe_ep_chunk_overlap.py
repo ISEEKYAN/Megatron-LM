@@ -80,6 +80,21 @@ def test_chunked_backward_submits_dgrad_before_te_delayed_wgrad(
     assert "retain_graph=True" not in source
 
 
+def test_chunked_backward_does_not_request_eager_expert_parameter_grads(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkOverlapOperator,
+    )
+
+    source = inspect.getsource(EPChunkOverlapOperator._full_recompute_fused_backward_v6)
+
+    assert "expert_inputs = (chunk.dispatched, *expert_params)" not in source
+    assert "local_state[\"param_grads\"]" not in source
+    assert "pop_delayed_weight_grads" in source
+
+
 def test_chunked_ep_keeps_compute_on_the_autograd_caller_stream(
     transformer_engine_import_stub,
 ):
