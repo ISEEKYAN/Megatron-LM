@@ -15,9 +15,12 @@ import torch.nn as nn
 import transformer_engine.pytorch as te
 
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.gqa import GQAttention
 from megatron.lite.primitive.modules.lora import LoraConfig
-from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapMoELayer
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapOperator
+from megatron.lite.primitive.modules.router import TopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
@@ -38,7 +41,7 @@ from megatron.lite.primitive.utils import build_fp8_recipe
 # ---------------------------------------------------------------------------
 
 
-class MoELayer(EPChunkOverlapMoELayer):
+class MoELayer(nn.Module):
     def __init__(
         self,
         config: Qwen3MoEConfig,
@@ -52,18 +55,40 @@ class MoELayer(EPChunkOverlapMoELayer):
         lora_config: LoraConfig | dict | None = None,
         layer_idx: int | None = None,
     ):
-        super().__init__(
+        super().__init__()
+        self.router = TopKRouter(
             config,
             ps,
-            use_deepep=use_deepep,
             router_bias_rate=router_bias_rate,
+            compute_aux_loss=False,
+        )
+        self.experts = Experts(
+            config,
+            ps,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
-            moe_full_recompute=True,
-            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
             lora_config=lora_config,
+        )
+        self.ep_chunk_overlap = EPChunkOverlapOperator(
+            config,
+            ps,
+            router=self.router,
+            experts=self.experts,
+            use_deepep=use_deepep,
+            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
+            moe_full_recompute=True,
+            dispatcher_factory=lambda slot: TokenDispatcher(
+                config.num_experts,
+                config.hidden_size,
+                ps,
+                use_deepep=use_deepep,
+                buffer_slot=slot,
+            ),
             layer_idx=layer_idx,
         )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ep_chunk_overlap(x)
 
 
 # ---------------------------------------------------------------------------

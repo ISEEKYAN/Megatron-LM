@@ -20,7 +20,7 @@ from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
 from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
 from megatron.lite.primitive.modules.gqa import GQAttention as FullAttention
 from megatron.lite.primitive.modules.gqa import split_grouped_qkvg as _split_grouped_qkvg
-from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapMoELayer
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapOperator
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding as Qwen35MRoPE
 from megatron.lite.primitive.modules.mtp import (
     MTPBlock,
@@ -152,7 +152,7 @@ class SharedExpert(nn.Module):
         return output * gate_val
 
 
-class MoELayer(EPChunkOverlapMoELayer):
+class MoELayer(nn.Module):
     def __init__(
         self,
         config: Qwen35Config,
@@ -169,24 +169,27 @@ class MoELayer(EPChunkOverlapMoELayer):
         num_chunks_ep_a2a_overlap: int = 1,
         layer_idx: int | None = None,
     ):
+        super().__init__()
         if fp8:
             raise NotImplementedError("lite qwen35 MoE fp8 is not implemented yet.")
-        router = TopKRouter(
+        self.router = TopKRouter(
             config,
             ps,
             router_bias_rate=router_bias_rate,
             compute_aux_loss=True,
             router_dtype=router_dtype,
         )
-        experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
-        super().__init__(
+        self.experts = Experts(
+            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute
+        )
+        self.ep_chunk_overlap = EPChunkOverlapOperator(
             config,
             ps,
+            router=self.router,
+            experts=self.experts,
             use_deepep=use_deepep,
             num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
             moe_full_recompute=True,
-            router=router,
-            experts=experts,
             dispatcher_factory=lambda slot: TokenDispatcher(
                 config.num_experts,
                 config.hidden_size,
@@ -197,6 +200,7 @@ class MoELayer(EPChunkOverlapMoELayer):
             ),
             layer_idx=layer_idx,
         )
+        self.num_chunks_ep_a2a_overlap = num_chunks_ep_a2a_overlap
         self.shared_expert = SharedExpert(config, ps, use_plain_te_linear=shared_expert_plain_te)
         self.preserve_3d_graph = bool(preserve_3d_graph)
 
@@ -213,23 +217,12 @@ class MoELayer(EPChunkOverlapMoELayer):
             side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side_stream):
                 shared_out = self.shared_expert(shared_input)
-        if self.chunk_spec == 1 and self.preserve_3d_graph:
-            scores, indices = self.router(router_input)
-            dispatched, tpe, permuted_probs = self.dispatcher.dispatch(
-                x_2d, scores, indices
+        if self.num_chunks_ep_a2a_overlap == 1 and self.preserve_3d_graph:
+            routed_out = self.ep_chunk_overlap.forward_synchronous(
+                x_2d, router_input=router_input
             )
-            self.dispatcher.wait_dispatch_event()
-            expert_out = self.experts(
-                dispatched,
-                tpe,
-                permuted_probs,
-                tokens_per_expert_list=getattr(
-                    self.dispatcher, "_local_tpe_list", None
-                ),
-            )
-            routed_out = self.dispatcher.combine(expert_out)
         else:
-            routed_out = super().forward(router_input).reshape_as(x_2d)
+            routed_out = self.ep_chunk_overlap(router_input).reshape_as(x_2d)
 
         if shared_out is None:
             shared_out = self.shared_expert(shared_input)

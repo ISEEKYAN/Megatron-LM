@@ -18,7 +18,6 @@ from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     parse_ep_chunk_spec,
     resolve_ep_chunk_overlap_chunks,
 )
-from megatron.lite.primitive.modules.router import TopKRouter
 from megatron.lite.primitive.parallel import ParallelState
 
 
@@ -105,24 +104,20 @@ class _BackwardChunk:
     expert_out_dtype: torch.dtype | None = None
 
 
-class EPChunkOverlapMoELayer(nn.Module):
-    """Product DeepEP chunk-overlap MoE layer."""
+class EPChunkOverlapOperator:
+    """Replaceable DeepEP chunk-overlap schedule over model-owned MoE modules."""
 
     def __init__(
         self,
         config: Any,
         ps: ParallelState,
         *,
+        router: nn.Module,
+        experts: Experts,
         num_chunks_ep_a2a_overlap: ChunkSpec = 1,
         use_deepep: bool = True,
-        router_bias_rate: float = 0.0,
-        fp8: bool = False,
-        moe_act_recompute: bool = False,
         moe_full_recompute: bool = True,
-        lora_config: Any | None = None,
         layer_idx: int | None = None,
-        router: nn.Module | None = None,
-        experts: Experts | None = None,
         dispatcher_factory: (
             Callable[[tuple[str, str, int, int]], TokenDispatcher] | None
         ) = None,
@@ -134,7 +129,6 @@ class EPChunkOverlapMoELayer(nn.Module):
             | None
         ) = None,
     ):
-        super().__init__()
         self.config = config
         self.ps = ps
         self.chunk_spec = parse_ep_chunk_spec(num_chunks_ep_a2a_overlap)
@@ -149,24 +143,8 @@ class EPChunkOverlapMoELayer(nn.Module):
         self._router_forward = router_forward
         self._active_routing_input: torch.Tensor | None = None
 
-        self.router = (
-            router
-            if router is not None
-            else TopKRouter(
-                config, ps, router_bias_rate=router_bias_rate, compute_aux_loss=False
-            )
-        )
-        self.experts = (
-            experts
-            if experts is not None
-            else Experts(
-                config,
-                ps,
-                fp8=fp8,
-                moe_act_recompute=moe_act_recompute,
-                lora_config=lora_config,
-            )
-        )
+        self.router = router
+        self.experts = experts
         self.dispatcher = self._new_dispatcher("main", 0)
         if self.chunk_spec == 2 and not self.dispatcher.use_deepep:
             raise RuntimeError("EP chunk overlap requires available DeepEP transport.")
@@ -229,6 +207,33 @@ class EPChunkOverlapMoELayer(nn.Module):
     ) -> torch.Tensor:
         with self._routing_context(routing_input):
             return self._forward_impl(x, routing_input)
+
+    __call__ = forward
+
+    def forward_synchronous(
+        self,
+        x: torch.Tensor,
+        *,
+        router_input: torch.Tensor | None = None,
+        routing_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the unsplit path while allowing a model-specific router input layout."""
+        input_shape = x.shape
+        x_2d = x.reshape(-1, x.size(-1))
+        route_x = x_2d if router_input is None else router_input
+        with self._routing_context(routing_input):
+            scores, indices = self._route(route_x, 0, x_2d.size(0))
+            dispatched, local_tpe, probs = self.dispatcher.dispatch(
+                x_2d, scores, indices
+            )
+            self.dispatcher.wait_dispatch_event()
+            expert_out = self.experts(
+                dispatched,
+                local_tpe,
+                probs,
+                getattr(self.dispatcher, "_local_tpe_list", None),
+            )
+            return self.dispatcher.combine(expert_out).view(input_shape)
 
     def _forward_impl(
         self, x: torch.Tensor, routing_input: torch.Tensor | None
@@ -715,7 +720,7 @@ class _FullRecomputeFused(torch.autograd.Function):
         ctx,
         x_2d: torch.Tensor,
         routing_input: torch.Tensor | None,
-        layer: EPChunkOverlapMoELayer,
+        operator: EPChunkOverlapOperator,
         input_shape: torch.Size,
         input_dtype: torch.dtype,
         fwd_chunks: int,
@@ -723,9 +728,9 @@ class _FullRecomputeFused(torch.autograd.Function):
         *params: torch.Tensor,
     ) -> torch.Tensor:
         del params, input_dtype
-        ctx.layer = layer
+        ctx.operator = operator
         ctx.bwd_chunks = bwd_chunks
-        ctx.num_router_params = len(tuple(layer.router.parameters()))
+        ctx.num_router_params = len(tuple(operator.router.parameters()))
         ctx.has_routing_input = routing_input is not None
         saved_routing = (
             routing_input.detach()
@@ -736,17 +741,17 @@ class _FullRecomputeFused(torch.autograd.Function):
         ranges = ep_chunk_ranges(
             x_2d.size(0), fwd_chunks, weights_env="MEGATRON_LITE_EP_CHUNK_WEIGHTS"
         )
-        output = layer._forward_output_only(x_2d, ranges, input_shape, x_2d.dtype)
+        output = operator._forward_output_only(x_2d, ranges, input_shape, x_2d.dtype)
         return output.detach().view(input_shape)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        layer = ctx.layer
+        operator = ctx.operator
         x_saved, routing_saved = ctx.saved_tensors
         grad_2d = grad_output.contiguous().view(-1, grad_output.size(-1))
         routing_input = routing_saved if ctx.has_routing_input else None
-        with layer._routing_context(routing_input), torch.enable_grad():
-            grad_x, router_grads, expert_grads = layer._full_recompute_fused_backward(
+        with operator._routing_context(routing_input), torch.enable_grad():
+            grad_x, router_grads, expert_grads = operator._full_recompute_fused_backward(
                 x_saved, grad_2d, ctx.bwd_chunks
             )
         return (
@@ -825,4 +830,4 @@ def _materialize(
     ]
 
 
-__all__ = ["EPChunkOverlapMoELayer", "resolve_ep_chunk_overlap_chunks"]
+__all__ = ["EPChunkOverlapOperator", "resolve_ep_chunk_overlap_chunks"]

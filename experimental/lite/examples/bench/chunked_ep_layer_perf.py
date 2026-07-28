@@ -20,7 +20,6 @@ import torch
 import torch.distributed as dist
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.qwen3_moe.lite.model import MoELayer
-from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapMoELayer
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from torch.utils.checkpoint import checkpoint
@@ -246,21 +245,16 @@ def main() -> int:
         ParallelConfig(tp=1, etp=1, ep=world_size, pp=1, vpp=1, cp=1)
     )
     baseline = MoELayer(config, parallel, use_deepep=True).to(torch.bfloat16).cuda()
-    candidate = (
-        EPChunkOverlapMoELayer(
-            config,
-            parallel,
-            num_chunks_ep_a2a_overlap=args.chunks,
-            use_deepep=True,
-            moe_full_recompute=True,
-            layer_idx=0,
-        )
-        .to(torch.bfloat16)
-        .cuda()
-    )
+    candidate = MoELayer(
+        config,
+        parallel,
+        num_chunks_ep_a2a_overlap=args.chunks,
+        use_deepep=True,
+        layer_idx=0,
+    ).to(torch.bfloat16).cuda()
     candidate.load_state_dict(baseline.state_dict())
-    assert baseline.dispatcher.use_deepep
-    assert candidate.dispatcher.use_deepep
+    assert baseline.ep_chunk_overlap.dispatcher.use_deepep
+    assert candidate.ep_chunk_overlap.dispatcher.use_deepep
 
     generator = torch.Generator(device=device).manual_seed(args.seed + rank)
     hidden = torch.randn(

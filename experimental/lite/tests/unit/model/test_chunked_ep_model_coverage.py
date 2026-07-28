@@ -30,7 +30,10 @@ def test_every_lite_moe_model_consumes_the_shared_chunked_ep_primitive(
     assert "num_chunks_ep_a2a_overlap: int = 1" in protocol
     assert "validate_ep_chunk_overlap_config(" in protocol
     assert "recompute_modules_for_ep_chunk_overlap(" in protocol
-    assert "EPChunkOverlapMoELayer" in implementation
+    assert "EPChunkOverlapOperator" in implementation
+    assert "self.ep_chunk_overlap = EPChunkOverlapOperator(" in implementation
+    assert "class MoELayer(EPChunkOverlap" not in implementation
+    assert "class DeepseekV4MoE(EPChunkOverlap" not in implementation
     assert "num_chunks_ep_a2a_overlap" in implementation
 
 
@@ -67,5 +70,5 @@ def test_chunk_policy_lives_with_the_moe_module_primitive():
 def test_deepseek_hash_router_keeps_checkpoint_gate_name():
     implementation = (MODEL_ROOT / "deepseek_v4/lite/moe.py").read_text()
 
-    assert 'self._modules["gate"] = self._modules.pop("router")' in implementation
-    assert 'object.__setattr__(self, "router", self.gate)' in implementation
+    assert "self.gate = SigmoidTopKRouter(" in implementation
+    assert 'self._modules["gate"] = self._modules.pop("router")' not in implementation

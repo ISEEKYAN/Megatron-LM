@@ -7,12 +7,12 @@ from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.mlp import SwiGLUMLP
-from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapMoELayer
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapOperator
 from megatron.lite.primitive.modules.router import SigmoidTopKRouter
 from megatron.lite.primitive.parallel.state import ParallelState
 
 
-class DeepseekV4MoE(EPChunkOverlapMoELayer):
+class DeepseekV4MoE(nn.Module):
     """Model-specific assembly over shared router, Experts, dispatcher, and shared MLP.
 
     Allowlist reason: this owns DS4 hash routing wiring, while expert compute stays shared.
@@ -27,10 +27,11 @@ class DeepseekV4MoE(EPChunkOverlapMoELayer):
         use_deepep: bool = False,
         num_chunks_ep_a2a_overlap: int = 1,
     ):
-        gate = SigmoidTopKRouter(config, ps, compute_aux_loss=False)
+        super().__init__()
+        self.gate = SigmoidTopKRouter(config, ps, compute_aux_loss=False)
         is_hash_layer = layer_idx < config.num_hash_layers
         if is_hash_layer:
-            gate.register_buffer(
+            self.gate.register_buffer(
                 "tid2eid",
                 torch.zeros(
                     config.vocab_size, config.num_experts_per_tok, dtype=torch.int64
@@ -38,16 +39,20 @@ class DeepseekV4MoE(EPChunkOverlapMoELayer):
                 persistent=True,
             )
         else:
-            gate._non_persistent_buffers_set.discard("expert_bias")
-        experts = Experts(config, ps)
-        super().__init__(
+            self.gate._non_persistent_buffers_set.discard("expert_bias")
+        self.experts = Experts(config, ps)
+        self.hidden_size = config.hidden_size
+        self.topk = config.num_experts_per_tok
+        self.route_scale = config.routed_scaling_factor
+        self.is_hash_layer = is_hash_layer
+        self.ep_chunk_overlap = EPChunkOverlapOperator(
             config,
             ps,
+            router=self.gate,
+            experts=self.experts,
             use_deepep=use_deepep,
             num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
             moe_full_recompute=True,
-            router=gate,
-            experts=experts,
             dispatcher_factory=lambda slot: TokenDispatcher(
                 config.n_routed_experts,
                 config.hidden_size,
@@ -55,15 +60,9 @@ class DeepseekV4MoE(EPChunkOverlapMoELayer):
                 use_deepep=use_deepep,
                 buffer_slot=slot,
             ),
+            router_forward=self._route_for_overlap,
             layer_idx=layer_idx,
         )
-        self.hidden_size = config.hidden_size
-        self.topk = config.num_experts_per_tok
-        self.route_scale = config.routed_scaling_factor
-        self.is_hash_layer = is_hash_layer
-        self._modules["gate"] = self._modules.pop("router")
-        object.__setattr__(self, "router", self.gate)
-        self._router_forward = self._route_for_overlap
         shared_intermediate = config.n_shared_experts * config.moe_intermediate_size
         self.shared_experts = (
             SwiGLUMLP(
@@ -109,7 +108,7 @@ class DeepseekV4MoE(EPChunkOverlapMoELayer):
     def forward(self, x: torch.Tensor, *, input_ids: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.shape
         x_flat = x.reshape(-1, self.hidden_size)
-        out = super().forward(x_flat, routing_input=input_ids)
+        out = self.ep_chunk_overlap(x_flat, routing_input=input_ids)
         if self.shared_experts is not None:
             out = out + self.shared_experts(x_flat)
         return out.view(shape)

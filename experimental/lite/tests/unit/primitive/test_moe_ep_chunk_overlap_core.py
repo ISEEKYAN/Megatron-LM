@@ -82,16 +82,15 @@ def test_training_fails_loud_instead_of_silently_skipping_chunks(
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-        EPChunkOverlapMoELayer,
+        EPChunkOverlapOperator,
     )
 
-    layer = object.__new__(EPChunkOverlapMoELayer)
-    torch.nn.Module.__init__(layer)
-    layer.moe_full_recompute = False
-    layer._num_chunks = lambda _tokens: 2
+    operator = object.__new__(EPChunkOverlapOperator)
+    operator.moe_full_recompute = False
+    operator._num_chunks = lambda _tokens: 2
 
     with pytest.raises(RuntimeError, match="requires moe_full_recompute"):
-        layer(torch.zeros(8, 4, requires_grad=True))
+        operator(torch.zeros(8, 4, requires_grad=True))
 
 
 def test_chunk_one_matches_unsplit_output_shape_and_gradient(
@@ -99,18 +98,17 @@ def test_chunk_one_matches_unsplit_output_shape_and_gradient(
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-        EPChunkOverlapMoELayer,
+        EPChunkOverlapOperator,
     )
 
-    layer = object.__new__(EPChunkOverlapMoELayer)
-    torch.nn.Module.__init__(layer)
-    layer.moe_full_recompute = False
-    layer._num_chunks = lambda _tokens: 1
-    layer._forward_full = lambda value: value.square() + 3 * value
+    operator = object.__new__(EPChunkOverlapOperator)
+    operator.moe_full_recompute = False
+    operator._num_chunks = lambda _tokens: 1
+    operator._forward_full = lambda value: value.square() + 3 * value
 
     actual_input = torch.randn(7, 4, requires_grad=True)
     expected_input = actual_input.detach().clone().requires_grad_(True)
-    actual = layer(actual_input)
+    actual = operator(actual_input)
     expected = expected_input.square() + 3 * expected_input
     actual.sum().backward()
     expected.sum().backward()
@@ -120,12 +118,54 @@ def test_chunk_one_matches_unsplit_output_shape_and_gradient(
     torch.testing.assert_close(actual_input.grad, expected_input.grad)
 
 
+def test_synchronous_operator_keeps_router_layout_separate_from_expert_tokens(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkOverlapOperator,
+    )
+
+    class FakeDispatcher:
+        use_deepep = True
+        _local_tpe_list = [6]
+
+        def dispatch(self, hidden, _scores, _indices):
+            assert hidden.shape == (6, 4)
+            return hidden, torch.tensor([6]), torch.ones(6)
+
+        def wait_dispatch_event(self):
+            return None
+
+        def combine(self, hidden):
+            return hidden
+
+    router_shapes = []
+    operator = object.__new__(EPChunkOverlapOperator)
+    operator.router = lambda hidden: (
+        router_shapes.append(hidden.shape) or torch.ones(6, 1),
+        torch.zeros(6, 1, dtype=torch.long),
+    )
+    operator.experts = lambda hidden, *_args: hidden + 1
+    operator.dispatcher = FakeDispatcher()
+    operator._router_forward = None
+    operator._active_routing_input = None
+
+    x_2d = torch.zeros(6, 4)
+    router_input = x_2d.view(3, 2, 4)
+    output = operator.forward_synchronous(x_2d, router_input=router_input)
+
+    assert router_shapes == [torch.Size([3, 2, 4])]
+    assert output.shape == x_2d.shape
+    torch.testing.assert_close(output, torch.ones_like(x_2d))
+
+
 def test_forward_trace_pipelines_next_dispatch_before_current_expert(
     monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-        EPChunkOverlapMoELayer,
+        EPChunkOverlapOperator,
     )
 
     trace = []
@@ -185,19 +225,18 @@ def test_forward_trace_pipelines_next_dispatch_before_current_expert(
     monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: caller)
     monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
 
-    layer = object.__new__(EPChunkOverlapMoELayer)
-    torch.nn.Module.__init__(layer)
-    layer.router = lambda hidden: (
+    operator = object.__new__(EPChunkOverlapOperator)
+    operator.router = lambda hidden: (
         torch.ones(hidden.size(0), 1),
         torch.zeros(hidden.size(0), 1, dtype=torch.long),
     )
-    layer.experts = FakeExperts()
-    layer._streams = lambda _device: (compute, comm)
+    operator.experts = FakeExperts()
+    operator._streams = lambda _device: (compute, comm)
     dispatchers = [FakeDispatcher(idx) for idx in range(3)]
-    layer._forward_dispatcher = lambda idx: dispatchers[idx]
+    operator._forward_dispatcher = lambda idx: dispatchers[idx]
 
     inputs = torch.arange(6, dtype=torch.float32).view(6, 1)
-    output = layer._forward_output_async(
+    output = operator._forward_output_async(
         inputs,
         [(0, 2), (2, 4), (4, 6)],
         inputs.shape,

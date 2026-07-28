@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     ep_chunk_ranges,
     parse_ep_chunk_spec,
@@ -72,10 +73,31 @@ def test_shared_model_contract_fails_loud(chunks, use_deepep, ep_size):
         validate_ep_chunk_overlap_config(chunks, use_deepep=use_deepep, ep_size=ep_size)
 
 
-def test_production_chunked_ep_layer_is_importable(transformer_engine_import_stub):
+def test_production_chunked_ep_operator_is_importable(transformer_engine_import_stub):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-        EPChunkOverlapMoELayer,
+        EPChunkOverlapOperator,
     )
 
-    assert EPChunkOverlapMoELayer.__name__ == "EPChunkOverlapMoELayer"
+    assert EPChunkOverlapOperator.__name__ == "EPChunkOverlapOperator"
+    assert not issubclass(EPChunkOverlapOperator, torch.nn.Module)
+
+
+def test_operator_keeps_router_and_expert_checkpoint_names_model_owned(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkOverlapOperator,
+    )
+
+    owner = torch.nn.Module()
+    owner.router = torch.nn.Linear(2, 2, bias=False)
+    owner.experts = torch.nn.Linear(2, 2, bias=False)
+    operator = object.__new__(EPChunkOverlapOperator)
+    operator.router = owner.router
+    operator.experts = owner.experts
+    owner.ep_chunk_overlap = operator
+
+    assert tuple(owner.state_dict()) == ("router.weight", "experts.weight")
+    assert "ep_chunk_overlap" not in owner._modules

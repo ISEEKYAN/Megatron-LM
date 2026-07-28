@@ -41,7 +41,7 @@ from megatron.lite.primitive.modules.attention import (
 )
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
-from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapMoELayer
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapOperator
 from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 from megatron.lite.primitive.modules.router import SigmoidTopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
@@ -280,7 +280,7 @@ class _LocalLinear(nn.Module):
         return self.linear(x)
 
 
-class MoELayer(EPChunkOverlapMoELayer):
+class MoELayer(nn.Module):
     def __init__(
         self,
         config: Glm5Config,
@@ -293,9 +293,10 @@ class MoELayer(EPChunkOverlapMoELayer):
         num_chunks_ep_a2a_overlap: int = 1,
         layer_idx: int | None = None,
     ):
+        super().__init__()
         if fp8:
             raise NotImplementedError("GLM-5 lite MoE fp8 training is not implemented yet.")
-        router = SigmoidTopKRouter(
+        self.router = SigmoidTopKRouter(
             config,
             ps,
             router_bias_rate=router_bias_rate,
@@ -304,20 +305,20 @@ class MoELayer(EPChunkOverlapMoELayer):
             router_dtype=torch.float32,
             expert_bias_persistent=True,
         )
-        experts = Experts(
+        self.experts = Experts(
             config,
             ps,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
         )
-        super().__init__(
+        self.ep_chunk_overlap = EPChunkOverlapOperator(
             config,
             ps,
+            router=self.router,
+            experts=self.experts,
             use_deepep=use_deepep,
             num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
             moe_full_recompute=True,
-            router=router,
-            experts=experts,
             dispatcher_factory=lambda slot: TokenDispatcher(
                 config.num_experts,
                 config.hidden_size,
@@ -333,7 +334,7 @@ class MoELayer(EPChunkOverlapMoELayer):
         input_shape = x.shape
 
         flat_x = x.view(-1, x.size(-1))
-        routed_out = super().forward(flat_x)
+        routed_out = self.ep_chunk_overlap(flat_x)
         shared_out = self.shared_expert(x)
         output = routed_out.view(input_shape)
         output += shared_out
