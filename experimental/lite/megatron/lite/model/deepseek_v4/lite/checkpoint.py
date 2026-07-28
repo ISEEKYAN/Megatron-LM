@@ -33,6 +33,9 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+from megatron.lite.primitive.quantization.qat import (
+    canonical_state_key as _canonical_state_key,
+)
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
     _cast_export_tensor,
@@ -407,7 +410,8 @@ def load_hf_weights(
         for name, target in state.items():
             if _is_native_metadata_key(name):
                 continue
-            global_name = to_global_layer_name(name, layer_map)
+            logical_name = _canonical_state_key(name)
+            global_name = to_global_layer_name(logical_name, layer_map)
             hf_names = _hf_names_for_state_key(
                 _to_global_expert_name(global_name, config, ps), config
             )

@@ -1,12 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
 import torch
-
+from megatron.lite.runtime.contracts import LossContext
+from tensordict import TensorDict
 from verl_mlite.engine.config import MegatronLiteEngineConfig
 from verl_mlite.engine.mlite_engine import MegatronLiteEngine, _build_lr_scheduler
-from megatron.lite.runtime.contracts import LossContext
 
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
@@ -49,6 +51,62 @@ def _engine_config(**kwargs) -> MegatronLiteEngineConfig:
     values = {"custom_backend_module": None, "impl_cfg": {"use_thd": True}}
     values.update(kwargs)
     return MegatronLiteEngineConfig(**values)
+
+
+def _r3_input_ids() -> torch.Tensor:
+    return torch.nested.as_nested_tensor(
+        [torch.arange(4), torch.arange(3)], layout=torch.jagged
+    )
+
+
+def _install_upstream_r3_stub(monkeypatch, build) -> None:
+    module = types.ModuleType("verl.utils.megatron.router_replay_utils")
+    module.build_r3_replay_mask = build
+    monkeypatch.setitem(
+        sys.modules, "verl.utils.megatron.router_replay_utils", module
+    )
+
+
+def test_r3_replay_mask_delegates_jagged_inputs_to_verl(monkeypatch):
+    """The connector delegates semantics before flattening the THD batch."""
+    input_ids = _r3_input_ids()
+    response_mask = torch.tensor([[1, 1], [0, 0]], dtype=torch.float32)
+    expected = torch.nested.as_nested_tensor(
+        [
+            torch.tensor([True, True, True, False]),
+            torch.tensor([False, False, False]),
+        ],
+        layout=torch.jagged,
+    )
+    seen = {}
+
+    def build(actual_input_ids, actual_response_mask):
+        seen["input_ids"] = actual_input_ids
+        seen["response_mask"] = actual_response_mask
+        return expected
+
+    _install_upstream_r3_stub(monkeypatch, build)
+    micro_batch = TensorDict(
+        {"input_ids": input_ids, "response_mask": response_mask},
+        batch_size=[2],
+    )
+
+    actual = MegatronLiteEngine._r3_replay_mask_for_packing(
+        micro_batch, input_ids
+    )
+
+    assert actual is expected
+    assert seen == {"input_ids": input_ids, "response_mask": response_mask}
+
+
+def test_r3_replay_mask_requires_response_mask(monkeypatch):
+    """R3 must fail loudly instead of guessing that every sequence has a response."""
+    _install_upstream_r3_stub(monkeypatch, lambda *_args: pytest.fail("must not run"))
+    input_ids = _r3_input_ids()
+    micro_batch = TensorDict({"input_ids": input_ids}, batch_size=[2])
+
+    with pytest.raises(KeyError, match="response_mask"):
+        MegatronLiteEngine._r3_replay_mask_for_packing(micro_batch, input_ids)
 
 
 @pytest.mark.parametrize("num_microbatches", [1, 4])
@@ -167,6 +225,84 @@ def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
             "target": "vllm",
         },
     }
+
+
+def test_qwen3_moe_online_weight_export_does_not_pass_unsupported_target() -> None:
+    engine = _engine(engine_config=_engine_config())
+    engine.model_config.hf_config = {"model_type": "qwen3_moe"}
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            captured["kwargs"] = kwargs
+            return iter(())
+
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine._initial_sync_cache_cleared = True
+
+    weights, metadata = engine.get_per_tensor_param()
+
+    assert list(weights) == []
+    assert metadata is None
+    assert "target" not in captured["kwargs"]
+
+
+def test_online_qat_export_wraps_mlite_hf_weight_stream(monkeypatch) -> None:
+    engine = _engine(
+        engine_config=_engine_config(
+            qat={
+                "enable": True,
+                "apply_modelopt_fake_quant": False,
+                "mode": "mxfp4",
+                "group_size": 32,
+                "ignore_patterns": ["lm_head"],
+            }
+        )
+    )
+    source_weights = iter(
+        [("model.layers.0.mlp.experts.0.gate_proj.weight", torch.ones(2, 32))]
+    )
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            return source_weights
+
+    def fake_export(weights, modules, qat_config, bridge):
+        captured.update(
+            weights=weights,
+            modules=modules,
+            qat_config=qat_config,
+            bridge=bridge,
+        )
+        return iter([("packed.weight", torch.ones(2, 16, dtype=torch.uint8))])
+
+    fake_modelopt = types.ModuleType("verl.utils.modelopt")
+    fake_modelopt.export_qat_weights = fake_export
+    monkeypatch.setitem(sys.modules, "verl.utils.modelopt", fake_modelopt)
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine.module = object()
+    engine._initial_sync_cache_cleared = True
+
+    weights, metadata = engine.get_per_tensor_param()
+
+    assert [name for name, _ in weights] == ["packed.weight"]
+    assert metadata is None
+    assert captured["weights"] is source_weights
+    assert captured["modules"] == [engine.module]
+    assert captured["bridge"] is None
+    assert captured["qat_config"].mode == "mxfp4"
+    assert captured["qat_config"].group_size == 32
+    assert captured["qat_config"].apply_modelopt_fake_quant is False
+
+
+def test_qat_export_rejects_native_resync_format_double_quantization() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _engine_config(qat={"enable": True, "mode": "mxfp4"}, resync_format="mxfp4")
 
 
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:

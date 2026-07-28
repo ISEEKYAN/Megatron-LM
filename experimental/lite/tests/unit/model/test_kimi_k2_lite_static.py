@@ -102,7 +102,11 @@ def test_kimi_k2_lite_uses_shared_mla_primitive():
     assert "class MultiLatentAttention" not in model_text
     assert "class MultiLatentAttention" in mla_text
     assert "megatron.core" not in mla_text
-    assert "KimiK2SigmoidTopKRouter" in model_text
+    assert (
+        "from megatron.lite.primitive.modules.router import SigmoidTopKRouter"
+        in model_text
+    )
+    assert "KimiK2SigmoidTopKRouter" not in model_text
 
 
 def test_kimi_k2_lite_optimizer_names_are_current():
