@@ -80,8 +80,13 @@ FSDP2 Muon does not support optimizer-state CPU offload in this release.
 |-------|--------|
 | DistOpt Muon vs Megatron-Core | Bitwise (`torch.equal`, 2000 tensor checks, DP=2) |
 | FSDP2 Muon vs reference | Within round-off (~1e-6 fp32 highest; ~1e-2 medium production precision) |
-| Peak memory (30B, 16 GPUs) | Muon **39.66 GiB** < Adam **46.63 GiB** |
-| GSM8K RL reward (GRPO) | Muon 0.297→0.8125 (Δ+0.516) ≥ Adam 0.266→0.750 |
+| Peak memory (30B) | Previous FSDP2 figure withdrawn pending a matched rerun after the routing fix |
+| GSM8K RL reward (GRPO) | Muon and AdamW are within the repeat-run spread |
+
+This table summarizes a mix of automated primitive checks and manual
+end-to-end validation. The DistOpt and FSDP2 correctness rows have repository
+test assertions; the memory and RL observations are not asserted by automated
+tests in this repository.
 
 ## Tests
 

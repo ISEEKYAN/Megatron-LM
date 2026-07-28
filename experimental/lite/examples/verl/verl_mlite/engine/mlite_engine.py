@@ -654,9 +654,13 @@ class MegatronLiteEngine(BaseEngine):
         optimizer_name = self._normalize_optimizer_name(self.optimizer_config)
         betas = tuple(getattr(self.optimizer_config, "betas", (0.9, 0.999)))
         override = getattr(self.optimizer_config, "override_optimizer_config", {}) or {}
-        offload_fraction = override.get(
-            "offload_fraction", override.get("optimizer_offload_fraction")
-        )
+        alias = override.get("offload_fraction")
+        canonical = override.get("optimizer_offload_fraction")
+        if alias is not None and canonical is not None and alias != canonical:
+            raise ValueError(
+                "offload_fraction compatibility alias conflicts with optimizer_offload_fraction"
+            )
+        offload_fraction = canonical if canonical is not None else alias
         if offload_fraction is None and override.get("optimizer_cpu_offload"):
             offload_fraction = 1.0
         if offload_fraction is None and self.is_optimizer_offload_enabled:
@@ -670,6 +674,27 @@ class MegatronLiteEngine(BaseEngine):
         lr_decay_style = getattr(self.optimizer_config, "lr_decay_style", None)
         if lr_decay_style is None:
             lr_decay_style = getattr(self.optimizer_config, "lr_scheduler_type", "constant")
+
+        native_override_fields = (
+            "muon_momentum",
+            "muon_split_qkv",
+            "muon_nesterov",
+            "muon_scale_mode",
+            "muon_fp32_matmul_prec",
+            "muon_coefficient_type",
+            "muon_num_ns_steps",
+            "muon_tp_mode",
+            "muon_extra_scale_factor",
+            "muon_match_adamw_update_rms",
+            "muon_scalar_optimizer",
+            "use_layer_wise_param_layout",
+            "overlap_grad_reduce",
+            "overlap_param_gather",
+            "overlap_param_gather_with_optimizer_step",
+        )
+        native_overrides = {
+            name: override[name] for name in native_override_fields if name in override
+        }
 
         return MegatronLiteOptimizerConfig(
             optimizer=optimizer_name,
@@ -697,6 +722,7 @@ class MegatronLiteEngine(BaseEngine):
             offload_fraction=offload_fraction,
             use_precision_aware_optimizer=override.get("use_precision_aware_optimizer"),
             decoupled_weight_decay=override.get("decoupled_weight_decay"),
+            **native_overrides,
         )
 
     @staticmethod
@@ -705,8 +731,10 @@ class MegatronLiteEngine(BaseEngine):
         lower = str(optimizer_name).lower()
         if "adam" in lower:
             return "adam"
+        if lower == "muon":
+            return "muon"
         raise ValueError(
-            f"MegatronLiteEngine only supports Adam-style optimizers today, got {optimizer_name!r}"
+            f"MegatronLiteEngine supports optimizer='adam' or 'muon', got {optimizer_name!r}"
         )
 
     def _extract_primary_module(self):
