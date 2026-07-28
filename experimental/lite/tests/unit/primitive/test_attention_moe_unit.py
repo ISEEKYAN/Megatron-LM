@@ -281,6 +281,42 @@ def test_topk_router_aux_loss_contributes_gate_gradient(monkeypatch):
     assert (grad_with_aux - grad_no_aux).abs().sum().item() > 0.0
 
 
+@pytest.mark.parametrize("router_kind", ["topk", "sigmoid"])
+def test_router_replay_rejects_nonzero_aux_loss(router_kind):
+    from megatron.lite.primitive.modules.router import SigmoidTopKRouter, TopKRouter
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+    from megatron.lite.primitive.parallel import ParallelState
+
+    config = SimpleNamespace(
+        hidden_size=8,
+        num_experts=4,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        router_aux_loss_coef=0.001,
+        aux_loss_alpha=0.001,
+        routed_scaling_factor=1.0,
+        scoring_func="sigmoid",
+        n_group=None,
+        topk_group=None,
+    )
+    router_cls = TopKRouter if router_kind == "topk" else SigmoidTopKRouter
+    RouterReplay.clear_global_router_replay_instances()
+    router = router_cls(config, ParallelState())
+    router.router_replay = RouterReplay()
+    router.train()
+    RouterReplay.set_replay_data(
+        [torch.tensor([[0, 1], [1, 2]])],
+        replay_mask=torch.tensor([True, True]),
+    )
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
+    with pytest.raises(RuntimeError, match="router aux loss.*disabled"):
+        router(torch.randn(2, 8, requires_grad=True))
+
+
 def test_dsa_index_share_schedule_and_state():
     from megatron.lite.primitive.modules.attention.dsa import (
         DSAIndexShareState,

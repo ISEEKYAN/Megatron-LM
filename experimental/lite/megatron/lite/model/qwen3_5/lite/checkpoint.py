@@ -13,11 +13,15 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
-
 from megatron.lite.model.qwen3_5.config import Qwen35Config
+from megatron.lite.primitive.quantization.qat import (
+    canonical_state_key as _canonical_state_key,
+)
 from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader, unwrap_model
 from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.quantization.mxfp4 import MXFP4_BLOCK_SIZE, quantize_mxfp4
 from megatron.lite.primitive.utils import ensure_divisible, log_rank0
+from megatron.lite.runtime.contracts.weights import ResyncFormat
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -718,12 +722,22 @@ def _load_experts(
 
 def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> None:
     state = model.state_dict()
+    # Logical (pre-QAT) name -> actual state key, so a checkpoint tensor named
+    # ``….weight`` still lands on ``….parametrizations.weight.original`` when the
+    # module has been wrapped by weight-only QAT.
+    canonical: dict[str, str] = {}
+    for key in state:
+        canonical.setdefault(_canonical_state_key(key), key)
     resolved: dict[str, torch.Tensor] = {}
     for name, tensor in loaded.items():
-        actual = name if name in state else None
-        if actual is None:
-            for key in state:
-                if name in key:
+        if name in state:
+            actual = name
+        elif name in canonical:
+            actual = canonical[name]
+        else:
+            actual = None
+            for logical, key in canonical.items():
+                if name in logical:
                     actual = key
                     break
         if actual is not None:
@@ -802,11 +816,36 @@ def export_hf_weights(
     include_mtp_only = kwargs.pop("include_mtp_only", False)
     kwargs.pop("include_local_prefixes", None)
     target = kwargs.pop("target", "hf")
+    resync_config = kwargs.pop("resync_config", None)
+    if target in {"hf", "vllm", ResyncFormat.BF16.value}:
+        if resync_config:
+            raise ValueError("Qwen3.5 resync_config requires target='mxfp4'")
+        if include_mtp_only:
+            return
+        spec_target = "hf" if target == ResyncFormat.BF16.value else target
+        yield from _export(model, Qwen35WeightSpec(config, target=spec_target), ps, vocab_size=config.vocab_size, **kwargs)
+        return
+    if ResyncFormat.parse(target) is not ResyncFormat.MXFP4:
+        raise ValueError(f"Qwen3.5 does not support resync target {target!r}")
+    if resync_config:
+        raise ValueError("Qwen3.5 MXFP4 resync does not accept resync_config")
     if include_mtp_only:
         return
-    yield from _export(
-        model, Qwen35WeightSpec(config, target=target), ps, vocab_size=config.vocab_size, **kwargs
-    )
+    yield from _export_mxfp4_weights(_export(model, Qwen35WeightSpec(config), ps, vocab_size=config.vocab_size, **kwargs))
+
+
+def _export_mxfp4_weights(weights):
+    """Convert the Qwen3.5 HF stream to compressed-tensors MXFP4 tensors."""
+    for name, tensor in weights:
+        ignored = name.endswith(("embed_tokens.weight", "lm_head.weight", ".mlp.gate.weight"))
+        if ignored or not name.endswith(".weight") or tensor.ndim != 2 or not tensor.dtype.is_floating_point:
+            yield name, tensor
+            continue
+        if tensor.shape[-1] % MXFP4_BLOCK_SIZE:
+            raise ValueError(f"MXFP4 weight {name!r} has input dimension {tensor.shape[-1]}, which is not divisible by {MXFP4_BLOCK_SIZE}")
+        packed, scale = quantize_mxfp4(tensor)
+        yield name, packed.view(torch.uint8)
+        yield f"{name[:-7]}.weight_scale", scale.view(torch.uint8)
 
 
 def save_hf_weights(

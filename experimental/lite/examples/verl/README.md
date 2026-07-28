@@ -162,6 +162,31 @@ so the MLite actor is wired up correctly without any extra worker-path knob.
 By default, GSM8K GRPO artifacts are written under
 `experimental/lite/examples/verl/outputs/qwen35_gsm8k_grpo`.
 
+### MXFP4 QAT four-arm launch
+
+For the complete `QATSpec` field reference, supported-format table,
+optimizer/checkpoint ordering contract, packed snapshot layout, and an
+end-to-end MXFP4 QAT launch recipe, see [QAT.md](QAT.md).
+
+Run the generalized four-arm Qwen3-MoE recipe with:
+
+```bash
+MODEL_PATH=Qwen/Qwen3-30B-A3B \
+TRAIN_FILES=/path/to/dapo-math-17k.parquet \
+VAL_FILES=/path/to/aime-2024.parquet \
+MXFP4_QUANTIZATION_CONFIG=/path/to/mxfp4_w4a16.json \
+bash experimental/lite/examples/verl/scripts/run_qwen3moe_mxfp4_qat.sh \
+  --mode qat_on
+```
+
+Modes are `baseline`, `qat_off`, `qat_on`, and `r3`. The `qat_off` and
+`qat_on` arms deliberately keep rollout MXFP4 identical and change only
+training-side `impl_cfg.qat.enabled`. This recipe uses vLLM
+compressed-tensors plus `verl.utils.qat.vllm_patch`, with paired
+`actor.engine.qat` export and `rollout.qat` configuration. See
+[QAT.md](QAT.md) for the exact arm semantics, validation scope, safe
+exclusions, and required MXFP4 JSON schema.
+
 ## Smoke / Dry-Run Checks
 
 Checked on this branch on 2026-06-07. These checks cover shell syntax,
@@ -172,6 +197,7 @@ cover end-to-end SFT or GRPO training.
   - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_sft.sh`
   - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_gsm8k_sft.sh`
   - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_gsm8k_grpo.sh`
+  - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_mxfp4_qat.sh`
 - Python import compilation:
   - `PYTHONPYCACHEPREFIX="$(mktemp -d)" python3 -m compileall -q experimental/lite/examples/verl/verl_mlite`
 - GSM8K SFT dry run:
