@@ -58,6 +58,8 @@ run_arm() {
     --impl-cfg-json "${impl_cfg}" \
     --steps "${CORRECTNESS_STEPS:-3}" \
     --warmup 0 \
+    --num-microbatches "${CORRECTNESS_NUM_MICROBATCHES:-1}" \
+    --seq-len "${CORRECTNESS_SEQ_LEN:-${SEQ_LEN:-1024}}" \
     --output-json "${OUTPUT_DIR}/qwen3_chunked_ep_${arm}_correctness.json" \
     2>&1 | tee "${OUTPUT_DIR}/qwen3_chunked_ep_${arm}_correctness.log"
 }
