@@ -33,7 +33,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-from megatron.lite.model.protocol_utils import (
+from megatron.lite.primitive.quantization.qat import (
     canonical_state_key as _canonical_state_key,
 )
 from megatron.lite.primitive.ckpt.hf_weights import (

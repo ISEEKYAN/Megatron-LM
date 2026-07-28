@@ -593,7 +593,7 @@ def test_every_model_uses_shared_canonical_state_key(
     transformer_engine_import_stub,
     monkeypatch,
 ):
-    from megatron.lite.model.protocol_utils import canonical_state_key
+    from megatron.lite.primitive.quantization.qat import canonical_state_key
 
     _protocol(model_name, transformer_engine_import_stub, monkeypatch)
     checkpoint = importlib.import_module(

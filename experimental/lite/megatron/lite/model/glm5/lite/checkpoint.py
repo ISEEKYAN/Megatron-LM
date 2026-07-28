@@ -28,7 +28,7 @@ import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
 from megatron.lite.model.glm5.config import Glm5Config
-from megatron.lite.model.protocol_utils import (
+from megatron.lite.primitive.quantization.qat import (
     canonical_state_key as _canonical_state_key,
 )
 from megatron.lite.primitive.ckpt.hf_weights import (

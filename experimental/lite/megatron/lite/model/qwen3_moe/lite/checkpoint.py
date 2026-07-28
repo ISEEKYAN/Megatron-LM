@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.model.protocol_utils import (
+from megatron.lite.primitive.quantization.qat import (
     canonical_state_key as _canonical_state_key,
 )
 from megatron.lite.primitive.ckpt.dcp import (  # noqa: F401 — re-export

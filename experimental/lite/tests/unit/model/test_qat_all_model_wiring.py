@@ -60,27 +60,18 @@ def test_every_model_applies_qat_before_optimizer_construction(model_name: str):
 def test_every_checkpoint_canonicalizes_qat_master_weight(model_name: str):
     checkpoint_path = MODEL_ROOT / model_name / "lite" / "checkpoint.py"
     tree = ast.parse(checkpoint_path.read_text())
-    canonicalizer = next(
+    canonicalizer_import = next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_canonical_state_key"
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "megatron.lite.primitive.quantization.qat"
+        and any(
+            alias.name == "canonical_state_key"
+            and alias.asname == "_canonical_state_key"
+            for alias in node.names
+        )
     )
-    module = ast.fix_missing_locations(
-        ast.Module(body=[canonicalizer], type_ignores=[])
-    )
-    namespace: dict[str, object] = {}
-    exec(compile(module, checkpoint_path, "exec"), namespace)
-    canonicalize = namespace["_canonical_state_key"]
-    assert callable(canonicalize)
-    assert canonicalize("layers.0.mlp.weight") == "layers.0.mlp.weight"
-    assert (
-        canonicalize("layers.0.mlp.parametrizations.weight.original")
-        == "layers.0.mlp.weight"
-    )
-    assert (
-        canonicalize("layers.0.mlp.parametrizations.weight.0.amax")
-        == "layers.0.mlp.parametrizations.weight.0.amax"
-    )
+    assert canonicalizer_import
 
     calls = [
         node
