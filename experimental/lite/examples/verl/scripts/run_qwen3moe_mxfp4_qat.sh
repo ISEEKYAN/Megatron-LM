@@ -35,7 +35,7 @@ qat_overrides_for_mode() {
             QAT_OVERRIDES+=(
                 "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
                 "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
-                "actor_rollout_ref.actor.engine.impl_cfg.router_replay.enabled=false"
+                "actor_rollout_ref.actor.engine.router_replay_mode=disabled"
                 "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
             )
             ;;
@@ -45,7 +45,7 @@ qat_overrides_for_mode() {
                 "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
                 "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
                 "actor_rollout_ref.rollout.quantization=mxfp4"
-                "actor_rollout_ref.actor.engine.impl_cfg.router_replay.enabled=false"
+                "actor_rollout_ref.actor.engine.router_replay_mode=disabled"
                 "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
             )
             ;;
@@ -55,7 +55,7 @@ qat_overrides_for_mode() {
                 "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
                 "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
                 "actor_rollout_ref.rollout.quantization=mxfp4"
-                "actor_rollout_ref.actor.engine.impl_cfg.router_replay.enabled=false"
+                "actor_rollout_ref.actor.engine.router_replay_mode=disabled"
                 "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
             )
             ;;
@@ -65,7 +65,7 @@ qat_overrides_for_mode() {
                 "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
                 "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
                 "actor_rollout_ref.rollout.quantization=mxfp4"
-                "actor_rollout_ref.actor.engine.impl_cfg.router_replay.enabled=true"
+                "actor_rollout_ref.actor.engine.router_replay_mode=R3"
                 "actor_rollout_ref.rollout.enable_rollout_routing_replay=true"
             )
             ;;
@@ -133,11 +133,11 @@ COMMON_OVERRIDES=(
     "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PPO_MICRO_BATCH_SIZE}"
     "actor_rollout_ref.actor.optim.lr=1e-5"
     "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384"
-    "actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1"
-    "actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${ACTOR_TP}"
-    "actor_rollout_ref.actor.megatron.expert_model_parallel_size=${ACTOR_EP}"
-    "actor_rollout_ref.actor.megatron.context_parallel_size=${ACTOR_CP}"
-    "actor_rollout_ref.actor.engine.impl_cfg.recompute=full"
+    "actor_rollout_ref.actor.engine.pp=1"
+    "actor_rollout_ref.actor.engine.tp=${ACTOR_TP}"
+    "actor_rollout_ref.actor.engine.ep=${ACTOR_EP}"
+    "actor_rollout_ref.actor.engine.cp=${ACTOR_CP}"
+    "+actor_rollout_ref.actor.engine.impl_cfg.recompute=full"
     "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}"
     "actor_rollout_ref.rollout.n=${N_RESPONSES}"
     "actor_rollout_ref.rollout.gpu_memory_utilization=0.6"
