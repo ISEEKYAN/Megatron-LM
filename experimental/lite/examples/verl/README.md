@@ -164,6 +164,10 @@ By default, GSM8K GRPO artifacts are written under
 
 ### FP4 QAT rollout resync
 
+For the complete `QATSpec` field reference, supported-format table,
+optimizer/checkpoint ordering contract, packed snapshot layout, and a runnable
+CPU MXFP4 example, see [QAT.md](QAT.md).
+
 The MLite engine can pass its BF16 HF-format weight stream through verl's
 online QAT exporter before vLLM resync. Keep the rollout quantization config
 fixed between the QAT-off and QAT-on arms; only the training-side
