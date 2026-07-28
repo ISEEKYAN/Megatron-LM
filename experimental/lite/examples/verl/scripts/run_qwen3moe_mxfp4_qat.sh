@@ -22,6 +22,56 @@
 
 set -euo pipefail
 
+# This is the complete MXFP4 QAT delta for any verl launcher: copy this block
+# into an existing GRPO/DAPO script; every other setting is ordinary training
+# configuration. qat_off and qat_on must have byte-identical rollout settings;
+# their sole QAT difference is impl_cfg.qat.enabled.
+qat_overrides_for_mode() {
+    local mode="$1"
+    QAT_OVERRIDES=()
+    case "$mode" in
+        baseline)
+            # BF16 training + BF16 rollout: the unquantized reference.
+            QAT_OVERRIDES+=(
+                "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
+                "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+                "actor_rollout_ref.actor.engine.impl_cfg.router_replay.enabled=false"
+                "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
+            )
+            ;;
+        qat_off)
+            # MXFP4 rollout without fake quant: measures training/rollout mismatch.
+            QAT_OVERRIDES+=(
+                "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
+                "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+                "actor_rollout_ref.rollout.quantization=mxfp4"
+                "actor_rollout_ref.actor.engine.impl_cfg.router_replay.enabled=false"
+                "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
+            )
+            ;;
+        qat_on)
+            # MXFP4 rollout plus training-side MXFP4 fake quantization.
+            QAT_OVERRIDES+=(
+                "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
+                "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+                "actor_rollout_ref.rollout.quantization=mxfp4"
+                "actor_rollout_ref.actor.engine.impl_cfg.router_replay.enabled=false"
+                "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
+            )
+            ;;
+        r3)
+            # qat_on plus router replay.
+            QAT_OVERRIDES+=(
+                "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
+                "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+                "actor_rollout_ref.rollout.quantization=mxfp4"
+                "actor_rollout_ref.actor.engine.impl_cfg.router_replay.enabled=true"
+                "actor_rollout_ref.rollout.enable_rollout_routing_replay=true"
+            )
+            ;;
+    esac
+}
+
 MODE="${MODE:-qat_on}"
 if [[ "${1:-}" == --mode=* ]]; then
     MODE="${1#--mode=}"
@@ -42,6 +92,7 @@ case "$MODE" in
         exit 2
         ;;
 esac
+qat_overrides_for_mode "$MODE"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BASE_LAUNCHER="${BASE_LAUNCHER:-${SCRIPT_DIR}/run_qwen3moe_gsm8k_grpo.sh}"
@@ -87,7 +138,6 @@ COMMON_OVERRIDES=(
     "actor_rollout_ref.actor.megatron.expert_model_parallel_size=${ACTOR_EP}"
     "actor_rollout_ref.actor.megatron.context_parallel_size=${ACTOR_CP}"
     "actor_rollout_ref.actor.engine.impl_cfg.recompute=full"
-    "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
     "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}"
     "actor_rollout_ref.rollout.n=${N_RESPONSES}"
     "actor_rollout_ref.rollout.gpu_memory_utilization=0.6"
@@ -107,39 +157,7 @@ COMMON_OVERRIDES=(
     "trainer.default_local_dir=${OUTPUT_ROOT}/${MODE}"
 )
 
-ARM_OVERRIDES=(
-    "actor_rollout_ref.actor.engine.impl_cfg.router_replay.enabled=false"
-    "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
-)
-case "$MODE" in
-    baseline)
-        ARM_OVERRIDES+=(
-            "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
-        )
-        ;;
-    qat_off)
-        ARM_OVERRIDES+=(
-            "actor_rollout_ref.rollout.quantization=mxfp4"
-            "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
-        )
-        ;;
-    qat_on)
-        ARM_OVERRIDES+=(
-            "actor_rollout_ref.rollout.quantization=mxfp4"
-            "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
-        )
-        ;;
-    r3)
-        ARM_OVERRIDES=(
-            "actor_rollout_ref.rollout.quantization=mxfp4"
-            "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
-            "actor_rollout_ref.actor.engine.impl_cfg.router_replay.enabled=true"
-            "actor_rollout_ref.rollout.enable_rollout_routing_replay=true"
-        )
-        ;;
-esac
-
-COMMAND=(bash "$BASE_LAUNCHER" "${COMMON_OVERRIDES[@]}" "${ARM_OVERRIDES[@]}" "$@")
+COMMAND=(bash "$BASE_LAUNCHER" "${COMMON_OVERRIDES[@]}" "${QAT_OVERRIDES[@]}" "$@")
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
     printf '%q ' "${COMMAND[@]}"
     printf '\n'
