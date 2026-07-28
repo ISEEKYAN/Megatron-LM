@@ -803,6 +803,9 @@ class MegatronLiteEngine(BaseEngine):
                 "MegatronLiteEngine supports only nested no-padding THD batches."
             )
         loss_mask = self._loss_mask_for_packing(micro_batch, input_ids)
+        r3_replay_mask = None
+        if self.engine_config.router_replay_mode == "R3":
+            r3_replay_mask = self._r3_replay_mask_for_packing(micro_batch, input_ids)
         routed_experts = micro_batch.get("routed_experts", None)
         if routed_experts is not None and not getattr(routed_experts, "is_nested", False):
             raise ValueError(
@@ -815,6 +818,9 @@ class MegatronLiteEngine(BaseEngine):
             loss_mask=None if loss_mask is None else loss_mask.values().contiguous().float(),
             seq_lens=input_ids.offsets().diff().to(dtype=torch.int64),
             routed_experts=routed_experts,
+            r3_replay_mask=(
+                None if r3_replay_mask is None else r3_replay_mask.values().contiguous()
+            ),
         )
 
     def _make_runtime_loss_context(
@@ -884,6 +890,15 @@ class MegatronLiteEngine(BaseEngine):
                 full_mask[-response_tokens:] = row_mask[:response_tokens]
             rows.append(full_mask)
         return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+    @staticmethod
+    def _r3_replay_mask_for_packing(
+        micro_batch: TensorDict, input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Reuse VERL's canonical R3 semantics while inputs are still jagged."""
+        from verl.utils.megatron.router_replay_utils import build_r3_replay_mask
+
+        return build_r3_replay_mask(input_ids, micro_batch["response_mask"])
 
     def _build_verl_model_output(
         self,
