@@ -8,7 +8,13 @@ grad_offload: false
 forward_only: false
 dtype: bfloat16
 export_dtype: bfloat16
-qat: {}
+# verl-owned online exporter schema. See ../../../../QAT.md for an enabled example.
+qat:
+  enable: false  # Enable verl export_qat_weights during vLLM resync.
+  apply_modelopt_fake_quant: false  # Keep false when MLite supplies training fake quant.
+  mode: mxfp4  # Export format understood by verl (for example, mxfp4).
+  group_size: 32  # Quantization group width; MXFP4 uses 32.
+  ignore_patterns: []  # Module-name strings or "re:" regular expressions to skip.
 resync_format: null
 resync_config: {}
 router_replay_mode: disabled
@@ -28,3 +34,12 @@ attention_backend_override: flash
 router_aux_loss_coef: null
 impl_cfg:
   use_thd: true
+  # MLite-owned training QAT schema. See ../../../../QAT.md for an enabled example.
+  qat:
+    enabled: false  # Opt in to MLite fake-quant parametrizations.
+    format: mxfp4  # int8, int4, fp8_e4m3, or mxfp4.
+    group_size: 32  # Quantization group width; MXFP4 uses 32.
+    symmetric: true  # Use symmetric scales where the selected format supports them.
+    ste_clip: true  # Mask STE gradients outside the representable range.
+    ignore_patterns: []  # Module-name strings or "re:" regular expressions to skip.
+    export_mode: fake  # "fake" for training state; "packed" for deployment snapshots.
