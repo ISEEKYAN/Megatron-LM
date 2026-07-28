@@ -52,6 +52,16 @@ _QUANTIZED_RESYNC_TARGETS = {
 }
 
 
+def _canonical_state_key(key: str) -> str:
+    """Map a parametrized QAT master back to its logical checkpoint name."""
+    marker = ".parametrizations."
+    if marker not in key or not key.endswith(".original"):
+        return key
+    head, rest = key.split(marker, 1)
+    attr = rest.split(".", 1)[0]
+    return f"{head}.{attr}"
+
+
 def EXPERT_CLASSIFIER(name: str) -> bool:
     return ".experts." in name and ".shared_experts." not in name
 
@@ -147,7 +157,9 @@ def _map_block_attr(attr: str, block: str) -> str | tuple[str, ...] | None:
     return None
 
 
-def _global_expert_idx_from_local(local_idx: int, config: DeepseekV4Config, ps: ParallelState) -> int:
+def _global_expert_idx_from_local(
+    local_idx: int, config: DeepseekV4Config, ps: ParallelState
+) -> int:
     num_local = ensure_divisible(config.n_routed_experts, ps.ep_size)
     return ps.ep_rank * num_local + local_idx
 
@@ -389,7 +401,9 @@ def load_hf_weights(
     mapping (identity at PP=1); else a non-first stage reads the wrong layer.
     """
     if (ps.tp_size, ps.etp_size) != (1, 1):
-        raise NotImplementedError("DeepSeek V4 direct HF load currently supports only TP=ETP=1.")
+        raise NotImplementedError(
+            "DeepSeek V4 direct HF load currently supports only TP=ETP=1."
+        )
 
     base_model = unwrap_model(model)
     state = base_model.state_dict()
@@ -407,7 +421,8 @@ def load_hf_weights(
         for name, target in state.items():
             if _is_native_metadata_key(name):
                 continue
-            global_name = to_global_layer_name(name, layer_map)
+            logical_name = _canonical_state_key(name)
+            global_name = to_global_layer_name(logical_name, layer_map)
             hf_names = _hf_names_for_state_key(
                 _to_global_expert_name(global_name, config, ps), config
             )
@@ -437,7 +452,9 @@ def load_hf_weights(
         log_rank0(f"WARNING: DeepSeek V4 checkpoint tensor missing: {name}")
 
 
-def _to_global_expert_name(name: str, config: DeepseekV4Config, ps: ParallelState) -> str:
+def _to_global_expert_name(
+    name: str, config: DeepseekV4Config, ps: ParallelState
+) -> str:
     """Rewrite an EP-local expert ``weight<local>`` suffix to its global id.
 
     The native ``state_dict`` carries the EP-local expert index; the HF target
@@ -478,7 +495,9 @@ class DeepseekV4WeightSpec:
     def weight_map(self) -> dict[str, list[str]]:
         return {}
 
-    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
+    def hf_to_native(
+        self, native_name: str, hf_tensors: list[torch.Tensor]
+    ) -> torch.Tensor:
         del native_name
         return hf_tensors[0]
 
@@ -500,7 +519,9 @@ class DeepseekV4WeightSpec:
                 (hf_names[0], first.contiguous()),
                 (hf_names[1], second.contiguous()),
             ]
-        raise AssertionError(f"Unexpected HF name fan-out for {native_name}: {hf_names}")
+        raise AssertionError(
+            f"Unexpected HF name fan-out for {native_name}: {hf_names}"
+        )
 
     def qkv_spec(self, native_name: str) -> tuple[int, int, int] | None:
         del native_name
@@ -539,7 +560,9 @@ class DeepseekV4WeightSpec:
         return f"{prefix}.weight{local_idx}"
 
 
-def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
+def _export_unquantized_weights(
+    model, config: DeepseekV4Config, ps: ParallelState, **kwargs
+):
     """Export gathered DS4 BF16 weights and persistent router buffers.
 
     Identical structure to kimi/glm5: delegate to the shared ``_export`` (which
@@ -562,7 +585,10 @@ def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelSta
     for chunk in chunks:
         base_chunk = unwrap_model(chunk)
         layer_map = (
-            {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
+            {
+                i: base_chunk.layer_indices[i]
+                for i in range(len(base_chunk.layer_indices))
+            }
             if hasattr(base_chunk, "layer_indices")
             else {}
         )
@@ -599,10 +625,14 @@ def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelSta
         is_source = src_pp == ps.pp_rank
         if is_source:
             stage_buffers = [
-                (name, tensor.to(bcast_device).contiguous()) for name, tensor in local_buffers
+                (name, tensor.to(bcast_device).contiguous())
+                for name, tensor in local_buffers
             ]
             header = [
-                [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in stage_buffers]
+                [
+                    (name, tuple(tensor.shape), tensor.dtype)
+                    for name, tensor in stage_buffers
+                ]
             ]
         else:
             stage_buffers = []
@@ -656,7 +686,9 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
         yield from weights
 
 
-def save_hf_weights(model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs) -> None:
+def save_hf_weights(
+    model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs
+) -> None:
     """Export + write sharded safetensors via ``stream_export_to_shards``."""
     from megatron.lite.primitive.ckpt.hf_weights import stream_export_to_shards
 

@@ -30,13 +30,19 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     pack_thd_forward_kwargs,
+    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
 from megatron.lite.model.qwen3_moe.common import is_expert_param
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
-from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
+from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+    EXPERT_CLASSIFIER,
+    PLACEMENT_FN,
+)
+from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+    load_hf_weights as _load_hf_weights_impl,
+)
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.lora import (
@@ -46,7 +52,11 @@ from megatron.lite.primitive.modules.lora import (
     trainable_param_stats,
 )
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
-from megatron.lite.primitive.quantization import QATSpec, apply_qat_to_chunks, normalize_qat_spec
+from megatron.lite.primitive.quantization import (
+    QATSpec,
+    apply_qat_to_chunks,
+    normalize_qat_spec,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
@@ -139,7 +149,9 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
 
 def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
     labels = batch.labels.reshape(1, -1) if batch.labels is not None else None
-    return model(input_ids=batch.input_ids.reshape(1, -1), labels=labels, packed_seq_params=None)
+    return model(
+        input_ids=batch.input_ids.reshape(1, -1), labels=labels, packed_seq_params=None
+    )
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
@@ -165,7 +177,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
     if mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
-            raise ValueError("mtp_enable=True but HF config has no num_nextn_predict_layers.")
+            raise ValueError(
+                "mtp_enable=True but HF config has no num_nextn_predict_layers."
+            )
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
         if impl_cfg.mtp_use_repeated_layer is not None:
             model_cfg.mtp_use_repeated_layer = impl_cfg.mtp_use_repeated_layer
@@ -192,12 +206,16 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
     vpp = None if p.vpp == 1 else p.vpp
     if vpp is None:
-        chunks = [Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
+        chunks = [
+            Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()
+        ]
     else:
         chunks = []
         for i in range(vpp):
             chunks.append(
-                Qwen3MoEModel(model_cfg, ps, vpp=vpp, vpp_chunk_id=i, **model_kwargs).to(torch.bfloat16).cuda()
+                Qwen3MoEModel(model_cfg, ps, vpp=vpp, vpp_chunk_id=i, **model_kwargs)
+                .to(torch.bfloat16)
+                .cuda()
             )
 
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
@@ -246,14 +264,18 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         )
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
 
-        attach_model_sharded_state_dict(chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param)
+        attach_model_sharded_state_dict(
+            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
+        )
         optimizer_backend = "dist_opt"
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 
         def _post_model_load_hook():
             from megatron.lite.model.qwen3_moe.lite.model import TransformerLayer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(
@@ -307,16 +329,22 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 # ---------------------------------------------------------------------------
 
 
-def load_hf_weights(chunk: nn.Module, hf_path: str, model_cfg: Qwen3MoEConfig, ps: ParallelState) -> None:
+def load_hf_weights(
+    chunk: nn.Module, hf_path: str, model_cfg: Qwen3MoEConfig, ps: ParallelState
+) -> None:
     """Load HF pretrained weights into model chunk."""
     if not hf_path:
         return
     _load_hf_weights_impl(chunk, hf_path, model_cfg, ps)
 
 
-def export_hf_weights(chunks: list[nn.Module], model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs):
+def export_hf_weights(
+    chunks: list[nn.Module], model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs
+):
     """Export HF weights from model chunks."""
-    from megatron.lite.model.qwen3_moe.lite.checkpoint import export_hf_weights as _export
+    from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+        export_hf_weights as _export,
+    )
 
     for chunk in chunks:
         yield from _export(chunk, model_cfg, ps, **kwargs)

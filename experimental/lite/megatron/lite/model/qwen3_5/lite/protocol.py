@@ -14,16 +14,28 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     pack_thd_forward_kwargs,
+    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
-from megatron.lite.model.qwen3_5.lite.checkpoint import export_hf_weights as _export_hf_weights_impl
-from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
-from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
+from megatron.lite.model.qwen3_5.lite.checkpoint import (
+    export_hf_weights as _export_hf_weights_impl,
+)
+from megatron.lite.model.qwen3_5.lite.checkpoint import (
+    load_hf_weights as _load_hf_weights_impl,
+)
+from megatron.lite.model.qwen3_5.lite.checkpoint import (
+    save_hf_weights as _save_hf_weights_impl,
+)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
+from megatron.lite.primitive.quantization import (
+    QATSpec,
+    apply_qat_to_chunks,
+    normalize_qat_spec,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
@@ -72,6 +84,7 @@ class ImplConfig:
     # all heads, best memory; bf16-floor vs CP-off, faithful packing-aware mirror of
     # upstream Megatron linear_cp_mode='chunkwise').
     gdn_cp_mode: str = "headwise"
+    qat: QATSpec | dict | None = None
 
 
 def _full_attn_module(layer, name: str):
@@ -118,7 +131,11 @@ def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
     """
     input_ids = batch.input_ids.reshape(1, -1)
     labels = batch.labels.reshape(1, -1) if batch.labels is not None else None
-    kwargs: dict[str, Any] = {"input_ids": input_ids, "labels": labels, "packed_seq_params": None}
+    kwargs: dict[str, Any] = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "packed_seq_params": None,
+    }
     add_cross_entropy_fusion(kwargs, model)
     return model(**kwargs)
 
@@ -171,7 +188,9 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
     if mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
-            raise ValueError("mtp_enable=True but HF config has no num_nextn_predict_layers.")
+            raise ValueError(
+                "mtp_enable=True but HF config has no num_nextn_predict_layers."
+            )
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
         if impl_cfg.mtp_use_repeated_layer is not None:
             model_cfg.mtp_use_repeated_layer = impl_cfg.mtp_use_repeated_layer
@@ -182,7 +201,11 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     vpp = None if p.vpp == 1 else p.vpp
     deterministic = impl_cfg.deterministic
-    if impl_cfg.use_thd and deterministic and "linear_attention" in model_cfg.layer_types:
+    if (
+        impl_cfg.use_thd
+        and deterministic
+        and "linear_attention" in model_cfg.layer_types
+    ):
         deterministic = False
     train_cfg = SimpleNamespace(
         tp=ps.tp_size,
@@ -209,7 +232,11 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     )
 
     if vpp is None:
-        chunks = [Qwen35Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
+        chunks = [
+            Qwen35Model(model_cfg, train_cfg, ps, **model_kwargs)
+            .to(torch.bfloat16)
+            .cuda()
+        ]
     else:
         chunks = [
             Qwen35Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **model_kwargs)
@@ -237,12 +264,17 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         for chunk in chunks:
             apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
 
+    # Parametrize before optimizer construction so it captures the BF16 master.
+    apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
+
     optimizer = None
     finalize_grads = None
     post_model_load_hook = None
     optimizer_backend = "none"
     if impl_cfg.optimizer == "dist_opt":
-        optimizer, finalize_grads = _build_dist_opt_optimizer(chunks, model_cfg, impl_cfg, ps)
+        optimizer, finalize_grads = _build_dist_opt_optimizer(
+            chunks, model_cfg, impl_cfg, ps
+        )
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
@@ -256,7 +288,9 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
         def _post_model_load_hook():
             from megatron.lite.model.qwen3_5.lite.model import Qwen35Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(

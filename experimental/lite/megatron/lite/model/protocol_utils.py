@@ -33,6 +33,21 @@ def _parallel_state(model) -> ParallelState:
     return parallel_state_from_model(model) or ParallelState()
 
 
+def router_replay_roots(chunk) -> list:
+    """Select decoder layers for R3, excluding MTP-only routers.
+
+    Rollout route tensors have one layer-axis entry per decoder router.  MTP
+    layers run only on the training side and therefore must keep their native
+    routing instead of consuming entries from that rollout-owned axis.
+    """
+    model = getattr(chunk, "model", chunk)
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        return [chunk]
+    values = getattr(layers, "values", None)
+    return list(values()) if callable(values) else list(layers)
+
+
 def nested_from_packed(tensor: torch.Tensor | None, seq_lens: torch.Tensor):
     """Split a 1-D packed (true, unpadded) tensor back into a jagged nested tensor."""
     if tensor is None:

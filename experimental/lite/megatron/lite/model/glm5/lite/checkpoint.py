@@ -42,7 +42,11 @@ def EXPERT_CLASSIFIER(name: str) -> bool:
 
 
 def PLACEMENT_FN(param_name: str) -> list:
-    if "experts" in param_name and "router" not in param_name and "shared" not in param_name:
+    if (
+        "experts" in param_name
+        and "router" not in param_name
+        and "shared" not in param_name
+    ):
         if "fc1" in param_name:
             return [Replicate(), Replicate(), Shard(0), Shard(0)]
         if "fc2" in param_name:
@@ -83,7 +87,9 @@ def _has(reader: SafeTensorReader, name: str) -> bool:
     return True
 
 
-def _dequant_fp8_weight(reader: SafeTensorReader, name: str, weight: torch.Tensor) -> torch.Tensor:
+def _dequant_fp8_weight(
+    reader: SafeTensorReader, name: str, weight: torch.Tensor
+) -> torch.Tensor:
     scale_name = f"{name}_scale_inv"
     if weight.dim() != 2 or weight.element_size() != 1 or not _has(reader, scale_name):
         return weight
@@ -96,11 +102,15 @@ def _dequant_fp8_weight(reader: SafeTensorReader, name: str, weight: torch.Tenso
 
 def _unpack_int4_from_int32(packed: torch.Tensor, shape: torch.Size) -> torch.Tensor:
     if packed.dtype != torch.int32:
-        raise ValueError(f"Expected packed int4 tensor to be int32, got {packed.dtype}.")
+        raise ValueError(
+            f"Expected packed int4 tensor to be int32, got {packed.dtype}."
+        )
     pack_factor = 8
     mask = 0xF
     rows, cols = int(shape[0]), int(shape[1])
-    unpacked = torch.empty((packed.shape[0], packed.shape[1] * pack_factor), dtype=torch.int32)
+    unpacked = torch.empty(
+        (packed.shape[0], packed.shape[1] * pack_factor), dtype=torch.int32
+    )
     for offset in range(pack_factor):
         unpacked[:, offset::pack_factor] = (packed >> (4 * offset)) & mask
     return (unpacked[:rows, :cols] - 8).to(torch.int8)
@@ -130,9 +140,9 @@ def _dequant_int4_weight(reader: SafeTensorReader, name: str) -> torch.Tensor:
         )
 
     group_size = unpacked.shape[1] // scale.shape[1]
-    return (unpacked.unflatten(-1, (scale.shape[1], group_size)) * scale.unsqueeze(-1)).flatten(
-        start_dim=-2
-    )
+    return (
+        unpacked.unflatten(-1, (scale.shape[1], group_size)) * scale.unsqueeze(-1)
+    ).flatten(start_dim=-2)
 
 
 def _get(reader: SafeTensorReader, name: str) -> torch.Tensor:
@@ -189,10 +199,16 @@ def _load_attention(
     # `<hf_prefix>.{...}` (DSA submodule names map 1:1 to the HF model).
     ap = f"{local_prefix}.self_attention.self_attention"
     out[f"{ap}.q_a_proj.weight"] = _get(reader, f"{hf_prefix}.q_a_proj.weight")
-    out[f"{ap}.q_a_layernorm.weight"] = _get(reader, f"{hf_prefix}.q_a_layernorm.weight")
+    out[f"{ap}.q_a_layernorm.weight"] = _get(
+        reader, f"{hf_prefix}.q_a_layernorm.weight"
+    )
     out[f"{ap}.q_b_proj.weight"] = _get(reader, f"{hf_prefix}.q_b_proj.weight")
-    out[f"{ap}.kv_a_proj_with_mqa.weight"] = _get(reader, f"{hf_prefix}.kv_a_proj_with_mqa.weight")
-    out[f"{ap}.kv_a_layernorm.weight"] = _get(reader, f"{hf_prefix}.kv_a_layernorm.weight")
+    out[f"{ap}.kv_a_proj_with_mqa.weight"] = _get(
+        reader, f"{hf_prefix}.kv_a_proj_with_mqa.weight"
+    )
+    out[f"{ap}.kv_a_layernorm.weight"] = _get(
+        reader, f"{hf_prefix}.kv_a_layernorm.weight"
+    )
     out[f"{ap}.kv_b_proj.weight"] = _get(reader, f"{hf_prefix}.kv_b_proj.weight")
     out[f"{ap}.o_proj.weight"] = _get(reader, f"{hf_prefix}.o_proj.weight")
     # GLM5.2 shared IndexShare layers do not instantiate a local indexer and
@@ -253,7 +269,9 @@ def _load_shared_expert(
     ps: ParallelState,
 ) -> None:
     prefixes = [f"{hf_mlp_prefix}.shared_experts", f"{hf_mlp_prefix}.shared_expert"]
-    shared = next(prefix for prefix in prefixes if _has(reader, f"{prefix}.down_proj.weight"))
+    shared = next(
+        prefix for prefix in prefixes if _has(reader, f"{prefix}.down_proj.weight")
+    )
     gate_up = torch.cat(
         [
             _get(reader, f"{shared}.gate_proj.weight"),
@@ -303,14 +321,25 @@ def _load_experts(
         out[f"{local_prefix}.moe.experts.fc2.weight{local_idx}"] = fc2
 
 
+def _canonical_state_key(key: str) -> str:
+    """Map a parametrized QAT master back to its logical checkpoint name."""
+    marker = ".parametrizations."
+    if marker not in key or not key.endswith(".original"):
+        return key
+    head, rest = key.split(marker, 1)
+    attr = rest.split(".", 1)[0]
+    return f"{head}.{attr}"
+
+
 def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> None:
     state = model.state_dict()
+    canonical = {_canonical_state_key(key): key for key in state}
     resolved: dict[str, torch.Tensor] = {}
     for name, tensor in loaded.items():
-        actual = name if name in state else None
+        actual = name if name in state else canonical.get(name)
         if actual is None:
-            for key in state:
-                if name in key:
+            for logical, key in canonical.items():
+                if name in logical:
                     actual = key
                     break
         if actual is not None:
@@ -329,7 +358,9 @@ def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> Non
         if name not in resolved:
             continue
         tensor = resolved[name].to(device=target.device)
-        target.data.copy_(tensor.to(dtype=target.dtype) if target.is_floating_point() else tensor)
+        target.data.copy_(
+            tensor.to(dtype=target.dtype) if target.is_floating_point() else tensor
+        )
 
 
 class Glm5WeightSpec:
@@ -345,7 +376,9 @@ class Glm5WeightSpec:
     def weight_map(self) -> dict[str, list[str]]:
         return {}
 
-    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
+    def hf_to_native(
+        self, native_name: str, hf_tensors: list[torch.Tensor]
+    ) -> torch.Tensor:
         del native_name
         return hf_tensors[0]
 
@@ -468,7 +501,10 @@ class Glm5WeightSpec:
 
     def tp_spec(self, native_name: str) -> tuple[int, int] | None:
         # GLM-5 is TP=1 (DSA not TP-capable); only EP / ETP shard tensors.
-        if native_name.startswith("mtp.layers.") and ".transformer_layer." in native_name:
+        if (
+            native_name.startswith("mtp.layers.")
+            and ".transformer_layer." in native_name
+        ):
             proxy = native_name.replace(".transformer_layer.", ".")
             return self.tp_spec(proxy)
         if native_name.endswith(".eh_proj.linear.weight"):
@@ -504,7 +540,9 @@ class Glm5WeightSpec:
         return f"{prefix}.weight{local_idx}"
 
 
-def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: ParallelState) -> None:
+def load_hf_weights(
+    model: nn.Module, path: str, config: Glm5Config, ps: ParallelState
+) -> None:
     base_model = unwrap_model(model)
     reader = SafeTensorReader(path)
     out: dict[str, torch.Tensor] = {}
@@ -532,7 +570,9 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
     for local_idx, global_idx in enumerate(base_model.layer_indices):
         lp = f"layers.{local_idx}"
         hp = f"{prefix}.layers.{global_idx}"
-        out[f"{lp}.input_layernorm.weight"] = _get(reader, f"{hp}.input_layernorm.weight")
+        out[f"{lp}.input_layernorm.weight"] = _get(
+            reader, f"{hp}.input_layernorm.weight"
+        )
         _load_attention(
             out,
             local_prefix=lp,
@@ -542,7 +582,9 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
             load_indexer=config.builds_dsa_indexer(global_idx),
         )
         if config.is_moe_layer(global_idx):
-            out[f"{lp}.mlp_norm.weight"] = _get(reader, f"{hp}.post_attention_layernorm.weight")
+            out[f"{lp}.mlp_norm.weight"] = _get(
+                reader, f"{hp}.post_attention_layernorm.weight"
+            )
             out[f"{lp}.moe.router.gate.weight"] = _get(reader, f"{hp}.mlp.gate.weight")
             bias_name = f"{hp}.mlp.gate.e_score_correction_bias"
             if _has(reader, bias_name):
@@ -589,7 +631,9 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
                 else f"{hp}.final_layernorm.weight"
             )
             out[f"{lp}.final_layernorm.weight"] = _get(reader, final_norm)
-            out[f"{tlp}.input_layernorm.weight"] = _get(reader, f"{hp}.input_layernorm.weight")
+            out[f"{tlp}.input_layernorm.weight"] = _get(
+                reader, f"{hp}.input_layernorm.weight"
+            )
             _load_attention(
                 out,
                 local_prefix=tlp,
@@ -602,10 +646,14 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
                 out[f"{tlp}.mlp_norm.weight"] = _get(
                     reader, f"{hp}.post_attention_layernorm.weight"
                 )
-                out[f"{tlp}.moe.router.gate.weight"] = _get(reader, f"{hp}.mlp.gate.weight")
+                out[f"{tlp}.moe.router.gate.weight"] = _get(
+                    reader, f"{hp}.mlp.gate.weight"
+                )
                 bias_name = f"{hp}.mlp.gate.e_score_correction_bias"
                 if _has(reader, bias_name):
-                    out[f"{tlp}.moe.router.expert_bias"] = _get(reader, bias_name).float()
+                    out[f"{tlp}.moe.router.expert_bias"] = _get(
+                        reader, bias_name
+                    ).float()
                 _load_shared_expert(
                     out,
                     local_prefix=tlp,
@@ -643,7 +691,9 @@ def export_hf_weights(model, config: Glm5Config, ps: ParallelState, **kwargs):
     yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
 
 
-def save_hf_weights(model, path: str, config: Glm5Config, ps: ParallelState, **kwargs) -> None:
+def save_hf_weights(
+    model, path: str, config: Glm5Config, ps: ParallelState, **kwargs
+) -> None:
     """Export + write sharded safetensors via ``stream_export_to_shards``."""
     from megatron.lite.primitive.ckpt.hf_weights import stream_export_to_shards
 

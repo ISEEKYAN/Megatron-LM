@@ -28,6 +28,7 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     nested_from_packed,
+    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
 )
 from megatron.lite.primitive.bundle import ModelBundle
@@ -40,6 +41,11 @@ from megatron.lite.primitive.parallel.thd import (
     unpack_thd_to_nested,
 )
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
+from megatron.lite.primitive.quantization import (
+    QATSpec,
+    apply_qat_to_chunks,
+    normalize_qat_spec,
+)
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
@@ -113,6 +119,7 @@ class ImplConfig:
     mtp_detach_encoder: bool = False
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
+    qat: QATSpec | dict | None = None
 
     def __post_init__(self) -> None:
         if self.dsa_cp_mode not in {"native", "legacy_gather_all"}:
@@ -325,6 +332,9 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
 
         for chunk in chunks:
             apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
+
+    # Parametrize before optimizer construction so it captures the BF16 master.
+    apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
 
     optimizer = None
     finalize_grads = None

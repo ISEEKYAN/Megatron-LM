@@ -3,18 +3,20 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
 
 def test_replay_mask_uses_live_scores_and_keeps_native_unmasked_row():
-    from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
 
     RouterReplay.clear_global_router_replay_instances()
     replay = RouterReplay()
-    dense = torch.tensor(
-        [[0.1, 0.2, 0.7], [0.6, 0.3, 0.1]], requires_grad=True
-    )
+    dense = torch.tensor([[0.1, 0.2, 0.7], [0.6, 0.3, 0.1]], requires_grad=True)
     native_indices = torch.tensor([[2, 1], [0, 1]])
     native_scores = dense.gather(1, native_indices)
     target = torch.tensor([[0, 1], [2, 1]])
@@ -54,7 +56,10 @@ def test_replayed_sqrtsoftplus_scores_are_live_normalized_and_nonzero():
 
 
 def test_backward_replay_keeps_fifo_across_pipeline_warmup_forwards():
-    from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
 
     RouterReplay.clear_global_router_replay_instances()
     replay = RouterReplay()
@@ -76,7 +81,10 @@ def test_ds4_hash_router_records_and_replays_its_layer_column():
 
     pytest.importorskip("transformer_engine")
     from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE
-    from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
 
     RouterReplay.clear_global_router_replay_instances()
     module = DeepseekV4MoE.__new__(DeepseekV4MoE)
@@ -129,8 +137,8 @@ def test_r3_mask_replays_every_causal_row_except_last():
     assert torch.equal(mask, expected)
 
 
-def test_ds4_replay_roots_exclude_mtp_layers():
-    from megatron.lite.model.deepseek_v4.lite.protocol import router_replay_roots
+def test_replay_roots_exclude_mtp_layers():
+    from megatron.lite.model.protocol_utils import router_replay_roots
 
     main_layers = nn.ModuleDict({"0": nn.Linear(2, 2), "1": nn.Linear(2, 2)})
     mtp_layers = nn.ModuleList([nn.Linear(2, 2)])
@@ -141,6 +149,26 @@ def test_ds4_replay_roots_exclude_mtp_layers():
     chunk.model = model
 
     assert router_replay_roots(chunk) == list(main_layers.values())
+
+
+@pytest.mark.parametrize(
+    "protocol_name",
+    ["qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2"],
+)
+def test_every_moe_protocol_exposes_mtp_safe_replay_roots(protocol_name):
+    from pathlib import Path
+
+    protocol_path = (
+        Path(__file__).parents[3]
+        / "megatron"
+        / "lite"
+        / "model"
+        / protocol_name
+        / "lite"
+        / "protocol.py"
+    )
+    source = protocol_path.read_text()
+    assert "router_replay_roots" in source
 
 
 def test_r3_driver_replays_layer_order_and_causal_rows_end_to_end():
@@ -198,7 +226,9 @@ def test_r3_driver_replays_layer_order_and_causal_rows_end_to_end():
     driver.begin()
     try:
         stepped = driver.wrap(
-            lambda active_model, _batch: [router(native) for router in active_model.routers]
+            lambda active_model, _batch: [
+                router(native) for router in active_model.routers
+            ]
         )
         layer0, layer1 = stepped(model, batch)
     finally:
@@ -260,7 +290,9 @@ def test_r3_driver_accepts_next_token_routes_without_final_input_row():
     assert driver is not None
     driver.begin()
     try:
-        stepped = driver.wrap(lambda active_model, _batch: active_model.routers[0](native))
+        stepped = driver.wrap(
+            lambda active_model, _batch: active_model.routers[0](native)
+        )
         actual = stepped(model, batch)
     finally:
         driver.end()
