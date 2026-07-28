@@ -100,8 +100,11 @@ warmup steps, all seven measured steps favored ChunkedEP:
 This is a `1.0437x` step-time speedup (`+4.37%` throughput) with a 0.067 GB
 (`+0.32%`) peak-memory change. Across the seven measured optimizer steps, the
 maximum absolute loss difference was `7.63e-6` and the maximum gradient-norm
-difference was `2.95e-7`. A separate deterministic one-step gate had identical
-BF16 logits, loss, and gradient norm.
+difference was `2.95e-7`. A separate deterministic optimizer-step gate had
+identical BF16 logits, loss, and gradient norm. Across 12 gradient tensors, its
+maximum absolute difference was `9.54e-7` and relative L2 difference was
+`7.47e-5`. Across all 36 exported post-step weight tensors, the maximum absolute
+difference was `1.22e-4` and relative L2 difference was `6.94e-7`.
 
 ### Single-layer full-recompute performance gate
 
