@@ -183,7 +183,23 @@ COMMON_OVERRIDES=(
     "trainer.default_local_dir=${OUTPUT_ROOT}/${MODE}"
 )
 
-COMMAND=(bash "$BASE_LAUNCHER" "${COMMON_OVERRIDES[@]}" "${QAT_OVERRIDES[@]}" "$@")
+EXTRA_OVERRIDES=("$@")
+for overrides_name in COMMON_OVERRIDES QAT_OVERRIDES EXTRA_OVERRIDES; do
+    declare -n overrides_ref="$overrides_name"
+    for index in "${!overrides_ref[@]}"; do
+        if [[ "${overrides_ref[$index]}" == +[a-z]* ]]; then
+            overrides_ref[$index]="+${overrides_ref[$index]}"
+        fi
+    done
+    unset -n overrides_ref
+done
+
+COMMAND=(
+    bash "$BASE_LAUNCHER"
+    "${COMMON_OVERRIDES[@]}"
+    "${QAT_OVERRIDES[@]}"
+    "${EXTRA_OVERRIDES[@]}"
+)
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
     printf '%q ' "${COMMAND[@]}"
     printf '\n'
