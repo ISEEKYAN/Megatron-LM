@@ -60,6 +60,7 @@ run_arm() {
     --warmup 0 \
     --num-microbatches "${CORRECTNESS_NUM_MICROBATCHES:-1}" \
     --seq-len "${CORRECTNESS_SEQ_LEN:-${SEQ_LEN:-1024}}" \
+    $([[ "${CORRECTNESS_SKIP_WEIGHT_HASH:-0}" == "1" ]] && printf '%s' '--skip-weight-hash') \
     --output-json "${OUTPUT_DIR}/qwen3_chunked_ep_${arm}_correctness.json" \
     2>&1 | tee "${OUTPUT_DIR}/qwen3_chunked_ep_${arm}_correctness.log"
 }
@@ -78,5 +79,9 @@ if [[ "${DRY_RUN}" != "1" ]]; then
     "${OUTPUT_DIR}/qwen3_chunked_ep_baseline_correctness.json" \
     "${OUTPUT_DIR}/qwen3_chunked_ep_chunked_correctness.json" \
     --output-json "${OUTPUT_DIR}/qwen3_chunked_ep_correctness_compare.json" \
+    --loss-atol "${CORRECTNESS_LOSS_ATOL:-0}" \
+    --loss-rtol "${CORRECTNESS_LOSS_RTOL:-0}" \
+    --grad-atol "${CORRECTNESS_GRAD_ATOL:-0}" \
+    --grad-rtol "${CORRECTNESS_GRAD_RTOL:-0}" \
     --fail-on-mismatch
 fi
