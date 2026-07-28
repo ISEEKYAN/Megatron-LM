@@ -112,17 +112,90 @@ hands the exported stream to its rollout exporter, while the vLLM compatibility
 and refit boundary is installed from
 `experimental/lite/examples/verl/verl_mlite/compat.py`.
 
-## Runnable CPU example
+## End-to-end QAT training launch
 
-The example below runs one MXFP4 fake-quantized optimizer step on a tiny
-Qwen3-MoE-shaped block, verifies that the optimizer owns `weight.original`,
-and creates a packed MXFP4 snapshot:
+The following recipe launches the same Qwen3 MoE MXFP4-QAT arm shape used by
+the four-arm DAPO experiment: 32 GPUs (four nodes with eight GPUs each), 30
+steps, eight responses per prompt, 2,048 prompt tokens, 14,336 response tokens,
+and a 16,384-token actor/rollout limit.
+
+The user must provide:
+
+- a local snapshot of the public `Qwen/Qwen3-30B-A3B` model;
+- a verl-compatible training parquet derived from the public
+  `BytedTsinghua-SIA/DAPO-Math-17k` dataset;
+- a verl-compatible AIME 2024 validation parquet;
+- local checkouts of verl and Megatron-LM on `VERL_ROOT` and `MEGATRON_ROOT`;
+- a running four-node Ray allocation with eight suitable GPUs per node.
+
+Run this from the Megatron-LM repository root on the Ray head node. Replace
+the six `/path/to/...` placeholders:
 
 ```bash
-PYTHONPATH=experimental/lite \
-python experimental/lite/examples/verl/scripts/qat_mxfp4_minimal.py
+export VERL_ROOT=/path/to/verl
+export MEGATRON_ROOT=/path/to/Megatron-LM
+export MODEL_PATH=/path/to/Qwen3-30B-A3B
+export TRAIN_FILES=/path/to/dapo-math-17k.parquet
+export VAL_FILES=/path/to/aime-2024.parquet
+export OUTPUT_ROOT=/path/to/output
+
+NNODES=4 \
+NGPUS_PER_NODE=8 \
+TRAIN_BATCH_SIZE=32 \
+PPO_MINI_BATCH_SIZE=32 \
+ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU=1 \
+MAX_PROMPT_LENGTH=2048 \
+MAX_RESPONSE_LENGTH=14336 \
+PPO_MAX_TOKEN_LEN_PER_GPU=16384 \
+ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU=16384 \
+ROLLOUT_MAX_MODEL_LEN=16384 \
+ROLLOUT_MAX_NUM_BATCHED_TOKENS=16384 \
+ROLLOUT_MAX_NUM_SEQS=32 \
+ROLLOUT_N=8 \
+ROLLOUT_TP=8 \
+ROLLOUT_GPU_MEMORY_UTILIZATION=0.6 \
+ACTOR_TP=2 \
+ACTOR_EP=8 \
+ACTOR_CP=1 \
+ACTOR_LR=1e-5 \
+USE_FUSED_KERNELS=True \
+PARAM_OFFLOAD=True \
+OPTIMIZER_OFFLOAD=True \
+GRAD_OFFLOAD=True \
+LOSS_AGG_MODE=token-mean \
+TOTAL_TRAINING_STEPS=30 \
+SAVE_FREQ=5 \
+TEST_FREQ=5 \
+bash experimental/lite/examples/verl/scripts/run_qwen3moe_gsm8k_grpo.sh \
+  'trainer.use_v1=True' \
+  'algorithm.rollout_correction.bypass_mode=False' \
+  '+algorithm.filter_groups.enable=True' \
+  '+algorithm.filter_groups.metric=acc' \
+  '+algorithm.filter_groups.max_inflight_gen_batches=1' \
+  'actor_rollout_ref.actor.clip_ratio_low=0.2' \
+  'actor_rollout_ref.actor.clip_ratio_high=0.28' \
+  'actor_rollout_ref.actor.engine.router_replay_mode=disabled' \
+  '+actor_rollout_ref.actor.engine.impl_cfg.recompute=full' \
+  'actor_rollout_ref.actor.engine.qat.enable=true' \
+  'actor_rollout_ref.actor.engine.qat.apply_modelopt_fake_quant=false' \
+  'actor_rollout_ref.actor.engine.qat.mode=mxfp4' \
+  'actor_rollout_ref.actor.engine.qat.group_size=32' \
+  'actor_rollout_ref.actor.engine.qat.ignore_patterns=[lm_head,embed_tokens,"re:.*mlp.gate$"]' \
+  'actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true' \
+  'actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4' \
+  'actor_rollout_ref.actor.engine.impl_cfg.qat.group_size=32' \
+  'actor_rollout_ref.actor.engine.impl_cfg.qat.symmetric=true' \
+  'actor_rollout_ref.actor.engine.impl_cfg.qat.ste_clip=true' \
+  'actor_rollout_ref.actor.engine.impl_cfg.qat.ignore_patterns=[lm_head,head,output_layer,gate,router,embedding,embed,word_embeddings]' \
+  'actor_rollout_ref.actor.engine.impl_cfg.qat.export_mode=fake' \
+  'actor_rollout_ref.rollout.quantization=mxfp4'
 ```
 
-This is a CPU contract example, not a throughput or convergence benchmark.
-Production model construction passes the same `QATSpec` through
-`ImplConfig.qat`.
+`engine.qat` controls the verl-owned online deployment export;
+`engine.impl_cfg.qat` controls MLite's training parametrizations. Both must be
+configured. Do not replace either ignore list with the other: their owners and
+matching semantics differ as described above.
+
+This command shape and its resolved Hydra argument list can be checked without
+allocating GPUs by adding `DRY_RUN=1`. A dry run validates configuration
+construction only; it is not evidence that training ran.
