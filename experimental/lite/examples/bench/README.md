@@ -67,8 +67,10 @@ when Megatron-Bridge is installed and `import megatron.bridge` succeeds.
 This pair compares the synchronous Qwen3 MoE path with token-wise ChunkedEP.
 Both arms use the same model, data, optimizer, parallel shape, and DeepEP
 transport. The baseline sets `num_chunks_ep_a2a_overlap=1`; the candidate changes
-the single shared forward/backward chunk count to two. ChunkedEP requires `EP>1` and
-`use_deepep=true`.
+the single shared forward/backward chunk count to two. Both arms request MoE
+full recomputation: the baseline uses the standard outer checkpoint, while the
+candidate replaces it with native fused ChunkedEP recomputation. ChunkedEP
+requires `EP>1` and `use_deepep=true`.
 
 ```bash
 HF_PATH=/models/Qwen3-30B-A3B \
@@ -79,6 +81,27 @@ bash experimental/lite/examples/bench/scripts/run_qwen3_chunked_ep_pair.sh
 Set `DRY_RUN=0` inside an 8-GPU allocation to run the default EP=8 pair. The
 script writes separate JSON and log files for direct loss, gradient-norm,
 throughput, and memory comparison.
+
+The shared policy is wired into every currently registered MLite MoE family:
+Qwen3 MoE, Qwen3.5, Kimi K2, GLM-5, and DeepSeek V4. The GPU measurements below
+cover Qwen3 MoE; the remaining families have construction-level coverage.
+
+### Validated Qwen3 THD SFT proxy
+
+An 8-GPU EP=8 run used one Qwen3-30B-A3B layer, eight experts, DeepEP, THD,
+distributed optimizer, one microbatch, and 16,384 tokens per GPU. After three
+warmup steps, all seven measured steps favored ChunkedEP:
+
+| chunks | step time | throughput | peak allocated memory |
+|---:|---:|---:|---:|
+| 1 | 177.604 ms | 738,002 tokens/s | 20.782 GB/GPU |
+| 2 | 170.169 ms | 770,248 tokens/s | 20.849 GB/GPU |
+
+This is a `1.0437x` step-time speedup (`+4.37%` throughput) with a 0.067 GB
+(`+0.32%`) peak-memory change. Across the seven measured optimizer steps, the
+maximum absolute loss difference was `7.63e-6` and the maximum gradient-norm
+difference was `2.95e-7`. A separate deterministic one-step gate had identical
+BF16 logits, loss, and gradient norm.
 
 ### Single-layer full-recompute performance gate
 
@@ -101,6 +124,12 @@ torchrun --nproc_per_node 8 \
 The gate fails unless every mode has a median speedup above `1.0x`, ChunkedEP
 wins at least 80% of paired repeats, and loss/gradient parity passes. The JSON
 output records per-mode timings, paired wins, peak memory, and parity metrics.
+
+For the same 16,384-token shape, ChunkedEP measured `1.2019x` in forward,
+`1.4611x` in backward, and `1.3707x` in fused forward+backward, winning all
+10/10 paired repeats in every mode. Output, loss, and input-gradient maximum
+absolute differences were zero; the maximum parameter-gradient difference was
+`3.81e-6`.
 
 ## Validated Run
 
