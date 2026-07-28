@@ -80,6 +80,39 @@ Set `DRY_RUN=0` inside an 8-GPU allocation to run the default EP=8 pair. The
 script writes separate JSON and log files for direct loss, gradient-norm,
 throughput, and memory comparison.
 
+### Single-layer full-recompute performance gate
+
+Use the layer gate to isolate ChunkedEP forward, backward, and fused
+forward+backward performance. Both arms use DeepEP and exact matching weights
+and inputs. The baseline uses checkpoint full recomputation; the candidate uses
+the native ChunkedEP full-recompute backward.
+
+```bash
+torchrun --nproc_per_node 8 \
+  experimental/lite/examples/bench/chunked_ep_layer_perf.py \
+  --hf-path /models/Qwen3-30B-A3B \
+  --tokens-per-gpu 16384 \
+  --chunks 4 \
+  --warmup 3 \
+  --repeats 10 \
+  --output-json /tmp/chunked_ep_layer_perf.json
+```
+
+The gate fails unless every mode has a median speedup above `1.0x`, ChunkedEP
+wins at least 80% of paired repeats, and loss/gradient parity passes. A validated
+8x H100 run produced:
+
+| Full-recompute mode | Baseline median ms | ChunkedEP median ms | Speedup | Paired wins |
+| --- | ---: | ---: | ---: | ---: |
+| Forward | 10.024 | 8.580 | 1.168x | 10/10 |
+| Backward | 23.031 | 17.630 | 1.306x | 10/10 |
+| Fused forward+backward | 33.236 | 26.390 | 1.259x | 10/10 |
+
+The same run reduced peak allocated memory from `2.102` to `1.296` GB for
+forward and from `2.847` to `1.727` GB for backward/fused. Loss, output, and
+input gradients matched exactly; the maximum gradient-norm difference was
+`1.69e-5`.
+
 ## Validated Run
 
 The following paired run completed on 2026-06-07 with 8x NVIDIA H100 80GB GPUs:
