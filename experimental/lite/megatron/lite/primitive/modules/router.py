@@ -193,18 +193,12 @@ class SigmoidTopKRouter(nn.Module):
             torch.zeros(config.n_routed_experts, dtype=torch.float32),
             persistent=expert_bias_persistent,
         )
-        self.register_buffer(
-            "local_tokens_per_expert",
-            torch.zeros(config.n_routed_experts, dtype=torch.float32),
-            persistent=False,
-        )
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
 
     def _apply(self, fn):
         super()._apply(fn)
         self.expert_bias.data = self.expert_bias.data.float()
-        self.local_tokens_per_expert.data = self.local_tokens_per_expert.data.float()
         return self
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -236,9 +230,6 @@ class SigmoidTopKRouter(nn.Module):
             fused=self.moe_router_fusion,
             **routing_kwargs,
         )
-        if torch.is_grad_enabled():
-            with torch.no_grad():
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
         topk_scores, topk_indices = _ordered_topk_from_routing_map(
             probs_dense, routing_map, self.topk
         )

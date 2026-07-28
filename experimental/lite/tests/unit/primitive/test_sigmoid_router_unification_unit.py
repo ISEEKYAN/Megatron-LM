@@ -150,7 +150,7 @@ def test_qwen_topk_router_output_is_bitwise_unchanged(
 
 
 @pytest.mark.parametrize("model_name", ["glm5", "kimi_k2"])
-def test_group_limited_routing_changes_selected_experts_and_counts_tokens(
+def test_group_limited_routing_changes_selected_experts(
     model_name, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
@@ -172,10 +172,6 @@ def test_group_limited_routing_changes_selected_experts_and_counts_tokens(
 
     assert torch.equal(grouped_indices, torch.tensor([[4, 5]]))
     assert torch.equal(ungrouped_indices, torch.tensor([[0, 4]]))
-    assert torch.equal(
-        grouped_router.local_tokens_per_expert,
-        torch.tensor([0, 0, 0, 0, 1, 1, 0, 0], dtype=torch.float32),
-    )
 
 
 def test_router_buffers_remain_float32_after_dtype_apply(
@@ -191,4 +187,3 @@ def test_router_buffers_remain_float32_after_dtype_apply(
     ).to(torch.bfloat16)
 
     assert router.expert_bias.dtype == torch.float32
-    assert router.local_tokens_per_expert.dtype == torch.float32
