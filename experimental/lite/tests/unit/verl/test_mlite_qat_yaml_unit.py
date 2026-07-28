@@ -3,43 +3,53 @@
 
 from pathlib import Path
 
-import yaml
+from hydra import compose, initialize_config_module
+from megatron.lite.primitive.quantization.qat import (
+    QATSpec,
+    _DEFAULT_IGNORE_PATTERNS,
+    normalize_qat_spec,
+)
+from omegaconf import OmegaConf
+
+
+def _compose_engine(*overrides: str) -> dict:
+    config_root = Path(__file__).parents[3] / "examples" / "verl"
+    assert (config_root / "verl_mlite" / "config" / "engine" / "mlite.yaml").is_file()
+    with initialize_config_module(
+        config_module="verl_mlite.config",
+        version_base=None,
+    ):
+        config = compose(
+            config_name=None,
+            overrides=["+engine@actor_rollout_ref.actor.engine=mlite", *overrides],
+        )
+    return OmegaConf.to_container(
+        config.actor_rollout_ref.actor.engine,
+        resolve=True,
+    )
 
 
 def test_default_yaml_keeps_export_and_training_qat_disabled() -> None:
-    config_path = (
-        Path(__file__).parents[3]
-        / "examples"
-        / "verl"
-        / "verl_mlite"
-        / "config"
-        / "engine"
-        / "mlite.yaml"
-    )
-    config = yaml.safe_load(config_path.read_text())
+    engine = _compose_engine()
 
-    assert config["qat"] == {
-        "enable": False,
-        "apply_modelopt_fake_quant": False,
-        "mode": "mxfp4",
-        "group_size": 32,
-        "ignore_patterns": [
-            "lm_head",
-            "embed_tokens",
-            "re:.*mlp.gate$",
-        ],
-    }
-    assert config["impl_cfg"]["qat"] == {
+    assert engine["qat"] == {}
+    assert engine["impl_cfg"]["qat"] == {
         "enabled": False,
         "format": "mxfp4",
         "group_size": 32,
         "symmetric": True,
         "ste_clip": True,
-        "ignore_patterns": [],
-        "export_mode": "fake",
+        "ignore_patterns": list(_DEFAULT_IGNORE_PATTERNS),
     }
 
-    # These are deliberately separate schemas: verl owns online export, while
-    # MLite owns training parametrization. Both remain opt-in by default.
-    assert config["qat"]["enable"] is False
-    assert config["impl_cfg"]["qat"]["enabled"] is False
+    spec = normalize_qat_spec(engine["impl_cfg"]["qat"])
+    assert spec == QATSpec(
+        enabled=False,
+        format="mxfp4",
+        group_size=32,
+        symmetric=True,
+        ste_clip=True,
+    )
+    assert spec.ignore_patterns == _DEFAULT_IGNORE_PATTERNS
+    assert not spec.targets_module("layers.0.mlp.router.gate")
+    assert spec.targets_module("layers.0.mlp.gate_up")

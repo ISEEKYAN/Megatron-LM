@@ -80,11 +80,6 @@ _FORMAT_BITS: dict[str, int] = {
     "mxfp4": 4,
 }
 
-# Integer vs floating-point families (they share the STE/three-state skeleton
-# but have different scale layouts and encodings).
-_INT_FORMATS: frozenset[str] = frozenset({"int8", "int4"})
-_FLOAT_FORMATS: frozenset[str] = frozenset({"fp8_e4m3", "mxfp4"})
-
 # Canonicalising aliases accepted from configs.
 _FORMAT_ALIASES: dict[str, str] = {"fp8": "fp8_e4m3"}
 
@@ -162,7 +157,6 @@ class QATSpec:
     activation_bits: int | None = (
         None  # weight-only in phase 1; W*A* is gated separately
     )
-    export_mode: str = "fake"  # "fake" (train) | "packed" (deploy snapshot)
     learnable_scales: bool = False  # LSQ future work; must be False in phase 1
 
     def __post_init__(self) -> None:
@@ -191,10 +185,6 @@ class QATSpec:
         if self.learnable_scales:
             raise ValueError(
                 "learnable_scales (LSQ) is deferred; this path uses max calibration."
-            )
-        if self.export_mode not in ("fake", "packed"):
-            raise ValueError(
-                f"export_mode must be 'fake' or 'packed', got {self.export_mode!r}."
             )
         if self.group_size < -1:
             raise ValueError(f"group_size must be >= -1, got {self.group_size}.")

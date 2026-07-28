@@ -8,17 +8,9 @@ grad_offload: false
 forward_only: false
 dtype: bfloat16
 export_dtype: bfloat16
-# verl-owned online exporter schema. See ../../../../QAT.md for an enabled example.
-qat:
-  enable: false  # Enable verl export_qat_weights during vLLM resync.
-  apply_modelopt_fake_quant: false  # Keep false when MLite supplies training fake quant.
-  mode: mxfp4  # Export format understood by verl (for example, mxfp4).
-  group_size: 32  # Quantization group width; MXFP4 uses 32.
-  # Required: verl has no built-in export ignore set; see ../../../../QAT.md.
-  ignore_patterns:
-    - lm_head
-    - embed_tokens
-    - "re:.*mlp.gate$"
+# Optional verl-owned export_qat_weights passthrough. It is not used by the
+# vLLM compressed-tensors MXFP4 rollout path; see ../../../../QAT.md.
+qat: {}
 resync_format: null
 resync_config: {}
 router_replay_mode: disabled
@@ -38,12 +30,22 @@ attention_backend_override: flash
 router_aux_loss_coef: null
 impl_cfg:
   use_thd: true
-  # MLite-owned training QAT schema. See ../../../../QAT.md for an enabled example.
+  # MLite-owned training schema: controls forward fake quantization and STE.
+  # See ../../../../QAT.md for an enabled example.
   qat:
     enabled: false  # Opt in to MLite fake-quant parametrizations.
     format: mxfp4  # int8, int4, fp8_e4m3, or mxfp4.
-    group_size: 32  # Quantization group width; MXFP4 uses 32.
+    group_size: 32  # MXFP4 requires an OCP block width of 32.
     symmetric: true  # Use symmetric scales where the selected format supports them.
     ste_clip: true  # Mask STE gradients outside the representable range.
-    ignore_patterns: []  # Module-name strings or "re:" regular expressions to skip.
-    export_mode: fake  # "fake" for training state; "packed" for deployment snapshots.
+    # Exact dotted Megatron path components skipped by training fake quant.
+    # This explicitly mirrors qat.py::_DEFAULT_IGNORE_PATTERNS; keep them in sync.
+    ignore_patterns:
+      - lm_head
+      - head
+      - output_layer
+      - gate
+      - router
+      - embedding
+      - embed
+      - word_embeddings

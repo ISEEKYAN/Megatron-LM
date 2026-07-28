@@ -162,42 +162,28 @@ so the MLite actor is wired up correctly without any extra worker-path knob.
 By default, GSM8K GRPO artifacts are written under
 `experimental/lite/examples/verl/outputs/qwen35_gsm8k_grpo`.
 
-### FP4 QAT rollout resync
+### MXFP4 QAT four-arm launch
 
 For the complete `QATSpec` field reference, supported-format table,
 optimizer/checkpoint ordering contract, packed snapshot layout, and an
 end-to-end MXFP4 QAT launch recipe, see [QAT.md](QAT.md).
 
-The MLite engine can pass its BF16 HF-format weight stream through verl's
-online QAT exporter before vLLM resync. Keep the rollout quantization config
-fixed between the QAT-off and QAT-on arms; only the training-side
-`impl_cfg.qat.enabled` value should change.
+Run the generalized four-arm Qwen3-MoE recipe with:
 
-```yaml
-actor_rollout_ref:
-  actor:
-    engine:
-      qat:
-        enable: true
-        apply_modelopt_fake_quant: false
-        mode: mxfp4
-        group_size: 32
-        ignore_patterns:
-          - lm_head
-          - embed_tokens
-          - "re:.*mlp.gate$"
-      impl_cfg:
-        qat:
-          enabled: true
-          format: mxfp4
-          group_size: 32
+```bash
+MODEL_PATH=Qwen/Qwen3-30B-A3B \
+TRAIN_FILES=/path/to/dapo-math-17k.parquet \
+VAL_FILES=/path/to/aime-2024.parquet \
+bash experimental/lite/examples/verl/scripts/run_qwen3moe_mxfp4_qat.sh \
+  --mode qat_on
 ```
 
-`apply_modelopt_fake_quant: false` is required because MLite supplies the
-training fake quantization. The verl exporter still quantizes every BF16
-resync online. Use a compressed-tensors `mxfp4-pack-quantized` rollout config
-for MXFP4, or `nvfp4-pack-quantized` for NVFP4. Do not combine `engine.qat`
-with MLite's model-owned `resync_format`; that would quantize the stream twice.
+Modes are `baseline`, `qat_off`, `qat_on`, and `r3`. The `qat_off` and
+`qat_on` arms deliberately keep rollout MXFP4 identical and change only
+training-side `impl_cfg.qat.enabled`. This recipe uses vLLM
+compressed-tensors plus `verl.utils.qat.vllm_patch`; it does not enable the
+separate verl `export_qat_weights` path. See [QAT.md](QAT.md) for the exact arm
+semantics, validation scope, safe exclusions, and optional exporter schema.
 
 ## Smoke / Dry-Run Checks
 
@@ -209,6 +195,7 @@ cover end-to-end SFT or GRPO training.
   - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_sft.sh`
   - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_gsm8k_sft.sh`
   - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_gsm8k_grpo.sh`
+  - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_mxfp4_qat.sh`
 - Python import compilation:
   - `PYTHONPYCACHEPREFIX="$(mktemp -d)" python3 -m compileall -q experimental/lite/examples/verl/verl_mlite`
 - GSM8K SFT dry run:
