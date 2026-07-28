@@ -46,8 +46,8 @@ def _override(tokens: list[str], name: str) -> str | None:
     )
 
 
-def _appended_override(tokens: list[str], name: str) -> str | None:
-    return _override(tokens, f"+{name}")
+def _add_or_override(tokens: list[str], name: str) -> str | None:
+    return _override(tokens, f"++{name}")
 
 
 def _has_verl() -> bool:
@@ -83,14 +83,20 @@ def test_four_arm_launcher_selects_only_the_intended_features(
         == rollout_quantization
     )
     assert _override(tokens, "actor_rollout_ref.actor.engine.qat.enable") is None
-    assert _appended_override(
+    assert _add_or_override(
         tokens, "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled"
     ) == training_qat
     assert (
-        _appended_override(
+        _add_or_override(
             tokens, "actor_rollout_ref.actor.engine.impl_cfg.qat.format"
         )
         == "mxfp4"
+    )
+    assert (
+        _add_or_override(
+            tokens, "actor_rollout_ref.actor.engine.impl_cfg.recompute"
+        )
+        == "full"
     )
     assert (
         _override(tokens, "actor_rollout_ref.actor.engine.router_replay_mode")

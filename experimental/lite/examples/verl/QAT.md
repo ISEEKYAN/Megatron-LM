@@ -196,5 +196,10 @@ parallelism, batch sizes, response count, step count, and output root are
 overridable environment variables. Use a local model snapshot for
 `MODEL_PATH` if the runtime cannot resolve the public Hub name.
 
+The launcher uses Hydra's `++` form for backend-specific `impl_cfg.qat` and
+`impl_cfg.recompute` fields. These fields may already be declared by an
+installed `verl_mlite` config package or may be absent when MLite code is
+supplied through `PYTHONPATH`; add-or-override supports both runtime layouts.
+
 Use `DRY_RUN=1` to inspect the resolved command without allocating GPUs. This
 checks argument construction only and is not evidence of a training run.
