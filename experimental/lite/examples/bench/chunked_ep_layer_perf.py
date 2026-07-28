@@ -253,7 +253,7 @@ def main() -> int:
         layer_idx=0,
     ).to(torch.bfloat16).cuda()
     candidate.load_state_dict(baseline.state_dict())
-    assert baseline.ep_chunk_overlap.dispatcher.use_deepep
+    assert baseline.dispatcher.use_deepep
     assert candidate.ep_chunk_overlap.dispatcher.use_deepep
 
     generator = torch.Generator(device=device).manual_seed(args.seed + rank)

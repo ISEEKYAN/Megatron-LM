@@ -182,25 +182,34 @@ class MoELayer(nn.Module):
         self.experts = Experts(
             config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute
         )
-        self.ep_chunk_overlap = EPChunkOverlapOperator(
-            config,
+        self.dispatcher = TokenDispatcher(
+            config.num_experts,
+            config.hidden_size,
             ps,
-            router=self.router,
-            experts=self.experts,
             use_deepep=use_deepep,
-            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
-            moe_full_recompute=True,
-            dispatcher_factory=lambda slot: TokenDispatcher(
-                config.num_experts,
-                config.hidden_size,
-                ps,
-                use_deepep=use_deepep,
-                moe_permute_fusion=moe_permute_fusion,
-                buffer_slot=slot,
-            ),
-            layer_idx=layer_idx,
+            moe_permute_fusion=moe_permute_fusion,
         )
-        self.num_chunks_ep_a2a_overlap = num_chunks_ep_a2a_overlap
+        self.ep_chunk_dispatchers = ()
+        self.ep_chunk_overlap = None
+        if num_chunks_ep_a2a_overlap > 1:
+            layer_slot = id(self) if layer_idx is None else int(layer_idx) % 8
+            self.ep_chunk_dispatchers = tuple(
+                TokenDispatcher(
+                    config.num_experts,
+                    config.hidden_size,
+                    ps,
+                    use_deepep=use_deepep,
+                    moe_permute_fusion=moe_permute_fusion,
+                    buffer_slot=("ep_chunk_overlap", "forward", layer_slot, idx),
+                )
+                for idx in range(num_chunks_ep_a2a_overlap)
+            )
+            self.ep_chunk_overlap = EPChunkOverlapOperator(
+                router=self.router,
+                experts=self.experts,
+                dispatcher=self.dispatcher,
+                forward_dispatchers=self.ep_chunk_dispatchers,
+            )
         self.shared_expert = SharedExpert(config, ps, use_plain_te_linear=shared_expert_plain_te)
         self.preserve_3d_graph = bool(preserve_3d_graph)
 
@@ -217,12 +226,23 @@ class MoELayer(nn.Module):
             side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side_stream):
                 shared_out = self.shared_expert(shared_input)
-        if self.num_chunks_ep_a2a_overlap == 1 and self.preserve_3d_graph:
-            routed_out = self.ep_chunk_overlap.forward_synchronous(
-                x_2d, router_input=router_input
-            )
-        else:
+        if self.ep_chunk_overlap is not None:
             routed_out = self.ep_chunk_overlap(router_input).reshape_as(x_2d)
+        else:
+            scores, indices = self.router(router_input)
+            dispatched, tpe, probs = self.dispatcher.dispatch(
+                x_2d, scores, indices
+            )
+            self.dispatcher.wait_dispatch_event()
+            expert_out = self.experts(
+                dispatched,
+                tpe,
+                probs,
+                tokens_per_expert_list=getattr(
+                    self.dispatcher, "_local_tpe_list", None
+                ),
+            )
+            routed_out = self.dispatcher.combine(expert_out)
 
         if shared_out is None:
             shared_out = self.shared_expert(shared_input)

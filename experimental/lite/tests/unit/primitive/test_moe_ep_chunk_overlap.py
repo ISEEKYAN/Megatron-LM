@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
@@ -81,6 +83,13 @@ def test_production_chunked_ep_operator_is_importable(transformer_engine_import_
 
     assert EPChunkOverlapOperator.__name__ == "EPChunkOverlapOperator"
     assert not issubclass(EPChunkOverlapOperator, torch.nn.Module)
+    assert tuple(inspect.signature(EPChunkOverlapOperator).parameters) == (
+        "router",
+        "experts",
+        "dispatcher",
+        "forward_dispatchers",
+        "router_forward",
+    )
 
 
 def test_operator_keeps_router_and_expert_checkpoint_names_model_owned(

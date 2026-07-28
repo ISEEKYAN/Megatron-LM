@@ -45,24 +45,33 @@ class DeepseekV4MoE(nn.Module):
         self.topk = config.num_experts_per_tok
         self.route_scale = config.routed_scaling_factor
         self.is_hash_layer = is_hash_layer
-        self.ep_chunk_overlap = EPChunkOverlapOperator(
-            config,
+        self.dispatcher = TokenDispatcher(
+            config.n_routed_experts,
+            config.hidden_size,
             ps,
-            router=self.gate,
-            experts=self.experts,
             use_deepep=use_deepep,
-            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
-            moe_full_recompute=True,
-            dispatcher_factory=lambda slot: TokenDispatcher(
-                config.n_routed_experts,
-                config.hidden_size,
-                ps,
-                use_deepep=use_deepep,
-                buffer_slot=slot,
-            ),
-            router_forward=self._route_for_overlap,
-            layer_idx=layer_idx,
         )
+        self.ep_chunk_dispatchers = ()
+        self.ep_chunk_overlap = None
+        if num_chunks_ep_a2a_overlap > 1:
+            layer_slot = int(layer_idx) % 8
+            self.ep_chunk_dispatchers = tuple(
+                TokenDispatcher(
+                    config.n_routed_experts,
+                    config.hidden_size,
+                    ps,
+                    use_deepep=use_deepep,
+                    buffer_slot=("ep_chunk_overlap", "forward", layer_slot, idx),
+                )
+                for idx in range(num_chunks_ep_a2a_overlap)
+            )
+            self.ep_chunk_overlap = EPChunkOverlapOperator(
+                router=self.gate,
+                experts=self.experts,
+                dispatcher=self.dispatcher,
+                forward_dispatchers=self.ep_chunk_dispatchers,
+                router_forward=self._route_for_overlap,
+            )
         shared_intermediate = config.n_shared_experts * config.moe_intermediate_size
         self.shared_experts = (
             SwiGLUMLP(
@@ -108,7 +117,23 @@ class DeepseekV4MoE(nn.Module):
     def forward(self, x: torch.Tensor, *, input_ids: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.shape
         x_flat = x.reshape(-1, self.hidden_size)
-        out = self.ep_chunk_overlap(x_flat, routing_input=input_ids)
+        if self.ep_chunk_overlap is not None:
+            out = self.ep_chunk_overlap(x_flat, routing_input=input_ids)
+        else:
+            scores, indices = self._route_for_overlap(self.gate, x_flat, input_ids)
+            dispatched, tpe, probs = self.dispatcher.dispatch(
+                x_flat, scores, indices
+            )
+            self.dispatcher.wait_dispatch_event()
+            expert_out = self.experts(
+                dispatched,
+                tpe,
+                probs,
+                tokens_per_expert_list=getattr(
+                    self.dispatcher, "_local_tpe_list", None
+                ),
+            )
+            out = self.dispatcher.combine(expert_out)
         if self.shared_experts is not None:
             out = out + self.shared_experts(x_flat)
         return out.view(shape)

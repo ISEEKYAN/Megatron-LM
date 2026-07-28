@@ -31,7 +31,13 @@ def test_every_lite_moe_model_consumes_the_shared_chunked_ep_primitive(
     assert "validate_ep_chunk_overlap_config(" in protocol
     assert "recompute_modules_for_ep_chunk_overlap(" in protocol
     assert "EPChunkOverlapOperator" in implementation
-    assert "self.ep_chunk_overlap = EPChunkOverlapOperator(" in implementation
+    assert "self.dispatcher = TokenDispatcher(" in implementation
+    assert "self.ep_chunk_overlap = None" in implementation
+    assert "if num_chunks_ep_a2a_overlap > 1:" in implementation
+    assert "EPChunkOverlapOperator(" in implementation
+    assert "if self.ep_chunk_overlap is not None:" in implementation
+    assert "self.dispatcher.dispatch(" in implementation
+    assert "dispatcher_factory" not in implementation
     assert "class MoELayer(EPChunkOverlap" not in implementation
     assert "class DeepseekV4MoE(EPChunkOverlap" not in implementation
     assert "num_chunks_ep_a2a_overlap" in implementation
@@ -65,6 +71,17 @@ def test_chunk_policy_lives_with_the_moe_module_primitive():
 
     assert policy.is_file()
     assert not old_policy.exists()
+
+
+def test_chunked_ep_operator_does_not_construct_or_factory_dispatchers():
+    implementation = (
+        LITE_ROOT / "megatron/lite/primitive/modules/moe_ep_chunk_overlap.py"
+    ).read_text()
+
+    assert "dispatcher_factory" not in implementation
+    assert "_new_dispatcher" not in implementation
+    assert "TokenDispatcher(" not in implementation
+    assert "config: Any" not in implementation
 
 
 def test_deepseek_hash_router_keeps_checkpoint_gate_name():

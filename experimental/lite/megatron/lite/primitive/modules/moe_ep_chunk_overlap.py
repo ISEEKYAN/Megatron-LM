@@ -13,12 +13,8 @@ import torch.nn as nn
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
-    ChunkSpec,
     ep_chunk_ranges,
-    parse_ep_chunk_spec,
-    resolve_ep_chunk_overlap_chunks,
 )
-from megatron.lite.primitive.parallel import ParallelState
 
 
 def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
@@ -54,10 +50,6 @@ def _shared_streams(
         streams = (_make_stream(device_index), _make_stream(device_index))
         _EP_CHUNK_STREAMS[device_index] = streams
     return streams
-
-
-def _max_deepep_chunks(chunk_spec: ChunkSpec) -> int:
-    return int(chunk_spec)
 
 
 def _event_current_stream_wait(event: Any) -> None:
@@ -109,18 +101,11 @@ class EPChunkOverlapOperator:
 
     def __init__(
         self,
-        config: Any,
-        ps: ParallelState,
         *,
         router: nn.Module,
         experts: Experts,
-        num_chunks_ep_a2a_overlap: ChunkSpec = 1,
-        use_deepep: bool = True,
-        moe_full_recompute: bool = True,
-        layer_idx: int | None = None,
-        dispatcher_factory: (
-            Callable[[tuple[str, str, int, int]], TokenDispatcher] | None
-        ) = None,
+        dispatcher: TokenDispatcher,
+        forward_dispatchers: tuple[TokenDispatcher, ...],
         router_forward: (
             Callable[
                 [nn.Module, torch.Tensor, torch.Tensor | None],
@@ -129,58 +114,24 @@ class EPChunkOverlapOperator:
             | None
         ) = None,
     ):
-        self.config = config
-        self.ps = ps
-        self.chunk_spec = parse_ep_chunk_spec(num_chunks_ep_a2a_overlap)
-        if self.chunk_spec == 2 and not use_deepep:
-            raise ValueError("EP chunk overlap requires use_deepep=True.")
-        self.use_deepep = use_deepep
-        self.moe_full_recompute = moe_full_recompute
-        self.layer_idx = layer_idx
-        self._max_chunks = _max_deepep_chunks(self.chunk_spec)
-        self._deepep_layer_buffer_slots = 8
-        self._dispatcher_factory = dispatcher_factory
         self._router_forward = router_forward
         self._active_routing_input: torch.Tensor | None = None
 
         self.router = router
         self.experts = experts
-        self.dispatcher = self._new_dispatcher("main", 0)
-        if self.chunk_spec == 2 and not self.dispatcher.use_deepep:
+        self.dispatcher = dispatcher
+        self._forward_dispatchers = forward_dispatchers
+        if (
+            not self.dispatcher.use_deepep
+            or len(self._forward_dispatchers) != 2
+            or not all(item.use_deepep for item in self._forward_dispatchers)
+        ):
             raise RuntimeError("EP chunk overlap requires available DeepEP transport.")
-
-        self._forward_dispatchers: list[TokenDispatcher] = []
-
-    def _deepep_buffer_slot_for(self, role: str, idx: int) -> tuple[str, str, int, int]:
-        layer_slot = id(self)
-        if self.layer_idx is not None:
-            layer_slot = int(self.layer_idx) % self._deepep_layer_buffer_slots
-        return ("ep_chunk_overlap", role, layer_slot, idx % self._max_chunks)
-
-    def _new_dispatcher(self, role: str, idx: int) -> TokenDispatcher:
-        slot = self._deepep_buffer_slot_for(role, idx)
-        if self._dispatcher_factory is not None:
-            return self._dispatcher_factory(slot)
-        return TokenDispatcher(
-            self.config.num_experts,
-            self.config.hidden_size,
-            self.ps,
-            use_deepep=self.use_deepep,
-            buffer_slot=slot,
-        )
 
     def _streams(
         self, device: torch.device
     ) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
         return _shared_streams(device)
-
-    def _num_chunks(self, num_tokens: int) -> int:
-        return resolve_ep_chunk_overlap_chunks(
-            num_tokens,
-            ep_size=self.dispatcher.ep_size,
-            hidden_size=self.config.hidden_size,
-            spec=self.chunk_spec,
-        )
 
     @contextmanager
     def _routing_context(self, routing_input: torch.Tensor | None):
@@ -210,48 +161,17 @@ class EPChunkOverlapOperator:
 
     __call__ = forward
 
-    def forward_synchronous(
-        self,
-        x: torch.Tensor,
-        *,
-        router_input: torch.Tensor | None = None,
-        routing_input: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Run the unsplit path while allowing a model-specific router input layout."""
-        input_shape = x.shape
-        x_2d = x.reshape(-1, x.size(-1))
-        route_x = x_2d if router_input is None else router_input
-        with self._routing_context(routing_input):
-            scores, indices = self._route(route_x, 0, x_2d.size(0))
-            dispatched, local_tpe, probs = self.dispatcher.dispatch(
-                x_2d, scores, indices
-            )
-            self.dispatcher.wait_dispatch_event()
-            expert_out = self.experts(
-                dispatched,
-                local_tpe,
-                probs,
-                getattr(self.dispatcher, "_local_tpe_list", None),
-            )
-            return self.dispatcher.combine(expert_out).view(input_shape)
-
     def _forward_impl(
         self, x: torch.Tensor, routing_input: torch.Tensor | None
     ) -> torch.Tensor:
         input_shape = x.shape
         x_2d = x.view(-1, x.size(-1)) if x.dim() == 3 else x
-        chunks = self._num_chunks(x_2d.size(0))
-        if chunks > 1 and torch.is_grad_enabled() and self.moe_full_recompute:
+        chunks = 2
+        if torch.is_grad_enabled():
             params = tuple(self.router.parameters()) + tuple(self.experts.parameters())
             return _FullRecomputeFused.apply(
                 x_2d, routing_input, self, input_shape, x.dtype, chunks, chunks, *params
             )
-        if torch.is_grad_enabled() and chunks > 1:
-            raise RuntimeError(
-                "EP chunk-overlap training requires moe_full_recompute=True."
-            )
-        if chunks <= 1:
-            return self._forward_full(x_2d).view(input_shape)
         ranges = ep_chunk_ranges(
             x_2d.size(0), chunks, weights_env="MEGATRON_LITE_EP_CHUNK_WEIGHTS"
         )
@@ -260,10 +180,6 @@ class EPChunkOverlapOperator:
         )
 
     def _forward_dispatcher(self, idx: int) -> TokenDispatcher:
-        while len(self._forward_dispatchers) <= idx:
-            self._forward_dispatchers.append(
-                self._new_dispatcher("forward", len(self._forward_dispatchers))
-            )
         return self._forward_dispatchers[idx]
 
     def _forward_full(self, x_2d: torch.Tensor) -> torch.Tensor:
@@ -830,4 +746,4 @@ def _materialize(
     ]
 
 
-__all__ = ["EPChunkOverlapOperator", "resolve_ep_chunk_overlap_chunks"]
+__all__ = ["EPChunkOverlapOperator"]

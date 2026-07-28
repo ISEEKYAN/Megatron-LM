@@ -311,30 +311,55 @@ class MoELayer(nn.Module):
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
         )
-        self.ep_chunk_overlap = EPChunkOverlapOperator(
-            config,
+        self.dispatcher = TokenDispatcher(
+            config.num_experts,
+            config.hidden_size,
             ps,
-            router=self.router,
-            experts=self.experts,
             use_deepep=use_deepep,
-            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
-            moe_full_recompute=True,
-            dispatcher_factory=lambda slot: TokenDispatcher(
-                config.num_experts,
-                config.hidden_size,
-                ps,
-                use_deepep=use_deepep,
-                buffer_slot=slot,
-            ),
-            layer_idx=layer_idx,
         )
+        self.ep_chunk_dispatchers = ()
+        self.ep_chunk_overlap = None
+        if num_chunks_ep_a2a_overlap > 1:
+            layer_slot = id(self) if layer_idx is None else int(layer_idx) % 8
+            self.ep_chunk_dispatchers = tuple(
+                TokenDispatcher(
+                    config.num_experts,
+                    config.hidden_size,
+                    ps,
+                    use_deepep=use_deepep,
+                    buffer_slot=("ep_chunk_overlap", "forward", layer_slot, idx),
+                )
+                for idx in range(num_chunks_ep_a2a_overlap)
+            )
+            self.ep_chunk_overlap = EPChunkOverlapOperator(
+                router=self.router,
+                experts=self.experts,
+                dispatcher=self.dispatcher,
+                forward_dispatchers=self.ep_chunk_dispatchers,
+            )
         self.shared_expert = SharedExpert(config, ps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_shape = x.shape
 
         flat_x = x.view(-1, x.size(-1))
-        routed_out = self.ep_chunk_overlap(flat_x)
+        if self.ep_chunk_overlap is not None:
+            routed_out = self.ep_chunk_overlap(flat_x)
+        else:
+            scores, indices = self.router(flat_x)
+            dispatched, tpe, probs = self.dispatcher.dispatch(
+                flat_x, scores, indices
+            )
+            self.dispatcher.wait_dispatch_event()
+            expert_out = self.experts(
+                dispatched,
+                tpe,
+                probs,
+                tokens_per_expert_list=getattr(
+                    self.dispatcher, "_local_tpe_list", None
+                ),
+            )
+            routed_out = self.dispatcher.combine(expert_out)
         shared_out = self.shared_expert(x)
         output = routed_out.view(input_shape)
         output += shared_out

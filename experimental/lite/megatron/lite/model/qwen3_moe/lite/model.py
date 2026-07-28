@@ -69,26 +69,49 @@ class MoELayer(nn.Module):
             moe_act_recompute=moe_act_recompute,
             lora_config=lora_config,
         )
-        self.ep_chunk_overlap = EPChunkOverlapOperator(
-            config,
+        self.dispatcher = TokenDispatcher(
+            config.num_experts,
+            config.hidden_size,
             ps,
-            router=self.router,
-            experts=self.experts,
             use_deepep=use_deepep,
-            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
-            moe_full_recompute=True,
-            dispatcher_factory=lambda slot: TokenDispatcher(
-                config.num_experts,
-                config.hidden_size,
-                ps,
-                use_deepep=use_deepep,
-                buffer_slot=slot,
-            ),
-            layer_idx=layer_idx,
         )
+        self.ep_chunk_dispatchers = ()
+        self.ep_chunk_overlap = None
+        if num_chunks_ep_a2a_overlap > 1:
+            layer_slot = id(self) if layer_idx is None else int(layer_idx) % 8
+            self.ep_chunk_dispatchers = tuple(
+                TokenDispatcher(
+                    config.num_experts,
+                    config.hidden_size,
+                    ps,
+                    use_deepep=use_deepep,
+                    buffer_slot=("ep_chunk_overlap", "forward", layer_slot, idx),
+                )
+                for idx in range(num_chunks_ep_a2a_overlap)
+            )
+            self.ep_chunk_overlap = EPChunkOverlapOperator(
+                router=self.router,
+                experts=self.experts,
+                dispatcher=self.dispatcher,
+                forward_dispatchers=self.ep_chunk_dispatchers,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ep_chunk_overlap(x)
+        if self.ep_chunk_overlap is not None:
+            return self.ep_chunk_overlap(x)
+
+        input_shape = x.shape
+        x_2d = x.view(-1, x.size(-1)) if x.dim() == 3 else x
+        scores, indices = self.router(x_2d)
+        dispatched, tpe, probs = self.dispatcher.dispatch(x_2d, scores, indices)
+        self.dispatcher.wait_dispatch_event()
+        expert_out = self.experts(
+            dispatched,
+            tpe,
+            probs,
+            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
+        )
+        return self.dispatcher.combine(expert_out).view(input_shape).to(x.dtype)
 
 
 # ---------------------------------------------------------------------------
