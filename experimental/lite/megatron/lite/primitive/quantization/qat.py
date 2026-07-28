@@ -144,9 +144,9 @@ class QATSpec:
 
     enabled: bool = False
     format: str = "int8"
-    group_size: int = (
-        0  # 0 = per-tensor, -1 = per-output-channel, N>0 = block along in-features
-    )
+    # None derives the format default: MXFP4's fixed OCP block is 32; other
+    # formats retain per-tensor (0). Explicit 0/-1/N integer grouping is kept.
+    group_size: int | None = None
     symmetric: bool = True
     ste_clip: bool = (
         True  # zero grad outside representable range; False = pure pass-through
@@ -165,6 +165,12 @@ class QATSpec:
         canonical = _FORMAT_ALIASES.get(self.format, self.format)
         if canonical != self.format:
             object.__setattr__(self, "format", canonical)
+        if self.group_size is None:
+            object.__setattr__(
+                self,
+                "group_size",
+                _MXFP4_BLOCK if canonical == "mxfp4" else 0,
+            )
         if not self.enabled:
             return
         if self.format in _DEFERRED_FORMATS:
@@ -186,6 +192,7 @@ class QATSpec:
             raise ValueError(
                 "learnable_scales (LSQ) is deferred; this path uses max calibration."
             )
+        assert self.group_size is not None
         if self.group_size < -1:
             raise ValueError(f"group_size must be >= -1, got {self.group_size}.")
         if self.format == "mxfp4" and self.group_size != _MXFP4_BLOCK:

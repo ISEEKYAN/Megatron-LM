@@ -35,17 +35,3 @@ impl_cfg:
   qat:
     enabled: false  # Opt in to MLite fake-quant parametrizations.
     format: mxfp4  # int8, int4, fp8_e4m3, or mxfp4.
-    group_size: 32  # MXFP4 requires an OCP block width of 32.
-    symmetric: true  # Use symmetric scales where the selected format supports them.
-    ste_clip: true  # Mask STE gradients outside the representable range.
-    # Exact dotted Megatron path components skipped by training fake quant.
-    # This explicitly mirrors qat.py::_DEFAULT_IGNORE_PATTERNS; keep them in sync.
-    ignore_patterns:
-      - lm_head
-      - head
-      - output_layer
-      - gate
-      - router
-      - embedding
-      - embed
-      - word_embeddings

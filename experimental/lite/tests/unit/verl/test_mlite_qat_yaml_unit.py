@@ -36,20 +36,11 @@ def test_default_yaml_keeps_export_and_training_qat_disabled() -> None:
     assert engine["impl_cfg"]["qat"] == {
         "enabled": False,
         "format": "mxfp4",
-        "group_size": 32,
-        "symmetric": True,
-        "ste_clip": True,
-        "ignore_patterns": list(_DEFAULT_IGNORE_PATTERNS),
     }
 
     spec = normalize_qat_spec(engine["impl_cfg"]["qat"])
-    assert spec == QATSpec(
-        enabled=False,
-        format="mxfp4",
-        group_size=32,
-        symmetric=True,
-        ste_clip=True,
-    )
+    assert spec == QATSpec(enabled=False, format="mxfp4")
+    assert spec.group_size == 32
     assert spec.ignore_patterns == _DEFAULT_IGNORE_PATTERNS
     assert not spec.targets_module("layers.0.mlp.router.gate")
     assert spec.targets_module("layers.0.mlp.gate_up")

@@ -12,16 +12,13 @@ impl_cfg = ImplConfig(
     qat=QATSpec(
         enabled=True,
         format="mxfp4",
-        group_size=32,
-        symmetric=True,
-        ste_clip=True,
     )
 )
 ```
 
 `QATSpec` defaults skip the numerically fragile output head, embedding, and
-router-gate path components. The default engine YAML repeats those defaults
-explicitly so a user does not accidentally replace them with an empty list.
+router-gate path components. The default engine YAML exposes only the two
+decisions required for MXFP4: whether QAT is enabled and which format to use.
 
 ## `QATSpec` fields
 
@@ -29,9 +26,9 @@ explicitly so a user does not accidentally replace them with an empty list.
 |---|---|
 | `enabled` | Explicit opt-in. `False` registers no parametrizations and leaves the model unchanged. |
 | `format` | `int8`, `int4`, `fp8_e4m3`, or `mxfp4`; `fp8` canonicalizes to `fp8_e4m3`. |
-| `group_size` | `0` is per-tensor, `-1` is per-output-channel, and a positive value groups the input-feature dimension. MXFP4 requires `32`. |
-| `symmetric` | Selects symmetric rather than affine integer quantization. |
-| `ste_clip` | `True` zeros gradients outside the representable range; `False` uses a pass-through STE. |
+| `group_size` | Integer and FP8 formats accept `0` (per-tensor), `-1` (per-output-channel), or a positive input-feature group. MXFP4 derives its fixed OCP block size `32` when omitted; an explicit conflicting value is rejected. |
+| `symmetric` | Integer formats only: selects symmetric rather than affine quantization. FP8 and MXFP4 do not consume it. |
+| `ste_clip` | Integer and FP8 formats: controls the saturation gradient mask. MXFP4 does not consume it because its saturation mask is always true. |
 | `ignore_patterns` | Exact, case-insensitive dotted Megatron path components to skip. |
 
 The format evidence is intentionally separated:

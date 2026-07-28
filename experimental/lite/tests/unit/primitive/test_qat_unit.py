@@ -70,7 +70,16 @@ def test_float_format_aliases_and_mxfp4_block():
     for bad in (0, -1, 16, 64):
         with pytest.raises(ValueError, match="microscaling block"):
             QATSpec(enabled=True, format="mxfp4", group_size=bad)
+    assert QATSpec(enabled=True, format="mxfp4").group_size == 32
     assert QATSpec(enabled=True, format="mxfp4", group_size=32).num_bits == 4
+
+
+@pytest.mark.parametrize("group_size", [0, -1, 4])
+def test_integer_group_size_keeps_explicit_semantics(group_size):
+    assert (
+        QATSpec(enabled=True, format="int4", group_size=group_size).group_size
+        == group_size
+    )
 
 
 def test_targets_module_skips_ignore_patterns():
