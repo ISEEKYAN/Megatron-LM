@@ -111,6 +111,31 @@ def test_deepep_buffer_slot_reuses_only_matching_slot(monkeypatch):
     assert built == [(group, 4096), (group, 4096)]
 
 
+def test_deepep_dispatch_materializes_contiguous_router_outputs():
+    class Buffer(_Buffer):
+        def __init__(self):
+            super().__init__()
+            self.layout_indices = None
+
+        def get_dispatch_layout(self, topk_indices, **_kwargs):
+            self.layout_indices = topk_indices
+            assert topk_indices.is_contiguous()
+            return None, None, None, None, _Event()
+
+    buffer = Buffer()
+    value = _dispatcher(buffer)
+    hidden = torch.zeros(3, 2)
+    scores = torch.ones(2, 3).transpose(0, 1)
+    indices = torch.zeros(2, 3, dtype=torch.long).transpose(0, 1)
+    assert not scores.is_contiguous()
+    assert not indices.is_contiguous()
+
+    value.submit_deepep_dispatch(hidden, scores, indices)
+
+    assert buffer.layout_indices is buffer.dispatch_calls[0][1]["topk_idx"]
+    assert buffer.dispatch_calls[0][1]["topk_weights"].is_contiguous()
+
+
 def test_prepared_combine_preserves_manual_metadata_and_finishes(monkeypatch):
     value = _dispatcher()
     monkeypatch.setattr(

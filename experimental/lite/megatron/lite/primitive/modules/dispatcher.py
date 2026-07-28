@@ -116,6 +116,8 @@ class _DeepEPDispatch(torch.autograd.Function):
         async_finish: bool,
         allocate_on_comm_stream: bool,
     ):
+        topk_indices = topk_indices.contiguous()
+        topk_scores = topk_scores.float().contiguous()
         previous_event = (
             EventOverlap(EventHandle())
             if async_finish and EventHandle is not None and EventOverlap is not None
@@ -138,7 +140,7 @@ class _DeepEPDispatch(torch.autograd.Function):
             buffer.dispatch(
                 hidden_states.contiguous(),
                 topk_idx=topk_indices,
-                topk_weights=topk_scores.float(),
+                topk_weights=topk_scores,
                 num_tokens_per_rank=num_tokens_per_rank,
                 num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
                 is_token_in_rank=is_token_in_rank,
@@ -669,6 +671,8 @@ class TokenDispatcher:
     ):
         if not self.use_deepep:
             raise RuntimeError("submit_deepep_dispatch requires DeepEP dispatch.")
+        topk_indices = topk_indices.contiguous()
+        topk_scores = topk_scores.float().contiguous()
         previous_event = (
             EventOverlap(EventHandle())
             if async_finish and EventHandle is not None and EventOverlap is not None
@@ -688,7 +692,6 @@ class TokenDispatcher:
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
 
-        topk_scores = topk_scores.float()
         hidden_states_contig = hidden_states.contiguous()
         recv_hidden, recv_indices, recv_probs, recv_per_expert, handle, event = (
             self.buffer.dispatch(
