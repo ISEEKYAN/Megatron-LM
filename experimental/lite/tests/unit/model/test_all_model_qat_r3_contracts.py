@@ -361,7 +361,7 @@ def _real_tiny_model(model_name: str, monkeypatch):
             num_experts_per_tok=1,
             n_group=1,
             topk_group=1,
-            first_k_dense_replace=1,
+            first_k_dense_replace=0,
             q_lora_rank=8,
             kv_lora_rank=8,
             qk_nope_head_dim=4,
@@ -393,7 +393,7 @@ def _real_tiny_model(model_name: str, monkeypatch):
             index_topk=2,
             intermediate_size=20,
             moe_intermediate_size=6,
-            first_k_dense_replace=1,
+            first_k_dense_replace=0,
             n_routed_experts=3,
             n_shared_experts=1,
             num_experts_per_tok=2,
@@ -433,7 +433,7 @@ def _real_tiny_model(model_name: str, monkeypatch):
     raise AssertionError(f"unsupported model: {model_name}")
 
 
-R3_SUPPORTED_MODEL_NAMES = ("qwen3_moe", "qwen3_5", "deepseek_v4")
+R3_SUPPORTED_MODEL_NAMES = MODEL_NAMES
 
 
 @pytest.mark.parametrize("cp_rank", [0, 1])
@@ -549,6 +549,22 @@ def test_supported_model_attaches_replay_only_to_decoder_router_count(
     finally:
         for root in roots:
             detach_router_replay(root)
+
+
+@pytest.mark.parametrize("model_name", MODEL_NAMES)
+def test_real_tiny_model_replay_attachment_count_matches_decoder_layers(
+    model_name: str,
+    transformer_engine_import_stub,
+    monkeypatch,
+):
+    _install_cpu_te_construction_stubs(transformer_engine_import_stub, monkeypatch)
+    model = _real_tiny_model(model_name, monkeypatch)
+
+    count = attach_router_replay(model, reset=False)
+    try:
+        assert count == len(model.layers)
+    finally:
+        detach_router_replay(model)
 
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)

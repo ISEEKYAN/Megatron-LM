@@ -17,21 +17,14 @@ from megatron.lite.primitive.modules.router_replay import (
 )
 from megatron.lite.primitive.parallel.thd import parallel_state_from_model
 
-R3_SUPPORTED_MODELS = frozenset({"qwen3_moe", "qwen3_5", "deepseek_v4"})
-_R3_CUSTOM_ROUTER_MODELS = frozenset({"glm5", "kimi_k2"})
+R3_SUPPORTED_MODELS = frozenset(
+    {"qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2"}
+)
 
 
 def _protocol_fn(protocol, name: str, fallback):
     fn = getattr(protocol, name, None) if protocol is not None else None
     return fn or fallback
-
-
-def _model_name_from_protocol(protocol) -> str | None:
-    name = getattr(protocol, "__name__", "")
-    prefix = "megatron.lite.model."
-    if not name.startswith(prefix):
-        return None
-    return name.removeprefix(prefix).split(".", 1)[0]
 
 
 class RouterReplayDriver:
@@ -52,15 +45,6 @@ class RouterReplayDriver:
         self._pp_total = 0
         self._emitted_evidence = False
 
-    def _validate_model_support(self) -> None:
-        model_name = _model_name_from_protocol(self._protocol)
-        if model_name not in _R3_CUSTOM_ROUTER_MODELS:
-            return
-        raise NotImplementedError(
-            f"{model_name} R3 router replay is unavailable: this model uses a "
-            "custom router that is not integrated with router replay."
-        )
-
     def _replay_roots(self):
         selector = (
             getattr(self._protocol, "router_replay_roots", None)
@@ -78,9 +62,7 @@ class RouterReplayDriver:
         action = spec.get("action") if isinstance(spec, dict) else spec
         if action in (None, "disabled"):
             return None
-        driver = cls(handle, action)
-        driver._validate_model_support()
-        return driver
+        return cls(handle, action)
 
     def begin(self) -> None:
         RouterReplay.clear_global_router_replay_instances()

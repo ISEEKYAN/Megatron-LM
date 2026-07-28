@@ -196,7 +196,14 @@ def test_glm5_config_preserves_mtp_aliases_and_layer_types():
 
 
 def test_glm5_lite_does_not_import_wrappers_or_sibling_models():
-    root = Path(__file__).resolve().parents[3] / "megatron" / "lite" / "model" / "glm5" / "lite"
+    root = (
+        Path(__file__).resolve().parents[3]
+        / "megatron"
+        / "lite"
+        / "model"
+        / "glm5"
+        / "lite"
+    )
     for path in root.glob("*.py"):
         text = path.read_text()
         assert "megatron.lite.model.qwen" not in text
@@ -208,7 +215,9 @@ def test_glm5_lite_does_not_import_wrappers_or_sibling_models():
 def test_glm5_lite_uses_shared_mla_and_dsa_primitive():
     root = Path(__file__).resolve().parents[3] / "megatron" / "lite"
     model_text = (root / "model" / "glm5" / "lite" / "model.py").read_text()
-    primitive_text = (root / "primitive" / "modules" / "attention" / "dsa.py").read_text()
+    primitive_text = (
+        root / "primitive" / "modules" / "attention" / "dsa.py"
+    ).read_text()
     kernel_text = (root / "primitive" / "kernels" / "dsa_kernels.py").read_text()
 
     assert "DynamicSparseAttention" in model_text
@@ -226,7 +235,9 @@ def test_glm5_lite_uses_shared_mla_and_dsa_primitive():
     assert "value_dim" in kernel_text
     assert "from cudnn.deepseek_sparse_attention import DSA" in kernel_text
     assert "from cudnn import DSA" in kernel_text
-    assert "cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90" in kernel_text
+    assert (
+        "cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90" in kernel_text
+    )
     assert "cudnn.deepseek_sparse_attention.indexer_forward._interface" in kernel_text
     assert "torch.cuda.get_device_capability(device)" in kernel_text
     assert "torch.topk" not in primitive_text
@@ -243,13 +254,19 @@ def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
     monkeypatch.setattr(dsa_kernels, "_load_indexer_fwd_sm90", lambda: sm90_entry)
     monkeypatch.setattr(dsa_kernels, "_load_indexer_fwd_sm100", lambda: sm100_entry)
 
-    monkeypatch.setattr(dsa_kernels.torch.cuda, "get_device_capability", lambda device: (9, 0))
+    monkeypatch.setattr(
+        dsa_kernels.torch.cuda, "get_device_capability", lambda device: (9, 0)
+    )
     assert dsa_kernels._select_indexer_forward(None) is sm90_entry
 
-    monkeypatch.setattr(dsa_kernels.torch.cuda, "get_device_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        dsa_kernels.torch.cuda, "get_device_capability", lambda device: (10, 0)
+    )
     assert dsa_kernels._select_indexer_forward(None) is sm100_entry
 
-    monkeypatch.setattr(dsa_kernels.torch.cuda, "get_device_capability", lambda device: (8, 0))
+    monkeypatch.setattr(
+        dsa_kernels.torch.cuda, "get_device_capability", lambda device: (8, 0)
+    )
     assert dsa_kernels._select_indexer_forward(None) is None
 
 
@@ -258,7 +275,10 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
     import torch
 
     from megatron.lite.primitive.modules.attention import dsa
-    from megatron.lite.primitive.modules.attention import DynamicSparseAttention, build_rope_cache
+    from megatron.lite.primitive.modules.attention import (
+        DynamicSparseAttention,
+        build_rope_cache,
+    )
 
     if not torch.cuda.is_available():
         pytest.skip("GLM-5 native attention requires CUDA (Transformer Engine RMSNorm)")
@@ -284,7 +304,14 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
         calculate_per_token_loss=False,
         value_dim=None,
     ):
-        del attn_sink, q_indexer, k_indexer, weights, softmax_scale, indexer_softmax_scale
+        del (
+            attn_sink,
+            q_indexer,
+            k_indexer,
+            weights,
+            softmax_scale,
+            indexer_softmax_scale,
+        )
         calls["training"] = {
             "query_shape": tuple(query.shape),
             "kv_shape": tuple(kv_full.shape),
@@ -348,7 +375,10 @@ def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
     import torch
 
     from megatron.lite.primitive.modules.attention import dsa
-    from megatron.lite.primitive.modules.attention import DynamicSparseAttention, build_rope_cache
+    from megatron.lite.primitive.modules.attention import (
+        DynamicSparseAttention,
+        build_rope_cache,
+    )
 
     if not torch.cuda.is_available():
         pytest.skip("GLM-5 native attention requires CUDA (Transformer Engine RMSNorm)")
@@ -356,7 +386,9 @@ def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
 
     calls = {}
 
-    def fake_indexer_topk(q_indexer, k_indexer, weights, topk, ratio, indexer_softmax_scale=1.0):
+    def fake_indexer_topk(
+        q_indexer, k_indexer, weights, topk, ratio, indexer_softmax_scale=1.0
+    ):
         del q_indexer, k_indexer, weights, indexer_softmax_scale
         calls["indexer"] = {"topk": topk, "ratio": ratio}
         idx = torch.zeros((1, 4, topk), dtype=torch.int32, device=device)
@@ -373,8 +405,13 @@ def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
         value_dim=None,
     ):
         del kv_full, attn_sink, topk_idxs, softmax_scale, indexer_topk
-        calls["sparse"] = {"topk_length_is_set": topk_length is not None, "value_dim": value_dim}
-        return query.new_zeros(query.shape[0], query.shape[1], query.shape[2] * value_dim)
+        calls["sparse"] = {
+            "topk_length_is_set": topk_length is not None,
+            "value_dim": value_dim,
+        }
+        return query.new_zeros(
+            query.shape[0], query.shape[1], query.shape[2] * value_dim
+        )
 
     monkeypatch.setattr(dsa._dsa_kernels, "indexer_topk", fake_indexer_topk)
     monkeypatch.setattr(dsa._dsa_kernels, "dsa_sparse_attn", fake_dsa_sparse_attn)
@@ -463,7 +500,8 @@ def test_glm52_index_share_shared_layers_omit_indexer_modules():
     assert "layers.2.self_attention.self_attention.indexer.wq_b.weight" in keys
     assert "layers.3.self_attention.self_attention.indexer.wq_b.weight" not in keys
     assert (
-        "mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight" in keys
+        "mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight"
+        in keys
     )
 
 
@@ -488,7 +526,9 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
 
     assert torch.equal(
         exported["model.layers.1.mlp.experts.2.gate_proj.weight"].detach().cpu(),
-        state["layers.1.moe.experts.fc1.weight2"][: cfg.moe_intermediate_size].detach().cpu(),
+        state["layers.1.moe.experts.fc1.weight2"][: cfg.moe_intermediate_size]
+        .detach()
+        .cpu(),
     )
     assert torch.equal(
         exported["model.layers.1.mlp.gate.e_score_correction_bias"].detach().cpu(),
@@ -498,7 +538,9 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
 
     hf_dir = tmp_path / "hf"
     save_hf_weights(model, str(hf_dir), cfg, ps)
-    with safe_open(str(hf_dir / "model.safetensors"), framework="pt", device="cpu") as handle:
+    with safe_open(
+        str(hf_dir / "model.safetensors"), framework="pt", device="cpu"
+    ) as handle:
         assert torch.equal(
             handle.get_tensor("model.layers.1.mlp.experts.2.down_proj.weight"),
             state["layers.1.moe.experts.fc2.weight2"].detach().cpu(),
@@ -519,7 +561,9 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
 
     hf_bf16_dir = tmp_path / "hf_bf16"
     save_hf_weights(model, str(hf_bf16_dir), cfg, ps, export_dtype=torch.bfloat16)
-    with safe_open(str(hf_bf16_dir / "model.safetensors"), framework="pt", device="cpu") as handle:
+    with safe_open(
+        str(hf_bf16_dir / "model.safetensors"), framework="pt", device="cpu"
+    ) as handle:
         floating_dtypes = {
             handle.get_tensor(key).dtype
             for key in handle.keys()
@@ -530,7 +574,9 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     loaded_bf16 = _make_glm5_model(cfg, ps=ps)
     load_hf_weights(loaded_bf16, str(hf_bf16_dir), cfg, ps)
     assert torch.equal(
-        loaded_bf16.state_dict()["layers.1.moe.experts.fc1.weight2"][cfg.moe_intermediate_size :]
+        loaded_bf16.state_dict()["layers.1.moe.experts.fc1.weight2"][
+            cfg.moe_intermediate_size :
+        ]
         .detach()
         .cpu(),
         state["layers.1.moe.experts.fc1.weight2"][cfg.moe_intermediate_size :]
@@ -553,7 +599,10 @@ def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
     import torch
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights, load_hf_weights
+    from megatron.lite.model.glm5.lite.checkpoint import (
+        export_hf_weights,
+        load_hf_weights,
+    )
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
     from megatron.lite.primitive.parallel import ParallelState
 
@@ -597,7 +646,9 @@ def test_glm52_checkpoint_mapping_skips_shared_indexer_without_te():
         / "lite"
         / "checkpoint.py"
     )
-    module_spec = importlib.util.spec_from_file_location("_glm5_checkpoint_test", checkpoint_path)
+    module_spec = importlib.util.spec_from_file_location(
+        "_glm5_checkpoint_test", checkpoint_path
+    )
     assert module_spec is not None and module_spec.loader is not None
     checkpoint_module = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(checkpoint_module)
@@ -620,7 +671,9 @@ def test_glm52_checkpoint_mapping_skips_shared_indexer_without_te():
         "layers.2.self_attention.self_attention.indexer.wq_b.weight", tensor
     ) == [("model.layers.2.self_attn.indexer.wq_b.weight", tensor)]
     assert (
-        spec.native_to_hf("layers.3.self_attention.self_attention.indexer.wq_b.weight", tensor)
+        spec.native_to_hf(
+            "layers.3.self_attention.self_attention.indexer.wq_b.weight", tensor
+        )
         == []
     )
     assert spec.native_to_hf(
@@ -669,7 +722,10 @@ def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp
         pytest.skip(f"Transformer Engine is not importable in this environment: {exc}")
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights, load_hf_weights
+    from megatron.lite.model.glm5.lite.checkpoint import (
+        export_hf_weights,
+        load_hf_weights,
+    )
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
     from megatron.lite.primitive.parallel import ParallelState
 
@@ -702,12 +758,16 @@ def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp
         loaded_state["layers.2.self_attention.self_attention.indexer.wq_b.weight"],
         state["layers.2.self_attention.self_attention.indexer.wq_b.weight"],
     )
-    assert "layers.3.self_attention.self_attention.indexer.wq_b.weight" not in loaded_state
+    assert (
+        "layers.3.self_attention.self_attention.indexer.wq_b.weight" not in loaded_state
+    )
     assert torch.equal(
         loaded_state[
             "mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight"
         ],
-        state["mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight"],
+        state[
+            "mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight"
+        ],
     )
 
 
@@ -715,12 +775,15 @@ def test_glm5_router_modules_use_current_names_and_bias_buffers():
     import torch
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5SigmoidTopKRouter
 
     model = _make_glm5_model(
         Glm5Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1), mtp_enable=True
     )
-    routers = [module for module in model.modules() if isinstance(module, Glm5SigmoidTopKRouter)]
+    routers = [
+        module
+        for module in model.modules()
+        if type(module).__name__ == "SigmoidTopKRouter"
+    ]
     assert len(routers) == 2
     for router in routers:
         assert hasattr(router, "gate")
@@ -777,19 +840,25 @@ def test_glm5_dsa_execution_policy_lives_in_impl_config_only(
     assert ImplConfig().dsa_indexer_loss_coeff == 0.0
     assert ImplConfig().dsa_indexer_use_sparse_loss is False
     assert ImplConfig().calculate_per_token_loss is False
-    assert ImplConfig(dsa_cp_mode="legacy_gather_all").dsa_cp_mode == "legacy_gather_all"
+    assert (
+        ImplConfig(dsa_cp_mode="legacy_gather_all").dsa_cp_mode == "legacy_gather_all"
+    )
 
 
 def test_glm5_production_cp_path_has_no_zigzag_layout():
     lite_root = Path(__file__).resolve().parents[3] / "megatron" / "lite"
     model_text = (lite_root / "model" / "glm5" / "lite" / "model.py").read_text()
-    dsa_text = (lite_root / "primitive" / "modules" / "attention" / "dsa.py").read_text()
+    dsa_text = (
+        lite_root / "primitive" / "modules" / "attention" / "dsa.py"
+    ).read_text()
 
     assert "zigzag" not in model_text
     assert "zigzag" not in dsa_text
 
 
-def test_glm5_attention_receives_impl_dsa_policy(monkeypatch, transformer_engine_import_stub):
+def test_glm5_attention_receives_impl_dsa_policy(
+    monkeypatch, transformer_engine_import_stub
+):
     import torch.nn as nn
 
     transformer_engine_import_stub()
@@ -907,7 +976,9 @@ def test_glm5_lite_tiny_forward_backward(monkeypatch):
     assert output["loss"].ndim == 0
     output["loss"].backward()
     grad_norm = sum(
-        param.grad.detach().float().norm() for param in model.parameters() if param.grad is not None
+        param.grad.detach().float().norm()
+        for param in model.parameters()
+        if param.grad is not None
     )
     assert torch.isfinite(grad_norm)
 
@@ -920,16 +991,26 @@ def test_glm5_lite_tiny_forward_backward(monkeypatch):
     mtp_infer = mtp_model(input_ids=input_ids)
     assert len(mtp_infer["mtp_hidden_states"]) == 1
     assert len(mtp_infer["mtp_logits"]) == 1
-    assert mtp_infer["mtp_hidden_states"][0].shape == (5, 2, mtp_model.config.hidden_size)
+    assert mtp_infer["mtp_hidden_states"][0].shape == (
+        5,
+        2,
+        mtp_model.config.hidden_size,
+    )
     assert mtp_infer["mtp_logits"][0].shape == (2, 5, mtp_model.config.vocab_size)
 
     # Training path (with labels) returns the MTP loss instead of logits.
     mtp_output = mtp_model(
-        input_ids=input_ids, labels=labels, loss_mask=torch.ones_like(labels, dtype=torch.float32)
+        input_ids=input_ids,
+        labels=labels,
+        loss_mask=torch.ones_like(labels, dtype=torch.float32),
     )
 
     assert len(mtp_output["mtp_hidden_states"]) == 1
-    assert mtp_output["mtp_hidden_states"][0].shape == (5, 2, mtp_model.config.hidden_size)
+    assert mtp_output["mtp_hidden_states"][0].shape == (
+        5,
+        2,
+        mtp_model.config.hidden_size,
+    )
     assert mtp_output["mtp_loss"].ndim == 0
     mtp_output["loss"].backward()
     mtp_grad_norm = sum(

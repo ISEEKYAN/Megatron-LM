@@ -29,6 +29,7 @@ from megatron.lite.model.protocol_utils import (
     add_loss_context_kwargs,
     nested_from_packed,
     pack_routed_experts as _pack_routed_experts,
+    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
 )
 from megatron.lite.primitive.bundle import ModelBundle

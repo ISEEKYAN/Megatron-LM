@@ -74,7 +74,9 @@ class TopKRouter(nn.Module):
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.register_buffer(
-            "expert_bias", torch.zeros(config.num_experts, dtype=torch.float32), persistent=False
+            "expert_bias",
+            torch.zeros(config.num_experts, dtype=torch.float32),
+            persistent=False,
         )
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
@@ -128,13 +130,18 @@ class TopKRouter(nn.Module):
         )
         if apply_aux_loss:
             routing_map, aux_scores = compute_routing_scores_for_aux_loss(
-                logits, self.topk, score_function="softmax", fused=self.moe_router_fusion
+                logits,
+                self.topk,
+                score_function="softmax",
+                fused=self.moe_router_fusion,
             )
             tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
             total_num_tokens = num_tokens
             if self._aux_loss_group is not None:
                 dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
+                total_num_tokens = num_tokens * dist.get_world_size(
+                    group=self._aux_loss_group
+                )
             aux_loss = switch_load_balancing_loss_func(
                 aux_scores,
                 tokens_per_expert,
@@ -161,6 +168,8 @@ class SigmoidTopKRouter(nn.Module):
         compute_aux_loss: bool = True,
         use_pre_softmax: bool = False,
         moe_router_fusion: bool = False,
+        router_dtype: torch.dtype | None = None,
+        expert_bias_persistent: bool = False,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -173,33 +182,70 @@ class SigmoidTopKRouter(nn.Module):
         self.aux_loss_coeff = getattr(config, "aux_loss_alpha", 0.0)
         self.scaling_factor = config.routed_scaling_factor
         self.score_function = getattr(config, "scoring_func", "sigmoid")
+        num_groups = getattr(config, "n_group", None)
+        self.num_groups = num_groups if num_groups and num_groups > 1 else None
+        self.group_topk = (
+            getattr(config, "topk_group", None) if self.num_groups is not None else None
+        )
         self.router_bias_rate = router_bias_rate
         self.compute_aux_loss = compute_aux_loss
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
+        self.router_dtype = router_dtype
         self.router_replay: RouterReplay | None = None
 
         self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
         self.register_buffer(
             "expert_bias",
             torch.zeros(config.n_routed_experts, dtype=torch.float32),
+            persistent=expert_bias_persistent,
+        )
+        self.register_buffer(
+            "local_tokens_per_expert",
+            torch.zeros(config.n_routed_experts, dtype=torch.float32),
             persistent=False,
         )
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
 
+    def _apply(self, fn):
+        super()._apply(fn)
+        self.expert_bias.data = self.expert_bias.data.float()
+        self.local_tokens_per_expert.data = self.local_tokens_per_expert.data.float()
+        return self
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = self.gate(x)
+        logits = (
+            self.gate(x)
+            if self.router_dtype is None
+            else router_gating_linear(
+                x,
+                self.gate.weight,
+                None,
+                self.router_dtype,
+            )
+        )
         logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
+        routing_kwargs = {}
+        if self.num_groups is not None and self.group_topk is not None:
+            routing_kwargs = {
+                "num_groups": self.num_groups,
+                "group_topk": self.group_topk,
+            }
         probs_dense, routing_map = topk_routing_with_score_function(
             logits,
             self.topk,
+            use_pre_softmax=self.use_pre_softmax,
             score_function=self.score_function,
             expert_bias=self.expert_bias.to(logits.dtype),
             scaling_factor=(self.scaling_factor or None),
             fused=self.moe_router_fusion,
+            **routing_kwargs,
         )
+        if torch.is_grad_enabled():
+            with torch.no_grad():
+                self.local_tokens_per_expert += routing_map.sum(dim=0)
         topk_scores, topk_indices = _ordered_topk_from_routing_map(
             probs_dense, routing_map, self.topk
         )
@@ -223,13 +269,18 @@ class SigmoidTopKRouter(nn.Module):
         )
         if apply_aux_loss:
             _, aux_scores = compute_routing_scores_for_aux_loss(
-                logits, self.topk, score_function=self.score_function, fused=self.moe_router_fusion
+                logits,
+                self.topk,
+                score_function=self.score_function,
+                fused=self.moe_router_fusion,
             )
             tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
             total_num_tokens = num_tokens
             if self._aux_loss_group is not None:
                 dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
+                total_num_tokens = num_tokens * dist.get_world_size(
+                    group=self._aux_loss_group
+                )
             aux_loss = switch_load_balancing_loss_func(
                 aux_scores,
                 tokens_per_expert,

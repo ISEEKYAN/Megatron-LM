@@ -3,12 +3,10 @@
 
 from __future__ import annotations
 
-import inspect
 import os
 from contextlib import nullcontext
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
@@ -17,8 +15,8 @@ from megatron.lite.model.kimi_k2.config import KimiK2Config
 from megatron.lite.primitive.modules.attention import MultiLatentAttention
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
-from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
+from megatron.lite.primitive.modules.router import SigmoidTopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
@@ -37,12 +35,6 @@ from megatron.lite.primitive.parallel import (
     scatter_to_sequence_parallel,
 )
 from megatron.lite.primitive.utils import build_fp8_recipe
-from megatron.lite.primitive.utils.moe import (
-    compute_routing_scores_for_aux_loss,
-    router_gating_linear,
-    switch_load_balancing_loss_func,
-    topk_routing_with_score_function,
-)
 
 _SP_GRAD_SUFFIXES: tuple[str, ...] = (
     ".input_layernorm.weight",
@@ -61,7 +53,8 @@ def _collect_sp_grad_params(model: nn.Module) -> list[nn.Parameter]:
     return [
         param
         for name, param in model.named_parameters()
-        if any(name.endswith(suffix) for suffix in _SP_GRAD_SUFFIXES) or name == "norm.weight"
+        if any(name.endswith(suffix) for suffix in _SP_GRAD_SUFFIXES)
+        or name == "norm.weight"
     ]
 
 
@@ -72,144 +65,12 @@ def _swiglu(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x1) * x2
 
 
-def _reduce_scatter_to_sequence_parallel(x: torch.Tensor, ps: ParallelState) -> torch.Tensor:
+def _reduce_scatter_to_sequence_parallel(
+    x: torch.Tensor, ps: ParallelState
+) -> torch.Tensor:
     if ps.tp_size == 1:
         return x
     return ReduceScatterDim0.apply(x, ps.tp_size, ps.tp_rank, ps.tp_group)
-
-
-def _ordered_topk_from_routing_map(
-    probs_dense: torch.Tensor, routing_map: torch.Tensor, topk: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    expert_ids = torch.arange(
-        probs_dense.size(-1), device=probs_dense.device, dtype=torch.long
-    ).expand_as(routing_map)
-    masked_ids = torch.where(
-        routing_map, expert_ids, torch.full_like(expert_ids, probs_dense.size(-1))
-    )
-    topk_indices = torch.sort(masked_ids, dim=-1).values[:, :topk]
-    topk_scores = torch.gather(probs_dense, dim=-1, index=topk_indices)
-    return topk_scores, topk_indices
-
-
-def _router_linear(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    router_dtype: torch.dtype,
-) -> torch.Tensor:
-    if x.is_cuda:
-        return router_gating_linear(x, weight, bias, router_dtype)
-    return F.linear(
-        x.to(router_dtype),
-        weight.to(router_dtype),
-        None if bias is None else bias.to(router_dtype),
-    )
-
-
-def _topk_routing_supports_groups() -> bool:
-    params = inspect.signature(topk_routing_with_score_function).parameters
-    return "num_groups" in params and "group_topk" in params
-
-
-class KimiK2SigmoidTopKRouter(nn.Module):
-    """Kimi K2 sigmoid router with group-limited routing and persistent expert bias."""
-
-    def __init__(
-        self,
-        config: KimiK2Config,
-        ps: ParallelState,
-        *,
-        router_bias_rate: float = 0.0,
-        compute_aux_loss: bool = True,
-        use_pre_softmax: bool = False,
-        moe_router_fusion: bool = False,
-    ):
-        super().__init__()
-        if router_bias_rate > 0:
-            raise NotImplementedError(
-                "Kimi K2 expert-bias EMA update is not implemented in lite yet."
-            )
-        self.topk = config.num_experts_per_tok
-        self.num_experts = config.n_routed_experts
-        self.aux_loss_coeff = config.aux_loss_alpha
-        self.scaling_factor = config.routed_scaling_factor
-        self.num_groups = config.n_group
-        self.group_topk = config.topk_group
-        self.router_bias_rate = router_bias_rate
-        self.compute_aux_loss = compute_aux_loss
-        self.use_pre_softmax = use_pre_softmax
-        self.moe_router_fusion = moe_router_fusion
-
-        self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
-        self.register_buffer(
-            "expert_bias",
-            torch.zeros(config.n_routed_experts, dtype=torch.float32),
-            persistent=True,
-        )
-        self.register_buffer(
-            "local_tokens_per_expert",
-            torch.zeros(config.n_routed_experts, dtype=torch.float32),
-            persistent=False,
-        )
-        self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
-
-    def _apply(self, fn):
-        super()._apply(fn)
-        self.expert_bias.data = self.expert_bias.data.float()
-        self.local_tokens_per_expert.data = self.local_tokens_per_expert.data.float()
-        return self
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = _router_linear(x, self.gate.weight, None, torch.float32)
-        logits = logits.view(-1, self.num_experts)
-        num_tokens = logits.size(0)
-        routing_kwargs = {}
-        if self.num_groups is not None and self.group_topk is not None:
-            if not _topk_routing_supports_groups():
-                raise NotImplementedError(
-                    "topk_routing_with_score_function does not support group-limited routing."
-                )
-            routing_kwargs = dict(num_groups=self.num_groups, group_topk=self.group_topk)
-        probs_dense, routing_map = topk_routing_with_score_function(
-            logits,
-            self.topk,
-            use_pre_softmax=self.use_pre_softmax,
-            score_function="sigmoid",
-            expert_bias=self.expert_bias.to(logits.dtype),
-            scaling_factor=(self.scaling_factor or None),
-            fused=self.moe_router_fusion,
-            **routing_kwargs,
-        )
-        if torch.is_grad_enabled():
-            with torch.no_grad():
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
-        topk_scores, topk_indices = _ordered_topk_from_routing_map(
-            probs_dense, routing_map, self.topk
-        )
-        topk_scores = topk_scores.to(logits.dtype)
-
-        if self.compute_aux_loss and self.training and torch.is_grad_enabled():
-            _, aux_scores = compute_routing_scores_for_aux_loss(
-                logits, self.topk, score_function="sigmoid", fused=self.moe_router_fusion
-            )
-            tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
-            total_num_tokens = num_tokens
-            if self._aux_loss_group is not None:
-                dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
-            aux_loss = switch_load_balancing_loss_func(
-                aux_scores,
-                tokens_per_expert,
-                total_num_tokens,
-                self.topk,
-                self.num_experts,
-                self.aux_loss_coeff,
-                fused=False,
-            )
-            topk_scores = MoEAuxLossAutoScaler.apply(topk_scores, aux_loss)
-
-        return topk_scores, topk_indices
 
 
 class DenseMLP(nn.Module):
@@ -223,7 +84,9 @@ class DenseMLP(nn.Module):
             normalization="RMSNorm",
             eps=config.rms_norm_eps,
         )
-        self.down = RowParallelLinear(config.intermediate_size, config.hidden_size, ps, bias=False)
+        self.down = RowParallelLinear(
+            config.intermediate_size, config.hidden_size, ps, bias=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down(_swiglu(self.gate_up(x)))
@@ -276,13 +139,17 @@ class MoELayer(nn.Module):
     ):
         super().__init__()
         if fp8:
-            raise NotImplementedError("Kimi K2 lite MoE fp8 training is not implemented yet.")
-        self.router = KimiK2SigmoidTopKRouter(
+            raise NotImplementedError(
+                "Kimi K2 lite MoE fp8 training is not implemented yet."
+            )
+        self.router = SigmoidTopKRouter(
             config,
             ps,
             router_bias_rate=router_bias_rate,
             compute_aux_loss=True,
             use_pre_softmax=True,
+            router_dtype=torch.float32,
+            expert_bias_persistent=True,
         )
         self.experts = Experts(
             config,
@@ -303,7 +170,9 @@ class MoELayer(nn.Module):
 
         flat_x = x.view(-1, x.size(-1))
         scores, indices = self.router(flat_x)
-        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(flat_x, scores, indices)
+        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(
+            flat_x, scores, indices
+        )
         del scores, indices
         self.dispatcher.wait_dispatch_event()
         expert_out = self.experts(
@@ -368,7 +237,9 @@ class KimiK2Layer(nn.Module):
             self.mlp = DenseMLP(config, ps)
 
     def forward(self, x: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
-        x = x + self.self_attention(self.input_layernorm(x), packed_seq_params=packed_seq_params)
+        x = x + self.self_attention(
+            self.input_layernorm(x), packed_seq_params=packed_seq_params
+        )
         if self.moe is not None:
             assert self.mlp_norm is not None
             mlp_input = self.mlp_norm(x)
@@ -384,7 +255,9 @@ def _roll_mtp_left(
     dims: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if packed_seq_params is not None:
-        return roll_packed_thd_left(tensor, packed_seq_params=packed_seq_params, dims=dims)
+        return roll_packed_thd_left(
+            tensor, packed_seq_params=packed_seq_params, dims=dims
+        )
     dim = dims if dims >= 0 else tensor.dim() + dims
     rolled = torch.roll(tensor, shifts=-1, dims=dim)
     rolled.select(dim, -1).zero_()
@@ -441,7 +314,9 @@ class KimiK2MTPLayer(nn.Module):
         packed_seq_params=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         del rotary_position_ids
-        input_ids, _ = _roll_mtp_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
+        input_ids, _ = _roll_mtp_left(
+            input_ids, packed_seq_params=packed_seq_params, dims=-1
+        )
         if position_ids is not None:
             position_ids, _ = _roll_mtp_left(
                 position_ids, packed_seq_params=packed_seq_params, dims=-1
@@ -458,7 +333,9 @@ class KimiK2MTPLayer(nn.Module):
         hidden_states = torch.cat((decoder_input, hidden_states), dim=-1)
         hidden_states = self.eh_proj(hidden_states)
         hidden_states = scatter_to_sequence_parallel(hidden_states, self.ps)
-        hidden_states = self.transformer_layer(hidden_states, packed_seq_params=packed_seq_params)
+        hidden_states = self.transformer_layer(
+            hidden_states, packed_seq_params=packed_seq_params
+        )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids
 
@@ -594,10 +471,14 @@ class KimiK2Model(nn.Module):
 
         self.embed: VocabParallelEmbedding | None = None
         if layout.has_embed:
-            self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+            self.embed = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, ps
+            )
 
         recompute_modules = getattr(train_config, "recompute_modules", [])
-        moe_act_recompute = "moe_act" in recompute_modules and "moe" not in recompute_modules
+        moe_act_recompute = (
+            "moe_act" in recompute_modules and "moe" not in recompute_modules
+        )
         self.layers = nn.ModuleList(
             [
                 KimiK2Layer(
@@ -625,7 +506,9 @@ class KimiK2Model(nn.Module):
         if mtp_enable and config.num_nextn_predict_layers > 0 and layout.has_mtp:
             mtp_embedding = self.embed
             if mtp_embedding is None:
-                mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+                mtp_embedding = VocabParallelEmbedding(
+                    config.vocab_size, config.hidden_size, ps
+                )
                 self.mtp_embed = mtp_embedding
             self.mtp = KimiK2MTPBlock(
                 config,
@@ -673,7 +556,9 @@ class KimiK2Model(nn.Module):
             h = hidden_states
 
         fp8_ctx = (
-            te.fp8_autocast(enabled=True, fp8_recipe=build_fp8_recipe(self.train_config))
+            te.fp8_autocast(
+                enabled=True, fp8_recipe=build_fp8_recipe(self.train_config)
+            )
             if self.train_config.fp8
             else nullcontext()
         )
@@ -711,7 +596,9 @@ class KimiK2Model(nn.Module):
                     output["mtp_loss"] = mtp_loss
                 labels_sb = labels.transpose(0, 1).contiguous()
                 if use_fused_kernels:
-                    hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
+                    hidden_full = gather_from_sequence_parallel(
+                        hidden_for_head, self.ps
+                    )
                     log_probs, entropy = linear_cross_entropy(
                         hidden_full,
                         self._head_weight_for_fused_ce(hidden_full),
@@ -727,7 +614,9 @@ class KimiK2Model(nn.Module):
                     logits = self.head(hidden_for_head)
                     if temperature_value != 1.0:
                         logits = logits / temperature_value
-                    loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                    loss = vocab_parallel_cross_entropy(
+                        logits, labels_sb, self.ps.tp_group
+                    )
                     output["loss"] = loss.mean()
                     output["log_probs"] = (-loss).transpose(0, 1).contiguous()
                     if calculate_entropy:
@@ -738,7 +627,9 @@ class KimiK2Model(nn.Module):
                 output["logits"] = self.head.gather(logits).transpose(0, 1).contiguous()
                 if mtp_hidden_states is not None:
                     output["mtp_logits"] = [
-                        self.head.gather(self.head(mtp_hidden)).transpose(0, 1).contiguous()
+                        self.head.gather(self.head(mtp_hidden))
+                        .transpose(0, 1)
+                        .contiguous()
                         for mtp_hidden in mtp_hidden_states
                     ]
         return output
@@ -814,13 +705,17 @@ class KimiK2Model(nn.Module):
                 logits = self.head(mtp_hidden)
                 if temperature != 1.0:
                     logits = logits / temperature
-                token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                token_loss = vocab_parallel_cross_entropy(
+                    logits, labels_sb, self.ps.tp_group
+                )
 
             token_loss = token_loss * mask_sb.to(dtype=token_loss.dtype)
             num_tokens = num_tokens.to(dtype=token_loss.dtype).clamp_min(1.0)
             mtp_loss_values.append(token_loss.sum() / num_tokens)
 
-            mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
+            mtp_loss_scale = self.mtp_loss_scaling_factor / max(
+                len(mtp_hidden_states), 1
+            )
             hidden_states = MTPLossAutoScaler.apply(
                 hidden_states,
                 mtp_loss_scale * token_loss / num_tokens,
@@ -837,7 +732,9 @@ class KimiK2Model(nn.Module):
         assert self.head is not None
         weight = self.head.col.linear.weight
         return (
-            weight if weight.dtype == hidden_states.dtype else weight.to(dtype=hidden_states.dtype)
+            weight
+            if weight.dtype == hidden_states.dtype
+            else weight.to(dtype=hidden_states.dtype)
         )
 
 
