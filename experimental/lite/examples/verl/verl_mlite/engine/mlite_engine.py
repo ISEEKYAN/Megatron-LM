@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import os
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -381,15 +382,30 @@ class MegatronLiteEngine(BaseEngine):
             for key in ("limit", "include_mtp_only", "include_local_prefixes")
             if key in kwargs
         }
+        export_kwargs.update(
+            buffer_max_size_bytes=2 * 1024**3,
+            cpu=False,
+        )
         if self.engine_config.resync_format is not None:
             export_kwargs["target"] = self.engine_config.resync_format
             if self.engine_config.resync_config:
                 export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
-        elif self.engine_config.model_name == "qwen3_5":
+        elif self._resolve_model_name() == "qwen3_5":
+            # Qwen3.5 selects its vLLM checkpoint layout through target=.
+            # Qwen3-MoE's HF exporter has no target parameter, so forwarding
+            # this keyword there fails at the first online weight resync.
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
-        return self.runtime.export_weights(self.handle, **export_kwargs), None
+        weights = self.runtime.export_weights(self.handle, **export_kwargs)
+        if self.engine_config.qat.get("enable", False):
+            from verl.utils.modelopt import export_qat_weights
+
+            qat_config = SimpleNamespace(**self.engine_config.qat)
+            weights = export_qat_weights(
+                weights, [self.module], qat_config, bridge=None
+            )
+        return weights, None
 
     def get_data_parallel_size(self):
         if self.handle is None:
@@ -787,6 +803,9 @@ class MegatronLiteEngine(BaseEngine):
                 "MegatronLiteEngine supports only nested no-padding THD batches."
             )
         loss_mask = self._loss_mask_for_packing(micro_batch, input_ids)
+        r3_replay_mask = None
+        if self.engine_config.router_replay_mode == "R3":
+            r3_replay_mask = self._r3_replay_mask_for_packing(micro_batch, input_ids)
         routed_experts = micro_batch.get("routed_experts", None)
         if routed_experts is not None and not getattr(routed_experts, "is_nested", False):
             raise ValueError(
@@ -799,6 +818,9 @@ class MegatronLiteEngine(BaseEngine):
             loss_mask=None if loss_mask is None else loss_mask.values().contiguous().float(),
             seq_lens=input_ids.offsets().diff().to(dtype=torch.int64),
             routed_experts=routed_experts,
+            r3_replay_mask=(
+                None if r3_replay_mask is None else r3_replay_mask.values().contiguous()
+            ),
         )
 
     def _make_runtime_loss_context(
@@ -868,6 +890,15 @@ class MegatronLiteEngine(BaseEngine):
                 full_mask[-response_tokens:] = row_mask[:response_tokens]
             rows.append(full_mask)
         return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+    @staticmethod
+    def _r3_replay_mask_for_packing(
+        micro_batch: TensorDict, input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Reuse VERL's canonical R3 semantics while inputs are still jagged."""
+        from verl.utils.megatron.router_replay_utils import build_r3_replay_mask
+
+        return build_r3_replay_mask(input_ids, micro_batch["response_mask"])
 
     def _build_verl_model_output(
         self,

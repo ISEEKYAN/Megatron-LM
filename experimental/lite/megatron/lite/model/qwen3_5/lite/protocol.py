@@ -14,6 +14,7 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     pack_thd_forward_kwargs,
+    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
@@ -24,6 +25,11 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load
 from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
+from megatron.lite.primitive.quantization import (
+    QATSpec,
+    apply_qat_to_chunks,
+    normalize_qat_spec,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
@@ -72,6 +78,7 @@ class ImplConfig:
     # all heads, best memory; bf16-floor vs CP-off, faithful packing-aware mirror of
     # upstream Megatron linear_cp_mode='chunkwise').
     gdn_cp_mode: str = "headwise"
+    qat: QATSpec | dict | None = None
 
 
 def _full_attn_module(layer, name: str):
@@ -236,6 +243,9 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
         for chunk in chunks:
             apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
+
+    # Parametrize before optimizer construction so it captures the BF16 master.
+    apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
 
     optimizer = None
     finalize_grads = None

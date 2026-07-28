@@ -33,6 +33,23 @@ def _parallel_state(model) -> ParallelState:
     return parallel_state_from_model(model) or ParallelState()
 
 
+def router_replay_roots(chunk) -> list:
+    """Select decoder layers for R3, excluding MTP-only routers.
+
+    The current rollout configuration does not run MTP, so route tensors have
+    one layer-axis entry per main decoder router.  MTP layers therefore keep
+    their native routing instead of consuming that rollout-owned axis.  If a
+    future rollout enables MTP speculative decoding, this assumption must be
+    reevaluated.
+    """
+    model = getattr(chunk, "model", chunk)
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        return [chunk]
+    values = getattr(layers, "values", None)
+    return list(values()) if callable(values) else list(layers)
+
+
 def nested_from_packed(tensor: torch.Tensor | None, seq_lens: torch.Tensor):
     """Split a 1-D packed (true, unpadded) tensor back into a jagged nested tensor."""
     if tensor is None:
@@ -175,24 +192,25 @@ def pack_routed_experts(
 def pack_r3_replay_mask(
     model, batch: PackedBatch, *, contiguous: bool = False
 ) -> torch.Tensor:
-    """Build and pack the causal R3 mask from a full-sequence loss mask.
+    """Pack a caller-provided causal R3 replay mask for the local layout.
 
-    Every row before the final token can influence a response-token logprob.
-    The final row has no consumed next-token logit and stays on native routing.
-    Sequences without response tokens are not replayed.
+    This helper performs only model-local THD/CP/TP layout conversion. The mask
+    semantics are defined by the caller and carried with the packed batch; a
+    missing mask fails loudly.
     """
 
+    if batch.r3_replay_mask is None:
+        raise ValueError("R3 router replay requires batch.r3_replay_mask.")
+    if batch.r3_replay_mask.numel() != int(batch.seq_lens.sum().item()):
+        raise ValueError(
+            "batch.r3_replay_mask must contain one entry per packed input token."
+        )
     rows = []
     offset = 0
     for length_tensor in batch.seq_lens:
         length = int(length_tensor.item())
-        has_response = True
-        if batch.loss_mask is not None:
-            has_response = bool(batch.loss_mask[offset : offset + length].sum().item())
-        row = torch.zeros(length, dtype=torch.long, device=batch.input_ids.device)
-        if has_response and length > 1:
-            row[:-1] = 1
-        rows.append(row[:, None, None])
+        row = batch.r3_replay_mask[offset : offset + length]
+        rows.append(row.to(device=batch.input_ids.device)[:, None, None])
         offset += length
     nested = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
     return pack_routed_experts(model, batch, nested, contiguous=contiguous)[0][

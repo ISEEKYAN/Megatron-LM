@@ -284,7 +284,14 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
         calculate_per_token_loss=False,
         value_dim=None,
     ):
-        del attn_sink, q_indexer, k_indexer, weights, softmax_scale, indexer_softmax_scale
+        del (
+            attn_sink,
+            q_indexer,
+            k_indexer,
+            weights,
+            softmax_scale,
+            indexer_softmax_scale,
+        )
         calls["training"] = {
             "query_shape": tuple(query.shape),
             "kv_shape": tuple(kv_full.shape),
@@ -715,12 +722,15 @@ def test_glm5_router_modules_use_current_names_and_bias_buffers():
     import torch
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5SigmoidTopKRouter
 
     model = _make_glm5_model(
         Glm5Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1), mtp_enable=True
     )
-    routers = [module for module in model.modules() if isinstance(module, Glm5SigmoidTopKRouter)]
+    routers = [
+        module
+        for module in model.modules()
+        if type(module).__name__ == "SigmoidTopKRouter"
+    ]
     assert len(routers) == 2
     for router in routers:
         assert hasattr(router, "gate")

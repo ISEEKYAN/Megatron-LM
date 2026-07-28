@@ -19,7 +19,16 @@ class RouterReplayAction(Enum):
 class RouterReplay:
     """Replay expert indices while gathering scores from the live router."""
 
-    global_router_replay_instances: list["RouterReplay"] = []
+    global_router_replay_instances: list[RouterReplay] = []
+
+    # Instrumentation. Counts how much routing the replay actually *substituted*,
+    # which is the only direct evidence that R3 is doing work: `routed_experts`
+    # being non-None only proves the data arrived, not that any routing decision
+    # was overridden. A run where replay is wired up but every substitution is a
+    # no-op is indistinguishable from a working one without these counters.
+    replay_rows_total: int = 0
+    replay_rows_changed: int = 0
+    replay_calls: int = 0
 
     def __init__(self) -> None:
         self.target_topk_idx: torch.Tensor | None = None
@@ -29,6 +38,20 @@ class RouterReplay:
         self.replay_backward_list: list[torch.Tensor] = []
         self.replay_backward_mask_list: list[torch.Tensor | None] = []
         RouterReplay.global_router_replay_instances.append(self)
+
+    @staticmethod
+    def reset_replay_stats() -> None:
+        RouterReplay.replay_rows_total = 0
+        RouterReplay.replay_rows_changed = 0
+        RouterReplay.replay_calls = 0
+
+    @staticmethod
+    def replay_stats() -> dict[str, int]:
+        return {
+            "calls": RouterReplay.replay_calls,
+            "rows": RouterReplay.replay_rows_total,
+            "changed": RouterReplay.replay_rows_changed,
+        }
 
     @staticmethod
     def clear_global_router_replay_instances() -> None:
@@ -117,14 +140,31 @@ class RouterReplay:
                 f"target={tuple(target.shape)} live={tuple(native_indices.shape)}."
             )
         if mask is None:
-            return target
-        mask = mask.to(device=native_indices.device, dtype=torch.bool).reshape(-1, 1)
-        if mask.size(0) != target.size(0):
-            raise ValueError(
-                "router replay mask length does not match routing rows: "
-                f"mask={mask.size(0)} rows={target.size(0)}."
+            selected = target
+        else:
+            mask = mask.to(device=native_indices.device, dtype=torch.bool).reshape(
+                -1, 1
             )
-        return torch.where(mask, target, native_indices)
+            if mask.size(0) != target.size(0):
+                raise ValueError(
+                    f"router replay mask length does not match routing rows: mask={mask.size(0)} rows={target.size(0)}."
+                )
+            selected = torch.where(mask, target, native_indices)
+        self._record_replay_stats(native_indices, selected)
+        return selected
+
+    @staticmethod
+    def _record_replay_stats(native: torch.Tensor, selected: torch.Tensor) -> None:
+        """Accumulate how many routing rows replay actually changed.
+
+        Counted per (token, top-k slot) row so the number is comparable across
+        layers and micro-batches. Cheap: one elementwise compare + two reductions
+        on an already-resident int tensor.
+        """
+        with torch.no_grad():
+            RouterReplay.replay_calls += 1
+            RouterReplay.replay_rows_total += int(native.numel())
+            RouterReplay.replay_rows_changed += int((selected != native).sum().item())
 
 
 def attach_router_replay(model: nn.Module, *, reset: bool = True) -> int:

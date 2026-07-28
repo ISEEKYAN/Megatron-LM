@@ -28,13 +28,18 @@ import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
 from megatron.lite.model.glm5.config import Glm5Config
+from megatron.lite.primitive.quantization.qat import (
+    canonical_state_key as _canonical_state_key,
+)
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
     parse_expert_idx,
     unwrap_model,
 )
 from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.quantization.mxfp4 import MXFP4_BLOCK_SIZE, quantize_mxfp4
 from megatron.lite.primitive.utils import ensure_divisible, log_rank0
+from megatron.lite.runtime.contracts.weights import ResyncFormat
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -305,12 +310,13 @@ def _load_experts(
 
 def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> None:
     state = model.state_dict()
+    canonical = {_canonical_state_key(key): key for key in state}
     resolved: dict[str, torch.Tensor] = {}
     for name, tensor in loaded.items():
-        actual = name if name in state else None
+        actual = name if name in state else canonical.get(name)
         if actual is None:
-            for key in state:
-                if name in key:
+            for logical, key in canonical.items():
+                if name in logical:
                     actual = key
                     break
         if actual is not None:
@@ -639,8 +645,34 @@ def export_hf_weights(model, config: Glm5Config, ps: ParallelState, **kwargs):
 
     if config is None:
         raise ValueError("GLM5 HF export requires a non-null model config")
+    target = kwargs.pop("target", "hf")
+    resync_config = kwargs.pop("resync_config", None)
     spec = Glm5WeightSpec(config)
-    yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
+    weights = _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
+    if target in {"hf", ResyncFormat.BF16.value}:
+        if resync_config:
+            raise ValueError("GLM5 resync_config requires target='mxfp4'")
+        yield from weights
+        return
+    if ResyncFormat.parse(target) is not ResyncFormat.MXFP4:
+        raise ValueError(f"GLM5 does not support resync target {target!r}")
+    if resync_config:
+        raise ValueError("GLM5 MXFP4 resync does not accept resync_config")
+    yield from _export_mxfp4_weights(weights)
+
+
+def _export_mxfp4_weights(weights):
+    """Convert the GLM5 HF stream to compressed-tensors MXFP4 tensors."""
+    for name, tensor in weights:
+        ignored = name.endswith(("embed_tokens.weight", "lm_head.weight", ".mlp.gate.weight"))
+        if ignored or not name.endswith(".weight") or tensor.ndim != 2 or not tensor.dtype.is_floating_point:
+            yield name, tensor
+            continue
+        if tensor.shape[-1] % MXFP4_BLOCK_SIZE:
+            raise ValueError(f"MXFP4 weight {name!r} has input dimension {tensor.shape[-1]}, which is not divisible by {MXFP4_BLOCK_SIZE}")
+        packed, scale = quantize_mxfp4(tensor)
+        yield name, packed.view(torch.uint8)
+        yield f"{name[:-7]}.weight_scale", scale.view(torch.uint8)
 
 
 def save_hf_weights(model, path: str, config: Glm5Config, ps: ParallelState, **kwargs) -> None:

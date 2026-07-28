@@ -9,9 +9,10 @@ model-specific: the weight map and tensor conversions.
 from __future__ import annotations
 
 import torch
-from torch.distributed.tensor import Replicate, Shard
-
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+from megatron.lite.primitive.quantization.qat import (
+    canonical_state_key as _canonical_state_key,
+)
 from megatron.lite.primitive.ckpt.dcp import (  # noqa: F401 — re-export
     canonicalize_fc1_for_dcp,
     canonicalize_qkv_for_dcp,
@@ -19,6 +20,12 @@ from megatron.lite.primitive.ckpt.dcp import (  # noqa: F401 — re-export
     decanon_qkv_after_dcp,
 )
 from megatron.lite.primitive.ckpt.hf_weights import extract_layer_idx, parse_expert_idx
+from megatron.lite.primitive.quantization.mxfp4 import (
+    MXFP4_BLOCK_SIZE,
+    quantize_mxfp4,
+)
+from megatron.lite.runtime.contracts.weights import ResyncFormat
+from torch.distributed.tensor import Replicate, Shard
 
 
 def _pack_mcore_qkv(
@@ -252,18 +259,78 @@ class Qwen3MoEWeightSpec:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_param_name_canonical(name: str, state_dict: dict) -> str | None:
+    """Resolve a logical checkpoint name onto a possibly QAT-parametrized key."""
+    canonical = {_canonical_state_key(key): key for key in state_dict}
+    if name in state_dict:
+        return name
+    if name in canonical:
+        return canonical[name]
+    for logical, key in canonical.items():
+        if name in logical:
+            return key
+    return None
+
+
 def load_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:
+    from megatron.lite.primitive.ckpt import hf_weights as hf_weights_module
     from megatron.lite.primitive.ckpt.hf_weights import load_hf_weights as _load
 
-    _load(model, path, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size)
+    original_resolve = hf_weights_module._resolve_param_name
+    hf_weights_module._resolve_param_name = _resolve_param_name_canonical
+    try:
+        _load(model, path, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size)
+    finally:
+        hf_weights_module._resolve_param_name = original_resolve
 
 
 def export_hf_weights(model, config: Qwen3MoEConfig, ps, **kwargs):
     from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
 
-    yield from _export(
-        model, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size, **kwargs
+    target = kwargs.pop("target", "hf")
+    resync_config = kwargs.pop("resync_config", None)
+    weights = _export(
+        model,
+        Qwen3MoEWeightSpec(config),
+        ps,
+        vocab_size=config.vocab_size,
+        **kwargs,
     )
+    if target in {"hf", ResyncFormat.BF16.value}:
+        if resync_config:
+            raise ValueError("Qwen3-MoE resync_config requires target='mxfp4'")
+        yield from weights
+        return
+    if ResyncFormat.parse(target) is not ResyncFormat.MXFP4:
+        raise ValueError(f"Qwen3-MoE does not support resync target {target!r}")
+    if resync_config:
+        raise ValueError("Qwen3-MoE MXFP4 resync does not accept resync_config")
+    yield from _export_mxfp4_weights(weights)
+
+
+def _export_mxfp4_weights(weights):
+    """Convert the Qwen3 HF stream to compressed-tensors MXFP4 tensors."""
+    for name, tensor in weights:
+        is_ignored = name in {
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+        } or name.endswith(".mlp.gate.weight")
+        if (
+            is_ignored
+            or not name.endswith(".weight")
+            or tensor.ndim != 2
+            or not tensor.dtype.is_floating_point
+        ):
+            yield name, tensor
+            continue
+        if tensor.shape[-1] % MXFP4_BLOCK_SIZE:
+            raise ValueError(
+                f"MXFP4 weight {name!r} has input dimension {tensor.shape[-1]}, "
+                f"which is not divisible by {MXFP4_BLOCK_SIZE}"
+            )
+        packed, scale = quantize_mxfp4(tensor)
+        yield name, packed.view(torch.uint8)
+        yield f"{name[:-7]}.weight_scale", scale.view(torch.uint8)
 
 
 def save_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:
