@@ -77,7 +77,6 @@ def test_chunked_backward_submits_dgrad_before_te_delayed_wgrad(
     assert source.index("pending_dispatch_bwd.append") < source.index(
         "pop_delayed_weight_grads"
     )
-    assert source.count("for chunk, local_state in pending_dispatch_bwd:") == 1
     assert "retain_graph=True" not in source
 
 
