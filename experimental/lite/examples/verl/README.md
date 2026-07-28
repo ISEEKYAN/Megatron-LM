@@ -148,6 +148,9 @@ Useful GRPO knobs:
   backend in text-only mode for GSM8K by default.
 - `ACTOR_TP`, `ACTOR_PP`, `ACTOR_VPP`, `ACTOR_CP`, `ACTOR_EP`, `ACTOR_ETP`
 - `PARAM_OFFLOAD`, `OPTIMIZER_OFFLOAD`, `GRAD_OFFLOAD`
+- `OMP_NUM_THREADS=1` is forwarded through Ray's runtime environment by
+  default, matching `torchrun`'s multi-process overload protection. Set it
+  explicitly to tune the worker thread count.
 - `INFER_BACKEND=vllm`
 - `POLICY_LOSS_MODE=vanilla` and `LOSS_AGG_MODE=seq-mean-token-sum-norm`
   select the pure GRPO baseline policy loss and aggregation mode.
@@ -213,5 +216,6 @@ cover end-to-end SFT or GRPO training.
     `actor_rollout_ref.rollout.name=vllm`,
     `actor_rollout_ref.actor.engine.impl=lite`,
     `actor_rollout_ref.actor.engine.ep=8`,
+    `ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS=1`,
     `algorithm.adv_estimator=grpo`, `actor_rollout_ref.actor.policy_loss.loss_mode=vanilla`,
     and `critic.enable=False`.
