@@ -83,18 +83,18 @@ def test_four_arm_launcher_selects_only_the_intended_features(
     tokens = _render_arm(mode, tmp_path)
 
     assert _override(tokens, "actor_rollout_ref.rollout.quantization") is None
-    assert _append(
+    assert _add_or_override(
         tokens, "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled"
     ) == training_qat
     expected_qat_field = "mxfp4" if training_qat == "true" else None
     expected_group_size = "32" if training_qat == "true" else None
-    assert _append(
+    assert _add_or_override(
         tokens, "actor_rollout_ref.actor.engine.impl_cfg.qat.format"
     ) == expected_qat_field
-    assert _append(
+    assert _add_or_override(
         tokens, "actor_rollout_ref.actor.engine.impl_cfg.qat.group_size"
     ) == expected_group_size
-    assert _append(
+    assert _add_or_override(
         tokens, "actor_rollout_ref.actor.engine.impl_cfg.recompute"
     ) == "full"
     assert _add_or_override(
