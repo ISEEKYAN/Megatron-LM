@@ -125,11 +125,19 @@ class QATSpec:
 
     enabled: bool = False
     format: str = "int8"
-    group_size: int = 0  # 0 = per-tensor, -1 = per-output-channel, N>0 = block along in-features
+    group_size: int = (
+        0  # 0 = per-tensor, -1 = per-output-channel, N>0 = block along in-features
+    )
     symmetric: bool = True
-    ste_clip: bool = True  # zero grad outside representable range; False = pure pass-through
-    ignore_patterns: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_IGNORE_PATTERNS)
-    activation_bits: int | None = None  # weight-only in phase 1; W*A* is gated separately
+    ste_clip: bool = (
+        True  # zero grad outside representable range; False = pure pass-through
+    )
+    ignore_patterns: tuple[str, ...] = field(
+        default_factory=lambda: _DEFAULT_IGNORE_PATTERNS
+    )
+    activation_bits: int | None = (
+        None  # weight-only in phase 1; W*A* is gated separately
+    )
     export_mode: str = "fake"  # "fake" (train) | "packed" (deploy snapshot)
     learnable_scales: bool = False  # LSQ future work; must be False in phase 1
 
@@ -148,16 +156,22 @@ class QATSpec:
                 "alias it onto MXFP4's E8M0 scale."
             )
         if self.format not in _FORMAT_BITS:
-            raise ValueError(f"Unknown QAT format {self.format!r}; supported: {sorted(_FORMAT_BITS)}.")
+            raise ValueError(
+                f"Unknown QAT format {self.format!r}; supported: {sorted(_FORMAT_BITS)}."
+            )
         if self.activation_bits is not None:
             raise ValueError(
                 "activation quantization (W*A*) is not supported here; it needs a "
                 "calibration/observer-freeze protocol and cross-DP amax sync before enabling."
             )
         if self.learnable_scales:
-            raise ValueError("learnable_scales (LSQ) is deferred; this path uses max calibration.")
+            raise ValueError(
+                "learnable_scales (LSQ) is deferred; this path uses max calibration."
+            )
         if self.export_mode not in ("fake", "packed"):
-            raise ValueError(f"export_mode must be 'fake' or 'packed', got {self.export_mode!r}.")
+            raise ValueError(
+                f"export_mode must be 'fake' or 'packed', got {self.export_mode!r}."
+            )
         if self.group_size < -1:
             raise ValueError(f"group_size must be >= -1, got {self.group_size}.")
         if self.format == "mxfp4" and self.group_size != _MXFP4_BLOCK:
@@ -187,7 +201,9 @@ def normalize_qat_spec(config: QATSpec | dict[str, Any] | None) -> QATSpec:
     if isinstance(config, QATSpec):
         return config
     if not isinstance(config, dict):
-        raise TypeError(f"QAT config must be QATSpec, dict, or None, got {type(config)!r}.")
+        raise TypeError(
+            f"QAT config must be QATSpec, dict, or None, got {type(config)!r}."
+        )
     values = dict(config)
     if "ignore_patterns" in values and not isinstance(values["ignore_patterns"], tuple):
         values["ignore_patterns"] = tuple(values["ignore_patterns"])
@@ -213,7 +229,9 @@ def _int_qrange(num_bits: int, symmetric: bool) -> tuple[int, int]:
     return 0, (1 << num_bits) - 1
 
 
-def _reshape_for_groups(weight: torch.Tensor, group_size: int) -> tuple[torch.Tensor, int]:
+def _reshape_for_groups(
+    weight: torch.Tensor, group_size: int
+) -> tuple[torch.Tensor, int]:
     """Reshape a 2D ``[out, in]`` weight so the reduction dim is last.
 
     Returns ``(view, reduce_dim)``. ``reduce_dim`` is the axis over which amax is
@@ -226,7 +244,9 @@ def _reshape_for_groups(weight: torch.Tensor, group_size: int) -> tuple[torch.Te
     # block along in-features
     out_features, in_features = weight.shape
     if in_features % group_size != 0:
-        raise ValueError(f"group_size={group_size} does not divide in_features={in_features}.")
+        raise ValueError(
+            f"group_size={group_size} does not divide in_features={in_features}."
+        )
     view = weight.reshape(out_features, in_features // group_size, group_size)
     return view, 2
 
@@ -300,16 +320,24 @@ class _FakeQuantizeSTE(torch.autograd.Function):
 def fake_quantize_weight(weight: torch.Tensor, spec: QATSpec) -> torch.Tensor:
     """Differentiable (STE) fake-quantization of a 2D weight per ``spec``."""
     if weight.dim() != 2:
-        raise ValueError(f"fake_quantize_weight expects a 2D [out, in] weight, got {tuple(weight.shape)}.")
+        raise ValueError(
+            f"fake_quantize_weight expects a 2D [out, in] weight, got {tuple(weight.shape)}."
+        )
     if spec.format == "fp8_e4m3":
         return _fp8_fake_quantize_weight(weight, spec)
     if spec.format == "mxfp4":
         return _mxfp4_fake_quantize_weight(weight, spec)
-    scale, zero_point, qmin, qmax = _compute_qparams(weight, spec.num_bits, spec.group_size, spec.symmetric)
+    scale, zero_point, qmin, qmax = _compute_qparams(
+        weight, spec.num_bits, spec.group_size, spec.symmetric
+    )
     if spec.group_size > 0:
         out_features, in_features = weight.shape
-        view = weight.reshape(out_features, in_features // spec.group_size, spec.group_size)
-        w_hat = _FakeQuantizeSTE.apply(view, scale, zero_point, qmin, qmax, spec.ste_clip)
+        view = weight.reshape(
+            out_features, in_features // spec.group_size, spec.group_size
+        )
+        w_hat = _FakeQuantizeSTE.apply(
+            view, scale, zero_point, qmin, qmax, spec.ste_clip
+        )
         return w_hat.reshape(out_features, in_features)
     return _FakeQuantizeSTE.apply(weight, scale, zero_point, qmin, qmax, spec.ste_clip)
 
@@ -376,7 +404,9 @@ def _grouped_view(weight: torch.Tensor, group_size: int) -> torch.Tensor:
         return weight
     out_features, in_features = weight.shape
     if in_features % group_size != 0:
-        raise ValueError(f"group_size={group_size} does not divide in_features={in_features}.")
+        raise ValueError(
+            f"group_size={group_size} does not divide in_features={in_features}."
+        )
     return weight.reshape(out_features, in_features // group_size, group_size)
 
 
@@ -436,7 +466,9 @@ def quantize_weight(weight: torch.Tensor, spec: QATSpec) -> dict[str, torch.Tens
         return _quantize_weight_fp8(weight, spec)
     if spec.format == "mxfp4":
         return _quantize_weight_mxfp4(weight)
-    scale, zero_point, qmin, qmax = _compute_qparams(weight, spec.num_bits, spec.group_size, spec.symmetric)
+    scale, zero_point, qmin, qmax = _compute_qparams(
+        weight, spec.num_bits, spec.group_size, spec.symmetric
+    )
     view, _ = _reshape_for_groups(weight.detach(), spec.group_size)
     w = view.float()
     if zero_point is None:
@@ -450,7 +482,9 @@ def quantize_weight(weight: torch.Tensor, spec: QATSpec) -> dict[str, torch.Tens
     return out
 
 
-def _quantize_weight_fp8(weight: torch.Tensor, spec: QATSpec) -> dict[str, torch.Tensor]:
+def _quantize_weight_fp8(
+    weight: torch.Tensor, spec: QATSpec
+) -> dict[str, torch.Tensor]:
     """Packed E4M3 deployment snapshot: fp8 codes + fp32 (amax/448) scale."""
     fmax = _fp8_e4m3_max()
     eps = torch.finfo(torch.float32).tiny
@@ -458,7 +492,11 @@ def _quantize_weight_fp8(weight: torch.Tensor, spec: QATSpec) -> dict[str, torch
     scale = (amax / fmax).clamp_min(eps)
     view = _grouped_view(weight.detach(), spec.group_size)
     codes = (view.float() / scale).clamp(-fmax, fmax).to(torch.float8_e4m3fn)
-    return {"qweight": codes.reshape(weight.shape), "scale": scale, "format": "fp8_e4m3"}
+    return {
+        "qweight": codes.reshape(weight.shape),
+        "scale": scale,
+        "format": "fp8_e4m3",
+    }
 
 
 def _quantize_weight_mxfp4(weight: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -482,12 +520,16 @@ def _quantize_weight_mxfp4(weight: torch.Tensor) -> dict[str, torch.Tensor]:
     return {"qweight": packed, "scale": e8m0, "format": "mxfp4"}
 
 
-def _dequantize_weight_fp8(packed: dict[str, torch.Tensor], spec: QATSpec) -> torch.Tensor:
+def _dequantize_weight_fp8(
+    packed: dict[str, torch.Tensor], spec: QATSpec
+) -> torch.Tensor:
     codes = packed["qweight"]
     scale = packed["scale"]
     if spec.group_size > 0:
         out_features, in_features = codes.shape
-        view = codes.reshape(out_features, in_features // spec.group_size, spec.group_size).float()
+        view = codes.reshape(
+            out_features, in_features // spec.group_size, spec.group_size
+        ).float()
         return (view * scale).reshape(out_features, in_features)
     return codes.float() * scale
 
@@ -515,7 +557,9 @@ def dequantize_weight(packed: dict[str, torch.Tensor], spec: QATSpec) -> torch.T
     scale = packed["scale"]
     out_features, in_features = codes.shape
     if spec.group_size > 0:
-        codes_v = codes.reshape(out_features, in_features // spec.group_size, spec.group_size).float()
+        codes_v = codes.reshape(
+            out_features, in_features // spec.group_size, spec.group_size
+        ).float()
     else:
         codes_v = codes.float()
     if "zero_point" in packed:
@@ -546,7 +590,9 @@ def unpack_int4(packed: torch.Tensor, *, signed: bool = True) -> torch.Tensor:
     if signed:
         lo = torch.where(lo >= 8, lo - 16, lo)
         hi = torch.where(hi >= 8, hi - 16, hi)
-    out = torch.stack([lo, hi], dim=-1).reshape(*packed.shape[:-1], packed.shape[-1] * 2)
+    out = torch.stack([lo, hi], dim=-1).reshape(
+        *packed.shape[:-1], packed.shape[-1] * 2
+    )
     return out.to(torch.int8)
 
 
@@ -563,7 +609,9 @@ def _compute_amax_tensor(weight: torch.Tensor, group_size: int) -> torch.Tensor:
             dim=0,
         )
     if weight.dim() != 2:
-        raise ValueError(f"QAT weight fake-quant expects 2D or 3D stacked weights, got {tuple(weight.shape)}.")
+        raise ValueError(
+            f"QAT weight fake-quant expects 2D or 3D stacked weights, got {tuple(weight.shape)}."
+        )
     return compute_amax(weight, group_size)
 
 
@@ -575,7 +623,9 @@ def _fake_quant_weight_tensor(weight: torch.Tensor, spec: QATSpec) -> torch.Tens
             dim=0,
         )
     if weight.dim() != 2:
-        raise ValueError(f"QAT weight fake-quant expects 2D or 3D stacked weights, got {tuple(weight.shape)}.")
+        raise ValueError(
+            f"QAT weight fake-quant expects 2D or 3D stacked weights, got {tuple(weight.shape)}."
+        )
     return fake_quantize_weight(weight, spec)
 
 
@@ -597,7 +647,9 @@ class WeightFakeQuant(nn.Module):
 
     def forward(self, weight: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            self.amax.copy_(_compute_amax_tensor(weight, self.spec.group_size).to(self.amax.dtype))
+            self.amax.copy_(
+                _compute_amax_tensor(weight, self.spec.group_size).to(self.amax.dtype)
+            )
         return _fake_quant_weight_tensor(weight, self.spec)
 
 
@@ -615,7 +667,9 @@ def _quantizable_weight_owner(module: nn.Module) -> nn.Module | None:
     on the module itself and are fake-quantized per expert slice.
     """
     inner = getattr(module, "linear", None)
-    if isinstance(inner, nn.Module) and isinstance(getattr(inner, "weight", None), nn.Parameter):
+    if isinstance(inner, nn.Module) and isinstance(
+        getattr(inner, "weight", None), nn.Parameter
+    ):
         if inner.weight.dim() in (2, 3):
             return inner
     weight = getattr(module, "weight", None)
@@ -631,11 +685,15 @@ def apply_qat_to_module(module: nn.Module, spec: QATSpec) -> bool:
         return False
     if parametrize.is_parametrized(owner, "weight"):
         return False
-    parametrize.register_parametrization(owner, "weight", WeightFakeQuant(spec, owner.weight.shape), unsafe=True)
+    parametrize.register_parametrization(
+        owner, "weight", WeightFakeQuant(spec, owner.weight.shape), unsafe=True
+    )
     return True
 
 
-def apply_qat_to_chunks(chunks, spec: QATSpec | dict[str, Any] | None) -> dict[str, int]:
+def apply_qat_to_chunks(
+    chunks, spec: QATSpec | dict[str, Any] | None
+) -> dict[str, int]:
     """Apply weight-only QAT to every eligible linear in the model chunks.
 
     Opt-in and inert by default: with a disabled spec nothing is registered and

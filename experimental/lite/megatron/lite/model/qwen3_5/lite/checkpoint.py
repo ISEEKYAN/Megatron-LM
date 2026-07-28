@@ -24,7 +24,11 @@ def EXPERT_CLASSIFIER(name: str) -> bool:
 
 
 def PLACEMENT_FN(param_name: str) -> list:
-    if "experts" in param_name and "router" not in param_name and "shared" not in param_name:
+    if (
+        "experts" in param_name
+        and "router" not in param_name
+        and "shared" not in param_name
+    ):
         if "fc1" in param_name:
             return [Replicate(), Replicate(), Shard(0), Shard(0)]
         if "fc2" in param_name:
@@ -95,7 +99,9 @@ def _tp_linear_attn_in_proj(
     ).contiguous()
 
 
-def _tp_linear_attn_conv1d(tensor: torch.Tensor, *, cfg: Qwen35Config, ps: ParallelState) -> torch.Tensor:
+def _tp_linear_attn_conv1d(
+    tensor: torch.Tensor, *, cfg: Qwen35Config, ps: ParallelState
+) -> torch.Tensor:
     if _linear_attn_head_replication(cfg, ps.tp_size):
         return _tp(tensor, ps.tp_rank, ps.tp_size)
     qk_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
@@ -119,7 +125,9 @@ def _linear_attn_head_replication(cfg: Qwen35Config, tp_size: int) -> bool:
     return cfg.linear_num_key_heads < tp_size or cfg.linear_num_value_heads < tp_size
 
 
-def _tp_linear_attn_state(tensor: torch.Tensor, *, cfg: Qwen35Config, ps: ParallelState) -> torch.Tensor:
+def _tp_linear_attn_state(
+    tensor: torch.Tensor, *, cfg: Qwen35Config, ps: ParallelState
+) -> torch.Tensor:
     """Keep GDN state whole only when its heads are physically replicated."""
     if _linear_attn_head_replication(cfg, ps.tp_size):
         return tensor
@@ -140,7 +148,9 @@ def _has(reader: SafeTensorReader, name: str) -> bool:
     return True
 
 
-def _load_vocab(reader: SafeTensorReader, name: str, cfg: Qwen35Config, ps: ParallelState) -> torch.Tensor:
+def _load_vocab(
+    reader: SafeTensorReader, name: str, cfg: Qwen35Config, ps: ParallelState
+) -> torch.Tensor:
     from megatron.lite.primitive.parallel import pad_vocab_for_tp
 
     tensor = _get(reader, name)
@@ -168,8 +178,12 @@ def _load_full_attn(
     out[f"{local_prefix}.full_attn.qkv.linear.weight"] = _tp(
         _merge_full_attn_qkvg(q, k, v, cfg=cfg), ps.tp_rank, ps.tp_size
     )
-    out[f"{local_prefix}.full_attn.q_norm.weight"] = _get(reader, f"{hf_prefix}.q_norm.weight")
-    out[f"{local_prefix}.full_attn.k_norm.weight"] = _get(reader, f"{hf_prefix}.k_norm.weight")
+    out[f"{local_prefix}.full_attn.q_norm.weight"] = _get(
+        reader, f"{hf_prefix}.q_norm.weight"
+    )
+    out[f"{local_prefix}.full_attn.k_norm.weight"] = _get(
+        reader, f"{hf_prefix}.k_norm.weight"
+    )
     out[f"{local_prefix}.full_attn.proj.linear.weight"] = _tp(
         _get(reader, f"{hf_prefix}.o_proj.weight"), ps.tp_rank, ps.tp_size, dim=1
     )
@@ -182,9 +196,15 @@ def _merge_full_attn_qkvg(
     head_dim = cfg.head_dim
     hidden = q_gate.shape[1]
     q_gate = q_gate.reshape(cfg.num_attention_heads, 2 * head_dim, hidden)
-    query = q_gate.narrow(1, 0, head_dim).reshape(cfg.num_attention_heads * head_dim, hidden)
-    gate = q_gate.narrow(1, head_dim, head_dim).reshape(cfg.num_attention_heads * head_dim, hidden)
-    q_heads_per_group = ensure_divisible(cfg.num_attention_heads, cfg.num_key_value_heads)
+    query = q_gate.narrow(1, 0, head_dim).reshape(
+        cfg.num_attention_heads * head_dim, hidden
+    )
+    gate = q_gate.narrow(1, head_dim, head_dim).reshape(
+        cfg.num_attention_heads * head_dim, hidden
+    )
+    q_heads_per_group = ensure_divisible(
+        cfg.num_attention_heads, cfg.num_key_value_heads
+    )
     q_group_width = q_heads_per_group * head_dim
     query = query.reshape(kv_heads, q_group_width, hidden)
     gate = gate.reshape(kv_heads, q_group_width, hidden)
@@ -197,7 +217,9 @@ def _unmerge_full_attn_qkvg(
     tensor: torch.Tensor, *, cfg: Qwen35Config
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Invert Qwen35 lite's full-attention q/g/k/v packing."""
-    q_heads_per_group = ensure_divisible(cfg.num_attention_heads, cfg.num_key_value_heads)
+    q_heads_per_group = ensure_divisible(
+        cfg.num_attention_heads, cfg.num_key_value_heads
+    )
     group_width = (2 * q_heads_per_group + 2) * cfg.head_dim
     hidden = tensor.shape[-1]
     packed = tensor.reshape(cfg.num_key_value_heads, group_width, hidden)
@@ -212,7 +234,9 @@ def _unmerge_full_attn_qkvg(
     )
     query = query.reshape(cfg.num_attention_heads, cfg.head_dim, hidden)
     gate = gate.reshape(cfg.num_attention_heads, cfg.head_dim, hidden)
-    q_gate = torch.cat([query, gate], dim=1).reshape(cfg.num_attention_heads * 2 * cfg.head_dim, hidden)
+    q_gate = torch.cat([query, gate], dim=1).reshape(
+        cfg.num_attention_heads * 2 * cfg.head_dim, hidden
+    )
     key = key.reshape(cfg.num_key_value_heads * cfg.head_dim, hidden)
     value = value.reshape(cfg.num_key_value_heads * cfg.head_dim, hidden)
     return q_gate.contiguous(), key.contiguous(), value.contiguous()
@@ -220,28 +244,45 @@ def _unmerge_full_attn_qkvg(
 
 def _split_linear_attn_in_proj(
     tensor: torch.Tensor, *, cfg: Qwen35Config
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     qk_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
     v_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
     return tensor.split(
-        [qk_dim, qk_dim, v_dim, v_dim, cfg.linear_num_value_heads, cfg.linear_num_value_heads],
+        [
+            qk_dim,
+            qk_dim,
+            v_dim,
+            v_dim,
+            cfg.linear_num_value_heads,
+            cfg.linear_num_value_heads,
+        ],
         dim=0,
     )
 
 
-def _merge_linear_attn_in_proj_tp_shards(shards: list[torch.Tensor], *, cfg: Qwen35Config) -> torch.Tensor:
+def _merge_linear_attn_in_proj_tp_shards(
+    shards: list[torch.Tensor], *, cfg: Qwen35Config
+) -> torch.Tensor:
     world_size = len(shards)
     if _linear_attn_head_replication(cfg, world_size):
         return torch.cat(shards, dim=0).contiguous()
-    qk_dim = ensure_divisible(cfg.linear_num_key_heads * cfg.linear_key_head_dim, world_size)
-    v_dim = ensure_divisible(cfg.linear_num_value_heads * cfg.linear_value_head_dim, world_size)
+    qk_dim = ensure_divisible(
+        cfg.linear_num_key_heads * cfg.linear_key_head_dim, world_size
+    )
+    v_dim = ensure_divisible(
+        cfg.linear_num_value_heads * cfg.linear_value_head_dim, world_size
+    )
     value_heads = ensure_divisible(cfg.linear_num_value_heads, world_size)
 
     parts: list[list[torch.Tensor]] = [[] for _ in range(6)]
     for shard in shards:
         for bucket, part in zip(
             parts,
-            shard.split([qk_dim, qk_dim, v_dim, v_dim, value_heads, value_heads], dim=0),
+            shard.split(
+                [qk_dim, qk_dim, v_dim, v_dim, value_heads, value_heads], dim=0
+            ),
             strict=True,
         ):
             bucket.append(part)
@@ -249,16 +290,24 @@ def _merge_linear_attn_in_proj_tp_shards(shards: list[torch.Tensor], *, cfg: Qwe
     return torch.cat([torch.cat(bucket, dim=0) for bucket in parts], dim=0).contiguous()
 
 
-def _merge_linear_attn_conv1d_tp_shards(shards: list[torch.Tensor], *, cfg: Qwen35Config) -> torch.Tensor:
+def _merge_linear_attn_conv1d_tp_shards(
+    shards: list[torch.Tensor], *, cfg: Qwen35Config
+) -> torch.Tensor:
     world_size = len(shards)
     if _linear_attn_head_replication(cfg, world_size):
         return torch.cat(shards, dim=0).contiguous()
-    qk_dim = ensure_divisible(cfg.linear_num_key_heads * cfg.linear_key_head_dim, world_size)
-    v_dim = ensure_divisible(cfg.linear_num_value_heads * cfg.linear_value_head_dim, world_size)
+    qk_dim = ensure_divisible(
+        cfg.linear_num_key_heads * cfg.linear_key_head_dim, world_size
+    )
+    v_dim = ensure_divisible(
+        cfg.linear_num_value_heads * cfg.linear_value_head_dim, world_size
+    )
 
     parts: list[list[torch.Tensor]] = [[] for _ in range(3)]
     for shard in shards:
-        for bucket, part in zip(parts, shard.split([qk_dim, qk_dim, v_dim], dim=0), strict=True):
+        for bucket, part in zip(
+            parts, shard.split([qk_dim, qk_dim, v_dim], dim=0), strict=True
+        ):
             bucket.append(part)
 
     return torch.cat([torch.cat(bucket, dim=0) for bucket in parts], dim=0).contiguous()
@@ -271,7 +320,9 @@ def _merge_gate_up_tp_shards(shards: list[torch.Tensor]) -> torch.Tensor:
         gate, up = shard.chunk(2, dim=0)
         gates.append(gate)
         ups.append(up)
-    return torch.cat([torch.cat(gates, dim=0), torch.cat(ups, dim=0)], dim=0).contiguous()
+    return torch.cat(
+        [torch.cat(gates, dim=0), torch.cat(ups, dim=0)], dim=0
+    ).contiguous()
 
 
 def _allgather_tp_shards(tensor: torch.Tensor, ps: ParallelState) -> list[torch.Tensor]:
@@ -297,17 +348,25 @@ class Qwen35WeightSpec:
     def weight_map(self) -> dict[str, list[str]]:
         return {}
 
-    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
+    def hf_to_native(
+        self, native_name: str, hf_tensors: list[torch.Tensor]
+    ) -> torch.Tensor:
         del native_name
         return hf_tensors[0]
 
-    def gather_dense(self, native_name: str, tensor: torch.Tensor, ps: ParallelState) -> torch.Tensor | None:
+    def gather_dense(
+        self, native_name: str, tensor: torch.Tensor, ps: ParallelState
+    ) -> torch.Tensor | None:
         if ps.tp_size <= 1:
             return None
         if native_name.endswith(".linear_attn.in_proj.linear.weight"):
-            return _merge_linear_attn_in_proj_tp_shards(_allgather_tp_shards(tensor, ps), cfg=self.config)
+            return _merge_linear_attn_in_proj_tp_shards(
+                _allgather_tp_shards(tensor, ps), cfg=self.config
+            )
         if native_name.endswith(".linear_attn.conv1d.weight"):
-            return _merge_linear_attn_conv1d_tp_shards(_allgather_tp_shards(tensor, ps), cfg=self.config)
+            return _merge_linear_attn_conv1d_tp_shards(
+                _allgather_tp_shards(tensor, ps), cfg=self.config
+            )
         if native_name.endswith((".linear_attn.dt_bias", ".linear_attn.A_log")):
             shards = _allgather_tp_shards(tensor, ps)
             if _linear_attn_head_replication(self.config, ps.tp_size):
@@ -317,7 +376,9 @@ class Qwen35WeightSpec:
             return _merge_gate_up_tp_shards(_allgather_tp_shards(tensor, ps))
         return None
 
-    def merge_dense_shards(self, native_name: str, shards: list[torch.Tensor]) -> torch.Tensor | None:
+    def merge_dense_shards(
+        self, native_name: str, shards: list[torch.Tensor]
+    ) -> torch.Tensor | None:
         if native_name.endswith(".linear_attn.in_proj.linear.weight"):
             return _merge_linear_attn_in_proj_tp_shards(shards, cfg=self.config)
         if native_name.endswith(".linear_attn.conv1d.weight"):
@@ -331,11 +392,16 @@ class Qwen35WeightSpec:
         return None
 
     def packed_expert_group_name(self, native_name: str) -> str | None:
-        if re.fullmatch(r"layers\.\d+\.moe\.experts\.fc[12]\.weight\d+", native_name) is None:
+        if (
+            re.fullmatch(r"layers\.\d+\.moe\.experts\.fc[12]\.weight\d+", native_name)
+            is None
+        ):
             return None
         return re.sub(r"\.weight\d+$", ".packed", native_name)
 
-    def native_to_hf(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    def native_to_hf(
+        self, native_name: str, tensor: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
         if self.target == "vllm":
             return self._native_to_vllm(native_name, tensor)
 
@@ -345,7 +411,9 @@ class Qwen35WeightSpec:
             return [("model.language_model.norm.weight", tensor)]
         if native_name == "head.col.linear.weight":
             return [("lm_head.weight", tensor)]
-        if native_name == "mtp_embed.embedding.weight" or native_name.startswith("mtp."):
+        if native_name == "mtp_embed.embedding.weight" or native_name.startswith(
+            "mtp."
+        ):
             return []
 
         match = re.match(r"layers\.(\d+)\.(.*)", native_name)
@@ -419,7 +487,9 @@ class Qwen35WeightSpec:
             buffer[int(expert_idx)] = tensor.contiguous()
             if len(buffer) < self.config.num_experts:
                 return []
-            packed = torch.stack([buffer[i] for i in range(self.config.num_experts)], dim=0).contiguous()
+            packed = torch.stack(
+                [buffer[i] for i in range(self.config.num_experts)], dim=0
+            ).contiguous()
             del self._expert_export_buffers[buffer_key]
             if kind == "1":
                 return [(f"{prefix}.mlp.experts.gate_up_proj", packed)]
@@ -434,14 +504,18 @@ class Qwen35WeightSpec:
 
         return []
 
-    def _native_to_vllm(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    def _native_to_vllm(
+        self, native_name: str, tensor: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
         if native_name == "embed.embedding.weight":
             return [("language_model.model.embed_tokens.weight", tensor)]
         if native_name == "norm.weight":
             return [("language_model.model.norm.weight", tensor)]
         if native_name == "head.col.linear.weight":
             return [("language_model.lm_head.weight", tensor)]
-        if native_name == "mtp_embed.embedding.weight" or native_name.startswith("mtp."):
+        if native_name == "mtp_embed.embedding.weight" or native_name.startswith(
+            "mtp."
+        ):
             return []
 
         match = re.match(r"layers\.(\d+)\.(.*)", native_name)
@@ -515,7 +589,9 @@ class Qwen35WeightSpec:
             buffer[int(expert_idx)] = tensor.contiguous()
             if len(buffer) < self.config.num_experts:
                 return []
-            packed = torch.stack([buffer[i] for i in range(self.config.num_experts)], dim=0).contiguous()
+            packed = torch.stack(
+                [buffer[i] for i in range(self.config.num_experts)], dim=0
+            ).contiguous()
             del self._expert_export_buffers[buffer_key]
             if kind == "1":
                 return [(f"{prefix}.mlp.experts.gate_up_proj", packed)]
@@ -555,12 +631,18 @@ class Qwen35WeightSpec:
             return (0, 0)
         if native_name.endswith(".moe.shared_expert.down.linear.weight"):
             return (1, 0)
-        if any(native_name.endswith(suffix) for suffix in (".linear_attn.conv1d.weight",)):
+        if any(
+            native_name.endswith(suffix) for suffix in (".linear_attn.conv1d.weight",)
+        ):
             return (0, 0)
         return None
 
     def is_expert(self, native_name: str) -> bool:
-        return ".moe.experts." in native_name and ".router." not in native_name and ".shared" not in native_name
+        return (
+            ".moe.experts." in native_name
+            and ".router." not in native_name
+            and ".shared" not in native_name
+        )
 
     def expert_global_id(self, native_name: str) -> int | None:
         match = re.search(r"\.weight(\d+)$", native_name)
@@ -589,7 +671,9 @@ def _load_linear_attn(
     b = _get(reader, f"{hf_prefix}.in_proj_b.weight")
     a = _get(reader, f"{hf_prefix}.in_proj_a.weight")
 
-    out[f"{local_prefix}.linear_attn.in_proj.linear.weight"] = _tp_linear_attn_in_proj(q, k, v, z, b, a, cfg=cfg, ps=ps)
+    out[f"{local_prefix}.linear_attn.in_proj.linear.weight"] = _tp_linear_attn_in_proj(
+        q, k, v, z, b, a, cfg=cfg, ps=ps
+    )
     out[f"{local_prefix}.linear_attn.in_proj.linear.layer_norm_weight"] = input_ln
     out[f"{local_prefix}.linear_attn.conv1d.weight"] = _tp_linear_attn_conv1d(
         _get(reader, f"{hf_prefix}.conv1d.weight"), cfg=cfg, ps=ps
@@ -597,7 +681,9 @@ def _load_linear_attn(
     out[f"{local_prefix}.linear_attn.dt_bias"] = _tp_linear_attn_state(
         _get(reader, f"{hf_prefix}.dt_bias"), cfg=cfg, ps=ps
     )
-    out[f"{local_prefix}.linear_attn.A_log"] = _tp_linear_attn_state(_get(reader, f"{hf_prefix}.A_log"), cfg=cfg, ps=ps)
+    out[f"{local_prefix}.linear_attn.A_log"] = _tp_linear_attn_state(
+        _get(reader, f"{hf_prefix}.A_log"), cfg=cfg, ps=ps
+    )
     out[f"{local_prefix}.linear_attn.norm.weight"] = _zero_centered_gamma_from_hf(
         _get(reader, f"{hf_prefix}.norm.weight")
     )
@@ -616,10 +702,15 @@ def _load_shared_expert(
 ) -> None:
     shared = f"{hf_mlp_prefix}.shared_expert"
     gate_up = torch.cat(
-        [_get(reader, f"{shared}.gate_proj.weight"), _get(reader, f"{shared}.up_proj.weight")],
+        [
+            _get(reader, f"{shared}.gate_proj.weight"),
+            _get(reader, f"{shared}.up_proj.weight"),
+        ],
         dim=0,
     )
-    out[f"{local_prefix}.moe.shared_expert.gate_up.linear.weight"] = _split_gate_up(gate_up, ps.tp_rank, ps.tp_size)
+    out[f"{local_prefix}.moe.shared_expert.gate_up.linear.weight"] = _split_gate_up(
+        gate_up, ps.tp_rank, ps.tp_size
+    )
     out[f"{local_prefix}.moe.shared_expert.down.linear.weight"] = _tp(
         _get(reader, f"{shared}.down_proj.weight"), ps.tp_rank, ps.tp_size, dim=1
     )
@@ -658,7 +749,13 @@ def _load_experts(
     for local_idx in range(num_local):
         global_idx = local_start + local_idx
         ep = f"{hf_mlp_prefix}.experts.{global_idx}"
-        fc1 = torch.cat([_get(reader, f"{ep}.gate_proj.weight"), _get(reader, f"{ep}.up_proj.weight")], dim=0)
+        fc1 = torch.cat(
+            [
+                _get(reader, f"{ep}.gate_proj.weight"),
+                _get(reader, f"{ep}.up_proj.weight"),
+            ],
+            dim=0,
+        )
         fc2 = _get(reader, f"{ep}.down_proj.weight")
         if ps.etp_size > 1:
             fc1 = _split_gate_up(fc1, ps.etp_rank, ps.etp_size)
@@ -723,18 +820,24 @@ def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> Non
             param.data.copy_(tensor.to(dtype=param.dtype))
 
 
-def load_hf_weights(model: nn.Module, path: str, config: Qwen35Config, ps: ParallelState) -> None:
+def load_hf_weights(
+    model: nn.Module, path: str, config: Qwen35Config, ps: ParallelState
+) -> None:
     base_model = unwrap_model(model)
     reader = SafeTensorReader(path)
     out: dict[str, torch.Tensor] = {}
 
     prefix = "model.language_model"
     if getattr(base_model, "embed", None) is not None:
-        out["embed.embedding.weight"] = _load_vocab(reader, f"{prefix}.embed_tokens.weight", config, ps)
+        out["embed.embedding.weight"] = _load_vocab(
+            reader, f"{prefix}.embed_tokens.weight", config, ps
+        )
     if getattr(base_model, "norm", None) is not None:
         out["norm.weight"] = _get(reader, f"{prefix}.norm.weight")
     if getattr(base_model, "head", None) is not None:
-        out["head.col.linear.weight"] = _load_vocab(reader, "lm_head.weight", config, ps)
+        out["head.col.linear.weight"] = _load_vocab(
+            reader, "lm_head.weight", config, ps
+        )
 
     for local_idx, global_idx in enumerate(base_model.layer_indices):
         lp = f"layers.{local_idx}"
@@ -760,15 +863,33 @@ def load_hf_weights(model: nn.Module, path: str, config: Qwen35Config, ps: Paral
                 ps=ps,
                 reader=reader,
             )
-        out[f"{lp}.mlp_norm.weight"] = _get(reader, f"{hp}.post_attention_layernorm.weight")
-        out[f"{lp}.moe.router.gate.weight"] = _get(reader, f"{hp}.mlp.gate.weight")[: config.num_experts]
-        _load_shared_expert(out, local_prefix=lp, hf_mlp_prefix=f"{hp}.mlp", ps=ps, reader=reader)
-        _load_experts(out, local_prefix=lp, hf_mlp_prefix=f"{hp}.mlp", cfg=config, ps=ps, reader=reader)
+        out[f"{lp}.mlp_norm.weight"] = _get(
+            reader, f"{hp}.post_attention_layernorm.weight"
+        )
+        out[f"{lp}.moe.router.gate.weight"] = _get(reader, f"{hp}.mlp.gate.weight")[
+            : config.num_experts
+        ]
+        _load_shared_expert(
+            out, local_prefix=lp, hf_mlp_prefix=f"{hp}.mlp", ps=ps, reader=reader
+        )
+        _load_experts(
+            out,
+            local_prefix=lp,
+            hf_mlp_prefix=f"{hp}.mlp",
+            cfg=config,
+            ps=ps,
+            reader=reader,
+        )
 
     _copy_loaded_state(base_model, out)
 
 
-def export_hf_weights(model: nn.Module | list[nn.Module], config: Qwen35Config, ps: ParallelState, **kwargs):
+def export_hf_weights(
+    model: nn.Module | list[nn.Module],
+    config: Qwen35Config,
+    ps: ParallelState,
+    **kwargs,
+):
     from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
 
     include_mtp_only = kwargs.pop("include_mtp_only", False)
@@ -776,10 +897,21 @@ def export_hf_weights(model: nn.Module | list[nn.Module], config: Qwen35Config, 
     target = kwargs.pop("target", "hf")
     if include_mtp_only:
         return
-    yield from _export(model, Qwen35WeightSpec(config, target=target), ps, vocab_size=config.vocab_size, **kwargs)
+    yield from _export(
+        model,
+        Qwen35WeightSpec(config, target=target),
+        ps,
+        vocab_size=config.vocab_size,
+        **kwargs,
+    )
 
 
-def save_hf_weights(model: nn.Module | list[nn.Module], path: str, config: Qwen35Config, ps: ParallelState) -> None:
+def save_hf_weights(
+    model: nn.Module | list[nn.Module],
+    path: str,
+    config: Qwen35Config,
+    ps: ParallelState,
+) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import save_hf_weights as _save
 
     _save(model, path, Qwen35WeightSpec(config), ps, vocab_size=config.vocab_size)

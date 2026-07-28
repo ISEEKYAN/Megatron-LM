@@ -35,7 +35,12 @@ pytestmark = pytest.mark.mlite
 def test_spec_defaults_are_inert_and_normalize():
     spec = normalize_qat_spec(None)
     assert spec.enabled is False
-    assert normalize_qat_spec({"enabled": True, "format": "int4", "group_size": 8}).num_bits == 4
+    assert (
+        normalize_qat_spec(
+            {"enabled": True, "format": "int4", "group_size": 8}
+        ).num_bits
+        == 4
+    )
     assert normalize_qat_spec(QATSpec(enabled=True)).num_bits == 8
     with pytest.raises(TypeError, match="QAT config"):
         normalize_qat_spec(object())
@@ -134,12 +139,18 @@ def test_fp8_fake_quant_matches_native_e4m3_cast(group_size):
         scale = (w.abs().amax() / fmax).clamp_min(torch.finfo(torch.float32).tiny)
         ref = (w / scale).clamp(-fmax, fmax).to(torch.float8_e4m3fn).float() * scale
     elif group_size == -1:
-        scale = (w.abs().amax(dim=1, keepdim=True) / fmax).clamp_min(torch.finfo(torch.float32).tiny)
+        scale = (w.abs().amax(dim=1, keepdim=True) / fmax).clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
         ref = (w / scale).clamp(-fmax, fmax).to(torch.float8_e4m3fn).float() * scale
     else:
         v = w.reshape(8, 64 // group_size, group_size)
-        scale = (v.abs().amax(dim=2, keepdim=True) / fmax).clamp_min(torch.finfo(torch.float32).tiny)
-        ref = ((v / scale).clamp(-fmax, fmax).to(torch.float8_e4m3fn).float() * scale).reshape(8, 64)
+        scale = (v.abs().amax(dim=2, keepdim=True) / fmax).clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
+        ref = (
+            (v / scale).clamp(-fmax, fmax).to(torch.float8_e4m3fn).float() * scale
+        ).reshape(8, 64)
     torch.testing.assert_close(w_hat, ref, rtol=0, atol=0)
 
 
@@ -189,7 +200,9 @@ def test_mxfp4_scale_never_saturates_so_ste_is_identity():
     w[0, 0] = 6.25  # amax=6.25 -> ceil(log2(6.25/6)) = 1 -> X=2 -> 3.125 <= 6
     w[0, 1] = 1.0
     wg = w.clone().requires_grad_(True)
-    fake_quantize_weight(wg, QATSpec(enabled=True, format="mxfp4", group_size=32)).sum().backward()
+    fake_quantize_weight(
+        wg, QATSpec(enabled=True, format="mxfp4", group_size=32)
+    ).sum().backward()
     assert wg.grad[0, 0].item() == 1.0  # block top is representable -> passes through
     assert wg.grad[0, 1].item() == 1.0  # in-range passes through
 
@@ -227,7 +240,9 @@ def test_parametrization_preserves_master_weight_identity():
     lin = nn.Linear(8, 6, bias=False).to(torch.bfloat16)
     master_before = lin.weight
     spec = QATSpec(enabled=True, format="int4", group_size=-1)
-    parametrize.register_parametrization(lin, "weight", WeightFakeQuant(spec, lin.weight.shape), unsafe=True)
+    parametrize.register_parametrization(
+        lin, "weight", WeightFakeQuant(spec, lin.weight.shape), unsafe=True
+    )
     # master survives untouched as .original, still trainable, still bf16
     original = lin.parametrizations.weight.original
     assert original is master_before
@@ -265,7 +280,11 @@ def test_disabled_spec_is_bit_identical():
     x = torch.randn(4, 8)
     ref = chunk(x)
     stats = apply_qat_to_chunks([chunk], QATSpec(enabled=False))
-    assert stats == {"quantized_modules": 0, "skipped_ignored": 0, "skipped_no_weight": 0}
+    assert stats == {
+        "quantized_modules": 0,
+        "skipped_ignored": 0,
+        "skipped_no_weight": 0,
+    }
     assert not parametrize.is_parametrized(chunk.qkv, "weight")
     torch.testing.assert_close(chunk(x), ref, rtol=0, atol=0)
 
@@ -322,7 +341,11 @@ def test_mxfp4_export_layout_is_packed_nibbles_and_e8m0_bytes():
     packed = quantize_weight(w, spec)
     assert packed["format"] == "mxfp4"
     # 64 in-features / 32 block = 2 blocks; each block packs 32 nibbles -> 16 bytes
-    assert packed["qweight"].dtype == torch.uint8 and packed["qweight"].shape == (6, 2, 16)
+    assert packed["qweight"].dtype == torch.uint8 and packed["qweight"].shape == (
+        6,
+        2,
+        16,
+    )
     assert packed["scale"].dtype == torch.uint8 and packed["scale"].shape == (6, 2, 1)
 
 
@@ -421,10 +444,14 @@ def _toy_linear_chunk(in_features: int = 64, out_features: int = 12):
 
 def test_canonical_state_key_strips_only_parametrization_original():
     assert _canonical_state_key("a.b.linear.weight") == "a.b.linear.weight"
-    assert _canonical_state_key("a.b.linear.parametrizations.weight.original") == "a.b.linear.weight"
+    assert (
+        _canonical_state_key("a.b.linear.parametrizations.weight.original")
+        == "a.b.linear.weight"
+    )
     # quantizer buffers keep their real name (must NOT collide with the master)
     assert (
-        _canonical_state_key("a.b.linear.parametrizations.weight.0.amax") == "a.b.linear.parametrizations.weight.0.amax"
+        _canonical_state_key("a.b.linear.parametrizations.weight.0.amax")
+        == "a.b.linear.parametrizations.weight.0.amax"
     )
 
 
@@ -436,7 +463,9 @@ def test_apply_before_load_still_loads_master_weight(fmt, group_size):
     torch.manual_seed(7)
     chunk = _toy_linear_chunk()
     # 1) apply QAT (parametrize) BEFORE load, exactly as build_model does.
-    apply_qat_to_chunks([chunk], QATSpec(enabled=True, format=fmt, group_size=group_size))
+    apply_qat_to_chunks(
+        [chunk], QATSpec(enabled=True, format=fmt, group_size=group_size)
+    )
     assert parametrize.is_parametrized(chunk.qkv.linear, "weight")
 
     # 2) load the HF-mapped state (keyed by the logical ``….linear.weight``).

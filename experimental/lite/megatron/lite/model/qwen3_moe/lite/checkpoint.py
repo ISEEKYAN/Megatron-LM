@@ -25,7 +25,9 @@ from megatron.lite.runtime.contracts.weights import ResyncFormat
 from torch.distributed.tensor import Replicate, Shard
 
 
-def _pack_mcore_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, config: Qwen3MoEConfig) -> torch.Tensor:
+def _pack_mcore_qkv(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, config: Qwen3MoEConfig
+) -> torch.Tensor:
     q_per_group = config.num_attention_heads // config.num_key_value_heads
     q = q.view(config.num_key_value_heads, q_per_group * config.head_dim, -1)
     k = k.view(config.num_key_value_heads, config.head_dim, -1)
@@ -33,7 +35,9 @@ def _pack_mcore_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, config: Q
     return torch.cat([q, k, v], dim=1).reshape(-1, q.shape[-1]).contiguous()
 
 
-def _unpack_mcore_qkv(tensor: torch.Tensor, config: Qwen3MoEConfig) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _unpack_mcore_qkv(
+    tensor: torch.Tensor, config: Qwen3MoEConfig
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q_per_group = config.num_attention_heads // config.num_key_value_heads
     group_width = (q_per_group + 2) * config.head_dim
     packed = tensor.view(config.num_key_value_heads, group_width, -1)
@@ -69,7 +73,9 @@ class Qwen3MoEWeightSpec:
             lp = f"layers.{li}"
             wm.update(
                 {
-                    f"{lp}.attn.qkv.linear.layer_norm_weight": [f"model.layers.{li}.input_layernorm.weight"],
+                    f"{lp}.attn.qkv.linear.layer_norm_weight": [
+                        f"model.layers.{li}.input_layernorm.weight"
+                    ],
                     f"{lp}.attn.qkv.linear.weight": [
                         f"{ap}.q_proj.weight",
                         f"{ap}.k_proj.weight",
@@ -78,7 +84,9 @@ class Qwen3MoEWeightSpec:
                     f"{lp}.attn.q_norm.weight": [f"{ap}.q_norm.weight"],
                     f"{lp}.attn.k_norm.weight": [f"{ap}.k_norm.weight"],
                     f"{lp}.attn.proj.linear.weight": [f"{ap}.o_proj.weight"],
-                    f"{lp}.mlp_norm.weight": [f"model.layers.{li}.post_attention_layernorm.weight"],
+                    f"{lp}.mlp_norm.weight": [
+                        f"model.layers.{li}.post_attention_layernorm.weight"
+                    ],
                     f"{lp}.moe.router.gate.weight": [f"{mp}.gate.weight"],
                 }
             )
@@ -87,7 +95,9 @@ class Qwen3MoEWeightSpec:
                     f"{mp}.experts.{e}.gate_proj.weight",
                     f"{mp}.experts.{e}.up_proj.weight",
                 ]
-                wm[f"{lp}.moe.experts._fc2_weight_{e}"] = [f"{mp}.experts.{e}.down_proj.weight"]
+                wm[f"{lp}.moe.experts._fc2_weight_{e}"] = [
+                    f"{mp}.experts.{e}.down_proj.weight"
+                ]
         for mi in range(c.num_nextn_predict_layers):
             hf_li = c.num_hidden_layers + mi
             hp = f"model.layers.{hf_li}"
@@ -101,7 +111,9 @@ class Qwen3MoEWeightSpec:
                     f"{lp}.hnorm.weight": [f"{hp}.hnorm.weight"],
                     f"{lp}.eh_proj.linear.weight": [f"{hp}.eh_proj.weight"],
                     f"{lp}.final_layernorm.weight": [f"{hp}.shared_head.norm.weight"],
-                    f"{tlp}.attn.qkv.linear.layer_norm_weight": [f"{hp}.input_layernorm.weight"],
+                    f"{tlp}.attn.qkv.linear.layer_norm_weight": [
+                        f"{hp}.input_layernorm.weight"
+                    ],
                     f"{tlp}.attn.qkv.linear.weight": [
                         f"{ap}.q_proj.weight",
                         f"{ap}.k_proj.weight",
@@ -119,10 +131,14 @@ class Qwen3MoEWeightSpec:
                     f"{mp}.experts.{e}.gate_proj.weight",
                     f"{mp}.experts.{e}.up_proj.weight",
                 ]
-                wm[f"{tlp}.moe.experts._fc2_weight_{e}"] = [f"{mp}.experts.{e}.down_proj.weight"]
+                wm[f"{tlp}.moe.experts._fc2_weight_{e}"] = [
+                    f"{mp}.experts.{e}.down_proj.weight"
+                ]
         return wm
 
-    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
+    def hf_to_native(
+        self, native_name: str, hf_tensors: list[torch.Tensor]
+    ) -> torch.Tensor:
         if len(hf_tensors) == 3 and "qkv" in native_name:
             # Match MCore SelfAttention's local qkv packing:
             # [q heads for kv-group 0, k0, v0, q heads for kv-group 1, k1, v1, ...].
@@ -135,7 +151,9 @@ class Qwen3MoEWeightSpec:
             return t[: self.config.num_experts]
         return t
 
-    def native_to_hf(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    def native_to_hf(
+        self, native_name: str, tensor: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
         c = self.config
         if native_name == "mtp_embed.embedding.weight":
             return []
@@ -152,7 +170,9 @@ class Qwen3MoEWeightSpec:
                 return [(f"{hp}.eh_proj.weight", tensor)]
             if native_name.endswith(".final_layernorm.weight"):
                 return [(f"{hp}.shared_head.norm.weight", tensor)]
-            proxy = native_name.replace(f"mtp.layers.{mtp_idx}.transformer_layer", f"layers.{hf_li}")
+            proxy = native_name.replace(
+                f"mtp.layers.{mtp_idx}.transformer_layer", f"layers.{hf_li}"
+            )
             return self.native_to_hf(proxy, tensor)
         if "embed" in native_name and "embedding" in native_name:
             return [("model.embed_tokens.weight", tensor)]
@@ -321,7 +341,12 @@ def _export_mxfp4_weights(weights):
             "model.embed_tokens.weight",
             "lm_head.weight",
         } or name.endswith(".mlp.gate.weight")
-        if is_ignored or not name.endswith(".weight") or tensor.ndim != 2 or not tensor.dtype.is_floating_point:
+        if (
+            is_ignored
+            or not name.endswith(".weight")
+            or tensor.ndim != 2
+            or not tensor.dtype.is_floating_point
+        ):
             yield name, tensor
             continue
         if tensor.shape[-1] % MXFP4_BLOCK_SIZE:

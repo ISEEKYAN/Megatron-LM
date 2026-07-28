@@ -117,7 +117,9 @@ def test_qwen3_moe_canonical_state_key_maps_grouped_expert_master():
     assert actual == canonical[logical]
     assert actual.endswith("parametrizations.weight.original")
 
-    real = torch.randn_like(chunk.layers[0].moe.experts.fc1.parametrizations.weight.original)
+    real = torch.randn_like(
+        chunk.layers[0].moe.experts.fc1.parametrizations.weight.original
+    )
     resolved = {actual: real}
     for name, param in chunk.named_parameters():
         if name == actual:
@@ -187,7 +189,9 @@ def test_qwen3_moe_mxfp4_resync_exports_compressed_tensors_stream(
         ("fp8_rollout_qat_on", {"enabled": True, "format": "fp8", "group_size": -1}),
     ],
 )
-def test_qwen3_moe_dapo_three_arm_impl_cfg_resolves(transformer_engine_import_stub, arm, impl_qat):
+def test_qwen3_moe_dapo_three_arm_impl_cfg_resolves(
+    transformer_engine_import_stub, arm, impl_qat
+):
     transformer_engine_import_stub()
     from megatron.lite.model.qwen3_moe.lite import protocol as qwen3_moe_protocol
 

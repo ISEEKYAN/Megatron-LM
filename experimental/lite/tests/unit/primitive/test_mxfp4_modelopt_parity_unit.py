@@ -78,7 +78,9 @@ def modelopt_mxfp4_qdq(weight: torch.Tensor, block_size: int = 32) -> torch.Tens
     def cast_fp4(x):
         sign = torch.sign(x)
         sign_bit = (2 - sign) // 2
-        ord_ = torch.sum((x.abs().unsqueeze(-1) - _MODELOPT_E2M1_BOUNDS.to(x.device)) > 0, dim=-1)
+        ord_ = torch.sum(
+            (x.abs().unsqueeze(-1) - _MODELOPT_E2M1_BOUNDS.to(x.device)) > 0, dim=-1
+        )
         return (sign_bit * 0b1000 + ord_).to(torch.uint8)
 
     original_shape = weight.shape
@@ -93,7 +95,9 @@ def modelopt_mxfp4_qdq(weight: torch.Tensor, block_size: int = 32) -> torch.Tens
     # dequantize
     sign = 1 - 2 * ((codes & 0b1000) >> 3).to(torch.float32)
     magnitude = (codes & 0b0111).to(torch.long)
-    values = torch.tensor(_MODELOPT_E2M1_VALUES, dtype=torch.float32, device=codes.device)
+    values = torch.tensor(
+        _MODELOPT_E2M1_VALUES, dtype=torch.float32, device=codes.device
+    )
     out = sign * values[magnitude.reshape(-1)].reshape(magnitude.shape)
     out = out.reshape(-1, block_size) * torch.exp2(e8m0_scale.float())
     return out.reshape(original_shape)
@@ -115,7 +119,9 @@ def _case_tensors() -> dict[str, torch.Tensor]:
     return {
         "gaussian": torch.randn(512, 4096, dtype=torch.bfloat16),
         "weight_scale": (torch.randn(256, 2048) * 0.02).to(torch.bfloat16),
-        "heavy_tail": (torch.randn(256, 2048) * torch.rand(256, 2048).pow(3)).to(torch.bfloat16),
+        "heavy_tail": (torch.randn(256, 2048) * torch.rand(256, 2048).pow(3)).to(
+            torch.bfloat16
+        ),
         "extreme": extreme,
     }
 
@@ -141,7 +147,9 @@ def test_training_fake_quant_is_bit_identical_to_modelopt(case: str) -> None:
     weight = CASES[case]
     got = _mxfp4_fake_quantize_weight(weight, SPEC)
     assert got.dtype == weight.dtype
-    _assert_bit_identical(got, modelopt_mxfp4_qdq(weight), f"training fake-quant [{case}]")
+    _assert_bit_identical(
+        got, modelopt_mxfp4_qdq(weight), f"training fake-quant [{case}]"
+    )
 
 
 @pytest.mark.parametrize("case", CASE_IDS)
@@ -222,8 +230,12 @@ def test_modelopt_reference_matches_installed_modelopt() -> None:
     )
     for case in CASE_IDS:
         weight = CASES[case]
-        qtensor, e8m0 = mxfp4_tensor.MXFP4QTensor.quantize(weight.clone(), MXFP4_BLOCK_SIZE)
-        want = qtensor.dequantize(dtype=torch.float32, scale=e8m0, block_sizes={-1: MXFP4_BLOCK_SIZE}).reshape(
-            weight.shape
+        qtensor, e8m0 = mxfp4_tensor.MXFP4QTensor.quantize(
+            weight.clone(), MXFP4_BLOCK_SIZE
         )
-        _assert_bit_identical(modelopt_mxfp4_qdq(weight), want, f"vendored reference [{case}]")
+        want = qtensor.dequantize(
+            dtype=torch.float32, scale=e8m0, block_sizes={-1: MXFP4_BLOCK_SIZE}
+        ).reshape(weight.shape)
+        _assert_bit_identical(
+            modelopt_mxfp4_qdq(weight), want, f"vendored reference [{case}]"
+        )

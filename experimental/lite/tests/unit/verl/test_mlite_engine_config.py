@@ -34,10 +34,14 @@ def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
 
 
 def _engine(
-    *, engine_config: MegatronLiteEngineConfig, optimizer_config: SimpleNamespace | None = None
+    *,
+    engine_config: MegatronLiteEngineConfig,
+    optimizer_config: SimpleNamespace | None = None,
 ) -> MegatronLiteEngine:
     return MegatronLiteEngine(
-        model_config=SimpleNamespace(local_path="/tmp/qwen35", hf_config={"model_type": "qwen3_5_moe"}, mtp=None),
+        model_config=SimpleNamespace(
+            local_path="/tmp/qwen35", hf_config={"model_type": "qwen3_5_moe"}, mtp=None
+        ),
         engine_config=engine_config,
         optimizer_config=optimizer_config or _optimizer_config(),
         checkpoint_config={},
@@ -59,7 +63,10 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     engine.get_data_parallel_group = lambda: None
 
     hook = engine._make_runtime_loss_fn(
-        lambda model_output, **_kwargs: (model_output["log_probs"] / num_microbatches, {}),
+        lambda model_output, **_kwargs: (
+            model_output["log_probs"] / num_microbatches,
+            {},
+        ),
         num_microbatches=num_microbatches,
         output_lst=outputs,
     )
@@ -68,13 +75,17 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
         (loss / num_microbatches).backward()
 
     torch.testing.assert_close(weight.grad, torch.tensor(3.0))
-    assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
+    assert [output["loss"] for output in outputs] == [
+        3.0 / num_microbatches
+    ] * num_microbatches
 
 
 def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> None:
     engine = _engine(
         engine_config=_engine_config(optimizer_offload=True),
-        optimizer_config=_optimizer_config(use_precision_aware_optimizer=True, decoupled_weight_decay=True),
+        optimizer_config=_optimizer_config(
+            use_precision_aware_optimizer=True, decoupled_weight_decay=True
+        ),
     )
 
     optimizer = engine._build_mlite_optimizer_config()
@@ -200,7 +211,9 @@ def test_online_qat_export_wraps_mlite_hf_weight_stream(monkeypatch) -> None:
             }
         )
     )
-    source_weights = iter([("model.layers.0.mlp.experts.0.gate_proj.weight", torch.ones(2, 32))])
+    source_weights = iter(
+        [("model.layers.0.mlp.experts.0.gate_proj.weight", torch.ones(2, 32))]
+    )
     captured = {}
 
     class Runtime:
