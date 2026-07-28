@@ -52,6 +52,7 @@ from megatron.lite.primitive.modules.lora import (
     trainable_param_stats,
 )
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
+    recompute_modules_for_ep_chunk_overlap,
     validate_ep_chunk_overlap_config,
 )
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
@@ -176,7 +177,6 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     validate_ep_chunk_overlap_config(
         impl_cfg.num_chunks_ep_a2a_overlap, use_deepep=impl_cfg.use_deepep, ep_size=p.ep
     )
-    chunked_ep = impl_cfg.num_chunks_ep_a2a_overlap == 2
     # ── override model config from impl_cfg ──
     if impl_cfg.router_aux_loss_coef is not None:
         model_cfg.router_aux_loss_coef = impl_cfg.router_aux_loss_coef
@@ -229,9 +229,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
     # ── recompute ──
-    layer_recompute_spec = recompute_spec
-    if chunked_ep and "moe" in recompute_spec:
-        layer_recompute_spec = [name for name in recompute_spec if name != "moe"]
+    layer_recompute_spec = recompute_modules_for_ep_chunk_overlap(
+        recompute_spec, num_chunks=impl_cfg.num_chunks_ep_a2a_overlap
+    )
     if layer_recompute_spec:
         for chunk in chunks:
             apply_recompute(chunk.layers, layer_recompute_spec, MODULE_MAP)

@@ -29,6 +29,7 @@ def test_every_lite_moe_model_consumes_the_shared_chunked_ep_primitive(
 
     assert "num_chunks_ep_a2a_overlap: int = 1" in protocol
     assert "validate_ep_chunk_overlap_config(" in protocol
+    assert "recompute_modules_for_ep_chunk_overlap(" in protocol
     assert "EPChunkOverlapMoELayer" in implementation
     assert "num_chunks_ep_a2a_overlap" in implementation
 
@@ -43,13 +44,6 @@ def test_backward_specific_chunk_parameter_is_removed_from_product_code():
     ]
 
     assert matches == []
-
-
-def test_qwen3_build_keeps_the_validated_chunked_ep_branch_live():
-    protocol = (MODEL_ROOT / "qwen3_moe/lite/protocol.py").read_text()
-
-    assert "chunked_ep = impl_cfg.num_chunks_ep_a2a_overlap == 2" in protocol
-    assert 'if chunked_ep and "moe" in recompute_spec:' in protocol
 
 
 def test_coverage_list_matches_every_registered_lite_model():

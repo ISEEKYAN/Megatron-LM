@@ -52,6 +52,7 @@ def test_qwen3_chunked_ep_pair_uses_deepep_and_explicit_chunks():
     text = script.read_text(encoding="utf-8")
 
     assert text.count('"use_deepep":true') == 2
+    assert text.count('"recompute":["moe"]') == 2
     assert '"num_chunks_ep_a2a_overlap":2' in text
     assert "--use-thd" in text
     assert "post_step_weights" not in text

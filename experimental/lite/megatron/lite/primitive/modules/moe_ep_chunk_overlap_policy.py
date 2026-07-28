@@ -38,6 +38,16 @@ def validate_ep_chunk_overlap_config(
     return num_chunks
 
 
+def recompute_modules_for_ep_chunk_overlap(
+    modules: list[str], *, num_chunks: int
+) -> list[str]:
+    """Avoid wrapping the native ChunkedEP full recompute in another checkpoint."""
+    chunks = parse_ep_chunk_spec(num_chunks)
+    if chunks == 1:
+        return modules
+    return [name for name in modules if name != "moe"]
+
+
 def ep_chunk_ranges(
     num_tokens: int,
     num_chunks: int,
@@ -103,6 +113,7 @@ __all__ = [
     "ChunkSpec",
     "ep_chunk_ranges",
     "parse_ep_chunk_spec",
+    "recompute_modules_for_ep_chunk_overlap",
     "resolve_ep_chunk_overlap_chunks",
     "validate_ep_chunk_overlap_config",
 ]

@@ -33,6 +33,7 @@ from megatron.lite.model.protocol_utils import (
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
+    recompute_modules_for_ep_chunk_overlap,
     validate_ep_chunk_overlap_config,
 )
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
@@ -437,9 +438,14 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
 
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
-    if recompute_spec:
+    layer_recompute_spec = recompute_modules_for_ep_chunk_overlap(
+        recompute_spec, num_chunks=impl_cfg.num_chunks_ep_a2a_overlap
+    )
+    if layer_recompute_spec:
         for chunk in chunks:
-            apply_recompute(_iter_transformer_units(chunk), recompute_spec, MODULE_MAP)
+            apply_recompute(
+                _iter_transformer_units(chunk), layer_recompute_spec, MODULE_MAP
+            )
 
     if impl_cfg.offload:
         from megatron.lite.primitive.recompute import apply_offload

@@ -65,11 +65,11 @@ run_arm() {
 }
 
 run_arm baseline \
-  '{"use_deepep":true,"num_chunks_ep_a2a_overlap":1}' \
+  '{"use_deepep":true,"recompute":["moe"],"num_chunks_ep_a2a_overlap":1}' \
   "${MASTER_PORT_BASELINE:-31851}" \
   "${CORRECTNESS_PORT_BASELINE:-31951}"
 run_arm chunked \
-  '{"use_deepep":true,"num_chunks_ep_a2a_overlap":2}' \
+  '{"use_deepep":true,"recompute":["moe"],"num_chunks_ep_a2a_overlap":2}' \
   "${MASTER_PORT_CHUNKED:-31852}" \
   "${CORRECTNESS_PORT_CHUNKED:-31952}"
 

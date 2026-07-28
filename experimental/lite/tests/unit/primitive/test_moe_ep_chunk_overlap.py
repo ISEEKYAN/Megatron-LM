@@ -6,6 +6,7 @@ import pytest
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     ep_chunk_ranges,
     parse_ep_chunk_spec,
+    recompute_modules_for_ep_chunk_overlap,
     resolve_ep_chunk_overlap_chunks,
     validate_ep_chunk_overlap_config,
 )
@@ -37,6 +38,17 @@ def test_forward_and_backward_share_the_same_closed_chunk_count():
             resolve_ep_chunk_overlap_chunks(tokens, ep_size=8, hidden_size=4096, spec=2)
             == 2
         )
+
+
+def test_chunked_full_recompute_replaces_the_outer_moe_checkpoint():
+    requested = ["core_attn", "moe", "mlp"]
+
+    assert recompute_modules_for_ep_chunk_overlap(requested, num_chunks=1) == requested
+    assert recompute_modules_for_ep_chunk_overlap(requested, num_chunks=2) == [
+        "core_attn",
+        "mlp",
+    ]
+    assert requested == ["core_attn", "moe", "mlp"]
 
 
 @pytest.mark.parametrize(

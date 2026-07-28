@@ -31,6 +31,7 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import (
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
+    recompute_modules_for_ep_chunk_overlap,
     validate_ep_chunk_overlap_config,
 )
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
@@ -262,9 +263,12 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
                 module.sync_tp_replicated_parameters()
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
-    if recompute_spec:
+    layer_recompute_spec = recompute_modules_for_ep_chunk_overlap(
+        recompute_spec, num_chunks=impl_cfg.num_chunks_ep_a2a_overlap
+    )
+    if layer_recompute_spec:
         for chunk in chunks:
-            apply_recompute(chunk.layers, recompute_spec, MODULE_MAP)
+            apply_recompute(chunk.layers, layer_recompute_spec, MODULE_MAP)
 
     if impl_cfg.offload:
         from megatron.lite.primitive.recompute import apply_offload
