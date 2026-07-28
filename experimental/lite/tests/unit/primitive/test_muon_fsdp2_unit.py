@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -466,6 +467,21 @@ def test_routing_splits_matrix_vs_fallback():
     assert muon_params == [model.weight]
     assert fallback_params == [model.norm]
     assert set(names.values()) == {"chunk0.weight", "chunk0.norm"}
+
+
+def test_fsdp2_muon_fails_loudly_when_routing_selects_no_matrix_params():
+    from megatron.lite.primitive.optimizers.fsdp2.optimizer import build_fsdp2_muon
+
+    model = _Toy()
+    model.weight.is_managed_by_layer_wise_optimizer = False
+    model.norm.is_managed_by_layer_wise_optimizer = False
+
+    with pytest.raises(RuntimeError, match="no matrix parameters"):
+        build_fsdp2_muon(
+            [model],
+            SimpleNamespace(),
+            SimpleNamespace(),
+        )
 
 
 def test_chained_facade_steps_muon_and_fallback_together():

@@ -392,6 +392,11 @@ def build_fsdp2_muon(
     muon_params, _fallback_params, muon_names = split_muon_and_fallback_params(
         model_chunks
     )
+    if not muon_params:
+        raise RuntimeError(
+            "FSDP2 Muon routing selected no matrix parameters; refusing to run "
+            "an AdamW-only fallback under optimizer='muon'."
+        )
     _muon_only, _muon_groups, _muon_name_map, muon_model_dtypes = (
         _build_adamw_param_groups(
             model_chunks,
