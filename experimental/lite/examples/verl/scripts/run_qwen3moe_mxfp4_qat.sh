@@ -33,8 +33,8 @@ qat_overrides_for_mode() {
         baseline)
             # BF16 training + BF16 rollout: the unquantized reference.
             QAT_OVERRIDES+=(
-                "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
-                "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
                 "actor_rollout_ref.actor.engine.router_replay_mode=disabled"
                 "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
             )
@@ -42,8 +42,8 @@ qat_overrides_for_mode() {
         qat_off)
             # MXFP4 rollout without fake quant: measures training/rollout mismatch.
             QAT_OVERRIDES+=(
-                "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
-                "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=false"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
                 "actor_rollout_ref.rollout.quantization=mxfp4"
                 "actor_rollout_ref.actor.engine.router_replay_mode=disabled"
                 "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
@@ -52,8 +52,8 @@ qat_overrides_for_mode() {
         qat_on)
             # MXFP4 rollout plus training-side MXFP4 fake quantization.
             QAT_OVERRIDES+=(
-                "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
-                "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
                 "actor_rollout_ref.rollout.quantization=mxfp4"
                 "actor_rollout_ref.actor.engine.router_replay_mode=disabled"
                 "actor_rollout_ref.rollout.enable_rollout_routing_replay=false"
@@ -62,8 +62,8 @@ qat_overrides_for_mode() {
         r3)
             # qat_on plus router replay.
             QAT_OVERRIDES+=(
-                "actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
-                "actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true"
+                "+actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4"
                 "actor_rollout_ref.rollout.quantization=mxfp4"
                 "actor_rollout_ref.actor.engine.router_replay_mode=R3"
                 "actor_rollout_ref.rollout.enable_rollout_routing_replay=true"
