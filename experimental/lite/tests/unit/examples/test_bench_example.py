@@ -56,6 +56,18 @@ def test_qwen3_chunked_ep_pair_uses_deepep_and_explicit_chunks():
     assert "overlap_moe_expert_parallel_comm" not in text
 
 
+def test_chunked_ep_layer_perf_has_the_three_full_recompute_gates():
+    root = Path(__file__).resolve().parents[3]
+    script = root / "examples/bench/chunked_ep_layer_perf.py"
+    text = script.read_text(encoding="utf-8")
+
+    assert 'MODES = ("forward", "backward", "fused_forward_backward")' in text
+    assert "default=16384" in text
+    assert "use_deepep=True" in text
+    assert "moe_full_recompute=True" in text
+    assert "speedup > 1.0" in text
+
+
 def test_bench_seed_is_applied_before_model_construction():
     from examples.bench.bench import _seed_benchmark
 
