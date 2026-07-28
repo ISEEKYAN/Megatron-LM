@@ -153,9 +153,10 @@ path.
 Exporter exclusions use HF names and support `"re:"` regular expressions;
 MLite training exclusions use exact Megatron dotted path components. Do not
 copy either list into the other. When combining this optional exporter with
-MLite training QAT, keep exporter `mode`/`group_size` consistent with training
-`format`/`group_size`, keep the two enable switches independent, and leave
-`apply_modelopt_fake_quant=false`.
+MLite training QAT, keep exporter `mode` and `group_size` consistent with the
+block size implied by the training `format` (32 for MXFP4), or training and
+export will use different quantization contracts. Keep the two enable switches
+independent, and leave `apply_modelopt_fake_quant=false`.
 
 ## Four-arm QAT launch
 
