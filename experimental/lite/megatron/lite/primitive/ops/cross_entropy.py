@@ -61,12 +61,9 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
     def forward(ctx, vocab_parallel_logits, target, tp_group, chunk_size):
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
-        if (
-            vocab_parallel_logits.numel() // vocab_parallel_logits.size(-1)
-            != target.numel()
-        ):
+        if vocab_parallel_logits.shape[:-1] != target.shape:
             raise ValueError(
-                "logits and target must contain the same number of tokens, "
+                "logits leading shape must match target shape, "
                 f"got {vocab_parallel_logits.shape[:-1]} and {target.shape}"
             )
 
@@ -142,8 +139,10 @@ def vocab_parallel_cross_entropy(
     Example:
         ``loss = vocab_parallel_cross_entropy(logits, labels, tp_group, chunk_size=512)``
     """
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+        raise TypeError(f"chunk_size must be an integer, got {chunk_size!r}")
     return _VocabParallelCrossEntropy.apply(
-        vocab_parallel_logits, target, tp_group, int(chunk_size)
+        vocab_parallel_logits, target, tp_group, chunk_size
     )
 
 

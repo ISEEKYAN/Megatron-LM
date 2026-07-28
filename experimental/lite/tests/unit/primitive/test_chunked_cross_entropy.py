@@ -73,6 +73,52 @@ def test_chunked_cross_entropy_bounds_saved_fp32_state_and_matches_gradients():
     torch.testing.assert_close(logits.grad, logits_ref.grad)
 
 
+def test_chunked_cross_entropy_default_chunk_spans_multiple_chunks():
+    logits = torch.randn(1025, 1, 7, dtype=torch.float16, requires_grad=True)
+    labels = torch.randint(0, 7, (1025, 1))
+    logits_ref = logits.detach().clone().requires_grad_()
+
+    loss = cross_entropy.vocab_parallel_cross_entropy(logits, labels)
+    loss.sum().backward()
+    expected = F.cross_entropy(
+        logits_ref.float().reshape(-1, 7), labels.reshape(-1), reduction="none"
+    ).view_as(labels)
+    expected.sum().backward()
+
+    torch.testing.assert_close(loss, expected)
+    torch.testing.assert_close(logits.grad, logits_ref.grad)
+
+
+def test_chunked_cross_entropy_rejects_same_numel_different_layout():
+    logits = torch.randn(2, 3, 5)
+    labels = torch.randint(0, 5, (3, 2))
+
+    with pytest.raises(ValueError, match="leading shape"):
+        cross_entropy.vocab_parallel_cross_entropy(logits, labels)
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1])
+def test_chunked_cross_entropy_rejects_nonpositive_chunk_size(chunk_size):
+    logits = torch.randn(2, 3, 5)
+    labels = torch.randint(0, 5, (2, 3))
+
+    with pytest.raises(ValueError, match="positive"):
+        cross_entropy.vocab_parallel_cross_entropy(
+            logits, labels, chunk_size=chunk_size
+        )
+
+
+@pytest.mark.parametrize("chunk_size", [3.9, True])
+def test_chunked_cross_entropy_rejects_noninteger_chunk_size(chunk_size):
+    logits = torch.randn(2, 3, 5)
+    labels = torch.randint(0, 5, (2, 3))
+
+    with pytest.raises(TypeError, match="integer"):
+        cross_entropy.vocab_parallel_cross_entropy(
+            logits, labels, chunk_size=chunk_size
+        )
+
+
 def test_chunked_cross_entropy_matches_two_rank_tp():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
