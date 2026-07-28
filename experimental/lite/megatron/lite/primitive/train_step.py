@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import torch.distributed as dist
@@ -22,6 +23,7 @@ def run_microbatch_loop(
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
     forward_only: bool = False,
+    overlap_forward_backward: bool = False,
 ):
     """Run forward-backward over microbatches with loss accumulation.
 
@@ -45,30 +47,65 @@ def run_microbatch_loop(
             ``infer_batch``). The caller (verl) runs the forward under ``no_grad`` so the
             loss has no ``grad_fn``; calling ``.backward()`` then raises. Mirrors the
             pipeline path, which already threads ``forward_only`` to skip backward.
+        overlap_forward_backward: Run the backward of one microbatch concurrently
+            with the forward of the next. This is the flat, adjacent-microbatch
+            combined-1F1B boundary used by chunked EP; model composition remains
+            owned by ``forward_fn``.
     """
     last_out = None
     all_metrics: list[dict] = []
-    for mb in range(num_microbatches):
+    cuda_device = next(
+        (parameter.device for parameter in model.parameters() if parameter.is_cuda),
+        None,
+    )
+
+    def run_forward(mb: int):
         batch, loss_context = split_loss_context(next(data_iter))
         if pre_forward_hook is not None:
             scale = torch.tensor(1.0 / num_microbatches, device="cuda")
             pre_forward_hook(scale)
         with use_loss_context(loss_context):
             out = forward_fn(model, batch)
-        if dist_opt and optimizer is not None and mb == num_microbatches - 1:
-            optimizer.grad_sync_enabled = True
         if loss_fn is not None:
             if loss_context is None:
                 loss, metrics = loss_fn(out, batch)
             else:
                 loss, metrics = loss_fn(out, batch, loss_context)
-            if not forward_only:
-                (loss / num_microbatches).backward()
             out["loss"] = loss.detach()
+            return out, loss, metrics
+        return out, out.get("loss"), None
+
+    def run_backward(loss, *, sync_grad: bool):
+        if cuda_device is not None:
+            torch.cuda.set_device(cuda_device)
+        if dist_opt and optimizer is not None and sync_grad:
+            optimizer.grad_sync_enabled = True
+        (loss / num_microbatches).backward()
+
+    if forward_only or not overlap_forward_backward or num_microbatches == 1:
+        for mb in range(num_microbatches):
+            out, loss, metrics = run_forward(mb)
+            if not forward_only:
+                run_backward(loss, sync_grad=mb == num_microbatches - 1)
+            if metrics is not None:
+                all_metrics.append(metrics)
+            last_out = out
+    else:
+        out, loss, metrics = run_forward(0)
+        if metrics is not None:
             all_metrics.append(metrics)
-        elif not forward_only:
-            (out["loss"] / num_microbatches).backward()
         last_out = out
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlite-combined-1f1b") as pool:
+            for mb in range(1, num_microbatches):
+                backward = pool.submit(run_backward, loss, sync_grad=False)
+                out, next_loss, metrics = run_forward(mb)
+                backward.result()
+                if metrics is not None:
+                    all_metrics.append(metrics)
+                last_out = out
+                loss = next_loss
+            pool.submit(run_backward, loss, sync_grad=True).result()
+
     if last_out is not None and all_metrics:
         last_out["_loss_fn_metrics"] = all_metrics
     return last_out
