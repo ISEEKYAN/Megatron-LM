@@ -163,10 +163,26 @@ def test_tiny_qwen_hf_load_has_full_coverage_before_lora_attach(tmp_path, capsys
                 self.linear.layer_norm_weight = nn.Parameter(torch.empty(in_features))
                 self.linear.eps = 1e-6
                 self.linear.zero_centered_gamma = False
+                self.linear.return_layernorm_output = False
+                self.linear.return_layernorm_output_gathered = False
             self.use_sp = False
 
         def forward(self, x):
+            if hasattr(self.linear, "layer_norm_weight"):
+                return self.forward_with_normalized_input(x)[0]
             return torch.nn.functional.linear(x, self.linear.weight)
+
+        def forward_with_normalized_input(self, x):
+            normalized = torch.nn.functional.rms_norm(
+                x,
+                (x.shape[-1],),
+                self.linear.layer_norm_weight,
+                self.linear.eps,
+            )
+            return (
+                torch.nn.functional.linear(normalized, self.linear.weight),
+                normalized,
+            )
 
     class _GroupedSurface(nn.Module):
         def __init__(self, num_experts, in_features, out_features):
@@ -390,6 +406,23 @@ def test_apply_lora_tp_layout_on_gqa_adapters():
         RowParallelLinear,
     )
 
+    class _FakeLayerNormLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(12, 16, dtype=torch.bfloat16))
+            self.layer_norm_weight = nn.Parameter(torch.ones(16, dtype=torch.bfloat16))
+            self.return_layernorm_output = False
+            self.return_layernorm_output_gathered = False
+
+        def forward(self, x):
+            normalized = torch.nn.functional.rms_norm(
+                x, (x.shape[-1],), self.layer_norm_weight
+            )
+            out = normalized @ self.weight.t()
+            if self.return_layernorm_output:
+                return out, normalized
+            return out
+
     def _column_surface():
         surface = ColumnParallelLinear.__new__(ColumnParallelLinear)
         nn.Module.__init__(surface)
@@ -398,7 +431,7 @@ def test_apply_lora_tp_layout_on_gqa_adapters():
         surface.tp_group = object()
         surface.local_out = 12
         surface.use_sp = True
-        surface.linear = nn.Linear(16, 12, bias=False, dtype=torch.bfloat16)
+        surface.linear = _FakeLayerNormLinear()
         surface.gather_output = False
         return surface
 
@@ -436,6 +469,13 @@ def test_apply_lora_tp_layout_on_gqa_adapters():
     assert qkv_adapter.rank_partitioned_a is True
     assert qkv_adapter.lora_a.tensor_model_parallel is True
     assert qkv_adapter.lora_b.tensor_model_parallel is True
+    assert attn.qkv._use_base_normalized_input is True
+    assert attn.qkv.base.linear.return_layernorm_output is True
+    assert attn.qkv.base.linear.return_layernorm_output_gathered is False
+    _, normalized_input = attn.qkv.base.forward_with_normalized_input(
+        torch.randn(2, 16, dtype=torch.bfloat16)
+    )
+    assert normalized_input.shape == (2, 16)
     assert proj_adapter.lora_a.shape == (4, 12)
     assert proj_adapter.lora_b.shape == (8, 4)
     assert proj_adapter.input_parallel_reduce is True

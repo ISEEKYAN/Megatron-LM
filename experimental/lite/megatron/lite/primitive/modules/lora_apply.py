@@ -32,15 +32,26 @@ class LoRAWrappedLinear(nn.Module):
         adapter: nn.Module,
         *,
         adapter_input_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        use_base_normalized_input: bool = False,
     ):
         super().__init__()
         self.base = base
         self.adapter = adapter
         self._adapter_input_fn = adapter_input_fn
+        self._use_base_normalized_input = bool(use_base_normalized_input)
+        if self._use_base_normalized_input and adapter_input_fn is not None:
+            raise ValueError(
+                "Choose either the base normalized input or adapter_input_fn, not both."
+            )
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        out = self.base(x, *args, **kwargs)
-        adapter_x = self._adapter_input_fn(x) if self._adapter_input_fn is not None else x
+        if self._use_base_normalized_input:
+            out, adapter_x = self.base.forward_with_normalized_input(x, *args, **kwargs)
+        else:
+            out = self.base(x, *args, **kwargs)
+            adapter_x = (
+                self._adapter_input_fn(x) if self._adapter_input_fn is not None else x
+            )
         return out + self.adapter(adapter_x)
 
     def __getattr__(self, name: str):
@@ -109,22 +120,17 @@ def _place_adapter_like(adapter: nn.Module, base: nn.Module) -> nn.Module:
     return adapter.to(device=reference.device, dtype=reference.dtype)
 
 
-def _qkv_adapter_input_fn(base_qkv: nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
+def _enable_qkv_normalized_output(base_qkv: nn.Module) -> bool:
     linear = base_qkv.linear
     if not hasattr(linear, "layer_norm_weight"):
-        return lambda x: x
-    eps = float(getattr(linear, "eps", 1e-6))
-    zero_centered = bool(getattr(linear, "zero_centered_gamma", False))
-
-    def _fn(x: torch.Tensor) -> torch.Tensor:
-        weight = linear.layer_norm_weight
-        if zero_centered:
-            weight = weight + 1
-        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
-        x_norm = x.float() * torch.rsqrt(variance + eps)
-        return (x_norm * weight.float()).to(x.dtype)
-
-    return _fn
+        return False
+    if not hasattr(base_qkv, "forward_with_normalized_input"):
+        raise TypeError(
+            f"{type(base_qkv).__name__} does not expose its normalized linear input."
+        )
+    linear.return_layernorm_output = True
+    linear.return_layernorm_output_gathered = False
+    return True
 
 
 def _attach_gqa_qkv(attn, spec: LoraSpec) -> bool:
@@ -151,8 +157,9 @@ def _attach_gqa_qkv(attn, spec: LoraSpec) -> bool:
         ),
         attn.qkv,
     )
+    use_base_normalized_input = _enable_qkv_normalized_output(attn.qkv)
     attn.qkv = LoRAWrappedLinear(
-        attn.qkv, adapter, adapter_input_fn=_qkv_adapter_input_fn(attn.qkv)
+        attn.qkv, adapter, use_base_normalized_input=use_base_normalized_input
     )
     return True
 
