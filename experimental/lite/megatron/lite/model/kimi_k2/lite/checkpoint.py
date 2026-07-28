@@ -17,7 +17,9 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     unwrap_model,
 )
 from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.quantization.mxfp4 import MXFP4_BLOCK_SIZE, quantize_mxfp4
 from megatron.lite.primitive.utils import ensure_divisible, log_rank0
+from megatron.lite.runtime.contracts.weights import ResyncFormat
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -620,8 +622,34 @@ def load_hf_weights(model: nn.Module, path: str, config: KimiK2Config, ps: Paral
 def export_hf_weights(model, config: KimiK2Config, ps: ParallelState, **kwargs):
     from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
 
+    target = kwargs.pop("target", "hf")
+    resync_config = kwargs.pop("resync_config", None)
     spec = KimiK2WeightSpec(config)
-    yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
+    weights = _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
+    if target in {"hf", ResyncFormat.BF16.value}:
+        if resync_config:
+            raise ValueError("Kimi K2 resync_config requires target='mxfp4'")
+        yield from weights
+        return
+    if ResyncFormat.parse(target) is not ResyncFormat.MXFP4:
+        raise ValueError(f"Kimi K2 does not support resync target {target!r}")
+    if resync_config:
+        raise ValueError("Kimi K2 MXFP4 resync does not accept resync_config")
+    yield from _export_mxfp4_weights(weights)
+
+
+def _export_mxfp4_weights(weights):
+    """Convert the Kimi K2 HF stream to compressed-tensors MXFP4 tensors."""
+    for name, tensor in weights:
+        ignored = name.endswith(("embed_tokens.weight", "lm_head.weight", ".mlp.gate.weight"))
+        if ignored or not name.endswith(".weight") or tensor.ndim != 2 or not tensor.dtype.is_floating_point:
+            yield name, tensor
+            continue
+        if tensor.shape[-1] % MXFP4_BLOCK_SIZE:
+            raise ValueError(f"MXFP4 weight {name!r} has input dimension {tensor.shape[-1]}, which is not divisible by {MXFP4_BLOCK_SIZE}")
+        packed, scale = quantize_mxfp4(tensor)
+        yield name, packed.view(torch.uint8)
+        yield f"{name[:-7]}.weight_scale", scale.view(torch.uint8)
 
 
 def save_hf_weights(model, path: str, config: KimiK2Config, ps: ParallelState, **kwargs) -> None:
