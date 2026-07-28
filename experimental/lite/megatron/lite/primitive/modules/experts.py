@@ -146,8 +146,8 @@ class Experts(nn.Module):
                 raise RuntimeError("Expert delayed weight gradients are not enabled.")
             if store.context is None or store.context.empty():
                 raise RuntimeError("Expert delayed weight-gradient queue is empty.")
-            (_, grad_biases, _), tensors = store.pop()
-            if any(grad is not None for grad in grad_biases):
+            (_, _grad_biases, _), tensors = store.pop()
+            if linear.use_bias:
                 raise RuntimeError("Chunked EP expert grouped linears must not use bias.")
             weight_grads = tensors[2]
             for idx, grad in enumerate(weight_grads):

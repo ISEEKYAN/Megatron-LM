@@ -10,6 +10,52 @@ from types import SimpleNamespace
 import torch
 
 
+def test_experts_accept_te_dbias_placeholders_when_bias_is_disabled(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    class FakeStore:
+        context = SimpleNamespace(empty=lambda: False)
+
+        @staticmethod
+        def delay_wgrad_compute():
+            return True
+
+        @staticmethod
+        def pop():
+            grads = [torch.ones(2, 2), torch.ones(2, 2)]
+            return (None, [torch.empty(0), torch.empty(0)], None), [None, None, grads]
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self, num_gemms, *_args, bias, **_kwargs):
+            super().__init__()
+            self.use_bias = bias
+            self.wgrad_store = FakeStore()
+            for idx in range(num_gemms):
+                self.register_parameter(
+                    f"weight{idx}", torch.nn.Parameter(torch.zeros(2, 2))
+                )
+
+    monkeypatch.setattr(
+        experts_module.te, "GroupedLinear", FakeGroupedLinear, raising=False
+    )
+    config = SimpleNamespace(
+        num_experts=2,
+        hidden_size=2,
+        moe_intermediate_size=2,
+        swiglu_limit=0.0,
+    )
+    ps = SimpleNamespace(ep_size=1, etp_size=1, tp_size=1, etp_group=None)
+    experts = experts_module.Experts(config, ps, delay_wgrad_compute=True)
+
+    grads = experts.pop_delayed_weight_grads()
+
+    assert len(grads) == 4
+    assert all(parameter.grad is None for parameter in experts.parameters())
+
+
 def test_dispatch_local_backward_accumulates_duplicate_token_rows_and_weights(
     transformer_engine_import_stub,
 ):
