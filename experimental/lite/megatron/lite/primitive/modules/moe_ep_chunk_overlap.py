@@ -581,17 +581,21 @@ class EPChunkOverlapOperator:
                     local_state.pop("grad_recv_probs", None)
 
                 pending_dispatch_bwd.append((chunk, local_state))
-
-        for chunk, local_state in pending_dispatch_bwd:
-            with torch.cuda.stream(compute_stream):
-                delayed_grads = self.experts.pop_delayed_weight_grads()
-                param_grads = tuple(
-                    delayed_grads.get(param, grad)
-                    for param, grad in zip(
-                        expert_params, local_state.pop("param_grads"), strict=True
+                with torch.cuda.stream(compute_stream):
+                    # The chunk's dispatch dgrad is already in flight on the
+                    # communication stream. Compute its deferred wgrad now so
+                    # the next chunk does not retain a second TE backward
+                    # context while still preserving dgrad/wgrad overlap.
+                    delayed_grads = self.experts.pop_delayed_weight_grads()
+                    param_grads = tuple(
+                        delayed_grads.get(param, grad)
+                        for param, grad in zip(
+                            expert_params,
+                            local_state.pop("param_grads"),
+                            strict=True,
+                        )
                     )
-                )
-                _accumulate(expert_accum, expert_params, param_grads)
+                    _accumulate(expert_accum, expert_params, param_grads)
 
         for chunk, local_state in pending_dispatch_bwd:
             with torch.cuda.stream(compute_stream):
