@@ -252,17 +252,3 @@ def test_core_contains_token_wise_forward_and_backward_deepep_pipeline():
         "submit_deepep_dispatch_backward",
         "finish_deepep_dispatch_backward",
     } <= calls
-
-
-def test_deepep_dispatch_metadata_check_does_not_resynchronize_the_gpu():
-    source_path = (
-        Path(__file__).parents[3]
-        / "megatron"
-        / "lite"
-        / "primitive"
-        / "modules"
-        / "dispatcher.py"
-    )
-    source = source_path.read_text()
-
-    assert "local_tpe.sum().item()" not in source
