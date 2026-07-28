@@ -152,6 +152,7 @@ class MoELayer(nn.Module):
             ps,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
+            delay_wgrad_compute=num_chunks_ep_a2a_overlap > 1,
         )
         self.dispatcher = TokenDispatcher(
             config.num_experts,

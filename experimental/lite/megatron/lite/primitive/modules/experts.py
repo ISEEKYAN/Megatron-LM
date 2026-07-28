@@ -77,6 +77,7 @@ class Experts(nn.Module):
         *,
         fp8: bool = False,
         moe_act_recompute: bool = False,
+        delay_wgrad_compute: bool = False,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
@@ -92,6 +93,7 @@ class Experts(nn.Module):
             config.moe_intermediate_size * 2 // ps.etp_size,
             bias=False,
             params_dtype=torch.bfloat16,
+            delay_wgrad_compute=delay_wgrad_compute,
         )
         self.fc2 = te.GroupedLinear(
             self.num_local_experts,
@@ -99,6 +101,7 @@ class Experts(nn.Module):
             config.hidden_size,
             bias=False,
             params_dtype=torch.bfloat16,
+            delay_wgrad_compute=delay_wgrad_compute,
         )
         lora = normalize_lora_config(lora_config)
         self.fc1_lora: SharedGroupedLinearLoRA | None = None
@@ -133,6 +136,23 @@ class Experts(nn.Module):
                         return grad
 
                     param.register_hook(_ar)
+
+    def pop_delayed_weight_grads(self) -> dict[torch.Tensor, torch.Tensor]:
+        """Execute one queued TE wgrad per grouped linear without touching ``.grad``."""
+        grads: dict[torch.Tensor, torch.Tensor] = {}
+        for linear in (self.fc1, self.fc2):
+            store = linear.wgrad_store
+            if not store.delay_wgrad_compute():
+                raise RuntimeError("Expert delayed weight gradients are not enabled.")
+            if store.context is None or store.context.empty():
+                raise RuntimeError("Expert delayed weight-gradient queue is empty.")
+            (_, grad_biases, _), tensors = store.pop()
+            if any(grad is not None for grad in grad_biases):
+                raise RuntimeError("Chunked EP expert grouped linears must not use bias.")
+            weight_grads = tensors[2]
+            for idx, grad in enumerate(weight_grads):
+                grads[getattr(linear, f"weight{idx}")] = grad
+        return grads
 
     def forward(
         self,

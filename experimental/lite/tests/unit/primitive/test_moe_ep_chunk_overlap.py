@@ -60,7 +60,7 @@ def test_chunked_full_recompute_checkpoints_attention_without_nesting_moe():
     ]
 
 
-def test_chunked_backward_submits_dgrad_before_delayed_wgrad(
+def test_chunked_backward_submits_dgrad_before_te_delayed_wgrad(
     transformer_engine_import_stub,
 ):
     transformer_engine_import_stub()
@@ -70,13 +70,14 @@ def test_chunked_backward_submits_dgrad_before_delayed_wgrad(
 
     source = inspect.getsource(EPChunkOverlapOperator._full_recompute_fused_backward_v6)
 
-    assert source.index("expert_input_grads =") < source.index(
+    assert source.count("torch.autograd.grad(") == 2
+    assert source.index("expert_grads =") < source.index(
         "pending_dispatch_bwd.append"
     )
     assert source.index("pending_dispatch_bwd.append") < source.index(
-        "param_grads ="
+        "pop_delayed_weight_grads"
     )
-    assert "retain_graph=True" in source
+    assert "retain_graph=True" not in source
 
 
 @pytest.mark.parametrize(

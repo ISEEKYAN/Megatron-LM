@@ -40,7 +40,11 @@ class DeepseekV4MoE(nn.Module):
             )
         else:
             self.gate._non_persistent_buffers_set.discard("expert_bias")
-        self.experts = Experts(config, ps)
+        self.experts = Experts(
+            config,
+            ps,
+            delay_wgrad_compute=num_chunks_ep_a2a_overlap > 1,
+        )
         self.hidden_size = config.hidden_size
         self.topk = config.num_experts_per_tok
         self.route_scale = config.routed_scaling_factor

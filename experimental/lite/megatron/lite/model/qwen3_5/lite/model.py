@@ -180,7 +180,11 @@ class MoELayer(nn.Module):
             router_dtype=router_dtype,
         )
         self.experts = Experts(
-            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute
+            config,
+            ps,
+            fp8=fp8,
+            moe_act_recompute=moe_act_recompute,
+            delay_wgrad_compute=num_chunks_ep_a2a_overlap > 1,
         )
         self.dispatcher = TokenDispatcher(
             config.num_experts,
