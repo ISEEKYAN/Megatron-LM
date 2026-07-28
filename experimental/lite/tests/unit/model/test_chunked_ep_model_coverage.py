@@ -45,6 +45,13 @@ def test_backward_specific_chunk_parameter_is_removed_from_product_code():
     assert matches == []
 
 
+def test_qwen3_build_keeps_the_validated_chunked_ep_branch_live():
+    protocol = (MODEL_ROOT / "qwen3_moe/lite/protocol.py").read_text()
+
+    assert "chunked_ep = impl_cfg.num_chunks_ep_a2a_overlap == 2" in protocol
+    assert 'if chunked_ep and "moe" in recompute_spec:' in protocol
+
+
 def test_coverage_list_matches_every_registered_lite_model():
     registered = {
         path.parents[1].name for path in MODEL_ROOT.glob("*/lite/protocol.py")

@@ -176,6 +176,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     validate_ep_chunk_overlap_config(
         impl_cfg.num_chunks_ep_a2a_overlap, use_deepep=impl_cfg.use_deepep, ep_size=p.ep
     )
+    chunked_ep = impl_cfg.num_chunks_ep_a2a_overlap == 2
     # ── override model config from impl_cfg ──
     if impl_cfg.router_aux_loss_coef is not None:
         model_cfg.router_aux_loss_coef = impl_cfg.router_aux_loss_coef
