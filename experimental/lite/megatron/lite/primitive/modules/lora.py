@@ -218,6 +218,12 @@ class _AllReduceSum(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
+        # Row-parallel LoRA partitions both A's input and B's output. After
+        # _AllGatherLastDim.backward selects the local B-output slice, each TP
+        # rank owns a different contribution to d(hidden). Sum those
+        # contributions before propagating through the input-sharded A.
+        # This is required by the chain rule; it does not rescale a replicated
+        # gradient from the forward all-reduce.
         out = grad.contiguous()
         dist.all_reduce(out, op=dist.ReduceOp.SUM, group=ctx.group)
         return out, None
