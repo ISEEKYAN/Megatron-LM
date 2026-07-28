@@ -27,7 +27,7 @@ def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
             return torch.cuda.Stream()
 
 
-_EP_CHUNK_STREAMS: dict[int, tuple[torch.cuda.Stream, torch.cuda.Stream]] = {}
+_EP_CHUNK_COMM_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
 def _cuda_device_index(device: torch.device | int | str) -> int:
@@ -41,15 +41,13 @@ def _cuda_device_index(device: torch.device | int | str) -> int:
     )
 
 
-def _shared_streams(
-    device: torch.device | int | str,
-) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
+def _shared_comm_stream(device: torch.device | int | str) -> torch.cuda.Stream:
     device_index = _cuda_device_index(device)
-    streams = _EP_CHUNK_STREAMS.get(device_index)
-    if streams is None:
-        streams = (_make_stream(device_index), _make_stream(device_index))
-        _EP_CHUNK_STREAMS[device_index] = streams
-    return streams
+    stream = _EP_CHUNK_COMM_STREAMS.get(device_index)
+    if stream is None:
+        stream = _make_stream(device_index)
+        _EP_CHUNK_COMM_STREAMS[device_index] = stream
+    return stream
 
 
 def _event_current_stream_wait(event: Any) -> None:
@@ -131,7 +129,7 @@ class EPChunkOverlapOperator:
     def _streams(
         self, device: torch.device
     ) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
-        return _shared_streams(device)
+        return torch.cuda.current_stream(device), _shared_comm_stream(device)
 
     @contextmanager
     def _routing_context(self, routing_input: torch.Tensor | None):

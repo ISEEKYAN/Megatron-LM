@@ -80,6 +80,19 @@ def test_chunked_backward_submits_dgrad_before_te_delayed_wgrad(
     assert "retain_graph=True" not in source
 
 
+def test_chunked_ep_keeps_compute_on_the_autograd_caller_stream(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkOverlapOperator,
+    )
+
+    source = inspect.getsource(EPChunkOverlapOperator._streams)
+
+    assert "torch.cuda.current_stream(device)" in source
+
+
 @pytest.mark.parametrize(
     "chunks,use_deepep,ep_size", [(1, False, 1), (1, True, 8), (2, True, 8)]
 )
