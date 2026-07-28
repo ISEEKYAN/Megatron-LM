@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import struct
 import sys
@@ -304,6 +305,128 @@ def _weight_fingerprint(rt, handle) -> dict[str, Any]:
     return result
 
 
+def _gradient_tensors(handle) -> dict[str, torch.Tensor]:
+    tensors = {}
+    for chunk_idx, chunk in enumerate(_model_chunks(handle)):
+        for name, param in sorted(chunk.named_parameters(), key=lambda item: item[0]):
+            grad = param.grad
+            if grad is None:
+                grad = getattr(param, "main_grad", None)
+            if grad is not None:
+                if hasattr(grad, "to_local"):
+                    grad = grad.to_local()
+                tensors[f"{chunk_idx}:{name}"] = grad.detach().contiguous().cpu()
+    return tensors
+
+
+def _weight_tensors(rt, handle) -> dict[str, torch.Tensor]:
+    tensors = {}
+    for name, tensor in rt.export_weights(handle):
+        if hasattr(tensor, "to_local"):
+            tensor = tensor.to_local()
+        tensors[str(name)] = tensor.detach().contiguous().cpu()
+    return tensors
+
+
+def _compare_named_tensors(
+    baseline: dict[str, torch.Tensor],
+    candidate: dict[str, torch.Tensor],
+    *,
+    atol: float,
+    rtol: float,
+) -> dict[str, Any]:
+    baseline_names = set(baseline)
+    candidate_names = set(candidate)
+    missing = sorted(baseline_names - candidate_names)
+    unexpected = sorted(candidate_names - baseline_names)
+    mismatches = []
+    max_abs = 0.0
+    diff_sq = 0.0
+    baseline_sq = 0.0
+    for name in sorted(baseline_names & candidate_names):
+        expected = baseline[name].float()
+        actual = candidate[name].float()
+        if expected.shape != actual.shape:
+            mismatches.append({"name": name, "reason": "shape"})
+            continue
+        diff = actual - expected
+        local_max = float(diff.abs().max()) if diff.numel() else 0.0
+        max_abs = max(max_abs, local_max)
+        diff_sq += float(diff.double().square().sum())
+        baseline_sq += float(expected.double().square().sum())
+        if not torch.allclose(actual, expected, atol=atol, rtol=rtol):
+            mismatches.append({"name": name, "max_abs": local_max})
+    l2_relative = math.sqrt(diff_sq) / max(math.sqrt(baseline_sq), 1e-30)
+    return {
+        "passed": not missing and not unexpected and not mismatches,
+        "tensor_count": len(baseline_names & candidate_names),
+        "max_abs": max_abs,
+        "l2_relative": l2_relative,
+        "missing": missing,
+        "unexpected": unexpected,
+        "mismatches": mismatches,
+        "atol": atol,
+        "rtol": rtol,
+    }
+
+
+def compare_training_tensor_artifacts(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    grad_atol: float,
+    grad_rtol: float,
+    weight_atol: float,
+    weight_rtol: float,
+) -> dict[str, Any]:
+    base_steps = baseline.get("steps", [])
+    candidate_steps = candidate.get("steps", [])
+    step_count = min(len(base_steps), len(candidate_steps))
+    lengths_match = step_count == len(base_steps) == len(candidate_steps)
+    gradient_results = []
+    weight_results = []
+    for step in range(step_count):
+        gradient_results.append(
+            _compare_named_tensors(
+                base_steps[step]["gradients"],
+                candidate_steps[step]["gradients"],
+                atol=grad_atol,
+                rtol=grad_rtol,
+            )
+        )
+        weight_results.append(
+            _compare_named_tensors(
+                base_steps[step]["post_step_weights"],
+                candidate_steps[step]["post_step_weights"],
+                atol=weight_atol,
+                rtol=weight_rtol,
+            )
+        )
+
+    def _summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "passed": bool(results) and all(item["passed"] for item in results),
+            "tensor_count": min(
+                (item["tensor_count"] for item in results), default=0
+            ),
+            "max_abs": max((item["max_abs"] for item in results), default=0.0),
+            "max_l2_relative": max(
+                (item["l2_relative"] for item in results), default=0.0
+            ),
+            "steps": results,
+        }
+
+    gradients = _summary(gradient_results)
+    weights = _summary(weight_results)
+    return {
+        "passed": lengths_match and gradients["passed"] and weights["passed"],
+        "samples": step_count,
+        "lengths_match": lengths_match,
+        "gradients": gradients,
+        "post_step_weights": weights,
+    }
+
+
 def _forward_logits(rt, handle, batch: Any) -> torch.Tensor | None:
     result = rt.forward_backward(
         handle,
@@ -321,6 +444,7 @@ def run_backend(
     *,
     hash_weights: bool = True,
     activation_probe_names: list[str] | None = None,
+    training_tensors_path: str | None = None,
 ) -> dict[str, Any]:
     os.environ["MEGATRON_LITE_DETERMINISTIC"] = "1"
     set_deterministic(cfg.seed)
@@ -339,6 +463,7 @@ def run_backend(
 
     data_iter = _make_data_iter(handle, session_cfg)
     steps: list[dict[str, Any]] = []
+    training_tensor_steps: list[dict[str, Any]] = []
     with rt.train_mode(handle):
         for step in range(session_cfg.steps):
             with _activation_probe_context(
@@ -353,6 +478,9 @@ def run_backend(
                 output = result.model_output
                 logits = _hash_tensor(output.vocab_parallel_logits if output.vocab_parallel_logits is not None else (-output.log_probs if output.log_probs is not None else None))
                 grads = _grad_fingerprint(handle)
+                gradient_tensors = (
+                    _gradient_tensors(handle) if training_tensors_path else None
+                )
 
                 if session_cfg.no_optimizer:
                     update_successful, grad_norm, num_zeros = True, 0.0, 0
@@ -363,6 +491,9 @@ def run_backend(
                 loss = result.metrics.get("loss")
                 if loss is None:
                     loss = result.model_output.loss
+                post_step_weight_tensors = (
+                    _weight_tensors(rt, handle) if training_tensors_path else None
+                )
 
             steps.append(
                 {
@@ -377,6 +508,18 @@ def run_backend(
                     "train_activation_probes": train_activation_probes,
                 }
             )
+            if training_tensors_path and _distributed_rank() == 0:
+                training_tensor_steps.append(
+                    {
+                        "gradients": gradient_tensors,
+                        "post_step_weights": post_step_weight_tensors,
+                    }
+                )
+
+    if training_tensors_path and _distributed_rank() == 0:
+        tensor_path = Path(training_tensors_path)
+        tensor_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"steps": training_tensor_steps}, tensor_path)
 
     return {
         "kind": "mlite_bench_correctness",
@@ -432,6 +575,7 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--skip-weight-hash", action="store_true")
     parser.add_argument("--activation-probes-json", default="{}")
+    parser.add_argument("--training-tensors-path", default=None)
 
 
 def _activation_probe_names(raw: str, backend: str) -> list[str]:
@@ -463,6 +607,12 @@ def _parser() -> argparse.ArgumentParser:
     cmp_p.add_argument("--grad-rtol", type=float, default=0.0)
     cmp_p.add_argument("--tensor-atol", type=float, default=0.0)
     cmp_p.add_argument("--tensor-rtol", type=float, default=0.0)
+    cmp_p.add_argument("--baseline-training-tensors", default=None)
+    cmp_p.add_argument("--candidate-training-tensors", default=None)
+    cmp_p.add_argument("--grad-tensor-atol", type=float, default=0.0)
+    cmp_p.add_argument("--grad-tensor-rtol", type=float, default=0.0)
+    cmp_p.add_argument("--weight-atol", type=float, default=0.0)
+    cmp_p.add_argument("--weight-rtol", type=float, default=0.0)
     return parser
 
 
@@ -479,6 +629,33 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             tensor_atol=ns.tensor_atol,
             tensor_rtol=ns.tensor_rtol,
         )
+        tensor_paths = (
+            ns.baseline_training_tensors,
+            ns.candidate_training_tensors,
+        )
+        if any(tensor_paths):
+            if not all(tensor_paths):
+                raise ValueError(
+                    "both baseline and candidate training tensor paths are required"
+                )
+            tensor_result = compare_training_tensor_artifacts(
+                torch.load(
+                    ns.baseline_training_tensors,
+                    map_location="cpu",
+                    weights_only=True,
+                ),
+                torch.load(
+                    ns.candidate_training_tensors,
+                    map_location="cpu",
+                    weights_only=True,
+                ),
+                grad_atol=ns.grad_tensor_atol,
+                grad_rtol=ns.grad_tensor_rtol,
+                weight_atol=ns.weight_atol,
+                weight_rtol=ns.weight_rtol,
+            )
+            result["training_tensors"] = tensor_result
+            result["passed"] = result["passed"] and tensor_result["passed"]
         text = json.dumps(result, indent=2, sort_keys=True)
         print(text, flush=True)
         if ns.output_json:
@@ -494,6 +671,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         cfg,
         hash_weights=not ns.skip_weight_hash,
         activation_probe_names=_activation_probe_names(ns.activation_probes_json, cfg.backend),
+        training_tensors_path=ns.training_tensors_path,
     )
     if _distributed_rank() == 0:
         text = json.dumps(artifact, indent=2, sort_keys=True)

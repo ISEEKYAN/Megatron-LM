@@ -8,6 +8,7 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 
+import pytest
 import torch
 
 from megatron.lite.runtime.contracts.config import ParallelConfig
@@ -318,6 +319,41 @@ def test_result_trace_compare_reports_metric_level_failures():
     assert comparison["passed"] is False
     assert comparison["loss_passed"] is True
     assert comparison["grad_norm_passed"] is False
+
+
+def test_training_tensor_artifacts_compare_gradients_and_post_step_weights():
+    from examples.bench.correctness import compare_training_tensor_artifacts
+
+    baseline = {
+        "steps": [
+            {
+                "gradients": {"0:w": torch.tensor([1.0, 2.0])},
+                "post_step_weights": {"w": torch.tensor([3.0, 4.0])},
+            }
+        ]
+    }
+    candidate = {
+        "steps": [
+            {
+                "gradients": {"0:w": torch.tensor([1.0, 2.0001])},
+                "post_step_weights": {"w": torch.tensor([3.0, 4.0002])},
+            }
+        ]
+    }
+
+    result = compare_training_tensor_artifacts(
+        baseline,
+        candidate,
+        grad_atol=2e-4,
+        grad_rtol=0.0,
+        weight_atol=3e-4,
+        weight_rtol=0.0,
+    )
+
+    assert result["passed"] is True
+    assert result["gradients"]["tensor_count"] == 1
+    assert result["gradients"]["max_abs"] == pytest.approx(1e-4, abs=1e-6)
+    assert result["post_step_weights"]["max_abs"] == pytest.approx(2e-4, abs=1e-6)
 
 
 def test_correctness_compare_requires_bitwise_fields():

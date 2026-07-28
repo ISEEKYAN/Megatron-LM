@@ -61,6 +61,7 @@ run_arm() {
     --num-microbatches "${CORRECTNESS_NUM_MICROBATCHES:-1}" \
     --seq-len "${CORRECTNESS_SEQ_LEN:-${SEQ_LEN:-1024}}" \
     $([[ "${CORRECTNESS_SKIP_WEIGHT_HASH:-0}" == "1" ]] && printf '%s' '--skip-weight-hash') \
+    --training-tensors-path "${OUTPUT_DIR}/qwen3_chunked_ep_${arm}_training_tensors.pt" \
     --output-json "${OUTPUT_DIR}/qwen3_chunked_ep_${arm}_correctness.json" \
     2>&1 | tee "${OUTPUT_DIR}/qwen3_chunked_ep_${arm}_correctness.log"
 }
@@ -83,5 +84,13 @@ if [[ "${DRY_RUN}" != "1" ]]; then
     --loss-rtol "${CORRECTNESS_LOSS_RTOL:-0}" \
     --grad-atol "${CORRECTNESS_GRAD_ATOL:-0}" \
     --grad-rtol "${CORRECTNESS_GRAD_RTOL:-0}" \
+    --baseline-training-tensors \
+      "${OUTPUT_DIR}/qwen3_chunked_ep_baseline_training_tensors.pt" \
+    --candidate-training-tensors \
+      "${OUTPUT_DIR}/qwen3_chunked_ep_chunked_training_tensors.pt" \
+    --grad-tensor-atol "${CORRECTNESS_GRAD_TENSOR_ATOL:-0}" \
+    --grad-tensor-rtol "${CORRECTNESS_GRAD_TENSOR_RTOL:-0}" \
+    --weight-atol "${CORRECTNESS_WEIGHT_ATOL:-0}" \
+    --weight-rtol "${CORRECTNESS_WEIGHT_RTOL:-0}" \
     --fail-on-mismatch
 fi
