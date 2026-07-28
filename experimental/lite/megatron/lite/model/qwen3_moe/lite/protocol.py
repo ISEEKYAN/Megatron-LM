@@ -109,6 +109,7 @@ class ImplConfig:
 # ---------------------------------------------------------------------------
 
 MODULE_MAP = {
+    "attn": lambda layer: layer.attn,
     "core_attn": lambda layer: layer.attn.core_attn,
     "experts": lambda layer: layer.moe.experts,
     "moe": lambda layer: layer.moe,

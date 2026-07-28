@@ -66,6 +66,7 @@ def _moe_module(name: str):
 
 
 MODULE_MAP = {
+    "attn": lambda layer: layer.self_attention,
     "core_attn": lambda layer: layer.self_attention.core_attn,
     "experts": _moe_module("experts"),
     "moe": _maybe("moe"),

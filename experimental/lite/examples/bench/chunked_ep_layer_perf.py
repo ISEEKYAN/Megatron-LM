@@ -237,8 +237,6 @@ def main() -> int:
     config = Qwen3MoEConfig.from_hf(
         args.hf_path,
         num_hidden_layers=1,
-        num_experts=world_size,
-        num_experts_per_tok=world_size,
         layer_types=["full_attention"],
     )
     parallel = init_parallel(
@@ -288,6 +286,7 @@ def main() -> int:
         "repeats": args.repeats,
         "use_deepep": True,
         "full_recompute": True,
+        "moe_full_recompute": True,
         "parity": parity,
         "metrics": metrics,
         "passed": parity["passed"] and all(item["passed"] for item in metrics.values()),

@@ -45,6 +45,8 @@ def recompute_modules_for_ep_chunk_overlap(
     chunks = parse_ep_chunk_spec(num_chunks)
     if chunks == 1:
         return modules
+    if "full" in modules:
+        return ["attn"]
     return [name for name in modules if name != "moe"]
 
 

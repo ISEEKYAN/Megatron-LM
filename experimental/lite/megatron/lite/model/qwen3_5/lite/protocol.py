@@ -91,7 +91,12 @@ def _full_attn_module(layer, name: str):
     return getattr(full_attn, name, None) if full_attn is not None else None
 
 
+def _attn_module(layer):
+    return layer.full_attn if layer.full_attn is not None else layer.linear_attn
+
+
 MODULE_MAP = {
+    "attn": _attn_module,
     "core_attn": lambda layer: _full_attn_module(layer, "core_attn"),
     "experts": lambda layer: layer.moe.experts,
     "moe": lambda layer: layer.moe,

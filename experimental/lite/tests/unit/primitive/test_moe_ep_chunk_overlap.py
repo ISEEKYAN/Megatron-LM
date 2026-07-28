@@ -54,6 +54,31 @@ def test_chunked_full_recompute_replaces_the_outer_moe_checkpoint():
     assert requested == ["core_attn", "moe", "mlp"]
 
 
+def test_chunked_full_recompute_checkpoints_attention_without_nesting_moe():
+    assert recompute_modules_for_ep_chunk_overlap(["full"], num_chunks=2) == [
+        "attn"
+    ]
+
+
+def test_chunked_backward_submits_dgrad_before_delayed_wgrad(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkOverlapOperator,
+    )
+
+    source = inspect.getsource(EPChunkOverlapOperator._full_recompute_fused_backward_v6)
+
+    assert source.index("expert_input_grads =") < source.index(
+        "pending_dispatch_bwd.append"
+    )
+    assert source.index("pending_dispatch_bwd.append") < source.index(
+        "param_grads ="
+    )
+    assert "retain_graph=True" in source
+
+
 @pytest.mark.parametrize(
     "chunks,use_deepep,ep_size", [(1, False, 1), (1, True, 8), (2, True, 8)]
 )

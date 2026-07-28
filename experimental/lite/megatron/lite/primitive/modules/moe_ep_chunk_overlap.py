@@ -530,33 +530,27 @@ class EPChunkOverlapOperator:
                             "EP chunk overlap expert graph was released."
                         )
                     if chunk.probs is None:
-                        expert_inputs = (chunk.dispatched, *expert_params)
+                        expert_inputs = (chunk.dispatched,)
                     else:
-                        expert_inputs = (chunk.dispatched, chunk.probs, *expert_params)
-                    expert_grads = torch.autograd.grad(
+                        expert_inputs = (chunk.dispatched, chunk.probs)
+                    expert_input_grads = torch.autograd.grad(
                         expert_output,
                         expert_inputs,
                         local_state["grad_expert_out"],
                         allow_unused=True,
-                        retain_graph=False,
+                        retain_graph=True,
                     )
-                    grad_dispatched = expert_grads[0]
+                    grad_dispatched = expert_input_grads[0]
                     if grad_dispatched is None:
                         grad_dispatched = torch.zeros_like(chunk.dispatched)
                     if chunk.probs is None:
                         grad_probs = None
-                        param_grads = expert_grads[1:]
                     else:
-                        grad_probs = expert_grads[1]
+                        grad_probs = expert_input_grads[1]
                         if grad_probs is None:
                             grad_probs = torch.zeros_like(chunk.probs)
-                        param_grads = expert_grads[2:]
-                    _accumulate(expert_accum, expert_params, param_grads)
                     chunk.dispatched = None
                     chunk.probs = None
-                    chunk.expert_out = None
-                    chunk.expert_out_edge = None
-                    local_state.pop("grad_expert_out", None)
                     grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
                         chunk, grad_dispatched, grad_probs
                     )
@@ -580,6 +574,26 @@ class EPChunkOverlapOperator:
                     local_state.pop("grad_recv_probs", None)
 
                 pending_dispatch_bwd.append((chunk, local_state))
+
+        for chunk, local_state in pending_dispatch_bwd:
+            with torch.cuda.stream(compute_stream):
+                expert_output = (
+                    chunk.expert_out_edge
+                    if chunk.expert_out_edge is not None
+                    else chunk.expert_out
+                )
+                if expert_output is None:
+                    raise RuntimeError("EP chunk overlap expert graph was released.")
+                param_grads = torch.autograd.grad(
+                    expert_output,
+                    expert_params,
+                    local_state["grad_expert_out"],
+                    allow_unused=True,
+                )
+                _accumulate(expert_accum, expert_params, param_grads)
+                chunk.expert_out = None
+                chunk.expert_out_edge = None
+                local_state.pop("grad_expert_out", None)
 
         for chunk, local_state in pending_dispatch_bwd:
             with torch.cuda.stream(compute_stream):

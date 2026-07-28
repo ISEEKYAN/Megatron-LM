@@ -89,6 +89,7 @@ def _moe_module(name: str):
 # GLM-5 ONLY: attention entries point at the DSA wrapper / module instead of
 # Kimi's MLA.  Everything else mirrors Kimi's MODULE_MAP.
 MODULE_MAP = {
+    "attn": lambda layer: layer.self_attention,
     "core_attn": lambda layer: layer.self_attention.self_attention,
     "experts": _moe_module("experts"),
     "moe": _maybe("moe"),
