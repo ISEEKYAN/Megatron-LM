@@ -41,6 +41,7 @@ from megatron.lite.primitive.modules.attention import (
 )
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapMoELayer
 from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 from megatron.lite.primitive.modules.router import SigmoidTopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
@@ -279,7 +280,7 @@ class _LocalLinear(nn.Module):
         return self.linear(x)
 
 
-class MoELayer(nn.Module):
+class MoELayer(EPChunkOverlapMoELayer):
     def __init__(
         self,
         config: Glm5Config,
@@ -289,11 +290,12 @@ class MoELayer(nn.Module):
         router_bias_rate: float,
         fp8: bool,
         moe_act_recompute: bool,
+        num_chunks_ep_a2a_overlap: int = 1,
+        layer_idx: int | None = None,
     ):
-        super().__init__()
         if fp8:
             raise NotImplementedError("GLM-5 lite MoE fp8 training is not implemented yet.")
-        self.router = SigmoidTopKRouter(
+        router = SigmoidTopKRouter(
             config,
             ps,
             router_bias_rate=router_bias_rate,
@@ -302,17 +304,28 @@ class MoELayer(nn.Module):
             router_dtype=torch.float32,
             expert_bias_persistent=True,
         )
-        self.experts = Experts(
+        experts = Experts(
             config,
             ps,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
         )
-        self.dispatcher = TokenDispatcher(
-            config.num_experts,
-            config.hidden_size,
+        super().__init__(
+            config,
             ps,
             use_deepep=use_deepep,
+            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
+            moe_full_recompute=True,
+            router=router,
+            experts=experts,
+            dispatcher_factory=lambda slot: TokenDispatcher(
+                config.num_experts,
+                config.hidden_size,
+                ps,
+                use_deepep=use_deepep,
+                buffer_slot=slot,
+            ),
+            layer_idx=layer_idx,
         )
         self.shared_expert = SharedExpert(config, ps)
 
@@ -320,17 +333,7 @@ class MoELayer(nn.Module):
         input_shape = x.shape
 
         flat_x = x.view(-1, x.size(-1))
-        scores, indices = self.router(flat_x)
-        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(flat_x, scores, indices)
-        del scores, indices
-        self.dispatcher.wait_dispatch_event()
-        expert_out = self.experts(
-            dispatched,
-            tpe,
-            permuted_probs,
-            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
-        )
-        routed_out = self.dispatcher.combine(expert_out)
+        routed_out = super().forward(flat_x)
         shared_out = self.shared_expert(x)
         output = routed_out.view(input_shape)
         output += shared_out
@@ -353,6 +356,7 @@ class Glm5Layer(nn.Module):
         dsa_indexer_loss_coeff: float = 0.0,
         dsa_indexer_use_sparse_loss: bool = False,
         calculate_per_token_loss: bool = False,
+        num_chunks_ep_a2a_overlap: int = 1,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -381,6 +385,8 @@ class Glm5Layer(nn.Module):
                 router_bias_rate=router_bias_rate,
                 fp8=fp8,
                 moe_act_recompute=moe_act_recompute,
+                num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
+                layer_idx=layer_idx,
             )
             self.mlp: DenseMLP | None = None
         else:
@@ -441,6 +447,7 @@ class Glm5MTPLayer(nn.Module):
         dsa_indexer_loss_coeff: float,
         dsa_indexer_use_sparse_loss: bool,
         calculate_per_token_loss: bool,
+        num_chunks_ep_a2a_overlap: int,
     ):
         super().__init__()
         self.ps = ps
@@ -468,6 +475,7 @@ class Glm5MTPLayer(nn.Module):
             dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
             calculate_per_token_loss=calculate_per_token_loss,
+            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -529,6 +537,7 @@ class Glm5MTPBlock(nn.Module):
         dsa_indexer_loss_coeff: float,
         dsa_indexer_use_sparse_loss: bool,
         calculate_per_token_loss: bool,
+        num_chunks_ep_a2a_overlap: int,
     ):
         super().__init__()
         self.num_layers = config.num_nextn_predict_layers
@@ -551,6 +560,7 @@ class Glm5MTPBlock(nn.Module):
                     dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
                     dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
                     calculate_per_token_loss=calculate_per_token_loss,
+                    num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
                 )
                 for idx in range(layers_to_build)
             ]
@@ -724,6 +734,7 @@ class Glm5Model(nn.Module):
                     dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
                     dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
                     calculate_per_token_loss=calculate_per_token_loss,
+                    num_chunks_ep_a2a_overlap=train_config.num_chunks_ep_a2a_overlap,
                 )
                 for idx in self.layer_indices
             ]
@@ -757,6 +768,7 @@ class Glm5Model(nn.Module):
                 dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
                 dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
                 calculate_per_token_loss=calculate_per_token_loss,
+                num_chunks_ep_a2a_overlap=train_config.num_chunks_ep_a2a_overlap,
             )
 
         self.sp_params: list[nn.Parameter] = []

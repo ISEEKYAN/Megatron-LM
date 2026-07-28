@@ -6,49 +6,36 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Literal
 
-ChunkSpec = int | Literal["auto"]
-ChunkDirection = Literal["forward", "fused_backward"]
+ChunkSpec = int
 
 
-def parse_ep_chunk_spec(
-    value: ChunkSpec | None, *, default: ChunkSpec = "auto"
-) -> ChunkSpec:
-    if value is None:
-        return default
+def parse_ep_chunk_spec(value: int) -> ChunkSpec:
     if isinstance(value, str):
         normalized = value.strip().lower()
-        if normalized == "auto":
-            return "auto"
         try:
             value = int(normalized)
         except ValueError as exc:
-            raise ValueError("chunk spec must be an integer or 'auto'") from exc
-    if int(value) < 1:
-        raise ValueError("chunk count must be >= 1")
+            raise ValueError("chunk count must be 1 or 2") from exc
+    if int(value) not in (1, 2):
+        raise ValueError("chunk count must be 1 or 2")
     return int(value)
 
 
 def resolve_ep_chunk_overlap_chunks(
-    num_tokens: int,
-    *,
-    ep_size: int,
-    hidden_size: int,
-    spec: ChunkSpec = "auto",
-    direction: ChunkDirection = "forward",
+    num_tokens: int, *, ep_size: int, hidden_size: int, spec: ChunkSpec = 1
 ) -> int:
-    del hidden_size
-    spec = parse_ep_chunk_spec(spec)
-    if spec != "auto":
-        return int(spec)
-    if ep_size <= 1 or num_tokens < 16_384:
-        return 1
-    if direction == "forward":
-        return 2 if num_tokens < 32_768 else 3
-    if direction == "fused_backward":
-        return 2
-    raise ValueError("direction must be 'forward' or 'fused_backward'")
+    del num_tokens, ep_size, hidden_size
+    return parse_ep_chunk_spec(spec)
+
+
+def validate_ep_chunk_overlap_config(
+    num_chunks: int, *, use_deepep: bool, ep_size: int
+) -> int:
+    num_chunks = parse_ep_chunk_spec(num_chunks)
+    if num_chunks == 2 and (not use_deepep or ep_size <= 1):
+        raise ValueError("ChunkedEP requires DeepEP and EP > 1")
+    return num_chunks
 
 
 def ep_chunk_ranges(
@@ -88,8 +75,7 @@ def ep_chunk_ranges(
         exact = [remainder * weight / sum(weights) for weight in weights]
         extra = [int(value) for value in exact]
         for idx in sorted(
-            range(num_chunks),
-            key=lambda item: (extra[item] - exact[item], item),
+            range(num_chunks), key=lambda item: (extra[item] - exact[item], item)
         )[: remainder - sum(extra)]:
             extra[idx] += 1
 
@@ -114,9 +100,9 @@ def ep_chunk_ranges(
 
 
 __all__ = [
-    "ChunkDirection",
     "ChunkSpec",
     "ep_chunk_ranges",
     "parse_ep_chunk_spec",
     "resolve_ep_chunk_overlap_chunks",
+    "validate_ep_chunk_overlap_config",
 ]

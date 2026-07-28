@@ -34,6 +34,9 @@ from megatron.lite.model.protocol_utils import (
     set_cross_entropy_fusion,
 )
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
+    validate_ep_chunk_overlap_config,
+)
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
 from megatron.lite.primitive.parallel.thd import (
@@ -104,6 +107,7 @@ class ImplConfig:
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
+    num_chunks_ep_a2a_overlap: int = 1
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     hf_path: str = ""
@@ -268,6 +272,9 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     _validate_parallel_scope(p)
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
+    validate_ep_chunk_overlap_config(
+        impl_cfg.num_chunks_ep_a2a_overlap, use_deepep=impl_cfg.use_deepep, ep_size=p.ep
+    )
     if impl_cfg.router_aux_loss_coef is not None:
         # GLM-5 has no aux_loss_alpha HF field; honour an explicit override only.
         model_cfg.aux_loss_alpha = impl_cfg.router_aux_loss_coef
@@ -297,6 +304,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         cp=ps.cp_size,
         vpp=vpp,
         use_deepep=impl_cfg.use_deepep,
+        num_chunks_ep_a2a_overlap=impl_cfg.num_chunks_ep_a2a_overlap,
         fp8=False,
         recompute_modules=recompute_spec,
         offload_modules=list(impl_cfg.offload),
@@ -324,13 +332,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         ]
     else:
         chunks = [
-            Glm5Model(
-                model_cfg,
-                train_cfg,
-                ps,
-                vpp_chunk_id=i,
-                **model_kwargs,
-            )
+            Glm5Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **model_kwargs)
             .to(torch.bfloat16)
             .cuda()
             for i in range(vpp)

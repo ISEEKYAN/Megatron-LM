@@ -18,15 +18,12 @@ from typing import Callable
 
 import torch
 import torch.distributed as dist
-from torch.utils.checkpoint import checkpoint
-
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.qwen3_moe.lite.model import MoELayer
-from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-    EPChunkOverlapMoELayer,
-)
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapMoELayer
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.runtime.contracts.config import ParallelConfig
+from torch.utils.checkpoint import checkpoint
 
 MODES = ("forward", "backward", "fused_forward_backward")
 
@@ -35,7 +32,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hf-path", required=True)
     parser.add_argument("--tokens-per-gpu", type=int, default=16384)
-    parser.add_argument("--chunks", type=int, default=2)
+    parser.add_argument("--chunks", type=int, choices=(1, 2), default=2)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
@@ -59,10 +56,7 @@ def _global_grad_norm(module: torch.nn.Module, device: torch.device) -> float:
 
 
 def _full_recompute_output(
-    module: torch.nn.Module,
-    hidden: torch.Tensor,
-    *,
-    native_chunked_recompute: bool,
+    module: torch.nn.Module, hidden: torch.Tensor, *, native_chunked_recompute: bool
 ) -> torch.Tensor:
     if native_chunked_recompute:
         return module(hidden)
@@ -94,17 +88,13 @@ def _run_once(
 
         def call() -> None:
             output = _full_recompute_output(
-                module,
-                hidden,
-                native_chunked_recompute=native_chunked_recompute,
+                module, hidden, native_chunked_recompute=native_chunked_recompute
             )
             output.detach()
 
     elif mode == "backward":
         output = _full_recompute_output(
-            module,
-            hidden,
-            native_chunked_recompute=native_chunked_recompute,
+            module, hidden, native_chunked_recompute=native_chunked_recompute
         )
         loss = output.float().square().mean()
         torch.cuda.synchronize(hidden.device)
@@ -116,9 +106,7 @@ def _run_once(
 
         def call() -> None:
             output = _full_recompute_output(
-                module,
-                hidden,
-                native_chunked_recompute=native_chunked_recompute,
+                module, hidden, native_chunked_recompute=native_chunked_recompute
             )
             output.float().square().mean().backward()
 
@@ -142,10 +130,7 @@ def _measure_pair(
 ) -> dict:
     samples: dict[str, list[float]] = {"baseline": [], "chunked": []}
     peak_gb: dict[str, float] = {"baseline": 0.0, "chunked": 0.0}
-    arms = {
-        "baseline": (baseline, False),
-        "chunked": (candidate, True),
-    }
+    arms = {"baseline": (baseline, False), "chunked": (candidate, True)}
     for iteration in range(warmup + repeats):
         order = (
             ("baseline", "chunked") if iteration % 2 == 0 else ("chunked", "baseline")
@@ -190,9 +175,7 @@ def _measure_pair(
 
 
 def _parity(
-    baseline: torch.nn.Module,
-    candidate: torch.nn.Module,
-    hidden: torch.Tensor,
+    baseline: torch.nn.Module, candidate: torch.nn.Module, hidden: torch.Tensor
 ) -> dict:
     outputs = []
     input_grads = []
@@ -203,9 +186,7 @@ def _parity(
         module.zero_grad(set_to_none=True)
         x = hidden.detach().clone().requires_grad_(True)
         output = _full_recompute_output(
-            module,
-            x,
-            native_chunked_recompute=native_chunked_recompute,
+            module, x, native_chunked_recompute=native_chunked_recompute
         )
         loss = output.float().square().mean()
         loss.backward()
@@ -228,8 +209,7 @@ def _parity(
     for name, expected in param_grads[0].items():
         actual = param_grads[1][name]
         param_grad_max_abs = max(
-            param_grad_max_abs,
-            float((actual - expected).abs().max()),
+            param_grad_max_abs, float((actual - expected).abs().max())
         )
     loss_abs = abs(losses[1] - losses[0])
     grad_norm_abs = abs(grad_norms[1] - grad_norms[0])
@@ -271,7 +251,6 @@ def main() -> int:
             config,
             parallel,
             num_chunks_ep_a2a_overlap=args.chunks,
-            ep_chunk_bwd_num_chunks=args.chunks,
             use_deepep=True,
             moe_full_recompute=True,
             layer_idx=0,

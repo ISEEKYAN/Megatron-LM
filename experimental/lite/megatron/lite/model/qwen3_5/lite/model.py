@@ -13,14 +13,18 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import transformer_engine.pytorch as te
-
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
 from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
 from megatron.lite.primitive.modules.gqa import GQAttention as FullAttention
-from megatron.lite.primitive.modules.gqa import split_grouped_qkvg as _split_grouped_qkvg
-from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding as Qwen35MRoPE
+from megatron.lite.primitive.modules.gqa import (
+    split_grouped_qkvg as _split_grouped_qkvg,
+)
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapMoELayer
+from megatron.lite.primitive.modules.mrope import (
+    MultimodalRotaryEmbedding as Qwen35MRoPE,
+)
 from megatron.lite.primitive.modules.mtp import (
     MTPBlock,
     MTPDecoderLayer,
@@ -113,7 +117,11 @@ class SharedExpert(nn.Module):
             return self.linear(x)
 
     def __init__(
-        self, config: Qwen35Config, ps: ParallelState, *, use_plain_te_linear: bool = False
+        self,
+        config: Qwen35Config,
+        ps: ParallelState,
+        *,
+        use_plain_te_linear: bool = False,
     ):
         super().__init__()
         ffn = config.shared_expert_intermediate_size
@@ -121,7 +129,9 @@ class SharedExpert(nn.Module):
             self.gate_up = self._PlainTELinear(config.hidden_size, ffn * 2)
             self.down = self._PlainTELinear(ffn, config.hidden_size)
         else:
-            self.gate_up = ColumnParallelLinear(config.hidden_size, ffn * 2, ps, bias=False)
+            self.gate_up = ColumnParallelLinear(
+                config.hidden_size, ffn * 2, ps, bias=False
+            )
             self.down = RowParallelLinear(ffn, config.hidden_size, ps, bias=False)
         self.shared_gate = nn.Linear(config.hidden_size, 1, bias=False)
         self.tp_group = ps.tp_group
@@ -151,7 +161,7 @@ class SharedExpert(nn.Module):
         return output * gate_val
 
 
-class MoELayer(nn.Module):
+class MoELayer(EPChunkOverlapMoELayer):
     def __init__(
         self,
         config: Qwen35Config,
@@ -165,26 +175,40 @@ class MoELayer(nn.Module):
         preserve_3d_graph: bool = False,
         shared_expert_plain_te: bool = False,
         moe_permute_fusion: bool | None = None,
+        num_chunks_ep_a2a_overlap: int = 1,
+        layer_idx: int | None = None,
     ):
-        super().__init__()
         if fp8:
             raise NotImplementedError("lite qwen35 MoE fp8 is not implemented yet.")
-        self.router = TopKRouter(
+        router = TopKRouter(
             config,
             ps,
             router_bias_rate=router_bias_rate,
             compute_aux_loss=True,
             router_dtype=router_dtype,
         )
-        self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
-        self.dispatcher = TokenDispatcher(
-            config.num_experts,
-            config.hidden_size,
+        experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
+        super().__init__(
+            config,
             ps,
             use_deepep=use_deepep,
-            moe_permute_fusion=moe_permute_fusion,
+            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
+            moe_full_recompute=True,
+            router=router,
+            experts=experts,
+            dispatcher_factory=lambda slot: TokenDispatcher(
+                config.num_experts,
+                config.hidden_size,
+                ps,
+                use_deepep=use_deepep,
+                moe_permute_fusion=moe_permute_fusion,
+                buffer_slot=slot,
+            ),
+            layer_idx=layer_idx,
         )
-        self.shared_expert = SharedExpert(config, ps, use_plain_te_linear=shared_expert_plain_te)
+        self.shared_expert = SharedExpert(
+            config, ps, use_plain_te_linear=shared_expert_plain_te
+        )
         self.preserve_3d_graph = bool(preserve_3d_graph)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -200,17 +224,23 @@ class MoELayer(nn.Module):
             side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side_stream):
                 shared_out = self.shared_expert(shared_input)
-        scores, indices = self.router(router_input)
-        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_2d, scores, indices)
-        del scores, indices
-        self.dispatcher.wait_dispatch_event()
-        expert_out = self.experts(
-            dispatched,
-            tpe,
-            permuted_probs,
-            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
-        )
-        routed_out = self.dispatcher.combine(expert_out)
+        if self.chunk_spec == 1 and self.preserve_3d_graph:
+            scores, indices = self.router(router_input)
+            dispatched, tpe, permuted_probs = self.dispatcher.dispatch(
+                x_2d, scores, indices
+            )
+            self.dispatcher.wait_dispatch_event()
+            expert_out = self.experts(
+                dispatched,
+                tpe,
+                permuted_probs,
+                tokens_per_expert_list=getattr(
+                    self.dispatcher, "_local_tpe_list", None
+                ),
+            )
+            routed_out = self.dispatcher.combine(expert_out)
+        else:
+            routed_out = super().forward(router_input).reshape_as(x_2d)
 
         if shared_out is None:
             shared_out = self.shared_expert(shared_input)
@@ -238,6 +268,7 @@ class Qwen35Layer(nn.Module):
         use_thd: bool = False,
         deterministic: bool = False,
         gdn_cp_mode: str = "headwise",
+        num_chunks_ep_a2a_overlap: int = 1,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -287,17 +318,26 @@ class Qwen35Layer(nn.Module):
             preserve_3d_graph=deterministic,
             shared_expert_plain_te=deterministic,
             moe_permute_fusion=True,
+            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
+            layer_idx=layer_idx,
         )
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
     ) -> torch.Tensor:
         residual = x
         if self.full_attn is not None:
-            h = self.full_attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
+            h = self.full_attn(
+                x, position_ids=position_ids, packed_seq_params=packed_seq_params
+            )
         else:
             assert self.linear_attn is not None
-            h = self.linear_attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
+            h = self.linear_attn(
+                x, position_ids=position_ids, packed_seq_params=packed_seq_params
+            )
         x = residual + h
         residual = x
         x = residual + self.moe(self.mlp_norm(x))
@@ -307,12 +347,16 @@ class Qwen35Layer(nn.Module):
 def _temperature_to_float(temperature: float | torch.Tensor) -> float:
     if isinstance(temperature, torch.Tensor):
         if temperature.numel() != 1:
-            raise ValueError("Qwen35Model fused/MTP SFT supports scalar temperature only.")
+            raise ValueError(
+                "Qwen35Model fused/MTP SFT supports scalar temperature only."
+            )
         return float(temperature.detach().float().item())
     return float(temperature)
 
 
-def _ensure_mrope_position_ids(position_ids: torch.Tensor | None) -> torch.Tensor | None:
+def _ensure_mrope_position_ids(
+    position_ids: torch.Tensor | None,
+) -> torch.Tensor | None:
     if position_ids is None:
         return None
     if position_ids.dim() == 2:
@@ -322,7 +366,9 @@ def _ensure_mrope_position_ids(position_ids: torch.Tensor | None) -> torch.Tenso
             return position_ids.expand(3, -1, -1).contiguous()
         if position_ids.shape[0] == 3:
             return position_ids
-    raise ValueError("Qwen3.5 MRoPE expects position_ids shape (B,S), (1,B,S), or (3,B,S).")
+    raise ValueError(
+        "Qwen3.5 MRoPE expects position_ids shape (B,S), (1,B,S), or (3,B,S)."
+    )
 
 
 class Qwen35Model(nn.Module):
@@ -362,15 +408,21 @@ class Qwen35Model(nn.Module):
         self.post_process = has_head
         self.share_embeddings_and_output_weights = False
         self.vision_model: nn.Module | None = (
-            _build_native_vision_model(hf_path) if has_embed and mount_vision_model else None
+            _build_native_vision_model(hf_path)
+            if has_embed and mount_vision_model
+            else None
         )
 
         self.embed: VocabParallelEmbedding | None = None
         if has_embed:
-            self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+            self.embed = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, ps
+            )
 
         recompute_modules = getattr(train_config, "recompute_modules", [])
-        moe_act_recompute = "moe_act" in recompute_modules and "moe" not in recompute_modules
+        moe_act_recompute = (
+            "moe_act" in recompute_modules and "moe" not in recompute_modules
+        )
         self.layers = nn.ModuleList(
             [
                 Qwen35Layer(
@@ -378,6 +430,7 @@ class Qwen35Model(nn.Module):
                     ps,
                     idx,
                     use_deepep=train_config.use_deepep,
+                    num_chunks_ep_a2a_overlap=train_config.num_chunks_ep_a2a_overlap,
                     router_bias_rate=router_bias_rate,
                     fp8=train_config.fp8,
                     moe_act_recompute=moe_act_recompute,
@@ -402,7 +455,9 @@ class Qwen35Model(nn.Module):
         if mtp_enable and config.num_nextn_predict_layers > 0 and self.head is not None:
             mtp_embedding = self.embed
             if mtp_embedding is None:
-                mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+                mtp_embedding = VocabParallelEmbedding(
+                    config.vocab_size, config.hidden_size, ps
+                )
                 self.mtp_embed = mtp_embedding
 
             def make_mtp_layer(layer_idx: int) -> MTPDecoderLayer:
@@ -416,6 +471,7 @@ class Qwen35Model(nn.Module):
                         ps,
                         config.num_hidden_layers + layer_idx,
                         use_deepep=train_config.use_deepep,
+                        num_chunks_ep_a2a_overlap=train_config.num_chunks_ep_a2a_overlap,
                         router_bias_rate=router_bias_rate,
                         fp8=train_config.fp8,
                         moe_act_recompute=moe_act_recompute,
@@ -465,17 +521,25 @@ class Qwen35Model(nn.Module):
             h = hidden_states
 
         if packed_seq_params is not None:
-            assert position_ids is not None, "THD path requires caller-supplied MRoPE position_ids."
+            assert (
+                position_ids is not None
+            ), "THD path requires caller-supplied MRoPE position_ids."
         elif position_ids is None and input_ids is not None:
             if self.ps.cp_size > 1:
-                raise ValueError("CP>1 requires caller-supplied FULL position_ids (3,B,S).")
+                raise ValueError(
+                    "CP>1 requires caller-supplied FULL position_ids (3,B,S)."
+                )
             batch, seq = input_ids.shape
             pos = torch.arange(seq, device=input_ids.device, dtype=torch.long)
-            position_ids = pos.unsqueeze(0).unsqueeze(0).expand(3, batch, seq).contiguous()
+            position_ids = (
+                pos.unsqueeze(0).unsqueeze(0).expand(3, batch, seq).contiguous()
+            )
         position_ids = _ensure_mrope_position_ids(position_ids)
 
         fp8_ctx = (
-            te.fp8_autocast(enabled=True, fp8_recipe=build_fp8_recipe(self.train_config))
+            te.fp8_autocast(
+                enabled=True, fp8_recipe=build_fp8_recipe(self.train_config)
+            )
             if self.train_config.fp8
             else nullcontext()
         )
@@ -483,7 +547,9 @@ class Qwen35Model(nn.Module):
             if self.embed is not None:
                 h = scatter_to_sequence_parallel(h, self.ps)
             for layer in self.layers:
-                h = layer(h, position_ids=position_ids, packed_seq_params=packed_seq_params)
+                h = layer(
+                    h, position_ids=position_ids, packed_seq_params=packed_seq_params
+                )
 
         output = {"hidden_states": h}
         if self.head is not None:
@@ -506,7 +572,9 @@ class Qwen35Model(nn.Module):
                     output["mtp_loss"] = mtp_loss
                 labels_sb = labels.transpose(0, 1).contiguous()
                 if use_fused_kernels:
-                    hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
+                    hidden_full = gather_from_sequence_parallel(
+                        hidden_for_head, self.ps
+                    )
                     log_probs, entropy = linear_cross_entropy(
                         hidden_full,
                         self._head_weight_for_fused_ce(hidden_full),
@@ -522,7 +590,9 @@ class Qwen35Model(nn.Module):
                     logits = self.head(hidden_for_head)
                     if temperature_value != 1.0:
                         logits = logits / temperature_value
-                    loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                    loss = vocab_parallel_cross_entropy(
+                        logits, labels_sb, self.ps.tp_group
+                    )
                     output["loss"] = loss.mean()
                     output["log_probs"] = (-loss).transpose(0, 1).contiguous()
                     if calculate_entropy:
@@ -587,11 +657,15 @@ class Qwen35Model(nn.Module):
                 logits = self.head(mtp_hidden)
                 if temperature != 1.0:
                     logits = logits / temperature
-                token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                token_loss = vocab_parallel_cross_entropy(
+                    logits, labels_sb, self.ps.tp_group
+                )
             token_loss = token_loss * mask_sb.to(dtype=token_loss.dtype)
             num_tokens = num_tokens.to(dtype=token_loss.dtype).clamp_min(1.0)
             mtp_loss_values.append(token_loss.sum() / num_tokens)
-            mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
+            mtp_loss_scale = self.mtp_loss_scaling_factor / max(
+                len(mtp_hidden_states), 1
+            )
             hidden_states = MTPLossAutoScaler.apply(
                 hidden_states, mtp_loss_scale * token_loss / num_tokens
             )
@@ -607,7 +681,9 @@ class Qwen35Model(nn.Module):
         assert self.head is not None
         weight = self.head.col.linear.weight
         return (
-            weight if weight.dtype == hidden_states.dtype else weight.to(dtype=hidden_states.dtype)
+            weight
+            if weight.dtype == hidden_states.dtype
+            else weight.to(dtype=hidden_states.dtype)
         )
 
 
@@ -640,7 +716,9 @@ def _resolve_hf_vision_cls(hf_config, hf_path: str) -> type:
     errors: list[str] = []
     for class_ref in _iter_auto_model_class_refs(hf_config):
         try:
-            model_cls = get_class_from_dynamic_module(class_ref, hf_path, trust_remote_code=True)
+            model_cls = get_class_from_dynamic_module(
+                class_ref, hf_path, trust_remote_code=True
+            )
         except Exception as exc:
             errors.append(f"{class_ref}: {exc}")
             continue
@@ -648,19 +726,27 @@ def _resolve_hf_vision_cls(hf_config, hf_path: str) -> type:
         if vision_cls is not None:
             return vision_cls
         errors.append(f"{class_ref}: missing HfVisionClass")
-    detail = "; ".join(errors) if errors else "config auto_map has no supported AutoModel entry"
+    detail = (
+        "; ".join(errors)
+        if errors
+        else "config auto_map has no supported AutoModel entry"
+    )
     raise RuntimeError(f"Cannot resolve native HF vision class for Qwen3.5: {detail}.")
 
 
 def _hook_fp32_rotary_emb(module: nn.Module) -> None:
     for submodule in module.modules():
         if hasattr(submodule, "inv_freq") and submodule.inv_freq is not None:
-            submodule._inv_freq_fp32_original = submodule.inv_freq.detach().clone().float()
+            submodule._inv_freq_fp32_original = (
+                submodule.inv_freq.detach().clone().float()
+            )
 
             def _hook(mod, args):
                 del args
                 if hasattr(mod, "_inv_freq_fp32_original"):
-                    mod.inv_freq = mod._inv_freq_fp32_original.to(device=mod.inv_freq.device)
+                    mod.inv_freq = mod._inv_freq_fp32_original.to(
+                        device=mod.inv_freq.device
+                    )
 
             submodule.register_forward_pre_hook(_hook)
 

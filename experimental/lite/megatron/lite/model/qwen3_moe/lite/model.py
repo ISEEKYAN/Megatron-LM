@@ -13,14 +13,10 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
-
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
-from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.gqa import GQAttention
 from megatron.lite.primitive.modules.lora import LoraConfig
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkOverlapMoELayer
-from megatron.lite.primitive.modules.router import TopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
@@ -41,7 +37,7 @@ from megatron.lite.primitive.utils import build_fp8_recipe
 # ---------------------------------------------------------------------------
 
 
-class MoELayer(nn.Module):
+class MoELayer(EPChunkOverlapMoELayer):
     def __init__(
         self,
         config: Qwen3MoEConfig,
@@ -51,42 +47,22 @@ class MoELayer(nn.Module):
         router_bias_rate: float = 0.0,
         fp8: bool = False,
         moe_act_recompute: bool = False,
+        num_chunks_ep_a2a_overlap: int = 1,
         lora_config: LoraConfig | dict | None = None,
+        layer_idx: int | None = None,
     ):
-        super().__init__()
-        # Match Qwen3-MoE's `load_balancing_type="none"` setting: no aux loss.
-        self.router = TopKRouter(
-            config, ps, router_bias_rate=router_bias_rate, compute_aux_loss=False
+        super().__init__(
+            config,
+            ps,
+            use_deepep=use_deepep,
+            router_bias_rate=router_bias_rate,
+            fp8=fp8,
+            moe_act_recompute=moe_act_recompute,
+            moe_full_recompute=True,
+            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
+            lora_config=lora_config,
+            layer_idx=layer_idx,
         )
-        self.experts = Experts(
-            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute, lora_config=lora_config
-        )
-        self.dispatcher = TokenDispatcher(
-            config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_shape = x.shape
-        if x.dim() == 3:
-            x_2d = x.view(-1, x.size(-1))
-        else:
-            x_2d = x
-
-        scores, indices = self.router(x_2d)
-        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_2d, scores, indices)
-        del scores, indices
-        self.dispatcher.wait_dispatch_event()
-        expert_out = self.experts(
-            dispatched,
-            tpe,
-            permuted_probs,
-            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
-        )
-        del dispatched, tpe, permuted_probs
-        combined = self.dispatcher.combine(expert_out)
-        del expert_out
-
-        return combined.view(input_shape).to(x.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +103,6 @@ class TransformerLayer(nn.Module):
         moe_act_recompute: bool = False,
         use_thd: bool = False,
         num_chunks_ep_a2a_overlap: int = 1,
-        ep_chunk_bwd_num_chunks: int | None = None,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
@@ -151,34 +126,23 @@ class TransformerLayer(nn.Module):
             lora_config=lora_config,
         )
         self.mlp_norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if num_chunks_ep_a2a_overlap > 1:
-            self.moe = EPChunkOverlapMoELayer(
-                config,
-                ps,
-                use_deepep=use_deepep,
-                router_bias_rate=router_bias_rate,
-                fp8=fp8,
-                moe_act_recompute=moe_act_recompute,
-                # Its custom backward rebuilds each chunk's forward graph.
-                moe_full_recompute=True,
-                num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
-                ep_chunk_bwd_num_chunks=ep_chunk_bwd_num_chunks,
-                lora_config=lora_config,
-                layer_idx=layer_idx,
-            )
-        else:
-            self.moe = MoELayer(
-                config,
-                ps,
-                use_deepep=use_deepep,
-                router_bias_rate=router_bias_rate,
-                fp8=fp8,
-                moe_act_recompute=moe_act_recompute,
-                lora_config=lora_config,
-            )
+        self.moe = MoELayer(
+            config,
+            ps,
+            use_deepep=use_deepep,
+            router_bias_rate=router_bias_rate,
+            fp8=fp8,
+            moe_act_recompute=moe_act_recompute,
+            num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
+            lora_config=lora_config,
+            layer_idx=layer_idx,
+        )
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
     ) -> torch.Tensor:
         residual = x
         h = self.attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
@@ -205,7 +169,9 @@ class MTPLossAutoScaler(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (mtp_loss,) = ctx.saved_tensors
-        scaled_mtp_grad = torch.ones_like(mtp_loss) * MTPLossAutoScaler.main_loss_backward_scale
+        scaled_mtp_grad = (
+            torch.ones_like(mtp_loss) * MTPLossAutoScaler.main_loss_backward_scale
+        )
         return grad_output, scaled_mtp_grad
 
     @staticmethod
@@ -231,7 +197,6 @@ class MultiTokenPredictionLayer(nn.Module):
         moe_act_recompute: bool,
         use_thd: bool,
         num_chunks_ep_a2a_overlap: int,
-        ep_chunk_bwd_num_chunks: int | None,
         detach_encoder: bool,
         lora_config: LoraConfig | dict | None,
     ):
@@ -242,7 +207,11 @@ class MultiTokenPredictionLayer(nn.Module):
         self.enorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = VanillaColumnParallelLinear(
-            config.hidden_size * 2, config.hidden_size, ps, sp=ps.tp_size > 1, gather_output=True
+            config.hidden_size * 2,
+            config.hidden_size,
+            ps,
+            sp=ps.tp_size > 1,
+            gather_output=True,
         )
         self.transformer_layer = TransformerLayer(
             config,
@@ -254,7 +223,6 @@ class MultiTokenPredictionLayer(nn.Module):
             moe_act_recompute=moe_act_recompute,
             use_thd=use_thd,
             num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
-            ep_chunk_bwd_num_chunks=ep_chunk_bwd_num_chunks,
             lora_config=lora_config,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -271,7 +239,9 @@ class MultiTokenPredictionLayer(nn.Module):
         attention_position_ids = (
             rotary_position_ids if rotary_position_ids is not None else position_ids
         )
-        input_ids, _ = roll_packed_thd_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
+        input_ids, _ = roll_packed_thd_left(
+            input_ids, packed_seq_params=packed_seq_params, dims=-1
+        )
         if position_ids is not None:
             position_ids, _ = roll_packed_thd_left(
                 position_ids, packed_seq_params=packed_seq_params, dims=-1
@@ -289,7 +259,9 @@ class MultiTokenPredictionLayer(nn.Module):
         hidden_states = self.eh_proj(hidden_states)
         hidden_states = scatter_to_sequence_parallel(hidden_states, self.ps)
         hidden_states = self.transformer_layer(
-            hidden_states, position_ids=attention_position_ids, packed_seq_params=packed_seq_params
+            hidden_states,
+            position_ids=attention_position_ids,
+            packed_seq_params=packed_seq_params,
         )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids
@@ -308,7 +280,6 @@ class MultiTokenPredictionBlock(nn.Module):
         moe_act_recompute: bool,
         use_thd: bool,
         num_chunks_ep_a2a_overlap: int,
-        ep_chunk_bwd_num_chunks: int | None,
         detach_encoder: bool,
         repeated_layer: bool,
         lora_config: LoraConfig | dict | None,
@@ -330,7 +301,6 @@ class MultiTokenPredictionBlock(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
-                    ep_chunk_bwd_num_chunks=ep_chunk_bwd_num_chunks,
                     detach_encoder=detach_encoder,
                     lora_config=lora_config,
                 )
@@ -388,7 +358,6 @@ class Qwen3MoEModel(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         num_chunks_ep_a2a_overlap: int = 1,
-        ep_chunk_bwd_num_chunks: int | None = None,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
@@ -398,7 +367,9 @@ class Qwen3MoEModel(nn.Module):
         self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self._input_tensor: torch.Tensor | None = None
-        layout = build_pipeline_chunk_layout(config.num_hidden_layers, ps, vpp, vpp_chunk_id)
+        layout = build_pipeline_chunk_layout(
+            config.num_hidden_layers, ps, vpp, vpp_chunk_id
+        )
         self.layer_indices = layout.layer_indices
         has_embed = layout.has_embed
         has_head = layout.has_head
@@ -408,7 +379,9 @@ class Qwen3MoEModel(nn.Module):
 
         self.embed: VocabParallelEmbedding | None = None
         if has_embed:
-            self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+            self.embed = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, ps
+            )
 
         _recompute = recompute_modules or []
         moe_act_recompute = "moe_act" in _recompute and "moe" not in _recompute
@@ -424,7 +397,6 @@ class Qwen3MoEModel(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
-                    ep_chunk_bwd_num_chunks=ep_chunk_bwd_num_chunks,
                     lora_config=lora_config,
                 )
                 for idx in self.layer_indices
@@ -442,7 +414,9 @@ class Qwen3MoEModel(nn.Module):
         if mtp_enable and config.num_nextn_predict_layers > 0 and self.head is not None:
             mtp_embedding = self.embed
             if mtp_embedding is None:
-                mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+                mtp_embedding = VocabParallelEmbedding(
+                    config.vocab_size, config.hidden_size, ps
+                )
                 self.mtp_embed = mtp_embedding
             self.mtp = MultiTokenPredictionBlock(
                 config,
@@ -454,7 +428,6 @@ class Qwen3MoEModel(nn.Module):
                 moe_act_recompute=moe_act_recompute,
                 use_thd=use_thd,
                 num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
-                ep_chunk_bwd_num_chunks=ep_chunk_bwd_num_chunks,
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
                 lora_config=lora_config,
@@ -467,7 +440,9 @@ class Qwen3MoEModel(nn.Module):
     def set_input_tensor(self, input_tensor):
         if isinstance(input_tensor, list):
             if len(input_tensor) > 1:
-                raise ValueError("Qwen3MoEModel expects a single pipeline input tensor.")
+                raise ValueError(
+                    "Qwen3MoEModel expects a single pipeline input tensor."
+                )
             input_tensor = input_tensor[0] if input_tensor else None
         self._input_tensor = input_tensor
 
@@ -503,7 +478,9 @@ class Qwen3MoEModel(nn.Module):
             if self.embed is not None:
                 h = scatter_to_sequence_parallel(h, self.ps)
             for layer in self.layers:
-                h = layer(h, position_ids=position_ids, packed_seq_params=packed_seq_params)
+                h = layer(
+                    h, position_ids=position_ids, packed_seq_params=packed_seq_params
+                )
             # Head path is SP-aware: norm runs on SP-sharded [S/tp, B, H] and
             # head's internal all-gather happens inside VocabParallelOutput.
             # Mirrors MC GPTModel's final_layernorm → output_layer(sp=True).
@@ -530,7 +507,9 @@ class Qwen3MoEModel(nn.Module):
                     output["mtp_loss"] = mtp_loss
                 labels_sb = labels.transpose(0, 1).contiguous()
                 if use_fused_kernels:
-                    hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
+                    hidden_full = gather_from_sequence_parallel(
+                        hidden_for_head, self.ps
+                    )
                     log_probs, entropy = linear_cross_entropy(
                         hidden_full,
                         self._head_weight_for_fused_ce(hidden_full),
@@ -548,7 +527,9 @@ class Qwen3MoEModel(nn.Module):
                     logits = self.head(hidden_for_head)
                     if temperature_value != 1.0:
                         logits = logits / temperature_value
-                    token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                    token_loss = vocab_parallel_cross_entropy(
+                        logits, labels_sb, self.ps.tp_group
+                    )
                     output["loss"] = token_loss.mean()
                     if return_log_probs:
                         output["log_probs"] = (-token_loss).transpose(0, 1).contiguous()
@@ -619,12 +600,16 @@ class Qwen3MoEModel(nn.Module):
                 logits = self.head(mtp_hidden)
                 if temperature != 1.0:
                     logits = logits / temperature
-                token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                token_loss = vocab_parallel_cross_entropy(
+                    logits, labels_sb, self.ps.tp_group
+                )
             token_loss = token_loss * mask_sb.to(dtype=token_loss.dtype)
             num_tokens = num_tokens.to(dtype=token_loss.dtype).clamp_min(1.0)
             mtp_loss_values.append(token_loss.sum() / num_tokens)
 
-            mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
+            mtp_loss_scale = self.mtp_loss_scaling_factor / max(
+                len(mtp_hidden_states), 1
+            )
             hidden_states = MTPLossAutoScaler.apply(
                 hidden_states, mtp_loss_scale * token_loss / num_tokens
             )

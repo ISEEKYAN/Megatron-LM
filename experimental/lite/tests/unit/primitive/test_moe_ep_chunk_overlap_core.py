@@ -35,12 +35,10 @@ def test_dispatch_local_backward_accumulates_duplicate_token_rows_and_weights(
     )
 
     torch.testing.assert_close(
-        grad_hidden,
-        torch.tensor([[4.0, 6.0], [0.0, 0.0], [5.0, 6.0]]),
+        grad_hidden, torch.tensor([[4.0, 6.0], [0.0, 0.0], [5.0, 6.0]])
     )
     torch.testing.assert_close(
-        grad_recv_probs,
-        torch.tensor([[0.0, 0.25], [0.0, 0.5], [0.0, 0.75]]),
+        grad_recv_probs, torch.tensor([[0.0, 0.25], [0.0, 0.5], [0.0, 0.75]])
     )
 
 
@@ -62,23 +60,21 @@ def test_dispatch_local_backward_materializes_zero_probability_gradient(
     )
 
     grad_hidden, grad_probs = _dispatch_local_backward(
-        chunk,
-        torch.empty(0, 4, dtype=torch.bfloat16),
-        None,
+        chunk, torch.empty(0, 4, dtype=torch.bfloat16), None
     )
 
     assert grad_hidden.shape == (0, 4)
     assert grad_probs.shape == (0, 2)
 
 
-def test_chunk_slots_cover_forward_and_backward_auto_policy(
+def test_chunk_slots_match_the_unified_closed_chunk_count(
     transformer_engine_import_stub,
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import _max_deepep_chunks
 
-    assert _max_deepep_chunks("auto", 2) == 4
-    assert _max_deepep_chunks(3, 7) == 7
+    assert _max_deepep_chunks(1) == 1
+    assert _max_deepep_chunks(2) == 2
 
 
 def test_training_fails_loud_instead_of_silently_skipping_chunks(
@@ -92,7 +88,7 @@ def test_training_fails_loud_instead_of_silently_skipping_chunks(
     layer = object.__new__(EPChunkOverlapMoELayer)
     torch.nn.Module.__init__(layer)
     layer.moe_full_recompute = False
-    layer._num_chunks = lambda _tokens, backward=False: 2
+    layer._num_chunks = lambda _tokens: 2
 
     with pytest.raises(RuntimeError, match="requires moe_full_recompute"):
         layer(torch.zeros(8, 4, requires_grad=True))
@@ -109,7 +105,7 @@ def test_chunk_one_matches_unsplit_output_shape_and_gradient(
     layer = object.__new__(EPChunkOverlapMoELayer)
     torch.nn.Module.__init__(layer)
     layer.moe_full_recompute = False
-    layer._num_chunks = lambda _tokens, backward=False: 1
+    layer._num_chunks = lambda _tokens: 1
     layer._forward_full = lambda value: value.square() + 3 * value
 
     actual_input = torch.randn(7, 4, requires_grad=True)
@@ -125,8 +121,7 @@ def test_chunk_one_matches_unsplit_output_shape_and_gradient(
 
 
 def test_forward_trace_pipelines_next_dispatch_before_current_expert(
-    monkeypatch,
-    transformer_engine_import_stub,
+    monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (

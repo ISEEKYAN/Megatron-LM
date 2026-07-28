@@ -67,7 +67,7 @@ when Megatron-Bridge is installed and `import megatron.bridge` succeeds.
 This pair compares the synchronous Qwen3 MoE path with token-wise ChunkedEP.
 Both arms use the same model, data, optimizer, parallel shape, and DeepEP
 transport. The baseline sets `num_chunks_ep_a2a_overlap=1`; the candidate changes
-only the forward/backward chunk counts to two. ChunkedEP requires `EP>1` and
+the single shared forward/backward chunk count to two. ChunkedEP requires `EP>1` and
 `use_deepep=true`.
 
 ```bash
@@ -92,26 +92,15 @@ torchrun --nproc_per_node 8 \
   experimental/lite/examples/bench/chunked_ep_layer_perf.py \
   --hf-path /models/Qwen3-30B-A3B \
   --tokens-per-gpu 16384 \
-  --chunks 4 \
+  --chunks 2 \
   --warmup 3 \
   --repeats 10 \
   --output-json /tmp/chunked_ep_layer_perf.json
 ```
 
 The gate fails unless every mode has a median speedup above `1.0x`, ChunkedEP
-wins at least 80% of paired repeats, and loss/gradient parity passes. A validated
-8x H100 run produced:
-
-| Full-recompute mode | Baseline median ms | ChunkedEP median ms | Speedup | Paired wins |
-| --- | ---: | ---: | ---: | ---: |
-| Forward | 10.024 | 8.580 | 1.168x | 10/10 |
-| Backward | 23.031 | 17.630 | 1.306x | 10/10 |
-| Fused forward+backward | 33.236 | 26.390 | 1.259x | 10/10 |
-
-The same run reduced peak allocated memory from `2.102` to `1.296` GB for
-forward and from `2.847` to `1.727` GB for backward/fused. Loss, output, and
-input gradients matched exactly; the maximum gradient-norm difference was
-`1.69e-5`.
+wins at least 80% of paired repeats, and loss/gradient parity passes. The JSON
+output records per-mode timings, paired wins, peak memory, and parity metrics.
 
 ## Validated Run
 

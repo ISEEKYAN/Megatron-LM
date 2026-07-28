@@ -5,12 +5,14 @@ import ast
 from pathlib import Path
 
 import pytest
-from torch import nn
-
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.model.registry import resolve_model_type_from_hf, resolve_runtime_model_name
+from megatron.lite.model.registry import (
+    resolve_model_type_from_hf,
+    resolve_runtime_model_name,
+)
 from megatron.lite.runtime.contracts.config import ParallelConfig
+from torch import nn
 
 pytestmark = pytest.mark.mlite
 
@@ -91,7 +93,9 @@ def test_qwen35_config_from_text_config_splits_mtp_layer_types():
     assert cfg.mrope_section == [1, 1, 0]
 
 
-def test_qwen_lite_protocols_build_configs_from_hf_dicts(transformer_engine_import_stub):
+def test_qwen_lite_protocols_build_configs_from_hf_dicts(
+    transformer_engine_import_stub,
+):
     transformer_engine_import_stub()
 
     from megatron.lite.model.qwen3_5.lite import protocol as qwen35_protocol
@@ -99,18 +103,15 @@ def test_qwen_lite_protocols_build_configs_from_hf_dicts(transformer_engine_impo
 
     qwen3_cfg = qwen3_protocol.build_model_config(_tiny_qwen3_hf_dict(), vocab_size=128)
     qwen35_cfg = qwen35_protocol.build_model_config(
-        {"model_type": "qwen3_5_moe", "text_config": _tiny_qwen35_text_config()}, vocab_size=128
+        {"model_type": "qwen3_5_moe", "text_config": _tiny_qwen35_text_config()},
+        vocab_size=128,
     )
 
     assert qwen3_cfg.vocab_size == 128
     overlap_cfg = qwen3_protocol.ImplConfig(
-        parallel=ParallelConfig(ep=8),
-        use_deepep=True,
-        num_chunks_ep_a2a_overlap=2,
-        ep_chunk_bwd_num_chunks=3,
+        parallel=ParallelConfig(ep=8), use_deepep=True, num_chunks_ep_a2a_overlap=2
     )
     assert overlap_cfg.num_chunks_ep_a2a_overlap == 2
-    assert overlap_cfg.ep_chunk_bwd_num_chunks == 3
     with pytest.raises(ValueError, match="DeepEP"):
         qwen3_protocol.build_model(
             qwen3_cfg,
@@ -134,9 +135,8 @@ def test_qwen_lite_protocols_build_configs_from_hf_dicts(transformer_engine_impo
     assert qwen35_cfg.layer_type_at(1) == "full_attention"
 
 
-def test_qwen3_chunk_count_selects_chunked_or_synchronous_moe(
-    transformer_engine_import_stub,
-    monkeypatch,
+def test_qwen3_forwards_the_unified_chunk_count_to_shared_moe(
+    transformer_engine_import_stub, monkeypatch
 ):
     transformer_engine_import_stub()
 
@@ -150,43 +150,28 @@ def test_qwen3_chunk_count_selects_chunked_or_synchronous_moe(
         def __init__(self, *_args, **_kwargs):
             super().__init__()
 
-    class _SyncMoE(nn.Module):
-        def __init__(self, *_args, **_kwargs):
-            super().__init__()
-
-    class _ChunkedMoE(nn.Module):
+    class _MoE(nn.Module):
         def __init__(self, *_args, **kwargs):
             super().__init__()
             self.kwargs = kwargs
 
     monkeypatch.setattr(qwen_model, "GQAttention", _Attention)
     monkeypatch.setattr(qwen_model.te, "RMSNorm", _Norm, raising=False)
-    monkeypatch.setattr(qwen_model, "MoELayer", _SyncMoE)
-    monkeypatch.setattr(qwen_model, "EPChunkOverlapMoELayer", _ChunkedMoE)
+    monkeypatch.setattr(qwen_model, "MoELayer", _MoE)
 
     cfg = Qwen3MoEConfig._from_hf_dict(_tiny_qwen3_hf_dict())
     ps = object()
     synchronous = qwen_model.TransformerLayer(
-        cfg,
-        ps,
-        0,
-        use_deepep=False,
-        num_chunks_ep_a2a_overlap=1,
+        cfg, ps, 0, use_deepep=False, num_chunks_ep_a2a_overlap=1
     )
     chunked = qwen_model.TransformerLayer(
-        cfg,
-        ps,
-        0,
-        use_deepep=True,
-        num_chunks_ep_a2a_overlap=2,
-        ep_chunk_bwd_num_chunks=3,
+        cfg, ps, 0, use_deepep=True, num_chunks_ep_a2a_overlap=2
     )
 
-    assert isinstance(synchronous.moe, _SyncMoE)
-    assert isinstance(chunked.moe, _ChunkedMoE)
+    assert isinstance(synchronous.moe, _MoE)
+    assert isinstance(chunked.moe, _MoE)
+    assert synchronous.moe.kwargs["num_chunks_ep_a2a_overlap"] == 1
     assert chunked.moe.kwargs["num_chunks_ep_a2a_overlap"] == 2
-    assert chunked.moe.kwargs["ep_chunk_bwd_num_chunks"] == 3
-    assert chunked.moe.kwargs["moe_full_recompute"] is True
 
 
 def test_qwen_lite_protocols_reexport_checkpoint_hook_names():
@@ -210,11 +195,16 @@ def _string_list_assignment(tree: ast.Module, name: str) -> set[str]:
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
-        if not any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+        if not any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        ):
             continue
         if not isinstance(node.value, (ast.List, ast.Tuple)):
             return set()
-        return {item.value for item in node.value.elts if isinstance(item, ast.Constant)}
+        return {
+            item.value for item in node.value.elts if isinstance(item, ast.Constant)
+        }
     return set()
 
 

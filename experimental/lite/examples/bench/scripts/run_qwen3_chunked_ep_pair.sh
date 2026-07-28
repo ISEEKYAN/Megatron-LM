@@ -55,5 +55,5 @@ run_arm baseline \
   '{"use_deepep":true,"num_chunks_ep_a2a_overlap":1}' \
   "${MASTER_PORT_BASELINE:-31851}"
 run_arm chunked \
-  '{"use_deepep":true,"num_chunks_ep_a2a_overlap":2,"ep_chunk_bwd_num_chunks":2}' \
+  '{"use_deepep":true,"num_chunks_ep_a2a_overlap":2}' \
   "${MASTER_PORT_CHUNKED:-31852}"
