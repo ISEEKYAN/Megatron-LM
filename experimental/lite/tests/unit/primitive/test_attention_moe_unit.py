@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -81,11 +82,28 @@ def test_attention_public_api_is_narrow():
     assert "validate_dsa_index_share_pipeline_split" in attention.dsa.__all__
 
 
+def test_mla_k3_switches_are_opt_in():
+    from megatron.lite.primitive.modules.attention import MultiLatentAttention
+
+    parameters = inspect.signature(MultiLatentAttention).parameters
+    assert parameters["mla_use_nope"].default is False
+    assert parameters["mla_use_output_gate"].default is False
+
+
+def test_kda_module_is_a_lazy_public_primitive():
+    from megatron.lite.primitive import modules
+
+    assert "KimiDeltaAttention" in modules.__all__
+    assert modules.KimiDeltaAttention.__module__.endswith(".modules.kda")
+
+
 def test_gqa_split_grouped_qkvg_preserves_q_gate_kv_order():
     split_grouped_qkvg = _split_grouped_qkvg()
     qkv = torch.arange(24).reshape(1, 24)
 
-    query, gate, key, value = split_grouped_qkvg(qkv, num_heads=4, num_kv_heads=2, head_dim=2)
+    query, gate, key, value = split_grouped_qkvg(
+        qkv, num_heads=4, num_kv_heads=2, head_dim=2
+    )
 
     assert query.shape == (1, 4, 2)
     assert gate.shape == (1, 4, 2)

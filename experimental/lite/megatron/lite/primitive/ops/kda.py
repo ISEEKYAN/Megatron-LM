@@ -138,18 +138,19 @@ def kda(
         k=k,
         v=v,
         g=gate_logits,
-        beta=beta_logits,
+        beta=torch.sigmoid(beta_logits),
         scale=q.shape[-1] ** -0.5 if scale is None else scale,
         A_log=a_log,
-        dt_bias=dt_bias,
+        # FLA consumes a flat [heads * head_dim] bias. Keep the public
+        # primitive/checkpoint contract head-major and adapt at this boundary.
+        dt_bias=dt_bias.reshape(-1),
         initial_state=initial_state,
         output_final_state=output_final_state,
         use_qk_l2norm_in_kernel=True,
         use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
         safe_gate=True,
         lower_bound=lower_bound,
-        state_v_first=True,
+        transpose_state_layout=True,
         cu_seqlens=cu_seqlens,
     )
 

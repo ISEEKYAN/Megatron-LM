@@ -5,22 +5,41 @@ from __future__ import annotations
 
 _EXPORTS = {
     "Experts": ("megatron.lite.primitive.modules.experts", "Experts"),
-    "GatedDeltaNet": ("megatron.lite.primitive.modules.gated_delta_net", "GatedDeltaNet"),
+    "GatedDeltaNet": (
+        "megatron.lite.primitive.modules.gated_delta_net",
+        "GatedDeltaNet",
+    ),
     "GQAttention": ("megatron.lite.primitive.modules.gqa", "GQAttention"),
+    "KimiDeltaAttention": (
+        "megatron.lite.primitive.modules.kda",
+        "KimiDeltaAttention",
+    ),
     "MTPBlock": ("megatron.lite.primitive.modules.mtp", "MTPBlock"),
     "MTPDecoderLayer": ("megatron.lite.primitive.modules.mtp", "MTPDecoderLayer"),
     "MTPLossAutoScaler": ("megatron.lite.primitive.modules.mtp", "MTPLossAutoScaler"),
-    "MoEAuxLossAutoScaler": ("megatron.lite.primitive.modules.moe", "MoEAuxLossAutoScaler"),
+    "MoEAuxLossAutoScaler": (
+        "megatron.lite.primitive.modules.moe",
+        "MoEAuxLossAutoScaler",
+    ),
     "MultimodalRotaryEmbedding": (
         "megatron.lite.primitive.modules.mrope",
         "MultimodalRotaryEmbedding",
     ),
-    "SigmoidTopKRouter": ("megatron.lite.primitive.modules.router", "SigmoidTopKRouter"),
+    "SigmoidTopKRouter": (
+        "megatron.lite.primitive.modules.router",
+        "SigmoidTopKRouter",
+    ),
     "SwiGLUMLP": ("megatron.lite.primitive.modules.mlp", "SwiGLUMLP"),
-    "TokenDispatcher": ("megatron.lite.primitive.modules.dispatcher", "TokenDispatcher"),
+    "TokenDispatcher": (
+        "megatron.lite.primitive.modules.dispatcher",
+        "TokenDispatcher",
+    ),
     "TopKRouter": ("megatron.lite.primitive.modules.router", "TopKRouter"),
     "_AllToAll": ("megatron.lite.primitive.modules.moe", "_AllToAll"),
-    "split_grouped_qkvg": ("megatron.lite.primitive.modules.gqa_utils", "split_grouped_qkvg"),
+    "split_grouped_qkvg": (
+        "megatron.lite.primitive.modules.gqa_utils",
+        "split_grouped_qkvg",
+    ),
 }
 
 
@@ -41,6 +60,7 @@ __all__ = [
     "Experts",
     "GatedDeltaNet",
     "GQAttention",
+    "KimiDeltaAttention",
     "MTPBlock",
     "MTPDecoderLayer",
     "MTPLossAutoScaler",

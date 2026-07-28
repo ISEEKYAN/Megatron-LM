@@ -5,14 +5,17 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Callable
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 import transformer_engine.pytorch as te  # pyright: ignore[reportMissingImports]
 
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.lite.primitive.kernels.swiglu import (
+    bias_swiglu_impl,
+    weighted_bias_swiglu_impl,
+)
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     SharedGroupedLinearLoRA,
@@ -27,7 +30,10 @@ __all__ = ["Experts", "_AllReduceETP"]
 
 @contextmanager
 def _expert_nvtx_range(name: str):
-    if os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1" or not torch.cuda.is_available():
+    if (
+        os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1"
+        or not torch.cuda.is_available()
+    ):
         yield
         return
     torch.cuda.nvtx.range_push(name)
@@ -69,7 +75,6 @@ class _AllReduceETP(torch.autograd.Function):
 
 
 class Experts(nn.Module):
-
     def __init__(
         self,
         config: Any,
@@ -78,24 +83,41 @@ class Experts(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        use_tp_for_experts: bool = False,
+        activation: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor]
+        | None = None,
     ):
         super().__init__()
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
         self.fp8 = fp8
         self.moe_act_recompute = moe_act_recompute
-        self.etp_group = ps.etp_group if ps.etp_size > 1 else None
+        if use_tp_for_experts and ps.ep_size > 1 and ps.etp_size == 1:
+            raise ValueError(
+                "use_tp_for_experts requires EP=1 or an explicit ETP group."
+            )
+        self.expert_tp_size = (
+            ps.etp_size if ps.etp_size > 1 else ps.tp_size if use_tp_for_experts else 1
+        )
+        self.expert_tp_group = (
+            ps.etp_group
+            if ps.etp_size > 1
+            else ps.tp_group
+            if use_tp_for_experts and ps.tp_size > 1
+            else None
+        )
+        self.activation = activation
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
 
         self.fc1 = te.GroupedLinear(
             self.num_local_experts,
             config.hidden_size,
-            config.moe_intermediate_size * 2 // ps.etp_size,
+            config.moe_intermediate_size * 2 // self.expert_tp_size,
             bias=False,
             params_dtype=torch.bfloat16,
         )
         self.fc2 = te.GroupedLinear(
             self.num_local_experts,
-            config.moe_intermediate_size // ps.etp_size,
+            config.moe_intermediate_size // self.expert_tp_size,
             config.hidden_size,
             bias=False,
             params_dtype=torch.bfloat16,
@@ -107,7 +129,7 @@ class Experts(nn.Module):
             self.fc1_lora = SharedGroupedLinearLoRA(
                 self.num_local_experts,
                 config.hidden_size,
-                config.moe_intermediate_size * 2 // ps.etp_size,
+                config.moe_intermediate_size * 2 // self.expert_tp_size,
                 lora.rank,
                 alpha=lora.alpha,
                 dropout=lora.dropout,
@@ -115,13 +137,18 @@ class Experts(nn.Module):
         if lora.enabled and lora.targets_module("linear_fc2"):
             self.fc2_lora = SharedGroupedLinearLoRA(
                 self.num_local_experts,
-                config.moe_intermediate_size // ps.etp_size,
+                config.moe_intermediate_size // self.expert_tp_size,
                 config.hidden_size,
                 lora.rank,
                 alpha=lora.alpha,
                 dropout=lora.dropout,
             )
-        if ps.tp_size > 1 and ps.ep_size == 1 and ps.etp_size == 1:
+        if (
+            ps.tp_size > 1
+            and ps.ep_size == 1
+            and ps.etp_size == 1
+            and not use_tp_for_experts
+        ):
             tp_group = ps.tp_group
             for module in (self.fc1, self.fc2, self.fc1_lora, self.fc2_lora):
                 if module is None:
@@ -148,19 +175,26 @@ class Experts(nn.Module):
         )
         pad_mask = None
         if self.fp8:
-            x, permuted_probs, m_splits, pad_mask = self._fp8_pad(x, permuted_probs, m_splits)
+            x, permuted_probs, m_splits, pad_mask = self._fp8_pad(
+                x, permuted_probs, m_splits
+            )
 
-        etp_real_len = x.shape[0]
-        if self.etp_group is not None:
-            max_len = torch.tensor([etp_real_len], device=x.device, dtype=torch.int64)
-            dist.all_reduce(max_len, op=dist.ReduceOp.MAX, group=self.etp_group)
+        expert_tp_real_len = x.shape[0]
+        if self.expert_tp_group is not None:
+            max_len = torch.tensor(
+                [expert_tp_real_len], device=x.device, dtype=torch.int64
+            )
+            dist.all_reduce(max_len, op=dist.ReduceOp.MAX, group=self.expert_tp_group)
             max_len = int(max_len.item())
-            if etp_real_len < max_len:
+            if expert_tp_real_len < max_len:
                 x = torch.cat(
                     [
                         x,
                         torch.zeros(
-                            max_len - etp_real_len, x.shape[1], dtype=x.dtype, device=x.device
+                            max_len - expert_tp_real_len,
+                            x.shape[1],
+                            dtype=x.dtype,
+                            device=x.device,
                         ),
                     ],
                     dim=0,
@@ -170,13 +204,15 @@ class Experts(nn.Module):
                         [
                             permuted_probs,
                             torch.zeros(
-                                max_len - etp_real_len, dtype=permuted_probs.dtype, device=x.device
+                                max_len - expert_tp_real_len,
+                                dtype=permuted_probs.dtype,
+                                device=x.device,
                             ),
                         ],
                         dim=0,
                     )
                 m_splits = list(m_splits)
-                m_splits[-1] += max_len - etp_real_len
+                m_splits[-1] += max_len - expert_tp_real_len
 
         probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
         with _expert_nvtx_range("ep_experts.forward"):
@@ -185,7 +221,13 @@ class Experts(nn.Module):
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs, self.swiglu_limit)
+                if self.activation is not None:
+                    raise NotImplementedError(
+                        "custom expert activation with moe_act_recompute is not supported"
+                    )
+                h = act_ckpt.checkpoint(
+                    swiglu_with_probs, fc1_out, probs, self.swiglu_limit
+                )
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
@@ -194,14 +236,18 @@ class Experts(nn.Module):
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
+                h = (
+                    self.activation(fc1_out, probs)
+                    if self.activation is not None
+                    else swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
+                )
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
 
-        if self.etp_group is not None:
-            out = _AllReduceETP.apply(out, self.etp_group)
-            out = out[:etp_real_len]
+        if self.expert_tp_group is not None:
+            out = _AllReduceETP.apply(out, self.expert_tp_group)
+            out = out[:expert_tp_real_len]
 
         if pad_mask is not None:
             out = out[pad_mask]
@@ -218,13 +264,17 @@ class Experts(nn.Module):
         mask = torch.zeros(total_padded, dtype=torch.bool, device=device)
         probs_pad = None
         if permuted_probs is not None:
-            probs_pad = torch.zeros(total_padded, device=device, dtype=permuted_probs.dtype)
+            probs_pad = torch.zeros(
+                total_padded, device=device, dtype=permuted_probs.dtype
+            )
         src_off, dst_off = 0, 0
         for real, pad in zip(m_splits, padded, strict=True):
             x_pad[dst_off : dst_off + real] = x[src_off : src_off + real]
             mask[dst_off : dst_off + real] = True
             if probs_pad is not None:
-                probs_pad[dst_off : dst_off + real] = permuted_probs[src_off : src_off + real]
+                probs_pad[dst_off : dst_off + real] = permuted_probs[
+                    src_off : src_off + real
+                ]
             src_off += real
             dst_off += pad
         return x_pad, probs_pad, padded, mask

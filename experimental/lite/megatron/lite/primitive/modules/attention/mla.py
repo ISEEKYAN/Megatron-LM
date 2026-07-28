@@ -45,7 +45,9 @@ _KEPT_PSP_FIELDS = (
 )
 
 
-def _apply_mla_rope_bshd(t: torch.Tensor, freqs: torch.Tensor, *, mscale: float) -> torch.Tensor:
+def _apply_mla_rope_bshd(
+    t: torch.Tensor, freqs: torch.Tensor, *, mscale: float
+) -> torch.Tensor:
     return _apply_rotary_pos_emb_bshd(
         t, freqs, rotary_interleaved=False, mscale=mscale, mla_rotary_interleaved=True
     )
@@ -90,10 +92,14 @@ class MultiLatentAttention(nn.Module):
         rope_theta: float = 10_000.0,
         rope_scaling: dict | None = None,
         use_thd: bool = False,
+        mla_use_nope: bool = False,
+        mla_use_output_gate: bool = False,
     ):
         super().__init__()
         if num_attention_heads % ps.tp_size != 0:
-            raise ValueError("num_attention_heads must be divisible by tensor parallel size")
+            raise ValueError(
+                "num_attention_heads must be divisible by tensor parallel size"
+            )
         self.ps = ps
         self.num_heads_local = num_attention_heads // ps.tp_size
         self.q_lora_rank = q_lora_rank
@@ -102,6 +108,8 @@ class MultiLatentAttention(nn.Module):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.q_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.mla_use_nope = bool(mla_use_nope)
+        self.mla_use_output_gate = bool(mla_use_output_gate)
 
         self.linear_proj = RowParallelLinear(
             num_attention_heads * v_head_dim,
@@ -131,6 +139,16 @@ class MultiLatentAttention(nn.Module):
             normalization="RMSNorm",
             eps=rms_norm_eps,
         )
+        self.linear_output_gate = (
+            ColumnParallelLinear(
+                hidden_size,
+                num_attention_heads * v_head_dim,
+                ps,
+                bias=False,
+            )
+            if self.mla_use_output_gate
+            else None
+        )
 
         rope_scaling = dict(rope_scaling or {})
         rope_type = rope_scaling.get("type", "rope")
@@ -149,7 +167,9 @@ class MultiLatentAttention(nn.Module):
                 mscale_all_dim=float(rope_scaling.get("mscale_all_dim", 1.0)),
                 cp_group=ps.cp_group if ps.cp_size > 1 else None,
             )
-            attn_mscale = _yarn_get_mscale(factor, float(rope_scaling.get("mscale_all_dim", 1.0)))
+            attn_mscale = _yarn_get_mscale(
+                factor, float(rope_scaling.get("mscale_all_dim", 1.0))
+            )
         elif rope_type == "rope":
             self.rotary = RotaryEmbedding(
                 kv_channels=qk_rope_head_dim,
@@ -177,7 +197,9 @@ class MultiLatentAttention(nn.Module):
         if not self._use_torch_core:
             dpa_kwargs = dict(cp_kwargs, softmax_scale=self._softmax_scale)
             kv_channels = (
-                (self.q_head_dim, v_head_dim) if v_head_dim != self.q_head_dim else self.q_head_dim
+                (self.q_head_dim, v_head_dim)
+                if v_head_dim != self.q_head_dim
+                else self.q_head_dim
             )
             self.core_attn = te.DotProductAttention(
                 num_attention_heads=self.num_heads_local,
@@ -222,7 +244,8 @@ class MultiLatentAttention(nn.Module):
             value = value.squeeze(1)
             k_pos = k_pos.squeeze(1)
 
-        q_pos, k_pos = self._apply_rope(q_pos, k_pos, packed_seq_params)
+        if not self.mla_use_nope:
+            q_pos, k_pos = self._apply_rope(q_pos, k_pos, packed_seq_params)
         if k_pos.dim() == q_nope.dim():
             k_pos = k_pos.expand(*q_nope.shape[:-1], self.qk_rope_head_dim)
         else:
@@ -261,9 +284,15 @@ class MultiLatentAttention(nn.Module):
                 out = self._torch_core_attention(query, key, value)
             else:
                 assert self.core_attn is not None
-                out = self.core_attn(query, key, value, core_attention_bias_type="no_bias")
+                out = self.core_attn(
+                    query, key, value, core_attention_bias_type="no_bias"
+                )
             if out.dim() > x.dim():
-                out = out.reshape(*out.shape[:-2], self.num_heads_local * self.v_head_dim)
+                out = out.reshape(
+                    *out.shape[:-2], self.num_heads_local * self.v_head_dim
+                )
+        if self.linear_output_gate is not None:
+            out = out * torch.sigmoid(self.linear_output_gate(x))
         return self.linear_proj(out)
 
     def _torch_core_attention(
@@ -299,7 +328,9 @@ class MultiLatentAttention(nn.Module):
         if self.ps.cp_size > 1:
             out = zigzag_slice_for_cp(out, self.ps.cp_rank, self.ps.cp_size, seq_dim=0)
             if out.size(0) != local_seq:
-                raise RuntimeError("CP MLA output shard has unexpected sequence length.")
+                raise RuntimeError(
+                    "CP MLA output shard has unexpected sequence length."
+                )
         return out
 
     def _torch_core_attention_thd(
@@ -358,7 +389,9 @@ class MultiLatentAttention(nn.Module):
                 scale=scale,
             )
             outputs.append(out.squeeze(0).permute(1, 0, 2).contiguous())
-        full_out = torch.cat(outputs, dim=0) if outputs else value.new_empty(value.shape)
+        full_out = (
+            torch.cat(outputs, dim=0) if outputs else value.new_empty(value.shape)
+        )
         if self.ps.cp_size <= 1:
             return full_out
         local_out = split_packed_to_cp_local(
