@@ -197,9 +197,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         chunks = []
         for i in range(vpp):
             chunks.append(
-                Qwen3MoEModel(model_cfg, ps, vpp=vpp, vpp_chunk_id=i, **model_kwargs)
-                .to(torch.bfloat16)
-                .cuda()
+                Qwen3MoEModel(model_cfg, ps, vpp=vpp, vpp_chunk_id=i, **model_kwargs).to(torch.bfloat16).cuda()
             )
 
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
@@ -248,9 +246,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         )
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
 
-        attach_model_sharded_state_dict(
-            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
-        )
+        attach_model_sharded_state_dict(chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param)
         optimizer_backend = "dist_opt"
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
@@ -311,18 +307,14 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 # ---------------------------------------------------------------------------
 
 
-def load_hf_weights(
-    chunk: nn.Module, hf_path: str, model_cfg: Qwen3MoEConfig, ps: ParallelState
-) -> None:
+def load_hf_weights(chunk: nn.Module, hf_path: str, model_cfg: Qwen3MoEConfig, ps: ParallelState) -> None:
     """Load HF pretrained weights into model chunk."""
     if not hf_path:
         return
     _load_hf_weights_impl(chunk, hf_path, model_cfg, ps)
 
 
-def export_hf_weights(
-    chunks: list[nn.Module], model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs
-):
+def export_hf_weights(chunks: list[nn.Module], model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs):
     """Export HF weights from model chunks."""
     from megatron.lite.model.qwen3_moe.lite.checkpoint import export_hf_weights as _export
 

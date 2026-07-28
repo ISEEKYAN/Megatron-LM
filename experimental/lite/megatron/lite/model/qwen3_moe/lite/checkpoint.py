@@ -9,8 +9,6 @@ model-specific: the weight map and tensor conversions.
 from __future__ import annotations
 
 import torch
-from torch.distributed.tensor import Replicate, Shard
-
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.ckpt.dcp import (  # noqa: F401 — re-export
     canonicalize_fc1_for_dcp,
@@ -24,11 +22,10 @@ from megatron.lite.primitive.quantization.mxfp4 import (
     quantize_mxfp4,
 )
 from megatron.lite.runtime.contracts.weights import ResyncFormat
+from torch.distributed.tensor import Replicate, Shard
 
 
-def _pack_mcore_qkv(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, config: Qwen3MoEConfig
-) -> torch.Tensor:
+def _pack_mcore_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, config: Qwen3MoEConfig) -> torch.Tensor:
     q_per_group = config.num_attention_heads // config.num_key_value_heads
     q = q.view(config.num_key_value_heads, q_per_group * config.head_dim, -1)
     k = k.view(config.num_key_value_heads, config.head_dim, -1)
@@ -36,9 +33,7 @@ def _pack_mcore_qkv(
     return torch.cat([q, k, v], dim=1).reshape(-1, q.shape[-1]).contiguous()
 
 
-def _unpack_mcore_qkv(
-    tensor: torch.Tensor, config: Qwen3MoEConfig
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _unpack_mcore_qkv(tensor: torch.Tensor, config: Qwen3MoEConfig) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q_per_group = config.num_attention_heads // config.num_key_value_heads
     group_width = (q_per_group + 2) * config.head_dim
     packed = tensor.view(config.num_key_value_heads, group_width, -1)
@@ -74,9 +69,7 @@ class Qwen3MoEWeightSpec:
             lp = f"layers.{li}"
             wm.update(
                 {
-                    f"{lp}.attn.qkv.linear.layer_norm_weight": [
-                        f"model.layers.{li}.input_layernorm.weight"
-                    ],
+                    f"{lp}.attn.qkv.linear.layer_norm_weight": [f"model.layers.{li}.input_layernorm.weight"],
                     f"{lp}.attn.qkv.linear.weight": [
                         f"{ap}.q_proj.weight",
                         f"{ap}.k_proj.weight",
@@ -142,9 +135,7 @@ class Qwen3MoEWeightSpec:
             return t[: self.config.num_experts]
         return t
 
-    def native_to_hf(
-        self, native_name: str, tensor: torch.Tensor
-    ) -> list[tuple[str, torch.Tensor]]:
+    def native_to_hf(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         c = self.config
         if native_name == "mtp_embed.embedding.weight":
             return []
@@ -161,9 +152,7 @@ class Qwen3MoEWeightSpec:
                 return [(f"{hp}.eh_proj.weight", tensor)]
             if native_name.endswith(".final_layernorm.weight"):
                 return [(f"{hp}.shared_head.norm.weight", tensor)]
-            proxy = native_name.replace(
-                f"mtp.layers.{mtp_idx}.transformer_layer", f"layers.{hf_li}"
-            )
+            proxy = native_name.replace(f"mtp.layers.{mtp_idx}.transformer_layer", f"layers.{hf_li}")
             return self.native_to_hf(proxy, tensor)
         if "embed" in native_name and "embedding" in native_name:
             return [("model.embed_tokens.weight", tensor)]
@@ -332,12 +321,7 @@ def _export_mxfp4_weights(weights):
             "model.embed_tokens.weight",
             "lm_head.weight",
         } or name.endswith(".mlp.gate.weight")
-        if (
-            is_ignored
-            or not name.endswith(".weight")
-            or tensor.ndim != 2
-            or not tensor.dtype.is_floating_point
-        ):
+        if is_ignored or not name.endswith(".weight") or tensor.ndim != 2 or not tensor.dtype.is_floating_point:
             yield name, tensor
             continue
         if tensor.shape[-1] % MXFP4_BLOCK_SIZE:

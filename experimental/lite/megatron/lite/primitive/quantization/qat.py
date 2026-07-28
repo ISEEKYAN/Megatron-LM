@@ -51,11 +51,23 @@ import torch.nn.utils.parametrize as parametrize
 # training is the error deployment actually makes.
 from megatron.lite.primitive.quantization.mxfp4 import (
     E2M1_LEVELS as _E2M1_LEVELS,
+)
+from megatron.lite.primitive.quantization.mxfp4 import (
     E2M1_MAX as _E2M1_MAX,
+)
+from megatron.lite.primitive.quantization.mxfp4 import (
     E8M0_BIAS as _E8M0_BIAS,
+)
+from megatron.lite.primitive.quantization.mxfp4 import (
     MXFP4_BLOCK_SIZE as _MXFP4_BLOCK,
+)
+from megatron.lite.primitive.quantization.mxfp4 import (
     e2m1_round_index as _e2m1_round_index,
+)
+from megatron.lite.primitive.quantization.mxfp4 import (
     mx_shared_scale as _mx_shared_scale,
+)
+from megatron.lite.primitive.quantization.mxfp4 import (
     mx_shared_scale_exponent as _mx_shared_scale_exponent,
 )
 
@@ -136,9 +148,7 @@ class QATSpec:
                 "alias it onto MXFP4's E8M0 scale."
             )
         if self.format not in _FORMAT_BITS:
-            raise ValueError(
-                f"Unknown QAT format {self.format!r}; supported: {sorted(_FORMAT_BITS)}."
-            )
+            raise ValueError(f"Unknown QAT format {self.format!r}; supported: {sorted(_FORMAT_BITS)}.")
         if self.activation_bits is not None:
             raise ValueError(
                 "activation quantization (W*A*) is not supported here; it needs a "
@@ -216,9 +226,7 @@ def _reshape_for_groups(weight: torch.Tensor, group_size: int) -> tuple[torch.Te
     # block along in-features
     out_features, in_features = weight.shape
     if in_features % group_size != 0:
-        raise ValueError(
-            f"group_size={group_size} does not divide in_features={in_features}."
-        )
+        raise ValueError(f"group_size={group_size} does not divide in_features={in_features}.")
     view = weight.reshape(out_features, in_features // group_size, group_size)
     return view, 2
 
@@ -297,9 +305,7 @@ def fake_quantize_weight(weight: torch.Tensor, spec: QATSpec) -> torch.Tensor:
         return _fp8_fake_quantize_weight(weight, spec)
     if spec.format == "mxfp4":
         return _mxfp4_fake_quantize_weight(weight, spec)
-    scale, zero_point, qmin, qmax = _compute_qparams(
-        weight, spec.num_bits, spec.group_size, spec.symmetric
-    )
+    scale, zero_point, qmin, qmax = _compute_qparams(weight, spec.num_bits, spec.group_size, spec.symmetric)
     if spec.group_size > 0:
         out_features, in_features = weight.shape
         view = weight.reshape(out_features, in_features // spec.group_size, spec.group_size)
@@ -311,6 +317,7 @@ def fake_quantize_weight(weight: torch.Tensor, spec: QATSpec) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Floating-point quant/dequant numerics (fp8 E4M3; MXFP4 = E2M1 + E8M0)
 # ---------------------------------------------------------------------------
+
 
 def _fp8_e4m3_max() -> float:
     return float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
@@ -429,9 +436,7 @@ def quantize_weight(weight: torch.Tensor, spec: QATSpec) -> dict[str, torch.Tens
         return _quantize_weight_fp8(weight, spec)
     if spec.format == "mxfp4":
         return _quantize_weight_mxfp4(weight)
-    scale, zero_point, qmin, qmax = _compute_qparams(
-        weight, spec.num_bits, spec.group_size, spec.symmetric
-    )
+    scale, zero_point, qmin, qmax = _compute_qparams(weight, spec.num_bits, spec.group_size, spec.symmetric)
     view, _ = _reshape_for_groups(weight.detach(), spec.group_size)
     w = view.float()
     if zero_point is None:
@@ -494,7 +499,7 @@ def _dequantize_weight_mxfp4(packed: dict[str, torch.Tensor]) -> torch.Tensor:
     mag = (codes & 0x7).to(torch.long)
     sign = ((codes >> 3) & 0x1).float()
     levels = torch.tensor(_E2M1_LEVELS, dtype=torch.float32, device=codes.device)
-    scale = torch.exp2((e8m0.float() - _E8M0_BIAS))
+    scale = torch.exp2(e8m0.float() - _E8M0_BIAS)
     values = (1.0 - 2.0 * sign) * levels[mag] * scale
     out_features, n_blk, block = values.shape
     return values.reshape(out_features, n_blk * block)
@@ -558,9 +563,7 @@ def _compute_amax_tensor(weight: torch.Tensor, group_size: int) -> torch.Tensor:
             dim=0,
         )
     if weight.dim() != 2:
-        raise ValueError(
-            f"QAT weight fake-quant expects 2D or 3D stacked weights, got {tuple(weight.shape)}."
-        )
+        raise ValueError(f"QAT weight fake-quant expects 2D or 3D stacked weights, got {tuple(weight.shape)}.")
     return compute_amax(weight, group_size)
 
 
@@ -572,9 +575,7 @@ def _fake_quant_weight_tensor(weight: torch.Tensor, spec: QATSpec) -> torch.Tens
             dim=0,
         )
     if weight.dim() != 2:
-        raise ValueError(
-            f"QAT weight fake-quant expects 2D or 3D stacked weights, got {tuple(weight.shape)}."
-        )
+        raise ValueError(f"QAT weight fake-quant expects 2D or 3D stacked weights, got {tuple(weight.shape)}.")
     return fake_quantize_weight(weight, spec)
 
 
@@ -596,9 +597,7 @@ class WeightFakeQuant(nn.Module):
 
     def forward(self, weight: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            self.amax.copy_(
-                _compute_amax_tensor(weight, self.spec.group_size).to(self.amax.dtype)
-            )
+            self.amax.copy_(_compute_amax_tensor(weight, self.spec.group_size).to(self.amax.dtype))
         return _fake_quant_weight_tensor(weight, self.spec)
 
 
@@ -632,9 +631,7 @@ def apply_qat_to_module(module: nn.Module, spec: QATSpec) -> bool:
         return False
     if parametrize.is_parametrized(owner, "weight"):
         return False
-    parametrize.register_parametrization(
-        owner, "weight", WeightFakeQuant(spec, owner.weight.shape), unsafe=True
-    )
+    parametrize.register_parametrization(owner, "weight", WeightFakeQuant(spec, owner.weight.shape), unsafe=True)
     return True
 
 

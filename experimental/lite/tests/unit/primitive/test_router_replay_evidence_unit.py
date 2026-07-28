@@ -10,10 +10,8 @@ readable as "it worked".
 
 from __future__ import annotations
 
-import torch
-
 import pytest
-
+import torch
 from megatron.lite.primitive.modules.router_replay import (
     RouterReplay,
     RouterReplayAction,

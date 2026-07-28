@@ -41,9 +41,7 @@ def test_quantizer_b_requires_authoritative_optional_backends():
         list(quantizer.export([("weight", torch.ones(1))]))
 
 
-def test_nvfp4_hf_export_delegates_to_modelopt_under_inference_mode(
-    monkeypatch, tmp_path
-):
+def test_nvfp4_hf_export_delegates_to_modelopt_under_inference_mode(monkeypatch, tmp_path):
     """NVFP4 deployment must use ModelOpt's artifact-aware HF exporter."""
     calls = []
 

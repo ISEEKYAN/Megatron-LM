@@ -12,7 +12,6 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
-
 from megatron.lite.primitive.quantization.qat import (
     QATSpec,
     WeightFakeQuant,
@@ -228,9 +227,7 @@ def test_parametrization_preserves_master_weight_identity():
     lin = nn.Linear(8, 6, bias=False).to(torch.bfloat16)
     master_before = lin.weight
     spec = QATSpec(enabled=True, format="int4", group_size=-1)
-    parametrize.register_parametrization(
-        lin, "weight", WeightFakeQuant(spec, lin.weight.shape), unsafe=True
-    )
+    parametrize.register_parametrization(lin, "weight", WeightFakeQuant(spec, lin.weight.shape), unsafe=True)
     # master survives untouched as .original, still trainable, still bf16
     original = lin.parametrizations.weight.original
     assert original is master_before
@@ -424,14 +421,10 @@ def _toy_linear_chunk(in_features: int = 64, out_features: int = 12):
 
 def test_canonical_state_key_strips_only_parametrization_original():
     assert _canonical_state_key("a.b.linear.weight") == "a.b.linear.weight"
-    assert (
-        _canonical_state_key("a.b.linear.parametrizations.weight.original")
-        == "a.b.linear.weight"
-    )
+    assert _canonical_state_key("a.b.linear.parametrizations.weight.original") == "a.b.linear.weight"
     # quantizer buffers keep their real name (must NOT collide with the master)
     assert (
-        _canonical_state_key("a.b.linear.parametrizations.weight.0.amax")
-        == "a.b.linear.parametrizations.weight.0.amax"
+        _canonical_state_key("a.b.linear.parametrizations.weight.0.amax") == "a.b.linear.parametrizations.weight.0.amax"
     )
 
 

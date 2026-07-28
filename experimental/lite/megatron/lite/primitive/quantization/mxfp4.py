@@ -62,9 +62,7 @@ def mx_shared_scale_exponent(block_amax: torch.Tensor) -> torch.Tensor:
     ``6 * 2^127``, and adding one would diverge from ModelOpt.
     """
     descale = block_amax.float() / E2M1_MAX
-    floor_exp = torch.tensor(
-        float(E8M0_EXP_MIN), dtype=torch.float32, device=descale.device
-    )
+    floor_exp = torch.tensor(float(E8M0_EXP_MIN), dtype=torch.float32, device=descale.device)
     return torch.ceil(torch.maximum(torch.log2(descale), floor_exp))
 
 
@@ -97,10 +95,7 @@ def _validate(tensor: torch.Tensor) -> None:
     if not tensor.dtype.is_floating_point:
         raise TypeError(f"MXFP4 source must be floating point, got {tensor.dtype}")
     if tensor.shape[-1] % MXFP4_BLOCK_SIZE:
-        raise ValueError(
-            f"tensor last dimension {tensor.shape[-1]} must be divisible by "
-            f"{MXFP4_BLOCK_SIZE}"
-        )
+        raise ValueError(f"tensor last dimension {tensor.shape[-1]} must be divisible by {MXFP4_BLOCK_SIZE}")
 
 
 def _select_scale(blocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -111,9 +106,7 @@ def _select_scale(blocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 def _quantize_nibbles(values: torch.Tensor) -> torch.Tensor:
     index = e2m1_round_index(values.abs()).to(torch.uint8)
-    sign = torch.where(values.signbit(), torch.tensor(8, device=values.device), 0).to(
-        torch.uint8
-    )
+    sign = torch.where(values.signbit(), torch.tensor(8, device=values.device), 0).to(torch.uint8)
     return index | sign
 
 
@@ -124,9 +117,7 @@ def quantize_mxfp4(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     blocks = source.reshape(*source.shape[:-1], -1, MXFP4_BLOCK_SIZE)
     scale_f, scale = _select_scale(blocks)
     normalized = blocks / scale_f.unsqueeze(-1)
-    nibbles = _quantize_nibbles(normalized).reshape(
-        *source.shape[:-1], source.shape[-1]
-    )
+    nibbles = _quantize_nibbles(normalized).reshape(*source.shape[:-1], source.shape[-1])
     packed = nibbles[..., 0::2] | (nibbles[..., 1::2] << 4)
     return packed.contiguous().view(torch.int8), scale.contiguous()
 
@@ -137,9 +128,7 @@ def dequantize_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         raise TypeError(f"MXFP4 packed tensor must be int8, got {packed.dtype}")
     expected = (*packed.shape[:-1], packed.shape[-1] * 2 // MXFP4_BLOCK_SIZE)
     if tuple(scale.shape) != expected:
-        raise ValueError(
-            f"scale shape {tuple(scale.shape)} does not match expected {expected}"
-        )
+        raise ValueError(f"scale shape {tuple(scale.shape)} does not match expected {expected}")
     table = torch.tensor(
         (*_E2M1_POSITIVE, *(value * -1.0 for value in _E2M1_POSITIVE)),
         dtype=torch.float32,

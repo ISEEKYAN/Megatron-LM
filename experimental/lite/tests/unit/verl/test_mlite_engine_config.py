@@ -5,10 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
+from megatron.lite.runtime.contracts import LossContext
 from verl_mlite.engine.config import MegatronLiteEngineConfig
 from verl_mlite.engine.mlite_engine import MegatronLiteEngine, _build_lr_scheduler
-from megatron.lite.runtime.contracts import LossContext
 
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
@@ -38,9 +37,7 @@ def _engine(
     *, engine_config: MegatronLiteEngineConfig, optimizer_config: SimpleNamespace | None = None
 ) -> MegatronLiteEngine:
     return MegatronLiteEngine(
-        model_config=SimpleNamespace(
-            local_path="/tmp/qwen35", hf_config={"model_type": "qwen3_5_moe"}, mtp=None
-        ),
+        model_config=SimpleNamespace(local_path="/tmp/qwen35", hf_config={"model_type": "qwen3_5_moe"}, mtp=None),
         engine_config=engine_config,
         optimizer_config=optimizer_config or _optimizer_config(),
         checkpoint_config={},
@@ -77,9 +74,7 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
 def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> None:
     engine = _engine(
         engine_config=_engine_config(optimizer_offload=True),
-        optimizer_config=_optimizer_config(
-            use_precision_aware_optimizer=True, decoupled_weight_decay=True
-        ),
+        optimizer_config=_optimizer_config(use_precision_aware_optimizer=True, decoupled_weight_decay=True),
     )
 
     optimizer = engine._build_mlite_optimizer_config()

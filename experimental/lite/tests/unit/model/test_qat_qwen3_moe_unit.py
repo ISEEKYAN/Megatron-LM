@@ -5,12 +5,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
-
-import pytest
-
 from megatron.lite.model.qwen3_moe.lite.checkpoint import (
     _canonical_state_key,
     _resolve_param_name_canonical,
@@ -189,9 +187,7 @@ def test_qwen3_moe_mxfp4_resync_exports_compressed_tensors_stream(
         ("fp8_rollout_qat_on", {"enabled": True, "format": "fp8", "group_size": -1}),
     ],
 )
-def test_qwen3_moe_dapo_three_arm_impl_cfg_resolves(
-    transformer_engine_import_stub, arm, impl_qat
-):
+def test_qwen3_moe_dapo_three_arm_impl_cfg_resolves(transformer_engine_import_stub, arm, impl_qat):
     transformer_engine_import_stub()
     from megatron.lite.model.qwen3_moe.lite import protocol as qwen3_moe_protocol
 

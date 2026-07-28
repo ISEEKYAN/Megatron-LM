@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """vLLM-compatible QAT recipes and a non-invasive prepare/export boundary."""
+
 from __future__ import annotations
 
 import copy
@@ -28,9 +29,7 @@ class RecipeContract:
 
 _CONTRACTS = {
     QATRecipe.INT4_W4A16_G128: RecipeContract("int4", 128, "float", False, "W4A16"),
-    QATRecipe.NVFP4_W4A16: RecipeContract(
-        "float4_e2m1", 16, "float8_e4m3fn", False, "NVFP4A16"
-    ),
+    QATRecipe.NVFP4_W4A16: RecipeContract("float4_e2m1", 16, "float8_e4m3fn", False, "NVFP4A16"),
 }
 
 
@@ -39,9 +38,7 @@ def recipe_contract(recipe: QATRecipe | str) -> RecipeContract:
     try:
         return _CONTRACTS[QATRecipe(recipe)]
     except ValueError as exc:
-        raise ValueError(
-            f"Unsupported QAT recipe {recipe!r}; use {list(QATRecipe)}."
-        ) from exc
+        raise ValueError(f"Unsupported QAT recipe {recipe!r}; use {list(QATRecipe)}.") from exc
 
 
 class QuantizerB:
@@ -80,9 +77,7 @@ class QuantizerB:
             ) from exc
         return mtq.quantize(model, self._modelopt_config(), calibration_forward_loop)
 
-    def export(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterator[tuple[str, torch.Tensor]]:
+    def export(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
         """Reject the former tensor-iterator pseudo-export.
 
         Kept as a narrow compatibility failure rather than returning the input:
@@ -90,20 +85,17 @@ class QuantizerB:
         """
         del weights
         raise RuntimeError(
-            "QAT recipe export requires export_hf_checkpoint(model, output_dir); ModelOpt Q/DQ cannot be CT-packed by tensor passthrough."
+            "QAT recipe export requires export_hf_checkpoint(model, output_dir); "
+            "ModelOpt Q/DQ cannot be CT-packed by tensor passthrough."
         )
         yield  # pragma: no cover - retains the historical iterator annotation.
 
-    def export_hf_checkpoint(
-        self, model: nn.Module, output_dir: str | PathLike[str]
-    ) -> None:
+    def export_hf_checkpoint(self, model: nn.Module, output_dir: str | PathLike[str]) -> None:
         """Write ModelOpt's quantized unified-HF artifact for vLLM loading."""
         try:
             from modelopt.torch.export import export_hf_checkpoint
         except ImportError as exc:
-            raise RuntimeError(
-                "QAT recipe export requires NVIDIA ModelOpt's unified-HF exporter."
-            ) from exc
+            raise RuntimeError("QAT recipe export requires NVIDIA ModelOpt's unified-HF exporter.") from exc
         with torch.inference_mode():
             export_hf_checkpoint(model, export_dir=str(output_dir))
 

@@ -41,9 +41,7 @@ class MegatronLiteEngineConfig(EngineConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.strategy != "mlite":
-            raise ValueError(
-                f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}"
-            )
+            raise ValueError(f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}")
         if self.custom_backend_module:
             importlib.import_module(self.custom_backend_module)
         if self.resync_format is not None:
@@ -66,6 +64,5 @@ class MegatronLiteEngineConfig(EngineConfig):
             raise ValueError("qat online export and native resync_format are mutually exclusive")
         if self.router_replay_mode not in ("disabled", "R3"):
             raise ValueError(
-                "MegatronLiteEngine supports router_replay_mode='disabled' or 'R3', "
-                f"got {self.router_replay_mode!r}"
+                f"MegatronLiteEngine supports router_replay_mode='disabled' or 'R3', got {self.router_replay_mode!r}"
             )

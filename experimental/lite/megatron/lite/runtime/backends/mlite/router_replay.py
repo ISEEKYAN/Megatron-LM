@@ -8,7 +8,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-
 from megatron.lite.model import protocol_utils
 from megatron.lite.primitive.modules.router_replay import (
     RouterReplay,
@@ -29,9 +28,7 @@ class RouterReplayDriver:
 
     def __init__(self, handle, action: str):
         if action not in ("record", "replay"):
-            raise ValueError(
-                f"router replay action must be 'record' or 'replay', got {action!r}."
-            )
+            raise ValueError(f"router replay action must be 'record' or 'replay', got {action!r}.")
         self.handle = handle
         self.action = action
         self._chunks = handle._extras.get("model_chunks", [handle._model])
@@ -43,17 +40,13 @@ class RouterReplayDriver:
         self._emitted_evidence = False
 
     def _replay_roots(self):
-        selector = (
-            getattr(self._protocol, "router_replay_roots", None)
-            if self._protocol is not None
-            else None
-        )
+        selector = getattr(self._protocol, "router_replay_roots", None) if self._protocol is not None else None
         for chunk in self._chunks:
             roots = selector(chunk) if selector is not None else [chunk]
             yield from roots
 
     @classmethod
-    def maybe_create(cls, handle, spec: Any) -> "RouterReplayDriver | None":
+    def maybe_create(cls, handle, spec: Any) -> RouterReplayDriver | None:
         if not spec:
             return None
         action = spec.get("action") if isinstance(spec, dict) else spec
@@ -63,13 +56,9 @@ class RouterReplayDriver:
 
     def begin(self) -> None:
         RouterReplay.clear_global_router_replay_instances()
-        self._num_routers = sum(
-            attach_router_replay(root, reset=False) for root in self._replay_roots()
-        )
+        self._num_routers = sum(attach_router_replay(root, reset=False) for root in self._replay_roots())
         if self._num_routers == 0:
-            raise RuntimeError(
-                "router replay requested but the model has no MoE routers."
-            )
+            raise RuntimeError("router replay requested but the model has no MoE routers.")
         self._ps = parallel_state_from_model(self._chunks[-1])
         self._compute_pp_layout()
         if self.action == "record":
@@ -80,9 +69,7 @@ class RouterReplayDriver:
         if ps is None or ps.pp_size <= 1:
             self._pp_total = self._num_routers
             return
-        counts = [
-            torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(ps.pp_size)
-        ]
+        counts = [torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(ps.pp_size)]
         dist.all_gather(
             counts,
             torch.tensor([self._num_routers], dtype=torch.long, device="cuda"),
@@ -123,9 +110,7 @@ class RouterReplayDriver:
             targets = pack_routes(model, batch, routed)
             replay_mask = pack_mask(model, batch)
             RouterReplay.set_replay_data(targets, replay_mask=replay_mask)
-            RouterReplay.set_global_router_replay_action(
-                RouterReplayAction.REPLAY_FORWARD
-            )
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             RouterReplay.reset_replay_stats()
             try:
                 return forward_step(model, batch)
@@ -135,9 +120,7 @@ class RouterReplayDriver:
                 # after one or more newer micro-batches have run.  Those calls
                 # must consume the saved per-microbatch FIFO, not the latest
                 # forward target.
-                RouterReplay.set_global_router_replay_action(
-                    RouterReplayAction.REPLAY_BACKWARD
-                )
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
 
         return stepped
 
@@ -188,11 +171,7 @@ class RouterReplayDriver:
         ps = self._ps
         if ps is None or ps.pp_size <= 1:
             expected = self._num_routers
-            actual = (
-                int(routed.values().size(1))
-                if getattr(routed, "is_nested", False)
-                else int(routed.size(-2))
-            )
+            actual = int(routed.values().size(1)) if getattr(routed, "is_nested", False) else int(routed.size(-2))
             if actual != expected:
                 raise ValueError(
                     f"R3 route layer count mismatch: rollout={actual}, actor={expected}. "

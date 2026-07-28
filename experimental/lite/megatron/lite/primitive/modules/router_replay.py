@@ -19,7 +19,7 @@ class RouterReplayAction(Enum):
 class RouterReplay:
     """Replay expert indices while gathering scores from the live router."""
 
-    global_router_replay_instances: list["RouterReplay"] = []
+    global_router_replay_instances: list[RouterReplay] = []
 
     # Instrumentation. Counts how much routing the replay actually *substituted*,
     # which is the only direct evidence that R3 is doing work: `routed_experts`
@@ -65,8 +65,7 @@ class RouterReplay:
         instances = RouterReplay.global_router_replay_instances
         if len(all_layers_topk_indices) != len(instances):
             raise ValueError(
-                f"router replay expects {len(instances)} per-layer tensors, "
-                f"got {len(all_layers_topk_indices)}."
+                f"router replay expects {len(instances)} per-layer tensors, got {len(all_layers_topk_indices)}."
             )
         for instance, indices in zip(instances, all_layers_topk_indices, strict=True):
             instance.target_topk_idx = indices
@@ -80,10 +79,7 @@ class RouterReplay:
 
     @staticmethod
     def get_recorded_data() -> list[torch.Tensor | None]:
-        return [
-            instance.recorded_topk_idx
-            for instance in RouterReplay.global_router_replay_instances
-        ]
+        return [instance.recorded_topk_idx for instance in RouterReplay.global_router_replay_instances]
 
     @staticmethod
     def set_global_router_replay_action(action: RouterReplayAction) -> None:
@@ -123,17 +119,13 @@ class RouterReplay:
             mask = self.target_replay_mask
         elif action == RouterReplayAction.REPLAY_BACKWARD:
             if not self.replay_backward_list:
-                raise RuntimeError(
-                    "router replay backward is active but its target queue is empty."
-                )
+                raise RuntimeError("router replay backward is active but its target queue is empty.")
             target = self.replay_backward_list.pop(0)
             mask = self.replay_backward_mask_list.pop(0)
         else:
             return native_indices
         if target is None:
-            raise RuntimeError(
-                "router replay is active but no target indices were set."
-            )
+            raise RuntimeError("router replay is active but no target indices were set.")
 
         target = target.to(device=native_indices.device, dtype=torch.long)
         if target.shape != native_indices.shape:
@@ -144,13 +136,10 @@ class RouterReplay:
         if mask is None:
             selected = target
         else:
-            mask = mask.to(device=native_indices.device, dtype=torch.bool).reshape(
-                -1, 1
-            )
+            mask = mask.to(device=native_indices.device, dtype=torch.bool).reshape(-1, 1)
             if mask.size(0) != target.size(0):
                 raise ValueError(
-                    "router replay mask length does not match routing rows: "
-                    f"mask={mask.size(0)} rows={target.size(0)}."
+                    f"router replay mask length does not match routing rows: mask={mask.size(0)} rows={target.size(0)}."
                 )
             selected = torch.where(mask, target, native_indices)
         self._record_replay_stats(native_indices, selected)
@@ -199,19 +188,11 @@ def gather_replayed_router_scores(
 
     if score_function == "softmax":
         if use_pre_softmax:
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).gather(
-                -1, indices
-            )
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).gather(-1, indices)
         else:
-            scores = torch.softmax(
-                logits.gather(-1, indices), dim=-1, dtype=torch.float32
-            )
+            scores = torch.softmax(logits.gather(-1, indices), dim=-1, dtype=torch.float32)
     elif score_function in ("sigmoid", "sqrtsoftplus"):
-        dense = (
-            logits.float().sigmoid()
-            if score_function == "sigmoid"
-            else F.softplus(logits.float()).sqrt()
-        )
+        dense = logits.float().sigmoid() if score_function == "sigmoid" else F.softplus(logits.float()).sqrt()
         scores = dense.gather(-1, indices)
         if indices.size(-1) > 1:
             scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
