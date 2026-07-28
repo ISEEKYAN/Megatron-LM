@@ -36,9 +36,11 @@ def _parallel_state(model) -> ParallelState:
 def router_replay_roots(chunk) -> list:
     """Select decoder layers for R3, excluding MTP-only routers.
 
-    Rollout route tensors have one layer-axis entry per decoder router.  MTP
-    layers run only on the training side and therefore must keep their native
-    routing instead of consuming entries from that rollout-owned axis.
+    The current rollout configuration does not run MTP, so route tensors have
+    one layer-axis entry per main decoder router.  MTP layers therefore keep
+    their native routing instead of consuming that rollout-owned axis.  If a
+    future rollout enables MTP speculative decoding, this assumption must be
+    reevaluated.
     """
     model = getattr(chunk, "model", chunk)
     layers = getattr(model, "layers", None)

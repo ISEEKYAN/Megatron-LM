@@ -272,7 +272,12 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
 
 
 def pack_routed_experts(model: nn.Module, batch: PackedBatch, routed_experts):
-    """Pack R3 routes using DS4's contiguous CP token layout."""
+    """Pack R3 routes using DS4's contiguous CP token layout.
+
+    The current rollout configuration does not run MTP, so the route layer axis
+    contains only main decoder routers.  If rollout later enables DeepSeek MTP
+    speculative decoding, this assumption must be reevaluated.
+    """
 
     return _pack_routed_experts(model, batch, routed_experts, contiguous=True)
 
