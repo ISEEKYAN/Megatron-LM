@@ -153,9 +153,9 @@ def test_replay_roots_exclude_mtp_layers():
 
 @pytest.mark.parametrize(
     "protocol_name",
-    ["qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2"],
+    ["qwen3_moe", "qwen3_5", "deepseek_v4"],
 )
-def test_every_moe_protocol_exposes_mtp_safe_replay_roots(protocol_name):
+def test_supported_moe_protocols_expose_mtp_safe_replay_roots(protocol_name):
     from pathlib import Path
 
     protocol_path = (
@@ -169,6 +169,44 @@ def test_every_moe_protocol_exposes_mtp_safe_replay_roots(protocol_name):
     )
     source = protocol_path.read_text()
     assert "router_replay_roots" in source
+
+
+@pytest.mark.parametrize("protocol_name", ["glm5", "kimi_k2"])
+def test_custom_router_protocols_do_not_claim_r3_support(protocol_name):
+    from pathlib import Path
+
+    protocol_path = (
+        Path(__file__).parents[3]
+        / "megatron"
+        / "lite"
+        / "model"
+        / protocol_name
+        / "lite"
+        / "protocol.py"
+    )
+    source = protocol_path.read_text()
+    assert "router_replay_roots" not in source
+
+
+@pytest.mark.parametrize("protocol_name", ["glm5", "kimi_k2"])
+def test_r3_driver_rejects_models_with_unintegrated_custom_routers(protocol_name):
+    from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+
+    chunk = nn.Module()
+    chunk.ps = SimpleNamespace(cp_size=1)
+    protocol = SimpleNamespace(
+        __name__=f"megatron.lite.model.{protocol_name}.lite.protocol"
+    )
+    handle = SimpleNamespace(
+        _model=chunk,
+        _extras={"model_chunks": [chunk], "protocol": protocol},
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match=rf"{protocol_name}.*custom router.*not.*integrated.*router replay",
+    ):
+        RouterReplayDriver.maybe_create(handle, {"action": "replay"})
 
 
 def test_r3_driver_begin_fails_loudly_when_model_has_no_moe_router():
