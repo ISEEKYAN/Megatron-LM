@@ -103,9 +103,11 @@ FSDP2 Muon does not support optimizer-state CPU offload in this release.
 | GSM8K RL reward (GRPO) | Muon and AdamW are within the repeat-run spread |
 
 This table summarizes a mix of automated primitive checks and manual
-end-to-end validation. The DistOpt and FSDP2 correctness rows have repository
-test assertions; the memory and RL observations are not asserted by automated
-tests in this repository.
+end-to-end validation. The DistOpt result is from a one-off offline DP=2 parity
+run; this repository does not currently contain an automated assertion for the
+2000-check TensorParallelMuon comparison. The FSDP2 correctness row has
+repository test assertions; the memory and RL observations are not asserted by
+automated tests in this repository.
 
 ## Tests
 

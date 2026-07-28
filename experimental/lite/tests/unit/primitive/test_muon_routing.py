@@ -115,11 +115,11 @@ def test_central_routing_preserves_module_owned_optimizer_metadata() -> None:
 
     assert embedding.is_embedding_or_output_parameter is True
     assert output.is_embedding_or_output_parameter is True
-    assert not hasattr(embedding, "is_managed_by_layer_wise_optimizer")
-    assert not hasattr(output, "is_managed_by_layer_wise_optimizer")
+    assert embedding.is_managed_by_layer_wise_optimizer is False
+    assert output.is_managed_by_layer_wise_optimizer is False
     assert qkv.is_qkv is True
     assert qkv.qkv_split_shapes == [4, 4, 2, 2]
-    assert not hasattr(qkv, "is_managed_by_layer_wise_optimizer")
+    assert qkv.is_managed_by_layer_wise_optimizer is True
 
 
 def test_central_routing_preserves_expert_and_tensor_parallel_metadata() -> None:
@@ -228,9 +228,7 @@ def test_compact_dist_opt_lowering_follows_upstream_order(monkeypatch) -> None:
         events.append("buffer_route")
         assert model_chunks == [model]
         assert model.embed.embedding.weight.is_embedding_or_output_parameter is True
-        assert not hasattr(
-            model.embed.embedding.weight, "is_managed_by_layer_wise_optimizer"
-        )
+        assert model.embed.embedding.weight.is_managed_by_layer_wise_optimizer is False
         for param in model.parameters():
             param.is_managed_by_layer_wise_optimizer = param.dim() == 2 and not getattr(
                 param, "is_embedding_or_output_parameter", False

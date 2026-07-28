@@ -34,6 +34,7 @@ from megatron.lite.primitive.optimizers.fsdp2.muon import (
     newton_schulz_orthogonalize,
     split_muon_and_fallback_params,
 )
+from megatron.lite.primitive.optimizers.muon_routing import tag_muon_parameter_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -460,9 +461,8 @@ class _Toy(torch.nn.Module):
 
 def test_routing_splits_matrix_vs_fallback():
     model = _Toy()
-    # mimic the pre-wrap tagging: matrix weight is Muon-managed, 1D norm is not.
-    model.weight.is_managed_by_layer_wise_optimizer = True
-    model.norm.is_managed_by_layer_wise_optimizer = False
+    tag_muon_parameter_metadata([model], is_expert_param=lambda _name: False)
+
     muon_params, fallback_params, names = split_muon_and_fallback_params([model])
     assert muon_params == [model.weight]
     assert fallback_params == [model.norm]
