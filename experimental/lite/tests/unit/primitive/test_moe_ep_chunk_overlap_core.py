@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -129,6 +130,31 @@ def test_accumulate_reuses_first_chunk_gradient_storage(
 
     assert accum[0].data_ptr() == storage
     torch.testing.assert_close(accum[0], torch.full((2, 2), 3.0))
+
+
+def test_delayed_wgrad_excludes_expert_params_from_autograd_targets(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _expert_grad_inputs,
+        _require_delayed_weight_grads,
+    )
+
+    dispatched = torch.ones(2, 2, requires_grad=True)
+    probs = torch.ones(2, requires_grad=True)
+    params = tuple(torch.nn.Parameter(torch.zeros(1)) for _ in range(2))
+    inputs = _expert_grad_inputs(dispatched, probs)
+
+    assert inputs == (dispatched, probs)
+    assert all(all(param is not item for item in inputs) for param in params)
+
+    delayed = {param: torch.ones_like(param) for param in params}
+    grads = _require_delayed_weight_grads(params, delayed)
+    assert grads == tuple(delayed[param] for param in params)
+
+    with pytest.raises(RuntimeError, match="missing 1 parameter gradient"):
+        _require_delayed_weight_grads(params, {params[0]: delayed[params[0]]})
 
 
 def test_forward_trace_pipelines_next_dispatch_before_current_expert(

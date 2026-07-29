@@ -523,14 +523,9 @@ class EPChunkOverlapOperator:
                         raise RuntimeError(
                             "EP chunk overlap expert graph was released."
                         )
-                    if chunk.probs is None:
-                        expert_inputs = (chunk.dispatched, *expert_params)
-                    else:
-                        expert_inputs = (
-                            chunk.dispatched,
-                            chunk.probs,
-                            *expert_params,
-                        )
+                    expert_inputs = _expert_grad_inputs(
+                        chunk.dispatched, chunk.probs
+                    )
                     expert_grads = torch.autograd.grad(
                         expert_output,
                         expert_inputs,
@@ -542,18 +537,15 @@ class EPChunkOverlapOperator:
                         grad_dispatched = torch.zeros_like(chunk.dispatched)
                     if chunk.probs is None:
                         grad_probs = None
-                        param_grads = expert_grads[1:]
                     else:
                         grad_probs = expert_grads[1]
                         if grad_probs is None:
                             grad_probs = torch.zeros_like(chunk.probs)
-                        param_grads = expert_grads[2:]
                     chunk.dispatched = None
                     chunk.probs = None
                     chunk.expert_out = None
                     chunk.expert_out_edge = None
                     local_state.pop("grad_expert_out", None)
-                    local_state["param_grads"] = param_grads
                     grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
                         chunk, grad_dispatched, grad_probs
                     )
@@ -580,12 +572,9 @@ class EPChunkOverlapOperator:
 
         for chunk, local_state in pending_dispatch_bwd:
             with torch.cuda.stream(compute_stream):
-                delayed_grads = self.experts.pop_delayed_weight_grads()
-                param_grads = tuple(
-                    delayed_grads.get(param, grad)
-                    for param, grad in zip(
-                        expert_params, local_state.pop("param_grads"), strict=True
-                    )
+                param_grads = _require_delayed_weight_grads(
+                    expert_params,
+                    self.experts.pop_delayed_weight_grads(),
                 )
                 _accumulate(expert_accum, expert_params, param_grads)
 
@@ -725,6 +714,24 @@ def _dispatch_local_backward(
             0, flat, grad_probs.reshape(-1).to(grad_recv_probs.dtype)
         )
     return grad_recv_hidden, grad_recv_probs
+
+
+def _expert_grad_inputs(
+    dispatched: torch.Tensor, probs: torch.Tensor | None
+) -> tuple[torch.Tensor, ...]:
+    return (dispatched,) if probs is None else (dispatched, probs)
+
+
+def _require_delayed_weight_grads(
+    params: tuple[torch.Tensor, ...],
+    delayed_grads: dict[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, ...]:
+    missing = sum(param not in delayed_grads for param in params)
+    if missing:
+        raise RuntimeError(
+            f"Expert delayed wgrad store is missing {missing} parameter gradient(s)."
+        )
+    return tuple(delayed_grads[param] for param in params)
 
 
 def _accumulate(
