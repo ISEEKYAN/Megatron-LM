@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import contextmanager
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any
@@ -56,6 +57,41 @@ except ImportError:
 
 
 _LR_SCHEDULER_STATE = "lr_scheduler.pt"
+_NSYS_PROFILE_STEP = 0
+
+
+@contextmanager
+def _nsys_profile_step():
+    """Expose a bounded, rank-zero-triggered SFT step range to Nsight Systems."""
+    global _NSYS_PROFILE_STEP
+    step = _NSYS_PROFILE_STEP
+    _NSYS_PROFILE_STEP += 1
+    enabled = (
+        os.environ.get("MEGATRON_LITE_NSYS_PROFILE") == "1"
+        and torch.cuda.is_available()
+    )
+    if not enabled:
+        yield
+        return
+
+    start = int(os.environ.get("MEGATRON_LITE_NSYS_START_STEP", "2"))
+    end = int(os.environ.get("MEGATRON_LITE_NSYS_END_STEP", "4"))
+    profile_rank = int(os.environ.get("MEGATRON_LITE_NSYS_PROFILE_RANK", "0"))
+    rank = int(os.environ.get("RANK", "0"))
+    if end < start:
+        raise ValueError(
+            "MEGATRON_LITE_NSYS_END_STEP must be greater than or equal to "
+            "MEGATRON_LITE_NSYS_START_STEP."
+        )
+    if rank == profile_rank and step == start:
+        torch.cuda.profiler.start()
+    torch.cuda.nvtx.range_push(f"mlite.sft_step.{step}")
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+        if rank == profile_rank and step == end:
+            torch.cuda.profiler.stop()
 
 
 def _isolate_compile_cache_per_rank() -> None:
@@ -315,6 +351,10 @@ class MegatronLiteEngine(BaseEngine):
     def train_mode(self, **kwargs):
         self._require_initialized()
         return _MegatronLiteModeCtx(self, mode="train", **kwargs)
+
+    def train_batch(self, data: TensorDict, loss_function):
+        with _nsys_profile_step():
+            return super().train_batch(data, loss_function)
 
     def eval_mode(self, **kwargs):
         self._require_initialized()

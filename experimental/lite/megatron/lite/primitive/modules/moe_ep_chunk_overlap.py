@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -30,6 +31,22 @@ def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
 
 _EP_CHUNK_COMM_STREAMS: dict[int, torch.cuda.Stream] = {}
 _EP_CHUNK_WGRAD_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+@contextmanager
+def _ep_chunk_nvtx(phase: str, chunk_idx: int | None = None):
+    if (
+        os.environ.get("MEGATRON_LITE_EP_CHUNK_NVTX") != "1"
+        or not torch.cuda.is_available()
+    ):
+        yield
+        return
+    suffix = "" if chunk_idx is None else f".chunk{chunk_idx}"
+    torch.cuda.nvtx.range_push(f"chunked_ep.{phase}{suffix}")
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 def _cuda_device_index(device: torch.device | int | str) -> int:
@@ -288,13 +305,15 @@ class EPChunkOverlapOperator:
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(input_ready)
                 scores, indices = self._route(x_chunk, start, end)
-                state = dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
+                with _ep_chunk_nvtx("forward.dispatch", chunk_idx):
+                    state = dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
             return chunk_idx, dispatcher, state
 
         def finish_dispatch_expert_submit_combine(pending):
             chunk_idx, dispatcher, state = pending
             with torch.cuda.stream(compute_stream):
-                dispatched, tpe, probs = dispatcher.finish_deepep_dispatch(state)
+                with _ep_chunk_nvtx("forward.dispatch.finish", chunk_idx):
+                    dispatched, tpe, probs = dispatcher.finish_deepep_dispatch(state)
                 recv_hidden = state.get("recv_hidden")
                 _record_ep_chunk_shape(
                     chunk_idx=chunk_idx,
@@ -317,22 +336,24 @@ class EPChunkOverlapOperator:
                     else nullcontext()
                 )
                 with expert_ctx:
-                    expert_out = self.experts(
-                        dispatched,
-                        tpe,
-                        probs,
-                        tokens_per_expert_list=getattr(
-                            dispatcher, "_local_tpe_list", None
-                        ),
-                    )
+                    with _ep_chunk_nvtx("forward.expert", chunk_idx):
+                        expert_out = self.experts(
+                            dispatched,
+                            tpe,
+                            probs,
+                            tokens_per_expert_list=getattr(
+                                dispatcher, "_local_tpe_list", None
+                            ),
+                        )
                 rank_grouped, handle = dispatcher.prepare_deepep_combine(expert_out)
                 ready = torch.cuda.Event()
                 ready.record(compute_stream)
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(ready)
-                combine_state = dispatcher.submit_deepep_combine_prepared(
-                    rank_grouped, handle
-                )
+                with _ep_chunk_nvtx("forward.combine", chunk_idx):
+                    combine_state = dispatcher.submit_deepep_combine_prepared(
+                        rank_grouped, handle
+                    )
             del dispatched, probs, expert_out
             return dispatcher, combine_state
 
@@ -352,8 +373,9 @@ class EPChunkOverlapOperator:
         caller_stream.wait_event(done)
         output_2d = x_2d.new_empty(x_2d.shape)
         offset = 0
-        for dispatcher, state in pending_combines:
-            chunk_out = dispatcher.finish_deepep_combine(state)
+        for chunk_idx, (dispatcher, state) in enumerate(pending_combines):
+            with _ep_chunk_nvtx("forward.combine.finish", chunk_idx):
+                chunk_out = dispatcher.finish_deepep_combine(state)
             next_offset = offset + chunk_out.size(0)
             output_2d[offset:next_offset].copy_(chunk_out)
             offset = next_offset
@@ -441,19 +463,20 @@ class EPChunkOverlapOperator:
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(router_ready)
                 chain_deepep_event()
-                state = remember_deepep_event(
-                    dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
-                )
+                with _ep_chunk_nvtx("backward.dispatch", chunk_idx):
+                    state = remember_deepep_event(
+                        dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
+                    )
             return chunk_idx, start, end, x_chunk, scores, state
 
         def submit_combine_bwd(chunk_idx: int, start: int, end: int, handle: Any):
-            del chunk_idx
             with torch.cuda.stream(comm_stream):
                 grad_chunk = grad_2d[start:end].contiguous()
                 chain_deepep_event()
-                return remember_deepep_event(
-                    dispatcher.submit_deepep_combine_backward(grad_chunk, handle)
-                )
+                with _ep_chunk_nvtx("backward.combine", chunk_idx):
+                    return remember_deepep_event(
+                        dispatcher.submit_deepep_combine_backward(grad_chunk, handle)
+                    )
 
         def finish_recompute_expert(chunk_idx: int, state: dict[str, Any]):
             with torch.cuda.stream(compute_stream):
@@ -471,12 +494,13 @@ class EPChunkOverlapOperator:
                     expert_probs = (
                         None if probs is None else probs.detach().requires_grad_(True)
                     )
-                    expert_out = self.experts(
-                        expert_input,
-                        local_tpe,
-                        expert_probs,
-                        tokens_per_expert_list=metadata["local_tpe_list"],
-                    )
+                    with _ep_chunk_nvtx("backward.expert", chunk_idx):
+                        expert_out = self.experts(
+                            expert_input,
+                            local_tpe,
+                            expert_probs,
+                            tokens_per_expert_list=metadata["local_tpe_list"],
+                        )
                 _record_ep_chunk_shape(
                     chunk_idx=chunk_idx,
                     phase="backward",
@@ -614,13 +638,14 @@ class EPChunkOverlapOperator:
                 with torch.cuda.stream(comm_stream):
                     comm_stream.wait_event(local_bwd_ready)
                     chain_deepep_event()
-                    local_state["dispatch_bwd_state"] = remember_deepep_event(
-                        dispatcher.submit_deepep_dispatch_backward(
-                            local_state["grad_recv_hidden"],
-                            local_state["grad_recv_probs"],
-                            chunk.handle,
+                    with _ep_chunk_nvtx("backward.dispatch", chunk.idx):
+                        local_state["dispatch_bwd_state"] = remember_deepep_event(
+                            dispatcher.submit_deepep_dispatch_backward(
+                                local_state["grad_recv_hidden"],
+                                local_state["grad_recv_probs"],
+                                chunk.handle,
+                            )
                         )
-                    )
                     _release_dispatch_scratch(chunk, comm_stream)
                     local_state.pop("grad_recv_hidden", None)
                     local_state.pop("grad_recv_probs", None)
@@ -631,9 +656,10 @@ class EPChunkOverlapOperator:
         wgrad_ready.record(compute_stream)
         with torch.cuda.stream(wgrad_stream):
             wgrad_stream.wait_event(wgrad_ready)
-            self.experts.flush_delayed_weight_grads(
-                num_contexts=len(pending_dispatch_bwd)
-            )
+            with _ep_chunk_nvtx("backward.wgrad"):
+                self.experts.flush_delayed_weight_grads(
+                    num_contexts=len(pending_dispatch_bwd)
+                )
             wgrad_done = torch.cuda.Event()
             wgrad_done.record(wgrad_stream)
         _queue_backward_stream_wait(wgrad_done, grad_2d.device)

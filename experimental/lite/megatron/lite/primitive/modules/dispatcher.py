@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from typing import Hashable
 
 import torch  # pyright: ignore[reportMissingImports]
@@ -21,6 +22,21 @@ except ImportError:
     deep_ep = None  # type: ignore
     EventHandle = None  # type: ignore
     EventOverlap = None  # type: ignore
+
+
+@contextmanager
+def _deepep_nvtx(phase: str):
+    if (
+        os.environ.get("MEGATRON_LITE_EP_CHUNK_NVTX") != "1"
+        or not torch.cuda.is_available()
+    ):
+        yield
+        return
+    torch.cuda.nvtx.range_push(f"deepep.{phase}")
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 def _hidden_bytes(hidden_size: int) -> int:
@@ -173,14 +189,15 @@ class _DeepEPDispatch(torch.autograd.Function):
             else None
         )
         grad_scores = None if grad_recv_probs is None else grad_recv_probs.float()
-        grad_hidden, grad_topk_scores, after_event = ctx.buffer.combine(
-            grad_recv_hidden.contiguous(),
-            ctx.handle,
-            topk_weights=grad_scores,
-            previous_event=previous_event,
-            async_finish=ctx.async_finish,
-            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
-        )
+        with _deepep_nvtx("dispatch.backward_combine"):
+            grad_hidden, grad_topk_scores, after_event = ctx.buffer.combine(
+                grad_recv_hidden.contiguous(),
+                ctx.handle,
+                topk_weights=grad_scores,
+                previous_event=previous_event,
+                async_finish=ctx.async_finish,
+                allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+            )
         if ctx.async_finish:
             after_event.current_stream_wait()
         return None, grad_hidden, None, grad_topk_scores, None, None, None
@@ -223,13 +240,14 @@ class _DeepEPCombine(torch.autograd.Function):
             if ctx.async_finish and EventHandle is not None and EventOverlap is not None
             else None
         )
-        grad_rank_grouped, _, _, _, _, after_event = ctx.buffer.dispatch(
-            grad_output.contiguous(),
-            handle=ctx.handle,
-            previous_event=previous_event,
-            async_finish=ctx.async_finish,
-            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
-        )
+        with _deepep_nvtx("combine.backward_dispatch"):
+            grad_rank_grouped, _, _, _, _, after_event = ctx.buffer.dispatch(
+                grad_output.contiguous(),
+                handle=ctx.handle,
+                previous_event=previous_event,
+                async_finish=ctx.async_finish,
+                allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+            )
         if ctx.async_finish:
             after_event.current_stream_wait()
         return None, grad_rank_grouped, None, None, None
@@ -259,13 +277,14 @@ class _DeepEPCombineBackwardOnly(torch.autograd.Function):
             if ctx.async_finish and EventHandle is not None and EventOverlap is not None
             else None
         )
-        grad_rank_grouped, _, _, _, _, after_event = ctx.buffer.dispatch(
-            grad_output.contiguous(),
-            handle=ctx.handle,
-            previous_event=previous_event,
-            async_finish=ctx.async_finish,
-            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
-        )
+        with _deepep_nvtx("combine.backward_dispatch"):
+            grad_rank_grouped, _, _, _, _, after_event = ctx.buffer.dispatch(
+                grad_output.contiguous(),
+                handle=ctx.handle,
+                previous_event=previous_event,
+                async_finish=ctx.async_finish,
+                allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+            )
         if ctx.async_finish:
             after_event.current_stream_wait()
         return None, grad_rank_grouped, None, None, None, None
@@ -889,23 +908,27 @@ class TokenDispatcher:
 
     def _dispatch_deepep(self, hidden_states, topk_scores, topk_indices):
         if torch.is_grad_enabled():
-            recv_hidden, recv_indices, recv_probs, recv_per_expert, handle = _DeepEPDispatch.apply(
-                self.buffer,
-                hidden_states,
-                topk_indices,
-                topk_scores.float(),
-                self.num_experts,
-                False,
-                False,
-            )
+            with _deepep_nvtx("dispatch.forward"):
+                recv_hidden, recv_indices, recv_probs, recv_per_expert, handle = (
+                    _DeepEPDispatch.apply(
+                        self.buffer,
+                        hidden_states,
+                        topk_indices,
+                        topk_scores.float(),
+                        self.num_experts,
+                        False,
+                        False,
+                    )
+                )
             self._handle = handle
             self._deepep_event = None
             return self._finish_deepep_dispatch(
                 recv_hidden, recv_indices, recv_probs, recv_per_expert
             )
-        state = self.submit_deepep_dispatch(
-            hidden_states, topk_scores, topk_indices, allocate_on_comm_stream=False
-        )
+        with _deepep_nvtx("dispatch.forward"):
+            state = self.submit_deepep_dispatch(
+                hidden_states, topk_scores, topk_indices, allocate_on_comm_stream=False
+            )
         return self.finish_deepep_dispatch(state)
 
     def wait_dispatch_event(self):
@@ -921,9 +944,13 @@ class TokenDispatcher:
             fused=self.moe_permute_fusion,
         )
         if torch.is_grad_enabled():
-            combined = _DeepEPCombine.apply(self.buffer, rank_grouped, self._handle, False, False)
+            with _deepep_nvtx("combine.forward"):
+                combined = _DeepEPCombine.apply(
+                    self.buffer, rank_grouped, self._handle, False, False
+                )
         else:
-            combined = self.buffer.combine(rank_grouped, self._handle)
+            with _deepep_nvtx("combine.forward"):
+                combined = self.buffer.combine(rank_grouped, self._handle)
         if isinstance(combined, tuple):
             combined = combined[0]
         self.clear_deepep_combine_state()

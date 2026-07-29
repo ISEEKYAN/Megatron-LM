@@ -10,6 +10,29 @@ from types import SimpleNamespace
 import torch
 
 
+def test_chunk_overlap_source_has_nsys_phase_ranges():
+    source_path = (
+        Path(__file__).parents[3]
+        / "megatron"
+        / "lite"
+        / "primitive"
+        / "modules"
+        / "moe_ep_chunk_overlap.py"
+    )
+    source = source_path.read_text()
+
+    for phase in (
+        "forward.dispatch",
+        "forward.expert",
+        "forward.combine",
+        "backward.dispatch",
+        "backward.expert",
+        "backward.combine",
+        "backward.wgrad",
+    ):
+        assert phase in source
+
+
 def test_experts_accept_te_dbias_placeholders_when_bias_is_disabled(
     monkeypatch, transformer_engine_import_stub
 ):
