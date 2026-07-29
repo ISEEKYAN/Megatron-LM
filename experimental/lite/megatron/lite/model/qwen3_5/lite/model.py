@@ -42,6 +42,7 @@ from megatron.lite.primitive.parallel import (
     gather_from_sequence_parallel,
     scatter_to_sequence_parallel,
 )
+from megatron.lite.primitive.recompute import discard_and_recompute_output_storage
 from megatron.lite.primitive.utils import build_fp8_recipe
 
 _SP_GRAD_SUFFIXES: tuple[str, ...] = (
@@ -324,6 +325,7 @@ class Qwen35Layer(nn.Module):
             moe_permute_fusion=True,
             num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
         )
+        self.reuse_moe_input_storage = num_chunks_ep_a2a_overlap > 1
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
@@ -336,7 +338,13 @@ class Qwen35Layer(nn.Module):
             h = self.linear_attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
         x = residual + h
         residual = x
-        x = residual + self.moe(self.mlp_norm(x))
+        mlp_input = self.mlp_norm(x)
+        moe_out = self.moe(mlp_input)
+        if self.reuse_moe_input_storage:
+            discard_and_recompute_output_storage(
+                mlp_input, moe_out, self.mlp_norm, x
+            )
+        x = residual + moe_out
         return x
 
 

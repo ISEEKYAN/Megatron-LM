@@ -62,6 +62,7 @@ from megatron.lite.primitive.parallel.mhc import (
     unfold_mhc_hidden_from_pipeline,
 )
 from megatron.lite.primitive.parallel.thd import _roll_packed_thd_left_local
+from megatron.lite.primitive.recompute import discard_and_recompute_output_storage
 from megatron.lite.primitive.utils import build_fp8_recipe
 
 
@@ -164,6 +165,7 @@ class DeepseekV4Layer(nn.Module):
             use_deepep=use_deepep,
             num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
         )
+        self.reuse_moe_input_storage = num_chunks_ep_a2a_overlap > 1
         # DS4 ONLY: per-layer multi-head hyper-connections wrapping attn + ffn.
         self.attn_hc = HyperConnection(
             config.hidden_size, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps
@@ -199,7 +201,12 @@ class DeepseekV4Layer(nn.Module):
         # input flattens in (S, B) order; transpose input_ids [B, S] -> [S, B]
         # so its flatten matches.  (No-op semantics for non-hash layers.)
         mlp_input_ids = None if input_ids is None else input_ids.transpose(0, 1).contiguous()
-        ffn_out = self.mlp(self.post_attention_layernorm(ffn_in), input_ids=mlp_input_ids)
+        mlp_input = self.post_attention_layernorm(ffn_in)
+        ffn_out = self.mlp(mlp_input, input_ids=mlp_input_ids)
+        if self.reuse_moe_input_storage:
+            discard_and_recompute_output_storage(
+                mlp_input, ffn_out, self.post_attention_layernorm, ffn_in
+            )
         return HyperConnection.post(ffn_out, residual, post, comb)
 
 
