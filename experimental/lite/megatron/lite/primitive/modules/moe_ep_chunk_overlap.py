@@ -367,7 +367,6 @@ class EPChunkOverlapOperator:
         dispatcher = self.dispatcher
         grad_x_chunks: list[torch.Tensor | None] = [None for _ in ranges]
         router_accum: list[torch.Tensor | None] = [None for _ in router_params]
-        expert_accum: list[torch.Tensor | None] = [None for _ in expert_params]
         pending_dispatch_bwd: list[tuple[_BackwardChunk, dict[str, Any]]] = []
         last_deepep_event: Any | None = None
 
@@ -570,13 +569,10 @@ class EPChunkOverlapOperator:
 
                 pending_dispatch_bwd.append((chunk, local_state))
 
-        for chunk, local_state in pending_dispatch_bwd:
-            with torch.cuda.stream(compute_stream):
-                param_grads = _require_delayed_weight_grads(
-                    expert_params,
-                    self.experts.pop_delayed_weight_grads(),
-                )
-                _accumulate(expert_accum, expert_params, param_grads)
+        with torch.cuda.stream(compute_stream):
+            self.experts.flush_delayed_weight_grads(
+                num_contexts=len(pending_dispatch_bwd)
+            )
 
         for chunk, local_state in pending_dispatch_bwd:
             with torch.cuda.stream(compute_stream):
@@ -622,9 +618,8 @@ class EPChunkOverlapOperator:
             ],
             dim=0,
         ).view_as(grad_2d)
-        expert_grads = _materialize(expert_params, expert_accum)
         router_grads_out = _materialize(router_params, router_accum)
-        return grad_x, router_grads_out, expert_grads
+        return grad_x, router_grads_out, [None for _ in expert_params]
 
 
 class _FullRecomputeFused(torch.autograd.Function):
@@ -720,18 +715,6 @@ def _expert_grad_inputs(
     dispatched: torch.Tensor, probs: torch.Tensor | None
 ) -> tuple[torch.Tensor, ...]:
     return (dispatched,) if probs is None else (dispatched, probs)
-
-
-def _require_delayed_weight_grads(
-    params: tuple[torch.Tensor, ...],
-    delayed_grads: dict[torch.Tensor, torch.Tensor],
-) -> tuple[torch.Tensor, ...]:
-    missing = sum(param not in delayed_grads for param in params)
-    if missing:
-        raise RuntimeError(
-            f"Expert delayed wgrad store is missing {missing} parameter gradient(s)."
-        )
-    return tuple(delayed_grads[param] for param in params)
 
 
 def _accumulate(

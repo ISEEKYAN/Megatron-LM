@@ -94,6 +94,7 @@ class Experts(nn.Module):
             bias=False,
             params_dtype=torch.bfloat16,
             delay_wgrad_compute=delay_wgrad_compute,
+            fuse_wgrad_accumulation=delay_wgrad_compute,
         )
         self.fc2 = te.GroupedLinear(
             self.num_local_experts,
@@ -102,6 +103,7 @@ class Experts(nn.Module):
             bias=False,
             params_dtype=torch.bfloat16,
             delay_wgrad_compute=delay_wgrad_compute,
+            fuse_wgrad_accumulation=delay_wgrad_compute,
         )
         lora = normalize_lora_config(lora_config)
         self.fc1_lora: SharedGroupedLinearLoRA | None = None
@@ -137,22 +139,28 @@ class Experts(nn.Module):
 
                     param.register_hook(_ar)
 
-    def pop_delayed_weight_grads(self) -> dict[torch.Tensor, torch.Tensor]:
-        """Execute one queued TE wgrad per grouped linear without touching ``.grad``."""
-        grads: dict[torch.Tensor, torch.Tensor] = {}
+    def flush_delayed_weight_grads(self, *, num_contexts: int) -> None:
+        """Execute queued TE wgrads directly into the reusable DistOpt buffers."""
         for linear in (self.fc1, self.fc2):
             store = linear.wgrad_store
             if not store.delay_wgrad_compute():
                 raise RuntimeError("Expert delayed weight gradients are not enabled.")
-            if store.context is None or store.context.empty():
-                raise RuntimeError("Expert delayed weight-gradient queue is empty.")
-            (_, _grad_biases, _), tensors = store.pop()
             if linear.use_bias:
                 raise RuntimeError("Chunked EP expert grouped linears must not use bias.")
-            weight_grads = tensors[2]
-            for idx, grad in enumerate(weight_grads):
-                grads[getattr(linear, f"weight{idx}")] = grad
-        return grads
+            for _ in range(num_contexts):
+                if store.context is None or store.context.empty():
+                    raise RuntimeError("Expert delayed weight-gradient queue is empty.")
+                (_, _grad_biases, _), tensors = store.pop()
+                weight_grads = tensors[2]
+                for idx, grad in enumerate(weight_grads):
+                    param = getattr(linear, f"weight{idx}")
+                    main_grad = getattr(param, "main_grad", None)
+                    if main_grad is None or grad.data_ptr() != main_grad.data_ptr():
+                        raise RuntimeError(
+                            "Expert delayed wgrad did not reuse its DistOpt main_grad buffer."
+                        )
+            if store.context is not None and not store.context.empty():
+                raise RuntimeError("Expert delayed weight-gradient queue was not drained.")
 
     def forward(
         self,

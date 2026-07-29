@@ -7,7 +7,6 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 
@@ -18,26 +17,33 @@ def test_experts_accept_te_dbias_placeholders_when_bias_is_disabled(
     from megatron.lite.primitive.modules import experts as experts_module
 
     class FakeStore:
-        context = SimpleNamespace(empty=lambda: False)
+        def __init__(self, linear):
+            self.linear = linear
+            self.pending = 1
+            self.context = SimpleNamespace(empty=lambda: self.pending == 0)
 
         @staticmethod
         def delay_wgrad_compute():
             return True
 
-        @staticmethod
-        def pop():
-            grads = [torch.ones(2, 2), torch.ones(2, 2)]
+        def pop(self):
+            self.pending -= 1
+            grads = [
+                getattr(self.linear, f"weight{idx}").main_grad
+                for idx in range(self.linear.num_gemms)
+            ]
             return (None, [torch.empty(0), torch.empty(0)], None), [None, None, grads]
 
     class FakeGroupedLinear(torch.nn.Module):
         def __init__(self, num_gemms, *_args, bias, **_kwargs):
             super().__init__()
+            self.num_gemms = num_gemms
             self.use_bias = bias
-            self.wgrad_store = FakeStore()
             for idx in range(num_gemms):
-                self.register_parameter(
-                    f"weight{idx}", torch.nn.Parameter(torch.zeros(2, 2))
-                )
+                param = torch.nn.Parameter(torch.zeros(2, 2))
+                param.main_grad = torch.ones(2, 2)
+                self.register_parameter(f"weight{idx}", param)
+            self.wgrad_store = FakeStore(self)
 
     monkeypatch.setattr(
         experts_module.te, "GroupedLinear", FakeGroupedLinear, raising=False
@@ -51,10 +57,56 @@ def test_experts_accept_te_dbias_placeholders_when_bias_is_disabled(
     ps = SimpleNamespace(ep_size=1, etp_size=1, tp_size=1, etp_group=None)
     experts = experts_module.Experts(config, ps, delay_wgrad_compute=True)
 
-    grads = experts.pop_delayed_weight_grads()
+    experts.flush_delayed_weight_grads(num_contexts=1)
 
-    assert len(grads) == 4
     assert all(parameter.grad is None for parameter in experts.parameters())
+
+
+def test_delayed_expert_wgrads_reuse_distopt_main_grad(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    grouped_linear_kwargs = []
+
+    class FakeStore:
+        context = SimpleNamespace(empty=lambda: False)
+
+        @staticmethod
+        def delay_wgrad_compute():
+            return True
+
+        @staticmethod
+        def pop():
+            return (None, [None, None], None), [None, None, []]
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self, num_gemms, *_args, bias, **kwargs):
+            super().__init__()
+            grouped_linear_kwargs.append(kwargs)
+            self.use_bias = bias
+            self.wgrad_store = FakeStore()
+            for idx in range(num_gemms):
+                param = torch.nn.Parameter(torch.zeros(2, 2))
+                param.main_grad = torch.zeros_like(param)
+                self.register_parameter(f"weight{idx}", param)
+
+    monkeypatch.setattr(
+        experts_module.te, "GroupedLinear", FakeGroupedLinear, raising=False
+    )
+    config = SimpleNamespace(
+        num_experts=2,
+        hidden_size=2,
+        moe_intermediate_size=2,
+        swiglu_limit=0.0,
+    )
+    ps = SimpleNamespace(ep_size=1, etp_size=1, tp_size=1, etp_group=None)
+    experts_module.Experts(config, ps, delay_wgrad_compute=True)
+
+    assert all(
+        kwargs["fuse_wgrad_accumulation"] for kwargs in grouped_linear_kwargs
+    )
 
 
 def test_dispatch_local_backward_accumulates_duplicate_token_rows_and_weights(
@@ -138,7 +190,6 @@ def test_delayed_wgrad_excludes_expert_params_from_autograd_targets(
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
         _expert_grad_inputs,
-        _require_delayed_weight_grads,
     )
 
     dispatched = torch.ones(2, 2, requires_grad=True)
@@ -148,13 +199,6 @@ def test_delayed_wgrad_excludes_expert_params_from_autograd_targets(
 
     assert inputs == (dispatched, probs)
     assert all(all(param is not item for item in inputs) for param in params)
-
-    delayed = {param: torch.ones_like(param) for param in params}
-    grads = _require_delayed_weight_grads(params, delayed)
-    assert grads == tuple(delayed[param] for param in params)
-
-    with pytest.raises(RuntimeError, match="missing 1 parameter gradient"):
-        _require_delayed_weight_grads(params, {params[0]: delayed[params[0]]})
 
 
 def test_forward_trace_pipelines_next_dispatch_before_current_expert(
