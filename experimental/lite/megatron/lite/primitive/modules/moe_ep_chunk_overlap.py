@@ -164,7 +164,7 @@ class EPChunkOverlapOperator:
         x_2d = x.view(-1, x.size(-1)) if x.dim() == 3 else x
         chunks = 2
         if torch.is_grad_enabled():
-            params = tuple(self.router.parameters()) + tuple(self.experts.parameters())
+            params = tuple(self.router.parameters())
             return _FullRecomputeFused.apply(
                 x_2d, routing_input, self, input_shape, x.dtype, chunks, chunks, *params
             )
@@ -322,13 +322,12 @@ class EPChunkOverlapOperator:
             ),
         )
         router_params = tuple(self.router.parameters())
-        expert_params = tuple(self.experts.parameters())
         if len(ranges) == 1:
             return self._full_recompute_skip_combine_backward(
-                x_saved, grad_2d, router_params, expert_params
+                x_saved, grad_2d, router_params
             )
         return self._full_recompute_fused_backward_v6(
-            x_saved, grad_2d, ranges, router_params, expert_params
+            x_saved, grad_2d, ranges, router_params
         )
 
     def _full_recompute_skip_combine_backward(
@@ -336,7 +335,6 @@ class EPChunkOverlapOperator:
         x_2d: torch.Tensor,
         grad_2d: torch.Tensor,
         router_params: tuple[torch.Tensor, ...],
-        expert_params: tuple[torch.Tensor, ...],
     ):
         x_recompute = x_2d.detach().requires_grad_(True)
         output = self._forward_full_skip_combine_autograd(x_recompute)
@@ -344,7 +342,7 @@ class EPChunkOverlapOperator:
         grad_x = x_recompute.grad
         if grad_x is None:
             grad_x = torch.zeros_like(x_recompute)
-        return (grad_x, [None for _ in router_params], [None for _ in expert_params])
+        return grad_x, [None for _ in router_params]
 
     def _full_recompute_fused_backward_v6(
         self,
@@ -352,13 +350,11 @@ class EPChunkOverlapOperator:
         grad_2d: torch.Tensor,
         ranges: list[tuple[int, int]],
         router_params: tuple[torch.Tensor, ...],
-        expert_params: tuple[torch.Tensor, ...],
     ):
         if not ranges:
             return (
                 grad_2d.new_zeros(grad_2d.shape),
                 [torch.zeros_like(param) for param in router_params],
-                [torch.zeros_like(param) for param in expert_params],
             )
 
         compute_stream, comm_stream = self._streams(grad_2d.device)
@@ -620,7 +616,7 @@ class EPChunkOverlapOperator:
             dim=0,
         ).view_as(grad_2d)
         router_grads_out = _materialize(router_params, router_accum)
-        return grad_x, router_grads_out, [None for _ in expert_params]
+        return grad_x, router_grads_out
 
 
 class _FullRecomputeFused(torch.autograd.Function):
@@ -660,7 +656,7 @@ class _FullRecomputeFused(torch.autograd.Function):
         grad_2d = grad_output.contiguous().view(-1, grad_output.size(-1))
         routing_input = routing_saved if ctx.has_routing_input else None
         with operator._routing_context(routing_input), torch.enable_grad():
-            grad_x, router_grads, expert_grads = operator._full_recompute_fused_backward(
+            grad_x, router_grads = operator._full_recompute_fused_backward(
                 x_saved, grad_2d, ctx.bwd_chunks
             )
         return (
@@ -672,7 +668,6 @@ class _FullRecomputeFused(torch.autograd.Function):
             None,
             None,
             *router_grads,
-            *expert_grads,
         )
 
 
