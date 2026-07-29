@@ -15,6 +15,7 @@ from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     ep_chunk_ranges,
 )
+from megatron.lite.primitive.utils.cuda_allocator import record_workspace_shape
 
 
 def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
@@ -68,6 +69,24 @@ def _queue_backward_stream_wait(event: torch.cuda.Event, device: torch.device) -
             torch.cuda.current_stream(device).wait_event(event)
 
     torch.autograd.Variable._execution_engine.queue_callback(wait_for_wgrad)
+
+
+def _record_ep_chunk_shape(
+    *,
+    chunk_idx: int,
+    phase: str,
+    recv_rows: int,
+    expert_rows: int,
+    device: torch.device,
+) -> None:
+    record_workspace_shape(
+        device_index=(
+            _cuda_device_index(device) if torch.device(device).type == "cuda" else -1
+        ),
+        scope=f"ep_chunk_{phase}",
+        slot=chunk_idx,
+        dimensions={"recv_rows": recv_rows, "expert_rows": expert_rows},
+    )
 
 
 def _event_current_stream_wait(event: Any) -> None:
@@ -274,9 +293,20 @@ class EPChunkOverlapOperator:
 
         def finish_dispatch_expert_submit_combine(pending):
             chunk_idx, dispatcher, state = pending
-            del chunk_idx
             with torch.cuda.stream(compute_stream):
                 dispatched, tpe, probs = dispatcher.finish_deepep_dispatch(state)
+                recv_hidden = state.get("recv_hidden")
+                _record_ep_chunk_shape(
+                    chunk_idx=chunk_idx,
+                    phase="forward",
+                    recv_rows=(
+                        dispatched.size(0)
+                        if recv_hidden is None
+                        else recv_hidden.size(0)
+                    ),
+                    expert_rows=dispatched.size(0),
+                    device=dispatched.device,
+                )
                 state.pop("recv_hidden", None)
                 state.pop("recv_indices", None)
                 state.pop("recv_probs", None)
@@ -426,7 +456,6 @@ class EPChunkOverlapOperator:
                 )
 
         def finish_recompute_expert(chunk_idx: int, state: dict[str, Any]):
-            del chunk_idx
             with torch.cuda.stream(compute_stream):
                 state["recv_hidden"] = (
                     state["recv_hidden"].detach().requires_grad_(True)
@@ -448,6 +477,13 @@ class EPChunkOverlapOperator:
                         expert_probs,
                         tokens_per_expert_list=metadata["local_tpe_list"],
                     )
+                _record_ep_chunk_shape(
+                    chunk_idx=chunk_idx,
+                    phase="backward",
+                    recv_rows=state["recv_hidden"].size(0),
+                    expert_rows=dispatched.size(0),
+                    device=dispatched.device,
+                )
             return (
                 dispatched,
                 local_tpe,

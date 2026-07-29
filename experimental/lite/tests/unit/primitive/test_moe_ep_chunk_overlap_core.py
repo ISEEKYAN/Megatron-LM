@@ -373,3 +373,68 @@ def test_core_contains_token_wise_forward_and_backward_deepep_pipeline():
         "submit_deepep_dispatch_backward",
         "finish_deepep_dispatch_backward",
     } <= calls
+
+
+def test_workspace_shape_metrics_report_and_reset_jitter(monkeypatch):
+    from megatron.lite.primitive.utils.cuda_allocator import (
+        pop_workspace_shape_metrics,
+        record_workspace_shape,
+    )
+
+    monkeypatch.setenv("MEGATRON_LITE_CUDA_WORKSPACE_SHAPE_METRICS", "1")
+    record_workspace_shape(
+        device_index=0,
+        scope="ep_chunk_forward",
+        slot=0,
+        dimensions={"expert_rows": 100},
+    )
+    record_workspace_shape(
+        device_index=0,
+        scope="ep_chunk_forward",
+        slot=0,
+        dimensions={"expert_rows": 140},
+    )
+
+    metrics = pop_workspace_shape_metrics()
+
+    prefix = "perf/workspace_ep_chunk_forward_0"
+    assert metrics[f"{prefix}_calls"] == 2
+    assert metrics[f"{prefix}_expert_rows_min"] == 100
+    assert metrics[f"{prefix}_expert_rows_max"] == 140
+    assert metrics[f"{prefix}_expert_rows_span"] == 40
+    assert metrics[f"{prefix}_expert_rows_unique"] == 2
+    assert pop_workspace_shape_metrics() == {}
+
+
+def test_cuda_allocator_metrics_expose_fragmentation(monkeypatch):
+    from megatron.lite.primitive.utils.cuda_allocator import (
+        cuda_allocator_metrics,
+    )
+
+    stats = {
+        "active_bytes.all.current": 3 * 1024**3,
+        "inactive_split_bytes.all.current": 2 * 1024**3,
+        "inactive_split_bytes.all.peak": 5 * 1024**3,
+        "segment.all.current": 7,
+        "active.all.current": 11,
+        "inactive_split.all.current": 13,
+        "num_alloc_retries": 17,
+        "num_ooms": 19,
+    }
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 4 * 1024**3)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 10 * 1024**3)
+    monkeypatch.setattr(torch.cuda, "memory_stats", lambda: stats)
+
+    metrics = cuda_allocator_metrics()
+
+    assert metrics["perf/cuda_memory_allocated_gb"] == 4
+    assert metrics["perf/cuda_memory_reserved_gb"] == 10
+    assert metrics["perf/cuda_reserved_minus_allocated_gb"] == 6
+    assert metrics["perf/cuda_inactive_split_bytes_gb"] == 2
+    assert metrics["perf/cuda_inactive_split_peak_gb"] == 5
+    assert metrics["perf/cuda_segment_count"] == 7
+    assert metrics["perf/cuda_active_block_count"] == 11
+    assert metrics["perf/cuda_inactive_split_block_count"] == 13
+    assert metrics["perf/cuda_num_alloc_retries"] == 17
+    assert metrics["perf/cuda_num_ooms"] == 19

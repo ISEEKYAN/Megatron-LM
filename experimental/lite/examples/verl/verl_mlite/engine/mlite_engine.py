@@ -14,6 +14,10 @@ import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
+from megatron.lite.primitive.utils.cuda_allocator import (
+    cuda_allocator_metrics,
+    pop_workspace_shape_metrics,
+)
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts import LossContext, PackedBatch
@@ -774,6 +778,8 @@ class MegatronLiteEngine(BaseEngine):
         if reduced_outputs is not None:
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
         metrics = dict(result.metrics)
+        metrics.update(cuda_allocator_metrics())
+        metrics.update(pop_workspace_shape_metrics())
         loss = result.model_output.loss
         losses = [] if loss is None else torch.as_tensor(loss).detach().flatten().cpu().tolist()
         return {
