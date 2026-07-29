@@ -34,7 +34,6 @@ from megatron.lite.primitive.parallel import (
     roll_packed_thd_left,
     scatter_to_sequence_parallel,
 )
-from megatron.lite.primitive.recompute import discard_and_recompute_output_storage
 from megatron.lite.primitive.utils import build_fp8_recipe
 
 # ---------------------------------------------------------------------------
@@ -185,7 +184,6 @@ class TransformerLayer(nn.Module):
             num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
             lora_config=lora_config,
         )
-        self.reuse_moe_input_storage = num_chunks_ep_a2a_overlap > 1
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
@@ -197,8 +195,6 @@ class TransformerLayer(nn.Module):
         residual = x
         h = self.mlp_norm(x)
         moe_out = self.moe(h)
-        if self.reuse_moe_input_storage:
-            discard_and_recompute_output_storage(h, moe_out, self.mlp_norm, x)
         x = residual + moe_out
 
         return x

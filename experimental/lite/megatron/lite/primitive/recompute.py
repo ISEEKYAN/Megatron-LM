@@ -185,30 +185,6 @@ class CheckpointWithoutOutput:
             hook_tensor.register_hook(self._recompute)
 
 
-def discard_and_recompute_output_storage(
-    output: torch.Tensor,
-    hook_tensor: torch.Tensor,
-    run_function: Callable,
-    *args: Any,
-) -> None:
-    """Discard an output while retaining its existing autograd graph.
-
-    The output is restored just before its downstream consumer runs backward.
-    Unlike ``CheckpointWithoutOutput``, this does not create another autograd
-    function or invoke a nested backward engine.
-    """
-    if not hook_tensor.requires_grad:
-        return
-
-    def restore_output(_grad: torch.Tensor) -> None:
-        with torch.no_grad():
-            restored = run_function(*args)
-            _get_share_storage()(output, restored)
-
-    output.untyped_storage().resize_(0)
-    hook_tensor.register_hook(restore_output)
-
-
 ModuleMap = dict[str, Callable[[nn.Module], nn.Module | None]]
 """Maps module name → lambda that extracts a sub-module from a layer."""
 
@@ -399,7 +375,6 @@ __all__ = [
     "ModuleMap",
     "apply_offload",
     "apply_recompute",
-    "discard_and_recompute_output_storage",
     "parse_recompute_spec",
     "wrap_checkpoint",
     "wrap_offload",
