@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -54,15 +55,21 @@ def run_microbatch_loop(
         (parameter.device for parameter in model.parameters() if parameter.is_cuda),
         None,
     )
+    compute_streams = (
+        (torch.cuda.Stream(device=cuda_device), torch.cuda.Stream(device=cuda_device))
+        if overlap_forward_backward and cuda_device is not None
+        else (None, None)
+    )
 
-    def run_forward():
+    def run_forward(stream):
         from megatron.lite.primitive.parallel.ep_overlap import ep_overlap_role
 
         batch, loss_context = split_loss_context(next(data_iter))
         if pre_forward_hook is not None:
             scale = torch.tensor(1.0 / num_microbatches, device="cuda")
             pre_forward_hook(scale)
-        with ep_overlap_role("forward"), use_loss_context(loss_context):
+        stream_context = torch.cuda.stream(stream) if stream is not None else nullcontext()
+        with stream_context, ep_overlap_role("forward"), use_loss_context(loss_context):
             out = forward_fn(model, batch)
         if loss_fn is not None:
             if loss_context is None:
@@ -73,42 +80,64 @@ def run_microbatch_loop(
             return out, loss, metrics
         return out, out["loss"], None
 
-    def run_backward(loss, *, sync_grad: bool):
+    def run_backward(loss, *, sync_grad: bool, stream):
         from megatron.lite.primitive.parallel.ep_overlap import ep_overlap_role
 
         if cuda_device is not None:
             torch.cuda.set_device(cuda_device)
         if dist_opt and optimizer is not None and sync_grad:
             optimizer.grad_sync_enabled = True
-        with ep_overlap_role("backward"):
+        stream_context = torch.cuda.stream(stream) if stream is not None else nullcontext()
+        with stream_context, ep_overlap_role("backward"):
             (loss / num_microbatches).backward()
 
     if forward_only or not overlap_forward_backward or num_microbatches == 1:
         for mb in range(num_microbatches):
-            out, loss, metrics = run_forward()
+            out, loss, metrics = run_forward(None)
             if not forward_only:
-                run_backward(loss, sync_grad=mb == num_microbatches - 1)
+                run_backward(
+                    loss, sync_grad=mb == num_microbatches - 1, stream=None
+                )
             if metrics is not None:
                 all_metrics.append(metrics)
             last_out = out
     else:
         from megatron.lite.primitive.parallel.ep_overlap import adjacent_ep_overlap
 
-        out, loss, metrics = run_forward()
+        stream_idx = 0
+        out, loss, metrics = run_forward(compute_streams[stream_idx])
         if metrics is not None:
             all_metrics.append(metrics)
         last_out = out
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlite-combined-1f1b") as pool:
             for _ in range(1, num_microbatches):
+                next_stream_idx = 1 - stream_idx
                 with adjacent_ep_overlap():
-                    backward = pool.submit(run_backward, loss, sync_grad=False)
-                    out, next_loss, metrics = run_forward()
+                    backward = pool.submit(
+                        run_backward,
+                        loss,
+                        sync_grad=False,
+                        stream=compute_streams[stream_idx],
+                    )
+                    out, next_loss, metrics = run_forward(
+                        compute_streams[next_stream_idx]
+                    )
                     backward.result()
                 if metrics is not None:
                     all_metrics.append(metrics)
                 last_out = out
                 loss = next_loss
-            pool.submit(run_backward, loss, sync_grad=True).result()
+                stream_idx = next_stream_idx
+            pool.submit(
+                run_backward,
+                loss,
+                sync_grad=True,
+                stream=compute_streams[stream_idx],
+            ).result()
+        if cuda_device is not None:
+            caller_stream = torch.cuda.current_stream(cuda_device)
+            for stream in compute_streams:
+                caller_stream.wait_stream(stream)
 
     if last_out is not None and all_metrics:
         last_out["_loss_fn_metrics"] = all_metrics
