@@ -195,7 +195,14 @@ def _attach_gqa_proj(attn, spec: LoraSpec) -> bool:
 
 
 def _attach_expert_fc(
-    experts, attr: str, target: str, spec: LoraSpec, *, in_features: int, out_features: int
+    experts,
+    attr: str,
+    target: str,
+    spec: LoraSpec,
+    *,
+    in_features: int,
+    out_features: int,
+    tp_group=None,
 ) -> bool:
     if not spec.targets_module(target):
         return False
@@ -211,6 +218,7 @@ def _attach_expert_fc(
             alpha=spec.alpha,
             dropout=spec.dropout,
             use_rslora=spec.use_rslora,
+            tp_group=tp_group,
         ),
         base,
     )
@@ -303,6 +311,11 @@ def apply_lora_to_chunks(
     from megatron.lite.primitive.modules.gqa import GQAttention
     from megatron.lite.primitive.modules.mlp import SwiGLUMLP
 
+    expert_tp_group = (
+        ps.tp_group
+        if ps is not None and ps.tp_size > 1 and ps.ep_size == 1 and ps.etp_size == 1
+        else None
+    )
     for chunk in chunks:
         for module in chunk.modules():
             if isinstance(module, GQAttention):
@@ -314,11 +327,23 @@ def apply_lora_to_chunks(
                 config_hidden, fc1_out = _local_linear_features(module.fc1)
                 fc2_in, fc2_out = _local_linear_features(module.fc2)
                 if _attach_expert_fc(
-                    module, "fc1", "linear_fc1", spec, in_features=config_hidden, out_features=fc1_out
+                    module,
+                    "fc1",
+                    "linear_fc1",
+                    spec,
+                    in_features=config_hidden,
+                    out_features=fc1_out,
+                    tp_group=expert_tp_group,
                 ):
                     stats["attached_modules"] += 1
                 if _attach_expert_fc(
-                    module, "fc2", "linear_fc2", spec, in_features=fc2_in, out_features=fc2_out
+                    module,
+                    "fc2",
+                    "linear_fc2",
+                    spec,
+                    in_features=fc2_in,
+                    out_features=fc2_out,
+                    tp_group=expert_tp_group,
                 ):
                     stats["attached_modules"] += 1
             elif isinstance(module, SwiGLUMLP):

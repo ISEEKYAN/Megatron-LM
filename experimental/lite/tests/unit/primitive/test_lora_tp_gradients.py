@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from megatron.lite.primitive.modules.lora import LinearLoRA
+from megatron.lite.primitive.modules.lora import LinearLoRA, SharedGroupedLinearLoRA
 from megatron.lite.primitive.modules.lora_apply import LoRAWrappedLinear
 
 pytestmark = [pytest.mark.mlite, pytest.mark.distributed]
@@ -99,6 +99,90 @@ def test_linear_proj_tp2_gradients_match_tp1(tmp_path):
         assert result["b_grad"] < 1e-12
         assert result["x_grad"] < 1e-12
         assert result["a_grad_ratio"] == pytest.approx(1.0, abs=1e-12)
+
+    if init_file.exists():
+        os.unlink(init_file)
+
+
+def _shared_grouped_tp_worker(
+    rank: int, world_size: int, init_file: str, queue
+) -> None:
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        torch.manual_seed(20260729)
+        tokens, in_features, out_features, lora_rank = 4, 6, 8, 3
+        x = torch.randn(tokens, in_features, dtype=torch.float64)
+        a = torch.randn(lora_rank, in_features, dtype=torch.float64)
+        b = torch.randn(out_features, lora_rank, dtype=torch.float64)
+        grad_out = torch.randn(tokens, out_features, dtype=torch.float64)
+
+        a_ref = a.clone().requires_grad_(True)
+        b_ref = b.clone().requires_grad_(True)
+        y_ref = (x @ a_ref.t()) @ b_ref.t()
+        (y_ref * grad_out).sum().backward()
+
+        adapter = SharedGroupedLinearLoRA(
+            2,
+            in_features,
+            out_features,
+            lora_rank,
+            alpha=lora_rank,
+            tp_group=dist.group.WORLD,
+        ).to(torch.float64)
+        with torch.no_grad():
+            adapter.lora_a.copy_(a)
+            adapter.lora_b.copy_(b)
+
+        local_grad_out = torch.zeros_like(grad_out)
+        local_out = out_features // world_size
+        out_slice = slice(rank * local_out, (rank + 1) * local_out)
+        local_grad_out[:, out_slice] = grad_out[:, out_slice]
+        y_tp = adapter(x, [tokens // 2, tokens // 2])
+        (y_tp * local_grad_out).sum().backward()
+        queue.put(
+            {
+                "rank": rank,
+                "a_grad": adapter.lora_a.grad.tolist(),
+                "b_grad": adapter.lora_b.grad.tolist(),
+                "a_ref": a_ref.grad.tolist(),
+                "b_ref": b_ref.grad.tolist(),
+            }
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_shared_grouped_tp2_gradients_match_tp1(tmp_path):
+    """Replicated expert adapters must sum partial TP gradients."""
+    world_size = 2
+    init_file = tmp_path / "shared-grouped-lora-tp-gradient-init"
+    ctx = mp.get_context("spawn")
+    queue = ctx.SimpleQueue()
+    mp.spawn(
+        _shared_grouped_tp_worker,
+        args=(world_size, str(init_file), queue),
+        nprocs=world_size,
+        join=True,
+    )
+    results = sorted(
+        (queue.get() for _ in range(world_size)), key=lambda item: item["rank"]
+    )
+
+    a_grads = [
+        torch.tensor(result["a_grad"], dtype=torch.float64) for result in results
+    ]
+    b_grads = [
+        torch.tensor(result["b_grad"], dtype=torch.float64) for result in results
+    ]
+    a_ref = torch.tensor(results[0]["a_ref"], dtype=torch.float64)
+    b_ref = torch.tensor(results[0]["b_ref"], dtype=torch.float64)
+    torch.testing.assert_close(a_grads[0], a_grads[1], rtol=0, atol=1e-12)
+    torch.testing.assert_close(b_grads[0], b_grads[1], rtol=0, atol=1e-12)
+    for a_grad, b_grad in zip(a_grads, b_grads):
+        torch.testing.assert_close(a_grad, a_ref, rtol=0, atol=1e-12)
+        torch.testing.assert_close(b_grad, b_ref, rtol=0, atol=1e-12)
 
     if init_file.exists():
         os.unlink(init_file)

@@ -528,6 +528,7 @@ class SharedGroupedLinearLoRA(nn.Module):
         alpha: int | None = None,
         dropout: float = 0.0,
         use_rslora: bool = False,
+        tp_group=None,
     ):
         super().__init__()
         if rank <= 0:
@@ -537,6 +538,7 @@ class SharedGroupedLinearLoRA(nn.Module):
         self.use_rslora = bool(use_rslora)
         self.scale = lora_scaling(rank, alpha, use_rslora=use_rslora)
         self.dropout_p = float(dropout)
+        self.tp_group = tp_group
         self.shared_across_experts = True
         self.lora_a = nn.Parameter(torch.empty(rank, in_features))
         self.lora_b = nn.Parameter(torch.empty(out_features, rank))
@@ -544,6 +546,12 @@ class SharedGroupedLinearLoRA(nn.Module):
         self.lora_b.tensor_model_parallel = False
         nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
         nn.init.zeros_(self.lora_b)
+        if self.tp_group is not None:
+            self.lora_a.register_hook(self._all_reduce_tp_grad)
+            self.lora_b.register_hook(self._all_reduce_tp_grad)
+
+    def _all_reduce_tp_grad(self, grad: torch.Tensor) -> torch.Tensor:
+        return _all_reduce_sum(grad, self.tp_group)
 
     def forward(self, x: torch.Tensor, splits: list[int]) -> torch.Tensor:
         if len(splits) != self.num_local_experts:

@@ -78,6 +78,38 @@ def test_apply_wraps_swiglu_and_freezes_base():
     assert stats["frozen_tensors"] > 0
 
 
+def test_apply_threads_tp_group_to_replicated_expert_adapters():
+    from megatron.lite.primitive.modules.experts import Experts
+    from megatron.lite.primitive.modules.lora_apply import LoRAWrappedGroupedLinear
+
+    class _GroupedSurface(nn.Module):
+        def __init__(self, num_experts, in_features, out_features):
+            super().__init__()
+            for expert_idx in range(num_experts):
+                self.register_parameter(
+                    f"weight{expert_idx}",
+                    nn.Parameter(torch.empty(out_features, in_features)),
+                )
+
+    experts = Experts.__new__(Experts)
+    nn.Module.__init__(experts)
+    experts.num_local_experts = 2
+    experts.fc1 = _GroupedSurface(2, 8, 16)
+    experts.fc2 = _GroupedSurface(2, 4, 8)
+    chunk = nn.Module()
+    chunk.experts = experts
+    tp_group = object()
+    ps = SimpleNamespace(tp_size=2, tp_group=tp_group, ep_size=1, etp_size=1)
+
+    stats = apply_lora_to_chunks(
+        [chunk], LoraSpec(enabled=True, rank=2, target_modules=("linear_fc1",)), ps=ps
+    )
+
+    assert stats["attached_modules"] == 1
+    assert isinstance(experts.fc1, LoRAWrappedGroupedLinear)
+    assert experts.fc1.adapter.tp_group is tp_group
+
+
 def test_qwen_protocol_loads_canonical_weights_before_lora_attach(monkeypatch):
     """Regression for HF load seeing ``.base.`` names after early LoRA attach."""
     from megatron.lite.model.qwen3_moe.lite import protocol
