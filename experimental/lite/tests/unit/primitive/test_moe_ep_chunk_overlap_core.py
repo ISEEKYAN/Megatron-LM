@@ -527,6 +527,38 @@ def test_fixed_capacity_scratch_reuses_rows_and_bounds_slots():
     _reset_fixed_capacity_scratch_for_tests()
 
 
+def test_fixed_capacity_scratch_release_records_the_consumer_stream(monkeypatch):
+    from megatron.lite.primitive.utils.cuda_allocator import (
+        _FixedScratchLease,
+        _FixedScratchSlot,
+    )
+
+    class FakeTensor:
+        is_cuda = True
+
+    class FakeStream:
+        cuda_stream = 1234
+
+    class FakeEvent:
+        def __init__(self):
+            self.recorded_stream = None
+
+        def record(self, stream):
+            self.recorded_stream = stream
+
+    event = FakeEvent()
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    slot = _FixedScratchSlot(tensor=FakeTensor(), in_use=True)
+    stream = FakeStream()
+
+    _FixedScratchLease(slot, torch.device("cuda", 0)).release(stream=stream)
+
+    assert slot.in_use is False
+    assert slot.event is event
+    assert event.recorded_stream is stream
+    assert slot.stream_key == stream.cuda_stream
+
+
 def test_fixed_capacity_scratch_fails_loud_on_capacity_overflow():
     from megatron.lite.primitive.utils.cuda_allocator import (
         _reset_fixed_capacity_scratch_for_tests,

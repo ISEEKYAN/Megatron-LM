@@ -696,7 +696,7 @@ class EPChunkOverlapOperator:
                 for lease in reversed(
                     local_state["dispatch_bwd_state"].pop("scratch_leases")
                 ):
-                    lease.release()
+                    lease.release(stream=compute_stream)
                 if grad_scores is None:
                     if chunk.scores_shape is None or chunk.scores_dtype is None:
                         raise RuntimeError("Missing router score metadata.")

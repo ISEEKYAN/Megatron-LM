@@ -158,6 +158,7 @@ class MoELayer(nn.Module):
         config: Qwen35Config,
         ps: ParallelState,
         *,
+        layer_idx: int,
         use_deepep: bool,
         router_bias_rate: float,
         fp8: bool,
@@ -191,6 +192,11 @@ class MoELayer(nn.Module):
             ps,
             use_deepep=use_deepep,
             moe_permute_fusion=moe_permute_fusion,
+            buffer_slot=(
+                ("ep_chunk_overlap", "main", layer_idx % 8, 0)
+                if num_chunks_ep_a2a_overlap > 1
+                else None
+            ),
         )
         self.ep_chunk_dispatchers = ()
         self.ep_chunk_overlap = None
@@ -202,7 +208,7 @@ class MoELayer(nn.Module):
                     ps,
                     use_deepep=use_deepep,
                     moe_permute_fusion=moe_permute_fusion,
-                    buffer_slot=("ep_chunk_overlap", "forward", idx),
+                    buffer_slot=("ep_chunk_overlap", "forward", layer_idx % 8, idx),
                 )
                 for idx in range(num_chunks_ep_a2a_overlap)
             )
@@ -314,6 +320,7 @@ class Qwen35Layer(nn.Module):
         self.moe = MoELayer(
             config,
             ps,
+            layer_idx=layer_idx,
             use_deepep=use_deepep,
             router_bias_rate=router_bias_rate,
             fp8=fp8,

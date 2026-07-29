@@ -29,11 +29,12 @@ class _FixedScratchLease:
         self._device = device
         self._active = True
 
-    def release(self) -> None:
+    def release(self, *, stream: torch.cuda.Stream | None = None) -> None:
         if not self._active:
             return
         if self._slot.tensor.is_cuda:
-            stream = torch.cuda.current_stream(self._device)
+            if stream is None:
+                stream = torch.cuda.current_stream(self._device)
             event = torch.cuda.Event()
             event.record(stream)
             self._slot.event = event
