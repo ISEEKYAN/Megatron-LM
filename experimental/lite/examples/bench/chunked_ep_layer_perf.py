@@ -94,7 +94,7 @@ def _run_once(
     *,
     mode: str,
     native_chunked_recompute: bool,
-) -> tuple[float, float]:
+) -> tuple[float, float, float, float]:
     _zero_grads(module)
     hidden = base_hidden.detach().clone().requires_grad_(True)
     torch.cuda.reset_peak_memory_stats(hidden.device)
@@ -130,8 +130,13 @@ def _run_once(
 
     elapsed_ms = _time_call(call)
     peak_gb = torch.cuda.max_memory_allocated(hidden.device) / 1e9
+    reserved_peak_gb = torch.cuda.max_memory_reserved(hidden.device) / 1e9
+    memory_stats = torch.cuda.memory_stats(hidden.device)
+    inactive_split_peak_gb = (
+        memory_stats.get("inactive_split_bytes.all.peak", 0) / 1e9
+    )
     _zero_grads(module)
-    return elapsed_ms, peak_gb
+    return elapsed_ms, peak_gb, reserved_peak_gb, inactive_split_peak_gb
 
 
 def _measure_pair(
@@ -145,6 +150,8 @@ def _measure_pair(
 ) -> dict:
     samples: dict[str, list[float]] = {"baseline": [], "chunked": []}
     peak_gb: dict[str, float] = {"baseline": 0.0, "chunked": 0.0}
+    reserved_peak_gb: dict[str, float] = {"baseline": 0.0, "chunked": 0.0}
+    inactive_split_peak_gb: dict[str, float] = {"baseline": 0.0, "chunked": 0.0}
     arms = {"baseline": (baseline, False), "chunked": (candidate, True)}
     for iteration in range(warmup + repeats):
         order = (
@@ -152,15 +159,23 @@ def _measure_pair(
         )
         for name in order:
             module, native_chunked_recompute = arms[name]
-            elapsed_ms, arm_peak_gb = _run_once(
-                module,
-                hidden,
-                mode=mode,
-                native_chunked_recompute=native_chunked_recompute,
+            elapsed_ms, arm_peak_gb, arm_reserved_peak_gb, arm_inactive_split_peak_gb = (
+                _run_once(
+                    module,
+                    hidden,
+                    mode=mode,
+                    native_chunked_recompute=native_chunked_recompute,
+                )
             )
             if iteration >= warmup:
                 samples[name].append(elapsed_ms)
                 peak_gb[name] = max(peak_gb[name], arm_peak_gb)
+                reserved_peak_gb[name] = max(
+                    reserved_peak_gb[name], arm_reserved_peak_gb
+                )
+                inactive_split_peak_gb[name] = max(
+                    inactive_split_peak_gb[name], arm_inactive_split_peak_gb
+                )
 
     baseline_median = statistics.median(samples["baseline"])
     chunked_median = statistics.median(samples["chunked"])
@@ -185,6 +200,10 @@ def _measure_pair(
         "stable_wins_required": stable_wins_required,
         "baseline_peak_gb": peak_gb["baseline"],
         "chunked_peak_gb": peak_gb["chunked"],
+        "baseline_reserved_peak_gb": reserved_peak_gb["baseline"],
+        "chunked_reserved_peak_gb": reserved_peak_gb["chunked"],
+        "baseline_inactive_split_peak_gb": inactive_split_peak_gb["baseline"],
+        "chunked_inactive_split_peak_gb": inactive_split_peak_gb["chunked"],
         "passed": passed,
     }
 

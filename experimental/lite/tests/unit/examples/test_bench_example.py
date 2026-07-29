@@ -75,6 +75,8 @@ def test_chunked_ep_layer_perf_has_the_three_full_recompute_gates():
     assert "speedup > 1.0" in text
     assert "candidate.experts.parameters()" in text
     assert "parameter.main_grad = torch.zeros_like" in text
+    assert '"chunked_reserved_peak_gb"' in text
+    assert '"chunked_inactive_split_peak_gb"' in text
     assert "num_experts=world_size" not in text
     assert "num_experts_per_tok=world_size" not in text
 
