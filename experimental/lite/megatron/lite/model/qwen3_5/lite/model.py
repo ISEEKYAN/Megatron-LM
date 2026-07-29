@@ -42,7 +42,6 @@ from megatron.lite.primitive.parallel import (
     gather_from_sequence_parallel,
     scatter_to_sequence_parallel,
 )
-from megatron.lite.primitive.recompute import CheckpointWithoutOutput
 from megatron.lite.primitive.utils import build_fp8_recipe
 
 _SP_GRAD_SUFFIXES: tuple[str, ...] = (
@@ -325,7 +324,6 @@ class Qwen35Layer(nn.Module):
             moe_permute_fusion=True,
             num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
         )
-        self.release_moe_input = num_chunks_ep_a2a_overlap > 1
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
@@ -338,14 +336,7 @@ class Qwen35Layer(nn.Module):
             h = self.linear_attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
         x = residual + h
         residual = x
-        if self.release_moe_input:
-            moe_input_ckpt = CheckpointWithoutOutput(preserve_rng_state=False)
-            mlp_input = moe_input_ckpt.checkpoint(self.mlp_norm, x)
-            moe_out = self.moe(mlp_input)
-            moe_input_ckpt.discard_output_and_register_recompute(moe_out)
-        else:
-            moe_out = self.moe(self.mlp_norm(x))
-        x = residual + moe_out
+        x = residual + self.moe(self.mlp_norm(x))
         return x
 
 

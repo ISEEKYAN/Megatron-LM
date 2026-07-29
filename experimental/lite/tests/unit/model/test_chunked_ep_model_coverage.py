@@ -86,14 +86,6 @@ def test_chunked_ep_operator_does_not_construct_or_factory_dispatchers():
     assert "config: Any" not in implementation
 
 
-@pytest.mark.parametrize("model_name", sorted(SUPPORTED_MODELS))
-def test_chunked_ep_releases_moe_norm_output_until_backward(model_name):
-    implementation = (MODEL_ROOT / model_name / "lite/model.py").read_text()
-
-    assert "CheckpointWithoutOutput" in implementation
-    assert "discard_output_and_register_recompute" in implementation
-
-
 def test_deepseek_hash_router_keeps_checkpoint_gate_name():
     implementation = (MODEL_ROOT / "deepseek_v4/lite/moe.py").read_text()
 

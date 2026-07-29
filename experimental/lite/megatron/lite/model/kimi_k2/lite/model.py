@@ -35,7 +35,6 @@ from megatron.lite.primitive.parallel import (
     roll_packed_thd_left,
     scatter_to_sequence_parallel,
 )
-from megatron.lite.primitive.recompute import CheckpointWithoutOutput
 from megatron.lite.primitive.utils import build_fp8_recipe
 
 _SP_GRAD_SUFFIXES: tuple[str, ...] = (
@@ -253,7 +252,6 @@ class KimiK2Layer(nn.Module):
                 num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
             )
             self.mlp: DenseMLP | None = None
-            self.release_moe_input = num_chunks_ep_a2a_overlap > 1
         else:
             self.mlp_norm = None
             self.moe = None
@@ -263,14 +261,8 @@ class KimiK2Layer(nn.Module):
         x = x + self.self_attention(self.input_layernorm(x), packed_seq_params=packed_seq_params)
         if self.moe is not None:
             assert self.mlp_norm is not None
-            if self.release_moe_input:
-                moe_input_ckpt = CheckpointWithoutOutput(preserve_rng_state=False)
-                mlp_input = moe_input_ckpt.checkpoint(self.mlp_norm, x)
-                moe_out = self.moe(mlp_input)
-                moe_input_ckpt.discard_output_and_register_recompute(moe_out)
-            else:
-                moe_out = self.moe(self.mlp_norm(x))
-            return x + moe_out
+            mlp_input = self.mlp_norm(x)
+            return x + self.moe(mlp_input)
         assert self.mlp is not None
         return x + self.mlp(x)
 
