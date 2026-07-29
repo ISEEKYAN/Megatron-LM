@@ -352,7 +352,12 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     )
     if layer_recompute_spec:
         for chunk in chunks:
-            apply_recompute(chunk.layers, layer_recompute_spec, MODULE_MAP)
+            apply_recompute(
+                chunk.layers,
+                layer_recompute_spec,
+                MODULE_MAP,
+                use_reentrant=impl_cfg.num_chunks_ep_a2a_overlap == 1,
+            )
 
     if impl_cfg.offload:
         from megatron.lite.primitive.recompute import apply_offload

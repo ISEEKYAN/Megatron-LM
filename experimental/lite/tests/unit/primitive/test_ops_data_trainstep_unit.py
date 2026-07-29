@@ -160,6 +160,33 @@ def test_recompute_parser_and_wrapper_replays_forward_on_backward():
     torch.testing.assert_close(x.grad, torch.tensor([4.0, -6.0]))
 
 
+def test_non_reentrant_recompute_replays_without_the_custom_checkpoint_function():
+    class CountingModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, x):
+            self.calls += 1
+            return x.sin().square()
+
+    module = CountingModule()
+    layers = nn.ModuleList([nn.ModuleDict({"attn": module})])
+    apply_recompute(
+        layers,
+        ["attn"],
+        {"attn": lambda layer: layer["attn"]},
+        use_reentrant=False,
+    )
+
+    x = torch.tensor([0.5], requires_grad=True)
+    output = module(x)
+    assert type(output.grad_fn).__name__ != "CheckpointFunctionBackward"
+    output.sum().backward()
+
+    assert module.calls == 2
+
+
 def test_train_step_microbatch_loop_and_grad_clip_cpu_contract():
     model = nn.Linear(2, 1, bias=False)
     with torch.no_grad():

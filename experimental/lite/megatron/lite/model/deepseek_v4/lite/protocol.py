@@ -437,7 +437,10 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     if layer_recompute_spec:
         for chunk in chunks:
             apply_recompute(
-                _iter_transformer_units(chunk), layer_recompute_spec, MODULE_MAP
+                _iter_transformer_units(chunk),
+                layer_recompute_spec,
+                MODULE_MAP,
+                use_reentrant=impl_cfg.num_chunks_ep_a2a_overlap == 1,
             )
 
     if impl_cfg.offload:

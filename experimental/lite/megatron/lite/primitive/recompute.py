@@ -194,6 +194,8 @@ def apply_recompute(
     module_names: list[str],
     module_map: ModuleMap,
     no_rng_modules: set[str] | None = None,
+    *,
+    use_reentrant: bool = True,
 ) -> None:
     """Wrap specified sub-modules with activation checkpointing for recomputation."""
     if not module_names:
@@ -207,7 +209,11 @@ def apply_recompute(
                 if mod_name in module_map:
                     submod = module_map[mod_name](layer)
                     if submod is not None:
-                        wrap_checkpoint(submod, preserve_rng_state=mod_name not in no_rng)
+                        wrap_checkpoint(
+                            submod,
+                            preserve_rng_state=mod_name not in no_rng,
+                            use_reentrant=use_reentrant,
+                        )
 
 
 def apply_offload(layers: nn.ModuleList, module_names: list[str], module_map: ModuleMap) -> None:
@@ -304,9 +310,28 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> None:
+def wrap_checkpoint(
+    module: nn.Module,
+    *,
+    preserve_rng_state: bool = True,
+    use_reentrant: bool = True,
+) -> None:
     """Wrap a module's forward with reentrant activation checkpointing."""
     original_forward = module.forward
+    if not use_reentrant:
+
+        def _non_reentrant_forward(*args, **kwargs):
+            return torch.utils.checkpoint.checkpoint(
+                original_forward,
+                *args,
+                use_reentrant=False,
+                preserve_rng_state=preserve_rng_state,
+                **kwargs,
+            )
+
+        module.forward = _non_reentrant_forward
+        return
+
     _routers = [m for m in module.modules() if hasattr(m, "expert_bias")]
 
     def _checkpointed_forward(*args, **kwargs):

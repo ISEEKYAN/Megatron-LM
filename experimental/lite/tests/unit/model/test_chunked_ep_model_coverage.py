@@ -30,6 +30,7 @@ def test_every_lite_moe_model_consumes_the_shared_chunked_ep_primitive(
     assert "num_chunks_ep_a2a_overlap: int = 1" in protocol
     assert "validate_ep_chunk_overlap_config(" in protocol
     assert "recompute_modules_for_ep_chunk_overlap(" in protocol
+    assert "use_reentrant=impl_cfg.num_chunks_ep_a2a_overlap == 1" in protocol
     assert "EPChunkOverlapOperator" in implementation
     assert "self.dispatcher = TokenDispatcher(" in implementation
     assert "self.ep_chunk_overlap = None" in implementation
