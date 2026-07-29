@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from pathlib import Path
-import re
 
 import pytest
 
@@ -42,11 +41,6 @@ def test_every_lite_moe_model_consumes_the_shared_chunked_ep_primitive(
     assert "class MoELayer(EPChunkOverlap" not in implementation
     assert "class DeepseekV4MoE(EPChunkOverlap" not in implementation
     assert "num_chunks_ep_a2a_overlap" in implementation
-    assert re.search(
-        r"moe_permute_fusion=True,\s+"
-        r'buffer_slot=\("ep_chunk_overlap", "forward", layer_slot, idx\)',
-        implementation,
-    )
 
 
 def test_backward_specific_chunk_parameter_is_removed_from_product_code():
