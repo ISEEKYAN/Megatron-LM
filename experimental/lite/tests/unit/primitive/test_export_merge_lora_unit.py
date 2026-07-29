@@ -151,10 +151,23 @@ def test_export_surface_map_covers_wrapper_base_weights():
     }
 
 
-def test_static_delta_rejects_dropout():
-    adapter = SharedGroupedLinearLoRA(2, 8, 16, 2, alpha=4, dropout=0.1)
-    with pytest.raises(ValueError, match="dropout=0"):
-        adapter.materialized_delta_weight()
+@pytest.mark.parametrize("adapter_kind", ["dense", "grouped"])
+def test_static_delta_uses_eval_semantics_with_training_dropout(adapter_kind):
+    def make_adapter(dropout):
+        if adapter_kind == "dense":
+            return LinearLoRA(8, 16, 2, alpha=4, dropout=dropout)
+        return SharedGroupedLinearLoRA(2, 8, 16, 2, alpha=4, dropout=dropout)
+
+    without_dropout = make_adapter(0.0)
+    with_dropout = make_adapter(0.1)
+    with_dropout.load_state_dict(without_dropout.state_dict())
+
+    torch.testing.assert_close(
+        with_dropout.materialized_delta_weight(),
+        without_dropout.materialized_delta_weight(),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_olora_tail_warns_when_grouped_expert_adapters_are_skipped():

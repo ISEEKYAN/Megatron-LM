@@ -488,8 +488,7 @@ class LinearLoRA(nn.Module):
         return out
 
     def materialized_delta_weight(self) -> torch.Tensor:
-        if self.dropout_p != 0.0:
-            raise ValueError("materialized_delta_weight requires dropout=0.")
+        """Return the static eval-mode delta; activation dropout does not apply."""
         lora_a = self.lora_a
         lora_b = self.lora_b
         if hasattr(lora_a, "full_tensor"):
@@ -555,8 +554,7 @@ class SharedGroupedLinearLoRA(nn.Module):
         return dropped.matmul(self.lora_a.t()).matmul(self.lora_b.t()) * self.scale
 
     def materialized_delta_weight(self, expert_idx: int = 0) -> torch.Tensor:
-        if self.dropout_p != 0.0:
-            raise ValueError("materialized_delta_weight requires dropout=0.")
+        """Return the static eval-mode delta; activation dropout does not apply."""
         del expert_idx
         lora_a = self.lora_a
         lora_b = self.lora_b
