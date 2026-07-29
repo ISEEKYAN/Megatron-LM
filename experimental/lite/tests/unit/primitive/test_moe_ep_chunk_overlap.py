@@ -80,6 +80,25 @@ def test_chunked_backward_submits_dgrad_before_te_delayed_wgrad(
     assert "retain_graph=True" not in source
 
 
+def test_two_chunk_backward_batches_expert_compute_and_delays_wgrad(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkOverlapOperator,
+    )
+
+    source = inspect.getsource(
+        EPChunkOverlapOperator._full_recompute_fused_backward_batched
+    )
+
+    assert source.count("self.experts(") == 1
+    assert source.count("torch.autograd.grad(") == 2
+    assert source.index("submit_deepep_dispatch_backward") < source.index(
+        "pop_delayed_weight_grads"
+    )
+
+
 def test_chunked_ep_keeps_compute_on_the_autograd_caller_stream(
     transformer_engine_import_stub,
 ):

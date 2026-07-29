@@ -112,7 +112,7 @@ def test_dispatch_local_backward_materializes_zero_probability_gradient(
     assert grad_probs.shape == (0, 2)
 
 
-def test_forward_trace_pipelines_next_dispatch_before_current_expert(
+def test_forward_trace_batches_all_chunks_into_one_expert_launch(
     monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
@@ -198,28 +198,16 @@ def test_forward_trace_pipelines_next_dispatch_before_current_expert(
 
     torch.testing.assert_close(output, inputs + 1)
     operations = [item for item in trace if not item.startswith(("event.", "caller."))]
-    assert operations == [
-        "comm.wait",
-        "dispatch.submit.0",
-        "comm.wait",
-        "dispatch.submit.1",
-        "dispatch.finish.0",
-        "expert.0",
-        "combine.prepare.0",
-        "comm.wait",
-        "combine.submit.0",
-        "comm.wait",
-        "dispatch.submit.2",
-        "dispatch.finish.1",
-        "expert.1",
-        "combine.prepare.1",
-        "comm.wait",
-        "combine.submit.1",
-        "dispatch.finish.2",
-        "expert.2",
-        "combine.prepare.2",
-        "comm.wait",
-        "combine.submit.2",
+    assert operations.count("expert.0") == 1
+    assert not any(item in operations for item in ("expert.1", "expert.2"))
+    expert_idx = operations.index("expert.0")
+    assert all(
+        operations.index(f"dispatch.finish.{idx}") < expert_idx for idx in range(3)
+    )
+    assert all(
+        operations.index(f"combine.prepare.{idx}") > expert_idx for idx in range(3)
+    )
+    assert operations[-3:] == [
         "combine.finish.0",
         "combine.finish.1",
         "combine.finish.2",
@@ -252,3 +240,25 @@ def test_core_contains_token_wise_forward_and_backward_deepep_pipeline():
         "submit_deepep_dispatch_backward",
         "finish_deepep_dispatch_backward",
     } <= calls
+
+def test_expert_chunk_merge_round_trip_groups_each_expert_once(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _merge_expert_chunks,
+        _split_expert_chunks,
+    )
+
+    counts = [[2, 1, 0], [1, 2, 1]]
+    chunks = [
+        torch.tensor([[0], [1], [2]]),
+        torch.tensor([[10], [11], [12], [13]]),
+    ]
+
+    merged = _merge_expert_chunks(chunks, counts)
+
+    assert merged.flatten().tolist() == [0, 1, 10, 2, 11, 12, 13]
+    restored = _split_expert_chunks(merged, counts)
+    torch.testing.assert_close(restored[0], chunks[0])
+    torch.testing.assert_close(restored[1], chunks[1])
