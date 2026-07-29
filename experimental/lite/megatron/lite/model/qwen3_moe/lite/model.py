@@ -34,6 +34,7 @@ from megatron.lite.primitive.parallel import (
     roll_packed_thd_left,
     scatter_to_sequence_parallel,
 )
+from megatron.lite.primitive.recompute import CheckpointWithoutOutput
 from megatron.lite.primitive.utils import build_fp8_recipe
 
 # ---------------------------------------------------------------------------
@@ -184,6 +185,7 @@ class TransformerLayer(nn.Module):
             num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
             lora_config=lora_config,
         )
+        self.release_moe_input = num_chunks_ep_a2a_overlap > 1
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
@@ -193,8 +195,14 @@ class TransformerLayer(nn.Module):
         x = residual + h
 
         residual = x
-        h = self.mlp_norm(x)
-        moe_out = self.moe(h)
+        if self.release_moe_input:
+            moe_input_ckpt = CheckpointWithoutOutput(preserve_rng_state=False)
+            h = moe_input_ckpt.checkpoint(self.mlp_norm, x)
+            moe_out = self.moe(h)
+            moe_input_ckpt.discard_output_and_register_recompute(moe_out)
+        else:
+            h = self.mlp_norm(x)
+            moe_out = self.moe(h)
         x = residual + moe_out
 
         return x
