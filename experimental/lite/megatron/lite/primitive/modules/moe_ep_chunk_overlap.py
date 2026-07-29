@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -182,6 +183,7 @@ class EPChunkOverlapOperator:
     ):
         self._router_forward = router_forward
         self._active_routing_input: torch.Tensor | None = None
+        self._recv_capacity_scalar: torch.Tensor | None = None
 
         self.router = router
         self.experts = experts
@@ -198,6 +200,28 @@ class EPChunkOverlapOperator:
         self, device: torch.device
     ) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
         return torch.cuda.current_stream(device), _shared_comm_stream(device)
+
+    def _recv_capacity_rows(self, x_2d: torch.Tensor, *, chunks: int) -> int:
+        """Return an exact intranode DeepEP receive bound for uneven THD ranks."""
+        if getattr(self.dispatcher.ps, "tp_size", 1) != 1:
+            return 0
+        max_rows = getattr(self, "_recv_capacity_scalar", None)
+        if max_rows is None or max_rows.device != x_2d.device:
+            max_rows = torch.empty((), dtype=torch.int64, device=x_2d.device)
+            self._recv_capacity_scalar = max_rows
+        max_rows.fill_(x_2d.size(0))
+        dist.all_reduce(
+            max_rows,
+            op=dist.ReduceOp.MAX,
+            group=self.dispatcher.ps.tp_ep_group,
+        )
+        ranges = ep_chunk_ranges(
+            int(max_rows.item()),
+            chunks,
+            weights_env="MEGATRON_LITE_EP_CHUNK_WEIGHTS",
+        )
+        max_chunk_rows = max((end - start for start, end in ranges), default=0)
+        return max_chunk_rows * self.dispatcher.ep_size
 
     @contextmanager
     def _routing_context(self, routing_input: torch.Tensor | None):
@@ -233,16 +257,29 @@ class EPChunkOverlapOperator:
         input_shape = x.shape
         x_2d = x.view(-1, x.size(-1)) if x.dim() == 3 else x
         chunks = 2
+        recv_capacity_rows = self._recv_capacity_rows(x_2d, chunks=chunks)
         if torch.is_grad_enabled():
             params = tuple(self.router.parameters()) + tuple(self.experts.parameters())
             return _FullRecomputeFused.apply(
-                x_2d, routing_input, self, input_shape, x.dtype, chunks, chunks, *params
+                x_2d,
+                routing_input,
+                self,
+                input_shape,
+                x.dtype,
+                chunks,
+                recv_capacity_rows,
+                *params,
             )
         ranges = ep_chunk_ranges(
             x_2d.size(0), chunks, weights_env="MEGATRON_LITE_EP_CHUNK_WEIGHTS"
         )
         return self._forward_output_async(
-            x_2d, ranges, input_shape, x.dtype, disable_expert_act_recompute=False
+            x_2d,
+            ranges,
+            input_shape,
+            x.dtype,
+            recv_capacity_rows=recv_capacity_rows,
+            disable_expert_act_recompute=False,
         )
 
     def _forward_dispatcher(self, idx: int) -> TokenDispatcher:
@@ -280,9 +317,15 @@ class EPChunkOverlapOperator:
         ranges: list[tuple[int, int]],
         input_shape: torch.Size,
         input_dtype: torch.dtype,
+        recv_capacity_rows: int,
     ) -> torch.Tensor:
         return self._forward_output_async(
-            x_2d, ranges, input_shape, input_dtype, disable_expert_act_recompute=True
+            x_2d,
+            ranges,
+            input_shape,
+            input_dtype,
+            recv_capacity_rows=recv_capacity_rows,
+            disable_expert_act_recompute=True,
         )
 
     def _forward_output_async(
@@ -292,6 +335,7 @@ class EPChunkOverlapOperator:
         input_shape: torch.Size,
         input_dtype: torch.dtype,
         *,
+        recv_capacity_rows: int,
         disable_expert_act_recompute: bool,
     ) -> torch.Tensor:
         if not ranges:
@@ -324,6 +368,7 @@ class EPChunkOverlapOperator:
                         x_chunk,
                         scores,
                         indices,
+                        num_worst_tokens=recv_capacity_rows,
                     )
             return chunk_idx, dispatcher, state
 
@@ -404,15 +449,16 @@ class EPChunkOverlapOperator:
         return output_2d.view(input_shape).to(input_dtype).detach()
 
     def _full_recompute_fused_backward(
-        self, x_saved: torch.Tensor, grad_2d: torch.Tensor, num_chunks: int
+        self,
+        x_saved: torch.Tensor,
+        grad_2d: torch.Tensor,
+        num_chunks: int,
+        recv_capacity_rows: int,
     ):
         ranges = ep_chunk_ranges(
             x_saved.size(0),
             num_chunks,
-            weights_env=(
-                "MEGATRON_LITE_EP_CHUNK_BWD_WEIGHTS",
-                "MEGATRON_LITE_EP_CHUNK_WEIGHTS",
-            ),
+            weights_env="MEGATRON_LITE_EP_CHUNK_WEIGHTS",
         )
         router_params = tuple(self.router.parameters())
         expert_params = tuple(self.experts.parameters())
@@ -421,7 +467,12 @@ class EPChunkOverlapOperator:
                 x_saved, grad_2d, router_params, expert_params
             )
         return self._full_recompute_fused_backward_v6(
-            x_saved, grad_2d, ranges, router_params, expert_params
+            x_saved,
+            grad_2d,
+            ranges,
+            router_params,
+            expert_params,
+            recv_capacity_rows,
         )
 
     def _full_recompute_skip_combine_backward(
@@ -446,6 +497,7 @@ class EPChunkOverlapOperator:
         ranges: list[tuple[int, int]],
         router_params: tuple[torch.Tensor, ...],
         expert_params: tuple[torch.Tensor, ...],
+        recv_capacity_rows: int,
     ):
         if not ranges:
             return (
@@ -490,6 +542,7 @@ class EPChunkOverlapOperator:
                             x_chunk,
                             scores,
                             indices,
+                            num_worst_tokens=recv_capacity_rows,
                         )
                     )
             return chunk_idx, start, end, x_chunk, scores, state
@@ -591,10 +644,7 @@ class EPChunkOverlapOperator:
                     recv_hidden_dtype=state["recv_hidden"].dtype,
                     recv_probs_shape=state["recv_probs"].shape,
                     recv_probs_dtype=state["recv_probs"].dtype,
-                    recv_capacity_rows=(
-                        x_chunk.size(0) * scores.size(-1) * 7 + 7
-                    )
-                    // 8,
+                    recv_capacity_rows=state["capacity_rows"],
                     dispatched=expert_input,
                     probs=expert_probs,
                     expert_out=expert_out_ref,
@@ -760,13 +810,14 @@ class _FullRecomputeFused(torch.autograd.Function):
         operator: EPChunkOverlapOperator,
         input_shape: torch.Size,
         input_dtype: torch.dtype,
-        fwd_chunks: int,
-        bwd_chunks: int,
+        chunks: int,
+        recv_capacity_rows: int,
         *params: torch.Tensor,
     ) -> torch.Tensor:
         del params, input_dtype
         ctx.operator = operator
-        ctx.bwd_chunks = bwd_chunks
+        ctx.chunks = chunks
+        ctx.recv_capacity_rows = recv_capacity_rows
         ctx.num_router_params = len(tuple(operator.router.parameters()))
         ctx.has_routing_input = routing_input is not None
         saved_routing = (
@@ -776,9 +827,15 @@ class _FullRecomputeFused(torch.autograd.Function):
         )
         ctx.save_for_backward(x_2d.detach(), saved_routing)
         ranges = ep_chunk_ranges(
-            x_2d.size(0), fwd_chunks, weights_env="MEGATRON_LITE_EP_CHUNK_WEIGHTS"
+            x_2d.size(0), chunks, weights_env="MEGATRON_LITE_EP_CHUNK_WEIGHTS"
         )
-        output = operator._forward_output_only(x_2d, ranges, input_shape, x_2d.dtype)
+        output = operator._forward_output_only(
+            x_2d,
+            ranges,
+            input_shape,
+            x_2d.dtype,
+            recv_capacity_rows,
+        )
         return output.detach().view(input_shape)
 
     @staticmethod
@@ -788,8 +845,13 @@ class _FullRecomputeFused(torch.autograd.Function):
         grad_2d = grad_output.contiguous().view(-1, grad_output.size(-1))
         routing_input = routing_saved if ctx.has_routing_input else None
         with operator._routing_context(routing_input), torch.enable_grad():
-            grad_x, router_grads, expert_grads = operator._full_recompute_fused_backward(
-                x_saved, grad_2d, ctx.bwd_chunks
+            grad_x, router_grads, expert_grads = (
+                operator._full_recompute_fused_backward(
+                    x_saved,
+                    grad_2d,
+                    ctx.chunks,
+                    ctx.recv_capacity_rows,
+                )
             )
         return (
             grad_x,

@@ -358,6 +358,7 @@ def test_forward_trace_launches_current_expert_before_blocking_next_dispatch(
         [(0, 2), (2, 4), (4, 6)],
         inputs.shape,
         inputs.dtype,
+        recv_capacity_rows=0,
         disable_expert_act_recompute=False,
     )
 
@@ -389,6 +390,35 @@ def test_forward_trace_launches_current_expert_before_blocking_next_dispatch(
         "combine.finish.1",
         "combine.finish.2",
     ]
+
+
+def test_recv_capacity_uses_ep_wide_max_for_uneven_thd(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import moe_ep_chunk_overlap as overlap
+
+    monkeypatch.delenv("MEGATRON_LITE_EP_CHUNK_WEIGHTS", raising=False)
+    calls = []
+
+    def fake_all_reduce(value, *, op, group):
+        calls.append((int(value.item()), op, group))
+        value.fill_(11)
+
+    monkeypatch.setattr(overlap.dist, "all_reduce", fake_all_reduce)
+    operator = object.__new__(overlap.EPChunkOverlapOperator)
+    operator.dispatcher = SimpleNamespace(
+        ep_size=3,
+        ps=SimpleNamespace(tp_size=1, tp_ep_group="ep-group"),
+    )
+
+    capacity = operator._recv_capacity_rows(torch.empty(5, 2), chunks=2)
+
+    # Global max rows=11 splits into [6, 5], so every receive rank is bounded
+    # by six rows from each of the three EP senders. local_rows * EP (=15)
+    # would be unsafe for this uneven THD batch.
+    assert capacity == 18
+    assert calls == [(5, overlap.dist.ReduceOp.MAX, "ep-group")]
 
 
 def test_core_contains_token_wise_forward_and_backward_deepep_pipeline():
