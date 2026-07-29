@@ -306,7 +306,12 @@ class EPChunkOverlapOperator:
                 comm_stream.wait_event(input_ready)
                 scores, indices = self._route(x_chunk, start, end)
                 with _ep_chunk_nvtx("forward.dispatch", chunk_idx):
-                    state = dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
+                    state = dispatcher.submit_deepep_dispatch(
+                        x_chunk,
+                        scores,
+                        indices,
+                        allocate_on_comm_stream=True,
+                    )
             return chunk_idx, dispatcher, state
 
         def finish_dispatch_expert_submit_combine(pending):
@@ -352,7 +357,9 @@ class EPChunkOverlapOperator:
                 comm_stream.wait_event(ready)
                 with _ep_chunk_nvtx("forward.combine", chunk_idx):
                     combine_state = dispatcher.submit_deepep_combine_prepared(
-                        rank_grouped, handle
+                        rank_grouped,
+                        handle,
+                        allocate_on_comm_stream=True,
                     )
             del dispatched, probs, expert_out
             return dispatcher, combine_state
@@ -465,7 +472,12 @@ class EPChunkOverlapOperator:
                 chain_deepep_event()
                 with _ep_chunk_nvtx("backward.dispatch", chunk_idx):
                     state = remember_deepep_event(
-                        dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
+                        dispatcher.submit_deepep_dispatch(
+                            x_chunk,
+                            scores,
+                            indices,
+                            allocate_on_comm_stream=True,
+                        )
                     )
             return chunk_idx, start, end, x_chunk, scores, state
 
@@ -475,7 +487,11 @@ class EPChunkOverlapOperator:
                 chain_deepep_event()
                 with _ep_chunk_nvtx("backward.combine", chunk_idx):
                     return remember_deepep_event(
-                        dispatcher.submit_deepep_combine_backward(grad_chunk, handle)
+                        dispatcher.submit_deepep_combine_backward(
+                            grad_chunk,
+                            handle,
+                            allocate_on_comm_stream=True,
+                        )
                     )
 
         def finish_recompute_expert(chunk_idx: int, state: dict[str, Any]):
@@ -644,6 +660,7 @@ class EPChunkOverlapOperator:
                                 local_state["grad_recv_hidden"],
                                 local_state["grad_recv_probs"],
                                 chunk.handle,
+                                allocate_on_comm_stream=True,
                             )
                         )
                     _release_dispatch_scratch(chunk, comm_stream)

@@ -282,7 +282,10 @@ def test_forward_trace_pipelines_next_dispatch_before_current_expert(
             self.chunk = chunk
             self._local_tpe_list = [2]
 
-        def submit_deepep_dispatch(self, hidden, _scores, _indices):
+        def submit_deepep_dispatch(
+            self, hidden, _scores, _indices, *, allocate_on_comm_stream
+        ):
+            assert allocate_on_comm_stream is True
             trace.append(f"dispatch.submit.{self.chunk}")
             return {
                 "hidden": hidden,
@@ -300,7 +303,10 @@ def test_forward_trace_pipelines_next_dispatch_before_current_expert(
             trace.append(f"combine.prepare.{self.chunk}")
             return expert_output, f"handle-{self.chunk}"
 
-        def submit_deepep_combine_prepared(self, output, _handle):
+        def submit_deepep_combine_prepared(
+            self, output, _handle, *, allocate_on_comm_stream
+        ):
+            assert allocate_on_comm_stream is True
             trace.append(f"combine.submit.{self.chunk}")
             return {"output": output}
 
@@ -396,6 +402,38 @@ def test_core_contains_token_wise_forward_and_backward_deepep_pipeline():
         "submit_deepep_dispatch_backward",
         "finish_deepep_dispatch_backward",
     } <= calls
+
+
+def test_async_deepep_submissions_allocate_on_comm_stream():
+    source_path = (
+        Path(__file__).parents[3]
+        / "megatron"
+        / "lite"
+        / "primitive"
+        / "modules"
+        / "moe_ep_chunk_overlap.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    async_submit_names = {
+        "submit_deepep_dispatch",
+        "submit_deepep_combine_prepared",
+        "submit_deepep_combine_backward",
+        "submit_deepep_dispatch_backward",
+    }
+    submissions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in async_submit_names
+    ]
+
+    assert submissions
+    for submission in submissions:
+        keywords = {keyword.arg: keyword.value for keyword in submission.keywords}
+        value = keywords.get("allocate_on_comm_stream")
+        assert isinstance(value, ast.Constant)
+        assert value.value is True
 
 
 def test_workspace_shape_metrics_report_and_reset_jitter(monkeypatch):
