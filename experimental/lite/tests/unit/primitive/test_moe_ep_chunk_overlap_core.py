@@ -559,6 +559,35 @@ def test_fixed_capacity_scratch_release_records_the_consumer_stream(monkeypatch)
     assert slot.stream_key == stream.cuda_stream
 
 
+def test_deepep_state_tensors_record_the_consumer_stream(monkeypatch):
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    class FakeTensor:
+        is_cuda = True
+        device = torch.device("cuda", 0)
+
+        def __init__(self):
+            self.recorded_stream = None
+
+        def record_stream(self, stream):
+            self.recorded_stream = stream
+
+    stream = object()
+    outer = FakeTensor()
+    nested = FakeTensor()
+    monkeypatch.setattr(
+        overlap.torch, "is_tensor", lambda value: isinstance(value, FakeTensor)
+    )
+    monkeypatch.setattr(overlap.torch.cuda, "current_stream", lambda _device: stream)
+
+    overlap._record_state_tensors_current_stream(
+        {"recv_hidden": outer, "metadata": {"recv_probs": nested}, "handle": object()}
+    )
+
+    assert outer.recorded_stream is stream
+    assert nested.recorded_stream is stream
+
+
 def test_fixed_capacity_scratch_fails_loud_on_capacity_overflow():
     from megatron.lite.primitive.utils.cuda_allocator import (
         _reset_fixed_capacity_scratch_for_tests,

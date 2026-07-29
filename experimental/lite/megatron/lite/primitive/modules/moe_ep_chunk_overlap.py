@@ -118,6 +118,14 @@ def _event_current_stream_wait(event: Any) -> None:
         torch.cuda.current_stream().wait_event(event)
 
 
+def _record_state_tensors_current_stream(state: dict[str, Any]) -> None:
+    for value in state.values():
+        if torch.is_tensor(value) and value.is_cuda:
+            value.record_stream(torch.cuda.current_stream(value.device))
+        elif isinstance(value, dict):
+            _record_state_tensors_current_stream(value)
+
+
 @contextmanager
 def _expert_act_recompute_disabled(experts: Experts):
     previous = experts.moe_act_recompute
@@ -325,6 +333,7 @@ class EPChunkOverlapOperator:
             with torch.cuda.stream(compute_stream):
                 with _ep_chunk_nvtx("forward.dispatch.finish", chunk_idx):
                     dispatched, tpe, probs = dispatcher.finish_deepep_dispatch(state)
+                _record_state_tensors_current_stream(state)
                 recv_hidden = state.get("recv_hidden")
                 _record_ep_chunk_shape(
                     chunk_idx=chunk_idx,
@@ -507,6 +516,7 @@ class EPChunkOverlapOperator:
                         state, force_manual_map=True, force_direct_permute=True
                     )
                 )
+                _record_state_tensors_current_stream(state)
                 with _expert_act_recompute_disabled(self.experts):
                     expert_input = dispatched.detach().requires_grad_(True)
                     expert_probs = (
