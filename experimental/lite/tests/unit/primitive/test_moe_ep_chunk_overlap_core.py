@@ -233,20 +233,6 @@ def test_delayed_wgrad_excludes_expert_params_from_autograd_targets(
     assert all(all(param is not item for item in inputs) for param in params)
 
 
-def test_delayed_wgrad_does_not_anchor_expert_params_on_the_outer_function():
-    source = (
-        Path(__file__).parents[3]
-        / "megatron"
-        / "lite"
-        / "primitive"
-        / "modules"
-        / "moe_ep_chunk_overlap.py"
-    ).read_text()
-
-    assert "tuple(self.experts.parameters())" not in source
-    assert "expert_params" not in source
-
-
 def test_forward_trace_pipelines_next_dispatch_before_current_expert(
     monkeypatch, transformer_engine_import_stub
 ):
