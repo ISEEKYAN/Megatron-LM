@@ -86,6 +86,7 @@ class MoELayer(nn.Module):
                     config.hidden_size,
                     ps,
                     use_deepep=use_deepep,
+                    moe_permute_fusion=True,
                     buffer_slot=("ep_chunk_overlap", "forward", layer_slot, idx),
                 )
                 for idx in range(num_chunks_ep_a2a_overlap)
