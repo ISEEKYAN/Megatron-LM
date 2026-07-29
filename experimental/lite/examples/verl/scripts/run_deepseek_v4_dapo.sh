@@ -308,7 +308,7 @@ TRAINER=(
   "trainer.default_local_dir=${CKPT_DIR}"
   "trainer.val_before_train=False"
   "trainer.log_val_generations=10"
-  "+ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS=${OMP_NUM_THREADS}"
+  "+ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS='${OMP_NUM_THREADS}'"
 )
 
 REWARD=(

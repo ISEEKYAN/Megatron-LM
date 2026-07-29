@@ -69,6 +69,6 @@ def test_ray_runtime_env_matches_torchrun_omp_contract(
     command = _dry_run(script, tmp_path, configured)
 
     assert (
-        f"+ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS={expected}"
+        f"+ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS=\\'{expected}\\'"
         in command
     )
