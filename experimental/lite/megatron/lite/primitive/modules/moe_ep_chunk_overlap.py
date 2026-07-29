@@ -306,7 +306,12 @@ class EPChunkOverlapOperator:
                 comm_stream.wait_event(input_ready)
                 scores, indices = self._route(x_chunk, start, end)
                 with _ep_chunk_nvtx("forward.dispatch", chunk_idx):
-                    state = dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
+                    state = dispatcher.submit_deepep_dispatch(
+                        x_chunk,
+                        scores,
+                        indices,
+                        num_worst_tokens=x_chunk.size(0) * dispatcher.ep_size,
+                    )
             return chunk_idx, dispatcher, state
 
         def finish_dispatch_expert(pending):
@@ -467,7 +472,12 @@ class EPChunkOverlapOperator:
                 chain_deepep_event()
                 with _ep_chunk_nvtx("backward.dispatch", chunk_idx):
                     state = remember_deepep_event(
-                        dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
+                        dispatcher.submit_deepep_dispatch(
+                            x_chunk,
+                            scores,
+                            indices,
+                            num_worst_tokens=x_chunk.size(0) * dispatcher.ep_size,
+                        )
                     )
             return chunk_idx, start, end, x_chunk, scores, state
 

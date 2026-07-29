@@ -687,6 +687,7 @@ class TokenDispatcher:
         *,
         allocate_on_comm_stream: bool = False,
         async_finish: bool = True,
+        num_worst_tokens: int = 0,
     ):
         if not self.use_deepep:
             raise RuntimeError("submit_deepep_dispatch requires DeepEP dispatch.")
@@ -710,6 +711,18 @@ class TokenDispatcher:
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
+        if num_tokens_per_rdma_rank is not None or getattr(self.ps, "tp_size", 1) != 1:
+            num_worst_tokens = 0
+        recv_counts = None
+        recv_counts_work = None
+        if num_worst_tokens:
+            _event_current_stream_wait(event)
+            recv_counts = num_tokens_per_expert.clone()
+            recv_counts_work = dist.all_reduce(
+                recv_counts,
+                group=self.ps.tp_ep_group,
+                async_op=True,
+            )
 
         hidden_states_contig = hidden_states.contiguous()
         recv_hidden, recv_indices, recv_probs, recv_per_expert, handle, event = (
@@ -721,6 +734,7 @@ class TokenDispatcher:
                 num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
                 is_token_in_rank=is_token_in_rank,
                 num_tokens_per_expert=num_tokens_per_expert,
+                num_worst_tokens=num_worst_tokens,
                 previous_event=event,
                 async_finish=async_finish,
                 allocate_on_comm_stream=allocate_on_comm_stream,
@@ -732,9 +746,24 @@ class TokenDispatcher:
             "recv_indices": recv_indices,
             "recv_probs": recv_probs,
             "recv_per_expert": recv_per_expert,
+            "recv_counts": recv_counts,
+            "recv_counts_work": recv_counts_work,
             "handle": handle,
             "event": event,
         }
+
+    def _resolve_deepep_recv_per_expert(self, state):
+        recv_per_expert = state["recv_per_expert"]
+        if recv_per_expert is not None and len(recv_per_expert) > 0:
+            return recv_per_expert
+        recv_counts = state.pop("recv_counts", None)
+        recv_counts_work = state.pop("recv_counts_work", None)
+        if recv_counts is None or recv_counts_work is None:
+            return recv_per_expert
+        recv_counts_work.wait()
+        start = self.ps.ep_rank * self.num_local_experts
+        end = start + self.num_local_experts
+        return recv_counts[start:end].tolist()
 
     def finish_deepep_dispatch(self, state):
         if not self.use_deepep:
@@ -742,11 +771,12 @@ class TokenDispatcher:
         self._handle = state["handle"]
         self._deepep_event = state["event"]
         self.wait_dispatch_event()
+        recv_per_expert = self._resolve_deepep_recv_per_expert(state)
         return self._finish_deepep_dispatch(
             state["recv_hidden"],
             state["recv_indices"],
             state["recv_probs"],
-            state["recv_per_expert"],
+            recv_per_expert,
         )
 
     def _finish_deepep_dispatch(
@@ -893,12 +923,13 @@ class TokenDispatcher:
                 "finish_deepep_dispatch_external requires DeepEP dispatch."
             )
         _event_current_stream_wait(state.get("event"))
+        recv_per_expert = self._resolve_deepep_recv_per_expert(state)
         dispatched, local_tpe, permuted_probs, metadata = (
             self._finish_deepep_dispatch_external(
                 state["recv_hidden"],
                 state["recv_indices"],
                 state["recv_probs"],
-                state["recv_per_expert"],
+                recv_per_expert,
                 force_manual_map=force_manual_map,
                 force_direct_permute=force_direct_permute,
             )

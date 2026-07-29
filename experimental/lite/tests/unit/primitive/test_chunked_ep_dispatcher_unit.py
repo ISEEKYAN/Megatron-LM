@@ -136,6 +136,49 @@ def test_deepep_dispatch_materializes_contiguous_router_outputs():
     assert buffer.dispatch_calls[0][1]["topk_weights"].is_contiguous()
 
 
+def test_fixed_capacity_dispatch_resolves_global_local_expert_counts(monkeypatch):
+    class Work:
+        waited = False
+
+        def wait(self):
+            self.waited = True
+
+    class Buffer(_Buffer):
+        def get_dispatch_layout(self, _topk_indices, **_kwargs):
+            return (
+                torch.zeros(2, dtype=torch.int32),
+                None,
+                torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+                torch.zeros(3, 2, dtype=torch.bool),
+                _Event(),
+            )
+
+    work = Work()
+
+    def all_reduce(counts, group, async_op):
+        assert group is value.ps.tp_ep_group
+        assert async_op
+        counts.add_(torch.tensor([10, 20, 30, 40], dtype=counts.dtype))
+        return work
+
+    monkeypatch.setattr(
+        dispatcher_module, "_event_current_stream_wait", lambda _event: None
+    )
+    value = _dispatcher(Buffer())
+    value.ps = SimpleNamespace(tp_ep_group=object(), ep_rank=1)
+    monkeypatch.setattr(dispatcher_module.dist, "all_reduce", all_reduce)
+    hidden = torch.zeros(3, 2)
+    scores = torch.ones(3, 1)
+    indices = torch.zeros(3, 1, dtype=torch.long)
+
+    state = value.submit_deepep_dispatch(hidden, scores, indices, num_worst_tokens=24)
+    recv_per_expert = value._resolve_deepep_recv_per_expert(state)
+
+    assert value.buffer.dispatch_calls[0][1]["num_worst_tokens"] == 24
+    assert recv_per_expert == [33, 44]
+    assert work.waited
+
+
 def test_prepared_combine_preserves_manual_metadata_and_finishes(monkeypatch):
     value = _dispatcher()
     monkeypatch.setattr(

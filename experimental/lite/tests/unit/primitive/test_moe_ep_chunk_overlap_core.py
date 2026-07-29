@@ -280,9 +280,13 @@ def test_forward_trace_launches_current_expert_before_blocking_next_dispatch(
     class FakeDispatcher:
         def __init__(self, chunk):
             self.chunk = chunk
+            self.ep_size = 3
             self._local_tpe_list = [2]
 
-        def submit_deepep_dispatch(self, hidden, _scores, _indices):
+        def submit_deepep_dispatch(
+            self, hidden, _scores, _indices, *, num_worst_tokens
+        ):
+            assert num_worst_tokens == hidden.size(0) * self.ep_size
             trace.append(f"dispatch.submit.{self.chunk}")
             return {
                 "hidden": hidden,
