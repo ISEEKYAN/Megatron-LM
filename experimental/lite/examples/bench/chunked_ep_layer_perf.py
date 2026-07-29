@@ -48,10 +48,26 @@ def _all_reduce_max(value: float, device: torch.device) -> float:
 def _global_grad_norm(module: torch.nn.Module, device: torch.device) -> float:
     squared = torch.zeros((), dtype=torch.float64, device=device)
     for parameter in module.parameters():
-        if parameter.grad is not None:
-            squared += parameter.grad.detach().double().square().sum()
+        grad = _parameter_grad(parameter)
+        if grad is not None:
+            squared += grad.detach().double().square().sum()
     dist.all_reduce(squared, op=dist.ReduceOp.SUM)
     return math.sqrt(float(squared.item()))
+
+
+def _parameter_grad(parameter: torch.Tensor) -> torch.Tensor | None:
+    if parameter.grad is not None:
+        return parameter.grad
+    return getattr(parameter, "main_grad", None)
+
+
+def _zero_grads(module: torch.nn.Module) -> None:
+    module.zero_grad(set_to_none=True)
+    for parameter in module.parameters():
+        main_grad = getattr(parameter, "main_grad", None)
+        if main_grad is not None:
+            main_grad.zero_()
+            parameter.grad_added_to_main_grad = False
 
 
 def _full_recompute_output(
@@ -79,7 +95,7 @@ def _run_once(
     mode: str,
     native_chunked_recompute: bool,
 ) -> tuple[float, float]:
-    module.zero_grad(set_to_none=True)
+    _zero_grads(module)
     hidden = base_hidden.detach().clone().requires_grad_(True)
     torch.cuda.reset_peak_memory_stats(hidden.device)
 
@@ -114,7 +130,7 @@ def _run_once(
 
     elapsed_ms = _time_call(call)
     peak_gb = torch.cuda.max_memory_allocated(hidden.device) / 1e9
-    module.zero_grad(set_to_none=True)
+    _zero_grads(module)
     return elapsed_ms, peak_gb
 
 
@@ -182,7 +198,7 @@ def _parity(
     losses = []
     grad_norms = []
     for module, native_chunked_recompute in ((baseline, False), (candidate, True)):
-        module.zero_grad(set_to_none=True)
+        _zero_grads(module)
         x = hidden.detach().clone().requires_grad_(True)
         output = _full_recompute_output(
             module, x, native_chunked_recompute=native_chunked_recompute
@@ -193,14 +209,14 @@ def _parity(
         input_grads.append(x.grad.detach())
         param_grads.append(
             {
-                name: parameter.grad.detach().clone()
+                name: grad.detach().clone()
                 for name, parameter in module.named_parameters()
-                if parameter.grad is not None
+                if (grad := _parameter_grad(parameter)) is not None
             }
         )
         losses.append(float(loss.detach()))
         grad_norms.append(_global_grad_norm(module, hidden.device))
-        module.zero_grad(set_to_none=True)
+        _zero_grads(module)
 
     output_max_abs = float((outputs[1] - outputs[0]).abs().max())
     input_grad_max_abs = float((input_grads[1] - input_grads[0]).abs().max())
@@ -251,6 +267,9 @@ def main() -> int:
         layer_idx=0,
     ).to(torch.bfloat16).cuda()
     candidate.load_state_dict(baseline.state_dict())
+    for parameter in candidate.experts.parameters():
+        parameter.main_grad = torch.zeros_like(parameter, dtype=torch.float32)
+        parameter.grad_added_to_main_grad = False
     assert baseline.dispatcher.use_deepep
     assert candidate.ep_chunk_overlap.dispatcher.use_deepep
 
