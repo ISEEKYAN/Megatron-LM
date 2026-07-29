@@ -58,14 +58,13 @@ class DeepseekV4MoE(nn.Module):
         self.ep_chunk_dispatchers = ()
         self.ep_chunk_overlap = None
         if num_chunks_ep_a2a_overlap > 1:
-            layer_slot = int(layer_idx) % 8
             self.ep_chunk_dispatchers = tuple(
                 TokenDispatcher(
                     config.n_routed_experts,
                     config.hidden_size,
                     ps,
                     use_deepep=use_deepep,
-                    buffer_slot=("ep_chunk_overlap", "forward", layer_slot, idx),
+                    buffer_slot=("ep_chunk_overlap", "forward", idx),
                 )
                 for idx in range(num_chunks_ep_a2a_overlap)
             )

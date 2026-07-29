@@ -291,7 +291,6 @@ class MoELayer(nn.Module):
         fp8: bool,
         moe_act_recompute: bool,
         num_chunks_ep_a2a_overlap: int = 1,
-        layer_idx: int | None = None,
     ):
         super().__init__()
         if fp8:
@@ -321,14 +320,13 @@ class MoELayer(nn.Module):
         self.ep_chunk_dispatchers = ()
         self.ep_chunk_overlap = None
         if num_chunks_ep_a2a_overlap > 1:
-            layer_slot = id(self) if layer_idx is None else int(layer_idx) % 8
             self.ep_chunk_dispatchers = tuple(
                 TokenDispatcher(
                     config.num_experts,
                     config.hidden_size,
                     ps,
                     use_deepep=use_deepep,
-                    buffer_slot=("ep_chunk_overlap", "forward", layer_slot, idx),
+                    buffer_slot=("ep_chunk_overlap", "forward", idx),
                 )
                 for idx in range(num_chunks_ep_a2a_overlap)
             )
@@ -413,7 +411,6 @@ class Glm5Layer(nn.Module):
                 fp8=fp8,
                 moe_act_recompute=moe_act_recompute,
                 num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
-                layer_idx=layer_idx,
             )
             self.mlp: DenseMLP | None = None
         else:

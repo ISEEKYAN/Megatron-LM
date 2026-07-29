@@ -53,7 +53,6 @@ class MoELayer(nn.Module):
         moe_act_recompute: bool = False,
         num_chunks_ep_a2a_overlap: int = 1,
         lora_config: LoraConfig | dict | None = None,
-        layer_idx: int | None = None,
     ):
         super().__init__()
         self.router = TopKRouter(
@@ -79,14 +78,13 @@ class MoELayer(nn.Module):
         self.ep_chunk_dispatchers = ()
         self.ep_chunk_overlap = None
         if num_chunks_ep_a2a_overlap > 1:
-            layer_slot = id(self) if layer_idx is None else int(layer_idx) % 8
             self.ep_chunk_dispatchers = tuple(
                 TokenDispatcher(
                     config.num_experts,
                     config.hidden_size,
                     ps,
                     use_deepep=use_deepep,
-                    buffer_slot=("ep_chunk_overlap", "forward", layer_slot, idx),
+                    buffer_slot=("ep_chunk_overlap", "forward", idx),
                 )
                 for idx in range(num_chunks_ep_a2a_overlap)
             )
@@ -185,7 +183,6 @@ class TransformerLayer(nn.Module):
             moe_act_recompute=moe_act_recompute,
             num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
             lora_config=lora_config,
-            layer_idx=layer_idx,
         )
 
     def forward(

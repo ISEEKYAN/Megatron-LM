@@ -41,6 +41,8 @@ def test_every_lite_moe_model_consumes_the_shared_chunked_ep_primitive(
     assert "class MoELayer(EPChunkOverlap" not in implementation
     assert "class DeepseekV4MoE(EPChunkOverlap" not in implementation
     assert "num_chunks_ep_a2a_overlap" in implementation
+    assert 'buffer_slot=("ep_chunk_overlap", "forward", idx)' in implementation
+    assert "layer_slot" not in implementation
 
 
 def test_backward_specific_chunk_parameter_is_removed_from_product_code():

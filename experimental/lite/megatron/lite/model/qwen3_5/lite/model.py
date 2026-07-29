@@ -167,7 +167,6 @@ class MoELayer(nn.Module):
         shared_expert_plain_te: bool = False,
         moe_permute_fusion: bool | None = None,
         num_chunks_ep_a2a_overlap: int = 1,
-        layer_idx: int | None = None,
     ):
         super().__init__()
         if fp8:
@@ -196,7 +195,6 @@ class MoELayer(nn.Module):
         self.ep_chunk_dispatchers = ()
         self.ep_chunk_overlap = None
         if num_chunks_ep_a2a_overlap > 1:
-            layer_slot = id(self) if layer_idx is None else int(layer_idx) % 8
             self.ep_chunk_dispatchers = tuple(
                 TokenDispatcher(
                     config.num_experts,
@@ -204,7 +202,7 @@ class MoELayer(nn.Module):
                     ps,
                     use_deepep=use_deepep,
                     moe_permute_fusion=moe_permute_fusion,
-                    buffer_slot=("ep_chunk_overlap", "forward", layer_slot, idx),
+                    buffer_slot=("ep_chunk_overlap", "forward", idx),
                 )
                 for idx in range(num_chunks_ep_a2a_overlap)
             )
@@ -325,7 +323,6 @@ class Qwen35Layer(nn.Module):
             shared_expert_plain_te=deterministic,
             moe_permute_fusion=True,
             num_chunks_ep_a2a_overlap=num_chunks_ep_a2a_overlap,
-            layer_idx=layer_idx,
         )
 
     def forward(
