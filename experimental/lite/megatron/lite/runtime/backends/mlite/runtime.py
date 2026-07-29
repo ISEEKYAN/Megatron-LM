@@ -515,10 +515,6 @@ class MegatronLiteRuntime(RuntimeBase):
                 dist.broadcast(loss_payload, src=ps.pp_global_ranks[-1], group=ps.pp_group)
             out = {"loss": loss_payload[1]} if bool(loss_payload[0].item()) else {}
         else:
-            impl_cfg = getattr(handle._config, "impl_cfg", {}) or {}
-            overlap_forward_backward = (
-                int(impl_cfg.get("num_chunks_ep_a2a_overlap", 1)) == 2
-            )
             try:
                 out = run_microbatch_loop(
                     handle._model,
@@ -530,7 +526,6 @@ class MegatronLiteRuntime(RuntimeBase):
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),
                     loss_fn=loss_fn,
                     forward_only=forward_only,
-                    overlap_forward_backward=overlap_forward_backward,
                 )
             finally:
                 if replay_driver is not None:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import threading
 
 import pytest
 import torch
@@ -14,35 +13,6 @@ from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     resolve_ep_chunk_overlap_chunks,
     validate_ep_chunk_overlap_config,
 )
-
-
-def test_adjacent_ep_overlap_orders_unequal_collective_counts():
-    from megatron.lite.primitive.parallel.ep_overlap import (
-        adjacent_ep_overlap,
-        ep_overlap_role,
-        ordered_ep_submission,
-    )
-
-    order = []
-
-    def run(role, count):
-        with ep_overlap_role(role):
-            for _ in range(count):
-                with ordered_ep_submission():
-                    order.append(role)
-
-    with adjacent_ep_overlap():
-        backward = threading.Thread(target=run, args=("backward", 6))
-        forward = threading.Thread(target=run, args=("forward", 4))
-        backward.start()
-        forward.start()
-        backward.join(timeout=5)
-        forward.join(timeout=5)
-
-    assert not backward.is_alive()
-    assert not forward.is_alive()
-    assert order[:8] == ["backward", "forward"] * 4
-    assert order[8:] == ["backward", "backward"]
 
 
 @pytest.mark.parametrize("value, expected", [(1, 1), (2, 2), ("2", 2)])
