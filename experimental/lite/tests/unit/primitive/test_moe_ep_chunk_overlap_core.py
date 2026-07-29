@@ -165,6 +165,38 @@ def test_dispatch_local_backward_materializes_zero_probability_gradient(
     assert grad_probs.shape == (0, 2)
 
 
+def test_dispatch_scratch_is_released_with_comm_stream_ownership(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _release_dispatch_scratch,
+    )
+
+    stream = object()
+
+    class Scratch:
+        def __init__(self):
+            self.stream = None
+
+        def record_stream(self, value):
+            self.stream = value
+
+    hidden = Scratch()
+    probs = Scratch()
+    chunk = SimpleNamespace(
+        recv_hidden_scratch=hidden,
+        recv_probs_scratch=probs,
+    )
+
+    _release_dispatch_scratch(chunk, stream)
+
+    assert hidden.stream is stream
+    assert probs.stream is stream
+    assert chunk.recv_hidden_scratch is None
+    assert chunk.recv_probs_scratch is None
+
+
 def test_accumulate_reuses_first_chunk_gradient_storage(
     transformer_engine_import_stub,
 ):

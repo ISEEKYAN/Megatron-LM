@@ -79,8 +79,8 @@ class _BackwardChunk:
     handle: Any
     row_id_map: torch.Tensor
     prob_flat_indices: torch.Tensor
-    recv_hidden_scratch: torch.Tensor
-    recv_probs_scratch: torch.Tensor
+    recv_hidden_scratch: torch.Tensor | None
+    recv_probs_scratch: torch.Tensor | None
     dispatched: torch.Tensor
     probs: torch.Tensor | None
     expert_out: torch.Tensor | None
@@ -564,6 +564,7 @@ class EPChunkOverlapOperator:
                             chunk.handle,
                         )
                     )
+                    _release_dispatch_scratch(chunk, comm_stream)
                     local_state.pop("grad_recv_hidden", None)
                     local_state.pop("grad_recv_probs", None)
 
@@ -695,6 +696,8 @@ def _dispatch_local_backward(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     row_id_map = chunk.row_id_map.reshape(-1).to(torch.long)
     grad_recv_hidden = chunk.recv_hidden_scratch
+    if grad_recv_hidden is None:
+        raise RuntimeError("EP chunk overlap recv-hidden scratch was released early.")
     grad_recv_hidden.zero_()
     grad_recv_hidden.scatter_add_(
         0,
@@ -702,6 +705,8 @@ def _dispatch_local_backward(
         grad_dispatched.to(grad_recv_hidden.dtype),
     )
     grad_recv_probs = chunk.recv_probs_scratch
+    if grad_recv_probs is None:
+        raise RuntimeError("EP chunk overlap recv-probs scratch was released early.")
     grad_recv_probs.zero_()
     if grad_probs is not None:
         flat = chunk.prob_flat_indices.reshape(-1).to(grad_probs.device, torch.long)
@@ -709,6 +714,16 @@ def _dispatch_local_backward(
             0, flat, grad_probs.reshape(-1).to(grad_recv_probs.dtype)
         )
     return grad_recv_hidden, grad_recv_probs
+
+
+def _release_dispatch_scratch(
+    chunk: _BackwardChunk, stream: torch.cuda.Stream
+) -> None:
+    for name in ("recv_hidden_scratch", "recv_probs_scratch"):
+        tensor = getattr(chunk, name)
+        if tensor is not None:
+            tensor.record_stream(stream)
+            setattr(chunk, name, None)
 
 
 def _expert_grad_inputs(
