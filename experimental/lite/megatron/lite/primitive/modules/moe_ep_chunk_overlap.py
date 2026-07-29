@@ -294,83 +294,50 @@ class EPChunkOverlapOperator:
                 state = dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
             return chunk_idx, dispatcher, state
 
-        def finish_dispatch(pending):
+        def finish_dispatch_expert_submit_combine(pending):
             chunk_idx, dispatcher, state = pending
+            del chunk_idx
             with torch.cuda.stream(compute_stream):
                 dispatched, tpe, probs = dispatcher.finish_deepep_dispatch(state)
                 state.pop("recv_hidden", None)
                 state.pop("recv_indices", None)
                 state.pop("recv_probs", None)
                 state.pop("recv_per_expert", None)
-            counts = getattr(dispatcher, "_local_tpe_list", None)
-            if counts is None:
-                raise RuntimeError("DeepEP dispatch did not provide local expert counts.")
-            return chunk_idx, dispatcher, dispatched, tpe, probs, list(counts)
-
-        def submit_combine(dispatcher, prepared, ready):
-            rank_grouped, handle = prepared
+                expert_ctx = (
+                    _expert_act_recompute_disabled(self.experts)
+                    if disable_expert_act_recompute
+                    else nullcontext()
+                )
+                with expert_ctx:
+                    expert_out = self.experts(
+                        dispatched,
+                        tpe,
+                        probs,
+                        tokens_per_expert_list=getattr(
+                            dispatcher, "_local_tpe_list", None
+                        ),
+                    )
+                rank_grouped, handle = dispatcher.prepare_deepep_combine(expert_out)
+                ready = torch.cuda.Event()
+                ready.record(compute_stream)
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(ready)
                 combine_state = dispatcher.submit_deepep_combine_prepared(
                     rank_grouped, handle
                 )
+            del dispatched, probs, expert_out
             return dispatcher, combine_state
 
+        pending_combines = []
         with torch.no_grad():
-            dispatched_chunks = [
-                finish_dispatch(submit_dispatch(chunk_idx))
-                for chunk_idx in range(len(ranges))
-            ]
-            counts = [item[5] for item in dispatched_chunks]
-            merged_hidden = _merge_expert_chunks(
-                [item[2] for item in dispatched_chunks], counts
-            )
-            probs_present = [item[4] is not None for item in dispatched_chunks]
-            if any(probs_present) != all(probs_present):
-                raise RuntimeError("DeepEP chunks disagree on expert probability routing.")
-            merged_probs = (
-                _merge_expert_chunks(
-                    [item[4] for item in dispatched_chunks], counts
+            next_state = submit_dispatch(0)
+            for loop_idx in range(len(ranges)):
+                current_state = next_state
+                if loop_idx + 1 < len(ranges):
+                    next_state = submit_dispatch(loop_idx + 1)
+                pending_combines.append(
+                    finish_dispatch_expert_submit_combine(current_state)
                 )
-                if all(probs_present)
-                else None
-            )
-            merged_counts = [
-                sum(chunk_counts[idx] for chunk_counts in counts)
-                for idx in range(len(counts[0]))
-            ]
-            merged_tpe = torch.tensor(
-                merged_counts,
-                dtype=dispatched_chunks[0][3].dtype,
-                device=merged_hidden.device,
-            )
-            expert_ctx = (
-                _expert_act_recompute_disabled(self.experts)
-                if disable_expert_act_recompute
-                else nullcontext()
-            )
-            with torch.cuda.stream(compute_stream), expert_ctx:
-                merged_out = self.experts(
-                    merged_hidden,
-                    merged_tpe,
-                    merged_probs,
-                    tokens_per_expert_list=merged_counts,
-                )
-                expert_outputs = _split_expert_chunks(merged_out, counts)
-                prepared_combines = [
-                    item[1].prepare_deepep_combine(expert_out)
-                    for item, expert_out in zip(
-                        dispatched_chunks, expert_outputs, strict=True
-                    )
-                ]
-                ready = torch.cuda.Event()
-                ready.record(compute_stream)
-            pending_combines = [
-                submit_combine(item[1], prepared, ready)
-                for item, prepared in zip(
-                    dispatched_chunks, prepared_combines, strict=True
-                )
-            ]
 
         done = torch.cuda.Event()
         done.record(compute_stream)

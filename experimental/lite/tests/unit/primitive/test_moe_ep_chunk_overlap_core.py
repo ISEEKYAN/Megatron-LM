@@ -112,7 +112,7 @@ def test_dispatch_local_backward_materializes_zero_probability_gradient(
     assert grad_probs.shape == (0, 2)
 
 
-def test_forward_trace_batches_all_chunks_into_one_expert_launch(
+def test_forward_trace_pipelines_next_dispatch_before_current_expert(
     monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
@@ -198,16 +198,28 @@ def test_forward_trace_batches_all_chunks_into_one_expert_launch(
 
     torch.testing.assert_close(output, inputs + 1)
     operations = [item for item in trace if not item.startswith(("event.", "caller."))]
-    assert operations.count("expert.0") == 1
-    assert not any(item in operations for item in ("expert.1", "expert.2"))
-    expert_idx = operations.index("expert.0")
-    assert all(
-        operations.index(f"dispatch.finish.{idx}") < expert_idx for idx in range(3)
-    )
-    assert all(
-        operations.index(f"combine.prepare.{idx}") > expert_idx for idx in range(3)
-    )
-    assert operations[-3:] == [
+    assert operations == [
+        "comm.wait",
+        "dispatch.submit.0",
+        "comm.wait",
+        "dispatch.submit.1",
+        "dispatch.finish.0",
+        "expert.0",
+        "combine.prepare.0",
+        "comm.wait",
+        "combine.submit.0",
+        "comm.wait",
+        "dispatch.submit.2",
+        "dispatch.finish.1",
+        "expert.1",
+        "combine.prepare.1",
+        "comm.wait",
+        "combine.submit.1",
+        "dispatch.finish.2",
+        "expert.2",
+        "combine.prepare.2",
+        "comm.wait",
+        "combine.submit.2",
         "combine.finish.0",
         "combine.finish.1",
         "combine.finish.2",
