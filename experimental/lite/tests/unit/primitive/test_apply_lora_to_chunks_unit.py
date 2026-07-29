@@ -396,6 +396,19 @@ def test_lora_wrapped_linear_forwards_base_attrs():
     torch.testing.assert_close(wrapped(x), expected)
 
 
+def test_qkv_normalized_surface_requires_exact_base_output_protocol():
+    from megatron.lite.primitive.modules.lora_apply import (
+        _enable_qkv_normalized_output,
+    )
+
+    base_qkv = nn.Module()
+    base_qkv.linear = nn.Module()
+    base_qkv.linear.layer_norm_weight = nn.Parameter(torch.ones(4))
+
+    with pytest.raises(TypeError, match="does not expose its normalized linear input"):
+        _enable_qkv_normalized_output(base_qkv)
+
+
 def test_apply_lora_tp_layout_on_gqa_adapters():
     from megatron.lite.primitive.modules.lora_apply import (
         _attach_gqa_proj,
