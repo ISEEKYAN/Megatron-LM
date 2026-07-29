@@ -59,7 +59,9 @@ def register_training_hooks(model_list: list, optimizer) -> None:
 
         optimizer_config = getattr(optimizer, "config", None)
         overlap_param_gather = getattr(optimizer_config, "overlap_param_gather", False)
-        overlap_grad_reduce = getattr(one_model.ddp_config, "overlap_grad_reduce", False)
+        overlap_grad_reduce = getattr(
+            one_model.ddp_config, "overlap_grad_reduce", False
+        )
         align_grad_reduce = True
         align_param_gather = getattr(one_model.ddp_config, "align_param_gather", False)
 
@@ -137,7 +139,9 @@ def offload_model_to_cpu(model_list: list) -> None:
             for buffers in all_buffers:
                 for buffer in buffers:
                     if buffer.param_data.storage().size() > 0:
-                        buffer.param_data.cpu_data = buffer.param_data.data.cpu().pin_memory()
+                        buffer.param_data.cpu_data = (
+                            buffer.param_data.data.cpu().pin_memory()
+                        )
                         buffer.param_data_size = buffer.param_data.storage().size()
                         buffer.param_data.storage().resize_(0)
 
@@ -180,7 +184,9 @@ def load_model_to_gpu(model_list: list, load_grad: bool = True) -> None:
 
                     if buffer.param_data.storage().size() == 0:
                         buffer.param_data.storage().resize_(buffer.param_data_size)
-                        buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=True)
+                        buffer.param_data.copy_(
+                            buffer.param_data.cpu_data, non_blocking=True
+                        )
 
             for param in model_chunk.module.parameters():
                 if not param.requires_grad and param.device.type == "cpu":
@@ -202,7 +208,8 @@ def offload_optimizer(optimizer) -> None:
         if _opt.optimizer is not None:
             hdo = _opt.optimizer
             if all(
-                hasattr(hdo, a) for a in ("sub_optimizers", "inner_param_to_orig_param", "state")
+                hasattr(hdo, a)
+                for a in ("sub_optimizers", "inner_param_to_orig_param", "state")
             ):
                 for sub_opt in hdo.sub_optimizers:
                     for param, state in sub_opt.state.items():
@@ -267,7 +274,9 @@ def build_sharded_state_dict(
         sharded_state_dict.update(chunk_sd)
 
     if optimizer is not None:
-        opt_sd = optimizer.sharded_state_dict(model_sharded_state_dict=sharded_state_dict)
+        opt_sd = optimizer.sharded_state_dict(
+            model_sharded_state_dict=sharded_state_dict
+        )
         sharded_state_dict.update(opt_sd)
 
     if lr_scheduler is not None:

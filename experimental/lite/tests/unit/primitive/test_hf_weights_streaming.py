@@ -37,7 +37,8 @@ class _FakeSharded(nn.Module):
         super().__init__()
         for name in names:
             self.register_parameter(
-                name.replace(".", "_"), nn.Parameter(torch.zeros(2), requires_grad=False)
+                name.replace(".", "_"),
+                nn.Parameter(torch.zeros(2), requires_grad=False),
             )
         self._names = list(names)
 
@@ -88,7 +89,9 @@ def test_iter_export_stream_unexpected_name_fails_loud() -> None:
         list(_iter_export_named_parameters(chunk, base))
 
 
-def test_safe_tensor_reader_context_reuses_and_closes_shard(monkeypatch, tmp_path) -> None:
+def test_safe_tensor_reader_context_reuses_and_closes_shard(
+    monkeypatch, tmp_path
+) -> None:
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"a": "shard.safetensors", "b": "shard.safetensors"}})
     )
@@ -118,7 +121,9 @@ def test_safe_tensor_reader_context_reuses_and_closes_shard(monkeypatch, tmp_pat
     assert events == ["enter", ("get", "a"), ("get", "b"), "exit"]
 
 
-def test_stream_export_removes_stale_owned_files_when_reusing_directory(tmp_path) -> None:
+def test_stream_export_removes_stale_owned_files_when_reusing_directory(
+    tmp_path,
+) -> None:
     for name in (
         "model.safetensors",
         "model-00001-of-00002.safetensors",
@@ -256,7 +261,9 @@ def test_bucketed_all_gather_uses_bounded_flat_buffers(monkeypatch) -> None:
         output[: tensor.numel()].copy_(tensor)
         output[tensor.numel() :].copy_(tensor + 100)
 
-    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor)
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
+    )
 
     gathered = bucketed_all_gather_into_tensor(
         bucket,
@@ -328,9 +335,7 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
         output[: tensor.numel()].copy_(tensor)
         output[tensor.numel() :].copy_(tensor + 100)
 
-    monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights.DTensor", FakeDTensor
-    )
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.DTensor", FakeDTensor)
     monkeypatch.setattr(
         torch.distributed,
         "get_world_size",
@@ -403,9 +408,7 @@ def test_oversized_fsdp_shard_is_gathered_in_shard_dimension_chunks(
         output[: tensor.numel()].copy_(tensor)
         output[tensor.numel() :].copy_(tensor + 100)
 
-    monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights.DTensor", FakeDTensor
-    )
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.DTensor", FakeDTensor)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
     monkeypatch.setattr(
         torch.distributed, "get_process_group_ranks", lambda group: [0, 1]
@@ -449,9 +452,7 @@ def test_replicated_dtensor_uses_local_tensor_without_collective(monkeypatch) ->
             raise AssertionError("replicated parameters must not call full_tensor")
 
     local = torch.arange(5, dtype=torch.float32)
-    monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights.DTensor", FakeDTensor
-    )
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.DTensor", FakeDTensor)
     monkeypatch.setattr(
         torch.distributed,
         "all_gather_into_tensor",
@@ -474,8 +475,12 @@ def test_export_batches_adjacent_tp_weights_into_one_flat_collective(
     class Model(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.first = nn.Parameter(torch.arange(4, dtype=torch.float32).reshape(2, 2))
-            self.second = nn.Parameter(torch.arange(3, dtype=torch.float32).reshape(1, 3))
+            self.first = nn.Parameter(
+                torch.arange(4, dtype=torch.float32).reshape(2, 2)
+            )
+            self.second = nn.Parameter(
+                torch.arange(3, dtype=torch.float32).reshape(1, 3)
+            )
 
     class Spec:
         num_experts = 0
@@ -513,9 +518,13 @@ def test_export_batches_adjacent_tp_weights_into_one_flat_collective(
         output[: tensor.numel()].copy_(tensor)
         output[tensor.numel() :].copy_(tensor + 10)
 
-    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor)
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
+    )
 
-    exported = dict(export_hf_weights(Model(), Spec(), ps, cpu=False, buffer_max_size_bytes=1024))
+    exported = dict(
+        export_hf_weights(Model(), Spec(), ps, cpu=False, buffer_max_size_bytes=1024)
+    )
 
     assert len(calls) == 1
     assert torch.equal(
@@ -535,7 +544,9 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
             for idx in range(2):
                 self.register_parameter(
                     f"weight{idx}",
-                    nn.Parameter(torch.arange(4, dtype=torch.float32) + offset + idx * 10),
+                    nn.Parameter(
+                        torch.arange(4, dtype=torch.float32) + offset + idx * 10
+                    ),
                 )
 
     class Model(nn.Module):
@@ -595,9 +606,7 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
         torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
     )
 
-    stream = export_hf_weights(
-        Model(), Spec(), ps, cpu=False, buffer_max_size_bytes=64
-    )
+    stream = export_hf_weights(Model(), Spec(), ps, cpu=False, buffer_max_size_bytes=64)
     name, tensor = next(stream)
 
     assert name == "first.experts.packed"
@@ -630,17 +639,31 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
         tp_spec = staticmethod(lambda name: None)
         native_to_hf = staticmethod(lambda name, tensor: [(name, tensor)])
 
-    ps = type("ParallelState", (), {
-        "pp_size": 2, "pp_rank": 0, "pp_global_ranks": [0, 1],
-        "tp_size": 1, "tp_group": None, "ep_size": 1, "ep_group": None,
-        "etp_size": 1, "etp_group": None,
-        "pp_group": "nccl-pp", "pp_cpu_group": "gloo-pp",
-    })()
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 2,
+            "pp_rank": 0,
+            "pp_global_ranks": [0, 1],
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+            "pp_group": "nccl-pp",
+            "pp_cpu_group": "gloo-pp",
+        },
+    )()
 
     groups = []
     remote_bias = torch.tensor([3.0, 4.0])
     remote_headers = iter(
-        [[("weight2", (2, 3), torch.float32), ("router_bias2", (2,), torch.float32)], []]
+        [
+            [("weight2", (2, 3), torch.float32), ("router_bias2", (2,), torch.float32)],
+            [],
+        ]
     )
     remote_tensors = iter([remote_weight, remote_bias])
 
@@ -656,8 +679,9 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
-    monkeypatch.setattr(torch.distributed, "broadcast_object_list",
-                        fake_broadcast_object_list)
+    monkeypatch.setattr(
+        torch.distributed, "broadcast_object_list", fake_broadcast_object_list
+    )
     monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
 
     exported = dict(export_hf_weights(Model(), Spec(), ps))
@@ -668,7 +692,6 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
     assert torch.equal(exported["router_bias"], torch.tensor([1.0, 2.0]))
     assert torch.equal(exported["weight2"], remote_weight)
     assert torch.equal(exported["router_bias2"], remote_bias)
-
 
 
 def test_pp_export_never_materializes_the_whole_stage(monkeypatch) -> None:

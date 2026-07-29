@@ -39,7 +39,9 @@ def _tensor_nbytes(tensor: torch.Tensor) -> int:
 def _to_cpu(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.device.type == "cpu":
         return tensor
-    with get_weight_sync_probe().measure("d2h", nbytes=_tensor_nbytes(tensor), device=tensor.device):
+    with get_weight_sync_probe().measure(
+        "d2h", nbytes=_tensor_nbytes(tensor), device=tensor.device
+    ):
         return tensor.cpu()
 
 
@@ -47,7 +49,9 @@ def _copy_to_cpu(dst: torch.Tensor, src: torch.Tensor) -> None:
     if src.device.type == "cpu":
         dst.copy_(src)
         return
-    with get_weight_sync_probe().measure("d2h", nbytes=_tensor_nbytes(src), device=src.device):
+    with get_weight_sync_probe().measure(
+        "d2h", nbytes=_tensor_nbytes(src), device=src.device
+    ):
         dst.copy_(src)
 
 
@@ -83,7 +87,9 @@ def _materialize_dtensor(tensor: torch.Tensor) -> torch.Tensor:
     params (dist_opt backend) pass through untouched.
     """
     if DTensor is not None and isinstance(tensor, DTensor):
-        with get_weight_sync_probe().measure("fsdp_gather", device=tensor.device) as sample:
+        with get_weight_sync_probe().measure(
+            "fsdp_gather", device=tensor.device
+        ) as sample:
             result = tensor.full_tensor()
             sample.nbytes = _tensor_nbytes(result)
             return result
@@ -101,7 +107,9 @@ class HFWeights(Protocol):
         """Megatron Lite param name → [HF param names]. Multiple = concat (QKV, gate+up)."""
         ...
 
-    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
+    def hf_to_native(
+        self, native_name: str, hf_tensors: list[torch.Tensor]
+    ) -> torch.Tensor:
         """Convert HF tensors → single Megatron Lite tensor (e.g. merge QKV)."""
         ...
 
@@ -244,7 +252,9 @@ def _resolve_export_dtype(export_dtype: str | torch.dtype | None) -> torch.dtype
     return aliases[normalized]
 
 
-def _cast_export_tensor(tensor: torch.Tensor, export_dtype: torch.dtype | None) -> torch.Tensor:
+def _cast_export_tensor(
+    tensor: torch.Tensor, export_dtype: torch.dtype | None
+) -> torch.Tensor:
     if export_dtype is None or not tensor.is_floating_point():
         return tensor
     return tensor.to(dtype=export_dtype)
@@ -255,14 +265,21 @@ def _cast_export_tensor(tensor: torch.Tensor, export_dtype: torch.dtype | None) 
 # ======================================================================
 
 
-def split_dim(tensor: torch.Tensor, rank: int, world: int, dim: int = 0) -> torch.Tensor:
+def split_dim(
+    tensor: torch.Tensor, rank: int, world: int, dim: int = 0
+) -> torch.Tensor:
     if world <= 1:
         return tensor
     return tensor.chunk(world, dim=dim)[rank].contiguous()
 
 
 def split_qkv(
-    tensor: torch.Tensor, rank: int, world: int, num_q_heads: int, num_kv_heads: int, head_dim: int
+    tensor: torch.Tensor,
+    rank: int,
+    world: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
 ) -> torch.Tensor:
     """TP-shard a fused [Q, K, V] weight, splitting Q/K/V heads independently.
 
@@ -363,7 +380,8 @@ def bucketed_all_gather_into_tensor(
         [torch.empty_like(tensor) for _, tensor in bucket] for _ in range(group_size)
     ]
     gathered_flat_views = [
-        [tensor.view(-1) for tensor in rank_shards] for rank_shards in gathered_shards_by_rank
+        [tensor.view(-1) for tensor in rank_shards]
+        for rank_shards in gathered_shards_by_rank
     ]
 
     send_buffer = torch.empty(max_chunk_numel, dtype=dtype, device=device)
@@ -636,7 +654,9 @@ def to_global_layer_name(name: str, layer_map: dict[int, int]) -> str:
     return re.sub(r"layers\.(\d+)\.", _replace, name)
 
 
-def gather_gate_up(tensor: torch.Tensor, world_size: int, group: dist.ProcessGroup) -> torch.Tensor:
+def gather_gate_up(
+    tensor: torch.Tensor, world_size: int, group: dist.ProcessGroup
+) -> torch.Tensor:
     ffn_local = tensor.shape[0] // 2
     gate_full = allgather_concat(tensor[:ffn_local], world_size, group, dim=0)
     up_full = allgather_concat(tensor[ffn_local:], world_size, group, dim=0)
@@ -649,7 +669,12 @@ def gather_gate_up(tensor: torch.Tensor, world_size: int, group: dist.ProcessGro
 
 
 def load_hf_weights(
-    model: nn.Module, hf_path: str, spec: HFWeights, ps, *, vocab_size: int | None = None
+    model: nn.Module,
+    hf_path: str,
+    spec: HFWeights,
+    ps,
+    *,
+    vocab_size: int | None = None,
 ) -> None:
     """Load HF safetensors into a Megatron Lite model using HFWeights.
 
@@ -708,7 +733,9 @@ def load_hf_weights(
                     padded = pad_vocab_for_tp(vocab_size, ps.tp_size)
                     if tensor.size(0) < padded:
                         pad = torch.zeros(
-                            padded - tensor.size(0), *tensor.shape[1:], dtype=tensor.dtype
+                            padded - tensor.size(0),
+                            *tensor.shape[1:],
+                            dtype=tensor.dtype,
                         )
                         tensor = torch.cat([tensor, pad], dim=0)
                 qkv = spec.qkv_spec(mapped) if hasattr(spec, "qkv_spec") else None
@@ -732,9 +759,13 @@ def load_hf_weights(
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
 
 
-def _load_expert_weight(native_name, hf_names, reader, spec, ps, loaded, expert_gid, expert_shard):
+def _load_expert_weight(
+    native_name, hf_names, reader, spec, ps, loaded, expert_gid, expert_shard
+):
     if expert_shard is None:
-        raise RuntimeError("Expert weight encountered but expert shard metadata is unavailable.")
+        raise RuntimeError(
+            "Expert weight encountered but expert shard metadata is unavailable."
+        )
     experts_per_rank, local_start = expert_shard
     if expert_gid < local_start or expert_gid >= local_start + experts_per_rank:
         return
@@ -906,9 +937,13 @@ def export_hf_weights(
             if rank0_only and rank != 0:
                 return
             for native_name, gathered_tensor in gathered_tensors.items():
-                if vocab_size is not None and ("embed" in native_name or "head" in native_name):
+                if vocab_size is not None and (
+                    "embed" in native_name or "head" in native_name
+                ):
                     gathered_tensor = gathered_tensor[:vocab_size]
-                for hf_name, hf_tensor in _native_to_hf(spec, native_name, gathered_tensor):
+                for hf_name, hf_tensor in _native_to_hf(
+                    spec, native_name, gathered_tensor
+                ):
                     yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
 
         def _flush_dense_bucket():
@@ -955,9 +990,9 @@ def export_hf_weights(
                     if packed_name is None:
                         yield from _iter_mapped({global_name: export_shard})
                         continue
-                    packed_expert_buffers.setdefault(packed_name, {})[
-                        global_idx
-                    ] = export_shard
+                    packed_expert_buffers.setdefault(packed_name, {})[global_idx] = (
+                        export_shard
+                    )
                 if packed_name is not None:
                     packed = packed_expert_buffers[packed_name]
                     if len(packed) == spec.num_experts:
@@ -989,7 +1024,8 @@ def export_hf_weights(
                     tensor_bytes = tensor.numel() * tensor.element_size()
                     should_flush = bool(expert_bucket) and (
                         tensor.dtype != expert_bucket[0][1].dtype
-                        or expert_bucket_bytes + tensor_bytes > expert_bucket_limit_bytes
+                        or expert_bucket_bytes + tensor_bytes
+                        > expert_bucket_limit_bytes
                     )
                     if should_flush:
                         yield from _flush_expert_bucket()
@@ -1090,7 +1126,10 @@ def export_hf_weights(
                     if bucket_bytes >= buffer_max_size_bytes:
                         break
                 header: list[Any] = [
-                    [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in bucket]
+                    [
+                        (name, tuple(tensor.shape), tensor.dtype)
+                        for name, tensor in bucket
+                    ]
                 ]
             else:
                 header = [None]
@@ -1156,7 +1195,9 @@ def _gather_expert(
         out[name] = _maybe_cpu(tensor, cpu=cpu)
 
 
-def _gather_expert_etp(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch.Tensor:
+def _gather_expert_etp(
+    name: str, tensor: torch.Tensor, spec: HFWeights, ps
+) -> torch.Tensor:
     # ETP gather
     if ps.etp_size > 1 and ps.etp_group is not None:
         tp_info = spec.tp_spec(name)

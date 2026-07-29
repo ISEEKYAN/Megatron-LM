@@ -939,7 +939,11 @@ class AllGatherPipeline:
 
     def wait_bucket_ready(self, bucket_id: int, bwd: bool = False) -> None:
         bucket = self.buckets[bucket_id]
-        if self.overlap and not bucket._full_ready and bucket._param_gather_work is None:
+        if (
+            self.overlap
+            and not bucket._full_ready
+            and bucket._param_gather_work is None
+        ):
             # Prefetch/overlap path: launch the dense all-gather ahead of use on the
             # dedicated priority communication stream.
             self.async_bucket_gather(bucket_id, bwd=bwd)
