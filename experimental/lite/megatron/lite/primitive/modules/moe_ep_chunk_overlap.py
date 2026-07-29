@@ -241,19 +241,17 @@ class EPChunkOverlapOperator:
 
         compute_stream, comm_stream = self._streams(x_2d.device)
         caller_stream = torch.cuda.current_stream(x_2d.device)
-        scores, indices = self._route(x_2d, 0, x_2d.size(0))
-        route_ready = torch.cuda.Event()
-        route_ready.record(caller_stream)
+        input_ready = torch.cuda.Event()
+        input_ready.record(caller_stream)
 
         def submit_dispatch(chunk_idx: int):
             start, end = ranges[chunk_idx]
             x_chunk = x_2d[start:end]
             dispatcher = self._forward_dispatcher(chunk_idx)
             with torch.cuda.stream(comm_stream):
-                comm_stream.wait_event(route_ready)
-                state = dispatcher.submit_deepep_dispatch(
-                    x_chunk, scores[start:end], indices[start:end]
-                )
+                comm_stream.wait_event(input_ready)
+                scores, indices = self._route(x_chunk, start, end)
+                state = dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
             return chunk_idx, dispatcher, state
 
         def finish_dispatch_expert_submit_combine(pending):
@@ -370,7 +368,7 @@ class EPChunkOverlapOperator:
         input_ready.record(torch.cuda.current_stream(grad_2d.device))
         dispatcher = self.dispatcher
         grad_x_chunks: list[torch.Tensor | None] = [None for _ in ranges]
-        grad_score_chunks: list[torch.Tensor | None] = [None for _ in ranges]
+        router_accum: list[torch.Tensor | None] = [None for _ in router_params]
         expert_accum: list[torch.Tensor | None] = [None for _ in expert_params]
         pending_dispatch_bwd: list[tuple[_BackwardChunk, dict[str, Any]]] = []
         last_deepep_event: Any | None = None
@@ -386,15 +384,17 @@ class EPChunkOverlapOperator:
 
         def submit_recompute_dispatch(chunk_idx: int):
             start, end = ranges[chunk_idx]
-            x_chunk = x_recompute[start:end]
-            scores = scores_all[start:end]
+            x_chunk = x_2d[start:end].detach().requires_grad_(True)
+            with torch.cuda.stream(compute_stream):
+                compute_stream.wait_event(input_ready)
+                scores, indices = self._route(x_chunk, start, end)
+                router_ready = torch.cuda.Event()
+                router_ready.record(compute_stream)
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(router_ready)
                 chain_deepep_event()
                 state = remember_deepep_event(
-                    dispatcher.submit_deepep_dispatch(
-                        x_chunk, scores, indices_all[start:end]
-                    )
+                    dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
                 )
             return chunk_idx, start, end, x_chunk, scores, state
 
@@ -441,13 +441,6 @@ class EPChunkOverlapOperator:
             )
 
         with torch.enable_grad():
-            x_recompute = x_2d.detach().requires_grad_(True)
-            with torch.cuda.stream(compute_stream):
-                compute_stream.wait_event(input_ready)
-                scores_all, indices_all = self._route(x_recompute, 0, x_2d.size(0))
-                router_ready = torch.cuda.Event()
-                router_ready.record(compute_stream)
-
             next_state = submit_recompute_dispatch(len(ranges) - 1)
             for rev_idx in range(len(ranges) - 1, -1, -1):
                 chunk_idx, start, end, x_chunk, scores, state = next_state
@@ -471,9 +464,13 @@ class EPChunkOverlapOperator:
                         "EP chunk overlap fused backward requires manual dgrad metadata."
                     )
 
+                scores_edge = None
+                scores_ref: torch.Tensor | None = scores
                 expert_out_edge = None
                 expert_out_ref: torch.Tensor | None = expert_out
                 if hasattr(torch.autograd.graph, "get_gradient_edge"):
+                    scores_edge = torch.autograd.graph.get_gradient_edge(scores)
+                    scores_ref = None
                     expert_out_edge = torch.autograd.graph.get_gradient_edge(expert_out)
                     expert_out_ref = None
 
@@ -482,7 +479,7 @@ class EPChunkOverlapOperator:
                     start=start,
                     end=end,
                     x=x_chunk,
-                    scores=None,
+                    scores=scores_ref,
                     handle=state["handle"],
                     row_id_map=row_id_map.detach(),
                     prob_flat_indices=prob_flat_indices.detach(),
@@ -493,6 +490,7 @@ class EPChunkOverlapOperator:
                     dispatched=expert_input,
                     probs=expert_probs,
                     expert_out=expert_out_ref,
+                    scores_edge=scores_edge,
                     scores_shape=scores.shape,
                     scores_dtype=scores.dtype,
                     expert_out_edge=expert_out_edge,
@@ -608,29 +606,25 @@ class EPChunkOverlapOperator:
                         device=grad_2d.device,
                         dtype=chunk.scores_dtype,
                     )
-                grad_x_chunks[chunk.idx] = grad_hidden.to(chunk.x.dtype)
-                grad_score_chunks[chunk.idx] = grad_scores.to(chunk.scores_dtype)
+                router_output = (
+                    chunk.scores_edge if chunk.scores_edge is not None else chunk.scores
+                )
+                if router_output is None:
+                    raise RuntimeError("EP chunk overlap router graph was released.")
+                router_grads = torch.autograd.grad(
+                    router_output,
+                    (chunk.x, *router_params),
+                    grad_scores.to(chunk.scores_dtype),
+                    allow_unused=True,
+                )
+                grad_score_x = router_grads[0]
+                if grad_score_x is None:
+                    grad_score_x = torch.zeros_like(chunk.x)
+                grad_x_chunks[chunk.idx] = grad_hidden.to(chunk.x.dtype) + grad_score_x
+                _accumulate(router_accum, router_params, router_grads[1:])
+                chunk.scores = None
+                chunk.scores_edge = None
                 local_state.clear()
-
-        with torch.cuda.stream(compute_stream):
-            grad_scores_all = torch.cat(
-                [
-                    torch.zeros_like(scores_all[start:end]) if grad is None else grad
-                    for (start, end), grad in zip(
-                        ranges, grad_score_chunks, strict=True
-                    )
-                ],
-                dim=0,
-            )
-            router_grads = torch.autograd.grad(
-                scores_all,
-                (x_recompute, *router_params),
-                grad_scores_all,
-                allow_unused=True,
-            )
-            grad_score_x = router_grads[0]
-            if grad_score_x is None:
-                grad_score_x = torch.zeros_like(x_recompute)
 
         done = torch.cuda.Event()
         done.record(compute_stream)
@@ -642,12 +636,9 @@ class EPChunkOverlapOperator:
                 for (start, end), grad in zip(ranges, grad_x_chunks, strict=True)
             ],
             dim=0,
-        ).view_as(grad_2d) + grad_score_x.view_as(grad_2d)
+        ).view_as(grad_2d)
         expert_grads = _materialize(expert_params, expert_accum)
-        router_grads_out = [
-            torch.zeros_like(param) if grad is None else grad
-            for param, grad in zip(router_params, router_grads[1:], strict=True)
-        ]
+        router_grads_out = _materialize(router_params, router_accum)
         return grad_x, router_grads_out, expert_grads
 
 
