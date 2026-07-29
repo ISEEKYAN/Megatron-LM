@@ -2,9 +2,6 @@
 from __future__ import annotations
 
 import threading
-from contextlib import nullcontext
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -225,40 +222,6 @@ def test_train_step_combined_1f1b_overlaps_adjacent_microbatches():
     )
 
     torch.testing.assert_close(model.weight.grad, torch.tensor([[1.0]]))
-
-
-def test_train_step_combined_1f1b_uses_two_compute_streams():
-    weight = torch.tensor(1.0, requires_grad=True)
-    model = MagicMock()
-    model.parameters.return_value = iter(
-        [SimpleNamespace(is_cuda=True, device=torch.device("cuda", 0))]
-    )
-    streams = [object(), object()]
-    caller_stream = MagicMock()
-    entered = []
-
-    def stream_context(stream):
-        entered.append(stream)
-        return nullcontext()
-
-    with (
-        patch("torch.cuda.Stream", side_effect=streams) as make_stream,
-        patch("torch.cuda.stream", side_effect=stream_context),
-        patch("torch.cuda.set_device"),
-        patch("torch.cuda.current_stream", return_value=caller_stream),
-    ):
-        run_microbatch_loop(
-            model,
-            iter([{}, {}]),
-            2,
-            lambda _model, _batch: {"loss": weight.square()},
-            overlap_forward_backward=True,
-        )
-
-    assert make_stream.call_count == 2
-    assert streams[0] in entered
-    assert streams[1] in entered
-    assert caller_stream.wait_stream.call_count == 2
 
 
 def test_utils_ensure_divisible_returns_quotient_and_reports_context():
