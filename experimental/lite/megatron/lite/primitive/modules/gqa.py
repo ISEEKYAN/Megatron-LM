@@ -72,6 +72,11 @@ class GQAttention(nn.Module):
         mrope_section: list[int] | None = None,
     ):
         super().__init__()
+        ensure_divisible(
+            num_attention_heads,
+            num_key_value_heads,
+            "num_attention_heads must be divisible by num_key_value_heads",
+        )
         self.num_heads_local = ensure_divisible(num_attention_heads, ps.tp_size)
         self.num_kv_heads_local = ensure_divisible(num_key_value_heads, ps.tp_size)
         self.head_dim = head_dim
@@ -120,13 +125,21 @@ class GQAttention(nn.Module):
                 ]
             else:
                 qkv_split_shapes = [q_projection_size, self.head_dim, self.head_dim]
-            qkv_weight = self.qkv.linear.weight
-            if (
-                qkv_weight.dim() == 2
-                and qkv_weight.shape[0] % sum(qkv_split_shapes) == 0
-            ):
-                qkv_weight.is_qkv = True
-                qkv_weight.qkv_split_shapes = qkv_split_shapes
+        else:
+            q_projection_size = self.num_heads_local * self.head_dim
+            kv_projection_size = self.num_kv_heads_local * self.head_dim
+            qkv_split_shapes = [q_projection_size] * (2 if self._output_gate else 1)
+            qkv_split_shapes.extend([kv_projection_size, kv_projection_size])
+
+        qkv_weight = self.qkv.linear.weight
+        if qkv_weight.dim() != 2 or qkv_weight.shape[0] % sum(qkv_split_shapes) != 0:
+            raise RuntimeError(
+                "GQA QKV projection cannot carry Muon split metadata: "
+                f"weight_shape={tuple(qkv_weight.shape)}, "
+                f"qkv_split_shapes={qkv_split_shapes}."
+            )
+        qkv_weight.is_qkv = True
+        qkv_weight.qkv_split_shapes = qkv_split_shapes
         self.q_norm = te.RMSNorm(
             head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
         )
