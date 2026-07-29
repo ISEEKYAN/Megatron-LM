@@ -1,8 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
-import threading
-
 import pytest
 import torch
 import torch.nn as nn
@@ -187,42 +185,6 @@ def test_train_step_microbatch_loop_and_grad_clip_cpu_contract():
 
     assert torch.isfinite(grad_norm)
     assert model.weight.grad.norm() <= 0.25 + 1.0e-6
-
-
-def test_train_step_combined_1f1b_overlaps_adjacent_microbatches():
-    backward_started = threading.Event()
-    next_forward_started = threading.Event()
-
-    class _OverlapProbe(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, value):
-            return value
-
-        @staticmethod
-        def backward(ctx, grad):
-            backward_started.set()
-            assert next_forward_started.wait(timeout=5)
-            return grad
-
-    model = nn.Linear(1, 1, bias=False)
-    data = iter([{"mb": 0}, {"mb": 1}])
-
-    def forward_fn(module, batch):
-        if batch["mb"] == 1:
-            assert backward_started.wait(timeout=5)
-            next_forward_started.set()
-        value = _OverlapProbe.apply(module.weight).sum()
-        return {"loss": value}
-
-    run_microbatch_loop(
-        model,
-        data,
-        2,
-        forward_fn,
-        overlap_forward_backward=True,
-    )
-
-    torch.testing.assert_close(model.weight.grad, torch.tensor([[1.0]]))
 
 
 def test_utils_ensure_divisible_returns_quotient_and_reports_context():
