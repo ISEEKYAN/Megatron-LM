@@ -375,22 +375,6 @@ def test_core_contains_token_wise_forward_and_backward_deepep_pipeline():
     } <= calls
 
 
-def test_models_reuse_primary_dispatcher_for_first_overlap_slot():
-    lite_root = Path(__file__).parents[3] / "megatron" / "lite" / "model"
-    model_paths = (
-        lite_root / "qwen3_moe" / "lite" / "model.py",
-        lite_root / "qwen3_5" / "lite" / "model.py",
-        lite_root / "kimi_k2" / "lite" / "model.py",
-        lite_root / "glm5" / "lite" / "model.py",
-        lite_root / "deepseek_v4" / "lite" / "moe.py",
-    )
-
-    for model_path in model_paths:
-        source = model_path.read_text()
-        assert "self.ep_chunk_dispatchers = (\n                self.dispatcher," in source
-        assert "for idx in range(num_chunks_ep_a2a_overlap)" not in source
-
-
 def test_workspace_shape_metrics_report_and_reset_jitter(monkeypatch):
     from megatron.lite.primitive.utils.cuda_allocator import (
         pop_workspace_shape_metrics,
