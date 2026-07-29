@@ -28,12 +28,7 @@ class DeepseekV4MoE(nn.Module):
         num_chunks_ep_a2a_overlap: int = 1,
     ):
         super().__init__()
-        self.gate = SigmoidTopKRouter(
-            config,
-            ps,
-            compute_aux_loss=False,
-            moe_router_fusion=num_chunks_ep_a2a_overlap > 1,
-        )
+        self.gate = SigmoidTopKRouter(config, ps, compute_aux_loss=False)
         is_hash_layer = layer_idx < config.num_hash_layers
         if is_hash_layer:
             self.gate.register_buffer(

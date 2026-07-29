@@ -144,7 +144,6 @@ class MoELayer(nn.Module):
             router_bias_rate=router_bias_rate,
             compute_aux_loss=True,
             use_pre_softmax=True,
-            moe_router_fusion=num_chunks_ep_a2a_overlap > 1,
             router_dtype=torch.float32,
             expert_bias_persistent=True,
         )
