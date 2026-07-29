@@ -28,6 +28,7 @@ def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
 
 
 _EP_CHUNK_COMM_STREAMS: dict[int, torch.cuda.Stream] = {}
+_EP_CHUNK_WGRAD_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
 def _cuda_device_index(device: torch.device | int | str) -> int:
@@ -48,6 +49,25 @@ def _shared_comm_stream(device: torch.device | int | str) -> torch.cuda.Stream:
         stream = _make_stream(device_index)
         _EP_CHUNK_COMM_STREAMS[device_index] = stream
     return stream
+
+
+def _shared_wgrad_stream(device: torch.device | int | str) -> torch.cuda.Stream:
+    device_index = _cuda_device_index(device)
+    stream = _EP_CHUNK_WGRAD_STREAMS.get(device_index)
+    if stream is None:
+        stream = _make_stream(device_index)
+        _EP_CHUNK_WGRAD_STREAMS[device_index] = stream
+    return stream
+
+
+def _queue_backward_stream_wait(event: torch.cuda.Event, device: torch.device) -> None:
+    """Make optimizer work queued after backward wait for deferred expert wgrad."""
+
+    def wait_for_wgrad() -> None:
+        with torch.cuda.device(device):
+            torch.cuda.current_stream(device).wait_event(event)
+
+    torch.autograd.Variable._execution_engine.queue_callback(wait_for_wgrad)
 
 
 def _event_current_stream_wait(event: Any) -> None:
@@ -362,6 +382,7 @@ class EPChunkOverlapOperator:
             )
 
         compute_stream, comm_stream = self._streams(grad_2d.device)
+        wgrad_stream = _shared_wgrad_stream(grad_2d.device)
         input_ready = torch.cuda.Event()
         input_ready.record(torch.cuda.current_stream(grad_2d.device))
         dispatcher = self.dispatcher
@@ -570,10 +591,16 @@ class EPChunkOverlapOperator:
 
                 pending_dispatch_bwd.append((chunk, local_state))
 
-        with torch.cuda.stream(compute_stream):
+        wgrad_ready = torch.cuda.Event()
+        wgrad_ready.record(compute_stream)
+        with torch.cuda.stream(wgrad_stream):
+            wgrad_stream.wait_event(wgrad_ready)
             self.experts.flush_delayed_weight_grads(
                 num_contexts=len(pending_dispatch_bwd)
             )
+            wgrad_done = torch.cuda.Event()
+            wgrad_done.record(wgrad_stream)
+        _queue_backward_stream_wait(wgrad_done, grad_2d.device)
 
         for chunk, local_state in pending_dispatch_bwd:
             with torch.cuda.stream(compute_stream):

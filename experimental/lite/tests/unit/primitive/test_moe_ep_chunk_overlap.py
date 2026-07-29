@@ -77,7 +77,29 @@ def test_chunked_backward_submits_dgrad_before_te_delayed_wgrad(
     assert source.index("pending_dispatch_bwd.append") < source.index(
         "flush_delayed_weight_grads"
     )
+    assert source.index("flush_delayed_weight_grads") < source.index(
+        "finish_deepep_dispatch_backward"
+    )
+    assert "_queue_backward_stream_wait(wgrad_done" in source
     assert "retain_graph=True" not in source
+
+
+def test_delayed_wgrad_runs_on_a_shared_non_caller_stream(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import moe_ep_chunk_overlap
+
+    source = inspect.getsource(
+        moe_ep_chunk_overlap.EPChunkOverlapOperator._full_recompute_fused_backward_v6
+    )
+    callback_source = inspect.getsource(
+        moe_ep_chunk_overlap._queue_backward_stream_wait
+    )
+
+    assert "_shared_wgrad_stream" in source
+    assert "wgrad_stream.wait_event(wgrad_ready)" in source
+    assert "_execution_engine.queue_callback" in callback_source
 
 
 def test_chunked_ep_keeps_compute_on_the_autograd_caller_stream(
