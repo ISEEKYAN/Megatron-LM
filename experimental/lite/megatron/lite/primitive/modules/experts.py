@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from contextlib import contextmanager
 from typing import Any
@@ -23,6 +24,79 @@ from megatron.lite.primitive.recompute import CheckpointWithoutOutput
 from megatron.lite.primitive.utils import ensure_divisible
 
 __all__ = ["Experts", "_AllReduceETP"]
+
+_DELAYED_WGRAD_STAGING: dict[
+    tuple[str, int | None, torch.dtype, int, int, str, int], torch.Tensor
+] = {}
+
+
+def _pack_delayed_wgrad_tensors(
+    contexts: list[list[Any]],
+    tensor_index: int,
+    *,
+    linear_index: int,
+    kind: str,
+) -> tuple[list[torch.Tensor], list[int]] | None:
+    per_context = [context[tensor_index] for context in contexts]
+    if not per_context or not all(
+        isinstance(items, (list, tuple)) for items in per_context
+    ):
+        return None
+    num_experts = len(per_context[0])
+    if any(len(items) != num_experts for items in per_context):
+        return None
+    tensors = [tensor for items in per_context for tensor in items]
+    if not tensors or not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        return None
+    first = tensors[0]
+    if first.dim() != 2 or any(
+        tensor.dim() != 2
+        or tensor.size(1) != first.size(1)
+        or tensor.dtype != first.dtype
+        or tensor.device != first.device
+        for tensor in tensors
+    ):
+        return None
+
+    rows_per_expert = [
+        sum(int(items[expert_idx].size(0)) for items in per_context)
+        for expert_idx in range(num_experts)
+    ]
+    total_rows = sum(rows_per_expert)
+    capacity_rows = ((max(total_rows, 1) + 1023) // 1024) * 1024
+    stream_id = (
+        int(torch.cuda.current_stream(first.device).cuda_stream)
+        if first.is_cuda
+        else 0
+    )
+    key = (
+        first.device.type,
+        first.device.index,
+        first.dtype,
+        stream_id,
+        linear_index,
+        kind,
+        first.size(1),
+    )
+    staging = _DELAYED_WGRAD_STAGING.get(key)
+    if staging is None or staging.size(0) < capacity_rows:
+        staging = first.new_empty((capacity_rows, first.size(1)), requires_grad=False)
+        _DELAYED_WGRAD_STAGING[key] = staging
+
+    packed = []
+    offset = 0
+    with torch.no_grad():
+        for expert_idx, rows in enumerate(rows_per_expert):
+            expert_view = staging[offset : offset + rows]
+            write_offset = 0
+            for items in per_context:
+                source = items[expert_idx]
+                next_offset = write_offset + source.size(0)
+                expert_view[write_offset:next_offset].copy_(source)
+                write_offset = next_offset
+            packed.append(expert_view)
+            offset += rows
+    return packed, rows_per_expert
 
 
 @contextmanager
@@ -140,25 +214,86 @@ class Experts(nn.Module):
                     param.register_hook(_ar)
 
     def flush_delayed_weight_grads(self, *, num_contexts: int) -> None:
-        """Execute queued TE wgrads directly into the reusable DistOpt buffers."""
-        for linear in (self.fc1, self.fc2):
+        """Fuse queued chunk wgrads into one grouped GEMM over reusable staging."""
+        for linear_index, linear in enumerate((self.fc1, self.fc2)):
             store = linear.wgrad_store
             if not store.delay_wgrad_compute():
                 raise RuntimeError("Expert delayed weight gradients are not enabled.")
             if linear.use_bias:
                 raise RuntimeError("Chunked EP expert grouped linears must not use bias.")
-            for _ in range(num_contexts):
-                if store.context is None or store.context.empty():
+            if num_contexts < 1:
+                raise RuntimeError("Expert delayed wgrad requires at least one context.")
+            if store.context is None:
+                raise RuntimeError("Expert delayed weight-gradient queue is unavailable.")
+
+            if num_contexts == 1:
+                if store.context.empty():
                     raise RuntimeError("Expert delayed weight-gradient queue is empty.")
                 (_, _grad_biases, _), tensors = store.pop()
                 weight_grads = tensors[2]
-                for idx, grad in enumerate(weight_grads):
-                    param = getattr(linear, f"weight{idx}")
-                    main_grad = getattr(param, "main_grad", None)
-                    if main_grad is None or grad.data_ptr() != main_grad.data_ptr():
+            else:
+                queued = []
+                for _ in range(num_contexts):
+                    if store.context.empty():
                         raise RuntimeError(
-                            "Expert delayed wgrad did not reuse its DistOpt main_grad buffer."
+                            "Expert delayed weight-gradient queue is empty."
                         )
+                    queued.append(store.context.get())
+                contexts = [item[0] for item in queued]
+                funcs = [item[1] for item in queued]
+                packed_inputs = _pack_delayed_wgrad_tensors(
+                    contexts, 0, linear_index=linear_index, kind="input"
+                )
+                packed_grads = _pack_delayed_wgrad_tensors(
+                    contexts, 1, linear_index=linear_index, kind="grad_output"
+                )
+                can_fuse = (
+                    packed_inputs is not None
+                    and packed_grads is not None
+                    and isinstance(funcs[0], functools.partial)
+                    and all(
+                        isinstance(func, functools.partial)
+                        and func.func is funcs[0].func
+                        and func.args == funcs[0].args
+                        for func in funcs
+                    )
+                )
+                if can_fuse:
+                    input_tensors, input_splits = packed_inputs
+                    grad_tensors, grad_splits = packed_grads
+                    if input_splits != grad_splits:
+                        raise RuntimeError(
+                            "Expert delayed wgrad input and output splits differ."
+                        )
+                    weight_grads = contexts[0][2]
+                    if any(
+                        any(
+                            grad.data_ptr() != weight_grads[idx].data_ptr()
+                            for idx, grad in enumerate(context[2])
+                        )
+                        for context in contexts[1:]
+                    ):
+                        raise RuntimeError(
+                            "Expert delayed wgrad contexts do not share main_grad."
+                        )
+                    keywords = dict(funcs[0].keywords or {})
+                    keywords["m_splits"] = input_splits
+                    fused_func = functools.partial(
+                        funcs[0].func, *funcs[0].args, **keywords
+                    )
+                    fused_func(input_tensors, grad_tensors, weight_grads)
+                else:
+                    weight_grads = contexts[-1][2]
+                    for tensors, func in queued:
+                        func(*tensors)
+
+            for idx, grad in enumerate(weight_grads):
+                param = getattr(linear, f"weight{idx}")
+                main_grad = getattr(param, "main_grad", None)
+                if main_grad is None or grad.data_ptr() != main_grad.data_ptr():
+                    raise RuntimeError(
+                        "Expert delayed wgrad did not reuse its DistOpt main_grad buffer."
+                    )
             if store.context is not None and not store.context.empty():
                 raise RuntimeError("Expert delayed weight-gradient queue was not drained.")
 

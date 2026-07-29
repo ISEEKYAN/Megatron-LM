@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import functools
+import queue
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -104,8 +106,97 @@ def test_delayed_expert_wgrads_reuse_distopt_main_grad(
     ps = SimpleNamespace(ep_size=1, etp_size=1, tp_size=1, etp_group=None)
     experts_module.Experts(config, ps, delay_wgrad_compute=True)
 
-    assert all(
-        kwargs["fuse_wgrad_accumulation"] for kwargs in grouped_linear_kwargs
+    assert all(kwargs["fuse_wgrad_accumulation"] for kwargs in grouped_linear_kwargs)
+
+
+def test_delayed_expert_wgrads_fuse_chunk_contexts_into_one_grouped_gemm(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    calls = []
+
+    def grouped_wgrad(inputs, grad_outputs, grad_weights, *, m_splits, accumulate):
+        calls.append(
+            {
+                "inputs": [tensor.clone() for tensor in inputs],
+                "grad_outputs": [tensor.clone() for tensor in grad_outputs],
+                "grad_weights": grad_weights,
+                "m_splits": list(m_splits),
+                "accumulate": accumulate,
+            }
+        )
+        return None, [None, None], None
+
+    class FakeStore:
+        def __init__(self, linear):
+            self.context = queue.Queue()
+            grads = [
+                getattr(linear, f"weight{idx}").main_grad
+                for idx in range(linear.num_gemms)
+            ]
+            for offset in (0, 10):
+                inputs = [
+                    torch.tensor([[1.0 + offset, 2.0 + offset]]),
+                    torch.tensor([[3.0 + offset, 4.0 + offset]]),
+                ]
+                grad_outputs = [
+                    torch.tensor([[5.0 + offset, 6.0 + offset]]),
+                    torch.tensor([[7.0 + offset, 8.0 + offset]]),
+                ]
+                fn = functools.partial(grouped_wgrad, m_splits=[1, 1], accumulate=True)
+                self.context.put([[inputs, grad_outputs, grads], fn])
+
+        @staticmethod
+        def delay_wgrad_compute():
+            return True
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self, num_gemms, *_args, bias, **_kwargs):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.use_bias = bias
+            for idx in range(num_gemms):
+                param = torch.nn.Parameter(torch.zeros(2, 2))
+                param.main_grad = torch.zeros_like(param)
+                self.register_parameter(f"weight{idx}", param)
+            self.wgrad_store = FakeStore(self)
+
+    monkeypatch.setattr(
+        experts_module.te, "GroupedLinear", FakeGroupedLinear, raising=False
+    )
+    experts_module._DELAYED_WGRAD_STAGING.clear()
+    config = SimpleNamespace(
+        num_experts=2,
+        hidden_size=2,
+        moe_intermediate_size=2,
+        swiglu_limit=0.0,
+    )
+    ps = SimpleNamespace(ep_size=1, etp_size=1, tp_size=1, etp_group=None)
+    experts = experts_module.Experts(config, ps, delay_wgrad_compute=True)
+
+    experts.flush_delayed_weight_grads(num_contexts=2)
+
+    assert len(calls) == 2
+    for call in calls:
+        assert call["m_splits"] == [2, 2]
+        assert call["accumulate"] is True
+        assert all(
+            grad.data_ptr()
+            == getattr(
+                experts.fc1 if call is calls[0] else experts.fc2,
+                f"weight{idx}",
+            ).main_grad.data_ptr()
+            for idx, grad in enumerate(call["grad_weights"])
+        )
+    torch.testing.assert_close(
+        calls[0]["inputs"][0],
+        torch.tensor([[1.0, 2.0], [11.0, 12.0]]),
+    )
+    torch.testing.assert_close(
+        calls[0]["grad_outputs"][1],
+        torch.tensor([[7.0, 8.0], [17.0, 18.0]]),
     )
 
 
