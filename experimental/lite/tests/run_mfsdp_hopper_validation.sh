@@ -36,7 +36,7 @@ case "${MODE}" in
       echo "cpu-offload mode requires NNODES=1 and NPROC_PER_NODE=8." >&2
       exit 2
     fi
-    TEST_EXPR="cpu_optimizer_offload_reduces_memory_and_preserves_update"
+    TEST_EXPR="offload_matrix_matches_fsdp2_precision_speed_and_memory"
     ;;
   *)
     echo "usage: $0 {throughput|full-parallel|cpu-offload}" >&2

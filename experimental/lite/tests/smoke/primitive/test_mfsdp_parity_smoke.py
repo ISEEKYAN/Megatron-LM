@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 import statistics
 import sys
@@ -22,6 +23,7 @@ from megatron.lite.primitive.optimizers.fsdp2 import (
 )
 from megatron.lite.primitive.optimizers.mfsdp import build_mfsdp_training_optimizer
 from megatron.lite.primitive.parallel import init_parallel
+from megatron.lite.primitive.recompute import apply_offload
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
@@ -239,12 +241,18 @@ def _build_fsdp2_pair(
     model_type: type[nn.Module] = TinyDenseModel,
     expert_classifier=None,
     unit_modules: tuple[type[nn.Module], ...] = (TinyUnit,),
+    offload_fraction: float = 0.0,
+    activation_offload: bool = False,
 ):
     ps = _parallel_state(parallel)
     chunks = [_new_model(seed, model_type)]
+    if activation_offload:
+        apply_offload(chunks[0].layers, ["full"], {})
+    optimizer_config = _optimizer_cfg(use_fused_optimizer=False)
+    optimizer_config.offload_fraction = offload_fraction
     optimizer = build_fsdp2_training_optimizer(
         chunks,
-        _optimizer_cfg(),
+        optimizer_config,
         ps,
         unit_modules=unit_modules,
         expert_classifier=expert_classifier,
@@ -262,10 +270,13 @@ def _build_mfsdp_pair(
     expert_classifier=None,
     unit_modules: tuple[type[nn.Module], ...] = (TinyUnit,),
     offload_fraction: float = 0.0,
+    activation_offload: bool = False,
     use_fused_optimizer: bool = True,
 ):
     ps = _parallel_state(parallel)
     chunks = [_new_model(seed, model_type)]
+    if activation_offload:
+        apply_offload(chunks[0].layers, ["full"], {})
     optimizer_config = _optimizer_cfg(use_fused_optimizer=use_fused_optimizer)
     optimizer_config.offload_fraction = offload_fraction
     impl_cfg = SimpleNamespace(
@@ -282,21 +293,113 @@ def _build_mfsdp_pair(
     return chunks, optimizer, finalize
 
 
-def _run_mfsdp_offload_arm(
+def _memory_triple() -> dict[str, float]:
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    values = torch.tensor(
+        [allocated, reserved, reserved - allocated],
+        device="cuda",
+        dtype=torch.float64,
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.MAX)
+    return dict(
+        zip(
+            ("allocated_gib", "reserved_gib", "scratch_gib"),
+            (float(value) / (1024**3) for value in values),
+            strict=True,
+        )
+    )
+
+
+def _optimizer_tensor_devices(optimizer: Any) -> list[str]:
+    devices: set[str] = set()
+    seen: set[int] = set()
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if value is None or depth > 8 or id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, torch.Tensor):
+            devices.add(value.device.type)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                visit(item, depth + 1)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item, depth + 1)
+            return
+        for attribute in (
+            "state",
+            "optimizer",
+            "_inner_optimizer",
+            "_cpu_optimizer",
+            "cpu_group",
+            "_cpu_params",
+        ):
+            visit(getattr(value, attribute, None), depth + 1)
+
+    visit(optimizer)
+    return sorted(devices)
+
+
+def _mfsdp_cpu_master_devices(optimizer: Any) -> list[str]:
+    inner = getattr(optimizer, "_inner_optimizer", None)
+    cpu_group = getattr(inner, "cpu_group", None)
+    cpu_params = getattr(cpu_group, "_cpu_params", ())
+    return sorted({param.device.type for param in cpu_params})
+
+
+def _profiled_train_step(chunks, optimizer, finalize, x, target):
+    optimizer.zero_grad()
+    torch.cuda.synchronize()
+    started = time.perf_counter()
+    output = chunks[0](x)
+    loss = torch.nn.functional.mse_loss(output.float(), target.float())
+    torch.cuda.synchronize()
+    training_memory = _memory_triple()
+    loss.backward()
+    if finalize is not None:
+        finalize()
+    success, grad_norm, _num_zeros = optimizer.step()
+    torch.cuda.synchronize()
+    optimizer_memory = _memory_triple()
+    elapsed = torch.tensor(time.perf_counter() - started, device="cuda")
+    dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    return (
+        bool(success),
+        float(loss.detach()),
+        float(grad_norm),
+        float(elapsed),
+        training_memory,
+        optimizer_memory,
+    )
+
+
+def _run_offload_arm(
     *,
+    backend: str,
     offload_fraction: float,
+    activation_offload: bool,
     x: torch.Tensor,
     target: torch.Tensor,
-) -> tuple[list[float], list[float], float, dict[str, torch.Tensor]]:
+) -> dict[str, Any]:
+    gc.collect()
     torch.cuda.empty_cache()
-    chunks, optimizer, finalize = _build_mfsdp_pair(
+    builder = _build_mfsdp_pair if backend == "mfsdp" else _build_fsdp2_pair
+    kwargs = dict(
         seed=4567,
         parallel=_dense_parallel_config(),
         model_type=BenchmarkModel,
         unit_modules=(BenchmarkUnit,),
         offload_fraction=offload_fraction,
-        use_fused_optimizer=False,
+        activation_offload=activation_offload,
     )
+    if backend == "mfsdp":
+        kwargs["use_fused_optimizer"] = False
+    chunks, optimizer, finalize = builder(**kwargs)
+
     losses = []
     for _ in range(2):
         success, loss, _grad_norm = _train_step(chunks, optimizer, finalize, x, target)
@@ -305,18 +408,37 @@ def _run_mfsdp_offload_arm(
 
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
-    step_times = [
-        _timed_train_step(chunks, optimizer, finalize, x, target) for _ in range(3)
-    ]
-    peak_bytes = torch.tensor(
-        torch.cuda.max_memory_allocated(), device="cuda", dtype=torch.float64
-    )
-    dist.all_reduce(peak_bytes, op=dist.ReduceOp.MAX)
+    step_times = []
+    training_memory = []
+    optimizer_memory = []
+    for _ in range(5):
+        success, loss, _grad_norm, step_s, training, optimizer_side = (
+            _profiled_train_step(chunks, optimizer, finalize, x, target)
+        )
+        assert success
+        losses.append(loss)
+        step_times.append(step_s)
+        training_memory.append(training)
+        optimizer_memory.append(optimizer_side)
+
     params = _named_model_tensors(chunks)
+    result = {
+        "backend": backend,
+        "optimizer_offload": bool(offload_fraction),
+        "activation_offload": activation_offload,
+        "losses": losses,
+        "step_ms": statistics.median(step_times) * 1000.0,
+        "tokens_per_s_per_gpu": x.shape[0] / statistics.median(step_times),
+        "training_memory": training_memory[-1],
+        "optimizer_memory": optimizer_memory[-1],
+        "optimizer_tensor_devices": _optimizer_tensor_devices(optimizer),
+        "cpu_master_devices": _mfsdp_cpu_master_devices(optimizer),
+        "params": params,
+    }
     del optimizer, chunks
     gc.collect()
     torch.cuda.empty_cache()
-    return losses, step_times, float(peak_bytes), params
+    return result
 
 
 def _qualified_type(value: Any) -> str:
@@ -673,7 +795,7 @@ def test_mfsdp_throughput_exceeds_fsdp2():
     assert speedup > _MIN_SPEEDUP
 
 
-def test_mfsdp_cpu_optimizer_offload_reduces_memory_and_preserves_update():
+def test_mfsdp_offload_matrix_matches_fsdp2_precision_speed_and_memory():
     torch.manual_seed(6060 + dist.get_rank())
     torch.cuda.manual_seed_all(6060 + dist.get_rank())
     x = torch.randn(
@@ -684,45 +806,133 @@ def test_mfsdp_cpu_optimizer_offload_reduces_memory_and_preserves_update():
     )
     target = torch.zeros_like(x)
 
-    baseline_losses, baseline_times, baseline_peak, baseline_params = (
-        _run_mfsdp_offload_arm(
-            offload_fraction=0.0,
-            x=x,
-            target=target,
+    commit = os.environ.get("MLITE_VALIDATION_COMMIT")
+    wandb_project = os.environ.get("WANDB_PROJECT")
+    if not commit:
+        pytest.fail("offload matrix requires MLITE_VALIDATION_COMMIT provenance")
+    if not wandb_project:
+        pytest.fail(
+            "offload matrix requires WANDB_PROJECT; offline fallback is not accepted"
         )
-    )
-    offload_losses, offload_times, offload_peak, offload_params = (
-        _run_mfsdp_offload_arm(
-            offload_fraction=1.0,
-            x=x,
-            target=target,
-        )
-    )
 
-    max_param_abs, max_param_rel = _assert_tensor_sets_close(
-        baseline_params, offload_params
-    )
-    baseline_step_s = statistics.median(baseline_times)
-    offload_step_s = statistics.median(offload_times)
-    assert offload_losses == pytest.approx(
-        baseline_losses, rel=_LOSS_REL_TOL, abs=_TENSOR_ATOL
-    )
-    assert offload_peak < baseline_peak
-
+    wandb_run = None
     if dist.get_rank() == 0:
-        print(
-            "[MFSDP_CPU_OFFLOAD] "
-            f"world_size={dist.get_world_size()} "
-            f"baseline_peak_gib={baseline_peak / (1024**3):.4f} "
-            f"offload_peak_gib={offload_peak / (1024**3):.4f} "
-            f"saved_gib={(baseline_peak - offload_peak) / (1024**3):.4f} "
-            f"baseline_step_ms={baseline_step_s * 1000.0:.4f} "
-            f"offload_step_ms={offload_step_s * 1000.0:.4f} "
-            f"slowdown={offload_step_s / baseline_step_s:.4f} "
-            f"max_param_abs_diff={max_param_abs:.8e} "
-            f"max_param_rel_diff={max_param_rel:.8e}",
-            flush=True,
+        try:
+            import wandb
+
+            wandb_run = wandb.init(
+                project=wandb_project,
+                entity=os.environ.get("WANDB_ENTITY"),
+                name=os.environ.get("WANDB_NAME", f"mfsdp-offload-{commit[:10]}"),
+                config={
+                    "commit": commit,
+                    "world_size": dist.get_world_size(),
+                    "optimizer_offload_values": [False, True],
+                    "activation_offload_values": [False, True],
+                    "reference": "fsdp2",
+                },
+            )
+            if wandb_run is None:
+                pytest.fail("wandb.init returned no run")
+            print(f"[MFSDP_WANDB] url={wandb_run.url}", flush=True)
+        except Exception as exc:
+            pytest.fail(f"mandatory W&B initialization failed: {exc}")
+
+    matrix = {}
+    for backend in ("fsdp2", "mfsdp"):
+        for optimizer_offload in (False, True):
+            for activation_offload in (False, True):
+                key = (backend, optimizer_offload, activation_offload)
+                matrix[key] = _run_offload_arm(
+                    backend=backend,
+                    offload_fraction=float(optimizer_offload),
+                    activation_offload=activation_offload,
+                    x=x,
+                    target=target,
+                )
+
+    comparisons = {}
+    for optimizer_offload in (False, True):
+        for activation_offload in (False, True):
+            fsdp2 = matrix[("fsdp2", optimizer_offload, activation_offload)]
+            mfsdp = matrix[("mfsdp", optimizer_offload, activation_offload)]
+            assert mfsdp["losses"] == pytest.approx(
+                fsdp2["losses"],
+                rel=_LOSS_REL_TOL,
+                abs=_TENSOR_ATOL,
+            )
+            max_abs, max_rel = _assert_tensor_sets_close(
+                fsdp2["params"],
+                mfsdp["params"],
+            )
+            comparisons[(optimizer_offload, activation_offload)] = {
+                "max_param_abs_diff": max_abs,
+                "max_param_rel_diff": max_rel,
+                "max_loss_rel_diff": _max_relative_difference(
+                    fsdp2["losses"],
+                    mfsdp["losses"],
+                ),
+            }
+
+    for backend in ("fsdp2", "mfsdp"):
+        for activation_offload in (False, True):
+            optimizer_off = matrix[(backend, False, activation_offload)]
+            optimizer_on = matrix[(backend, True, activation_offload)]
+            assert (
+                optimizer_on["optimizer_memory"]["allocated_gib"]
+                < optimizer_off["optimizer_memory"]["allocated_gib"]
+            )
+            assert "cpu" in optimizer_on["optimizer_tensor_devices"]
+            if backend == "mfsdp":
+                assert optimizer_off["cpu_master_devices"] == []
+                assert optimizer_on["cpu_master_devices"] == ["cpu"]
+        for optimizer_offload in (False, True):
+            activation_off = matrix[(backend, optimizer_offload, False)]
+            activation_on = matrix[(backend, optimizer_offload, True)]
+            assert (
+                activation_on["training_memory"]["allocated_gib"]
+                < activation_off["training_memory"]["allocated_gib"]
+            )
+
+    serializable_matrix = {}
+    for (backend, optimizer_offload, activation_offload), result in matrix.items():
+        name = (
+            f"{backend}_optimizer_{int(optimizer_offload)}"
+            f"_activation_{int(activation_offload)}"
         )
+        serializable_matrix[name] = {
+            key: value for key, value in result.items() if key != "params"
+        }
+        if dist.get_rank() == 0:
+            print(
+                "[MFSDP_OFFLOAD_MATRIX] "
+                + json.dumps(
+                    {
+                        "commit": commit,
+                        "arm": name,
+                        **serializable_matrix[name],
+                        **comparisons[(optimizer_offload, activation_offload)],
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+    if wandb_run is not None:
+        try:
+            for arm, result in serializable_matrix.items():
+                payload = {
+                    f"{arm}/step_ms": result["step_ms"],
+                    f"{arm}/tokens_per_s_per_gpu": result["tokens_per_s_per_gpu"],
+                    f"{arm}/loss_final": result["losses"][-1],
+                }
+                for side in ("training_memory", "optimizer_memory"):
+                    for metric, value in result[side].items():
+                        payload[f"{arm}/{side}/{metric}"] = value
+                wandb_run.log(payload)
+            wandb_run.finish()
+        except Exception as exc:
+            pytest.fail(f"mandatory W&B logging failed: {exc}")
 
 
 def test_mfsdp_matches_fsdp2_tiny_dense_single_step():

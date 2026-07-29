@@ -12,8 +12,9 @@ import torch.nn as nn
 class CpuAdamGroup:
     """Adam momentum state on CPU for a subset of M-FSDP shard parameters.
 
-    Memory savings: exp_avg + exp_avg_sq moved off GPU (2 × 4B × numel).
-    Hard constraint: shard_param.data (fp32 master) stays on GPU for all-gather.
+    Memory savings: the authoritative fp32 master plus exp_avg and exp_avg_sq
+    live on CPU. ``shard_param.data`` is the GPU compute/all-gather mirror and
+    is refreshed after each CPU update.
 
     Per-step flow (synchronous):
       1. D2H — copy GPU gradient → pinned CPU grad buffer  (blocking)
