@@ -15,6 +15,7 @@ from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     ep_chunk_ranges,
 )
+from megatron.lite.primitive.parallel.ep_overlap import ordered_ep_submission
 
 
 def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
@@ -251,7 +252,8 @@ class EPChunkOverlapOperator:
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(input_ready)
                 scores, indices = self._route(x_chunk, start, end)
-                state = dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
+                with ordered_ep_submission():
+                    state = dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
             return chunk_idx, dispatcher, state
 
         def finish_dispatch_expert_submit_combine(pending):
@@ -282,9 +284,10 @@ class EPChunkOverlapOperator:
                 ready.record(compute_stream)
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(ready)
-                combine_state = dispatcher.submit_deepep_combine_prepared(
-                    rank_grouped, handle
-                )
+                with ordered_ep_submission():
+                    combine_state = dispatcher.submit_deepep_combine_prepared(
+                        rank_grouped, handle
+                    )
             del dispatched, probs, expert_out
             return dispatcher, combine_state
 
@@ -393,9 +396,10 @@ class EPChunkOverlapOperator:
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(router_ready)
                 chain_deepep_event()
-                state = remember_deepep_event(
-                    dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
-                )
+                with ordered_ep_submission():
+                    state = remember_deepep_event(
+                        dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
+                    )
             return chunk_idx, start, end, x_chunk, scores, state
 
         def submit_combine_bwd(chunk_idx: int, start: int, end: int, handle: Any):
@@ -403,9 +407,10 @@ class EPChunkOverlapOperator:
             with torch.cuda.stream(comm_stream):
                 grad_chunk = grad_2d[start:end].contiguous()
                 chain_deepep_event()
-                return remember_deepep_event(
-                    dispatcher.submit_deepep_combine_backward(grad_chunk, handle)
-                )
+                with ordered_ep_submission():
+                    return remember_deepep_event(
+                        dispatcher.submit_deepep_combine_backward(grad_chunk, handle)
+                    )
 
         def finish_recompute_expert(chunk_idx: int, state: dict[str, Any]):
             del chunk_idx
@@ -570,13 +575,14 @@ class EPChunkOverlapOperator:
                 with torch.cuda.stream(comm_stream):
                     comm_stream.wait_event(local_bwd_ready)
                     chain_deepep_event()
-                    local_state["dispatch_bwd_state"] = remember_deepep_event(
-                        dispatcher.submit_deepep_dispatch_backward(
-                            local_state["grad_recv_hidden"],
-                            local_state["grad_recv_probs"],
-                            chunk.handle,
+                    with ordered_ep_submission():
+                        local_state["dispatch_bwd_state"] = remember_deepep_event(
+                            dispatcher.submit_deepep_dispatch_backward(
+                                local_state["grad_recv_hidden"],
+                                local_state["grad_recv_probs"],
+                                chunk.handle,
+                            )
                         )
-                    )
                     local_state.pop("grad_recv_hidden", None)
                     local_state.pop("grad_recv_probs", None)
 

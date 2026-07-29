@@ -47,6 +47,31 @@ def test_runtime_returns_loss_separately_from_microbatch_metrics():
     assert result.model_output.loss is not None
 
 
+@pytest.mark.parametrize(("chunks", "expected"), [(1, False), (2, True)])
+def test_runtime_selects_adjacent_microbatch_overlap_from_chunked_ep_config(
+    chunks, expected
+):
+    handle = ModelHandle(
+        model=nn.Linear(1, 1, bias=False),
+        parallel_state=types.SimpleNamespace(pp_size=1),
+        config=MegatronLiteConfig(impl_cfg={"num_chunks_ep_a2a_overlap": chunks}),
+        _extras={"forward_step": MagicMock()},
+    )
+
+    with patch(
+        "megatron.lite.primitive.train_step.run_microbatch_loop",
+        return_value={"loss": torch.tensor(1.0)},
+    ) as run:
+        MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
+            handle,
+            iter([{}]),
+            None,
+            num_microbatches=2,
+        )
+
+    assert run.call_args.kwargs["overlap_forward_backward"] is expected
+
+
 def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
     context = LossContext(source_batch="source")
     seen = []
