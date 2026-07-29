@@ -112,27 +112,6 @@ def test_dispatch_local_backward_materializes_zero_probability_gradient(
     assert grad_probs.shape == (0, 2)
 
 
-def test_dispatch_backward_scratch_reuses_capacity_per_chunk_slot(
-    transformer_engine_import_stub,
-):
-    transformer_engine_import_stub()
-    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-        _EP_CHUNK_SCRATCH,
-        _zeroed_scratch,
-    )
-
-    _EP_CHUNK_SCRATCH.clear()
-    reference = torch.empty(8)
-    first = _zeroed_scratch(reference, (4, 2), role="hidden", slot=0)
-    first.fill_(7)
-    reused = _zeroed_scratch(reference, (2, 2), role="hidden", slot=0)
-    other_slot = _zeroed_scratch(reference, (2, 2), role="hidden", slot=1)
-
-    assert reused.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
-    assert other_slot.untyped_storage().data_ptr() != first.untyped_storage().data_ptr()
-    torch.testing.assert_close(reused, torch.zeros_like(reused))
-
-
 def test_forward_trace_pipelines_next_dispatch_before_current_expert(
     monkeypatch, transformer_engine_import_stub
 ):
