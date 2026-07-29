@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import threading
 
 import pytest
 import torch
@@ -14,31 +13,6 @@ from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     resolve_ep_chunk_overlap_chunks,
     validate_ep_chunk_overlap_config,
 )
-
-
-def test_adjacent_microbatch_turns_keep_collective_order_deterministic():
-    from megatron.lite.primitive.parallel.ep_overlap import (
-        adjacent_microbatch_ep_overlap,
-        ep_overlap_turn,
-    )
-
-    order = []
-
-    def backward():
-        for _ in range(2):
-            with ep_overlap_turn("backward"):
-                order.append("backward")
-
-    with adjacent_microbatch_ep_overlap():
-        worker = threading.Thread(target=backward)
-        worker.start()
-        for _ in range(2):
-            with ep_overlap_turn("forward"):
-                order.append("forward")
-        worker.join(timeout=5)
-
-    assert not worker.is_alive()
-    assert order == ["backward", "forward", "backward", "forward"]
 
 
 @pytest.mark.parametrize("value, expected", [(1, 1), (2, 2), ("2", 2)])

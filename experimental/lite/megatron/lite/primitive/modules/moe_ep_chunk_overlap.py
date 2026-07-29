@@ -15,7 +15,6 @@ from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     ep_chunk_ranges,
 )
-from megatron.lite.primitive.parallel.ep_overlap import ep_overlap_turn
 
 
 def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
@@ -168,10 +167,9 @@ class EPChunkOverlapOperator:
         chunks = 2
         if torch.is_grad_enabled():
             params = tuple(self.router.parameters()) + tuple(self.experts.parameters())
-            with ep_overlap_turn("forward"):
-                return _FullRecomputeFused.apply(
-                    x_2d, routing_input, self, input_shape, x.dtype, chunks, chunks, *params
-                )
+            return _FullRecomputeFused.apply(
+                x_2d, routing_input, self, input_shape, x.dtype, chunks, chunks, *params
+            )
         ranges = ep_chunk_ranges(
             x_2d.size(0), chunks, weights_env="MEGATRON_LITE_EP_CHUNK_WEIGHTS"
         )
@@ -680,11 +678,10 @@ class _FullRecomputeFused(torch.autograd.Function):
         x_saved, routing_saved = ctx.saved_tensors
         grad_2d = grad_output.contiguous().view(-1, grad_output.size(-1))
         routing_input = routing_saved if ctx.has_routing_input else None
-        with ep_overlap_turn("backward"):
-            with operator._routing_context(routing_input), torch.enable_grad():
-                grad_x, router_grads, expert_grads = operator._full_recompute_fused_backward(
-                    x_saved, grad_2d, ctx.bwd_chunks
-                )
+        with operator._routing_context(routing_input), torch.enable_grad():
+            grad_x, router_grads, expert_grads = operator._full_recompute_fused_backward(
+                x_saved, grad_2d, ctx.bwd_chunks
+            )
         return (
             grad_x,
             None,
