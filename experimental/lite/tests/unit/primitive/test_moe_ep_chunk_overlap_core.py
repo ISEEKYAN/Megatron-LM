@@ -177,11 +177,17 @@ def test_forward_trace_pipelines_next_dispatch_before_current_expert(
     monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: caller)
     monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
 
+    route_calls = []
+
+    def route(hidden):
+        route_calls.append(hidden.shape)
+        return (
+            torch.ones(hidden.size(0), 1),
+            torch.zeros(hidden.size(0), 1, dtype=torch.long),
+        )
+
     operator = object.__new__(EPChunkOverlapOperator)
-    operator.router = lambda hidden: (
-        torch.ones(hidden.size(0), 1),
-        torch.zeros(hidden.size(0), 1, dtype=torch.long),
-    )
+    operator.router = route
     operator.experts = FakeExperts()
     operator._streams = lambda _device: (compute, comm)
     dispatchers = [FakeDispatcher(idx) for idx in range(3)]
@@ -197,6 +203,7 @@ def test_forward_trace_pipelines_next_dispatch_before_current_expert(
     )
 
     torch.testing.assert_close(output, inputs + 1)
+    assert route_calls == [inputs.shape]
     operations = [item for item in trace if not item.startswith(("event.", "caller."))]
     assert operations == [
         "comm.wait",

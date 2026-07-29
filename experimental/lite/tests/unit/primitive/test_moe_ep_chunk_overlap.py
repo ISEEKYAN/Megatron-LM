@@ -77,6 +77,8 @@ def test_chunked_backward_submits_dgrad_before_te_delayed_wgrad(
     assert source.index("pending_dispatch_bwd.append") < source.index(
         "pop_delayed_weight_grads"
     )
+    assert "scores_all, indices_all = self._route(x_recompute" in source
+    assert "self._route(x_chunk" not in source
     assert "retain_graph=True" not in source
 
 
