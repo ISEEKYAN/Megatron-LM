@@ -15,6 +15,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     export_hf_weights,
 )
 from megatron.lite.primitive.modules.lora import LinearLoRA, SharedGroupedLinearLoRA
+from megatron.lite.primitive.modules.lora import apply_olora_tail_init
 from megatron.lite.primitive.modules.lora_apply import (
     LoRAWrappedGroupedLinear,
     LoRAWrappedLinear,
@@ -154,3 +155,15 @@ def test_static_delta_rejects_dropout():
     adapter = SharedGroupedLinearLoRA(2, 8, 16, 2, alpha=4, dropout=0.1)
     with pytest.raises(ValueError, match="dropout=0"):
         adapter.materialized_delta_weight()
+
+
+def test_olora_tail_warns_when_grouped_expert_adapters_are_skipped():
+    model = _TinyWrappedModel()
+
+    with pytest.warns(
+        UserWarning,
+        match="OLoRA-tail does not support MoE grouped expert adapters",
+    ):
+        stats = apply_olora_tail_init(model)
+
+    assert stats == {"initialized": 1, "skipped": 1}

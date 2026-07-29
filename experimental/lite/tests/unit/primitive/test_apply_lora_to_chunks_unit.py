@@ -409,6 +409,27 @@ def test_qkv_normalized_surface_requires_exact_base_output_protocol():
         _enable_qkv_normalized_output(base_qkv)
 
 
+def test_qkv_adapter_consumes_exact_base_normalized_output_object():
+    class _NormalizedOutputBase(nn.Module):
+        def forward_with_normalized_input(self, x):
+            self.normalized_output = x.detach().clone()
+            return torch.zeros_like(x), self.normalized_output
+
+    class _RecordingAdapter(nn.Module):
+        def forward(self, x):
+            self.input = x
+            return torch.zeros_like(x)
+
+    base = _NormalizedOutputBase()
+    adapter = _RecordingAdapter()
+    wrapped = LoRAWrappedLinear(base, adapter, use_base_normalized_input=True)
+
+    wrapped(torch.randn(2, 4))
+
+    assert adapter.input is base.normalized_output
+    assert torch.equal(adapter.input, base.normalized_output)
+
+
 def test_apply_lora_tp_layout_on_gqa_adapters():
     from megatron.lite.primitive.modules.lora_apply import (
         _attach_gqa_proj,

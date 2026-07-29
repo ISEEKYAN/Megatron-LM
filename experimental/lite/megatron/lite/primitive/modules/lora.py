@@ -7,6 +7,7 @@ Megatron-style sharded linear surfaces, not arbitrary PEFT injection.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -577,12 +578,15 @@ def _weight_owner(module: nn.Module) -> nn.Module | None:
 
 
 def apply_olora_tail_init(model: nn.Module) -> dict[str, int]:
+    """Initialize supported dense adapters and warn for unsupported grouped experts."""
+
     from megatron.lite.primitive.modules.lora_apply import (
         LoRAWrappedGroupedLinear,
         LoRAWrappedLinear,
     )
 
     stats = {"initialized": 0, "skipped": 0}
+    skipped_grouped_experts = 0
     for module in model.modules():
         if isinstance(module, LoRAWrappedLinear):
             owner = _weight_owner(module.base)
@@ -593,6 +597,15 @@ def apply_olora_tail_init(model: nn.Module) -> dict[str, int]:
             stats["initialized"] += 1
         elif isinstance(module, LoRAWrappedGroupedLinear):
             stats["skipped"] += 1
+            skipped_grouped_experts += 1
+    if skipped_grouped_experts:
+        warnings.warn(
+            "OLoRA-tail does not support MoE grouped expert adapters; "
+            f"skipped {skipped_grouped_experts} grouped adapter(s) while "
+            "initializing supported dense adapters.",
+            UserWarning,
+            stacklevel=2,
+        )
     return stats
 
 
