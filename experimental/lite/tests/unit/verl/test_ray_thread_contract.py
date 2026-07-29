@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
 import pytest
+import ray
+from omegaconf import OmegaConf
 
 
 LITE_ROOT = Path(__file__).parents[3]
@@ -46,6 +49,20 @@ def _dry_run(script: str, tmp_path: Path, omp_num_threads: str | None) -> str:
     ).stdout
 
 
+def _ray_init_kwargs(command: str) -> dict[str, object]:
+    prefix = "+ray_kwargs.ray_init."
+    overrides = [
+        argument for argument in shlex.split(command) if argument.startswith(prefix)
+    ]
+
+    assert overrides
+    config = OmegaConf.from_dotlist(
+        [override.removeprefix("+") for override in overrides]
+    )
+
+    return OmegaConf.to_container(config.ray_kwargs.ray_init, resolve=True)
+
+
 @pytest.mark.parametrize(
     "script",
     [
@@ -72,3 +89,29 @@ def test_ray_runtime_env_matches_torchrun_omp_contract(
         f"+ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS=\\'{expected}\\'"
         in command
     )
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (None, "1"),
+        ("3", "3"),
+    ],
+)
+def test_ray_worker_observes_omp_contract(
+    configured: str | None,
+    expected: str,
+    tmp_path: Path,
+) -> None:
+    command = _dry_run("run_qwen3moe_gsm8k_grpo.sh", tmp_path, configured)
+    ray.init(num_cpus=1, include_dashboard=False, **_ray_init_kwargs(command))
+
+    try:
+
+        @ray.remote
+        def read_omp_num_threads() -> str | None:
+            return os.environ.get("OMP_NUM_THREADS")
+
+        assert ray.get(read_omp_num_threads.remote()) == expected
+    finally:
+        ray.shutdown()
