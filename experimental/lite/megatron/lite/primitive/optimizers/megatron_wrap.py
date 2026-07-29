@@ -162,20 +162,15 @@ def build_dist_opt_stack(
             ddp_kwargs = {}
             if pg_collection is not None:
                 ddp_kwargs["pg_collection"] = pg_collection
-            wrapped_chunk = DistributedDataParallel(
-                dist_opt_transformer_cfg,
-                ddp_config,
-                chunk,
-                disable_bucketing=(chunk_idx > 0),
-                **ddp_kwargs,
-            )
-            for param in chunk.parameters():
-                setattr(
-                    param,
-                    "_mlite_ddp_overlap_grad_reduce",
-                    ddp_config.overlap_grad_reduce,
+            wrapped_chunks.append(
+                DistributedDataParallel(
+                    dist_opt_transformer_cfg,
+                    ddp_config,
+                    chunk,
+                    disable_bucketing=(chunk_idx > 0),
+                    **ddp_kwargs,
                 )
-            wrapped_chunks.append(wrapped_chunk)
+            )
 
     # Single-source-of-truth OptimizerConfig construction for native lite
     # model protocols.

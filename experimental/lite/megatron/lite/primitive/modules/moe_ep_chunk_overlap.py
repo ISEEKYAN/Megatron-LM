@@ -165,16 +165,8 @@ class EPChunkOverlapOperator:
         chunks = 2
         if torch.is_grad_enabled():
             params = tuple(self.router.parameters()) + tuple(self.experts.parameters())
-            autograd_params = _select_autograd_params(params)
             return _FullRecomputeFused.apply(
-                x_2d,
-                routing_input,
-                self,
-                input_shape,
-                x.dtype,
-                chunks,
-                chunks,
-                *autograd_params,
+                x_2d, routing_input, self, input_shape, x.dtype, chunks, chunks, *params
             )
         ranges = ep_chunk_ranges(
             x_2d.size(0), chunks, weights_env="MEGATRON_LITE_EP_CHUNK_WEIGHTS"
@@ -659,10 +651,10 @@ class _FullRecomputeFused(torch.autograd.Function):
         bwd_chunks: int,
         *params: torch.Tensor,
     ) -> torch.Tensor:
-        del input_dtype
+        del params, input_dtype
         ctx.operator = operator
         ctx.bwd_chunks = bwd_chunks
-        ctx.autograd_params = params
+        ctx.num_router_params = len(tuple(operator.router.parameters()))
         ctx.has_routing_input = routing_input is not None
         saved_routing = (
             routing_input.detach()
@@ -686,14 +678,6 @@ class _FullRecomputeFused(torch.autograd.Function):
             grad_x, router_grads, expert_grads = operator._full_recompute_fused_backward(
                 x_saved, grad_2d, ctx.bwd_chunks
             )
-        params = tuple(operator.router.parameters()) + tuple(
-            operator.experts.parameters()
-        )
-        param_grads = _finalize_param_grads(
-            params,
-            (*router_grads, *expert_grads),
-            ctx.autograd_params,
-        )
         return (
             grad_x,
             None,
@@ -702,7 +686,8 @@ class _FullRecomputeFused(torch.autograd.Function):
             None,
             None,
             None,
-            *param_grads,
+            *router_grads,
+            *expert_grads,
         )
 
 
@@ -755,44 +740,6 @@ def _accumulate(
             accum[idx] = grad
         else:
             accum[idx].add_(grad)
-
-
-def _uses_direct_main_grad(param: torch.Tensor) -> bool:
-    if getattr(param, "_mlite_ddp_overlap_grad_reduce", None) is not False:
-        return False
-    if getattr(param, "main_grad", None) is None:
-        raise RuntimeError(
-            "Direct main-grad accumulation requires the MLite DDP main_grad buffer."
-        )
-    if not hasattr(param, "grad_added_to_main_grad"):
-        raise RuntimeError(
-            "Direct main-grad accumulation requires the MLite DDP grad marker."
-        )
-    return True
-
-
-def _select_autograd_params(
-    params: tuple[torch.Tensor, ...],
-) -> tuple[torch.Tensor, ...]:
-    fallback = tuple(param for param in params if not _uses_direct_main_grad(param))
-    return fallback if fallback else params[:1]
-
-
-def _finalize_param_grads(
-    params: tuple[torch.Tensor, ...],
-    grads: tuple[torch.Tensor, ...],
-    autograd_params: tuple[torch.Tensor, ...],
-) -> tuple[torch.Tensor | None, ...]:
-    grad_by_param = dict(zip(params, grads, strict=True))
-    for param, grad in zip(params, grads, strict=True):
-        if not _uses_direct_main_grad(param):
-            continue
-        param.main_grad.add_(grad)
-        param.grad_added_to_main_grad = True
-    return tuple(
-        None if _uses_direct_main_grad(param) else grad_by_param[param]
-        for param in autograd_params
-    )
 
 
 def _materialize(

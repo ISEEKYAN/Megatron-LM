@@ -131,67 +131,6 @@ def test_accumulate_reuses_first_chunk_gradient_storage(
     torch.testing.assert_close(accum[0], torch.full((2, 2), 3.0))
 
 
-def test_dist_opt_param_grads_bypass_accumulate_grad(
-    transformer_engine_import_stub,
-):
-    transformer_engine_import_stub()
-    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-        _finalize_param_grads,
-        _select_autograd_params,
-    )
-
-    direct = torch.nn.Parameter(torch.zeros(2, 2, dtype=torch.bfloat16))
-    direct.main_grad = torch.zeros(2, 2)
-    direct.grad_added_to_main_grad = False
-    direct._mlite_ddp_overlap_grad_reduce = False
-    fallback = torch.nn.Parameter(torch.zeros(2, 2))
-    direct_grad = torch.full((2, 2), 2.0, dtype=torch.bfloat16)
-    fallback_grad = torch.full((2, 2), 3.0)
-
-    autograd_params = _select_autograd_params((direct, fallback))
-    autograd_grads = _finalize_param_grads(
-        (direct, fallback),
-        (direct_grad, fallback_grad),
-        autograd_params,
-    )
-
-    assert autograd_params == (fallback,)
-    assert autograd_grads == (fallback_grad,)
-    torch.testing.assert_close(direct.main_grad, torch.full((2, 2), 2.0))
-    assert direct.grad_added_to_main_grad is True
-
-
-def test_all_direct_params_keep_one_backward_trigger(
-    transformer_engine_import_stub,
-):
-    transformer_engine_import_stub()
-    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-        _finalize_param_grads,
-        _select_autograd_params,
-    )
-
-    params = tuple(
-        torch.nn.Parameter(torch.zeros(1, dtype=torch.bfloat16)) for _ in range(2)
-    )
-    for param in params:
-        param.main_grad = torch.zeros(1)
-        param.grad_added_to_main_grad = False
-        param._mlite_ddp_overlap_grad_reduce = False
-
-    autograd_params = _select_autograd_params(params)
-    autograd_grads = _finalize_param_grads(
-        params,
-        (torch.ones(1, dtype=torch.bfloat16),) * 2,
-        autograd_params,
-    )
-
-    assert autograd_params == params[:1]
-    assert autograd_grads == (None,)
-    for param in params:
-        torch.testing.assert_close(param.main_grad, torch.ones(1))
-        assert param.grad_added_to_main_grad is True
-
-
 def test_forward_trace_pipelines_next_dispatch_before_current_expert(
     monkeypatch, transformer_engine_import_stub
 ):
