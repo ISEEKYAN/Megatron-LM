@@ -79,10 +79,8 @@ class _BackwardChunk:
     handle: Any
     row_id_map: torch.Tensor
     prob_flat_indices: torch.Tensor
-    recv_hidden_shape: torch.Size
-    recv_hidden_dtype: torch.dtype
-    recv_probs_shape: torch.Size
-    recv_probs_dtype: torch.dtype
+    recv_hidden_scratch: torch.Tensor
+    recv_probs_scratch: torch.Tensor
     dispatched: torch.Tensor
     probs: torch.Tensor | None
     expert_out: torch.Tensor | None
@@ -483,10 +481,8 @@ class EPChunkOverlapOperator:
                     handle=state["handle"],
                     row_id_map=row_id_map.detach(),
                     prob_flat_indices=prob_flat_indices.detach(),
-                    recv_hidden_shape=state["recv_hidden"].shape,
-                    recv_hidden_dtype=state["recv_hidden"].dtype,
-                    recv_probs_shape=state["recv_probs"].shape,
-                    recv_probs_dtype=state["recv_probs"].dtype,
+                    recv_hidden_scratch=state["recv_hidden"].detach(),
+                    recv_probs_scratch=state["recv_probs"].detach(),
                     dispatched=expert_input,
                     probs=expert_probs,
                     expert_out=expert_out_ref,
@@ -714,21 +710,15 @@ def _dispatch_local_backward(
     grad_probs: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     row_id_map = chunk.row_id_map.reshape(-1).to(torch.long)
-    grad_recv_hidden = torch.zeros(
-        chunk.recv_hidden_shape,
-        dtype=chunk.recv_hidden_dtype,
-        device=grad_dispatched.device,
-    )
+    grad_recv_hidden = chunk.recv_hidden_scratch
+    grad_recv_hidden.zero_()
     grad_recv_hidden.scatter_add_(
         0,
         row_id_map.unsqueeze(1).expand(-1, grad_dispatched.size(1)),
         grad_dispatched.to(grad_recv_hidden.dtype),
     )
-    grad_recv_probs = torch.zeros(
-        chunk.recv_probs_shape,
-        dtype=chunk.recv_probs_dtype,
-        device=grad_dispatched.device,
-    )
+    grad_recv_probs = chunk.recv_probs_scratch
+    grad_recv_probs.zero_()
     if grad_probs is not None:
         flat = chunk.prob_flat_indices.reshape(-1).to(grad_probs.device, torch.long)
         grad_recv_probs.reshape(-1).index_copy_(

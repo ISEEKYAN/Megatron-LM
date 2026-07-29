@@ -64,13 +64,13 @@ def test_dispatch_local_backward_accumulates_duplicate_token_rows_and_weights(
         _dispatch_local_backward,
     )
 
+    recv_hidden = torch.full((3, 2), 9.0)
+    recv_probs = torch.full((3, 2), 9.0)
     chunk = SimpleNamespace(
         row_id_map=torch.tensor([0, 0, 2]),
         prob_flat_indices=torch.tensor([1, 3, 5]),
-        recv_hidden_shape=torch.Size([3, 2]),
-        recv_hidden_dtype=torch.float32,
-        recv_probs_shape=torch.Size([3, 2]),
-        recv_probs_dtype=torch.float32,
+        recv_hidden_scratch=recv_hidden,
+        recv_probs_scratch=recv_probs,
     )
     grad_dispatched = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     grad_probs = torch.tensor([0.25, 0.5, 0.75])
@@ -85,6 +85,8 @@ def test_dispatch_local_backward_accumulates_duplicate_token_rows_and_weights(
     torch.testing.assert_close(
         grad_recv_probs, torch.tensor([[0.0, 0.25], [0.0, 0.5], [0.0, 0.75]])
     )
+    assert grad_hidden.data_ptr() == recv_hidden.data_ptr()
+    assert grad_recv_probs.data_ptr() == recv_probs.data_ptr()
 
 
 def test_dispatch_local_backward_materializes_zero_probability_gradient(
@@ -98,10 +100,8 @@ def test_dispatch_local_backward_materializes_zero_probability_gradient(
     chunk = SimpleNamespace(
         row_id_map=torch.empty(0, dtype=torch.long),
         prob_flat_indices=torch.empty(0, dtype=torch.long),
-        recv_hidden_shape=torch.Size([0, 4]),
-        recv_hidden_dtype=torch.bfloat16,
-        recv_probs_shape=torch.Size([0, 2]),
-        recv_probs_dtype=torch.float32,
+        recv_hidden_scratch=torch.empty(0, 4, dtype=torch.bfloat16),
+        recv_probs_scratch=torch.empty(0, 2, dtype=torch.float32),
     )
 
     grad_hidden, grad_probs = _dispatch_local_backward(
