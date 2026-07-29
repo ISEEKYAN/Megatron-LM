@@ -207,6 +207,36 @@ def test_dispatch_local_backward_materializes_zero_probability_gradient(
         lease.release()
 
 
+def test_dispatch_local_backward_falls_back_when_recv_rows_exceed_fixed_capacity(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _dispatch_local_backward,
+    )
+
+    chunk = SimpleNamespace(
+        idx=0,
+        row_id_map=torch.tensor([0, 1, 2]),
+        prob_flat_indices=torch.tensor([0, 2, 4]),
+        recv_hidden_shape=torch.Size((3, 2)),
+        recv_hidden_dtype=torch.float32,
+        recv_probs_shape=torch.Size((3, 2)),
+        recv_probs_dtype=torch.float32,
+        recv_capacity_rows=2,
+    )
+
+    grad_hidden, grad_probs, leases = _dispatch_local_backward(
+        chunk,
+        torch.ones(3, 2),
+        torch.ones(3),
+    )
+
+    assert grad_hidden.shape == (3, 2)
+    assert grad_probs.shape == (3, 2)
+    assert leases == []
+
+
 def test_accumulate_reuses_first_chunk_gradient_storage(
     transformer_engine_import_stub,
 ):
@@ -271,9 +301,9 @@ def test_forward_trace_launches_current_expert_before_blocking_next_dispatch(
             self._local_tpe_list = [2]
 
         def submit_deepep_dispatch(
-            self, hidden, _scores, _indices, *, num_worst_tokens
+            self, hidden, _scores, _indices, *, num_worst_tokens=0
         ):
-            assert num_worst_tokens == hidden.size(0) * self.ep_size
+            assert num_worst_tokens == 0
             trace.append(f"dispatch.submit.{self.chunk}")
             return {
                 "hidden": hidden,

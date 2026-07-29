@@ -324,7 +324,6 @@ class EPChunkOverlapOperator:
                         x_chunk,
                         scores,
                         indices,
-                        num_worst_tokens=x_chunk.size(0) * dispatcher.ep_size,
                     )
             return chunk_idx, dispatcher, state
 
@@ -491,7 +490,6 @@ class EPChunkOverlapOperator:
                             x_chunk,
                             scores,
                             indices,
-                            num_worst_tokens=x_chunk.size(0) * dispatcher.ep_size,
                         )
                     )
             return chunk_idx, start, end, x_chunk, scores, state
@@ -593,7 +591,10 @@ class EPChunkOverlapOperator:
                     recv_hidden_dtype=state["recv_hidden"].dtype,
                     recv_probs_shape=state["recv_probs"].shape,
                     recv_probs_dtype=state["recv_probs"].dtype,
-                    recv_capacity_rows=state["capacity_rows"],
+                    recv_capacity_rows=(
+                        x_chunk.size(0) * scores.size(-1) * 7 + 7
+                    )
+                    // 8,
                     dispatched=expert_input,
                     probs=expert_probs,
                     expert_out=expert_out_ref,
@@ -823,7 +824,12 @@ def _dispatch_local_backward(
 ) -> tuple[torch.Tensor, torch.Tensor, list[Any]]:
     row_id_map = chunk.row_id_map.reshape(-1).to(torch.long)
     leases = []
-    if chunk.recv_capacity_rows is None:
+    use_fixed_scratch = (
+        chunk.recv_capacity_rows is not None
+        and chunk.recv_hidden_shape[0] <= chunk.recv_capacity_rows
+        and chunk.recv_probs_shape[0] <= chunk.recv_capacity_rows
+    )
+    if not use_fixed_scratch:
         grad_recv_hidden = torch.zeros(
             chunk.recv_hidden_shape,
             dtype=chunk.recv_hidden_dtype,
@@ -844,7 +850,7 @@ def _dispatch_local_backward(
         row_id_map.unsqueeze(1).expand(-1, grad_dispatched.size(1)),
         grad_dispatched.to(grad_recv_hidden.dtype),
     )
-    if chunk.recv_capacity_rows is None:
+    if not use_fixed_scratch:
         grad_recv_probs = torch.zeros(
             chunk.recv_probs_shape,
             dtype=chunk.recv_probs_dtype,
