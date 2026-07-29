@@ -748,6 +748,7 @@ class TokenDispatcher:
             "recv_per_expert": recv_per_expert,
             "recv_counts": recv_counts,
             "recv_counts_work": recv_counts_work,
+            "capacity_rows": int(num_worst_tokens) if num_worst_tokens else None,
             "handle": handle,
             "event": event,
         }

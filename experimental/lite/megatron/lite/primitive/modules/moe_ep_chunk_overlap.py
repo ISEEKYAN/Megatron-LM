@@ -16,7 +16,10 @@ from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     ep_chunk_ranges,
 )
-from megatron.lite.primitive.utils.cuda_allocator import record_workspace_shape
+from megatron.lite.primitive.utils.cuda_allocator import (
+    lease_fixed_capacity_scratch,
+    record_workspace_shape,
+)
 
 
 def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
@@ -135,8 +138,11 @@ class _BackwardChunk:
     handle: Any
     row_id_map: torch.Tensor
     prob_flat_indices: torch.Tensor
-    recv_hidden_scratch: torch.Tensor | None
-    recv_probs_scratch: torch.Tensor | None
+    recv_hidden_shape: torch.Size
+    recv_hidden_dtype: torch.dtype
+    recv_probs_shape: torch.Size
+    recv_probs_dtype: torch.dtype
+    recv_capacity_rows: int | None
     dispatched: torch.Tensor
     probs: torch.Tensor | None
     expert_out: torch.Tensor | None
@@ -573,8 +579,11 @@ class EPChunkOverlapOperator:
                     handle=state["handle"],
                     row_id_map=row_id_map.detach(),
                     prob_flat_indices=prob_flat_indices.detach(),
-                    recv_hidden_scratch=state["recv_hidden"].detach(),
-                    recv_probs_scratch=state["recv_probs"].detach(),
+                    recv_hidden_shape=state["recv_hidden"].shape,
+                    recv_hidden_dtype=state["recv_hidden"].dtype,
+                    recv_probs_shape=state["recv_probs"].shape,
+                    recv_probs_dtype=state["recv_probs"].dtype,
+                    recv_capacity_rows=state["capacity_rows"],
                     dispatched=expert_input,
                     probs=expert_probs,
                     expert_out=expert_out_ref,
@@ -638,11 +647,12 @@ class EPChunkOverlapOperator:
                     chunk.expert_out = None
                     chunk.expert_out_edge = None
                     local_state.pop("grad_expert_out", None)
-                    grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
-                        chunk, grad_dispatched, grad_probs
+                    grad_recv_hidden, grad_recv_probs, scratch_leases = (
+                        _dispatch_local_backward(chunk, grad_dispatched, grad_probs)
                     )
                     local_state["grad_recv_hidden"] = grad_recv_hidden
                     local_state["grad_recv_probs"] = grad_recv_probs
+                    local_state["scratch_leases"] = scratch_leases
                     local_bwd_ready = torch.cuda.Event()
                     local_bwd_ready.record(compute_stream)
                     del grad_dispatched, grad_probs
@@ -658,7 +668,9 @@ class EPChunkOverlapOperator:
                                 chunk.handle,
                             )
                         )
-                    _release_dispatch_scratch(chunk, comm_stream)
+                    local_state["dispatch_bwd_state"]["scratch_leases"] = (
+                        local_state.pop("scratch_leases")
+                    )
                     local_state.pop("grad_recv_hidden", None)
                     local_state.pop("grad_recv_probs", None)
 
@@ -681,6 +693,10 @@ class EPChunkOverlapOperator:
                 grad_hidden, grad_scores = dispatcher.finish_deepep_dispatch_backward(
                     local_state["dispatch_bwd_state"]
                 )
+                for lease in reversed(
+                    local_state["dispatch_bwd_state"].pop("scratch_leases")
+                ):
+                    lease.release()
                 if grad_scores is None:
                     if chunk.scores_shape is None or chunk.scores_dtype is None:
                         raise RuntimeError("Missing router score metadata.")
@@ -794,37 +810,74 @@ def _dispatch_local_backward(
     chunk: _BackwardChunk,
     grad_dispatched: torch.Tensor,
     grad_probs: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, list[Any]]:
     row_id_map = chunk.row_id_map.reshape(-1).to(torch.long)
-    grad_recv_hidden = chunk.recv_hidden_scratch
-    if grad_recv_hidden is None:
-        raise RuntimeError("EP chunk overlap recv-hidden scratch was released early.")
-    grad_recv_hidden.zero_()
+    leases = []
+    if chunk.recv_capacity_rows is None:
+        grad_recv_hidden = torch.zeros(
+            chunk.recv_hidden_shape,
+            dtype=chunk.recv_hidden_dtype,
+            device=grad_dispatched.device,
+        )
+    else:
+        grad_recv_hidden, hidden_lease = lease_fixed_capacity_scratch(
+            scope="ep_chunk_grad_recv_hidden",
+            shape=chunk.recv_hidden_shape,
+            capacity_rows=chunk.recv_capacity_rows,
+            dtype=chunk.recv_hidden_dtype,
+            device=grad_dispatched.device,
+            max_slots=2,
+        )
+        leases.append(hidden_lease)
     grad_recv_hidden.scatter_add_(
         0,
         row_id_map.unsqueeze(1).expand(-1, grad_dispatched.size(1)),
         grad_dispatched.to(grad_recv_hidden.dtype),
     )
-    grad_recv_probs = chunk.recv_probs_scratch
-    if grad_recv_probs is None:
-        raise RuntimeError("EP chunk overlap recv-probs scratch was released early.")
-    grad_recv_probs.zero_()
+    if chunk.recv_capacity_rows is None:
+        grad_recv_probs = torch.zeros(
+            chunk.recv_probs_shape,
+            dtype=chunk.recv_probs_dtype,
+            device=grad_dispatched.device,
+        )
+    else:
+        grad_recv_probs, probs_lease = lease_fixed_capacity_scratch(
+            scope="ep_chunk_grad_recv_probs",
+            shape=chunk.recv_probs_shape,
+            capacity_rows=chunk.recv_capacity_rows,
+            dtype=chunk.recv_probs_dtype,
+            device=grad_dispatched.device,
+            max_slots=2,
+        )
+        leases.append(probs_lease)
+    record_workspace_shape(
+        device_index=(
+            _cuda_device_index(grad_dispatched.device)
+            if grad_dispatched.device.type == "cuda"
+            else -1
+        ),
+        scope="ep_chunk_backward_scratch",
+        slot=chunk.idx,
+        dimensions={
+            "capacity_rows": (
+                0
+                if chunk.recv_capacity_rows is None
+                else chunk.recv_capacity_rows
+            ),
+            "hidden_bytes": int(
+                grad_recv_hidden.numel() * grad_recv_hidden.element_size()
+            ),
+            "probs_bytes": int(
+                grad_recv_probs.numel() * grad_recv_probs.element_size()
+            ),
+        },
+    )
     if grad_probs is not None:
         flat = chunk.prob_flat_indices.reshape(-1).to(grad_probs.device, torch.long)
         grad_recv_probs.reshape(-1).index_copy_(
             0, flat, grad_probs.reshape(-1).to(grad_recv_probs.dtype)
         )
-    return grad_recv_hidden, grad_recv_probs
-
-
-def _release_dispatch_scratch(
-    chunk: _BackwardChunk, stream: torch.cuda.Stream
-) -> None:
-    for name in ("recv_hidden_scratch", "recv_probs_scratch"):
-        tensor = getattr(chunk, name)
-        if tensor is not None:
-            tensor.record_stream(stream)
-            setattr(chunk, name, None)
+    return grad_recv_hidden, grad_recv_probs, leases
 
 
 def _expert_grad_inputs(

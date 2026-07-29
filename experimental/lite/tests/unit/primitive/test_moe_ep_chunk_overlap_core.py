@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -133,25 +134,32 @@ def test_delayed_expert_wgrads_reuse_distopt_main_grad(
 
 
 def test_dispatch_local_backward_accumulates_duplicate_token_rows_and_weights(
+    monkeypatch,
     transformer_engine_import_stub,
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
         _dispatch_local_backward,
     )
+    from megatron.lite.primitive.utils.cuda_allocator import (
+        pop_workspace_shape_metrics,
+    )
 
-    recv_hidden = torch.full((3, 2), 9.0)
-    recv_probs = torch.full((3, 2), 9.0)
+    monkeypatch.setenv("MEGATRON_LITE_CUDA_WORKSPACE_SHAPE_METRICS", "1")
     chunk = SimpleNamespace(
+        idx=0,
         row_id_map=torch.tensor([0, 0, 2]),
         prob_flat_indices=torch.tensor([1, 3, 5]),
-        recv_hidden_scratch=recv_hidden,
-        recv_probs_scratch=recv_probs,
+        recv_hidden_shape=torch.Size((3, 2)),
+        recv_hidden_dtype=torch.float32,
+        recv_probs_shape=torch.Size((3, 2)),
+        recv_probs_dtype=torch.float32,
+        recv_capacity_rows=4,
     )
     grad_dispatched = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     grad_probs = torch.tensor([0.25, 0.5, 0.75])
 
-    grad_hidden, grad_recv_probs = _dispatch_local_backward(
+    grad_hidden, grad_recv_probs, leases = _dispatch_local_backward(
         chunk, grad_dispatched, grad_probs
     )
 
@@ -161,8 +169,13 @@ def test_dispatch_local_backward_accumulates_duplicate_token_rows_and_weights(
     torch.testing.assert_close(
         grad_recv_probs, torch.tensor([[0.0, 0.25], [0.0, 0.5], [0.0, 0.75]])
     )
-    assert grad_hidden.data_ptr() == recv_hidden.data_ptr()
-    assert grad_recv_probs.data_ptr() == recv_probs.data_ptr()
+    metrics = pop_workspace_shape_metrics()
+    prefix = "perf/workspace_ep_chunk_backward_scratch_0"
+    assert metrics[f"{prefix}_capacity_rows_max"] == 4
+    assert metrics[f"{prefix}_hidden_bytes_max"] == 3 * 2 * 4
+    assert metrics[f"{prefix}_probs_bytes_max"] == 3 * 2 * 4
+    for lease in leases:
+        lease.release()
 
 
 def test_dispatch_local_backward_materializes_zero_probability_gradient(
@@ -174,50 +187,24 @@ def test_dispatch_local_backward_materializes_zero_probability_gradient(
     )
 
     chunk = SimpleNamespace(
+        idx=0,
         row_id_map=torch.empty(0, dtype=torch.long),
         prob_flat_indices=torch.empty(0, dtype=torch.long),
-        recv_hidden_scratch=torch.empty(0, 4, dtype=torch.bfloat16),
-        recv_probs_scratch=torch.empty(0, 2, dtype=torch.float32),
+        recv_hidden_shape=torch.Size((0, 4)),
+        recv_hidden_dtype=torch.bfloat16,
+        recv_probs_shape=torch.Size((0, 2)),
+        recv_probs_dtype=torch.float32,
+        recv_capacity_rows=1,
     )
 
-    grad_hidden, grad_probs = _dispatch_local_backward(
+    grad_hidden, grad_probs, leases = _dispatch_local_backward(
         chunk, torch.empty(0, 4, dtype=torch.bfloat16), None
     )
 
     assert grad_hidden.shape == (0, 4)
     assert grad_probs.shape == (0, 2)
-
-
-def test_dispatch_scratch_is_released_with_comm_stream_ownership(
-    transformer_engine_import_stub,
-):
-    transformer_engine_import_stub()
-    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-        _release_dispatch_scratch,
-    )
-
-    stream = object()
-
-    class Scratch:
-        def __init__(self):
-            self.stream = None
-
-        def record_stream(self, value):
-            self.stream = value
-
-    hidden = Scratch()
-    probs = Scratch()
-    chunk = SimpleNamespace(
-        recv_hidden_scratch=hidden,
-        recv_probs_scratch=probs,
-    )
-
-    _release_dispatch_scratch(chunk, stream)
-
-    assert hidden.stream is stream
-    assert probs.stream is stream
-    assert chunk.recv_hidden_scratch is None
-    assert chunk.recv_probs_scratch is None
+    for lease in leases:
+        lease.release()
 
 
 def test_accumulate_reuses_first_chunk_gradient_storage(
@@ -435,9 +422,19 @@ def test_workspace_shape_metrics_report_and_reset_jitter(monkeypatch):
 
 def test_cuda_allocator_metrics_expose_fragmentation(monkeypatch):
     from megatron.lite.primitive.utils.cuda_allocator import (
+        _reset_fixed_capacity_scratch_for_tests,
         cuda_allocator_metrics,
+        lease_fixed_capacity_scratch,
     )
 
+    _reset_fixed_capacity_scratch_for_tests()
+    _scratch, lease = lease_fixed_capacity_scratch(
+        scope="grad_recv_hidden",
+        shape=(2, 4),
+        capacity_rows=8,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
     stats = {
         "active_bytes.all.current": 3 * 1024**3,
         "inactive_split_bytes.all.current": 2 * 1024**3,
@@ -465,3 +462,84 @@ def test_cuda_allocator_metrics_expose_fragmentation(monkeypatch):
     assert metrics["perf/cuda_inactive_split_block_count"] == 13
     assert metrics["perf/cuda_num_alloc_retries"] == 17
     assert metrics["perf/cuda_num_ooms"] == 19
+    assert metrics["perf/scratch_bytes"] == 8 * 4 * 4
+    assert metrics["perf/scratch_grad_recv_hidden_bytes"] == 8 * 4 * 4
+    lease.release()
+    _reset_fixed_capacity_scratch_for_tests()
+
+
+def test_fixed_capacity_scratch_reuses_rows_and_bounds_slots():
+    from megatron.lite.primitive.utils.cuda_allocator import (
+        _reset_fixed_capacity_scratch_for_tests,
+        fixed_capacity_scratch_metrics,
+        lease_fixed_capacity_scratch,
+    )
+
+    _reset_fixed_capacity_scratch_for_tests()
+    first, first_lease = lease_fixed_capacity_scratch(
+        scope="grad_recv_hidden",
+        shape=(3, 4),
+        capacity_rows=8,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        max_slots=2,
+    )
+    second, second_lease = lease_fixed_capacity_scratch(
+        scope="grad_recv_hidden",
+        shape=(5, 4),
+        capacity_rows=8,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        max_slots=2,
+    )
+    assert first.shape == (3, 4)
+    assert second.shape == (5, 4)
+    assert first.untyped_storage().data_ptr() != second.untyped_storage().data_ptr()
+
+    with pytest.raises(RuntimeError, match="all 2 slots are in use"):
+        lease_fixed_capacity_scratch(
+            scope="grad_recv_hidden",
+            shape=(2, 4),
+            capacity_rows=8,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            max_slots=2,
+        )
+
+    first_lease.release()
+    reused, reused_lease = lease_fixed_capacity_scratch(
+        scope="grad_recv_hidden",
+        shape=(7, 4),
+        capacity_rows=8,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        max_slots=2,
+    )
+    assert reused.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+    metrics = fixed_capacity_scratch_metrics()
+    assert metrics["perf/scratch_bytes"] == 2 * 8 * 4 * 4
+    assert metrics["perf/scratch_slots"] == 2
+    assert metrics["perf/scratch_slots_in_use"] == 2
+    assert metrics["perf/scratch_grad_recv_hidden_bytes"] == 2 * 8 * 4 * 4
+
+    reused_lease.release()
+    second_lease.release()
+    _reset_fixed_capacity_scratch_for_tests()
+
+
+def test_fixed_capacity_scratch_fails_loud_on_capacity_overflow():
+    from megatron.lite.primitive.utils.cuda_allocator import (
+        _reset_fixed_capacity_scratch_for_tests,
+        lease_fixed_capacity_scratch,
+    )
+
+    _reset_fixed_capacity_scratch_for_tests()
+    with pytest.raises(ValueError, match="rows 9 exceed fixed capacity 8"):
+        lease_fixed_capacity_scratch(
+            scope="grad_recv_hidden",
+            shape=(9, 4),
+            capacity_rows=8,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            max_slots=2,
+        )

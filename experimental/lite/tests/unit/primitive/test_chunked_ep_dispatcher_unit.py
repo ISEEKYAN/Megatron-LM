@@ -175,6 +175,7 @@ def test_fixed_capacity_dispatch_resolves_global_local_expert_counts(monkeypatch
     recv_per_expert = value._resolve_deepep_recv_per_expert(state)
 
     assert value.buffer.dispatch_calls[0][1]["num_worst_tokens"] == 24
+    assert state["capacity_rows"] == 24
     assert recv_per_expert == [33, 44]
     assert work.waited
 
