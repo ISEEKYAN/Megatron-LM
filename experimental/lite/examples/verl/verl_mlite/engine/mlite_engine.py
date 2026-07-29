@@ -776,6 +776,9 @@ class MegatronLiteEngine(BaseEngine):
             router_replay={"action": "replay"} if replay_enabled else None,
         )
         if reduced_outputs is not None:
+            diagnostics = cuda_allocator_metrics()
+            diagnostics.update(pop_workspace_shape_metrics())
+            reduced_outputs.append({"metrics": diagnostics})
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
         metrics = dict(result.metrics)
         metrics.update(cuda_allocator_metrics())
