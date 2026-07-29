@@ -260,6 +260,21 @@ def _vllm_server_profile_env() -> dict[str, str]:
     return result
 
 
+def _torchrun_process_env() -> dict[str, str]:
+    """Return process defaults that torchrun supplies to every local worker."""
+    # torch.distributed.run.config_from_args defaults OMP_NUM_THREADS to 1 for
+    # multi-process launches, while LocalElasticAgent._start_workers defaults
+    # TORCH_NCCL_ASYNC_ERROR_HANDLING to 1. Preserve explicit user values just
+    # as torchrun does. Elastic rank/rendezvous variables are topology state,
+    # so Ray remains responsible for those rather than synthesizing them here.
+    return {
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING": os.environ.get(
+            "TORCH_NCCL_ASYNC_ERROR_HANDLING", "1"
+        ),
+    }
+
+
 class _RayActorClassProfile:
     """Merge a process profile into one Ray actor class's ``runtime_env``."""
 
@@ -269,7 +284,8 @@ class _RayActorClassProfile:
 
     def options(self, **kwargs: Any) -> Any:
         runtime_env = dict(kwargs.get("runtime_env") or {})
-        env_vars = dict(runtime_env.get("env_vars") or {})
+        env_vars = _torchrun_process_env()
+        env_vars.update(runtime_env.get("env_vars") or {})
         env_vars.update(self._env_vars)
         runtime_env["env_vars"] = env_vars
         kwargs["runtime_env"] = runtime_env

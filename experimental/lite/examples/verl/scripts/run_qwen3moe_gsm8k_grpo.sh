@@ -40,9 +40,6 @@ INFER_BACKEND="${INFER_BACKEND:-vllm}"
 
 NNODES="${NNODES:-1}"
 NGPUS_PER_NODE="${NGPUS_PER_NODE:-${NPROC_PER_NODE:-8}}"
-# Match torchrun's multi-process overload protection for Ray-launched workers.
-# An explicit user value wins, just as it does under torchrun.
-OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-128}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
@@ -292,7 +289,6 @@ TRAINER=(
   "trainer.default_local_dir=${CKPT_DIR}"
   "trainer.val_before_train=False"
   "trainer.log_val_generations=${LOG_VAL_GENERATIONS}"
-  "+ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS='${OMP_NUM_THREADS}'"
 )
 
 COMMAND=(

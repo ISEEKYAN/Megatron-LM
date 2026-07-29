@@ -39,9 +39,6 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-}"
 
 NNODES="${NNODES:-1}"
 NGPUS_PER_NODE="${NGPUS_PER_NODE:-${NPROC_PER_NODE:-8}}"
-# Match torchrun's multi-process overload protection for Ray-launched workers.
-# An explicit user value wins, just as it does under torchrun.
-OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 ACTOR_PP="${ACTOR_PP:-4}"
 ACTOR_CP="${ACTOR_CP:-4}"
 ACTOR_EP="${ACTOR_EP:-8}"
@@ -308,7 +305,6 @@ TRAINER=(
   "trainer.default_local_dir=${CKPT_DIR}"
   "trainer.val_before_train=False"
   "trainer.log_val_generations=10"
-  "+ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS='${OMP_NUM_THREADS}'"
 )
 
 REWARD=(
