@@ -736,7 +736,10 @@ def _accumulate(
         if grad is None:
             continue
         grad = grad.to(param.dtype)
-        accum[idx] = grad if accum[idx] is None else accum[idx] + grad
+        if accum[idx] is None:
+            accum[idx] = grad
+        else:
+            accum[idx].add_(grad)
 
 
 def _materialize(

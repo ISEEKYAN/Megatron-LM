@@ -112,6 +112,25 @@ def test_dispatch_local_backward_materializes_zero_probability_gradient(
     assert grad_probs.shape == (0, 2)
 
 
+def test_accumulate_reuses_first_chunk_gradient_storage(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import _accumulate
+
+    parameter = torch.nn.Parameter(torch.zeros(2, 2))
+    first = torch.ones(2, 2)
+    second = torch.full((2, 2), 2.0)
+    accum = [None]
+
+    _accumulate(accum, (parameter,), (first,))
+    storage = accum[0].data_ptr()
+    _accumulate(accum, (parameter,), (second,))
+
+    assert accum[0].data_ptr() == storage
+    torch.testing.assert_close(accum[0], torch.full((2, 2), 3.0))
+
+
 def test_forward_trace_pipelines_next_dispatch_before_current_expert(
     monkeypatch, transformer_engine_import_stub
 ):
