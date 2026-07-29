@@ -624,6 +624,29 @@ def _assert_tensor_sets_close(
     return max_abs, max_rel
 
 
+def _tensor_set_metrics(
+    lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]
+) -> dict[str, float]:
+    assert lhs.keys() == rhs.keys()
+    max_abs = 0.0
+    max_rel = 0.0
+    min_cosine = 1.0
+    for name in lhs:
+        left = lhs[name].double().reshape(-1)
+        right = rhs[name].double().reshape(-1)
+        diff = (left - right).abs()
+        max_abs = max(max_abs, float(diff.max().item()))
+        denominator = torch.maximum(left.abs(), right.abs()).clamp_min(_TENSOR_ATOL)
+        max_rel = max(max_rel, float((diff / denominator).max().item()))
+        cosine = torch.nn.functional.cosine_similarity(left, right, dim=0, eps=1.0e-12)
+        min_cosine = min(min_cosine, float(cosine.item()))
+    return {
+        "max_param_abs_diff": max_abs,
+        "max_param_rel_diff": max_rel,
+        "min_param_cosine": min_cosine,
+    }
+
+
 def _dense_parallel_config() -> ParallelConfig:
     return ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1)
 
@@ -851,7 +874,33 @@ def test_mfsdp_offload_matrix_matches_fsdp2_precision_speed_and_memory():
                     target=target,
                 )
 
+    if dist.get_rank() == 0:
+        for (backend, optimizer_offload, activation_offload), result in matrix.items():
+            name = (
+                f"{backend}_optimizer_{int(optimizer_offload)}"
+                f"_activation_{int(activation_offload)}"
+            )
+            raw = {key: value for key, value in result.items() if key != "params"}
+            print(
+                "[MFSDP_OFFLOAD_RAW] "
+                + json.dumps({"commit": commit, "arm": name, **raw}, sort_keys=True),
+                flush=True,
+            )
+            wandb_run.log(
+                {
+                    f"{name}/step_ms": raw["step_ms"],
+                    f"{name}/tokens_per_s_per_gpu": raw["tokens_per_s_per_gpu"],
+                    f"{name}/loss_final": raw["losses"][-1],
+                    **{
+                        f"{name}/{side}/{metric}": value
+                        for side in ("training_memory", "optimizer_memory")
+                        for metric, value in raw[side].items()
+                    },
+                }
+            )
+
     comparisons = {}
+    offload_effects = {}
     for optimizer_offload in (False, True):
         for activation_offload in (False, True):
             fsdp2 = matrix[("fsdp2", optimizer_offload, activation_offload)]
@@ -861,20 +910,31 @@ def test_mfsdp_offload_matrix_matches_fsdp2_precision_speed_and_memory():
                 rel=_LOSS_REL_TOL,
                 abs=_TENSOR_ATOL,
             )
-            max_abs, max_rel = _assert_tensor_sets_close(
-                fsdp2["params"],
-                mfsdp["params"],
-            )
             comparisons[(optimizer_offload, activation_offload)] = {
-                "max_param_abs_diff": max_abs,
-                "max_param_rel_diff": max_rel,
                 "max_loss_rel_diff": _max_relative_difference(
                     fsdp2["losses"],
                     mfsdp["losses"],
                 ),
+                **_tensor_set_metrics(fsdp2["params"], mfsdp["params"]),
             }
 
     for backend in ("fsdp2", "mfsdp"):
+        baseline = matrix[(backend, False, False)]
+        for optimizer_offload in (False, True):
+            for activation_offload in (False, True):
+                arm = matrix[(backend, optimizer_offload, activation_offload)]
+                assert arm["losses"] == pytest.approx(
+                    baseline["losses"],
+                    rel=_LOSS_REL_TOL,
+                    abs=_TENSOR_ATOL,
+                )
+                offload_effects[(backend, optimizer_offload, activation_offload)] = {
+                    "max_loss_rel_diff": _max_relative_difference(
+                        baseline["losses"],
+                        arm["losses"],
+                    ),
+                    **_tensor_set_metrics(baseline["params"], arm["params"]),
+                }
         for activation_offload in (False, True):
             optimizer_off = matrix[(backend, False, activation_offload)]
             optimizer_on = matrix[(backend, True, activation_offload)]
@@ -911,7 +971,12 @@ def test_mfsdp_offload_matrix_matches_fsdp2_precision_speed_and_memory():
                         "commit": commit,
                         "arm": name,
                         **serializable_matrix[name],
-                        **comparisons[(optimizer_offload, activation_offload)],
+                        "vs_fsdp2": comparisons[
+                            (optimizer_offload, activation_offload)
+                        ],
+                        "vs_backend_no_offload": offload_effects[
+                            (backend, optimizer_offload, activation_offload)
+                        ],
                     },
                     sort_keys=True,
                 ),
