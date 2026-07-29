@@ -311,6 +311,12 @@ def _memory_triple() -> dict[str, float]:
     )
 
 
+def _memory_delta(
+    current: dict[str, float], baseline: dict[str, float]
+) -> dict[str, float]:
+    return {name: current[name] - baseline[name] for name in current}
+
+
 def _optimizer_tensor_devices(optimizer: Any) -> list[str]:
     devices: set[str] = set()
     seen: set[int] = set()
@@ -387,6 +393,10 @@ def _run_offload_arm(
 ) -> dict[str, Any]:
     gc.collect()
     torch.cuda.empty_cache()
+    # Composable FSDP keeps process-lifetime bookkeeping across models. Preserve
+    # the absolute allocator snapshot, but compare each arm using its isolated
+    # increment so earlier arms cannot contaminate later arms.
+    arm_baseline_memory = _memory_triple()
     builder = _build_mfsdp_pair if backend == "mfsdp" else _build_fsdp2_pair
     kwargs = dict(
         seed=4567,
@@ -429,8 +439,15 @@ def _run_offload_arm(
         "losses": losses,
         "step_ms": statistics.median(step_times) * 1000.0,
         "tokens_per_s_per_gpu": x.shape[0] / statistics.median(step_times),
+        "arm_baseline_memory": arm_baseline_memory,
         "training_memory": training_memory[-1],
+        "training_incremental_memory": _memory_delta(
+            training_memory[-1], arm_baseline_memory
+        ),
         "optimizer_memory": optimizer_memory[-1],
+        "optimizer_incremental_memory": _memory_delta(
+            optimizer_memory[-1], arm_baseline_memory
+        ),
         "optimizer_tensor_devices": _optimizer_tensor_devices(optimizer),
         "cpu_master_devices": _mfsdp_cpu_master_devices(optimizer),
         "params": params,
@@ -893,7 +910,12 @@ def test_mfsdp_offload_matrix_matches_fsdp2_precision_speed_and_memory():
                     f"{name}/loss_final": raw["losses"][-1],
                     **{
                         f"{name}/{side}/{metric}": value
-                        for side in ("training_memory", "optimizer_memory")
+                        for side in (
+                            "training_memory",
+                            "training_incremental_memory",
+                            "optimizer_memory",
+                            "optimizer_incremental_memory",
+                        )
                         for metric, value in raw[side].items()
                     },
                 }
@@ -939,8 +961,8 @@ def test_mfsdp_offload_matrix_matches_fsdp2_precision_speed_and_memory():
             optimizer_off = matrix[(backend, False, activation_offload)]
             optimizer_on = matrix[(backend, True, activation_offload)]
             assert (
-                optimizer_on["optimizer_memory"]["allocated_gib"]
-                < optimizer_off["optimizer_memory"]["allocated_gib"]
+                optimizer_on["optimizer_incremental_memory"]["allocated_gib"]
+                < optimizer_off["optimizer_incremental_memory"]["allocated_gib"]
             )
             assert "cpu" in optimizer_on["optimizer_tensor_devices"]
             if backend == "mfsdp":
@@ -950,8 +972,8 @@ def test_mfsdp_offload_matrix_matches_fsdp2_precision_speed_and_memory():
             activation_off = matrix[(backend, optimizer_offload, False)]
             activation_on = matrix[(backend, optimizer_offload, True)]
             assert (
-                activation_on["training_memory"]["allocated_gib"]
-                < activation_off["training_memory"]["allocated_gib"]
+                activation_on["training_incremental_memory"]["allocated_gib"]
+                < activation_off["training_incremental_memory"]["allocated_gib"]
             )
 
     serializable_matrix = {}
@@ -991,7 +1013,12 @@ def test_mfsdp_offload_matrix_matches_fsdp2_precision_speed_and_memory():
                     f"{arm}/tokens_per_s_per_gpu": result["tokens_per_s_per_gpu"],
                     f"{arm}/loss_final": result["losses"][-1],
                 }
-                for side in ("training_memory", "optimizer_memory"):
+                for side in (
+                    "training_memory",
+                    "training_incremental_memory",
+                    "optimizer_memory",
+                    "optimizer_incremental_memory",
+                ):
                     for metric, value in result[side].items():
                         payload[f"{arm}/{side}/{metric}"] = value
                 wandb_run.log(payload)
