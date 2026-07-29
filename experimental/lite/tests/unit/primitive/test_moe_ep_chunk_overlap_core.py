@@ -557,6 +557,50 @@ def test_fixed_capacity_scratch_reuses_rows_and_bounds_slots():
     _reset_fixed_capacity_scratch_for_tests()
 
 
+def test_fixed_capacity_scratch_capacity_changes_keep_one_bounded_bank():
+    from megatron.lite.primitive.utils.cuda_allocator import (
+        _reset_fixed_capacity_scratch_for_tests,
+        fixed_capacity_scratch_metrics,
+        lease_fixed_capacity_scratch,
+    )
+
+    _reset_fixed_capacity_scratch_for_tests()
+    _small, small_lease = lease_fixed_capacity_scratch(
+        scope="grad_recv_hidden",
+        shape=(4, 4),
+        capacity_rows=8,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        max_slots=1,
+    )
+    small_lease.release()
+    grown, grown_lease = lease_fixed_capacity_scratch(
+        scope="grad_recv_hidden",
+        shape=(12, 4),
+        capacity_rows=16,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        max_slots=1,
+    )
+    grown_lease.release()
+    reused, reused_lease = lease_fixed_capacity_scratch(
+        scope="grad_recv_hidden",
+        shape=(6, 4),
+        capacity_rows=10,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        max_slots=1,
+    )
+
+    assert reused.untyped_storage().data_ptr() == grown.untyped_storage().data_ptr()
+    metrics = fixed_capacity_scratch_metrics()
+    assert metrics["perf/scratch_bytes"] == 16 * 4 * 4
+    assert metrics["perf/scratch_slots"] == 1
+
+    reused_lease.release()
+    _reset_fixed_capacity_scratch_for_tests()
+
+
 def test_fixed_capacity_scratch_release_records_the_consumer_stream(monkeypatch):
     from megatron.lite.primitive.utils.cuda_allocator import (
         _FixedScratchLease,

@@ -86,14 +86,18 @@ def lease_fixed_capacity_scratch(
         scope,
         dtype,
         shape[1:],
-        int(capacity_rows),
     )
     slots = _FIXED_CAPACITY_SCRATCH.setdefault(key, [])
+    grow_candidate = None
     wait_candidate = None
     for slot in slots:
         if slot.in_use:
             continue
         if _slot_ready(slot, device):
+            if slot.tensor.size(0) < capacity_rows:
+                if grow_candidate is None:
+                    grow_candidate = slot
+                continue
             slot.in_use = True
             slot.event = None
             view = slot.tensor[:rows].view(shape).detach()
@@ -101,6 +105,16 @@ def lease_fixed_capacity_scratch(
             return view, _FixedScratchLease(slot, device)
         if wait_candidate is None:
             wait_candidate = slot
+    if grow_candidate is not None:
+        grow_candidate.tensor = torch.empty(
+            (capacity_rows, *shape[1:]), dtype=dtype, device=device
+        )
+        grow_candidate.in_use = True
+        grow_candidate.event = None
+        grow_candidate.stream_key = None
+        view = grow_candidate.tensor[:rows].view(shape).detach()
+        view.zero_()
+        return view, _FixedScratchLease(grow_candidate, device)
     if len(slots) < max_slots:
         slot = _FixedScratchSlot(
             torch.empty((capacity_rows, *shape[1:]), dtype=dtype, device=device),
@@ -116,6 +130,10 @@ def lease_fixed_capacity_scratch(
         )
     assert wait_candidate.event is not None
     torch.cuda.current_stream(device).wait_event(wait_candidate.event)
+    if wait_candidate.tensor.size(0) < capacity_rows:
+        wait_candidate.tensor = torch.empty(
+            (capacity_rows, *shape[1:]), dtype=dtype, device=device
+        )
     wait_candidate.in_use = True
     wait_candidate.event = None
     wait_candidate.stream_key = None
