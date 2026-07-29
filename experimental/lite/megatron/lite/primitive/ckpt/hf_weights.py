@@ -786,6 +786,50 @@ def _merge_dense_shards(
     return torch.cat(shards, dim=split_dim)
 
 
+def _iter_export_named_parameters(chunk: nn.Module, base_chunk: nn.Module):
+    """Source ``(name, full_param)`` pairs for export, bounded when possible.
+
+    Backends whose wrapper exposes ``stream_full_parameters`` (the mfsdp backend)
+    gather the unsharded parameters one bucket at a time, capping the transient
+    export footprint at a single bucket instead of the whole model. Everything
+    else -- FSDP2 ``DTensor`` params (gathered lazily by ``_materialize_dtensor``)
+    and plain manually-sharded params -- falls back to ``named_parameters``.
+
+    The streaming path is guarded for completeness. Its bucket walk emits a
+    param only when it can match the bucket's shard identity back to a name; a
+    param whose identity fails to match would otherwise fall through the bucket
+    loop and never be yielded (a silently truncated shard on resync). So the set
+    of streamed names is checked against the full ``named_parameters`` set on the
+    unwrapped chunk and any drift fails loud instead of shipping partial weights.
+    """
+    streamer = getattr(chunk, "stream_full_parameters", None)
+    if not callable(streamer):
+        yield from base_chunk.named_parameters()
+        return
+
+    from megatron.lite.primitive.utils import log_rank0
+
+    log_rank0(
+        "[export] bounded stream_full_parameters path active "
+        "(per-bucket materialization)"
+    )
+    # Cheap reference set: the unwrapped chunk's sharded named_parameters (no
+    # all-gather). Names align with the streamer, which resolves against the same
+    # (currently-installed, sharded) module params.
+    expected = {name for name, _ in base_chunk.named_parameters()}
+    streamed: set[str] = set()
+    for name, param in streamer():
+        streamed.add(name)
+        yield name, param
+    if streamed != expected:
+        missing = sorted(expected - streamed)
+        unexpected = sorted(streamed - expected)
+        raise RuntimeError(
+            "bounded parameter export is incomplete: refusing to ship a "
+            f"truncated weight shard (missing={missing}, unexpected={unexpected})"
+        )
+
+
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,
@@ -828,7 +872,11 @@ def export_hf_weights(
                 if hasattr(base_chunk, "layer_indices")
                 else {}
             )
-            for name, param in base_chunk.named_parameters():
+            # M-FSDP backends stream unsharded params one bounded bucket at a
+            # time via ``stream_full_parameters`` (capping the export peak);
+            # FSDP2 / manual shards fall back to ``named_parameters`` and are
+            # gathered lazily downstream by ``_materialize_dtensor``.
+            for name, param in _iter_export_named_parameters(chunk, base_chunk):
                 yield to_global_layer_name(name, layer_map), param.data.detach()
             if callable(is_export_buffer):
                 for name, buffer in base_chunk.named_buffers():
