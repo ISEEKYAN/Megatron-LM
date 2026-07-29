@@ -283,7 +283,6 @@ def main() -> int:
         parallel,
         num_chunks_ep_a2a_overlap=args.chunks,
         use_deepep=True,
-        layer_idx=0,
     ).to(torch.bfloat16).cuda()
     candidate.load_state_dict(baseline.state_dict())
     for parameter in candidate.experts.parameters():

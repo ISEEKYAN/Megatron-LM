@@ -86,6 +86,14 @@ def test_chunked_ep_operator_does_not_construct_or_factory_dispatchers():
     assert "config: Any" not in implementation
 
 
+def test_chunked_ep_benchmark_uses_the_current_qwen_moe_signature():
+    benchmark = (
+        LITE_ROOT / "examples/bench/chunked_ep_layer_perf.py"
+    ).read_text()
+
+    assert "layer_idx=" not in benchmark
+
+
 def test_deepseek_hash_router_keeps_checkpoint_gate_name():
     implementation = (MODEL_ROOT / "deepseek_v4/lite/moe.py").read_text()
 
