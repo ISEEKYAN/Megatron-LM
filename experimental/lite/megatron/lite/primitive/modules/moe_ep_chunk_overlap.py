@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -28,6 +29,34 @@ def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
 
 
 _EP_CHUNK_COMM_STREAMS: dict[int, torch.cuda.Stream] = {}
+_EP_CHUNK_SCRATCH: dict[
+    tuple[str, int | None, torch.dtype, str, int], torch.Tensor
+] = {}
+
+
+def _zeroed_scratch(
+    reference: torch.Tensor,
+    shape: tuple[int, ...] | torch.Size,
+    *,
+    role: str,
+    slot: int,
+) -> torch.Tensor:
+    """Return a zeroed view over shared grow-only scratch for one in-flight chunk."""
+    numel = math.prod(shape)
+    key = (
+        reference.device.type,
+        reference.device.index,
+        reference.dtype,
+        role,
+        slot,
+    )
+    storage = _EP_CHUNK_SCRATCH.get(key)
+    if storage is None or storage.numel() < numel:
+        storage = reference.new_empty(numel)
+        _EP_CHUNK_SCRATCH[key] = storage
+    view = storage[:numel].view(shape)
+    view.zero_()
+    return view
 
 
 def _cuda_device_index(device: torch.device | int | str) -> int:
@@ -559,7 +588,10 @@ class EPChunkOverlapOperator:
                     local_state.pop("grad_expert_out", None)
                     local_state["param_grads"] = param_grads
                     grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
-                        chunk, grad_dispatched, grad_probs
+                        chunk,
+                        grad_dispatched,
+                        grad_probs,
+                        scratch_slot=chunk.idx,
                     )
                     local_state["grad_recv_hidden"] = grad_recv_hidden
                     local_state["grad_recv_probs"] = grad_recv_probs
@@ -712,22 +744,36 @@ def _dispatch_local_backward(
     chunk: _BackwardChunk,
     grad_dispatched: torch.Tensor,
     grad_probs: torch.Tensor | None,
+    *,
+    scratch_slot: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     row_id_map = chunk.row_id_map.reshape(-1).to(torch.long)
-    grad_recv_hidden = torch.zeros(
+    hidden_reference = (
+        grad_dispatched
+        if grad_dispatched.dtype == chunk.recv_hidden_dtype
+        else grad_dispatched.new_empty(0, dtype=chunk.recv_hidden_dtype)
+    )
+    grad_recv_hidden = _zeroed_scratch(
+        hidden_reference,
         chunk.recv_hidden_shape,
-        dtype=chunk.recv_hidden_dtype,
-        device=grad_dispatched.device,
+        role="hidden",
+        slot=scratch_slot,
     )
     grad_recv_hidden.scatter_add_(
         0,
         row_id_map.unsqueeze(1).expand(-1, grad_dispatched.size(1)),
         grad_dispatched.to(grad_recv_hidden.dtype),
     )
-    grad_recv_probs = torch.zeros(
+    probs_reference = (
+        grad_probs
+        if grad_probs is not None
+        else grad_dispatched.new_empty(0, dtype=chunk.recv_probs_dtype)
+    )
+    grad_recv_probs = _zeroed_scratch(
+        probs_reference,
         chunk.recv_probs_shape,
-        dtype=chunk.recv_probs_dtype,
-        device=grad_dispatched.device,
+        role="probs",
+        slot=scratch_slot,
     )
     if grad_probs is not None:
         flat = chunk.prob_flat_indices.reshape(-1).to(grad_probs.device, torch.long)
