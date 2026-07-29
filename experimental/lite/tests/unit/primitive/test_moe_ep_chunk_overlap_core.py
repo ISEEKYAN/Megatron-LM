@@ -256,7 +256,7 @@ def test_delayed_wgrad_excludes_expert_params_from_autograd_targets(
     assert all(all(param is not item for item in inputs) for param in params)
 
 
-def test_forward_trace_pipelines_next_dispatch_before_current_expert(
+def test_forward_trace_launches_current_expert_before_blocking_next_dispatch(
     monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
@@ -345,18 +345,18 @@ def test_forward_trace_pipelines_next_dispatch_before_current_expert(
     assert operations == [
         "comm.wait",
         "dispatch.submit.0",
-        "comm.wait",
-        "dispatch.submit.1",
         "dispatch.finish.0",
         "expert.0",
         "combine.prepare.0",
         "comm.wait",
-        "combine.submit.0",
+        "dispatch.submit.1",
         "comm.wait",
-        "dispatch.submit.2",
+        "combine.submit.0",
         "dispatch.finish.1",
         "expert.1",
         "combine.prepare.1",
+        "comm.wait",
+        "dispatch.submit.2",
         "comm.wait",
         "combine.submit.1",
         "dispatch.finish.2",

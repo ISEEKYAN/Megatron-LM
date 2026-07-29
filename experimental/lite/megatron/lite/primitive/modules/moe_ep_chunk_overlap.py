@@ -309,7 +309,7 @@ class EPChunkOverlapOperator:
                     state = dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
             return chunk_idx, dispatcher, state
 
-        def finish_dispatch_expert_submit_combine(pending):
+        def finish_dispatch_expert(pending):
             chunk_idx, dispatcher, state = pending
             with torch.cuda.stream(compute_stream):
                 with _ep_chunk_nvtx("forward.dispatch.finish", chunk_idx):
@@ -348,25 +348,27 @@ class EPChunkOverlapOperator:
                 rank_grouped, handle = dispatcher.prepare_deepep_combine(expert_out)
                 ready = torch.cuda.Event()
                 ready.record(compute_stream)
+            del dispatched, probs, expert_out
+            return chunk_idx, dispatcher, rank_grouped, handle, ready
+
+        def submit_combine(prepared):
+            chunk_idx, dispatcher, rank_grouped, handle, ready = prepared
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(ready)
                 with _ep_chunk_nvtx("forward.combine", chunk_idx):
                     combine_state = dispatcher.submit_deepep_combine_prepared(
                         rank_grouped, handle
                     )
-            del dispatched, probs, expert_out
             return dispatcher, combine_state
 
         pending_combines = []
         with torch.no_grad():
-            next_state = submit_dispatch(0)
+            current_state = submit_dispatch(0)
             for loop_idx in range(len(ranges)):
-                current_state = next_state
+                prepared = finish_dispatch_expert(current_state)
                 if loop_idx + 1 < len(ranges):
-                    next_state = submit_dispatch(loop_idx + 1)
-                pending_combines.append(
-                    finish_dispatch_expert_submit_combine(current_state)
-                )
+                    current_state = submit_dispatch(loop_idx + 1)
+                pending_combines.append(submit_combine(prepared))
 
         done = torch.cuda.Event()
         done.record(compute_stream)
