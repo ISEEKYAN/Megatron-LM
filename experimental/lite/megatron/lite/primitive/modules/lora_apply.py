@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -85,6 +86,15 @@ class LoRAWrappedGroupedLinear(nn.Module):
             return getattr(self.base, name)
 
 
+@dataclass(frozen=True)
+class LoraTargetRule:
+    """One model-declared linear attribute handled by the generic applicator."""
+
+    owner_type: str
+    attr: str
+    target: str
+
+
 def _linear_weight_owner(module: nn.Module) -> nn.Module | None:
     inner = getattr(module, "linear", None)
     if isinstance(inner, nn.Module) and isinstance(getattr(inner, "weight", None), nn.Parameter):
@@ -133,8 +143,10 @@ def _enable_qkv_normalized_output(base_qkv: nn.Module) -> bool:
     return True
 
 
-def _attach_gqa_qkv(attn, spec: LoraSpec) -> bool:
-    if not spec.targets_module("linear_qkv"):
+def _attach_gqa_qkv(attn, spec: LoraSpec, *, module_path: str = "") -> bool:
+    if not spec.targets_module("linear_qkv") or spec.ignores_module(
+        _module_path(module_path, "qkv")
+    ):
         return False
     if isinstance(attn.qkv, LoRAWrappedLinear):
         return False
@@ -164,8 +176,18 @@ def _attach_gqa_qkv(attn, spec: LoraSpec) -> bool:
     return True
 
 
-def _attach_gqa_proj(attn, spec: LoraSpec) -> bool:
-    if not spec.targets_module("linear_proj"):
+def _module_path(parent: str, child: str) -> str:
+    return f"{parent}.{child}" if parent else child
+
+
+def _target_is_ignored(spec: LoraSpec, target: str, parent: str, child: str) -> bool:
+    return spec.targets_module(target) and spec.ignores_module(_module_path(parent, child))
+
+
+def _attach_gqa_proj(attn, spec: LoraSpec, *, module_path: str = "") -> bool:
+    if not spec.targets_module("linear_proj") or spec.ignores_module(
+        _module_path(module_path, "proj")
+    ):
         return False
     if isinstance(attn.proj, LoRAWrappedLinear):
         return False
@@ -203,8 +225,11 @@ def _attach_expert_fc(
     in_features: int,
     out_features: int,
     tp_group=None,
+    module_path: str = "",
 ) -> bool:
-    if not spec.targets_module(target):
+    if not spec.targets_module(target) or spec.ignores_module(
+        _module_path(module_path, attr)
+    ):
         return False
     base = getattr(experts, attr)
     if isinstance(base, LoRAWrappedGroupedLinear):
@@ -226,11 +251,15 @@ def _attach_expert_fc(
     return True
 
 
-def _attach_swiglu_mlp(mlp, spec: LoraSpec) -> int:
+def _attach_swiglu_mlp(mlp, spec: LoraSpec, *, module_path: str = "") -> int:
     attached = 0
     hidden = mlp.gate_up.in_features
     intermediate = mlp.down.in_features
-    if spec.targets_module("linear_fc1") and not isinstance(mlp.gate_up, LoRAWrappedLinear):
+    if (
+        spec.targets_module("linear_fc1")
+        and not spec.ignores_module(_module_path(module_path, "gate_up"))
+        and not isinstance(mlp.gate_up, LoRAWrappedLinear)
+    ):
         adapter = _place_adapter_like(
             LinearLoRA(
                 hidden,
@@ -244,7 +273,11 @@ def _attach_swiglu_mlp(mlp, spec: LoraSpec) -> int:
         )
         mlp.gate_up = LoRAWrappedLinear(mlp.gate_up, adapter)
         attached += 1
-    if spec.targets_module("linear_fc2") and not isinstance(mlp.down, LoRAWrappedLinear):
+    if (
+        spec.targets_module("linear_fc2")
+        and not spec.ignores_module(_module_path(module_path, "down"))
+        and not isinstance(mlp.down, LoRAWrappedLinear)
+    ):
         adapter = _place_adapter_like(
             LinearLoRA(
                 intermediate,
@@ -259,6 +292,75 @@ def _attach_swiglu_mlp(mlp, spec: LoraSpec) -> int:
         mlp.down = LoRAWrappedLinear(mlp.down, adapter)
         attached += 1
     return attached
+
+
+def _attach_declared_linear(
+    owner: nn.Module,
+    rule: LoraTargetRule,
+    spec: LoraSpec,
+    *,
+    module_path: str,
+) -> bool:
+    if type(owner).__name__ != rule.owner_type or not spec.targets_module(rule.target):
+        return False
+    target_path = _module_path(module_path, rule.attr)
+    if spec.ignores_module(target_path):
+        return False
+    base = getattr(owner, rule.attr, None)
+    if not isinstance(base, nn.Module) or isinstance(base, LoRAWrappedLinear):
+        return False
+
+    local_in, local_out = _local_linear_features(base)
+    kwargs: dict[str, Any] = {}
+    use_base_normalized_input = False
+    if hasattr(base, "local_out"):
+        tp_size = int(getattr(base, "tp_size", 1))
+        kwargs.update(
+            tp_group=getattr(base, "tp_group", None),
+            tp_rank=int(getattr(base, "tp_rank", 0)),
+            sequence_parallel_input=bool(getattr(base, "use_sp", False)),
+            rank_partition_size=tp_size,
+            rank_partitioned_a=tp_size > 1,
+            a_tensor_model_parallel=tp_size > 1,
+            b_tensor_model_parallel=tp_size > 1,
+        )
+        if hasattr(base, "linear"):
+            use_base_normalized_input = _enable_qkv_normalized_output(base)
+    elif hasattr(base, "local_in"):
+        tp_size = int(getattr(base, "tp_size", 1))
+        kwargs.update(
+            tp_group=getattr(base, "tp_group", None),
+            tp_rank=int(getattr(base, "tp_rank", 0)),
+            sequence_parallel_scatter_output=bool(getattr(base, "use_sp", False)),
+            input_parallel_reduce=tp_size > 1,
+            output_partition_size=tp_size,
+            output_partitioned_b=tp_size > 1,
+            a_tensor_model_parallel=tp_size > 1,
+            b_tensor_model_parallel=tp_size > 1,
+        )
+
+    adapter = _place_adapter_like(
+        LinearLoRA(
+            local_in,
+            local_out,
+            spec.rank,
+            alpha=spec.alpha,
+            dropout=spec.dropout,
+            use_rslora=spec.use_rslora,
+            **kwargs,
+        ),
+        base,
+    )
+    setattr(
+        owner,
+        rule.attr,
+        LoRAWrappedLinear(
+            base,
+            adapter,
+            use_base_normalized_input=use_base_normalized_input,
+        ),
+    )
+    return True
 
 
 def get_linear_lora_adapter(module: nn.Module, attr: str) -> LinearLoRA | None:
@@ -277,13 +379,18 @@ def get_grouped_lora_adapter(module: nn.Module, attr: str) -> SharedGroupedLinea
 
 def iter_lora_adapter_modules(module: nn.Module):
     """Yield native LoRA adapter modules (for PEFT export / OLoRA init)."""
+    seen: set[int] = set()
     for child in module.modules():
+        adapter = None
         if isinstance(child, LoRAWrappedLinear):
-            yield child.adapter
+            adapter = child.adapter
         elif isinstance(child, LoRAWrappedGroupedLinear):
-            yield child.adapter
+            adapter = child.adapter
         elif isinstance(child, (LinearLoRA, SharedGroupedLinearLoRA)):
-            yield child
+            adapter = child
+        if adapter is not None and id(adapter) not in seen:
+            seen.add(id(adapter))
+            yield adapter
 
 
 def apply_lora_to_chunks(
@@ -291,6 +398,7 @@ def apply_lora_to_chunks(
     spec: LoraSpec | dict[str, Any] | None,
     *,
     ps=None,
+    model_targets: Sequence[LoraTargetRule] = (),
 ) -> dict[str, int]:
     """Post-build batch attach LoRA wrappers + freeze base weights.
 
@@ -306,6 +414,10 @@ def apply_lora_to_chunks(
     }
     if not spec.enabled or spec.rank <= 0:
         return stats
+    if ps is not None and getattr(ps, "etp_size", 1) > 1:
+        raise NotImplementedError(
+            "Megatron Lite LoRA does not support ETP>1; use etp_size=1."
+        )
 
     from megatron.lite.primitive.modules.experts import Experts
     from megatron.lite.primitive.modules.gqa import GQAttention
@@ -317,13 +429,25 @@ def apply_lora_to_chunks(
         else None
     )
     for chunk in chunks:
-        for module in chunk.modules():
+        for module_path, module in list(chunk.named_modules()):
             if isinstance(module, GQAttention):
-                if _attach_gqa_qkv(module, spec):
+                stats["skipped_ignored"] += int(
+                    _target_is_ignored(spec, "linear_qkv", module_path, "qkv")
+                )
+                stats["skipped_ignored"] += int(
+                    _target_is_ignored(spec, "linear_proj", module_path, "proj")
+                )
+                if _attach_gqa_qkv(module, spec, module_path=module_path):
                     stats["attached_modules"] += 1
-                if _attach_gqa_proj(module, spec):
+                if _attach_gqa_proj(module, spec, module_path=module_path):
                     stats["attached_modules"] += 1
             elif isinstance(module, Experts):
+                stats["skipped_ignored"] += int(
+                    _target_is_ignored(spec, "linear_fc1", module_path, "fc1")
+                )
+                stats["skipped_ignored"] += int(
+                    _target_is_ignored(spec, "linear_fc2", module_path, "fc2")
+                )
                 config_hidden, fc1_out = _local_linear_features(module.fc1)
                 fc2_in, fc2_out = _local_linear_features(module.fc2)
                 if _attach_expert_fc(
@@ -334,6 +458,7 @@ def apply_lora_to_chunks(
                     in_features=config_hidden,
                     out_features=fc1_out,
                     tp_group=expert_tp_group,
+                    module_path=module_path,
                 ):
                     stats["attached_modules"] += 1
                 if _attach_expert_fc(
@@ -344,10 +469,34 @@ def apply_lora_to_chunks(
                     in_features=fc2_in,
                     out_features=fc2_out,
                     tp_group=expert_tp_group,
+                    module_path=module_path,
                 ):
                     stats["attached_modules"] += 1
             elif isinstance(module, SwiGLUMLP):
-                stats["attached_modules"] += _attach_swiglu_mlp(module, spec)
+                stats["skipped_ignored"] += int(
+                    _target_is_ignored(spec, "linear_fc1", module_path, "gate_up")
+                )
+                stats["skipped_ignored"] += int(
+                    _target_is_ignored(spec, "linear_fc2", module_path, "down")
+                )
+                stats["attached_modules"] += _attach_swiglu_mlp(
+                    module, spec, module_path=module_path
+                )
+            for rule in model_targets:
+                if (
+                    type(module).__name__ == rule.owner_type
+                    and spec.targets_module(rule.target)
+                    and spec.ignores_module(_module_path(module_path, rule.attr))
+                ):
+                    stats["skipped_ignored"] += 1
+                    continue
+                if _attach_declared_linear(
+                    module,
+                    rule,
+                    spec,
+                    module_path=module_path,
+                ):
+                    stats["attached_modules"] += 1
 
         freeze_stats = freeze_non_lora_params(chunk)
         trainable_stats = trainable_param_stats(chunk)
@@ -360,6 +509,7 @@ def apply_lora_to_chunks(
 __all__ = [
     "LoRAWrappedGroupedLinear",
     "LoRAWrappedLinear",
+    "LoraTargetRule",
     "apply_lora_to_chunks",
     "get_grouped_lora_adapter",
     "get_linear_lora_adapter",

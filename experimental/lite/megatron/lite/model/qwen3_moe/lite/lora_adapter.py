@@ -20,6 +20,10 @@ from megatron.lite.primitive.modules.lora_apply import (
 )
 from megatron.lite.primitive.parallel import ParallelState
 
+# This model needs no model-specific targets beyond the primitive's built-in
+# GQA, SwiGLU, and grouped-expert surfaces.
+LORA_TARGETS = ()
+
 _PEFT_PREFIX = "base_model.model.model"
 
 

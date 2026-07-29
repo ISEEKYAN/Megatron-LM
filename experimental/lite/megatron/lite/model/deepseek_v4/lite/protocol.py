@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+from megatron.lite.model.deepseek_v4.lite.lora_adapter import LORA_TARGETS
 from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     EXPERT_CLASSIFIER,
     PLACEMENT_FN,
@@ -23,6 +24,12 @@ from megatron.lite.model.protocol_utils import (
     router_replay_roots as router_replay_roots,
 )
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.modules.lora import (
+    LoraSpec,
+    apply_olora_tail_init,
+    normalize_lora_spec,
+)
+from megatron.lite.primitive.modules.lora_apply import apply_lora_to_chunks
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
     contiguous_position_ids_for_cp,
@@ -68,6 +75,7 @@ class ImplConfig:
     num_nextn_predict_layers: int | None = None
     mtp_loss_scaling_factor: float = 0.1
     qat: QATSpec | dict | None = None
+    lora: LoraSpec | dict | None = None
 
 
 MODULE_MAP = {
@@ -371,6 +379,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Model
 
     p = impl_cfg.parallel
+    lora_spec = normalize_lora_spec(impl_cfg.lora)
     _validate_parallel_scope(p)
     _apply_mtp_config(model_cfg, impl_cfg)
     mtp_enable = bool(impl_cfg.mtp_enable) and model_cfg.num_nextn_predict_layers > 0
@@ -421,6 +430,25 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         for chunk in chunks:
             apply_offload(_iter_transformer_units(chunk), impl_cfg.offload, MODULE_MAP)
 
+    lora_stats = (
+        None
+        if lora_spec.enabled
+        else apply_lora_to_chunks(
+            chunks, lora_spec, ps=ps, model_targets=LORA_TARGETS
+        )
+    )
+
+    def _attach_lora_after_load():
+        nonlocal lora_stats
+        if lora_stats is None:
+            lora_stats = apply_lora_to_chunks(
+                chunks, lora_spec, ps=ps, model_targets=LORA_TARGETS
+            )
+            if lora_spec.init == "olora_tail":
+                for chunk in chunks:
+                    apply_olora_tail_init(chunk)
+        return lora_stats
+
     # Parametrize before optimizer construction so it captures the BF16 master.
     apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
 
@@ -436,20 +464,38 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         )
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
-        optimizer, finalize_grads = build_dist_opt_training_optimizer(
-            chunks,
-            model_cfg=model_cfg,
-            impl_cfg=impl_cfg,
-            ps=ps,
-            model_name="deepseek_v4",
-            is_expert=is_expert_param,
-            deterministic=impl_cfg.deterministic,
-        )
-        attach_model_sharded_state_dict(
-            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
-        )
-        register_training_hooks(chunks, optimizer)
         optimizer_backend = "dist_opt"
+
+        def _build_dist_opt():
+            built_optimizer, built_finalize_grads = build_dist_opt_training_optimizer(
+                chunks,
+                model_cfg=model_cfg,
+                impl_cfg=impl_cfg,
+                ps=ps,
+                model_name="deepseek_v4",
+                is_expert=is_expert_param,
+                deterministic=impl_cfg.deterministic,
+            )
+            attach_model_sharded_state_dict(
+                chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
+            )
+            register_training_hooks(chunks, built_optimizer)
+            return built_optimizer, built_finalize_grads
+
+        if lora_spec.enabled:
+
+            def _post_model_load_hook():
+                stats = _attach_lora_after_load()
+                built_optimizer, built_finalize_grads = _build_dist_opt()
+                return {
+                    "optimizer": built_optimizer,
+                    "finalize_grads": built_finalize_grads,
+                    "extras": {"lora_stats": stats},
+                }
+
+            post_model_load_hook = _post_model_load_hook
+        else:
+            optimizer, finalize_grads = _build_dist_opt()
     elif optimizer_name == "fsdp2":
         optimizer_backend = "fsdp2"
 
@@ -457,6 +503,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Layer
             from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
+            stats = _attach_lora_after_load()
             return {
                 "optimizer": build_fsdp2_training_optimizer(
                     chunks,
@@ -468,12 +515,19 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                     vpp=impl_cfg.parallel.vpp,
                     leaf_module_names=(),
                     use_fp32_shards=False,
-                )
+                ),
+                "extras": {"lora_stats": stats},
             }
 
         post_model_load_hook = _post_model_load_hook
     elif optimizer_name is None:
         optimizer_backend = "none"
+        if lora_spec.enabled:
+
+            def _post_model_load_hook():
+                return {"extras": {"lora_stats": _attach_lora_after_load()}}
+
+            post_model_load_hook = _post_model_load_hook
     else:
         raise ValueError(f"Unknown DeepSeek V4 lite optimizer: {impl_cfg.optimizer!r}.")
 
@@ -488,6 +542,8 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
             "pre_forward_hook": _make_aux_loss_hook(),
+            "lora_spec": lora_spec,
+            "lora_stats": lora_stats,
         },
     )
 

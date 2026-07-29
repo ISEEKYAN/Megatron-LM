@@ -19,6 +19,7 @@ from megatron.lite.model.protocol_utils import (
     unpack_thd_forward_output,
 )
 from megatron.lite.model.qwen3_5.config import Qwen35Config
+from megatron.lite.model.qwen3_5.lite.lora_adapter import LORA_TARGETS
 from megatron.lite.model.qwen3_5.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
 from megatron.lite.model.qwen3_5.lite.checkpoint import (
     export_hf_weights as _export_hf_weights_impl,
@@ -276,13 +277,19 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     # Wrapping earlier inserts ``.base.`` into state-dict names and prevents
     # the checkpoint mapper from resolving the wrapped base parameters.
     lora_stats = (
-        None if lora_spec.enabled else apply_lora_to_chunks(chunks, lora_spec, ps=ps)
+        None
+        if lora_spec.enabled
+        else apply_lora_to_chunks(
+            chunks, lora_spec, ps=ps, model_targets=LORA_TARGETS
+        )
     )
 
     def _attach_lora_after_load():
         nonlocal lora_stats
         if lora_stats is None:
-            lora_stats = apply_lora_to_chunks(chunks, lora_spec, ps=ps)
+            lora_stats = apply_lora_to_chunks(
+                chunks, lora_spec, ps=ps, model_targets=LORA_TARGETS
+            )
             if lora_spec.init == "olora_tail":
                 for chunk in chunks:
                     apply_olora_tail_init(chunk)

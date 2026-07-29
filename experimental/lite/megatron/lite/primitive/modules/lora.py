@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """LoRA helpers for Megatron Lite native model implementations.
 
-This module is intentionally narrow: it supports the Qwen3-MoE lite path's
-Megatron-style sharded linear surfaces, not arbitrary PEFT injection.
+The primitive owns generic Megatron-style sharded linear adapters. Individual
+models declare extra target attributes next to their model implementation.
 """
 
 from __future__ import annotations
@@ -64,6 +64,11 @@ class LoraSpec:
         canonical = _TARGET_ALIASES.get(name, name)
         return canonical in self.targets()
 
+    def ignores_module(self, name: str) -> bool:
+        """Match exact, case-insensitive dotted path components."""
+        components = {component.lower() for component in name.split(".")}
+        return any(pattern.lower() in components for pattern in self.ignore_patterns)
+
 
 def normalize_lora_spec(config: LoraSpec | dict[str, Any] | None) -> LoraSpec:
     if config is None:
@@ -73,6 +78,12 @@ def normalize_lora_spec(config: LoraSpec | dict[str, Any] | None) -> LoraSpec:
     if not isinstance(config, dict):
         raise TypeError(f"LoRA spec must be LoraSpec, dict, or None, got {type(config)!r}.")
     values = dict(config)
+    if "enabled" not in values and int(values.get("rank", 0) or 0) > 0:
+        warnings.warn(
+            "LoRA rank alone is inert; LoRA requires enabled=True.",
+            UserWarning,
+            stacklevel=2,
+        )
     if values.get("enabled") is False:
         values["rank"] = 0
     if "targets" in values and "target_modules" not in values:

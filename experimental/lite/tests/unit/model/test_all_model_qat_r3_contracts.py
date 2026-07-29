@@ -18,6 +18,16 @@ from megatron.lite.primitive.modules.router_replay import (
     attach_router_replay,
     detach_router_replay,
 )
+from megatron.lite.primitive.modules.lora import (
+    LinearLoRA,
+    LoraSpec,
+    SharedGroupedLinearLoRA,
+)
+from megatron.lite.primitive.modules.lora_apply import (
+    LoRAWrappedLinear,
+    apply_lora_to_chunks,
+    iter_lora_adapter_modules,
+)
 from megatron.lite.primitive.quantization.qat import (
     QATSpec,
     apply_qat_to_chunks,
@@ -302,7 +312,9 @@ def _train_config():
     )
 
 
-def _real_tiny_model(model_name: str, monkeypatch):
+def _real_tiny_model(
+    model_name: str, monkeypatch, *, cover_all_lora_targets: bool = False
+):
     from megatron.lite.primitive.parallel import ParallelState
 
     ps = ParallelState()
@@ -341,7 +353,11 @@ def _real_tiny_model(model_name: str, monkeypatch):
             shared_expert_intermediate_size=8,
             max_position_embeddings=16,
             partial_rotary_factor=1.0,
-            layer_types=["full_attention", "full_attention"],
+            layer_types=(
+                ["linear_attention", "full_attention"]
+                if cover_all_lora_targets
+                else ["full_attention", "full_attention"]
+            ),
         )
         return Qwen35Model(config, _train_config(), ps)
     if model_name == "kimi_k2":
@@ -361,7 +377,7 @@ def _real_tiny_model(model_name: str, monkeypatch):
             num_experts_per_tok=1,
             n_group=1,
             topk_group=1,
-            first_k_dense_replace=0,
+            first_k_dense_replace=1 if cover_all_lora_targets else 0,
             q_lora_rank=8,
             kv_lora_rank=8,
             qk_nope_head_dim=4,
@@ -393,7 +409,7 @@ def _real_tiny_model(model_name: str, monkeypatch):
             index_topk=2,
             intermediate_size=20,
             moe_intermediate_size=6,
-            first_k_dense_replace=0,
+            first_k_dense_replace=1 if cover_all_lora_targets else 0,
             n_routed_experts=3,
             n_shared_experts=1,
             num_experts_per_tok=2,
@@ -431,6 +447,61 @@ def _real_tiny_model(model_name: str, monkeypatch):
         )
         return DeepseekV4Model(config, _train_config(), ps)
     raise AssertionError(f"unsupported model: {model_name}")
+
+
+@pytest.mark.parametrize("model_name", MODEL_NAMES)
+def test_every_real_tiny_model_attaches_trainable_lora_and_runs_adapter_forward(
+    model_name: str,
+    transformer_engine_import_stub,
+    monkeypatch,
+):
+    _install_cpu_te_construction_stubs(transformer_engine_import_stub, monkeypatch)
+    model = _real_tiny_model(
+        model_name, monkeypatch, cover_all_lora_targets=True
+    )
+    adapter_module = importlib.import_module(
+        f"megatron.lite.model.{model_name}.lite.lora_adapter"
+    )
+
+    stats = apply_lora_to_chunks(
+        [model],
+        LoraSpec(enabled=True, rank=2),
+        ps=model.ps,
+        model_targets=adapter_module.LORA_TARGETS,
+    )
+    adapters = list(iter_lora_adapter_modules(model))
+    trainable = {
+        name: parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+
+    assert stats["attached_modules"] == len(adapters)
+    assert stats["attached_modules"] > 0
+    assert stats["trainable_tensors"] == len(trainable)
+    assert trainable
+    assert all("lora_" in name for name in trainable)
+
+    for rule in adapter_module.LORA_TARGETS:
+        owners = [
+            module for module in model.modules() if type(module).__name__ == rule.owner_type
+        ]
+        assert owners, f"{model_name} declaration has no real {rule.owner_type}"
+        assert all(
+            isinstance(getattr(owner, rule.attr), LoRAWrappedLinear) for owner in owners
+        )
+
+    for adapter in adapters:
+        x = torch.randn(2, adapter.lora_a.shape[1])
+        if isinstance(adapter, SharedGroupedLinearLoRA):
+            splits = [0] * adapter.num_local_experts
+            splits[0] = x.shape[0]
+            output = adapter(x, splits)
+        else:
+            assert isinstance(adapter, LinearLoRA)
+            output = adapter(x)
+        assert output.shape[:-1] == x.shape[:-1]
+        assert torch.count_nonzero(output) == 0
 
 
 R3_SUPPORTED_MODEL_NAMES = MODEL_NAMES

@@ -46,7 +46,8 @@ def _swiglu_mlp():
 
 
 def test_lora_spec_enabled_is_authoritative_not_rank():
-    assert not normalize_lora_spec({"rank": 8}).enabled
+    with pytest.warns(UserWarning, match="requires enabled=True"):
+        assert not normalize_lora_spec({"rank": 8}).enabled
     assert normalize_lora_spec({"enabled": True, "rank": 4}).enabled
     assert not normalize_lora_spec({"enabled": False, "rank": 8}).enabled
 
@@ -76,6 +77,43 @@ def test_apply_wraps_swiglu_and_freezes_base():
     assert all("lora" in n.lower() for n in trainable)
     assert stats["trainable_tensors"] > 0
     assert stats["frozen_tensors"] > 0
+
+
+def test_apply_honors_exact_ignore_path_components():
+    SwiGLUMLP = _swiglu_mlp()
+    chunk = nn.Module()
+    chunk.mlp = SwiGLUMLP(8, 16)
+
+    stats = apply_lora_to_chunks(
+        [chunk],
+        LoraSpec(
+            enabled=True,
+            rank=2,
+            target_modules=("linear_fc1", "linear_fc2"),
+            ignore_patterns=("gate_up",),
+        ),
+    )
+
+    assert not isinstance(chunk.mlp.gate_up, LoRAWrappedLinear)
+    assert isinstance(chunk.mlp.down, LoRAWrappedLinear)
+    assert stats["skipped_ignored"] == 1
+
+
+def test_lora_etp_gt_one_fails_loud_before_mutating_model():
+    SwiGLUMLP = _swiglu_mlp()
+    chunk = nn.Module()
+    chunk.mlp = SwiGLUMLP(8, 16)
+    before = copy.deepcopy(chunk.state_dict())
+    ps = SimpleNamespace(tp_size=1, tp_group=None, ep_size=1, etp_size=2)
+
+    with pytest.raises(NotImplementedError, match="does not support ETP"):
+        apply_lora_to_chunks(
+            [chunk],
+            LoraSpec(enabled=True, rank=2),
+            ps=ps,
+        )
+
+    torch.testing.assert_close(chunk.state_dict(), before)
 
 
 def test_apply_threads_tp_group_to_replicated_expert_adapters():
