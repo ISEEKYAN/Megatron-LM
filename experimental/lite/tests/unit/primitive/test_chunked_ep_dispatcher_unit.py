@@ -219,3 +219,29 @@ def test_external_finish_returns_manual_map_without_mutating_dispatcher():
     assert probs.tolist() == pytest.approx([0.3, 0.5, 0.2, 0.4])
     assert metadata["manual_row_id_map"].tolist() == [1, 2, 0, 1]
     assert value._row_id_map is None
+
+
+def test_external_finish_does_not_read_cuda_metadata_with_tensor_item(monkeypatch):
+    value = _dispatcher()
+    recv_hidden = torch.tensor([[1.0], [2.0], [3.0]])
+    recv_indices = torch.tensor([[1, -1], [0, 1], [0, -1]])
+    recv_probs = torch.tensor([[0.2, 0.0], [0.3, 0.4], [0.5, 0.0]])
+
+    def fail_item(_tensor):
+        raise AssertionError("dispatch finish must validate host metadata without a device sync")
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_item)
+    dispatched, local_tpe, _probs, metadata = (
+        value._finish_deepep_dispatch_external(
+            recv_hidden,
+            recv_indices,
+            recv_probs,
+            [2, 2],
+            force_manual_map=True,
+            force_direct_permute=True,
+        )
+    )
+
+    assert dispatched.shape == (4, 1)
+    assert local_tpe.shape == (2,)
+    assert metadata["local_tpe_list"] == [2, 2]

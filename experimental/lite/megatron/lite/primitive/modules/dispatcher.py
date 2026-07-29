@@ -843,15 +843,15 @@ class TokenDispatcher:
                 f"recv_per_expert_len={len(recv_per_expert)} "
                 f"recv_per_expert_sum={sum(int(x) for x in recv_per_expert)} "
                 f"recv_per_expert_head={recv_per_expert[: self.num_local_experts]} "
-                f"local_tpe_sum={int(local_tpe.sum().item())}",
+                f"local_tpe_sum={sum(local_tpe_list)}",
                 flush=True,
             )
-        if int(local_tpe.sum().item()) != int(dispatched.shape[0]):
+        if sum(local_tpe_list) != int(dispatched.shape[0]):
             ep_rank = dist.get_rank(group=self.ps.ep_group)
             raise RuntimeError(
                 "DeepEP dispatch metadata mismatch: "
                 f"ep_rank={ep_rank} dispatched_tokens={int(dispatched.shape[0])} "
-                f"local_tpe={local_tpe.tolist()} recv_per_expert_len={len(recv_per_expert)}"
+                f"local_tpe={local_tpe_list} recv_per_expert_len={len(recv_per_expert)}"
             )
         metadata = {
             "row_id_map": sorted_indices,
