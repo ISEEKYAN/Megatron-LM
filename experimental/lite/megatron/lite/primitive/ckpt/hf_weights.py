@@ -1554,6 +1554,15 @@ def export_hf_weights(
 
         yield from _flush_dense_bucket()
         yield from _flush_expert_bucket()
+        if packed_expert_buffers:
+            incomplete = ", ".join(
+                f"{packed_name!r} ({len(packed)}/{spec.num_experts})"
+                for packed_name, packed in sorted(packed_expert_buffers.items())
+            )
+            raise RuntimeError(
+                f"{type(spec).__name__} has incomplete packed expert export "
+                f"group(s): {incomplete}"
+            )
         return
 
     # Streaming pp>1 export. The legacy path materialized every PP stage's
