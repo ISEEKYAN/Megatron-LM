@@ -936,9 +936,9 @@ def load_hf_weights(
         actual = _resolve_param_name(mapped, state, canonical_state)
         if actual is None:
             continue
-        mapped_targets[actual] = (mapped, hf_names)
+        mapped_targets[actual] = (native_name, hf_names)
         if actual in named_buffers:
-            required_buffers[actual] = (mapped, hf_names)
+            required_buffers[actual] = (native_name, hf_names)
 
     optional_for_load = getattr(spec, "optional_for_load", None)
     conflicting_load_contracts = (
@@ -976,9 +976,10 @@ def load_hf_weights(
             if mapped is None:
                 continue
 
-            expert_gid = spec.expert_global_id(mapped)
+            expert_gid = spec.expert_global_id(native_name)
             if expert_gid is not None:
                 loaded_name = _load_expert_weight(
+                    native_name,
                     mapped,
                     hf_names,
                     reader,
@@ -1004,7 +1005,7 @@ def load_hf_weights(
                 present_sources = (
                     []
                     if is_stage_global_target
-                    else _present_hf_sources(reader, spec, mapped, hf_names)
+                    else _present_hf_sources(reader, spec, native_name, hf_names)
                 )
                 if present_sources:
                     raise RuntimeError(
@@ -1016,7 +1017,9 @@ def load_hf_weights(
 
             replica_group_hook = getattr(spec, "replica_group_for_load", None)
             replica_group = (
-                replica_group_hook(mapped, ps) if callable(replica_group_hook) else None
+                replica_group_hook(native_name, ps)
+                if callable(replica_group_hook)
+                else None
             )
             replica_ranks: list[int] | None = None
             source_global_rank: int | None = None
@@ -1028,7 +1031,7 @@ def load_hf_weights(
                 replica_ranks = dist.get_process_group_ranks(replica_group)
                 source_hook = getattr(spec, "replica_source_rank_for_load", None)
                 source_group_rank = (
-                    source_hook(mapped, ps) if callable(source_hook) else 0
+                    source_hook(native_name, ps) if callable(source_hook) else 0
                 )
                 if not 0 <= source_group_rank < len(replica_ranks):
                     raise ValueError(
@@ -1044,7 +1047,9 @@ def load_hf_weights(
                     continue
 
             try:
-                hf_tensors = _read_hf_tensors(reader, spec, mapped, hf_names, target)
+                hf_tensors = _read_hf_tensors(
+                    reader, spec, native_name, hf_names, target
+                )
             except KeyError as error:
                 if actual in required_buffers:
                     raise RuntimeError(
@@ -1052,23 +1057,25 @@ def load_hf_weights(
                         f"{actual!r} from HF tensor(s) {hf_names!r}, but no "
                         "candidate exists in the checkpoint"
                     ) from error
-                _handle_missing_hf_tensors(spec, mapped, hf_names, error)
+                _handle_missing_hf_tensors(spec, native_name, hf_names, error)
                 continue
-            tensor = spec.hf_to_native(mapped, hf_tensors)
+            tensor = spec.hf_to_native(native_name, hf_tensors)
 
             custom_shard = getattr(spec, "shard_for_load", None)
             sharded = (
-                custom_shard(mapped, tensor, ps) if callable(custom_shard) else None
+                custom_shard(native_name, tensor, ps)
+                if callable(custom_shard)
+                else None
             )
             if sharded is not None:
                 tensor = sharded
             else:
-                tp_info = spec.tp_spec(mapped)
+                tp_info = spec.tp_spec(native_name)
                 if tp_info is not None:
                     split_d, tp_or_etp = tp_info
                     if tp_or_etp == 0:
                         if vocab_size is not None and (
-                            "embed" in mapped or "head" in mapped
+                            "embed" in native_name or "head" in native_name
                         ):
                             from megatron.lite.primitive.parallel import (  # isort: skip
                                 pad_vocab_for_tp,
@@ -1084,12 +1091,14 @@ def load_hf_weights(
                                 )
                                 tensor = torch.cat([tensor, pad], dim=0)
                         qkv = (
-                            spec.qkv_spec(mapped) if hasattr(spec, "qkv_spec") else None
+                            spec.qkv_spec(native_name)
+                            if hasattr(spec, "qkv_spec")
+                            else None
                         )
                         if qkv is not None:
                             tensor = split_qkv(tensor, ps.tp_rank, ps.tp_size, *qkv)
                         elif split_d == 0 and (
-                            "gate_up" in mapped or ".fc1." in mapped
+                            "gate_up" in native_name or ".fc1." in native_name
                         ):
                             tensor = split_gate_up(tensor, ps.tp_rank, ps.tp_size)
                         else:
@@ -1124,6 +1133,7 @@ def load_hf_weights(
 
 def _load_expert_weight(
     native_name,
+    target_name,
     hf_names,
     reader,
     spec,
@@ -1142,7 +1152,7 @@ def _load_expert_weight(
     if expert_gid < local_start or expert_gid >= local_start + experts_per_rank:
         return None
 
-    local_name = spec.expert_local_name(native_name, expert_gid - local_start)
+    local_name = spec.expert_local_name(target_name, expert_gid - local_start)
     actual = _resolve_param_name(local_name, state, canonical_state)
     target = targets.get(actual) if actual is not None else None
     if target is None:
