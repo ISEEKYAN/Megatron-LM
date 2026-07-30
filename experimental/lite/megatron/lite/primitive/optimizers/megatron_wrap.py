@@ -90,8 +90,8 @@ def _ensure_dist_opt_mpu_parallel_state(engine_cfg) -> None:
     """Initialize Megatron-Core mpu globals when dist_opt fallback groups are used."""
 
     from megatron.core import (
-        parallel_state as mpu,
-    )  # pyright: ignore[reportMissingImports]
+        parallel_state as mpu,  # pyright: ignore[reportMissingImports]
+    )
 
     p = engine_cfg.parallel
     expected = (int(p.tp), int(p.ep), _effective_etp(p), int(p.pp), int(p.cp))
@@ -145,8 +145,8 @@ def build_dist_opt_optimizer_config(
         )
 
     from megatron.core.optimizer.optimizer_config import (
-        OptimizerConfig as CoreOptimizerConfig,
-    )  # pyright: ignore[reportMissingImports]
+        OptimizerConfig as CoreOptimizerConfig,  # pyright: ignore[reportMissingImports]
+    )
 
     legacy_offload = getattr(opt, "offload_fraction", None)
     native_offload = getattr(opt, "optimizer_offload_fraction", None)
