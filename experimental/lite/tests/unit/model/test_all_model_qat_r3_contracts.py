@@ -471,6 +471,134 @@ def test_model_load_optionality_is_explicit_and_explains_default_owner(
     assert not hasattr(checkpoint.DeepseekV4WeightSpec, "optional_for_load")
 
 
+@pytest.mark.parametrize(
+    ("model_name", "spec_name"),
+    [
+        ("kimi_k2", "KimiK2WeightSpec"),
+        ("glm5", "Glm5WeightSpec"),
+    ],
+)
+def test_optional_router_bias_checkpoint_remains_loadable(
+    model_name,
+    spec_name,
+    tmp_path,
+    transformer_engine_import_stub,
+    monkeypatch,
+):
+    from safetensors.torch import save_file
+
+    from megatron.lite.primitive.ckpt.hf_weights import load_hf_weights
+
+    _protocol(model_name, transformer_engine_import_stub, monkeypatch)
+    checkpoint = importlib.import_module(
+        f"megatron.lite.model.{model_name}.lite.checkpoint"
+    )
+    spec = getattr(checkpoint, spec_name)(types.SimpleNamespace(num_experts=0))
+
+    class Router(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("expert_bias", torch.zeros(3))
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe = nn.Module()
+            self.moe.router = Router()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.required = nn.Parameter(torch.zeros(1))
+            self.layers = nn.ModuleList([Layer()])
+
+    model = Model()
+    monkeypatch.setattr(
+        spec,
+        "weight_map",
+        lambda: {
+            "required": ["hf.required"],
+            "layers.0.moe.router.expert_bias": ["hf.router.expert_bias"],
+        },
+    )
+    save_file(
+        {"hf.required": torch.ones(1)},
+        str(tmp_path / "model.safetensors"),
+    )
+    ps = types.SimpleNamespace(
+        ep_size=1,
+        ep_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        etp_size=1,
+        etp_rank=0,
+        pp_size=1,
+    )
+
+    with pytest.warns(RuntimeWarning, match="model constructor owns"):
+        load_hf_weights(model, str(tmp_path), spec, ps)
+
+    assert model.required.item() == 1
+    assert torch.equal(
+        model.layers[0].moe.router.expert_bias,
+        torch.zeros(3),
+    )
+
+
+def test_deepseek_v4_router_buffer_remains_required(
+    tmp_path,
+    transformer_engine_import_stub,
+    monkeypatch,
+):
+    from safetensors.torch import save_file
+
+    from megatron.lite.primitive.ckpt.hf_weights import load_hf_weights
+
+    _protocol("deepseek_v4", transformer_engine_import_stub, monkeypatch)
+    checkpoint = importlib.import_module(
+        "megatron.lite.model.deepseek_v4.lite.checkpoint"
+    )
+    spec = checkpoint.DeepseekV4WeightSpec(
+        types.SimpleNamespace(num_hash_layers=0, n_routed_experts=1)
+    )
+
+    class Gate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("expert_bias", torch.zeros(1))
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = nn.Module()
+            self.mlp.gate = Gate()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([Layer()])
+
+    save_file(
+        {"unrelated": torch.ones(1)},
+        str(tmp_path / "model.safetensors"),
+    )
+    ps = types.SimpleNamespace(
+        ep_size=1,
+        ep_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        etp_size=1,
+        etp_rank=0,
+    )
+
+    with pytest.raises(
+        KeyError,
+        match=r"DeepseekV4WeightSpec.*layers\.0\.mlp\.gate\.expert_bias"
+        r".*layers\.0\.ffn\.gate\.bias",
+    ):
+        load_hf_weights(Model(), str(tmp_path), spec, ps)
+
+
 @pytest.mark.parametrize("cp_rank", [0, 1])
 def test_glm5_r3_route_packing_matches_contiguous_forward_layout(
     cp_rank,
@@ -533,9 +661,9 @@ def test_supported_model_replay_roots_are_exact_decoder_layers(
 
     assert roots == expected
     assert len(roots) == len(case.chunk.model.layers)
-    assert roots != [
-        case.chunk
-    ], "falling back to the whole chunk would include MTP routers"
+    assert roots != [case.chunk], (
+        "falling back to the whole chunk would include MTP routers"
+    )
     if mtp_enabled:
         mtp_modules = set(case.chunk.model.mtp.modules())
         assert all(root not in mtp_modules for root in roots)

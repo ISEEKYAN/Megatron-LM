@@ -933,6 +933,22 @@ def load_hf_weights(
             f"{type(spec).__name__}.expected_buffers() declared non-persistent "
             f"buffers: {sorted(nonpersistent_expected)!r}"
         )
+    optional_for_load = getattr(spec, "optional_for_load", None)
+    conflicting_buffer_contracts = (
+        {
+            name
+            for name in expected_buffers
+            if optional_for_load(name) not in (None, False)
+        }
+        if callable(optional_for_load)
+        else set()
+    )
+    if conflicting_buffer_contracts:
+        raise ValueError(
+            f"{type(spec).__name__} declares {sorted(conflicting_buffer_contracts)!r} "
+            "in both expected_buffers() and optional_for_load(); checkpoint state "
+            "cannot be both required and optional"
+        )
     num_experts_total = getattr(spec, "num_experts", None)
     expert_shard = None
     if num_experts_total is None:
