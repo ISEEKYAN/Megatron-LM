@@ -11,7 +11,10 @@ import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
 
-from megatron.lite.primitive.modules.gqa_utils import split_grouped_qkvg
+from megatron.lite.primitive.modules.gqa_utils import (
+    split_grouped_qkvg,
+    split_grouped_qkvg_for_tp,
+)
 from megatron.lite.primitive.modules.lora import (
     LinearLoRA,
     LoraConfig,
@@ -22,6 +25,7 @@ from megatron.lite.primitive.parallel import (
     ColumnParallelLinear,
     ParallelState,
     RowParallelLinear,
+    all_gather_last_dim_with_grad_reduce,
 )
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.rope import (
@@ -78,7 +82,14 @@ class GQAttention(nn.Module):
             "num_attention_heads must be divisible by num_key_value_heads",
         )
         self.num_heads_local = ensure_divisible(num_attention_heads, ps.tp_size)
-        self.num_kv_heads_local = ensure_divisible(num_key_value_heads, ps.tp_size)
+        self._replicate_kv = num_key_value_heads < ps.tp_size
+        if self._replicate_kv:
+            ensure_divisible(ps.tp_size, num_key_value_heads)
+            self.num_kv_heads_local = 1
+        else:
+            self.num_kv_heads_local = ensure_divisible(num_key_value_heads, ps.tp_size)
+        self.num_heads = num_attention_heads
+        self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
         self.ps = ps
         self._output_gate = output_gate
@@ -132,7 +143,7 @@ class GQAttention(nn.Module):
             qkv_split_shapes.extend([kv_projection_size, kv_projection_size])
 
         qkv_weight = self.qkv.linear.weight
-        if qkv_weight.dim() != 2 or qkv_weight.shape[0] % sum(qkv_split_shapes) != 0:
+        if qkv_weight.dim() != 2:
             raise RuntimeError(
                 "GQA QKV projection cannot carry Muon split metadata: "
                 f"weight_shape={tuple(qkv_weight.shape)}, "
@@ -226,6 +237,8 @@ class GQAttention(nn.Module):
         qkv = self.qkv(x)
         if self.qkv_lora is not None:
             qkv = qkv + self.qkv_lora(self._qkv_lora_input(x))
+        if self._replicate_kv:
+            qkv = all_gather_last_dim_with_grad_reduce(qkv, self.ps.tp_group)
         q, gate, k, v = self._split_qkv(qkv)
 
         is_thd = packed_seq_params is not None
@@ -338,6 +351,28 @@ class GQAttention(nn.Module):
         nq, nkv, hd = self.num_heads_local, self.num_kv_heads_local, self.head_dim
         lead = qkv.shape[:-1]
         if self._qkv_layout == "mcore":
+            if self._replicate_kv:
+                if self._output_gate:
+                    return split_grouped_qkvg_for_tp(
+                        qkv,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        head_dim=hd,
+                        tp_rank=self.ps.tp_rank,
+                        tp_size=self.ps.tp_size,
+                    )
+
+                replicas_per_kv_head = ensure_divisible(self.ps.tp_size, self.num_kv_heads)
+                q_heads_per_group = ensure_divisible(self.num_heads, self.num_kv_heads)
+                group_width = (q_heads_per_group + 2) * hd
+                kv_group_rank = self.ps.tp_rank // replicas_per_kv_head
+                q_rank_in_group = self.ps.tp_rank % replicas_per_kv_head
+                qkv = qkv.narrow(-1, kv_group_rank * group_width, group_width)
+                qkv = qkv.view(*lead, 1, group_width)
+                q, k, v = qkv.split([q_heads_per_group * hd, hd, hd], dim=-1)
+                q = q.reshape(*lead, q_heads_per_group, hd)
+                q_start = q_rank_in_group * nq
+                return q[..., q_start : q_start + nq, :], None, k, v
             q_per_group = ensure_divisible(nq, nkv)
             if self._output_gate:
                 return split_grouped_qkvg(
