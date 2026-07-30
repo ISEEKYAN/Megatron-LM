@@ -14,6 +14,7 @@ on-disk safetensors keyed by GLOBAL names. ``load_hf_weights`` must copy each
 local layer the GLOBAL layer's tensor; pre-fix it resolves local names, finds
 nothing, and leaves the params untouched.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -174,29 +175,47 @@ def test_ds4_export_streams_router_buffers_from_every_pp_stage(monkeypatch):
             self.layers = nn.ModuleDict({"0": Layer()})
 
     remote = torch.tensor([3, 1, 4], dtype=torch.int64)
+    remote_headers = iter(
+        [
+            [
+                (
+                    "layers.0.mlp.gate.tid2eid",
+                    tuple(remote.shape),
+                    remote.dtype,
+                )
+            ],
+            [],
+        ]
+    )
 
     def fake_broadcast_object_list(header, *, src, **_kwargs):
         if src == 0:
-            header[0] = [
-                ("layers.0.ffn.gate.tid2eid", tuple(remote.shape), remote.dtype)
-            ]
+            header[0] = next(remote_headers)
 
     def fake_broadcast(tensor, *, src, **_kwargs):
         if src == 0:
             tensor.copy_(remote)
 
+    monkeypatch.setattr(hf_weights.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(hf_weights.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(
-        hf_weights, "export_hf_weights", lambda *_args, **_kwargs: iter(())
+        hf_weights.dist, "broadcast_object_list", fake_broadcast_object_list
     )
-    monkeypatch.setattr(ckpt.dist, "get_rank", lambda: 1)
-    monkeypatch.setattr(ckpt.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(ckpt.dist, "broadcast_object_list", fake_broadcast_object_list)
-    monkeypatch.setattr(ckpt.dist, "broadcast", fake_broadcast)
+    monkeypatch.setattr(hf_weights.dist, "broadcast", fake_broadcast)
 
     ps = SimpleNamespace(
-        pp_size=2, pp_rank=1, pp_global_ranks=[0, 1], pp_group=object()
+        pp_size=2,
+        pp_rank=1,
+        pp_global_ranks=[0, 1],
+        pp_group=object(),
+        tp_size=1,
+        tp_group=None,
+        ep_size=1,
+        ep_group=None,
+        etp_size=1,
+        etp_group=None,
     )
-    cfg = SimpleNamespace(num_hash_layers=1, vocab_size=8)
+    cfg = SimpleNamespace(num_hash_layers=1, n_routed_experts=1, vocab_size=8)
 
     exported = dict(ckpt._export_unquantized_weights(StageOne(), cfg, ps))
 

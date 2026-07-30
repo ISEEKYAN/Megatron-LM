@@ -436,39 +436,23 @@ def _real_tiny_model(model_name: str, monkeypatch):
 R3_SUPPORTED_MODEL_NAMES = MODEL_NAMES
 
 
-def test_model_load_optionality_is_explicit_and_explains_default_owner(
+def test_mapped_model_state_has_no_optional_override(
     transformer_engine_import_stub,
     monkeypatch,
 ):
-    expected_optional = {
-        "kimi_k2": {
-            "layers.0.moe.router.expert_bias": "model constructor",
-        },
-        "glm5": {
-            "layers.0.moe.router.expert_bias": "model constructor",
-            "layers.0.self_attention.self_attention.indexer.k_norm.bias": (
-                "model constructor"
-            ),
-        },
-    }
-    for model_name, cases in expected_optional.items():
+    for model_name, spec_name in (
+        ("kimi_k2", "KimiK2WeightSpec"),
+        ("glm5", "Glm5WeightSpec"),
+        ("deepseek_v4", "DeepseekV4WeightSpec"),
+    ):
         _protocol(model_name, transformer_engine_import_stub, monkeypatch)
         checkpoint = importlib.import_module(
             f"megatron.lite.model.{model_name}.lite.checkpoint"
         )
-        spec_type = getattr(
-            checkpoint,
-            {"kimi_k2": "KimiK2WeightSpec", "glm5": "Glm5WeightSpec"}[model_name],
-        )
-        for native_name, expected_reason in cases.items():
-            assert expected_reason in spec_type.optional_for_load(native_name)
-        assert spec_type.optional_for_load("layers.0.required.weight") is None
-
-    _protocol("deepseek_v4", transformer_engine_import_stub, monkeypatch)
-    checkpoint = importlib.import_module(
-        "megatron.lite.model.deepseek_v4.lite.checkpoint"
-    )
-    assert not hasattr(checkpoint.DeepseekV4WeightSpec, "optional_for_load")
+        spec_type = getattr(checkpoint, spec_name)
+        assert not hasattr(spec_type, "optional_for_load")
+        assert not hasattr(spec_type, "expected_buffers")
+        assert not hasattr(spec_type, "is_export_buffer")
 
 
 @pytest.mark.parametrize(
@@ -478,7 +462,7 @@ def test_model_load_optionality_is_explicit_and_explains_default_owner(
         ("glm5", "Glm5WeightSpec"),
     ],
 )
-def test_optional_router_bias_checkpoint_remains_loadable(
+def test_persistent_router_bias_is_required(
     model_name,
     spec_name,
     tmp_path,
@@ -535,14 +519,11 @@ def test_optional_router_bias_checkpoint_remains_loadable(
         pp_size=1,
     )
 
-    with pytest.warns(RuntimeWarning, match="model constructor owns"):
+    with pytest.raises(
+        RuntimeError,
+        match=rf"{spec_name}.*layers\.0\.moe\.router\.expert_bias",
+    ):
         load_hf_weights(model, str(tmp_path), spec, ps)
-
-    assert model.required.item() == 1
-    assert torch.equal(
-        model.layers[0].moe.router.expert_bias,
-        torch.zeros(3),
-    )
 
 
 def test_deepseek_v4_router_buffer_remains_required(
@@ -592,11 +573,87 @@ def test_deepseek_v4_router_buffer_remains_required(
     )
 
     with pytest.raises(
-        KeyError,
+        RuntimeError,
         match=r"DeepseekV4WeightSpec.*layers\.0\.mlp\.gate\.expert_bias"
         r".*layers\.0\.ffn\.gate\.bias",
     ):
         load_hf_weights(Model(), str(tmp_path), spec, ps)
+
+
+def test_kimi_router_bias_92_key_roundtrip_uses_weight_map(
+    tmp_path,
+    transformer_engine_import_stub,
+    monkeypatch,
+):
+    from safetensors.torch import save_file
+
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        export_hf_weights,
+        load_hf_weights,
+    )
+
+    _protocol("kimi_k2", transformer_engine_import_stub, monkeypatch)
+    checkpoint = importlib.import_module("megatron.lite.model.kimi_k2.lite.checkpoint")
+    spec = checkpoint.KimiK2WeightSpec(types.SimpleNamespace(num_experts=0))
+
+    class Router(nn.Module):
+        def __init__(self, layer_idx):
+            super().__init__()
+            self.register_buffer(
+                "expert_bias",
+                torch.full((2,), float(layer_idx)),
+            )
+
+    class Layer(nn.Module):
+        def __init__(self, layer_idx):
+            super().__init__()
+            self.moe = nn.Module()
+            self.moe.router = Router(layer_idx)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([Layer(idx) for idx in range(92)])
+
+    weight_map = {
+        f"layers.{idx}.moe.router.expert_bias": [
+            f"model.layers.{idx}.mlp.gate.e_score_correction_bias"
+        ]
+        for idx in range(92)
+    }
+    monkeypatch.setattr(spec, "weight_map", lambda: weight_map)
+    ps = types.SimpleNamespace(
+        pp_size=1,
+        tp_size=1,
+        tp_rank=0,
+        tp_group=None,
+        ep_size=1,
+        ep_rank=0,
+        ep_group=None,
+        etp_size=1,
+        etp_rank=0,
+        etp_group=None,
+    )
+
+    exported = dict(export_hf_weights(Model(), spec, ps))
+    assert set(exported) == {
+        hf_name for hf_names in weight_map.values() for hf_name in hf_names
+    }
+    assert len(exported) == 92
+
+    save_file(exported, str(tmp_path / "model.safetensors"))
+    loaded = Model()
+    for buffer in loaded.buffers():
+        buffer.zero_()
+    load_hf_weights(loaded, str(tmp_path), spec, ps)
+
+    assert all(
+        torch.equal(
+            loaded.layers[idx].moe.router.expert_bias,
+            torch.full((2,), float(idx)),
+        )
+        for idx in range(92)
+    )
 
 
 @pytest.mark.parametrize("cp_rank", [0, 1])

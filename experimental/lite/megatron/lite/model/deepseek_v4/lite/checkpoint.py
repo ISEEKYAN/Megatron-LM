@@ -27,7 +27,6 @@ from __future__ import annotations
 import re
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.primitive.parallel import ParallelState
@@ -35,11 +34,8 @@ from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.runtime.contracts.weights import ResyncFormat
 
 from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
-    _cast_export_tensor,
-    _resolve_export_dtype,
     parse_expert_idx,
     to_global_layer_name,
-    unwrap_model,
 )
 
 _QUANTIZED_RESYNC_TARGETS = {ResyncFormat.BLOCK_FP8.value, ResyncFormat.MXFP4.value}
@@ -285,26 +281,6 @@ class DeepseekV4WeightSpec:
                 weight_map[mapped_name] = hf_names
         return weight_map
 
-    def expected_buffers(
-        self, base_model: nn.Module, ps: ParallelState
-    ) -> tuple[str, ...]:
-        del ps
-        layer_map = (
-            {
-                local_idx: base_model.layer_indices[local_idx]
-                for local_idx in range(len(base_model.layer_indices))
-            }
-            if hasattr(base_model, "layer_indices")
-            else {}
-        )
-        return tuple(
-            name
-            for name, _buffer in base_model.named_buffers(remove_duplicate=False)
-            if _router_buffer_matches_layer_kind(
-                to_global_layer_name(name, layer_map), self.config
-            )
-        )
-
     def hf_to_native(
         self, native_name: str, hf_tensors: list[torch.Tensor]
     ) -> torch.Tensor:
@@ -400,95 +376,13 @@ class DeepseekV4WeightSpec:
 def _export_unquantized_weights(
     model, config: DeepseekV4Config, ps: ParallelState, **kwargs
 ):
-    """Export gathered DS4 BF16 weights and persistent router buffers.
-
-    Identical structure to kimi/glm5: delegate to the shared ``_export`` (which
-    does the TP/ETP/EP/PP gather, including the PP ``all_gather_object`` reached
-    by ALL ranks before any ``rank0_only`` filter), then append the persistent
-    router buffers (``tid2eid`` for hash layers, ``expert_bias`` for non-hash
-    layers) which the parameter-only ``_export`` does not visit.
-    """
+    """Export DS4 parameters and mapped persistent buffers through one plan."""
     from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
         export_hf_weights as _export,
     )
 
     spec = DeepseekV4WeightSpec(config)
-    rank0_only = bool(kwargs.get("rank0_only", False))
-    cpu = bool(kwargs.get("cpu", False))
-    export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
     yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
-
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    chunks = list(model) if isinstance(model, list | nn.ModuleList) else [model]
-    local_buffers: list[tuple[str, torch.Tensor]] = []
-    for chunk in chunks:
-        base_chunk = unwrap_model(chunk)
-        layer_map = (
-            {
-                i: base_chunk.layer_indices[i]
-                for i in range(len(base_chunk.layer_indices))
-            }
-            if hasattr(base_chunk, "layer_indices")
-            else {}
-        )
-        for name, buffer in base_chunk.named_buffers():
-            # Persistent router buffers carried into HF: hash-layer ``tid2eid``
-            # and the (made-persistent for non-hash layers) ``expert_bias``.
-            global_name = to_global_layer_name(name, layer_map)
-            if not _router_buffer_matches_layer_kind(global_name, config):
-                continue
-            for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer.detach()):
-                local_buffers.append((hf_name, hf_tensor.contiguous()))
-
-    emit = not (rank0_only and rank != 0)
-    if ps.pp_size <= 1:
-        if emit:
-            for hf_name, tensor in local_buffers:
-                tensor = tensor.cpu() if cpu else tensor
-                yield hf_name, _cast_export_tensor(tensor, export_dtype)
-        return
-
-    # Router state is stored as buffers, so the parameter-only shared exporter
-    # above cannot carry it across PP stages.  Every actor rank feeds one rollout
-    # worker; yielding only this rank's local buffers leaves each online vLLM
-    # replica with router state for just one pipeline stage.  Stream every PP
-    # stage's buffers over the same PP group used for parameters so each rank
-    # emits a complete model without materializing the full checkpoint.
-    bcast_device = (
-        torch.device("cuda", torch.cuda.current_device())
-        if torch.cuda.is_available()
-        else torch.device("cpu")
-    )
-    for src_pp in range(ps.pp_size):
-        src_global = ps.pp_global_ranks[src_pp]
-        is_source = src_pp == ps.pp_rank
-        if is_source:
-            stage_buffers = [
-                (name, tensor.to(bcast_device).contiguous())
-                for name, tensor in local_buffers
-            ]
-            header = [
-                [
-                    (name, tuple(tensor.shape), tensor.dtype)
-                    for name, tensor in stage_buffers
-                ]
-            ]
-        else:
-            stage_buffers = []
-            header = [None]
-        dist.broadcast_object_list(
-            header, src=src_global, group=ps.pp_group, device=bcast_device
-        )
-        for idx, (hf_name, shape, dtype) in enumerate(header[0]):
-            tensor = (
-                stage_buffers[idx][1]
-                if is_source
-                else torch.empty(shape, dtype=dtype, device=bcast_device)
-            )
-            dist.broadcast(tensor, src=src_global, group=ps.pp_group)
-            if emit:
-                output = tensor.cpu() if cpu else tensor
-                yield hf_name, _cast_export_tensor(output, export_dtype)
 
 
 def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
