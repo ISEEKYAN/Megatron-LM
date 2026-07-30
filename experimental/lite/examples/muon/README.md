@@ -1,13 +1,9 @@
 # Muon optimizer in Megatron Lite
 
-Megatron Lite adds production Muon support for both **DistOpt** (Megatron-Core
-distributed optimizer) and **FSDP2** backends. Matrix weights are optimized with
-Muon (Newton–Schulz orthogonalized updates); embeddings, output layers, biases,
-and norms fall back to AdamW under the same facade.
-
-Upstream Megatron-Core currently routes Muon only through the distributed
-optimizer path. This PR additionally lowers Muon onto FSDP2 sharded parameters
-via distributed Newton–Schulz (`emerging_optimizers.newton_schulz_tp`).
+Megatron Lite supports Muon through the **DistOpt** (Megatron-Core distributed
+optimizer) path. Matrix weights use Muon (Newton–Schulz orthogonalized updates);
+embeddings, output layers, biases, and norms use the upstream scalar-optimizer
+fallback.
 
 ## Quick start (VERL + Megatron Lite)
 
@@ -33,8 +29,7 @@ An AdamW learning rate is **not** directly reusable. The Megatron-Core default
 `muon_extra_scale_factor = 1.0` is not AdamW-comparable: carrying an AdamW `lr`
 over unchanged yields roughly a **4.4x** larger effective step.
 
-`emerging_optimizers` gives the closed form for the factor that matches AdamW's
-update RMS norm:
+The closed form for the factor that matches AdamW's update RMS norm is:
 
 ```
 muon_extra_scale_factor = sqrt((1 - beta1) / (1 + beta1))
@@ -50,7 +45,6 @@ Supported backends:
 | Backend | Entry point | Notes |
 |---------|-------------|-------|
 | `dist_opt` | `build_dist_opt_stack()` | Compact LayerWise layout; bitwise parity vs Megatron-Core TensorParallelMuon |
-| `fsdp2` | `build_fsdp2_training_optimizer()` | Distributed NS on DTensor shards; AdamW fallback for non-matrix params |
 
 ## Python API (direct)
 
@@ -67,19 +61,12 @@ opt = OptimizerConfig(
 ```
 
 DistOpt training uses `megatron.lite.primitive.optimizers.megatron_wrap.build_dist_opt_stack`.
-FSDP2 training uses `megatron.lite.primitive.optimizers.fsdp2.optimizer.build_fsdp2_training_optimizer`.
 
 Parameter routing metadata is tagged automatically before wrapping:
 
 - `VocabParallelEmbedding` / `VocabParallelOutput` mark embedding/output weights.
 - `GQAttention` marks fused QKV weights for per-head Muon splits.
 - `tag_muon_parameter_metadata()` tags expert parameters.
-
-## FSDP2 dependency
-
-FSDP2 Muon imports `emerging_optimizers` (same package as Megatron-Core Muon).
-For unit tests, set `EMERGING_OPT_SITE` to a site-packages tree containing
-`emerging_optimizers`, or install the pinned Megatron emerging-optimizers wheel.
 
 ## Current limitations
 
@@ -91,23 +78,18 @@ Muon compact DistOpt lowering does **not** yet support:
 - Precision-aware optimizer
 - Optimizer CPU offload (use the dedicated offload lowering when available)
 
-FSDP2 Muon does not support optimizer-state CPU offload in this release.
-
 ## Validation summary
 
 | Check | Result |
 |-------|--------|
 | DistOpt Muon vs Megatron-Core | Bitwise (`torch.equal`, 2000 tensor checks, DP=2) |
-| FSDP2 Muon vs reference | Within round-off (~1e-6 fp32 highest; ~1e-2 medium production precision) |
-| Peak memory (30B) | Previous FSDP2 figure withdrawn pending a matched rerun after the routing fix |
 | GSM8K RL reward (GRPO) | Muon and AdamW are within the repeat-run spread |
 
 This table summarizes a mix of automated primitive checks and manual
 end-to-end validation. The DistOpt result is from a one-off offline DP=2 parity
 run; this repository does not currently contain an automated assertion for the
-2000-check TensorParallelMuon comparison. The FSDP2 correctness row has
-repository test assertions; the memory and RL observations are not asserted by
-automated tests in this repository.
+2000-check TensorParallelMuon comparison. The RL observation is not asserted by
+an automated test in this repository.
 
 ## Tests
 
@@ -117,17 +99,11 @@ CPU unit tests (no GPU required):
 PYTHONPATH="$(pwd):$(pwd)/experimental/lite" \
   pytest \
     experimental/lite/tests/unit/primitive/test_muon_routing.py \
-    experimental/lite/tests/unit/primitive/test_muon_fsdp2_unit.py \
+    experimental/lite/tests/unit/primitive/test_fsdp2_unit.py \
     experimental/lite/tests/unit/runtime/test_optimizer_config_contract.py
-```
-
-GPU lifecycle test (single CUDA device):
-
-```bash
-PYTHONPATH="$(pwd):$(pwd)/experimental/lite" \
-  pytest experimental/lite/tests/unit/primitive/test_muon_fsdp2_offload_gpu.py
 ```
 
 ## Backend support
 
-Muon is currently supported only through the MLite DistOpt path. FSDP2 with `optimizer=muon` is unsupported and fails loudly; it never falls back to AdamW.
+Muon is currently supported only through the MLite DistOpt path. FSDP2 with
+`optimizer=muon` is unsupported and fails loudly; it never falls back to AdamW.
