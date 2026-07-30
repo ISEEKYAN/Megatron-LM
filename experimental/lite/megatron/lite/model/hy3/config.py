@@ -51,6 +51,11 @@ class Hy3Config:
     def shared_expert_intermediate_size(self) -> int:
         return self.moe_intermediate_size * self.num_shared_experts
 
+    @property
+    def n_routed_experts(self) -> int:
+        """Compatibility view consumed by the model-agnostic router primitive."""
+        return self.num_experts
+
     def _validate(self) -> None:
         errors: list[str] = []
 
@@ -65,19 +70,37 @@ class Hy3Config:
             "num_attention_heads must be divisible by num_key_value_heads",
         )
         check(self.head_dim > 0, "head_dim must be positive")
-        check(0 <= self.first_k_dense_replace <= self.num_hidden_layers, "first_k_dense_replace is out of range")
-        check(len(self.layer_types) == self.num_hidden_layers, "layer_types length must equal num_hidden_layers")
-        check(all(kind in {"dense", "sparse"} for kind in self.layer_types), "layer_types must contain dense or sparse")
+        check(
+            0 <= self.first_k_dense_replace <= self.num_hidden_layers,
+            "first_k_dense_replace is out of range",
+        )
+        check(
+            len(self.layer_types) == self.num_hidden_layers,
+            "layer_types length must equal num_hidden_layers",
+        )
+        check(
+            all(kind in {"dense", "sparse"} for kind in self.layer_types),
+            "layer_types must contain dense or sparse",
+        )
         check(self.num_experts > 0, "num_experts must be positive")
-        check(1 <= self.num_experts_per_tok <= self.num_experts, "num_experts_per_tok is out of range")
+        check(
+            1 <= self.num_experts_per_tok <= self.num_experts,
+            "num_experts_per_tok is out of range",
+        )
         check(self.num_shared_experts == 1, "num_shared_experts must be 1")
         check(self.hidden_act == "silu", "hidden_act must be silu")
         check(self.qk_norm, "qk_norm must be enabled")
         check(self.moe_router_use_sigmoid, "moe_router_use_sigmoid must be enabled")
-        check(self.moe_router_enable_expert_bias, "moe_router_enable_expert_bias must be enabled")
+        check(
+            self.moe_router_enable_expert_bias,
+            "moe_router_enable_expert_bias must be enabled",
+        )
         check(self.route_norm, "route_norm must be enabled")
         check(self.router_scaling_factor > 0, "router_scaling_factor must be positive")
-        check(self.num_nextn_predict_layers >= 0, "num_nextn_predict_layers must be non-negative")
+        check(
+            self.num_nextn_predict_layers >= 0,
+            "num_nextn_predict_layers must be non-negative",
+        )
         if errors:
             raise ValueError("Invalid Hy3Config:\n  " + "\n  ".join(errors))
 
@@ -87,13 +110,17 @@ class Hy3Config:
 
     @classmethod
     def from_hf_config(cls, hf_config, **overrides) -> "Hy3Config":
-        source = hf_config.to_dict() if hasattr(hf_config, "to_dict") else vars(hf_config)
+        source = (
+            hf_config.to_dict() if hasattr(hf_config, "to_dict") else vars(hf_config)
+        )
         return cls._from_hf_dict(source, **overrides)
 
     @classmethod
     def _from_hf_dict(cls, hf: dict[str, Any], **overrides) -> "Hy3Config":
         if hf.get("model_type", "hy_v3") != "hy_v3":
-            raise ValueError(f"model_type must be 'hy_v3', got {hf.get('model_type')!r}")
+            raise ValueError(
+                f"model_type must be 'hy_v3', got {hf.get('model_type')!r}"
+            )
         valid = {item.name for item in dc_fields(cls)}
         kwargs = {key: value for key, value in hf.items() if key in valid}
         rope = hf.get("rope_parameters")

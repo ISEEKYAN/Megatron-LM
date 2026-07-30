@@ -20,6 +20,11 @@ from megatron.lite.model.hy3.lite.model import Hy3Model, Hy3TransformerLayer
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
+from megatron.lite.primitive.quantization import (
+    QATSpec,
+    apply_qat_to_chunks,
+    normalize_qat_spec,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 
@@ -38,6 +43,7 @@ class ImplConfig:
     mtp_detach_encoder: bool = False
     mtp_loss_scaling_factor: float = 0.1
     deterministic: bool = True
+    qat: QATSpec | dict | None = None
 
 
 MODULE_MAP = {
@@ -108,7 +114,9 @@ def build_model(model_cfg: Hy3Config, *, impl_cfg: ImplConfig) -> ModelBundle:
             vpp=vpp,
             vpp_chunk_id=index if vpp is not None else None,
             **model_kwargs,
-        ).to(torch.bfloat16).cuda()
+        )
+        .to(torch.bfloat16)
+        .cuda()
         for index in range(vpp or 1)
     ]
     if recompute:
@@ -120,11 +128,16 @@ def build_model(model_cfg: Hy3Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         for chunk in chunks:
             apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
 
+    # Parametrize before optimizer construction so it captures the BF16 master.
+    apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
+
     optimizer = None
     finalize_grads = None
     post_model_load_hook = None
     if impl_cfg.optimizer == "mc":
-        from megatron.lite.primitive.optimizers.megatron_wrap import build_mc_training_optimizer
+        from megatron.lite.primitive.optimizers.megatron_wrap import (
+            build_mc_training_optimizer,
+        )
 
         optimizer, finalize_grads = build_mc_training_optimizer(
             chunks,
@@ -140,7 +153,9 @@ def build_model(model_cfg: Hy3Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         optimizer_backend = "fsdp2"
 
         def build_optimizer_after_load():
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(

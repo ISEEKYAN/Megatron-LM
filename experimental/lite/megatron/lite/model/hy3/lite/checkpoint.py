@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import re
+
 import torch
 from torch.distributed.tensor import Replicate, Shard
 
@@ -30,7 +32,9 @@ class Hy3WeightSpec:
         attention = f"{hf_prefix}.self_attn"
         weight_map.update(
             {
-                f"{native_prefix}.attn.qkv.linear.layer_norm_weight": [f"{hf_prefix}.input_layernorm.weight"],
+                f"{native_prefix}.attn.qkv.linear.layer_norm_weight": [
+                    f"{hf_prefix}.input_layernorm.weight"
+                ],
                 f"{native_prefix}.attn.qkv.linear.weight": [
                     f"{attention}.q_proj.weight",
                     f"{attention}.k_proj.weight",
@@ -38,8 +42,12 @@ class Hy3WeightSpec:
                 ],
                 f"{native_prefix}.attn.q_norm.weight": [f"{attention}.q_norm.weight"],
                 f"{native_prefix}.attn.k_norm.weight": [f"{attention}.k_norm.weight"],
-                f"{native_prefix}.attn.proj.linear.weight": [f"{attention}.o_proj.weight"],
-                f"{native_prefix}.mlp_norm.weight": [f"{hf_prefix}.post_attention_layernorm.weight"],
+                f"{native_prefix}.attn.proj.linear.weight": [
+                    f"{attention}.o_proj.weight"
+                ],
+                f"{native_prefix}.mlp_norm.weight": [
+                    f"{hf_prefix}.post_attention_layernorm.weight"
+                ],
             }
         )
 
@@ -52,13 +60,17 @@ class Hy3WeightSpec:
         mlp = f"{hf_prefix}.mlp"
         weight_map.update(
             {
-                f"{native_prefix}.moe.router.gate.weight": [f"{mlp}.router.gate.weight"],
+                f"{native_prefix}.moe.router.gate.weight": [
+                    f"{mlp}.router.gate.weight"
+                ],
                 f"{native_prefix}.moe.router.expert_bias": [f"{mlp}.expert_bias"],
                 f"{native_prefix}.moe.shared_mlp.gate_up.linear.weight": [
                     f"{mlp}.shared_mlp.gate_proj.weight",
                     f"{mlp}.shared_mlp.up_proj.weight",
                 ],
-                f"{native_prefix}.moe.shared_mlp.down.linear.weight": [f"{mlp}.shared_mlp.down_proj.weight"],
+                f"{native_prefix}.moe.shared_mlp.down.linear.weight": [
+                    f"{mlp}.shared_mlp.down_proj.weight"
+                ],
             }
         )
         for expert in range(self.config.num_experts):
@@ -87,7 +99,9 @@ class Hy3WeightSpec:
                     f"{hf}.mlp.gate_proj.weight",
                     f"{hf}.mlp.up_proj.weight",
                 ]
-                result[f"{native}.mlp.down.linear.weight"] = [f"{hf}.mlp.down_proj.weight"]
+                result[f"{native}.mlp.down.linear.weight"] = [
+                    f"{hf}.mlp.down_proj.weight"
+                ]
             else:
                 self._add_sparse_mlp(result, native, hf)
         for mtp_index in range(config.num_nextn_predict_layers):
@@ -100,14 +114,18 @@ class Hy3WeightSpec:
                     f"{native}.enorm.weight": [f"{hf}.enorm.weight"],
                     f"{native}.hnorm.weight": [f"{hf}.hnorm.weight"],
                     f"{native}.eh_proj.linear.weight": [f"{hf}.eh_proj.weight"],
-                    f"{native}.final_layernorm.weight": [f"{hf}.final_layernorm.weight"],
+                    f"{native}.final_layernorm.weight": [
+                        f"{hf}.final_layernorm.weight"
+                    ],
                 }
             )
             self._add_attention(result, transformer, hf)
             self._add_sparse_mlp(result, transformer, hf)
         return result
 
-    def hf_to_native(self, native_name: str, tensors: list[torch.Tensor]) -> torch.Tensor:
+    def hf_to_native(
+        self, native_name: str, tensors: list[torch.Tensor]
+    ) -> torch.Tensor:
         if len(tensors) == 3:
             return pack_grouped_query_qkv(
                 *tensors,
@@ -119,7 +137,19 @@ class Hy3WeightSpec:
             return torch.cat(tensors, dim=0)
         return tensors[0]
 
-    def native_to_hf(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    @staticmethod
+    def _canonical_expert_name(native_name: str) -> str:
+        """Restore GroupedLinear's local name to the shared weight-map key."""
+        return re.sub(
+            r"(\.moe\.experts)\.(fc[12])\.weight(\d+)$",
+            r"\1._\2_weight_\3",
+            native_name,
+        )
+
+    def native_to_hf(
+        self, native_name: str, tensor: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
+        native_name = self._canonical_expert_name(native_name)
         if native_name == "mtp_embed.embedding.weight":
             return []
         targets = self.weight_map().get(native_name)
@@ -165,6 +195,7 @@ class Hy3WeightSpec:
         return ".experts." in native_name and ".router." not in native_name
 
     def expert_global_id(self, native_name: str) -> int | None:
+        native_name = self._canonical_expert_name(native_name)
         if "_fc1_weight_" in native_name or "_fc2_weight_" in native_name:
             return int(native_name.rsplit("_", 1)[1])
         return None
@@ -203,7 +234,9 @@ def load_hf_weights(model, path: str, config: Hy3Config, ps) -> None:
 def export_hf_weights(model, config: Hy3Config, ps, **kwargs):
     from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as export
 
-    yield from export(model, Hy3WeightSpec(config), ps, vocab_size=config.vocab_size, **kwargs)
+    yield from export(
+        model, Hy3WeightSpec(config), ps, vocab_size=config.vocab_size, **kwargs
+    )
 
 
 def save_hf_weights(model, path: str, config: Hy3Config, ps) -> None:

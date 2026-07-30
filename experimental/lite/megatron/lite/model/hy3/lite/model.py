@@ -14,7 +14,11 @@ from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.gqa import GQAttention
 from megatron.lite.primitive.modules.mlp import SwiGLUMLP
-from megatron.lite.primitive.modules.mtp import MTPBlock, MTPDecoderLayer, MTPLossAutoScaler
+from megatron.lite.primitive.modules.mtp import (
+    MTPBlock,
+    MTPDecoderLayer,
+    MTPLossAutoScaler,
+)
 from megatron.lite.primitive.modules.router import SigmoidTopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
@@ -49,7 +53,7 @@ class Hy3MoELayer(nn.Module):
             config,
             ps,
             compute_aux_loss=False,
-            persistent_expert_bias=True,
+            expert_bias_persistent=True,
         )
         self.experts = Experts(
             config,
@@ -66,7 +70,6 @@ class Hy3MoELayer(nn.Module):
         self.shared_mlp = SwiGLUMLP(
             config.hidden_size,
             config.shared_expert_intermediate_size,
-            ps,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -123,7 +126,7 @@ class Hy3TransformerLayer(nn.Module):
         self.mlp: SwiGLUMLP | None = None
         self.moe: Hy3MoELayer | None = None
         if self.layer_type == "dense":
-            self.mlp = SwiGLUMLP(config.hidden_size, config.intermediate_size, ps)
+            self.mlp = SwiGLUMLP(config.hidden_size, config.intermediate_size)
         elif self.layer_type == "sparse":
             self.moe = Hy3MoELayer(
                 config,
@@ -214,7 +217,11 @@ class Hy3Model(nn.Module):
                 for index in self.layer_indices
             ]
         )
-        self.norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if layout.has_head else None
+        self.norm = (
+            te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if layout.has_head
+            else None
+        )
         self.head = (
             VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
             if layout.has_head
@@ -225,7 +232,9 @@ class Hy3Model(nn.Module):
         if mtp_enable and config.num_nextn_predict_layers > 0 and self.head is not None:
             mtp_embedding = self.embed
             if mtp_embedding is None:
-                mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+                mtp_embedding = VocabParallelEmbedding(
+                    config.vocab_size, config.hidden_size, ps
+                )
                 self.mtp_embed = mtp_embedding
 
             def make_mtp_layer(index: int) -> MTPDecoderLayer:
@@ -284,10 +293,18 @@ class Hy3Model(nn.Module):
             hidden = hidden_states if hidden_states is not None else self._input_tensor
             if hidden is None:
                 raise ValueError("hidden states are required on a non-embedding stage")
-        context = te.fp8_autocast(enabled=True, fp8_recipe=build_fp8_recipe()) if self.fp8 else nullcontext()
+        context = (
+            te.fp8_autocast(enabled=True, fp8_recipe=build_fp8_recipe())
+            if self.fp8
+            else nullcontext()
+        )
         with context:
             for layer in self.layers:
-                hidden = layer(hidden, position_ids=position_ids, packed_seq_params=packed_seq_params)
+                hidden = layer(
+                    hidden,
+                    position_ids=position_ids,
+                    packed_seq_params=packed_seq_params,
+                )
         output = {"hidden_states": hidden}
         if self.head is None:
             return output
@@ -296,7 +313,11 @@ class Hy3Model(nn.Module):
         if labels is None:
             output["logits"] = self.head.gather(self.head(hidden_for_head))
             return output
-        temperature_value = float(temperature.detach().float().item()) if isinstance(temperature, torch.Tensor) else float(temperature)
+        temperature_value = (
+            float(temperature.detach().float().item())
+            if isinstance(temperature, torch.Tensor)
+            else float(temperature)
+        )
         mtp_result = self._apply_mtp_loss(
             hidden_for_head,
             input_ids=input_ids,
@@ -324,9 +345,15 @@ class Hy3Model(nn.Module):
             logits = self.head(hidden_for_head)
             if temperature_value != 1.0:
                 logits = logits / temperature_value
-            token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+            token_loss = vocab_parallel_cross_entropy(
+                logits, labels_sb, self.ps.tp_group
+            )
             log_probs = -token_loss
-            entropy = vocab_parallel_entropy(logits, self.ps.tp_group) if calculate_entropy else None
+            entropy = (
+                vocab_parallel_entropy(logits, self.ps.tp_group)
+                if calculate_entropy
+                else None
+            )
         output["loss"] = token_loss.mean()
         if return_log_probs:
             output["log_probs"] = log_probs.transpose(0, 1).contiguous()
@@ -355,7 +382,11 @@ class Hy3Model(nn.Module):
             return None
         if input_ids is None:
             raise ValueError("MTP training requires input_ids")
-        mask = torch.ones_like(labels, dtype=torch.float32) if loss_mask is None else loss_mask.float()
+        mask = (
+            torch.ones_like(labels, dtype=torch.float32)
+            if loss_mask is None
+            else loss_mask.float()
+        )
         mtp_hidden_states = self.mtp(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -368,12 +399,18 @@ class Hy3Model(nn.Module):
             shifted_labels, _ = roll_packed_thd_left(
                 shifted_labels, packed_seq_params=packed_seq_params, dims=-1
             )
-            mask, num_tokens = roll_packed_thd_left(mask, packed_seq_params=packed_seq_params, dims=-1)
+            mask, num_tokens = roll_packed_thd_left(
+                mask, packed_seq_params=packed_seq_params, dims=-1
+            )
             labels_sb = shifted_labels.transpose(0, 1).contiguous()
             if use_fused_kernels:
                 hidden_full = gather_from_sequence_parallel(mtp_hidden, self.ps)
                 log_probs, _ = linear_cross_entropy(
-                    hidden_full, self._head_weight(hidden_full), labels_sb, temperature, self.ps.tp_group
+                    hidden_full,
+                    self._head_weight(hidden_full),
+                    labels_sb,
+                    temperature,
+                    self.ps.tp_group,
                 )
                 token_loss = -log_probs
             else:
@@ -388,8 +425,12 @@ class Hy3Model(nn.Module):
             denominator = num_tokens.to(token_loss.dtype).clamp_min(1.0)
             losses.append(token_loss.sum() / denominator)
             scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, scale * token_loss / denominator)
-        return hidden_states, torch.stack([loss.detach().float() for loss in losses]).mean()
+            hidden_states = MTPLossAutoScaler.apply(
+                hidden_states, scale * token_loss / denominator
+            )
+        return hidden_states, torch.stack(
+            [loss.detach().float() for loss in losses]
+        ).mean()
 
 
 __all__ = ["Hy3MoELayer", "Hy3Model", "Hy3TransformerLayer"]
