@@ -348,6 +348,41 @@ def test_declared_expected_buffer_missing_from_checkpoint_fails(monkeypatch) -> 
         load_hf_weights(Model(), "unused", Spec(), _parallel_state())
 
 
+def test_buffer_cannot_be_both_optional_and_expected(monkeypatch) -> None:
+    _stub_parallel_import(monkeypatch)
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("router_expert_bias", torch.zeros(4))
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def weight_map():
+            return {"router_expert_bias": ["hf.router.expert_bias"]}
+
+        @staticmethod
+        def expected_buffers(base_model, ps):
+            return ("router_expert_bias",)
+
+        @staticmethod
+        def optional_for_load(name):
+            if name == "router_expert_bias":
+                return "the constructor owns the default"
+            return None
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Spec.*router_expert_bias.*expected_buffers\(\)"
+            r".*optional_for_load\(\)"
+        ),
+    ):
+        load_hf_weights(Model(), "unused", Spec(), _parallel_state())
+
+
 def test_checkpoint_source_without_model_target_fails(monkeypatch) -> None:
     _stub_parallel_import(monkeypatch)
 
