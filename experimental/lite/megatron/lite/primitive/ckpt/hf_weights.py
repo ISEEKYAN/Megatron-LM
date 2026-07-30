@@ -1371,7 +1371,8 @@ def export_hf_weights(
                 else {}
             )
             for name, param in base_chunk.named_parameters():
-                yield to_global_layer_name(name, layer_map), param.data.detach()
+                logical_name = canonical_state_key(name)
+                yield to_global_layer_name(logical_name, layer_map), param.data.detach()
             persistent_buffers = [
                 (name, buffer)
                 for name, buffer in base_chunk.named_buffers()
