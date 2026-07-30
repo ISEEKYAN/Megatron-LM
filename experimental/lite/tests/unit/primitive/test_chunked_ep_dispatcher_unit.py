@@ -81,6 +81,7 @@ def _dispatcher(buffer=None):
     value.buffer = buffer or _Buffer()
     value.num_experts = 4
     value.num_local_experts = 2
+    value.ep_size = 2
     value.moe_permute_fusion = False
     value.ps = SimpleNamespace(ep_group=None)
     value._row_id_map = torch.tensor([0, 1])
@@ -158,7 +159,8 @@ def test_fixed_capacity_dispatch_resolves_global_local_expert_counts(monkeypatch
     def all_reduce(counts, group, async_op):
         assert group is value.ps.tp_ep_group
         assert async_op
-        counts.add_(torch.tensor([10, 20, 30, 40], dtype=counts.dtype))
+        assert counts.numel() == 6
+        counts.add_(torch.tensor([5, 6, 10, 20, 30, 40], dtype=counts.dtype))
         return work
 
     monkeypatch.setattr(
@@ -201,9 +203,9 @@ def test_fixed_capacity_dispatch_fails_before_deepep_when_receive_rows_exceed_bo
     class Buffer(_Buffer):
         def get_dispatch_layout(self, _topk_indices, **_kwargs):
             return (
-                torch.zeros(2, dtype=torch.int32),
+                torch.tensor([40, 100], dtype=torch.int32),
                 None,
-                torch.tensor([11, 22, 33, 44], dtype=torch.int32),
+                torch.tensor([1, 2, 3, 4], dtype=torch.int32),
                 torch.zeros(3, 2, dtype=torch.bool),
                 _Event(),
             )

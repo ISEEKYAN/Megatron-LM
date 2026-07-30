@@ -717,19 +717,23 @@ class TokenDispatcher:
         recv_counts_work = None
         if num_worst_tokens:
             _event_current_stream_wait(event)
-            recv_counts = num_tokens_per_expert.clone()
+            recv_layout = torch.cat(
+                (
+                    num_tokens_per_rank.to(dtype=num_tokens_per_expert.dtype),
+                    num_tokens_per_expert,
+                )
+            )
             recv_counts_work = dist.all_reduce(
-                recv_counts,
+                recv_layout,
                 group=self.ps.tp_ep_group,
                 async_op=True,
             )
             recv_counts_work.wait()
-            start = self.ps.ep_rank * self.num_local_experts
-            end = start + self.num_local_experts
             torch._assert_async(
-                recv_counts[start:end].sum() <= num_worst_tokens,
+                recv_layout[self.ps.ep_rank] <= num_worst_tokens,
                 "DeepEP receive rows exceed the fixed dispatch capacity",
             )
+            recv_counts = recv_layout[self.ep_size :]
             recv_counts_work = None
 
         hidden_states_contig = hidden_states.contiguous()
