@@ -10,7 +10,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
-
 from megatron.lite.primitive.modules.gqa_utils import (
     split_grouped_qkvg,
     split_grouped_qkvg_for_tp,
@@ -362,7 +361,9 @@ class GQAttention(nn.Module):
                         tp_size=self.ps.tp_size,
                     )
 
-                replicas_per_kv_head = ensure_divisible(self.ps.tp_size, self.num_kv_heads)
+                replicas_per_kv_head = ensure_divisible(
+                    self.ps.tp_size, self.num_kv_heads
+                )
                 q_heads_per_group = ensure_divisible(self.num_heads, self.num_kv_heads)
                 group_width = (q_heads_per_group + 2) * hd
                 kv_group_rank = self.ps.tp_rank // replicas_per_kv_head

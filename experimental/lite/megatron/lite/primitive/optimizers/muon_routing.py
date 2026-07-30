@@ -6,7 +6,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.protocols import ExpertClassifierFn
 
 

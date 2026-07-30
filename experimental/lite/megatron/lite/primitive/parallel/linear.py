@@ -9,7 +9,6 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 import transformer_engine.pytorch as te  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.utils import ensure_divisible
 
 if TYPE_CHECKING:
@@ -438,7 +437,9 @@ class _AllGatherLastDimWithGradReduce(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         local_width = ensure_divisible(grad_output.shape[-1], ctx.tp_size)
         flat_grad = grad_output.reshape(-1, grad_output.shape[-1])
-        packed_grad = torch.cat(flat_grad.split(local_width, dim=-1), dim=0).contiguous()
+        packed_grad = torch.cat(
+            flat_grad.split(local_width, dim=-1), dim=0
+        ).contiguous()
         local_grad = torch.empty(
             (flat_grad.shape[0], local_width),
             dtype=grad_output.dtype,

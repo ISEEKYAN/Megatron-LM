@@ -64,9 +64,7 @@ def _r3_input_ids() -> torch.Tensor:
 def _install_upstream_r3_stub(monkeypatch, build) -> None:
     module = types.ModuleType("verl.utils.megatron.router_replay_utils")
     module.build_r3_replay_mask = build
-    monkeypatch.setitem(
-        sys.modules, "verl.utils.megatron.router_replay_utils", module
-    )
+    monkeypatch.setitem(sys.modules, "verl.utils.megatron.router_replay_utils", module)
 
 
 def test_r3_replay_mask_delegates_jagged_inputs_to_verl(monkeypatch):
@@ -74,10 +72,7 @@ def test_r3_replay_mask_delegates_jagged_inputs_to_verl(monkeypatch):
     input_ids = _r3_input_ids()
     response_mask = torch.tensor([[1, 1], [0, 0]], dtype=torch.float32)
     expected = torch.nested.as_nested_tensor(
-        [
-            torch.tensor([True, True, True, False]),
-            torch.tensor([False, False, False]),
-        ],
+        [torch.tensor([True, True, True, False]), torch.tensor([False, False, False])],
         layout=torch.jagged,
     )
     seen = {}
@@ -89,13 +84,10 @@ def test_r3_replay_mask_delegates_jagged_inputs_to_verl(monkeypatch):
 
     _install_upstream_r3_stub(monkeypatch, build)
     micro_batch = TensorDict(
-        {"input_ids": input_ids, "response_mask": response_mask},
-        batch_size=[2],
+        {"input_ids": input_ids, "response_mask": response_mask}, batch_size=[2]
     )
 
-    actual = MegatronLiteEngine._r3_replay_mask_for_packing(
-        micro_batch, input_ids
-    )
+    actual = MegatronLiteEngine._r3_replay_mask_for_packing(micro_batch, input_ids)
 
     assert actual is expected
     assert seen == {"input_ids": input_ids, "response_mask": response_mask}
@@ -334,10 +326,7 @@ def test_online_qat_export_wraps_mlite_hf_weight_stream(monkeypatch) -> None:
 
     def fake_export(weights, modules, qat_config, bridge):
         captured.update(
-            weights=weights,
-            modules=modules,
-            qat_config=qat_config,
-            bridge=bridge,
+            weights=weights, modules=modules, qat_config=qat_config, bridge=bridge
         )
         return iter([("packed.weight", torch.ones(2, 16, dtype=torch.uint8))])
 

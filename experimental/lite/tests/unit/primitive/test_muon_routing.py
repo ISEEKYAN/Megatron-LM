@@ -10,7 +10,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
-
 from megatron.lite.primitive.optimizers.megatron_wrap import (
     _build_pg_collection,
     build_dist_opt_optimizer_config,
@@ -178,9 +177,7 @@ def test_compact_dist_opt_lowering_follows_upstream_order(monkeypatch) -> None:
         lambda _model_cfg, _engine_cfg: SimpleNamespace(),
     )
     monkeypatch.setattr(
-        wrap_module,
-        "_build_pg_collection",
-        lambda _ps, _engine_cfg: pg_collection,
+        wrap_module, "_build_pg_collection", lambda _ps, _engine_cfg: pg_collection
     )
     monkeypatch.setattr(
         wrap_module,
@@ -292,9 +289,7 @@ def test_compact_dist_opt_lowering_follows_upstream_order(monkeypatch) -> None:
     optimizer_config = OptimizerConfig(optimizer="muon")
     optimizer_config.override_optimizer_config = {"muon_num_ns_steps": 7}
     engine_config = SimpleNamespace(
-        parallel=parallel,
-        optimizer=optimizer_config,
-        deterministic=False,
+        parallel=parallel, optimizer=optimizer_config, deterministic=False
     )
 
     wrapped, optimizer = build_dist_opt_stack(
@@ -362,8 +357,7 @@ def test_compact_muon_rejects_runtime_optimizer_overrides(
         },
     )
     engine_config = SimpleNamespace(
-        parallel=runtime_config.parallel,
-        optimizer=runtime_config.optimizer,
+        parallel=runtime_config.parallel, optimizer=runtime_config.optimizer
     )
 
     with pytest.raises(ValueError, match=message):
@@ -498,9 +492,7 @@ def test_intra_dist_opt_owner_rank_order_matches_upstream_single_instance(
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 16)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
     monkeypatch.setattr(
-        torch.distributed,
-        "new_group",
-        lambda ranks, **_kwargs: tuple(ranks),
+        torch.distributed, "new_group", lambda ranks, **_kwargs: tuple(ranks)
     )
 
     state = init_parallel(SimpleNamespace(tp=2, ep=2, etp=2, cp=1, pp=2))

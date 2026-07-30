@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from megatron.lite.primitive.parallel.cp import split_packed_for_cp
 from megatron.lite.primitive.parallel.pipeline import _num_microbatches_from_config
 from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
