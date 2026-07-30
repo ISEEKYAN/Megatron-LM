@@ -27,6 +27,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     export_hf_weights,
     stream_export_to_shards,
 )
+from megatron.lite.primitive.quantization.qat import QATSpec, apply_qat_to_chunks
 
 
 def test_safe_tensor_reader_context_reuses_and_closes_shard(
@@ -723,6 +724,48 @@ def test_persistent_buffer_load_export_mapping_must_match() -> None:
         match=r"Spec.*router_bias.*hf\.expected_bias.*hf\.different_bias",
     ):
         dict(export_hf_weights(Model(), Spec(), ps))
+
+
+def test_qat_parametrized_parameter_exports_with_logical_name() -> None:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(4, 4, bias=False)
+
+    class Spec:
+        num_experts = 0
+        is_expert = staticmethod(lambda name: False)
+        tp_spec = staticmethod(lambda name: None)
+        weight_map = staticmethod(lambda: {"proj.weight": ["hf.proj.weight"]})
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            assert name == "proj.weight"
+            return [("hf.proj.weight", tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+    model = Model()
+    expected = model.proj.weight.detach().clone()
+    stats = apply_qat_to_chunks(
+        [model], QATSpec(enabled=True, format="int8", group_size=-1)
+    )
+
+    assert stats["quantized_modules"] == 1
+    exported = dict(export_hf_weights(model, Spec(), ps))
+    assert exported.keys() == {"hf.proj.weight"}
+    assert torch.equal(exported["hf.proj.weight"], expected)
 
 
 def test_pp_export_never_materializes_the_whole_stage(monkeypatch) -> None:
