@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
     SafeTensorReader,
+    _resolve_param_name,
     export_hf_weights,
     load_hf_weights,
 )
@@ -35,6 +36,20 @@ def _parallel_state(*, tp_size=1, tp_rank=0):
             "etp_rank": 0,
         },
     )()
+
+
+def test_state_resolution_is_exact_and_rejects_duplicate_canonical_keys() -> None:
+    tensor = torch.ones(1)
+
+    assert _resolve_param_name("weight", {"module.weight": tensor}) is None
+    with pytest.raises(RuntimeError, match="duplicate canonical checkpoint state"):
+        _resolve_param_name(
+            "proj.weight",
+            {
+                "proj.weight": tensor,
+                "proj.parametrizations.weight.original": tensor,
+            },
+        )
 
 
 def test_reader_reuses_cpu_mmap_handle_then_moves_requested_tensor(

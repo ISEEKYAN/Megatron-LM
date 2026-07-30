@@ -152,6 +152,7 @@ def test_gpu_resident_export_is_bitwise_equal_to_legacy_cpu_export() -> None:
 
     class Spec:
         num_experts = 0
+        weight_map = staticmethod(lambda: {"weight": ["weight"]})
 
         @staticmethod
         def is_expert(name):
@@ -425,6 +426,12 @@ def test_export_batches_adjacent_tp_weights_into_one_flat_collective(
 
     class Spec:
         num_experts = 0
+        weight_map = staticmethod(
+            lambda: {
+                "first": ["first"],
+                "second": ["second"],
+            }
+        )
 
         @staticmethod
         def is_expert(name):
@@ -505,6 +512,13 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
 
     class Spec:
         num_experts = 4
+        weight_map = staticmethod(
+            lambda: {
+                f"{group}.experts.weight{idx}": [f"{group}.experts.packed"]
+                for group in ("first", "second")
+                for idx in range(2)
+            }
+        )
 
         @staticmethod
         def is_expert(name):
@@ -573,6 +587,9 @@ def test_packed_expert_export_rejects_incomplete_group() -> None:
 
     class Spec:
         num_experts = 4
+        weight_map = staticmethod(
+            lambda: {f"experts.weight{idx}": ["experts.packed"] for idx in range(3)}
+        )
 
         @staticmethod
         def is_expert(name):
@@ -630,6 +647,8 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
             lambda: {
                 "weight": ["weight"],
                 "router_bias": ["router_bias"],
+                "weight2": ["weight2"],
+                "router_bias2": ["router_bias2"],
             }
         )
         tp_spec = staticmethod(lambda name: None)
@@ -768,6 +787,94 @@ def test_qat_parametrized_parameter_exports_with_logical_name() -> None:
     assert torch.equal(exported["hf.proj.weight"], expected)
 
 
+def test_export_fails_loudly_when_mapped_hf_tensor_is_missing() -> None:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2))
+
+    class Spec:
+        num_experts = 0
+        is_expert = staticmethod(lambda name: False)
+        tp_spec = staticmethod(lambda name: None)
+        weight_map = staticmethod(
+            lambda: {
+                "weight": ["hf.weight"],
+                "missing": ["hf.missing"],
+            }
+        )
+        native_to_hf = staticmethod(lambda name, tensor: [(f"hf.{name}", tensor)])
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+
+    with pytest.raises(RuntimeError, match=r"coverage mismatch.*hf\.missing"):
+        list(export_hf_weights(Model(), Spec(), ps))
+
+
+def test_export_rejects_unexpected_and_duplicate_hf_tensors() -> None:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first = nn.Parameter(torch.ones(2))
+            self.second = nn.Parameter(torch.ones(2))
+
+    class Spec:
+        num_experts = 0
+        is_expert = staticmethod(lambda name: False)
+        tp_spec = staticmethod(lambda name: None)
+        weight_map = staticmethod(
+            lambda: {
+                "first": ["hf.first"],
+                "second": ["hf.second"],
+            }
+        )
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            if name == "first":
+                return [("hf.unexpected", tensor)]
+            return [("hf.second", tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+
+    with pytest.raises(RuntimeError, match=r"unexpected HF export tensor"):
+        list(export_hf_weights(Model(), Spec(), ps))
+
+    Spec.weight_map = staticmethod(
+        lambda: {
+            "first": ["hf.first"],
+            "second": ["hf.first"],
+        }
+    )
+    Spec.native_to_hf = staticmethod(lambda name, tensor: [("hf.first", tensor)])
+    with pytest.raises(RuntimeError, match=r"duplicate HF export tensor"):
+        list(export_hf_weights(Model(), Spec(), ps))
+
+
 def test_pp_export_never_materializes_the_whole_stage(monkeypatch) -> None:
     """Residency guard: with one-param buckets, pulling the first streamed param
     must visit exactly one of three stage params — the legacy path would have
@@ -792,6 +899,7 @@ def test_pp_export_never_materializes_the_whole_stage(monkeypatch) -> None:
 
     class Spec:
         num_experts = 0
+        weight_map = staticmethod(lambda: {name: [name] for name in params})
 
         @staticmethod
         def is_expert(name):

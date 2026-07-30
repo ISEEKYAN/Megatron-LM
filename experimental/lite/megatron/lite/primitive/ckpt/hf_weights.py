@@ -875,7 +875,7 @@ def _load_weight_map_for_model(
     state: dict[str, torch.Tensor],
 ) -> dict[str, list[str]]:
     """Build the one native-to-HF plan shared by load and export."""
-    logical_state_keys = tuple(canonical_state_key(name) for name in state)
+    logical_state_keys = tuple(_canonical_state_index(state))
     load_weight_map = getattr(spec, "load_weight_map", None)
     return (
         load_weight_map(base_model, ps, logical_state_keys)
@@ -904,6 +904,7 @@ def load_hf_weights(
     if callable(validate_load):
         validate_load(ps)
     state = base_model.state_dict()
+    canonical_state = _canonical_state_index(state)
     wmap = _load_weight_map_for_model(base_model, spec, ps, state)
 
     global_to_local: dict[int, int] = (
@@ -922,7 +923,7 @@ def load_hf_weights(
         mapped = remap_layer_index(native_name, global_to_local)
         if mapped is None:
             continue
-        actual = _resolve_param_name(mapped, state)
+        actual = _resolve_param_name(mapped, state, canonical_state)
         if actual is None:
             continue
         mapped_targets[actual] = (mapped, hf_names)
@@ -974,6 +975,7 @@ def load_hf_weights(
                     spec,
                     ps,
                     state,
+                    canonical_state,
                     targets,
                     expert_gid,
                     expert_shard,
@@ -982,7 +984,7 @@ def load_hf_weights(
                     loaded_names.add(loaded_name)
                 continue
 
-            actual = _resolve_param_name(mapped, state)
+            actual = _resolve_param_name(mapped, state, canonical_state)
             target = targets.get(actual) if actual is not None else None
             if target is None:
                 pp_size = int(getattr(ps, "pp_size", 1))
@@ -1117,6 +1119,7 @@ def _load_expert_weight(
     spec,
     ps,
     state,
+    canonical_state,
     targets,
     expert_gid,
     expert_shard,
@@ -1130,7 +1133,7 @@ def _load_expert_weight(
         return None
 
     local_name = spec.expert_local_name(native_name, expert_gid - local_start)
-    actual = _resolve_param_name(local_name, state)
+    actual = _resolve_param_name(local_name, state, canonical_state)
     target = targets.get(actual) if actual is not None else None
     if target is None:
         present_sources = _present_hf_sources(reader, spec, native_name, hf_names)
@@ -1298,16 +1301,31 @@ def _present_hf_sources(
     return present
 
 
-def _resolve_param_name(name: str, state_dict: dict) -> str | None:
-    if name in state_dict:
-        return name
-    canonical = {canonical_state_key(key): key for key in state_dict}
-    if name in canonical:
-        return canonical[name]
-    for logical_name, key in canonical.items():
-        if name in logical_name:
-            return key
-    return None
+def _canonical_state_index(state_dict: dict) -> dict[str, str]:
+    canonical: dict[str, str] = {}
+    for key in state_dict:
+        logical_name = canonical_state_key(key)
+        previous = canonical.get(logical_name)
+        if previous is not None and previous != key:
+            raise RuntimeError(
+                "duplicate canonical checkpoint state: "
+                f"{logical_name!r} from {previous!r} and {key!r}"
+            )
+        canonical[logical_name] = key
+    return canonical
+
+
+def _resolve_param_name(
+    name: str,
+    state_dict: dict,
+    canonical_state: dict[str, str] | None = None,
+) -> str | None:
+    canonical = (
+        _canonical_state_index(state_dict)
+        if canonical_state is None
+        else canonical_state
+    )
+    return canonical.get(name)
 
 
 def _merge_dense_shards(
@@ -1328,7 +1346,7 @@ def _merge_dense_shards(
     return torch.cat(shards, dim=split_dim)
 
 
-def export_hf_weights(
+def _export_hf_weights_unchecked(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,
     ps,
@@ -1642,6 +1660,54 @@ def export_hf_weights(
                 del tensor
             del bucket
     return
+
+
+def export_hf_weights(
+    model: nn.Module | list[nn.Module],
+    spec: HFWeights,
+    ps,
+    *,
+    vocab_size: int | None = None,
+    limit: int | None = None,
+    rank0_only: bool = False,
+    export_dtype: str | torch.dtype | None = None,
+    cpu: bool = False,
+    buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Export HF weights and fail loudly on incomplete static-map coverage."""
+    weight_map = spec.weight_map()
+    validate = bool(weight_map) and limit is None
+    expected = (
+        {hf_name for hf_names in weight_map.values() for hf_name in hf_names}
+        if validate
+        else set()
+    )
+    seen: set[str] = set()
+    emit = not (rank0_only and dist.is_initialized() and dist.get_rank() != 0)
+
+    for hf_name, tensor in _export_hf_weights_unchecked(
+        model,
+        spec,
+        ps,
+        vocab_size=vocab_size,
+        limit=limit,
+        rank0_only=rank0_only,
+        export_dtype=export_dtype,
+        cpu=cpu,
+        buffer_max_size_bytes=buffer_max_size_bytes,
+    ):
+        if validate and emit:
+            if hf_name not in expected:
+                raise RuntimeError(f"unexpected HF export tensor: {hf_name}")
+            if hf_name in seen:
+                raise RuntimeError(f"duplicate HF export tensor: {hf_name}")
+            seen.add(hf_name)
+        yield hf_name, tensor
+
+    if validate and emit:
+        missing = sorted(expected - seen)
+        if missing:
+            raise RuntimeError(f"HF export coverage mismatch: missing={missing[:8]}")
 
 
 def _gather_dense(
