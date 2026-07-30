@@ -136,6 +136,10 @@ class HFWeights(Protocol):
         """
         return None
 
+    def fused_pairs(self, native_name: str) -> tuple[str, str] | None:
+        """Return ordered logical parts for a fused native tensor, if declared."""
+        return None
+
     @property
     def num_experts(self) -> int:
         """Total number of experts (needed for EP gather index math)."""
@@ -1368,6 +1372,17 @@ def _resolve_param_name(
     return canonical.get(name)
 
 
+def _is_fused_gate_up(spec: HFWeights, native_name: str) -> bool:
+    """Use the spec's semantic declaration; retain legacy name fallback temporarily."""
+    fused_pairs = getattr(spec, "fused_pairs", None)
+    if callable(fused_pairs):
+        declared = fused_pairs(native_name)
+        if declared is not None:
+            return declared == ("gate", "up")
+    # Compatibility for unported specs.  New specs must declare fused_pairs().
+    return "gate_up" in native_name or "fc1" in native_name
+
+
 def _merge_dense_shards(
     name: str, tensor: torch.Tensor, shards: list[torch.Tensor], spec: HFWeights
 ) -> torch.Tensor:
@@ -1383,7 +1398,7 @@ def _merge_dense_shards(
     split_dim, tp_or_etp = tp_info
     if tp_or_etp != 0:
         return tensor
-    if split_dim == 0 and ("gate_up" in name or ".fc1." in name):
+    if split_dim == 0 and _is_fused_gate_up(spec, name):
         return _merge_gate_up_shards(shards)
     return torch.cat(shards, dim=split_dim)
 
@@ -1766,7 +1781,7 @@ def _gather_dense(
     if tp_info is not None and ps.tp_size > 1:
         split_d, tp_or_etp = tp_info
         if tp_or_etp == 0:
-            if split_d == 0 and ("gate_up" in name or ".fc1." in name):
+            if split_d == 0 and _is_fused_gate_up(spec, name):
                 tensor = gather_gate_up(tensor, ps.tp_size, ps.tp_group)
             else:
                 tensor = allgather_concat(tensor, ps.tp_size, ps.tp_group, dim=split_d)
@@ -1806,7 +1821,7 @@ def _gather_expert_etp(
         tp_info = spec.tp_spec(name)
         if tp_info is not None:
             split_d, _ = tp_info
-            if "fc1" in name:
+            if _is_fused_gate_up(spec, name):
                 return gather_gate_up(tensor, ps.etp_size, ps.etp_group)
             return allgather_concat(tensor, ps.etp_size, ps.etp_group, dim=split_d)
     return tensor

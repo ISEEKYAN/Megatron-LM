@@ -255,6 +255,8 @@ class DeepseekV4WeightSpec:
             raise NotImplementedError(
                 "DeepSeek V4 direct HF load currently supports only TP=ETP=1."
             )
+        # Keep this TP=1 guard: generic fused gate/up export cannot be treated as
+        # validated for DS4 until CSA gains a real TP implementation.
 
     def load_weight_map(
         self,
