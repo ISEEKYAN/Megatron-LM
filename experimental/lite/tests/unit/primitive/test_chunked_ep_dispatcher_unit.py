@@ -164,6 +164,14 @@ def test_fixed_capacity_dispatch_resolves_global_local_expert_counts(monkeypatch
     monkeypatch.setattr(
         dispatcher_module, "_event_current_stream_wait", lambda _event: None
     )
+    capacity_checks = []
+    monkeypatch.setattr(
+        torch,
+        "_assert_async",
+        lambda condition, message: capacity_checks.append(
+            (bool(condition.item()), message)
+        ),
+    )
     value = _dispatcher(Buffer())
     value.ps = SimpleNamespace(tp_ep_group=object(), ep_rank=1)
     monkeypatch.setattr(dispatcher_module.dist, "all_reduce", all_reduce)
@@ -171,13 +179,63 @@ def test_fixed_capacity_dispatch_resolves_global_local_expert_counts(monkeypatch
     scores = torch.ones(3, 1)
     indices = torch.zeros(3, 1, dtype=torch.long)
 
-    state = value.submit_deepep_dispatch(hidden, scores, indices, num_worst_tokens=24)
+    state = value.submit_deepep_dispatch(hidden, scores, indices, num_worst_tokens=80)
     recv_per_expert = value._resolve_deepep_recv_per_expert(state)
 
-    assert value.buffer.dispatch_calls[0][1]["num_worst_tokens"] == 24
-    assert state["capacity_rows"] == 24
+    assert value.buffer.dispatch_calls[0][1]["num_worst_tokens"] == 80
+    assert state["capacity_rows"] == 80
     assert recv_per_expert == [33, 44]
     assert work.waited
+    assert capacity_checks == [
+        (True, "DeepEP receive rows exceed the fixed dispatch capacity")
+    ]
+
+
+def test_fixed_capacity_dispatch_fails_before_deepep_when_receive_rows_exceed_bound(
+    monkeypatch,
+):
+    class Work:
+        def wait(self):
+            return None
+
+    class Buffer(_Buffer):
+        def get_dispatch_layout(self, _topk_indices, **_kwargs):
+            return (
+                torch.zeros(2, dtype=torch.int32),
+                None,
+                torch.tensor([11, 22, 33, 44], dtype=torch.int32),
+                torch.zeros(3, 2, dtype=torch.bool),
+                _Event(),
+            )
+
+    def fail_loud(condition, message):
+        if not bool(condition.item()):
+            raise RuntimeError(message)
+
+    buffer = Buffer()
+    value = _dispatcher(buffer)
+    value.ps = SimpleNamespace(tp_ep_group=object(), ep_rank=1)
+    monkeypatch.setattr(
+        dispatcher_module, "_event_current_stream_wait", lambda _event: None
+    )
+    monkeypatch.setattr(
+        dispatcher_module.dist,
+        "all_reduce",
+        lambda _counts, group, async_op: Work(),
+    )
+    monkeypatch.setattr(torch, "_assert_async", fail_loud)
+
+    with pytest.raises(
+        RuntimeError, match="DeepEP receive rows exceed the fixed dispatch capacity"
+    ):
+        value.submit_deepep_dispatch(
+            torch.zeros(3, 2),
+            torch.ones(3, 1),
+            torch.zeros(3, 1, dtype=torch.long),
+            num_worst_tokens=76,
+        )
+
+    assert buffer.dispatch_calls == []
 
 
 def test_prepared_combine_preserves_manual_metadata_and_finishes(monkeypatch):

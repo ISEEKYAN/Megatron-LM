@@ -723,6 +723,14 @@ class TokenDispatcher:
                 group=self.ps.tp_ep_group,
                 async_op=True,
             )
+            recv_counts_work.wait()
+            start = self.ps.ep_rank * self.num_local_experts
+            end = start + self.num_local_experts
+            torch._assert_async(
+                recv_counts[start:end].sum() <= num_worst_tokens,
+                "DeepEP receive rows exceed the fixed dispatch capacity",
+            )
+            recv_counts_work = None
 
         hidden_states_contig = hidden_states.contiguous()
         recv_hidden, recv_indices, recv_probs, recv_per_expert, handle, event = (
@@ -759,9 +767,10 @@ class TokenDispatcher:
             return recv_per_expert
         recv_counts = state.pop("recv_counts", None)
         recv_counts_work = state.pop("recv_counts_work", None)
-        if recv_counts is None or recv_counts_work is None:
+        if recv_counts is None:
             return recv_per_expert
-        recv_counts_work.wait()
+        if recv_counts_work is not None:
+            recv_counts_work.wait()
         start = self.ps.ep_rank * self.num_local_experts
         end = start + self.num_local_experts
         return recv_counts[start:end].tolist()
