@@ -277,6 +277,16 @@ class SafeTensorReader:
                 tensor = f.get_tensor(name)
         return tensor if device.type == "cpu" else tensor.to(device)
 
+    def get_raw_tensor(
+        self,
+        name: str,
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Read one explicitly mapped physical source without dequantizing it."""
+        target_device = torch.device(self.device if device is None else device)
+        return self._get_raw_tensor(name, target_device)
+
     def _get_groupwise_int4(self, name: str, device: torch.device) -> torch.Tensor:
         packed = self._get_raw_tensor(f"{name}_packed", device)
         scale = self._get_raw_tensor(f"{name}_scale", device)
@@ -1242,6 +1252,12 @@ def _read_hf_tensors(
 ) -> list[torch.Tensor]:
     candidate_hook = getattr(spec, "hf_name_candidates", None)
     shape_hook = getattr(spec, "hf_target_shape", None)
+    mapped_sources = set(hf_names)
+    explicit_packed_scale = any(
+        name.endswith("_packed")
+        and f"{name.removesuffix('_packed')}_scale" in mapped_sources
+        for name in hf_names
+    )
     tensors: list[torch.Tensor] = []
     for index, hf_name in enumerate(hf_names):
         candidates = (
@@ -1263,12 +1279,20 @@ def _read_hf_tensors(
             )
         else:
             target_shape = None
-        tensor = reader.get_tensor(
-            resolved,
-            device=target.device,
-            target_shape=target_shape,
-            target_dtype=target.dtype,
-        )
+        if explicit_packed_scale:
+            raw_reader = getattr(reader, "get_raw_tensor", None)
+            tensor = (
+                raw_reader(resolved, device=target.device)
+                if callable(raw_reader)
+                else reader.get_tensor(resolved, device=target.device)
+            )
+        else:
+            tensor = reader.get_tensor(
+                resolved,
+                device=target.device,
+                target_shape=target_shape,
+                target_dtype=target.dtype,
+            )
         transform_source = getattr(spec, "transform_hf_source", None)
         if callable(transform_source):
             tensor = transform_source(native_name, index, resolved, tensor)
