@@ -238,6 +238,11 @@ def test_tp2_export_reassembles_fused_gate_up_before_hf_split() -> None:
 
     class Spec:
         @staticmethod
+        def fused_split(name):
+            assert name == "layers.0.mlp.gate_up.linear.weight"
+            return ("gate", "up")
+
+        @staticmethod
         def tp_spec(name):
             assert name == "layers.0.mlp.gate_up.linear.weight"
             return (0, 0)
@@ -266,6 +271,11 @@ def test_pp_tp2_export_reassembles_fused_gate_up_before_hf_split(
     ]
 
     class Spec:
+        @staticmethod
+        def fused_split(name):
+            assert name == "layers.0.mlp.gate_up.linear.weight"
+            return ("gate", "up")
+
         @staticmethod
         def tp_spec(name):
             assert name == "layers.0.mlp.gate_up.linear.weight"

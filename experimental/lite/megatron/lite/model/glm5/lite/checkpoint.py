@@ -307,7 +307,7 @@ class Glm5WeightSpec:
         del native_name
         return None
 
-    def fused_pairs(self, native_name: str) -> tuple[str, str] | None:
+    def fused_split(self, native_name: str) -> tuple[str, ...] | None:
         if (
             native_name.endswith(".gate_up.linear.weight")
             or ".experts.fc1." in native_name

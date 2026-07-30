@@ -136,8 +136,8 @@ class HFWeights(Protocol):
         """
         return None
 
-    def fused_pairs(self, native_name: str) -> tuple[str, str] | None:
-        """Return ordered logical parts for a fused native tensor, if declared."""
+    def fused_split(self, native_name: str) -> tuple[str, ...] | None:
+        """Return ordered dim-0 logical parts for a fused native tensor."""
         return None
 
     @property
@@ -1373,14 +1373,9 @@ def _resolve_param_name(
 
 
 def _is_fused_gate_up(spec: HFWeights, native_name: str) -> bool:
-    """Use the spec's semantic declaration; retain legacy name fallback temporarily."""
-    fused_pairs = getattr(spec, "fused_pairs", None)
-    if callable(fused_pairs):
-        declared = fused_pairs(native_name)
-        if declared is not None:
-            return declared == ("gate", "up")
-    # Compatibility for unported specs.  New specs must declare fused_pairs().
-    return "gate_up" in native_name or "fc1" in native_name
+    """Only an explicit spec contract may select fused gate/up reassembly."""
+    fused_split = getattr(spec, "fused_split", None)
+    return bool(callable(fused_split) and fused_split(native_name) == ("gate", "up"))
 
 
 def _merge_dense_shards(
