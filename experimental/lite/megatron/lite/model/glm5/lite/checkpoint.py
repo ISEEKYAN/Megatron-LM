@@ -207,6 +207,15 @@ class Glm5WeightSpec:
     def is_export_buffer(native_name: str) -> bool:
         return native_name.endswith(".moe.router.expert_bias")
 
+    @staticmethod
+    def expected_buffers(base_model: nn.Module, ps) -> tuple[str, ...]:
+        del ps
+        return tuple(
+            name
+            for name, _buffer in base_model.named_buffers(remove_duplicate=False)
+            if name.endswith(".moe.router.expert_bias")
+        )
+
     # GLM-5 ONLY: DSA attention native suffix -> HF suffix.  The wrapper places
     # the DSA module under `self_attention.self_attention.*`; the HF model uses
     # `self_attn.*` with identical submodule names.

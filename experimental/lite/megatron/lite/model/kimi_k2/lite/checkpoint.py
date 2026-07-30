@@ -206,6 +206,15 @@ class KimiK2WeightSpec:
     def is_export_buffer(native_name: str) -> bool:
         return native_name.endswith(".moe.router.expert_bias")
 
+    @staticmethod
+    def expected_buffers(base_model: nn.Module, ps) -> tuple[str, ...]:
+        del ps
+        return tuple(
+            name
+            for name, _buffer in base_model.named_buffers(remove_duplicate=False)
+            if name.endswith(".moe.router.expert_bias")
+        )
+
     def native_to_hf(
         self, native_name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:

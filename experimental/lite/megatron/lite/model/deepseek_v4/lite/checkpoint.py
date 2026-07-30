@@ -285,6 +285,26 @@ class DeepseekV4WeightSpec:
                 weight_map[mapped_name] = hf_names
         return weight_map
 
+    def expected_buffers(
+        self, base_model: nn.Module, ps: ParallelState
+    ) -> tuple[str, ...]:
+        del ps
+        layer_map = (
+            {
+                local_idx: base_model.layer_indices[local_idx]
+                for local_idx in range(len(base_model.layer_indices))
+            }
+            if hasattr(base_model, "layer_indices")
+            else {}
+        )
+        return tuple(
+            name
+            for name, _buffer in base_model.named_buffers(remove_duplicate=False)
+            if _router_buffer_matches_layer_kind(
+                to_global_layer_name(name, layer_map), self.config
+            )
+        )
+
     def hf_to_native(
         self, native_name: str, hf_tensors: list[torch.Tensor]
     ) -> torch.Tensor:
