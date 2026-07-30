@@ -196,16 +196,6 @@ class KimiK2WeightSpec:
             )
         return candidates
 
-    @staticmethod
-    def optional_for_load(native_name: str) -> str | None:
-        if native_name.endswith(".moe.router.expert_bias"):
-            return "the Kimi K2 model constructor owns the router bias default"
-        return None
-
-    @staticmethod
-    def is_export_buffer(native_name: str) -> bool:
-        return native_name.endswith(".moe.router.expert_bias")
-
     def native_to_hf(
         self, native_name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:

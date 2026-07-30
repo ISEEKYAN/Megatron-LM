@@ -136,15 +136,6 @@ class HFWeights(Protocol):
         """
         return None
 
-    def expected_buffers(self, base_model: nn.Module, ps) -> Iterable[str]:
-        """Persistent model buffers that must be restored from the checkpoint.
-
-        The default is empty so model-owned caches and other undeclared buffers
-        retain the historical load behavior.
-        """
-        del base_model, ps
-        return ()
-
     @property
     def num_experts(self) -> int:
         """Total number of experts (needed for EP gather index math)."""
@@ -877,6 +868,22 @@ def gather_gate_up(
 # ======================================================================
 
 
+def _load_weight_map_for_model(
+    base_model: nn.Module,
+    spec: HFWeights,
+    ps,
+    state: dict[str, torch.Tensor],
+) -> dict[str, list[str]]:
+    """Build the one native-to-HF plan shared by load and export."""
+    logical_state_keys = tuple(canonical_state_key(name) for name in state)
+    load_weight_map = getattr(spec, "load_weight_map", None)
+    return (
+        load_weight_map(base_model, ps, logical_state_keys)
+        if callable(load_weight_map)
+        else spec.weight_map()
+    )
+
+
 def load_hf_weights(
     model: nn.Module,
     hf_path: str,
@@ -897,13 +904,7 @@ def load_hf_weights(
     if callable(validate_load):
         validate_load(ps)
     state = base_model.state_dict()
-    logical_state_keys = tuple(canonical_state_key(name) for name in state)
-    load_weight_map = getattr(spec, "load_weight_map", None)
-    wmap = (
-        load_weight_map(base_model, ps, logical_state_keys)
-        if callable(load_weight_map)
-        else spec.weight_map()
-    )
+    wmap = _load_weight_map_for_model(base_model, spec, ps, state)
 
     global_to_local: dict[int, int] = (
         {gi: li for li, gi in enumerate(base_model.layer_indices)}
@@ -914,40 +915,35 @@ def load_hf_weights(
     targets = dict(base_model.named_parameters(remove_duplicate=False))
     targets.update(dict(base_model.named_buffers(remove_duplicate=False)))
     loaded_names: set[str] = set()
-    expected_buffers_hook = getattr(spec, "expected_buffers", None)
-    expected_buffers = (
-        set(expected_buffers_hook(base_model, ps))
-        if callable(expected_buffers_hook)
-        else set()
-    )
     named_buffers = dict(base_model.named_buffers(remove_duplicate=False))
-    invalid_expected = expected_buffers - named_buffers.keys()
-    if invalid_expected:
-        raise ValueError(
-            f"{type(spec).__name__}.expected_buffers() declared names that are "
-            f"not model buffers: {sorted(invalid_expected)!r}"
-        )
-    nonpersistent_expected = expected_buffers - state.keys()
-    if nonpersistent_expected:
-        raise ValueError(
-            f"{type(spec).__name__}.expected_buffers() declared non-persistent "
-            f"buffers: {sorted(nonpersistent_expected)!r}"
-        )
+    mapped_targets: dict[str, tuple[str, list[str]]] = {}
+    required_buffers: dict[str, tuple[str, list[str]]] = {}
+    for native_name, hf_names in wmap.items():
+        mapped = remap_layer_index(native_name, global_to_local)
+        if mapped is None:
+            continue
+        actual = _resolve_param_name(mapped, state)
+        if actual is None:
+            continue
+        mapped_targets[actual] = (mapped, hf_names)
+        if actual in named_buffers:
+            required_buffers[actual] = (mapped, hf_names)
+
     optional_for_load = getattr(spec, "optional_for_load", None)
-    conflicting_buffer_contracts = (
+    conflicting_load_contracts = (
         {
-            name
-            for name in expected_buffers
-            if optional_for_load(name) not in (None, False)
+            actual
+            for actual, (mapped, _hf_names) in mapped_targets.items()
+            if optional_for_load(mapped) not in (None, False)
         }
         if callable(optional_for_load)
         else set()
     )
-    if conflicting_buffer_contracts:
+    if conflicting_load_contracts:
         raise ValueError(
-            f"{type(spec).__name__} declares {sorted(conflicting_buffer_contracts)!r} "
-            "in both expected_buffers() and optional_for_load(); checkpoint state "
-            "cannot be both required and optional"
+            f"{type(spec).__name__} declares {sorted(conflicting_load_contracts)!r} "
+            "as required in weight_map()/load_weight_map() but optional in "
+            "optional_for_load(); checkpoint state cannot be both required and optional"
         )
     num_experts_total = getattr(spec, "num_experts", None)
     expert_shard = None
@@ -1038,6 +1034,12 @@ def load_hf_weights(
             try:
                 hf_tensors = _read_hf_tensors(reader, spec, mapped, hf_names, target)
             except KeyError as error:
+                if actual in required_buffers:
+                    raise RuntimeError(
+                        f"{type(spec).__name__} expected checkpoint buffer "
+                        f"{actual!r} from HF tensor(s) {hf_names!r}, but no "
+                        "candidate exists in the checkpoint"
+                    ) from error
                 _handle_missing_hf_tensors(spec, mapped, hf_names, error)
                 continue
             tensor = spec.hf_to_native(mapped, hf_tensors)
@@ -1100,7 +1102,7 @@ def load_hf_weights(
             continue
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
-    missing_expected_buffers = expected_buffers - loaded_names
+    missing_expected_buffers = required_buffers.keys() - loaded_names
     if missing_expected_buffers:
         raise RuntimeError(
             f"{type(spec).__name__} expected checkpoint buffer(s) were not "
@@ -1356,10 +1358,10 @@ def export_hf_weights(
     resolved_export_dtype = _resolve_export_dtype(export_dtype)
 
     def _iter_native_tensors():
-        """Yield parameters plus model-declared persistent export buffers."""
-        is_export_buffer = getattr(spec, "is_export_buffer", None)
+        """Yield parameters plus persistent buffers present in the HF load plan."""
         for chunk in chunks:
             base_chunk = unwrap_model(chunk)
+            state = base_chunk.state_dict()
             layer_map = (
                 {
                     i: base_chunk.layer_indices[i]
@@ -1370,11 +1372,30 @@ def export_hf_weights(
             )
             for name, param in base_chunk.named_parameters():
                 yield to_global_layer_name(name, layer_map), param.data.detach()
-            if callable(is_export_buffer):
-                for name, buffer in base_chunk.named_buffers():
-                    global_name = to_global_layer_name(name, layer_map)
-                    if is_export_buffer(global_name):
-                        yield global_name, buffer.detach()
+            persistent_buffers = [
+                (name, buffer)
+                for name, buffer in base_chunk.named_buffers()
+                if name in state
+            ]
+            if not persistent_buffers:
+                continue
+            wmap = _load_weight_map_for_model(base_chunk, spec, ps, state)
+            for name, buffer in persistent_buffers:
+                global_name = to_global_layer_name(name, layer_map)
+                if global_name in wmap:
+                    exported_names = [
+                        hf_name
+                        for hf_name, _tensor in spec.native_to_hf(
+                            global_name, buffer.detach()
+                        )
+                    ]
+                    if exported_names != wmap[global_name]:
+                        raise RuntimeError(
+                            f"{type(spec).__name__} maps persistent buffer "
+                            f"{global_name!r} to {wmap[global_name]!r} for load "
+                            f"but to {exported_names!r} for export"
+                        )
+                    yield global_name, buffer.detach()
 
     if ps.pp_size <= 1:
         exported_params = 0

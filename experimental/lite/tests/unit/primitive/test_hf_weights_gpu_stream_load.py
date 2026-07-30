@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
     SafeTensorReader,
+    export_hf_weights,
     load_hf_weights,
 )
 
@@ -280,12 +281,6 @@ def test_persistent_buffer_is_loaded_by_generic_loader(monkeypatch) -> None:
             return {"router_expert_bias": ["hf.router.expert_bias"]}
 
         @staticmethod
-        def expected_buffers(base_model, ps):
-            assert base_model is model
-            assert ps.ep_size == 1
-            return ("router_expert_bias",)
-
-        @staticmethod
         def expert_global_id(name):
             return None
 
@@ -306,7 +301,7 @@ def test_persistent_buffer_is_loaded_by_generic_loader(monkeypatch) -> None:
     assert torch.equal(model.router_expert_bias, expected)
 
 
-def test_declared_expected_buffer_missing_from_checkpoint_fails(monkeypatch) -> None:
+def test_mapped_persistent_buffer_missing_from_checkpoint_fails(monkeypatch) -> None:
     _stub_parallel_import(monkeypatch)
 
     class Model(nn.Module):
@@ -324,18 +319,20 @@ def test_declared_expected_buffer_missing_from_checkpoint_fails(monkeypatch) -> 
         def __exit__(self, exc_type, exc, traceback):
             pass
 
+        @staticmethod
+        def first_available(names):
+            raise KeyError(names[0])
+
     class Spec:
         num_experts = 0
 
         @staticmethod
         def weight_map():
-            return {}
+            return {"router_expert_bias": ["hf.router_expert_bias"]}
 
         @staticmethod
-        def expected_buffers(base_model, ps):
-            assert isinstance(base_model, Model)
-            assert ps.ep_size == 1
-            return ("router_expert_bias",)
+        def expert_global_id(name):
+            return None
 
     monkeypatch.setattr(
         "megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader
@@ -343,7 +340,7 @@ def test_declared_expected_buffer_missing_from_checkpoint_fails(monkeypatch) -> 
 
     with pytest.raises(
         RuntimeError,
-        match=r"Spec.*expected checkpoint buffer.*router_expert_bias",
+        match=r"Spec.*router_expert_bias.*hf\.router_expert_bias",
     ):
         load_hf_weights(Model(), "unused", Spec(), _parallel_state())
 
@@ -364,10 +361,6 @@ def test_buffer_cannot_be_both_optional_and_expected(monkeypatch) -> None:
             return {"router_expert_bias": ["hf.router.expert_bias"]}
 
         @staticmethod
-        def expected_buffers(base_model, ps):
-            return ("router_expert_bias",)
-
-        @staticmethod
         def optional_for_load(name):
             if name == "router_expert_bias":
                 return "the constructor owns the default"
@@ -376,7 +369,7 @@ def test_buffer_cannot_be_both_optional_and_expected(monkeypatch) -> None:
     with pytest.raises(
         ValueError,
         match=(
-            r"Spec.*router_expert_bias.*expected_buffers\(\)"
+            r"Spec.*router_expert_bias.*weight_map\(\)/load_weight_map\(\)"
             r".*optional_for_load\(\)"
         ),
     ):
@@ -461,6 +454,78 @@ def test_undeclared_buffer_adds_no_warning_or_failure(monkeypatch) -> None:
     assert torch.equal(model.rotary_cache, torch.ones(4))
 
 
+def test_nonpersistent_primitive_router_bias_needs_no_checkpoint(
+    tmp_path,
+    transformer_engine_import_stub,
+) -> None:
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.router import TopKRouter
+
+    router = TopKRouter(
+        SimpleNamespace(
+            num_experts_per_tok=1,
+            num_experts=2,
+            router_aux_loss_coef=0.0,
+            hidden_size=4,
+        ),
+        SimpleNamespace(tp_size=1, tp_group=None),
+    )
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def weight_map():
+            return {"gate.weight": ["hf.gate.weight"]}
+
+        @staticmethod
+        def expert_global_id(name):
+            return None
+
+        @staticmethod
+        def hf_to_native(name, tensors):
+            return tensors[0]
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+        @staticmethod
+        def is_expert(name):
+            return False
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [("hf.gate.weight", tensor)]
+
+    save_file(
+        {"hf.gate.weight": torch.ones_like(router.gate.weight)},
+        str(tmp_path / "model.safetensors"),
+    )
+
+    load_hf_weights(router, str(tmp_path), Spec(), _parallel_state())
+
+    assert "expert_bias" not in router.state_dict()
+    assert torch.equal(router.expert_bias, torch.zeros(2))
+    assert torch.equal(router.gate.weight, torch.ones_like(router.gate.weight))
+
+    export_ps = SimpleNamespace(
+        pp_size=1,
+        tp_size=1,
+        tp_group=None,
+        ep_size=1,
+        ep_group=None,
+        etp_size=1,
+        etp_group=None,
+    )
+    exported = dict(export_hf_weights(router, Spec(), export_ps))
+    assert set(exported) == {"hf.gate.weight"}
+
+
 def test_missing_required_hf_tensor_fails_with_spec_and_key_context(
     monkeypatch,
 ) -> None:
@@ -503,7 +568,7 @@ def test_missing_required_hf_tensor_fails_with_spec_and_key_context(
         load_hf_weights(model, "unused", RequiredSpec(), _parallel_state())
 
 
-def test_missing_optional_hf_tensor_warns_and_preserves_constructor_value(
+def test_mapped_parameter_cannot_be_optional(
     monkeypatch,
 ) -> None:
     _stub_parallel_import(monkeypatch)
@@ -544,9 +609,10 @@ def test_missing_optional_hf_tensor_warns_and_preserves_constructor_value(
         "megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader
     )
 
-    with pytest.warns(
-        RuntimeWarning,
-        match=r"OptionalSpec.*weight.*model constructor owns the default value",
+    with pytest.raises(
+        ValueError,
+        match=r"OptionalSpec.*weight.*weight_map\(\)/load_weight_map\(\)"
+        r".*optional_for_load\(\)",
     ):
         load_hf_weights(model, "unused", OptionalSpec(), _parallel_state())
     assert model.weight.item() == 11

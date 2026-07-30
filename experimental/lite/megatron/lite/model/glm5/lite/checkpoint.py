@@ -195,18 +195,6 @@ class Glm5WeightSpec:
             )
         return candidates
 
-    @staticmethod
-    def optional_for_load(native_name: str) -> str | None:
-        if native_name.endswith(".moe.router.expert_bias"):
-            return "the GLM5 model constructor owns the router bias default"
-        if native_name.endswith(".indexer.k_norm.bias"):
-            return "the GLM5 model constructor owns the indexer norm bias default"
-        return None
-
-    @staticmethod
-    def is_export_buffer(native_name: str) -> bool:
-        return native_name.endswith(".moe.router.expert_bias")
-
     # GLM-5 ONLY: DSA attention native suffix -> HF suffix.  The wrapper places
     # the DSA module under `self_attention.self_attention.*`; the HF model uses
     # `self_attn.*` with identical submodule names.
