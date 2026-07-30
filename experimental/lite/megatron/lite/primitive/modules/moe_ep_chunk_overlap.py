@@ -886,11 +886,17 @@ def _dispatch_local_backward(
 ) -> tuple[torch.Tensor, torch.Tensor, list[Any]]:
     row_id_map = chunk.row_id_map.reshape(-1).to(torch.long)
     leases = []
-    use_fixed_scratch = (
-        chunk.recv_capacity_rows is not None
-        and chunk.recv_hidden_shape[0] <= chunk.recv_capacity_rows
-        and chunk.recv_probs_shape[0] <= chunk.recv_capacity_rows
-    )
+    if chunk.recv_capacity_rows is not None and (
+        chunk.recv_hidden_shape[0] > chunk.recv_capacity_rows
+        or chunk.recv_probs_shape[0] > chunk.recv_capacity_rows
+    ):
+        raise ValueError(
+            "EP chunk backward receive rows exceed fixed capacity: "
+            f"hidden_rows={chunk.recv_hidden_shape[0]} "
+            f"probs_rows={chunk.recv_probs_shape[0]} "
+            f"capacity_rows={chunk.recv_capacity_rows}"
+        )
+    use_fixed_scratch = chunk.recv_capacity_rows is not None
     if not use_fixed_scratch:
         grad_recv_hidden = torch.zeros(
             chunk.recv_hidden_shape,

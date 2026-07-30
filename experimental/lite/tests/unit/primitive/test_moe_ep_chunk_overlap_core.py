@@ -207,7 +207,7 @@ def test_dispatch_local_backward_materializes_zero_probability_gradient(
         lease.release()
 
 
-def test_dispatch_local_backward_falls_back_when_recv_rows_exceed_fixed_capacity(
+def test_dispatch_local_backward_fails_when_recv_rows_exceed_fixed_capacity(
     transformer_engine_import_stub,
 ):
     transformer_engine_import_stub()
@@ -226,15 +226,12 @@ def test_dispatch_local_backward_falls_back_when_recv_rows_exceed_fixed_capacity
         recv_capacity_rows=2,
     )
 
-    grad_hidden, grad_probs, leases = _dispatch_local_backward(
-        chunk,
-        torch.ones(3, 2),
-        torch.ones(3),
-    )
-
-    assert grad_hidden.shape == (3, 2)
-    assert grad_probs.shape == (3, 2)
-    assert leases == []
+    with pytest.raises(ValueError, match="exceed fixed capacity"):
+        _dispatch_local_backward(
+            chunk,
+            torch.ones(3, 2),
+            torch.ones(3),
+        )
 
 
 def test_accumulate_reuses_first_chunk_gradient_storage(
