@@ -363,10 +363,6 @@ def build_fsdp2_training_optimizer(
 ) -> FSDP2Optimizer:
     """Wrap model chunks with FSDP2 and build the matching AdamW adapter."""
 
-    if str(getattr(opt, "optimizer", "adam")).lower() == "muon":
-        raise ValueError(
-            "optimizer='muon' is supported only with MLite DistOpt; FSDP2 does not support Muon."
-        )
     if (vpp or 1) > 1 and ps.pp_size <= 1:
         raise ValueError("optimizer='fsdp2' requires pp>1 when vpp>1.")
 

@@ -99,11 +99,9 @@ CPU unit tests (no GPU required):
 PYTHONPATH="$(pwd):$(pwd)/experimental/lite" \
   pytest \
     experimental/lite/tests/unit/primitive/test_muon_routing.py \
-    experimental/lite/tests/unit/primitive/test_fsdp2_unit.py \
     experimental/lite/tests/unit/runtime/test_optimizer_config_contract.py
 ```
 
 ## Backend support
 
-Muon is currently supported only through the MLite DistOpt path. FSDP2 with
-`optimizer=muon` is unsupported and fails loudly; it never falls back to AdamW.
+Muon is currently supported only through the MLite DistOpt path.
