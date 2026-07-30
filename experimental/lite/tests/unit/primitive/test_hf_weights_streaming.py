@@ -22,6 +22,7 @@ if importlib.util.find_spec("safetensors") is None:
 
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
+    _gather_dense,
     _iter_bucketed_materialized_tensors,
     _merge_dense_shards,
     bucketed_all_gather_into_tensor,
@@ -246,6 +247,49 @@ def test_tp2_export_reassembles_fused_gate_up_before_hf_split() -> None:
         shards[0],
         shards,
         Spec(),
+    )
+
+    assert torch.equal(merged, torch.cat((gate, up), dim=0))
+
+
+def test_pp_tp2_export_reassembles_fused_gate_up_before_hf_split(
+    monkeypatch,
+) -> None:
+    gate = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    up = torch.arange(100, 116, dtype=torch.float32).reshape(8, 2)
+    shards = [
+        torch.cat(
+            (gate.chunk(2, dim=0)[rank], up.chunk(2, dim=0)[rank]),
+            dim=0,
+        )
+        for rank in range(2)
+    ]
+
+    class Spec:
+        @staticmethod
+        def tp_spec(name):
+            assert name == "layers.0.mlp.gate_up.linear.weight"
+            return (0, 0)
+
+    ps = type(
+        "ParallelState",
+        (),
+        {"tp_size": 2, "tp_group": "tp"},
+    )()
+
+    def fake_all_gather(output, tensor, group=None):
+        assert group == "tp"
+        assert torch.equal(tensor, shards[0])
+        for destination, shard in zip(output, shards, strict=True):
+            destination.copy_(shard)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    merged = _gather_dense(
+        "layers.0.mlp.gate_up.linear.weight",
+        shards[0],
+        Spec(),
+        ps,
+        cpu=False,
     )
 
     assert torch.equal(merged, torch.cat((gate, up), dim=0))

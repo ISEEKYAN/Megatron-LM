@@ -1766,7 +1766,10 @@ def _gather_dense(
     if tp_info is not None and ps.tp_size > 1:
         split_d, tp_or_etp = tp_info
         if tp_or_etp == 0:
-            tensor = allgather_concat(tensor, ps.tp_size, ps.tp_group, dim=split_d)
+            if split_d == 0 and ("gate_up" in name or ".fc1." in name):
+                tensor = gather_gate_up(tensor, ps.tp_size, ps.tp_group)
+            else:
+                tensor = allgather_concat(tensor, ps.tp_size, ps.tp_group, dim=split_d)
     return _maybe_cpu(tensor, cpu=cpu)
 
 
