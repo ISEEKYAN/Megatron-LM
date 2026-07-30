@@ -23,6 +23,7 @@ if importlib.util.find_spec("safetensors") is None:
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
     _iter_bucketed_materialized_tensors,
+    _merge_dense_shards,
     bucketed_all_gather_into_tensor,
     export_hf_weights,
     stream_export_to_shards,
@@ -221,6 +222,33 @@ def test_bucketed_all_gather_uses_bounded_flat_buffers(monkeypatch) -> None:
     assert torch.equal(gathered[0][2][1], bucket[0][1] + 100)
     assert torch.equal(gathered[1][2][0], bucket[1][1])
     assert torch.equal(gathered[1][2][1], bucket[1][1] + 100)
+
+
+def test_tp2_export_reassembles_fused_gate_up_before_hf_split() -> None:
+    gate = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    up = torch.arange(100, 116, dtype=torch.float32).reshape(8, 2)
+    shards = [
+        torch.cat(
+            (gate.chunk(2, dim=0)[rank], up.chunk(2, dim=0)[rank]),
+            dim=0,
+        )
+        for rank in range(2)
+    ]
+
+    class Spec:
+        @staticmethod
+        def tp_spec(name):
+            assert name == "layers.0.mlp.gate_up.linear.weight"
+            return (0, 0)
+
+    merged = _merge_dense_shards(
+        "layers.0.mlp.gate_up.linear.weight",
+        shards[0],
+        shards,
+        Spec(),
+    )
+
+    assert torch.equal(merged, torch.cat((gate, up), dim=0))
 
 
 def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:

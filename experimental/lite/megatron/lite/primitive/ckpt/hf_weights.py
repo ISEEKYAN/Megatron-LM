@@ -864,13 +864,19 @@ def to_global_layer_name(name: str, layer_map: dict[int, int]) -> str:
     return re.sub(r"layers\.(\d+)\.", _replace, name)
 
 
+def _merge_gate_up_shards(shards: list[torch.Tensor]) -> torch.Tensor:
+    ffn_local = shards[0].shape[0] // 2
+    gate_full = torch.cat([shard[:ffn_local] for shard in shards], dim=0)
+    up_full = torch.cat([shard[ffn_local:] for shard in shards], dim=0)
+    return torch.cat([gate_full, up_full], dim=0)
+
+
 def gather_gate_up(
     tensor: torch.Tensor, world_size: int, group: dist.ProcessGroup
 ) -> torch.Tensor:
-    ffn_local = tensor.shape[0] // 2
-    gate_full = allgather_concat(tensor[:ffn_local], world_size, group, dim=0)
-    up_full = allgather_concat(tensor[ffn_local:], world_size, group, dim=0)
-    return torch.cat([gate_full, up_full], dim=0)
+    shards = [torch.empty_like(tensor) for _ in range(world_size)]
+    dist.all_gather(shards, tensor.contiguous(), group=group)
+    return _merge_gate_up_shards(shards)
 
 
 # ======================================================================
@@ -1377,6 +1383,8 @@ def _merge_dense_shards(
     split_dim, tp_or_etp = tp_info
     if tp_or_etp != 0:
         return tensor
+    if split_dim == 0 and ("gate_up" in name or ".fc1." in name):
+        return _merge_gate_up_shards(shards)
     return torch.cat(shards, dim=split_dim)
 
 
