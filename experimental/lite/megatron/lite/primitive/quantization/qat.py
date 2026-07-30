@@ -685,9 +685,23 @@ def _quantizable_weight_owner(module: nn.Module) -> nn.Module | None:
     MLite parallel linears wrap the real GEMM as ``module.linear`` (TE) whose
     ``.weight`` is the parameter; plain ``nn.Linear`` owns ``.weight`` directly.
     MoE ``te.GroupedLinear`` experts expose a 3D stacked ``[E, out, in]`` weight
-    on the module itself and are fake-quantized per expert slice.
+    on the module itself and are fake-quantized per expert slice. Convolution
+    kernels may also be 2D/3D, but they are not GEMM weights and must not enter
+    this weight-only linear QAT path.
     """
+    convolution_types = (
+        nn.Conv1d,
+        nn.Conv2d,
+        nn.Conv3d,
+        nn.ConvTranspose1d,
+        nn.ConvTranspose2d,
+        nn.ConvTranspose3d,
+    )
+    if isinstance(module, convolution_types):
+        return None
     inner = getattr(module, "linear", None)
+    if isinstance(inner, convolution_types):
+        return None
     if isinstance(inner, nn.Module) and isinstance(
         getattr(inner, "weight", None), nn.Parameter
     ):
