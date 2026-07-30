@@ -15,20 +15,36 @@ for root in (REPO_ROOT, LITE_ROOT, VERL_EXAMPLE_ROOT):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
+_EMERGING_OPT_SITE = os.environ.get("EMERGING_OPT_SITE")
+if not _EMERGING_OPT_SITE:
+    _default_eo_site = Path(__file__).resolve().parents[5] / ".vicky" / "eo_site"
+    if _default_eo_site.is_dir():
+        _EMERGING_OPT_SITE = str(_default_eo_site)
+if _EMERGING_OPT_SITE and _EMERGING_OPT_SITE not in sys.path:
+    sys.path.insert(0, _EMERGING_OPT_SITE)
+    os.environ.setdefault("EMERGING_OPT_SITE", _EMERGING_OPT_SITE)
+
 
 def pytest_configure(config):
-    config.addinivalue_line("markers", "mlite: mark a test as Megatron Lite validation coverage")
+    config.addinivalue_line(
+        "markers", "mlite: mark a test as Megatron Lite validation coverage"
+    )
     config.addinivalue_line(
         "markers",
         "smoke: mark a Megatron Lite smoke test; skipped unless --mlite-smoke or MLITE_RUN_SMOKE=1 is set",
     )
     config.addinivalue_line("markers", "gpu: mark a test as requiring CUDA")
-    config.addinivalue_line("markers", "distributed: mark a test as requiring torch.distributed")
+    config.addinivalue_line(
+        "markers", "distributed: mark a test as requiring torch.distributed"
+    )
 
 
 def pytest_addoption(parser):
     parser.addoption(
-        "--mlite-smoke", action="store_true", default=False, help="run Megatron Lite smoke tests"
+        "--mlite-smoke",
+        action="store_true",
+        default=False,
+        help="run Megatron Lite smoke tests",
     )
 
 
@@ -36,7 +52,9 @@ def pytest_collection_modifyitems(config, items):
     run_smoke = config.getoption("--mlite-smoke") or os.getenv("MLITE_RUN_SMOKE") == "1"
     if run_smoke:
         return
-    skip_smoke = pytest.mark.skip(reason="set --mlite-smoke or MLITE_RUN_SMOKE=1 to run")
+    skip_smoke = pytest.mark.skip(
+        reason="set --mlite-smoke or MLITE_RUN_SMOKE=1 to run"
+    )
     for item in items:
         if "smoke" in item.keywords:
             item.add_marker(skip_smoke)
@@ -58,7 +76,9 @@ def transformer_engine_import_stub(monkeypatch):
 
         class _UnavailableTE:
             def __init__(self, *args, **kwargs):
-                raise RuntimeError("Transformer Engine is not installed in this test environment.")
+                raise RuntimeError(
+                    "Transformer Engine is not installed in this test environment."
+                )
 
         root = types.ModuleType("transformer_engine")
         root.__version__ = "0.0.0"
@@ -93,12 +113,16 @@ def transformer_engine_import_stub(monkeypatch):
         root.pytorch = pytorch
         monkeypatch.setitem(sys.modules, "transformer_engine", root)
         monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", pytorch)
-        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.permutation", permutation)
+        monkeypatch.setitem(
+            sys.modules, "transformer_engine.pytorch.permutation", permutation
+        )
         monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.router", router)
         monkeypatch.setitem(
             sys.modules, "transformer_engine.pytorch.cpp_extensions", cpp_extensions
         )
         monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module", module)
-        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module.base", module_base)
+        monkeypatch.setitem(
+            sys.modules, "transformer_engine.pytorch.module.base", module_base
+        )
 
     return install

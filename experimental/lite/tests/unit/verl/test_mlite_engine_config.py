@@ -35,7 +35,9 @@ def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
 
 
 def _engine(
-    *, engine_config: MegatronLiteEngineConfig, optimizer_config: SimpleNamespace | None = None
+    *,
+    engine_config: MegatronLiteEngineConfig,
+    optimizer_config: SimpleNamespace | None = None,
 ) -> MegatronLiteEngine:
     return MegatronLiteEngine(
         model_config=SimpleNamespace(
@@ -62,9 +64,7 @@ def _r3_input_ids() -> torch.Tensor:
 def _install_upstream_r3_stub(monkeypatch, build) -> None:
     module = types.ModuleType("verl.utils.megatron.router_replay_utils")
     module.build_r3_replay_mask = build
-    monkeypatch.setitem(
-        sys.modules, "verl.utils.megatron.router_replay_utils", module
-    )
+    monkeypatch.setitem(sys.modules, "verl.utils.megatron.router_replay_utils", module)
 
 
 def test_r3_replay_mask_delegates_jagged_inputs_to_verl(monkeypatch):
@@ -72,10 +72,7 @@ def test_r3_replay_mask_delegates_jagged_inputs_to_verl(monkeypatch):
     input_ids = _r3_input_ids()
     response_mask = torch.tensor([[1, 1], [0, 0]], dtype=torch.float32)
     expected = torch.nested.as_nested_tensor(
-        [
-            torch.tensor([True, True, True, False]),
-            torch.tensor([False, False, False]),
-        ],
+        [torch.tensor([True, True, True, False]), torch.tensor([False, False, False])],
         layout=torch.jagged,
     )
     seen = {}
@@ -87,13 +84,10 @@ def test_r3_replay_mask_delegates_jagged_inputs_to_verl(monkeypatch):
 
     _install_upstream_r3_stub(monkeypatch, build)
     micro_batch = TensorDict(
-        {"input_ids": input_ids, "response_mask": response_mask},
-        batch_size=[2],
+        {"input_ids": input_ids, "response_mask": response_mask}, batch_size=[2]
     )
 
-    actual = MegatronLiteEngine._r3_replay_mask_for_packing(
-        micro_batch, input_ids
-    )
+    actual = MegatronLiteEngine._r3_replay_mask_for_packing(micro_batch, input_ids)
 
     assert actual is expected
     assert seen == {"input_ids": input_ids, "response_mask": response_mask}
@@ -118,7 +112,10 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     engine.get_data_parallel_group = lambda: None
 
     hook = engine._make_runtime_loss_fn(
-        lambda model_output, **_kwargs: (model_output["log_probs"] / num_microbatches, {}),
+        lambda model_output, **_kwargs: (
+            model_output["log_probs"] / num_microbatches,
+            {},
+        ),
         num_microbatches=num_microbatches,
         output_lst=outputs,
     )
@@ -127,7 +124,9 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
         (loss / num_microbatches).backward()
 
     torch.testing.assert_close(weight.grad, torch.tensor(3.0))
-    assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
+    assert [output["loss"] for output in outputs] == [
+        3.0 / num_microbatches
+    ] * num_microbatches
 
 
 def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> None:
@@ -156,6 +155,60 @@ def test_explicit_optimizer_offload_fraction_overrides_engine_default() -> None:
     optimizer = engine._build_mlite_optimizer_config()
 
     assert optimizer.offload_fraction == 0.25
+
+
+def test_canonical_optimizer_offload_fraction_is_preferred() -> None:
+    engine = _engine(
+        engine_config=_engine_config(optimizer_offload=True),
+        optimizer_config=_optimizer_config(optimizer_offload_fraction=0.25),
+    )
+
+    optimizer = engine._build_mlite_optimizer_config()
+
+    assert optimizer.optimizer_offload_fraction == 0.25
+
+
+def test_conflicting_optimizer_offload_alias_fails_loudly() -> None:
+    engine = _engine(
+        engine_config=_engine_config(),
+        optimizer_config=_optimizer_config(
+            offload_fraction=0.25, optimizer_offload_fraction=0.5
+        ),
+    )
+
+    with pytest.raises(
+        ValueError, match="offload_fraction.*optimizer_offload_fraction"
+    ):
+        engine._build_mlite_optimizer_config()
+
+
+def test_verl_muon_overrides_route_to_native_contract() -> None:
+    engine = _engine(
+        engine_config=_engine_config(),
+        optimizer_config=_optimizer_config(
+            muon_momentum=0.9,
+            muon_num_ns_steps=7,
+            muon_match_adamw_update_rms=True,
+            use_layer_wise_param_layout=True,
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+        ),
+    )
+    engine.optimizer_config.optimizer = "muon"
+
+    optimizer = engine._build_mlite_optimizer_config()
+
+    assert optimizer.optimizer == "muon"
+    assert optimizer.muon_momentum == 0.9
+    assert optimizer.muon_num_ns_steps == 7
+    assert optimizer.muon_match_adamw_update_rms is True
+    assert optimizer.muon_extra_scale_factor == pytest.approx(
+        ((1.0 - 0.9) / (1.0 + 0.9)) ** 0.5
+    )
+    assert optimizer.muon_extra_scale_factor != 1.0
+    assert optimizer.use_layer_wise_param_layout is True
+    assert optimizer.overlap_grad_reduce is True
+    assert optimizer.overlap_param_gather is True
 
 
 def test_optimizer_cpu_offload_alias_maps_to_full_offload_fraction() -> None:
@@ -273,10 +326,7 @@ def test_online_qat_export_wraps_mlite_hf_weight_stream(monkeypatch) -> None:
 
     def fake_export(weights, modules, qat_config, bridge):
         captured.update(
-            weights=weights,
-            modules=modules,
-            qat_config=qat_config,
-            bridge=bridge,
+            weights=weights, modules=modules, qat_config=qat_config, bridge=bridge
         )
         return iter([("packed.weight", torch.ones(2, 16, dtype=torch.uint8))])
 

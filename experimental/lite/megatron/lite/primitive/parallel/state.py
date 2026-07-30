@@ -6,7 +6,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.utils import ensure_divisible
 
 
@@ -22,6 +21,7 @@ class ParallelState:
     dp_cp_group: dist.ProcessGroup | None = None
     tp_ep_group: dist.ProcessGroup | None = None
     ep_dp_group: dist.ProcessGroup | None = None
+    intra_dist_opt_group: dist.ProcessGroup | None = None
     cp_global_ranks: list[int] | None = None
     pp_global_ranks: list[int] | None = None
 
@@ -184,6 +184,18 @@ def init_parallel(config) -> ParallelState:
                 g = dist.new_group(ranks)
                 if rank in ranks:
                     ps.ep_dp_group = g
+
+    # Match Megatron's single-instance ``intra_dist_opt`` rank order: concatenate
+    # each fixed-expert-DP ``tp-ep-pp`` group in expert-DP order. This group owns
+    # global optimizer statistics; it is intentionally distinct from dense DP×CP.
+    intra_dist_opt_ranks = [
+        _e(t, e, d, p)
+        for d in range(expert_dp)
+        for p in range(pp)
+        for e in range(ep)
+        for t in range(etp)
+    ]
+    ps.intra_dist_opt_group = dist.new_group(intra_dist_opt_ranks)
 
     pp_ranks = ps.pp_global_ranks
     if pp_ranks is None:

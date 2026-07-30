@@ -9,7 +9,6 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 import transformer_engine.pytorch as te  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.utils import ensure_divisible
 
 if TYPE_CHECKING:
@@ -78,8 +77,12 @@ class _VanillaColParallelMatmulSP(torch.autograd.Function):
         if ws > 1:
             s_local = input_.shape[0]
             total_shape = (s_local * ws, *input_.shape[1:])
-            total_input = torch.empty(total_shape, dtype=input_.dtype, device=input_.device)
-            dist.all_gather_into_tensor(total_input, input_.contiguous(), group=tp_group)
+            total_input = torch.empty(
+                total_shape, dtype=input_.dtype, device=input_.device
+            )
+            dist.all_gather_into_tensor(
+                total_input, input_.contiguous(), group=tp_group
+            )
         else:
             total_input = input_
         ctx.save_for_backward(total_input, weight)
@@ -97,7 +100,9 @@ class _VanillaColParallelMatmulSP(torch.autograd.Function):
             grad_input = torch.empty(
                 out_shape, dtype=grad_input_full.dtype, device=grad_input_full.device
             )
-            dist.reduce_scatter_tensor(grad_input, grad_input_full.contiguous(), group=ctx.tp_group)
+            dist.reduce_scatter_tensor(
+                grad_input, grad_input_full.contiguous(), group=ctx.tp_group
+            )
         else:
             grad_input = grad_input_full
         gi = grad_output.reshape(-1, grad_output.shape[-1])
@@ -119,13 +124,22 @@ class _VanillaColLinear(nn.Module):
     `sp=False`, input is assumed replicated and grad_input is all-reduced.
     """
 
-    def __init__(self, in_features: int, out_features: int, ps: ParallelState, *, sp: bool = False):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        ps: ParallelState,
+        *,
+        sp: bool = False,
+    ):
         super().__init__()
         self.tp_group = ps.tp_group
         self.tp_size = ps.tp_size
         self.sp = sp
         local_out = ensure_divisible(out_features, ps.tp_size)
-        self.weight = nn.Parameter(torch.empty(local_out, in_features, dtype=torch.bfloat16))
+        self.weight = nn.Parameter(
+            torch.empty(local_out, in_features, dtype=torch.bfloat16)
+        )
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -184,7 +198,9 @@ class ColumnParallelLinear(nn.Module):
         self.tp_group = ps.tp_group
         self.local_out = ensure_divisible(out_features, ps.tp_size)
         self.use_sp = (
-            ps.tp_size > 1 and not gather_output if sequence_parallel is None else sequence_parallel
+            ps.tp_size > 1 and not gather_output
+            if sequence_parallel is None
+            else sequence_parallel
         )
         if normalization is not None:
             self.linear = te.LayerNormLinear(
@@ -274,7 +290,12 @@ class VocabParallelEmbedding(nn.Module):
     """Embedding table split across TP on the vocab dimension."""
 
     def __init__(
-        self, vocab_size: int, hidden_size: int, ps: ParallelState, *, deterministic: bool = False
+        self,
+        vocab_size: int,
+        hidden_size: int,
+        ps: ParallelState,
+        *,
+        deterministic: bool = False,
     ):
         super().__init__()
         self.tp_size = ps.tp_size
@@ -285,12 +306,15 @@ class VocabParallelEmbedding(nn.Module):
         self.vocab_start = self.tp_rank * self.local_vocab
         self.vocab_end = self.vocab_start + self.local_vocab
         self.embedding = nn.Embedding(self.local_vocab, hidden_size)
+        self.embedding.weight.is_embedding_or_output_parameter = True
         self.tp_group = ps.tp_group
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         # input_ids: [B, S] → out: [S, B, H]
         mask = (input_ids >= self.vocab_start) & (input_ids < self.vocab_end)
-        local_ids = (input_ids - self.vocab_start).clamp(min=0, max=self.local_vocab - 1)
+        local_ids = (input_ids - self.vocab_start).clamp(
+            min=0, max=self.local_vocab - 1
+        )
         if self.deterministic:
             out = self.embedding.weight[local_ids]
         else:
@@ -346,14 +370,22 @@ class VocabParallelOutput(nn.Module):
     """
 
     def __init__(
-        self, vocab_size: int, hidden_size: int, ps: ParallelState, *, backend: str = "vanilla"
+        self,
+        vocab_size: int,
+        hidden_size: int,
+        ps: ParallelState,
+        *,
+        backend: str = "vanilla",
     ):
         super().__init__()
         padded_vocab = pad_vocab_for_tp(vocab_size, ps.tp_size)
         # SP-aware head: when tp>1 we run on SP-sharded input (matches MC
         # GPTModel where final_layernorm runs on SP-sharded hiddens and
         # output_layer gathers internally + reduce-scatters on backward).
-        self.col = _ColForLMHead(hidden_size, padded_vocab, ps, backend=backend, sp=ps.tp_size > 1)
+        self.col = _ColForLMHead(
+            hidden_size, padded_vocab, ps, backend=backend, sp=ps.tp_size > 1
+        )
+        self.col.linear.weight.is_embedding_or_output_parameter = True
         self.padded_vocab = padded_vocab
         self.local_vocab = padded_vocab // ps.tp_size
         self.vocab_size = vocab_size
@@ -405,7 +437,9 @@ class _AllGatherLastDimWithGradReduce(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         local_width = ensure_divisible(grad_output.shape[-1], ctx.tp_size)
         flat_grad = grad_output.reshape(-1, grad_output.shape[-1])
-        packed_grad = torch.cat(flat_grad.split(local_width, dim=-1), dim=0).contiguous()
+        packed_grad = torch.cat(
+            flat_grad.split(local_width, dim=-1), dim=0
+        ).contiguous()
         local_grad = torch.empty(
             (flat_grad.shape[0], local_width),
             dtype=grad_output.dtype,
