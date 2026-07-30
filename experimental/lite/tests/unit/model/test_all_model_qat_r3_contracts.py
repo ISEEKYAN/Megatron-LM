@@ -479,6 +479,10 @@ def test_every_real_tiny_model_attaches_trainable_lora_and_runs_adapter_forward(
     assert stats["attached_modules"] == len(adapters)
     assert stats["attached_modules"] > 0
     assert stats["trainable_tensors"] == len(trainable)
+    assert len(trainable) == 2 * len(adapters)
+    assert sum(parameter.numel() for parameter in trainable.values()) == sum(
+        adapter.lora_a.numel() + adapter.lora_b.numel() for adapter in adapters
+    )
     assert trainable
     assert all("lora_" in name for name in trainable)
 
