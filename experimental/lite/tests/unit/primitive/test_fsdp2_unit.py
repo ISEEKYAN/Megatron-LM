@@ -567,3 +567,13 @@ def test_fp32_adamw_load_matches_uninterrupted_next_step_cpu(cpu_update: bool):
     for key in ("master_params", "exp_avgs", "exp_avg_sqs"):
         torch.testing.assert_close(loaded_state[key][0], direct_state[key][0], atol=0.0, rtol=0.0)
     assert loaded_state["steps"] == direct_state["steps"]
+
+
+def test_fsdp2_rejects_muon_before_wrapping():
+    with pytest.raises(ValueError, match="only with MLite DistOpt"):
+        fsdp2_optimizer.build_fsdp2_training_optimizer(
+            [ToyModel()],
+            SimpleNamespace(optimizer="muon"),
+            ParallelState(),
+            unit_modules=(ToyBlock,),
+        )

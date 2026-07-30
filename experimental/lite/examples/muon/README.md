@@ -127,3 +127,7 @@ GPU lifecycle test (single CUDA device):
 PYTHONPATH="$(pwd):$(pwd)/experimental/lite" \
   pytest experimental/lite/tests/unit/primitive/test_muon_fsdp2_offload_gpu.py
 ```
+
+## Backend support
+
+Muon is currently supported only through the MLite DistOpt path. FSDP2 with `optimizer=muon` is unsupported and fails loudly; it never falls back to AdamW.
