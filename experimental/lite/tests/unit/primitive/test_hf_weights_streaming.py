@@ -560,6 +560,56 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
     )
 
 
+def test_packed_expert_export_rejects_incomplete_group() -> None:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.experts = nn.Module()
+            for idx in range(3):
+                self.experts.register_parameter(
+                    f"weight{idx}", nn.Parameter(torch.tensor([float(idx)]))
+                )
+
+    class Spec:
+        num_experts = 4
+
+        @staticmethod
+        def is_expert(name):
+            return name.startswith("experts.")
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+        @staticmethod
+        def packed_expert_group_name(name):
+            return "experts.packed"
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"experts\.packed.*3/4",
+    ):
+        list(export_hf_weights(Model(), Spec(), ps, cpu=True))
+
+
 def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> None:
     """Streamed pp2 export must be bitwise-equal to the legacy materialized
     dict, with every header/tensor exchange on the NCCL pp_group."""
