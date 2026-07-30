@@ -280,6 +280,12 @@ def test_persistent_buffer_is_loaded_by_generic_loader(monkeypatch) -> None:
             return {"router_expert_bias": ["hf.router.expert_bias"]}
 
         @staticmethod
+        def expected_buffers(base_model, ps):
+            assert base_model is model
+            assert ps.ep_size == 1
+            return ("router_expert_bias",)
+
+        @staticmethod
         def expert_global_id(name):
             return None
 
@@ -298,6 +304,126 @@ def test_persistent_buffer_is_loaded_by_generic_loader(monkeypatch) -> None:
     load_hf_weights(model, "unused", Spec(), _parallel_state())
 
     assert torch.equal(model.router_expert_bias, expected)
+
+
+def test_declared_expected_buffer_missing_from_checkpoint_fails(monkeypatch) -> None:
+    _stub_parallel_import(monkeypatch)
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("router_expert_bias", torch.zeros(4))
+
+    class Reader:
+        def __init__(self, path):
+            assert path == "unused"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            pass
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def weight_map():
+            return {}
+
+        @staticmethod
+        def expected_buffers(base_model, ps):
+            assert isinstance(base_model, Model)
+            assert ps.ep_size == 1
+            return ("router_expert_bias",)
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"Spec.*expected checkpoint buffer.*router_expert_bias",
+    ):
+        load_hf_weights(Model(), "unused", Spec(), _parallel_state())
+
+
+def test_checkpoint_source_without_model_target_fails(monkeypatch) -> None:
+    _stub_parallel_import(monkeypatch)
+
+    class Reader:
+        def __init__(self, path):
+            assert path == "unused"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            pass
+
+        @staticmethod
+        def first_available(names):
+            assert names == ["hf.ghost.weight"]
+            return names[0]
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def weight_map():
+            return {"ghost.weight": ["hf.ghost.weight"]}
+
+        @staticmethod
+        def expert_global_id(name):
+            return None
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"Spec.*hf\.ghost\.weight.*ghost\.weight.*no model target",
+    ):
+        load_hf_weights(nn.Module(), "unused", Spec(), _parallel_state())
+
+
+def test_undeclared_buffer_adds_no_warning_or_failure(monkeypatch) -> None:
+    _stub_parallel_import(monkeypatch)
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("rotary_cache", torch.ones(4))
+
+    class Reader:
+        def __init__(self, path):
+            assert path == "unused"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            pass
+
+    class LegacySpec:
+        num_experts = 0
+
+        @staticmethod
+        def weight_map():
+            return {}
+
+    warnings = []
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader
+    )
+    monkeypatch.setattr("megatron.lite.primitive.utils.log_rank0", warnings.append)
+
+    model = Model()
+    load_hf_weights(model, "unused", LegacySpec(), _parallel_state())
+
+    assert warnings == []
+    assert torch.equal(model.rotary_cache, torch.ones(4))
 
 
 def test_missing_required_hf_tensor_fails_with_spec_and_key_context(

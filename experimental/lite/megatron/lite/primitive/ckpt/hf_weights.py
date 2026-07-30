@@ -136,6 +136,15 @@ class HFWeights(Protocol):
         """
         return None
 
+    def expected_buffers(self, base_model: nn.Module, ps) -> Iterable[str]:
+        """Persistent model buffers that must be restored from the checkpoint.
+
+        The default is empty so model-owned caches and other undeclared buffers
+        retain the historical load behavior.
+        """
+        del base_model, ps
+        return ()
+
     @property
     def num_experts(self) -> int:
         """Total number of experts (needed for EP gather index math)."""
@@ -572,8 +581,7 @@ def bucketed_all_gather_into_tensor(
                 tensor,
                 [
                     recv_buffer[
-                        rank * total_numel
-                        + offsets[idx] : rank * total_numel
+                        rank * total_numel + offsets[idx] : rank * total_numel
                         + offsets[idx]
                         + numel_per_tensor[idx]
                     ].view_as(tensor)
@@ -906,6 +914,25 @@ def load_hf_weights(
     targets = dict(base_model.named_parameters(remove_duplicate=False))
     targets.update(dict(base_model.named_buffers(remove_duplicate=False)))
     loaded_names: set[str] = set()
+    expected_buffers_hook = getattr(spec, "expected_buffers", None)
+    expected_buffers = (
+        set(expected_buffers_hook(base_model, ps))
+        if callable(expected_buffers_hook)
+        else set()
+    )
+    named_buffers = dict(base_model.named_buffers(remove_duplicate=False))
+    invalid_expected = expected_buffers - named_buffers.keys()
+    if invalid_expected:
+        raise ValueError(
+            f"{type(spec).__name__}.expected_buffers() declared names that are "
+            f"not model buffers: {sorted(invalid_expected)!r}"
+        )
+    nonpersistent_expected = expected_buffers - state.keys()
+    if nonpersistent_expected:
+        raise ValueError(
+            f"{type(spec).__name__}.expected_buffers() declared non-persistent "
+            f"buffers: {sorted(nonpersistent_expected)!r}"
+        )
     num_experts_total = getattr(spec, "num_experts", None)
     expert_shard = None
     if num_experts_total is None:
@@ -946,6 +973,21 @@ def load_hf_weights(
             actual = _resolve_param_name(mapped, state)
             target = targets.get(actual) if actual is not None else None
             if target is None:
+                pp_size = int(getattr(ps, "pp_size", 1))
+                is_stage_global_target = pp_size > 1 and not mapped.startswith(
+                    "layers."
+                )
+                present_sources = (
+                    []
+                    if is_stage_global_target
+                    else _present_hf_sources(reader, spec, mapped, hf_names)
+                )
+                if present_sources:
+                    raise RuntimeError(
+                        f"{type(spec).__name__} checkpoint tensor(s) "
+                        f"{present_sources!r} map to native target {mapped!r}, "
+                        "but the current load plan has no model target"
+                    )
                 continue
 
             replica_group_hook = getattr(spec, "replica_group_for_load", None)
@@ -1042,6 +1084,12 @@ def load_hf_weights(
             continue
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
+    missing_expected_buffers = expected_buffers - loaded_names
+    if missing_expected_buffers:
+        raise RuntimeError(
+            f"{type(spec).__name__} expected checkpoint buffer(s) were not "
+            f"loaded: {sorted(missing_expected_buffers)!r}"
+        )
 
 
 def _load_expert_weight(
@@ -1067,6 +1115,13 @@ def _load_expert_weight(
     actual = _resolve_param_name(local_name, state)
     target = targets.get(actual) if actual is not None else None
     if target is None:
+        present_sources = _present_hf_sources(reader, spec, native_name, hf_names)
+        if present_sources:
+            raise RuntimeError(
+                f"{type(spec).__name__} checkpoint tensor(s) {present_sources!r} "
+                f"map to native expert target {native_name!r}, but the current "
+                "load plan has no model target"
+            )
         return None
 
     replica_group_hook = getattr(spec, "replica_group_for_load", None)
@@ -1198,6 +1253,31 @@ def _read_hf_tensors(
             tensor = transform_source(native_name, index, resolved, tensor)
         tensors.append(tensor)
     return tensors
+
+
+def _present_hf_sources(
+    reader: SafeTensorReader,
+    spec: HFWeights,
+    native_name: str,
+    hf_names: list[str],
+) -> list[str]:
+    """Return mapped checkpoint sources that exist without loading payloads."""
+    resolve = getattr(reader, "first_available", None)
+    if not callable(resolve):
+        return []
+    candidate_hook = getattr(spec, "hf_name_candidates", None)
+    present: list[str] = []
+    for hf_name in hf_names:
+        candidates = (
+            candidate_hook(native_name, hf_name)
+            if callable(candidate_hook)
+            else [hf_name]
+        )
+        try:
+            present.append(resolve(candidates))
+        except KeyError:
+            continue
+    return present
 
 
 def _resolve_param_name(name: str, state_dict: dict) -> str | None:
@@ -1355,9 +1435,9 @@ def export_hf_weights(
                     if packed_name is None:
                         yield from _iter_mapped({global_name: export_shard})
                         continue
-                    packed_expert_buffers.setdefault(packed_name, {})[
-                        global_idx
-                    ] = export_shard
+                    packed_expert_buffers.setdefault(packed_name, {})[global_idx] = (
+                        export_shard
+                    )
                 if packed_name is not None:
                     packed = packed_expert_buffers[packed_name]
                     if len(packed) == spec.num_experts:
