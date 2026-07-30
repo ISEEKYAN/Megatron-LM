@@ -9,6 +9,8 @@ import torch.nn as nn
 
 from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
     SafeTensorReader,
+    _read_hf_tensors,
+    _resolve_param_name,
     export_hf_weights,
     load_hf_weights,
 )
@@ -35,6 +37,52 @@ def _parallel_state(*, tp_size=1, tp_rank=0):
             "etp_rank": 0,
         },
     )()
+
+
+def test_state_resolution_is_exact_and_rejects_duplicate_canonical_keys() -> None:
+    tensor = torch.ones(1)
+
+    assert _resolve_param_name("weight", {"module.weight": tensor}) is None
+    with pytest.raises(RuntimeError, match="duplicate canonical checkpoint state"):
+        _resolve_param_name(
+            "proj.weight",
+            {
+                "proj.weight": tensor,
+                "proj.parametrizations.weight.original": tensor,
+            },
+        )
+
+
+def test_explicit_packed_scale_sources_reach_weight_spec_without_reader_dequant() -> (
+    None
+):
+    packed = torch.tensor([[1, 2]], dtype=torch.int8)
+    scale = torch.tensor([[127]], dtype=torch.uint8)
+    tensors = {"expert.weight_packed": packed, "expert.weight_scale": scale}
+    reader = SafeTensorReader.__new__(SafeTensorReader)
+    reader.device = torch.device("cpu")
+    reader.index = {name: "model.safetensors" for name in tensors}
+    reader._stack = None
+    reader._handles = {}
+    reader._cached_request = None
+    reader._cached_tensor = None
+    reader._get_raw_tensor = lambda name, device: tensors[name].to(device)
+
+    class Spec:
+        pass
+
+    sources = _read_hf_tensors(
+        reader,
+        Spec(),
+        "experts.fc1.weight0",
+        ["expert.weight_packed", "expert.weight_scale"],
+        torch.empty((2, 2), dtype=torch.bfloat16),
+    )
+
+    assert sources[0].dtype == torch.int8
+    assert sources[1].dtype == torch.uint8
+    assert torch.equal(sources[0], packed)
+    assert torch.equal(sources[1], scale)
 
 
 def test_reader_reuses_cpu_mmap_handle_then_moves_requested_tensor(
@@ -299,6 +347,68 @@ def test_persistent_buffer_is_loaded_by_generic_loader(monkeypatch) -> None:
     load_hf_weights(model, "unused", Spec(), _parallel_state())
 
     assert torch.equal(model.router_expert_bias, expected)
+
+
+def test_pp_remap_keeps_global_name_for_weight_spec_conversion(monkeypatch) -> None:
+    _stub_parallel_import(monkeypatch)
+
+    class Layer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("expert_bias", torch.zeros(2))
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([Layer()])
+            self.layer_indices = [2]
+
+    model = Model()
+
+    class Reader:
+        def __init__(self, path):
+            assert path == "unused"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            pass
+
+        def get_tensor(self, name, *, device, target_shape=None, target_dtype=None):
+            assert name == "hf.layers.2.expert_bias"
+            return torch.tensor([1.0, 2.0], device=device)
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def weight_map():
+            return {"layers.2.expert_bias": ["hf.layers.2.expert_bias"]}
+
+        @staticmethod
+        def expert_global_id(name):
+            assert name == "layers.2.expert_bias"
+            return None
+
+        @staticmethod
+        def hf_to_native(name, tensors):
+            assert name == "layers.2.expert_bias"
+            return tensors[0]
+
+        @staticmethod
+        def tp_spec(name):
+            assert name == "layers.2.expert_bias"
+            return None
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader
+    )
+    ps = _parallel_state()
+    ps.pp_size = 2
+    load_hf_weights(model, "unused", Spec(), ps)
+
+    assert torch.equal(model.layers[0].expert_bias, torch.tensor([1.0, 2.0]))
 
 
 def test_mapped_persistent_buffer_missing_from_checkpoint_fails(monkeypatch) -> None:
@@ -796,6 +906,76 @@ def test_expert_mappings_copy_before_reading_the_next_mapping(monkeypatch) -> No
 
     assert torch.equal(model.expert0, torch.tensor([1.0]))
     assert torch.equal(model.expert1, torch.tensor([2.0]))
+
+
+def test_pp_expert_remap_separates_global_spec_and_local_target_names(
+    monkeypatch,
+) -> None:
+    _stub_parallel_import(monkeypatch)
+
+    class Layer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.expert0 = nn.Parameter(torch.zeros(1))
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([Layer()])
+            self.layer_indices = [2]
+
+    model = Model()
+
+    class Reader:
+        def __init__(self, path):
+            assert path == "unused"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            pass
+
+        def get_tensor(self, name, *, device, target_shape=None, target_dtype=None):
+            assert name == "hf.layers.2.expert0"
+            return torch.tensor([3.0], device=device)
+
+    class Spec:
+        num_experts = 1
+
+        @staticmethod
+        def weight_map():
+            return {"layers.2.weight0": ["hf.layers.2.expert0"]}
+
+        @staticmethod
+        def expert_global_id(name):
+            assert name == "layers.2.weight0"
+            return 0
+
+        @staticmethod
+        def expert_local_name(name, local_idx):
+            assert name == "layers.0.weight0"
+            assert local_idx == 0
+            return "layers.0.expert0"
+
+        @staticmethod
+        def hf_to_native(name, tensors):
+            assert name == "layers.2.weight0"
+            return tensors[0]
+
+        @staticmethod
+        def tp_spec(name):
+            assert name == "layers.2.weight0"
+            return None
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader
+    )
+    ps = _parallel_state()
+    ps.pp_size = 2
+    load_hf_weights(model, "unused", Spec(), ps)
+
+    assert torch.equal(model.layers[0].expert0, torch.tensor([3.0]))
 
 
 def test_expert_mapping_resolves_qat_parametrized_master(monkeypatch) -> None:

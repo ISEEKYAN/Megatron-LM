@@ -314,6 +314,30 @@ def test_apply_quantizes_targets_and_skips_ignored():
     assert chunk.lm_head.weight.grad is not None  # untouched, plain param
 
 
+def test_apply_skips_convolution_weights_but_keeps_grouped_experts():
+    class GroupedExpertLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(2, 64, 64))
+
+    class Toy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.short_conv = nn.Conv1d(64, 64, kernel_size=4, groups=64, bias=False)
+            self.proj = nn.Linear(64, 64, bias=False)
+            self.experts = GroupedExpertLinear()
+
+    chunk = Toy()
+    stats = apply_qat_to_chunks(
+        [chunk], QATSpec(enabled=True, format="mxfp4", group_size=32)
+    )
+
+    assert not parametrize.is_parametrized(chunk.short_conv, "weight")
+    assert parametrize.is_parametrized(chunk.proj, "weight")
+    assert parametrize.is_parametrized(chunk.experts, "weight")
+    assert stats["quantized_modules"] == 2
+
+
 # --------------------------------------------------------------------------- deployment round-trip
 
 

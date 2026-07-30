@@ -307,6 +307,14 @@ class Glm5WeightSpec:
         del native_name
         return None
 
+    def fused_split(self, native_name: str) -> tuple[str, ...] | None:
+        if (
+            native_name.endswith(".gate_up.linear.weight")
+            or ".experts.fc1." in native_name
+        ):
+            return ("gate", "up")
+        return None
+
     def tp_spec(self, native_name: str) -> tuple[int, int] | None:
         # GLM-5 is TP=1 (DSA not TP-capable); only EP / ETP shard tensors.
         if (

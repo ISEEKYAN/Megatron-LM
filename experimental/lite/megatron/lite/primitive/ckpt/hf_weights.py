@@ -136,6 +136,10 @@ class HFWeights(Protocol):
         """
         return None
 
+    def fused_split(self, native_name: str) -> tuple[str, ...] | None:
+        """Return ordered dim-0 logical parts for a fused native tensor."""
+        return None
+
     @property
     def num_experts(self) -> int:
         """Total number of experts (needed for EP gather index math)."""
@@ -276,6 +280,16 @@ class SafeTensorReader:
             with safe_open(str(filepath), framework="pt", device="cpu") as f:
                 tensor = f.get_tensor(name)
         return tensor if device.type == "cpu" else tensor.to(device)
+
+    def get_raw_tensor(
+        self,
+        name: str,
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Read one explicitly mapped physical source without dequantizing it."""
+        target_device = torch.device(self.device if device is None else device)
+        return self._get_raw_tensor(name, target_device)
 
     def _get_groupwise_int4(self, name: str, device: torch.device) -> torch.Tensor:
         packed = self._get_raw_tensor(f"{name}_packed", device)
@@ -854,13 +868,19 @@ def to_global_layer_name(name: str, layer_map: dict[int, int]) -> str:
     return re.sub(r"layers\.(\d+)\.", _replace, name)
 
 
+def _merge_gate_up_shards(shards: list[torch.Tensor]) -> torch.Tensor:
+    ffn_local = shards[0].shape[0] // 2
+    gate_full = torch.cat([shard[:ffn_local] for shard in shards], dim=0)
+    up_full = torch.cat([shard[ffn_local:] for shard in shards], dim=0)
+    return torch.cat([gate_full, up_full], dim=0)
+
+
 def gather_gate_up(
     tensor: torch.Tensor, world_size: int, group: dist.ProcessGroup
 ) -> torch.Tensor:
-    ffn_local = tensor.shape[0] // 2
-    gate_full = allgather_concat(tensor[:ffn_local], world_size, group, dim=0)
-    up_full = allgather_concat(tensor[ffn_local:], world_size, group, dim=0)
-    return torch.cat([gate_full, up_full], dim=0)
+    shards = [torch.empty_like(tensor) for _ in range(world_size)]
+    dist.all_gather(shards, tensor.contiguous(), group=group)
+    return _merge_gate_up_shards(shards)
 
 
 # ======================================================================
@@ -875,7 +895,7 @@ def _load_weight_map_for_model(
     state: dict[str, torch.Tensor],
 ) -> dict[str, list[str]]:
     """Build the one native-to-HF plan shared by load and export."""
-    logical_state_keys = tuple(canonical_state_key(name) for name in state)
+    logical_state_keys = tuple(_canonical_state_index(state))
     load_weight_map = getattr(spec, "load_weight_map", None)
     return (
         load_weight_map(base_model, ps, logical_state_keys)
@@ -904,6 +924,7 @@ def load_hf_weights(
     if callable(validate_load):
         validate_load(ps)
     state = base_model.state_dict()
+    canonical_state = _canonical_state_index(state)
     wmap = _load_weight_map_for_model(base_model, spec, ps, state)
 
     global_to_local: dict[int, int] = (
@@ -922,12 +943,12 @@ def load_hf_weights(
         mapped = remap_layer_index(native_name, global_to_local)
         if mapped is None:
             continue
-        actual = _resolve_param_name(mapped, state)
+        actual = _resolve_param_name(mapped, state, canonical_state)
         if actual is None:
             continue
-        mapped_targets[actual] = (mapped, hf_names)
+        mapped_targets[actual] = (native_name, hf_names)
         if actual in named_buffers:
-            required_buffers[actual] = (mapped, hf_names)
+            required_buffers[actual] = (native_name, hf_names)
 
     optional_for_load = getattr(spec, "optional_for_load", None)
     conflicting_load_contracts = (
@@ -965,15 +986,17 @@ def load_hf_weights(
             if mapped is None:
                 continue
 
-            expert_gid = spec.expert_global_id(mapped)
+            expert_gid = spec.expert_global_id(native_name)
             if expert_gid is not None:
                 loaded_name = _load_expert_weight(
+                    native_name,
                     mapped,
                     hf_names,
                     reader,
                     spec,
                     ps,
                     state,
+                    canonical_state,
                     targets,
                     expert_gid,
                     expert_shard,
@@ -982,7 +1005,7 @@ def load_hf_weights(
                     loaded_names.add(loaded_name)
                 continue
 
-            actual = _resolve_param_name(mapped, state)
+            actual = _resolve_param_name(mapped, state, canonical_state)
             target = targets.get(actual) if actual is not None else None
             if target is None:
                 pp_size = int(getattr(ps, "pp_size", 1))
@@ -992,7 +1015,7 @@ def load_hf_weights(
                 present_sources = (
                     []
                     if is_stage_global_target
-                    else _present_hf_sources(reader, spec, mapped, hf_names)
+                    else _present_hf_sources(reader, spec, native_name, hf_names)
                 )
                 if present_sources:
                     raise RuntimeError(
@@ -1004,7 +1027,9 @@ def load_hf_weights(
 
             replica_group_hook = getattr(spec, "replica_group_for_load", None)
             replica_group = (
-                replica_group_hook(mapped, ps) if callable(replica_group_hook) else None
+                replica_group_hook(native_name, ps)
+                if callable(replica_group_hook)
+                else None
             )
             replica_ranks: list[int] | None = None
             source_global_rank: int | None = None
@@ -1016,7 +1041,7 @@ def load_hf_weights(
                 replica_ranks = dist.get_process_group_ranks(replica_group)
                 source_hook = getattr(spec, "replica_source_rank_for_load", None)
                 source_group_rank = (
-                    source_hook(mapped, ps) if callable(source_hook) else 0
+                    source_hook(native_name, ps) if callable(source_hook) else 0
                 )
                 if not 0 <= source_group_rank < len(replica_ranks):
                     raise ValueError(
@@ -1032,7 +1057,9 @@ def load_hf_weights(
                     continue
 
             try:
-                hf_tensors = _read_hf_tensors(reader, spec, mapped, hf_names, target)
+                hf_tensors = _read_hf_tensors(
+                    reader, spec, native_name, hf_names, target
+                )
             except KeyError as error:
                 if actual in required_buffers:
                     raise RuntimeError(
@@ -1040,23 +1067,25 @@ def load_hf_weights(
                         f"{actual!r} from HF tensor(s) {hf_names!r}, but no "
                         "candidate exists in the checkpoint"
                     ) from error
-                _handle_missing_hf_tensors(spec, mapped, hf_names, error)
+                _handle_missing_hf_tensors(spec, native_name, hf_names, error)
                 continue
-            tensor = spec.hf_to_native(mapped, hf_tensors)
+            tensor = spec.hf_to_native(native_name, hf_tensors)
 
             custom_shard = getattr(spec, "shard_for_load", None)
             sharded = (
-                custom_shard(mapped, tensor, ps) if callable(custom_shard) else None
+                custom_shard(native_name, tensor, ps)
+                if callable(custom_shard)
+                else None
             )
             if sharded is not None:
                 tensor = sharded
             else:
-                tp_info = spec.tp_spec(mapped)
+                tp_info = spec.tp_spec(native_name)
                 if tp_info is not None:
                     split_d, tp_or_etp = tp_info
                     if tp_or_etp == 0:
                         if vocab_size is not None and (
-                            "embed" in mapped or "head" in mapped
+                            "embed" in native_name or "head" in native_name
                         ):
                             from megatron.lite.primitive.parallel import (  # isort: skip
                                 pad_vocab_for_tp,
@@ -1072,12 +1101,14 @@ def load_hf_weights(
                                 )
                                 tensor = torch.cat([tensor, pad], dim=0)
                         qkv = (
-                            spec.qkv_spec(mapped) if hasattr(spec, "qkv_spec") else None
+                            spec.qkv_spec(native_name)
+                            if hasattr(spec, "qkv_spec")
+                            else None
                         )
                         if qkv is not None:
                             tensor = split_qkv(tensor, ps.tp_rank, ps.tp_size, *qkv)
                         elif split_d == 0 and (
-                            "gate_up" in mapped or ".fc1." in mapped
+                            "gate_up" in native_name or ".fc1." in native_name
                         ):
                             tensor = split_gate_up(tensor, ps.tp_rank, ps.tp_size)
                         else:
@@ -1112,11 +1143,13 @@ def load_hf_weights(
 
 def _load_expert_weight(
     native_name,
+    target_name,
     hf_names,
     reader,
     spec,
     ps,
     state,
+    canonical_state,
     targets,
     expert_gid,
     expert_shard,
@@ -1129,8 +1162,8 @@ def _load_expert_weight(
     if expert_gid < local_start or expert_gid >= local_start + experts_per_rank:
         return None
 
-    local_name = spec.expert_local_name(native_name, expert_gid - local_start)
-    actual = _resolve_param_name(local_name, state)
+    local_name = spec.expert_local_name(target_name, expert_gid - local_start)
+    actual = _resolve_param_name(local_name, state, canonical_state)
     target = targets.get(actual) if actual is not None else None
     if target is None:
         present_sources = _present_hf_sources(reader, spec, native_name, hf_names)
@@ -1239,6 +1272,12 @@ def _read_hf_tensors(
 ) -> list[torch.Tensor]:
     candidate_hook = getattr(spec, "hf_name_candidates", None)
     shape_hook = getattr(spec, "hf_target_shape", None)
+    mapped_sources = set(hf_names)
+    explicit_packed_scale = any(
+        name.endswith("_packed")
+        and f"{name.removesuffix('_packed')}_scale" in mapped_sources
+        for name in hf_names
+    )
     tensors: list[torch.Tensor] = []
     for index, hf_name in enumerate(hf_names):
         candidates = (
@@ -1260,12 +1299,20 @@ def _read_hf_tensors(
             )
         else:
             target_shape = None
-        tensor = reader.get_tensor(
-            resolved,
-            device=target.device,
-            target_shape=target_shape,
-            target_dtype=target.dtype,
-        )
+        if explicit_packed_scale:
+            raw_reader = getattr(reader, "get_raw_tensor", None)
+            tensor = (
+                raw_reader(resolved, device=target.device)
+                if callable(raw_reader)
+                else reader.get_tensor(resolved, device=target.device)
+            )
+        else:
+            tensor = reader.get_tensor(
+                resolved,
+                device=target.device,
+                target_shape=target_shape,
+                target_dtype=target.dtype,
+            )
         transform_source = getattr(spec, "transform_hf_source", None)
         if callable(transform_source):
             tensor = transform_source(native_name, index, resolved, tensor)
@@ -1298,16 +1345,37 @@ def _present_hf_sources(
     return present
 
 
-def _resolve_param_name(name: str, state_dict: dict) -> str | None:
-    if name in state_dict:
-        return name
-    canonical = {canonical_state_key(key): key for key in state_dict}
-    if name in canonical:
-        return canonical[name]
-    for logical_name, key in canonical.items():
-        if name in logical_name:
-            return key
-    return None
+def _canonical_state_index(state_dict: dict) -> dict[str, str]:
+    canonical: dict[str, str] = {}
+    for key in state_dict:
+        logical_name = canonical_state_key(key)
+        previous = canonical.get(logical_name)
+        if previous is not None and previous != key:
+            raise RuntimeError(
+                "duplicate canonical checkpoint state: "
+                f"{logical_name!r} from {previous!r} and {key!r}"
+            )
+        canonical[logical_name] = key
+    return canonical
+
+
+def _resolve_param_name(
+    name: str,
+    state_dict: dict,
+    canonical_state: dict[str, str] | None = None,
+) -> str | None:
+    canonical = (
+        _canonical_state_index(state_dict)
+        if canonical_state is None
+        else canonical_state
+    )
+    return canonical.get(name)
+
+
+def _is_fused_gate_up(spec: HFWeights, native_name: str) -> bool:
+    """Only an explicit spec contract may select fused gate/up reassembly."""
+    fused_split = getattr(spec, "fused_split", None)
+    return bool(callable(fused_split) and fused_split(native_name) == ("gate", "up"))
 
 
 def _merge_dense_shards(
@@ -1325,10 +1393,12 @@ def _merge_dense_shards(
     split_dim, tp_or_etp = tp_info
     if tp_or_etp != 0:
         return tensor
+    if split_dim == 0 and _is_fused_gate_up(spec, name):
+        return _merge_gate_up_shards(shards)
     return torch.cat(shards, dim=split_dim)
 
 
-def export_hf_weights(
+def _export_hf_weights_unchecked(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,
     ps,
@@ -1644,6 +1714,54 @@ def export_hf_weights(
     return
 
 
+def export_hf_weights(
+    model: nn.Module | list[nn.Module],
+    spec: HFWeights,
+    ps,
+    *,
+    vocab_size: int | None = None,
+    limit: int | None = None,
+    rank0_only: bool = False,
+    export_dtype: str | torch.dtype | None = None,
+    cpu: bool = False,
+    buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Export HF weights and fail loudly on incomplete static-map coverage."""
+    weight_map = spec.weight_map()
+    validate = bool(weight_map) and limit is None
+    expected = (
+        {hf_name for hf_names in weight_map.values() for hf_name in hf_names}
+        if validate
+        else set()
+    )
+    seen: set[str] = set()
+    emit = not (rank0_only and dist.is_initialized() and dist.get_rank() != 0)
+
+    for hf_name, tensor in _export_hf_weights_unchecked(
+        model,
+        spec,
+        ps,
+        vocab_size=vocab_size,
+        limit=limit,
+        rank0_only=rank0_only,
+        export_dtype=export_dtype,
+        cpu=cpu,
+        buffer_max_size_bytes=buffer_max_size_bytes,
+    ):
+        if validate and emit:
+            if hf_name not in expected:
+                raise RuntimeError(f"unexpected HF export tensor: {hf_name}")
+            if hf_name in seen:
+                raise RuntimeError(f"duplicate HF export tensor: {hf_name}")
+            seen.add(hf_name)
+        yield hf_name, tensor
+
+    if validate and emit:
+        missing = sorted(expected - seen)
+        if missing:
+            raise RuntimeError(f"HF export coverage mismatch: missing={missing[:8]}")
+
+
 def _gather_dense(
     name: str, tensor: torch.Tensor, spec: HFWeights, ps, *, cpu: bool = True
 ) -> torch.Tensor:
@@ -1658,7 +1776,10 @@ def _gather_dense(
     if tp_info is not None and ps.tp_size > 1:
         split_d, tp_or_etp = tp_info
         if tp_or_etp == 0:
-            tensor = allgather_concat(tensor, ps.tp_size, ps.tp_group, dim=split_d)
+            if split_d == 0 and _is_fused_gate_up(spec, name):
+                tensor = gather_gate_up(tensor, ps.tp_size, ps.tp_group)
+            else:
+                tensor = allgather_concat(tensor, ps.tp_size, ps.tp_group, dim=split_d)
     return _maybe_cpu(tensor, cpu=cpu)
 
 
@@ -1695,7 +1816,7 @@ def _gather_expert_etp(
         tp_info = spec.tp_spec(name)
         if tp_info is not None:
             split_d, _ = tp_info
-            if "fc1" in name:
+            if _is_fused_gate_up(spec, name):
                 return gather_gate_up(tensor, ps.etp_size, ps.etp_group)
             return allgather_concat(tensor, ps.etp_size, ps.etp_group, dim=split_d)
     return tensor

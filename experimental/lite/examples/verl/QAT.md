@@ -73,9 +73,12 @@ optimizer construction. This order is mandatory:
 surviving master parameter.
 
 HF checkpoints continue to use logical `...weight` names. `canonical_state_key`
-maps those names onto the parametrized master during loading. Without the
-mapping, a tensor can be silently dropped and training can proceed from random
-initialization. Quantizer buffers such as
+maps those names onto the parametrized master during both loading and HF export:
+QAT-on and QAT-off exports therefore retain the same logical HF key set and
+emit the BF16 master, not the parametrization wrapper. The exporter rejects
+missing, unexpected, or duplicate keys for a complete static weight map.
+Without the mapping, a tensor can be silently dropped and training can proceed
+from random initialization. Quantizer buffers such as
 `...parametrizations.weight.0.amax` remain unchanged.
 
 ## Training and packed snapshots

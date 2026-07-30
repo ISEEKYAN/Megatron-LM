@@ -294,6 +294,14 @@ class KimiK2WeightSpec:
         del native_name
         return None
 
+    def fused_split(self, native_name: str) -> tuple[str, ...] | None:
+        if (
+            native_name.endswith(".gate_up.linear.weight")
+            or ".experts.fc1." in native_name
+        ):
+            return ("gate", "up")
+        return None
+
     def tp_spec(self, native_name: str) -> tuple[int, int] | None:
         if (
             native_name.startswith("mtp.layers.")
