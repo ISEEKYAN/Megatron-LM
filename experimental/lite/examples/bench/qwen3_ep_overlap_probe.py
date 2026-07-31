@@ -38,6 +38,11 @@ def build_arm_configs() -> tuple[dict[str, Any], dict[str, Any]]:
     return baseline, overlap
 
 
+def select_arm_config(arm: str) -> dict[str, Any]:
+    baseline, overlap = build_arm_configs()
+    return {"baseline": baseline, "overlap": overlap}[arm]
+
+
 def assert_only_overlap_diff(baseline: dict[str, Any], overlap: dict[str, Any]) -> None:
     if set(baseline) != set(overlap):
         raise ValueError(
@@ -188,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hf-path", required=True)
     parser.add_argument("--config-only", action="store_true")
+    parser.add_argument("--arm", choices=("baseline", "overlap"))
     parser.add_argument("--out-dir", default=".")
     parser.add_argument("--cycles", type=int, default=4)
     parser.add_argument("--warmup", type=int, default=1)
@@ -205,31 +211,31 @@ def main(argv: list[str] | None = None) -> int:
         )
         print("QWEN3_EP_OVERLAP_CONFIG_ONLY_OK", flush=True)
         return 0
+    if args.arm is None:
+        parser.error("--arm is required unless --config-only")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    arm_configs = build_arm_configs()
-    for name, impl_cfg in zip(("baseline", "overlap"), arm_configs, strict=True):
-        cfg = BenchCliConfig(
-            backend="mlite",
-            hf_path=args.hf_path,
-            model_name="qwen3_moe",
-            tp=1,
-            etp=1,
-            ep=8,
-            pp=1,
-            cp=1,
-            steps=args.cycles + args.warmup,
-            warmup=args.warmup,
-            num_microbatches=4,
-            seq_len=256,
-            truncate_layers=2,
-            keep_experts=8,
-            disable_mtp=True,
-            same_data_across_dp=True,
-            skip_load_hf_weights=True,
-            impl_cfg_json=json.dumps(impl_cfg, sort_keys=True),
-        )
-        _gpu_arm(name, cfg, out_dir, args.cycles, args.warmup)
+    cfg = BenchCliConfig(
+        backend="mlite",
+        hf_path=args.hf_path,
+        model_name="qwen3_moe",
+        tp=1,
+        etp=1,
+        ep=8,
+        pp=1,
+        cp=1,
+        steps=args.cycles + args.warmup,
+        warmup=args.warmup,
+        num_microbatches=4,
+        seq_len=256,
+        truncate_layers=2,
+        keep_experts=8,
+        disable_mtp=True,
+        same_data_across_dp=True,
+        skip_load_hf_weights=True,
+        impl_cfg_json=json.dumps(select_arm_config(args.arm), sort_keys=True),
+    )
+    _gpu_arm(args.arm, cfg, out_dir, args.cycles, args.warmup)
     print("QWEN3_EP_OVERLAP_PROBE_OK", flush=True)
     return 0
 

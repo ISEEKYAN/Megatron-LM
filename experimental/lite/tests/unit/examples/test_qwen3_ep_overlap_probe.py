@@ -22,6 +22,16 @@ def test_overlap_probe_arms_differ_only_in_overlap_knob():
     probe.assert_only_overlap_diff(baseline, overlap)
 
 
+def test_overlap_probe_selects_exactly_one_arm_per_process():
+    from examples.bench import qwen3_ep_overlap_probe as probe
+
+    baseline = probe.select_arm_config("baseline")
+    overlap = probe.select_arm_config("overlap")
+    assert baseline["overlap_moe_expert_parallel_comm"] is False
+    assert overlap["overlap_moe_expert_parallel_comm"] is True
+    assert baseline is not overlap
+
+
 def test_overlap_probe_rejects_non_overlap_difference():
     from examples.bench.qwen3_ep_overlap_probe import assert_only_overlap_diff
 
