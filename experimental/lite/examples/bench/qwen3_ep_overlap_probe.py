@@ -12,11 +12,18 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from examples.bench.bench import (
-    BenchCliConfig,
-    build_dry_run_plan,
-    build_runtime_config,
-)
+from examples.bench import bench as bench_module
+from examples.bench import cycle_memory_probe
+
+BenchCliConfig = bench_module.BenchCliConfig
+build_dry_run_plan = bench_module.build_dry_run_plan
+build_runtime_config = bench_module.build_runtime_config
+current_snapshot = cycle_memory_probe.current_snapshot
+dump_snapshot = cycle_memory_probe.dump_snapshot
+live_allocation_stacks = cycle_memory_probe.live_allocation_stacks
+per_cycle_retention = cycle_memory_probe.per_cycle_retention
+record_memory_history = cycle_memory_probe.record_memory_history
+sample_cuda_memory = cycle_memory_probe.sample_cuda_memory
 
 _OVERLAP_KEY = "overlap_moe_expert_parallel_comm"
 _SHARED_IMPL_CFG: dict[str, Any] = {"use_deepep": False, "recompute": []}
@@ -79,54 +86,11 @@ def build_config_only_plans(hf_path: str) -> tuple[dict[str, Any], dict[str, Any
     return baseline_plan, overlap_plan
 
 
-def _sample_cuda_memory() -> dict[str, int]:
-    """Reuse the established probe's reserved/allocated/inactive-split evidence."""
-    import torch
-
-    stats = torch.cuda.memory_stats()
-    allocated = torch.cuda.memory_allocated()
-    reserved = torch.cuda.memory_reserved()
-    return {
-        "allocated_bytes": allocated,
-        "reserved_bytes": reserved,
-        "reserved_minus_allocated_bytes": reserved - allocated,
-        "inactive_split_bytes": int(stats.get("inactive_split_bytes.all.current", 0)),
-    }
-
-
-def _live_stacks(snapshot: dict[str, Any], top_n: int) -> list[dict[str, Any]]:
-    """Existing probe's live allocation-stack aggregation, unchanged in criterion."""
-    grouped: dict[tuple[str, ...], list[int]] = {}
-    for segment in snapshot.get("segments", []) or []:
-        for block in segment.get("blocks", []) or []:
-            if block.get("state") not in {"active_allocated", "allocated"}:
-                continue
-            frames = block.get("frames") or []
-            if not frames and (history := block.get("history") or []):
-                frames = history[0].get("frames") or []
-            key = tuple(
-                f"{frame.get('filename', '?')}:{frame.get('line', '?')}:{frame.get('name', '?')}"
-                for frame in frames
-            )[:6]
-            if not key:
-                continue
-            entry = grouped.setdefault(key, [0, 0])
-            entry[0] += int(block.get("size", block.get("requested_size", 0)) or 0)
-            entry[1] += 1
-    return [
-        {"frames": list(key), "retained_bytes": value[0], "num_blocks": value[1]}
-        for key, value in sorted(
-            grouped.items(), key=lambda item: item[1][0], reverse=True
-        )[:top_n]
-    ]
-
-
 def _gpu_arm(
     name: str, cfg: BenchCliConfig, out_dir: Path, cycles: int, warmup: int
 ) -> None:
     """One arm of the copied per-cycle CSV/snapshot lifecycle."""
     import torch
-
     from examples.bench.session import PretrainSessionConfig, _make_data_iter
     from megatron.lite.runtime import create_runtime
 
@@ -136,12 +100,7 @@ def _gpu_arm(
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     torch.manual_seed(cfg.seed)
     torch.cuda.manual_seed_all(cfg.seed)
-    try:
-        torch.cuda.memory._record_memory_history(
-            enabled="all", stacks="all", max_entries=200000
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"_record_memory_history failed: {exc}") from exc
+    record_memory_history()
     runtime = create_runtime(build_runtime_config(cfg))
     handle = runtime.build_model()
     session = PretrainSessionConfig(
@@ -174,7 +133,7 @@ def _gpu_arm(
             before = {
                 "cycle": cycle,
                 "phase": "before",
-                **_sample_cuda_memory(),
+                **sample_cuda_memory(),
                 "step_ms": 0.0,
             }
             writer.writerow(before)
@@ -189,21 +148,14 @@ def _gpu_arm(
             after = {
                 "cycle": cycle,
                 "phase": "after",
-                **_sample_cuda_memory(),
+                **sample_cuda_memory(),
                 "step_ms": round((time.perf_counter() - started) * 1000, 3),
             }
             writer.writerow(after)
             rows.append(after)
             if cycle >= warmup:
-                try:
-                    torch.cuda.memory._dump_snapshot(
-                        out_dir / f"{name}-rank{rank}-cycle{cycle}.pickle"
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    raise RuntimeError(
-                        f"_dump_snapshot cycle {cycle} failed: {exc}"
-                    ) from exc
-    stacks = _live_stacks(torch.cuda.memory._snapshot(), top_n=15)
+                dump_snapshot(out_dir / f"{name}-rank{rank}-cycle{cycle}.pickle")
+    stacks = live_allocation_stacks(current_snapshot(), top_n=15)
     if not stacks:
         raise RuntimeError(
             "snapshot yielded no live allocation stacks; attribution evidence missing"
@@ -214,6 +166,15 @@ def _gpu_arm(
                 "arm": name,
                 "impl_cfg": json.loads(cfg.impl_cfg_json),
                 "rows": rows,
+                "retention": {
+                    metric: per_cycle_retention(
+                        rows, phase="after", metric=metric, warmup_cycles=warmup
+                    )
+                    for metric in (
+                        "reserved_minus_allocated_bytes",
+                        "inactive_split_bytes",
+                    )
+                },
                 "live_stacks": stacks,
             },
             indent=2,
