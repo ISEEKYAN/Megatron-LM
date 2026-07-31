@@ -120,6 +120,7 @@ class RuntimeBatchPlan:
 
     items: Any
     replicated_factory: Callable[[], Any] | None = None
+    output_sample_order: list[list[int]] | None = None
 
 
 __all__ = [

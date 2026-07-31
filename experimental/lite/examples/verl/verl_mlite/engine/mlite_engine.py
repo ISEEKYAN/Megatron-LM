@@ -934,6 +934,7 @@ class MegatronLiteEngine(BaseEngine):
             RuntimeBatchPlan(
                 items=iter(runtime_batches),
                 replicated_factory=_replicated_runtime_batch,
+                output_sample_order=indices,
             ),
             loss_fn=runtime_loss_fn,
             num_microbatches=num_micro_batches,

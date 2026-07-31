@@ -303,6 +303,7 @@ def prepare_runtime(
     forward_step: Callable,
     loss_fn: Callable | None,
     input_num_microbatches: int,
+    output_sample_order: list[list[int]] | None = None,
 ) -> tuple[
     Iterator[Any], int, Callable, Callable | None, Callable | None, Callable, Callable
 ]:
@@ -343,7 +344,10 @@ def prepare_runtime(
 
         def finish_records(records):
             return collect_records(
-                records, batch_size=batch_size, dcp_group=parallel_state.dp_cp_group
+                records,
+                batch_size=batch_size,
+                dcp_group=parallel_state.dp_cp_group,
+                output_sample_order=output_sample_order,
             )
 
     def microbatch_context(batch: PackedBatch):
@@ -398,9 +402,13 @@ def _detach_value(value: Any) -> Any:
 
 
 def collect_records(
-    records: list[dict[str, Any]], *, batch_size: int, dcp_group: Any
+    records: list[dict[str, Any]],
+    *,
+    batch_size: int,
+    dcp_group: Any,
+    output_sample_order: list[list[int]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Restore detached post-backward records to original sample order."""
+    """Collect detached records in the caller-requested postprocess order."""
     local = []
     output_device = None
     for record in records:
@@ -443,12 +451,23 @@ def collect_records(
             values = values_by_key.setdefault(key, {})
             for sample_id, part in zip(record["sample_ids"], parts, strict=True):
                 values[sample_id] = part
+    sample_order = (
+        list(range(batch_size))
+        if output_sample_order is None
+        else [int(sample_id) for group in output_sample_order for sample_id in group]
+    )
+    if sorted(sample_order) != list(range(batch_size)):
+        raise ValueError(
+            "Dynamic CP output_sample_order must contain each sample exactly once, "
+            f"got {sample_order}."
+        )
+
     restored = {}
     for key, values in values_by_key.items():
         if sorted(values) != list(range(batch_size)):
             raise RuntimeError(f"Dynamic CP output {key!r} is missing samples.")
         nested = torch.nested.as_nested_tensor(
-            [values[sample_id] for sample_id in range(batch_size)], layout=torch.jagged
+            [values[sample_id] for sample_id in sample_order], layout=torch.jagged
         )
         restored[key] = (
             nested.to(output_device) if output_device is not None else nested

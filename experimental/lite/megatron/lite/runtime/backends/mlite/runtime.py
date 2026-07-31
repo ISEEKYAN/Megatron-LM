@@ -492,8 +492,10 @@ class MegatronLiteRuntime(RuntimeBase):
             raise ValueError("num_microbatches must be >= 1")
 
         replicated_factory = None
+        output_sample_order = None
         if isinstance(data, RuntimeBatchPlan):
             replicated_factory = data.replicated_factory
+            output_sample_order = data.output_sample_order
             data = data.items
         if hasattr(data, "__next__"):
             data_iter = data
@@ -548,6 +550,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 forward_step=forward_step,
                 loss_fn=loss_fn,
                 input_num_microbatches=input_num_microbatches,
+                output_sample_order=output_sample_order,
             )
 
             capture_runtime_records = loss_fn is not None

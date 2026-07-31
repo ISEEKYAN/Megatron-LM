@@ -3,10 +3,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tensordict import TensorDict
+from verl.utils import tensordict_utils as tu
 
+from megatron.lite.primitive.parallel import dcp
+from megatron.lite.runtime.contracts import LossContext
+from verl_mlite.engine import mlite_engine as mlite_engine_module
 from verl_mlite.engine.config import MegatronLiteEngineConfig
 from verl_mlite.engine.mlite_engine import MegatronLiteEngine, _build_lr_scheduler
-from megatron.lite.runtime.contracts import LossContext
 
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
@@ -89,6 +93,42 @@ def test_runtime_parallel_fields_are_forwarded_generically_from_impl_config():
     assert config.parallel.dynamic_context_parallel is True
     assert config.parallel.max_seqlen_per_dp_cp_rank == 8192
     assert config.parallel.min_dynamic_context_parallel_size == 2
+
+
+def test_dcp_records_survive_verl_dynamic_batch_restore_in_input_order(monkeypatch):
+    """DCP must emit VERL's dynamic order before VERL restores the input order."""
+    data = TensorDict({}, batch_size=[3])
+    tu.assign_non_tensor(data, use_dynamic_bsz=True)
+    expected = [torch.full((i + 1,), i, dtype=torch.int64) for i in range(3)]
+    ordered_values = torch.nested.as_nested_tensor(expected, layout=torch.jagged)
+    records = [
+        {
+            "model_output": {"log_probs": ordered_values},
+            "loss": torch.tensor(1.0),
+            "metrics": {},
+            "_mlite_dcp_sample_ids": [0, 1, 2],
+            "_mlite_dcp_group_leader": True,
+        }
+    ]
+    dynamic_indices = [[2, 0], [1]]
+    assert [sample for group in dynamic_indices for sample in group] != list(range(3))
+    group = SimpleNamespace(size=lambda: 1)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda gathered, local, group: gathered.__setitem__(0, local),
+    )
+    completed = dcp.collect_records(
+        records,
+        batch_size=3,
+        dcp_group=group,
+        output_sample_order=dynamic_indices,
+    )
+    result = mlite_engine_module.postprocess_batch_func(completed, dynamic_indices, data)
+
+    actual = result["model_output"]["log_probs"].unbind()
+    assert len(actual) == len(expected)
+    assert all(torch.equal(got, want) for got, want in zip(actual, expected, strict=True))
 
 
 def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> None:
