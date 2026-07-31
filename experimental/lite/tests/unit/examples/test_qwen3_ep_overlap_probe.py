@@ -71,6 +71,39 @@ def test_overlap_probe_reuses_shared_cycle_memory_harness():
     assert not hasattr(probe, "_live_stacks")
 
 
+def test_overlap_probe_success_requires_all_rank_artifacts(tmp_path):
+    from examples.bench.qwen3_ep_overlap_probe import require_probe_artifacts
+
+    with pytest.raises(RuntimeError, match="probe evidence missing"):
+        require_probe_artifacts(
+            out_dir=tmp_path,
+            arm="baseline",
+            rank=3,
+            cycles=2,
+            warmup=1,
+        )
+
+    expected = [
+        tmp_path / "baseline-rank3.csv",
+        tmp_path / "baseline-rank3-summary.json",
+        tmp_path / "baseline-rank3-cycle1.pickle",
+        tmp_path / "baseline-rank3-cycle2.pickle",
+    ]
+    for path in expected:
+        path.write_bytes(b"evidence")
+
+    assert (
+        require_probe_artifacts(
+            out_dir=tmp_path,
+            arm="baseline",
+            rank=3,
+            cycles=2,
+            warmup=1,
+        )
+        == expected
+    )
+
+
 def test_cycle_memory_retention_separates_fragmentation_from_inactive_split():
     from examples.bench.cycle_memory_probe import per_cycle_retention
 
