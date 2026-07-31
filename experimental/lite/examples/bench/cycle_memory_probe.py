@@ -113,13 +113,10 @@ def per_cycle_retention(
     ]
     rows.sort(key=lambda row: int(row["cycle"]))
     if len(rows) < 2:
-        return {
-            "slope_bytes_per_cycle": 0.0,
-            "net_delta_bytes": 0.0,
-            "first_cycle": int(rows[0]["cycle"]) if rows else None,
-            "last_cycle": int(rows[-1]["cycle"]) if rows else None,
-            "n_points": len(rows),
-        }
+        raise ValueError(
+            "per-cycle retention requires at least 2 samples: "
+            f"phase={phase!r}, metric={metric!r}, n_points={len(rows)}"
+        )
     xs = [float(int(row["cycle"])) for row in rows]
     ys = [float(row[metric]) for row in rows]
     return {
