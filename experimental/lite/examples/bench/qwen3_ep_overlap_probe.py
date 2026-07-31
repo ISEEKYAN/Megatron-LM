@@ -91,6 +91,28 @@ def build_config_only_plans(hf_path: str) -> tuple[dict[str, Any], dict[str, Any
     return baseline_plan, overlap_plan
 
 
+def require_probe_artifacts(
+    out_dir: Path, arm: str, rank: int, cycles: int, warmup: int
+) -> list[Path]:
+    expected = [
+        out_dir / f"{arm}-rank{rank}.csv",
+        out_dir / f"{arm}-rank{rank}-summary.json",
+        *[
+            out_dir / f"{arm}-rank{rank}-cycle{cycle}.pickle"
+            for cycle in range(warmup, cycles + warmup)
+        ],
+    ]
+    missing = [
+        path for path in expected if not path.is_file() or path.stat().st_size == 0
+    ]
+    if missing:
+        raise RuntimeError(
+            "probe evidence missing or empty: "
+            + ", ".join(str(path) for path in missing)
+        )
+    return expected
+
+
 def _gpu_arm(
     name: str, cfg: BenchCliConfig, out_dir: Path, cycles: int, warmup: int
 ) -> None:
@@ -236,6 +258,13 @@ def main(argv: list[str] | None = None) -> int:
         impl_cfg_json=json.dumps(select_arm_config(args.arm), sort_keys=True),
     )
     _gpu_arm(args.arm, cfg, out_dir, args.cycles, args.warmup)
+    require_probe_artifacts(
+        out_dir=out_dir,
+        arm=args.arm,
+        rank=int(os.environ.get("RANK", "0")),
+        cycles=args.cycles,
+        warmup=args.warmup,
+    )
     print("QWEN3_EP_OVERLAP_PROBE_OK", flush=True)
     return 0
 
