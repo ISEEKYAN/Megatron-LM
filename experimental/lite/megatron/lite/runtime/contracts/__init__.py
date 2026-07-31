@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         ForwardResult,
         ModelOutputs,
         PackedBatch,
+        RuntimeBatchPlan,
         TrainBatch,
     )
     from megatron.lite.runtime.contracts.handle import ModelHandle
@@ -42,6 +43,7 @@ __all__ = [
     "PackedBatch",
     "ParallelConfig",
     "RuntimeConfig",
+    "RuntimeBatchPlan",
     "TrainBatch",
 ]
 
@@ -60,6 +62,7 @@ def __getattr__(name: str):
         "PackedBatch": "megatron.lite.runtime.contracts.data",
         "ParallelConfig": "megatron.lite.runtime.contracts.config",
         "RuntimeConfig": "megatron.lite.runtime.contracts.config",
+        "RuntimeBatchPlan": "megatron.lite.runtime.contracts.data",
         "TrainBatch": "megatron.lite.runtime.contracts.data",
     }
     if name in _lazy:

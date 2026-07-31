@@ -15,7 +15,12 @@ import torch
 import torch.distributed as dist
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
+from megatron.lite.runtime.contracts.data import (
+    ForwardResult,
+    ModelOutputs,
+    PackedBatch,
+    RuntimeBatchPlan,
+)
 from megatron.lite.runtime.contracts.handle import ModelHandle
 from megatron.lite.runtime.contracts.loss import get_loss_context, split_loss_context, use_loss_context
 
@@ -187,6 +192,11 @@ class MegatronLiteRuntime(RuntimeBase):
         else:
             rt_cfg = self._cfg
 
+        if rt_cfg.parallel.dynamic_context_parallel:
+            from megatron.lite.primitive.parallel.dcp import validate_runtime_config
+
+            validate_runtime_config(rt_cfg)
+
         # ── init distributed ──
         if not dist.is_initialized():
             dist.init_process_group("nccl", timeout=timedelta(minutes=10))
@@ -251,6 +261,11 @@ class MegatronLiteRuntime(RuntimeBase):
             raise ValueError("Megatron Lite model bundles must provide a typed forward_step.")
 
         p = rt_cfg.parallel
+        dynamic_cp_groups = None
+        if p.dynamic_context_parallel:
+            from megatron.lite.primitive.parallel.dcp import initialize_runtime
+
+            dynamic_cp_groups = initialize_runtime(bundle.parallel_state, rt_cfg)
         model = bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks
         return ModelHandle(
             model=model,
@@ -266,6 +281,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 "finalize_grads": bundle.finalize_grads,
                 "world_size": dist.get_world_size(),
                 "cp_range": (p.cp, p.cp),
+                "dynamic_cp_groups": dynamic_cp_groups,
                 **bundle.extras,
             },
         )
@@ -475,6 +491,10 @@ class MegatronLiteRuntime(RuntimeBase):
         if num_microbatches < 1:
             raise ValueError("num_microbatches must be >= 1")
 
+        replicated_factory = None
+        if isinstance(data, RuntimeBatchPlan):
+            replicated_factory = data.replicated_factory
+            data = data.items
         if hasattr(data, "__next__"):
             data_iter = data
         elif hasattr(data, "__iter__"):
@@ -482,12 +502,55 @@ class MegatronLiteRuntime(RuntimeBase):
         else:
             data_iter = iter([data])
 
+        ps = handle._parallel_state
+        parallel = handle.config.parallel if handle.config is not None else None
+        dynamic_cp = bool(parallel is not None and parallel.dynamic_context_parallel)
+        if dynamic_cp and router_replay is not None:
+            raise NotImplementedError(
+                "dynamic_context_parallel does not support router replay."
+            )
+
         replay_driver = RouterReplayDriver.maybe_create(handle, router_replay)
         if replay_driver is not None:
             replay_driver.begin()
             forward_step = replay_driver.wrap(forward_step)
 
-        ps = handle._parallel_state
+        finish_runtime_records = None
+        capture_runtime_records = False
+        microbatch_context = None
+        pre_forward_scale = None
+        if dynamic_cp:
+            from megatron.lite.primitive.parallel.dcp import prepare_runtime
+
+            groups = handle._extras.get("dynamic_cp_groups")
+            if not groups:
+                raise RuntimeError("Dynamic CP process groups were not initialized.")
+            if replicated_factory is None:
+                raise ValueError(
+                    "Dynamic CP requires a RuntimeBatchPlan with a replicated batch view."
+                )
+            input_num_microbatches = num_microbatches
+            data_iter = iter([replicated_factory()])
+            (
+                data_iter,
+                num_microbatches,
+                forward_step,
+                loss_fn,
+                finish_runtime_records,
+                microbatch_context,
+                pre_forward_scale,
+            ) = prepare_runtime(
+                data_iter,
+                num_microbatches=1,
+                parallel_state=ps,
+                config=parallel,
+                groups=groups,
+                forward_step=forward_step,
+                loss_fn=loss_fn,
+                input_num_microbatches=input_num_microbatches,
+            )
+
+            capture_runtime_records = loss_fn is not None
         if ps.pp_size > 1:
             from types import SimpleNamespace
 
@@ -548,6 +611,9 @@ class MegatronLiteRuntime(RuntimeBase):
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),
                     loss_fn=loss_fn,
                     forward_only=forward_only,
+                    capture_records=capture_runtime_records,
+                    microbatch_context=microbatch_context,
+                    pre_forward_scale=pre_forward_scale,
                 )
             finally:
                 if replay_driver is not None:
@@ -560,6 +626,9 @@ class MegatronLiteRuntime(RuntimeBase):
 
         loss_tensor = out.get("loss") if out else None
         metric_rows = out.get("_loss_fn_metrics", []) if out else []
+        records = out.get("_runtime_records", []) if out else []
+        if finish_runtime_records is not None:
+            records = finish_runtime_records(records)
         if ps.pp_size > 1:
             metric_rows += [item["metrics"] for item in outputs if item.get("metrics")]
         metrics: dict = {}
@@ -575,6 +644,8 @@ class MegatronLiteRuntime(RuntimeBase):
                 routed_experts=out.get("routed_experts") if out else None,
             ),
             metrics=metrics,
+            records=records,
+            records_complete=capture_runtime_records,
         )
 
     def is_mp_src_rank_with_outputs(self, handle: ModelHandle) -> bool:

@@ -28,6 +28,9 @@ class ParallelConfig:
     pp: int = 1
     vpp: int = 1
     cp: int = 1
+    dynamic_context_parallel: bool = False
+    max_seqlen_per_dp_cp_rank: int | None = None
+    min_dynamic_context_parallel_size: int = 1
     # Optional explicit mcore pipeline layout for advanced users (custom mode),
     # e.g. "E|t*5|t*6|t,m,L" (MTP `m` must sit on the final/loss stage; standalone MTP
     # is not supported yet). None -> auto-balanced from (num_layers, pp, mtp).

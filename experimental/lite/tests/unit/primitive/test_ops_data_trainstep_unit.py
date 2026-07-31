@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
 import torch
 import torch.nn as nn
@@ -185,6 +187,37 @@ def test_train_step_microbatch_loop_and_grad_clip_cpu_contract():
 
     assert torch.isfinite(grad_norm)
     assert model.weight.grad.norm() <= 0.25 + 1.0e-6
+
+
+def test_train_step_microbatch_context_encloses_backward():
+    active = False
+    backward_saw_context = []
+    parameter = torch.tensor(2.0, requires_grad=True)
+
+    @contextmanager
+    def _microbatch_context(_batch):
+        nonlocal active
+        active = True
+        try:
+            yield
+        finally:
+            active = False
+
+    def _forward(_model, _batch):
+        value = parameter.square()
+        value.register_hook(lambda grad: backward_saw_context.append(active) or grad)
+        return {"loss": value}
+
+    run_microbatch_loop(
+        None,
+        iter([{}]),
+        1,
+        _forward,
+        microbatch_context=_microbatch_context,
+    )
+
+    assert backward_saw_context == [True]
+    assert active is False
 
 
 def test_utils_ensure_divisible_returns_quotient_and_reports_context():

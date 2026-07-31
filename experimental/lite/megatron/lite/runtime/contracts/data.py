@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -109,6 +110,16 @@ class ForwardResult:
 
     model_output: ModelOutputs = field(default_factory=ModelOutputs)
     metrics: dict[str, Any] = field(default_factory=dict)
+    records: list[dict[str, Any]] = field(default_factory=list)
+    records_complete: bool = False
+
+
+@dataclass(slots=True)
+class RuntimeBatchPlan:
+    """Lazy alternate batch views offered to a runtime without feature coupling."""
+
+    items: Any
+    replicated_factory: Callable[[], Any] | None = None
 
 
 __all__ = [
@@ -116,5 +127,6 @@ __all__ = [
     "ForwardResult",
     "ModelOutputs",
     "PackedBatch",
+    "RuntimeBatchPlan",
     "TrainBatch",
 ]

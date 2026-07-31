@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import types
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -45,6 +46,95 @@ def test_runtime_returns_loss_separately_from_microbatch_metrics():
 
     assert result.metrics == {"micro": [0, 1]}
     assert result.model_output.loss is not None
+
+
+def test_runtime_delegates_dynamic_cp_once_and_collects_records(monkeypatch):
+    from megatron.lite.primitive.parallel import dcp
+    from megatron.lite.runtime.contracts.data import RuntimeBatchPlan
+
+    calls = []
+
+    def _prepare(data_iterator, **kwargs):
+        calls.append(("prepare", kwargs["num_microbatches"]))
+        item = next(data_iterator)
+        def _finish(records):
+            calls.append(("finish", len(records)))
+            return records
+
+        return (
+            iter([item, item]),
+            2,
+            kwargs["forward_step"],
+            kwargs["loss_fn"],
+            _finish,
+            lambda _batch: nullcontext(),
+            lambda _batch: 1,
+        )
+
+    monkeypatch.setattr(dcp, "prepare_runtime", _prepare)
+    model = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1)
+    handle = ModelHandle(
+        model=model,
+        parallel_state=types.SimpleNamespace(pp_size=1, dp_cp_group=object()),
+        config=types.SimpleNamespace(
+            parallel=ParallelConfig(
+                dynamic_context_parallel=True,
+                max_seqlen_per_dp_cp_rank=8,
+            )
+        ),
+        _extras={
+            "forward_step": lambda module, batch: {"value": module(batch["x"])},
+            "dynamic_cp_groups": {1: object()},
+        },
+    )
+
+    def _loss(out, _batch):
+        out["_runtime_model_output"] = {"value": out["value"]}
+        return out["value"].sum(), {}
+
+    result = MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
+        handle,
+        RuntimeBatchPlan(
+            items=iter([{"x": torch.ones(1, 1)}]),
+            replicated_factory=lambda: {"x": torch.ones(1, 1)},
+        ),
+        _loss,
+    )
+
+    assert calls == [("prepare", 1), ("finish", 2)]
+    assert len(result.records) == 2
+    assert [record["loss"].item() for record in result.records] == [1.0, 1.0]
+
+
+def test_static_runtime_does_not_delegate_dynamic_cp(monkeypatch):
+    from megatron.lite.primitive.parallel import dcp
+    from megatron.lite.runtime.contracts.data import RuntimeBatchPlan
+
+    monkeypatch.setattr(
+        dcp,
+        "prepare_runtime",
+        lambda *_args, **_kwargs: pytest.fail("static path must not schedule DCP"),
+    )
+    model = nn.Linear(1, 1, bias=False)
+    handle = ModelHandle(
+        model=model,
+        parallel_state=types.SimpleNamespace(pp_size=1),
+        config=types.SimpleNamespace(parallel=ParallelConfig()),
+        _extras={"forward_step": lambda module, batch: {"loss": module(batch).sum()}},
+    )
+
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
+        handle,
+        RuntimeBatchPlan(
+            items=iter([torch.ones(1, 1)]),
+            replicated_factory=lambda: pytest.fail(
+                "static path must not materialize replicated data"
+            ),
+        ),
+        loss_fn=None,
+    )
 
 
 def test_pipeline_callbacks_accept_wrapped_and_presplit_context():

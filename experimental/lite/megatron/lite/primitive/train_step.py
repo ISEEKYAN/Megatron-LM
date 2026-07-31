@@ -4,12 +4,26 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
 from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
+
+
+def _detach_runtime_output(value):
+    """Drop autograd graphs from values returned after per-microbatch backward."""
+    if isinstance(value, torch.Tensor):
+        return value.detach()
+    if isinstance(value, dict):
+        return {key: _detach_runtime_output(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detach_runtime_output(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_runtime_output(item) for item in value)
+    return value
 
 
 def run_microbatch_loop(
@@ -22,6 +36,9 @@ def run_microbatch_loop(
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
     forward_only: bool = False,
+    capture_records: bool = False,
+    microbatch_context: Callable | None = None,
+    pre_forward_scale: Callable | None = None,
 ):
     """Run forward-backward over microbatches with loss accumulation.
 
@@ -34,9 +51,11 @@ def run_microbatch_loop(
             see `pipeline_parallel/schedules.py`). Used e.g. by MoE aux-loss
             scale-setting; runtime stays model-agnostic by passing the hook
             through from the model bundle's extras.
-            # TODO: once CP is supported, align with MC's
-            # `schedules:297`-style scale of `cp_group_size / num_microbatches`
-            # (currently assumes ``cp_group_size == 1``).
+        microbatch_context: Optional callback returning a context manager that
+            encloses the pre-forward hook, forward, loss, and backward for one batch.
+        pre_forward_scale: Optional callback returning the numerator for the
+            pre-forward scale. The default is 1; CP runtimes may return their
+            current local CP size, matching MCore schedules.
         loss_fn: Optional external loss function.
             ``loss_fn(model_output: dict, batch) -> (loss: Tensor, metrics: dict)``.
             When provided, ``forward_fn`` output is passed to ``loss_fn`` instead of
@@ -48,29 +67,59 @@ def run_microbatch_loop(
     """
     last_out = None
     all_metrics: list[dict] = []
+    records: list[dict] = []
     for mb in range(num_microbatches):
         batch, loss_context = split_loss_context(next(data_iter))
-        if pre_forward_hook is not None:
-            scale = torch.tensor(1.0 / num_microbatches, device="cuda")
-            pre_forward_hook(scale)
-        with use_loss_context(loss_context):
-            out = forward_fn(model, batch)
-        if dist_opt and optimizer is not None and mb == num_microbatches - 1:
-            optimizer.grad_sync_enabled = True
-        if loss_fn is not None:
-            if loss_context is None:
-                loss, metrics = loss_fn(out, batch)
-            else:
-                loss, metrics = loss_fn(out, batch, loss_context)
-            if not forward_only:
-                (loss / num_microbatches).backward()
-            out["loss"] = loss.detach()
-            all_metrics.append(metrics)
-        elif not forward_only:
-            (out["loss"] / num_microbatches).backward()
+        active_context = (
+            nullcontext() if microbatch_context is None else microbatch_context(batch)
+        )
+        with active_context:
+            if pre_forward_hook is not None:
+                scale_numerator = (
+                    1.0 if pre_forward_scale is None else pre_forward_scale(batch)
+                )
+                scale = torch.tensor(
+                    scale_numerator / num_microbatches, device="cuda"
+                )
+                pre_forward_hook(scale)
+            with use_loss_context(loss_context):
+                out = forward_fn(model, batch)
+            if dist_opt and optimizer is not None and mb == num_microbatches - 1:
+                optimizer.grad_sync_enabled = True
+            if loss_fn is not None:
+                if loss_context is None:
+                    loss, metrics = loss_fn(out, batch)
+                else:
+                    loss, metrics = loss_fn(out, batch, loss_context)
+                if not forward_only:
+                    (loss / num_microbatches).backward()
+                out["loss"] = loss.detach()
+                all_metrics.append(metrics)
+                if capture_records:
+                    records.append(
+                        {
+                            "model_output": _detach_runtime_output(
+                                out.get("_runtime_model_output")
+                            ),
+                            "loss": out.get("_runtime_reported_loss", loss.detach()),
+                            "metrics": metrics,
+                            **{
+                                key: out[key]
+                                for key in (
+                                    "_mlite_dcp_sample_ids",
+                                    "_mlite_dcp_group_leader",
+                                )
+                                if key in out
+                            },
+                        }
+                    )
+            elif not forward_only:
+                (out["loss"] / num_microbatches).backward()
         last_out = out
     if last_out is not None and all_metrics:
         last_out["_loss_fn_metrics"] = all_metrics
+        if records:
+            last_out["_runtime_records"] = records
     return last_out
 
 

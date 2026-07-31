@@ -72,6 +72,25 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
 
 
+def test_runtime_parallel_fields_are_forwarded_generically_from_impl_config():
+    engine = _engine(
+        engine_config=_engine_config(
+            impl_cfg={
+                "use_thd": True,
+                "dynamic_context_parallel": True,
+                "max_seqlen_per_dp_cp_rank": 8192,
+                "min_dynamic_context_parallel_size": 2,
+            }
+        )
+    )
+
+    config = engine._build_mlite_config()
+
+    assert config.parallel.dynamic_context_parallel is True
+    assert config.parallel.max_seqlen_per_dp_cp_rank == 8192
+    assert config.parallel.min_dynamic_context_parallel_size == 2
+
+
 def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> None:
     engine = _engine(
         engine_config=_engine_config(optimizer_offload=True),

@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from dataclasses import fields as dc_fields
 from enum import Enum
 from typing import Any
 
@@ -16,7 +17,7 @@ from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts import LossContext, PackedBatch
+from megatron.lite.runtime.contracts import LossContext, PackedBatch, RuntimeBatchPlan
 from megatron.lite.runtime.contracts.config import OptimizerConfig as MegatronLiteOptimizerConfig
 from megatron.lite.runtime.contracts.config import ParallelConfig, RuntimeConfig
 from tensordict import TensorDict
@@ -744,18 +745,21 @@ class MegatronLiteEngine(BaseEngine):
             raise RuntimeError("MegatronLiteEngine is not initialized yet.")
 
     def _build_mlite_config(self) -> MegatronLiteConfig:
+        parallel = ParallelConfig(
+            **{
+                item.name: self.engine_config.impl_cfg.get(
+                    item.name,
+                    getattr(self.engine_config, item.name, item.default),
+                )
+                for item in dc_fields(ParallelConfig)
+            }
+        )
+        parallel.etp = parallel.etp or 1
         return MegatronLiteConfig(
             model_name=self._resolve_model_name(),
             impl=self.engine_config.impl,
             hf_path=self.model_config.local_path,
-            parallel=ParallelConfig(
-                tp=self.engine_config.tp,
-                etp=self.engine_config.etp or 1,
-                ep=self.engine_config.ep,
-                pp=self.engine_config.pp,
-                vpp=self.engine_config.vpp,
-                cp=self.engine_config.cp,
-            ),
+            parallel=parallel,
             optimizer=self._build_mlite_optimizer_config(),
             attention_backend_override=self.engine_config.attention_backend_override,
             # verl's megatron backend hard-disables the load-balancing objective
@@ -917,14 +921,27 @@ class MegatronLiteEngine(BaseEngine):
                 "router_replay_mode='R3' requires routed_experts on every "
                 "actor micro-batch in a step."
             )
+
+        def _replicated_runtime_batch():
+            source_batch = data.to(get_device_id())
+            return (
+                self._make_runtime_batch(source_batch),
+                self._make_runtime_loss_context(source_batch, loss_scale=loss_scale),
+            )
+
         result = self.runtime.forward_backward(
             self.handle,
-            iter(runtime_batches),
+            RuntimeBatchPlan(
+                items=iter(runtime_batches),
+                replicated_factory=_replicated_runtime_batch,
+            ),
             loss_fn=runtime_loss_fn,
             num_microbatches=num_micro_batches,
             forward_only=forward_only,
             router_replay={"action": "replay"} if replay_enabled else None,
         )
+        if result.records_complete and self.is_mp_src_rank_with_outputs():
+            return postprocess_batch_func(output_lst=result.records, indices=indices, data=data)
         if reduced_outputs is not None:
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
         metrics = dict(result.metrics)
@@ -1071,6 +1088,7 @@ class MegatronLiteEngine(BaseEngine):
                 raw_output=raw_output, runtime_batch=runtime_batch
             )
             raw_output["_verl_model_output"] = model_output
+            raw_output["_runtime_model_output"] = model_output
             if loss_function is not None:
                 loss, metrics = loss_function(
                     model_output=model_output,
@@ -1089,6 +1107,7 @@ class MegatronLiteEngine(BaseEngine):
                 )
 
             raw_output["_verl_metrics"] = metrics
+            raw_output["_runtime_reported_loss"] = loss.detach()
             if output_lst is not None:
                 output_lst.append(
                     {
