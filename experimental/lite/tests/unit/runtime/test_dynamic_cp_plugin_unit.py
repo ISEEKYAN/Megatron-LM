@@ -239,7 +239,7 @@ def test_mixed_cp_plan_reports_each_sample_group_and_histogram(monkeypatch, caps
 
     assert local_cp_sizes == [1, 2]
     assert capsys.readouterr().out.splitlines() == [
-        'MLITE_DYNAMIC_CP_PLAN step=0 cp_size_space=[1,2] '
+        "MLITE_DYNAMIC_CP_PLAN step=0 cp_size_space=[1,2] "
         'cp_size_histogram={"1":2,"2":1} '
         'groups=[{"cp_size":1,"ranks":[0],"sample_ids":[0]},'
         '{"cp_size":1,"ranks":[1],"sample_ids":[2]},'
@@ -335,7 +335,10 @@ def test_mixed_cp_uses_pool_global_token_count_for_loss_normalization(monkeypatc
     assert torch.equal(dcp_global_loss, baseline_global_loss)
 
 
-def test_dynamic_cp_missing_loss_mask_fails_before_normalization_can_degrade(monkeypatch):
+@pytest.mark.parametrize("with_context", [False, True])
+def test_dynamic_cp_missing_loss_mask_fails_before_normalization_can_degrade(
+    monkeypatch, with_context
+):
     from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
 
     module = types.ModuleType("megatron.core.datasets.data_schedule")
@@ -380,9 +383,13 @@ def test_dynamic_cp_missing_loss_mask_fails_before_normalization_can_degrade(mon
                             labels=torch.tensor([1, 2]),
                             seq_lens=torch.tensor([1, 1]),
                         ),
-                        LossContext(
-                            loss_scale=0.5,
-                            source_batch=torch.tensor([[0.0], [0.0]]),
+                        (
+                            LossContext(
+                                loss_scale=0.5,
+                                source_batch=torch.tensor([[0.0], [0.0]]),
+                            )
+                            if with_context
+                            else None
                         ),
                     )
                 ]
@@ -504,7 +511,7 @@ def test_logical_dp_loss_compensates_physical_pool_average(monkeypatch):
     prepared.finish(require_complete=True)
 
 
-def test_restore_outputs_keeps_metrics_from_every_distinct_leader(monkeypatch):
+def test_restore_outputs_merges_metrics_from_every_distinct_leader(monkeypatch):
     from megatron.lite.runtime.backends.mlite import dynamic_cp
 
     pool = _Group(2)
@@ -540,11 +547,62 @@ def test_restore_outputs_keeps_metrics_from_every_distinct_leader(monkeypatch):
         device=torch.device("cpu"),
     )
 
-    scores = [item["metrics"]["score"] for item in collector if "metrics" in item]
+    assert len(collector) == 1
+    scores = collector[0]["metrics"]["score"]
     assert scores == [1.0, 3.0]
     assert sum(scores) / len(scores) == 2.0
     assert sum(scores) / len(scores) not in scores
     assert sum(item.get("loss", 0.0) for item in collector) == 4.0
+
+
+def test_restore_outputs_preserves_metric_aggregator_across_leaders(monkeypatch):
+    from megatron.lite.runtime.backends.mlite import dynamic_cp
+
+    class Metric:
+        def __init__(self, values):
+            self.values = list(values)
+
+        def init_list(self):
+            return Metric([])
+
+        def append(self, value):
+            self.values.extend(value.values)
+
+    pool = _Group(2)
+    rank0_records = [
+        {
+            "sample_ids": [0],
+            "model_output": {},
+            "loss": 0.0,
+            "metrics": {"score": Metric([1.0])},
+        }
+    ]
+    rank1_records = [
+        {
+            "sample_ids": [1],
+            "model_output": {},
+            "loss": 0.0,
+            "metrics": {"score": Metric([3.0])},
+        }
+    ]
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, _records, group: output.__setitem__(
+            slice(None), [rank0_records, rank1_records]
+        ),
+    )
+    collector = []
+
+    dynamic_cp._restore_outputs(
+        collector,
+        rank0_records,
+        pool=pool,
+        input_groups=[[0, 1]],
+        device=torch.device("cpu"),
+    )
+
+    assert collector[0]["metrics"]["score"].values == [1.0, 3.0]
 
 
 def _loss_fn(kind: str, collector: list[dict]):
