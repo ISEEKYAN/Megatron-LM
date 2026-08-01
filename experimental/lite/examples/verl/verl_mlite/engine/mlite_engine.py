@@ -950,7 +950,9 @@ class MegatronLiteEngine(BaseEngine):
                 )
 
             raw_output["_verl_metrics"] = metrics
-            if output_lst is not None:
+            if output_lst is not None and not getattr(
+                _loss_fn, "runtime_collects_outputs", False
+            ):
                 output_lst.append(
                     {
                         "model_output": model_output,
@@ -960,6 +962,8 @@ class MegatronLiteEngine(BaseEngine):
                 )
             return (loss * num_microbatches if loss_function is not None else loss), metrics
 
+        _loss_fn.runtime_output_collector = output_lst
+        _loss_fn.runtime_output_extractor = lambda output: output["_verl_model_output"]
         return _loss_fn
 
     def _mtp_enable_train(self) -> bool:

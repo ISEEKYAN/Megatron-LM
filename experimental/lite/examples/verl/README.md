@@ -55,6 +55,8 @@ bash experimental/lite/examples/verl/scripts/run_qwen3moe_sft.sh
 Useful knobs:
 
 - `TP_SIZE`, `PP_SIZE`, `VPP_SIZE`, `CP_SIZE`, `EP_SIZE`, `ETP_SIZE`
+- `DYNAMIC_CONTEXT_PARALLEL=True`, `MAX_SEQLEN_PER_DP_CP_RANK`, and
+  `MIN_DYNAMIC_CONTEXT_PARALLEL_SIZE` enable runtime-owned dynamic CP scheduling
 - `TOTAL_STEPS`, `TOTAL_EPOCHS`, `TRAIN_BATCH_SIZE`, `MICRO_BATCH_SIZE`
 - `MAX_TOKENS_PER_GPU`, `MAX_LENGTH`, `MESSAGES_KEY`
 - `PARAM_OFFLOAD`, `OPTIMIZER_OFFLOAD`, `GRAD_OFFLOAD`
@@ -75,6 +77,18 @@ Example dry run:
 MODEL_PATH=/path/to/qwen3.5-35b-a3b-hf \
 TRAIN_FILES=/path/to/train.parquet \
 DRY_RUN=1 \
+bash experimental/lite/examples/verl/scripts/run_qwen3moe_sft.sh
+```
+
+Dynamic CP keeps the same VERL engine API and is enabled as an MLite runtime
+plugin:
+
+```bash
+MODEL_PATH=/path/to/qwen3.5-35b-a3b-hf \
+TRAIN_FILES=/path/to/train.parquet \
+NUM_GPUS=4 TP_SIZE=1 CP_SIZE=1 EP_SIZE=1 \
+DYNAMIC_CONTEXT_PARALLEL=True \
+MAX_SEQLEN_PER_DP_CP_RANK=4096 \
 bash experimental/lite/examples/verl/scripts/run_qwen3moe_sft.sh
 ```
 
