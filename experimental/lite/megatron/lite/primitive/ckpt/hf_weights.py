@@ -178,7 +178,7 @@ class SafeTensorReader:
         self._stack: ExitStack | None = None
         self._handles: dict[Path, Any] = {}
         self._cached_request: (
-            tuple[str, torch.device, torch.Size | None, torch.dtype | None] | None
+            tuple[str, torch.device, torch.Size | None, torch.dtype | None, bool] | None
         ) = None
         self._cached_tensor: torch.Tensor | None = None
 
@@ -214,9 +214,10 @@ class SafeTensorReader:
         device: torch.device | str | None = None,
         target_shape: torch.Size | None = None,
         target_dtype: torch.dtype | None = None,
+        raw: bool = False,
     ) -> torch.Tensor:
         target_device = torch.device(self.device if device is None else device)
-        request = (name, target_device, target_shape, target_dtype)
+        request = (name, target_device, target_shape, target_dtype, raw)
         if request == self._cached_request:
             assert self._cached_tensor is not None
             return self._cached_tensor
@@ -226,10 +227,7 @@ class SafeTensorReader:
             return tensor
 
         tensor = self._get_raw_tensor(name, target_device)
-        if name.endswith(("_packed", "_scale")):
-            # Explicit physical quantization components are consumed together
-            # by the model weight spec.  They are not standalone one-byte
-            # weights for this generic reader to dequantize.
+        if raw:
             self._cached_request, self._cached_tensor = request, tensor
             return tensor
         scaled_quantized = isinstance(
@@ -1289,12 +1287,16 @@ def _read_hf_tensors(
             )
         else:
             target_shape = None
-        tensor = reader.get_tensor(
-            resolved,
-            device=target.device,
-            target_shape=target_shape,
-            target_dtype=target.dtype,
-        )
+        raw_source = getattr(spec, "raw_hf_source", None)
+        if callable(raw_source) and raw_source(native_name, index, resolved):
+            tensor = reader.get_tensor(resolved, device=target.device, raw=True)
+        else:
+            tensor = reader.get_tensor(
+                resolved,
+                device=target.device,
+                target_shape=target_shape,
+                target_dtype=target.dtype,
+            )
         transform_source = getattr(spec, "transform_hf_source", None)
         if callable(transform_source):
             tensor = transform_source(native_name, index, resolved, tensor)

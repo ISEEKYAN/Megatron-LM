@@ -62,18 +62,42 @@ def test_safe_tensor_reader_rejects_one_byte_quantized_weight_without_scale(
         )
 
 
-@pytest.mark.parametrize("suffix", ["packed", "scale"])
-def test_safe_tensor_reader_preserves_explicit_quantization_components(suffix) -> None:
-    name = f"expert.weight_{suffix}"
-    physical = torch.tensor([[0, 127, 255]], dtype=torch.uint8)
-    actual = _reader({name: physical}).get_tensor(
-        name,
-        target_shape=physical.shape,
-        target_dtype=torch.bfloat16,
+def test_explicit_packed_component_without_plan_context_still_fails_loudly() -> None:
+    name = "expert.weight_packed"
+    with pytest.raises(RuntimeError, match=r"expert\.weight_packed.*missing scale"):
+        _reader({name: torch.ones((2, 2), dtype=torch.uint8)}).get_tensor(
+            name,
+            target_shape=torch.Size((2, 4)),
+            target_dtype=torch.bfloat16,
+        )
+
+
+def test_load_plan_can_request_paired_physical_quantization_components() -> None:
+    packed = torch.tensor([[0, 127, 255]], dtype=torch.uint8)
+    scale = torch.tensor([[121, 122, 123]], dtype=torch.uint8)
+    tensors = {
+        "expert.weight_packed": packed,
+        "expert.weight_scale": scale,
+    }
+
+    class Spec:
+        @staticmethod
+        def raw_hf_source(native_name, index, resolved_name):
+            assert native_name == "expert.weight"
+            assert resolved_name in tensors
+            return index in (0, 1)
+
+    actual = _read_hf_tensors(
+        _reader(tensors),
+        Spec(),
+        "expert.weight",
+        ["expert.weight_packed", "expert.weight_scale"],
+        torch.empty((2, 4), dtype=torch.bfloat16),
     )
 
-    assert actual.dtype == torch.uint8
-    assert torch.equal(actual, physical)
+    assert [tensor.dtype for tensor in actual] == [torch.uint8, torch.uint8]
+    assert torch.equal(actual[0], packed)
+    assert torch.equal(actual[1], scale)
 
 
 def test_multi_source_mapping_dequantizes_each_fp8_block_scaled_source() -> None:
