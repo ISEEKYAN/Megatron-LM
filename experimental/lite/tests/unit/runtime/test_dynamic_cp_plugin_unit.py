@@ -36,6 +36,7 @@ def test_dynamic_cp_exposes_logical_dp_one_without_replacing_physical_dp(monkeyp
     physical_dp_group = _Group(4, rank=2)
     pool_group = _Group(4, rank=2)
     logical_dp_group = _Group(1)
+    cp2_group = _Group(2)
     ps = SimpleNamespace(
         dp_size=4,
         dp_rank=2,
@@ -58,6 +59,7 @@ def test_dynamic_cp_exposes_logical_dp_one_without_replacing_physical_dp(monkeyp
         {"max_seqlen_per_dp_cp_rank": 8},
         create_groups=lambda _ps, _minimum, _parallel: {
             1: logical_dp_group,
+            2: cp2_group,
             4: pool_group,
         },
     )
@@ -162,10 +164,222 @@ class _SplitScheduler:
         return [[[0], [1]]]
 
 
+class _MixedCPScheduler:
+    def __init__(self, **_kwargs):
+        pass
+
+    def get_groups_and_subsamples(self, sample_lengths):
+        assert sample_lengths == [(0, 2), (1, 8), (2, 2)]
+        return [[[0], [2]], [[1], [1]]]
+
+
+class _CP4OnlyScheduler:
+    def __init__(self, **_kwargs):
+        pass
+
+    def get_groups_and_subsamples(self, sample_lengths):
+        assert sample_lengths == [(0, 16)]
+        return [[[0], [0], [0], [0]]]
+
+
 def _install_fake_scheduler(monkeypatch):
     module = types.ModuleType("megatron.core.datasets.data_schedule")
     module.DefaultDynamicCPScheduler = _CrossCutScheduler
     monkeypatch.setitem(sys.modules, "megatron.core.datasets.data_schedule", module)
+
+
+def test_mixed_cp_plan_reports_each_sample_group_and_histogram(monkeypatch, capsys):
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
+
+    module = types.ModuleType("megatron.core.datasets.data_schedule")
+    module.DefaultDynamicCPScheduler = _MixedCPScheduler
+    monkeypatch.setitem(sys.modules, "megatron.core.datasets.data_schedule", module)
+    pool, singleton = _Group(2), _Group(1)
+    ps = SimpleNamespace(
+        dp_size=2,
+        dp_rank=0,
+        dp_group=pool,
+        dp_cp_group=pool,
+        cp_size=1,
+        cp_rank=0,
+        cp_group=singleton,
+        pp_size=1,
+    )
+    handle = ModelHandle(
+        model=object(),
+        parallel_state=ps,
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(tp=1, cp=1, pp=1, vpp=1),
+            impl_cfg={"use_thd": True},
+        ),
+        _extras={"forward_step": lambda *_args: {}},
+    )
+    plugin = DynamicCPPlugin(
+        {"max_seqlen_per_dp_cp_rank": 4},
+        create_groups=lambda _ps, _minimum, _parallel: {1: singleton, 2: pool},
+    )
+    plugin.initialize(handle)
+    prepared = plugin._prepare(
+        handle,
+        PackedBatch(
+            input_ids=torch.arange(12),
+            labels=torch.arange(12),
+            seq_lens=torch.tensor([2, 8, 2]),
+        ),
+        None,
+        1,
+    )
+
+    local_cp_sizes = []
+    for item in prepared.data:
+        selected, _context = split_loss_context(item)
+        local_cp_sizes.append(selected.extras["_mlite_dcp_local_cp_size"])
+    prepared.finish(require_complete=True)
+
+    assert local_cp_sizes == [1, 2]
+    assert capsys.readouterr().out.splitlines() == [
+        'MLITE_DYNAMIC_CP_PLAN step=0 cp_size_space=[1,2] '
+        'cp_size_histogram={"1":2,"2":1} '
+        'groups=[{"cp_size":1,"ranks":[0],"sample_ids":[0]},'
+        '{"cp_size":1,"ranks":[1],"sample_ids":[2]},'
+        '{"cp_size":2,"ranks":[0,1],"sample_ids":[1]}] global_num_tokens=None'
+    ]
+
+
+def test_mixed_cp_uses_pool_global_token_count_for_loss_normalization(monkeypatch):
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
+
+    module = types.ModuleType("megatron.core.datasets.data_schedule")
+    module.DefaultDynamicCPScheduler = _MixedCPScheduler
+    monkeypatch.setitem(sys.modules, "megatron.core.datasets.data_schedule", module)
+
+    def run_rank(rank):
+        pool, singleton = _Group(2, rank), _Group(1)
+
+        def sum_uneven_owned_tokens(value, *, group):
+            assert group is pool
+            owned = 7 if rank == 0 else 1
+            peer = 1 if rank == 0 else 7
+            assert torch.equal(value, torch.tensor(owned, dtype=torch.int64))
+            value.add_(peer)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", sum_uneven_owned_tokens)
+        ps = SimpleNamespace(
+            dp_size=2,
+            dp_rank=rank,
+            dp_group=pool,
+            dp_cp_group=pool,
+            cp_size=1,
+            cp_rank=0,
+            cp_group=singleton,
+            pp_size=1,
+        )
+        handle = ModelHandle(
+            model=object(),
+            parallel_state=ps,
+            config=SimpleNamespace(
+                parallel=SimpleNamespace(tp=1, cp=1, pp=1, vpp=1),
+                impl_cfg={"use_thd": True},
+            ),
+            _extras={"forward_step": lambda *_args: {}},
+        )
+        plugin = DynamicCPPlugin(
+            {"max_seqlen_per_dp_cp_rank": 4},
+            create_groups=lambda _ps, _minimum, _parallel: {1: singleton, 2: pool},
+        )
+        plugin.initialize(handle)
+        prepared = plugin._prepare(
+            handle,
+            iter(
+                [
+                    (
+                        PackedBatch(
+                            input_ids=torch.arange(12),
+                            labels=torch.arange(12),
+                            seq_lens=torch.tensor([2, 8, 2]),
+                            loss_mask=torch.tensor(
+                                [1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0]
+                            ),
+                        ),
+                        LossContext(loss_scale=1 / 4, source_batch=torch.zeros(3, 1)),
+                    )
+                ]
+            ),
+            lambda _output, selected, context: (
+                selected.loss_mask.sum(dtype=torch.float32) * context.loss_scale,
+                {},
+            ),
+            1,
+        )
+        losses = []
+        token_counts = []
+        for item in prepared.data:
+            selected, context = split_loss_context(item)
+            loss, _metrics = prepared.loss({}, selected, context)
+            losses.append(loss)
+            token_counts.append(selected.extras["_mlite_dcp_global_num_tokens"])
+        prepared.finish(require_complete=True)
+        return sum(losses) / len(losses), token_counts
+
+    rank0_loss, rank0_tokens = run_rank(0)
+    rank1_loss, rank1_tokens = run_rank(1)
+    dcp_global_loss = (rank0_loss + rank1_loss) / 2
+    baseline_tokens = torch.tensor(7, dtype=torch.int64) + torch.tensor(
+        1, dtype=torch.int64
+    )
+    baseline_global_loss = torch.tensor(8.0) / baseline_tokens
+
+    assert rank0_tokens == rank1_tokens == [8, 8]
+    assert torch.equal(baseline_tokens, torch.tensor(8, dtype=torch.int64))
+    assert torch.equal(dcp_global_loss, baseline_global_loss)
+
+
+def test_required_cp_size_coverage_fails_loudly(monkeypatch):
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
+
+    module = types.ModuleType("megatron.core.datasets.data_schedule")
+    module.DefaultDynamicCPScheduler = _CP4OnlyScheduler
+    monkeypatch.setitem(sys.modules, "megatron.core.datasets.data_schedule", module)
+    pool, singleton, cp2 = _Group(4), _Group(1), _Group(2)
+    ps = SimpleNamespace(
+        dp_size=4,
+        dp_rank=0,
+        dp_group=pool,
+        dp_cp_group=pool,
+        cp_size=1,
+        cp_rank=0,
+        cp_group=singleton,
+        pp_size=1,
+    )
+    handle = ModelHandle(
+        model=object(),
+        parallel_state=ps,
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(tp=1, cp=1, pp=1, vpp=1),
+            impl_cfg={"use_thd": True},
+        ),
+        _extras={"forward_step": lambda *_args: {}},
+    )
+    plugin = DynamicCPPlugin(
+        {"max_seqlen_per_dp_cp_rank": 4, "require_full_cp_size_coverage": True},
+        create_groups=lambda _ps, _minimum, _parallel: {1: singleton, 2: cp2, 4: pool},
+    )
+    plugin.initialize(handle)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"did not cover required cp_size values \[1, 2\]; expected \[1, 2, 4\]",
+    ):
+        plugin._prepare(
+            handle,
+            PackedBatch(
+                input_ids=torch.arange(16),
+                labels=torch.arange(16),
+                seq_lens=torch.tensor([16]),
+            ),
+            None,
+            1,
+        )
 
 
 def test_logical_dp_loss_compensates_physical_pool_average(monkeypatch):

@@ -9,6 +9,7 @@ physical DP group for gradient synchronization.
 
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, fields, replace
@@ -23,6 +24,8 @@ from megatron.lite.runtime.contracts.loss import LossContext, split_loss_context
 _SAMPLE_IDS = "_mlite_dcp_sample_ids"
 _GROUP_LEADER = "_mlite_dcp_group_leader"
 _LOCAL_CP_SIZE = "_mlite_dcp_local_cp_size"
+_GLOBAL_NUM_TOKENS = "_mlite_dcp_global_num_tokens"
+_LOSS_SCALE_CORRECTION = "_mlite_dcp_loss_scale_correction"
 
 
 def _positive_power_of_two(value: int, name: str) -> int:
@@ -395,9 +398,14 @@ class DynamicCPPlugin:
             int(config.get("min_context_parallel_size", 1)),
             "min_context_parallel_size",
         )
+        require_coverage = config.get("require_full_cp_size_coverage", False)
+        if type(require_coverage) is not bool:
+            raise TypeError("require_full_cp_size_coverage must be a bool.")
+        self.require_full_coverage = require_coverage
         self._create_groups = create_groups or _create_groups
         self._groups: dict[int, Any] | None = None
         self._pool: Any = None
+        self._step = 0
 
     def initialize(self, handle: Any) -> Any:
         ps = handle._parallel_state
@@ -413,10 +421,21 @@ class DynamicCPPlugin:
         if self.minimum > pool_size:
             raise ValueError("Dynamic CP minimum group size exceeds the DPxCP pool.")
         groups = self._create_groups(ps, self.minimum, parallel)
+        cp_size_space = []
+        size = self.minimum
+        while size <= pool_size:
+            cp_size_space.append(size)
+            size *= 2
+        missing_groups = [size for size in cp_size_space if size not in groups]
+        if missing_groups:
+            raise RuntimeError(
+                f"Dynamic CP groups omit cp_size values {missing_groups}."
+            )
         logical = groups.get(1)
         if logical is None or logical.size() != 1:
             raise RuntimeError("Dynamic CP requires a singleton logical DP group.")
         self._groups, self._pool = groups, pool
+        self._cp_size_space = cp_size_space
         handle._extras.update(
             logical_dp_size=1,
             logical_dp_rank=0,
@@ -478,6 +497,8 @@ class DynamicCPPlugin:
             ]
         )
         covered = []
+        plan_groups = []
+        cp_size_histogram: dict[int, int] = {}
         for assignments in plans:
             if len(assignments) != self._pool.size() or any(
                 not ids for ids in assignments
@@ -496,11 +517,55 @@ class DynamicCPPlugin:
                         raise RuntimeError(
                             "Dynamic CP subgroup members must be contiguous."
                         )
-                    covered.extend(int(index) for index in ids)
+                    sample_ids = [int(index) for index in ids]
+                    cp_size = len(members)
+                    covered.extend(sample_ids)
+                    plan_groups.append(
+                        {"cp_size": cp_size, "ranks": members, "sample_ids": sample_ids}
+                    )
+                    cp_size_histogram[cp_size] = cp_size_histogram.get(
+                        cp_size, 0
+                    ) + len(sample_ids)
                     seen.add(key)
         if sorted(covered) != list(range(len(samples))):
             raise RuntimeError(
                 "Dynamic CP plan must cover every input sample exactly once."
+            )
+        missing_cp_sizes = sorted(set(self._cp_size_space) - set(cp_size_histogram))
+        global_num_tokens = None
+        if all(sample["loss_mask"] is not None for sample in samples):
+            owned_ids = [
+                sample_id
+                for group in plan_groups
+                if group["ranks"][0] == self._pool.rank()
+                for sample_id in group["sample_ids"]
+            ]
+            owned_num_tokens = torch.zeros((), dtype=torch.int64, device=device)
+            for sample_id in owned_ids:
+                owned_num_tokens += samples[sample_id]["loss_mask"].sum(
+                    dtype=torch.int64
+                )
+            torch.distributed.all_reduce(owned_num_tokens, group=self._pool)
+            global_num_tokens = int(owned_num_tokens.item())
+            if global_num_tokens < 1:
+                raise ValueError("Dynamic CP requires a positive global token count.")
+        if self._pool.rank() == 0:
+            histogram = {
+                str(size): cp_size_histogram[size] for size in sorted(cp_size_histogram)
+            }
+            print(
+                f"MLITE_DYNAMIC_CP_PLAN step={self._step} "
+                f"cp_size_space={json.dumps(self._cp_size_space, separators=(',', ':'))} "
+                f"cp_size_histogram={json.dumps(histogram, separators=(',', ':'))} "
+                f"groups={json.dumps(plan_groups, separators=(',', ':'))} "
+                f"global_num_tokens={global_num_tokens}",
+                flush=True,
+            )
+        self._step += 1
+        if self.require_full_coverage and missing_cp_sizes:
+            raise RuntimeError(
+                "Dynamic CP plan did not cover required cp_size values "
+                f"{missing_cp_sizes}; expected {self._cp_size_space}."
             )
         rank = self._pool.rank()
         scheduled = []
@@ -521,9 +586,18 @@ class DynamicCPPlugin:
             batch = _select_batch(
                 samples, ids, cp_size=cp_size, leader=rank == members[0]
             )
-            scheduled.append(
-                (batch, _select_context(contexts, ids, batch.input_ids.device))
-            )
+            context = _select_context(contexts, ids, batch.input_ids.device)
+            correction = 1.0
+            if context is not None and global_num_tokens is not None:
+                if context.loss_scale <= 0:
+                    raise ValueError(
+                        f"Dynamic CP requires positive loss_scale, got {context.loss_scale}."
+                    )
+                correct_scale = num_microbatches / global_num_tokens
+                correction = correct_scale / context.loss_scale
+            batch.extras[_GLOBAL_NUM_TOKENS] = global_num_tokens
+            batch.extras[_LOSS_SCALE_CORRECTION] = correction
+            scheduled.append((batch, context))
 
         binding = _Binding(handle._parallel_state, self._groups)
         bound = _BoundIterator(iter(scheduled), binding)
@@ -566,7 +640,8 @@ class DynamicCPPlugin:
                 # K CP ranks is represented K times; N/K preserves logical-DP=1
                 # global-loss weighting across mixed subgroup sizes.
                 replica_scale = self._pool.size() / int(batch.extras[_LOCAL_CP_SIZE])
-                return loss * schedule_scale * replica_scale, metrics
+                normalization = float(batch.extras[_LOSS_SCALE_CORRECTION])
+                return loss * normalization * schedule_scale * replica_scale, metrics
 
         return _Prepared(
             data=bound,
