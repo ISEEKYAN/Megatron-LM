@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import math
 import os
@@ -366,6 +367,13 @@ def _gpu_arm(
     (out_dir / f"{name}-rank{rank}-summary.json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
     )
+    torch.cuda.synchronize()
+    del data, handle, runtime
+    from megatron.lite.primitive.modules.dispatcher import _DEEPEP_BUFFER_CACHE
+
+    _DEEPEP_BUFFER_CACHE.clear()
+    gc.collect()
+    torch.cuda.synchronize()
 
 
 def main(argv: list[str] | None = None) -> int:

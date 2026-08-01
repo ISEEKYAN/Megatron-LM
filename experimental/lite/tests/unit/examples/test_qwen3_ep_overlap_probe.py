@@ -123,6 +123,8 @@ def test_overlap_probe_explicitly_closes_the_distributed_runtime():
 
     source = Path(probe.__file__).read_text(encoding="utf-8")
 
+    assert "_DEEPEP_BUFFER_CACHE.clear()" in source
+    assert "gc.collect()" in source
     assert "torch.cuda.synchronize()" in source
     assert "torch.distributed.barrier()" in source
     assert "torch.distributed.destroy_process_group()" in source
