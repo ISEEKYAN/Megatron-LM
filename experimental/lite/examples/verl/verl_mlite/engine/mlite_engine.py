@@ -976,9 +976,9 @@ class MegatronLiteEngine(BaseEngine):
 
     def _reduce_mtp_metric(self, mtp_loss: torch.Tensor) -> torch.Tensor:
         mtp_loss = mtp_loss.detach().float().clone()
-        dp_group = self.get_data_parallel_group()
-        if dist.is_initialized() and dp_group is not None:
-            dist.all_reduce(mtp_loss, op=dist.ReduceOp.AVG, group=dp_group)
+        metric_group = self.handle.metric_group
+        if dist.is_initialized() and metric_group is not None:
+            dist.all_reduce(mtp_loss, op=dist.ReduceOp.AVG, group=metric_group)
         return mtp_loss
 
     @staticmethod
