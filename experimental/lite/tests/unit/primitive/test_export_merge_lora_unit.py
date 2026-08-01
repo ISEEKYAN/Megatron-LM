@@ -180,3 +180,32 @@ def test_olora_tail_warns_when_grouped_expert_adapters_are_skipped():
         stats = apply_olora_tail_init(model)
 
     assert stats == {"initialized": 1, "skipped": 1}
+
+
+def test_olora_tail_merged_export_matches_external_pretrained_base():
+    """Residual-base training and merged rollout must represent one weight.
+
+    The pre-init tensor is the independent reference: it comes from the plain
+    model before either the OLoRA-tail transform or the export path runs.  This
+    catches a self-consistent but jointly wrong residual/export pair.
+    """
+    model = _TinyWrappedModel()
+    # Powers of two make subtract-then-add bitwise reversible, so this test can
+    # distinguish a contract violation from ordinary floating-point roundoff.
+    with torch.no_grad():
+        model.qkv.base.linear.weight.fill_(3.0)
+        model.qkv.adapter.lora_a.fill_(0.25)
+        model.qkv.adapter.lora_b.fill_(0.5)
+    external_base = _export_dict(model, merge_lora=False)["qkv.linear.weight"].clone()
+    delta = model.qkv.adapter.materialized_delta_weight().clone()
+
+    with pytest.warns(UserWarning, match="OLoRA-tail"):
+        apply_olora_tail_init(model)
+
+    residual_base = _export_dict(model, merge_lora=False)["qkv.linear.weight"]
+    rollout_weight = _export_dict(model, merge_lora=True)["qkv.linear.weight"]
+    training_weight = residual_base + delta
+
+    assert not torch.equal(residual_base, external_base)
+    torch.testing.assert_close(training_weight, external_base, rtol=0, atol=0)
+    torch.testing.assert_close(rollout_weight, training_weight, rtol=0, atol=0)

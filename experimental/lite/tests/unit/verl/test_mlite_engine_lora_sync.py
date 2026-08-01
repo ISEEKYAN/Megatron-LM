@@ -50,7 +50,9 @@ def test_unknown_mode_fails_loud():
         resolve({"enabled": True, "rank": 8, "rollout_sync": "adaptor"})
 
 
-@pytest.mark.parametrize("init", ["olora", "pissa", "OLoRA", "PiSSA"])
+@pytest.mark.parametrize(
+    "init", ["olora", "pissa", "olora_tail", "OLoRA", "PiSSA", "OLoRA_TAIL"]
+)
 def test_residual_base_inits_force_merge_even_when_adapter_is_requested(init):
     """These inits subtract the adapter's starting delta from the base weight.
 

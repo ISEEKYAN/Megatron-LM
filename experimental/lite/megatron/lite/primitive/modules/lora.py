@@ -32,6 +32,20 @@ _TARGET_ALIASES = {
     "fc2": "linear_fc2",
 }
 
+# Initializations in this set replace the pretrained weight with a residual
+# base.  Any consumer that combines a separately loaded base with the adapter
+# must consult this contract.  Keep the older OLoRA/PiSSA spellings fail-safe
+# even though the only base-mutating initialization currently implemented by
+# MLite is ``olora_tail``.
+_LORA_INITS_WITH_RESIDUAL_BASE = frozenset({"olora", "olora_tail", "pissa"})
+
+
+def lora_init_uses_residual_base(init: str | None) -> bool:
+    """Whether ``init`` replaces the pretrained weight with a residual base."""
+
+    normalized = str(init or "default").lower()
+    return normalized in _LORA_INITS_WITH_RESIDUAL_BASE
+
 
 def lora_scaling(rank: int, alpha: int | None, *, use_rslora: bool = False) -> float:
     effective_alpha = float(rank if alpha is None else alpha)
@@ -769,6 +783,7 @@ __all__ = [
     "SharedGroupedLinearLoRA",
     "apply_olora_tail_init",
     "freeze_non_lora_params",
+    "lora_init_uses_residual_base",
     "lora_scaling",
     "normalize_lora_config",
     "normalize_lora_spec",

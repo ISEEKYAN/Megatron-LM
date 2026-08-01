@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+from megatron.lite.primitive.modules.lora import lora_init_uses_residual_base
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
@@ -455,7 +456,7 @@ class MegatronLiteEngine(BaseEngine):
                 f"Unknown lora.rollout_sync={mode!r}; expected 'adapter' or 'merge'."
             )
         init = str(lora_cfg.get("init", "default") or "default").lower()
-        if init in ("olora", "pissa"):
+        if lora_init_uses_residual_base(init):
             # These initializations subtract the adapter's starting delta from the
             # base weight, so the rollout base is *not* the pretrained weight and
             # an adapter-only sync would apply the delta to the wrong operand.
