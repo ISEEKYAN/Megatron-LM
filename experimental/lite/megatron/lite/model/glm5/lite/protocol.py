@@ -40,7 +40,10 @@ from megatron.lite.primitive.modules.lora import (
     apply_olora_tail_init,
     normalize_lora_spec,
 )
-from megatron.lite.primitive.modules.lora_apply import apply_lora_to_chunks
+from megatron.lite.primitive.modules.lora_apply import (
+    apply_lora_to_chunks,
+    validate_lora_parallel_support,
+)
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
 from megatron.lite.primitive.parallel.thd import (
@@ -274,6 +277,7 @@ def _build_dist_opt_optimizer(
 def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     p = impl_cfg.parallel
     lora_spec = normalize_lora_spec(impl_cfg.lora)
+    validate_lora_parallel_support(lora_spec, etp_size=p.etp)
     _validate_parallel_scope(p)
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
@@ -333,13 +337,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         ]
     else:
         chunks = [
-            Glm5Model(
-                model_cfg,
-                train_cfg,
-                ps,
-                vpp_chunk_id=i,
-                **model_kwargs,
-            )
+            Glm5Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **model_kwargs)
             .to(torch.bfloat16)
             .cuda()
             for i in range(vpp)
@@ -359,9 +357,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     lora_stats = (
         None
         if lora_spec.enabled
-        else apply_lora_to_chunks(
-            chunks, lora_spec, ps=ps, model_targets=LORA_TARGETS
-        )
+        else apply_lora_to_chunks(chunks, lora_spec, ps=ps, model_targets=LORA_TARGETS)
     )
 
     def _attach_lora_after_load():

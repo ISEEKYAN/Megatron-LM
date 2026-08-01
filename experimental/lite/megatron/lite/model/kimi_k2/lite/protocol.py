@@ -26,7 +26,10 @@ from megatron.lite.primitive.modules.lora import (
     apply_olora_tail_init,
     normalize_lora_spec,
 )
-from megatron.lite.primitive.modules.lora_apply import apply_lora_to_chunks
+from megatron.lite.primitive.modules.lora_apply import (
+    apply_lora_to_chunks,
+    validate_lora_parallel_support,
+)
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.primitive.quantization import (
@@ -140,7 +143,9 @@ def _make_aux_loss_hook():
 def _build_dist_opt_optimizer(
     chunks, model_cfg: KimiK2Config, impl_cfg: ImplConfig, ps: ParallelState
 ):
-    from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_training_optimizer
+    from megatron.lite.primitive.optimizers.megatron_wrap import (
+        build_dist_opt_training_optimizer,
+    )
 
     return build_dist_opt_training_optimizer(
         chunks,
@@ -156,6 +161,7 @@ def _build_dist_opt_optimizer(
 def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     p = impl_cfg.parallel
     lora_spec = normalize_lora_spec(impl_cfg.lora)
+    validate_lora_parallel_support(lora_spec, etp_size=p.etp)
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
     if impl_cfg.router_aux_loss_coef is not None:
@@ -164,7 +170,9 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
     if mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
-            raise ValueError("mtp_enable=True but HF config has no num_nextn_predict_layers.")
+            raise ValueError(
+                "mtp_enable=True but HF config has no num_nextn_predict_layers."
+            )
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
         if impl_cfg.mtp_use_repeated_layer is not None:
             model_cfg.mtp_use_repeated_layer = impl_cfg.mtp_use_repeated_layer
@@ -199,16 +207,14 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
     )
 
     if vpp is None:
-        chunks = [KimiK2Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
+        chunks = [
+            KimiK2Model(model_cfg, train_cfg, ps, **model_kwargs)
+            .to(torch.bfloat16)
+            .cuda()
+        ]
     else:
         chunks = [
-            KimiK2Model(
-                model_cfg,
-                train_cfg,
-                ps,
-                vpp_chunk_id=i,
-                **model_kwargs,
-            )
+            KimiK2Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **model_kwargs)
             .to(torch.bfloat16)
             .cuda()
             for i in range(vpp)
@@ -228,9 +234,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
     lora_stats = (
         None
         if lora_spec.enabled
-        else apply_lora_to_chunks(
-            chunks, lora_spec, ps=ps, model_targets=LORA_TARGETS
-        )
+        else apply_lora_to_chunks(chunks, lora_spec, ps=ps, model_targets=LORA_TARGETS)
     )
 
     def _attach_lora_after_load():
@@ -286,7 +290,9 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
         def _post_model_load_hook():
             from megatron.lite.model.kimi_k2.lite.model import KimiK2Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
 
             stats = _attach_lora_after_load()
             return {
@@ -342,12 +348,16 @@ def load_hf_weights(
 
 
 def export_hf_weights(chunks, model_cfg: KimiK2Config, ps: ParallelState, **kwargs):
-    from megatron.lite.model.kimi_k2.lite.checkpoint import export_hf_weights as export_impl
+    from megatron.lite.model.kimi_k2.lite.checkpoint import (
+        export_hf_weights as export_impl,
+    )
 
     yield from export_impl(chunks, model_cfg, ps, **kwargs)
 
 
-def save_hf_weights(chunks, path: str, model_cfg: KimiK2Config, ps: ParallelState) -> None:
+def save_hf_weights(
+    chunks, path: str, model_cfg: KimiK2Config, ps: ParallelState
+) -> None:
     from megatron.lite.model.kimi_k2.lite.checkpoint import save_hf_weights as save_impl
 
     save_impl(chunks, path, model_cfg, ps)

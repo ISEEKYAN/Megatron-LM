@@ -24,9 +24,15 @@ from megatron.lite.primitive.modules.lora import (
     SharedGroupedLinearLoRA,
 )
 from megatron.lite.primitive.modules.lora_apply import (
+    LoRAWrappedGroupedLinear,
     LoRAWrappedLinear,
     apply_lora_to_chunks,
     iter_lora_adapter_modules,
+    load_lora_adapter_state,
+    merge_lora_in_chunks,
+    remove_lora_from_chunks,
+    save_lora_adapter_state,
+    unmerge_lora_in_chunks,
 )
 from megatron.lite.primitive.quantization.qat import (
     QATSpec,
@@ -121,11 +127,7 @@ class _CpuTERMSNorm(nn.Module):
     """State-dict-compatible TE RMSNorm stand-in for CPU-only construction."""
 
     def __init__(
-        self,
-        hidden_size: int,
-        *,
-        zero_centered_gamma: bool = False,
-        **_kwargs,
+        self, hidden_size: int, *, zero_centered_gamma: bool = False, **_kwargs
     ):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
@@ -152,13 +154,11 @@ class _CpuTEGroupedLinear(nn.Module):
         super().__init__()
         for index in range(num_gemms):
             self.register_parameter(
-                f"weight{index}",
-                nn.Parameter(torch.empty(out_features, in_features)),
+                f"weight{index}", nn.Parameter(torch.empty(out_features, in_features))
             )
             if bias:
                 self.register_parameter(
-                    f"bias{index}",
-                    nn.Parameter(torch.zeros(out_features)),
+                    f"bias{index}", nn.Parameter(torch.zeros(out_features))
                 )
 
 
@@ -197,11 +197,7 @@ def _layers(chunk: _TinyChunk) -> list[nn.Module]:
 
 
 def _case(
-    model_name: str,
-    transformer_engine_import_stub,
-    monkeypatch,
-    *,
-    mtp_enabled: bool,
+    model_name: str, transformer_engine_import_stub, monkeypatch, *, mtp_enabled: bool
 ) -> _ModelCase:
     return _ModelCase(
         name=model_name,
@@ -451,13 +447,15 @@ def _real_tiny_model(
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
 def test_every_real_tiny_model_attaches_trainable_lora_and_runs_adapter_forward(
-    model_name: str,
-    transformer_engine_import_stub,
-    monkeypatch,
+    model_name: str, transformer_engine_import_stub, monkeypatch, tmp_path
 ):
     _install_cpu_te_construction_stubs(transformer_engine_import_stub, monkeypatch)
-    model = _real_tiny_model(
-        model_name, monkeypatch, cover_all_lora_targets=True
+    model = _real_tiny_model(model_name, monkeypatch, cover_all_lora_targets=True)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(0.01)
+    lora_off_trainable_numel = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
     adapter_module = importlib.import_module(
         f"megatron.lite.model.{model_name}.lite.lora_adapter"
@@ -485,10 +483,15 @@ def test_every_real_tiny_model_attaches_trainable_lora_and_runs_adapter_forward(
     )
     assert trainable
     assert all("lora_" in name for name in trainable)
+    lora_on_trainable_numel = sum(parameter.numel() for parameter in trainable.values())
+    assert lora_on_trainable_numel > 0
+    assert lora_on_trainable_numel < lora_off_trainable_numel
 
     for rule in adapter_module.LORA_TARGETS:
         owners = [
-            module for module in model.modules() if type(module).__name__ == rule.owner_type
+            module
+            for module in model.modules()
+            if type(module).__name__ == rule.owner_type
         ]
         assert owners, f"{model_name} declaration has no real {rule.owner_type}"
         assert all(
@@ -507,13 +510,69 @@ def test_every_real_tiny_model_attaches_trainable_lora_and_runs_adapter_forward(
         assert output.shape[:-1] == x.shape[:-1]
         assert torch.count_nonzero(output) == 0
 
+        with torch.no_grad():
+            adapter.lora_b.fill_(0.25)
+        if isinstance(adapter, SharedGroupedLinearLoRA):
+            output = adapter(x, splits)
+        else:
+            output = adapter(x)
+        assert torch.count_nonzero(output) > 0
+
+    adapter_path = tmp_path / f"{model_name}-adapter.pt"
+    saved_state = {
+        name: parameter.detach().clone() for name, parameter in trainable.items()
+    }
+    save_stats = save_lora_adapter_state([model], adapter_path)
+    with torch.no_grad():
+        for parameter in trainable.values():
+            parameter.zero_()
+    load_stats = load_lora_adapter_state([model], adapter_path)
+    assert save_stats["saved_tensors"] == load_stats["loaded_tensors"]
+    assert all(
+        torch.equal(trainable[name], expected) for name, expected in saved_state.items()
+    )
+
+    wrappers = [
+        module
+        for module in model.modules()
+        if isinstance(module, (LoRAWrappedLinear, LoRAWrappedGroupedLinear))
+    ]
+    base_before = {
+        id(parameter): parameter.detach().clone()
+        for wrapper in wrappers
+        for parameter in wrapper.base.parameters()
+    }
+    merge_stats = merge_lora_in_chunks([model])
+    assert merge_stats["merged_modules"] == len(wrappers)
+    assert any(
+        not torch.equal(parameter, base_before[id(parameter)])
+        for wrapper in wrappers
+        for parameter in wrapper.base.parameters()
+    )
+    unmerge_stats = unmerge_lora_in_chunks([model])
+    assert unmerge_stats["unmerged_modules"] == len(wrappers)
+    for wrapper in wrappers:
+        for parameter in wrapper.base.parameters():
+            torch.testing.assert_close(parameter, base_before[id(parameter)])
+
+    remove_stats = remove_lora_from_chunks([model])
+    assert remove_stats["removed_modules"] == len(wrappers)
+    assert not list(iter_lora_adapter_modules(model))
+    assert (
+        sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+        == lora_off_trainable_numel
+    )
+
 
 R3_SUPPORTED_MODEL_NAMES = MODEL_NAMES
 
 
 def test_mapped_model_state_has_no_optional_override(
-    transformer_engine_import_stub,
-    monkeypatch,
+    transformer_engine_import_stub, monkeypatch
 ):
     for model_name, spec_name in (
         ("kimi_k2", "KimiK2WeightSpec"),
@@ -532,17 +591,10 @@ def test_mapped_model_state_has_no_optional_override(
 
 @pytest.mark.parametrize(
     ("model_name", "spec_name"),
-    [
-        ("kimi_k2", "KimiK2WeightSpec"),
-        ("glm5", "Glm5WeightSpec"),
-    ],
+    [("kimi_k2", "KimiK2WeightSpec"), ("glm5", "Glm5WeightSpec")],
 )
 def test_persistent_router_bias_is_required(
-    model_name,
-    spec_name,
-    tmp_path,
-    transformer_engine_import_stub,
-    monkeypatch,
+    model_name, spec_name, tmp_path, transformer_engine_import_stub, monkeypatch
 ):
     from safetensors.torch import save_file
 
@@ -580,31 +632,19 @@ def test_persistent_router_bias_is_required(
             "layers.0.moe.router.expert_bias": ["hf.router.expert_bias"],
         },
     )
-    save_file(
-        {"hf.required": torch.ones(1)},
-        str(tmp_path / "model.safetensors"),
-    )
+    save_file({"hf.required": torch.ones(1)}, str(tmp_path / "model.safetensors"))
     ps = types.SimpleNamespace(
-        ep_size=1,
-        ep_rank=0,
-        tp_size=1,
-        tp_rank=0,
-        etp_size=1,
-        etp_rank=0,
-        pp_size=1,
+        ep_size=1, ep_rank=0, tp_size=1, tp_rank=0, etp_size=1, etp_rank=0, pp_size=1
     )
 
     with pytest.raises(
-        RuntimeError,
-        match=rf"{spec_name}.*layers\.0\.moe\.router\.expert_bias",
+        RuntimeError, match=rf"{spec_name}.*layers\.0\.moe\.router\.expert_bias"
     ):
         load_hf_weights(model, str(tmp_path), spec, ps)
 
 
 def test_deepseek_v4_router_buffer_remains_required(
-    tmp_path,
-    transformer_engine_import_stub,
-    monkeypatch,
+    tmp_path, transformer_engine_import_stub, monkeypatch
 ):
     from safetensors.torch import save_file
 
@@ -634,17 +674,9 @@ def test_deepseek_v4_router_buffer_remains_required(
             super().__init__()
             self.layers = nn.ModuleList([Layer()])
 
-    save_file(
-        {"unrelated": torch.ones(1)},
-        str(tmp_path / "model.safetensors"),
-    )
+    save_file({"unrelated": torch.ones(1)}, str(tmp_path / "model.safetensors"))
     ps = types.SimpleNamespace(
-        ep_size=1,
-        ep_rank=0,
-        tp_size=1,
-        tp_rank=0,
-        etp_size=1,
-        etp_rank=0,
+        ep_size=1, ep_rank=0, tp_size=1, tp_rank=0, etp_size=1, etp_rank=0
     )
 
     with pytest.raises(
@@ -656,9 +688,7 @@ def test_deepseek_v4_router_buffer_remains_required(
 
 
 def test_kimi_router_bias_92_key_roundtrip_uses_weight_map(
-    tmp_path,
-    transformer_engine_import_stub,
-    monkeypatch,
+    tmp_path, transformer_engine_import_stub, monkeypatch
 ):
     from safetensors.torch import save_file
 
@@ -674,10 +704,7 @@ def test_kimi_router_bias_92_key_roundtrip_uses_weight_map(
     class Router(nn.Module):
         def __init__(self, layer_idx):
             super().__init__()
-            self.register_buffer(
-                "expert_bias",
-                torch.full((2,), float(layer_idx)),
-            )
+            self.register_buffer("expert_bias", torch.full((2,), float(layer_idx)))
 
     class Layer(nn.Module):
         def __init__(self, layer_idx):
@@ -724,8 +751,7 @@ def test_kimi_router_bias_92_key_roundtrip_uses_weight_map(
 
     assert all(
         torch.equal(
-            loaded.layers[idx].moe.router.expert_bias,
-            torch.full((2,), float(idx)),
+            loaded.layers[idx].moe.router.expert_bias, torch.full((2,), float(idx))
         )
         for idx in range(92)
     )
@@ -733,9 +759,7 @@ def test_kimi_router_bias_92_key_roundtrip_uses_weight_map(
 
 @pytest.mark.parametrize("cp_rank", [0, 1])
 def test_glm5_r3_route_packing_matches_contiguous_forward_layout(
-    cp_rank,
-    transformer_engine_import_stub,
-    monkeypatch,
+    cp_rank, transformer_engine_import_stub, monkeypatch
 ):
     from megatron.lite.runtime.contracts import PackedBatch
 
@@ -743,11 +767,7 @@ def test_glm5_r3_route_packing_matches_contiguous_forward_layout(
     deepseek_v4 = _protocol("deepseek_v4", transformer_engine_import_stub, monkeypatch)
     model = nn.Module()
     model.ps = types.SimpleNamespace(
-        tp_size=1,
-        tp_rank=0,
-        cp_size=2,
-        cp_rank=cp_rank,
-        cp_group=None,
+        tp_size=1, tp_rank=0, cp_size=2, cp_rank=cp_rank, cp_group=None
     )
     batch = PackedBatch(
         input_ids=torch.arange(8),
@@ -776,16 +796,10 @@ def test_glm5_r3_route_packing_matches_contiguous_forward_layout(
 @pytest.mark.parametrize("model_name", R3_SUPPORTED_MODEL_NAMES)
 @pytest.mark.parametrize("mtp_enabled", [False, True], ids=["mtp-off", "mtp-on"])
 def test_supported_model_replay_roots_are_exact_decoder_layers(
-    model_name: str,
-    mtp_enabled: bool,
-    transformer_engine_import_stub,
-    monkeypatch,
+    model_name: str, mtp_enabled: bool, transformer_engine_import_stub, monkeypatch
 ):
     case = _case(
-        model_name,
-        transformer_engine_import_stub,
-        monkeypatch,
-        mtp_enabled=mtp_enabled,
+        model_name, transformer_engine_import_stub, monkeypatch, mtp_enabled=mtp_enabled
     )
     expected = _layers(case.chunk)
 
@@ -793,9 +807,9 @@ def test_supported_model_replay_roots_are_exact_decoder_layers(
 
     assert roots == expected
     assert len(roots) == len(case.chunk.model.layers)
-    assert roots != [case.chunk], (
-        "falling back to the whole chunk would include MTP routers"
-    )
+    assert roots != [
+        case.chunk
+    ], "falling back to the whole chunk would include MTP routers"
     if mtp_enabled:
         mtp_modules = set(case.chunk.model.mtp.modules())
         assert all(root not in mtp_modules for root in roots)
@@ -803,15 +817,10 @@ def test_supported_model_replay_roots_are_exact_decoder_layers(
 
 @pytest.mark.parametrize("model_name", R3_SUPPORTED_MODEL_NAMES)
 def test_supported_model_mtp_off_replay_attachment_count_is_unchanged(
-    model_name: str,
-    transformer_engine_import_stub,
-    monkeypatch,
+    model_name: str, transformer_engine_import_stub, monkeypatch
 ):
     case = _case(
-        model_name,
-        transformer_engine_import_stub,
-        monkeypatch,
-        mtp_enabled=False,
+        model_name, transformer_engine_import_stub, monkeypatch, mtp_enabled=False
     )
     old_count = attach_router_replay(case.chunk, reset=False)
     detach_router_replay(case.chunk)
@@ -828,15 +837,10 @@ def test_supported_model_mtp_off_replay_attachment_count_is_unchanged(
 
 @pytest.mark.parametrize("model_name", R3_SUPPORTED_MODEL_NAMES)
 def test_supported_model_attaches_replay_only_to_decoder_router_count(
-    model_name: str,
-    transformer_engine_import_stub,
-    monkeypatch,
+    model_name: str, transformer_engine_import_stub, monkeypatch
 ):
     case = _case(
-        model_name,
-        transformer_engine_import_stub,
-        monkeypatch,
-        mtp_enabled=True,
+        model_name, transformer_engine_import_stub, monkeypatch, mtp_enabled=True
     )
     roots = case.protocol.router_replay_roots(case.chunk)
 
@@ -856,9 +860,7 @@ def test_supported_model_attaches_replay_only_to_decoder_router_count(
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
 def test_real_tiny_model_replay_attachment_count_matches_decoder_layers(
-    model_name: str,
-    transformer_engine_import_stub,
-    monkeypatch,
+    model_name: str, transformer_engine_import_stub, monkeypatch
 ):
     _install_cpu_te_construction_stubs(transformer_engine_import_stub, monkeypatch)
     model = _real_tiny_model(model_name, monkeypatch)
@@ -875,10 +877,7 @@ def test_real_tiny_model_replay_attachment_count_matches_decoder_layers(
     ("key", "expected"),
     [
         ("layers.0.mlp.weight", "layers.0.mlp.weight"),
-        (
-            "layers.0.mlp.parametrizations.weight.original",
-            "layers.0.mlp.weight",
-        ),
+        ("layers.0.mlp.parametrizations.weight.original", "layers.0.mlp.weight"),
         (
             "layers.0.mlp.parametrizations.weight.0.amax",
             "layers.0.mlp.parametrizations.weight.0.amax",
@@ -908,9 +907,7 @@ def test_every_model_uses_shared_canonical_state_key(
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
 def test_every_model_qat_off_canonicalization_is_identity_for_all_real_state_keys(
-    model_name: str,
-    transformer_engine_import_stub,
-    monkeypatch,
+    model_name: str, transformer_engine_import_stub, monkeypatch
 ):
     _install_cpu_te_construction_stubs(transformer_engine_import_stub, monkeypatch)
     model = _real_tiny_model(model_name, monkeypatch)
@@ -926,15 +923,10 @@ def test_every_model_qat_off_canonicalization_is_identity_for_all_real_state_key
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
 def test_every_model_qat_none_is_bitwise_inert(
-    model_name: str,
-    transformer_engine_import_stub,
-    monkeypatch,
+    model_name: str, transformer_engine_import_stub, monkeypatch
 ):
     case = _case(
-        model_name,
-        transformer_engine_import_stub,
-        monkeypatch,
-        mtp_enabled=False,
+        model_name, transformer_engine_import_stub, monkeypatch, mtp_enabled=False
     )
     implicit = copy.deepcopy(case.chunk)
     explicit = copy.deepcopy(case.chunk)
@@ -960,20 +952,14 @@ def test_every_model_qat_none_is_bitwise_inert(
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
 def test_every_model_qat_quantizes_gate_up_but_not_router_gate(
-    model_name: str,
-    transformer_engine_import_stub,
-    monkeypatch,
+    model_name: str, transformer_engine_import_stub, monkeypatch
 ):
     case = _case(
-        model_name,
-        transformer_engine_import_stub,
-        monkeypatch,
-        mtp_enabled=False,
+        model_name, transformer_engine_import_stub, monkeypatch, mtp_enabled=False
     )
 
     stats = apply_qat_to_chunks(
-        [case.chunk],
-        QATSpec(enabled=True, format="int8", group_size=-1),
+        [case.chunk], QATSpec(enabled=True, format="int8", group_size=-1)
     )
 
     assert stats["quantized_modules"] > 0
@@ -985,15 +971,12 @@ def test_every_model_qat_quantizes_gate_up_but_not_router_gate(
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
 def test_every_model_qat_expert_load_target_resolves_master_weight(
-    model_name: str,
-    transformer_engine_import_stub,
-    monkeypatch,
+    model_name: str, transformer_engine_import_stub, monkeypatch
 ):
     _install_cpu_te_construction_stubs(transformer_engine_import_stub, monkeypatch)
     model = _real_tiny_model(model_name, monkeypatch)
     stats = apply_qat_to_chunks(
-        [model],
-        QATSpec(enabled=True, format="int8", group_size=-1),
+        [model], QATSpec(enabled=True, format="int8", group_size=-1)
     )
     assert stats["quantized_modules"] > 0
 

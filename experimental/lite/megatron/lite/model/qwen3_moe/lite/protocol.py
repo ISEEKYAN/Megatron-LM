@@ -50,7 +50,10 @@ from megatron.lite.primitive.modules.lora import (
     apply_olora_tail_init,
     normalize_lora_spec,
 )
-from megatron.lite.primitive.modules.lora_apply import apply_lora_to_chunks
+from megatron.lite.primitive.modules.lora_apply import (
+    apply_lora_to_chunks,
+    validate_lora_parallel_support,
+)
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.quantization import (
     QATSpec,
@@ -166,6 +169,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     """
     p = impl_cfg.parallel
     lora_spec = normalize_lora_spec(impl_cfg.lora)
+    validate_lora_parallel_support(lora_spec, etp_size=p.etp)
 
     # ── validation ──
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):

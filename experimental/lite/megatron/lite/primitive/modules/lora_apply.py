@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -40,12 +41,15 @@ class LoRAWrappedLinear(nn.Module):
         self.adapter = adapter
         self._adapter_input_fn = adapter_input_fn
         self._use_base_normalized_input = bool(use_base_normalized_input)
+        self._merged_delta: torch.Tensor | None = None
         if self._use_base_normalized_input and adapter_input_fn is not None:
             raise ValueError(
                 "Choose either the base normalized input or adapter_input_fn, not both."
             )
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        if self._merged_delta is not None:
+            return self.base(x, *args, **kwargs)
         if self._use_base_normalized_input:
             out, adapter_x = self.base.forward_with_normalized_input(x, *args, **kwargs)
         else:
@@ -74,9 +78,14 @@ class LoRAWrappedGroupedLinear(nn.Module):
         super().__init__()
         self.base = base
         self.adapter = adapter
+        self._merged_deltas: tuple[torch.Tensor, ...] | None = None
 
-    def forward(self, x: torch.Tensor, splits: list[int], *args, **kwargs) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, splits: list[int], *args, **kwargs
+    ) -> torch.Tensor:
         out = self.base(x, splits, *args, **kwargs)
+        if self._merged_deltas is not None:
+            return out
         return out + self.adapter(x, splits)
 
     def __getattr__(self, name: str):
@@ -97,7 +106,9 @@ class LoraTargetRule:
 
 def _linear_weight_owner(module: nn.Module) -> nn.Module | None:
     inner = getattr(module, "linear", None)
-    if isinstance(inner, nn.Module) and isinstance(getattr(inner, "weight", None), nn.Parameter):
+    if isinstance(inner, nn.Module) and isinstance(
+        getattr(inner, "weight", None), nn.Parameter
+    ):
         return inner
     if isinstance(getattr(module, "weight", None), nn.Parameter):
         return module
@@ -126,7 +137,9 @@ def _local_linear_features(module: nn.Module) -> tuple[int, int]:
 def _place_adapter_like(adapter: nn.Module, base: nn.Module) -> nn.Module:
     reference = next(base.parameters(), None)
     if reference is None:
-        raise ValueError(f"Cannot place LoRA adapter for parameterless {type(base).__name__}.")
+        raise ValueError(
+            f"Cannot place LoRA adapter for parameterless {type(base).__name__}."
+        )
     return adapter.to(device=reference.device, dtype=reference.dtype)
 
 
@@ -181,7 +194,9 @@ def _module_path(parent: str, child: str) -> str:
 
 
 def _target_is_ignored(spec: LoraSpec, target: str, parent: str, child: str) -> bool:
-    return spec.targets_module(target) and spec.ignores_module(_module_path(parent, child))
+    return spec.targets_module(target) and spec.ignores_module(
+        _module_path(parent, child)
+    )
 
 
 def _attach_gqa_proj(attn, spec: LoraSpec, *, module_path: str = "") -> bool:
@@ -295,11 +310,7 @@ def _attach_swiglu_mlp(mlp, spec: LoraSpec, *, module_path: str = "") -> int:
 
 
 def _attach_declared_linear(
-    owner: nn.Module,
-    rule: LoraTargetRule,
-    spec: LoraSpec,
-    *,
-    module_path: str,
+    owner: nn.Module, rule: LoraTargetRule, spec: LoraSpec, *, module_path: str
 ) -> bool:
     if type(owner).__name__ != rule.owner_type or not spec.targets_module(rule.target):
         return False
@@ -355,9 +366,7 @@ def _attach_declared_linear(
         owner,
         rule.attr,
         LoRAWrappedLinear(
-            base,
-            adapter,
-            use_base_normalized_input=use_base_normalized_input,
+            base, adapter, use_base_normalized_input=use_base_normalized_input
         ),
     )
     return True
@@ -370,7 +379,9 @@ def get_linear_lora_adapter(module: nn.Module, attr: str) -> LinearLoRA | None:
     return None
 
 
-def get_grouped_lora_adapter(module: nn.Module, attr: str) -> SharedGroupedLinearLoRA | None:
+def get_grouped_lora_adapter(
+    module: nn.Module, attr: str
+) -> SharedGroupedLinearLoRA | None:
     child = getattr(module, attr, None)
     if isinstance(child, LoRAWrappedGroupedLinear):
         return child.adapter
@@ -391,6 +402,239 @@ def iter_lora_adapter_modules(module: nn.Module):
         if adapter is not None and id(adapter) not in seen:
             seen.add(id(adapter))
             yield adapter
+
+
+def _lora_wrappers(chunks: Sequence[nn.Module]):
+    for chunk in chunks:
+        for module in chunk.modules():
+            if isinstance(module, (LoRAWrappedLinear, LoRAWrappedGroupedLinear)):
+                yield module
+
+
+def _grouped_base_weights(
+    wrapper: LoRAWrappedGroupedLinear,
+) -> tuple[nn.Parameter, ...]:
+    weights = tuple(
+        getattr(wrapper.base, f"weight{index}", None)
+        for index in range(wrapper.adapter.num_local_experts)
+    )
+    if not weights or any(not isinstance(weight, nn.Parameter) for weight in weights):
+        raise TypeError(
+            f"Cannot merge grouped LoRA into {type(wrapper.base).__name__}: "
+            "expected one weight{index} parameter per local expert."
+        )
+    return weights
+
+
+def merge_lora_in_chunks(chunks: Sequence[nn.Module]) -> dict[str, int]:
+    """Merge attached adapters into base weights without removing wrappers."""
+
+    wrappers = list(_lora_wrappers(chunks))
+    if not wrappers:
+        raise RuntimeError("Cannot merge LoRA: no LoRA wrappers are attached.")
+    already_merged = [
+        wrapper
+        for wrapper in wrappers
+        if getattr(wrapper, "_merged_delta", None) is not None
+        or getattr(wrapper, "_merged_deltas", None) is not None
+    ]
+    if already_merged:
+        raise RuntimeError(
+            f"Cannot merge LoRA: {len(already_merged)} wrapper(s) are already merged."
+        )
+
+    plans: list[
+        tuple[nn.Module, tuple[nn.Parameter, ...], tuple[torch.Tensor, ...]]
+    ] = []
+    for wrapper in wrappers:
+        if isinstance(wrapper, LoRAWrappedLinear):
+            owner = _linear_weight_owner(wrapper.base)
+            if owner is None:
+                raise TypeError(
+                    f"Cannot merge LoRA into {type(wrapper.base).__name__}: no 2-D weight."
+                )
+            delta = wrapper.adapter.materialized_delta_weight().to(
+                device=owner.weight.device, dtype=owner.weight.dtype
+            )
+            weights = (owner.weight,)
+            deltas = (delta,)
+        else:
+            weights = _grouped_base_weights(wrapper)
+            delta = wrapper.adapter.materialized_delta_weight()
+            deltas = tuple(
+                delta.to(device=weight.device, dtype=weight.dtype) for weight in weights
+            )
+        for weight, delta in zip(weights, deltas, strict=True):
+            if weight.shape != delta.shape:
+                raise ValueError(
+                    f"Cannot merge LoRA: base shape {tuple(weight.shape)} != "
+                    f"delta shape {tuple(delta.shape)}."
+                )
+        plans.append((wrapper, weights, deltas))
+
+    with torch.no_grad():
+        for wrapper, weights, deltas in plans:
+            for weight, delta in zip(weights, deltas, strict=True):
+                weight.add_(delta)
+            if isinstance(wrapper, LoRAWrappedLinear):
+                wrapper._merged_delta = deltas[0]
+            else:
+                wrapper._merged_deltas = deltas
+    return {"merged_modules": len(plans)}
+
+
+def unmerge_lora_in_chunks(chunks: Sequence[nn.Module]) -> dict[str, int]:
+    """Undo an in-place merge and reactivate the attached adapters."""
+
+    wrappers = list(_lora_wrappers(chunks))
+    if not wrappers:
+        raise RuntimeError("Cannot unmerge LoRA: no LoRA wrappers are attached.")
+    not_merged = [
+        wrapper
+        for wrapper in wrappers
+        if getattr(wrapper, "_merged_delta", None) is None
+        and getattr(wrapper, "_merged_deltas", None) is None
+    ]
+    if not_merged:
+        raise RuntimeError(
+            f"Cannot unmerge LoRA: {len(not_merged)} wrapper(s) are not merged."
+        )
+
+    plans = []
+    for wrapper in wrappers:
+        if isinstance(wrapper, LoRAWrappedLinear):
+            owner = _linear_weight_owner(wrapper.base)
+            if owner is None:
+                raise TypeError(
+                    f"Cannot unmerge LoRA from {type(wrapper.base).__name__}: no 2-D weight."
+                )
+            plans.append((wrapper, (owner.weight,), (wrapper._merged_delta,)))
+        else:
+            plans.append(
+                (wrapper, _grouped_base_weights(wrapper), wrapper._merged_deltas)
+            )
+
+    with torch.no_grad():
+        for wrapper, weights, deltas in plans:
+            for weight, delta in zip(weights, deltas, strict=True):
+                weight.sub_(delta)
+            if isinstance(wrapper, LoRAWrappedLinear):
+                wrapper._merged_delta = None
+            else:
+                wrapper._merged_deltas = None
+    return {"unmerged_modules": len(plans)}
+
+
+def remove_lora_from_chunks(chunks: Sequence[nn.Module]) -> dict[str, int]:
+    """Remove adapters and restore the pre-apply trainability state."""
+
+    wrappers = list(_lora_wrappers(chunks))
+    if not wrappers:
+        raise RuntimeError("Cannot remove LoRA: no LoRA wrappers are attached.")
+    if any(
+        getattr(wrapper, "_merged_delta", None) is not None
+        or getattr(wrapper, "_merged_deltas", None) is not None
+        for wrapper in wrappers
+    ):
+        raise RuntimeError(
+            "Cannot remove LoRA while adapters are merged; unmerge first."
+        )
+    missing_snapshots = [
+        chunk
+        for chunk in chunks
+        if getattr(chunk, "_mlite_lora_requires_grad_state", None) is None
+    ]
+    if missing_snapshots:
+        raise RuntimeError(
+            "LoRA trainability snapshot is missing; refusing partial removal."
+        )
+
+    removed = 0
+    for chunk in chunks:
+        for parent in list(chunk.modules()):
+            for name, child in list(parent.named_children()):
+                if isinstance(child, (LoRAWrappedLinear, LoRAWrappedGroupedLinear)):
+                    setattr(parent, name, child.base)
+                    removed += 1
+        prior = getattr(chunk, "_mlite_lora_requires_grad_state", None)
+        for parameter in chunk.parameters():
+            if id(parameter) in prior:
+                parameter.requires_grad_(prior[id(parameter)])
+        delattr(chunk, "_mlite_lora_requires_grad_state")
+    return {"removed_modules": removed}
+
+
+def _named_lora_adapter_tensors(chunks: Sequence[nn.Module]):
+    seen: set[int] = set()
+    for chunk_index, chunk in enumerate(chunks):
+        for module_name, module in chunk.named_modules():
+            if isinstance(module, (LoRAWrappedLinear, LoRAWrappedGroupedLinear)):
+                adapter = module.adapter
+                if id(adapter) in seen:
+                    continue
+                seen.add(id(adapter))
+                prefix = f"chunk{chunk_index}.{module_name}".rstrip(".")
+                yield f"{prefix}.lora_a", adapter.lora_a
+                yield f"{prefix}.lora_b", adapter.lora_b
+
+
+def save_lora_adapter_state(
+    chunks: Sequence[nn.Module], path: str | Path
+) -> dict[str, int]:
+    """Save only attached adapter tensors using stable wrapper paths."""
+
+    state = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in _named_lora_adapter_tensors(chunks)
+    }
+    if not state:
+        raise RuntimeError(
+            "Cannot save LoRA adapter state: no LoRA adapters are attached."
+        )
+    torch.save({"format": "mlite_lora_adapter_v1", "state": state}, Path(path))
+    return {"saved_tensors": len(state)}
+
+
+def load_lora_adapter_state(
+    chunks: Sequence[nn.Module], path: str | Path
+) -> dict[str, int]:
+    """Load adapter tensors only after validating the complete key/shape set."""
+
+    checkpoint_path = Path(path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"LoRA adapter checkpoint does not exist: {checkpoint_path}"
+        )
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("format") != "mlite_lora_adapter_v1"
+    ):
+        raise RuntimeError(f"Invalid LoRA adapter checkpoint format: {checkpoint_path}")
+    saved = payload.get("state")
+    if not isinstance(saved, dict):
+        raise RuntimeError(f"Invalid LoRA adapter checkpoint state: {checkpoint_path}")
+    current = dict(_named_lora_adapter_tensors(chunks))
+    if set(saved) != set(current):
+        missing = sorted(set(current) - set(saved))
+        unexpected = sorted(set(saved) - set(current))
+        raise RuntimeError(
+            "LoRA adapter checkpoint does not match attached adapters: "
+            f"missing={missing}, unexpected={unexpected}."
+        )
+    for name, parameter in current.items():
+        tensor = saved[name]
+        if not isinstance(tensor, torch.Tensor) or tensor.shape != parameter.shape:
+            raise RuntimeError(
+                f"LoRA adapter checkpoint tensor {name!r} has shape "
+                f"{getattr(tensor, 'shape', None)}, expected {tuple(parameter.shape)}."
+            )
+    with torch.no_grad():
+        for name, parameter in current.items():
+            parameter.copy_(
+                saved[name].to(device=parameter.device, dtype=parameter.dtype)
+            )
+    return {"loaded_tensors": len(current)}
 
 
 def apply_lora_to_chunks(
@@ -414,10 +658,20 @@ def apply_lora_to_chunks(
     }
     if not spec.enabled or spec.rank <= 0:
         return stats
-    if ps is not None and getattr(ps, "etp_size", 1) > 1:
-        raise NotImplementedError(
-            "Megatron Lite LoRA does not support ETP>1; use etp_size=1."
+    validate_lora_parallel_support(
+        spec, etp_size=getattr(ps, "etp_size", 1) if ps is not None else 1
+    )
+    existing = list(_lora_wrappers(chunks))
+    if existing:
+        raise RuntimeError(
+            f"Cannot apply LoRA: {len(existing)} LoRA wrapper(s) are already attached."
         )
+    for chunk in chunks:
+        if hasattr(chunk, "_mlite_lora_requires_grad_state"):
+            raise RuntimeError("Cannot apply LoRA: stale trainability snapshot exists.")
+        chunk._mlite_lora_requires_grad_state = {
+            id(parameter): parameter.requires_grad for parameter in chunk.parameters()
+        }
 
     from megatron.lite.primitive.modules.experts import Experts
     from megatron.lite.primitive.modules.gqa import GQAttention
@@ -490,12 +744,7 @@ def apply_lora_to_chunks(
                 ):
                     stats["skipped_ignored"] += 1
                     continue
-                if _attach_declared_linear(
-                    module,
-                    rule,
-                    spec,
-                    module_path=module_path,
-                ):
+                if _attach_declared_linear(module, rule, spec, module_path=module_path):
                     stats["attached_modules"] += 1
 
         freeze_stats = freeze_non_lora_params(chunk)
@@ -503,7 +752,27 @@ def apply_lora_to_chunks(
         stats["frozen_tensors"] += freeze_stats["frozen_tensors"]
         stats["trainable_tensors"] += trainable_stats["trainable_tensors"]
 
+    if stats["attached_modules"] == 0:
+        for chunk in chunks:
+            prior = chunk._mlite_lora_requires_grad_state
+            for parameter in chunk.parameters():
+                parameter.requires_grad_(prior[id(parameter)])
+            delattr(chunk, "_mlite_lora_requires_grad_state")
+        raise RuntimeError("LoRA is enabled but no declared target modules matched.")
     return stats
+
+
+def validate_lora_parallel_support(
+    spec: LoraSpec | dict[str, Any] | None, *, etp_size: int | None
+) -> None:
+    """Reject unsupported LoRA+ETP before model construction or mutation."""
+
+    normalized = normalize_lora_spec(spec)
+    effective_etp = 1 if etp_size is None else int(etp_size)
+    if normalized.enabled and normalized.rank > 0 and effective_etp > 1:
+        raise NotImplementedError(
+            "Megatron Lite LoRA does not support ETP>1; use etp_size=1."
+        )
 
 
 __all__ = [
@@ -514,4 +783,10 @@ __all__ = [
     "get_grouped_lora_adapter",
     "get_linear_lora_adapter",
     "iter_lora_adapter_modules",
+    "load_lora_adapter_state",
+    "merge_lora_in_chunks",
+    "remove_lora_from_chunks",
+    "save_lora_adapter_state",
+    "unmerge_lora_in_chunks",
+    "validate_lora_parallel_support",
 ]

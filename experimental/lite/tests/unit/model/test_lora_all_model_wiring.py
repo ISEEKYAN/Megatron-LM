@@ -21,11 +21,7 @@ def test_every_model_declares_lora_targets(model_name: str):
         target.id
         for node in tree.body
         if isinstance(node, (ast.Assign, ast.AnnAssign))
-        for target in (
-            node.targets
-            if isinstance(node, ast.Assign)
-            else (node.target,)
-        )
+        for target in (node.targets if isinstance(node, ast.Assign) else (node.target,))
         if isinstance(target, ast.Name)
     }
     assert "LORA_TARGETS" in assignments
@@ -58,6 +54,17 @@ def test_every_model_applies_lora_before_optimizer_construction(model_name: str)
         for node in calls
         if isinstance(node.func, ast.Name) and node.func.id == "apply_lora_to_chunks"
     ]
+    validation_calls = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name)
+        and node.func.id == "validate_lora_parallel_support"
+    ]
+    init_parallel_calls = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "init_parallel"
+    ]
     optimizer_calls = [
         node
         for node in calls
@@ -71,6 +78,11 @@ def test_every_model_applies_lora_before_optimizer_construction(model_name: str)
         or (isinstance(node.func, ast.Attribute) and "optimizer" in node.func.attr)
     ]
     assert lora_calls
+    assert validation_calls
+    assert init_parallel_calls
+    assert min(call.lineno for call in validation_calls) < min(
+        call.lineno for call in init_parallel_calls
+    )
     assert optimizer_calls
     assert min(call.lineno for call in lora_calls) < min(
         call.lineno for call in optimizer_calls
