@@ -68,31 +68,6 @@ def lora_scaling(rank: int, alpha: int | None, *, use_rslora: bool = False) -> f
     return effective_alpha / denom
 
 
-def assert_lora_alpha_scaling_consistent(
-    rank: int,
-    alpha: int | None,
-    *,
-    applied_alpha: int,
-    applied_use_rslora: bool,
-    use_rslora: bool = False,
-) -> None:
-    """Fail if a consumer would apply a different LoRA alpha or scale."""
-
-    expected_alpha = resolve_lora_alpha(rank, alpha)
-    expected_scaling = lora_scaling(rank, alpha, use_rslora=use_rslora)
-    applied_scaling = lora_scaling(
-        rank,
-        applied_alpha,
-        use_rslora=applied_use_rslora,
-    )
-    if applied_alpha != expected_alpha or applied_scaling != expected_scaling:
-        raise RuntimeError(
-            "LoRA alpha/scaling disagrees between training and rollout: "
-            f"training alpha={expected_alpha}, scaling={expected_scaling}; "
-            f"rollout alpha={applied_alpha}, scaling={applied_scaling}."
-        )
-
-
 @dataclass(frozen=True)
 class LoraSpec:
     enabled: bool = False
@@ -830,7 +805,6 @@ __all__ = [
     "LoraSpec",
     "SharedGroupedLinearLoRA",
     "apply_olora_tail_init",
-    "assert_lora_alpha_scaling_consistent",
     "freeze_non_lora_params",
     "lora_init_uses_residual_base",
     "lora_scaling",

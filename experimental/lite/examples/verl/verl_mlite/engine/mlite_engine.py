@@ -20,7 +20,6 @@ from megatron.lite.primitive.modules.lora import (
     LORA_DEFAULT_RANK,
     LORA_DEFAULT_TARGET_MODULES,
     LORA_DEFAULT_USE_RSLORA,
-    assert_lora_alpha_scaling_consistent,
     lora_init_uses_residual_base,
     resolve_lora_alpha,
 )
@@ -566,7 +565,7 @@ class MegatronLiteEngine(BaseEngine):
             lora_cfg.get("target_modules", LORA_DEFAULT_TARGET_MODULES)
         )
         exclude_modules = list(lora_cfg.get("exclude_modules", []) or [])
-        peft_config = {
+        return {
             "task_type": "CAUSAL_LM",
             "r": rank,
             "lora_alpha": resolve_lora_alpha(rank, alpha),
@@ -576,14 +575,6 @@ class MegatronLiteEngine(BaseEngine):
             "bias": "none",
             "lora_dropout": float(lora_cfg.get("dropout", LORA_DEFAULT_DROPOUT)),
         }
-        assert_lora_alpha_scaling_consistent(
-            rank,
-            alpha,
-            applied_alpha=peft_config["lora_alpha"],
-            applied_use_rslora=peft_config["use_rslora"],
-            use_rslora=use_rslora,
-        )
-        return peft_config
 
     def _checked_adapter_stream(self, stream):
         """Fail loudly if the expert adapter surface is incomplete."""
