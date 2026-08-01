@@ -345,6 +345,10 @@ def _restore_outputs(
                 "metrics": values[0]["metrics"],
             }
         )
+        # Collector consumers fold each output entry independently. Preserve
+        # every distinct subgroup leader as a separate metric contribution
+        # while emitting the reconstructed output and summed loss exactly once.
+        collector.extend({"metrics": item["metrics"]} for item in values[1:])
 
 
 @dataclass(slots=True)
@@ -440,6 +444,7 @@ class DynamicCPPlugin:
             logical_dp_size=1,
             logical_dp_rank=0,
             logical_dp_group=logical,
+            metric_group=pool,
             cp_range=(self.minimum, pool_size),
         )
         return handle
@@ -532,6 +537,17 @@ class DynamicCPPlugin:
                 "Dynamic CP plan must cover every input sample exactly once."
             )
         missing_cp_sizes = sorted(set(self._cp_size_space) - set(cp_size_histogram))
+        if loss_fn is not None and any(context is not None for context, _ in contexts):
+            missing_masks = [
+                sample_id
+                for sample_id, sample in enumerate(samples)
+                if sample["loss_mask"] is None
+            ]
+            if missing_masks:
+                raise ValueError(
+                    "Dynamic CP requires loss_mask on every sample for pool-global "
+                    f"loss normalization; missing sample ids {missing_masks}."
+                )
         global_num_tokens = None
         if all(sample["loss_mask"] is not None for sample in samples):
             owned_ids = [

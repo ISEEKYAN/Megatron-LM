@@ -69,6 +69,7 @@ def test_dynamic_cp_exposes_logical_dp_one_without_replacing_physical_dp(monkeyp
     assert handle.dp_size == 1
     assert handle.dp_rank == 0
     assert handle.dp_group is logical_dp_group
+    assert handle.metric_group is pool_group
     assert ps.dp_size == 4
     assert ps.dp_rank == 2
     assert ps.dp_group is physical_dp_group
@@ -334,6 +335,63 @@ def test_mixed_cp_uses_pool_global_token_count_for_loss_normalization(monkeypatc
     assert torch.equal(dcp_global_loss, baseline_global_loss)
 
 
+def test_dynamic_cp_missing_loss_mask_fails_before_normalization_can_degrade(monkeypatch):
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
+
+    module = types.ModuleType("megatron.core.datasets.data_schedule")
+    module.DefaultDynamicCPScheduler = _SplitScheduler
+    monkeypatch.setitem(sys.modules, "megatron.core.datasets.data_schedule", module)
+    pool, singleton = _Group(2), _Group(1)
+    handle = ModelHandle(
+        model=object(),
+        parallel_state=SimpleNamespace(
+            dp_size=2,
+            dp_rank=0,
+            dp_group=pool,
+            dp_cp_group=pool,
+            cp_size=1,
+            cp_rank=0,
+            cp_group=singleton,
+            pp_size=1,
+        ),
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(tp=1, cp=1, pp=1, vpp=1),
+            impl_cfg={"use_thd": True},
+        ),
+        _extras={"forward_step": lambda *_args: {}},
+    )
+    plugin = DynamicCPPlugin(
+        {"max_seqlen_per_dp_cp_rank": 1},
+        create_groups=lambda _ps, _minimum, _parallel: {1: singleton, 2: pool},
+    )
+    plugin.initialize(handle)
+
+    with pytest.raises(
+        ValueError,
+        match="requires loss_mask on every sample for pool-global loss normalization",
+    ):
+        plugin._prepare(
+            handle,
+            iter(
+                [
+                    (
+                        PackedBatch(
+                            input_ids=torch.tensor([1, 2]),
+                            labels=torch.tensor([1, 2]),
+                            seq_lens=torch.tensor([1, 1]),
+                        ),
+                        LossContext(
+                            loss_scale=0.5,
+                            source_batch=torch.tensor([[0.0], [0.0]]),
+                        ),
+                    )
+                ]
+            ),
+            lambda *_args: (torch.tensor(1.0), {}),
+            1,
+        )
+
+
 def test_required_cp_size_coverage_fails_loudly(monkeypatch):
     from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
 
@@ -413,6 +471,12 @@ def test_logical_dp_loss_compensates_physical_pool_average(monkeypatch):
         create_groups=lambda _ps, _minimum, _parallel: {1: singleton, 2: pool},
     )
     plugin.initialize(handle)
+
+    def sum_pool_tokens(value, *, group):
+        assert group is pool
+        value.add_(1)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", sum_pool_tokens)
     prepared = plugin._prepare(
         handle,
         iter(
@@ -422,6 +486,7 @@ def test_logical_dp_loss_compensates_physical_pool_average(monkeypatch):
                         input_ids=torch.tensor([1, 2]),
                         labels=torch.tensor([1, 2]),
                         seq_lens=torch.tensor([1, 1]),
+                        loss_mask=torch.ones(2),
                     ),
                     LossContext(source_batch=torch.tensor([[0.0], [0.0]])),
                 )
@@ -433,8 +498,53 @@ def test_logical_dp_loss_compensates_physical_pool_average(monkeypatch):
     selected, context = next(prepared.data)
     loss, _ = prepared.loss({}, selected, context)
 
-    assert torch.equal(loss, torch.tensor(2.0))
+    # Two one-token leaders contribute one normalized global loss after the
+    # physical-pool DDP average; neither rank silently keeps a half-loss.
+    assert torch.equal(loss, torch.tensor(1.0))
     prepared.finish(require_complete=True)
+
+
+def test_restore_outputs_keeps_metrics_from_every_distinct_leader(monkeypatch):
+    from megatron.lite.runtime.backends.mlite import dynamic_cp
+
+    pool = _Group(2)
+    rank0_records = [
+        {
+            "sample_ids": [0],
+            "model_output": {"values": [torch.tensor([10.0])]},
+            "loss": 1.0,
+            "metrics": {"score": 1.0},
+        }
+    ]
+    rank1_records = [
+        {
+            "sample_ids": [1],
+            "model_output": {"values": [torch.tensor([30.0])]},
+            "loss": 3.0,
+            "metrics": {"score": 3.0},
+        }
+    ]
+
+    def gather(output, records, *, group):
+        assert group is pool
+        assert records is rank0_records
+        output[:] = [rank0_records, rank1_records]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    collector = []
+    dynamic_cp._restore_outputs(
+        collector,
+        rank0_records,
+        pool=pool,
+        input_groups=[[0, 1]],
+        device=torch.device("cpu"),
+    )
+
+    scores = [item["metrics"]["score"] for item in collector if "metrics" in item]
+    assert scores == [1.0, 3.0]
+    assert sum(scores) / len(scores) == 2.0
+    assert sum(scores) / len(scores) not in scores
+    assert sum(item.get("loss", 0.0) for item in collector) == 4.0
 
 
 def _loss_fn(kind: str, collector: list[dict]):
@@ -489,11 +599,13 @@ def test_sft_and_rl_true_loss_match_disabled_reference_across_cp_cut(
         "all_gather_object",
         lambda output, records, group: output.__setitem__(slice(None), [records, []]),
     )
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda value, group: None)
 
     batch = PackedBatch(
         input_ids=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
         labels=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
         seq_lens=torch.tensor([5, 2]),
+        loss_mask=torch.ones(7),
     )
     source_batch = torch.tensor(source)
 
@@ -533,7 +645,7 @@ def test_sft_and_rl_true_loss_match_disabled_reference_across_cp_cut(
     baseline_records = []
     baseline_result = _run_loop(
         baseline_handle,
-        iter([(batch, LossContext(source_batch=source_batch))]),
+        iter([(batch, LossContext(loss_scale=1 / 7, source_batch=source_batch))]),
         _loss_fn(kind, baseline_records),
     )
 
@@ -546,7 +658,7 @@ def test_sft_and_rl_true_loss_match_disabled_reference_across_cp_cut(
     dcp_records = []
     dcp_result = plugin.wrap_forward_backward(_run_loop)(
         dcp_handle,
-        iter([(batch, LossContext(source_batch=source_batch))]),
+        iter([(batch, LossContext(loss_scale=1 / 7, source_batch=source_batch))]),
         _loss_fn(kind, dcp_records),
     )
 

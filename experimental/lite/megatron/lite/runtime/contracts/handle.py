@@ -59,6 +59,13 @@ class ModelHandle:
         return getattr(ps, "dp_group", None)
 
     @property
+    def metric_group(self):
+        """Process group that owns training-wide metric reductions."""
+        if "metric_group" in self._extras:
+            return self._extras["metric_group"]
+        return self.dp_group
+
+    @property
     def cp_range(self) -> tuple[int, int]:
         return self._extras.get("cp_range", (1, 1))
 
