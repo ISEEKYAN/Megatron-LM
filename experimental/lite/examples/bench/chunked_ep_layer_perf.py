@@ -132,9 +132,7 @@ def _run_once(
     peak_gb = torch.cuda.max_memory_allocated(hidden.device) / 1e9
     reserved_peak_gb = torch.cuda.max_memory_reserved(hidden.device) / 1e9
     memory_stats = torch.cuda.memory_stats(hidden.device)
-    inactive_split_peak_gb = (
-        memory_stats.get("inactive_split_bytes.all.peak", 0) / 1e9
-    )
+    inactive_split_peak_gb = memory_stats.get("inactive_split_bytes.all.peak", 0) / 1e9
     _zero_grads(module)
     return elapsed_ms, peak_gb, reserved_peak_gb, inactive_split_peak_gb
 
@@ -159,13 +157,16 @@ def _measure_pair(
         )
         for name in order:
             module, native_chunked_recompute = arms[name]
-            elapsed_ms, arm_peak_gb, arm_reserved_peak_gb, arm_inactive_split_peak_gb = (
-                _run_once(
-                    module,
-                    hidden,
-                    mode=mode,
-                    native_chunked_recompute=native_chunked_recompute,
-                )
+            (
+                elapsed_ms,
+                arm_peak_gb,
+                arm_reserved_peak_gb,
+                arm_inactive_split_peak_gb,
+            ) = _run_once(
+                module,
+                hidden,
+                mode=mode,
+                native_chunked_recompute=native_chunked_recompute,
             )
             if iteration >= warmup:
                 samples[name].append(elapsed_ms)
@@ -270,20 +271,27 @@ def main() -> int:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     config = Qwen3MoEConfig.from_hf(
-        args.hf_path,
-        num_hidden_layers=1,
-        layer_types=["full_attention"],
+        args.hf_path, num_hidden_layers=1, layer_types=["full_attention"]
     )
     parallel = init_parallel(
         ParallelConfig(tp=1, etp=1, ep=world_size, pp=1, vpp=1, cp=1)
     )
-    baseline = MoELayer(config, parallel, use_deepep=True).to(torch.bfloat16).cuda()
-    candidate = MoELayer(
-        config,
-        parallel,
-        num_chunks_ep_a2a_overlap=args.chunks,
-        use_deepep=True,
-    ).to(torch.bfloat16).cuda()
+    baseline = (
+        MoELayer(config, parallel, layer_idx=0, use_deepep=True)
+        .to(torch.bfloat16)
+        .cuda()
+    )
+    candidate = (
+        MoELayer(
+            config,
+            parallel,
+            layer_idx=0,
+            num_chunks_ep_a2a_overlap=args.chunks,
+            use_deepep=True,
+        )
+        .to(torch.bfloat16)
+        .cuda()
+    )
     candidate.load_state_dict(baseline.state_dict())
     for parameter in candidate.experts.parameters():
         parameter.main_grad = torch.zeros_like(parameter, dtype=torch.float32)

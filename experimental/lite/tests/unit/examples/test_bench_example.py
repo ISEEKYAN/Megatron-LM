@@ -71,6 +71,7 @@ def test_chunked_ep_layer_perf_has_the_three_full_recompute_gates():
     assert 'MODES = ("forward", "backward", "fused_forward_backward")' in text
     assert "default=16384" in text
     assert "use_deepep=True" in text
+    assert text.count("layer_idx=0") == 2
     assert '"moe_full_recompute": True' in text
     assert "speedup > 1.0" in text
     assert "candidate.experts.parameters()" in text
