@@ -421,6 +421,12 @@ def main(argv: list[str] | None = None) -> int:
         cycles=args.cycles,
         warmup=args.warmup,
     )
+    import torch
+
+    torch.cuda.synchronize()
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
     print("QWEN3_EP_OVERLAP_PROBE_OK", flush=True)
     return 0
 

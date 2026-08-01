@@ -118,6 +118,16 @@ def test_overlap_probe_rejects_truncated_model_evidence():
         )
 
 
+def test_overlap_probe_explicitly_closes_the_distributed_runtime():
+    from examples.bench import qwen3_ep_overlap_probe as probe
+
+    source = Path(probe.__file__).read_text(encoding="utf-8")
+
+    assert "torch.cuda.synchronize()" in source
+    assert "torch.distributed.barrier()" in source
+    assert "torch.distributed.destroy_process_group()" in source
+
+
 def test_overlap_probe_rejects_missing_peak_memory_evidence():
     from examples.bench.qwen3_ep_overlap_probe import validate_probe_summary
 
