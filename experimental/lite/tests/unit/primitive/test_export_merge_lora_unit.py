@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import ast
+import copy
+import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +20,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
 )
 from megatron.lite.primitive.modules.lora import LinearLoRA, SharedGroupedLinearLoRA
 from megatron.lite.primitive.modules.lora import apply_olora_tail_init
+from megatron.lite.primitive.modules.lora import lora_init_uses_residual_base
 from megatron.lite.primitive.modules.lora_apply import (
     LoRAWrappedGroupedLinear,
     LoRAWrappedLinear,
@@ -108,6 +113,36 @@ def _export_dict(model, *, merge_lora):
     )
 
 
+def _load_production_rollout_sync_resolver():
+    """Load the production decision without importing optional VERL dependencies."""
+    engine_path = (
+        Path(__file__).parents[3]
+        / "examples/verl/verl_mlite/engine/mlite_engine.py"
+    )
+    tree = ast.parse(engine_path.read_text())
+    engine_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MegatronLiteEngine"
+    )
+    resolver = copy.deepcopy(
+        next(
+            node
+            for node in engine_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_lora_rollout_sync_is_merge"
+        )
+    )
+    resolver.decorator_list = []
+    namespace = {
+        "logger": logging.getLogger(__name__),
+        "lora_init_uses_residual_base": lora_init_uses_residual_base,
+    }
+    module = ast.fix_missing_locations(ast.Module([resolver], []))
+    exec(compile(module, engine_path, "exec"), namespace)
+    return namespace[resolver.name]
+
+
 def test_wrapper_names_are_canonical_and_adapter_params_never_leak():
     model = _TinyWrappedModel()
     plain = _export_dict(model, merge_lora=False)
@@ -182,12 +217,14 @@ def test_olora_tail_warns_when_grouped_expert_adapters_are_skipped():
     assert stats == {"initialized": 1, "skipped": 1}
 
 
-def test_olora_tail_merged_export_matches_external_pretrained_base():
-    """Residual-base training and merged rollout must represent one weight.
+def test_olora_tail_rollout_decision_matches_external_pretrained_base():
+    """The production sync decision must preserve the pretrained weight.
 
     The pre-init tensor is the independent reference: it comes from the plain
-    model before either the OLoRA-tail transform or the export path runs.  This
-    catches a self-consistent but jointly wrong residual/export pair.
+    model before either the OLoRA-tail transform or rollout-mode resolution
+    runs.  Driving export with the production resolver catches the original
+    failure: a self-consistent residual/export implementation hidden behind an
+    incorrect adapter-only rollout decision.
     """
     model = _TinyWrappedModel()
     # Powers of two make subtract-then-add bitwise reversible, so this test can
@@ -203,9 +240,13 @@ def test_olora_tail_merged_export_matches_external_pretrained_base():
         apply_olora_tail_init(model)
 
     residual_base = _export_dict(model, merge_lora=False)["qkv.linear.weight"]
-    rollout_weight = _export_dict(model, merge_lora=True)["qkv.linear.weight"]
+    merge_lora = _load_production_rollout_sync_resolver()(
+        {"enabled": True, "init": "olora_tail", "rollout_sync": "adapter"}
+    )
+    rollout_weight = _export_dict(model, merge_lora=merge_lora)["qkv.linear.weight"]
     training_weight = residual_base + delta
 
     assert not torch.equal(residual_base, external_base)
+    assert merge_lora is True
     torch.testing.assert_close(training_weight, external_base, rtol=0, atol=0)
     torch.testing.assert_close(rollout_weight, training_weight, rtol=0, atol=0)
