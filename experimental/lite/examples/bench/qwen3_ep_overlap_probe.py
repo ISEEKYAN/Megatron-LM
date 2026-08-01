@@ -28,8 +28,8 @@ record_memory_history = cycle_memory_probe.record_memory_history
 reset_peak_memory = cycle_memory_probe.reset_peak_memory
 sample_cuda_memory = cycle_memory_probe.sample_cuda_memory
 
-_OVERLAP_KEY = "overlap_moe_expert_parallel_comm"
-_SHARED_IMPL_CFG: dict[str, Any] = {"use_deepep": False, "recompute": []}
+_OVERLAP_KEY = "num_chunks_ep_a2a_overlap"
+_SHARED_IMPL_CFG: dict[str, Any] = {"use_deepep": True, "recompute": ["moe"]}
 _PARALLEL_EVIDENCE = {"ep": 8, "tp": 1, "pp": 1, "cp": 1}
 
 
@@ -153,8 +153,8 @@ def validate_probe_summary(summary: dict[str, Any], *, warmup: int) -> None:
 def build_arm_configs() -> tuple[dict[str, Any], dict[str, Any]]:
     baseline = deepcopy(_SHARED_IMPL_CFG)
     overlap = deepcopy(_SHARED_IMPL_CFG)
-    baseline[_OVERLAP_KEY] = False
-    overlap[_OVERLAP_KEY] = True
+    baseline[_OVERLAP_KEY] = 1
+    overlap[_OVERLAP_KEY] = 2
     assert_only_overlap_diff(baseline, overlap)
     return baseline, overlap
 
@@ -171,8 +171,8 @@ def assert_only_overlap_diff(baseline: dict[str, Any], overlap: dict[str, Any]) 
         )
     for key in sorted(baseline):
         if key == _OVERLAP_KEY:
-            if baseline[key] is not False or overlap[key] is not True:
-                raise ValueError(f"{_OVERLAP_KEY} must be False/True")
+            if baseline[key] != 1 or overlap[key] != 2:
+                raise ValueError(f"{_OVERLAP_KEY} must be 1/2")
         elif baseline[key] != overlap[key]:
             raise ValueError(f"controlled A/B differs outside {_OVERLAP_KEY}: {key}")
 

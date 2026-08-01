@@ -14,12 +14,14 @@ sys.path = [path for path in sys.path if path != _LITE_ROOT]
 sys.path.insert(0, _LITE_ROOT)
 
 
-def test_overlap_probe_arms_differ_only_in_overlap_knob():
+def test_overlap_probe_arms_differ_only_in_chunk_count():
     from examples.bench import qwen3_ep_overlap_probe as probe
 
     baseline, overlap = probe.build_arm_configs()
-    assert baseline["overlap_moe_expert_parallel_comm"] is False
-    assert overlap["overlap_moe_expert_parallel_comm"] is True
+    assert baseline["use_deepep"] is True
+    assert overlap["use_deepep"] is True
+    assert baseline["num_chunks_ep_a2a_overlap"] == 1
+    assert overlap["num_chunks_ep_a2a_overlap"] == 2
     probe.assert_only_overlap_diff(baseline, overlap)
 
 
@@ -28,18 +30,18 @@ def test_overlap_probe_selects_exactly_one_arm_per_process():
 
     baseline = probe.select_arm_config("baseline")
     overlap = probe.select_arm_config("overlap")
-    assert baseline["overlap_moe_expert_parallel_comm"] is False
-    assert overlap["overlap_moe_expert_parallel_comm"] is True
+    assert baseline["num_chunks_ep_a2a_overlap"] == 1
+    assert overlap["num_chunks_ep_a2a_overlap"] == 2
     assert baseline is not overlap
 
 
-def test_overlap_probe_rejects_non_overlap_difference():
+def test_overlap_probe_rejects_non_chunk_difference():
     from examples.bench.qwen3_ep_overlap_probe import assert_only_overlap_diff
 
     with pytest.raises(ValueError, match="use_deepep"):
         assert_only_overlap_diff(
-            {"overlap_moe_expert_parallel_comm": False, "use_deepep": False},
-            {"overlap_moe_expert_parallel_comm": True, "use_deepep": True},
+            {"num_chunks_ep_a2a_overlap": 1, "use_deepep": False},
+            {"num_chunks_ep_a2a_overlap": 2, "use_deepep": True},
         )
 
 
@@ -72,18 +74,18 @@ def test_overlap_probe_config_only_builds_full_model_runtime_configs(tmp_path):
     baseline, overlap = build_config_only_plans(
         hf_path=str(_write_qwen3_moe_config(tmp_path / "hf"))
     )
-    assert (
-        baseline["runtime"]["backend_cfg"]["impl_cfg"][
-            "overlap_moe_expert_parallel_comm"
-        ]
-        is False
-    )
-    assert (
-        overlap["runtime"]["backend_cfg"]["impl_cfg"][
-            "overlap_moe_expert_parallel_comm"
-        ]
-        is True
-    )
+    assert baseline["runtime"]["backend_cfg"]["impl_cfg"] == {
+        "use_deepep": True,
+        "recompute": ["moe"],
+        "num_chunks_ep_a2a_overlap": 1,
+        "use_thd": False,
+    }
+    assert overlap["runtime"]["backend_cfg"]["impl_cfg"] == {
+        "use_deepep": True,
+        "recompute": ["moe"],
+        "num_chunks_ep_a2a_overlap": 2,
+        "use_thd": False,
+    }
     for plan in (baseline, overlap):
         assert plan["evidence_contract"]["model"] == {
             "num_hidden_layers": 48,
