@@ -8,7 +8,6 @@ import copy
 import pytest
 import torch
 import torch.nn as nn
-import torch.nn.utils.parametrize as parametrize
 
 from megatron.lite.primitive.modules.lora import (
     LinearLoRA,
@@ -20,6 +19,7 @@ from megatron.lite.primitive.modules.lora_apply import (
     LoRAWrappedLinear,
     apply_lora_to_chunks,
 )
+from megatron.lite.primitive.quantization import QATSpec, apply_qat_to_chunks
 
 pytestmark = pytest.mark.mlite
 
@@ -78,24 +78,6 @@ def test_apply_wraps_swiglu_and_freezes_base():
     assert stats["frozen_tensors"] > 0
 
 
-class _IdentityWeightTransform(parametrize.Module):
-    def forward(self, weight: torch.Tensor) -> torch.Tensor:
-        return weight * 1.0
-
-
-def _apply_fake_qat_to_linears(model: nn.Module) -> None:
-    for module in model.modules():
-        if isinstance(module, LoRAWrappedLinear):
-            owner = _weight_owner(module.base)
-        else:
-            owner = _weight_owner(module)
-        if owner is None or parametrize.is_parametrized(owner, "weight"):
-            continue
-        parametrize.register_parametrization(
-            owner, "weight", _IdentityWeightTransform(), unsafe=True
-        )
-
-
 def test_qat_and_lora_four_combos():
     SwiGLUMLP = _swiglu_mlp()
     combos = [(False, False), (True, False), (False, True), (True, True)]
@@ -109,7 +91,7 @@ def test_qat_and_lora_four_combos():
         chunk = nn.Module()
         chunk.mlp = mlp
         if qat_on:
-            _apply_fake_qat_to_linears(chunk)
+            assert apply_qat_to_chunks([chunk], QATSpec(enabled=True, format="int8"))["quantized_modules"] == 2
         apply_lora_to_chunks([chunk], LoraSpec(enabled=lora_on, rank=2))
         if lora_on:
             for name, param in chunk.named_parameters():
@@ -118,10 +100,11 @@ def test_qat_and_lora_four_combos():
         with torch.no_grad():
             outputs.append(mlp(x).clone())
 
-    # Identity QAT parametrization must not change the base forward.
-    torch.testing.assert_close(outputs[0], outputs[1])
+    # Real Q/DQ changes the forward; both transforms remain runnable together.
+    assert not torch.allclose(outputs[0], outputs[1])
     assert not torch.allclose(outputs[0], outputs[2])
-    assert outputs[3].shape == outputs[0].shape
+    loss = outputs[3].square().mean()
+    assert loss.isfinite()
 
 
 def test_lora_wrapped_linear_forwards_base_attrs():
