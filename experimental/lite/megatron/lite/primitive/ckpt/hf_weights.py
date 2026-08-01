@@ -35,6 +35,10 @@ except Exception:  # pragma: no cover - older torch without DTensor
 from megatron.lite.primitive.ckpt.weight_sync_probe import (  # isort: skip
     get_weight_sync_probe,
 )
+from megatron.lite.primitive.ckpt.fused_weights import (  # isort: skip
+    FusedWeightLayout,
+    WeightSegment,
+)
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -492,26 +496,26 @@ def split_qkv(
     Naive ``split_dim`` would slice across the Q/K/V boundary incorrectly
     when num_q_heads != num_kv_heads (GQA).
     """
-    if world <= 1:
-        return tensor
-    q_size = num_q_heads * head_dim
-    kv_size = num_kv_heads * head_dim
-    q = tensor[:q_size]
-    k = tensor[q_size : q_size + kv_size]
-    v = tensor[q_size + kv_size :]
-    q_shard = q.chunk(world, dim=0)[rank]
-    k_shard = k.chunk(world, dim=0)[rank]
-    v_shard = v.chunk(world, dim=0)[rank]
-    return torch.cat([q_shard, k_shard, v_shard], dim=0).contiguous()
+    layout = FusedWeightLayout(
+        name="qkv",
+        segments=(
+            WeightSegment("q", num_q_heads, head_dim),
+            WeightSegment("k", num_kv_heads, head_dim),
+            WeightSegment("v", num_kv_heads, head_dim),
+        ),
+    )
+    return layout.tp_shard(tensor, rank=rank, world_size=world)
 
 
 def split_gate_up(tensor: torch.Tensor, rank: int, world: int) -> torch.Tensor:
-    if world <= 1:
-        return tensor
+    if tensor.size(0) % 2:
+        raise ValueError("gate_up tensor must contain equal gate and up rows")
     ffn = tensor.shape[0] // 2
-    gate = tensor[:ffn].chunk(world, dim=0)[rank]
-    up = tensor[ffn:].chunk(world, dim=0)[rank]
-    return torch.cat([gate, up], dim=0).contiguous()
+    layout = FusedWeightLayout(
+        name="gate_up",
+        segments=(WeightSegment("gate", ffn, 1), WeightSegment("up", ffn, 1)),
+    )
+    return layout.tp_shard(tensor, rank=rank, world_size=world)
 
 
 def allgather_concat(
@@ -857,10 +861,29 @@ def to_global_layer_name(name: str, layer_map: dict[int, int]) -> str:
 def gather_gate_up(
     tensor: torch.Tensor, world_size: int, group: dist.ProcessGroup
 ) -> torch.Tensor:
+    if tensor.size(0) % 2:
+        raise ValueError("gate_up tensor must contain equal gate and up rows")
     ffn_local = tensor.shape[0] // 2
-    gate_full = allgather_concat(tensor[:ffn_local], world_size, group, dim=0)
-    up_full = allgather_concat(tensor[ffn_local:], world_size, group, dim=0)
-    return torch.cat([gate_full, up_full], dim=0)
+    local_layout = FusedWeightLayout(
+        name="gate_up",
+        segments=(
+            WeightSegment("gate", ffn_local, 1),
+            WeightSegment("up", ffn_local, 1),
+        ),
+    )
+    local = local_layout.split(tensor)
+    full = {
+        name: allgather_concat(part, world_size, group, dim=0)
+        for name, part in local.items()
+    }
+    full_layout = FusedWeightLayout(
+        name="gate_up",
+        segments=(
+            WeightSegment("gate", ffn_local * world_size, 1),
+            WeightSegment("up", ffn_local * world_size, 1),
+        ),
+    )
+    return full_layout.fuse(full)
 
 
 # ======================================================================
