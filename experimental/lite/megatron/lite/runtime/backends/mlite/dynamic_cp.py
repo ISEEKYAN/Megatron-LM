@@ -296,6 +296,32 @@ def _record_output(
     }
 
 
+def _merge_metric_rows(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge leader metrics without importing an application metric type."""
+    merged: dict[str, Any] = {}
+    keys = {key for record in records for key in record["metrics"]}
+    for key in keys:
+        values = [
+            record["metrics"][key] for record in records if key in record["metrics"]
+        ]
+        first = values[0]
+        init_list = getattr(first, "init_list", None)
+        if callable(init_list):
+            aggregate = init_list()
+            for value in values:
+                aggregate.append(value)
+            merged[key] = aggregate
+        elif all(isinstance(value, list) for value in values):
+            merged[key] = [item for value in values for item in value]
+        elif any(isinstance(value, list) for value in values):
+            raise TypeError(
+                f"Dynamic CP metric {key!r} mixes list and scalar leader values."
+            )
+        else:
+            merged[key] = values
+    return merged
+
+
 def _restore_outputs(
     collector: list[dict[str, Any]] | None,
     records: list[dict[str, Any]],
@@ -342,13 +368,9 @@ def _restore_outputs(
             {
                 "model_output": model_output,
                 "loss": sum(item["loss"] for item in values),
-                "metrics": values[0]["metrics"],
+                "metrics": _merge_metric_rows(values),
             }
         )
-        # Collector consumers fold each output entry independently. Preserve
-        # every distinct subgroup leader as a separate metric contribution
-        # while emitting the reconstructed output and summed loss exactly once.
-        collector.extend({"metrics": item["metrics"]} for item in values[1:])
 
 
 @dataclass(slots=True)
@@ -537,7 +559,7 @@ class DynamicCPPlugin:
                 "Dynamic CP plan must cover every input sample exactly once."
             )
         missing_cp_sizes = sorted(set(self._cp_size_space) - set(cp_size_histogram))
-        if loss_fn is not None and any(context is not None for context, _ in contexts):
+        if loss_fn is not None:
             missing_masks = [
                 sample_id
                 for sample_id, sample in enumerate(samples)
@@ -603,8 +625,12 @@ class DynamicCPPlugin:
                 samples, ids, cp_size=cp_size, leader=rank == members[0]
             )
             context = _select_context(contexts, ids, batch.input_ids.device)
-            correction = 1.0
-            if context is not None and global_num_tokens is not None:
+            correction = None
+            if context is not None:
+                if global_num_tokens is None:
+                    raise RuntimeError(
+                        "Dynamic CP loss normalization has no pool-global token count."
+                    )
                 if context.loss_scale <= 0:
                     raise ValueError(
                         f"Dynamic CP requires positive loss_scale, got {context.loss_scale}."
@@ -656,8 +682,10 @@ class DynamicCPPlugin:
                 # K CP ranks is represented K times; N/K preserves logical-DP=1
                 # global-loss weighting across mixed subgroup sizes.
                 replica_scale = self._pool.size() / int(batch.extras[_LOCAL_CP_SIZE])
-                normalization = float(batch.extras[_LOSS_SCALE_CORRECTION])
-                return loss * normalization * schedule_scale * replica_scale, metrics
+                normalization = batch.extras[_LOSS_SCALE_CORRECTION]
+                if normalization is not None:
+                    loss = loss * float(normalization)
+                return loss * schedule_scale * replica_scale, metrics
 
         return _Prepared(
             data=bound,
