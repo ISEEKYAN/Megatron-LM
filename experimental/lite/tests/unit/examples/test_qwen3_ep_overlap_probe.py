@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -42,10 +43,35 @@ def test_overlap_probe_rejects_non_overlap_difference():
         )
 
 
-def test_overlap_probe_config_only_builds_both_runtime_configs():
+def test_overlap_probe_rejects_wrong_parallel_topology():
+    from examples.bench import qwen3_ep_overlap_probe as probe
+
+    with pytest.raises(ValueError, match="parallel topology"):
+        probe.build_parallel_evidence(probe.BenchCliConfig(ep=4, tp=1, pp=1, cp=1))
+
+
+def _write_qwen3_moe_config(path: Path) -> Path:
+    path.mkdir()
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_moe",
+                "num_hidden_layers": 48,
+                "num_experts": 128,
+                "num_experts_per_tok": 8,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_overlap_probe_config_only_builds_full_model_runtime_configs(tmp_path):
     from examples.bench.qwen3_ep_overlap_probe import build_config_only_plans
 
-    baseline, overlap = build_config_only_plans(hf_path="/tmp/hf")
+    baseline, overlap = build_config_only_plans(
+        hf_path=str(_write_qwen3_moe_config(tmp_path / "hf"))
+    )
     assert (
         baseline["runtime"]["backend_cfg"]["impl_cfg"][
             "overlap_moe_expert_parallel_comm"
@@ -58,6 +84,63 @@ def test_overlap_probe_config_only_builds_both_runtime_configs():
         ]
         is True
     )
+    for plan in (baseline, overlap):
+        assert plan["evidence_contract"]["model"] == {
+            "num_hidden_layers": 48,
+            "truncated": False,
+            "num_experts": 128,
+        }
+        assert plan["evidence_contract"]["parallel"] == {
+            "ep": 8,
+            "tp": 1,
+            "pp": 1,
+            "cp": 1,
+        }
+
+
+def test_overlap_probe_rejects_truncated_model_evidence():
+    from examples.bench.qwen3_ep_overlap_probe import validate_probe_summary
+
+    with pytest.raises(ValueError, match="truncated"):
+        validate_probe_summary(
+            {
+                "model": {
+                    "num_hidden_layers": 2,
+                    "truncated": True,
+                    "num_experts": 128,
+                },
+                "parallel": {"ep": 8, "tp": 1, "pp": 1, "cp": 1},
+                "rows": [],
+            },
+            warmup=1,
+        )
+
+
+def test_overlap_probe_rejects_missing_peak_memory_evidence():
+    from examples.bench.qwen3_ep_overlap_probe import validate_probe_summary
+
+    with pytest.raises(ValueError, match="peak memory"):
+        validate_probe_summary(
+            {
+                "model": {
+                    "num_hidden_layers": 48,
+                    "truncated": False,
+                    "num_experts": 128,
+                },
+                "parallel": {"ep": 8, "tp": 1, "pp": 1, "cp": 1},
+                "rows": [
+                    {
+                        "cycle": cycle,
+                        "phase": "after",
+                        "step_ms": 10.0,
+                        "peak_allocated_bytes": 100,
+                        "peak_reserved_bytes": 200,
+                    }
+                    for cycle in (1, 2)
+                ],
+            },
+            warmup=1,
+        )
 
 
 def test_overlap_probe_reuses_shared_cycle_memory_harness():
@@ -76,11 +159,7 @@ def test_overlap_probe_success_requires_all_rank_artifacts(tmp_path):
 
     with pytest.raises(RuntimeError, match="probe evidence missing"):
         require_probe_artifacts(
-            out_dir=tmp_path,
-            arm="baseline",
-            rank=3,
-            cycles=2,
-            warmup=1,
+            out_dir=tmp_path, arm="baseline", rank=3, cycles=2, warmup=1
         )
 
     expected = [
@@ -94,11 +173,7 @@ def test_overlap_probe_success_requires_all_rank_artifacts(tmp_path):
 
     assert (
         require_probe_artifacts(
-            out_dir=tmp_path,
-            arm="baseline",
-            rank=3,
-            cycles=2,
-            warmup=1,
+            out_dir=tmp_path, arm="baseline", rank=3, cycles=2, warmup=1
         )
         == expected
     )
