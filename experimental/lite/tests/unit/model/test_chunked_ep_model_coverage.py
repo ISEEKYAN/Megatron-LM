@@ -41,7 +41,7 @@ def test_every_lite_moe_model_consumes_the_shared_chunked_ep_primitive(
     assert "class MoELayer(EPChunkOverlap" not in implementation
     assert "class DeepseekV4MoE(EPChunkOverlap" not in implementation
     assert "num_chunks_ep_a2a_overlap" in implementation
-    assert '("ep_chunk_overlap", "main", layer_idx % 8, 0)' in implementation
+    assert 'buffer_slot=("deepep", "main", layer_idx % 8)' in implementation
     assert (
         'buffer_slot=("ep_chunk_overlap", "forward", layer_idx % 8, idx)'
         in implementation
@@ -94,7 +94,7 @@ def test_chunked_ep_benchmark_uses_the_current_qwen_moe_signature():
         LITE_ROOT / "examples/bench/chunked_ep_layer_perf.py"
     ).read_text()
 
-    assert "layer_idx=" not in benchmark
+    assert benchmark.count("layer_idx=0") == 2
 
 
 def test_deepseek_hash_router_keeps_checkpoint_gate_name():

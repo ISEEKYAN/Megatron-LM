@@ -159,11 +159,7 @@ class MoELayer(nn.Module):
             config.hidden_size,
             ps,
             use_deepep=use_deepep,
-            buffer_slot=(
-                ("ep_chunk_overlap", "main", layer_idx % 8, 0)
-                if num_chunks_ep_a2a_overlap > 1
-                else None
-            ),
+            buffer_slot=("deepep", "main", layer_idx % 8),
         )
         self.ep_chunk_dispatchers = ()
         self.ep_chunk_overlap = None
