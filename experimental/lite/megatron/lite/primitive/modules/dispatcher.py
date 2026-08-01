@@ -713,29 +713,6 @@ class TokenDispatcher:
         )
         if num_tokens_per_rdma_rank is not None or getattr(self.ps, "tp_size", 1) != 1:
             num_worst_tokens = 0
-        recv_counts = None
-        recv_counts_work = None
-        if num_worst_tokens:
-            _event_current_stream_wait(event)
-            recv_layout = torch.cat(
-                (
-                    num_tokens_per_rank.to(dtype=num_tokens_per_expert.dtype),
-                    num_tokens_per_expert,
-                )
-            )
-            recv_counts_work = dist.all_reduce(
-                recv_layout,
-                group=self.ps.tp_ep_group,
-                async_op=True,
-            )
-            recv_counts_work.wait()
-            torch._assert_async(
-                recv_layout[self.ps.ep_rank] <= num_worst_tokens,
-                "DeepEP receive rows exceed the fixed dispatch capacity",
-            )
-            recv_counts = recv_layout[self.ep_size :]
-            recv_counts_work = None
-
         hidden_states_contig = hidden_states.contiguous()
         recv_hidden, recv_indices, recv_probs, recv_per_expert, handle, event = (
             self.buffer.dispatch(
@@ -758,8 +735,6 @@ class TokenDispatcher:
             "recv_indices": recv_indices,
             "recv_probs": recv_probs,
             "recv_per_expert": recv_per_expert,
-            "recv_counts": recv_counts,
-            "recv_counts_work": recv_counts_work,
             "capacity_rows": int(num_worst_tokens) if num_worst_tokens else None,
             "handle": handle,
             "event": event,
@@ -769,15 +744,19 @@ class TokenDispatcher:
         recv_per_expert = state["recv_per_expert"]
         if recv_per_expert is not None and len(recv_per_expert) > 0:
             return recv_per_expert
-        recv_counts = state.pop("recv_counts", None)
-        recv_counts_work = state.pop("recv_counts_work", None)
-        if recv_counts is None:
+        capacity_rows = state.get("capacity_rows")
+        if capacity_rows is None:
             return recv_per_expert
-        if recv_counts_work is not None:
-            recv_counts_work.wait()
-        start = self.ps.ep_rank * self.num_local_experts
-        end = start + self.num_local_experts
-        return recv_counts[start:end].tolist()
+        recv_indices = state["recv_indices"]
+        valid = recv_indices >= 0
+        valid_rows = valid.any(dim=-1) if valid.dim() > 1 else valid
+        torch._assert_async(
+            valid_rows.sum() <= capacity_rows,
+            "DeepEP receive rows exceed the fixed dispatch capacity",
+        )
+        return torch.bincount(
+            recv_indices[valid].to(torch.long), minlength=self.num_local_experts
+        )[: self.num_local_experts]
 
     def finish_deepep_dispatch(self, state):
         if not self.use_deepep:

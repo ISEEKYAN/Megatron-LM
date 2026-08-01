@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -183,8 +182,6 @@ class EPChunkOverlapOperator:
     ):
         self._router_forward = router_forward
         self._active_routing_input: torch.Tensor | None = None
-        self._recv_capacity_scalar: torch.Tensor | None = None
-
         self.router = router
         self.experts = experts
         self.dispatcher = dispatcher
@@ -201,22 +198,21 @@ class EPChunkOverlapOperator:
     ) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
         return torch.cuda.current_stream(device), _shared_comm_stream(device)
 
-    def _recv_capacity_rows(self, x_2d: torch.Tensor, *, chunks: int) -> int:
-        """Return an exact intranode DeepEP receive bound for uneven THD ranks."""
-        if getattr(self.dispatcher.ps, "tp_size", 1) != 1:
+    def _recv_capacity_rows(
+        self,
+        x_2d: torch.Tensor,
+        *,
+        chunks: int,
+        rows_replicated_across_ep: bool,
+    ) -> int:
+        """Return a collective-free bound when EP ranks own equal input rows."""
+        if (
+            getattr(self.dispatcher.ps, "tp_size", 1) != 1
+            or not rows_replicated_across_ep
+        ):
             return 0
-        max_rows = getattr(self, "_recv_capacity_scalar", None)
-        if max_rows is None or max_rows.device != x_2d.device:
-            max_rows = torch.empty((), dtype=torch.int64, device=x_2d.device)
-            self._recv_capacity_scalar = max_rows
-        max_rows.fill_(x_2d.size(0))
-        dist.all_reduce(
-            max_rows,
-            op=dist.ReduceOp.MAX,
-            group=self.dispatcher.ps.tp_ep_group,
-        )
         ranges = ep_chunk_ranges(
-            int(max_rows.item()),
+            x_2d.size(0),
             chunks,
             weights_env="MEGATRON_LITE_EP_CHUNK_WEIGHTS",
         )
@@ -257,7 +253,11 @@ class EPChunkOverlapOperator:
         input_shape = x.shape
         x_2d = x.view(-1, x.size(-1)) if x.dim() == 3 else x
         chunks = 2
-        recv_capacity_rows = self._recv_capacity_rows(x_2d, chunks=chunks)
+        recv_capacity_rows = self._recv_capacity_rows(
+            x_2d,
+            chunks=chunks,
+            rows_replicated_across_ep=x.dim() == 3,
+        )
         if torch.is_grad_enabled():
             params = tuple(self.router.parameters()) + tuple(self.experts.parameters())
             return _FullRecomputeFused.apply(
@@ -423,29 +423,33 @@ class EPChunkOverlapOperator:
                     combine_state = dispatcher.submit_deepep_combine_prepared(
                         rank_grouped, handle
                     )
-            return dispatcher, combine_state
+            return chunk_idx, dispatcher, combine_state
 
-        pending_combines = []
+        output_2d = x_2d.new_empty(x_2d.shape)
+
+        def finish_combine(pending) -> None:
+            chunk_idx, dispatcher, state = pending
+            with _ep_chunk_nvtx("forward.combine.finish", chunk_idx):
+                chunk_out = dispatcher.finish_deepep_combine(state)
+            start, end = ranges[chunk_idx]
+            output_2d[start:end].copy_(chunk_out)
+
+        pending_combine = None
         with torch.no_grad():
             current_state = submit_dispatch(0)
             for loop_idx in range(len(ranges)):
                 prepared = finish_dispatch_expert(current_state)
                 if loop_idx + 1 < len(ranges):
                     current_state = submit_dispatch(loop_idx + 1)
-                pending_combines.append(submit_combine(prepared))
+                if pending_combine is not None:
+                    finish_combine(pending_combine)
+                pending_combine = submit_combine(prepared)
 
         done = torch.cuda.Event()
         done.record(compute_stream)
         caller_stream.wait_event(done)
-        output_2d = x_2d.new_empty(x_2d.shape)
-        offset = 0
-        for chunk_idx, (dispatcher, state) in enumerate(pending_combines):
-            with _ep_chunk_nvtx("forward.combine.finish", chunk_idx):
-                chunk_out = dispatcher.finish_deepep_combine(state)
-            next_offset = offset + chunk_out.size(0)
-            output_2d[offset:next_offset].copy_(chunk_out)
-            offset = next_offset
-            del chunk_out
+        assert pending_combine is not None
+        finish_combine(pending_combine)
         return output_2d.view(input_shape).to(input_dtype).detach()
 
     def _full_recompute_fused_backward(

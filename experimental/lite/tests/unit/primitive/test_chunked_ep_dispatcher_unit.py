@@ -137,13 +137,9 @@ def test_deepep_dispatch_materializes_contiguous_router_outputs():
     assert buffer.dispatch_calls[0][1]["topk_weights"].is_contiguous()
 
 
-def test_fixed_capacity_dispatch_resolves_global_local_expert_counts(monkeypatch):
-    class Work:
-        waited = False
-
-        def wait(self):
-            self.waited = True
-
+def test_fixed_capacity_dispatch_resolves_local_expert_counts_without_collective(
+    monkeypatch,
+):
     class Buffer(_Buffer):
         def get_dispatch_layout(self, _topk_indices, **_kwargs):
             return (
@@ -154,29 +150,24 @@ def test_fixed_capacity_dispatch_resolves_global_local_expert_counts(monkeypatch
                 _Event(),
             )
 
-    work = Work()
+        def dispatch(self, tensor, **kwargs):
+            self.dispatch_calls.append((tensor, kwargs))
+            return (
+                torch.zeros(6, 2),
+                torch.tensor([[0], [1], [1], [-1], [-1], [-1]]),
+                torch.ones(6, 1),
+                None,
+                "handle",
+                _Event(),
+            )
 
-    def all_reduce(counts, group, async_op):
-        assert group is value.ps.tp_ep_group
-        assert async_op
-        assert counts.numel() == 6
-        counts.add_(torch.tensor([5, 6, 10, 20, 30, 40], dtype=counts.dtype))
-        return work
-
-    monkeypatch.setattr(
-        dispatcher_module, "_event_current_stream_wait", lambda _event: None
-    )
-    capacity_checks = []
-    monkeypatch.setattr(
-        torch,
-        "_assert_async",
-        lambda condition, message: capacity_checks.append(
-            (bool(condition.item()), message)
-        ),
-    )
     value = _dispatcher(Buffer())
     value.ps = SimpleNamespace(tp_ep_group=object(), ep_rank=1)
-    monkeypatch.setattr(dispatcher_module.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(
+        dispatcher_module.dist,
+        "all_reduce",
+        lambda *_args, **_kwargs: pytest.fail("metadata collective is forbidden"),
+    )
     hidden = torch.zeros(3, 2)
     scores = torch.ones(3, 1)
     indices = torch.zeros(3, 1, dtype=torch.long)
@@ -186,27 +177,30 @@ def test_fixed_capacity_dispatch_resolves_global_local_expert_counts(monkeypatch
 
     assert value.buffer.dispatch_calls[0][1]["num_worst_tokens"] == 80
     assert state["capacity_rows"] == 80
-    assert recv_per_expert == [33, 44]
-    assert work.waited
-    assert capacity_checks == [
-        (True, "DeepEP receive rows exceed the fixed dispatch capacity")
-    ]
+    assert recv_per_expert.tolist() == [1, 2]
 
 
-def test_fixed_capacity_dispatch_fails_before_deepep_when_receive_rows_exceed_bound(
+def test_fixed_capacity_dispatch_fails_when_receive_rows_exceed_bound(
     monkeypatch,
 ):
-    class Work:
-        def wait(self):
-            return None
-
     class Buffer(_Buffer):
         def get_dispatch_layout(self, _topk_indices, **_kwargs):
             return (
-                torch.tensor([40, 100], dtype=torch.int32),
+                torch.tensor([1, 1], dtype=torch.int32),
                 None,
                 torch.tensor([1, 2, 3, 4], dtype=torch.int32),
                 torch.zeros(3, 2, dtype=torch.bool),
+                _Event(),
+            )
+
+        def dispatch(self, tensor, **kwargs):
+            self.dispatch_calls.append((tensor, kwargs))
+            return (
+                torch.zeros(3, 2),
+                torch.tensor([[0], [1], [0]]),
+                torch.ones(3, 1),
+                None,
+                "handle",
                 _Event(),
             )
 
@@ -220,24 +214,20 @@ def test_fixed_capacity_dispatch_fails_before_deepep_when_receive_rows_exceed_bo
     monkeypatch.setattr(
         dispatcher_module, "_event_current_stream_wait", lambda _event: None
     )
-    monkeypatch.setattr(
-        dispatcher_module.dist,
-        "all_reduce",
-        lambda _counts, group, async_op: Work(),
-    )
     monkeypatch.setattr(torch, "_assert_async", fail_loud)
 
     with pytest.raises(
         RuntimeError, match="DeepEP receive rows exceed the fixed dispatch capacity"
     ):
-        value.submit_deepep_dispatch(
+        state = value.submit_deepep_dispatch(
             torch.zeros(3, 2),
             torch.ones(3, 1),
             torch.zeros(3, 1, dtype=torch.long),
-            num_worst_tokens=76,
+            num_worst_tokens=2,
         )
+        value._resolve_deepep_recv_per_expert(state)
 
-    assert buffer.dispatch_calls == []
+    assert len(buffer.dispatch_calls) == 1
 
 
 def test_prepared_combine_preserves_manual_metadata_and_finishes(monkeypatch):

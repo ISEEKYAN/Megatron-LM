@@ -35,6 +35,24 @@ def test_overlap_probe_selects_exactly_one_arm_per_process():
     assert baseline is not overlap
 
 
+def test_overlap_probe_destroys_process_group_when_gpu_arm_fails(monkeypatch):
+    from examples.bench import qwen3_ep_overlap_probe as probe
+
+    destroyed = []
+    monkeypatch.setattr(probe, "build_config_only_plans", lambda _path: ({}, {}))
+    monkeypatch.setattr(
+        probe,
+        "_gpu_arm",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(probe, "_destroy_process_group", lambda: destroyed.append(True))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        probe.main(["--hf-path", "unused", "--arm", "overlap"])
+
+    assert destroyed == [True]
+
+
 def test_overlap_probe_rejects_non_chunk_difference():
     from examples.bench.qwen3_ep_overlap_probe import assert_only_overlap_diff
 

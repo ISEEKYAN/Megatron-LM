@@ -368,6 +368,13 @@ def _gpu_arm(
     )
 
 
+def _destroy_process_group() -> None:
+    import torch
+
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hf-path", required=True)
@@ -413,14 +420,17 @@ def main(argv: list[str] | None = None) -> int:
         skip_load_hf_weights=True,
         impl_cfg_json=json.dumps(select_arm_config(args.arm), sort_keys=True),
     )
-    _gpu_arm(args.arm, cfg, out_dir, args.cycles, args.warmup)
-    require_probe_artifacts(
-        out_dir=out_dir,
-        arm=args.arm,
-        rank=int(os.environ.get("RANK", "0")),
-        cycles=args.cycles,
-        warmup=args.warmup,
-    )
+    try:
+        _gpu_arm(args.arm, cfg, out_dir, args.cycles, args.warmup)
+        require_probe_artifacts(
+            out_dir=out_dir,
+            arm=args.arm,
+            rank=int(os.environ.get("RANK", "0")),
+            cycles=args.cycles,
+            warmup=args.warmup,
+        )
+    finally:
+        _destroy_process_group()
     print("QWEN3_EP_OVERLAP_PROBE_OK", flush=True)
     return 0
 
