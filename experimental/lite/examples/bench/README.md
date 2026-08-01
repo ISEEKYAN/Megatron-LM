@@ -75,10 +75,18 @@ DRY_RUN=1 \
 bash experimental/lite/examples/bench/scripts/run_qwen3_ep_overlap_pair.sh
 ```
 
-Set `DRY_RUN=0` inside an 8-GPU allocation to run the default EP=8 pair. The
-overlap arm sets only `overlap_moe_expert_parallel_comm=true`; the script writes
-separate JSON and log files for direct loss, gradient-norm, throughput, and
-memory comparison.
+Set `DRY_RUN=0` inside an 8-GPU allocation to run the EP=8 pair. This probe uses
+the complete model configuration: it rejects layer or expert truncation and
+records the realized layer count, expert count, and EP/TP/PP/CP topology in
+every rank summary. The overlap arm changes only
+`overlap_moe_expert_parallel_comm`. Each summary contains repeated global-step
+timings with a 95% confidence interval plus per-step and overall
+`max_memory_allocated`/`max_memory_reserved` evidence. Set `NSYS_PROFILE=1` to
+also capture CUDA/NVTX/OSRT traces for both arms; each measured step has an NVTX
+range. CSV, summary, allocator snapshot, log, and nsys outputs are kept under
+`OUTPUT_DIR`. Run the unprofiled measurement pair and the nsys pair in separate
+output directories; profiler timings are attribution evidence, not performance
+numbers.
 
 ## Validated Run
 

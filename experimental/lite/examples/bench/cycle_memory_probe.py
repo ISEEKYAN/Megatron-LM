@@ -34,9 +34,17 @@ def sample_cuda_memory() -> dict[str, int]:
     return {
         "allocated_bytes": allocated,
         "reserved_bytes": reserved,
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
         "reserved_minus_allocated_bytes": reserved - allocated,
         "inactive_split_bytes": int(stats.get("inactive_split_bytes.all.current", 0)),
     }
+
+
+def reset_peak_memory() -> None:
+    import torch
+
+    torch.cuda.reset_peak_memory_stats()
 
 
 def dump_snapshot(path: Path) -> None:
@@ -134,5 +142,6 @@ __all__ = [
     "live_allocation_stacks",
     "per_cycle_retention",
     "record_memory_history",
+    "reset_peak_memory",
     "sample_cuda_memory",
 ]

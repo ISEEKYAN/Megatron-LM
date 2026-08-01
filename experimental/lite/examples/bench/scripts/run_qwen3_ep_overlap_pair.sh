@@ -7,52 +7,38 @@ OUTPUT_DIR=${OUTPUT_DIR:-"${REPO_ROOT}/experimental/lite/examples/bench/outputs"
 PYTHON_BIN=${PYTHON_BIN:-python}
 NPROC=${NPROC:-8}
 DRY_RUN=${DRY_RUN:-1}
+NSYS_PROFILE=${NSYS_PROFILE:-0}
+CYCLES=${CYCLES:-10}
+WARMUP=${WARMUP:-3}
 
 export PYTHONPATH="${REPO_ROOT}/experimental/lite:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export MEGATRON_LITE_MOE_PERMUTE_FUSION=0
 
-COMMON_ARGS=(
-  --backend mlite
-  --hf-path "${HF_PATH}"
-  --model-name qwen3_moe
-  --tp "${TP:-1}"
-  --etp "${ETP:-1}"
-  --ep "${EP:-8}"
-  --pp 1
-  --cp 1
-  --steps "${STEPS:-12}"
-  --warmup "${WARMUP:-4}"
-  --num-microbatches "${NUM_MICROBATCHES:-4}"
-  --seq-len "${SEQ_LEN:-1024}"
-  --truncate-layers "${TRUNCATE_LAYERS:-8}"
-  --keep-experts "${KEEP_EXPERTS:-8}"
-  --disable-mtp
-  --same-data-across-dp
-  --skip-load-hf-weights
-)
-
 run_arm() {
   local arm=$1
-  local impl_cfg=$2
-  local port=$3
+  local port=$2
   if [[ "${DRY_RUN}" == "1" ]]; then
-    "${PYTHON_BIN}" "${REPO_ROOT}/experimental/lite/examples/bench/bench.py" \
-      "${COMMON_ARGS[@]}" \
-      --impl-cfg-json "${impl_cfg}" \
-      --dry-run
+    "${PYTHON_BIN}" \
+      "${REPO_ROOT}/experimental/lite/examples/bench/qwen3_ep_overlap_probe.py" \
+      --hf-path "${HF_PATH}" --config-only
     return
   fi
 
   mkdir -p "${OUTPUT_DIR}"
-  torchrun --nproc_per_node "${NPROC}" --master_port "${port}" \
-    "${REPO_ROOT}/experimental/lite/examples/bench/bench.py" \
-    "${COMMON_ARGS[@]}" \
-    --impl-cfg-json "${impl_cfg}" \
-    --output-json "${OUTPUT_DIR}/qwen3_ep_${arm}.json" \
-    2>&1 | tee "${OUTPUT_DIR}/qwen3_ep_${arm}.log"
+  local command=(
+    torchrun --nproc_per_node "${NPROC}" --master_port "${port}"
+    "${REPO_ROOT}/experimental/lite/examples/bench/qwen3_ep_overlap_probe.py"
+    --hf-path "${HF_PATH}" --out-dir "${OUTPUT_DIR}"
+    --cycles "${CYCLES}" --warmup "${WARMUP}" --arm "${arm}"
+  )
+  if [[ "${NSYS_PROFILE}" == "1" ]]; then
+    nsys profile --force-overwrite=true --trace=cuda,nvtx,osrt --sample=none \
+      --output "${OUTPUT_DIR}/qwen3_ep_${arm}" "${command[@]}" \
+      2>&1 | tee "${OUTPUT_DIR}/qwen3_ep_${arm}.log"
+  else
+    "${command[@]}" 2>&1 | tee "${OUTPUT_DIR}/qwen3_ep_${arm}.log"
+  fi
 }
 
-run_arm baseline '{}' "${MASTER_PORT_BASELINE:-31851}"
-run_arm overlap \
-  '{"overlap_moe_expert_parallel_comm":true,"use_deepep":false,"recompute":[]}' \
-  "${MASTER_PORT_OVERLAP:-31852}"
+run_arm baseline "${MASTER_PORT_BASELINE:-31851}"
+run_arm overlap "${MASTER_PORT_OVERLAP:-31852}"
