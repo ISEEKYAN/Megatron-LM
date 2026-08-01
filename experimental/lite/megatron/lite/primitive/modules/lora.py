@@ -16,7 +16,16 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-_DEFAULT_TARGET_MODULES = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
+LORA_DEFAULT_RANK = 0
+LORA_DEFAULT_ALPHA = None
+LORA_DEFAULT_DROPOUT = 0.0
+LORA_DEFAULT_TARGET_MODULES = (
+    "linear_qkv",
+    "linear_proj",
+    "linear_fc1",
+    "linear_fc2",
+)
+LORA_DEFAULT_USE_RSLORA = False
 _DEFAULT_IGNORE_PATTERNS = (
     "lm_head",
     "output_layer",
@@ -47,22 +56,53 @@ def lora_init_uses_residual_base(init: str | None) -> bool:
     return normalized in _LORA_INITS_WITH_RESIDUAL_BASE
 
 
+def resolve_lora_alpha(rank: int, alpha: int | None) -> int:
+    """Resolve the shared training/export alpha contract."""
+
+    return int(rank if alpha is None else alpha)
+
+
 def lora_scaling(rank: int, alpha: int | None, *, use_rslora: bool = False) -> float:
-    effective_alpha = float(rank if alpha is None else alpha)
+    effective_alpha = float(resolve_lora_alpha(rank, alpha))
     denom = float(rank) ** 0.5 if use_rslora else float(rank)
     return effective_alpha / denom
+
+
+def assert_lora_alpha_scaling_consistent(
+    rank: int,
+    alpha: int | None,
+    *,
+    applied_alpha: int,
+    applied_use_rslora: bool,
+    use_rslora: bool = False,
+) -> None:
+    """Fail if a consumer would apply a different LoRA alpha or scale."""
+
+    expected_alpha = resolve_lora_alpha(rank, alpha)
+    expected_scaling = lora_scaling(rank, alpha, use_rslora=use_rslora)
+    applied_scaling = lora_scaling(
+        rank,
+        applied_alpha,
+        use_rslora=applied_use_rslora,
+    )
+    if applied_alpha != expected_alpha or applied_scaling != expected_scaling:
+        raise RuntimeError(
+            "LoRA alpha/scaling disagrees between training and rollout: "
+            f"training alpha={expected_alpha}, scaling={expected_scaling}; "
+            f"rollout alpha={applied_alpha}, scaling={applied_scaling}."
+        )
 
 
 @dataclass(frozen=True)
 class LoraSpec:
     enabled: bool = False
-    rank: int = 0
-    alpha: int | None = None
-    dropout: float = 0.0
+    rank: int = LORA_DEFAULT_RANK
+    alpha: int | None = LORA_DEFAULT_ALPHA
+    dropout: float = LORA_DEFAULT_DROPOUT
     target_modules: tuple[str, ...] = field(
-        default_factory=lambda: _DEFAULT_TARGET_MODULES
+        default_factory=lambda: LORA_DEFAULT_TARGET_MODULES
     )
-    use_rslora: bool = False
+    use_rslora: bool = LORA_DEFAULT_USE_RSLORA
     init: str = "default"
     # How the rollout engine receives the adapter.
     #
@@ -120,14 +160,17 @@ def normalize_lora_spec(config: LoraSpec | dict[str, Any] | None) -> LoraSpec:
             f"LoRA spec must be LoraSpec, dict, or None, got {type(config)!r}."
         )
     values = dict(config)
-    if "enabled" not in values and int(values.get("rank", 0) or 0) > 0:
+    if (
+        "enabled" not in values
+        and int(values.get("rank", LORA_DEFAULT_RANK) or 0) > 0
+    ):
         warnings.warn(
             "LoRA rank alone is inert; LoRA requires enabled=True.",
             UserWarning,
             stacklevel=2,
         )
     if values.get("enabled") is False:
-        values["rank"] = 0
+        values["rank"] = LORA_DEFAULT_RANK
     if "targets" in values and "target_modules" not in values:
         values["target_modules"] = values.pop("targets")
     else:
@@ -471,9 +514,9 @@ class LinearLoRA(nn.Module):
         out_features: int,
         rank: int,
         *,
-        alpha: int | None = None,
-        dropout: float = 0.0,
-        use_rslora: bool = False,
+        alpha: int | None = LORA_DEFAULT_ALPHA,
+        dropout: float = LORA_DEFAULT_DROPOUT,
+        use_rslora: bool = LORA_DEFAULT_USE_RSLORA,
         sequence_parallel_input: bool = False,
         row_parallel_output: bool = False,
         sequence_parallel_scatter_output: bool = False,
@@ -510,7 +553,7 @@ class LinearLoRA(nn.Module):
             self.rank_partition_size = 1
             self.local_rank = self.rank
         self.use_rslora = bool(use_rslora)
-        self.alpha = int(rank if alpha is None else alpha)
+        self.alpha = resolve_lora_alpha(rank, alpha)
         self.scale = lora_scaling(rank, alpha, use_rslora=use_rslora)
         self.dropout_p = float(dropout)
         self.sequence_parallel_input = bool(sequence_parallel_input)
@@ -657,9 +700,9 @@ class SharedGroupedLinearLoRA(nn.Module):
         out_features: int,
         rank: int,
         *,
-        alpha: int | None = None,
-        dropout: float = 0.0,
-        use_rslora: bool = False,
+        alpha: int | None = LORA_DEFAULT_ALPHA,
+        dropout: float = LORA_DEFAULT_DROPOUT,
+        use_rslora: bool = LORA_DEFAULT_USE_RSLORA,
         tp_group=None,
     ):
         super().__init__()
@@ -668,7 +711,7 @@ class SharedGroupedLinearLoRA(nn.Module):
         self.num_local_experts = int(num_local_experts)
         self.rank = int(rank)
         self.use_rslora = bool(use_rslora)
-        self.alpha = int(rank if alpha is None else alpha)
+        self.alpha = resolve_lora_alpha(rank, alpha)
         self.scale = lora_scaling(rank, alpha, use_rslora=use_rslora)
         self.dropout_p = float(dropout)
         self.tp_group = tp_group
@@ -777,15 +820,22 @@ def apply_olora_tail_init(model: nn.Module) -> dict[str, int]:
 
 
 __all__ = [
+    "LORA_DEFAULT_ALPHA",
+    "LORA_DEFAULT_DROPOUT",
+    "LORA_DEFAULT_RANK",
+    "LORA_DEFAULT_TARGET_MODULES",
+    "LORA_DEFAULT_USE_RSLORA",
     "LinearLoRA",
     "LoraConfig",
     "LoraSpec",
     "SharedGroupedLinearLoRA",
     "apply_olora_tail_init",
+    "assert_lora_alpha_scaling_consistent",
     "freeze_non_lora_params",
     "lora_init_uses_residual_base",
     "lora_scaling",
     "normalize_lora_config",
     "normalize_lora_spec",
+    "resolve_lora_alpha",
     "trainable_param_stats",
 ]

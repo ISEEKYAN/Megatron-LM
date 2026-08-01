@@ -14,7 +14,16 @@ import torch
 import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
-from megatron.lite.primitive.modules.lora import lora_init_uses_residual_base
+from megatron.lite.primitive.modules.lora import (
+    LORA_DEFAULT_ALPHA,
+    LORA_DEFAULT_DROPOUT,
+    LORA_DEFAULT_RANK,
+    LORA_DEFAULT_TARGET_MODULES,
+    LORA_DEFAULT_USE_RSLORA,
+    assert_lora_alpha_scaling_consistent,
+    lora_init_uses_residual_base,
+    resolve_lora_alpha,
+)
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
@@ -494,7 +503,7 @@ class MegatronLiteEngine(BaseEngine):
                 "model.lora.merge=false, or use lora.rollout_sync='merge'."
             )
         merge = bool(verl_lora.get("merge", False))
-        rank = int(verl_lora.get("rank", 0) or 0)
+        rank = int(verl_lora.get("rank", LORA_DEFAULT_RANK) or 0)
         if merge or rank <= 0:
             raise RuntimeError(
                 "lora.rollout_sync='adapter' but VERL's rollout side is not in "
@@ -507,7 +516,7 @@ class MegatronLiteEngine(BaseEngine):
                 "impl_cfg.lora.rollout_sync='adapter'."
             )
 
-        engine_rank = int(lora_cfg.get("rank", 0) or 0)
+        engine_rank = int(lora_cfg.get("rank", LORA_DEFAULT_RANK) or 0)
         if engine_rank != rank:
             raise RuntimeError(
                 f"LoRA rank disagrees across the two config surfaces: training "
@@ -550,20 +559,31 @@ class MegatronLiteEngine(BaseEngine):
         """
         from verl.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules
 
+        rank = int(lora_cfg.get("rank", LORA_DEFAULT_RANK))
+        alpha = lora_cfg.get("alpha", LORA_DEFAULT_ALPHA)
+        use_rslora = bool(lora_cfg.get("use_rslora", LORA_DEFAULT_USE_RSLORA))
         target_modules = list(
-            lora_cfg.get("target_modules", ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"])
+            lora_cfg.get("target_modules", LORA_DEFAULT_TARGET_MODULES)
         )
         exclude_modules = list(lora_cfg.get("exclude_modules", []) or [])
-        return {
+        peft_config = {
             "task_type": "CAUSAL_LM",
-            "r": int(lora_cfg.get("rank", 0)),
-            "lora_alpha": int(lora_cfg.get("alpha", 32)),
-            "use_rslora": bool(lora_cfg.get("use_rslora", False)),
+            "r": rank,
+            "lora_alpha": resolve_lora_alpha(rank, alpha),
+            "use_rslora": use_rslora,
             "target_modules": convert_megatron_to_hf_target_modules(target_modules),
             "exclude_modules": convert_megatron_to_hf_target_modules(exclude_modules),
             "bias": "none",
-            "lora_dropout": float(lora_cfg.get("dropout", 0.0)),
+            "lora_dropout": float(lora_cfg.get("dropout", LORA_DEFAULT_DROPOUT)),
         }
+        assert_lora_alpha_scaling_consistent(
+            rank,
+            alpha,
+            applied_alpha=peft_config["lora_alpha"],
+            applied_use_rslora=peft_config["use_rslora"],
+            use_rslora=use_rslora,
+        )
+        return peft_config
 
     def _checked_adapter_stream(self, stream):
         """Fail loudly if the expert adapter surface is incomplete."""
@@ -577,7 +597,9 @@ class MegatronLiteEngine(BaseEngine):
         expected = expected_global_expert_count(
             num_experts=getattr(cfg, "num_experts", None),
             target_modules=(
-                lora_cfg.get("target_modules", []) if hasattr(lora_cfg, "get") else []
+                lora_cfg.get("target_modules", LORA_DEFAULT_TARGET_MODULES)
+                if hasattr(lora_cfg, "get")
+                else LORA_DEFAULT_TARGET_MODULES
             ),
         )
         yield from guard_expert_adapter_completeness(stream, expected)

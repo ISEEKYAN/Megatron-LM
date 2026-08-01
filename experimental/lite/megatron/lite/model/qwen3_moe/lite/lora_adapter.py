@@ -12,7 +12,11 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.primitive.modules.lora import LoraConfig, normalize_lora_config
+from megatron.lite.primitive.modules.lora import (
+    LoraConfig,
+    normalize_lora_config,
+    resolve_lora_alpha,
+)
 from megatron.lite.primitive.modules.lora_apply import (
     get_grouped_lora_adapter,
     get_linear_lora_adapter,
@@ -191,10 +195,6 @@ def _state_target_modules(state: dict[str, torch.Tensor]) -> set[str]:
     return out
 
 
-def _effective_lora_alpha(lora_config: LoraConfig) -> int:
-    return lora_config.rank if lora_config.alpha is None else int(lora_config.alpha)
-
-
 def _peft_target_set(value: Any) -> set[str] | None:
     if value is None:
         return None
@@ -278,10 +278,11 @@ def _validate_adapter_config(
             raise ValueError(
                 f"Adapter config rank r={config_rank} does not match expected rank {expected.rank}."
             )
-        if config_alpha is not None and int(config_alpha) != _effective_lora_alpha(expected):
+        expected_alpha = resolve_lora_alpha(expected.rank, expected.alpha)
+        if config_alpha is not None and int(config_alpha) != expected_alpha:
             raise ValueError(
                 "Adapter config lora_alpha="
-                f"{config_alpha} does not match expected alpha {_effective_lora_alpha(expected)}."
+                f"{config_alpha} does not match expected alpha {expected_alpha}."
             )
         if config_targets is not None and config_targets != expected_targets:
             raise ValueError(
@@ -455,7 +456,7 @@ def save_lora_adapter(
             "base_model_name_or_path": base_model_name_or_path,
             "inference_mode": False,
             "r": lora.rank,
-            "lora_alpha": _effective_lora_alpha(lora),
+            "lora_alpha": resolve_lora_alpha(lora.rank, lora.alpha),
             "lora_dropout": lora.dropout,
             "target_modules": _target_modules_from_lora_config(lora),
             "bias": "none",

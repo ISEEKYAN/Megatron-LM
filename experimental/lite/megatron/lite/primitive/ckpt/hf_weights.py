@@ -1417,7 +1417,9 @@ def vllm_applied_lora_scaling(
     compensation folded into ``lora_B``, so a consumer-side change shows up as a
     changed formula here rather than as a stale hand-tuned constant.
     """
-    resolved_alpha = float(rank if alpha is None else alpha)
+    from megatron.lite.primitive.modules.lora import resolve_lora_alpha
+
+    resolved_alpha = float(resolve_lora_alpha(rank, alpha))
     if packed_moe:
         return resolved_alpha / float(rank)
     return resolved_alpha / (float(rank) ** 0.5 if use_rslora else float(rank))
