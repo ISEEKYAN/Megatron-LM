@@ -226,6 +226,12 @@ class SafeTensorReader:
             return tensor
 
         tensor = self._get_raw_tensor(name, target_device)
+        if name.endswith(("_packed", "_scale")):
+            # Explicit physical quantization components are consumed together
+            # by the model weight spec.  They are not standalone one-byte
+            # weights for this generic reader to dequantize.
+            self._cached_request, self._cached_tensor = request, tensor
+            return tensor
         scaled_quantized = isinstance(
             tensor, torch.Tensor
         ) and _is_scaled_quantized_dtype(tensor.dtype)

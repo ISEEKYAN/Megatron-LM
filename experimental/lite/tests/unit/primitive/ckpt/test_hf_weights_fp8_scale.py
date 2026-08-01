@@ -62,6 +62,20 @@ def test_safe_tensor_reader_rejects_one_byte_quantized_weight_without_scale(
         )
 
 
+@pytest.mark.parametrize("suffix", ["packed", "scale"])
+def test_safe_tensor_reader_preserves_explicit_quantization_components(suffix) -> None:
+    name = f"expert.weight_{suffix}"
+    physical = torch.tensor([[0, 127, 255]], dtype=torch.uint8)
+    actual = _reader({name: physical}).get_tensor(
+        name,
+        target_shape=physical.shape,
+        target_dtype=torch.bfloat16,
+    )
+
+    assert actual.dtype == torch.uint8
+    assert torch.equal(actual, physical)
+
+
 def test_multi_source_mapping_dequantizes_each_fp8_block_scaled_source() -> None:
     if not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("torch float8_e4m3fn is required")
