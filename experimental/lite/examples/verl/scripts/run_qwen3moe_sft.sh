@@ -71,6 +71,9 @@ CP_SIZE="${CP_SIZE:-1}"
 DYNAMIC_CONTEXT_PARALLEL="${DYNAMIC_CONTEXT_PARALLEL:-False}"
 MAX_SEQLEN_PER_DP_CP_RANK="${MAX_SEQLEN_PER_DP_CP_RANK:-}"
 MIN_DYNAMIC_CONTEXT_PARALLEL_SIZE="${MIN_DYNAMIC_CONTEXT_PARALLEL_SIZE:-1}"
+# Dynamic-CP acceptance must observe every feasible subgroup size.  Production
+# callers may opt out only when their workload deliberately cannot cover it.
+REQUIRE_FULL_CP_SIZE_COVERAGE="${REQUIRE_FULL_CP_SIZE_COVERAGE:-True}"
 EP_SIZE="${EP_SIZE:-8}"
 ETP_SIZE="${ETP_SIZE:-1}"
 DTYPE="${DTYPE:-bfloat16}"
@@ -215,6 +218,7 @@ if [[ "${DYNAMIC_CONTEXT_PARALLEL}" == "True" || "${DYNAMIC_CONTEXT_PARALLEL}" =
   BACKEND_ARGS+=(
     "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel.max_seqlen_per_dp_cp_rank=${MAX_SEQLEN_PER_DP_CP_RANK}"
     "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel.min_context_parallel_size=${MIN_DYNAMIC_CONTEXT_PARALLEL_SIZE}"
+    "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel.require_full_cp_size_coverage=${REQUIRE_FULL_CP_SIZE_COVERAGE}"
   )
 fi
 
