@@ -226,7 +226,9 @@ def _merge_source(parts: list[Any], device: torch.device) -> Any:
                     for value in values
                 ]
                 data[key] = (
-                    plain[0] if all(value == plain[0] for value in plain[1:]) else plain
+                    values[0]
+                    if all(value == plain[0] for value in plain[1:])
+                    else plain
                 )
         constructor = getattr(type(samples[0]), "from_dict", None)
         if not callable(constructor):
