@@ -170,13 +170,16 @@ def test_merge_lora_adds_dense_and_shared_expert_deltas():
         assert torch.equal(merged[name], plain[name] + shared_delta)
 
 
-def test_export_merge_lora_fails_after_in_place_merge():
-    """Never add a LoRA delta twice after an in-place merge."""
+def test_in_place_merge_and_merged_export_fail_loudly_on_second_merge():
+    """Never add a LoRA delta twice through either merge surface."""
     model = _TinyWrappedModel()
 
     from megatron.lite.primitive.modules.lora_apply import merge_lora_in_chunks
 
     merge_lora_in_chunks([model])
+
+    with pytest.raises(RuntimeError, match="already merged"):
+        merge_lora_in_chunks([model])
 
     with pytest.raises(RuntimeError, match="already merged in-place"):
         _export_dict(model, merge_lora=True)

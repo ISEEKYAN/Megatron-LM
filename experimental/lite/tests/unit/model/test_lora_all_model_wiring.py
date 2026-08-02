@@ -13,18 +13,44 @@ MODEL_ROOT = Path(__file__).parents[3] / "megatron" / "lite" / "model"
 MODEL_NAMES = ("qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2")
 
 
+def _has_model_targets_lora_binding(tree: ast.AST) -> bool:
+    """Return whether an apply call binds ``model_targets`` to ``LORA_TARGETS``."""
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "apply_lora_to_chunks"
+        and any(
+            keyword.arg == "model_targets"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "LORA_TARGETS"
+            for keyword in node.keywords
+        )
+        for node in ast.walk(tree)
+    )
+
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
-def test_every_model_declares_lora_targets(model_name: str):
+def test_every_model_binds_lora_targets_to_apply_call(model_name: str):
     adapter_path = MODEL_ROOT / model_name / "lite" / "lora_adapter.py"
     tree = ast.parse(adapter_path.read_text())
-    assignments = {
-        target.id
+    assert any(
+        isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id == "LORA_TARGETS"
+            for target in (node.targets if isinstance(node, ast.Assign) else (node.target,))
+        )
         for node in tree.body
-        if isinstance(node, (ast.Assign, ast.AnnAssign))
-        for target in (node.targets if isinstance(node, ast.Assign) else (node.target,))
-        if isinstance(target, ast.Name)
-    }
-    assert "LORA_TARGETS" in assignments
+    )
+
+    protocol_path = MODEL_ROOT / model_name / "lite" / "protocol.py"
+    assert _has_model_targets_lora_binding(ast.parse(protocol_path.read_text()))
+
+
+def test_model_targets_binding_rejects_another_constant():
+    tree = ast.parse(
+        "apply_lora_to_chunks(chunks, lora_config, model_targets=OTHER_TARGETS)"
+    )
+
+    assert not _has_model_targets_lora_binding(tree)
 
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
@@ -87,15 +113,7 @@ def test_every_model_applies_lora_before_optimizer_construction(model_name: str)
     assert min(call.lineno for call in lora_calls) < min(
         call.lineno for call in optimizer_calls
     )
-    assert any(
-        any(
-            keyword.arg == "model_targets"
-            and isinstance(keyword.value, ast.Name)
-            and keyword.value.id == "LORA_TARGETS"
-            for keyword in call.keywords
-        )
-        for call in lora_calls
-    )
+    assert _has_model_targets_lora_binding(tree)
 
 
 @pytest.mark.parametrize("model_name", MODEL_NAMES)
