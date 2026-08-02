@@ -7,6 +7,9 @@ The Python package is `verl_mlite`. It registers VERL's language-model engine
 backend as `mlite`, while Megatron Lite model implementations still use
 `impl=lite`.
 
+See [LoRA.md](LoRA.md) for the LoRA configuration, explicit ETP limitation,
+and per-model capability matrix.
+
 ## Layout
 
 - `verl_mlite/engine/mlite_engine.py`: VERL `BaseEngine` implementation backed

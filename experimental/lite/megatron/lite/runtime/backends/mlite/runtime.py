@@ -238,6 +238,10 @@ class MegatronLiteRuntime(RuntimeBase):
                         raise TypeError("post_model_load_hook extras update must be a dict.")
                     bundle.extras.update(extra_updates)
 
+        olora_hook = bundle.extras.get("olora_hook")
+        if callable(olora_hook) and loaded_hf_weights:
+            olora_hook()
+
         if loaded_hf_weights and bundle.optimizer is not None:
             reload_model_params = getattr(bundle.optimizer, "reload_model_params", None)
             if callable(reload_model_params):
@@ -362,6 +366,24 @@ class MegatronLiteRuntime(RuntimeBase):
         else:
             for chunk in model_chunks:
                 yield from chunk.named_parameters()
+
+    def export_lora_adapter(
+        self, handle: ModelHandle, **kwargs
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Export LoRA factors in vLLM/PEFT naming for adapter-only rollout sync."""
+        model_chunks = handle._extras.get("model_chunks", [handle._model])
+        proto = handle._extras.get("protocol")
+        model_cfg = handle._extras.get("model_cfg")
+        ps = handle._parallel_state
+
+        exporter = getattr(proto, "export_hf_lora_adapter", None) if proto else None
+        if exporter is None:
+            raise NotImplementedError(
+                f"Model protocol {type(proto).__name__} does not implement "
+                "export_hf_lora_adapter; adapter-only rollout sync is unavailable. "
+                "Set the LoRA rollout sync mode to 'merge' to fall back."
+            )
+        yield from exporter(model_chunks, model_cfg, ps, **kwargs)
 
     def release_export_scratch(self, handle: ModelHandle) -> None:
         """Release retained full-parameter scratch before colocated rollout wake."""

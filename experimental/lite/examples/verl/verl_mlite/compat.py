@@ -1342,6 +1342,90 @@ def _patch_bucketed_weight_sender() -> bool:
     return changed
 
 
+_LORA_ADAPTER_DEVICE_ENV = "MLITE_LORA_ADAPTER_DEVICE"
+
+
+def _lora_adapter_staging_mode() -> str:
+    """``default`` | ``cuda`` | ``cpu_nopin`` -- see :func:`_patch_vllm_lora_adapter_staging`."""
+    mode = os.environ.get(_LORA_ADAPTER_DEVICE_ENV, "").strip().lower()
+    if mode in ("", "default", "cpu"):
+        return "default"
+    if mode not in ("cuda", "cpu_nopin"):
+        raise ValueError(
+            f"{_LORA_ADAPTER_DEVICE_ENV}={mode!r}; expected 'default', 'cuda' or 'cpu_nopin'."
+        )
+    return mode
+
+
+def _patch_vllm_lora_adapter_staging() -> bool:
+    """Take the adapter sync off the pinned-host round trip.
+
+    VERL's LoRA hijack calls ``LoRAModel.from_lora_tensors(..., device="cpu")``
+    while vLLM's own default for that classmethod is ``"cuda"``, and vLLM derives
+    ``pin_memory = str(device) == "cpu" and is_pin_memory_available()``. So the
+    hardcoded ``"cpu"`` buys, per adapter tensor: a D2H copy, a ``cudaHostAlloc``
+    for the pinned buffer, and later an H2D copy back in ``set_lora``.
+
+    On a 128-expert MoE that cost is paid ~37k times per weight sync, because
+    vLLM's non-3D fused-MoE LoRA requires one separately named tensor per
+    (expert, projection, factor) and will not accept a packed form. Measured:
+    the adapter path ships 4.5x *fewer* bytes than a full merged sync yet takes
+    14.3x longer -- ~2.8 ms per tensor against a transfer that should cost under
+    two seconds in total. Per-tensor overhead, not bandwidth.
+
+    This is deliberately a *measurement hook*, not a decided fix. Staging on the
+    device removes the round trip but keeps the staged copy in GPU memory, which
+    is not obviously affordable; ``cpu_nopin`` isolates the allocation cost from
+    the copy cost. Which of the three wins is an empirical question, so the mode
+    is switchable rather than chosen here:
+
+    ``default``    leave VERL's behaviour untouched (baseline arm)
+    ``cuda``       stage on the current device: no D2H, no pinning
+    ``cpu_nopin``  keep host staging, skip the per-tensor pinned allocation
+
+    Patching vLLM's classmethod rather than editing VERL keeps the change inside
+    this repo and makes it survive a VERL upgrade.
+    """
+    mode = _lora_adapter_staging_mode()
+    if mode == "default" or not _vllm_importable():
+        return False
+
+    from vllm.lora import models as vllm_lora_models
+
+    target = vllm_lora_models.LoRAModel
+    if getattr(target.from_lora_tensors, "_mlite_lora_staging", False):
+        return False
+
+    original = target.from_lora_tensors.__func__
+
+    @wraps(original)
+    def from_lora_tensors(cls, lora_model_id, tensors, peft_helper, **kwargs):
+        if mode == "cuda":
+            import torch
+
+            # The tensors already arrive on this rank's device from the weight
+            # transfer; naming it explicitly also turns pin_memory off upstream.
+            kwargs["device"] = (
+                f"cuda:{torch.cuda.current_device()}"
+                if torch.cuda.is_available()
+                else "cpu"
+            )
+            return original(cls, lora_model_id, tensors, peft_helper, **kwargs)
+
+        # cpu_nopin: same host staging, minus ~37k cudaHostAlloc calls.
+        kwargs["device"] = "cpu"
+        sentinel = vllm_lora_models.is_pin_memory_available
+        vllm_lora_models.is_pin_memory_available = lambda: False
+        try:
+            return original(cls, lora_model_id, tensors, peft_helper, **kwargs)
+        finally:
+            vllm_lora_models.is_pin_memory_available = sentinel
+
+    from_lora_tensors._mlite_lora_staging = True
+    target.from_lora_tensors = classmethod(from_lora_tensors)
+    return True
+
+
 def apply_runtime_patches() -> None:
     _trace_runtime_patch("00.begin")
     result = _patch_transformers_vision2seq_alias()
@@ -1370,6 +1454,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08c.verl_dsv4_native_layerwise_reload", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
+    result = _patch_vllm_lora_adapter_staging()
+    _trace_runtime_patch("09b.vllm_lora_adapter_staging", result)
     _trace_runtime_patch("10.end")
 
 

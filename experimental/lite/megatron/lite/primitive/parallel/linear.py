@@ -219,6 +219,22 @@ class ColumnParallelLinear(nn.Module):
             out = _AllGatherLastDim.apply(out, self.tp_size, self.tp_group)
         return out
 
+    def forward_with_normalized_input(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the linear output and the exact normalization-kernel output."""
+
+        result = self.linear(x)
+        if not isinstance(result, tuple) or len(result) < 2:
+            raise RuntimeError(
+                "The underlying normalized linear must enable "
+                "return_layernorm_output before requesting its normalized input."
+            )
+        out, normalized_input = result[:2]
+        if self.gather_output and self.tp_size > 1:
+            out = _AllGatherLastDim.apply(out, self.tp_size, self.tp_group)
+        return out, normalized_input
+
 
 class RowParallelLinear(nn.Module):
     """TE-based row-parallel linear. Splits input dim across TP."""

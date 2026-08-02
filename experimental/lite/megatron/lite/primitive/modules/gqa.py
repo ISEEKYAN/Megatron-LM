@@ -15,7 +15,6 @@ from megatron.lite.primitive.modules.gqa_utils import (
     split_grouped_qkvg,
     split_grouped_qkvg_for_tp,
 )
-from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
 from megatron.lite.primitive.parallel import (
     ColumnParallelLinear,
@@ -65,7 +64,6 @@ class GQAttention(nn.Module):
         use_fp32_rope: bool = False,
         zero_centered_gamma: bool = False,
         qkv_layout: str = "flat",
-        lora_config: LoraConfig | dict | None = None,
         mrope_section: list[int] | None = None,
     ):
         super().__init__()
@@ -115,40 +113,6 @@ class GQAttention(nn.Module):
             head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
         )
 
-        lora = normalize_lora_config(lora_config)
-        self.qkv_lora: LinearLoRA | None = None
-        self.proj_lora: LinearLoRA | None = None
-        if lora.enabled and lora.targets_module("linear_qkv"):
-            self.qkv_lora = LinearLoRA(
-                hidden_size,
-                self.qkv.local_out,
-                lora.rank,
-                alpha=lora.alpha,
-                dropout=lora.dropout,
-                sequence_parallel_input=self.qkv.use_sp,
-                tp_group=ps.tp_group,
-                rank_partition_size=ps.tp_size,
-                rank_partitioned_a=ps.tp_size > 1,
-                a_tensor_model_parallel=ps.tp_size > 1,
-                b_tensor_model_parallel=ps.tp_size > 1,
-            )
-        if lora.enabled and lora.targets_module("linear_proj"):
-            self.proj_lora = LinearLoRA(
-                self.proj.local_in,
-                hidden_size,
-                lora.rank,
-                alpha=lora.alpha,
-                dropout=lora.dropout,
-                tp_group=ps.tp_group,
-                tp_rank=ps.tp_rank,
-                sequence_parallel_scatter_output=self.proj.use_sp,
-                input_parallel_reduce=ps.tp_size > 1,
-                output_partition_size=ps.tp_size,
-                output_partitioned_b=ps.tp_size > 1,
-                a_tensor_model_parallel=ps.tp_size > 1,
-                b_tensor_model_parallel=ps.tp_size > 1,
-            )
-
         if self._mrope_section is None:
             self.rotary = RotaryEmbedding(
                 kv_channels=head_dim,
@@ -189,8 +153,6 @@ class GQAttention(nn.Module):
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
         qkv = self.qkv(x)
-        if self.qkv_lora is not None:
-            qkv = qkv + self.qkv_lora(self._qkv_lora_input(x))
         if self._replicate_kv:
             qkv = all_gather_last_dim_with_grad_reduce(qkv, self.ps.tp_group)
         q, gate, k, v = self._split_qkv(qkv)
@@ -280,20 +242,7 @@ class GQAttention(nn.Module):
             gate_fp32 = gate.reshape(attn_out.shape).float().sigmoid()
             attn_out = (attn_out.float() * gate_fp32).to(attn_out.dtype)
         output = self.proj(attn_out)
-        if self.proj_lora is not None:
-            output = output + self.proj_lora(attn_out)
         return output
-
-    def _qkv_lora_input(self, x: torch.Tensor) -> torch.Tensor:
-        linear = self.qkv.linear
-        if not hasattr(linear, "layer_norm_weight"):
-            return x
-        weight = linear.layer_norm_weight
-        if self._qkv_zero_centered_gamma:
-            weight = weight + 1
-        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
-        x_norm = x.float() * torch.rsqrt(variance + self._qkv_eps)
-        return (x_norm * weight.float()).to(x.dtype)
 
     def _split_qkv(self, qkv: torch.Tensor):
         nq, nkv, hd = self.num_heads_local, self.num_kv_heads_local, self.head_dim

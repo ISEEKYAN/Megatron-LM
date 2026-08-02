@@ -133,6 +133,17 @@ class Qwen3MoEWeightSpec:
                 ]
         return wm
 
+    def load_weight_map(
+        self, base_model: nn.Module, ps, logical_state_keys: tuple[str, ...]
+    ) -> dict[str, list[str]]:
+        """Exclude the optional standalone MTP embedding when it is absent."""
+
+        del base_model, ps
+        weight_map = self.weight_map()
+        if "mtp_embed.embedding.weight" not in logical_state_keys:
+            weight_map.pop("mtp_embed.embedding.weight", None)
+        return weight_map
+
     def hf_to_native(
         self, native_name: str, hf_tensors: list[torch.Tensor]
     ) -> torch.Tensor:
@@ -275,11 +286,7 @@ def export_hf_weights(model, config: Qwen3MoEConfig, ps, **kwargs):
     target = kwargs.pop("target", "hf")
     resync_config = kwargs.pop("resync_config", None)
     weights = _export(
-        model,
-        Qwen3MoEWeightSpec(config),
-        ps,
-        vocab_size=config.vocab_size,
-        **kwargs,
+        model, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size, **kwargs
     )
     if target in {"hf", ResyncFormat.BF16.value}:
         if resync_config:
@@ -316,6 +323,14 @@ def _export_mxfp4_weights(weights):
         packed, scale = quantize_mxfp4(tensor)
         yield name, packed.view(torch.uint8)
         yield f"{name[:-7]}.weight_scale", scale.view(torch.uint8)
+
+
+def export_hf_lora_adapter(model, config: Qwen3MoEConfig, ps, **kwargs):
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        export_hf_lora_adapter as _export_adapter,
+    )
+
+    yield from _export_adapter(model, Qwen3MoEWeightSpec(config), ps, **kwargs)
 
 
 def save_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:

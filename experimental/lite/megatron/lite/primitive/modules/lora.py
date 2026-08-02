@@ -1,12 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """LoRA helpers for Megatron Lite native model implementations.
 
-This module is intentionally narrow: it supports the Qwen3-MoE lite path's
-Megatron-style sharded linear surfaces, not arbitrary PEFT injection.
+The primitive owns generic Megatron-style sharded linear adapters. Individual
+models declare extra target attributes next to their model implementation.
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,7 +16,24 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-_DEFAULT_TARGET_MODULES = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
+LORA_DEFAULT_RANK = 0
+LORA_DEFAULT_ALPHA = None
+LORA_DEFAULT_DROPOUT = 0.0
+LORA_DEFAULT_TARGET_MODULES = (
+    "linear_qkv",
+    "linear_proj",
+    "linear_fc1",
+    "linear_fc2",
+)
+LORA_DEFAULT_USE_RSLORA = False
+_DEFAULT_IGNORE_PATTERNS = (
+    "lm_head",
+    "output_layer",
+    "router",
+    "gate",
+    "embedding",
+    "word_embeddings",
+)
 _TARGET_ALIASES = {
     "qkv": "linear_qkv",
     "proj": "linear_proj",
@@ -23,21 +41,73 @@ _TARGET_ALIASES = {
     "fc2": "linear_fc2",
 }
 
+# Initializations in this set replace the pretrained weight with a residual
+# base.  Any consumer that combines a separately loaded base with the adapter
+# must consult this contract.  Keep the older OLoRA/PiSSA spellings fail-safe
+# even though the only base-mutating initialization currently implemented by
+# MLite is ``olora_tail``.
+_LORA_INITS_WITH_RESIDUAL_BASE = frozenset({"olora", "olora_tail", "pissa"})
+
+
+def lora_init_uses_residual_base(init: str | None) -> bool:
+    """Whether ``init`` replaces the pretrained weight with a residual base."""
+
+    normalized = str(init or "default").lower()
+    return normalized in _LORA_INITS_WITH_RESIDUAL_BASE
+
+
+def resolve_lora_alpha(rank: int, alpha: int | None) -> int:
+    """Resolve the shared training/export alpha contract."""
+
+    return int(rank if alpha is None else alpha)
+
+
+def lora_scaling(rank: int, alpha: int | None, *, use_rslora: bool = False) -> float:
+    effective_alpha = float(resolve_lora_alpha(rank, alpha))
+    denom = float(rank) ** 0.5 if use_rslora else float(rank)
+    return effective_alpha / denom
+
 
 @dataclass(frozen=True)
-class LoraConfig:
-    rank: int = 0
-    alpha: int | None = None
-    dropout: float = 0.0
-    target_modules: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_TARGET_MODULES)
-
-    @property
-    def enabled(self) -> bool:
-        return self.rank > 0
+class LoraSpec:
+    enabled: bool = False
+    rank: int = LORA_DEFAULT_RANK
+    alpha: int | None = LORA_DEFAULT_ALPHA
+    dropout: float = LORA_DEFAULT_DROPOUT
+    target_modules: tuple[str, ...] = field(
+        default_factory=lambda: LORA_DEFAULT_TARGET_MODULES
+    )
+    use_rslora: bool = LORA_DEFAULT_USE_RSLORA
+    init: str = "default"
+    # How the rollout engine receives the adapter.
+    #
+    # ``merge`` folds the delta into the base weight in the rollout dtype, which
+    # rounds away every update below half an ulp of the base weight. It is kept
+    # for initializations whose base is not the pretrained weight (OLoRA/PiSSA),
+    # where adapter-only sync would apply the delta to the wrong operand.
+    #
+    # ``adapter`` ships the LoRA factors and lets the inference engine apply
+    # them. This is the default.
+    #
+    # NOTE: this field is declarative. The rollout export path resolves the mode
+    # from the raw engine config, not from this dataclass -- see
+    # ``MegatronLiteEngine._lora_rollout_sync_is_merge``. Keep the two defaults
+    # equal; tests/unit/verl/test_mlite_engine_lora_sync.py pins the resolver,
+    # which is the site that actually decides, and asserts the two agree.
+    #
+    # An earlier revision of this comment argued for a ``merge`` default from a
+    # run whose adapter arm produced a near-uniform policy. That failure was the
+    # rollout engine starting from random weights under ``load_format=dummy``
+    # plus an expert-parallel misattribution; both are fixed, so the argument no
+    # longer applies and is not restated here.
+    rollout_sync: str = "adapter"
+    ignore_patterns: tuple[str, ...] = field(
+        default_factory=lambda: _DEFAULT_IGNORE_PATTERNS
+    )
 
     @property
     def scale(self) -> float:
-        return float(self.rank if self.alpha is None else self.alpha) / float(self.rank)
+        return lora_scaling(self.rank, self.alpha, use_rslora=self.use_rslora)
 
     def targets(self) -> set[str]:
         out = set()
@@ -49,25 +119,46 @@ class LoraConfig:
         canonical = _TARGET_ALIASES.get(name, name)
         return canonical in self.targets()
 
+    def ignores_module(self, name: str) -> bool:
+        """Match exact, case-insensitive dotted path components."""
+        components = {component.lower() for component in name.split(".")}
+        return any(pattern.lower() in components for pattern in self.ignore_patterns)
 
-def normalize_lora_config(config: LoraConfig | dict[str, Any] | None) -> LoraConfig:
+
+def normalize_lora_spec(config: LoraSpec | dict[str, Any] | None) -> LoraSpec:
     if config is None:
-        return LoraConfig()
-    if isinstance(config, LoraConfig):
+        return LoraSpec()
+    if isinstance(config, LoraSpec):
         return config
     if not isinstance(config, dict):
-        raise TypeError(f"LoRA config must be LoraConfig, dict, or None, got {type(config)!r}.")
+        raise TypeError(
+            f"LoRA spec must be LoraSpec, dict, or None, got {type(config)!r}."
+        )
     values = dict(config)
-    enabled = values.pop("enabled", None)
-    if enabled is False:
-        values["rank"] = 0
+    if (
+        "enabled" not in values
+        and int(values.get("rank", LORA_DEFAULT_RANK) or 0) > 0
+    ):
+        warnings.warn(
+            "LoRA rank alone is inert; LoRA requires enabled=True.",
+            UserWarning,
+            stacklevel=2,
+        )
+    if values.get("enabled") is False:
+        values["rank"] = LORA_DEFAULT_RANK
     if "targets" in values and "target_modules" not in values:
         values["target_modules"] = values.pop("targets")
     else:
         values.pop("targets", None)
     if "target_modules" in values and not isinstance(values["target_modules"], tuple):
         values["target_modules"] = tuple(values["target_modules"])
-    return LoraConfig(**values)
+    if "ignore_patterns" in values and not isinstance(values["ignore_patterns"], tuple):
+        values["ignore_patterns"] = tuple(values["ignore_patterns"])
+    return LoraSpec(**values)
+
+
+LoraConfig = LoraSpec
+normalize_lora_config = normalize_lora_spec
 
 
 def freeze_non_lora_params(model: nn.Module) -> dict[str, int]:
@@ -134,13 +225,17 @@ class _AllGatherSequence(torch.autograd.Function):
         world_size = dist.get_world_size(group)
         ctx.group = group
         ctx.local_seq = x.shape[0]
-        out = torch.empty((x.shape[0] * world_size, *x.shape[1:]), dtype=x.dtype, device=x.device)
+        out = torch.empty(
+            (x.shape[0] * world_size, *x.shape[1:]), dtype=x.dtype, device=x.device
+        )
         dist.all_gather_into_tensor(out, x.contiguous(), group=group)
         return out
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
-        out = torch.empty((ctx.local_seq, *grad.shape[1:]), dtype=grad.dtype, device=grad.device)
+        out = torch.empty(
+            (ctx.local_seq, *grad.shape[1:]), dtype=grad.dtype, device=grad.device
+        )
         dist.reduce_scatter_tensor(out, grad.contiguous(), group=ctx.group)
         return out, None
 
@@ -155,14 +250,18 @@ class _ReduceScatterSequence(torch.autograd.Function):
             )
         ctx.group = group
         ctx.world_size = world_size
-        out = torch.empty((x.shape[0] // world_size, *x.shape[1:]), dtype=x.dtype, device=x.device)
+        out = torch.empty(
+            (x.shape[0] // world_size, *x.shape[1:]), dtype=x.dtype, device=x.device
+        )
         dist.reduce_scatter_tensor(out, x.contiguous(), group=group)
         return out
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         out = torch.empty(
-            (grad.shape[0] * ctx.world_size, *grad.shape[1:]), dtype=grad.dtype, device=grad.device
+            (grad.shape[0] * ctx.world_size, *grad.shape[1:]),
+            dtype=grad.dtype,
+            device=grad.device,
         )
         dist.all_gather_into_tensor(out, grad.contiguous(), group=ctx.group)
         return out, None
@@ -173,7 +272,9 @@ class _ScatterSequence(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, group, group_rank: int) -> torch.Tensor:
         world_size = dist.get_world_size(group)
         if x.shape[0] % world_size != 0:
-            raise ValueError(f"Cannot scatter sequence dim {x.shape[0]} over TP={world_size}.")
+            raise ValueError(
+                f"Cannot scatter sequence dim {x.shape[0]} over TP={world_size}."
+            )
         ctx.group = group
         ctx.world_size = world_size
         local_seq = x.shape[0] // world_size
@@ -183,7 +284,9 @@ class _ScatterSequence(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         out = torch.empty(
-            (grad.shape[0] * ctx.world_size, *grad.shape[1:]), dtype=grad.dtype, device=grad.device
+            (grad.shape[0] * ctx.world_size, *grad.shape[1:]),
+            dtype=grad.dtype,
+            device=grad.device,
         )
         dist.all_gather_into_tensor(out, grad.contiguous(), group=ctx.group)
         return out, None, None
@@ -199,12 +302,20 @@ class _AllReduceSum(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
+        # Row-parallel LoRA partitions both A's input and B's output. After
+        # _AllGatherLastDim.backward selects the local B-output slice, each TP
+        # rank owns a different contribution to d(hidden). Sum those
+        # contributions before propagating through the input-sharded A.
+        # This is required by the chain rule; it does not rescale a replicated
+        # gradient from the forward all-reduce.
         out = grad.contiguous()
         dist.all_reduce(out, op=dist.ReduceOp.SUM, group=ctx.group)
         return out, None
 
 
-def _all_gather_last_dim(x: torch.Tensor, group, *, reduce_backward: bool = False) -> torch.Tensor:
+def _all_gather_last_dim(
+    x: torch.Tensor, group, *, reduce_backward: bool = False
+) -> torch.Tensor:
     if group is None or dist.get_world_size(group) == 1:
         return x
     return _AllGatherLastDim.apply(x, group, reduce_backward)
@@ -222,11 +333,15 @@ class _AllGatherLastDim(torch.autograd.Function):
         ctx.reduce_backward = bool(reduce_backward)
         flat = x.movedim(-1, 0).contiguous().view(ctx.local_width, -1)
         gathered = torch.empty(
-            (ctx.local_width * world_size, flat.shape[1]), dtype=x.dtype, device=x.device
+            (ctx.local_width * world_size, flat.shape[1]),
+            dtype=x.dtype,
+            device=x.device,
         )
         dist.all_gather_into_tensor(gathered, flat, group=group)
         return (
-            gathered.view(ctx.local_width * world_size, *x.shape[:-1]).movedim(0, -1).contiguous()
+            gathered.view(ctx.local_width * world_size, *x.shape[:-1])
+            .movedim(0, -1)
+            .contiguous()
         )
 
     @staticmethod
@@ -236,7 +351,11 @@ class _AllGatherLastDim(torch.autograd.Function):
         out = flat.narrow(0, start, ctx.local_width).contiguous()
         if ctx.reduce_backward:
             dist.all_reduce(out, op=dist.ReduceOp.SUM, group=ctx.group)
-        return out.view(ctx.local_width, *grad.shape[:-1]).movedim(0, -1).contiguous(), None, None
+        return (
+            out.view(ctx.local_width, *grad.shape[:-1]).movedim(0, -1).contiguous(),
+            None,
+            None,
+        )
 
 
 class _SequenceParallelRankPartitionedLoRA(torch.autograd.Function):
@@ -251,7 +370,12 @@ class _SequenceParallelRankPartitionedLoRA(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, x: torch.Tensor, lora_a: torch.Tensor, lora_b: torch.Tensor, scale: float, group
+        ctx,
+        x: torch.Tensor,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+        scale: float,
+        group,
     ):
         world_size = dist.get_world_size(group) if group is not None else 1
         if world_size > 1:
@@ -302,25 +426,35 @@ class _SequenceParallelRankPartitionedLoRA(torch.autograd.Function):
         )
         grad_gathered = grad_hidden_local.matmul(lora_a)
         if world_size > 1:
-            grad_x = _reduce_scatter_sequence_forward(grad_gathered, group, ctx.local_seq)
+            grad_x = _reduce_scatter_sequence_forward(
+                grad_gathered, group, ctx.local_seq
+            )
         else:
             grad_x = grad_gathered
         return grad_x, grad_a, grad_b, None, None
 
 
-def _all_gather_sequence_forward(x: torch.Tensor, group, world_size: int) -> torch.Tensor:
-    out = torch.empty((x.shape[0] * world_size, *x.shape[1:]), dtype=x.dtype, device=x.device)
+def _all_gather_sequence_forward(
+    x: torch.Tensor, group, world_size: int
+) -> torch.Tensor:
+    out = torch.empty(
+        (x.shape[0] * world_size, *x.shape[1:]), dtype=x.dtype, device=x.device
+    )
     dist.all_gather_into_tensor(out, x.contiguous(), group=group)
     return out
 
 
-def _reduce_scatter_sequence_forward(x: torch.Tensor, group, local_seq: int) -> torch.Tensor:
+def _reduce_scatter_sequence_forward(
+    x: torch.Tensor, group, local_seq: int
+) -> torch.Tensor:
     out = torch.empty((local_seq, *x.shape[1:]), dtype=x.dtype, device=x.device)
     dist.reduce_scatter_tensor(out, x.contiguous(), group=group)
     return out
 
 
-def _all_gather_last_dim_forward(x: torch.Tensor, group, world_size: int) -> torch.Tensor:
+def _all_gather_last_dim_forward(
+    x: torch.Tensor, group, world_size: int
+) -> torch.Tensor:
     if world_size == 1:
         return x
     local_width = x.shape[-1]
@@ -329,7 +463,11 @@ def _all_gather_last_dim_forward(x: torch.Tensor, group, world_size: int) -> tor
         (local_width * world_size, flat.shape[1]), dtype=x.dtype, device=x.device
     )
     dist.all_gather_into_tensor(gathered, flat, group=group)
-    return gathered.view(local_width * world_size, *x.shape[:-1]).movedim(0, -1).contiguous()
+    return (
+        gathered.view(local_width * world_size, *x.shape[:-1])
+        .movedim(0, -1)
+        .contiguous()
+    )
 
 
 def _split_last_dim(x: torch.Tensor, group_rank: int, local_width: int) -> torch.Tensor:
@@ -351,8 +489,9 @@ class LinearLoRA(nn.Module):
         out_features: int,
         rank: int,
         *,
-        alpha: int | None = None,
-        dropout: float = 0.0,
+        alpha: int | None = LORA_DEFAULT_ALPHA,
+        dropout: float = LORA_DEFAULT_DROPOUT,
+        use_rslora: bool = LORA_DEFAULT_USE_RSLORA,
         sequence_parallel_input: bool = False,
         row_parallel_output: bool = False,
         sequence_parallel_scatter_output: bool = False,
@@ -388,7 +527,9 @@ class LinearLoRA(nn.Module):
         else:
             self.rank_partition_size = 1
             self.local_rank = self.rank
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
+        self.use_rslora = bool(use_rslora)
+        self.alpha = resolve_lora_alpha(rank, alpha)
+        self.scale = lora_scaling(rank, alpha, use_rslora=use_rslora)
         self.dropout_p = float(dropout)
         self.sequence_parallel_input = bool(sequence_parallel_input)
         self.row_parallel_output = bool(row_parallel_output)
@@ -426,7 +567,11 @@ class LinearLoRA(nn.Module):
         nn.init.zeros_(self.lora_b)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.sequence_parallel_input and self.rank_partitioned_a and not self.training:
+        if (
+            self.sequence_parallel_input
+            and self.rank_partitioned_a
+            and not self.training
+        ):
             # Keep eval/inference on the simple path; the memory optimization
             # matters only when autograd needs to retain forward activations.
             pass
@@ -444,7 +589,11 @@ class LinearLoRA(nn.Module):
             )
         if self.sequence_parallel_input:
             x = _gather_sequence_parallel(x, self.tp_group)
-        dropped = F.dropout(x, p=self.dropout_p, training=self.training) if self.dropout_p else x
+        dropped = (
+            F.dropout(x, p=self.dropout_p, training=self.training)
+            if self.dropout_p
+            else x
+        )
         hidden = dropped.matmul(self.lora_a.t())
         if self.rank_partitioned_a:
             hidden = _all_gather_last_dim(hidden, self.tp_group, reduce_backward=True)
@@ -459,53 +608,61 @@ class LinearLoRA(nn.Module):
             out = _scatter_sequence_parallel(out, self.tp_group, self.tp_rank)
         return out
 
+    def materialized_lora_factors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return TP-gathered ``(lora_a, lora_b)`` with **no** scaling applied.
 
-class GroupedLinearLoRA(nn.Module):
-    """Per-local-expert LoRA delta for `te.GroupedLinear` expert surfaces."""
+        Adapter-only rollout sync ships the factors themselves, so the scale
+        must stay separable: the consumer (vLLM) applies its own scaling and the
+        exporter compensates for any mismatch. ``materialized_delta_weight`` is
+        the merged-export counterpart and multiplies ``self.scale`` back in.
+        """
+        if self.dropout_p != 0.0:
+            raise ValueError("materialized_lora_factors requires dropout=0.")
+        lora_a = self.lora_a
+        lora_b = self.lora_b
+        if hasattr(lora_a, "full_tensor"):
+            lora_a = lora_a.full_tensor()
+        if hasattr(lora_b, "full_tensor"):
+            lora_b = lora_b.full_tensor()
+        if self.rank_partitioned_a:
+            lora_a = _all_gather_last_dim_forward(
+                lora_a.t(), self.tp_group, self.rank_partition_size
+            ).t()
+        if self.output_partitioned_b:
+            lora_b = _all_gather_last_dim_forward(
+                lora_b.t(), self.tp_group, self.output_partition_size
+            ).t()
+        return lora_a, lora_b
 
-    def __init__(
-        self,
-        num_local_experts: int,
-        in_features: int,
-        out_features: int,
-        rank: int,
-        *,
-        alpha: int | None = None,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        if rank <= 0:
-            raise ValueError("LoRA rank must be positive for GroupedLinearLoRA.")
-        self.num_local_experts = int(num_local_experts)
-        self.rank = int(rank)
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
-        self.dropout_p = float(dropout)
-        self.lora_a = nn.Parameter(torch.empty(num_local_experts, rank, in_features))
-        self.lora_b = nn.Parameter(torch.empty(num_local_experts, out_features, rank))
-        nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
-        nn.init.zeros_(self.lora_b)
+    def materialized_delta_weight(self) -> torch.Tensor:
+        # Merge/export uses eval semantics, so activation dropout is irrelevant.
+        # Adapter-only export is stricter because the consumer owns dropout and
+        # therefore continues to reject non-zero dropout in
+        # ``materialized_lora_factors``.
+        lora_a = self.lora_a
+        lora_b = self.lora_b
+        if hasattr(lora_a, "full_tensor"):
+            lora_a = lora_a.full_tensor()
+        if hasattr(lora_b, "full_tensor"):
+            lora_b = lora_b.full_tensor()
+        if self.rank_partitioned_a:
+            lora_a = _all_gather_last_dim_forward(
+                lora_a.t(), self.tp_group, self.rank_partition_size
+            ).t()
+        if self.output_partitioned_b:
+            lora_b = _all_gather_last_dim_forward(
+                lora_b.t(), self.tp_group, self.output_partition_size
+            ).t()
+        return (lora_b @ lora_a) * self.scale
 
-    def forward(self, x: torch.Tensor, splits: list[int]) -> torch.Tensor:
-        if len(splits) != self.num_local_experts:
-            raise ValueError(
-                f"GroupedLinearLoRA expected {self.num_local_experts} splits, got {len(splits)}."
-            )
-        outputs = []
-        offset = 0
-        for expert_idx, size in enumerate(splits):
-            x_i = x[offset : offset + size]
-            if size == 0:
-                outputs.append(x_i.new_empty((0, self.lora_b.shape[1])))
-            else:
-                dropped = (
-                    F.dropout(x_i, p=self.dropout_p, training=self.training)
-                    if self.dropout_p
-                    else x_i
+    def olora_tail_init_(self, base_weight: torch.Tensor) -> None:
+        with torch.no_grad():
+            delta = self.materialized_delta_weight()
+            if base_weight.shape != delta.shape:
+                raise ValueError(
+                    f"OLoRA-tail base shape {base_weight.shape} != delta {delta.shape}."
                 )
-                h_i = dropped.matmul(self.lora_a[expert_idx].t())
-                outputs.append(h_i.matmul(self.lora_b[expert_idx].t()) * self.scale)
-            offset += size
-        return torch.cat(outputs, dim=0) if outputs else x.new_empty((0, self.lora_b.shape[1]))
+            base_weight.sub_(delta.to(base_weight.dtype))
 
 
 class SharedGroupedLinearLoRA(nn.Module):
@@ -518,16 +675,21 @@ class SharedGroupedLinearLoRA(nn.Module):
         out_features: int,
         rank: int,
         *,
-        alpha: int | None = None,
-        dropout: float = 0.0,
+        alpha: int | None = LORA_DEFAULT_ALPHA,
+        dropout: float = LORA_DEFAULT_DROPOUT,
+        use_rslora: bool = LORA_DEFAULT_USE_RSLORA,
+        tp_group=None,
     ):
         super().__init__()
         if rank <= 0:
             raise ValueError("LoRA rank must be positive for SharedGroupedLinearLoRA.")
         self.num_local_experts = int(num_local_experts)
         self.rank = int(rank)
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
+        self.use_rslora = bool(use_rslora)
+        self.alpha = resolve_lora_alpha(rank, alpha)
+        self.scale = lora_scaling(rank, alpha, use_rslora=use_rslora)
         self.dropout_p = float(dropout)
+        self.tp_group = tp_group
         self.shared_across_experts = True
         self.lora_a = nn.Parameter(torch.empty(rank, in_features))
         self.lora_b = nn.Parameter(torch.empty(out_features, rank))
@@ -535,22 +697,119 @@ class SharedGroupedLinearLoRA(nn.Module):
         self.lora_b.tensor_model_parallel = False
         nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
         nn.init.zeros_(self.lora_b)
+        if self.tp_group is not None:
+            self.lora_a.register_hook(self._all_reduce_tp_grad)
+            self.lora_b.register_hook(self._all_reduce_tp_grad)
+
+    def _all_reduce_tp_grad(self, grad: torch.Tensor) -> torch.Tensor:
+        return _all_reduce_sum(grad, self.tp_group)
 
     def forward(self, x: torch.Tensor, splits: list[int]) -> torch.Tensor:
         if len(splits) != self.num_local_experts:
             raise ValueError(
                 f"SharedGroupedLinearLoRA expected {self.num_local_experts} splits, got {len(splits)}."
             )
-        dropped = F.dropout(x, p=self.dropout_p, training=self.training) if self.dropout_p else x
+        dropped = (
+            F.dropout(x, p=self.dropout_p, training=self.training)
+            if self.dropout_p
+            else x
+        )
         return dropped.matmul(self.lora_a.t()).matmul(self.lora_b.t()) * self.scale
+
+    def materialized_lora_factors(
+        self, expert_idx: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(lora_a, lora_b)`` with **no** scaling applied.
+
+        The adapter is shared by every local expert, so ``expert_idx`` only
+        documents the caller's intent; the returned factors are identical for
+        all experts (see the class docstring).
+        """
+        if self.dropout_p != 0.0:
+            raise ValueError("materialized_lora_factors requires dropout=0.")
+        del expert_idx
+        lora_a = self.lora_a
+        lora_b = self.lora_b
+        if hasattr(lora_a, "full_tensor"):
+            lora_a = lora_a.full_tensor()
+        if hasattr(lora_b, "full_tensor"):
+            lora_b = lora_b.full_tensor()
+        return lora_a, lora_b
+
+    def materialized_delta_weight(self, expert_idx: int = 0) -> torch.Tensor:
+        del expert_idx
+        lora_a = self.lora_a
+        lora_b = self.lora_b
+        if hasattr(lora_a, "full_tensor"):
+            lora_a = lora_a.full_tensor()
+        if hasattr(lora_b, "full_tensor"):
+            lora_b = lora_b.full_tensor()
+        return (lora_b @ lora_a) * self.scale
+
+
+def _weight_owner(module: nn.Module) -> nn.Module | None:
+    inner = getattr(module, "linear", None)
+    if isinstance(inner, nn.Module) and isinstance(
+        getattr(inner, "weight", None), nn.Parameter
+    ):
+        if inner.weight.dim() == 2:
+            return inner
+    if (
+        isinstance(getattr(module, "weight", None), nn.Parameter)
+        and module.weight.dim() == 2
+    ):
+        return module
+    return None
+
+
+def apply_olora_tail_init(model: nn.Module) -> dict[str, int]:
+    """Initialize supported dense adapters and warn for unsupported grouped experts."""
+
+    from megatron.lite.primitive.modules.lora_apply import (
+        LoRAWrappedGroupedLinear,
+        LoRAWrappedLinear,
+    )
+
+    stats = {"initialized": 0, "skipped": 0}
+    skipped_grouped_experts = 0
+    for module in model.modules():
+        if isinstance(module, LoRAWrappedLinear):
+            owner = _weight_owner(module.base)
+            if owner is None:
+                stats["skipped"] += 1
+                continue
+            module.adapter.olora_tail_init_(owner.weight)
+            stats["initialized"] += 1
+        elif isinstance(module, LoRAWrappedGroupedLinear):
+            stats["skipped"] += 1
+            skipped_grouped_experts += 1
+    if skipped_grouped_experts:
+        warnings.warn(
+            "OLoRA-tail does not support MoE grouped expert adapters; "
+            f"skipped {skipped_grouped_experts} grouped adapter(s) while "
+            "initializing supported dense adapters.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return stats
 
 
 __all__ = [
-    "GroupedLinearLoRA",
+    "LORA_DEFAULT_ALPHA",
+    "LORA_DEFAULT_DROPOUT",
+    "LORA_DEFAULT_RANK",
+    "LORA_DEFAULT_TARGET_MODULES",
+    "LORA_DEFAULT_USE_RSLORA",
     "LinearLoRA",
     "LoraConfig",
+    "LoraSpec",
     "SharedGroupedLinearLoRA",
+    "apply_olora_tail_init",
     "freeze_non_lora_params",
+    "lora_init_uses_residual_base",
+    "lora_scaling",
     "normalize_lora_config",
+    "normalize_lora_spec",
+    "resolve_lora_alpha",
     "trainable_param_stats",
 ]

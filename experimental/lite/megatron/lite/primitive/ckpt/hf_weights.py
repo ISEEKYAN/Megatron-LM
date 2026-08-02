@@ -522,6 +522,7 @@ def allgather_concat(
     return torch.cat(gathered, dim=dim)
 
 
+@torch.no_grad()
 def bucketed_all_gather_into_tensor(
     bucket: list[tuple[str, torch.Tensor]],
     *,
@@ -1328,6 +1329,408 @@ def _merge_dense_shards(
     return torch.cat(shards, dim=split_dim)
 
 
+_ADAPTER_NAME_MARKERS = (".adapter.", ".lora_", ".delta_mem")
+
+
+def _is_adapter_param(name: str) -> bool:
+    lowered = f".{name.lower()}"
+    return any(marker in lowered for marker in _ADAPTER_NAME_MARKERS)
+
+
+def _lora_export_surfaces(
+    base_chunk: nn.Module,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Return wrapper-transparent parameter names and optional LoRA deltas.
+
+    This primitive knows only the generic LoRA wrapper contract. Model-specific
+    native/HF naming remains owned by ``HFWeights``.
+    """
+    from megatron.lite.primitive.modules.lora_apply import (
+        LoRAWrappedGroupedLinear,
+        LoRAWrappedLinear,
+    )
+
+    canonical_names: dict[str, str] = {}
+    delta_resolvers: dict[str, Any] = {}
+    for module_name, module in base_chunk.named_modules():
+        if not isinstance(module, (LoRAWrappedLinear, LoRAWrappedGroupedLinear)):
+            continue
+        prefix = f"{module_name}." if module_name else ""
+        base_prefix = f"{prefix}base."
+        base_params = list(module.base.named_parameters())
+        for relative_name, _ in base_params:
+            canonical_names[f"{base_prefix}{relative_name}"] = f"{prefix}{relative_name}"
+
+        if isinstance(module, LoRAWrappedLinear):
+            owner = getattr(module.base, "linear", module.base)
+            weight = getattr(owner, "weight", None)
+            for relative_name, param in base_params:
+                if param is weight:
+                    delta_resolvers[f"{prefix}{relative_name}"] = (
+                        module.adapter.materialized_delta_weight
+                    )
+                    break
+            continue
+
+        for relative_name, _ in base_params:
+            match = re.fullmatch(r"weight(\d+)", relative_name)
+            if match is None:
+                continue
+            expert_idx = int(match.group(1))
+            delta_resolvers[f"{prefix}{relative_name}"] = (
+                lambda adapter=module.adapter, idx=expert_idx: (
+                    adapter.materialized_delta_weight(idx)
+                )
+            )
+    return canonical_names, delta_resolvers
+
+
+def _merged_param_tensor(tensor: torch.Tensor, resolver) -> torch.Tensor:
+    base = _materialize_dtensor(tensor)
+    delta = _materialize_dtensor(resolver())
+    return base + delta.to(dtype=base.dtype, device=base.device)
+
+
+# vLLM's PEFT adapter namespace. ``parse_fine_tuned_lora_name``
+# (``vllm/lora/utils.py:127-168``) strips this prefix and requires the
+# ``.lora_A.weight`` / ``.lora_B.weight`` suffixes.
+VLLM_LORA_NAME_PREFIX = "base_model.model."
+
+
+def vllm_applied_lora_scaling(
+    rank: int, alpha: int | None, *, use_rslora: bool, packed_moe: bool
+) -> float:
+    """Scaling vLLM will itself apply to the factors we export.
+
+    Two consumer code paths, hence two formulas:
+
+    * non-MoE surfaces honour ``PEFTHelper.vllm_lora_scaling_factor``
+      (``vllm/lora/peft_helper.py:53-58``), which mirrors :func:`lora_scaling`
+      including the rsLoRA branch;
+    * FusedMoE surfaces are packed by ``PackedLoRALayerWeights.pack_moe``
+      (``vllm/lora/lora_weights.py:199-206``), which builds the packed weights
+      *without* a ``scaling=`` argument and therefore falls back to the
+      ``alpha / rank`` default (``lora_weights.py:121-124``). rsLoRA is dropped
+      on that path regardless of what ``peft_config`` declares.
+
+    Callers divide the training-side scale by this value to obtain the
+    compensation folded into ``lora_B``, so a consumer-side change shows up as a
+    changed formula here rather than as a stale hand-tuned constant.
+    """
+    from megatron.lite.primitive.modules.lora import resolve_lora_alpha
+
+    resolved_alpha = float(resolve_lora_alpha(rank, alpha))
+    if packed_moe:
+        return resolved_alpha / float(rank)
+    return resolved_alpha / (float(rank) ** 0.5 if use_rslora else float(rank))
+
+
+def _lora_adapter_surfaces(base_chunk: nn.Module) -> list[tuple[str, Any, bool]]:
+    """Return ``(canonical_weight_name, adapter, is_grouped)`` per LoRA surface.
+
+    ``canonical_weight_name`` is the wrapper-transparent native name of the base
+    weight the adapter targets, i.e. exactly the key ``HFWeights.native_to_hf``
+    understands. Grouped (MoE expert) surfaces are reported once; the adapter is
+    shared by every expert (:class:`SharedGroupedLinearLoRA`), so the caller
+    replays it across the model-declared expert range.
+    """
+    from megatron.lite.primitive.modules.lora_apply import (
+        LoRAWrappedGroupedLinear,
+        LoRAWrappedLinear,
+    )
+
+    surfaces: list[tuple[str, Any, bool]] = []
+    for module_name, module in base_chunk.named_modules():
+        if not isinstance(module, (LoRAWrappedLinear, LoRAWrappedGroupedLinear)):
+            continue
+        prefix = f"{module_name}." if module_name else ""
+        base_params = list(module.base.named_parameters())
+
+        if isinstance(module, LoRAWrappedLinear):
+            owner = getattr(module.base, "linear", module.base)
+            weight = getattr(owner, "weight", None)
+            for relative_name, param in base_params:
+                if param is weight:
+                    surfaces.append((f"{prefix}{relative_name}", module.adapter, False))
+                    break
+            continue
+
+        for relative_name, _ in base_params:
+            if re.fullmatch(r"weight(\d+)", relative_name) is None:
+                continue
+            surfaces.append((f"{prefix}{relative_name}", module.adapter, True))
+            break
+    return surfaces
+
+
+def expected_global_expert_count(*, num_experts: int | None, target_modules) -> int | None:
+    """Number of global experts an adapter export must cover, or None.
+
+    Deliberately the *expert count*, not a tensor count. The tensor count is the
+    weaker invariant: it stays correct while every rank attributes its adapter to
+    experts it does not own, which is precisely the failure this guard exists to
+    catch.
+    """
+    if not num_experts:
+        return None
+    targets = set(target_modules or ())
+    if not ({"linear_fc1", "linear_fc2"} & targets):
+        return None
+    return int(num_experts)
+
+
+_EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
+
+
+def guard_expert_adapter_completeness(stream, expected_experts: int | None):
+    """Pass tensors through, raising unless every global expert is covered once.
+
+    This guards two distinct invariants, and it needs both:
+
+    * **coverage** -- vLLM resolves adapter tensors by name and *silently* zeroes
+      any module it cannot find (``vllm/lora/models.py:719-720`` skips, then
+      ``:393-396`` calls ``reset_lora``), and VERL's ``TensorLoRARequest`` path
+      bypasses vLLM's own name validation, so a missing expert degrades the
+      rollout policy with no error;
+    * **identity** -- an expert id appearing more than once means two different
+      adapters were attributed to the same expert, which is what an EP-broadcast
+      bug looks like.
+
+    The identity half exists because the earlier count-based version could not
+    see that class of bug at all: when every EP rank emitted the full global
+    expert range, the total came out exactly right while seven of every eight
+    experts carried another rank's adapter. A negative control could not have
+    caught that either -- dropping a tensor makes a count-based guard fire,
+    because counting is genuinely what it did. An assertion only defends the
+    invariant it actually measures.
+    """
+    seen: dict[int, int] = {}
+    total = 0
+    for name, tensor in stream:
+        total += 1
+        match = _EXPERT_ID_RE.search(name)
+        if match is not None:
+            expert_id = int(match.group(1))
+            seen[expert_id] = seen.get(expert_id, 0) + 1
+        yield name, tensor
+
+    if expected_experts is None:
+        return
+
+    missing = sorted(set(range(expected_experts)) - set(seen))
+    out_of_range = sorted(idx for idx in seen if idx >= expected_experts)
+    counts = set(seen.values())
+    if missing or out_of_range or len(counts) > 1:
+        raise RuntimeError(
+            "LoRA adapter export does not cover each global expert exactly once: "
+            f"covered={len(seen)}/{expected_experts} "
+            f"missing={missing[:8]}{'...' if len(missing) > 8 else ''} "
+            f"out_of_range={out_of_range[:8]}{'...' if len(out_of_range) > 8 else ''} "
+            f"tensors_per_expert={sorted(counts)} (total tensors={total}). "
+            "Uneven coverage means some experts would receive another rank's "
+            "adapter or none at all, and vLLM reports neither."
+        )
+
+
+def _gather_lora_factors_across_tp(
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    native_name: str,
+    spec: HFWeights,
+    ps,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Undo the TP sharding that the merged path leaves in place.
+
+    ``materialized_lora_factors`` gathers only the adapter-internal partitions
+    (rank / output). The remaining sharding follows the *base weight*: a column
+    parallel weight (``split_dim == 0``) leaves ``lora_B`` split on its output
+    rows, and a row parallel weight (``split_dim == 1``) leaves ``lora_A`` split
+    on its input columns. Merged export never notices, because the sharded
+    product lines up with the sharded base weight and the caller gathers
+    afterwards. Adapter-only export ships the factors themselves, so the gather
+    has to happen here -- otherwise vLLM receives undersized tensors and its
+    ``[:, :shape1, :shape2].copy_()`` slice assignment fills only part of the
+    buffer, silently.
+    """
+    tp_info = spec.tp_spec(native_name)
+    if tp_info is None:
+        return lora_a, lora_b
+    split_dim, tp_or_etp = tp_info
+    world_size = ps.etp_size if tp_or_etp else ps.tp_size
+    group = ps.etp_group if tp_or_etp else ps.tp_group
+    if world_size <= 1:
+        return lora_a, lora_b
+
+    if split_dim == 0:
+        lora_b = allgather_concat(lora_b, world_size, group, dim=0)
+    elif split_dim == 1:
+        lora_a = allgather_concat(lora_a, world_size, group, dim=1)
+    else:
+        raise ValueError(
+            f"Unsupported TP split dim {split_dim} for LoRA surface {native_name!r}."
+        )
+    return lora_a, lora_b
+
+
+def _gather_lora_factors_across_ep(lora_a, lora_b, ps) -> list[tuple[Any, Any]]:
+    """Return one ``(lora_a, lora_b)`` pair per expert-parallel rank.
+
+    A grouped adapter is shared only among the experts its own rank owns, never
+    globally: each EP rank initializes its own ``lora_a`` and grows its own
+    ``lora_b`` from its own experts' gradients, and expert gradients are not
+    reduced across EP. Base export already accounts for this -- it all-gathers
+    over ``ep_group`` and maps local expert indices to global ones. The adapter
+    export has to do the same; otherwise every rank claims the whole global
+    expert range for its own factors.
+    """
+    if ps.ep_size <= 1 or ps.ep_group is None:
+        return [(lora_a, lora_b)]
+    a_shards = [torch.empty_like(lora_a) for _ in range(ps.ep_size)]
+    b_shards = [torch.empty_like(lora_b) for _ in range(ps.ep_size)]
+    _ep_all_gather(a_shards, lora_a.contiguous(), ps.ep_group)
+    _ep_all_gather(b_shards, lora_b.contiguous(), ps.ep_group)
+
+    # Self-identity: our own slot must come back bit-identical. A stream-level
+    # coverage check cannot see this -- within one rank's output the broadcast
+    # bug and the correct mapping are indistinguishable, since both emit every
+    # global expert id exactly once. The difference is *which* adapter each id
+    # carries, and this is where that becomes checkable.
+    if not (
+        torch.equal(a_shards[ps.ep_rank], lora_a)
+        and torch.equal(b_shards[ps.ep_rank], lora_b)
+    ):
+        raise RuntimeError(
+            f"EP all-gather returned foreign data in our own slot {ps.ep_rank} "
+            f"(ep_size={ps.ep_size}); expert adapters would be attributed to the "
+            "wrong experts, which no count- or coverage-based check can detect."
+        )
+    return list(zip(a_shards, b_shards))
+
+
+def _iter_expert_adapter_placements(
+    global_name: str,
+    lora_a,
+    lora_b,
+    *,
+    is_grouped: bool,
+    num_experts: int,
+    ps,
+):
+    """Yield ``(native_name, lora_a, lora_b)`` with each adapter on its own experts.
+
+    Emitting a rank's adapter under every global expert id is silently wrong and
+    survives any count-based check, because the count comes out right: each rank
+    emits exactly the expected number of tensors, just attributed to experts it
+    does not own. Measured on a real EP=8 checkpoint, the eight adapters are
+    mutually near-orthogonal (pairwise relative difference ~1.41, cosine ~0), so
+    seven of every eight experts received a correctly scaled delta pointing in an
+    unrelated direction.
+    """
+    if not is_grouped:
+        yield global_name, lora_a, lora_b
+        return
+
+    shards = _gather_lora_factors_across_ep(lora_a, lora_b, ps)
+    if num_experts % len(shards) != 0:
+        raise ValueError(
+            f"num_experts={num_experts} is not divisible by ep_size={len(shards)}; "
+            "cannot map local expert indices to global ones."
+        )
+    experts_per_rank = num_experts // len(shards)
+    for ep_rank, (a_shard, b_shard) in enumerate(shards):
+        for local_idx in range(experts_per_rank):
+            global_idx = ep_rank * experts_per_rank + local_idx
+            yield set_expert_idx(global_name, global_idx), a_shard, b_shard
+
+
+def export_hf_lora_adapter(
+    model: nn.Module | list[nn.Module],
+    spec: HFWeights,
+    ps,
+    *,
+    export_dtype: str | torch.dtype | None = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Export LoRA factors as vLLM/PEFT-named ``(name, tensor)`` pairs.
+
+    This is the adapter-only counterpart of :func:`export_hf_weights`. The base
+    weights are unchanged by LoRA training and are synced once, so steady-state
+    rollout refresh only needs these factors.
+
+    Fused native surfaces (``linear_qkv``, expert ``linear_fc1``) map to several
+    HF modules. Because the wrapper shares one ``lora_A`` and splits only the
+    output rows of ``lora_B``, slicing ``lora_B`` with the *same* rule the spec
+    uses for the base weight yields per-target adapters that are exactly
+    equivalent to the fused one -- so we reuse ``spec.native_to_hf`` itself as
+    the splitter instead of duplicating the packing convention here.
+
+    ``lora_B`` carries the compensation ``train_scale / vllm_scale`` so the
+    product of our factors and vLLM's own scaling reproduces the training-time
+    delta on every surface (see :func:`vllm_applied_lora_scaling`).
+    """
+    if isinstance(model, nn.ModuleList):
+        chunks: list[nn.Module] = list(model)
+    elif isinstance(model, list):
+        chunks = model
+    else:
+        chunks = [model]
+
+    resolved_export_dtype = _resolve_export_dtype(export_dtype)
+    num_experts = int(getattr(spec, "num_experts", 0) or 0)
+
+    def _cast(tensor: torch.Tensor) -> torch.Tensor:
+        materialized = _materialize_dtensor(tensor).detach()
+        if resolved_export_dtype is not None:
+            materialized = materialized.to(dtype=resolved_export_dtype)
+        return materialized.contiguous()
+
+    for chunk in chunks:
+        base_chunk = unwrap_model(chunk)
+        layer_map = (
+            {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
+            if hasattr(base_chunk, "layer_indices")
+            else {}
+        )
+        for canonical_name, adapter, is_grouped in _lora_adapter_surfaces(base_chunk):
+            lora_a, lora_b = adapter.materialized_lora_factors()
+            train_scale = float(adapter.scale)
+            consumer_scale = vllm_applied_lora_scaling(
+                int(adapter.rank),
+                getattr(adapter, "alpha", None),
+                use_rslora=bool(getattr(adapter, "use_rslora", False)),
+                packed_moe=is_grouped,
+            )
+            if consumer_scale == 0.0:
+                raise ValueError(
+                    f"vLLM-side LoRA scaling resolved to 0 for {canonical_name!r}; "
+                    "refusing to export an adapter whose scale cannot be compensated."
+                )
+            lora_a = _cast(lora_a)
+            lora_b = _cast(lora_b).mul(train_scale / consumer_scale)
+
+            global_name = to_global_layer_name(canonical_name, layer_map)
+            lora_a, lora_b = _gather_lora_factors_across_tp(
+                lora_a, lora_b, global_name, spec, ps
+            )
+            for native_name, lora_a, lora_b in _iter_expert_adapter_placements(
+                global_name, lora_a, lora_b, is_grouped=is_grouped, num_experts=num_experts, ps=ps
+            ):
+                for hf_name, lora_b_piece in spec.native_to_hf(native_name, lora_b):
+                    if not hf_name.endswith(".weight"):
+                        raise ValueError(
+                            f"LoRA surface {native_name!r} mapped to non-weight HF name "
+                            f"{hf_name!r}; adapter export needs a weight surface."
+                        )
+                    hf_module = hf_name[: -len(".weight")]
+                    yield (
+                        f"{VLLM_LORA_NAME_PREFIX}{hf_module}.lora_A.weight",
+                        lora_a,
+                    )
+                    yield (
+                        f"{VLLM_LORA_NAME_PREFIX}{hf_module}.lora_B.weight",
+                        lora_b_piece.contiguous(),
+                    )
+
+
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,
@@ -1339,13 +1742,16 @@ def export_hf_weights(
     export_dtype: str | torch.dtype | None = None,
     cpu: bool = False,
     buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+    merge_lora: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Export model weights as HF-format (name, tensor) pairs.
 
     Gathers across TP/ETP/EP/PP so the output is the full unsharded HF state on
     every participating rank. RL weight sync needs every colocated rollout rank
     to receive weights; save paths can pass ``rank0_only=True`` to avoid
-    materializing duplicate writers.
+    materializing duplicate writers. LoRA wrappers are transparent to native
+    checkpoint names: adapter parameters are omitted, and ``merge_lora=True``
+    emits each adapted base weight with its current delta merged.
     """
     if isinstance(model, nn.ModuleList):
         chunks: list[nn.Module] = list(model)
@@ -1354,6 +1760,29 @@ def export_hf_weights(
     else:
         chunks = [model]
 
+    if merge_lora:
+        from megatron.lite.primitive.modules.lora_apply import (
+            LoRAWrappedGroupedLinear,
+            LoRAWrappedLinear,
+        )
+
+        merged_wrappers = [
+            module
+            for chunk in chunks
+            for module in unwrap_model(chunk).modules()
+            if isinstance(module, (LoRAWrappedLinear, LoRAWrappedGroupedLinear))
+            and (
+                getattr(module, "_merged_delta", None) is not None
+                or getattr(module, "_merged_deltas", None) is not None
+            )
+        ]
+        if merged_wrappers:
+            raise RuntimeError(
+                "Cannot export LoRA with merge_lora=True: "
+                f"{len(merged_wrappers)} wrapper(s) are already merged in-place. "
+                "Use merge_lora=False after merge_lora_in_chunks()."
+            )
+
     rank = dist.get_rank() if dist.is_initialized() else 0
     resolved_export_dtype = _resolve_export_dtype(export_dtype)
 
@@ -1361,6 +1790,7 @@ def export_hf_weights(
         """Yield parameters plus persistent buffers present in the HF load plan."""
         for chunk in chunks:
             base_chunk = unwrap_model(chunk)
+            canonical_names, delta_resolvers = _lora_export_surfaces(base_chunk)
             state = base_chunk.state_dict()
             layer_map = (
                 {
@@ -1371,8 +1801,14 @@ def export_hf_weights(
                 else {}
             )
             for name, param in base_chunk.named_parameters():
-                logical_name = canonical_state_key(name)
-                yield to_global_layer_name(logical_name, layer_map), param.data.detach()
+                if _is_adapter_param(name):
+                    continue
+                canonical_name = canonical_names.get(name, name)
+                tensor = param.data.detach()
+                resolver = delta_resolvers.get(canonical_name)
+                if merge_lora and resolver is not None:
+                    tensor = _merged_param_tensor(tensor, resolver)
+                yield to_global_layer_name(canonical_name, layer_map), tensor
             persistent_buffers = [
                 (name, buffer)
                 for name, buffer in base_chunk.named_buffers()
