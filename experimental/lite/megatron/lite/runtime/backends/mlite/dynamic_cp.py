@@ -136,6 +136,24 @@ def _detach_cpu(value: Any) -> Any:
     return value
 
 
+@dataclass(frozen=True)
+class _NestedSourceSample:
+    value: Any
+    nested_keys: tuple[Any, ...]
+
+
+def _nested_source_keys(source: Any) -> tuple[Any, ...]:
+    keys = getattr(source, "keys", None)
+    get = getattr(source, "get", None)
+    if not callable(keys) or not callable(get) or not hasattr(source, "batch_size"):
+        return ()
+    return tuple(
+        key
+        for key in keys()
+        if getattr(get(key), "is_nested", False)
+    )
+
+
 def _split_source(source: Any, count: int) -> list[Any]:
     if source is None:
         return [None] * count
@@ -150,6 +168,12 @@ def _split_source(source: Any, count: int) -> list[Any]:
         ) from exc
     if isinstance(source, list):
         return [[_detach_cpu(item)] for item in source]
+    nested_keys = _nested_source_keys(source)
+    if nested_keys:
+        return [
+            _NestedSourceSample(_detach_cpu(source[index]), nested_keys)
+            for index in range(count)
+        ]
     return [_detach_cpu(source[index : index + 1]) for index in range(count)]
 
 
@@ -171,6 +195,27 @@ def _merge_source(parts: list[Any], device: torch.device) -> Any:
         return None
     if isinstance(parts[0], list):
         return [item for part in parts for item in part]
+    if isinstance(parts[0], _NestedSourceSample):
+        if any(not isinstance(part, _NestedSourceSample) for part in parts):
+            raise TypeError("Dynamic CP cannot mix nested and ordinary source samples.")
+        nested_keys = parts[0].nested_keys
+        if any(part.nested_keys != nested_keys for part in parts[1:]):
+            raise ValueError("Dynamic CP cannot merge incompatible nested source schemas.")
+        samples = [part.value for part in parts]
+        keys = tuple(samples[0].keys())
+        data = {}
+        for key in keys:
+            values = [sample.get(key) for sample in samples]
+            if key in nested_keys:
+                data[key] = torch.nested.as_nested_tensor(values, layout=torch.jagged)
+            elif all(isinstance(value, torch.Tensor) for value in values):
+                data[key] = torch.stack(values)
+            else:
+                data[key] = values
+        constructor = getattr(type(samples[0]), "from_dict", None)
+        if not callable(constructor):
+            raise TypeError("Dynamic CP nested source container cannot be reconstructed.")
+        return constructor(data, batch_size=[len(samples)]).to(device)
     try:
         merged = torch.cat(parts, dim=0)
     except (RuntimeError, TypeError) as exc:

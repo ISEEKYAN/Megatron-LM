@@ -30,6 +30,44 @@ class _Group:
         return self._rank
 
 
+def test_dynamic_cp_split_merge_preserves_jagged_tensordict_samples():
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import (
+        _merge_source,
+        _split_source,
+    )
+
+    source = TensorDict(
+        {
+            "input_ids": torch.nested.as_nested_tensor(
+                [torch.arange(3), torch.arange(5)], layout=torch.jagged
+            ),
+            "loss_mask": torch.nested.as_nested_tensor(
+                [torch.ones(3), torch.ones(5)], layout=torch.jagged
+            ),
+            "temperature": torch.tensor([0.5, 0.75]),
+            "metadata": ["first", "second"],
+        },
+        batch_size=[2],
+    )
+
+    samples = _split_source(source, count=2)
+    merged = _merge_source([samples[1], samples[0]], torch.device("cpu"))
+
+    assert merged.batch_size == torch.Size([2])
+    assert merged["input_ids"].is_nested
+    assert [row.tolist() for row in merged["input_ids"].unbind()] == [
+        [0, 1, 2, 3, 4],
+        [0, 1, 2],
+    ]
+    assert [row.tolist() for row in merged["loss_mask"].unbind()] == [
+        [1.0] * 5,
+        [1.0] * 3,
+    ]
+    assert torch.equal(merged["temperature"], torch.tensor([0.75, 0.5]))
+    assert list(merged["metadata"]) == ["second", "first"]
+
+
 def test_dynamic_cp_exposes_logical_dp_one_without_replacing_physical_dp(monkeypatch):
     from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
 
