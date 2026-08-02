@@ -340,6 +340,29 @@ def test_fsdp2_optimizer_offloads_dtensor_state_without_extra_knob(monkeypatch):
     assert not hasattr(optimizer, "optimizer_offload_dtensor_state")
 
 
+def test_fsdp2_grad_sync_enabled_propagates_to_fsdp2_roots():
+    class FakeFSDP2Root(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls: list[tuple[bool, bool]] = []
+
+        def set_requires_gradient_sync(
+            self, requires_gradient_sync: bool, *, recurse: bool
+        ) -> None:
+            self.calls.append((requires_gradient_sync, recurse))
+
+    param = nn.Parameter(torch.tensor([1.0]))
+    root = FakeFSDP2Root()
+    optimizer = FSDP2Optimizer(
+        torch.optim.SGD([param], lr=0.0), [param], fsdp_modules=[root]
+    )
+
+    optimizer.grad_sync_enabled = True
+    optimizer.grad_sync_enabled = False
+
+    assert root.calls == [(True, True), (False, True)]
+
+
 def test_fsdp2_shard_placement_prefers_first_divisible_dimension():
     placement_for_two = build_fsdp2_shard_placement_fn(2)
     placement_for_three = build_fsdp2_shard_placement_fn(3)

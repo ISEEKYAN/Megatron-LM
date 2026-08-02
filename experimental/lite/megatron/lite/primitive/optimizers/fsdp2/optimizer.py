@@ -36,6 +36,7 @@ from megatron.lite.primitive.optimizers.fsdp2.wrap import (
     FSDP2Config,
     build_fsdp2_process_group_mesh,
     build_fsdp2_shard_placement_fn,
+    set_fsdp2_requires_gradient_sync,
     wrap_fsdp2,
     wrap_fsdp2_module,
 )
@@ -75,6 +76,7 @@ class FSDP2Optimizer:
         tp_replicated_grad_sync_group: dist.ProcessGroup | None = None,
         grad_norm_accum_dtype: str | torch.dtype = torch.float32,
         param_names: dict[int, str] | None = None,
+        fsdp_modules: Iterable[nn.Module] | None = None,
     ):
         self.optimizer = optimizer
         self.params = list(params)
@@ -99,7 +101,18 @@ class FSDP2Optimizer:
         self._tp_replicated_grad_param_ids = {id(param) for param in self.tp_replicated_grad_params}
         self.tp_replicated_grad_sync_group = tp_replicated_grad_sync_group
         self._cpu_offloaded_state: dict[tuple[int, str], OffloadedStateEntry] = {}
-        self.grad_sync_enabled = False
+        self.fsdp_modules = list(fsdp_modules or ())
+        self._grad_sync_enabled = False
+
+    @property
+    def grad_sync_enabled(self) -> bool:
+        return self._grad_sync_enabled
+
+    @grad_sync_enabled.setter
+    def grad_sync_enabled(self, enabled: bool) -> None:
+        self._grad_sync_enabled = bool(enabled)
+        for module in self.fsdp_modules:
+            set_fsdp2_requires_gradient_sync(module, self._grad_sync_enabled)
 
     @property
     def param_groups(self):
@@ -332,6 +345,7 @@ def build_fsdp2_adamw(
         tp_replicated_grad_sync_group=tp_replicated_grad_sync_group,
         grad_norm_accum_dtype=grad_norm_accum_dtype,
         param_names=param_names,
+        fsdp_modules=model_chunks,
     )
 
 
