@@ -10,6 +10,7 @@ physical DP group for gradient synchronization.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, fields, replace
@@ -75,31 +76,6 @@ def _create_groups(ps: Any, minimum: int, parallel: Any) -> dict[int, Any]:
         raise RuntimeError("Dynamic CP logical DP group omitted the local rank.")
     local[1] = logical_dp_group
     return local
-
-
-def _initialize_group(group: Any) -> None:
-    """Eagerly create NCCL communicators before CP P2P enters the group."""
-    if not torch.distributed.is_initialized():
-        return
-    device = torch.cuda.current_device()
-    ranks = torch.distributed.get_process_group_ranks(group)
-    rank = torch.distributed.get_rank()
-    try:
-        index = ranks.index(rank)
-    except ValueError as exc:
-        raise RuntimeError("Dynamic CP rank is absent from its local group.") from exc
-    token = torch.empty(1, device=torch.device("cuda", device))
-    operations = [
-        torch.distributed.P2POp(
-            torch.distributed.irecv, token, ranks[(index - 1) % len(ranks)], group
-        ),
-        torch.distributed.P2POp(
-            torch.distributed.isend, token, ranks[(index + 1) % len(ranks)], group
-        ),
-    ]
-    for work in torch.distributed.batch_isend_irecv(operations):
-        work.wait()
-    torch.distributed.barrier(group=group, device_ids=[device])
 
 
 def _batch_samples(batch: PackedBatch) -> list[dict[str, torch.Tensor]]:
@@ -526,7 +502,6 @@ class DynamicCPPlugin:
         self,
         config: Mapping[str, Any],
         create_groups: Callable | None = None,
-        initialize_group: Callable | None = None,
     ):
         if not isinstance(config, Mapping):
             raise TypeError("dynamic_context_parallel plugin config must be a mapping.")
@@ -543,7 +518,6 @@ class DynamicCPPlugin:
             raise TypeError("require_full_cp_size_coverage must be a bool.")
         self.require_full_coverage = require_coverage
         self._create_groups = create_groups or _create_groups
-        self._initialize_group = initialize_group or _initialize_group
         self._groups: dict[int, Any] | None = None
         self._pool: Any = None
         self._step = 0
@@ -575,14 +549,11 @@ class DynamicCPPlugin:
         logical = groups.get(1)
         if logical is None or logical.size() != 1:
             raise RuntimeError("Dynamic CP requires a singleton logical DP group.")
-        # TE's CP attention uses unbatched P2P.  If a dynamic subgroup remains
-        # lazy until its first send/recv, NCCL may create pair communicators in
-        # a different order on different ranks.  Initialize every participating
-        # process group collectively, in the same size order, before any model
-        # forward can enter it.
-        for size in cp_size_space:
-            if size > 1:
-                self._initialize_group(groups[size])
+        # Transformer Engine defaults to unbatched CP P2P for cp_size > 2.
+        # That creates pair communicators lazily, whose creation order differs
+        # when ranks enter dynamic subgroups in different plans.  The batched
+        # ring call initializes the complete ProcessGroup collectively.
+        os.environ["NVTE_BATCH_MHA_P2P_COMM"] = "1"
         self._groups, self._pool = groups, pool
         self._cp_size_space = cp_size_space
         handle._extras.update(
