@@ -43,6 +43,7 @@ from megatron.lite.model.qwen3_moe.lite.checkpoint import (
 from megatron.lite.model.qwen3_moe.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
 )
+from megatron.lite.model.qwen3_moe.lite.lora_adapter import LORA_TARGETS
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.lora import (
@@ -241,13 +242,19 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     # every wrapped base parameter invisible to the loader.  Keep disabled
     # LoRA inert, and attach enabled LoRA in the post-load/pre-wrap hook below.
     lora_stats = (
-        None if lora_spec.enabled else apply_lora_to_chunks(chunks, lora_spec, ps=ps)
+        None
+        if lora_spec.enabled
+        else apply_lora_to_chunks(
+            chunks, lora_spec, ps=ps, model_targets=LORA_TARGETS
+        )
     )
 
     def _attach_lora_after_load():
         nonlocal lora_stats
         if lora_stats is None:
-            lora_stats = apply_lora_to_chunks(chunks, lora_spec, ps=ps)
+            lora_stats = apply_lora_to_chunks(
+                chunks, lora_spec, ps=ps, model_targets=LORA_TARGETS
+            )
             if lora_spec.init == "olora_tail":
                 for chunk in chunks:
                     apply_olora_tail_init(chunk)
@@ -393,11 +400,11 @@ def export_hf_lora_adapter(
 ):
     """Export LoRA factors in vLLM/PEFT naming (adapter-only rollout sync)."""
     from megatron.lite.model.qwen3_moe.lite.checkpoint import (
-        export_hf_lora_adapter as _export_adapter,
+        export_hf_lora_adapter as _export_hf_lora_adapter_impl,
     )
 
     for chunk in chunks:
-        yield from _export_adapter(chunk, model_cfg, ps, **kwargs)
+        yield from _export_hf_lora_adapter_impl(chunk, model_cfg, ps, **kwargs)
 
 
 def save_hf_weights(

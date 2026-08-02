@@ -1760,6 +1760,29 @@ def export_hf_weights(
     else:
         chunks = [model]
 
+    if merge_lora:
+        from megatron.lite.primitive.modules.lora_apply import (
+            LoRAWrappedGroupedLinear,
+            LoRAWrappedLinear,
+        )
+
+        merged_wrappers = [
+            module
+            for chunk in chunks
+            for module in unwrap_model(chunk).modules()
+            if isinstance(module, (LoRAWrappedLinear, LoRAWrappedGroupedLinear))
+            and (
+                getattr(module, "_merged_delta", None) is not None
+                or getattr(module, "_merged_deltas", None) is not None
+            )
+        ]
+        if merged_wrappers:
+            raise RuntimeError(
+                "Cannot export LoRA with merge_lora=True: "
+                f"{len(merged_wrappers)} wrapper(s) are already merged in-place. "
+                "Use merge_lora=False after merge_lora_in_chunks()."
+            )
+
     rank = dist.get_rank() if dist.is_initialized() else 0
     resolved_export_dtype = _resolve_export_dtype(export_dtype)
 

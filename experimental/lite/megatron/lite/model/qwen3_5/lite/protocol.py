@@ -56,6 +56,7 @@ __all__ = [
     "PLACEMENT_FN",
     "build_model",
     "build_model_config",
+    "export_hf_lora_adapter",
     "export_hf_weights",
     "load_hf_weights",
     "save_hf_weights",
@@ -398,6 +399,16 @@ def export_hf_weights(
     chunks: list[nn.Module], model_cfg: Qwen35Config, ps: ParallelState, **kwargs
 ):
     yield from _export_hf_weights_impl(chunks, model_cfg, ps, **kwargs)
+
+
+def export_hf_lora_adapter(
+    chunks: list[nn.Module], model_cfg: Qwen35Config, ps: ParallelState, **kwargs
+):
+    from megatron.lite.model.qwen3_5.lite.checkpoint import (
+        export_hf_lora_adapter as _export_hf_lora_adapter_impl,
+    )
+
+    yield from _export_hf_lora_adapter_impl(chunks, model_cfg, ps, **kwargs)
 
 
 def save_hf_weights(

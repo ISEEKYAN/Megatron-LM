@@ -355,6 +355,14 @@ def export_hf_weights(chunks, model_cfg: KimiK2Config, ps: ParallelState, **kwar
     yield from export_impl(chunks, model_cfg, ps, **kwargs)
 
 
+def export_hf_lora_adapter(chunks, model_cfg: KimiK2Config, ps: ParallelState, **kwargs):
+    from megatron.lite.model.kimi_k2.lite.checkpoint import (
+        export_hf_lora_adapter as _export_hf_lora_adapter_impl,
+    )
+
+    yield from _export_hf_lora_adapter_impl(chunks, model_cfg, ps, **kwargs)
+
+
 def save_hf_weights(
     chunks, path: str, model_cfg: KimiK2Config, ps: ParallelState
 ) -> None:

@@ -574,6 +574,16 @@ def export_hf_weights(
     yield from _export_hf_weights_impl(chunks, model_cfg, ps, **kwargs)
 
 
+def export_hf_lora_adapter(
+    chunks: list[nn.Module], model_cfg: DeepseekV4Config, ps: ParallelState, **kwargs
+):
+    from megatron.lite.model.deepseek_v4.lite.checkpoint import (
+        export_hf_lora_adapter as _export_hf_lora_adapter_impl,
+    )
+
+    yield from _export_hf_lora_adapter_impl(chunks, model_cfg, ps, **kwargs)
+
+
 def save_hf_weights(
     chunks: list[nn.Module],
     path: str,

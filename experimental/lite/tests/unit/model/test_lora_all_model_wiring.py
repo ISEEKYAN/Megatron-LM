@@ -87,3 +87,53 @@ def test_every_model_applies_lora_before_optimizer_construction(model_name: str)
     assert min(call.lineno for call in lora_calls) < min(
         call.lineno for call in optimizer_calls
     )
+    assert any(
+        any(
+            keyword.arg == "model_targets"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "LORA_TARGETS"
+            for keyword in call.keywords
+        )
+        for call in lora_calls
+    )
+
+
+@pytest.mark.parametrize("model_name", MODEL_NAMES)
+def test_every_model_exports_lora_adapter(model_name: str):
+    """Adapter rollout must be implemented uniformly, not just declared by runtime."""
+    protocol_path = MODEL_ROOT / model_name / "lite" / "protocol.py"
+    tree = ast.parse(protocol_path.read_text())
+    adapter_export = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "export_hf_lora_adapter"
+        ),
+        None,
+    )
+
+    assert adapter_export is not None
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_export_hf_lora_adapter_impl"
+        for node in ast.walk(adapter_export)
+    )
+
+    checkpoint_path = MODEL_ROOT / model_name / "lite" / "checkpoint.py"
+    checkpoint_tree = ast.parse(checkpoint_path.read_text())
+    checkpoint_export = next(
+        (
+            node
+            for node in checkpoint_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "export_hf_lora_adapter"
+        ),
+        None,
+    )
+    assert checkpoint_export is not None
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_export_adapter"
+        for node in ast.walk(checkpoint_export)
+    )
