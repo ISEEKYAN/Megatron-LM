@@ -211,7 +211,23 @@ def _merge_source(parts: list[Any], device: torch.device) -> Any:
             elif all(isinstance(value, torch.Tensor) for value in values):
                 data[key] = torch.stack(values)
             else:
-                data[key] = values
+                # Integer indexing turns TensorDict non-tensor fields into
+                # scalar wrappers.  Re-stacking equal broadcast metadata would
+                # change it into a per-sample stack (for example, a mode enum),
+                # so retain the scalar representation when every sample agrees.
+                plain = [
+                    (
+                        value.data
+                        if hasattr(value, "batch_size")
+                        and hasattr(value, "data")
+                        and not isinstance(value, torch.Tensor)
+                        else value
+                    )
+                    for value in values
+                ]
+                data[key] = (
+                    plain[0] if all(value == plain[0] for value in plain[1:]) else plain
+                )
         constructor = getattr(type(samples[0]), "from_dict", None)
         if not callable(constructor):
             raise TypeError("Dynamic CP nested source container cannot be reconstructed.")
