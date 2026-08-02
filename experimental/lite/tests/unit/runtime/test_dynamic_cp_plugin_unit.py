@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from megatron.lite.runtime.contracts.data import (
     ForwardResult,
     ModelOutputs,
@@ -49,9 +48,8 @@ def test_dynamic_cp_split_merge_preserves_jagged_tensordict_samples():
             "temperature": torch.tensor([0.5, 0.75]),
             "metadata": ["first", "second"],
             "pad_mode": ["no_padding", "no_padding"],
-            "scalar_control": NonTensorData(
-                data=torch.tensor(3), batch_size=[2]
-            ),
+            "scalar_control": NonTensorData(data=torch.tensor(3), batch_size=[2]),
+            "vector_control": NonTensorData(data=torch.tensor([3, 4]), batch_size=[2]),
         },
         batch_size=[2],
     )
@@ -75,6 +73,8 @@ def test_dynamic_cp_split_merge_preserves_jagged_tensordict_samples():
     assert merged.get("pad_mode").data == "no_padding"
     assert isinstance(merged.get("scalar_control"), NonTensorData)
     assert torch.equal(merged.get("scalar_control").data, torch.tensor(3))
+    assert isinstance(merged.get("vector_control"), NonTensorData)
+    assert torch.equal(merged.get("vector_control").data, torch.tensor([3, 4]))
 
 
 def test_dynamic_cp_exposes_logical_dp_one_without_replacing_physical_dp(monkeypatch):
