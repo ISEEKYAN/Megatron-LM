@@ -122,6 +122,43 @@ def test_dynamic_cp_exposes_logical_dp_one_without_replacing_physical_dp(monkeyp
     assert ps.dp_group is physical_dp_group
 
 
+def test_dynamic_cp_eagerly_initializes_each_non_singleton_group():
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
+
+    pool, singleton, cp2 = _Group(4), _Group(1), _Group(2)
+    ps = SimpleNamespace(
+        dp_size=4,
+        dp_rank=0,
+        dp_group=pool,
+        dp_cp_group=pool,
+        cp_size=1,
+        pp_size=1,
+    )
+    handle = ModelHandle(
+        model=object(),
+        parallel_state=ps,
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(tp=1, cp=1, pp=1, vpp=1),
+            impl_cfg={"use_thd": True},
+        ),
+        _extras={},
+    )
+    initialized = []
+    plugin = DynamicCPPlugin(
+        {"max_seqlen_per_dp_cp_rank": 8},
+        create_groups=lambda _ps, _minimum, _parallel: {
+            1: singleton,
+            2: cp2,
+            4: pool,
+        },
+        initialize_group=initialized.append,
+    )
+
+    plugin.initialize(handle)
+
+    assert initialized == [cp2, pool]
+
+
 def test_install_wraps_only_the_target_runtime_instance():
     from megatron.lite.runtime.backends.mlite.dynamic_cp import install
 
