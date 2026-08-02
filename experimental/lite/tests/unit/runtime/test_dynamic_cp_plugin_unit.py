@@ -77,6 +77,27 @@ def test_dynamic_cp_split_merge_preserves_jagged_tensordict_samples():
     assert torch.equal(merged.get("vector_control").data, torch.tensor([3, 4]))
 
 
+def test_dynamic_cp_merge_rejects_mismatched_tensordict_keys():
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import (
+        _merge_source,
+        _split_source,
+    )
+
+    common = {
+        "input_ids": torch.nested.as_nested_tensor(
+            [torch.arange(3)], layout=torch.jagged
+        ),
+        "temperature": torch.tensor([0.5]),
+    }
+    left = TensorDict(common, batch_size=[1])
+    right = TensorDict({**common, "extra": torch.tensor([1])}, batch_size=[1])
+    parts = [_split_source(left, 1)[0], _split_source(right, 1)[0]]
+
+    with pytest.raises(ValueError, match="incompatible nested source keys"):
+        _merge_source(parts, torch.device("cpu"))
+
+
 def test_dynamic_cp_exposes_logical_dp_one_without_replacing_physical_dp(monkeypatch):
     from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
 
@@ -328,6 +349,93 @@ def test_mixed_cp_plan_reports_each_sample_group_and_histogram(monkeypatch, caps
         '{"cp_size":1,"ranks":[1],"sample_ids":[2]},'
         '{"cp_size":2,"ranks":[0,1],"sample_ids":[1]}] global_num_tokens=None'
     ]
+
+
+def test_mixed_cp_rebinds_context_parallel_modules_and_restores_physical_group(
+    monkeypatch,
+):
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
+
+    module = types.ModuleType("megatron.core.datasets.data_schedule")
+    module.DefaultDynamicCPScheduler = _MixedCPScheduler
+    monkeypatch.setitem(sys.modules, "megatron.core.datasets.data_schedule", module)
+
+    pool, singleton = _Group(2), _Group(1)
+    group_ranks = {id(pool): [0, 2], id(singleton): [0]}
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_process_group_ranks",
+        lambda group: group_ranks[id(group)],
+    )
+
+    class ContextParallelAttention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cp_group = pool
+            self.cp_global_ranks = [0, 2]
+            self.cp_stream = object()
+            self.cp_comm_type = "p2p"
+
+        def set_context_parallel_group(
+            self, cp_group, cp_global_ranks, cp_stream, cp_comm_type="p2p"
+        ):
+            self.cp_group = cp_group
+            self.cp_global_ranks = cp_global_ranks
+            self.cp_stream = cp_stream
+            self.cp_comm_type = cp_comm_type
+
+    model = torch.nn.Module()
+    model.attention = ContextParallelAttention()
+    ps = SimpleNamespace(
+        dp_size=1,
+        dp_rank=0,
+        dp_group=singleton,
+        dp_cp_group=pool,
+        cp_size=2,
+        cp_rank=0,
+        cp_group=pool,
+        cp_global_ranks=[0, 2],
+        pp_size=1,
+    )
+    handle = ModelHandle(
+        model=model,
+        parallel_state=ps,
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(tp=1, cp=2, pp=1, vpp=1),
+            impl_cfg={"use_thd": True},
+        ),
+        _extras={"forward_step": lambda *_args: {}},
+    )
+    plugin = DynamicCPPlugin(
+        {"max_seqlen_per_dp_cp_rank": 4},
+        create_groups=lambda _ps, _minimum, _parallel: {1: singleton, 2: pool},
+    )
+    plugin.initialize(handle)
+    prepared = plugin._prepare(
+        handle,
+        PackedBatch(
+            input_ids=torch.arange(12),
+            labels=torch.arange(12),
+            seq_lens=torch.tensor([2, 8, 2]),
+        ),
+        None,
+        1,
+    )
+
+    next(prepared.data)
+    assert (ps.cp_size, ps.cp_group, ps.cp_global_ranks) == (1, singleton, [0])
+    assert model.attention.cp_group is singleton
+    assert model.attention.cp_global_ranks == [0]
+
+    next(prepared.data)
+    assert (ps.cp_size, ps.cp_group, ps.cp_global_ranks) == (2, pool, [0, 2])
+    assert model.attention.cp_group is pool
+    assert model.attention.cp_global_ranks == [0, 2]
+
+    prepared.finish(require_complete=True)
+    assert (ps.cp_size, ps.cp_group, ps.cp_global_ranks) == (2, pool, [0, 2])
+    assert model.attention.cp_group is pool
+    assert model.attention.cp_global_ranks == [0, 2]
 
 
 def test_mixed_cp_uses_pool_global_token_count_for_loss_normalization(monkeypatch):
@@ -686,6 +794,47 @@ def test_restore_outputs_preserves_metric_aggregator_across_leaders(monkeypatch)
     )
 
     assert collector[0]["metrics"]["score"].values == [1.0, 3.0]
+
+
+def test_restore_outputs_rejects_mismatched_model_output_keys(monkeypatch):
+    from megatron.lite.runtime.backends.mlite import dynamic_cp
+
+    pool = _Group(2)
+    rank0_records = [
+        {
+            "sample_ids": [0],
+            "model_output": {"values": [torch.tensor([10.0])]},
+            "loss": 0.0,
+            "metrics": {},
+        }
+    ]
+    rank1_records = [
+        {
+            "sample_ids": [1],
+            "model_output": {
+                "values": [torch.tensor([30.0])],
+                "logits": [torch.tensor([3.0])],
+            },
+            "loss": 0.0,
+            "metrics": {},
+        }
+    ]
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, _records, group: output.__setitem__(
+            slice(None), [rank0_records, rank1_records]
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="incompatible model output keys"):
+        dynamic_cp._restore_outputs(
+            [],
+            rank0_records,
+            pool=pool,
+            input_groups=[[0, 1]],
+            device=torch.device("cpu"),
+        )
 
 
 def _loss_fn(kind: str, collector: list[dict]):

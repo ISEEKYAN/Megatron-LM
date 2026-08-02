@@ -225,6 +225,9 @@ def _merge_source(parts: list[Any], device: torch.device) -> Any:
             )
         samples = [part.value for part in parts]
         keys = tuple(samples[0].keys())
+        expected_keys = set(keys)
+        if any(set(sample.keys()) != expected_keys for sample in samples[1:]):
+            raise ValueError("Dynamic CP cannot merge incompatible nested source keys.")
         data = {}
         for key in keys:
             values = [sample.get(key) for sample in samples]
@@ -320,11 +323,51 @@ def _select_batch(
     )
 
 
+def _context_parallel_modules(model: Any) -> list[Any]:
+    roots = model if isinstance(model, (list, tuple)) else [model]
+    found = []
+    seen = set()
+    for root in roots:
+        modules = getattr(root, "modules", None)
+        if not callable(modules):
+            continue
+        for module in modules():
+            if id(module) in seen:
+                continue
+            setter = getattr(module, "set_context_parallel_group", None)
+            if callable(setter) and all(
+                hasattr(module, name)
+                for name in (
+                    "cp_group",
+                    "cp_global_ranks",
+                    "cp_stream",
+                    "cp_comm_type",
+                )
+            ):
+                found.append(module)
+                seen.add(id(module))
+    return found
+
+
 class _Binding:
-    def __init__(self, ps: Any, groups: dict[int, Any]):
+    def __init__(
+        self, ps: Any, groups: dict[int, Any], context_parallel_modules: list[Any]
+    ):
         self.ps = ps
         self.groups = groups
         self.static = (ps.cp_size, ps.cp_rank, ps.cp_group)
+        self.had_global_ranks = hasattr(ps, "cp_global_ranks")
+        self.static_global_ranks = getattr(ps, "cp_global_ranks", None)
+        self.context_parallel_modules = [
+            (
+                module,
+                module.cp_group,
+                module.cp_global_ranks,
+                module.cp_stream,
+                module.cp_comm_type,
+            )
+            for module in context_parallel_modules
+        ]
         self.local_cp_size: int | None = None
 
     def bind(self, size: int) -> None:
@@ -332,12 +375,30 @@ class _Binding:
         group = self.groups.get(size)
         if group is None or group.size() != size:
             raise RuntimeError(f"No Dynamic CP group exists for size={size}.")
+        global_ranks = None
+        if self.had_global_ranks or self.context_parallel_modules:
+            global_ranks = list(torch.distributed.get_process_group_ranks(group))
+            self.ps.cp_global_ranks = global_ranks
         self.ps.cp_size, self.ps.cp_rank, self.ps.cp_group = size, group.rank(), group
+        for module, _group, _ranks, stream, comm_type in self.context_parallel_modules:
+            module.set_context_parallel_group(group, global_ranks, stream, comm_type)
         self.local_cp_size = size
 
     def restore(self) -> None:
         if self.local_cp_size is not None:
             self.ps.cp_size, self.ps.cp_rank, self.ps.cp_group = self.static
+            if self.had_global_ranks:
+                self.ps.cp_global_ranks = self.static_global_ranks
+            elif hasattr(self.ps, "cp_global_ranks"):
+                del self.ps.cp_global_ranks
+            for (
+                module,
+                group,
+                ranks,
+                stream,
+                comm_type,
+            ) in self.context_parallel_modules:
+                module.set_context_parallel_group(group, ranks, stream, comm_type)
             self.local_cp_size = None
 
 
@@ -435,9 +496,12 @@ def _restore_outputs(
         missing = [sample_id for sample_id in ids if sample_id not in by_id]
         if missing:
             raise RuntimeError(f"Dynamic CP output is missing sample ids {missing}.")
-        keys = set.intersection(
-            *(set(by_id[sample_id][0]["model_output"]) for sample_id in ids)
-        )
+        key_sets = [set(by_id[sample_id][0]["model_output"]) for sample_id in ids]
+        keys = key_sets[0]
+        if any(candidate != keys for candidate in key_sets[1:]):
+            raise RuntimeError(
+                f"Dynamic CP samples {ids} have incompatible model output keys."
+            )
         model_output = {}
         for key in keys:
             rows = [
@@ -520,6 +584,7 @@ class DynamicCPPlugin:
         self._create_groups = create_groups or _create_groups
         self._groups: dict[int, Any] | None = None
         self._pool: Any = None
+        self._context_parallel_modules: list[Any] = []
         self._step = 0
 
     def initialize(self, handle: Any) -> Any:
@@ -555,6 +620,7 @@ class DynamicCPPlugin:
         # ring call initializes the complete ProcessGroup collectively.
         os.environ["NVTE_BATCH_MHA_P2P_COMM"] = "1"
         self._groups, self._pool = groups, pool
+        self._context_parallel_modules = _context_parallel_modules(handle._model)
         self._cp_size_space = cp_size_space
         handle._extras.update(
             logical_dp_size=1,
@@ -735,7 +801,9 @@ class DynamicCPPlugin:
             batch.extras[_LOSS_SCALE_CORRECTION] = correction
             scheduled.append((batch, context))
 
-        binding = _Binding(handle._parallel_state, self._groups)
+        binding = _Binding(
+            handle._parallel_state, self._groups, self._context_parallel_modules
+        )
         bound = _BoundIterator(iter(scheduled), binding)
 
         def forward(model: Any, batch: PackedBatch):
