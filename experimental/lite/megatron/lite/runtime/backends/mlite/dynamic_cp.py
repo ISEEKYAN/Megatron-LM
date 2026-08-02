@@ -81,7 +81,25 @@ def _initialize_group(group: Any) -> None:
     """Eagerly create NCCL communicators before CP P2P enters the group."""
     if not torch.distributed.is_initialized():
         return
-    torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+    device = torch.cuda.current_device()
+    ranks = torch.distributed.get_process_group_ranks(group)
+    rank = torch.distributed.get_rank()
+    try:
+        index = ranks.index(rank)
+    except ValueError as exc:
+        raise RuntimeError("Dynamic CP rank is absent from its local group.") from exc
+    token = torch.empty(1, device=torch.device("cuda", device))
+    operations = [
+        torch.distributed.P2POp(
+            torch.distributed.irecv, token, ranks[(index - 1) % len(ranks)], group
+        ),
+        torch.distributed.P2POp(
+            torch.distributed.isend, token, ranks[(index + 1) % len(ranks)], group
+        ),
+    ]
+    for work in torch.distributed.batch_isend_irecv(operations):
+        work.wait()
+    torch.distributed.barrier(group=group, device_ids=[device])
 
 
 def _batch_samples(batch: PackedBatch) -> list[dict[str, torch.Tensor]]:
