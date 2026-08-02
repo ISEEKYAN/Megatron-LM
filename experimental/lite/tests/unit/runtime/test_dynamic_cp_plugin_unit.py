@@ -159,6 +159,56 @@ def test_dynamic_cp_eagerly_initializes_each_non_singleton_group():
     assert initialized == [cp2, pool]
 
 
+def test_dynamic_cp_group_initializer_uses_batched_ring_as_first_p2p(monkeypatch):
+    from megatron.lite.runtime.backends.mlite import dynamic_cp
+
+    group = _Group(4)
+    token = object()
+    events = []
+
+    class _Work:
+        def wait(self):
+            events.append("wait")
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda actual: [4, 6, 8, 10]
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 6)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(torch, "empty", lambda *_args, **_kwargs: token)
+    monkeypatch.setattr(
+        torch.distributed,
+        "P2POp",
+        lambda op, tensor, peer, actual: (op, tensor, peer, actual),
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "batch_isend_irecv",
+        lambda ops: events.append(("batch", ops)) or [_Work(), _Work()],
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "barrier",
+        lambda **kwargs: events.append(("barrier", kwargs)),
+    )
+
+    dynamic_cp._initialize_group(group)
+
+    assert events == [
+        (
+            "batch",
+            [
+                (torch.distributed.irecv, token, 4, group),
+                (torch.distributed.isend, token, 8, group),
+            ],
+        ),
+        "wait",
+        "wait",
+        ("barrier", {"group": group, "device_ids": [2]}),
+    ]
+
+
 def test_install_wraps_only_the_target_runtime_instance():
     from megatron.lite.runtime.backends.mlite.dynamic_cp import install
 
