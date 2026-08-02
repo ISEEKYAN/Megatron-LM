@@ -13,7 +13,6 @@ from megatron.lite.primitive.modules.lora import (
     LinearLoRA,
     LoraSpec,
     normalize_lora_spec,
-    _weight_owner,
 )
 from megatron.lite.primitive.modules.lora_apply import (
     LoRAWrappedLinear,
