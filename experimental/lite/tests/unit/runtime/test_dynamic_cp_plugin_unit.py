@@ -49,6 +49,9 @@ def test_dynamic_cp_split_merge_preserves_jagged_tensordict_samples():
             "temperature": torch.tensor([0.5, 0.75]),
             "metadata": ["first", "second"],
             "pad_mode": ["no_padding", "no_padding"],
+            "scalar_control": NonTensorData(
+                data=torch.tensor(3), batch_size=[2]
+            ),
         },
         batch_size=[2],
     )
@@ -70,6 +73,8 @@ def test_dynamic_cp_split_merge_preserves_jagged_tensordict_samples():
     assert list(merged["metadata"]) == ["second", "first"]
     assert isinstance(merged.get("pad_mode"), NonTensorData)
     assert merged.get("pad_mode").data == "no_padding"
+    assert isinstance(merged.get("scalar_control"), NonTensorData)
+    assert torch.equal(merged.get("scalar_control").data, torch.tensor(3))
 
 
 def test_dynamic_cp_exposes_logical_dp_one_without_replacing_physical_dp(monkeypatch):
