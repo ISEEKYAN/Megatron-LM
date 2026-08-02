@@ -17,7 +17,6 @@ from functools import wraps
 from typing import Any
 
 import torch
-
 from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.loss import LossContext, split_loss_context
 
@@ -147,11 +146,7 @@ def _nested_source_keys(source: Any) -> tuple[Any, ...]:
     get = getattr(source, "get", None)
     if not callable(keys) or not callable(get) or not hasattr(source, "batch_size"):
         return ()
-    return tuple(
-        key
-        for key in keys()
-        if getattr(get(key), "is_nested", False)
-    )
+    return tuple(key for key in keys() if getattr(get(key), "is_nested", False))
 
 
 def _split_source(source: Any, count: int) -> list[Any]:
@@ -190,6 +185,30 @@ def _same_policy(left: LossContext, right: LossContext) -> bool:
     return True
 
 
+def _source_value_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+        return (
+            isinstance(left, torch.Tensor)
+            and isinstance(right, torch.Tensor)
+            and torch.equal(left, right)
+        )
+    if isinstance(left, Mapping) or isinstance(right, Mapping):
+        return (
+            isinstance(left, Mapping)
+            and isinstance(right, Mapping)
+            and left.keys() == right.keys()
+            and all(_source_value_equal(left[key], right[key]) for key in left)
+        )
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        return (
+            type(left) is type(right)
+            and len(left) == len(right)
+            and all(_source_value_equal(lhs, rhs) for lhs, rhs in zip(left, right))
+        )
+    result = left == right
+    return result if isinstance(result, bool) else False
+
+
 def _merge_source(parts: list[Any], device: torch.device) -> Any:
     if not parts or parts[0] is None:
         return None
@@ -200,7 +219,9 @@ def _merge_source(parts: list[Any], device: torch.device) -> Any:
             raise TypeError("Dynamic CP cannot mix nested and ordinary source samples.")
         nested_keys = parts[0].nested_keys
         if any(part.nested_keys != nested_keys for part in parts[1:]):
-            raise ValueError("Dynamic CP cannot merge incompatible nested source schemas.")
+            raise ValueError(
+                "Dynamic CP cannot merge incompatible nested source schemas."
+            )
         samples = [part.value for part in parts]
         keys = tuple(samples[0].keys())
         data = {}
@@ -227,12 +248,14 @@ def _merge_source(parts: list[Any], device: torch.device) -> Any:
                 ]
                 data[key] = (
                     values[0]
-                    if all(value == plain[0] for value in plain[1:])
+                    if all(_source_value_equal(value, plain[0]) for value in plain[1:])
                     else plain
                 )
         constructor = getattr(type(samples[0]), "from_dict", None)
         if not callable(constructor):
-            raise TypeError("Dynamic CP nested source container cannot be reconstructed.")
+            raise TypeError(
+                "Dynamic CP nested source container cannot be reconstructed."
+            )
         return constructor(data, batch_size=[len(samples)]).to(device)
     try:
         merged = torch.cat(parts, dim=0)
