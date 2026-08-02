@@ -32,6 +32,7 @@ class _Group:
 
 def test_dynamic_cp_split_merge_preserves_jagged_tensordict_samples():
     TensorDict = pytest.importorskip("tensordict").TensorDict
+    NonTensorData = pytest.importorskip("tensordict.tensorclass").NonTensorData
     from megatron.lite.runtime.backends.mlite.dynamic_cp import (
         _merge_source,
         _split_source,
@@ -47,6 +48,7 @@ def test_dynamic_cp_split_merge_preserves_jagged_tensordict_samples():
             ),
             "temperature": torch.tensor([0.5, 0.75]),
             "metadata": ["first", "second"],
+            "pad_mode": ["no_padding", "no_padding"],
         },
         batch_size=[2],
     )
@@ -66,6 +68,8 @@ def test_dynamic_cp_split_merge_preserves_jagged_tensordict_samples():
     ]
     assert torch.equal(merged["temperature"], torch.tensor([0.75, 0.5]))
     assert list(merged["metadata"]) == ["second", "first"]
+    assert isinstance(merged.get("pad_mode"), NonTensorData)
+    assert merged.get("pad_mode").data == "no_padding"
 
 
 def test_dynamic_cp_exposes_logical_dp_one_without_replacing_physical_dp(monkeypatch):
