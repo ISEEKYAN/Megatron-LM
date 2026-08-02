@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+# isort: off
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable
@@ -11,6 +12,9 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from megatron.lite.primitive.optimizers.fsdp2.main_grad import get_param_grad
+
+# isort: on
 
 try:  # pragma: no cover - import availability is PyTorch-version dependent.
     from torch.distributed.tensor import DTensor, Partial, Replicate
@@ -40,16 +44,27 @@ def sharded_grad_sq_sum(
     groups = _group_grads(params)
     total: torch.Tensor | None = None
     for group in groups.values():
-        local_sq = _group_local_sq_sum(group, dtype=dtype, chunk_size_numel=chunk_size_numel)
+        local_sq = _group_local_sq_sum(
+            group, dtype=dtype, chunk_size_numel=chunk_size_numel
+        )
         meta = group[0][2]
-        if meta is not None and not _has_partial_placement(meta) and dist.is_initialized():
+        if (
+            meta is not None
+            and not _has_partial_placement(meta)
+            and dist.is_initialized()
+        ):
             _reduce_dtensor_scalar_(
-                local_sq, meta, op=dist.ReduceOp.SUM, scalar_all_reduce=scalar_all_reduce
+                local_sq,
+                meta,
+                op=dist.ReduceOp.SUM,
+                scalar_all_reduce=scalar_all_reduce,
             )
         total = local_sq if total is None else total.to(local_sq.device) + local_sq
 
     if total is None:
-        return torch.zeros((), device=default_device or torch.device("cpu"), dtype=dtype)
+        return torch.zeros(
+            (), device=default_device or torch.device("cpu"), dtype=dtype
+        )
     return total
 
 
@@ -70,13 +85,24 @@ def sharded_grad_norm(
 
     if math.isinf(float(norm_type)):
         total = sharded_grad_abs_max(
-            params, pp_group=pp_group, accum_dtype=accum_dtype, default_device=default_device
+            params,
+            pp_group=pp_group,
+            accum_dtype=accum_dtype,
+            default_device=default_device,
         )
         return total
     if float(norm_type) != 2.0:
-        raise ValueError(f"sharded_grad_norm supports norm_type=2.0 or inf, got {norm_type!r}.")
-    sq_sum = sharded_grad_sq_sum(params, accum_dtype=accum_dtype, default_device=default_device)
-    if pp_group is not None and dist.is_initialized() and dist.get_world_size(pp_group) > 1:
+        raise ValueError(
+            f"sharded_grad_norm supports norm_type=2.0 or inf, got {norm_type!r}."
+        )
+    sq_sum = sharded_grad_sq_sum(
+        params, accum_dtype=accum_dtype, default_device=default_device
+    )
+    if (
+        pp_group is not None
+        and dist.is_initialized()
+        and dist.get_world_size(pp_group) > 1
+    ):
         all_reduce_scalar_(sq_sum, op=dist.ReduceOp.SUM, group=pp_group)
     return sq_sum.sqrt()
 
@@ -96,22 +122,33 @@ def sharded_grad_abs_max(
     for group in groups.values():
         local_max = _group_local_abs_max(group, dtype=dtype)
         meta = group[0][2]
-        if meta is not None and not _has_partial_placement(meta) and dist.is_initialized():
+        if (
+            meta is not None
+            and not _has_partial_placement(meta)
+            and dist.is_initialized()
+        ):
             _reduce_dtensor_scalar_(local_max, meta, op=dist.ReduceOp.MAX)
-        total = local_max if total is None else torch.maximum(total.to(local_max.device), local_max)
+        total = (
+            local_max
+            if total is None
+            else torch.maximum(total.to(local_max.device), local_max)
+        )
 
     if total is None:
-        total = torch.zeros((), device=default_device or torch.device("cpu"), dtype=dtype)
-    if pp_group is not None and dist.is_initialized() and dist.get_world_size(pp_group) > 1:
+        total = torch.zeros(
+            (), device=default_device or torch.device("cpu"), dtype=dtype
+        )
+    if (
+        pp_group is not None
+        and dist.is_initialized()
+        and dist.get_world_size(pp_group) > 1
+    ):
         all_reduce_scalar_(total, op=dist.ReduceOp.MAX, group=pp_group)
     return total
 
 
 def all_reduce_scalar_(
-    value: torch.Tensor,
-    *,
-    op: dist.ReduceOp,
-    group: dist.ProcessGroup,
+    value: torch.Tensor, *, op: dist.ReduceOp, group: dist.ProcessGroup
 ) -> None:
     """All-reduce a scalar on a device compatible with the process group backend."""
 
@@ -144,8 +181,9 @@ def clip_grads_with_sharded_norm_(
         if clip_coef >= 1.0:
             return
     for param in params:
-        if param.grad is not None:
-            _scale_grad_(param.grad, clip_coef)
+        grad = get_param_grad(param)
+        if grad is not None:
+            _scale_grad_(grad, clip_coef)
 
 
 def resolve_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
@@ -155,20 +193,24 @@ def resolve_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
         name = dtype.removeprefix("torch.")
         resolved = getattr(torch, name, None)
     if not isinstance(resolved, torch.dtype):
-        raise ValueError(f"Unsupported torch dtype for grad norm accumulation: {dtype!r}")
+        raise ValueError(
+            f"Unsupported torch dtype for grad norm accumulation: {dtype!r}"
+        )
     if not torch.empty((), dtype=resolved).is_floating_point():
-        raise ValueError(f"Grad norm accumulation dtype must be floating point: {dtype!r}")
+        raise ValueError(
+            f"Grad norm accumulation dtype must be floating point: {dtype!r}"
+        )
     return resolved
 
 
 def _group_grads(
     params: Iterable[nn.Parameter],
 ) -> dict[tuple[Any, ...], list[tuple[nn.Parameter, torch.Tensor, Any | None]]]:
-    groups: dict[tuple[Any, ...], list[tuple[nn.Parameter, torch.Tensor, Any | None]]] = (
-        defaultdict(list)
-    )
+    groups: dict[
+        tuple[Any, ...], list[tuple[nn.Parameter, torch.Tensor, Any | None]]
+    ] = defaultdict(list)
     for param in params:
-        grad = param.grad
+        grad = get_param_grad(param)
         if grad is None:
             continue
         meta = _dtensor_meta(param, grad)
@@ -178,7 +220,10 @@ def _group_grads(
             key = (
                 "dtensor",
                 id(meta.device_mesh),
-                tuple((type(placement).__name__, repr(placement)) for placement in meta.placements),
+                tuple(
+                    (type(placement).__name__, repr(placement))
+                    for placement in meta.placements
+                ),
             )
         groups[key].append((param, grad, meta))
     return groups
@@ -194,7 +239,9 @@ def _group_local_sq_sum(
     total = torch.zeros((), device=device, dtype=dtype)
     for _param, grad, meta in group:
         local_grad = _local_grad(grad, meta)
-        total += _tensor_sq_sum(local_grad.detach(), dtype=dtype, chunk_size_numel=chunk_size_numel)
+        total += _tensor_sq_sum(
+            local_grad.detach(), dtype=dtype, chunk_size_numel=chunk_size_numel
+        )
     return total
 
 
@@ -266,7 +313,9 @@ def _is_dtensor_like(tensor: Any) -> bool:
 
 
 def _has_partial_placement(dtensor: Any) -> bool:
-    return any(_placement_name(placement) == "Partial" for placement in dtensor.placements)
+    return any(
+        _placement_name(placement) == "Partial" for placement in dtensor.placements
+    )
 
 
 def _is_replicate_placement(placement: Any) -> bool:

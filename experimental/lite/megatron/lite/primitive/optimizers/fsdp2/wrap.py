@@ -18,11 +18,15 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+# isort: off
 from megatron.lite.primitive.parallel.state import ParallelState
+
+# isort: on
 
 UnitModule = type[nn.Module] | str
 
 _WARNED_TP_NOT_RECOMMENDED = False
+_MAIN_GRAD_STATE_ATTR = "_mlite_fsdp2_main_grad_state"
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,7 @@ class FSDP2Config:
     device_type: str = "cuda"
     param_dtype: str | torch.dtype | None = None
     reduce_dtype: str | torch.dtype | None = None
+    grad_dtype: str | torch.dtype = "float32"
     output_dtype: str | torch.dtype | None = None
     cast_forward_inputs: bool | None = True
 
@@ -64,6 +69,9 @@ class FSDP2Config:
             raise ValueError("forward_prefetch_depth must be >= 0.")
         if self.backward_prefetch_depth < 0:
             raise ValueError("backward_prefetch_depth must be >= 0.")
+        object.__setattr__(
+            self, "grad_dtype", _resolve_fsdp2_grad_dtype(self.grad_dtype)
+        )
 
 
 def fsdp2_available() -> bool:
@@ -77,7 +85,9 @@ def fsdp2_available() -> bool:
     return True
 
 
-def build_fsdp2_device_mesh(ps: ParallelState, config: FSDP2Config | None = None) -> Any:
+def build_fsdp2_device_mesh(
+    ps: ParallelState, config: FSDP2Config | None = None
+) -> Any:
     """Build the default one-dimensional FSDP2 DeviceMesh from ``ParallelState``."""
 
     cfg = config or FSDP2Config()
@@ -111,7 +121,9 @@ def build_fsdp2_process_group_mesh(
 
     from torch.distributed import DeviceMesh
 
-    return DeviceMesh.from_group(group, device_type=device_type, mesh_dim_names=(mesh_dim_name,))
+    return DeviceMesh.from_group(
+        group, device_type=device_type, mesh_dim_names=(mesh_dim_name,)
+    )
 
 
 def build_fsdp2_shard_placement_fn(fsdp_size: int) -> Callable[[nn.Parameter], Any]:
@@ -169,7 +181,9 @@ def wrap_fsdp2(
     )
 
     wrapped_units: list[nn.Module] = []
-    unit_modules = list(_iter_fsdp2_unit_modules(model, unit_types, cfg.leaf_module_names))
+    unit_modules = list(
+        _iter_fsdp2_unit_modules(model, unit_types, cfg.leaf_module_names)
+    )
     for idx, sub_module in enumerate(unit_modules):
         kwargs = dict(common_kwargs)
         _set_optional_reshard_after_forward(
@@ -253,35 +267,6 @@ def _warn_tp_not_recommended(ps: ParallelState) -> None:
     )
 
 
-def promote_fsdp2_trainable_params_to_fp32(
-    model: nn.Module, *, ignored_params: set[nn.Parameter] | None = None
-) -> int:
-    """Promote FSDP2-owned trainable floating parameters to FP32 shards.
-
-    Model protocols still use ``FSDP2Config.param_dtype`` to run compute in
-    BF16. Keeping the sharded parameters in FP32 makes the torch optimizer path
-    closer to MCore dist-opt's main-param semantics and avoids BF16 grad-norm
-    and update drift before FSDP2 wrapping.
-    """
-
-    ignored_param_ids = {id(param) for param in ignored_params or ()}
-    promoted = 0
-    with torch.no_grad():
-        for param in model.parameters():
-            if id(param) in ignored_param_ids:
-                continue
-            if not param.requires_grad or not param.is_floating_point():
-                continue
-            if param.dtype == torch.float32:
-                continue
-            param._fsdp2_model_param_dtype = param.dtype
-            param.data = param.data.to(torch.float32)
-            if param.grad is not None:
-                param.grad = param.grad.to(torch.float32)
-            promoted += 1
-    return promoted
-
-
 def set_fsdp2_requires_gradient_sync(
     module: nn.Module, requires_gradient_sync: bool, *, recurse: bool = True
 ) -> int:
@@ -305,6 +290,143 @@ def set_fsdp2_requires_gradient_sync(
     return touched
 
 
+def register_fsdp2_main_grad_hooks(
+    module: nn.Module, grad_dtype: str | torch.dtype, *, recurse: bool = True
+) -> int:
+    """Capture reduced FP32 shards in MLite-owned ``main_grad`` buffers.
+
+    PyTorch 2.11 calls ``FSDPModule.set_all_reduce_hook`` after reduce-scatter
+    (and HSDP all-reduce) but before casting the result back to the persistent
+    parameter dtype. For FP32 gradients, this installs one hook per FSDP
+    parameter group and exposes per-parameter views through ``param.main_grad``.
+    PyTorch remains the sole owner of ``param.grad`` and its lazy-init methods.
+    """
+
+    if not torch.__version__.startswith("2.11."):
+        raise RuntimeError("FSDP2 main_grad hooks require pinned PyTorch 2.11.x.")
+    resolved_dtype = _resolve_fsdp2_grad_dtype(grad_dtype)
+    if resolved_dtype is torch.bfloat16:
+        return 0
+    modules = (module, *tuple(module.modules())) if recurse else (module,)
+    touched = 0
+    seen: set[int] = set()
+    for candidate in modules:
+        getter = getattr(candidate, "_get_fsdp_state", None)
+        setter = getattr(candidate, "set_all_reduce_hook", None)
+        if not callable(getter) or not callable(setter):
+            continue
+        state = getter()
+        if hasattr(state, "_fsdp_param_groups"):
+            raise RuntimeError(
+                "Installed PyTorch FSDP2 state shape does not match pinned 2.11.x."
+            )
+        param_group = getattr(state, "_fsdp_param_group", None)
+        if param_group is None or id(param_group) in seen:
+            continue
+        seen.add(id(param_group))
+        if getattr(param_group, "_all_reduce_hook", None) is not None:
+            raise RuntimeError("FSDP2 parameter group already has an all-reduce hook.")
+        if bool(getattr(param_group, "force_sum_reduction_for_comms", False)):
+            raise RuntimeError(
+                "FSDP2 FP32 main_grad does not support post-hook gradient division."
+            )
+        main_grad_state = _FSDP2MainGradState(param_group, resolved_dtype)
+        setter(main_grad_state.capture)
+        setattr(candidate, _MAIN_GRAD_STATE_ATTR, main_grad_state)
+        touched += 1
+    if touched == 0:
+        raise RuntimeError(
+            "FSDP2 FP32 main_grad registration found no parameter groups."
+        )
+    return touched
+
+
+class _FSDP2MainGradState:
+    """Own one flat FP32 reduced-gradient buffer and its parameter views."""
+
+    def __init__(self, param_group: Any, dtype: torch.dtype) -> None:
+        fsdp_params = tuple(getattr(param_group, "fsdp_params", ()))
+        self.fsdp_params = tuple(
+            fsdp_param
+            for fsdp_param in fsdp_params
+            if getattr(fsdp_param, "sharded_param", None) is not None
+            and fsdp_param.sharded_param.requires_grad
+        )
+        if not self.fsdp_params:
+            raise RuntimeError(
+                "FSDP2 main_grad found an empty trainable parameter group."
+            )
+        self.dtype = dtype
+        self.buffer: torch.Tensor | None = None
+        self.active = False
+        for fsdp_param in self.fsdp_params:
+            sharded_param = fsdp_param.sharded_param
+            setattr(sharded_param, _MAIN_GRAD_STATE_ATTR, self)
+            hook = sharded_param.register_post_accumulate_grad_hook(
+                self._clear_torch_landed_grad
+            )
+            setattr(sharded_param, "_mlite_fsdp2_landed_grad_hook", hook)
+
+    @property
+    def expected_numel(self) -> int:
+        return sum(
+            int(fsdp_param.padded_sharded_param_size.numel())
+            for fsdp_param in self.fsdp_params
+        )
+
+    def capture(self, reduce_output: torch.Tensor) -> None:
+        if reduce_output.dtype is not self.dtype:
+            raise RuntimeError(
+                f"FSDP2 main_grad expected {self.dtype} reduce output, "
+                f"got {reduce_output.dtype}."
+            )
+        if reduce_output.numel() != self.expected_numel:
+            raise RuntimeError(
+                f"FSDP2 main_grad expected {self.expected_numel} elements from "
+                f"the complete parameter group, got {reduce_output.numel()}."
+            )
+        if self.buffer is None:
+            # Take ownership of the already-reduced FP32 allocation. PyTorch's
+            # following dtype cast allocates its own BF16 landed-grad tensor.
+            self.buffer = reduce_output.detach()
+        elif (
+            self.buffer.shape != reduce_output.shape
+            or self.buffer.device != reduce_output.device
+        ):
+            raise RuntimeError(
+                "FSDP2 main_grad buffer layout changed after registration."
+            )
+        else:
+            self.buffer.add_(reduce_output)
+        self.active = True
+
+        offset = 0
+        for fsdp_param in self.fsdp_params:
+            main_grad = torch.as_strided(
+                self.buffer,
+                size=fsdp_param.sharded_size,
+                stride=fsdp_param.contiguous_sharded_stride,
+                storage_offset=offset,
+            )
+            to_sharded_dtensor = getattr(fsdp_param, "to_sharded_dtensor", None)
+            if callable(to_sharded_dtensor):
+                main_grad = to_sharded_dtensor(main_grad)
+            fsdp_param.sharded_param.main_grad = main_grad
+            offset += int(fsdp_param.padded_sharded_param_size.numel())
+
+    def zero(self) -> None:
+        self.buffer = None
+        self.active = False
+        for fsdp_param in self.fsdp_params:
+            sharded_param = fsdp_param.sharded_param
+            if hasattr(sharded_param, "main_grad"):
+                delattr(sharded_param, "main_grad")
+
+    def _clear_torch_landed_grad(self, param: torch.Tensor) -> None:
+        if self.active:
+            param.grad = None
+
+
 def _load_fully_shard():
     try:
         from torch.distributed.fsdp import fully_shard
@@ -316,7 +438,9 @@ def _load_fully_shard():
     return fully_shard
 
 
-def _resolve_unit_module_types(unit_modules: Iterable[UnitModule]) -> tuple[type[nn.Module], ...]:
+def _resolve_unit_module_types(
+    unit_modules: Iterable[UnitModule],
+) -> tuple[type[nn.Module], ...]:
     resolved: list[type[nn.Module]] = []
     for item in unit_modules:
         if isinstance(item, str):
@@ -336,12 +460,16 @@ def _import_module_type(path: str) -> type[nn.Module]:
     module = importlib.import_module(module_name)
     obj = getattr(module, attr_name)
     if not isinstance(obj, type) or not issubclass(obj, nn.Module):
-        raise TypeError(f"FSDP2 unit module path does not resolve to nn.Module: {path!r}")
+        raise TypeError(
+            f"FSDP2 unit module path does not resolve to nn.Module: {path!r}"
+        )
     return obj
 
 
 def _iter_fsdp2_unit_modules(
-    root: nn.Module, unit_types: tuple[type[nn.Module], ...], leaf_module_names: tuple[str, ...]
+    root: nn.Module,
+    unit_types: tuple[type[nn.Module], ...],
+    leaf_module_names: tuple[str, ...],
 ) -> Iterable[nn.Module]:
     leaf_names = set(leaf_module_names)
     if not unit_types and not leaf_names:
@@ -387,7 +515,11 @@ def _is_fsdp2_module(module: nn.Module) -> bool:
 
 
 def _apply_fsdp2_prefetch(
-    root: nn.Module, wrapped_units: list[nn.Module], *, forward_depth: int, backward_depth: int
+    root: nn.Module,
+    wrapped_units: list[nn.Module],
+    *,
+    forward_depth: int,
+    backward_depth: int,
 ) -> None:
     fsdp_units = [module for module in wrapped_units if _is_fsdp2_module(module)]
     fsdp_root = root if _is_fsdp2_module(root) else None
@@ -408,7 +540,9 @@ def _apply_fsdp2_prefetch(
                 fsdp_units[idx].set_modules_to_backward_prefetch(targets)
 
 
-def _unit_reshard_after_forward(cfg: FSDP2Config, idx: int, total_units: int) -> bool | int | None:
+def _unit_reshard_after_forward(
+    cfg: FSDP2Config, idx: int, total_units: int
+) -> bool | int | None:
     if total_units > 0 and idx == total_units - 1:
         return cfg.last_unit_reshard_after_forward
     return cfg.reshard_after_forward
@@ -445,7 +579,11 @@ def _fully_shard_kwargs(
 
 
 def _mixed_precision_policy_from_config(cfg: FSDP2Config) -> Any | None:
-    if cfg.param_dtype is None and cfg.reduce_dtype is None and cfg.output_dtype is None:
+    if (
+        cfg.param_dtype is None
+        and cfg.reduce_dtype is None
+        and cfg.output_dtype is None
+    ):
         return None
     try:
         from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -471,7 +609,16 @@ def _resolve_torch_dtype(dtype: str | torch.dtype | None) -> torch.dtype | None:
     name = dtype.removeprefix("torch.")
     resolved = getattr(torch, name, None)
     if not isinstance(resolved, torch.dtype):
-        raise ValueError(f"Unsupported torch dtype for FSDP2 mixed precision: {dtype!r}")
+        raise ValueError(
+            f"Unsupported torch dtype for FSDP2 mixed precision: {dtype!r}"
+        )
+    return resolved
+
+
+def _resolve_fsdp2_grad_dtype(dtype: str | torch.dtype) -> torch.dtype:
+    resolved = _resolve_torch_dtype(dtype)
+    if resolved not in {torch.bfloat16, torch.float32}:
+        raise ValueError("FSDP2 grad_dtype must be bfloat16 or float32.")
     return resolved
 
 
@@ -479,7 +626,9 @@ def _save_param_attrs(module: nn.Module) -> dict[str, dict[str, Any]]:
     return {name: dict(vars(param)) for name, param in module.named_parameters()}
 
 
-def _restore_param_attrs(module: nn.Module, saved_attrs: dict[str, dict[str, Any]]) -> None:
+def _restore_param_attrs(
+    module: nn.Module, saved_attrs: dict[str, dict[str, Any]]
+) -> None:
     for name, param in module.named_parameters():
         for attr_name, attr_value in saved_attrs.get(name, {}).items():
             setattr(param, attr_name, attr_value)
@@ -491,7 +640,7 @@ __all__ = [
     "build_fsdp2_process_group_mesh",
     "build_fsdp2_shard_placement_fn",
     "fsdp2_available",
-    "promote_fsdp2_trainable_params_to_fp32",
+    "register_fsdp2_main_grad_hooks",
     "set_fsdp2_requires_gradient_sync",
     "wrap_fsdp2",
     "wrap_fsdp2_module",

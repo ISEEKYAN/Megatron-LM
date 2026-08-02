@@ -266,7 +266,6 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
         reshard_after_forward=True,
         forward_prefetch_depth=0,
         backward_prefetch_depth=0,
-        use_fp32_shards=False,
         use_fp32_master=True,
     )
 
@@ -348,7 +347,6 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
         reshard_after_forward=True,
         forward_prefetch_depth=0,
         backward_prefetch_depth=0,
-        use_fp32_shards=False,
         use_fp32_master=False,
     )
     del stress_optimizer
@@ -424,7 +422,6 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
         reshard_after_forward=False,
         forward_prefetch_depth=0,
         backward_prefetch_depth=0,
-        use_fp32_shards=False,
         use_fp32_master=False,
     )
     x = torch.randn(2, 512, device="cuda", dtype=torch.bfloat16)

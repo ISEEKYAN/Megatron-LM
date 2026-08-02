@@ -69,6 +69,28 @@ sets `optim.override_optimizer_config.offload_fraction=1.0` by default, which
 keeps FSDP2 optimizer update state on CPU during forward/backward to reduce GPU
 memory pressure.
 
+The FSDP2 recipe independently controls persistent parameter and gradient
+storage through `optim.override_optimizer_config.fsdp2_param_dtype` (default
+`bfloat16`) and `fsdp2_grad_dtype` (default `float32`). FSDP2 still computes
+with BF16 materialized parameters and reduces in FP32. A FP32 grad setting
+makes MLite retain the reduced FP32 shard as `main_grad`; PyTorch's transient
+BF16 `.grad` is cleared before the optimizer step. `main_grad`, the FP32
+optimizer master parameter, and both Adam moments use separate storage. This
+mode therefore requires `fsdp2_use_fp32_master=True` and does not support TE
+FusedAdam. With CPU optimizer offload enabled, the FP32 master and Adam moments
+remain on CPU. The removed `use_fp32_shards` API and
+`fsdp2_use_fp32_shards` optimizer option fail with a migration error instead
+of being silently ignored; replace old `True` with `float32` for both new keys,
+or old `False` with `bfloat16` for both. The DeepSeek V4 DAPO launcher is a
+complete example of the current configuration:
+
+```bash
+MODEL_PATH=/path/to/deepseek-v4-hf \
+TRAIN_FILES=/path/to/train.parquet \
+VAL_FILES=/path/to/validation.parquet \
+bash experimental/lite/examples/verl/scripts/run_deepseek_v4_dapo.sh
+```
+
 Example dry run:
 
 ```bash

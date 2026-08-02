@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+# isort: off
 import inspect
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -10,6 +11,9 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from megatron.lite.primitive.optimizers.fsdp2.main_grad import get_param_grad
+
+# isort: on
 
 
 def local_grad_sq_sum(
@@ -20,7 +24,7 @@ def local_grad_sq_sum(
 ) -> torch.Tensor:
     total: torch.Tensor | None = None
     for param in params:
-        grad = param.grad
+        grad = get_param_grad(param)
         if grad is None:
             continue
         grad = to_local_tensor(grad)
@@ -28,7 +32,9 @@ def local_grad_sq_sum(
             total = torch.zeros((), device=grad.device, dtype=dtype)
         total += grad.detach().to(dtype).pow(2).sum()
     if total is None:
-        return torch.zeros((), device=default_device or torch.device("cpu"), dtype=dtype)
+        return torch.zeros(
+            (), device=default_device or torch.device("cpu"), dtype=dtype
+        )
     return total
 
 
@@ -42,13 +48,8 @@ def to_local_tensor(tensor):
     return tensor
 
 
-def fsdp2_model_param_dtype(param: nn.Parameter) -> torch.dtype | None:
-    dtype = getattr(param, "_fsdp2_model_param_dtype", None)
-    return dtype if isinstance(dtype, torch.dtype) else None
-
-
 def has_dtensor_grad_or_param(param: nn.Parameter) -> bool:
-    grad = param.grad
+    grad = get_param_grad(param)
     return is_dtensor_like(param) or (grad is not None and is_dtensor_like(grad))
 
 
@@ -60,7 +61,9 @@ def is_dtensor_like(tensor: Any) -> bool:
     )
 
 
-def copy_local_tensor_to_param_(param: nn.Parameter, local_tensor: torch.Tensor) -> None:
+def copy_local_tensor_to_param_(
+    param: nn.Parameter, local_tensor: torch.Tensor
+) -> None:
     if not is_dtensor_like(param):
         param.detach().copy_(local_tensor.to(device=param.device, dtype=param.dtype))
         return
@@ -70,7 +73,9 @@ def copy_local_tensor_to_param_(param: nn.Parameter, local_tensor: torch.Tensor)
     # local * mesh, e.g. a (3,) param over 8 ranks -> 0 or 8), so copy local->local
     # (master is init'd from this same local shard, so shapes match).
     local_param = to_local_tensor(param)
-    local_param.copy_(local_tensor.to(device=local_param.device, dtype=local_param.dtype))
+    local_param.copy_(
+        local_tensor.to(device=local_param.device, dtype=local_param.dtype)
+    )
 
 
 def all_reduce_grad_(grad: torch.Tensor, *, group: dist.ProcessGroup) -> None:
@@ -108,9 +113,13 @@ class ChainedOptimizer:
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         optimizer_states = state_dict.get("optimizers")
-        if not isinstance(optimizer_states, list) or len(optimizer_states) != len(self.optimizers):
+        if not isinstance(optimizer_states, list) or len(optimizer_states) != len(
+            self.optimizers
+        ):
             raise ValueError("Invalid chained torch optimizer state_dict.")
-        for optimizer, optimizer_state in zip(self.optimizers, optimizer_states, strict=True):
+        for optimizer, optimizer_state in zip(
+            self.optimizers, optimizer_states, strict=True
+        ):
             optimizer.load_state_dict(optimizer_state)
 
 
@@ -126,9 +135,10 @@ class FP32AdamW:
         betas: tuple[float, float],
         eps: float,
         cpu_update: bool = False,
-        model_param_dtypes: dict[int, torch.dtype] | None = None,
     ):
-        self.param_groups = normalize_param_groups(params, default_weight_decay=weight_decay)
+        self.param_groups = normalize_param_groups(
+            params, default_weight_decay=weight_decay
+        )
         self.params: list[nn.Parameter] = []
         self.lr = lr
         self.weight_decay = weight_decay
@@ -138,8 +148,6 @@ class FP32AdamW:
         self.step_count = 0
         self.state: dict[nn.Parameter, dict[str, torch.Tensor]] = {}
         self._master_for_param: dict[nn.Parameter, torch.Tensor] = {}
-        self._model_param_dtypes_by_id = dict(model_param_dtypes or {})
-        self._model_dtype_for_param: dict[nn.Parameter, torch.dtype] = {}
 
         for group in self.param_groups:
             group.setdefault("lr", lr)
@@ -148,9 +156,6 @@ class FP32AdamW:
             group["weight_decay"] = group_weight_decay
             for param in group["params"]:
                 self.params.append(param)
-                model_dtype = self._model_param_dtypes_by_id.get(id(param))
-                if model_dtype is not None:
-                    self._model_dtype_for_param[param] = model_dtype
                 master = self._init_master_param(param)
                 self.state[param] = {
                     "master_param": master,
@@ -164,16 +169,11 @@ class FP32AdamW:
         if self.cpu_update:
             local_param = to_local_tensor(param.detach())
             return local_param.detach().to(device="cpu", dtype=torch.float32).clone()
-        if self._model_param_dtype(param) is not None:
-            return param.detach().to(dtype=torch.float32).clone()
         return (
             param.detach()
             if param.dtype is torch.float32
             else param.detach().to(dtype=torch.float32).clone()
         )
-
-    def _model_param_dtype(self, param: nn.Parameter) -> torch.dtype | None:
-        return self._model_dtype_for_param.get(param) or fsdp2_model_param_dtype(param)
 
     def zero_grad(self, *args, **kwargs) -> None:
         set_to_none = kwargs.get("set_to_none", False)
@@ -197,7 +197,7 @@ class FP32AdamW:
             group_lr = float(group.get("lr", self.lr))
             group_weight_decay = float(group.get("weight_decay", self.weight_decay))
             for param in group["params"]:
-                grad = param.grad
+                grad = get_param_grad(param)
                 if grad is None:
                     continue
                 state = self.state[param]
@@ -215,19 +215,20 @@ class FP32AdamW:
                 exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
                 denom = exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(self.eps)
-                master.addcdiv_(exp_avg.to(dtype=torch.float32), denom, value=-group_step_size)
+                master.addcdiv_(
+                    exp_avg.to(dtype=torch.float32), denom, value=-group_step_size
+                )
                 self._copy_master_to_param(param, master)
 
     def _prepare_grad(self, grad: torch.Tensor, master: torch.Tensor) -> torch.Tensor:
         if self.cpu_update:
             grad = to_local_tensor(grad)
             return grad.detach().to(device=master.device, dtype=torch.float32)
+        if grad.dtype is torch.float32:
+            return grad.detach()
         return grad.detach().to(dtype=torch.float32)
 
     def _copy_master_to_param(self, param: nn.Parameter, master: torch.Tensor) -> None:
-        model_dtype = self._model_param_dtype(param)
-        if model_dtype is not None:
-            master = master.to(dtype=model_dtype).to(dtype=param.dtype)
         if not self.cpu_update:
             param.detach().copy_(master.to(dtype=param.dtype))
             return
@@ -237,7 +238,9 @@ class FP32AdamW:
         return {
             "type": "fp32_adamw",
             "step_count": self.step_count,
-            "master_params": [self.state[param]["master_param"] for param in self.params],
+            "master_params": [
+                self.state[param]["master_param"] for param in self.params
+            ],
             "exp_avgs": [self.state[param]["exp_avg"] for param in self.params],
             "exp_avg_sqs": [self.state[param]["exp_avg_sq"] for param in self.params],
             "steps": [int(self.state[param]["step"]) for param in self.params],
@@ -269,7 +272,9 @@ class FP32AdamW:
                 local_target.copy_(local_src)
         loaded_steps = state_dict.get("steps")
         if loaded_steps is not None:
-            if not isinstance(loaded_steps, list) or len(loaded_steps) != len(self.params):
+            if not isinstance(loaded_steps, list) or len(loaded_steps) != len(
+                self.params
+            ):
                 raise ValueError("Invalid FP32 AdamW steps state.")
             for param, step in zip(self.params, loaded_steps, strict=True):
                 self.state[param]["step"] = int(step)
@@ -278,9 +283,9 @@ class FP32AdamW:
                 self.state[param]["step"] = self.step_count
         loaded_weight_decays = state_dict.get("weight_decays")
         if loaded_weight_decays is not None:
-            if not isinstance(loaded_weight_decays, list) or len(loaded_weight_decays) != len(
-                self.params
-            ):
+            if not isinstance(loaded_weight_decays, list) or len(
+                loaded_weight_decays
+            ) != len(self.params):
                 raise ValueError("Invalid FP32 AdamW weight_decay state.")
             idx = 0
             for group in self.param_groups:
@@ -304,7 +309,6 @@ def build_adamw_optimizer(
     foreach: bool | str,
     use_fp32_master: bool,
     cpu_update: bool,
-    model_param_dtypes: dict[int, torch.dtype] | None,
     opt,
 ) -> Any:
     param_groups = normalize_param_groups(params, default_weight_decay=weight_decay)
@@ -328,22 +332,35 @@ def build_adamw_optimizer(
             betas=betas,
             eps=eps,
             cpu_update=cpu_update,
-            model_param_dtypes=model_param_dtypes,
         )
     if foreach not in {True, False, "auto"}:
-        raise ValueError(f"adamw_foreach must be True, False, or 'auto', got {foreach!r}.")
+        raise ValueError(
+            f"adamw_foreach must be True, False, or 'auto', got {foreach!r}."
+        )
     if foreach is False:
         return torch.optim.AdamW(
-            param_groups, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps, foreach=False
+            param_groups,
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=betas,
+            eps=eps,
+            foreach=False,
         )
 
     dtensor_param_groups, tensor_param_groups = split_dtensor_and_tensor_param_groups(
         param_groups, default_weight_decay=weight_decay
     )
-    split_param_groups = [group for group in (dtensor_param_groups, tensor_param_groups) if group]
+    split_param_groups = [
+        group for group in (dtensor_param_groups, tensor_param_groups) if group
+    ]
     if foreach == "auto" and not dtensor_param_groups:
         return torch.optim.AdamW(
-            param_groups, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps, foreach=False
+            param_groups,
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=betas,
+            eps=eps,
+            foreach=False,
         )
     if len(split_param_groups) <= 1:
         return torch.optim.AdamW(
@@ -379,7 +396,9 @@ def maybe_build_te_fused_adam_optimizer(
 
     all_param_list = list(all_params)
     master_weights = get_bool_opt(
-        opt, "master_weights", default=use_fp32_master and should_use_master_weights(all_param_list)
+        opt,
+        "master_weights",
+        default=use_fp32_master and should_use_master_weights(all_param_list),
     )
     kwargs = dict(
         lr=lr,
@@ -388,15 +407,23 @@ def maybe_build_te_fused_adam_optimizer(
         eps=eps,
         adam_w_mode=True,
         master_weights=master_weights,
-        master_weight_dtype=get_dtype_opt(opt, "master_weight_dtype", default=torch.float32),
-        store_param_remainders=get_bool_opt(opt, "store_param_remainders", default=master_weights),
+        master_weight_dtype=get_dtype_opt(
+            opt, "master_weight_dtype", default=torch.float32
+        ),
+        store_param_remainders=get_bool_opt(
+            opt, "store_param_remainders", default=master_weights
+        ),
         exp_avg_dtype=get_dtype_opt(opt, "exp_avg_dtype", default=torch.float32),
         exp_avg_sq_dtype=get_dtype_opt(opt, "exp_avg_sq_dtype", default=torch.float32),
     )
-    return FusedAdam(param_groups, **filter_supported_kwargs(FusedAdam.__init__, kwargs))
+    return FusedAdam(
+        param_groups, **filter_supported_kwargs(FusedAdam.__init__, kwargs)
+    )
 
 
-def filter_supported_kwargs(fn: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+def filter_supported_kwargs(
+    fn: Callable[..., Any], kwargs: dict[str, Any]
+) -> dict[str, Any]:
     try:
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
@@ -407,7 +434,10 @@ def filter_supported_kwargs(fn: Callable[..., Any], kwargs: dict[str, Any]) -> d
 
 
 def should_use_master_weights(params: Iterable[nn.Parameter]) -> bool:
-    return any(param.is_floating_point() and param.dtype is not torch.float32 for param in params)
+    return any(
+        param.is_floating_point() and param.dtype is not torch.float32
+        for param in params
+    )
 
 
 def get_bool_opt(opt, attr: str, *, default: bool) -> bool:
@@ -451,7 +481,9 @@ def get_opt_value(opt, attr: str):
 
 
 def normalize_param_groups(
-    params: Iterable[nn.Parameter] | Iterable[dict[str, Any]], *, default_weight_decay: float
+    params: Iterable[nn.Parameter] | Iterable[dict[str, Any]],
+    *,
+    default_weight_decay: float,
 ) -> list[dict[str, Any]]:
     items = list(params)
     if not items:
@@ -533,7 +565,6 @@ __all__ = [
     "copy_local_tensor_to_param_",
     "dtensor_from_local",
     "filter_supported_kwargs",
-    "fsdp2_model_param_dtype",
     "get_bool_opt",
     "get_dtype_opt",
     "get_opt_value",

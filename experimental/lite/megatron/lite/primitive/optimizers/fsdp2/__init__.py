@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+# isort: off
 from megatron.lite.primitive.optimizers.fsdp2.grad_clip import (
     all_reduce_scalar_,
     clip_grads_with_sharded_norm_,
@@ -24,11 +25,13 @@ from megatron.lite.primitive.optimizers.fsdp2.wrap import (
     build_fsdp2_process_group_mesh,
     build_fsdp2_shard_placement_fn,
     fsdp2_available,
-    promote_fsdp2_trainable_params_to_fp32,
+    register_fsdp2_main_grad_hooks,
     set_fsdp2_requires_gradient_sync,
     wrap_fsdp2,
     wrap_fsdp2_module,
 )
+
+# isort: on
 
 __all__ = [
     "BACKEND",
@@ -43,7 +46,7 @@ __all__ = [
     "build_fsdp2_shard_placement_fn",
     "clip_grads_with_sharded_norm_",
     "fsdp2_available",
-    "promote_fsdp2_trainable_params_to_fp32",
+    "register_fsdp2_main_grad_hooks",
     "resolve_torch_dtype",
     "set_fsdp2_requires_gradient_sync",
     "sharded_grad_abs_max",
