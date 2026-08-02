@@ -69,6 +69,21 @@ sets `optim.override_optimizer_config.offload_fraction=1.0` by default, which
 keeps FSDP2 optimizer update state on CPU during forward/backward to reduce GPU
 memory pressure.
 
+The FSDP2 recipe keeps model parameter shards in BF16, reduces gradients in
+FP32, and enables the separate FP32 optimizer master parameters by default.
+No parameter-shard precision override is needed. The removed
+`use_fp32_shards` API and `fsdp2_use_fp32_shards` optimizer option fail with a
+migration error instead of being silently ignored; remove either old setting
+from existing launch configs. The DeepSeek V4 DAPO launcher is a complete
+example of the current configuration:
+
+```bash
+MODEL_PATH=/path/to/deepseek-v4-hf \
+TRAIN_FILES=/path/to/train.parquet \
+VAL_FILES=/path/to/validation.parquet \
+bash experimental/lite/examples/verl/scripts/run_deepseek_v4_dapo.sh
+```
+
 Example dry run:
 
 ```bash

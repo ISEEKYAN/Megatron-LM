@@ -253,35 +253,6 @@ def _warn_tp_not_recommended(ps: ParallelState) -> None:
     )
 
 
-def promote_fsdp2_trainable_params_to_fp32(
-    model: nn.Module, *, ignored_params: set[nn.Parameter] | None = None
-) -> int:
-    """Promote FSDP2-owned trainable floating parameters to FP32 shards.
-
-    Model protocols still use ``FSDP2Config.param_dtype`` to run compute in
-    BF16. Keeping the sharded parameters in FP32 makes the torch optimizer path
-    closer to MCore dist-opt's main-param semantics and avoids BF16 grad-norm
-    and update drift before FSDP2 wrapping.
-    """
-
-    ignored_param_ids = {id(param) for param in ignored_params or ()}
-    promoted = 0
-    with torch.no_grad():
-        for param in model.parameters():
-            if id(param) in ignored_param_ids:
-                continue
-            if not param.requires_grad or not param.is_floating_point():
-                continue
-            if param.dtype == torch.float32:
-                continue
-            param._fsdp2_model_param_dtype = param.dtype
-            param.data = param.data.to(torch.float32)
-            if param.grad is not None:
-                param.grad = param.grad.to(torch.float32)
-            promoted += 1
-    return promoted
-
-
 def set_fsdp2_requires_gradient_sync(
     module: nn.Module, requires_gradient_sync: bool, *, recurse: bool = True
 ) -> int:
@@ -491,7 +462,6 @@ __all__ = [
     "build_fsdp2_process_group_mesh",
     "build_fsdp2_shard_placement_fn",
     "fsdp2_available",
-    "promote_fsdp2_trainable_params_to_fp32",
     "set_fsdp2_requires_gradient_sync",
     "wrap_fsdp2",
     "wrap_fsdp2_module",

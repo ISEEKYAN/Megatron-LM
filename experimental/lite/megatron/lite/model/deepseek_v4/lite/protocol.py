@@ -467,7 +467,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                     deterministic=impl_cfg.deterministic,
                     vpp=impl_cfg.parallel.vpp,
                     leaf_module_names=(),
-                    use_fp32_shards=False,
                 )
             }
 

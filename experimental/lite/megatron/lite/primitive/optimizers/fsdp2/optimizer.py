@@ -16,8 +16,8 @@ import torch.nn as nn
 from megatron.lite.primitive.optimizers.fsdp2.adamw import (
     all_reduce_grad_,
     build_adamw_optimizer,
-    fsdp2_model_param_dtype,
     get_bool_opt,
+    get_opt_value,
     has_dtensor_grad_or_param,
     local_grad_sq_sum,
 )
@@ -36,7 +36,6 @@ from megatron.lite.primitive.optimizers.fsdp2.wrap import (
     FSDP2Config,
     build_fsdp2_process_group_mesh,
     build_fsdp2_shard_placement_fn,
-    promote_fsdp2_trainable_params_to_fp32,
     wrap_fsdp2,
     wrap_fsdp2_module,
 )
@@ -49,7 +48,6 @@ _DEFAULT_FORWARD_PREFETCH_DEPTH = 1
 _DEFAULT_BACKWARD_PREFETCH_DEPTH = 0
 _DEFAULT_PARAM_DTYPE: str | None = "bfloat16"
 _DEFAULT_REDUCE_DTYPE: str | None = "float32"
-_DEFAULT_USE_FP32_SHARDS = True
 _DEFAULT_USE_FP32_MASTER = True
 _DEFAULT_ADAMW_FOREACH: bool | str = "auto"
 
@@ -290,7 +288,6 @@ def build_fsdp2_adamw(
     grad_norm_accum_dtype: str | torch.dtype = torch.float32,
     adamw_foreach: bool | str = "auto",
     use_fp32_master: bool = False,
-    model_param_dtypes: dict[tuple[int, str], torch.dtype] | None = None,
 ) -> FSDP2Optimizer:
     """Build AdamW from Megatron Lite's shared OptimizerConfig-like object."""
 
@@ -298,11 +295,10 @@ def build_fsdp2_adamw(
     if optimizer_name not in {"adam", "adamw"}:
         raise ValueError(f"fsdp2 supports adam/adamw, got {optimizer_name!r}.")
 
-    params, param_groups, param_names, param_model_dtypes = _build_adamw_param_groups(
+    params, param_groups, param_names = _build_adamw_param_groups(
         model_chunks,
         weight_decay=float(getattr(opt, "weight_decay", 0.01)),
         apply_wd_to_qk_layernorm=bool(getattr(opt, "apply_wd_to_qk_layernorm", False)),
-        model_param_dtypes=model_param_dtypes,
     )
     beta1 = getattr(opt, "adam_beta1", None)
     beta2 = getattr(opt, "adam_beta2", None)
@@ -318,7 +314,6 @@ def build_fsdp2_adamw(
         foreach=adamw_foreach,
         use_fp32_master=use_fp32_master,
         cpu_update=use_fp32_master and float(offload_fraction) > 0.0,
-        model_param_dtypes=param_model_dtypes,
         opt=opt,
     )
     return FSDP2Optimizer(
@@ -357,11 +352,24 @@ def build_fsdp2_training_optimizer(
     backward_prefetch_depth: int = _DEFAULT_BACKWARD_PREFETCH_DEPTH,
     param_dtype: str | torch.dtype | None = _DEFAULT_PARAM_DTYPE,
     reduce_dtype: str | torch.dtype | None = _DEFAULT_REDUCE_DTYPE,
-    use_fp32_shards: bool | None = None,
     use_fp32_master: bool | None = None,
     adamw_foreach: bool | str = _DEFAULT_ADAMW_FOREACH,
+    **removed_options: Any,
 ) -> FSDP2Optimizer:
     """Wrap model chunks with FSDP2 and build the matching AdamW adapter."""
+
+    if "use_fp32_shards" in removed_options:
+        raise ValueError("use_fp32_shards has been removed; behavior is equivalent to False.")
+    if removed_options:
+        unexpected = next(iter(removed_options))
+        raise TypeError(
+            "build_fsdp2_training_optimizer() got an unexpected keyword argument "
+            f"{unexpected!r}"
+        )
+    if get_opt_value(opt, "fsdp2_use_fp32_shards") is not None:
+        raise ValueError(
+            "fsdp2_use_fp32_shards has been removed; behavior is equivalent to False."
+        )
 
     if (vpp or 1) > 1 and ps.pp_size <= 1:
         raise ValueError("optimizer='fsdp2' requires pp>1 when vpp>1.")
@@ -387,11 +395,6 @@ def build_fsdp2_training_optimizer(
         from megatron.lite.primitive.deterministic import deterministic_requested
 
         deterministic = deterministic_requested()
-    effective_use_fp32_shards = (
-        bool(use_fp32_shards)
-        if use_fp32_shards is not None
-        else get_bool_opt(opt, "fsdp2_use_fp32_shards", default=_DEFAULT_USE_FP32_SHARDS)
-    )
     effective_use_fp32_master = (
         bool(use_fp32_master)
         if use_fp32_master is not None
@@ -413,12 +416,6 @@ def build_fsdp2_training_optimizer(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
     )
-    if effective_use_fp32_shards:
-        model_param_dtypes = _collect_model_param_dtypes(model_chunks)
-        for chunk in model_chunks:
-            promote_fsdp2_trainable_params_to_fp32(chunk)
-    else:
-        model_param_dtypes = {}
 
     tp_replicated_grad_param_names = _collect_tp_replicated_grad_param_names(model_chunks)
 
@@ -450,9 +447,6 @@ def build_fsdp2_training_optimizer(
             ignored_params=ignored_expert_params or None,
             shard_placement_fn=dense_shard_placement_fn,
         )
-    if model_param_dtypes:
-        _restore_model_param_dtypes(model_chunks, model_param_dtypes)
-
     tp_replicated_grad_params = _collect_tp_replicated_grad_params(
         model_chunks, param_names=tp_replicated_grad_param_names
     )
@@ -470,7 +464,6 @@ def build_fsdp2_training_optimizer(
         grad_norm_accum_dtype="float32",
         adamw_foreach=False if deterministic else adamw_foreach,
         use_fp32_master=effective_use_fp32_master,
-        model_param_dtypes=model_param_dtypes,
     )
 
 
@@ -517,25 +510,6 @@ def _collect_expert_modules(
 
 def _collect_module_params(modules: Iterable[nn.Module]) -> set[nn.Parameter]:
     return {param for module in modules for param in module.parameters()}
-
-
-def _collect_model_param_dtypes(chunks: Iterable[nn.Module]) -> dict[tuple[int, str], torch.dtype]:
-    return {
-        (chunk_idx, name): param.dtype
-        for chunk_idx, chunk in enumerate(chunks)
-        for name, param in chunk.named_parameters()
-        if param.requires_grad and param.is_floating_point() and param.dtype != torch.float32
-    }
-
-
-def _restore_model_param_dtypes(
-    chunks: Iterable[nn.Module], model_param_dtypes: dict[tuple[int, str], torch.dtype]
-) -> None:
-    for chunk_idx, chunk in enumerate(chunks):
-        for name, param in chunk.named_parameters():
-            model_dtype = model_param_dtypes.get((chunk_idx, name))
-            if model_dtype is not None:
-                param._fsdp2_model_param_dtype = model_dtype
 
 
 def _collect_tp_replicated_grad_param_names(chunks: Iterable[nn.Module]) -> list[tuple[int, str]]:
@@ -594,13 +568,11 @@ def _build_adamw_param_groups(
     *,
     weight_decay: float,
     apply_wd_to_qk_layernorm: bool,
-    model_param_dtypes: dict[tuple[int, str], torch.dtype] | None = None,
-) -> tuple[list[nn.Parameter], list[dict[str, Any]], dict[int, str], dict[int, torch.dtype]]:
+) -> tuple[list[nn.Parameter], list[dict[str, Any]], dict[int, str]]:
     params: list[nn.Parameter] = []
     decay_params: list[nn.Parameter] = []
     no_decay_params: list[nn.Parameter] = []
     param_names: dict[int, str] = {}
-    param_model_dtypes: dict[int, torch.dtype] = {}
     seen_param_ids: set[int] = set()
 
     for chunk_idx, chunk in enumerate(model_chunks):
@@ -610,13 +582,6 @@ def _build_adamw_param_groups(
             seen_param_ids.add(id(param))
             params.append(param)
             param_names[id(param)] = f"chunk{chunk_idx}.{name}"
-            model_dtype = None
-            if model_param_dtypes is not None:
-                model_dtype = model_param_dtypes.get((chunk_idx, name))
-            if model_dtype is None:
-                model_dtype = fsdp2_model_param_dtype(param)
-            if model_dtype is not None:
-                param_model_dtypes[id(param)] = model_dtype
             if _matches_megatron_no_weight_decay(name, param, apply_wd_to_qk_layernorm):
                 no_decay_params.append(param)
             else:
@@ -629,7 +594,7 @@ def _build_adamw_param_groups(
         param_groups.append({"params": decay_params, "weight_decay": weight_decay, "wd_mult": 1.0})
     if no_decay_params:
         param_groups.append({"params": no_decay_params, "weight_decay": 0.0, "wd_mult": 0.0})
-    return params, param_groups, param_names, param_model_dtypes
+    return params, param_groups, param_names
 
 
 def _matches_megatron_no_weight_decay(

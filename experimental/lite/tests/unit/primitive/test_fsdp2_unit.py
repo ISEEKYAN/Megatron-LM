@@ -83,6 +83,20 @@ class ToyMoEBlock(nn.Module):
         return self.experts(self.dense(x))
 
 
+def _assert_loss_and_gradients_bitwise_equal(
+    actual_loss: torch.Tensor,
+    expected_loss: torch.Tensor,
+    actual_model: nn.Module,
+    expected_model: nn.Module,
+) -> None:
+    assert torch.equal(actual_loss, expected_loss)
+    actual_grads = dict(actual_model.named_parameters())
+    expected_grads = dict(expected_model.named_parameters())
+    assert actual_grads.keys() == expected_grads.keys()
+    for name in actual_grads:
+        assert torch.equal(actual_grads[name].grad, expected_grads[name].grad), name
+
+
 def test_fsdp2_config_validates_empty_wrap_surface():
     with pytest.raises(ValueError, match="wrap_root=True"):
         FSDP2Config(wrap_root=False)
@@ -141,7 +155,6 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
         unit_modules=(ToyMoEBlock,),
         expert_classifier=lambda name: ".experts." in f".{name}",
         reshard_after_forward=True,
-        use_fp32_shards=False,
         use_fp32_master=False,
     )
 
@@ -159,6 +172,132 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
     assert dense_config.reshard_after_forward is True
     assert dense_config.last_unit_reshard_after_forward is True
     assert dense_kwargs["ignored_params"] == set(model.experts.parameters())
+
+
+@pytest.mark.parametrize("removed_value", [False, True])
+def test_fsdp2_rejects_removed_use_fp32_shards_keyword(removed_value: bool):
+    with pytest.raises(
+        ValueError,
+        match="use_fp32_shards has been removed; behavior is equivalent to False",
+    ):
+        fsdp2_optimizer.build_fsdp2_training_optimizer(
+            [ToyModel()],
+            None,
+            ParallelState(),
+            unit_modules=(ToyBlock,),
+            use_fp32_shards=removed_value,
+        )
+
+
+@pytest.mark.parametrize(
+    "opt",
+    [
+        SimpleNamespace(fsdp2_use_fp32_shards=False),
+        {"fsdp2_use_fp32_shards": True},
+        SimpleNamespace(override_optimizer_config={"fsdp2_use_fp32_shards": False}),
+    ],
+)
+def test_fsdp2_rejects_removed_use_fp32_shards_config(opt):
+    with pytest.raises(
+        ValueError,
+        match="fsdp2_use_fp32_shards has been removed; behavior is equivalent to False",
+    ):
+        fsdp2_optimizer.build_fsdp2_training_optimizer(
+            [ToyModel()],
+            opt,
+            ParallelState(),
+            unit_modules=(ToyBlock,),
+        )
+
+
+def test_fsdp2_default_mixed_precision_policy_keeps_bf16_params_fp32_reductions():
+    policy = fsdp2_wrap._mixed_precision_policy_from_config(
+        FSDP2Config(param_dtype="bfloat16", reduce_dtype="float32")
+    )
+
+    assert policy.param_dtype is torch.bfloat16
+    assert policy.reduce_dtype is torch.float32
+
+
+def test_removed_fp32_shards_path_preserves_loss_and_gradients_bitwise_cpu(monkeypatch):
+    monkeypatch.setattr(fsdp2_optimizer, "wrap_fsdp2", lambda model, *_args, **_kwargs: model)
+    torch.manual_seed(1234)
+    actual_model = ToyModel().to(dtype=torch.bfloat16)
+    expected_model = copy.deepcopy(actual_model)
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        weight_decay=0.0,
+        adam_beta1=0.9,
+        adam_beta2=0.95,
+        adam_eps=1.0e-8,
+        clip_grad=1.0e9,
+        offload_fraction=0.0,
+    )
+    actual_optimizer = fsdp2_optimizer.build_fsdp2_training_optimizer(
+        [actual_model],
+        opt,
+        ParallelState(),
+        unit_modules=(ToyBlock,),
+        use_fp32_master=True,
+        adamw_foreach=False,
+    )
+    # This is the old use_fp32_shards=False path: wrapping leaves BF16 model
+    # parameters intact, then the optimizer owns the only FP32 parameter copy.
+    expected_optimizer = fsdp2_optimizer.build_fsdp2_adamw(
+        [expected_model],
+        opt,
+        ParallelState(),
+        use_fp32_master=True,
+        adamw_foreach=False,
+    )
+    actual_params = list(actual_model.parameters())
+    actual_masters = actual_optimizer.optimizer.state_dict()["master_params"]
+    assert all(
+        param.dtype is torch.bfloat16 and param.element_size() == 2
+        for param in actual_params
+    )
+    assert all(
+        master.dtype is torch.float32 and master.element_size() == 4
+        for master in actual_masters
+    )
+    assert all(
+        param.untyped_storage().data_ptr() != master.untyped_storage().data_ptr()
+        for param, master in zip(actual_params, actual_masters, strict=True)
+    )
+    inputs = [
+        torch.randn(3, 4, dtype=torch.bfloat16, generator=torch.Generator().manual_seed(seed))
+        for seed in range(5)
+    ]
+
+    for x in inputs:
+        actual_optimizer.zero_grad()
+        expected_optimizer.zero_grad()
+        actual_loss = actual_model(x).float().square().mean()
+        expected_loss = expected_model(x).float().square().mean()
+        actual_loss.backward()
+        expected_loss.backward()
+        _assert_loss_and_gradients_bitwise_equal(
+            actual_loss, expected_loss, actual_model, expected_model
+        )
+        assert actual_optimizer.step()[0]
+        assert expected_optimizer.step()[0]
+        for actual_param, expected_param in zip(
+            actual_model.parameters(), expected_model.parameters(), strict=True
+        ):
+            assert torch.equal(actual_param, expected_param)
+
+
+def test_bitwise_loss_and_gradient_check_detects_perturbation():
+    actual_model = nn.Linear(2, 1, bias=False)
+    expected_model = copy.deepcopy(actual_model)
+    actual_model.weight.grad = torch.tensor([[1.0, 2.0]])
+    expected_model.weight.grad = torch.tensor([[1.0, 2.5]])
+
+    with pytest.raises(AssertionError):
+        _assert_loss_and_gradients_bitwise_equal(
+            torch.tensor(1.0), torch.tensor(1.0), actual_model, expected_model
+        )
 
 
 @pytest.mark.parametrize("depth", [0, 1, 2])
@@ -482,7 +621,6 @@ def test_fp32_adamw_state_dict_roundtrip_cpu():
         foreach=False,
         use_fp32_master=True,
         cpu_update=False,
-        model_param_dtypes={id(param): torch.bfloat16},
         opt=SimpleNamespace(),
     )
     param.grad = torch.tensor([0.5, -0.25], dtype=torch.bfloat16)
@@ -503,7 +641,6 @@ def test_fp32_adamw_state_dict_roundtrip_cpu():
         foreach=False,
         use_fp32_master=True,
         cpu_update=False,
-        model_param_dtypes={id(loaded_param): torch.bfloat16},
         opt=SimpleNamespace(),
     )
     loaded_optimizer.load_state_dict(state)
@@ -530,7 +667,6 @@ def test_fp32_adamw_load_matches_uninterrupted_next_step_cpu(cpu_update: bool):
             foreach=False,
             use_fp32_master=True,
             cpu_update=cpu_update,
-            model_param_dtypes={id(param): torch.bfloat16},
             opt=SimpleNamespace(),
         )
         return param, optimizer
