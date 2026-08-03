@@ -23,6 +23,11 @@ def validate_dist_opt_config(engine_cfg) -> None:
 validate_dist_opt_session = validate_dist_opt_config
 
 
+def _resolve_grad_reduce_in_fp32(engine_cfg) -> bool:
+    """Keep the historical FP32 default while allowing memory-bounded callers to opt out."""
+    return bool(getattr(engine_cfg, "grad_reduce_in_fp32", True))
+
+
 def _effective_etp(parallel) -> int:
     return int(parallel.etp if parallel.etp is not None else 1)
 
@@ -153,7 +158,9 @@ def build_dist_opt_stack(
         wrapped_chunks = list(model_chunks)
     else:
         ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=True, overlap_grad_reduce=False, grad_reduce_in_fp32=True
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=False,
+            grad_reduce_in_fp32=_resolve_grad_reduce_in_fp32(engine_cfg),
         )
         wrapped_chunks = []
         for chunk_idx, chunk in enumerate(model_chunks):
@@ -205,6 +212,7 @@ def build_dist_opt_training_optimizer(
     is_expert: ExpertClassifierFn | None = None,
     skip_ddp_wrap: bool = False,
     deterministic: bool | None = None,
+    grad_reduce_in_fp32: bool = True,
 ):
     """Build the dist_opt DDP+optimizer stack from a Megatron Lite model ImplConfig."""
 
@@ -230,6 +238,7 @@ def build_dist_opt_training_optimizer(
         parallel=impl_cfg.parallel,
         optimizer=opt,
         deterministic=bool(deterministic),
+        grad_reduce_in_fp32=bool(grad_reduce_in_fp32),
     )
     model_chunks[:], optimizer = build_dist_opt_stack(
         model_chunks,
