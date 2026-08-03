@@ -526,6 +526,98 @@ def test_mixed_cp_uses_pool_global_token_count_for_loss_normalization(monkeypatc
     assert torch.equal(dcp_global_loss, baseline_global_loss)
 
 
+def test_runtime_collector_records_the_loss_scaled_for_backward(monkeypatch):
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
+
+    module = types.ModuleType("megatron.core.datasets.data_schedule")
+    module.DefaultDynamicCPScheduler = _SplitScheduler
+    monkeypatch.setitem(sys.modules, "megatron.core.datasets.data_schedule", module)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda value, group: None)
+
+    def gather(output, records, *, group):
+        output[:] = [
+            records,
+            [
+                {
+                    "sample_ids": [1],
+                    "model_output": {"values": [torch.tensor([2.0])]},
+                    "loss": 24.0,
+                    "metrics": {},
+                }
+            ],
+        ]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    pool, singleton = _Group(2), _Group(1)
+    handle = ModelHandle(
+        model=object(),
+        parallel_state=SimpleNamespace(
+            dp_size=2,
+            dp_rank=0,
+            dp_group=pool,
+            dp_cp_group=pool,
+            cp_size=1,
+            cp_rank=0,
+            cp_group=singleton,
+            pp_size=1,
+        ),
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(tp=1, cp=1, pp=1, vpp=1),
+            impl_cfg={"use_thd": True},
+        ),
+        _extras={"forward_step": lambda *_args: {}},
+    )
+    plugin = DynamicCPPlugin(
+        {"max_seqlen_per_dp_cp_rank": 1},
+        create_groups=lambda _ps, _minimum, _parallel: {1: singleton, 2: pool},
+    )
+    plugin.initialize(handle)
+    collector = []
+
+    def loss_fn(_output, _batch, _context):
+        return torch.tensor(3.0), {}
+
+    loss_fn.runtime_output_collector = collector
+    loss_fn.runtime_output_extractor = lambda output: output
+    prepared = plugin._prepare(
+        handle,
+        iter(
+            [
+                (
+                    PackedBatch(
+                        input_ids=torch.tensor([1]),
+                        labels=torch.tensor([1]),
+                        seq_lens=torch.tensor([1]),
+                        loss_mask=torch.ones(1),
+                    ),
+                    LossContext(loss_scale=0.25, source_batch=torch.tensor([[0.0]])),
+                ),
+                (
+                    PackedBatch(
+                        input_ids=torch.tensor([2]),
+                        labels=torch.tensor([2]),
+                        seq_lens=torch.tensor([1]),
+                        loss_mask=torch.ones(1),
+                    ),
+                    LossContext(loss_scale=0.25, source_batch=torch.tensor([[0.0]])),
+                ),
+            ]
+        ),
+        loss_fn,
+        2,
+    )
+
+    batch, context = split_loss_context(next(prepared.data))
+    scaled_loss, _metrics = prepared.loss(
+        {"values": torch.tensor([[1.0]])}, batch, context
+    )
+
+    # correction=8, schedule_scale=1/2, replica_scale=2: all are non-unit.
+    assert torch.equal(scaled_loss, torch.tensor(24.0))
+    prepared.finish(require_complete=True)
+    assert collector[0]["loss"] == 24.0
+
+
 @pytest.mark.parametrize("with_context", [False, True])
 def test_dynamic_cp_missing_loss_mask_fails_before_normalization_can_degrade(
     monkeypatch, with_context
