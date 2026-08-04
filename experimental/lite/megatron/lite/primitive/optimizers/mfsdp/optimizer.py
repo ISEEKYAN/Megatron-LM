@@ -356,7 +356,14 @@ def build_mfsdp_stack(
     )
     opt = engine_cfg.optimizer
     classifier = is_expert or (lambda _name: False)
+    offload_fraction = float(getattr(opt, "offload_fraction", 0.0) or 0.0)
+    if not math.isfinite(offload_fraction) or not 0.0 <= offload_fraction <= 1.0:
+        raise ValueError(
+            f"M-FSDP offload_fraction must be in [0, 1], got {offload_fraction}."
+        )
     config = build_mfsdp_config(opt)
+    if offload_fraction == 1.0:
+        config = replace(config, full_optimizer_offload=True)
     config = _order_param_gathers_for_parallel_collectives(config, ps)
     groups = build_mfsdp_process_groups(ps)
 
@@ -384,12 +391,6 @@ def build_mfsdp_stack(
         weight_decay=float(getattr(opt, "weight_decay", 0.01)),
         apply_wd_to_qk_layernorm=bool(getattr(opt, "apply_wd_to_qk_layernorm", False)),
     )
-    offload_fraction = float(getattr(opt, "offload_fraction", 0.0) or 0.0)
-    if not math.isfinite(offload_fraction) or not 0.0 <= offload_fraction <= 1.0:
-        raise ValueError(
-            f"M-FSDP offload_fraction must be in [0, 1], got {offload_fraction}."
-        )
-
     if offload_fraction > 0.0:
         optimizer_name = str(getattr(opt, "optimizer", "adam")).lower()
         if optimizer_name != "adam":
@@ -420,7 +421,7 @@ def build_mfsdp_stack(
             total_numel = sum(p.numel() for p in params)
             logger.info(
                 "M-FSDP CPU optimizer offload: %.1f%% of parameter elements "
-                "(%d / %d) use CPU Adam; exp_avg + exp_avg_sq moved off GPU.",
+                "(%d / %d) use CPU Adam; FP32 master and Adam moments live on CPU.",
                 100.0 * cpu_numel / max(total_numel, 1),
                 cpu_numel,
                 total_numel,

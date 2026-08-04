@@ -97,9 +97,33 @@ class CpuAdamGroup:
             cpu_param.grad = None
 
     def state_dict(self) -> dict[str, Any]:
-        return self._cpu_optimizer.state_dict()
+        return {
+            "optimizer": self._cpu_optimizer.state_dict(),
+            "master_params": [param.detach().clone() for param in self._cpu_params],
+        }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self._cpu_optimizer.load_state_dict(state_dict)
-        for gpu_param, cpu_param in zip(self._gpu_params, self._cpu_params):
-            cpu_param.data.copy_(gpu_param.data.view(-1).cpu())
+        optimizer_state = state_dict.get("optimizer", state_dict)
+        self._cpu_optimizer.load_state_dict(optimizer_state)
+        master_params = state_dict.get("master_params")
+        if master_params is not None and len(master_params) != len(self._cpu_params):
+            raise ValueError(
+                "M-FSDP CPU optimizer checkpoint master parameter count does not "
+                f"match: expected {len(self._cpu_params)}, got {len(master_params)}."
+            )
+        with torch.no_grad():
+            for index, (gpu_param, cpu_param) in enumerate(
+                zip(self._gpu_params, self._cpu_params)
+            ):
+                if master_params is None:
+                    cpu_param.copy_(gpu_param.detach().view(-1).cpu())
+                else:
+                    saved = master_params[index]
+                    if saved.shape != cpu_param.shape:
+                        raise ValueError(
+                            "M-FSDP CPU optimizer checkpoint master parameter shape "
+                            f"does not match at index {index}: expected "
+                            f"{tuple(cpu_param.shape)}, got {tuple(saved.shape)}."
+                        )
+                    cpu_param.copy_(saved)
+                gpu_param.view(-1).copy_(cpu_param.to(dtype=gpu_param.dtype))

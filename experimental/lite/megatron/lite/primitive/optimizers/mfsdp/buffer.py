@@ -323,9 +323,12 @@ class ParamBucket:
         )
         self.device = specs[0].full_param.device
         compute_dtype = specs[0].full_param.dtype
+        main_params_dtype = (
+            compute_dtype if config.full_optimizer_offload else config.main_params_dtype
+        )
         self.policy = MixedPrecisionPolicy(
             compute_dtype=compute_dtype,
-            main_params_dtype=config.main_params_dtype,
+            main_params_dtype=main_params_dtype,
             main_grads_dtype=config.main_grads_dtype,
             grad_comm_dtype=config.grad_comm_dtype,
         )
@@ -364,10 +367,14 @@ class ParamBucket:
             device=self.device,
         )
         self.grad_shard_buffer = self.main_grad_buffer
-        self.local_compute_buffer = torch.empty(
-            self.local_numel,
-            dtype=self.policy.compute_dtype,
-            device=self.device,
+        self.local_compute_buffer = (
+            self.main_param_buffer
+            if self.policy.main_params_dtype == self.policy.compute_dtype
+            else torch.empty(
+                self.local_numel,
+                dtype=self.policy.compute_dtype,
+                device=self.device,
+            )
         )
         self.local_grad_comm_buffer = (
             self.main_grad_buffer
@@ -411,6 +418,8 @@ class ParamBucket:
                 )
                 _copy_parameter_metadata(spec.full_param, shard_param)
                 shard_param._mfsdp_original_ndim = spec.full_param.ndim
+                if shard_param.dtype != self.policy.main_grads_dtype:
+                    shard_param.grad_dtype = self.policy.main_grads_dtype
                 spec.shard_param = shard_param
                 spec.full_param.register_post_accumulate_grad_hook(
                     self._make_grad_ready_hook(spec)
@@ -446,7 +455,8 @@ class ParamBucket:
                 ),
             )
             self.full_buffer = self._full_lease.tensor
-        self.local_compute_buffer.copy_(self.main_param_buffer)
+        if self.local_compute_buffer is not self.main_param_buffer:
+            self.local_compute_buffer.copy_(self.main_param_buffer)
         return self.full_buffer, self.local_compute_buffer
 
     def mark_param_gather_launched(self, work: Any | None) -> None:
@@ -511,11 +521,16 @@ class ParamBucket:
             id(spec): spec.shard_param is not None and spec.shard_param.grad is not None
             for spec in self.specs
         }
+        compute_shares_main = self.local_compute_buffer is self.main_param_buffer
         self.main_param_buffer = self.main_param_buffer.to(device)
         grad_comm_shares_main = self.local_grad_comm_buffer is self.main_grad_buffer
         self.main_grad_buffer = self.main_grad_buffer.to(device)
         self.grad_shard_buffer = self.main_grad_buffer
-        self.local_compute_buffer = self.local_compute_buffer.to(device)
+        self.local_compute_buffer = (
+            self.main_param_buffer
+            if compute_shares_main
+            else self.local_compute_buffer.to(device)
+        )
         self.local_grad_comm_buffer = (
             self.main_grad_buffer
             if grad_comm_shares_main

@@ -808,6 +808,73 @@ def test_mfsdp_offload_fraction_keeps_optimizer_state_on_cpu():
         assert gpu_param.device.type != "cuda" or gpu_param.data is not None
 
 
+def test_mfsdp_full_offload_has_six_gpu_and_twelve_cpu_bytes_per_param():
+    _Model, _Unit, ps, engine_cfg = _build_offload_stack(offload_fraction=1.0)
+
+    torch.manual_seed(43)
+    model = _Model().to(dtype=torch.bfloat16)
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+
+    value = torch.randn(3, 4, dtype=torch.bfloat16)
+    target = torch.randn(3, 2, dtype=torch.bfloat16)
+    optimizer.zero_grad()
+    torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+    optimizer.finish_grad_sync()
+    success, _grad_norm, _ = optimizer.step()
+    assert success
+
+    inner = optimizer._inner_optimizer
+    cpu_group = inner.cpu_group
+    assert cpu_group is not None
+    total_numel = sum(param.numel() for param in inner.params)
+    buckets = [bucket for chunk in chunks for bucket in chunk.param_sync.buckets]
+    assert all(
+        bucket.local_compute_buffer is bucket.main_param_buffer for bucket in buckets
+    )
+
+    gpu_param_bytes = sum(
+        param.numel() * param.element_size() for param in inner.params
+    )
+    gpu_main_grad_bytes = sum(
+        param.grad.numel() * param.grad.element_size()
+        for param in inner.params
+        if param.grad is not None
+    )
+    cpu_master_bytes = sum(
+        param.numel() * param.element_size() for param in cpu_group._cpu_params
+    )
+    cpu_exp_avg_bytes = sum(
+        cpu_group._cpu_optimizer.state[param]["exp_avg"].numel()
+        * cpu_group._cpu_optimizer.state[param]["exp_avg"].element_size()
+        for param in cpu_group._cpu_params
+    )
+    cpu_exp_avg_sq_bytes = sum(
+        cpu_group._cpu_optimizer.state[param]["exp_avg_sq"].numel()
+        * cpu_group._cpu_optimizer.state[param]["exp_avg_sq"].element_size()
+        for param in cpu_group._cpu_params
+    )
+
+    assert all(param.dtype == torch.bfloat16 for param in inner.params)
+    assert all(
+        param.grad is not None and param.grad.dtype == torch.float32
+        for param in inner.params
+    )
+    assert all(
+        param.device.type == "cpu" and param.dtype == torch.float32
+        for param in cpu_group._cpu_params
+    )
+    assert gpu_param_bytes + gpu_main_grad_bytes == 6 * total_numel
+    assert cpu_master_bytes == 4 * total_numel
+    assert cpu_exp_avg_bytes == 4 * total_numel
+    assert cpu_exp_avg_sq_bytes == 4 * total_numel
+
+
 def test_mfsdp_offload_fraction_numerically_matches_no_offload():
     _Model, _Unit, ps, engine_cfg_offload = _build_offload_stack(offload_fraction=1.0)
     _, _, _, engine_cfg_gpu = _build_offload_stack(offload_fraction=0.0)
@@ -989,11 +1056,27 @@ def test_mfsdp_offload_fraction_checkpoint_round_trips():
     optimizer.finish_grad_sync()
     optimizer.step()
 
-    saved = optimizer.state_dict()
+    saved = copy.deepcopy(optimizer.state_dict())
     assert "gpu" in saved
     assert "cpu" in saved
+    assert "master_params" in saved["cpu"]
+
+    cpu_group = optimizer._inner_optimizer.cpu_group
+    assert cpu_group is not None
+    expected_masters = [
+        param.detach().clone() for param in saved["cpu"]["master_params"]
+    ]
+    with torch.no_grad():
+        for cpu_param, gpu_param in zip(cpu_group._cpu_params, cpu_group._gpu_params):
+            cpu_param.add_(17.0)
+            gpu_param.add_(23.0)
 
     optimizer.load_state_dict(saved)
+    for cpu_param, gpu_param, expected in zip(
+        cpu_group._cpu_params, cpu_group._gpu_params, expected_masters
+    ):
+        assert torch.equal(cpu_param, expected)
+        assert torch.equal(gpu_param, expected.to(dtype=gpu_param.dtype))
 
     optimizer.zero_grad()
     torch.nn.functional.mse_loss(chunks[0](value), target).backward()

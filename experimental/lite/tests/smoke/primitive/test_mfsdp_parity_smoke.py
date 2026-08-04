@@ -357,6 +357,58 @@ def _mfsdp_cpu_master_devices(optimizer: Any) -> list[str]:
     return sorted({param.device.type for param in cpu_params})
 
 
+def _tensor_role(tensors: list[torch.Tensor]) -> dict[str, Any]:
+    assert tensors
+    devices = sorted({tensor.device.type for tensor in tensors})
+    dtypes = sorted({str(tensor.dtype) for tensor in tensors})
+    numel = sum(tensor.numel() for tensor in tensors)
+    return {
+        "devices": devices,
+        "dtypes": dtypes,
+        "numel": numel,
+        "bytes": sum(tensor.numel() * tensor.element_size() for tensor in tensors),
+    }
+
+
+def _mfsdp_optimizer_byte_ledger(chunks, optimizer: Any) -> dict[str, Any]:
+    inner = optimizer._inner_optimizer
+    buckets = [bucket for chunk in chunks for bucket in chunk.param_sync.buckets]
+    cpu_group = inner.cpu_group
+    param_tensors = [bucket.local_compute_buffer for bucket in buckets]
+    main_grad_tensors = [bucket.main_grad_buffer for bucket in buckets]
+    if cpu_group is None:
+        master_tensors = [bucket.main_param_buffer for bucket in buckets]
+        exp_avg_tensors = [
+            state["exp_avg"]
+            for state in inner.optimizer.state.values()
+            if "exp_avg" in state
+        ]
+        exp_avg_sq_tensors = [
+            state["exp_avg_sq"]
+            for state in inner.optimizer.state.values()
+            if "exp_avg_sq" in state
+        ]
+    else:
+        master_tensors = list(cpu_group._cpu_params)
+        exp_avg_tensors = [
+            state["exp_avg"]
+            for state in cpu_group._cpu_optimizer.state.values()
+            if "exp_avg" in state
+        ]
+        exp_avg_sq_tensors = [
+            state["exp_avg_sq"]
+            for state in cpu_group._cpu_optimizer.state.values()
+            if "exp_avg_sq" in state
+        ]
+    return {
+        "param": _tensor_role(param_tensors),
+        "main_grad": _tensor_role(main_grad_tensors),
+        "master": _tensor_role(master_tensors),
+        "exp_avg": _tensor_role(exp_avg_tensors),
+        "exp_avg_sq": _tensor_role(exp_avg_sq_tensors),
+    }
+
+
 def _profiled_train_step(chunks, optimizer, finalize, x, target):
     optimizer.zero_grad()
     torch.cuda.synchronize()
@@ -450,6 +502,11 @@ def _run_offload_arm(
         ),
         "optimizer_tensor_devices": _optimizer_tensor_devices(optimizer),
         "cpu_master_devices": _mfsdp_cpu_master_devices(optimizer),
+        "optimizer_byte_ledger": (
+            _mfsdp_optimizer_byte_ledger(chunks, optimizer)
+            if backend == "mfsdp"
+            else None
+        ),
         "params": params,
     }
     del optimizer, chunks
@@ -968,6 +1025,28 @@ def test_mfsdp_offload_matrix_matches_fsdp2_precision_speed_and_memory():
             if backend == "mfsdp":
                 assert optimizer_off["cpu_master_devices"] == []
                 assert optimizer_on["cpu_master_devices"] == ["cpu"]
+                off_ledger = optimizer_off["optimizer_byte_ledger"]
+                on_ledger = optimizer_on["optimizer_byte_ledger"]
+                assert off_ledger["param"]["devices"] == ["cuda"]
+                assert off_ledger["param"]["dtypes"] == ["torch.bfloat16"]
+                assert off_ledger["main_grad"]["devices"] == ["cuda"]
+                assert off_ledger["main_grad"]["dtypes"] == ["torch.float32"]
+                for role in ("master", "exp_avg", "exp_avg_sq"):
+                    assert off_ledger[role]["devices"] == ["cuda"]
+                    assert off_ledger[role]["dtypes"] == ["torch.float32"]
+                    assert on_ledger[role]["devices"] == ["cpu"]
+                    assert on_ledger[role]["dtypes"] == ["torch.float32"]
+                assert on_ledger["param"]["devices"] == ["cuda"]
+                assert on_ledger["param"]["dtypes"] == ["torch.bfloat16"]
+                assert on_ledger["main_grad"]["devices"] == ["cuda"]
+                assert on_ledger["main_grad"]["dtypes"] == ["torch.float32"]
+                for ledger in (off_ledger, on_ledger):
+                    assert ledger["param"]["bytes"] == 2 * ledger["param"]["numel"]
+                    assert ledger["main_grad"]["bytes"] == (
+                        4 * ledger["main_grad"]["numel"]
+                    )
+                    for role in ("master", "exp_avg", "exp_avg_sq"):
+                        assert ledger[role]["bytes"] == 4 * ledger[role]["numel"]
         for optimizer_offload in (False, True):
             activation_off = matrix[(backend, optimizer_offload, False)]
             activation_on = matrix[(backend, optimizer_offload, True)]

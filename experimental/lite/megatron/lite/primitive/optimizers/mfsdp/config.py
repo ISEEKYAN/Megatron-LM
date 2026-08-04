@@ -40,6 +40,7 @@ class MFSDPConfig:
     main_params_dtype: torch.dtype = torch.float32
     main_grads_dtype: torch.dtype = torch.float32
     grad_comm_dtype: torch.dtype = torch.float32
+    full_optimizer_offload: bool = False
     nccl_ub: bool = False
     fsdp_double_buffer: bool = True
     disable_symmetric_registration: bool = False
