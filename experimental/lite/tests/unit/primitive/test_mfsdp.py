@@ -52,6 +52,44 @@ class _DirectParamModel(torch.nn.Module):
         return torch.nn.functional.linear(hidden, self.projection.weight)
 
 
+class _FusedMainGradLinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, weight, fuse_wgrad_accumulation):
+        ctx.save_for_backward(value, weight)
+        ctx.weight = weight
+        ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+        return torch.nn.functional.linear(value, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        value, weight = ctx.saved_tensors
+        grad_input = grad_output.matmul(weight)
+        grad_weight = grad_output.float().reshape(-1, grad_output.shape[-1]).t().matmul(
+            value.float().reshape(-1, value.shape[-1])
+        )
+        if ctx.fuse_wgrad_accumulation:
+            ctx.weight.main_grad.add_(grad_weight)
+            ctx.weight.grad_added_to_main_grad = True
+            grad_weight = torch.zeros_like(weight)
+        return grad_input, grad_weight, None
+
+
+class _FusedMainGradLinear(torch.nn.Module):
+    """CPU stand-in for TE's dynamic ``weight.main_grad`` backward contract."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(4, 4, dtype=torch.bfloat16))
+        self.fuse_wgrad_accumulation = False
+
+    def forward(self, value):
+        return _FusedMainGradLinearFunction.apply(
+            value,
+            self.weight,
+            self.fuse_wgrad_accumulation,
+        )
+
+
 def _optimizer_params(optimizer) -> list[torch.nn.Parameter]:
     return optimizer._inner_optimizer.params
 
@@ -1410,6 +1448,93 @@ def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
     assert all(param.dtype is torch.float32 for param in optimizer_params)
     assert any(not torch.equal(old, new) for old, new in zip(before, optimizer_params))
     assert torch.isfinite(chunks[0](value).float()).all()
+
+
+def test_mfsdp_routes_fused_wgrad_through_bucketed_fp32_main_grad():
+    model = _FusedMainGradLinear()
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        etp_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="sgd",
+        lr=0.0,
+        weight_decay=0.0,
+        clip_grad=0.0,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
+            optimizer=opt,
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_FusedMainGradLinear,),
+    )
+
+    chunk = chunks[0]
+    bucket = chunk.param_sync.buckets[0]
+    optimizer.zero_grad()
+    value = torch.randn(8, 4, dtype=torch.bfloat16)
+    chunk(value).float().sum().backward()
+
+    spec = bucket.specs[0]
+    assert model.fuse_wgrad_accumulation is True
+    assert spec.full_param.grad_added_to_main_grad is True
+    assert spec.full_param.main_grad.dtype is torch.float32
+    assert spec.full_param.main_grad.untyped_storage().data_ptr() == (
+        bucket.full_main_grad_buffer.untyped_storage().data_ptr()
+    )
+    assert not torch.equal(
+        spec.full_param.main_grad,
+        spec.full_param.main_grad.to(torch.bfloat16).to(torch.float32),
+    )
+    first_main_grad = spec.full_param.main_grad.detach().clone()
+    main_grad_storage = spec.full_param.main_grad.untyped_storage().data_ptr()
+
+    second_value = torch.randn(8, 4, dtype=torch.bfloat16)
+    chunk(second_value).float().sum().backward()
+    second_expected = second_value.float().sum(dim=0).repeat(4, 1)
+    assert spec.full_param.main_grad.untyped_storage().data_ptr() == main_grad_storage
+    assert torch.equal(spec.full_param.main_grad, first_main_grad + second_expected)
+    expected_main_grad = spec.full_param.main_grad.detach().reshape(-1).clone()
+
+    optimizer.finish_grad_sync()
+    consumed_grad = _optimizer_params(optimizer)[0].grad
+    assert consumed_grad is not None
+    assert consumed_grad.dtype is torch.float32
+    assert torch.equal(consumed_grad, expected_main_grad)
+    assert not torch.equal(
+        consumed_grad,
+        consumed_grad.to(torch.bfloat16).to(torch.float32),
+    )
+
+
+def test_mfsdp_keeps_regular_autograd_grad_as_main_grad_fallback():
+    chunk, optimizer = _single_rank_mfsdp_stack()
+    optimizer.zero_grad()
+    value = torch.randn(3, 4)
+    chunk(value).square().mean().backward()
+    expected = {
+        spec.name: spec.full_param.grad.detach().float().clone()
+        for bucket in chunk.param_sync.buckets
+        for spec in bucket.specs
+    }
+
+    optimizer.finish_grad_sync()
+
+    for name, shard in _optimizer_named_shards(optimizer).items():
+        assert shard.grad is not None
+        assert torch.equal(shard.grad.reshape(-1), expected[name].reshape(-1))
 
 
 def _run_mfsdp_gloo_parity(rank: int, world_size: int, init_file: str) -> None:

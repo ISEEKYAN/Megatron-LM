@@ -379,7 +379,13 @@ class ParamBucket:
             )
         )
         self.full_buffer = torch.empty(0, dtype=compute_dtype, device=self.device)
+        self.full_main_grad_buffer = torch.empty(
+            0,
+            dtype=self.policy.main_grads_dtype,
+            device=self.device,
+        )
         self._full_lease: BufferLease | None = None
+        self._full_main_grad_lease: BufferLease | None = None
         self._grad_lease: BufferLease | None = None
         self._param_gather_work: Any | None = None
         self._grad_reduce_work: Any | None = None
@@ -412,6 +418,9 @@ class ParamBucket:
                 _copy_parameter_metadata(spec.full_param, shard_param)
                 shard_param._mfsdp_original_ndim = spec.full_param.ndim
                 spec.shard_param = shard_param
+                # TE returns a dummy ``.grad`` when its wgrad GEMM writes the
+                # real gradient directly into ``main_grad``.
+                spec.full_param.grad_added_to_main_grad = False
                 spec.full_param.register_post_accumulate_grad_hook(
                     self._make_grad_ready_hook(spec)
                 )
@@ -431,6 +440,39 @@ class ParamBucket:
             spec.full_param.data = view
             for binding in spec.bindings:
                 setattr(binding.module, binding.attribute, spec.full_param)
+
+    def prepare_main_grads(self) -> None:
+        """Attach bounded FP32 views for fused wgrad accumulation."""
+        if self._full_main_grad_lease is None:
+            self._full_main_grad_lease = self.allocator.allocate(
+                self.full_numel,
+                dtype=self.policy.main_grads_dtype,
+                device=self.device,
+                group=self.process_group,
+                key=(
+                    "main_grad",
+                    id(self.process_group),
+                    self.allocator_layout_key,
+                ),
+            )
+            self.full_main_grad_buffer = self._full_main_grad_lease.tensor
+            self.full_main_grad_buffer.zero_()
+        for spec in self.specs:
+            spec.full_param.main_grad = self.full_main_grad_buffer.narrow(
+                0, spec.full_offset, spec.numel
+            ).view(spec.shape)
+
+    def _release_full_main_grads(self) -> None:
+        if self._full_main_grad_lease is not None:
+            self._full_main_grad_lease.release()
+            self._full_main_grad_lease = None
+        self.full_main_grad_buffer = torch.empty(
+            0,
+            dtype=self.policy.main_grads_dtype,
+            device=self.device,
+        )
+        for spec in self.specs:
+            spec.full_param.main_grad = self.full_main_grad_buffer
 
     def prepare_param_gather(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._full_lease is None:
@@ -505,6 +547,8 @@ class ParamBucket:
         self.discard_full_parameter_views()
         if self._grad_reduce_launched:
             self.wait_grad_reduce()
+        else:
+            self._release_full_main_grads()
         self.allocator.release_cached()
 
         grad_present = {
@@ -525,6 +569,11 @@ class ParamBucket:
         self.full_buffer = torch.empty(
             0,
             dtype=self.policy.compute_dtype,
+            device=device,
+        )
+        self.full_main_grad_buffer = torch.empty(
+            0,
+            dtype=self.policy.main_grads_dtype,
             device=device,
         )
 
@@ -563,6 +612,8 @@ class ParamBucket:
         self.discard_full_parameter_views()
         if self._grad_reduce_launched:
             self.wait_grad_reduce()
+        else:
+            self._release_full_main_grads()
         self.allocator.release_cached()
 
     def prepare_grad_reduce(
@@ -573,23 +624,27 @@ class ParamBucket:
         if not force and len(self._grad_ready_ids) != len(self.specs):
             return None
         self._grad_reduce_launched = True
-        self._grad_lease = self.allocator.allocate(
-            self.full_numel,
-            dtype=self.policy.grad_comm_dtype,
-            device=self.device,
-            group=self.process_group,
-            key=(
-                "grad",
-                id(self.process_group),
-                self.allocator_layout_key,
-            ),
-        )
-        grad_input = self._grad_lease.tensor
-        grad_input.zero_()
+        self.prepare_main_grads()
+        if self.policy.grad_comm_dtype == self.policy.main_grads_dtype:
+            grad_input = self.full_main_grad_buffer
+        else:
+            self._grad_lease = self.allocator.allocate(
+                self.full_numel,
+                dtype=self.policy.grad_comm_dtype,
+                device=self.device,
+                group=self.process_group,
+                key=(
+                    "grad",
+                    id(self.process_group),
+                    self.allocator_layout_key,
+                ),
+            )
+            grad_input = self._grad_lease.tensor
+            grad_input.copy_(self.full_main_grad_buffer)
         with torch.no_grad():
             for spec in self.specs:
                 grad = spec.full_param.grad
-                if grad is not None:
+                if grad is not None and not spec.full_param.grad_added_to_main_grad:
                     grad_input.narrow(0, spec.full_offset, spec.numel).copy_(
                         grad.reshape(-1)
                     )
@@ -628,6 +683,7 @@ class ParamBucket:
         if self._grad_lease is not None:
             self._grad_lease.release()
             self._grad_lease = None
+        self._release_full_main_grads()
 
     def copy_full_parameters_to_shards(self) -> None:
         self.wait_param_gather()
@@ -646,8 +702,10 @@ class ParamBucket:
         self.main_grad_buffer.zero_()
         for spec in self.specs:
             spec.full_param.grad = None
+            spec.full_param.grad_added_to_main_grad = False
             if spec.shard_param is not None:
                 spec.shard_param.grad = None
+        self._release_full_main_grads()
 
     def set_grad_sync_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -982,6 +1040,7 @@ class AllGatherPipeline:
         bucket_id = bucket.bucket_id
         self.wait_bucket_ready(bucket_id, bwd=True)
         bucket.install_full_parameters()
+        bucket.prepare_main_grads()
         self._backward_cursor = min(self._backward_cursor, bucket_id - 1)
         if self.overlap and self._backward_cursor >= 0:
             self.async_bucket_gather(self._backward_cursor, bwd=True)
