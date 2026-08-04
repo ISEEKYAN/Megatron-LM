@@ -17,6 +17,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.optimizers.fsdp2 import (
     build_fsdp2_training_optimizer,
     fsdp2_available,
@@ -140,10 +141,46 @@ class TinyTEQwen3MoE(nn.Module):
         return self.out(x)
 
 
+class TinyTEGroupedExpertLayer(nn.Module):
+    def __init__(self, ps):
+        super().__init__()
+        config = SimpleNamespace(
+            num_experts=2,
+            hidden_size=8,
+            moe_intermediate_size=16,
+            swiglu_limit=0.0,
+        )
+        self.experts = Experts(config, ps)
+
+    def forward(self, x):
+        first_expert_tokens = x.shape[0] // 2
+        tokens_per_expert = torch.tensor(
+            [first_expert_tokens, x.shape[0] - first_expert_tokens],
+            device=x.device,
+            dtype=torch.int64,
+        )
+        return torch.tanh(self.experts(x, tokens_per_expert))
+
+
+class TinyTEGroupedMoE(nn.Module):
+    def __init__(self, ps):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [TinyTEGroupedExpertLayer(ps), TinyTEGroupedExpertLayer(ps)]
+        )
+        self.out = TinyTELinear(8, 4)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return self.out(x)
+
+
 class RecordingSGD(torch.optim.SGD):
     def __init__(self, param_groups):
         super().__init__(param_groups, lr=0.0)
         self.consumed_grad_groups: list[list[torch.Tensor]] = []
+        self.consumed_grad_by_param: dict[int, torch.Tensor] = {}
 
     def step(self, closure=None):
         self.consumed_grad_groups = [
@@ -154,6 +191,12 @@ class RecordingSGD(torch.optim.SGD):
             ]
             for group in self.param_groups
         ]
+        self.consumed_grad_by_param = {
+            id(param): param.grad.detach().clone()
+            for group in self.param_groups
+            for param in group["params"]
+            if param.grad is not None
+        }
         return super().step(closure)
 
 
@@ -741,6 +784,16 @@ def _is_tiny_expert(name: str) -> bool:
     return name.startswith("experts.")
 
 
+def _grouped_expert_key(name: str) -> str | None:
+    layer_name, marker, parameter_name = name.partition("experts.")
+    if not marker:
+        return None
+    weight_name = parameter_name.rsplit(".", 1)[-1]
+    if not weight_name.startswith("weight") or not weight_name[6:].isdigit():
+        return None
+    return f"{layer_name}expert{weight_name[6:]}"
+
+
 def test_mfsdp_native_fp32_fused_wgrad_reaches_optimizer_groups():
     parallel = _dense_parallel_config()
     ps = _parallel_state(parallel)
@@ -827,6 +880,114 @@ def test_mfsdp_native_fp32_fused_wgrad_reaches_optimizer_groups():
                     "world_size": dist.get_world_size(),
                     "bucket_count": len(chunk.param_sync.buckets),
                     "optimizer_group_count": len(optimizer.param_groups),
+                    "main_grad_low_bit_fractions": main_grad_fractions,
+                    "optimizer_grad_low_bit_fractions": optimizer_grad_fractions,
+                    "consumed_grad_low_bit_fractions": consumed_grad_fractions,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+
+def test_mfsdp_native_fp32_grouped_expert_wgrad_reaches_optimizer():
+    parallel = _dense_parallel_config()
+    ps = _parallel_state(parallel)
+    torch.manual_seed(9127)
+    torch.cuda.manual_seed_all(9127)
+    chunks = [TinyTEGroupedMoE(ps).cuda().to(torch.bfloat16)]
+    optimizer_config = _optimizer_cfg(use_fused_optimizer=False)
+    impl_cfg = SimpleNamespace(
+        parallel=parallel,
+        optimizer_config=optimizer_config,
+    )
+
+    def build_recording_optimizer(param_groups, _optimizer_config):
+        params = [param for group in param_groups for param in group["params"]]
+        return RecordingSGD(
+            [{"params": [param], "weight_decay": 0.0} for param in params]
+        )
+
+    optimizer, finalize = build_mfsdp_training_optimizer(
+        chunks,
+        impl_cfg=impl_cfg,
+        ps=ps,
+        is_expert=lambda name: "experts." in name,
+        fsdp_unit_modules=(TinyTEGroupedExpertLayer,),
+        optimizer_factory=build_recording_optimizer,
+    )
+    chunk = chunks[0]
+    grouped_linear_modules = [
+        module for module in chunk.modules() if type(module).__name__ == "GroupedLinear"
+    ]
+    assert len(grouped_linear_modules) == 4
+    assert all(module.fuse_wgrad_accumulation for module in grouped_linear_modules)
+
+    expert_specs = {}
+    for bucket in chunk.param_sync.buckets:
+        for spec in bucket.specs:
+            expert_key = _grouped_expert_key(spec.name)
+            if expert_key is not None:
+                expert_specs.setdefault(expert_key, []).append(spec)
+    assert len(expert_specs) == 4
+    assert all(len(specs) == 2 for specs in expert_specs.values())
+
+    optimizer.zero_grad()
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(9131 + dist.get_rank())
+    value = torch.randn(
+        64,
+        8,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    chunk(value).float().square().mean().backward()
+
+    main_grad_fractions = {}
+    for expert_key, specs in expert_specs.items():
+        main_grads = []
+        for spec in specs:
+            assert spec.shard_param is not None
+            assert spec.full_param.grad_added_to_main_grad is True
+            assert spec.full_param.main_grad.dtype is torch.float32
+            assert spec.full_param.grad is None
+            main_grads.append(spec.full_param.main_grad)
+        main_grad_fractions[expert_key] = _bf16_roundtrip_difference_fraction(
+            main_grads
+        )
+
+    finalize()
+    optimizer_grad_fractions = {
+        expert_key: _bf16_roundtrip_difference_fraction(
+            [spec.shard_param.grad for spec in specs]
+        )
+        for expert_key, specs in expert_specs.items()
+    }
+    success, _grad_norm, _num_zeros = optimizer.step()
+    recording_optimizer = optimizer._inner_optimizer.optimizer
+    consumed_grad_fractions = {
+        expert_key: _bf16_roundtrip_difference_fraction(
+            [
+                recording_optimizer.consumed_grad_by_param[id(spec.shard_param)]
+                for spec in specs
+            ]
+        )
+        for expert_key, specs in expert_specs.items()
+    }
+
+    assert success
+    assert all(fraction > 0.0 for fraction in main_grad_fractions.values())
+    assert all(fraction > 0.0 for fraction in optimizer_grad_fractions.values())
+    assert all(fraction > 0.0 for fraction in consumed_grad_fractions.values())
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_NATIVE_FP32_GROUPED_EXPERT_WGRAD] "
+            + json.dumps(
+                {
+                    "world_size": dist.get_world_size(),
+                    "expert_group_count": len(expert_specs),
+                    "grouped_linear_count": len(grouped_linear_modules),
                     "main_grad_low_bit_fractions": main_grad_fractions,
                     "optimizer_grad_low_bit_fractions": optimizer_grad_fractions,
                     "consumed_grad_low_bit_fractions": consumed_grad_fractions,
