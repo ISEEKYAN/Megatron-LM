@@ -12,7 +12,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 from megatron.lite.primitive.optimizers.fsdp2.adamw import (
     all_reduce_grad_,
     build_adamw_optimizer,
@@ -85,7 +84,9 @@ class FSDP2Optimizer:
         self.clip_grad = float(clip_grad)
         self.grad_norm_accum_dtype = resolve_torch_dtype(grad_norm_accum_dtype)
         self.replicated_grad_params = list(replicated_grad_params or ())
-        self._replicated_grad_param_ids = {id(param) for param in self.replicated_grad_params}
+        self._replicated_grad_param_ids = {
+            id(param) for param in self.replicated_grad_params
+        }
         self.replicated_grad_sync_group = replicated_grad_sync_group
         self.replicated_grad_sync_divisor = replicated_grad_sync_divisor
         self.replicated_grad_norm_group = replicated_grad_norm_group
@@ -94,11 +95,15 @@ class FSDP2Optimizer:
             id(param) for param in self.expert_sharded_grad_params
         }
         self.expert_sharded_grad_scale = (
-            1.0 if expert_sharded_grad_scale is None else float(expert_sharded_grad_scale)
+            1.0
+            if expert_sharded_grad_scale is None
+            else float(expert_sharded_grad_scale)
         )
         self.expert_sharded_grad_norm_group = expert_sharded_grad_norm_group
         self.tp_replicated_grad_params = list(tp_replicated_grad_params or ())
-        self._tp_replicated_grad_param_ids = {id(param) for param in self.tp_replicated_grad_params}
+        self._tp_replicated_grad_param_ids = {
+            id(param) for param in self.tp_replicated_grad_params
+        }
         self.tp_replicated_grad_sync_group = tp_replicated_grad_sync_group
         self._cpu_offloaded_state: dict[tuple[int, str], OffloadedStateEntry] = {}
         self.grad_sync_enabled = False
@@ -148,7 +153,11 @@ class FSDP2Optimizer:
         group = self.tp_replicated_grad_sync_group
         if not self.tp_replicated_grad_params:
             return
-        if group is None or not dist.is_initialized() or dist.get_world_size(group) <= 1:
+        if (
+            group is None
+            or not dist.is_initialized()
+            or dist.get_world_size(group) <= 1
+        ):
             return
         for param in self.tp_replicated_grad_params:
             grad = param.grad
@@ -170,7 +179,9 @@ class FSDP2Optimizer:
             | self._expert_sharded_grad_param_ids
         )
         sharded_params = [
-            param for param in self.params if id(param) not in excluded_sharded_param_ids
+            param
+            for param in self.params
+            if id(param) not in excluded_sharded_param_ids
         ]
         dtensor_sharded_params = [
             param for param in sharded_params if has_dtensor_grad_or_param(param)
@@ -194,7 +205,9 @@ class FSDP2Optimizer:
             and dist.is_initialized()
             and dist.get_world_size(plain_sharded_group) > 1
         ):
-            all_reduce_scalar_(plain_sharded_sq, op=dist.ReduceOp.SUM, group=plain_sharded_group)
+            all_reduce_scalar_(
+                plain_sharded_sq, op=dist.ReduceOp.SUM, group=plain_sharded_group
+            )
         total_sq = total_sq.to(plain_sharded_sq.device) + plain_sharded_sq
         if (
             self.ps is not None
@@ -220,7 +233,9 @@ class FSDP2Optimizer:
             and dist.get_world_size(self.replicated_grad_norm_group) > 1
         ):
             all_reduce_scalar_(
-                replicated_sq, op=dist.ReduceOp.SUM, group=self.replicated_grad_norm_group
+                replicated_sq,
+                op=dist.ReduceOp.SUM,
+                group=self.replicated_grad_norm_group,
             )
 
         expert_sharded_sq = sharded_grad_sq_sum(
@@ -270,7 +285,9 @@ class FSDP2Optimizer:
         )
 
     def load_state_to_device(self) -> None:
-        move_offloaded_optimizer_state_to_device(self.optimizer, self._cpu_offloaded_state)
+        move_offloaded_optimizer_state_to_device(
+            self.optimizer, self._cpu_offloaded_state
+        )
 
 
 def build_fsdp2_adamw(
@@ -368,10 +385,15 @@ def build_fsdp2_training_optimizer(
 
     expert_params = _collect_expert_params(model_chunks, ps, expert_classifier)
     expert_modules = _collect_expert_modules(
-        model_chunks, ps, expert_classifier, expert_module_leaf_name=expert_module_leaf_name
+        model_chunks,
+        ps,
+        expert_classifier,
+        expert_module_leaf_name=expert_module_leaf_name,
     )
     if expert_params and not expert_modules:
-        raise RuntimeError("FSDP2 expert parameters were found but no expert module was found.")
+        raise RuntimeError(
+            "FSDP2 expert parameters were found but no expert module was found."
+        )
 
     if opt is None:
         opt = SimpleNamespace(
@@ -390,12 +412,16 @@ def build_fsdp2_training_optimizer(
     effective_use_fp32_shards = (
         bool(use_fp32_shards)
         if use_fp32_shards is not None
-        else get_bool_opt(opt, "fsdp2_use_fp32_shards", default=_DEFAULT_USE_FP32_SHARDS)
+        else get_bool_opt(
+            opt, "fsdp2_use_fp32_shards", default=_DEFAULT_USE_FP32_SHARDS
+        )
     )
     effective_use_fp32_master = (
         bool(use_fp32_master)
         if use_fp32_master is not None
-        else get_bool_opt(opt, "fsdp2_use_fp32_master", default=_DEFAULT_USE_FP32_MASTER)
+        else get_bool_opt(
+            opt, "fsdp2_use_fp32_master", default=_DEFAULT_USE_FP32_MASTER
+        )
     )
 
     unit_reshard_after_forward = _fsdp2_unit_reshard_after_forward(
@@ -408,8 +434,12 @@ def build_fsdp2_training_optimizer(
         last_unit_reshard_after_forward=unit_reshard_after_forward,
         root_reshard_after_forward=False,
         wrap_root=wrap_root,
-        forward_prefetch_depth=_fsdp2_prefetch_depth(ps, default_depth=forward_prefetch_depth),
-        backward_prefetch_depth=_fsdp2_prefetch_depth(ps, default_depth=backward_prefetch_depth),
+        forward_prefetch_depth=_fsdp2_prefetch_depth(
+            ps, default_depth=forward_prefetch_depth
+        ),
+        backward_prefetch_depth=_fsdp2_prefetch_depth(
+            ps, default_depth=backward_prefetch_depth
+        ),
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
     )
@@ -420,16 +450,22 @@ def build_fsdp2_training_optimizer(
     else:
         model_param_dtypes = {}
 
-    tp_replicated_grad_param_names = _collect_tp_replicated_grad_param_names(model_chunks)
+    tp_replicated_grad_param_names = _collect_tp_replicated_grad_param_names(
+        model_chunks
+    )
 
     dense_shard_placement_fn = build_fsdp2_shard_placement_fn(ps.dp_cp_size)
     expert_shard_placement_fn = build_fsdp2_shard_placement_fn(ps.expert_dp_size)
 
     if expert_modules:
         if ps.ep_dp_group is None:
-            raise RuntimeError("FSDP2 expert sharding requires ParallelState.ep_dp_group.")
+            raise RuntimeError(
+                "FSDP2 expert sharding requires ParallelState.ep_dp_group."
+            )
         expert_mesh = build_fsdp2_process_group_mesh(
-            ps.ep_dp_group, mesh_dim_name="expert_dp", device_type=fsdp2_config.device_type
+            ps.ep_dp_group,
+            mesh_dim_name="expert_dp",
+            device_type=fsdp2_config.device_type,
         )
         for module in expert_modules:
             wrap_fsdp2_module(
@@ -462,11 +498,15 @@ def build_fsdp2_training_optimizer(
         ps,
         expert_sharded_grad_params=list(ignored_expert_params),
         expert_sharded_grad_scale=(
-            float(ps.expert_dp_size) / float(ps.dp_cp_size) if ignored_expert_params else None
+            float(ps.expert_dp_size) / float(ps.dp_cp_size)
+            if ignored_expert_params
+            else None
         ),
         expert_sharded_grad_norm_group=ps.ep_group if ignored_expert_params else None,
         tp_replicated_grad_params=tp_replicated_grad_params,
-        tp_replicated_grad_sync_group=ps.tp_group if tp_replicated_grad_params else None,
+        tp_replicated_grad_sync_group=(
+            ps.tp_group if tp_replicated_grad_params else None
+        ),
         grad_norm_accum_dtype="float32",
         adamw_foreach=False if deterministic else adamw_foreach,
         use_fp32_master=effective_use_fp32_master,
@@ -475,7 +515,9 @@ def build_fsdp2_training_optimizer(
 
 
 def _collect_expert_params(
-    chunks: Iterable[nn.Module], ps: ParallelState, expert_classifier: Callable[[str], bool] | None
+    chunks: Iterable[nn.Module],
+    ps: ParallelState,
+    expert_classifier: Callable[[str], bool] | None,
 ) -> set[nn.Parameter]:
     if ps.ep_size <= 1 or expert_classifier is None:
         return set()
@@ -519,12 +561,16 @@ def _collect_module_params(modules: Iterable[nn.Module]) -> set[nn.Parameter]:
     return {param for module in modules for param in module.parameters()}
 
 
-def _collect_model_param_dtypes(chunks: Iterable[nn.Module]) -> dict[tuple[int, str], torch.dtype]:
+def _collect_model_param_dtypes(
+    chunks: Iterable[nn.Module],
+) -> dict[tuple[int, str], torch.dtype]:
     return {
         (chunk_idx, name): param.dtype
         for chunk_idx, chunk in enumerate(chunks)
         for name, param in chunk.named_parameters()
-        if param.requires_grad and param.is_floating_point() and param.dtype != torch.float32
+        if param.requires_grad
+        and param.is_floating_point()
+        and param.dtype != torch.float32
     }
 
 
@@ -538,7 +584,9 @@ def _restore_model_param_dtypes(
                 param._fsdp2_model_param_dtype = model_dtype
 
 
-def _collect_tp_replicated_grad_param_names(chunks: Iterable[nn.Module]) -> list[tuple[int, str]]:
+def _collect_tp_replicated_grad_param_names(
+    chunks: Iterable[nn.Module],
+) -> list[tuple[int, str]]:
     names: list[tuple[int, str]] = []
     for chunk_idx, chunk in enumerate(chunks):
         sp_param_ids = {id(param) for param in getattr(chunk, "sp_params", ())}
@@ -595,7 +643,9 @@ def _build_adamw_param_groups(
     weight_decay: float,
     apply_wd_to_qk_layernorm: bool,
     model_param_dtypes: dict[tuple[int, str], torch.dtype] | None = None,
-) -> tuple[list[nn.Parameter], list[dict[str, Any]], dict[int, str], dict[int, torch.dtype]]:
+) -> tuple[
+    list[nn.Parameter], list[dict[str, Any]], dict[int, str], dict[int, torch.dtype]
+]:
     params: list[nn.Parameter] = []
     decay_params: list[nn.Parameter] = []
     no_decay_params: list[nn.Parameter] = []
@@ -626,9 +676,13 @@ def _build_adamw_param_groups(
     # 1D params and bias skip AdamW decay unless the Q/K layernorm override is set.
     param_groups: list[dict[str, Any]] = []
     if decay_params:
-        param_groups.append({"params": decay_params, "weight_decay": weight_decay, "wd_mult": 1.0})
+        param_groups.append(
+            {"params": decay_params, "weight_decay": weight_decay, "wd_mult": 1.0}
+        )
     if no_decay_params:
-        param_groups.append({"params": no_decay_params, "weight_decay": 0.0, "wd_mult": 0.0})
+        param_groups.append(
+            {"params": no_decay_params, "weight_decay": 0.0, "wd_mult": 0.0}
+        )
     return params, param_groups, param_names, param_model_dtypes
 
 
@@ -640,7 +694,10 @@ def _matches_megatron_no_weight_decay(
     if not apply_wd_to_qk_layernorm:
         return True
     return not (
-        "q_layernorm." in name or "k_layernorm." in name or "q_norm." in name or "k_norm." in name
+        "q_layernorm." in name
+        or "k_layernorm." in name
+        or "q_norm." in name
+        or "k_norm." in name
     )
 
 
