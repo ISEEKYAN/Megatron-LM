@@ -739,6 +739,8 @@ class ParamBucket:
             if param.grad is None:
                 return
             self._grad_ready_ids.add(id(spec))
+            if param.grad_added_to_main_grad:
+                param.grad = None
             if len(self._grad_ready_ids) != len(self.specs):
                 return
             if self.grad_sync_enabled and self.grad_ready_callback is not None:

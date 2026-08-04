@@ -64,8 +64,11 @@ class _FusedMainGradLinearFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         value, weight = ctx.saved_tensors
         grad_input = grad_output.matmul(weight)
-        grad_weight = grad_output.float().reshape(-1, grad_output.shape[-1]).t().matmul(
-            value.float().reshape(-1, value.shape[-1])
+        grad_weight = (
+            grad_output.float()
+            .reshape(-1, grad_output.shape[-1])
+            .t()
+            .matmul(value.float().reshape(-1, value.shape[-1]))
         )
         if ctx.fuse_wgrad_accumulation:
             ctx.weight.main_grad.add_(grad_weight)
@@ -1490,6 +1493,7 @@ def test_mfsdp_routes_fused_wgrad_through_bucketed_fp32_main_grad():
     spec = bucket.specs[0]
     assert model.fuse_wgrad_accumulation is True
     assert spec.full_param.grad_added_to_main_grad is True
+    assert spec.full_param.grad is None
     assert spec.full_param.main_grad.dtype is torch.float32
     assert spec.full_param.main_grad.untyped_storage().data_ptr() == (
         bucket.full_main_grad_buffer.untyped_storage().data_ptr()
@@ -1503,6 +1507,7 @@ def test_mfsdp_routes_fused_wgrad_through_bucketed_fp32_main_grad():
 
     second_value = torch.randn(8, 4, dtype=torch.bfloat16)
     chunk(second_value).float().sum().backward()
+    assert spec.full_param.grad is None
     second_expected = second_value.float().sum(dim=0).repeat(4, 1)
     assert spec.full_param.main_grad.untyped_storage().data_ptr() == main_grad_storage
     assert torch.equal(spec.full_param.main_grad, first_main_grad + second_expected)
