@@ -554,6 +554,9 @@ def _split_param_groups_by_fraction(
     offload_fraction: float,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split param groups so the first *offload_fraction* of numel goes to CPU."""
+    if offload_fraction == 1.0:
+        return [], [dict(group) for group in param_groups]
+
     total_numel = sum(p.numel() for g in param_groups for p in g["params"])
     cpu_numel_target = int(total_numel * offload_fraction)
 

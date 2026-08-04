@@ -958,6 +958,19 @@ def test_mfsdp_offload_fraction_partial_splits_by_numel():
     assert ratio <= 0.95, f"Expected some GPU params at fraction=0.5, got {ratio:.2%}"
 
 
+def test_mfsdp_full_offload_includes_trailing_empty_shards():
+    nonempty = torch.nn.Parameter(torch.ones(4))
+    trailing_empty = torch.nn.Parameter(torch.empty(0))
+
+    gpu_groups, cpu_groups = mfsdp_optimizer._split_param_groups_by_fraction(
+        [{"params": [nonempty, trailing_empty], "weight_decay": 0.0}],
+        1.0,
+    )
+
+    assert gpu_groups == []
+    assert cpu_groups[0]["params"] == [nonempty, trailing_empty]
+
+
 def test_mfsdp_offload_fraction_zero_has_no_cpu_group():
     _Model, _Unit, ps, engine_cfg = _build_offload_stack(offload_fraction=0.0)
 
