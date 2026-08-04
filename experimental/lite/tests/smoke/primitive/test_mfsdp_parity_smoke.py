@@ -100,6 +100,63 @@ class TinyParallelModel(nn.Module):
         return self.out(self.experts(hidden))
 
 
+class TinyTELinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        import transformer_engine.pytorch as te
+
+        self.linear = te.Linear(
+            in_features,
+            out_features,
+            bias=False,
+            params_dtype=torch.bfloat16,
+        )
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class TinyTETransformerLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dense = TinyTELinear(8, 8)
+        self.expert = TinyTELinear(8, 8)
+
+    def forward(self, x):
+        return torch.tanh(self.dense(x) + self.expert(x))
+
+
+class TinyTEQwen3MoE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [TinyTETransformerLayer(), TinyTETransformerLayer()]
+        )
+        self.out = TinyTELinear(8, 4)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return self.out(x)
+
+
+class RecordingSGD(torch.optim.SGD):
+    def __init__(self, param_groups):
+        super().__init__(param_groups, lr=0.0)
+        self.consumed_grad_groups: list[list[torch.Tensor]] = []
+
+    def step(self, closure=None):
+        self.consumed_grad_groups = [
+            [
+                param.grad.detach().clone()
+                for param in group["params"]
+                if param.grad is not None
+            ]
+            for group in self.param_groups
+        ]
+        return super().step(closure)
+
+
 class BenchmarkUnit(nn.Module):
     def __init__(self, hidden_size: int):
         super().__init__()
@@ -309,6 +366,14 @@ def _memory_triple() -> dict[str, float]:
             strict=True,
         )
     )
+
+
+def _bf16_roundtrip_difference_fraction(tensors: list[torch.Tensor]) -> float:
+    values = torch.cat([tensor.detach().float().reshape(-1) for tensor in tensors])
+    assert values.numel() > 0
+    rounded = values.to(torch.bfloat16).to(torch.float32)
+    assert not torch.equal(values, rounded)
+    return float((values != rounded).float().mean().item())
 
 
 def _memory_delta(
@@ -674,6 +739,102 @@ def _tp_ep_parallel_config() -> ParallelConfig:
 
 def _is_tiny_expert(name: str) -> bool:
     return name.startswith("experts.")
+
+
+def test_mfsdp_native_fp32_fused_wgrad_reaches_optimizer_groups():
+    parallel = _dense_parallel_config()
+    ps = _parallel_state(parallel)
+    chunks = [_new_model(7319, TinyTEQwen3MoE)]
+    optimizer_config = _optimizer_cfg(use_fused_optimizer=False)
+    impl_cfg = SimpleNamespace(
+        parallel=parallel,
+        optimizer_config=optimizer_config,
+    )
+
+    def build_recording_optimizer(param_groups, _optimizer_config):
+        params = [param for group in param_groups for param in group["params"]]
+        assert len(params) == 5
+        return RecordingSGD(
+            [
+                {"params": params[::2], "weight_decay": 0.0},
+                {"params": params[1::2], "weight_decay": 0.0},
+            ]
+        )
+
+    optimizer, finalize = build_mfsdp_training_optimizer(
+        chunks,
+        impl_cfg=impl_cfg,
+        ps=ps,
+        is_expert=lambda name: ".expert." in name,
+        fsdp_unit_modules=(TinyTETransformerLayer,),
+        optimizer_factory=build_recording_optimizer,
+    )
+    chunk = chunks[0]
+    assert len(chunk.param_sync.buckets) == 5
+    assert len(optimizer.param_groups) == 2
+
+    optimizer.zero_grad()
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(8107 + dist.get_rank())
+    value = torch.randn(
+        64,
+        8,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    chunk(value).float().square().mean().backward()
+
+    main_grad_by_shard = {}
+    for bucket in chunk.param_sync.buckets:
+        for spec in bucket.specs:
+            assert spec.shard_param is not None
+            assert spec.full_param.grad_added_to_main_grad is True
+            assert spec.full_param.main_grad.dtype is torch.float32
+            main_grad_by_shard[id(spec.shard_param)] = (
+                spec.full_param.main_grad.detach().clone()
+            )
+    main_grad_fractions = [
+        _bf16_roundtrip_difference_fraction(
+            [main_grad_by_shard[id(param)] for param in group["params"]]
+        )
+        for group in optimizer.param_groups
+    ]
+
+    finalize()
+    optimizer_grad_fractions = [
+        _bf16_roundtrip_difference_fraction(
+            [param.grad for param in group["params"] if param.grad is not None]
+        )
+        for group in optimizer.param_groups
+    ]
+    success, _grad_norm, _num_zeros = optimizer.step()
+    recording_optimizer = optimizer._inner_optimizer.optimizer
+    consumed_grad_fractions = [
+        _bf16_roundtrip_difference_fraction(group)
+        for group in recording_optimizer.consumed_grad_groups
+    ]
+
+    assert success
+    assert all(fraction > 0.0 for fraction in main_grad_fractions)
+    assert all(fraction > 0.0 for fraction in optimizer_grad_fractions)
+    assert all(fraction > 0.0 for fraction in consumed_grad_fractions)
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_NATIVE_FP32_WGRAD] "
+            + json.dumps(
+                {
+                    "world_size": dist.get_world_size(),
+                    "bucket_count": len(chunk.param_sync.buckets),
+                    "optimizer_group_count": len(optimizer.param_groups),
+                    "main_grad_low_bit_fractions": main_grad_fractions,
+                    "optimizer_grad_low_bit_fractions": optimizer_grad_fractions,
+                    "consumed_grad_low_bit_fractions": consumed_grad_fractions,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
 
 def test_mfsdp_precision_curve_matches_fsdp2():
