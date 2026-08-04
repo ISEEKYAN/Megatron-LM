@@ -830,12 +830,25 @@ class DynamicCPPlugin:
             extractor = getattr(
                 loss_fn, "runtime_output_extractor", lambda output: output
             )
+            output_loss_scale = float(
+                getattr(loss_fn, "runtime_output_loss_scale", 1.0)
+            )
             loss_fn.runtime_collects_outputs = collect_outputs
             schedule_scale = len(scheduled) / num_microbatches
 
             @wraps(loss_fn)
             def wrapped_loss(output, batch, *args, **kwargs):
                 loss, metrics = loss_fn(output, batch, *args, **kwargs)
+                if collect_outputs and bool(batch.extras[_GROUP_LEADER]):
+                    records.append(
+                        _record_output(
+                            output,
+                            batch,
+                            loss * output_loss_scale,
+                            metrics,
+                            extractor,
+                        )
+                    )
                 # DDP still reduces over the physical pool. A sample computed by
                 # K CP ranks is represented K times; N/K preserves logical-DP=1
                 # global-loss weighting across mixed subgroup sizes.
@@ -844,10 +857,6 @@ class DynamicCPPlugin:
                 if normalization is not None:
                     loss = loss * float(normalization)
                 scaled_loss = loss * schedule_scale * replica_scale
-                if collect_outputs and bool(batch.extras[_GROUP_LEADER]):
-                    records.append(
-                        _record_output(output, batch, scaled_loss, metrics, extractor)
-                    )
                 return scaled_loss, metrics
 
         return _Prepared(

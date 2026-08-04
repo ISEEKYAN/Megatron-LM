@@ -122,6 +122,7 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
         num_microbatches=num_microbatches,
         output_lst=outputs,
     )
+    assert hook.runtime_output_loss_scale == 1 / num_microbatches
     for _ in range(num_microbatches):
         loss, _ = hook({}, object(), LossContext(source_batch=object()))
         (loss / num_microbatches).backward()

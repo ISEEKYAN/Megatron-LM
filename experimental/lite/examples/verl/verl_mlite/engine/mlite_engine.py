@@ -964,6 +964,10 @@ class MegatronLiteEngine(BaseEngine):
 
         _loss_fn.runtime_output_collector = output_lst
         _loss_fn.runtime_output_extractor = lambda output: output["_verl_model_output"]
+        # The static collector records ``loss`` before this hook applies the
+        # microbatch multiplier used for backward.  Runtime sidecars must report
+        # that same application-level value even when they reschedule batches.
+        _loss_fn.runtime_output_loss_scale = 1 / num_microbatches
         return _loss_fn
 
     def _mtp_enable_train(self) -> bool:

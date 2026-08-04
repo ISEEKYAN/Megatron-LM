@@ -526,7 +526,9 @@ def test_mixed_cp_uses_pool_global_token_count_for_loss_normalization(monkeypatc
     assert torch.equal(dcp_global_loss, baseline_global_loss)
 
 
-def test_runtime_collector_records_the_loss_scaled_for_backward(monkeypatch):
+def test_runtime_collector_reports_application_loss_not_backward_scaled_loss(
+    monkeypatch,
+):
     from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
 
     module = types.ModuleType("megatron.core.datasets.data_schedule")
@@ -541,7 +543,7 @@ def test_runtime_collector_records_the_loss_scaled_for_backward(monkeypatch):
                 {
                     "sample_ids": [1],
                     "model_output": {"values": [torch.tensor([2.0])]},
-                    "loss": 24.0,
+                    "loss": 1.0,
                     "metrics": {},
                 }
             ],
@@ -579,6 +581,7 @@ def test_runtime_collector_records_the_loss_scaled_for_backward(monkeypatch):
 
     loss_fn.runtime_output_collector = collector
     loss_fn.runtime_output_extractor = lambda output: output
+    loss_fn.runtime_output_loss_scale = 1 / 3
     prepared = plugin._prepare(
         handle,
         iter(
@@ -615,7 +618,7 @@ def test_runtime_collector_records_the_loss_scaled_for_backward(monkeypatch):
     # correction=8, schedule_scale=1/2, replica_scale=2: all are non-unit.
     assert torch.equal(scaled_loss, torch.tensor(24.0))
     prepared.finish(require_complete=True)
-    assert collector[0]["loss"] == 24.0
+    assert [record["loss"] for record in collector] == [1.0, 1.0]
 
 
 @pytest.mark.parametrize("with_context", [False, True])
