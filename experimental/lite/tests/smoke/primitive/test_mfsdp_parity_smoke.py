@@ -1795,9 +1795,25 @@ def test_mfsdp_matches_reference_full_parallel_precision_curve(
         reference_backend, seed=7345
     )
     mfsdp_handle, mfsdp_initial = _build_full_parallel_handle("mfsdp", seed=7345)
-    _assert_distinct_backend_identities(
-        reference_handle._optimizer, mfsdp_handle._optimizer
-    )
+    if reference_backend == "fsdp2":
+        _assert_distinct_backend_identities(
+            reference_handle._optimizer, mfsdp_handle._optimizer
+        )
+    else:
+        assert reference_handle._optimizer is not mfsdp_handle._optimizer
+        assert _qualified_type(reference_handle._optimizer).startswith(
+            "megatron.core.optimizer."
+        )
+        assert _qualified_type(mfsdp_handle._optimizer).startswith(
+            "megatron.lite.primitive.optimizers.mfsdp."
+        )
+        if dist.get_rank() == 0:
+            print(
+                "[MFSDP_BACKEND] "
+                f"configured={reference_backend} optimizer_type="
+                f"{_qualified_type(reference_handle._optimizer)}",
+                flush=True,
+            )
 
     for handle in (reference_handle, mfsdp_handle):
         ps = handle._parallel_state
