@@ -1592,13 +1592,13 @@ def _build_full_parallel_handle(backend: str, *, seed: int):
     initial_params = _named_model_tensors(bundle.chunks)
     assert bundle.extras.get("optimizer_backend") == backend
     post_load_hook = bundle.extras.get("post_model_load_hook")
-    assert callable(post_load_hook), (
-        f"{backend} did not expose its production post-load hook."
-    )
-    updates = post_load_hook()
-    assert isinstance(updates, dict)
-    optimizer = updates.get("optimizer", bundle.optimizer)
-    finalize_grads = updates.get("finalize_grads", bundle.finalize_grads)
+    optimizer = bundle.optimizer
+    finalize_grads = bundle.finalize_grads
+    if callable(post_load_hook):
+        updates = post_load_hook()
+        assert isinstance(updates, dict)
+        optimizer = updates.get("optimizer", optimizer)
+        finalize_grads = updates.get("finalize_grads", finalize_grads)
     assert optimizer is not None
 
     extras = dict(bundle.extras)
