@@ -29,6 +29,288 @@ class _Group:
         return self._rank
 
 
+def test_dynamic_cp_keeps_r3_routes_and_masks_with_the_selected_samples():
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import (
+        _batch_samples,
+        _select_batch,
+    )
+
+    batch = PackedBatch(
+        input_ids=torch.arange(5),
+        labels=torch.arange(5),
+        seq_lens=torch.tensor([3, 2]),
+        routed_experts=torch.nested.as_nested_tensor(
+            [torch.tensor([[[10, 11]], [[12, 13]]]), torch.tensor([[[20, 21]]])],
+            layout=torch.jagged,
+        ),
+        r3_replay_mask=torch.tensor([True, True, False, True, False]),
+    )
+
+    selected = _select_batch(_batch_samples(batch), [1, 0], cp_size=1, leader=True)
+
+    assert torch.equal(
+        selected.r3_replay_mask, torch.tensor([True, False, True, True, False])
+    )
+    assert getattr(selected.routed_experts, "is_nested", False)
+    routes = list(selected.routed_experts.unbind())
+    assert torch.equal(routes[0], torch.tensor([[[20, 21]]]))
+    assert torch.equal(routes[1], torch.tensor([[[10, 11]], [[12, 13]]]))
+
+
+def test_dynamic_cp_allows_pipeline_parallel_but_not_virtual_pipeline_parallel():
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
+
+    pool, singleton, cp2 = _Group(4), _Group(1), _Group(2)
+    handle = ModelHandle(
+        model=object(),
+        parallel_state=SimpleNamespace(
+            dp_size=4, dp_rank=0, dp_group=pool, dp_cp_group=pool, cp_size=1, pp_size=2
+        ),
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(tp=1, cp=1, pp=2, vpp=1),
+            impl_cfg={"use_thd": True},
+        ),
+        _extras={},
+    )
+    plugin = DynamicCPPlugin(
+        {"max_seqlen_per_dp_cp_rank": 8},
+        create_groups=lambda _ps, _minimum, _parallel: {1: singleton, 2: cp2, 4: pool},
+    )
+
+    plugin.initialize(handle)
+
+    handle.config.parallel.vpp = 2
+    with pytest.raises(NotImplementedError, match="VPP=1"):
+        DynamicCPPlugin(
+            {"max_seqlen_per_dp_cp_rank": 8},
+            create_groups=lambda _ps, _minimum, _parallel: {
+                1: singleton,
+                2: cp2,
+                4: pool,
+            },
+        ).initialize(handle)
+
+
+def test_dynamic_cp_builds_separate_dp_cp_groups_for_each_pipeline_stage(monkeypatch):
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import _create_groups
+
+    created = []
+    module = types.ModuleType("megatron.core.parallel_state")
+
+    def create_dynamic_dp_cp_groups(rank, ranks, **_kwargs):
+        created.append((rank, ranks))
+        return {2: _Group(2)} if rank in ranks else {}
+
+    module.create_dynamic_dp_cp_groups = create_dynamic_dp_cp_groups
+    monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", module)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 4)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 8)
+    monkeypatch.setattr(
+        torch.distributed, "new_group", lambda ranks: _Group(len(ranks))
+    )
+    physical = _Group(4)
+
+    groups = _create_groups(
+        SimpleNamespace(dp_size=2, dp_cp_group=physical),
+        1,
+        SimpleNamespace(tp=1, cp=2, pp=2),
+    )
+
+    assert created == [(4, [0, 1, 2, 3]), (4, [4, 5, 6, 7])]
+    assert groups[4] is physical
+    assert groups[1].size() == 1
+
+
+@pytest.mark.parametrize("action", ["record", "replay"])
+def test_dynamic_cp_forwards_r2_r3_router_replay_to_the_runtime(monkeypatch, action):
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
+
+    class Prepared:
+        data = iter(())
+        count = 1
+        loss = None
+        forward = staticmethod(lambda model, batch: None)
+        pre_forward = None
+        binding = SimpleNamespace(bind=lambda _size: None)
+
+        def finish(self, require_complete):
+            assert require_complete
+
+    handle = SimpleNamespace(
+        _model=object(), _extras={"forward_step": lambda model, batch: None}
+    )
+    plugin = DynamicCPPlugin({"max_seqlen_per_dp_cp_rank": 8})
+    monkeypatch.setattr(plugin, "_prepare", lambda *_args: Prepared())
+    replay = {"action": action}
+
+    def original_forward_backward(*args, **kwargs):
+        assert kwargs["router_replay"] is replay
+        return "forwarded"
+
+    assert (
+        plugin.wrap_forward_backward(original_forward_backward)(
+            handle, object(), None, router_replay=replay
+        )
+        == "forwarded"
+    )
+
+
+def test_dynamic_cp_rebinds_each_prefetched_pipeline_microbatch(monkeypatch):
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
+
+    module = types.ModuleType("megatron.core.datasets.data_schedule")
+    module.DefaultDynamicCPScheduler = _MixedCPScheduler
+    monkeypatch.setitem(sys.modules, "megatron.core.datasets.data_schedule", module)
+    pool, singleton = _Group(2), _Group(1)
+    ps = SimpleNamespace(
+        dp_size=2,
+        dp_rank=0,
+        dp_group=pool,
+        dp_cp_group=pool,
+        cp_size=1,
+        cp_rank=0,
+        cp_group=singleton,
+        pp_size=2,
+    )
+    seen = []
+    aux_scales = []
+    handle = ModelHandle(
+        model=object(),
+        parallel_state=ps,
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(tp=1, cp=1, pp=2, vpp=1),
+            impl_cfg={"use_thd": True},
+        ),
+        _extras={
+            "forward_step": lambda _model, _batch: seen.append(ps.cp_size),
+            "_dcp_original_pre_forward": lambda scale: aux_scales.append(float(scale)),
+        },
+    )
+    plugin = DynamicCPPlugin(
+        {"max_seqlen_per_dp_cp_rank": 4},
+        create_groups=lambda _ps, _minimum, _parallel: {1: singleton, 2: pool},
+    )
+    plugin.initialize(handle)
+    prepared = plugin._prepare(
+        handle,
+        PackedBatch(
+            input_ids=torch.arange(12),
+            labels=torch.arange(12),
+            seq_lens=torch.tensor([2, 8, 2]),
+        ),
+        None,
+        1,
+    )
+    handle._extras["_dcp_original_forward"] = handle._extras["forward_step"]
+
+    # PP schedules prefetch all batches before running the first forward.
+    prefetched = [split_loss_context(item)[0] for item in prepared.data]
+    for batch in prefetched:
+        prepared.pre_forward(torch.tensor(0.5))
+        prepared.forward(handle._model, batch)
+    prepared.finish(require_complete=True)
+
+    assert seen == [1, 2]
+    assert aux_scales == [0.5, 1.0]
+    assert (ps.cp_size, ps.cp_group) == (1, singleton)
+
+
+def test_qat_router_replay_uses_each_prefetched_microbatch_cp_group(monkeypatch):
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
+
+    module = types.ModuleType("megatron.core.datasets.data_schedule")
+    module.DefaultDynamicCPScheduler = _MixedCPScheduler
+    monkeypatch.setitem(sys.modules, "megatron.core.datasets.data_schedule", module)
+    pool, singleton = _Group(2), _Group(1)
+    ps = SimpleNamespace(
+        dp_size=2,
+        dp_rank=0,
+        dp_group=pool,
+        dp_cp_group=pool,
+        cp_size=1,
+        cp_rank=0,
+        cp_group=singleton,
+        pp_size=2,
+    )
+    seen = []
+
+    class Protocol:
+        def pack_routed_experts(self, _model, _batch, routed):
+            seen.append(ps.cp_size)
+            return routed
+
+    handle = ModelHandle(
+        model=object(),
+        parallel_state=ps,
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(tp=1, cp=1, pp=2, vpp=1),
+            impl_cfg={"use_thd": True, "qat": {"enabled": True}},
+        ),
+        _extras={"forward_step": lambda *_args: {}, "protocol": Protocol()},
+    )
+    plugin = DynamicCPPlugin(
+        {"max_seqlen_per_dp_cp_rank": 4},
+        create_groups=lambda _ps, _minimum, _parallel: {1: singleton, 2: pool},
+    )
+    plugin.initialize(handle)
+    routes = torch.nested.as_nested_tensor(
+        [
+            torch.ones(1, 1, 1, dtype=torch.long),
+            torch.ones(7, 1, 1, dtype=torch.long),
+            torch.ones(1, 1, 1, dtype=torch.long),
+        ],
+        layout=torch.jagged,
+    )
+    batch = PackedBatch(
+        input_ids=torch.arange(12),
+        labels=torch.arange(12),
+        seq_lens=torch.tensor([2, 8, 2]),
+        routed_experts=routes,
+        r3_replay_mask=torch.ones(12, dtype=torch.bool),
+    )
+
+    def pipeline_like_forward_backward(
+        inner_handle, data, _loss, *, num_microbatches, **_kwargs
+    ):
+        prefetched = [
+            split_loss_context(next(data))[0] for _ in range(num_microbatches)
+        ]
+        for selected in prefetched:
+            inner_handle._extras["protocol"].pack_routed_experts(
+                inner_handle._model, selected, selected.routed_experts
+            )
+            inner_handle._extras["forward_step"](inner_handle._model, selected)
+
+    plugin.wrap_forward_backward(pipeline_like_forward_backward)(
+        handle, batch, None, router_replay={"action": "replay"}
+    )
+
+    assert seen == [1, 2]
+    assert handle._extras["protocol"].__class__ is Protocol
+
+
+def test_dynamic_cp_router_replay_rejects_fused_router(monkeypatch):
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import DynamicCPPlugin
+
+    model = torch.nn.Module()
+    model.router = torch.nn.Module()
+    model.router.moe_router_fusion = True
+    handle = SimpleNamespace(
+        _model=model,
+        _extras={"forward_step": lambda *_args: {}},
+        config=SimpleNamespace(impl_cfg={"qat": {"enabled": True}}),
+    )
+    plugin = DynamicCPPlugin({"max_seqlen_per_dp_cp_rank": 8})
+    monkeypatch.setattr(
+        plugin, "_prepare", lambda *_args: pytest.fail("must fail before prepare")
+    )
+
+    with pytest.raises(NotImplementedError, match="moe_router_fusion=False"):
+        plugin.wrap_forward_backward(lambda *_args, **_kwargs: None)(
+            handle, object(), None, router_replay={"action": "replay"}
+        )
+
+
 def test_dynamic_cp_split_merge_preserves_jagged_tensordict_samples():
     TensorDict = pytest.importorskip("tensordict").TensorDict
     NonTensorData = pytest.importorskip("tensordict.tensorclass").NonTensorData
@@ -192,12 +474,29 @@ def test_install_wraps_only_the_target_runtime_instance():
     enabled = Runtime()
     disabled = Runtime()
 
-    install(enabled, {"max_seqlen_per_dp_cp_rank": 8})
+    install(enabled, {"enabled": True, "max_seqlen_per_dp_cp_rank": 8})
 
     assert "forward_backward" in enabled.__dict__
     assert "build_model" in enabled.__dict__
     assert "forward_backward" not in disabled.__dict__
     assert "build_model" not in disabled.__dict__
+
+
+def test_dynamic_cp_plugin_is_explicitly_disabled_by_default():
+    from megatron.lite.runtime.backends.mlite.dynamic_cp import install
+
+    class Runtime:
+        def build_model(self):
+            return "handle"
+
+        def forward_backward(self, *args, **kwargs):
+            return args, kwargs
+
+    runtime = Runtime()
+    install(runtime, {"max_seqlen_per_dp_cp_rank": 8})
+
+    assert "forward_backward" not in runtime.__dict__
+    assert "build_model" not in runtime.__dict__
 
 
 def test_disabled_runtime_does_not_import_dynamic_cp(monkeypatch):
@@ -228,7 +527,10 @@ def test_runtime_config_installs_dynamic_cp_sidecar():
             impl_cfg={
                 "use_thd": True,
                 "runtime_plugins": {
-                    "dynamic_context_parallel": {"max_seqlen_per_dp_cp_rank": 8}
+                    "dynamic_context_parallel": {
+                        "enabled": True,
+                        "max_seqlen_per_dp_cp_rank": 8,
+                    }
                 },
             }
         ),

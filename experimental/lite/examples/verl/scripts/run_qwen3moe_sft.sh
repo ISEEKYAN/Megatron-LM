@@ -208,6 +208,7 @@ BACKEND_ARGS=(
   "engine.load_hf_weights=${LOAD_HF_WEIGHTS}"
   "engine.impl_cfg.use_thd=True"
   "+engine.impl_cfg.optimizer=${MLITE_IMPL_OPTIMIZER}"
+  "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel.enabled=${DYNAMIC_CONTEXT_PARALLEL}"
 )
 
 if [[ "${DYNAMIC_CONTEXT_PARALLEL}" == "True" || "${DYNAMIC_CONTEXT_PARALLEL}" == "true" || "${DYNAMIC_CONTEXT_PARALLEL}" == "1" ]]; then

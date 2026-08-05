@@ -83,8 +83,9 @@ DRY_RUN=1 \
 bash experimental/lite/examples/verl/scripts/run_qwen3moe_sft.sh
 ```
 
-Dynamic CP keeps the same VERL engine API and is enabled as an MLite runtime
-plugin:
+Dynamic CP keeps the same VERL engine API and is an explicitly enabled MLite
+runtime plugin. It is disabled by default; enabling it also requires
+`MAX_SEQLEN_PER_DP_CP_RANK`:
 
 ```bash
 MODEL_PATH=/path/to/qwen3.5-35b-a3b-hf \
@@ -100,6 +101,19 @@ Dynamic CP uses the physical DP×CP pool to normalize the training loss, while
 VERL's `batch_num_tokens` and loss logging retain their logical-DP view.  Do
 not compare those telemetry values as though they were the training-loss
 normalization denominator.
+
+Ordinary pipeline parallelism and R2/R3 router replay are supported. Virtual
+pipeline parallelism remains unsupported and fails loudly. R2/R3 also require
+`moe_router_fusion=False`, because the fused router path bypasses the replay
+hook; this restriction does not apply when router replay is disabled.
+
+Dynamic CP is not unconditionally faster. Its benefit depends on a sequence
+length distribution that lets the scheduler use smaller CP groups for enough
+microbatches while keeping all DP×CP ranks busy. Decide with an A/B run that
+keeps the checkpoint, samples, token budget, and parallel topology fixed; after
+warm-up, compare both processed tokens per second and the emitted
+`cp_size_histogram`. Leave it disabled when the histogram stays concentrated at
+the full static CP size or throughput does not improve.
 
 By default, logs, command snapshots, JSONL logger output, and checkpoints are
 written under `experimental/lite/examples/verl/outputs/qwen3moe_sft`. Override
