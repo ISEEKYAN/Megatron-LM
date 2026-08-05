@@ -1305,7 +1305,12 @@ def _resolve_param_name(name: str, state_dict: dict) -> str | None:
     if name in canonical:
         return canonical[name]
     for logical_name, key in canonical.items():
-        if name in logical_name:
+        # Wrapped modules may prefix the logical key (for example
+        # ``module.layers.0...``), but an arbitrary substring is not a valid
+        # parameter match.  In particular, a PP stage without the final
+        # ``norm.weight`` used to bind that stage-global tensor to a local
+        # ``q_norm.weight`` and then fail with a misleading shape mismatch.
+        if logical_name.endswith(f".{name}"):
             return key
     return None
 
