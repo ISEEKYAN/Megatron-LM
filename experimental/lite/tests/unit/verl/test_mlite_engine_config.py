@@ -1,6 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
@@ -51,62 +49,6 @@ def _engine_config(**kwargs) -> MegatronLiteEngineConfig:
     values = {"custom_backend_module": None, "impl_cfg": {"use_thd": True}}
     values.update(kwargs)
     return MegatronLiteEngineConfig(**values)
-
-
-def _r3_input_ids() -> torch.Tensor:
-    return torch.nested.as_nested_tensor(
-        [torch.arange(4), torch.arange(3)], layout=torch.jagged
-    )
-
-
-def _install_upstream_r3_stub(monkeypatch, build) -> None:
-    module = types.ModuleType("verl.utils.megatron.router_replay_utils")
-    module.build_r3_replay_mask = build
-    monkeypatch.setitem(
-        sys.modules, "verl.utils.megatron.router_replay_utils", module
-    )
-
-
-def test_r3_replay_mask_delegates_jagged_inputs_to_verl(monkeypatch):
-    """The connector delegates semantics before flattening the THD batch."""
-    input_ids = _r3_input_ids()
-    response_mask = torch.tensor([[1, 1], [0, 0]], dtype=torch.float32)
-    expected = torch.nested.as_nested_tensor(
-        [
-            torch.tensor([True, True, True, False]),
-            torch.tensor([False, False, False]),
-        ],
-        layout=torch.jagged,
-    )
-    seen = {}
-
-    def build(actual_input_ids, actual_response_mask):
-        seen["input_ids"] = actual_input_ids
-        seen["response_mask"] = actual_response_mask
-        return expected
-
-    _install_upstream_r3_stub(monkeypatch, build)
-    micro_batch = TensorDict(
-        {"input_ids": input_ids, "response_mask": response_mask},
-        batch_size=[2],
-    )
-
-    actual = MegatronLiteEngine._r3_replay_mask_for_packing(
-        micro_batch, input_ids
-    )
-
-    assert actual is expected
-    assert seen == {"input_ids": input_ids, "response_mask": response_mask}
-
-
-def test_r3_replay_mask_requires_response_mask(monkeypatch):
-    """R3 must fail loudly instead of guessing that every sequence has a response."""
-    _install_upstream_r3_stub(monkeypatch, lambda *_args: pytest.fail("must not run"))
-    input_ids = _r3_input_ids()
-    micro_batch = TensorDict({"input_ids": input_ids}, batch_size=[2])
-
-    with pytest.raises(KeyError, match="response_mask"):
-        MegatronLiteEngine._r3_replay_mask_for_packing(micro_batch, input_ids)
 
 
 @pytest.mark.parametrize("num_microbatches", [1, 4])

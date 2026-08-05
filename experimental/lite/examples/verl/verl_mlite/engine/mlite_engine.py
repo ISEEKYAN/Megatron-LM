@@ -27,6 +27,7 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
+from verl_mlite.router_replay import build_r3_replay_mask
 
 try:
     # Recent VERL wraps per-step metric values in a Metric aggregator that
@@ -895,9 +896,7 @@ class MegatronLiteEngine(BaseEngine):
     def _r3_replay_mask_for_packing(
         micro_batch: TensorDict, input_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Reuse VERL's canonical R3 semantics while inputs are still jagged."""
-        from verl.utils.megatron.router_replay_utils import build_r3_replay_mask
-
+        """Build the R3 mask while inputs are still jagged."""
         return build_r3_replay_mask(input_ids, micro_batch["response_mask"])
 
     def _build_verl_model_output(
