@@ -173,6 +173,12 @@ def test_pretrain_session_runs_with_fake_runtime_on_cpu():
     assert len(result.step_traces) == 2
     assert [trace.loss for trace in result.step_traces] == [2.0, 3.0]
     assert result.step_traces[0].grad_norm == 3.5
+    assert all(trace.optimizer_step_ms >= 0.0 for trace in result.step_traces)
+    assert result.avg_optimizer_step_ms >= 0.0
+
+    artifact = result.to_dict()
+    assert "avg_optimizer_step_ms" in artifact["summary"]
+    assert "optimizer_step_ms" in artifact["result"]["step_traces"][0]
 
 
 def test_bench_main_writes_dry_run_output_json(tmp_path):
@@ -223,6 +229,25 @@ def test_bench_main_writes_output_json_only_on_rank_zero(tmp_path, monkeypatch):
 
     assert artifact["dry_run"] is True
     assert not output_path.exists()
+
+
+def test_mfsdp_offload_bench_script_is_single_arm_and_slurm_guarded():
+    script = (
+        Path(__file__).resolve().parents[3]
+        / "examples/bench/scripts/run_qwen35_mfsdp_offload.sh"
+    ).read_text(encoding="utf-8")
+
+    assert script.count("torchrun ") == 1
+    assert "SLURM_JOB_ID" in script
+    assert "WANDB_PROJECT" in script
+    assert "avg_optimizer_step_ms" in script
+    assert "'{\"optimizer\":\"mfsdp\"}'" in script
+    assert (
+        "'{\"offload_fraction\":1.0,\"use_precision_aware_optimizer\":false}'"
+        in script
+    )
+    assert '"dist_opt"' not in script
+    assert '"fsdp2"' not in script
 
 
 def test_result_artifact_summary_and_trace_compare(tmp_path):

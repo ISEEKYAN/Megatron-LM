@@ -364,6 +364,7 @@ def _step_reporter(trace: StepTrace) -> None:
         f"loss={trace.loss:.6f}",
         f"grad_norm={trace.grad_norm:.6f}",
         f"step_ms={trace.step_ms:.3f}",
+        f"optimizer_step_ms={trace.optimizer_step_ms:.3f}",
         f"peak_mem_gb={(trace.peak_mem_gb or 0.0):.3f}",
     ]
     if trace.tflops_per_gpu is not None:

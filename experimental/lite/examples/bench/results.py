@@ -16,6 +16,7 @@ class StepTrace:
     loss: float
     grad_norm: float
     step_ms: float
+    optimizer_step_ms: float
     peak_mem_gb: float | None = None
     tflops_per_gpu: float | None = None
 
@@ -25,6 +26,7 @@ class StepTrace:
             "loss": self.loss,
             "grad_norm": self.grad_norm,
             "step_ms": self.step_ms,
+            "optimizer_step_ms": self.optimizer_step_ms,
         }
         if self.peak_mem_gb is not None:
             result["peak_mem_gb"] = self.peak_mem_gb
@@ -49,6 +51,7 @@ class RunResult:
     num_microbatches: int
     step_traces: list[StepTrace] = field(default_factory=list)
     avg_step_ms: float = 0.0
+    avg_optimizer_step_ms: float = 0.0
     peak_mem_gb: float = 0.0
     tok_per_s: float = 0.0
     tok_per_s_per_gpu: float = 0.0
@@ -62,6 +65,7 @@ class RunResult:
             "impl": self.impl,
             "optimizer_backend": self.optimizer_backend,
             "avg_step_ms": self.avg_step_ms,
+            "avg_optimizer_step_ms": self.avg_optimizer_step_ms,
             "tok_per_s": self.tok_per_s,
             "tok_per_s_per_gpu": self.tok_per_s_per_gpu,
             "peak_mem_gb": self.peak_mem_gb,
@@ -87,6 +91,7 @@ class RunResult:
                 "num_microbatches": self.num_microbatches,
                 "step_traces": [trace.to_dict() for trace in self.step_traces],
                 "avg_step_ms": self.avg_step_ms,
+                "avg_optimizer_step_ms": self.avg_optimizer_step_ms,
                 "peak_mem_gb": self.peak_mem_gb,
                 "tok_per_s": self.tok_per_s,
                 "tok_per_s_per_gpu": self.tok_per_s_per_gpu,
@@ -119,6 +124,7 @@ def result_summary(artifact: dict[str, Any]) -> dict[str, Any]:
         "impl": result.get("impl"),
         "optimizer_backend": result.get("optimizer_backend"),
         "avg_step_ms": result.get("avg_step_ms"),
+        "avg_optimizer_step_ms": result.get("avg_optimizer_step_ms"),
         "tok_per_s": result.get("tok_per_s"),
         "tok_per_s_per_gpu": result.get("tok_per_s_per_gpu"),
         "peak_mem_gb": result.get("peak_mem_gb"),
