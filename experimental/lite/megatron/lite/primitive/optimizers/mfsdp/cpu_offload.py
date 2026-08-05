@@ -86,22 +86,40 @@ class CpuAdamGroup:
         self._use_pinned = use_pinned
         self._gpu_params: list[nn.Parameter] = []
         self._cpu_params: list[torch.Tensor] = []
-        self._cpu_grad_bufs: list[torch.Tensor | None] = []
+        self._cpu_grad_bufs: list[torch.Tensor] = []
         cpu_groups: list[dict[str, Any]] = []
 
+        total_numel = sum(
+            gpu_param.numel()
+            for group in gpu_param_groups
+            for gpu_param in group["params"]
+        )
+        self._cpu_master_pool = torch.empty(
+            total_numel,
+            dtype=torch.float32,
+            device="cpu",
+            pin_memory=use_pinned,
+        )
+        self._cpu_grad_pool = torch.empty(
+            total_numel,
+            dtype=torch.float32,
+            device="cpu",
+            pin_memory=use_pinned,
+        )
+        offset = 0
         for group in gpu_param_groups:
             cpu_group_params: list[torch.Tensor] = []
             for gpu_param in group["params"]:
-                flat = gpu_param.detach().cpu().float().contiguous()
-                if use_pinned:
-                    pinned = torch.empty_like(flat, pin_memory=True)
-                    pinned.copy_(flat)
-                    flat = pinned
+                numel = gpu_param.numel()
+                flat = self._cpu_master_pool.narrow(0, offset, numel)
+                flat.copy_(gpu_param.detach().view(-1))
+                grad_buf = self._cpu_grad_pool.narrow(0, offset, numel)
+                offset += numel
                 # Wrap as leaf tensor with grad support so AdamW can update it.
                 cpu_p = flat.detach().requires_grad_(True)
                 self._gpu_params.append(gpu_param)
                 self._cpu_params.append(cpu_p)
-                self._cpu_grad_bufs.append(None)
+                self._cpu_grad_bufs.append(grad_buf)
                 cpu_group_params.append(cpu_p)
 
             cpu_group = {k: v for k, v in group.items() if k != "params"}
@@ -147,13 +165,11 @@ class CpuAdamGroup:
                 continue
             flat_gpu_grad = gpu_param.grad.detach().view(-1)
             buf = self._cpu_grad_bufs[i]
-            if buf is None or buf.shape != flat_gpu_grad.shape:
-                buf = torch.zeros(
-                    flat_gpu_grad.shape, dtype=torch.float32, device="cpu"
+            if buf.shape != flat_gpu_grad.shape:
+                raise ValueError(
+                    "M-FSDP CPU gradient shape changed after pool allocation: "
+                    f"expected {tuple(buf.shape)}, got {tuple(flat_gpu_grad.shape)}."
                 )
-                if self._use_pinned:
-                    buf = buf.pin_memory()
-                self._cpu_grad_bufs[i] = buf
             if self._use_pinned:
                 with torch.cuda.stream(self._d2h_stream):
                     buf.copy_(flat_gpu_grad, non_blocking=True)

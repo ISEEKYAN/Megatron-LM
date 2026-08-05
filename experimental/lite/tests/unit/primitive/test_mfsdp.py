@@ -819,6 +819,35 @@ def test_mfsdp_cpu_offload_overlaps_per_param_d2h_cpu_step_and_h2d():
     assert "self._h2d_stream.record_event().wait(current_stream)" in source
 
 
+def test_mfsdp_cpu_offload_uses_two_flat_host_pools():
+    _Model, _Unit, ps, engine_cfg = _build_offload_stack(offload_fraction=1.0)
+    _chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    cpu_group = optimizer._inner_optimizer.cpu_group
+    assert cpu_group is not None
+
+    total_numel = sum(param.numel() for param in cpu_group._cpu_params)
+    assert cpu_group._cpu_master_pool.numel() == total_numel
+    assert cpu_group._cpu_grad_pool.numel() == total_numel
+    assert all(buffer is not None for buffer in cpu_group._cpu_grad_bufs)
+
+    master_storage = cpu_group._cpu_master_pool.untyped_storage().data_ptr()
+    grad_storage = cpu_group._cpu_grad_pool.untyped_storage().data_ptr()
+    assert {param.untyped_storage().data_ptr() for param in cpu_group._cpu_params} == {
+        master_storage
+    }
+    assert {
+        buffer.untyped_storage().data_ptr()
+        for buffer in cpu_group._cpu_grad_bufs
+        if buffer is not None
+    } == {grad_storage}
+
+
 def test_mfsdp_full_offload_has_six_gpu_and_twelve_cpu_bytes_per_param():
     _Model, _Unit, ps, engine_cfg = _build_offload_stack(offload_fraction=1.0)
 
