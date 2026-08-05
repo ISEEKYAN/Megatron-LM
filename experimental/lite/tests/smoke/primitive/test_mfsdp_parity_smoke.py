@@ -1024,6 +1024,7 @@ def test_mfsdp_non_fused_wgrad_accumulates_in_fp32_per_microbatch():
     assert not hasattr(model.linear, "fuse_wgrad_accumulation")
     chunks = [model]
     optimizer_config = _optimizer_cfg(use_fused_optimizer=False)
+    optimizer_config.clip_grad = 10000.0
     impl_cfg = SimpleNamespace(
         parallel=parallel,
         optimizer_config=optimizer_config,
