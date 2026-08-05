@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+from megatron.lite.primitive.modules import router_replay
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
@@ -896,8 +897,6 @@ class MegatronLiteEngine(BaseEngine):
         micro_batch: TensorDict, input_ids: torch.Tensor
     ) -> torch.Tensor:
         """Build the R3 mask while inputs are still jagged."""
-        from megatron.lite.primitive.modules import router_replay
-
         return router_replay.build_r3_replay_mask(
             input_ids, micro_batch["response_mask"]
         )
