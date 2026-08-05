@@ -61,9 +61,9 @@ class CpuAdamGroup:
             lr=lr,
             betas=betas,
             eps=eps,
-            # CPU offload creates many shard tensors; batch their AdamW updates
-            # instead of paying one Python dispatch per tensor.
-            foreach=True,
+            # Keep scalar CPU AdamW: the foreach path regresses the isolated
+            # optimizer step for the representative M-FSDP MoE workload.
+            foreach=False,
         )
 
     @property

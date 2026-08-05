@@ -794,8 +794,6 @@ def test_mfsdp_offload_fraction_keeps_optimizer_state_on_cpu():
     assert cpu_group is not None, (
         "Expected cpu_group to be set for offload_fraction=1.0"
     )
-    assert cpu_group._cpu_optimizer.defaults["foreach"] is True
-
     for cpu_p in cpu_group._cpu_params:
         assert cpu_p.device.type == "cpu", "cpu_param should be on CPU"
     cpu_opt_state = cpu_group._cpu_optimizer.state
