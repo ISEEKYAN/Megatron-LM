@@ -896,9 +896,11 @@ class MegatronLiteEngine(BaseEngine):
         micro_batch: TensorDict, input_ids: torch.Tensor
     ) -> torch.Tensor:
         """Build the R3 mask while inputs are still jagged."""
-        from verl_mlite.router_replay import build_r3_replay_mask
+        from megatron.lite.primitive.modules import router_replay
 
-        return build_r3_replay_mask(input_ids, micro_batch["response_mask"])
+        return router_replay.build_r3_replay_mask(
+            input_ids, micro_batch["response_mask"]
+        )
 
     def _build_verl_model_output(
         self,

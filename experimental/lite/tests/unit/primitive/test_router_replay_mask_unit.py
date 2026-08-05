@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from verl_mlite.router_replay import build_r3_replay_mask
+from megatron.lite.primitive.modules.router_replay import build_r3_replay_mask
 
 
 def _jagged_input_ids() -> torch.Tensor:
