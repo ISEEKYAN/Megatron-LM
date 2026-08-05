@@ -16,10 +16,10 @@ class CpuAdamGroup:
     live on CPU. ``shard_param.data`` is the GPU compute/all-gather mirror and
     is refreshed after each CPU update.
 
-    Per-step flow (synchronous):
-      1. D2H — copy GPU gradient → pinned CPU grad buffer  (blocking)
+    Per-step flow:
+      1. D2H — enqueue GPU gradient → pinned CPU grad buffer, then fence once
       2. CPU AdamW step updates cpu_param
-      3. H2D — copy updated cpu_param → GPU shard_param.data  (blocking)
+      3. H2D — enqueue updated cpu_param → GPU shard_param.data
     """
 
     def __init__(
@@ -89,13 +89,17 @@ class CpuAdamGroup:
                     buf = buf.pin_memory()
                 self._cpu_grad_bufs[i] = buf
 
-            buf.copy_(flat_gpu_grad)
+            buf.copy_(flat_gpu_grad, non_blocking=True)
             cpu_param.grad = buf
 
+        if self._use_pinned:
+            # CPU AdamW must not read pinned gradients until every queued D2H
+            # copy has completed. One fence avoids synchronizing per tensor.
+            torch.cuda.current_stream().synchronize()
         self._cpu_optimizer.step()
 
         for gpu_param, cpu_param in zip(self._gpu_params, self._cpu_params):
-            gpu_param.data.view(-1).copy_(cpu_param.data)
+            gpu_param.data.view(-1).copy_(cpu_param.data, non_blocking=True)
             cpu_param.grad = None
 
     def state_dict(self) -> dict[str, Any]:
