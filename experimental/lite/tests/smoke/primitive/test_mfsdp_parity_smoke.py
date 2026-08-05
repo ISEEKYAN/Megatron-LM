@@ -1020,7 +1020,9 @@ def test_mfsdp_non_fused_wgrad_accumulates_in_fp32_per_microbatch():
     ps = _parallel_state(parallel)
     torch.manual_seed(10103)
     torch.cuda.manual_seed_all(10103)
-    chunks = [TinyNonFusedLinear().cuda()]
+    model = TinyNonFusedLinear().cuda()
+    assert not hasattr(model.linear, "fuse_wgrad_accumulation")
+    chunks = [model]
     optimizer_config = _optimizer_cfg(use_fused_optimizer=False)
     impl_cfg = SimpleNamespace(
         parallel=parallel,
@@ -1039,7 +1041,6 @@ def test_mfsdp_non_fused_wgrad_accumulates_in_fp32_per_microbatch():
         optimizer_factory=build_recording_optimizer,
     )
     chunk = chunks[0]
-    assert not hasattr(chunk.linear, "fuse_wgrad_accumulation")
     assert len(chunk.param_sync.buckets) == 1
     spec = chunk.param_sync.buckets[0].specs[0]
     assert spec.shard_param is not None
