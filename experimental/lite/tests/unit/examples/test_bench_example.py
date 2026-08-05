@@ -9,7 +9,6 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import torch
-
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs
 from megatron.lite.runtime.contracts.handle import ModelHandle
@@ -78,7 +77,9 @@ def test_bench_builds_bridge_dry_run_plan_without_bridge_import():
     assert plan["runtime"]["backend"] == "bridge"
     backend_cfg = plan["runtime"]["backend_cfg"]
     assert backend_cfg["model_name"] == "qwen3_5"
-    assert backend_cfg["override_transformer_config"] == {"attention_backend": "unfused"}
+    assert backend_cfg["override_transformer_config"] == {
+        "attention_backend": "unfused"
+    }
     assert backend_cfg["bridge_post_init"].startswith("<callable:")
 
 
@@ -100,7 +101,9 @@ def test_bench_builds_mbridge_dry_run_plan_without_mbridge_import():
     assert plan["runtime"]["backend"] == "mbridge"
     backend_cfg = plan["runtime"]["backend_cfg"]
     assert backend_cfg["model_name"] == "qwen3_5"
-    assert backend_cfg["override_transformer_config"] == {"attention_backend": "unfused"}
+    assert backend_cfg["override_transformer_config"] == {
+        "attention_backend": "unfused"
+    }
     assert backend_cfg["bridge_post_init"].startswith("<callable:")
 
 
@@ -138,7 +141,9 @@ class _FakeRuntime:
 
     def forward_backward(self, handle, data, loss_fn, *, num_microbatches: int = 1):
         self.loss += 1
-        return ForwardResult(model_output=ModelOutputs(loss=torch.tensor(float(self.loss))))
+        return ForwardResult(
+            model_output=ModelOutputs(loss=torch.tensor(float(self.loss)))
+        )
 
     def optimizer_step(self, handle):
         return True, 3.5, 0
@@ -155,7 +160,9 @@ def test_pretrain_session_runs_with_fake_runtime_on_cpu():
         optimizer=object(),
         parallel_state=None,
         config=type(
-            "Cfg", (), {"model_name": "fake", "impl": "lite", "parallel": ParallelConfig()}
+            "Cfg",
+            (),
+            {"model_name": "fake", "impl": "lite", "parallel": ParallelConfig()},
         )(),
         _extras={"optimizer_backend": "fake"},
     )
@@ -243,15 +250,18 @@ def test_mfsdp_offload_bench_script_is_single_arm_and_slurm_guarded():
     assert "avg_optimizer_step_ms" in script
     assert "'{\"optimizer\":\"mfsdp\"}'" in script
     assert (
-        "'{\"offload_fraction\":1.0,\"use_precision_aware_optimizer\":false}'"
-        in script
+        "'{\"offload_fraction\":1.0,\"use_precision_aware_optimizer\":false}'" in script
     )
     assert '"dist_opt"' not in script
     assert '"fsdp2"' not in script
 
 
 def test_result_artifact_summary_and_trace_compare(tmp_path):
-    from examples.bench.results import compare_step_traces, load_result_artifact, result_summary
+    from examples.bench.results import (
+        compare_step_traces,
+        load_result_artifact,
+        result_summary,
+    )
 
     baseline = {
         "summary": {
@@ -287,17 +297,25 @@ def test_result_artifact_summary_and_trace_compare(tmp_path):
     loaded = load_result_artifact(baseline_path)
 
     assert result_summary(loaded)["backend"] == "mlite"
-    assert compare_step_traces(baseline, candidate, atol=1e-3, rtol=0.0)["passed"] is True
+    assert (
+        compare_step_traces(baseline, candidate, atol=1e-3, rtol=0.0)["passed"] is True
+    )
 
 
 def test_result_trace_compare_reports_metric_level_failures():
     from examples.bench.results import compare_step_traces
 
     baseline = {
-        "result": {"step_traces": [{"step": 0, "loss": 1.0, "grad_norm": 2.0, "step_ms": 10.0}]}
+        "result": {
+            "step_traces": [{"step": 0, "loss": 1.0, "grad_norm": 2.0, "step_ms": 10.0}]
+        }
     }
     candidate = {
-        "result": {"step_traces": [{"step": 0, "loss": 1.00001, "grad_norm": 3.0, "step_ms": 10.0}]}
+        "result": {
+            "step_traces": [
+                {"step": 0, "loss": 1.00001, "grad_norm": 3.0, "step_ms": 10.0}
+            ]
+        }
     }
 
     comparison = compare_step_traces(baseline, candidate, atol=1e-3, rtol=0.0)
@@ -368,11 +386,7 @@ def test_correctness_compare_supports_explicit_numeric_tolerances():
     }
 
     comparison = compare_correctness_artifacts(
-        baseline,
-        candidate,
-        loss_atol=1e-5,
-        grad_atol=1e-4,
-        tensor_atol=3e-3,
+        baseline, candidate, loss_atol=1e-5, grad_atol=1e-4, tensor_atol=3e-3
     )
 
     assert comparison["passed"] is True
