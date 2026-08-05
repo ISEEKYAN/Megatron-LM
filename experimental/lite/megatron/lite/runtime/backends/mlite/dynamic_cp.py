@@ -78,7 +78,7 @@ def _create_groups(ps: Any, minimum: int, parallel: Any) -> dict[int, Any]:
     return local
 
 
-def _batch_samples(batch: PackedBatch) -> list[dict[str, torch.Tensor]]:
+def _batch_samples(batch: PackedBatch) -> list[dict[str, Any]]:
     if not isinstance(batch, PackedBatch):
         raise TypeError("Dynamic CP accepts only text-only PackedBatch inputs.")
     lengths = batch.seq_lens
@@ -93,8 +93,21 @@ def _batch_samples(batch: PackedBatch) -> list[dict[str, torch.Tensor]]:
         value = getattr(batch, name)
         if value is not None and (value.ndim != 1 or value.numel() != total):
             raise ValueError(f"PackedBatch.{name} must contain {total} packed tokens.")
-    if batch.routed_experts is not None or batch.r3_replay_mask is not None:
-        raise NotImplementedError("Dynamic CP does not support router replay.")
+    routes = batch.routed_experts
+    replay_mask = batch.r3_replay_mask
+    if (routes is None) != (replay_mask is None):
+        raise ValueError(
+            "Dynamic CP router replay requires routed_experts and r3_replay_mask together."
+        )
+    route_rows = None
+    if routes is not None:
+        if not getattr(routes, "is_nested", False):
+            raise TypeError("Dynamic CP router replay requires jagged routed_experts.")
+        route_rows = list(routes.unbind())
+        if len(route_rows) != len(lengths):
+            raise ValueError(
+                "Dynamic CP routed_experts and seq_lens must have the same sample count."
+            )
 
     positions = batch.make_position_ids()
     mask = batch.loss_mask
@@ -109,6 +122,12 @@ def _batch_samples(batch: PackedBatch) -> list[dict[str, torch.Tensor]]:
                 "labels": batch.labels[start:end],
                 "loss_mask": None if mask is None else mask[start:end],
                 "position_ids": positions[start:end],
+                "routed_experts": (
+                    None if route_rows is None else route_rows[len(samples)]
+                ),
+                "r3_replay_mask": (
+                    None if replay_mask is None else replay_mask[start:end]
+                ),
             }
         )
         start = end
@@ -292,7 +311,7 @@ def _select_context(
 
 
 def _select_batch(
-    samples: list[dict[str, torch.Tensor]],
+    samples: list[dict[str, Any]],
     ids: list[int],
     *,
     cp_size: int,
@@ -308,6 +327,20 @@ def _select_batch(
             return None
         return torch.cat(values)
 
+    def combine_routes() -> torch.Tensor | None:
+        values = [sample["routed_experts"] for sample in selected]
+        if values[0] is None:
+            if any(value is not None for value in values):
+                raise ValueError(
+                    "Dynamic CP cannot mix missing and present routed_experts."
+                )
+            return None
+        if any(value is None for value in values):
+            raise ValueError(
+                "Dynamic CP cannot mix missing and present routed_experts."
+            )
+        return torch.nested.as_nested_tensor(values, layout=torch.jagged)
+
     device = selected[0]["input_ids"].device
     return PackedBatch(
         input_ids=combine("input_ids"),
@@ -319,6 +352,8 @@ def _select_batch(
         ),
         loss_mask=combine("loss_mask"),
         position_ids=combine("position_ids"),
+        routed_experts=combine_routes(),
+        r3_replay_mask=combine("r3_replay_mask"),
         extras={_SAMPLE_IDS: ids, _LOCAL_CP_SIZE: cp_size, _GROUP_LEADER: leader},
     )
 
@@ -418,6 +453,63 @@ class _BoundIterator:
         self.binding.bind(int(batch.extras[_LOCAL_CP_SIZE]))
         self.consumed += 1
         return item
+
+
+class _ReplayProtocolBinding:
+    """Bind the scheduled CP group before router replay packs one microbatch."""
+
+    def __init__(self, protocol: Any, binding: _Binding):
+        self._protocol = protocol
+        self._binding = binding
+
+    def __getattr__(self, name: str) -> Any:
+        if self._protocol is None:
+            raise AttributeError(name)
+        return getattr(self._protocol, name)
+
+    def _bind(self, batch: PackedBatch) -> None:
+        self._binding.bind(int(batch.extras[_LOCAL_CP_SIZE]))
+
+    def pack_routed_experts(self, model: Any, batch: PackedBatch, routed: Any):
+        self._bind(batch)
+        if self._protocol is not None:
+            pack = getattr(self._protocol, "pack_routed_experts", None)
+            if callable(pack):
+                return pack(model, batch, routed)
+        from megatron.lite.model import protocol_utils
+
+        return protocol_utils.pack_routed_experts(model, batch, routed)
+
+    def pack_r3_replay_mask(self, model: Any, batch: PackedBatch):
+        self._bind(batch)
+        if self._protocol is not None:
+            pack = getattr(self._protocol, "pack_r3_replay_mask", None)
+            if callable(pack):
+                return pack(model, batch)
+        from megatron.lite.model import protocol_utils
+
+        return protocol_utils.pack_r3_replay_mask(model, batch)
+
+
+def _router_replay_requested(spec: Any) -> bool:
+    if not spec:
+        return False
+    action = spec.get("action") if isinstance(spec, Mapping) else spec
+    return action not in (None, "disabled")
+
+
+def _reject_fused_router_replay(model: Any) -> None:
+    roots = model if isinstance(model, (list, tuple)) else [model]
+    for root in roots:
+        modules = getattr(root, "modules", None)
+        candidates = modules() if callable(modules) else (root,)
+        if any(
+            bool(getattr(module, "moe_router_fusion", False)) for module in candidates
+        ):
+            raise NotImplementedError(
+                "Dynamic CP router replay requires moe_router_fusion=False because "
+                "the fused router path bypasses the replay hook."
+            )
 
 
 def _record_output(
@@ -592,8 +684,8 @@ class DynamicCPPlugin:
         parallel = handle.config.parallel
         if not bool(handle.config.impl_cfg.get("use_thd", True)):
             raise ValueError("Dynamic CP requires packed THD inputs.")
-        if int(parallel.pp) != 1 or int(parallel.vpp) != 1:
-            raise NotImplementedError("Dynamic CP requires PP=VPP=1.")
+        if int(parallel.vpp) != 1:
+            raise NotImplementedError("Dynamic CP requires VPP=1.")
         pool = ps.dp_cp_group
         pool_size = int(ps.dp_size) * int(ps.cp_size)
         if pool is None or pool.size() != pool_size or pool_size < 2 or pool_size & 1:
@@ -806,19 +898,29 @@ class DynamicCPPlugin:
         )
         bound = _BoundIterator(iter(scheduled), binding)
 
+        pending_pre_forward_scale: torch.Tensor | None = None
+        original_pre_forward = handle._extras.get("_dcp_original_pre_forward")
+
         def forward(model: Any, batch: PackedBatch):
-            if int(batch.extras[_LOCAL_CP_SIZE]) != binding.local_cp_size:
-                raise RuntimeError(
-                    "Dynamic CP forward does not match its bound subgroup."
+            nonlocal pending_pre_forward_scale
+            binding.bind(int(batch.extras[_LOCAL_CP_SIZE]))
+            if original_pre_forward is not None:
+                if pending_pre_forward_scale is None:
+                    raise RuntimeError(
+                        "Dynamic CP forward is missing its pre-forward scale."
+                    )
+                original_pre_forward(
+                    pending_pre_forward_scale * int(binding.local_cp_size or 1)
                 )
+                pending_pre_forward_scale = None
             return handle._extras["_dcp_original_forward"](model, batch)
 
-        pre_forward = handle._extras.get("_dcp_original_pre_forward")
-        if pre_forward is not None:
-            original_hook = pre_forward
+        pre_forward = None
+        if original_pre_forward is not None:
 
             def pre_forward(scale: torch.Tensor) -> None:
-                original_hook(scale * int(binding.local_cp_size or 1))
+                nonlocal pending_pre_forward_scale
+                pending_pre_forward_scale = scale
 
         records: list[dict[str, Any]] = []
         collector = getattr(loss_fn, "runtime_output_collector", None)
@@ -893,24 +995,30 @@ class DynamicCPPlugin:
             forward_only=False,
             router_replay=None,
         ):
-            if router_replay is not None:
-                raise NotImplementedError("Dynamic CP does not support router replay.")
             original_forward = handle._extras["forward_step"]
             original_hook = handle._extras.get("pre_forward_hook")
+            original_protocol = handle._extras.get("protocol")
             handle._extras["_dcp_original_forward"] = original_forward
             handle._extras["_dcp_original_pre_forward"] = original_hook
             prepared = None
             try:
+                replay_requested = _router_replay_requested(router_replay)
+                if replay_requested:
+                    _reject_fused_router_replay(handle._model)
                 prepared = self._prepare(handle, data, loss_fn, num_microbatches)
                 handle._extras["forward_step"] = prepared.forward
                 handle._extras["pre_forward_hook"] = prepared.pre_forward
+                if replay_requested:
+                    handle._extras["protocol"] = _ReplayProtocolBinding(
+                        original_protocol, prepared.binding
+                    )
                 return forward_backward(
                     handle,
                     prepared.data,
                     prepared.loss,
                     num_microbatches=prepared.count,
                     forward_only=forward_only,
-                    router_replay=None,
+                    router_replay=router_replay,
                 )
             finally:
                 try:
@@ -920,6 +1028,10 @@ class DynamicCPPlugin:
                     handle._extras.pop("_dcp_original_forward", None)
                     handle._extras.pop("_dcp_original_pre_forward", None)
                     handle._extras["forward_step"] = original_forward
+                    if original_protocol is None:
+                        handle._extras.pop("protocol", None)
+                    else:
+                        handle._extras["protocol"] = original_protocol
                     if original_hook is None:
                         handle._extras.pop("pre_forward_hook", None)
                     else:
@@ -930,6 +1042,13 @@ class DynamicCPPlugin:
 
 def install(runtime: Any, config: Mapping[str, Any]) -> None:
     """Install the sidecar on exactly one runtime object."""
+    if not isinstance(config, Mapping):
+        raise TypeError("dynamic_context_parallel plugin config must be a mapping.")
+    enabled = config.get("enabled", False)
+    if type(enabled) is not bool:
+        raise TypeError("dynamic_context_parallel.enabled must be a bool.")
+    if not enabled:
+        return
     plugin = DynamicCPPlugin(config)
     runtime.build_model = plugin.wrap_build_model(runtime.build_model)
     runtime.forward_backward = plugin.wrap_forward_backward(runtime.forward_backward)
