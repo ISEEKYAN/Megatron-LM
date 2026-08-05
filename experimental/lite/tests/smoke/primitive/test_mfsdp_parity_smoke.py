@@ -176,6 +176,17 @@ class TinyTEGroupedMoE(nn.Module):
         return self.out(x)
 
 
+class TinyNonFusedLinear(nn.Module):
+    """Regular autograd linear covering M-FSDP's non-TE gradient path."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
 class RecordingSGD(torch.optim.SGD):
     def __init__(self, param_groups):
         super().__init__(param_groups, lr=0.0)
@@ -417,6 +428,11 @@ def _bf16_roundtrip_difference_fraction(tensors: list[torch.Tensor]) -> float:
     rounded = values.to(torch.bfloat16).to(torch.float32)
     assert not torch.equal(values, rounded)
     return float((values != rounded).float().mean().item())
+
+
+def _is_bf16_roundtrip_exact(tensor: torch.Tensor) -> bool:
+    values = tensor.detach().float()
+    return torch.equal(values, values.to(torch.bfloat16).to(torch.float32))
 
 
 def _memory_delta(
@@ -843,6 +859,7 @@ def test_mfsdp_native_fp32_fused_wgrad_reaches_optimizer_groups():
         for spec in bucket.specs:
             assert spec.shard_param is not None
             assert spec.full_param.grad_added_to_main_grad is True
+            assert spec.full_param.grad is None
             assert spec.full_param.main_grad.dtype is torch.float32
             main_grad_by_shard[id(spec.shard_param)] = (
                 spec.full_param.main_grad.detach().clone()
@@ -991,6 +1008,87 @@ def test_mfsdp_native_fp32_grouped_expert_wgrad_reaches_optimizer():
                     "main_grad_low_bit_fractions": main_grad_fractions,
                     "optimizer_grad_low_bit_fractions": optimizer_grad_fractions,
                     "consumed_grad_low_bit_fractions": consumed_grad_fractions,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+
+def test_mfsdp_non_fused_wgrad_accumulates_in_fp32_per_microbatch():
+    parallel = _dense_parallel_config()
+    ps = _parallel_state(parallel)
+    torch.manual_seed(10103)
+    torch.cuda.manual_seed_all(10103)
+    chunks = [TinyNonFusedLinear().cuda()]
+    optimizer_config = _optimizer_cfg(use_fused_optimizer=False)
+    impl_cfg = SimpleNamespace(
+        parallel=parallel,
+        optimizer_config=optimizer_config,
+    )
+
+    def build_recording_optimizer(param_groups, _optimizer_config):
+        return RecordingSGD(param_groups)
+
+    optimizer, finalize = build_mfsdp_training_optimizer(
+        chunks,
+        impl_cfg=impl_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(TinyNonFusedLinear,),
+        optimizer_factory=build_recording_optimizer,
+    )
+    chunk = chunks[0]
+    assert not hasattr(chunk.linear, "fuse_wgrad_accumulation")
+    assert len(chunk.param_sync.buckets) == 1
+    spec = chunk.param_sync.buckets[0].specs[0]
+    assert spec.shard_param is not None
+    assert spec.full_param.grad_added_to_main_grad is False
+
+    optimizer.zero_grad()
+    chunk(torch.ones(1, 4, device="cuda", dtype=torch.bfloat16)).sum().backward()
+    single_backward_grad = spec.full_param.main_grad.detach().clone()
+    assert spec.full_param.grad is None
+    assert spec.full_param.main_grad.dtype is torch.float32
+    assert torch.equal(single_backward_grad, torch.ones(4, 4, device="cuda"))
+    assert _is_bf16_roundtrip_exact(single_backward_grad)
+
+    optimizer.zero_grad()
+    chunk(
+        torch.full((1, 4), 256.0, device="cuda", dtype=torch.bfloat16)
+    ).sum().backward()
+    assert spec.full_param.grad is None
+    assert torch.equal(
+        spec.full_param.main_grad,
+        torch.full((4, 4), 256.0, device="cuda"),
+    )
+    assert _is_bf16_roundtrip_exact(spec.full_param.main_grad)
+
+    chunk(torch.ones(1, 4, device="cuda", dtype=torch.bfloat16)).sum().backward()
+    expected = torch.full((4, 4), 257.0, device="cuda")
+    assert spec.full_param.grad is None
+    assert torch.equal(spec.full_param.main_grad, expected)
+    assert not _is_bf16_roundtrip_exact(spec.full_param.main_grad)
+
+    finalize()
+    expected_shard = expected.reshape(-1).chunk(dist.get_world_size())[dist.get_rank()]
+    assert spec.shard_param.grad is not None
+    assert spec.shard_param.grad.dtype is torch.float32
+    assert torch.equal(spec.shard_param.grad, expected_shard)
+    success, _grad_norm, _num_zeros = optimizer.step()
+    recording_optimizer = optimizer._inner_optimizer.optimizer
+    consumed_grad = recording_optimizer.consumed_grad_by_param[id(spec.shard_param)]
+    assert success
+    assert torch.equal(consumed_grad, expected_shard)
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_NON_FUSED_FP32_ACCUMULATION] "
+            + json.dumps(
+                {
+                    "world_size": dist.get_world_size(),
+                    "single_backward_bf16_roundtrip_exact": True,
+                    "multi_microbatch_value": float(consumed_grad[0]),
+                    "multi_microbatch_bf16_roundtrip_exact": False,
                 },
                 sort_keys=True,
             ),
