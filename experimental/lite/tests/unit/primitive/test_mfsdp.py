@@ -17,6 +17,7 @@ import torch.multiprocessing as mp
 
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
 from megatron.lite.primitive.optimizers.mfsdp import buffer as mfsdp_buffer
+from megatron.lite.primitive.optimizers.mfsdp import cpu_offload as mfsdp_cpu_offload
 from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
 from megatron.lite.runtime.contracts.config import ParallelConfig
 
@@ -806,6 +807,15 @@ def test_mfsdp_offload_fraction_keeps_optimizer_state_on_cpu():
 
     for gpu_param in inner.params:
         assert gpu_param.device.type != "cuda" or gpu_param.data is not None
+
+
+def test_mfsdp_cpu_offload_queues_transfers_before_one_d2h_fence():
+    source = inspect.getsource(mfsdp_cpu_offload.CpuAdamGroup.step)
+
+    assert source.count("non_blocking=True") == 2
+    fence = source.index("torch.cuda.current_stream().synchronize()")
+    optimizer_step = source.index("self._cpu_optimizer.step()")
+    assert fence < optimizer_step
 
 
 def test_mfsdp_full_offload_has_six_gpu_and_twelve_cpu_bytes_per_param():
