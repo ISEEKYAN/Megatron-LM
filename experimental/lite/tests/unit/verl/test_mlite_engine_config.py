@@ -255,7 +255,7 @@ def test_online_qat_export_wraps_mlite_hf_weight_stream(monkeypatch) -> None:
             qat={
                 "enable": True,
                 "apply_modelopt_fake_quant": False,
-                "mode": "mxfp4",
+                "mode": "nvfp4",
                 "group_size": 32,
                 "ignore_patterns": ["lm_head"],
             }
@@ -295,9 +295,102 @@ def test_online_qat_export_wraps_mlite_hf_weight_stream(monkeypatch) -> None:
     assert captured["weights"] is source_weights
     assert captured["modules"] == [engine.module]
     assert captured["bridge"] is None
-    assert captured["qat_config"].mode == "mxfp4"
+    assert captured["qat_config"].mode == "nvfp4"
     assert captured["qat_config"].group_size == 32
     assert captured["qat_config"].apply_modelopt_fake_quant is False
+
+
+def test_online_mxfp4_qat_uses_native_packed_scale_export_for_k3(monkeypatch) -> None:
+    """K3 must send checkpoint-format MXFP4, never BF16 into a scale loader."""
+    engine = _engine(
+        engine_config=_engine_config(
+            qat={
+                "enable": True,
+                "apply_modelopt_fake_quant": False,
+                "mode": "mxfp4",
+                "group_size": 32,
+            }
+        )
+    )
+    engine.model_config.hf_config = {"model_type": "kimi_k3"}
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            captured.update(kwargs)
+            return iter(
+                [
+                    (
+                        "language_model.model.layers.0.block_sparse_moe."
+                        "experts.0.w1.weight_packed",
+                        torch.empty((3072, 1792), dtype=torch.uint8),
+                    ),
+                    (
+                        "language_model.model.layers.0.block_sparse_moe."
+                        "experts.0.w1.weight_scale",
+                        torch.empty((3072, 112), dtype=torch.uint8),
+                    ),
+                    (
+                        "language_model.model.layers.0.block_sparse_moe."
+                        "experts.0.w3.weight_packed",
+                        torch.empty((3072, 1792), dtype=torch.uint8),
+                    ),
+                    (
+                        "language_model.model.layers.0.block_sparse_moe."
+                        "experts.0.w3.weight_scale",
+                        torch.empty((3072, 112), dtype=torch.uint8),
+                    ),
+                    (
+                        "language_model.model.layers.0.block_sparse_moe."
+                        "experts.0.w2.weight_packed",
+                        torch.empty((3584, 1536), dtype=torch.uint8),
+                    ),
+                    (
+                        "language_model.model.layers.0.block_sparse_moe."
+                        "experts.0.w2.weight_scale",
+                        torch.empty((3584, 96), dtype=torch.uint8),
+                    ),
+                ]
+            )
+
+    forbidden_exporter = types.ModuleType("verl.utils.modelopt")
+
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("MXFP4 must use the model protocol export, not ModelOpt")
+
+    forbidden_exporter.export_qat_weights = fail_if_called
+    monkeypatch.setitem(sys.modules, "verl.utils.modelopt", forbidden_exporter)
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine.module = object()
+    engine._initial_sync_cache_cleared = True
+
+    weights, metadata = engine.get_per_tensor_param()
+
+    exported = dict(weights)
+    assert metadata is None
+    assert captured["target"] == "mxfp4"
+    assert all(tensor.dtype == torch.uint8 for tensor in exported.values())
+    assert exported[
+        "language_model.model.layers.0.block_sparse_moe.experts.0.w1.weight_packed"
+    ].shape == (3072, 1792)
+    assert exported[
+        "language_model.model.layers.0.block_sparse_moe.experts.0.w1.weight_scale"
+    ].shape == (3072, 112)
+    assert exported[
+        "language_model.model.layers.0.block_sparse_moe.experts.0.w3.weight_packed"
+    ].shape == (3072, 1792)
+    assert exported[
+        "language_model.model.layers.0.block_sparse_moe.experts.0.w3.weight_scale"
+    ].shape == (3072, 112)
+    assert exported[
+        "language_model.model.layers.0.block_sparse_moe.experts.0.w2.weight_packed"
+    ].shape == (3584, 1536)
+    assert exported[
+        "language_model.model.layers.0.block_sparse_moe.experts.0.w2.weight_scale"
+    ].shape == (3584, 96)
 
 
 def test_qat_export_rejects_native_resync_format_double_quantization() -> None:
