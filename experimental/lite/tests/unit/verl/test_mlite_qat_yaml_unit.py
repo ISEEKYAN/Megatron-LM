@@ -44,3 +44,30 @@ def test_default_yaml_keeps_export_and_training_qat_disabled() -> None:
     assert spec.ignore_patterns == _DEFAULT_IGNORE_PATTERNS
     assert not spec.targets_module("layers.0.mlp.router.gate")
     assert spec.targets_module("layers.0.mlp.gate_up")
+
+
+def test_colocated_ref_follows_actor_runtime_plugins() -> None:
+    config_root = Path(__file__).parents[3] / "examples" / "verl"
+    ref = OmegaConf.load(
+        config_root / "verl_mlite" / "config" / "ref" / "mlite_ref.yaml"
+    )
+    actor_plugins = {
+        "dynamic_context_parallel": {
+            "enabled": True,
+            "max_seqlen_per_dp_cp_rank": 4096,
+        }
+    }
+    root = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "actor": {"engine": {"impl_cfg": {"runtime_plugins": actor_plugins}}},
+                "ref": {"engine": ref.engine},
+            }
+        }
+    )
+
+    resolved = OmegaConf.to_container(
+        root.actor_rollout_ref.ref.engine.impl_cfg, resolve=True
+    )
+
+    assert resolved["runtime_plugins"] == actor_plugins

@@ -60,10 +60,11 @@ class Qwen3MoEWeightSpec:
         c = self.config
         wm: dict[str, list[str]] = {
             "embed.embedding.weight": ["model.embed_tokens.weight"],
-            "mtp_embed.embedding.weight": ["model.embed_tokens.weight"],
             "norm.weight": ["model.norm.weight"],
             "head.col.linear.weight": ["lm_head.weight"],
         }
+        if c.num_nextn_predict_layers > 0:
+            wm["mtp_embed.embedding.weight"] = ["model.embed_tokens.weight"]
         for li in range(c.num_hidden_layers):
             ap = f"model.layers.{li}.self_attn"
             mp = f"model.layers.{li}.mlp"
