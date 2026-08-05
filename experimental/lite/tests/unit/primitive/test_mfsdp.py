@@ -795,6 +795,7 @@ def test_mfsdp_offload_fraction_keeps_optimizer_state_on_cpu():
     assert cpu_group is not None, (
         "Expected cpu_group to be set for offload_fraction=1.0"
     )
+    assert len(cpu_group._cpu_optimizer.optimizers) == len(cpu_group._cpu_params)
     for cpu_p in cpu_group._cpu_params:
         assert cpu_p.device.type == "cpu", "cpu_param should be on CPU"
     cpu_opt_state = cpu_group._cpu_optimizer.state
@@ -808,13 +809,14 @@ def test_mfsdp_offload_fraction_keeps_optimizer_state_on_cpu():
         assert gpu_param.device.type != "cuda" or gpu_param.data is not None
 
 
-def test_mfsdp_cpu_offload_queues_transfers_before_one_d2h_fence():
+def test_mfsdp_cpu_offload_overlaps_per_param_d2h_cpu_step_and_h2d():
     source = inspect.getsource(mfsdp_cpu_offload.CpuAdamGroup.step)
 
-    assert source.count("non_blocking=True") == 2
-    fence = source.index("torch.cuda.current_stream().synchronize()")
-    optimizer_step = source.index("self._cpu_optimizer.step()")
-    assert fence < optimizer_step
+    assert source.count("non_blocking=True") >= 2
+    assert "self._d2h_stream.record_event()" in source
+    assert "d2h_event.synchronize()" in source
+    assert "with torch.cuda.stream(self._h2d_stream)" in source
+    assert "self._h2d_stream.record_event().wait(current_stream)" in source
 
 
 def test_mfsdp_full_offload_has_six_gpu_and_twelve_cpu_bytes_per_param():
@@ -1105,6 +1107,34 @@ def test_mfsdp_offload_fraction_checkpoint_round_trips():
     optimizer.finish_grad_sync()
     success, _, _ = optimizer.step()
     assert success
+
+    legacy_optimizer = {"state": {}, "param_groups": []}
+    expected_exp_avg = []
+    for index, cpu_optimizer in enumerate(cpu_group._cpu_optimizer.optimizers):
+        local = copy.deepcopy(cpu_optimizer.state_dict())
+        group = local["param_groups"][0]
+        group["params"] = [index]
+        legacy_optimizer["param_groups"].append(group)
+        if 0 in local["state"]:
+            legacy_optimizer["state"][index] = local["state"][0]
+            expected_exp_avg.append(local["state"][0]["exp_avg"].clone())
+    legacy_saved = {
+        "optimizer": legacy_optimizer,
+        "master_params": [param.detach().clone() for param in cpu_group._cpu_params],
+    }
+    for state in cpu_group._cpu_optimizer.state.values():
+        state["exp_avg"].zero_()
+    cpu_group.load_state_dict(legacy_saved)
+    restored_exp_avg = [
+        state["exp_avg"]
+        for cpu_optimizer in cpu_group._cpu_optimizer.optimizers
+        for state in cpu_optimizer.state.values()
+    ]
+    assert len(restored_exp_avg) == len(expected_exp_avg)
+    assert all(
+        torch.equal(restored, expected)
+        for restored, expected in zip(restored_exp_avg, expected_exp_avg)
+    )
 
 
 def _single_rank_mfsdp_stack():
