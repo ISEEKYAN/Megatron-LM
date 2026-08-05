@@ -9,6 +9,60 @@ import torch
 import torch.nn as nn
 
 
+class _CpuOptimizerCollection:
+    """Compatibility facade for one CPU optimizer per offloaded parameter."""
+
+    def __init__(self, optimizers: list[torch.optim.Optimizer]) -> None:
+        self.optimizers = optimizers
+
+    @property
+    def param_groups(self) -> list[dict[str, Any]]:
+        return [
+            group for optimizer in self.optimizers for group in optimizer.param_groups
+        ]
+
+    @property
+    def state(self) -> dict[torch.Tensor, dict[str, Any]]:
+        return {
+            param: value
+            for optimizer in self.optimizers
+            for param, value in optimizer.state.items()
+        }
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"optimizers": [optimizer.state_dict() for optimizer in self.optimizers]}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        optimizer_states = state_dict.get("optimizers")
+        if optimizer_states is not None:
+            if len(optimizer_states) != len(self.optimizers):
+                raise ValueError(
+                    "M-FSDP CPU optimizer checkpoint parameter count does not "
+                    f"match: expected {len(self.optimizers)}, got {len(optimizer_states)}."
+                )
+            for optimizer, optimizer_state in zip(self.optimizers, optimizer_states):
+                optimizer.load_state_dict(optimizer_state)
+            return
+
+        # Backward compatibility with checkpoints from the former aggregate
+        # AdamW. Torch state ids are ordered by the flattened param_groups.
+        group_by_param_id = {
+            param_id: group
+            for group in state_dict["param_groups"]
+            for param_id in group["params"]
+        }
+        for param_id, optimizer in enumerate(self.optimizers):
+            group = dict(group_by_param_id[param_id])
+            group["params"] = [0]
+            local_state = state_dict["state"].get(param_id)
+            optimizer.load_state_dict(
+                {
+                    "state": {} if local_state is None else {0: local_state},
+                    "param_groups": [group],
+                }
+            )
+
+
 class CpuAdamGroup:
     """Adam momentum state on CPU for a subset of M-FSDP shard parameters.
 
@@ -16,10 +70,8 @@ class CpuAdamGroup:
     live on CPU. ``shard_param.data`` is the GPU compute/all-gather mirror and
     is refreshed after each CPU update.
 
-    Per-step flow:
-      1. D2H — enqueue GPU gradient → pinned CPU grad buffer, then fence once
-      2. CPU AdamW step updates cpu_param
-      3. H2D — enqueue updated cpu_param → GPU shard_param.data
+    Per-step flow overlaps later D2H copies and earlier H2D copies with each
+    per-parameter CPU AdamW update using dedicated streams and D2H events.
     """
 
     def __init__(
@@ -56,30 +108,44 @@ class CpuAdamGroup:
             cpu_group["params"] = cpu_group_params
             cpu_groups.append(cpu_group)
 
-        self._cpu_optimizer = torch.optim.AdamW(
-            cpu_groups,
-            lr=lr,
-            betas=betas,
-            eps=eps,
-            # Keep scalar CPU AdamW: the foreach path regresses the isolated
-            # optimizer step for the representative M-FSDP MoE workload.
-            foreach=False,
-        )
+        cpu_optimizers: list[torch.optim.Optimizer] = []
+        for group in cpu_groups:
+            group_defaults = {k: v for k, v in group.items() if k != "params"}
+            for cpu_param in group["params"]:
+                cpu_optimizers.append(
+                    torch.optim.AdamW(
+                        [{**group_defaults, "params": [cpu_param]}],
+                        lr=lr,
+                        betas=betas,
+                        eps=eps,
+                        # A one-parameter optimizer has no foreach opportunity.
+                        foreach=False,
+                    )
+                )
+        self._cpu_optimizer = _CpuOptimizerCollection(cpu_optimizers)
+        if use_pinned:
+            self._d2h_stream = torch.cuda.Stream()
+            self._h2d_stream = torch.cuda.Stream()
 
     @property
     def param_groups(self) -> list[dict[str, Any]]:
         return self._cpu_optimizer.param_groups
 
     def step(self) -> None:
+        d2h_events: list[torch.cuda.Event | None] = []
+        current_stream = torch.cuda.current_stream() if self._use_pinned else None
+        if self._use_pinned:
+            self._d2h_stream.wait_stream(current_stream)
+            self._h2d_stream.wait_stream(current_stream)
+
         for i, (gpu_param, cpu_param) in enumerate(
             zip(self._gpu_params, self._cpu_params)
         ):
             if gpu_param.grad is None:
                 cpu_param.grad = None
+                d2h_events.append(None)
                 continue
-
             flat_gpu_grad = gpu_param.grad.detach().view(-1)
-
             buf = self._cpu_grad_bufs[i]
             if buf is None or buf.shape != flat_gpu_grad.shape:
                 buf = torch.zeros(
@@ -88,19 +154,33 @@ class CpuAdamGroup:
                 if self._use_pinned:
                     buf = buf.pin_memory()
                 self._cpu_grad_bufs[i] = buf
-
-            buf.copy_(flat_gpu_grad, non_blocking=True)
+            if self._use_pinned:
+                with torch.cuda.stream(self._d2h_stream):
+                    buf.copy_(flat_gpu_grad, non_blocking=True)
+                    d2h_events.append(self._d2h_stream.record_event())
+            else:
+                buf.copy_(flat_gpu_grad, non_blocking=True)
+                d2h_events.append(None)
             cpu_param.grad = buf
 
-        if self._use_pinned:
-            # CPU AdamW must not read pinned gradients until every queued D2H
-            # copy has completed. One fence avoids synchronizing per tensor.
-            torch.cuda.current_stream().synchronize()
-        self._cpu_optimizer.step()
-
-        for gpu_param, cpu_param in zip(self._gpu_params, self._cpu_params):
-            gpu_param.data.view(-1).copy_(cpu_param.data, non_blocking=True)
+        for gpu_param, cpu_param, cpu_optimizer, d2h_event in zip(
+            self._gpu_params,
+            self._cpu_params,
+            self._cpu_optimizer.optimizers,
+            d2h_events,
+        ):
+            if d2h_event is not None:
+                d2h_event.synchronize()
+            cpu_optimizer.step()
+            if self._use_pinned:
+                with torch.cuda.stream(self._h2d_stream):
+                    gpu_param.data.view(-1).copy_(cpu_param.data, non_blocking=True)
+            else:
+                gpu_param.data.view(-1).copy_(cpu_param.data, non_blocking=True)
             cpu_param.grad = None
+
+        if self._use_pinned:
+            self._h2d_stream.record_event().wait(current_stream)
 
     def state_dict(self) -> dict[str, Any]:
         return {
