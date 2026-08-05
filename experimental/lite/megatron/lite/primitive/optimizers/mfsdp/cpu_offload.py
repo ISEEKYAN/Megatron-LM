@@ -3,10 +3,58 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _TransferRun:
+    """Adjacent shard views transferred as one storage span."""
+
+    indices: tuple[int, ...]
+    cpu_master: torch.Tensor | None = None
+    cpu_grad: torch.Tensor | None = None
+
+
+def _are_adjacent_views(left: torch.Tensor, right: torch.Tensor) -> bool:
+    if left.numel() == 0 or right.numel() == 0:
+        return False
+    return (
+        left.device == right.device
+        and left.dtype == right.dtype
+        and left.layout == torch.strided
+        and right.layout == torch.strided
+        and left.is_contiguous()
+        and right.is_contiguous()
+        and left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
+        and right.storage_offset() == left.storage_offset() + left.numel()
+    )
+
+
+def _contiguous_runs(tensors: list[torch.Tensor]) -> list[_TransferRun]:
+    runs: list[_TransferRun] = []
+    for index, tensor in enumerate(tensors):
+        if runs and _are_adjacent_views(tensors[runs[-1].indices[-1]], tensor):
+            runs[-1].indices += (index,)
+        else:
+            runs.append(_TransferRun(indices=(index,)))
+    return runs
+
+
+def _storage_span(
+    tensors: list[torch.Tensor], indices: tuple[int, ...]
+) -> torch.Tensor:
+    first = tensors[indices[0]].detach()
+    total_numel = sum(tensors[index].numel() for index in indices)
+    return torch.as_strided(
+        first, (total_numel,), (1,), storage_offset=first.storage_offset()
+    )
 
 
 class _CpuOptimizerCollection:
@@ -70,8 +118,9 @@ class CpuAdamGroup:
     live on CPU. ``shard_param.data`` is the GPU compute/all-gather mirror and
     is refreshed after each CPU update.
 
-    Per-step flow overlaps later D2H copies and earlier H2D copies with each
-    per-parameter CPU AdamW update using dedicated streams and D2H events.
+    Adjacent shard views sharing flat M-FSDP storage transfer as one run. The
+    run-level D2H and H2D copies overlap with CPU AdamW updates on other runs;
+    discontiguous or partially missing gradients retain the scalar fallback.
     """
 
     def __init__(
@@ -85,28 +134,51 @@ class CpuAdamGroup:
         use_pinned = torch.cuda.is_available()
         self._use_pinned = use_pinned
         self._gpu_params: list[nn.Parameter] = []
-        self._cpu_params: list[torch.Tensor] = []
-        self._cpu_grad_bufs: list[torch.Tensor | None] = []
+        group_indices: list[list[int]] = []
         cpu_groups: list[dict[str, Any]] = []
 
         for group in gpu_param_groups:
-            cpu_group_params: list[torch.Tensor] = []
+            indices: list[int] = []
             for gpu_param in group["params"]:
-                flat = gpu_param.detach().cpu().float().contiguous()
-                if use_pinned:
-                    pinned = torch.empty_like(flat, pin_memory=True)
-                    pinned.copy_(flat)
-                    flat = pinned
-                # Wrap as leaf tensor with grad support so AdamW can update it.
-                cpu_p = flat.detach().requires_grad_(True)
+                indices.append(len(self._gpu_params))
                 self._gpu_params.append(gpu_param)
-                self._cpu_params.append(cpu_p)
-                self._cpu_grad_bufs.append(None)
-                cpu_group_params.append(cpu_p)
+            group_indices.append(indices)
 
+        self._transfer_runs = _contiguous_runs(self._gpu_params)
+        cpu_params: list[torch.Tensor | None] = [None] * len(self._gpu_params)
+        for run in self._transfer_runs:
+            total_numel = sum(self._gpu_params[i].numel() for i in run.indices)
+            run.cpu_master = torch.empty(
+                total_numel, dtype=torch.float32, device="cpu", pin_memory=use_pinned
+            )
+            run.cpu_master.copy_(_storage_span(self._gpu_params, run.indices))
+            offset = 0
+            for index in run.indices:
+                numel = self._gpu_params[index].numel()
+                # AdamW sees leaf views while transfers use the owning flat buffer.
+                cpu_params[index] = (
+                    run.cpu_master.narrow(0, offset, numel)
+                    .detach()
+                    .requires_grad_(True)
+                )
+                offset += numel
+
+        self._cpu_params = [param for param in cpu_params if param is not None]
+        if len(self._cpu_params) != len(self._gpu_params):
+            raise RuntimeError("M-FSDP CPU master construction lost a parameter view.")
+        self._cpu_grad_bufs: list[torch.Tensor | None] = [None] * len(self._gpu_params)
+
+        for group, indices in zip(gpu_param_groups, group_indices):
             cpu_group = {k: v for k, v in group.items() if k != "params"}
-            cpu_group["params"] = cpu_group_params
+            cpu_group["params"] = [self._cpu_params[index] for index in indices]
             cpu_groups.append(cpu_group)
+
+        logger.info(
+            "M-FSDP CPU offload packs %d parameter shards into %d contiguous "
+            "transfer runs.",
+            len(self._gpu_params),
+            len(self._transfer_runs),
+        )
 
         cpu_optimizers: list[torch.optim.Optimizer] = []
         for group in cpu_groups:
@@ -138,46 +210,71 @@ class CpuAdamGroup:
             self._d2h_stream.wait_stream(current_stream)
             self._h2d_stream.wait_stream(current_stream)
 
-        for i, (gpu_param, cpu_param) in enumerate(
-            zip(self._gpu_params, self._cpu_params)
-        ):
-            if gpu_param.grad is None:
-                cpu_param.grad = None
-                d2h_events.append(None)
-                continue
-            flat_gpu_grad = gpu_param.grad.detach().view(-1)
-            buf = self._cpu_grad_bufs[i]
-            if buf is None or buf.shape != flat_gpu_grad.shape:
-                buf = torch.zeros(
-                    flat_gpu_grad.shape, dtype=torch.float32, device="cpu"
+        for run in self._transfer_runs:
+            if run.cpu_grad is None:
+                assert run.cpu_master is not None
+                run.cpu_grad = torch.zeros_like(
+                    run.cpu_master, pin_memory=self._use_pinned
                 )
-                if self._use_pinned:
-                    buf = buf.pin_memory()
-                self._cpu_grad_bufs[i] = buf
+                offset = 0
+                for index in run.indices:
+                    numel = self._gpu_params[index].numel()
+                    self._cpu_grad_bufs[index] = run.cpu_grad.narrow(0, offset, numel)
+                    offset += numel
+
+            active_indices = [
+                index
+                for index in run.indices
+                if self._gpu_params[index].grad is not None
+            ]
+            active_index_set = set(active_indices)
+            for index in run.indices:
+                self._cpu_params[index].grad = (
+                    self._cpu_grad_bufs[index] if index in active_index_set else None
+                )
+
+            def copy_grads() -> None:
+                assert run.cpu_grad is not None
+                grads = [
+                    self._gpu_params[index].grad.detach().view(-1)
+                    for index in active_indices
+                ]
+                if len(active_indices) == len(run.indices) and all(
+                    _are_adjacent_views(left, right)
+                    for left, right in zip(grads, grads[1:])
+                ):
+                    run.cpu_grad.copy_(
+                        _storage_span(grads, tuple(range(len(grads)))),
+                        non_blocking=True,
+                    )
+                    return
+                for index, grad in zip(active_indices, grads):
+                    buf = self._cpu_grad_bufs[index]
+                    assert buf is not None
+                    buf.copy_(grad, non_blocking=True)
+
             if self._use_pinned:
                 with torch.cuda.stream(self._d2h_stream):
-                    buf.copy_(flat_gpu_grad, non_blocking=True)
+                    copy_grads()
                     d2h_events.append(self._d2h_stream.record_event())
             else:
-                buf.copy_(flat_gpu_grad, non_blocking=True)
+                copy_grads()
                 d2h_events.append(None)
-            cpu_param.grad = buf
 
-        for gpu_param, cpu_param, cpu_optimizer, d2h_event in zip(
-            self._gpu_params,
-            self._cpu_params,
-            self._cpu_optimizer.optimizers,
-            d2h_events,
-        ):
+        for run, d2h_event in zip(self._transfer_runs, d2h_events):
             if d2h_event is not None:
                 d2h_event.synchronize()
-            cpu_optimizer.step()
+            for index in run.indices:
+                self._cpu_optimizer.optimizers[index].step()
+            assert run.cpu_master is not None
+            gpu_span = _storage_span(self._gpu_params, run.indices)
             if self._use_pinned:
                 with torch.cuda.stream(self._h2d_stream):
-                    gpu_param.data.view(-1).copy_(cpu_param.data, non_blocking=True)
+                    gpu_span.copy_(run.cpu_master, non_blocking=True)
             else:
-                gpu_param.data.view(-1).copy_(cpu_param.data, non_blocking=True)
-            cpu_param.grad = None
+                gpu_span.copy_(run.cpu_master, non_blocking=True)
+            for index in run.indices:
+                self._cpu_params[index].grad = None
 
         if self._use_pinned:
             self._h2d_stream.record_event().wait(current_stream)

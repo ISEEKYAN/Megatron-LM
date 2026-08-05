@@ -819,6 +819,75 @@ def test_mfsdp_cpu_offload_overlaps_per_param_d2h_cpu_step_and_h2d():
     assert "self._h2d_stream.record_event().wait(current_stream)" in source
 
 
+def test_mfsdp_cpu_offload_coalesces_only_adjacent_shard_views():
+    shared = torch.arange(12, dtype=torch.bfloat16)
+    separate = torch.arange(4, dtype=torch.bfloat16)
+    params = [
+        torch.nn.Parameter(shared.narrow(0, 0, 4)),
+        torch.nn.Parameter(shared.narrow(0, 4, 4)),
+        torch.nn.Parameter(separate),
+    ]
+
+    cpu_group = mfsdp_cpu_offload.CpuAdamGroup(
+        [{"params": params, "weight_decay": 0.0}],
+        lr=1.0e-3,
+        betas=(0.9, 0.999),
+        eps=1.0e-8,
+    )
+
+    assert [run.indices for run in cpu_group._transfer_runs] == [(0, 1), (2,)]
+    assert (
+        cpu_group._cpu_params[0].untyped_storage().data_ptr()
+        == cpu_group._cpu_params[1].untyped_storage().data_ptr()
+    )
+    assert (
+        cpu_group._cpu_params[1].untyped_storage().data_ptr()
+        != cpu_group._cpu_params[2].untyped_storage().data_ptr()
+    )
+
+
+def test_mfsdp_cpu_offload_packed_run_matches_scalar_adamw():
+    shared = torch.tensor(
+        [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0],
+        dtype=torch.bfloat16,
+    )
+    params = [
+        torch.nn.Parameter(shared.narrow(0, 0, 4)),
+        torch.nn.Parameter(shared.narrow(0, 4, 4)),
+    ]
+    grads = [
+        torch.tensor([0.25, -0.5, 0.75, -1.0], dtype=torch.bfloat16),
+        torch.tensor([1.25, -1.5, 1.75, -2.0], dtype=torch.bfloat16),
+    ]
+    references = [
+        param.detach().float().clone().requires_grad_(True) for param in params
+    ]
+    reference_optimizers = [
+        torch.optim.AdamW([param], lr=1.0e-3, betas=(0.9, 0.999), eps=1.0e-8)
+        for param in references
+    ]
+    cpu_group = mfsdp_cpu_offload.CpuAdamGroup(
+        [{"params": params, "weight_decay": 0.01}],
+        lr=1.0e-3,
+        betas=(0.9, 0.999),
+        eps=1.0e-8,
+    )
+
+    for param, reference, grad, reference_optimizer in zip(
+        params, references, grads, reference_optimizers
+    ):
+        param.grad = grad
+        reference.grad = grad.float()
+        reference_optimizer.step()
+    cpu_group.step()
+
+    for param, cpu_param, reference in zip(
+        params, cpu_group._cpu_params, references
+    ):
+        assert torch.equal(cpu_param, reference)
+        assert torch.equal(param, reference.to(dtype=param.dtype))
+
+
 def test_mfsdp_full_offload_has_six_gpu_and_twelve_cpu_bytes_per_param():
     _Model, _Unit, ps, engine_cfg = _build_offload_stack(offload_fraction=1.0)
 
