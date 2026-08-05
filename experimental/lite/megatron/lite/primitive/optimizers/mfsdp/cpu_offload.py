@@ -61,7 +61,9 @@ class CpuAdamGroup:
             lr=lr,
             betas=betas,
             eps=eps,
-            foreach=False,
+            # CPU offload creates many shard tensors; batch their AdamW updates
+            # instead of paying one Python dispatch per tensor.
+            foreach=True,
         )
 
     @property

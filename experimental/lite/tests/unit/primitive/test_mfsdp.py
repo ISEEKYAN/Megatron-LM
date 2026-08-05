@@ -794,6 +794,7 @@ def test_mfsdp_offload_fraction_keeps_optimizer_state_on_cpu():
     assert cpu_group is not None, (
         "Expected cpu_group to be set for offload_fraction=1.0"
     )
+    assert cpu_group._cpu_optimizer.defaults["foreach"] is True
 
     for cpu_p in cpu_group._cpu_params:
         assert cpu_p.device.type == "cpu", "cpu_param should be on CPU"
@@ -923,9 +924,9 @@ def test_mfsdp_offload_fraction_numerically_matches_no_offload():
     }
     assert ref_params.keys() == cpu_params.keys()
     for name in ref_params:
-        assert torch.allclose(
-            ref_params[name], cpu_params[name], atol=1e-5, rtol=1e-4
-        ), f"Parameter {name} diverges between GPU-only and CPU-offload runs"
+        assert torch.equal(ref_params[name], cpu_params[name]), (
+            f"Parameter {name} diverges between GPU-only and CPU-offload runs"
+        )
 
 
 def test_mfsdp_offload_fraction_partial_splits_by_numel():
