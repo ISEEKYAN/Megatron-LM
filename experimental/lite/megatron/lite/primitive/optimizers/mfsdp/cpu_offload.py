@@ -61,6 +61,8 @@ class CpuAdamGroup:
             lr=lr,
             betas=betas,
             eps=eps,
+            # Keep scalar CPU AdamW: the foreach path regresses the isolated
+            # optimizer step for the representative M-FSDP MoE workload.
             foreach=False,
         )
 

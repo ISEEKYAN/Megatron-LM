@@ -923,9 +923,9 @@ def test_mfsdp_offload_fraction_numerically_matches_no_offload():
     }
     assert ref_params.keys() == cpu_params.keys()
     for name in ref_params:
-        assert torch.allclose(
-            ref_params[name], cpu_params[name], atol=1e-5, rtol=1e-4
-        ), f"Parameter {name} diverges between GPU-only and CPU-offload runs"
+        assert torch.equal(ref_params[name], cpu_params[name]), (
+            f"Parameter {name} diverges between GPU-only and CPU-offload runs"
+        )
 
 
 def test_mfsdp_offload_fraction_partial_splits_by_numel():
