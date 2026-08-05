@@ -625,6 +625,12 @@ class ParamBucket:
             return None
         self._grad_reduce_launched = True
         self.prepare_main_grads()
+        with torch.no_grad():
+            for spec in self.specs:
+                grad = spec.full_param.grad
+                if grad is not None and not spec.full_param.grad_added_to_main_grad:
+                    spec.full_param.main_grad.add_(grad)
+                spec.full_param.grad = None
         if self.policy.grad_comm_dtype == self.policy.main_grads_dtype:
             grad_input = self.full_main_grad_buffer
         else:
@@ -641,14 +647,6 @@ class ParamBucket:
             )
             grad_input = self._grad_lease.tensor
             grad_input.copy_(self.full_main_grad_buffer)
-        with torch.no_grad():
-            for spec in self.specs:
-                grad = spec.full_param.grad
-                if grad is not None and not spec.full_param.grad_added_to_main_grad:
-                    grad_input.narrow(0, spec.full_offset, spec.numel).copy_(
-                        grad.reshape(-1)
-                    )
-                spec.full_param.grad = None
         return self.local_grad_comm_buffer, grad_input
 
     def mark_grad_reduce_launched(self, work: Any | None) -> None:
@@ -740,6 +738,10 @@ class ParamBucket:
                 return
             self._grad_ready_ids.add(id(spec))
             if param.grad_added_to_main_grad:
+                param.grad = None
+            else:
+                with torch.no_grad():
+                    param.main_grad.add_(param.grad)
                 param.grad = None
             if len(self._grad_ready_ids) != len(self.specs):
                 return
