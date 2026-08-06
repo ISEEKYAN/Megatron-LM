@@ -257,9 +257,9 @@ def compare_correctness_artifacts(
             mismatches.append({"step": idx, "field": "loss"})
         if not grad_matches:
             mismatches.append({"step": idx, "field": "grad_norm"})
-        for field in ("post_step_weights", "update_successful", "num_zeros"):
-            if base.get(field) != cand.get(field):
-                mismatches.append({"step": idx, "field": field})
+        for field_name in ("post_step_weights", "update_successful", "num_zeros"):
+            if base.get(field_name) != cand.get(field_name):
+                mismatches.append({"step": idx, "field": field_name})
         if not _tensor_fingerprint_matches(base.get("logits"), cand.get("logits")):
             mismatches.append({"step": idx, "field": "logits"})
 

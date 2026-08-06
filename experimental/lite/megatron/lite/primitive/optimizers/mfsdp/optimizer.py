@@ -220,9 +220,7 @@ class _StandaloneOptimizer:
                 for group, group_values in zip(
                     self.optimizer.param_groups, param_values, strict=True
                 ):
-                    for param, value in zip(
-                        group["params"], group_values, strict=True
-                    ):
+                    for param, value in zip(group["params"], group_values, strict=True):
                         param.copy_(value.to(device=param.device, dtype=param.dtype))
 
     def offload_state_to_cpu(self) -> None:

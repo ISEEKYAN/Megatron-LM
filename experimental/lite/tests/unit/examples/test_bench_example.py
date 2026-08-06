@@ -248,9 +248,9 @@ def test_mfsdp_offload_bench_script_is_single_arm_and_slurm_guarded():
     assert "SLURM_JOB_ID" in script
     assert "WANDB_PROJECT" in script
     assert "avg_optimizer_step_ms" in script
-    assert "'{\"optimizer\":\"mfsdp\"}'" in script
+    assert '\'{"optimizer":"mfsdp"}\'' in script
     assert (
-        "'{\"offload_fraction\":1.0,\"use_precision_aware_optimizer\":false}'" in script
+        '\'{"offload_fraction":1.0,"use_precision_aware_optimizer":false}\'' in script
     )
     assert '"dist_opt"' not in script
     assert '"fsdp2"' not in script

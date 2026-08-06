@@ -23,12 +23,12 @@ if str(_EXPERIMENTAL_LITE_ROOT) not in sys.path:
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(_REPO_ROOT))
 
-from examples.bench.results import StepTrace
-from examples.bench.session import PretrainSessionConfig, run_pretrain_session
-from megatron.lite.runtime import RuntimeConfig, create_runtime
-from megatron.lite.runtime.backends.bridge.config import BridgeConfig
-from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
+from examples.bench.results import StepTrace  # noqa: E402
+from examples.bench.session import PretrainSessionConfig, run_pretrain_session  # noqa: E402
+from megatron.lite.runtime import RuntimeConfig, create_runtime  # noqa: E402
+from megatron.lite.runtime.backends.bridge.config import BridgeConfig  # noqa: E402
+from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig  # noqa: E402
+from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig  # noqa: E402
 
 
 @dataclass
