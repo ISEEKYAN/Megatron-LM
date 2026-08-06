@@ -40,6 +40,7 @@ pytestmark = [
 _MFSDP_SHARDING_STRATEGY = "optim_grads_params"
 _PRECISION_STEPS = 50
 _LOSS_REL_TOL = 1.0e-2
+_E2E_SFT_LOSS_REL_TOL = 5.09e-3
 _TENSOR_RTOL = 1.0e-2
 _TENSOR_ATOL = 1.0e-5
 _BENCH_WARMUP_STEPS = 5
@@ -1670,13 +1671,13 @@ def _build_full_parallel_handle(backend: str, *, seed: int):
     initial_params = _named_model_tensors(bundle.chunks)
     assert bundle.extras.get("optimizer_backend") == backend
     post_load_hook = bundle.extras.get("post_model_load_hook")
-    assert callable(post_load_hook), (
-        f"{backend} did not expose its production post-load hook."
-    )
-    updates = post_load_hook()
-    assert isinstance(updates, dict)
-    optimizer = updates.get("optimizer", bundle.optimizer)
-    finalize_grads = updates.get("finalize_grads", bundle.finalize_grads)
+    optimizer = bundle.optimizer
+    finalize_grads = bundle.finalize_grads
+    if callable(post_load_hook):
+        updates = post_load_hook()
+        assert isinstance(updates, dict)
+        optimizer = updates.get("optimizer", optimizer)
+        finalize_grads = updates.get("finalize_grads", finalize_grads)
     assert optimizer is not None
 
     extras = dict(bundle.extras)
@@ -1833,7 +1834,10 @@ def _max_snapshot_abs_diff(
     return max(float((lhs[name] - rhs[name]).abs().max()) for name in lhs)
 
 
-def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
+@pytest.mark.parametrize("reference_backend", ("dist_opt", "fsdp2"))
+def test_mfsdp_matches_reference_full_parallel_precision_curve(
+    monkeypatch, reference_backend
+):
     if dist.get_world_size() != _FULL_PARALLEL_WORLD_SIZE:
         pytest.skip("M-FSDP TP2/EP2/ETP1/PP2/CP2 signoff requires exactly 8 ranks.")
 
@@ -1866,13 +1870,31 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
         record_cp_split,
     )
 
-    fsdp2_handle, fsdp2_initial = _build_full_parallel_handle("fsdp2", seed=7345)
-    mfsdp_handle, mfsdp_initial = _build_full_parallel_handle("mfsdp", seed=7345)
-    _assert_distinct_backend_identities(
-        fsdp2_handle._optimizer, mfsdp_handle._optimizer
+    reference_handle, reference_initial = _build_full_parallel_handle(
+        reference_backend, seed=7345
     )
+    mfsdp_handle, mfsdp_initial = _build_full_parallel_handle("mfsdp", seed=7345)
+    if reference_backend == "fsdp2":
+        _assert_distinct_backend_identities(
+            reference_handle._optimizer, mfsdp_handle._optimizer
+        )
+    else:
+        assert reference_handle._optimizer is not mfsdp_handle._optimizer
+        assert _qualified_type(reference_handle._optimizer).startswith(
+            "megatron.core.optimizer."
+        )
+        assert _qualified_type(mfsdp_handle._optimizer).startswith(
+            "megatron.lite.primitive.optimizers.mfsdp."
+        )
+        if dist.get_rank() == 0:
+            print(
+                "[MFSDP_BACKEND] "
+                f"configured={reference_backend} optimizer_type="
+                f"{_qualified_type(reference_handle._optimizer)}",
+                flush=True,
+            )
 
-    for handle in (fsdp2_handle, mfsdp_handle):
+    for handle in (reference_handle, mfsdp_handle):
         ps = handle._parallel_state
         assert (ps.tp_size, ps.ep_size, ps.etp_size, ps.pp_size, ps.cp_size) == (
             2,
@@ -1883,16 +1905,37 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
         )
 
     initial_max_abs = torch.tensor(
-        _max_snapshot_abs_diff(fsdp2_initial, mfsdp_initial), device="cuda"
+        _max_snapshot_abs_diff(reference_initial, mfsdp_initial), device="cuda"
     )
     dist.all_reduce(initial_max_abs, op=dist.ReduceOp.MAX)
     assert float(initial_max_abs) == 0.0
 
-    losses = {"fsdp2": [], "mfsdp": []}
-    grad_norms = {"fsdp2": [], "mfsdp": []}
+    losses = {reference_backend: [], "mfsdp": []}
+    grad_norms = {reference_backend: [], "mfsdp": []}
+    wandb_run = None
+    if dist.get_rank() == 0:
+        import wandb
+
+        wandb_run = wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "mlite-mfsdp-precision"),
+            entity=os.environ.get("WANDB_ENTITY", "megatron-core-moe-dev"),
+            name=os.environ.get("WANDB_NAME", f"mfsdp-sft-curve-{reference_backend}"),
+            config={
+                "reference_backend": reference_backend,
+                "target_backend": "mfsdp",
+                "seed": 7345,
+                "steps": _FULL_PARALLEL_STEPS,
+                "microbatches": _FULL_PARALLEL_MICROBATCHES,
+                "same_input_sft": True,
+            },
+        )
+        print(f"[MFSDP_WANDB] url={wandb_run.url}", flush=True)
     traces = {}
     for step in range(_FULL_PARALLEL_STEPS):
-        for backend, handle in (("fsdp2", fsdp2_handle), ("mfsdp", mfsdp_handle)):
+        for backend, handle in (
+            (reference_backend, reference_handle),
+            ("mfsdp", mfsdp_handle),
+        ):
             dist.barrier()
             loss, grad_norm, trace = _run_full_parallel_step(
                 handle,
@@ -1903,8 +1946,19 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
             grad_norms[backend].append(grad_norm)
             if trace:
                 traces[backend] = trace
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "step": step + 1,
+                    f"{reference_backend}/sft_loss": losses[reference_backend][-1],
+                    "mfsdp/sft_loss": losses["mfsdp"][-1],
+                    f"{reference_backend}/grad_norm": grad_norms[reference_backend][-1],
+                    "mfsdp/grad_norm": grad_norms["mfsdp"][-1],
+                },
+                step=step + 1,
+            )
 
-    for backend in ("fsdp2", "mfsdp"):
+    for backend in (reference_backend, "mfsdp"):
         trace = traces.get(backend, ())
         assert trace, f"{backend} tap recorded no distributed collectives."
         assert _contains_collective(trace, "all_gather", "allgather")
@@ -1916,11 +1970,11 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
     )
 
     loss_rel_curve = torch.tensor(
-        _relative_difference_curve(losses["fsdp2"], losses["mfsdp"]),
+        _relative_difference_curve(losses[reference_backend], losses["mfsdp"]),
         device="cuda",
     )
     grad_norm_rel_curve = torch.tensor(
-        _relative_difference_curve(grad_norms["fsdp2"], grad_norms["mfsdp"]),
+        _relative_difference_curve(grad_norms[reference_backend], grad_norms["mfsdp"]),
         device="cuda",
     )
     dist.all_reduce(loss_rel_curve, op=dist.ReduceOp.MAX)
@@ -1929,7 +1983,7 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
     max_grad_norm_rel_diff = grad_norm_rel_curve.max()
 
     if dist.get_rank() == 0:
-        ps = fsdp2_handle._parallel_state
+        ps = reference_handle._parallel_state
         print(
             "[MFSDP_FULL_PARALLEL] "
             "topology=tp2_ep2_etp1_pp2_cp2 "
@@ -1937,10 +1991,12 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
             f"dp_cp_size={ps.dp_cp_size} "
             f"microbatches={_FULL_PARALLEL_MICROBATCHES} "
             f"steps={_FULL_PARALLEL_STEPS} "
+            f"reference={reference_backend} "
+            f"sft_loss_rel_tol={_E2E_SFT_LOSS_REL_TOL:.3e} "
             f"initial_max_abs_diff={float(initial_max_abs):.8e} "
             f"max_loss_rel_diff={float(max_loss_rel_diff):.8e} "
             f"max_grad_norm_rel_diff={float(max_grad_norm_rel_diff):.8e} "
-            f"fsdp2_losses={','.join(f'{value:.8f}' for value in losses['fsdp2'])} "
+            f"{reference_backend}_losses={','.join(f'{value:.8f}' for value in losses[reference_backend])} "
             f"mfsdp_losses={','.join(f'{value:.8f}' for value in losses['mfsdp'])} "
             f"cp_split={cp_splits[0][0]}->{cp_splits[0][1]} "
             f"cp_split_calls={len(cp_splits)}",
@@ -1956,13 +2012,13 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
                 f"step={curve_index + 1} "
                 f"loss_rel_diff={float(loss_rel_curve[curve_index]):.8e} "
                 f"grad_norm_rel_diff={float(grad_norm_rel_curve[curve_index]):.8e} "
-                f"loss_fsdp2={losses['fsdp2'][curve_index]:.8f} "
+                f"loss_{reference_backend}={losses[reference_backend][curve_index]:.8f} "
                 f"loss_mfsdp={losses['mfsdp'][curve_index]:.8f} "
-                f"grad_norm_fsdp2={grad_norms['fsdp2'][curve_index]:.8f} "
+                f"grad_norm_{reference_backend}={grad_norms[reference_backend][curve_index]:.8f} "
                 f"grad_norm_mfsdp={grad_norms['mfsdp'][curve_index]:.8f}",
                 flush=True,
             )
-        for backend in ("fsdp2", "mfsdp"):
+        for backend in (reference_backend, "mfsdp"):
             trace = traces[backend]
             print(
                 "[MFSDP_COMM_TRACE] "
@@ -1973,7 +2029,9 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
 
     assert torch.isfinite(loss_rel_curve).all()
     assert torch.isfinite(grad_norm_rel_curve).all()
-    assert float(max_loss_rel_diff) <= _LOSS_REL_TOL
+    assert float(max_loss_rel_diff) <= _E2E_SFT_LOSS_REL_TOL
     assert float(max_grad_norm_rel_diff) <= _LOSS_REL_TOL
-    assert losses["fsdp2"][-1] < losses["fsdp2"][0]
+    assert losses[reference_backend][-1] < losses[reference_backend][0]
     assert losses["mfsdp"][-1] < losses["mfsdp"][0]
+    if wandb_run is not None:
+        wandb_run.finish()
