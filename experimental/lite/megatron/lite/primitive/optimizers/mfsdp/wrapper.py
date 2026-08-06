@@ -252,10 +252,13 @@ class MegatronFSDP(nn.Module):
         self.param_sync.materialize_all()
         return super().state_dict(*args, **kwargs)
 
+    def install_optimized_model_weights(self) -> None:
+        self.param_sync.copy_full_parameters_to_shards()
+
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         self.param_sync.materialize_all()
         result = super().load_state_dict(state_dict, strict=strict, assign=assign)
-        self.param_sync.copy_full_parameters_to_shards()
+        self.install_optimized_model_weights()
         return result
 
 

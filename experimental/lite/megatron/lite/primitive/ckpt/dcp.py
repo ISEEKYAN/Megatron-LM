@@ -22,6 +22,7 @@ import torch.nn as nn  # pyright: ignore[reportMissingImports]
 from torch.distributed.device_mesh import DeviceMesh  # pyright: ignore[reportMissingImports]
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
+from megatron.lite.primitive.optimizers.mfsdp.wrapper import MFSdpModule
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
@@ -159,7 +160,8 @@ def load_training_checkpoint(
                 t = state_dict[key]
                 with torch.no_grad():
                     _copy_tensor_(param, t)
-        _copy_full_parameters_to_shards_if_available(model)
+        if isinstance(model, MFSdpModule):
+            model.install_optimized_model_weights()
 
     if load_optimizer:
         _load_optimizer_checkpoint(optimizer, ckpt_path)
@@ -262,20 +264,6 @@ def _model_chunks(model: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:
     if not all(isinstance(chunk, nn.Module) for chunk in chunks):
         raise TypeError("checkpoint model chunks must be nn.Module instances.")
     return chunks
-
-
-def _copy_full_parameters_to_shards_if_available(
-    model: nn.Module | Iterable[nn.Module],
-) -> None:
-    for chunk in _model_chunks(model):
-        for module in chunk.modules():
-            copy_fn = getattr(
-                getattr(module, "param_sync", None),
-                "copy_full_parameters_to_shards",
-                None,
-            )
-            if callable(copy_fn):
-                copy_fn()
 
 
 def _to_local_tensor(tensor: Any) -> torch.Tensor:

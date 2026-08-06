@@ -84,24 +84,20 @@ def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
 def test_dcp_load_refreshes_mfsdp_shards_from_loaded_full_parameters(
     monkeypatch, tmp_path
 ) -> None:
-    class FakeParamSync:
-        def __init__(self, full_param: torch.nn.Parameter) -> None:
-            self.full_param = full_param
-            self.shard_param = torch.full_like(full_param, -7.0, dtype=torch.float32)
-            self.copy_calls = 0
-
-        def copy_full_parameters_to_shards(self) -> None:
-            self.copy_calls += 1
-            self.shard_param.copy_(self.full_param.float())
-
     class FakeMFSdpModule(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.weight = torch.nn.Parameter(torch.zeros(2, dtype=torch.bfloat16))
-            self.param_sync = FakeParamSync(self.weight)
+            self.shard_param = torch.full_like(self.weight, -7.0, dtype=torch.float32)
+            self.install_calls = 0
+
+        def install_optimized_model_weights(self) -> None:
+            self.install_calls += 1
+            self.shard_param.copy_(self.weight.float())
 
     model = FakeMFSdpModule()
 
+    monkeypatch.setattr(dcp, "MFSdpModule", FakeMFSdpModule)
     monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: False)
     monkeypatch.setattr(dcp, "_build_meshes", lambda _config: (object(), object()))
     monkeypatch.setattr(
@@ -126,10 +122,10 @@ def test_dcp_load_refreshes_mfsdp_shards_from_loaded_full_parameters(
         load_optimizer=False,
     )
 
-    assert model.param_sync.copy_calls == 1
+    assert model.install_calls == 1
     torch.testing.assert_close(
-        model.param_sync.shard_param,
-        torch.full_like(model.param_sync.shard_param, 3.0),
+        model.shard_param,
+        torch.full_like(model.shard_param, 3.0),
     )
 
 
