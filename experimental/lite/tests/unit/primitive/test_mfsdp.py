@@ -1042,7 +1042,37 @@ def test_mfsdp_offload_fraction_zero_preserves_optimizer_state_dict_contract():
     optimizer.finish_grad_sync()
     optimizer.step()
 
-    assert optimizer.state_dict().keys() == {"state", "param_groups"}
+    assert optimizer.state_dict().keys() == {
+        "state",
+        "param_groups",
+        "_mfsdp_param_values",
+    }
+
+
+def test_mfsdp_optimizer_checkpoint_round_trips_fp32_shard_values():
+    _Model, _Unit, ps, engine_cfg = _build_offload_stack(offload_fraction=0.0)
+
+    torch.manual_seed(11)
+    _chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    expected = [param.detach().clone() for param in _optimizer_params(optimizer)]
+    saved = copy.deepcopy(optimizer.state_dict())
+
+    with torch.no_grad():
+        for param in _optimizer_params(optimizer):
+            param.add_(17.0)
+
+    optimizer.load_state_dict(saved)
+
+    for param, expected_param in zip(
+        _optimizer_params(optimizer), expected, strict=True
+    ):
+        assert torch.equal(param, expected_param)
 
 
 @pytest.mark.parametrize("offload_fraction", [-0.01, 1.01])
