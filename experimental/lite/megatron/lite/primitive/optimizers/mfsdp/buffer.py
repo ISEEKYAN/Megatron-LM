@@ -370,24 +370,18 @@ class ParamBucket:
         self.local_compute_buffer = (
             self.main_param_buffer
             if self.policy.main_params_dtype == self.policy.compute_dtype
-            else torch.empty(
-                self.local_numel,
-                dtype=self.policy.compute_dtype,
-                device=self.device,
-            )
+            else torch.empty(0, dtype=self.policy.compute_dtype, device=self.device)
         )
         self.local_grad_comm_buffer = (
             self.main_grad_buffer
             if self.policy.grad_comm_dtype == self.policy.main_grads_dtype
-            else torch.empty(
-                self.local_numel,
-                dtype=self.policy.grad_comm_dtype,
-                device=self.device,
-            )
+            else torch.empty(0, dtype=self.policy.grad_comm_dtype, device=self.device)
         )
         self.full_buffer = torch.empty(0, dtype=compute_dtype, device=self.device)
         self._full_lease: BufferLease | None = None
         self._grad_lease: BufferLease | None = None
+        self._local_compute_lease: BufferLease | None = None
+        self._local_grad_comm_lease: BufferLease | None = None
         self._param_gather_work: Any | None = None
         self._grad_reduce_work: Any | None = None
         self._grad_reduce_launched = False
@@ -455,7 +449,20 @@ class ParamBucket:
                 ),
             )
             self.full_buffer = self._full_lease.tensor
-        if self.local_compute_buffer is not self.main_param_buffer:
+        if self.policy.main_params_dtype != self.policy.compute_dtype:
+            if self._local_compute_lease is None:
+                self._local_compute_lease = self.allocator.allocate(
+                    self.local_numel,
+                    dtype=self.policy.compute_dtype,
+                    device=self.device,
+                    group=self.gather_group,
+                    key=(
+                        "param-local",
+                        id(self.gather_group),
+                        self.allocator_layout_key,
+                    ),
+                )
+                self.local_compute_buffer = self._local_compute_lease.tensor
             self.local_compute_buffer.copy_(self.main_param_buffer)
         return self.full_buffer, self.local_compute_buffer
 
@@ -479,6 +486,7 @@ class ParamBucket:
         if self._param_gather_work is not None:
             self._param_gather_work.wait()
             self._param_gather_work = None
+        self._release_local_compute_buffer()
         self._full_ready = True
 
     def release_full_parameters(self) -> None:
@@ -489,6 +497,7 @@ class ParamBucket:
         if self._full_lease is not None:
             self._full_lease.release()
             self._full_lease = None
+        self._release_local_compute_buffer()
         self.full_buffer = torch.empty(
             0,
             dtype=self.policy.compute_dtype,
@@ -507,6 +516,28 @@ class ParamBucket:
         with torch.no_grad():
             for spec in self.specs:
                 spec.full_param.data = empty
+
+    def _release_local_compute_buffer(self) -> None:
+        if self._local_compute_lease is not None:
+            self._local_compute_lease.release()
+            self._local_compute_lease = None
+        if self.policy.main_params_dtype != self.policy.compute_dtype:
+            self.local_compute_buffer = torch.empty(
+                0,
+                dtype=self.policy.compute_dtype,
+                device=self.device,
+            )
+
+    def _release_local_grad_comm_buffer(self) -> None:
+        if self._local_grad_comm_lease is not None:
+            self._local_grad_comm_lease.release()
+            self._local_grad_comm_lease = None
+        if self.policy.grad_comm_dtype != self.policy.main_grads_dtype:
+            self.local_grad_comm_buffer = torch.empty(
+                0,
+                dtype=self.policy.grad_comm_dtype,
+                device=self.device,
+            )
 
     def move_model_state(self, device: torch.device, *, load_grad: bool) -> None:
         """Move persistent sharded storage without breaking optimizer aliases."""
@@ -601,6 +632,19 @@ class ParamBucket:
         )
         grad_input = self._grad_lease.tensor
         grad_input.zero_()
+        if self.policy.grad_comm_dtype != self.policy.main_grads_dtype:
+            self._local_grad_comm_lease = self.allocator.allocate(
+                self.local_numel,
+                dtype=self.policy.grad_comm_dtype,
+                device=self.device,
+                group=self.process_group,
+                key=(
+                    "grad-local",
+                    id(self.process_group),
+                    self.allocator_layout_key,
+                ),
+            )
+            self.local_grad_comm_buffer = self._local_grad_comm_lease.tensor
         with torch.no_grad():
             for spec in self.specs:
                 grad = spec.full_param.grad
@@ -643,6 +687,7 @@ class ParamBucket:
         if self._grad_lease is not None:
             self._grad_lease.release()
             self._grad_lease = None
+        self._release_local_grad_comm_buffer()
 
     def copy_full_parameters_to_shards(self) -> None:
         self.wait_param_gather()
@@ -659,6 +704,7 @@ class ParamBucket:
         self.grad_sync_enabled = False
         self._grad_ready_ids.clear()
         self.main_grad_buffer.zero_()
+        self._release_local_grad_comm_buffer()
         for spec in self.specs:
             spec.full_param.grad = None
             if spec.shard_param is not None:

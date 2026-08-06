@@ -156,9 +156,9 @@ def test_mfsdp_full_parallel_signoff_is_single_node_50_step_curve():
 def test_mfsdp_is_standalone_without_vendored_mcore_or_fsdp2_dependencies():
     package = Path(mfsdp_config.__file__).parent
 
-    assert not list(
-        (package / "impl").glob("*.py")
-    ), "Do not vendor the MCore FSDP implementation."
+    assert not list((package / "impl").glob("*.py")), (
+        "Do not vendor the MCore FSDP implementation."
+    )
     violations = []
     for source_path in package.rglob("*.py"):
         tree = ast.parse(source_path.read_text(), filename=str(source_path))
@@ -772,9 +772,9 @@ def test_mfsdp_offload_fraction_keeps_optimizer_state_on_cpu():
 
     inner = optimizer._inner_optimizer
     cpu_group = inner.cpu_group
-    assert (
-        cpu_group is not None
-    ), "Expected cpu_group to be set for offload_fraction=1.0"
+    assert cpu_group is not None, (
+        "Expected cpu_group to be set for offload_fraction=1.0"
+    )
     assert len(cpu_group._cpu_optimizer.optimizers) == len(cpu_group._cpu_params)
     for cpu_p in cpu_group._cpu_params:
         assert cpu_p.device.type == "cpu", "cpu_param should be on CPU"
@@ -914,9 +914,9 @@ def test_mfsdp_offload_fraction_numerically_matches_no_offload():
     }
     assert ref_params.keys() == cpu_params.keys()
     for name in ref_params:
-        assert torch.equal(
-            ref_params[name], cpu_params[name]
-        ), f"Parameter {name} diverges between GPU-only and CPU-offload runs"
+        assert torch.equal(ref_params[name], cpu_params[name]), (
+            f"Parameter {name} diverges between GPU-only and CPU-offload runs"
+        )
 
 
 def test_mfsdp_offload_fraction_partial_splits_by_numel():
@@ -943,9 +943,9 @@ def test_mfsdp_offload_fraction_partial_splits_by_numel():
     ratio = cpu_numel / total_numel
     # The greedy split assigns whole params; exact ratio depends on model shape.
     # For fraction=0.5 with 3 params of unequal size the ratio will be ≥0.4.
-    assert (
-        ratio >= 0.4
-    ), f"Expected substantial CPU offload at fraction=0.5, got {ratio:.2%}"
+    assert ratio >= 0.4, (
+        f"Expected substantial CPU offload at fraction=0.5, got {ratio:.2%}"
+    )
     assert ratio <= 0.95, f"Expected some GPU params at fraction=0.5, got {ratio:.2%}"
 
 
@@ -1323,6 +1323,53 @@ def test_mfsdp_empty_uneven_shard_stays_inside_local_buffer(monkeypatch):
     assert bucket.specs[1].local_offset == bucket.local_numel
     assert bucket.specs[1].shard_param is not None
     assert bucket.specs[1].shard_param.numel() == 0
+
+
+def test_mfsdp_dtype_conversion_buffers_are_collective_scoped():
+    """Cast/communication storage must not remain resident through optimizer.step."""
+    model = torch.nn.Linear(4, 3, bias=False, dtype=torch.bfloat16)
+    groups = mfsdp_buffer.MFSDPProcessGroups(
+        dense_dp=None,
+        expert_dp=None,
+        dense_ag=None,
+        expert_ag=None,
+        tp=None,
+        etp=None,
+        ep=None,
+        pp=None,
+    )
+    config = mfsdp_config.MFSDPConfig(
+        bucket_size=None,
+        main_params_dtype=torch.float32,
+        main_grads_dtype=torch.float32,
+        grad_comm_dtype=torch.bfloat16,
+    )
+    bucket = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=groups,
+        config=config,
+        is_expert=lambda _name: False,
+        unit_modules=(),
+    ).buckets[0]
+
+    assert bucket.local_compute_buffer.numel() == 0
+    assert bucket.local_grad_comm_buffer.numel() == 0
+
+    bucket.release_full_parameters()
+    _, local_compute = bucket.prepare_param_gather()
+    assert local_compute.numel() == bucket.local_numel
+    bucket.wait_param_gather()
+    assert bucket.local_compute_buffer.numel() == 0
+
+    bucket.install_full_parameters()
+    for spec in bucket.specs:
+        spec.full_param.grad = torch.ones_like(spec.full_param)
+    grad_reduce = mfsdp_buffer.GradReducePipeline([bucket])
+    grad_reduce.reduce_gradients(bucket, force=True)
+    assert bucket.local_grad_comm_buffer.numel() == bucket.local_numel
+    grad_reduce.finish()
+    assert bucket.local_grad_comm_buffer.numel() == 0
+    assert torch.count_nonzero(bucket.main_grad_buffer) == bucket.local_numel
 
 
 def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
