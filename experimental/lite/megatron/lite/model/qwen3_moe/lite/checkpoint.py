@@ -10,9 +10,6 @@ from __future__ import annotations
 
 import torch
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.primitive.quantization.qat import (
-    canonical_state_key as _canonical_state_key,
-)
 from megatron.lite.primitive.ckpt.dcp import (  # noqa: F401 — re-export
     canonicalize_fc1_for_dcp,
     canonicalize_qkv_for_dcp,
@@ -20,10 +17,7 @@ from megatron.lite.primitive.ckpt.dcp import (  # noqa: F401 — re-export
     decanon_qkv_after_dcp,
 )
 from megatron.lite.primitive.ckpt.hf_weights import extract_layer_idx, parse_expert_idx
-from megatron.lite.primitive.quantization.mxfp4 import (
-    MXFP4_BLOCK_SIZE,
-    quantize_mxfp4,
-)
+from megatron.lite.primitive.quantization.mxfp4 import MXFP4_BLOCK_SIZE, quantize_mxfp4
 from megatron.lite.runtime.contracts.weights import ResyncFormat
 from torch.distributed.tensor import Replicate, Shard
 
@@ -66,10 +60,11 @@ class Qwen3MoEWeightSpec:
         c = self.config
         wm: dict[str, list[str]] = {
             "embed.embedding.weight": ["model.embed_tokens.weight"],
-            "mtp_embed.embedding.weight": ["model.embed_tokens.weight"],
             "norm.weight": ["model.norm.weight"],
             "head.col.linear.weight": ["lm_head.weight"],
         }
+        if c.num_nextn_predict_layers > 0:
+            wm["mtp_embed.embedding.weight"] = ["model.embed_tokens.weight"]
         for li in range(c.num_hidden_layers):
             ap = f"model.layers.{li}.self_attn"
             mp = f"model.layers.{li}.mlp"
@@ -87,7 +82,9 @@ class Qwen3MoEWeightSpec:
                     f"{lp}.attn.q_norm.weight": [f"{ap}.q_norm.weight"],
                     f"{lp}.attn.k_norm.weight": [f"{ap}.k_norm.weight"],
                     f"{lp}.attn.proj.linear.weight": [f"{ap}.o_proj.weight"],
-                    f"{lp}.mlp_norm.weight": [f"model.layers.{li}.post_attention_layernorm.weight"],
+                    f"{lp}.mlp_norm.weight": [
+                        f"model.layers.{li}.post_attention_layernorm.weight"
+                    ],
                     f"{lp}.moe.router.gate.weight": [f"{mp}.gate.weight"],
                 }
             )
@@ -96,7 +93,9 @@ class Qwen3MoEWeightSpec:
                     f"{mp}.experts.{e}.gate_proj.weight",
                     f"{mp}.experts.{e}.up_proj.weight",
                 ]
-                wm[f"{lp}.moe.experts._fc2_weight_{e}"] = [f"{mp}.experts.{e}.down_proj.weight"]
+                wm[f"{lp}.moe.experts._fc2_weight_{e}"] = [
+                    f"{mp}.experts.{e}.down_proj.weight"
+                ]
         for mi in range(c.num_nextn_predict_layers):
             hf_li = c.num_hidden_layers + mi
             hp = f"model.layers.{hf_li}"
@@ -110,7 +109,9 @@ class Qwen3MoEWeightSpec:
                     f"{lp}.hnorm.weight": [f"{hp}.hnorm.weight"],
                     f"{lp}.eh_proj.linear.weight": [f"{hp}.eh_proj.weight"],
                     f"{lp}.final_layernorm.weight": [f"{hp}.shared_head.norm.weight"],
-                    f"{tlp}.attn.qkv.linear.layer_norm_weight": [f"{hp}.input_layernorm.weight"],
+                    f"{tlp}.attn.qkv.linear.layer_norm_weight": [
+                        f"{hp}.input_layernorm.weight"
+                    ],
                     f"{tlp}.attn.qkv.linear.weight": [
                         f"{ap}.q_proj.weight",
                         f"{ap}.k_proj.weight",
@@ -128,10 +129,14 @@ class Qwen3MoEWeightSpec:
                     f"{mp}.experts.{e}.gate_proj.weight",
                     f"{mp}.experts.{e}.up_proj.weight",
                 ]
-                wm[f"{tlp}.moe.experts._fc2_weight_{e}"] = [f"{mp}.experts.{e}.down_proj.weight"]
+                wm[f"{tlp}.moe.experts._fc2_weight_{e}"] = [
+                    f"{mp}.experts.{e}.down_proj.weight"
+                ]
         return wm
 
-    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
+    def hf_to_native(
+        self, native_name: str, hf_tensors: list[torch.Tensor]
+    ) -> torch.Tensor:
         if len(hf_tensors) == 3 and "qkv" in native_name:
             # Match MCore SelfAttention's local qkv packing:
             # [q heads for kv-group 0, k0, v0, q heads for kv-group 1, k1, v1, ...].
@@ -259,29 +264,10 @@ class Qwen3MoEWeightSpec:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_param_name_canonical(name: str, state_dict: dict) -> str | None:
-    """Resolve a logical checkpoint name onto a possibly QAT-parametrized key."""
-    canonical = {_canonical_state_key(key): key for key in state_dict}
-    if name in state_dict:
-        return name
-    if name in canonical:
-        return canonical[name]
-    for logical, key in canonical.items():
-        if name in logical:
-            return key
-    return None
-
-
 def load_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:
-    from megatron.lite.primitive.ckpt import hf_weights as hf_weights_module
     from megatron.lite.primitive.ckpt.hf_weights import load_hf_weights as _load
 
-    original_resolve = hf_weights_module._resolve_param_name
-    hf_weights_module._resolve_param_name = _resolve_param_name_canonical
-    try:
-        _load(model, path, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size)
-    finally:
-        hf_weights_module._resolve_param_name = original_resolve
+    _load(model, path, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size)
 
 
 def export_hf_weights(model, config: Qwen3MoEConfig, ps, **kwargs):

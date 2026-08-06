@@ -8,9 +8,9 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
-import pytest
 
 if importlib.util.find_spec("safetensors") is None:
     safetensors = types.ModuleType("safetensors")
@@ -20,14 +20,8 @@ if importlib.util.find_spec("safetensors") is None:
     sys.modules["safetensors"] = safetensors
     sys.modules["safetensors.torch"] = safetensors_torch
 
-from megatron.lite.primitive.ckpt.hf_weights import (
-    SafeTensorReader,
-    _iter_bucketed_materialized_tensors,
-    _iter_export_named_parameters,
-    bucketed_all_gather_into_tensor,
-    export_hf_weights,
-    stream_export_to_shards,
-)
+import megatron.lite.primitive.ckpt.hf_weights as hf_weights
+from megatron.lite.primitive.quantization.qat import QATSpec, apply_qat_to_chunks
 
 
 class _FakeSharded(nn.Module):
@@ -60,7 +54,7 @@ class _FakeStreamer:
 def test_iter_export_falls_back_to_named_parameters_without_streamer() -> None:
     base = _FakeSharded(["decoder.layers.0.self_attn.q_proj.weight", "lm_head.weight"])
     chunk = base  # no stream_full_parameters attribute
-    out = [name for name, _ in _iter_export_named_parameters(chunk, base)]
+    out = [name for name, _ in hf_weights._iter_export_named_parameters(chunk, base)]
     assert out == ["decoder.layers.0.self_attn.q_proj.weight", "lm_head.weight"]
 
 
@@ -68,7 +62,7 @@ def test_iter_export_stream_covers_bias_passes_completeness_guard() -> None:
     names = ["decoder.layers.0.mlp.up_proj.weight", "decoder.layers.0.mlp.up_proj.bias"]
     base = _FakeSharded(names)
     chunk = _FakeStreamer(names)
-    out = [name for name, _ in _iter_export_named_parameters(chunk, base)]
+    out = [name for name, _ in hf_weights._iter_export_named_parameters(chunk, base)]
     assert sorted(out) == sorted(names)
 
 
@@ -78,7 +72,7 @@ def test_iter_export_stream_dropping_bias_fails_loud() -> None:
     # A bucket-identity mismatch would drop the bias from the stream entirely.
     chunk = _FakeStreamer(["decoder.layers.0.mlp.up_proj.weight"])
     with pytest.raises(RuntimeError, match="truncated weight shard"):
-        list(_iter_export_named_parameters(chunk, base))
+        list(hf_weights._iter_export_named_parameters(chunk, base))
 
 
 def test_iter_export_stream_unexpected_name_fails_loud() -> None:
@@ -86,7 +80,7 @@ def test_iter_export_stream_unexpected_name_fails_loud() -> None:
     base = _FakeSharded(names)
     chunk = _FakeStreamer(names + ["decoder.layers.0.mlp.up_proj.ghost"])
     with pytest.raises(RuntimeError, match="unexpected="):
-        list(_iter_export_named_parameters(chunk, base))
+        list(hf_weights._iter_export_named_parameters(chunk, base))
 
 
 def test_safe_tensor_reader_context_reuses_and_closes_shard(
@@ -114,7 +108,7 @@ def test_safe_tensor_reader_context_reuses_and_closes_shard(
         lambda *args, **kwargs: Handle(),
     )
 
-    with SafeTensorReader(str(tmp_path)) as reader:
+    with hf_weights.SafeTensorReader(str(tmp_path)) as reader:
         assert reader.get_tensor("a").item() == 1
         assert reader.get_tensor("b").item() == 2
 
@@ -134,7 +128,7 @@ def test_stream_export_removes_stale_owned_files_when_reusing_directory(
     unrelated = tmp_path / "README.txt"
     unrelated.write_text("keep")
 
-    stream_export_to_shards(
+    hf_weights.stream_export_to_shards(
         iter([("new", torch.ones(2))]), str(tmp_path), shard_size_bytes=1024
     )
 
@@ -162,7 +156,7 @@ def test_stream_export_flushes_bounded_shards_and_writes_hf_index(
     )
     tensors = [(f"weight_{i}", torch.ones(2, dtype=torch.float32)) for i in range(3)]
 
-    stream_export_to_shards(iter(tensors), str(tmp_path), shard_size_bytes=8)
+    hf_weights.stream_export_to_shards(iter(tensors), str(tmp_path), shard_size_bytes=8)
 
     assert flushed == [(["weight_0"], 8), (["weight_1"], 8), (["weight_2"], 8)]
     index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
@@ -189,7 +183,7 @@ def test_stream_export_nonzero_rank_drains_iterator_for_collectives(
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
     monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(True))
 
-    stream_export_to_shards(export_iter(), str(tmp_path), shard_size_bytes=4)
+    hf_weights.stream_export_to_shards(export_iter(), str(tmp_path), shard_size_bytes=4)
 
     assert consumed == [0, 1, 2]
     assert barriers == [True]
@@ -197,7 +191,10 @@ def test_stream_export_nonzero_rank_drains_iterator_for_collectives(
 
 
 def test_export_defaults_to_device_resident_tensors() -> None:
-    assert inspect.signature(export_hf_weights).parameters["cpu"].default is False
+    assert (
+        inspect.signature(hf_weights.export_hf_weights).parameters["cpu"].default
+        is False
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -239,8 +236,8 @@ def test_gpu_resident_export_is_bitwise_equal_to_legacy_cpu_export() -> None:
     )()
     model = Model()
 
-    legacy = dict(export_hf_weights(model, Spec(), ps, cpu=True))
-    resident = dict(export_hf_weights(model, Spec(), ps))
+    legacy = dict(hf_weights.export_hf_weights(model, Spec(), ps, cpu=True))
+    resident = dict(hf_weights.export_hf_weights(model, Spec(), ps))
 
     assert legacy.keys() == resident.keys()
     assert legacy["weight"].device.type == "cpu"
@@ -265,11 +262,8 @@ def test_bucketed_all_gather_uses_bounded_flat_buffers(monkeypatch) -> None:
         torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
     )
 
-    gathered = bucketed_all_gather_into_tensor(
-        bucket,
-        group="tp",
-        group_size=2,
-        buffer_max_size_bytes=32,
+    gathered = hf_weights.bucketed_all_gather_into_tensor(
+        bucket, group="tp", group_size=2, buffer_max_size_bytes=32
     )
 
     assert len(calls) == 3
@@ -313,19 +307,13 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
     equivalent_group = object()
     single_rank_group = object()
     first = FakeDTensor(
-        torch.arange(6, dtype=torch.float32).reshape(2, 3),
-        (4, 3),
-        0,
-        first_group,
+        torch.arange(6, dtype=torch.float32).reshape(2, 3), (4, 3), 0, first_group
     )
     single = FakeDTensor(
         torch.arange(3, dtype=torch.float32), (3,), 0, single_rank_group
     )
     second = FakeDTensor(
-        torch.arange(4, dtype=torch.float32).reshape(2, 2),
-        (2, 4),
-        1,
-        equivalent_group,
+        torch.arange(4, dtype=torch.float32).reshape(2, 2), (2, 4), 1, equivalent_group
     )
     calls = []
 
@@ -351,7 +339,7 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
     )
 
     outputs = list(
-        _iter_bucketed_materialized_tensors(
+        hf_weights._iter_bucketed_materialized_tensors(
             [
                 ("first", first),
                 ("plain", torch.tensor([7.0])),
@@ -424,7 +412,7 @@ def test_oversized_fsdp_shard_is_gathered_in_shard_dimension_chunks(
     )
 
     outputs = dict(
-        _iter_bucketed_materialized_tensors(
+        hf_weights._iter_bucketed_materialized_tensors(
             [("oversized", FakeDTensor(local))], buffer_max_size_bytes=32
         )
     )
@@ -462,7 +450,9 @@ def test_replicated_dtensor_uses_local_tensor_without_collective(monkeypatch) ->
     )
 
     outputs = list(
-        _iter_bucketed_materialized_tensors([("replicated", FakeDTensor(local))])
+        hf_weights._iter_bucketed_materialized_tensors(
+            [("replicated", FakeDTensor(local))]
+        )
     )
 
     assert outputs[0][0] == "replicated"
@@ -523,7 +513,9 @@ def test_export_batches_adjacent_tp_weights_into_one_flat_collective(
     )
 
     exported = dict(
-        export_hf_weights(Model(), Spec(), ps, cpu=False, buffer_max_size_bytes=1024)
+        hf_weights.export_hf_weights(
+            Model(), Spec(), ps, cpu=False, buffer_max_size_bytes=1024
+        )
     )
 
     assert len(calls) == 1
@@ -606,7 +598,9 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
         torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
     )
 
-    stream = export_hf_weights(Model(), Spec(), ps, cpu=False, buffer_max_size_bytes=64)
+    stream = hf_weights.export_hf_weights(
+        Model(), Spec(), ps, cpu=False, buffer_max_size_bytes=64
+    )
     name, tensor = next(stream)
 
     assert name == "first.experts.packed"
@@ -618,6 +612,53 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
     assert torch.equal(
         tensor, torch.stack(expected_local + [value + 100 for value in expected_local])
     )
+
+
+def test_packed_expert_export_rejects_incomplete_group() -> None:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.experts = nn.Module()
+            for idx in range(3):
+                self.experts.register_parameter(
+                    f"weight{idx}", nn.Parameter(torch.tensor([float(idx)]))
+                )
+
+    class Spec:
+        num_experts = 4
+
+        @staticmethod
+        def is_expert(name):
+            return name.startswith("experts.")
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+        @staticmethod
+        def packed_expert_group_name(name):
+            return "experts.packed"
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+
+    with pytest.raises(RuntimeError, match=r"experts\.packed.*3/4"):
+        list(hf_weights.export_hf_weights(Model(), Spec(), ps, cpu=True))
 
 
 def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> None:
@@ -635,7 +676,9 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
     class Spec:
         num_experts = 0
         is_expert = staticmethod(lambda name: False)
-        is_export_buffer = staticmethod(lambda name: name == "router_bias")
+        weight_map = staticmethod(
+            lambda: {"weight": ["weight"], "router_bias": ["router_bias"]}
+        )
         tp_spec = staticmethod(lambda name: None)
         native_to_hf = staticmethod(lambda name, tensor: [(name, tensor)])
 
@@ -684,7 +727,7 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
     )
     monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
 
-    exported = dict(export_hf_weights(Model(), Spec(), ps))
+    exported = dict(hf_weights.export_hf_weights(Model(), Spec(), ps))
 
     assert set(groups) == {"nccl-pp"}
     assert exported.keys() == {"weight", "router_bias", "weight2", "router_bias2"}
@@ -692,6 +735,83 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
     assert torch.equal(exported["router_bias"], torch.tensor([1.0, 2.0]))
     assert torch.equal(exported["weight2"], remote_weight)
     assert torch.equal(exported["router_bias2"], remote_bias)
+
+
+def test_persistent_buffer_load_export_mapping_must_match() -> None:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("router_bias", torch.ones(2))
+
+    class Spec:
+        num_experts = 0
+        is_expert = staticmethod(lambda name: False)
+        weight_map = staticmethod(lambda: {"router_bias": ["hf.expected_bias"]})
+        tp_spec = staticmethod(lambda name: None)
+        native_to_hf = staticmethod(
+            lambda name, tensor: [("hf.different_bias", tensor)]
+        )
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+
+    with pytest.raises(
+        RuntimeError, match=r"Spec.*router_bias.*hf\.expected_bias.*hf\.different_bias"
+    ):
+        dict(hf_weights.export_hf_weights(Model(), Spec(), ps))
+
+
+def test_qat_parametrized_parameter_exports_with_logical_name() -> None:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(4, 4, bias=False)
+
+    class Spec:
+        num_experts = 0
+        is_expert = staticmethod(lambda name: False)
+        tp_spec = staticmethod(lambda name: None)
+        weight_map = staticmethod(lambda: {"proj.weight": ["hf.proj.weight"]})
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            assert name == "proj.weight"
+            return [("hf.proj.weight", tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+    model = Model()
+    expected = model.proj.weight.detach().clone()
+    stats = apply_qat_to_chunks(
+        [model], QATSpec(enabled=True, format="int8", group_size=-1)
+    )
+
+    assert stats["quantized_modules"] == 1
+    exported = dict(hf_weights.export_hf_weights(model, Spec(), ps))
+    assert exported.keys() == {"hf.proj.weight"}
+    assert torch.equal(exported["hf.proj.weight"], expected)
 
 
 def test_pp_export_never_materializes_the_whole_stage(monkeypatch) -> None:
@@ -766,7 +886,7 @@ def test_pp_export_never_materializes_the_whole_stage(monkeypatch) -> None:
     monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
 
     # buffer_max_size_bytes=1 caps every bucket at a single parameter.
-    stream = export_hf_weights(Model(), Spec(), ps, buffer_max_size_bytes=1)
+    stream = hf_weights.export_hf_weights(Model(), Spec(), ps, buffer_max_size_bytes=1)
     first_name, first_tensor = next(stream)
 
     assert first_name == "weight_a"

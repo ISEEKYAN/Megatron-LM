@@ -9,15 +9,13 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
-from megatron.lite.model.qwen3_moe.lite.checkpoint import (
-    _canonical_state_key,
-    _resolve_param_name_canonical,
-    export_hf_weights,
-)
+from megatron.lite.model.qwen3_moe.lite.checkpoint import export_hf_weights
+from megatron.lite.primitive.ckpt.hf_weights import _resolve_param_name
 from megatron.lite.primitive.quantization.qat import (
     QATSpec,
     _fake_quant_weight_tensor,
     apply_qat_to_chunks,
+    canonical_state_key,
     normalize_qat_spec,
 )
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
@@ -112,8 +110,8 @@ def test_qwen3_moe_canonical_state_key_maps_grouped_expert_master():
     assert logical not in state
     assert not any(logical in key for key in state)
 
-    canonical = {_canonical_state_key(key): key for key in state}
-    actual = _resolve_param_name_canonical(logical, state)
+    canonical = {canonical_state_key(key): key for key in state}
+    actual = _resolve_param_name(logical, state)
     assert actual == canonical[logical]
     assert actual.endswith("parametrizations.weight.original")
 

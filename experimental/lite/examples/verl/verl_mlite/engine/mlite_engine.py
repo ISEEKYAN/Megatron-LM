@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+from megatron.lite.primitive.modules import router_replay
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
@@ -895,10 +896,10 @@ class MegatronLiteEngine(BaseEngine):
     def _r3_replay_mask_for_packing(
         micro_batch: TensorDict, input_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Reuse VERL's canonical R3 semantics while inputs are still jagged."""
-        from verl.utils.megatron.router_replay_utils import build_r3_replay_mask
-
-        return build_r3_replay_mask(input_ids, micro_batch["response_mask"])
+        """Build the R3 mask while inputs are still jagged."""
+        return router_replay.build_r3_replay_mask(
+            input_ids, micro_batch["response_mask"]
+        )
 
     def _build_verl_model_output(
         self,
@@ -950,7 +951,9 @@ class MegatronLiteEngine(BaseEngine):
                 )
 
             raw_output["_verl_metrics"] = metrics
-            if output_lst is not None:
+            if output_lst is not None and not getattr(
+                _loss_fn, "runtime_collects_outputs", False
+            ):
                 output_lst.append(
                     {
                         "model_output": model_output,
@@ -960,6 +963,12 @@ class MegatronLiteEngine(BaseEngine):
                 )
             return (loss * num_microbatches if loss_function is not None else loss), metrics
 
+        _loss_fn.runtime_output_collector = output_lst
+        _loss_fn.runtime_output_extractor = lambda output: output["_verl_model_output"]
+        # The static collector records ``loss`` before this hook applies the
+        # microbatch multiplier used for backward.  Runtime sidecars must report
+        # that same application-level value even when they reschedule batches.
+        _loss_fn.runtime_output_loss_scale = 1 / num_microbatches
         return _loss_fn
 
     def _mtp_enable_train(self) -> bool:
@@ -972,9 +981,9 @@ class MegatronLiteEngine(BaseEngine):
 
     def _reduce_mtp_metric(self, mtp_loss: torch.Tensor) -> torch.Tensor:
         mtp_loss = mtp_loss.detach().float().clone()
-        dp_group = self.get_data_parallel_group()
-        if dist.is_initialized() and dp_group is not None:
-            dist.all_reduce(mtp_loss, op=dist.ReduceOp.AVG, group=dp_group)
+        metric_group = self.handle.metric_group
+        if dist.is_initialized() and metric_group is not None:
+            dist.all_reduce(mtp_loss, op=dist.ReduceOp.AVG, group=metric_group)
         return mtp_loss
 
     @staticmethod
