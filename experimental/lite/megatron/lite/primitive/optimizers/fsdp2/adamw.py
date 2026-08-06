@@ -164,7 +164,7 @@ class FP32AdamW:
         if self.cpu_update:
             local_param = to_local_tensor(param.detach())
             return local_param.detach().to(device="cpu", dtype=torch.float32).clone()
-        if self._model_param_dtype(param) is not None:
+        if self._model_param_dtype(param) not in (None, torch.float32):
             return param.detach().to(dtype=torch.float32).clone()
         return (
             param.detach()
