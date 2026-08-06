@@ -700,3 +700,48 @@ def test_verl_sft_script_does_not_emit_optimizer_state_offload_when_disabled(tmp
     assert "engine.param_offload=False" in command
     assert "engine.optimizer_offload=False" in command
     assert "override_optimizer_config.offload_fraction" not in command
+
+
+def test_verl_sft_script_emits_explicit_dynamic_cp_switch_when_disabled(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[3]
+        / "examples"
+        / "verl"
+        / "scripts"
+        / "run_qwen3moe_sft.sh"
+    )
+
+    command = _run_verl_sft_dry_run(
+        script, tmp_path, DYNAMIC_CONTEXT_PARALLEL="False"
+    )
+
+    assert (
+        "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel.enabled=False"
+        in command
+    )
+
+
+def test_verl_sft_dynamic_cp_acceptance_requires_full_cp_size_coverage(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[3]
+        / "examples"
+        / "verl"
+        / "scripts"
+        / "run_qwen3moe_sft.sh"
+    )
+
+    command = _run_verl_sft_dry_run(
+        script,
+        tmp_path,
+        DYNAMIC_CONTEXT_PARALLEL="True",
+        MAX_SEQLEN_PER_DP_CP_RANK="4096",
+    )
+
+    assert (
+        "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel."
+        "require_full_cp_size_coverage=True"
+    ) in command
+    assert (
+        "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel.enabled=True"
+        in command
+    )
