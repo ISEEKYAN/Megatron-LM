@@ -17,6 +17,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.optimizers.fsdp2 import (
     build_fsdp2_training_optimizer,
     fsdp2_available,
@@ -39,6 +40,7 @@ pytestmark = [
 _MFSDP_SHARDING_STRATEGY = "optim_grads_params"
 _PRECISION_STEPS = 50
 _LOSS_REL_TOL = 1.0e-2
+_E2E_SFT_LOSS_REL_TOL = 5.09e-3
 _TENSOR_RTOL = 1.0e-2
 _TENSOR_ATOL = 1.0e-5
 _BENCH_WARMUP_STEPS = 5
@@ -98,6 +100,116 @@ class TinyParallelModel(nn.Module):
     def forward(self, x):
         hidden = self.unit(x) + self.tp_bias
         return self.out(self.experts(hidden))
+
+
+class TinyTELinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        import transformer_engine.pytorch as te
+
+        self.linear = te.Linear(
+            in_features,
+            out_features,
+            bias=False,
+            params_dtype=torch.bfloat16,
+        )
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class TinyTETransformerLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dense = TinyTELinear(8, 8)
+        self.expert = TinyTELinear(8, 8)
+
+    def forward(self, x):
+        return torch.tanh(self.dense(x) + self.expert(x))
+
+
+class TinyTEQwen3MoE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [TinyTETransformerLayer(), TinyTETransformerLayer()]
+        )
+        self.out = TinyTELinear(8, 4)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return self.out(x)
+
+
+class TinyTEGroupedExpertLayer(nn.Module):
+    def __init__(self, ps):
+        super().__init__()
+        config = SimpleNamespace(
+            num_experts=2,
+            hidden_size=8,
+            moe_intermediate_size=16,
+            swiglu_limit=0.0,
+        )
+        self.experts = Experts(config, ps)
+
+    def forward(self, x):
+        first_expert_tokens = x.shape[0] // 2
+        tokens_per_expert = torch.tensor(
+            [first_expert_tokens, x.shape[0] - first_expert_tokens],
+            device=x.device,
+            dtype=torch.int64,
+        )
+        return torch.tanh(self.experts(x, tokens_per_expert))
+
+
+class TinyTEGroupedMoE(nn.Module):
+    def __init__(self, ps):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [TinyTEGroupedExpertLayer(ps), TinyTEGroupedExpertLayer(ps)]
+        )
+        self.out = TinyTELinear(8, 4)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return self.out(x)
+
+
+class TinyNonFusedLinear(nn.Module):
+    """Regular autograd linear covering M-FSDP's non-TE gradient path."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class RecordingSGD(torch.optim.SGD):
+    def __init__(self, param_groups):
+        super().__init__(param_groups, lr=0.0)
+        self.consumed_grad_groups: list[list[torch.Tensor]] = []
+        self.consumed_grad_by_param: dict[int, torch.Tensor] = {}
+
+    def step(self, closure=None):
+        self.consumed_grad_groups = [
+            [
+                param.grad.detach().clone()
+                for param in group["params"]
+                if param.grad is not None
+            ]
+            for group in self.param_groups
+        ]
+        self.consumed_grad_by_param = {
+            id(param): param.grad.detach().clone()
+            for group in self.param_groups
+            for param in group["params"]
+            if param.grad is not None
+        }
+        return super().step(closure)
 
 
 class BenchmarkUnit(nn.Module):
@@ -309,6 +421,19 @@ def _memory_triple() -> dict[str, float]:
             strict=True,
         )
     )
+
+
+def _bf16_roundtrip_difference_fraction(tensors: list[torch.Tensor]) -> float:
+    values = torch.cat([tensor.detach().float().reshape(-1) for tensor in tensors])
+    assert values.numel() > 0
+    rounded = values.to(torch.bfloat16).to(torch.float32)
+    assert not torch.equal(values, rounded)
+    return float((values != rounded).float().mean().item())
+
+
+def _is_bf16_roundtrip_exact(tensor: torch.Tensor) -> bool:
+    values = tensor.detach().float()
+    return torch.equal(values, values.to(torch.bfloat16).to(torch.float32))
 
 
 def _memory_delta(
@@ -731,6 +856,304 @@ def _tp_ep_parallel_config() -> ParallelConfig:
 
 def _is_tiny_expert(name: str) -> bool:
     return name.startswith("experts.")
+
+
+def _grouped_expert_key(name: str) -> str | None:
+    layer_name, marker, parameter_name = name.partition("experts.")
+    if not marker:
+        return None
+    weight_name = parameter_name.rsplit(".", 1)[-1]
+    if not weight_name.startswith("weight") or not weight_name[6:].isdigit():
+        return None
+    return f"{layer_name}expert{weight_name[6:]}"
+
+
+def test_mfsdp_native_fp32_fused_wgrad_reaches_optimizer_groups():
+    parallel = _dense_parallel_config()
+    ps = _parallel_state(parallel)
+    chunks = [_new_model(7319, TinyTEQwen3MoE)]
+    optimizer_config = _optimizer_cfg(use_fused_optimizer=False)
+    impl_cfg = SimpleNamespace(
+        parallel=parallel,
+        optimizer_config=optimizer_config,
+    )
+
+    def build_recording_optimizer(param_groups, _optimizer_config):
+        params = [param for group in param_groups for param in group["params"]]
+        assert len(params) == 5
+        return RecordingSGD(
+            [
+                {"params": params[::2], "weight_decay": 0.0},
+                {"params": params[1::2], "weight_decay": 0.0},
+            ]
+        )
+
+    optimizer, finalize = build_mfsdp_training_optimizer(
+        chunks,
+        impl_cfg=impl_cfg,
+        ps=ps,
+        is_expert=lambda name: ".expert." in name,
+        fsdp_unit_modules=(TinyTETransformerLayer,),
+        optimizer_factory=build_recording_optimizer,
+    )
+    chunk = chunks[0]
+    assert len(chunk.param_sync.buckets) == 5
+    assert len(optimizer.param_groups) == 2
+
+    optimizer.zero_grad()
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(8107 + dist.get_rank())
+    value = torch.randn(
+        64,
+        8,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    chunk(value).float().square().mean().backward()
+
+    main_grad_by_shard = {}
+    for bucket in chunk.param_sync.buckets:
+        for spec in bucket.specs:
+            assert spec.shard_param is not None
+            assert spec.full_param.grad_added_to_main_grad is True
+            assert spec.full_param.grad is None
+            assert spec.full_param.main_grad.dtype is torch.float32
+            main_grad_by_shard[id(spec.shard_param)] = (
+                spec.full_param.main_grad.detach().clone()
+            )
+    main_grad_fractions = [
+        _bf16_roundtrip_difference_fraction(
+            [main_grad_by_shard[id(param)] for param in group["params"]]
+        )
+        for group in optimizer.param_groups
+    ]
+
+    finalize()
+    optimizer_grad_fractions = [
+        _bf16_roundtrip_difference_fraction(
+            [param.grad for param in group["params"] if param.grad is not None]
+        )
+        for group in optimizer.param_groups
+    ]
+    success, _grad_norm, _num_zeros = optimizer.step()
+    recording_optimizer = optimizer._inner_optimizer.optimizer
+    consumed_grad_fractions = [
+        _bf16_roundtrip_difference_fraction(group)
+        for group in recording_optimizer.consumed_grad_groups
+    ]
+
+    assert success
+    assert all(fraction > 0.0 for fraction in main_grad_fractions)
+    assert all(fraction > 0.0 for fraction in optimizer_grad_fractions)
+    assert all(fraction > 0.0 for fraction in consumed_grad_fractions)
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_NATIVE_FP32_WGRAD] "
+            + json.dumps(
+                {
+                    "world_size": dist.get_world_size(),
+                    "bucket_count": len(chunk.param_sync.buckets),
+                    "optimizer_group_count": len(optimizer.param_groups),
+                    "main_grad_low_bit_fractions": main_grad_fractions,
+                    "optimizer_grad_low_bit_fractions": optimizer_grad_fractions,
+                    "consumed_grad_low_bit_fractions": consumed_grad_fractions,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+
+def test_mfsdp_native_fp32_grouped_expert_wgrad_reaches_optimizer():
+    parallel = _dense_parallel_config()
+    ps = _parallel_state(parallel)
+    torch.manual_seed(9127)
+    torch.cuda.manual_seed_all(9127)
+    chunks = [TinyTEGroupedMoE(ps).cuda().to(torch.bfloat16)]
+    optimizer_config = _optimizer_cfg(use_fused_optimizer=False)
+    impl_cfg = SimpleNamespace(
+        parallel=parallel,
+        optimizer_config=optimizer_config,
+    )
+
+    def build_recording_optimizer(param_groups, _optimizer_config):
+        params = [param for group in param_groups for param in group["params"]]
+        return RecordingSGD(
+            [{"params": [param], "weight_decay": 0.0} for param in params]
+        )
+
+    optimizer, finalize = build_mfsdp_training_optimizer(
+        chunks,
+        impl_cfg=impl_cfg,
+        ps=ps,
+        is_expert=lambda name: "experts." in name,
+        fsdp_unit_modules=(TinyTEGroupedExpertLayer,),
+        optimizer_factory=build_recording_optimizer,
+    )
+    chunk = chunks[0]
+    grouped_linear_modules = [
+        module for module in chunk.modules() if type(module).__name__ == "GroupedLinear"
+    ]
+    assert len(grouped_linear_modules) == 4
+    assert all(module.fuse_wgrad_accumulation for module in grouped_linear_modules)
+
+    expert_specs = {}
+    for bucket in chunk.param_sync.buckets:
+        for spec in bucket.specs:
+            expert_key = _grouped_expert_key(spec.name)
+            if expert_key is not None:
+                expert_specs.setdefault(expert_key, []).append(spec)
+    assert len(expert_specs) == 4
+    assert all(len(specs) == 2 for specs in expert_specs.values())
+
+    optimizer.zero_grad()
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(9131 + dist.get_rank())
+    value = torch.randn(
+        64,
+        8,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    chunk(value).float().square().mean().backward()
+
+    main_grad_fractions = {}
+    for expert_key, specs in expert_specs.items():
+        main_grads = []
+        for spec in specs:
+            assert spec.shard_param is not None
+            assert spec.full_param.grad_added_to_main_grad is True
+            assert spec.full_param.main_grad.dtype is torch.float32
+            assert spec.full_param.grad is None
+            main_grads.append(spec.full_param.main_grad)
+        main_grad_fractions[expert_key] = _bf16_roundtrip_difference_fraction(
+            main_grads
+        )
+
+    finalize()
+    optimizer_grad_fractions = {
+        expert_key: _bf16_roundtrip_difference_fraction(
+            [spec.shard_param.grad for spec in specs]
+        )
+        for expert_key, specs in expert_specs.items()
+    }
+    success, _grad_norm, _num_zeros = optimizer.step()
+    recording_optimizer = optimizer._inner_optimizer.optimizer
+    consumed_grad_fractions = {
+        expert_key: _bf16_roundtrip_difference_fraction(
+            [
+                recording_optimizer.consumed_grad_by_param[id(spec.shard_param)]
+                for spec in specs
+            ]
+        )
+        for expert_key, specs in expert_specs.items()
+    }
+
+    assert success
+    assert all(fraction > 0.0 for fraction in main_grad_fractions.values())
+    assert all(fraction > 0.0 for fraction in optimizer_grad_fractions.values())
+    assert all(fraction > 0.0 for fraction in consumed_grad_fractions.values())
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_NATIVE_FP32_GROUPED_EXPERT_WGRAD] "
+            + json.dumps(
+                {
+                    "world_size": dist.get_world_size(),
+                    "expert_group_count": len(expert_specs),
+                    "grouped_linear_count": len(grouped_linear_modules),
+                    "main_grad_low_bit_fractions": main_grad_fractions,
+                    "optimizer_grad_low_bit_fractions": optimizer_grad_fractions,
+                    "consumed_grad_low_bit_fractions": consumed_grad_fractions,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+
+def test_mfsdp_non_fused_wgrad_accumulates_in_fp32_per_microbatch():
+    parallel = _dense_parallel_config()
+    ps = _parallel_state(parallel)
+    torch.manual_seed(10103)
+    torch.cuda.manual_seed_all(10103)
+    model = TinyNonFusedLinear().cuda()
+    assert not hasattr(model.linear, "fuse_wgrad_accumulation")
+    chunks = [model]
+    optimizer_config = _optimizer_cfg(use_fused_optimizer=False)
+    optimizer_config.clip_grad = 10000.0
+    impl_cfg = SimpleNamespace(
+        parallel=parallel,
+        optimizer_config=optimizer_config,
+    )
+
+    def build_recording_optimizer(param_groups, _optimizer_config):
+        return RecordingSGD(param_groups)
+
+    optimizer, finalize = build_mfsdp_training_optimizer(
+        chunks,
+        impl_cfg=impl_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(TinyNonFusedLinear,),
+        optimizer_factory=build_recording_optimizer,
+    )
+    chunk = chunks[0]
+    assert len(chunk.param_sync.buckets) == 1
+    spec = chunk.param_sync.buckets[0].specs[0]
+    assert spec.shard_param is not None
+    assert spec.full_param.grad_added_to_main_grad is False
+
+    optimizer.zero_grad()
+    chunk(torch.ones(1, 4, device="cuda", dtype=torch.bfloat16)).sum().backward()
+    single_backward_grad = spec.full_param.main_grad.detach().clone()
+    assert spec.full_param.grad is None
+    assert spec.full_param.main_grad.dtype is torch.float32
+    assert torch.equal(single_backward_grad, torch.ones(4, 4, device="cuda"))
+    assert _is_bf16_roundtrip_exact(single_backward_grad)
+
+    optimizer.zero_grad()
+    chunk(
+        torch.full((1, 4), 256.0, device="cuda", dtype=torch.bfloat16)
+    ).sum().backward()
+    assert spec.full_param.grad is None
+    assert torch.equal(
+        spec.full_param.main_grad,
+        torch.full((4, 4), 256.0, device="cuda"),
+    )
+    assert _is_bf16_roundtrip_exact(spec.full_param.main_grad)
+
+    chunk(torch.ones(1, 4, device="cuda", dtype=torch.bfloat16)).sum().backward()
+    expected = torch.full((4, 4), 257.0, device="cuda")
+    assert spec.full_param.grad is None
+    assert torch.equal(spec.full_param.main_grad, expected)
+    assert not _is_bf16_roundtrip_exact(spec.full_param.main_grad)
+
+    finalize()
+    expected_shard = expected.reshape(-1).chunk(dist.get_world_size())[dist.get_rank()]
+    assert spec.shard_param.grad is not None
+    assert spec.shard_param.grad.dtype is torch.float32
+    assert torch.equal(spec.shard_param.grad, expected_shard)
+    success, _grad_norm, _num_zeros = optimizer.step()
+    recording_optimizer = optimizer._inner_optimizer.optimizer
+    consumed_grad = recording_optimizer.consumed_grad_by_param[id(spec.shard_param)]
+    assert success
+    assert torch.equal(consumed_grad, expected_shard)
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_NON_FUSED_FP32_ACCUMULATION] "
+            + json.dumps(
+                {
+                    "world_size": dist.get_world_size(),
+                    "single_backward_bf16_roundtrip_exact": True,
+                    "multi_microbatch_value": float(consumed_grad[0]),
+                    "multi_microbatch_bf16_roundtrip_exact": False,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
 
 def test_mfsdp_precision_curve_matches_fsdp2():
@@ -1248,13 +1671,13 @@ def _build_full_parallel_handle(backend: str, *, seed: int):
     initial_params = _named_model_tensors(bundle.chunks)
     assert bundle.extras.get("optimizer_backend") == backend
     post_load_hook = bundle.extras.get("post_model_load_hook")
-    assert callable(post_load_hook), (
-        f"{backend} did not expose its production post-load hook."
-    )
-    updates = post_load_hook()
-    assert isinstance(updates, dict)
-    optimizer = updates.get("optimizer", bundle.optimizer)
-    finalize_grads = updates.get("finalize_grads", bundle.finalize_grads)
+    optimizer = bundle.optimizer
+    finalize_grads = bundle.finalize_grads
+    if callable(post_load_hook):
+        updates = post_load_hook()
+        assert isinstance(updates, dict)
+        optimizer = updates.get("optimizer", optimizer)
+        finalize_grads = updates.get("finalize_grads", finalize_grads)
     assert optimizer is not None
 
     extras = dict(bundle.extras)
@@ -1411,7 +1834,10 @@ def _max_snapshot_abs_diff(
     return max(float((lhs[name] - rhs[name]).abs().max()) for name in lhs)
 
 
-def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
+@pytest.mark.parametrize("reference_backend", ("dist_opt", "fsdp2"))
+def test_mfsdp_matches_reference_full_parallel_precision_curve(
+    monkeypatch, reference_backend
+):
     if dist.get_world_size() != _FULL_PARALLEL_WORLD_SIZE:
         pytest.skip("M-FSDP TP2/EP2/ETP1/PP2/CP2 signoff requires exactly 8 ranks.")
 
@@ -1444,13 +1870,31 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
         record_cp_split,
     )
 
-    fsdp2_handle, fsdp2_initial = _build_full_parallel_handle("fsdp2", seed=7345)
-    mfsdp_handle, mfsdp_initial = _build_full_parallel_handle("mfsdp", seed=7345)
-    _assert_distinct_backend_identities(
-        fsdp2_handle._optimizer, mfsdp_handle._optimizer
+    reference_handle, reference_initial = _build_full_parallel_handle(
+        reference_backend, seed=7345
     )
+    mfsdp_handle, mfsdp_initial = _build_full_parallel_handle("mfsdp", seed=7345)
+    if reference_backend == "fsdp2":
+        _assert_distinct_backend_identities(
+            reference_handle._optimizer, mfsdp_handle._optimizer
+        )
+    else:
+        assert reference_handle._optimizer is not mfsdp_handle._optimizer
+        assert _qualified_type(reference_handle._optimizer).startswith(
+            "megatron.core.optimizer."
+        )
+        assert _qualified_type(mfsdp_handle._optimizer).startswith(
+            "megatron.lite.primitive.optimizers.mfsdp."
+        )
+        if dist.get_rank() == 0:
+            print(
+                "[MFSDP_BACKEND] "
+                f"configured={reference_backend} optimizer_type="
+                f"{_qualified_type(reference_handle._optimizer)}",
+                flush=True,
+            )
 
-    for handle in (fsdp2_handle, mfsdp_handle):
+    for handle in (reference_handle, mfsdp_handle):
         ps = handle._parallel_state
         assert (ps.tp_size, ps.ep_size, ps.etp_size, ps.pp_size, ps.cp_size) == (
             2,
@@ -1461,16 +1905,37 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
         )
 
     initial_max_abs = torch.tensor(
-        _max_snapshot_abs_diff(fsdp2_initial, mfsdp_initial), device="cuda"
+        _max_snapshot_abs_diff(reference_initial, mfsdp_initial), device="cuda"
     )
     dist.all_reduce(initial_max_abs, op=dist.ReduceOp.MAX)
     assert float(initial_max_abs) == 0.0
 
-    losses = {"fsdp2": [], "mfsdp": []}
-    grad_norms = {"fsdp2": [], "mfsdp": []}
+    losses = {reference_backend: [], "mfsdp": []}
+    grad_norms = {reference_backend: [], "mfsdp": []}
+    wandb_run = None
+    if dist.get_rank() == 0:
+        import wandb
+
+        wandb_run = wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "mlite-mfsdp-precision"),
+            entity=os.environ.get("WANDB_ENTITY", "megatron-core-moe-dev"),
+            name=os.environ.get("WANDB_NAME", f"mfsdp-sft-curve-{reference_backend}"),
+            config={
+                "reference_backend": reference_backend,
+                "target_backend": "mfsdp",
+                "seed": 7345,
+                "steps": _FULL_PARALLEL_STEPS,
+                "microbatches": _FULL_PARALLEL_MICROBATCHES,
+                "same_input_sft": True,
+            },
+        )
+        print(f"[MFSDP_WANDB] url={wandb_run.url}", flush=True)
     traces = {}
     for step in range(_FULL_PARALLEL_STEPS):
-        for backend, handle in (("fsdp2", fsdp2_handle), ("mfsdp", mfsdp_handle)):
+        for backend, handle in (
+            (reference_backend, reference_handle),
+            ("mfsdp", mfsdp_handle),
+        ):
             dist.barrier()
             loss, grad_norm, trace = _run_full_parallel_step(
                 handle,
@@ -1481,8 +1946,19 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
             grad_norms[backend].append(grad_norm)
             if trace:
                 traces[backend] = trace
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "step": step + 1,
+                    f"{reference_backend}/sft_loss": losses[reference_backend][-1],
+                    "mfsdp/sft_loss": losses["mfsdp"][-1],
+                    f"{reference_backend}/grad_norm": grad_norms[reference_backend][-1],
+                    "mfsdp/grad_norm": grad_norms["mfsdp"][-1],
+                },
+                step=step + 1,
+            )
 
-    for backend in ("fsdp2", "mfsdp"):
+    for backend in (reference_backend, "mfsdp"):
         trace = traces.get(backend, ())
         assert trace, f"{backend} tap recorded no distributed collectives."
         assert _contains_collective(trace, "all_gather", "allgather")
@@ -1494,11 +1970,11 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
     )
 
     loss_rel_curve = torch.tensor(
-        _relative_difference_curve(losses["fsdp2"], losses["mfsdp"]),
+        _relative_difference_curve(losses[reference_backend], losses["mfsdp"]),
         device="cuda",
     )
     grad_norm_rel_curve = torch.tensor(
-        _relative_difference_curve(grad_norms["fsdp2"], grad_norms["mfsdp"]),
+        _relative_difference_curve(grad_norms[reference_backend], grad_norms["mfsdp"]),
         device="cuda",
     )
     dist.all_reduce(loss_rel_curve, op=dist.ReduceOp.MAX)
@@ -1507,7 +1983,7 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
     max_grad_norm_rel_diff = grad_norm_rel_curve.max()
 
     if dist.get_rank() == 0:
-        ps = fsdp2_handle._parallel_state
+        ps = reference_handle._parallel_state
         print(
             "[MFSDP_FULL_PARALLEL] "
             "topology=tp2_ep2_etp1_pp2_cp2 "
@@ -1515,10 +1991,12 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
             f"dp_cp_size={ps.dp_cp_size} "
             f"microbatches={_FULL_PARALLEL_MICROBATCHES} "
             f"steps={_FULL_PARALLEL_STEPS} "
+            f"reference={reference_backend} "
+            f"sft_loss_rel_tol={_E2E_SFT_LOSS_REL_TOL:.3e} "
             f"initial_max_abs_diff={float(initial_max_abs):.8e} "
             f"max_loss_rel_diff={float(max_loss_rel_diff):.8e} "
             f"max_grad_norm_rel_diff={float(max_grad_norm_rel_diff):.8e} "
-            f"fsdp2_losses={','.join(f'{value:.8f}' for value in losses['fsdp2'])} "
+            f"{reference_backend}_losses={','.join(f'{value:.8f}' for value in losses[reference_backend])} "
             f"mfsdp_losses={','.join(f'{value:.8f}' for value in losses['mfsdp'])} "
             f"cp_split={cp_splits[0][0]}->{cp_splits[0][1]} "
             f"cp_split_calls={len(cp_splits)}",
@@ -1534,13 +2012,13 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
                 f"step={curve_index + 1} "
                 f"loss_rel_diff={float(loss_rel_curve[curve_index]):.8e} "
                 f"grad_norm_rel_diff={float(grad_norm_rel_curve[curve_index]):.8e} "
-                f"loss_fsdp2={losses['fsdp2'][curve_index]:.8f} "
+                f"loss_{reference_backend}={losses[reference_backend][curve_index]:.8f} "
                 f"loss_mfsdp={losses['mfsdp'][curve_index]:.8f} "
-                f"grad_norm_fsdp2={grad_norms['fsdp2'][curve_index]:.8f} "
+                f"grad_norm_{reference_backend}={grad_norms[reference_backend][curve_index]:.8f} "
                 f"grad_norm_mfsdp={grad_norms['mfsdp'][curve_index]:.8f}",
                 flush=True,
             )
-        for backend in ("fsdp2", "mfsdp"):
+        for backend in (reference_backend, "mfsdp"):
             trace = traces[backend]
             print(
                 "[MFSDP_COMM_TRACE] "
@@ -1551,7 +2029,9 @@ def test_mfsdp_matches_fsdp2_full_parallel_precision_curve(monkeypatch):
 
     assert torch.isfinite(loss_rel_curve).all()
     assert torch.isfinite(grad_norm_rel_curve).all()
-    assert float(max_loss_rel_diff) <= _LOSS_REL_TOL
+    assert float(max_loss_rel_diff) <= _E2E_SFT_LOSS_REL_TOL
     assert float(max_grad_norm_rel_diff) <= _LOSS_REL_TOL
-    assert losses["fsdp2"][-1] < losses["fsdp2"][0]
+    assert losses[reference_backend][-1] < losses[reference_backend][0]
     assert losses["mfsdp"][-1] < losses["mfsdp"][0]
+    if wandb_run is not None:
+        wandb_run.finish()
