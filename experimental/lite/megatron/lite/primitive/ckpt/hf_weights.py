@@ -572,7 +572,8 @@ def bucketed_all_gather_into_tensor(
                 tensor,
                 [
                     recv_buffer[
-                        rank * total_numel + offsets[idx] : rank * total_numel
+                        rank * total_numel
+                        + offsets[idx] : rank * total_numel
                         + offsets[idx]
                         + numel_per_tensor[idx]
                     ].view_as(tensor)
@@ -869,10 +870,7 @@ def gather_gate_up(
 
 
 def _load_weight_map_for_model(
-    base_model: nn.Module,
-    spec: HFWeights,
-    ps,
-    state: dict[str, torch.Tensor],
+    base_model: nn.Module, spec: HFWeights, ps, state: dict[str, torch.Tensor]
 ) -> dict[str, list[str]]:
     """Build the one native-to-HF plan shared by load and export."""
     logical_state_keys = tuple(canonical_state_key(name) for name in state)
@@ -1111,15 +1109,7 @@ def load_hf_weights(
 
 
 def _load_expert_weight(
-    native_name,
-    hf_names,
-    reader,
-    spec,
-    ps,
-    state,
-    targets,
-    expert_gid,
-    expert_shard,
+    native_name, hf_names, reader, spec, ps, state, targets, expert_gid, expert_shard
 ) -> str | None:
     if expert_shard is None:
         raise RuntimeError(
@@ -1196,10 +1186,7 @@ def _load_expert_weight(
 
 
 def _handle_missing_hf_tensors(
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
-    error: KeyError,
+    spec: HFWeights, native_name: str, hf_names: list[str], error: KeyError
 ) -> None:
     """Fail on required HF sources and explain every optional fallback.
 
@@ -1274,10 +1261,7 @@ def _read_hf_tensors(
 
 
 def _present_hf_sources(
-    reader: SafeTensorReader,
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
+    reader: SafeTensorReader, spec: HFWeights, native_name: str, hf_names: list[str]
 ) -> list[str]:
     """Return mapped checkpoint sources that exist without loading payloads."""
     resolve = getattr(reader, "first_available", None)
@@ -1333,6 +1317,50 @@ def _merge_dense_shards(
     return torch.cat(shards, dim=split_dim)
 
 
+def _iter_export_named_parameters(chunk: nn.Module, base_chunk: nn.Module):
+    """Source ``(name, full_param)`` pairs for export, bounded when possible.
+
+    Backends whose wrapper exposes ``stream_full_parameters`` (the mfsdp backend)
+    gather the unsharded parameters one bucket at a time, capping the transient
+    export footprint at a single bucket instead of the whole model. Everything
+    else -- FSDP2 ``DTensor`` params (gathered lazily by ``_materialize_dtensor``)
+    and plain manually-sharded params -- falls back to ``named_parameters``.
+
+    The streaming path is guarded for completeness. Its bucket walk emits a
+    param only when it can match the bucket's shard identity back to a name; a
+    param whose identity fails to match would otherwise fall through the bucket
+    loop and never be yielded (a silently truncated shard on resync). So the set
+    of streamed names is checked against the full ``named_parameters`` set on the
+    unwrapped chunk and any drift fails loud instead of shipping partial weights.
+    """
+    streamer = getattr(chunk, "stream_full_parameters", None)
+    if not callable(streamer):
+        yield from base_chunk.named_parameters()
+        return
+
+    from megatron.lite.primitive.utils import log_rank0
+
+    log_rank0(
+        "[export] bounded stream_full_parameters path active "
+        "(per-bucket materialization)"
+    )
+    # Cheap reference set: the unwrapped chunk's sharded named_parameters (no
+    # all-gather). Names align with the streamer, which resolves against the same
+    # (currently-installed, sharded) module params.
+    expected = {name for name, _ in base_chunk.named_parameters()}
+    streamed: set[str] = set()
+    for name, param in streamer():
+        streamed.add(name)
+        yield name, param
+    if streamed != expected:
+        missing = sorted(expected - streamed)
+        unexpected = sorted(streamed - expected)
+        raise RuntimeError(
+            "bounded parameter export is incomplete: refusing to ship a "
+            f"truncated weight shard (missing={missing}, unexpected={unexpected})"
+        )
+
+
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,
@@ -1375,7 +1403,11 @@ def export_hf_weights(
                 if hasattr(base_chunk, "layer_indices")
                 else {}
             )
-            for name, param in base_chunk.named_parameters():
+            # M-FSDP backends stream unsharded params one bounded bucket at a
+            # time via ``stream_full_parameters`` (capping the export peak);
+            # FSDP2 / manual shards fall back to ``named_parameters`` and are
+            # gathered lazily downstream by ``_materialize_dtensor``.
+            for name, param in _iter_export_named_parameters(chunk, base_chunk):
                 logical_name = canonical_state_key(name)
                 yield to_global_layer_name(logical_name, layer_map), param.data.detach()
             persistent_buffers = [
@@ -1478,9 +1510,9 @@ def export_hf_weights(
                     if packed_name is None:
                         yield from _iter_mapped({global_name: export_shard})
                         continue
-                    packed_expert_buffers.setdefault(packed_name, {})[global_idx] = (
-                        export_shard
-                    )
+                    packed_expert_buffers.setdefault(packed_name, {})[
+                        global_idx
+                    ] = export_shard
                 if packed_name is not None:
                     packed = packed_expert_buffers[packed_name]
                     if len(packed) == spec.num_experts:

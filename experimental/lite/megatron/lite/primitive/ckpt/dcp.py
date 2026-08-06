@@ -22,6 +22,7 @@ import torch.nn as nn  # pyright: ignore[reportMissingImports]
 from torch.distributed.device_mesh import DeviceMesh  # pyright: ignore[reportMissingImports]
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
+from megatron.lite.primitive.optimizers.mfsdp.wrapper import MFSdpModule
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
@@ -159,6 +160,8 @@ def load_training_checkpoint(
                 t = state_dict[key]
                 with torch.no_grad():
                     _copy_tensor_(param, t)
+        if isinstance(model, MFSdpModule):
+            model.install_optimized_model_weights()
 
     if load_optimizer:
         _load_optimizer_checkpoint(optimizer, ckpt_path)
