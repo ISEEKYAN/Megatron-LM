@@ -17,6 +17,7 @@ tripped ``DoubleBufferAllocator.release_cached``'s busy guard with a spurious
 These tests build a real M-FSDP-wrapped model (world_size=1, gloo-free CPU path)
 and exercise the multi-forward timing that produced the crash.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -99,6 +100,16 @@ def _any_slot_busy(chunk) -> bool:
     return False
 
 
+def _release_cached_buffers(chunk) -> None:
+    """Exercise the allocator guard used by wake/export without resync helpers."""
+    seen: set[int] = set()
+    for bucket in chunk.param_sync.buckets:
+        allocator = bucket.allocator
+        if id(allocator) not in seen:
+            seen.add(id(allocator))
+            allocator.release_cached()
+
+
 def test_retain_bucket_is_actually_the_layernorm_1d_params():
     # Guards the premise: LayerNorm weight/bias form a retain-through-backward
     # bucket. If bucketing changes so nothing retains, the regression below
@@ -124,7 +135,7 @@ def test_train_step_leaves_no_active_buffers():
     # A grad-enabled forward+backward releases the retain bucket via the
     # autograd graph, so the export/wake reclaim path is clean.
     assert not _any_slot_busy(chunk)
-    chunk.param_sync.release_cached_buffers()  # must not raise
+    _release_cached_buffers(chunk)  # must not raise
 
 
 def test_no_grad_recompute_forward_releases_retain_bucket():
@@ -150,7 +161,7 @@ def test_no_grad_recompute_forward_releases_retain_bucket():
         "grad-disabled recompute forward left a full-parameter buffer active"
     )
     # The reclaim a colocated vLLM wake / full-parameter export performs.
-    chunk.param_sync.release_cached_buffers()  # must not raise
+    _release_cached_buffers(chunk)  # must not raise
 
 
 def test_inference_mode_recompute_forward_releases_retain_bucket():
@@ -166,7 +177,7 @@ def test_inference_mode_recompute_forward_releases_retain_bucket():
         chunk(value)
 
     assert not _any_slot_busy(chunk)
-    chunk.param_sync.release_cached_buffers()  # must not raise
+    _release_cached_buffers(chunk)  # must not raise
 
 
 def test_grad_enabled_forward_still_retains_until_backward():
