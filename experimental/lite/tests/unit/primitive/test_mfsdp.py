@@ -885,9 +885,9 @@ def test_mfsdp_full_offload_has_six_gpu_and_twelve_cpu_bytes_per_param():
         param.numel() * param.element_size() for param in inner.params
     )
     gpu_main_grad_bytes = sum(
-        param.grad.numel() * param.grad.element_size()
+        param.main_grad.numel() * param.main_grad.element_size()
         for param in inner.params
-        if param.grad is not None
+        if hasattr(param, "main_grad")
     )
     cpu_master_bytes = sum(
         param.numel() * param.element_size() for param in cpu_group._cpu_params
@@ -905,7 +905,7 @@ def test_mfsdp_full_offload_has_six_gpu_and_twelve_cpu_bytes_per_param():
 
     assert all(param.dtype == torch.bfloat16 for param in inner.params)
     assert all(
-        param.grad is not None and param.grad.dtype == torch.float32
+        param.grad is None and param.main_grad.dtype == torch.float32
         for param in inner.params
     )
     assert all(

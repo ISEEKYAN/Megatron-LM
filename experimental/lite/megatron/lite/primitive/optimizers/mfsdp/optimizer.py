@@ -183,8 +183,9 @@ class _StandaloneOptimizer:
             coefficient = min(1.0, self.clip_grad / (float(total_norm.item()) + 1.0e-6))
             if coefficient < 1.0:
                 for param in self.params:
-                    if param.grad is not None:
-                        param.grad.mul_(coefficient)
+                    grad = getattr(param, "main_grad", param.grad)
+                    if grad is not None:
+                        grad.mul_(coefficient)
         return float(total_norm.float().item())
 
     def state_dict(self) -> dict[str, Any]:
@@ -247,8 +248,9 @@ class _StandaloneOptimizer:
             return
         if self.expert_grad_scale != 1.0:
             for param in self.expert_params:
-                if param.grad is not None:
-                    param.grad.mul_(self.expert_grad_scale)
+                grad = getattr(param, "main_grad", param.grad)
+                if grad is not None:
+                    grad.mul_(self.expert_grad_scale)
         self._expert_grads_scaled = True
 
     def _sync_tp_replicated_grads_once(self) -> None:
@@ -256,9 +258,10 @@ class _StandaloneOptimizer:
             return
         group = getattr(self.ps, "tp_group", None)
         for param in self.tp_replicated_params:
-            if param.grad is not None:
+            grad = getattr(param, "main_grad", param.grad)
+            if grad is not None:
                 _all_reduce_grad_if_distributed(
-                    param.grad,
+                    grad,
                     group,
                     average=bool(
                         getattr(param, "average_gradients_across_tp_domain", False)

@@ -141,11 +141,12 @@ class CpuAdamGroup:
         for i, (gpu_param, cpu_param) in enumerate(
             zip(self._gpu_params, self._cpu_params)
         ):
-            if gpu_param.grad is None:
+            grad = getattr(gpu_param, "main_grad", gpu_param.grad)
+            if grad is None:
                 cpu_param.grad = None
                 d2h_events.append(None)
                 continue
-            flat_gpu_grad = gpu_param.grad.detach().view(-1)
+            flat_gpu_grad = grad.detach().view(-1)
             buf = self._cpu_grad_bufs[i]
             if buf is None or buf.shape != flat_gpu_grad.shape:
                 buf = torch.zeros(

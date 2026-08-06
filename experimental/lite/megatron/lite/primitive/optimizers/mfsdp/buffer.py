@@ -418,8 +418,6 @@ class ParamBucket:
                 )
                 _copy_parameter_metadata(spec.full_param, shard_param)
                 shard_param._mfsdp_original_ndim = spec.full_param.ndim
-                if shard_param.dtype != self.policy.main_grads_dtype:
-                    shard_param.grad_dtype = self.policy.main_grads_dtype
                 spec.shard_param = shard_param
                 # TE returns a dummy ``.grad`` when its wgrad GEMM writes the
                 # real gradient directly into ``main_grad``.
@@ -734,9 +732,18 @@ class ParamBucket:
             self.main_grad_buffer.div_(self.world_size)
         for spec in self.specs:
             assert spec.shard_param is not None
-            spec.shard_param.grad = self.main_grad_buffer.narrow(
+            main_grad = self.main_grad_buffer.narrow(
                 0, spec.local_offset, spec.shard_numel
             ).view_as(spec.shard_param)
+            if spec.shard_param.dtype == main_grad.dtype:
+                spec.shard_param.grad = main_grad
+            else:
+                # PyTorch requires ``Parameter.grad`` to have the parameter's
+                # dtype. The CPU optimizer consumes this explicit FP32 view;
+                # leave ``.grad`` empty instead of allocating a lossy BF16
+                # mirror that no optimizer should read.
+                spec.shard_param.main_grad = main_grad
+                spec.shard_param.grad = None
         if self._grad_lease is not None:
             self._grad_lease.release()
             self._grad_lease = None
