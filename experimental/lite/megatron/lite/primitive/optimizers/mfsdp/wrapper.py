@@ -97,6 +97,7 @@ class MegatronFSDP(nn.Module):
             is_expert=is_expert,
             unit_modules=unit_modules,
         )
+        _enable_fused_wgrad_accumulation(module)
         self.param_sync = CommunicationPipelines(self.param_and_grad_buffer.buckets)
         self.all_gather_pipeline: AllGatherPipeline = self.param_sync.all_gather
         self.grad_reduce_pipeline: GradReducePipeline = self.param_sync.grad_reduce
@@ -270,6 +271,13 @@ def _module_by_id(root: nn.Module, module_id: int) -> nn.Module:
         if id(module) == module_id:
             return module
     raise RuntimeError("M-FSDP bucket owner is no longer part of the wrapped module.")
+
+
+def _enable_fused_wgrad_accumulation(module: nn.Module) -> None:
+    """Enable TE-style fused wgrad only inside the M-FSDP ownership boundary."""
+    for child in module.modules():
+        if hasattr(child, "fuse_wgrad_accumulation"):
+            child.fuse_wgrad_accumulation = True
 
 
 __all__ = ["MFSdpModule", "MegatronFSDP", "mark_optimizer_built"]
