@@ -38,6 +38,7 @@ from megatron.lite.primitive.optimizers.mfsdp.wrapper import (
 )
 
 ExpertClassifierFn = Callable[[str], bool]
+_MFSDP_PARAM_VALUES_KEY = "_mfsdp_param_values"
 
 logger = logging.getLogger(__name__)
 
@@ -188,24 +189,41 @@ class _StandaloneOptimizer:
 
     def state_dict(self) -> dict[str, Any]:
         if self.cpu_group is None:
-            return self.optimizer.state_dict()
-        return {
-            "gpu": self.optimizer.state_dict(),
-            "cpu": self.cpu_group.state_dict(),
-        }
+            state = self.optimizer.state_dict()
+        else:
+            state = {
+                "gpu": self.optimizer.state_dict(),
+                "cpu": self.cpu_group.state_dict(),
+            }
+        state[_MFSDP_PARAM_VALUES_KEY] = [
+            [param.detach().cpu().clone() for param in group["params"]]
+            for group in self.optimizer.param_groups
+        ]
+        return state
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        state = dict(state_dict)
+        param_values = state.pop(_MFSDP_PARAM_VALUES_KEY, None)
         if self.cpu_group is None:
-            gpu_state = state_dict.get("gpu", state_dict)
+            gpu_state = state.get("gpu", state)
             self.optimizer.load_state_dict(gpu_state)
-            return
-        if "gpu" not in state_dict or "cpu" not in state_dict:
+        elif "gpu" not in state or "cpu" not in state:
             raise ValueError(
                 "M-FSDP CPU-offloaded optimizer requires a checkpoint with "
                 "both 'gpu' and 'cpu' optimizer states."
             )
-        self.optimizer.load_state_dict(state_dict["gpu"])
-        self.cpu_group.load_state_dict(state_dict["cpu"])
+        else:
+            self.optimizer.load_state_dict(state["gpu"])
+            self.cpu_group.load_state_dict(state["cpu"])
+        if param_values is not None:
+            with torch.no_grad():
+                for group, group_values in zip(
+                    self.optimizer.param_groups, param_values, strict=True
+                ):
+                    for param, value in zip(
+                        group["params"], group_values, strict=True
+                    ):
+                        param.copy_(value.to(device=param.device, dtype=param.dtype))
 
     def offload_state_to_cpu(self) -> None:
         self._offloaded_state_devices.clear()
