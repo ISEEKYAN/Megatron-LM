@@ -657,6 +657,7 @@ class _ForwardChunkContext:
     dispatched: torch.Tensor
     probs: torch.Tensor | None
     expert_out: torch.Tensor | None
+    dispatcher: TokenDispatcher
     scores_edge: Any | None = None
     scores_shape: torch.Size | None = None
     scores_dtype: torch.dtype | None = None
@@ -940,6 +941,7 @@ class _EPChunkOperationBase:
                     expert_out_edge=expert_out_edge,
                     expert_out_shape=expert_out.shape,
                     expert_out_dtype=expert_out.dtype,
+                    dispatcher=dispatcher,
                 )
                 state.clear()
             return (
@@ -1386,7 +1388,7 @@ class _EPChunkOperationBase:
                 expert_out_edge=saved.expert_out_edge,
                 expert_out_shape=saved.expert_out_shape,
                 expert_out_dtype=saved.expert_out_dtype,
-                dispatcher=lease.dispatcher,
+                dispatcher=saved.dispatcher,
                 workspace_lease=lease,
             )
             with torch.cuda.stream(comm_stream):
