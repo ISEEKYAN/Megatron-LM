@@ -138,6 +138,7 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
     from megatron.lite.model.qwen3_moe.lite import model
 
     workspaces = []
+    released = []
 
     class FakeWorkspace:
         def __init__(self, key):
@@ -162,6 +163,11 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
     )
     monkeypatch.setattr(model, "Experts", lambda *_args, **_kwargs: torch.nn.Identity())
     monkeypatch.setattr(model, "get_ep_chunk_workspace", get_workspace)
+    monkeypatch.setattr(
+        model,
+        "release_ep_chunk_workspace",
+        lambda key, stream=None: released.append((key.op, stream)),
+    )
     monkeypatch.setattr(model, "EPChunkForwardOp", FakeOp)
     monkeypatch.setattr(model, "EPChunkBackwardOp", FakeOp)
     monkeypatch.setattr(model, "EPChunkFusedForwardBackwardOp", FakeOp)
@@ -189,11 +195,22 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
         for workspace in workspaces
     )
     assert all(workspace.materialize_devices == [] for workspace in workspaces)
+    by_op = {workspace.key.op: workspace for workspace in workspaces}
     layer.materialize_ep_chunk_workspaces(device=model.torch.device("cuda", 3))
-    assert all(
-        workspace.materialize_devices == [model.torch.device("cuda", 3)]
-        for workspace in workspaces
+    assert by_op["forward"].materialize_devices == [model.torch.device("cuda", 3)]
+    assert by_op["backward"].materialize_devices == []
+
+    layer.materialize_ep_chunk_workspaces(
+        phase="backward", device=model.torch.device("cuda", 3)
     )
+    assert by_op["backward"].materialize_devices == [model.torch.device("cuda", 3)]
+
+    stream = object()
+    layer.release_ep_chunk_workspaces(phase="forward", stream=stream)
+    layer.release_ep_chunk_workspaces(phase="backward", stream=stream)
+    assert released == [("forward", stream), ("backward", stream)]
+    with pytest.raises(ValueError, match="expected 'forward' or 'backward'"):
+        layer.materialize_ep_chunk_workspaces(phase="unused")
 
 
 @pytest.mark.parametrize(
@@ -270,6 +287,11 @@ def test_qwen3_builds_only_two_cross_layer_workspaces_for_48_layers(
     assert len(registry) == 2
     assert dispatcher_count == 0
     layers[0].materialize_ep_chunk_workspaces(device="cpu")
+    assert dispatcher_count == 2
+    assert (
+        registry[next(key for key in registry if key.op != "forward")].dispatchers == []
+    )
+    layers[0].materialize_ep_chunk_workspaces(phase="backward", device="cpu")
     assert dispatcher_count == 4
     assert len({id(layer.ep_chunk_forward.workspace) for layer in layers}) == 1
     companion = "ep_chunk_fused" if full_recompute else "ep_chunk_backward"
@@ -369,9 +391,6 @@ def test_qwen3_training_mode_matches_no_recompute_and_full_recompute_parity(
     class FakeWorkspace:
         def __init__(self, key):
             self.key = key
-
-        def warmup(self, *, device):
-            pass
 
     class FakeForward:
         def __init__(self, *, backward_op=None, **_kwargs):

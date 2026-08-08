@@ -142,7 +142,6 @@ def test_dispatch_local_backward_accumulates_duplicate_rows_in_workspace(
         ),
     )
     workspace = EPChunkWorkspaceRegistry().get_or_create(key, lambda slot: slot)
-    workspace.warmup(device="cpu")
     lease = workspace.acquire(0)
     chunk = SimpleNamespace(
         idx=0,
@@ -255,6 +254,66 @@ def test_core_contains_forward_backward_deepep_pipeline():
         "submit_deepep_dispatch_backward",
         "finish_deepep_dispatch_backward",
     } <= calls
+
+
+def test_all_chunked_async_deepep_allocations_are_owned_by_comm_stream():
+    tree = ast.parse(SOURCE.read_text())
+    submit_names = {
+        "submit_deepep_dispatch",
+        "submit_deepep_combine_prepared",
+        "submit_deepep_combine_backward",
+        "submit_deepep_dispatch_backward",
+    }
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in submit_names
+    ]
+
+    assert calls
+    for call in calls:
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        assert isinstance(keywords.get("allocate_on_comm_stream"), ast.Constant)
+        assert keywords["allocate_on_comm_stream"].value is True
+        if call.func.attr in {
+            "submit_deepep_dispatch",
+            "submit_deepep_combine_prepared",
+        }:
+            assert isinstance(keywords.get("async_finish"), ast.Constant)
+            assert keywords["async_finish"].value is True
+
+
+def test_all_chunked_deepep_submissions_run_inside_the_slot_mem_pool():
+    tree = ast.parse(SOURCE.read_text())
+    submit_names = {
+        "submit_deepep_dispatch",
+        "submit_deepep_combine_prepared",
+        "submit_deepep_combine_backward",
+        "submit_deepep_dispatch_backward",
+    }
+    guarded = []
+
+    def visit(node, in_pool=False):
+        if isinstance(node, ast.With):
+            in_pool = in_pool or any(
+                isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Attribute)
+                and item.context_expr.func.attr == "deepep_allocation"
+                for item in node.items
+            )
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in submit_names
+        ):
+            guarded.append(in_pool)
+        for child in ast.iter_child_nodes(node):
+            visit(child, in_pool)
+
+    visit(tree)
+    assert guarded and all(guarded)
 
 
 def test_production_path_has_no_global_cuda_sync_or_allocator_fallback():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -167,12 +168,11 @@ def test_workspace_slots_are_stable_and_consumer_event_guarded(
     )
     workspace = registry_type().get_or_create(key, lambda slot: f"dispatcher-{slot}")
 
-    workspace.warmup(device="cpu")
-    workspace.warmup_tensor("output", (8, 4), dtype=torch.float32, device="cpu")
-    before = [workspace.tensor(slot, "output").data_ptr() for slot in range(2)]
-    allocation_count = workspace.metrics()["allocations"]
-
     first = workspace.acquire(0)
+    before = first.tensor(
+        "output", (8, 4), dtype=torch.float32, device="cpu"
+    ).data_ptr()
+    allocation_count = workspace.metrics()["allocations"]
     with pytest.raises(RuntimeError, match="already leased"):
         workspace.acquire(0)
     pending = _FakeEvent(ready=False)
@@ -181,10 +181,11 @@ def test_workspace_slots_are_stable_and_consumer_event_guarded(
     stream = _FakeStream()
     second = workspace.acquire(0, stream=stream)
     assert stream.waited == [pending]
+    after = second.tensor(
+        "output", (8, 4), dtype=torch.float32, device="cpu"
+    ).data_ptr()
     second.release(_FakeEvent(ready=True))
 
-    workspace.warmup_tensor("output", (8, 4), dtype=torch.float32, device="cpu")
-    after = [workspace.tensor(slot, "output").data_ptr() for slot in range(2)]
     metrics = workspace.metrics()
     assert after == before
     assert metrics["allocations"] == allocation_count
@@ -192,7 +193,7 @@ def test_workspace_slots_are_stable_and_consumer_event_guarded(
     assert metrics["fallbacks"] == 0
 
 
-def test_workspace_shape_overflow_fails_loud_without_growth(
+def test_backward_scratch_grows_to_observed_shape_but_not_beyond_profile(
     transformer_engine_import_stub,
 ):
     (
@@ -220,18 +221,22 @@ def test_workspace_shape_overflow_fails_loud_without_growth(
     )
     workspace = registry_type().get_or_create(key, lambda slot: slot)
     workspace.materialize(device="cpu")
-    workspace.warmup_tensor("grad_hidden", (8, 4), dtype=torch.float32, device="cpu")
+    assert workspace.evidence()["data_ptrs"] == {}
+    lease = workspace.acquire(0)
+    first = lease.tensor("grad_recv_hidden", (8, 4), dtype=torch.float32, device="cpu")
+    grown = lease.tensor("grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu")
 
-    with pytest.raises(RuntimeError, match="exceeds the fixed workspace shape"):
-        workspace.warmup_tensor(
-            "grad_hidden", (9, 4), dtype=torch.float32, device="cpu"
-        )
+    assert grown.shape == (9, 4)
+    assert grown.data_ptr() != first.data_ptr()
+    assert workspace.metrics()["grows"] == 1
 
-    assert workspace.metrics()["grows"] == 0
+    with pytest.raises(RuntimeError, match="exceeds fixed profile capacity"):
+        lease.tensor("grad_recv_hidden", (17, 4), dtype=torch.float32, device="cpu")
+
     assert workspace.metrics()["fallbacks"] == 0
 
 
-def test_production_warmup_makes_backward_steady_state_allocation_free(
+def test_backward_scratch_is_actual_shape_lazy_then_steady_state_stable(
     transformer_engine_import_stub,
 ):
     (
@@ -262,32 +267,38 @@ def test_production_warmup_makes_backward_steady_state_allocation_free(
         lambda slot: slot,
     )
 
-    workspace.warmup(device="cpu")
-    pointers = {
-        (slot, name): workspace.tensor(slot, name).data_ptr()
-        for slot in range(2)
-        for name in ("grad_recv_hidden", "grad_recv_probs")
-    }
-    allocations = workspace.metrics()["allocations"]
+    workspace.materialize(device="cpu")
+    assert workspace.metrics()["allocations"] == 0
+    assert workspace.evidence()["data_ptrs"] == {}
 
-    lease = workspace.acquire(0)
-    lease.tensor("grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu")
-    lease.tensor("grad_recv_probs", (9, 2), dtype=torch.float32, device="cpu")
+    first_ptrs = {}
+    for slot in range(2):
+        lease = workspace.acquire(slot)
+        first_ptrs[(slot, "grad_recv_hidden")] = lease.tensor(
+            "grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu"
+        ).data_ptr()
+        first_ptrs[(slot, "grad_recv_probs")] = lease.tensor(
+            "grad_recv_probs", (9, 2), dtype=torch.float32, device="cpu"
+        ).data_ptr()
+        lease.release(_FakeEvent(ready=True))
 
-    assert workspace.metrics()["allocations"] == allocations
-    assert workspace.metrics()["runtime_allocations"] == 0
-    evidence = workspace.evidence()
-    assert evidence["runtime_allocations"] == 0
-    assert evidence["data_ptrs"] == {
-        f"{slot}:{name}": pointers[(slot, name)]
-        for slot in range(2)
-        for name in ("grad_recv_hidden", "grad_recv_probs")
-    }
-    assert {
-        (slot, name): workspace.tensor(slot, name).data_ptr()
-        for slot in range(2)
-        for name in ("grad_recv_hidden", "grad_recv_probs")
-    } == pointers
+    first_metrics = workspace.metrics().copy()
+    assert first_metrics["allocations"] == 4
+    assert first_metrics["runtime_allocations"] == 4
+
+    second_ptrs = {}
+    for slot in range(2):
+        lease = workspace.acquire(slot)
+        second_ptrs[(slot, "grad_recv_hidden")] = lease.tensor(
+            "grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu"
+        ).data_ptr()
+        second_ptrs[(slot, "grad_recv_probs")] = lease.tensor(
+            "grad_recv_probs", (9, 2), dtype=torch.float32, device="cpu"
+        ).data_ptr()
+        lease.release(_FakeEvent(ready=True))
+
+    assert second_ptrs == first_ptrs
+    assert workspace.metrics() == first_metrics
 
 
 def test_profile_rejects_input_rows_beyond_qwen_capacity(
@@ -351,13 +362,97 @@ def test_workspace_reports_deepep_buffer_count_and_resident_bytes(
         ),
         dispatcher,
     )
-    workspace.warmup(device="cpu")
+    workspace.materialize(device="cpu")
 
     evidence = workspace.evidence()
     assert evidence["dispatcher_count"] == 2
     assert evidence["deepep_buffer_count"] == 2
     assert evidence["deepep_buffer_resident_bytes"] == 2048
     assert evidence["caller_owned_recv_proven"] is False
+
+
+def test_workspace_lazily_owns_one_cuda_mem_pool_per_slot(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    created = []
+    entered = []
+    creation_devices = []
+
+    class FakePool:
+        pass
+
+    @contextmanager
+    def use_pool(pool, device=None):
+        entered.append((pool, device))
+        yield
+
+    @contextmanager
+    def use_device(device):
+        creation_devices.append(device)
+        yield
+
+    def make_pool(*, allocator=None, use_on_oom=False, no_split=False):
+        assert allocator is None
+        assert use_on_oom is False
+        assert no_split is False
+        pool = FakePool()
+        created.append(pool)
+        return pool
+
+    monkeypatch.setattr(overlap.torch.cuda, "MemPool", make_pool)
+    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
+    monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="forward",
+            device_type="cuda",
+            device_index=3,
+            ep_group_id=31,
+            dtype=torch.bfloat16,
+            shape_profile=profile_type(
+                max_input_rows=8,
+                hidden_size=4,
+                topk=2,
+                ep_size=2,
+            ),
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    workspace.materialize()
+    assert len(created) == 2
+    assert creation_devices == [torch.device("cuda", 3)]
+    assert workspace.evidence()["allocation_pool_count"] == 2
+
+    lease0 = workspace.acquire(0)
+    with lease0.deepep_allocation():
+        pass
+    with lease0.deepep_allocation():
+        pass
+    assert entered == [(created[0], torch.device("cuda", 3))] * 2
+    lease0.release(_FakeEvent(ready=True))
+
+    lease1 = workspace.acquire(1)
+    with lease1.deepep_allocation():
+        pass
+    assert len(created) == 2
+    lease1.release(_FakeEvent(ready=True))
+    assert workspace.evidence()["allocation_pool_count"] == 2
+
+    workspace.release()
+    assert workspace.evidence()["allocation_pool_count"] == 0
 
 
 def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
@@ -410,6 +505,7 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
         "dispatcher_count": 0,
         "deepep_buffer_count": 0,
         "deepep_buffer_resident_bytes": 0,
+        "allocation_pool_count": 0,
         "caller_owned_recv_proven": False,
         "materialized": False,
     }
@@ -417,12 +513,13 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
 
     workspace.materialize(device="cpu")
     first_dispatchers = tuple(created)
-    first_tensors = [
-        workspace.tensor(slot, name)
-        for slot in range(2)
-        for name in ("grad_recv_hidden", "grad_recv_probs")
-    ]
-    first_ptrs = {tensor.data_ptr() for tensor in first_tensors}
+    assert workspace.evidence()["data_ptrs"] == {}
+    for slot in range(2):
+        lease = workspace.acquire(slot)
+        lease.tensor("grad_recv_hidden", (4, 4), dtype=torch.float32, device="cpu")
+        lease.tensor("grad_recv_probs", (4, 2), dtype=torch.float32, device="cpu")
+        lease.release(_FakeEvent(ready=True))
+    first_ptrs = set(workspace.evidence()["data_ptrs"].values())
     assert workspace.evidence()["dispatcher_count"] == 2
 
     registry.release(key)
@@ -433,24 +530,27 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
 
     workspace.materialize(device="cpu")
     assert registry.get_or_create(key, factory) is workspace
-    assert {
-        workspace.tensor(slot, name).data_ptr()
-        for slot in range(2)
-        for name in ("grad_recv_hidden", "grad_recv_probs")
-    }.isdisjoint(first_ptrs)
+    assert workspace.evidence()["data_ptrs"] == {}
+    for slot in range(2):
+        lease = workspace.acquire(slot)
+        lease.tensor("grad_recv_hidden", (4, 4), dtype=torch.float32, device="cpu")
+        lease.tensor("grad_recv_probs", (4, 2), dtype=torch.float32, device="cpu")
+        lease.release(_FakeEvent(ready=True))
+    assert set(workspace.evidence()["data_ptrs"].values()).isdisjoint(first_ptrs)
     registry.release(key)
 
     rebuilt = registry.get_or_create(key, factory)
     assert rebuilt is not workspace
     rebuilt.materialize(device="cpu")
+    for slot in range(2):
+        lease = rebuilt.acquire(slot)
+        lease.tensor("grad_recv_hidden", (4, 4), dtype=torch.float32, device="cpu")
+        lease.tensor("grad_recv_probs", (4, 2), dtype=torch.float32, device="cpu")
+        lease.release(_FakeEvent(ready=True))
     assert all(
         rebuilt.dispatcher(slot) is not first_dispatchers[slot] for slot in range(2)
     )
-    assert {
-        rebuilt.tensor(slot, name).data_ptr()
-        for slot in range(2)
-        for name in ("grad_recv_hidden", "grad_recv_probs")
-    }.isdisjoint(first_ptrs)
+    assert set(rebuilt.evidence()["data_ptrs"].values()).isdisjoint(first_ptrs)
 
 
 def test_workspace_release_rejects_active_lease_and_pending_event(

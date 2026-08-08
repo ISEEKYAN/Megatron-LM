@@ -211,11 +211,30 @@ class MoELayer(nn.Module):
                 workspaces.append(op.workspace)
         return tuple(workspaces)
 
+    def _ep_chunk_workspaces_for_phase(self, phase: str):
+        """Select only workspaces first used by one execution phase."""
+        if phase == "forward":
+            ops = (self.ep_chunk_forward,)
+        elif phase == "backward":
+            ops = (
+                self.ep_chunk_fused
+                if self.ep_chunk_full_recompute
+                else self.ep_chunk_backward,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported EP chunk workspace phase {phase!r}; expected 'forward' or 'backward'"
+            )
+        return tuple(op.workspace for op in ops if op is not None)
+
     def materialize_ep_chunk_workspaces(
-        self, *, device: torch.device | str | None = None
+        self,
+        *,
+        phase: str = "forward",
+        device: torch.device | str | None = None,
     ) -> None:
-        """Explicitly materialize only the two workspaces selected by Qwen."""
-        for workspace in self._ep_chunk_workspaces():
+        """Materialize only the workspace needed by the requested execution phase."""
+        for workspace in self._ep_chunk_workspaces_for_phase(phase):
             workspace.materialize(device=device)
 
     def ep_chunk_workspace_evidence(self) -> dict[str, dict]:
@@ -224,9 +243,16 @@ class MoELayer(nn.Module):
             for workspace in self._ep_chunk_workspaces()
         }
 
-    def release_ep_chunk_workspaces(self, *, stream=None) -> None:
-        """Release selected workspaces for an explicit mode switch or teardown."""
-        for workspace in self._ep_chunk_workspaces():
+    def release_ep_chunk_workspaces(
+        self, *, phase: str | None = None, stream=None
+    ) -> None:
+        """Release one phase or all selected workspaces for mode switch/teardown."""
+        workspaces = (
+            self._ep_chunk_workspaces()
+            if phase is None
+            else self._ep_chunk_workspaces_for_phase(phase)
+        )
+        for workspace in workspaces:
             release_ep_chunk_workspace(workspace.key, stream=stream)
 
 

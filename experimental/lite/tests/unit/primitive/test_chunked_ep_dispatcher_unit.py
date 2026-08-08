@@ -76,7 +76,9 @@ def test_deepep_dispatch_materializes_contiguous_router_outputs():
     assert not scores.is_contiguous()
     assert not indices.is_contiguous()
 
-    state = value.submit_deepep_dispatch(hidden, scores, indices)
+    state = value.submit_deepep_dispatch(
+        hidden, scores, indices, allocate_on_comm_stream=True
+    )
 
     assert buffer.layout_indices is buffer.dispatch_calls[0][1]["topk_idx"]
     assert buffer.dispatch_calls[0][1]["topk_weights"].is_contiguous()
@@ -102,7 +104,9 @@ def test_chunked_dispatch_uses_native_deepep_layout_and_preserves_evidence():
     scores = torch.ones(3, 2)
     indices = torch.tensor([[0, 2], [1, 3], [0, 1]])
 
-    state = value.submit_deepep_dispatch(hidden, scores, indices)
+    state = value.submit_deepep_dispatch(
+        hidden, scores, indices, allocate_on_comm_stream=True
+    )
 
     kwargs = buffer.dispatch_calls[0][1]
     torch.testing.assert_close(
@@ -117,6 +121,7 @@ def test_chunked_dispatch_uses_native_deepep_layout_and_preserves_evidence():
     )
     assert kwargs["num_tokens_per_rdma_rank"] is None
     assert kwargs["previous_event"] is not None
+    assert kwargs["allocate_on_comm_stream"] is True
     assert "num_worst_tokens" not in kwargs
     dispatch_inputs = state["_dispatch_inputs"]
     assert dispatch_inputs[0] is hidden
@@ -167,10 +172,14 @@ def test_prepared_combine_preserves_manual_metadata_and_finishes(monkeypatch):
 
     rank_grouped, handle = value.prepare_deepep_combine(expert_output)
     state = value.submit_deepep_combine_prepared(
-        rank_grouped, handle, async_finish=True
+        rank_grouped,
+        handle,
+        async_finish=True,
+        allocate_on_comm_stream=True,
     )
 
     assert handle == "dispatch-handle"
+    assert value.buffer.combine_calls[0][2]["allocate_on_comm_stream"] is True
     event = state["event"]
     result = value.finish_deepep_combine(state)
     assert event.waited
@@ -183,7 +192,9 @@ def test_manual_backward_submit_finish_pairs_wait_for_events():
     value = _dispatcher()
     grad = torch.zeros(2, 3)
 
-    combine_state = value.submit_deepep_combine_backward(grad, "combine-handle")
+    combine_state = value.submit_deepep_combine_backward(
+        grad, "combine-handle", allocate_on_comm_stream=True
+    )
     combine_event = combine_state["event"]
     assert torch.equal(
         value.finish_deepep_combine_backward(combine_state), torch.full((2, 3), 2.0)
@@ -191,13 +202,18 @@ def test_manual_backward_submit_finish_pairs_wait_for_events():
     assert combine_event.waited
 
     dispatch_state = value.submit_deepep_dispatch_backward(
-        grad, torch.ones(2, 1), "dispatch-handle"
+        grad,
+        torch.ones(2, 1),
+        "dispatch-handle",
+        allocate_on_comm_stream=True,
     )
     dispatch_event = dispatch_state["event"]
     grad_hidden, grad_scores = value.finish_deepep_dispatch_backward(dispatch_state)
     assert torch.equal(grad_hidden, torch.ones(2, 3))
     assert grad_scores.shape == (2, 1)
     assert dispatch_event.waited
+    assert value.buffer.dispatch_calls[0][1]["allocate_on_comm_stream"] is True
+    assert value.buffer.combine_calls[0][2]["allocate_on_comm_stream"] is True
 
 
 def test_manual_backward_consumes_explicit_handle_on_its_origin_buffer():

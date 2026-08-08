@@ -112,6 +112,7 @@ class EPChunkWorkspaceKey:
 class _WorkspaceSlot:
     dispatcher: TokenDispatcher | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    allocation_pool: Any | None = None
     in_use: bool = False
     consumer_event: Any | None = None
 
@@ -136,6 +137,14 @@ class EPChunkWorkspaceLease:
         return self.workspace._lease_tensor(
             self.slot, name, shape, dtype=dtype, device=device
         )
+
+    @contextmanager
+    def deepep_allocation(self):
+        """Route DeepEP's internal torch allocations through this slot's pool."""
+        if not self._active:
+            raise RuntimeError("EP chunk workspace lease has already been released")
+        with self.workspace._deepep_allocation(self.slot):
+            yield
 
     def release(self, consumer_event: Any) -> None:
         if not self._active:
@@ -162,6 +171,7 @@ class EPChunkWorkspace:
         self._slots = [_WorkspaceSlot() for _ in range(EP_CHUNK_COUNT)]
         self._allocations = 0
         self._runtime_allocations = 0
+        self._grows = 0
         self._waits = 0
         self._materialized = False
 
@@ -173,12 +183,35 @@ class EPChunkWorkspace:
         return dispatcher
 
     def materialize(self, *, device: torch.device | str | None = None) -> None:
-        """Lazily create dispatchers and bounded scratch storage."""
+        """Create this op's dispatchers and empty per-slot allocation pools."""
         if self._materialized:
             return
         if self._registry is not None:
             self._registry._claim(self)
-        dispatchers = [self._dispatcher_factory(slot) for slot in range(EP_CHUNK_COUNT)]
+        profile_device = self._profile_device()
+        if device is not None and torch.device(device) != profile_device:
+            raise RuntimeError(
+                f"EP chunk materialize device {torch.device(device)} does not match "
+                f"workspace key device {profile_device}"
+            )
+        if self.key.device_type == "cuda":
+            with torch.cuda.device(profile_device):
+                dispatchers = [
+                    self._dispatcher_factory(slot) for slot in range(EP_CHUNK_COUNT)
+                ]
+                allocation_pools = [
+                    torch.cuda.MemPool(
+                        allocator=None,
+                        use_on_oom=False,
+                        no_split=False,
+                    )
+                    for _ in range(EP_CHUNK_COUNT)
+                ]
+        else:
+            dispatchers = [
+                self._dispatcher_factory(slot) for slot in range(EP_CHUNK_COUNT)
+            ]
+            allocation_pools = [None for _ in range(EP_CHUNK_COUNT)]
         if len({id(dispatcher) for dispatcher in dispatchers}) != EP_CHUNK_COUNT:
             raise RuntimeError("EP chunk workspace requires two distinct dispatchers")
         for chunk_idx, dispatcher in enumerate(dispatchers):
@@ -188,23 +221,8 @@ class EPChunkWorkspace:
                 )
         for chunk_idx, dispatcher in enumerate(dispatchers):
             self._slots[chunk_idx].dispatcher = dispatcher
+            self._slots[chunk_idx].allocation_pool = allocation_pools[chunk_idx]
         self._materialized = True
-        if self.key.op == "backward":
-            if device is None:
-                device = self._profile_device()
-            profile = self.key.shape_profile
-            self.warmup_tensor(
-                "grad_recv_hidden",
-                (profile.max_recv_rows, profile.hidden_size),
-                dtype=self.key.dtype,
-                device=device,
-            )
-            self.warmup_tensor(
-                "grad_recv_probs",
-                (profile.max_recv_rows, profile.topk),
-                dtype=torch.float32,
-                device=device,
-            )
 
     def acquire(self, slot: int, *, stream: Any | None = None) -> EPChunkWorkspaceLease:
         self._validate_slot(slot)
@@ -229,23 +247,6 @@ class EPChunkWorkspace:
             state.consumer_event = None
         state.in_use = True
         return EPChunkWorkspaceLease(self, slot)
-
-    def warmup_tensor(
-        self,
-        name: str,
-        shape: tuple[int, ...] | torch.Size,
-        *,
-        dtype: torch.dtype,
-        device: torch.device | str,
-    ) -> None:
-        for slot in range(EP_CHUNK_COUNT):
-            self._reserve_tensor(
-                slot, name, shape, dtype=dtype, device=device, runtime=False
-            )
-
-    def warmup(self, *, device: torch.device | str) -> None:
-        """Compatibility alias for explicit eager materialization."""
-        self.materialize(device=device)
 
     def close(self, *, stream: Any | None = None) -> None:
         """Release resident state without a device-wide synchronization."""
@@ -273,8 +274,10 @@ class EPChunkWorkspace:
             slot.consumer_event = None
             slot.tensors.clear()
             slot.dispatcher = None
+            slot.allocation_pool = None
         self._allocations = 0
         self._runtime_allocations = 0
+        self._grows = 0
         self._waits = 0
         self._materialized = False
 
@@ -282,14 +285,19 @@ class EPChunkWorkspace:
         """Idempotent alias for explicit lifecycle callers."""
         self.close(stream=stream)
 
-    def tensor(self, slot: int, name: str) -> torch.Tensor:
+    @contextmanager
+    def _deepep_allocation(self, slot: int):
         self._validate_slot(slot)
-        try:
-            return self._slots[slot].tensors[name]
-        except KeyError as exc:
-            raise RuntimeError(
-                f"EP chunk workspace tensor {name!r} is not warm"
-            ) from exc
+        if self.key.device_type != "cuda":
+            yield
+            return
+        state = self._slots[slot]
+        if state.allocation_pool is None:
+            raise RuntimeError("EP chunk CUDA allocation pool is not materialized")
+        with torch.cuda.use_mem_pool(
+            state.allocation_pool, device=self._profile_device()
+        ):
+            yield
 
     def _lease_tensor(
         self,
@@ -300,12 +308,43 @@ class EPChunkWorkspace:
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> torch.Tensor:
-        tensor = self._reserve_tensor(
-            slot, name, shape, dtype=dtype, device=device, runtime=True
-        )
         requested = tuple(int(dim) for dim in shape)
+        self._validate_runtime_tensor(name, requested, dtype)
+        tensor = self._reserve_tensor(
+            slot,
+            name,
+            requested,
+            dtype=dtype,
+            device=device,
+        )
         slices = tuple(slice(0, dim) for dim in requested)
         return tensor[slices].view(requested).detach()
+
+    def _validate_runtime_tensor(
+        self, name: str, shape: tuple[int, ...], dtype: torch.dtype
+    ) -> None:
+        profile = self.key.shape_profile
+        contracts = {
+            "grad_recv_hidden": (
+                (profile.max_recv_rows, profile.hidden_size),
+                self.key.dtype,
+            ),
+            "grad_recv_probs": ((profile.max_recv_rows, profile.topk), torch.float32),
+        }
+        contract = contracts.get(name)
+        if contract is None:
+            return
+        capacity, expected_dtype = contract
+        if (
+            len(shape) != len(capacity)
+            or any(want > have for want, have in zip(shape, capacity, strict=True))
+            or shape[1:] != capacity[1:]
+            or dtype != expected_dtype
+        ):
+            raise RuntimeError(
+                f"EP chunk tensor {name!r} shape {shape} dtype {dtype} exceeds fixed "
+                f"profile capacity {capacity} dtype {expected_dtype}"
+            )
 
     def _reserve_tensor(
         self,
@@ -315,7 +354,6 @@ class EPChunkWorkspace:
         *,
         dtype: torch.dtype,
         device: torch.device | str,
-        runtime: bool,
     ) -> torch.Tensor:
         self._validate_slot(slot)
         requested = tuple(int(dim) for dim in shape)
@@ -326,16 +364,25 @@ class EPChunkWorkspace:
             existing = torch.empty(requested, dtype=dtype, device=device)
             self._slots[slot].tensors[name] = existing
             self._allocations += 1
-            if runtime:
-                self._runtime_allocations += 1
+            self._runtime_allocations += 1
             return existing
         capacity = tuple(existing.shape)
-        if (
+        incompatible = (
             existing.dtype != dtype
             or existing.device != torch.device(device)
             or len(capacity) != len(requested)
-            or any(want > have for want, have in zip(requested, capacity, strict=True))
-        ):
+        )
+        too_small = not incompatible and any(
+            want > have for want, have in zip(requested, capacity, strict=True)
+        )
+        if too_small:
+            existing = torch.empty(requested, dtype=dtype, device=device)
+            self._slots[slot].tensors[name] = existing
+            self._allocations += 1
+            self._runtime_allocations += 1
+            self._grows += 1
+            return existing
+        if incompatible or too_small:
             raise RuntimeError(
                 f"EP chunk tensor {name!r} shape {requested} exceeds the fixed "
                 f"workspace shape {capacity}"
@@ -347,7 +394,7 @@ class EPChunkWorkspace:
             "allocations": self._allocations,
             "runtime_allocations": self._runtime_allocations,
             "waits": self._waits,
-            "grows": 0,
+            "grows": self._grows,
             "fallbacks": 0,
         }
 
@@ -371,6 +418,9 @@ class EPChunkWorkspace:
             ),
             "deepep_buffer_count": len(buffers),
             "deepep_buffer_resident_bytes": sum(buffers.values()),
+            "allocation_pool_count": sum(
+                slot.allocation_pool is not None for slot in self._slots
+            ),
             "caller_owned_recv_proven": False,
             "materialized": self._materialized,
         }
@@ -747,11 +797,14 @@ class _EPChunkOperationBase:
                 comm_stream.wait_event(input_ready)
                 scores, indices = self._route(x_chunk, start, end)
                 with _ep_chunk_nvtx("forward.dispatch", chunk_idx):
-                    state = dispatcher.submit_deepep_dispatch(
-                        x_chunk,
-                        scores,
-                        indices,
-                    )
+                    with lease.deepep_allocation():
+                        state = dispatcher.submit_deepep_dispatch(
+                            x_chunk,
+                            scores,
+                            indices,
+                            allocate_on_comm_stream=True,
+                            async_finish=True,
+                        )
             return chunk_idx, dispatcher, state, lease
 
         def finish_dispatch_expert(pending):
@@ -799,9 +852,13 @@ class _EPChunkOperationBase:
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(ready)
                 with _ep_chunk_nvtx("forward.combine", chunk_idx):
-                    combine_state = dispatcher.submit_deepep_combine_prepared(
-                        rank_grouped, handle
-                    )
+                    with lease.deepep_allocation():
+                        combine_state = dispatcher.submit_deepep_combine_prepared(
+                            rank_grouped,
+                            handle,
+                            allocate_on_comm_stream=True,
+                            async_finish=True,
+                        )
             return chunk_idx, dispatcher, combine_state, lease
 
         output_2d = x_2d.new_empty(x_2d.shape)
@@ -865,7 +922,14 @@ class _EPChunkOperationBase:
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(router_ready)
                 with _ep_chunk_nvtx("forward.dispatch", chunk_idx):
-                    state = dispatcher.submit_deepep_dispatch(x_chunk, scores, indices)
+                    with lease.deepep_allocation():
+                        state = dispatcher.submit_deepep_dispatch(
+                            x_chunk,
+                            scores,
+                            indices,
+                            allocate_on_comm_stream=True,
+                            async_finish=True,
+                        )
             return chunk_idx, start, end, x_chunk, scores, dispatcher, state, lease
 
         def finish_dispatch_expert(pending):
@@ -958,9 +1022,13 @@ class _EPChunkOperationBase:
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(ready)
                 with _ep_chunk_nvtx("forward.combine", chunk_idx):
-                    combine_state = dispatcher.submit_deepep_combine_prepared(
-                        rank_grouped, handle
-                    )
+                    with lease.deepep_allocation():
+                        combine_state = dispatcher.submit_deepep_combine_prepared(
+                            rank_grouped,
+                            handle,
+                            allocate_on_comm_stream=True,
+                            async_finish=True,
+                        )
             return chunk_idx, dispatcher, combine_state, lease
 
         output_2d = x_2d.new_empty(x_2d.shape)
@@ -1061,13 +1129,16 @@ class _EPChunkOperationBase:
                 comm_stream.wait_event(router_ready)
                 chain_deepep_event()
                 with _ep_chunk_nvtx("backward.dispatch", chunk_idx):
-                    state = remember_deepep_event(
-                        dispatcher.submit_deepep_dispatch(
-                            x_chunk,
-                            scores,
-                            indices,
+                    with lease.deepep_allocation():
+                        state = remember_deepep_event(
+                            dispatcher.submit_deepep_dispatch(
+                                x_chunk,
+                                scores,
+                                indices,
+                                allocate_on_comm_stream=True,
+                                async_finish=True,
+                            )
                         )
-                    )
             return chunk_idx, start, end, x_chunk, scores, dispatcher, state, lease
 
         def submit_combine_bwd(
@@ -1076,14 +1147,20 @@ class _EPChunkOperationBase:
             end: int,
             dispatcher: TokenDispatcher,
             handle: Any,
+            workspace_lease: EPChunkWorkspaceLease,
         ):
             with torch.cuda.stream(comm_stream):
                 grad_chunk = grad_2d[start:end].contiguous()
                 chain_deepep_event()
                 with _ep_chunk_nvtx("backward.combine", chunk_idx):
-                    return remember_deepep_event(
-                        dispatcher.submit_deepep_combine_backward(grad_chunk, handle)
-                    )
+                    with workspace_lease.deepep_allocation():
+                        return remember_deepep_event(
+                            dispatcher.submit_deepep_combine_backward(
+                                grad_chunk,
+                                handle,
+                                allocate_on_comm_stream=True,
+                            )
+                        )
 
         def finish_recompute_expert(
             chunk_idx: int,
@@ -1144,7 +1221,12 @@ class _EPChunkOperationBase:
                     workspace_lease,
                 ) = next_state
                 combine_state = submit_combine_bwd(
-                    chunk_idx, start, end, dispatcher, state["handle"]
+                    chunk_idx,
+                    start,
+                    end,
+                    dispatcher,
+                    state["handle"],
+                    workspace_lease,
                 )
                 (
                     dispatched,
@@ -1268,13 +1350,15 @@ class _EPChunkOperationBase:
                     comm_stream.wait_event(local_bwd_ready)
                     chain_deepep_event()
                     with _ep_chunk_nvtx("backward.dispatch", chunk.idx):
-                        local_state["dispatch_bwd_state"] = remember_deepep_event(
-                            dispatcher.submit_deepep_dispatch_backward(
-                                local_state["grad_recv_hidden"],
-                                local_state["grad_recv_probs"],
-                                chunk.handle,
+                        with chunk.workspace_lease.deepep_allocation():
+                            local_state["dispatch_bwd_state"] = remember_deepep_event(
+                                dispatcher.submit_deepep_dispatch_backward(
+                                    local_state["grad_recv_hidden"],
+                                    local_state["grad_recv_probs"],
+                                    chunk.handle,
+                                    allocate_on_comm_stream=True,
+                                )
                             )
-                        )
                     local_state.pop("grad_recv_hidden", None)
                     local_state.pop("grad_recv_probs", None)
 
@@ -1398,12 +1482,14 @@ class _EPChunkOperationBase:
                 if last_deepep_event is not None:
                     _event_current_stream_wait(last_deepep_event)
                 with _ep_chunk_nvtx("backward.combine", chunk.idx):
-                    combine_state = remember_deepep_event(
-                        chunk.dispatcher.submit_deepep_combine_backward(
-                            grad_2d[chunk.start : chunk.end].contiguous(),
-                            chunk.handle,
+                    with chunk.workspace_lease.deepep_allocation():
+                        combine_state = remember_deepep_event(
+                            chunk.dispatcher.submit_deepep_combine_backward(
+                                grad_2d[chunk.start : chunk.end].contiguous(),
+                                chunk.handle,
+                                allocate_on_comm_stream=True,
+                            )
                         )
-                    )
 
             local_state: dict[str, Any] = {}
             with torch.cuda.stream(compute_stream):
@@ -1446,13 +1532,15 @@ class _EPChunkOperationBase:
                 if last_deepep_event is not None:
                     _event_current_stream_wait(last_deepep_event)
                 with _ep_chunk_nvtx("backward.dispatch", chunk.idx):
-                    local_state["dispatch_bwd_state"] = remember_deepep_event(
-                        chunk.dispatcher.submit_deepep_dispatch_backward(
-                            grad_recv_hidden,
-                            grad_recv_probs,
-                            chunk.handle,
+                    with chunk.workspace_lease.deepep_allocation():
+                        local_state["dispatch_bwd_state"] = remember_deepep_event(
+                            chunk.dispatcher.submit_deepep_dispatch_backward(
+                                grad_recv_hidden,
+                                grad_recv_probs,
+                                chunk.handle,
+                                allocate_on_comm_stream=True,
+                            )
                         )
-                    )
             pending_dispatch_bwd.append((chunk, local_state))
 
         wgrad_ready = torch.cuda.Event()
