@@ -129,6 +129,10 @@ def test_three_ops_get_independent_cross_layer_workspaces(
     assert forward_layer_0 is forward_layer_47
     assert forward_layer_0 is not backward
     assert backward is not fused
+    assert created == []
+    forward_layer_0.materialize(device="cpu")
+    backward.materialize(device="cpu")
+    fused.materialize(device="cpu")
     assert len(created) == 6
     assert [slot for slot, _ in created] == [0, 1, 0, 1, 0, 1]
     assert "layer" not in key_type.__dataclass_fields__
@@ -215,6 +219,7 @@ def test_workspace_shape_overflow_fails_loud_without_growth(
         ),
     )
     workspace = registry_type().get_or_create(key, lambda slot: slot)
+    workspace.materialize(device="cpu")
     workspace.warmup_tensor("grad_hidden", (8, 4), dtype=torch.float32, device="cpu")
 
     with pytest.raises(RuntimeError, match="exceeds the fixed workspace shape"):
@@ -353,6 +358,159 @@ def test_workspace_reports_deepep_buffer_count_and_resident_bytes(
     assert evidence["deepep_buffer_count"] == 2
     assert evidence["deepep_buffer_resident_bytes"] == 2048
     assert evidence["caller_owned_recv_proven"] is False
+
+
+def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    key = key_type(
+        op="backward",
+        device_type="cpu",
+        device_index=None,
+        ep_group_id=23,
+        dtype=torch.float32,
+        shape_profile=profile_type(
+            max_input_rows=8,
+            hidden_size=4,
+            topk=2,
+            ep_size=2,
+        ),
+    )
+    created = []
+
+    def factory(slot):
+        dispatcher = SimpleNamespace(
+            slot=slot,
+            use_deepep=True,
+            buffer=object(),
+            deepep_buffer_resident_bytes=256,
+        )
+        created.append(dispatcher)
+        return dispatcher
+
+    registry = registry_type()
+    workspace = registry.get_or_create(key, factory)
+    assert workspace.evidence() == {
+        "allocations": 0,
+        "runtime_allocations": 0,
+        "waits": 0,
+        "grows": 0,
+        "fallbacks": 0,
+        "data_ptrs": {},
+        "dispatcher_count": 0,
+        "deepep_buffer_count": 0,
+        "deepep_buffer_resident_bytes": 0,
+        "caller_owned_recv_proven": False,
+        "materialized": False,
+    }
+    assert created == []
+
+    workspace.materialize(device="cpu")
+    first_dispatchers = tuple(created)
+    first_tensors = [
+        workspace.tensor(slot, name)
+        for slot in range(2)
+        for name in ("grad_recv_hidden", "grad_recv_probs")
+    ]
+    first_ptrs = {tensor.data_ptr() for tensor in first_tensors}
+    assert workspace.evidence()["dispatcher_count"] == 2
+
+    registry.release(key)
+    assert workspace.evidence()["dispatcher_count"] == 0
+    assert workspace.evidence()["deepep_buffer_resident_bytes"] == 0
+    assert workspace.evidence()["data_ptrs"] == {}
+    registry.release(key)
+
+    workspace.materialize(device="cpu")
+    assert registry.get_or_create(key, factory) is workspace
+    assert {
+        workspace.tensor(slot, name).data_ptr()
+        for slot in range(2)
+        for name in ("grad_recv_hidden", "grad_recv_probs")
+    }.isdisjoint(first_ptrs)
+    registry.release(key)
+
+    rebuilt = registry.get_or_create(key, factory)
+    assert rebuilt is not workspace
+    rebuilt.materialize(device="cpu")
+    assert all(
+        rebuilt.dispatcher(slot) is not first_dispatchers[slot] for slot in range(2)
+    )
+    assert {
+        rebuilt.tensor(slot, name).data_ptr()
+        for slot in range(2)
+        for name in ("grad_recv_hidden", "grad_recv_probs")
+    }.isdisjoint(first_ptrs)
+
+
+def test_workspace_release_rejects_active_lease_and_pending_event(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    key = key_type(
+        op="forward",
+        device_type="cpu",
+        device_index=None,
+        ep_group_id=29,
+        dtype=torch.float32,
+        shape_profile=profile_type(
+            max_input_rows=8,
+            hidden_size=4,
+            topk=2,
+            ep_size=2,
+        ),
+    )
+    registry = registry_type()
+    workspace = registry.get_or_create(key, lambda slot: SimpleNamespace(slot=slot))
+    lease = workspace.acquire(0)
+    with pytest.raises(RuntimeError, match="slot 0 is leased"):
+        registry.release(key)
+
+    event = _FakeEvent(ready=False)
+    lease.release(event)
+    with pytest.raises(RuntimeError, match="pending consumer event"):
+        registry.release(key)
+
+    stream = _FakeStream()
+    registry.release(key, stream=stream)
+    assert stream.waited == [event]
+    assert workspace.evidence()["dispatcher_count"] == 0
+
+
+def test_workspace_release_never_uses_device_wide_synchronize(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        _profile,
+        _key,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+
+    assert "synchronize" not in inspect.getsource(registry_type.release)
 
 
 @pytest.mark.parametrize("shape", [(2, 5, 4), (10, 4)], ids=["bshd", "thd-packed"])

@@ -131,7 +131,7 @@ def test_qwen3_chunked_ep_is_one_boolean_fixed_profile(transformer_engine_import
     assert not any("num_chunks" in name or "schedule" in name for name in vars(cfg))
 
 
-def test_qwen3_layer_prewarms_three_ops_from_real_token_capacity(
+def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
     monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
@@ -142,14 +142,15 @@ def test_qwen3_layer_prewarms_three_ops_from_real_token_capacity(
     class FakeWorkspace:
         def __init__(self, key):
             self.key = key
-            self.warm_devices = []
+            self.materialize_devices = []
 
-        def warmup(self, *, device):
-            self.warm_devices.append(device)
+        def materialize(self, *, device=None):
+            self.materialize_devices.append(device)
 
     class FakeOp:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.workspace = kwargs["workspace"]
 
     def get_workspace(key, _factory):
         workspace = FakeWorkspace(key)
@@ -173,7 +174,7 @@ def test_qwen3_layer_prewarms_three_ops_from_real_token_capacity(
         max_position_embeddings=17,
     )
     ps = SimpleNamespace(ep_size=8, tp_ep_group=object())
-    model.MoELayer(
+    layer = model.MoELayer(
         config,
         ps,
         use_deepep=True,
@@ -187,8 +188,10 @@ def test_qwen3_layer_prewarms_three_ops_from_real_token_capacity(
         and workspace.key.shape_profile.max_recv_rows == 17 * 8
         for workspace in workspaces
     )
+    assert all(workspace.materialize_devices == [] for workspace in workspaces)
+    layer.materialize_ep_chunk_workspaces(device=model.torch.device("cuda", 3))
     assert all(
-        workspace.warm_devices == [model.torch.device("cuda", 3)]
+        workspace.materialize_devices == [model.torch.device("cuda", 3)]
         for workspace in workspaces
     )
 
@@ -213,12 +216,14 @@ def test_qwen3_builds_only_two_cross_layer_workspaces_for_48_layers(
     dispatcher_count = 0
 
     class FakeWorkspace:
-        def __init__(self, key, dispatchers):
+        def __init__(self, key, factory):
             self.key = key
-            self.dispatchers = dispatchers
+            self.factory = factory
+            self.dispatchers = []
 
-        def warmup(self, *, device):
-            pass
+        def materialize(self, *, device=None):
+            if not self.dispatchers:
+                self.dispatchers = [self.factory(0), self.factory(1)]
 
     class FakeOp:
         def __init__(self, **kwargs):
@@ -231,7 +236,7 @@ def test_qwen3_builds_only_two_cross_layer_workspaces_for_48_layers(
 
     def get_workspace(key, factory):
         if key not in registry:
-            registry[key] = FakeWorkspace(key, [factory(0), factory(1)])
+            registry[key] = FakeWorkspace(key, factory)
         return registry[key]
 
     monkeypatch.setattr(model, "TopKRouter", lambda *_args, **_kwargs: object())
@@ -263,6 +268,8 @@ def test_qwen3_builds_only_two_cross_layer_workspaces_for_48_layers(
 
     assert {key.op for key in registry} == expected_ops
     assert len(registry) == 2
+    assert dispatcher_count == 0
+    layers[0].materialize_ep_chunk_workspaces(device="cpu")
     assert dispatcher_count == 4
     assert len({id(layer.ep_chunk_forward.workspace) for layer in layers}) == 1
     companion = "ep_chunk_fused" if full_recompute else "ep_chunk_backward"
@@ -300,6 +307,28 @@ def test_qwen3_compose_layer_alone_interprets_recompute_policy(
     assert protocol._ep_chunk_full_recompute_requested(modules) is expected
 
 
+@pytest.mark.parametrize(
+    "modules,full_recompute,expected",
+    [
+        (["moe_act"], False, True),
+        (["moe_act"], True, False),
+        (["moe"], False, False),
+    ],
+)
+def test_qwen3_compose_layer_owns_moe_activation_recompute_selection(
+    modules, full_recompute, expected, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import model
+
+    assert (
+        model._qwen3_moe_act_recompute_requested(
+            modules, ep_chunk_full_recompute=full_recompute
+        )
+        is expected
+    )
+
+
 def test_qwen3_compose_layer_replaces_only_its_outer_moe_checkpoint(
     transformer_engine_import_stub,
 ):
@@ -307,9 +336,10 @@ def test_qwen3_compose_layer_replaces_only_its_outer_moe_checkpoint(
     from megatron.lite.model.qwen3_moe.lite import protocol
 
     requested = ["core_attn", "moe", "mlp"]
-    assert protocol._qwen3_recompute_modules_for_ep_chunk_overlap(
-        requested, enabled=False
-    ) == requested
+    assert (
+        protocol._qwen3_recompute_modules_for_ep_chunk_overlap(requested, enabled=False)
+        == requested
+    )
     assert protocol._qwen3_recompute_modules_for_ep_chunk_overlap(
         requested, enabled=True
     ) == ["core_attn", "mlp"]

@@ -87,6 +87,9 @@ def test_three_ops_have_distinct_saved_context_and_recompute_contracts(
     forward_source = inspect.getsource(EPChunkForwardOp)
     backward_source = inspect.getsource(EPChunkBackwardOp)
     fused_source = inspect.getsource(EPChunkFusedForwardBackwardOp)
+    primitive_source = inspect.getsource(
+        inspect.getmodule(EPChunkFusedForwardBackwardOp)
+    )
 
     assert "forward-only" not in forward_source
     assert "_SavedContextEPChunkFunction.apply" in forward_source
@@ -94,6 +97,7 @@ def test_three_ops_have_distinct_saved_context_and_recompute_contracts(
     assert "_full_recompute" not in backward_source
     assert "backward_op" not in fused_source
     assert "_full_recompute_fused_backward" in fused_source
+    assert "moe_act_recompute" not in primitive_source
 
 
 def test_three_ops_direct_behavior_contracts(transformer_engine_import_stub):

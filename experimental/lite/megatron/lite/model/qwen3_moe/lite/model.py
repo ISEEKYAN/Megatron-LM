@@ -26,6 +26,7 @@ from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
     EPChunkShapeProfile,
     EPChunkWorkspaceKey,
     get_ep_chunk_workspace,
+    release_ep_chunk_workspace,
 )
 from megatron.lite.primitive.modules.router import TopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
@@ -134,7 +135,6 @@ class MoELayer(nn.Module):
                         use_deepep=True,
                     ),
                 )
-                workspace.warmup(device=torch.device("cuda", device_index))
                 return workspace
 
             op_kwargs = dict(
@@ -197,6 +197,38 @@ class MoELayer(nn.Module):
 
         return combined.view(input_shape).to(x.dtype)
 
+    def _ep_chunk_workspaces(self):
+        """Return the unique lightweight workspaces selected by Qwen composition."""
+        workspaces = []
+        for op in (
+            self.ep_chunk_forward,
+            self.ep_chunk_backward,
+            self.ep_chunk_fused,
+        ):
+            if op is not None and all(
+                op.workspace is not workspace for workspace in workspaces
+            ):
+                workspaces.append(op.workspace)
+        return tuple(workspaces)
+
+    def materialize_ep_chunk_workspaces(
+        self, *, device: torch.device | str | None = None
+    ) -> None:
+        """Explicitly materialize only the two workspaces selected by Qwen."""
+        for workspace in self._ep_chunk_workspaces():
+            workspace.materialize(device=device)
+
+    def ep_chunk_workspace_evidence(self) -> dict[str, dict]:
+        return {
+            workspace.key.op: workspace.evidence()
+            for workspace in self._ep_chunk_workspaces()
+        }
+
+    def release_ep_chunk_workspaces(self, *, stream=None) -> None:
+        """Release selected workspaces for an explicit mode switch or teardown."""
+        for workspace in self._ep_chunk_workspaces():
+            release_ep_chunk_workspace(workspace.key, stream=stream)
+
 
 # ---------------------------------------------------------------------------
 # Transformer Layer + Model
@@ -212,6 +244,17 @@ _SP_GRAD_SUFFIXES: tuple[str, ...] = (
     ".hnorm.weight",
     ".final_layernorm.weight",
 )
+
+
+def _qwen3_moe_act_recompute_requested(
+    recompute_modules: list[str], *, ep_chunk_full_recompute: bool
+) -> bool:
+    """Keep recompute-policy interpretation in the Qwen composition layer."""
+    return (
+        "moe_act" in recompute_modules
+        and "moe" not in recompute_modules
+        and not ep_chunk_full_recompute
+    )
 
 
 def _collect_sp_grad_params(model: nn.Module) -> list[nn.Parameter]:
@@ -530,7 +573,10 @@ class Qwen3MoEModel(nn.Module):
             )
 
         _recompute = recompute_modules or []
-        moe_act_recompute = "moe_act" in _recompute and "moe" not in _recompute
+        moe_act_recompute = _qwen3_moe_act_recompute_requested(
+            _recompute,
+            ep_chunk_full_recompute=ep_chunk_full_recompute,
+        )
         self.layers = nn.ModuleList(
             [
                 TransformerLayer(

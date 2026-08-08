@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
@@ -158,6 +158,7 @@ class EPChunkWorkspace:
     ):
         self.key = key
         self._dispatcher_factory = dispatcher_factory
+        self._registry: EPChunkWorkspaceRegistry | None = None
         self._slots = [_WorkspaceSlot() for _ in range(EP_CHUNK_COUNT)]
         self._allocations = 0
         self._runtime_allocations = 0
@@ -175,9 +176,9 @@ class EPChunkWorkspace:
         """Lazily create dispatchers and bounded scratch storage."""
         if self._materialized:
             return
-        dispatchers = [
-            self._dispatcher_factory(slot) for slot in range(EP_CHUNK_COUNT)
-        ]
+        if self._registry is not None:
+            self._registry._claim(self)
+        dispatchers = [self._dispatcher_factory(slot) for slot in range(EP_CHUNK_COUNT)]
         if len({id(dispatcher) for dispatcher in dispatchers}) != EP_CHUNK_COUNT:
             raise RuntimeError("EP chunk workspace requires two distinct dispatchers")
         for chunk_idx, dispatcher in enumerate(dispatchers):
@@ -185,6 +186,7 @@ class EPChunkWorkspace:
                 raise RuntimeError(
                     f"EP chunk dispatcher {chunk_idx} has DeepEP disabled"
                 )
+        for chunk_idx, dispatcher in enumerate(dispatchers):
             self._slots[chunk_idx].dispatcher = dispatcher
         self._materialized = True
         if self.key.op == "backward":
@@ -254,6 +256,7 @@ class EPChunkWorkspace:
                 raise RuntimeError(
                     f"Cannot close EP chunk workspace: slot {slot_idx} is leased"
                 )
+        for slot in self._slots:
             event = slot.consumer_event
             if event is not None:
                 ready = bool(event.query()) if hasattr(event, "query") else False
@@ -266,6 +269,7 @@ class EPChunkWorkspace:
                     for tensor in slot.tensors.values():
                         if tensor.is_cuda:
                             tensor.record_stream(stream)
+        for slot in self._slots:
             slot.consumer_event = None
             slot.tensors.clear()
             slot.dispatcher = None
@@ -273,6 +277,10 @@ class EPChunkWorkspace:
         self._runtime_allocations = 0
         self._waits = 0
         self._materialized = False
+
+    def release(self, *, stream: Any | None = None) -> None:
+        """Idempotent alias for explicit lifecycle callers."""
+        self.close(stream=stream)
 
     def tensor(self, slot: int, name: str) -> torch.Tensor:
         self._validate_slot(slot)
@@ -358,7 +366,9 @@ class EPChunkWorkspace:
         return {
             **self.metrics(),
             "data_ptrs": data_ptrs,
-            "dispatcher_count": len(self._slots),
+            "dispatcher_count": sum(
+                slot.dispatcher is not None for slot in self._slots
+            ),
             "deepep_buffer_count": len(buffers),
             "deepep_buffer_resident_bytes": sum(buffers.values()),
             "caller_owned_recv_proven": False,
@@ -388,8 +398,31 @@ class EPChunkWorkspaceRegistry:
         workspace = self._workspaces.get(key)
         if workspace is None:
             workspace = EPChunkWorkspace(key, dispatcher_factory)
+            workspace._registry = self
             self._workspaces[key] = workspace
         return workspace
+
+    def _claim(self, workspace: EPChunkWorkspace) -> None:
+        current = self._workspaces.get(workspace.key)
+        if current is not None and current is not workspace:
+            raise RuntimeError(
+                "Cannot rematerialize an EP chunk workspace after its key was reused"
+            )
+        self._workspaces[workspace.key] = workspace
+
+    def release(
+        self,
+        key: EPChunkWorkspaceKey,
+        *,
+        stream: Any | None = None,
+    ) -> None:
+        """Close and unregister one workspace; missing keys are idempotent."""
+        workspace = self._workspaces.get(key)
+        if workspace is None:
+            return
+        workspace.close(stream=stream)
+        if self._workspaces.get(key) is workspace:
+            del self._workspaces[key]
 
 
 _EP_CHUNK_WORKSPACES = EPChunkWorkspaceRegistry()
@@ -401,6 +434,15 @@ def get_ep_chunk_workspace(
 ) -> EPChunkWorkspace:
     """Return the process-local workspace shared by every matching model layer."""
     return _EP_CHUNK_WORKSPACES.get_or_create(key, dispatcher_factory)
+
+
+def release_ep_chunk_workspace(
+    key: EPChunkWorkspaceKey,
+    *,
+    stream: Any | None = None,
+) -> None:
+    """Close and unregister a process-local EP chunk workspace."""
+    _EP_CHUNK_WORKSPACES.release(key, stream=stream)
 
 
 def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
@@ -571,16 +613,6 @@ def _record_state_tensors_current_stream(state: dict[str, Any]) -> None:
             _record_state_tensors_current_stream(value)
 
 
-@contextmanager
-def _expert_act_recompute_disabled(experts: Experts):
-    previous = experts.moe_act_recompute
-    experts.moe_act_recompute = False
-    try:
-        yield
-    finally:
-        experts.moe_act_recompute = previous
-
-
 @dataclass
 class _BackwardChunk:
     idx: int
@@ -625,7 +657,6 @@ class _ForwardChunkContext:
     dispatched: torch.Tensor
     probs: torch.Tensor | None
     expert_out: torch.Tensor | None
-    dispatcher: TokenDispatcher
     scores_edge: Any | None = None
     scores_shape: torch.Size | None = None
     scores_dtype: torch.dtype | None = None
@@ -662,19 +693,6 @@ class _EPChunkOperationBase:
         self.router = router
         self.experts = experts
         self.workspace = workspace
-        chunk_dispatchers = tuple(
-            workspace.dispatcher(slot) for slot in range(EP_CHUNK_COUNT)
-        )
-        for chunk_idx, chunk_dispatcher in enumerate(chunk_dispatchers):
-            if not chunk_dispatcher.use_deepep:
-                raise RuntimeError(
-                    "EP chunk overlap "
-                    f"chunk dispatcher {chunk_idx} has DeepEP disabled."
-                )
-        if len({id(item) for item in chunk_dispatchers}) != EP_CHUNK_COUNT:
-            raise RuntimeError(
-                "EP chunk overlap requires distinct per-chunk dispatchers."
-            )
 
     def _streams(
         self, device: torch.device
@@ -701,29 +719,12 @@ class _EPChunkOperationBase:
             routing_input = routing_input.reshape(-1)[start:end]
         return router_forward(self.router, x, routing_input)
 
-    def _forward_output_only(
-        self,
-        x_2d: torch.Tensor,
-        ranges: list[tuple[int, int]],
-        input_shape: torch.Size,
-        input_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        return self._forward_output_async(
-            x_2d,
-            ranges,
-            input_shape,
-            input_dtype,
-            disable_expert_act_recompute=True,
-        )
-
     def _forward_output_async(
         self,
         x_2d: torch.Tensor,
         ranges: list[tuple[int, int]],
         input_shape: torch.Size,
         input_dtype: torch.dtype,
-        *,
-        disable_expert_act_recompute: bool,
     ) -> torch.Tensor:
         self.workspace.key.shape_profile.validate_input(x_2d)
         if not ranges:
@@ -771,21 +772,15 @@ class _EPChunkOperationBase:
                 state.pop("recv_indices", None)
                 state.pop("recv_probs", None)
                 state.pop("recv_per_expert", None)
-                expert_ctx = (
-                    _expert_act_recompute_disabled(self.experts)
-                    if disable_expert_act_recompute
-                    else nullcontext()
-                )
-                with expert_ctx:
-                    with _ep_chunk_nvtx("forward.expert", chunk_idx):
-                        expert_out = self.experts(
-                            dispatched,
-                            tpe,
-                            probs,
-                            tokens_per_expert_list=getattr(
-                                dispatcher, "_local_tpe_list", None
-                            ),
-                        )
+                with _ep_chunk_nvtx("forward.expert", chunk_idx):
+                    expert_out = self.experts(
+                        dispatched,
+                        tpe,
+                        probs,
+                        tokens_per_expert_list=getattr(
+                            dispatcher, "_local_tpe_list", None
+                        ),
+                    )
                 rank_grouped, handle = dispatcher.prepare_deepep_combine(expert_out)
                 ready = torch.cuda.Event()
                 ready.record(compute_stream)
@@ -945,7 +940,6 @@ class _EPChunkOperationBase:
                     expert_out_edge=expert_out_edge,
                     expert_out_shape=expert_out.shape,
                     expert_out_dtype=expert_out.dtype,
-                    dispatcher=dispatcher,
                 )
                 state.clear()
             return (
@@ -1113,18 +1107,17 @@ class _EPChunkOperationBase:
                     )
                 )
                 _record_state_tensors_current_stream(state)
-                with _expert_act_recompute_disabled(self.experts):
-                    expert_input = dispatched.detach().requires_grad_(True)
-                    expert_probs = (
-                        None if probs is None else probs.detach().requires_grad_(True)
+                expert_input = dispatched.detach().requires_grad_(True)
+                expert_probs = (
+                    None if probs is None else probs.detach().requires_grad_(True)
+                )
+                with _ep_chunk_nvtx("backward.expert", chunk_idx):
+                    expert_out = self.experts(
+                        expert_input,
+                        local_tpe,
+                        expert_probs,
+                        tokens_per_expert_list=metadata["local_tpe_list"],
                     )
-                    with _ep_chunk_nvtx("backward.expert", chunk_idx):
-                        expert_out = self.experts(
-                            expert_input,
-                            local_tpe,
-                            expert_probs,
-                            tokens_per_expert_list=metadata["local_tpe_list"],
-                        )
             return (
                 dispatched,
                 local_tpe,
@@ -1393,7 +1386,7 @@ class _EPChunkOperationBase:
                 expert_out_edge=saved.expert_out_edge,
                 expert_out_shape=saved.expert_out_shape,
                 expert_out_dtype=saved.expert_out_dtype,
-                dispatcher=saved.dispatcher,
+                dispatcher=lease.dispatcher,
                 workspace_lease=lease,
             )
             with torch.cuda.stream(comm_stream):
@@ -1594,7 +1587,6 @@ class EPChunkForwardOp(_EPChunkOperationBase):
                 ranges,
                 input_shape,
                 x.dtype,
-                disable_expert_act_recompute=False,
             )
 
     __call__ = forward
@@ -1714,4 +1706,5 @@ __all__ = [
     "EPChunkWorkspaceKey",
     "EPChunkWorkspaceRegistry",
     "get_ep_chunk_workspace",
+    "release_ep_chunk_workspace",
 ]
