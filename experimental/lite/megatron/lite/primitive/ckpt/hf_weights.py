@@ -826,12 +826,11 @@ def _iter_export_named_parameters(chunk: nn.Module, base_chunk: nn.Module):
     else -- FSDP2 ``DTensor`` params (gathered lazily by ``_materialize_dtensor``)
     and plain manually-sharded params -- falls back to ``named_parameters``.
 
-    The streaming path is guarded for completeness. Its bucket walk emits a
-    param only when it can match the bucket's shard identity back to a name; a
-    param whose identity fails to match would otherwise fall through the bucket
-    loop and never be yielded (a silently truncated shard on resync). So the set
-    of streamed names is checked against the full ``named_parameters`` set on the
-    unwrapped chunk and any drift fails loud instead of shipping partial weights.
+    The streaming path is guarded for completeness. M-FSDP emits each bucket's
+    stable ``ParamSpec.name`` with an independent full-parameter snapshot; the
+    set of streamed names is checked against the full ``named_parameters`` set
+    on the unwrapped chunk and any drift fails loud instead of shipping partial
+    weights.
     """
     streamer = getattr(chunk, "stream_full_parameters", None)
     if not callable(streamer):
@@ -845,8 +844,7 @@ def _iter_export_named_parameters(chunk: nn.Module, base_chunk: nn.Module):
         "(per-bucket materialization)"
     )
     # Cheap reference set: the unwrapped chunk's sharded named_parameters (no
-    # all-gather). Names align with the streamer, which resolves against the same
-    # (currently-installed, sharded) module params.
+    # all-gather). Names align with the streamer's stable ParamSpec names.
     expected = {name for name, _ in base_chunk.named_parameters()}
     streamed: set[str] = set()
     for name, param in streamer():

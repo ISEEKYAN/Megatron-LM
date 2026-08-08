@@ -509,16 +509,15 @@ def test_mfsdp_double_buffer_rejects_a_third_in_flight_lease():
         allocator.allocate(**args)
 
 
-def test_mfsdp_nccl_user_buffer_falls_back_when_apex_is_missing(monkeypatch):
+def test_mfsdp_nccl_user_buffer_fails_loudly_when_apex_is_missing(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
     def missing_apex(_name):
         raise ImportError("optional allocator missing")
 
     monkeypatch.setattr(mfsdp_buffer.importlib, "import_module", missing_apex)
-    user_buffer = mfsdp_buffer.NCCLUserBuffer(enabled=True, groups=(), symmetric=True)
-
-    assert user_buffer.active is False
+    with pytest.raises(RuntimeError, match="NCCL user-buffer allocation unavailable"):
+        mfsdp_buffer.NCCLUserBuffer(enabled=True, groups=(), symmetric=True)
 
 
 def test_mfsdp_parallel_metadata_uses_topology_and_explicit_classifier():
@@ -2135,6 +2134,10 @@ def _run_mfsdp_gloo_parity(rank: int, world_size: int, init_file: str) -> None:
         assert reference_norm == candidate_norm
 
         reference_params = dict(reference.named_parameters())
+        streamed_params = dict(chunks[0].stream_full_parameters())
+        assert reference_params.keys() == streamed_params.keys()
+        for name, reference_param in reference_params.items():
+            assert torch.equal(reference_param, streamed_params[name]), name
         candidate_params = {
             name.removeprefix("module."): param
             for name, param in chunks[0].named_parameters()

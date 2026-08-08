@@ -12,7 +12,6 @@ persistent local main buffers.
 from __future__ import annotations
 
 import importlib
-import logging
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
@@ -31,11 +30,8 @@ from megatron.lite.primitive.optimizers.mfsdp.config import (
     group_size,
 )
 
-logger = logging.getLogger(__name__)
-
-
 class NCCLUserBuffer:
-    """Best-effort Apex NCCL memory-pool adapter."""
+    """Apex NCCL memory-pool adapter required when ``nccl_ub`` is enabled."""
 
     def __init__(
         self, *, enabled: bool, groups: tuple[dist.ProcessGroup, ...], symmetric: bool
@@ -45,7 +41,6 @@ class NCCLUserBuffer:
         self.symmetric = symmetric
         self.module: Any | None = None
         self.pool: Any | None = None
-        self._warned = False
         if self.enabled:
             self._initialize()
 
@@ -64,7 +59,7 @@ class NCCLUserBuffer:
             self.module = module
             self.pool = pool
         except (ImportError, AttributeError, RuntimeError, TypeError) as error:
-            self._disable(f"NCCL user-buffer allocation unavailable: {error}")
+            self._fail(f"NCCL user-buffer allocation unavailable: {error}")
 
     def allocation_context(self, group: dist.ProcessGroup | None):
         if not self.active or group is None:
@@ -72,8 +67,7 @@ class NCCLUserBuffer:
         try:
             return self.module.nccl_mem(self.pool, group=group)
         except (AttributeError, RuntimeError, TypeError) as error:
-            self._disable(f"NCCL user-buffer context failed: {error}")
-            return nullcontext()
+            self._fail(f"NCCL user-buffer context failed: {error}")
 
     def register_additional_groups(self) -> None:
         if not self.active or len(self.groups) < 2:
@@ -85,15 +79,12 @@ class NCCLUserBuffer:
                 )
                 backend.register_mem_pool(self.pool)
             except (AttributeError, RuntimeError, TypeError) as error:
-                self._disable(f"NCCL user-buffer group registration failed: {error}")
-                return
+                self._fail(f"NCCL user-buffer group registration failed: {error}")
 
-    def _disable(self, reason: str) -> None:
+    def _fail(self, reason: str) -> None:
         self.module = None
         self.pool = None
-        if not self._warned:
-            logger.warning("%s; using Torch communication buffers.", reason)
-            self._warned = True
+        raise RuntimeError(reason)
 
 
 @dataclass(slots=True)
@@ -139,7 +130,7 @@ class TemporaryBufferAllocator:
                 self.user_buffer.register_additional_groups()
         except (RuntimeError, TypeError) as error:
             if self.user_buffer is not None:
-                self.user_buffer._disable(f"Registered allocation failed: {error}")
+                self.user_buffer._fail(f"Registered allocation failed: {error}")
             tensor = torch.empty(numel, dtype=dtype, device=device)
             registered = False
         return BufferLease(tensor=tensor, owner=self, key=key, registered=registered)

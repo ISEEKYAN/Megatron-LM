@@ -237,21 +237,25 @@ class MegatronFSDP(nn.Module):
         shards for a per-layer EP collective) keeps a private allocation and
         never aliases storage that the release has handed back to the allocator.
         """
-        # Names are resolved against the currently-installed (sharded) params,
-        # which is the module state on entry and after each bucket release.
-        name_by_shard_id = {
-            id(param): name for name, param in self.module.named_parameters()
-        }
         covered: set[str] = set()
         for bucket in self.param_sync.stream_materialize_buckets():
             for spec in bucket.specs:
-                name = name_by_shard_id.get(id(spec.shard_param))
-                if name is None:
-                    continue
-                covered.add(name)
+                # ``ParamSpec.name`` is captured before the sharded view is
+                # installed and remains the canonical module path.  Do not
+                # recover a name through a shard object's identity: tied
+                # bindings and wrapper view changes can make that lookup miss,
+                # which would silently export a DP shard as though it were a
+                # full parameter.
+                covered.add(spec.name)
                 full_param = spec.full_param
-                full_param.data = full_param.data.clone()
-                yield name, full_param
+                # The bucket cleanup below restores the module's sharded view
+                # and clears ``full_param.data``.  Return a separate Parameter
+                # so an exporter that keeps a yielded tensor while advancing
+                # to another bucket retains the full snapshot it was promised.
+                yield spec.name, nn.Parameter(
+                    full_param.detach().clone(),
+                    requires_grad=full_param.requires_grad,
+                )
         # Parameters (and any params not owned by an M-FSDP bucket) that the
         # bucket walk did not cover -- emit them from the restored sharded view.
         for name, param in self.module.named_parameters():
