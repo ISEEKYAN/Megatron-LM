@@ -20,6 +20,10 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "mlite: mark a test as Megatron Lite validation coverage")
     config.addinivalue_line(
         "markers",
+        "mbridge: mark a parity test that requires an installed Megatron-Bridge reference",
+    )
+    config.addinivalue_line(
+        "markers",
         "smoke: mark a Megatron Lite smoke test; skipped unless --mlite-smoke or MLITE_RUN_SMOKE=1 is set",
     )
     config.addinivalue_line("markers", "gpu: mark a test as requiring CUDA")
