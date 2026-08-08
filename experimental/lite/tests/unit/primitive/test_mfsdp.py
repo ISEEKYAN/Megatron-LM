@@ -1240,7 +1240,7 @@ def test_mfsdp_offload_fraction_checkpoint_round_trips():
     )
 
 
-def _single_rank_mfsdp_stack():
+def _single_rank_mfsdp_stack(*, override_optimizer_config=None):
     """Build a trained single-rank M-FSDP stack for scratch-release tests."""
 
     class _Unit(torch.nn.Module):
@@ -1281,7 +1281,10 @@ def _single_rank_mfsdp_stack():
         adam_beta1=0.9,
         adam_beta2=0.999,
         adam_eps=1.0e-8,
-        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+        override_optimizer_config={
+            "mfsdp_sharding_strategy": "optim_grads_params",
+            **(override_optimizer_config or {}),
+        },
     )
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [_Model()],
@@ -1608,6 +1611,71 @@ def test_mfsdp_get_main_grad_lazily_materializes_only_the_requested_bucket():
     )
 
 
+def test_mfsdp_double_buffer_enforces_two_inflight_bucket_slots_for_nccl_ub():
+    """A third, differently sized bucket drains a completed slot before allocation."""
+    chunk, _optimizer = _single_rank_mfsdp_stack(
+        override_optimizer_config={"bucket_size": 4, "nccl_ub": True}
+    )
+    pipeline = chunk.grad_reduce_pipeline
+
+    assert chunk.mfsdp_config.nccl_ub is True
+    assert chunk.mfsdp_config.fsdp_double_buffer is True
+    buckets = chunk.param_sync.buckets
+    assert len({bucket.full_numel for bucket in buckets}) > 1
+    assert len(buckets) > 2
+    first, second = buckets[:2]
+    third = next(bucket for bucket in buckets[2:] if bucket.full_numel != first.full_numel)
+
+    # Model the two completed-but-not-yet-retired reduce-scatter operations that
+    # occupy the allocator's two main-grad slots.  The old implementation called
+    # allocator.allocate() directly from get_main_grad(), so the third call
+    # raised "capacity exhausted" here.
+    first.get_main_grad(first.specs[0])
+    second.get_main_grad(second.specs[0])
+    first._grad_reduce_launched = True
+    second._grad_reduce_launched = True
+    first._grad_reduce_finished = False
+    second._grad_reduce_finished = False
+    pipeline._pending = [
+        (first, first.full_numel * first.full_main_grad_buffer.element_size()),
+        (second, second.full_numel * second.full_main_grad_buffer.element_size()),
+    ]
+    pipeline._pending_bytes = sum(byte_count for _bucket, byte_count in pipeline._pending)
+    assert len(pipeline._pending) == 2
+    assert third.config.fsdp_double_buffer is True
+    assert third.before_main_grad_allocate is not None
+    assert third.before_main_grad_allocate.__self__ is pipeline
+
+    third.get_main_grad(third.specs[0])
+
+    # The allocator has only two slots per communication key.  The third bucket
+    # retired the oldest completed reduce by slot count, not historical bytes.
+    assert first._full_main_grad_lease is None
+    assert third._full_main_grad_lease is not None
+    assert len(pipeline._pending) <= 2
+
+
+def test_mfsdp_wrapper_aborts_busy_double_buffer_slots_after_forward_exception():
+    """The production wrapper, not a test-only call, owns force teardown."""
+    chunk, _optimizer = _single_rank_mfsdp_stack(
+        override_optimizer_config={"fsdp_double_buffer": True}
+    )
+
+    def fail_after_mfsdp_acquire(_module, _inputs):
+        raise RuntimeError("intentional forward failure")
+
+    handle = chunk.module.unit1.register_forward_pre_hook(fail_after_mfsdp_acquire)
+    try:
+        with pytest.raises(RuntimeError, match="intentional forward failure"):
+            chunk(torch.randn(3, 4))
+    finally:
+        handle.remove()
+
+    allocator = chunk.param_and_grad_buffer.allocator
+    assert getattr(allocator, "_slots", {}) == {}
+    assert getattr(allocator, "_busy", {}) == {}
+
+
 def test_mfsdp_grad_reduce_pending_queue_is_bounded_in_bytes():
     class PendingBucket:
         def __init__(self, full_numel: int):
@@ -1644,30 +1712,6 @@ def test_mfsdp_grad_reduce_pending_queue_is_bounded_in_bytes():
     assert pipeline._pending_capacity_bytes == 2 * 32 * 4
     assert first.waited is True
     assert second.waited is False
-
-
-def test_mfsdp_double_buffer_force_teardown_drops_busy_slots():
-    """Exception cleanup must not replace the original failure with a slot error."""
-    allocator = mfsdp_buffer.DoubleBufferAllocator()
-    lease = allocator.allocate(
-        8,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        group=None,
-        key=("teardown",),
-    )
-
-    with pytest.raises(RuntimeError, match="active M-FSDP communication buffers"):
-        allocator.release_cached()
-
-    allocator.release_cached(force=True)
-
-    assert allocator._slots == {}
-    assert allocator._busy == {}
-    assert allocator._reuse_events == {}
-    # Keep the local reference live deliberately: teardown is about allocator
-    # ownership, not attempting to invalidate a tensor held by the primary error.
-    assert lease.tensor.numel() == 8
 
 
 def test_mfsdp_materializes_root_params_used_without_calling_their_leaf_module():

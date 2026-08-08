@@ -154,6 +154,12 @@ class MegatronFSDP(nn.Module):
                     attach_backward,
                     output,
                 )
+        except BaseException:
+            # A failed module forward can leave a registered double-buffer slot
+            # busy.  Teardown must preserve the original exception rather than
+            # replacing it with the allocator's active-slot guard.
+            self.param_sync.abort()
+            raise
         finally:
             self.param_sync.end_forward()
         return output

@@ -388,6 +388,7 @@ class ParamBucket:
         self._full_ready = True
         self.grad_sync_enabled = False
         self.grad_ready_callback: Callable[["ParamBucket"], None] | None = None
+        self.before_main_grad_allocate: Callable[["ParamBucket"], None] | None = None
         self._grad_ready_ids: set[int] = set()
         self._initialize_parameters()
 
@@ -439,6 +440,7 @@ class ParamBucket:
     def prepare_main_grads(self) -> None:
         """Attach bounded FP32 views for fused wgrad accumulation."""
         if self._full_main_grad_lease is None:
+            self._enforce_main_grad_slot_limit()
             # Unlike full parameters, gradient staging has no autograd-saved
             # views after its reduce-scatter completes. Pool it across bucket
             # layouts so released per-bucket slots do not become resident.
@@ -457,6 +459,7 @@ class ParamBucket:
     def get_main_grad(self, spec: ParamSpec) -> torch.Tensor:
         """Lazily allocate this bucket's full-precision gradient staging view."""
         if self._full_main_grad_lease is None:
+            self._enforce_main_grad_slot_limit()
             self._full_main_grad_lease = self.allocator.allocate(
                 self.full_numel,
                 dtype=self.policy.main_grads_dtype,
@@ -471,6 +474,11 @@ class ParamBucket:
         ).view(spec.shape)
         spec.full_param.main_grad = main_grad
         return main_grad
+
+    def _enforce_main_grad_slot_limit(self) -> None:
+        """Retire an in-flight reduction before consuming a third grad slot."""
+        if self.before_main_grad_allocate is not None:
+            self.before_main_grad_allocate(self)
 
     def _make_main_grad_getter(self, spec: ParamSpec) -> Callable[[], torch.Tensor]:
         return lambda: self.get_main_grad(spec)
@@ -1146,6 +1154,25 @@ class GradReducePipeline:
         self._pending_capacity_bytes = 0
         for bucket in buckets:
             bucket.grad_ready_callback = self.reduce_gradients
+            bucket.before_main_grad_allocate = self._enforce_double_buffer_limit
+
+    def _retire_oldest(self) -> None:
+        completed, completed_bytes = self._pending.pop(0)
+        completed.wait_grad_reduce()
+        self._pending_bytes -= completed_bytes
+
+    def _enforce_double_buffer_limit(self, incoming: ParamBucket) -> None:
+        """Keep at most two live full-gradient bucket slots.
+
+        This is the MCore ``_enforce_double_buffer_limit`` lifecycle at the
+        lazy main-gradient allocation boundary.  Slot pressure is a count of
+        in-flight bucket allocations, not a byte watermark: differently sized
+        buckets still each consume one of the allocator's two reusable slots.
+        """
+        if not incoming.config.fsdp_double_buffer:
+            return
+        while len(self._pending) >= 2:
+            self._retire_oldest()
 
     def reduce_gradients(self, bucket: ParamBucket, *, force: bool = False) -> None:
         self._drain_for(bucket)
@@ -1185,18 +1212,14 @@ class GradReducePipeline:
             self._pending
             and self._pending_bytes + byte_count > self._pending_capacity_bytes
         ):
-            completed, completed_bytes = self._pending.pop(0)
-            completed.wait_grad_reduce()
-            self._pending_bytes -= completed_bytes
+            self._retire_oldest()
 
     def reclaim_before_backward(self) -> None:
         # Bound full, unsharded FP32 gradient staging to the allocator's two
         # reusable slots.  Without this drain, delayed microbatch sync retains
         # one 4-byte-per-parameter buffer for every completed bucket.
         while len(self._pending) >= 2:
-            completed, completed_bytes = self._pending.pop(0)
-            completed.wait_grad_reduce()
-            self._pending_bytes -= completed_bytes
+            self._retire_oldest()
 
     def has_microbatch_work(self) -> bool:
         return bool(self._pending) or any(
@@ -1210,9 +1233,12 @@ class GradReducePipeline:
                 self.reduce_gradients(bucket, force=True)
         self.comm_stream.wait_for_current()
         while self._pending:
-            bucket, byte_count = self._pending.pop(0)
-            bucket.wait_grad_reduce()
-            self._pending_bytes -= byte_count
+            self._retire_oldest()
+
+    def abort(self) -> None:
+        """Forget queued work after a forward exception has become primary."""
+        self._pending.clear()
+        self._pending_bytes = 0
 
     def start_microbatch(self) -> None:
         for bucket in self.buckets:
@@ -1354,6 +1380,19 @@ class CommunicationPipelines:
 
     def finish_grad_sync(self) -> None:
         self.grad_reduce.finish()
+
+    def abort(self) -> None:
+        """Exception teardown: drop allocator state without masking the error."""
+        self.grad_reduce.abort()
+        for bucket in self.buckets:
+            bucket._grad_reduce_work = None
+            bucket._grad_reduce_event = None
+            bucket._grad_reduce_launched = False
+            bucket._release_local_grad_comm_buffer()
+            bucket._release_full_main_grads()
+            bucket.release_full_parameters()
+            bucket.discard_full_parameter_views()
+            bucket.allocator.release_cached(force=True)
 
     def reset_grad_state(self) -> None:
         self.grad_reduce.reset()
