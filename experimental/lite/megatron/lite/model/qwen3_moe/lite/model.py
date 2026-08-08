@@ -23,6 +23,7 @@ from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
     EPChunkBackwardOp,
     EPChunkForwardOp,
     EPChunkFusedForwardBackwardOp,
+    EPChunkShapeProfile,
     EPChunkWorkspaceKey,
     get_ep_chunk_workspace,
 )
@@ -58,6 +59,7 @@ class MoELayer(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         enable_ep_chunk_overlap: bool = False,
+        ep_chunk_max_token_rows_per_rank: int | None = None,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
@@ -80,22 +82,28 @@ class MoELayer(nn.Module):
         if enable_ep_chunk_overlap:
             if not use_deepep or ps.ep_size <= 1:
                 raise RuntimeError("Qwen3 ChunkedEP requires DeepEP and EP > 1")
+            if ep_chunk_max_token_rows_per_rank is None:
+                raise RuntimeError(
+                    "Qwen3 ChunkedEP requires ep_chunk_max_token_rows_per_rank"
+                )
             device_index = torch.cuda.current_device()
+            shape_profile = EPChunkShapeProfile.for_fixed_two_chunk_ep(
+                max_input_rows=ep_chunk_max_token_rows_per_rank,
+                hidden_size=config.hidden_size,
+                topk=config.num_experts_per_tok,
+                ep_size=ps.ep_size,
+            )
             common_key = dict(
                 device_type="cuda",
                 device_index=device_index,
                 ep_group_id=id(ps.tp_ep_group),
                 dtype=torch.bfloat16,
-                shape_profile=(
-                    config.num_experts,
-                    config.hidden_size,
-                    config.num_experts_per_tok,
-                ),
+                shape_profile=shape_profile,
             )
 
             def workspace(op):
                 key = EPChunkWorkspaceKey(op=op, **common_key)
-                return get_ep_chunk_workspace(
+                workspace = get_ep_chunk_workspace(
                     key,
                     lambda _slot: TokenDispatcher(
                         config.num_experts,
@@ -104,6 +112,8 @@ class MoELayer(nn.Module):
                         use_deepep=True,
                     ),
                 )
+                workspace.warmup(device=torch.device("cuda", device_index))
+                return workspace
 
             op_kwargs = dict(
                 router=self.router,
@@ -196,6 +206,7 @@ class TransformerLayer(nn.Module):
         moe_act_recompute: bool = False,
         use_thd: bool = False,
         enable_ep_chunk_overlap: bool = False,
+        ep_chunk_max_token_rows_per_rank: int | None = None,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
@@ -227,6 +238,7 @@ class TransformerLayer(nn.Module):
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
             enable_ep_chunk_overlap=enable_ep_chunk_overlap,
+            ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
             lora_config=lora_config,
         )
 
@@ -289,6 +301,7 @@ class MultiTokenPredictionLayer(nn.Module):
         moe_act_recompute: bool,
         use_thd: bool,
         enable_ep_chunk_overlap: bool,
+        ep_chunk_max_token_rows_per_rank: int | None,
         detach_encoder: bool,
         lora_config: LoraConfig | dict | None,
     ):
@@ -315,6 +328,7 @@ class MultiTokenPredictionLayer(nn.Module):
             moe_act_recompute=moe_act_recompute,
             use_thd=use_thd,
             enable_ep_chunk_overlap=enable_ep_chunk_overlap,
+            ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
             lora_config=lora_config,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -372,6 +386,7 @@ class MultiTokenPredictionBlock(nn.Module):
         moe_act_recompute: bool,
         use_thd: bool,
         enable_ep_chunk_overlap: bool,
+        ep_chunk_max_token_rows_per_rank: int | None,
         detach_encoder: bool,
         repeated_layer: bool,
         lora_config: LoraConfig | dict | None,
@@ -393,6 +408,7 @@ class MultiTokenPredictionBlock(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     enable_ep_chunk_overlap=enable_ep_chunk_overlap,
+                    ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
                     detach_encoder=detach_encoder,
                     lora_config=lora_config,
                 )
@@ -450,6 +466,7 @@ class Qwen3MoEModel(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         enable_ep_chunk_overlap: bool = False,
+        ep_chunk_max_token_rows_per_rank: int | None = None,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
@@ -489,6 +506,7 @@ class Qwen3MoEModel(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     enable_ep_chunk_overlap=enable_ep_chunk_overlap,
+                    ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
                     lora_config=lora_config,
                 )
                 for idx in self.layer_indices
@@ -520,6 +538,7 @@ class Qwen3MoEModel(nn.Module):
                 moe_act_recompute=moe_act_recompute,
                 use_thd=use_thd,
                 enable_ep_chunk_overlap=enable_ep_chunk_overlap,
+                ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
                 lora_config=lora_config,

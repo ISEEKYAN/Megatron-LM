@@ -52,7 +52,11 @@ def test_qwen_model_contract_accepts_only_supported_combinations(
 ):
     assert (
         validate_ep_chunk_overlap_config(
-            enabled, use_deepep=use_deepep, ep_size=ep_size, topk=topk
+            enabled,
+            use_deepep=use_deepep,
+            ep_size=ep_size,
+            topk=topk,
+            max_token_rows_per_rank=4096 if enabled else None,
         )
         is enabled
     )

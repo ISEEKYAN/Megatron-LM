@@ -23,6 +23,73 @@ EPChunkOpName = Literal["forward", "backward", "fused_forward_backward"]
 
 
 @dataclass(frozen=True)
+class EPChunkShapeProfile:
+    """Fixed token and DeepEP receive capacities for one EP rank."""
+
+    max_input_rows: int
+    hidden_size: int
+    topk: int
+    ep_size: int
+    max_recv_rows: int = field(init=False)
+
+    @classmethod
+    def for_fixed_two_chunk_ep(
+        cls,
+        *,
+        max_input_rows: int,
+        hidden_size: int,
+        topk: int,
+        ep_size: int,
+    ) -> "EPChunkShapeProfile":
+        if ep_size <= 1:
+            raise ValueError("Fixed EP chunk profile requires EP > 1")
+        if max_input_rows < EP_CHUNK_COUNT:
+            raise ValueError("Fixed two-chunk profile requires at least two rows")
+        return cls(
+            max_input_rows=max_input_rows,
+            hidden_size=hidden_size,
+            topk=topk,
+            ep_size=ep_size,
+        )
+
+    def __post_init__(self) -> None:
+        if any(
+            int(value) <= 0
+            for value in (
+                self.max_input_rows,
+                self.hidden_size,
+                self.topk,
+                self.ep_size,
+            )
+        ):
+            raise ValueError("EP chunk shape-profile capacities must be positive")
+        if self.ep_size <= 1:
+            raise ValueError("Fixed EP chunk profile requires EP > 1")
+        if self.max_input_rows < EP_CHUNK_COUNT:
+            raise ValueError("Fixed two-chunk profile requires at least two rows")
+        max_chunk_rows = (self.max_input_rows + EP_CHUNK_COUNT - 1) // EP_CHUNK_COUNT
+        # DeepEP may receive every source rank's chunk on one destination rank.
+        # Hidden rows are sent once per destination even when multiple top-k
+        # experts are local: EP scales rows, while top-k sizes recv_probs width.
+        object.__setattr__(self, "max_recv_rows", max_chunk_rows * self.ep_size)
+
+    def validate_input_rows(self, rows: int) -> None:
+        if rows > self.max_input_rows:
+            raise RuntimeError(
+                f"EP chunk input rows {rows} exceeds fixed profile "
+                f"capacity {self.max_input_rows}"
+            )
+
+    def validate_input(self, value: torch.Tensor) -> None:
+        if value.size(-1) != self.hidden_size:
+            raise RuntimeError(
+                f"EP chunk hidden size {value.size(-1)} does not match fixed "
+                f"profile {self.hidden_size}"
+            )
+        self.validate_input_rows(value.numel() // self.hidden_size)
+
+
+@dataclass(frozen=True)
 class EPChunkWorkspaceKey:
     """Cross-layer workspace identity; layer and chunk are deliberately absent."""
 
@@ -31,17 +98,13 @@ class EPChunkWorkspaceKey:
     device_index: int | None
     ep_group_id: int
     dtype: torch.dtype
-    shape_profile: tuple[int, ...]
+    shape_profile: EPChunkShapeProfile
 
     def __post_init__(self) -> None:
         if self.op not in {"forward", "backward", "fused_forward_backward"}:
             raise ValueError(f"Unsupported EP chunk op: {self.op!r}")
-        if len(self.shape_profile) != 3 or any(
-            int(value) <= 0 for value in self.shape_profile
-        ):
-            raise ValueError(
-                "EP chunk shape_profile must be (max_rows, hidden_size, topk)"
-            )
+        if not isinstance(self.shape_profile, EPChunkShapeProfile):
+            raise TypeError("EP chunk shape_profile must be EPChunkShapeProfile")
 
 
 @dataclass
@@ -99,7 +162,9 @@ class EPChunkWorkspace:
         if len({id(slot.dispatcher) for slot in self._slots}) != EP_CHUNK_COUNT:
             raise RuntimeError("EP chunk workspace requires two distinct dispatchers")
         self._allocations = 0
+        self._runtime_allocations = 0
         self._waits = 0
+        self._warmed = False
 
     def dispatcher(self, slot: int) -> TokenDispatcher:
         self._validate_slot(slot)
@@ -107,6 +172,8 @@ class EPChunkWorkspace:
 
     def acquire(self, slot: int, *, stream: Any | None = None) -> EPChunkWorkspaceLease:
         self._validate_slot(slot)
+        if not self._warmed:
+            raise RuntimeError("EP chunk workspace must be warmed before execution")
         state = self._slots[slot]
         if state.in_use:
             raise RuntimeError(f"EP chunk workspace slot {slot} is already leased")
@@ -136,7 +203,29 @@ class EPChunkWorkspace:
         device: torch.device | str,
     ) -> None:
         for slot in range(EP_CHUNK_COUNT):
-            self._reserve_tensor(slot, name, shape, dtype=dtype, device=device)
+            self._reserve_tensor(
+                slot, name, shape, dtype=dtype, device=device, runtime=False
+            )
+
+    def warmup(self, *, device: torch.device | str) -> None:
+        """Reserve every op-owned scratch tensor before the first execution."""
+        if self.key.op != "backward":
+            self._warmed = True
+            return
+        profile = self.key.shape_profile
+        self.warmup_tensor(
+            "grad_recv_hidden",
+            (profile.max_recv_rows, profile.hidden_size),
+            dtype=self.key.dtype,
+            device=device,
+        )
+        self.warmup_tensor(
+            "grad_recv_probs",
+            (profile.max_recv_rows, profile.topk),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._warmed = True
 
     def tensor(self, slot: int, name: str) -> torch.Tensor:
         self._validate_slot(slot)
@@ -156,7 +245,9 @@ class EPChunkWorkspace:
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> torch.Tensor:
-        tensor = self._reserve_tensor(slot, name, shape, dtype=dtype, device=device)
+        tensor = self._reserve_tensor(
+            slot, name, shape, dtype=dtype, device=device, runtime=True
+        )
         requested = tuple(int(dim) for dim in shape)
         slices = tuple(slice(0, dim) for dim in requested)
         return tensor[slices].view(requested).detach().zero_()
@@ -169,6 +260,7 @@ class EPChunkWorkspace:
         *,
         dtype: torch.dtype,
         device: torch.device | str,
+        runtime: bool,
     ) -> torch.Tensor:
         self._validate_slot(slot)
         requested = tuple(int(dim) for dim in shape)
@@ -179,6 +271,8 @@ class EPChunkWorkspace:
             existing = torch.empty(requested, dtype=dtype, device=device)
             self._slots[slot].tensors[name] = existing
             self._allocations += 1
+            if runtime:
+                self._runtime_allocations += 1
             return existing
         capacity = tuple(existing.shape)
         if (
@@ -196,6 +290,7 @@ class EPChunkWorkspace:
     def metrics(self) -> dict[str, int]:
         return {
             "allocations": self._allocations,
+            "runtime_allocations": self._runtime_allocations,
             "waits": self._waits,
             "grows": 0,
             "fallbacks": 0,
@@ -524,6 +619,7 @@ class _EPChunkOperationBase:
         *,
         disable_expert_act_recompute: bool,
     ) -> torch.Tensor:
+        self.workspace.key.shape_profile.validate_input(x_2d)
         if not ranges:
             return x_2d.new_empty(input_shape).to(input_dtype)
         if len(ranges) != EP_CHUNK_COUNT:
@@ -1067,6 +1163,7 @@ class EPChunkBackwardOp(_EPChunkOperationBase):
         grad_output: torch.Tensor,
         routing_input: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor | None]]:
+        self.workspace.key.shape_profile.validate_input(x_saved)
         grad_2d = grad_output.contiguous().view(-1, grad_output.size(-1))
         with self._routing_context(routing_input), torch.enable_grad():
             return self._full_recompute_fused_backward(x_saved, grad_2d)
@@ -1184,6 +1281,7 @@ __all__ = [
     "EPChunkBackwardOp",
     "EPChunkForwardOp",
     "EPChunkFusedForwardBackwardOp",
+    "EPChunkShapeProfile",
     "EPChunkWorkspace",
     "EPChunkWorkspaceKey",
     "EPChunkWorkspaceRegistry",

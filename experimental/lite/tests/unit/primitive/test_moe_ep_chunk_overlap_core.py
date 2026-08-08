@@ -122,6 +122,7 @@ def test_dispatch_local_backward_accumulates_duplicate_rows_in_workspace(
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkShapeProfile,
         EPChunkWorkspaceKey,
         EPChunkWorkspaceRegistry,
         _dispatch_local_backward,
@@ -133,9 +134,15 @@ def test_dispatch_local_backward_accumulates_duplicate_rows_in_workspace(
         device_index=None,
         ep_group_id=1,
         dtype=torch.float32,
-        shape_profile=(3, 2, 2),
+        shape_profile=EPChunkShapeProfile(
+            max_input_rows=3,
+            hidden_size=2,
+            topk=2,
+            ep_size=2,
+        ),
     )
     workspace = EPChunkWorkspaceRegistry().get_or_create(key, lambda slot: slot)
+    workspace.warmup(device="cpu")
     lease = workspace.acquire(0)
     chunk = SimpleNamespace(
         idx=0,

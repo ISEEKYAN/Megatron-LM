@@ -31,6 +31,7 @@ def _symbols(transformer_engine_import_stub):
         EPChunkBackwardOp,
         EPChunkForwardOp,
         EPChunkFusedForwardBackwardOp,
+        EPChunkShapeProfile,
         EPChunkWorkspaceKey,
         EPChunkWorkspaceRegistry,
         _FusedEPChunkFunction,
@@ -41,6 +42,7 @@ def _symbols(transformer_engine_import_stub):
         EPChunkForwardOp,
         EPChunkBackwardOp,
         EPChunkFusedForwardBackwardOp,
+        EPChunkShapeProfile,
         EPChunkWorkspaceKey,
         EPChunkWorkspaceRegistry,
         _FusedEPChunkFunction,
@@ -55,6 +57,7 @@ def test_three_explicit_ops_have_fixed_two_chunk_contract(
         forward_op,
         backward_op,
         fused_op,
+        _profile,
         _key,
         _registry,
         _function,
@@ -87,6 +90,7 @@ def test_three_ops_get_independent_cross_layer_workspaces(
         _forward_op,
         _backward_op,
         _fused_op,
+        profile_type,
         key_type,
         registry_type,
         _function,
@@ -99,12 +103,18 @@ def test_three_ops_get_independent_cross_layer_workspaces(
         created.append((slot, dispatcher))
         return dispatcher
 
+    profile = profile_type(
+        max_input_rows=128,
+        hidden_size=64,
+        topk=8,
+        ep_size=8,
+    )
     common = dict(
         device_type="cpu",
         device_index=None,
         ep_group_id=7,
         dtype=torch.bfloat16,
-        shape_profile=(128, 64, 8),
+        shape_profile=profile,
     )
     forward_key = key_type(op="forward", **common)
     backward_key = key_type(op="backward", **common)
@@ -132,6 +142,7 @@ def test_workspace_slots_are_stable_and_consumer_event_guarded(
         _forward_op,
         _backward_op,
         _fused_op,
+        profile_type,
         key_type,
         registry_type,
         _function,
@@ -142,10 +153,16 @@ def test_workspace_slots_are_stable_and_consumer_event_guarded(
         device_index=None,
         ep_group_id=3,
         dtype=torch.float32,
-        shape_profile=(8, 4, 2),
+        shape_profile=profile_type(
+            max_input_rows=8,
+            hidden_size=4,
+            topk=2,
+            ep_size=4,
+        ),
     )
     workspace = registry_type().get_or_create(key, lambda slot: f"dispatcher-{slot}")
 
+    workspace.warmup(device="cpu")
     workspace.warmup_tensor("output", (8, 4), dtype=torch.float32, device="cpu")
     before = [workspace.tensor(slot, "output").data_ptr() for slot in range(2)]
     allocation_count = workspace.metrics()["allocations"]
@@ -178,6 +195,7 @@ def test_workspace_shape_overflow_fails_loud_without_growth(
         _forward_op,
         _backward_op,
         _fused_op,
+        profile_type,
         key_type,
         registry_type,
         _function,
@@ -188,7 +206,12 @@ def test_workspace_shape_overflow_fails_loud_without_growth(
         device_index=None,
         ep_group_id=5,
         dtype=torch.float32,
-        shape_profile=(8, 4, 2),
+        shape_profile=profile_type(
+            max_input_rows=8,
+            hidden_size=4,
+            topk=2,
+            ep_size=4,
+        ),
     )
     workspace = registry_type().get_or_create(key, lambda slot: slot)
     workspace.warmup_tensor("grad_hidden", (8, 4), dtype=torch.float32, device="cpu")
@@ -202,6 +225,132 @@ def test_workspace_shape_overflow_fails_loud_without_growth(
     assert workspace.metrics()["fallbacks"] == 0
 
 
+def test_production_warmup_makes_backward_steady_state_allocation_free(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    profile = profile_type(
+        max_input_rows=8,
+        hidden_size=4,
+        topk=2,
+        ep_size=4,
+    )
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=11,
+            dtype=torch.float32,
+            shape_profile=profile,
+        ),
+        lambda slot: slot,
+    )
+
+    workspace.warmup(device="cpu")
+    pointers = {
+        (slot, name): workspace.tensor(slot, name).data_ptr()
+        for slot in range(2)
+        for name in ("grad_recv_hidden", "grad_recv_probs")
+    }
+    allocations = workspace.metrics()["allocations"]
+
+    lease = workspace.acquire(0)
+    lease.tensor("grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu")
+    lease.tensor("grad_recv_probs", (9, 2), dtype=torch.float32, device="cpu")
+
+    assert workspace.metrics()["allocations"] == allocations
+    assert workspace.metrics()["runtime_allocations"] == 0
+    assert {
+        (slot, name): workspace.tensor(slot, name).data_ptr()
+        for slot in range(2)
+        for name in ("grad_recv_hidden", "grad_recv_probs")
+    } == pointers
+
+
+def test_profile_rejects_input_rows_beyond_qwen_capacity(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        _key,
+        _registry,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    profile = profile_type(
+        max_input_rows=8,
+        hidden_size=4,
+        topk=2,
+        ep_size=4,
+    )
+
+    with pytest.raises(RuntimeError, match="exceeds fixed profile"):
+        profile.validate_input_rows(9)
+
+
+@pytest.mark.parametrize("shape", [(2, 5, 4), (10, 4)], ids=["bshd", "thd-packed"])
+def test_profile_checks_actual_flattened_rows_for_batched_and_packed_inputs(
+    shape, transformer_engine_import_stub
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        _key,
+        _registry,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    profile = profile_type.for_fixed_two_chunk_ep(
+        max_input_rows=9,
+        hidden_size=4,
+        topk=2,
+        ep_size=8,
+    )
+
+    with pytest.raises(RuntimeError, match="input rows 10"):
+        profile.validate_input(torch.empty(shape))
+
+
+def test_qwen3_profile_freezes_deepep_worst_case_receive_capacity(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        _key,
+        _registry,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+
+    profile = profile_type.for_fixed_two_chunk_ep(
+        max_input_rows=17,
+        hidden_size=64,
+        topk=8,
+        ep_size=8,
+    )
+
+    assert profile.max_recv_rows == 9 * 8
+    assert profile.topk == 8
+
+
 def test_fused_autograd_keeps_input_alive_for_backward(
     transformer_engine_import_stub,
 ):
@@ -210,6 +359,7 @@ def test_fused_autograd_keeps_input_alive_for_backward(
         _forward_op,
         _backward_op,
         _fused_op,
+        _profile,
         _key,
         _registry,
         function,

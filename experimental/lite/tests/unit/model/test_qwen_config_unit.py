@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -121,12 +122,94 @@ def test_qwen3_chunked_ep_is_one_boolean_fixed_profile(transformer_engine_import
         parallel=ParallelConfig(ep=8),
         use_deepep=True,
         enable_ep_chunk_overlap=True,
+        ep_chunk_max_token_rows_per_rank=4096,
     )
 
     assert cfg.enable_ep_chunk_overlap is True
-    assert not any(
-        "chunk" in name and name != "enable_ep_chunk_overlap" for name in vars(cfg)
+    assert cfg.ep_chunk_max_token_rows_per_rank == 4096
+    assert not any("num_chunks" in name or "schedule" in name for name in vars(cfg))
+
+
+def test_qwen3_layer_prewarms_three_ops_from_real_token_capacity(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import model
+
+    workspaces = []
+
+    class FakeWorkspace:
+        def __init__(self, key):
+            self.key = key
+            self.warm_devices = []
+
+        def warmup(self, *, device):
+            self.warm_devices.append(device)
+
+    class FakeOp:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    def get_workspace(key, _factory):
+        workspace = FakeWorkspace(key)
+        workspaces.append(workspace)
+        return workspace
+
+    monkeypatch.setattr(model, "TopKRouter", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(model, "Experts", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(model, "get_ep_chunk_workspace", get_workspace)
+    monkeypatch.setattr(model, "EPChunkForwardOp", FakeOp)
+    monkeypatch.setattr(model, "EPChunkBackwardOp", FakeOp)
+    monkeypatch.setattr(model, "EPChunkFusedForwardBackwardOp", FakeOp)
+    monkeypatch.setattr(model.torch.cuda, "current_device", lambda: 3)
+
+    config = SimpleNamespace(
+        num_experts=128,
+        hidden_size=64,
+        num_experts_per_tok=8,
+        max_position_embeddings=17,
     )
+    ps = SimpleNamespace(ep_size=8, tp_ep_group=object())
+    model.MoELayer(
+        config,
+        ps,
+        use_deepep=True,
+        enable_ep_chunk_overlap=True,
+        ep_chunk_max_token_rows_per_rank=33,
+    )
+
+    assert [workspace.key.op for workspace in workspaces] == [
+        "forward",
+        "backward",
+        "fused_forward_backward",
+    ]
+    assert all(
+        workspace.key.shape_profile.max_input_rows == 33
+        and workspace.key.shape_profile.max_recv_rows == 17 * 8
+        for workspace in workspaces
+    )
+    assert all(
+        workspace.warm_devices == [model.torch.device("cuda", 3)]
+        for workspace in workspaces
+    )
+
+
+def test_qwen3_chunked_ep_requires_explicit_per_rank_token_capacity(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import protocol
+
+    model_cfg = Qwen3MoEConfig._from_hf_dict(_tiny_qwen3_hf_dict())
+    with pytest.raises(ValueError, match="ep_chunk_max_token_rows_per_rank"):
+        protocol.build_model(
+            model_cfg,
+            impl_cfg=protocol.ImplConfig(
+                parallel=ParallelConfig(ep=8),
+                use_deepep=True,
+                enable_ep_chunk_overlap=True,
+            ),
+        )
 
 
 def test_qwen3_chunked_ep_fails_loud_without_deepep_or_ep(

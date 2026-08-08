@@ -6,7 +6,12 @@ from __future__ import annotations
 
 
 def validate_ep_chunk_overlap_config(
-    enabled: bool, *, use_deepep: bool, ep_size: int, topk: int
+    enabled: bool,
+    *,
+    use_deepep: bool,
+    ep_size: int,
+    topk: int,
+    max_token_rows_per_rank: int | None = None,
 ) -> bool:
     if not isinstance(enabled, bool):
         raise TypeError("enable_ep_chunk_overlap must be a bool")
@@ -14,6 +19,12 @@ def validate_ep_chunk_overlap_config(
         raise ValueError("ChunkedEP requires DeepEP and EP > 1")
     if enabled and topk > ep_size:
         raise ValueError("ChunkedEP router top-k must not exceed EP size")
+    if enabled and (
+        not isinstance(max_token_rows_per_rank, int)
+        or isinstance(max_token_rows_per_rank, bool)
+        or max_token_rows_per_rank < 2
+    ):
+        raise ValueError("ChunkedEP requires ep_chunk_max_token_rows_per_rank >= 2")
     return enabled
 
 

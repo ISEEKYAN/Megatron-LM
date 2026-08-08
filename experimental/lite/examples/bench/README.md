@@ -36,11 +36,16 @@ impl = ImplConfig(
     parallel=ParallelConfig(ep=8),
     use_deepep=True,
     enable_ep_chunk_overlap=True,
+    ep_chunk_max_token_rows_per_rank=4096,
 )
 ```
 
 This profile always uses two chunks. It requires DeepEP with `EP > 1`; there is
-no dynamic chunk-count or per-model scheduling policy.
+no dynamic chunk-count or per-model scheduling policy. The caller must set
+`ep_chunk_max_token_rows_per_rank` to the true maximum flattened MoE input rows
+for one rank and one forward (including BSHD micro-batches or all packed THD
+tokens). Inputs above that fixed capacity fail loudly; scratch tensors are
+preallocated during Qwen3 model construction, before the first execution.
 
 ## Dry-Run
 

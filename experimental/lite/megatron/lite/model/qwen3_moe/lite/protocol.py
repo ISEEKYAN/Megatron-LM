@@ -92,6 +92,7 @@ class ImplConfig:
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
     enable_ep_chunk_overlap: bool = False
+    ep_chunk_max_token_rows_per_rank: int | None = None
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     router_aux_loss_coef: float | None = None
@@ -180,6 +181,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         use_deepep=impl_cfg.use_deepep,
         ep_size=p.ep,
         topk=model_cfg.num_experts_per_tok,
+        max_token_rows_per_rank=impl_cfg.ep_chunk_max_token_rows_per_rank,
     )
 
     # ── override model config from impl_cfg ──
@@ -219,6 +221,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
         enable_ep_chunk_overlap=impl_cfg.enable_ep_chunk_overlap,
+        ep_chunk_max_token_rows_per_rank=impl_cfg.ep_chunk_max_token_rows_per_rank,
         lora_config=lora_config,
     )
 
