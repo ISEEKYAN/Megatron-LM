@@ -23,7 +23,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 from megatron.lite.primitive.optimizers.mfsdp.config import (
     MFSDPConfig,
     MFSDPProcessGroups,
@@ -39,11 +38,7 @@ class NCCLUserBuffer:
     """Best-effort Apex NCCL memory-pool adapter."""
 
     def __init__(
-        self,
-        *,
-        enabled: bool,
-        groups: tuple[dist.ProcessGroup, ...],
-        symmetric: bool,
+        self, *, enabled: bool, groups: tuple[dist.ProcessGroup, ...], symmetric: bool
     ) -> None:
         self.enabled = bool(enabled and torch.cuda.is_available())
         self.groups = groups
@@ -185,11 +180,7 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
             tensor = slots[slot]
             if tensor is None or tensor.numel() < numel:
                 lease = super().allocate(
-                    numel,
-                    dtype=dtype,
-                    device=device,
-                    group=group,
-                    key=pool_key,
+                    numel, dtype=dtype, device=device, group=group, key=pool_key
                 )
                 tensor = lease.tensor
                 slots[slot] = tensor
@@ -209,11 +200,7 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
                 registered=registered,
             )
         return super().allocate(
-            numel,
-            dtype=dtype,
-            device=device,
-            group=group,
-            key=pool_key,
+            numel, dtype=dtype, device=device, group=group, key=pool_key
         )
 
     def release(self, lease: BufferLease) -> None:
@@ -250,8 +237,7 @@ def _wait_for_reuse_event(event: Any | None, tensor: torch.Tensor) -> None:
 
 
 def build_temporary_allocator(
-    config: MFSDPConfig,
-    groups: tuple[dist.ProcessGroup, ...],
+    config: MFSDPConfig, groups: tuple[dist.ProcessGroup, ...]
 ) -> TemporaryBufferAllocator:
     user_buffer = NCCLUserBuffer(
         enabled=config.nccl_ub,
@@ -347,24 +333,16 @@ class ParamBucket:
             intersection_end = min(spec_end, local_end)
             spec.shard_numel = max(0, intersection_end - intersection_begin)
             spec.local_offset = min(
-                self.local_numel,
-                max(0, intersection_begin - local_begin),
+                self.local_numel, max(0, intersection_begin - local_begin)
             )
-            spec.param_offset = min(
-                spec.numel,
-                max(0, intersection_begin - spec_begin),
-            )
+            spec.param_offset = min(spec.numel, max(0, intersection_begin - spec_begin))
             offset = spec_end
 
         self.main_param_buffer = torch.zeros(
-            self.local_numel,
-            dtype=self.policy.main_params_dtype,
-            device=self.device,
+            self.local_numel, dtype=self.policy.main_params_dtype, device=self.device
         )
         self.main_grad_buffer = torch.zeros(
-            self.local_numel,
-            dtype=self.policy.main_grads_dtype,
-            device=self.device,
+            self.local_numel, dtype=self.policy.main_grads_dtype, device=self.device
         )
         self.grad_shard_buffer = self.main_grad_buffer
         self.local_compute_buffer = (
@@ -379,9 +357,7 @@ class ParamBucket:
         )
         self.full_buffer = torch.empty(0, dtype=compute_dtype, device=self.device)
         self.full_main_grad_buffer = torch.empty(
-            0,
-            dtype=self.policy.main_grads_dtype,
-            device=self.device,
+            0, dtype=self.policy.main_grads_dtype, device=self.device
         )
         self._full_lease: BufferLease | None = None
         self._full_main_grad_lease: BufferLease | None = None
@@ -391,6 +367,8 @@ class ParamBucket:
         self._param_gather_work: Any | None = None
         self._grad_reduce_work: Any | None = None
         self._grad_reduce_launched = False
+        self._microbatch_reduced = False
+        self._has_accumulated_grad = False
         self._full_ready = True
         self.grad_sync_enabled = False
         self.grad_ready_callback: Callable[["ParamBucket"], None] | None = None
@@ -413,8 +391,7 @@ class ParamBucket:
                     0, spec.local_offset, spec.shard_numel
                 )
                 shard_param = nn.Parameter(
-                    shard_view,
-                    requires_grad=spec.full_param.requires_grad,
+                    shard_view, requires_grad=spec.full_param.requires_grad
                 )
                 _copy_parameter_metadata(spec.full_param, shard_param)
                 shard_param._mfsdp_original_ndim = spec.full_param.ndim
@@ -450,11 +427,7 @@ class ParamBucket:
                 dtype=self.policy.main_grads_dtype,
                 device=self.device,
                 group=self.process_group,
-                key=(
-                    "main_grad",
-                    id(self.process_group),
-                    self.allocator_layout_key,
-                ),
+                key=("main_grad", id(self.process_group), self.allocator_layout_key),
             )
             self.full_main_grad_buffer = self._full_main_grad_lease.tensor
             self.full_main_grad_buffer.zero_()
@@ -468,9 +441,7 @@ class ParamBucket:
             self._full_main_grad_lease.release()
             self._full_main_grad_lease = None
         self.full_main_grad_buffer = torch.empty(
-            0,
-            dtype=self.policy.main_grads_dtype,
-            device=self.device,
+            0, dtype=self.policy.main_grads_dtype, device=self.device
         )
         for spec in self.specs:
             spec.full_param.main_grad = self.full_main_grad_buffer
@@ -482,11 +453,7 @@ class ParamBucket:
                 dtype=self.policy.compute_dtype,
                 device=self.device,
                 group=self.gather_group,
-                key=(
-                    "param",
-                    id(self.gather_group),
-                    self.allocator_layout_key,
-                ),
+                key=("param", id(self.gather_group), self.allocator_layout_key),
             )
             self.full_buffer = self._full_lease.tensor
         if self.policy.main_params_dtype != self.policy.compute_dtype:
@@ -518,10 +485,7 @@ class ParamBucket:
                 output.copy_(local)
             else:
                 self._param_gather_work = dist.all_gather_into_tensor(
-                    output,
-                    local,
-                    group=self.gather_group,
-                    async_op=True,
+                    output, local, group=self.gather_group, async_op=True
                 )
         if self._param_gather_work is not None:
             self._param_gather_work.wait()
@@ -539,20 +503,14 @@ class ParamBucket:
             self._full_lease = None
         self._release_local_compute_buffer()
         self.full_buffer = torch.empty(
-            0,
-            dtype=self.policy.compute_dtype,
-            device=self.device,
+            0, dtype=self.policy.compute_dtype, device=self.device
         )
 
         self._full_ready = False
 
     def discard_full_parameter_views(self) -> None:
         """Release full-parameter references after autograd no longer needs them."""
-        empty = torch.empty(
-            0,
-            dtype=self.policy.compute_dtype,
-            device=self.device,
-        )
+        empty = torch.empty(0, dtype=self.policy.compute_dtype, device=self.device)
         with torch.no_grad():
             for spec in self.specs:
                 spec.full_param.data = empty
@@ -563,9 +521,7 @@ class ParamBucket:
             self._local_compute_lease = None
         if self.policy.main_params_dtype != self.policy.compute_dtype:
             self.local_compute_buffer = torch.empty(
-                0,
-                dtype=self.policy.compute_dtype,
-                device=self.device,
+                0, dtype=self.policy.compute_dtype, device=self.device
             )
 
     def _release_local_grad_comm_buffer(self) -> None:
@@ -574,10 +530,10 @@ class ParamBucket:
             self._local_grad_comm_lease = None
         if self.policy.grad_comm_dtype != self.policy.main_grads_dtype:
             self.local_grad_comm_buffer = torch.empty(
-                0,
-                dtype=self.policy.grad_comm_dtype,
-                device=self.device,
+                0, dtype=self.policy.grad_comm_dtype, device=self.device
             )
+        else:
+            self.local_grad_comm_buffer = self.main_grad_buffer
 
     def move_model_state(self, device: torch.device, *, load_grad: bool) -> None:
         """Move persistent sharded storage without breaking optimizer aliases."""
@@ -611,29 +567,21 @@ class ParamBucket:
         )
         self.device = device
         self.full_buffer = torch.empty(
-            0,
-            dtype=self.policy.compute_dtype,
-            device=device,
+            0, dtype=self.policy.compute_dtype, device=device
         )
         self.full_main_grad_buffer = torch.empty(
-            0,
-            dtype=self.policy.main_grads_dtype,
-            device=device,
+            0, dtype=self.policy.main_grads_dtype, device=device
         )
 
         with torch.no_grad():
             for spec in self.specs:
                 assert spec.shard_param is not None
                 spec.shard_param.data = self.main_param_buffer.narrow(
-                    0,
-                    spec.local_offset,
-                    spec.shard_numel,
+                    0, spec.local_offset, spec.shard_numel
                 )
                 if load_grad and grad_present[id(spec)]:
                     spec.shard_param.grad = self.main_grad_buffer.narrow(
-                        0,
-                        spec.local_offset,
-                        spec.shard_numel,
+                        0, spec.local_offset, spec.shard_numel
                     ).view_as(spec.shard_param)
                 else:
                     spec.shard_param.grad = None
@@ -663,23 +611,22 @@ class ParamBucket:
     def prepare_grad_reduce(
         self, *, force: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if self._grad_reduce_launched:
+        if self._grad_reduce_launched or self._microbatch_reduced:
             return None
         if not force and len(self._grad_ready_ids) != len(self.specs):
             return None
         self._grad_reduce_launched = True
         self.prepare_main_grads()
-        if self.policy.grad_comm_dtype != self.policy.main_grads_dtype:
+        if (
+            self.policy.grad_comm_dtype != self.policy.main_grads_dtype
+            or self._has_accumulated_grad
+        ):
             self._local_grad_comm_lease = self.allocator.allocate(
                 self.local_numel,
                 dtype=self.policy.grad_comm_dtype,
                 device=self.device,
                 group=self.process_group,
-                key=(
-                    "grad-local",
-                    id(self.process_group),
-                    self.allocator_layout_key,
-                ),
+                key=("grad-local", id(self.process_group), self.allocator_layout_key),
             )
             self.local_grad_comm_buffer = self._local_grad_comm_lease.tensor
         with torch.no_grad():
@@ -696,14 +643,17 @@ class ParamBucket:
                 dtype=self.policy.grad_comm_dtype,
                 device=self.device,
                 group=self.process_group,
-                key=(
-                    "grad",
-                    id(self.process_group),
-                    self.allocator_layout_key,
-                ),
+                key=("grad", id(self.process_group), self.allocator_layout_key),
             )
             grad_input = self._grad_lease.tensor
             grad_input.copy_(self.full_main_grad_buffer)
+        if self.local_grad_comm_buffer.numel() != self.local_numel:
+            raise RuntimeError(
+                "M-FSDP reduce-scatter output staging has the wrong size: "
+                f"bucket={self.bucket_id} output={self.local_grad_comm_buffer.numel()} "
+                f"expected={self.local_numel} accumulated={self._has_accumulated_grad} "
+                f"lease={self._local_grad_comm_lease is not None}."
+            )
         return self.local_grad_comm_buffer, grad_input
 
     def mark_grad_reduce_launched(self, work: Any | None) -> None:
@@ -727,9 +677,14 @@ class ParamBucket:
         if self._grad_reduce_work is not None:
             self._grad_reduce_work.wait()
             self._grad_reduce_work = None
-        self.main_grad_buffer.copy_(self.local_grad_comm_buffer)
+        reduced_grad = self.local_grad_comm_buffer
         if self.config.average_gradients and self.world_size > 1:
-            self.main_grad_buffer.div_(self.world_size)
+            reduced_grad.div_(self.world_size)
+        if self._has_accumulated_grad:
+            self.main_grad_buffer.add_(reduced_grad)
+        elif reduced_grad is not self.main_grad_buffer:
+            self.main_grad_buffer.copy_(reduced_grad)
+        self._has_accumulated_grad = True
         for spec in self.specs:
             assert spec.shard_param is not None
             main_grad = self.main_grad_buffer.narrow(
@@ -749,6 +704,9 @@ class ParamBucket:
             self._grad_lease = None
         self._release_local_grad_comm_buffer()
         self._release_full_main_grads()
+        self._grad_reduce_launched = False
+        self._grad_ready_ids.clear()
+        self._microbatch_reduced = True
 
     def copy_full_parameters_to_shards(self) -> None:
         self.wait_param_gather()
@@ -762,6 +720,8 @@ class ParamBucket:
             self._grad_reduce_work.wait()
         self._grad_reduce_work = None
         self._grad_reduce_launched = False
+        self._microbatch_reduced = False
+        self._has_accumulated_grad = False
         self.grad_sync_enabled = False
         self._grad_ready_ids.clear()
         self.main_grad_buffer.zero_()
@@ -772,6 +732,9 @@ class ParamBucket:
             if spec.shard_param is not None:
                 spec.shard_param.grad = None
         self._release_full_main_grads()
+
+    def start_microbatch(self) -> None:
+        self._microbatch_reduced = False
 
     def set_grad_sync_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -813,7 +776,7 @@ class ParamBucket:
                 param.grad = None
             if len(self._grad_ready_ids) != len(self.specs):
                 return
-            if self.grad_sync_enabled and self.grad_ready_callback is not None:
+            if self.grad_ready_callback is not None:
                 self.grad_ready_callback(self)
             self.release_full_parameters()
             self.discard_full_parameter_views()
@@ -838,13 +801,9 @@ class ParamAndGradBuffer:
         self.module = module
         self.groups = groups
         self.config = config
-        self.allocator = build_temporary_allocator(
-            config,
-            groups.registration_groups(),
-        )
+        self.allocator = build_temporary_allocator(config, groups.registration_groups())
         self.buckets, self.owners = self._build(
-            is_expert=is_expert,
-            unit_modules=unit_modules or (),
+            is_expert=is_expert, unit_modules=unit_modules or ()
         )
 
     def _build(
@@ -878,10 +837,7 @@ class ParamAndGradBuffer:
                 )
                 specs_by_id[id(param)] = spec
                 owner_by_param_id[id(param)] = _parameter_owner(
-                    parent_name,
-                    parent,
-                    module_by_name,
-                    unit_types,
+                    parent_name, parent, module_by_name, unit_types
                 )
                 expert_by_param_id[id(param)] = bool(is_expert(name))
             spec.bindings.append(ParamBinding(parent, attribute))
@@ -1017,9 +973,7 @@ class CommunicationStream:
                 self.stream = torch.cuda.Stream(device=device, priority=-1)
 
     def launch(
-        self,
-        callback: Callable[[], Any | None],
-        tensors: Iterable[torch.Tensor],
+        self, callback: Callable[[], Any | None], tensors: Iterable[torch.Tensor]
     ) -> Any | None:
         if self.stream is None:
             return callback()
@@ -1058,10 +1012,7 @@ class AllGatherPipeline:
                 output.copy_(local)
                 return None
             return dist.all_gather_into_tensor(
-                output,
-                local,
-                group=bucket.gather_group,
-                async_op=True,
+                output, local, group=bucket.gather_group, async_op=True
             )
 
         work = self.comm_stream.launch(collective, (output, local))
@@ -1139,9 +1090,9 @@ class GradReducePipeline:
         self.buckets = buckets
         device = buckets[0].device if buckets else torch.device("cpu")
         self.comm_stream = CommunicationStream(device)
+        self._pending: list[ParamBucket] = []
         for bucket in buckets:
-            if bucket.config.overlap_grad_reduce:
-                bucket.grad_ready_callback = self.reduce_gradients
+            bucket.grad_ready_callback = self.reduce_gradients
 
     def reduce_gradients(self, bucket: ParamBucket, *, force: bool = False) -> None:
         tensors = bucket.prepare_grad_reduce(force=force)
@@ -1163,15 +1114,35 @@ class GradReducePipeline:
 
         work = self.comm_stream.launch(collective, (output, grad_input))
         bucket.mark_grad_reduce_launched(work)
+        self._pending.append(bucket)
+
+    def reclaim_before_backward(self) -> None:
+        # Bound full, unsharded FP32 gradient staging to the allocator's two
+        # reusable slots.  Without this drain, delayed microbatch sync retains
+        # one 4-byte-per-parameter buffer for every completed bucket.
+        while len(self._pending) >= 2:
+            self._pending.pop(0).wait_grad_reduce()
+
+    def has_microbatch_work(self) -> bool:
+        return bool(self._pending) or any(
+            bucket._grad_ready_ids or bucket._full_main_grad_lease is not None
+            for bucket in self.buckets
+        )
 
     def finish(self) -> None:
         for bucket in reversed(self.buckets):
-            self.reduce_gradients(bucket, force=True)
+            if not bucket._microbatch_reduced:
+                self.reduce_gradients(bucket, force=True)
         self.comm_stream.wait_for_current()
+        while self._pending:
+            self._pending.pop(0).wait_grad_reduce()
+
+    def start_microbatch(self) -> None:
         for bucket in self.buckets:
-            bucket.wait_grad_reduce()
+            bucket.start_microbatch()
 
     def reset(self) -> None:
+        self._pending.clear()
         for bucket in self.buckets:
             bucket.reset_grad_state()
 
@@ -1192,19 +1163,26 @@ class CommunicationPipelines:
         self.grad_reduce = GradReducePipeline(buckets)
 
     def begin_forward(self) -> None:
+        if self.grad_reduce.has_microbatch_work():
+            self.grad_reduce.finish()
         self.all_gather.begin_forward()
 
     def acquire_forward(self, bucket_ids: Iterable[int]) -> None:
         self.all_gather.acquire_forward(bucket_ids)
 
     def begin_backward(self) -> None:
+        if self.grad_reduce.has_microbatch_work():
+            self.grad_reduce.finish()
+        self.grad_reduce.start_microbatch()
         self.all_gather.begin_backward()
 
     def acquire_backward(self, bucket: ParamBucket) -> None:
+        self.grad_reduce.reclaim_before_backward()
         self.all_gather.acquire_backward(bucket)
 
     def acquire_backward_ids(self, bucket_ids: Iterable[int]) -> None:
         for bucket_id in reversed(tuple(bucket_ids)):
+            self.grad_reduce.reclaim_before_backward()
             self.all_gather.acquire_backward(self.buckets[bucket_id])
 
     def release_backward_ids(self, bucket_ids: Iterable[int]) -> None:

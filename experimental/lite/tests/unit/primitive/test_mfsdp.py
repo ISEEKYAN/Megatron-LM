@@ -87,9 +87,7 @@ class _FusedMainGradLinear(torch.nn.Module):
 
     def forward(self, value):
         return _FusedMainGradLinearFunction.apply(
-            value,
-            self.weight,
-            self.fuse_wgrad_accumulation,
+            value, self.weight, self.fuse_wgrad_accumulation
         )
 
 
@@ -208,9 +206,9 @@ def test_mfsdp_full_parallel_signoff_is_single_node_50_step_curve():
 def test_mfsdp_is_standalone_without_vendored_mcore_or_fsdp2_dependencies():
     package = Path(mfsdp_config.__file__).parent
 
-    assert not list((package / "impl").glob("*.py")), (
-        "Do not vendor the MCore FSDP implementation."
-    )
+    assert not list(
+        (package / "impl").glob("*.py")
+    ), "Do not vendor the MCore FSDP implementation."
     violations = []
     for source_path in package.rglob("*.py"):
         tree = ast.parse(source_path.read_text(), filename=str(source_path))
@@ -824,9 +822,9 @@ def test_mfsdp_offload_fraction_keeps_optimizer_state_on_cpu():
 
     inner = optimizer._inner_optimizer
     cpu_group = inner.cpu_group
-    assert cpu_group is not None, (
-        "Expected cpu_group to be set for offload_fraction=1.0"
-    )
+    assert (
+        cpu_group is not None
+    ), "Expected cpu_group to be set for offload_fraction=1.0"
     assert len(cpu_group._cpu_optimizer.optimizers) == len(cpu_group._cpu_params)
     for cpu_p in cpu_group._cpu_params:
         assert cpu_p.device.type == "cpu", "cpu_param should be on CPU"
@@ -966,9 +964,9 @@ def test_mfsdp_offload_fraction_numerically_matches_no_offload():
     }
     assert ref_params.keys() == cpu_params.keys()
     for name in ref_params:
-        assert torch.equal(ref_params[name], cpu_params[name]), (
-            f"Parameter {name} diverges between GPU-only and CPU-offload runs"
-        )
+        assert torch.equal(
+            ref_params[name], cpu_params[name]
+        ), f"Parameter {name} diverges between GPU-only and CPU-offload runs"
 
 
 def test_mfsdp_offload_fraction_partial_splits_by_numel():
@@ -995,9 +993,9 @@ def test_mfsdp_offload_fraction_partial_splits_by_numel():
     ratio = cpu_numel / total_numel
     # The greedy split assigns whole params; exact ratio depends on model shape.
     # For fraction=0.5 with 3 params of unequal size the ratio will be ≥0.4.
-    assert ratio >= 0.4, (
-        f"Expected substantial CPU offload at fraction=0.5, got {ratio:.2%}"
-    )
+    assert (
+        ratio >= 0.4
+    ), f"Expected substantial CPU offload at fraction=0.5, got {ratio:.2%}"
     assert ratio <= 0.95, f"Expected some GPU params at fraction=0.5, got {ratio:.2%}"
 
 
@@ -1454,7 +1452,7 @@ def test_mfsdp_dtype_conversion_buffers_are_collective_scoped():
     assert torch.count_nonzero(bucket.main_grad_buffer) == bucket.local_numel
 
 
-def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
+def test_mfsdp_reduce_scatters_each_microbatch_into_sharded_accumulation():
     torch.manual_seed(321)
     reference = _GlooModel()
     candidate = copy.deepcopy(reference)
@@ -1478,7 +1476,10 @@ def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
         adam_beta1=0.9,
         adam_beta2=0.999,
         adam_eps=1.0e-8,
-        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+        override_optimizer_config={
+            "mfsdp_sharding_strategy": "optim_grads_params",
+            "bucket_size": 4,
+        },
     )
     reference_optimizer = torch.optim.AdamW(
         reference.parameters(),
@@ -1508,10 +1509,23 @@ def test_mfsdp_accumulates_all_microbatches_before_grad_reduce():
         reference_loss = torch.nn.functional.mse_loss(reference(value), target)
         (reference_loss / len(microbatches)).backward()
 
-        candidate_loss = torch.nn.functional.mse_loss(chunks[0](value), target)
+        candidate_output = chunks[0](value)
+        if microbatch_idx:
+            buckets = chunks[0].param_sync.buckets
+            assert all(bucket._full_main_grad_lease is None for bucket in buckets)
+            assert any(
+                torch.count_nonzero(bucket.main_grad_buffer) for bucket in buckets
+            )
+        candidate_loss = torch.nn.functional.mse_loss(candidate_output, target)
         if microbatch_idx == len(microbatches) - 1:
             candidate_optimizer.grad_sync_enabled = True
         (candidate_loss / len(microbatches)).backward()
+
+        live_full_grads = sum(
+            bucket._full_main_grad_lease is not None
+            for bucket in chunks[0].param_sync.buckets
+        )
+        assert live_full_grads <= 2
 
     candidate_optimizer.finish_grad_sync()
 
@@ -1673,8 +1687,7 @@ def test_mfsdp_routes_fused_wgrad_through_bucketed_fp32_main_grad():
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [model],
         engine_cfg=SimpleNamespace(
-            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
-            optimizer=opt,
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1), optimizer=opt
         ),
         ps=ps,
         is_expert=lambda _name: False,
@@ -1707,8 +1720,14 @@ def test_mfsdp_routes_fused_wgrad_through_bucketed_fp32_main_grad():
     assert spec.full_param.grad is None
     second_expected = second_value.float().sum(dim=0).repeat(4, 1)
     assert spec.full_param.main_grad.untyped_storage().data_ptr() == main_grad_storage
-    assert torch.equal(spec.full_param.main_grad, first_main_grad + second_expected)
-    expected_main_grad = spec.full_param.main_grad.detach().reshape(-1).clone()
+    assert torch.equal(spec.full_param.main_grad, second_expected)
+
+    optimizer.finish_grad_sync()
+    assert torch.equal(
+        bucket.main_grad_buffer.view_as(second_expected),
+        first_main_grad + second_expected,
+    )
+    expected_main_grad = (first_main_grad + second_expected).reshape(-1)
 
     optimizer.finish_grad_sync()
     consumed_grad = _optimizer_params(optimizer)[0].grad
@@ -1716,8 +1735,7 @@ def test_mfsdp_routes_fused_wgrad_through_bucketed_fp32_main_grad():
     assert consumed_grad.dtype is torch.float32
     assert torch.equal(consumed_grad, expected_main_grad)
     assert not torch.equal(
-        consumed_grad,
-        consumed_grad.to(torch.bfloat16).to(torch.float32),
+        consumed_grad, consumed_grad.to(torch.bfloat16).to(torch.float32)
     )
 
 
@@ -1726,11 +1744,15 @@ def test_mfsdp_routes_regular_autograd_grad_through_fp32_main_grad():
     optimizer.zero_grad()
     value = torch.randn(3, 4)
     chunk(value).square().mean().backward()
-    expected = {
-        spec.name: spec.full_param.main_grad.detach().clone()
-        for bucket in chunk.param_sync.buckets
-        for spec in bucket.specs
-    }
+    expected = {}
+    for bucket in chunk.param_sync.buckets:
+        for spec in bucket.specs:
+            grad = spec.full_param.main_grad
+            if grad.numel() == 0:
+                grad = bucket.main_grad_buffer.narrow(
+                    0, spec.local_offset, spec.shard_numel
+                ).view_as(spec.shard_param)
+            expected[spec.name] = grad.detach().clone()
     for bucket in chunk.param_sync.buckets:
         for spec in bucket.specs:
             assert spec.full_param.grad is None
@@ -1766,8 +1788,7 @@ def test_mfsdp_accumulates_regular_wgrad_in_fp32_per_microbatch():
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [model],
         engine_cfg=SimpleNamespace(
-            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
-            optimizer=opt,
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1), optimizer=opt
         ),
         ps=ps,
         is_expert=lambda _name: False,
@@ -1786,13 +1807,14 @@ def test_mfsdp_accumulates_regular_wgrad_in_fp32_per_microbatch():
     chunk(torch.ones(1, 4, dtype=torch.bfloat16)).sum().backward()
     assert spec.full_param.grad is None
     expected = torch.full((4, 4), 257.0)
-    assert torch.equal(spec.full_param.main_grad, expected)
-    assert not torch.equal(
-        spec.full_param.main_grad,
-        spec.full_param.main_grad.to(torch.bfloat16).to(torch.float32),
-    )
+    assert torch.equal(spec.full_param.main_grad, torch.ones((4, 4)))
 
     optimizer.finish_grad_sync()
+    assert torch.equal(bucket.main_grad_buffer.view_as(expected), expected)
+    assert not torch.equal(
+        bucket.main_grad_buffer,
+        bucket.main_grad_buffer.to(torch.bfloat16).to(torch.float32),
+    )
     consumed_grad = _optimizer_params(optimizer)[0].grad
     assert consumed_grad is not None
     assert consumed_grad.dtype is torch.float32
@@ -1850,12 +1872,13 @@ def _run_mfsdp_gloo_parity(rank: int, world_size: int, init_file: str) -> None:
         )
 
         torch.manual_seed(900 + rank)
-        value = torch.randn(3, 4)
-        target = torch.randn(3, 2)
         reference_optimizer.zero_grad()
-        torch.nn.functional.mse_loss(reference(value), target).backward()
         candidate_optimizer.zero_grad()
-        torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+        for _microbatch in range(2):
+            value = torch.randn(3, 4)
+            target = torch.randn(3, 2)
+            (torch.nn.functional.mse_loss(reference(value), target) / 2).backward()
+            (torch.nn.functional.mse_loss(chunks[0](value), target) / 2).backward()
         for param in reference.parameters():
             assert param.grad is not None
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
