@@ -1,11 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: off
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import pytest
 import torch
-
 from megatron.lite.primitive.parallel.cp import split_packed_for_cp
 from megatron.lite.primitive.parallel.pipeline import _num_microbatches_from_config
 from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
@@ -16,12 +16,16 @@ from megatron.lite.primitive.parallel.sp import (
 )
 from megatron.lite.primitive.parallel.state import ParallelState
 
+# isort: on
+
 pytestmark = pytest.mark.mlite
 
 
-def test_tp_vocab_embedding_and_output_single_rank_contract(transformer_engine_import_stub):
+def test_tp_vocab_embedding_and_output_single_rank_contract(
+    transformer_engine_import_stub,
+):
     transformer_engine_import_stub()
-    from megatron.lite.primitive.parallel.linear import (
+    from megatron.lite.primitive.parallel.linear import (  # isort: skip
         VocabParallelEmbedding,
         VocabParallelOutput,
         pad_vocab_for_tp,
@@ -75,12 +79,16 @@ def test_cp_packed_split_handles_each_sample_independently():
     )
 
     torch.testing.assert_close(rank0[0], torch.tensor([0, 1, 6, 7, 8, 9, 14, 15]))
-    torch.testing.assert_close(rank0[1], torch.tensor([100, 101, 106, 107, 108, 109, 114, 115]))
+    torch.testing.assert_close(
+        rank0[1], torch.tensor([100, 101, 106, 107, 108, 109, 114, 115])
+    )
     torch.testing.assert_close(rank0[2], torch.tensor([0, 4, 8], dtype=torch.int32))
     assert rank0[3] == 4
 
     torch.testing.assert_close(rank1[0], torch.tensor([2, 3, 4, 5, 10, 11, 12, 13]))
-    torch.testing.assert_close(rank1[1], torch.tensor([102, 103, 104, 105, 110, 111, 112, 113]))
+    torch.testing.assert_close(
+        rank1[1], torch.tensor([102, 103, 104, 105, 110, 111, 112, 113])
+    )
     torch.testing.assert_close(rank1[2], torch.tensor([0, 4, 8], dtype=torch.int32))
     assert rank1[3] == 4
 
@@ -109,12 +117,17 @@ def test_dp_dimension_controls_dense_microbatch_contract():
     assert ps.dp_cp_rank == 5
 
 
-def test_ep_token_dispatcher_local_roundtrip_is_independent_of_deepep():
+def test_ep_token_dispatcher_local_roundtrip_is_independent_of_deepep(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
     from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 
     ps = ParallelState(ep_size=1, ep_rank=0)
     dispatcher = TokenDispatcher(num_experts=3, hidden_size=2, ps=ps, use_deepep=False)
-    hidden = torch.tensor([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]], requires_grad=True)
+    hidden = torch.tensor(
+        [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]], requires_grad=True
+    )
     topk_indices = torch.tensor([[0], [2], [1], [2]])
     topk_scores = torch.ones(4, 1)
 
@@ -129,3 +142,21 @@ def test_ep_token_dispatcher_local_roundtrip_is_independent_of_deepep():
 
     combined.sum().backward()
     torch.testing.assert_close(hidden.grad, torch.ones_like(hidden))
+
+
+def test_dispatcher_local_sidecar_uses_the_same_route_permutation(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+
+    ps = ParallelState(ep_size=1, ep_rank=0)
+    dispatcher = TokenDispatcher(num_experts=3, hidden_size=2, ps=ps, use_deepep=False)
+    hidden = torch.tensor([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]])
+    topk_indices = torch.tensor([[0], [2], [1], [2]])
+    topk_scores = torch.ones(4, 1)
+
+    dispatched, _, _ = dispatcher.dispatch(hidden, topk_scores, topk_indices)
+    sidecar = dispatcher.dispatch_sidecar(hidden[:, :1])
+
+    torch.testing.assert_close(sidecar, dispatched[:, :1])

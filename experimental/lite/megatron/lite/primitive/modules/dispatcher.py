@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 """Token dispatcher: AllToAll and DeepEP dispatch/combine."""
 
 from __future__ import annotations
@@ -7,7 +8,6 @@ import os
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.modules.moe import _AllToAll
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
@@ -15,7 +15,11 @@ from megatron.lite.primitive.utils.moe import permute, unpermute
 
 try:
     import deep_ep  # pyright: ignore[reportMissingImports]
-    from deep_ep.utils import EventHandle, EventOverlap  # pyright: ignore[reportMissingImports]
+
+    from deep_ep.utils import (  # pyright: ignore[reportMissingImports]
+        EventHandle,
+        EventOverlap,
+    )
 except ImportError:
     deep_ep = None  # type: ignore
     EventHandle = None  # type: ignore
@@ -46,7 +50,9 @@ def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
             config.get_rdma_buffer_size_hint(hidden_bytes, group_size), num_rdma_bytes
         )
 
-    return deep_ep.Buffer(group=group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=num_rdma_bytes)
+    return deep_ep.Buffer(
+        group=group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=num_rdma_bytes
+    )
 
 
 def _use_moe_permute_fusion() -> bool:
@@ -87,19 +93,24 @@ class _DeepEPDispatch(torch.autograd.Function):
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
-        (recv_hidden, recv_indices, recv_probs, recv_per_expert, handle, after_event) = (
-            buffer.dispatch(
-                hidden_states.contiguous(),
-                topk_idx=topk_indices,
-                topk_weights=topk_scores.float(),
-                num_tokens_per_rank=num_tokens_per_rank,
-                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-                is_token_in_rank=is_token_in_rank,
-                num_tokens_per_expert=num_tokens_per_expert,
-                previous_event=event,
-                async_finish=async_finish,
-                allocate_on_comm_stream=allocate_on_comm_stream,
-            )
+        (
+            recv_hidden,
+            recv_indices,
+            recv_probs,
+            recv_per_expert,
+            handle,
+            after_event,
+        ) = buffer.dispatch(
+            hidden_states.contiguous(),
+            topk_idx=topk_indices,
+            topk_weights=topk_scores.float(),
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            previous_event=event,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
         )
         if async_finish:
             after_event.current_stream_wait()
@@ -115,7 +126,12 @@ class _DeepEPDispatch(torch.autograd.Function):
 
     @staticmethod
     def backward(
-        ctx, grad_recv_hidden, grad_recv_indices, grad_recv_probs, grad_recv_per_expert, grad_handle
+        ctx,
+        grad_recv_hidden,
+        grad_recv_indices,
+        grad_recv_probs,
+        grad_recv_per_expert,
+        grad_handle,
     ):
         del grad_recv_indices, grad_recv_per_expert, grad_handle
         previous_event = (
@@ -187,7 +203,6 @@ class _DeepEPCombine(torch.autograd.Function):
 
 
 class TokenDispatcher:
-
     def __init__(
         self,
         num_experts: int,
@@ -202,7 +217,9 @@ class TokenDispatcher:
         self.ep_size = ps.ep_size
         self.num_local_experts = ensure_divisible(num_experts, ps.ep_size)
         self.moe_permute_fusion = (
-            _use_moe_permute_fusion() if moe_permute_fusion is None else bool(moe_permute_fusion)
+            _use_moe_permute_fusion()
+            if moe_permute_fusion is None
+            else bool(moe_permute_fusion)
         )
 
         self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
@@ -214,20 +231,28 @@ class TokenDispatcher:
         self._restore_shape: tuple | None = None
         self._input_splits: list[int] | None = None
         self._output_splits: list[int] | None = None
+        self._sidecar_recv_chunk_sizes: list[int] | None = None
         self._handle = None
         self._deepep_event = None
 
         if self.ep_size > 1 and self.num_local_experts > 1:
             chunk_idxs = torch.arange(self.ep_size * self.num_local_experts)
             self._sort_by_experts = (
-                chunk_idxs.reshape(self.ep_size, self.num_local_experts).T.ravel().tolist()
+                chunk_idxs.reshape(self.ep_size, self.num_local_experts)
+                .T.ravel()
+                .tolist()
             )
             self._restore_by_ranks = (
-                chunk_idxs.reshape(self.num_local_experts, self.ep_size).T.ravel().tolist()
+                chunk_idxs.reshape(self.num_local_experts, self.ep_size)
+                .T.ravel()
+                .tolist()
             )
 
     def dispatch(
-        self, hidden_states: torch.Tensor, topk_scores: torch.Tensor, topk_indices: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        topk_scores: torch.Tensor,
+        topk_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if self.ep_size <= 1:
             return self._dispatch_local(hidden_states, topk_scores, topk_indices)
@@ -244,6 +269,42 @@ class TokenDispatcher:
         if self.use_deepep:
             return self._combine_deepep(expert_output)
         return self._combine_alltoall(expert_output)
+
+    def dispatch_sidecar(self, sidecar: torch.Tensor) -> torch.Tensor:
+        """Route a per-token sidecar with the active standard dispatcher plan.
+
+        The caller must invoke this after :meth:`dispatch` and before
+        :meth:`combine`; it intentionally shares the exact token permutation
+        and standard all-to-all split plan.  DeepEP has no verified equivalent
+        sidecar contract, so it is rejected rather than silently diverging.
+        """
+        if self._row_id_map is None or self._restore_shape is None:
+            raise RuntimeError("dispatch_sidecar requires an active token dispatch.")
+        if sidecar.ndim < 1 or sidecar.shape[0] != self._restore_shape[0]:
+            raise ValueError("sidecar must have one row per pre-dispatch token.")
+        if self.use_deepep:
+            raise RuntimeError("DeepEP does not support multi-LoRA sidecar dispatch.")
+
+        permuted = sidecar.index_select(0, self._row_id_map)
+        if self.ep_size <= 1:
+            return permuted
+
+        if self._input_splits is None or self._output_splits is None:
+            raise RuntimeError(
+                "standard EP sidecar dispatch is missing split metadata."
+            )
+        received = _AllToAll.apply(
+            permuted, self._input_splits, self._output_splits, self.ps.ep_group
+        )
+        if self.num_local_experts <= 1:
+            return received
+        chunk_sizes = self._sidecar_recv_chunk_sizes
+        if chunk_sizes is None or not hasattr(self, "_sort_by_experts"):
+            raise RuntimeError(
+                "standard EP sidecar dispatch is missing expert ordering metadata."
+            )
+        chunks = torch.split(received, chunk_sizes, dim=0)
+        return torch.cat([chunks[i] for i in self._sort_by_experts], dim=0)
 
     def submit_deepep_combine(
         self, expert_output: torch.Tensor, *, allocate_on_comm_stream: bool = False
@@ -295,7 +356,9 @@ class TokenDispatcher:
         routing_map.scatter_(1, topk_indices, True)
         num_out = int(routing_map.sum().item())
 
-        probs_2d = torch.zeros(t, e, dtype=topk_scores.dtype, device=hidden_states.device)
+        probs_2d = torch.zeros(
+            t, e, dtype=topk_scores.dtype, device=hidden_states.device
+        )
         probs_2d.scatter_(1, topk_indices, topk_scores)
 
         permuted, permuted_probs, sorted_indices = permute(
@@ -337,7 +400,9 @@ class TokenDispatcher:
         # so this is a no-op for them.
         num_out = int(routing_map.sum().item())
 
-        probs_2d = torch.zeros(t, e, dtype=topk_scores.dtype, device=hidden_states.device)
+        probs_2d = torch.zeros(
+            t, e, dtype=topk_scores.dtype, device=hidden_states.device
+        )
         probs_2d.scatter_(1, topk_indices, topk_scores)
 
         permuted, permuted_probs, sorted_indices = permute(
@@ -351,26 +416,36 @@ class TokenDispatcher:
         self._restore_shape = hidden_states.shape
 
         tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
-        tpe_by_rank = tokens_per_expert.view(self.ep_size, self.num_local_experts).sum(dim=1)
+        tpe_by_rank = tokens_per_expert.view(self.ep_size, self.num_local_experts).sum(
+            dim=1
+        )
         self._input_splits = tpe_by_rank.tolist()
 
         global_tpe_flat = tokens_per_expert.new_empty(self.ep_size * e)
-        dist.all_gather_into_tensor(global_tpe_flat, tokens_per_expert, group=self.ps.ep_group)
+        dist.all_gather_into_tensor(
+            global_tpe_flat, tokens_per_expert, group=self.ps.ep_group
+        )
         global_tpe_2d = global_tpe_flat.view(self.ep_size, e)
         ep_rank = dist.get_rank(group=self.ps.ep_group)
         my_start = ep_rank * self.num_local_experts
-        recv_tpe_2d = global_tpe_2d[:, my_start : my_start + self.num_local_experts].contiguous()
+        recv_tpe_2d = global_tpe_2d[
+            :, my_start : my_start + self.num_local_experts
+        ].contiguous()
         self._output_splits = recv_tpe_2d.sum(dim=1).tolist()
 
         recv_flat = _AllToAll.apply(
             permuted, self._input_splits, self._output_splits, self.ps.ep_group
         )
         recv_scores = _AllToAll.apply(
-            permuted_probs.unsqueeze(-1), self._input_splits, self._output_splits, self.ps.ep_group
+            permuted_probs.unsqueeze(-1),
+            self._input_splits,
+            self._output_splits,
+            self.ps.ep_group,
         )
 
         if self.num_local_experts > 1:
             chunk_sizes = recv_tpe_2d.ravel().tolist()
+            self._sidecar_recv_chunk_sizes = chunk_sizes
             chunks = torch.split(recv_flat, chunk_sizes, dim=0)
             score_chunks = torch.split(recv_scores, chunk_sizes, dim=0)
             sort_idxs = self._sort_by_experts
@@ -384,6 +459,7 @@ class TokenDispatcher:
             permuted_probs_out = recv_scores
             self._combine_chunk_sizes = None
             self._combine_restore_idxs = None
+            self._sidecar_recv_chunk_sizes = None
 
         recv_tpe = recv_tpe_2d.sum(dim=0)
         return dispatched, recv_tpe, permuted_probs_out.squeeze(-1)
@@ -415,11 +491,17 @@ class TokenDispatcher:
         self._output_splits = None
         self._combine_chunk_sizes = None
         self._combine_restore_idxs = None
+        self._sidecar_recv_chunk_sizes = None
         self._local_tpe_list = None
         return result
 
     def submit_deepep_dispatch(
-        self, hidden_states, topk_scores, topk_indices, *, allocate_on_comm_stream: bool = False
+        self,
+        hidden_states,
+        topk_scores,
+        topk_indices,
+        *,
+        allocate_on_comm_stream: bool = False,
     ):
         if not self.use_deepep:
             raise RuntimeError("submit_deepep_dispatch requires DeepEP dispatch.")
@@ -489,16 +571,23 @@ class TokenDispatcher:
         if isinstance(recv_per_expert, torch.Tensor):
             recv_per_expert = [int(x) for x in recv_per_expert.detach().cpu().tolist()]
         local_tpe = torch.tensor(
-            recv_per_expert[: self.num_local_experts], dtype=torch.int64, device=recv_hidden.device
+            recv_per_expert[: self.num_local_experts],
+            dtype=torch.int64,
+            device=recv_hidden.device,
         )
-        self._local_tpe_list = [int(x) for x in recv_per_expert[: self.num_local_experts]]
+        self._local_tpe_list = [
+            int(x) for x in recv_per_expert[: self.num_local_experts]
+        ]
         rows = recv_hidden.size(0)
         recv_indices = recv_indices.to(torch.long)
         routing_map = torch.zeros(
             rows, self.num_local_experts, dtype=torch.bool, device=recv_hidden.device
         )
         probs_2d = torch.zeros(
-            rows, self.num_local_experts, dtype=recv_probs.dtype, device=recv_hidden.device
+            rows,
+            self.num_local_experts,
+            dtype=recv_probs.dtype,
+            device=recv_hidden.device,
         )
         valid = recv_indices >= 0
         row_ids = torch.arange(rows, device=recv_hidden.device).unsqueeze(1)
@@ -529,9 +618,9 @@ class TokenDispatcher:
                 f"local_tpe_sum={int(local_tpe.sum().item())}",
                 flush=True,
             )
-        if os.environ.get("MEGATRON_LITE_DEEPEP_SKIP_DISPATCH_METADATA_CHECK") != "1" and int(
-            local_tpe.sum().item()
-        ) != int(dispatched.shape[0]):
+        if os.environ.get(
+            "MEGATRON_LITE_DEEPEP_SKIP_DISPATCH_METADATA_CHECK"
+        ) != "1" and int(local_tpe.sum().item()) != int(dispatched.shape[0]):
             ep_rank = dist.get_rank(group=self.ps.ep_group)
             raise RuntimeError(
                 "DeepEP dispatch metadata mismatch: "
@@ -542,14 +631,16 @@ class TokenDispatcher:
 
     def _dispatch_deepep(self, hidden_states, topk_scores, topk_indices):
         if torch.is_grad_enabled():
-            recv_hidden, recv_indices, recv_probs, recv_per_expert, handle = _DeepEPDispatch.apply(
-                self.buffer,
-                hidden_states,
-                topk_indices,
-                topk_scores.float(),
-                self.num_experts,
-                False,
-                False,
+            recv_hidden, recv_indices, recv_probs, recv_per_expert, handle = (
+                _DeepEPDispatch.apply(
+                    self.buffer,
+                    hidden_states,
+                    topk_indices,
+                    topk_scores.float(),
+                    self.num_experts,
+                    False,
+                    False,
+                )
             )
             self._handle = handle
             self._deepep_event = None
@@ -574,7 +665,9 @@ class TokenDispatcher:
             fused=self.moe_permute_fusion,
         )
         if torch.is_grad_enabled():
-            combined = _DeepEPCombine.apply(self.buffer, rank_grouped, self._handle, False, False)
+            combined = _DeepEPCombine.apply(
+                self.buffer, rank_grouped, self._handle, False, False
+            )
         else:
             combined = self.buffer.combine(rank_grouped, self._handle)
         if isinstance(combined, tuple):

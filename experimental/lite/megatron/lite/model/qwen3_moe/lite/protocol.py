@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 """Qwen3MoE lite impl — model protocol for Megatron Lite runtime.
 
 This file is the reference implementation of the Megatron Lite model protocol.
@@ -30,7 +31,11 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     pack_thd_forward_kwargs,
+)
+from megatron.lite.model.protocol_utils import (
     router_replay_roots as router_replay_roots,
+)
+from megatron.lite.model.protocol_utils import (
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
@@ -147,6 +152,8 @@ def build_model_config(source: str | Path | dict, **overrides) -> Qwen3MoEConfig
 
 def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
     kwargs = pack_thd_forward_kwargs(model, batch)
+    if "multi_lora_sidecars" in batch.extras:
+        kwargs["multi_lora_sidecars"] = batch.extras["multi_lora_sidecars"]
     add_loss_context_kwargs(kwargs, include_return_log_probs=True)
     add_cross_entropy_fusion(kwargs, model)
     return model(**kwargs)
@@ -154,9 +161,14 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
 
 def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
     labels = batch.labels.reshape(1, -1) if batch.labels is not None else None
-    return model(
-        input_ids=batch.input_ids.reshape(1, -1), labels=labels, packed_seq_params=None
-    )
+    kwargs = {
+        "input_ids": batch.input_ids.reshape(1, -1),
+        "labels": labels,
+        "packed_seq_params": None,
+    }
+    if "multi_lora_sidecars" in batch.extras:
+        kwargs["multi_lora_sidecars"] = batch.extras["multi_lora_sidecars"]
+    return model(**kwargs)
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
@@ -244,9 +256,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     lora_stats = (
         None
         if lora_spec.enabled
-        else apply_lora_to_chunks(
-            chunks, lora_spec, ps=ps, model_targets=LORA_TARGETS
-        )
+        else apply_lora_to_chunks(chunks, lora_spec, ps=ps, model_targets=LORA_TARGETS)
     )
 
     def _attach_lora_after_load():

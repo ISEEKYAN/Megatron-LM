@@ -1,0 +1,379 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""CPU contracts for the independent dense multi-LoRA primitive."""
+
+# isort: off
+import json
+from types import SimpleNamespace
+
+import megatron.lite.primitive.modules.multi_lora_reference as multi_lora_reference
+import pytest
+import torch
+import torch.nn as nn
+from megatron.lite.model.qwen3_moe.lite import multi_lora
+from megatron.lite.primitive.ckpt.hf_weights import VLLM_LORA_NAME_PREFIX
+from megatron.lite.primitive.modules import multi_lora_kernel
+from megatron.lite.primitive.modules.lora import LoraSpec
+from megatron.lite.primitive.modules.multi_lora import BatchedLoraDelta
+from megatron.lite.primitive.modules.multi_lora_bank import (
+    DenseLoraBank,
+    NamedLoraBankRegistry,
+    load_named_lora_adapter,
+    save_named_lora_adapter,
+)
+
+# isort: on
+
+
+def _inputs(dtype=torch.float64):
+    x = torch.tensor(
+        [[1.0, 2.0], [-1.0, 3.0], [2.0, -2.0]], dtype=dtype, requires_grad=True
+    )
+    a_bank = torch.tensor(
+        [[[1.0, 0.0], [0.0, 1.0]], [[2.0, 1.0], [-1.0, 1.0]]],
+        dtype=dtype,
+        requires_grad=True,
+    )
+    b_bank = torch.tensor(
+        [[[1.0, 2.0], [3.0, 4.0]], [[-1.0, 1.0], [2.0, 0.0]]],
+        dtype=dtype,
+        requires_grad=True,
+    )
+    indices = torch.tensor([0, 1, 1])
+    return x, a_bank, b_bank, indices
+
+
+def _assert_bf16_gradient_parity(actual, reference):
+    """Use a scale-aware BF16 criterion, calibrated against the Mint kernel."""
+    actual32, reference32 = actual.float(), reference.float()
+    error = (actual32 - reference32).abs()
+    reference_abs = reference32.abs()
+    reference_rms = reference32.square().mean().sqrt()
+    reference_max = reference_abs.max()
+    signal_floor = 0.01 * reference_rms
+    signal = reference_abs >= signal_floor
+    # Mint's BF16 grad_A reduction reaches one 0.25 output-ULP at p99 even
+    # when its RMS is small; retain the RMS scaling while admitting that floor.
+    p99_limit = torch.maximum(
+        0.0125 * reference_rms, torch.tensor(0.25, device=error.device)
+    )
+    assert torch.quantile(error, 0.99) <= p99_limit
+    assert error.max() <= 0.02 * reference_max
+    if signal.any():
+        relative = error[signal] / reference_abs[signal]
+        assert torch.quantile(relative, 0.99) <= 0.20
+    if (~signal).any():
+        assert error[~signal].max() <= 0.02 * reference_rms
+
+
+def test_batched_lora_delta_matches_dense_reference_for_sorted_slots():
+    x, a_bank, b_bank, indices = _inputs()
+
+    actual = BatchedLoraDelta.apply(x, a_bank, b_bank, indices, 0.25)
+    expected = multi_lora_reference.dense_lora_delta_reference(
+        x, a_bank, b_bank, indices, 0.25
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_batched_lora_delta_backward_matches_reference_for_repeated_slots():
+    x, a_bank, b_bank, _ = _inputs()
+    indices = torch.tensor([0, 1, 1])
+    grad_out = torch.tensor([[1.0, -2.0], [0.5, 3.0], [-1.0, 4.0]], dtype=x.dtype)
+
+    actual = BatchedLoraDelta.apply(x, a_bank, b_bank, indices, 0.75)
+    actual.backward(grad_out)
+    actual_grads = tuple(t.grad.detach().clone() for t in (x, a_bank, b_bank))
+
+    ref_x, ref_a, ref_b, _ = _inputs()
+    expected = multi_lora_reference.dense_lora_delta_reference(
+        ref_x, ref_a, ref_b, indices, 0.75
+    )
+    expected.backward(grad_out)
+
+    for actual_grad, reference_tensor in zip(
+        actual_grads, (ref_x, ref_a, ref_b), strict=True
+    ):
+        torch.testing.assert_close(actual_grad, reference_tensor.grad)
+
+
+def test_batched_lora_delta_passes_gradcheck():
+    x, a_bank, b_bank, _ = _inputs()
+    indices = torch.tensor([0, 1, 1])
+
+    assert torch.autograd.gradcheck(
+        lambda x_, a_, b_: BatchedLoraDelta.apply(x_, a_, b_, indices, 0.5),
+        (x, a_bank, b_bank),
+    )
+
+
+def test_dense_lora_bank_delegates_to_operator_without_copying_tensors():
+    x, a_bank, b_bank, indices = _inputs(dtype=torch.float32)
+    bank = DenseLoraBank(a_bank, b_bank)
+
+    assert bank.a_bank is a_bank
+    assert bank.b_bank is b_bank
+    torch.testing.assert_close(
+        bank.delta(x, indices, scale=2.0),
+        BatchedLoraDelta.apply(x, a_bank, b_bank, indices, 2.0),
+    )
+
+
+@pytest.mark.parametrize(("out_features", "expected"), [(128, False), (256, True)])
+def test_bgmv_fused_selection_uses_output_width_not_adapter_count(
+    out_features, expected
+):
+    """The fused choice is a property of N, not the bank's G dimension."""
+    assert multi_lora_kernel._use_fused_bgmv(out_features) is expected
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not multi_lora_kernel._TRITON_AVAILABLE,
+    reason="requires CUDA Triton BGMV",
+)
+@pytest.mark.parametrize(
+    ("dtype", "rtol", "atol"),
+    [(torch.float32, 2e-3, 2e-3), (torch.bfloat16, 8e-2, 5e-2)],
+)
+@pytest.mark.parametrize("out_features", [128, 256])
+def test_cuda_triton_bgmv_training_matches_independent_oracle(
+    monkeypatch, out_features, dtype, rtol, atol
+):
+    """Exercise both N launch regimes, dtypes, idle bank slot, and full backward."""
+    torch.manual_seed(7)
+    tokens, slots, rank, in_features = 5, 4, 8, 16
+    indices = torch.tensor([0, 0, 1, 2, 2], device="cuda", dtype=torch.int64)
+    values = [
+        torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
+        for shape in (
+            (tokens, in_features),
+            (slots, rank, in_features),
+            (slots, out_features, rank),
+        )
+    ]
+    x, a_bank, b_bank = values
+    backward_calls = 0
+    original_backward = multi_lora_kernel.multi_lora_bgmv.bgmv_bwd
+
+    def counted_backward(*args, **kwargs):
+        nonlocal backward_calls
+        backward_calls += 1
+        return original_backward(*args, **kwargs)
+
+    monkeypatch.setattr(multi_lora_kernel.multi_lora_bgmv, "bgmv_bwd", counted_backward)
+    actual = BatchedLoraDelta.apply(x, a_bank, b_bank, indices, 0.75)
+    reference_values = [value.detach().clone().requires_grad_(True) for value in values]
+    reference = multi_lora_reference.dense_lora_delta_reference(
+        *reference_values, indices, 0.75
+    )
+    torch.testing.assert_close(actual, reference, rtol=rtol, atol=atol)
+    grad_out = torch.randn_like(actual)
+    actual.backward(grad_out)
+    reference.backward(grad_out)
+    assert backward_calls == 1
+    for actual_value, reference_value in zip(values, reference_values, strict=True):
+        if dtype is torch.bfloat16:
+            _assert_bf16_gradient_parity(actual_value.grad, reference_value.grad)
+        else:
+            torch.testing.assert_close(
+                actual_value.grad, reference_value.grad, rtol=rtol, atol=atol
+            )
+    torch.testing.assert_close(a_bank.grad[3], torch.zeros_like(a_bank.grad[3]))
+    torch.testing.assert_close(b_bank.grad[3], torch.zeros_like(b_bank.grad[3]))
+
+
+def _named_registry():
+    return NamedLoraBankRegistry(
+        banks={
+            "model.layers.0.q_proj": DenseLoraBank(
+                torch.arange(12, dtype=torch.float32).view(2, 2, 3),
+                torch.arange(16, dtype=torch.float32).view(2, 4, 2),
+            ),
+            "model.layers.0.o_proj": DenseLoraBank(
+                torch.arange(12, 24, dtype=torch.float32).view(2, 2, 3),
+                torch.arange(16, 32, dtype=torch.float32).view(2, 4, 2),
+            ),
+        },
+        names={"alpha": 0, "bravo": 1},
+        rank=2,
+        alpha=4,
+        base_model_identity={"name": "tiny-qwen", "revision": "abc123"},
+        lora_spec=LoraSpec(enabled=True, rank=2, alpha=4, dropout=0.125),
+    )
+
+
+def test_named_registry_exports_only_explicit_slot_as_two_dimensional_peft_state():
+    registry = _named_registry()
+
+    state = registry.export_state("bravo")
+
+    assert set(state) == {
+        f"{VLLM_LORA_NAME_PREFIX}model.layers.0.q_proj.lora_A.weight",
+        f"{VLLM_LORA_NAME_PREFIX}model.layers.0.q_proj.lora_B.weight",
+        f"{VLLM_LORA_NAME_PREFIX}model.layers.0.o_proj.lora_A.weight",
+        f"{VLLM_LORA_NAME_PREFIX}model.layers.0.o_proj.lora_B.weight",
+    }
+    torch.testing.assert_close(
+        state[f"{VLLM_LORA_NAME_PREFIX}model.layers.0.q_proj.lora_A.weight"],
+        registry.banks["model.layers.0.q_proj"].a_bank[1],
+    )
+    assert (
+        state[f"{VLLM_LORA_NAME_PREFIX}model.layers.0.q_proj.lora_A.weight"].ndim == 2
+    )
+    assert registry.manifest("bravo")["slot"] == 1
+    assert registry.manifest("bravo")["name"] == "bravo"
+
+
+def test_named_registry_rejects_duplicate_or_unknown_slots():
+    bank = DenseLoraBank(torch.ones(2, 1, 1), torch.ones(2, 1, 1))
+    with pytest.raises(ValueError, match="duplicate"):
+        NamedLoraBankRegistry(
+            banks={"q_proj": bank},
+            names={"alpha": 0, "bravo": 0},
+            rank=1,
+            alpha=1,
+            base_model_identity={},
+        )
+    with pytest.raises(KeyError, match="Unknown"):
+        _named_registry().export_state("not-registered")
+
+
+def test_named_registry_roundtrip_writes_only_named_slot_and_validates_manifest(
+    tmp_path,
+):
+    source = _named_registry()
+    save_named_lora_adapter(source, "bravo", tmp_path)
+    config = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert config["r"] == source.lora_spec.rank
+    assert config["lora_alpha"] == source.lora_spec.alpha
+    assert config["lora_dropout"] == source.lora_spec.dropout
+    assert config["target_modules"] == ["o_proj", "q_proj"]
+    destination = _named_registry()
+    for bank in destination.banks.values():
+        bank.a_bank.zero_()
+        bank.b_bank.zero_()
+
+    load_named_lora_adapter(destination, "bravo", tmp_path)
+
+    for surface, source_bank in source.banks.items():
+        target_bank = destination.banks[surface]
+        torch.testing.assert_close(target_bank.a_bank[1], source_bank.a_bank[1])
+        torch.testing.assert_close(target_bank.b_bank[1], source_bank.b_bank[1])
+        torch.testing.assert_close(
+            target_bank.a_bank[0], torch.zeros_like(target_bank.a_bank[0])
+        )
+        torch.testing.assert_close(
+            target_bank.b_bank[0], torch.zeros_like(target_bank.b_bank[0])
+        )
+
+    manifest = source.manifest("bravo")
+    manifest["slot"] = 0
+    with pytest.raises(ValueError, match="slot"):
+        destination.load_state("bravo", source.export_state("bravo"), manifest)
+
+
+def test_named_registry_import_is_no_grad_and_rejects_shape_mismatch():
+    source = _named_registry()
+    destination = _named_registry()
+    for bank in destination.banks.values():
+        bank.a_bank.requires_grad_(True)
+        bank.b_bank.requires_grad_(True)
+
+    state = source.export_state("alpha")
+    destination.load_state("alpha", state, source.manifest("alpha"))
+
+    for bank in destination.banks.values():
+        assert bank.a_bank.grad_fn is None
+        assert bank.b_bank.grad_fn is None
+
+    bad_state = dict(state)
+    bad_state[f"{VLLM_LORA_NAME_PREFIX}model.layers.0.q_proj.lora_A.weight"] = (
+        torch.ones(1, 3)
+    )
+    with pytest.raises(ValueError, match="shape"):
+        destination.load_state("alpha", bad_state, source.manifest("alpha"))
+
+
+@pytest.mark.parametrize(
+    ("bad_indices", "message"),
+    [
+        (torch.tensor([0, 2, 1]), "out of range"),
+        (torch.tensor([-1, 0, 1]), "out of range"),
+        (torch.tensor([1, 0, 1]), "monotonically non-decreasing"),
+        (torch.tensor([0, 1, 1], dtype=torch.int32), "torch.int64"),
+        (torch.tensor([[0, 1, 0]]), "one-dimensional"),
+    ],
+)
+def test_batched_lora_delta_rejects_non_prototype_indices(bad_indices, message):
+    x, a_bank, b_bank, _ = _inputs()
+
+    with pytest.raises((IndexError, ValueError), match=message):
+        BatchedLoraDelta.apply(x, a_bank, b_bank, bad_indices, 1.0)
+    with pytest.raises((IndexError, ValueError), match=message):
+        multi_lora_reference.dense_lora_delta_reference(
+            x, a_bank, b_bank, bad_indices, 1.0
+        )
+
+
+def test_qwen_moe_sidecar_sorts_then_restores_unsorted_slots():
+    x = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    a_bank = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
+    b_bank = torch.tensor([[[2.0]], [[3.0]]])
+    slots = torch.tensor([1, 0, 1], dtype=torch.int64)
+    bank = DenseLoraBank(a_bank, b_bank)
+
+    actual = multi_lora.apply_dense_lora_delta(bank, x, slots, scale=1.0)
+    expected_rows = [
+        b_bank[slot] @ (a_bank[slot] @ row) for row, slot in zip(x, slots, strict=True)
+    ]
+    expected = torch.stack(expected_rows)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_ep_gradient_sync_is_identity_in_forward_and_all_reduces_in_backward(
+    monkeypatch,
+):
+    calls = []
+    param = torch.tensor([2.0], requires_grad=True)
+    group = object()
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda actual: 2)
+
+    def fake_all_reduce(grad, *, op, group):
+        calls.append((grad.clone(), op, group))
+        grad.add_(3.0)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    output = multi_lora._AllReduceGradient.apply(param, group)
+    torch.testing.assert_close(output, param)
+    output.sum().backward()
+
+    assert len(calls) == 1
+    assert calls[0][2] is group
+    torch.testing.assert_close(param.grad, torch.tensor([4.0]))
+
+
+@pytest.mark.parametrize(
+    ("etp_size", "use_deepep", "message"), [(2, False, "ETP"), (1, True, "DeepEP")]
+)
+def test_qwen_moe_sidecar_rejects_unverified_parallel_modes(
+    transformer_engine_import_stub, etp_size, use_deepep, message
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite.model import MoELayer
+
+    layer = MoELayer.__new__(MoELayer)
+    nn.Module.__init__(layer)
+    layer.ps = SimpleNamespace(etp_size=etp_size)
+    layer._use_deepep_requested = use_deepep
+    sidecar = multi_lora.MoELoraSidecar(
+        fc1=DenseLoraBank(torch.ones(1, 1, 2), torch.ones(1, 2, 1)),
+        fc2=DenseLoraBank(torch.ones(1, 1, 1), torch.ones(1, 2, 1)),
+        lora_indices=torch.zeros(1, dtype=torch.int64),
+        scale=1.0,
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        layer(torch.ones(1, 2), multi_lora_sidecar=sidecar)
