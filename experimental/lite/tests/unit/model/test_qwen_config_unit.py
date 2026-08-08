@@ -171,7 +171,13 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
     monkeypatch.setattr(model, "EPChunkForwardOp", FakeOp)
     monkeypatch.setattr(model, "EPChunkBackwardOp", FakeOp)
     monkeypatch.setattr(model, "EPChunkFusedForwardBackwardOp", FakeOp)
-    monkeypatch.setattr(model.torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(
+        model.torch.cuda,
+        "current_device",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("Qwen construction must not bind a CUDA device")
+        ),
+    )
 
     config = SimpleNamespace(
         num_experts=128,
@@ -192,6 +198,7 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
     assert all(
         workspace.key.shape_profile.max_input_rows == 33
         and workspace.key.shape_profile.max_recv_rows == 17 * 8
+        and workspace.key.device_index is None
         for workspace in workspaces
     )
     assert all(workspace.materialize_devices == [] for workspace in workspaces)
@@ -313,6 +320,43 @@ def test_qwen3_chunked_ep_requires_explicit_per_rank_token_capacity(
                 use_deepep=True,
                 enable_ep_chunk_overlap=True,
             ),
+        )
+
+
+@pytest.mark.parametrize(
+    "topk,max_rows,match",
+    [
+        (3, 8, "top-k must not exceed EP size"),
+        (2, 1, "ep_chunk_max_token_rows_per_rank >= 2"),
+    ],
+)
+def test_qwen3_moe_layer_direct_construction_reuses_chunk_policy_validation(
+    topk, max_rows, match, monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import model
+
+    monkeypatch.setattr(
+        model,
+        "TopKRouter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("policy validation must run before module construction")
+        ),
+    )
+    config = SimpleNamespace(
+        num_experts=8,
+        hidden_size=4,
+        num_experts_per_tok=topk,
+    )
+    ps = SimpleNamespace(ep_size=2, tp_ep_group=object())
+
+    with pytest.raises(ValueError, match=match):
+        model.MoELayer(
+            config,
+            ps,
+            use_deepep=True,
+            enable_ep_chunk_overlap=True,
+            ep_chunk_max_token_rows_per_rank=max_rows,
         )
 
 
@@ -534,6 +578,31 @@ def test_qwen3_full_recompute_initial_forward_runs_no_grad_then_fused_backward(
 
     torch.testing.assert_close(value.grad, torch.full_like(value, 3))
     assert calls == {"forward": 1, "backward": 0, "fused": 1}
+
+
+def test_qwen3_full_recompute_custom_function_forward_is_framework_no_grad(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite.model import (
+        _Qwen3EPChunkFullRecomputeFunction,
+    )
+
+    class Forward:
+        def __call__(self, value):
+            if torch.is_grad_enabled():
+                raise RuntimeError(
+                    "custom autograd Function.forward unexpectedly enabled grad"
+                )
+            return value * 2
+
+    layer = SimpleNamespace(ep_chunk_forward=Forward())
+    value = torch.randn(2, 4, requires_grad=True)
+
+    output = _Qwen3EPChunkFullRecomputeFunction.apply(value, layer)
+
+    assert output.requires_grad
+    assert output.grad_fn is not None
 
 
 def test_qwen3_chunked_ep_fails_loud_without_deepep_or_ep(

@@ -28,6 +28,9 @@ from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
     get_ep_chunk_workspace,
     release_ep_chunk_workspace,
 )
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
+    validate_ep_chunk_overlap_config,
+)
 from megatron.lite.primitive.modules.router import TopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
@@ -52,6 +55,12 @@ from megatron.lite.primitive.utils import build_fp8_recipe
 class _Qwen3EPChunkFullRecomputeFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, layer: "MoELayer", *params: torch.Tensor):
+        # torch.autograd.Function.apply runs forward with grad disabled. Keep this
+        # fail-loud guard because the initial full-recompute forward must not build a graph.
+        if torch.is_grad_enabled():
+            raise RuntimeError(
+                "Qwen3 full-recompute custom forward must run with grad disabled"
+            )
         del params
         ctx.layer = layer
         ctx.save_for_backward(x.detach())
@@ -85,6 +94,13 @@ class MoELayer(nn.Module):
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
+        validate_ep_chunk_overlap_config(
+            enable_ep_chunk_overlap,
+            use_deepep=use_deepep,
+            ep_size=ps.ep_size,
+            topk=config.num_experts_per_tok,
+            max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+        )
         # Match Qwen3-MoE's `load_balancing_type="none"` setting: no aux loss.
         self.router = TopKRouter(
             config, ps, router_bias_rate=router_bias_rate, compute_aux_loss=False
@@ -103,13 +119,7 @@ class MoELayer(nn.Module):
         self.ep_chunk_fused: EPChunkFusedForwardBackwardOp | None = None
         self.ep_chunk_full_recompute = ep_chunk_full_recompute
         if enable_ep_chunk_overlap:
-            if not use_deepep or ps.ep_size <= 1:
-                raise RuntimeError("Qwen3 ChunkedEP requires DeepEP and EP > 1")
-            if ep_chunk_max_token_rows_per_rank is None:
-                raise RuntimeError(
-                    "Qwen3 ChunkedEP requires ep_chunk_max_token_rows_per_rank"
-                )
-            device_index = torch.cuda.current_device()
+            assert ep_chunk_max_token_rows_per_rank is not None
             shape_profile = EPChunkShapeProfile.for_fixed_two_chunk_ep(
                 max_input_rows=ep_chunk_max_token_rows_per_rank,
                 hidden_size=config.hidden_size,
@@ -118,7 +128,9 @@ class MoELayer(nn.Module):
             )
             common_key = dict(
                 device_type="cuda",
-                device_index=device_index,
+                # Bind to the actual runtime tensor/explicit materialize device,
+                # after the CPU-constructed module has been moved to its rank device.
+                device_index=None,
                 ep_group_id=id(ps.tp_ep_group),
                 dtype=torch.bfloat16,
                 shape_profile=shape_profile,

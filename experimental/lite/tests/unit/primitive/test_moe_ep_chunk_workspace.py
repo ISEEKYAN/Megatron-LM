@@ -455,6 +455,72 @@ def test_workspace_lazily_owns_one_cuda_mem_pool_per_slot(
     assert workspace.evidence()["allocation_pool_count"] == 0
 
 
+def test_unbound_workspace_binds_to_first_runtime_stream_device(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    device_contexts = []
+
+    @contextmanager
+    def use_device(device):
+        device_contexts.append(torch.device(device))
+        yield
+
+    @contextmanager
+    def use_pool(_pool, device=None):
+        yield
+
+    monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
+    monkeypatch.setattr(overlap.torch.cuda, "MemPool", lambda **_kwargs: object())
+    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="forward",
+            device_type="cuda",
+            device_index=None,
+            ep_group_id=37,
+            dtype=torch.bfloat16,
+            shape_profile=profile_type(
+                max_input_rows=8,
+                hidden_size=4,
+                topk=2,
+                ep_size=2,
+            ),
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    stream = SimpleNamespace(device=torch.device("cuda", 5))
+
+    lease = workspace.acquire(0, stream=stream)
+
+    assert device_contexts == [torch.device("cuda", 5)]
+    assert workspace.evidence()["materialized_device"] == "cuda:5"
+    lease.release(_FakeEvent(ready=True))
+
+    with pytest.raises(RuntimeError, match="already materialized on cuda:5"):
+        workspace.acquire(1, stream=SimpleNamespace(device=torch.device("cuda", 6)))
+
+    workspace.release()
+    rebound = workspace.acquire(
+        0, stream=SimpleNamespace(device=torch.device("cuda", 6))
+    )
+    assert device_contexts == [torch.device("cuda", 5), torch.device("cuda", 6)]
+    assert workspace.evidence()["materialized_device"] == "cuda:6"
+    rebound.release(_FakeEvent(ready=True))
+
+
 def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
     transformer_engine_import_stub,
 ):
@@ -506,6 +572,7 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
         "deepep_buffer_count": 0,
         "deepep_buffer_resident_bytes": 0,
         "allocation_pool_count": 0,
+        "materialized_device": None,
         "caller_owned_recv_proven": False,
         "materialized": False,
     }

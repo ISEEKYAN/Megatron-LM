@@ -174,6 +174,7 @@ class EPChunkWorkspace:
         self._grows = 0
         self._waits = 0
         self._materialized = False
+        self._bound_device: torch.device | None = None
 
     def dispatcher(self, slot: int) -> TokenDispatcher:
         self._validate_slot(slot)
@@ -185,15 +186,11 @@ class EPChunkWorkspace:
     def materialize(self, *, device: torch.device | str | None = None) -> None:
         """Create this op's dispatchers and empty per-slot allocation pools."""
         if self._materialized:
+            self._validate_bound_device(device)
             return
         if self._registry is not None:
             self._registry._claim(self)
-        profile_device = self._profile_device()
-        if device is not None and torch.device(device) != profile_device:
-            raise RuntimeError(
-                f"EP chunk materialize device {torch.device(device)} does not match "
-                f"workspace key device {profile_device}"
-            )
+        profile_device = self._resolve_materialize_device(device)
         if self.key.device_type == "cuda":
             with torch.cuda.device(profile_device):
                 dispatchers = [
@@ -222,12 +219,16 @@ class EPChunkWorkspace:
         for chunk_idx, dispatcher in enumerate(dispatchers):
             self._slots[chunk_idx].dispatcher = dispatcher
             self._slots[chunk_idx].allocation_pool = allocation_pools[chunk_idx]
+        self._bound_device = profile_device
         self._materialized = True
 
     def acquire(self, slot: int, *, stream: Any | None = None) -> EPChunkWorkspaceLease:
         self._validate_slot(slot)
+        runtime_device = getattr(stream, "device", None)
         if not self._materialized:
-            self.materialize(device=self._profile_device())
+            self.materialize(device=runtime_device)
+        else:
+            self._validate_bound_device(runtime_device)
         state = self._slots[slot]
         if state.in_use:
             raise RuntimeError(f"EP chunk workspace slot {slot} is already leased")
@@ -279,6 +280,7 @@ class EPChunkWorkspace:
         self._runtime_allocations = 0
         self._grows = 0
         self._waits = 0
+        self._bound_device = None
         self._materialized = False
 
     def release(self, *, stream: Any | None = None) -> None:
@@ -294,9 +296,9 @@ class EPChunkWorkspace:
         state = self._slots[slot]
         if state.allocation_pool is None:
             raise RuntimeError("EP chunk CUDA allocation pool is not materialized")
-        with torch.cuda.use_mem_pool(
-            state.allocation_pool, device=self._profile_device()
-        ):
+        if self._bound_device is None:
+            raise RuntimeError("EP chunk workspace device is not materialized")
+        with torch.cuda.use_mem_pool(state.allocation_pool, device=self._bound_device):
             yield
 
     def _lease_tensor(
@@ -421,14 +423,50 @@ class EPChunkWorkspace:
             "allocation_pool_count": sum(
                 slot.allocation_pool is not None for slot in self._slots
             ),
+            "materialized_device": (
+                None if self._bound_device is None else str(self._bound_device)
+            ),
             "caller_owned_recv_proven": False,
             "materialized": self._materialized,
         }
 
-    def _profile_device(self) -> torch.device:
-        if self.key.device_index is None:
-            return torch.device(self.key.device_type)
-        return torch.device(self.key.device_type, self.key.device_index)
+    def _resolve_materialize_device(
+        self, device: torch.device | str | None
+    ) -> torch.device:
+        key_device = (
+            torch.device(self.key.device_type)
+            if self.key.device_index is None
+            else torch.device(self.key.device_type, self.key.device_index)
+        )
+        requested = key_device if device is None else torch.device(device)
+        if requested.type != self.key.device_type:
+            raise RuntimeError(
+                f"EP chunk materialize device {requested} does not match workspace "
+                f"device type {self.key.device_type}"
+            )
+        if (
+            self.key.device_index is not None
+            and requested.index != self.key.device_index
+        ):
+            raise RuntimeError(
+                f"EP chunk materialize device {requested} does not match workspace "
+                f"key device {key_device}"
+            )
+        if requested.type == "cuda" and requested.index is None:
+            requested = torch.device("cuda", torch.cuda.current_device())
+        return requested
+
+    def _validate_bound_device(self, device: torch.device | str | None) -> None:
+        if device is None:
+            return
+        requested = torch.device(device)
+        if requested.type == "cuda" and requested.index is None:
+            requested = torch.device("cuda", torch.cuda.current_device())
+        if requested != self._bound_device:
+            raise RuntimeError(
+                f"EP chunk workspace already materialized on {self._bound_device}, "
+                f"cannot use stream/device {requested}"
+            )
 
     @staticmethod
     def _validate_slot(slot: int) -> None:
