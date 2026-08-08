@@ -764,6 +764,33 @@ class ParamBucket:
         self._grad_ready_ids.clear()
         self._microbatch_reduced = True
 
+    def wait_for_inflight_grad_reduce(self) -> None:
+        """Drain already-launched reduce work without starting new work.
+
+        Exception teardown must not call :meth:`wait_grad_reduce`: that method
+        intentionally launches a missing reduction for the normal completion
+        path.  Here we only wait on work that exists, before its staging leases
+        and their shared allocator can be reclaimed.
+        """
+        error: BaseException | None = None
+        if self._grad_reduce_event is not None:
+            try:
+                self._grad_reduce_event.synchronize()
+            except BaseException as caught:
+                error = caught
+            finally:
+                self._grad_reduce_event = None
+        if self._grad_reduce_work is not None:
+            try:
+                self._grad_reduce_work.wait()
+            except BaseException as caught:
+                if error is None:
+                    error = caught
+            finally:
+                self._grad_reduce_work = None
+        if error is not None:
+            raise error
+
     def copy_full_parameters_to_shards(self) -> None:
         self.wait_param_gather()
         local_begin = self.rank * self.local_numel
@@ -1382,17 +1409,42 @@ class CommunicationPipelines:
         self.grad_reduce.finish()
 
     def abort(self) -> None:
-        """Exception teardown: drop allocator state without masking the error."""
+        """Best-effort two-phase exception teardown for shared communication storage."""
         self.grad_reduce.abort()
+
+        # Phase one drains work and drops every bucket lease.  Continue after a
+        # cleanup failure: a primary forward exception takes precedence, and
+        # force-clearing a shared allocator early would invalidate another
+        # bucket's live lease.
         for bucket in self.buckets:
-            bucket._grad_reduce_work = None
-            bucket._grad_reduce_event = None
+            try:
+                bucket.wait_for_inflight_grad_reduce()
+            except BaseException:
+                pass
             bucket._grad_reduce_launched = False
-            bucket._release_local_grad_comm_buffer()
-            bucket._release_full_main_grads()
-            bucket.release_full_parameters()
-            bucket.discard_full_parameter_views()
-            bucket.allocator.release_cached(force=True)
+            for release in (
+                bucket._release_local_grad_comm_buffer,
+                bucket._release_full_main_grads,
+                bucket.release_full_parameters,
+                bucket.discard_full_parameter_views,
+            ):
+                try:
+                    release()
+                except BaseException:
+                    pass
+
+        # Phase two force-clears each shared allocator once, after every lease
+        # that can refer to it has been released.
+        seen_allocators: set[int] = set()
+        for bucket in self.buckets:
+            allocator = bucket.allocator
+            if id(allocator) in seen_allocators:
+                continue
+            seen_allocators.add(id(allocator))
+            try:
+                allocator.release_cached(force=True)
+            except BaseException:
+                pass
 
     def reset_grad_state(self) -> None:
         self.grad_reduce.reset()

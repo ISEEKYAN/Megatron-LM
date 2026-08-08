@@ -1676,6 +1676,73 @@ def test_mfsdp_wrapper_aborts_busy_double_buffer_slots_after_forward_exception()
     assert getattr(allocator, "_busy", {}) == {}
 
 
+def test_mfsdp_wrapper_preserves_primary_forward_failure_when_cleanup_fails(
+    monkeypatch,
+):
+    """Secondary teardown errors must never replace the module failure."""
+    chunk, _optimizer = _single_rank_mfsdp_stack(
+        override_optimizer_config={"fsdp_double_buffer": True}
+    )
+
+    def fail_after_mfsdp_acquire(_module, _inputs):
+        raise RuntimeError("PRIMARY_FORWARD_FAILURE")
+
+    def fail_cleanup():
+        raise RuntimeError("SECONDARY_CLEANUP_FAILURE")
+
+    handle = chunk.module.unit1.register_forward_pre_hook(fail_after_mfsdp_acquire)
+    monkeypatch.setattr(chunk.param_sync, "abort", fail_cleanup)
+    monkeypatch.setattr(chunk.param_sync, "end_forward", fail_cleanup)
+    try:
+        with pytest.raises(RuntimeError, match="PRIMARY_FORWARD_FAILURE"):
+            chunk(torch.randn(3, 4))
+    finally:
+        handle.remove()
+
+
+def test_mfsdp_abort_waits_inflight_work_before_shared_allocator_clear(monkeypatch):
+    """Abort drains work and releases leases before clearing a shared allocator."""
+    chunk, _optimizer = _single_rank_mfsdp_stack(
+        override_optimizer_config={"fsdp_double_buffer": True}
+    )
+    bucket = chunk.param_sync.buckets[0]
+    bucket.get_main_grad(bucket.specs[0])
+
+    class InflightWork:
+        waited = False
+
+        def wait(self):
+            self.waited = True
+
+    class InflightEvent:
+        synchronized = False
+
+        def synchronize(self):
+            self.synchronized = True
+
+    work = InflightWork()
+    event = InflightEvent()
+    bucket._grad_reduce_work = work
+    bucket._grad_reduce_event = event
+    allocator = chunk.param_and_grad_buffer.allocator
+    release_cached = allocator.release_cached
+
+    def assert_drained_before_clear(*, force=False):
+        assert force is True
+        assert work.waited is True
+        assert event.synchronized is True
+        assert bucket._full_main_grad_lease is None
+        return release_cached(force=force)
+
+    monkeypatch.setattr(allocator, "release_cached", assert_drained_before_clear)
+    chunk.param_sync.abort()
+
+    assert bucket._grad_reduce_work is None
+    assert bucket._grad_reduce_event is None
+    assert getattr(allocator, "_slots", {}) == {}
+    assert getattr(allocator, "_busy", {}) == {}
+
+
 def test_mfsdp_grad_reduce_pending_queue_is_bounded_in_bytes():
     class PendingBucket:
         def __init__(self, full_numel: int):

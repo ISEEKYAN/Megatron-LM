@@ -137,6 +137,7 @@ class MegatronFSDP(nn.Module):
 
     def forward(self, *args, **kwargs):
         self.param_sync.begin_forward()
+        primary_failure = False
 
         def attach_backward(tensor: torch.Tensor) -> torch.Tensor:
             if not tensor.requires_grad:
@@ -155,13 +156,21 @@ class MegatronFSDP(nn.Module):
                     output,
                 )
         except BaseException:
+            primary_failure = True
             # A failed module forward can leave a registered double-buffer slot
-            # busy.  Teardown must preserve the original exception rather than
-            # replacing it with the allocator's active-slot guard.
-            self.param_sync.abort()
+            # busy.  Both cleanup phases are best-effort: neither may replace
+            # the original module failure.
+            try:
+                self.param_sync.abort()
+            except BaseException:
+                pass
             raise
         finally:
-            self.param_sync.end_forward()
+            try:
+                self.param_sync.end_forward()
+            except BaseException:
+                if not primary_failure:
+                    raise
         return output
 
     def start_param_sync(self, *_args, force_sync: bool = False, **_kwargs) -> None:
