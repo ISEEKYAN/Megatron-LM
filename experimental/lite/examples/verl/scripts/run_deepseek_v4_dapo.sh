@@ -54,6 +54,7 @@ ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}"
 PARAM_OFFLOAD="${PARAM_OFFLOAD:-True}"
 OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-True}"
 GRAD_OFFLOAD="${GRAD_OFFLOAD:-False}"
+MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-fsdp2}"
 
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-15}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-null}"
@@ -132,6 +133,15 @@ esac
 
 : "${TRAIN_FILES:?set TRAIN_FILES or DAPO_DATA_DIR}"
 : "${VAL_FILES:?set VAL_FILES or DAPO_DATA_DIR}"
+
+case "${MLITE_OPTIMIZER_BACKEND}" in
+  fsdp2|mfsdp)
+    ;;
+  *)
+    echo "MLITE_OPTIMIZER_BACKEND must be fsdp2 or mfsdp, got ${MLITE_OPTIMIZER_BACKEND}" >&2
+    exit 2
+    ;;
+esac
 
 MAX_SEQ_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 DEFAULT_RUN_NAME="ds4_dapo_pp${ACTOR_PP}_ep${ACTOR_EP}_cp${ACTOR_CP}"
@@ -226,7 +236,7 @@ ACTOR=(
   "actor_rollout_ref.actor.engine.grad_offload=${GRAD_OFFLOAD}"
   "actor_rollout_ref.actor.engine.attention_backend_override=fused"
   "actor_rollout_ref.actor.engine.impl_cfg.use_thd=True"
-  "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=fsdp2"
+  "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=${MLITE_OPTIMIZER_BACKEND}"
   "actor_rollout_ref.actor.engine.load_hf_weights=True"
   "+actor_rollout_ref.actor.engine.cross_entropy_fusion=True"
   "actor_rollout_ref.actor.engine.resync_format=${ROLLOUT_RESYNC_FORMAT}"

@@ -23,12 +23,12 @@ if str(_EXPERIMENTAL_LITE_ROOT) not in sys.path:
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(_REPO_ROOT))
 
-from examples.bench.results import StepTrace
-from examples.bench.session import PretrainSessionConfig, run_pretrain_session
-from megatron.lite.runtime import RuntimeConfig, create_runtime
-from megatron.lite.runtime.backends.bridge.config import BridgeConfig
-from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
+from examples.bench.results import StepTrace  # noqa: E402
+from examples.bench.session import PretrainSessionConfig, run_pretrain_session  # noqa: E402
+from megatron.lite.runtime import RuntimeConfig, create_runtime  # noqa: E402
+from megatron.lite.runtime.backends.bridge.config import BridgeConfig  # noqa: E402
+from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig  # noqa: E402
+from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig  # noqa: E402
 
 
 @dataclass
@@ -79,7 +79,9 @@ def _json_mapping(raw: str, *, name: str) -> dict[str, Any]:
 
 
 def _parallel_config(cfg: BenchCliConfig) -> ParallelConfig:
-    return ParallelConfig(tp=cfg.tp, etp=cfg.etp, ep=cfg.ep, pp=cfg.pp, vpp=cfg.vpp, cp=cfg.cp)
+    return ParallelConfig(
+        tp=cfg.tp, etp=cfg.etp, ep=cfg.ep, pp=cfg.pp, vpp=cfg.vpp, cp=cfg.cp
+    )
 
 
 def _optimizer_config(cfg: BenchCliConfig) -> OptimizerConfig:
@@ -142,11 +144,17 @@ def _make_mlite_model_config_hook(cfg: BenchCliConfig):
             old_num = getattr(model_cfg, "num_experts", None)
             old_topk = getattr(model_cfg, "num_experts_per_tok", None)
             if old_num is None or old_topk is None:
-                raise ValueError("keep_experts requires model config with MoE expert metadata.")
+                raise ValueError(
+                    "keep_experts requires model config with MoE expert metadata."
+                )
             if keep_experts <= 0 or keep_experts > old_num:
-                raise ValueError(f"keep_experts must be in [1, {old_num}], got {keep_experts}.")
+                raise ValueError(
+                    f"keep_experts must be in [1, {old_num}], got {keep_experts}."
+                )
             return replace(
-                model_cfg, num_experts=keep_experts, num_experts_per_tok=min(old_topk, keep_experts)
+                model_cfg,
+                num_experts=keep_experts,
+                num_experts_per_tok=min(old_topk, keep_experts),
             )
 
         hooks.append(keep_experts_hook)
@@ -195,9 +203,13 @@ def _make_bridge_post_init_hook(cfg: BenchCliConfig):
             old_num = getattr(hf_cfg, "num_experts", None)
             old_topk = getattr(hf_cfg, "num_experts_per_tok", None)
             if old_num is None or old_topk is None:
-                raise ValueError("keep_experts requires HF config with MoE expert metadata.")
+                raise ValueError(
+                    "keep_experts requires HF config with MoE expert metadata."
+                )
             if keep_experts <= 0 or keep_experts > old_num:
-                raise ValueError(f"keep_experts must be in [1, {old_num}], got {keep_experts}.")
+                raise ValueError(
+                    f"keep_experts must be in [1, {old_num}], got {keep_experts}."
+                )
             hf_cfg.num_experts = keep_experts
             hf_cfg.num_experts_per_tok = min(old_topk, keep_experts)
             _refresh_bridge_config(bridge)
@@ -221,7 +233,9 @@ def _make_bridge_post_init_hook(cfg: BenchCliConfig):
             hf_cfg = _get_bridge_config_root(bridge)
             old_layers = getattr(hf_cfg, "num_hidden_layers", None)
             if old_layers is None:
-                raise ValueError("truncate_layers requires HF config with num_hidden_layers.")
+                raise ValueError(
+                    "truncate_layers requires HF config with num_hidden_layers."
+                )
             if keep_layers <= 0 or keep_layers > old_layers:
                 raise ValueError(
                     f"truncate_layers must be in [1, {old_layers}], got {keep_layers}."
@@ -259,7 +273,9 @@ def _make_bridge_post_init_hook(cfg: BenchCliConfig):
 def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
     parallel = _parallel_config(cfg)
     optimizer = _optimizer_config(cfg)
-    optimizer_overrides = _json_mapping(cfg.override_optimizer_json, name="override_optimizer_json")
+    optimizer_overrides = _json_mapping(
+        cfg.override_optimizer_json, name="override_optimizer_json"
+    )
 
     if cfg.backend == "mlite":
         for key, value in optimizer_overrides.items():
@@ -292,7 +308,9 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             use_thd=cfg.use_thd,
             load_hf_weights=not cfg.skip_load_hf_weights,
             build_optimizer=not cfg.skip_optimizer_build,
-            override_ddp_config=_json_mapping(cfg.override_ddp_json, name="override_ddp_json"),
+            override_ddp_config=_json_mapping(
+                cfg.override_ddp_json, name="override_ddp_json"
+            ),
             override_transformer_config=_json_mapping(
                 cfg.override_transformer_json, name="override_transformer_json"
             ),
@@ -300,9 +318,13 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             bridge_post_init=_make_bridge_post_init_hook(cfg),
         )
     else:
-        raise ValueError(f"backend must be 'mlite', 'bridge', or 'mbridge', got {cfg.backend!r}.")
+        raise ValueError(
+            f"backend must be 'mlite', 'bridge', or 'mbridge', got {cfg.backend!r}."
+        )
 
-    return RuntimeConfig(backend=cfg.backend, hf_path=cfg.hf_path, backend_cfg=backend_cfg)
+    return RuntimeConfig(
+        backend=cfg.backend, hf_path=cfg.hf_path, backend_cfg=backend_cfg
+    )
 
 
 def build_session_config(cfg: BenchCliConfig) -> PretrainSessionConfig:
@@ -321,7 +343,10 @@ def build_session_config(cfg: BenchCliConfig) -> PretrainSessionConfig:
 
 def _to_jsonable(value: Any) -> Any:
     if is_dataclass(value):
-        return {field.name: _to_jsonable(getattr(value, field.name)) for field in fields(value)}
+        return {
+            field.name: _to_jsonable(getattr(value, field.name))
+            for field in fields(value)
+        }
     if isinstance(value, dict):
         return {str(k): _to_jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -364,6 +389,7 @@ def _step_reporter(trace: StepTrace) -> None:
         f"loss={trace.loss:.6f}",
         f"grad_norm={trace.grad_norm:.6f}",
         f"step_ms={trace.step_ms:.3f}",
+        f"optimizer_step_ms={trace.optimizer_step_ms:.3f}",
         f"peak_mem_gb={(trace.peak_mem_gb or 0.0):.3f}",
     ]
     if trace.tflops_per_gpu is not None:
@@ -386,7 +412,9 @@ def run(cfg: BenchCliConfig) -> dict[str, Any]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=["mlite", "bridge", "mbridge"], default="mlite")
+    parser.add_argument(
+        "--backend", choices=["mlite", "bridge", "mbridge"], default="mlite"
+    )
     parser.add_argument("--hf-path", default="")
     parser.add_argument("--model-name", default="qwen3_moe")
     parser.add_argument("--impl", default="lite")

@@ -183,8 +183,9 @@ class _StandaloneOptimizer:
             coefficient = min(1.0, self.clip_grad / (float(total_norm.item()) + 1.0e-6))
             if coefficient < 1.0:
                 for param in self.params:
-                    if param.grad is not None:
-                        param.grad.mul_(coefficient)
+                    grad = getattr(param, "main_grad", param.grad)
+                    if grad is not None:
+                        grad.mul_(coefficient)
         return float(total_norm.float().item())
 
     def state_dict(self) -> dict[str, Any]:
@@ -220,9 +221,7 @@ class _StandaloneOptimizer:
                 for group, group_values in zip(
                     self.optimizer.param_groups, param_values, strict=True
                 ):
-                    for param, value in zip(
-                        group["params"], group_values, strict=True
-                    ):
+                    for param, value in zip(group["params"], group_values, strict=True):
                         param.copy_(value.to(device=param.device, dtype=param.dtype))
 
     def offload_state_to_cpu(self) -> None:
@@ -249,8 +248,9 @@ class _StandaloneOptimizer:
             return
         if self.expert_grad_scale != 1.0:
             for param in self.expert_params:
-                if param.grad is not None:
-                    param.grad.mul_(self.expert_grad_scale)
+                grad = getattr(param, "main_grad", param.grad)
+                if grad is not None:
+                    grad.mul_(self.expert_grad_scale)
         self._expert_grads_scaled = True
 
     def _sync_tp_replicated_grads_once(self) -> None:
@@ -258,9 +258,10 @@ class _StandaloneOptimizer:
             return
         group = getattr(self.ps, "tp_group", None)
         for param in self.tp_replicated_params:
-            if param.grad is not None:
+            grad = getattr(param, "main_grad", param.grad)
+            if grad is not None:
                 _all_reduce_grad_if_distributed(
-                    param.grad,
+                    grad,
                     group,
                     average=bool(
                         getattr(param, "average_gradients_across_tp_domain", False)
@@ -572,6 +573,9 @@ def _split_param_groups_by_fraction(
     offload_fraction: float,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split param groups so the first *offload_fraction* of numel goes to CPU."""
+    if offload_fraction == 1.0:
+        return [], [dict(group) for group in param_groups]
+
     total_numel = sum(p.numel() for g in param_groups for p in g["params"])
     cpu_numel_target = int(total_numel * offload_fraction)
 

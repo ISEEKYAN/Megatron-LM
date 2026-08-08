@@ -19,7 +19,7 @@ def local_grad_sq_sum(
     resolved_dtype = resolve_torch_dtype(dtype)
     total: torch.Tensor | None = None
     for param in params:
-        grad = param.grad
+        grad = getattr(param, "main_grad", param.grad)
         if grad is None:
             continue
         local_grad = to_local_tensor(grad)

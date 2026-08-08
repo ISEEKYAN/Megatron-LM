@@ -23,6 +23,7 @@ SCRIPT = (
     (
         "weight_bits",
         "enable_r3",
+        "optimizer_backend",
         "expert_dtype",
         "resync_format",
         "moe_backend",
@@ -31,10 +32,21 @@ SCRIPT = (
         "rollout_replay",
     ),
     [
-        ("4", "True", "fp4", "mxfp4", "marlin", "ue8m0", "R3", "True"),
+        (
+            "4",
+            "True",
+            "mfsdp",
+            "fp4",
+            "mxfp4",
+            "marlin",
+            "ue8m0",
+            "R3",
+            "True",
+        ),
         (
             "8",
             "False",
+            "fsdp2",
             "fp8",
             "block_fp8",
             "flashinfer_cutlass",
@@ -48,6 +60,7 @@ def test_ds4_dapo_weight_and_r3_knobs(
     tmp_path: Path,
     weight_bits: str,
     enable_r3: str,
+    optimizer_backend: str,
     expert_dtype: str,
     resync_format: str,
     moe_backend: str,
@@ -66,6 +79,7 @@ def test_ds4_dapo_weight_and_r3_knobs(
         "VAL_FILES": str(tmp_path / "val.parquet"),
         "ROLLOUT_WEIGHT_BITS": weight_bits,
         "ENABLE_R3": enable_r3,
+        "MLITE_OPTIMIZER_BACKEND": optimizer_backend,
         "DRY_RUN": "1",
     }
     result = subprocess.run(
@@ -79,7 +93,9 @@ def test_ds4_dapo_weight_and_r3_knobs(
     assert f"quantization_config.scale_fmt={scale_fmt}" in command
     assert f"router_replay_mode={router_mode}" in command
     assert f"enable_rollout_routing_replay={rollout_replay}" in command
-    assert "actor_rollout_ref.actor.engine.impl_cfg.optimizer=fsdp2" in command
+    assert (
+        f"actor_rollout_ref.actor.engine.impl_cfg.optimizer={optimizer_backend}" in command
+    )
     assert "actor_rollout_ref.actor.engine.attention_backend_override=fused" in command
     assert "actor_rollout_ref.rollout.enforce_eager=True" in command
     assert "algorithm.rollout_correction.bypass_mode=False" in command

@@ -65,9 +65,7 @@ def _resolve_vocab_size(handle: ModelHandle) -> int:
     return 151936
 
 
-def _infinite_packed_batches(
-    vocab_size: int, seq_len: int, *, device: str, seed: int
-):
+def _infinite_packed_batches(vocab_size: int, seq_len: int, *, device: str, seed: int):
     """Yield raw, model-agnostic :class:`PackedBatch` objects for the bench.
 
     The bench is the single source of truth for one unpadded packed batch (1-D
@@ -82,7 +80,9 @@ def _infinite_packed_batches(
     seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
     while True:
         yield PackedBatch(
-            input_ids=torch.randint(0, vocab_size, (seq_len,), device=device, generator=g),
+            input_ids=torch.randint(
+                0, vocab_size, (seq_len,), device=device, generator=g
+            ),
             labels=torch.randint(0, vocab_size, (seq_len,), device=device, generator=g),
             seq_lens=seq_lens.clone(),
         )
@@ -91,7 +91,9 @@ def _infinite_packed_batches(
 def _make_data_iter(handle: ModelHandle, cfg: PretrainSessionConfig):
     data_seed = cfg.seed if cfg.same_data_across_dp else cfg.seed + handle.dp_rank
     vocab_size = _resolve_vocab_size(handle)
-    return _infinite_packed_batches(vocab_size, cfg.seq_len, device=cfg.device, seed=data_seed)
+    return _infinite_packed_batches(
+        vocab_size, cfg.seq_len, device=cfg.device, seed=data_seed
+    )
 
 
 def _calc_tflops_per_gpu(
@@ -176,6 +178,7 @@ def run_pretrain_session(
 
     step_traces: list[StepTrace] = []
     timings: list[float] = []
+    optimizer_timings: list[float] = []
 
     _reset_peak_memory(cfg.device)
     with rt.train_mode(handle):
@@ -191,8 +194,13 @@ def run_pretrain_session(
             )
             if cfg.no_optimizer:
                 grad_norm = 0.0
+                optimizer_elapsed_ms = 0.0
             else:
+                _sync(cfg.device)
+                optimizer_t0 = time.perf_counter()
                 _, grad_norm, _ = rt.optimizer_step(handle)
+                _sync(cfg.device)
+                optimizer_elapsed_ms = (time.perf_counter() - optimizer_t0) * 1000
                 rt.lr_scheduler_step(handle)
             _sync(cfg.device)
 
@@ -209,6 +217,7 @@ def run_pretrain_session(
                 loss=float(result.metrics.get("loss", result.model_output.loss) or 0.0),
                 grad_norm=float(grad_norm),
                 step_ms=elapsed_ms,
+                optimizer_step_ms=optimizer_elapsed_ms,
                 peak_mem_gb=_peak_memory_gb(cfg.device),
                 tflops_per_gpu=tflops_per_gpu,
             )
@@ -216,10 +225,14 @@ def run_pretrain_session(
                 step_reporter(trace)
             if step >= cfg.warmup:
                 timings.append(elapsed_ms)
+                optimizer_timings.append(optimizer_elapsed_ms)
                 trace.step = step - cfg.warmup
                 step_traces.append(trace)
 
     avg_step_ms = sum(timings) / len(timings) if timings else 0.0
+    avg_optimizer_step_ms = (
+        sum(optimizer_timings) / len(optimizer_timings) if optimizer_timings else 0.0
+    )
     avg_step_s = avg_step_ms / 1000
     tok_per_s = tokens_per_step / avg_step_s if avg_step_s > 0 else 0.0
     avg_tflops = _calc_tflops_per_gpu(
@@ -239,7 +252,11 @@ def run_pretrain_session(
         impl=getattr(config, "impl", "bridge"),
         optimizer_backend=handle._extras.get(
             "optimizer_backend",
-            getattr(handle._optimizer, "name", "none") if handle._optimizer is not None else "none",
+            (
+                getattr(handle._optimizer, "name", "none")
+                if handle._optimizer is not None
+                else "none"
+            ),
         ),
         tp=parallel.tp,
         etp=parallel.etp,
@@ -251,6 +268,7 @@ def run_pretrain_session(
         num_microbatches=cfg.num_microbatches,
         step_traces=step_traces,
         avg_step_ms=avg_step_ms,
+        avg_optimizer_step_ms=avg_optimizer_step_ms,
         peak_mem_gb=_peak_memory_gb(cfg.device),
         tok_per_s=tok_per_s,
         tok_per_s_per_gpu=tok_per_s / world_size,

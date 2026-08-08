@@ -152,6 +152,24 @@ Compare `loss`, `grad_norm`, `avg_step_ms`, `tok_per_s`, peak memory, and
 `tflops_per_gpu` in the two JSON outputs. Benchmarks are performance evidence;
 they are not a replacement for precision tests.
 
+## M-FSDP CPU-offload Benchmark
+
+Use the single-arm script when optimizing M-FSDP CPU offload. It fixes the
+optimizer backend to `mfsdp` and the offload fraction to `1.0`, reports both
+end-to-end `avg_step_ms` and isolated `avg_optimizer_step_ms`, and refuses a
+real GPU run outside Slurm. Keep its workload variables unchanged when
+comparing optimization commits.
+
+```bash
+HF_PATH=/models/Qwen3.5-35B-A3B \
+DRY_RUN=1 \
+bash experimental/lite/examples/bench/scripts/run_qwen35_mfsdp_offload.sh
+```
+
+For a real run, set `DRY_RUN=0`, `WANDB_PROJECT`, and the fixed workload
+variables in the Slurm job. The script writes the full per-step JSON/log and
+prints the W&B run URL after publishing the two timing metrics.
+
 ## Deterministic Correctness
 
 Use `correctness.py` for strict deterministic parity. It emits exact scalar
