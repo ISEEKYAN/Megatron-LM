@@ -28,6 +28,9 @@ def _build_optimizer(
     ("param_dtype", "model_dtype", "cpu_update", "aliases_param"),
     [
         pytest.param(torch.float32, torch.float32, False, True, id="fp32-shards"),
+        pytest.param(
+            torch.float32, torch.bfloat16, False, True, id="bf16-model-fp32-shards"
+        ),
         pytest.param(torch.bfloat16, None, False, False, id="non-fp32-shards"),
         pytest.param(torch.float32, torch.float32, True, False, id="cpu-update"),
     ],
@@ -46,16 +49,31 @@ def test_fp32_adamw_master_storage_ownership_cpu(
     assert master.nbytes == param.numel() * torch.float32.itemsize
 
 
-def test_fp32_adamw_keeps_master_when_copyback_casts_cpu():
-    param = nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
-    optimizer = _build_optimizer(param, model_dtype=torch.bfloat16)
-    master = optimizer.state[param]["master_param"]
-    param.grad = torch.tensor([0.1234567], dtype=torch.float32)
-    optimizer.step()
+def test_fp32_shard_shared_master_skips_bf16_copyback_cpu():
+    initial = torch.tensor([1.0], dtype=torch.float32)
+    shared_param = nn.Parameter(initial.clone())
+    reference_param = nn.Parameter(initial.clone())
+    shared_optimizer = _build_optimizer(shared_param, model_dtype=torch.bfloat16)
+    reference_optimizer = _build_optimizer(reference_param, model_dtype=torch.bfloat16)
+    reference_optimizer.state[reference_param][
+        "master_param"
+    ] = reference_param.detach().clone()
+    shared_master = shared_optimizer.state[shared_param]["master_param"]
+    reference_master = reference_optimizer.state[reference_param]["master_param"]
 
-    assert master.data_ptr() != param.data_ptr()
-    assert torch.equal(param, master.to(torch.bfloat16).to(torch.float32))
-    assert not torch.equal(param, master)
+    assert shared_master.data_ptr() == shared_param.data_ptr()
+    grad = torch.tensor([0.1234567], dtype=torch.float32)
+    shared_param.grad = grad.clone()
+    reference_param.grad = grad.clone()
+    shared_optimizer.step()
+    reference_optimizer.step()
+
+    assert torch.equal(shared_master, reference_master)
+    assert torch.equal(shared_param, shared_master)
+    assert torch.equal(
+        reference_param, reference_master.to(torch.bfloat16).to(torch.float32)
+    )
+    assert not torch.equal(reference_param, reference_master)
 
 
 def test_fp32_adamw_shared_master_matches_cloned_reference_for_20_steps_cpu():

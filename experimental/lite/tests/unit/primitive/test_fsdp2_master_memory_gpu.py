@@ -54,7 +54,7 @@ def test_fp32_master_memory_saves_one_parameter_cuda():
                 FP32AdamW, "_init_master_param", FP32AdamW._init_master_param
             )
         with context:
-            optimizer = _build_optimizer(param, model_dtype=torch.float32)
+            optimizer = _build_optimizer(param, model_dtype=torch.bfloat16)
         torch.cuda.synchronize(device)
         stats = torch.cuda.memory_stats(device)
         resident = stats["allocated_bytes.all.current"] - param_bytes
@@ -83,7 +83,7 @@ def test_fp32_master_memory_saves_one_parameter_cuda():
 
 def test_fp32_master_three_configurations_cuda():
     fp32_param = nn.Parameter(torch.ones(8, device="cuda", dtype=torch.float32))
-    fp32_optimizer = _build_optimizer(fp32_param, model_dtype=torch.float32)
+    fp32_optimizer = _build_optimizer(fp32_param, model_dtype=torch.bfloat16)
     assert (
         fp32_optimizer.state[fp32_param]["master_param"].data_ptr()
         == fp32_param.data_ptr()
