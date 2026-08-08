@@ -30,6 +30,7 @@ from megatron.lite.primitive.optimizers.mfsdp.config import (
     group_size,
 )
 
+
 class NCCLUserBuffer:
     """Apex NCCL memory-pool adapter required when ``nccl_ub`` is enabled."""
 
@@ -407,6 +408,8 @@ class ParamBucket:
                 # TE returns a dummy ``.grad`` when its wgrad GEMM writes the
                 # real gradient directly into ``main_grad``.
                 spec.full_param.grad_added_to_main_grad = False
+                spec.full_param.__fsdp_param__ = True
+                spec.full_param.overwrite_main_grad = True
                 spec.full_param.get_main_grad = self._make_main_grad_getter(spec)
                 spec.full_param.register_post_accumulate_grad_hook(
                     self._make_grad_ready_hook(spec)
@@ -425,6 +428,10 @@ class ParamBucket:
                 spec.shape
             )
             spec.full_param.data = view
+            # TE checks these MCore FSDP markers before using the lazy FP32
+            # wgrad destination, so restore them on every materialization.
+            spec.full_param.__fsdp_param__ = True
+            spec.full_param.overwrite_main_grad = True
             for binding in spec.bindings:
                 setattr(binding.module, binding.attribute, spec.full_param)
 
@@ -1222,9 +1229,10 @@ class GradReducePipeline:
         self._pending_bytes += byte_count
 
     def _drain_for(self, bucket: ParamBucket) -> None:
-        byte_count = bucket.full_numel * torch.empty(
-            (), dtype=bucket.policy.grad_comm_dtype
-        ).element_size()
+        byte_count = (
+            bucket.full_numel
+            * torch.empty((), dtype=bucket.policy.grad_comm_dtype).element_size()
+        )
         self._pending_capacity_bytes = max(self._pending_capacity_bytes, 2 * byte_count)
         while (
             self._pending

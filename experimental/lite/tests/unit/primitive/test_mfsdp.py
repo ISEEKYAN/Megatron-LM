@@ -71,7 +71,12 @@ class _FusedMainGradLinearFunction(torch.autograd.Function):
             .matmul(value.float().reshape(-1, value.shape[-1]))
         )
         if ctx.fuse_wgrad_accumulation:
-            ctx.weight.get_main_grad().add_(grad_weight)
+            main_grad = (
+                ctx.weight.get_main_grad()
+                if hasattr(ctx.weight, "__fsdp_param__")
+                else ctx.weight.main_grad
+            )
+            main_grad.add_(grad_weight)
             ctx.weight.grad_added_to_main_grad = True
             grad_weight = torch.zeros_like(weight)
         return grad_input, grad_weight, None
@@ -468,9 +473,7 @@ def test_mfsdp_config_enables_double_buffer_for_nccl_user_buffers():
 def test_mfsdp_config_keeps_double_buffer_opt_in_without_nccl_user_buffers():
     config = mfsdp_config.build_mfsdp_config(
         SimpleNamespace(
-            override_optimizer_config={
-                "mfsdp_sharding_strategy": "optim_grads_params",
-            }
+            override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"}
         )
     )
 
@@ -481,11 +484,7 @@ def test_mfsdp_config_keeps_double_buffer_opt_in_without_nccl_user_buffers():
 def test_mfsdp_temporary_lease_physically_releases_storage():
     allocator = mfsdp_buffer.TemporaryBufferAllocator()
     lease = allocator.allocate(
-        32,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        group=None,
-        key=("grad",),
+        32, dtype=torch.float32, device=torch.device("cpu"), group=None, key=("grad",)
     )
 
     assert lease.tensor.untyped_storage().nbytes() == 32 * 4
@@ -1498,6 +1497,59 @@ def test_mfsdp_dtype_conversion_buffers_are_collective_scoped():
     assert torch.count_nonzero(bucket.main_grad_buffer) == bucket.local_numel
 
 
+def test_mfsdp_full_param_installs_mcore_te_lazy_main_grad_protocol():
+    """TE must recognize and materialize the released full-param lazy grad."""
+    model = torch.nn.Linear(4, 3, bias=False, dtype=torch.bfloat16)
+    groups = mfsdp_buffer.MFSDPProcessGroups(
+        dense_dp=None,
+        expert_dp=None,
+        dense_ag=None,
+        expert_ag=None,
+        tp=None,
+        etp=None,
+        ep=None,
+        pp=None,
+    )
+    bucket = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=groups,
+        config=mfsdp_config.MFSDPConfig(bucket_size=None),
+        is_expert=lambda _name: False,
+        unit_modules=(),
+    ).buckets[0]
+    spec = bucket.specs[0]
+    assert spec.full_param.__fsdp_param__ is True
+    assert spec.full_param.overwrite_main_grad is True
+    assert callable(spec.full_param.get_main_grad)
+
+    # Simulate a released full parameter and the next all-gather/install cycle.
+    bucket.release_full_parameters()
+    bucket.wait_param_gather()
+    spec.full_param.__fsdp_param__ = False
+    spec.full_param.overwrite_main_grad = False
+    bucket.install_full_parameters()
+
+    assert spec.full_param.__fsdp_param__ is True
+    assert spec.full_param.overwrite_main_grad is True
+    getter = spec.full_param.get_main_grad
+    calls = 0
+
+    def counted_getter():
+        nonlocal calls
+        calls += 1
+        return getter()
+
+    spec.full_param.get_main_grad = counted_getter
+    main_grad = spec.full_param.get_main_grad()
+
+    assert calls == 1
+    assert main_grad is spec.full_param.main_grad
+    assert main_grad.shape == spec.full_param.shape
+    assert main_grad.dtype is torch.float32
+    assert main_grad.is_contiguous()
+    assert main_grad.numel() == spec.full_param.numel()
+
+
 def test_mfsdp_reduce_scatters_each_microbatch_into_sharded_accumulation():
     torch.manual_seed(321)
     reference = _GlooModel()
@@ -1623,7 +1675,9 @@ def test_mfsdp_double_buffer_enforces_two_inflight_bucket_slots_for_nccl_ub():
     assert len({bucket.full_numel for bucket in buckets}) > 1
     assert len(buckets) > 2
     first, second = buckets[:2]
-    third = next(bucket for bucket in buckets[2:] if bucket.full_numel != first.full_numel)
+    third = next(
+        bucket for bucket in buckets[2:] if bucket.full_numel != first.full_numel
+    )
 
     # Model the two completed-but-not-yet-retired reduce-scatter operations that
     # occupy the allocator's two main-grad slots.  The old implementation called
@@ -1639,7 +1693,9 @@ def test_mfsdp_double_buffer_enforces_two_inflight_bucket_slots_for_nccl_ub():
         (first, first.full_numel * first.full_main_grad_buffer.element_size()),
         (second, second.full_numel * second.full_main_grad_buffer.element_size()),
     ]
-    pipeline._pending_bytes = sum(byte_count for _bucket, byte_count in pipeline._pending)
+    pipeline._pending_bytes = sum(
+        byte_count for _bucket, byte_count in pipeline._pending
+    )
     assert len(pipeline._pending) == 2
     assert third.config.fsdp_double_buffer is True
     assert third.before_main_grad_allocate is not None
@@ -1804,9 +1860,7 @@ def test_mfsdp_materializes_root_params_used_without_calling_their_leaf_module()
         adam_beta1=0.9,
         adam_beta2=0.999,
         adam_eps=1.0e-8,
-        override_optimizer_config={
-            "mfsdp_sharding_strategy": "optim_grads_params",
-        },
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
     )
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [candidate],
@@ -1853,9 +1907,7 @@ def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
         adam_beta1=0.9,
         adam_beta2=0.999,
         adam_eps=1.0e-8,
-        override_optimizer_config={
-            "mfsdp_sharding_strategy": "optim_grads_params",
-        },
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
     )
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [model],
