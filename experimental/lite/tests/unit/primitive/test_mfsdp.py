@@ -1549,6 +1549,8 @@ def test_mfsdp_reduce_scatters_each_microbatch_into_sharded_accumulation():
     microbatches = [
         (torch.randn(3, 4), torch.randn(3, 2)),
         (torch.randn(2, 4), torch.randn(2, 2)),
+        (torch.randn(5, 4), torch.randn(5, 2)),
+        (torch.randn(4, 4), torch.randn(4, 2)),
     ]
 
     reference_optimizer.zero_grad()
@@ -1642,6 +1644,30 @@ def test_mfsdp_grad_reduce_pending_queue_is_bounded_in_bytes():
     assert pipeline._pending_capacity_bytes == 2 * 32 * 4
     assert first.waited is True
     assert second.waited is False
+
+
+def test_mfsdp_double_buffer_force_teardown_drops_busy_slots():
+    """Exception cleanup must not replace the original failure with a slot error."""
+    allocator = mfsdp_buffer.DoubleBufferAllocator()
+    lease = allocator.allocate(
+        8,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        group=None,
+        key=("teardown",),
+    )
+
+    with pytest.raises(RuntimeError, match="active M-FSDP communication buffers"):
+        allocator.release_cached()
+
+    allocator.release_cached(force=True)
+
+    assert allocator._slots == {}
+    assert allocator._busy == {}
+    assert allocator._reuse_events == {}
+    # Keep the local reference live deliberately: teardown is about allocator
+    # ownership, not attempting to invalidate a tensor held by the primary error.
+    assert lease.tensor.numel() == 8
 
 
 def test_mfsdp_materializes_root_params_used_without_calling_their_leaf_module():
