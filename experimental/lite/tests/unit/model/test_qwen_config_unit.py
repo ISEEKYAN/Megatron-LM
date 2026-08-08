@@ -448,6 +448,75 @@ def test_qwen3_training_mode_matches_no_recompute_and_full_recompute_parity(
     assert calls == expected_counts
 
 
+def test_qwen3_full_recompute_initial_forward_runs_no_grad_then_fused_backward(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import model
+
+    calls = {"forward": 0, "backward": 0, "fused": 0}
+
+    class FakeWorkspace:
+        def __init__(self, key):
+            self.key = key
+
+    class FakeForward:
+        def __init__(self, *, backward_op=None, **_kwargs):
+            assert backward_op is None
+            self.backward_op = backward_op
+
+        def __call__(self, x):
+            assert torch.is_grad_enabled() is False
+            assert self.backward_op is None
+            calls["forward"] += 1
+            return x * 2
+
+    class ForbiddenBackward:
+        def __init__(self, **_kwargs):
+            calls["backward"] += 1
+            raise AssertionError("full recompute must not construct BackwardOp")
+
+    class FakeFused:
+        def __init__(self, **_kwargs):
+            pass
+
+        def forward_backward(self, _x_saved, grad_output, _routing_input=None):
+            calls["fused"] += 1
+            return grad_output * 3, [], []
+
+    monkeypatch.setattr(
+        model, "TopKRouter", lambda *_args, **_kwargs: torch.nn.Identity()
+    )
+    monkeypatch.setattr(model, "Experts", lambda *_args, **_kwargs: torch.nn.Identity())
+    monkeypatch.setattr(
+        model,
+        "get_ep_chunk_workspace",
+        lambda key, _factory: FakeWorkspace(key),
+    )
+    monkeypatch.setattr(model, "EPChunkForwardOp", FakeForward)
+    monkeypatch.setattr(model, "EPChunkBackwardOp", ForbiddenBackward)
+    monkeypatch.setattr(model, "EPChunkFusedForwardBackwardOp", FakeFused)
+    monkeypatch.setattr(model.torch.cuda, "current_device", lambda: 0)
+    layer = model.MoELayer(
+        SimpleNamespace(num_experts=8, hidden_size=4, num_experts_per_tok=2),
+        SimpleNamespace(ep_size=2, tp_ep_group=object()),
+        use_deepep=True,
+        enable_ep_chunk_overlap=True,
+        ep_chunk_max_token_rows_per_rank=8,
+        ep_chunk_full_recompute=True,
+    )
+    value = torch.randn(2, 4, requires_grad=True)
+
+    with torch.enable_grad():
+        assert torch.is_grad_enabled() is True
+        actual = layer(value)
+    torch.testing.assert_close(actual, value.detach() * 2)
+    actual.sum().backward()
+
+    torch.testing.assert_close(value.grad, torch.full_like(value, 3))
+    assert calls == {"forward": 1, "backward": 0, "fused": 1}
+
+
 def test_qwen3_chunked_ep_fails_loud_without_deepep_or_ep(
     transformer_engine_import_stub,
 ):
