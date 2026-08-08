@@ -9,6 +9,19 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
   exit 2
 fi
 
+PYTHON_PATH="$(which python)"
+echo "which python: ${PYTHON_PATH}"
+if [[ "${PYTHON_PATH}" != "/usr/bin/python3" ]]; then
+  echo "M-FSDP Hopper validation requires /usr/bin/python3 from verl.vllm023.sqsh." >&2
+  exit 2
+fi
+TRANSFORMER_ENGINE_FILE="$(python -c 'import transformer_engine; print(transformer_engine.__file__)')"
+echo "transformer_engine.__file__: ${TRANSFORMER_ENGINE_FILE}"
+if [[ "${TRANSFORMER_ENGINE_FILE}" != /usr/local/lib/python3.12/dist-packages/transformer_engine/* ]]; then
+  echo "M-FSDP Hopper validation requires transformer_engine from verl.vllm023.sqsh." >&2
+  exit 2
+fi
+
 MODE="${1:-}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NNODES="${NNODES:-${SLURM_NNODES:-1}}"
