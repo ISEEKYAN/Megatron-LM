@@ -1,0 +1,70 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+from __future__ import annotations
+
+from pathlib import Path
+
+
+LITE_ROOT = Path(__file__).resolve().parents[3]
+MODEL_ROOT = LITE_ROOT / "megatron/lite/model"
+
+
+def test_only_qwen3_moe_composes_the_chunked_ep_primitive():
+    qwen_protocol = (MODEL_ROOT / "qwen3_moe/lite/protocol.py").read_text()
+    qwen_model = (MODEL_ROOT / "qwen3_moe/lite/model.py").read_text()
+
+    assert "enable_ep_chunk_overlap: bool = False" in qwen_protocol
+    assert "validate_ep_chunk_overlap_config(" in qwen_protocol
+    assert "EPChunkForwardOp(" in qwen_model
+    assert "EPChunkBackwardOp(" in qwen_model
+    assert "EPChunkFusedForwardBackwardOp(" in qwen_model
+    assert "get_ep_chunk_workspace(" in qwen_model
+
+    for model_name, implementation in (
+        ("qwen3_5", "model.py"),
+        ("kimi_k2", "model.py"),
+        ("glm5", "model.py"),
+        ("deepseek_v4", "moe.py"),
+    ):
+        protocol = (MODEL_ROOT / model_name / "lite/protocol.py").read_text()
+        model = (MODEL_ROOT / model_name / "lite" / implementation).read_text()
+        assert "enable_ep_chunk_overlap" not in protocol
+        assert "EPChunkForwardOp" not in model
+        assert "EPChunkBackwardOp" not in model
+        assert "EPChunkFusedForwardBackwardOp" not in model
+
+
+def test_qwen3_layer_is_only_a_lightweight_three_op_composition():
+    model = (MODEL_ROOT / "qwen3_moe/lite/model.py").read_text()
+
+    assert "_full_recompute_fused_backward" not in model
+    assert "submit_deepep_dispatch" not in model
+    assert "MEGATRON_LITE_EP_CHUNK" not in model
+    assert "layer_idx %" not in model
+    assert "buffer_slot=" not in model
+
+
+def test_dynamic_chunk_configuration_is_absent_from_product_code():
+    product = LITE_ROOT / "megatron/lite"
+    forbidden = (
+        "ep_chunk_num_chunks",
+        "ep_chunk_bwd_num_chunks",
+        "MEGATRON_LITE_EP_CHUNK_WEIGHTS",
+    )
+
+    matches = {
+        token: [path for path in product.rglob("*.py") if token in path.read_text()]
+        for token in forbidden
+    }
+
+    assert matches == {token: [] for token in forbidden}
+
+
+def test_chunk_policy_lives_with_the_moe_module_primitive():
+    policy = (
+        LITE_ROOT / "megatron/lite/primitive/modules/moe_ep_chunk_overlap_policy.py"
+    )
+    old_policy = LITE_ROOT / "megatron/lite/primitive/moe_ep_chunk_overlap_policy.py"
+
+    assert policy.is_file()
+    assert not old_policy.exists()

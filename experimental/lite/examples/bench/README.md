@@ -23,6 +23,25 @@ This benchmark separates two validation lines:
 
 Use the `mbridge` line for Core/distopt precision and speed claims.
 
+## Qwen3 MoE ChunkedEP
+
+Qwen3 MoE can compose the fixed two-chunk DeepEP overlap implementation through
+its lite implementation config:
+
+```python
+from megatron.lite.model.qwen3_moe.lite.protocol import ImplConfig
+from megatron.lite.runtime.contracts import ParallelConfig
+
+impl = ImplConfig(
+    parallel=ParallelConfig(ep=8),
+    use_deepep=True,
+    enable_ep_chunk_overlap=True,
+)
+```
+
+This profile always uses two chunks. It requires DeepEP with `EP > 1`; there is
+no dynamic chunk-count or per-model scheduling policy.
+
 ## Dry-Run
 
 ```bash
