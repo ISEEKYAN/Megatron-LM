@@ -49,7 +49,7 @@ column is intentionally pending rather than inferred from an absent MLite copy.
 | Contract point | In-tree M-FSDP evidence | Runtime-HDO evidence required |
 | --- | --- | --- |
 | import and construction | `CpuAdamGroup(gpu_param_groups, lr, betas, eps)` | `from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer`; `HDO(params, offload_fraction, cpu_optimizer_cls, gpu_optimizer_cls, param_update_in_fp32, pin_cpu_grads, pin_cpu_params, overlap_cpu_optimizer_d2h_h2d, **kwargs)` |
-| parameter/master ownership | per-parameter pinned CPU FP32 leaves | full offload clones CUDA params to pinned CPU (MCore `hybrid_optimizer.py:273-283`); `param_update_in_fp32=True` creates FP32 master copies (`:277-280`) and persists `master_param` in state (`:315-321`) |
+| parameter/master ownership | per-parameter pinned CPU FP32 leaves | full offload initially clones CUDA params to CPU; with `param_update_in_fp32=True`, MCore replaces that local bf16 clone with one FP32 clone, which is both CPU optimizer parameter and `param_to_fp32_param` value (`hybrid_optimizer.py:273-288`) |
 | gradients | reads `param.main_grad`, else `param.grad` | HDO reads `getattr(param, "decoupled_grad", param.grad)` (`:91`, `:102`): an adapter can bind M-FSDP FP32 `main_grad` to `decoupled_grad` |
 | update/device ordering | D2H and H2D streams plus per-param events | D2H stream copies gradients and records per-CPU-optimizer events (`:162-174`); post-step H2D hooks copy parameters back (`:117-148`) |
 | offload selection | `offload_fraction` split by parameter numel | native parameter-numel threshold supports full and partial offload (`:251-292`) |
@@ -159,16 +159,23 @@ It deliberately separates persistent state from transient step peaks.
 | GPU model parameters | M-FSDP sharded bf16 storage plus materialization governed by M-FSDP | same for `N_gpu`, plus normal M-FSDP shards | adapter may not add a permanent full GPU parameter copy |
 | GPU gradients | M-FSDP FP32 `main_grad` for the optimizer-step lifetime | proportional to active M-FSDP shards | `decoupled_grad` is an alias, not another allocation |
 | GPU optimizer state | zero for fully CPU-offloaded parameters | HDO GPU optimizer state only for `N_gpu` | report `N_gpu` separately; no mixed-arm aggregation |
-| CPU parameter/master | HDO CPU parameter copy plus, with `param_update_in_fp32=True`, FP32 master: **8N_cpu bytes** | **8N_cpu bytes** | measured allocator/reserved values must accompany this symbolic ledger |
+| CPU parameter/master | one FP32 tensor: **4N_cpu bytes** | **4N_cpu bytes** | with `param_update_in_fp32=True`, the CPU optimizer parameter and `param_to_fp32_param` entry are the same object, not two tensors |
 | CPU Adam moments | FP32 `exp_avg` + `exp_avg_sq`: **8N_cpu bytes** after first step | **8N_cpu bytes** | state is persistent after lazy initialization |
 | CPU gradient staging | HDO `cpu_copy_map_grad`: **4N_cpu bytes** after first use | **4N_cpu bytes** | persistent in current HDO, regardless of `pin_cpu_grads` |
 | CPU optimizer objects | one per CPU parameter when overlap is enabled: **O(P)** | **O(P_cpu)** | metadata/object overhead must be reported separately, not hidden in tensor bytes |
 
-Thus the current HDO CPU tensor steady state is at least **20N_cpu bytes**
-(CPU parameter + FP32 master + two moments + persistent FP32 grad staging),
-before allocator padding and Python/optimizer-object overhead.  This is a
-symbolic design ledger, not a measured 8-GPU result.  The Route-B adapter may
-reuse HDO unchanged only if this 4N persistent grad residency is accepted.
+The object identity at MCore `hybrid_optimizer.py:273-288` matters: lines
+273-279 first create a bf16 CPU clone; when `param_update_in_fp32=True`, the
+local `param` is replaced by `param.clone().float()`.  The original bf16 clone
+has no retained owner.  Lines 281-288 give this one FP32 object to the CPU
+optimizer and store the same object in `param_to_fp32_param`; the map is not a
+second master allocation.  Therefore the current HDO CPU tensor steady state
+is at least **16N_cpu bytes**: **4N_cpu** for the shared FP32
+parameter/master, **8N_cpu** for two FP32 Adam moments, and **4N_cpu** for
+persistent FP32 gradient staging, before allocator padding and
+Python/optimizer-object overhead.  This is a symbolic design ledger, not a
+measured 8-GPU result.  The Route-B adapter may reuse HDO unchanged only if
+this 4N persistent grad residency is accepted.
 
 If it is not accepted, the only in-scope design is a separately reviewed HDO
 bounded reusable staging ring: `R` pinned FP32 buffers of at most the bounded
