@@ -71,7 +71,7 @@ class _FusedMainGradLinearFunction(torch.autograd.Function):
             .matmul(value.float().reshape(-1, value.shape[-1]))
         )
         if ctx.fuse_wgrad_accumulation:
-            ctx.weight.main_grad.add_(grad_weight)
+            ctx.weight.get_main_grad().add_(grad_weight)
             ctx.weight.grad_added_to_main_grad = True
             grad_weight = torch.zeros_like(weight)
         return grad_input, grad_weight, None
@@ -463,6 +463,50 @@ def test_mfsdp_config_enables_double_buffer_for_nccl_user_buffers():
 
     assert config.nccl_ub is True
     assert config.fsdp_double_buffer is True
+
+
+def test_mfsdp_config_keeps_double_buffer_opt_in_without_nccl_user_buffers():
+    config = mfsdp_config.build_mfsdp_config(
+        SimpleNamespace(
+            override_optimizer_config={
+                "mfsdp_sharding_strategy": "optim_grads_params",
+            }
+        )
+    )
+
+    assert config.nccl_ub is False
+    assert config.fsdp_double_buffer is False
+
+
+def test_mfsdp_temporary_lease_physically_releases_storage():
+    allocator = mfsdp_buffer.TemporaryBufferAllocator()
+    lease = allocator.allocate(
+        32,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        group=None,
+        key=("grad",),
+    )
+
+    assert lease.tensor.untyped_storage().nbytes() == 32 * 4
+    lease.release()
+    assert lease.tensor.untyped_storage().nbytes() == 0
+
+
+def test_mfsdp_double_buffer_rejects_a_third_in_flight_lease():
+    allocator = mfsdp_buffer.DoubleBufferAllocator()
+    args = dict(
+        numel=8,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        group=None,
+        key=("grad",),
+    )
+    allocator.allocate(**args)
+    allocator.allocate(**args)
+
+    with pytest.raises(RuntimeError, match="capacity exhausted"):
+        allocator.allocate(**args)
 
 
 def test_mfsdp_nccl_user_buffer_falls_back_when_apex_is_missing(monkeypatch):
@@ -1525,20 +1569,11 @@ def test_mfsdp_reduce_scatters_each_microbatch_into_sharded_accumulation():
             candidate_optimizer.grad_sync_enabled = True
         (candidate_loss / len(microbatches)).backward()
 
-        live_full_grads = sum(
-            bucket._full_main_grad_lease is not None
-            for bucket in chunks[0].param_sync.buckets
-        )
-        assert live_full_grads <= 2
-
     candidate_optimizer.finish_grad_sync()
 
-    allocator = chunks[0].param_and_grad_buffer.allocator
-    gradient_pool_keys = [
-        key for key in allocator._slots if key[0] in {"main_grad", "grad", "grad-local"}
-    ]
-    assert {key[0] for key in gradient_pool_keys} == {"main_grad", "grad-local"}
-    assert len(gradient_pool_keys) == 2
+    assert all(
+        bucket._full_main_grad_lease is None for bucket in chunks[0].param_sync.buckets
+    )
 
     reference_grads = {
         name: param.grad.detach().reshape(-1)
@@ -1551,6 +1586,62 @@ def test_mfsdp_reduce_scatters_each_microbatch_into_sharded_accumulation():
     assert reference_grads.keys() == candidate_grads.keys()
     for name, reference_grad in reference_grads.items():
         assert torch.equal(reference_grad, candidate_grads[name]), name
+
+
+def test_mfsdp_get_main_grad_lazily_materializes_only_the_requested_bucket():
+    chunk, _optimizer = _single_rank_mfsdp_stack()
+    first, second = chunk.param_sync.buckets[:2]
+    first_param = first.specs[0].full_param
+
+    assert first._full_main_grad_lease is None
+    assert second._full_main_grad_lease is None
+
+    main_grad = first_param.get_main_grad()
+
+    assert main_grad.shape == first.specs[0].shape
+    assert first._full_main_grad_lease is not None
+    assert second._full_main_grad_lease is None
+    assert main_grad.untyped_storage().data_ptr() == (
+        first.full_main_grad_buffer.untyped_storage().data_ptr()
+    )
+
+
+def test_mfsdp_grad_reduce_pending_queue_is_bounded_in_bytes():
+    class PendingBucket:
+        def __init__(self, full_numel: int):
+            self.device = torch.device("cpu")
+            self.full_numel = full_numel
+            self.policy = SimpleNamespace(grad_comm_dtype=torch.float32)
+            self.world_size = 1
+            self.process_group = None
+            self.launched = False
+            self.waited = False
+            self.grad_ready_callback = None
+
+        def prepare_grad_reduce(self, *, force=False):
+            self.launched = True
+            return torch.empty(self.full_numel), torch.ones(self.full_numel)
+
+        def mark_grad_reduce_launched(self, work, completion_event=None):
+            self.work = work
+            self.completion_event = completion_event
+
+        def wait_grad_reduce(self):
+            self.waited = True
+
+    first = PendingBucket(8)
+    second = PendingBucket(32)
+    third = PendingBucket(32)
+    pipeline = mfsdp_buffer.GradReducePipeline([first, second, third])
+
+    pipeline.reduce_gradients(first, force=True)
+    pipeline.reduce_gradients(second, force=True)
+    pipeline.reduce_gradients(third, force=True)
+
+    assert pipeline._pending_bytes == (32 + 32) * 4
+    assert pipeline._pending_capacity_bytes == 2 * 32 * 4
+    assert first.waited is True
+    assert second.waited is False
 
 
 def test_mfsdp_materializes_root_params_used_without_calling_their_leaf_module():
@@ -1577,7 +1668,9 @@ def test_mfsdp_materializes_root_params_used_without_calling_their_leaf_module()
         adam_beta1=0.9,
         adam_beta2=0.999,
         adam_eps=1.0e-8,
-        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+        override_optimizer_config={
+            "mfsdp_sharding_strategy": "optim_grads_params",
+        },
     )
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [candidate],
@@ -1624,7 +1717,9 @@ def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
         adam_beta1=0.9,
         adam_beta2=0.999,
         adam_eps=1.0e-8,
-        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+        override_optimizer_config={
+            "mfsdp_sharding_strategy": "optim_grads_params",
+        },
     )
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [model],
@@ -1724,13 +1819,11 @@ def test_mfsdp_routes_fused_wgrad_through_bucketed_fp32_main_grad():
         spec.full_param.main_grad.to(torch.bfloat16).to(torch.float32),
     )
     first_main_grad = spec.full_param.main_grad.detach().clone()
-    main_grad_storage = spec.full_param.main_grad.untyped_storage().data_ptr()
-
     second_value = torch.randn(8, 4, dtype=torch.bfloat16)
     chunk(second_value).float().sum().backward()
     assert spec.full_param.grad is None
     second_expected = second_value.float().sum(dim=0).repeat(4, 1)
-    assert spec.full_param.main_grad.untyped_storage().data_ptr() == main_grad_storage
+    assert spec.full_param.main_grad.numel() == spec.numel
     assert torch.equal(spec.full_param.main_grad, second_expected)
 
     optimizer.finish_grad_sync()
