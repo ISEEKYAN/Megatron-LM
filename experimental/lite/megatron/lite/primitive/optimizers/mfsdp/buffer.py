@@ -422,12 +422,15 @@ class ParamBucket:
     def prepare_main_grads(self) -> None:
         """Attach bounded FP32 views for fused wgrad accumulation."""
         if self._full_main_grad_lease is None:
+            # Unlike full parameters, gradient staging has no autograd-saved
+            # views after its reduce-scatter completes. Pool it across bucket
+            # layouts so released per-bucket slots do not become resident.
             self._full_main_grad_lease = self.allocator.allocate(
                 self.full_numel,
                 dtype=self.policy.main_grads_dtype,
                 device=self.device,
                 group=self.process_group,
-                key=("main_grad", id(self.process_group), self.allocator_layout_key),
+                key=("main_grad", id(self.process_group)),
             )
             self.full_main_grad_buffer = self._full_main_grad_lease.tensor
             self.full_main_grad_buffer.zero_()
@@ -626,7 +629,7 @@ class ParamBucket:
                 dtype=self.policy.grad_comm_dtype,
                 device=self.device,
                 group=self.process_group,
-                key=("grad-local", id(self.process_group), self.allocator_layout_key),
+                key=("grad-local", id(self.process_group)),
             )
             self.local_grad_comm_buffer = self._local_grad_comm_lease.tensor
         with torch.no_grad():
@@ -643,7 +646,7 @@ class ParamBucket:
                 dtype=self.policy.grad_comm_dtype,
                 device=self.device,
                 group=self.process_group,
-                key=("grad", id(self.process_group), self.allocator_layout_key),
+                key=("grad", id(self.process_group)),
             )
             grad_input = self._grad_lease.tensor
             grad_input.copy_(self.full_main_grad_buffer)

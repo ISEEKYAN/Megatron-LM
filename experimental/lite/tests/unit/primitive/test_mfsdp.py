@@ -1498,6 +1498,10 @@ def test_mfsdp_reduce_scatters_each_microbatch_into_sharded_accumulation():
         is_expert=lambda _name: False,
         fsdp_unit_modules=(_GlooUnit,),
     )
+    assert (
+        len({bucket.allocator_layout_key for bucket in chunks[0].param_sync.buckets})
+        > 1
+    )
     microbatches = [
         (torch.randn(3, 4), torch.randn(3, 2)),
         (torch.randn(2, 4), torch.randn(2, 2)),
@@ -1528,6 +1532,13 @@ def test_mfsdp_reduce_scatters_each_microbatch_into_sharded_accumulation():
         assert live_full_grads <= 2
 
     candidate_optimizer.finish_grad_sync()
+
+    allocator = chunks[0].param_and_grad_buffer.allocator
+    gradient_pool_keys = [
+        key for key in allocator._slots if key[0] in {"main_grad", "grad", "grad-local"}
+    ]
+    assert {key[0] for key in gradient_pool_keys} == {"main_grad", "grad-local"}
+    assert len(gradient_pool_keys) == 2
 
     reference_grads = {
         name: param.grad.detach().reshape(-1)
