@@ -170,6 +170,57 @@ def test_dispatch_local_backward_accumulates_duplicate_rows_in_workspace(
     )
 
 
+def test_dispatch_local_backward_clears_reused_scratch_before_sparse_writes(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _dispatch_local_backward,
+    )
+
+    scratch = {
+        "grad_recv_hidden": torch.full((3, 2), 17.0),
+        "grad_recv_probs": torch.full((3, 2), 19.0),
+    }
+
+    class ReusedLease:
+        @staticmethod
+        def tensor(name, _shape, *, dtype, device):
+            return scratch[name].to(dtype=dtype, device=device)
+
+    chunk = SimpleNamespace(
+        workspace_lease=ReusedLease(),
+        row_id_map=torch.tensor([0, 2]),
+        prob_flat_indices=torch.tensor([1, 5]),
+        recv_hidden_shape=torch.Size((3, 2)),
+        recv_hidden_dtype=torch.float32,
+        recv_probs_shape=torch.Size((3, 2)),
+        recv_probs_dtype=torch.float32,
+    )
+
+    grad_hidden, grad_probs = _dispatch_local_backward(
+        chunk,
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        torch.tensor([0.25, 0.75]),
+    )
+    torch.testing.assert_close(
+        grad_hidden, torch.tensor([[1.0, 2.0], [0.0, 0.0], [3.0, 4.0]])
+    )
+    torch.testing.assert_close(
+        grad_probs,
+        torch.tensor([[0.0, 0.25], [0.0, 0.0], [0.0, 0.75]]),
+    )
+
+    scratch["grad_recv_hidden"].fill_(23.0)
+    scratch["grad_recv_probs"].fill_(29.0)
+    _grad_hidden, grad_probs_none = _dispatch_local_backward(
+        chunk,
+        torch.tensor([[5.0, 6.0], [7.0, 8.0]]),
+        None,
+    )
+    torch.testing.assert_close(grad_probs_none, torch.zeros_like(grad_probs_none))
+
+
 def test_accumulate_reuses_first_chunk_gradient_storage(
     transformer_engine_import_stub,
 ):

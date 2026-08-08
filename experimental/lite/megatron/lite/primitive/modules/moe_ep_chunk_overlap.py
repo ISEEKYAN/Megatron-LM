@@ -305,7 +305,7 @@ class EPChunkWorkspace:
         )
         requested = tuple(int(dim) for dim in shape)
         slices = tuple(slice(0, dim) for dim in requested)
-        return tensor[slices].view(requested).detach().zero_()
+        return tensor[slices].view(requested).detach()
 
     def _reserve_tensor(
         self,
@@ -1649,6 +1649,7 @@ def _dispatch_local_backward(
         dtype=chunk.recv_hidden_dtype,
         device=grad_dispatched.device,
     )
+    grad_recv_hidden.zero_()
     grad_recv_hidden.scatter_add_(
         0,
         row_id_map.unsqueeze(1).expand(-1, grad_dispatched.size(1)),
@@ -1660,6 +1661,7 @@ def _dispatch_local_backward(
         dtype=chunk.recv_probs_dtype,
         device=grad_dispatched.device,
     )
+    grad_recv_probs.zero_()
     if grad_probs is not None:
         flat = chunk.prob_flat_indices.reshape(-1).to(grad_probs.device, torch.long)
         grad_recv_probs.reshape(-1).index_copy_(
