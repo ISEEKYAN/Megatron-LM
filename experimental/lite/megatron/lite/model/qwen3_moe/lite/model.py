@@ -48,6 +48,26 @@ from megatron.lite.primitive.utils import build_fp8_recipe
 # ---------------------------------------------------------------------------
 
 
+class _Qwen3EPChunkFullRecomputeFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, layer: "MoELayer", *params: torch.Tensor):
+        del params
+        ctx.layer = layer
+        ctx.save_for_backward(x.detach())
+        assert layer.ep_chunk_forward is not None
+        return layer.ep_chunk_forward(x).detach()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (x_saved,) = ctx.saved_tensors
+        layer = ctx.layer
+        assert layer.ep_chunk_fused is not None
+        grad_x, router_grads, expert_grads = layer.ep_chunk_fused.forward_backward(
+            x_saved, grad_output
+        )
+        return grad_x, None, *router_grads, *expert_grads
+
+
 class MoELayer(nn.Module):
     def __init__(
         self,
@@ -60,6 +80,7 @@ class MoELayer(nn.Module):
         moe_act_recompute: bool = False,
         enable_ep_chunk_overlap: bool = False,
         ep_chunk_max_token_rows_per_rank: int | None = None,
+        ep_chunk_full_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
@@ -79,6 +100,7 @@ class MoELayer(nn.Module):
         self.ep_chunk_forward: EPChunkForwardOp | None = None
         self.ep_chunk_backward: EPChunkBackwardOp | None = None
         self.ep_chunk_fused: EPChunkFusedForwardBackwardOp | None = None
+        self.ep_chunk_full_recompute = ep_chunk_full_recompute
         if enable_ep_chunk_overlap:
             if not use_deepep or ps.ep_size <= 1:
                 raise RuntimeError("Qwen3 ChunkedEP requires DeepEP and EP > 1")
@@ -119,26 +141,34 @@ class MoELayer(nn.Module):
                 router=self.router,
                 experts=self.experts,
             )
-            self.ep_chunk_forward = EPChunkForwardOp(
-                workspace=workspace("forward"), **op_kwargs
-            )
-            self.ep_chunk_backward = EPChunkBackwardOp(
-                workspace=workspace("backward"), **op_kwargs
-            )
-            self.ep_chunk_fused = EPChunkFusedForwardBackwardOp(
-                workspace=workspace("fused_forward_backward"),
-                backward_op=self.ep_chunk_backward,
-                **op_kwargs,
-            )
+            if ep_chunk_full_recompute:
+                self.ep_chunk_forward = EPChunkForwardOp(
+                    workspace=workspace("forward"), **op_kwargs
+                )
+                self.ep_chunk_fused = EPChunkFusedForwardBackwardOp(
+                    workspace=workspace("fused_forward_backward"), **op_kwargs
+                )
+            else:
+                self.ep_chunk_backward = EPChunkBackwardOp(
+                    workspace=workspace("backward"), **op_kwargs
+                )
+                self.ep_chunk_forward = EPChunkForwardOp(
+                    workspace=workspace("forward"),
+                    backward_op=self.ep_chunk_backward,
+                    **op_kwargs,
+                )
         else:
             self.dispatcher = TokenDispatcher(
                 config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.ep_chunk_fused is not None:
-            if torch.is_grad_enabled():
-                return self.ep_chunk_fused(x)
+        if self.ep_chunk_forward is not None:
+            if self.ep_chunk_full_recompute:
+                params = tuple(self.router.parameters()) + tuple(
+                    self.experts.parameters()
+                )
+                return _Qwen3EPChunkFullRecomputeFunction.apply(x, self, *params)
             assert self.ep_chunk_forward is not None
             return self.ep_chunk_forward(x)
 
@@ -207,6 +237,7 @@ class TransformerLayer(nn.Module):
         use_thd: bool = False,
         enable_ep_chunk_overlap: bool = False,
         ep_chunk_max_token_rows_per_rank: int | None = None,
+        ep_chunk_full_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
@@ -239,6 +270,7 @@ class TransformerLayer(nn.Module):
             moe_act_recompute=moe_act_recompute,
             enable_ep_chunk_overlap=enable_ep_chunk_overlap,
             ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+            ep_chunk_full_recompute=ep_chunk_full_recompute,
             lora_config=lora_config,
         )
 
@@ -302,6 +334,7 @@ class MultiTokenPredictionLayer(nn.Module):
         use_thd: bool,
         enable_ep_chunk_overlap: bool,
         ep_chunk_max_token_rows_per_rank: int | None,
+        ep_chunk_full_recompute: bool,
         detach_encoder: bool,
         lora_config: LoraConfig | dict | None,
     ):
@@ -329,6 +362,7 @@ class MultiTokenPredictionLayer(nn.Module):
             use_thd=use_thd,
             enable_ep_chunk_overlap=enable_ep_chunk_overlap,
             ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+            ep_chunk_full_recompute=ep_chunk_full_recompute,
             lora_config=lora_config,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -387,6 +421,7 @@ class MultiTokenPredictionBlock(nn.Module):
         use_thd: bool,
         enable_ep_chunk_overlap: bool,
         ep_chunk_max_token_rows_per_rank: int | None,
+        ep_chunk_full_recompute: bool,
         detach_encoder: bool,
         repeated_layer: bool,
         lora_config: LoraConfig | dict | None,
@@ -409,6 +444,7 @@ class MultiTokenPredictionBlock(nn.Module):
                     use_thd=use_thd,
                     enable_ep_chunk_overlap=enable_ep_chunk_overlap,
                     ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+                    ep_chunk_full_recompute=ep_chunk_full_recompute,
                     detach_encoder=detach_encoder,
                     lora_config=lora_config,
                 )
@@ -467,6 +503,7 @@ class Qwen3MoEModel(nn.Module):
         mtp_detach_encoder: bool = False,
         enable_ep_chunk_overlap: bool = False,
         ep_chunk_max_token_rows_per_rank: int | None = None,
+        ep_chunk_full_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
@@ -507,6 +544,7 @@ class Qwen3MoEModel(nn.Module):
                     use_thd=use_thd,
                     enable_ep_chunk_overlap=enable_ep_chunk_overlap,
                     ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+                    ep_chunk_full_recompute=ep_chunk_full_recompute,
                     lora_config=lora_config,
                 )
                 for idx in self.layer_indices
@@ -539,6 +577,7 @@ class Qwen3MoEModel(nn.Module):
                 use_thd=use_thd,
                 enable_ep_chunk_overlap=enable_ep_chunk_overlap,
                 ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+                ep_chunk_full_recompute=ep_chunk_full_recompute,
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
                 lora_config=lora_config,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,7 +35,7 @@ def _symbols(transformer_engine_import_stub):
         EPChunkShapeProfile,
         EPChunkWorkspaceKey,
         EPChunkWorkspaceRegistry,
-        _FusedEPChunkFunction,
+        _SavedContextEPChunkFunction,
     )
 
     return (
@@ -45,7 +46,7 @@ def _symbols(transformer_engine_import_stub):
         EPChunkShapeProfile,
         EPChunkWorkspaceKey,
         EPChunkWorkspaceRegistry,
-        _FusedEPChunkFunction,
+        _SavedContextEPChunkFunction,
     )
 
 
@@ -71,13 +72,13 @@ def test_three_explicit_ops_have_fixed_two_chunk_contract(
     )
     assert tuple(inspect.signature(backward_op.backward).parameters) == (
         "self",
+        "context",
+        "grad_output",
+    )
+    assert tuple(inspect.signature(fused_op.forward_backward).parameters) == (
+        "self",
         "x_saved",
         "grad_output",
-        "routing_input",
-    )
-    assert tuple(inspect.signature(fused_op.forward).parameters) == (
-        "self",
-        "x",
         "routing_input",
     )
 
@@ -270,6 +271,13 @@ def test_production_warmup_makes_backward_steady_state_allocation_free(
 
     assert workspace.metrics()["allocations"] == allocations
     assert workspace.metrics()["runtime_allocations"] == 0
+    evidence = workspace.evidence()
+    assert evidence["runtime_allocations"] == 0
+    assert evidence["data_ptrs"] == {
+        f"{slot}:{name}": pointers[(slot, name)]
+        for slot in range(2)
+        for name in ("grad_recv_hidden", "grad_recv_probs")
+    }
     assert {
         (slot, name): workspace.tensor(slot, name).data_ptr()
         for slot in range(2)
@@ -299,6 +307,52 @@ def test_profile_rejects_input_rows_beyond_qwen_capacity(
 
     with pytest.raises(RuntimeError, match="exceeds fixed profile"):
         profile.validate_input_rows(9)
+
+
+def test_workspace_reports_deepep_buffer_count_and_resident_bytes(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    profile = profile_type(
+        max_input_rows=8,
+        hidden_size=4,
+        topk=2,
+        ep_size=2,
+    )
+
+    def dispatcher(_slot):
+        return SimpleNamespace(
+            buffer=object(),
+            deepep_buffer_resident_bytes=1024,
+        )
+
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="forward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=19,
+            dtype=torch.float32,
+            shape_profile=profile,
+        ),
+        dispatcher,
+    )
+    workspace.warmup(device="cpu")
+
+    evidence = workspace.evidence()
+    assert evidence["dispatcher_count"] == 2
+    assert evidence["deepep_buffer_count"] == 2
+    assert evidence["deepep_buffer_resident_bytes"] == 2048
+    assert evidence["caller_owned_recv_proven"] is False
 
 
 @pytest.mark.parametrize("shape", [(2, 5, 4), (10, 4)], ids=["bshd", "thd-packed"])
@@ -351,7 +405,7 @@ def test_qwen3_profile_freezes_deepep_worst_case_receive_capacity(
     assert profile.topk == 8
 
 
-def test_fused_autograd_keeps_input_alive_for_backward(
+def test_saved_context_autograd_keeps_forward_context_for_backward(
     transformer_engine_import_stub,
 ):
     (
@@ -366,7 +420,7 @@ def test_fused_autograd_keeps_input_alive_for_backward(
     ) = _symbols(transformer_engine_import_stub)
     source = inspect.getsource(function)
 
-    assert "ctx.save_for_backward(x_2d.detach(), saved_routing)" in source
-    assert "ctx.backward_op = fused_op.backward_op" in source
-    assert "ctx.saved_tensors" in source
+    assert "ctx.saved_forward_context = saved_context" in source
+    assert "ctx.backward_op = forward_op.backward_op" in source
+    assert "ctx.backward_op.backward(" in source
     assert "synchronize" not in source

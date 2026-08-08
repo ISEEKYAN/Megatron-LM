@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
@@ -155,8 +156,10 @@ def test_qwen3_layer_prewarms_three_ops_from_real_token_capacity(
         workspaces.append(workspace)
         return workspace
 
-    monkeypatch.setattr(model, "TopKRouter", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(model, "Experts", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        model, "TopKRouter", lambda *_args, **_kwargs: torch.nn.Identity()
+    )
+    monkeypatch.setattr(model, "Experts", lambda *_args, **_kwargs: torch.nn.Identity())
     monkeypatch.setattr(model, "get_ep_chunk_workspace", get_workspace)
     monkeypatch.setattr(model, "EPChunkForwardOp", FakeOp)
     monkeypatch.setattr(model, "EPChunkBackwardOp", FakeOp)
@@ -178,11 +181,7 @@ def test_qwen3_layer_prewarms_three_ops_from_real_token_capacity(
         ep_chunk_max_token_rows_per_rank=33,
     )
 
-    assert [workspace.key.op for workspace in workspaces] == [
-        "forward",
-        "backward",
-        "fused_forward_backward",
-    ]
+    assert {workspace.key.op for workspace in workspaces} == {"forward", "backward"}
     assert all(
         workspace.key.shape_profile.max_input_rows == 33
         and workspace.key.shape_profile.max_recv_rows == 17 * 8
@@ -192,6 +191,82 @@ def test_qwen3_layer_prewarms_three_ops_from_real_token_capacity(
         workspace.warm_devices == [model.torch.device("cuda", 3)]
         for workspace in workspaces
     )
+
+
+@pytest.mark.parametrize(
+    "full_recompute,expected_ops",
+    [
+        (False, {"forward", "backward"}),
+        (True, {"forward", "fused_forward_backward"}),
+    ],
+)
+def test_qwen3_builds_only_two_cross_layer_workspaces_for_48_layers(
+    full_recompute,
+    expected_ops,
+    monkeypatch,
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import model
+
+    registry = {}
+    dispatcher_count = 0
+
+    class FakeWorkspace:
+        def __init__(self, key, dispatchers):
+            self.key = key
+            self.dispatchers = dispatchers
+
+        def warmup(self, *, device):
+            pass
+
+    class FakeOp:
+        def __init__(self, **kwargs):
+            self.workspace = kwargs["workspace"]
+
+    def fake_dispatcher(*_args, **_kwargs):
+        nonlocal dispatcher_count
+        dispatcher_count += 1
+        return object()
+
+    def get_workspace(key, factory):
+        if key not in registry:
+            registry[key] = FakeWorkspace(key, [factory(0), factory(1)])
+        return registry[key]
+
+    monkeypatch.setattr(model, "TopKRouter", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(model, "Experts", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(model, "TokenDispatcher", fake_dispatcher)
+    monkeypatch.setattr(model, "get_ep_chunk_workspace", get_workspace)
+    monkeypatch.setattr(model, "EPChunkForwardOp", FakeOp)
+    monkeypatch.setattr(model, "EPChunkBackwardOp", FakeOp)
+    monkeypatch.setattr(model, "EPChunkFusedForwardBackwardOp", FakeOp)
+    monkeypatch.setattr(model.torch.cuda, "current_device", lambda: 0)
+    config = SimpleNamespace(
+        num_experts=128,
+        hidden_size=64,
+        num_experts_per_tok=8,
+    )
+    ps = SimpleNamespace(ep_size=8, tp_ep_group=object())
+
+    layers = [
+        model.MoELayer(
+            config,
+            ps,
+            use_deepep=True,
+            enable_ep_chunk_overlap=True,
+            ep_chunk_max_token_rows_per_rank=16384,
+            ep_chunk_full_recompute=full_recompute,
+        )
+        for _ in range(48)
+    ]
+
+    assert {key.op for key in registry} == expected_ops
+    assert len(registry) == 2
+    assert dispatcher_count == 4
+    assert len({id(layer.ep_chunk_forward.workspace) for layer in layers}) == 1
+    companion = "ep_chunk_fused" if full_recompute else "ep_chunk_backward"
+    assert len({id(getattr(layer, companion).workspace) for layer in layers}) == 1
 
 
 def test_qwen3_chunked_ep_requires_explicit_per_rank_token_capacity(
@@ -210,6 +285,137 @@ def test_qwen3_chunked_ep_requires_explicit_per_rank_token_capacity(
                 enable_ep_chunk_overlap=True,
             ),
         )
+
+
+@pytest.mark.parametrize(
+    "modules,expected",
+    [([], False), (["core_attn"], False), (["moe"], True), (["full"], True)],
+)
+def test_qwen3_compose_layer_alone_interprets_recompute_policy(
+    modules, expected, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import protocol
+
+    assert protocol._ep_chunk_full_recompute_requested(modules) is expected
+
+
+def test_qwen3_compose_layer_replaces_only_its_outer_moe_checkpoint(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import protocol
+
+    requested = ["core_attn", "moe", "mlp"]
+    assert protocol._qwen3_recompute_modules_for_ep_chunk_overlap(
+        requested, enabled=False
+    ) == requested
+    assert protocol._qwen3_recompute_modules_for_ep_chunk_overlap(
+        requested, enabled=True
+    ) == ["core_attn", "mlp"]
+    assert protocol._qwen3_recompute_modules_for_ep_chunk_overlap(
+        ["full"], enabled=True
+    ) == ["attn"]
+
+
+@pytest.mark.parametrize(
+    "full_recompute,expected_counts",
+    [
+        (False, {"forward": 1, "backward": 1, "fused": 0}),
+        (True, {"forward": 1, "backward": 0, "fused": 1}),
+    ],
+)
+def test_qwen3_training_mode_matches_no_recompute_and_full_recompute_parity(
+    full_recompute,
+    expected_counts,
+    monkeypatch,
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import model
+
+    calls = {"forward": 0, "backward": 0, "fused": 0}
+
+    class FakeWorkspace:
+        def __init__(self, key):
+            self.key = key
+
+        def warmup(self, *, device):
+            pass
+
+    class FakeForward:
+        def __init__(self, *, backward_op=None, **_kwargs):
+            self.backward_op = backward_op
+
+        def __call__(self, x):
+            calls["forward"] += 1
+
+            class SavedForward(torch.autograd.Function):
+                @staticmethod
+                def forward(ctx, value, backward_op):
+                    ctx.backward_op = backward_op
+                    return value * 2
+
+                @staticmethod
+                def backward(ctx, grad_output):
+                    grad_x, _router, _experts = ctx.backward_op.backward(
+                        object(), grad_output
+                    )
+                    return grad_x, None
+
+            return SavedForward.apply(x, self.backward_op)
+
+    class FakeBackward:
+        def __init__(self, **_kwargs):
+            pass
+
+        def backward(self, _context, grad_output):
+            calls["backward"] += 1
+            return grad_output * 2, [], []
+
+    class FakeFused:
+        def __init__(self, **_kwargs):
+            pass
+
+        def forward_backward(self, _x_saved, grad_output, _routing_input=None):
+            calls["fused"] += 1
+            return grad_output * 2, [], []
+
+    monkeypatch.setattr(
+        model, "TopKRouter", lambda *_args, **_kwargs: torch.nn.Identity()
+    )
+    monkeypatch.setattr(model, "Experts", lambda *_args, **_kwargs: torch.nn.Identity())
+    monkeypatch.setattr(
+        model,
+        "get_ep_chunk_workspace",
+        lambda key, _factory: FakeWorkspace(key),
+    )
+    monkeypatch.setattr(model, "EPChunkForwardOp", FakeForward)
+    monkeypatch.setattr(model, "EPChunkBackwardOp", FakeBackward)
+    monkeypatch.setattr(model, "EPChunkFusedForwardBackwardOp", FakeFused)
+    monkeypatch.setattr(model.torch.cuda, "current_device", lambda: 0)
+    config = SimpleNamespace(
+        num_experts=8,
+        hidden_size=4,
+        num_experts_per_tok=2,
+    )
+    ps = SimpleNamespace(ep_size=2, tp_ep_group=object())
+    layer = model.MoELayer(
+        config,
+        ps,
+        use_deepep=True,
+        enable_ep_chunk_overlap=True,
+        ep_chunk_max_token_rows_per_rank=8,
+        ep_chunk_full_recompute=full_recompute,
+    )
+    value = torch.randn(2, 4, requires_grad=True)
+    expected = value * 2
+
+    actual = layer(value)
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    torch.testing.assert_close(value.grad, torch.full_like(value, 2))
+    assert calls == expected_counts
 
 
 def test_qwen3_chunked_ep_fails_loud_without_deepep_or_ep(

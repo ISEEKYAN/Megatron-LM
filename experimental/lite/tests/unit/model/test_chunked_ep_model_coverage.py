@@ -21,6 +21,8 @@ def test_only_qwen3_moe_composes_the_chunked_ep_primitive():
     assert "get_ep_chunk_workspace(" in qwen_model
     assert "max_input_rows=ep_chunk_max_token_rows_per_rank" in qwen_model
     assert "workspace.warmup(device=" in qwen_model
+    assert "ep_chunk_full_recompute" in qwen_model
+    assert "if torch.is_grad_enabled():\n                return self.ep_chunk_fused" not in qwen_model
 
     for model_name, implementation in (
         ("qwen3_5", "model.py"),

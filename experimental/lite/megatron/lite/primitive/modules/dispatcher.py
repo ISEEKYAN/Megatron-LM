@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
@@ -42,7 +44,20 @@ def _hidden_bytes(hidden_size: int) -> int:
     return hidden_size * 2
 
 
-def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
+@dataclass(frozen=True)
+class _DeepEPBufferAllocation:
+    buffer: Any
+    num_nvl_bytes: int
+    num_rdma_bytes: int
+
+    @property
+    def resident_bytes(self) -> int:
+        return self.num_nvl_bytes + self.num_rdma_bytes
+
+
+def _build_deepep_buffer(
+    group: dist.ProcessGroup, hidden_size: int
+) -> _DeepEPBufferAllocation:
     if deep_ep is None:
         raise RuntimeError("DeepEP buffer requested but deep_ep is not installed.")
 
@@ -62,8 +77,12 @@ def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
             config.get_rdma_buffer_size_hint(hidden_bytes, group_size), num_rdma_bytes
         )
 
-    return deep_ep.Buffer(
-        group=group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=num_rdma_bytes
+    return _DeepEPBufferAllocation(
+        buffer=deep_ep.Buffer(
+            group=group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=num_rdma_bytes
+        ),
+        num_nvl_bytes=num_nvl_bytes,
+        num_rdma_bytes=num_rdma_bytes,
     )
 
 
@@ -267,7 +286,9 @@ class TokenDispatcher:
         self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
         if self.use_deepep:
             assert ps.tp_ep_group is not None
-            self.buffer = _build_deepep_buffer(ps.tp_ep_group, hidden_size)
+            allocation = _build_deepep_buffer(ps.tp_ep_group, hidden_size)
+            self.buffer = allocation.buffer
+            self.deepep_buffer_resident_bytes = allocation.resident_bytes
 
         self._row_id_map: torch.Tensor | None = None
         self._restore_shape: tuple | None = None

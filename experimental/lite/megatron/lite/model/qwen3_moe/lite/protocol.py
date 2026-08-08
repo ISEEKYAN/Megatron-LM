@@ -52,7 +52,6 @@ from megatron.lite.primitive.modules.lora import (
     trainable_param_stats,
 )
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
-    recompute_modules_for_ep_chunk_overlap,
     validate_ep_chunk_overlap_config,
 )
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
@@ -161,6 +160,22 @@ def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
     )
 
 
+def _ep_chunk_full_recompute_requested(modules: list[str]) -> bool:
+    """Interpret Qwen3 recompute composition without leaking it into primitives."""
+    return "full" in modules or "moe" in modules
+
+
+def _qwen3_recompute_modules_for_ep_chunk_overlap(
+    modules: list[str], *, enabled: bool
+) -> list[str]:
+    """Replace Qwen3's outer MoE checkpoint when the fused op owns recompute."""
+    if not enabled:
+        return modules
+    if "full" in modules:
+        return ["attn"]
+    return [name for name in modules if name != "moe"]
+
+
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     return unpack_thd_forward_output(model, batch, output)
 
@@ -206,7 +221,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
     # ── build chunks ──
     recompute_spec = parse_recompute_spec(
-        recompute_modules_for_ep_chunk_overlap(
+        _qwen3_recompute_modules_for_ep_chunk_overlap(
             impl_cfg.recompute,
             enabled=impl_cfg.enable_ep_chunk_overlap,
         )
@@ -221,6 +236,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
         enable_ep_chunk_overlap=impl_cfg.enable_ep_chunk_overlap,
+        ep_chunk_full_recompute=(
+            _ep_chunk_full_recompute_requested(impl_cfg.recompute)
+        ),
         ep_chunk_max_token_rows_per_rank=impl_cfg.ep_chunk_max_token_rows_per_rank,
         lora_config=lora_config,
     )
