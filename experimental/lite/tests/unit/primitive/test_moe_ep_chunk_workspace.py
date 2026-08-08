@@ -582,3 +582,43 @@ def test_saved_context_autograd_keeps_forward_context_for_backward(
     assert "ctx.backward_op = forward_op.backward_op" in source
     assert "ctx.backward_op.backward(" in source
     assert "synchronize" not in source
+
+
+def test_saved_context_backward_uses_the_dispatcher_that_created_its_handle(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+        _ForwardChunkContext,
+    )
+
+    fields = _ForwardChunkContext.__dataclass_fields__
+    forward_source = inspect.getsource(
+        _EPChunkOperationBase._forward_saved_context_async
+    )
+    backward_source = inspect.getsource(_EPChunkOperationBase._saved_context_backward)
+
+    assert "dispatcher" in fields
+    assert "dispatcher=dispatcher" in forward_source
+    assert "dispatcher=saved.dispatcher" in backward_source
+    assert "dispatcher=lease.dispatcher" not in backward_source
+
+
+def test_saved_forward_context_does_not_pin_two_shared_slots_across_layers(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+        _ForwardChunkContext,
+    )
+
+    fields = _ForwardChunkContext.__dataclass_fields__
+    forward_source = inspect.getsource(
+        _EPChunkOperationBase._forward_saved_context_async
+    )
+
+    assert "workspace_lease" not in fields
+    assert "lease.release(consumed)" in forward_source
+    assert 'handle=state["handle"]' in forward_source

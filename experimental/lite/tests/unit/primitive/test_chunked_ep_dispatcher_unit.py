@@ -200,6 +200,34 @@ def test_manual_backward_submit_finish_pairs_wait_for_events():
     assert dispatch_event.waited
 
 
+def test_manual_backward_consumes_explicit_handle_on_its_origin_buffer():
+    class Buffer(_Buffer):
+        def __init__(self):
+            super().__init__()
+            self.backward_handles = []
+
+        def dispatch(self, tensor, **kwargs):
+            self.backward_handles.append(kwargs["handle"])
+            return tensor, None, None, None, None, _Event()
+
+        def combine(self, tensor, handle, **kwargs):
+            self.backward_handles.append(handle)
+            return tensor, tensor.new_zeros((tensor.size(0), 1)), _Event()
+
+    origin = Buffer()
+    value = _dispatcher(origin)
+    old_handle = object()
+    newer_handle = object()
+    value._handle = newer_handle
+    grad = torch.zeros(2, 3)
+
+    value.submit_deepep_combine_backward(grad, old_handle)
+    value.submit_deepep_dispatch_backward(grad, torch.ones(2, 1), old_handle)
+
+    assert origin.backward_handles == [old_handle, old_handle]
+    assert value._handle is newer_handle
+
+
 def test_external_finish_returns_manual_map_without_mutating_dispatcher():
     value = _dispatcher()
     value._row_id_map = None
