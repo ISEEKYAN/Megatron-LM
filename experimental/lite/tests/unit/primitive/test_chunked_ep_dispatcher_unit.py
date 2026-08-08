@@ -1,53 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import importlib
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 
-def _install_te_import_stub():
-    def unavailable(*_args, **_kwargs):
-        return None
-
-    root = types.ModuleType("transformer_engine")
-    pytorch = types.ModuleType("transformer_engine.pytorch")
-    cpp_extensions = types.ModuleType("transformer_engine.pytorch.cpp_extensions")
-    module = types.ModuleType("transformer_engine.pytorch.module")
-    module_base = types.ModuleType("transformer_engine.pytorch.module.base")
-    permutation = types.ModuleType("transformer_engine.pytorch.permutation")
-    router = types.ModuleType("transformer_engine.pytorch.router")
-    cpp_extensions.general_gemm = unavailable
-    module_base.get_workspace = unavailable
-    module.base = module_base
-    permutation.moe_permute = unavailable
-    permutation.moe_permute_and_pad_with_probs = unavailable
-    permutation.moe_permute_with_probs = unavailable
-    permutation.moe_unpermute = unavailable
-    router.fused_compute_score_for_moe_aux_loss = unavailable
-    router.fused_moe_aux_loss = unavailable
-    router.fused_topk_with_score_function = unavailable
-    root.pytorch = pytorch
-    for name, value in {
-        "transformer_engine": root,
-        "transformer_engine.pytorch": pytorch,
-        "transformer_engine.pytorch.cpp_extensions": cpp_extensions,
-        "transformer_engine.pytorch.module": module,
-        "transformer_engine.pytorch.module.base": module_base,
-        "transformer_engine.pytorch.permutation": permutation,
-        "transformer_engine.pytorch.router": router,
-    }.items():
-        sys.modules.setdefault(name, value)
+@pytest.fixture(autouse=True)
+def _isolated_te_import(transformer_engine_import_stub):
+    transformer_engine_import_stub()
 
 
-_install_te_import_stub()
-
-dispatcher_module = importlib.import_module(
-    "megatron.lite.primitive.modules.dispatcher"
-)
+def _dispatcher_module():
+    return importlib.import_module("megatron.lite.primitive.modules.dispatcher")
 
 
 class _Event:
@@ -76,7 +42,7 @@ class _Buffer:
 
 
 def _dispatcher(buffer=None):
-    value = object.__new__(dispatcher_module.TokenDispatcher)
+    value = object.__new__(_dispatcher_module().TokenDispatcher)
     value.use_deepep = True
     value.buffer = buffer or _Buffer()
     value.num_experts = 4
@@ -193,7 +159,7 @@ def test_dynamic_dispatch_uses_deepep_receive_counts():
 def test_prepared_combine_preserves_manual_metadata_and_finishes(monkeypatch):
     value = _dispatcher()
     monkeypatch.setattr(
-        dispatcher_module,
+        _dispatcher_module(),
         "unpermute",
         lambda tensor, row_id_map, restore_shape, fused: tensor + 10,
     )
