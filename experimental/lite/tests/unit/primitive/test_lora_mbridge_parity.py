@@ -231,7 +231,6 @@ def test_l3_tp2_materialized_delta_shards_match_bridge_merge(parallelism, monkey
     base, a, b, _, _ = _tensors(surface)
     tp_size = 2
     fake_group = object()
-    monkeypatch.setattr(bridge_lora, "get_pg_size", lambda group: tp_size)
 
     if parallelism == "column":
         a_shards = a.chunk(tp_size, dim=0)
@@ -285,7 +284,13 @@ def test_l3_tp2_materialized_delta_shards_match_bridge_merge(parallelism, monkey
         )
         mlite_merged = base_shard + mlite.materialized_delta_weight()
         bridge_merged = BridgeLoRAMerge().merge(
-            base_shard, b_shard, a_shard, ALPHA, RANK, tp_group=fake_group
+            base_shard,
+            b_shard,
+            a_shard,
+            ALPHA,
+            RANK,
+            tp_group=fake_group,
+            tp_size=tp_size,
         )
         torch.testing.assert_close(bridge_merged, mlite_merged, rtol=0, atol=1e-12)
 
@@ -297,7 +302,6 @@ def test_l3_tp_shard_order_negative_control_is_load_bearing(monkeypatch):
     b_local = b.chunk(2, dim=0)[0]
     base_local = base.chunk(2, dim=0)[0]
     fake_group = object()
-    monkeypatch.setattr(bridge_lora, "get_pg_size", lambda group: 2)
 
     def reversed_all_gather(outputs, _local, group):
         assert group is fake_group
@@ -306,7 +310,13 @@ def test_l3_tp_shard_order_negative_control_is_load_bearing(monkeypatch):
 
     monkeypatch.setattr(torch.distributed, "all_gather", reversed_all_gather)
     wrong = BridgeLoRAMerge().merge(
-        base_local, b_local, a_shards[0], ALPHA, RANK, tp_group=fake_group
+        base_local,
+        b_local,
+        a_shards[0],
+        ALPHA,
+        RANK,
+        tp_group=fake_group,
+        tp_size=2,
     )
     correct = base_local + (b_local @ a) * (ALPHA / RANK)
     assert not torch.allclose(wrong, correct)
@@ -396,7 +406,13 @@ def test_l5_adapter_and_merged_export_tensors_match(surface):
     }.keys()
 
     bridge_merged = BridgeLoRAMerge().merge(
-        bridge.weight, bridge_b, bridge_a, bridge.alpha, bridge.dim, tp_group=None
+        bridge.weight,
+        bridge_b,
+        bridge_a,
+        bridge.alpha,
+        bridge.dim,
+        tp_group=None,
+        tp_size=1,
     )
     mlite_merged = mlite.base.weight + mlite.adapter.materialized_delta_weight()
     torch.testing.assert_close(mlite_merged, bridge_merged, rtol=0, atol=1e-12)
