@@ -129,6 +129,7 @@ def test_three_ops_direct_behavior_contracts(transformer_engine_import_stub):
 
     def saved_backward(_self, context, grad):
         assert context is marker
+        assert torch.is_grad_enabled() is True
         calls["backward"] += 1
         return grad * 2, [], []
 

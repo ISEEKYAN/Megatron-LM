@@ -1353,11 +1353,14 @@ class _EPChunkOperationBase:
         router_params = tuple(self.router.parameters())
         expert_params = tuple(self.experts.parameters())
         compute_stream, comm_stream = self._streams(grad_2d.device)
+        caller_stream = torch.cuda.current_stream(grad_2d.device)
+        grad_ready = torch.cuda.Event()
+        grad_ready.record(caller_stream)
         wgrad_stream = _shared_wgrad_stream(grad_2d.device)
         grad_x_chunks: list[torch.Tensor | None] = [None for _ in context.chunks]
         router_accum: list[torch.Tensor | None] = [None for _ in router_params]
         pending_dispatch_bwd: list[tuple[_BackwardChunk, dict[str, Any]]] = []
-        last_deepep_event: Any | None = None
+        last_deepep_event: Any | None = grad_ready
 
         def remember_deepep_event(state: dict[str, Any]):
             nonlocal last_deepep_event
@@ -1543,9 +1546,10 @@ class _SavedContextEPChunkFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        grad_x, router_grads, expert_grads = ctx.backward_op.backward(
-            ctx.saved_forward_context, grad_output
-        )
+        with torch.enable_grad():
+            grad_x, router_grads, expert_grads = ctx.backward_op.backward(
+                ctx.saved_forward_context, grad_output
+            )
         return grad_x, None, None, None, None, *router_grads, *expert_grads
 
 

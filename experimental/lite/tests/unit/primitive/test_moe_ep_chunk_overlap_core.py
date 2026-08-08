@@ -305,3 +305,25 @@ def test_deepep_state_tensors_record_the_consumer_stream(monkeypatch):
 
     assert outer.recorded_stream is stream
     assert nested.recorded_stream is stream
+
+
+def test_saved_backward_chains_first_combine_to_caller_grad_readiness(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+    )
+
+    import inspect
+
+    source = inspect.getsource(_EPChunkOperationBase._saved_context_backward)
+
+    assert "caller_stream = torch.cuda.current_stream(grad_2d.device)" in source
+    assert "grad_ready = torch.cuda.Event()" in source
+    assert "grad_ready.record(caller_stream)" in source
+    assert "last_deepep_event: Any | None = grad_ready" in source
+    assert source.index("grad_ready.record(caller_stream)") < source.index(
+        "submit_deepep_combine_backward"
+    )
+    assert "torch.cuda.synchronize" not in source
