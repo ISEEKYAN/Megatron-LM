@@ -150,8 +150,7 @@ class TemporaryBufferAllocator:
         return BufferLease(tensor=tensor, owner=self, key=key, registered=registered)
 
     def release(self, lease: BufferLease) -> None:
-        # Dynamic storage is reclaimed when the lease drops its final reference.
-        return None
+        _free_storage(lease.tensor)
 
     def release_cached(self, *, force: bool = False) -> None:
         """Drop allocator-owned communication storage before a device move."""
@@ -208,12 +207,9 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
                 slot=slot,
                 registered=registered,
             )
-        return super().allocate(
-            numel,
-            dtype=dtype,
-            device=device,
-            group=group,
-            key=pool_key,
+        raise RuntimeError(
+            "M-FSDP double-buffer capacity exhausted; drain a completed "
+            "gradient reduce before acquiring another slot."
         )
 
     def release(self, lease: BufferLease) -> None:
@@ -247,6 +243,21 @@ def _record_reuse_event(tensor: torch.Tensor) -> Any | None:
 def _wait_for_reuse_event(event: Any | None, tensor: torch.Tensor) -> None:
     if event is not None:
         torch.cuda.current_stream(tensor.device).wait_event(event)
+
+
+def _free_storage(tensor: torch.Tensor) -> None:
+    """Release a temporary communication allocation after its completion event.
+
+    A zero-sized replacement tensor only drops one Python view and leaves the
+    allocator free to retain the original storage.  MCore physically resizes
+    temporary bucket storage after the completion event; do the same here for
+    the non-double-buffer path.
+    """
+    if tensor.numel() == 0:
+        return
+    storage = tensor.untyped_storage()
+    if storage.nbytes() and tensor.storage_offset() == 0:
+        storage.resize_(0)
 
 
 def build_temporary_allocator(
@@ -390,7 +401,9 @@ class ParamBucket:
         self._grad_lease: BufferLease | None = None
         self._param_gather_work: Any | None = None
         self._grad_reduce_work: Any | None = None
+        self._grad_reduce_event: Any | None = None
         self._grad_reduce_launched = False
+        self._grad_reduce_finished = False
         self._full_ready = True
         self.grad_sync_enabled = False
         self.grad_ready_callback: Callable[["ParamBucket"], None] | None = None
@@ -611,10 +624,15 @@ class ParamBucket:
                 spec.full_param.grad = None
         return self.local_grad_comm_buffer, grad_input
 
-    def mark_grad_reduce_launched(self, work: Any | None) -> None:
+    def mark_grad_reduce_launched(
+        self, work: Any | None, completion_event: Any | None = None
+    ) -> None:
         self._grad_reduce_work = work
+        self._grad_reduce_event = completion_event
 
     def wait_grad_reduce(self) -> None:
+        if self._grad_reduce_finished:
+            return
         if not self._grad_reduce_launched:
             tensors = self.prepare_grad_reduce(force=True)
             assert tensors is not None
@@ -629,6 +647,9 @@ class ParamBucket:
                     group=self.process_group,
                     async_op=True,
                 )
+        if self._grad_reduce_event is not None:
+            self._grad_reduce_event.synchronize()
+            self._grad_reduce_event = None
         if self._grad_reduce_work is not None:
             self._grad_reduce_work.wait()
             self._grad_reduce_work = None
@@ -643,6 +664,7 @@ class ParamBucket:
         if self._grad_lease is not None:
             self._grad_lease.release()
             self._grad_lease = None
+        self._grad_reduce_finished = True
 
     def copy_full_parameters_to_shards(self) -> None:
         self.wait_param_gather()
@@ -655,7 +677,9 @@ class ParamBucket:
         if self._grad_reduce_work is not None:
             self._grad_reduce_work.wait()
         self._grad_reduce_work = None
+        self._grad_reduce_event = None
         self._grad_reduce_launched = False
+        self._grad_reduce_finished = False
         self.grad_sync_enabled = False
         self._grad_ready_ids.clear()
         self.main_grad_buffer.zero_()
@@ -1023,11 +1047,15 @@ class GradReducePipeline:
         self.buckets = buckets
         device = buckets[0].device if buckets else torch.device("cpu")
         self.comm_stream = CommunicationStream(device)
+        self._pending: list[tuple[ParamBucket, int]] = []
+        self._pending_bytes = 0
+        self._pending_capacity_bytes = 0
         for bucket in buckets:
             if bucket.config.overlap_grad_reduce:
                 bucket.grad_ready_callback = self.reduce_gradients
 
     def reduce_gradients(self, bucket: ParamBucket, *, force: bool = False) -> None:
+        self._drain_for(bucket)
         tensors = bucket.prepare_grad_reduce(force=force)
         if tensors is None:
             return
@@ -1046,16 +1074,44 @@ class GradReducePipeline:
             )
 
         work = self.comm_stream.launch(collective, (output, grad_input))
-        bucket.mark_grad_reduce_launched(work)
+        completion_event = None
+        if self.comm_stream.stream is not None:
+            completion_event = torch.cuda.Event()
+            completion_event.record(self.comm_stream.stream)
+        bucket.mark_grad_reduce_launched(work, completion_event)
+        byte_count = grad_input.numel() * grad_input.element_size()
+        self._pending.append((bucket, byte_count))
+        self._pending_bytes += byte_count
+
+    def _drain_for(self, bucket: ParamBucket) -> None:
+        """Keep in-flight gradient communication bounded in bytes.
+
+        Two bucket-sized windows match MCore's double-buffer lifecycle.  The
+        queue is byte-based so a large bucket cannot hide behind a small count;
+        draining also makes an exhausted UBR slot available instead of creating
+        a third resident fallback allocation.
+        """
+        byte_count = bucket.full_numel * torch.empty(
+            (), dtype=bucket.policy.grad_comm_dtype
+        ).element_size()
+        self._pending_capacity_bytes = max(self._pending_capacity_bytes, 2 * byte_count)
+        while self._pending and self._pending_bytes + byte_count > self._pending_capacity_bytes:
+            completed, completed_bytes = self._pending.pop(0)
+            completed.wait_grad_reduce()
+            self._pending_bytes -= completed_bytes
 
     def finish(self) -> None:
         for bucket in reversed(self.buckets):
             self.reduce_gradients(bucket, force=True)
         self.comm_stream.wait_for_current()
-        for bucket in self.buckets:
+        while self._pending:
+            bucket, byte_count = self._pending.pop(0)
             bucket.wait_grad_reduce()
+            self._pending_bytes -= byte_count
 
     def reset(self) -> None:
+        self._pending.clear()
+        self._pending_bytes = 0
         for bucket in self.buckets:
             bucket.reset_grad_state()
 

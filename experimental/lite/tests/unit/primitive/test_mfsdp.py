@@ -421,6 +421,50 @@ def test_mfsdp_config_enables_double_buffer_for_nccl_user_buffers():
     assert config.fsdp_double_buffer is True
 
 
+def test_mfsdp_config_keeps_double_buffer_opt_in():
+    config = mfsdp_config.build_mfsdp_config(
+        SimpleNamespace(
+            override_optimizer_config={
+                "mfsdp_sharding_strategy": "optim_grads_params",
+            }
+        )
+    )
+
+    assert config.nccl_ub is False
+    assert config.fsdp_double_buffer is False
+
+
+def test_mfsdp_temporary_lease_physically_releases_storage():
+    allocator = mfsdp_buffer.TemporaryBufferAllocator()
+    lease = allocator.allocate(
+        32,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        group=None,
+        key=("grad",),
+    )
+
+    assert lease.tensor.untyped_storage().nbytes() == 32 * 4
+    lease.release()
+    assert lease.tensor.untyped_storage().nbytes() == 0
+
+
+def test_mfsdp_double_buffer_has_no_third_resident_fallback():
+    allocator = mfsdp_buffer.DoubleBufferAllocator()
+    args = dict(
+        numel=8,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        group=None,
+        key=("grad",),
+    )
+    allocator.allocate(**args)
+    allocator.allocate(**args)
+
+    with pytest.raises(RuntimeError, match="capacity exhausted"):
+        allocator.allocate(**args)
+
+
 def test_mfsdp_nccl_user_buffer_falls_back_when_apex_is_missing(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
