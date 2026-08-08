@@ -2,16 +2,17 @@
 
 ## Decision status
 
-**GO for direct import; NOT READY to claim the CPU-gradient-residency memory
-goal without a separate HDO change.**
+**Mechanical import and construction: GO.  Unchanged-HDO Route-B readiness:
+NO-GO.**
 
 The fixed runtime MCore exposes `HybridDeviceOptimizer` (HDO), and a genuine
 single-node 8-GPU container probe imports and constructs it successfully.  The
 minimal Route-B direction is therefore a thin M-FSDP lifecycle adapter around a
-direct HDO import, not a local reimplementation.  This is not a claim that
-unmodified HDO already meets M-FSDP's CPU-memory target: its first step allocates
-a full CPU gradient staging tensor for every CPU-offloaded parameter, and its
-overlap mode creates one CPU optimizer per parameter.
+direct HDO import, not a local reimplementation.  This does not make unchanged
+HDO ready: its first step allocates a full CPU gradient staging tensor for every
+CPU-offloaded parameter, and its overlap mode creates one CPU optimizer per
+parameter.  Removing that persistent 4N CPU-gradient residency requires an HDO
+change, so it cannot be claimed by a direct-reuse Route B.
 
 ## Evidence source and scope
 
@@ -228,6 +229,19 @@ boundary; CPU RSS/pinned-memory and GPU allocated/reserved cannot be conflated.
 Treat this as performance/memory evidence only (`perf.measure` and
 `application.bench`); it cannot establish numerical correctness.
 
+**Explicit performance/readiness gate.**  A future Route-B implementation is
+ready only if, separately for `offload_fraction=0` and
+`offload_fraction=1`, its matched M-FSDP arm has both lower
+`avg_optimizer_step_ms` and lower end-to-end `avg_step_ms` than the matched
+FSDP2 arm.  For each of those two offload fractions, its three GPU peak
+measurements--steady state, complete optimizer step, and full training
+step--must each also be lower than the matched FSDP2 measurement.  A tie or any
+single failure is **not ready**.  The artifact must additionally publish the
+absolute and relative time and peak-memory gaps to the matched dist_opt arm for
+each fraction; those gaps are required context, not a substituted FSDP2 gate.
+This gate is prospective only: unchanged HDO is already NO-GO on the separate
+persistent-4N CPU-gradient-residency requirement above.
+
 ### B. Precision: independent 50-optimizer-step job
 
 Run a distinct 8-GPU Slurm allocation for 50 optimizer steps.  Construct all
@@ -269,27 +283,40 @@ gate.  This is the end-to-end precision line required by
 
 ## Research execution ledger and honest status
 
-This research did consume GPU time.  The valid final runtime probe was Slurm
-job **15353917**, requested as one node / **8 GPUs** / three-minute walltime;
-it was submitted at `2026-08-08T07:08:55-07:00`, RUNNING at
-`2026-08-08T07:08:57-07:00`, and `sacct` recorded `COMPLETED ExitCode=0:0`.
-Its purpose was runtime import/construction evidence only.  It is not a
-performance, memory, training, or 50-step precision run.  Earlier probe jobs
-are described above only to preserve their validity boundaries.
+This research consumed GPU time under ordinary worker run
+`77d4dad840a02874` on lane `codex_terra`.  The complete probe ledger uses the
+top-level `sacct` `ElapsedRaw x gres/gpu` accounting, including cancelled and
+failed probes; it does not substitute only the final successful job:
 
-No `vk-flow run` (or equivalent task-bound research-run record) was created
-for job 15353917.  Therefore the probe's task binding is reconstructed from the
-task-specific sbatch filename, remote output directory, recorded task log, and
-the checked-in `validation/probe_mcore_hdo_runtime.sbatch`; that is weaker than
-a first-class research-run record.  This gap is explicitly recorded rather
-than represented as zero GPU cost or as a validated formal experiment.  Any
-future performance or precision allocation must be created through the
-task-bound run workflow before submission and must retain the job id, `sacct`,
-raw log, and output artifacts.
+| Job | Top-level state | ElapsedRaw | GPUs | GPU-seconds |
+| --- | --- | ---: | ---: | ---: |
+| 15353607 | CANCELLED | 32 s | 1 | 32 |
+| 15353623 | COMPLETED | 48 s | 8 | 384 |
+| 15353712 | CANCELLED | 37 s | 8 | 296 |
+| 15353750 | COMPLETED | 41 s | 8 | 328 |
+| 15353814 | FAILED | 45 s | 8 | 360 |
+| 15353917 | COMPLETED | 85 s | 8 | 680 |
+| **Total** | | | | **2,080 GPU-s = 0.577777... GPU-h** |
 
-**Current decision:** direct HDO import is feasible at MCore
+All six entries are runtime probes, not performance, memory, training, or
+50-step precision evidence.  The final valid import/construction probe was
+15353917; it was submitted at `2026-08-08T07:08:55-07:00`, RUNNING at
+`2026-08-08T07:08:57-07:00`, and was diagnosed within the five-minute gate.
+
+No formal `vk-flow research run` (or equivalent task-bound research-run record)
+was created for any of these probes.  Their task binding is therefore
+reconstructed from the task-specific sbatch filename, remote output directory,
+recorded task log, and the checked-in
+`validation/probe_mcore_hdo_runtime.sbatch`; this is a real process gap, not a
+zero-cost claim or a validated formal experiment.  Any future performance or
+precision allocation must be created through the task-bound run workflow before
+submission and must retain the job id, `sacct`, raw log, and output artifacts.
+
+**Current decision:** mechanical HDO import and construction are GO at MCore
 `6204b925f3da8b998524c6bb47a9ca779d95ce2e`, conditional on implementing and
-testing the lifecycle contract above.  It is **not approved to implement in
-this task**, and neither the HDO 4N CPU-gradient residency nor the formal
-8-GPU performance/memory/precision acceptance design has been validated.  The
-stale contrary conclusion that no Slurm job existed has been removed.
+testing the lifecycle contract above.  **Unchanged-HDO Route-B readiness is
+NO-GO** because its persistent 4N CPU-gradient staging can be removed only by
+changing HDO; that change is neither direct reuse nor approved in this task.
+Neither the formal 8-GPU performance/memory gate nor the precision design has
+been validated.  The stale contrary conclusion that no Slurm job existed has
+been removed.
