@@ -81,38 +81,29 @@ def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
     _assert_state_equal(optimizer.state_dict(), expected)
 
 
-def test_dcp_load_refreshes_mfsdp_shards_from_loaded_full_parameters(
+def test_dcp_load_writes_mfsdp_persistent_shards_directly(
     monkeypatch, tmp_path
 ) -> None:
-    class FakeParamSync:
-        def __init__(self, full_param: torch.nn.Parameter) -> None:
-            self.full_param = full_param
-            self.shard_param = torch.full_like(full_param, -7.0, dtype=torch.float32)
-            self.copy_calls = 0
-
-        def copy_full_parameters_to_shards(self) -> None:
-            self.copy_calls += 1
-            self.shard_param.copy_(self.full_param.float())
-
     class FakeMFSdpModule(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.weight = torch.nn.Parameter(torch.zeros(2, dtype=torch.bfloat16))
-            self.param_sync = FakeParamSync(self.weight)
+            self.weight = torch.nn.Parameter(torch.full((2,), -7.0))
+            self.bucket = SimpleNamespace(
+                process_group=None, full_numel=self.weight.numel()
+            )
+
+        def iter_persistent_shards(self):
+            yield "weight", self.weight, self.bucket
 
     model = FakeMFSdpModule()
 
     monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: False)
     monkeypatch.setattr(dcp, "_build_meshes", lambda _config: (object(), object()))
-    monkeypatch.setattr(
-        dcp,
-        "_empty_dcp_tensor_like_param",
-        lambda param, _mesh, _placements: torch.empty_like(param),
-    )
-
     def fake_load(state_dict, checkpoint_id) -> None:
         assert checkpoint_id == str(tmp_path)
-        state_dict["model.weight"].fill_(3.0)
+        next(value for key, value in state_dict.items() if key.startswith("model.")).fill_(
+            3.0
+        )
 
     monkeypatch.setattr(dcp.dcp, "load", fake_load)
 
@@ -126,10 +117,9 @@ def test_dcp_load_refreshes_mfsdp_shards_from_loaded_full_parameters(
         load_optimizer=False,
     )
 
-    assert model.param_sync.copy_calls == 1
     torch.testing.assert_close(
-        model.param_sync.shard_param,
-        torch.full_like(model.param_sync.shard_param, 3.0),
+        model.weight,
+        torch.full_like(model.weight, 3.0),
     )
 
 

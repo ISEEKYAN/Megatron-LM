@@ -49,26 +49,36 @@ same-command PR #89 archive.
   available.
 - Root/non-unit dynamic fallback allocation: `equivalent-with-proof`.
 - Unit post-forward reshard: `equivalent-with-proof`.
-- Cross-unit tied/shared parameters: `missing`.
+- Cross-unit tied/shared parameters: `equivalent-with-proof`; all bindings are
+  discovered with `remove_duplicate=False`, promoted to the root owner, and
+  represented by one reduction spec.
 - Saved-tensor parameter-view restoration: `equivalent-with-proof`.
 - Recompute `PRE_BACKWARD` release: `equivalent-with-proof`.
 - Ordinary and TE GroupedLinear authoritative FP32 gradient destination:
   `equivalent-with-proof`; both write the parameter-group FP32 bucket directly.
-- TE delayed-wgrad callback: `missing`.
+- TE delayed-wgrad callback: `equivalent-with-proof`; parameters marked
+  `skip_backward_post_hook` receive MCore's post-wgrad completion callback.
 - Globally stable RS ordering: `equivalent-with-proof`.
 - RS Work completion: `equivalent-with-proof`; normal paths install stream
   dependencies and consume ProcessGroup Work without host event synchronization.
 - Multi-microbatch FP32 shard accumulation: `equivalent-with-proof`.
 - Optimizer step to next AG: `equivalent-with-proof`.
 - Eval-to-train overlap lifecycle: `equivalent-with-proof`, GPU job 15407429.
-- Public `named_parameters` and `state_dict`: `divergent`.
-- Model DCP persistent distributed state: `divergent`.
+- Public `named_parameters` and `state_dict`: `equivalent-with-proof`; both
+  expose persistent optimizer shards and never call `materialize_all`.
+- Model DCP persistent distributed state: `equivalent-with-proof` for the same
+  topology. Each parameter is a DP-group `DTensor` over its authoritative
+  flat shard; group identity and VPP chunk index are part of the key.
+  Cross-topology M-FSDP restore is `unsupported-fail-fast` because changing
+  DP-group membership changes the key/global padded shape.
 - Model-only restore and CPU-master refresh: `equivalent-with-proof`.
 - Bounded HF export: `equivalent-with-proof`.
 - Forward/backward exception teardown: `partial`; fail-fast cleanup is proven
   only for the covered CPU/Gloo cases.
 - Device move: `equivalent-with-proof` for current offload contract.
-- PP/VPP chunk state and checkpoint-key uniqueness: `missing`.
+- PP/VPP chunk state and checkpoint-key uniqueness: `equivalent-with-proof`;
+  checkpoint keys include PP stage, VPP chunk, canonical parameter name, and
+  data-group identity.
 - Full DP/TP/EP/ETP/PP/VPP/CP topology contract: `missing`.
 
 ## Root backward lifecycle

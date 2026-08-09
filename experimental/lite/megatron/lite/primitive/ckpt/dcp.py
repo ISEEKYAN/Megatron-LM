@@ -31,6 +31,7 @@ from torch.distributed.device_mesh import (
     DeviceMesh,
 )  # pyright: ignore[reportMissingImports]
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
+from torch.distributed.tensor.placement_types import Shard
 
 
 def save_training_checkpoint(
@@ -77,8 +78,12 @@ def save_training_checkpoint(
         return
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
-    if not isinstance(model, nn.Module):
-        raise TypeError("DCP checkpointing currently expects a single nn.Module.")
+    chunks = _model_chunks(model)
+    mfsdp_shards = _mfsdp_persistent_shards(chunks)
+    if len(chunks) != 1 and mfsdp_shards is None:
+        raise TypeError(
+            "Multi-chunk DCP checkpointing requires M-FSDP persistent shard state."
+        )
     dense_mesh, expert_mesh = _build_meshes(config)
     state_dict: dict = {"step": step}
     # Pipeline stages own DIFFERENT parameters but their local layers re-index
@@ -88,12 +93,17 @@ def save_training_checkpoint(
     model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
     if save_model:
-        for name, param in model.named_parameters():
-            placements = get_placements(name)
-            mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(
-                param, mesh, placements
-            )
+        if mfsdp_shards is not None:
+            for chunk_idx, name, param, bucket in mfsdp_shards:
+                key = _mfsdp_state_key(model_prefix, chunk_idx, name, bucket)
+                state_dict[key] = _dcp_tensor_from_mfsdp_shard(param, bucket)
+        else:
+            for name, param in chunks[0].named_parameters():
+                placements = get_placements(name)
+                mesh = expert_mesh if is_expert(name) else dense_mesh
+                state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(
+                    param, mesh, placements
+                )
 
     ckpt_path = os.path.join(path, f"step_{step}")
     os.makedirs(ckpt_path, exist_ok=True)
@@ -146,8 +156,12 @@ def load_training_checkpoint(
         return step
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
-    if not isinstance(model, nn.Module):
-        raise TypeError("DCP checkpointing currently expects a single nn.Module.")
+    chunks = _model_chunks(model)
+    mfsdp_shards = _mfsdp_persistent_shards(chunks)
+    if len(chunks) != 1 and mfsdp_shards is None:
+        raise TypeError(
+            "Multi-chunk DCP checkpointing requires M-FSDP persistent shard state."
+        )
     dense_mesh, expert_mesh = _build_meshes(config)
 
     state_dict: dict = {"step": 0}
@@ -156,23 +170,33 @@ def load_training_checkpoint(
     model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
     if load_model:
-        for name, param in model.named_parameters():
-            placements = get_placements(name)
-            mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _empty_dcp_tensor_like_param(
-                param, mesh, placements
-            )
+        if mfsdp_shards is not None:
+            for chunk_idx, name, param, bucket in mfsdp_shards:
+                key = _mfsdp_state_key(model_prefix, chunk_idx, name, bucket)
+                state_dict[key] = _empty_dcp_tensor_like_mfsdp_shard(param, bucket)
+        else:
+            for name, param in chunks[0].named_parameters():
+                placements = get_placements(name)
+                mesh = expert_mesh if is_expert(name) else dense_mesh
+                state_dict[f"{model_prefix}.{name}"] = _empty_dcp_tensor_like_param(
+                    param, mesh, placements
+                )
 
     dcp.load(state_dict, checkpoint_id=ckpt_path)
 
     if load_model:
-        for name, param in model.named_parameters():
-            key = f"{model_prefix}.{name}"
-            if key in state_dict:
-                t = state_dict[key]
+        if mfsdp_shards is not None:
+            for chunk_idx, name, param, bucket in mfsdp_shards:
+                key = _mfsdp_state_key(model_prefix, chunk_idx, name, bucket)
                 with torch.no_grad():
-                    _copy_tensor_(param, t)
-        _copy_full_parameters_to_shards_if_available(model)
+                    _copy_tensor_(param, state_dict[key])
+        else:
+            for name, param in chunks[0].named_parameters():
+                key = f"{model_prefix}.{name}"
+                if key in state_dict:
+                    t = state_dict[key]
+                    with torch.no_grad():
+                        _copy_tensor_(param, t)
 
     optimizer_loaded = load_optimizer and _load_optimizer_checkpoint(
         optimizer, ckpt_path
@@ -295,18 +319,65 @@ def _model_chunks(model: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:
     return chunks
 
 
-def _copy_full_parameters_to_shards_if_available(
-    model: nn.Module | Iterable[nn.Module],
-) -> None:
-    for chunk in _model_chunks(model):
-        for module in chunk.modules():
-            copy_fn = getattr(
-                getattr(module, "param_sync", None),
-                "copy_full_parameters_to_shards",
-                None,
-            )
-            if callable(copy_fn):
-                copy_fn()
+def _mfsdp_persistent_shards(chunks: list[nn.Module]):
+    shards = []
+    for chunk_idx, chunk in enumerate(chunks):
+        iterator = getattr(chunk, "iter_persistent_shards", None)
+        if not callable(iterator):
+            return None
+        shards.extend(
+            (chunk_idx, name, param, bucket)
+            for name, param, bucket in iterator()
+        )
+    return shards
+
+
+def _mfsdp_group_ranks(bucket) -> tuple[int, ...]:
+    if not dist.is_available() or not dist.is_initialized():
+        return (0,)
+    group = bucket.process_group
+    if group is None:
+        return tuple(range(dist.get_world_size()))
+    return tuple(dist.get_process_group_ranks(group))
+
+
+def _mfsdp_state_key(
+    model_prefix: str, chunk_idx: int, name: str, bucket
+) -> str:
+    group_identity = "-".join(str(rank) for rank in _mfsdp_group_ranks(bucket))
+    return f"{model_prefix}.chunk{chunk_idx}.{name}.__dp_group_{group_identity}"
+
+
+def _dcp_tensor_from_mfsdp_shard(param: torch.Tensor, bucket):
+    local = _to_local_tensor(param).detach()
+    ranks = _mfsdp_group_ranks(bucket)
+    if len(ranks) == 1:
+        return local
+    mesh = DeviceMesh(local.device.type, torch.tensor(ranks))
+    return DTensor.from_local(
+        local,
+        mesh,
+        [Shard(0)],
+        shape=(bucket.full_numel,),
+        stride=(1,),
+        run_check=False,
+    )
+
+
+def _empty_dcp_tensor_like_mfsdp_shard(param: torch.Tensor, bucket):
+    local = torch.empty_like(_to_local_tensor(param))
+    ranks = _mfsdp_group_ranks(bucket)
+    if len(ranks) == 1:
+        return local
+    mesh = DeviceMesh(local.device.type, torch.tensor(ranks))
+    return DTensor.from_local(
+        local,
+        mesh,
+        [Shard(0)],
+        shape=(bucket.full_numel,),
+        stride=(1,),
+        run_check=False,
+    )
 
 
 def _sync_optimizer_main_weights_from_model_if_available(optimizer) -> None:

@@ -87,7 +87,6 @@ class MegatronFSDP(nn.Module):
         super().__init__()
         self.module = module
         self.mfsdp_config = config
-        self._expose_sharded_parameters = True
         self.param_and_grad_buffer = ParamAndGradBuffer(
             module,
             groups=groups,
@@ -257,27 +256,27 @@ class MegatronFSDP(nn.Module):
             if name not in covered:
                 yield name, param
 
+    def iter_persistent_shards(self):
+        """Yield canonical names and persistent local shards for checkpointing."""
+        for bucket in self.param_sync.buckets:
+            for spec in bucket.specs:
+                assert spec.shard_param is not None
+                yield spec.name, spec.shard_param, bucket
+
     def named_parameters(self, *args, **kwargs) -> Iterator[tuple[str, nn.Parameter]]:
-        if not self._expose_sharded_parameters:
-            self.param_sync.materialize_all()
+        """Expose persistent optimizer shards without transient all-gathers."""
         return super().named_parameters(*args, **kwargs)
 
     def state_dict(self, *args, **kwargs):
-        self.param_sync.materialize_all()
+        """Return persistent shard state; full weights require explicit export."""
         return super().state_dict(*args, **kwargs)
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
-        self.param_sync.materialize_all()
-        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
-        self.param_sync.copy_full_parameters_to_shards()
-        return result
+        """Load persistent shard state without allocating full model weights."""
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
 
 MFSdpModule = MegatronFSDP
-
-
-def mark_optimizer_built(module: MegatronFSDP) -> None:
-    module._expose_sharded_parameters = False
 
 
 def _module_by_id(root: nn.Module, module_id: int) -> nn.Module:
@@ -294,4 +293,4 @@ def _enable_fused_wgrad_accumulation(module: nn.Module) -> None:
             child.fuse_wgrad_accumulation = True
 
 
-__all__ = ["MFSdpModule", "MegatronFSDP", "mark_optimizer_built"]
+__all__ = ["MFSdpModule", "MegatronFSDP"]

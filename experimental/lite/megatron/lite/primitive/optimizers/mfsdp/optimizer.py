@@ -32,10 +32,7 @@ from megatron.lite.primitive.optimizers.mfsdp.grad_norm import (
     local_grad_sq_sum,
     resolve_torch_dtype,
 )
-from megatron.lite.primitive.optimizers.mfsdp.wrapper import (
-    MFSdpModule,
-    mark_optimizer_built,
-)
+from megatron.lite.primitive.optimizers.mfsdp.wrapper import MFSdpModule
 
 ExpertClassifierFn = Callable[[str], bool]
 _MFSDP_PARAM_VALUES_KEY = "_mfsdp_param_values"
@@ -458,8 +455,6 @@ def build_mfsdp_stack(
         ),
         cpu_group=cpu_group,
     )
-    for chunk in wrapped_chunks:
-        mark_optimizer_built(chunk)
     optimizer = MFSdpOptimizer(standalone_optimizer, wrapped_chunks)
     return wrapped_chunks, optimizer
 

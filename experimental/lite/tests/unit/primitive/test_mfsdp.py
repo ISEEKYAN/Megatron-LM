@@ -25,6 +25,7 @@ from megatron.lite.primitive.optimizers.mfsdp import (  # isort: skip
 from megatron.lite.primitive.optimizers.mfsdp import (  # isort: skip
     optimizer as mfsdp_optimizer,
 )
+from megatron.lite.primitive.optimizers.mfsdp import wrapper as mfsdp_wrapper  # isort: skip
 
 
 class _GlooUnit(torch.nn.Module):
@@ -896,7 +897,9 @@ def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
     }
     assert reference_params.keys() == candidate_params.keys()
     for name, reference_param in reference_params.items():
-        assert torch.equal(reference_param, candidate_params[name]), name
+        assert torch.equal(
+            reference_param.reshape(-1), candidate_params[name].reshape(-1)
+        ), name
 
     saved_model = {
         name: value.clone() for name, value in chunks[0].state_dict().items()
@@ -909,6 +912,65 @@ def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
     assert saved_model.keys() == restored_model.keys()
     for name, value in saved_model.items():
         assert torch.equal(value, restored_model[name]), name
+
+
+def test_mfsdp_public_state_uses_persistent_shards_without_materialize_all(
+    monkeypatch,
+):
+    chunk, _optimizer = _single_rank_mfsdp_stack()
+    monkeypatch.setattr(
+        chunk.param_sync,
+        "materialize_all",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("public state must not gather full parameters")
+        ),
+    )
+
+    named = dict(chunk.named_parameters())
+    held_state = chunk.state_dict()
+    saved = {name: value.clone() for name, value in held_state.items()}
+    with torch.no_grad():
+        chunk(torch.randn(2, 4))
+
+    assert named
+    assert saved
+    assert all(
+        bucket._full_lease is None and not bucket._full_ready
+        for bucket in chunk.param_sync.buckets
+    )
+    for name, value in saved.items():
+        assert torch.equal(value, held_state[name])
+        assert torch.equal(value, chunk.state_dict()[name])
+
+
+def test_mfsdp_dcp_multi_chunk_keys_do_not_collide(monkeypatch, tmp_path):
+    first, _first_optimizer = _single_rank_mfsdp_stack()
+    second, _second_optimizer = _single_rank_mfsdp_stack()
+    captured = {}
+    monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: False)
+    monkeypatch.setattr(dcp, "_build_meshes", lambda _config: (object(), object()))
+    monkeypatch.setattr(
+        dcp.dcp,
+        "save",
+        lambda state_dict, checkpoint_id: captured.update(state_dict),
+    )
+
+    dcp.save_training_checkpoint(
+        [first, second],
+        optimizer=None,
+        step=3,
+        path=str(tmp_path),
+        config=object(),
+        ps=SimpleNamespace(pp_rank=0, pp_size=1),
+        save_rng=False,
+        save_optimizer=False,
+    )
+
+    model_keys = [key for key in captured if key.startswith("model.")]
+    assert model_keys
+    assert len(model_keys) == len(set(model_keys))
+    assert any(".chunk0." in key for key in model_keys)
+    assert any(".chunk1." in key for key in model_keys)
 
 
 def _build_offload_stack(offload_fraction: float):
@@ -2404,6 +2466,60 @@ def test_mfsdp_cross_unit_tied_parameter_is_promoted_to_root_and_reduced_once():
     assert spec.full_param._is_shared is True
 
 
+def test_mfsdp_cross_unit_tied_parameter_backward_matches_unwrapped_model():
+    class Unit(torch.nn.Module):
+        def __init__(self, weight):
+            super().__init__()
+            self.weight = weight
+
+        def forward(self, value):
+            return torch.nn.functional.linear(value, self.weight)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            weight = torch.nn.Parameter(torch.randn(3, 4))
+            self.first = Unit(weight)
+            self.second = Unit(weight)
+
+        def forward(self, value):
+            return self.first(value) + self.second(value)
+
+    torch.manual_seed(17)
+    reference = Model()
+    candidate = copy.deepcopy(reference)
+    wrapped = mfsdp_wrapper.MegatronFSDP(
+        candidate,
+        groups=mfsdp_buffer.MFSDPProcessGroups(
+            dense_dp=None,
+            expert_dp=None,
+            dense_ag=None,
+            expert_ag=None,
+            tp=None,
+            etp=None,
+            ep=None,
+            pp=None,
+        ),
+        config=mfsdp_config.MFSDPConfig(bucket_size=None),
+        is_expert=lambda _name: False,
+        unit_modules=(Unit,),
+    )
+    value = torch.randn(2, 4)
+
+    reference(value).sum().backward()
+    wrapped(value).sum().backward()
+    wrapped.finish_grad_sync()
+
+    bucket = wrapped.param_sync.buckets[0]
+    shard_param = bucket.specs[0].shard_param
+    assert shard_param is not None
+    assert torch.equal(
+        shard_param.grad.reshape_as(reference.first.weight.grad),
+        reference.first.weight.grad,
+    )
+    assert len(bucket._grad_ready_ids) == 0
+
+
 def test_mfsdp_delayed_wgrad_parameter_installs_completion_callback():
     model = torch.nn.Linear(4, 3, bias=False)
     model.weight.skip_backward_post_hook = True
@@ -2718,7 +2834,11 @@ def test_mfsdp_keeps_fp32_shards_for_bfloat16_compute_parameters():
     optimizer_params = _optimizer_params(optimizer)
     assert all(param.dtype is torch.float32 for param in optimizer_params)
     assert all(
-        param.dtype is torch.bfloat16 for _name, param in chunks[0].named_parameters()
+        param.dtype is torch.float32 for _name, param in chunks[0].named_parameters()
+    )
+    assert all(
+        param.dtype is torch.bfloat16
+        for _name, param in chunks[0].stream_full_parameters()
     )
     assert all(
         bucket.grad_shard_buffer.dtype is torch.float32
@@ -2994,8 +3114,14 @@ def _run_mfsdp_gloo_parity(rank: int, world_size: int, init_file: str) -> None:
             for name, param in chunks[0].named_parameters()
         }
         assert reference_params.keys() == candidate_params.keys()
-        for name, reference_param in reference_params.items():
-            assert torch.equal(reference_param, candidate_params[name]), name
+        for bucket in chunks[0].param_sync.buckets:
+            for spec in bucket.specs:
+                expected = (
+                    reference_params[spec.name]
+                    .reshape(-1)
+                    .narrow(0, spec.param_offset, spec.shard_numel)
+                )
+                assert torch.equal(candidate_params[spec.name], expected), spec.name
     finally:
         dist.destroy_process_group()
 
