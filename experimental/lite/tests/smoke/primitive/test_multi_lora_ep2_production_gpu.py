@@ -323,6 +323,24 @@ def _bank_parameters(bundle) -> dict[str, torch.Tensor]:
     return parameters
 
 
+def _bank_surface_kind(bundle, parameter: torch.Tensor) -> str:
+    """Classify encoded bank parameters through the registry's native surface."""
+    state = bundle.extras["multi_lora_training_state"]
+    matches = []
+    for surface, bank in state.registry.banks.items():
+        if parameter is bank.a_bank or parameter is bank.b_bank:
+            matches.append(surface)
+    assert (
+        len(matches) == 1
+    ), f"bank parameter has ambiguous/missing registry surface: {matches}"
+    surface = matches[0]
+    if ".moe.experts._fc" in surface:
+        return "fc"
+    if ".attn." in surface:
+        return "attention"
+    raise AssertionError(f"unsupported model-owned bank surface: {surface}")
+
+
 def _run_bank_gradient_contract(bundle) -> None:
     """Exercise mixed token routing and inspect each semantic A/B slot axis."""
     state = bundle.extras["multi_lora_training_state"]
@@ -430,7 +448,7 @@ def _group_ranks(group) -> tuple[int, ...]:
 
 
 def _optimizer_param_range(
-    bundle, parameter: torch.Tensor, *, is_fc: bool
+    bundle, parameter: torch.Tensor
 ) -> tuple[int, object, object, object, object] | None:
     """Resolve this rank's optional dist-opt shard for one dense bank.
 
@@ -438,6 +456,7 @@ def _optimizer_param_range(
     a valid rank may own none of a small bank.  Global ownership is checked
     only after gathering the local records below.
     """
+    is_fc = _bank_surface_kind(bundle, parameter) == "fc"
     owners = [
         (index, child)
         for index, child in enumerate(_distributed_optimizer_leaves(bundle.optimizer))
@@ -486,7 +505,7 @@ def _assert_dense_owner_contract(
 ) -> None:
     """Prove every local shard maps to one dense leaf, never the EP child."""
     assert records, f"no distributed-optimizer shard found for semantic bank {name}"
-    is_fc = ".moe.experts._fc" in name
+    is_fc = _bank_surface_kind(bundle, _bank_parameters(bundle)[name]) == "fc"
     expected_ranks = _group_ranks(
         bundle.parallel_state.ep_dp_group if is_fc else bundle.parallel_state.dp_group
     )
@@ -509,7 +528,7 @@ def _bank_sync_absolute_oracle(
     """Reference FC as EP→expert-DP; attention as dense-DP only."""
     expected: dict[str, torch.Tensor] = {}
     for name, contribution in local_contributions.items():
-        if ".moe.experts._fc" in name:
+        if _bank_surface_kind(bundle, _bank_parameters(bundle)[name]) == "fc":
             bank_dtype = _bank_parameters(bundle)[name].dtype
             assert bank_dtype is torch.bfloat16
             assert contribution.dtype is torch.float32
@@ -519,7 +538,10 @@ def _bank_sync_absolute_oracle(
             dist.all_reduce(value, group=bundle.parallel_state.ep_dp_group)
             value.div_(bundle.parallel_state.expert_dp_size)
         else:
-            assert ".attn." in name
+            assert (
+                _bank_surface_kind(bundle, _bank_parameters(bundle)[name])
+                == "attention"
+            )
             assert contribution.dtype is torch.float32
             value = contribution.to("cuda")
             value = value.float()
@@ -529,9 +551,7 @@ def _bank_sync_absolute_oracle(
     expected_keys = set(local_contributions)
     local_factors: dict[str, dict[str, object]] = {}
     for name, parameter in _bank_parameters(bundle).items():
-        owned = _optimizer_param_range(
-            bundle, parameter, is_fc=".moe.experts._fc" in name
-        )
+        owned = _optimizer_param_range(bundle, parameter)
         if owned is None:
             continue
         leaf_index, owner, _param_range, buffer, bucket = owned
@@ -544,7 +564,7 @@ def _bank_sync_absolute_oracle(
     optimizer_expected: dict[str, torch.Tensor] = {}
     factors: dict[str, float] = {}
     for name in sorted(expected_keys):
-        is_fc = ".moe.experts._fc" in name
+        is_fc = _bank_surface_kind(bundle, _bank_parameters(bundle)[name]) == "fc"
         expected_factor = 1.0 / (
             bundle.parallel_state.expert_dp_size
             if is_fc
@@ -571,7 +591,7 @@ def _reconstruct_optimizer_owned_bank_grads(bundle) -> dict[str, torch.Tensor]:
     reconstructed: dict[str, torch.Tensor] = {}
     for name in sorted(parameters):
         parameter = parameters[name]
-        is_fc = ".moe.experts._fc" in name
+        is_fc = _bank_surface_kind(bundle, parameter) == "fc"
         group = (
             bundle.parallel_state.ep_dp_group
             if is_fc
@@ -581,7 +601,7 @@ def _reconstruct_optimizer_owned_bank_grads(bundle) -> dict[str, torch.Tensor]:
         # Ownership metadata is local and may be absent.  Never raise before
         # the owner group has collectively observed every rank's result.
         try:
-            owned = _optimizer_param_range(bundle, parameter, is_fc=is_fc)
+            owned = _optimizer_param_range(bundle, parameter)
             if owned is not None:
                 leaf_index, owner, param_range, buffer, bucket = owned
                 reduced = bucket.grad_data.view(-1)[
@@ -1028,7 +1048,9 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
     expected_batch = manifest["batch_by_rank"][dist.get_rank()]
     assert _batch_record(batch) == expected_batch
     for name, parameter in state.named_parameters():
-        _assert_model_owned_bank_allreduce(parameter, is_fc=".moe.experts._fc" in name)
+        _assert_model_owned_bank_allreduce(
+            parameter, is_fc=_bank_surface_kind(bundle, parameter) == "fc"
+        )
     expected_keys = _expected_semantic_bank_keys(state)
     assert set(oracle_grads) == expected_keys == set(manifest["semantic_bank_keys"])
     _initialize_nonzero_banks(bundle)
@@ -1146,7 +1168,7 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
         protocol.MoELoraSidecar = original_sidecar
     assert set(unsynced_grads) == expected_keys
     for name, oracle in oracle_grads.items():
-        if ".moe.experts._fc" in name:
+        if _bank_surface_kind(bundle, _bank_parameters(bundle)[name]) == "fc":
             group_ranks = tuple(
                 dist.get_process_group_ranks(bundle.parallel_state.ep_dp_group)
             )

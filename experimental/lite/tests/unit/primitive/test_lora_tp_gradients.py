@@ -796,3 +796,67 @@ def test_model_owned_bank_allreduce_is_explicit_and_bool_like():
     _assert_model_owned_bank_allreduce(SimpleNamespace(allreduce=0), is_fc=True)
     with pytest.raises(AssertionError, match="missing allreduce"):
         _assert_model_owned_bank_allreduce(SimpleNamespace(), is_fc=False)
+
+
+def test_encoded_bank_parameter_uses_registry_surface_metadata():
+    from experimental.lite.tests.smoke.primitive.test_multi_lora_ep2_production_gpu import (
+        _bank_surface_kind,
+    )
+
+    fc_a, fc_b, attn_a, attn_b = (torch.tensor(float(index)) for index in range(4))
+    state = SimpleNamespace(
+        registry=SimpleNamespace(
+            banks={
+                "layers.0.moe.experts._fc1_weight_0": SimpleNamespace(
+                    a_bank=fc_a, b_bank=fc_b
+                ),
+                "layers.0.attn.qkv.linear.weight": SimpleNamespace(
+                    a_bank=attn_a, b_bank=attn_b
+                ),
+            }
+        )
+    )
+    bundle = SimpleNamespace(extras={"multi_lora_training_state": state})
+    encoded = {
+        "bank_66635f615f5f_a": fc_a,
+        "bank_66635f625f5f_b": fc_b,
+        "bank_6174746e5f615f_a": attn_a,
+        "bank_6174746e5f625f_b": attn_b,
+    }
+    assert all(
+        ".moe.experts._fc" not in name and ".attn." not in name for name in encoded
+    )
+    assert [
+        _bank_surface_kind(bundle, parameter) for parameter in encoded.values()
+    ] == ["fc", "fc", "attention", "attention"]
+
+
+@pytest.mark.parametrize(
+    "surfaces, message",
+    [
+        ({}, "ambiguous/missing"),
+        ({"x": None, "y": None}, "ambiguous/missing"),
+        ({"layers.0.other": None}, "unsupported"),
+    ],
+)
+def test_bank_surface_metadata_fails_loud_for_missing_ambiguous_or_unsupported(
+    surfaces, message
+):
+    from experimental.lite.tests.smoke.primitive.test_multi_lora_ep2_production_gpu import (
+        _bank_surface_kind,
+    )
+
+    parameter = torch.tensor(1.0)
+    banks = {
+        surface: SimpleNamespace(a_bank=parameter, b_bank=torch.tensor(2.0))
+        for surface in surfaces
+    }
+    bundle = SimpleNamespace(
+        extras={
+            "multi_lora_training_state": SimpleNamespace(
+                registry=SimpleNamespace(banks=banks)
+            )
+        }
+    )
+    with pytest.raises(AssertionError, match=message):
+        _bank_surface_kind(bundle, parameter)
