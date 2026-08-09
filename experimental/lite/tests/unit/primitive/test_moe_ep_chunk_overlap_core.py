@@ -6,6 +6,7 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -186,12 +187,11 @@ def test_dispatch_local_backward_accumulates_duplicate_rows_in_workspace(
     )
     workspace = EPChunkWorkspaceRegistry().get_or_create(key, lambda slot: slot)
     lease = workspace.acquire(0)
-    recv_hidden_base = torch.full((3, 2), 17.0)
+    dispatched_base = torch.full((4, 2), 17.0)
     recv_probs_base = torch.full((3, 2), 19.0)
     chunk = SimpleNamespace(
         idx=0,
         workspace_lease=lease,
-        recv_hidden_base=recv_hidden_base,
         recv_probs_base=recv_probs_base,
         row_id_map=torch.tensor([0, 0, 2]),
         prob_flat_indices=torch.tensor([1, 3, 5]),
@@ -205,9 +205,10 @@ def test_dispatch_local_backward_accumulates_duplicate_rows_in_workspace(
         chunk,
         torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
         torch.tensor([0.25, 0.5, 0.75]),
+        hidden_reuse_base=dispatched_base,
     )
 
-    assert grad_hidden.data_ptr() == recv_hidden_base.data_ptr()
+    assert grad_hidden.data_ptr() == dispatched_base.data_ptr()
     assert grad_probs.data_ptr() == recv_probs_base.data_ptr()
     assert workspace.metrics()["runtime_allocations"] == 0
 
@@ -228,11 +229,10 @@ def test_dispatch_local_backward_clears_reused_scratch_before_sparse_writes(
         _dispatch_local_backward,
     )
 
-    recv_hidden_base = torch.full((3, 2), 17.0)
+    expert_out_base = torch.full((4, 2), 17.0)
     recv_probs_base = torch.full((3, 2), 19.0)
 
     chunk = SimpleNamespace(
-        recv_hidden_base=recv_hidden_base,
         recv_probs_base=recv_probs_base,
         row_id_map=torch.tensor([0, 2]),
         prob_flat_indices=torch.tensor([1, 5]),
@@ -246,6 +246,7 @@ def test_dispatch_local_backward_clears_reused_scratch_before_sparse_writes(
         chunk,
         torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
         torch.tensor([0.25, 0.75]),
+        hidden_reuse_base=expert_out_base,
     )
     torch.testing.assert_close(
         grad_hidden, torch.tensor([[1.0, 2.0], [0.0, 0.0], [3.0, 4.0]])
@@ -255,14 +256,49 @@ def test_dispatch_local_backward_clears_reused_scratch_before_sparse_writes(
         torch.tensor([[0.0, 0.25], [0.0, 0.0], [0.0, 0.75]]),
     )
 
-    recv_hidden_base.fill_(23.0)
+    expert_out_base.fill_(23.0)
     recv_probs_base.fill_(29.0)
     _grad_hidden, grad_probs_none = _dispatch_local_backward(
         chunk,
         torch.tensor([[5.0, 6.0], [7.0, 8.0]]),
         None,
+        hidden_reuse_base=expert_out_base,
     )
     torch.testing.assert_close(grad_probs_none, torch.zeros_like(grad_probs_none))
+
+
+def test_dispatch_local_backward_fails_loud_for_invalid_hidden_reuse_storage(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _dispatch_local_backward,
+    )
+
+    chunk = SimpleNamespace(
+        recv_probs_base=torch.empty(3, 2),
+        row_id_map=torch.tensor([0, 2]),
+        prob_flat_indices=torch.tensor([1, 5]),
+        recv_hidden_shape=torch.Size((3, 2)),
+        recv_hidden_dtype=torch.float32,
+        recv_probs_shape=torch.Size((3, 2)),
+        recv_probs_dtype=torch.float32,
+    )
+    grad_dispatched = torch.ones(2, 2)
+    invalid_bases = (
+        torch.empty(2, 2),
+        torch.empty(2, 4).t(),
+        torch.empty(3, 2, dtype=torch.float64),
+    )
+
+    for hidden_reuse_base in invalid_bases:
+        with pytest.raises(RuntimeError, match="hidden reuse storage"):
+            _dispatch_local_backward(
+                chunk,
+                grad_dispatched,
+                None,
+                hidden_reuse_base=hidden_reuse_base,
+            )
 
 
 def test_accumulate_reuses_first_chunk_gradient_storage(
@@ -593,7 +629,7 @@ def test_saved_context_wrapper_resets_scratch_after_backward_op_returns(
     assert "cuda.synchronize" not in source
 
 
-def test_saved_backward_drops_expert_graph_before_allocating_grad_recv(
+def test_saved_backward_flushes_delayed_wgrad_before_reusing_dispatched_storage(
     transformer_engine_import_stub,
 ):
     import inspect
@@ -605,10 +641,15 @@ def test_saved_backward_drops_expert_graph_before_allocating_grad_recv(
 
     source = inspect.getsource(_EPChunkOperationBase._saved_context_backward)
     grad_complete = source.index("expert_grads = torch.autograd.grad(")
-    graph_cleared = source.index("saved.dispatched = None")
-    scratch_allocated = source.index("_dispatch_local_backward(")
+    queued = source.index("pending_dispatch_bwd.append")
+    flushed = source.index("flush_delayed_weight_grads")
+    flush_waited = source.index("compute_stream.wait_event(wgrad_done)")
+    alias_taken = source.index("hidden_reuse_base = chunk.dispatched.detach()")
+    graph_cleared = source.index("saved.dispatched = None", alias_taken)
+    storage_overwritten = source.index("_dispatch_local_backward(", graph_cleared)
 
-    assert grad_complete < graph_cleared < scratch_allocated
+    assert grad_complete < queued < flushed < flush_waited
+    assert flush_waited < alias_taken < graph_cleared < storage_overwritten
     for assignment in (
         "saved.dispatched = None",
         "saved.probs = None",
@@ -625,7 +666,7 @@ def test_saved_backward_drops_expert_graph_before_allocating_grad_recv(
     assert "cuda.synchronize" not in source
 
 
-def test_normal_and_fused_backward_chunks_retain_recv_bases_for_in_place_grad(
+def test_normal_and_fused_backward_reuse_graph_storage_for_hidden_grad(
     transformer_engine_import_stub,
 ):
     import inspect
@@ -638,10 +679,10 @@ def test_normal_and_fused_backward_chunks_retain_recv_bases_for_in_place_grad(
         _dispatch_local_backward,
     )
 
-    assert "recv_hidden_base" in _BackwardChunk.__dataclass_fields__
     assert "recv_probs_base" in _BackwardChunk.__dataclass_fields__
-    assert "recv_hidden_base" in _ForwardChunkContext.__dataclass_fields__
     assert "recv_probs_base" in _ForwardChunkContext.__dataclass_fields__
+    assert "recv_hidden_base" not in _BackwardChunk.__dataclass_fields__
+    assert "recv_hidden_base" not in _ForwardChunkContext.__dataclass_fields__
     saved_source = inspect.getsource(_EPChunkOperationBase._forward_saved_context_async)
     normal_backward_source = inspect.getsource(
         _EPChunkOperationBase._saved_context_backward
@@ -652,20 +693,18 @@ def test_normal_and_fused_backward_chunks_retain_recv_bases_for_in_place_grad(
     helper_source = inspect.getsource(_dispatch_local_backward)
 
     for source in (saved_source, fused_source):
-        assert 'recv_hidden_base=state["recv_hidden"]' in source
+        assert 'recv_hidden_base=state["recv_hidden"]' not in source
         assert 'recv_probs_base=state["recv_probs"]' in source
-    for source in (normal_backward_source, fused_source):
-        submit = source.index("submit_deepep_dispatch_backward(")
-        recorded = source.index("grad_recv_hidden.record_stream(comm_stream)")
-        cleared = source.index("chunk.recv_hidden_base = None")
-        assert submit < recorded < cleared
+    assert "hidden_reuse_base = chunk.dispatched.detach()" in normal_backward_source
+    assert "hidden_reuse_base = chunk.expert_out.detach()" in fused_source
     assert "chunk.workspace_lease.tensor(" not in helper_source
-    assert "grad_recv_hidden = chunk.recv_hidden_base" in helper_source
+    assert "hidden_reuse_base.detach()" in helper_source
+    assert ".view(-1)[:required_hidden_numel]" in helper_source
     assert "grad_recv_probs = chunk.recv_probs_base" in helper_source
     assert "cuda.synchronize" not in helper_source
 
 
-def test_fused_expert_autograd_references_die_before_recv_base_overwrite(
+def test_fused_reuses_expert_out_only_after_autograd_and_before_graph_clear(
     transformer_engine_import_stub,
 ):
     import inspect
@@ -677,11 +716,14 @@ def test_fused_expert_autograd_references_die_before_recv_base_overwrite(
 
     source = inspect.getsource(_EPChunkOperationBase._full_recompute_fused_backward_v6)
     autograd = source.index("expert_grads = torch.autograd.grad(")
-    graph_clear = source.index("chunk.dispatched = None", autograd)
+    alias_taken = source.index(
+        "hidden_reuse_base = chunk.expert_out.detach()", autograd
+    )
+    graph_clear = source.index("chunk.expert_out = None", alias_taken)
     locals_clear = source.index("del expert_dispatched", graph_clear)
     overwrite = source.index("_dispatch_local_backward(", locals_clear)
 
-    assert autograd < graph_clear < locals_clear < overwrite
+    assert autograd < alias_taken < graph_clear < locals_clear < overwrite
     assert "del expert_input, expert_probs, metadata" in source
     assert "state.clear()" in source
     assert "del expert_dispatched, expert_probs_input" in source

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -819,7 +820,6 @@ class _BackwardChunk:
     recv_hidden_dtype: torch.dtype
     recv_probs_shape: torch.Size
     recv_probs_dtype: torch.dtype
-    recv_hidden_base: torch.Tensor | None
     recv_probs_base: torch.Tensor | None
     dispatched: torch.Tensor | None
     probs: torch.Tensor | None
@@ -848,7 +848,6 @@ class _ForwardChunkContext:
     recv_hidden_dtype: torch.dtype
     recv_probs_shape: torch.Size
     recv_probs_dtype: torch.dtype
-    recv_hidden_base: torch.Tensor | None
     recv_probs_base: torch.Tensor | None
     dispatched: torch.Tensor | None
     probs: torch.Tensor | None
@@ -1181,7 +1180,6 @@ class _EPChunkOperationBase:
                     recv_hidden_dtype=state["recv_hidden"].dtype,
                     recv_probs_shape=state["recv_probs"].shape,
                     recv_probs_dtype=state["recv_probs"].dtype,
-                    recv_hidden_base=state["recv_hidden"],
                     recv_probs_base=state["recv_probs"],
                     dispatched=expert_input,
                     probs=expert_probs,
@@ -1442,7 +1440,6 @@ class _EPChunkOperationBase:
                     scores_edge = torch.autograd.graph.get_gradient_edge(scores)
                     scores_ref = None
                     expert_out_edge = torch.autograd.graph.get_gradient_edge(expert_out)
-                    expert_out_ref = None
 
                 chunk = _BackwardChunk(
                     idx=chunk_idx,
@@ -1457,7 +1454,6 @@ class _EPChunkOperationBase:
                     recv_hidden_dtype=state["recv_hidden"].dtype,
                     recv_probs_shape=state["recv_probs"].shape,
                     recv_probs_dtype=state["recv_probs"].dtype,
-                    recv_hidden_base=state["recv_hidden"],
                     recv_probs_base=state["recv_probs"],
                     dispatched=expert_input,
                     probs=expert_probs,
@@ -1520,6 +1516,11 @@ class _EPChunkOperationBase:
                         grad_probs = expert_grads[1]
                         if grad_probs is None:
                             grad_probs = torch.zeros_like(expert_probs_input)
+                    if chunk.expert_out is None:
+                        raise RuntimeError(
+                            "EP chunk fused backward lost expert output storage."
+                        )
+                    hidden_reuse_base = chunk.expert_out.detach()
                     chunk.dispatched = None
                     chunk.probs = None
                     chunk.expert_out = None
@@ -1534,7 +1535,10 @@ class _EPChunkOperationBase:
                     del expert_dispatched, expert_probs_input
                     del expert_inputs, expert_grads, expert_output
                     grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
-                        chunk, grad_dispatched, grad_probs
+                        chunk,
+                        grad_dispatched,
+                        grad_probs,
+                        hidden_reuse_base=hidden_reuse_base,
                     )
                     local_state["grad_recv_hidden"] = grad_recv_hidden
                     local_state["grad_recv_probs"] = grad_recv_probs
@@ -1560,9 +1564,8 @@ class _EPChunkOperationBase:
                             grad_recv_hidden.record_stream(comm_stream)
                         if grad_recv_probs.is_cuda:
                             grad_recv_probs.record_stream(comm_stream)
-                        chunk.recv_hidden_base = None
                         chunk.recv_probs_base = None
-                        del grad_recv_hidden, grad_recv_probs
+                        del grad_recv_hidden, grad_recv_probs, hidden_reuse_base
 
                 pending_dispatch_bwd.append((chunk, local_state))
 
@@ -1673,7 +1676,6 @@ class _EPChunkOperationBase:
                 recv_hidden_dtype=saved.recv_hidden_dtype,
                 recv_probs_shape=saved.recv_probs_shape,
                 recv_probs_dtype=saved.recv_probs_dtype,
-                recv_hidden_base=saved.recv_hidden_base,
                 recv_probs_base=saved.recv_probs_base,
                 dispatched=saved.dispatched,
                 probs=saved.probs,
@@ -1734,17 +1736,44 @@ class _EPChunkOperationBase:
                     grad_probs = expert_grads[1]
                     if grad_probs is None:
                         grad_probs = torch.zeros_like(probs)
-                saved.dispatched = None
+                local_state["grad_dispatched"] = grad_dispatched
+                local_state["grad_probs"] = grad_probs
+                local_state["saved"] = saved
                 saved.probs = None
                 saved.expert_out = None
                 saved.expert_out_edge = None
-                chunk.dispatched = None
                 chunk.probs = None
                 chunk.expert_out = None
                 chunk.expert_out_edge = None
                 del dispatched, probs, expert_inputs, expert_grads, expert_output
+            pending_dispatch_bwd.append((chunk, local_state))
+
+        wgrad_ready = torch.cuda.Event()
+        wgrad_ready.record(compute_stream)
+        with torch.cuda.stream(wgrad_stream):
+            wgrad_stream.wait_event(wgrad_ready)
+            with _ep_chunk_nvtx("backward.wgrad"):
+                self.experts.flush_delayed_weight_grads(
+                    num_contexts=len(pending_dispatch_bwd)
+                )
+            wgrad_done = torch.cuda.Event()
+            wgrad_done.record(wgrad_stream)
+        _queue_backward_stream_wait(wgrad_done, grad_2d.device)
+
+        for chunk, local_state in pending_dispatch_bwd:
+            with torch.cuda.stream(compute_stream):
+                compute_stream.wait_event(wgrad_done)
+                if chunk.dispatched is None:
+                    raise RuntimeError("EP chunk saved expert input was released")
+                hidden_reuse_base = chunk.dispatched.detach()
+                saved = local_state.pop("saved")
+                saved.dispatched = None
+                chunk.dispatched = None
                 grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
-                    chunk, grad_dispatched, grad_probs
+                    chunk,
+                    local_state.pop("grad_dispatched"),
+                    local_state.pop("grad_probs"),
+                    hidden_reuse_base=hidden_reuse_base,
                 )
                 local_ready = torch.cuda.Event()
                 local_ready.record(compute_stream)
@@ -1766,24 +1795,9 @@ class _EPChunkOperationBase:
                         grad_recv_hidden.record_stream(comm_stream)
                     if grad_recv_probs.is_cuda:
                         grad_recv_probs.record_stream(comm_stream)
-                    saved.recv_hidden_base = None
                     saved.recv_probs_base = None
-                    chunk.recv_hidden_base = None
                     chunk.recv_probs_base = None
-                    del grad_recv_hidden, grad_recv_probs
-            pending_dispatch_bwd.append((chunk, local_state))
-
-        wgrad_ready = torch.cuda.Event()
-        wgrad_ready.record(compute_stream)
-        with torch.cuda.stream(wgrad_stream):
-            wgrad_stream.wait_event(wgrad_ready)
-            with _ep_chunk_nvtx("backward.wgrad"):
-                self.experts.flush_delayed_weight_grads(
-                    num_contexts=len(pending_dispatch_bwd)
-                )
-            wgrad_done = torch.cuda.Event()
-            wgrad_done.record(wgrad_stream)
-        _queue_backward_stream_wait(wgrad_done, grad_2d.device)
+                    del grad_recv_hidden, grad_recv_probs, hidden_reuse_base
 
         for chunk, local_state in pending_dispatch_bwd:
             with torch.cuda.stream(compute_stream):
@@ -1969,21 +1983,39 @@ def _dispatch_local_backward(
     chunk: _BackwardChunk,
     grad_dispatched: torch.Tensor,
     grad_probs: torch.Tensor | None,
+    *,
+    hidden_reuse_base: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     row_id_map = chunk.row_id_map.reshape(-1).to(torch.long)
-    if chunk.recv_hidden_base is None or chunk.recv_probs_base is None:
-        raise RuntimeError("EP chunk backward requires retained recv base tensors")
-    grad_recv_hidden = chunk.recv_hidden_base.detach()
+    if chunk.recv_probs_base is None:
+        raise RuntimeError(
+            "EP chunk backward requires retained recv probability storage"
+        )
+    required_hidden_numel = math.prod(chunk.recv_hidden_shape)
+    if (
+        hidden_reuse_base.dtype != chunk.recv_hidden_dtype
+        or hidden_reuse_base.device != grad_dispatched.device
+        or not hidden_reuse_base.is_contiguous()
+        or hidden_reuse_base.numel() < required_hidden_numel
+    ):
+        raise RuntimeError(
+            "EP chunk hidden reuse storage must be contiguous with matching "
+            "dtype/device and sufficient capacity"
+        )
+    grad_recv_hidden = (
+        hidden_reuse_base.detach()
+        .view(-1)[:required_hidden_numel]
+        .view(chunk.recv_hidden_shape)
+    )
     grad_recv_probs = chunk.recv_probs_base.detach()
     if (
-        grad_recv_hidden.shape != chunk.recv_hidden_shape
-        or grad_recv_hidden.dtype != chunk.recv_hidden_dtype
-        or grad_recv_hidden.device != grad_dispatched.device
-        or grad_recv_probs.shape != chunk.recv_probs_shape
+        grad_recv_probs.shape != chunk.recv_probs_shape
         or grad_recv_probs.dtype != chunk.recv_probs_dtype
         or grad_recv_probs.device != grad_dispatched.device
     ):
-        raise RuntimeError("EP chunk retained recv base does not match saved metadata")
+        raise RuntimeError(
+            "EP chunk retained recv probability storage does not match saved metadata"
+        )
     grad_recv_hidden.zero_()
     grad_recv_hidden.scatter_add_(
         0,
