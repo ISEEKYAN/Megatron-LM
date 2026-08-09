@@ -17,10 +17,7 @@ _REQUIRED_DDP_KNOB_VALUES = {
     "use_distributed_optimizer": True,
     "use_megatron_fsdp": True,
 }
-_UNSUPPORTED_OPTIMIZATION_KNOBS = {
-    "use_hsdp",
-    "hsdp",
-}
+_UNSUPPORTED_OPTIMIZATION_KNOBS = {"use_hsdp", "hsdp"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,11 +153,7 @@ PARAM_NAME_ATTR = "_mlite_mfsdp_param_name"
 
 
 def annotate_parallel_parameters(
-    module: nn.Module,
-    is_expert: Callable[[str], bool],
-    *,
-    tp_size: int,
-    etp_size: int,
+    module: nn.Module, is_expert: Callable[[str], bool], *, tp_size: int, etp_size: int
 ) -> None:
     """Normalize parameter ownership from topology and explicit attributes."""
     sequence_parallel_ids = {id(param) for param in getattr(module, "sp_params", ())}
@@ -292,17 +285,12 @@ def _coerce_dtype(value: Any, *, name: str) -> torch.dtype:
     return mapping[normalized]
 
 
-def validate_mfsdp_config(
-    engine_cfg,
-    *,
-    has_optimizer_factory: bool = False,
-) -> None:
+def validate_mfsdp_config(engine_cfg, *, has_optimizer_factory: bool = False) -> None:
     """Validate the supported surface for optimizer='megatron_fsdp'."""
     validate_mfsdp_topology(engine_cfg.parallel)
     opt = engine_cfg.optimizer
     validate_optimizer_name(
-        getattr(opt, "optimizer", "adam"),
-        has_optimizer_factory=has_optimizer_factory,
+        getattr(opt, "optimizer", "adam"), has_optimizer_factory=has_optimizer_factory
     )
     validate_optimization_knobs(opt)
     if os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1":
@@ -321,9 +309,7 @@ def validate_mfsdp_topology(parallel_cfg) -> None:
 
 
 def validate_optimizer_name(
-    optimizer_name: str,
-    *,
-    has_optimizer_factory: bool = False,
+    optimizer_name: str, *, has_optimizer_factory: bool = False
 ) -> None:
     if optimizer_name not in _SUPPORTED_OPTIMIZERS and not has_optimizer_factory:
         raise ValueError(

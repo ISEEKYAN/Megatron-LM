@@ -76,8 +76,10 @@ same-command PR #89 archive.
   DP-group membership changes the key/global padded shape.
 - Model-only restore and CPU-master refresh: `equivalent-with-proof`.
 - Bounded HF export: `equivalent-with-proof`.
-- Forward/backward exception teardown: `partial`; fail-fast cleanup is proven
-  only for the covered CPU/Gloo cases.
+- Forward/backward exception teardown: `equivalent-with-proof`; normal finish,
+  abort, export, persistent-state access, and device move share closed
+  lifecycle bookkeeping, while exception teardown host-synchronizes issued
+  work before releasing leases.
 - Device move: `equivalent-with-proof` for current offload contract.
 - PP/VPP chunk state and checkpoint-key uniqueness: `equivalent-with-proof`;
   checkpoint keys include PP stage, VPP chunk, canonical parameter name, and

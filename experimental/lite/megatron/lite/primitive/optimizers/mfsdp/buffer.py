@@ -551,11 +551,7 @@ class ParamBucket:
                 dtype=self.policy.compute_dtype,
                 device=self.device,
                 group=self.gather_group,
-                key=(
-                    "param",
-                    id(self.gather_group),
-                    self.allocator_layout_key[2],
-                ),
+                key=("param", id(self.gather_group), self.allocator_layout_key[2]),
             )
             self.full_buffer = self._full_lease.tensor
         if self.policy.main_params_dtype != self.policy.compute_dtype:
@@ -1223,10 +1219,7 @@ def _resolve_suggested_communication_unit_size(
     if not groups:
         groups = tuple((index,) for index in range(len(buckets)))
     largest_owner = max(
-        (
-            sum(buckets[bucket_id].full_numel for bucket_id in group)
-            for group in groups
-        ),
+        (sum(buckets[bucket_id].full_numel for bucket_id in group) for group in groups),
         default=1,
     )
     # Keep at most the current and next largest owner worth of communication
@@ -1888,15 +1881,29 @@ class CommunicationPipelines:
         # buckets that were never consumed (for example at graph boundaries).
         self.all_gather.release_all()
         self.discard_full_parameter_views()
+        self._reset_lifecycle_bookkeeping()
 
-    def abort(self) -> None:
-        """Best-effort two-phase exception teardown for shared communication storage."""
-        self.grad_reduce.abort()
+    def prepare_persistent_state(self) -> None:
+        """Close parameter scratch before checkpoint/public-state access."""
+        if self._backward_started or self.grad_reduce.has_microbatch_work():
+            raise RuntimeError(
+                "M-FSDP persistent state requires finish_grad_sync() at a step boundary."
+            )
+        self.all_gather.release_all()
+        self.discard_full_parameter_views()
+        self._reset_lifecycle_bookkeeping()
+
+    def _reset_lifecycle_bookkeeping(self) -> None:
         self._backward_started = False
         self._pending_param_ids.clear()
         self._processed_owner_ids.clear()
         for owner_id in self._training_states:
             self._training_states[owner_id] = TrainingState.IDLE
+
+    def abort(self) -> None:
+        """Best-effort two-phase exception teardown for shared communication storage."""
+        self.grad_reduce.abort()
+        self._reset_lifecycle_bookkeeping()
 
         # Phase one drains work and drops every bucket lease.  Continue after a
         # cleanup failure: a primary forward exception takes precedence, and
@@ -1951,11 +1958,7 @@ class CommunicationPipelines:
             seen_allocators.add(id(allocator))
             allocator.release_cached()
         self.grad_reduce.abort()
-        self._backward_started = False
-        self._pending_param_ids.clear()
-        self._processed_owner_ids.clear()
-        for owner_id in self._training_states:
-            self._training_states[owner_id] = TrainingState.IDLE
+        self._reset_lifecycle_bookkeeping()
 
     def reset_grad_state(self) -> None:
         self.grad_reduce.reset()

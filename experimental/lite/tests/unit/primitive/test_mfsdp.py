@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 from __future__ import annotations
 
 import ast
@@ -17,6 +18,9 @@ import torch.multiprocessing as mp
 from megatron.lite.primitive.ckpt import dcp
 from megatron.lite.primitive.optimizers.mfsdp import buffer as mfsdp_buffer
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
+from megatron.lite.primitive.optimizers.mfsdp import (
+    wrapper as mfsdp_wrapper,
+)  # isort: skip
 from megatron.lite.runtime.contracts.config import ParallelConfig
 
 from megatron.lite.primitive.optimizers.mfsdp import (  # isort: skip
@@ -25,7 +29,6 @@ from megatron.lite.primitive.optimizers.mfsdp import (  # isort: skip
 from megatron.lite.primitive.optimizers.mfsdp import (  # isort: skip
     optimizer as mfsdp_optimizer,
 )
-from megatron.lite.primitive.optimizers.mfsdp import wrapper as mfsdp_wrapper  # isort: skip
 
 
 class _GlooUnit(torch.nn.Module):
@@ -914,9 +917,7 @@ def test_mfsdp_cpu_single_rank_matches_torch_adamw_optimizer_step():
         assert torch.equal(value, restored_model[name]), name
 
 
-def test_mfsdp_public_state_uses_persistent_shards_without_materialize_all(
-    monkeypatch,
-):
+def test_mfsdp_public_state_uses_persistent_shards_without_materialize_all(monkeypatch):
     chunk, _optimizer = _single_rank_mfsdp_stack()
     monkeypatch.setattr(
         chunk.param_sync,
@@ -943,6 +944,24 @@ def test_mfsdp_public_state_uses_persistent_shards_without_materialize_all(
         assert torch.equal(value, chunk.state_dict()[name])
 
 
+def test_mfsdp_state_requires_finished_step_and_then_clears_lifecycle():
+    chunk, optimizer = _single_rank_mfsdp_stack()
+    optimizer.zero_grad()
+    chunk(torch.randn(2, 4)).sum().backward()
+
+    with pytest.raises(RuntimeError, match="finish_grad_sync"):
+        chunk.state_dict()
+
+    optimizer.finish_grad_sync()
+    assert chunk.state_dict()
+    assert chunk.param_sync._backward_started is False
+    assert chunk.param_sync._pending_param_ids == set()
+    assert chunk.param_sync._processed_owner_ids == set()
+    assert set(chunk.param_sync._training_states.values()) == {
+        mfsdp_buffer.TrainingState.IDLE
+    }
+
+
 def test_mfsdp_dcp_multi_chunk_keys_do_not_collide(monkeypatch, tmp_path):
     first, _first_optimizer = _single_rank_mfsdp_stack()
     second, _second_optimizer = _single_rank_mfsdp_stack()
@@ -950,9 +969,7 @@ def test_mfsdp_dcp_multi_chunk_keys_do_not_collide(monkeypatch, tmp_path):
     monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: False)
     monkeypatch.setattr(dcp, "_build_meshes", lambda _config: (object(), object()))
     monkeypatch.setattr(
-        dcp.dcp,
-        "save",
-        lambda state_dict, checkpoint_id: captured.update(state_dict),
+        dcp.dcp, "save", lambda state_dict, checkpoint_id: captured.update(state_dict)
     )
 
     dcp.save_training_checkpoint(
@@ -1802,7 +1819,9 @@ def test_mfsdp_grad_reduce_consumes_work_without_host_event_sync(monkeypatch):
 
     class Event:
         def synchronize(self):
-            raise AssertionError("normal reduction completion must not host-synchronize")
+            raise AssertionError(
+                "normal reduction completion must not host-synchronize"
+            )
 
     stream = SimpleNamespace(wait_event=lambda event: calls.append(("event", event)))
     work = SimpleNamespace(wait=lambda: calls.append("work"))
@@ -2583,9 +2602,7 @@ def test_mfsdp_custom_gather_group_requires_identical_rank_order(monkeypatch):
     rank_orders = {id(dense_dp): [0, 2], id(dense_ag): [2, 0]}
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     monkeypatch.setattr(
-        dist,
-        "get_process_group_ranks",
-        lambda group: rank_orders[id(group)],
+        dist, "get_process_group_ranks", lambda group: rank_orders[id(group)]
     )
     ps = SimpleNamespace(
         dp_cp_group=dense_dp,
@@ -2756,7 +2773,7 @@ def test_mfsdp_multi_output_graph_runs_one_root_lifecycle():
     assert chunk.grad_reduce_pipeline._microbatch_id == 1
     assert chunk.param_sync._backward_started is False
     assert chunk.param_sync._pending_param_ids == set()
-    assert chunk.param_sync._processed_owner_ids == {id(chunk.module)}
+    assert chunk.param_sync._processed_owner_ids == set()
 
 
 def test_mfsdp_next_microbatch_forward_does_not_drain_grad_reduce_queue():

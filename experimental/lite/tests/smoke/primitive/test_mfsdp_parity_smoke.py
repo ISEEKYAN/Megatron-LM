@@ -2072,14 +2072,7 @@ def test_mfsdp_matches_reference_full_parallel_precision_curve(
             ps.pp_size,
             ps.virtual_pipeline_size,
             ps.cp_size,
-        ) == (
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-        )
+        ) == (2, 2, 2, 2, 2, 2)
 
     initial_max_abs = torch.tensor(
         _max_snapshot_abs_diff(reference_initial, mfsdp_initial), device="cuda"

@@ -326,8 +326,7 @@ def _mfsdp_persistent_shards(chunks: list[nn.Module]):
         if not callable(iterator):
             return None
         shards.extend(
-            (chunk_idx, name, param, bucket)
-            for name, param, bucket in iterator()
+            (chunk_idx, name, param, bucket) for name, param, bucket in iterator()
         )
     return shards
 
@@ -341,9 +340,7 @@ def _mfsdp_group_ranks(bucket) -> tuple[int, ...]:
     return tuple(dist.get_process_group_ranks(group))
 
 
-def _mfsdp_state_key(
-    model_prefix: str, chunk_idx: int, name: str, bucket
-) -> str:
+def _mfsdp_state_key(model_prefix: str, chunk_idx: int, name: str, bucket) -> str:
     group_identity = "-".join(str(rank) for rank in _mfsdp_group_ranks(bucket))
     return f"{model_prefix}.chunk{chunk_idx}.{name}.__dp_group_{group_identity}"
 

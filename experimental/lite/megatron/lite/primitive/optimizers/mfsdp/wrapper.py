@@ -232,6 +232,7 @@ class MegatronFSDP(nn.Module):
         shards for a per-layer EP collective) keeps a private allocation and
         never aliases storage that the release has handed back to the allocator.
         """
+        self.param_sync.prepare_persistent_state()
         covered: set[str] = set()
         for bucket in self.param_sync.stream_materialize_buckets():
             for spec in bucket.specs:
@@ -258,6 +259,7 @@ class MegatronFSDP(nn.Module):
 
     def iter_persistent_shards(self):
         """Yield canonical names and persistent local shards for checkpointing."""
+        self.param_sync.prepare_persistent_state()
         for bucket in self.param_sync.buckets:
             for spec in bucket.specs:
                 assert spec.shard_param is not None
@@ -269,10 +271,12 @@ class MegatronFSDP(nn.Module):
 
     def state_dict(self, *args, **kwargs):
         """Return persistent shard state; full weights require explicit export."""
+        self.param_sync.prepare_persistent_state()
         return super().state_dict(*args, **kwargs)
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         """Load persistent shard state without allocating full model weights."""
+        self.param_sync.prepare_persistent_state()
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
 
