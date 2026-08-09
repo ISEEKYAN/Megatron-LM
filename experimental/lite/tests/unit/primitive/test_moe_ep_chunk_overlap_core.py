@@ -1572,6 +1572,67 @@ def test_experts_split_fc1_and_swiglu_forward_activation_from_fc2_output(
     ]
 
 
+def test_experts_owned_outputs_only_request_dgrad_for_each_grad_input(
+    monkeypatch, transformer_engine_import_stub
+):
+    """The production adapter must not allocate FC1 dgrad for wgrad-only input."""
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    constructed = []
+    adapter_calls = []
+    allocated = []
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self, _num_gemms, _in_features, out_features, **_kwargs):
+            super().__init__()
+            self.name = "fc1" if not constructed else "fc2"
+            self.out_features = out_features
+            constructed.append(self)
+
+    def fake_owned_linear(linear, x, _m_splits, out, dgrad_out):
+        adapter_calls.append((linear.name, x.requires_grad, dgrad_out is not None))
+        if linear.name == "fc1":
+            # FC1 parameter gradients make its output an autograd input to FC2,
+            # even though the original expert input needs no dgrad.
+            return out.requires_grad_(True)
+        return out
+
+    def allocation(name, shape):
+        allocated.append(name)
+        return torch.empty(shape, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        experts_module.te, "GroupedLinear", FakeGroupedLinear, raising=False
+    )
+    monkeypatch.setattr(
+        experts_module, "_caller_owned_grouped_linear", fake_owned_linear
+    )
+    monkeypatch.setattr(experts_module, "swiglu_with_probs", lambda y, *_args: y[:, :2])
+    experts = experts_module.Experts(
+        SimpleNamespace(
+            num_experts=2,
+            hidden_size=2,
+            moe_intermediate_size=2,
+            swiglu_limit=0.0,
+        ),
+        SimpleNamespace(ep_size=1, etp_size=1, tp_size=1, etp_group=None),
+        delay_wgrad_compute=True,
+    )
+
+    with torch.enable_grad():
+        output = experts(
+            torch.ones(3, 2, dtype=torch.bfloat16),
+            None,
+            tokens_per_expert_list=[1, 2],
+            output_allocation=allocation,
+        )
+
+    assert output.shape == (3, 2)
+    assert adapter_calls == [("fc1", False, False), ("fc2", True, True)]
+    assert allocated == ["fc1_output", "fc2_output", "fc2_dgrad"]
+
+
 def test_caller_owned_grouped_linear_keeps_te_delayed_wgrad_contract(
     transformer_engine_import_stub,
 ):

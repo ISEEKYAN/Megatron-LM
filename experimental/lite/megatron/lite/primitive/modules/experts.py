@@ -602,7 +602,6 @@ class Experts(nn.Module):
                 nullcontext if activation_allocation is None else activation_allocation
             )
             with allocation_scope():
-                needs_dgrad = torch.is_grad_enabled()
                 if caller_owned_outputs:
                     fc1_out = _caller_owned_grouped_linear(
                         self.fc1,
@@ -613,7 +612,7 @@ class Experts(nn.Module):
                         ),
                         (
                             output_allocation("fc1_dgrad", tuple(x.shape))
-                            if needs_dgrad
+                            if x.requires_grad
                             else None
                         ),
                     )
@@ -639,7 +638,7 @@ class Experts(nn.Module):
                     ),
                     (
                         output_allocation("fc2_dgrad", tuple(h.shape))
-                        if needs_dgrad
+                        if h.requires_grad
                         else None
                     ),
                 )
