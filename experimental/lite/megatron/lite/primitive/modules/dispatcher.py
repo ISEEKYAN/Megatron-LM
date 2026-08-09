@@ -712,7 +712,7 @@ class TokenDispatcher:
     def _resolve_deepep_recv_per_expert(self, state):
         return state["recv_per_expert"]
 
-    def finish_deepep_dispatch(self, state):
+    def finish_deepep_dispatch(self, state, *, materialize_local_tpe: bool = True):
         if not self.use_deepep:
             raise RuntimeError("finish_deepep_dispatch requires DeepEP dispatch.")
         self._handle = state["handle"]
@@ -724,6 +724,7 @@ class TokenDispatcher:
             state["recv_indices"],
             state["recv_probs"],
             recv_per_expert,
+            materialize_local_tpe=materialize_local_tpe,
         )
 
     def _finish_deepep_dispatch(
@@ -732,6 +733,8 @@ class TokenDispatcher:
         recv_indices: torch.Tensor,
         recv_probs: torch.Tensor,
         recv_per_expert,
+        *,
+        materialize_local_tpe: bool = True,
     ):
         dispatched, local_tpe, permuted_probs, metadata = (
             self._finish_deepep_dispatch_external(
@@ -739,6 +742,7 @@ class TokenDispatcher:
                 recv_indices,
                 recv_probs,
                 recv_per_expert,
+                materialize_local_tpe=materialize_local_tpe,
             )
         )
         self._local_tpe_list = metadata["local_tpe_list"]
@@ -755,40 +759,43 @@ class TokenDispatcher:
         *,
         force_manual_map: bool = False,
         force_direct_permute: bool = False,
+        materialize_local_tpe: bool = True,
     ):
         if isinstance(recv_per_expert, torch.Tensor):
             recv_per_expert = [int(x) for x in recv_per_expert.detach().cpu().tolist()]
-        local_tpe = torch.tensor(
-            recv_per_expert[: self.num_local_experts],
-            dtype=torch.int64,
-            device=recv_hidden.device,
-        )
         local_tpe_list = [int(x) for x in recv_per_expert[: self.num_local_experts]]
+        local_tpe = (
+            torch.tensor(
+                local_tpe_list,
+                dtype=torch.int64,
+                device=recv_hidden.device,
+            )
+            if materialize_local_tpe
+            else None
+        )
         rows = recv_hidden.size(0)
         recv_indices = recv_indices.to(torch.long)
+        if recv_indices.dim() != 2:
+            raise RuntimeError(
+                "DeepEP dispatch indices must have shape [recv_rows, topk]"
+            )
         valid = recv_indices >= 0
         num_out = sum(int(x) for x in recv_per_expert)
         use_direct_permute = force_direct_permute
         need_manual_map = force_manual_map or use_direct_permute
-        valid_row_ids = None
-        valid_expert_ids = None
+        valid_coords = valid.nonzero(as_tuple=False)
+        valid_row_ids = valid_coords[:, 0]
+        valid_topk_slots = valid_coords[:, 1]
+        valid_expert_ids = recv_indices[valid_row_ids, valid_topk_slots]
+        valid_prob_flat_indices = (
+            valid_row_ids * recv_indices.size(1) + valid_topk_slots
+        )
         manual_order = None
         manual_prob_flat_indices = None
         if need_manual_map:
-            row_ids_full = torch.arange(
-                rows, device=recv_hidden.device, dtype=torch.long
-            )
-            row_ids_full = row_ids_full.view(
-                rows, *([1] * (recv_indices.dim() - 1))
-            ).expand_as(recv_indices)
-            valid_row_ids = row_ids_full[valid]
-            valid_expert_ids = recv_indices[valid]
             manual_order = torch.argsort(
                 valid_expert_ids * rows + valid_row_ids,
                 stable=True,
-            )
-            valid_prob_flat_indices = (
-                valid.reshape(-1).nonzero(as_tuple=False).reshape(-1)
             )
             manual_row_id_map = valid_row_ids.index_select(0, manual_order)
             manual_prob_flat_indices = valid_prob_flat_indices.index_select(
@@ -801,7 +808,9 @@ class TokenDispatcher:
             sorted_indices = manual_row_id_map
             assert sorted_indices is not None
             dispatched = recv_hidden.index_select(0, sorted_indices)
-            permuted_probs = recv_probs[valid].index_select(0, manual_order)
+            permuted_probs = recv_probs.reshape(-1).index_select(
+                0, manual_prob_flat_indices
+            )
         else:
             routing_map = torch.zeros(
                 rows,
@@ -815,17 +824,10 @@ class TokenDispatcher:
                 dtype=recv_probs.dtype,
                 device=recv_hidden.device,
             )
-            if valid_row_ids is None or valid_expert_ids is None:
-                row_ids_full = torch.arange(
-                    rows, device=recv_hidden.device, dtype=torch.long
-                )
-                row_ids_full = row_ids_full.view(
-                    rows, *([1] * (recv_indices.dim() - 1))
-                ).expand_as(recv_indices)
-                valid_row_ids = row_ids_full[valid]
-                valid_expert_ids = recv_indices[valid]
             routing_map[valid_row_ids, valid_expert_ids] = True
-            probs_2d[valid_row_ids, valid_expert_ids] = recv_probs[valid]
+            probs_2d[valid_row_ids, valid_expert_ids] = recv_probs.reshape(
+                -1
+            ).index_select(0, valid_prob_flat_indices)
             dispatched, permuted_probs, sorted_indices = permute(
                 recv_hidden,
                 routing_map,
@@ -869,6 +871,7 @@ class TokenDispatcher:
         *,
         force_manual_map: bool = False,
         force_direct_permute: bool = False,
+        materialize_local_tpe: bool = True,
     ):
         if not self.use_deepep:
             raise RuntimeError(
@@ -884,6 +887,7 @@ class TokenDispatcher:
                 recv_per_expert,
                 force_manual_map=force_manual_map,
                 force_direct_permute=force_direct_permute,
+                materialize_local_tpe=materialize_local_tpe,
             )
         )
         metadata["handle"] = state["handle"]

@@ -117,6 +117,49 @@ def test_delayed_expert_wgrads_request_distopt_main_grad_reuse(
     assert all(kwargs["fuse_wgrad_accumulation"] for kwargs in grouped_linear_kwargs)
 
 
+def test_experts_accept_host_splits_without_a_device_count_tensor(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    seen_splits = []
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self, _num_gemms, _in_features, out_features, **_kwargs):
+            super().__init__()
+            self.out_features = out_features
+
+        def forward(self, x, splits):
+            seen_splits.append(splits)
+            return x.new_ones((x.size(0), self.out_features))
+
+    monkeypatch.setattr(
+        experts_module.te, "GroupedLinear", FakeGroupedLinear, raising=False
+    )
+    monkeypatch.setattr(
+        experts_module, "bias_swiglu_impl", lambda x, bias=None: x[:, :2]
+    )
+    config = SimpleNamespace(
+        num_experts=2,
+        hidden_size=2,
+        moe_intermediate_size=2,
+        swiglu_limit=0.0,
+    )
+    ps = SimpleNamespace(ep_size=1, etp_size=1, tp_size=1, etp_group=None)
+    experts = experts_module.Experts(config, ps)
+
+    out = experts(
+        torch.ones(3, 2),
+        None,
+        None,
+        tokens_per_expert_list=[1, 2],
+    )
+
+    assert out.shape == (3, 2)
+    assert seen_splits == [[1, 2], [1, 2]]
+
+
 def test_dispatch_local_backward_accumulates_duplicate_rows_in_workspace(
     transformer_engine_import_stub,
 ):
@@ -343,7 +386,10 @@ def test_production_path_has_no_global_cuda_sync_or_allocator_fallback():
     assert "slot_grow" not in source
 
 
-def test_deepep_state_tensors_record_the_consumer_stream(monkeypatch):
+def test_deepep_state_tensors_record_the_consumer_stream(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
     import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
 
     class FakeTensor:
@@ -370,6 +416,105 @@ def test_deepep_state_tensors_record_the_consumer_stream(monkeypatch):
 
     assert outer.recorded_stream is stream
     assert nested.recorded_stream is stream
+
+
+def test_chunked_forward_enqueues_experts_before_lifetime_bookkeeping():
+    tree = ast.parse(SOURCE.read_text())
+    forward_names = {"_forward_output_async", "_forward_saved_context_async"}
+
+    for function in (
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name in forward_names
+    ):
+        expert_calls = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "experts"
+        ]
+        record_calls = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_record_state_tensors_current_stream"
+        ]
+        assert len(expert_calls) == len(record_calls) == 1
+        assert expert_calls[0].lineno < record_calls[0].lineno
+
+
+def test_recv_telemetry_is_cold_unless_explicitly_enabled(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    overlap._EP_CHUNK_RECV_ACTIVE.clear()
+    overlap._EP_CHUNK_RECV_STATS.clear()
+    monkeypatch.delenv("MEGATRON_LITE_EP_CHUNK_SCRATCH_TRACE", raising=False)
+
+    overlap._record_ep_chunk_recv_tensors(
+        action="acquire",
+        phase="forward",
+        workspace="forward",
+        chunk_idx=0,
+        recv_hidden=torch.zeros(2, 3),
+        recv_probs=torch.zeros(2, 1),
+    )
+
+    assert overlap._EP_CHUNK_RECV_ACTIVE == {}
+    assert overlap._EP_CHUNK_RECV_STATS == {}
+
+
+def test_chunked_forward_submits_next_dispatch_before_expert_host_setup():
+    tree = ast.parse(SOURCE.read_text())
+    forward_names = {"_forward_output_async", "_forward_saved_context_async"}
+
+    for function in (
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name in forward_names
+    ):
+        nested_names = {
+            node.name for node in function.body if isinstance(node, ast.FunctionDef)
+        }
+        assert {"finish_dispatch", "run_expert"} <= nested_names
+        loop = next(node for node in ast.walk(function) if isinstance(node, ast.For))
+        calls = {
+            node.func.id: node.lineno
+            for node in ast.walk(loop)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert calls["finish_dispatch"] < calls["submit_dispatch"] < calls["run_expert"]
+
+
+def test_saved_forward_routes_next_chunk_on_comm_stream():
+    tree = ast.parse(SOURCE.read_text())
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_forward_saved_context_async"
+    )
+    submit = next(
+        node
+        for node in function.body
+        if isinstance(node, ast.FunctionDef) and node.name == "submit_dispatch"
+    )
+    stream_contexts = [
+        item.context_expr.args[0].id
+        for node in ast.walk(submit)
+        if isinstance(node, ast.With)
+        for item in node.items
+        if isinstance(item.context_expr, ast.Call)
+        and isinstance(item.context_expr.func, ast.Attribute)
+        and item.context_expr.func.attr == "stream"
+        and isinstance(item.context_expr.args[0], ast.Name)
+    ]
+
+    assert stream_contexts == ["comm_stream"]
 
 
 def test_saved_backward_chains_first_combine_to_caller_grad_readiness(

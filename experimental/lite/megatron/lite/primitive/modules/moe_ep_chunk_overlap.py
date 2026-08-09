@@ -566,6 +566,12 @@ def _record_ep_chunk_recv_tensors(
     recv_hidden: torch.Tensor | None = None,
     recv_probs: torch.Tensor | None = None,
 ) -> None:
+    if os.environ.get("MEGATRON_LITE_EP_CHUNK_SCRATCH_TRACE", "0") in {
+        "0",
+        "false",
+        "False",
+    }:
+        return
     key = (phase, workspace, int(chunk_idx))
     if action == "acquire":
         if key in _EP_CHUNK_RECV_ACTIVE:
@@ -609,25 +615,20 @@ def _record_ep_chunk_recv_tensors(
             f"EP chunk recv action must be acquire or release, got {action!r}"
         )
 
-    if os.environ.get("MEGATRON_LITE_EP_CHUNK_SCRATCH_TRACE", "0") not in {
-        "0",
-        "false",
-        "False",
-    }:
-        values = (
-            _EP_CHUNK_RECV_ACTIVE.get(key, values)
-            if action == "release"
-            else _EP_CHUNK_RECV_ACTIVE[key]
-        )
-        print(
-            "[EPCHUNK_RECV_TRACE] "
-            f"action={action} phase={phase} workspace={workspace} chunk={chunk_idx} "
-            f"hidden_numel={values['hidden_numel']} hidden_bytes={values['hidden_bytes']} "
-            f"probs_numel={values['probs_numel']} probs_bytes={values['probs_bytes']} "
-            f"active_blocks={_EP_CHUNK_RECV_STATS.get('active_blocks', 0)} "
-            f"active_bytes={_EP_CHUNK_RECV_STATS.get('active_bytes', 0)}",
-            flush=True,
-        )
+    values = (
+        _EP_CHUNK_RECV_ACTIVE.get(key, values)
+        if action == "release"
+        else _EP_CHUNK_RECV_ACTIVE[key]
+    )
+    print(
+        "[EPCHUNK_RECV_TRACE] "
+        f"action={action} phase={phase} workspace={workspace} chunk={chunk_idx} "
+        f"hidden_numel={values['hidden_numel']} hidden_bytes={values['hidden_bytes']} "
+        f"probs_numel={values['probs_numel']} probs_bytes={values['probs_bytes']} "
+        f"active_blocks={_EP_CHUNK_RECV_STATS.get('active_blocks', 0)} "
+        f"active_bytes={_EP_CHUNK_RECV_STATS.get('active_bytes', 0)}",
+        flush=True,
+    )
 
 
 @contextmanager
@@ -846,12 +847,18 @@ class _EPChunkOperationBase:
                         )
             return chunk_idx, dispatcher, state, lease
 
-        def finish_dispatch_expert(pending):
+        def finish_dispatch(pending):
             chunk_idx, dispatcher, state, lease = pending
             with torch.cuda.stream(compute_stream):
                 with _ep_chunk_nvtx("forward.dispatch.finish", chunk_idx):
-                    dispatched, tpe, probs = dispatcher.finish_deepep_dispatch(state)
-                _record_state_tensors_current_stream(state)
+                    dispatched, tpe, probs = dispatcher.finish_deepep_dispatch(
+                        state, materialize_local_tpe=False
+                    )
+            return chunk_idx, dispatcher, state, lease, dispatched, tpe, probs
+
+        def run_expert(finished):
+            chunk_idx, dispatcher, state, lease, dispatched, tpe, probs = finished
+            with torch.cuda.stream(compute_stream):
                 recv_hidden = state.get("recv_hidden")
                 _record_ep_chunk_recv_tensors(
                     action="acquire",
@@ -861,10 +868,6 @@ class _EPChunkOperationBase:
                     recv_hidden=recv_hidden,
                     recv_probs=state.get("recv_probs"),
                 )
-                state.pop("recv_hidden", None)
-                state.pop("recv_indices", None)
-                state.pop("recv_probs", None)
-                state.pop("recv_per_expert", None)
                 with _ep_chunk_nvtx("forward.expert", chunk_idx):
                     expert_out = self.experts(
                         dispatched,
@@ -874,6 +877,11 @@ class _EPChunkOperationBase:
                             dispatcher, "_local_tpe_list", None
                         ),
                     )
+                _record_state_tensors_current_stream(state)
+                state.pop("recv_hidden", None)
+                state.pop("recv_indices", None)
+                state.pop("recv_probs", None)
+                state.pop("recv_per_expert", None)
                 rank_grouped, handle = dispatcher.prepare_deepep_combine(expert_out)
                 ready = torch.cuda.Event()
                 ready.record(compute_stream)
@@ -915,9 +923,10 @@ class _EPChunkOperationBase:
         with torch.no_grad():
             current_state = submit_dispatch(0)
             for loop_idx in range(len(ranges)):
-                prepared = finish_dispatch_expert(current_state)
+                finished = finish_dispatch(current_state)
                 if loop_idx + 1 < len(ranges):
                     current_state = submit_dispatch(loop_idx + 1)
+                prepared = run_expert(finished)
                 if pending_combine is not None:
                     finish_combine(pending_combine)
                 pending_combine = submit_combine(prepared)
@@ -952,13 +961,9 @@ class _EPChunkOperationBase:
             x_chunk = x_2d[start:end]
             lease = self.workspace.acquire(chunk_idx, stream=comm_stream)
             dispatcher = lease.dispatcher
-            with torch.cuda.stream(compute_stream):
-                compute_stream.wait_event(input_ready)
-                scores, indices = self._route(x_chunk, start, end)
-                router_ready = torch.cuda.Event()
-                router_ready.record(compute_stream)
             with torch.cuda.stream(comm_stream):
-                comm_stream.wait_event(router_ready)
+                comm_stream.wait_event(input_ready)
+                scores, indices = self._route(x_chunk, start, end)
                 with _ep_chunk_nvtx("forward.dispatch", chunk_idx):
                     with lease.deepep_recv_allocation():
                         state = dispatcher.submit_deepep_dispatch(
@@ -970,7 +975,7 @@ class _EPChunkOperationBase:
                         )
             return chunk_idx, start, end, x_chunk, scores, dispatcher, state, lease
 
-        def finish_dispatch_expert(pending):
+        def finish_dispatch(pending):
             chunk_idx, start, end, x_chunk, scores, dispatcher, state, lease = pending
             with torch.cuda.stream(compute_stream):
                 state["recv_hidden"] = (
@@ -983,13 +988,44 @@ class _EPChunkOperationBase:
                             state,
                             force_manual_map=True,
                             force_direct_permute=True,
+                            materialize_local_tpe=False,
                         )
                     )
-                _record_state_tensors_current_stream(state)
                 expert_input = dispatched.detach().requires_grad_(True)
                 expert_probs = (
                     None if probs is None else probs.detach().requires_grad_(True)
                 )
+            return (
+                chunk_idx,
+                start,
+                end,
+                x_chunk,
+                scores,
+                dispatcher,
+                state,
+                lease,
+                expert_input,
+                expert_probs,
+                local_tpe,
+                metadata,
+            )
+
+        def run_expert(finished):
+            (
+                chunk_idx,
+                start,
+                end,
+                x_chunk,
+                scores,
+                dispatcher,
+                state,
+                lease,
+                expert_input,
+                expert_probs,
+                local_tpe,
+                metadata,
+            ) = finished
+            with torch.cuda.stream(compute_stream):
                 with _ep_chunk_nvtx("forward.expert", chunk_idx):
                     expert_out = self.experts(
                         expert_input,
@@ -997,6 +1033,7 @@ class _EPChunkOperationBase:
                         expert_probs,
                         tokens_per_expert_list=metadata["local_tpe_list"],
                     )
+                _record_state_tensors_current_stream(state)
                 row_id_map = metadata["manual_row_id_map"]
                 prob_flat_indices = metadata["manual_prob_flat_indices"]
                 if row_id_map is None or prob_flat_indices is None:
@@ -1083,9 +1120,10 @@ class _EPChunkOperationBase:
         current_state = submit_dispatch(0)
         pending_combine = None
         for loop_idx in range(len(ranges)):
-            prepared = finish_dispatch_expert(current_state)
+            finished = finish_dispatch(current_state)
             if loop_idx + 1 < len(ranges):
                 current_state = submit_dispatch(loop_idx + 1)
+            prepared = run_expert(finished)
             if pending_combine is not None:
                 finish_combine(pending_combine)
             pending_combine = submit_combine(prepared)
@@ -1217,10 +1255,12 @@ class _EPChunkOperationBase:
                 )
                 dispatched, local_tpe, probs, metadata = (
                     dispatcher.finish_deepep_dispatch_external_with_options(
-                        state, force_manual_map=True, force_direct_permute=True
+                        state,
+                        force_manual_map=True,
+                        force_direct_permute=True,
+                        materialize_local_tpe=False,
                     )
                 )
-                _record_state_tensors_current_stream(state)
                 expert_input = dispatched.detach().requires_grad_(True)
                 expert_probs = (
                     None if probs is None else probs.detach().requires_grad_(True)
@@ -1232,6 +1272,7 @@ class _EPChunkOperationBase:
                         expert_probs,
                         tokens_per_expert_list=metadata["local_tpe_list"],
                     )
+                _record_state_tensors_current_stream(state)
             return (
                 dispatched,
                 local_tpe,

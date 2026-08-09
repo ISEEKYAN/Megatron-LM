@@ -174,15 +174,18 @@ class Experts(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        tokens_per_expert: torch.Tensor,
+        tokens_per_expert: torch.Tensor | None,
         permuted_probs: torch.Tensor | None = None,
         tokens_per_expert_list: list[int] | None = None,
     ) -> torch.Tensor:
-        m_splits = (
-            tokens_per_expert.tolist()
-            if tokens_per_expert_list is None
-            else list(tokens_per_expert_list)
-        )
+        if tokens_per_expert_list is None:
+            if tokens_per_expert is None:
+                raise RuntimeError(
+                    "Experts requires token counts in tensor or host-list form"
+                )
+            m_splits = tokens_per_expert.tolist()
+        else:
+            m_splits = list(tokens_per_expert_list)
         pad_mask = None
         if self.fp8:
             x, permuted_probs, m_splits, pad_mask = self._fp8_pad(

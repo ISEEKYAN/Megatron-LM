@@ -292,3 +292,57 @@ def test_external_finish_does_not_read_cuda_metadata_with_tensor_item(monkeypatc
     assert dispatched.shape == (4, 1)
     assert local_tpe.shape == (2,)
     assert metadata["local_tpe_list"] == [2, 2]
+
+
+def test_external_finish_can_reuse_host_expert_splits_without_device_tpe(monkeypatch):
+    value = _dispatcher()
+    recv_hidden = torch.tensor([[1.0], [2.0], [3.0]])
+    recv_indices = torch.tensor([[1, -1], [0, 1], [0, -1]])
+    recv_probs = torch.tensor([[0.2, 0.0], [0.3, 0.4], [0.5, 0.0]])
+    original_tensor = torch.tensor
+
+    def reject_local_tpe(data, *args, **kwargs):
+        if data == [2, 2] and kwargs.get("dtype") == torch.int64:
+            raise AssertionError("chunked dispatch must not rematerialize host splits")
+        return original_tensor(data, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", reject_local_tpe)
+    dispatched, local_tpe, probs, metadata = value._finish_deepep_dispatch_external(
+        recv_hidden,
+        recv_indices,
+        recv_probs,
+        [2, 2],
+        force_manual_map=True,
+        force_direct_permute=True,
+        materialize_local_tpe=False,
+    )
+
+    assert local_tpe is None
+    assert dispatched.squeeze(-1).tolist() == [2.0, 3.0, 1.0, 2.0]
+    assert probs.tolist() == pytest.approx([0.3, 0.5, 0.2, 0.4])
+    assert metadata["local_tpe_list"] == [2, 2]
+
+
+def test_external_manual_finish_derives_rows_from_one_valid_coordinate_map(monkeypatch):
+    value = _dispatcher()
+    recv_hidden = torch.tensor([[1.0], [2.0], [3.0]])
+    recv_indices = torch.tensor([[1, -1], [0, 1], [0, -1]])
+    recv_probs = torch.tensor([[0.2, 0.0], [0.3, 0.4], [0.5, 0.0]])
+
+    def reject_arange(*_args, **_kwargs):
+        raise AssertionError("manual finish must not build a dense row-id grid")
+
+    monkeypatch.setattr(torch, "arange", reject_arange)
+    dispatched, _local_tpe, probs, metadata = value._finish_deepep_dispatch_external(
+        recv_hidden,
+        recv_indices,
+        recv_probs,
+        [2, 2],
+        force_manual_map=True,
+        force_direct_permute=True,
+    )
+
+    assert dispatched.squeeze(-1).tolist() == [2.0, 3.0, 1.0, 2.0]
+    assert probs.tolist() == pytest.approx([0.3, 0.5, 0.2, 0.4])
+    assert metadata["manual_row_id_map"].tolist() == [1, 2, 0, 1]
+    assert metadata["manual_prob_flat_indices"].tolist() == [2, 4, 0, 3]
