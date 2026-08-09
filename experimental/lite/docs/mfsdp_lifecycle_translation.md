@@ -2,10 +2,71 @@
 
 Reference: `NVIDIA/Megatron-LM upstream/dev@43124b60`.
 
-This ledger records the intentionally ported lifecycle subset for standalone
-`optim_grads_params`. It is not a claim that Lite implements MCore HSDP,
-DTensor, FP8 buffers, fine-grained hooks, or multiple distributed-optimizer
-instances.
+This ledger is the release contract for standalone `optim_grads_params`.
+Every in-scope row must end as `exact`, `equivalent-with-proof`, or
+`unsupported-fail-fast`.  `divergent` and `missing` are implementation
+blockers, not accepted release notes.
+
+Out of scope for this delivery: FP8, HSDP, and CUDA Graph.  CPU optimizer
+offload performance is tracked separately; offload checkpoint correctness
+remains in scope.
+
+## Frozen references and acceptance baseline
+
+- Semantic reference: `NVIDIA/Megatron-LM upstream/dev@43124b60`.
+- Product/performance reference: PR #89 head `15145be3a`.
+- Public-state reference: Lite FSDP2 at this branch.
+- Current repaired-overlap result (`ac4bd8140`, Qwen3.5 8-layer/8-expert,
+  DP8, four microbatches, sequence length 1024, offload=0):
+  - 20/20 finite updates; loss `12.4322357 -> 12.4297810`;
+    grad norm `0.8542209 -> 0.8539507`.
+  - `1357.37 ms/step`, `24140.86 tok/s`, `19.205 GB` peak allocated.
+- Same-shape FSDP2 archive:
+  - `1219.07 ms/step`, `26879.49 tok/s`, `11.578 GB` peak allocated.
+- Same-shape dist-opt archive:
+  - `1032.31 ms/step`, `31742.44 tok/s`, `16.936 GB` peak allocated.
+- PR #89's exact archived command and numbers must be recovered before final
+  acceptance.  A differently shaped run is not a substitute.
+
+Hard release gates: M-FSDP throughput must be no lower than FSDP2, peak
+allocated memory no higher than FSDP2, and neither metric may regress the
+same-command PR #89 archive.
+
+## Full contract status
+
+- Parameter flatten/pad/local shard: `equivalent-with-proof`.
+- Dense/expert process-group selection: `equivalent-with-proof`.
+- Custom gather-group rank-order validation: `missing`.
+- Initial full-to-persistent-shard transition: `equivalent-with-proof`.
+- Forward owner AG and pure-DP prefetch: `equivalent-with-proof`.
+- AG ProcessGroup Work lifetime: `equivalent-with-proof` after `71e33aef6`.
+- AG overlap under intersecting TP/EP/ETP/CP groups: `divergent`.
+- Double-buffer pool layout: `divergent` (per-layout slots rather than MCore
+  FixedPool/MaxPool).
+- Non-double-buffer AG/RS live-set bound: `divergent`.
+- Root/non-unit preservation and fallback allocation: `divergent`.
+- Unit post-forward reshard: `equivalent-with-proof`.
+- Cross-unit tied/shared parameters: `missing`.
+- Saved-tensor parameter-view restoration: `equivalent-with-proof`.
+- Recompute `PRE_BACKWARD` release: `equivalent-with-proof`.
+- Ordinary and TE GroupedLinear authoritative FP32 gradient destination:
+  `divergent` (ordinary gradients use an extra per-parameter `staged_grad`).
+- TE delayed-wgrad callback: `missing`.
+- Globally stable RS ordering: `equivalent-with-proof`.
+- RS Work completion: `equivalent-with-proof`; normal-path host
+  `event.synchronize()` remains `divergent`.
+- Multi-microbatch FP32 shard accumulation: `equivalent-with-proof`.
+- Optimizer step to next AG: `equivalent-with-proof`.
+- Eval-to-train overlap lifecycle: `equivalent-with-proof`, GPU job 15407429.
+- Public `named_parameters` and `state_dict`: `divergent`.
+- Model DCP persistent distributed state: `divergent`.
+- Model-only restore and CPU-master refresh: `equivalent-with-proof`.
+- Bounded HF export: `equivalent-with-proof`.
+- Forward/backward exception teardown: `partial`; fail-fast cleanup is proven
+  only for the covered CPU/Gloo cases.
+- Device move: `equivalent-with-proof` for current offload contract.
+- PP/VPP chunk state and checkpoint-key uniqueness: `missing`.
+- Full DP/TP/EP/ETP/PP/VPP/CP topology contract: `missing`.
 
 ## Root backward lifecycle
 
