@@ -140,6 +140,7 @@ class _FusedMainGradLinearFunction(torch.autograd.Function):
         ctx.save_for_backward(value, weight)
         ctx.weight = weight
         ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+        ctx.overwrite_main_grad = bool(getattr(weight, "overwrite_main_grad", False))
         return torch.nn.functional.linear(value, weight)
 
     @staticmethod
@@ -158,7 +159,10 @@ class _FusedMainGradLinearFunction(torch.autograd.Function):
                 if hasattr(ctx.weight, "__fsdp_param__")
                 else ctx.weight.main_grad
             )
-            main_grad.add_(grad_weight)
+            if ctx.overwrite_main_grad:
+                main_grad.copy_(grad_weight)
+            else:
+                main_grad.add_(grad_weight)
             ctx.weight.grad_added_to_main_grad = True
             grad_weight = torch.zeros_like(weight)
         return grad_input, grad_weight, None
@@ -3046,6 +3050,23 @@ def test_mfsdp_routes_fused_wgrad_through_bucketed_fp32_main_grad():
     assert not torch.equal(
         consumed_grad, consumed_grad.to(torch.bfloat16).to(torch.float32)
     )
+
+    # PP executes multiple forwards before their backwards. TE caches the
+    # overwrite/accumulate choice during each forward, so this ordering must
+    # still rotate the authoritative RS staging buffer per microbatch.
+    optimizer.zero_grad()
+    first_value = torch.randn(8, 4, dtype=torch.bfloat16)
+    second_value = torch.randn(8, 4, dtype=torch.bfloat16)
+    first_output = chunk(first_value)
+    second_output = chunk(second_value)
+    first_output.float().sum().backward()
+    second_output.float().sum().backward()
+    optimizer.finish_grad_sync()
+
+    expected = (
+        first_value.float().sum(dim=0) + second_value.float().sum(dim=0)
+    ).repeat(4, 1)
+    assert torch.equal(bucket.main_grad_buffer.view_as(expected), expected)
 
 
 def test_mfsdp_routes_regular_autograd_grad_through_fp32_main_grad():

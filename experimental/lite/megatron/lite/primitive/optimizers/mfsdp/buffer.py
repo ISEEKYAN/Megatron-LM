@@ -1456,6 +1456,7 @@ class GradReducePipeline:
         self._bucket_ready_microbatch: dict[int, int] = {}
         self._ready_group_indices: set[int] = set()
         self._next_group_index = 0
+        self._microbatch_complete = False
         self._group_index_by_bucket = {
             bucket_id: group_index
             for group_index, group in enumerate(self._bucket_groups)
@@ -1507,6 +1508,8 @@ class GradReducePipeline:
         # MCore's cross-microbatch overlap by carrying reductions through the
         # next forward, then retire in FIFO order immediately before the same
         # bucket's staging is reused by backward.
+        if self._microbatch_complete:
+            self.start_microbatch()
         retired_incoming = False
         while any(bucket is incoming for bucket, _elements in self._pending):
             retired_incoming = retired_incoming or self._pending[0][0] is incoming
@@ -1568,6 +1571,8 @@ class GradReducePipeline:
             for bucket_id in group:
                 self._reduce_bucket(self.buckets[bucket_id], force=False)
             self._next_group_index += 1
+        if self._next_group_index == len(self._bucket_groups):
+            self._microbatch_complete = True
 
     def _reduce_bucket(self, bucket: ParamBucket, *, force: bool = False) -> None:
         self._wait_for_previous_grad_reduce(bucket.full_numel)
@@ -1648,12 +1653,14 @@ class GradReducePipeline:
         self._bucket_ready_microbatch.clear()
         self._ready_group_indices.clear()
         self._next_group_index = 0
+        self._microbatch_complete = False
 
     def start_microbatch(self) -> None:
         self._microbatch_id += 1
         self._bucket_ready_microbatch.clear()
         self._ready_group_indices.clear()
         self._next_group_index = 0
+        self._microbatch_complete = False
         for bucket in self.buckets:
             bucket.start_microbatch()
 
@@ -1664,6 +1671,7 @@ class GradReducePipeline:
         self._bucket_ready_microbatch.clear()
         self._ready_group_indices.clear()
         self._next_group_index = 0
+        self._microbatch_complete = False
         for bucket in self.buckets:
             bucket.reset_grad_state()
 
@@ -1805,6 +1813,12 @@ class CommunicationPipelines:
             self.release_backward_ids(self._owner_bucket_ids.get(owner_id, ()))
 
     def end_backward(self) -> None:
+        if self.grad_reduce._microbatch_complete:
+            # Per-parameter hooks already resolved every group for the final
+            # backward represented by this GraphTask. The root callback is
+            # only the unused/shared-parameter fallback in this case.
+            self._pending_param_ids.clear()
+            self._processed_owner_ids.update(self._owner_bucket_ids)
         ordered_owners: list[int] = []
         for group in self.grad_reduce._bucket_groups:
             owner_id = self.buckets[group[0]].owner_id
