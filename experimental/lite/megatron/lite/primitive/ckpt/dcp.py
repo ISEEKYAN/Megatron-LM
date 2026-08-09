@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 """
 DCP (Distributed Checkpoint) framework for training checkpoints.
 
@@ -19,9 +20,6 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.distributed.checkpoint as dcp  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-from torch.distributed.device_mesh import DeviceMesh  # pyright: ignore[reportMissingImports]
-from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
@@ -29,6 +27,10 @@ from megatron.lite.primitive.protocols import (
     default_expert_classifier,
     default_placement_fn,
 )
+from torch.distributed.device_mesh import (
+    DeviceMesh,
+)  # pyright: ignore[reportMissingImports]
+from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
 
 def save_training_checkpoint(
@@ -62,7 +64,12 @@ def save_training_checkpoint(
         ckpt_path = os.path.join(path, f"step_{step}")
         os.makedirs(ckpt_path, exist_ok=True)
         _save_dist_opt_checkpoint(
-            model, optimizer, step, ckpt_path, save_model=save_model, save_optimizer=save_optimizer
+            model,
+            optimizer,
+            step,
+            ckpt_path,
+            save_model=save_model,
+            save_optimizer=save_optimizer,
         )
         if save_rng:
             _save_rng_sidecar(ckpt_path)
@@ -84,7 +91,9 @@ def save_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(param, mesh, placements)
+            state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(
+                param, mesh, placements
+            )
 
     ckpt_path = os.path.join(path, f"step_{step}")
     os.makedirs(ckpt_path, exist_ok=True)
@@ -125,7 +134,11 @@ def load_training_checkpoint(
     ckpt_path = _resolve_step_checkpoint_path(path)
     if _supports_dist_opt_distckpt(model, optimizer):
         step = _load_dist_opt_checkpoint(
-            model, optimizer, ckpt_path, load_model=load_model, load_optimizer=load_optimizer
+            model,
+            optimizer,
+            ckpt_path,
+            load_model=load_model,
+            load_optimizer=load_optimizer,
         )
         if load_rng:
             _load_rng_sidecar(ckpt_path)
@@ -161,8 +174,11 @@ def load_training_checkpoint(
                     _copy_tensor_(param, t)
         _copy_full_parameters_to_shards_if_available(model)
 
-    if load_optimizer:
-        _load_optimizer_checkpoint(optimizer, ckpt_path)
+    optimizer_loaded = load_optimizer and _load_optimizer_checkpoint(
+        optimizer, ckpt_path
+    )
+    if load_model and not optimizer_loaded:
+        _sync_optimizer_main_weights_from_model_if_available(optimizer)
 
     step = state_dict.get("step", 0)
     if load_rng:
@@ -176,14 +192,17 @@ def _resolve_step_checkpoint_path(path: str) -> str:
         return path
 
     step_dirs = sorted(
-        [d for d in os.listdir(path) if d.startswith("step_")], key=lambda d: int(d.split("_")[1])
+        [d for d in os.listdir(path) if d.startswith("step_")],
+        key=lambda d: int(d.split("_")[1]),
     )
     if step_dirs:
         return os.path.join(path, step_dirs[-1])
     return path
 
 
-def _supports_dist_opt_distckpt(model: nn.Module | Iterable[nn.Module], optimizer) -> bool:
+def _supports_dist_opt_distckpt(
+    model: nn.Module | Iterable[nn.Module], optimizer
+) -> bool:
     try:
         from megatron.lite.primitive.ckpt.distckpt import supports_dist_opt_distckpt
     except ModuleNotFoundError as exc:
@@ -206,7 +225,12 @@ def _save_dist_opt_checkpoint(
     from megatron.lite.primitive.ckpt.distckpt import save_dist_opt_checkpoint
 
     save_dist_opt_checkpoint(
-        model, optimizer, step, path, save_model=save_model, save_optimizer=save_optimizer
+        model,
+        optimizer,
+        step,
+        path,
+        save_model=save_model,
+        save_optimizer=save_optimizer,
     )
 
 
@@ -236,23 +260,30 @@ def _save_optimizer_checkpoint(optimizer, path: str) -> None:
         return
     state_dict_fn = getattr(optimizer, "state_dict", None)
     if not callable(state_dict_fn):
-        raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide state_dict().")
+        raise TypeError(
+            f"Optimizer {type(optimizer).__name__} does not provide state_dict()."
+        )
     torch.save(state_dict_fn(), _optimizer_checkpoint_path(path))
 
 
-def _load_optimizer_checkpoint(optimizer, path: str) -> None:
+def _load_optimizer_checkpoint(optimizer, path: str) -> bool:
     if optimizer is None:
         log_rank0("Skipping optimizer checkpoint load because optimizer is None")
-        return
+        return False
     ckpt_path = _optimizer_checkpoint_path(path)
     if not os.path.exists(ckpt_path):
-        log_rank0(f"No optimizer checkpoint found at {ckpt_path}; loading model state only")
-        return
+        log_rank0(
+            f"No optimizer checkpoint found at {ckpt_path}; loading model state only"
+        )
+        return False
     load_state_dict_fn = getattr(optimizer, "load_state_dict", None)
     if not callable(load_state_dict_fn):
-        raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide load_state_dict().")
+        raise TypeError(
+            f"Optimizer {type(optimizer).__name__} does not provide load_state_dict()."
+        )
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     load_state_dict_fn(state)
+    return True
 
 
 def _model_chunks(model: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:
@@ -278,6 +309,26 @@ def _copy_full_parameters_to_shards_if_available(
                 copy_fn()
 
 
+def _sync_optimizer_main_weights_from_model_if_available(optimizer) -> None:
+    if optimizer is None:
+        return
+    backend_name = getattr(
+        optimizer, "optimizer_backend", getattr(optimizer, "name", None)
+    )
+    if not isinstance(backend_name, str):
+        return
+
+    from megatron.lite.primitive.optimizers import get_optimizer_backend
+
+    try:
+        backend = get_optimizer_backend(backend_name)
+    except ValueError:
+        return
+    sync_fn = getattr(backend, "sync_model_weights_to_main_weights", None)
+    if callable(sync_fn):
+        sync_fn(optimizer)
+
+
 def _to_local_tensor(tensor: Any) -> torch.Tensor:
     local_tensor = getattr(tensor, "_local_tensor", None)
     if isinstance(local_tensor, torch.Tensor):
@@ -296,7 +347,9 @@ def _is_dtensor_like(tensor: Any) -> bool:
     )
 
 
-def _dcp_tensor_from_param(param: torch.Tensor, mesh: DeviceMesh, placements: list) -> DTensor:
+def _dcp_tensor_from_param(
+    param: torch.Tensor, mesh: DeviceMesh, placements: list
+) -> DTensor:
     if _is_dtensor_like(param):
         return _dtensor_from_dtensor_like_param(param, _to_local_tensor(param).detach())
     return DTensor.from_local(_to_local_tensor(param).detach(), mesh, placements)
@@ -306,11 +359,17 @@ def _empty_dcp_tensor_like_param(
     param: torch.Tensor, mesh: DeviceMesh, placements: list
 ) -> DTensor:
     if _is_dtensor_like(param):
-        return _dtensor_from_dtensor_like_param(param, torch.empty_like(_to_local_tensor(param)))
-    return DTensor.from_local(torch.empty_like(_to_local_tensor(param)), mesh, placements)
+        return _dtensor_from_dtensor_like_param(
+            param, torch.empty_like(_to_local_tensor(param))
+        )
+    return DTensor.from_local(
+        torch.empty_like(_to_local_tensor(param)), mesh, placements
+    )
 
 
-def _dtensor_from_dtensor_like_param(param: torch.Tensor, local_tensor: torch.Tensor) -> DTensor:
+def _dtensor_from_dtensor_like_param(
+    param: torch.Tensor, local_tensor: torch.Tensor
+) -> DTensor:
     return DTensor.from_local(
         local_tensor,
         param.device_mesh,
@@ -322,7 +381,9 @@ def _dtensor_from_dtensor_like_param(param: torch.Tensor, local_tensor: torch.Te
 
 def _copy_tensor_(target: torch.Tensor, src: torch.Tensor) -> None:
     local_target = _to_local_tensor(target)
-    local_src = _to_local_tensor(src).to(device=local_target.device, dtype=local_target.dtype)
+    local_src = _to_local_tensor(src).to(
+        device=local_target.device, dtype=local_target.dtype
+    )
     if isinstance(local_target, torch.Tensor) and local_target is not target:
         local_target.copy_(local_src)
     else:
@@ -366,7 +427,9 @@ def _local_checkpoint_file(path: str | os.PathLike[str]) -> Path:
 
 
 def _local_optimizer_parameter_state_file(ckpt_file: Path) -> Path:
-    return ckpt_file.with_name(f"{ckpt_file.stem}.optimizer_parameter_state{ckpt_file.suffix}")
+    return ckpt_file.with_name(
+        f"{ckpt_file.stem}.optimizer_parameter_state{ckpt_file.suffix}"
+    )
 
 
 def _rank_suffix() -> str:
@@ -402,7 +465,9 @@ def _get_cuda_rng_tracker_states() -> dict[str, torch.Tensor]:
     from megatron.core import tensor_parallel
 
     states = tensor_parallel.get_cuda_rng_tracker().get_states()
-    return {name: _cpu_clone(state) for name, state in states.items() if state is not None}
+    return {
+        name: _cpu_clone(state) for name, state in states.items() if state is not None
+    }
 
 
 def _get_rng_state() -> dict[str, Any]:
@@ -429,7 +494,9 @@ def _restore_cuda_rng_tracker_states(states: dict[str, torch.Tensor]) -> None:
         }
         tracker.set_states(restored)
     except Exception as exc:
-        raise RuntimeError("Failed to restore Megatron tensor-parallel RNG tracker state.") from exc
+        raise RuntimeError(
+            "Failed to restore Megatron tensor-parallel RNG tracker state."
+        ) from exc
 
 
 def _restore_rng_state(state: dict[str, Any] | None) -> None:
@@ -471,7 +538,9 @@ def _save_local_training_checkpoint(
     ckpt_file.parent.mkdir(parents=True, exist_ok=True)
     save_parameter_state = getattr(optimizer, "save_parameter_state", None)
     optimizer_parameter_state_file = (
-        _local_optimizer_parameter_state_file(ckpt_file) if callable(save_parameter_state) else None
+        _local_optimizer_parameter_state_file(ckpt_file)
+        if callable(save_parameter_state)
+        else None
     )
     state = {
         "format": "megatron_lite.local_training.v1",
@@ -571,7 +640,9 @@ def _ag(data, size, group, dim=0):
     return allgather_concat(data, size, group, dim)
 
 
-def canonicalize_qkv_for_dcp(model, num_attention_heads, num_key_value_heads, head_dim, ps):
+def canonicalize_qkv_for_dcp(
+    model, num_attention_heads, num_key_value_heads, head_dim, ps
+):
     """Rearrange fused QKV from interleaved-TP to canonical (Q|K|V) for DCP save."""
     if ps.tp_size <= 1:
         return
@@ -594,7 +665,9 @@ def canonicalize_qkv_for_dcp(model, num_attention_heads, num_key_value_heads, he
         param.data.copy_(canon.chunk(ps.tp_size, dim=0)[ps.tp_rank])
 
 
-def decanon_qkv_after_dcp(model, num_attention_heads, num_key_value_heads, head_dim, ps):
+def decanon_qkv_after_dcp(
+    model, num_attention_heads, num_key_value_heads, head_dim, ps
+):
     """Reverse of canonicalize_qkv_for_dcp."""
     if ps.tp_size <= 1:
         return

@@ -14,6 +14,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from megatron.lite.primitive.ckpt import dcp
 from megatron.lite.primitive.optimizers.mfsdp import buffer as mfsdp_buffer
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
 from megatron.lite.runtime.contracts.config import ParallelConfig
@@ -1351,6 +1352,59 @@ def test_mfsdp_offload_fraction_checkpoint_round_trips():
         torch.equal(restored, expected)
         for restored, expected in zip(restored_exp_avg, expected_exp_avg)
     )
+
+
+@pytest.mark.parametrize("load_optimizer", [False, True])
+def test_mfsdp_model_only_dcp_restore_refreshes_cpu_masters_before_next_step(
+    monkeypatch, tmp_path, load_optimizer
+):
+    _Model, _Unit, ps, engine_cfg = _build_offload_stack(offload_fraction=1.0)
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    cpu_group = optimizer._inner_optimizer.cpu_group
+    assert cpu_group is not None
+    with torch.no_grad():
+        for cpu_param in cpu_group._cpu_params:
+            # CPU-only tests otherwise alias ``detach().cpu()`` with the shard;
+            # real CUDA offload always owns a distinct host master allocation.
+            cpu_param.data = cpu_param.detach().clone()
+            cpu_param.fill_(-7.0)
+
+    monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: False)
+    monkeypatch.setattr(dcp, "_build_meshes", lambda _config: (object(), object()))
+    monkeypatch.setattr(
+        dcp,
+        "_empty_dcp_tensor_like_param",
+        lambda param, _mesh, _placements: torch.empty_like(param),
+    )
+
+    def fake_load(state_dict, checkpoint_id) -> None:
+        assert checkpoint_id == str(tmp_path)
+        for key, value in state_dict.items():
+            if key.startswith("model."):
+                value.fill_(3.0)
+
+    monkeypatch.setattr(dcp.dcp, "load", fake_load)
+    dcp.load_training_checkpoint(
+        chunks[0],
+        optimizer,
+        str(tmp_path),
+        config=object(),
+        ps=SimpleNamespace(pp_rank=0, pp_size=1),
+        load_rng=False,
+        load_optimizer=load_optimizer,
+    )
+
+    assert all(torch.all(param == 3.0) for param in cpu_group._gpu_params)
+    optimizer.zero_grad()
+    success, _grad_norm, _ = optimizer.step()
+    assert success
+    assert all(torch.all(param == 3.0) for param in cpu_group._gpu_params)
 
 
 def _single_rank_mfsdp_stack(*, override_optimizer_config=None):

@@ -131,6 +131,16 @@ class CpuAdamGroup:
     def param_groups(self) -> list[dict[str, Any]]:
         return self._cpu_optimizer.param_groups
 
+    def sync_master_params_from_model(self) -> None:
+        """Refresh authoritative CPU masters from their model-shard mirrors."""
+        with torch.no_grad():
+            for gpu_param, cpu_param in zip(self._gpu_params, self._cpu_params):
+                cpu_param.copy_(
+                    gpu_param.detach()
+                    .view(-1)
+                    .to(device=cpu_param.device, dtype=cpu_param.dtype)
+                )
+
     def step(self) -> None:
         d2h_events: list[torch.cuda.Event | None] = []
         current_stream = torch.cuda.current_stream() if self._use_pinned else None

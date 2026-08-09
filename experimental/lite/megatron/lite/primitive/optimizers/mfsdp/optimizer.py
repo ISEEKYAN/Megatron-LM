@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 """Self-contained Megatron-FSDP construction for Megatron Lite."""
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 from megatron.lite.primitive.optimizers.mfsdp.config import (
     MFSDPConfig,
     annotate_parallel_parameters,
@@ -21,6 +21,7 @@ from megatron.lite.primitive.optimizers.mfsdp.config import (
     build_mfsdp_process_groups,
     validate_mfsdp_config,
 )
+from megatron.lite.primitive.optimizers.mfsdp.cpu_offload import CpuAdamGroup
 from megatron.lite.primitive.optimizers.mfsdp.fully_shard import fully_shard_model
 from megatron.lite.primitive.optimizers.mfsdp.fused_ops import (
     OptimizerFactory,
@@ -31,7 +32,6 @@ from megatron.lite.primitive.optimizers.mfsdp.grad_norm import (
     local_grad_sq_sum,
     resolve_torch_dtype,
 )
-from megatron.lite.primitive.optimizers.mfsdp.cpu_offload import CpuAdamGroup
 from megatron.lite.primitive.optimizers.mfsdp.wrapper import (
     MFSdpModule,
     mark_optimizer_built,
@@ -151,10 +151,7 @@ class _StandaloneOptimizer:
         dense_dp_group = getattr(self.ps, "dp_cp_group", None) or getattr(
             self.ps, "dp_group", None
         )
-        _sum_if_distributed(
-            dense_sq,
-            dense_dp_group,
-        )
+        _sum_if_distributed(dense_sq, dense_dp_group)
         _sum_if_distributed(dense_sq, getattr(self.ps, "tp_group", None))
 
         tp_replicated_sq = local_grad_sq_sum(
@@ -277,10 +274,7 @@ def _sum_if_distributed(value: torch.Tensor, group: dist.ProcessGroup | None) ->
 
 
 def _all_reduce_grad_if_distributed(
-    grad: torch.Tensor,
-    group: dist.ProcessGroup | None,
-    *,
-    average: bool = False,
+    grad: torch.Tensor, group: dist.ProcessGroup | None, *, average: bool = False
 ) -> None:
     if group is None or not dist.is_initialized() or dist.get_world_size(group) <= 1:
         return
@@ -305,6 +299,7 @@ class MFSdpOptimizer:
     """Join the standalone optimizer and M-FSDP communication lifecycle."""
 
     name = "megatron_fsdp"
+    optimizer_backend = "mfsdp"
 
     def __init__(self, optimizer: Any, model_chunks: list[MFSdpModule]) -> None:
         self._inner_optimizer = optimizer
@@ -370,8 +365,7 @@ def build_mfsdp_stack(
 ):
     """Wrap chunks with the native M-FSDP path and build its local optimizer."""
     validate_mfsdp_config(
-        engine_cfg,
-        has_optimizer_factory=optimizer_factory is not None,
+        engine_cfg, has_optimizer_factory=optimizer_factory is not None
     )
     opt = engine_cfg.optimizer
     classifier = is_expert or (lambda _name: False)
@@ -427,9 +421,7 @@ def build_mfsdp_stack(
         )
         torch_optimizer = (
             _build_optimizer_algorithm(
-                gpu_param_groups,
-                opt,
-                optimizer_factory=optimizer_factory,
+                gpu_param_groups, opt, optimizer_factory=optimizer_factory
             )
             if gpu_param_groups
             else _NullOptimizer()
@@ -447,9 +439,7 @@ def build_mfsdp_stack(
             )
     else:
         torch_optimizer = _build_optimizer_algorithm(
-            param_groups,
-            opt,
-            optimizer_factory=optimizer_factory,
+            param_groups, opt, optimizer_factory=optimizer_factory
         )
         cpu_group = None
 
@@ -475,8 +465,7 @@ def build_mfsdp_stack(
 
 
 def _order_param_gathers_for_parallel_collectives(
-    config: MFSDPConfig,
-    ps: Any,
+    config: MFSDPConfig, ps: Any
 ) -> MFSDPConfig:
     """Avoid unordered async collectives across intersecting process groups.
 
@@ -510,19 +499,10 @@ def _order_param_gathers_for_parallel_collectives(
 
 
 def _mark_mfsdp_parallel_attrs(
-    model: nn.Module,
-    classifier: ExpertClassifierFn,
-    *,
-    tp_size: int,
-    etp_size: int,
+    model: nn.Module, classifier: ExpertClassifierFn, *, tp_size: int, etp_size: int
 ) -> None:
     """Compatibility entry point for the active metadata normalization pass."""
-    annotate_parallel_parameters(
-        model,
-        classifier,
-        tp_size=tp_size,
-        etp_size=etp_size,
-    )
+    annotate_parallel_parameters(model, classifier, tp_size=tp_size, etp_size=etp_size)
 
 
 def build_mfsdp_training_optimizer(
@@ -549,10 +529,7 @@ def build_mfsdp_training_optimizer(
             adam_eps=None,
             override_optimizer_config={},
         )
-    engine_cfg = SimpleNamespace(
-        parallel=impl_cfg.parallel,
-        optimizer=opt,
-    )
+    engine_cfg = SimpleNamespace(parallel=impl_cfg.parallel, optimizer=opt)
     model_chunks[:], optimizer = build_mfsdp_stack(
         model_chunks,
         engine_cfg=engine_cfg,
@@ -569,8 +546,7 @@ def build_mfsdp_training_optimizer(
 
 
 def _split_param_groups_by_fraction(
-    param_groups: list[dict[str, Any]],
-    offload_fraction: float,
+    param_groups: list[dict[str, Any]], offload_fraction: float
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split param groups so the first *offload_fraction* of numel goes to CPU."""
     if offload_fraction == 1.0:
@@ -605,8 +581,7 @@ def _split_param_groups_by_fraction(
 
 
 def _build_cpu_adam_group(
-    cpu_param_groups: list[dict[str, Any]],
-    opt: Any,
+    cpu_param_groups: list[dict[str, Any]], opt: Any
 ) -> CpuAdamGroup:
     lr = float(getattr(opt, "lr", 1.0e-4))
     beta1 = getattr(opt, "adam_beta1", None)
@@ -626,11 +601,7 @@ def _build_param_groups(
     classifier: ExpertClassifierFn,
     weight_decay: float,
     apply_wd_to_qk_layernorm: bool,
-) -> tuple[
-    list[nn.Parameter],
-    list[dict[str, Any]],
-    list[nn.Parameter],
-]:
+) -> tuple[list[nn.Parameter], list[dict[str, Any]], list[nn.Parameter]]:
     params: list[nn.Parameter] = []
     decay_params: list[nn.Parameter] = []
     no_decay_params: list[nn.Parameter] = []
@@ -674,8 +645,4 @@ def _build_optimizer_algorithm(
     *,
     optimizer_factory: OptimizerFactory | None = None,
 ) -> torch.optim.Optimizer:
-    return build_optimizer(
-        param_groups,
-        opt,
-        optimizer_factory=optimizer_factory,
-    )
+    return build_optimizer(param_groups, opt, optimizer_factory=optimizer_factory)

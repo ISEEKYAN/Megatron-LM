@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 """Runtime backend contract for standalone M-FSDP."""
 
 from __future__ import annotations
@@ -87,7 +88,7 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> None:
 
 
 def preprocess_state_dict_for_uneven_dtensor(
-    state_dict: dict[str, Any],
+    state_dict: dict[str, Any]
 ) -> dict[str, Any]:
     """Attach DCP planner closures to every nested DTensor, in stable key order."""
     for _path, value in sorted(_walk_state(state_dict), key=lambda item: item[0]):
@@ -139,6 +140,9 @@ class MegatronFSDPBackend:
     def sync_model_weights_to_main_weights(self, optimizer: Any) -> bool:
         for chunk in optimizer._model_chunks:
             chunk.param_sync.copy_full_parameters_to_shards()
+        cpu_group = getattr(optimizer._inner_optimizer, "cpu_group", None)
+        if cpu_group is not None:
+            cpu_group.sync_master_params_from_model()
         return True
 
     def finalize_grads(
