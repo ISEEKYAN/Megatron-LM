@@ -1283,7 +1283,9 @@ class AllGatherPipeline:
         bucket.wait_param_gather()
 
     def begin_forward(self) -> None:
-        self.release_all()
+        # A root/non-unit bucket retained by an eval forward remains valid
+        # until the following training backward consumes it.
+        self.release_all(preserve_non_fsdp_units=True)
         self._forward_cursor = 0
         if self.buckets and self.overlap:
             self.async_bucket_gather(0)
@@ -1677,14 +1679,18 @@ class CommunicationPipelines:
             owner_id: TrainingState.IDLE for owner_id in self._owner_bucket_ids
         }
         self._backward_started = False
+        self._preserve_non_fsdp_units_after_forward = False
 
-    def begin_forward(self) -> None:
+    def begin_forward(self, *, preserve_non_fsdp_units: bool = False) -> None:
         graph_task_id = getattr(torch._C, "_current_graph_task_id", lambda: -1)()
         if self._backward_started and graph_task_id < 0:
             # PyTorch does not execute queued GraphTask callbacks after every
             # backward failure.  A later forward is the first universally
             # reachable boundary where stale work can be torn down.
             self.abort()
+        self._preserve_non_fsdp_units_after_forward = (
+            self._preserve_non_fsdp_units_after_forward or bool(preserve_non_fsdp_units)
+        )
         self.all_gather.begin_forward()
 
     def acquire_forward(self, bucket_ids: Iterable[int]) -> None:
@@ -1698,7 +1704,11 @@ class CommunicationPipelines:
     def release_forward_owner(self, owner_id: int, bucket_ids: Iterable[int]) -> None:
         if self._training_states.get(owner_id) is TrainingState.PRE_BACKWARD:
             return
-        self.release_forward_ids(bucket_ids)
+        if (
+            self._owner_is_fsdp_unit.get(owner_id, True)
+            or not self._preserve_non_fsdp_units_after_forward
+        ):
+            self.release_forward_ids(bucket_ids)
         self._training_states[owner_id] = TrainingState.IDLE
 
     def begin_backward(self) -> bool:
@@ -1766,6 +1776,7 @@ class CommunicationPipelines:
                 f"{len(self._pending_param_ids)}"
             )
         self._backward_started = False
+        self._preserve_non_fsdp_units_after_forward = False
         for owner_id in self._training_states:
             self._training_states[owner_id] = TrainingState.IDLE
 
@@ -1790,6 +1801,8 @@ class CommunicationPipelines:
     def end_forward(self) -> None:
         for bucket in self.buckets:
             if self._training_states.get(bucket.owner_id) is TrainingState.PRE_BACKWARD:
+                continue
+            if not bucket.is_fsdp_unit and self._preserve_non_fsdp_units_after_forward:
                 continue
             bucket.release_full_parameters()
             bucket.discard_full_parameter_views()
@@ -1862,6 +1875,7 @@ class CommunicationPipelines:
         """Best-effort two-phase exception teardown for shared communication storage."""
         self.grad_reduce.abort()
         self._backward_started = False
+        self._preserve_non_fsdp_units_after_forward = False
         self._pending_param_ids.clear()
         self._processed_owner_ids.clear()
         for owner_id in self._training_states:
