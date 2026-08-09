@@ -18,7 +18,8 @@ Protocol convention (what runtime calls):
     create_runtime(hf_path, cfg) -> Runtime          — fully override runtime
 
 Qwen3 ChunkedEP fields in ``ImplConfig``:
-  ``enable_ep_chunk_overlap`` enables the fixed two-chunk DeepEP composition;
+  ``enable_ep_chunk_overlap`` enables the two-physical-slot DeepEP composition
+  (the current Qwen3 profile selects two logical chunks);
   ``ep_chunk_max_token_rows_per_rank`` is the required flattened per-rank
   forward capacity; ``ep_chunk_full_recompute`` selects fwd+fused-fwd-bwd
   composition. ChunkedEP requires DeepEP, EP>1, top-k<=EP, and an explicit

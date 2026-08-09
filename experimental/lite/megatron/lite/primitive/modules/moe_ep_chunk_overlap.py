@@ -38,7 +38,7 @@ class EPChunkShapeProfile:
     max_expert_rows: int = field(init=False)
 
     @classmethod
-    def for_fixed_two_chunk_ep(
+    def for_two_slot_chunked_ep(
         cls,
         *,
         max_input_rows: int,
@@ -48,9 +48,9 @@ class EPChunkShapeProfile:
         chunk_count: int = 2,
     ) -> "EPChunkShapeProfile":
         if ep_size <= 1:
-            raise ValueError("Fixed EP chunk profile requires EP > 1")
+            raise ValueError("Two-slot EP chunk profile requires EP > 1")
         if max_input_rows < 2:
-            raise ValueError("Fixed two-chunk profile requires at least two rows")
+            raise ValueError("Two-slot EP chunk profile requires at least two rows")
         return cls(
             max_input_rows=max_input_rows,
             hidden_size=hidden_size,
@@ -72,12 +72,14 @@ class EPChunkShapeProfile:
         ):
             raise ValueError("EP chunk shape-profile capacities must be positive")
         if self.ep_size <= 1:
-            raise ValueError("Fixed EP chunk profile requires EP > 1")
+            raise ValueError("Two-slot EP chunk profile requires EP > 1")
         if self.chunk_count < 2:
             raise ValueError("EP chunk profile requires at least two chunks")
         if self.max_input_rows < self.chunk_count:
             raise ValueError("EP chunk profile requires at least one row per chunk")
-        max_chunk_rows = (self.max_input_rows + self.chunk_count - 1) // self.chunk_count
+        max_chunk_rows = (
+            self.max_input_rows + self.chunk_count - 1
+        ) // self.chunk_count
         # DeepEP recv storage may contain every source rank's chunk on one
         # destination rank. It stores one hidden row per transported token and
         # represents its local top-k destinations in recv_probs.
@@ -91,7 +93,7 @@ class EPChunkShapeProfile:
     def validate_input_rows(self, rows: int) -> None:
         if rows > self.max_input_rows:
             raise RuntimeError(
-                f"EP chunk input rows {rows} exceeds fixed profile "
+                f"EP chunk input rows {rows} exceeds two-slot profile "
                 f"capacity {self.max_input_rows}"
             )
 
@@ -99,7 +101,7 @@ class EPChunkShapeProfile:
         """Validate DeepEP rows received by one destination rank for one chunk."""
         if rows > self.max_recv_rows:
             raise RuntimeError(
-                f"EP chunk recv rows {rows} exceeds fixed profile "
+                f"EP chunk recv rows {rows} exceeds two-slot profile "
                 f"capacity {self.max_recv_rows}"
             )
 
@@ -107,14 +109,14 @@ class EPChunkShapeProfile:
         """Validate rows after one received token expands to local experts."""
         if rows > self.max_expert_rows:
             raise RuntimeError(
-                f"EP chunk expert rows {rows} exceeds fixed profile "
+                f"EP chunk expert rows {rows} exceeds two-slot profile "
                 f"capacity {self.max_expert_rows}"
             )
 
     def validate_input(self, value: torch.Tensor) -> None:
         if value.size(-1) != self.hidden_size:
             raise RuntimeError(
-                f"EP chunk hidden size {value.size(-1)} does not match fixed "
+                f"EP chunk hidden size {value.size(-1)} does not match two-slot "
                 f"profile {self.hidden_size}"
             )
         self.validate_input_rows(value.numel() // self.hidden_size)
@@ -620,7 +622,10 @@ class EPChunkWorkspace:
         requested = tuple(int(dim) for dim in shape)
         profile = self.key.shape_profile
         contracts = {
-            "fc1_input": ((profile.max_expert_rows, profile.hidden_size), self.key.dtype),
+            "fc1_input": (
+                (profile.max_expert_rows, profile.hidden_size),
+                self.key.dtype,
+            ),
         }
         ceiling, expected_dtype = contracts.get(name, (requested, dtype))
         if (
@@ -1227,7 +1232,9 @@ class _EPChunkOperationBase:
         def submit_dispatch(chunk_idx: int):
             start, end = ranges[chunk_idx]
             x_chunk = x_2d[start:end]
-            lease = self.workspace.acquire(chunk_idx % EP_CHUNK_COUNT, stream=comm_stream)
+            lease = self.workspace.acquire(
+                chunk_idx % EP_CHUNK_COUNT, stream=comm_stream
+            )
             dispatcher = lease.dispatcher
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(input_ready)
@@ -1287,11 +1294,13 @@ class _EPChunkOperationBase:
                                 dispatcher, "_local_tpe_list", None
                             ),
                             activation_allocation=expert_activation_lease.allocate,
-                            output_allocation=lambda name, shape: expert_activation_lease.tensor(
-                                name,
-                                shape,
-                                dtype=fc1_input.dtype,
-                                device=fc1_input.device,
+                            output_allocation=lambda name, shape: (
+                                expert_activation_lease.tensor(
+                                    name,
+                                    shape,
+                                    dtype=fc1_input.dtype,
+                                    device=fc1_input.device,
+                                )
                             ),
                         )
                 expert_ready = torch.cuda.Event()
@@ -1345,6 +1354,12 @@ class _EPChunkOperationBase:
             for loop_idx in range(len(ranges)):
                 finished = finish_dispatch(current_state)
                 if loop_idx + 1 < len(ranges):
+                    if pending_combine is not None:
+                        next_slot = (loop_idx + 1) % EP_CHUNK_COUNT
+                        pending_slot = pending_combine[0] % EP_CHUNK_COUNT
+                        if next_slot == pending_slot:
+                            finish_combine(pending_combine)
+                            pending_combine = None
                     current_state = submit_dispatch(loop_idx + 1)
                 prepared = run_expert(finished)
                 if pending_combine is not None:
@@ -1380,7 +1395,9 @@ class _EPChunkOperationBase:
         def submit_dispatch(chunk_idx: int):
             start, end = ranges[chunk_idx]
             x_chunk = x_2d[start:end]
-            lease = self.workspace.acquire(chunk_idx % EP_CHUNK_COUNT, stream=comm_stream)
+            lease = self.workspace.acquire(
+                chunk_idx % EP_CHUNK_COUNT, stream=comm_stream
+            )
             dispatcher = lease.dispatcher
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(input_ready)
@@ -1551,6 +1568,12 @@ class _EPChunkOperationBase:
         for loop_idx in range(len(ranges)):
             finished = finish_dispatch(current_state)
             if loop_idx + 1 < len(ranges):
+                if pending_combine is not None:
+                    next_slot = (loop_idx + 1) % EP_CHUNK_COUNT
+                    pending_slot = pending_combine[0] % EP_CHUNK_COUNT
+                    if next_slot == pending_slot:
+                        finish_combine(pending_combine)
+                        pending_combine = None
                 current_state = submit_dispatch(loop_idx + 1)
             prepared = run_expert(finished)
             if pending_combine is not None:
@@ -1576,9 +1599,7 @@ class _EPChunkOperationBase:
         x_saved: torch.Tensor,
         grad_2d: torch.Tensor,
     ):
-        ranges = ep_chunk_ranges(
-            x_saved.size(0), chunk_count=self._logical_chunk_count
-        )
+        ranges = ep_chunk_ranges(x_saved.size(0), chunk_count=self._logical_chunk_count)
         router_params = tuple(self.router.parameters())
         expert_params = tuple(self.experts.parameters())
         return self._full_recompute_fused_backward_v6(
@@ -1626,7 +1647,9 @@ class _EPChunkOperationBase:
         def submit_recompute_dispatch(chunk_idx: int):
             start, end = ranges[chunk_idx]
             x_chunk = x_2d[start:end].detach().requires_grad_(True)
-            lease = self.workspace.acquire(chunk_idx % EP_CHUNK_COUNT, stream=comm_stream)
+            lease = self.workspace.acquire(
+                chunk_idx % EP_CHUNK_COUNT, stream=comm_stream
+            )
             dispatcher = lease.dispatcher
             with torch.cuda.stream(compute_stream):
                 compute_stream.wait_event(input_ready)
@@ -1721,11 +1744,13 @@ class _EPChunkOperationBase:
                             expert_probs,
                             tokens_per_expert_list=metadata["local_tpe_list"],
                             activation_allocation=expert_activation_lease.allocate,
-                            output_allocation=lambda name, shape: expert_activation_lease.tensor(
-                                name,
-                                shape,
-                                dtype=expert_input.dtype,
-                                device=expert_input.device,
+                            output_allocation=lambda name, shape: (
+                                expert_activation_lease.tensor(
+                                    name,
+                                    shape,
+                                    dtype=expert_input.dtype,
+                                    device=expert_input.device,
+                                )
                             ),
                         )
                 _record_state_tensors_current_stream(state)
@@ -1961,7 +1986,9 @@ class _EPChunkOperationBase:
 
                 pending_dispatch_bwd.append((chunk, local_state))
                 if len(pending_dispatch_bwd) > 1:
-                    raise RuntimeError("EP chunk fused backward pending queue exceeded one chunk")
+                    raise RuntimeError(
+                        "EP chunk fused backward pending queue exceeded one chunk"
+                    )
 
         if last_wgrad_done is None:
             raise RuntimeError("EP chunk fused backward did not flush expert wgrads")
@@ -2278,9 +2305,7 @@ class EPChunkForwardOp(_EPChunkOperationBase):
                 x.dtype,
                 *params,
             )
-        ranges = ep_chunk_ranges(
-            x_2d.size(0), chunk_count=self._logical_chunk_count
-        )
+        ranges = ep_chunk_ranges(x_2d.size(0), chunk_count=self._logical_chunk_count)
         with self._routing_context(routing_input):
             return self._forward_output_async(
                 x_2d,
@@ -2453,7 +2478,9 @@ def _retire_one_fused_dispatch_bwd(
 ) -> None:
     """Finish one dispatched backward chunk and release its slot lease."""
     if len(pending) > 1:
-        raise RuntimeError("EP chunk fused backward retained more than one pending chunk")
+        raise RuntimeError(
+            "EP chunk fused backward retained more than one pending chunk"
+        )
     if not pending:
         return
     chunk, local_state = pending.pop()
@@ -2469,7 +2496,9 @@ def _retire_one_fused_dispatch_bwd(
                 device=grad_2d.device,
                 dtype=chunk.scores_dtype,
             )
-        router_output = chunk.scores_edge if chunk.scores_edge is not None else chunk.scores
+        router_output = (
+            chunk.scores_edge if chunk.scores_edge is not None else chunk.scores
+        )
         if router_output is None:
             raise RuntimeError("EP chunk overlap router graph was released.")
         router_grads = torch.autograd.grad(

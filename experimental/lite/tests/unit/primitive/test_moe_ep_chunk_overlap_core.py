@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -1114,6 +1115,187 @@ def test_chunked_forward_submits_next_dispatch_before_expert_host_setup():
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         }
         assert calls["finish_dispatch"] < calls["submit_dispatch"] < calls["run_expert"]
+
+
+@pytest.mark.parametrize("chunk_count", [3, 4])
+@pytest.mark.parametrize("saved_context", [False, True])
+def test_logical_chunk_slot_reuse_finishes_combine_before_dispatch_reacquire(
+    chunk_count, saved_context, monkeypatch, transformer_engine_import_stub
+):
+    """Exercise both forward pipelines with two strictly leased physical slots."""
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import moe_ep_chunk_overlap as overlap
+
+    events = []
+
+    class FakeEvent:
+        def record(self, _stream):
+            pass
+
+    class FakeStream:
+        device = torch.device("cpu")
+
+        def wait_event(self, _event):
+            pass
+
+    class FakeDispatcher:
+        moe_permute_fusion = False
+
+        def submit_deepep_dispatch(self, x, _scores, _indices, **_kwargs):
+            return {
+                "chunk_idx": int(x[0, 0]),
+                "recv_hidden": x.clone(),
+                "recv_probs": torch.ones(x.size(0), 1),
+                "handle": object(),
+            }
+
+        def finish_deepep_dispatch(self, state, **_kwargs):
+            return (
+                state["recv_hidden"],
+                [state["recv_hidden"].size(0)],
+                state["recv_probs"],
+            )
+
+        def finish_deepep_dispatch_external_with_options(self, state, **_kwargs):
+            return (
+                state["recv_hidden"],
+                [state["recv_hidden"].size(0)],
+                state["recv_probs"],
+                {
+                    "local_tpe_list": [state["recv_hidden"].size(0)],
+                    "manual_row_id_map": torch.arange(state["recv_hidden"].size(0)),
+                    "manual_prob_flat_indices": torch.arange(
+                        state["recv_hidden"].size(0)
+                    ),
+                },
+            )
+
+        def prepare_deepep_combine(self, expert_out):
+            return expert_out, object()
+
+        def submit_deepep_combine_prepared(self, rank_grouped, handle, **_kwargs):
+            return rank_grouped, handle
+
+        def finish_deepep_combine(self, state):
+            return state[0]
+
+    class FakeLease:
+        def __init__(self, workspace, slot):
+            self.workspace = workspace
+            self.slot = slot
+            self.dispatcher = FakeDispatcher()
+            self.allocation_arena = SimpleNamespace(allocate=lambda: nullcontext())
+
+        def deepep_recv_allocation(self):
+            return nullcontext()
+
+        def release(self, _event):
+            events.append(f"release:{self.slot}")
+            self.workspace.leased.remove(self.slot)
+
+    class FakeActivationLease:
+        def tensor(self, _name, shape, *, dtype, device):
+            return torch.empty(shape, dtype=dtype, device=device)
+
+        def allocate(self):
+            return nullcontext()
+
+        def release(self, _event):
+            pass
+
+    class FakeWorkspace:
+        def __init__(self):
+            self.key = SimpleNamespace(
+                op="forward",
+                shape_profile=SimpleNamespace(
+                    chunk_count=chunk_count, validate_input=lambda _value: None
+                ),
+            )
+            self.leased = set()
+
+        def acquire(self, slot, **_kwargs):
+            if slot in self.leased:
+                raise RuntimeError(f"slot {slot} already leased")
+            self.leased.add(slot)
+            events.append(f"acquire:{slot}")
+            return FakeLease(self, slot)
+
+        def acquire_expert_activation(self, **_kwargs):
+            return FakeActivationLease()
+
+    compute_stream = FakeStream()
+    workspace = FakeWorkspace()
+    operation = overlap._EPChunkOperationBase(
+        router=lambda x: (x * 2, torch.zeros(x.size(0), 1, dtype=torch.long)),
+        experts=lambda x, *_args, **_kwargs: x + 1,
+        workspace=workspace,
+    )
+    monkeypatch.setattr(
+        operation, "_streams", lambda _device: (compute_stream, FakeStream())
+    )
+    monkeypatch.setattr(overlap.torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(overlap.torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(
+        overlap.torch.cuda, "current_stream", lambda _device=None: compute_stream
+    )
+    monkeypatch.setattr(
+        overlap, "_validate_finished_deepep_dispatch", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        overlap, "_record_state_tensors_current_stream", lambda _state: None
+    )
+    monkeypatch.setattr(
+        overlap, "_record_ep_chunk_recv_tensors", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(
+        overlap, "unpermute", lambda expert_out, *_args, **_kwargs: expert_out
+    )
+
+    x = (
+        torch.arange(chunk_count * 2, dtype=torch.float32)
+        .view(-1, 1)
+        .requires_grad_(True)
+    )
+    ranges = [(2 * index, 2 * index + 2) for index in range(chunk_count)]
+    if saved_context:
+        output, context = operation._forward_saved_context_async(
+            x, ranges, x.shape, x.dtype
+        )
+        assert len(context.chunks) == chunk_count
+    else:
+        output = operation._forward_output_async(x, ranges, x.shape, x.dtype)
+
+    assert output.shape == x.shape
+    assert workspace.leased == set()
+    for slot in range(2):
+        acquires = [
+            index for index, event in enumerate(events) if event == f"acquire:{slot}"
+        ]
+        assert len(acquires) == (chunk_count + 1 - slot) // 2
+        for reused in acquires[1:]:
+            assert any(event == f"release:{slot}" for event in events[:reused]), events
+
+
+def test_two_chunk_forward_keeps_next_dispatch_ahead_of_first_combine_release(
+    transformer_engine_import_stub,
+):
+    """The n=2 schedule retains its existing dispatch/expert/combine overlap."""
+    # The n=3/4 executable harness above would be redundant here; this source
+    # order pins the n=2 fast path, where no physical slot is reused in-loop.
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+    )
+
+    for method in (
+        _EPChunkOperationBase._forward_output_async,
+        _EPChunkOperationBase._forward_saved_context_async,
+    ):
+        source = inspect.getsource(method)
+        first_dispatch = source.index("current_state = submit_dispatch(0)")
+        next_dispatch = source.index("current_state = submit_dispatch(loop_idx + 1)")
+        first_combine = source.index("finish_combine(pending_combine)", next_dispatch)
+        assert first_dispatch < next_dispatch < first_combine
 
 
 def test_saved_forward_routes_next_chunk_on_comm_stream():

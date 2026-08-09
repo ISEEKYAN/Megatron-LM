@@ -126,7 +126,7 @@ class MoELayer(nn.Module):
         self.ep_chunk_full_recompute = ep_chunk_full_recompute
         if enable_ep_chunk_overlap:
             assert ep_chunk_max_token_rows_per_rank is not None
-            shape_profile = EPChunkShapeProfile.for_fixed_two_chunk_ep(
+            shape_profile = EPChunkShapeProfile.for_two_slot_chunked_ep(
                 max_input_rows=ep_chunk_max_token_rows_per_rank,
                 hidden_size=config.hidden_size,
                 topk=config.num_experts_per_tok,

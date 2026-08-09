@@ -626,7 +626,7 @@ def test_profile_rejects_input_rows_beyond_qwen_capacity(
         ep_size=4,
     )
 
-    with pytest.raises(RuntimeError, match="exceeds fixed profile"):
+    with pytest.raises(RuntimeError, match="exceeds two-slot profile"):
         profile.validate_input_rows(9)
 
 
@@ -929,9 +929,7 @@ def test_expert_activation_lease_lazily_grows_one_fc1_input_buffer(
     )
     stream = _FakeStream()
     first = workspace.acquire_expert_activation(stream=stream)
-    first_tensor = first.tensor(
-        "fc1_input", (5, 4), dtype=torch.float32, device="cpu"
-    )
+    first_tensor = first.tensor("fc1_input", (5, 4), dtype=torch.float32, device="cpu")
     # A caller-owned autograd output can require gradients for one invocation;
     # the persistent base must stay non-grad when its next lease aliases it.
     first_tensor.requires_grad_(True)
@@ -954,9 +952,7 @@ def test_expert_activation_lease_lazily_grows_one_fc1_input_buffer(
     second.release(grow_guard)
 
     third = workspace.acquire_expert_activation(stream=stream)
-    grown_tensor = third.tensor(
-        "fc1_input", (7, 4), dtype=torch.float32, device="cpu"
-    )
+    grown_tensor = third.tensor("fc1_input", (7, 4), dtype=torch.float32, device="cpu")
 
     assert stream.waited == [pending, grow_guard]
     grown_evidence = workspace.evidence()["expert_activation_tensors"]["fc1_input"]
@@ -1213,7 +1209,7 @@ def test_profile_checks_actual_flattened_rows_for_batched_and_packed_inputs(
         _registry,
         _function,
     ) = _symbols(transformer_engine_import_stub)
-    profile = profile_type.for_fixed_two_chunk_ep(
+    profile = profile_type.for_two_slot_chunked_ep(
         max_input_rows=9,
         hidden_size=4,
         topk=2,
@@ -1238,7 +1234,7 @@ def test_qwen3_profile_freezes_deepep_worst_case_receive_capacity(
         _function,
     ) = _symbols(transformer_engine_import_stub)
 
-    profile = profile_type.for_fixed_two_chunk_ep(
+    profile = profile_type.for_two_slot_chunked_ep(
         max_input_rows=17,
         hidden_size=64,
         topk=8,

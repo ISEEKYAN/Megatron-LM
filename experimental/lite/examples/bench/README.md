@@ -25,8 +25,8 @@ Use the `mbridge` line for Core/distopt precision and speed claims.
 
 ## Qwen3 MoE ChunkedEP
 
-Qwen3 MoE can compose the fixed two-chunk DeepEP overlap implementation through
-its lite implementation config:
+Qwen3 MoE can compose the two-physical-slot DeepEP overlap implementation
+through its lite implementation config:
 
 ```python
 from megatron.lite.model.qwen3_moe.lite.protocol import ImplConfig
@@ -51,8 +51,10 @@ python experimental/lite/examples/bench/bench.py \
   --impl-cfg-json '{"use_deepep":true,"enable_ep_chunk_overlap":true,"ep_chunk_max_token_rows_per_rank":4096,"ep_chunk_full_recompute":false}'
 ```
 
-This profile always uses two chunks. It requires DeepEP with `EP > 1`; there is
-no dynamic chunk-count or per-model scheduling policy. The caller must set
+The primitive keeps two physical workspace slots while its profile owns the
+logical chunk count; the current Qwen3 configuration selects two logical
+chunks. It requires DeepEP with `EP > 1`; there is no per-model scheduling
+policy. The caller must set
 `ep_chunk_max_token_rows_per_rank` to the true maximum flattened MoE input rows
 for one rank and one forward (including BSHD micro-batches or all packed THD
 tokens). Inputs above that fixed capacity fail loudly; scratch tensors are
