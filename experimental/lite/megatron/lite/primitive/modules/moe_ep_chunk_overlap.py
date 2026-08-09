@@ -1287,6 +1287,12 @@ class _EPChunkOperationBase:
                                 dispatcher, "_local_tpe_list", None
                             ),
                             activation_allocation=expert_activation_lease.allocate,
+                            output_allocation=lambda name, shape: expert_activation_lease.tensor(
+                                name,
+                                shape,
+                                dtype=fc1_input.dtype,
+                                device=fc1_input.device,
+                            ),
                         )
                 expert_ready = torch.cuda.Event()
                 expert_ready.record(compute_stream)
@@ -1715,6 +1721,12 @@ class _EPChunkOperationBase:
                             expert_probs,
                             tokens_per_expert_list=metadata["local_tpe_list"],
                             activation_allocation=expert_activation_lease.allocate,
+                            output_allocation=lambda name, shape: expert_activation_lease.tensor(
+                                name,
+                                shape,
+                                dtype=expert_input.dtype,
+                                device=expert_input.device,
+                            ),
                         )
                 _record_state_tensors_current_stream(state)
             return (

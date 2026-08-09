@@ -1486,7 +1486,7 @@ def test_forward_and_fused_split_expert_activation_from_slot_output_arenas(
     assert forward_acquire < forward_slot < forward_expert < forward_release
     assert "activation_allocation=expert_activation_lease.allocate" in forward_source
     assert 'expert_activation_lease.tensor(\n                            "fc1_input"' in forward_source
-    assert "output_allocation=" not in forward_source
+    assert "output_allocation=lambda name, shape:" in forward_source
     assert "wgrad_done" not in forward_source
     assert saved_arena < saved_expert
     assert "activation_allocation=" not in saved_forward_source
@@ -1494,7 +1494,7 @@ def test_forward_and_fused_split_expert_activation_from_slot_output_arenas(
     assert "activation_allocation=expert_activation_lease.allocate" in fused_source
     assert 'expert_activation_lease.tensor(\n                    "fc1_input"' in fused_source
     assert "expert_input = fc1_input.requires_grad_(True)" in fused_source
-    assert "output_allocation=" not in fused_source
+    assert "output_allocation=lambda name, shape:" in fused_source
     no_grad_finish = forward_source.index("finish_deepep_combine(state)")
     no_grad_release = forward_source.index("lease.release(consumed)", no_grad_finish)
     assert no_grad_finish < no_grad_release
@@ -1566,6 +1566,24 @@ def test_experts_split_fc1_and_swiglu_forward_activation_from_fc2_output(
         ("weighted_swiglu", ("slot", "activation")),
         ("fc2", ("slot",)),
     ]
+
+
+def test_caller_owned_grouped_linear_keeps_te_delayed_wgrad_contract(
+    transformer_engine_import_stub,
+):
+    """The output adapter is narrow: it must not silently become generic TE."""
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    source = inspect.getsource(experts_module._CallerOwnedGroupedLinear)
+    assert "general_grouped_gemm" in source
+    assert "wgrad_store.put" in source
+    assert "main_grad sinks" in source
+    assert "linear.fp8" in source
+    assert "linear.use_bias" in source
+    assert "torch.bfloat16" in source
 
 
 def test_manual_unpermute_writes_into_stable_workspace_slot(

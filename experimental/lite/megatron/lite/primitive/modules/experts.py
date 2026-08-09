@@ -29,6 +29,102 @@ from megatron.lite.primitive.utils import ensure_divisible
 __all__ = ["Experts", "_AllReduceETP"]
 
 
+class _CallerOwnedGroupedLinear(torch.autograd.Function):
+    """TE 2.15 grouped GEMM with a caller-owned BF16 output.
+
+    This deliberately implements only the ChunkedEP Qwen3 contract: ordinary
+    BF16 weights, no bias, and TE delayed wgrad.  It is not a replacement for
+    ``te.GroupedLinear``.  Keeping the boundary this small lets a full
+    recompute chunk retain TE's grouped dgrad/wgrad and selected FP32 gradient
+    sinks while its large FC1/FC2 output has a stable caller-owned address.
+    """
+
+    @staticmethod
+    def forward(ctx, inp, out, linear, m_splits, *weights):
+        from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+
+        if (
+            linear.fp8
+            or linear.use_bias
+            or not linear.wgrad_store.delay_wgrad_compute()
+            or inp.dtype != torch.bfloat16
+            or out.dtype != torch.bfloat16
+        ):
+            raise RuntimeError(
+                "Caller-owned grouped GEMM requires BF16, bias-free TE delayed-wgrad"
+            )
+        if tuple(out.shape) != (sum(m_splits), weights[0].shape[0]):
+            raise RuntimeError("Caller-owned grouped GEMM output has the wrong shape")
+        if not out.is_contiguous():
+            raise RuntimeError("Caller-owned grouped GEMM output must be contiguous")
+        inputmats = list(torch.split(inp.reshape(-1, inp.shape[-1]), m_splits))
+        general_grouped_gemm(
+            list(weights),
+            inputmats,
+            [out],
+            [None] * len(weights),
+            torch.bfloat16,
+            single_output=True,
+            m_splits=m_splits,
+        )
+        ctx.linear = linear
+        ctx.m_splits = list(m_splits)
+        ctx.inp_shape = inp.shape
+        ctx.save_for_backward(inp, *weights)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        from functools import partial
+
+        from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+
+        inp, *weights = ctx.saved_tensors
+        grad_output = grad_output.contiguous().view(-1, grad_output.shape[-1])
+        grad_mats = list(torch.split(grad_output, ctx.m_splits))
+        dgrad = torch.empty_like(inp).view(-1, inp.shape[-1])
+        general_grouped_gemm(
+            list(weights),
+            grad_mats,
+            [dgrad],
+            [None] * len(weights),
+            torch.bfloat16,
+            layout="NN",
+            single_output=True,
+            m_splits=ctx.m_splits,
+            grad=True,
+        )
+        main_grads = [getattr(weight, "main_grad", None) for weight in weights]
+        if any(grad is None for grad in main_grads):
+            raise RuntimeError("Caller-owned grouped GEMM requires prepared main_grad sinks")
+        wgrad = partial(
+            general_grouped_gemm,
+            quantization_params=[None] * len(weights),
+            out_dtype=torch.bfloat16,
+            layout="NT",
+            grad=True,
+            m_splits=ctx.m_splits,
+            use_bias=False,
+            accumulate=True,
+        )
+        inputmats = list(torch.split(inp.reshape(-1, inp.shape[-1]), ctx.m_splits))
+        ctx.linear.wgrad_store.put([inputmats, grad_mats, main_grads], wgrad)
+        return dgrad.view(ctx.inp_shape), None, None, None, *([None] * len(weights))
+
+
+def _caller_owned_grouped_linear(
+    linear: Any,
+    x: torch.Tensor,
+    m_splits: list[int],
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the narrow TE2.15 caller-owned-output adapter, or fail loudly."""
+    if getattr(linear, "return_bias", False):
+        raise RuntimeError("Caller-owned grouped GEMM does not support return_bias")
+    weights = [getattr(linear, f"weight{idx}") for idx in range(linear.num_gemms)]
+    return _CallerOwnedGroupedLinear.apply(x, out, linear, m_splits, *weights)
+
+
 @contextmanager
 def _expert_nvtx_range(name: str):
     if (
@@ -291,6 +387,7 @@ class Experts(nn.Module):
         permuted_probs: torch.Tensor | None = None,
         tokens_per_expert_list: list[int] | None = None,
         activation_allocation: Callable[[], AbstractContextManager[None]] | None = None,
+        output_allocation: Callable[[str, tuple[int, int]], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if tokens_per_expert_list is None:
             if tokens_per_expert is None:
@@ -340,12 +437,34 @@ class Experts(nn.Module):
                 m_splits[-1] += max_len - etp_real_len
 
         probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
+        caller_owned_outputs = output_allocation is not None
+        if caller_owned_outputs and (
+            self.fp8
+            or self.fc1_lora is not None
+            or self.fc2_lora is not None
+            or self.etp_group is not None
+            or self.moe_act_recompute
+        ):
+            raise RuntimeError(
+                "Caller-owned ChunkedEP outputs support only BF16 Qwen3 without "
+                "FP8, LoRA, ETP, or activation recompute"
+            )
         with _expert_nvtx_range("ep_experts.forward"):
             allocation_scope = (
                 nullcontext if activation_allocation is None else activation_allocation
             )
             with allocation_scope():
-                fc1_out = self.fc1(x, m_splits)
+                if caller_owned_outputs:
+                    fc1_out = _caller_owned_grouped_linear(
+                        self.fc1,
+                        x,
+                        m_splits,
+                        output_allocation(
+                            "fc1_output", (x.shape[0], self.fc1.out_features)
+                        ),
+                    )
+                else:
+                    fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
                 if self.moe_act_recompute and probs is not None:
@@ -356,7 +475,17 @@ class Experts(nn.Module):
                 else:
                     act_ckpt = None
                     h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
-            out = self.fc2(h, m_splits)
+            if caller_owned_outputs:
+                out = _caller_owned_grouped_linear(
+                    self.fc2,
+                    h,
+                    m_splits,
+                    output_allocation(
+                        "fc2_output", (h.shape[0], self.fc2.out_features)
+                    ),
+                )
+            else:
+                out = self.fc2(h, m_splits)
             if self.fc2_lora is not None:
                 out = out + self.fc2_lora(h, m_splits)
             if act_ckpt is not None:
