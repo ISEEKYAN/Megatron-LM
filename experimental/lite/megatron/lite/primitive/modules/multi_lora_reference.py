@@ -55,4 +55,90 @@ def dense_lora_delta_reference(
     )
 
 
-__all__ = ["dense_lora_delta_reference"]
+def dense_lora_backward_reference_fp32_single_cast(
+    x: torch.Tensor,
+    grad_output: torch.Tensor,
+    a_bank: torch.Tensor,
+    b_bank: torch.Tensor,
+    lora_indices: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiate in FP32 and quantize each returned gradient once.
+
+    This is an explicit numerical contract for diagnosing BF16 differences; it
+    is deliberately separate from PyTorch autograd's implementation details.
+    """
+    x32, grad32 = x.float(), grad_output.float()
+    a32, b32 = a_bank.float(), b_bank.float()
+    selected_a, selected_b = (
+        a32.index_select(0, lora_indices),
+        b32.index_select(0, lora_indices),
+    )
+    hidden = torch.bmm(selected_a, x32.unsqueeze(-1)).squeeze(-1)
+    grad_hidden = (
+        torch.bmm(selected_b.transpose(1, 2), grad32.unsqueeze(-1)).squeeze(-1) * scale
+    )
+    grad_x = torch.bmm(selected_a.transpose(1, 2), grad_hidden.unsqueeze(-1)).squeeze(
+        -1
+    )
+    grad_a = torch.zeros_like(a32)
+    grad_a.index_add_(
+        0,
+        lora_indices,
+        torch.bmm(grad_hidden.unsqueeze(-1), x32.unsqueeze(1)),
+    )
+    grad_b = torch.zeros_like(b32)
+    grad_b.index_add_(
+        0,
+        lora_indices,
+        torch.bmm((grad32 * scale).unsqueeze(-1), hidden.unsqueeze(1)),
+    )
+    return tuple(gradient.to(x.dtype) for gradient in (grad_x, grad_a, grad_b))
+
+
+def dense_lora_backward_reference_bf16_staged(
+    x: torch.Tensor,
+    grad_output: torch.Tensor,
+    a_bank: torch.Tensor,
+    b_bank: torch.Tensor,
+    lora_indices: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Model the production BF16 stores between backward stages explicitly."""
+    if x.dtype is not torch.bfloat16:
+        raise ValueError("the staged reference is defined only for torch.bfloat16")
+    x32, grad32 = x.float(), grad_output.float()
+    a32, b32 = a_bank.float(), b_bank.float()
+    selected_a, selected_b = (
+        a32.index_select(0, lora_indices),
+        b32.index_select(0, lora_indices),
+    )
+    hidden = torch.bmm(selected_a, x32.unsqueeze(-1)).squeeze(-1).to(torch.bfloat16)
+    grad_hidden = (
+        torch.bmm(selected_b.transpose(1, 2), grad32.unsqueeze(-1)).squeeze(-1) * scale
+    ).to(torch.bfloat16)
+    grad_x = (
+        torch.bmm(selected_a.transpose(1, 2), grad_hidden.float().unsqueeze(-1))
+        .squeeze(-1)
+        .to(torch.bfloat16)
+    )
+    grad_a = torch.zeros_like(a32)
+    grad_a.index_add_(
+        0,
+        lora_indices,
+        torch.bmm(grad_hidden.float().unsqueeze(-1), x32.unsqueeze(1)),
+    )
+    grad_b = torch.zeros_like(b32)
+    grad_b.index_add_(
+        0,
+        lora_indices,
+        torch.bmm((grad32 * scale).unsqueeze(-1), hidden.float().unsqueeze(1)),
+    )
+    return grad_x, grad_a.to(torch.bfloat16), grad_b.to(torch.bfloat16)
+
+
+__all__ = [
+    "dense_lora_backward_reference_bf16_staged",
+    "dense_lora_backward_reference_fp32_single_cast",
+    "dense_lora_delta_reference",
+]
