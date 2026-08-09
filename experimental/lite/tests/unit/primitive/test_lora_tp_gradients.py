@@ -644,3 +644,143 @@ def test_tp2_ep2_bank_ownership_uses_ep_then_expert_dp_for_fc_only(tmp_path):
     assert all(row[1] != row[3] for row in results)
     if init_file.exists():
         os.unlink(init_file)
+
+
+def _optimizer_owned_bank_gather_worker(rank, world_size, init_file, queue):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        from experimental.lite.tests.smoke.primitive.test_multi_lora_ep2_production_gpu import (
+            _gather_optimizer_owned_bank_shards,
+        )
+
+        # Rank one owns no reduce-scatter range; it must nevertheless issue
+        # the same world all_gather_object as rank zero.
+        local = (
+            {"error": None, "shard": {"bank_a": {"rank": rank}}}
+            if rank == 0
+            else {"error": None, "shard": None}
+        )
+        gathered = _gather_optimizer_owned_bank_shards(local, group=dist.group.WORLD)
+        queue.put((rank, gathered))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_optimizer_owned_bank_reconstruction_gathers_non_owner_gloo(tmp_path):
+    init_file = tmp_path / "optimizer-owned-bank-gather"
+    queue = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(
+        _optimizer_owned_bank_gather_worker,
+        args=(2, str(init_file), queue),
+        nprocs=2,
+        join=True,
+    )
+    results = sorted((queue.get() for _ in range(2)))
+    assert results == [
+        (
+            0,
+            [
+                {"error": None, "shard": {"bank_a": {"rank": 0}}},
+                {"error": None, "shard": None},
+            ],
+        ),
+        (
+            1,
+            [
+                {"error": None, "shard": {"bank_a": {"rank": 0}}},
+                {"error": None, "shard": None},
+            ],
+        ),
+    ]
+    if init_file.exists():
+        os.unlink(init_file)
+
+
+def _owner_group_gather_worker(rank, world_size, init_file, queue):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        from experimental.lite.tests.smoke.primitive.test_multi_lora_ep2_production_gpu import (
+            _gather_optimizer_owned_bank_shards,
+        )
+
+        group02 = dist.new_group([0, 2])
+        group13 = dist.new_group([1, 3])
+        lane = group02 if rank in (0, 2) else group13
+        # Same semantic name has a distinct owner/value in each EDP lane.
+        owner = rank in (0, 1)
+        local = (
+            {
+                "error": None,
+                "shard": {"bank": "fc1_a", "lane": 0 if rank in (0, 2) else 1},
+            }
+            if owner
+            else {"error": None, "shard": None}
+        )
+        gathered = _gather_optimizer_owned_bank_shards(local, group=lane)
+        queue.put((rank, gathered))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_optimizer_owned_bank_gather_isolates_ep_dp_lanes_gloo(tmp_path):
+    init_file = tmp_path / "owner-group-lanes"
+    queue = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(
+        _owner_group_gather_worker, args=(4, str(init_file), queue), nprocs=4, join=True
+    )
+    results = dict(queue.get() for _ in range(4))
+    assert (
+        results[0]
+        == results[2]
+        == [
+            {"error": None, "shard": {"bank": "fc1_a", "lane": 0}},
+            {"error": None, "shard": None},
+        ]
+    )
+    assert (
+        results[1]
+        == results[3]
+        == [
+            {"error": None, "shard": {"bank": "fc1_a", "lane": 1}},
+            {"error": None, "shard": None},
+        ]
+    )
+    if init_file.exists():
+        os.unlink(init_file)
+
+
+def _owner_group_error_worker(rank, world_size, init_file, queue):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        from experimental.lite.tests.smoke.primitive.test_multi_lora_ep2_production_gpu import (
+            _gather_optimizer_owned_bank_shards,
+        )
+
+        record = {
+            "error": "AssertionError: malformed owner" if rank == 0 else None,
+            "shard": None,
+        }
+        gathered = _gather_optimizer_owned_bank_shards(record, group=dist.group.WORLD)
+        queue.put((rank, [item["error"] for item in gathered]))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_optimizer_owned_bank_owner_error_is_visible_to_every_rank_gloo(tmp_path):
+    init_file = tmp_path / "owner-group-error"
+    queue = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(
+        _owner_group_error_worker, args=(2, str(init_file), queue), nprocs=2, join=True
+    )
+    assert sorted(queue.get() for _ in range(2)) == [
+        (0, ["AssertionError: malformed owner", None]),
+        (1, ["AssertionError: malformed owner", None]),
+    ]
+    if init_file.exists():
+        os.unlink(init_file)

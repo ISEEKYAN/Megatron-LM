@@ -552,45 +552,48 @@ def _bank_sync_absolute_oracle(
 
 def _reconstruct_optimizer_owned_bank_grads(bundle) -> dict[str, torch.Tensor]:
     """Rebuild each logical bank grad from dist-opt's owned reduce-scatter shards."""
-    local_shards: dict[str, dict[str, object]] = {}
-    for name, parameter in _bank_parameters(bundle).items():
-        owned = _optimizer_param_range(
-            bundle, parameter, is_fc=".moe.experts._fc" in name
-        )
-        if owned is None:
-            continue
-        leaf_index, owner, param_range, buffer, bucket = owned
-        # ``gbuf_world_in_bucket`` identifies the reduce-scatter output view;
-        # ``param`` maps that view back to the logical bank tensor's offsets.
-        reduced = bucket.grad_data.view(-1)[
-            param_range["gbuf_world_in_bucket"]
-            .start : param_range["gbuf_world_in_bucket"]
-            .end
-        ].detach()
-        local_shards[name] = {
-            **_dense_owner_record(bundle, leaf_index, owner, buffer),
-            "start": param_range["param"].start,
-            "end": param_range["param"].end,
-            "shape": tuple(parameter.shape),
-            "dtype": str(reduced.dtype),
-            "values": reduced.float().cpu().clone(),
-        }
-
-    gathered = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, local_shards)
-    expected_keys = set(_bank_parameters(bundle))
-    assert set().union(*(set(shards) for shards in gathered)) == expected_keys
+    parameters = _bank_parameters(bundle)
     reconstructed: dict[str, torch.Tensor] = {}
-    for name in sorted(expected_keys):
-        shape = tuple(_bank_parameters(bundle)[name].shape)
+    for name in sorted(parameters):
+        parameter = parameters[name]
+        is_fc = ".moe.experts._fc" in name
+        group = (
+            bundle.parallel_state.ep_dp_group
+            if is_fc
+            else bundle.parallel_state.dp_group
+        )
+        local: dict[str, object] = {"error": None, "shard": None}
+        # Ownership metadata is local and may be absent.  Never raise before
+        # the owner group has collectively observed every rank's result.
+        try:
+            owned = _optimizer_param_range(bundle, parameter, is_fc=is_fc)
+            if owned is not None:
+                leaf_index, owner, param_range, buffer, bucket = owned
+                reduced = bucket.grad_data.view(-1)[
+                    param_range["gbuf_world_in_bucket"]
+                    .start : param_range["gbuf_world_in_bucket"]
+                    .end
+                ].detach()
+                local["shard"] = {
+                    **_dense_owner_record(bundle, leaf_index, owner, buffer),
+                    "start": param_range["param"].start,
+                    "end": param_range["param"].end,
+                    "shape": tuple(parameter.shape),
+                    "dtype": str(reduced.dtype),
+                    "values": reduced.float().cpu().clone(),
+                }
+        except Exception as error:  # reported symmetrically below
+            local["error"] = f"{type(error).__name__}: {error}"
+        gathered = _gather_optimizer_owned_bank_shards(local, group=group)
+        errors = [record["error"] for record in gathered if record["error"]]
+        assert not errors, f"owner metadata error for {name}: {errors}"
+        records = [
+            record["shard"] for record in gathered if record["shard"] is not None
+        ]
+        shape = tuple(parameter.shape)
         flat = torch.empty(int(torch.tensor(shape).prod()), dtype=torch.float32)
         ranges = []
-        records = []
-        for shards in gathered:
-            if name not in shards:
-                continue
-            shard = shards[name]
-            records.append(shard)
+        for shard in records:
             start, end = int(shard["start"]), int(shard["end"])
             values = shard["values"]
             assert end - start == values.numel()
@@ -604,6 +607,16 @@ def _reconstruct_optimizer_owned_bank_grads(bundle) -> dict[str, torch.Tensor]:
         assert offset == flat.numel(), f"incomplete dist-opt shard coverage for {name}"
         reconstructed[name] = flat.reshape(shape)
     return reconstructed
+
+
+def _gather_optimizer_owned_bank_shards(
+    local_shard: dict[str, object], *, group
+) -> list[dict[str, object]]:
+    """Gather one semantic bank on its dist-opt owner group, non-owners included."""
+    gathered: list[dict[str, object] | None] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(gathered, local_shard, group=group)
+    assert all(shards is not None for shards in gathered)
+    return [shards for shards in gathered if shards is not None]
 
 
 def _run_unsynchronized_reference(
@@ -939,9 +952,6 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
     assert manifest["topology"]["oracle"][dist.get_rank()]["tp"] == phase_config["tp"]
     assert manifest["topology"]["oracle"][dist.get_rank()]["ep"] == phase_config["ep"]
     assert manifest["topology"]["verify"] is None
-    batch = _production_batch(bundle)
-    expected_batch = manifest["batch_by_rank"][dist.get_rank()]
-    assert _batch_record(batch) == expected_batch
     for rank in range(phase_config["world"]):
         path = artifact_dir / f"ep2_bank_grads_rank_{rank:05d}.pt"
         assert _sha256(path) == manifest["oracle_files"][f"rank_{rank:05d}"]
@@ -990,6 +1000,9 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
     assert state is not None
     assert bundle.extras["optimizer_backend"] == "dist_opt"
     assert callable(bundle.finalize_grads)
+    batch = _production_batch(bundle)
+    expected_batch = manifest["batch_by_rank"][dist.get_rank()]
+    assert _batch_record(batch) == expected_batch
     for name, parameter in state.named_parameters():
         is_fc = ".moe.experts._fc" in name
         assert getattr(parameter, "allreduce", None) is (not is_fc)
