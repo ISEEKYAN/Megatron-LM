@@ -24,27 +24,6 @@ EP_CHUNK_COUNT = 2
 EPChunkOpName = Literal["forward", "backward", "fused_forward_backward"]
 
 
-def _experimental_logical_chunk_groups(rows: int) -> list[tuple[int, int]]:
-    """Return one or two two-chunk passes for the private n=4 experiment.
-
-    The production primitive remains fixed at two logical chunks.  The scratch
-    candidate may opt into four logical chunks, but executes them as two
-    sequential two-chunk passes, so the existing two event-guarded workspace
-    slots are released before either is reused.
-    """
-    count = os.environ.get("MEGATRON_LITE_EP_CHUNK_EXPERIMENTAL_LOGICAL_COUNT", "2")
-    if count == "2":
-        return [(0, rows)]
-    if count == "4":
-        if rows < 4:
-            raise ValueError("Experimental four-chunk EP requires at least four tokens")
-        midpoint = (rows + 1) // 2
-        return [(0, midpoint), (midpoint, rows)]
-    raise ValueError(
-        "MEGATRON_LITE_EP_CHUNK_EXPERIMENTAL_LOGICAL_COUNT must be 2 or 4"
-    )
-
-
 @dataclass(frozen=True)
 class EPChunkShapeProfile:
     """Fixed token and DeepEP receive capacities for one EP rank."""
@@ -2172,21 +2151,14 @@ class EPChunkForwardOp(_EPChunkOperationBase):
                 x.dtype,
                 *params,
             )
-        outputs = []
-        routing_flat = None if routing_input is None else routing_input.reshape(-1)
-        for start, end in _experimental_logical_chunk_groups(x_2d.size(0)):
-            with self._routing_context(
-                None if routing_flat is None else routing_flat[start:end]
-            ):
-                outputs.append(
-                    self._forward_output_async(
-                        x_2d[start:end],
-                        ep_chunk_ranges(end - start),
-                        torch.Size((end - start, x_2d.size(-1))),
-                        x.dtype,
-                    )
-                )
-        return torch.cat(outputs, dim=0).view(input_shape)
+        ranges = ep_chunk_ranges(x_2d.size(0))
+        with self._routing_context(routing_input):
+            return self._forward_output_async(
+                x_2d,
+                ranges,
+                input_shape,
+                x.dtype,
+            )
 
     __call__ = forward
 
@@ -2214,36 +2186,11 @@ class EPChunkFusedForwardBackwardOp(_EPChunkOperationBase):
     ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor | None]]:
         x_2d = x_saved.view(-1, x_saved.size(-1))
         grad_2d = grad_output.contiguous().view(-1, grad_output.size(-1))
-        grad_x_chunks = []
-        router_accum: list[torch.Tensor | None] = [
-            None for _ in self.router.parameters()
-        ]
-        expert_grads: list[torch.Tensor | None] | None = None
-        routing_flat = None if routing_input is None else routing_input.reshape(-1)
-        with torch.enable_grad():
-            for start, end in _experimental_logical_chunk_groups(x_2d.size(0)):
-                with self._routing_context(
-                    None if routing_flat is None else routing_flat[start:end]
-                ):
-                    grad_x, router_grads, current_expert_grads = (
-                        self._full_recompute_fused_backward(
-                            x_2d[start:end], grad_2d[start:end]
-                        )
-                    )
-                grad_x_chunks.append(grad_x)
-                _accumulate(
-                    router_accum,
-                    tuple(self.router.parameters()),
-                    router_grads,
-                )
-                expert_grads = current_expert_grads
-        if expert_grads is None:
-            raise RuntimeError("Experimental EP chunk fused pass produced no gradients")
-        return (
-            torch.cat(grad_x_chunks, dim=0).view_as(x_saved),
-            _materialize(tuple(self.router.parameters()), router_accum),
-            expert_grads,
-        )
+        with self._routing_context(routing_input), torch.enable_grad():
+            grad_x, router_grads, expert_grads = self._full_recompute_fused_backward(
+                x_2d, grad_2d
+            )
+        return grad_x.view_as(x_saved), router_grads, expert_grads
 
 
 def _manual_unpermute_backward(
