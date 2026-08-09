@@ -59,18 +59,24 @@ def test_qwen_model_contract_fails_loud(enabled, use_deepep, ep_size):
         )
 
 
-def test_backward_op_orders_dgrad_before_delayed_wgrad(transformer_engine_import_stub):
+def test_fused_op_flushes_each_dgrad_before_local_storage_overwrite(
+    transformer_engine_import_stub,
+):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkBackwardOp
 
     source = inspect.getsource(EPChunkBackwardOp._full_recompute_fused_backward_v6)
 
-    assert source.index("pending_dispatch_bwd.append") < source.index(
-        "flush_delayed_weight_grads"
-    )
-    assert source.index("flush_delayed_weight_grads") < source.index(
-        "finish_deepep_dispatch_backward"
-    )
+    dgrad = source.index("expert_grads = torch.autograd.grad(")
+    dgrad_ready = source.index("dgrad_ready.record(compute_stream)", dgrad)
+    flushed = source.index("flush_delayed_weight_grads", dgrad_ready)
+    overwritten = source.index("_dispatch_local_backward", flushed)
+    local_ready = source.index("local_bwd_ready.record(wgrad_stream)", overwritten)
+    dispatched = source.index("submit_deepep_dispatch_backward", local_ready)
+
+    assert dgrad < dgrad_ready < flushed < overwritten < local_ready < dispatched
+    assert "num_contexts=1" in source[flushed:overwritten]
+    assert "compute_stream.wait_event(wgrad_done)" not in source
     assert "torch.cuda.synchronize" not in source
 
 

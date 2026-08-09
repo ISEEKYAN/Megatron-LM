@@ -60,6 +60,35 @@ def swiglu_with_probs(
     return bias_swiglu_impl(y, bias=None)
 
 
+def _record_cuda_tensor_tree_stream(value: Any, stream: Any) -> None:
+    """Record every nested CUDA tensor and its view bases on one stream."""
+    seen: set[int] = set()
+
+    def record(item: Any) -> None:
+        item_id = id(item)
+        if item_id in seen:
+            return
+        if torch.is_tensor(item):
+            seen.add(item_id)
+            if item.is_cuda:
+                item.record_stream(stream)
+            base = getattr(item, "_base", None)
+            if base is not None:
+                record(base)
+            return
+        if isinstance(item, dict):
+            seen.add(item_id)
+            for nested in item.values():
+                record(nested)
+            return
+        if isinstance(item, (list, tuple, set)):
+            seen.add(item_id)
+            for nested in item:
+                record(nested)
+
+    record(value)
+
+
 class _AllReduceETP(torch.autograd.Function):
     """AllReduce with proper autograd: grad(AllReduce) = AllReduce."""
 
@@ -144,7 +173,9 @@ class Experts(nn.Module):
 
                     param.register_hook(_ar)
 
-    def flush_delayed_weight_grads(self, *, num_contexts: int) -> None:
+    def flush_delayed_weight_grads(
+        self, *, num_contexts: int, stream: Any | None = None
+    ) -> None:
         """Execute queued TE wgrads directly into the reusable DistOpt buffers."""
         for linear in (self.fc1, self.fc2):
             store = linear.wgrad_store
@@ -157,7 +188,10 @@ class Experts(nn.Module):
             for _ in range(num_contexts):
                 if store.context is None or store.context.empty():
                     raise RuntimeError("Expert delayed weight-gradient queue is empty.")
-                (_, _grad_biases, _), tensors = store.pop()
+                result, tensors = store.pop()
+                if stream is not None:
+                    _record_cuda_tensor_tree_stream((result, tensors), stream)
+                _, _grad_biases, _ = result
                 weight_grads = tensors[2]
                 for idx, grad in enumerate(weight_grads):
                     param = getattr(linear, f"weight{idx}")

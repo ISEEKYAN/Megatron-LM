@@ -1290,6 +1290,7 @@ class _EPChunkOperationBase:
         router_accum: list[torch.Tensor | None] = [None for _ in router_params]
         pending_dispatch_bwd: list[tuple[_BackwardChunk, dict[str, Any]]] = []
         last_deepep_event: Any | None = None
+        last_wgrad_done: torch.cuda.Event | None = None
 
         def chain_deepep_event() -> None:
             if last_deepep_event is not None:
@@ -1537,26 +1538,45 @@ class _EPChunkOperationBase:
                     )
                     del expert_dispatched, expert_probs_input
                     del expert_inputs, expert_grads, expert_output
+                    dgrad_ready = torch.cuda.Event()
+                    dgrad_ready.record(compute_stream)
+
+                with torch.cuda.stream(wgrad_stream):
+                    wgrad_stream.wait_event(dgrad_ready)
+                    with _ep_chunk_nvtx("backward.wgrad"):
+                        self.experts.flush_delayed_weight_grads(
+                            num_contexts=1,
+                            stream=wgrad_stream,
+                        )
+                    wgrad_done = torch.cuda.Event()
+                    wgrad_done.record(wgrad_stream)
+                    for tensor in (
+                        grad_dispatched,
+                        grad_probs,
+                        hidden_reuse_base,
+                        chunk.recv_probs_base,
+                        chunk.row_id_map,
+                        chunk.prob_flat_indices,
+                    ):
+                        if tensor is not None and tensor.is_cuda:
+                            tensor.record_stream(wgrad_stream)
                     grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
                         chunk,
                         grad_dispatched,
                         grad_probs,
                         hidden_reuse_base=hidden_reuse_base,
                     )
-                    local_state["grad_recv_hidden"] = grad_recv_hidden
-                    local_state["grad_recv_probs"] = grad_recv_probs
                     local_bwd_ready = torch.cuda.Event()
-                    local_bwd_ready.record(compute_stream)
+                    local_bwd_ready.record(wgrad_stream)
                     del grad_dispatched, grad_probs
+                last_wgrad_done = wgrad_done
 
                 with torch.cuda.stream(comm_stream):
                     comm_stream.wait_event(local_bwd_ready)
                     chain_deepep_event()
                     with _ep_chunk_nvtx("backward.dispatch", chunk.idx):
-                        grad_recv_hidden = local_state.pop("grad_recv_hidden")
-                        grad_recv_probs = local_state.pop("grad_recv_probs")
                         local_state["dispatch_bwd_state"] = remember_deepep_event(
-                            dispatcher.submit_deepep_dispatch_backward(
+                            chunk.dispatcher.submit_deepep_dispatch_backward(
                                 grad_recv_hidden,
                                 grad_recv_probs,
                                 chunk.handle,
@@ -1572,17 +1592,9 @@ class _EPChunkOperationBase:
 
                 pending_dispatch_bwd.append((chunk, local_state))
 
-        wgrad_ready = torch.cuda.Event()
-        wgrad_ready.record(compute_stream)
-        with torch.cuda.stream(wgrad_stream):
-            wgrad_stream.wait_event(wgrad_ready)
-            with _ep_chunk_nvtx("backward.wgrad"):
-                self.experts.flush_delayed_weight_grads(
-                    num_contexts=len(pending_dispatch_bwd)
-                )
-            wgrad_done = torch.cuda.Event()
-            wgrad_done.record(wgrad_stream)
-        _queue_backward_stream_wait(wgrad_done, grad_2d.device)
+        if last_wgrad_done is None:
+            raise RuntimeError("EP chunk fused backward did not flush expert wgrads")
+        _queue_backward_stream_wait(last_wgrad_done, grad_2d.device)
 
         for chunk, local_state in pending_dispatch_bwd:
             with torch.cuda.stream(compute_stream):

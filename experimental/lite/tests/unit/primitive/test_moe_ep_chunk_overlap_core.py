@@ -83,6 +83,94 @@ def test_experts_accept_te_dbias_placeholders_when_bias_is_disabled(
     assert all(parameter.grad is None for parameter in experts.parameters())
 
 
+def test_expert_wgrad_flush_records_nested_cuda_views_and_bases(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    original_is_tensor = experts_module.torch.is_tensor
+    stream = object()
+    recorded = []
+
+    class FakeCudaTensor:
+        is_cuda = True
+
+        def __init__(self, name, *, base=None):
+            self.name = name
+            self._base = base
+
+        def record_stream(self, actual_stream):
+            recorded.append((self.name, actual_stream))
+
+    class FakeStore:
+        def __init__(self, linear, prefix):
+            self.linear = linear
+            self.pending = 1
+            self.context = SimpleNamespace(empty=lambda: self.pending == 0)
+            self.base = FakeCudaTensor(f"{prefix}.base")
+            self.view = FakeCudaTensor(f"{prefix}.view", base=self.base)
+
+        @staticmethod
+        def delay_wgrad_compute():
+            return True
+
+        def pop(self):
+            self.pending -= 1
+            grads = [
+                getattr(self.linear, f"weight{idx}").main_grad
+                for idx in range(self.linear.num_gemms)
+            ]
+            result = ({"result": (self.view,)}, None, None)
+            tensors = [{"input": self.view}, [self.view], grads]
+            return result, tensors
+
+    class FakeGroupedLinear(torch.nn.Module):
+        next_idx = 0
+
+        def __init__(self, num_gemms, *_args, bias, **_kwargs):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.use_bias = bias
+            prefix = f"linear{FakeGroupedLinear.next_idx}"
+            FakeGroupedLinear.next_idx += 1
+            for idx in range(num_gemms):
+                param = torch.nn.Parameter(torch.zeros(2, 2))
+                param.main_grad = torch.ones(2, 2)
+                self.register_parameter(f"weight{idx}", param)
+            self.wgrad_store = FakeStore(self, prefix)
+
+    monkeypatch.setattr(
+        experts_module.te, "GroupedLinear", FakeGroupedLinear, raising=False
+    )
+    monkeypatch.setattr(
+        experts_module.torch,
+        "is_tensor",
+        lambda value: isinstance(value, FakeCudaTensor) or original_is_tensor(value),
+    )
+    experts = experts_module.Experts(
+        SimpleNamespace(
+            num_experts=2,
+            hidden_size=2,
+            moe_intermediate_size=2,
+            swiglu_limit=0.0,
+        ),
+        SimpleNamespace(ep_size=1, etp_size=1, tp_size=1, etp_group=None),
+        delay_wgrad_compute=True,
+    )
+
+    experts.flush_delayed_weight_grads(num_contexts=1, stream=stream)
+
+    assert recorded == [
+        ("linear0.view", stream),
+        ("linear0.base", stream),
+        ("linear1.view", stream),
+        ("linear1.base", stream),
+    ]
+    assert experts.fc1.wgrad_store.context.empty()
+    assert experts.fc2.wgrad_store.context.empty()
+
+
 def test_delayed_expert_wgrads_request_distopt_main_grad_reuse(
     monkeypatch, transformer_engine_import_stub
 ):
@@ -725,7 +813,7 @@ def test_normal_and_fused_backward_reuse_manual_unpermute_workspace_storage(
     assert "cuda.synchronize" not in helper_source
 
 
-def test_fused_reuses_arena_owned_expert_output_before_delayed_wgrad_flush(
+def test_fused_flushes_each_chunk_before_reusing_delayed_wgrad_storage(
     transformer_engine_import_stub,
 ):
     import inspect
@@ -737,23 +825,44 @@ def test_fused_reuses_arena_owned_expert_output_before_delayed_wgrad_flush(
 
     source = inspect.getsource(_EPChunkOperationBase._full_recompute_fused_backward_v6)
     autograd = source.index("expert_grads = torch.autograd.grad(")
-    flushed = source.index("flush_delayed_weight_grads", autograd)
     direct_unpermute = source.index("out=chunk.expert_out.detach()")
+    next_dispatch = source.index(
+        "next_state = submit_recompute_dispatch", direct_unpermute
+    )
+    dgrad_ready = source.index("dgrad_ready.record(compute_stream)", autograd)
+    per_chunk_flush = source.index("flush_delayed_weight_grads", dgrad_ready)
     alias_taken = source.index(
         'hidden_reuse_base = local_state.pop("grad_expert_out").detach()', autograd
     )
     graph_clear = source.index("chunk.expert_out = None", alias_taken)
     locals_clear = source.index("del expert_dispatched", graph_clear)
-    overwrite = source.index("_dispatch_local_backward(", locals_clear)
+    overwrite = source.index("_dispatch_local_backward(", per_chunk_flush)
+    local_ready = source.index("local_bwd_ready.record(wgrad_stream)", overwrite)
     dispatch = source.index("submit_deepep_dispatch_backward(", overwrite)
+    pending_append = source.index("pending_dispatch_bwd.append", dispatch)
 
-    assert direct_unpermute < autograd < alias_taken
-    assert alias_taken < graph_clear < locals_clear < overwrite < dispatch
-    assert dispatch < flushed
+    assert direct_unpermute < next_dispatch < autograd < alias_taken
+    assert alias_taken < graph_clear < locals_clear < dgrad_ready < per_chunk_flush
+    assert per_chunk_flush < overwrite < local_ready < dispatch < pending_append
+    assert "num_contexts=1" in source[per_chunk_flush:overwrite]
+    assert "stream=wgrad_stream" in source[per_chunk_flush:overwrite]
+    assert "num_contexts=len(pending_dispatch_bwd)" not in source
+    assert "compute_stream.wait_event(wgrad_done)" not in source
+    assert "pending_local_bwd" not in source
+    assert "_queue_backward_stream_wait(last_wgrad_done" in source
     assert "del expert_input, expert_probs, metadata" in source
     assert "state.clear()" in source
     assert "del expert_dispatched, expert_probs_input" in source
     assert "del expert_inputs, expert_grads, expert_output" in source
+    for name in (
+        "grad_dispatched",
+        "grad_probs",
+        "hidden_reuse_base",
+        "chunk.recv_probs_base",
+        "chunk.row_id_map",
+        "chunk.prob_flat_indices",
+    ):
+        assert name in source[per_chunk_flush:overwrite]
     assert "cuda.synchronize" not in source
 
 
