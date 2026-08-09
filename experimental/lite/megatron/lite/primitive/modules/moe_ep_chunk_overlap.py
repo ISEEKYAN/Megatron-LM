@@ -155,6 +155,23 @@ def _validate_finished_deepep_dispatch(
     profile.validate_expert_rows(dispatched.size(0))
 
 
+def _expert_activation_output_allocation(
+    lease: _EPChunkExpertActivationLease,
+    input_tensor: torch.Tensor,
+) -> Callable[[str, tuple[int, int]], torch.Tensor]:
+    """Build the caller-owned expert-output allocation callback for one input."""
+
+    def allocate(name: str, shape: tuple[int, int]) -> torch.Tensor:
+        return lease.tensor(
+            name,
+            shape,
+            dtype=input_tensor.dtype,
+            device=input_tensor.device,
+        )
+
+    return allocate
+
+
 @dataclass(frozen=True)
 class EPChunkWorkspaceKey:
     """Cross-layer workspace identity; layer and chunk are deliberately absent."""
@@ -1305,13 +1322,8 @@ class _EPChunkOperationBase:
                             dispatcher, "_local_tpe_list", None
                         ),
                         activation_allocation=expert_activation_lease.allocate,
-                        output_allocation=lambda name, shape: (
-                            expert_activation_lease.tensor(
-                                name,
-                                shape,
-                                dtype=fc1_input.dtype,
-                                device=fc1_input.device,
-                            ),
+                        output_allocation=_expert_activation_output_allocation(
+                            expert_activation_lease, fc1_input
                         ),
                     )
                 expert_ready = torch.cuda.Event()
@@ -1754,13 +1766,8 @@ class _EPChunkOperationBase:
                         expert_probs,
                         tokens_per_expert_list=metadata["local_tpe_list"],
                         activation_allocation=expert_activation_lease.allocate,
-                        output_allocation=lambda name, shape: (
-                            expert_activation_lease.tensor(
-                                name,
-                                shape,
-                                dtype=expert_input.dtype,
-                                device=expert_input.device,
-                            ),
+                        output_allocation=_expert_activation_output_allocation(
+                            expert_activation_lease, expert_input
                         ),
                     )
                 _record_state_tensors_current_stream(state)

@@ -1667,7 +1667,7 @@ def test_forward_and_fused_split_expert_activation_from_slot_output_arenas(
         'expert_activation_lease.tensor(\n                        "fc1_input"'
         in forward_source
     )
-    assert "output_allocation=lambda name, shape:" in forward_source
+    assert "output_allocation=_expert_activation_output_allocation(" in forward_source
     assert "wgrad_done" not in forward_source
     assert saved_arena < saved_expert
     assert "activation_allocation=" not in saved_forward_source
@@ -1678,13 +1678,45 @@ def test_forward_and_fused_split_expert_activation_from_slot_output_arenas(
         in fused_source
     )
     assert "expert_input = fc1_input.requires_grad_(True)" in fused_source
-    assert "output_allocation=lambda name, shape:" in fused_source
+    assert "output_allocation=_expert_activation_output_allocation(" in fused_source
     no_grad_finish = forward_source.index("finish_deepep_combine(state)")
     no_grad_release = forward_source.index("lease.release(consumed)", no_grad_finish)
     assert no_grad_finish < no_grad_release
     assert "cuda.synchronize" not in forward_source
     assert "cuda.synchronize" not in saved_forward_source
     assert "cuda.synchronize" not in fused_source
+
+
+def test_expert_activation_output_allocation_returns_owned_tensor(
+    transformer_engine_import_stub,
+):
+    """Both no-grad forward and fused use the same Tensor-returning callback."""
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _expert_activation_output_allocation,
+    )
+
+    class FakeLease:
+        def __init__(self):
+            self.calls = []
+
+        def tensor(self, name, shape, *, dtype, device):
+            self.calls.append((name, shape, dtype, device))
+            return torch.empty(shape, dtype=dtype, device=device)
+
+    lease = FakeLease()
+    input_tensor = torch.empty((3, 2), dtype=torch.bfloat16)
+
+    allocation = _expert_activation_output_allocation(lease, input_tensor)
+    output = allocation("fc1_output", (5, 4))
+
+    assert isinstance(output, torch.Tensor)
+    assert output.shape == (5, 4)
+    assert output.dtype is input_tensor.dtype
+    assert output.device == input_tensor.device
+    assert lease.calls == [
+        ("fc1_output", (5, 4), input_tensor.dtype, input_tensor.device)
+    ]
 
 
 def test_no_grad_and_fused_expert_compute_do_not_nest_slot_and_activation_arenas(
