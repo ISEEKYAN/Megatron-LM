@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import os
 import weakref
-from contextlib import contextmanager
-from typing import Any
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from typing import Any, Callable
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
@@ -290,6 +290,7 @@ class Experts(nn.Module):
         tokens_per_expert: torch.Tensor | None,
         permuted_probs: torch.Tensor | None = None,
         tokens_per_expert_list: list[int] | None = None,
+        activation_allocation: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> torch.Tensor:
         if tokens_per_expert_list is None:
             if tokens_per_expert is None:
@@ -340,26 +341,26 @@ class Experts(nn.Module):
 
         probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
         with _expert_nvtx_range("ep_experts.forward"):
-            if self.moe_act_recompute and probs is not None:
-                act_ckpt = CheckpointWithoutOutput(preserve_rng_state=True)
+            allocation_scope = (
+                nullcontext if activation_allocation is None else activation_allocation
+            )
+            with allocation_scope():
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = act_ckpt.checkpoint(
-                    swiglu_with_probs, fc1_out, probs, self.swiglu_limit
-                )
-                out = self.fc2(h, m_splits)
-                if self.fc2_lora is not None:
-                    out = out + self.fc2_lora(h, m_splits)
+                if self.moe_act_recompute and probs is not None:
+                    act_ckpt = CheckpointWithoutOutput(preserve_rng_state=True)
+                    h = act_ckpt.checkpoint(
+                        swiglu_with_probs, fc1_out, probs, self.swiglu_limit
+                    )
+                else:
+                    act_ckpt = None
+                    h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
+            out = self.fc2(h, m_splits)
+            if self.fc2_lora is not None:
+                out = out + self.fc2_lora(h, m_splits)
+            if act_ckpt is not None:
                 act_ckpt.discard_output_and_register_recompute(out)
-            else:
-                fc1_out = self.fc1(x, m_splits)
-                if self.fc1_lora is not None:
-                    fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
-                out = self.fc2(h, m_splits)
-                if self.fc2_lora is not None:
-                    out = out + self.fc2_lora(h, m_splits)
 
         if self.etp_group is not None:
             out = _AllReduceETP.apply(out, self.etp_group)

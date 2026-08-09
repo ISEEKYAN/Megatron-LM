@@ -189,6 +189,34 @@ class _EPChunkAllocationArena:
             yield
 
 
+class _EPChunkExpertActivationLease:
+    def __init__(self, workspace: "EPChunkWorkspace"):
+        self.workspace = workspace
+        self._active = True
+
+    @contextmanager
+    def allocate(self):
+        if not self._active:
+            raise RuntimeError(
+                "EP chunk expert activation lease has already been released"
+            )
+        with self.workspace._expert_activation_arena.allocate():
+            yield
+
+    def release(self, consumer_event: Any) -> None:
+        if not self._active:
+            raise RuntimeError(
+                "EP chunk expert activation lease has already been released"
+            )
+        if consumer_event is None:
+            raise RuntimeError(
+                "EP chunk expert activation release requires a consumer event"
+            )
+        self.workspace._expert_activation_consumer_event = consumer_event
+        self.workspace._expert_activation_in_use = False
+        self._active = False
+
+
 class EPChunkWorkspaceLease:
     def __init__(
         self,
@@ -262,6 +290,10 @@ class EPChunkWorkspace:
         self._allocation_arenas = [
             _EPChunkAllocationArena() for _ in range(EP_CHUNK_COUNT)
         ]
+        self._expert_activation_arena = _EPChunkAllocationArena()
+        self._expert_activation_in_use = False
+        self._expert_activation_consumer_event: Any | None = None
+        self._expert_activation_waits = 0
         self._allocations = 0
         self._runtime_allocations = 0
         self._grows = 0
@@ -306,11 +338,21 @@ class EPChunkWorkspace:
                     )
                     for _ in range(EP_CHUNK_COUNT)
                 ]
+                expert_activation_pool = (
+                    self._expert_activation_arena.allocation_pool
+                    if self._expert_activation_arena.device is not None
+                    else torch.cuda.MemPool(
+                        allocator=None,
+                        use_on_oom=False,
+                        no_split=False,
+                    )
+                )
         else:
             dispatchers = [
                 self._dispatcher_factory(slot) for slot in range(EP_CHUNK_COUNT)
             ]
             allocation_pools = [None for _ in range(EP_CHUNK_COUNT)]
+            expert_activation_pool = None
         if len({id(dispatcher) for dispatcher in dispatchers}) != EP_CHUNK_COUNT:
             raise RuntimeError("EP chunk workspace requires two distinct dispatchers")
         for chunk_idx, dispatcher in enumerate(dispatchers):
@@ -325,6 +367,8 @@ class EPChunkWorkspace:
                 chunk_idx
             ]
             self._allocation_arenas[chunk_idx].device = profile_device
+        self._expert_activation_arena.allocation_pool = expert_activation_pool
+        self._expert_activation_arena.device = profile_device
         self._materialized = True
 
     def prepare_scratch(self, *, device: torch.device | str | None = None) -> None:
@@ -373,6 +417,47 @@ class EPChunkWorkspace:
             require_dispatcher=require_dispatcher,
         )
 
+    def acquire_expert_activation(
+        self, *, stream: Any | None = None
+    ) -> _EPChunkExpertActivationLease:
+        runtime_device = getattr(stream, "device", None)
+        if not self._materialized:
+            profile_device = self._bind(runtime_device)
+        else:
+            self._validate_bound_device(runtime_device)
+            profile_device = self._bound_device
+            if profile_device is None:
+                raise RuntimeError(
+                    "Materialized EP chunk workspace has no bound device"
+                )
+        if self._expert_activation_arena.device is None:
+            if self.key.device_type == "cuda":
+                with torch.cuda.device(profile_device):
+                    self._expert_activation_arena.allocation_pool = torch.cuda.MemPool(
+                        allocator=None,
+                        use_on_oom=False,
+                        no_split=False,
+                    )
+            self._expert_activation_arena.device = profile_device
+        if self._expert_activation_in_use:
+            raise RuntimeError("EP chunk expert activation arena is already leased")
+        event = self._expert_activation_consumer_event
+        if event is not None:
+            ready = bool(event.query()) if hasattr(event, "query") else False
+            if not ready:
+                if stream is not None and hasattr(stream, "wait_event"):
+                    stream.wait_event(event)
+                elif hasattr(event, "current_stream_wait"):
+                    event.current_stream_wait()
+                else:
+                    raise RuntimeError(
+                        "Pending EP chunk expert activation event is not stream-waitable"
+                    )
+                self._expert_activation_waits += 1
+        self._expert_activation_consumer_event = None
+        self._expert_activation_in_use = True
+        return _EPChunkExpertActivationLease(self)
+
     def _bind(self, device: torch.device | str | None) -> torch.device:
         """Claim registry identity and bind a runtime device without allocating."""
         if self._registry is not None:
@@ -393,10 +478,13 @@ class EPChunkWorkspace:
         for arena in self._allocation_arenas:
             arena.allocation_pool = None
             arena.device = None
+        self._expert_activation_arena.allocation_pool = None
+        self._expert_activation_arena.device = None
         self._allocations = 0
         self._runtime_allocations = 0
         self._grows = 0
         self._waits = 0
+        self._expert_activation_waits = 0
         self._bound_device = None
         self._materialized = False
 
@@ -412,6 +500,26 @@ class EPChunkWorkspace:
         stream: Any | None,
         operation: str,
     ) -> None:
+        if self._expert_activation_in_use:
+            raise RuntimeError(
+                f"Cannot {operation} in EP chunk workspace: expert activation arena "
+                "is leased"
+            )
+        activation_event = self._expert_activation_consumer_event
+        if activation_event is not None:
+            ready = (
+                bool(activation_event.query())
+                if hasattr(activation_event, "query")
+                else False
+            )
+            if not ready:
+                if stream is None or not hasattr(stream, "wait_event"):
+                    raise RuntimeError(
+                        f"Cannot {operation} in EP chunk workspace with a pending "
+                        "expert activation event"
+                    )
+                stream.wait_event(activation_event)
+        self._expert_activation_consumer_event = None
         for slot_idx, slot in enumerate(self._slots):
             if slot.in_use:
                 raise RuntimeError(
@@ -578,6 +686,19 @@ class EPChunkWorkspace:
                 for slot_idx, slot in enumerate(self._slots)
                 if slot.allocation_pool is not None
             },
+            "expert_activation_pool_count": int(
+                self._expert_activation_arena.allocation_pool is not None
+            ),
+            "expert_activation_pool_id": (
+                None
+                if self._expert_activation_arena.allocation_pool is None
+                else id(self._expert_activation_arena.allocation_pool)
+            ),
+            "expert_activation_waits": self._expert_activation_waits,
+            "expert_activation_in_use": self._expert_activation_in_use,
+            "expert_activation_event_guarded": (
+                self._expert_activation_consumer_event is not None
+            ),
             "active_lease_count": sum(slot.in_use for slot in self._slots),
             "consumer_event_guard_count": sum(
                 slot.consumer_event is not None for slot in self._slots
@@ -1027,6 +1148,9 @@ class _EPChunkOperationBase:
         def run_expert(finished):
             chunk_idx, dispatcher, state, lease, dispatched, tpe, probs = finished
             with torch.cuda.stream(compute_stream):
+                expert_activation_lease = self.workspace.acquire_expert_activation(
+                    stream=compute_stream
+                )
                 recv_hidden = state.get("recv_hidden")
                 _record_ep_chunk_recv_tensors(
                     action="acquire",
@@ -1045,7 +1169,11 @@ class _EPChunkOperationBase:
                             tokens_per_expert_list=getattr(
                                 dispatcher, "_local_tpe_list", None
                             ),
+                            activation_allocation=expert_activation_lease.allocate,
                         )
+                expert_ready = torch.cuda.Event()
+                expert_ready.record(compute_stream)
+                expert_activation_lease.release(expert_ready)
                 _record_state_tensors_current_stream(state)
                 state.pop("recv_hidden", None)
                 state.pop("recv_indices", None)
@@ -1449,6 +1577,9 @@ class _EPChunkOperationBase:
                 expert_probs = (
                     None if probs is None else probs.detach().requires_grad_(True)
                 )
+                expert_activation_lease = self.workspace.acquire_expert_activation(
+                    stream=compute_stream
+                )
                 with _ep_chunk_nvtx("backward.expert", chunk_idx):
                     with workspace_lease.allocation_arena.allocate():
                         expert_out = self.experts(
@@ -1456,6 +1587,7 @@ class _EPChunkOperationBase:
                             local_tpe,
                             expert_probs,
                             tokens_per_expert_list=metadata["local_tpe_list"],
+                            activation_allocation=expert_activation_lease.allocate,
                         )
                 _record_state_tensors_current_stream(state)
             return (
@@ -1466,6 +1598,7 @@ class _EPChunkOperationBase:
                 expert_input,
                 expert_probs,
                 expert_out,
+                expert_activation_lease,
             )
 
         with torch.enable_grad():
@@ -1496,6 +1629,7 @@ class _EPChunkOperationBase:
                     expert_input,
                     expert_probs,
                     expert_out,
+                    expert_activation_lease,
                 ) = finish_recompute_expert(
                     chunk_idx, dispatcher, state, workspace_lease
                 )
@@ -1585,12 +1719,13 @@ class _EPChunkOperationBase:
                     # Fused mode flushes and releases owned aliases per chunk,
                     # so each delayed TE context must rebind its selected sink.
                     self.experts._prepare_delayed_weight_grad_sinks()
-                    expert_grads = torch.autograd.grad(
-                        expert_output,
-                        expert_inputs,
-                        local_state["grad_expert_out"],
-                        allow_unused=True,
-                    )
+                    with expert_activation_lease.allocate():
+                        expert_grads = torch.autograd.grad(
+                            expert_output,
+                            expert_inputs,
+                            local_state["grad_expert_out"],
+                            allow_unused=True,
+                        )
                     grad_dispatched = expert_grads[0]
                     if grad_dispatched is None:
                         grad_dispatched = torch.zeros_like(expert_dispatched)
@@ -1643,6 +1778,7 @@ class _EPChunkOperationBase:
                     )
                     local_bwd_ready = torch.cuda.Event()
                     local_bwd_ready.record(wgrad_stream)
+                    expert_activation_lease.release(local_bwd_ready)
                     del grad_dispatched, grad_probs
                 last_wgrad_done = wgrad_done
 
@@ -1742,6 +1878,9 @@ class _EPChunkOperationBase:
         last_deepep_event: Any | None = grad_ready
         if context.chunks:
             self.experts._prepare_delayed_weight_grad_sinks()
+        expert_activation_lease = self.workspace.acquire_expert_activation(
+            stream=compute_stream
+        )
 
         def remember_deepep_event(state: dict[str, Any]):
             nonlocal last_deepep_event
@@ -1813,12 +1952,13 @@ class _EPChunkOperationBase:
                 if dispatched is None:
                     raise RuntimeError("EP chunk saved expert input was released")
                 expert_inputs = _expert_grad_inputs(dispatched, probs)
-                expert_grads = torch.autograd.grad(
-                    expert_output,
-                    expert_inputs,
-                    local_state["grad_expert_out"],
-                    allow_unused=True,
-                )
+                with expert_activation_lease.allocate():
+                    expert_grads = torch.autograd.grad(
+                        expert_output,
+                        expert_inputs,
+                        local_state["grad_expert_out"],
+                        allow_unused=True,
+                    )
                 grad_dispatched = expert_grads[0]
                 if grad_dispatched is None:
                     grad_dispatched = torch.zeros_like(dispatched)
@@ -1886,6 +2026,11 @@ class _EPChunkOperationBase:
                         grad_recv_probs.record_stream(comm_stream)
                     chunk.recv_probs_base = None
                     del grad_recv_hidden, grad_recv_probs, hidden_reuse_base
+
+        with torch.cuda.stream(compute_stream):
+            backward_activation_done = torch.cuda.Event()
+            backward_activation_done.record(compute_stream)
+        expert_activation_lease.release(backward_activation_done)
 
         for chunk, local_state in pending_dispatch_bwd:
             with torch.cuda.stream(compute_stream):

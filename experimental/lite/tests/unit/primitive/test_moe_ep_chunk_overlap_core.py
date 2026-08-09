@@ -1257,6 +1257,9 @@ def test_fused_flushes_each_chunk_before_reusing_delayed_wgrad_storage(
     )
     dgrad_ready = source.index("dgrad_ready.record(compute_stream)", autograd)
     per_chunk_flush = source.index("flush_delayed_weight_grads", dgrad_ready)
+    activation_release = source.index(
+        "expert_activation_lease.release(local_bwd_ready)", per_chunk_flush
+    )
     alias_taken = source.index(
         'hidden_reuse_base = local_state.pop("grad_expert_out").detach()', autograd
     )
@@ -1269,9 +1272,14 @@ def test_fused_flushes_each_chunk_before_reusing_delayed_wgrad_storage(
 
     assert direct_unpermute < next_dispatch < autograd < alias_taken
     assert alias_taken < graph_clear < locals_clear < dgrad_ready < per_chunk_flush
-    assert per_chunk_flush < overwrite < local_ready < dispatch < pending_append
+    assert per_chunk_flush < overwrite < local_ready < activation_release
+    assert activation_release < dispatch < pending_append
     assert "num_contexts=1" in source[per_chunk_flush:overwrite]
     assert "stream=wgrad_stream" in source[per_chunk_flush:overwrite]
+    activation_backward = source.rindex(
+        "with expert_activation_lease.allocate():", 0, autograd
+    )
+    assert activation_backward < autograd < dgrad_ready
     assert "num_contexts=len(pending_dispatch_bwd)" not in source
     assert "compute_stream.wait_event(wgrad_done)" not in source
     assert "pending_local_bwd" not in source
@@ -1292,7 +1300,81 @@ def test_fused_flushes_each_chunk_before_reusing_delayed_wgrad_storage(
     assert "cuda.synchronize" not in source
 
 
-def test_forward_and_fused_expert_allocations_use_their_workspace_slot_arenas(
+def test_fused_autograd_context_is_only_source_level_pool_routing_evidence(
+    transformer_engine_import_stub,
+):
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+    )
+
+    source = inspect.getsource(_EPChunkOperationBase._full_recompute_fused_backward_v6)
+    tree = ast.parse(inspect.cleandoc(source))
+    activation_scopes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.With)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Attribute)
+            and isinstance(item.context_expr.func.value, ast.Name)
+            and item.context_expr.func.value.id == "expert_activation_lease"
+            and item.context_expr.func.attr == "allocate"
+            for item in node.items
+        )
+    ]
+    assert any(
+        any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Attribute)
+            and isinstance(node.func.value.value, ast.Name)
+            and node.func.value.value.id == "torch"
+            and node.func.value.attr == "autograd"
+            and node.func.attr == "grad"
+            for node in ast.walk(scope)
+        )
+        for scope in activation_scopes
+    )
+    # use_mem_pool is current-thread scoped; GPU allocator history must prove
+    # whether autograd engine worker allocations actually use this pool.
+
+
+def test_saved_backward_owns_one_activation_lease_until_all_local_backward_reads(
+    transformer_engine_import_stub,
+):
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+    )
+
+    source = inspect.getsource(_EPChunkOperationBase._saved_context_backward)
+    acquire = source.index("acquire_expert_activation(")
+    chunk_loop = source.index("for saved in reversed(context.chunks):")
+    activation_scope = source.index(
+        "with expert_activation_lease.allocate():", chunk_loop
+    )
+    autograd = source.index("expert_grads = torch.autograd.grad(", activation_scope)
+    pending = source.index("pending_dispatch_bwd.append", autograd)
+    local_backward = source.index("_dispatch_local_backward(", pending)
+    activation_done = source.index(
+        "backward_activation_done.record(compute_stream)", local_backward
+    )
+    release = source.index(
+        "expert_activation_lease.release(backward_activation_done)", activation_done
+    )
+    finish_dispatch = source.index("finish_deepep_dispatch_backward(", release)
+
+    assert acquire < chunk_loop < activation_scope < autograd < pending
+    assert pending < local_backward < activation_done < release < finish_dispatch
+    assert "cuda.synchronize" not in source
+
+
+def test_forward_and_fused_split_expert_activation_from_slot_output_arenas(
     transformer_engine_import_stub,
 ):
     import inspect
@@ -1310,24 +1392,101 @@ def test_forward_and_fused_expert_allocations_use_their_workspace_slot_arenas(
         _EPChunkOperationBase._full_recompute_fused_backward_v6
     )
 
-    forward_arena = forward_source.index("with lease.allocation_arena.allocate():")
-    forward_expert = forward_source.index("expert_out = self.experts(", forward_arena)
+    forward_acquire = forward_source.index("acquire_expert_activation(")
+    forward_slot = forward_source.index("with lease.allocation_arena.allocate():")
+    forward_expert = forward_source.index("expert_out = self.experts(", forward_acquire)
+    forward_release = forward_source.index(
+        "expert_activation_lease.release(expert_ready)", forward_expert
+    )
     saved_arena = saved_forward_source.index("with lease.allocation_arena.allocate():")
     saved_expert = saved_forward_source.index("expert_out = self.experts(", saved_arena)
-    fused_arena = fused_source.index(
-        "with workspace_lease.allocation_arena.allocate():"
+    fused_acquire = fused_source.index("acquire_expert_activation(")
+    fused_dispatch_finish = fused_source.index(
+        "finish_deepep_dispatch_external_with_options("
     )
-    fused_expert = fused_source.index("expert_out = self.experts(", fused_arena)
+    fused_slot = fused_source.index("with workspace_lease.allocation_arena.allocate():")
+    fused_expert = fused_source.index("expert_out = self.experts(", fused_acquire)
 
-    assert forward_arena < forward_expert
+    assert forward_acquire < forward_slot < forward_expert < forward_release
+    assert "activation_allocation=expert_activation_lease.allocate" in forward_source
+    assert "output_allocation=" not in forward_source
+    assert "wgrad_done" not in forward_source
     assert saved_arena < saved_expert
-    assert fused_arena < fused_expert
+    assert "activation_allocation=" not in saved_forward_source
+    assert fused_dispatch_finish < fused_acquire < fused_slot < fused_expert
+    assert "activation_allocation=expert_activation_lease.allocate" in fused_source
+    assert "output_allocation=" not in fused_source
     no_grad_finish = forward_source.index("finish_deepep_combine(state)")
     no_grad_release = forward_source.index("lease.release(consumed)", no_grad_finish)
     assert no_grad_finish < no_grad_release
     assert "cuda.synchronize" not in forward_source
     assert "cuda.synchronize" not in saved_forward_source
     assert "cuda.synchronize" not in fused_source
+
+
+def test_experts_split_fc1_and_swiglu_forward_activation_from_fc2_output(
+    monkeypatch, transformer_engine_import_stub
+):
+    from contextlib import contextmanager
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    active = []
+    calls = []
+    constructed = []
+
+    @contextmanager
+    def stage(name):
+        active.append(name)
+        try:
+            yield
+        finally:
+            assert active.pop() == name
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self, _num_gemms, _in_features, out_features, **_kwargs):
+            super().__init__()
+            self.name = "fc1" if not constructed else "fc2"
+            self.out_features = out_features
+            constructed.append(self)
+
+        def forward(self, x, _splits):
+            calls.append((self.name, tuple(active)))
+            return x.new_ones((x.size(0), self.out_features))
+
+    def weighted(value, _probs, _limit):
+        calls.append(("weighted_swiglu", tuple(active)))
+        return value[:, :2]
+
+    monkeypatch.setattr(
+        experts_module.te, "GroupedLinear", FakeGroupedLinear, raising=False
+    )
+    monkeypatch.setattr(experts_module, "swiglu_with_probs", weighted)
+    experts = experts_module.Experts(
+        SimpleNamespace(
+            num_experts=2,
+            hidden_size=2,
+            moe_intermediate_size=2,
+            swiglu_limit=0.0,
+        ),
+        SimpleNamespace(ep_size=1, etp_size=1, tp_size=1, etp_group=None),
+    )
+
+    with stage("slot"):
+        experts(
+            torch.ones(3, 2),
+            None,
+            torch.ones(3),
+            tokens_per_expert_list=[1, 2],
+            activation_allocation=lambda: stage("activation"),
+        )
+
+    assert calls == [
+        ("fc1", ("slot", "activation")),
+        ("weighted_swiglu", ("slot", "activation")),
+        ("fc2", ("slot",)),
+    ]
 
 
 def test_manual_unpermute_writes_into_stable_workspace_slot(

@@ -638,7 +638,7 @@ def test_workspace_reports_deepep_buffer_count_and_resident_bytes(
     assert evidence["caller_owned_recv_proven"] is False
 
 
-def test_workspace_lazily_owns_one_cuda_mem_pool_per_slot(
+def test_workspace_owns_two_comm_pools_and_one_expert_activation_pool(
     monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
@@ -699,7 +699,7 @@ def test_workspace_lazily_owns_one_cuda_mem_pool_per_slot(
         lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
     )
     workspace.materialize()
-    assert len(created) == 2
+    assert len(created) == 3
     assert creation_devices == [torch.device("cuda", 3)]
     evidence = workspace.evidence()
     assert evidence["allocation_pool_count"] == 2
@@ -707,6 +707,8 @@ def test_workspace_lazily_owns_one_cuda_mem_pool_per_slot(
         id(created[0]),
         id(created[1]),
     }
+    assert evidence["expert_activation_pool_count"] == 1
+    assert evidence["expert_activation_pool_id"] == id(created[2])
     assert evidence["caller_owned_recv_proven"] is False
     assert evidence["recv_observer_enabled"] is False
     monkeypatch.setenv("MEGATRON_LITE_EP_CHUNK_SCRATCH_TRACE", "1")
@@ -725,12 +727,137 @@ def test_workspace_lazily_owns_one_cuda_mem_pool_per_slot(
     lease1 = workspace.acquire(1)
     with lease1.deepep_recv_allocation():
         pass
-    assert len(created) == 2
+    assert len(created) == 3
     lease1.release(_FakeEvent(ready=True))
     assert workspace.evidence()["allocation_pool_count"] == 2
 
     workspace.release()
     assert workspace.evidence()["allocation_pool_count"] == 0
+    assert workspace.evidence()["expert_activation_pool_count"] == 0
+
+
+def test_three_ops_own_distinct_expert_activation_pools(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+
+    @contextmanager
+    def use_device(_device):
+        yield
+
+    @contextmanager
+    def use_pool(_pool, device=None):
+        yield
+
+    monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
+    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
+    monkeypatch.setattr(overlap.torch.cuda, "MemPool", lambda **_kwargs: object())
+    registry = registry_type()
+    profile = profile_type(
+        max_input_rows=8,
+        hidden_size=4,
+        topk=2,
+        ep_size=2,
+    )
+    workspaces = []
+    for op in ("forward", "backward", "fused_forward_backward"):
+        workspace = registry.get_or_create(
+            key_type(
+                op=op,
+                device_type="cuda",
+                device_index=3,
+                ep_group_id=43,
+                dtype=torch.bfloat16,
+                shape_profile=profile,
+            ),
+            lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+        )
+        if op == "backward":
+            workspace.prepare_scratch(device=torch.device("cuda", 3))
+            assert workspace.evidence()["dispatcher_count"] == 0
+            assert workspace.evidence()["allocation_pool_count"] == 0
+            assert workspace.evidence()["expert_activation_pool_count"] == 0
+            lease = workspace.acquire_expert_activation(
+                stream=SimpleNamespace(device=torch.device("cuda", 3))
+            )
+            lease.release(_FakeEvent(ready=True))
+            assert workspace.evidence()["dispatcher_count"] == 0
+            assert workspace.evidence()["allocation_pool_count"] == 0
+        else:
+            workspace.materialize()
+        workspaces.append(workspace)
+
+    activation_ids = {
+        workspace.evidence()["expert_activation_pool_id"] for workspace in workspaces
+    }
+    comm_ids = {
+        pool_id
+        for workspace in workspaces
+        for pool_id in workspace.evidence()["allocation_pool_ids"].values()
+    }
+    assert len(activation_ids) == 3
+    assert [
+        workspace.evidence()["allocation_pool_count"] for workspace in workspaces
+    ] == [2, 0, 2]
+    assert len(comm_ids) == 4
+    assert activation_ids.isdisjoint(comm_ids)
+
+
+def test_expert_activation_arena_waits_only_for_its_consumer_event(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="fused_forward_backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=41,
+            dtype=torch.bfloat16,
+            shape_profile=profile_type(
+                max_input_rows=8,
+                hidden_size=4,
+                topk=2,
+                ep_size=2,
+            ),
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    stream = _FakeStream()
+    first = workspace.acquire_expert_activation(stream=stream)
+    with pytest.raises(RuntimeError, match="expert activation arena is already leased"):
+        workspace.acquire_expert_activation(stream=stream)
+
+    pending = _FakeEvent(ready=False)
+    first.release(pending)
+    second = workspace.acquire_expert_activation(stream=stream)
+
+    assert stream.waited == [pending]
+    assert workspace.evidence()["expert_activation_waits"] == 1
+    assert workspace.metrics()["runtime_allocations"] == 0
+    assert workspace.metrics()["grows"] == 0
+    second.release(_FakeEvent(ready=True))
 
 
 def test_unbound_workspace_binds_to_first_runtime_stream_device(
@@ -852,6 +979,11 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
         "deepep_buffer_resident_bytes": 0,
         "allocation_pool_count": 0,
         "allocation_pool_ids": {},
+        "expert_activation_pool_count": 0,
+        "expert_activation_pool_id": None,
+        "expert_activation_waits": 0,
+        "expert_activation_in_use": False,
+        "expert_activation_event_guarded": False,
         "active_lease_count": 0,
         "consumer_event_guard_count": 0,
         "recv_observer_enabled": False,
