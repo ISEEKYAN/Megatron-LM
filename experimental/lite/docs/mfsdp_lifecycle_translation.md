@@ -88,13 +88,19 @@ Hard release gates:
 - Saved-tensor parameter-view restoration: `equivalent-with-proof`.
 - Recompute `PRE_BACKWARD` release: `equivalent-with-proof`.
 - Ordinary and TE GroupedLinear authoritative FP32 gradient destination:
-  `equivalent-with-proof`; both write the parameter-group FP32 bucket directly.
+  `equivalent-with-proof` against MCore configured with
+  `main_grads_dtype=torch.float32` and `grad_comm_dtype=torch.float32`.
+  TE fused wgrad writes the FP32 staging view directly; non-fused BF16
+  autograd gradients are copied into that FP32 view once per microbatch.
 - TE delayed-wgrad callback: `equivalent-with-proof`; parameters marked
   `skip_backward_post_hook` receive MCore's post-wgrad completion callback.
 - Globally stable RS ordering: `equivalent-with-proof`.
 - RS Work completion: `equivalent-with-proof`; normal paths install stream
   dependencies and consume ProcessGroup Work without host event synchronization.
-- Multi-microbatch FP32 shard accumulation: `equivalent-with-proof`.
+- Multi-microbatch FP32 shard accumulation: `equivalent-with-proof`; each
+  microbatch is reduce-scattered independently and accumulated in the
+  persistent FP32 shard. PR89 and FSDP2 remain required product precision
+  baselines alongside dist-opt even where their internal staging differs.
 - Optimizer step to next AG: `equivalent-with-proof`.
 - Eval-to-train overlap lifecycle: `equivalent-with-proof`, GPU job 15407429.
 - Public `named_parameters` and `state_dict`: `equivalent-with-proof`; both
