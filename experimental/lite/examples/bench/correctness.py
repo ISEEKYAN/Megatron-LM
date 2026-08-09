@@ -1,9 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 """Deterministic correctness runner for MLite and reference backends."""
 
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -22,12 +24,15 @@ if str(_EXPERIMENTAL_LITE_ROOT) not in sys.path:
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(_REPO_ROOT))
 
-from megatron.lite.primitive.deterministic import set_deterministic
-from megatron.lite.runtime import create_runtime
-
-from examples.bench.bench import BenchCliConfig, build_runtime_config, build_session_config
+from examples.bench.bench import (
+    BenchCliConfig,
+    build_runtime_config,
+    build_session_config,
+)
 from examples.bench.results import compare_correctness_artifacts, load_result_artifact
 from examples.bench.session import _make_data_iter
+from megatron.lite.primitive.deterministic import set_deterministic
+from megatron.lite.runtime import create_runtime
 
 
 def _distributed_rank() -> int:
@@ -145,7 +150,9 @@ def _resolve_probe_module(modules: dict[str, Any], name: str) -> tuple[str, Any]
 
 
 @contextmanager
-def _activation_probe_context(handle, probe_names: list[str], *, record_grad: bool = False):
+def _activation_probe_context(
+    handle, probe_names: list[str], *, record_grad: bool = False
+):
     records: list[dict[str, Any]] = []
     hooks = []
     tensor_hooks = []
@@ -182,12 +189,18 @@ def _activation_probe_context(handle, probe_names: list[str], *, record_grad: bo
                         record_grad=record_grad,
                         tensor_hooks=tensor_hooks,
                     )
-                    records[-1]["resolved_name"] = f"{_resolved_name}::{_method_name}:input"
+                    records[-1][
+                        "resolved_name"
+                    ] = f"{_resolved_name}::{_method_name}:input"
                     records[-1]["module_type"] = _module_type
                     return _original(*args, **kwargs)
                 output = _original(*args, **kwargs)
                 _record_activation_probe(
-                    records, _probe_name, output, record_grad=record_grad, tensor_hooks=tensor_hooks
+                    records,
+                    _probe_name,
+                    output,
+                    record_grad=record_grad,
+                    tensor_hooks=tensor_hooks,
                 )
                 records[-1]["resolved_name"] = f"{_resolved_name}::{_method_name}"
                 records[-1]["module_type"] = _module_type
@@ -205,9 +218,15 @@ def _activation_probe_context(handle, probe_names: list[str], *, record_grad: bo
 
         if record_input:
 
-            def _pre_hook(_module, args, probe_name=name, resolved_probe_name=resolved_name):
+            def _pre_hook(
+                _module, args, probe_name=name, resolved_probe_name=resolved_name
+            ):
                 _record_activation_probe(
-                    records, probe_name, args, record_grad=record_grad, tensor_hooks=tensor_hooks
+                    records,
+                    probe_name,
+                    args,
+                    record_grad=record_grad,
+                    tensor_hooks=tensor_hooks,
                 )
                 records[-1]["resolved_name"] = f"{resolved_probe_name}:input"
                 records[-1]["module_type"] = (
@@ -217,12 +236,20 @@ def _activation_probe_context(handle, probe_names: list[str], *, record_grad: bo
             hooks.append(module.register_forward_pre_hook(_pre_hook))
             continue
 
-        def _hook(_module, _args, output, probe_name=name, resolved_probe_name=resolved_name):
+        def _hook(
+            _module, _args, output, probe_name=name, resolved_probe_name=resolved_name
+        ):
             _record_activation_probe(
-                records, probe_name, output, record_grad=record_grad, tensor_hooks=tensor_hooks
+                records,
+                probe_name,
+                output,
+                record_grad=record_grad,
+                tensor_hooks=tensor_hooks,
             )
             records[-1]["resolved_name"] = resolved_probe_name
-            records[-1]["module_type"] = type(_module).__module__ + "." + type(_module).__qualname__
+            records[-1]["module_type"] = (
+                type(_module).__module__ + "." + type(_module).__qualname__
+            )
 
         hooks.append(module.register_forward_hook(_hook))
     try:
@@ -306,14 +333,14 @@ def _weight_fingerprint(rt, handle) -> dict[str, Any]:
 
 def _forward_logits(rt, handle, batch: Any) -> torch.Tensor | None:
     result = rt.forward_backward(
-        handle,
-        iter([batch]),
-        loss_fn=None,
-        num_microbatches=1,
-        forward_only=True,
+        handle, iter([batch]), loss_fn=None, num_microbatches=1, forward_only=True
     )
     output = result.model_output
-    return output.vocab_parallel_logits if output.vocab_parallel_logits is not None else (-output.log_probs if output.log_probs is not None else None)
+    return (
+        output.vocab_parallel_logits
+        if output.vocab_parallel_logits is not None
+        else (-output.log_probs if output.log_probs is not None else None)
+    )
 
 
 def run_backend(
@@ -321,6 +348,7 @@ def run_backend(
     *,
     hash_weights: bool = True,
     activation_probe_names: list[str] | None = None,
+    verify_resume_path: str | None = None,
 ) -> dict[str, Any]:
     os.environ["MEGATRON_LITE_DETERMINISTIC"] = "1"
     set_deterministic(cfg.seed)
@@ -347,11 +375,18 @@ def run_backend(
                 rt.zero_grad(handle)
                 _sync(session_cfg.device)
                 result = rt.forward_backward(
-                    handle, data_iter, loss_fn=None, num_microbatches=session_cfg.num_microbatches
+                    handle,
+                    data_iter,
+                    loss_fn=None,
+                    num_microbatches=session_cfg.num_microbatches,
                 )
                 _sync(session_cfg.device)
                 output = result.model_output
-                logits = _hash_tensor(output.vocab_parallel_logits if output.vocab_parallel_logits is not None else (-output.log_probs if output.log_probs is not None else None))
+                logits = _hash_tensor(
+                    output.vocab_parallel_logits
+                    if output.vocab_parallel_logits is not None
+                    else (-output.log_probs if output.log_probs is not None else None)
+                )
                 grads = _grad_fingerprint(handle)
 
                 if session_cfg.no_optimizer:
@@ -373,9 +408,61 @@ def run_backend(
                     "grad_norm": _scalar(grad_norm),
                     "update_successful": bool(update_successful),
                     "num_zeros": None if num_zeros is None else int(num_zeros),
-                    "post_step_weights": _weight_fingerprint(rt, handle) if hash_weights else None,
+                    "post_step_weights": (
+                        _weight_fingerprint(rt, handle) if hash_weights else None
+                    ),
                     "train_activation_probes": train_activation_probes,
                 }
+            )
+
+    resume = None
+    if verify_resume_path is not None:
+        rt.save_checkpoint(handle, verify_resume_path, global_step=session_cfg.steps)
+        next_batches = [next(data_iter) for _ in range(session_cfg.num_microbatches)]
+
+        def next_step(step_rt, step_handle):
+            step_rt.zero_grad(step_handle)
+            result = step_rt.forward_backward(
+                step_handle,
+                iter(next_batches),
+                loss_fn=None,
+                num_microbatches=session_cfg.num_microbatches,
+            )
+            success, grad_norm, _num_zeros = step_rt.optimizer_step(step_handle)
+            step_rt.lr_scheduler_step(step_handle)
+            loss = result.metrics.get("loss")
+            if loss is None:
+                loss = result.model_output.loss
+            return {
+                "loss": _scalar(loss),
+                "grad_norm": _scalar(grad_norm),
+                "update_successful": bool(success),
+                "post_step_weights": _weight_fingerprint(step_rt, step_handle),
+            }
+
+        uninterrupted = next_step(rt, handle)
+        rt.to(handle, "cpu", model=True, optimizer=True, grad=True)
+        del handle
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        resumed_rt = create_runtime(rt_cfg)
+        resumed_handle = resumed_rt.build_model()
+        loaded_step = resumed_rt.load_checkpoint(resumed_handle, verify_resume_path)
+        if loaded_step != session_cfg.steps:
+            raise AssertionError(
+                f"resume step mismatch: {loaded_step} != {session_cfg.steps}"
+            )
+        resumed = next_step(resumed_rt, resumed_handle)
+        resume = {
+            "loaded_step": loaded_step,
+            "uninterrupted": uninterrupted,
+            "resumed": resumed,
+            "exact_match": uninterrupted == resumed,
+        }
+        if not resume["exact_match"]:
+            raise AssertionError(
+                "checkpoint resume next step differs from uninterrupted run"
             )
 
     return {
@@ -388,6 +475,7 @@ def run_backend(
         "steps": steps,
         "eval_logits": eval_logits,
         "activation_probes": activation_probes,
+        "resume": resume,
         "metadata": {
             "deterministic": True,
             "hash_weights": hash_weights,
@@ -398,7 +486,9 @@ def run_backend(
 
 
 def _add_run_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--backend", choices=["mlite", "bridge", "mbridge"], required=True)
+    parser.add_argument(
+        "--backend", choices=["mlite", "bridge", "mbridge"], required=True
+    )
     parser.add_argument("--hf-path", required=True)
     parser.add_argument("--model-name", default="qwen3_5")
     parser.add_argument("--impl", default="lite")
@@ -432,6 +522,7 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--skip-weight-hash", action="store_true")
     parser.add_argument("--activation-probes-json", default="{}")
+    parser.add_argument("--verify-resume-path", default=None)
 
 
 def _activation_probe_names(raw: str, backend: str) -> list[str]:
@@ -441,15 +532,21 @@ def _activation_probe_names(raw: str, backend: str) -> list[str]:
     if isinstance(value, dict):
         selected = value.get(backend, [])
         if not isinstance(selected, list):
-            raise ValueError(f"activation probe list for {backend!r} must be a JSON list.")
+            raise ValueError(
+                f"activation probe list for {backend!r} must be a JSON list."
+            )
         return [str(item) for item in selected]
-    raise ValueError("activation_probes_json must be a JSON list or backend-to-list mapping.")
+    raise ValueError(
+        "activation_probes_json must be a JSON list or backend-to-list mapping."
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    run_p = sub.add_parser("run", help="run one backend and write a correctness artifact")
+    run_p = sub.add_parser(
+        "run", help="run one backend and write a correctness artifact"
+    )
     _add_run_args(run_p)
 
     cmp_p = sub.add_parser("compare", help="strictly compare two correctness artifacts")
@@ -488,12 +585,19 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         return result
 
     cfg = BenchCliConfig(
-        **{k: v for k, v in vars(ns).items() if k in BenchCliConfig.__dataclass_fields__}
+        **{
+            k: v
+            for k, v in vars(ns).items()
+            if k in BenchCliConfig.__dataclass_fields__
+        }
     )
     artifact = run_backend(
         cfg,
         hash_weights=not ns.skip_weight_hash,
-        activation_probe_names=_activation_probe_names(ns.activation_probes_json, cfg.backend),
+        activation_probe_names=_activation_probe_names(
+            ns.activation_probes_json, cfg.backend
+        ),
+        verify_resume_path=ns.verify_resume_path,
     )
     if _distributed_rank() == 0:
         text = json.dumps(artifact, indent=2, sort_keys=True)
