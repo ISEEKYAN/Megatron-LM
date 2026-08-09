@@ -1929,9 +1929,11 @@ def test_mfsdp_full_param_installs_mcore_te_lazy_main_grad_protocol():
     spec.full_param.overwrite_main_grad = True
     bucket._make_grad_ready_hook(spec)(spec.full_param)
     assert id(spec) in bucket._staged_grad_ids
+    assert spec.full_param.grad_added_to_main_grad is True
     assert spec.full_param.overwrite_main_grad is False
 
     bucket._release_full_main_grads()
+    assert spec.full_param.grad_added_to_main_grad is False
     assert spec.full_param.overwrite_main_grad is True
 
 
@@ -2460,7 +2462,7 @@ def test_mfsdp_begin_backward_is_once_only_until_post_backward_reset():
     assert events == ["grad", "param", "grad", "param"]
 
 
-def test_mfsdp_grad_hook_only_stages_and_never_launches_collectives():
+def test_mfsdp_grad_hook_notifies_rs_scheduler_when_bucket_is_ready():
     model = torch.nn.Linear(4, 3, bias=False)
     buffers = mfsdp_buffer.ParamAndGradBuffer(
         model,
@@ -2481,12 +2483,12 @@ def test_mfsdp_grad_hook_only_stages_and_never_launches_collectives():
     bucket = buffers.buckets[0]
     spec = bucket.specs[0]
     spec.full_param.grad = torch.ones_like(spec.full_param)
-    bucket.grad_ready_callback = lambda _bucket: (_ for _ in ()).throw(
-        AssertionError("per-parameter hook reached the RS scheduler")
-    )
+    ready = []
+    bucket.grad_ready_callback = ready.append
 
     bucket._make_grad_ready_hook(spec)(spec.full_param)
 
+    assert ready == [bucket]
     assert bucket._grad_ready_ids == {id(spec)}
     assert torch.equal(spec.full_param.main_grad, torch.ones_like(spec.full_param))
     assert spec.full_param.grad is None

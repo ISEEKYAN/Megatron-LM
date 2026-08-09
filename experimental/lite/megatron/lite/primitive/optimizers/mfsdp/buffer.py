@@ -548,6 +548,7 @@ class ParamBucket:
         )
         for spec in self.specs:
             spec.full_param.main_grad = self.full_main_grad_buffer
+            spec.full_param.grad_added_to_main_grad = False
             spec.full_param.overwrite_main_grad = True
 
     def prepare_param_gather(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -758,6 +759,8 @@ class ParamBucket:
                 if grad is not None and not spec.full_param.grad_added_to_main_grad:
                     spec.full_param.main_grad.add_(grad)
                 spec.full_param.grad = None
+                spec.full_param.grad_added_to_main_grad = False
+                spec.full_param.overwrite_main_grad = True
         self._staged_grad_ids.clear()
         if self.policy.grad_comm_dtype == self.policy.main_grads_dtype:
             grad_input = self.full_main_grad_buffer
@@ -936,7 +939,8 @@ class ParamBucket:
 
     def _make_grad_ready_hook(self, spec: ParamSpec) -> Callable[[nn.Parameter], None]:
         def grad_ready(param: nn.Parameter) -> None:
-            if not param.grad_added_to_main_grad:
+            fused_wgrad_staged = bool(param.grad_added_to_main_grad)
+            if not fused_wgrad_staged:
                 with torch.no_grad():
                     if param.grad is not None:
                         # MCore's data-distributed _grad_acc writes directly
@@ -957,13 +961,20 @@ class ParamBucket:
             param.overwrite_main_grad = False
             if param.grad is not None:
                 param.grad = None
-            # MCore treats this as a one-backward notification from TE.  It
-            # must not leak into the next microbatch's accumulation decision.
-            param.grad_added_to_main_grad = False
+            # MCore resets this one-backward TE signal after scheduling RS.
+            # Our global rank order may defer RS across pipeline microbatches,
+            # so keep it set until the staging buffer is actually consumed;
+            # TE then accumulates rather than overwriting the live FP32 view.
+            param.grad_added_to_main_grad = fused_wgrad_staged
             # get_main_grad() may retire this same bucket's previous
             # microbatch, whose completion clears the old ready set. Mark the
             # current parameter only after that retirement.
             self._grad_ready_ids.add(id(spec))
+            if (
+                len(self._grad_ready_ids) == len(self.specs)
+                and self.grad_ready_callback is not None
+            ):
+                self.grad_ready_callback(self)
 
         return grad_ready
 
@@ -1454,7 +1465,10 @@ class GradReducePipeline:
             buckets, owner_bucket_ids, explicit=suggested_communication_unit_size
         )
         for bucket in buckets:
-            bucket.grad_ready_callback = None
+            # Match MCore's grad-acc hooks: a complete bucket enters the
+            # deterministic RS scheduler during each backward, rather than
+            # waiting for the root callback after multiple PP microbatches.
+            bucket.grad_ready_callback = self.reduce_gradients
             bucket.before_main_grad_allocate = self._prepare_main_grad_allocate
 
     def _retire_oldest(self) -> None:
