@@ -106,8 +106,8 @@ def _phase_artifact_dir() -> Path:
 
 def _phase() -> str:
     phase = os.environ.get("MLITE_MULTI_LORA_PHASE")
-    if phase not in {"ep1_oracle", "ep2_verify"}:
-        pytest.skip("set MLITE_MULTI_LORA_PHASE to ep1_oracle or ep2_verify")
+    if phase not in {"ep2_oracle", "ep2_verify"}:
+        pytest.skip("set MLITE_MULTI_LORA_PHASE to ep2_oracle or ep2_verify")
     return phase
 
 
@@ -133,8 +133,22 @@ def _named_parameters(bundle) -> dict[str, torch.Tensor]:
 
 
 def _checkpoint_semantics(bundle) -> dict[str, dict[str, object]]:
-    """Independent dense/expert/bank semantic value records for DCP resharding."""
+    """Bind every named model parameter plus dense/expert/bank DCP semantics."""
     parameters = _named_parameters(bundle)
+    state = bundle.extras["multi_lora_training_state"]
+    bank_records = {
+        name: _tensor_record(parameter) for name, parameter in state.named_parameters()
+    }
+    assert set(bank_records) == _expected_semantic_bank_keys(state)
+    bank_prefix = "multi_lora_training_state."
+    model_records = {
+        name: _tensor_record(parameter)
+        for name, parameter in parameters.items()
+        if not name.startswith(bank_prefix)
+    }
+    assert set(parameters) == set(model_records) | {
+        f"{bank_prefix}{name}" for name in bank_records
+    }
     dense_candidates = sorted(
         name
         for name in parameters
@@ -162,12 +176,8 @@ def _checkpoint_semantics(bundle) -> dict[str, dict[str, object]]:
             (bundle.parallel_state.ep_rank + 1) * local_experts,
         )
     }
-    state = bundle.extras["multi_lora_training_state"]
-    bank_records = {
-        name: _tensor_record(parameter) for name, parameter in state.named_parameters()
-    }
-    assert set(bank_records) == _expected_semantic_bank_keys(state)
     return {
+        "model": model_records,
         "dense": {dense_name: _tensor_record(parameters[dense_name])},
         "experts": expert_records,
         "banks": bank_records,
@@ -549,7 +559,7 @@ def _expected_semantic_bank_keys(state) -> set[str]:
 
 @pytest.mark.timeout(120)
 def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
-    """EP1 oracle and EP2-local DCP prove exactly one EP2 reduction."""
+    """Same-topology EP2 oracle and DCP prove exactly one EP2 reduction."""
     _Qwen3MoEConfig, model, protocol = _qwen_symbols()
     phase = _phase()
     artifact_dir = _phase_artifact_dir()
@@ -564,34 +574,43 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
         "candidate commit, tree, and diff hashes must bind the phase artifact"
     )
 
-    if phase == "ep1_oracle":
+    if phase == "ep2_oracle":
         if dist.get_rank() == 0:
             assert not artifact_dir.exists(), (
                 "phase artifact directory already exists; refuse stale COMPLETE/checkpoint reuse"
             )
             artifact_dir.mkdir(parents=True)
         dist.barrier()
-        bundle = _build_bundle(ep=1, model_seed=3100)
-        ep1_topology = _actual_topology(bundle)
-        assert ep1_topology["dp"] == 2
-        assert ep1_topology["expert_dp"] == 2
-        ep1_topologies = [None, None]
-        dist.all_gather_object(ep1_topologies, ep1_topology)
+        bundle = _build_bundle(ep=2, model_seed=3100)
+        ep2_topology = _actual_topology(bundle)
+        assert ep2_topology == {
+            "world": 2,
+            "tp": 1,
+            "ep": 2,
+            "etp": 1,
+            "pp": 1,
+            "cp": 1,
+            "dp": 2,
+            "dp_rank": dist.get_rank(),
+            "expert_dp": 1,
+            "expert_dp_rank": 0,
+        }
+        ep2_topologies = [None, None]
+        dist.all_gather_object(ep2_topologies, ep2_topology)
         _initialize_nonzero_banks(bundle)
         _configure_fixed_router(bundle)
         batch = _batch()
+        parameter_semantics = _checkpoint_semantics(bundle)
         loss, local_contributions = _run_unsynchronized_reference(bundle, batch)
         expected_keys = _expected_semantic_bank_keys(
             bundle.extras["multi_lora_training_state"]
         )
         assert set(local_contributions) == expected_keys
-        assert all(
-            gradient.abs().max() > 0 for gradient in local_contributions.values()
-        )
         oracle_grads, normalization_by_key = _dense_dp_absolute_oracle(
             bundle, local_contributions
         )
         assert set(oracle_grads) == expected_keys
+        assert all(gradient.abs().max() > 0 for gradient in oracle_grads.values())
         gathered_contributions = [None] * dist.get_world_size(
             bundle.parallel_state.dp_group
         )
@@ -600,6 +619,13 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
             local_contributions,
             group=bundle.parallel_state.dp_group,
         )
+        assert all(
+            any(
+                contribution[name].abs().max() > 0
+                for contribution in gathered_contributions
+            )
+            for name in expected_keys
+        ), "each bank must receive a contribution from at least one EP rank"
         assert any(
             not torch.equal(
                 gathered_contributions[0][name], gathered_contributions[1][name]
@@ -610,6 +636,7 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
         batches = [None, None]
         oracle_tensors_by_rank = [None, None]
         local_contribution_tensors_by_rank = [None, None]
+        parameter_semantics_by_rank = [None, None]
         dist.all_gather_object(losses, loss)
         dist.all_gather_object(batches, _batch_record(batch))
         dist.all_gather_object(
@@ -623,17 +650,18 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
                 for name, value in local_contributions.items()
             },
         )
+        dist.all_gather_object(parameter_semantics_by_rank, parameter_semantics)
         dist.barrier()
-        oracle_path = artifact_dir / f"ep1_bank_grads_rank_{dist.get_rank():05d}.pt"
+        oracle_path = artifact_dir / f"ep2_bank_grads_rank_{dist.get_rank():05d}.pt"
         local_path = (
-            artifact_dir / f"ep1_local_bank_grads_rank_{dist.get_rank():05d}.pt"
+            artifact_dir / f"ep2_local_bank_grads_rank_{dist.get_rank():05d}.pt"
         )
         torch.save(oracle_grads, oracle_path)
         torch.save(local_contributions, local_path)
         dist.barrier()
         if dist.get_rank() == 0:
             manifest = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "candidate": {
                     "commit": candidate_sha,
                     "tree": candidate_tree,
@@ -641,9 +669,9 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
                 },
                 "test_sha256": _sha256(Path(__file__)),
                 "model_config": _config().to_dict(),
-                "topology": {"ep1_oracle": ep1_topologies, "ep2_verify": None},
+                "topology": {"ep2_oracle": ep2_topologies, "ep2_verify": None},
                 "impl_config": {
-                    "ep1_oracle": _impl_contract(ep=1),
+                    "ep2_oracle": _impl_contract(ep=2),
                     "ep2_verify": _impl_contract(ep=2),
                 },
                 "seeds": {"model": 3100, "batch_base": 4100},
@@ -654,15 +682,16 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
                 "semantic_bank_keys": sorted(expected_keys),
                 "semantic_bank_tensors_by_rank": oracle_tensors_by_rank,
                 "local_contribution_tensors_by_rank": local_contribution_tensors_by_rank,
+                "parameter_semantics_by_rank": parameter_semantics_by_rank,
                 "oracle_files": {
                     f"rank_{rank:05d}": _sha256(
-                        artifact_dir / f"ep1_bank_grads_rank_{rank:05d}.pt"
+                        artifact_dir / f"ep2_bank_grads_rank_{rank:05d}.pt"
                     )
                     for rank in range(2)
                 },
                 "local_contribution_files": {
                     f"rank_{rank:05d}": _sha256(
-                        artifact_dir / f"ep1_local_bank_grads_rank_{rank:05d}.pt"
+                        artifact_dir / f"ep2_local_bank_grads_rank_{rank:05d}.pt"
                     )
                     for rank in range(2)
                 },
@@ -675,7 +704,7 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
             complete_payload = {
                 "commit": candidate_sha,
                 "manifest_sha256": _sha256(manifest_path),
-                "phase": "ep1_oracle",
+                "phase": "ep2_oracle",
             }
             temporary_complete = complete_path.with_name(f".COMPLETE.{os.getpid()}.tmp")
             temporary_complete.write_text(json.dumps(complete_payload, sort_keys=True))
@@ -688,7 +717,7 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
     assert complete == {
         "commit": candidate_sha,
         "manifest_sha256": _sha256(manifest_path),
-        "phase": "ep1_oracle",
+        "phase": "ep2_oracle",
     }
     assert manifest["candidate"] == {
         "commit": candidate_sha,
@@ -696,7 +725,7 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
         "diff": candidate_diff,
     }
     assert manifest["test_sha256"] == _sha256(Path(__file__))
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["seeds"] == {
         "model": 3100,
         "batch_base": 4100,
@@ -707,34 +736,34 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
     )
     assert manifest["model_config"] == _config().to_dict()
     assert manifest["impl_config"] == {
-        "ep1_oracle": _impl_contract(ep=1),
+        "ep2_oracle": _impl_contract(ep=2),
         "ep2_verify": _impl_contract(ep=2),
     }
-    assert manifest["topology"]["ep1_oracle"][dist.get_rank()] == {
+    assert manifest["topology"]["ep2_oracle"][dist.get_rank()] == {
         "world": 2,
         "tp": 1,
-        "ep": 1,
+        "ep": 2,
         "etp": 1,
         "pp": 1,
         "cp": 1,
         "dp": 2,
         "dp_rank": dist.get_rank(),
-        "expert_dp": 2,
-        "expert_dp_rank": dist.get_rank(),
+        "expert_dp": 1,
+        "expert_dp_rank": 0,
     }
     assert manifest["topology"]["ep2_verify"] is None
     batch = _batch()
     expected_batch = manifest["batch_by_rank"][dist.get_rank()]
     assert _batch_record(batch) == expected_batch
     for rank in range(2):
-        path = artifact_dir / f"ep1_bank_grads_rank_{rank:05d}.pt"
+        path = artifact_dir / f"ep2_bank_grads_rank_{rank:05d}.pt"
         assert _sha256(path) == manifest["oracle_files"][f"rank_{rank:05d}"]
-        local_path = artifact_dir / f"ep1_local_bank_grads_rank_{rank:05d}.pt"
+        local_path = artifact_dir / f"ep2_local_bank_grads_rank_{rank:05d}.pt"
         assert (
             _sha256(local_path)
             == manifest["local_contribution_files"][f"rank_{rank:05d}"]
         )
-    oracle_path = artifact_dir / f"ep1_bank_grads_rank_{dist.get_rank():05d}.pt"
+    oracle_path = artifact_dir / f"ep2_bank_grads_rank_{dist.get_rank():05d}.pt"
     oracle_grads = torch.load(oracle_path, map_location="cpu", weights_only=True)
     assert {
         name: _tensor_record(value) for name, value in oracle_grads.items()
@@ -765,6 +794,10 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
     expected_keys = _expected_semantic_bank_keys(state)
     assert set(oracle_grads) == expected_keys == set(manifest["semantic_bank_keys"])
     _initialize_nonzero_banks(bundle)
+    assert (
+        _checkpoint_semantics(bundle)
+        == manifest["parameter_semantics_by_rank"][dist.get_rank()]
+    )
 
     # The real production injection creates model-owned sidecars.  They must
     # never request the legacy explicit EP all-reduce; dense dist-opt finalize
@@ -818,7 +851,7 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
         if path.is_file()
     } == checkpoint_files
     pre_load_semantics = _checkpoint_semantics(bundle)
-    for category in ("dense", "experts", "banks"):
+    for category in ("model", "dense", "experts", "banks"):
         assert set(pre_load_semantics[category]) == set(checkpoint_semantics[category])
         for name in checkpoint_semantics[category]:
             assert (
@@ -839,6 +872,12 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
     )
     post_load_semantics = _checkpoint_semantics(bundle)
     assert post_load_semantics == checkpoint_semantics
+    assert (
+        post_load_semantics == manifest["parameter_semantics_by_rank"][dist.get_rank()]
+    )
+    assert _batch_record(batch) == expected_batch
+    assert _config().to_dict() == manifest["model_config"]
+    assert _impl_contract(ep=2) == manifest["impl_config"]["ep2_verify"]
     _configure_fixed_router(bundle)
     _loss, ep2_grads = _run_production_forward_and_finalize(bundle, batch)
     assert set(ep2_grads) == expected_keys
@@ -850,7 +889,7 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
         torch.testing.assert_close(ep2_grads[name].cpu(), oracle, rtol=0, atol=0)
 
     # This actual production-forward negative control restores explicit EP
-    # sync after clearing the correct arm's gradients.  It must double EP1.
+    # sync after clearing the correct arm's gradients.  It must double EP2.
     _clear_gradients(bundle)
     original_sidecar = protocol.MoELoraSidecar
 
