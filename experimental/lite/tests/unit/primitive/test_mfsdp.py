@@ -1983,6 +1983,64 @@ def test_mfsdp_all_gather_wait_is_bucket_scoped_not_whole_stream():
     assert bucket.waited is True
 
 
+def test_mfsdp_grad_reduce_waits_for_owner_bucket_group_in_bucket_id_order():
+    config = SimpleNamespace(
+        suggested_communication_unit_size=32,
+        fsdp_double_buffer=False,
+    )
+
+    def fake_bucket(bucket_id):
+        bucket = SimpleNamespace(
+            bucket_id=bucket_id,
+            specs=[object()],
+            _grad_ready_ids=set(),
+            device=torch.device("cpu"),
+            full_numel=4,
+            config=config,
+        )
+        bucket.start_microbatch = lambda: None
+        return bucket
+
+    buckets = [fake_bucket(0), fake_bucket(1)]
+    pipeline = mfsdp_buffer.GradReducePipeline(buckets, owner_bucket_ids=[(1, 0)])
+    launched = []
+    pipeline._reduce_bucket = lambda bucket, force=False: launched.append(
+        (bucket.bucket_id, force)
+    )
+
+    buckets[1]._grad_ready_ids.add(id(buckets[1].specs[0]))
+    pipeline.reduce_gradients(buckets[1])
+    assert launched == []
+
+    buckets[0]._grad_ready_ids.add(id(buckets[0].specs[0]))
+    pipeline.reduce_gradients(buckets[0])
+    assert launched == [(0, False), (1, False)]
+
+    # Readiness from the preceding microbatch must not make a partial current
+    # group launch early while the prior reductions are still queued.
+    pipeline.start_microbatch()
+    launched.clear()
+    pipeline.reduce_gradients(buckets[0])
+    assert launched == []
+    pipeline.reduce_gradients(buckets[1])
+    assert launched == [(0, False), (1, False)]
+
+
+def test_mfsdp_begin_backward_is_once_only_until_post_backward_reset():
+    pipeline = mfsdp_buffer.CommunicationPipelines([])
+    events = []
+    pipeline.grad_reduce.start_microbatch = lambda: events.append("grad")
+    pipeline.all_gather.begin_backward = lambda: events.append("param")
+
+    assert pipeline.begin_backward() is True
+    assert pipeline.begin_backward() is False
+    assert events == ["grad", "param"]
+
+    pipeline.end_backward()
+    assert pipeline.begin_backward() is True
+    assert events == ["grad", "param", "grad", "param"]
+
+
 def test_mfsdp_next_microbatch_forward_does_not_drain_grad_reduce_queue():
     chunk, optimizer = _single_rank_mfsdp_stack()
     value = torch.randn(3, 4)

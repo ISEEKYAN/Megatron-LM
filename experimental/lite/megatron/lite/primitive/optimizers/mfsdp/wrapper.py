@@ -28,7 +28,10 @@ class _BeginBackward(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor, None]:
-        ctx.pipeline.begin_backward()
+        if ctx.pipeline.begin_backward():
+            torch.autograd.Variable._execution_engine.queue_callback(
+                ctx.pipeline.end_backward
+            )
         return grad, None
 
 

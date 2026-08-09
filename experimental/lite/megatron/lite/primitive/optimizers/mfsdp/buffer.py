@@ -1307,10 +1307,22 @@ class GradReducePipeline:
         suggested_communication_unit_size: int | None = None,
     ) -> None:
         self.buckets = buckets
+        groups = tuple(tuple(sorted(set(group))) for group in (owner_bucket_ids or ()))
+        self._bucket_groups = tuple(sorted(groups, key=lambda group: group[0])) or tuple(
+            (bucket.bucket_id,) for bucket in buckets
+        )
+        self._bucket_to_group = {
+            bucket_id: group
+            for group in self._bucket_groups
+            for bucket_id in group
+        }
         device = buckets[0].device if buckets else torch.device("cpu")
         self.comm_stream = CommunicationStream(device)
         self._pending: list[tuple[ParamBucket, int]] = []
         self._pending_elements = 0
+        self._microbatch_id = 0
+        self._bucket_ready_microbatch: dict[int, int] = {}
+        self._group_launched_microbatch: dict[int, int] = {}
         self._pending_capacity_elements = _resolve_suggested_communication_unit_size(
             buckets,
             owner_bucket_ids,
@@ -1354,7 +1366,28 @@ class GradReducePipeline:
             incoming.start_microbatch()
         self._enforce_double_buffer_limit(incoming)
 
-    def reduce_gradients(self, bucket: ParamBucket, *, force: bool = False) -> None:
+    def _ready_bucket_group(self, bucket: ParamBucket) -> tuple[int, ...] | None:
+        """Return the deterministic owner group once every bucket is ready.
+
+        MCore does not issue reduce-scatter directly from a rank-local bucket
+        completion hook.  It waits for the whole FSDP-unit bucket group and
+        launches that group in bucket-id order, otherwise conditional/unused
+        gradients can give different ranks different collective sequences.
+        """
+        group = self._bucket_to_group.get(bucket.bucket_id, (bucket.bucket_id,))
+        self._bucket_ready_microbatch[bucket.bucket_id] = self._microbatch_id
+        group_key = group[0]
+        if self._group_launched_microbatch.get(group_key) == self._microbatch_id:
+            return None
+        if any(
+            self._bucket_ready_microbatch.get(bucket_id) != self._microbatch_id
+            for bucket_id in group
+        ):
+            return None
+        self._group_launched_microbatch[group_key] = self._microbatch_id
+        return group
+
+    def _reduce_bucket(self, bucket: ParamBucket, *, force: bool = False) -> None:
         self._wait_for_previous_grad_reduce()
         tensors = bucket.prepare_grad_reduce(force=force)
         if tensors is None:
@@ -1383,6 +1416,16 @@ class GradReducePipeline:
         self._pending.append((bucket, element_count))
         self._pending_elements += element_count
 
+    def reduce_gradients(self, bucket: ParamBucket, *, force: bool = False) -> None:
+        if force:
+            group = self._bucket_to_group.get(bucket.bucket_id, (bucket.bucket_id,))
+        else:
+            group = self._ready_bucket_group(bucket)
+            if group is None:
+                return
+        for bucket_id in group:
+            self._reduce_bucket(self.buckets[bucket_id], force=force)
+
     def _wait_for_previous_grad_reduce(self) -> None:
         while (
             self._pending
@@ -1397,9 +1440,14 @@ class GradReducePipeline:
         )
 
     def finish(self) -> None:
-        for bucket in reversed(self.buckets):
-            if not bucket._microbatch_reduced:
-                self.reduce_gradients(bucket, force=True)
+        # Finish whole owner groups in a globally deterministic order.  Calling
+        # reduce_gradients(force=True) once per bucket would relaunch the same
+        # group, so issue each unfinished member directly here.
+        for group in self._bucket_groups:
+            for bucket_id in group:
+                bucket = self.buckets[bucket_id]
+                if not bucket._microbatch_reduced:
+                    self._reduce_bucket(bucket, force=True)
         self.comm_stream.wait_for_current()
         while self._pending:
             self._retire_oldest()
@@ -1408,14 +1456,20 @@ class GradReducePipeline:
         """Forget queued work after a forward exception has become primary."""
         self._pending.clear()
         self._pending_elements = 0
+        self._bucket_ready_microbatch.clear()
+        self._group_launched_microbatch.clear()
 
     def start_microbatch(self) -> None:
+        self._microbatch_id += 1
         for bucket in self.buckets:
             bucket.start_microbatch()
 
     def reset(self) -> None:
         self._pending.clear()
         self._pending_elements = 0
+        self._microbatch_id = 0
+        self._bucket_ready_microbatch.clear()
+        self._group_launched_microbatch.clear()
         for bucket in self.buckets:
             bucket.reset_grad_state()
 
@@ -1450,6 +1504,7 @@ class CommunicationPipelines:
             owner_bucket_ids,
             suggested_communication_unit_size=explicit,
         )
+        self._backward_started = False
 
     def begin_forward(self) -> None:
         self.all_gather.begin_forward()
@@ -1457,9 +1512,16 @@ class CommunicationPipelines:
     def acquire_forward(self, bucket_ids: Iterable[int]) -> None:
         self.all_gather.acquire_forward(bucket_ids)
 
-    def begin_backward(self) -> None:
+    def begin_backward(self) -> bool:
+        if self._backward_started:
+            return False
+        self._backward_started = True
         self.grad_reduce.start_microbatch()
         self.all_gather.begin_backward()
+        return True
+
+    def end_backward(self) -> None:
+        self._backward_started = False
 
     def acquire_backward(self, bucket: ParamBucket) -> None:
         self.all_gather.acquire_backward(bucket)
@@ -1549,6 +1611,7 @@ class CommunicationPipelines:
     def abort(self) -> None:
         """Best-effort two-phase exception teardown for shared communication storage."""
         self.grad_reduce.abort()
+        self._backward_started = False
 
         # Phase one drains work and drops every bucket lease.  Continue after a
         # cleanup failure: a primary forward exception takes precedence, and
