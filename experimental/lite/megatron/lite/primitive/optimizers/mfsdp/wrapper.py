@@ -7,21 +7,25 @@ from collections.abc import Callable, Iterable, Iterator
 
 import torch
 import torch.nn as nn
-from megatron.lite.primitive.optimizers.mfsdp.buffer import (
-    AllGatherPipeline, CommunicationPipelines, GradReducePipeline,
-    ParamAndGradBuffer)
-from megatron.lite.primitive.optimizers.mfsdp.config import (
-    MFSDPConfig, MFSDPProcessGroups)
 from torch.autograd.graph import saved_tensors_hooks
 from torch.utils._pytree import tree_map_only
+
+from megatron.lite.primitive.optimizers.mfsdp.buffer import (  # isort: skip
+    AllGatherPipeline,
+    CommunicationPipelines,
+    GradReducePipeline,
+    ParamAndGradBuffer,
+)
+from megatron.lite.primitive.optimizers.mfsdp.config import (  # isort: skip
+    MFSDPConfig,
+    MFSDPProcessGroups,
+)
 
 
 class _BeginBackward(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx,
-        tensor: torch.Tensor,
-        pipeline: CommunicationPipelines,
+        ctx, tensor: torch.Tensor, pipeline: CommunicationPipelines
     ) -> torch.Tensor:
         ctx.pipeline = pipeline
         return tensor
@@ -56,18 +60,15 @@ class _AcquireBackward(torch.autograd.Function):
 class _ReleaseBackward(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx,
-        tensor: torch.Tensor,
-        pipeline: CommunicationPipelines,
-        bucket_ids: tuple[int, ...],
+        ctx, tensor: torch.Tensor, pipeline: CommunicationPipelines, owner_id: int
     ) -> torch.Tensor:
         ctx.pipeline = pipeline
-        ctx.bucket_ids = bucket_ids
+        ctx.owner_id = owner_id
         return tensor
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor, None, None]:
-        ctx.pipeline.release_backward_ids(ctx.bucket_ids)
+        ctx.pipeline.release_post_backward_owner(ctx.owner_id)
         return grad, None, None
 
 
@@ -95,29 +96,26 @@ class MegatronFSDP(nn.Module):
             unit_modules=unit_modules,
         )
         _enable_fused_wgrad_accumulation(module)
-        self.param_sync = CommunicationPipelines(
-            self.param_and_grad_buffer.buckets,
-            self.param_and_grad_buffer.owners.values(),
-        )
+        self.param_sync = CommunicationPipelines(self.param_and_grad_buffer)
         self.all_gather_pipeline: AllGatherPipeline = self.param_sync.all_gather
         self.grad_reduce_pipeline: GradReducePipeline = self.param_sync.grad_reduce
         for owner_id, bucket_ids in self.param_and_grad_buffer.owners.items():
             owner = _module_by_id(module, owner_id)
             ids = tuple(bucket_ids)
 
-            def prepare_forward(_module, args, ids=ids):
-                self.param_sync.acquire_forward(ids)
+            def prepare_forward(_module, args, ids=ids, owner_id=owner_id):
+                self.param_sync.acquire_forward_owner(owner_id, ids)
                 return tree_map_only(
                     torch.Tensor,
                     lambda tensor: (
-                        _ReleaseBackward.apply(tensor, self.param_sync, ids)
+                        _ReleaseBackward.apply(tensor, self.param_sync, owner_id)
                         if tensor.requires_grad
                         else tensor
                     ),
                     args,
                 )
 
-            def finish_forward(_module, _args, output, ids=ids):
+            def finish_forward(_module, _args, output, ids=ids, owner_id=owner_id):
                 output = tree_map_only(
                     torch.Tensor,
                     lambda tensor: (
@@ -127,11 +125,20 @@ class MegatronFSDP(nn.Module):
                     ),
                     output,
                 )
-                self.param_sync.release_forward_ids(ids)
+                self.param_sync.release_forward_owner(owner_id, ids)
                 return output
+
+            def finish_backward(_module, _grad_input, _grad_output, owner_id=owner_id):
+                # Full backward hooks run after AccumulateGrad when module
+                # inputs require grad.  For a graph root with grad-disabled
+                # inputs they may run earlier; leave that owner for the queued
+                # root callback unless at least one parameter hook has staged.
+                if self.param_sync.owner_has_staged_gradients(owner_id):
+                    self.param_sync.process_post_backward(owner_id)
 
             owner.register_forward_pre_hook(prepare_forward)
             owner.register_forward_hook(finish_forward)
+            owner.register_full_backward_hook(finish_backward)
         self.param_sync.release_all()
         self.param_sync.discard_full_parameter_views()
 
@@ -146,15 +153,10 @@ class MegatronFSDP(nn.Module):
 
         try:
             with saved_tensors_hooks(
-                self.param_sync.pack_saved_tensor,
-                self.param_sync.unpack_saved_tensor,
+                self.param_sync.pack_saved_tensor, self.param_sync.unpack_saved_tensor
             ):
                 output = self.module(*args, **kwargs)
-                output = tree_map_only(
-                    torch.Tensor,
-                    attach_backward,
-                    output,
-                )
+                output = tree_map_only(torch.Tensor, attach_backward, output)
         except BaseException:
             primary_failure = True
             # A failed module forward can leave a registered double-buffer slot
@@ -192,16 +194,10 @@ class MegatronFSDP(nn.Module):
         self.param_sync.reset_grad_state()
 
     def move_model_state(
-        self,
-        device: torch.device | str,
-        *,
-        load_grad: bool = True,
+        self, device: torch.device | str, *, load_grad: bool = True
     ) -> None:
         """Move M-FSDP-owned storage while preserving optimizer parameter aliases."""
-        self.param_sync.move_model_state(
-            torch.device(device),
-            load_grad=load_grad,
-        )
+        self.param_sync.move_model_state(torch.device(device), load_grad=load_grad)
 
     def release_export_scratch(self) -> None:
         """Reclaim the training step's all-gather scratch before a colocated wake.
@@ -253,8 +249,7 @@ class MegatronFSDP(nn.Module):
                 # so an exporter that keeps a yielded tensor while advancing
                 # to another bucket retains the full snapshot it was promised.
                 yield spec.name, nn.Parameter(
-                    full_param.detach().clone(),
-                    requires_grad=full_param.requires_grad,
+                    full_param.detach().clone(), requires_grad=full_param.requires_grad
                 )
         # Parameters (and any params not owned by an M-FSDP bucket) that the
         # bucket walk did not cover -- emit them from the restored sharded view.

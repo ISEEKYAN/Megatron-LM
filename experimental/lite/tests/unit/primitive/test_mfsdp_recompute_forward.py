@@ -7,9 +7,13 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
-from megatron.lite.primitive.optimizers.mfsdp import \
-    optimizer as mfsdp_optimizer
+from megatron.lite.primitive.optimizers.mfsdp import buffer as mfsdp_buffer
 from megatron.lite.runtime.contracts.config import ParallelConfig
+from torch.utils.checkpoint import checkpoint
+
+from megatron.lite.primitive.optimizers.mfsdp import (  # isort: skip
+    optimizer as mfsdp_optimizer,
+)
 
 
 class _NormUnit(nn.Module):
@@ -55,16 +59,13 @@ def _build_chunk():
         adam_beta1=0.9,
         adam_beta2=0.999,
         adam_eps=1.0e-8,
-        override_optimizer_config={
-            "mfsdp_sharding_strategy": "optim_grads_params",
-        },
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
     )
     torch.manual_seed(0)
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [_NormModel()],
         engine_cfg=SimpleNamespace(
-            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1),
-            optimizer=opt,
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1), optimizer=opt
         ),
         ps=ps,
         is_expert=lambda _name: False,
@@ -139,9 +140,9 @@ def test_no_grad_recompute_forward_releases_retain_bucket():
     with torch.no_grad():
         chunk(value)
 
-    assert not _any_slot_busy(chunk), (
-        "grad-disabled recompute forward left a full-parameter buffer active"
-    )
+    assert not _any_slot_busy(
+        chunk
+    ), "grad-disabled recompute forward left a full-parameter buffer active"
     # The reclaim a colocated vLLM wake / full-parameter export performs.
     _release_cached_buffers(chunk)  # must not raise
 
@@ -175,4 +176,35 @@ def test_grad_enabled_forward_reshards_before_backward_like_mcore():
     loss.backward()
     optimizer.finish_grad_sync()
     # Backward drains it.
+    assert not _any_slot_busy(chunk)
+
+
+def test_activation_recompute_uses_pre_backward_lazy_release(monkeypatch):
+    chunk, optimizer = _build_chunk()
+    original_forward = chunk.module.forward
+
+    def checkpointed_forward(value):
+        hidden = checkpoint(chunk.module.unit, value, use_reentrant=False)
+        return chunk.module.out(hidden)
+
+    chunk.module.forward = checkpointed_forward
+    states = []
+    acquire_forward_owner = chunk.param_sync.acquire_forward_owner
+
+    def record_acquire(owner_id, bucket_ids):
+        result = acquire_forward_owner(owner_id, bucket_ids)
+        states.append(chunk.param_sync._training_states[owner_id])
+        return result
+
+    monkeypatch.setattr(chunk.param_sync, "acquire_forward_owner", record_acquire)
+    optimizer.zero_grad()
+    torch.nn.functional.mse_loss(chunk(torch.randn(3, 4)), torch.randn(3, 2)).backward()
+    optimizer.finish_grad_sync()
+    chunk.module.forward = original_forward
+
+    assert mfsdp_buffer.TrainingState.FORWARD in states
+    assert mfsdp_buffer.TrainingState.PRE_BACKWARD in states
+    assert set(chunk.param_sync._training_states.values()) == {
+        mfsdp_buffer.TrainingState.IDLE
+    }
     assert not _any_slot_busy(chunk)

@@ -17,14 +17,20 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from megatron.lite.primitive.optimizers.mfsdp.config import (
-    MFSDPConfig, MFSDPProcessGroups, MixedPrecisionPolicy, group_rank,
-    group_size)
+
+from megatron.lite.primitive.optimizers.mfsdp.config import (  # isort: skip
+    MFSDPConfig,
+    MFSDPProcessGroups,
+    MixedPrecisionPolicy,
+    group_rank,
+    group_size,
+)
 
 
 class NCCLUserBuffer:
@@ -144,6 +150,7 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
 
     def __init__(self, user_buffer: NCCLUserBuffer | None = None) -> None:
         super().__init__(user_buffer)
+        self._spill_allocator = TemporaryBufferAllocator(user_buffer)
         self._slots: dict[tuple[Any, ...], list[torch.Tensor | None]] = {}
         self._busy: dict[tuple[Any, ...], set[int]] = {}
         self._reuse_events: dict[tuple[Any, ...], list[Any | None]] = {}
@@ -189,6 +196,20 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
         raise RuntimeError(
             "M-FSDP double-buffer capacity exhausted; drain a completed "
             "gradient reduce before acquiring another slot."
+        )
+
+    def allocate_staging_spill(
+        self,
+        numel: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        group: dist.ProcessGroup | None,
+        key: tuple[Any, ...],
+    ) -> BufferLease:
+        """Allocate non-cached staging for a deterministically deferred group."""
+        return self._spill_allocator.allocate(
+            numel, dtype=dtype, device=device, group=group, key=key
         )
 
     def release(self, lease: BufferLease) -> None:
@@ -271,6 +292,7 @@ class ParamSpec:
     param_offset: int = 0
     shard_param: nn.Parameter | None = None
     retain_full_storage_through_backward: bool = False
+    staged_grad: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +301,12 @@ class SavedParamView:
     size: tuple[int, ...]
     stride: tuple[int, ...]
     storage_offset: int
+
+
+class TrainingState(Enum):
+    IDLE = auto()
+    FORWARD = auto()
+    PRE_BACKWARD = auto()
 
 
 class ParamBucket:
@@ -294,6 +322,9 @@ class ParamBucket:
         config: MFSDPConfig,
         allocator: TemporaryBufferAllocator,
         allocator_layout_key: tuple[Any, ...],
+        owner_id: int,
+        is_expert: bool,
+        is_fsdp_unit: bool,
     ) -> None:
         if not specs:
             raise ValueError("An M-FSDP parameter bucket cannot be empty.")
@@ -306,6 +337,9 @@ class ParamBucket:
         self.config = config
         self.allocator = allocator
         self.allocator_layout_key = allocator_layout_key
+        self.owner_id = owner_id
+        self.is_expert = is_expert
+        self.is_fsdp_unit = is_fsdp_unit
         self.retain_full_storage_through_backward = all(
             spec.retain_full_storage_through_backward for spec in specs
         )
@@ -440,13 +474,7 @@ class ParamBucket:
             # Unlike full parameters, gradient staging has no autograd-saved
             # views after its reduce-scatter completes. Pool it across bucket
             # layouts so released per-bucket slots do not become resident.
-            self._full_main_grad_lease = self.allocator.allocate(
-                self.full_numel,
-                dtype=self.policy.main_grads_dtype,
-                device=self.device,
-                group=self.process_group,
-                key=("main_grad", id(self.process_group)),
-            )
+            self._full_main_grad_lease = self._allocate_full_main_grad_lease()
             self.full_main_grad_buffer = self._full_main_grad_lease.tensor
             self.full_main_grad_buffer.zero_()
         for spec in self.specs:
@@ -459,13 +487,7 @@ class ParamBucket:
         # resolves storage pressure when main_grad is requested again.
         self._enforce_main_grad_slot_limit()
         if self._full_main_grad_lease is None:
-            self._full_main_grad_lease = self.allocator.allocate(
-                self.full_numel,
-                dtype=self.policy.main_grads_dtype,
-                device=self.device,
-                group=self.process_group,
-                key=("main_grad", id(self.process_group)),
-            )
+            self._full_main_grad_lease = self._allocate_full_main_grad_lease()
             self.full_main_grad_buffer = self._full_main_grad_lease.tensor
             self.full_main_grad_buffer.zero_()
         main_grad = self.full_main_grad_buffer.narrow(
@@ -478,6 +500,22 @@ class ParamBucket:
         """Retire an in-flight reduction before consuming a third grad slot."""
         if self.before_main_grad_allocate is not None:
             self.before_main_grad_allocate(self)
+
+    def _allocate_full_main_grad_lease(self) -> BufferLease:
+        allocation = dict(
+            dtype=self.policy.main_grads_dtype,
+            device=self.device,
+            group=self.process_group,
+            key=("main_grad", id(self.process_group)),
+        )
+        try:
+            return self.allocator.allocate(self.full_numel, **allocation)
+        except RuntimeError as error:
+            if "double-buffer capacity exhausted" not in str(error) or not isinstance(
+                self.allocator, DoubleBufferAllocator
+            ):
+                raise
+            return self.allocator.allocate_staging_spill(self.full_numel, **allocation)
 
     def _make_main_grad_getter(self, spec: ParamSpec) -> Callable[[], torch.Tensor]:
         return lambda: self.get_main_grad(spec)
@@ -591,6 +629,11 @@ class ParamBucket:
         else:
             self.local_grad_comm_buffer = self.main_grad_buffer
 
+    def _release_grad_input_buffer(self) -> None:
+        if self._grad_lease is not None:
+            self._grad_lease.release()
+            self._grad_lease = None
+
     def move_model_state(self, device: torch.device, *, load_grad: bool) -> None:
         """Move persistent sharded storage without breaking optimizer aliases."""
         device = torch.device(device)
@@ -687,6 +730,9 @@ class ParamBucket:
             self.local_grad_comm_buffer = self._local_grad_comm_lease.tensor
         with torch.no_grad():
             for spec in self.specs:
+                if spec.staged_grad is not None:
+                    spec.full_param.main_grad.copy_(spec.staged_grad)
+                    spec.staged_grad = None
                 grad = spec.full_param.grad
                 if grad is not None and not spec.full_param.grad_added_to_main_grad:
                     spec.full_param.main_grad.add_(grad)
@@ -722,19 +768,15 @@ class ParamBucket:
         if self._grad_reduce_finished:
             return
         if not self._grad_reduce_launched:
-            tensors = self.prepare_grad_reduce(force=True)
-            assert tensors is not None
-            output, grad_input = tensors
-            if self.world_size == 1:
-                output.copy_(grad_input)
-            else:
-                self._grad_reduce_work = dist.reduce_scatter_tensor(
-                    output,
-                    grad_input,
-                    op=dist.ReduceOp.SUM,
-                    group=self.process_group,
-                    async_op=True,
-                )
+            raise RuntimeError(
+                "M-FSDP gradient reduction must be launched by GradReducePipeline."
+            )
+        self._finalize_launched_grad_reduce()
+
+    def _finalize_launched_grad_reduce(self) -> None:
+        """Finish an already-issued reduction without any collective launch path."""
+        if not self._grad_reduce_launched or self._grad_reduce_finished:
+            return
         if self._grad_reduce_event is not None:
             self._grad_reduce_event.synchronize()
             self._grad_reduce_event = None
@@ -763,9 +805,7 @@ class ParamBucket:
                 # mirror that no optimizer should read.
                 spec.shard_param.main_grad = main_grad
                 spec.shard_param.grad = None
-        if self._grad_lease is not None:
-            self._grad_lease.release()
-            self._grad_lease = None
+        self._release_grad_input_buffer()
         self._release_local_grad_comm_buffer()
         self._release_full_main_grads()
         self._grad_reduce_launched = False
@@ -823,13 +863,27 @@ class ParamBucket:
         for spec in self.specs:
             spec.full_param.grad = None
             spec.full_param.grad_added_to_main_grad = False
+            spec.staged_grad = None
             if spec.shard_param is not None:
                 spec.shard_param.grad = None
         self._release_full_main_grads()
 
-    def start_microbatch(self) -> None:
+    def start_microbatch(self, *, clear_readiness: bool = True) -> None:
         self._microbatch_reduced = False
         self._grad_reduce_finished = False
+        if clear_readiness:
+            self._grad_ready_ids.clear()
+
+    def clear_transient_grad_state(self) -> None:
+        self._grad_ready_ids.clear()
+        self._grad_reduce_launched = False
+        self._grad_reduce_finished = False
+        self._microbatch_reduced = False
+        self._grad_generation = 0
+        for spec in self.specs:
+            spec.staged_grad = None
+            spec.full_param.grad = None
+            spec.full_param.grad_added_to_main_grad = False
 
     def set_grad_sync_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -860,16 +914,18 @@ class ParamBucket:
 
     def _make_grad_ready_hook(self, spec: ParamSpec) -> Callable[[nn.Parameter], None]:
         def grad_ready(param: nn.Parameter) -> None:
-            main_grad = param.get_main_grad()
             if not param.grad_added_to_main_grad:
                 with torch.no_grad():
                     if param.grad is None:
-                        main_grad.zero_()
+                        spec.staged_grad = None
                     else:
-                        # This is the data-distributed MCore path: each
-                        # microbatch owns a fresh unsharded communication
-                        # bucket, so copy rather than accumulate into it.
-                        main_grad.copy_(param.grad)
+                        # Keep ready-but-globally-deferred groups out of the
+                        # two-slot communication allocator. The central RS
+                        # authority copies this FP32 staging tensor into its
+                        # bucket only when stable global order can launch it.
+                        spec.staged_grad = param.grad.detach().to(
+                            dtype=self.policy.main_grads_dtype, copy=True
+                        )
             if param.grad is not None:
                 param.grad = None
             # MCore treats this as a one-backward notification from TE.  It
@@ -879,14 +935,6 @@ class ParamBucket:
             # microbatch, whose completion clears the old ready set. Mark the
             # current parameter only after that retirement.
             self._grad_ready_ids.add(id(spec))
-            if len(self._grad_ready_ids) != len(self.specs):
-                return
-            if self.grad_ready_callback is not None:
-                self.grad_ready_callback(self)
-            self.release_full_parameters()
-            self.discard_full_parameter_views()
-            if not self.grad_sync_enabled:
-                self._grad_ready_ids.clear()
 
         return grad_ready
 
@@ -907,8 +955,16 @@ class ParamAndGradBuffer:
         self.groups = groups
         self.config = config
         self.allocator = build_temporary_allocator(config, groups.registration_groups())
-        self.buckets, self.owners = self._build(
-            is_expert=is_expert, unit_modules=unit_modules or ()
+        (
+            self.buckets,
+            self.owners,
+            self.reduction_groups,
+            self.owner_specs,
+            self.owner_is_fsdp_unit,
+        ) = self._build(is_expert=is_expert, unit_modules=unit_modules or ())
+        self.forward_owner_buckets = self.owners
+        self.all_params_requiring_post_backward_handling = tuple(
+            spec for bucket in self.buckets for spec in bucket.specs
         )
 
     def _build(
@@ -916,7 +972,13 @@ class ParamAndGradBuffer:
         *,
         is_expert: Callable[[str], bool],
         unit_modules: Iterable[type[nn.Module] | str],
-    ) -> tuple[list[ParamBucket], dict[int, list[int]]]:
+    ) -> tuple[
+        list[ParamBucket],
+        dict[int, list[int]],
+        dict[tuple[int, bool], tuple[int, ...]],
+        dict[int, tuple[ParamSpec, ...]],
+        dict[int, bool],
+    ]:
         module_by_name = dict(self.module.named_modules())
         module_order = {
             id(value): index for index, value in enumerate(module_by_name.values())
@@ -947,12 +1009,10 @@ class ParamAndGradBuffer:
                 expert_by_param_id[id(param)] = bool(is_expert(name))
             spec.bindings.append(ParamBinding(parent, attribute))
 
-        grouped: dict[
-            tuple[int, bool, torch.dtype, torch.device], list[ParamSpec]
-        ] = defaultdict(list)
-        owner_for_key: dict[
-            tuple[int, bool, torch.dtype, torch.device], nn.Module
-        ] = {}
+        grouped: dict[tuple[int, bool, torch.dtype, torch.device], list[ParamSpec]] = (
+            defaultdict(list)
+        )
+        owner_for_key: dict[tuple[int, bool, torch.dtype, torch.device], nn.Module] = {}
         for param_id, spec in specs_by_id.items():
             owner = owner_by_param_id[param_id]
             expert = expert_by_param_id[param_id]
@@ -967,9 +1027,16 @@ class ParamAndGradBuffer:
 
         buckets: list[ParamBucket] = []
         owners: dict[int, list[int]] = defaultdict(list)
+        reduction_groups: dict[tuple[int, bool], list[int]] = defaultdict(list)
+        owner_specs: dict[int, list[ParamSpec]] = defaultdict(list)
+        owner_is_fsdp_unit: dict[int, bool] = {}
         for key in sorted(grouped, key=lambda item: item[0]):
             _owner_order, expert, _dtype, _device = key
             owner = owner_for_key[key]
+            owner_id = id(owner)
+            is_fsdp_unit = not unit_types or isinstance(owner, unit_types)
+            owner_is_fsdp_unit[owner_id] = is_fsdp_unit
+            owner_specs[owner_id].extend(grouped[key])
             partitions = _split_specs(grouped[key], self.config.bucket_size)
             owner_type = type(owner)
             owner_layout = f"{owner_type.__module__}.{owner_type.__qualname__}"
@@ -990,10 +1057,20 @@ class ParamAndGradBuffer:
                             len(partitions),
                             sum(spec.numel for spec in partition),
                         ),
+                        owner_id=owner_id,
+                        is_expert=expert,
+                        is_fsdp_unit=is_fsdp_unit,
                     )
                 )
-                owners[id(owner)].append(bucket_id)
-        return buckets, dict(owners)
+                owners[owner_id].append(bucket_id)
+                reduction_groups[(owner_id, expert)].append(bucket_id)
+        return (
+            buckets,
+            dict(owners),
+            {key: tuple(value) for key, value in reduction_groups.items()},
+            {key: tuple(value) for key, value in owner_specs.items()},
+            owner_is_fsdp_unit,
+        )
 
 
 def _split_specs(
@@ -1144,16 +1221,13 @@ class AllGatherPipeline:
         owner_bucket_ids = tuple(tuple(group) for group in (owner_bucket_ids or ()))
         self.suggested_prefetch_elements = (
             _resolve_suggested_communication_unit_size(
-                buckets,
-                owner_bucket_ids,
-                explicit=suggested_communication_unit_size,
+                buckets, owner_bucket_ids, explicit=suggested_communication_unit_size
             )
             // 2
         )
         groups = owner_bucket_ids or ((bucket.bucket_id,) for bucket in buckets)
         self._bucket_groups = sorted(
-            (tuple(sorted(set(group))) for group in groups),
-            key=lambda group: group[0],
+            (tuple(sorted(set(group))) for group in groups), key=lambda group: group[0]
         )
         self._bucket_to_group = {
             bucket_id: index
@@ -1288,8 +1362,10 @@ class AllGatherPipeline:
             self.wait_bucket_ready(bucket.bucket_id)
             bucket.install_full_parameters()
 
-    def release_all(self) -> None:
+    def release_all(self, *, preserve_non_fsdp_units: bool = False) -> None:
         for bucket in self.buckets:
+            if preserve_non_fsdp_units and not bucket.is_fsdp_unit:
+                continue
             bucket.release_full_parameters()
 
     def reset_device(self, device: torch.device) -> None:
@@ -1312,13 +1388,13 @@ class GradReducePipeline:
             for index, bucket in enumerate(buckets)
         }
         groups = tuple(tuple(sorted(set(group))) for group in (owner_bucket_ids or ()))
-        self._bucket_groups = tuple(sorted(groups, key=lambda group: group[0])) or tuple(
-            (self._bucket_ids[id(bucket)],) for bucket in buckets
+        self._bucket_groups = (
+            tuple(sorted(groups, key=lambda group: group[0], reverse=True))
+            if groups
+            else tuple((self._bucket_ids[id(bucket)],) for bucket in buckets)
         )
         self._bucket_to_group = {
-            bucket_id: group
-            for group in self._bucket_groups
-            for bucket_id in group
+            bucket_id: group for group in self._bucket_groups for bucket_id in group
         }
         device = buckets[0].device if buckets else torch.device("cpu")
         self.comm_stream = CommunicationStream(device)
@@ -1326,19 +1402,32 @@ class GradReducePipeline:
         self._pending_elements = 0
         self._microbatch_id = 0
         self._bucket_ready_microbatch: dict[int, int] = {}
-        self._group_launched_microbatch: dict[int, int] = {}
+        self._ready_group_indices: set[int] = set()
+        self._next_group_index = 0
+        self._group_index_by_bucket = {
+            bucket_id: group_index
+            for group_index, group in enumerate(self._bucket_groups)
+            for bucket_id in group
+        }
         self._pending_capacity_elements = _resolve_suggested_communication_unit_size(
-            buckets,
-            owner_bucket_ids,
-            explicit=suggested_communication_unit_size,
+            buckets, owner_bucket_ids, explicit=suggested_communication_unit_size
         )
         for bucket in buckets:
-            bucket.grad_ready_callback = self.reduce_gradients
+            bucket.grad_ready_callback = None
             bucket.before_main_grad_allocate = self._prepare_main_grad_allocate
 
     def _retire_oldest(self) -> None:
         completed, completed_elements = self._pending.pop(0)
-        completed.wait_grad_reduce()
+        completed_generation = getattr(completed, "_grad_generation", 0)
+        current_readiness = (
+            set(completed._grad_ready_ids)
+            if completed_generation < self._microbatch_id
+            else None
+        )
+        completed._finalize_launched_grad_reduce()
+        if completed_generation < self._microbatch_id:
+            completed.start_microbatch(clear_readiness=False)
+            completed._grad_ready_ids.update(current_readiness or ())
         self._pending_elements -= completed_elements
 
     def _enforce_double_buffer_limit(self, incoming: ParamBucket) -> None:
@@ -1351,7 +1440,11 @@ class GradReducePipeline:
         """
         if not incoming.config.fsdp_double_buffer:
             return
-        while len(self._pending) >= 2:
+        allocator_busy = getattr(incoming.allocator, "_busy", {})
+        while self._pending and (
+            len(self._pending) >= 2
+            or sum(len(slots) for slots in allocator_busy.values()) >= 2
+        ):
             self._retire_oldest()
 
     def _prepare_main_grad_allocate(self, incoming: ParamBucket) -> None:
@@ -1367,33 +1460,63 @@ class GradReducePipeline:
             # wait_grad_reduce() finalized the previous microbatch after this
             # microbatch's begin_backward() reset. Re-open the bucket for the
             # reduction that will be produced by the current backward.
-            incoming.start_microbatch()
+            incoming.start_microbatch(clear_readiness=False)
         self._enforce_double_buffer_limit(incoming)
 
-    def _ready_bucket_group(self, bucket: ParamBucket) -> tuple[int, ...] | None:
-        """Return the deterministic owner group once every bucket is ready.
-
-        MCore does not issue reduce-scatter directly from a rank-local bucket
-        completion hook.  It waits for the whole FSDP-unit bucket group and
-        launches that group in bucket-id order, otherwise conditional/unused
-        gradients can give different ranks different collective sequences.
-        """
+    def _mark_bucket_ready(self, bucket: ParamBucket) -> None:
         bucket_id = self._bucket_ids[id(bucket)]
         group = self._bucket_to_group.get(bucket_id, (bucket_id,))
         self._bucket_ready_microbatch[bucket_id] = self._microbatch_id
-        group_key = group[0]
-        if self._group_launched_microbatch.get(group_key) == self._microbatch_id:
-            return None
         if any(
             self._bucket_ready_microbatch.get(bucket_id) != self._microbatch_id
             for bucket_id in group
         ):
-            return None
-        self._group_launched_microbatch[group_key] = self._microbatch_id
-        return group
+            return
+        group_index = self._group_index_by_bucket[group[0]]
+        self._ready_group_indices.add(group_index)
+        self._drain_ready_groups()
+
+    def mark_group_ready(self, bucket_ids: Iterable[int]) -> None:
+        """Resolve one complete reduction group and drain global order.
+
+        A later owner may finish first on one rank.  It is retained in the
+        ready set until every earlier reduction group has resolved, so all
+        ranks issue collectives in the same stable bucket order.
+        """
+        group = tuple(sorted(set(bucket_ids)))
+        if not group:
+            return
+        expected = self._bucket_to_group.get(group[0], (group[0],))
+        if group != expected:
+            raise RuntimeError(
+                f"M-FSDP reduction group mismatch: expected={expected}, got={group}."
+            )
+        process_group = self.buckets[group[0]].process_group
+        if any(
+            self.buckets[bucket_id].process_group is not process_group
+            for bucket_id in group
+        ):
+            raise RuntimeError("M-FSDP reduction group mixes process groups.")
+        for bucket_id in group:
+            self._bucket_ready_microbatch[bucket_id] = self._microbatch_id
+        self._ready_group_indices.add(self._group_index_by_bucket[group[0]])
+        self._drain_ready_groups()
+
+    def _drain_ready_groups(self) -> None:
+        while (
+            self._next_group_index < len(self._bucket_groups)
+            and self._next_group_index in self._ready_group_indices
+        ):
+            group_index = self._next_group_index
+            group = self._bucket_groups[group_index]
+            self._ready_group_indices.remove(group_index)
+            for bucket_id in group:
+                self._reduce_bucket(self.buckets[bucket_id], force=False)
+            self._next_group_index += 1
 
     def _reduce_bucket(self, bucket: ParamBucket, *, force: bool = False) -> None:
         self._wait_for_previous_grad_reduce()
+        self._prepare_main_grad_allocate(bucket)
         tensors = bucket.prepare_grad_reduce(force=force)
         if tensors is None:
             return
@@ -1417,6 +1540,7 @@ class GradReducePipeline:
             completion_event = torch.cuda.Event()
             completion_event.record(self.comm_stream.stream)
         bucket.mark_grad_reduce_launched(work, completion_event)
+        bucket._grad_generation = self._microbatch_id
         element_count = grad_input.numel()
         self._pending.append((bucket, element_count))
         self._pending_elements += element_count
@@ -1425,17 +1549,20 @@ class GradReducePipeline:
         if force:
             bucket_id = self._bucket_ids[id(bucket)]
             group = self._bucket_to_group.get(bucket_id, (bucket_id,))
+            for member_id in group:
+                member = self.buckets[member_id]
+                ready_ids = getattr(member, "_grad_ready_ids", None)
+                if ready_ids is not None:
+                    ready_ids.update(id(spec) for spec in member.specs)
+            self.mark_group_ready(group)
         else:
-            group = self._ready_bucket_group(bucket)
-            if group is None:
+            if len(bucket._grad_ready_ids) != len(bucket.specs):
                 return
-        for bucket_id in group:
-            self._reduce_bucket(self.buckets[bucket_id], force=force)
+            self._mark_bucket_ready(bucket)
 
     def _wait_for_previous_grad_reduce(self) -> None:
         while (
-            self._pending
-            and self._pending_elements > self._pending_capacity_elements
+            self._pending and self._pending_elements > self._pending_capacity_elements
         ):
             self._retire_oldest()
 
@@ -1446,14 +1573,13 @@ class GradReducePipeline:
         )
 
     def finish(self) -> None:
-        # Finish whole owner groups in a globally deterministic order.  Calling
-        # reduce_gradients(force=True) once per bucket would relaunch the same
-        # group, so issue each unfinished member directly here.
-        for group in self._bucket_groups:
-            for bucket_id in group:
-                bucket = self.buckets[bucket_id]
-                if not bucket._microbatch_reduced:
-                    self._reduce_bucket(bucket, force=True)
+        for group_index in range(self._next_group_index, len(self._bucket_groups)):
+            self._ready_group_indices.add(group_index)
+        self._drain_ready_groups()
+        self.drain_launched()
+
+    def drain_launched(self) -> None:
+        """Finalize only work already issued by the central RS authority."""
         self.comm_stream.wait_for_current()
         while self._pending:
             self._retire_oldest()
@@ -1463,10 +1589,14 @@ class GradReducePipeline:
         self._pending.clear()
         self._pending_elements = 0
         self._bucket_ready_microbatch.clear()
-        self._group_launched_microbatch.clear()
+        self._ready_group_indices.clear()
+        self._next_group_index = 0
 
     def start_microbatch(self) -> None:
         self._microbatch_id += 1
+        self._bucket_ready_microbatch.clear()
+        self._ready_group_indices.clear()
+        self._next_group_index = 0
         for bucket in self.buckets:
             bucket.start_microbatch()
 
@@ -1475,7 +1605,8 @@ class GradReducePipeline:
         self._pending_elements = 0
         self._microbatch_id = 0
         self._bucket_ready_microbatch.clear()
-        self._group_launched_microbatch.clear()
+        self._ready_group_indices.clear()
+        self._next_group_index = 0
         for bucket in self.buckets:
             bucket.reset_grad_state()
 
@@ -1492,42 +1623,151 @@ class CommunicationPipelines:
 
     def __init__(
         self,
-        buckets: list[ParamBucket],
+        buckets: list[ParamBucket] | ParamAndGradBuffer,
         owner_bucket_ids: Iterable[Iterable[int]] | None = None,
     ) -> None:
-        self.buckets = buckets
-        owner_bucket_ids = tuple(tuple(group) for group in (owner_bucket_ids or ()))
+        metadata = buckets if isinstance(buckets, ParamAndGradBuffer) else None
+        if metadata is not None:
+            self.buckets = metadata.buckets
+            self._owner_bucket_ids = {
+                owner_id: tuple(bucket_ids)
+                for owner_id, bucket_ids in metadata.owners.items()
+            }
+            self._reduction_groups = dict(metadata.reduction_groups)
+            self._owner_specs = dict(metadata.owner_specs)
+            self._owner_is_fsdp_unit = dict(metadata.owner_is_fsdp_unit)
+        else:
+            self.buckets = buckets
+            legacy_groups = tuple(tuple(group) for group in (owner_bucket_ids or ()))
+            self._owner_bucket_ids = {
+                index: group for index, group in enumerate(legacy_groups)
+            }
+            self._reduction_groups = {
+                (index, False): group for index, group in enumerate(legacy_groups)
+            }
+            self._owner_specs = {}
+            self._owner_is_fsdp_unit = {
+                owner_id: True for owner_id in self._owner_bucket_ids
+            }
+        forward_groups = tuple(self._owner_bucket_ids.values())
+        reduction_groups = tuple(self._reduction_groups.values())
         explicit = (
-            buckets[0].config.suggested_communication_unit_size if buckets else None
+            self.buckets[0].config.suggested_communication_unit_size
+            if self.buckets
+            else None
         )
         self.all_gather = AllGatherPipeline(
-            buckets,
-            owner_bucket_ids,
-            suggested_communication_unit_size=explicit,
+            self.buckets, forward_groups, suggested_communication_unit_size=explicit
         )
         self.grad_reduce = GradReducePipeline(
-            buckets,
-            owner_bucket_ids,
-            suggested_communication_unit_size=explicit,
+            self.buckets, reduction_groups, suggested_communication_unit_size=explicit
         )
+        self._owner_reduction_groups: dict[int, tuple[tuple[int, bool], ...]] = {
+            owner_id: tuple(
+                sorted(
+                    (key for key in self._reduction_groups if key[0] == owner_id),
+                    key=lambda key: self._reduction_groups[key][0],
+                )
+            )
+            for owner_id in self._owner_bucket_ids
+        }
+        self._pending_param_ids: set[int] = set()
+        self._processed_owner_ids: set[int] = set()
+        self._training_states = {
+            owner_id: TrainingState.IDLE for owner_id in self._owner_bucket_ids
+        }
         self._backward_started = False
 
     def begin_forward(self) -> None:
+        graph_task_id = getattr(torch._C, "_current_graph_task_id", lambda: -1)()
+        if self._backward_started and graph_task_id < 0:
+            # PyTorch does not execute queued GraphTask callbacks after every
+            # backward failure.  A later forward is the first universally
+            # reachable boundary where stale work can be torn down.
+            self.abort()
         self.all_gather.begin_forward()
 
     def acquire_forward(self, bucket_ids: Iterable[int]) -> None:
         self.all_gather.acquire_forward(bucket_ids)
 
+    def acquire_forward_owner(self, owner_id: int, bucket_ids: Iterable[int]) -> None:
+        if self._training_states.get(owner_id) is not TrainingState.PRE_BACKWARD:
+            self._training_states[owner_id] = TrainingState.FORWARD
+        self.acquire_forward(bucket_ids)
+
+    def release_forward_owner(self, owner_id: int, bucket_ids: Iterable[int]) -> None:
+        if self._training_states.get(owner_id) is TrainingState.PRE_BACKWARD:
+            return
+        self.release_forward_ids(bucket_ids)
+        self._training_states[owner_id] = TrainingState.IDLE
+
     def begin_backward(self) -> bool:
         if self._backward_started:
             return False
         self._backward_started = True
+        self._pending_param_ids = {
+            id(spec) for specs in self._owner_specs.values() for spec in specs
+        }
+        self._processed_owner_ids.clear()
+        for owner_id in self._training_states:
+            self._training_states[owner_id] = TrainingState.PRE_BACKWARD
         self.grad_reduce.start_microbatch()
         self.all_gather.begin_backward()
         return True
 
+    def process_post_backward(self, owner_id: int) -> None:
+        if owner_id in self._processed_owner_ids:
+            return
+        for group_key in self._owner_reduction_groups.get(owner_id, ()):
+            bucket_ids = self._reduction_groups[group_key]
+            for bucket_id in bucket_ids:
+                bucket = self.buckets[bucket_id]
+                for spec in bucket.specs:
+                    bucket._grad_ready_ids.add(id(spec))
+                    self._pending_param_ids.discard(id(spec))
+            self.grad_reduce.mark_group_ready(bucket_ids)
+        self._processed_owner_ids.add(owner_id)
+        self.release_backward_ids(self._owner_bucket_ids.get(owner_id, ()))
+        self._training_states[owner_id] = TrainingState.IDLE
+
+    def owner_has_staged_gradients(self, owner_id: int) -> bool:
+        return any(
+            self.buckets[bucket_id]._grad_ready_ids
+            for bucket_id in self._owner_bucket_ids.get(owner_id, ())
+        )
+
+    def release_post_backward_owner(self, owner_id: int) -> None:
+        """Release unit parameters after its backward kernels have consumed them.
+
+        Parameter AccumulateGrad hooks are sibling graph tasks and are not
+        guaranteed to run before the input-side release marker.  Gradient
+        processing therefore remains in the queued root callback, after every
+        AccumulateGrad hook has staged its value.
+        """
+        if self._owner_is_fsdp_unit.get(owner_id, True):
+            self.release_backward_ids(self._owner_bucket_ids.get(owner_id, ()))
+
     def end_backward(self) -> None:
+        ordered_owners: list[int] = []
+        for group in self.grad_reduce._bucket_groups:
+            owner_id = self.buckets[group[0]].owner_id
+            if owner_id not in ordered_owners:
+                ordered_owners.append(owner_id)
+        ordered_owners.extend(
+            owner_id
+            for owner_id in self._owner_bucket_ids
+            if owner_id not in ordered_owners
+        )
+        for owner_id in ordered_owners:
+            self.process_post_backward(owner_id)
+        if self._pending_param_ids:
+            raise RuntimeError(
+                "M-FSDP root post-backward left parameters pending: "
+                f"{len(self._pending_param_ids)}"
+            )
         self._backward_started = False
+        for owner_id in self._training_states:
+            self._training_states[owner_id] = TrainingState.IDLE
 
     def acquire_backward(self, bucket: ParamBucket) -> None:
         self.all_gather.acquire_backward(bucket)
@@ -1549,6 +1789,8 @@ class CommunicationPipelines:
 
     def end_forward(self) -> None:
         for bucket in self.buckets:
+            if self._training_states.get(bucket.owner_id) is TrainingState.PRE_BACKWARD:
+                continue
             bucket.release_full_parameters()
             bucket.discard_full_parameter_views()
 
@@ -1589,6 +1831,7 @@ class CommunicationPipelines:
 
     def move_model_state(self, device: torch.device, *, load_grad: bool) -> None:
         device = torch.device(device)
+        self._quiesce_transient_state()
         for bucket in self.buckets:
             bucket.move_model_state(device, load_grad=load_grad)
         self.all_gather.reset_device(device)
@@ -1603,6 +1846,7 @@ class CommunicationPipelines:
         their optimizer aliases in place as the export gather source. See
         ``ParamBucket.release_scratch_keep_weights``.
         """
+        self._quiesce_transient_state()
         for bucket in self.buckets:
             bucket.release_scratch_keep_weights()
 
@@ -1618,6 +1862,10 @@ class CommunicationPipelines:
         """Best-effort two-phase exception teardown for shared communication storage."""
         self.grad_reduce.abort()
         self._backward_started = False
+        self._pending_param_ids.clear()
+        self._processed_owner_ids.clear()
+        for owner_id in self._training_states:
+            self._training_states[owner_id] = TrainingState.IDLE
 
         # Phase one drains work and drops every bucket lease.  Continue after a
         # cleanup failure: a primary forward exception takes precedence, and
@@ -1628,8 +1876,9 @@ class CommunicationPipelines:
                 bucket.wait_for_inflight_grad_reduce()
             except BaseException:
                 pass
-            bucket._grad_reduce_launched = False
+            bucket.clear_transient_grad_state()
             for release in (
+                bucket._release_grad_input_buffer,
                 bucket._release_local_grad_comm_buffer,
                 bucket._release_full_main_grads,
                 bucket.release_full_parameters,
@@ -1652,6 +1901,30 @@ class CommunicationPipelines:
                 allocator.release_cached(force=True)
             except BaseException:
                 pass
+
+    def _quiesce_transient_state(self) -> None:
+        """Drain issued work and close every transient lifecycle lease."""
+        self.grad_reduce.drain_launched()
+        self.all_gather.release_all()
+        self.discard_full_parameter_views()
+        for bucket in self.buckets:
+            bucket._release_grad_input_buffer()
+            bucket._release_local_grad_comm_buffer()
+            bucket._release_full_main_grads()
+            bucket.clear_transient_grad_state()
+        seen_allocators: set[int] = set()
+        for bucket in self.buckets:
+            allocator = bucket.allocator
+            if id(allocator) in seen_allocators:
+                continue
+            seen_allocators.add(id(allocator))
+            allocator.release_cached()
+        self.grad_reduce.abort()
+        self._backward_started = False
+        self._pending_param_ids.clear()
+        self._processed_owner_ids.clear()
+        for owner_id in self._training_states:
+            self._training_states[owner_id] = TrainingState.IDLE
 
     def reset_grad_state(self) -> None:
         self.grad_reduce.reset()
@@ -1691,4 +1964,5 @@ __all__ = [
     "ParamSpec",
     "SavedParamView",
     "TemporaryBufferAllocator",
+    "TrainingState",
 ]

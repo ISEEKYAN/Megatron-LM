@@ -16,11 +16,14 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from megatron.lite.primitive.optimizers.mfsdp import buffer as mfsdp_buffer
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
-from megatron.lite.primitive.optimizers.mfsdp import \
-    cpu_offload as mfsdp_cpu_offload
-from megatron.lite.primitive.optimizers.mfsdp import \
-    optimizer as mfsdp_optimizer
 from megatron.lite.runtime.contracts.config import ParallelConfig
+
+from megatron.lite.primitive.optimizers.mfsdp import (  # isort: skip
+    cpu_offload as mfsdp_cpu_offload,
+)
+from megatron.lite.primitive.optimizers.mfsdp import (  # isort: skip
+    optimizer as mfsdp_optimizer,
+)
 
 
 class _GlooUnit(torch.nn.Module):
@@ -52,6 +55,78 @@ class _DirectParamModel(torch.nn.Module):
     def forward(self, value):
         hidden = self.unit(value)
         return torch.nn.functional.linear(hidden, self.projection.weight)
+
+
+class _TwoOwnerModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.unit0 = _GlooUnit(4, 4)
+        self.unit1 = _GlooUnit(4, 4)
+
+    def forward(self, value):
+        return self.unit1(self.unit0(value))
+
+
+class _FourOwnerModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.units = torch.nn.ModuleList([_GlooUnit(4, 4) for _ in range(4)])
+
+    def forward(self, value):
+        for unit in self.units:
+            value = unit(value)
+        return value
+
+
+class _MixedExpertUnit(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dense = torch.nn.Parameter(torch.ones(4))
+        self.experts = torch.nn.Parameter(torch.ones(4))
+
+    def forward(self, value):
+        return value * self.dense + value * self.experts
+
+
+class _UnusedUnit(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.used = torch.nn.Linear(4, 4, bias=False)
+        self.unused = torch.nn.Linear(4, 4, bias=False)
+
+    def forward(self, value):
+        return self.used(value)
+
+
+class _FailBackward(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value):
+        return value
+
+    @staticmethod
+    def backward(ctx, grad):
+        raise RuntimeError("intentional backward failure")
+
+
+class _FailUnit(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(4, 4, bias=False)
+        self.fail = True
+
+    def forward(self, value):
+        value = self.linear(value)
+        return _FailBackward.apply(value) if self.fail else value
+
+
+class _MultiOutputUnit(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(4, 4, bias=False)
+
+    def forward(self, value):
+        hidden = self.linear(value)
+        return hidden, hidden.square()
 
 
 class _FusedMainGradLinearFunction(torch.autograd.Function):
@@ -121,6 +196,37 @@ def _optimizer_named_shards(optimizer) -> dict[str, torch.nn.Parameter]:
                 assert spec.shard_param is not None
                 result[spec.name] = spec.shard_param
     return result
+
+
+def _build_cpu_mfsdp(model, *, unit_modules):
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        etp_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="sgd",
+        lr=0.0,
+        weight_decay=0.0,
+        clip_grad=0.0,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1), optimizer=opt
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=unit_modules,
+    )
+    return chunks[0], optimizer
 
 
 def test_mfsdp_zero_grad_supports_fused_optimizer_contract():
@@ -220,9 +326,9 @@ def test_mfsdp_full_parallel_signoff_is_single_node_50_step_curve():
 def test_mfsdp_is_standalone_without_vendored_mcore_or_fsdp2_dependencies():
     package = Path(mfsdp_config.__file__).parent
 
-    assert not list((package / "impl").glob("*.py")), (
-        "Do not vendor the MCore FSDP implementation."
-    )
+    assert not list(
+        (package / "impl").glob("*.py")
+    ), "Do not vendor the MCore FSDP implementation."
     violations = []
     for source_path in package.rglob("*.py"):
         tree = ast.parse(source_path.read_text(), filename=str(source_path))
@@ -873,9 +979,9 @@ def test_mfsdp_offload_fraction_keeps_optimizer_state_on_cpu():
 
     inner = optimizer._inner_optimizer
     cpu_group = inner.cpu_group
-    assert cpu_group is not None, (
-        "Expected cpu_group to be set for offload_fraction=1.0"
-    )
+    assert (
+        cpu_group is not None
+    ), "Expected cpu_group to be set for offload_fraction=1.0"
     assert len(cpu_group._cpu_optimizer.optimizers) == len(cpu_group._cpu_params)
     for cpu_p in cpu_group._cpu_params:
         assert cpu_p.device.type == "cpu", "cpu_param should be on CPU"
@@ -1015,9 +1121,9 @@ def test_mfsdp_offload_fraction_numerically_matches_no_offload():
     }
     assert ref_params.keys() == cpu_params.keys()
     for name in ref_params:
-        assert torch.equal(ref_params[name], cpu_params[name]), (
-            f"Parameter {name} diverges between GPU-only and CPU-offload runs"
-        )
+        assert torch.equal(
+            ref_params[name], cpu_params[name]
+        ), f"Parameter {name} diverges between GPU-only and CPU-offload runs"
 
 
 def test_mfsdp_offload_fraction_partial_splits_by_numel():
@@ -1044,9 +1150,9 @@ def test_mfsdp_offload_fraction_partial_splits_by_numel():
     ratio = cpu_numel / total_numel
     # The greedy split assigns whole params; exact ratio depends on model shape.
     # For fraction=0.5 with 3 params of unequal size the ratio will be ≥0.4.
-    assert ratio >= 0.4, (
-        f"Expected substantial CPU offload at fraction=0.5, got {ratio:.2%}"
-    )
+    assert (
+        ratio >= 0.4
+    ), f"Expected substantial CPU offload at fraction=0.5, got {ratio:.2%}"
     assert ratio <= 0.95, f"Expected some GPU params at fraction=0.5, got {ratio:.2%}"
 
 
@@ -1601,6 +1707,8 @@ def test_mfsdp_sharded_grad_hook_overwrites_each_microbatch_staging_buffer():
 
     bucket._make_grad_ready_hook(spec)(spec.full_param)
 
+    assert torch.equal(spec.staged_grad, expected)
+    bucket.prepare_grad_reduce(force=True)
     assert torch.equal(spec.full_param.main_grad, expected)
     assert spec.full_param.grad_added_to_main_grad is False
 
@@ -1760,10 +1868,7 @@ def test_mfsdp_double_buffer_enforces_two_inflight_bucket_slots_for_nccl_ub():
     second._grad_reduce_launched = True
     first._grad_reduce_finished = False
     second._grad_reduce_finished = False
-    pipeline._pending = [
-        (first, first.full_numel),
-        (second, second.full_numel),
-    ]
+    pipeline._pending = [(first, first.full_numel), (second, second.full_numel)]
     pipeline._pending_elements = sum(
         element_count for _bucket, element_count in pipeline._pending
     )
@@ -1869,6 +1974,46 @@ def test_mfsdp_abort_waits_inflight_work_before_shared_allocator_clear(monkeypat
     assert getattr(allocator, "_busy", {}) == {}
 
 
+def test_mfsdp_abort_releases_grad_dtype_conversion_lease():
+    model = torch.nn.Linear(4, 3, bias=False, dtype=torch.bfloat16)
+    buffers = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=mfsdp_buffer.MFSDPProcessGroups(
+            dense_dp=None,
+            expert_dp=None,
+            dense_ag=None,
+            expert_ag=None,
+            tp=None,
+            etp=None,
+            ep=None,
+            pp=None,
+        ),
+        config=mfsdp_config.MFSDPConfig(
+            bucket_size=None,
+            main_grads_dtype=torch.float32,
+            grad_comm_dtype=torch.bfloat16,
+            fsdp_double_buffer=True,
+        ),
+        is_expert=lambda _name: False,
+        unit_modules=(),
+    )
+    pipelines = mfsdp_buffer.CommunicationPipelines(buffers)
+    bucket = buffers.buckets[0]
+    spec = bucket.specs[0]
+    pipelines.begin_backward()
+    spec.full_param.grad = torch.ones_like(spec.full_param)
+    bucket._make_grad_ready_hook(spec)(spec.full_param)
+    pipelines.process_post_backward(bucket.owner_id)
+    assert bucket._grad_lease is not None
+
+    pipelines.abort()
+
+    assert bucket._grad_lease is None
+    assert bucket._grad_ready_ids == set()
+    assert pipelines.grad_reduce.has_microbatch_work() is False
+    assert getattr(buffers.allocator, "_busy", {}) == {}
+
+
 def test_mfsdp_grad_reduce_waits_at_launch_using_mcore_element_capacity():
     class PendingBucket:
         def __init__(self, full_numel: int):
@@ -1876,8 +2021,7 @@ def test_mfsdp_grad_reduce_waits_at_launch_using_mcore_element_capacity():
             self.full_numel = full_numel
             self.policy = SimpleNamespace(grad_comm_dtype=torch.float32)
             self.config = SimpleNamespace(
-                fsdp_double_buffer=False,
-                suggested_communication_unit_size=32,
+                fsdp_double_buffer=False, suggested_communication_unit_size=32
             )
             self.world_size = 1
             self.process_group = None
@@ -1893,7 +2037,7 @@ def test_mfsdp_grad_reduce_waits_at_launch_using_mcore_element_capacity():
             self.work = work
             self.completion_event = completion_event
 
-        def wait_grad_reduce(self):
+        def _finalize_launched_grad_reduce(self):
             self.waited = True
 
     first = PendingBucket(8)
@@ -1985,8 +2129,7 @@ def test_mfsdp_all_gather_wait_is_bucket_scoped_not_whole_stream():
 
 def test_mfsdp_grad_reduce_waits_for_owner_bucket_group_in_bucket_id_order():
     config = SimpleNamespace(
-        suggested_communication_unit_size=32,
-        fsdp_double_buffer=False,
+        suggested_communication_unit_size=32, fsdp_double_buffer=False
     )
 
     def fake_bucket(bucket_id):
@@ -2039,6 +2182,220 @@ def test_mfsdp_begin_backward_is_once_only_until_post_backward_reset():
     pipeline.end_backward()
     assert pipeline.begin_backward() is True
     assert events == ["grad", "param", "grad", "param"]
+
+
+def test_mfsdp_grad_hook_only_stages_and_never_launches_collectives():
+    model = torch.nn.Linear(4, 3, bias=False)
+    buffers = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=mfsdp_buffer.MFSDPProcessGroups(
+            dense_dp=None,
+            expert_dp=None,
+            dense_ag=None,
+            expert_ag=None,
+            tp=None,
+            etp=None,
+            ep=None,
+            pp=None,
+        ),
+        config=mfsdp_config.MFSDPConfig(bucket_size=None),
+        is_expert=lambda _name: False,
+        unit_modules=(),
+    )
+    bucket = buffers.buckets[0]
+    spec = bucket.specs[0]
+    spec.full_param.grad = torch.ones_like(spec.full_param)
+    bucket.grad_ready_callback = lambda _bucket: (_ for _ in ()).throw(
+        AssertionError("per-parameter hook reached the RS scheduler")
+    )
+
+    bucket._make_grad_ready_hook(spec)(spec.full_param)
+
+    assert bucket._grad_ready_ids == {id(spec)}
+    assert torch.equal(spec.staged_grad, torch.ones_like(spec.full_param))
+
+
+def test_mfsdp_dense_and_expert_buckets_use_distinct_reduction_groups():
+    model = _MixedExpertUnit()
+    buffers = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=mfsdp_buffer.MFSDPProcessGroups(
+            dense_dp=None,
+            expert_dp=object(),
+            dense_ag=None,
+            expert_ag=object(),
+            tp=None,
+            etp=None,
+            ep=None,
+            pp=None,
+        ),
+        config=mfsdp_config.MFSDPConfig(bucket_size=None),
+        is_expert=lambda name: "experts" in name,
+        unit_modules=(_MixedExpertUnit,),
+    )
+
+    owner_id = id(model)
+    assert set(buffers.reduction_groups) == {(owner_id, False), (owner_id, True)}
+    dense_ids = buffers.reduction_groups[(owner_id, False)]
+    expert_ids = buffers.reduction_groups[(owner_id, True)]
+    assert dense_ids != expert_ids
+    assert all(buffers.buckets[index].process_group is None for index in dense_ids)
+    assert all(buffers.buckets[index].process_group is not None for index in expert_ids)
+
+
+def test_mfsdp_unit_post_backward_defers_later_groups_until_order_is_stable():
+    model = _TwoOwnerModel()
+    buffers = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=mfsdp_buffer.MFSDPProcessGroups(
+            dense_dp=None,
+            expert_dp=None,
+            dense_ag=None,
+            expert_ag=None,
+            tp=None,
+            etp=None,
+            ep=None,
+            pp=None,
+        ),
+        config=mfsdp_config.MFSDPConfig(bucket_size=None),
+        is_expert=lambda _name: False,
+        unit_modules=(_GlooUnit,),
+    )
+    pipeline = mfsdp_buffer.CommunicationPipelines(buffers)
+    launched = []
+    pipeline.grad_reduce._reduce_bucket = lambda bucket, force=False: launched.append(
+        bucket.bucket_id
+    )
+    owner0 = id(model.unit0)
+    owner1 = id(model.unit1)
+
+    assert pipeline.begin_backward() is True
+    pipeline.process_post_backward(owner0)
+    assert launched == []
+
+    pipeline.process_post_backward(owner1)
+    assert launched == sorted(launched, reverse=True)
+    assert launched == [bucket.bucket_id for bucket in reversed(buffers.buckets)]
+    pipeline.end_backward()
+    assert pipeline._pending_param_ids == set()
+
+
+def test_mfsdp_deferred_groups_do_not_exhaust_double_buffer_slots():
+    model = _FourOwnerModel()
+    buffers = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=mfsdp_buffer.MFSDPProcessGroups(
+            dense_dp=None,
+            expert_dp=None,
+            dense_ag=None,
+            expert_ag=None,
+            tp=None,
+            etp=None,
+            ep=None,
+            pp=None,
+        ),
+        config=mfsdp_config.MFSDPConfig(bucket_size=None, fsdp_double_buffer=True),
+        is_expert=lambda _name: False,
+        unit_modules=(_GlooUnit,),
+    )
+    pipeline = mfsdp_buffer.CommunicationPipelines(buffers)
+    owners = [id(unit) for unit in model.units]
+    pipeline.begin_backward()
+
+    # Model rank-local use where the highest-order owner is unused. Lower
+    # groups become ready first but must not consume the two communication
+    # slots while deterministic order waits for root resolution.
+    for owner_id in owners[:3]:
+        spec = buffers.owner_specs[owner_id][0]
+        bucket = next(
+            bucket
+            for bucket in buffers.buckets
+            if any(member is spec for member in bucket.specs)
+        )
+        spec.full_param.get_main_grad().fill_(1.0)
+        spec.full_param.grad_added_to_main_grad = True
+        spec.full_param.grad = torch.zeros_like(spec.full_param)
+        bucket._make_grad_ready_hook(spec)(spec.full_param)
+        pipeline.process_post_backward(owner_id)
+    assert any(
+        bucket._full_main_grad_lease is not None
+        and bucket._full_main_grad_lease.slot is None
+        for bucket in buffers.buckets
+    )
+
+    pipeline.process_post_backward(owners[3])
+    pipeline.grad_reduce.finish()
+    assert all(bucket._full_main_grad_lease is None for bucket in buffers.buckets)
+
+
+def test_mfsdp_root_post_backward_zeros_unused_params_and_exhausts_pending():
+    chunk, optimizer = _build_cpu_mfsdp(_UnusedUnit(), unit_modules=(_UnusedUnit,))
+    optimizer.zero_grad()
+
+    chunk(torch.randn(2, 4)).sum().backward()
+    optimizer.finish_grad_sync()
+
+    shards = _optimizer_named_shards(optimizer)
+    assert torch.count_nonzero(shards["used.weight"].grad) > 0
+    assert torch.count_nonzero(shards["unused.weight"].grad) == 0
+    assert chunk.param_sync._pending_param_ids == set()
+    assert chunk.param_sync._backward_started is False
+
+
+def test_mfsdp_backward_exception_is_torn_down_by_next_forward():
+    chunk, optimizer = _build_cpu_mfsdp(_FailUnit(), unit_modules=(_FailUnit,))
+    optimizer.zero_grad()
+
+    with pytest.raises(RuntimeError, match="intentional backward failure"):
+        chunk(torch.randn(2, 4)).sum().backward()
+    assert chunk.param_sync._backward_started is True
+
+    chunk.module.fail = False
+    chunk(torch.randn(2, 4)).sum().backward()
+    optimizer.finish_grad_sync()
+
+    assert chunk.param_sync._backward_started is False
+    assert chunk.param_sync._pending_param_ids == set()
+    assert chunk.grad_reduce_pipeline._pending == []
+    assert all(
+        bucket._full_main_grad_lease is None for bucket in chunk.param_sync.buckets
+    )
+
+
+def test_mfsdp_release_scratch_drains_pending_lifecycle():
+    chunk, optimizer = _build_cpu_mfsdp(_TwoOwnerModel(), unit_modules=(_GlooUnit,))
+    optimizer.zero_grad()
+    chunk(torch.randn(2, 4)).sum().backward()
+    assert chunk.grad_reduce_pipeline._pending
+
+    chunk.release_export_scratch()
+
+    assert chunk.grad_reduce_pipeline._pending == []
+    assert chunk.param_sync._pending_param_ids == set()
+    assert chunk.param_sync._backward_started is False
+    assert all(
+        bucket._full_main_grad_lease is None
+        and bucket._full_lease is None
+        and bucket._grad_reduce_work is None
+        and bucket._param_gather_work is None
+        for bucket in chunk.param_sync.buckets
+    )
+
+
+def test_mfsdp_multi_output_graph_runs_one_root_lifecycle():
+    chunk, optimizer = _build_cpu_mfsdp(
+        _MultiOutputUnit(), unit_modules=(_MultiOutputUnit,)
+    )
+    optimizer.zero_grad()
+
+    first, second = chunk(torch.randn(2, 4))
+    (first.sum() + second.sum()).backward()
+    optimizer.finish_grad_sync()
+
+    assert chunk.grad_reduce_pipeline._microbatch_id == 1
+    assert chunk.param_sync._backward_started is False
+    assert chunk.param_sync._pending_param_ids == set()
+    assert chunk.param_sync._processed_owner_ids == {id(chunk.module)}
 
 
 def test_mfsdp_next_microbatch_forward_does_not_drain_grad_reduce_queue():
