@@ -1264,11 +1264,6 @@ def test_mfsdp_qwen35_eval_to_train_first_step_is_finite():
     hf_path = os.environ.get("MLITE_QWEN35_HF_PATH")
     if not hf_path:
         pytest.skip("set MLITE_QWEN35_HF_PATH for the real Qwen3.5 lifecycle gate")
-    # The cluster environment activates a Conda cross-compiler that cannot
-    # link Triton's CUDA launcher.  Select the host compiler before the first
-    # compiled model op, matching the benchmark launch scripts.
-    os.environ["CC"] = os.environ.get("MLITE_SMOKE_CC", "/usr/bin/gcc")
-    os.environ["CXX"] = os.environ.get("MLITE_SMOKE_CXX", "/usr/bin/g++")
 
     from examples.bench.bench import BenchCliConfig
     from examples.bench.correctness import run_backend

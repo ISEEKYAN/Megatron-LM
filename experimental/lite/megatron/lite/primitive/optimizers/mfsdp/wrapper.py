@@ -215,10 +215,6 @@ class MegatronFSDP(nn.Module):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def release_eval_scratch(self) -> None:
-        """Reset transient communication state at an eval-to-train boundary."""
-        self.param_sync.release_scratch_keep_weights()
-
     def stream_full_parameters(self) -> Iterator[tuple[str, nn.Parameter]]:
         """Yield ``(name, full_param)`` one bucket at a time for export.
 

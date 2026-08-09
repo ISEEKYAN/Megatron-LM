@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# isort: skip_file
 """MegatronLiteRuntime — Megatron Lite's default training backend."""
 
 from __future__ import annotations
@@ -674,22 +673,7 @@ class _EvalModeCtx:
         return self
 
     def __exit__(self, *exc):
-        cleanup_error = None
-        try:
-            for chunk in self._handle._extras.get(
-                "model_chunks", [self._handle._model]
-            ):
-                release = getattr(chunk, "release_eval_scratch", None)
-                if callable(release):
-                    try:
-                        release()
-                    except BaseException as error:
-                        if exc[0] is None and cleanup_error is None:
-                            cleanup_error = error
-        finally:
-            torch.set_grad_enabled(self._prev_grad)
-        if cleanup_error is not None:
-            raise cleanup_error
+        torch.set_grad_enabled(self._prev_grad)
         return False
 
 
