@@ -437,15 +437,15 @@ def test_workspace_lazily_owns_one_cuda_mem_pool_per_slot(
     assert workspace.evidence()["allocation_pool_count"] == 2
 
     lease0 = workspace.acquire(0)
-    with lease0.deepep_allocation():
+    with lease0.deepep_recv_allocation():
         pass
-    with lease0.deepep_allocation():
+    with lease0.deepep_recv_allocation():
         pass
     assert entered == [(created[0], torch.device("cuda", 3))] * 2
     lease0.release(_FakeEvent(ready=True))
 
     lease1 = workspace.acquire(1)
-    with lease1.deepep_allocation():
+    with lease1.deepep_recv_allocation():
         pass
     assert len(created) == 2
     lease1.release(_FakeEvent(ready=True))
@@ -572,6 +572,7 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
         "deepep_buffer_count": 0,
         "deepep_buffer_resident_bytes": 0,
         "allocation_pool_count": 0,
+        "allocation_pool_scope": "deepep_dispatch_recv",
         "materialized_device": None,
         "caller_owned_recv_proven": False,
         "materialized": False,

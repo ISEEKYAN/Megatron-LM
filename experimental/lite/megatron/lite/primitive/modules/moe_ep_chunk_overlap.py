@@ -139,11 +139,11 @@ class EPChunkWorkspaceLease:
         )
 
     @contextmanager
-    def deepep_allocation(self):
-        """Route DeepEP's internal torch allocations through this slot's pool."""
+    def deepep_recv_allocation(self):
+        """Route DeepEP dispatch recv allocations through this slot's pool."""
         if not self._active:
             raise RuntimeError("EP chunk workspace lease has already been released")
-        with self.workspace._deepep_allocation(self.slot):
+        with self.workspace._deepep_recv_allocation(self.slot):
             yield
 
     def release(self, consumer_event: Any) -> None:
@@ -288,7 +288,7 @@ class EPChunkWorkspace:
         self.close(stream=stream)
 
     @contextmanager
-    def _deepep_allocation(self, slot: int):
+    def _deepep_recv_allocation(self, slot: int):
         self._validate_slot(slot)
         if self.key.device_type != "cuda":
             yield
@@ -423,6 +423,7 @@ class EPChunkWorkspace:
             "allocation_pool_count": sum(
                 slot.allocation_pool is not None for slot in self._slots
             ),
+            "allocation_pool_scope": "deepep_dispatch_recv",
             "materialized_device": (
                 None if self._bound_device is None else str(self._bound_device)
             ),
@@ -835,7 +836,7 @@ class _EPChunkOperationBase:
                 comm_stream.wait_event(input_ready)
                 scores, indices = self._route(x_chunk, start, end)
                 with _ep_chunk_nvtx("forward.dispatch", chunk_idx):
-                    with lease.deepep_allocation():
+                    with lease.deepep_recv_allocation():
                         state = dispatcher.submit_deepep_dispatch(
                             x_chunk,
                             scores,
@@ -890,13 +891,12 @@ class _EPChunkOperationBase:
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(ready)
                 with _ep_chunk_nvtx("forward.combine", chunk_idx):
-                    with lease.deepep_allocation():
-                        combine_state = dispatcher.submit_deepep_combine_prepared(
-                            rank_grouped,
-                            handle,
-                            allocate_on_comm_stream=True,
-                            async_finish=True,
-                        )
+                    combine_state = dispatcher.submit_deepep_combine_prepared(
+                        rank_grouped,
+                        handle,
+                        allocate_on_comm_stream=True,
+                        async_finish=True,
+                    )
             return chunk_idx, dispatcher, combine_state, lease
 
         output_2d = x_2d.new_empty(x_2d.shape)
@@ -960,7 +960,7 @@ class _EPChunkOperationBase:
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(router_ready)
                 with _ep_chunk_nvtx("forward.dispatch", chunk_idx):
-                    with lease.deepep_allocation():
+                    with lease.deepep_recv_allocation():
                         state = dispatcher.submit_deepep_dispatch(
                             x_chunk,
                             scores,
@@ -1060,13 +1060,12 @@ class _EPChunkOperationBase:
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(ready)
                 with _ep_chunk_nvtx("forward.combine", chunk_idx):
-                    with lease.deepep_allocation():
-                        combine_state = dispatcher.submit_deepep_combine_prepared(
-                            rank_grouped,
-                            handle,
-                            allocate_on_comm_stream=True,
-                            async_finish=True,
-                        )
+                    combine_state = dispatcher.submit_deepep_combine_prepared(
+                        rank_grouped,
+                        handle,
+                        allocate_on_comm_stream=True,
+                        async_finish=True,
+                    )
             return chunk_idx, dispatcher, combine_state, lease
 
         output_2d = x_2d.new_empty(x_2d.shape)
@@ -1167,7 +1166,7 @@ class _EPChunkOperationBase:
                 comm_stream.wait_event(router_ready)
                 chain_deepep_event()
                 with _ep_chunk_nvtx("backward.dispatch", chunk_idx):
-                    with lease.deepep_allocation():
+                    with lease.deepep_recv_allocation():
                         state = remember_deepep_event(
                             dispatcher.submit_deepep_dispatch(
                                 x_chunk,
@@ -1185,20 +1184,18 @@ class _EPChunkOperationBase:
             end: int,
             dispatcher: TokenDispatcher,
             handle: Any,
-            workspace_lease: EPChunkWorkspaceLease,
         ):
             with torch.cuda.stream(comm_stream):
                 grad_chunk = grad_2d[start:end].contiguous()
                 chain_deepep_event()
                 with _ep_chunk_nvtx("backward.combine", chunk_idx):
-                    with workspace_lease.deepep_allocation():
-                        return remember_deepep_event(
-                            dispatcher.submit_deepep_combine_backward(
-                                grad_chunk,
-                                handle,
-                                allocate_on_comm_stream=True,
-                            )
+                    return remember_deepep_event(
+                        dispatcher.submit_deepep_combine_backward(
+                            grad_chunk,
+                            handle,
+                            allocate_on_comm_stream=True,
                         )
+                    )
 
         def finish_recompute_expert(
             chunk_idx: int,
@@ -1264,7 +1261,6 @@ class _EPChunkOperationBase:
                     end,
                     dispatcher,
                     state["handle"],
-                    workspace_lease,
                 )
                 (
                     dispatched,
@@ -1388,15 +1384,14 @@ class _EPChunkOperationBase:
                     comm_stream.wait_event(local_bwd_ready)
                     chain_deepep_event()
                     with _ep_chunk_nvtx("backward.dispatch", chunk.idx):
-                        with chunk.workspace_lease.deepep_allocation():
-                            local_state["dispatch_bwd_state"] = remember_deepep_event(
-                                dispatcher.submit_deepep_dispatch_backward(
-                                    local_state["grad_recv_hidden"],
-                                    local_state["grad_recv_probs"],
-                                    chunk.handle,
-                                    allocate_on_comm_stream=True,
-                                )
+                        local_state["dispatch_bwd_state"] = remember_deepep_event(
+                            dispatcher.submit_deepep_dispatch_backward(
+                                local_state["grad_recv_hidden"],
+                                local_state["grad_recv_probs"],
+                                chunk.handle,
+                                allocate_on_comm_stream=True,
                             )
+                        )
                     local_state.pop("grad_recv_hidden", None)
                     local_state.pop("grad_recv_probs", None)
 
@@ -1520,14 +1515,13 @@ class _EPChunkOperationBase:
                 if last_deepep_event is not None:
                     _event_current_stream_wait(last_deepep_event)
                 with _ep_chunk_nvtx("backward.combine", chunk.idx):
-                    with chunk.workspace_lease.deepep_allocation():
-                        combine_state = remember_deepep_event(
-                            chunk.dispatcher.submit_deepep_combine_backward(
-                                grad_2d[chunk.start : chunk.end].contiguous(),
-                                chunk.handle,
-                                allocate_on_comm_stream=True,
-                            )
+                    combine_state = remember_deepep_event(
+                        chunk.dispatcher.submit_deepep_combine_backward(
+                            grad_2d[chunk.start : chunk.end].contiguous(),
+                            chunk.handle,
+                            allocate_on_comm_stream=True,
                         )
+                    )
 
             local_state: dict[str, Any] = {}
             with torch.cuda.stream(compute_stream):
@@ -1570,15 +1564,14 @@ class _EPChunkOperationBase:
                 if last_deepep_event is not None:
                     _event_current_stream_wait(last_deepep_event)
                 with _ep_chunk_nvtx("backward.dispatch", chunk.idx):
-                    with chunk.workspace_lease.deepep_allocation():
-                        local_state["dispatch_bwd_state"] = remember_deepep_event(
-                            chunk.dispatcher.submit_deepep_dispatch_backward(
-                                grad_recv_hidden,
-                                grad_recv_probs,
-                                chunk.handle,
-                                allocate_on_comm_stream=True,
-                            )
+                    local_state["dispatch_bwd_state"] = remember_deepep_event(
+                        chunk.dispatcher.submit_deepep_dispatch_backward(
+                            grad_recv_hidden,
+                            grad_recv_probs,
+                            chunk.handle,
+                            allocate_on_comm_stream=True,
                         )
+                    )
             pending_dispatch_bwd.append((chunk, local_state))
 
         wgrad_ready = torch.cuda.Event()

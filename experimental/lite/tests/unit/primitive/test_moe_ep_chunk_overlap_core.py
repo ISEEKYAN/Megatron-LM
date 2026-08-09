@@ -285,7 +285,7 @@ def test_all_chunked_async_deepep_allocations_are_owned_by_comm_stream():
             assert keywords["async_finish"].value is True
 
 
-def test_all_chunked_deepep_submissions_run_inside_the_slot_mem_pool():
+def test_only_deepep_recv_dispatch_uses_the_persistent_slot_mem_pool():
     tree = ast.parse(SOURCE.read_text())
     submit_names = {
         "submit_deepep_dispatch",
@@ -293,14 +293,14 @@ def test_all_chunked_deepep_submissions_run_inside_the_slot_mem_pool():
         "submit_deepep_combine_backward",
         "submit_deepep_dispatch_backward",
     }
-    guarded = []
+    submissions = []
 
     def visit(node, in_pool=False):
         if isinstance(node, ast.With):
             in_pool = in_pool or any(
                 isinstance(item.context_expr, ast.Call)
                 and isinstance(item.context_expr.func, ast.Attribute)
-                and item.context_expr.func.attr == "deepep_allocation"
+                and item.context_expr.func.attr == "deepep_recv_allocation"
                 for item in node.items
             )
         if (
@@ -308,12 +308,18 @@ def test_all_chunked_deepep_submissions_run_inside_the_slot_mem_pool():
             and isinstance(node.func, ast.Attribute)
             and node.func.attr in submit_names
         ):
-            guarded.append(in_pool)
+            submissions.append((node.func.attr, in_pool))
         for child in ast.iter_child_nodes(node):
             visit(child, in_pool)
 
     visit(tree)
-    assert guarded and all(guarded)
+    assert submissions
+    assert all(
+        in_pool for name, in_pool in submissions if name == "submit_deepep_dispatch"
+    )
+    assert all(
+        not in_pool for name, in_pool in submissions if name != "submit_deepep_dispatch"
+    )
 
 
 def test_production_path_has_no_global_cuda_sync_or_allocator_fallback():

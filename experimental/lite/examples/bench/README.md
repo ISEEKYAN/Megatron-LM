@@ -46,10 +46,10 @@ no dynamic chunk-count or per-model scheduling policy. The caller must set
 for one rank and one forward (including BSHD micro-batches or all packed THD
 tokens). Inputs above that fixed capacity fail loudly; scratch tensors are
 not allocated during Qwen3 model construction. The selected phase lazily
-materializes two dispatcher/allocation-pool slots, while backward scratch is
-allocated at the actual received shape and may grow only within the fixed
-profile during preflight. Repeating the same preflight shape must not allocate
-or grow again.
+materializes two dispatcher/dispatch-recv allocation-pool slots, while
+backward scratch is allocated at the actual received shape and may grow only
+within the fixed profile during preflight. Repeating the same preflight shape
+must not allocate or grow again.
 
 ## Dry-Run
 
