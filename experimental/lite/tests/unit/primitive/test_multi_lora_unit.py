@@ -44,26 +44,25 @@ def _inputs(dtype=torch.float64):
 
 
 def _assert_bf16_gradient_parity(actual, reference):
-    """Use a scale-aware BF16 criterion, calibrated against the Mint kernel."""
+    """Require p99 agreement within two representable BF16 output ULPs."""
     actual32, reference32 = actual.float(), reference.float()
     error = (actual32 - reference32).abs()
-    reference_abs = reference32.abs()
-    reference_rms = reference32.square().mean().sqrt()
-    reference_max = reference_abs.max()
-    signal_floor = 0.01 * reference_rms
-    signal = reference_abs >= signal_floor
-    # Mint's BF16 grad_A reduction reaches one 0.25 output-ULP at p99 even
-    # when its RMS is small; retain the RMS scaling while admitting that floor.
-    p99_limit = torch.maximum(
-        0.0125 * reference_rms, torch.tensor(0.25, device=error.device)
+    # BF16 stores are quantized at a magnitude-dependent spacing.  Comparing
+    # against that spacing is stricter and more interpretable than a global
+    # relative/RMS percentage: the tested fused rank-32 reduction may differ
+    # only in accumulation order, never by more than two stored output values
+    # at p99.  ``nextafter`` also remains well-defined near zero.
+    reference_bf16 = reference.detach().to(torch.bfloat16)
+    ulp = (
+        torch.nextafter(reference_bf16, torch.full_like(reference_bf16, float("inf")))
+        .float()
+        .sub(reference_bf16.float())
+        .abs()
     )
-    assert torch.quantile(error, 0.99) <= p99_limit
-    assert error.max() <= 0.02 * reference_max
-    if signal.any():
-        relative = error[signal] / reference_abs[signal]
-        assert torch.quantile(relative, 0.99) <= 0.20
-    if (~signal).any():
-        assert error[~signal].max() <= 0.02 * reference_rms
+    assert (
+        torch.quantile(error / ulp.clamp_min(torch.finfo(torch.bfloat16).tiny), 0.99)
+        <= 2
+    )
 
 
 def test_batched_lora_delta_matches_dense_reference_for_sorted_slots():
@@ -291,7 +290,9 @@ def test_named_registry_export_reuses_hf_mapping_and_scaling_contract():
     )
 
 
-def test_named_registry_export_gathers_tensor_parallel_output_before_mapping(monkeypatch):
+def test_named_registry_export_gathers_tensor_parallel_output_before_mapping(
+    monkeypatch,
+):
     """A bank's local TP B rows must never be exported as a partial adapter."""
     registry = NamedLoraBankRegistry(
         banks={
@@ -318,11 +319,20 @@ def test_named_registry_export_gathers_tensor_parallel_output_before_mapping(mon
     monkeypatch.setattr(
         hf_weights,
         "allgather_concat",
-        lambda tensor, world_size, group, dim: torch.cat((tensor, tensor + 10), dim=dim),
+        lambda tensor, world_size, group, dim: torch.cat(
+            (tensor, tensor + 10), dim=dim
+        ),
     )
     ps = SimpleNamespace(
-        tp_size=2, tp_rank=0, tp_group="tp", etp_size=1, etp_rank=0,
-        etp_group=None, ep_size=1, ep_rank=0, ep_group=None,
+        tp_size=2,
+        tp_rank=0,
+        tp_group="tp",
+        etp_size=1,
+        etp_rank=0,
+        etp_group=None,
+        ep_size=1,
+        ep_rank=0,
+        ep_group=None,
     )
     state = export_named_lora_adapter_state(registry, "alpha", Spec(), ps)
     key = f"{VLLM_LORA_NAME_PREFIX}model.layers.0.self_attn.q_proj.lora_B.weight"
