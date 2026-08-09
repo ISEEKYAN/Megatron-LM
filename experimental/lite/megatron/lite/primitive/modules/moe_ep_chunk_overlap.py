@@ -1480,8 +1480,14 @@ class _EPChunkOperationBase:
                     )
                     combine_state.pop("grad_rank_grouped", None)
                     combine_state.pop("event", None)
+                    if chunk.expert_out is None:
+                        raise RuntimeError(
+                            "EP chunk fused backward lost expert output storage."
+                        )
                     local_state["grad_expert_out"] = _manual_unpermute_backward(
-                        chunk, grad_rank_grouped
+                        chunk,
+                        grad_rank_grouped,
+                        out=chunk.expert_out.detach(),
                     )
                     del grad_rank_grouped
 
@@ -1518,11 +1524,7 @@ class _EPChunkOperationBase:
                         grad_probs = expert_grads[1]
                         if grad_probs is None:
                             grad_probs = torch.zeros_like(expert_probs_input)
-                    if chunk.expert_out is None:
-                        raise RuntimeError(
-                            "EP chunk fused backward lost expert output storage."
-                        )
-                    hidden_reuse_base = chunk.expert_out.detach()
+                    hidden_reuse_base = local_state.pop("grad_expert_out").detach()
                     chunk.dispatched = None
                     chunk.probs = None
                     chunk.expert_out = None
@@ -1533,7 +1535,6 @@ class _EPChunkOperationBase:
                         workspace=self.workspace.key.op,
                         chunk_idx=chunk.idx,
                     )
-                    local_state.pop("grad_expert_out", None)
                     del expert_dispatched, expert_probs_input
                     del expert_inputs, expert_grads, expert_output
                     grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
@@ -1959,7 +1960,10 @@ class EPChunkFusedForwardBackwardOp(_EPChunkOperationBase):
 
 
 def _manual_unpermute_backward(
-    chunk: _BackwardChunk, grad_rank_grouped: torch.Tensor
+    chunk: _BackwardChunk,
+    grad_rank_grouped: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if chunk.expert_out_shape is None or chunk.expert_out_dtype is None:
         raise RuntimeError("Missing expert output metadata.")
@@ -1973,12 +1977,25 @@ def _manual_unpermute_backward(
             "EP chunk manual unpermute output metadata does not match the "
             "rank-grouped gradient"
         )
-    grad_expert_out = chunk.workspace_lease.tensor(
-        "grad_expert_out",
-        chunk.expert_out_shape,
-        dtype=chunk.expert_out_dtype,
-        device=grad_rank_grouped.device,
-    )
+    if out is None:
+        grad_expert_out = chunk.workspace_lease.tensor(
+            "grad_expert_out",
+            chunk.expert_out_shape,
+            dtype=chunk.expert_out_dtype,
+            device=grad_rank_grouped.device,
+        )
+    else:
+        if (
+            out.shape != chunk.expert_out_shape
+            or out.dtype != chunk.expert_out_dtype
+            or out.device != grad_rank_grouped.device
+            or not out.is_contiguous()
+        ):
+            raise RuntimeError(
+                "EP chunk manual unpermute output storage must be contiguous "
+                "with matching shape, dtype, and device"
+            )
+        grad_expert_out = out
     with torch.no_grad():
         torch.index_select(
             grad_rank_grouped.detach(),

@@ -709,7 +709,11 @@ def test_normal_and_fused_backward_reuse_manual_unpermute_workspace_storage(
         '"grad_expert_out"'
         in normal_backward_source[normal_backward_source.index("hidden_reuse_base =") :]
     )
-    assert "hidden_reuse_base = chunk.expert_out.detach()" in fused_source
+    assert "out=chunk.expert_out.detach()" in fused_source
+    assert (
+        'hidden_reuse_base = local_state.pop("grad_expert_out").detach()'
+        in fused_source
+    )
     assert "chunk.workspace_lease.tensor(" in unpermute_source
     assert '"grad_expert_out"' in unpermute_source
     assert "torch.index_select(" in unpermute_source
@@ -734,15 +738,17 @@ def test_fused_reuses_arena_owned_expert_output_before_delayed_wgrad_flush(
     source = inspect.getsource(_EPChunkOperationBase._full_recompute_fused_backward_v6)
     autograd = source.index("expert_grads = torch.autograd.grad(")
     flushed = source.index("flush_delayed_weight_grads", autograd)
+    direct_unpermute = source.index("out=chunk.expert_out.detach()")
     alias_taken = source.index(
-        "hidden_reuse_base = chunk.expert_out.detach()", autograd
+        'hidden_reuse_base = local_state.pop("grad_expert_out").detach()', autograd
     )
     graph_clear = source.index("chunk.expert_out = None", alias_taken)
     locals_clear = source.index("del expert_dispatched", graph_clear)
     overwrite = source.index("_dispatch_local_backward(", locals_clear)
     dispatch = source.index("submit_deepep_dispatch_backward(", overwrite)
 
-    assert autograd < alias_taken < graph_clear < locals_clear < overwrite < dispatch
+    assert direct_unpermute < autograd < alias_taken
+    assert alias_taken < graph_clear < locals_clear < overwrite < dispatch
     assert dispatch < flushed
     assert "del expert_input, expert_probs, metadata" in source
     assert "state.clear()" in source
@@ -824,3 +830,39 @@ def test_manual_unpermute_writes_into_stable_workspace_slot(
     assert first_ptr == second.data_ptr()
     assert lease.names == ["grad_expert_out", "grad_expert_out"]
     torch.testing.assert_close(second, second_input.index_select(0, chunk.row_id_map))
+
+
+def test_fused_manual_unpermute_reuses_expert_output_without_workspace_scratch(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _manual_unpermute_backward,
+    )
+
+    class NoScratchLease:
+        def tensor(self, *args, **kwargs):
+            raise AssertionError(
+                "fused manual unpermute must not allocate workspace scratch"
+            )
+
+    expert_out = torch.full((4, 2), -1.0)
+    chunk = SimpleNamespace(
+        expert_out_shape=torch.Size((4, 2)),
+        expert_out_dtype=torch.float32,
+        row_id_map=torch.tensor([2, 0, 3, 1]),
+        workspace_lease=NoScratchLease(),
+    )
+    grad_rank_grouped = torch.arange(8, dtype=torch.float32).view(4, 2)
+
+    grad_expert_out = _manual_unpermute_backward(
+        chunk,
+        grad_rank_grouped,
+        out=expert_out.detach(),
+    )
+
+    assert grad_expert_out.data_ptr() == expert_out.data_ptr()
+    torch.testing.assert_close(
+        grad_expert_out,
+        grad_rank_grouped.index_select(0, chunk.row_id_map),
+    )
