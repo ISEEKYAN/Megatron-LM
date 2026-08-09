@@ -899,10 +899,10 @@ class ParamBucket:
             spec.full_param.grad_added_to_main_grad = False
 
     def set_grad_sync_enabled(self, enabled: bool) -> None:
-        enabled = bool(enabled)
-        if enabled and not self.grad_sync_enabled:
-            self._grad_ready_ids.clear()
-        self.grad_sync_enabled = enabled
+        # Pipeline schedules switch this flag immediately before the final
+        # microbatch backward. Readiness already staged by an earlier pipeline
+        # stage belongs to the active generation and must not be discarded.
+        self.grad_sync_enabled = bool(enabled)
 
     def saved_view(self, tensor: torch.Tensor) -> SavedParamView | None:
         if not self._full_ready or tensor.numel() == 0:
