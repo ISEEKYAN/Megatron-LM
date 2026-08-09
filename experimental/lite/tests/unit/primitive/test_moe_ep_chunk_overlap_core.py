@@ -186,9 +186,13 @@ def test_dispatch_local_backward_accumulates_duplicate_rows_in_workspace(
     )
     workspace = EPChunkWorkspaceRegistry().get_or_create(key, lambda slot: slot)
     lease = workspace.acquire(0)
+    recv_hidden_base = torch.full((3, 2), 17.0)
+    recv_probs_base = torch.full((3, 2), 19.0)
     chunk = SimpleNamespace(
         idx=0,
         workspace_lease=lease,
+        recv_hidden_base=recv_hidden_base,
+        recv_probs_base=recv_probs_base,
         row_id_map=torch.tensor([0, 0, 2]),
         prob_flat_indices=torch.tensor([1, 3, 5]),
         recv_hidden_shape=torch.Size((3, 2)),
@@ -202,6 +206,10 @@ def test_dispatch_local_backward_accumulates_duplicate_rows_in_workspace(
         torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
         torch.tensor([0.25, 0.5, 0.75]),
     )
+
+    assert grad_hidden.data_ptr() == recv_hidden_base.data_ptr()
+    assert grad_probs.data_ptr() == recv_probs_base.data_ptr()
+    assert workspace.metrics()["runtime_allocations"] == 0
 
     torch.testing.assert_close(
         grad_hidden, torch.tensor([[4.0, 6.0], [0.0, 0.0], [5.0, 6.0]])
@@ -220,18 +228,12 @@ def test_dispatch_local_backward_clears_reused_scratch_before_sparse_writes(
         _dispatch_local_backward,
     )
 
-    scratch = {
-        "grad_recv_hidden": torch.full((3, 2), 17.0),
-        "grad_recv_probs": torch.full((3, 2), 19.0),
-    }
-
-    class ReusedLease:
-        @staticmethod
-        def tensor(name, _shape, *, dtype, device):
-            return scratch[name].to(dtype=dtype, device=device)
+    recv_hidden_base = torch.full((3, 2), 17.0)
+    recv_probs_base = torch.full((3, 2), 19.0)
 
     chunk = SimpleNamespace(
-        workspace_lease=ReusedLease(),
+        recv_hidden_base=recv_hidden_base,
+        recv_probs_base=recv_probs_base,
         row_id_map=torch.tensor([0, 2]),
         prob_flat_indices=torch.tensor([1, 5]),
         recv_hidden_shape=torch.Size((3, 2)),
@@ -253,8 +255,8 @@ def test_dispatch_local_backward_clears_reused_scratch_before_sparse_writes(
         torch.tensor([[0.0, 0.25], [0.0, 0.0], [0.0, 0.75]]),
     )
 
-    scratch["grad_recv_hidden"].fill_(23.0)
-    scratch["grad_recv_probs"].fill_(29.0)
+    recv_hidden_base.fill_(23.0)
+    recv_probs_base.fill_(29.0)
     _grad_hidden, grad_probs_none = _dispatch_local_backward(
         chunk,
         torch.tensor([[5.0, 6.0], [7.0, 8.0]]),
@@ -620,4 +622,68 @@ def test_saved_backward_drops_expert_graph_before_allocating_grad_recv(
         assert assignment in source
     assert "saved.scores = None" not in source
     assert "saved.x = None" not in source
+    assert "cuda.synchronize" not in source
+
+
+def test_normal_and_fused_backward_chunks_retain_recv_bases_for_in_place_grad(
+    transformer_engine_import_stub,
+):
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _BackwardChunk,
+        _EPChunkOperationBase,
+        _ForwardChunkContext,
+        _dispatch_local_backward,
+    )
+
+    assert "recv_hidden_base" in _BackwardChunk.__dataclass_fields__
+    assert "recv_probs_base" in _BackwardChunk.__dataclass_fields__
+    assert "recv_hidden_base" in _ForwardChunkContext.__dataclass_fields__
+    assert "recv_probs_base" in _ForwardChunkContext.__dataclass_fields__
+    saved_source = inspect.getsource(_EPChunkOperationBase._forward_saved_context_async)
+    normal_backward_source = inspect.getsource(
+        _EPChunkOperationBase._saved_context_backward
+    )
+    fused_source = inspect.getsource(
+        _EPChunkOperationBase._full_recompute_fused_backward_v6
+    )
+    helper_source = inspect.getsource(_dispatch_local_backward)
+
+    for source in (saved_source, fused_source):
+        assert 'recv_hidden_base=state["recv_hidden"]' in source
+        assert 'recv_probs_base=state["recv_probs"]' in source
+    for source in (normal_backward_source, fused_source):
+        submit = source.index("submit_deepep_dispatch_backward(")
+        recorded = source.index("grad_recv_hidden.record_stream(comm_stream)")
+        cleared = source.index("chunk.recv_hidden_base = None")
+        assert submit < recorded < cleared
+    assert "chunk.workspace_lease.tensor(" not in helper_source
+    assert "grad_recv_hidden = chunk.recv_hidden_base" in helper_source
+    assert "grad_recv_probs = chunk.recv_probs_base" in helper_source
+    assert "cuda.synchronize" not in helper_source
+
+
+def test_fused_expert_autograd_references_die_before_recv_base_overwrite(
+    transformer_engine_import_stub,
+):
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+    )
+
+    source = inspect.getsource(_EPChunkOperationBase._full_recompute_fused_backward_v6)
+    autograd = source.index("expert_grads = torch.autograd.grad(")
+    graph_clear = source.index("chunk.dispatched = None", autograd)
+    locals_clear = source.index("del expert_dispatched", graph_clear)
+    overwrite = source.index("_dispatch_local_backward(", locals_clear)
+
+    assert autograd < graph_clear < locals_clear < overwrite
+    assert "del expert_input, expert_probs, metadata" in source
+    assert "state.clear()" in source
+    assert "del expert_dispatched, expert_probs_input" in source
+    assert "del expert_inputs, expert_grads, expert_output" in source
     assert "cuda.synchronize" not in source

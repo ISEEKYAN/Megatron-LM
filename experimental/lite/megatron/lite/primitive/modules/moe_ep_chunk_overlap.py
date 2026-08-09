@@ -819,6 +819,8 @@ class _BackwardChunk:
     recv_hidden_dtype: torch.dtype
     recv_probs_shape: torch.Size
     recv_probs_dtype: torch.dtype
+    recv_hidden_base: torch.Tensor | None
+    recv_probs_base: torch.Tensor | None
     dispatched: torch.Tensor | None
     probs: torch.Tensor | None
     expert_out: torch.Tensor | None
@@ -846,6 +848,8 @@ class _ForwardChunkContext:
     recv_hidden_dtype: torch.dtype
     recv_probs_shape: torch.Size
     recv_probs_dtype: torch.dtype
+    recv_hidden_base: torch.Tensor | None
+    recv_probs_base: torch.Tensor | None
     dispatched: torch.Tensor | None
     probs: torch.Tensor | None
     expert_out: torch.Tensor | None
@@ -1177,6 +1181,8 @@ class _EPChunkOperationBase:
                     recv_hidden_dtype=state["recv_hidden"].dtype,
                     recv_probs_shape=state["recv_probs"].shape,
                     recv_probs_dtype=state["recv_probs"].dtype,
+                    recv_hidden_base=state["recv_hidden"],
+                    recv_probs_base=state["recv_probs"],
                     dispatched=expert_input,
                     probs=expert_probs,
                     expert_out=expert_out_ref,
@@ -1451,6 +1457,8 @@ class _EPChunkOperationBase:
                     recv_hidden_dtype=state["recv_hidden"].dtype,
                     recv_probs_shape=state["recv_probs"].shape,
                     recv_probs_dtype=state["recv_probs"].dtype,
+                    recv_hidden_base=state["recv_hidden"],
+                    recv_probs_base=state["recv_probs"],
                     dispatched=expert_input,
                     probs=expert_probs,
                     expert_out=expert_out_ref,
@@ -1463,10 +1471,9 @@ class _EPChunkOperationBase:
                     dispatcher=dispatcher,
                     workspace_lease=workspace_lease,
                 )
-                state.pop("recv_hidden", None)
-                state.pop("recv_indices", None)
-                state.pop("recv_probs", None)
+                state.clear()
                 del dispatched, probs, expert_out, scores, local_tpe
+                del expert_input, expert_probs, metadata
 
                 local_state: dict[str, Any] = {}
                 with torch.cuda.stream(compute_stream):
@@ -1489,11 +1496,15 @@ class _EPChunkOperationBase:
                         if chunk.expert_out_edge is not None
                         else chunk.expert_out
                     )
-                    if chunk.dispatched is None or expert_output is None:
+                    expert_dispatched = chunk.dispatched
+                    expert_probs_input = chunk.probs
+                    if expert_dispatched is None or expert_output is None:
                         raise RuntimeError(
                             "EP chunk overlap expert graph was released."
                         )
-                    expert_inputs = _expert_grad_inputs(chunk.dispatched, chunk.probs)
+                    expert_inputs = _expert_grad_inputs(
+                        expert_dispatched, expert_probs_input
+                    )
                     expert_grads = torch.autograd.grad(
                         expert_output,
                         expert_inputs,
@@ -1502,13 +1513,13 @@ class _EPChunkOperationBase:
                     )
                     grad_dispatched = expert_grads[0]
                     if grad_dispatched is None:
-                        grad_dispatched = torch.zeros_like(chunk.dispatched)
-                    if chunk.probs is None:
+                        grad_dispatched = torch.zeros_like(expert_dispatched)
+                    if expert_probs_input is None:
                         grad_probs = None
                     else:
                         grad_probs = expert_grads[1]
                         if grad_probs is None:
-                            grad_probs = torch.zeros_like(chunk.probs)
+                            grad_probs = torch.zeros_like(expert_probs_input)
                     chunk.dispatched = None
                     chunk.probs = None
                     chunk.expert_out = None
@@ -1520,6 +1531,8 @@ class _EPChunkOperationBase:
                         chunk_idx=chunk.idx,
                     )
                     local_state.pop("grad_expert_out", None)
+                    del expert_dispatched, expert_probs_input
+                    del expert_inputs, expert_grads, expert_output
                     grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
                         chunk, grad_dispatched, grad_probs
                     )
@@ -1533,16 +1546,23 @@ class _EPChunkOperationBase:
                     comm_stream.wait_event(local_bwd_ready)
                     chain_deepep_event()
                     with _ep_chunk_nvtx("backward.dispatch", chunk.idx):
+                        grad_recv_hidden = local_state.pop("grad_recv_hidden")
+                        grad_recv_probs = local_state.pop("grad_recv_probs")
                         local_state["dispatch_bwd_state"] = remember_deepep_event(
                             dispatcher.submit_deepep_dispatch_backward(
-                                local_state["grad_recv_hidden"],
-                                local_state["grad_recv_probs"],
+                                grad_recv_hidden,
+                                grad_recv_probs,
                                 chunk.handle,
                                 allocate_on_comm_stream=True,
                             )
                         )
-                    local_state.pop("grad_recv_hidden", None)
-                    local_state.pop("grad_recv_probs", None)
+                        if grad_recv_hidden.is_cuda:
+                            grad_recv_hidden.record_stream(comm_stream)
+                        if grad_recv_probs.is_cuda:
+                            grad_recv_probs.record_stream(comm_stream)
+                        chunk.recv_hidden_base = None
+                        chunk.recv_probs_base = None
+                        del grad_recv_hidden, grad_recv_probs
 
                 pending_dispatch_bwd.append((chunk, local_state))
 
@@ -1653,6 +1673,8 @@ class _EPChunkOperationBase:
                 recv_hidden_dtype=saved.recv_hidden_dtype,
                 recv_probs_shape=saved.recv_probs_shape,
                 recv_probs_dtype=saved.recv_probs_dtype,
+                recv_hidden_base=saved.recv_hidden_base,
+                recv_probs_base=saved.recv_probs_base,
                 dispatched=saved.dispatched,
                 probs=saved.probs,
                 expert_out=saved.expert_out,
@@ -1740,6 +1762,15 @@ class _EPChunkOperationBase:
                             allocate_on_comm_stream=True,
                         )
                     )
+                    if grad_recv_hidden.is_cuda:
+                        grad_recv_hidden.record_stream(comm_stream)
+                    if grad_recv_probs.is_cuda:
+                        grad_recv_probs.record_stream(comm_stream)
+                    saved.recv_hidden_base = None
+                    saved.recv_probs_base = None
+                    chunk.recv_hidden_base = None
+                    chunk.recv_probs_base = None
+                    del grad_recv_hidden, grad_recv_probs
             pending_dispatch_bwd.append((chunk, local_state))
 
         wgrad_ready = torch.cuda.Event()
@@ -1940,23 +1971,24 @@ def _dispatch_local_backward(
     grad_probs: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     row_id_map = chunk.row_id_map.reshape(-1).to(torch.long)
-    grad_recv_hidden = chunk.workspace_lease.tensor(
-        "grad_recv_hidden",
-        chunk.recv_hidden_shape,
-        dtype=chunk.recv_hidden_dtype,
-        device=grad_dispatched.device,
-    )
+    if chunk.recv_hidden_base is None or chunk.recv_probs_base is None:
+        raise RuntimeError("EP chunk backward requires retained recv base tensors")
+    grad_recv_hidden = chunk.recv_hidden_base.detach()
+    grad_recv_probs = chunk.recv_probs_base.detach()
+    if (
+        grad_recv_hidden.shape != chunk.recv_hidden_shape
+        or grad_recv_hidden.dtype != chunk.recv_hidden_dtype
+        or grad_recv_hidden.device != grad_dispatched.device
+        or grad_recv_probs.shape != chunk.recv_probs_shape
+        or grad_recv_probs.dtype != chunk.recv_probs_dtype
+        or grad_recv_probs.device != grad_dispatched.device
+    ):
+        raise RuntimeError("EP chunk retained recv base does not match saved metadata")
     grad_recv_hidden.zero_()
     grad_recv_hidden.scatter_add_(
         0,
         row_id_map.unsqueeze(1).expand(-1, grad_dispatched.size(1)),
         grad_dispatched.to(grad_recv_hidden.dtype),
-    )
-    grad_recv_probs = chunk.workspace_lease.tensor(
-        "grad_recv_probs",
-        chunk.recv_probs_shape,
-        dtype=chunk.recv_probs_dtype,
-        device=grad_dispatched.device,
     )
     grad_recv_probs.zero_()
     if grad_probs is not None:
