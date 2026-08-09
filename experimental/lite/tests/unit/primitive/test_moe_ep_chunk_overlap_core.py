@@ -197,8 +197,6 @@ def test_all_three_dispatch_finish_paths_validate_before_expert_or_arena(
         assert validated < expert
 
 
-
-
 def test_three_ops_expose_bounded_nvtx_phase_ranges():
     source = SOURCE.read_text()
 
@@ -1485,14 +1483,20 @@ def test_forward_and_fused_split_expert_activation_from_slot_output_arenas(
 
     assert forward_acquire < forward_slot < forward_expert < forward_release
     assert "activation_allocation=expert_activation_lease.allocate" in forward_source
-    assert 'expert_activation_lease.tensor(\n                            "fc1_input"' in forward_source
+    assert (
+        'expert_activation_lease.tensor(\n                            "fc1_input"'
+        in forward_source
+    )
     assert "output_allocation=lambda name, shape:" in forward_source
     assert "wgrad_done" not in forward_source
     assert saved_arena < saved_expert
     assert "activation_allocation=" not in saved_forward_source
     assert fused_dispatch_finish < fused_acquire < fused_slot < fused_expert
     assert "activation_allocation=expert_activation_lease.allocate" in fused_source
-    assert 'expert_activation_lease.tensor(\n                    "fc1_input"' in fused_source
+    assert (
+        'expert_activation_lease.tensor(\n                    "fc1_input"'
+        in fused_source
+    )
     assert "expert_input = fc1_input.requires_grad_(True)" in fused_source
     assert "output_allocation=lambda name, shape:" in fused_source
     no_grad_finish = forward_source.index("finish_deepep_combine(state)")
@@ -1607,9 +1611,9 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
     base._2X_ACC_FPROP = False
     base._2X_ACC_DGRAD = False
     base._2X_ACC_WGRAD = False
-    base.get_dummy_wgrad = lambda shape, dtype, zero=False: torch.zeros(
-        shape, dtype=dtype
-    ) if zero else torch.ones(shape, dtype=dtype)
+    base.get_dummy_wgrad = lambda shape, dtype, zero=False: (
+        torch.zeros(shape, dtype=dtype) if zero else torch.ones(shape, dtype=dtype)
+    )
     cpp = sys.modules["transformer_engine.pytorch.cpp_extensions"]
 
     def fake_grouped_gemm(
@@ -1654,8 +1658,14 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
             self.fuse_wgrad_accumulation = True
             self.wgrad_store = Store()
             self.activation_dtype = torch.bfloat16
-            self.weight0 = torch.nn.Parameter(torch.eye(2, dtype=torch.bfloat16))
-            self.weight1 = torch.nn.Parameter(2 * torch.eye(2, dtype=torch.bfloat16))
+            self.weight0 = torch.nn.Parameter(
+                torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.bfloat16)
+            )
+            self.weight1 = torch.nn.Parameter(
+                torch.tensor(
+                    [[2.0, -1.0], [0.0, 3.0], [4.0, 1.0]], dtype=torch.bfloat16
+                )
+            )
             for weight in (self.weight0, self.weight1):
                 weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
                 weight.grad_added_to_main_grad = False
@@ -1683,19 +1693,72 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
 
     linear = Linear()
     x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16, requires_grad=True)
-    out = torch.empty_like(x)
+    out = torch.empty(2, 3, dtype=torch.bfloat16)
     dgrad = torch.empty_like(x)
     result = experts_module._caller_owned_grouped_linear(linear, x, [1, 1], out, dgrad)
     assert result.data_ptr() == out.data_ptr()
     result.float().sum().backward()
+    assert x.grad.data_ptr() == dgrad.data_ptr()
+    torch.testing.assert_close(
+        x.grad,
+        torch.tensor([[9.0, 12.0], [6.0, 3.0]], dtype=torch.bfloat16),
+    )
     assert linear.calls == [
-        ("prepare", 2), ("weights",), ("biases",), ("quantizers",), ("end",)
+        ("prepare", 2),
+        ("weights",),
+        ("biases",),
+        ("quantizers",),
+        ("end",),
     ]
     assert len(linear.wgrad_store.entries) == 1
     tensors, delayed = linear.wgrad_store.entries.pop()
     delayed(*tensors)
-    assert all(weight.grad_added_to_main_grad for weight in (linear.weight0, linear.weight1))
-    assert all(torch.count_nonzero(weight.main_grad) for weight in (linear.weight0, linear.weight1))
+    assert all(
+        weight.grad_added_to_main_grad for weight in (linear.weight0, linear.weight1)
+    )
+    assert all(
+        torch.count_nonzero(weight.main_grad)
+        for weight in (linear.weight0, linear.weight1)
+    )
+    torch.testing.assert_close(
+        linear.weight0.main_grad,
+        torch.tensor([[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]]),
+    )
+    torch.testing.assert_close(
+        linear.weight1.main_grad,
+        torch.tensor([[3.0, 4.0], [3.0, 4.0], [3.0, 4.0]]),
+    )
+
+    no_dgrad_x = torch.tensor([[2.0, 1.0], [4.0, 3.0]], dtype=torch.bfloat16)
+    no_dgrad_out = torch.empty(2, 3, dtype=torch.bfloat16)
+    no_dgrad_result = experts_module._caller_owned_grouped_linear(
+        linear, no_dgrad_x, [1, 1], no_dgrad_out, None
+    )
+    assert no_dgrad_result.requires_grad
+    no_dgrad_result.float().sum().backward()
+    assert len(linear.wgrad_store.entries) == 1
+    tensors, delayed = linear.wgrad_store.entries.pop()
+    delayed(*tensors)
+
+    # TE2.15 must defer MCore-FSDP main_grad lookup until backward, after the
+    # framework has materialized the sink.  The saved weight Tensor is not the
+    # source of these Python-side hook attributes.
+    for weight in (linear.weight0, linear.weight1):
+        sink = weight.main_grad
+        del weight.main_grad
+        weight.__fsdp_param__ = True
+        weight.get_main_grad = lambda sink=sink: sink
+    fsdp_x = torch.tensor(
+        [[1.0, 1.0], [2.0, 2.0]], dtype=torch.bfloat16, requires_grad=True
+    )
+    fsdp_out = torch.empty(2, 3, dtype=torch.bfloat16)
+    fsdp_dgrad = torch.empty_like(fsdp_x)
+    experts_module._caller_owned_grouped_linear(
+        linear, fsdp_x, [1, 1], fsdp_out, fsdp_dgrad
+    ).float().sum().backward()
+    tensors, delayed = linear.wgrad_store.entries.pop()
+    delayed(*tensors)
+    assert fsdp_x.grad.data_ptr() == fsdp_dgrad.data_ptr()
 
     with pytest.raises(RuntimeError, match="non-grad"):
         experts_module._caller_owned_grouped_linear(
