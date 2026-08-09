@@ -30,14 +30,30 @@ def validate_ep_chunk_overlap_config(
 
 def ep_chunk_ranges(
     num_tokens: int,
+    *,
+    chunk_count: int = 2,
 ) -> list[tuple[int, int]]:
-    """Split tokens into the one supported production profile: two halves."""
+    """Split tokens into a fixed number of contiguous non-empty chunks."""
     if isinstance(num_tokens, bool) or not isinstance(num_tokens, int):
         raise TypeError("EP chunk token count must be an int")
-    if num_tokens < 2:
-        raise ValueError("EP chunk overlap requires at least two tokens")
-    midpoint = (num_tokens + 1) // 2
-    return [(0, midpoint), (midpoint, num_tokens)]
+    if isinstance(chunk_count, bool) or not isinstance(chunk_count, int):
+        raise TypeError("EP chunk count must be an int")
+    if chunk_count < 2:
+        raise ValueError("EP chunk overlap requires at least two chunks")
+    if num_tokens < chunk_count:
+        if chunk_count == 2:
+            raise ValueError("EP chunk overlap requires at least two tokens")
+        raise ValueError(
+            f"EP chunk overlap requires at least {chunk_count} tokens"
+        )
+    base, remainder = divmod(num_tokens, chunk_count)
+    ranges = []
+    start = 0
+    for index in range(chunk_count):
+        end = start + base + int(index < remainder)
+        ranges.append((start, end))
+        start = end
+    return ranges
 
 
 __all__ = [

@@ -20,6 +20,7 @@ from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
 from megatron.lite.primitive.utils.moe import unpermute
 
 
+# Physical workspace capacity, deliberately independent of logical chunk count.
 EP_CHUNK_COUNT = 2
 EPChunkOpName = Literal["forward", "backward", "fused_forward_backward"]
 
@@ -32,6 +33,7 @@ class EPChunkShapeProfile:
     hidden_size: int
     topk: int
     ep_size: int
+    chunk_count: int = 2
     max_recv_rows: int = field(init=False)
     max_expert_rows: int = field(init=False)
 
@@ -43,16 +45,18 @@ class EPChunkShapeProfile:
         hidden_size: int,
         topk: int,
         ep_size: int,
+        chunk_count: int = 2,
     ) -> "EPChunkShapeProfile":
         if ep_size <= 1:
             raise ValueError("Fixed EP chunk profile requires EP > 1")
-        if max_input_rows < EP_CHUNK_COUNT:
+        if max_input_rows < 2:
             raise ValueError("Fixed two-chunk profile requires at least two rows")
         return cls(
             max_input_rows=max_input_rows,
             hidden_size=hidden_size,
             topk=topk,
             ep_size=ep_size,
+            chunk_count=chunk_count,
         )
 
     def __post_init__(self) -> None:
@@ -63,14 +67,17 @@ class EPChunkShapeProfile:
                 self.hidden_size,
                 self.topk,
                 self.ep_size,
+                self.chunk_count,
             )
         ):
             raise ValueError("EP chunk shape-profile capacities must be positive")
         if self.ep_size <= 1:
             raise ValueError("Fixed EP chunk profile requires EP > 1")
-        if self.max_input_rows < EP_CHUNK_COUNT:
-            raise ValueError("Fixed two-chunk profile requires at least two rows")
-        max_chunk_rows = (self.max_input_rows + EP_CHUNK_COUNT - 1) // EP_CHUNK_COUNT
+        if self.chunk_count < 2:
+            raise ValueError("EP chunk profile requires at least two chunks")
+        if self.max_input_rows < self.chunk_count:
+            raise ValueError("EP chunk profile requires at least one row per chunk")
+        max_chunk_rows = (self.max_input_rows + self.chunk_count - 1) // self.chunk_count
         # DeepEP recv storage may contain every source rank's chunk on one
         # destination rank. It stores one hidden row per transported token and
         # represents its local top-k destinations in recv_probs.
@@ -1076,6 +1083,10 @@ class _EPChunkOperationBase:
     ) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
         return torch.cuda.current_stream(device), _shared_comm_stream(device)
 
+    @property
+    def _logical_chunk_count(self) -> int:
+        return self.workspace.key.shape_profile.chunk_count
+
     @contextmanager
     def _routing_context(self, routing_input: torch.Tensor | None):
         previous = getattr(self, "_active_routing_input", None)
@@ -1106,8 +1117,8 @@ class _EPChunkOperationBase:
         self.workspace.key.shape_profile.validate_input(x_2d)
         if not ranges:
             return x_2d.new_empty(input_shape).to(input_dtype)
-        if len(ranges) != EP_CHUNK_COUNT:
-            raise RuntimeError("EP chunk overlap requires two non-empty token chunks")
+        if len(ranges) != self._logical_chunk_count:
+            raise RuntimeError("EP chunk overlap ranges do not match the shape profile")
 
         compute_stream, comm_stream = self._streams(x_2d.device)
         caller_stream = torch.cuda.current_stream(x_2d.device)
@@ -1117,7 +1128,7 @@ class _EPChunkOperationBase:
         def submit_dispatch(chunk_idx: int):
             start, end = ranges[chunk_idx]
             x_chunk = x_2d[start:end]
-            lease = self.workspace.acquire(chunk_idx, stream=comm_stream)
+            lease = self.workspace.acquire(chunk_idx % EP_CHUNK_COUNT, stream=comm_stream)
             dispatcher = lease.dispatcher
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(input_ready)
@@ -1245,8 +1256,8 @@ class _EPChunkOperationBase:
     ) -> tuple[torch.Tensor, _SavedForwardContext]:
         """Run the overlapped forward once and retain its graph for backward."""
         self.workspace.key.shape_profile.validate_input(x_2d)
-        if len(ranges) != EP_CHUNK_COUNT:
-            raise RuntimeError("EP chunk overlap requires two non-empty token chunks")
+        if len(ranges) != self._logical_chunk_count:
+            raise RuntimeError("EP chunk overlap ranges do not match the shape profile")
 
         compute_stream, comm_stream = self._streams(x_2d.device)
         caller_stream = torch.cuda.current_stream(x_2d.device)
@@ -1257,7 +1268,7 @@ class _EPChunkOperationBase:
         def submit_dispatch(chunk_idx: int):
             start, end = ranges[chunk_idx]
             x_chunk = x_2d[start:end]
-            lease = self.workspace.acquire(chunk_idx, stream=comm_stream)
+            lease = self.workspace.acquire(chunk_idx % EP_CHUNK_COUNT, stream=comm_stream)
             dispatcher = lease.dispatcher
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(input_ready)
@@ -1453,7 +1464,9 @@ class _EPChunkOperationBase:
         x_saved: torch.Tensor,
         grad_2d: torch.Tensor,
     ):
-        ranges = ep_chunk_ranges(x_saved.size(0))
+        ranges = ep_chunk_ranges(
+            x_saved.size(0), chunk_count=self._logical_chunk_count
+        )
         router_params = tuple(self.router.parameters())
         expert_params = tuple(self.experts.parameters())
         return self._full_recompute_fused_backward_v6(
@@ -1501,7 +1514,7 @@ class _EPChunkOperationBase:
         def submit_recompute_dispatch(chunk_idx: int):
             start, end = ranges[chunk_idx]
             x_chunk = x_2d[start:end].detach().requires_grad_(True)
-            lease = self.workspace.acquire(chunk_idx, stream=comm_stream)
+            lease = self.workspace.acquire(chunk_idx % EP_CHUNK_COUNT, stream=comm_stream)
             dispatcher = lease.dispatcher
             with torch.cuda.stream(compute_stream):
                 compute_stream.wait_event(input_ready)
@@ -1601,6 +1614,22 @@ class _EPChunkOperationBase:
                 expert_activation_lease,
             )
 
+        def retire_pending_dispatch_bwd() -> None:
+            """Retire the previous chunk before the next large expert activation.
+
+            The next DeepEP receive may already be in flight, but a two-slot
+            workspace cannot keep a prior dispatch-backward lease and delayed
+            wgrad aliases alive through another FC1/SwiGLU activation.
+            """
+            _retire_one_fused_dispatch_bwd(
+                pending_dispatch_bwd,
+                compute_stream=compute_stream,
+                grad_2d=grad_2d,
+                router_params=router_params,
+                grad_x_chunks=grad_x_chunks,
+                router_accum=router_accum,
+            )
+
         with torch.enable_grad():
             next_state = submit_recompute_dispatch(len(ranges) - 1)
             for rev_idx in range(len(ranges) - 1, -1, -1):
@@ -1614,6 +1643,9 @@ class _EPChunkOperationBase:
                     state,
                     workspace_lease,
                 ) = next_state
+                # `next_state` was prefetched by the preceding iteration. Retire
+                # the prior large context before this chunk can enter FC1/SwiGLU.
+                retire_pending_dispatch_bwd()
                 combine_state = submit_combine_bwd(
                     chunk_idx,
                     start,
@@ -1802,48 +1834,14 @@ class _EPChunkOperationBase:
                         del grad_recv_hidden, grad_recv_probs, hidden_reuse_base
 
                 pending_dispatch_bwd.append((chunk, local_state))
+                if len(pending_dispatch_bwd) > 1:
+                    raise RuntimeError("EP chunk fused backward pending queue exceeded one chunk")
 
         if last_wgrad_done is None:
             raise RuntimeError("EP chunk fused backward did not flush expert wgrads")
         _queue_backward_stream_wait(last_wgrad_done, grad_2d.device)
 
-        for chunk, local_state in pending_dispatch_bwd:
-            with torch.cuda.stream(compute_stream):
-                grad_hidden, grad_scores = (
-                    chunk.dispatcher.finish_deepep_dispatch_backward(
-                        local_state["dispatch_bwd_state"]
-                    )
-                )
-                if grad_scores is None:
-                    if chunk.scores_shape is None or chunk.scores_dtype is None:
-                        raise RuntimeError("Missing router score metadata.")
-                    grad_scores = torch.zeros(
-                        chunk.scores_shape,
-                        device=grad_2d.device,
-                        dtype=chunk.scores_dtype,
-                    )
-                router_output = (
-                    chunk.scores_edge if chunk.scores_edge is not None else chunk.scores
-                )
-                if router_output is None:
-                    raise RuntimeError("EP chunk overlap router graph was released.")
-                router_grads = torch.autograd.grad(
-                    router_output,
-                    (chunk.x, *router_params),
-                    grad_scores.to(chunk.scores_dtype),
-                    allow_unused=True,
-                )
-                grad_score_x = router_grads[0]
-                if grad_score_x is None:
-                    grad_score_x = torch.zeros_like(chunk.x)
-                grad_x_chunks[chunk.idx] = grad_hidden.to(chunk.x.dtype) + grad_score_x
-                _accumulate(router_accum, router_params, router_grads[1:])
-                chunk.scores = None
-                chunk.scores_edge = None
-                consumed = torch.cuda.Event()
-                consumed.record(compute_stream)
-                chunk.workspace_lease.release(consumed)
-                local_state.clear()
+        retire_pending_dispatch_bwd()
 
         done = torch.cuda.Event()
         done.record(compute_stream)
@@ -1889,7 +1887,7 @@ class _EPChunkOperationBase:
 
         for saved in reversed(context.chunks):
             lease = self.workspace.acquire(
-                saved.idx,
+                saved.idx % EP_CHUNK_COUNT,
                 stream=comm_stream,
                 require_dispatcher=False,
             )
@@ -2102,7 +2100,10 @@ class _SavedContextEPChunkFunction(torch.autograd.Function):
             x_graph = x_2d.detach().requires_grad_(True)
             output, saved_context = forward_op._forward_saved_context_async(
                 x_graph,
-                ep_chunk_ranges(x_graph.size(0)),
+                ep_chunk_ranges(
+                    x_graph.size(0),
+                    chunk_count=forward_op._logical_chunk_count,
+                ),
                 input_shape,
                 x_graph.dtype,
             )
@@ -2151,7 +2152,9 @@ class EPChunkForwardOp(_EPChunkOperationBase):
                 x.dtype,
                 *params,
             )
-        ranges = ep_chunk_ranges(x_2d.size(0))
+        ranges = ep_chunk_ranges(
+            x_2d.size(0), chunk_count=self._logical_chunk_count
+        )
         with self._routing_context(routing_input):
             return self._forward_output_async(
                 x_2d,
@@ -2311,6 +2314,55 @@ def _accumulate(
             accum[idx] = grad
         else:
             accum[idx].add_(grad)
+
+
+def _retire_one_fused_dispatch_bwd(
+    pending: list[tuple[_BackwardChunk, dict[str, Any]]],
+    *,
+    compute_stream: torch.cuda.Stream,
+    grad_2d: torch.Tensor,
+    router_params: tuple[torch.Tensor, ...],
+    grad_x_chunks: list[torch.Tensor | None],
+    router_accum: list[torch.Tensor | None],
+) -> None:
+    """Finish one dispatched backward chunk and release its slot lease."""
+    if len(pending) > 1:
+        raise RuntimeError("EP chunk fused backward retained more than one pending chunk")
+    if not pending:
+        return
+    chunk, local_state = pending.pop()
+    with torch.cuda.stream(compute_stream):
+        grad_hidden, grad_scores = chunk.dispatcher.finish_deepep_dispatch_backward(
+            local_state["dispatch_bwd_state"]
+        )
+        if grad_scores is None:
+            if chunk.scores_shape is None or chunk.scores_dtype is None:
+                raise RuntimeError("Missing router score metadata.")
+            grad_scores = torch.zeros(
+                chunk.scores_shape,
+                device=grad_2d.device,
+                dtype=chunk.scores_dtype,
+            )
+        router_output = chunk.scores_edge if chunk.scores_edge is not None else chunk.scores
+        if router_output is None:
+            raise RuntimeError("EP chunk overlap router graph was released.")
+        router_grads = torch.autograd.grad(
+            router_output,
+            (chunk.x, *router_params),
+            grad_scores.to(chunk.scores_dtype),
+            allow_unused=True,
+        )
+        grad_score_x = router_grads[0]
+        if grad_score_x is None:
+            grad_score_x = torch.zeros_like(chunk.x)
+        grad_x_chunks[chunk.idx] = grad_hidden.to(chunk.x.dtype) + grad_score_x
+        _accumulate(router_accum, router_params, router_grads[1:])
+        chunk.scores = None
+        chunk.scores_edge = None
+        consumed = torch.cuda.Event()
+        consumed.record(compute_stream)
+        chunk.workspace_lease.release(consumed)
+        local_state.clear()
 
 
 def _materialize(

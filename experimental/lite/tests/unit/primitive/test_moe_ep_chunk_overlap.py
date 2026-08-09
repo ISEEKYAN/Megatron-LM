@@ -23,6 +23,27 @@ def test_fixed_two_chunk_ranges_cover_each_token_exactly_once():
     )
 
 
+@pytest.mark.parametrize(
+    ("chunk_count", "expected"),
+    [
+        (2, [(0, 6), (6, 11)]),
+        (3, [(0, 4), (4, 8), (8, 11)]),
+        (4, [(0, 3), (3, 6), (6, 9), (9, 11)]),
+    ],
+)
+def test_parameterized_chunk_ranges_cover_odd_rows_once(chunk_count, expected):
+    ranges = ep_chunk_ranges(11, chunk_count=chunk_count)
+
+    assert ranges == expected
+    assert [token for start, end in ranges for token in range(start, end)] == list(
+        range(11)
+    )
+
+
+def test_parameterized_ranges_return_exact_chunk_count_when_rows_do_not_divide():
+    assert ep_chunk_ranges(6, chunk_count=4) == [(0, 2), (2, 4), (4, 5), (5, 6)]
+
+
 @pytest.mark.parametrize("tokens", [0, 1])
 def test_fixed_two_chunk_ranges_fail_loud_when_both_chunks_cannot_be_live(tokens):
     with pytest.raises(ValueError, match="at least two tokens"):
@@ -118,7 +139,9 @@ def test_three_ops_direct_behavior_contracts(transformer_engine_import_stub):
     def workspace(op):
         dispatchers = [SimpleNamespace(use_deepep=True) for _ in range(2)]
         return SimpleNamespace(
-            key=SimpleNamespace(op=op),
+            key=SimpleNamespace(
+                op=op, shape_profile=SimpleNamespace(chunk_count=2)
+            ),
             dispatcher=lambda slot: dispatchers[slot],
             reset_tensors=lambda **_kwargs: None,
         )

@@ -230,6 +230,83 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
 
 
 @pytest.mark.parametrize(
+    ("mtp_enable", "requested_chunk_count", "expected_chunk_count", "expected_moe_layers"),
+    [(False, None, 2, 1), (True, 3, 3, 3)],
+)
+def test_qwen3_model_build_propagates_logical_chunk_count_to_decoder_and_mtp(
+    mtp_enable,
+    requested_chunk_count,
+    expected_chunk_count,
+    expected_moe_layers,
+    monkeypatch,
+    transformer_engine_import_stub,
+):
+    """Exercise the real Qwen composition, including MTP's nested TransformerLayer."""
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import model
+    from megatron.lite.primitive.parallel import ParallelState
+
+    class NoOpModule(torch.nn.Identity):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    class FakeWorkspace:
+        def __init__(self, key):
+            self.key = key
+
+    class FakeOp:
+        def __init__(self, **kwargs):
+            self.workspace = kwargs["workspace"]
+
+    for name in (
+        "GQAttention",
+        "TopKRouter",
+        "Experts",
+        "VocabParallelEmbedding",
+        "VocabParallelOutput",
+        "VanillaColumnParallelLinear",
+    ):
+        monkeypatch.setattr(model, name, NoOpModule)
+    monkeypatch.setattr(model.te, "RMSNorm", NoOpModule)
+    monkeypatch.setattr(
+        model, "get_ep_chunk_workspace", lambda key, _factory: FakeWorkspace(key)
+    )
+    monkeypatch.setattr(model, "EPChunkForwardOp", FakeOp)
+    monkeypatch.setattr(model, "EPChunkBackwardOp", FakeOp)
+    monkeypatch.setattr(model, "EPChunkFusedForwardBackwardOp", FakeOp)
+
+    hf = _tiny_qwen3_hf_dict()
+    if mtp_enable:
+        hf["num_nextn_predict_layers"] = 2
+    config = Qwen3MoEConfig._from_hf_dict(hf)
+    model_kwargs = dict(
+        use_deepep=True,
+        mtp_enable=mtp_enable,
+        enable_ep_chunk_overlap=True,
+        ep_chunk_max_token_rows_per_rank=8,
+    )
+    if requested_chunk_count is not None:
+        model_kwargs["ep_chunk_count"] = requested_chunk_count
+    built = model.Qwen3MoEModel(
+        config,
+        ParallelState(ep_size=2, tp_ep_group=object()),
+        **model_kwargs,
+    )
+
+    moe_layers = [layer.moe for layer in built.layers]
+    if mtp_enable:
+        assert built.mtp is not None
+        moe_layers.extend(layer.transformer_layer.moe for layer in built.mtp.layers)
+    assert len(moe_layers) == expected_moe_layers
+    assert {
+        moe.ep_chunk_forward.workspace.key.shape_profile.chunk_count for moe in moe_layers
+    } == {expected_chunk_count}
+    assert {
+        moe.ep_chunk_backward.workspace.key.shape_profile.chunk_count for moe in moe_layers
+    } == {expected_chunk_count}
+
+
+@pytest.mark.parametrize(
     "full_recompute,expected_ops",
     [
         (False, {"forward", "backward"}),

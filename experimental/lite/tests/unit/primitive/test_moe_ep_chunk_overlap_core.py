@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -51,6 +52,79 @@ def test_finished_deepep_dispatch_shape_contract_executes_with_fake_dispatcher(
     state, dispatched = dispatcher.finish(recv_rows=4, expert_rows=9)
     with pytest.raises(RuntimeError, match="expert rows"):
         _validate_finished_deepep_dispatch(profile, state, dispatched)
+
+
+def test_fused_pending_retirement_releases_before_the_next_large_context(
+    monkeypatch, transformer_engine_import_stub
+):
+    """CPU behavior contract for the production fused pending-retirement primitive."""
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import moe_ep_chunk_overlap as overlap
+
+    events = []
+
+    class FakeEvent:
+        def record(self, _stream):
+            events.append("lease-release-event")
+
+    class FakeDispatcher:
+        def finish_deepep_dispatch_backward(self, _state):
+            events.append("retire-dispatch-bwd")
+            return torch.ones(1, 1), torch.ones(1, 1)
+
+    class FakeLease:
+        def release(self, _event):
+            events.append("lease-release")
+
+    monkeypatch.setattr(overlap.torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(overlap.torch.cuda, "Event", FakeEvent)
+    x = torch.ones(1, 1, requires_grad=True)
+    scores = x * 2
+    chunk = overlap._BackwardChunk(
+        idx=0,
+        start=0,
+        end=1,
+        x=x,
+        scores=scores,
+        handle=None,
+        row_id_map=torch.zeros(1, dtype=torch.long),
+        prob_flat_indices=torch.zeros(1, dtype=torch.long),
+        recv_hidden_shape=torch.Size((1, 1)),
+        recv_hidden_dtype=torch.float32,
+        recv_probs_shape=torch.Size((1, 1)),
+        recv_probs_dtype=torch.float32,
+        recv_probs_base=None,
+        dispatched=None,
+        probs=None,
+        expert_out=None,
+        dispatcher=FakeDispatcher(),
+        workspace_lease=FakeLease(),
+        scores_shape=scores.shape,
+        scores_dtype=scores.dtype,
+    )
+    pending = [(chunk, {"dispatch_bwd_state": object()})]
+    grad_x_chunks = [None]
+
+    events.append("prefetch-next")
+    overlap._retire_one_fused_dispatch_bwd(
+        pending,
+        compute_stream=object(),
+        grad_2d=torch.ones(1, 1),
+        router_params=(),
+        grad_x_chunks=grad_x_chunks,
+        router_accum=[],
+    )
+    events.append("expert-start-next")
+
+    assert pending == []
+    torch.testing.assert_close(grad_x_chunks[0], torch.full((1, 1), 3.0))
+    assert events == [
+        "prefetch-next",
+        "retire-dispatch-bwd",
+        "lease-release-event",
+        "lease-release",
+        "expert-start-next",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -121,6 +195,8 @@ def test_all_three_dispatch_finish_paths_validate_before_expert_or_arena(
         validated = source.index("_validate_finished_deepep_dispatch")
         expert = source.index("self.experts(", validated)
         assert validated < expert
+
+
 
 
 def test_three_ops_expose_bounded_nvtx_phase_ranges():

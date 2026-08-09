@@ -84,6 +84,44 @@ def test_three_explicit_ops_have_fixed_two_chunk_contract(
     )
 
 
+@pytest.mark.parametrize("chunk_count", [2, 3, 4])
+def test_logical_chunk_count_is_profile_contract_but_workspace_stays_two_slots(
+    chunk_count, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EP_CHUNK_COUNT,
+        EPChunkShapeProfile,
+        EPChunkWorkspaceKey,
+        EPChunkWorkspaceRegistry,
+    )
+
+    profile = EPChunkShapeProfile(
+        max_input_rows=17,
+        hidden_size=4,
+        topk=2,
+        ep_size=4,
+        chunk_count=chunk_count,
+    )
+    workspace = EPChunkWorkspaceRegistry().get_or_create(
+        EPChunkWorkspaceKey(
+            op="forward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=31,
+            dtype=torch.float32,
+            shape_profile=profile,
+        ),
+        lambda slot: f"dispatcher-{slot}",
+    )
+    workspace.materialize(device="cpu")
+
+    assert profile.chunk_count == chunk_count
+    assert EP_CHUNK_COUNT == 2
+    assert workspace.evidence()["dispatcher_count"] == 2
+    assert workspace.metrics()["fallbacks"] == 0
+
+
 def test_three_ops_get_independent_cross_layer_workspaces(
     transformer_engine_import_stub,
 ):

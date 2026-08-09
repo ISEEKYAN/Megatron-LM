@@ -90,6 +90,7 @@ class MoELayer(nn.Module):
         moe_act_recompute: bool = False,
         enable_ep_chunk_overlap: bool = False,
         ep_chunk_max_token_rows_per_rank: int | None = None,
+        ep_chunk_count: int = 2,
         ep_chunk_full_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
     ):
@@ -130,6 +131,7 @@ class MoELayer(nn.Module):
                 hidden_size=config.hidden_size,
                 topk=config.num_experts_per_tok,
                 ep_size=ps.ep_size,
+                chunk_count=ep_chunk_count,
             )
             common_key = dict(
                 device_type="cuda",
@@ -368,6 +370,7 @@ class TransformerLayer(nn.Module):
         use_thd: bool = False,
         enable_ep_chunk_overlap: bool = False,
         ep_chunk_max_token_rows_per_rank: int | None = None,
+        ep_chunk_count: int = 2,
         ep_chunk_full_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
     ):
@@ -401,6 +404,7 @@ class TransformerLayer(nn.Module):
             moe_act_recompute=moe_act_recompute,
             enable_ep_chunk_overlap=enable_ep_chunk_overlap,
             ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+            ep_chunk_count=ep_chunk_count,
             ep_chunk_full_recompute=ep_chunk_full_recompute,
             lora_config=lora_config,
         )
@@ -465,6 +469,7 @@ class MultiTokenPredictionLayer(nn.Module):
         use_thd: bool,
         enable_ep_chunk_overlap: bool,
         ep_chunk_max_token_rows_per_rank: int | None,
+        ep_chunk_count: int,
         ep_chunk_full_recompute: bool,
         detach_encoder: bool,
         lora_config: LoraConfig | dict | None,
@@ -493,6 +498,7 @@ class MultiTokenPredictionLayer(nn.Module):
             use_thd=use_thd,
             enable_ep_chunk_overlap=enable_ep_chunk_overlap,
             ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+            ep_chunk_count=ep_chunk_count,
             ep_chunk_full_recompute=ep_chunk_full_recompute,
             lora_config=lora_config,
         )
@@ -552,6 +558,7 @@ class MultiTokenPredictionBlock(nn.Module):
         use_thd: bool,
         enable_ep_chunk_overlap: bool,
         ep_chunk_max_token_rows_per_rank: int | None,
+        ep_chunk_count: int,
         ep_chunk_full_recompute: bool,
         detach_encoder: bool,
         repeated_layer: bool,
@@ -575,6 +582,7 @@ class MultiTokenPredictionBlock(nn.Module):
                     use_thd=use_thd,
                     enable_ep_chunk_overlap=enable_ep_chunk_overlap,
                     ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+                    ep_chunk_count=ep_chunk_count,
                     ep_chunk_full_recompute=ep_chunk_full_recompute,
                     detach_encoder=detach_encoder,
                     lora_config=lora_config,
@@ -634,6 +642,7 @@ class Qwen3MoEModel(nn.Module):
         mtp_detach_encoder: bool = False,
         enable_ep_chunk_overlap: bool = False,
         ep_chunk_max_token_rows_per_rank: int | None = None,
+        ep_chunk_count: int = 2,
         ep_chunk_full_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
     ):
@@ -683,6 +692,7 @@ class Qwen3MoEModel(nn.Module):
                     use_thd=use_thd,
                     enable_ep_chunk_overlap=enable_ep_chunk_overlap,
                     ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+                    ep_chunk_count=ep_chunk_count,
                     ep_chunk_full_recompute=ep_chunk_full_recompute,
                     lora_config=lora_config,
                 )
@@ -716,6 +726,7 @@ class Qwen3MoEModel(nn.Module):
                 use_thd=use_thd,
                 enable_ep_chunk_overlap=enable_ep_chunk_overlap,
                 ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+                ep_chunk_count=ep_chunk_count,
                 ep_chunk_full_recompute=ep_chunk_full_recompute,
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
