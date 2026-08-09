@@ -447,7 +447,7 @@ def _optimizer_param_range(
     if not owners:
         return None
     leaf_index, optimizer = owners[0]
-    assert getattr(parameter, "allreduce", None) is (not is_fc)
+    _assert_model_owned_bank_allreduce(parameter, is_fc=is_fc)
     gbuf_index, dtype, bucket_index = optimizer.model_param_gbuf_map[parameter]
     range_map = optimizer.gbuf_ranges[gbuf_index][dtype][bucket_index]
     param_range = range_map["param_map"][parameter]
@@ -460,6 +460,14 @@ def _optimizer_param_range(
     assert _group_ranks(optimizer.data_parallel_group) == expected_ranks
     assert _group_ranks(buffer.data_parallel_group) == expected_ranks
     return leaf_index, optimizer, param_range, buffer, bucket
+
+
+def _assert_model_owned_bank_allreduce(parameter: torch.Tensor, *, is_fc: bool) -> None:
+    """Check explicit optimizer ownership without relying on bool identity."""
+    value = getattr(parameter, "allreduce", None)
+    assert value is not None, "model-owned LoRA bank is missing allreduce ownership"
+    # Megatron may attach a bool-like scalar rather than Python's singleton.
+    assert bool(value) == (not is_fc)
 
 
 def _dense_owner_record(

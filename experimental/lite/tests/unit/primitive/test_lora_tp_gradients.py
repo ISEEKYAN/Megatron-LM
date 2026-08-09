@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -784,3 +785,14 @@ def test_optimizer_owned_bank_owner_error_is_visible_to_every_rank_gloo(tmp_path
     ]
     if init_file.exists():
         os.unlink(init_file)
+
+
+def test_model_owned_bank_allreduce_is_explicit_and_bool_like():
+    from experimental.lite.tests.smoke.primitive.test_multi_lora_ep2_production_gpu import (
+        _assert_model_owned_bank_allreduce,
+    )
+
+    _assert_model_owned_bank_allreduce(SimpleNamespace(allreduce=1), is_fc=False)
+    _assert_model_owned_bank_allreduce(SimpleNamespace(allreduce=0), is_fc=True)
+    with pytest.raises(AssertionError, match="missing allreduce"):
+        _assert_model_owned_bank_allreduce(SimpleNamespace(), is_fc=False)
