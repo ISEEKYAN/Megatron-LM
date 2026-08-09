@@ -1094,6 +1094,17 @@ def test_shared_owner_reuses_all_large_activation_names_across_ops(
         ).data_ptr()
         for name in names
     }
+    # FC2 output is phase-reused by its input-gradient and then FC1's
+    # input-gradient; the shared physical allocation is raw-byte storage.
+    assert first_ptrs["fc1_dgrad"] == first_ptrs["fc2_output"]
+    assert first_ptrs["fc2_dgrad"] == first_ptrs["fc2_output"]
+    assert len(set(first_ptrs.values())) == 3
+    owner = forward._expert_activation_owner
+    assert set(owner.arena.tensors) == {
+        "fc1_input",
+        "fc1_output",
+        "fc2_output",
+    }
     pending = _FakeEvent(ready=False)
     first.release(pending)
     stream = _FakeStream()
@@ -1106,7 +1117,6 @@ def test_shared_owner_reuses_all_large_activation_names_across_ops(
     }
     assert stream.waited == [pending]
     assert second_ptrs == first_ptrs
-    owner = forward._expert_activation_owner
     assert owner.grows == 0
     for tensor in owner.arena.tensors.values():
         requested_bytes = 131963 * 16 * tensor.element_size()
@@ -1131,6 +1141,56 @@ def test_shared_owner_reuses_all_large_activation_names_across_ops(
     assert fused._expert_activation_owner.arena.tensors
     registry.release(fused.key)
     assert not owner.arena.tensors
+
+
+def test_colored_storage_cannot_grow_after_its_first_active_lease_view(
+    transformer_engine_import_stub,
+):
+    """A larger same-lease raw view must not strand the earlier storage alias."""
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="fused_forward_backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=99,
+            dtype=torch.float32,
+            shape_profile=profile_type(
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=2
+            ),
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    first_width = 2 * 1024 * 1024
+    first = workspace.acquire_expert_activation()
+    first_view = first.tensor(
+        "fc2_dgrad", (1, first_width), dtype=torch.float32, device="cpu"
+    )
+    first_ptr = first_view.data_ptr()
+    with pytest.raises(RuntimeError, match="during an active lease"):
+        first.tensor(
+            "fc2_output", (1, first_width + 1), dtype=torch.float32, device="cpu"
+        )
+    assert first_view.data_ptr() == first_ptr
+    first.release(_FakeEvent(ready=True))
+
+    # The next lease is safe to grow because acquire clears issued slots only
+    # after the preceding consumer event has become ready.
+    second = workspace.acquire_expert_activation()
+    second_view = second.tensor(
+        "fc2_output", (1, first_width + 1), dtype=torch.float32, device="cpu"
+    )
+    assert second_view.data_ptr() != first_ptr
+    second.release(_FakeEvent(ready=True))
 
 
 @pytest.mark.parametrize(

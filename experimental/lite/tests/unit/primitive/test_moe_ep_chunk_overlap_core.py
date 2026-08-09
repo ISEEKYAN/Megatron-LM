@@ -1918,6 +1918,7 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
         torch.zeros(shape, dtype=dtype) if zero else torch.ones(shape, dtype=dtype)
     )
     cpp = sys.modules["transformer_engine.pytorch.cpp_extensions"]
+    trace = {"fc1_dgrad_ptr": None, "events": []}
 
     def fake_grouped_gemm(
         weights, inputs, outputs, quantization_params=None, out_dtype=None, **kwargs
@@ -1935,6 +1936,15 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
         else:
             pieces = [inp @ weight.T for weight, inp in zip(weights, inputs)]
         outputs[0].copy_(torch.cat(pieces, dim=0))
+        if (
+            kwargs.get("layout") == "NN"
+            and outputs[0].data_ptr() == trace["fc1_dgrad_ptr"]
+        ):
+            trace["events"].append(
+                "fc2_dgrad_first_write"
+                if outputs[0].shape[1] == 3
+                else "fc1_dgrad_first_write"
+            )
         return None, [None] * len(pieces), None
 
     cpp.general_grouped_gemm = fake_grouped_gemm
@@ -2042,6 +2052,110 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
     assert len(linear.wgrad_store.entries) == 1
     tensors, delayed = linear.wgrad_store.entries.pop()
     delayed(*tensors)
+
+    # Full two-linear CPU probe: use the production workspace's raw-byte
+    # coloring, run fake general_grouped_gemm forward, let an external consumer
+    # read FC2 output, then verify the FC2-DGRAD -> SwiGLU -> FC1-DGRAD reuse order.
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkShapeProfile,
+        EPChunkWorkspaceKey,
+        EPChunkWorkspaceRegistry,
+    )
+
+    workspace = EPChunkWorkspaceRegistry().get_or_create(
+        EPChunkWorkspaceKey(
+            op="fused_forward_backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=101,
+            dtype=torch.bfloat16,
+            shape_profile=EPChunkShapeProfile(
+                max_input_rows=8, hidden_size=2, topk=2, ep_size=2
+            ),
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    lease = workspace.acquire_expert_activation()
+    colored_fc1_out = lease.tensor(
+        "fc1_output", (2, 3), dtype=torch.bfloat16, device="cpu"
+    )
+    colored_fc2_out = lease.tensor(
+        "fc2_output", (2, 2), dtype=torch.bfloat16, device="cpu"
+    )
+    colored_fc1_dgrad = lease.tensor(
+        "fc1_dgrad", (2, 2), dtype=torch.bfloat16, device="cpu"
+    )
+    colored_fc2_dgrad = lease.tensor(
+        "fc2_dgrad", (2, 3), dtype=torch.bfloat16, device="cpu"
+    )
+    assert colored_fc2_out.data_ptr() == colored_fc1_dgrad.data_ptr()
+    assert colored_fc2_out.data_ptr() == colored_fc2_dgrad.data_ptr()
+
+    fc1 = Linear()
+    fc2 = Linear()
+    fc2.weight0 = torch.nn.Parameter(
+        torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 1.0]], dtype=torch.bfloat16)
+    )
+    fc2.weight1 = torch.nn.Parameter(
+        torch.tensor([[2.0, 0.0, 0.0], [0.0, 3.0, 0.0]], dtype=torch.bfloat16)
+    )
+    for weight in (fc2.weight0, fc2.weight1):
+        weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+        weight.grad_added_to_main_grad = False
+        weight.zero_out_wgrad = True
+    colored_x = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16, requires_grad=True
+    )
+    trace["fc1_dgrad_ptr"] = colored_fc1_dgrad.data_ptr()
+    colored_fc1 = experts_module._caller_owned_grouped_linear(
+        fc1, colored_x, [1, 1], colored_fc1_out, colored_fc1_dgrad
+    )
+
+    class FakeSwiGLU(torch.autograd.Function):
+        """CPU stand-in that records FC2-dgrad's final intermediate consumer."""
+
+        @staticmethod
+        def forward(ctx, value):
+            return value.clone()
+
+        @staticmethod
+        def backward(ctx, grad):
+            trace["events"].append("swiglu_intermediate_consumer")
+            return grad
+
+    colored_fc2 = experts_module._caller_owned_grouped_linear(
+        fc2,
+        FakeSwiGLU.apply(colored_fc1),
+        [1, 1],
+        colored_fc2_out,
+        colored_fc2_dgrad,
+    )
+    torch.testing.assert_close(
+        colored_fc2, torch.tensor([[22.0, 28.0], [4.0, 36.0]], dtype=torch.bfloat16)
+    )
+    trace["events"].append("fc2_output_external_consumer")
+    (
+        colored_fc2 * torch.tensor([[2.0, 3.0], [5.0, 7.0]], dtype=torch.bfloat16)
+    ).float().sum().backward()
+    assert trace["events"] == [
+        "fc2_output_external_consumer",
+        "fc2_dgrad_first_write",
+        "swiglu_intermediate_consumer",
+        "fc1_dgrad_first_write",
+    ]
+    assert colored_x.grad is not None
+    assert colored_x.grad.data_ptr() == colored_fc1_dgrad.data_ptr()
+    torch.testing.assert_close(
+        colored_x.grad,
+        torch.tensor([[36.0, 46.0], [20.0, 53.0]], dtype=torch.bfloat16),
+    )
+
+    class ReadyEvent:
+        @staticmethod
+        def query():
+            return True
+
+    lease.release(ReadyEvent())
 
     # TE2.15 must defer MCore-FSDP main_grad lookup until backward, after the
     # framework has materialized the sink.  The saved weight Tensor is not the

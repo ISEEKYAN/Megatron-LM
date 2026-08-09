@@ -230,6 +230,16 @@ class _EPChunkAllocationArena:
 
 _EXPERT_ACTIVATION_SIZE_CLASS_BYTES = 8 * 1024 * 1024
 
+# These names are logical TE buffers.  FC2 output has an external consumer;
+# only after that consumer completes may its raw bytes be reused first for
+# FC2's input-gradient and then for FC1's input-gradient.  The latter two have
+# different widths, so the storage contract is byte-capacity based rather than
+# a tensor-shape alias.  FC1 input/output retain delayed or SwiGLU consumers.
+_EXPERT_ACTIVATION_STORAGE_SLOTS = {
+    "fc1_dgrad": "fc2_output",
+    "fc2_dgrad": "fc2_output",
+}
+
 
 def _expert_activation_capacity_bytes(requested_bytes: int) -> int:
     """Round an observed activation request to its 8 MiB reuse class."""
@@ -261,6 +271,7 @@ class _EPChunkSharedExpertActivationOwner:
     waits: int = 0
     allocations: int = 0
     grows: int = 0
+    issued_storage_slots: set[str] = field(default_factory=set)
 
     def acquire(self, *, stream: Any | None, device: torch.device) -> None:
         if self.arena.device is None:
@@ -287,6 +298,7 @@ class _EPChunkSharedExpertActivationOwner:
             self.waits += 1
         self.consumer_event = None
         self.in_use = True
+        self.issued_storage_slots.clear()
 
     def release(self, event: Any) -> None:
         self.consumer_event = event
@@ -319,36 +331,39 @@ class _EPChunkSharedExpertActivationOwner:
             raise RuntimeError(
                 f"EP chunk expert activation {name!r} shape {requested} dtype {dtype} exceeds profile ceiling {ceiling} dtype {expected_dtype}"
             )
-        existing = self.arena.tensors.get(name)
+        storage_name = _EXPERT_ACTIVATION_STORAGE_SLOTS.get(name, name)
+        existing = self.arena.tensors.get(storage_name)
+        requested_numel = 1
+        for dim in requested:
+            requested_numel *= dim
+        element_size = int(torch.empty((), dtype=dtype).element_size())
+        requested_bytes = requested_numel * element_size
         incompatible = existing is not None and (
-            existing.dtype != dtype
-            or existing.device != torch.device(device)
-            or existing.dim() != len(requested)
+            existing.dtype != dtype or existing.device != torch.device(device)
         )
         if incompatible:
             raise RuntimeError(
-                f"EP chunk expert activation {name!r} does not match its reusable storage"
+                f"EP chunk expert activation {name!r} does not match colored storage "
+                f"{storage_name!r}"
             )
-        required_rows = requested[0]
-        growing = existing is not None and required_rows > existing.shape[0]
+        growing = existing is not None and (
+            requested_bytes > existing.numel() * existing.element_size()
+        )
+        if growing and storage_name in self.issued_storage_slots:
+            raise RuntimeError(
+                "EP chunk expert activation cannot grow colored storage "
+                f"{storage_name!r} during an active lease"
+            )
         if existing is None or growing:
-            row_bytes = int(torch.empty((), dtype=dtype).element_size())
-            for dim in requested[1:]:
-                row_bytes *= dim
-            capacity_bytes = _expert_activation_capacity_bytes(
-                required_rows * row_bytes
-            )
-            capacity_rows = (capacity_bytes + row_bytes - 1) // row_bytes
+            capacity_bytes = _expert_activation_capacity_bytes(requested_bytes)
+            capacity_numel = (capacity_bytes + element_size - 1) // element_size
             with self.arena.allocate():
-                existing = torch.empty(
-                    (capacity_rows, *requested[1:]), dtype=dtype, device=device
-                )
-            self.arena.tensors[name] = existing
+                existing = torch.empty((capacity_numel,), dtype=dtype, device=device)
+            self.arena.tensors[storage_name] = existing
             self.allocations += 1
             self.grows += int(growing)
-        return (
-            existing[tuple(slice(0, dim) for dim in requested)].view(requested).detach()
-        )
+        self.issued_storage_slots.add(storage_name)
+        return existing.narrow(0, 0, requested_numel).view(requested).detach()
 
 
 class _EPChunkExpertActivationLease:
