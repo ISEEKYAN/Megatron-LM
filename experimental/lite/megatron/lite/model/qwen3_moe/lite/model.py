@@ -75,6 +75,12 @@ class _Qwen3EPChunkFullRecomputeFunction(torch.autograd.Function):
         grad_x, router_grads, expert_grads = layer.ep_chunk_fused.forward_backward(
             x_saved, grad_output
         )
+        reset_stream = (
+            torch.cuda.current_stream(grad_output.device)
+            if grad_output.is_cuda
+            else None
+        )
+        layer.ep_chunk_fused.workspace.reset_tensors(stream=reset_stream)
         return grad_x, None, *router_grads, *expert_grads
 
 
@@ -225,19 +231,32 @@ class MoELayer(nn.Module):
 
     def _ep_chunk_workspaces_for_phase(self, phase: str):
         """Select only workspaces first used by one execution phase."""
+        return tuple(
+            workspace
+            for workspace, _require_dispatcher in self._ep_chunk_requirements_for_phase(
+                phase
+            )
+        )
+
+    def _ep_chunk_requirements_for_phase(self, phase: str):
+        """Pair phase workspaces with their dispatcher materialization requirement."""
         if phase == "forward":
-            ops = (self.ep_chunk_forward,)
+            requirements = ((self.ep_chunk_forward, True),)
         elif phase == "backward":
-            ops = (
-                self.ep_chunk_fused
+            requirements = (
+                (self.ep_chunk_fused, True)
                 if self.ep_chunk_full_recompute
-                else self.ep_chunk_backward,
+                else (self.ep_chunk_backward, False),
             )
         else:
             raise ValueError(
                 f"Unsupported EP chunk workspace phase {phase!r}; expected 'forward' or 'backward'"
             )
-        return tuple(op.workspace for op in ops if op is not None)
+        return tuple(
+            (op.workspace, require_dispatcher)
+            for op, require_dispatcher in requirements
+            if op is not None
+        )
 
     def materialize_ep_chunk_workspaces(
         self,
@@ -246,8 +265,13 @@ class MoELayer(nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         """Materialize only the workspace needed by the requested execution phase."""
-        for workspace in self._ep_chunk_workspaces_for_phase(phase):
-            workspace.materialize(device=device)
+        for workspace, require_dispatcher in self._ep_chunk_requirements_for_phase(
+            phase
+        ):
+            if require_dispatcher:
+                workspace.materialize(device=device)
+            else:
+                workspace.prepare_scratch(device=device)
 
     def ep_chunk_workspace_evidence(self) -> dict[str, dict]:
         return {
@@ -266,6 +290,11 @@ class MoELayer(nn.Module):
         )
         for workspace in workspaces:
             release_ep_chunk_workspace(workspace.key, stream=stream)
+
+    def reset_ep_chunk_workspace_tensors(self, *, phase: str, stream=None) -> None:
+        """Drop phase scratch at an explicit safe boundary, retaining DeepEP state."""
+        for workspace in self._ep_chunk_workspaces_for_phase(phase):
+            workspace.reset_tensors(stream=stream)
 
 
 # ---------------------------------------------------------------------------

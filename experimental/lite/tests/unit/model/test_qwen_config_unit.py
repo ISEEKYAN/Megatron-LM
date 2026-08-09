@@ -144,9 +144,16 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
         def __init__(self, key):
             self.key = key
             self.materialize_devices = []
+            self.prepare_scratch_devices = []
+
+        def reset_tensors(self, *, stream=None):
+            del stream
 
         def materialize(self, *, device=None):
             self.materialize_devices.append(device)
+
+        def prepare_scratch(self, *, device=None):
+            self.prepare_scratch_devices.append(device)
 
     class FakeOp:
         def __init__(self, **kwargs):
@@ -210,7 +217,8 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
     layer.materialize_ep_chunk_workspaces(
         phase="backward", device=model.torch.device("cuda", 3)
     )
-    assert by_op["backward"].materialize_devices == [model.torch.device("cuda", 3)]
+    assert by_op["backward"].materialize_devices == []
+    assert by_op["backward"].prepare_scratch_devices == [model.torch.device("cuda", 3)]
 
     stream = object()
     layer.release_ep_chunk_workspaces(phase="forward", stream=stream)
@@ -248,6 +256,9 @@ def test_qwen3_builds_only_two_cross_layer_workspaces_for_48_layers(
         def materialize(self, *, device=None):
             if not self.dispatchers:
                 self.dispatchers = [self.factory(0), self.factory(1)]
+
+        def prepare_scratch(self, *, device=None):
+            del device
 
     class FakeOp:
         def __init__(self, **kwargs):
@@ -299,7 +310,7 @@ def test_qwen3_builds_only_two_cross_layer_workspaces_for_48_layers(
         registry[next(key for key in registry if key.op != "forward")].dispatchers == []
     )
     layers[0].materialize_ep_chunk_workspaces(phase="backward", device="cpu")
-    assert dispatcher_count == 4
+    assert dispatcher_count == (4 if full_recompute else 2)
     assert len({id(layer.ep_chunk_forward.workspace) for layer in layers}) == 1
     companion = "ep_chunk_fused" if full_recompute else "ep_chunk_backward"
     assert len({id(getattr(layer, companion).workspace) for layer in layers}) == 1
@@ -436,6 +447,9 @@ def test_qwen3_training_mode_matches_no_recompute_and_full_recompute_parity(
         def __init__(self, key):
             self.key = key
 
+        def reset_tensors(self, *, stream=None):
+            del stream
+
     class FakeForward:
         def __init__(self, *, backward_op=None, **_kwargs):
             self.backward_op = backward_op
@@ -467,8 +481,8 @@ def test_qwen3_training_mode_matches_no_recompute_and_full_recompute_parity(
             return grad_output * 2, [], []
 
     class FakeFused:
-        def __init__(self, **_kwargs):
-            pass
+        def __init__(self, **kwargs):
+            self.workspace = kwargs["workspace"]
 
         def forward_backward(self, _x_saved, grad_output, _routing_input=None):
             calls["fused"] += 1
@@ -517,11 +531,15 @@ def test_qwen3_full_recompute_initial_forward_runs_no_grad_then_fused_backward(
     transformer_engine_import_stub()
     from megatron.lite.model.qwen3_moe.lite import model
 
-    calls = {"forward": 0, "backward": 0, "fused": 0}
+    calls = {"forward": 0, "backward": 0, "fused": 0, "reset": 0}
 
     class FakeWorkspace:
         def __init__(self, key):
             self.key = key
+
+        def reset_tensors(self, *, stream=None):
+            del stream
+            calls["reset"] += 1
 
     class FakeForward:
         def __init__(self, *, backward_op=None, **_kwargs):
@@ -540,8 +558,8 @@ def test_qwen3_full_recompute_initial_forward_runs_no_grad_then_fused_backward(
             raise AssertionError("full recompute must not construct BackwardOp")
 
     class FakeFused:
-        def __init__(self, **_kwargs):
-            pass
+        def __init__(self, **kwargs):
+            self.workspace = kwargs["workspace"]
 
         def forward_backward(self, _x_saved, grad_output, _routing_input=None):
             calls["fused"] += 1
@@ -577,7 +595,7 @@ def test_qwen3_full_recompute_initial_forward_runs_no_grad_then_fused_backward(
     actual.sum().backward()
 
     torch.testing.assert_close(value.grad, torch.full_like(value, 3))
-    assert calls == {"forward": 1, "backward": 0, "fused": 1}
+    assert calls == {"forward": 1, "backward": 0, "fused": 1, "reset": 1}
 
 
 def test_qwen3_full_recompute_custom_function_forward_is_framework_no_grad(

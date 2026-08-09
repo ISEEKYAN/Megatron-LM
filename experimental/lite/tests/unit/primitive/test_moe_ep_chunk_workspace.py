@@ -301,6 +301,286 @@ def test_backward_scratch_is_actual_shape_lazy_then_steady_state_stable(
     assert workspace.metrics() == first_metrics
 
 
+def test_backward_scratch_only_lease_does_not_materialize_dispatchers_or_pools(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    created = []
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=17,
+            dtype=torch.float32,
+            shape_profile=profile_type(
+                max_input_rows=8,
+                hidden_size=4,
+                topk=2,
+                ep_size=4,
+            ),
+        ),
+        lambda slot: created.append(slot) or f"dispatcher-{slot}",
+    )
+
+    lease = workspace.acquire(0, require_dispatcher=False)
+    scratch = lease.tensor(
+        "grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu"
+    )
+
+    assert scratch.shape == (9, 4)
+    assert created == []
+    assert workspace.evidence()["dispatcher_count"] == 0
+    assert workspace.evidence()["allocation_pool_count"] == 0
+    with pytest.raises(RuntimeError, match="scratch-only lease has no dispatcher"):
+        _ = lease.dispatcher
+    lease.release(_FakeEvent(ready=True))
+
+
+def test_dispatcher_backed_lease_still_materializes_two_dispatchers(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    created = []
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="fused_forward_backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=19,
+            dtype=torch.float32,
+            shape_profile=profile_type(
+                max_input_rows=8,
+                hidden_size=4,
+                topk=2,
+                ep_size=4,
+            ),
+        ),
+        lambda slot: created.append(slot) or f"dispatcher-{slot}",
+    )
+
+    lease = workspace.acquire(0)
+
+    assert lease.dispatcher == "dispatcher-0"
+    assert created == [0, 1]
+    assert workspace.evidence()["dispatcher_count"] == 2
+    lease.release(_FakeEvent(ready=True))
+
+
+def test_reset_tensors_waits_for_consumers_and_keeps_dispatchers(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=23,
+            dtype=torch.float32,
+            shape_profile=profile_type(
+                max_input_rows=8,
+                hidden_size=4,
+                topk=2,
+                ep_size=4,
+            ),
+        ),
+        lambda slot: f"dispatcher-{slot}",
+    )
+    lease = workspace.acquire(0)
+    tensor = lease.tensor("grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu")
+    lease.release(_FakeEvent(ready=False))
+
+    with pytest.raises(RuntimeError, match="pending consumer event"):
+        workspace.reset_tensors()
+
+    stream = _FakeStream()
+    workspace.reset_tensors(stream=stream)
+
+    evidence = workspace.evidence()
+    assert len(stream.waited) == 1
+    assert evidence["dispatcher_count"] == 2
+    assert evidence["data_ptrs"] == {}
+    assert evidence["tensor_details"] == {}
+    assert tensor.shape == (9, 4)
+
+
+def test_workspace_evidence_reports_actual_scratch_shape_dtype_and_bytes(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=29,
+            dtype=torch.float32,
+            shape_profile=profile_type(
+                max_input_rows=8,
+                hidden_size=4,
+                topk=2,
+                ep_size=4,
+            ),
+        ),
+        lambda slot: f"dispatcher-{slot}",
+    )
+    lease = workspace.acquire(0, require_dispatcher=False)
+    lease.tensor("grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu")
+    lease.tensor("grad_recv_probs", (9, 2), dtype=torch.float32, device="cpu")
+    lease.release(_FakeEvent(ready=True))
+
+    details = workspace.evidence()["tensor_details"]
+    assert details == {
+        "0:grad_recv_hidden": {
+            "shape": (9, 4),
+            "dtype": "torch.float32",
+            "nbytes": 9 * 4 * 4,
+        },
+        "0:grad_recv_probs": {
+            "shape": (9, 2),
+            "dtype": "torch.float32",
+            "nbytes": 9 * 2 * 4,
+        },
+    }
+
+
+def test_scratch_only_lease_allocates_from_borrowed_forward_arena(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=31,
+            dtype=torch.float32,
+            shape_profile=profile_type(
+                max_input_rows=8,
+                hidden_size=4,
+                topk=2,
+                ep_size=4,
+            ),
+        ),
+        lambda slot: f"unused-{slot}",
+    )
+    entered = []
+
+    class FakeArena:
+        @contextmanager
+        def allocate(self):
+            entered.append("enter")
+            yield
+            entered.append("exit")
+
+    lease = workspace.acquire(
+        0,
+        require_dispatcher=False,
+        allocation_arena=FakeArena(),
+    )
+    lease.tensor("grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu")
+
+    assert entered == ["enter", "exit"]
+    assert workspace.evidence()["dispatcher_count"] == 0
+    lease.release(_FakeEvent(ready=True))
+
+
+def test_fused_dispatcher_lease_allocates_scratch_from_its_own_slot_arena(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="fused_forward_backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=41,
+            dtype=torch.float32,
+            shape_profile=profile_type(
+                max_input_rows=8,
+                hidden_size=4,
+                topk=2,
+                ep_size=4,
+            ),
+        ),
+        lambda slot: f"fused-{slot}",
+    )
+    entered = []
+
+    class FakeArena:
+        allocation_pool = None
+        device = None
+
+        @contextmanager
+        def allocate(self):
+            entered.append("enter")
+            yield
+            entered.append("exit")
+
+    workspace._allocation_arenas[0] = FakeArena()
+    lease = workspace.acquire(0)
+    lease.tensor("grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu")
+
+    assert entered == ["enter", "exit"]
+    assert lease.allocation_arena is workspace.allocation_arena(0)
+    lease.release(_FakeEvent(ready=True))
+
+
 def test_profile_rejects_input_rows_beyond_qwen_capacity(
     transformer_engine_import_stub,
 ):
@@ -568,6 +848,7 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
         "grows": 0,
         "fallbacks": 0,
         "data_ptrs": {},
+        "tensor_details": {},
         "dispatcher_count": 0,
         "deepep_buffer_count": 0,
         "deepep_buffer_resident_bytes": 0,
@@ -771,6 +1052,7 @@ def test_saved_context_backward_uses_the_dispatcher_that_created_its_handle(
     assert "dispatcher=dispatcher" in forward_source
     assert "dispatcher=saved.dispatcher" in backward_source
     assert "dispatcher=lease.dispatcher" not in backward_source
+    assert "require_dispatcher=False" in backward_source
 
 
 def test_saved_forward_context_does_not_pin_two_shared_slots_across_layers(

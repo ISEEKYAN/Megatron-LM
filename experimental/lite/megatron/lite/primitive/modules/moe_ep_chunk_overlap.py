@@ -117,12 +117,46 @@ class _WorkspaceSlot:
     consumer_event: Any | None = None
 
 
+@dataclass
+class _EPChunkAllocationArena:
+    allocation_pool: Any | None = None
+    device: torch.device | None = None
+
+    @contextmanager
+    def allocate(self):
+        if self.allocation_pool is None:
+            yield
+            return
+        if self.device is None:
+            raise RuntimeError("EP chunk allocation arena has no bound device")
+        with torch.cuda.use_mem_pool(self.allocation_pool, device=self.device):
+            yield
+
+
 class EPChunkWorkspaceLease:
-    def __init__(self, workspace: "EPChunkWorkspace", slot: int):
+    def __init__(
+        self,
+        workspace: "EPChunkWorkspace",
+        slot: int,
+        *,
+        require_dispatcher: bool,
+        allocation_arena: _EPChunkAllocationArena | None = None,
+    ):
         self.workspace = workspace
         self.slot = slot
-        self.dispatcher = workspace.dispatcher(slot)
+        self._require_dispatcher = require_dispatcher
+        self.allocation_arena = (
+            workspace.allocation_arena(slot)
+            if allocation_arena is None
+            else allocation_arena
+        )
         self._active = True
+
+    @property
+    def dispatcher(self) -> TokenDispatcher:
+        if not self._require_dispatcher:
+            raise RuntimeError("EP chunk scratch-only lease has no dispatcher")
+        return self.workspace.dispatcher(self.slot)
 
     def tensor(
         self,
@@ -135,7 +169,12 @@ class EPChunkWorkspaceLease:
         if not self._active:
             raise RuntimeError("EP chunk workspace lease has already been released")
         return self.workspace._lease_tensor(
-            self.slot, name, shape, dtype=dtype, device=device
+            self.slot,
+            name,
+            shape,
+            dtype=dtype,
+            device=device,
+            allocation_arena=self.allocation_arena,
         )
 
     @contextmanager
@@ -143,7 +182,7 @@ class EPChunkWorkspaceLease:
         """Route DeepEP dispatch recv allocations through this slot's pool."""
         if not self._active:
             raise RuntimeError("EP chunk workspace lease has already been released")
-        with self.workspace._deepep_recv_allocation(self.slot):
+        with self.allocation_arena.allocate():
             yield
 
     def release(self, consumer_event: Any) -> None:
@@ -169,6 +208,9 @@ class EPChunkWorkspace:
         self._dispatcher_factory = dispatcher_factory
         self._registry: EPChunkWorkspaceRegistry | None = None
         self._slots = [_WorkspaceSlot() for _ in range(EP_CHUNK_COUNT)]
+        self._allocation_arenas = [
+            _EPChunkAllocationArena() for _ in range(EP_CHUNK_COUNT)
+        ]
         self._allocations = 0
         self._runtime_allocations = 0
         self._grows = 0
@@ -183,14 +225,23 @@ class EPChunkWorkspace:
             raise RuntimeError("EP chunk workspace is not materialized")
         return dispatcher
 
+    def allocation_arena(self, slot: int) -> _EPChunkAllocationArena:
+        self._validate_slot(slot)
+        return self._allocation_arenas[slot]
+
     def materialize(self, *, device: torch.device | str | None = None) -> None:
         """Create this op's dispatchers and empty per-slot allocation pools."""
         if self._materialized:
             self._validate_bound_device(device)
-            return
-        if self._registry is not None:
-            self._registry._claim(self)
-        profile_device = self._resolve_materialize_device(device)
+            if all(slot.dispatcher is not None for slot in self._slots):
+                return
+            profile_device = self._bound_device
+            if profile_device is None:
+                raise RuntimeError(
+                    "Materialized EP chunk workspace has no bound device"
+                )
+        else:
+            profile_device = self._bind(device)
         if self.key.device_type == "cuda":
             with torch.cuda.device(profile_device):
                 dispatchers = [
@@ -219,14 +270,33 @@ class EPChunkWorkspace:
         for chunk_idx, dispatcher in enumerate(dispatchers):
             self._slots[chunk_idx].dispatcher = dispatcher
             self._slots[chunk_idx].allocation_pool = allocation_pools[chunk_idx]
-        self._bound_device = profile_device
+            self._allocation_arenas[chunk_idx].allocation_pool = allocation_pools[
+                chunk_idx
+            ]
+            self._allocation_arenas[chunk_idx].device = profile_device
         self._materialized = True
 
-    def acquire(self, slot: int, *, stream: Any | None = None) -> EPChunkWorkspaceLease:
+    def prepare_scratch(self, *, device: torch.device | str | None = None) -> None:
+        """Bind scratch ownership without constructing a dispatcher or CUDA pool."""
+        if self._materialized:
+            self._validate_bound_device(device)
+            return
+        self._bind(device)
+
+    def acquire(
+        self,
+        slot: int,
+        *,
+        stream: Any | None = None,
+        require_dispatcher: bool = True,
+        allocation_arena: _EPChunkAllocationArena | None = None,
+    ) -> EPChunkWorkspaceLease:
         self._validate_slot(slot)
         runtime_device = getattr(stream, "device", None)
-        if not self._materialized:
+        if require_dispatcher:
             self.materialize(device=runtime_device)
+        elif not self._materialized:
+            self._bind(runtime_device)
         else:
             self._validate_bound_device(runtime_device)
         state = self._slots[slot]
@@ -245,18 +315,58 @@ class EPChunkWorkspace:
                         "Pending EP chunk consumer event is not stream-waitable"
                     )
                 self._waits += 1
-            state.consumer_event = None
+        state.consumer_event = None
         state.in_use = True
-        return EPChunkWorkspaceLease(self, slot)
+        return EPChunkWorkspaceLease(
+            self,
+            slot,
+            require_dispatcher=require_dispatcher,
+            allocation_arena=allocation_arena,
+        )
+
+    def _bind(self, device: torch.device | str | None) -> torch.device:
+        """Claim registry identity and bind a runtime device without allocating."""
+        if self._registry is not None:
+            self._registry._claim(self)
+        profile_device = self._resolve_materialize_device(device)
+        self._bound_device = profile_device
+        self._materialized = True
+        return profile_device
 
     def close(self, *, stream: Any | None = None) -> None:
         """Release resident state without a device-wide synchronization."""
         if not self._materialized:
             return
+        self._prepare_slots_for_reset(stream=stream, operation="close")
+        for slot in self._slots:
+            slot.dispatcher = None
+            slot.allocation_pool = None
+        for arena in self._allocation_arenas:
+            arena.allocation_pool = None
+            arena.device = None
+        self._allocations = 0
+        self._runtime_allocations = 0
+        self._grows = 0
+        self._waits = 0
+        self._bound_device = None
+        self._materialized = False
+
+    def reset_tensors(self, *, stream: Any | None = None) -> None:
+        """Drop reusable scratch after its consumers without releasing DeepEP state."""
+        if not self._materialized:
+            return
+        self._prepare_slots_for_reset(stream=stream, operation="reset tensors")
+
+    def _prepare_slots_for_reset(
+        self,
+        *,
+        stream: Any | None,
+        operation: str,
+    ) -> None:
         for slot_idx, slot in enumerate(self._slots):
             if slot.in_use:
                 raise RuntimeError(
-                    f"Cannot close EP chunk workspace: slot {slot_idx} is leased"
+                    f"Cannot {operation} in EP chunk workspace: slot {slot_idx} is leased"
                 )
         for slot in self._slots:
             event = slot.consumer_event
@@ -265,7 +375,8 @@ class EPChunkWorkspace:
                 if not ready:
                     if stream is None or not hasattr(stream, "wait_event"):
                         raise RuntimeError(
-                            "Cannot close EP chunk workspace with a pending consumer event"
+                            f"Cannot {operation} in EP chunk workspace with a pending "
+                            "consumer event"
                         )
                     stream.wait_event(event)
                     for tensor in slot.tensors.values():
@@ -274,32 +385,10 @@ class EPChunkWorkspace:
         for slot in self._slots:
             slot.consumer_event = None
             slot.tensors.clear()
-            slot.dispatcher = None
-            slot.allocation_pool = None
-        self._allocations = 0
-        self._runtime_allocations = 0
-        self._grows = 0
-        self._waits = 0
-        self._bound_device = None
-        self._materialized = False
 
     def release(self, *, stream: Any | None = None) -> None:
         """Idempotent alias for explicit lifecycle callers."""
         self.close(stream=stream)
-
-    @contextmanager
-    def _deepep_recv_allocation(self, slot: int):
-        self._validate_slot(slot)
-        if self.key.device_type != "cuda":
-            yield
-            return
-        state = self._slots[slot]
-        if state.allocation_pool is None:
-            raise RuntimeError("EP chunk CUDA allocation pool is not materialized")
-        if self._bound_device is None:
-            raise RuntimeError("EP chunk workspace device is not materialized")
-        with torch.cuda.use_mem_pool(state.allocation_pool, device=self._bound_device):
-            yield
 
     def _lease_tensor(
         self,
@@ -309,6 +398,7 @@ class EPChunkWorkspace:
         *,
         dtype: torch.dtype,
         device: torch.device | str,
+        allocation_arena: _EPChunkAllocationArena,
     ) -> torch.Tensor:
         requested = tuple(int(dim) for dim in shape)
         self._validate_runtime_tensor(name, requested, dtype)
@@ -318,6 +408,7 @@ class EPChunkWorkspace:
             requested,
             dtype=dtype,
             device=device,
+            allocation_arena=allocation_arena,
         )
         slices = tuple(slice(0, dim) for dim in requested)
         return tensor[slices].view(requested).detach()
@@ -356,6 +447,7 @@ class EPChunkWorkspace:
         *,
         dtype: torch.dtype,
         device: torch.device | str,
+        allocation_arena: _EPChunkAllocationArena,
     ) -> torch.Tensor:
         self._validate_slot(slot)
         requested = tuple(int(dim) for dim in shape)
@@ -363,7 +455,8 @@ class EPChunkWorkspace:
             raise ValueError("EP chunk workspace tensor shape must be non-negative")
         existing = self._slots[slot].tensors.get(name)
         if existing is None:
-            existing = torch.empty(requested, dtype=dtype, device=device)
+            with allocation_arena.allocate():
+                existing = torch.empty(requested, dtype=dtype, device=device)
             self._slots[slot].tensors[name] = existing
             self._allocations += 1
             self._runtime_allocations += 1
@@ -378,7 +471,8 @@ class EPChunkWorkspace:
             want > have for want, have in zip(requested, capacity, strict=True)
         )
         if too_small:
-            existing = torch.empty(requested, dtype=dtype, device=device)
+            with allocation_arena.allocate():
+                existing = torch.empty(requested, dtype=dtype, device=device)
             self._slots[slot].tensors[name] = existing
             self._allocations += 1
             self._runtime_allocations += 1
@@ -404,6 +498,7 @@ class EPChunkWorkspace:
         """Return allocation and DeepEP residency evidence for GPU validation."""
         buffers: dict[int, int] = {}
         data_ptrs: dict[str, int] = {}
+        tensor_details: dict[str, dict[str, Any]] = {}
         for slot_idx, slot in enumerate(self._slots):
             buffer = getattr(slot.dispatcher, "buffer", None)
             if buffer is not None:
@@ -411,10 +506,17 @@ class EPChunkWorkspace:
                     getattr(slot.dispatcher, "deepep_buffer_resident_bytes", 0)
                 )
             for name, tensor in slot.tensors.items():
-                data_ptrs[f"{slot_idx}:{name}"] = tensor.data_ptr()
+                tensor_key = f"{slot_idx}:{name}"
+                data_ptrs[tensor_key] = tensor.data_ptr()
+                tensor_details[tensor_key] = {
+                    "shape": tuple(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "nbytes": tensor.numel() * tensor.element_size(),
+                }
         return {
             **self.metrics(),
             "data_ptrs": data_ptrs,
+            "tensor_details": tensor_details,
             "dispatcher_count": sum(
                 slot.dispatcher is not None for slot in self._slots
             ),
@@ -748,6 +850,8 @@ class _ForwardChunkContext:
     probs: torch.Tensor | None
     expert_out: torch.Tensor | None
     dispatcher: TokenDispatcher
+    allocation_arena: _EPChunkAllocationArena
+    recv_consumed_event: Any
     scores_edge: Any | None = None
     scores_shape: torch.Size | None = None
     scores_dtype: torch.dtype | None = None
@@ -1048,6 +1152,8 @@ class _EPChunkOperationBase:
                 )
                 ready = torch.cuda.Event()
                 ready.record(compute_stream)
+                recv_consumed_event = torch.cuda.Event()
+                recv_consumed_event.record(compute_stream)
 
                 scores_edge = None
                 scores_ref: torch.Tensor | None = scores
@@ -1081,6 +1187,8 @@ class _EPChunkOperationBase:
                     expert_out_shape=expert_out.shape,
                     expert_out_dtype=expert_out.dtype,
                     dispatcher=dispatcher,
+                    allocation_arena=lease.allocation_arena,
+                    recv_consumed_event=recv_consumed_event,
                 )
                 state.clear()
             return (
@@ -1526,7 +1634,12 @@ class _EPChunkOperationBase:
             return state
 
         for saved in reversed(context.chunks):
-            lease = self.workspace.acquire(saved.idx, stream=comm_stream)
+            lease = self.workspace.acquire(
+                saved.idx,
+                stream=comm_stream,
+                require_dispatcher=False,
+                allocation_arena=saved.allocation_arena,
+            )
             chunk = _BackwardChunk(
                 idx=saved.idx,
                 start=saved.start,
@@ -1566,6 +1679,7 @@ class _EPChunkOperationBase:
 
             local_state: dict[str, Any] = {}
             with torch.cuda.stream(compute_stream):
+                compute_stream.wait_event(saved.recv_consumed_event)
                 grad_rank_grouped = chunk.dispatcher.finish_deepep_combine_backward(
                     combine_state
                 )
@@ -1710,6 +1824,12 @@ class _SavedContextEPChunkFunction(torch.autograd.Function):
             grad_x, router_grads, expert_grads = ctx.backward_op.backward(
                 ctx.saved_forward_context, grad_output
             )
+        reset_stream = (
+            torch.cuda.current_stream(grad_output.device)
+            if grad_output.is_cuda
+            else None
+        )
+        ctx.backward_op.workspace.reset_tensors(stream=reset_stream)
         return grad_x, None, None, None, None, *router_grads, *expert_grads
 
 

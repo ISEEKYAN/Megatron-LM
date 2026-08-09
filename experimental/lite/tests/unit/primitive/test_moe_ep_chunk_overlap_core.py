@@ -537,3 +537,55 @@ def test_saved_backward_chains_first_combine_to_caller_grad_readiness(
         "submit_deepep_combine_backward"
     )
     assert "torch.cuda.synchronize" not in source
+
+
+def test_saved_backward_reuses_forward_pool_only_after_recv_consumer_event(
+    transformer_engine_import_stub,
+):
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+        _ForwardChunkContext,
+    )
+
+    fields = _ForwardChunkContext.__dataclass_fields__
+    forward_source = inspect.getsource(
+        _EPChunkOperationBase._forward_saved_context_async
+    )
+    backward_source = inspect.getsource(_EPChunkOperationBase._saved_context_backward)
+
+    assert "allocation_arena" in fields
+    assert "recv_consumed_event" in fields
+    assert "allocation_arena=lease.allocation_arena" in forward_source
+    assert "recv_consumed_event.record(compute_stream)" in forward_source
+    assert forward_source.index("recv_consumed_event.record(compute_stream)") < (
+        forward_source.index("state.clear()")
+    )
+    assert "allocation_arena=saved.allocation_arena" in backward_source
+    assert "compute_stream.wait_event(saved.recv_consumed_event)" in backward_source
+    assert backward_source.index(
+        "compute_stream.wait_event(saved.recv_consumed_event)"
+    ) < backward_source.index("_dispatch_local_backward(")
+    assert "cuda.synchronize" not in backward_source
+
+
+def test_saved_context_wrapper_resets_scratch_after_backward_op_returns(
+    transformer_engine_import_stub,
+):
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _SavedContextEPChunkFunction,
+    )
+
+    source = inspect.getsource(_SavedContextEPChunkFunction.backward)
+
+    assert "ctx.backward_op.backward(" in source
+    assert "ctx.backward_op.workspace.reset_tensors(" in source
+    assert source.index("ctx.backward_op.backward(") < source.index(
+        "ctx.backward_op.workspace.reset_tensors("
+    )
+    assert "cuda.synchronize" not in source

@@ -113,6 +113,7 @@ def test_three_ops_direct_behavior_contracts(transformer_engine_import_stub):
         return SimpleNamespace(
             key=SimpleNamespace(op=op),
             dispatcher=lambda slot: dispatchers[slot],
+            reset_tensors=lambda **_kwargs: None,
         )
 
     router = torch.nn.Identity()
