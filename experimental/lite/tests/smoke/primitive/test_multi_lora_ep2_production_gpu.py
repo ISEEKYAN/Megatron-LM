@@ -498,7 +498,7 @@ def _assert_dense_owner_contract(
 def _local_full_bank_contributions(bundle) -> dict[str, torch.Tensor]:
     """Read unsynchronized full gradients for the independent DP oracle arm."""
     return {
-        name: _main_grad(parameter).detach().float().cpu().clone()
+        name: _main_grad(parameter).detach().cpu().clone()
         for name, parameter in _bank_parameters(bundle).items()
     }
 
@@ -509,13 +509,20 @@ def _bank_sync_absolute_oracle(
     """Reference FC as EP→expert-DP; attention as dense-DP only."""
     expected: dict[str, torch.Tensor] = {}
     for name, contribution in local_contributions.items():
-        value = contribution.to("cuda")
         if ".moe.experts._fc" in name:
+            bank_dtype = _bank_parameters(bundle)[name].dtype
+            assert bank_dtype is torch.bfloat16
+            assert contribution.dtype is torch.float32
+            value = contribution.to("cuda", dtype=bank_dtype)
             dist.all_reduce(value, group=bundle.parallel_state.ep_group)
+            value = value.float()
             dist.all_reduce(value, group=bundle.parallel_state.ep_dp_group)
             value.div_(bundle.parallel_state.expert_dp_size)
         else:
             assert ".attn." in name
+            assert contribution.dtype is torch.float32
+            value = contribution.to("cuda")
+            value = value.float()
             dist.all_reduce(value, group=bundle.parallel_state.dp_group)
             value.div_(bundle.parallel_state.dp_size)
         expected[name] = value.cpu()
@@ -642,6 +649,14 @@ def _run_unsynchronized_reference(
         return original_dispatch(*args, **kwargs)
 
     dispatcher.dispatch = capture_dispatch
+    _Qwen3MoEConfig, _model, protocol = _qwen_symbols()
+    original_sidecar = protocol.MoELoraSidecar
+
+    def disable_explicit_sync(*args, **kwargs):
+        kwargs["requires_explicit_ep_sync"] = False
+        return original_sidecar(*args, **kwargs)
+
+    protocol.MoELoraSidecar = disable_explicit_sync
     try:
         output = bundle.forward_step(chunk, batch)
         assert output["loss"].isfinite()
@@ -650,6 +665,7 @@ def _run_unsynchronized_reference(
         assert dispatch_calls == [True]
     finally:
         dispatcher.dispatch = original_dispatch
+        protocol.MoELoraSidecar = original_sidecar
     return float(output["loss"].detach().cpu()), _local_full_bank_contributions(bundle)
 
 
@@ -960,6 +976,7 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
     assert manifest["topology"]["oracle"][dist.get_rank()]["tp"] == phase_config["tp"]
     assert manifest["topology"]["oracle"][dist.get_rank()]["ep"] == phase_config["ep"]
     assert manifest["topology"]["verify"] is None
+    local_contributions_by_rank = []
     for rank in range(phase_config["world"]):
         path = artifact_dir / f"ep2_bank_grads_rank_{rank:05d}.pt"
         assert _sha256(path) == manifest["oracle_files"][f"rank_{rank:05d}"]
@@ -973,7 +990,6 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
     assert {
         name: _tensor_record(value) for name, value in oracle_grads.items()
     } == manifest["semantic_bank_tensors_by_rank"][dist.get_rank()]
-    local_contributions_by_rank = []
     for rank in range(phase_config["world"]):
         local_path = artifact_dir / f"ep2_local_bank_grads_rank_{rank:05d}.pt"
         local_contributions = torch.load(
@@ -1012,8 +1028,7 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
     expected_batch = manifest["batch_by_rank"][dist.get_rank()]
     assert _batch_record(batch) == expected_batch
     for name, parameter in state.named_parameters():
-        is_fc = ".moe.experts._fc" in name
-        assert getattr(parameter, "allreduce", None) is (not is_fc)
+        _assert_model_owned_bank_allreduce(parameter, is_fc=".moe.experts._fc" in name)
     expected_keys = _expected_semantic_bank_keys(state)
     assert set(oracle_grads) == expected_keys == set(manifest["semantic_bank_keys"])
     _initialize_nonzero_banks(bundle)
@@ -1115,48 +1130,43 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
         )
         torch.testing.assert_close(production_grads[name].cpu(), oracle, rtol=0, atol=0)
 
-    # This actual production-forward negative control restores explicit EP
-    # sync after clearing the correct arm's gradients.  It must double EP2.
+    # Production owns FC synchronization explicitly.  Disabling it is the
+    # negative control: FC must diverge while TP attention remains unchanged.
     _clear_gradients(bundle)
     original_sidecar = protocol.MoELoraSidecar
 
-    def force_explicit_sync(*args, **kwargs):
-        kwargs["requires_explicit_ep_sync"] = True
+    def disable_explicit_sync(*args, **kwargs):
+        kwargs["requires_explicit_ep_sync"] = False
         return original_sidecar(*args, **kwargs)
 
-    protocol.MoELoraSidecar = force_explicit_sync
+    protocol.MoELoraSidecar = disable_explicit_sync
     try:
-        _loss, doubled_grads = _run_production_forward_and_finalize(bundle, batch)
+        _loss, unsynced_grads = _run_production_forward_and_finalize(bundle, batch)
     finally:
         protocol.MoELoraSidecar = original_sidecar
-    assert set(doubled_grads) == expected_keys
-    live_bank_parameters = _bank_parameters(bundle)
-    observed_bf16_rounding = False
+    assert set(unsynced_grads) == expected_keys
     for name, oracle in oracle_grads.items():
-        # The legacy explicit all-reduce sums in the live BF16 bank dtype before
-        # the dist-opt reconstruction returns FP32 shards.  Preserve that exact
-        # operation order rather than using the FP32 mean oracle twice.
-        dtype = live_bank_parameters[name].dtype
-        assert dtype is torch.bfloat16
         if ".moe.experts._fc" in name:
-            explicit_expected = sum(
-                (
-                    contribution[name].to(dtype)
-                    for contribution in local_contributions_by_rank
-                )
-            ).float()
-            assert not torch.equal(explicit_expected, oracle)
-            observed_bf16_rounding |= bool(
-                torch.any(explicit_expected != oracle * 2).item()
+            group_ranks = tuple(
+                dist.get_process_group_ranks(bundle.parallel_state.ep_dp_group)
+            )
+            expected = (
+                sum(
+                    (
+                        local_contributions_by_rank[rank][name].float()
+                        for rank in group_ranks
+                    )
+                ).float()
+                / bundle.parallel_state.expert_dp_size
             )
             torch.testing.assert_close(
-                doubled_grads[name].cpu(), explicit_expected, rtol=0, atol=0
+                unsynced_grads[name].cpu(), expected, rtol=0, atol=0
             )
+            assert not torch.equal(expected, oracle), name
         else:
             torch.testing.assert_close(
-                doubled_grads[name].cpu(), oracle, rtol=0, atol=0
+                unsynced_grads[name].cpu(), oracle, rtol=0, atol=0
             )
-    assert observed_bf16_rounding
     for name, param in state.named_parameters():
         assert name.startswith("bank_") and "." not in name
     verify_topologies = [None] * phase_config["world"]
