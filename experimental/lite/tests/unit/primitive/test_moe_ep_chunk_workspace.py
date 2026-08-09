@@ -932,6 +932,9 @@ def test_expert_activation_lease_lazily_grows_one_fc1_input_buffer(
     first_tensor = first.tensor(
         "fc1_input", (5, 4), dtype=torch.float32, device="cpu"
     )
+    # A caller-owned autograd output can require gradients for one invocation;
+    # the persistent base must stay non-grad when its next lease aliases it.
+    first_tensor.requires_grad_(True)
     first_ptr = first_tensor.data_ptr()
     pending = _FakeEvent(ready=False)
     first.release(pending)
@@ -943,6 +946,7 @@ def test_expert_activation_lease_lazily_grows_one_fc1_input_buffer(
 
     assert stream.waited == [pending]
     assert second_tensor.data_ptr() == first_ptr
+    assert not second_tensor.requires_grad
     evidence = workspace.evidence()["expert_activation_tensors"]["fc1_input"]
     assert evidence["shape"] == (5, 4)
     assert evidence["data_ptr"] == first_ptr
