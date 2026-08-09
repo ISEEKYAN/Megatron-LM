@@ -22,6 +22,7 @@ from megatron.lite.primitive.modules.multi_lora_bank import (
     LoraBankPartition,
     apply_batched_lora_delta,
 )
+from megatron.lite.model.qwen3_moe.lite.multi_lora import _AllReduceGradient
 
 pytestmark = [pytest.mark.mlite, pytest.mark.distributed]
 
@@ -582,5 +583,64 @@ def test_multi_lora_proj_tp2_sp_matches_tp1_forward_and_gradients(tmp_path):
     for result in results:
         for key in ("forward", "x", "a", "b"):
             assert result[key] <= 3e-6, results
+    if init_file.exists():
+        os.unlink(init_file)
+
+
+def _tp2_ep2_bank_ownership_worker(rank, world_size, init_file, queue):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        # Create every group in identical global order, then select ownership.
+        group01 = dist.new_group([0, 1])
+        group23 = dist.new_group([2, 3])
+        group02 = dist.new_group([0, 2])
+        group13 = dist.new_group([1, 3])
+        ep = group01 if rank < 2 else group23
+        dp = group02 if rank in (0, 2) else group13
+        fc = torch.tensor(float(rank + 1), requires_grad=True)
+        attn = torch.tensor(float(rank + 1), requires_grad=True)
+        (_AllReduceGradient.apply(fc, ep) * (rank + 1)).backward()
+        (attn * (rank + 1)).backward()
+        fc_grad, attn_grad = fc.grad.clone(), attn.grad.clone()
+        old_fc = torch.tensor(float(rank + 1))
+        dist.all_reduce(old_fc, group=dp)
+        old_fc.div_(2)
+        dist.all_reduce(fc_grad, group=dp)
+        fc_grad.div_(2)
+        dist.all_reduce(attn_grad, group=dp)
+        attn_grad.div_(2)
+        queue.put(
+            (
+                rank,
+                fc_grad.item(),
+                attn_grad.item(),
+                old_fc.item(),
+                tuple(dist.get_process_group_ranks(ep)),
+                tuple(dist.get_process_group_ranks(dp)),
+            )
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_tp2_ep2_bank_ownership_uses_ep_then_expert_dp_for_fc_only(tmp_path):
+    init_file = tmp_path / "tp2-ep2-bank-ownership"
+    queue = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(
+        _tp2_ep2_bank_ownership_worker,
+        args=(4, str(init_file), queue),
+        nprocs=4,
+        join=True,
+    )
+    results = sorted((queue.get() for _ in range(4)))
+    assert [row[1:4] for row in results] == [
+        (5.0, 2.0, 2.0),
+        (5.0, 3.0, 3.0),
+        (5.0, 2.0, 2.0),
+        (5.0, 3.0, 3.0),
+    ]
+    assert all(row[1] != row[3] for row in results)
     if init_file.exists():
         os.unlink(init_file)

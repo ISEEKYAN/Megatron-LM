@@ -41,8 +41,8 @@ def _qwen_symbols():
 def _ep2_cuda_group():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the production multi-LoRA EP2 smoke.")
-    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
-        pytest.skip("run this smoke through torchrun with exactly two ranks")
+    if int(os.environ.get("WORLD_SIZE", "1")) not in (2, 4):
+        pytest.skip("run this smoke through torchrun with 2 or 4 ranks")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     created = False
     if not dist.is_initialized():
@@ -70,14 +70,14 @@ def _config():
     )
 
 
-def _build_bundle(*, ep: int, model_seed: int):
+def _build_bundle(*, tp: int = 1, ep: int, model_seed: int):
     _Qwen3MoEConfig, _model, protocol = _qwen_symbols()
     torch.manual_seed(model_seed)
     torch.cuda.manual_seed_all(model_seed)
     return protocol.build_model(
         _config(),
         impl_cfg=protocol.ImplConfig(
-            parallel=ParallelConfig(tp=1, ep=ep, etp=1, pp=1, cp=1),
+            parallel=ParallelConfig(tp=tp, ep=ep, etp=1, pp=1, cp=1),
             optimizer="dist_opt",
             optimizer_config=OptimizerConfig(
                 optimizer="adam", lr=1.0e-3, weight_decay=0.0, clip_grad=1.0
@@ -109,6 +109,16 @@ def _phase() -> str:
     if phase not in {"ep2_oracle", "ep2_verify"}:
         pytest.skip("set MLITE_MULTI_LORA_PHASE to ep2_oracle or ep2_verify")
     return phase
+
+
+def _phase_parallel_config() -> dict[str, int]:
+    """Select checkpoint topology from the launcher, not an EP-only name."""
+    world = dist.get_world_size()
+    if world == 2:
+        return {"world": 2, "tp": 1, "ep": 2}
+    if world == 4:
+        return {"world": 4, "tp": 2, "ep": 2}
+    raise AssertionError(f"unsupported phase world size {world}; expected 2 or 4")
 
 
 def _sha256(path: Path) -> str:
@@ -191,7 +201,7 @@ def _poison_parameters(bundle) -> None:
             parameter.add_(0.125)
 
 
-def _actual_topology(bundle) -> dict[str, int]:
+def _actual_topology(bundle) -> dict[str, object]:
     """Record dense/expert decomposition from live state and process groups."""
     ps = bundle.parallel_state
     dense_dp_group_size = (
@@ -213,13 +223,55 @@ def _actual_topology(bundle) -> dict[str, int]:
         "dp_rank": ps.dp_rank,
         "expert_dp": expert_dp_group_size,
         "expert_dp_rank": ps.expert_dp_rank,
+        "tp_group_ranks": sorted(dist.get_process_group_ranks(ps.tp_group)),
+        "ep_group_ranks": sorted(dist.get_process_group_ranks(ps.ep_group)),
+        "dp_group_ranks": sorted(dist.get_process_group_ranks(ps.dp_group)),
+        "expert_dp_group_ranks": sorted(dist.get_process_group_ranks(ps.ep_dp_group)),
     }
 
 
-def _impl_contract(*, ep: int) -> dict[str, object]:
+def _assert_tp_ep_membership(bundle, *, tp: int, ep: int) -> None:
+    topology = _actual_topology(bundle)
+    assert topology["tp"] == tp and topology["ep"] == ep
+    assert len(topology["tp_group_ranks"]) == tp
+    assert len(topology["ep_group_ranks"]) == ep
+    assert dist.get_rank() in topology["tp_group_ranks"]
+    assert dist.get_rank() in topology["ep_group_ranks"]
+
+
+@pytest.mark.timeout(120)
+def test_tp2_ep1_attention_multi_lora_production_groups():
+    """GPU production builder must expose a real TP2 attention-bank path."""
+    if dist.get_world_size() != 2:
+        pytest.skip("TP2/EP1 production smoke requires exactly two ranks")
+    bundle = _build_bundle(tp=2, ep=1, model_seed=3201)
+    _assert_tp_ep_membership(bundle, tp=2, ep=1)
+    state = bundle.extras["multi_lora_training_state"]
+    qkv, proj = state.attention_banks_for_layer(0)
+    assert qkv.partition.rank_partitioned_a and proj.partition.output_partitioned_b
+    assert qkv.a_bank.requires_grad and proj.b_bank.requires_grad
+    _run_bank_gradient_contract(bundle)
+
+
+@pytest.mark.timeout(120)
+def test_tp2_ep2_attention_and_expert_multi_lora_production_groups():
+    """Four-rank production construction keeps TP attention orthogonal to EP experts."""
+    if dist.get_world_size() != 4:
+        pytest.skip("TP2/EP2 production smoke requires exactly four ranks")
+    bundle = _build_bundle(tp=2, ep=2, model_seed=3202)
+    _assert_tp_ep_membership(bundle, tp=2, ep=2)
+    state = bundle.extras["multi_lora_training_state"]
+    fc1, fc2 = state.banks_for_layer(0)
+    qkv, proj = state.attention_banks_for_layer(0)
+    assert fc1.partition.tp_size == fc2.partition.tp_size == 1
+    assert qkv.partition.rank_partitioned_a and proj.partition.output_partitioned_b
+    _run_bank_gradient_contract(bundle)
+
+
+def _impl_contract(*, tp: int = 1, ep: int) -> dict[str, object]:
     """All implementation knobs that define this production evidence."""
     return {
-        "parallel": {"tp": 1, "ep": ep, "etp": 1, "pp": 1, "cp": 1},
+        "parallel": {"tp": tp, "ep": ep, "etp": 1, "pp": 1, "cp": 1},
         "optimizer": "dist_opt",
         "optimizer_config": {
             "optimizer": "adam",
@@ -271,6 +323,31 @@ def _bank_parameters(bundle) -> dict[str, torch.Tensor]:
     return parameters
 
 
+def _run_bank_gradient_contract(bundle) -> None:
+    """Exercise mixed token routing and inspect each semantic A/B slot axis."""
+    state = bundle.extras["multi_lora_training_state"]
+    with torch.no_grad():
+        for bank in state.registry.banks.values():
+            bank.a_bank[0].fill_(0.125)
+            bank.b_bank[0].fill_(0.125)
+            bank.a_bank[1].fill_(0.25)
+            bank.b_bank[1].fill_(0.25)
+    _configure_fixed_router(bundle)
+    batch = _production_batch(bundle)
+    batch.extras["multi_lora_slots"][0].copy_(
+        torch.tensor([0, 1, 0, 1], device="cuda", dtype=torch.long)
+    )
+    loss, gradients = _run_production_forward_and_finalize(bundle, batch)
+    assert loss == loss
+    assert set(gradients) == _expected_semantic_bank_keys(state)
+    parameters = _bank_parameters(bundle)
+    for name, gradient in gradients.items():
+        assert gradient.shape == parameters[name].shape
+        assert name.rsplit("_", 1)[-1] in {"a", "b"}
+        assert gradient[0].abs().max() > 0, name
+        assert gradient[1].abs().max() > 0, name
+
+
 def _distributed_optimizer_leaves(optimizer) -> tuple[object, ...]:
     """Return dist-opt leaves without assuming a Qwen dense/expert chain shape."""
     chained = getattr(optimizer, "chained_optimizers", None)
@@ -289,7 +366,7 @@ def _group_ranks(group) -> tuple[int, ...]:
 
 
 def _optimizer_param_range(
-    bundle, parameter: torch.Tensor
+    bundle, parameter: torch.Tensor, *, is_fc: bool
 ) -> tuple[int, object, object, object, object] | None:
     """Resolve this rank's optional dist-opt shard for one dense bank.
 
@@ -306,17 +383,18 @@ def _optimizer_param_range(
     if not owners:
         return None
     leaf_index, optimizer = owners[0]
-    assert getattr(parameter, "allreduce", None) is True
+    assert getattr(parameter, "allreduce", None) is (not is_fc)
     gbuf_index, dtype, bucket_index = optimizer.model_param_gbuf_map[parameter]
     range_map = optimizer.gbuf_ranges[gbuf_index][dtype][bucket_index]
     param_range = range_map["param_map"][parameter]
     buffer = optimizer.buffers[gbuf_index]
     bucket = buffer.buckets[bucket_index]
-    dense_dp_ranks = _group_ranks(bundle.parallel_state.dp_group)
-    assert _group_ranks(optimizer.data_parallel_group) == dense_dp_ranks
-    assert _group_ranks(buffer.data_parallel_group) == dense_dp_ranks
-    if bundle.parallel_state.ep_size > 1:
-        assert dense_dp_ranks != _group_ranks(bundle.parallel_state.ep_dp_group)
+    expected_group = (
+        bundle.parallel_state.ep_dp_group if is_fc else bundle.parallel_state.dp_group
+    )
+    expected_ranks = _group_ranks(expected_group)
+    assert _group_ranks(optimizer.data_parallel_group) == expected_ranks
+    assert _group_ranks(buffer.data_parallel_group) == expected_ranks
     return leaf_index, optimizer, param_range, buffer, bucket
 
 
@@ -336,16 +414,13 @@ def _assert_dense_owner_contract(
 ) -> None:
     """Prove every local shard maps to one dense leaf, never the EP child."""
     assert records, f"no distributed-optimizer shard found for semantic bank {name}"
-    dense_dp_ranks = _group_ranks(bundle.parallel_state.dp_group)
+    is_fc = ".moe.experts._fc" in name
+    expected_ranks = _group_ranks(
+        bundle.parallel_state.ep_dp_group if is_fc else bundle.parallel_state.dp_group
+    )
     assert len({record["leaf_index"] for record in records}) == 1
-    assert all(record["owner_group_ranks"] == dense_dp_ranks for record in records)
-    assert all(record["buffer_group_ranks"] == dense_dp_ranks for record in records)
-    if bundle.parallel_state.ep_size > 1:
-        expert_dp_ranks = _group_ranks(bundle.parallel_state.ep_dp_group)
-        assert all(record["owner_group_ranks"] != expert_dp_ranks for record in records)
-        assert all(
-            record["buffer_group_ranks"] != expert_dp_ranks for record in records
-        )
+    assert all(record["owner_group_ranks"] == expected_ranks for record in records)
+    assert all(record["buffer_group_ranks"] == expected_ranks for record in records)
 
 
 def _local_full_bank_contributions(bundle) -> dict[str, torch.Tensor]:
@@ -356,19 +431,28 @@ def _local_full_bank_contributions(bundle) -> dict[str, torch.Tensor]:
     }
 
 
-def _dense_dp_absolute_oracle(
+def _bank_sync_absolute_oracle(
     bundle, local_contributions: dict[str, torch.Tensor]
 ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
-    """Independently average rank-local full grads and audit live normalization."""
-    gathered = [None] * dist.get_world_size(bundle.parallel_state.dp_group)
-    dist.all_gather_object(
-        gathered, local_contributions, group=bundle.parallel_state.dp_group
-    )
+    """Reference FC as EP→expert-DP; attention as dense-DP only."""
+    expected: dict[str, torch.Tensor] = {}
+    for name, contribution in local_contributions.items():
+        value = contribution.to("cuda")
+        if ".moe.experts._fc" in name:
+            dist.all_reduce(value, group=bundle.parallel_state.ep_group)
+            dist.all_reduce(value, group=bundle.parallel_state.ep_dp_group)
+            value.div_(bundle.parallel_state.expert_dp_size)
+        else:
+            assert ".attn." in name
+            dist.all_reduce(value, group=bundle.parallel_state.dp_group)
+            value.div_(bundle.parallel_state.dp_size)
+        expected[name] = value.cpu()
     expected_keys = set(local_contributions)
-    assert all(set(contribution) == expected_keys for contribution in gathered)
     local_factors: dict[str, dict[str, object]] = {}
     for name, parameter in _bank_parameters(bundle).items():
-        owned = _optimizer_param_range(bundle, parameter)
+        owned = _optimizer_param_range(
+            bundle, parameter, is_fc=".moe.experts._fc" in name
+        )
         if owned is None:
             continue
         leaf_index, owner, _param_range, buffer, bucket = owned
@@ -376,14 +460,17 @@ def _dense_dp_absolute_oracle(
             **_dense_owner_record(bundle, leaf_index, owner, buffer),
             "factor": float(bucket.gradient_scaling_factor),
         }
-    gathered_factors = [None] * len(gathered)
-    dist.all_gather_object(
-        gathered_factors, local_factors, group=bundle.parallel_state.dp_group
-    )
-    expected: dict[str, torch.Tensor] = {}
+    gathered_factors = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered_factors, local_factors)
+    optimizer_expected: dict[str, torch.Tensor] = {}
     factors: dict[str, float] = {}
-    expected_factor = 1.0 / len(gathered)
     for name in sorted(expected_keys):
+        is_fc = ".moe.experts._fc" in name
+        expected_factor = 1.0 / (
+            bundle.parallel_state.expert_dp_size
+            if is_fc
+            else bundle.parallel_state.dp_size
+        )
         records = [
             factor_map[name] for factor_map in gathered_factors if name in factor_map
         ]
@@ -391,30 +478,30 @@ def _dense_dp_absolute_oracle(
         seen = {record["factor"] for record in records}
         assert len(seen) == 1, f"missing or inconsistent dense-DP factor for {name}"
         factor = seen.pop()
-        assert factor == expected_factor, (
-            f"dense-DP bucket factor for {name} is {factor}, expected {expected_factor}"
-        )
+        assert (
+            factor == expected_factor
+        ), f"owner bucket factor for {name} is {factor}, expected {expected_factor}"
         factors[name] = factor
-        expected[name] = torch.stack(
-            [contribution[name] for contribution in gathered]
-        ).mean(0)
-    return expected, factors
+        optimizer_expected[name] = expected[name]
+    return optimizer_expected, factors
 
 
 def _reconstruct_optimizer_owned_bank_grads(bundle) -> dict[str, torch.Tensor]:
     """Rebuild each logical bank grad from dist-opt's owned reduce-scatter shards."""
     local_shards: dict[str, dict[str, object]] = {}
     for name, parameter in _bank_parameters(bundle).items():
-        owned = _optimizer_param_range(bundle, parameter)
+        owned = _optimizer_param_range(
+            bundle, parameter, is_fc=".moe.experts._fc" in name
+        )
         if owned is None:
             continue
         leaf_index, owner, param_range, buffer, bucket = owned
         # ``gbuf_world_in_bucket`` identifies the reduce-scatter output view;
         # ``param`` maps that view back to the logical bank tensor's offsets.
         reduced = bucket.grad_data.view(-1)[
-            param_range["gbuf_world_in_bucket"].start : param_range[
-                "gbuf_world_in_bucket"
-            ].end
+            param_range["gbuf_world_in_bucket"]
+            .start : param_range["gbuf_world_in_bucket"]
+            .end
         ].detach()
         local_shards[name] = {
             **_dense_owner_record(bundle, leaf_index, owner, buffer),
@@ -425,8 +512,8 @@ def _reconstruct_optimizer_owned_bank_grads(bundle) -> dict[str, torch.Tensor]:
             "values": reduced.float().cpu().clone(),
         }
 
-    gathered = [None] * dist.get_world_size(bundle.parallel_state.dp_group)
-    dist.all_gather_object(gathered, local_shards, group=bundle.parallel_state.dp_group)
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, local_shards)
     expected_keys = set(_bank_parameters(bundle))
     assert set().union(*(set(shards) for shards in gathered)) == expected_keys
     reconstructed: dict[str, torch.Tensor] = {}
@@ -523,14 +610,26 @@ def _clear_gradients(bundle) -> None:
     bundle.optimizer.zero_grad()
 
 
-def _batch() -> PackedBatch:
-    torch.manual_seed(4100 + dist.get_rank())
+def _batch(*, dense_dp_rank: int) -> PackedBatch:
+    # TP ranks share one dense-DP replica batch; replicas differ by dp rank.
+    torch.manual_seed(4100 + dense_dp_rank)
     return PackedBatch(
         input_ids=torch.randint(0, 64, (4,), device="cuda"),
         labels=torch.randint(0, 64, (4,), device="cuda"),
         seq_lens=torch.tensor([4], device="cuda", dtype=torch.int64),
         extras={"multi_lora_slots": {0: torch.tensor([0, 0, 1, 1], device="cuda")}},
     )
+
+
+def _production_batch(bundle) -> PackedBatch:
+    batch = _batch(dense_dp_rank=bundle.parallel_state.dp_rank)
+    record = _batch_record(batch)
+    if bundle.parallel_state.tp_size == 1:
+        return batch
+    gathered = [None] * dist.get_world_size(bundle.parallel_state.tp_group)
+    dist.all_gather_object(gathered, record, group=bundle.parallel_state.tp_group)
+    assert all(item == gathered[0] for item in gathered)
+    return batch
 
 
 def _batch_record(batch: PackedBatch) -> dict[str, dict[str, object]]:
@@ -548,6 +647,8 @@ def _expected_semantic_bank_keys(state) -> set[str]:
     surfaces = (
         "layers.0.moe.experts._fc1_weight_0",
         "layers.0.moe.experts._fc2_weight_0",
+        "layers.0.attn.qkv.linear.weight",
+        "layers.0.attn.proj.linear.weight",
     )
     assert set(state.registry.banks) == set(surfaces)
     return {
@@ -558,10 +659,11 @@ def _expected_semantic_bank_keys(state) -> set[str]:
 
 
 @pytest.mark.timeout(120)
-def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
-    """Same-topology EP2 oracle and DCP prove exactly one EP2 reduction."""
+def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
+    """Same-topology TP/EP oracle and DCP prove each bank's one reduction."""
     _Qwen3MoEConfig, model, protocol = _qwen_symbols()
     phase = _phase()
+    phase_config = _phase_parallel_config()
     artifact_dir = _phase_artifact_dir()
     checkpoint_dir = artifact_dir / "production_checkpoint"
     manifest_path = artifact_dir / "manifest.json"
@@ -570,43 +672,52 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
     candidate_sha = os.environ.get("MLITE_CANDIDATE_SHA")
     candidate_tree = os.environ.get("MLITE_CANDIDATE_TREE_SHA")
     candidate_diff = os.environ.get("MLITE_CANDIDATE_DIFF_SHA")
-    assert candidate_sha and candidate_tree and candidate_diff, (
-        "candidate commit, tree, and diff hashes must bind the phase artifact"
-    )
+    assert (
+        candidate_sha and candidate_tree and candidate_diff
+    ), "candidate commit, tree, and diff hashes must bind the phase artifact"
 
     if phase == "ep2_oracle":
         if dist.get_rank() == 0:
-            assert not artifact_dir.exists(), (
-                "phase artifact directory already exists; refuse stale COMPLETE/checkpoint reuse"
-            )
+            assert (
+                not artifact_dir.exists()
+            ), "phase artifact directory already exists; refuse stale COMPLETE/checkpoint reuse"
             artifact_dir.mkdir(parents=True)
         dist.barrier()
-        bundle = _build_bundle(ep=2, model_seed=3100)
-        ep2_topology = _actual_topology(bundle)
-        assert ep2_topology == {
-            "world": 2,
-            "tp": 1,
-            "ep": 2,
-            "etp": 1,
-            "pp": 1,
-            "cp": 1,
-            "dp": 2,
-            "dp_rank": dist.get_rank(),
-            "expert_dp": 1,
-            "expert_dp_rank": 0,
+        bundle = _build_bundle(
+            tp=phase_config["tp"], ep=phase_config["ep"], model_seed=3100
+        )
+        oracle_topology = _actual_topology(bundle)
+        assert {
+            key: oracle_topology[key] for key in ("world", "tp", "ep")
+        } == phase_config
+        assert set(oracle_topology) == {
+            "world",
+            "tp",
+            "ep",
+            "etp",
+            "pp",
+            "cp",
+            "dp",
+            "dp_rank",
+            "expert_dp",
+            "expert_dp_rank",
+            "tp_group_ranks",
+            "ep_group_ranks",
+            "dp_group_ranks",
+            "expert_dp_group_ranks",
         }
-        ep2_topologies = [None, None]
-        dist.all_gather_object(ep2_topologies, ep2_topology)
+        oracle_topologies = [None] * phase_config["world"]
+        dist.all_gather_object(oracle_topologies, oracle_topology)
         _initialize_nonzero_banks(bundle)
         _configure_fixed_router(bundle)
-        batch = _batch()
+        batch = _production_batch(bundle)
         parameter_semantics = _checkpoint_semantics(bundle)
         loss, local_contributions = _run_unsynchronized_reference(bundle, batch)
         expected_keys = _expected_semantic_bank_keys(
             bundle.extras["multi_lora_training_state"]
         )
         assert set(local_contributions) == expected_keys
-        oracle_grads, normalization_by_key = _dense_dp_absolute_oracle(
+        oracle_grads, normalization_by_key = _bank_sync_absolute_oracle(
             bundle, local_contributions
         )
         assert set(oracle_grads) == expected_keys
@@ -632,11 +743,11 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
             )
             for name in expected_keys
         ), "rank-specific DP batches must produce distinct local contributions"
-        losses = [None, None]
-        batches = [None, None]
-        oracle_tensors_by_rank = [None, None]
-        local_contribution_tensors_by_rank = [None, None]
-        parameter_semantics_by_rank = [None, None]
+        losses = [None] * phase_config["world"]
+        batches = [None] * phase_config["world"]
+        oracle_tensors_by_rank = [None] * phase_config["world"]
+        local_contribution_tensors_by_rank = [None] * phase_config["world"]
+        parameter_semantics_by_rank = [None] * phase_config["world"]
         dist.all_gather_object(losses, loss)
         dist.all_gather_object(batches, _batch_record(batch))
         dist.all_gather_object(
@@ -669,10 +780,14 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
                 },
                 "test_sha256": _sha256(Path(__file__)),
                 "model_config": _config().to_dict(),
-                "topology": {"ep2_oracle": ep2_topologies, "ep2_verify": None},
+                "topology": {"oracle": oracle_topologies, "verify": None},
                 "impl_config": {
-                    "ep2_oracle": _impl_contract(ep=2),
-                    "ep2_verify": _impl_contract(ep=2),
+                    "oracle": _impl_contract(
+                        tp=phase_config["tp"], ep=phase_config["ep"]
+                    ),
+                    "verify": _impl_contract(
+                        tp=phase_config["tp"], ep=phase_config["ep"]
+                    ),
                 },
                 "seeds": {"model": 3100, "batch_base": 4100},
                 "batch_by_rank": batches,
@@ -687,13 +802,13 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
                     f"rank_{rank:05d}": _sha256(
                         artifact_dir / f"ep2_bank_grads_rank_{rank:05d}.pt"
                     )
-                    for rank in range(2)
+                    for rank in range(phase_config["world"])
                 },
                 "local_contribution_files": {
                     f"rank_{rank:05d}": _sha256(
                         artifact_dir / f"ep2_local_bank_grads_rank_{rank:05d}.pt"
                     )
-                    for rank in range(2)
+                    for rank in range(phase_config["world"])
                 },
             }
             temporary_manifest = manifest_path.with_name(f".manifest.{os.getpid()}.tmp")
@@ -726,36 +841,25 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
     }
     assert manifest["test_sha256"] == _sha256(Path(__file__))
     assert manifest["schema_version"] == 3
-    assert manifest["seeds"] == {
-        "model": 3100,
-        "batch_base": 4100,
-    }
+    assert manifest["seeds"] == {"model": 3100, "batch_base": 4100}
     assert manifest["loss_normalization"] == "model token-loss mean"
     assert set(manifest["dense_dp_gradient_scaling_by_key"]) == set(
         manifest["semantic_bank_keys"]
     )
     assert manifest["model_config"] == _config().to_dict()
-    assert manifest["impl_config"] == {
-        "ep2_oracle": _impl_contract(ep=2),
-        "ep2_verify": _impl_contract(ep=2),
-    }
-    assert manifest["topology"]["ep2_oracle"][dist.get_rank()] == {
-        "world": 2,
-        "tp": 1,
-        "ep": 2,
-        "etp": 1,
-        "pp": 1,
-        "cp": 1,
-        "dp": 2,
-        "dp_rank": dist.get_rank(),
-        "expert_dp": 1,
-        "expert_dp_rank": 0,
-    }
-    assert manifest["topology"]["ep2_verify"] is None
-    batch = _batch()
+    expected_impl = _impl_contract(tp=phase_config["tp"], ep=phase_config["ep"])
+    assert manifest["impl_config"] == {"oracle": expected_impl, "verify": expected_impl}
+    assert (
+        manifest["topology"]["oracle"][dist.get_rank()]["world"]
+        == phase_config["world"]
+    )
+    assert manifest["topology"]["oracle"][dist.get_rank()]["tp"] == phase_config["tp"]
+    assert manifest["topology"]["oracle"][dist.get_rank()]["ep"] == phase_config["ep"]
+    assert manifest["topology"]["verify"] is None
+    batch = _production_batch(bundle)
     expected_batch = manifest["batch_by_rank"][dist.get_rank()]
     assert _batch_record(batch) == expected_batch
-    for rank in range(2):
+    for rank in range(phase_config["world"]):
         path = artifact_dir / f"ep2_bank_grads_rank_{rank:05d}.pt"
         assert _sha256(path) == manifest["oracle_files"][f"rank_{rank:05d}"]
         local_path = artifact_dir / f"ep2_local_bank_grads_rank_{rank:05d}.pt"
@@ -769,7 +873,7 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
         name: _tensor_record(value) for name, value in oracle_grads.items()
     } == manifest["semantic_bank_tensors_by_rank"][dist.get_rank()]
     local_contributions_by_rank = []
-    for rank in range(2):
+    for rank in range(phase_config["world"]):
         local_path = artifact_dir / f"ep2_local_bank_grads_rank_{rank:05d}.pt"
         local_contributions = torch.load(
             local_path, map_location="cpu", weights_only=True
@@ -780,28 +884,18 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
         } == manifest["local_contribution_tensors_by_rank"][rank]
         local_contributions_by_rank.append(local_contributions)
 
-    bundle = _build_bundle(ep=2, model_seed=3100)
-    ep2_topology = _actual_topology(bundle)
-    assert ep2_topology == {
-        "world": 2,
-        "tp": 1,
-        "ep": 2,
-        "etp": 1,
-        "pp": 1,
-        "cp": 1,
-        "dp": 2,
-        "dp_rank": dist.get_rank(),
-        "expert_dp": 1,
-        "expert_dp_rank": 0,
-    }
+    bundle = _build_bundle(
+        tp=phase_config["tp"], ep=phase_config["ep"], model_seed=3100
+    )
+    verify_topology = _actual_topology(bundle)
+    assert verify_topology == manifest["topology"]["oracle"][dist.get_rank()]
     state = bundle.extras["multi_lora_training_state"]
     assert state is not None
     assert bundle.extras["optimizer_backend"] == "dist_opt"
     assert callable(bundle.finalize_grads)
-    assert all(
-        getattr(parameter, "allreduce", None) is True
-        for parameter in state.parameters()
-    )
+    for name, parameter in state.named_parameters():
+        is_fc = ".moe.experts._fc" in name
+        assert getattr(parameter, "allreduce", None) is (not is_fc)
     expected_keys = _expected_semantic_bank_keys(state)
     assert set(oracle_grads) == expected_keys == set(manifest["semantic_bank_keys"])
     _initialize_nonzero_banks(bundle)
@@ -810,9 +904,8 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
         == manifest["parameter_semantics_by_rank"][dist.get_rank()]
     )
 
-    # The real production injection creates model-owned sidecars.  They must
-    # never request the legacy explicit EP all-reduce; dense dist-opt finalize
-    # owns the one reduction for these registered parameters.
+    # FC sidecars are EP-replicated expert parameters; attention remains on
+    # its TP carrier and is dense-DP owned independently of this flag.
     kwargs = {}
     probe_batch = type(
         "Batch",
@@ -825,8 +918,8 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
     )()
     protocol._inject_multi_lora_sidecars(kwargs, probe_batch, state)
     sidecar = kwargs["multi_lora_sidecars"][0]
-    assert sidecar.requires_explicit_ep_sync is False
-    assert model._sidecar_ep_sync_group(bundle.parallel_state, sidecar) is None
+    assert sidecar.requires_explicit_ep_sync is True
+    assert model._sidecar_ep_sync_group(bundle.parallel_state, sidecar) is not None
 
     # This is intentionally an EP2-to-EP2 DCP round trip.  Do not turn this
     # smoke back into a cross-EP reshard test: that is a known production DCP
@@ -888,16 +981,16 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
     )
     assert _batch_record(batch) == expected_batch
     assert _config().to_dict() == manifest["model_config"]
-    assert _impl_contract(ep=2) == manifest["impl_config"]["ep2_verify"]
+    assert expected_impl == manifest["impl_config"]["verify"]
     _configure_fixed_router(bundle)
-    _loss, ep2_grads = _run_production_forward_and_finalize(bundle, batch)
-    assert set(ep2_grads) == expected_keys
+    _loss, production_grads = _run_production_forward_and_finalize(bundle, batch)
+    assert set(production_grads) == expected_keys
     for name, oracle in oracle_grads.items():
         assert (
             _tensor_record(oracle)
             == manifest["semantic_bank_tensors_by_rank"][dist.get_rank()][name]
         )
-        torch.testing.assert_close(ep2_grads[name].cpu(), oracle, rtol=0, atol=0)
+        torch.testing.assert_close(production_grads[name].cpu(), oracle, rtol=0, atol=0)
 
     # This actual production-forward negative control restores explicit EP
     # sync after clearing the correct arm's gradients.  It must double EP2.
@@ -922,28 +1015,35 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
         # operation order rather than using the FP32 mean oracle twice.
         dtype = live_bank_parameters[name].dtype
         assert dtype is torch.bfloat16
-        explicit_expected = (
-            local_contributions_by_rank[0][name].to(dtype)
-            + local_contributions_by_rank[1][name].to(dtype)
-        ).float()
-        assert not torch.equal(explicit_expected, oracle)
-        observed_bf16_rounding |= bool(
-            torch.any(explicit_expected != oracle * 2).item()
-        )
-        torch.testing.assert_close(
-            doubled_grads[name].cpu(), explicit_expected, rtol=0, atol=0
-        )
+        if ".moe.experts._fc" in name:
+            explicit_expected = sum(
+                (
+                    contribution[name].to(dtype)
+                    for contribution in local_contributions_by_rank
+                )
+            ).float()
+            assert not torch.equal(explicit_expected, oracle)
+            observed_bf16_rounding |= bool(
+                torch.any(explicit_expected != oracle * 2).item()
+            )
+            torch.testing.assert_close(
+                doubled_grads[name].cpu(), explicit_expected, rtol=0, atol=0
+            )
+        else:
+            torch.testing.assert_close(
+                doubled_grads[name].cpu(), oracle, rtol=0, atol=0
+            )
     assert observed_bf16_rounding
     for name, param in state.named_parameters():
         assert name.startswith("bank_") and "." not in name
-    ep2_topologies = [None, None]
-    dist.all_gather_object(ep2_topologies, ep2_topology)
+    verify_topologies = [None] * phase_config["world"]
+    dist.all_gather_object(verify_topologies, verify_topology)
     if dist.get_rank() == 0:
         receipt = {
             "commit": candidate_sha,
             "manifest_sha256": _sha256(manifest_path),
             "phase": "ep2_verify",
-            "topology_by_rank": ep2_topologies,
+            "topology_by_rank": verify_topologies,
             "checkpoint_files": checkpoint_files,
         }
         temporary_receipt = phase_b_receipt_path.with_name(

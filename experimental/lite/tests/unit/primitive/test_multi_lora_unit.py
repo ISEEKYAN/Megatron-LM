@@ -270,7 +270,7 @@ def test_tp_attention_builder_uses_linear_lora_partition_shapes(monkeypatch):
     for bank in (fc1, fc2):
         for parameter in (bank.a_bank, bank.b_bank):
             assert parameter.tensor_model_parallel is False
-            assert parameter.allreduce is True
+            assert parameter.allreduce is False
 
 
 def test_tp_attention_builder_rejects_rank_not_divisible_by_tp():
@@ -1087,10 +1087,10 @@ def test_semantic_bank_parameter_names_survive_reordered_registry_and_pp_stages(
     assert all("." not in name for name in stage_zero | stage_one)
 
 
-def test_model_owned_sidecar_has_no_explicit_ep_gradient_owner(
+def test_model_owned_fc_sidecar_has_explicit_ep_gradient_owner(
     monkeypatch, transformer_engine_import_stub
 ):
-    """Production injection, not a tensor attribute, selects dense finalize ownership."""
+    """Model-owned replicated FC banks retain their explicit EP owner."""
     state = MultiLoraTrainingState(
         NamedLoraBankRegistry(
             banks={
@@ -1127,14 +1127,14 @@ def test_model_owned_sidecar_has_no_explicit_ep_gradient_owner(
     protocol = importlib.import_module("megatron.lite.model.qwen3_moe.lite.protocol")
     protocol._inject_multi_lora_sidecars(injected, Batch(), state)
     owned = injected["multi_lora_sidecars"][0]
-    assert owned.requires_explicit_ep_sync is False
+    assert owned.requires_explicit_ep_sync is True
 
     # Test the real model.py selector, not a hand-passed ``None`` argument.
     transformer_engine_import_stub()
     sys.modules.pop("megatron.lite.model.qwen3_moe.lite.model", None)
     model = importlib.import_module("megatron.lite.model.qwen3_moe.lite.model")
     ps = SimpleNamespace(ep_size=2, ep_group=object())
-    assert model._sidecar_ep_sync_group(ps, owned) is None
+    assert model._sidecar_ep_sync_group(ps, owned) is ps.ep_group
 
     # The legacy external contract still selects one explicit EP group for
     # each of its two model call sites (fc1 and fc2).
@@ -1287,7 +1287,11 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
     assert qkv.b_bank.shape == (2, 8, 24)
     assert proj.a_bank.shape == (2, 24, 4)
     assert proj.b_bank.shape == (2, 4, 24)
-    for bank in (fc1, fc2, qkv, proj):
+    for bank in (fc1, fc2):
+        for parameter in (bank.a_bank, bank.b_bank):
+            assert parameter.tensor_model_parallel is False
+            assert parameter.allreduce is False
+    for bank in (qkv, proj):
         for parameter in (bank.a_bank, bank.b_bank):
             assert parameter.tensor_model_parallel is False
             assert parameter.allreduce is True
