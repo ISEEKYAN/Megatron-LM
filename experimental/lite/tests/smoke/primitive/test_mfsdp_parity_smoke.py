@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import os
 import statistics
 import sys
@@ -1307,9 +1308,37 @@ def test_mfsdp_qwen35_eval_to_train_first_step_is_finite():
             ),
         ),
         hash_weights=True,
+        activation_probe_names=[
+            "embed",
+            "layers.0",
+            "layers.0.linear_attn",
+            "layers.0.moe",
+            "layers.1",
+            "norm",
+            "head",
+        ],
     )
 
     step = artifact["steps"][0]
+    bad_probes = []
+    for record in step["train_activation_probes"]:
+        for field in ("tensor", "grad"):
+            value = record.get(field)
+            summary = value.get("summary") if isinstance(value, dict) else None
+            if summary is not None and not all(
+                math.isfinite(float(item))
+                for key in ("min", "max", "mean")
+                for item in (summary[key],)
+            ):
+                bad_probes.append(
+                    {
+                        "name": record["name"],
+                        "resolved_name": record.get("resolved_name"),
+                        "field": field,
+                        "summary": summary,
+                    }
+                )
+    assert not bad_probes, json.dumps(bad_probes, sort_keys=True)
     loss = float(step["loss"]["value"])
     grad_norm = float(step["grad_norm"]["value"])
     assert torch.isfinite(torch.tensor(loss))
