@@ -548,6 +548,7 @@ class ParamBucket:
         )
         for spec in self.specs:
             spec.full_param.main_grad = self.full_main_grad_buffer
+            spec.full_param.overwrite_main_grad = True
 
     def prepare_param_gather(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._full_lease is None:
@@ -948,7 +949,12 @@ class ParamBucket:
                             main_grad.add_(param.grad)
                         else:
                             main_grad.copy_(param.grad)
-                self._staged_grad_ids.add(id(spec))
+            # TE fused wgrad reaches this hook with
+            # ``grad_added_to_main_grad=True`` because it has already written
+            # the authoritative buffer. Track that contribution too, and make
+            # a subsequent backward accumulate if RS has not consumed it yet.
+            self._staged_grad_ids.add(id(spec))
+            param.overwrite_main_grad = False
             if param.grad is not None:
                 param.grad = None
             # MCore treats this as a one-backward notification from TE.  It

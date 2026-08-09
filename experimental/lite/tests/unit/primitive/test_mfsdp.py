@@ -1925,6 +1925,15 @@ def test_mfsdp_full_param_installs_mcore_te_lazy_main_grad_protocol():
     assert main_grad.is_contiguous()
     assert main_grad.numel() == spec.full_param.numel()
 
+    spec.full_param.grad_added_to_main_grad = True
+    spec.full_param.overwrite_main_grad = True
+    bucket._make_grad_ready_hook(spec)(spec.full_param)
+    assert id(spec) in bucket._staged_grad_ids
+    assert spec.full_param.overwrite_main_grad is False
+
+    bucket._release_full_main_grads()
+    assert spec.full_param.overwrite_main_grad is True
+
 
 def test_mfsdp_sharded_grad_hook_writes_authoritative_bucket_buffer():
     """Match MCore's data-distributed _grad_acc copy_ semantics."""
