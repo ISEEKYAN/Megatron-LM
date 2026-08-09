@@ -228,6 +228,120 @@ class _EPChunkAllocationArena:
                 self._allocation_depth = 0
 
 
+_EXPERT_ACTIVATION_SIZE_CLASS_BYTES = 2 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _EPChunkExpertActivationKey:
+    """Physical activation ownership deliberately excludes the logical op."""
+
+    device_type: str
+    device_index: int | None
+    ep_group_id: int
+    dtype: torch.dtype
+    shape_profile: EPChunkShapeProfile
+
+
+@dataclass
+class _EPChunkSharedExpertActivationOwner:
+    key: _EPChunkExpertActivationKey
+    arena: _EPChunkAllocationArena = field(default_factory=_EPChunkAllocationArena)
+    in_use: bool = False
+    consumer_event: Any | None = None
+    waits: int = 0
+    allocations: int = 0
+    grows: int = 0
+
+    def acquire(self, *, stream: Any | None, device: torch.device) -> None:
+        if self.arena.device is None:
+            if self.key.device_type == "cuda":
+                with torch.cuda.device(device):
+                    self.arena.allocation_pool = torch.cuda.MemPool(
+                        allocator=None, use_on_oom=False, no_split=False
+                    )
+            self.arena.device = device
+        if self.in_use:
+            raise RuntimeError("EP chunk expert activation arena is already leased")
+        event = self.consumer_event
+        if event is not None and not (
+            bool(event.query()) if hasattr(event, "query") else False
+        ):
+            if stream is not None and hasattr(stream, "wait_event"):
+                stream.wait_event(event)
+            elif hasattr(event, "current_stream_wait"):
+                event.current_stream_wait()
+            else:
+                raise RuntimeError(
+                    "Pending EP chunk expert activation event is not stream-waitable"
+                )
+            self.waits += 1
+        self.consumer_event = None
+        self.in_use = True
+
+    def release(self, event: Any) -> None:
+        self.consumer_event = event
+        self.in_use = False
+
+    def tensor(
+        self,
+        name: str,
+        shape: tuple[int, ...] | torch.Size,
+        *,
+        dtype: torch.dtype,
+        device: torch.device | str,
+    ) -> torch.Tensor:
+        requested = tuple(int(dim) for dim in shape)
+        profile = self.key.shape_profile
+        ceiling, expected_dtype = {
+            "fc1_input": (
+                (profile.max_expert_rows, profile.hidden_size),
+                self.key.dtype,
+            )
+        }.get(name, (requested, dtype))
+        if (
+            not requested
+            or any(dim < 0 for dim in requested)
+            or len(requested) != len(ceiling)
+            or any(want > limit for want, limit in zip(requested, ceiling, strict=True))
+            or requested[1:] != ceiling[1:]
+            or dtype != expected_dtype
+        ):
+            raise RuntimeError(
+                f"EP chunk expert activation {name!r} shape {requested} dtype {dtype} exceeds profile ceiling {ceiling} dtype {expected_dtype}"
+            )
+        existing = self.arena.tensors.get(name)
+        incompatible = existing is not None and (
+            existing.dtype != dtype
+            or existing.device != torch.device(device)
+            or existing.dim() != len(requested)
+        )
+        if incompatible:
+            raise RuntimeError(
+                f"EP chunk expert activation {name!r} does not match its reusable storage"
+            )
+        required_rows = requested[0]
+        growing = existing is not None and required_rows > existing.shape[0]
+        if existing is None or growing:
+            row_bytes = int(torch.empty((), dtype=dtype).element_size())
+            for dim in requested[1:]:
+                row_bytes *= dim
+            capacity_bytes = (
+                (required_rows * row_bytes + _EXPERT_ACTIVATION_SIZE_CLASS_BYTES - 1)
+                // _EXPERT_ACTIVATION_SIZE_CLASS_BYTES
+            ) * _EXPERT_ACTIVATION_SIZE_CLASS_BYTES
+            capacity_rows = (capacity_bytes + row_bytes - 1) // row_bytes
+            with self.arena.allocate():
+                existing = torch.empty(
+                    (capacity_rows, *requested[1:]), dtype=dtype, device=device
+                )
+            self.arena.tensors[name] = existing
+            self.allocations += 1
+            self.grows += int(growing)
+        return (
+            existing[tuple(slice(0, dim) for dim in requested)].view(requested).detach()
+        )
+
+
 class _EPChunkExpertActivationLease:
     def __init__(self, workspace: "EPChunkWorkspace"):
         self.workspace = workspace
@@ -239,7 +353,7 @@ class _EPChunkExpertActivationLease:
             raise RuntimeError(
                 "EP chunk expert activation lease has already been released"
             )
-        with self.workspace._expert_activation_arena.allocate():
+        with self.workspace._expert_activation_owner.arena.allocate():
             yield
 
     def tensor(
@@ -273,8 +387,7 @@ class _EPChunkExpertActivationLease:
             raise RuntimeError(
                 "EP chunk expert activation release requires a consumer event"
             )
-        self.workspace._expert_activation_consumer_event = consumer_event
-        self.workspace._expert_activation_in_use = False
+        self.workspace._expert_activation_owner.release(consumer_event)
         self._active = False
 
 
@@ -351,10 +464,15 @@ class EPChunkWorkspace:
         self._allocation_arenas = [
             _EPChunkAllocationArena() for _ in range(EP_CHUNK_COUNT)
         ]
-        self._expert_activation_arena = _EPChunkAllocationArena()
-        self._expert_activation_in_use = False
-        self._expert_activation_consumer_event: Any | None = None
-        self._expert_activation_waits = 0
+        self._expert_activation_owner = _EPChunkSharedExpertActivationOwner(
+            _EPChunkExpertActivationKey(
+                key.device_type,
+                key.device_index,
+                key.ep_group_id,
+                key.dtype,
+                key.shape_profile,
+            )
+        )
         self._allocations = 0
         self._runtime_allocations = 0
         self._grows = 0
@@ -399,21 +517,11 @@ class EPChunkWorkspace:
                     )
                     for _ in range(EP_CHUNK_COUNT)
                 ]
-                expert_activation_pool = (
-                    self._expert_activation_arena.allocation_pool
-                    if self._expert_activation_arena.device is not None
-                    else torch.cuda.MemPool(
-                        allocator=None,
-                        use_on_oom=False,
-                        no_split=False,
-                    )
-                )
         else:
             dispatchers = [
                 self._dispatcher_factory(slot) for slot in range(EP_CHUNK_COUNT)
             ]
             allocation_pools = [None for _ in range(EP_CHUNK_COUNT)]
-            expert_activation_pool = None
         if len({id(dispatcher) for dispatcher in dispatchers}) != EP_CHUNK_COUNT:
             raise RuntimeError("EP chunk workspace requires two distinct dispatchers")
         for chunk_idx, dispatcher in enumerate(dispatchers):
@@ -428,8 +536,6 @@ class EPChunkWorkspace:
                 chunk_idx
             ]
             self._allocation_arenas[chunk_idx].device = profile_device
-        self._expert_activation_arena.allocation_pool = expert_activation_pool
-        self._expert_activation_arena.device = profile_device
         self._materialized = True
 
     def prepare_scratch(self, *, device: torch.device | str | None = None) -> None:
@@ -491,32 +597,7 @@ class EPChunkWorkspace:
                 raise RuntimeError(
                     "Materialized EP chunk workspace has no bound device"
                 )
-        if self._expert_activation_arena.device is None:
-            if self.key.device_type == "cuda":
-                with torch.cuda.device(profile_device):
-                    self._expert_activation_arena.allocation_pool = torch.cuda.MemPool(
-                        allocator=None,
-                        use_on_oom=False,
-                        no_split=False,
-                    )
-            self._expert_activation_arena.device = profile_device
-        if self._expert_activation_in_use:
-            raise RuntimeError("EP chunk expert activation arena is already leased")
-        event = self._expert_activation_consumer_event
-        if event is not None:
-            ready = bool(event.query()) if hasattr(event, "query") else False
-            if not ready:
-                if stream is not None and hasattr(stream, "wait_event"):
-                    stream.wait_event(event)
-                elif hasattr(event, "current_stream_wait"):
-                    event.current_stream_wait()
-                else:
-                    raise RuntimeError(
-                        "Pending EP chunk expert activation event is not stream-waitable"
-                    )
-                self._expert_activation_waits += 1
-        self._expert_activation_consumer_event = None
-        self._expert_activation_in_use = True
+        self._expert_activation_owner.acquire(stream=stream, device=profile_device)
         return _EPChunkExpertActivationLease(self)
 
     def _bind(self, device: torch.device | str | None) -> torch.device:
@@ -539,14 +620,10 @@ class EPChunkWorkspace:
         for arena in self._allocation_arenas:
             arena.allocation_pool = None
             arena.device = None
-        self._expert_activation_arena.allocation_pool = None
-        self._expert_activation_arena.device = None
-        self._expert_activation_arena.tensors.clear()
         self._allocations = 0
         self._runtime_allocations = 0
         self._grows = 0
         self._waits = 0
-        self._expert_activation_waits = 0
         self._bound_device = None
         self._materialized = False
 
@@ -562,12 +639,12 @@ class EPChunkWorkspace:
         stream: Any | None,
         operation: str,
     ) -> None:
-        if self._expert_activation_in_use:
+        if self._expert_activation_owner.in_use:
             raise RuntimeError(
                 f"Cannot {operation} in EP chunk workspace: expert activation arena "
                 "is leased"
             )
-        activation_event = self._expert_activation_consumer_event
+        activation_event = self._expert_activation_owner.consumer_event
         if activation_event is not None:
             ready = (
                 bool(activation_event.query())
@@ -581,7 +658,6 @@ class EPChunkWorkspace:
                         "expert activation event"
                     )
                 stream.wait_event(activation_event)
-        self._expert_activation_consumer_event = None
         for slot_idx, slot in enumerate(self._slots):
             if slot.in_use:
                 raise RuntimeError(
@@ -669,36 +745,9 @@ class EPChunkWorkspace:
                 f"EP chunk expert activation {name!r} shape {requested} dtype {dtype} "
                 f"exceeds profile ceiling {ceiling} dtype {expected_dtype}"
             )
-        arena = self._expert_activation_arena
-        existing = arena.tensors.get(name)
-        if existing is None:
-            with arena.allocate():
-                existing = torch.empty(requested, dtype=dtype, device=device)
-            arena.tensors[name] = existing
-            self._allocations += 1
-            self._runtime_allocations += 1
-        capacity = tuple(existing.shape)
-        incompatible = (
-            existing.dtype != dtype
-            or existing.device != torch.device(device)
-            or len(capacity) != len(requested)
+        return self._expert_activation_owner.tensor(
+            name, requested, dtype=dtype, device=device
         )
-        too_small = not incompatible and any(
-            want > have for want, have in zip(requested, capacity, strict=True)
-        )
-        if too_small:
-            with arena.allocate():
-                existing = torch.empty(requested, dtype=dtype, device=device)
-            arena.tensors[name] = existing
-            self._allocations += 1
-            self._runtime_allocations += 1
-            self._grows += 1
-        elif incompatible:
-            raise RuntimeError(
-                f"EP chunk expert activation {name!r} does not match its reusable storage"
-            )
-        slices = tuple(slice(0, dim) for dim in requested)
-        return existing[slices].view(requested).detach()
 
     def _validate_runtime_tensor(
         self, name: str, shape: tuple[int, ...], dtype: torch.dtype
@@ -799,6 +848,7 @@ class EPChunkWorkspace:
                     "dtype": str(tensor.dtype),
                     "nbytes": tensor.numel() * tensor.element_size(),
                 }
+        owner = self._expert_activation_owner
         expert_activation_tensors = {
             name: {
                 "data_ptr": tensor.data_ptr(),
@@ -806,7 +856,7 @@ class EPChunkWorkspace:
                 "dtype": str(tensor.dtype),
                 "nbytes": tensor.numel() * tensor.element_size(),
             }
-            for name, tensor in self._expert_activation_arena.tensors.items()
+            for name, tensor in owner.arena.tensors.items()
         }
         return {
             **self.metrics(),
@@ -826,18 +876,18 @@ class EPChunkWorkspace:
                 if slot.allocation_pool is not None
             },
             "expert_activation_pool_count": int(
-                self._expert_activation_arena.allocation_pool is not None
+                owner.arena.allocation_pool is not None
             ),
             "expert_activation_pool_id": (
                 None
-                if self._expert_activation_arena.allocation_pool is None
-                else id(self._expert_activation_arena.allocation_pool)
+                if owner.arena.allocation_pool is None
+                else id(owner.arena.allocation_pool)
             ),
-            "expert_activation_waits": self._expert_activation_waits,
-            "expert_activation_in_use": self._expert_activation_in_use,
-            "expert_activation_event_guarded": (
-                self._expert_activation_consumer_event is not None
-            ),
+            "expert_activation_waits": owner.waits,
+            "expert_activation_allocations": owner.allocations,
+            "expert_activation_grows": owner.grows,
+            "expert_activation_in_use": owner.in_use,
+            "expert_activation_event_guarded": (owner.consumer_event is not None),
             "expert_activation_tensors": expert_activation_tensors,
             "active_lease_count": sum(slot.in_use for slot in self._slots),
             "consumer_event_guard_count": sum(
@@ -901,6 +951,9 @@ class EPChunkWorkspace:
 class EPChunkWorkspaceRegistry:
     def __init__(self):
         self._workspaces: dict[EPChunkWorkspaceKey, EPChunkWorkspace] = {}
+        self._expert_activation_owners: dict[
+            _EPChunkExpertActivationKey, _EPChunkSharedExpertActivationOwner
+        ] = {}
 
     def get_or_create(
         self,
@@ -911,6 +964,18 @@ class EPChunkWorkspaceRegistry:
         if workspace is None:
             workspace = EPChunkWorkspace(key, dispatcher_factory)
             workspace._registry = self
+            activation_key = _EPChunkExpertActivationKey(
+                key.device_type,
+                key.device_index,
+                key.ep_group_id,
+                key.dtype,
+                key.shape_profile,
+            )
+            workspace._expert_activation_owner = (
+                self._expert_activation_owners.setdefault(
+                    activation_key, _EPChunkSharedExpertActivationOwner(activation_key)
+                )
+            )
             self._workspaces[key] = workspace
         return workspace
 
@@ -935,6 +1000,30 @@ class EPChunkWorkspaceRegistry:
         workspace.close(stream=stream)
         if self._workspaces.get(key) is workspace:
             del self._workspaces[key]
+        activation_key = workspace._expert_activation_owner.key
+        if not any(
+            candidate._expert_activation_owner is workspace._expert_activation_owner
+            for candidate in self._workspaces.values()
+        ):
+            owner = self._expert_activation_owners.pop(activation_key, None)
+            if owner is not None:
+                if owner.in_use:
+                    raise RuntimeError(
+                        "Cannot release leased EP chunk expert activation owner"
+                    )
+                event = owner.consumer_event
+                if event is not None and not (
+                    bool(event.query()) if hasattr(event, "query") else False
+                ):
+                    if stream is None or not hasattr(stream, "wait_event"):
+                        raise RuntimeError(
+                            "Cannot release EP chunk expert activation owner with pending event"
+                        )
+                    stream.wait_event(event)
+                owner.consumer_event = None
+                owner.arena.tensors.clear()
+                owner.arena.allocation_pool = None
+                owner.arena.device = None
 
 
 _EP_CHUNK_WORKSPACES = EPChunkWorkspaceRegistry()

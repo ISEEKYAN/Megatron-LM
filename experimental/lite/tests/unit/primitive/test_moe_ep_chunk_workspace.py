@@ -105,7 +105,10 @@ def test_owned_expert_tensor_reenters_its_activation_arena_once(
 
     assert tuple(tensor.shape) == (3, 4)
     assert entered == [
-        (workspace._expert_activation_arena.allocation_pool, torch.device("cuda", 0))
+        (
+            workspace._expert_activation_owner.arena.allocation_pool,
+            torch.device("cuda", 0),
+        )
     ]
     lease.release(_FakeEvent(ready=True))
 
@@ -821,7 +824,7 @@ def test_workspace_owns_two_comm_pools_and_one_expert_activation_pool(
         lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
     )
     workspace.materialize()
-    assert len(created) == 3
+    assert len(created) == 2
     assert creation_devices == [torch.device("cuda", 3)]
     evidence = workspace.evidence()
     assert evidence["allocation_pool_count"] == 2
@@ -829,8 +832,8 @@ def test_workspace_owns_two_comm_pools_and_one_expert_activation_pool(
         id(created[0]),
         id(created[1]),
     }
-    assert evidence["expert_activation_pool_count"] == 1
-    assert evidence["expert_activation_pool_id"] == id(created[2])
+    assert evidence["expert_activation_pool_count"] == 0
+    assert evidence["expert_activation_pool_id"] is None
     assert evidence["caller_owned_recv_proven"] is False
     assert evidence["recv_observer_enabled"] is False
     monkeypatch.setenv("MEGATRON_LITE_EP_CHUNK_SCRATCH_TRACE", "1")
@@ -846,6 +849,13 @@ def test_workspace_owns_two_comm_pools_and_one_expert_activation_pool(
     lease0.release(_FakeEvent(ready=True))
     assert workspace.evidence()["consumer_event_guard_count"] == 1
 
+    activation = workspace.acquire_expert_activation(
+        stream=SimpleNamespace(device=torch.device("cuda", 3))
+    )
+    activation.release(_FakeEvent(ready=True))
+    assert workspace.evidence()["expert_activation_pool_count"] == 1
+    assert workspace.evidence()["expert_activation_pool_id"] == id(created[2])
+
     lease1 = workspace.acquire(1)
     with lease1.deepep_recv_allocation():
         pass
@@ -855,10 +865,12 @@ def test_workspace_owns_two_comm_pools_and_one_expert_activation_pool(
 
     workspace.release()
     assert workspace.evidence()["allocation_pool_count"] == 0
-    assert workspace.evidence()["expert_activation_pool_count"] == 0
+    # A workspace close cannot discard a registry-owned activation arena: a
+    # compatible forward/fused workspace may still hold the physical owner.
+    assert workspace.evidence()["expert_activation_pool_count"] == 1
 
 
-def test_three_ops_own_distinct_expert_activation_pools(
+def test_three_ops_share_one_compatible_expert_activation_owner(
     monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
@@ -929,7 +941,7 @@ def test_three_ops_own_distinct_expert_activation_pools(
         for workspace in workspaces
         for pool_id in workspace.evidence()["allocation_pool_ids"].values()
     }
-    assert len(activation_ids) == 3
+    assert len(activation_ids) == 1
     assert [
         workspace.evidence()["allocation_pool_count"] for workspace in workspaces
     ] == [2, 0, 2]
@@ -982,7 +994,7 @@ def test_expert_activation_arena_waits_only_for_its_consumer_event(
     second.release(_FakeEvent(ready=True))
 
 
-def test_expert_activation_lease_lazily_grows_one_fc1_input_buffer(
+def test_expert_activation_lease_size_classes_adjacent_rows_without_growth(
     transformer_engine_import_stub,
 ):
     (
@@ -1030,7 +1042,11 @@ def test_expert_activation_lease_lazily_grows_one_fc1_input_buffer(
     assert second_tensor.data_ptr() == first_ptr
     assert not second_tensor.requires_grad
     evidence = workspace.evidence()["expert_activation_tensors"]["fc1_input"]
-    assert evidence["shape"] == (5, 4)
+    assert evidence["shape"][0] >= 5
+    assert (
+        evidence["nbytes"] - first_tensor.numel() * first_tensor.element_size()
+        < 2 * 1024 * 1024
+    )
     assert evidence["data_ptr"] == first_ptr
     grow_guard = _FakeEvent(ready=False)
     second.release(grow_guard)
@@ -1040,10 +1056,89 @@ def test_expert_activation_lease_lazily_grows_one_fc1_input_buffer(
 
     assert stream.waited == [pending, grow_guard]
     grown_evidence = workspace.evidence()["expert_activation_tensors"]["fc1_input"]
-    assert grown_evidence["shape"] == (7, 4)
-    assert grown_evidence["data_ptr"] == grown_tensor.data_ptr()
-    assert workspace.metrics()["grows"] == 1
+    assert grown_evidence["data_ptr"] == first_ptr
+    assert grown_tensor.data_ptr() == first_ptr
+    assert workspace._expert_activation_owner.grows == 0
     third.release(_FakeEvent(ready=True))
+
+
+def test_shared_owner_reuses_all_large_activation_names_across_ops(
+    transformer_engine_import_stub,
+):
+    """Adjacent routed row counts must not cold-grow five live activation names."""
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    registry = registry_type()
+    profile = profile_type(max_input_rows=131963, hidden_size=16, topk=2, ep_size=2)
+
+    def make_workspace(op):
+        return registry.get_or_create(
+            key_type(
+                op=op,
+                device_type="cpu",
+                device_index=None,
+                ep_group_id=97,
+                dtype=torch.float32,
+                shape_profile=profile,
+            ),
+            lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+        )
+
+    forward, fused = make_workspace("forward"), make_workspace("fused_forward_backward")
+    assert forward._expert_activation_owner is fused._expert_activation_owner
+    names = ("fc1_input", "fc1_output", "fc2_output", "fc1_dgrad", "fc2_dgrad")
+    first = forward.acquire_expert_activation()
+    first_ptrs = {
+        name: first.tensor(
+            name, (131750, 16), dtype=torch.float32, device="cpu"
+        ).data_ptr()
+        for name in names
+    }
+    pending = _FakeEvent(ready=False)
+    first.release(pending)
+    stream = _FakeStream()
+    second = fused.acquire_expert_activation(stream=stream)
+    second_ptrs = {
+        name: second.tensor(
+            name, (131963, 16), dtype=torch.float32, device="cpu"
+        ).data_ptr()
+        for name in names
+    }
+    assert stream.waited == [pending]
+    assert second_ptrs == first_ptrs
+    owner = forward._expert_activation_owner
+    assert owner.grows == 0
+    for tensor in owner.arena.tensors.values():
+        requested_bytes = 131963 * 16 * tensor.element_size()
+        assert (
+            tensor.numel() * tensor.element_size() - requested_bytes < 2 * 1024 * 1024
+        )
+    second.release(_FakeEvent(ready=True))
+
+    isolated = registry.get_or_create(
+        key_type(
+            op="forward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=98,
+            dtype=torch.float32,
+            shape_profile=profile,
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    assert isolated._expert_activation_owner is not owner
+    registry.release(forward.key)
+    assert fused._expert_activation_owner.arena.tensors
+    registry.release(fused.key)
+    assert not owner.arena.tensors
 
 
 def test_unbound_workspace_binds_to_first_runtime_stream_device(
@@ -1169,6 +1264,8 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
         "expert_activation_pool_id": None,
         "expert_activation_tensors": {},
         "expert_activation_waits": 0,
+        "expert_activation_allocations": 0,
+        "expert_activation_grows": 0,
         "expert_activation_in_use": False,
         "expert_activation_event_guarded": False,
         "active_lease_count": 0,
