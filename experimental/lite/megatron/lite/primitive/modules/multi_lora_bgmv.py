@@ -155,6 +155,14 @@ if _TRITON_AVAILABLE:
                 mask=mask_m[:, None] & mask_n[None, :],
             )
 
+    @triton.jit
+    def _promote_mixed_dot_operands(lhs, rhs):
+        """Keep native same-dtype dots; make FP32 scratch dots legal and exact."""
+        if lhs.dtype != rhs.dtype:
+            lhs = lhs.to(tl.float32)
+            rhs = rhs.to(tl.float32)
+        return lhs, rhs
+
     @triton.autotune(configs=_TUNING_CONFIGS, key=["K", "N", "G"])
     @triton.jit
     def _bgmv_shrink_kernel(
@@ -195,6 +203,7 @@ if _TRITON_AVAILABLE:
             k_mask = block_k * BLOCK_K + offsets_k < K
             x = tl.load(x_ptrs, mask=mask_m[:, None] & k_mask[None, :], other=0.0)
             w = tl.load(w_ptrs, mask=mask_n[:, None] & k_mask[None, :], other=0.0)
+            x, w = _promote_mixed_dot_operands(x, w)
             acc += tl.dot(x, w.T, input_precision="ieee")
             x_ptrs += BLOCK_K
             w_ptrs += BLOCK_K
@@ -244,6 +253,7 @@ if _TRITON_AVAILABLE:
             k_mask = block_k * BLOCK_K + offsets_k < K
             x = tl.load(x_ptrs, mask=mask_m[:, None] & k_mask[None, :], other=0.0)
             w = tl.load(w_ptrs, mask=k_mask[:, None] & mask_n[None, :], other=0.0)
+            x, w = _promote_mixed_dot_operands(x, w)
             acc += tl.dot(x, w, input_precision="ieee")
             x_ptrs += BLOCK_K
             w_ptrs += BLOCK_K * N
@@ -288,6 +298,7 @@ if _TRITON_AVAILABLE:
             k_mask = block_k * BLOCK_K + offsets_k < group_size
             x = tl.load(x_ptrs, mask=mask_m[:, None] & k_mask[None, :], other=0.0)
             w = tl.load(w_ptrs, mask=k_mask[:, None] & mask_n[None, :], other=0.0)
+            x, w = _promote_mixed_dot_operands(x, w)
             acc += tl.dot(x, w, input_precision="ieee")
             x_ptrs += BLOCK_K * M
             w_ptrs += BLOCK_K * N

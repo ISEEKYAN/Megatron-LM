@@ -3,6 +3,7 @@
 
 # isort: off
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import megatron.lite.primitive.modules.multi_lora_reference as multi_lora_reference
@@ -41,6 +42,22 @@ def _inputs(dtype=torch.float64):
     )
     indices = torch.tensor([0, 1, 1])
     return x, a_bank, b_bank, indices
+
+
+def test_bgmv_mixed_precision_promotion_covers_all_scratch_dot_boundaries():
+    """FP32 scratch must not leave an unpromoted BF16 ``tl.dot`` boundary."""
+    source = Path(multi_lora_kernel.multi_lora_bgmv.__file__).read_text()
+
+    assert source.count("_promote_mixed_dot_operands(") == 4
+    for kernel_name in (
+        "_bgmv_shrink_kernel",
+        "_bgmv_expand_kernel",
+        "_bgmv_shrink_transpose_kernel",
+    ):
+        kernel_source = source.split(f"def {kernel_name}", maxsplit=1)[1].split(
+            "@triton.autotune", maxsplit=1
+        )[0]
+        assert "_promote_mixed_dot_operands(x, w)" in kernel_source
 
 
 def _bf16_gradient_diagnostic(name, actual, references):
