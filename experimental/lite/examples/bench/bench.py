@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 """Benchmark MLite and reference runtime backends.
 
 Run from the Megatron-LM repo root after adding ``experimental/lite`` to
@@ -24,11 +25,17 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(_REPO_ROOT))
 
 from examples.bench.results import StepTrace  # noqa: E402
-from examples.bench.session import PretrainSessionConfig, run_pretrain_session  # noqa: E402
+from examples.bench.session import (
+    PretrainSessionConfig,  # noqa: E402
+    run_pretrain_session,
+)
 from megatron.lite.runtime import RuntimeConfig, create_runtime  # noqa: E402
 from megatron.lite.runtime.backends.bridge.config import BridgeConfig  # noqa: E402
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig  # noqa: E402
-from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig  # noqa: E402
+from megatron.lite.runtime.contracts.config import (  # noqa: E402
+    OptimizerConfig,
+    ParallelConfig,
+)
 
 
 @dataclass
@@ -54,6 +61,7 @@ class BenchCliConfig:
     no_optimizer: bool = False
     skip_load_hf_weights: bool = False
     skip_optimizer_build: bool = False
+    skip_eval: bool = False
     keep_experts: int | None = None
     truncate_layers: int | None = None
     disable_mtp: bool = False

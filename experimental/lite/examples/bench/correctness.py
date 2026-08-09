@@ -358,12 +358,17 @@ def run_backend(
     handle = rt.build_model()
     session_cfg = build_session_config(cfg)
 
-    eval_iter = _make_data_iter(handle, session_cfg)
-    eval_batch = next(eval_iter)
     activation_probe_names = list(activation_probe_names or [])
-    with _activation_probe_context(handle, activation_probe_names) as activation_probes:
-        with rt.eval_mode(handle):
-            eval_logits = _hash_tensor(_forward_logits(rt, handle, eval_batch))
+    activation_probes: list[dict[str, Any]] = []
+    eval_logits = None
+    if not cfg.skip_eval:
+        eval_iter = _make_data_iter(handle, session_cfg)
+        eval_batch = next(eval_iter)
+        with _activation_probe_context(
+            handle, activation_probe_names
+        ) as activation_probes:
+            with rt.eval_mode(handle):
+                eval_logits = _hash_tensor(_forward_logits(rt, handle, eval_batch))
 
     data_iter = _make_data_iter(handle, session_cfg)
     steps: list[dict[str, Any]] = []
@@ -481,6 +486,7 @@ def run_backend(
             "hash_weights": hash_weights,
             "same_data_across_dp": cfg.same_data_across_dp,
             "use_thd": cfg.use_thd,
+            "skip_eval": cfg.skip_eval,
         },
     }
 
@@ -521,6 +527,7 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--impl-cfg-json", default="{}")
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--skip-weight-hash", action="store_true")
+    parser.add_argument("--skip-eval", action="store_true")
     parser.add_argument("--activation-probes-json", default="{}")
     parser.add_argument("--verify-resume-path", default=None)
 

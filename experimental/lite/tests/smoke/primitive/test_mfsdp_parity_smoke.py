@@ -1305,6 +1305,10 @@ def test_mfsdp_qwen35_eval_to_train_first_step_is_finite():
                         "MLITE_SMOKE_DOUBLE_BUFFER", "1"
                     )
                     == "1",
+                    "overlap_param_gather": os.environ.get(
+                        "MLITE_SMOKE_GATHER_OVERLAP", "1"
+                    )
+                    == "1",
                 }
             ),
             impl_cfg_json=json.dumps(
