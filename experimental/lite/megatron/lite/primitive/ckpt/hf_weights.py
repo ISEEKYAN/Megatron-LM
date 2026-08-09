@@ -837,12 +837,14 @@ def extract_layer_idx(name: str) -> int:
 
 
 def parse_expert_idx(name: str) -> int:
-    m = re.search(r"weight(\d+)$", name)
+    m = re.search(r"weight_?(\d+)$", name)
     return int(m.group(1)) if m else 0
 
 
 def set_expert_idx(name: str, idx: int) -> str:
-    return re.sub(r"weight\d+$", f"weight{idx}", name)
+    return re.sub(
+        r"weight(_?)(\d+)$", lambda match: f"weight{match.group(1)}{idx}", name
+    )
 
 
 def to_global_layer_name(name: str, layer_map: dict[int, int]) -> str:
@@ -1359,7 +1361,9 @@ def _lora_export_surfaces(
         base_prefix = f"{prefix}base."
         base_params = list(module.base.named_parameters())
         for relative_name, _ in base_params:
-            canonical_names[f"{base_prefix}{relative_name}"] = f"{prefix}{relative_name}"
+            canonical_names[f"{base_prefix}{relative_name}"] = (
+                f"{prefix}{relative_name}"
+            )
 
         if isinstance(module, LoRAWrappedLinear):
             owner = getattr(module.base, "linear", module.base)
@@ -1463,7 +1467,9 @@ def _lora_adapter_surfaces(base_chunk: nn.Module) -> list[tuple[str, Any, bool]]
     return surfaces
 
 
-def expected_global_expert_count(*, num_experts: int | None, target_modules) -> int | None:
+def expected_global_expert_count(
+    *, num_experts: int | None, target_modules
+) -> int | None:
     """Number of global experts an adapter export must cover, or None.
 
     Deliberately the *expert count*, not a tensor count. The tensor count is the
@@ -1686,8 +1692,12 @@ def export_hf_lora_bank_adapter(
             lora_a, lora_b, native_name, spec, ps
         )
         for placed_name, placed_a, placed_b in _iter_expert_adapter_placements(
-            native_name, lora_a, lora_b, is_grouped=is_grouped,
-            num_experts=num_experts, ps=ps,
+            native_name,
+            lora_a,
+            lora_b,
+            is_grouped=is_grouped,
+            num_experts=num_experts,
+            ps=ps,
         ):
             for hf_name, lora_b_piece in _native_to_hf(spec, placed_name, placed_b):
                 if not hf_name.endswith(".weight"):
@@ -1746,7 +1756,10 @@ def export_hf_lora_adapter(
     for chunk in chunks:
         base_chunk = unwrap_model(chunk)
         layer_map = (
-            {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
+            {
+                i: base_chunk.layer_indices[i]
+                for i in range(len(base_chunk.layer_indices))
+            }
             if hasattr(base_chunk, "layer_indices")
             else {}
         )
@@ -1772,7 +1785,12 @@ def export_hf_lora_adapter(
                 lora_a, lora_b, global_name, spec, ps
             )
             for native_name, lora_a, lora_b in _iter_expert_adapter_placements(
-                global_name, lora_a, lora_b, is_grouped=is_grouped, num_experts=num_experts, ps=ps
+                global_name,
+                lora_a,
+                lora_b,
+                is_grouped=is_grouped,
+                num_experts=num_experts,
+                ps=ps,
             ):
                 for hf_name, lora_b_piece in spec.native_to_hf(native_name, lora_b):
                     if not hf_name.endswith(".weight"):

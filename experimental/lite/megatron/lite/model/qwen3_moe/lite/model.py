@@ -41,6 +41,14 @@ from megatron.lite.primitive.utils import build_fp8_recipe
 
 # isort: on
 
+
+def _sidecar_ep_sync_group(ps, sidecar: MoELoraSidecar):
+    """Return the sole explicit EP reduction owner for an external sidecar."""
+    if sidecar.requires_explicit_ep_sync and ps.ep_size > 1:
+        return ps.ep_group
+    return None
+
+
 # ---------------------------------------------------------------------------
 # MoE Layer (thin assembly over megatron.lite.primitive.modules)
 # ---------------------------------------------------------------------------
@@ -89,7 +97,7 @@ class MoELayer(nn.Module):
                 x_2d,
                 multi_lora_sidecar.lora_indices,
                 scale=multi_lora_sidecar.scale,
-                gradient_sync_group=(self.ps.ep_group if self.ps.ep_size > 1 else None),
+                gradient_sync_group=_sidecar_ep_sync_group(self.ps, multi_lora_sidecar),
             )
 
         scores, indices = self.router(x_2d)
@@ -114,7 +122,7 @@ class MoELayer(nn.Module):
                 h,
                 routed_lora_indices,
                 scale=multi_lora_sidecar.scale,
-                gradient_sync_group=(self.ps.ep_group if self.ps.ep_size > 1 else None),
+                gradient_sync_group=_sidecar_ep_sync_group(self.ps, multi_lora_sidecar),
             )
 
         expert_out = self.experts(

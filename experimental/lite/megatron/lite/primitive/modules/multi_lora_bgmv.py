@@ -33,7 +33,10 @@ _FUSED_N_THRESHOLD = 256
 
 def use_fused_bgmv(out_features: int, rank: int) -> bool:
     """Whether the production forward launches the fused BGMV kernel."""
-    return out_features >= _FUSED_N_THRESHOLD and rank >= 16
+    # The fused kernel forms ``tl.arange(0, RANK)`` without a tail mask.  Keep
+    # non-power-of-two ranks on the two-stage kernel until that contract gains
+    # a masked fused implementation.
+    return out_features >= _FUSED_N_THRESHOLD and rank >= 16 and rank & (rank - 1) == 0
 
 
 _TUNING_CONFIGS = (
@@ -145,10 +148,11 @@ if _TRITON_AVAILABLE:
                 b_base + offsets_r[:, None] + offsets_n[None, :] * RANK,
                 mask=mask_n[None, :],
             )
-            # Match the two-stage kernels exactly.  The default permits lower
-            # precision FP32 dot modes on SM90, which makes the fused rank-32
-            # path numerically diverge from its independent oracle.
-            delta = tl.dot(hidden.to(b.dtype), b, input_precision="ieee") * scale
+            # ``hidden`` is an FP32 scratch buffer.  Apply the same mixed-dot
+            # contract as the two-stage expand kernel: only a mixed boundary is
+            # promoted, while native same-dtype dots retain their original path.
+            hidden_dot, b_dot = _promote_mixed_dot_operands(hidden, b)
+            delta = tl.dot(hidden_dot, b_dot, input_precision="ieee") * scale
             tl.store(
                 delta_ptr + rows[:, None] * N + offsets_n[None, :],
                 delta.to(delta_ptr.dtype.element_ty),

@@ -9,16 +9,12 @@ accidentally choose a different slot on another surface.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Mapping
 
 import torch
-from megatron.lite.primitive.ckpt.hf_weights import (
-    VLLM_LORA_NAME_PREFIX,
-    export_hf_lora_bank_adapter,
-)
+import torch.nn as nn
+from megatron.lite.primitive.ckpt.hf_weights import export_hf_lora_bank_adapter
 from megatron.lite.primitive.modules.lora import LoraSpec, resolve_lora_alpha
 from megatron.lite.primitive.modules.multi_lora import BatchedLoraDelta
 
@@ -54,13 +50,150 @@ class DenseLoraBank:
 
 
 @dataclass(frozen=True)
+class MultiLoraSpec:
+    """Declarative construction contract for trainable named dense banks."""
+
+    names: tuple[str, ...] = ()
+    rank: int = 0
+    alpha: int | None = None
+    use_rslora: bool = False
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.names)
+
+
+def normalize_multi_lora_spec(
+    config: MultiLoraSpec | Mapping[str, Any] | None,
+) -> MultiLoraSpec:
+    """Normalize runtime config without allowing an unowned registry injection."""
+    if config is None:
+        return MultiLoraSpec()
+    if isinstance(config, MultiLoraSpec):
+        spec = config
+    elif isinstance(config, Mapping):
+        values = dict(config)
+        if "names" in values:
+            values["names"] = tuple(values["names"])
+        spec = MultiLoraSpec(**values)
+    else:
+        raise TypeError("multi_lora must be MultiLoraSpec, mapping, or None.")
+    if not spec.names:
+        if spec.rank:
+            raise ValueError("disabled multi_lora must not set rank.")
+        return spec
+    if spec.rank < 1:
+        raise ValueError("enabled multi_lora requires rank >= 1.")
+    if len(set(spec.names)) != len(spec.names) or any(not name for name in spec.names):
+        raise ValueError("multi_lora adapter names must be unique non-empty strings.")
+    if resolve_lora_alpha(spec.rank, spec.alpha) < 1:
+        raise ValueError("multi_lora alpha must resolve to a positive value.")
+    return spec
+
+
+def validate_multi_lora_parallel_support(
+    spec: MultiLoraSpec, *, tp_size: int, etp_size: int | None, use_deepep: bool
+) -> None:
+    """Reject unsupported parallel modes before model or optimizer construction."""
+    if not spec.enabled:
+        return
+    if etp_size is not None and etp_size > 1:
+        raise ValueError("multi-LoRA model-owned sidecars do not support ETP.")
+    if tp_size > 1:
+        raise ValueError("multi-LoRA model-owned sidecars do not support TP.")
+    if use_deepep:
+        raise ValueError("multi-LoRA model-owned sidecars do not support DeepEP.")
+
+
+class MultiLoraTrainingState(nn.Module):
+    """Model-owned bank parameters plus the only production sidecar factory."""
+
+    def __init__(
+        self,
+        registry: "NamedLoraBankRegistry",
+        layer_surfaces: Mapping[int, tuple[str, str]],
+    ) -> None:
+        super().__init__()
+        self.registry = registry
+        self._layer_surfaces = dict(layer_surfaces)
+        registered_tensor_names: dict[int, str] = {}
+        for surface, bank in registry.banks.items():
+            for factor, tensor in (("a", bank.a_bank), ("b", bank.b_bank)):
+                if not isinstance(tensor, nn.Parameter):
+                    raise TypeError(
+                        "production multi-LoRA banks must own nn.Parameter tensors."
+                    )
+                parameter_name = self.parameter_name(surface, factor)
+                prior_name = registered_tensor_names.get(id(tensor))
+                if prior_name is not None:
+                    raise ValueError(
+                        "one model-owned multi-LoRA Parameter cannot represent two "
+                        f"native surfaces: {prior_name!r} and {parameter_name!r}."
+                    )
+                self.register_parameter(parameter_name, tensor)
+                registered_tensor_names[id(tensor)] = parameter_name
+
+    @staticmethod
+    def parameter_name(native_surface: str, factor: str) -> str:
+        """Return a dot-free, reversible checkpoint key fragment for one factor."""
+        if factor not in {"a", "b"}:
+            raise ValueError("multi-LoRA parameter factor must be 'a' or 'b'.")
+        return f"bank_{native_surface.encode('utf-8').hex()}_{factor}"
+
+    def banks_for_layer(self, layer_idx: int) -> tuple[DenseLoraBank, DenseLoraBank]:
+        """Return model-owned native-surface banks without model-layer imports."""
+        try:
+            fc1_surface, fc2_surface = self._layer_surfaces[layer_idx]
+        except KeyError as exc:
+            raise KeyError(f"multi-LoRA slots name unknown layer: {layer_idx}") from exc
+        return self.registry.banks[fc1_surface], self.registry.banks[fc2_surface]
+
+    @property
+    def local_layer_indices(self) -> tuple[int, ...]:
+        """Global layer indices physically owned by this pipeline stage."""
+        return tuple(sorted(self._layer_surfaces))
+
+    def checkpoint_identity_metadata(self) -> dict[str, Any]:
+        """Return the versioned tenant identity required to reload these slots.
+
+        Bank tensors alone are insufficient: equal-shaped banks with a changed
+        name-to-slot order would silently assign one tenant's adapter to
+        another.  Training checkpoint bridges persist and compare this record
+        before copying any bank tensor.
+        """
+        spec = self.registry.lora_spec
+        return {
+            "schema_version": 1,
+            "names_by_slot": tuple(
+                name
+                for name, _slot in sorted(
+                    self.registry.names.items(), key=lambda item: item[1]
+                )
+            ),
+            "rank": self.registry.rank,
+            "alpha": self.registry.alpha,
+            "use_rslora": bool(spec.use_rslora) if spec is not None else False,
+        }
+
+    @property
+    def scale(self) -> float:
+        scale = (
+            self.registry.lora_spec
+            or LoraSpec(
+                enabled=True, rank=self.registry.rank, alpha=self.registry.alpha
+            )
+        ).scale
+        return scale
+
+
+@dataclass(frozen=True)
 class NamedLoraBankRegistry:
     """One stable adapter-name registry shared by homogeneous LoRA surfaces.
 
-    ``banks`` maps a PEFT module name (for example ``layers.0.q_proj``) to its
-    three-dimensional ``DenseLoraBank``.  ``names`` is the sole authority for
-    choosing a bank slot; file/directory enumeration is intentionally absent
-    from both import and export.
+    ``banks`` maps a native model weight name (for example
+    ``layers.0.moe.experts._fc1_weight_0``) to its three-dimensional
+    ``DenseLoraBank``. ``names`` is the sole authority for choosing a bank
+    slot; the HF exporter performs naming, TP/EP gather, and scale conversion.
     """
 
     banks: Mapping[str, DenseLoraBank]
@@ -136,22 +269,6 @@ class NamedLoraBankRegistry:
             selected[surface] = (a, b)
         return selected
 
-    def export_state(self, name: str, *, cpu: bool = True) -> dict[str, torch.Tensor]:
-        """Produce ordinary single-adapter PEFT keys for one explicit name."""
-        state: dict[str, torch.Tensor] = {}
-        for surface, (a, b) in self.select(name).items():
-            if a.ndim != 2 or b.ndim != 2:
-                raise AssertionError(
-                    "select() must reduce a bank to two-dimensional factors."
-                )
-            state[f"{VLLM_LORA_NAME_PREFIX}{surface}.lora_A.weight"] = (
-                a.detach().cpu().contiguous() if cpu else a.detach().contiguous()
-            )
-            state[f"{VLLM_LORA_NAME_PREFIX}{surface}.lora_B.weight"] = (
-                b.detach().cpu().contiguous() if cpu else b.detach().contiguous()
-            )
-        return state
-
     def export_hf_state(
         self, name: str, spec, ps, *, export_dtype=None
     ) -> dict[str, torch.Tensor]:
@@ -159,7 +276,7 @@ class NamedLoraBankRegistry:
         lora_spec = self.lora_spec or LoraSpec(
             enabled=True, rank=self.rank, alpha=self.alpha
         )
-        return dict(
+        items = list(
             export_hf_lora_bank_adapter(
                 self.select(name),
                 spec=spec,
@@ -171,149 +288,20 @@ class NamedLoraBankRegistry:
                 export_dtype=export_dtype,
             )
         )
-
-    def manifest(self, name: str) -> dict[str, Any]:
-        """Return self-validating metadata for one exported slot."""
-        slot = self.slot_for(name)
-        return {
-            "format": "megatron.lite_multi_lora_peft_v1",
-            "name": name,
-            "slot": slot,
-            "revision": self.revision,
-            "rank": self.rank,
-            "alpha": resolve_lora_alpha(self.rank, self.alpha),
-            "targets": sorted(self.banks),
-            "base_model_identity": dict(self.base_model_identity),
-            "shapes": {
-                surface: {
-                    "A": list(bank.a_bank.shape[1:]),
-                    "B": list(bank.b_bank.shape[1:]),
-                }
-                for surface, bank in self.banks.items()
-            },
-        }
-
-    def load_state(
-        self, name: str, state: Mapping[str, torch.Tensor], manifest: Mapping[str, Any]
-    ) -> None:
-        """Validate then write a directory's factors into one explicit slot only."""
-        expected = self.manifest(name)
-        for key in (
-            "format",
-            "name",
-            "slot",
-            "revision",
-            "rank",
-            "alpha",
-            "targets",
-            "base_model_identity",
-            "shapes",
-        ):
-            if manifest.get(key) != expected[key]:
-                raise ValueError(
-                    f"multi-LoRA manifest {key!r} does not match registered adapter {name!r}."
-                )
-        expected_keys = {
-            f"{VLLM_LORA_NAME_PREFIX}{surface}.lora_{factor}.weight"
-            for surface in self.banks
-            for factor in ("A", "B")
-        }
-        if set(state) != expected_keys:
-            raise ValueError(
-                "adapter state keys do not exactly match registered target surfaces."
+        state = dict(items)
+        if len(state) != len(items):
+            raise RuntimeError(
+                "named multi-LoRA export produced duplicate HF keys; each grouped "
+                "native surface must be registered exactly once before expert expansion."
             )
-        slot = self.slot_for(name)
-        for surface, bank in self.banks.items():
-            for factor, target in (("A", bank.a_bank), ("B", bank.b_bank)):
-                value = state[f"{VLLM_LORA_NAME_PREFIX}{surface}.lora_{factor}.weight"]
-                if tuple(value.shape) != tuple(target.shape[1:]):
-                    raise ValueError(
-                        f"adapter {name!r} {surface!r} lora_{factor} shape {tuple(value.shape)} "
-                        f"does not match {tuple(target.shape[1:])}."
-                    )
-                # Adapter import is a state update, never part of the caller's
-                # autograd graph.  Keep this explicit instead of using
-                # ``.data``, which can silently invalidate autograd views.
-                with torch.no_grad():
-                    target[slot].copy_(
-                        value.to(device=target.device, dtype=target.dtype)
-                    )
-
-
-def save_named_lora_adapter(
-    registry: NamedLoraBankRegistry, name: str, output_dir: str | Path
-) -> dict[str, Any]:
-    """Save one named bank slot as a normal PEFT adapter directory."""
-    from safetensors.torch import save_file
-
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    state = registry.export_state(name)
-    save_file(state, str(output / "adapter_model.safetensors"))
-    manifest = registry.manifest(name)
-    (output / "adapter_config.json").write_text(
-        json.dumps(
-            {
-                "peft_type": "LORA",
-                "task_type": "CAUSAL_LM",
-                "base_model_name_or_path": str(
-                    registry.base_model_identity.get("name", "")
-                ),
-                "inference_mode": False,
-                "r": registry.rank,
-                "lora_alpha": resolve_lora_alpha(registry.rank, registry.alpha),
-                "lora_dropout": (
-                    registry.lora_spec.dropout
-                    if registry.lora_spec is not None
-                    else 0.0
-                ),
-                "target_modules": sorted(
-                    {surface.rsplit(".", 1)[-1] for surface in manifest["targets"]}
-                ),
-                "bias": "none",
-                "fan_in_fan_out": False,
-                "init_lora_weights": True,
-                "modules_to_save": None,
-            },
-            indent=2,
-        )
-        + "\n"
-    )
-    (output / "multi_lora_manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n"
-    )
-    return {
-        "path": str(output),
-        "name": name,
-        "slot": manifest["slot"],
-        "manifest": manifest,
-    }
-
-
-def export_named_lora_adapter_state(
-    registry: NamedLoraBankRegistry, name: str, spec, ps, *, export_dtype=None
-) -> dict[str, torch.Tensor]:
-    """Production export entry for one named multi-LoRA bank slot."""
-    return registry.export_hf_state(name, spec, ps, export_dtype=export_dtype)
-
-
-def load_named_lora_adapter(
-    registry: NamedLoraBankRegistry, name: str, adapter_dir: str | Path
-) -> dict[str, Any]:
-    """Load one named directory into its registered slot; never infer the slot."""
-    from safetensors.torch import load_file
-
-    output = Path(adapter_dir)
-    manifest = json.loads((output / "multi_lora_manifest.json").read_text())
-    state = load_file(str(output / "adapter_model.safetensors"), device="cpu")
-    registry.load_state(name, state, manifest)
-    return {"path": str(output), "name": name, "slot": registry.slot_for(name)}
+        return state
 
 
 __all__ = [
     "DenseLoraBank",
+    "MultiLoraSpec",
+    "MultiLoraTrainingState",
     "NamedLoraBankRegistry",
-    "export_named_lora_adapter_state",
-    "load_named_lora_adapter",
-    "save_named_lora_adapter",
+    "normalize_multi_lora_spec",
+    "validate_multi_lora_parallel_support",
 ]

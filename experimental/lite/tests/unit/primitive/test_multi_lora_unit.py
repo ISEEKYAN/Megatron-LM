@@ -2,25 +2,40 @@
 """CPU contracts for the independent dense multi-LoRA primitive."""
 
 # isort: off
-import json
+import importlib
+import sys
+import types
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
-import megatron.lite.primitive.modules.multi_lora_reference as multi_lora_reference
+import multi_lora_reference
 import pytest
 import torch
 import torch.nn as nn
 from megatron.lite.model.qwen3_moe.lite import multi_lora
-from megatron.lite.primitive.ckpt.hf_weights import VLLM_LORA_NAME_PREFIX
+from megatron.lite.model.qwen3_moe.lite.checkpoint import Qwen3MoEWeightSpec
+from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.ckpt.hf_weights import (
+    VLLM_LORA_NAME_PREFIX,
+    export_hf_lora_bank_adapter,
+)
+from megatron.lite.primitive.ckpt.identity import (
+    model_checkpoint_identity_metadata,
+    require_checkpoint_identity_match,
+)
+from megatron.lite.primitive.ckpt import dcp
 from megatron.lite.primitive.modules import multi_lora_kernel
+from megatron.lite.primitive.modules import multi_lora_bank
 from megatron.lite.primitive.modules.lora import LoraSpec
 from megatron.lite.primitive.modules.multi_lora import BatchedLoraDelta
 from megatron.lite.primitive.modules.multi_lora_bank import (
     DenseLoraBank,
+    MultiLoraSpec,
+    MultiLoraTrainingState,
     NamedLoraBankRegistry,
-    export_named_lora_adapter_state,
-    load_named_lora_adapter,
-    save_named_lora_adapter,
+    validate_multi_lora_parallel_support,
 )
 
 # isort: on
@@ -48,32 +63,42 @@ def test_bgmv_mixed_precision_promotion_covers_all_scratch_dot_boundaries():
     """FP32 scratch must not leave an unpromoted BF16 ``tl.dot`` boundary."""
     source = Path(multi_lora_kernel.multi_lora_bgmv.__file__).read_text()
 
-    assert source.count("_promote_mixed_dot_operands(") == 4
+    assert source.count("_promote_mixed_dot_operands(") == 5
     for kernel_name in (
         "_bgmv_shrink_kernel",
         "_bgmv_expand_kernel",
         "_bgmv_shrink_transpose_kernel",
+        "_bgmv_fused_fwd_kernel",
     ):
         kernel_source = source.split(f"def {kernel_name}", maxsplit=1)[1].split(
             "@triton.autotune", maxsplit=1
         )[0]
-        assert "_promote_mixed_dot_operands(x, w)" in kernel_source
+        assert "_promote_mixed_dot_operands(" in kernel_source
+    fused_source = source.split("def _bgmv_fused_fwd_kernel", maxsplit=1)[1].split(
+        "@triton.jit", maxsplit=1
+    )[0]
+    assert "_promote_mixed_dot_operands(hidden, b)" in fused_source
 
 
 def _bf16_ground_truth_result(name, actual, ground_truth, eager):
     """Allow at most one final-output ULP from the FP32 mathematical oracle."""
     actual32 = actual.float()
-    ground32, eager32 = ground_truth.float(), eager.float()
-    error = (actual32 - ground32).abs()
+    eager32 = eager.float()
     ground_bf16 = ground_truth.detach().to(torch.bfloat16)
-    ulp = (
-        torch.nextafter(ground_bf16, torch.full_like(ground_bf16, float("inf")))
-        .float()
-        .sub(ground32)
-        .abs()
-        .clamp_min(torch.finfo(torch.bfloat16).tiny)
+    actual_bf16 = actual.detach().to(torch.bfloat16)
+    lower = torch.nextafter(ground_bf16, torch.full_like(ground_bf16, -float("inf")))
+    upper = torch.nextafter(ground_bf16, torch.full_like(ground_bf16, float("inf")))
+    # One output ULP means exactly one adjacent representable BF16 value in the
+    # direction of the actual output.  Do not replace the subnormal spacing at
+    # zero with ``finfo.tiny`` (the smallest *normal* value).
+    direction_step = torch.where(
+        actual_bf16 >= ground_bf16,
+        upper.float() - ground_bf16.float(),
+        ground_bf16.float() - lower.float(),
     )
-    ground_ulp_error = error / ulp
+    ground_ulp_error = (
+        actual_bf16.float() - ground_bf16.float()
+    ).abs() / direction_step
     ground_p99_ulp = torch.quantile(ground_ulp_error, 0.99)
     ground_max_ulp = ground_ulp_error.max()
     eager_p99 = torch.quantile((actual32 - eager32).abs(), 0.99)
@@ -82,7 +107,27 @@ def _bf16_ground_truth_result(name, actual, ground_truth, eager):
         f"p99_ulp={ground_p99_ulp.item():.9g}; "
         f"eager_bf16_p99_diagnostic={eager_p99.item():.9g}"
     )
-    return report, ground_max_ulp <= 1
+    return report, bool(((actual_bf16 >= lower) & (actual_bf16 <= upper)).all())
+
+
+@pytest.mark.parametrize("reference", [2.0, -2.0, 0.5, -0.5, 0.0])
+def test_bf16_output_ulp_gate_accepts_one_adjacent_value_and_rejects_two(reference):
+    """Cover normal, signed power boundaries, and zero/subnormal ULP spacing."""
+    ground_truth = torch.tensor([reference], dtype=torch.bfloat16)
+    eager = ground_truth.clone()
+    for direction in (-float("inf"), float("inf")):
+        one_ulp = torch.nextafter(
+            ground_truth, torch.full_like(ground_truth, direction)
+        )
+        two_ulp = torch.nextafter(one_ulp, torch.full_like(one_ulp, direction))
+        _, one_passes = _bf16_ground_truth_result(
+            "one_ulp", one_ulp, ground_truth, eager
+        )
+        _, two_passes = _bf16_ground_truth_result(
+            "two_ulp", two_ulp, ground_truth, eager
+        )
+        assert one_passes
+        assert not two_passes
 
 
 def test_batched_lora_delta_matches_dense_reference_for_sorted_slots():
@@ -182,7 +227,7 @@ def test_dense_lora_bank_delegates_to_operator_without_copying_tensors():
 
 @pytest.mark.parametrize(
     ("out_features", "rank", "expected"),
-    [(128, 32, False), (256, 8, False), (256, 32, True)],
+    [(128, 32, False), (256, 8, False), (256, 24, False), (256, 32, True)],
 )
 def test_bgmv_fused_selection_has_one_production_predicate(
     out_features, rank, expected
@@ -248,7 +293,16 @@ def test_cuda_triton_bgmv_training_matches_independent_oracle(
     reference = multi_lora_reference.dense_lora_delta_reference(
         *reference_values, indices, 0.75
     )
-    torch.testing.assert_close(actual, reference, rtol=rtol, atol=atol)
+    if dtype is torch.bfloat16:
+        fp32_forward = multi_lora_reference.dense_lora_delta_reference_fp32_single_cast(
+            *reference_values, indices, 0.75
+        )
+        forward_report, forward_passes = _bf16_ground_truth_result(
+            "forward_delta", actual, fp32_forward, reference
+        )
+        assert forward_passes, forward_report
+    else:
+        torch.testing.assert_close(actual, reference, rtol=rtol, atol=atol)
     grad_out = torch.randn_like(actual)
     actual.backward(grad_out)
     reference.backward(grad_out)
@@ -321,28 +375,6 @@ def _named_registry():
     )
 
 
-def test_named_registry_exports_only_explicit_slot_as_two_dimensional_peft_state():
-    registry = _named_registry()
-
-    state = registry.export_state("bravo")
-
-    assert set(state) == {
-        f"{VLLM_LORA_NAME_PREFIX}model.layers.0.q_proj.lora_A.weight",
-        f"{VLLM_LORA_NAME_PREFIX}model.layers.0.q_proj.lora_B.weight",
-        f"{VLLM_LORA_NAME_PREFIX}model.layers.0.o_proj.lora_A.weight",
-        f"{VLLM_LORA_NAME_PREFIX}model.layers.0.o_proj.lora_B.weight",
-    }
-    torch.testing.assert_close(
-        state[f"{VLLM_LORA_NAME_PREFIX}model.layers.0.q_proj.lora_A.weight"],
-        registry.banks["model.layers.0.q_proj"].a_bank[1],
-    )
-    assert (
-        state[f"{VLLM_LORA_NAME_PREFIX}model.layers.0.q_proj.lora_A.weight"].ndim == 2
-    )
-    assert registry.manifest("bravo")["slot"] == 1
-    assert registry.manifest("bravo")["name"] == "bravo"
-
-
 def test_named_registry_export_reuses_hf_mapping_and_scaling_contract():
     """Named multi-LoRA export must take the production HF export route."""
     registry = NamedLoraBankRegistry(
@@ -391,7 +423,7 @@ def test_named_registry_export_reuses_hf_mapping_and_scaling_contract():
         ep_rank=0,
         ep_group=None,
     )
-    state = export_named_lora_adapter_state(registry, "alpha", Spec(), ps)
+    state = registry.export_hf_state("alpha", Spec(), ps)
     prefix = VLLM_LORA_NAME_PREFIX + "model.layers.0.mlp.experts.0"
     assert set(state) == {
         f"{prefix}.gate_proj.lora_A.weight",
@@ -450,7 +482,7 @@ def test_named_registry_export_gathers_tensor_parallel_output_before_mapping(
         ep_rank=0,
         ep_group=None,
     )
-    state = export_named_lora_adapter_state(registry, "alpha", Spec(), ps)
+    state = registry.export_hf_state("alpha", Spec(), ps)
     key = f"{VLLM_LORA_NAME_PREFIX}model.layers.0.self_attn.q_proj.lora_B.weight"
     torch.testing.assert_close(
         state[key], torch.tensor([[1.0, 2.0], [3.0, 4.0], [11.0, 12.0], [13.0, 14.0]])
@@ -468,63 +500,483 @@ def test_named_registry_rejects_duplicate_or_unknown_slots():
             base_model_identity={},
         )
     with pytest.raises(KeyError, match="Unknown"):
-        _named_registry().export_state("not-registered")
+        _named_registry().slot_for("not-registered")
 
 
-def test_named_registry_roundtrip_writes_only_named_slot_and_validates_manifest(
+def test_model_owned_training_state_discovers_optimizer_params_and_builds_sidecars():
+    """The production sidecar factory must share registry parameter objects."""
+    fc1 = DenseLoraBank(
+        torch.nn.Parameter(torch.ones(2, 2, 3)),
+        torch.nn.Parameter(torch.zeros(2, 4, 2)),
+    )
+    fc2 = DenseLoraBank(
+        torch.nn.Parameter(torch.ones(2, 2, 2)),
+        torch.nn.Parameter(torch.zeros(2, 3, 2)),
+    )
+    registry = NamedLoraBankRegistry(
+        banks={
+            "layers.0.moe.experts._fc1_weight_0": fc1,
+            "layers.0.moe.experts._fc2_weight_0": fc2,
+        },
+        names={"alpha": 0, "bravo": 1},
+        rank=2,
+        alpha=4,
+        base_model_identity={},
+        lora_spec=LoraSpec(enabled=True, rank=2, alpha=4),
+    )
+    state = MultiLoraTrainingState(
+        registry,
+        {
+            0: (
+                "layers.0.moe.experts._fc1_weight_0",
+                "layers.0.moe.experts._fc2_weight_0",
+            )
+        },
+    )
+
+    sidecar = multi_lora.MoELoraSidecar(
+        *state.banks_for_layer(0),
+        lora_indices=torch.tensor([0, 1], dtype=torch.int64),
+        scale=state.scale,
+    )
+
+    assert sidecar.fc1 is fc1
+    assert sidecar.fc2 is fc2
+    assert {id(parameter) for parameter in state.parameters()} == {
+        id(fc1.a_bank),
+        id(fc1.b_bank),
+        id(fc2.a_bank),
+        id(fc2.b_bank),
+    }
+    assert state.registry.slot_for("bravo") == 1
+    assert sidecar.requires_explicit_ep_sync is True
+
+
+def test_model_owned_checkpoint_identity_is_pp_global_and_rejects_contract_changes():
+    """Same-shaped banks must not silently restore into reordered adapter names."""
+
+    def build_state(names, *, alpha=2, rank=1, layer_idx=0):
+        fc1_surface = f"layers.{layer_idx}.moe.experts._fc1_weight_0"
+        fc2_surface = f"layers.{layer_idx}.moe.experts._fc2_weight_0"
+        registry = NamedLoraBankRegistry(
+            banks={
+                fc1_surface: DenseLoraBank(
+                    nn.Parameter(torch.ones(2, rank, 1)),
+                    nn.Parameter(torch.ones(2, 2, rank)),
+                ),
+                fc2_surface: DenseLoraBank(
+                    nn.Parameter(torch.ones(2, rank, 2)),
+                    nn.Parameter(torch.ones(2, 1, rank)),
+                ),
+            },
+            names={name: slot for slot, name in enumerate(names)},
+            rank=rank,
+            alpha=alpha,
+            base_model_identity={},
+        )
+        return MultiLoraTrainingState(
+            registry,
+            {layer_idx: (fc1_surface, fc2_surface)},
+        )
+
+    source = nn.Module()
+    source.add_module("multi_lora_training_state", build_state(("alpha", "bravo")))
+    pp_stage_one = nn.Module()
+    pp_stage_one.add_module(
+        "multi_lora_training_state", build_state(("alpha", "bravo"), layer_idx=7)
+    )
+    restored = nn.Module()
+    restored.add_module("multi_lora_training_state", build_state(("bravo", "alpha")))
+    saved_identity = model_checkpoint_identity_metadata(source)
+    assert saved_identity["chunk0.multi_lora_training_state"]["schema_version"] == 1
+    assert saved_identity == model_checkpoint_identity_metadata(pp_stage_one)
+    with pytest.raises(ValueError, match="identity mismatch"):
+        require_checkpoint_identity_match(restored, saved_identity)
+    for changed in (
+        build_state(("alpha", "bravo"), alpha=4),
+        build_state(("alpha", "bravo"), rank=2),
+    ):
+        target = nn.Module()
+        target.add_module("multi_lora_training_state", changed)
+        with pytest.raises(ValueError, match="identity mismatch"):
+            require_checkpoint_identity_match(target, saved_identity)
+
+
+def test_semantic_bank_parameter_names_survive_reordered_registry_and_pp_stages(
     tmp_path,
 ):
-    source = _named_registry()
-    save_named_lora_adapter(source, "bravo", tmp_path)
-    config = json.loads((tmp_path / "adapter_config.json").read_text())
-    assert config["r"] == source.lora_spec.rank
-    assert config["lora_alpha"] == source.lora_spec.alpha
-    assert config["lora_dropout"] == source.lora_spec.dropout
-    assert config["target_modules"] == ["o_proj", "q_proj"]
-    destination = _named_registry()
-    for bank in destination.banks.values():
-        bank.a_bank.zero_()
-        bank.b_bank.zero_()
-
-    load_named_lora_adapter(destination, "bravo", tmp_path)
-
-    for surface, source_bank in source.banks.items():
-        target_bank = destination.banks[surface]
-        torch.testing.assert_close(target_bank.a_bank[1], source_bank.a_bank[1])
-        torch.testing.assert_close(target_bank.b_bank[1], source_bank.b_bank[1])
-        torch.testing.assert_close(
-            target_bank.a_bank[0], torch.zeros_like(target_bank.a_bank[0])
-        )
-        torch.testing.assert_close(
-            target_bank.b_bank[0], torch.zeros_like(target_bank.b_bank[0])
-        )
-
-    manifest = source.manifest("bravo")
-    manifest["slot"] = 0
-    with pytest.raises(ValueError, match="slot"):
-        destination.load_state("bravo", source.export_state("bravo"), manifest)
-
-
-def test_named_registry_import_is_no_grad_and_rejects_shape_mismatch():
-    source = _named_registry()
-    destination = _named_registry()
-    for bank in destination.banks.values():
-        bank.a_bank.requires_grad_(True)
-        bank.b_bank.requires_grad_(True)
-
-    state = source.export_state("alpha")
-    destination.load_state("alpha", state, source.manifest("alpha"))
-
-    for bank in destination.banks.values():
-        assert bank.a_bank.grad_fn is None
-        assert bank.b_bank.grad_fn is None
-
-    bad_state = dict(state)
-    bad_state[f"{VLLM_LORA_NAME_PREFIX}model.layers.0.q_proj.lora_A.weight"] = (
-        torch.ones(1, 3)
+    """Tensor checkpoint keys bind each global native surface, not insertion order."""
+    surfaces = (
+        "layers.0.moe.experts._fc1_weight_0",
+        "layers.0.moe.experts._fc2_weight_0",
+        "layers.1.moe.experts._fc1_weight_0",
+        "layers.1.moe.experts._fc2_weight_0",
     )
-    with pytest.raises(ValueError, match="shape"):
-        destination.load_state("alpha", bad_state, source.manifest("alpha"))
+
+    def make_state(surface_order, *, fill_offset):
+        banks = {}
+        for index, surface in enumerate(surface_order):
+            banks[surface] = DenseLoraBank(
+                nn.Parameter(
+                    torch.full((1, 1, 1), fill_offset + surfaces.index(surface) * 10.0)
+                ),
+                nn.Parameter(
+                    torch.full(
+                        (1, 1, 1), fill_offset + surfaces.index(surface) * 10.0 + 1
+                    )
+                ),
+            )
+        registry = NamedLoraBankRegistry(
+            banks=banks, names={"alpha": 0}, rank=1, alpha=1, base_model_identity={}
+        )
+        return MultiLoraTrainingState(
+            registry,
+            {
+                0: (surfaces[0], surfaces[1]),
+                1: (surfaces[2], surfaces[3]),
+            },
+        )
+
+    source = nn.Module()
+    source_state = make_state(tuple(reversed(surfaces)), fill_offset=10.0)
+    source.add_module("multi_lora_training_state", source_state)
+    target = nn.Module()
+    target_state = make_state(surfaces, fill_offset=-100.0)
+    target.add_module("multi_lora_training_state", target_state)
+    dcp.save_training_checkpoint(
+        source,
+        torch.optim.SGD(source.parameters(), lr=0.1),
+        1,
+        str(tmp_path),
+        use_dcp=False,
+    )
+    dcp.load_training_checkpoint(
+        target,
+        torch.optim.SGD(target.parameters(), lr=0.1),
+        str(tmp_path),
+        use_dcp=False,
+    )
+    for surface in surfaces:
+        source_bank = source_state.registry.banks[surface]
+        target_bank = target_state.registry.banks[surface]
+        torch.testing.assert_close(target_bank.a_bank, source_bank.a_bank)
+        torch.testing.assert_close(target_bank.b_bank, source_bank.b_bank)
+
+    stage_zero = {
+        MultiLoraTrainingState.parameter_name(surfaces[0], factor)
+        for factor in ("a", "b")
+    }
+    stage_one = {
+        MultiLoraTrainingState.parameter_name(surfaces[2], factor)
+        for factor in ("a", "b")
+    }
+    assert stage_zero.isdisjoint(stage_one)
+    assert all("." not in name for name in stage_zero | stage_one)
+
+
+def test_model_owned_sidecar_has_no_explicit_ep_gradient_owner(
+    monkeypatch, transformer_engine_import_stub
+):
+    """Production injection, not a tensor attribute, selects dense finalize ownership."""
+    state = MultiLoraTrainingState(
+        NamedLoraBankRegistry(
+            banks={
+                "layers.0.moe.experts._fc1_weight_0": DenseLoraBank(
+                    nn.Parameter(torch.ones(1, 1, 1)), nn.Parameter(torch.ones(1, 2, 1))
+                ),
+                "layers.0.moe.experts._fc2_weight_0": DenseLoraBank(
+                    nn.Parameter(torch.ones(1, 1, 2)), nn.Parameter(torch.ones(1, 1, 1))
+                ),
+            },
+            names={"alpha": 0},
+            rank=1,
+            alpha=1,
+            base_model_identity={},
+        ),
+        {
+            0: (
+                "layers.0.moe.experts._fc1_weight_0",
+                "layers.0.moe.experts._fc2_weight_0",
+            )
+        },
+    )
+    injected = {}
+
+    class Batch:
+        extras = {"multi_lora_slots": {0: torch.tensor([0], dtype=torch.int64)}}
+
+    fake_model = types.ModuleType("megatron.lite.model.qwen3_moe.lite.model")
+    fake_model.MTPLossAutoScaler = type("MTPLossAutoScaler", (), {})
+    fake_model.Qwen3MoEModel = nn.Module
+    monkeypatch.setitem(
+        sys.modules, "megatron.lite.model.qwen3_moe.lite.model", fake_model
+    )
+    protocol = importlib.import_module("megatron.lite.model.qwen3_moe.lite.protocol")
+    protocol._inject_multi_lora_sidecars(injected, Batch(), state)
+    owned = injected["multi_lora_sidecars"][0]
+    assert owned.requires_explicit_ep_sync is False
+
+    # Test the real model.py selector, not a hand-passed ``None`` argument.
+    transformer_engine_import_stub()
+    sys.modules.pop("megatron.lite.model.qwen3_moe.lite.model", None)
+    model = importlib.import_module("megatron.lite.model.qwen3_moe.lite.model")
+    ps = SimpleNamespace(ep_size=2, ep_group=object())
+    assert model._sidecar_ep_sync_group(ps, owned) is None
+
+    # The legacy external contract still selects one explicit EP group for
+    # each of its two model call sites (fc1 and fc2).
+    group = object()
+    external = multi_lora.MoELoraSidecar(
+        *state.banks_for_layer(0),
+        lora_indices=torch.tensor([0], dtype=torch.int64),
+        scale=1.0,
+    )
+    assert external.requires_explicit_ep_sync is True
+    ps.ep_group = group
+    assert model._sidecar_ep_sync_group(ps, external) is group
+    # Both model call sites consume this same selector; an inverted flag would
+    # change the result for both fc1 and fc2 before any kernel is launched.
+    assert model._sidecar_ep_sync_group(ps, external) is group
+
+
+def test_pipeline_stage_filters_remote_slots_and_rejects_missing_local_slot(
+    monkeypatch,
+):
+    """Each PP stage constructs sidecars only for its own global layer IDs."""
+    registry = NamedLoraBankRegistry(
+        banks={
+            "layers.1.moe.experts._fc1_weight_0": DenseLoraBank(
+                nn.Parameter(torch.ones(1, 1, 1)), nn.Parameter(torch.ones(1, 2, 1))
+            ),
+            "layers.1.moe.experts._fc2_weight_0": DenseLoraBank(
+                nn.Parameter(torch.ones(1, 1, 2)), nn.Parameter(torch.ones(1, 1, 1))
+            ),
+        },
+        names={"alpha": 0},
+        rank=1,
+        alpha=1,
+        base_model_identity={},
+    )
+    stage_one = MultiLoraTrainingState(
+        registry,
+        {
+            1: (
+                "layers.1.moe.experts._fc1_weight_0",
+                "layers.1.moe.experts._fc2_weight_0",
+            )
+        },
+    )
+    assert stage_one.local_layer_indices == (1,)
+    fake_model = types.ModuleType("megatron.lite.model.qwen3_moe.lite.model")
+    fake_model.MTPLossAutoScaler = type("MTPLossAutoScaler", (), {})
+    fake_model.Qwen3MoEModel = nn.Module
+    monkeypatch.setitem(
+        sys.modules, "megatron.lite.model.qwen3_moe.lite.model", fake_model
+    )
+    protocol = importlib.import_module("megatron.lite.model.qwen3_moe.lite.protocol")
+
+    class Batch:
+        extras = {
+            "multi_lora_slots": {
+                0: torch.tensor([0], dtype=torch.int64),
+                1: torch.tensor([0], dtype=torch.int64),
+            }
+        }
+
+    kwargs = {}
+    protocol._inject_multi_lora_sidecars(kwargs, Batch(), stage_one)
+    assert set(kwargs["multi_lora_sidecars"]) == {1}
+
+    class MissingLocalBatch:
+        extras = {"multi_lora_slots": {0: torch.tensor([0], dtype=torch.int64)}}
+
+    with pytest.raises(ValueError, match=r"missing local pipeline layers: \[1\]"):
+        protocol._inject_multi_lora_sidecars({}, MissingLocalBatch(), stage_one)
+
+
+def test_model_owned_fc2_bank_uses_out_features_by_rank_layout():
+    """fc2's B bank is [slots, hidden_size, rank], not transposed."""
+    fc2 = DenseLoraBank(
+        torch.nn.Parameter(torch.ones(2, 2, 2)),
+        torch.nn.Parameter(torch.zeros(2, 3, 2)),
+    )
+    output = fc2.delta(
+        torch.ones(2, 2), torch.tensor([0, 1], dtype=torch.int64), scale=1.0
+    )
+    assert output.shape == (2, 3)
+
+
+def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
+    """Builder wiring, not a hand-made bank, owns the train/export lifecycle."""
+
+    fake_model = types.ModuleType("megatron.lite.model.qwen3_moe.lite.model")
+    fake_model.MTPLossAutoScaler = type("MTPLossAutoScaler", (), {})
+    fake_model.Qwen3MoEModel = nn.Module
+    monkeypatch.setitem(
+        sys.modules, "megatron.lite.model.qwen3_moe.lite.model", fake_model
+    )
+    qwen3_moe_protocol = importlib.import_module(
+        "megatron.lite.model.qwen3_moe.lite.protocol"
+    )
+
+    class FakeLayer:
+        layer_idx = 0
+
+    class FakeChunk(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+            self.layers = [FakeLayer()]
+
+    chunk = FakeChunk()
+    config = Qwen3MoEConfig(
+        num_hidden_layers=1,
+        hidden_size=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=2,
+        vocab_size=8,
+        num_experts=3,
+        num_experts_per_tok=1,
+        moe_intermediate_size=6,
+        layer_types=["full_attention"],
+    )
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        qwen3_moe_protocol.build_model(
+            config,
+            impl_cfg=qwen3_moe_protocol.ImplConfig(
+                lora=LoraSpec(enabled=True, rank=2),
+                multi_lora=MultiLoraSpec(names=("alpha",), rank=2),
+            ),
+        )
+    with pytest.raises(ValueError, match="dist_opt only"):
+        qwen3_moe_protocol.build_model(
+            config,
+            impl_cfg=qwen3_moe_protocol.ImplConfig(
+                optimizer="fsdp2", multi_lora=MultiLoraSpec(names=("alpha",), rank=2)
+            ),
+        )
+    state = qwen3_moe_protocol._build_multi_lora_training_state(
+        [chunk], config, MultiLoraSpec(names=("alpha", "bravo"), rank=24)
+    )
+    assert state is chunk.multi_lora_training_state
+    fc1, fc2 = state.banks_for_layer(0)
+    assert fc1.a_bank.shape == (2, 24, 4)
+    assert fc1.b_bank.shape == (2, 12, 24)
+    assert fc2.a_bank.shape == (2, 24, 6)
+    assert fc2.b_bank.shape == (2, 4, 24)
+    assert set(state.registry.banks) == {
+        "layers.0.moe.experts._fc1_weight_0",
+        "layers.0.moe.experts._fc2_weight_0",
+    }
+    assert {id(parameter) for parameter in state.parameters()} == {
+        id(fc1.a_bank),
+        id(fc1.b_bank),
+        id(fc2.a_bank),
+        id(fc2.b_bank),
+    }
+    optimizer_parameter_ids = {
+        id(parameter)
+        for group in torch.optim.SGD(chunk.parameters(), lr=0.1).param_groups
+        for parameter in group["params"]
+    }
+    assert {
+        id(parameter) for parameter in state.parameters()
+    } <= optimizer_parameter_ids
+    checkpoint_state = chunk.state_dict()
+    assert {
+        "multi_lora_training_state."
+        + MultiLoraTrainingState.parameter_name(surface, factor)
+        for surface in (
+            "layers.0.moe.experts._fc1_weight_0",
+            "layers.0.moe.experts._fc2_weight_0",
+        )
+        for factor in ("a", "b")
+    } <= set(checkpoint_state)
+    selected = state.registry.select("alpha")
+    assert len(selected) == 2
+    selected_fc1_a, selected_fc1_b = selected["layers.0.moe.experts._fc1_weight_0"]
+    selected_fc2_a, selected_fc2_b = selected["layers.0.moe.experts._fc2_weight_0"]
+    torch.testing.assert_close(selected_fc1_a, fc1.a_bank[0])
+    torch.testing.assert_close(selected_fc1_b, fc1.b_bank[0])
+    torch.testing.assert_close(selected_fc2_a, fc2.a_bank[0])
+    torch.testing.assert_close(selected_fc2_b, fc2.b_bank[0])
+
+    ps = SimpleNamespace(
+        tp_size=1,
+        tp_rank=0,
+        tp_group=None,
+        etp_size=1,
+        etp_rank=0,
+        etp_group=None,
+        ep_size=1,
+        ep_rank=0,
+        ep_group=None,
+    )
+    generated = list(
+        export_hf_lora_bank_adapter(
+            selected,
+            spec=Qwen3MoEWeightSpec(config),
+            ps=ps,
+            train_scale=state.scale,
+            rank=state.registry.rank,
+            alpha=state.registry.alpha,
+            use_rslora=False,
+        )
+    )
+    expected_modules = {
+        f"model.layers.0.mlp.experts.{expert_idx}.{projection}"
+        for expert_idx in range(config.num_experts)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    }
+    expected_keys = {
+        f"{VLLM_LORA_NAME_PREFIX}{module}.lora_{factor}.weight"
+        for module in expected_modules
+        for factor in ("A", "B")
+    }
+    generated_keys = [key for key, _ in generated]
+    assert set(generated_keys) == expected_keys
+    assert len(generated_keys) == len(expected_keys) == config.num_experts * 3 * 2
+    assert len(generated_keys) == len(set(generated_keys))
+    assert (
+        set(state.registry.export_hf_state("alpha", Qwen3MoEWeightSpec(config), ps))
+        == expected_keys
+    )
+
+    bundle = ModelBundle(
+        chunks=[chunk],
+        parallel_state=SimpleNamespace(),
+        forward_step=partial(
+            qwen3_moe_protocol._forward_step_bshd, multi_lora_state=state
+        ),
+        extras={"multi_lora_registry": state.registry},
+    )
+    batch = SimpleNamespace(
+        input_ids=torch.tensor([1, 2]),
+        labels=None,
+        extras={"multi_lora_slots": {0: torch.tensor([0, 1], dtype=torch.int64)}},
+    )
+    output = bundle.forward_step(lambda **kwargs: kwargs, batch)
+    sidecar = output["multi_lora_sidecars"][0]
+    assert bundle.extras["multi_lora_registry"] is state.registry
+    assert sidecar.fc1 is fc1 and sidecar.fc2 is fc2
+    assert sidecar.lora_indices is batch.extras["multi_lora_slots"][0]
+
+
+def test_multi_lora_parallel_contract_rejects_etp_and_deepep():
+    spec = multi_lora_bank.MultiLoraSpec(names=("alpha",), rank=2)
+    with pytest.raises(ValueError, match="ETP"):
+        validate_multi_lora_parallel_support(
+            spec, tp_size=1, etp_size=2, use_deepep=False
+        )
+    with pytest.raises(ValueError, match="TP"):
+        validate_multi_lora_parallel_support(
+            spec, tp_size=2, etp_size=1, use_deepep=False
+        )
+    with pytest.raises(ValueError, match="DeepEP"):
+        validate_multi_lora_parallel_support(
+            spec, tp_size=1, etp_size=1, use_deepep=True
+        )
 
 
 @pytest.mark.parametrize(

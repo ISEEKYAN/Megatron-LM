@@ -15,9 +15,8 @@ def dense_lora_delta_reference(
 ) -> torch.Tensor:
     """Compute ``scale * B[slot] @ A[slot] @ x`` for every input row.
 
-    A slot of ``-1`` is an explicitly inactive adapter and produces a zero
-    delta. This intentionally uses indexing and matmul directly, rather than
-    the operator kernel, so it remains a parity oracle.
+    This intentionally uses indexing and matmul directly, rather than the
+    operator kernel, so it remains a parity oracle.
     """
     if x.ndim != 2:
         raise ValueError("x must be two-dimensional [tokens, in_features].")
@@ -98,7 +97,23 @@ def dense_lora_backward_reference_fp32_single_cast(
     return tuple(gradient.to(x.dtype) for gradient in (grad_x, grad_a, grad_b))
 
 
+def dense_lora_delta_reference_fp32_single_cast(
+    x: torch.Tensor,
+    a_bank: torch.Tensor,
+    b_bank: torch.Tensor,
+    lora_indices: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Compute the forward delta in FP32, then cast only the public output."""
+    x32, a32, b32 = x.float(), a_bank.float(), b_bank.float()
+    selected_a = a32.index_select(0, lora_indices)
+    selected_b = b32.index_select(0, lora_indices)
+    hidden = torch.bmm(selected_a, x32.unsqueeze(-1)).squeeze(-1)
+    return (torch.bmm(selected_b, hidden.unsqueeze(-1)).squeeze(-1) * scale).to(x.dtype)
+
+
 __all__ = [
     "dense_lora_backward_reference_fp32_single_cast",
+    "dense_lora_delta_reference_fp32_single_cast",
     "dense_lora_delta_reference",
 ]

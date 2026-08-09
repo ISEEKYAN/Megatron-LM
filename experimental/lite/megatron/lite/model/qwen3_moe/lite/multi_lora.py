@@ -76,6 +76,11 @@ class MoELoraSidecar:
     fc2: DenseLoraBank
     lora_indices: torch.Tensor
     scale: float
+    # External callers provide replicated banks outside the model/optimizer
+    # lifecycle, so they retain the legacy explicit EP reduction.  The model
+    # builder sets this False for model-owned banks; dist-opt then owns their
+    # single dense-DP/finalize reduction.
+    requires_explicit_ep_sync: bool = True
 
 
 __all__ = ["MoELoraSidecar", "apply_dense_lora_delta"]
