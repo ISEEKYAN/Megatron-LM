@@ -334,18 +334,82 @@ def _run_bank_gradient_contract(bundle) -> None:
             bank.b_bank[1].fill_(0.25)
     _configure_fixed_router(bundle)
     batch = _production_batch(bundle)
+    parameters = _bank_parameters(bundle)
+
+    def assert_slots(gradients, *, active: tuple[int, ...]) -> None:
+        assert set(gradients) == _expected_semantic_bank_keys(state)
+        for name, gradient in gradients.items():
+            assert gradient.shape == parameters[name].shape
+            assert name.rsplit("_", 1)[-1] in {"a", "b"}
+            for slot in range(gradient.shape[0]):
+                if slot in active:
+                    assert gradient[slot].abs().max() > 0, (name, slot)
+                else:
+                    assert gradient[slot].eq(0).all(), (name, slot)
+
+    # Independent miss arm: all factors are nonzero but every token selects
+    # alpha.  Its bravo gradients must be exactly zero before the mixed arm.
+    batch.extras["multi_lora_slots"][0].zero_()
+    loss, gradients = _run_production_forward_and_finalize(bundle, batch)
+    assert loss == loss
+    assert_slots(gradients, active=(0,))
+    _clear_gradients(bundle)
+
+    # A separate lifecycle establishes that the same semantic A/B slot axis
+    # receives gradients for both adapters under mixed token routing.
     batch.extras["multi_lora_slots"][0].copy_(
         torch.tensor([0, 1, 0, 1], device="cuda", dtype=torch.long)
     )
     loss, gradients = _run_production_forward_and_finalize(bundle, batch)
     assert loss == loss
-    assert set(gradients) == _expected_semantic_bank_keys(state)
-    parameters = _bank_parameters(bundle)
-    for name, gradient in gradients.items():
-        assert gradient.shape == parameters[name].shape
-        assert name.rsplit("_", 1)[-1] in {"a", "b"}
-        assert gradient[0].abs().max() > 0, name
-        assert gradient[1].abs().max() > 0, name
+    assert_slots(gradients, active=(0, 1))
+
+
+def _adapter_export_oracle(bundle) -> dict[str, dict[str, torch.Tensor]]:
+    """Export both slots through the real TP materialization + native mapper."""
+    from megatron.lite.model.qwen3_moe.lite.checkpoint import Qwen3MoEWeightSpec
+    from megatron.lite.primitive.ckpt.hf_weights import VLLM_LORA_NAME_PREFIX
+
+    state = bundle.extras["multi_lora_training_state"]
+    expected_modules = {
+        f"model.layers.0.mlp.experts.{expert}.{projection}"
+        for expert in range(_config().num_experts)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    } | {
+        f"model.layers.0.self_attn.{projection}"
+        for projection in ("q_proj", "k_proj", "v_proj", "o_proj")
+    }
+    expected_keys = {
+        f"{VLLM_LORA_NAME_PREFIX}{module}.lora_{factor}.weight"
+        for module in expected_modules
+        for factor in ("A", "B")
+    }
+    exported = {
+        name: state.registry.export_hf_state(
+            name, Qwen3MoEWeightSpec(_config()), bundle.parallel_state
+        )
+        for name in ("alpha", "bravo")
+    }
+    for name, tensors in exported.items():
+        assert set(tensors) == expected_keys, name
+        assert all(tensor.ndim == 2 for tensor in tensors.values())
+        assert all(
+            tensor.shape[0 if key.endswith("lora_A.weight") else 1]
+            == state.registry.rank
+            for key, tensor in tensors.items()
+        )
+    assert any(
+        not torch.equal(exported["alpha"][key], exported["bravo"][key])
+        for key in expected_keys
+    )
+    records = {
+        name: {key: _tensor_record(value) for key, value in tensors.items()}
+        for name, tensors in exported.items()
+    }
+    gathered = [None] * bundle.parallel_state.dp_size
+    dist.all_gather_object(gathered, records, group=bundle.parallel_state.dp_group)
+    assert all(record == gathered[0] for record in gathered)
+    return exported
 
 
 def _distributed_optimizer_leaves(optimizer) -> tuple[object, ...]:
@@ -711,6 +775,10 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
         _initialize_nonzero_banks(bundle)
         _configure_fixed_router(bundle)
         batch = _production_batch(bundle)
+        adapter_exports = _adapter_export_oracle(bundle)
+        export_path = artifact_dir / f"adapter_exports_rank_{dist.get_rank():05d}.pt"
+        torch.save(adapter_exports, export_path)
+        dist.barrier()
         parameter_semantics = _checkpoint_semantics(bundle)
         loss, local_contributions = _run_unsynchronized_reference(bundle, batch)
         expected_keys = _expected_semantic_bank_keys(
@@ -748,6 +816,7 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
         oracle_tensors_by_rank = [None] * phase_config["world"]
         local_contribution_tensors_by_rank = [None] * phase_config["world"]
         parameter_semantics_by_rank = [None] * phase_config["world"]
+        adapter_export_records_by_rank = [None] * phase_config["world"]
         dist.all_gather_object(losses, loss)
         dist.all_gather_object(batches, _batch_record(batch))
         dist.all_gather_object(
@@ -762,6 +831,13 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
             },
         )
         dist.all_gather_object(parameter_semantics_by_rank, parameter_semantics)
+        dist.all_gather_object(
+            adapter_export_records_by_rank,
+            {
+                adapter: {key: _tensor_record(value) for key, value in tensors.items()}
+                for adapter, tensors in adapter_exports.items()
+            },
+        )
         dist.barrier()
         oracle_path = artifact_dir / f"ep2_bank_grads_rank_{dist.get_rank():05d}.pt"
         local_path = (
@@ -798,6 +874,13 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
                 "semantic_bank_tensors_by_rank": oracle_tensors_by_rank,
                 "local_contribution_tensors_by_rank": local_contribution_tensors_by_rank,
                 "parameter_semantics_by_rank": parameter_semantics_by_rank,
+                "adapter_export_tensors_by_rank": adapter_export_records_by_rank,
+                "adapter_export_files": {
+                    f"rank_{rank:05d}": _sha256(
+                        artifact_dir / f"adapter_exports_rank_{rank:05d}.pt"
+                    )
+                    for rank in range(phase_config["world"])
+                },
                 "oracle_files": {
                     f"rank_{rank:05d}": _sha256(
                         artifact_dir / f"ep2_bank_grads_rank_{rank:05d}.pt"
@@ -883,6 +966,20 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
             name: _tensor_record(value) for name, value in local_contributions.items()
         } == manifest["local_contribution_tensors_by_rank"][rank]
         local_contributions_by_rank.append(local_contributions)
+    adapter_export_path = (
+        artifact_dir / f"adapter_exports_rank_{dist.get_rank():05d}.pt"
+    )
+    assert (
+        _sha256(adapter_export_path)
+        == manifest["adapter_export_files"][f"rank_{dist.get_rank():05d}"]
+    )
+    adapter_export_oracle = torch.load(
+        adapter_export_path, map_location="cpu", weights_only=True
+    )
+    assert {
+        adapter: {key: _tensor_record(value) for key, value in tensors.items()}
+        for adapter, tensors in adapter_export_oracle.items()
+    } == manifest["adapter_export_tensors_by_rank"][dist.get_rank()]
 
     bundle = _build_bundle(
         tp=phase_config["tp"], ep=phase_config["ep"], model_seed=3100
@@ -980,6 +1077,11 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
         post_load_semantics == manifest["parameter_semantics_by_rank"][dist.get_rank()]
     )
     assert _batch_record(batch) == expected_batch
+    restored_exports = _adapter_export_oracle(bundle)
+    for adapter, tensors in restored_exports.items():
+        assert set(tensors) == set(adapter_export_oracle[adapter])
+        for key, value in tensors.items():
+            assert torch.equal(value.cpu(), adapter_export_oracle[adapter][key])
     assert _config().to_dict() == manifest["model_config"]
     assert expected_impl == manifest["impl_config"]["verify"]
     _configure_fixed_router(bundle)
