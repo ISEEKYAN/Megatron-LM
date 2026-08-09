@@ -228,7 +228,17 @@ class _EPChunkAllocationArena:
                 self._allocation_depth = 0
 
 
-_EXPERT_ACTIVATION_SIZE_CLASS_BYTES = 2 * 1024 * 1024
+_EXPERT_ACTIVATION_SIZE_CLASS_BYTES = 8 * 1024 * 1024
+
+
+def _expert_activation_capacity_bytes(requested_bytes: int) -> int:
+    """Round an observed activation request to its 8 MiB reuse class."""
+    if requested_bytes <= 0:
+        raise ValueError("EP chunk expert activation must have positive byte size")
+    return (
+        (requested_bytes + _EXPERT_ACTIVATION_SIZE_CLASS_BYTES - 1)
+        // _EXPERT_ACTIVATION_SIZE_CLASS_BYTES
+    ) * _EXPERT_ACTIVATION_SIZE_CLASS_BYTES
 
 
 @dataclass(frozen=True)
@@ -254,11 +264,11 @@ class _EPChunkSharedExpertActivationOwner:
 
     def acquire(self, *, stream: Any | None, device: torch.device) -> None:
         if self.arena.device is None:
-            if self.key.device_type == "cuda":
-                with torch.cuda.device(device):
-                    self.arena.allocation_pool = torch.cuda.MemPool(
-                        allocator=None, use_on_oom=False, no_split=False
-                    )
+            # A strong reference to each caller-owned tensor is sufficient to
+            # stabilize its address after warmup.  Do not place persistent
+            # activations in another MemPool: only DeepEP's two communication
+            # slots own custom pools, avoiding cross-pool nesting and extra
+            # allocator residency.
             self.arena.device = device
         if self.in_use:
             raise RuntimeError("EP chunk expert activation arena is already leased")
@@ -325,10 +335,9 @@ class _EPChunkSharedExpertActivationOwner:
             row_bytes = int(torch.empty((), dtype=dtype).element_size())
             for dim in requested[1:]:
                 row_bytes *= dim
-            capacity_bytes = (
-                (required_rows * row_bytes + _EXPERT_ACTIVATION_SIZE_CLASS_BYTES - 1)
-                // _EXPERT_ACTIVATION_SIZE_CLASS_BYTES
-            ) * _EXPERT_ACTIVATION_SIZE_CLASS_BYTES
+            capacity_bytes = _expert_activation_capacity_bytes(
+                required_rows * row_bytes
+            )
             capacity_rows = (capacity_bytes + row_bytes - 1) // row_bytes
             with self.arena.allocate():
                 existing = torch.empty(

@@ -59,7 +59,7 @@ def test_allocation_arena_reenters_one_pool_once_and_restores_depth_after_error(
     assert entered == [(arena.allocation_pool, torch.device("cuda", 0))] * 2
 
 
-def test_owned_expert_tensor_reenters_its_activation_arena_once(
+def test_owned_expert_tensor_does_not_enter_a_dedicated_activation_pool(
     monkeypatch, transformer_engine_import_stub
 ):
     """The real lease tensor path can allocate inside Experts' activation scope."""
@@ -104,12 +104,10 @@ def test_owned_expert_tensor_reenters_its_activation_arena_once(
         )
 
     assert tuple(tensor.shape) == (3, 4)
-    assert entered == [
-        (
-            workspace._expert_activation_owner.arena.allocation_pool,
-            torch.device("cuda", 0),
-        )
-    ]
+    # Persistent caller-owned tensors retain their addresses without a custom
+    # MemPool.  Only DeepEP's two communication slots own such pools.
+    assert entered == []
+    assert workspace.evidence()["expert_activation_pool_count"] == 0
     lease.release(_FakeEvent(ready=True))
 
 
@@ -763,7 +761,7 @@ def test_workspace_reports_deepep_buffer_count_and_resident_bytes(
     assert evidence["caller_owned_recv_proven"] is False
 
 
-def test_workspace_owns_two_comm_pools_and_one_expert_activation_pool(
+def test_workspace_owns_only_two_comm_pools_not_an_activation_pool(
     monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
@@ -853,13 +851,13 @@ def test_workspace_owns_two_comm_pools_and_one_expert_activation_pool(
         stream=SimpleNamespace(device=torch.device("cuda", 3))
     )
     activation.release(_FakeEvent(ready=True))
-    assert workspace.evidence()["expert_activation_pool_count"] == 1
-    assert workspace.evidence()["expert_activation_pool_id"] == id(created[2])
+    assert workspace.evidence()["expert_activation_pool_count"] == 0
+    assert workspace.evidence()["expert_activation_pool_id"] is None
 
     lease1 = workspace.acquire(1)
     with lease1.deepep_recv_allocation():
         pass
-    assert len(created) == 3
+    assert len(created) == 2
     lease1.release(_FakeEvent(ready=True))
     assert workspace.evidence()["allocation_pool_count"] == 2
 
@@ -867,7 +865,7 @@ def test_workspace_owns_two_comm_pools_and_one_expert_activation_pool(
     assert workspace.evidence()["allocation_pool_count"] == 0
     # A workspace close cannot discard a registry-owned activation arena: a
     # compatible forward/fused workspace may still hold the physical owner.
-    assert workspace.evidence()["expert_activation_pool_count"] == 1
+    assert workspace.evidence()["expert_activation_pool_count"] == 0
 
 
 def test_three_ops_share_one_compatible_expert_activation_owner(
@@ -891,12 +889,7 @@ def test_three_ops_share_one_compatible_expert_activation_owner(
     def use_device(_device):
         yield
 
-    @contextmanager
-    def use_pool(_pool, device=None):
-        yield
-
     monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
-    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
     monkeypatch.setattr(overlap.torch.cuda, "MemPool", lambda **_kwargs: object())
     registry = registry_type()
     profile = profile_type(
@@ -933,20 +926,19 @@ def test_three_ops_share_one_compatible_expert_activation_owner(
             workspace.materialize()
         workspaces.append(workspace)
 
-    activation_ids = {
-        workspace.evidence()["expert_activation_pool_id"] for workspace in workspaces
-    }
     comm_ids = {
         pool_id
         for workspace in workspaces
         for pool_id in workspace.evidence()["allocation_pool_ids"].values()
     }
-    assert len(activation_ids) == 1
+    assert {
+        workspace.evidence()["expert_activation_pool_id"] for workspace in workspaces
+    } == {None}
     assert [
         workspace.evidence()["allocation_pool_count"] for workspace in workspaces
     ] == [2, 0, 2]
     assert len(comm_ids) == 4
-    assert activation_ids.isdisjoint(comm_ids)
+    assert None not in comm_ids
 
 
 def test_expert_activation_arena_waits_only_for_its_consumer_event(
@@ -1045,7 +1037,7 @@ def test_expert_activation_lease_size_classes_adjacent_rows_without_growth(
     assert evidence["shape"][0] >= 5
     assert (
         evidence["nbytes"] - first_tensor.numel() * first_tensor.element_size()
-        < 2 * 1024 * 1024
+        < 8 * 1024 * 1024
     )
     assert evidence["data_ptr"] == first_ptr
     grow_guard = _FakeEvent(ready=False)
@@ -1119,7 +1111,7 @@ def test_shared_owner_reuses_all_large_activation_names_across_ops(
     for tensor in owner.arena.tensors.values():
         requested_bytes = 131963 * 16 * tensor.element_size()
         assert (
-            tensor.numel() * tensor.element_size() - requested_bytes < 2 * 1024 * 1024
+            tensor.numel() * tensor.element_size() - requested_bytes < 8 * 1024 * 1024
         )
     second.release(_FakeEvent(ready=True))
 
@@ -1139,6 +1131,32 @@ def test_shared_owner_reuses_all_large_activation_names_across_ops(
     assert fused._expert_activation_owner.arena.tensors
     registry.release(fused.key)
     assert not owner.arena.tensors
+
+
+@pytest.mark.parametrize(
+    ("requested_bytes", "capacity_bytes"),
+    [
+        (532_676_608, 536_870_912),
+        (530_579_456, 536_870_912),
+        (534_773_760, 536_870_912),
+    ],
+)
+def test_expert_activation_rounds_real_32k_requests_to_8mib_classes(
+    requested_bytes, capacity_bytes, transformer_engine_import_stub
+):
+    """32K Qwen3 records remain in one 8 MiB class without cold growth."""
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EXPERT_ACTIVATION_SIZE_CLASS_BYTES,
+        _expert_activation_capacity_bytes,
+    )
+
+    assert _EXPERT_ACTIVATION_SIZE_CLASS_BYTES == 8 * 1024 * 1024
+    assert _expert_activation_capacity_bytes(requested_bytes) == capacity_bytes
+    # The next routed block may request the full 512 MiB; it must reuse this
+    # class rather than cold-grow a second persistent buffer.
+    assert _expert_activation_capacity_bytes(536_870_912) == capacity_bytes
+    assert capacity_bytes - requested_bytes < _EXPERT_ACTIVATION_SIZE_CLASS_BYTES
 
 
 def test_unbound_workspace_binds_to_first_runtime_stream_device(
