@@ -143,7 +143,7 @@ class MegatronFSDP(nn.Module):
         self.param_sync.discard_full_parameter_views()
 
     def forward(self, *args, **kwargs):
-        self.param_sync.begin_forward(preserve_non_fsdp_units=not self.training)
+        self.param_sync.begin_forward()
         primary_failure = False
 
         def attach_backward(tensor: torch.Tensor) -> torch.Tensor:

@@ -1283,10 +1283,7 @@ class AllGatherPipeline:
         bucket.wait_param_gather()
 
     def begin_forward(self) -> None:
-        # Keep a root/non-unit bucket retained by the preceding eval forward
-        # until the next forward installs it. The current forward's mode
-        # decides whether it remains retained at its own post-forward boundary.
-        self.release_all(preserve_non_fsdp_units=True)
+        self.release_all()
         self._forward_cursor = 0
         if self.buckets and self.overlap:
             self.async_bucket_gather(0)
@@ -1680,16 +1677,14 @@ class CommunicationPipelines:
             owner_id: TrainingState.IDLE for owner_id in self._owner_bucket_ids
         }
         self._backward_started = False
-        self._preserve_non_fsdp_units_after_forward = False
 
-    def begin_forward(self, *, preserve_non_fsdp_units: bool = False) -> None:
+    def begin_forward(self) -> None:
         graph_task_id = getattr(torch._C, "_current_graph_task_id", lambda: -1)()
         if self._backward_started and graph_task_id < 0:
             # PyTorch does not execute queued GraphTask callbacks after every
             # backward failure.  A later forward is the first universally
             # reachable boundary where stale work can be torn down.
             self.abort()
-        self._preserve_non_fsdp_units_after_forward = bool(preserve_non_fsdp_units)
         self.all_gather.begin_forward()
 
     def acquire_forward(self, bucket_ids: Iterable[int]) -> None:
@@ -1703,11 +1698,7 @@ class CommunicationPipelines:
     def release_forward_owner(self, owner_id: int, bucket_ids: Iterable[int]) -> None:
         if self._training_states.get(owner_id) is TrainingState.PRE_BACKWARD:
             return
-        if (
-            self._owner_is_fsdp_unit.get(owner_id, True)
-            or not self._preserve_non_fsdp_units_after_forward
-        ):
-            self.release_forward_ids(bucket_ids)
+        self.release_forward_ids(bucket_ids)
         self._training_states[owner_id] = TrainingState.IDLE
 
     def begin_backward(self) -> bool:
@@ -1800,8 +1791,6 @@ class CommunicationPipelines:
         for bucket in self.buckets:
             if self._training_states.get(bucket.owner_id) is TrainingState.PRE_BACKWARD:
                 continue
-            if not bucket.is_fsdp_unit and self._preserve_non_fsdp_units_after_forward:
-                continue
             bucket.release_full_parameters()
             bucket.discard_full_parameter_views()
 
@@ -1836,12 +1825,8 @@ class CommunicationPipelines:
     def release_all(self) -> None:
         self.all_gather.release_all()
 
-    def discard_full_parameter_views(
-        self, *, preserve_non_fsdp_units: bool = False
-    ) -> None:
+    def discard_full_parameter_views(self) -> None:
         for bucket in self.buckets:
-            if preserve_non_fsdp_units and not bucket.is_fsdp_unit:
-                continue
             bucket.discard_full_parameter_views()
 
     def move_model_state(self, device: torch.device, *, load_grad: bool) -> None:

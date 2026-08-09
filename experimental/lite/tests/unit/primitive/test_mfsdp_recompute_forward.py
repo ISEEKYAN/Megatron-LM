@@ -163,30 +163,6 @@ def test_inference_mode_recompute_forward_releases_retain_bucket():
     _release_cached_buffers(chunk)  # must not raise
 
 
-def test_eval_to_train_preserves_non_unit_parameters_until_train_forward():
-    chunk, optimizer = _build_chunk()
-    value = torch.randn(3, 4)
-
-    chunk.eval()
-    with torch.no_grad():
-        eval_output = chunk(value)
-
-    non_unit_buckets = [
-        bucket for bucket in chunk.param_sync.buckets if not bucket.is_fsdp_unit
-    ]
-    assert non_unit_buckets
-    assert all(bucket._full_ready for bucket in non_unit_buckets)
-    assert all(bucket._full_lease is not None for bucket in non_unit_buckets)
-
-    chunk.train()
-    optimizer.zero_grad()
-    train_output = chunk(value)
-
-    assert torch.isfinite(train_output).all()
-    assert torch.equal(train_output, eval_output)
-    assert not _any_slot_busy(chunk)
-
-
 def test_grad_enabled_forward_reshards_before_backward_like_mcore():
     chunk, optimizer = _build_chunk()
     value = torch.randn(3, 4)
