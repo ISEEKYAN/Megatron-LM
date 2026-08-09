@@ -365,6 +365,22 @@ def EXPERT_CLASSIFIER(name: str) -> bool:
 
 
 def PLACEMENT_FN(param_name: str) -> list:
+    if ".bank_" in param_name or param_name.startswith("bank_"):
+        encoded = param_name.rsplit("_", 1)[0].split("bank_", 1)[1]
+        try:
+            surface = bytes.fromhex(encoded).decode("utf-8")
+        except ValueError:
+            surface = ""
+        factor = param_name.rsplit("_", 1)[-1]
+        if ".attn.qkv." in surface:
+            return [Replicate(), Replicate(), Replicate(), Shard(1)]
+        if ".attn.proj." in surface:
+            return [
+                Replicate(),
+                Replicate(),
+                Replicate(),
+                Shard(2 if factor == "a" else 1),
+            ]
     if "experts" in param_name and "router" not in param_name:
         if "fc1" in param_name:
             return [Replicate(), Replicate(), Shard(0), Shard(0)]

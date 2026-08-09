@@ -14,14 +14,24 @@ from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
+from megatron.lite.primitive.ckpt import hf_weights
 from megatron.lite.primitive.ckpt.hf_weights import export_hf_lora_bank_adapter
 from megatron.lite.primitive.modules.lora import LoraSpec, resolve_lora_alpha
 from megatron.lite.primitive.modules.lora import (
     _all_reduce_sum,
+    _all_gather_last_dim,
     _gather_sequence_parallel,
     _scatter_sequence_parallel,
 )
+from megatron.lite.primitive.modules import multi_lora_kernel
 from megatron.lite.primitive.modules.multi_lora import BatchedLoraDelta
+
+
+@dataclass(frozen=True)
+class LoraBankPartition:
+    tp_size: int = 1
+    rank_partitioned_a: bool = False
+    output_partitioned_b: bool = False
 
 
 @dataclass(frozen=True)
@@ -30,16 +40,23 @@ class DenseLoraBank:
 
     a_bank: torch.Tensor
     b_bank: torch.Tensor
+    partition: LoraBankPartition = LoraBankPartition()
 
     def __post_init__(self) -> None:
         if self.a_bank.ndim != 3 or self.b_bank.ndim != 3:
             raise ValueError(
                 "DenseLoraBank requires three-dimensional A_bank and B_bank."
             )
-        if (
-            self.a_bank.shape[0] != self.b_bank.shape[0]
-            or self.a_bank.shape[1] != self.b_bank.shape[2]
+        if self.partition.tp_size < 1 or (
+            self.partition.rank_partitioned_a and self.partition.output_partitioned_b
         ):
+            raise ValueError("invalid multi-LoRA TP partition metadata.")
+        ranks_match = self.a_bank.shape[1] == self.b_bank.shape[2]
+        if self.partition.rank_partitioned_a:
+            ranks_match = (
+                self.a_bank.shape[1] * self.partition.tp_size == self.b_bank.shape[2]
+            )
+        if self.a_bank.shape[0] != self.b_bank.shape[0] or not ranks_match:
             raise ValueError(
                 "DenseLoraBank A_bank and B_bank must agree on slots and rank."
             )
@@ -76,20 +93,52 @@ def apply_batched_lora_delta(
     if sequence_parallel_input:
         rows = _gather_sequence_parallel(rows, tp_group)
         slots = _gather_sequence_parallel(slots[:, None], tp_group).squeeze(-1)
-    if slots.numel() < 2 or bool(torch.all(slots[1:] >= slots[:-1])):
-        delta = bank.delta(rows, slots, scale=scale)
+    partition = bank.partition
+    if rows.shape[0] == 0:
+        width = bank.b_bank.shape[1] * (
+            partition.tp_size if partition.output_partitioned_b else 1
+        )
+        return rows.new_zeros((*x.shape[:-1], width))
+    if not partition.rank_partitioned_a and not partition.output_partitioned_b:
+        if slots.numel() < 2 or bool(torch.all(slots[1:] >= slots[:-1])):
+            delta = bank.delta(rows, slots, scale=scale)
+        else:
+            order = torch.argsort(slots, stable=True)
+            restore = torch.empty_like(order)
+            restore[order] = torch.arange(order.numel(), device=order.device)
+            delta = bank.delta(
+                rows.index_select(0, order), slots.index_select(0, order), scale=scale
+            ).index_select(0, restore)
     else:
         order = torch.argsort(slots, stable=True)
         restore = torch.empty_like(order)
         restore[order] = torch.arange(order.numel(), device=order.device)
-        delta = bank.delta(
-            rows.index_select(0, order), slots.index_select(0, order), scale=scale
-        ).index_select(0, restore)
-    if input_parallel_reduce:
-        delta = _all_reduce_sum(delta, tp_group)
+        rows, slots = rows.index_select(0, order), slots.index_select(0, order)
+        hidden = multi_lora_kernel.batched_lora_linear_stage(
+            rows,
+            bank.a_bank,
+            slots,
+            output_dtype=torch.float32,
+            max_g_size_hint=rows.shape[0],
+        )
+        if partition.rank_partitioned_a:
+            hidden = _all_gather_last_dim(hidden, tp_group, reduce_backward=True)
+        if input_parallel_reduce:
+            hidden = _all_reduce_sum(hidden, tp_group)
+        delta = multi_lora_kernel.batched_lora_linear_stage(
+            hidden,
+            bank.b_bank,
+            slots,
+            scale=scale,
+            output_dtype=rows.dtype,
+            max_g_size_hint=rows.shape[0],
+        )
+        if partition.output_partitioned_b:
+            delta = _all_gather_last_dim(delta, tp_group, reduce_backward=False)
+        delta = delta.index_select(0, restore)
     if sequence_parallel_scatter_output:
         delta = _scatter_sequence_parallel(delta, tp_group, tp_rank)
-    return delta.reshape(*x.shape[:-1], bank.b_bank.shape[1])
+    return delta.reshape(*x.shape[:-1], delta.shape[-1])
 
 
 @dataclass(frozen=True)
@@ -142,6 +191,8 @@ def validate_multi_lora_parallel_support(
         return
     if etp_size is not None and etp_size > 1:
         raise ValueError("multi-LoRA model-owned sidecars do not support ETP.")
+    if tp_size > 1 and spec.rank % tp_size:
+        raise ValueError("multi-LoRA rank must be divisible by TP size.")
     if use_deepep:
         raise ValueError("multi-LoRA model-owned sidecars do not support DeepEP.")
 
@@ -300,7 +351,12 @@ class NamedLoraBankRegistry:
                 raise ValueError(
                     f"surface {surface!r} has {bank.slots} slots; expected {slot_count}."
                 )
-            if bank.a_bank.shape[1] != self.rank or bank.b_bank.shape[2] != self.rank:
+            a_rank = (
+                bank.a_bank.shape[1] * bank.partition.tp_size
+                if bank.partition.rank_partitioned_a
+                else bank.a_bank.shape[1]
+            )
+            if a_rank != self.rank or bank.b_bank.shape[2] != self.rank:
                 raise ValueError(
                     f"surface {surface!r} rank does not match registry rank {self.rank}."
                 )
@@ -329,18 +385,35 @@ class NamedLoraBankRegistry:
         lora_spec = self.lora_spec or LoraSpec(
             enabled=True, rank=self.rank, alpha=self.alpha
         )
-        items = list(
-            export_hf_lora_bank_adapter(
-                self.select(name),
-                spec=spec,
-                ps=ps,
-                train_scale=lora_spec.scale,
-                rank=self.rank,
-                alpha=self.alpha,
-                use_rslora=lora_spec.use_rslora,
-                export_dtype=export_dtype,
+        selected = self.select(name)
+        items = []
+        for surface, bank in self.banks.items():
+            active_partition = (
+                bank.partition.rank_partitioned_a or bank.partition.output_partitioned_b
             )
-        )
+            if (active_partition and bank.partition.tp_size != ps.tp_size) or (
+                not active_partition and bank.partition.tp_size not in (1, ps.tp_size)
+            ):
+                raise ValueError(
+                    "multi-LoRA bank TP metadata does not match export parallel state."
+                )
+            a, b = selected[surface]
+            if ps.tp_size > 1 and bank.partition.rank_partitioned_a:
+                a = hf_weights.allgather_concat(a, ps.tp_size, ps.tp_group, dim=0)
+            if ps.tp_size > 1 and bank.partition.output_partitioned_b:
+                b = hf_weights.allgather_concat(b, ps.tp_size, ps.tp_group, dim=0)
+            items.extend(
+                export_hf_lora_bank_adapter(
+                    {surface: (a, b)},
+                    spec=spec,
+                    ps=ps,
+                    train_scale=lora_spec.scale,
+                    rank=self.rank,
+                    alpha=self.alpha,
+                    use_rslora=lora_spec.use_rslora,
+                    export_dtype=export_dtype,
+                )
+            )
         state = dict(items)
         if len(state) != len(items):
             raise RuntimeError(

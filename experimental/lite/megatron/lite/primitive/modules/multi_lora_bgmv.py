@@ -394,6 +394,93 @@ def bgmv_fwd(x, lora_a, lora_b, lora_indices, scale, max_g_size_hint=None):
     return delta, hidden
 
 
+def bgmv_stage_fwd(
+    x, weight, lora_indices, *, scale=1.0, output_dtype=None, max_g_size_hint=None
+):
+    """Run selected-bank ``y=x@W.T`` with the existing shrink kernel."""
+    tokens = x.shape[0]
+    groups, out_features, in_features = weight.shape
+    offsets, sizes, groups = compute_group_offsets(lora_indices, num_loras=groups)
+    max_group = max_g_size_hint if max_g_size_hint is not None else tokens
+    out = torch.empty(
+        tokens, out_features, device=x.device, dtype=output_dtype or x.dtype
+    )
+
+    def grid(meta):
+        return (
+            triton.cdiv(max_group, meta["BLOCK_M"]),
+            triton.cdiv(out_features, meta["BLOCK_N"]),
+            groups,
+        )
+
+    _bgmv_shrink_kernel[grid](
+        x,
+        weight,
+        out,
+        offsets,
+        sizes,
+        tokens,
+        K=in_features,
+        N=out_features,
+        G=groups,
+        scale=scale,
+    )
+    return out
+
+
+def bgmv_stage_bwd(
+    x, grad_out, weight, lora_indices, *, scale=1.0, max_g_size_hint=None
+):
+    """Backward for one ``y=x@W.T`` stage: expand for x, transpose-shrink for W."""
+    tokens = x.shape[0]
+    groups, out_features, in_features = weight.shape
+    offsets, sizes, groups = compute_group_offsets(lora_indices, num_loras=groups)
+    max_group = max_g_size_hint if max_g_size_hint is not None else tokens
+    grad_x = torch.empty_like(x)
+
+    def grid_x(meta):
+        return (
+            triton.cdiv(max_group, meta["BLOCK_M"]),
+            triton.cdiv(in_features, meta["BLOCK_N"]),
+            groups,
+        )
+
+    _bgmv_expand_kernel[grid_x](
+        grad_out.contiguous(),
+        weight,
+        grad_x,
+        offsets,
+        sizes,
+        tokens,
+        K=out_features,
+        N=in_features,
+        G=groups,
+        scale=scale,
+    )
+    grad_w = torch.zeros_like(weight)
+
+    def grid_w(meta):
+        return (
+            triton.cdiv(out_features, meta["BLOCK_N"]),
+            triton.cdiv(in_features, meta["BLOCK_N"]),
+            groups,
+        )
+
+    _bgmv_shrink_transpose_kernel[grid_w](
+        grad_out.contiguous(),
+        x,
+        grad_w,
+        offsets,
+        sizes,
+        tokens,
+        M=out_features,
+        N=in_features,
+        G=groups,
+        scale=scale,
+    )
+    return grad_x, grad_w
+
+
 def bgmv_bwd(
     x, grad_out, lora_a, lora_b, lora_indices, scale, hidden=None, max_g_size_hint=None
 ):

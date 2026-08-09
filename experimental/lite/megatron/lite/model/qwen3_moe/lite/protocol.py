@@ -60,6 +60,7 @@ from megatron.lite.primitive.modules.lora import (
 )
 from megatron.lite.primitive.modules.multi_lora_bank import (
     DenseLoraBank,
+    LoraBankPartition,
     MultiLoraSpec,
     MultiLoraTrainingState,
     NamedLoraBankRegistry,
@@ -279,21 +280,24 @@ def _build_multi_lora_training_state(
                 ),
             )
             attn = layer.attn
+            tp_size = int(getattr(attn.qkv, "tp_size", 1))
+            if spec.rank % tp_size:
+                raise ValueError("multi-LoRA rank must be divisible by TP size.")
             # Preserve TE's fused LayerNorm+QKV GEMM and request the exact
             # normalized activation it already produces for the sidecar delta.
             attn.qkv.linear.return_layernorm_output = True
             attn.qkv.linear.return_layernorm_output_gathered = False
             qkv = DenseLoraBank(
-                nn.Parameter(
+                a_bank=nn.Parameter(
                     torch.empty(
                         len(spec.names),
-                        spec.rank,
+                        spec.rank // tp_size,
                         model_cfg.hidden_size,
                         device=device,
                         dtype=dtype,
                     )
                 ),
-                nn.Parameter(
+                b_bank=nn.Parameter(
                     torch.empty(
                         len(spec.names),
                         attn.qkv.local_out,
@@ -302,9 +306,12 @@ def _build_multi_lora_training_state(
                         dtype=dtype,
                     )
                 ),
+                partition=LoraBankPartition(
+                    tp_size=tp_size, rank_partitioned_a=tp_size > 1
+                ),
             )
             proj = DenseLoraBank(
-                nn.Parameter(
+                a_bank=nn.Parameter(
                     torch.empty(
                         len(spec.names),
                         spec.rank,
@@ -313,14 +320,17 @@ def _build_multi_lora_training_state(
                         dtype=dtype,
                     )
                 ),
-                nn.Parameter(
+                b_bank=nn.Parameter(
                     torch.empty(
                         len(spec.names),
-                        model_cfg.hidden_size,
+                        model_cfg.hidden_size // tp_size,
                         spec.rank,
                         device=device,
                         dtype=dtype,
                     )
+                ),
+                partition=LoraBankPartition(
+                    tp_size=tp_size, output_partitioned_b=tp_size > 1
                 ),
             )
             nn.init.kaiming_uniform_(fc1.a_bank, a=5**0.5)

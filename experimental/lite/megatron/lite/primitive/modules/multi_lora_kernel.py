@@ -40,6 +40,69 @@ def dense_batched_lora_forward(
     return delta * scale, hidden
 
 
+def dense_batched_lora_stage_forward(
+    x, weight, slots, *, scale=1.0, output_dtype=None, max_g_size_hint=None
+):
+    """Selected-bank shrink/expand stage; CUDA dispatch stays in Mint Triton."""
+    if _TRITON_AVAILABLE and x.is_cuda and x.is_contiguous() and weight.is_contiguous():
+        return multi_lora_bgmv.bgmv_stage_fwd(
+            x,
+            weight,
+            slots,
+            scale=scale,
+            output_dtype=output_dtype,
+            max_g_size_hint=max_g_size_hint,
+        )
+    selected = weight.index_select(0, slots)
+    return (torch.bmm(selected, x.unsqueeze(-1)).squeeze(-1) * scale).to(
+        output_dtype or x.dtype
+    )
+
+
+class BatchedLoraLinearStage(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, slots, scale, output_dtype, max_g_size_hint):
+        ctx.save_for_backward(x, weight, slots)
+        ctx.scale, ctx.max_g_size_hint = scale, max_g_size_hint
+        return dense_batched_lora_stage_forward(
+            x,
+            weight,
+            slots,
+            scale=scale,
+            output_dtype=output_dtype,
+            max_g_size_hint=max_g_size_hint,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight, slots = ctx.saved_tensors
+        if _can_use_triton(x, weight, weight):
+            grad_x, grad_w = multi_lora_bgmv.bgmv_stage_bwd(
+                x,
+                grad_out,
+                weight,
+                slots,
+                scale=ctx.scale,
+                max_g_size_hint=ctx.max_g_size_hint,
+            )
+        else:
+            selected = weight.index_select(0, slots)
+            grad_x = torch.bmm(grad_out.unsqueeze(1), selected).squeeze(1) * ctx.scale
+            grad_w = torch.zeros_like(weight)
+            grad_w.index_add_(
+                0, slots, grad_out.unsqueeze(-1) * x.unsqueeze(1) * ctx.scale
+            )
+        return grad_x, grad_w, None, None, None, None
+
+
+def batched_lora_linear_stage(
+    x, weight, slots, *, scale=1.0, output_dtype=None, max_g_size_hint=None
+):
+    return BatchedLoraLinearStage.apply(
+        x, weight, slots, scale, output_dtype, max_g_size_hint
+    )
+
+
 def dense_batched_lora_backward(x, grad_output, a_bank, b_bank, slots, scale, hidden):
     """Return Triton gradients, or ``None`` to select the eager fallback."""
     if not _can_use_triton(x, a_bank, b_bank):
@@ -61,4 +124,7 @@ __all__ = [
     "use_fused_bgmv",
     "dense_batched_lora_backward",
     "dense_batched_lora_forward",
+    "dense_batched_lora_stage_forward",
+    "BatchedLoraLinearStage",
+    "batched_lora_linear_stage",
 ]
