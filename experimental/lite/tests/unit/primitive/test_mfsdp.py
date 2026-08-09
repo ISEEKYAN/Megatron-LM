@@ -2459,7 +2459,6 @@ def test_mfsdp_grad_hook_only_stages_and_never_launches_collectives():
     )
 
     bucket._make_grad_ready_hook(spec)(spec.full_param)
-    bucket.set_grad_sync_enabled(True)
 
     assert bucket._grad_ready_ids == {id(spec)}
     assert torch.equal(spec.full_param.main_grad, torch.ones_like(spec.full_param))
