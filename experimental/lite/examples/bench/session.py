@@ -55,6 +55,12 @@ def _world_size() -> int:
     return 1
 
 
+def _effective_tokens_per_step(handle: ModelHandle, cfg: PretrainSessionConfig) -> int:
+    # TP/EP/CP ranks cooperate on the same tokens. Only the data-parallel
+    # dimension contributes distinct samples to global throughput.
+    return cfg.num_microbatches * cfg.seq_len * handle.dp_size
+
+
 def _resolve_vocab_size(handle: ModelHandle) -> int:
     proto = handle._extras.get("protocol")
     model_cfg = handle._extras.get("model_cfg")
@@ -173,7 +179,7 @@ def run_pretrain_session(
         data_iter = _make_data_iter(handle, cfg)
 
     world_size = _world_size()
-    tokens_per_step = cfg.num_microbatches * cfg.seq_len * world_size
+    tokens_per_step = _effective_tokens_per_step(handle, cfg)
     step_flops, activated_params = _resolve_step_flops(handle, cfg)
 
     step_traces: list[StepTrace] = []

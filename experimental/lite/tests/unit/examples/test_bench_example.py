@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 """Unit tests for the benchmark example."""
 
 from __future__ import annotations
@@ -7,6 +8,7 @@ import json
 import sys
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from megatron.lite.runtime.contracts.config import ParallelConfig
@@ -186,6 +188,20 @@ def test_pretrain_session_runs_with_fake_runtime_on_cpu():
     artifact = result.to_dict()
     assert "avg_optimizer_step_ms" in artifact["summary"]
     assert "optimizer_step_ms" in artifact["result"]["step_traces"][0]
+
+
+def test_effective_tokens_count_only_data_parallel_samples():
+    from examples.bench.session import PretrainSessionConfig, _effective_tokens_per_step
+
+    handle = ModelHandle(
+        model=object(),
+        optimizer=object(),
+        parallel_state=SimpleNamespace(dp_size=2),
+        config=SimpleNamespace(),
+    )
+    config = PretrainSessionConfig(num_microbatches=4, seq_len=128)
+
+    assert _effective_tokens_per_step(handle, config) == 4 * 128 * 2
 
 
 def test_bench_main_writes_dry_run_output_json(tmp_path):
