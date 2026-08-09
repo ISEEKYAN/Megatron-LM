@@ -12,6 +12,7 @@ from megatron.lite.primitive.modules.lora import (
     LinearLoRA,
     SharedGroupedLinearLoRA,
     freeze_non_lora_params,
+    lora_scaling,
     normalize_lora_config,
     trainable_param_stats,
 )
@@ -48,6 +49,43 @@ def test_lora_config_aliases_and_trainable_param_accounting():
         "trainable_tensors": 2,
         "trainable_numel": model.lora_adapter.weight.numel() + model.lora_adapter.bias.numel(),
     }
+
+
+def test_rslora_uses_sqrt_rank_scaling():
+    # standard LoRA: alpha/rank; rsLoRA: alpha/sqrt(rank). rank=4, alpha=8 -> 2.0 vs 4.0.
+    assert lora_scaling(4, 8, use_rslora=False) == 2.0
+    assert lora_scaling(4, 8, use_rslora=True) == 4.0
+    assert lora_scaling(4, None, use_rslora=True) == 4 / (4**0.5)  # alpha defaults to rank
+
+    cfg = normalize_lora_config({"rank": 4, "alpha": 8, "use_rslora": True})
+    assert cfg.use_rslora
+    assert cfg.scale == 4.0
+    assert normalize_lora_config({"rank": 4, "alpha": 8}).scale == 2.0  # default off
+
+    assert LinearLoRA(2, 1, rank=4, alpha=8).scale == 2.0
+    assert LinearLoRA(2, 1, rank=4, alpha=8, use_rslora=True).scale == 4.0
+    assert SharedGroupedLinearLoRA(2, 2, 2, rank=4, alpha=8, use_rslora=True).scale == 4.0
+    assert GroupedLinearLoRA(2, 2, 2, rank=4, alpha=8, use_rslora=True).scale == 4.0
+
+    # modules record use_rslora so the adapter round-trip can invert scale->alpha correctly
+    assert LinearLoRA(2, 1, rank=4, alpha=8, use_rslora=True).use_rslora is True
+    assert LinearLoRA(2, 1, rank=4, alpha=8).use_rslora is False
+
+
+def test_rslora_forward_scales_delta_by_sqrt_rank():
+    # identical adapter weights, rsLoRA output = sqrt(rank) x standard output.
+    # alpha=8 != rank=4 so the std path is non-trivially scaled (2.0), not 1.0.
+    torch.manual_seed(0)
+    a = torch.randn(4, 3)
+    b = torch.randn(2, 4)
+    std = LinearLoRA(3, 2, rank=4, alpha=8, dropout=0.0)
+    rs = LinearLoRA(3, 2, rank=4, alpha=8, dropout=0.0, use_rslora=True)
+    with torch.no_grad():
+        for layer in (std, rs):
+            layer.lora_a.copy_(a)
+            layer.lora_b.copy_(b)
+    x = torch.randn(1, 3)
+    torch.testing.assert_close(rs(x), std(x) * (4**0.5))
 
 
 def test_linear_lora_forward_backward_matches_low_rank_delta():
