@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 from __future__ import annotations
 
 import os
@@ -12,14 +13,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 import torch.nn as nn
-
-from megatron.lite.runtime import create_runtime
 from megatron.lite.primitive.optimizers.mfsdp.optimizer import MFSdpOptimizer
+from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.backends.mlite.runtime import (
     MegatronLiteRuntime,
     _apply_attention_backend_env,
     _build_impl_cfg,
+    _EvalModeCtx,
     _pipeline_callbacks,
 )
 from megatron.lite.runtime.contracts.config import (
@@ -77,6 +78,22 @@ def test_release_export_scratch_routes_to_mfsdp_chunks_and_skips_plain_ones():
     assert released == [id(mfsdp_a), id(mfsdp_b)]
 
 
+def test_eval_mode_releases_mfsdp_scratch_before_returning_to_training():
+    chunk = MagicMock()
+    handle = ModelHandle(
+        model=chunk,
+        parallel_state=types.SimpleNamespace(pp_size=1),
+        _extras={"model_chunks": [chunk]},
+    )
+
+    with _EvalModeCtx(handle):
+        assert not torch.is_grad_enabled()
+
+    chunk.eval.assert_called_once_with()
+    chunk.release_eval_scratch.assert_called_once_with()
+    assert torch.is_grad_enabled()
+
+
 def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
     context = LossContext(source_batch="source")
     seen = []
@@ -104,7 +121,7 @@ def test_pipeline_runtime_enables_mfsdp_grad_reduce_on_last_microbatch(monkeypat
 
     grad_sync_transitions = []
     param_sync = types.SimpleNamespace(
-        set_grad_sync_enabled=grad_sync_transitions.append,
+        set_grad_sync_enabled=grad_sync_transitions.append
     )
     optimizer = MFSdpOptimizer(
         optimizer=types.SimpleNamespace(),
@@ -129,11 +146,7 @@ def test_pipeline_runtime_enables_mfsdp_grad_reduce_on_last_microbatch(monkeypat
 
     monkeypatch.setattr(torch, "tensor", cpu_tensor)
     parallel_state = types.SimpleNamespace(
-        pp_size=2,
-        pp_group=None,
-        pp_global_ranks=None,
-        tp_size=1,
-        cp_size=1,
+        pp_size=2, pp_group=None, pp_global_ranks=None, tp_size=1, cp_size=1
     )
     model = nn.Linear(1, 1, bias=False)
     handle = ModelHandle(
@@ -152,10 +165,7 @@ def test_pipeline_runtime_enables_mfsdp_grad_reduce_on_last_microbatch(monkeypat
         seq_lens=torch.tensor([4]),
     )
     MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
-        handle,
-        iter([batch, batch]),
-        None,
-        num_microbatches=2,
+        handle, iter([batch, batch]), None, num_microbatches=2
     )
     assert observed_callbacks == [True]
     assert grad_sync_transitions == [True]
@@ -359,9 +369,7 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty-cache"))
     chunk = Chunk()
     handle = ModelHandle(
-        model=chunk,
-        optimizer=Optimizer(),
-        _extras={"model_chunks": [chunk]},
+        model=chunk, optimizer=Optimizer(), _extras={"model_chunks": [chunk]}
     )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
@@ -396,9 +404,7 @@ def test_export_transfer_does_not_move_optimizer_or_release_scratch(monkeypatch)
     )
     chunk = Chunk()
     handle = ModelHandle(
-        model=chunk,
-        optimizer=HookedOptimizer(),
-        _extras={"model_chunks": [chunk]},
+        model=chunk, optimizer=HookedOptimizer(), _extras={"model_chunks": [chunk]}
     )
 
     MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(
