@@ -33,6 +33,7 @@ class EPChunkShapeProfile:
     topk: int
     ep_size: int
     max_recv_rows: int = field(init=False)
+    max_expert_rows: int = field(init=False)
 
     @classmethod
     def for_fixed_two_chunk_ep(
@@ -70,10 +71,15 @@ class EPChunkShapeProfile:
         if self.max_input_rows < EP_CHUNK_COUNT:
             raise ValueError("Fixed two-chunk profile requires at least two rows")
         max_chunk_rows = (self.max_input_rows + EP_CHUNK_COUNT - 1) // EP_CHUNK_COUNT
-        # DeepEP may receive every source rank's chunk on one destination rank.
-        # Hidden rows are sent once per destination even when multiple top-k
-        # experts are local: EP scales rows, while top-k sizes recv_probs width.
-        object.__setattr__(self, "max_recv_rows", max_chunk_rows * self.ep_size)
+        # DeepEP recv storage may contain every source rank's chunk on one
+        # destination rank. It stores one hidden row per transported token and
+        # represents its local top-k destinations in recv_probs.
+        max_recv_rows = max_chunk_rows * self.ep_size
+        object.__setattr__(self, "max_recv_rows", max_recv_rows)
+        # Manual expert permutation can expand one received token into as many
+        # as top-k local expert rows. This is a validation ceiling only: the
+        # workspace still reserves the observed runtime shape lazily.
+        object.__setattr__(self, "max_expert_rows", max_recv_rows * self.topk)
 
     def validate_input_rows(self, rows: int) -> None:
         if rows > self.max_input_rows:
@@ -413,7 +419,7 @@ class EPChunkWorkspace:
         profile = self.key.shape_profile
         contracts = {
             "grad_expert_out": (
-                (profile.max_recv_rows, profile.hidden_size),
+                (profile.max_expert_rows, profile.hidden_size),
                 self.key.dtype,
             ),
         }

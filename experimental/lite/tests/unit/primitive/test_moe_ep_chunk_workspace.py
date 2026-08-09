@@ -193,7 +193,7 @@ def test_workspace_slots_are_stable_and_consumer_event_guarded(
     assert metrics["fallbacks"] == 0
 
 
-def test_backward_scratch_grows_to_observed_shape_but_not_beyond_profile(
+def test_expert_scratch_can_exceed_recv_rows_but_not_expert_row_capacity(
     transformer_engine_import_stub,
 ):
     (
@@ -223,15 +223,16 @@ def test_backward_scratch_grows_to_observed_shape_but_not_beyond_profile(
     workspace.materialize(device="cpu")
     assert workspace.evidence()["data_ptrs"] == {}
     lease = workspace.acquire(0)
-    first = lease.tensor("grad_expert_out", (8, 4), dtype=torch.float32, device="cpu")
-    grown = lease.tensor("grad_expert_out", (9, 4), dtype=torch.float32, device="cpu")
+    assert key.shape_profile.max_recv_rows == 16
+    first = lease.tensor("grad_expert_out", (16, 4), dtype=torch.float32, device="cpu")
+    grown = lease.tensor("grad_expert_out", (17, 4), dtype=torch.float32, device="cpu")
 
-    assert grown.shape == (9, 4)
+    assert grown.shape == (17, 4)
     assert grown.data_ptr() != first.data_ptr()
     assert workspace.metrics()["grows"] == 1
 
     with pytest.raises(RuntimeError, match="exceeds fixed profile capacity"):
-        lease.tensor("grad_expert_out", (17, 4), dtype=torch.float32, device="cpu")
+        lease.tensor("grad_expert_out", (33, 4), dtype=torch.float32, device="cpu")
 
     assert workspace.metrics()["fallbacks"] == 0
 
@@ -992,6 +993,7 @@ def test_qwen3_profile_freezes_deepep_worst_case_receive_capacity(
     )
 
     assert profile.max_recv_rows == 9 * 8
+    assert profile.max_expert_rows == 9 * 8 * 8
     assert profile.topk == 8
 
 
