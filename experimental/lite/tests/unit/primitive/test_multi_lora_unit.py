@@ -203,14 +203,32 @@ def test_cuda_triton_bgmv_training_matches_independent_oracle(
         )
     ]
     x, a_bank, b_bank = values
-    backward_calls = 0
+    backward_calls, saved_hidden_dtypes, backward_hidden_dtypes = 0, [], []
+    internal_scratch_dtypes = []
+    original_empty = multi_lora_kernel.multi_lora_bgmv.torch.empty
+    original_forward = multi_lora_kernel.multi_lora_bgmv.bgmv_fwd
     original_backward = multi_lora_kernel.multi_lora_bgmv.bgmv_bwd
+
+    def captured_empty(*size, **kwargs):
+        if size == (tokens, rank):
+            internal_scratch_dtypes.append(kwargs["dtype"])
+        return original_empty(*size, **kwargs)
+
+    def captured_forward(*args, **kwargs):
+        result = original_forward(*args, **kwargs)
+        saved_hidden_dtypes.append(result[1].dtype)
+        return result
 
     def counted_backward(*args, **kwargs):
         nonlocal backward_calls
         backward_calls += 1
+        backward_hidden_dtypes.append(kwargs["hidden"].dtype)
         return original_backward(*args, **kwargs)
 
+    monkeypatch.setattr(
+        multi_lora_kernel.multi_lora_bgmv.torch, "empty", captured_empty
+    )
+    monkeypatch.setattr(multi_lora_kernel.multi_lora_bgmv, "bgmv_fwd", captured_forward)
     monkeypatch.setattr(multi_lora_kernel.multi_lora_bgmv, "bgmv_bwd", counted_backward)
     actual = BatchedLoraDelta.apply(x, a_bank, b_bank, indices, 0.75)
     reference_values = [value.detach().clone().requires_grad_(True) for value in values]
@@ -222,6 +240,15 @@ def test_cuda_triton_bgmv_training_matches_independent_oracle(
     actual.backward(grad_out)
     reference.backward(grad_out)
     assert backward_calls == 1
+    assert saved_hidden_dtypes == [torch.float32]
+    assert backward_hidden_dtypes == [torch.float32]
+    assert internal_scratch_dtypes == [torch.float32, torch.float32]
+    assert actual.dtype is dtype
+    assert [(value.grad.dtype, value.grad.shape) for value in values] == [
+        (dtype, x.shape),
+        (dtype, a_bank.shape),
+        (dtype, b_bank.shape),
+    ]
     if dtype is torch.bfloat16:
         fp32_single_cast = (
             multi_lora_reference.dense_lora_backward_reference_fp32_single_cast(

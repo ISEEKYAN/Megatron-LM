@@ -310,7 +310,11 @@ def bgmv_fwd(x, lora_a, lora_b, lora_indices, scale, max_g_size_hint=None):
         else (int(sizes.amax().item()) if groups else 1)
     )
     _l2_prefetch(lora_a, lora_b)
-    hidden = torch.empty(tokens, rank, device=x.device, dtype=x.dtype)
+    # ``hidden`` is saved for grad_B.  Along with ``grad_hidden`` below, these
+    # are the only T×R scratch buffers deliberately widened to FP32.  Relative
+    # to the former BF16 storage, their combined peak increment is
+    # 2 * tokens * rank * (4 - 2) = 4 * tokens * rank bytes.
+    hidden = torch.empty(tokens, rank, device=x.device, dtype=torch.float32)
 
     def grid_hidden(meta):
         return (
@@ -397,7 +401,8 @@ def bgmv_bwd(
             groups,
         )
 
-    grad_hidden = torch.empty(tokens, rank, device=x.device, dtype=x.dtype)
+    # Keep the backward intermediate FP32 until the public gradients are stored.
+    grad_hidden = torch.empty(tokens, rank, device=x.device, dtype=torch.float32)
     _bgmv_expand_kernel[grid_hidden](
         grad_out,
         lora_b,
@@ -444,7 +449,7 @@ def bgmv_bwd(
         grad_hidden, x, grad_a, offsets, sizes, tokens, M=rank, N=in_features, G=groups
     )
     if hidden is None:
-        hidden = torch.empty(tokens, rank, device=x.device, dtype=x.dtype)
+        hidden = torch.empty(tokens, rank, device=x.device, dtype=torch.float32)
         _bgmv_shrink_kernel[grid_hidden](
             x,
             lora_a,
