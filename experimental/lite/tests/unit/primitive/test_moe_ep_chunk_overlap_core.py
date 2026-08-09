@@ -16,6 +16,113 @@ SOURCE = (
 )
 
 
+def test_finished_deepep_dispatch_shape_contract_executes_with_fake_dispatcher(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkShapeProfile,
+        _validate_finished_deepep_dispatch,
+    )
+
+    class FakeDispatcher:
+        @staticmethod
+        def finish(*, recv_rows, expert_rows):
+            state = {
+                "recv_hidden": torch.zeros(recv_rows, 4),
+                "recv_probs": torch.zeros(recv_rows, 2),
+            }
+            return state, torch.zeros(expert_rows, 4)
+
+    profile = EPChunkShapeProfile(
+        max_input_rows=4,
+        hidden_size=4,
+        topk=2,
+        ep_size=2,
+    )
+    dispatcher = FakeDispatcher()
+    state, dispatched = dispatcher.finish(recv_rows=4, expert_rows=8)
+    _validate_finished_deepep_dispatch(profile, state, dispatched)
+
+    state, dispatched = dispatcher.finish(recv_rows=5, expert_rows=8)
+    with pytest.raises(RuntimeError, match="recv rows"):
+        _validate_finished_deepep_dispatch(profile, state, dispatched)
+
+    state, dispatched = dispatcher.finish(recv_rows=4, expert_rows=9)
+    with pytest.raises(RuntimeError, match="expert rows"):
+        _validate_finished_deepep_dispatch(profile, state, dispatched)
+
+
+@pytest.mark.parametrize(
+    "state,dispatched,error",
+    [
+        (
+            {"recv_hidden": torch.zeros(4), "recv_probs": torch.zeros(4, 2)},
+            torch.zeros(8, 4),
+            "recv_hidden must be a rank-2 tensor",
+        ),
+        (
+            {"recv_hidden": torch.zeros(4, 5), "recv_probs": torch.zeros(4, 2)},
+            torch.zeros(8, 4),
+            "recv hidden size 5.*profile 4",
+        ),
+        (
+            {"recv_hidden": torch.zeros(4, 4), "recv_probs": torch.zeros(4)},
+            torch.zeros(8, 4),
+            "recv_probs must be a rank-2 tensor",
+        ),
+        (
+            {"recv_hidden": torch.zeros(4, 4), "recv_probs": torch.zeros(3, 2)},
+            torch.zeros(8, 4),
+            "recv_hidden and recv_probs rows must match",
+        ),
+        (
+            {"recv_hidden": torch.zeros(4, 4), "recv_probs": torch.zeros(4, 3)},
+            torch.zeros(8, 4),
+            "recv_probs top-k 3.*profile 2",
+        ),
+        (
+            {"recv_hidden": torch.zeros(4, 4), "recv_probs": torch.zeros(4, 2)},
+            torch.zeros(8, 5),
+            "dispatched expert input must be rank-2",
+        ),
+    ],
+)
+def test_finished_deepep_dispatch_rejects_shape_contract_mismatch(
+    state, dispatched, error, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkShapeProfile,
+        _validate_finished_deepep_dispatch,
+    )
+
+    profile = EPChunkShapeProfile(max_input_rows=4, hidden_size=4, topk=2, ep_size=2)
+    with pytest.raises(RuntimeError, match=error):
+        _validate_finished_deepep_dispatch(profile, state, dispatched)
+
+
+def test_all_three_dispatch_finish_paths_validate_before_expert_or_arena(
+    transformer_engine_import_stub,
+):
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+    )
+
+    for method in (
+        _EPChunkOperationBase._forward_output_async,
+        _EPChunkOperationBase._forward_saved_context_async,
+        _EPChunkOperationBase._full_recompute_fused_backward_v6,
+    ):
+        source = inspect.getsource(method)
+        validated = source.index("_validate_finished_deepep_dispatch")
+        expert = source.index("self.experts(", validated)
+        assert validated < expert
+
+
 def test_three_ops_expose_bounded_nvtx_phase_ranges():
     source = SOURCE.read_text()
 

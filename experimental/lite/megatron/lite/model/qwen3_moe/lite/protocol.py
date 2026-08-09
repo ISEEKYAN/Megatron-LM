@@ -16,6 +16,14 @@ Protocol convention (what runtime calls):
     vocab_size(model_cfg) -> int                     — benchmark metadata
   Escape hatch:
     create_runtime(hf_path, cfg) -> Runtime          — fully override runtime
+
+Qwen3 ChunkedEP fields in ``ImplConfig``:
+  ``enable_ep_chunk_overlap`` enables the fixed two-chunk DeepEP composition;
+  ``ep_chunk_max_token_rows_per_rank`` is the required flattened per-rank
+  forward capacity; ``ep_chunk_full_recompute`` selects fwd+fused-fwd-bwd
+  composition. ChunkedEP requires DeepEP, EP>1, top-k<=EP, and an explicit
+  capacity. Full recompute requires ChunkedEP; normal ChunkedEP rejects outer
+  ``moe``/``full`` recompute.
 """
 
 from __future__ import annotations
@@ -43,7 +51,11 @@ from megatron.lite.model.qwen3_moe.lite.checkpoint import (
 from megatron.lite.model.qwen3_moe.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
 )
-from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
+from megatron.lite.model.qwen3_moe.lite.model import (
+    MTPLossAutoScaler,
+    Qwen3MoEModel,
+    validate_qwen3_ep_chunk_recompute_composition,
+)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
@@ -172,25 +184,6 @@ def _qwen3_recompute_modules_for_ep_chunk_overlap(
     return [name for name in modules if name != "moe"]
 
 
-def _validate_ep_chunk_recompute_contract(impl_cfg: ImplConfig) -> None:
-    """Reject ambiguous Qwen3 composition before primitive construction."""
-    overlap = impl_cfg.enable_ep_chunk_overlap
-    full_recompute = impl_cfg.ep_chunk_full_recompute
-    if full_recompute and not overlap:
-        raise ValueError(
-            "ep_chunk_full_recompute=True requires enable_ep_chunk_overlap=True"
-        )
-    if (
-        overlap
-        and not full_recompute
-        and any(module in {"moe", "full"} for module in impl_cfg.recompute)
-    ):
-        raise ValueError(
-            "normal ChunkedEP conflicts with outer MoE recompute; enable "
-            "ep_chunk_full_recompute or remove moe/full recompute"
-        )
-
-
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     return unpack_thd_forward_output(model, batch, output)
 
@@ -202,7 +195,11 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     """
     p = impl_cfg.parallel
     lora_config = normalize_lora_config(impl_cfg.lora)
-    _validate_ep_chunk_recompute_contract(impl_cfg)
+    validate_qwen3_ep_chunk_recompute_composition(
+        enable_ep_chunk_overlap=impl_cfg.enable_ep_chunk_overlap,
+        ep_chunk_full_recompute=impl_cfg.ep_chunk_full_recompute,
+        recompute_modules=impl_cfg.recompute,
+    )
 
     # ── validation ──
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):

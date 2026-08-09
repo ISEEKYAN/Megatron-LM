@@ -701,15 +701,26 @@ def test_workspace_lazily_owns_one_cuda_mem_pool_per_slot(
     workspace.materialize()
     assert len(created) == 2
     assert creation_devices == [torch.device("cuda", 3)]
-    assert workspace.evidence()["allocation_pool_count"] == 2
+    evidence = workspace.evidence()
+    assert evidence["allocation_pool_count"] == 2
+    assert set(evidence["allocation_pool_ids"].values()) == {
+        id(created[0]),
+        id(created[1]),
+    }
+    assert evidence["caller_owned_recv_proven"] is False
+    assert evidence["recv_observer_enabled"] is False
+    monkeypatch.setenv("MEGATRON_LITE_EP_CHUNK_SCRATCH_TRACE", "1")
+    assert workspace.evidence()["recv_observer_enabled"] is True
 
     lease0 = workspace.acquire(0)
+    assert workspace.evidence()["active_lease_count"] == 1
     with lease0.deepep_recv_allocation():
         pass
     with lease0.deepep_recv_allocation():
         pass
     assert entered == [(created[0], torch.device("cuda", 3))] * 2
     lease0.release(_FakeEvent(ready=True))
+    assert workspace.evidence()["consumer_event_guard_count"] == 1
 
     lease1 = workspace.acquire(1)
     with lease1.deepep_recv_allocation():
@@ -840,7 +851,10 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
         "deepep_buffer_count": 0,
         "deepep_buffer_resident_bytes": 0,
         "allocation_pool_count": 0,
-        "allocation_pool_scope": "deepep_dispatch_recv",
+        "allocation_pool_ids": {},
+        "active_lease_count": 0,
+        "consumer_event_guard_count": 0,
+        "recv_observer_enabled": False,
         "materialized_device": None,
         "caller_owned_recv_proven": False,
         "materialized": False,
@@ -995,6 +1009,50 @@ def test_qwen3_profile_freezes_deepep_worst_case_receive_capacity(
     assert profile.max_recv_rows == 9 * 8
     assert profile.max_expert_rows == 9 * 8 * 8
     assert profile.topk == 8
+
+
+@pytest.mark.parametrize("rows", [0, 1, 72])
+def test_shape_profile_accepts_recv_rows_at_or_below_capacity(
+    rows, transformer_engine_import_stub
+):
+    profile = _symbols(transformer_engine_import_stub)[4](
+        max_input_rows=17, hidden_size=4, topk=8, ep_size=8
+    )
+
+    profile.validate_recv_rows(rows)
+
+
+def test_shape_profile_rejects_recv_rows_above_capacity(
+    transformer_engine_import_stub,
+):
+    profile = _symbols(transformer_engine_import_stub)[4](
+        max_input_rows=17, hidden_size=4, topk=8, ep_size=8
+    )
+
+    with pytest.raises(RuntimeError, match="recv rows 73.*capacity 72"):
+        profile.validate_recv_rows(73)
+
+
+@pytest.mark.parametrize("rows", [0, 73, 576])
+def test_shape_profile_accepts_expert_rows_at_or_below_capacity(
+    rows, transformer_engine_import_stub
+):
+    profile = _symbols(transformer_engine_import_stub)[4](
+        max_input_rows=17, hidden_size=4, topk=8, ep_size=8
+    )
+
+    profile.validate_expert_rows(rows)
+
+
+def test_shape_profile_rejects_expert_rows_above_capacity(
+    transformer_engine_import_stub,
+):
+    profile = _symbols(transformer_engine_import_stub)[4](
+        max_input_rows=17, hidden_size=4, topk=8, ep_size=8
+    )
+
+    with pytest.raises(RuntimeError, match="expert rows 577.*capacity 576"):
+        profile.validate_expert_rows(577)
 
 
 def test_saved_context_autograd_keeps_forward_context_for_backward(

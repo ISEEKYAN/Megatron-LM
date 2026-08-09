@@ -59,9 +59,10 @@ def test_qwen_model_contract_fails_loud(enabled, use_deepep, ep_size):
         )
 
 
-def test_fused_op_flushes_each_dgrad_before_local_storage_overwrite(
+def test_fused_op_static_source_order_flushes_before_local_storage_overwrite(
     transformer_engine_import_stub,
 ):
+    """Static concurrency guard; this is not end-to-end DeepEP evidence."""
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkBackwardOp
 

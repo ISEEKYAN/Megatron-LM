@@ -33,10 +33,21 @@ def moe(task, implementation, config, reference, budget):
         "boundaries": ["module owns routing math; EP owns distributed expert placement; DeepEP owns dispatch/combine transport"],
     }
     usage_contract = {
-        "config": require_config_keys(config, ["num_experts", "top_k", "expert_parallel_size", "use_deepep"]),
+        "config": require_config_keys(config, [
+            "num_experts", "top_k", "expert_parallel_size", "use_deepep",
+            "enable_ep_chunk_overlap", "ep_chunk_max_token_rows_per_rank",
+            "ep_chunk_full_recompute",
+        ]),
         "choose_when": ["model architecture has sparse experts", "expert count justifies EP or grouped GEMM"],
         "avoid_when": ["router tie behavior cannot be stabilized", "DeepEP metadata cannot be validated against all-to-all"],
         "compose_with": ["primitive.parallel.ep", "DeepEP dispatcher when EP>1", "primitive.parallel.tp for expert MLP if explicit"],
+        "unsupported_combinations": [
+            "ChunkedEP without DeepEP or with EP<=1",
+            "ChunkedEP with top_k>expert_parallel_size",
+            "ChunkedEP without explicit per-rank flattened-token capacity",
+            "ep_chunk_full_recompute without enable_ep_chunk_overlap",
+            "normal ChunkedEP with outer moe/full recompute",
+        ],
     }
     ep_validation = None
     if config.expert_parallel_size > 1:

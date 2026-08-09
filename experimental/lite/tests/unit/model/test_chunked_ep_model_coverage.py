@@ -5,8 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 
 
+# Static scope guards only: public bench + Slurm GPU validation own end-to-end
+# DeepEP evidence.
+
+
 LITE_ROOT = Path(__file__).resolve().parents[3]
 MODEL_ROOT = LITE_ROOT / "megatron/lite/model"
+SKILL_ROOT = LITE_ROOT / "skills"
 
 
 def test_only_qwen3_moe_composes_the_chunked_ep_primitive():
@@ -77,3 +82,21 @@ def test_chunk_policy_lives_with_the_moe_module_primitive():
 
     assert policy.is_file()
     assert not old_policy.exists()
+
+
+def test_moe_and_bench_skills_publish_chunked_ep_usage_contract():
+    moe_skill = (SKILL_ROOT / "primitive/module/moe.md").read_text()
+    bench_skill = (SKILL_ROOT / "application/bench.md").read_text()
+    protocol = (MODEL_ROOT / "qwen3_moe/lite/protocol.py").read_text()
+
+    for key in (
+        "enable_ep_chunk_overlap",
+        "ep_chunk_max_token_rows_per_rank",
+        "ep_chunk_full_recompute",
+    ):
+        assert key in moe_skill
+        assert key in protocol
+    assert "unsupported_combinations" in moe_skill
+    assert "top_k>expert_parallel_size" in moe_skill
+    assert "experimental/lite/examples/bench/bench.py" in bench_skill
+    assert "--impl-cfg-json" in bench_skill

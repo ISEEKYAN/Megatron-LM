@@ -94,6 +94,11 @@ class MoELayer(nn.Module):
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
+        validate_qwen3_ep_chunk_recompute_composition(
+            enable_ep_chunk_overlap=enable_ep_chunk_overlap,
+            ep_chunk_full_recompute=ep_chunk_full_recompute,
+            recompute_modules=[],
+        )
         validate_ep_chunk_overlap_config(
             enable_ep_chunk_overlap,
             use_deepep=use_deepep,
@@ -305,6 +310,28 @@ _SP_GRAD_SUFFIXES: tuple[str, ...] = (
     ".hnorm.weight",
     ".final_layernorm.weight",
 )
+
+
+def validate_qwen3_ep_chunk_recompute_composition(
+    *,
+    enable_ep_chunk_overlap: bool,
+    ep_chunk_full_recompute: bool,
+    recompute_modules: list[str] | tuple[str, ...],
+) -> None:
+    """Validate Qwen3 recompute composition without leaking policy to primitives."""
+    if ep_chunk_full_recompute and not enable_ep_chunk_overlap:
+        raise ValueError(
+            "ep_chunk_full_recompute=True requires enable_ep_chunk_overlap=True"
+        )
+    if (
+        enable_ep_chunk_overlap
+        and not ep_chunk_full_recompute
+        and any(module in {"moe", "full"} for module in recompute_modules)
+    ):
+        raise ValueError(
+            "normal ChunkedEP conflicts with outer MoE recompute; enable "
+            "ep_chunk_full_recompute or remove moe/full recompute"
+        )
 
 
 def _qwen3_moe_act_recompute_requested(
@@ -611,6 +638,11 @@ class Qwen3MoEModel(nn.Module):
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
+        validate_qwen3_ep_chunk_recompute_composition(
+            enable_ep_chunk_overlap=enable_ep_chunk_overlap,
+            ep_chunk_full_recompute=ep_chunk_full_recompute,
+            recompute_modules=recompute_modules or [],
+        )
         self.config = config
         self.ps = ps
         self.fp8 = fp8

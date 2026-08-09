@@ -411,7 +411,11 @@ def test_qwen3_protocol_rejects_conflicting_chunk_recompute_composition(
     )
 
     with pytest.raises(ValueError, match=error):
-        protocol._validate_ep_chunk_recompute_contract(impl)
+        protocol.validate_qwen3_ep_chunk_recompute_composition(
+            enable_ep_chunk_overlap=impl.enable_ep_chunk_overlap,
+            ep_chunk_full_recompute=impl.ep_chunk_full_recompute,
+            recompute_modules=impl.recompute,
+        )
 
 
 @pytest.mark.parametrize(
@@ -429,13 +433,39 @@ def test_qwen3_protocol_accepts_unambiguous_chunk_recompute_composition(
     transformer_engine_import_stub()
     from megatron.lite.model.qwen3_moe.lite import protocol
 
-    protocol._validate_ep_chunk_recompute_contract(
-        protocol.ImplConfig(
+    protocol.validate_qwen3_ep_chunk_recompute_composition(
+        enable_ep_chunk_overlap=overlap,
+        ep_chunk_full_recompute=full_recompute,
+        recompute_modules=recompute,
+    )
+
+
+@pytest.mark.parametrize(
+    "overlap,full_recompute,recompute,error",
+    [
+        (False, True, [], "requires enable_ep_chunk_overlap=True"),
+        (True, False, ["moe"], "conflicts with outer MoE recompute"),
+        (True, False, ["full"], "conflicts with outer MoE recompute"),
+    ],
+)
+def test_qwen3_direct_model_construction_rejects_ambiguous_recompute(
+    overlap,
+    full_recompute,
+    recompute,
+    error,
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite.model import Qwen3MoEModel
+
+    with pytest.raises(ValueError, match=error):
+        Qwen3MoEModel(
+            SimpleNamespace(),
+            SimpleNamespace(),
             enable_ep_chunk_overlap=overlap,
             ep_chunk_full_recompute=full_recompute,
-            recompute=recompute,
+            recompute_modules=recompute,
         )
-    )
 
 
 @pytest.mark.parametrize(

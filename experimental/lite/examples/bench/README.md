@@ -40,6 +40,17 @@ impl = ImplConfig(
 )
 ```
 
+The public bench consumes the same fields through ``--impl-cfg-json``; use this
+surface for controlled MLite runs rather than a private validation entrypoint:
+
+```bash
+python experimental/lite/examples/bench/bench.py \
+  --backend mlite \
+  --hf-path /models/Qwen3-MoE \
+  --ep 8 \
+  --impl-cfg-json '{"use_deepep":true,"enable_ep_chunk_overlap":true,"ep_chunk_max_token_rows_per_rank":4096,"ep_chunk_full_recompute":false}'
+```
+
 This profile always uses two chunks. It requires DeepEP with `EP > 1`; there is
 no dynamic chunk-count or per-model scheduling policy. The caller must set
 `ep_chunk_max_token_rows_per_rank` to the true maximum flattened MoE input rows

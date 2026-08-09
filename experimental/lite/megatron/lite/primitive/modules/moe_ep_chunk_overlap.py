@@ -88,6 +88,22 @@ class EPChunkShapeProfile:
                 f"capacity {self.max_input_rows}"
             )
 
+    def validate_recv_rows(self, rows: int) -> None:
+        """Validate DeepEP rows received by one destination rank for one chunk."""
+        if rows > self.max_recv_rows:
+            raise RuntimeError(
+                f"EP chunk recv rows {rows} exceeds fixed profile "
+                f"capacity {self.max_recv_rows}"
+            )
+
+    def validate_expert_rows(self, rows: int) -> None:
+        """Validate rows after one received token expands to local experts."""
+        if rows > self.max_expert_rows:
+            raise RuntimeError(
+                f"EP chunk expert rows {rows} exceeds fixed profile "
+                f"capacity {self.max_expert_rows}"
+            )
+
     def validate_input(self, value: torch.Tensor) -> None:
         if value.size(-1) != self.hidden_size:
             raise RuntimeError(
@@ -95,6 +111,39 @@ class EPChunkShapeProfile:
                 f"profile {self.hidden_size}"
             )
         self.validate_input_rows(value.numel() // self.hidden_size)
+
+
+def _validate_finished_deepep_dispatch(
+    profile: EPChunkShapeProfile,
+    state: dict[str, Any],
+    dispatched: torch.Tensor,
+) -> None:
+    """Validate runtime DeepEP outputs before expert use or arena allocation."""
+    recv_hidden = state.get("recv_hidden")
+    recv_probs = state.get("recv_probs")
+    if not torch.is_tensor(recv_hidden) or recv_hidden.dim() != 2:
+        raise RuntimeError("EP chunk DeepEP recv_hidden must be a rank-2 tensor")
+    if recv_hidden.size(1) != profile.hidden_size:
+        raise RuntimeError(
+            f"EP chunk recv hidden size {recv_hidden.size(1)} does not match "
+            f"fixed profile {profile.hidden_size}"
+        )
+    profile.validate_recv_rows(recv_hidden.size(0))
+    if not torch.is_tensor(recv_probs) or recv_probs.dim() != 2:
+        raise RuntimeError("EP chunk DeepEP recv_probs must be a rank-2 tensor")
+    if recv_probs.size(0) != recv_hidden.size(0):
+        raise RuntimeError("EP chunk recv_hidden and recv_probs rows must match")
+    if recv_probs.size(1) != profile.topk:
+        raise RuntimeError(
+            f"EP chunk recv_probs top-k {recv_probs.size(1)} does not match "
+            f"fixed profile {profile.topk}"
+        )
+    profile.validate_recv_rows(recv_probs.size(0))
+    if dispatched.dim() != 2 or dispatched.size(1) != profile.hidden_size:
+        raise RuntimeError(
+            "EP chunk dispatched expert input must be rank-2 with the fixed hidden size"
+        )
+    profile.validate_expert_rows(dispatched.size(0))
 
 
 @dataclass(frozen=True)
@@ -524,7 +573,19 @@ class EPChunkWorkspace:
             "allocation_pool_count": sum(
                 slot.allocation_pool is not None for slot in self._slots
             ),
-            "allocation_pool_scope": "deepep_dispatch_recv",
+            "allocation_pool_ids": {
+                str(slot_idx): id(slot.allocation_pool)
+                for slot_idx, slot in enumerate(self._slots)
+                if slot.allocation_pool is not None
+            },
+            "active_lease_count": sum(slot.in_use for slot in self._slots),
+            "consumer_event_guard_count": sum(
+                slot.consumer_event is not None for slot in self._slots
+            ),
+            "recv_observer_enabled": os.environ.get(
+                "MEGATRON_LITE_EP_CHUNK_SCRATCH_TRACE", "0"
+            )
+            not in {"0", "false", "False"},
             "materialized_device": (
                 None if self._bound_device is None else str(self._bound_device)
             ),
@@ -958,6 +1019,9 @@ class _EPChunkOperationBase:
                     dispatched, tpe, probs = dispatcher.finish_deepep_dispatch(
                         state, materialize_local_tpe=False
                     )
+                    _validate_finished_deepep_dispatch(
+                        self.workspace.key.shape_profile, state, dispatched
+                    )
             return chunk_idx, dispatcher, state, lease, dispatched, tpe, probs
 
         def run_expert(finished):
@@ -1097,6 +1161,9 @@ class _EPChunkOperationBase:
                             materialize_local_tpe=False,
                         )
                     )
+                _validate_finished_deepep_dispatch(
+                    self.workspace.key.shape_profile, state, dispatched
+                )
                 expert_input = dispatched.detach().requires_grad_(True)
                 expert_probs = (
                     None if probs is None else probs.detach().requires_grad_(True)
@@ -1374,6 +1441,9 @@ class _EPChunkOperationBase:
                         force_direct_permute=True,
                         materialize_local_tpe=False,
                     )
+                )
+                _validate_finished_deepep_dispatch(
+                    self.workspace.key.shape_profile, state, dispatched
                 )
                 expert_input = dispatched.detach().requires_grad_(True)
                 expert_probs = (
