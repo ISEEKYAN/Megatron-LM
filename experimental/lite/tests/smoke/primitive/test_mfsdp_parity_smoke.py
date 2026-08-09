@@ -1968,8 +1968,12 @@ def _contains_collective(sequence: tuple[str, ...], *tokens: str) -> bool:
 
 
 def _run_full_parallel_step(
-    handle: ModelHandle, *, batch_seed: int, record_collectives: bool
-) -> tuple[float, float, tuple[str, ...]]:
+    handle: ModelHandle,
+    *,
+    batch_seed: int,
+    record_collectives: bool,
+    capture_grads: bool,
+) -> tuple[float, float, tuple[str, ...], dict[str, torch.Tensor] | None]:
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     runtime.zero_grad(handle)
     batches = _fixed_packed_batches(64, seed=batch_seed)
@@ -1988,11 +1992,50 @@ def _run_full_parallel_step(
             handle, iter(batches), None, num_microbatches=_FULL_PARALLEL_MICROBATCHES
         )
 
+    grads = _named_optimizer_grads(handle._optimizer) if capture_grads else None
     success, grad_norm, _num_zeros = runtime.optimizer_step(handle)
     assert success
     loss = result.model_output.loss
     assert loss is not None
-    return float(loss.detach().float().cpu()), float(grad_norm), tuple(sequence)
+    return float(loss.detach().float().cpu()), float(grad_norm), tuple(sequence), grads
+
+
+def _gradient_diagnostics(
+    reference: dict[str, torch.Tensor], candidate: dict[str, torch.Tensor]
+) -> dict[str, object]:
+    assert reference.keys() == candidate.keys()
+    rows = []
+    category_sq = {
+        "reference_dense": 0.0,
+        "candidate_dense": 0.0,
+        "reference_expert": 0.0,
+        "candidate_expert": 0.0,
+    }
+    for name in reference:
+        ref = reference[name].double()
+        cand = candidate[name].double()
+        difference = (ref - cand).abs()
+        denominator = torch.maximum(ref.abs(), cand.abs()).clamp_min(_TENSOR_ATOL)
+        category = "expert" if _is_tiny_expert(name) else "dense"
+        category_sq[f"reference_{category}"] += float(ref.square().sum())
+        category_sq[f"candidate_{category}"] += float(cand.square().sum())
+        rows.append(
+            {
+                "name": name,
+                "category": category,
+                "reference_norm": float(ref.norm()),
+                "candidate_norm": float(cand.norm()),
+                "max_abs_diff": float(difference.max()),
+                "max_rel_diff": float((difference / denominator).max()),
+            }
+        )
+    rows.sort(key=lambda row: row["max_abs_diff"], reverse=True)
+    return {
+        "category_norms": {
+            name: math.sqrt(value) for name, value in category_sq.items()
+        },
+        "worst_parameters": rows[:16],
+    }
 
 
 def _max_snapshot_abs_diff(
@@ -2081,6 +2124,7 @@ def test_mfsdp_matches_reference_full_parallel_precision_curve(
 
     losses = {reference_backend: [], "mfsdp": []}
     grad_norms = {reference_backend: [], "mfsdp": []}
+    first_step_grads = {}
     wandb_run = None
     if dist.get_rank() == 0:
         import wandb
@@ -2106,11 +2150,16 @@ def test_mfsdp_matches_reference_full_parallel_precision_curve(
             ("mfsdp", mfsdp_handle),
         ):
             dist.barrier()
-            loss, grad_norm, trace = _run_full_parallel_step(
-                handle, batch_seed=8345 + step, record_collectives=step == 0
+            loss, grad_norm, trace, grads = _run_full_parallel_step(
+                handle,
+                batch_seed=8345 + step,
+                record_collectives=step == 0,
+                capture_grads=step == 0,
             )
             losses[backend].append(loss)
             grad_norms[backend].append(grad_norm)
+            if grads is not None:
+                first_step_grads[backend] = grads
             if trace:
                 traces[backend] = trace
         if wandb_run is not None:
@@ -2193,6 +2242,19 @@ def test_mfsdp_matches_reference_full_parallel_precision_curve(
                 f"sequence={' > '.join(trace[:96])}",
                 flush=True,
             )
+        print(
+            "[MFSDP_GRAD_DIAGNOSTICS] "
+            + json.dumps(
+                {
+                    "reference": reference_backend,
+                    **_gradient_diagnostics(
+                        first_step_grads[reference_backend], first_step_grads["mfsdp"]
+                    ),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
     assert torch.isfinite(loss_rel_curve).all()
     assert torch.isfinite(grad_norm_rel_curve).all()
