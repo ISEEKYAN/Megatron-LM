@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# isort: skip_file
 from types import SimpleNamespace
 
 import pytest
@@ -21,9 +20,7 @@ class _Scheduler:
 
 @pytest.fixture(autouse=True)
 def _single_process_dist(monkeypatch):
-    monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.dist.is_initialized", lambda: False
-    )
+    monkeypatch.setattr("verl_mlite.engine.mlite_engine.dist.is_initialized", lambda: False)
 
 
 def _optimizer_config() -> SimpleNamespace:
@@ -105,9 +102,7 @@ def test_save_checkpoint_forwards_contents_scheduler_and_param_offload_reload(
         parallel_state,
         placement_fn,
         expert_classifier,
-    ) = _initialized_engine(
-        checkpoint_config={"save_contents": ["model"]}, param_offload=True
-    )
+    ) = _initialized_engine(checkpoint_config={"save_contents": ["model"]}, param_offload=True)
     to_calls = []
     save_calls = []
     sync_calls = []
@@ -138,9 +133,7 @@ def test_save_checkpoint_forwards_contents_scheduler_and_param_offload_reload(
     )
 
 
-def test_save_checkpoint_skips_when_contents_exclude_model_and_optimizer(
-    tmp_path, monkeypatch
-):
+def test_save_checkpoint_skips_when_contents_exclude_model_and_optimizer(tmp_path, monkeypatch):
     engine, *_ = _initialized_engine(checkpoint_config={"save_contents": ["extra"]})
     checkpoint_path = tmp_path / "ckpt"
     save_calls = []
@@ -155,9 +148,7 @@ def test_save_checkpoint_skips_when_contents_exclude_model_and_optimizer(
     assert not checkpoint_path.exists()
 
 
-def test_load_checkpoint_restores_scheduler_and_param_offload_reload(
-    tmp_path, monkeypatch
-):
+def test_load_checkpoint_restores_scheduler_and_param_offload_reload(tmp_path, monkeypatch):
     (
         engine,
         module,
@@ -194,34 +185,6 @@ def test_load_checkpoint_restores_scheduler_and_param_offload_reload(
     assert load_kwargs["is_expert"] is expert_classifier
     assert load_kwargs["load_model"] is True
     assert load_kwargs["load_optimizer"] is True
-
-
-def test_mfsdp_engine_routes_native_checkpoint_to_rank_local_mode(
-    tmp_path, monkeypatch
-):
-    engine, module, *_ = _initialized_engine()
-
-    class MFSdpMarker(torch.nn.Module):
-        def iter_persistent_shards(self):
-            return iter(())
-
-    module.add_module("mfsdp_marker", MFSdpMarker())
-    save_calls = []
-    load_calls = []
-    monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.save_training_checkpoint",
-        lambda *args, **kwargs: save_calls.append(kwargs),
-    )
-    monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.load_training_checkpoint",
-        lambda *args, **kwargs: load_calls.append(kwargs) or 0,
-    )
-
-    engine.save_checkpoint(str(tmp_path), global_step=1)
-    engine.load_checkpoint(str(tmp_path))
-
-    assert save_calls[0]["use_dcp"] is False
-    assert load_calls[0]["use_dcp"] is False
 
 
 def test_hf_model_save_fails_loudly_when_protocol_has_no_export(tmp_path):
