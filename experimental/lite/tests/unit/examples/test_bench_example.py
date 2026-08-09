@@ -20,6 +20,52 @@ sys.path = [path for path in sys.path if path != _LITE_ROOT]
 sys.path.insert(0, _LITE_ROOT)
 
 
+def test_correctness_runner_measures_timing_without_hashing(monkeypatch):
+    from examples.bench import correctness
+
+    class Runtime:
+        def __init__(self):
+            self.steps = 0
+
+        def zero_grad(self, _handle):
+            pass
+
+        def forward_backward(self, _handle, _data_iter, **_kwargs):
+            self.steps += 1
+            return SimpleNamespace(
+                model_output=SimpleNamespace(loss=torch.tensor(1.0)), metrics={}
+            )
+
+        def optimizer_step(self, _handle):
+            return True, 1.0, 0
+
+        def lr_scheduler_step(self, _handle):
+            pass
+
+    clock = iter((0.0, 0.5, 1.0, 1.75))
+    monkeypatch.setattr(correctness.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(correctness, "_sync", lambda _device: None)
+    monkeypatch.setattr(correctness, "_distributed_max", lambda value, _device: value)
+    runtime = Runtime()
+
+    result = correctness._measure_training_performance(
+        runtime,
+        SimpleNamespace(_parallel_state=SimpleNamespace(dp_size=2)),
+        iter(()),
+        SimpleNamespace(
+            device="cpu", no_optimizer=False, num_microbatches=2, seq_len=8
+        ),
+        warmup_steps=1,
+        measured_steps=2,
+    )
+
+    assert runtime.steps == 3
+    assert result["step_seconds_max_rank"] == [0.5, 0.75]
+    assert result["tokens_per_step"] == 32
+    assert result["tokens_per_second"] == 51.2
+    assert result["memory"] is None
+
+
 def test_bench_builds_mlite_runtime_config_with_model_hook():
     from examples.bench.bench import BenchCliConfig, build_runtime_config
     from megatron.lite.model.qwen3_5.config import Qwen35Config

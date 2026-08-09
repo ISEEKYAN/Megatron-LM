@@ -11,6 +11,7 @@ import json
 import os
 import struct
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -356,12 +357,96 @@ def _forward_logits(rt, handle, batch: Any) -> torch.Tensor | None:
     )
 
 
+def _distributed_max(value: float, device: str) -> float:
+    tensor = torch.tensor(value, dtype=torch.float64, device=device)
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return float(tensor.cpu())
+
+
+def _measure_training_performance(
+    rt, handle, data_iter, session_cfg, *, warmup_steps: int, measured_steps: int
+) -> dict[str, Any]:
+    device_type = torch.device(session_cfg.device).type
+
+    def train_step() -> None:
+        rt.zero_grad(handle)
+        result = rt.forward_backward(
+            handle,
+            data_iter,
+            loss_fn=None,
+            num_microbatches=session_cfg.num_microbatches,
+        )
+        if not session_cfg.no_optimizer:
+            success, _grad_norm, _num_zeros = rt.optimizer_step(handle)
+            if not success:
+                raise RuntimeError("performance step optimizer update failed")
+            rt.lr_scheduler_step(handle)
+        if result.model_output.loss is None and result.metrics.get("loss") is None:
+            raise RuntimeError("performance step did not produce a loss")
+
+    for _ in range(warmup_steps):
+        train_step()
+    _sync(session_cfg.device)
+    if device_type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+    step_seconds = []
+    for _ in range(measured_steps):
+        _sync(session_cfg.device)
+        started = time.perf_counter()
+        train_step()
+        _sync(session_cfg.device)
+        step_seconds.append(
+            _distributed_max(time.perf_counter() - started, session_cfg.device)
+        )
+
+    ps = handle._parallel_state
+    dp_size = int(getattr(ps, "dp_size", getattr(ps, "dp_cp_size", 1)))
+    tokens_per_step = (
+        int(session_cfg.seq_len) * int(session_cfg.num_microbatches) * dp_size
+    )
+    mean_seconds = sum(step_seconds) / len(step_seconds)
+    memory = None
+    if device_type == "cuda":
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        memory = {
+            "peak_allocated_bytes_max": int(
+                _distributed_max(
+                    float(torch.cuda.max_memory_allocated()), session_cfg.device
+                )
+            ),
+            "peak_reserved_bytes_max": int(
+                _distributed_max(
+                    float(torch.cuda.max_memory_reserved()), session_cfg.device
+                )
+            ),
+            "total_bytes_max": int(
+                _distributed_max(float(total_bytes), session_cfg.device)
+            ),
+            "used_bytes_max": int(
+                _distributed_max(float(total_bytes - free_bytes), session_cfg.device)
+            ),
+        }
+    return {
+        "warmup_steps": warmup_steps,
+        "measured_steps": measured_steps,
+        "step_seconds_max_rank": step_seconds,
+        "mean_step_seconds": mean_seconds,
+        "tokens_per_step": tokens_per_step,
+        "tokens_per_second": tokens_per_step / mean_seconds,
+        "memory": memory,
+    }
+
+
 def run_backend(
     cfg: BenchCliConfig,
     *,
     hash_weights: bool = True,
     activation_probe_names: list[str] | None = None,
     verify_resume_path: str | None = None,
+    performance_warmup_steps: int = 0,
+    performance_steps: int = 0,
 ) -> dict[str, Any]:
     os.environ["MEGATRON_LITE_DETERMINISTIC"] = "1"
     set_deterministic(cfg.seed)
@@ -433,6 +518,24 @@ def run_backend(
                 }
             )
 
+    if performance_steps and verify_resume_path is not None:
+        raise ValueError(
+            "combined performance measurement and resume verification require "
+            "separate fresh-process arms"
+        )
+    performance = (
+        _measure_training_performance(
+            rt,
+            handle,
+            data_iter,
+            session_cfg,
+            warmup_steps=performance_warmup_steps,
+            measured_steps=performance_steps,
+        )
+        if performance_steps
+        else None
+    )
+
     resume = None
     if verify_resume_path is not None:
         rt.save_checkpoint(handle, verify_resume_path, global_step=session_cfg.steps)
@@ -493,6 +596,7 @@ def run_backend(
         "steps": steps,
         "eval_logits": eval_logits,
         "activation_probes": activation_probes,
+        "performance": performance,
         "resume": resume,
         "metadata": {
             "deterministic": True,
@@ -519,6 +623,8 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cp", type=int, default=1)
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=0)
+    parser.add_argument("--performance-warmup-steps", type=int, default=0)
+    parser.add_argument("--performance-steps", type=int, default=0)
     parser.add_argument("--num-microbatches", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
@@ -618,6 +724,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             ns.activation_probes_json, cfg.backend
         ),
         verify_resume_path=ns.verify_resume_path,
+        performance_warmup_steps=ns.performance_warmup_steps,
+        performance_steps=ns.performance_steps,
     )
     if _distributed_rank() == 0:
         text = json.dumps(artifact, indent=2, sort_keys=True)
