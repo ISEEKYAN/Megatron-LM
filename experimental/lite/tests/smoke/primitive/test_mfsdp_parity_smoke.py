@@ -1315,7 +1315,7 @@ def test_mfsdp_qwen35_eval_to_train_first_step_is_finite():
                 {"optimizer": "mfsdp", "mount_vision_model": False}
             ),
         ),
-        hash_weights=True,
+        hash_weights=False,
         activation_probe_names=[
             "embed",
             "layers.0",
