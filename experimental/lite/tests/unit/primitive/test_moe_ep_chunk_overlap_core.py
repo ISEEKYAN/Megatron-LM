@@ -54,10 +54,10 @@ def test_finished_deepep_dispatch_shape_contract_executes_with_fake_dispatcher(
         _validate_finished_deepep_dispatch(profile, state, dispatched)
 
 
-def test_fused_pending_retirement_releases_before_the_next_large_context(
+def test_fused_pending_retirement_releases_dispatch_lease_before_next_expert(
     monkeypatch, transformer_engine_import_stub
 ):
-    """CPU behavior contract for the production fused pending-retirement primitive."""
+    """CPU contract for dispatch-lease ordering, not physical allocator reuse."""
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules import moe_ep_chunk_overlap as overlap
 
@@ -539,7 +539,7 @@ def test_chunked_ep_backward_phases_prepare_sinks_before_expert_autograd(
     ):
         source = inspect.getsource(method)
         assert source.index("_prepare_delayed_weight_grad_sinks") < source.index(
-            "torch.autograd.grad"
+            "expert_grads = torch.autograd.grad"
         )
 
 
