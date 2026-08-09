@@ -60,51 +60,29 @@ def test_bgmv_mixed_precision_promotion_covers_all_scratch_dot_boundaries():
         assert "_promote_mixed_dot_operands(x, w)" in kernel_source
 
 
-def _bf16_gradient_diagnostic(name, actual, references):
-    """Collect every BF16 comparison before enforcing the original parity gate."""
+def _bf16_ground_truth_result(name, actual, ground_truth, eager):
+    """Allow at most one final-output ULP from the FP32 mathematical oracle."""
     actual32 = actual.float()
-    failures, report = [], []
-    for reference_name, reference in references.items():
-        reference32 = reference.float()
-        error = (actual32 - reference32).abs()
-        reference_abs = reference32.abs()
-        reference_rms = reference32.square().mean().sqrt()
-        reference_max = reference_abs.max()
-        signal_floor = 0.01 * reference_rms
-        signal = reference_abs >= signal_floor
-        ulp = (
-            torch.nextafter(
-                reference.detach().to(torch.bfloat16),
-                torch.full_like(reference, float("inf"), dtype=torch.bfloat16),
-            )
-            .float()
-            .sub(reference32)
-            .abs()
-        )
-        report.append(
-            f"{name}/{reference_name}: abs_max={error.max().item():.9g} "
-            f"abs_p99={torch.quantile(error, 0.99).item():.9g} "
-            f"bf16_ulp_p99={torch.quantile(error / ulp.clamp_min(torch.finfo(torch.bfloat16).tiny), 0.99).item():.9g} "
-            f"bf16_ulp_max={(error / ulp.clamp_min(torch.finfo(torch.bfloat16).tiny)).max().item():.9g}"
-        )
-        if reference_name != "eager":
-            continue
-        # Retain the pre-existing scale-aware correctness gate verbatim.
-        p99_limit = torch.maximum(
-            0.0125 * reference_rms, torch.tensor(0.25, device=error.device)
-        )
-        if torch.quantile(error, 0.99) > p99_limit:
-            failures.append(f"{name}: p99 exceeds {p99_limit.item():.9g}")
-        if error.max() > 0.02 * reference_max:
-            failures.append(f"{name}: max exceeds 2% of reference max")
-        if (
-            signal.any()
-            and torch.quantile(error[signal] / reference_abs[signal], 0.99) > 0.20
-        ):
-            failures.append(f"{name}: signal relative p99 exceeds 0.20")
-        if (~signal).any() and error[~signal].max() > 0.02 * reference_rms:
-            failures.append(f"{name}: low-signal max exceeds 2% of reference RMS")
-    return report, failures
+    ground32, eager32 = ground_truth.float(), eager.float()
+    error = (actual32 - ground32).abs()
+    ground_bf16 = ground_truth.detach().to(torch.bfloat16)
+    ulp = (
+        torch.nextafter(ground_bf16, torch.full_like(ground_bf16, float("inf")))
+        .float()
+        .sub(ground32)
+        .abs()
+        .clamp_min(torch.finfo(torch.bfloat16).tiny)
+    )
+    ground_ulp_error = error / ulp
+    ground_p99_ulp = torch.quantile(ground_ulp_error, 0.99)
+    ground_max_ulp = ground_ulp_error.max()
+    eager_p99 = torch.quantile((actual32 - eager32).abs(), 0.99)
+    report = (
+        f"{name}: fp32_ground_truth_max_ulp={ground_max_ulp.item():.9g} "
+        f"p99_ulp={ground_p99_ulp.item():.9g}; "
+        f"eager_bf16_p99_diagnostic={eager_p99.item():.9g}"
+    )
+    return report, ground_max_ulp <= 1
 
 
 def test_batched_lora_delta_matches_dense_reference_for_sorted_slots():
@@ -139,27 +117,45 @@ def test_batched_lora_delta_backward_matches_reference_for_repeated_slots():
         torch.testing.assert_close(actual_grad, reference_tensor.grad)
 
 
-def test_bf16_backward_diagnostic_references_define_all_gradient_outputs():
-    """Both diagnostic contracts are executable without the Triton implementation."""
-    x, a_bank, b_bank, indices = _inputs(dtype=torch.bfloat16)
-    grad_output = torch.ones(3, 2, dtype=torch.bfloat16)
-
-    fp32_single_cast = (
-        multi_lora_reference.dense_lora_backward_reference_fp32_single_cast(
-            x, grad_output, a_bank, b_bank, indices, 0.75
-        )
+def test_fp32_backward_reference_matches_float64_autograd_truth():
+    """Validate FP32-single-cast backward against random float64 autograd truth."""
+    torch.manual_seed(23)
+    # Values originate as FP32, then become float64 exactly.  Float64 autograd
+    # supplies an independent high-precision derivative truth for those exact
+    # inputs; it does not duplicate the oracle's FP32 contraction code.
+    x = torch.randn(5, 3, dtype=torch.float32).double().requires_grad_(True)
+    a_bank = torch.randn(3, 2, 3, dtype=torch.float32).double().requires_grad_(True)
+    b_bank = torch.randn(3, 4, 2, dtype=torch.float32).double().requires_grad_(True)
+    indices = torch.tensor([0, 0, 1, 2, 2])
+    grad_output = torch.randn(5, 4, dtype=torch.float32).double()
+    output = multi_lora_reference.dense_lora_delta_reference(
+        x, a_bank, b_bank, indices, 0.75
     )
-    bf16_staged = multi_lora_reference.dense_lora_backward_reference_bf16_staged(
-        x, grad_output, a_bank, b_bank, indices, 0.75
+    output.backward(grad_output)
+    expected = tuple(value.grad.detach() for value in (x, a_bank, b_bank))
+    actual = multi_lora_reference.dense_lora_backward_reference_fp32_single_cast(
+        x.detach(), grad_output, a_bank.detach(), b_bank.detach(), indices, 0.75
     )
+    for observed, ground_truth in zip(actual, expected, strict=True):
+        # The oracle performs contractions and reductions in FP32, so its
+        # intermediate rounding is part of the intended implementation.  It
+        # then widens that FP32 result back to the caller's float64 dtype.  Check
+        # this exact widening property, then compare both sides as FP32 with
+        # torch's standard FP32 tolerance rather than fitting a threshold to
+        # this particular sample.  The BF16 contract remains a separate final
+        # output single-cast check in the CUDA parity test.
+        torch.testing.assert_close(observed, observed.float().double(), rtol=0, atol=0)
+        torch.testing.assert_close(observed.float(), ground_truth.float())
 
-    for gradients in (fp32_single_cast, bf16_staged):
-        assert [gradient.dtype for gradient in gradients] == [torch.bfloat16] * 3
-        assert [gradient.shape for gradient in gradients] == [
-            x.shape,
-            a_bank.shape,
-            b_bank.shape,
-        ]
+
+def test_dense_lora_reference_passes_float64_gradcheck():
+    x, a_bank, b_bank, indices = _inputs()
+    assert torch.autograd.gradcheck(
+        lambda x_, a_, b_: multi_lora_reference.dense_lora_delta_reference(
+            x_, a_, b_, indices, 0.75
+        ),
+        (x, a_bank, b_bank),
+    )
 
 
 def test_batched_lora_delta_passes_gradcheck():
@@ -277,40 +273,29 @@ def test_cuda_triton_bgmv_training_matches_independent_oracle(
                 0.75,
             )
         )
-        bf16_staged = multi_lora_reference.dense_lora_backward_reference_bf16_staged(
-            reference_values[0],
-            grad_out,
-            reference_values[1],
-            reference_values[2],
-            indices,
-            0.75,
-        )
         reports, failures = [], []
-    for name, actual_value, reference_value, fp32_value, staged_value in zip(
+    for name, actual_value, reference_value, fp32_value in zip(
         ("grad_input", "grad_A", "grad_B"),
         values,
         reference_values,
         fp32_single_cast if dtype is torch.bfloat16 else (None,) * 3,
-        bf16_staged if dtype is torch.bfloat16 else (None,) * 3,
         strict=True,
     ):
         if dtype is torch.bfloat16:
-            report, failure = _bf16_gradient_diagnostic(
-                name,
-                actual_value.grad,
-                {
-                    "eager": reference_value.grad,
-                    "fp32_single_cast": fp32_value,
-                    "bf16_staged": staged_value,
-                },
+            report, passed = _bf16_ground_truth_result(
+                name, actual_value.grad, fp32_value, reference_value.grad
             )
-            reports.extend(report)
-            failures.extend(failure)
+            reports.append(report)
+            if not passed:
+                failures.append(f"{name}: FP32-ground-truth max exceeds one BF16 ULP")
         else:
             torch.testing.assert_close(
                 actual_value.grad, reference_value.grad, rtol=rtol, atol=atol
             )
     if dtype is torch.bfloat16:
+        # Eager BF16 is intentionally diagnostic-only: its reduction order is
+        # backend dependent, while the gate above specifies the math contract.
+        print("\n".join(reports))
         assert not failures, "\n".join([*reports, *failures])
     torch.testing.assert_close(a_bank.grad[3], torch.zeros_like(a_bank.grad[3]))
     torch.testing.assert_close(b_bank.grad[3], torch.zeros_like(b_bank.grad[3]))
