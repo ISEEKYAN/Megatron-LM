@@ -223,15 +223,15 @@ def test_backward_scratch_grows_to_observed_shape_but_not_beyond_profile(
     workspace.materialize(device="cpu")
     assert workspace.evidence()["data_ptrs"] == {}
     lease = workspace.acquire(0)
-    first = lease.tensor("grad_recv_hidden", (8, 4), dtype=torch.float32, device="cpu")
-    grown = lease.tensor("grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu")
+    first = lease.tensor("grad_expert_out", (8, 4), dtype=torch.float32, device="cpu")
+    grown = lease.tensor("grad_expert_out", (9, 4), dtype=torch.float32, device="cpu")
 
     assert grown.shape == (9, 4)
     assert grown.data_ptr() != first.data_ptr()
     assert workspace.metrics()["grows"] == 1
 
     with pytest.raises(RuntimeError, match="exceeds fixed profile capacity"):
-        lease.tensor("grad_recv_hidden", (17, 4), dtype=torch.float32, device="cpu")
+        lease.tensor("grad_expert_out", (17, 4), dtype=torch.float32, device="cpu")
 
     assert workspace.metrics()["fallbacks"] == 0
 
@@ -276,26 +276,20 @@ def test_op_scratch_is_actual_shape_lazy_then_steady_state_stable(
     first_ptrs = {}
     for slot in range(2):
         lease = workspace.acquire(slot)
-        first_ptrs[(slot, "grad_recv_hidden")] = lease.tensor(
-            "grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu"
-        ).data_ptr()
-        first_ptrs[(slot, "grad_recv_probs")] = lease.tensor(
-            "grad_recv_probs", (9, 2), dtype=torch.float32, device="cpu"
+        first_ptrs[(slot, "grad_expert_out")] = lease.tensor(
+            "grad_expert_out", (9, 4), dtype=torch.float32, device="cpu"
         ).data_ptr()
         lease.release(_FakeEvent(ready=True))
 
     first_metrics = workspace.metrics().copy()
-    assert first_metrics["allocations"] == 4
-    assert first_metrics["runtime_allocations"] == 4
+    assert first_metrics["allocations"] == 2
+    assert first_metrics["runtime_allocations"] == 2
 
     second_ptrs = {}
     for slot in range(2):
         lease = workspace.acquire(slot)
-        second_ptrs[(slot, "grad_recv_hidden")] = lease.tensor(
-            "grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu"
-        ).data_ptr()
-        second_ptrs[(slot, "grad_recv_probs")] = lease.tensor(
-            "grad_recv_probs", (9, 2), dtype=torch.float32, device="cpu"
+        second_ptrs[(slot, "grad_expert_out")] = lease.tensor(
+            "grad_expert_out", (9, 4), dtype=torch.float32, device="cpu"
         ).data_ptr()
         lease.release(_FakeEvent(ready=True))
 
@@ -335,9 +329,7 @@ def test_backward_scratch_only_lease_does_not_materialize_dispatchers_or_pools(
     )
 
     lease = workspace.acquire(0, require_dispatcher=False)
-    scratch = lease.tensor(
-        "grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu"
-    )
+    scratch = lease.tensor("grad_expert_out", (9, 4), dtype=torch.float32, device="cpu")
 
     assert scratch.shape == (9, 4)
     assert created == []
@@ -417,7 +409,7 @@ def test_reset_tensors_waits_for_consumers_and_keeps_dispatchers(
         lambda slot: f"dispatcher-{slot}",
     )
     lease = workspace.acquire(0)
-    tensor = lease.tensor("grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu")
+    tensor = lease.tensor("grad_expert_out", (9, 4), dtype=torch.float32, device="cpu")
     lease.release(_FakeEvent(ready=False))
 
     with pytest.raises(RuntimeError, match="pending consumer event"):
@@ -464,26 +456,20 @@ def test_workspace_evidence_reports_actual_scratch_shape_dtype_and_bytes(
         lambda slot: f"dispatcher-{slot}",
     )
     lease = workspace.acquire(0, require_dispatcher=False)
-    lease.tensor("grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu")
-    lease.tensor("grad_recv_probs", (9, 2), dtype=torch.float32, device="cpu")
+    lease.tensor("grad_expert_out", (9, 4), dtype=torch.float32, device="cpu")
     lease.release(_FakeEvent(ready=True))
 
     details = workspace.evidence()["tensor_details"]
     assert details == {
-        "0:grad_recv_hidden": {
+        "0:grad_expert_out": {
             "shape": (9, 4),
             "dtype": "torch.float32",
             "nbytes": 9 * 4 * 4,
         },
-        "0:grad_recv_probs": {
-            "shape": (9, 2),
-            "dtype": "torch.float32",
-            "nbytes": 9 * 2 * 4,
-        },
     }
 
 
-def test_scratch_only_lease_allocates_from_borrowed_forward_arena(
+def test_scratch_only_lease_allocates_from_its_own_backward_arena(
     transformer_engine_import_stub,
 ):
     (
@@ -521,15 +507,13 @@ def test_scratch_only_lease_allocates_from_borrowed_forward_arena(
             yield
             entered.append("exit")
 
-    lease = workspace.acquire(
-        0,
-        require_dispatcher=False,
-        allocation_arena=FakeArena(),
-    )
-    lease.tensor("grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu")
+    workspace._allocation_arenas[0] = FakeArena()
+    lease = workspace.acquire(0, require_dispatcher=False)
+    lease.tensor("grad_expert_out", (9, 4), dtype=torch.float32, device="cpu")
 
     assert entered == ["enter", "exit"]
     assert workspace.evidence()["dispatcher_count"] == 0
+    assert lease.allocation_arena is workspace.allocation_arena(0)
     lease.release(_FakeEvent(ready=True))
 
 
@@ -576,7 +560,7 @@ def test_fused_dispatcher_lease_allocates_scratch_from_its_own_slot_arena(
 
     workspace._allocation_arenas[0] = FakeArena()
     lease = workspace.acquire(0)
-    lease.tensor("grad_recv_hidden", (9, 4), dtype=torch.float32, device="cpu")
+    lease.tensor("grad_expert_out", (9, 4), dtype=torch.float32, device="cpu")
 
     assert entered == ["enter", "exit"]
     assert lease.allocation_arena is workspace.allocation_arena(0)
@@ -867,8 +851,7 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
     assert workspace.evidence()["data_ptrs"] == {}
     for slot in range(2):
         lease = workspace.acquire(slot)
-        lease.tensor("grad_recv_hidden", (4, 4), dtype=torch.float32, device="cpu")
-        lease.tensor("grad_recv_probs", (4, 2), dtype=torch.float32, device="cpu")
+        lease.tensor("grad_expert_out", (4, 4), dtype=torch.float32, device="cpu")
         lease.release(_FakeEvent(ready=True))
     first_ptrs = set(workspace.evidence()["data_ptrs"].values())
     assert workspace.evidence()["dispatcher_count"] == 2
@@ -884,8 +867,7 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
     assert workspace.evidence()["data_ptrs"] == {}
     for slot in range(2):
         lease = workspace.acquire(slot)
-        lease.tensor("grad_recv_hidden", (4, 4), dtype=torch.float32, device="cpu")
-        lease.tensor("grad_recv_probs", (4, 2), dtype=torch.float32, device="cpu")
+        lease.tensor("grad_expert_out", (4, 4), dtype=torch.float32, device="cpu")
         lease.release(_FakeEvent(ready=True))
     assert set(workspace.evidence()["data_ptrs"].values()).isdisjoint(first_ptrs)
     registry.release(key)
@@ -895,8 +877,7 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
     rebuilt.materialize(device="cpu")
     for slot in range(2):
         lease = rebuilt.acquire(slot)
-        lease.tensor("grad_recv_hidden", (4, 4), dtype=torch.float32, device="cpu")
-        lease.tensor("grad_recv_probs", (4, 2), dtype=torch.float32, device="cpu")
+        lease.tensor("grad_expert_out", (4, 4), dtype=torch.float32, device="cpu")
         lease.release(_FakeEvent(ready=True))
     assert all(
         rebuilt.dispatcher(slot) is not first_dispatchers[slot] for slot in range(2)
@@ -1071,6 +1052,17 @@ def test_saved_forward_context_does_not_pin_two_shared_slots_across_layers(
         _EPChunkOperationBase._forward_saved_context_async
     )
 
-    assert "workspace_lease" not in fields
+    assert "forward_workspace_lease" not in fields
     assert "lease.release(consumed)" in forward_source
+    expert_finished = forward_source.index("expert_out = self.experts(")
+    context_saved = forward_source.index("saved_chunks[chunk_idx] =")
+    slot_released = forward_source.index("lease.release(consumed)")
+    assert expert_finished < context_saved < slot_released
+    for saved_tensor in (
+        "recv_probs_base",
+        "dispatched",
+        "probs",
+        "expert_out_edge",
+    ):
+        assert saved_tensor in fields
     assert 'handle=state["handle"]' in forward_source

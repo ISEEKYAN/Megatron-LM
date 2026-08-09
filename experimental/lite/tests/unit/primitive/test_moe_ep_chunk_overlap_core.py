@@ -577,7 +577,7 @@ def test_saved_backward_chains_first_combine_to_caller_grad_readiness(
     assert "torch.cuda.synchronize" not in source
 
 
-def test_saved_backward_reuses_forward_pool_only_after_recv_consumer_event(
+def test_saved_backward_uses_its_own_manual_unpermute_arena_after_recv_event(
     transformer_engine_import_stub,
 ):
     import inspect
@@ -594,14 +594,18 @@ def test_saved_backward_reuses_forward_pool_only_after_recv_consumer_event(
     )
     backward_source = inspect.getsource(_EPChunkOperationBase._saved_context_backward)
 
-    assert "allocation_arena" in fields
+    assert "allocation_arena" not in fields
+    assert "forward_workspace_lease" not in fields
     assert "recv_consumed_event" in fields
-    assert "allocation_arena=lease.allocation_arena" in forward_source
+    assert "allocation_arena=lease.allocation_arena" not in forward_source
     assert "recv_consumed_event.record(compute_stream)" in forward_source
     assert forward_source.index("recv_consumed_event.record(compute_stream)") < (
         forward_source.index("state.clear()")
     )
-    assert "allocation_arena=saved.allocation_arena" in backward_source
+    assert "allocation_arena=saved.allocation_arena" not in backward_source
+    assert "forward_workspace_lease=lease" not in forward_source
+    assert "lease.release(consumed)" in forward_source
+    assert "forward_workspace_lease" not in backward_source
     assert "compute_stream.wait_event(saved.recv_consumed_event)" in backward_source
     assert backward_source.index(
         "compute_stream.wait_event(saved.recv_consumed_event)"
@@ -609,7 +613,7 @@ def test_saved_backward_reuses_forward_pool_only_after_recv_consumer_event(
     assert "cuda.synchronize" not in backward_source
 
 
-def test_saved_context_wrapper_resets_scratch_after_backward_op_returns(
+def test_saved_context_wrapper_keeps_scratch_until_explicit_lifecycle_reset(
     transformer_engine_import_stub,
 ):
     import inspect
@@ -622,14 +626,11 @@ def test_saved_context_wrapper_resets_scratch_after_backward_op_returns(
     source = inspect.getsource(_SavedContextEPChunkFunction.backward)
 
     assert "ctx.backward_op.backward(" in source
-    assert "ctx.backward_op.workspace.reset_tensors(" in source
-    assert source.index("ctx.backward_op.backward(") < source.index(
-        "ctx.backward_op.workspace.reset_tensors("
-    )
+    assert "ctx.backward_op.workspace.reset_tensors(" not in source
     assert "cuda.synchronize" not in source
 
 
-def test_saved_backward_flushes_delayed_wgrad_before_reusing_dispatched_storage(
+def test_saved_backward_reuses_manual_unpermute_storage_only_after_wgrad_flush(
     transformer_engine_import_stub,
 ):
     import inspect
@@ -641,15 +642,19 @@ def test_saved_backward_flushes_delayed_wgrad_before_reusing_dispatched_storage(
 
     source = inspect.getsource(_EPChunkOperationBase._saved_context_backward)
     grad_complete = source.index("expert_grads = torch.autograd.grad(")
-    queued = source.index("pending_dispatch_bwd.append")
     flushed = source.index("flush_delayed_weight_grads")
     flush_waited = source.index("compute_stream.wait_event(wgrad_done)")
-    alias_taken = source.index("hidden_reuse_base = chunk.dispatched.detach()")
-    graph_cleared = source.index("saved.dispatched = None", alias_taken)
-    storage_overwritten = source.index("_dispatch_local_backward(", graph_cleared)
+    alias_taken = source.index("hidden_reuse_base = local_state.pop(", flush_waited)
+    storage_overwritten = source.index("_dispatch_local_backward(", alias_taken)
+    dispatch_submitted = source.index(
+        "submit_deepep_dispatch_backward(", storage_overwritten
+    )
+    queued = source.index("pending_dispatch_bwd.append", grad_complete)
 
-    assert grad_complete < queued < flushed < flush_waited
-    assert flush_waited < alias_taken < graph_cleared < storage_overwritten
+    assert grad_complete < queued < flushed < flush_waited < alias_taken
+    assert alias_taken < storage_overwritten < dispatch_submitted
+    assert "hidden_reuse_base = chunk.dispatched.detach()" not in source
+    assert "Delayed grouped-linear wgrad retains its grad-output storage" in source
     for assignment in (
         "saved.dispatched = None",
         "saved.probs = None",
@@ -666,7 +671,7 @@ def test_saved_backward_flushes_delayed_wgrad_before_reusing_dispatched_storage(
     assert "cuda.synchronize" not in source
 
 
-def test_normal_and_fused_backward_reuse_graph_storage_for_hidden_grad(
+def test_normal_and_fused_backward_reuse_manual_unpermute_workspace_storage(
     transformer_engine_import_stub,
 ):
     import inspect
@@ -677,6 +682,7 @@ def test_normal_and_fused_backward_reuse_graph_storage_for_hidden_grad(
         _EPChunkOperationBase,
         _ForwardChunkContext,
         _dispatch_local_backward,
+        _manual_unpermute_backward,
     )
 
     assert "recv_probs_base" in _BackwardChunk.__dataclass_fields__
@@ -691,12 +697,23 @@ def test_normal_and_fused_backward_reuse_graph_storage_for_hidden_grad(
         _EPChunkOperationBase._full_recompute_fused_backward_v6
     )
     helper_source = inspect.getsource(_dispatch_local_backward)
+    unpermute_source = inspect.getsource(_manual_unpermute_backward)
 
     for source in (saved_source, fused_source):
         assert 'recv_hidden_base=state["recv_hidden"]' not in source
         assert 'recv_probs_base=state["recv_probs"]' in source
-    assert "hidden_reuse_base = chunk.dispatched.detach()" in normal_backward_source
+    for source in (normal_backward_source, fused_source):
+        assert "hidden_reuse_base = chunk.dispatched.detach()" not in source
+    assert "hidden_reuse_base = local_state.pop(" in normal_backward_source
+    assert (
+        '"grad_expert_out"'
+        in normal_backward_source[normal_backward_source.index("hidden_reuse_base =") :]
+    )
     assert "hidden_reuse_base = chunk.expert_out.detach()" in fused_source
+    assert "chunk.workspace_lease.tensor(" in unpermute_source
+    assert '"grad_expert_out"' in unpermute_source
+    assert "torch.index_select(" in unpermute_source
+    assert "out=grad_expert_out" in unpermute_source
     assert "chunk.workspace_lease.tensor(" not in helper_source
     assert "hidden_reuse_base.detach()" in helper_source
     assert ".view(-1)[:required_hidden_numel]" in helper_source
@@ -704,7 +721,7 @@ def test_normal_and_fused_backward_reuse_graph_storage_for_hidden_grad(
     assert "cuda.synchronize" not in helper_source
 
 
-def test_fused_reuses_expert_out_only_after_autograd_and_before_graph_clear(
+def test_fused_reuses_arena_owned_expert_output_before_delayed_wgrad_flush(
     transformer_engine_import_stub,
 ):
     import inspect
@@ -716,16 +733,94 @@ def test_fused_reuses_expert_out_only_after_autograd_and_before_graph_clear(
 
     source = inspect.getsource(_EPChunkOperationBase._full_recompute_fused_backward_v6)
     autograd = source.index("expert_grads = torch.autograd.grad(")
+    flushed = source.index("flush_delayed_weight_grads", autograd)
     alias_taken = source.index(
         "hidden_reuse_base = chunk.expert_out.detach()", autograd
     )
     graph_clear = source.index("chunk.expert_out = None", alias_taken)
     locals_clear = source.index("del expert_dispatched", graph_clear)
     overwrite = source.index("_dispatch_local_backward(", locals_clear)
+    dispatch = source.index("submit_deepep_dispatch_backward(", overwrite)
 
-    assert autograd < alias_taken < graph_clear < locals_clear < overwrite
+    assert autograd < alias_taken < graph_clear < locals_clear < overwrite < dispatch
+    assert dispatch < flushed
     assert "del expert_input, expert_probs, metadata" in source
     assert "state.clear()" in source
     assert "del expert_dispatched, expert_probs_input" in source
     assert "del expert_inputs, expert_grads, expert_output" in source
     assert "cuda.synchronize" not in source
+
+
+def test_forward_and_fused_expert_allocations_use_their_workspace_slot_arenas(
+    transformer_engine_import_stub,
+):
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+    )
+
+    forward_source = inspect.getsource(_EPChunkOperationBase._forward_output_async)
+    saved_forward_source = inspect.getsource(
+        _EPChunkOperationBase._forward_saved_context_async
+    )
+    fused_source = inspect.getsource(
+        _EPChunkOperationBase._full_recompute_fused_backward_v6
+    )
+
+    forward_arena = forward_source.index("with lease.allocation_arena.allocate():")
+    forward_expert = forward_source.index("expert_out = self.experts(", forward_arena)
+    saved_arena = saved_forward_source.index("with lease.allocation_arena.allocate():")
+    saved_expert = saved_forward_source.index("expert_out = self.experts(", saved_arena)
+    fused_arena = fused_source.index(
+        "with workspace_lease.allocation_arena.allocate():"
+    )
+    fused_expert = fused_source.index("expert_out = self.experts(", fused_arena)
+
+    assert forward_arena < forward_expert
+    assert saved_arena < saved_expert
+    assert fused_arena < fused_expert
+    no_grad_finish = forward_source.index("finish_deepep_combine(state)")
+    no_grad_release = forward_source.index("lease.release(consumed)", no_grad_finish)
+    assert no_grad_finish < no_grad_release
+    assert "cuda.synchronize" not in forward_source
+    assert "cuda.synchronize" not in saved_forward_source
+    assert "cuda.synchronize" not in fused_source
+
+
+def test_manual_unpermute_writes_into_stable_workspace_slot(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _manual_unpermute_backward,
+    )
+
+    class StableLease:
+        def __init__(self):
+            self.storage = None
+            self.names = []
+
+        def tensor(self, name, shape, *, dtype, device):
+            self.names.append(name)
+            if self.storage is None:
+                self.storage = torch.empty(shape, dtype=dtype, device=device)
+            return self.storage
+
+    lease = StableLease()
+    chunk = SimpleNamespace(
+        expert_out_shape=torch.Size((4, 2)),
+        expert_out_dtype=torch.float32,
+        row_id_map=torch.tensor([2, 0, 3, 1]),
+        workspace_lease=lease,
+    )
+    first_input = torch.arange(8, dtype=torch.float32).view(4, 2)
+    first = _manual_unpermute_backward(chunk, first_input)
+    first_ptr = first.data_ptr()
+    second_input = first_input + 10
+    second = _manual_unpermute_backward(chunk, second_input)
+
+    assert first_ptr == second.data_ptr()
+    assert lease.names == ["grad_expert_out", "grad_expert_out"]
+    torch.testing.assert_close(second, second_input.index_select(0, chunk.row_id_map))
