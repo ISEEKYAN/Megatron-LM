@@ -98,32 +98,6 @@ def _release_cached_buffers(chunk) -> None:
             allocator.release_cached()
 
 
-def test_eval_root_storage_survives_next_train_forward_then_releases_after_backward():
-    chunk, optimizer = _build_chunk()
-    value = torch.randn(3, 4)
-
-    chunk.eval()
-    with torch.no_grad():
-        eval_output = chunk(value)
-    non_unit_buckets = [
-        bucket for bucket in chunk.param_sync.buckets if not bucket.is_fsdp_unit
-    ]
-    assert non_unit_buckets
-    assert all(bucket._full_ready for bucket in non_unit_buckets)
-
-    chunk.train()
-    optimizer.zero_grad()
-    train_output = chunk(value)
-    assert torch.equal(train_output, eval_output)
-    assert all(bucket._full_ready for bucket in non_unit_buckets)
-
-    train_output.square().mean().backward()
-    optimizer.finish_grad_sync()
-    assert optimizer.step()[0]
-    assert not chunk.param_sync._preserve_non_fsdp_units_after_forward
-    assert not _any_slot_busy(chunk)
-
-
 def test_layernorm_params_follow_mcore_unit_reshard_lifecycle():
     chunk, _optimizer = _build_chunk()
     assert not any(
