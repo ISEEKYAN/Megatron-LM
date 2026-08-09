@@ -1301,6 +1301,10 @@ def test_mfsdp_qwen35_eval_to_train_first_step_is_finite():
                     "offload_fraction": 0.0,
                     "use_precision_aware_optimizer": False,
                     "nccl_ub": False,
+                    "fsdp_double_buffer": os.environ.get(
+                        "MLITE_SMOKE_DOUBLE_BUFFER", "1"
+                    )
+                    == "1",
                 }
             ),
             impl_cfg_json=json.dumps(
