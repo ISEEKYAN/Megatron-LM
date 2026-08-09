@@ -577,8 +577,12 @@ class ParamBucket:
         if self._param_gather_event is not None:
             torch.cuda.current_stream(self.device).wait_event(self._param_gather_event)
             self._param_gather_event = None
-            self._param_gather_work = None
-        elif self._param_gather_work is not None:
+        if self._param_gather_work is not None:
+            # The event belongs to our Python communication stream, while
+            # ProcessGroupNCCL may execute the async collective on its own
+            # internal stream.  Waiting only on that event can expose the
+            # output and recycle the input before NCCL has completed.  Work.wait
+            # installs the process-group completion dependency on this stream.
             self._param_gather_work.wait()
             self._param_gather_work = None
         self._release_local_compute_buffer()

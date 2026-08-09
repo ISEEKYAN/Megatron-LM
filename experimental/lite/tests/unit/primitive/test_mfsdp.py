@@ -1680,6 +1680,44 @@ def test_mfsdp_dtype_conversion_buffers_are_collective_scoped():
     assert torch.count_nonzero(bucket.main_grad_buffer) == bucket.local_numel
 
 
+def test_mfsdp_param_gather_waits_for_process_group_work_after_stream_event(
+    monkeypatch,
+):
+    model = torch.nn.Linear(4, 3, bias=False, dtype=torch.bfloat16)
+    groups = mfsdp_buffer.MFSDPProcessGroups(
+        dense_dp=None,
+        expert_dp=None,
+        dense_ag=None,
+        expert_ag=None,
+        tp=None,
+        etp=None,
+        ep=None,
+        pp=None,
+    )
+    bucket = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=groups,
+        config=mfsdp_config.MFSDPConfig(bucket_size=None),
+        is_expert=lambda _name: False,
+        unit_modules=(),
+    ).buckets[0]
+    calls = []
+    event = object()
+    work = SimpleNamespace(wait=lambda: calls.append("work"))
+    stream = SimpleNamespace(wait_event=lambda value: calls.append(("event", value)))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: stream)
+    bucket._full_ready = False
+    bucket._param_gather_event = event
+    bucket._param_gather_work = work
+
+    bucket.wait_param_gather()
+
+    assert calls == [("event", event), "work"]
+    assert bucket._param_gather_event is None
+    assert bucket._param_gather_work is None
+    assert bucket._full_ready
+
+
 def test_mfsdp_full_param_installs_mcore_te_lazy_main_grad_protocol():
     """TE must recognize and materialize the released full-param lazy grad."""
     model = torch.nn.Linear(4, 3, bias=False, dtype=torch.bfloat16)
