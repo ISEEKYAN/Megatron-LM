@@ -292,7 +292,20 @@ def _grad_fingerprint(handle) -> dict[str, Any]:
     details = []
     include_details = os.environ.get("MLITE_CORRECTNESS_GRAD_DETAILS") == "1"
     for chunk_idx, chunk in enumerate(_model_chunks(handle)):
-        for name, param in sorted(chunk.named_parameters(), key=lambda item: item[0]):
+        param_sync = getattr(chunk, "param_sync", None)
+        if param_sync is None:
+            named_params = list(chunk.named_parameters())
+        else:
+            # M-FSDP's public named_parameters() materializes every bucket
+            # after optimizer construction.  Fingerprint the authoritative
+            # optimizer shards directly so diagnostics remain bounded.
+            named_params = [
+                (spec.name, spec.shard_param)
+                for bucket in param_sync.buckets
+                for spec in bucket.specs
+                if spec.shard_param is not None
+            ]
+        for name, param in sorted(named_params, key=lambda item: item[0]):
             grad = param.grad
             if grad is None:
                 grad = getattr(param, "main_grad", None)
