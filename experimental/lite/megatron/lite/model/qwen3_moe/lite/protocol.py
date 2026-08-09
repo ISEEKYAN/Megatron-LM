@@ -92,6 +92,7 @@ class ImplConfig:
     use_deepep: bool = False
     enable_ep_chunk_overlap: bool = False
     ep_chunk_max_token_rows_per_rank: int | None = None
+    ep_chunk_full_recompute: bool = False
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     router_aux_loss_coef: float | None = None
@@ -160,11 +161,6 @@ def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
     )
 
 
-def _ep_chunk_full_recompute_requested(modules: list[str]) -> bool:
-    """Interpret Qwen3 recompute composition without leaking it into primitives."""
-    return "full" in modules or "moe" in modules
-
-
 def _qwen3_recompute_modules_for_ep_chunk_overlap(
     modules: list[str], *, enabled: bool
 ) -> list[str]:
@@ -174,6 +170,25 @@ def _qwen3_recompute_modules_for_ep_chunk_overlap(
     if "full" in modules:
         return ["attn"]
     return [name for name in modules if name != "moe"]
+
+
+def _validate_ep_chunk_recompute_contract(impl_cfg: ImplConfig) -> None:
+    """Reject ambiguous Qwen3 composition before primitive construction."""
+    overlap = impl_cfg.enable_ep_chunk_overlap
+    full_recompute = impl_cfg.ep_chunk_full_recompute
+    if full_recompute and not overlap:
+        raise ValueError(
+            "ep_chunk_full_recompute=True requires enable_ep_chunk_overlap=True"
+        )
+    if (
+        overlap
+        and not full_recompute
+        and any(module in {"moe", "full"} for module in impl_cfg.recompute)
+    ):
+        raise ValueError(
+            "normal ChunkedEP conflicts with outer MoE recompute; enable "
+            "ep_chunk_full_recompute or remove moe/full recompute"
+        )
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
@@ -187,6 +202,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     """
     p = impl_cfg.parallel
     lora_config = normalize_lora_config(impl_cfg.lora)
+    _validate_ep_chunk_recompute_contract(impl_cfg)
 
     # ── validation ──
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
@@ -223,7 +239,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     recompute_spec = parse_recompute_spec(
         _qwen3_recompute_modules_for_ep_chunk_overlap(
             impl_cfg.recompute,
-            enabled=impl_cfg.enable_ep_chunk_overlap,
+            enabled=(
+                impl_cfg.enable_ep_chunk_overlap and impl_cfg.ep_chunk_full_recompute
+            ),
         )
     )
     model_kwargs: dict[str, Any] = dict(
@@ -236,9 +254,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
         enable_ep_chunk_overlap=impl_cfg.enable_ep_chunk_overlap,
-        ep_chunk_full_recompute=(
-            _ep_chunk_full_recompute_requested(impl_cfg.recompute)
-        ),
+        ep_chunk_full_recompute=impl_cfg.ep_chunk_full_recompute,
         ep_chunk_max_token_rows_per_rank=impl_cfg.ep_chunk_max_token_rows_per_rank,
         lora_config=lora_config,
     )

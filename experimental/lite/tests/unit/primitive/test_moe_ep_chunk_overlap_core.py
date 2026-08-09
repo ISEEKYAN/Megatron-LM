@@ -171,7 +171,7 @@ def test_expert_wgrad_flush_records_nested_cuda_views_and_bases(
     assert experts.fc2.wgrad_store.context.empty()
 
 
-def test_delayed_expert_wgrads_request_distopt_main_grad_reuse(
+def test_delayed_expert_wgrads_request_fused_sink_reuse(
     monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
@@ -204,6 +204,325 @@ def test_delayed_expert_wgrads_request_distopt_main_grad_reuse(
 
     assert all(kwargs["delay_wgrad_compute"] for kwargs in grouped_linear_kwargs)
     assert all(kwargs["fuse_wgrad_accumulation"] for kwargs in grouped_linear_kwargs)
+
+
+def _build_fake_delayed_grad_experts(monkeypatch, experts_module):
+    class FakeStore:
+        def __init__(self, linear):
+            self.linear = linear
+            self.pending = []
+            self.context = SimpleNamespace(empty=lambda: not self.pending)
+
+        @staticmethod
+        def delay_wgrad_compute():
+            return True
+
+        def queue(self, value):
+            sinks = [
+                getattr(self.linear, f"weight{idx}").main_grad
+                for idx in range(self.linear.num_gemms)
+            ]
+            self.pending.append((float(value), sinks))
+
+        def pop(self):
+            value, sinks = self.pending.pop(0)
+            for sink in sinks:
+                sink.add_(value)
+            return (None, [None] * self.linear.num_gemms, None), [None, None, sinks]
+
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(
+            self,
+            num_gemms,
+            *_args,
+            bias,
+            fuse_wgrad_accumulation,
+            **_kwargs,
+        ):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.use_bias = bias
+            self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+            self.output_size = _args[1]
+            for idx in range(num_gemms):
+                self.register_parameter(
+                    f"weight{idx}", torch.nn.Parameter(torch.zeros(2, 2))
+                )
+            self.wgrad_store = FakeStore(self)
+
+        def forward(self, x, _m_splits):
+            return x.new_zeros((*x.shape[:-1], self.output_size))
+
+    monkeypatch.setattr(
+        experts_module.te, "GroupedLinear", FakeGroupedLinear, raising=False
+    )
+    return experts_module.Experts(
+        SimpleNamespace(
+            num_experts=2,
+            hidden_size=2,
+            moe_intermediate_size=2,
+            swiglu_limit=0.0,
+        ),
+        SimpleNamespace(ep_size=1, etp_size=1, tp_size=1, etp_group=None),
+        delay_wgrad_compute=True,
+    )
+
+
+@pytest.mark.parametrize("flush_schedule", ["normal", "full_fused"])
+def test_delayed_expert_standard_grads_match_native_accumulation_without_main_grad(
+    flush_schedule, monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    experts = _build_fake_delayed_grad_experts(monkeypatch, experts_module)
+    params = tuple(experts.fc1.parameters()) + tuple(experts.fc2.parameters())
+    assert all(
+        param.grad is None and not hasattr(param, "main_grad") for param in params
+    )
+    assert experts._owned_main_grad_aliases == {}
+    native_params = [torch.nn.Parameter(torch.zeros_like(param)) for param in params]
+
+    grad_storage = None
+    for contribution in (1.25, 2.75):
+        sum((param * contribution).sum() for param in native_params).backward()
+        experts._prepare_delayed_weight_grad_sinks()
+        if grad_storage is None:
+            grad_storage = {id(param): param.grad for param in params}
+        else:
+            assert all(param.grad is grad_storage[id(param)] for param in params)
+        for linear in (experts.fc1, experts.fc2):
+            linear.wgrad_store.queue(contribution)
+        if flush_schedule == "full_fused":
+            experts.flush_delayed_weight_grads(num_contexts=1)
+    if flush_schedule == "normal":
+        experts.flush_delayed_weight_grads(num_contexts=2)
+
+    for param, native_param in zip(params, native_params, strict=True):
+        torch.testing.assert_close(param.grad, native_param.grad)
+        assert not hasattr(param, "main_grad")
+    assert experts._owned_main_grad_aliases == {}
+
+
+def test_delayed_expert_forward_keeps_gradient_sinks_lazy_until_backward(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    experts = _build_fake_delayed_grad_experts(monkeypatch, experts_module)
+    monkeypatch.setattr(
+        experts_module,
+        "swiglu_with_probs",
+        lambda value, _probs, _limit: value[..., :2],
+    )
+    params = tuple(experts.fc1.parameters()) + tuple(experts.fc2.parameters())
+    x = torch.zeros(3, 2)
+
+    with torch.no_grad():
+        experts(x, None, tokens_per_expert_list=[1, 2])
+    assert all(
+        param.grad is None and not hasattr(param, "main_grad") for param in params
+    )
+
+    with torch.enable_grad():
+        experts(x.requires_grad_(), None, tokens_per_expert_list=[1, 2])
+    assert all(
+        param.grad is None and not hasattr(param, "main_grad") for param in params
+    )
+
+    experts._prepare_delayed_weight_grad_sinks()
+    assert all(param.main_grad is param.grad for param in params)
+    for linear in (experts.fc1, experts.fc2):
+        linear.wgrad_store.queue(2.0)
+    experts.flush_delayed_weight_grads(num_contexts=1)
+    assert all(torch.equal(param.grad, torch.full_like(param, 2.0)) for param in params)
+    assert all(not hasattr(param, "main_grad") for param in params)
+
+
+def test_chunked_ep_backward_phases_prepare_sinks_before_expert_autograd(
+    transformer_engine_import_stub,
+):
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+    )
+
+    for method in (
+        _EPChunkOperationBase._full_recompute_fused_backward_v6,
+        _EPChunkOperationBase._saved_context_backward,
+    ):
+        source = inspect.getsource(method)
+        assert source.index("_prepare_delayed_weight_grad_sinks") < source.index(
+            "torch.autograd.grad"
+        )
+
+
+def test_delayed_expert_external_main_grad_stays_zero_copy_without_parameter_grad(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    experts = _build_fake_delayed_grad_experts(monkeypatch, experts_module)
+    params = tuple(experts.fc1.parameters()) + tuple(experts.fc2.parameters())
+    external = {}
+    for param in params:
+        external[id(param)] = torch.zeros_like(param)
+        param.main_grad = external[id(param)]
+
+    experts._prepare_delayed_weight_grad_sinks()
+    for linear in (experts.fc1, experts.fc2):
+        linear.wgrad_store.queue(3.5)
+    experts.flush_delayed_weight_grads(num_contexts=1)
+
+    for param in params:
+        assert param.grad is None
+        assert param.main_grad is external[id(param)]
+        torch.testing.assert_close(param.main_grad, torch.full_like(param, 3.5))
+    assert experts._owned_main_grad_aliases == {}
+
+
+def test_delayed_expert_fsdp_accessor_is_resolved_by_te_at_pop(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    experts = _build_fake_delayed_grad_experts(monkeypatch, experts_module)
+    params = tuple(experts.fc1.parameters()) + tuple(experts.fc2.parameters())
+    external = {id(param): torch.zeros_like(param) for param in params}
+    accessor_calls = []
+    for param in params:
+        param.__fsdp_param__ = True
+
+        def get_main_grad(p=param):
+            accessor_calls.append(id(p))
+            return external[id(p)]
+
+        param.get_main_grad = get_main_grad
+
+    experts._prepare_delayed_weight_grad_sinks()
+    assert accessor_calls == []
+    assert all(not hasattr(param, "main_grad") for param in params)
+
+    # Frozen TE resolves the saved accessor during delayed backward and writes the
+    # result back to origin_weight.main_grad before WeightGradStore.pop returns.
+    for linear in (experts.fc1, experts.fc2):
+        for idx in range(linear.num_gemms):
+            param = getattr(linear, f"weight{idx}")
+            param.main_grad = param.get_main_grad()
+        linear.wgrad_store.queue(4.5)
+    experts.flush_delayed_weight_grads(num_contexts=1)
+
+    assert sorted(accessor_calls) == sorted(id(param) for param in params)
+    for param in params:
+        assert param.grad is None
+        assert param.main_grad is external[id(param)]
+        torch.testing.assert_close(param.main_grad, torch.full_like(param, 4.5))
+
+
+def test_delayed_expert_fsdp_accessor_sink_is_validated_after_pop(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    experts = _build_fake_delayed_grad_experts(monkeypatch, experts_module)
+    params = tuple(experts.fc1.parameters()) + tuple(experts.fc2.parameters())
+    for param in params:
+        param.__fsdp_param__ = True
+        param.get_main_grad = lambda: torch.zeros(1)
+
+    experts._prepare_delayed_weight_grad_sinks()
+    for linear in (experts.fc1, experts.fc2):
+        for idx in range(linear.num_gemms):
+            param = getattr(linear, f"weight{idx}")
+            param.main_grad = param.get_main_grad()
+        linear.wgrad_store.queue(1.0)
+
+    with pytest.raises(RuntimeError, match="matching shape and device"):
+        experts.flush_delayed_weight_grads(num_contexts=1)
+
+
+def test_callable_get_main_grad_without_fsdp_capability_uses_standard_grad(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    experts = _build_fake_delayed_grad_experts(monkeypatch, experts_module)
+    params = tuple(experts.fc1.parameters()) + tuple(experts.fc2.parameters())
+    calls = []
+    for param in params:
+        param.get_main_grad = lambda: calls.append(True)
+
+    experts._prepare_delayed_weight_grad_sinks()
+
+    assert calls == []
+    assert all(param.main_grad is param.grad for param in params)
+
+
+def test_owned_standard_grad_alias_obeys_zero_grad_and_explicit_release(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    experts = _build_fake_delayed_grad_experts(monkeypatch, experts_module)
+    params = tuple(experts.fc1.parameters()) + tuple(experts.fc2.parameters())
+
+    experts._prepare_delayed_weight_grad_sinks()
+    first_grads = {id(param): param.grad for param in params}
+    assert all(param.main_grad is param.grad for param in params)
+    experts.release_delayed_weight_grad_aliases()
+    assert all(param.grad is first_grads[id(param)] for param in params)
+    assert all(not hasattr(param, "main_grad") for param in params)
+
+    experts.zero_grad(set_to_none=False)
+    experts._prepare_delayed_weight_grad_sinks()
+    assert all(param.grad is first_grads[id(param)] for param in params)
+    for linear in (experts.fc1, experts.fc2):
+        linear.wgrad_store.queue(2.0)
+    experts.flush_delayed_weight_grads(num_contexts=1)
+    assert all(torch.equal(param.grad, torch.full_like(param, 2.0)) for param in params)
+
+    experts.zero_grad(set_to_none=True)
+    assert all(param.grad is None for param in params)
+    experts._prepare_delayed_weight_grad_sinks()
+    assert all(param.grad is not first_grads[id(param)] for param in params)
+    assert all(param.main_grad is param.grad for param in params)
+
+
+def test_chunked_ep_public_ops_have_no_optimizer_or_recompute_policy_knowledge(
+    transformer_engine_import_stub,
+):
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkBackwardOp,
+        EPChunkForwardOp,
+        EPChunkFusedForwardBackwardOp,
+    )
+
+    for op in (EPChunkForwardOp, EPChunkBackwardOp, EPChunkFusedForwardBackwardOp):
+        public_contract = str(inspect.signature(op.__init__))
+        for name, member in inspect.getmembers(op, predicate=inspect.isfunction):
+            if not name.startswith("_"):
+                public_contract += str(inspect.signature(member))
+        assert "optimizer" not in public_contract
+        assert "recompute_modules" not in public_contract
+        assert "ep_chunk_full_recompute" not in public_contract
+
+
+def test_pending_combine_guards_are_fail_loud_under_python_optimized_mode():
+    source = SOURCE.read_text()
+
+    assert "assert pending_combine is not None" not in source
+    assert source.count("EP chunk combine pipeline produced no pending output") == 2
 
 
 def test_experts_accept_host_splits_without_a_device_count_tensor(

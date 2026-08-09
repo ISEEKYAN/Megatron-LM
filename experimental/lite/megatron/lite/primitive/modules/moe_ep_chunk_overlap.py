@@ -778,7 +778,7 @@ def _shared_wgrad_stream(device: torch.device | int | str) -> torch.cuda.Stream:
 
 
 def _queue_backward_stream_wait(event: torch.cuda.Event, device: torch.device) -> None:
-    """Make optimizer work queued after backward wait for deferred expert wgrad."""
+    """Make work queued after backward wait for deferred expert wgrad."""
 
     def wait_for_wgrad() -> None:
         with torch.cuda.device(device):
@@ -1039,7 +1039,8 @@ class _EPChunkOperationBase:
         done = torch.cuda.Event()
         done.record(compute_stream)
         caller_stream.wait_event(done)
-        assert pending_combine is not None
+        if pending_combine is None:
+            raise RuntimeError("EP chunk combine pipeline produced no pending output")
         finish_combine(pending_combine)
         return output_2d.view(input_shape).to(input_dtype).detach()
 
@@ -1241,7 +1242,8 @@ class _EPChunkOperationBase:
         done = torch.cuda.Event()
         done.record(compute_stream)
         caller_stream.wait_event(done)
-        assert pending_combine is not None
+        if pending_combine is None:
+            raise RuntimeError("EP chunk combine pipeline produced no pending output")
         finish_combine(pending_combine)
         if any(chunk is None for chunk in saved_chunks):
             raise RuntimeError("EP chunk saved forward context is incomplete")
@@ -1510,6 +1512,9 @@ class _EPChunkOperationBase:
                     expert_inputs = _expert_grad_inputs(
                         expert_dispatched, expert_probs_input
                     )
+                    # Fused mode flushes and releases owned aliases per chunk,
+                    # so each delayed TE context must rebind its selected sink.
+                    self.experts._prepare_delayed_weight_grad_sinks()
                     expert_grads = torch.autograd.grad(
                         expert_output,
                         expert_inputs,
@@ -1665,6 +1670,8 @@ class _EPChunkOperationBase:
         router_accum: list[torch.Tensor | None] = [None for _ in router_params]
         pending_dispatch_bwd: list[tuple[_BackwardChunk, dict[str, Any]]] = []
         last_deepep_event: Any | None = grad_ready
+        if context.chunks:
+            self.experts._prepare_delayed_weight_grad_sinks()
 
         def remember_deepep_event(state: dict[str, Any]):
             nonlocal last_deepep_event

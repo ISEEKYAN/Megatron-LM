@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import weakref
 from contextlib import contextmanager
 from typing import Any
 
@@ -118,6 +119,10 @@ class Experts(nn.Module):
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
         self.fp8 = fp8
         self.moe_act_recompute = moe_act_recompute
+        self._delay_wgrad_compute = delay_wgrad_compute
+        self._owned_main_grad_aliases: dict[
+            int, weakref.ReferenceType[torch.Tensor]
+        ] = {}
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
 
@@ -173,10 +178,77 @@ class Experts(nn.Module):
 
                     param.register_hook(_ar)
 
+    def _delayed_weight_parameters(self):
+        for linear in (self.fc1, self.fc2):
+            for idx in range(linear.num_gemms):
+                yield getattr(linear, f"weight{idx}")
+
+    @staticmethod
+    def _validate_weight_grad_sink(param: nn.Parameter, sink: torch.Tensor) -> None:
+        if (
+            not torch.is_tensor(sink)
+            or sink.shape != param.shape
+            or sink.device != param.device
+            or not sink.is_contiguous()
+        ):
+            raise RuntimeError(
+                "Expert delayed weight-gradient sink must be a contiguous tensor "
+                "with matching shape and device"
+            )
+
+    def _prepare_delayed_weight_grad_sinks(self) -> None:
+        """Prepare the sink selected by TE for each delayed expert wgrad."""
+        if not self._delay_wgrad_compute:
+            return
+        for param in self._delayed_weight_parameters():
+            # Frozen TE saves this accessor only for its FSDP parameter wrapper,
+            # then resolves it during delayed backward and writes main_grad back.
+            if hasattr(param, "__fsdp_param__"):
+                if not callable(getattr(param, "get_main_grad", None)):
+                    raise RuntimeError(
+                        "Expert FSDP parameter requires a callable get_main_grad"
+                    )
+                continue
+
+            param_id = id(param)
+            owned_ref = self._owned_main_grad_aliases.get(param_id)
+            owned = None if owned_ref is None else owned_ref()
+            main_grad = getattr(param, "main_grad", None)
+            if owned_ref is not None:
+                if main_grad is not owned:
+                    self._owned_main_grad_aliases.pop(param_id, None)
+                elif param.grad is owned:
+                    self._validate_weight_grad_sink(param, owned)
+                    continue
+                else:
+                    delattr(param, "main_grad")
+                    self._owned_main_grad_aliases.pop(param_id, None)
+                    main_grad = None
+
+            if main_grad is not None:
+                self._validate_weight_grad_sink(param, main_grad)
+                continue
+            if param.grad is None:
+                param.grad = torch.zeros_like(
+                    param,
+                    memory_format=torch.preserve_format,
+                )
+            self._validate_weight_grad_sink(param, param.grad)
+            param.main_grad = param.grad
+            self._owned_main_grad_aliases[param_id] = weakref.ref(param.grad)
+
+    def release_delayed_weight_grad_aliases(self) -> None:
+        """Drop owned TE aliases without changing standard parameter gradients."""
+        for param in self._delayed_weight_parameters():
+            owned_ref = self._owned_main_grad_aliases.pop(id(param), None)
+            owned = None if owned_ref is None else owned_ref()
+            if owned is not None and getattr(param, "main_grad", None) is owned:
+                delattr(param, "main_grad")
+
     def flush_delayed_weight_grads(
         self, *, num_contexts: int, stream: Any | None = None
     ) -> None:
-        """Execute queued TE wgrads directly into the reusable DistOpt buffers."""
+        """Execute queued TE wgrads directly into their selected gradient sinks."""
         for linear in (self.fc1, self.fc2):
             store = linear.wgrad_store
             if not store.delay_wgrad_compute():
@@ -195,15 +267,22 @@ class Experts(nn.Module):
                 weight_grads = tensors[2]
                 for idx, grad in enumerate(weight_grads):
                     param = getattr(linear, f"weight{idx}")
-                    main_grad = getattr(param, "main_grad", None)
-                    if main_grad is None or grad.data_ptr() != main_grad.data_ptr():
+                    sink = getattr(param, "main_grad", None)
+                    if sink is None:
                         raise RuntimeError(
-                            "Expert delayed wgrad did not reuse its DistOpt main_grad buffer."
+                            "Expert delayed wgrad produced no selected gradient sink"
+                        )
+                    self._validate_weight_grad_sink(param, sink)
+                    self._validate_weight_grad_sink(param, grad)
+                    if grad.data_ptr() != sink.data_ptr():
+                        raise RuntimeError(
+                            "Expert delayed wgrad did not reuse its selected gradient sink"
                         )
             if store.context is not None and not store.context.empty():
                 raise RuntimeError(
                     "Expert delayed weight-gradient queue was not drained."
                 )
+        self.release_delayed_weight_grad_aliases()
 
     def forward(
         self,
