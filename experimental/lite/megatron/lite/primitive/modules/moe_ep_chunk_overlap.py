@@ -819,7 +819,7 @@ class _BackwardChunk:
     recv_hidden_dtype: torch.dtype
     recv_probs_shape: torch.Size
     recv_probs_dtype: torch.dtype
-    dispatched: torch.Tensor
+    dispatched: torch.Tensor | None
     probs: torch.Tensor | None
     expert_out: torch.Tensor | None
     dispatcher: TokenDispatcher
@@ -846,7 +846,7 @@ class _ForwardChunkContext:
     recv_hidden_dtype: torch.dtype
     recv_probs_shape: torch.Size
     recv_probs_dtype: torch.dtype
-    dispatched: torch.Tensor
+    dispatched: torch.Tensor | None
     probs: torch.Tensor | None
     expert_out: torch.Tensor | None
     dispatcher: TokenDispatcher
@@ -1693,7 +1693,11 @@ class _EPChunkOperationBase:
                 )
                 if expert_output is None:
                     raise RuntimeError("EP chunk saved expert graph was released")
-                expert_inputs = _expert_grad_inputs(chunk.dispatched, chunk.probs)
+                dispatched = chunk.dispatched
+                probs = chunk.probs
+                if dispatched is None:
+                    raise RuntimeError("EP chunk saved expert input was released")
+                expert_inputs = _expert_grad_inputs(dispatched, probs)
                 expert_grads = torch.autograd.grad(
                     expert_output,
                     expert_inputs,
@@ -1702,12 +1706,21 @@ class _EPChunkOperationBase:
                 )
                 grad_dispatched = expert_grads[0]
                 if grad_dispatched is None:
-                    grad_dispatched = torch.zeros_like(chunk.dispatched)
+                    grad_dispatched = torch.zeros_like(dispatched)
                 grad_probs = None
-                if chunk.probs is not None:
+                if probs is not None:
                     grad_probs = expert_grads[1]
                     if grad_probs is None:
-                        grad_probs = torch.zeros_like(chunk.probs)
+                        grad_probs = torch.zeros_like(probs)
+                saved.dispatched = None
+                saved.probs = None
+                saved.expert_out = None
+                saved.expert_out_edge = None
+                chunk.dispatched = None
+                chunk.probs = None
+                chunk.expert_out = None
+                chunk.expert_out_edge = None
+                del dispatched, probs, expert_inputs, expert_grads, expert_output
                 grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
                     chunk, grad_dispatched, grad_probs
                 )

@@ -589,3 +589,35 @@ def test_saved_context_wrapper_resets_scratch_after_backward_op_returns(
         "ctx.backward_op.workspace.reset_tensors("
     )
     assert "cuda.synchronize" not in source
+
+
+def test_saved_backward_drops_expert_graph_before_allocating_grad_recv(
+    transformer_engine_import_stub,
+):
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+    )
+
+    source = inspect.getsource(_EPChunkOperationBase._saved_context_backward)
+    grad_complete = source.index("expert_grads = torch.autograd.grad(")
+    graph_cleared = source.index("saved.dispatched = None")
+    scratch_allocated = source.index("_dispatch_local_backward(")
+
+    assert grad_complete < graph_cleared < scratch_allocated
+    for assignment in (
+        "saved.dispatched = None",
+        "saved.probs = None",
+        "saved.expert_out = None",
+        "saved.expert_out_edge = None",
+        "chunk.dispatched = None",
+        "chunk.probs = None",
+        "chunk.expert_out = None",
+        "chunk.expert_out_edge = None",
+    ):
+        assert assignment in source
+    assert "saved.scores = None" not in source
+    assert "saved.x = None" not in source
+    assert "cuda.synchronize" not in source

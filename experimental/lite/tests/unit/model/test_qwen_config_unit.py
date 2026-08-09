@@ -595,7 +595,7 @@ def test_qwen3_full_recompute_initial_forward_runs_no_grad_then_fused_backward(
     actual.sum().backward()
 
     torch.testing.assert_close(value.grad, torch.full_like(value, 3))
-    assert calls == {"forward": 1, "backward": 0, "fused": 1, "reset": 1}
+    assert calls == {"forward": 1, "backward": 0, "fused": 1, "reset": 0}
 
 
 def test_qwen3_full_recompute_custom_function_forward_is_framework_no_grad(

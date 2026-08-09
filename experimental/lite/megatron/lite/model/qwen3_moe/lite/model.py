@@ -75,12 +75,6 @@ class _Qwen3EPChunkFullRecomputeFunction(torch.autograd.Function):
         grad_x, router_grads, expert_grads = layer.ep_chunk_fused.forward_backward(
             x_saved, grad_output
         )
-        reset_stream = (
-            torch.cuda.current_stream(grad_output.device)
-            if grad_output.is_cuda
-            else None
-        )
-        layer.ep_chunk_fused.workspace.reset_tensors(stream=reset_stream)
         return grad_x, None, *router_grads, *expert_grads
 
 

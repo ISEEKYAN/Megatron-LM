@@ -236,7 +236,9 @@ def test_backward_scratch_grows_to_observed_shape_but_not_beyond_profile(
     assert workspace.metrics()["fallbacks"] == 0
 
 
-def test_backward_scratch_is_actual_shape_lazy_then_steady_state_stable(
+@pytest.mark.parametrize("op", ["backward", "fused_forward_backward"])
+def test_op_scratch_is_actual_shape_lazy_then_steady_state_stable(
+    op,
     transformer_engine_import_stub,
 ):
     (
@@ -257,7 +259,7 @@ def test_backward_scratch_is_actual_shape_lazy_then_steady_state_stable(
     )
     workspace = registry_type().get_or_create(
         key_type(
-            op="backward",
+            op=op,
             device_type="cpu",
             device_index=None,
             ep_group_id=11,
