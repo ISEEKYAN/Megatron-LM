@@ -11,11 +11,13 @@ Out of scope for this delivery: FP8, HSDP, and CUDA Graph.  CPU optimizer
 offload performance is tracked separately; offload checkpoint correctness
 remains in scope.
 
-## Frozen references and acceptance baseline
+## References and acceptance protocol
 
 - Semantic reference: `NVIDIA/Megatron-LM upstream/dev@43124b60`.
 - Product/performance reference: PR #89 head `15145be3a`.
 - Public-state reference: Lite FSDP2 at this branch.
+- Performance arms: MCore `43124b60`, PR #89 `15145be3a`, Lite FSDP2, and
+  the PR #148 candidate. Dist-opt is informational only.
 - Current repaired-overlap result (`ac4bd8140`, Qwen3.5 8-layer/8-expert,
   DP8, four microbatches, sequence length 1024, offload=0):
   - 20/20 finite updates; loss `12.4322357 -> 12.4297810`;
@@ -25,12 +27,33 @@ remains in scope.
   - `1219.07 ms/step`, `26879.49 tok/s`, `11.578 GB` peak allocated.
 - Same-shape dist-opt archive:
   - `1032.31 ms/step`, `31742.44 tok/s`, `16.936 GB` peak allocated.
-- PR #89's exact archived command and numbers must be recovered before final
-  acceptance.  A differently shaped run is not a substitute.
+- These archived numbers are diagnostic only, not release evidence: they were
+  not produced by the four-arm protocol below.
+- PR #89's exact archived command and raw JSON remain unrecovered. This ledger
+  and the baseline-freeze stage are therefore not complete.
 
-Hard release gates: M-FSDP throughput must be no lower than FSDP2, peak
-allocated memory no higher than FSDP2, and neither metric may regress the
-same-command PR #89 archive.
+The four arms must run in independent fresh processes with one manifest:
+commit, container digest, GPU/node, PyTorch/CUDA/NCCL/TE, model and checkpoint
+hash, batch hashes, optimizer/dtypes, global and micro batch, sequence length,
+recompute, bucket/queue depth, effective overlap, seed, and every parallel
+degree. Each repeat uses five warmup and twenty measured steps; run order is
+paired/randomized and repeated at least five times. Timing samples are
+rank-synchronized and retained as raw JSON.
+
+Hard release gates:
+
+- The lower 95% paired-bootstrap confidence bound of
+  `tok/s(PR148) / tok/s(FSDP2)` is strictly greater than `1.0`.
+- The corresponding PR148/PR89 lower bound is at least `1.0`.
+- Per-backend fresh-process peak allocated bytes are reduced across ranks with
+  MAX; PR148 is strictly below FSDP2 and no higher than PR89.
+- Peak reserved bytes and `mem_get_info` are reported separately and are not
+  described as allocated memory.
+- MCore is measured under the same manifest. Without that arm, only semantic
+  alignment may be claimed, never MCore performance alignment.
+- Precision freezes explicit tensor-level tolerances and compares per-step
+  loss/grad norm plus final parameters, FP32 masters, optimizer state, and the
+  post-resume next step from identical initialization and batch hashes.
 
 ## Full contract status
 
@@ -69,23 +92,23 @@ same-command PR #89 archive.
 - Eval-to-train overlap lifecycle: `equivalent-with-proof`, GPU job 15407429.
 - Public `named_parameters` and `state_dict`: `equivalent-with-proof`; both
   expose persistent optimizer shards and never call `materialize_all`.
-- Model DCP persistent distributed state: `equivalent-with-proof` for the same
-  topology. Each parameter is a DP-group `DTensor` over its authoritative
-  flat shard; group identity and VPP chunk index are part of the key.
-  Cross-topology M-FSDP restore is `unsupported-fail-fast` because changing
-  DP-group membership changes the key/global padded shape.
-- Model-only restore and CPU-master refresh: `equivalent-with-proof`.
+- Model DCP persistent distributed state: `unsupported-fail-fast`. A parameter
+  may occupy only a fragment of a flat bucket shard, so it cannot be truthfully
+  represented as a per-parameter `DTensor` without a custom DCP planner.
+  Rank-local `use_dcp=False` checkpoints remain the supported same-topology path.
+- Model-only DCP restore and CPU-master refresh: `unsupported-fail-fast`;
+  optimizer-inclusive rank-local restore remains supported.
 - Bounded HF export: `equivalent-with-proof`.
 - Forward/backward exception teardown: `equivalent-with-proof`; normal finish,
   abort, export, persistent-state access, and device move share closed
   lifecycle bookkeeping, while exception teardown host-synchronizes issued
   work before releasing leases.
 - Device move: `equivalent-with-proof` for current offload contract.
-- PP/VPP chunk state and checkpoint-key uniqueness: `equivalent-with-proof`;
-  checkpoint keys include PP stage, VPP chunk, canonical parameter name, and
-  data-group identity.
-- Full DP/TP/EP/ETP/PP/VPP/CP topology contract: implementation is
-  `equivalent-with-proof`; the combined GPU evidence gate remains required.
+- PP chunk state and checkpoint-key uniqueness: `equivalent-with-proof`.
+- VPP execution: external `parallel/pp.py` currently fails fast before optimizer
+  construction. M-FSDP must not modify that optimizer-independent primitive;
+  VPP runtime validation is blocked on the generic pipeline feature.
+- Full DP/TP/EP/ETP/PP/CP topology contract: pending combined GPU evidence.
 
 ## Root backward lifecycle
 

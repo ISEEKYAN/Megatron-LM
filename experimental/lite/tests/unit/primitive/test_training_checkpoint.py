@@ -88,9 +88,7 @@ def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
     _assert_state_equal(optimizer.state_dict(), expected)
 
 
-def test_dcp_load_writes_mfsdp_persistent_shards_directly(
-    monkeypatch, tmp_path
-) -> None:
+def test_dcp_rejects_mfsdp_flat_bucket_fragments(monkeypatch, tmp_path) -> None:
     class FakeMFSdpModule(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -105,27 +103,16 @@ def test_dcp_load_writes_mfsdp_persistent_shards_directly(
     model = FakeMFSdpModule()
 
     monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: False)
-    monkeypatch.setattr(dcp, "_build_meshes", lambda _config: (object(), object()))
-
-    def fake_load(state_dict, checkpoint_id) -> None:
-        assert checkpoint_id == str(tmp_path)
-        next(
-            value for key, value in state_dict.items() if key.startswith("model.")
-        ).fill_(3.0)
-
-    monkeypatch.setattr(dcp.dcp, "load", fake_load)
-
-    dcp.load_training_checkpoint(
-        model,
-        optimizer=None,
-        path=str(tmp_path),
-        config=object(),
-        ps=ParallelState(),
-        load_rng=False,
-        load_optimizer=False,
-    )
-
-    torch.testing.assert_close(model.weight, torch.full_like(model.weight, 3.0))
+    with pytest.raises(NotImplementedError, match="flat buckets"):
+        dcp.load_training_checkpoint(
+            model,
+            optimizer=None,
+            path=str(tmp_path),
+            config=object(),
+            ps=ParallelState(),
+            load_rng=False,
+            load_optimizer=False,
+        )
 
 
 class FakeDistOpt:

@@ -962,32 +962,21 @@ def test_mfsdp_state_requires_finished_step_and_then_clears_lifecycle():
     }
 
 
-def test_mfsdp_dcp_multi_chunk_keys_do_not_collide(monkeypatch, tmp_path):
+def test_mfsdp_dcp_multi_chunk_save_fails_fast(monkeypatch, tmp_path):
     first, _first_optimizer = _single_rank_mfsdp_stack()
     second, _second_optimizer = _single_rank_mfsdp_stack()
-    captured = {}
     monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: False)
-    monkeypatch.setattr(dcp, "_build_meshes", lambda _config: (object(), object()))
-    monkeypatch.setattr(
-        dcp.dcp, "save", lambda state_dict, checkpoint_id: captured.update(state_dict)
-    )
-
-    dcp.save_training_checkpoint(
-        [first, second],
-        optimizer=None,
-        step=3,
-        path=str(tmp_path),
-        config=object(),
-        ps=SimpleNamespace(pp_rank=0, pp_size=1),
-        save_rng=False,
-        save_optimizer=False,
-    )
-
-    model_keys = [key for key in captured if key.startswith("model.")]
-    assert model_keys
-    assert len(model_keys) == len(set(model_keys))
-    assert any(".chunk0." in key for key in model_keys)
-    assert any(".chunk1." in key for key in model_keys)
+    with pytest.raises(NotImplementedError, match="flat buckets"):
+        dcp.save_training_checkpoint(
+            [first, second],
+            optimizer=None,
+            step=3,
+            path=str(tmp_path),
+            config=object(),
+            ps=SimpleNamespace(pp_rank=0, pp_size=1),
+            save_rng=False,
+            save_optimizer=False,
+        )
 
 
 def _build_offload_stack(offload_fraction: float):
@@ -1433,9 +1422,8 @@ def test_mfsdp_offload_fraction_checkpoint_round_trips():
     )
 
 
-@pytest.mark.parametrize("load_optimizer", [False, True])
-def test_mfsdp_model_only_dcp_restore_refreshes_cpu_masters_before_next_step(
-    monkeypatch, tmp_path, load_optimizer
+def test_mfsdp_dcp_restore_fails_before_misdescribing_flat_bucket_fragments(
+    monkeypatch, tmp_path
 ):
     _Model, _Unit, ps, engine_cfg = _build_offload_stack(offload_fraction=1.0)
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
@@ -1445,45 +1433,16 @@ def test_mfsdp_model_only_dcp_restore_refreshes_cpu_masters_before_next_step(
         is_expert=lambda _name: False,
         fsdp_unit_modules=(_Unit,),
     )
-    cpu_group = optimizer._inner_optimizer.cpu_group
-    assert cpu_group is not None
-    with torch.no_grad():
-        for cpu_param in cpu_group._cpu_params:
-            # CPU-only tests otherwise alias ``detach().cpu()`` with the shard;
-            # real CUDA offload always owns a distinct host master allocation.
-            cpu_param.data = cpu_param.detach().clone()
-            cpu_param.fill_(-7.0)
-
     monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: False)
-    monkeypatch.setattr(dcp, "_build_meshes", lambda _config: (object(), object()))
-    monkeypatch.setattr(
-        dcp,
-        "_empty_dcp_tensor_like_param",
-        lambda param, _mesh, _placements: torch.empty_like(param),
-    )
-
-    def fake_load(state_dict, checkpoint_id) -> None:
-        assert checkpoint_id == str(tmp_path)
-        for key, value in state_dict.items():
-            if key.startswith("model."):
-                value.fill_(3.0)
-
-    monkeypatch.setattr(dcp.dcp, "load", fake_load)
-    dcp.load_training_checkpoint(
-        chunks[0],
-        optimizer,
-        str(tmp_path),
-        config=object(),
-        ps=SimpleNamespace(pp_rank=0, pp_size=1),
-        load_rng=False,
-        load_optimizer=load_optimizer,
-    )
-
-    assert all(torch.all(param == 3.0) for param in cpu_group._gpu_params)
-    optimizer.zero_grad()
-    success, _grad_norm, _ = optimizer.step()
-    assert success
-    assert all(torch.all(param == 3.0) for param in cpu_group._gpu_params)
+    with pytest.raises(NotImplementedError, match="flat buckets"):
+        dcp.load_training_checkpoint(
+            chunks[0],
+            optimizer,
+            str(tmp_path),
+            config=object(),
+            ps=SimpleNamespace(pp_rank=0, pp_size=1),
+            load_rng=False,
+        )
 
 
 def _single_rank_mfsdp_stack(*, override_optimizer_config=None):

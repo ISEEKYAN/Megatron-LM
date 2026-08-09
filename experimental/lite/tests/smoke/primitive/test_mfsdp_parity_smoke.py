@@ -1800,14 +1800,14 @@ def test_mfsdp_matches_fsdp2_tp_ep_single_step():
 
 
 def _full_parallel_config() -> ParallelConfig:
-    return ParallelConfig(tp=2, ep=2, etp=2, pp=2, vpp=2, cp=2)
+    return ParallelConfig(tp=2, ep=2, etp=2, pp=2, vpp=1, cp=2)
 
 
 def _tiny_qwen3_moe_config():
     from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 
     return Qwen3MoEConfig(
-        num_hidden_layers=4,
+        num_hidden_layers=2,
         hidden_size=256,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -1817,7 +1817,7 @@ def _tiny_qwen3_moe_config():
         num_experts_per_tok=1,
         moe_intermediate_size=64,
         max_position_embeddings=4096,
-        layer_types=["full_attention"] * 4,
+        layer_types=["full_attention", "full_attention"],
     )
 
 
@@ -2008,7 +2008,7 @@ def test_mfsdp_matches_reference_full_parallel_precision_curve(
     monkeypatch, reference_backend
 ):
     if dist.get_world_size() != _FULL_PARALLEL_WORLD_SIZE:
-        pytest.skip("M-FSDP TP2/EP2/ETP1/PP2/CP2 signoff requires exactly 8 ranks.")
+        pytest.skip("M-FSDP TP2/EP2/ETP2/PP2/CP2 signoff requires exactly 8 ranks.")
 
     if int(os.environ.get("SLURM_NNODES", "0")) != 1:
         pytest.fail("M-FSDP full-parallel signoff requires exactly one Slurm node.")
@@ -2065,14 +2065,13 @@ def test_mfsdp_matches_reference_full_parallel_precision_curve(
 
     for handle in (reference_handle, mfsdp_handle):
         ps = handle._parallel_state
-        assert (
-            ps.tp_size,
-            ps.ep_size,
-            ps.etp_size,
-            ps.pp_size,
-            ps.virtual_pipeline_size,
-            ps.cp_size,
-        ) == (2, 2, 2, 2, 2, 2)
+        assert (ps.tp_size, ps.ep_size, ps.etp_size, ps.pp_size, ps.cp_size) == (
+            2,
+            2,
+            2,
+            2,
+            2,
+        )
 
     initial_max_abs = torch.tensor(
         _max_snapshot_abs_diff(reference_initial, mfsdp_initial), device="cuda"
@@ -2154,7 +2153,7 @@ def test_mfsdp_matches_reference_full_parallel_precision_curve(
         ps = reference_handle._parallel_state
         print(
             "[MFSDP_FULL_PARALLEL] "
-            "topology=tp2_ep2_etp2_pp2_vpp2_cp2 "
+            "topology=tp2_ep2_etp2_pp2_cp2 "
             f"world_size={dist.get_world_size()} "
             f"dp_cp_size={ps.dp_cp_size} "
             f"microbatches={_FULL_PARALLEL_MICROBATCHES} "
