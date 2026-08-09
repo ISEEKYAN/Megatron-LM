@@ -15,20 +15,19 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.utils._python_dispatch import TorchDispatchMode
-
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.optimizers.fsdp2 import (
-    build_fsdp2_training_optimizer,
-    fsdp2_available,
-)
-from megatron.lite.primitive.optimizers.mfsdp import build_mfsdp_training_optimizer
+    build_fsdp2_training_optimizer, fsdp2_available)
+from megatron.lite.primitive.optimizers.mfsdp import \
+    build_mfsdp_training_optimizer
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.primitive.recompute import apply_offload
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
-from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
+from megatron.lite.runtime.contracts.config import (OptimizerConfig,
+                                                    ParallelConfig)
 from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
+from torch.utils._python_dispatch import TorchDispatchMode
 
 pytestmark = [
     pytest.mark.mlite,

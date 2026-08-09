@@ -7,19 +7,13 @@ from collections.abc import Callable, Iterable, Iterator
 
 import torch
 import torch.nn as nn
+from megatron.lite.primitive.optimizers.mfsdp.buffer import (
+    AllGatherPipeline, CommunicationPipelines, GradReducePipeline,
+    ParamAndGradBuffer)
+from megatron.lite.primitive.optimizers.mfsdp.config import (
+    MFSDPConfig, MFSDPProcessGroups)
 from torch.autograd.graph import saved_tensors_hooks
 from torch.utils._pytree import tree_map_only
-
-from megatron.lite.primitive.optimizers.mfsdp.buffer import (
-    AllGatherPipeline,
-    CommunicationPipelines,
-    GradReducePipeline,
-    ParamAndGradBuffer,
-)
-from megatron.lite.primitive.optimizers.mfsdp.config import (
-    MFSDPConfig,
-    MFSDPProcessGroups,
-)
 
 
 class _BeginBackward(torch.autograd.Function):

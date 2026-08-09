@@ -24,8 +24,8 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
-
-from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
+from megatron.lite.primitive.optimizers.mfsdp import \
+    optimizer as mfsdp_optimizer
 from megatron.lite.runtime.contracts.config import ParallelConfig
 
 

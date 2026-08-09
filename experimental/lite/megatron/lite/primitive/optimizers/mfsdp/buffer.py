@@ -23,12 +23,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from megatron.lite.primitive.optimizers.mfsdp.config import (
-    MFSDPConfig,
-    MFSDPProcessGroups,
-    MixedPrecisionPolicy,
-    group_rank,
-    group_size,
-)
+    MFSDPConfig, MFSDPProcessGroups, MixedPrecisionPolicy, group_rank,
+    group_size)
 
 
 class NCCLUserBuffer:

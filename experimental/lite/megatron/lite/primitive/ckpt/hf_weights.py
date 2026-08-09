@@ -29,7 +29,8 @@ try:
 except Exception:  # pragma: no cover - older torch without DTensor
     DTensor = None  # type: ignore[assignment]
 
-from megatron.lite.primitive.ckpt.weight_sync_probe import get_weight_sync_probe
+from megatron.lite.primitive.ckpt.weight_sync_probe import \
+    get_weight_sync_probe
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:

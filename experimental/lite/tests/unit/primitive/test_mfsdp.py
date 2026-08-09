@@ -16,8 +16,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from megatron.lite.primitive.optimizers.mfsdp import buffer as mfsdp_buffer
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
-from megatron.lite.primitive.optimizers.mfsdp import cpu_offload as mfsdp_cpu_offload
-from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
+from megatron.lite.primitive.optimizers.mfsdp import \
+    cpu_offload as mfsdp_cpu_offload
+from megatron.lite.primitive.optimizers.mfsdp import \
+    optimizer as mfsdp_optimizer
 from megatron.lite.runtime.contracts.config import ParallelConfig
 
 
