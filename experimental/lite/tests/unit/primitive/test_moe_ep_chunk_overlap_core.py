@@ -1649,7 +1649,6 @@ def test_forward_and_fused_split_expert_activation_from_slot_output_arenas(
     )
 
     forward_acquire = forward_source.index("acquire_expert_activation(")
-    forward_slot = forward_source.index("with lease.allocation_arena.allocate():")
     forward_expert = forward_source.index("expert_out = self.experts(", forward_acquire)
     forward_release = forward_source.index(
         "expert_activation_lease.release(expert_ready)", forward_expert
@@ -1660,20 +1659,19 @@ def test_forward_and_fused_split_expert_activation_from_slot_output_arenas(
     fused_dispatch_finish = fused_source.index(
         "finish_deepep_dispatch_external_with_options("
     )
-    fused_slot = fused_source.index("with workspace_lease.allocation_arena.allocate():")
     fused_expert = fused_source.index("expert_out = self.experts(", fused_acquire)
 
-    assert forward_acquire < forward_slot < forward_expert < forward_release
+    assert forward_acquire < forward_expert < forward_release
     assert "activation_allocation=expert_activation_lease.allocate" in forward_source
     assert (
-        'expert_activation_lease.tensor(\n                            "fc1_input"'
+        'expert_activation_lease.tensor(\n                        "fc1_input"'
         in forward_source
     )
     assert "output_allocation=lambda name, shape:" in forward_source
     assert "wgrad_done" not in forward_source
     assert saved_arena < saved_expert
     assert "activation_allocation=" not in saved_forward_source
-    assert fused_dispatch_finish < fused_acquire < fused_slot < fused_expert
+    assert fused_dispatch_finish < fused_acquire < fused_expert
     assert "activation_allocation=expert_activation_lease.allocate" in fused_source
     assert (
         'expert_activation_lease.tensor(\n                    "fc1_input"'
@@ -1687,6 +1685,36 @@ def test_forward_and_fused_split_expert_activation_from_slot_output_arenas(
     assert "cuda.synchronize" not in forward_source
     assert "cuda.synchronize" not in saved_forward_source
     assert "cuda.synchronize" not in fused_source
+
+
+def test_no_grad_and_fused_expert_compute_do_not_nest_slot_and_activation_arenas(
+    transformer_engine_import_stub,
+):
+    """DeepEP receives use a slot pool; owned expert activations use one other pool."""
+    import inspect
+
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+    )
+
+    forward_source = inspect.getsource(_EPChunkOperationBase._forward_output_async)
+    forward_expert = forward_source[
+        forward_source.index("def run_expert") : forward_source.index(
+            "def submit_combine"
+        )
+    ]
+    fused_source = inspect.getsource(
+        _EPChunkOperationBase._full_recompute_fused_backward_v6
+    )
+    fused_expert = fused_source[
+        fused_source.index("def finish_recompute_expert") : fused_source.index(
+            "def retire_pending_dispatch_bwd"
+        )
+    ]
+
+    assert "allocation_arena.allocate" not in forward_expert
+    assert "allocation_arena.allocate" not in fused_expert
 
 
 def test_experts_split_fc1_and_swiglu_forward_activation_from_fc2_output(

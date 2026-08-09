@@ -26,6 +26,90 @@ class _FakeStream:
         self.waited.append(event)
 
 
+def test_allocation_arena_reenters_one_pool_once_and_restores_depth_after_error(
+    monkeypatch, transformer_engine_import_stub
+):
+    """Nested expert allocation scopes must not nest CUDA MemPool contexts."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    entered = []
+
+    @contextmanager
+    def use_pool(pool, device=None):
+        entered.append((pool, device))
+        yield
+
+    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
+    arena = overlap._EPChunkAllocationArena(
+        allocation_pool=object(), device=torch.device("cuda", 0)
+    )
+
+    with arena.allocate():
+        with arena.allocate():
+            assert arena._allocation_depth == 2
+    assert entered == [(arena.allocation_pool, torch.device("cuda", 0))]
+    assert arena._allocation_depth == 0
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with arena.allocate():
+            with arena.allocate():
+                raise RuntimeError("boom")
+    assert arena._allocation_depth == 0
+    assert entered == [(arena.allocation_pool, torch.device("cuda", 0))] * 2
+
+
+def test_owned_expert_tensor_reenters_its_activation_arena_once(
+    monkeypatch, transformer_engine_import_stub
+):
+    """The real lease tensor path can allocate inside Experts' activation scope."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    entered = []
+
+    @contextmanager
+    def use_device(_device):
+        yield
+
+    @contextmanager
+    def use_pool(pool, device=None):
+        entered.append((pool, device))
+        yield
+
+    monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
+    monkeypatch.setattr(overlap.torch.cuda, "MemPool", lambda **_kwargs: object())
+    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
+    profile = overlap.EPChunkShapeProfile(
+        max_input_rows=8, hidden_size=4, topk=2, ep_size=2
+    )
+    workspace = overlap.EPChunkWorkspaceRegistry().get_or_create(
+        overlap.EPChunkWorkspaceKey(
+            op="forward",
+            device_type="cuda",
+            device_index=0,
+            ep_group_id=1,
+            dtype=torch.bfloat16,
+            shape_profile=profile,
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    workspace.materialize()
+    lease = workspace.acquire_expert_activation(
+        stream=SimpleNamespace(device=torch.device("cuda", 0))
+    )
+    with lease.allocate():
+        tensor = lease.tensor(
+            "fc1_input", (3, 4), dtype=torch.bfloat16, device=torch.device("cpu")
+        )
+
+    assert tuple(tensor.shape) == (3, 4)
+    assert entered == [
+        (workspace._expert_activation_arena.allocation_pool, torch.device("cuda", 0))
+    ]
+    lease.release(_FakeEvent(ready=True))
+
+
 def _symbols(transformer_engine_import_stub):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (

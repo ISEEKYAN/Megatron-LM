@@ -187,6 +187,7 @@ class _EPChunkAllocationArena:
     allocation_pool: Any | None = None
     device: torch.device | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    _allocation_depth: int = field(default=0, init=False, repr=False)
 
     @contextmanager
     def allocate(self):
@@ -195,8 +196,19 @@ class _EPChunkAllocationArena:
             return
         if self.device is None:
             raise RuntimeError("EP chunk allocation arena has no bound device")
+        if self._allocation_depth:
+            self._allocation_depth += 1
+            try:
+                yield
+            finally:
+                self._allocation_depth -= 1
+            return
         with torch.cuda.use_mem_pool(self.allocation_pool, device=self.device):
-            yield
+            self._allocation_depth = 1
+            try:
+                yield
+            finally:
+                self._allocation_depth = 0
 
 
 class _EPChunkExpertActivationLease:
@@ -1278,31 +1290,30 @@ class _EPChunkOperationBase:
                     recv_probs=state.get("recv_probs"),
                 )
                 with _ep_chunk_nvtx("forward.expert", chunk_idx):
-                    with lease.allocation_arena.allocate():
-                        fc1_input = expert_activation_lease.tensor(
-                            "fc1_input",
-                            dispatched.shape,
-                            dtype=dispatched.dtype,
-                            device=dispatched.device,
-                        )
-                        fc1_input.copy_(dispatched)
-                        expert_out = self.experts(
-                            fc1_input,
-                            tpe,
-                            probs,
-                            tokens_per_expert_list=getattr(
-                                dispatcher, "_local_tpe_list", None
+                    fc1_input = expert_activation_lease.tensor(
+                        "fc1_input",
+                        dispatched.shape,
+                        dtype=dispatched.dtype,
+                        device=dispatched.device,
+                    )
+                    fc1_input.copy_(dispatched)
+                    expert_out = self.experts(
+                        fc1_input,
+                        tpe,
+                        probs,
+                        tokens_per_expert_list=getattr(
+                            dispatcher, "_local_tpe_list", None
+                        ),
+                        activation_allocation=expert_activation_lease.allocate,
+                        output_allocation=lambda name, shape: (
+                            expert_activation_lease.tensor(
+                                name,
+                                shape,
+                                dtype=fc1_input.dtype,
+                                device=fc1_input.device,
                             ),
-                            activation_allocation=expert_activation_lease.allocate,
-                            output_allocation=lambda name, shape: (
-                                expert_activation_lease.tensor(
-                                    name,
-                                    shape,
-                                    dtype=fc1_input.dtype,
-                                    device=fc1_input.device,
-                                )
-                            ),
-                        )
+                        ),
+                    )
                 expert_ready = torch.cuda.Event()
                 expert_ready.record(compute_stream)
                 expert_activation_lease.release(expert_ready)
@@ -1737,22 +1748,21 @@ class _EPChunkOperationBase:
                     fc1_input.copy_(dispatched)
                 expert_input = fc1_input.requires_grad_(True)
                 with _ep_chunk_nvtx("backward.expert", chunk_idx):
-                    with workspace_lease.allocation_arena.allocate():
-                        expert_out = self.experts(
-                            expert_input,
-                            local_tpe,
-                            expert_probs,
-                            tokens_per_expert_list=metadata["local_tpe_list"],
-                            activation_allocation=expert_activation_lease.allocate,
-                            output_allocation=lambda name, shape: (
-                                expert_activation_lease.tensor(
-                                    name,
-                                    shape,
-                                    dtype=expert_input.dtype,
-                                    device=expert_input.device,
-                                )
+                    expert_out = self.experts(
+                        expert_input,
+                        local_tpe,
+                        expert_probs,
+                        tokens_per_expert_list=metadata["local_tpe_list"],
+                        activation_allocation=expert_activation_lease.allocate,
+                        output_allocation=lambda name, shape: (
+                            expert_activation_lease.tensor(
+                                name,
+                                shape,
+                                dtype=expert_input.dtype,
+                                device=expert_input.device,
                             ),
-                        )
+                        ),
+                    )
                 _record_state_tensors_current_stream(state)
             return (
                 dispatched,
