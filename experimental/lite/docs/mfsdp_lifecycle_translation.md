@@ -41,20 +41,23 @@ same-command PR #89 archive.
 - Forward owner AG and pure-DP prefetch: `equivalent-with-proof`.
 - AG ProcessGroup Work lifetime: `equivalent-with-proof` after `71e33aef6`.
 - AG overlap under intersecting TP/EP/ETP/CP groups: `divergent`.
-- Double-buffer pool layout: `divergent` (per-layout slots rather than MCore
-  FixedPool/MaxPool).
-- Non-double-buffer AG/RS live-set bound: `divergent`.
-- Root/non-unit preservation and fallback allocation: `divergent`.
+- Double-buffer pool layout: `equivalent-with-proof`; dtype/bucket-offset max
+  slots are shared across unit layouts and pool exhaustion uses MCore's dynamic
+  backup allocation.
+- Non-double-buffer AG/RS live-set bound: `equivalent-with-proof`; the default
+  is bounded by two maximum owner groups, while an explicit override remains
+  available.
+- Root/non-unit dynamic fallback allocation: `equivalent-with-proof`.
 - Unit post-forward reshard: `equivalent-with-proof`.
 - Cross-unit tied/shared parameters: `missing`.
 - Saved-tensor parameter-view restoration: `equivalent-with-proof`.
 - Recompute `PRE_BACKWARD` release: `equivalent-with-proof`.
 - Ordinary and TE GroupedLinear authoritative FP32 gradient destination:
-  `divergent` (ordinary gradients use an extra per-parameter `staged_grad`).
+  `equivalent-with-proof`; both write the parameter-group FP32 bucket directly.
 - TE delayed-wgrad callback: `missing`.
 - Globally stable RS ordering: `equivalent-with-proof`.
-- RS Work completion: `equivalent-with-proof`; normal-path host
-  `event.synchronize()` remains `divergent`.
+- RS Work completion: `equivalent-with-proof`; normal paths install stream
+  dependencies and consume ProcessGroup Work without host event synchronization.
 - Multi-microbatch FP32 shard accumulation: `equivalent-with-proof`.
 - Optimizer step to next AG: `equivalent-with-proof`.
 - Eval-to-train overlap lifecycle: `equivalent-with-proof`, GPU job 15407429.

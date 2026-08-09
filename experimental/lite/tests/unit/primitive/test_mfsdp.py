@@ -1718,6 +1718,43 @@ def test_mfsdp_param_gather_waits_for_process_group_work_after_stream_event(
     assert bucket._full_ready
 
 
+def test_mfsdp_grad_reduce_consumes_work_without_host_event_sync(monkeypatch):
+    model = torch.nn.Linear(4, 3, bias=False, dtype=torch.bfloat16)
+    bucket = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=mfsdp_buffer.MFSDPProcessGroups(
+            dense_dp=None,
+            expert_dp=None,
+            dense_ag=None,
+            expert_ag=None,
+            tp=None,
+            etp=None,
+            ep=None,
+            pp=None,
+        ),
+        config=mfsdp_config.MFSDPConfig(bucket_size=None),
+        is_expert=lambda _name: False,
+        unit_modules=(),
+    ).buckets[0]
+    calls = []
+
+    class Event:
+        def synchronize(self):
+            raise AssertionError("normal reduction completion must not host-synchronize")
+
+    stream = SimpleNamespace(wait_event=lambda event: calls.append(("event", event)))
+    work = SimpleNamespace(wait=lambda: calls.append("work"))
+    event = Event()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: stream)
+    bucket._grad_reduce_launched = True
+    bucket._grad_reduce_event = event
+    bucket._grad_reduce_work = work
+
+    bucket._finalize_launched_grad_reduce()
+
+    assert calls == [("event", event), "work"]
+
+
 def test_mfsdp_full_param_installs_mcore_te_lazy_main_grad_protocol():
     """TE must recognize and materialize the released full-param lazy grad."""
     model = torch.nn.Linear(4, 3, bias=False, dtype=torch.bfloat16)
@@ -1771,7 +1808,7 @@ def test_mfsdp_full_param_installs_mcore_te_lazy_main_grad_protocol():
     assert main_grad.numel() == spec.full_param.numel()
 
 
-def test_mfsdp_sharded_grad_hook_overwrites_each_microbatch_staging_buffer():
+def test_mfsdp_sharded_grad_hook_writes_authoritative_bucket_buffer():
     """Match MCore's data-distributed _grad_acc copy_ semantics."""
     model = torch.nn.Linear(4, 3, bias=False, dtype=torch.bfloat16)
     groups = mfsdp_buffer.MFSDPProcessGroups(
@@ -1799,9 +1836,8 @@ def test_mfsdp_sharded_grad_hook_overwrites_each_microbatch_staging_buffer():
 
     bucket._make_grad_ready_hook(spec)(spec.full_param)
 
-    assert torch.equal(spec.staged_grad, expected)
-    bucket.prepare_grad_reduce(force=True)
     assert torch.equal(spec.full_param.main_grad, expected)
+    assert spec.full_param.grad is None
     assert spec.full_param.grad_added_to_main_grad is False
 
 
@@ -2141,13 +2177,28 @@ def test_mfsdp_grad_reduce_waits_at_launch_using_mcore_element_capacity():
     pipeline.reduce_gradients(second, force=True)
     pipeline.reduce_gradients(third, force=True)
 
-    # MCore measures the already-queued elements immediately before launching
-    # the next reduction.  The queue may therefore exceed the suggestion by
-    # the just-launched bucket; it is trimmed at the following launch.
-    assert pipeline._pending_elements == 32 + 32
+    # The standalone default treats the configured capacity as a hard live-set
+    # bound and retires old work before admitting the incoming bucket.
+    assert pipeline._pending_elements == 32
     assert pipeline._pending_capacity_elements == 32
     assert first.waited is True
-    assert second.waited is False
+    assert second.waited is True
+
+
+def test_mfsdp_default_communication_capacity_is_bounded_by_owner_depth():
+    buckets = [
+        SimpleNamespace(
+            full_numel=numel,
+            config=SimpleNamespace(suggested_communication_unit_size=None),
+        )
+        for numel in (8, 32, 16)
+    ]
+
+    capacity = mfsdp_buffer._resolve_suggested_communication_unit_size(
+        buckets, ((0,), (1,), (2,)), explicit=None
+    )
+
+    assert capacity == 64
 
 
 def test_mfsdp_all_gather_launches_whole_owner_before_wait_and_prefetches_by_budget():
@@ -2304,7 +2355,82 @@ def test_mfsdp_grad_hook_only_stages_and_never_launches_collectives():
     bucket._make_grad_ready_hook(spec)(spec.full_param)
 
     assert bucket._grad_ready_ids == {id(spec)}
-    assert torch.equal(spec.staged_grad, torch.ones_like(spec.full_param))
+    assert torch.equal(spec.full_param.main_grad, torch.ones_like(spec.full_param))
+    assert spec.full_param.grad is None
+
+
+def test_mfsdp_cross_unit_tied_parameter_is_promoted_to_root_and_reduced_once():
+    class Unit(torch.nn.Module):
+        def __init__(self, weight):
+            super().__init__()
+            self.weight = weight
+
+        def forward(self, value):
+            return torch.nn.functional.linear(value, self.weight)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            weight = torch.nn.Parameter(torch.randn(3, 4))
+            self.first = Unit(weight)
+            self.second = Unit(weight)
+
+        def forward(self, value):
+            return self.first(value) + self.second(value)
+
+    model = Model()
+    buffers = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=mfsdp_buffer.MFSDPProcessGroups(
+            dense_dp=None,
+            expert_dp=None,
+            dense_ag=None,
+            expert_ag=None,
+            tp=None,
+            etp=None,
+            ep=None,
+            pp=None,
+        ),
+        config=mfsdp_config.MFSDPConfig(bucket_size=None),
+        is_expert=lambda _name: False,
+        unit_modules=(Unit,),
+    )
+
+    assert len(buffers.buckets) == 1
+    spec = buffers.buckets[0].specs[0]
+    assert buffers.buckets[0].owner_id == id(model)
+    assert buffers.buckets[0].is_fsdp_unit is False
+    assert len(spec.bindings) == 2
+    assert spec.full_param._is_shared is True
+
+
+def test_mfsdp_delayed_wgrad_parameter_installs_completion_callback():
+    model = torch.nn.Linear(4, 3, bias=False)
+    model.weight.skip_backward_post_hook = True
+    buffers = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=mfsdp_buffer.MFSDPProcessGroups(
+            dense_dp=None,
+            expert_dp=None,
+            dense_ag=None,
+            expert_ag=None,
+            tp=None,
+            etp=None,
+            ep=None,
+            pp=None,
+        ),
+        config=mfsdp_config.MFSDPConfig(bucket_size=None),
+        is_expert=lambda _name: False,
+        unit_modules=(),
+    )
+    bucket = buffers.buckets[0]
+    spec = bucket.specs[0]
+    spec.full_param.grad = torch.ones_like(spec.full_param)
+
+    spec.full_param.post_wgrad_grad_acc_hook()
+
+    assert bucket._grad_ready_ids == {id(spec)}
+    assert torch.equal(spec.full_param.main_grad, torch.ones_like(spec.full_param))
 
 
 def test_mfsdp_dense_and_expert_buckets_use_distinct_reduction_groups():

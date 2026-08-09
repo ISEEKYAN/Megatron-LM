@@ -150,7 +150,7 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
 
     def __init__(self, user_buffer: NCCLUserBuffer | None = None) -> None:
         super().__init__(user_buffer)
-        self._spill_allocator = TemporaryBufferAllocator(user_buffer)
+        self._fallback_allocator = TemporaryBufferAllocator(user_buffer)
         self._slots: dict[tuple[Any, ...], list[torch.Tensor | None]] = {}
         self._busy: dict[tuple[Any, ...], set[int]] = {}
         self._reuse_events: dict[tuple[Any, ...], list[Any | None]] = {}
@@ -198,7 +198,7 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
             "gradient reduce before acquiring another slot."
         )
 
-    def allocate_staging_spill(
+    def allocate_fallback(
         self,
         numel: int,
         *,
@@ -207,8 +207,8 @@ class DoubleBufferAllocator(TemporaryBufferAllocator):
         group: dist.ProcessGroup | None,
         key: tuple[Any, ...],
     ) -> BufferLease:
-        """Allocate non-cached staging for a deterministically deferred group."""
-        return self._spill_allocator.allocate(
+        """Use MCore's dynamic backup when no fixed/max-pool slot is idle."""
+        return self._fallback_allocator.allocate(
             numel, dtype=dtype, device=device, group=group, key=key
         )
 
@@ -292,7 +292,6 @@ class ParamSpec:
     param_offset: int = 0
     shard_param: nn.Parameter | None = None
     retain_full_storage_through_backward: bool = False
-    staged_grad: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,7 +334,13 @@ class ParamBucket:
         self.world_size = group_size(process_group)
         self.rank = group_rank(process_group)
         self.config = config
-        self.allocator = allocator
+        # MCore's root/non-unit buckets use dynamic fallback storage rather
+        # than pinning entries in the symmetric two-slot unit pool.
+        self.allocator = (
+            allocator
+            if is_fsdp_unit or not isinstance(allocator, DoubleBufferAllocator)
+            else TemporaryBufferAllocator(allocator.user_buffer)
+        )
         self.allocator_layout_key = allocator_layout_key
         self.owner_id = owner_id
         self.is_expert = is_expert
@@ -442,9 +447,18 @@ class ParamBucket:
                 spec.full_param.__fsdp_param__ = True
                 spec.full_param.overwrite_main_grad = True
                 spec.full_param.get_main_grad = self._make_main_grad_getter(spec)
-                spec.full_param.register_post_accumulate_grad_hook(
-                    self._make_grad_ready_hook(spec)
-                )
+                grad_ready_hook = self._make_grad_ready_hook(spec)
+                if getattr(spec.full_param, "skip_backward_post_hook", False):
+                    # TE delayed-wgrad computes the real gradient after the
+                    # ordinary AccumulateGrad point and invokes this callback.
+                    spec.full_param.register_post_accumulate_grad_hook(
+                        lambda _param: None
+                    )
+                    spec.full_param.post_wgrad_grad_acc_hook = (
+                        lambda param=spec.full_param, hook=grad_ready_hook: hook(param)
+                    )
+                else:
+                    spec.full_param.register_post_accumulate_grad_hook(grad_ready_hook)
 
     def install_sharded_parameters(self) -> None:
         for spec in self.specs:
@@ -515,7 +529,7 @@ class ParamBucket:
                 self.allocator, DoubleBufferAllocator
             ):
                 raise
-            return self.allocator.allocate_staging_spill(self.full_numel, **allocation)
+            return self.allocator.allocate_fallback(self.full_numel, **allocation)
 
     def _make_main_grad_getter(self, spec: ParamSpec) -> Callable[[], torch.Tensor]:
         return lambda: self.get_main_grad(spec)
@@ -537,7 +551,11 @@ class ParamBucket:
                 dtype=self.policy.compute_dtype,
                 device=self.device,
                 group=self.gather_group,
-                key=("param", id(self.gather_group), self.allocator_layout_key),
+                key=(
+                    "param",
+                    id(self.gather_group),
+                    self.allocator_layout_key[2],
+                ),
             )
             self.full_buffer = self._full_lease.tensor
         if self.policy.main_params_dtype != self.policy.compute_dtype:
@@ -550,7 +568,7 @@ class ParamBucket:
                     key=(
                         "param-local",
                         id(self.gather_group),
-                        self.allocator_layout_key,
+                        self.allocator_layout_key[2],
                     ),
                 )
                 self.local_compute_buffer = self._local_compute_lease.tensor
@@ -591,7 +609,7 @@ class ParamBucket:
     def release_full_parameters(self) -> None:
         self.install_sharded_parameters()
         if self._param_gather_event is not None:
-            self._param_gather_event.synchronize()
+            torch.cuda.current_stream(self.device).wait_event(self._param_gather_event)
             self._param_gather_event = None
         if self._param_gather_work is not None:
             self._param_gather_work.wait()
@@ -734,9 +752,6 @@ class ParamBucket:
             self.local_grad_comm_buffer = self._local_grad_comm_lease.tensor
         with torch.no_grad():
             for spec in self.specs:
-                if spec.staged_grad is not None:
-                    spec.full_param.main_grad.copy_(spec.staged_grad)
-                    spec.staged_grad = None
                 grad = spec.full_param.grad
                 if grad is not None and not spec.full_param.grad_added_to_main_grad:
                     spec.full_param.main_grad.add_(grad)
@@ -782,7 +797,7 @@ class ParamBucket:
         if not self._grad_reduce_launched or self._grad_reduce_finished:
             return
         if self._grad_reduce_event is not None:
-            self._grad_reduce_event.synchronize()
+            torch.cuda.current_stream(self.device).wait_event(self._grad_reduce_event)
             self._grad_reduce_event = None
         if self._grad_reduce_work is not None:
             self._grad_reduce_work.wait()
@@ -867,7 +882,6 @@ class ParamBucket:
         for spec in self.specs:
             spec.full_param.grad = None
             spec.full_param.grad_added_to_main_grad = False
-            spec.staged_grad = None
             if spec.shard_param is not None:
                 spec.shard_param.grad = None
         self._release_full_main_grads()
@@ -885,7 +899,6 @@ class ParamBucket:
         self._microbatch_reduced = False
         self._grad_generation = 0
         for spec in self.specs:
-            spec.staged_grad = None
             spec.full_param.grad = None
             spec.full_param.grad_added_to_main_grad = False
 
@@ -920,16 +933,13 @@ class ParamBucket:
         def grad_ready(param: nn.Parameter) -> None:
             if not param.grad_added_to_main_grad:
                 with torch.no_grad():
-                    if param.grad is None:
-                        spec.staged_grad = None
-                    else:
-                        # Keep ready-but-globally-deferred groups out of the
-                        # two-slot communication allocator. The central RS
-                        # authority copies this FP32 staging tensor into its
-                        # bucket only when stable global order can launch it.
-                        spec.staged_grad = param.grad.detach().to(
-                            dtype=self.policy.main_grads_dtype, copy=True
-                        )
+                    if param.grad is not None:
+                        # MCore's data-distributed _grad_acc writes directly
+                        # into the parameter group's authoritative FP32 bucket.
+                        # The persistent local shard accumulates completed
+                        # microbatch reduce-scatters, so this staging view is
+                        # overwritten rather than accumulated here.
+                        self.get_main_grad(spec).copy_(param.grad)
             if param.grad is not None:
                 param.grad = None
             # MCore treats this as a one-backward notification from TE.  It
@@ -990,6 +1000,7 @@ class ParamAndGradBuffer:
         unit_types = _resolve_module_types(unit_modules)
         specs_by_id: dict[int, ParamSpec] = {}
         owner_by_param_id: dict[int, nn.Module] = {}
+        binding_owners_by_param_id: dict[int, set[nn.Module]] = defaultdict(set)
         expert_by_param_id: dict[int, bool] = {}
 
         for name, param in self.module.named_parameters(remove_duplicate=False):
@@ -997,6 +1008,8 @@ class ParamAndGradBuffer:
                 continue
             parent_name, _, attribute = name.rpartition(".")
             parent = module_by_name[parent_name]
+            owner = _parameter_owner(parent_name, parent, module_by_name, unit_types)
+            expert = bool(is_expert(name))
             spec = specs_by_id.get(id(param))
             if spec is None:
                 spec = ParamSpec(
@@ -1007,11 +1020,22 @@ class ParamAndGradBuffer:
                     numel=param.numel(),
                 )
                 specs_by_id[id(param)] = spec
-                owner_by_param_id[id(param)] = _parameter_owner(
-                    parent_name, parent, module_by_name, unit_types
+                owner_by_param_id[id(param)] = owner
+                expert_by_param_id[id(param)] = expert
+            elif expert_by_param_id[id(param)] != expert:
+                raise ValueError(
+                    "A tied M-FSDP parameter cannot mix dense and expert bindings: "
+                    f"{spec.name!r} and {name!r}."
                 )
-                expert_by_param_id[id(param)] = bool(is_expert(name))
             spec.bindings.append(ParamBinding(parent, attribute))
+            binding_owners_by_param_id[id(param)].add(owner)
+
+        for param_id, binding_owners in binding_owners_by_param_id.items():
+            spec = specs_by_id[param_id]
+            is_cross_owner_shared = len(binding_owners) > 1
+            if is_cross_owner_shared or bool(getattr(spec.full_param, "shared", False)):
+                owner_by_param_id[param_id] = self.module
+                spec.full_param._is_shared = True
 
         grouped: dict[tuple[int, bool, torch.dtype, torch.device], list[ParamSpec]] = (
             defaultdict(list)
@@ -1196,18 +1220,19 @@ def _resolve_suggested_communication_unit_size(
         return int(configured)
 
     groups = tuple(tuple(group) for group in (owner_bucket_ids or ()))
-    if groups:
-        total_elements = sum(
+    if not groups:
+        groups = tuple((index,) for index in range(len(buckets)))
+    largest_owner = max(
+        (
             sum(buckets[bucket_id].full_numel for bucket_id in group)
             for group in groups
-        )
-        average_owner_elements = total_elements // len(groups)
-        suggested = average_owner_elements * 2
-    else:
-        suggested = 1_000_000_000
-    # This follows MCore exactly: its default is never smaller than 1B
-    # elements, while an explicitly configured value is accepted as-is.
-    return max(1_000_000_000, suggested)
+        ),
+        default=1,
+    )
+    # Keep at most the current and next largest owner worth of communication
+    # storage. MCore accepts a large global suggestion, but standalone Lite
+    # must retain a model-size-independent live-set bound by default.
+    return max(2 * largest_owner, 1)
 
 
 class AllGatherPipeline:
@@ -1519,7 +1544,7 @@ class GradReducePipeline:
             self._next_group_index += 1
 
     def _reduce_bucket(self, bucket: ParamBucket, *, force: bool = False) -> None:
-        self._wait_for_previous_grad_reduce()
+        self._wait_for_previous_grad_reduce(bucket.full_numel)
         self._prepare_main_grad_allocate(bucket)
         tensors = bucket.prepare_grad_reduce(force=force)
         if tensors is None:
@@ -1564,9 +1589,11 @@ class GradReducePipeline:
                 return
             self._mark_bucket_ready(bucket)
 
-    def _wait_for_previous_grad_reduce(self) -> None:
+    def _wait_for_previous_grad_reduce(self, incoming_elements: int) -> None:
         while (
-            self._pending and self._pending_elements > self._pending_capacity_elements
+            self._pending
+            and self._pending_elements + incoming_elements
+            > self._pending_capacity_elements
         ):
             self._retire_oldest()
 
@@ -1734,7 +1761,7 @@ class CommunicationPipelines:
         self.release_backward_ids(self._owner_bucket_ids.get(owner_id, ()))
         self._training_states[owner_id] = TrainingState.IDLE
 
-    def owner_has_staged_gradients(self, owner_id: int) -> bool:
+    def owner_has_ready_gradients(self, owner_id: int) -> bool:
         return any(
             self.buckets[bucket_id]._grad_ready_ids
             for bucket_id in self._owner_bucket_ids.get(owner_id, ())

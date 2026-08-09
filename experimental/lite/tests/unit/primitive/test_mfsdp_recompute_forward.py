@@ -163,6 +163,29 @@ def test_inference_mode_recompute_forward_releases_retain_bucket():
     _release_cached_buffers(chunk)  # must not raise
 
 
+def test_eval_to_train_multiple_steps_restore_idle_lifecycle():
+    chunk, optimizer = _build_chunk()
+    value = torch.randn(3, 4)
+    target = torch.randn(3, 2)
+
+    chunk.eval()
+    with torch.no_grad():
+        assert torch.isfinite(chunk(value)).all()
+
+    chunk.train()
+    for _ in range(2):
+        optimizer.zero_grad()
+        loss = torch.nn.functional.mse_loss(chunk(value), target)
+        assert torch.isfinite(loss)
+        loss.backward()
+        optimizer.finish_grad_sync()
+        optimizer.step()
+        assert not _any_slot_busy(chunk)
+        assert set(chunk.param_sync._training_states.values()) == {
+            mfsdp_buffer.TrainingState.IDLE
+        }
+
+
 def test_grad_enabled_forward_reshards_before_backward_like_mcore():
     chunk, optimizer = _build_chunk()
     value = torch.randn(3, 4)

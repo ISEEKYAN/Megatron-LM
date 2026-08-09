@@ -133,7 +133,7 @@ class MegatronFSDP(nn.Module):
                 # inputs require grad.  For a graph root with grad-disabled
                 # inputs they may run earlier; leave that owner for the queued
                 # root callback unless at least one parameter hook has staged.
-                if self.param_sync.owner_has_staged_gradients(owner_id):
+                if self.param_sync.owner_has_ready_gradients(owner_id):
                     self.param_sync.process_post_backward(owner_id)
 
             owner.register_forward_pre_hook(prepare_forward)
