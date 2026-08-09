@@ -36,11 +36,14 @@ same-command PR #89 archive.
 
 - Parameter flatten/pad/local shard: `equivalent-with-proof`.
 - Dense/expert process-group selection: `equivalent-with-proof`.
-- Custom gather-group rank-order validation: `missing`.
+- Custom gather-group rank-order validation: `equivalent-with-proof`; startup
+  rejects any AG group whose global-rank order differs from its data group.
 - Initial full-to-persistent-shard transition: `equivalent-with-proof`.
 - Forward owner AG and pure-DP prefetch: `equivalent-with-proof`.
 - AG ProcessGroup Work lifetime: `equivalent-with-proof` after `71e33aef6`.
-- AG overlap under intersecting TP/EP/ETP/CP groups: `divergent`.
+- AG overlap under intersecting TP/EP/ETP/CP groups:
+  `equivalent-with-proof`; multidimensional configurations retain MCore's
+  dedicated-stream overlap and no longer silently force the serial path.
 - Double-buffer pool layout: `equivalent-with-proof`; dtype/bucket-offset max
   slots are shared across unit layouts and pool exhaustion uses MCore's dynamic
   backup allocation.
@@ -79,7 +82,8 @@ same-command PR #89 archive.
 - PP/VPP chunk state and checkpoint-key uniqueness: `equivalent-with-proof`;
   checkpoint keys include PP stage, VPP chunk, canonical parameter name, and
   data-group identity.
-- Full DP/TP/EP/ETP/PP/VPP/CP topology contract: `missing`.
+- Full DP/TP/EP/ETP/PP/VPP/CP topology contract: implementation is
+  `equivalent-with-proof`; the combined GPU evidence gate remains required.
 
 ## Root backward lifecycle
 

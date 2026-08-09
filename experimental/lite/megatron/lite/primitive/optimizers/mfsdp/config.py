@@ -102,7 +102,7 @@ def build_mfsdp_process_groups(ps: Any) -> MFSDPProcessGroups:
     expert_dp = getattr(ps, "ep_dp_group", None) or dense_dp
     dense_ag = getattr(ps, "dp_cp_ag_group", None) or getattr(ps, "dp_ag_group", None)
     expert_ag = getattr(ps, "ep_dp_ag_group", None)
-    return MFSDPProcessGroups(
+    groups = MFSDPProcessGroups(
         dense_dp=dense_dp,
         expert_dp=expert_dp,
         dense_ag=dense_ag or dense_dp,
@@ -112,6 +112,31 @@ def build_mfsdp_process_groups(ps: Any) -> MFSDPProcessGroups:
         ep=getattr(ps, "ep_group", None),
         pp=getattr(ps, "pp_group", None),
     )
+    _validate_gather_group_rank_order(groups.dense_dp, groups.dense_ag, "dense")
+    _validate_gather_group_rank_order(groups.expert_dp, groups.expert_ag, "expert")
+    return groups
+
+
+def _validate_gather_group_rank_order(
+    data_group: dist.ProcessGroup | None,
+    gather_group: dist.ProcessGroup | None,
+    kind: str,
+) -> None:
+    """Require AG output rank order to match the persistent shard layout."""
+    if (
+        data_group is None
+        or gather_group is None
+        or not dist.is_available()
+        or not dist.is_initialized()
+    ):
+        return
+    data_ranks = tuple(dist.get_process_group_ranks(data_group))
+    gather_ranks = tuple(dist.get_process_group_ranks(gather_group))
+    if data_ranks != gather_ranks:
+        raise ValueError(
+            f"M-FSDP {kind} gather-group rank order must match its data group: "
+            f"data={data_ranks}, gather={gather_ranks}."
+        )
 
 
 def group_size(group: dist.ProcessGroup | None) -> int:

@@ -1800,14 +1800,14 @@ def test_mfsdp_matches_fsdp2_tp_ep_single_step():
 
 
 def _full_parallel_config() -> ParallelConfig:
-    return ParallelConfig(tp=2, ep=2, etp=1, pp=2, vpp=1, cp=2)
+    return ParallelConfig(tp=2, ep=2, etp=2, pp=2, vpp=2, cp=2)
 
 
 def _tiny_qwen3_moe_config():
     from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 
     return Qwen3MoEConfig(
-        num_hidden_layers=2,
+        num_hidden_layers=4,
         hidden_size=256,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -1817,7 +1817,7 @@ def _tiny_qwen3_moe_config():
         num_experts_per_tok=1,
         moe_intermediate_size=64,
         max_position_embeddings=4096,
-        layer_types=["full_attention", "full_attention"],
+        layer_types=["full_attention"] * 4,
     )
 
 
@@ -2065,10 +2065,18 @@ def test_mfsdp_matches_reference_full_parallel_precision_curve(
 
     for handle in (reference_handle, mfsdp_handle):
         ps = handle._parallel_state
-        assert (ps.tp_size, ps.ep_size, ps.etp_size, ps.pp_size, ps.cp_size) == (
+        assert (
+            ps.tp_size,
+            ps.ep_size,
+            ps.etp_size,
+            ps.pp_size,
+            ps.virtual_pipeline_size,
+            ps.cp_size,
+        ) == (
             2,
             2,
-            1,
+            2,
+            2,
             2,
             2,
         )
@@ -2153,7 +2161,7 @@ def test_mfsdp_matches_reference_full_parallel_precision_curve(
         ps = reference_handle._parallel_state
         print(
             "[MFSDP_FULL_PARALLEL] "
-            "topology=tp2_ep2_etp1_pp2_cp2 "
+            "topology=tp2_ep2_etp2_pp2_vpp2_cp2 "
             f"world_size={dist.get_world_size()} "
             f"dp_cp_size={ps.dp_cp_size} "
             f"microbatches={_FULL_PARALLEL_MICROBATCHES} "

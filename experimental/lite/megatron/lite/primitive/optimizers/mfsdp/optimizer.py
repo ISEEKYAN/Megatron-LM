@@ -374,7 +374,6 @@ def build_mfsdp_stack(
     config = build_mfsdp_config(opt)
     if offload_fraction == 1.0:
         config = replace(config, full_optimizer_offload=True)
-    config = _order_param_gathers_for_parallel_collectives(config, ps)
     groups = build_mfsdp_process_groups(ps)
 
     wrapped_chunks = []
@@ -457,40 +456,6 @@ def build_mfsdp_stack(
     )
     optimizer = MFSdpOptimizer(standalone_optimizer, wrapped_chunks)
     return wrapped_chunks, optimizer
-
-
-def _order_param_gathers_for_parallel_collectives(
-    config: MFSDPConfig, ps: Any
-) -> MFSDPConfig:
-    """Avoid unordered async collectives across intersecting process groups.
-
-    The standalone overlap pipeline has no dependency handshake with model-side
-    TP/CP/EP/ETP collectives.  When parameter shards and model-parallel groups
-    both span ranks, prefetching the next bucket can enqueue collectives on
-    intersecting process groups in different orders.  Keep overlap for pure
-    data parallelism, but make multidimensional compositions use ordered bucket
-    gathers until that cross-group handshake exists.
-    """
-    if not config.overlap_param_gather:
-        return config
-
-    model_parallel_size = math.prod(
-        max(int(getattr(ps, name, 1) or 1), 1)
-        for name in ("tp_size", "cp_size", "ep_size", "etp_size")
-    )
-    sharded_group_size = max(
-        int(getattr(ps, "dp_cp_size", 1) or 1),
-        int(getattr(ps, "expert_dp_size", 1) or 1),
-    )
-    if model_parallel_size == 1 or sharded_group_size == 1:
-        return config
-
-    if not dist.is_initialized() or dist.get_rank() == 0:
-        logger.warning(
-            "Disabling M-FSDP parameter-gather overlap because parameter shards "
-            "and model-parallel collectives span intersecting process groups."
-        )
-    return replace(config, overlap_param_gather=False)
 
 
 def _mark_mfsdp_parallel_attrs(

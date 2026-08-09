@@ -2577,6 +2577,33 @@ def test_mfsdp_dense_and_expert_buckets_use_distinct_reduction_groups():
     assert all(buffers.buckets[index].process_group is not None for index in expert_ids)
 
 
+def test_mfsdp_custom_gather_group_requires_identical_rank_order(monkeypatch):
+    dense_dp = object()
+    dense_ag = object()
+    rank_orders = {id(dense_dp): [0, 2], id(dense_ag): [2, 0]}
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        dist,
+        "get_process_group_ranks",
+        lambda group: rank_orders[id(group)],
+    )
+    ps = SimpleNamespace(
+        dp_cp_group=dense_dp,
+        dp_group=None,
+        dp_cp_ag_group=dense_ag,
+        dp_ag_group=None,
+        ep_dp_group=dense_dp,
+        ep_dp_ag_group=dense_ag,
+        tp_group=None,
+        etp_group=None,
+        ep_group=None,
+        pp_group=None,
+    )
+
+    with pytest.raises(ValueError, match="rank order"):
+        mfsdp_config.build_mfsdp_process_groups(ps)
+
+
 def test_mfsdp_unit_post_backward_defers_later_groups_until_order_is_stable():
     model = _TwoOwnerModel()
     buffers = mfsdp_buffer.ParamAndGradBuffer(
