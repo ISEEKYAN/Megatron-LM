@@ -16,14 +16,15 @@ import torch
 import torch.nn as nn
 from megatron.lite.primitive.ckpt import hf_weights
 from megatron.lite.primitive.ckpt.hf_weights import export_hf_lora_bank_adapter
-from megatron.lite.primitive.modules.lora import LoraSpec, resolve_lora_alpha
+from megatron.lite.primitive.modules import multi_lora_kernel
 from megatron.lite.primitive.modules.lora import (
-    _all_reduce_sum,
+    LoraSpec,
     _all_gather_last_dim,
+    _all_reduce_sum,
     _gather_sequence_parallel,
     _scatter_sequence_parallel,
+    resolve_lora_alpha,
 )
-from megatron.lite.primitive.modules import multi_lora_kernel
 from megatron.lite.primitive.modules.multi_lora import BatchedLoraDelta
 
 
@@ -98,7 +99,7 @@ def apply_batched_lora_delta(
         width = bank.b_bank.shape[1] * (
             partition.tp_size if partition.output_partitioned_b else 1
         )
-        return rows.new_zeros((*x.shape[:-1], width))
+        return rows.new_zeros((rows.shape[0], width)).reshape(-1, *x.shape[1:-1], width)
     if not partition.rank_partitioned_a and not partition.output_partitioned_b:
         if slots.numel() < 2 or bool(torch.all(slots[1:] >= slots[:-1])):
             delta = bank.delta(rows, slots, scale=scale)
@@ -138,7 +139,9 @@ def apply_batched_lora_delta(
         delta = delta.index_select(0, restore)
     if sequence_parallel_scatter_output:
         delta = _scatter_sequence_parallel(delta, tp_group, tp_rank)
-    return delta.reshape(*x.shape[:-1], delta.shape[-1])
+    # SP collectives may change the number of token rows.  The output layout
+    # must follow the post-collective delta, not the caller's pre-gather input.
+    return delta.reshape(-1, *x.shape[1:-1], delta.shape[-1])
 
 
 @dataclass(frozen=True)
@@ -156,7 +159,7 @@ class MultiLoraSpec:
 
 
 def normalize_multi_lora_spec(
-    config: MultiLoraSpec | Mapping[str, Any] | None,
+    config: MultiLoraSpec | Mapping[str, Any] | None
 ) -> MultiLoraSpec:
     """Normalize runtime config without allowing an unowned registry injection."""
     if config is None:
@@ -398,6 +401,11 @@ class NamedLoraBankRegistry:
                     "multi-LoRA bank TP metadata does not match export parallel state."
                 )
             a, b = selected[surface]
+            # DTensor must become its local tensor before the LoRA-internal
+            # gather.  The normal exporter then performs only the base-weight
+            # gather for this same surface.
+            a = hf_weights._materialize_dtensor(a)
+            b = hf_weights._materialize_dtensor(b)
             if ps.tp_size > 1 and bank.partition.rank_partitioned_a:
                 a = hf_weights.allgather_concat(a, ps.tp_size, ps.tp_group, dim=0)
             if ps.tp_size > 1 and bank.partition.output_partitioned_b:

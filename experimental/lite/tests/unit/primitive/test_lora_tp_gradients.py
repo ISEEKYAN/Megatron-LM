@@ -9,8 +9,19 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from megatron.lite.primitive.modules.lora import LinearLoRA, SharedGroupedLinearLoRA
+from megatron.lite.primitive.modules import multi_lora_kernel
+from megatron.lite.primitive.modules.lora import (
+    LinearLoRA,
+    SharedGroupedLinearLoRA,
+    _all_gather_last_dim,
+    _gather_sequence_parallel,
+)
 from megatron.lite.primitive.modules.lora_apply import LoRAWrappedLinear
+from megatron.lite.primitive.modules.multi_lora_bank import (
+    DenseLoraBank,
+    LoraBankPartition,
+    apply_batched_lora_delta,
+)
 
 pytestmark = [pytest.mark.mlite, pytest.mark.distributed]
 
@@ -317,5 +328,189 @@ def test_qkv_tp2_sp_uses_base_normalized_input_and_matches_merged_export(tmp_pat
         assert result["merged_forward"] < 1e-12
         assert result["materialized_delta"] < 1e-12
 
+    if init_file.exists():
+        os.unlink(init_file)
+
+
+def _multi_lora_qkv_tp_worker(
+    rank: int, world_size: int, init_file: str, queue
+) -> None:
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        torch.manual_seed(20260809)
+        tokens, hidden, out_features, lora_rank = 4, 4, 6, 4
+        slots = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+        x_full = torch.randn(tokens, hidden, dtype=torch.float32)
+        a_full = torch.randn(2, lora_rank, hidden, dtype=torch.float32)
+        b_full = torch.randn(2, out_features, lora_rank, dtype=torch.float32)
+        grad_full = torch.randn(tokens, out_features, dtype=torch.float32)
+
+        x_ref = x_full.clone().requires_grad_(True)
+        a_ref = a_full.clone().requires_grad_(True)
+        b_ref = b_full.clone().requires_grad_(True)
+        # The production carrier retains the established BGMV FP32 A-stage
+        # scratch before the rank gather, including when its inputs are FP64
+        # in this CPU oracle.
+        y_ref = apply_batched_lora_delta(
+            DenseLoraBank(a_ref, b_ref), x_ref, slots, scale=1.0
+        )
+        (y_ref * grad_full).sum().backward()
+
+        local_rank = lora_rank // world_size
+        local_out = out_features // world_size
+        token_slice = slice(
+            rank * (tokens // world_size), (rank + 1) * (tokens // world_size)
+        )
+        rank_slice = slice(rank * local_rank, (rank + 1) * local_rank)
+        out_slice = slice(rank * local_out, (rank + 1) * local_out)
+        a_local = a_full[:, rank_slice].clone().requires_grad_(True)
+        b_local = b_full[:, out_slice].clone().requires_grad_(True)
+        x_local = x_full[token_slice].clone().requires_grad_(True)
+        bank = DenseLoraBank(
+            a_local,
+            b_local,
+            LoraBankPartition(tp_size=world_size, rank_partitioned_a=True),
+        )
+        actual = apply_batched_lora_delta(
+            bank,
+            x_local,
+            slots[token_slice],
+            scale=1.0,
+            tp_group=dist.group.WORLD,
+            sequence_parallel_input=True,
+        )
+        (actual * grad_full[:, out_slice]).sum().backward()
+        queue.put(
+            {
+                "rank": rank,
+                "forward": (actual - y_ref[:, out_slice]).abs().max().item(),
+                "x_grad": (x_local.grad - x_ref.grad[token_slice]).abs().max().item(),
+                "a_grad": (a_local.grad - a_ref.grad[:, rank_slice]).abs().max().item(),
+                "b_grad": (b_local.grad - b_ref.grad[:, out_slice]).abs().max().item(),
+            }
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _multi_lora_qkv_tp_backward_probe_worker(
+    rank: int, world_size: int, init_file: str, queue
+) -> None:
+    """Isolate the hidden all-gather backward before changing production."""
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        torch.manual_seed(20260810)
+        slots = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+        x_full = torch.randn(4, 4)
+        a_full = torch.randn(2, 4, 4)
+        b_full = torch.randn(2, 6, 4)
+        grad_full = torch.randn(4, 6)
+        token_slice = slice(rank * 2, (rank + 1) * 2)
+        rank_slice = slice(rank * 2, (rank + 1) * 2)
+        out_slice = slice(rank * 3, (rank + 1) * 3)
+        rows = _gather_sequence_parallel(
+            x_full[token_slice].clone().requires_grad_(), dist.group.WORLD
+        )
+        hidden = multi_lora_kernel.batched_lora_linear_stage(
+            rows,
+            a_full[:, rank_slice].clone().requires_grad_(),
+            slots,
+            output_dtype=torch.float32,
+            max_g_size_hint=4,
+        )
+        hidden.retain_grad()
+        hidden_full = _all_gather_last_dim(
+            hidden, dist.group.WORLD, reduce_backward=True
+        )
+        out = multi_lora_kernel.batched_lora_linear_stage(
+            hidden_full,
+            b_full[:, out_slice].clone().requires_grad_(),
+            slots,
+            max_g_size_hint=4,
+        )
+        (out * grad_full[:, out_slice]).sum().backward()
+        expected = torch.stack(
+            [b_full[slot].t() @ grad for slot, grad in zip(slots, grad_full)]
+        )[:, rank_slice]
+        queue.put({"rank": rank, "hidden": (hidden.grad - expected).abs().max().item()})
+    finally:
+        dist.destroy_process_group()
+
+
+def test_multi_lora_qkv_tp2_probe_hidden_gather_backward(tmp_path):
+    world_size = 2
+    init_file = tmp_path / "multi-lora-qkv-tp-probe-init"
+    queue = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(
+        _multi_lora_qkv_tp_backward_probe_worker,
+        args=(world_size, str(init_file), queue),
+        nprocs=world_size,
+        join=True,
+    )
+    results = sorted(
+        (queue.get() for _ in range(world_size)), key=lambda item: item["rank"]
+    )
+    assert [item["hidden"] for item in results] == pytest.approx([0.0, 0.0], abs=1e-6)
+    if init_file.exists():
+        os.unlink(init_file)
+
+
+def _all_gather_last_dim_no_reduce_worker(rank, world_size, init_file, queue):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        local = (
+            torch.arange(4, dtype=torch.float32)
+            .reshape(2, 2)
+            .add_(rank * 10)
+            .requires_grad_()
+        )
+        gathered = _all_gather_last_dim(local, dist.group.WORLD, reduce_backward=False)
+        grad = torch.arange(gathered.numel(), dtype=torch.float32).reshape_as(gathered)
+        (gathered * grad).sum().backward()
+        expected = grad[:, rank * 2 : (rank + 1) * 2]
+        queue.put((rank, (local.grad - expected).abs().max().item()))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_all_gather_last_dim_tp2_without_reduce_backward_returns_local_chunk(tmp_path):
+    init_file = tmp_path / "all-gather-last-dim-no-reduce-init"
+    queue = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(
+        _all_gather_last_dim_no_reduce_worker,
+        args=(2, str(init_file), queue),
+        nprocs=2,
+        join=True,
+    )
+    assert [
+        error for _, error in sorted(queue.get() for _ in range(2))
+    ] == pytest.approx([0.0, 0.0])
+    if init_file.exists():
+        os.unlink(init_file)
+
+
+def test_multi_lora_qkv_tp2_sp_matches_tp1_forward_and_gradients(tmp_path):
+    """The bank carrier must retain the single-LoRA QKV TP/SP contract."""
+    world_size = 2
+    init_file = tmp_path / "multi-lora-qkv-tp-init"
+    queue = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(
+        _multi_lora_qkv_tp_worker,
+        args=(world_size, str(init_file), queue),
+        nprocs=world_size,
+        join=True,
+    )
+    results = sorted(
+        (queue.get() for _ in range(world_size)), key=lambda result: result["rank"]
+    )
+    for result in results:
+        for key in ("forward", "x_grad", "a_grad", "b_grad"):
+            assert result[key] < 1e-6, results
     if init_file.exists():
         os.unlink(init_file)

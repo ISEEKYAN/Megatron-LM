@@ -280,6 +280,8 @@ def _build_multi_lora_training_state(
                 ),
             )
             attn = layer.attn
+            # TP1 test doubles and the TP1 base module need no distributed
+            # attribute; real TP modules provide their authoritative size.
             tp_size = int(getattr(attn.qkv, "tp_size", 1))
             if spec.rank % tp_size:
                 raise ValueError("multi-LoRA rank must be divisible by TP size.")
@@ -341,6 +343,15 @@ def _build_multi_lora_training_state(
             nn.init.zeros_(qkv.b_bank)
             nn.init.kaiming_uniform_(proj.a_bank, a=5**0.5)
             nn.init.zeros_(proj.b_bank)
+            for bank, tensor_model_parallel in (
+                (fc1, False),
+                (fc2, False),
+                (qkv, True),
+                (proj, True),
+            ):
+                for parameter in (bank.a_bank, bank.b_bank):
+                    parameter.tensor_model_parallel = tensor_model_parallel
+                    parameter.allreduce = not tensor_model_parallel
             fc1_surface = f"layers.{layer_idx}.moe.experts._fc1_weight_0"
             fc2_surface = f"layers.{layer_idx}.moe.experts._fc2_weight_0"
             qkv_surface = f"layers.{layer_idx}.attn.qkv.linear.weight"
@@ -362,10 +373,7 @@ def _build_multi_lora_training_state(
         alpha=spec.alpha,
         base_model_identity={},
         lora_spec=LoraSpec(
-            enabled=True,
-            rank=spec.rank,
-            alpha=spec.alpha,
-            use_rslora=spec.use_rslora,
+            enabled=True, rank=spec.rank, alpha=spec.alpha, use_rslora=spec.use_rslora
         ),
     )
     state = MultiLoraTrainingState(registry, layer_surfaces, attention_surfaces)
