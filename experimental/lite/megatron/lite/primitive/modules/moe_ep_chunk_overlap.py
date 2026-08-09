@@ -184,6 +184,7 @@ class _WorkspaceSlot:
 class _EPChunkAllocationArena:
     allocation_pool: Any | None = None
     device: torch.device | None = None
+    tensors: dict[str, torch.Tensor] = field(default_factory=dict)
 
     @contextmanager
     def allocate(self):
@@ -209,6 +210,28 @@ class _EPChunkExpertActivationLease:
             )
         with self.workspace._expert_activation_arena.allocate():
             yield
+
+    def tensor(
+        self,
+        name: str,
+        shape: tuple[int, ...] | torch.Size,
+        *,
+        dtype: torch.dtype,
+        device: torch.device | str,
+    ) -> torch.Tensor:
+        """Return this lease's stable activation storage.
+
+        The lease must remain live through every delayed TE consumer.  In
+        particular, FC1's saved input is reused only after the caller records
+        the wgrad completion event in ``release``.
+        """
+        if not self._active:
+            raise RuntimeError(
+                "EP chunk expert activation lease has already been released"
+            )
+        return self.workspace._expert_activation_tensor(
+            name, shape, dtype=dtype, device=device
+        )
 
     def release(self, consumer_event: Any) -> None:
         if not self._active:
@@ -487,6 +510,7 @@ class EPChunkWorkspace:
             arena.device = None
         self._expert_activation_arena.allocation_pool = None
         self._expert_activation_arena.device = None
+        self._expert_activation_arena.tensors.clear()
         self._allocations = 0
         self._runtime_allocations = 0
         self._grows = 0
@@ -576,6 +600,46 @@ class EPChunkWorkspace:
         )
         slices = tuple(slice(0, dim) for dim in requested)
         return tensor[slices].view(requested).detach()
+
+    def _expert_activation_tensor(
+        self,
+        name: str,
+        shape: tuple[int, ...] | torch.Size,
+        *,
+        dtype: torch.dtype,
+        device: torch.device | str,
+    ) -> torch.Tensor:
+        """Reserve caller-owned expert activation storage at profile capacity."""
+        requested = tuple(int(dim) for dim in shape)
+        profile = self.key.shape_profile
+        contracts = {
+            "fc1_input": ((profile.max_expert_rows, profile.hidden_size), self.key.dtype),
+        }
+        capacity, expected_dtype = contracts.get(name, (requested, dtype))
+        if (
+            len(requested) != len(capacity)
+            or any(want > have for want, have in zip(requested, capacity, strict=True))
+            or requested[1:] != capacity[1:]
+            or dtype != expected_dtype
+        ):
+            raise RuntimeError(
+                f"EP chunk expert activation {name!r} shape {requested} dtype {dtype} "
+                f"exceeds fixed profile capacity {capacity} dtype {expected_dtype}"
+            )
+        arena = self._expert_activation_arena
+        existing = arena.tensors.get(name)
+        if existing is None:
+            with arena.allocate():
+                existing = torch.empty(capacity, dtype=dtype, device=device)
+            arena.tensors[name] = existing
+            self._allocations += 1
+            self._runtime_allocations += 1
+        if existing.dtype != dtype or existing.device != torch.device(device):
+            raise RuntimeError(
+                f"EP chunk expert activation {name!r} does not match its fixed storage"
+            )
+        slices = tuple(slice(0, dim) for dim in requested)
+        return existing[slices].view(requested).detach()
 
     def _validate_runtime_tensor(
         self, name: str, shape: tuple[int, ...], dtype: torch.dtype
@@ -676,6 +740,15 @@ class EPChunkWorkspace:
                     "dtype": str(tensor.dtype),
                     "nbytes": tensor.numel() * tensor.element_size(),
                 }
+        expert_activation_tensors = {
+            name: {
+                "data_ptr": tensor.data_ptr(),
+                "shape": tuple(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "nbytes": tensor.numel() * tensor.element_size(),
+            }
+            for name, tensor in self._expert_activation_arena.tensors.items()
+        }
         return {
             **self.metrics(),
             "data_ptrs": data_ptrs,
@@ -706,6 +779,7 @@ class EPChunkWorkspace:
             "expert_activation_event_guarded": (
                 self._expert_activation_consumer_event is not None
             ),
+            "expert_activation_tensors": expert_activation_tensors,
             "active_lease_count": sum(slot.in_use for slot in self._slots),
             "consumer_event_guard_count": sum(
                 slot.consumer_event is not None for slot in self._slots
@@ -1173,8 +1247,15 @@ class _EPChunkOperationBase:
                 )
                 with _ep_chunk_nvtx("forward.expert", chunk_idx):
                     with lease.allocation_arena.allocate():
+                        fc1_input = expert_activation_lease.tensor(
+                            "fc1_input",
+                            dispatched.shape,
+                            dtype=dispatched.dtype,
+                            device=dispatched.device,
+                        )
+                        fc1_input.copy_(dispatched)
                         expert_out = self.experts(
-                            dispatched,
+                            fc1_input,
                             tpe,
                             probs,
                             tokens_per_expert_list=getattr(
@@ -1586,13 +1667,21 @@ class _EPChunkOperationBase:
                 _validate_finished_deepep_dispatch(
                     self.workspace.key.shape_profile, state, dispatched
                 )
-                expert_input = dispatched.detach().requires_grad_(True)
                 expert_probs = (
                     None if probs is None else probs.detach().requires_grad_(True)
                 )
                 expert_activation_lease = self.workspace.acquire_expert_activation(
                     stream=compute_stream
                 )
+                fc1_input = expert_activation_lease.tensor(
+                    "fc1_input",
+                    dispatched.shape,
+                    dtype=dispatched.dtype,
+                    device=dispatched.device,
+                )
+                with torch.no_grad():
+                    fc1_input.copy_(dispatched)
+                expert_input = fc1_input.requires_grad_(True)
                 with _ep_chunk_nvtx("backward.expert", chunk_idx):
                     with workspace_lease.allocation_arena.allocate():
                         expert_out = self.experts(

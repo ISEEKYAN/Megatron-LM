@@ -1485,12 +1485,15 @@ def test_forward_and_fused_split_expert_activation_from_slot_output_arenas(
 
     assert forward_acquire < forward_slot < forward_expert < forward_release
     assert "activation_allocation=expert_activation_lease.allocate" in forward_source
+    assert 'expert_activation_lease.tensor(\n                            "fc1_input"' in forward_source
     assert "output_allocation=" not in forward_source
     assert "wgrad_done" not in forward_source
     assert saved_arena < saved_expert
     assert "activation_allocation=" not in saved_forward_source
     assert fused_dispatch_finish < fused_acquire < fused_slot < fused_expert
     assert "activation_allocation=expert_activation_lease.allocate" in fused_source
+    assert 'expert_activation_lease.tensor(\n                    "fc1_input"' in fused_source
+    assert "expert_input = fc1_input.requires_grad_(True)" in fused_source
     assert "output_allocation=" not in fused_source
     no_grad_finish = forward_source.index("finish_deepep_combine(state)")
     no_grad_release = forward_source.index("lease.release(consumed)", no_grad_finish)

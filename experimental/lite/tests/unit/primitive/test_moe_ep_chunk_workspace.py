@@ -898,6 +898,57 @@ def test_expert_activation_arena_waits_only_for_its_consumer_event(
     second.release(_FakeEvent(ready=True))
 
 
+def test_expert_activation_lease_owns_one_fixed_fc1_input_buffer(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="fused_forward_backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=43,
+            dtype=torch.float32,
+            shape_profile=profile_type(
+                max_input_rows=8,
+                hidden_size=4,
+                topk=2,
+                ep_size=2,
+            ),
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    stream = _FakeStream()
+    first = workspace.acquire_expert_activation(stream=stream)
+    first_tensor = first.tensor(
+        "fc1_input", (5, 4), dtype=torch.float32, device="cpu"
+    )
+    first_ptr = first_tensor.data_ptr()
+    pending = _FakeEvent(ready=False)
+    first.release(pending)
+
+    second = workspace.acquire_expert_activation(stream=stream)
+    second_tensor = second.tensor(
+        "fc1_input", (3, 4), dtype=torch.float32, device="cpu"
+    )
+
+    assert stream.waited == [pending]
+    assert second_tensor.data_ptr() == first_ptr
+    evidence = workspace.evidence()["expert_activation_tensors"]["fc1_input"]
+    assert evidence["shape"] == (16, 4)
+    assert evidence["data_ptr"] == first_ptr
+    second.release(_FakeEvent(ready=True))
+
+
 def test_unbound_workspace_binds_to_first_runtime_stream_device(
     monkeypatch, transformer_engine_import_stub
 ):
@@ -1019,6 +1070,7 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
         "allocation_pool_ids": {},
         "expert_activation_pool_count": 0,
         "expert_activation_pool_id": None,
+        "expert_activation_tensors": {},
         "expert_activation_waits": 0,
         "expert_activation_in_use": False,
         "expert_activation_event_guarded": False,
