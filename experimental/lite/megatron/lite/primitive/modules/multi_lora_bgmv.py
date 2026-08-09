@@ -145,7 +145,10 @@ if _TRITON_AVAILABLE:
                 b_base + offsets_r[:, None] + offsets_n[None, :] * RANK,
                 mask=mask_n[None, :],
             )
-            delta = tl.dot(hidden.to(b.dtype), b) * scale
+            # Match the two-stage kernels exactly.  The default permits lower
+            # precision FP32 dot modes on SM90, which makes the fused rank-32
+            # path numerically diverge from its independent oracle.
+            delta = tl.dot(hidden.to(b.dtype), b, input_precision="ieee") * scale
             tl.store(
                 delta_ptr + rows[:, None] * N + offsets_n[None, :],
                 delta.to(delta_ptr.dtype.element_ty),
