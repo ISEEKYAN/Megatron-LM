@@ -266,7 +266,7 @@ def test_tp_attention_builder_uses_linear_lora_partition_shapes(monkeypatch):
     for bank in (qkv, proj):
         for parameter in (bank.a_bank, bank.b_bank):
             assert parameter.tensor_model_parallel is True
-            assert parameter.allreduce is False
+            assert parameter.allreduce is True
     for bank in (fc1, fc2):
         for parameter in (bank.a_bank, bank.b_bank):
             assert parameter.tensor_model_parallel is False
@@ -1287,6 +1287,10 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
     assert qkv.b_bank.shape == (2, 8, 24)
     assert proj.a_bank.shape == (2, 24, 4)
     assert proj.b_bank.shape == (2, 4, 24)
+    for bank in (fc1, fc2, qkv, proj):
+        for parameter in (bank.a_bank, bank.b_bank):
+            assert parameter.tensor_model_parallel is False
+            assert parameter.allreduce is True
     assert set(state.registry.banks) == {
         "layers.0.moe.experts._fc1_weight_0",
         "layers.0.moe.experts._fc2_weight_0",

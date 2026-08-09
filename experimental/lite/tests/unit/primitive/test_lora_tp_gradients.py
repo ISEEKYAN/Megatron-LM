@@ -514,3 +514,73 @@ def test_multi_lora_qkv_tp2_sp_matches_tp1_forward_and_gradients(tmp_path):
             assert result[key] < 1e-6, results
     if init_file.exists():
         os.unlink(init_file)
+
+
+def _multi_lora_proj_tp_worker(rank, world_size, init_file, queue):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        torch.manual_seed(20260811)
+        tokens, hidden, local_in, lora_rank = 4, 4, 2, 4
+        slots = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+        x_full = torch.randn(tokens, hidden)
+        a_full = torch.randn(2, lora_rank, hidden)
+        b_full = torch.randn(2, hidden, lora_rank)
+        grad_full = torch.randn(tokens, hidden)
+        x_ref, a_ref, b_ref = (
+            value.clone().requires_grad_() for value in (x_full, a_full, b_full)
+        )
+        y_ref = apply_batched_lora_delta(
+            DenseLoraBank(a_ref, b_ref), x_ref, slots, scale=1.0
+        )
+        (y_ref * grad_full).sum().backward()
+        token_slice, input_slice, output_slice = (
+            slice(rank * 2, (rank + 1) * 2),
+            slice(rank * local_in, (rank + 1) * local_in),
+            slice(rank * local_in, (rank + 1) * local_in),
+        )
+        x_local = x_full[:, input_slice].clone().requires_grad_()
+        a_local = a_full[:, :, input_slice].clone().requires_grad_()
+        b_local = b_full[:, output_slice].clone().requires_grad_()
+        bank = DenseLoraBank(
+            a_local, b_local, LoraBankPartition(tp_size=2, output_partitioned_b=True)
+        )
+        actual = apply_batched_lora_delta(
+            bank,
+            x_local,
+            slots,
+            scale=1.0,
+            tp_group=dist.group.WORLD,
+            tp_rank=rank,
+            input_parallel_reduce=True,
+            sequence_parallel_scatter_output=True,
+        )
+        (actual * grad_full[token_slice]).sum().backward()
+        queue.put(
+            {
+                "rank": rank,
+                "forward": (actual - y_ref[token_slice]).abs().max().item(),
+                "x": (x_local.grad - x_ref.grad[:, input_slice]).abs().max().item(),
+                "a": (a_local.grad - a_ref.grad[:, :, input_slice]).abs().max().item(),
+                "b": (b_local.grad - b_ref.grad[:, output_slice]).abs().max().item(),
+            }
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_multi_lora_proj_tp2_sp_matches_tp1_forward_and_gradients(tmp_path):
+    init_file = tmp_path / "multi-lora-proj-tp-init"
+    queue = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(
+        _multi_lora_proj_tp_worker, args=(2, str(init_file), queue), nprocs=2, join=True
+    )
+    results = sorted((queue.get() for _ in range(2)), key=lambda result: result["rank"])
+    # TP and TP1 sum FP32 contractions in a different legal order.  This
+    # permits a few ULP on x/A while forward and B remain exact.
+    for result in results:
+        for key in ("forward", "x", "a", "b"):
+            assert result[key] <= 3e-6, results
+    if init_file.exists():
+        os.unlink(init_file)

@@ -343,15 +343,16 @@ def _build_multi_lora_training_state(
             nn.init.zeros_(qkv.b_bank)
             nn.init.kaiming_uniform_(proj.a_bank, a=5**0.5)
             nn.init.zeros_(proj.b_bank)
-            for bank, tensor_model_parallel in (
-                (fc1, False),
-                (fc2, False),
-                (qkv, True),
-                (proj, True),
-            ):
+            for bank in (fc1, fc2, qkv, proj):
+                tensor_model_parallel = (
+                    bank.partition.rank_partitioned_a
+                    or bank.partition.output_partitioned_b
+                )
                 for parameter in (bank.a_bank, bank.b_bank):
                     parameter.tensor_model_parallel = tensor_model_parallel
-                    parameter.allreduce = not tensor_model_parallel
+                    # These model-owned banks are non-expert parameters.  Keep
+                    # them in regular DP buffers independent of TP ownership.
+                    parameter.allreduce = True
             fc1_surface = f"layers.{layer_idx}.moe.experts._fc1_weight_0"
             fc2_surface = f"layers.{layer_idx}.moe.experts._fc2_weight_0"
             qkv_surface = f"layers.{layer_idx}.attn.qkv.linear.weight"
