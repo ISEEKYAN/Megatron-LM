@@ -1445,6 +1445,72 @@ def test_mfsdp_dcp_restore_fails_before_misdescribing_flat_bucket_fragments(
         )
 
 
+@pytest.mark.parametrize("offload_fraction", [0.0, 1.0])
+def test_mfsdp_rank_local_checkpoint_resume_matches_uninterrupted_next_step(
+    tmp_path, offload_fraction
+):
+    _Model, _Unit, ps, engine_cfg = _build_offload_stack(
+        offload_fraction=offload_fraction
+    )
+    torch.manual_seed(9123)
+    resumed_chunks, resumed_optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    torch.manual_seed(9123)
+    reference_chunks, reference_optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    value = torch.randn(3, 4)
+    target = torch.randn(3, 2)
+
+    def train_step(chunks, optimizer):
+        optimizer.zero_grad()
+        loss = torch.nn.functional.mse_loss(chunks[0](value), target)
+        loss.backward()
+        optimizer.finish_grad_sync()
+        success, _grad_norm, _num_zeros = optimizer.step()
+        assert success
+
+    train_step(resumed_chunks, resumed_optimizer)
+    train_step(reference_chunks, reference_optimizer)
+    dcp.save_training_checkpoint(
+        resumed_chunks,
+        resumed_optimizer,
+        step=1,
+        path=str(tmp_path),
+        use_dcp=False,
+        save_rng=False,
+    )
+    with torch.no_grad():
+        for _name, shard, _bucket in resumed_chunks[0].iter_persistent_shards():
+            shard.fill_(-17.0)
+        cpu_group = resumed_optimizer._inner_optimizer.cpu_group
+        if cpu_group is not None:
+            for cpu_param in cpu_group._cpu_params:
+                cpu_param.fill_(-19.0)
+
+    loaded_step = dcp.load_training_checkpoint(
+        resumed_chunks, resumed_optimizer, str(tmp_path), use_dcp=False, load_rng=False
+    )
+    assert loaded_step == 1
+    train_step(resumed_chunks, resumed_optimizer)
+    train_step(reference_chunks, reference_optimizer)
+
+    resumed_shards = dict(resumed_chunks[0].named_parameters())
+    reference_shards = dict(reference_chunks[0].named_parameters())
+    assert resumed_shards.keys() == reference_shards.keys()
+    for name in resumed_shards:
+        torch.testing.assert_close(resumed_shards[name], reference_shards[name])
+
+
 def _single_rank_mfsdp_stack(*, override_optimizer_config=None):
     """Build a trained single-rank M-FSDP stack for scratch-release tests."""
 

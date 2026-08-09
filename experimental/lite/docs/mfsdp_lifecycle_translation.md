@@ -105,6 +105,9 @@ Hard release gates:
   Rank-local `use_dcp=False` checkpoints remain the supported same-topology path.
 - Model-only DCP restore and CPU-master refresh: `unsupported-fail-fast`;
   optimizer-inclusive rank-local restore remains supported.
+- Rank-local same-topology resume: `equivalent-with-proof` for offload fractions
+  0 and 1, including optimizer state and next-step shard equality against an
+  uninterrupted run.
 - Bounded HF export: `equivalent-with-proof`.
 - Forward/backward exception teardown: `equivalent-with-proof`; normal finish,
   abort, export, persistent-state access, and device move share closed
