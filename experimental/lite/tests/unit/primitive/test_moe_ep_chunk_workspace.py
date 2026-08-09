@@ -84,6 +84,164 @@ def test_three_explicit_ops_have_fixed_two_chunk_contract(
     )
 
 
+def test_experimental_four_logical_chunks_are_two_sequential_two_slot_passes(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EP_CHUNK_COUNT,
+        _experimental_logical_chunk_groups,
+    )
+
+    monkeypatch.setenv("MEGATRON_LITE_EP_CHUNK_EXPERIMENTAL_LOGICAL_COUNT", "4")
+    assert EP_CHUNK_COUNT == 2
+    assert _experimental_logical_chunk_groups(16) == [(0, 8), (8, 16)]
+    assert _experimental_logical_chunk_groups(17) == [(0, 9), (9, 17)]
+
+
+def test_experimental_n4_forward_executes_two_native_two_range_passes_with_offset_routing(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkForwardOp,
+        EPChunkShapeProfile,
+        EPChunkWorkspaceKey,
+        EPChunkWorkspaceRegistry,
+    )
+
+    monkeypatch.setenv("MEGATRON_LITE_EP_CHUNK_EXPERIMENTAL_LOGICAL_COUNT", "4")
+    calls = []
+
+    class Event:
+        def record(self, *_args):
+            pass
+
+        def query(self):
+            return True
+
+    class Stream:
+        device = None
+
+        def wait_event(self, _event):
+            pass
+
+    @contextmanager
+    def stream_context(_stream):
+        yield
+
+    class Dispatcher:
+        use_deepep = True
+        moe_permute_fusion = False
+        _local_tpe_list = None
+
+        def submit_deepep_dispatch(self, x, scores, _indices, **_kwargs):
+            return {"recv_hidden": x, "recv_probs": scores, "handle": object()}
+
+        def finish_deepep_dispatch(self, state, **_kwargs):
+            return state["recv_hidden"], None, state["recv_probs"]
+
+        def prepare_deepep_combine(self, expert_out):
+            return expert_out, object()
+
+        def submit_deepep_combine_prepared(self, rank_grouped, _handle, **_kwargs):
+            return {"out": rank_grouped}
+
+        def finish_deepep_combine(self, state):
+            return state.pop("out")
+
+    class Experts(torch.nn.Module):
+        def forward(self, dispatched, *_args, **_kwargs):
+            return dispatched
+
+    monkeypatch.setattr(overlap.torch.cuda, "Event", Event)
+    monkeypatch.setattr(overlap.torch.cuda, "current_stream", lambda *_args: Stream())
+    monkeypatch.setattr(overlap.torch.cuda, "stream", stream_context)
+    profile = EPChunkShapeProfile(16, 2, 2, 2)
+    workspace = EPChunkWorkspaceRegistry().get_or_create(
+        EPChunkWorkspaceKey("forward", "cpu", None, 1, torch.float32, profile),
+        lambda _slot: Dispatcher(),
+    )
+    op = EPChunkForwardOp(
+        router=lambda x: (torch.ones(x.size(0), 2), torch.zeros(x.size(0), 2, dtype=torch.long)),
+        experts=Experts(),
+        workspace=workspace,
+        router_forward=lambda _router, x, routing: (routing[:, None].expand(-1, 2), torch.zeros(x.size(0), 2, dtype=torch.long)),
+    )
+    op._streams = lambda _device: (Stream(), Stream())
+    original = op._forward_output_async
+
+    def counted_output(x, ranges, input_shape, dtype):
+        calls.append((tuple(ranges), x.clone()))
+        return original(x, ranges, input_shape, dtype)
+
+    op._forward_output_async = counted_output
+    calls = []
+    x = torch.arange(17 * 2, dtype=torch.float32).view(17, 2)
+    routing = torch.arange(17)
+    with torch.no_grad():
+        actual = op.forward(x, routing)
+
+    assert torch.equal(actual, x)
+    assert [ranges for ranges, _ in calls] == [((0, 5), (5, 9)), ((0, 4), (4, 8))]
+    assert torch.equal(calls[0][1], x[:9])
+    assert torch.equal(calls[1][1], x[9:])
+    assert workspace.evidence()["dispatcher_count"] == 2
+    assert workspace.evidence()["active_lease_count"] == 0
+
+
+def test_experimental_n4_fused_accumulates_router_grads_across_two_passes(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkFusedForwardBackwardOp,
+    )
+
+    monkeypatch.setenv("MEGATRON_LITE_EP_CHUNK_EXPERIMENTAL_LOGICAL_COUNT", "4")
+    op = object.__new__(EPChunkFusedForwardBackwardOp)
+    op.router = torch.nn.Linear(2, 1, bias=False)
+    op.experts = torch.nn.Identity()
+    op._router_forward = None
+    seen = []
+
+    def fake_fused(x, grad):
+        seen.append((x.clone(), grad.clone()))
+        return grad * 2, [torch.full_like(op.router.weight, len(seen))], []
+
+    op._full_recompute_fused_backward = fake_fused
+    x = torch.arange(34, dtype=torch.float32).view(17, 2)
+    grad = torch.ones_like(x)
+    grad_x, router_grads, expert_grads = op.forward_backward(x, grad)
+
+    assert [chunk.size(0) for chunk, _ in seen] == [9, 8]
+    assert torch.equal(grad_x, grad * 2)
+    assert torch.equal(router_grads[0], torch.full_like(op.router.weight, 3))
+    assert expert_grads == []
+
+
+def test_experimental_switch_off_preserves_one_native_two_range_pass(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkForwardOp
+
+    monkeypatch.delenv("MEGATRON_LITE_EP_CHUNK_EXPERIMENTAL_LOGICAL_COUNT", raising=False)
+    op = object.__new__(EPChunkForwardOp)
+    op._router_forward = None
+    op.router = torch.nn.Identity()
+    op.experts = torch.nn.Identity()
+    calls = []
+    op._forward_output_async = lambda x, ranges, input_shape, _dtype: (
+        calls.append(tuple(ranges)) or x.view(input_shape)
+    )
+    x = torch.randn(16, 2)
+    with torch.no_grad():
+        assert torch.equal(op.forward(x), x)
+    assert calls == [((0, 8), (8, 16))]
+
+
 def test_three_ops_get_independent_cross_layer_workspaces(
     transformer_engine_import_stub,
 ):
