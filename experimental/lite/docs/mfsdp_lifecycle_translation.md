@@ -29,8 +29,15 @@ remains in scope.
   - `1032.31 ms/step`, `31742.44 tok/s`, `16.936 GB` peak allocated.
 - These archived numbers are diagnostic only, not release evidence: they were
   not produced by the four-arm protocol below.
-- PR #89's exact archived command and raw JSON remain unrecovered. This ledger
-  and the baseline-freeze stage are therefore not complete.
+- PR #89's historical command is recovered as
+  `NPROC_PER_NODE=8 tests/run_mfsdp_hopper_validation.sh cpu-offload` at
+  `15145be3a`; its W&B run is `vgihnxmw`. That tiny-model 2-warmup/5-measure
+  archive documents prior capability but is not comparable to the Qwen gate.
+- The product gate uses Qwen3.5, 8 layers, 8 experts, DP8, TP/EP/ETP/PP/CP=1,
+  four microbatches, sequence length 1024, seed 7345, BF16 compute, FP32
+  masters, AdamW (`lr=1e-4`, weight decay `0.1`, clip `1.0`), no HF load, no
+  MTP, no CPU offload, and AG overlap enabled. PR #89 must be rerun under this
+  same manifest; its historical tiny-model numbers cannot satisfy the gate.
 
 The four arms must run in independent fresh processes with one manifest:
 commit, container digest, GPU/node, PyTorch/CUDA/NCCL/TE, model and checkpoint
