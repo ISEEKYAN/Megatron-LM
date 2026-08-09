@@ -1260,6 +1260,58 @@ def test_mfsdp_non_fused_wgrad_accumulates_in_fp32_per_microbatch():
         )
 
 
+def test_mfsdp_qwen35_eval_to_train_first_step_is_finite():
+    hf_path = os.environ.get("MLITE_QWEN35_HF_PATH")
+    if not hf_path:
+        pytest.skip("set MLITE_QWEN35_HF_PATH for the real Qwen3.5 lifecycle gate")
+
+    from examples.bench.bench import BenchCliConfig
+    from examples.bench.correctness import run_backend
+
+    artifact = run_backend(
+        BenchCliConfig(
+            backend="mlite",
+            hf_path=hf_path,
+            model_name="qwen3_5",
+            tp=1,
+            etp=1,
+            ep=1,
+            pp=1,
+            cp=1,
+            steps=1,
+            num_microbatches=1,
+            seq_len=1024,
+            seed=7345,
+            same_data_across_dp=True,
+            skip_load_hf_weights=True,
+            keep_experts=8,
+            truncate_layers=8,
+            disable_mtp=True,
+            optimizer_lr=1.0e-4,
+            optimizer_weight_decay=0.1,
+            optimizer_clip_grad=1.0,
+            override_optimizer_json=json.dumps(
+                {
+                    "offload_fraction": 0.0,
+                    "use_precision_aware_optimizer": False,
+                    "nccl_ub": False,
+                }
+            ),
+            impl_cfg_json=json.dumps(
+                {"optimizer": "mfsdp", "mount_vision_model": False}
+            ),
+        ),
+        hash_weights=True,
+    )
+
+    step = artifact["steps"][0]
+    loss = float(step["loss"]["value"])
+    grad_norm = float(step["grad_norm"]["value"])
+    assert torch.isfinite(torch.tensor(loss))
+    assert torch.isfinite(torch.tensor(grad_norm))
+    assert step["update_successful"]
+
+
 def test_mfsdp_precision_curve_matches_fsdp2():
     torch.manual_seed(4026 + dist.get_rank())
     torch.cuda.manual_seed_all(4026 + dist.get_rank())
