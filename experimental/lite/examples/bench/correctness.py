@@ -447,6 +447,7 @@ def run_backend(
     verify_resume_path: str | None = None,
     performance_warmup_steps: int = 0,
     performance_steps: int = 0,
+    measure_during_correctness: bool = False,
 ) -> dict[str, Any]:
     os.environ["MEGATRON_LITE_DETERMINISTIC"] = "1"
     set_deterministic(cfg.seed)
@@ -470,13 +471,21 @@ def run_backend(
 
     data_iter = _make_data_iter(handle, session_cfg)
     steps: list[dict[str, Any]] = []
+    measured_step_seconds: list[float] = []
+    if measure_during_correctness and session_cfg.steps < 3:
+        raise ValueError("in-curve performance measurement requires at least 3 steps")
     with rt.train_mode(handle):
         for step in range(session_cfg.steps):
+            capture_fingerprints = not measure_during_correctness or step in {
+                0,
+                session_cfg.steps - 1,
+            }
             with _activation_probe_context(
                 handle, activation_probe_names, record_grad=True
             ) as train_activation_probes:
                 rt.zero_grad(handle)
                 _sync(session_cfg.device)
+                started = time.perf_counter()
                 result = rt.forward_backward(
                     handle,
                     data_iter,
@@ -485,12 +494,18 @@ def run_backend(
                 )
                 _sync(session_cfg.device)
                 output = result.model_output
-                logits = _hash_tensor(
-                    output.vocab_parallel_logits
-                    if output.vocab_parallel_logits is not None
-                    else (-output.log_probs if output.log_probs is not None else None)
+                logits = (
+                    _hash_tensor(
+                        output.vocab_parallel_logits
+                        if output.vocab_parallel_logits is not None
+                        else (
+                            -output.log_probs if output.log_probs is not None else None
+                        )
+                    )
+                    if capture_fingerprints
+                    else None
                 )
-                grads = _grad_fingerprint(handle)
+                grads = _grad_fingerprint(handle) if capture_fingerprints else None
 
                 if session_cfg.no_optimizer:
                     update_successful, grad_norm, num_zeros = True, 0.0, 0
@@ -498,6 +513,12 @@ def run_backend(
                     update_successful, grad_norm, num_zeros = rt.optimizer_step(handle)
                     rt.lr_scheduler_step(handle)
                 _sync(session_cfg.device)
+                if measure_during_correctness and not capture_fingerprints:
+                    measured_step_seconds.append(
+                        _distributed_max(
+                            time.perf_counter() - started, session_cfg.device
+                        )
+                    )
                 loss = result.metrics.get("loss")
                 if loss is None:
                     loss = result.model_output.loss
@@ -517,24 +538,72 @@ def run_backend(
                     "train_activation_probes": train_activation_probes,
                 }
             )
+            if measure_during_correctness and step == 0:
+                if torch.device(session_cfg.device).type == "cuda":
+                    torch.cuda.reset_peak_memory_stats()
 
+    if measure_during_correctness and performance_steps:
+        raise ValueError(
+            "choose either in-curve measurement or separate performance steps"
+        )
     if performance_steps and verify_resume_path is not None:
         raise ValueError(
             "combined performance measurement and resume verification require "
             "separate fresh-process arms"
         )
-    performance = (
-        _measure_training_performance(
-            rt,
-            handle,
-            data_iter,
-            session_cfg,
-            warmup_steps=performance_warmup_steps,
-            measured_steps=performance_steps,
+    if measure_during_correctness:
+        ps = handle._parallel_state
+        dp_size = int(getattr(ps, "dp_size", getattr(ps, "dp_cp_size", 1)))
+        tokens_per_step = (
+            int(session_cfg.seq_len) * int(session_cfg.num_microbatches) * dp_size
         )
-        if performance_steps
-        else None
-    )
+        mean_seconds = sum(measured_step_seconds) / len(measured_step_seconds)
+        memory = None
+        if torch.device(session_cfg.device).type == "cuda":
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            memory = {
+                "peak_allocated_bytes_max": int(
+                    _distributed_max(
+                        float(torch.cuda.max_memory_allocated()), session_cfg.device
+                    )
+                ),
+                "peak_reserved_bytes_max": int(
+                    _distributed_max(
+                        float(torch.cuda.max_memory_reserved()), session_cfg.device
+                    )
+                ),
+                "total_bytes_max": int(
+                    _distributed_max(float(total_bytes), session_cfg.device)
+                ),
+                "used_bytes_max": int(
+                    _distributed_max(
+                        float(total_bytes - free_bytes), session_cfg.device
+                    )
+                ),
+            }
+        performance = {
+            "total_correctness_steps": session_cfg.steps,
+            "warmup_steps": 1,
+            "measured_steps": len(measured_step_seconds),
+            "step_seconds_max_rank": measured_step_seconds,
+            "mean_step_seconds": mean_seconds,
+            "tokens_per_step": tokens_per_step,
+            "tokens_per_second": tokens_per_step / mean_seconds,
+            "memory": memory,
+        }
+    else:
+        performance = (
+            _measure_training_performance(
+                rt,
+                handle,
+                data_iter,
+                session_cfg,
+                warmup_steps=performance_warmup_steps,
+                measured_steps=performance_steps,
+            )
+            if performance_steps
+            else None
+        )
 
     resume = None
     if verify_resume_path is not None:
@@ -625,6 +694,7 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--performance-warmup-steps", type=int, default=0)
     parser.add_argument("--performance-steps", type=int, default=0)
+    parser.add_argument("--measure-during-correctness", action="store_true")
     parser.add_argument("--num-microbatches", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
@@ -726,6 +796,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         verify_resume_path=ns.verify_resume_path,
         performance_warmup_steps=ns.performance_warmup_steps,
         performance_steps=ns.performance_steps,
+        measure_during_correctness=ns.measure_during_correctness,
     )
     if _distributed_rank() == 0:
         text = json.dumps(artifact, indent=2, sort_keys=True)
