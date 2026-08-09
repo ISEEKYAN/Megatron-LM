@@ -1521,6 +1521,27 @@ def test_qwen_moe_sidecar_sorts_then_restores_unsorted_slots():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize(("tp_rank", "expected"), [(0, [0, 1]), (1, [2, 3])])
+def test_moe_sp_global_slots_follow_contiguous_scatter_order(
+    transformer_engine_import_stub, tp_rank, expected
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite.model import _local_moe_lora_indices
+
+    slots = torch.tensor([0, 1, 2, 3])
+    actual = _local_moe_lora_indices(slots, local_rows=2, tp_size=2, tp_rank=tp_rank)
+    assert actual.tolist() == expected
+    # Local input is already in SP-scatter order and must not be sliced again.
+    assert (
+        _local_moe_lora_indices(actual, local_rows=2, tp_size=2, tp_rank=tp_rank)
+        is actual
+    )
+    with pytest.raises(ValueError, match="local or TP-global"):
+        _local_moe_lora_indices(
+            torch.tensor([0, 1, 2]), local_rows=2, tp_size=2, tp_rank=tp_rank
+        )
+
+
 def test_ep_gradient_sync_is_identity_in_forward_and_all_reduces_in_backward(
     monkeypatch,
 ):

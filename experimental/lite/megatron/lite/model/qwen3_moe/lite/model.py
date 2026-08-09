@@ -37,6 +37,20 @@ from megatron.lite.primitive.parallel import (
     roll_packed_thd_left,
     scatter_to_sequence_parallel,
 )
+
+
+def _local_moe_lora_indices(
+    lora_indices: torch.Tensor, *, local_rows: int, tp_size: int, tp_rank: int
+) -> torch.Tensor:
+    """Normalize logical SP slots to the local MoE row order."""
+    if lora_indices.numel() == local_rows:
+        return lora_indices
+    if tp_size > 1 and lora_indices.numel() == local_rows * tp_size:
+        # SP scatter uses contiguous TP chunks; MoE must slice that same axis.
+        return lora_indices.chunk(tp_size)[tp_rank]
+    raise ValueError("MoE multi-LoRA indices must describe local or TP-global rows.")
+
+
 from megatron.lite.primitive.utils import build_fp8_recipe
 
 # isort: on
@@ -92,10 +106,16 @@ class MoELayer(nn.Module):
                 raise RuntimeError("multi-LoRA MoE sidecars do not support ETP.")
             if self._use_deepep_requested:
                 raise RuntimeError("multi-LoRA MoE sidecars do not support DeepEP.")
+            lora_indices = _local_moe_lora_indices(
+                multi_lora_sidecar.lora_indices,
+                local_rows=x_2d.shape[0],
+                tp_size=self.ps.tp_size,
+                tp_rank=self.ps.tp_rank,
+            )
             fc1_delta = apply_dense_lora_delta(
                 multi_lora_sidecar.fc1,
                 x_2d,
-                multi_lora_sidecar.lora_indices,
+                lora_indices,
                 scale=multi_lora_sidecar.scale,
                 gradient_sync_group=_sidecar_ep_sync_group(self.ps, multi_lora_sidecar),
             )
@@ -110,9 +130,7 @@ class MoELayer(nn.Module):
         if multi_lora_sidecar is not None:
             assert fc1_delta is not None
             routed_fc1_delta = self.dispatcher.dispatch_sidecar(fc1_delta)
-            routed_lora_indices = self.dispatcher.dispatch_sidecar(
-                multi_lora_sidecar.lora_indices
-            )
+            routed_lora_indices = self.dispatcher.dispatch_sidecar(lora_indices)
         self.dispatcher.wait_dispatch_event()
 
         def _fc2_delta(h: torch.Tensor) -> torch.Tensor:
