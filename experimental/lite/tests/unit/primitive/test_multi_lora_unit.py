@@ -35,6 +35,7 @@ from megatron.lite.primitive.modules.multi_lora_bank import (
     MultiLoraSpec,
     MultiLoraTrainingState,
     NamedLoraBankRegistry,
+    apply_batched_lora_delta,
     validate_multi_lora_parallel_support,
 )
 
@@ -139,6 +140,81 @@ def test_batched_lora_delta_matches_dense_reference_for_sorted_slots():
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_attention_bank_delta_matches_dense_oracle_and_only_updates_selected_slots():
+    """The generic attention carrier keeps per-token slots and zero banks inert."""
+    x = torch.tensor([[1.0, 2.0], [3.0, -1.0], [2.0, 4.0]], requires_grad=True)
+    a_bank = nn.Parameter(torch.tensor([[[1.0, 0.0]], [[0.0, 2.0]], [[3.0, 1.0]]]))
+    b_bank = nn.Parameter(torch.tensor([[[2.0]], [[-1.0]], [[0.0]]]))
+    slots = torch.tensor([1, 0, 1], dtype=torch.int64)
+    actual = apply_batched_lora_delta(
+        DenseLoraBank(a_bank, b_bank), x, slots, scale=0.5
+    )
+    expected = torch.stack(
+        [0.5 * (b_bank[slot] @ a_bank[slot] @ row) for row, slot in zip(x, slots)]
+    )
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    assert a_bank.grad[2].eq(0).all() and b_bank.grad[2].eq(0).all()
+
+    zero_bank = DenseLoraBank(
+        nn.Parameter(torch.ones(1, 1, 2)), nn.Parameter(torch.zeros(1, 1, 1))
+    )
+    assert (
+        apply_batched_lora_delta(
+            zero_bank, x.detach(), torch.zeros(3, dtype=torch.int64), scale=1.0
+        )
+        .eq(0)
+        .all()
+    )
+
+
+def test_attention_bank_tp_sp_contract_reuses_linear_lora_collective_order(monkeypatch):
+    """QKV gathers SP input; O-proj reduces TP-local contributions then scatters."""
+    calls = []
+    monkeypatch.setattr(
+        multi_lora_bank,
+        "_gather_sequence_parallel",
+        lambda value, group: calls.append(("gather", value.shape)) or value,
+    )
+    monkeypatch.setattr(
+        multi_lora_bank,
+        "_all_reduce_sum",
+        lambda value, group: calls.append(("reduce", value.shape)) or value,
+    )
+    monkeypatch.setattr(
+        multi_lora_bank,
+        "_scatter_sequence_parallel",
+        lambda value, group, rank: (
+            calls.append(("scatter", value.shape, rank)) or value
+        ),
+    )
+    bank = DenseLoraBank(
+        nn.Parameter(torch.ones(2, 1, 2)), nn.Parameter(torch.ones(2, 3, 1))
+    )
+    x = torch.ones(2, 1, 2)
+    slots = torch.tensor([0, 1], dtype=torch.int64)
+    qkv = apply_batched_lora_delta(
+        bank, x, slots, scale=1.0, tp_group=object(), sequence_parallel_input=True
+    )
+    proj = apply_batched_lora_delta(
+        bank,
+        x,
+        slots,
+        scale=1.0,
+        tp_group=object(),
+        tp_rank=1,
+        input_parallel_reduce=True,
+        sequence_parallel_scatter_output=True,
+    )
+    assert qkv.shape == proj.shape == (2, 1, 3)
+    assert calls == [
+        ("gather", (2, 2)),
+        ("gather", (2, 1)),
+        ("reduce", (2, 3)),
+        ("scatter", (2, 3), 1),
+    ]
 
 
 def test_batched_lora_delta_backward_matches_reference_for_repeated_slots():
@@ -821,6 +897,13 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
 
     class FakeLayer:
         layer_idx = 0
+        attn = SimpleNamespace(
+            qkv=SimpleNamespace(
+                local_out=8,
+                linear=SimpleNamespace(),
+            ),
+            proj=SimpleNamespace(local_in=4),
+        )
 
     class FakeChunk(nn.Module):
         def __init__(self):
@@ -861,19 +944,30 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
     )
     assert state is chunk.multi_lora_training_state
     fc1, fc2 = state.banks_for_layer(0)
+    qkv, proj = state.attention_banks_for_layer(0)
     assert fc1.a_bank.shape == (2, 24, 4)
     assert fc1.b_bank.shape == (2, 12, 24)
     assert fc2.a_bank.shape == (2, 24, 6)
     assert fc2.b_bank.shape == (2, 4, 24)
+    assert qkv.a_bank.shape == (2, 24, 4)
+    assert qkv.b_bank.shape == (2, 8, 24)
+    assert proj.a_bank.shape == (2, 24, 4)
+    assert proj.b_bank.shape == (2, 4, 24)
     assert set(state.registry.banks) == {
         "layers.0.moe.experts._fc1_weight_0",
         "layers.0.moe.experts._fc2_weight_0",
+        "layers.0.attn.qkv.linear.weight",
+        "layers.0.attn.proj.linear.weight",
     }
     assert {id(parameter) for parameter in state.parameters()} == {
         id(fc1.a_bank),
         id(fc1.b_bank),
         id(fc2.a_bank),
         id(fc2.b_bank),
+        id(state.registry.banks["layers.0.attn.qkv.linear.weight"].a_bank),
+        id(state.registry.banks["layers.0.attn.qkv.linear.weight"].b_bank),
+        id(state.registry.banks["layers.0.attn.proj.linear.weight"].a_bank),
+        id(state.registry.banks["layers.0.attn.proj.linear.weight"].b_bank),
     }
     optimizer_parameter_ids = {
         id(parameter)
@@ -890,11 +984,13 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
         for surface in (
             "layers.0.moe.experts._fc1_weight_0",
             "layers.0.moe.experts._fc2_weight_0",
+            "layers.0.attn.qkv.linear.weight",
+            "layers.0.attn.proj.linear.weight",
         )
         for factor in ("a", "b")
     } <= set(checkpoint_state)
     selected = state.registry.select("alpha")
-    assert len(selected) == 2
+    assert len(selected) == 4
     selected_fc1_a, selected_fc1_b = selected["layers.0.moe.experts._fc1_weight_0"]
     selected_fc2_a, selected_fc2_b = selected["layers.0.moe.experts._fc2_weight_0"]
     torch.testing.assert_close(selected_fc1_a, fc1.a_bank[0])
@@ -928,6 +1024,9 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
         f"model.layers.0.mlp.experts.{expert_idx}.{projection}"
         for expert_idx in range(config.num_experts)
         for projection in ("gate_proj", "up_proj", "down_proj")
+    } | {
+        f"model.layers.0.self_attn.{projection}"
+        for projection in ("q_proj", "k_proj", "v_proj", "o_proj")
     }
     expected_keys = {
         f"{VLLM_LORA_NAME_PREFIX}{module}.lora_{factor}.weight"
@@ -936,7 +1035,7 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
     }
     generated_keys = [key for key, _ in generated]
     assert set(generated_keys) == expected_keys
-    assert len(generated_keys) == len(expected_keys) == config.num_experts * 3 * 2
+    assert len(generated_keys) == len(expected_keys) == (config.num_experts * 3 + 4) * 2
     assert len(generated_keys) == len(set(generated_keys))
     assert (
         set(state.registry.export_hf_state("alpha", Qwen3MoEWeightSpec(config), ps))
@@ -960,19 +1059,17 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
     sidecar = output["multi_lora_sidecars"][0]
     assert bundle.extras["multi_lora_registry"] is state.registry
     assert sidecar.fc1 is fc1 and sidecar.fc2 is fc2
+    assert sidecar.qkv is qkv and sidecar.proj is proj
     assert sidecar.lora_indices is batch.extras["multi_lora_slots"][0]
 
 
-def test_multi_lora_parallel_contract_rejects_etp_and_deepep():
+def test_multi_lora_parallel_contract_allows_tp_and_rejects_etp_and_deepep():
     spec = multi_lora_bank.MultiLoraSpec(names=("alpha",), rank=2)
     with pytest.raises(ValueError, match="ETP"):
         validate_multi_lora_parallel_support(
             spec, tp_size=1, etp_size=2, use_deepep=False
         )
-    with pytest.raises(ValueError, match="TP"):
-        validate_multi_lora_parallel_support(
-            spec, tp_size=2, etp_size=1, use_deepep=False
-        )
+    validate_multi_lora_parallel_support(spec, tp_size=2, etp_size=1, use_deepep=False)
     with pytest.raises(ValueError, match="DeepEP"):
         validate_multi_lora_parallel_support(
             spec, tp_size=1, etp_size=1, use_deepep=True

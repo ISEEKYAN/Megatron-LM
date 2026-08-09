@@ -81,6 +81,8 @@ class MoELoraSidecar:
     # builder sets this False for model-owned banks; dist-opt then owns their
     # single dense-DP/finalize reduction.
     requires_explicit_ep_sync: bool = True
+    qkv: DenseLoraBank | None = None
+    proj: DenseLoraBank | None = None
 
 
 __all__ = ["MoELoraSidecar", "apply_dense_lora_delta"]

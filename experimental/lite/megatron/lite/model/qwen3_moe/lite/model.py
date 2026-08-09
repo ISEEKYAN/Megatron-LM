@@ -215,7 +215,12 @@ class TransformerLayer(nn.Module):
         multi_lora_sidecar: MoELoraSidecar | None = None,
     ) -> torch.Tensor:
         residual = x
-        h = self.attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
+        h = self.attn(
+            x,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            multi_lora_sidecar=multi_lora_sidecar,
+        )
         x = residual + h
 
         residual = x

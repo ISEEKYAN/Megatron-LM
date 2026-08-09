@@ -178,13 +178,20 @@ def _inject_multi_lora_sidecars(kwargs, batch: PackedBatch, multi_lora_state) ->
             "multi_lora_slots is missing local pipeline layers: "
             f"{sorted(missing_local_layers)}"
         )
-    kwargs["multi_lora_sidecars"] = {
-        layer_idx: MoELoraSidecar(
+
+    def _sidecar(layer_idx, layer_slots):
+        attention_banks = multi_lora_state.attention_banks_for_layer(layer_idx)
+        return MoELoraSidecar(
             *multi_lora_state.banks_for_layer(layer_idx),
             lora_indices=layer_slots,
             scale=multi_lora_state.scale,
             requires_explicit_ep_sync=False,
+            qkv=None if attention_banks is None else attention_banks[0],
+            proj=None if attention_banks is None else attention_banks[1],
         )
+
+    kwargs["multi_lora_sidecars"] = {
+        layer_idx: _sidecar(layer_idx, layer_slots)
         for layer_idx, layer_slots in slots.items()
         if layer_idx in local_layers
     }
@@ -227,6 +234,7 @@ def _build_multi_lora_training_state(
     dtype = next(chunks[0].parameters()).dtype
     banks: dict[str, DenseLoraBank] = {}
     layer_surfaces: dict[int, tuple[str, str]] = {}
+    attention_surfaces: dict[int, tuple[str, str]] = {}
     for chunk in chunks:
         for layer in chunk.layers:
             layer_idx = layer.layer_idx
@@ -270,19 +278,73 @@ def _build_multi_lora_training_state(
                     )
                 ),
             )
+            attn = layer.attn
+            # Preserve TE's fused LayerNorm+QKV GEMM and request the exact
+            # normalized activation it already produces for the sidecar delta.
+            attn.qkv.linear.return_layernorm_output = True
+            attn.qkv.linear.return_layernorm_output_gathered = False
+            qkv = DenseLoraBank(
+                nn.Parameter(
+                    torch.empty(
+                        len(spec.names),
+                        spec.rank,
+                        model_cfg.hidden_size,
+                        device=device,
+                        dtype=dtype,
+                    )
+                ),
+                nn.Parameter(
+                    torch.empty(
+                        len(spec.names),
+                        attn.qkv.local_out,
+                        spec.rank,
+                        device=device,
+                        dtype=dtype,
+                    )
+                ),
+            )
+            proj = DenseLoraBank(
+                nn.Parameter(
+                    torch.empty(
+                        len(spec.names),
+                        spec.rank,
+                        attn.proj.local_in,
+                        device=device,
+                        dtype=dtype,
+                    )
+                ),
+                nn.Parameter(
+                    torch.empty(
+                        len(spec.names),
+                        model_cfg.hidden_size,
+                        spec.rank,
+                        device=device,
+                        dtype=dtype,
+                    )
+                ),
+            )
             nn.init.kaiming_uniform_(fc1.a_bank, a=5**0.5)
             nn.init.zeros_(fc1.b_bank)
             nn.init.kaiming_uniform_(fc2.a_bank, a=5**0.5)
             nn.init.zeros_(fc2.b_bank)
+            nn.init.kaiming_uniform_(qkv.a_bank, a=5**0.5)
+            nn.init.zeros_(qkv.b_bank)
+            nn.init.kaiming_uniform_(proj.a_bank, a=5**0.5)
+            nn.init.zeros_(proj.b_bank)
             fc1_surface = f"layers.{layer_idx}.moe.experts._fc1_weight_0"
             fc2_surface = f"layers.{layer_idx}.moe.experts._fc2_weight_0"
+            qkv_surface = f"layers.{layer_idx}.attn.qkv.linear.weight"
+            proj_surface = f"layers.{layer_idx}.attn.proj.linear.weight"
             layer_surfaces[layer_idx] = (fc1_surface, fc2_surface)
+            attention_surfaces[layer_idx] = (qkv_surface, proj_surface)
             # One canonical grouped native surface per layer.  The HF exporter
             # expands this shared bank across experts exactly once; registering
             # every expert here would make that exporter expand an E-sized map E
             # times and overwrite the same output keys.
             banks[fc1_surface] = fc1
             banks[fc2_surface] = fc2
+            banks[qkv_surface] = qkv
+            banks[proj_surface] = proj
     registry = NamedLoraBankRegistry(
         banks=banks,
         names={name: slot for slot, name in enumerate(spec.names)},
@@ -296,7 +358,7 @@ def _build_multi_lora_training_state(
             use_rslora=spec.use_rslora,
         ),
     )
-    state = MultiLoraTrainingState(registry, layer_surfaces)
+    state = MultiLoraTrainingState(registry, layer_surfaces, attention_surfaces)
     chunks[0].add_module("multi_lora_training_state", state)
     return state
 

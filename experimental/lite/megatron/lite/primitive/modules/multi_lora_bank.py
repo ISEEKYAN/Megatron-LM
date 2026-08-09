@@ -16,6 +16,11 @@ import torch
 import torch.nn as nn
 from megatron.lite.primitive.ckpt.hf_weights import export_hf_lora_bank_adapter
 from megatron.lite.primitive.modules.lora import LoraSpec, resolve_lora_alpha
+from megatron.lite.primitive.modules.lora import (
+    _all_reduce_sum,
+    _gather_sequence_parallel,
+    _scatter_sequence_parallel,
+)
 from megatron.lite.primitive.modules.multi_lora import BatchedLoraDelta
 
 
@@ -47,6 +52,44 @@ class DenseLoraBank:
         self, x: torch.Tensor, lora_indices: torch.Tensor, *, scale: float
     ) -> torch.Tensor:
         return BatchedLoraDelta.apply(x, self.a_bank, self.b_bank, lora_indices, scale)
+
+
+def apply_batched_lora_delta(
+    bank: DenseLoraBank,
+    x: torch.Tensor,
+    lora_indices: torch.Tensor,
+    *,
+    scale: float,
+    tp_group=None,
+    tp_rank: int = 0,
+    sequence_parallel_input: bool = False,
+    input_parallel_reduce: bool = False,
+    sequence_parallel_scatter_output: bool = False,
+) -> torch.Tensor:
+    """Apply a selected bank with the established LinearLoRA TP/SP collectives."""
+    if x.ndim < 2:
+        raise ValueError("batched LoRA input must have a feature dimension.")
+    rows = x.reshape(-1, x.shape[-1])
+    slots = lora_indices.reshape(-1)
+    if slots.numel() != rows.shape[0]:
+        raise ValueError("batched LoRA indices must have one entry per token.")
+    if sequence_parallel_input:
+        rows = _gather_sequence_parallel(rows, tp_group)
+        slots = _gather_sequence_parallel(slots[:, None], tp_group).squeeze(-1)
+    if slots.numel() < 2 or bool(torch.all(slots[1:] >= slots[:-1])):
+        delta = bank.delta(rows, slots, scale=scale)
+    else:
+        order = torch.argsort(slots, stable=True)
+        restore = torch.empty_like(order)
+        restore[order] = torch.arange(order.numel(), device=order.device)
+        delta = bank.delta(
+            rows.index_select(0, order), slots.index_select(0, order), scale=scale
+        ).index_select(0, restore)
+    if input_parallel_reduce:
+        delta = _all_reduce_sum(delta, tp_group)
+    if sequence_parallel_scatter_output:
+        delta = _scatter_sequence_parallel(delta, tp_group, tp_rank)
+    return delta.reshape(*x.shape[:-1], bank.b_bank.shape[1])
 
 
 @dataclass(frozen=True)
@@ -99,8 +142,6 @@ def validate_multi_lora_parallel_support(
         return
     if etp_size is not None and etp_size > 1:
         raise ValueError("multi-LoRA model-owned sidecars do not support ETP.")
-    if tp_size > 1:
-        raise ValueError("multi-LoRA model-owned sidecars do not support TP.")
     if use_deepep:
         raise ValueError("multi-LoRA model-owned sidecars do not support DeepEP.")
 
@@ -112,10 +153,12 @@ class MultiLoraTrainingState(nn.Module):
         self,
         registry: "NamedLoraBankRegistry",
         layer_surfaces: Mapping[int, tuple[str, str]],
+        attention_surfaces: Mapping[int, tuple[str, str]] | None = None,
     ) -> None:
         super().__init__()
         self.registry = registry
         self._layer_surfaces = dict(layer_surfaces)
+        self._attention_surfaces = dict(attention_surfaces or {})
         registered_tensor_names: dict[int, str] = {}
         for surface, bank in registry.banks.items():
             for factor, tensor in (("a", bank.a_bank), ("b", bank.b_bank)):
@@ -147,6 +190,16 @@ class MultiLoraTrainingState(nn.Module):
         except KeyError as exc:
             raise KeyError(f"multi-LoRA slots name unknown layer: {layer_idx}") from exc
         return self.registry.banks[fc1_surface], self.registry.banks[fc2_surface]
+
+    def attention_banks_for_layer(
+        self, layer_idx: int
+    ) -> tuple[DenseLoraBank, DenseLoraBank] | None:
+        """Return the QKV and output-projection banks for one model layer."""
+        surfaces = self._attention_surfaces.get(layer_idx)
+        if surfaces is None:
+            return None
+        qkv_surface, proj_surface = surfaces
+        return self.registry.banks[qkv_surface], self.registry.banks[proj_surface]
 
     @property
     def local_layer_indices(self) -> tuple[int, ...]:
@@ -299,6 +352,7 @@ class NamedLoraBankRegistry:
 
 __all__ = [
     "DenseLoraBank",
+    "apply_batched_lora_delta",
     "MultiLoraSpec",
     "MultiLoraTrainingState",
     "NamedLoraBankRegistry",
