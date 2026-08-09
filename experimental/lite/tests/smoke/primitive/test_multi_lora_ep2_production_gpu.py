@@ -768,6 +768,17 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
     assert {
         name: _tensor_record(value) for name, value in oracle_grads.items()
     } == manifest["semantic_bank_tensors_by_rank"][dist.get_rank()]
+    local_contributions_by_rank = []
+    for rank in range(2):
+        local_path = artifact_dir / f"ep2_local_bank_grads_rank_{rank:05d}.pt"
+        local_contributions = torch.load(
+            local_path, map_location="cpu", weights_only=True
+        )
+        assert set(local_contributions) == set(manifest["semantic_bank_keys"])
+        assert {
+            name: _tensor_record(value) for name, value in local_contributions.items()
+        } == manifest["local_contribution_tensors_by_rank"][rank]
+        local_contributions_by_rank.append(local_contributions)
 
     bundle = _build_bundle(ep=2, model_seed=3100)
     ep2_topology = _actual_topology(bundle)
@@ -903,10 +914,26 @@ def test_ep2_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path
     finally:
         protocol.MoELoraSidecar = original_sidecar
     assert set(doubled_grads) == expected_keys
+    live_bank_parameters = _bank_parameters(bundle)
+    observed_bf16_rounding = False
     for name, oracle in oracle_grads.items():
-        torch.testing.assert_close(
-            doubled_grads[name].cpu(), oracle * 2, rtol=0, atol=0
+        # The legacy explicit all-reduce sums in the live BF16 bank dtype before
+        # the dist-opt reconstruction returns FP32 shards.  Preserve that exact
+        # operation order rather than using the FP32 mean oracle twice.
+        dtype = live_bank_parameters[name].dtype
+        assert dtype is torch.bfloat16
+        explicit_expected = (
+            local_contributions_by_rank[0][name].to(dtype)
+            + local_contributions_by_rank[1][name].to(dtype)
+        ).float()
+        assert not torch.equal(explicit_expected, oracle)
+        observed_bf16_rounding |= bool(
+            torch.any(explicit_expected != oracle * 2).item()
         )
+        torch.testing.assert_close(
+            doubled_grads[name].cpu(), explicit_expected, rtol=0, atol=0
+        )
+    assert observed_bf16_rounding
     for name, param in state.named_parameters():
         assert name.startswith("bank_") and "." not in name
     ep2_topologies = [None, None]
