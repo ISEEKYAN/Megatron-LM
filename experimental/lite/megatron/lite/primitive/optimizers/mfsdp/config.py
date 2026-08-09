@@ -34,6 +34,7 @@ class MFSDPConfig:
 
     sharding_strategy: str = "optim_grads_params"
     bucket_size: int | None = 40_000_000
+    suggested_communication_unit_size: int | None = None
     overlap_grad_reduce: bool = True
     overlap_param_gather: bool = True
     average_gradients: bool = True
@@ -194,12 +195,21 @@ def build_mfsdp_config(opt: Any) -> MFSDPConfig:
             "The standalone M-FSDP path supports only "
             "data_parallel_sharding_strategy='optim_grads_params'."
         )
-    raw_bucket_size = option(
-        "bucket_size", 40_000_000, "suggested_communication_unit_size"
-    )
+    raw_bucket_size = option("bucket_size", 40_000_000)
     bucket_size = None if raw_bucket_size is None else int(raw_bucket_size)
     if bucket_size is not None and bucket_size <= 0:
         raise ValueError("M-FSDP bucket_size must be a positive element count or None.")
+    raw_communication_size = option("suggested_communication_unit_size", None)
+    suggested_communication_unit_size = (
+        None if raw_communication_size is None else int(raw_communication_size)
+    )
+    if (
+        suggested_communication_unit_size is not None
+        and suggested_communication_unit_size <= 0
+    ):
+        raise ValueError(
+            "M-FSDP suggested_communication_unit_size must be positive or None."
+        )
 
     main_params_dtype = _coerce_dtype(
         option("megatron_fsdp_main_params_dtype", torch.float32),
@@ -217,6 +227,7 @@ def build_mfsdp_config(opt: Any) -> MFSDPConfig:
     return MFSDPConfig(
         sharding_strategy=strategy,
         bucket_size=bucket_size,
+        suggested_communication_unit_size=suggested_communication_unit_size,
         overlap_grad_reduce=bool(option("overlap_grad_reduce", True)),
         overlap_param_gather=bool(option("overlap_param_gather", True)),
         average_gradients=bool(option("average_in_collective", True)),

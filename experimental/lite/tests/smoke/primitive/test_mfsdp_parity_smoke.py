@@ -917,7 +917,7 @@ def test_mfsdp_native_fp32_fused_wgrad_reaches_optimizer_groups():
     for bucket in chunk.param_sync.buckets:
         for spec in bucket.specs:
             assert spec.shard_param is not None
-            assert spec.full_param.grad_added_to_main_grad is True
+            assert spec.full_param.grad_added_to_main_grad is False
             assert spec.full_param.grad is None
             assert spec.full_param.main_grad.dtype is torch.float32
             main_grad_by_shard[id(spec.shard_param)] = (
@@ -1054,9 +1054,9 @@ def test_mfsdp_native_fp32_grouped_expert_wgrad_reaches_optimizer():
                 )
                 if spec.shard_param is None:
                     raise AssertionError(f"{spec.name}: missing shard_param")
-                if getattr(full_param, "grad_added_to_main_grad", None) is not True:
+                if getattr(full_param, "grad_added_to_main_grad", None) is not False:
                     raise AssertionError(
-                        f"{spec.name}: grad_added_to_main_grad is not True"
+                        f"{spec.name}: grad_added_to_main_grad was not consumed"
                     )
                 if main_grad is None or main_grad.dtype is not torch.float32:
                     raise AssertionError(f"{spec.name}: main_grad is not fp32")
@@ -1247,8 +1247,14 @@ def test_mfsdp_non_fused_wgrad_accumulates_in_fp32_per_microbatch():
     chunk(torch.ones(1, 4, device="cuda", dtype=torch.bfloat16)).sum().backward()
     expected = torch.full((4, 4), 257.0, device="cuda")
     assert spec.full_param.grad is None
-    assert torch.equal(spec.full_param.main_grad, expected)
-    assert not _is_bf16_roundtrip_exact(spec.full_param.main_grad)
+    # MCore's data-distributed main_grad is a per-microbatch unsharded
+    # communication staging buffer.  Cross-microbatch accumulation happens in
+    # the persistent FP32 shard after each reduce-scatter, not in this view.
+    assert torch.equal(
+        spec.full_param.main_grad,
+        torch.ones(4, 4, device="cuda"),
+    )
+    assert _is_bf16_roundtrip_exact(spec.full_param.main_grad)
 
     finalize()
     expected_shard = expected.reshape(-1).chunk(dist.get_world_size())[dist.get_rank()]

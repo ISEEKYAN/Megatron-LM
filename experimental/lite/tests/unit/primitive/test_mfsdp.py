@@ -1425,6 +1425,20 @@ def test_mfsdp_bucket_policy_splits_one_unit_without_splitting_parameters():
     ]
 
 
+def test_mfsdp_bucket_size_is_independent_from_communication_unit_size():
+    opt = SimpleNamespace(
+        override_optimizer_config={
+            "bucket_size": 17,
+            "suggested_communication_unit_size": 123,
+        }
+    )
+
+    config = mfsdp_config.build_mfsdp_config(opt)
+
+    assert config.bucket_size == 17
+    assert config.suggested_communication_unit_size == 123
+
+
 def test_mfsdp_empty_uneven_shard_stays_inside_local_buffer(monkeypatch):
     monkeypatch.setattr(mfsdp_buffer, "group_size", lambda _group: 4)
     monkeypatch.setattr(mfsdp_buffer, "group_rank", lambda _group: 0)
@@ -1559,6 +1573,38 @@ def test_mfsdp_full_param_installs_mcore_te_lazy_main_grad_protocol():
     assert main_grad.numel() == spec.full_param.numel()
 
 
+def test_mfsdp_sharded_grad_hook_overwrites_each_microbatch_staging_buffer():
+    """Match MCore's data-distributed _grad_acc copy_ semantics."""
+    model = torch.nn.Linear(4, 3, bias=False, dtype=torch.bfloat16)
+    groups = mfsdp_buffer.MFSDPProcessGroups(
+        dense_dp=None,
+        expert_dp=None,
+        dense_ag=None,
+        expert_ag=None,
+        tp=None,
+        etp=None,
+        ep=None,
+        pp=None,
+    )
+    bucket = mfsdp_buffer.ParamAndGradBuffer(
+        model,
+        groups=groups,
+        config=mfsdp_config.MFSDPConfig(bucket_size=None),
+        is_expert=lambda _name: False,
+        unit_modules=(),
+    ).buckets[0]
+    spec = bucket.specs[0]
+    staged = spec.full_param.get_main_grad()
+    staged.fill_(7.0)
+    expected = torch.full_like(spec.full_param, 3.0)
+    spec.full_param.grad = expected
+
+    bucket._make_grad_ready_hook(spec)(spec.full_param)
+
+    assert torch.equal(spec.full_param.main_grad, expected)
+    assert spec.full_param.grad_added_to_main_grad is False
+
+
 def test_mfsdp_reduce_scatters_each_microbatch_into_sharded_accumulation():
     torch.manual_seed(321)
     reference = _GlooModel()
@@ -1625,7 +1671,11 @@ def test_mfsdp_reduce_scatters_each_microbatch_into_sharded_accumulation():
         candidate_output = chunks[0](value)
         if microbatch_idx:
             buckets = chunks[0].param_sync.buckets
-            assert all(bucket._full_main_grad_lease is None for bucket in buckets)
+            # MCore carries the previous microbatch's asynchronous reductions
+            # through this forward. Their staging is retired lazily when the
+            # corresponding backward bucket requests main_grad again, not at
+            # begin_forward().
+            assert chunks[0].grad_reduce_pipeline._pending
             assert any(
                 torch.count_nonzero(bucket.main_grad_buffer) for bucket in buckets
             )
@@ -1633,6 +1683,18 @@ def test_mfsdp_reduce_scatters_each_microbatch_into_sharded_accumulation():
         if microbatch_idx == len(microbatches) - 1:
             candidate_optimizer.grad_sync_enabled = True
         (candidate_loss / len(microbatches)).backward()
+        assert chunks[0].grad_reduce_pipeline._pending, (
+            microbatch_idx,
+            [
+                (
+                    bucket.bucket_id,
+                    len(bucket._grad_ready_ids),
+                    bucket._grad_reduce_launched,
+                    bucket._microbatch_reduced,
+                )
+                for bucket in chunks[0].param_sync.buckets
+            ],
+        )
 
     candidate_optimizer.finish_grad_sync()
 
@@ -1699,11 +1761,11 @@ def test_mfsdp_double_buffer_enforces_two_inflight_bucket_slots_for_nccl_ub():
     first._grad_reduce_finished = False
     second._grad_reduce_finished = False
     pipeline._pending = [
-        (first, first.full_numel * first.full_main_grad_buffer.element_size()),
-        (second, second.full_numel * second.full_main_grad_buffer.element_size()),
+        (first, first.full_numel),
+        (second, second.full_numel),
     ]
-    pipeline._pending_bytes = sum(
-        byte_count for _bucket, byte_count in pipeline._pending
+    pipeline._pending_elements = sum(
+        element_count for _bucket, element_count in pipeline._pending
     )
     assert len(pipeline._pending) == 2
     assert third.config.fsdp_double_buffer is True
@@ -1807,12 +1869,16 @@ def test_mfsdp_abort_waits_inflight_work_before_shared_allocator_clear(monkeypat
     assert getattr(allocator, "_busy", {}) == {}
 
 
-def test_mfsdp_grad_reduce_pending_queue_is_bounded_in_bytes():
+def test_mfsdp_grad_reduce_waits_at_launch_using_mcore_element_capacity():
     class PendingBucket:
         def __init__(self, full_numel: int):
             self.device = torch.device("cpu")
             self.full_numel = full_numel
             self.policy = SimpleNamespace(grad_comm_dtype=torch.float32)
+            self.config = SimpleNamespace(
+                fsdp_double_buffer=False,
+                suggested_communication_unit_size=32,
+            )
             self.world_size = 1
             self.process_group = None
             self.launched = False
@@ -1839,10 +1905,98 @@ def test_mfsdp_grad_reduce_pending_queue_is_bounded_in_bytes():
     pipeline.reduce_gradients(second, force=True)
     pipeline.reduce_gradients(third, force=True)
 
-    assert pipeline._pending_bytes == (32 + 32) * 4
-    assert pipeline._pending_capacity_bytes == 2 * 32 * 4
+    # MCore measures the already-queued elements immediately before launching
+    # the next reduction.  The queue may therefore exceed the suggestion by
+    # the just-launched bucket; it is trimmed at the following launch.
+    assert pipeline._pending_elements == 32 + 32
+    assert pipeline._pending_capacity_elements == 32
     assert first.waited is True
     assert second.waited is False
+
+
+def test_mfsdp_all_gather_launches_whole_owner_before_wait_and_prefetches_by_budget():
+    events = []
+
+    class GatherBucket:
+        def __init__(self, bucket_id: int):
+            self.bucket_id = bucket_id
+            self.device = torch.device("cpu")
+            self.full_numel = 10
+            self.config = SimpleNamespace(
+                overlap_param_gather=True,
+                fsdp_double_buffer=False,
+                suggested_communication_unit_size=30,
+            )
+
+        def install_full_parameters(self):
+            events.append(("install", self.bucket_id))
+
+    buckets = [GatherBucket(index) for index in range(4)]
+    pipeline = mfsdp_buffer.AllGatherPipeline(buckets)
+    pipeline.async_bucket_gather = lambda bucket_id, bwd=False: events.append(
+        ("launch_bwd" if bwd else "launch_fwd", bucket_id)
+    )
+    pipeline.wait_bucket_ready = lambda bucket_id, bwd=False: events.append(
+        ("wait_bwd" if bwd else "wait_fwd", bucket_id)
+    )
+
+    pipeline.acquire_forward((0, 1))
+
+    assert events[:4] == [
+        ("launch_fwd", 0),
+        ("launch_fwd", 1),
+        ("launch_fwd", 2),
+        ("launch_fwd", 3),
+    ]
+    assert events[4:] == [
+        ("wait_fwd", 0),
+        ("install", 0),
+        ("wait_fwd", 1),
+        ("install", 1),
+    ]
+
+
+def test_mfsdp_all_gather_wait_is_bucket_scoped_not_whole_stream():
+    class GatherBucket:
+        bucket_id = 0
+        device = torch.device("cpu")
+        full_numel = 10
+        config = SimpleNamespace(
+            overlap_param_gather=True,
+            fsdp_double_buffer=False,
+            suggested_communication_unit_size=30,
+        )
+        _full_ready = False
+        _param_gather_work = object()
+
+        def wait_param_gather(self):
+            self.waited = True
+
+    bucket = GatherBucket()
+    pipeline = mfsdp_buffer.AllGatherPipeline([bucket])
+    pipeline.comm_stream.wait_for_current = lambda: (_ for _ in ()).throw(
+        AssertionError("waited for unrelated prefetched collectives")
+    )
+
+    pipeline.wait_bucket_ready(0)
+
+    assert bucket.waited is True
+
+
+def test_mfsdp_next_microbatch_forward_does_not_drain_grad_reduce_queue():
+    chunk, optimizer = _single_rank_mfsdp_stack()
+    value = torch.randn(3, 4)
+    target = torch.randn(3, 2)
+
+    optimizer.zero_grad()
+    torch.nn.functional.mse_loss(chunk(value), target).backward()
+    pending_before = tuple(chunk.grad_reduce_pipeline._pending)
+    assert pending_before
+
+    chunk(value)
+
+    assert tuple(chunk.grad_reduce_pipeline._pending) == pending_before
+    optimizer.finish_grad_sync()
 
 
 def test_mfsdp_materializes_root_params_used_without_calling_their_leaf_module():
@@ -2005,7 +2159,10 @@ def test_mfsdp_routes_fused_wgrad_through_bucketed_fp32_main_grad():
 
     spec = bucket.specs[0]
     assert model.fuse_wgrad_accumulation is True
-    assert spec.full_param.grad_added_to_main_grad is True
+    # Match MCore's _grad_acc contract: this is a per-backward signal from TE,
+    # not optimizer-step state, so the post-accumulate hook must consume and
+    # clear it before the next microbatch.
+    assert spec.full_param.grad_added_to_main_grad is False
     assert spec.full_param.grad is None
     assert spec.full_param.main_grad.dtype is torch.float32
     assert spec.full_param.main_grad.untyped_storage().data_ptr() == (

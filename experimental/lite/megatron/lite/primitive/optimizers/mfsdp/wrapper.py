@@ -92,7 +92,10 @@ class MegatronFSDP(nn.Module):
             unit_modules=unit_modules,
         )
         _enable_fused_wgrad_accumulation(module)
-        self.param_sync = CommunicationPipelines(self.param_and_grad_buffer.buckets)
+        self.param_sync = CommunicationPipelines(
+            self.param_and_grad_buffer.buckets,
+            self.param_and_grad_buffer.owners.values(),
+        )
         self.all_gather_pipeline: AllGatherPipeline = self.param_sync.all_gather
         self.grad_reduce_pipeline: GradReducePipeline = self.param_sync.grad_reduce
         for owner_id, bucket_ids in self.param_and_grad_buffer.owners.items():

@@ -1,22 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""M-FSDP multi-forward (recompute) full-parameter buffer lifecycle. CPU-only.
-
-A ``retain_full_storage_through_backward`` bucket (1-D params -- LayerNorm
-weight/bias) keeps its gathered full-parameter buffer resident past the forward
-so the matching backward can reuse it without re-gathering; the actual release
-is deferred to ``_ReleaseBackward`` in the autograd graph. That deferral is only
-valid when a backward will run. A *grad-disabled* forward (``torch.no_grad`` /
-``inference_mode`` -- e.g. the DAPO ``bypass_mode=False`` rollout-correction
-logprob recompute, a second forward inside one logical step) has no backward, so
-the deferred release never fires and the bucket's full-parameter lease stays
-pinned (its allocator slot ``busy``). The next ``release_cached`` -- a colocated
-vLLM wake, a full-parameter export, or a ``move_model_state`` offload -- then
-tripped ``DoubleBufferAllocator.release_cached``'s busy guard with a spurious
-"Cannot release active M-FSDP communication buffers." RuntimeError (buffer.py).
-
-These tests build a real M-FSDP-wrapped model (world_size=1, gloo-free CPU path)
-and exercise the multi-forward timing that produced the crash.
-"""
+"""M-FSDP multi-forward full-parameter lifecycle tests. CPU-only."""
 
 from __future__ import annotations
 
@@ -114,17 +97,12 @@ def _release_cached_buffers(chunk) -> None:
             allocator.release_cached()
 
 
-def test_retain_bucket_is_actually_the_layernorm_1d_params():
-    # Guards the premise: LayerNorm weight/bias form a retain-through-backward
-    # bucket. If bucketing changes so nothing retains, the regression below
-    # would pass vacuously.
+def test_layernorm_params_follow_mcore_unit_reshard_lifecycle():
     chunk, _optimizer = _build_chunk()
-    retain = [
-        [spec.name for spec in bucket.specs]
+    assert not any(
+        bucket.retain_full_storage_through_backward
         for bucket in chunk.param_sync.buckets
-        if bucket.retain_full_storage_through_backward
-    ]
-    assert retain == [["unit.norm.weight", "unit.norm.bias"]]
+    )
 
 
 def test_train_step_leaves_no_active_buffers():
@@ -184,18 +162,15 @@ def test_inference_mode_recompute_forward_releases_retain_bucket():
     _release_cached_buffers(chunk)  # must not raise
 
 
-def test_grad_enabled_forward_still_retains_until_backward():
-    # The retain optimization must be preserved on the training path: with grad
-    # enabled the 1-D bucket stays resident after the forward (so backward reuses
-    # it) and is only released once backward runs.
+def test_grad_enabled_forward_reshards_before_backward_like_mcore():
     chunk, optimizer = _build_chunk()
     value = torch.randn(3, 4)
     target = torch.randn(3, 2)
 
     optimizer.zero_grad()
     loss = torch.nn.functional.mse_loss(chunk(value), target)
-    # The output still owns the complete autograd graph before backward.
     assert loss.requires_grad
+    assert not _any_slot_busy(chunk)
 
     loss.backward()
     optimizer.finish_grad_sync()

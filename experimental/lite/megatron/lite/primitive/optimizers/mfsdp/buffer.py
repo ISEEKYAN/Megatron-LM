@@ -367,6 +367,7 @@ class ParamBucket:
         self._local_compute_lease: BufferLease | None = None
         self._local_grad_comm_lease: BufferLease | None = None
         self._param_gather_work: Any | None = None
+        self._param_gather_event: Any | None = None
         self._grad_reduce_work: Any | None = None
         self._grad_reduce_event: Any | None = None
         self._grad_reduce_launched = False
@@ -426,6 +427,7 @@ class ParamBucket:
             spec.full_param.data = view
             # TE checks these MCore FSDP markers before using the lazy FP32
             # wgrad destination, so restore them on every materialization.
+            spec.full_param.grad_added_to_main_grad = False
             spec.full_param.__fsdp_param__ = True
             spec.full_param.overwrite_main_grad = True
             for binding in spec.bindings:
@@ -452,8 +454,11 @@ class ParamBucket:
 
     def get_main_grad(self, spec: ParamSpec) -> torch.Tensor:
         """Lazily allocate this bucket's full-precision gradient staging view."""
+        # A prior microbatch may still be reducing this bucket's staging
+        # buffer.  MCore carries that work across the next forward and only
+        # resolves storage pressure when main_grad is requested again.
+        self._enforce_main_grad_slot_limit()
         if self._full_main_grad_lease is None:
-            self._enforce_main_grad_slot_limit()
             self._full_main_grad_lease = self.allocator.allocate(
                 self.full_numel,
                 dtype=self.policy.main_grads_dtype,
@@ -514,13 +519,16 @@ class ParamBucket:
             self.local_compute_buffer.copy_(self.main_param_buffer)
         return self.full_buffer, self.local_compute_buffer
 
-    def mark_param_gather_launched(self, work: Any | None) -> None:
+    def mark_param_gather_launched(
+        self, work: Any | None, completion_event: Any | None = None
+    ) -> None:
         self._param_gather_work = work
+        self._param_gather_event = completion_event
 
     def wait_param_gather(self) -> None:
         if self._full_ready:
             return
-        if self._param_gather_work is None:
+        if self._param_gather_work is None and self._param_gather_event is None:
             output, local = self.prepare_param_gather()
             if self.world_size == 1:
                 output.copy_(local)
@@ -528,7 +536,11 @@ class ParamBucket:
                 self._param_gather_work = dist.all_gather_into_tensor(
                     output, local, group=self.gather_group, async_op=True
                 )
-        if self._param_gather_work is not None:
+        if self._param_gather_event is not None:
+            torch.cuda.current_stream(self.device).wait_event(self._param_gather_event)
+            self._param_gather_event = None
+            self._param_gather_work = None
+        elif self._param_gather_work is not None:
             self._param_gather_work.wait()
             self._param_gather_work = None
         self._release_local_compute_buffer()
@@ -536,6 +548,9 @@ class ParamBucket:
 
     def release_full_parameters(self) -> None:
         self.install_sharded_parameters()
+        if self._param_gather_event is not None:
+            self._param_gather_event.synchronize()
+            self._param_gather_event = None
         if self._param_gather_work is not None:
             self._param_gather_work.wait()
             self._param_gather_work = None
@@ -845,16 +860,25 @@ class ParamBucket:
 
     def _make_grad_ready_hook(self, spec: ParamSpec) -> Callable[[nn.Parameter], None]:
         def grad_ready(param: nn.Parameter) -> None:
-            if param.grad is None:
-                return
-            self._grad_ready_ids.add(id(spec))
             main_grad = param.get_main_grad()
-            if param.grad_added_to_main_grad:
-                param.grad = None
-            else:
+            if not param.grad_added_to_main_grad:
                 with torch.no_grad():
-                    main_grad.add_(param.grad)
+                    if param.grad is None:
+                        main_grad.zero_()
+                    else:
+                        # This is the data-distributed MCore path: each
+                        # microbatch owns a fresh unsharded communication
+                        # bucket, so copy rather than accumulate into it.
+                        main_grad.copy_(param.grad)
+            if param.grad is not None:
                 param.grad = None
+            # MCore treats this as a one-backward notification from TE.  It
+            # must not leak into the next microbatch's accumulation decision.
+            param.grad_added_to_main_grad = False
+            # get_main_grad() may retire this same bucket's previous
+            # microbatch, whose completion clears the old ready set. Mark the
+            # current parameter only after that retirement.
+            self._grad_ready_ids.add(id(spec))
             if len(self._grad_ready_ids) != len(self.specs):
                 return
             if self.grad_ready_callback is not None:
@@ -924,20 +948,17 @@ class ParamAndGradBuffer:
             spec.bindings.append(ParamBinding(parent, attribute))
 
         grouped: dict[
-            tuple[int, bool, bool, torch.dtype, torch.device], list[ParamSpec]
+            tuple[int, bool, torch.dtype, torch.device], list[ParamSpec]
         ] = defaultdict(list)
         owner_for_key: dict[
-            tuple[int, bool, bool, torch.dtype, torch.device], nn.Module
+            tuple[int, bool, torch.dtype, torch.device], nn.Module
         ] = {}
         for param_id, spec in specs_by_id.items():
             owner = owner_by_param_id[param_id]
             expert = expert_by_param_id[param_id]
-            retain_full_storage = len(spec.shape) == 1
-            spec.retain_full_storage_through_backward = retain_full_storage
             key = (
                 module_order[id(owner)],
                 expert,
-                retain_full_storage,
                 spec.full_param.dtype,
                 spec.full_param.device,
             )
@@ -947,7 +968,7 @@ class ParamAndGradBuffer:
         buckets: list[ParamBucket] = []
         owners: dict[int, list[int]] = defaultdict(list)
         for key in sorted(grouped, key=lambda item: item[0]):
-            _owner_order, expert, _retain_full_storage, _dtype, _device = key
+            _owner_order, expert, _dtype, _device = key
             owner = owner_for_key[key]
             partitions = _split_specs(grouped[key], self.config.bucket_size)
             owner_type = type(owner)
@@ -965,7 +986,6 @@ class ParamAndGradBuffer:
                         allocator_layout_key=(
                             owner_layout,
                             expert,
-                            _retain_full_storage,
                             partition_index,
                             len(partitions),
                             sum(spec.numel for spec in partition),
@@ -1070,13 +1090,76 @@ class CommunicationStream:
         if self.stream is not None:
             torch.cuda.current_stream(self.device).wait_stream(self.stream)
 
+    def record_event(self) -> torch.cuda.Event | None:
+        if self.stream is None:
+            return None
+        event = torch.cuda.Event()
+        with torch.cuda.stream(self.stream):
+            event.record(self.stream)
+        return event
+
+
+def _resolve_suggested_communication_unit_size(
+    buckets: list["ParamBucket"],
+    owner_bucket_ids: Iterable[Iterable[int]] | None,
+    *,
+    explicit: int | None,
+) -> int:
+    """Resolve MCore's shared RS queue / AG prefetch element budget."""
+    configured = explicit
+    if configured is None and buckets:
+        configured = getattr(
+            buckets[0].config, "suggested_communication_unit_size", None
+        )
+    if configured is not None:
+        return int(configured)
+
+    groups = tuple(tuple(group) for group in (owner_bucket_ids or ()))
+    if groups:
+        total_elements = sum(
+            sum(buckets[bucket_id].full_numel for bucket_id in group)
+            for group in groups
+        )
+        average_owner_elements = total_elements // len(groups)
+        suggested = average_owner_elements * 2
+    else:
+        suggested = 1_000_000_000
+    # This follows MCore exactly: its default is never smaller than 1B
+    # elements, while an explicitly configured value is accepted as-is.
+    return max(1_000_000_000, suggested)
+
 
 class AllGatherPipeline:
     """Prefetch parameter buckets in forward and reverse-backward order."""
 
-    def __init__(self, buckets: list[ParamBucket]) -> None:
+    def __init__(
+        self,
+        buckets: list[ParamBucket],
+        owner_bucket_ids: Iterable[Iterable[int]] | None = None,
+        *,
+        suggested_communication_unit_size: int | None = None,
+    ) -> None:
         self.buckets = buckets
         self.overlap = bool(buckets and buckets[0].config.overlap_param_gather)
+        owner_bucket_ids = tuple(tuple(group) for group in (owner_bucket_ids or ()))
+        self.suggested_prefetch_elements = (
+            _resolve_suggested_communication_unit_size(
+                buckets,
+                owner_bucket_ids,
+                explicit=suggested_communication_unit_size,
+            )
+            // 2
+        )
+        groups = owner_bucket_ids or ((bucket.bucket_id,) for bucket in buckets)
+        self._bucket_groups = sorted(
+            (tuple(sorted(set(group))) for group in groups),
+            key=lambda group: group[0],
+        )
+        self._bucket_to_group = {
+            bucket_id: index
+            for index, group in enumerate(self._bucket_groups)
+            for bucket_id in group
+        }
         device = buckets[0].device if buckets else torch.device("cpu")
         self.comm_stream = CommunicationStream(device)
         self._forward_cursor = 0
@@ -1084,7 +1167,11 @@ class AllGatherPipeline:
 
     def async_bucket_gather(self, bucket_id: int, bwd: bool = False) -> None:
         bucket = self.buckets[bucket_id]
-        if bucket._full_ready or bucket._param_gather_work is not None:
+        if (
+            bucket._full_ready
+            or bucket._param_gather_work is not None
+            or bucket._param_gather_event is not None
+        ):
             return
         output, local = bucket.prepare_param_gather()
 
@@ -1097,7 +1184,7 @@ class AllGatherPipeline:
             )
 
         work = self.comm_stream.launch(collective, (output, local))
-        bucket.mark_param_gather_launched(work)
+        bucket.mark_param_gather_launched(work, self.comm_stream.record_event())
 
     def wait_bucket_ready(self, bucket_id: int, bwd: bool = False) -> None:
         bucket = self.buckets[bucket_id]
@@ -1105,11 +1192,11 @@ class AllGatherPipeline:
             self.overlap
             and not bucket._full_ready
             and bucket._param_gather_work is None
+            and bucket._param_gather_event is None
         ):
             # Prefetch/overlap path: launch the dense all-gather ahead of use on the
             # dedicated priority communication stream.
             self.async_bucket_gather(bucket_id, bwd=bwd)
-        self.comm_stream.wait_for_current()
         # When overlap is disabled (the guard forces this for any CP>=2 + DP-sharded
         # config, see optimizer._order_param_gathers_for_parallel_collectives), do NOT
         # launch on the side comm stream. Let wait_param_gather issue the all-gather on
@@ -1128,12 +1215,49 @@ class AllGatherPipeline:
             self.async_bucket_gather(0)
 
     def acquire_forward(self, bucket_ids: Iterable[int]) -> None:
-        for bucket_id in bucket_ids:
+        requested = tuple(sorted(set(bucket_ids)))
+        self._launch_with_prefetch(requested, bwd=False)
+        for bucket_id in requested:
             self.wait_bucket_ready(bucket_id)
             self.buckets[bucket_id].install_full_parameters()
-            self._forward_cursor = max(self._forward_cursor, bucket_id + 1)
-            if self.overlap and self._forward_cursor < len(self.buckets):
-                self.async_bucket_gather(self._forward_cursor)
+        if requested:
+            self._forward_cursor = max(self._forward_cursor, requested[-1] + 1)
+
+    def _launch_with_prefetch(self, bucket_ids: tuple[int, ...], *, bwd: bool) -> None:
+        if not bucket_ids:
+            return
+        # The non-overlap path deliberately gathers on the current stream in
+        # wait_bucket_ready() so intersecting CP/DP process groups keep one
+        # program order across ranks.
+        if not self.overlap:
+            return
+        for bucket_id in bucket_ids:
+            self.async_bucket_gather(bucket_id, bwd=bwd)
+
+        direction = -1 if bwd else 1
+        edge_bucket = bucket_ids[0] if bwd else bucket_ids[-1]
+        group_index = self._bucket_to_group[edge_bucket] + direction
+        resident_groups = {self._bucket_to_group[bucket_id] for bucket_id in bucket_ids}
+        double_buffer = bool(
+            getattr(self.buckets[0].config, "fsdp_double_buffer", False)
+        )
+        if double_buffer and len(resident_groups) > 2:
+            raise ValueError(
+                "M-FSDP double buffers cannot materialize more than two owners at once."
+            )
+        prefetched = 0
+        while 0 <= group_index < len(self._bucket_groups):
+            if prefetched >= self.suggested_prefetch_elements:
+                break
+            if double_buffer and group_index not in resident_groups:
+                if len(resident_groups) >= 2:
+                    break
+                resident_groups.add(group_index)
+            group = self._bucket_groups[group_index]
+            for bucket_id in group:
+                self.async_bucket_gather(bucket_id, bwd=bwd)
+                prefetched += self.buckets[bucket_id].full_numel
+            group_index += direction
 
     def begin_backward(self) -> None:
         self._backward_cursor = len(self.buckets) - 1
@@ -1147,6 +1271,15 @@ class AllGatherPipeline:
         self._backward_cursor = min(self._backward_cursor, bucket_id - 1)
         if self.overlap and self._backward_cursor >= 0:
             self.async_bucket_gather(self._backward_cursor, bwd=True)
+
+    def acquire_backward_ids(self, bucket_ids: Iterable[int]) -> None:
+        requested = tuple(sorted(set(bucket_ids)))
+        self._launch_with_prefetch(requested, bwd=True)
+        for bucket_id in requested:
+            self.wait_bucket_ready(bucket_id, bwd=True)
+            self.buckets[bucket_id].install_full_parameters()
+        if requested:
+            self._backward_cursor = min(self._backward_cursor, requested[0] - 1)
 
     def materialize_all(self) -> None:
         for bucket in self.buckets:
@@ -1166,21 +1299,31 @@ class AllGatherPipeline:
 class GradReducePipeline:
     """Launch ready reduce-scatter buckets on a communication stream."""
 
-    def __init__(self, buckets: list[ParamBucket]) -> None:
+    def __init__(
+        self,
+        buckets: list[ParamBucket],
+        owner_bucket_ids: Iterable[Iterable[int]] | None = None,
+        *,
+        suggested_communication_unit_size: int | None = None,
+    ) -> None:
         self.buckets = buckets
         device = buckets[0].device if buckets else torch.device("cpu")
         self.comm_stream = CommunicationStream(device)
         self._pending: list[tuple[ParamBucket, int]] = []
-        self._pending_bytes = 0
-        self._pending_capacity_bytes = 0
+        self._pending_elements = 0
+        self._pending_capacity_elements = _resolve_suggested_communication_unit_size(
+            buckets,
+            owner_bucket_ids,
+            explicit=suggested_communication_unit_size,
+        )
         for bucket in buckets:
             bucket.grad_ready_callback = self.reduce_gradients
-            bucket.before_main_grad_allocate = self._enforce_double_buffer_limit
+            bucket.before_main_grad_allocate = self._prepare_main_grad_allocate
 
     def _retire_oldest(self) -> None:
-        completed, completed_bytes = self._pending.pop(0)
+        completed, completed_elements = self._pending.pop(0)
         completed.wait_grad_reduce()
-        self._pending_bytes -= completed_bytes
+        self._pending_elements -= completed_elements
 
     def _enforce_double_buffer_limit(self, incoming: ParamBucket) -> None:
         """Keep at most two live full-gradient bucket slots.
@@ -1195,8 +1338,24 @@ class GradReducePipeline:
         while len(self._pending) >= 2:
             self._retire_oldest()
 
+    def _prepare_main_grad_allocate(self, incoming: ParamBucket) -> None:
+        # This standalone bucket object owns one staging lease.  Preserve
+        # MCore's cross-microbatch overlap by carrying reductions through the
+        # next forward, then retire in FIFO order immediately before the same
+        # bucket's staging is reused by backward.
+        retired_incoming = False
+        while any(bucket is incoming for bucket, _elements in self._pending):
+            retired_incoming = retired_incoming or self._pending[0][0] is incoming
+            self._retire_oldest()
+        if retired_incoming:
+            # wait_grad_reduce() finalized the previous microbatch after this
+            # microbatch's begin_backward() reset. Re-open the bucket for the
+            # reduction that will be produced by the current backward.
+            incoming.start_microbatch()
+        self._enforce_double_buffer_limit(incoming)
+
     def reduce_gradients(self, bucket: ParamBucket, *, force: bool = False) -> None:
-        self._drain_for(bucket)
+        self._wait_for_previous_grad_reduce()
         tensors = bucket.prepare_grad_reduce(force=force)
         if tensors is None:
             return
@@ -1220,27 +1379,15 @@ class GradReducePipeline:
             completion_event = torch.cuda.Event()
             completion_event.record(self.comm_stream.stream)
         bucket.mark_grad_reduce_launched(work, completion_event)
-        byte_count = grad_input.numel() * grad_input.element_size()
-        self._pending.append((bucket, byte_count))
-        self._pending_bytes += byte_count
+        element_count = grad_input.numel()
+        self._pending.append((bucket, element_count))
+        self._pending_elements += element_count
 
-    def _drain_for(self, bucket: ParamBucket) -> None:
-        byte_count = (
-            bucket.full_numel
-            * torch.empty((), dtype=bucket.policy.grad_comm_dtype).element_size()
-        )
-        self._pending_capacity_bytes = max(self._pending_capacity_bytes, 2 * byte_count)
+    def _wait_for_previous_grad_reduce(self) -> None:
         while (
             self._pending
-            and self._pending_bytes + byte_count > self._pending_capacity_bytes
+            and self._pending_elements > self._pending_capacity_elements
         ):
-            self._retire_oldest()
-
-    def reclaim_before_backward(self) -> None:
-        # Bound full, unsharded FP32 gradient staging to the allocator's two
-        # reusable slots.  Without this drain, delayed microbatch sync retains
-        # one 4-byte-per-parameter buffer for every completed bucket.
-        while len(self._pending) >= 2:
             self._retire_oldest()
 
     def has_microbatch_work(self) -> bool:
@@ -1260,7 +1407,7 @@ class GradReducePipeline:
     def abort(self) -> None:
         """Forget queued work after a forward exception has become primary."""
         self._pending.clear()
-        self._pending_bytes = 0
+        self._pending_elements = 0
 
     def start_microbatch(self) -> None:
         for bucket in self.buckets:
@@ -1268,7 +1415,7 @@ class GradReducePipeline:
 
     def reset(self) -> None:
         self._pending.clear()
-        self._pending_bytes = 0
+        self._pending_elements = 0
         for bucket in self.buckets:
             bucket.reset_grad_state()
 
@@ -1283,33 +1430,42 @@ class GradReducePipeline:
 class CommunicationPipelines:
     """Join parameter all-gather and gradient reduce-scatter pipelines."""
 
-    def __init__(self, buckets: list[ParamBucket]) -> None:
+    def __init__(
+        self,
+        buckets: list[ParamBucket],
+        owner_bucket_ids: Iterable[Iterable[int]] | None = None,
+    ) -> None:
         self.buckets = buckets
-        self.all_gather = AllGatherPipeline(buckets)
-        self.grad_reduce = GradReducePipeline(buckets)
+        owner_bucket_ids = tuple(tuple(group) for group in (owner_bucket_ids or ()))
+        explicit = (
+            buckets[0].config.suggested_communication_unit_size if buckets else None
+        )
+        self.all_gather = AllGatherPipeline(
+            buckets,
+            owner_bucket_ids,
+            suggested_communication_unit_size=explicit,
+        )
+        self.grad_reduce = GradReducePipeline(
+            buckets,
+            owner_bucket_ids,
+            suggested_communication_unit_size=explicit,
+        )
 
     def begin_forward(self) -> None:
-        if self.grad_reduce.has_microbatch_work():
-            self.grad_reduce.finish()
         self.all_gather.begin_forward()
 
     def acquire_forward(self, bucket_ids: Iterable[int]) -> None:
         self.all_gather.acquire_forward(bucket_ids)
 
     def begin_backward(self) -> None:
-        if self.grad_reduce.has_microbatch_work():
-            self.grad_reduce.finish()
         self.grad_reduce.start_microbatch()
         self.all_gather.begin_backward()
 
     def acquire_backward(self, bucket: ParamBucket) -> None:
-        self.grad_reduce.reclaim_before_backward()
         self.all_gather.acquire_backward(bucket)
 
     def acquire_backward_ids(self, bucket_ids: Iterable[int]) -> None:
-        for bucket_id in reversed(tuple(bucket_ids)):
-            self.grad_reduce.reclaim_before_backward()
-            self.all_gather.acquire_backward(self.buckets[bucket_id])
+        self.all_gather.acquire_backward_ids(bucket_ids)
 
     def release_backward_ids(self, bucket_ids: Iterable[int]) -> None:
         for bucket_id in bucket_ids:
@@ -1317,34 +1473,16 @@ class CommunicationPipelines:
             bucket.release_full_parameters()
             bucket.discard_full_parameter_views()
 
-    def _retain_through_backward(self, bucket: "ParamBucket") -> bool:
-        # A ``retain_full_storage_through_backward`` bucket keeps its gathered
-        # full-parameter buffer live past the forward so the matching backward
-        # can reuse it without re-gathering; the release is deferred to
-        # ``_ReleaseBackward`` (see wrapper.py). That deferral is only valid when
-        # a backward will actually run -- i.e. autograd is recording a graph.
-        # A grad-disabled forward (``torch.no_grad`` / ``inference_mode``, e.g.
-        # the DAPO rollout-correction logprob recompute) has no backward, so the
-        # deferred release would never fire and the bucket's full-parameter lease
-        # would stay pinned (its allocator slot ``busy``) until the next
-        # ``begin_forward``. Any intervening ``release_cached`` (a colocated vLLM
-        # wake / full-parameter export / ``move_model_state`` offload) would then
-        # trip the busy-buffer guard with a spurious "active buffers" raise. When
-        # grad is disabled, release these buckets eagerly like every other.
-        return bucket.retain_full_storage_through_backward and torch.is_grad_enabled()
-
     def release_forward_ids(self, bucket_ids: Iterable[int]) -> None:
         for bucket_id in bucket_ids:
             bucket = self.buckets[bucket_id]
-            if not self._retain_through_backward(bucket):
-                bucket.release_full_parameters()
-                bucket.discard_full_parameter_views()
+            bucket.release_full_parameters()
+            bucket.discard_full_parameter_views()
 
     def end_forward(self) -> None:
         for bucket in self.buckets:
-            if not self._retain_through_backward(bucket):
-                bucket.release_full_parameters()
-                bucket.discard_full_parameter_views()
+            bucket.release_full_parameters()
+            bucket.discard_full_parameter_views()
 
     def materialize_all(self) -> None:
         self.all_gather.materialize_all()
@@ -1402,6 +1540,11 @@ class CommunicationPipelines:
 
     def finish_grad_sync(self) -> None:
         self.grad_reduce.finish()
+        # MCore synchronizes and resets the parameter-gather pipeline before
+        # exposing optimizer shards.  This also releases backward-prefetched
+        # buckets that were never consumed (for example at graph boundaries).
+        self.all_gather.release_all()
+        self.discard_full_parameter_views()
 
     def abort(self) -> None:
         """Best-effort two-phase exception teardown for shared communication storage."""
