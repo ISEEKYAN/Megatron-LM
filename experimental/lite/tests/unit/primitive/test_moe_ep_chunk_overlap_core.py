@@ -1123,6 +1123,9 @@ def test_logical_chunk_slot_reuse_finishes_combine_before_dispatch_reacquire(
     chunk_count, saved_context, monkeypatch, transformer_engine_import_stub
 ):
     """Exercise both forward pipelines with two strictly leased physical slots."""
+    import gc
+    import weakref
+
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules import moe_ep_chunk_overlap as overlap
 
@@ -1150,8 +1153,15 @@ def test_logical_chunk_slot_reuse_finishes_combine_before_dispatch_reacquire(
             }
 
         def finish_deepep_dispatch(self, state, **_kwargs):
+            gc.collect()
+            chunk_idx = state["chunk_idx"] // 2
+            events.append(f"finish:{chunk_idx}")
+            dispatched = state["recv_hidden"].clone()
+            weakref.finalize(
+                dispatched, events.append, f"retire_dispatched:{chunk_idx}"
+            )
             return (
-                state["recv_hidden"],
+                dispatched,
                 [state["recv_hidden"].size(0)],
                 state["recv_probs"],
             )
@@ -1267,6 +1277,8 @@ def test_logical_chunk_slot_reuse_finishes_combine_before_dispatch_reacquire(
 
     assert output.shape == x.shape
     assert workspace.leased == set()
+    if not saved_context:
+        assert events.index("retire_dispatched:0") < events.index("finish:1"), events
     for slot in range(2):
         acquires = [
             index for index, event in enumerate(events) if event == f"acquire:{slot}"

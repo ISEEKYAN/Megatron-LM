@@ -1498,6 +1498,11 @@ class _EPChunkOperationBase:
                             pending_combine = None
                     current_state = submit_dispatch(loop_idx + 1)
                 prepared = run_expert(finished)
+                # ``run_expert`` copies the permute result into fc1_input.
+                # Do not retain that result through the next iteration's
+                # finish_dispatch RHS, which otherwise creates a second large
+                # permute allocation before the first can be retired.
+                del finished
                 if pending_combine is not None:
                     finish_combine(pending_combine)
                 pending_combine = submit_combine(prepared)
