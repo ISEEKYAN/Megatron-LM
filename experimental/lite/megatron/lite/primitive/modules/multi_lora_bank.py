@@ -89,11 +89,18 @@ def apply_batched_lora_delta(
         raise ValueError("batched LoRA input must have a feature dimension.")
     rows = x.reshape(-1, x.shape[-1])
     slots = lora_indices.reshape(-1)
-    if slots.numel() != rows.shape[0]:
-        raise ValueError("batched LoRA indices must have one entry per token.")
     if sequence_parallel_input:
+        local_rows = rows.shape[0]
         rows = _gather_sequence_parallel(rows, tp_group)
-        slots = _gather_sequence_parallel(slots[:, None], tp_group).squeeze(-1)
+        # Sidecars receive the logical batch slots.  The normalized QKV input
+        # is SP-local, so accept either logical-global slots (production) or
+        # local slots (the primitive contract) and gather only the latter.
+        if slots.numel() == local_rows:
+            slots = _gather_sequence_parallel(slots[:, None], tp_group).squeeze(-1)
+        elif slots.numel() != rows.shape[0]:
+            raise ValueError("SP LoRA indices must describe local or gathered tokens.")
+    elif slots.numel() != rows.shape[0]:
+        raise ValueError("batched LoRA indices must have one entry per token.")
     partition = bank.partition
     if rows.shape[0] == 0:
         width = bank.b_bank.shape[1] * (
