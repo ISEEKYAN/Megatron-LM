@@ -1307,9 +1307,13 @@ class GradReducePipeline:
         suggested_communication_unit_size: int | None = None,
     ) -> None:
         self.buckets = buckets
+        self._bucket_ids = {
+            id(bucket): getattr(bucket, "bucket_id", index)
+            for index, bucket in enumerate(buckets)
+        }
         groups = tuple(tuple(sorted(set(group))) for group in (owner_bucket_ids or ()))
         self._bucket_groups = tuple(sorted(groups, key=lambda group: group[0])) or tuple(
-            (bucket.bucket_id,) for bucket in buckets
+            (self._bucket_ids[id(bucket)],) for bucket in buckets
         )
         self._bucket_to_group = {
             bucket_id: group
@@ -1374,8 +1378,9 @@ class GradReducePipeline:
         launches that group in bucket-id order, otherwise conditional/unused
         gradients can give different ranks different collective sequences.
         """
-        group = self._bucket_to_group.get(bucket.bucket_id, (bucket.bucket_id,))
-        self._bucket_ready_microbatch[bucket.bucket_id] = self._microbatch_id
+        bucket_id = self._bucket_ids[id(bucket)]
+        group = self._bucket_to_group.get(bucket_id, (bucket_id,))
+        self._bucket_ready_microbatch[bucket_id] = self._microbatch_id
         group_key = group[0]
         if self._group_launched_microbatch.get(group_key) == self._microbatch_id:
             return None
@@ -1418,7 +1423,8 @@ class GradReducePipeline:
 
     def reduce_gradients(self, bucket: ParamBucket, *, force: bool = False) -> None:
         if force:
-            group = self._bucket_to_group.get(bucket.bucket_id, (bucket.bucket_id,))
+            bucket_id = self._bucket_ids[id(bucket)]
+            group = self._bucket_to_group.get(bucket_id, (bucket_id,))
         else:
             group = self._ready_bucket_group(bucket)
             if group is None:
