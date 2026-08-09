@@ -1578,14 +1578,130 @@ def test_caller_owned_grouped_linear_keeps_te_delayed_wgrad_contract(
     from megatron.lite.primitive.modules import experts as experts_module
 
     source = inspect.getsource(experts_module._CallerOwnedGroupedLinear)
+    wrapper_source = inspect.getsource(experts_module._caller_owned_grouped_linear)
     assert "general_grouped_gemm" in source
     assert "wgrad_store.put" in source
     assert "main_grad sinks" in source
-    assert "linear.fp8" in source
-    assert "linear.use_bias" in source
+    assert "grad_added_to_main_grad" in source
+    assert "overwrite_main_grad" in source
+    assert "_2X_ACC_FPROP" in source
+    assert "_2X_ACC_DGRAD" in source
+    assert "_2X_ACC_WGRAD" in source
+    assert "prepare_forward" in wrapper_source
+    assert "end_forward" in wrapper_source
+    assert "_get_weight_tensors" in wrapper_source
+    assert "_get_quantizers" in wrapper_source
     assert "torch.bfloat16" in source
     assert "dgrad_out" in source
     assert "torch.empty_like(inp)" not in source
+
+
+def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
+    monkeypatch, transformer_engine_import_stub
+):
+    """CPU fake of TE2.15's narrow adapter: buffers, hooks, and delayed GEMM execute."""
+    transformer_engine_import_stub()
+    import sys
+
+    base = sys.modules["transformer_engine.pytorch.module.base"]
+    base._2X_ACC_FPROP = False
+    base._2X_ACC_DGRAD = False
+    base._2X_ACC_WGRAD = False
+    base.get_dummy_wgrad = lambda shape, dtype, zero=False: torch.zeros(
+        shape, dtype=dtype
+    ) if zero else torch.ones(shape, dtype=dtype)
+    cpp = sys.modules["transformer_engine.pytorch.cpp_extensions"]
+
+    def fake_grouped_gemm(
+        weights, inputs, outputs, quantization_params=None, out_dtype=None, **kwargs
+    ):
+        if kwargs.get("layout") == "NN":
+            pieces = [inp @ weight for weight, inp in zip(weights, inputs)]
+        elif kwargs.get("layout") == "NT":
+            pieces = [grad.T @ inp for inp, grad in zip(weights, inputs)]
+            for dst, piece in zip(outputs, pieces, strict=True):
+                if kwargs.get("accumulate"):
+                    dst.add_(piece)
+                else:
+                    dst.copy_(piece)
+            return None, [None] * len(pieces), None
+        else:
+            pieces = [inp @ weight.T for weight, inp in zip(weights, inputs)]
+        outputs[0].copy_(torch.cat(pieces, dim=0))
+        return None, [None] * len(pieces), None
+
+    cpp.general_grouped_gemm = fake_grouped_gemm
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    class Store:
+        def __init__(self):
+            self.entries = []
+
+        @staticmethod
+        def delay_wgrad_compute():
+            return True
+
+        def put(self, tensors, fn):
+            self.entries.append((tensors, fn))
+
+    class Linear:
+        def __init__(self):
+            self.num_gemms = 2
+            self.fp8 = False
+            self.use_bias = False
+            self.return_bias = False
+            self.save_original_input = False
+            self.fuse_wgrad_accumulation = True
+            self.wgrad_store = Store()
+            self.activation_dtype = torch.bfloat16
+            self.weight0 = torch.nn.Parameter(torch.eye(2, dtype=torch.bfloat16))
+            self.weight1 = torch.nn.Parameter(2 * torch.eye(2, dtype=torch.bfloat16))
+            for weight in (self.weight0, self.weight1):
+                weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+                weight.grad_added_to_main_grad = False
+                weight.zero_out_wgrad = True
+            self.calls = []
+
+        def prepare_forward(self, value, *, num_gemms):
+            self.calls.append(("prepare", num_gemms))
+            return value
+
+        def end_forward(self):
+            self.calls.append(("end",))
+
+        def _get_weight_tensors(self):
+            self.calls.append(("weights",))
+            return [self.weight0, self.weight1]
+
+        def _get_bias_tensors(self):
+            self.calls.append(("biases",))
+            return []
+
+        def _get_quantizers(self):
+            self.calls.append(("quantizers",))
+            return tuple([None, None] for _ in range(6))
+
+    linear = Linear()
+    x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16, requires_grad=True)
+    out = torch.empty_like(x)
+    dgrad = torch.empty_like(x)
+    result = experts_module._caller_owned_grouped_linear(linear, x, [1, 1], out, dgrad)
+    assert result.data_ptr() == out.data_ptr()
+    result.float().sum().backward()
+    assert linear.calls == [
+        ("prepare", 2), ("weights",), ("biases",), ("quantizers",), ("end",)
+    ]
+    assert len(linear.wgrad_store.entries) == 1
+    tensors, delayed = linear.wgrad_store.entries.pop()
+    delayed(*tensors)
+    assert all(weight.grad_added_to_main_grad for weight in (linear.weight0, linear.weight1))
+    assert all(torch.count_nonzero(weight.main_grad) for weight in (linear.weight0, linear.weight1))
+
+    with pytest.raises(RuntimeError, match="non-grad"):
+        experts_module._caller_owned_grouped_linear(
+            linear, x, [1, 1], out.detach().requires_grad_(), dgrad
+        )
+    assert linear.calls[-1] == ("end",)
 
 
 def test_manual_unpermute_writes_into_stable_workspace_slot(

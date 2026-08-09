@@ -29,97 +29,115 @@ from megatron.lite.primitive.utils import ensure_divisible
 __all__ = ["Experts", "_AllReduceETP"]
 
 
-class _CallerOwnedGroupedLinear(torch.autograd.Function):
-    """TE 2.15 grouped GEMM with a caller-owned BF16 output.
+def _validate_caller_owned_buffer(
+    name: str, buffer: torch.Tensor, expected_shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> None:
+    """Match TE's explicit-output contract before exposing an arena view to autograd."""
+    if (
+        tuple(buffer.shape) != expected_shape
+        or buffer.dtype != dtype
+        or buffer.device != device
+        or not buffer.is_contiguous()
+        or buffer.requires_grad
+    ):
+        raise RuntimeError(
+            f"Caller-owned grouped GEMM {name} must be contiguous, non-grad, and match shape/dtype/device"
+        )
 
-    This deliberately implements only the ChunkedEP Qwen3 contract: ordinary
-    BF16 weights, no bias, and TE delayed wgrad.  It is not a replacement for
-    ``te.GroupedLinear``.  Keeping the boundary this small lets a full
-    recompute chunk retain TE's grouped dgrad/wgrad and selected FP32 gradient
-    sinks while its large FC1/FC2 output has a stable caller-owned address.
+
+class _CallerOwnedGroupedLinear(torch.autograd.Function):
+    """TE 2.15 BF16 grouped-GEMM internals with explicit arena-owned outputs.
+
+    The enclosing helper deliberately retains TE's public module lifecycle.
+    This class changes only TE 2.15's two ``torch.empty`` allocation sites.
     """
 
     @staticmethod
-    def forward(ctx, inp, out, dgrad_out, linear, m_splits, *weights):
+    def forward(ctx, inp, out, dgrad_out, non_tensor_args, *weights):
         from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+        from transformer_engine.pytorch.module.base import _2X_ACC_FPROP
 
-        if (
-            linear.fp8
-            or linear.use_bias
-            or not linear.wgrad_store.delay_wgrad_compute()
-            or inp.dtype != torch.bfloat16
-            or out.dtype != torch.bfloat16
-        ):
-            raise RuntimeError(
-                "Caller-owned grouped GEMM requires BF16, bias-free TE delayed-wgrad"
+        m_splits, is_first_microbatch, wgrad_store, fuse_wgrad_accumulation, activation_dtype = non_tensor_args
+        if inp.dtype != torch.bfloat16 or activation_dtype != torch.bfloat16:
+            raise RuntimeError("Caller-owned grouped GEMM requires BF16 activation")
+        if not fuse_wgrad_accumulation or not wgrad_store.delay_wgrad_compute():
+            raise RuntimeError("Caller-owned grouped GEMM requires TE delayed fused wgrad")
+        _validate_caller_owned_buffer(
+            "output", out, (sum(m_splits), weights[0].shape[0]), activation_dtype, inp.device
+        )
+        if inp.requires_grad:
+            if dgrad_out is None:
+                raise RuntimeError("Caller-owned grouped GEMM requires dgrad output for grad input")
+            _validate_caller_owned_buffer(
+                "dgrad output", dgrad_out, tuple(inp.shape), activation_dtype, inp.device
             )
-        if tuple(out.shape) != (sum(m_splits), weights[0].shape[0]):
-            raise RuntimeError("Caller-owned grouped GEMM output has the wrong shape")
-        if not out.is_contiguous():
-            raise RuntimeError("Caller-owned grouped GEMM output must be contiguous")
-        if dgrad_out is not None and (
-            tuple(dgrad_out.shape) != tuple(inp.shape) or not dgrad_out.is_contiguous()
-        ):
-            raise RuntimeError(
-                "Caller-owned grouped GEMM dgrad output must match the contiguous input"
-            )
+        elif dgrad_out is not None:
+            raise RuntimeError("Caller-owned grouped GEMM received dgrad output for non-grad input")
         inputmats = list(torch.split(inp.reshape(-1, inp.shape[-1]), m_splits))
         general_grouped_gemm(
-            list(weights),
-            inputmats,
-            [out],
-            [None] * len(weights),
-            torch.bfloat16,
-            single_output=True,
-            m_splits=m_splits,
+            list(weights), inputmats, [out], [None] * len(weights), activation_dtype,
+            single_output=True, m_splits=m_splits, use_split_accumulator=_2X_ACC_FPROP,
         )
-        ctx.linear = linear
-        ctx.m_splits = list(m_splits)
-        ctx.inp_shape = inp.shape
-        ctx.dgrad_out = dgrad_out
-        ctx.save_for_backward(inp, *weights)
-        return out
+        if ctx is not None:
+            ctx.m_splits = list(m_splits)
+            ctx.inp_shape = inp.shape
+            ctx.dgrad_out = dgrad_out
+            ctx.wgrad_store = wgrad_store
+            ctx.is_first_microbatch = is_first_microbatch
+            ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+            ctx.save_for_backward(inp, *weights)
+        return out.view(-1, *inp.shape[1:-1], out.shape[-1])
 
     @staticmethod
     def backward(ctx, grad_output):
         from functools import partial
 
         from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+        from transformer_engine.pytorch.module.base import _2X_ACC_DGRAD, _2X_ACC_WGRAD, get_dummy_wgrad
 
         inp, *weights = ctx.saved_tensors
-        grad_output = grad_output.contiguous().view(-1, grad_output.shape[-1])
-        grad_mats = list(torch.split(grad_output, ctx.m_splits))
-        dgrad_out = ctx.dgrad_out
-        if dgrad_out is None:
-            raise RuntimeError("Caller-owned grouped GEMM backward requires dgrad output")
-        dgrad = dgrad_out.view(-1, inp.shape[-1])
-        general_grouped_gemm(
-            list(weights),
-            grad_mats,
-            [dgrad],
-            [None] * len(weights),
-            torch.bfloat16,
-            layout="NN",
-            single_output=True,
-            m_splits=ctx.m_splits,
-            grad=True,
-        )
+        activation_dtype = inp.dtype
+        grad_view = grad_output.contiguous().view(-1, grad_output.shape[-1])
+        grad_mats = list(torch.split(grad_view, ctx.m_splits))
+        dgrad = None
+        if inp.requires_grad:
+            dgrad_out = ctx.dgrad_out
+            if dgrad_out is None:
+                raise RuntimeError("Caller-owned grouped GEMM lost its dgrad output")
+            dgrad = dgrad_out.view(-1, inp.shape[-1])
+            general_grouped_gemm(
+                list(weights), grad_mats, [dgrad], [None] * len(weights), activation_dtype,
+                layout="NN", single_output=True, m_splits=ctx.m_splits, grad=True,
+                use_split_accumulator=_2X_ACC_DGRAD,
+            )
         main_grads = [getattr(weight, "main_grad", None) for weight in weights]
-        if any(grad is None for grad in main_grads):
+        if any(main_grad is None for main_grad in main_grads):
             raise RuntimeError("Caller-owned grouped GEMM requires prepared main_grad sinks")
+        if ctx.is_first_microbatch is not None:
+            accumulate = not ctx.is_first_microbatch
+        else:
+            accumulate = True
         wgrad = partial(
-            general_grouped_gemm,
-            quantization_params=[None] * len(weights),
-            out_dtype=torch.bfloat16,
-            layout="NT",
-            grad=True,
-            m_splits=ctx.m_splits,
-            use_bias=False,
-            accumulate=True,
+            general_grouped_gemm, quantization_params=[None] * len(weights),
+            out_dtype=activation_dtype, layout="NT", grad=True, m_splits=ctx.m_splits,
+            use_bias=False, use_split_accumulator=_2X_ACC_WGRAD,
+            accumulate=accumulate and not getattr(weights[0], "overwrite_main_grad", False),
         )
         inputmats = list(torch.split(inp.reshape(-1, inp.shape[-1]), ctx.m_splits))
-        ctx.linear.wgrad_store.put([inputmats, grad_mats, main_grads], wgrad)
-        return dgrad.view(ctx.inp_shape), None, None, None, None, *([None] * len(weights))
+        ctx.wgrad_store.put([inputmats, grad_mats, main_grads], wgrad)
+        wgrad_returns = []
+        for weight, main_grad in zip(weights, main_grads):
+            if hasattr(weight, "grad_added_to_main_grad"):
+                weight.grad_added_to_main_grad = True
+                wgrad_returns.append(
+                    get_dummy_wgrad(list(main_grad.shape), weight.dtype, zero=getattr(weight, "zero_out_wgrad", False))
+                )
+            else:
+                wgrad_returns.append(None)
+        return (
+            dgrad.view(ctx.inp_shape) if dgrad is not None else None,
+            None, None, None, *wgrad_returns,
+        )
 
 
 def _caller_owned_grouped_linear(
@@ -129,11 +147,36 @@ def _caller_owned_grouped_linear(
     out: torch.Tensor,
     dgrad_out: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Apply the narrow TE2.15 caller-owned-output adapter, or fail loudly."""
-    if getattr(linear, "return_bias", False):
-        raise RuntimeError("Caller-owned grouped GEMM does not support return_bias")
-    weights = [getattr(linear, f"weight{idx}") for idx in range(linear.num_gemms)]
-    return _CallerOwnedGroupedLinear.apply(x, out, dgrad_out, linear, m_splits, *weights)
+    """Reuse TE2.15 ``GroupedLinear.forward`` lifecycle around its two buffers."""
+    if (
+        getattr(linear, "fp8", False)
+        or getattr(linear, "use_bias", False)
+        or getattr(linear, "return_bias", False)
+        or getattr(linear, "save_original_input", False)
+    ):
+        raise RuntimeError("Caller-owned grouped GEMM supports only BF16 bias-free Qwen3")
+    if len(m_splits) != linear.num_gemms:
+        raise RuntimeError("Caller-owned grouped GEMM split count does not match TE module")
+    prepared_x = linear.prepare_forward(x, num_gemms=linear.num_gemms)
+    try:
+        weights = linear._get_weight_tensors()
+        linear._get_bias_tensors()
+        quantizers = linear._get_quantizers()
+        if any(item is not None for group in quantizers for item in group):
+            raise RuntimeError("Caller-owned grouped GEMM does not support TE quantizers")
+        non_tensor_args = (
+            list(m_splits), None, linear.wgrad_store, linear.fuse_wgrad_accumulation,
+            linear.activation_dtype,
+        )
+        if torch.is_grad_enabled():
+            return _CallerOwnedGroupedLinear.apply(
+                prepared_x, out, dgrad_out, non_tensor_args, *weights
+            )
+        return _CallerOwnedGroupedLinear.forward(
+            None, prepared_x, out, dgrad_out, non_tensor_args, *weights
+        )
+    finally:
+        linear.end_forward()
 
 
 @contextmanager
