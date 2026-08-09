@@ -19,10 +19,23 @@ except ImportError:  # pragma: no cover - CPU contract tests.
     _TRITON_AVAILABLE = False
 
 
-__all__ = ["_TRITON_AVAILABLE", "bgmv_bwd", "bgmv_fwd", "compute_group_offsets"]
+__all__ = [
+    "_TRITON_AVAILABLE",
+    "bgmv_bwd",
+    "bgmv_fwd",
+    "compute_group_offsets",
+    "use_fused_bgmv",
+]
 
 _BLOCK_N = 64
 _FUSED_N_THRESHOLD = 256
+
+
+def use_fused_bgmv(out_features: int, rank: int) -> bool:
+    """Whether the production forward launches the fused BGMV kernel."""
+    return out_features >= _FUSED_N_THRESHOLD and rank >= 16
+
+
 _TUNING_CONFIGS = (
     [
         triton.Config({"BLOCK_M": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3),
@@ -318,7 +331,7 @@ def bgmv_fwd(x, lora_a, lora_b, lora_indices, scale, max_g_size_hint=None):
     delta = torch.empty(tokens, out_features, device=x.device, dtype=x.dtype)
     # Triton SM90 dot requires K >= 16.  Rank-8 banks retain the complete
     # two-stage path; the fused optimization is available once rank permits it.
-    if out_features >= _FUSED_N_THRESHOLD and rank >= 16:
+    if use_fused_bgmv(out_features, rank):
         _bgmv_fused_fwd_kernel[
             lambda meta: (triton.cdiv(max_group, meta["BLOCK_M"]), groups)
         ](

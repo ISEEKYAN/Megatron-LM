@@ -383,6 +383,11 @@ class MegatronLiteRuntime(RuntimeBase):
                 "export_hf_lora_adapter; adapter-only rollout sync is unavailable. "
                 "Set the LoRA rollout sync mode to 'merge' to fall back."
             )
+        registry = handle._extras.get("multi_lora_registry")
+        if registry is not None:
+            if "multi_lora_registry" in kwargs:
+                raise ValueError("multi-LoRA registry must be supplied by the model handle only.")
+            kwargs["multi_lora_registry"] = registry
         yield from exporter(model_chunks, model_cfg, ps, **kwargs)
 
     def release_export_scratch(self, handle: ModelHandle) -> None:

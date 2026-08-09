@@ -9,6 +9,7 @@ model-specific: the weight map and tensor conversions.
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.ckpt.dcp import (  # noqa: F401 — re-export
     canonicalize_fc1_for_dcp,
@@ -329,6 +330,26 @@ def export_hf_lora_adapter(model, config: Qwen3MoEConfig, ps, **kwargs):
     from megatron.lite.primitive.ckpt.hf_weights import (
         export_hf_lora_adapter as _export_adapter,
     )
+
+    registry = kwargs.pop("multi_lora_registry", None)
+    name = kwargs.pop("multi_lora_name", None)
+    if registry is not None:
+        if name is None:
+            raise ValueError("multi_lora_registry export requires multi_lora_name.")
+        # The named-bank path intentionally enters at the same HF boundary as
+        # attached LoRA: it cannot bypass TP/EP placement, WeightSpec mapping,
+        # or the consumer-scale compensation.
+        yield from registry.export_hf_state(
+            name,
+            Qwen3MoEWeightSpec(config),
+            ps,
+            export_dtype=kwargs.pop("export_dtype", None),
+        ).items()
+        if kwargs:
+            raise TypeError(
+                f"Unexpected named multi-LoRA export arguments: {sorted(kwargs)}"
+            )
+        return
 
     yield from _export_adapter(model, Qwen3MoEWeightSpec(config), ps, **kwargs)
 

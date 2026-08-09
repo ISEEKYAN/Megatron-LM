@@ -1643,6 +1643,66 @@ def _iter_expert_adapter_placements(
             yield set_expert_idx(global_name, global_idx), a_shard, b_shard
 
 
+def export_hf_lora_bank_adapter(
+    banks,
+    *,
+    spec: HFWeights,
+    ps,
+    train_scale: float,
+    rank: int,
+    alpha: int | None,
+    use_rslora: bool,
+    export_dtype: str | torch.dtype | None = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Export selected dense-bank factors through the normal HF adapter contract.
+
+    ``banks`` maps native weight names to selected, two-dimensional ``(A, B)``
+    factors. Keeping this below the registry layer makes named multi-LoRA use
+    the same TP/EP placement, native-to-HF mapping, and consumer-scale rules as
+    module-attached LoRA.
+    """
+    resolved_export_dtype = _resolve_export_dtype(export_dtype)
+    num_experts = int(getattr(spec, "num_experts", 0) or 0)
+
+    def _cast(tensor: torch.Tensor) -> torch.Tensor:
+        materialized = _materialize_dtensor(tensor).detach()
+        if resolved_export_dtype is not None:
+            materialized = materialized.to(dtype=resolved_export_dtype)
+        return materialized.contiguous()
+
+    for native_name, (lora_a, lora_b) in banks.items():
+        is_grouped = bool(spec.is_expert(native_name))
+        consumer_scale = vllm_applied_lora_scaling(
+            rank, alpha, use_rslora=use_rslora, packed_moe=is_grouped
+        )
+        if consumer_scale == 0.0:
+            raise ValueError(
+                f"vLLM-side LoRA scaling resolved to 0 for {native_name!r}; "
+                "refusing to export an adapter whose scale cannot be compensated."
+            )
+        lora_a = _cast(lora_a)
+        lora_b = _cast(lora_b).mul(train_scale / consumer_scale)
+        lora_a, lora_b = _gather_lora_factors_across_tp(
+            lora_a, lora_b, native_name, spec, ps
+        )
+        for placed_name, placed_a, placed_b in _iter_expert_adapter_placements(
+            native_name, lora_a, lora_b, is_grouped=is_grouped,
+            num_experts=num_experts, ps=ps,
+        ):
+            for hf_name, lora_b_piece in _native_to_hf(spec, placed_name, placed_b):
+                if not hf_name.endswith(".weight"):
+                    raise ValueError(
+                        f"LoRA surface {placed_name!r} mapped to non-weight HF name "
+                        f"{hf_name!r}; adapter export needs a weight surface."
+                    )
+                hf_module = hf_name[: -len(".weight")]
+                yield f"{VLLM_LORA_NAME_PREFIX}{hf_module}.lora_A.weight", placed_a
+                yield (
+                    f"{VLLM_LORA_NAME_PREFIX}{hf_module}.lora_B.weight",
+                    lora_b_piece.contiguous(),
+                )
+
+
 def export_hf_lora_adapter(
     model: nn.Module | list[nn.Module],
     spec: HFWeights,

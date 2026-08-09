@@ -17,6 +17,7 @@ from megatron.lite.primitive.modules.multi_lora import BatchedLoraDelta
 from megatron.lite.primitive.modules.multi_lora_bank import (
     DenseLoraBank,
     NamedLoraBankRegistry,
+    export_named_lora_adapter_state,
     load_named_lora_adapter,
     save_named_lora_adapter,
 )
@@ -119,12 +120,15 @@ def test_dense_lora_bank_delegates_to_operator_without_copying_tensors():
     )
 
 
-@pytest.mark.parametrize(("out_features", "expected"), [(128, False), (256, True)])
-def test_bgmv_fused_selection_uses_output_width_not_adapter_count(
-    out_features, expected
+@pytest.mark.parametrize(
+    ("out_features", "rank", "expected"),
+    [(128, 32, False), (256, 8, False), (256, 32, True)],
+)
+def test_bgmv_fused_selection_has_one_production_predicate(
+    out_features, rank, expected
 ):
-    """The fused choice is a property of N, not the bank's G dimension."""
-    assert multi_lora_kernel._use_fused_bgmv(out_features) is expected
+    """The public predicate is exactly the production launch decision."""
+    assert multi_lora_kernel.use_fused_bgmv(out_features, rank) is expected
 
 
 @pytest.mark.skipif(
@@ -135,13 +139,13 @@ def test_bgmv_fused_selection_uses_output_width_not_adapter_count(
     ("dtype", "rtol", "atol"),
     [(torch.float32, 2e-3, 2e-3), (torch.bfloat16, 8e-2, 5e-2)],
 )
-@pytest.mark.parametrize("out_features", [128, 256])
+@pytest.mark.parametrize(("out_features", "rank"), [(128, 8), (256, 8), (256, 32)])
 def test_cuda_triton_bgmv_training_matches_independent_oracle(
-    monkeypatch, out_features, dtype, rtol, atol
+    monkeypatch, out_features, rank, dtype, rtol, atol
 ):
-    """Exercise both N launch regimes, dtypes, idle bank slot, and full backward."""
+    """Exercise shrink and production fused launch regimes with full backward."""
     torch.manual_seed(7)
-    tokens, slots, rank, in_features = 5, 4, 8, 16
+    tokens, slots, in_features = 5, 4, 16
     indices = torch.tensor([0, 0, 1, 2, 2], device="cuda", dtype=torch.int64)
     values = [
         torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
@@ -222,6 +226,109 @@ def test_named_registry_exports_only_explicit_slot_as_two_dimensional_peft_state
     )
     assert registry.manifest("bravo")["slot"] == 1
     assert registry.manifest("bravo")["name"] == "bravo"
+
+
+def test_named_registry_export_reuses_hf_mapping_and_scaling_contract():
+    """Named multi-LoRA export must take the production HF export route."""
+    registry = NamedLoraBankRegistry(
+        banks={
+            "layers.0.moe.experts.fc1.weight0": DenseLoraBank(
+                torch.tensor([[[1.0, 2.0], [3.0, 4.0]]]),
+                torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]),
+            )
+        },
+        names={"alpha": 0},
+        rank=2,
+        alpha=4,
+        base_model_identity={},
+        lora_spec=LoraSpec(enabled=True, rank=2, alpha=4, use_rslora=True),
+    )
+
+    class Spec:
+        num_experts = 1
+
+        @staticmethod
+        def tp_spec(name):
+            assert name == "layers.0.moe.experts.fc1.weight0"
+            return None
+
+        @staticmethod
+        def is_expert(name):
+            return "experts" in name
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            assert name == "layers.0.moe.experts.fc1.weight0"
+            gate, up = tensor.chunk(2, dim=0)
+            return [
+                ("model.layers.0.mlp.experts.0.gate_proj.weight", gate),
+                ("model.layers.0.mlp.experts.0.up_proj.weight", up),
+            ]
+
+    ps = SimpleNamespace(
+        tp_size=1,
+        tp_rank=0,
+        tp_group=None,
+        etp_size=1,
+        etp_rank=0,
+        etp_group=None,
+        ep_size=1,
+        ep_rank=0,
+        ep_group=None,
+    )
+    state = export_named_lora_adapter_state(registry, "alpha", Spec(), ps)
+    prefix = VLLM_LORA_NAME_PREFIX + "model.layers.0.mlp.experts.0"
+    assert set(state) == {
+        f"{prefix}.gate_proj.lora_A.weight",
+        f"{prefix}.gate_proj.lora_B.weight",
+        f"{prefix}.up_proj.lora_A.weight",
+        f"{prefix}.up_proj.lora_B.weight",
+    }
+    # vLLM FusedMoE uses alpha/rank, while training chose rsLoRA alpha/sqrt(rank).
+    torch.testing.assert_close(
+        state[f"{prefix}.gate_proj.lora_B.weight"],
+        registry.banks["layers.0.moe.experts.fc1.weight0"].b_bank[0, :2] * 2**0.5,
+    )
+
+
+def test_named_registry_export_gathers_tensor_parallel_output_before_mapping(monkeypatch):
+    """A bank's local TP B rows must never be exported as a partial adapter."""
+    registry = NamedLoraBankRegistry(
+        banks={
+            "layers.0.attn.qkv.linear.weight": DenseLoraBank(
+                torch.ones(1, 2, 2), torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+            )
+        },
+        names={"alpha": 0},
+        rank=2,
+        alpha=2,
+        base_model_identity={},
+    )
+
+    class Spec:
+        num_experts = 0
+        tp_spec = staticmethod(lambda name: (0, 0))
+        is_expert = staticmethod(lambda name: False)
+        native_to_hf = staticmethod(
+            lambda name, tensor: [("model.layers.0.self_attn.q_proj.weight", tensor)]
+        )
+
+    import megatron.lite.primitive.ckpt.hf_weights as hf_weights
+
+    monkeypatch.setattr(
+        hf_weights,
+        "allgather_concat",
+        lambda tensor, world_size, group, dim: torch.cat((tensor, tensor + 10), dim=dim),
+    )
+    ps = SimpleNamespace(
+        tp_size=2, tp_rank=0, tp_group="tp", etp_size=1, etp_rank=0,
+        etp_group=None, ep_size=1, ep_rank=0, ep_group=None,
+    )
+    state = export_named_lora_adapter_state(registry, "alpha", Spec(), ps)
+    key = f"{VLLM_LORA_NAME_PREFIX}model.layers.0.self_attn.q_proj.lora_B.weight"
+    torch.testing.assert_close(
+        state[key], torch.tensor([[1.0, 2.0], [3.0, 4.0], [11.0, 12.0], [13.0, 14.0]])
+    )
 
 
 def test_named_registry_rejects_duplicate_or_unknown_slots():

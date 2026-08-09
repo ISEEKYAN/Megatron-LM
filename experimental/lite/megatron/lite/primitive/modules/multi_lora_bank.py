@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import torch
-from megatron.lite.primitive.ckpt.hf_weights import VLLM_LORA_NAME_PREFIX
+from megatron.lite.primitive.ckpt.hf_weights import (
+    VLLM_LORA_NAME_PREFIX,
+    export_hf_lora_bank_adapter,
+)
 from megatron.lite.primitive.modules.lora import LoraSpec, resolve_lora_alpha
 from megatron.lite.primitive.modules.multi_lora import BatchedLoraDelta
 
@@ -149,6 +152,26 @@ class NamedLoraBankRegistry:
             )
         return state
 
+    def export_hf_state(
+        self, name: str, spec, ps, *, export_dtype=None
+    ) -> dict[str, torch.Tensor]:
+        """Export one named slot through the production HF adapter pipeline."""
+        lora_spec = self.lora_spec or LoraSpec(
+            enabled=True, rank=self.rank, alpha=self.alpha
+        )
+        return dict(
+            export_hf_lora_bank_adapter(
+                self.select(name),
+                spec=spec,
+                ps=ps,
+                train_scale=lora_spec.scale,
+                rank=self.rank,
+                alpha=self.alpha,
+                use_rslora=lora_spec.use_rslora,
+                export_dtype=export_dtype,
+            )
+        )
+
     def manifest(self, name: str) -> dict[str, Any]:
         """Return self-validating metadata for one exported slot."""
         slot = self.slot_for(name)
@@ -267,6 +290,13 @@ def save_named_lora_adapter(
     }
 
 
+def export_named_lora_adapter_state(
+    registry: NamedLoraBankRegistry, name: str, spec, ps, *, export_dtype=None
+) -> dict[str, torch.Tensor]:
+    """Production export entry for one named multi-LoRA bank slot."""
+    return registry.export_hf_state(name, spec, ps, export_dtype=export_dtype)
+
+
 def load_named_lora_adapter(
     registry: NamedLoraBankRegistry, name: str, adapter_dir: str | Path
 ) -> dict[str, Any]:
@@ -283,6 +313,7 @@ def load_named_lora_adapter(
 __all__ = [
     "DenseLoraBank",
     "NamedLoraBankRegistry",
+    "export_named_lora_adapter_state",
     "load_named_lora_adapter",
     "save_named_lora_adapter",
 ]

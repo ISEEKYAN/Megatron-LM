@@ -413,6 +413,15 @@ def export_hf_lora_adapter(
         export_hf_lora_adapter as _export_hf_lora_adapter_impl,
     )
 
+    # A named dense bank is independent of a model chunk.  Export it once, not
+    # once per PP/VPP chunk, through the same protocol entry runtime uses.
+    if kwargs.get("multi_lora_registry") is not None:
+        if not chunks:
+            raise ValueError(
+                "named multi-LoRA export requires at least one model chunk."
+            )
+        yield from _export_hf_lora_adapter_impl(chunks[0], model_cfg, ps, **kwargs)
+        return
     for chunk in chunks:
         yield from _export_hf_lora_adapter_impl(chunk, model_cfg, ps, **kwargs)
 

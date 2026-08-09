@@ -7,11 +7,7 @@ import torch
 from megatron.lite.primitive.modules import multi_lora_bgmv
 
 _TRITON_AVAILABLE = multi_lora_bgmv._TRITON_AVAILABLE
-_FUSED_N_THRESHOLD = 256
-
-
-def _use_fused_bgmv(out_features: int) -> bool:
-    return out_features >= _FUSED_N_THRESHOLD
+use_fused_bgmv = multi_lora_bgmv.use_fused_bgmv
 
 
 def _can_use_triton(
@@ -62,7 +58,7 @@ def dense_batched_lora_backward(x, grad_output, a_bank, b_bank, slots, scale, hi
 
 __all__ = [
     "_TRITON_AVAILABLE",
-    "_use_fused_bgmv",
+    "use_fused_bgmv",
     "dense_batched_lora_backward",
     "dense_batched_lora_forward",
 ]
