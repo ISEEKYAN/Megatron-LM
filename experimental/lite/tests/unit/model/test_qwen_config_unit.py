@@ -453,7 +453,6 @@ def test_qwen3_training_mode_matches_no_recompute_and_full_recompute_parity(
     class FakeForward:
         def __init__(self, *, backward_op=None, **_kwargs):
             self.backward_op = backward_op
-            self.workspace = _kwargs["workspace"]
 
         def __call__(self, x):
             calls["forward"] += 1
@@ -546,7 +545,6 @@ def test_qwen3_full_recompute_initial_forward_runs_no_grad_then_fused_backward(
         def __init__(self, *, backward_op=None, **_kwargs):
             assert backward_op is None
             self.backward_op = backward_op
-            self.workspace = _kwargs["workspace"]
 
         def __call__(self, x):
             assert torch.is_grad_enabled() is False
@@ -600,77 +598,6 @@ def test_qwen3_full_recompute_initial_forward_runs_no_grad_then_fused_backward(
     assert calls == {"forward": 1, "backward": 0, "fused": 1, "reset": 0}
 
 
-def test_qwen3_full_recompute_releases_inactive_phase_across_layers_and_microbatches(
-    monkeypatch, transformer_engine_import_stub
-):
-    transformer_engine_import_stub()
-    from megatron.lite.model.qwen3_moe.lite import model
-
-    stream = object()
-    resident = set()
-    materializations = {"forward": 0, "backward": 0}
-    releases = []
-    max_resident = 0
-
-    def materialize(phase):
-        nonlocal max_resident
-        other = "backward" if phase == "forward" else "forward"
-        assert other not in resident
-        if phase not in resident:
-            resident.add(phase)
-            materializations[phase] += 1
-        max_resident = max(max_resident, len(resident))
-
-    class Forward:
-        def __call__(self, value):
-            materialize("forward")
-            return value * 2
-
-    class Fused:
-        def forward_backward(self, _x_saved, grad_output):
-            materialize("backward")
-            return grad_output * 3, [], []
-
-    class Layer:
-        def __init__(self):
-            self.ep_chunk_forward = Forward()
-            self.ep_chunk_fused = Fused()
-
-        def release_ep_chunk_workspaces(self, *, phase, stream):
-            releases.append((phase, stream))
-            resident.discard(phase)
-
-    monkeypatch.setattr(
-        model,
-        "_ep_chunk_current_stream",
-        lambda _tensor: stream,
-        raising=False,
-    )
-    layers = [Layer(), Layer()]
-
-    for _microbatch in range(2):
-        value = torch.randn(2, 4, requires_grad=True)
-        output = value
-        for layer in layers:
-            output = model._Qwen3EPChunkFullRecomputeFunction.apply(output, layer)
-        output.sum().backward()
-        torch.testing.assert_close(value.grad, torch.full_like(value, 9))
-
-    assert max_resident == 1
-    assert resident == {"backward"}
-    assert materializations == {"forward": 2, "backward": 2}
-    assert (
-        releases
-        == [
-            ("backward", stream),
-            ("backward", stream),
-            ("forward", stream),
-            ("forward", stream),
-        ]
-        * 2
-    )
-
-
 def test_qwen3_full_recompute_custom_function_forward_is_framework_no_grad(
     transformer_engine_import_stub,
 ):
@@ -687,10 +614,7 @@ def test_qwen3_full_recompute_custom_function_forward_is_framework_no_grad(
                 )
             return value * 2
 
-    layer = SimpleNamespace(
-        ep_chunk_forward=Forward(),
-        release_ep_chunk_workspaces=lambda **_kwargs: None,
-    )
+    layer = SimpleNamespace(ep_chunk_forward=Forward())
     value = torch.randn(2, 4, requires_grad=True)
 
     output = _Qwen3EPChunkFullRecomputeFunction.apply(value, layer)

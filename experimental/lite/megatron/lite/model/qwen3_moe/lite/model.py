@@ -52,13 +52,6 @@ from megatron.lite.primitive.utils import build_fp8_recipe
 # ---------------------------------------------------------------------------
 
 
-def _ep_chunk_current_stream(tensor: torch.Tensor):
-    """Return the tensor device's current stream without synchronizing it."""
-    if not tensor.is_cuda:
-        return None
-    return torch.cuda.current_stream(tensor.device)
-
-
 class _Qwen3EPChunkFullRecomputeFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, layer: "MoELayer", *params: torch.Tensor):
@@ -72,10 +65,6 @@ class _Qwen3EPChunkFullRecomputeFunction(torch.autograd.Function):
         ctx.layer = layer
         ctx.save_for_backward(x.detach())
         assert layer.ep_chunk_forward is not None
-        layer.release_ep_chunk_workspaces(
-            phase="backward",
-            stream=_ep_chunk_current_stream(x),
-        )
         return layer.ep_chunk_forward(x).detach()
 
     @staticmethod
@@ -83,10 +72,6 @@ class _Qwen3EPChunkFullRecomputeFunction(torch.autograd.Function):
         (x_saved,) = ctx.saved_tensors
         layer = ctx.layer
         assert layer.ep_chunk_fused is not None
-        layer.release_ep_chunk_workspaces(
-            phase="forward",
-            stream=_ep_chunk_current_stream(grad_output),
-        )
         grad_x, router_grads, expert_grads = layer.ep_chunk_fused.forward_backward(
             x_saved, grad_output
         )
