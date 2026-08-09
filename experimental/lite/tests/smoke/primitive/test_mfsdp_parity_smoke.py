@@ -284,9 +284,11 @@ def _cuda_dist():
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://")
         created_pg = True
-    yield
-    if created_pg and dist.is_initialized():
-        dist.destroy_process_group()
+    try:
+        yield
+    finally:
+        if created_pg and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def _install_transformer_engine_import_stub_if_needed() -> None:
@@ -1020,36 +1022,155 @@ def test_mfsdp_native_fp32_grouped_expert_wgrad_reaches_optimizer():
     chunk(value).float().square().mean().backward()
 
     main_grad_fractions = {}
-    for expert_key, specs in expert_specs.items():
-        main_grads = []
-        for spec in specs:
-            assert spec.shard_param is not None
-            assert spec.full_param.grad_added_to_main_grad is True
-            assert spec.full_param.main_grad.dtype is torch.float32
-            assert spec.full_param.grad is None
-            main_grads.append(spec.full_param.main_grad)
-        main_grad_fractions[expert_key] = _bf16_roundtrip_difference_fraction(
-            main_grads
+    local_error = None
+    local_specs = []
+    try:
+        for expert_key, specs in expert_specs.items():
+            main_grads = []
+            for spec in specs:
+                full_param = spec.full_param
+                main_grad = getattr(full_param, "main_grad", None)
+                local_specs.append(
+                    {
+                        "name": spec.name,
+                        "has_fsdp_param": hasattr(full_param, "__fsdp_param__"),
+                        "overwrite_main_grad": getattr(
+                            full_param, "overwrite_main_grad", None
+                        ),
+                        "grad_added": getattr(
+                            full_param, "grad_added_to_main_grad", None
+                        ),
+                        "main_grad": None
+                        if main_grad is None
+                        else {
+                            "shape": tuple(main_grad.shape),
+                            "numel": main_grad.numel(),
+                            "dtype": str(main_grad.dtype),
+                            "contiguous": main_grad.is_contiguous(),
+                        },
+                        "full_param_grad": None
+                        if full_param.grad is None
+                        else str(full_param.grad.dtype),
+                    }
+                )
+                if spec.shard_param is None:
+                    raise AssertionError(f"{spec.name}: missing shard_param")
+                if getattr(full_param, "grad_added_to_main_grad", None) is not True:
+                    raise AssertionError(
+                        f"{spec.name}: grad_added_to_main_grad is not True"
+                    )
+                if main_grad is None or main_grad.dtype is not torch.float32:
+                    raise AssertionError(f"{spec.name}: main_grad is not fp32")
+                if full_param.grad is not None:
+                    raise AssertionError(f"{spec.name}: full_param.grad is populated")
+                main_grads.append(main_grad)
+            main_grad_fractions[expert_key] = _bf16_roundtrip_difference_fraction(
+                main_grads
+            )
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+    gathered_errors = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered_errors, local_error)
+    dist.barrier()
+    if any(gathered_errors):
+        pytest.fail(
+            "GroupedLinear rank-local diagnostics: " + json.dumps(gathered_errors)
         )
 
     finalize()
-    optimizer_grad_fractions = {
-        expert_key: _bf16_roundtrip_difference_fraction(
-            [spec.shard_param.grad for spec in specs]
-        )
-        for expert_key, specs in expert_specs.items()
+    optimizer_grad_fractions, optimizer_records, optimizer_error = {}, [], None
+    try:
+        for expert_key, specs in expert_specs.items():
+            owned = []
+            for spec in specs:
+                grad = spec.shard_param.grad
+                record = {
+                    "expert": expert_key,
+                    "name": spec.name,
+                    "shard_numel": spec.shard_param.numel(),
+                    "grad": None
+                    if grad is None
+                    else {"shape": tuple(grad.shape), "dtype": str(grad.dtype)},
+                    "optimizer_owned": any(
+                        spec.shard_param is p
+                        for g in optimizer.param_groups
+                        for p in g["params"]
+                    ),
+                }
+                optimizer_records.append(record)
+                if grad is not None and grad.numel() > 0:
+                    assert record["optimizer_owned"]
+                    assert grad.dtype is torch.float32
+                    owned.append(grad)
+            if owned:
+                optimizer_grad_fractions[expert_key] = (
+                    _bf16_roundtrip_difference_fraction(owned)
+                )
+    except Exception as exc:
+        optimizer_error = f"{type(exc).__name__}: {exc}"
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, optimizer_error)
+    all_records = [None] * dist.get_world_size()
+    dist.all_gather_object(all_records, optimizer_records)
+    if any(gathered):
+        pytest.fail("Grouped optimizer-grad diagnostics: " + json.dumps(gathered))
+    expected = {spec.name for specs in expert_specs.values() for spec in specs}
+    covered = {
+        record["name"]
+        for records in all_records
+        for record in records
+        if record["optimizer_owned"]
+        and record["grad"] is not None
+        and record["shard_numel"] > 0
     }
+    if covered != expected:
+        pytest.fail(
+            f"Grouped optimizer-grad global coverage missing: {expected - covered}"
+        )
     success, _grad_norm, _num_zeros = optimizer.step()
     recording_optimizer = optimizer._inner_optimizer.optimizer
-    consumed_grad_fractions = {
-        expert_key: _bf16_roundtrip_difference_fraction(
-            [
-                recording_optimizer.consumed_grad_by_param[id(spec.shard_param)]
-                for spec in specs
-            ]
-        )
-        for expert_key, specs in expert_specs.items()
+    consumed_grad_fractions, consumed_records, consumed_error = {}, [], None
+    try:
+        for expert_key, specs in expert_specs.items():
+            owned = []
+            for spec in specs:
+                grad = recording_optimizer.consumed_grad_by_param.get(
+                    id(spec.shard_param)
+                )
+                consumed_records.append(
+                    {
+                        "name": spec.name,
+                        "shard_numel": spec.shard_param.numel(),
+                        "entry": grad is not None,
+                        "dtype": None if grad is None else str(grad.dtype),
+                    }
+                )
+                if grad is not None:
+                    owned.append(grad)
+            owned = [grad for grad in owned if grad.numel() > 0]
+            if owned:
+                assert all(grad.dtype is torch.float32 for grad in owned)
+                consumed_grad_fractions[expert_key] = (
+                    _bf16_roundtrip_difference_fraction(owned)
+                )
+    except Exception as exc:
+        consumed_error = f"{type(exc).__name__}: {exc}"
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, consumed_error)
+    if any(gathered):
+        pytest.fail("Grouped consumed-grad diagnostics: " + json.dumps(gathered))
+    all_consumed = [None] * dist.get_world_size()
+    dist.all_gather_object(all_consumed, consumed_records)
+    consumed_covered = {
+        record["name"]
+        for records in all_consumed
+        for record in records
+        if record["entry"] and record["shard_numel"] > 0
     }
+    if consumed_covered != expected:
+        pytest.fail(
+            f"Grouped consumed-grad global coverage missing: {expected - consumed_covered}"
+        )
 
     assert success
     assert all(fraction > 0.0 for fraction in main_grad_fractions.values())

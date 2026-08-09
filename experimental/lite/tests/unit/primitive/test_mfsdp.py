@@ -205,15 +205,22 @@ def test_mfsdp_full_parallel_signoff_is_single_node_50_step_curve():
     assert "batch_seed=8345 + step" in smoke_source
 
     runner_source = (tests_root / "run_mfsdp_hopper_validation.sh").read_text()
+    assert (
+        "grouped-linear mode requires NNODES=1 and NPROC_PER_NODE=8." in runner_source
+    )
+    assert (
+        'TEST_EXPR="native_fp32_grouped_expert_wgrad_reaches_optimizer"'
+        in runner_source
+    )
     assert "full-parallel mode requires NNODES=1 and NPROC_PER_NODE=8." in runner_source
 
 
 def test_mfsdp_is_standalone_without_vendored_mcore_or_fsdp2_dependencies():
     package = Path(mfsdp_config.__file__).parent
 
-    assert not list(
-        (package / "impl").glob("*.py")
-    ), "Do not vendor the MCore FSDP implementation."
+    assert not list((package / "impl").glob("*.py")), (
+        "Do not vendor the MCore FSDP implementation."
+    )
     violations = []
     for source_path in package.rglob("*.py"):
         tree = ast.parse(source_path.read_text(), filename=str(source_path))
@@ -864,9 +871,9 @@ def test_mfsdp_offload_fraction_keeps_optimizer_state_on_cpu():
 
     inner = optimizer._inner_optimizer
     cpu_group = inner.cpu_group
-    assert (
-        cpu_group is not None
-    ), "Expected cpu_group to be set for offload_fraction=1.0"
+    assert cpu_group is not None, (
+        "Expected cpu_group to be set for offload_fraction=1.0"
+    )
     assert len(cpu_group._cpu_optimizer.optimizers) == len(cpu_group._cpu_params)
     for cpu_p in cpu_group._cpu_params:
         assert cpu_p.device.type == "cpu", "cpu_param should be on CPU"
@@ -1006,9 +1013,9 @@ def test_mfsdp_offload_fraction_numerically_matches_no_offload():
     }
     assert ref_params.keys() == cpu_params.keys()
     for name in ref_params:
-        assert torch.equal(
-            ref_params[name], cpu_params[name]
-        ), f"Parameter {name} diverges between GPU-only and CPU-offload runs"
+        assert torch.equal(ref_params[name], cpu_params[name]), (
+            f"Parameter {name} diverges between GPU-only and CPU-offload runs"
+        )
 
 
 def test_mfsdp_offload_fraction_partial_splits_by_numel():
@@ -1035,9 +1042,9 @@ def test_mfsdp_offload_fraction_partial_splits_by_numel():
     ratio = cpu_numel / total_numel
     # The greedy split assigns whole params; exact ratio depends on model shape.
     # For fraction=0.5 with 3 params of unequal size the ratio will be ≥0.4.
-    assert (
-        ratio >= 0.4
-    ), f"Expected substantial CPU offload at fraction=0.5, got {ratio:.2%}"
+    assert ratio >= 0.4, (
+        f"Expected substantial CPU offload at fraction=0.5, got {ratio:.2%}"
+    )
     assert ratio <= 0.95, f"Expected some GPU params at fraction=0.5, got {ratio:.2%}"
 
 

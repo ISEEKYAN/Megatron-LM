@@ -30,6 +30,13 @@ export MLITE_RUN_SMOKE=1
 export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 
 case "${MODE}" in
+  grouped-linear)
+    if [[ "${NNODES}" != "1" || "${NPROC_PER_NODE}" != "8" ]]; then
+      echo "grouped-linear mode requires NNODES=1 and NPROC_PER_NODE=8." >&2
+      exit 2
+    fi
+    TEST_EXPR="native_fp32_grouped_expert_wgrad_reaches_optimizer"
+    ;;
   throughput)
     if [[ "${NNODES}" != "1" || "${NPROC_PER_NODE}" != "8" ]]; then
       echo "throughput mode requires NNODES=1 and NPROC_PER_NODE=8." >&2
