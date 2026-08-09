@@ -418,6 +418,7 @@ class ParamBucket:
         self.grad_ready_callback: Callable[["ParamBucket"], None] | None = None
         self.before_main_grad_allocate: Callable[["ParamBucket"], None] | None = None
         self._grad_ready_ids: set[int] = set()
+        self._staged_grad_ids: set[int] = set()
         self._initialize_parameters()
 
     def _initialize_parameters(self) -> None:
@@ -535,6 +536,7 @@ class ParamBucket:
         return lambda: self.get_main_grad(spec)
 
     def _release_full_main_grads(self) -> None:
+        self._staged_grad_ids.clear()
         if self._full_main_grad_lease is not None:
             self._full_main_grad_lease.release()
             self._full_main_grad_lease = None
@@ -752,6 +754,7 @@ class ParamBucket:
                 if grad is not None and not spec.full_param.grad_added_to_main_grad:
                     spec.full_param.main_grad.add_(grad)
                 spec.full_param.grad = None
+        self._staged_grad_ids.clear()
         if self.policy.grad_comm_dtype == self.policy.main_grads_dtype:
             grad_input = self.full_main_grad_buffer
         else:
@@ -873,6 +876,7 @@ class ParamBucket:
         self._has_accumulated_grad = False
         self.grad_sync_enabled = False
         self._grad_ready_ids.clear()
+        self._staged_grad_ids.clear()
         self.main_grad_buffer.zero_()
         self._release_local_grad_comm_buffer()
         for spec in self.specs:
@@ -890,6 +894,7 @@ class ParamBucket:
 
     def clear_transient_grad_state(self) -> None:
         self._grad_ready_ids.clear()
+        self._staged_grad_ids.clear()
         self._grad_reduce_launched = False
         self._grad_reduce_finished = False
         self._microbatch_reduced = False
@@ -931,11 +936,16 @@ class ParamBucket:
                 with torch.no_grad():
                     if param.grad is not None:
                         # MCore's data-distributed _grad_acc writes directly
-                        # into the parameter group's authoritative FP32 bucket.
-                        # The persistent local shard accumulates completed
-                        # microbatch reduce-scatters, so this staging view is
-                        # overwritten rather than accumulated here.
-                        self.get_main_grad(spec).copy_(param.grad)
+                        # into the authoritative FP32 bucket. Usually this is
+                        # a fresh staging view. If global ordering deferred the
+                        # previous microbatch before RS launch, accumulate into
+                        # that still-live view instead of overwriting it.
+                        main_grad = self.get_main_grad(spec)
+                        if id(spec) in self._staged_grad_ids:
+                            main_grad.add_(param.grad)
+                        else:
+                            main_grad.copy_(param.grad)
+                self._staged_grad_ids.add(id(spec))
             if param.grad is not None:
                 param.grad = None
             # MCore treats this as a one-backward notification from TE.  It

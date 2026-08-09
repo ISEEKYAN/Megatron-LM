@@ -951,6 +951,8 @@ def test_mfsdp_state_requires_finished_step_and_then_clears_lifecycle():
 
     with pytest.raises(RuntimeError, match="finish_grad_sync"):
         chunk.state_dict()
+    with pytest.raises(RuntimeError, match="finish_grad_sync"):
+        dict(chunk.named_parameters())
 
     optimizer.finish_grad_sync()
     assert chunk.state_dict()
@@ -960,6 +962,13 @@ def test_mfsdp_state_requires_finished_step_and_then_clears_lifecycle():
     assert set(chunk.param_sync._training_states.values()) == {
         mfsdp_buffer.TrainingState.IDLE
     }
+
+
+def test_mfsdp_load_state_dict_rejects_assign():
+    chunk, _optimizer = _single_rank_mfsdp_stack()
+
+    with pytest.raises(NotImplementedError, match="assign=True"):
+        chunk.load_state_dict(chunk.state_dict(), assign=True)
 
 
 def test_mfsdp_dcp_multi_chunk_save_fails_fast(monkeypatch, tmp_path):
@@ -1945,6 +1954,12 @@ def test_mfsdp_sharded_grad_hook_writes_authoritative_bucket_buffer():
     assert torch.equal(spec.full_param.main_grad, expected)
     assert spec.full_param.grad is None
     assert spec.full_param.grad_added_to_main_grad is False
+
+    bucket.start_microbatch()
+    spec.full_param.grad = torch.full_like(spec.full_param, 2.0)
+    bucket._make_grad_ready_hook(spec)(spec.full_param)
+
+    assert torch.equal(spec.full_param.main_grad, torch.full_like(spec.full_param, 5.0))
 
 
 def test_mfsdp_reduce_scatters_each_microbatch_into_sharded_accumulation():

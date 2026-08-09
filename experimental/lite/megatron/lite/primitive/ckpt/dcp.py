@@ -306,8 +306,9 @@ def _model_chunks(model: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:
 
 def _has_mfsdp_persistent_shards(model: nn.Module | Iterable[nn.Module]) -> bool:
     return any(
-        callable(getattr(chunk, "iter_persistent_shards", None))
+        callable(getattr(module, "iter_persistent_shards", None))
         for chunk in _model_chunks(model)
+        for module in chunk.modules()
     )
 
 

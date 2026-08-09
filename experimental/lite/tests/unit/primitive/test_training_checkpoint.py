@@ -100,7 +100,7 @@ def test_dcp_rejects_mfsdp_flat_bucket_fragments(monkeypatch, tmp_path) -> None:
         def iter_persistent_shards(self):
             yield "weight", self.weight, self.bucket
 
-    model = FakeMFSdpModule()
+    model = torch.nn.ModuleList([FakeMFSdpModule()])
 
     monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: False)
     with pytest.raises(NotImplementedError, match="flat buckets"):

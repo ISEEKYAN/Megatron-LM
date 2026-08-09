@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 """Raw HF weight update bridge for miles rollout engines."""
 
 from __future__ import annotations
@@ -57,14 +58,20 @@ class RawHFWeightUpdater:
         broadcast = importlib.import_module(
             "miles.backends.megatron_utils.update_weight.update_weight_from_distributed.broadcast"
         )
-        connect_rollout_engines_from_distributed = broadcast.connect_rollout_engines_from_distributed
-        disconnect_rollout_engines_from_distributed = broadcast.disconnect_rollout_engines_from_distributed
+        connect_rollout_engines_from_distributed = (
+            broadcast.connect_rollout_engines_from_distributed
+        )
+        disconnect_rollout_engines_from_distributed = (
+            broadcast.disconnect_rollout_engines_from_distributed
+        )
 
         self.rollout_engines = list(rollout_engines)
         self.rollout_engine_lock = rollout_engine_lock
 
         if engine_gpu_counts is None:
-            engine_gpu_counts = [self.args.rollout_num_gpus_per_engine] * len(rollout_engines)
+            engine_gpu_counts = [self.args.rollout_num_gpus_per_engine] * len(
+                rollout_engines
+            )
         if engine_gpu_offsets is None:
             engine_gpu_offsets = []
             offset = 0
@@ -75,9 +82,13 @@ class RawHFWeightUpdater:
         if not getattr(self.args, "colocate", False):
             colocate_engine_nums = 0
         else:
-            total_actor_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
+            total_actor_gpus = (
+                self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
+            )
             colocate_engine_nums = 0
-            for gpu_offset, gpu_count in zip(engine_gpu_offsets, engine_gpu_counts, strict=True):
+            for gpu_offset, gpu_count in zip(
+                engine_gpu_offsets, engine_gpu_counts, strict=True
+            ):
                 if gpu_offset + gpu_count > total_actor_gpus:
                     break
                 colocate_engine_nums += 1
@@ -102,7 +113,10 @@ class RawHFWeightUpdater:
                 engine_gpu_counts=engine_gpu_counts[colocate_engine_nums:],
             )
 
-        self._connect_colocated_groups(engine_gpu_counts[:colocate_engine_nums], engine_gpu_offsets[:colocate_engine_nums])
+        self._connect_colocated_groups(
+            engine_gpu_counts[:colocate_engine_nums],
+            engine_gpu_offsets[:colocate_engine_nums],
+        )
 
     @property
     def _active_rollout_engines(self):
@@ -114,7 +128,9 @@ class RawHFWeightUpdater:
         self._ipc_gather_src = None
         self._ipc_engine = None
 
-        for engine_idx, (offset, count) in enumerate(zip(engine_gpu_offsets, engine_gpu_counts, strict=True)):
+        for engine_idx, (offset, count) in enumerate(
+            zip(engine_gpu_offsets, engine_gpu_counts, strict=True)
+        ):
             group_ranks = list(range(offset, offset + count))
             new_group = dist.new_group(ranks=group_ranks, backend="gloo")
             if rank in group_ranks:
@@ -123,7 +139,9 @@ class RawHFWeightUpdater:
                 self._ipc_engine = self.rollout_engines[engine_idx]
 
     def update_weights(self) -> None:
-        common = importlib.import_module("miles.backends.megatron_utils.update_weight.common")
+        common = importlib.import_module(
+            "miles.backends.megatron_utils.update_weight.common"
+        )
         broadcast = importlib.import_module(
             "miles.backends.megatron_utils.update_weight.update_weight_from_distributed.broadcast"
         )
@@ -140,8 +158,15 @@ class RawHFWeightUpdater:
         rank = dist.get_rank()
         if rank == 0:
             mode = self.args.pause_generation_mode
-            ray.get([engine.pause_generation.remote(mode=mode) for engine in self._active_rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self._active_rollout_engines])
+            ray.get(
+                [
+                    engine.pause_generation.remote(mode=mode)
+                    for engine in self._active_rollout_engines
+                ]
+            )
+            ray.get(
+                [engine.flush_cache.remote() for engine in self._active_rollout_engines]
+            )
         dist.barrier(group=get_gloo_group())
 
         refs = []
@@ -178,7 +203,12 @@ class RawHFWeightUpdater:
                 restore_weights_before_load=False,
                 post_process_quantization=True,
             )
-            ray.get([engine.continue_generation.remote() for engine in self._active_rollout_engines])
+            ray.get(
+                [
+                    engine.continue_generation.remote()
+                    for engine in self._active_rollout_engines
+                ]
+            )
         dist.barrier(group=get_gloo_group())
 
     def _export_weight_chunks(self):
@@ -200,7 +230,9 @@ class RawHFWeightUpdater:
                 continue
             tensor = tensor.detach()
             if not tensor.is_cuda:
-                tensor = tensor.to(device=torch.cuda.current_device(), non_blocking=True)
+                tensor = tensor.to(
+                    device=torch.cuda.current_device(), non_blocking=True
+                )
             item_bytes = tensor.numel() * tensor.element_size()
             if chunk and chunk_bytes + item_bytes > limit:
                 torch.cuda.synchronize()
@@ -241,11 +273,21 @@ class RawHFWeightUpdater:
                 pp_next_rank=-1,
                 pp_prev_rank=-1,
             )
-            yield from proto.export_hf_weights(model_chunks, model_cfg, local_pp_ps, **export_kwargs)
+            yield from proto.export_hf_weights(
+                model_chunks, model_cfg, local_pp_ps, **export_kwargs
+            )
             return
 
         for chunk in model_chunks:
-            yield from chunk.named_parameters()
+            stream = getattr(chunk, "stream_full_parameters", None)
+            if callable(stream):
+                yield from stream()
+            elif callable(getattr(chunk, "iter_persistent_shards", None)):
+                raise RuntimeError(
+                    "M-FSDP weight export requires stream_full_parameters()."
+                )
+            else:
+                yield from chunk.named_parameters()
 
 
 def _send_to_colocated_engine_direct(
@@ -266,9 +308,12 @@ def _send_to_colocated_engine_direct(
 
     is_gather_src = dist.get_rank() == ipc_gather_src
     serialized_tensors = [
-        (name, MultiprocessingSerializer.serialize(tensor)) for name, tensor in hf_named_tensors
+        (name, MultiprocessingSerializer.serialize(tensor))
+        for name, tensor in hf_named_tensors
     ]
-    serialized_named_tensors = [None] * dist.get_world_size(ipc_gather_group) if is_gather_src else None
+    serialized_named_tensors = (
+        [None] * dist.get_world_size(ipc_gather_group) if is_gather_src else None
+    )
     dist.gather_object(
         serialized_tensors,
         object_gather_list=serialized_named_tensors,
@@ -282,10 +327,17 @@ def _send_to_colocated_engine_direct(
         for tensor_group in zip(*serialized_named_tensors, strict=True):
             names = {name for name, _ in tensor_group}
             if len(names) != 1:
-                raise RuntimeError(f"Mismatched TP tensor names during weight sync: {sorted(names)}")
+                raise RuntimeError(
+                    f"Mismatched TP tensor names during weight sync: {sorted(names)}"
+                )
             name = tensor_group[0][0]
             named_tensors.append(
-                (name, LocalSerializedTensor(values=[rank_part[1] for rank_part in tensor_group]))
+                (
+                    name,
+                    LocalSerializedTensor(
+                        values=[rank_part[1] for rank_part in tensor_group]
+                    ),
+                )
             )
         payload = [
             MultiprocessingSerializer.serialize(named_tensors, output_str=True)
@@ -293,8 +345,7 @@ def _send_to_colocated_engine_direct(
         ]
         refs.append(
             ipc_engine.update_weights_from_tensor.remote(
-                serialized_named_tensors=payload,
-                weight_version=str(weight_version),
+                serialized_named_tensors=payload, weight_version=str(weight_version)
             )
         )
 

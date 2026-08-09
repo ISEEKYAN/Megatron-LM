@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 """MegatronLiteRuntime — Megatron Lite's default training backend."""
 
 from __future__ import annotations
@@ -404,7 +405,15 @@ class MegatronLiteRuntime(RuntimeBase):
             yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
         else:
             for chunk in model_chunks:
-                yield from chunk.named_parameters()
+                stream = getattr(chunk, "stream_full_parameters", None)
+                if callable(stream):
+                    yield from stream()
+                elif callable(getattr(chunk, "iter_persistent_shards", None)):
+                    raise RuntimeError(
+                        "M-FSDP weight export requires stream_full_parameters()."
+                    )
+                else:
+                    yield from chunk.named_parameters()
 
     def release_export_scratch(self, handle: ModelHandle) -> None:
         """Release retained full-parameter scratch before colocated rollout wake."""

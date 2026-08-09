@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# isort: skip_file
 from __future__ import annotations
 
 import os
@@ -77,6 +78,24 @@ def test_release_export_scratch_routes_to_mfsdp_chunks_and_skips_plain_ones():
     assert released == [id(mfsdp_a), id(mfsdp_b)]
 
 
+def test_export_fallback_streams_full_mfsdp_parameters():
+    chunk = nn.Module()
+    full_weight = torch.ones(3, 2)
+    chunk.stream_full_parameters = lambda: iter((("weight", full_weight),))
+    chunk.named_parameters = lambda: (_ for _ in ()).throw(
+        AssertionError("M-FSDP export must not expose persistent shards")
+    )
+    handle = types.SimpleNamespace(
+        _model=chunk, _parallel_state=object(), _extras={"model_chunks": [chunk]}
+    )
+
+    exported = list(
+        MegatronLiteRuntime.__new__(MegatronLiteRuntime).export_weights(handle)
+    )
+
+    assert exported == [("weight", full_weight)]
+
+
 def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
     context = LossContext(source_batch="source")
     seen = []
@@ -104,7 +123,7 @@ def test_pipeline_runtime_enables_mfsdp_grad_reduce_on_last_microbatch(monkeypat
 
     grad_sync_transitions = []
     param_sync = types.SimpleNamespace(
-        set_grad_sync_enabled=grad_sync_transitions.append,
+        set_grad_sync_enabled=grad_sync_transitions.append
     )
     optimizer = MFSdpOptimizer(
         optimizer=types.SimpleNamespace(),
@@ -129,11 +148,7 @@ def test_pipeline_runtime_enables_mfsdp_grad_reduce_on_last_microbatch(monkeypat
 
     monkeypatch.setattr(torch, "tensor", cpu_tensor)
     parallel_state = types.SimpleNamespace(
-        pp_size=2,
-        pp_group=None,
-        pp_global_ranks=None,
-        tp_size=1,
-        cp_size=1,
+        pp_size=2, pp_group=None, pp_global_ranks=None, tp_size=1, cp_size=1
     )
     model = nn.Linear(1, 1, bias=False)
     handle = ModelHandle(
@@ -152,10 +167,7 @@ def test_pipeline_runtime_enables_mfsdp_grad_reduce_on_last_microbatch(monkeypat
         seq_lens=torch.tensor([4]),
     )
     MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
-        handle,
-        iter([batch, batch]),
-        None,
-        num_microbatches=2,
+        handle, iter([batch, batch]), None, num_microbatches=2
     )
     assert observed_callbacks == [True]
     assert grad_sync_transitions == [True]
@@ -359,9 +371,7 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty-cache"))
     chunk = Chunk()
     handle = ModelHandle(
-        model=chunk,
-        optimizer=Optimizer(),
-        _extras={"model_chunks": [chunk]},
+        model=chunk, optimizer=Optimizer(), _extras={"model_chunks": [chunk]}
     )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
@@ -396,9 +406,7 @@ def test_export_transfer_does_not_move_optimizer_or_release_scratch(monkeypatch)
     )
     chunk = Chunk()
     handle = ModelHandle(
-        model=chunk,
-        optimizer=HookedOptimizer(),
-        _extras={"model_chunks": [chunk]},
+        model=chunk, optimizer=HookedOptimizer(), _extras={"model_chunks": [chunk]}
     )
 
     MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(

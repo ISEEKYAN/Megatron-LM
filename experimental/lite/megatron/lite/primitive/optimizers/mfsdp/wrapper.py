@@ -267,6 +267,7 @@ class MegatronFSDP(nn.Module):
 
     def named_parameters(self, *args, **kwargs) -> Iterator[tuple[str, nn.Parameter]]:
         """Expose persistent optimizer shards without transient all-gathers."""
+        self.param_sync.prepare_persistent_state()
         return super().named_parameters(*args, **kwargs)
 
     def state_dict(self, *args, **kwargs):
@@ -276,8 +277,13 @@ class MegatronFSDP(nn.Module):
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         """Load persistent shard state without allocating full model weights."""
+        if assign:
+            raise NotImplementedError(
+                "M-FSDP load_state_dict(assign=True) would invalidate bucket and "
+                "optimizer shard references."
+            )
         self.param_sync.prepare_persistent_state()
-        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        return super().load_state_dict(state_dict, strict=strict, assign=False)
 
 
 MFSdpModule = MegatronFSDP
