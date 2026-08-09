@@ -418,7 +418,6 @@ class ParamBucket:
         self.grad_ready_callback: Callable[["ParamBucket"], None] | None = None
         self.before_main_grad_allocate: Callable[["ParamBucket"], None] | None = None
         self._grad_ready_ids: set[int] = set()
-        self._staged_grad_ids: set[int] = set()
         self._initialize_parameters()
 
     def _initialize_parameters(self) -> None:
@@ -478,10 +477,7 @@ class ParamBucket:
             # wgrad destination, so restore them on every materialization.
             spec.full_param.grad_added_to_main_grad = False
             spec.full_param.__fsdp_param__ = True
-            # A pipeline schedule may enter the next forward before global RS
-            # ordering launches this parameter's previous microbatch. Preserve
-            # that still-live staging contribution by asking TE to accumulate.
-            spec.full_param.overwrite_main_grad = id(spec) not in self._staged_grad_ids
+            spec.full_param.overwrite_main_grad = True
             for binding in spec.bindings:
                 setattr(binding.module, binding.attribute, spec.full_param)
 
@@ -539,7 +535,6 @@ class ParamBucket:
         return lambda: self.get_main_grad(spec)
 
     def _release_full_main_grads(self) -> None:
-        self._staged_grad_ids.clear()
         if self._full_main_grad_lease is not None:
             self._full_main_grad_lease.release()
             self._full_main_grad_lease = None
@@ -761,7 +756,6 @@ class ParamBucket:
                 spec.full_param.grad = None
                 spec.full_param.grad_added_to_main_grad = False
                 spec.full_param.overwrite_main_grad = True
-        self._staged_grad_ids.clear()
         if self.policy.grad_comm_dtype == self.policy.main_grads_dtype:
             grad_input = self.full_main_grad_buffer
         else:
@@ -883,7 +877,6 @@ class ParamBucket:
         self._has_accumulated_grad = False
         self.grad_sync_enabled = False
         self._grad_ready_ids.clear()
-        self._staged_grad_ids.clear()
         self.main_grad_buffer.zero_()
         self._release_local_grad_comm_buffer()
         for spec in self.specs:
@@ -901,7 +894,6 @@ class ParamBucket:
 
     def clear_transient_grad_state(self) -> None:
         self._grad_ready_ids.clear()
-        self._staged_grad_ids.clear()
         self._grad_reduce_launched = False
         self._grad_reduce_finished = False
         self._microbatch_reduced = False
@@ -939,33 +931,17 @@ class ParamBucket:
 
     def _make_grad_ready_hook(self, spec: ParamSpec) -> Callable[[nn.Parameter], None]:
         def grad_ready(param: nn.Parameter) -> None:
-            fused_wgrad_staged = bool(param.grad_added_to_main_grad)
-            if not fused_wgrad_staged:
+            if not param.grad_added_to_main_grad:
                 with torch.no_grad():
                     if param.grad is not None:
-                        # MCore's data-distributed _grad_acc writes directly
-                        # into the authoritative FP32 bucket. Usually this is
-                        # a fresh staging view. If global ordering deferred the
-                        # previous microbatch before RS launch, accumulate into
-                        # that still-live view instead of overwriting it.
-                        main_grad = self.get_main_grad(spec)
-                        if id(spec) in self._staged_grad_ids:
-                            main_grad.add_(param.grad)
-                        else:
-                            main_grad.copy_(param.grad)
-            # TE fused wgrad reaches this hook with
-            # ``grad_added_to_main_grad=True`` because it has already written
-            # the authoritative buffer. Track that contribution too, and make
-            # a subsequent backward accumulate if RS has not consumed it yet.
-            self._staged_grad_ids.add(id(spec))
-            param.overwrite_main_grad = False
+                        # A non-fused BF16 autograd gradient is converted into
+                        # a fresh FP32 communication view for this microbatch.
+                        self.get_main_grad(spec).copy_(param.grad)
             if param.grad is not None:
                 param.grad = None
-            # MCore resets this one-backward TE signal after scheduling RS.
-            # Our global rank order may defer RS across pipeline microbatches,
-            # so keep it set until the staging buffer is actually consumed;
-            # TE then accumulates rather than overwriting the live FP32 view.
-            param.grad_added_to_main_grad = fused_wgrad_staged
+            # TE fused wgrad has already written this same FP32 view. Every
+            # microbatch enters RS immediately, so the signal is consumed here.
+            param.grad_added_to_main_grad = False
             # get_main_grad() may retire this same bucket's previous
             # microbatch, whose completion clears the old ready set. Mark the
             # current parameter only after that retirement.

@@ -1908,9 +1908,6 @@ def test_mfsdp_full_param_installs_mcore_te_lazy_main_grad_protocol():
 
     assert spec.full_param.__fsdp_param__ is True
     assert spec.full_param.overwrite_main_grad is True
-    bucket._staged_grad_ids.add(id(spec))
-    bucket.install_full_parameters()
-    assert spec.full_param.overwrite_main_grad is False
     getter = spec.full_param.get_main_grad
     calls = 0
 
@@ -1932,9 +1929,8 @@ def test_mfsdp_full_param_installs_mcore_te_lazy_main_grad_protocol():
     spec.full_param.grad_added_to_main_grad = True
     spec.full_param.overwrite_main_grad = True
     bucket._make_grad_ready_hook(spec)(spec.full_param)
-    assert id(spec) in bucket._staged_grad_ids
-    assert spec.full_param.grad_added_to_main_grad is True
-    assert spec.full_param.overwrite_main_grad is False
+    assert spec.full_param.grad_added_to_main_grad is False
+    assert spec.full_param.overwrite_main_grad is True
 
     bucket._release_full_main_grads()
     assert spec.full_param.grad_added_to_main_grad is False
@@ -1977,7 +1973,9 @@ def test_mfsdp_sharded_grad_hook_writes_authoritative_bucket_buffer():
     spec.full_param.grad = torch.full_like(spec.full_param, 2.0)
     bucket._make_grad_ready_hook(spec)(spec.full_param)
 
-    assert torch.equal(spec.full_param.main_grad, torch.full_like(spec.full_param, 5.0))
+    # The unsharded staging view is per-microbatch. Persistent FP32
+    # accumulation happens after each reduce-scatter in main_grad_buffer.
+    assert torch.equal(spec.full_param.main_grad, torch.full_like(spec.full_param, 2.0))
 
 
 def test_mfsdp_reduce_scatters_each_microbatch_into_sharded_accumulation():
