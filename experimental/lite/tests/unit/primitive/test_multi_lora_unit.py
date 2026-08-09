@@ -354,6 +354,72 @@ def test_qkv_tp_carrier_collective_trace_has_hidden_rank_gather(monkeypatch):
     assert result.shape == (4, 1, 4)
 
 
+def test_qkv_sp_accepts_global_slots_without_second_slot_gather(monkeypatch):
+    """Production SP passes local rows but logical-global adapter slots."""
+    calls = []
+
+    def gather(value, _group):
+        calls.append(tuple(value.shape))
+        return torch.cat((value, value + 1), dim=0)
+
+    monkeypatch.setattr(multi_lora_bank, "_gather_sequence_parallel", gather)
+    monkeypatch.setattr(
+        multi_lora_bank,
+        "_all_gather_last_dim",
+        lambda value, _group, reduce_backward: torch.cat((value, value), dim=-1),
+    )
+    bank = DenseLoraBank(
+        torch.arange(2 * 2 * 4, dtype=torch.float32).reshape(2, 2, 4) / 16,
+        torch.arange(2 * 4 * 4, dtype=torch.float32).reshape(2, 4, 4) / 16,
+        LoraBankPartition(tp_size=2, rank_partitioned_a=True),
+    )
+    local_rows = torch.randn(2, 1, 4, requires_grad=True)
+    global_slots = torch.tensor([0, 1, 0, 1])
+    actual = apply_batched_lora_delta(
+        bank,
+        local_rows,
+        global_slots,
+        scale=0.5,
+        tp_group=object(),
+        sequence_parallel_input=True,
+    )
+    explicit_rows = torch.cat(
+        (local_rows.detach(), local_rows.detach() + 1), dim=0
+    ).requires_grad_()
+    expected = apply_batched_lora_delta(
+        bank, explicit_rows, global_slots, scale=0.5, tp_group=object()
+    )
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(
+        local_rows.grad, explicit_rows.grad[:2] + explicit_rows.grad[2:]
+    )
+    assert calls == [(2, 4)]
+
+
+def test_qkv_sp_rejects_slots_neither_local_nor_global(monkeypatch):
+    monkeypatch.setattr(
+        multi_lora_bank,
+        "_gather_sequence_parallel",
+        lambda value, _group: torch.cat((value, value), dim=0),
+    )
+    bank = DenseLoraBank(
+        torch.ones(2, 2, 4),
+        torch.ones(2, 4, 4),
+        LoraBankPartition(tp_size=2, rank_partitioned_a=True),
+    )
+    with pytest.raises(ValueError, match="SP LoRA indices"):
+        apply_batched_lora_delta(
+            bank,
+            torch.ones(2, 1, 4),
+            torch.tensor([0, 1, 0]),
+            scale=1.0,
+            tp_group=object(),
+            sequence_parallel_input=True,
+        )
+
+
 def test_proj_tp_carrier_collective_trace_has_local_b_then_output_gather(monkeypatch):
     calls = []
     monkeypatch.setattr(
