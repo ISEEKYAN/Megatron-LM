@@ -609,34 +609,59 @@ class EPChunkWorkspace:
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> torch.Tensor:
-        """Reserve caller-owned expert activation storage at profile capacity."""
+        """Reserve caller-owned storage at the observed high-watermark.
+
+        ``max_expert_rows`` is an input-validity ceiling, not an allocation
+        target: allocating it would turn a sparse routing bound into a large,
+        permanently resident activation.  A replacement is safe here because
+        ``acquire_expert_activation`` has waited for the preceding consumer
+        event before this method can be called.
+        """
         requested = tuple(int(dim) for dim in shape)
         profile = self.key.shape_profile
         contracts = {
             "fc1_input": ((profile.max_expert_rows, profile.hidden_size), self.key.dtype),
         }
-        capacity, expected_dtype = contracts.get(name, (requested, dtype))
+        ceiling, expected_dtype = contracts.get(name, (requested, dtype))
         if (
-            len(requested) != len(capacity)
-            or any(want > have for want, have in zip(requested, capacity, strict=True))
-            or requested[1:] != capacity[1:]
+            not requested
+            or any(dim < 0 for dim in requested)
+            or len(requested) != len(ceiling)
+            or any(want > limit for want, limit in zip(requested, ceiling, strict=True))
+            or requested[1:] != ceiling[1:]
             or dtype != expected_dtype
         ):
             raise RuntimeError(
                 f"EP chunk expert activation {name!r} shape {requested} dtype {dtype} "
-                f"exceeds fixed profile capacity {capacity} dtype {expected_dtype}"
+                f"exceeds profile ceiling {ceiling} dtype {expected_dtype}"
             )
         arena = self._expert_activation_arena
         existing = arena.tensors.get(name)
         if existing is None:
             with arena.allocate():
-                existing = torch.empty(capacity, dtype=dtype, device=device)
+                existing = torch.empty(requested, dtype=dtype, device=device)
             arena.tensors[name] = existing
             self._allocations += 1
             self._runtime_allocations += 1
-        if existing.dtype != dtype or existing.device != torch.device(device):
+        capacity = tuple(existing.shape)
+        incompatible = (
+            existing.dtype != dtype
+            or existing.device != torch.device(device)
+            or len(capacity) != len(requested)
+        )
+        too_small = not incompatible and any(
+            want > have for want, have in zip(requested, capacity, strict=True)
+        )
+        if too_small:
+            with arena.allocate():
+                existing = torch.empty(requested, dtype=dtype, device=device)
+            arena.tensors[name] = existing
+            self._allocations += 1
+            self._runtime_allocations += 1
+            self._grows += 1
+        elif incompatible:
             raise RuntimeError(
-                f"EP chunk expert activation {name!r} does not match its fixed storage"
+                f"EP chunk expert activation {name!r} does not match its reusable storage"
             )
         slices = tuple(slice(0, dim) for dim in requested)
         return existing[slices].view(requested).detach()

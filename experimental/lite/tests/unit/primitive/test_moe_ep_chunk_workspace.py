@@ -898,7 +898,7 @@ def test_expert_activation_arena_waits_only_for_its_consumer_event(
     second.release(_FakeEvent(ready=True))
 
 
-def test_expert_activation_lease_owns_one_fixed_fc1_input_buffer(
+def test_expert_activation_lease_lazily_grows_one_fc1_input_buffer(
     transformer_engine_import_stub,
 ):
     (
@@ -944,9 +944,22 @@ def test_expert_activation_lease_owns_one_fixed_fc1_input_buffer(
     assert stream.waited == [pending]
     assert second_tensor.data_ptr() == first_ptr
     evidence = workspace.evidence()["expert_activation_tensors"]["fc1_input"]
-    assert evidence["shape"] == (16, 4)
+    assert evidence["shape"] == (5, 4)
     assert evidence["data_ptr"] == first_ptr
-    second.release(_FakeEvent(ready=True))
+    grow_guard = _FakeEvent(ready=False)
+    second.release(grow_guard)
+
+    third = workspace.acquire_expert_activation(stream=stream)
+    grown_tensor = third.tensor(
+        "fc1_input", (7, 4), dtype=torch.float32, device="cpu"
+    )
+
+    assert stream.waited == [pending, grow_guard]
+    grown_evidence = workspace.evidence()["expert_activation_tensors"]["fc1_input"]
+    assert grown_evidence["shape"] == (7, 4)
+    assert grown_evidence["data_ptr"] == grown_tensor.data_ptr()
+    assert workspace.metrics()["grows"] == 1
+    third.release(_FakeEvent(ready=True))
 
 
 def test_unbound_workspace_binds_to_first_runtime_stream_device(
