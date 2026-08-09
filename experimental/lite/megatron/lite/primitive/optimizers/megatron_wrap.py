@@ -9,8 +9,10 @@ from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-
-from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
+from megatron.lite.primitive.protocols import (
+    ExpertClassifierFn,
+    default_expert_classifier,
+)
 
 
 def validate_dist_opt_config(engine_cfg) -> None:
@@ -30,7 +32,9 @@ def _effective_etp(parallel) -> int:
 def _ensure_dist_opt_mpu_parallel_state(engine_cfg) -> None:
     """Initialize Megatron-Core mpu globals when dist_opt fallback groups are used."""
 
-    from megatron.core import parallel_state as mpu  # pyright: ignore[reportMissingImports]
+    from megatron.core import (
+        parallel_state as mpu,  # pyright: ignore[reportMissingImports]
+    )
 
     p = engine_cfg.parallel
     expected = (int(p.tp), int(p.ep), _effective_etp(p), int(p.pp), int(p.cp))
@@ -123,7 +127,10 @@ def build_dist_opt_stack(
             influences optimizer master-grad sharding, so callers that prewrap
             chunks own the DDP config compatibility.
     """
-    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.distributed import (
+        DistributedDataParallel,
+        DistributedDataParallelConfig,
+    )
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
     from megatron.core.optimizer import get_megatron_optimizer
     from megatron.core.transformer.enums import ModelType
@@ -153,7 +160,9 @@ def build_dist_opt_stack(
         wrapped_chunks = list(model_chunks)
     else:
         ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=True, overlap_grad_reduce=False, grad_reduce_in_fp32=True
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=False,
+            grad_reduce_in_fp32=True,
         )
         wrapped_chunks = []
         for chunk_idx, chunk in enumerate(model_chunks):
@@ -180,8 +189,12 @@ def build_dist_opt_stack(
     # groups. Long term, this primitive should always pass its own
     # `pg_collection`.
     if skip_ddp_wrap or use_mpu_groups:
-        optimizer = get_megatron_optimizer(config=opt_config, model_chunks=wrapped_chunks)
-        optimizer._dist_opt_pg_collection = None  # pyright: ignore[reportAttributeAccessIssue]
+        optimizer = get_megatron_optimizer(
+            config=opt_config, model_chunks=wrapped_chunks
+        )
+        optimizer._dist_opt_pg_collection = (
+            None  # pyright: ignore[reportAttributeAccessIssue]
+        )
     else:
         optimizer = get_megatron_optimizer(
             config=opt_config,
@@ -320,7 +333,6 @@ def _mark_dist_opt_parallel_attrs(
 
 def _build_pg_collection(ps, engine_cfg):
     import torch.distributed as dist  # pyright: ignore[reportMissingImports]
-
     from megatron.core.process_groups_config import ProcessGroupCollection
 
     if ps.pp_group is None:
@@ -330,7 +342,9 @@ def _build_pg_collection(ps, engine_cfg):
         return ((pp_i * ps.dp_size + dp_i) * ps.cp_size + cp_i) * ps.tp_size + tp_i
 
     def _expert_rank(etp_i: int, ep_i: int, edp_i: int, pp_i: int) -> int:
-        return ((pp_i * ps.expert_dp_size + edp_i) * ps.ep_size + ep_i) * ps.etp_size + etp_i
+        return (
+            (pp_i * ps.expert_dp_size + edp_i) * ps.ep_size + ep_i
+        ) * ps.etp_size + etp_i
 
     rank = dist.get_rank()
     world = dist.get_world_size()
@@ -374,7 +388,9 @@ def _build_pg_collection(ps, engine_cfg):
                 tp_ep_pp_group = group
 
         if mp_group is None or tp_ep_pp_group is None:
-            raise RuntimeError("Failed to construct dist_opt pipeline-aware process groups.")
+            raise RuntimeError(
+                "Failed to construct dist_opt pipeline-aware process groups."
+            )
 
     pg_kwargs = dict(
         tp=ps.tp_group,
@@ -434,7 +450,9 @@ class DistOptBackend:
     def load_state_dict(self, optimizer: Any, state_dict: dict) -> None:
         optimizer.load_state_dict(state_dict)
 
-    def finalize_grads(self, finalize_fn, model_chunks: list[Any], optimizer: Any) -> None:
+    def finalize_grads(
+        self, finalize_fn, model_chunks: list[Any], optimizer: Any
+    ) -> None:
         finalize_fn(model_chunks, optimizer)
 
 
