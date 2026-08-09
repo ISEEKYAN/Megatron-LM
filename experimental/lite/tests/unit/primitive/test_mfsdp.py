@@ -1904,6 +1904,9 @@ def test_mfsdp_full_param_installs_mcore_te_lazy_main_grad_protocol():
 
     assert spec.full_param.__fsdp_param__ is True
     assert spec.full_param.overwrite_main_grad is True
+    bucket._staged_grad_ids.add(id(spec))
+    bucket.install_full_parameters()
+    assert spec.full_param.overwrite_main_grad is False
     getter = spec.full_param.get_main_grad
     calls = 0
 

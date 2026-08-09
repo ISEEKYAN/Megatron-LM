@@ -478,7 +478,10 @@ class ParamBucket:
             # wgrad destination, so restore them on every materialization.
             spec.full_param.grad_added_to_main_grad = False
             spec.full_param.__fsdp_param__ = True
-            spec.full_param.overwrite_main_grad = True
+            # A pipeline schedule may enter the next forward before global RS
+            # ordering launches this parameter's previous microbatch. Preserve
+            # that still-live staging contribution by asking TE to accumulate.
+            spec.full_param.overwrite_main_grad = id(spec) not in self._staged_grad_ids
             for binding in spec.bindings:
                 setattr(binding.module, binding.attribute, spec.full_param)
 
