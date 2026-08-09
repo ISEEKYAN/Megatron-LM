@@ -1584,6 +1584,8 @@ def test_caller_owned_grouped_linear_keeps_te_delayed_wgrad_contract(
     assert "linear.fp8" in source
     assert "linear.use_bias" in source
     assert "torch.bfloat16" in source
+    assert "dgrad_out" in source
+    assert "torch.empty_like(inp)" not in source
 
 
 def test_manual_unpermute_writes_into_stable_workspace_slot(

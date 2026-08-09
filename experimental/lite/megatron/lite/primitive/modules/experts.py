@@ -40,7 +40,7 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inp, out, linear, m_splits, *weights):
+    def forward(ctx, inp, out, dgrad_out, linear, m_splits, *weights):
         from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
 
         if (
@@ -57,6 +57,12 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
             raise RuntimeError("Caller-owned grouped GEMM output has the wrong shape")
         if not out.is_contiguous():
             raise RuntimeError("Caller-owned grouped GEMM output must be contiguous")
+        if dgrad_out is not None and (
+            tuple(dgrad_out.shape) != tuple(inp.shape) or not dgrad_out.is_contiguous()
+        ):
+            raise RuntimeError(
+                "Caller-owned grouped GEMM dgrad output must match the contiguous input"
+            )
         inputmats = list(torch.split(inp.reshape(-1, inp.shape[-1]), m_splits))
         general_grouped_gemm(
             list(weights),
@@ -70,6 +76,7 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
         ctx.linear = linear
         ctx.m_splits = list(m_splits)
         ctx.inp_shape = inp.shape
+        ctx.dgrad_out = dgrad_out
         ctx.save_for_backward(inp, *weights)
         return out
 
@@ -82,7 +89,10 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
         inp, *weights = ctx.saved_tensors
         grad_output = grad_output.contiguous().view(-1, grad_output.shape[-1])
         grad_mats = list(torch.split(grad_output, ctx.m_splits))
-        dgrad = torch.empty_like(inp).view(-1, inp.shape[-1])
+        dgrad_out = ctx.dgrad_out
+        if dgrad_out is None:
+            raise RuntimeError("Caller-owned grouped GEMM backward requires dgrad output")
+        dgrad = dgrad_out.view(-1, inp.shape[-1])
         general_grouped_gemm(
             list(weights),
             grad_mats,
@@ -109,7 +119,7 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
         )
         inputmats = list(torch.split(inp.reshape(-1, inp.shape[-1]), ctx.m_splits))
         ctx.linear.wgrad_store.put([inputmats, grad_mats, main_grads], wgrad)
-        return dgrad.view(ctx.inp_shape), None, None, None, *([None] * len(weights))
+        return dgrad.view(ctx.inp_shape), None, None, None, None, *([None] * len(weights))
 
 
 def _caller_owned_grouped_linear(
@@ -117,12 +127,13 @@ def _caller_owned_grouped_linear(
     x: torch.Tensor,
     m_splits: list[int],
     out: torch.Tensor,
+    dgrad_out: torch.Tensor | None,
 ) -> torch.Tensor:
     """Apply the narrow TE2.15 caller-owned-output adapter, or fail loudly."""
     if getattr(linear, "return_bias", False):
         raise RuntimeError("Caller-owned grouped GEMM does not support return_bias")
     weights = [getattr(linear, f"weight{idx}") for idx in range(linear.num_gemms)]
-    return _CallerOwnedGroupedLinear.apply(x, out, linear, m_splits, *weights)
+    return _CallerOwnedGroupedLinear.apply(x, out, dgrad_out, linear, m_splits, *weights)
 
 
 @contextmanager
@@ -454,6 +465,7 @@ class Experts(nn.Module):
                 nullcontext if activation_allocation is None else activation_allocation
             )
             with allocation_scope():
+                needs_dgrad = torch.is_grad_enabled()
                 if caller_owned_outputs:
                     fc1_out = _caller_owned_grouped_linear(
                         self.fc1,
@@ -461,6 +473,11 @@ class Experts(nn.Module):
                         m_splits,
                         output_allocation(
                             "fc1_output", (x.shape[0], self.fc1.out_features)
+                        ),
+                        (
+                            output_allocation("fc1_dgrad", tuple(x.shape))
+                            if needs_dgrad
+                            else None
                         ),
                     )
                 else:
@@ -482,6 +499,11 @@ class Experts(nn.Module):
                     m_splits,
                     output_allocation(
                         "fc2_output", (h.shape[0], self.fc2.out_features)
+                    ),
+                    (
+                        output_allocation("fc2_dgrad", tuple(h.shape))
+                        if needs_dgrad
+                        else None
                     ),
                 )
             else:
