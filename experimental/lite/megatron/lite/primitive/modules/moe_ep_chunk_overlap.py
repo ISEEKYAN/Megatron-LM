@@ -2053,7 +2053,12 @@ class _EPChunkOperationBase:
                         grad_probs = expert_grads[1]
                         if grad_probs is None:
                             grad_probs = torch.zeros_like(expert_probs_input)
-                    hidden_reuse_base = local_state.pop("grad_expert_out").detach()
+                    # FC1 dgrad aliases FC2 output, so autograd can have
+                    # overwritten grad_expert_out. FC1 input is distinct
+                    # storage for the later local scatter; delayed Wgrad is
+                    # its last reader and drains on wgrad_stream below.
+                    hidden_reuse_base = expert_dispatched.detach()
+                    local_state.pop("grad_expert_out")
                     chunk.dispatched = None
                     chunk.probs = None
                     chunk.expert_out = None
@@ -2253,6 +2258,10 @@ class _EPChunkOperationBase:
                     grad_probs = expert_grads[1]
                     if grad_probs is None:
                         grad_probs = torch.zeros_like(probs)
+                # FC1 dgrad aliases FC2 output. Keep FC1 input as the
+                # distinct post-Wgrad local-scatter destination instead.
+                local_state["hidden_reuse_base"] = dispatched.detach()
+                local_state.pop("grad_expert_out")
                 local_state["grad_dispatched"] = grad_dispatched
                 local_state["grad_probs"] = grad_probs
                 saved.probs = None
@@ -2278,12 +2287,12 @@ class _EPChunkOperationBase:
             wgrad_done.record(wgrad_stream)
         _queue_backward_stream_wait(wgrad_done, grad_2d.device)
 
-        # Delayed grouped-linear wgrad retains its grad-output storage. The
-        # manual-unpermute output cannot be repurposed until that queue drains.
+        # Delayed grouped-linear Wgrad retains FC1 input. Do not repurpose its
+        # distinct local-scatter destination until that queue drains.
         for chunk, local_state in pending_dispatch_bwd:
             with torch.cuda.stream(compute_stream):
                 compute_stream.wait_event(wgrad_done)
-                hidden_reuse_base = local_state.pop("grad_expert_out").detach()
+                hidden_reuse_base = local_state.pop("hidden_reuse_base")
                 grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
                     chunk,
                     local_state.pop("grad_dispatched"),
@@ -2536,6 +2545,8 @@ def _dispatch_local_backward(
     *,
     hidden_reuse_base: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not grad_dispatched.is_contiguous():
+        raise RuntimeError("EP chunk local backward gradient source must be contiguous")
     row_id_map = chunk.row_id_map.reshape(-1).to(torch.long)
     if chunk.recv_probs_base is None:
         raise RuntimeError(
@@ -2557,6 +2568,10 @@ def _dispatch_local_backward(
         .view(-1)[:required_hidden_numel]
         .view(chunk.recv_hidden_shape)
     )
+    if _tensor_byte_ranges_overlap(grad_dispatched, grad_recv_hidden):
+        raise RuntimeError(
+            "EP chunk local backward source and destination storage overlap"
+        )
     grad_recv_probs = chunk.recv_probs_base.detach()
     if (
         grad_recv_probs.shape != chunk.recv_probs_shape
@@ -2579,6 +2594,17 @@ def _dispatch_local_backward(
             0, flat, grad_probs.reshape(-1).to(grad_recv_probs.dtype)
         )
     return grad_recv_hidden, grad_recv_probs
+
+
+def _tensor_byte_ranges_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Whether two contiguous tensor views overlap in addressable bytes."""
+    if left.numel() == 0 or right.numel() == 0:
+        return False
+    left_start = left.data_ptr()
+    left_end = left_start + left.numel() * left.element_size()
+    right_start = right.data_ptr()
+    right_end = right_start + right.numel() * right.element_size()
+    return left_start < right_end and right_start < left_end
 
 
 def _expert_grad_inputs(

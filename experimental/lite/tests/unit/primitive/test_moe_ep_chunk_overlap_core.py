@@ -1426,17 +1426,20 @@ def test_saved_backward_reuses_manual_unpermute_storage_only_after_wgrad_flush(
     grad_complete = source.index("expert_grads = torch.autograd.grad(")
     flushed = source.index("flush_delayed_weight_grads")
     flush_waited = source.index("compute_stream.wait_event(wgrad_done)")
-    alias_taken = source.index("hidden_reuse_base = local_state.pop(", flush_waited)
+    alias_saved = source.index('local_state["hidden_reuse_base"] = dispatched.detach()')
+    alias_taken = source.index(
+        'hidden_reuse_base = local_state.pop("hidden_reuse_base")', flush_waited
+    )
     storage_overwritten = source.index("_dispatch_local_backward(", alias_taken)
     dispatch_submitted = source.index(
         "submit_deepep_dispatch_backward(", storage_overwritten
     )
     queued = source.index("pending_dispatch_bwd.append", grad_complete)
 
-    assert grad_complete < queued < flushed < flush_waited < alias_taken
+    assert grad_complete < alias_saved < queued < flushed < flush_waited < alias_taken
     assert alias_taken < storage_overwritten < dispatch_submitted
-    assert "hidden_reuse_base = chunk.dispatched.detach()" not in source
-    assert "Delayed grouped-linear wgrad retains its grad-output storage" in source
+    assert 'local_state["hidden_reuse_base"] = dispatched.detach()' in source
+    assert "Delayed grouped-linear Wgrad retains FC1 input" in source
     for assignment in (
         "saved.dispatched = None",
         "saved.probs = None",
@@ -1484,18 +1487,16 @@ def test_normal_and_fused_backward_reuse_manual_unpermute_workspace_storage(
     for source in (saved_source, fused_source):
         assert 'recv_hidden_base=state["recv_hidden"]' not in source
         assert 'recv_probs_base=state["recv_probs"]' in source
-    for source in (normal_backward_source, fused_source):
-        assert "hidden_reuse_base = chunk.dispatched.detach()" not in source
-    assert "hidden_reuse_base = local_state.pop(" in normal_backward_source
     assert (
-        '"grad_expert_out"'
-        in normal_backward_source[normal_backward_source.index("hidden_reuse_base =") :]
+        'local_state["hidden_reuse_base"] = dispatched.detach()'
+        in normal_backward_source
+    )
+    assert (
+        'hidden_reuse_base = local_state.pop("hidden_reuse_base")'
+        in normal_backward_source
     )
     assert "out=chunk.expert_out.detach()" in fused_source
-    assert (
-        'hidden_reuse_base = local_state.pop("grad_expert_out").detach()'
-        in fused_source
-    )
+    assert "hidden_reuse_base = expert_dispatched.detach()" in fused_source
     assert "chunk.workspace_lease.tensor(" in unpermute_source
     assert '"grad_expert_out"' in unpermute_source
     assert "torch.index_select(" in unpermute_source
@@ -1529,7 +1530,7 @@ def test_fused_flushes_each_chunk_before_reusing_delayed_wgrad_storage(
         "expert_activation_lease.release(local_bwd_ready)", per_chunk_flush
     )
     alias_taken = source.index(
-        'hidden_reuse_base = local_state.pop("grad_expert_out").detach()', autograd
+        "hidden_reuse_base = expert_dispatched.detach()", autograd
     )
     graph_clear = source.index("chunk.expert_out = None", alias_taken)
     locals_clear = source.index("del expert_dispatched", graph_clear)
@@ -1566,6 +1567,202 @@ def test_fused_flushes_each_chunk_before_reusing_delayed_wgrad_storage(
     ):
         assert name in source[per_chunk_flush:overwrite]
     assert "cuda.synchronize" not in source
+
+
+def test_dispatch_local_backward_rejects_source_destination_storage_alias(
+    transformer_engine_import_stub,
+):
+    """The FC1-input reuse slot must not alias autograd's FC1 dgrad source."""
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _dispatch_local_backward,
+    )
+
+    shared = torch.empty(3, 2)
+    chunk = SimpleNamespace(
+        recv_probs_base=torch.empty(3, 2),
+        row_id_map=torch.tensor([0, 2]),
+        prob_flat_indices=torch.tensor([1, 5]),
+        recv_hidden_shape=torch.Size((3, 2)),
+        recv_hidden_dtype=torch.float32,
+        recv_probs_shape=torch.Size((3, 2)),
+        recv_probs_dtype=torch.float32,
+    )
+
+    with pytest.raises(RuntimeError, match="source and destination storage overlap"):
+        _dispatch_local_backward(
+            chunk,
+            shared[:2],
+            None,
+            hidden_reuse_base=shared,
+        )
+
+
+def test_dispatch_local_backward_rejects_partial_byte_range_overlap(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _dispatch_local_backward,
+    )
+
+    shared = torch.empty(4, 2)
+    chunk = SimpleNamespace(
+        recv_probs_base=torch.empty(3, 2),
+        row_id_map=torch.tensor([0, 2]),
+        prob_flat_indices=torch.tensor([1, 5]),
+        recv_hidden_shape=torch.Size((3, 2)),
+        recv_hidden_dtype=torch.float32,
+        recv_probs_shape=torch.Size((3, 2)),
+        recv_probs_dtype=torch.float32,
+    )
+
+    with pytest.raises(RuntimeError, match="source and destination storage overlap"):
+        _dispatch_local_backward(
+            chunk,
+            shared[:2],
+            None,
+            hidden_reuse_base=shared[1:],
+        )
+
+
+def test_dispatch_local_backward_accepts_adjacent_nonoverlapping_ranges(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _dispatch_local_backward,
+    )
+
+    shared = torch.empty(5, 2)
+    grad_dispatched = shared[:2]
+    grad_dispatched.copy_(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    hidden_reuse_base = shared[2:]
+    chunk = SimpleNamespace(
+        recv_probs_base=torch.empty(3, 2),
+        row_id_map=torch.tensor([0, 2]),
+        prob_flat_indices=torch.tensor([1, 5]),
+        recv_hidden_shape=torch.Size((3, 2)),
+        recv_hidden_dtype=torch.float32,
+        recv_probs_shape=torch.Size((3, 2)),
+        recv_probs_dtype=torch.float32,
+    )
+
+    grad_hidden, _ = _dispatch_local_backward(
+        chunk, grad_dispatched, None, hidden_reuse_base=hidden_reuse_base
+    )
+
+    assert grad_hidden.data_ptr() != grad_dispatched.data_ptr()
+    torch.testing.assert_close(
+        grad_hidden, torch.tensor([[1.0, 2.0], [0.0, 0.0], [3.0, 4.0]])
+    )
+
+
+def test_dispatch_local_backward_rejects_noncontiguous_gradient_source(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _dispatch_local_backward,
+    )
+
+    chunk = SimpleNamespace(
+        recv_probs_base=torch.empty(3, 2),
+        row_id_map=torch.tensor([0, 2]),
+        prob_flat_indices=torch.tensor([1, 5]),
+        recv_hidden_shape=torch.Size((3, 2)),
+        recv_hidden_dtype=torch.float32,
+        recv_probs_shape=torch.Size((3, 2)),
+        recv_probs_dtype=torch.float32,
+    )
+    noncontiguous_source = torch.empty(2, 3)[:, :2]
+
+    assert not noncontiguous_source.is_contiguous()
+    with pytest.raises(RuntimeError, match="gradient source must be contiguous"):
+        _dispatch_local_backward(
+            chunk,
+            noncontiguous_source,
+            None,
+            hidden_reuse_base=torch.empty(3, 2),
+        )
+
+
+def test_autograd_flush_then_local_scatter_reuses_distinct_fc1_input_storage(
+    transformer_engine_import_stub,
+):
+    """CPU model of the fused FC1-dgrad/FC2-output coloring boundary."""
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _dispatch_local_backward,
+    )
+
+    events = []
+
+    class CallerOwnedDgrad(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value, dgrad_out):
+            ctx.dgrad_out = dgrad_out
+            return value * 2
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            events.append("autograd writes fc1_dgrad")
+            ctx.dgrad_out.copy_(grad_output * 3)
+            return ctx.dgrad_out, None
+
+    # This is the physical FC2-output/FC1-dgrad color from the production
+    # arena. FC1 input deliberately has a different physical address.
+    fc2_output_and_fc1_dgrad = torch.empty(3, 2)
+    expert_dispatched = torch.tensor([[2.0, 3.0], [5.0, 7.0]], requires_grad=True)
+    expert_output = CallerOwnedDgrad.apply(
+        expert_dispatched, fc2_output_and_fc1_dgrad[:2]
+    )
+    grad_dispatched = torch.autograd.grad(
+        expert_output,
+        expert_dispatched,
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+    )[0]
+    hidden_reuse_base = expert_dispatched.detach()
+
+    assert grad_dispatched.data_ptr() == fc2_output_and_fc1_dgrad.data_ptr()
+    assert grad_dispatched.data_ptr() != hidden_reuse_base.data_ptr()
+
+    class DelayedWgradQueue:
+        def flush(self):
+            events.append("flush delayed wgrad")
+
+    # The delayed FC1 Wgrad still reads expert_dispatched, so this real queue
+    # flush is the final operation before zero/scatter overwrites that storage.
+    delayed_wgrad = DelayedWgradQueue()
+    delayed_wgrad.flush()
+    chunk = SimpleNamespace(
+        recv_probs_base=torch.empty(2, 1),
+        row_id_map=torch.tensor([1, 0]),
+        prob_flat_indices=torch.tensor([0, 1]),
+        recv_hidden_shape=torch.Size((2, 2)),
+        recv_hidden_dtype=torch.float32,
+        recv_probs_shape=torch.Size((2, 1)),
+        recv_probs_dtype=torch.float32,
+    )
+
+    def dispatch_after_flush():
+        events.append("zero/scatter fc1_input")
+        return _dispatch_local_backward(
+            chunk,
+            grad_dispatched,
+            None,
+            hidden_reuse_base=hidden_reuse_base,
+        )
+
+    grad_hidden, _ = dispatch_after_flush()
+
+    assert events == [
+        "autograd writes fc1_dgrad",
+        "flush delayed wgrad",
+        "zero/scatter fc1_input",
+    ]
+    assert grad_hidden.data_ptr() == expert_dispatched.data_ptr()
+    torch.testing.assert_close(grad_hidden, torch.tensor([[9.0, 12.0], [3.0, 6.0]]))
 
 
 def test_fused_autograd_context_is_only_source_level_pool_routing_evidence(
