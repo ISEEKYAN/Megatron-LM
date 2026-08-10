@@ -219,3 +219,10 @@ def test_ds4_dapo_rejects_invalid_feature_knob(
     )
     assert result.returncode == 2
     assert message in result.stderr
+
+
+def test_ds4_dapo_compose_only_resolves_hydra_config_before_training() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert 'if [[ "${COMPOSE_ONLY:-0}" == "1" ]]; then' in source
+    assert '"${COMMAND[@]}" --cfg job --resolve' in source

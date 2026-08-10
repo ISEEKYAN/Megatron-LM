@@ -370,6 +370,11 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
+if [[ "${COMPOSE_ONLY:-0}" == "1" ]]; then
+  "${COMMAND[@]}" --cfg job --resolve
+  exit 0
+fi
+
 python3 "${VALIDATOR}" environment
 
 echo "[ds4-dapo] weights=expert-w${ROLLOUT_WEIGHT_BITS}/dense-w8 qat=${ENABLE_QAT} r3=${ENABLE_R3}"
