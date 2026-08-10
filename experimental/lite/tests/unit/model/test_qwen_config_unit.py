@@ -305,6 +305,27 @@ def test_qwen3_model_build_propagates_logical_chunk_count_to_decoder_and_mtp(
     } == {expected_chunk_count}
 
 
+def test_qwen3_moe_parks_through_the_public_workspace_key_api(monkeypatch):
+    """The composition layer must not inspect ChunkedEP primitive internals."""
+    from megatron.lite.model.qwen3_moe.lite import model
+
+    forward_key = object()
+    backward_key = object()
+    parked = []
+    layer = object.__new__(model.MoELayer)
+    layer.ep_chunk_forward = SimpleNamespace(workspace=SimpleNamespace(key=forward_key))
+    layer.ep_chunk_backward = SimpleNamespace(workspace=SimpleNamespace(key=backward_key))
+    layer.ep_chunk_fused = None
+    monkeypatch.setattr(
+        model, "park_ep_chunk_workspace", lambda key, stream=None: parked.append((key, stream))
+    )
+
+    stream = object()
+    layer.park_ep_chunk_activations(stream=stream)
+
+    assert parked == [(forward_key, stream)]
+
+
 @pytest.mark.parametrize(
     "full_recompute,expected_ops",
     [

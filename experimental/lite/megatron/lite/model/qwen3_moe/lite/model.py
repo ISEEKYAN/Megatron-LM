@@ -26,6 +26,7 @@ from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
     EPChunkShapeProfile,
     EPChunkWorkspaceKey,
     get_ep_chunk_workspace,
+    park_ep_chunk_workspace,
     release_ep_chunk_workspace,
 )
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
@@ -387,6 +388,12 @@ class MoELayer(nn.Module):
         """Drop phase scratch at an explicit safe boundary, retaining DeepEP state."""
         for workspace in self._ep_chunk_workspaces_for_phase(phase):
             workspace.reset_tensors(stream=stream)
+
+    def park_ep_chunk_activations(self, *, stream=None) -> None:
+        """Park shared activation references after Qwen3's transformer stack."""
+        for workspace in self._ep_chunk_workspaces():
+            park_ep_chunk_workspace(workspace.key, stream=stream)
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -899,6 +906,14 @@ class Qwen3MoEModel(nn.Module):
                 h = layer(
                     h, position_ids=position_ids, packed_seq_params=packed_seq_params
                 )
+            # All Qwen3 transformer layers have finished consuming their MoE
+            # activations.  Park references before norm/LM-head/CE; the next
+            # fused recompute reacquires the same event-guarded MemPool.
+            stream = torch.cuda.current_stream(h.device) if h.is_cuda else None
+            for layer in self.layers:
+                if layer.moe.ep_chunk_forward is not None:
+                    layer.moe.park_ep_chunk_activations(stream=stream)
+                    break
             # Head path is SP-aware: norm runs on SP-sharded [S/tp, B, H] and
             # head's internal all-gather happens inside VocabParallelOutput.
             # Mirrors MC GPTModel's final_layernorm → output_layer(sp=True).

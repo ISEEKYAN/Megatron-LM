@@ -300,6 +300,8 @@ class _EPChunkExpertActivationArenaCoordinator:
     waits: int = 0
     allocations: int = 0
     grows: int = 0
+    parks: int = 0
+    rehydrates: int = 0
     issued_storage_slots: set[str] = field(default_factory=set)
     max_requested_bytes: dict[str, int] = field(default_factory=dict)
     capacity_bytes: dict[str, int] = field(default_factory=dict)
@@ -309,12 +311,17 @@ class _EPChunkExpertActivationArenaCoordinator:
         self, *, op: EPChunkOpName, stream: Any | None, device: torch.device
     ) -> None:
         if self.arena.device is None:
-            # A strong reference to each caller-owned tensor is sufficient to
-            # stabilize its address after warmup.  Do not place persistent
-            # activations in another MemPool: only DeepEP's two communication
-            # slots own custom pools, avoiding cross-pool nesting and extra
-            # allocator residency.
             self.arena.device = device
+        if self.key.device_type == "cuda" and self.arena.allocation_pool is None:
+            # Activation storage must be owned by a pool rather than by a
+            # cross-OP tensor reference.  A release event parks one OP before
+            # the next OP reacquires this single compatible pool.
+            with torch.cuda.device(device):
+                self.arena.allocation_pool = torch.cuda.MemPool(
+                    allocator=None,
+                    use_on_oom=False,
+                    no_split=False,
+                )
         if self.claimed_op is not None:
             raise RuntimeError(
                 "EP chunk expert activation coordinator is already claimed by "
@@ -342,6 +349,28 @@ class _EPChunkExpertActivationArenaCoordinator:
             raise RuntimeError("EP chunk expert activation coordinator release lost owner")
         self.consumer_event = event
         self.claimed_op = None
+
+    def park(self, *, stream: Any | None) -> None:
+        """Drop cross-OP tensor references at an explicit model lifecycle boundary."""
+        if self.claimed_op is not None:
+            raise RuntimeError("Cannot park a leased EP chunk expert activation arena")
+        event = self.consumer_event
+        if event is not None and not (
+            bool(event.query()) if hasattr(event, "query") else False
+        ):
+            if stream is not None and hasattr(stream, "wait_event"):
+                stream.wait_event(event)
+            elif hasattr(event, "current_stream_wait"):
+                event.current_stream_wait()
+            else:
+                raise RuntimeError(
+                    "Pending EP chunk expert activation event is not stream-waitable"
+                )
+            self.waits += 1
+        self.consumer_event = None
+        if self.arena.tensors:
+            self.parks += 1
+            self.arena.tensors.clear()
 
     def tensor(
         self,
@@ -399,9 +428,11 @@ class _EPChunkExpertActivationArenaCoordinator:
                 f"EP chunk expert activation {name!r} does not match colored storage "
                 f"{storage_name!r}"
             )
-        growing = existing is not None and (
-            requested_bytes > existing.numel() * existing.element_size()
-        )
+        reserved_capacity_bytes = self.capacity_bytes.get(storage_name, 0)
+        rehydrating = existing is None and reserved_capacity_bytes > 0
+        growing = requested_bytes > reserved_capacity_bytes > 0
+        if existing is not None:
+            growing = growing or requested_bytes > existing.numel() * existing.element_size()
         if growing and storage_name in self.issued_storage_slots:
             raise RuntimeError(
                 "EP chunk expert activation cannot grow colored storage "
@@ -409,23 +440,21 @@ class _EPChunkExpertActivationArenaCoordinator:
             )
         if existing is None or growing:
             requested_capacity_bytes = _expert_activation_capacity_bytes(requested_bytes)
-            capacity_bytes = requested_capacity_bytes
+            capacity_bytes = max(reserved_capacity_bytes, requested_capacity_bytes)
             ceiling_numel = 1
             for dim in ceiling:
                 ceiling_numel *= dim
             ceiling_capacity_bytes = _expert_activation_capacity_bytes(
                 ceiling_numel * element_size
             )
-            capacity_bytes = max(
-                requested_capacity_bytes,
-                min(capacity_bytes, ceiling_capacity_bytes),
-            )
+            capacity_bytes = min(capacity_bytes, ceiling_capacity_bytes)
             capacity_numel = (capacity_bytes + element_size - 1) // element_size
             with self.arena.allocate():
                 existing = torch.empty((capacity_numel,), dtype=dtype, device=device)
             self.arena.tensors[storage_name] = existing
-            self.allocations += 1
+            self.allocations += int(reserved_capacity_bytes == 0)
             self.grows += int(growing)
+            self.rehydrates += int(rehydrating)
             self.capacity_bytes[storage_name] = capacity_bytes
         if previous_trailing_shape is None:
             self.logical_trailing_shapes[name] = trailing_shape
@@ -794,6 +823,10 @@ class EPChunkWorkspace:
             return
         self._prepare_slots_for_reset(stream=stream, operation="reset tensors")
 
+    def park_expert_activations(self, *, stream: Any | None = None) -> None:
+        """Park activation references while retaining the shared MemPool/high-watermark."""
+        self._expert_activation_owner.coordinator.park(stream=stream)
+
     def _prepare_slots_for_reset(
         self,
         *,
@@ -1038,6 +1071,8 @@ class EPChunkWorkspace:
             "expert_activation_waits": owner.waits,
             "expert_activation_allocations": owner.allocations,
             "expert_activation_grows": owner.grows,
+            "expert_activation_parks": coordinator.parks,
+            "expert_activation_rehydrates": coordinator.rehydrates,
             "expert_activation_in_use": owner.in_use,
             "expert_activation_event_guarded": (owner.consumer_event is not None),
             "expert_activation_arena_id": id(coordinator),
@@ -1216,6 +1251,14 @@ class EPChunkWorkspaceRegistry:
             coordinator.max_requested_bytes.clear()
             coordinator.capacity_bytes.clear()
             coordinator.logical_trailing_shapes.clear()
+            coordinator.parks = 0
+            coordinator.rehydrates = 0
+
+    def park(self, key: EPChunkWorkspaceKey, *, stream: Any | None = None) -> None:
+        """Park one workspace's shared activation arena without releasing its pool."""
+        workspace = self._workspaces.get(key)
+        if workspace is not None:
+            workspace.park_expert_activations(stream=stream)
 
 
 _EP_CHUNK_WORKSPACES = EPChunkWorkspaceRegistry()
@@ -1236,6 +1279,15 @@ def release_ep_chunk_workspace(
 ) -> None:
     """Close and unregister a process-local EP chunk workspace."""
     _EP_CHUNK_WORKSPACES.release(key, stream=stream)
+
+
+def park_ep_chunk_workspace(
+    key: EPChunkWorkspaceKey,
+    *,
+    stream: Any | None = None,
+) -> None:
+    """Drop activation tensor references at a model-owned phase boundary."""
+    _EP_CHUNK_WORKSPACES.park(key, stream=stream)
 
 
 def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
@@ -2867,5 +2919,6 @@ __all__ = [
     "EPChunkWorkspaceKey",
     "EPChunkWorkspaceRegistry",
     "get_ep_chunk_workspace",
+    "park_ep_chunk_workspace",
     "release_ep_chunk_workspace",
 ]
