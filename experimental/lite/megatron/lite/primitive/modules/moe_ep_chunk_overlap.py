@@ -230,13 +230,19 @@ class _EPChunkAllocationArena:
 
 _EXPERT_ACTIVATION_SIZE_CLASS_BYTES = 8 * 1024 * 1024
 
-# These names are logical TE buffers. FC2 output remains live through delayed
-# FC2 Wgrad, so it must not share physical bytes with either dgrad. FC2 dgrad
-# is consumed by SwiGLU before FC1 dgrad is written, making that pair the only
-# safe raw-byte alias in the four-slot baseline. FC1 input/output retain their
-# delayed or SwiGLU consumers.
-_EXPERT_ACTIVATION_STORAGE_SLOTS = {
+# Normal saved-context backward keeps FC2 output separate because its delayed
+# FC2 Wgrad remains deferred. FC2 dgrad is consumed by SwiGLU before FC1 dgrad
+# is written, making that pair the only safe normal-mode raw-byte alias.
+_NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS = {
     "fc1_dgrad": "fc2_dgrad",
+}
+
+# Fused backward first completes an overlapping FC2 Wgrad synchronously, then
+# writes FC2 dgrad and finally FC1 dgrad after SwiGLU consumes it. That permits
+# all three logical tensors to use FC2-output raw storage in this OP only.
+_FUSED_EXPERT_ACTIVATION_STORAGE_SLOTS = {
+    "fc1_dgrad": "fc2_output",
+    "fc2_dgrad": "fc2_output",
 }
 
 
@@ -310,6 +316,7 @@ class _EPChunkSharedExpertActivationOwner:
         *,
         dtype: torch.dtype,
         device: torch.device | str,
+        storage_name: str | None = None,
     ) -> torch.Tensor:
         requested = tuple(int(dim) for dim in shape)
         profile = self.key.shape_profile
@@ -330,7 +337,7 @@ class _EPChunkSharedExpertActivationOwner:
             raise RuntimeError(
                 f"EP chunk expert activation {name!r} shape {requested} dtype {dtype} exceeds profile ceiling {ceiling} dtype {expected_dtype}"
             )
-        storage_name = _EXPERT_ACTIVATION_STORAGE_SLOTS.get(name, name)
+        storage_name = name if storage_name is None else storage_name
         existing = self.arena.tensors.get(storage_name)
         requested_numel = 1
         for dim in requested:
@@ -768,8 +775,17 @@ class EPChunkWorkspace:
                 f"EP chunk expert activation {name!r} shape {requested} dtype {dtype} "
                 f"exceeds profile ceiling {ceiling} dtype {expected_dtype}"
             )
+        storage_slots = (
+            _FUSED_EXPERT_ACTIVATION_STORAGE_SLOTS
+            if self.key.op == "fused_forward_backward"
+            else _NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS
+        )
         return self._expert_activation_owner.tensor(
-            name, requested, dtype=dtype, device=device
+            name,
+            requested,
+            dtype=dtype,
+            device=device,
+            storage_name=storage_slots.get(name, name),
         )
 
     def _validate_runtime_tensor(
@@ -2052,10 +2068,9 @@ class _EPChunkOperationBase:
                         grad_probs = expert_grads[1]
                         if grad_probs is None:
                             grad_probs = torch.zeros_like(expert_probs_input)
-                    # FC1 dgrad aliases FC2 output, so autograd can have
-                    # overwritten grad_expert_out. FC1 input is distinct
-                    # storage for the later local scatter; delayed Wgrad is
-                    # its last reader and drains on wgrad_stream below.
+                    # In fused mode FC1 dgrad aliases FC2 output, so autograd
+                    # can have overwritten grad_expert_out. FC1 input is the
+                    # delayed-Wgrad-flush local-scatter destination below.
                     hidden_reuse_base = expert_dispatched.detach()
                     local_state.pop("grad_expert_out")
                     chunk.dispatched = None

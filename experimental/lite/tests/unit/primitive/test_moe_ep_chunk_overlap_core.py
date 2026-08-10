@@ -263,6 +263,24 @@ def test_experts_accept_te_dbias_placeholders_when_bias_is_disabled(
     experts.flush_delayed_weight_grads(num_contexts=1)
 
     assert all(parameter.grad is None for parameter in experts.parameters())
+    for linear in (experts.fc1, experts.fc2):
+        linear.wgrad_store._mlite_immediate_wgrad_contexts = 1
+    experts.flush_delayed_weight_grads(num_contexts=1)
+    assert all(
+        linear.wgrad_store._mlite_immediate_wgrad_contexts == 0
+        for linear in (experts.fc1, experts.fc2)
+    )
+
+    for linear in (experts.fc1, experts.fc2):
+        linear.wgrad_store._mlite_immediate_wgrad_contexts = 2
+    with pytest.raises(RuntimeError, match="immediate/deferred context accounting"):
+        experts.flush_delayed_weight_grads(num_contexts=1)
+
+    for linear in (experts.fc1, experts.fc2):
+        linear.wgrad_store._mlite_immediate_wgrad_contexts = 1
+        linear.wgrad_store.pending = 1
+    with pytest.raises(RuntimeError, match="queue was not drained"):
+        experts.flush_delayed_weight_grads(num_contexts=1)
 
 
 def test_expert_wgrad_flush_records_nested_cuda_views_and_bases(
@@ -2112,7 +2130,7 @@ def test_caller_owned_grouped_linear_keeps_te_delayed_wgrad_contract(
     assert "torch.empty_like(inp)" not in source
 
 
-def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
+def test_caller_owned_grouped_linear_executes_te_lifecycle_and_partial_overlap_wgrad(
     monkeypatch, transformer_engine_import_stub
 ):
     """CPU fake of TE2.15's narrow adapter: buffers, hooks, and delayed GEMM execute."""
@@ -2127,7 +2145,12 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
         torch.zeros(shape, dtype=dtype) if zero else torch.ones(shape, dtype=dtype)
     )
     cpp = sys.modules["transformer_engine.pytorch.cpp_extensions"]
-    trace = {"fc1_dgrad_ptr": None, "events": []}
+    trace = {
+        "fc1_dgrad_ptr": None,
+        "overlap_dgrad_ptr": None,
+        "overlap_dgrad_end": None,
+        "events": [],
+    }
 
     def fake_grouped_gemm(
         weights, inputs, outputs, quantization_params=None, out_dtype=None, **kwargs
@@ -2135,16 +2158,30 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
         if kwargs.get("layout") == "NN":
             pieces = [inp @ weight for weight, inp in zip(weights, inputs)]
         elif kwargs.get("layout") == "NT":
+            if any(
+                trace["overlap_dgrad_ptr"] < grad.data_ptr() + grad.nbytes
+                and grad.data_ptr() < trace["overlap_dgrad_end"]
+                for grad in inputs
+                if trace["overlap_dgrad_ptr"] is not None
+            ):
+                trace["events"].append("overlap wgrad reads grad_output")
             pieces = [grad.T @ inp for inp, grad in zip(weights, inputs)]
             for dst, piece in zip(outputs, pieces, strict=True):
                 if kwargs.get("accumulate"):
                     dst.add_(piece)
                 else:
                     dst.copy_(piece)
+            if (
+                trace["events"]
+                and trace["events"][-1] == "overlap wgrad reads grad_output"
+            ):
+                trace["events"].append("overlap wgrad completes")
             return None, [None] * len(pieces), None
         else:
             pieces = [inp @ weight.T for weight, inp in zip(weights, inputs)]
         outputs[0].copy_(torch.cat(pieces, dim=0))
+        if outputs[0].data_ptr() == trace["overlap_dgrad_ptr"]:
+            trace["events"].append("overlap dgrad first write")
         if (
             kwargs.get("layout") == "NN"
             and outputs[0].data_ptr() == trace["fc1_dgrad_ptr"]
@@ -2251,6 +2288,75 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
         torch.tensor([[3.0, 4.0], [3.0, 4.0], [3.0, 4.0]]),
     )
 
+    # Fused 3-slot mode may use the FC2 output bytes as the FC2 dgrad output.
+    # The explicit grad_output and dgrad_out below are different contiguous
+    # views with a partial byte-range overlap, not a same-data_ptr shortcut.
+    # Wgrad must execute before Dgrad overwrites the shared bytes, rather than
+    # enqueueing a deferred callback that would read corruption during flush.
+    overlap_linear = Linear()
+    overlap_linear.weight0 = torch.nn.Parameter(
+        torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.bfloat16)
+    )
+    overlap_linear.weight1 = torch.nn.Parameter(
+        torch.tensor([[2.0, -1.0, 4.0], [0.0, 3.0, 5.0]], dtype=torch.bfloat16)
+    )
+    for weight in (overlap_linear.weight0, overlap_linear.weight1):
+        weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+        weight.grad_added_to_main_grad = False
+        weight.zero_out_wgrad = True
+    overlap_x = torch.tensor(
+        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    overlap_out = torch.empty(2, 2, dtype=torch.bfloat16)
+    overlap_raw = torch.empty(8, dtype=torch.bfloat16)
+    overlap_grad_output = overlap_raw[:4].view(2, 2)
+    overlap_dgrad_out = overlap_raw[2:].view(2, 3)
+    assert overlap_grad_output.data_ptr() != overlap_dgrad_out.data_ptr()
+    overlap_result = experts_module._caller_owned_grouped_linear(
+        overlap_linear,
+        overlap_x,
+        [1, 1],
+        overlap_out,
+        overlap_dgrad_out,
+    )
+    overlap_grad_output.copy_(
+        torch.tensor([[2.0, 3.0], [5.0, 7.0]], dtype=torch.bfloat16)
+    )
+    trace["overlap_dgrad_ptr"] = overlap_dgrad_out.data_ptr()
+    trace["overlap_dgrad_end"] = overlap_dgrad_out.data_ptr() + overlap_dgrad_out.nbytes
+    overlap_dgrad = torch.autograd.grad(overlap_result, overlap_x, overlap_grad_output)[
+        0
+    ]
+
+    assert overlap_dgrad.data_ptr() == overlap_dgrad_out.data_ptr()
+    torch.testing.assert_close(
+        overlap_dgrad,
+        torch.tensor([[14.0, 19.0, 24.0], [10.0, 16.0, 55.0]], dtype=torch.bfloat16),
+    )
+    assert overlap_linear.wgrad_store.entries == []
+    assert trace["events"] == [
+        "overlap wgrad reads grad_output",
+        "overlap wgrad completes",
+        "overlap dgrad first write",
+    ]
+    assert all(
+        weight.grad_added_to_main_grad
+        for weight in (overlap_linear.weight0, overlap_linear.weight1)
+    )
+    torch.testing.assert_close(
+        overlap_linear.weight0.main_grad,
+        torch.tensor([[2.0, 4.0, 6.0], [3.0, 6.0, 9.0]]),
+    )
+    torch.testing.assert_close(
+        overlap_linear.weight1.main_grad,
+        torch.tensor([[20.0, 25.0, 30.0], [28.0, 35.0, 42.0]]),
+    )
+    trace["events"].clear()
+    trace["overlap_dgrad_ptr"] = None
+    trace["overlap_dgrad_end"] = None
+
     no_dgrad_x = torch.tensor([[2.0, 1.0], [4.0, 3.0]], dtype=torch.bfloat16)
     no_dgrad_out = torch.empty(2, 3, dtype=torch.bfloat16)
     no_dgrad_result = experts_module._caller_owned_grouped_linear(
@@ -2297,7 +2403,7 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
     colored_fc2_dgrad = lease.tensor(
         "fc2_dgrad", (2, 3), dtype=torch.bfloat16, device="cpu"
     )
-    assert colored_fc2_out.data_ptr() != colored_fc1_dgrad.data_ptr()
+    assert colored_fc2_out.data_ptr() == colored_fc1_dgrad.data_ptr()
     assert colored_fc2_dgrad.data_ptr() == colored_fc1_dgrad.data_ptr()
 
     fc1 = Linear()

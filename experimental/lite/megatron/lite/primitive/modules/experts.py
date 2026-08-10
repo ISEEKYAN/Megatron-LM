@@ -49,6 +49,24 @@ def _validate_caller_owned_buffer(
         )
 
 
+def _tensor_byte_ranges_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Return whether two contiguous tensor views overlap in addressable bytes."""
+    if left.numel() == 0 or right.numel() == 0:
+        return False
+    left_start = left.data_ptr()
+    left_end = left_start + left.numel() * left.element_size()
+    right_start = right.data_ptr()
+    right_end = right_start + right.numel() * right.element_size()
+    return left_start < right_end and right_start < left_end
+
+
+def _record_immediate_wgrad_context(store: Any) -> None:
+    count = getattr(store, "_mlite_immediate_wgrad_contexts", 0)
+    if not isinstance(count, int) or count < 0:
+        raise RuntimeError("Invalid immediate delayed-wgrad context count")
+    store._mlite_immediate_wgrad_contexts = count + 1
+
+
 class _CallerOwnedGroupedLinear(torch.autograd.Function):
     """TE 2.15 BF16 grouped-GEMM internals with explicit arena-owned outputs.
 
@@ -152,23 +170,12 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
         grad_view = grad_output.contiguous().view(-1, grad_output.shape[-1])
         grad_mats = list(torch.split(grad_view, ctx.m_splits))
         dgrad = None
+        dgrad_out = None
         if ctx.requires_dgrad:
             dgrad_out = ctx.dgrad_out
             if dgrad_out is None:
                 raise RuntimeError("Caller-owned grouped GEMM lost its dgrad output")
             dgrad = dgrad_out.view(-1, inp.shape[-1])
-            general_grouped_gemm(
-                list(weights),
-                grad_mats,
-                [dgrad],
-                [None] * len(weights),
-                activation_dtype,
-                layout="NN",
-                single_output=True,
-                m_splits=ctx.m_splits,
-                grad=True,
-                use_split_accumulator=_2X_ACC_DGRAD,
-            )
         origin_weights = [None] * len(weights)
         main_grads = [None] * len(weights)
         if ctx.fuse_wgrad_accumulation and ctx.weights_requires_grad:
@@ -201,8 +208,32 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
             accumulate=accumulate and not ctx.origin_weights_overwrite_main_grad,
         )
         inputmats = list(torch.split(inp.reshape(-1, inp.shape[-1]), ctx.m_splits))
+        immediate_wgrad = (
+            ctx.weights_requires_grad
+            and dgrad is not None
+            and _tensor_byte_ranges_overlap(grad_view, dgrad)
+        )
+        if immediate_wgrad:
+            # A caller-owned dgrad view overlaps the live grad-output bytes.
+            # Wgrad must consume them before Dgrad writes the same storage.
+            wgrad(inputmats, grad_mats, main_grads)
+            _record_immediate_wgrad_context(ctx.wgrad_store)
+        if dgrad is not None:
+            general_grouped_gemm(
+                list(weights),
+                grad_mats,
+                [dgrad],
+                [None] * len(weights),
+                activation_dtype,
+                layout="NN",
+                single_output=True,
+                m_splits=ctx.m_splits,
+                grad=True,
+                use_split_accumulator=_2X_ACC_DGRAD,
+            )
         if ctx.weights_requires_grad:
-            ctx.wgrad_store.put([inputmats, grad_mats, main_grads], wgrad)
+            if not immediate_wgrad:
+                ctx.wgrad_store.put([inputmats, grad_mats, main_grads], wgrad)
         wgrad_returns = []
         for weight, main_grad in zip(origin_weights, main_grads, strict=True):
             if weight is not None and hasattr(weight, "grad_added_to_main_grad"):
@@ -501,7 +532,17 @@ class Experts(nn.Module):
                 raise RuntimeError(
                     "Chunked EP expert grouped linears must not use bias."
                 )
-            for _ in range(num_contexts):
+            immediate_contexts = getattr(store, "_mlite_immediate_wgrad_contexts", 0)
+            if (
+                not isinstance(immediate_contexts, int)
+                or immediate_contexts < 0
+                or immediate_contexts > num_contexts
+            ):
+                raise RuntimeError(
+                    "Expert delayed wgrad immediate/deferred context accounting "
+                    "does not match the requested flush"
+                )
+            for _ in range(num_contexts - immediate_contexts):
                 if store.context is None or store.context.empty():
                     raise RuntimeError("Expert delayed weight-gradient queue is empty.")
                 result, tensors = store.pop()
@@ -522,6 +563,7 @@ class Experts(nn.Module):
                         raise RuntimeError(
                             "Expert delayed wgrad did not reuse its selected gradient sink"
                         )
+            store._mlite_immediate_wgrad_contexts = 0
             if store.context is not None and not store.context.empty():
                 raise RuntimeError(
                     "Expert delayed weight-gradient queue was not drained."

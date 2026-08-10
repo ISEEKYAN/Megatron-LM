@@ -1117,7 +1117,13 @@ def test_shared_owner_reuses_all_large_activation_names_across_ops(
         for name in names
     }
     assert stream.waited == [pending]
-    assert second_ptrs == first_ptrs
+    # The shared owner retains normal-path storage, while fused mode has a
+    # narrower, safe three-slot coloring after immediate FC2 Wgrad.
+    assert second_ptrs["fc1_input"] == first_ptrs["fc1_input"]
+    assert second_ptrs["fc1_output"] == first_ptrs["fc1_output"]
+    assert second_ptrs["fc2_output"] == first_ptrs["fc2_output"]
+    assert second_ptrs["fc2_dgrad"] == second_ptrs["fc2_output"]
+    assert second_ptrs["fc1_dgrad"] == second_ptrs["fc2_output"]
     assert owner.grows == 0
     for tensor in owner.arena.tensors.values():
         requested_bytes = 131963 * 16 * tensor.element_size()
@@ -1160,7 +1166,8 @@ def test_delayed_fc2_wgrad_reads_output_before_safe_dgrad_slot_reuse(
     ) = _symbols(transformer_engine_import_stub)
     workspace = registry_type().get_or_create(
         key_type(
-            op="fused_forward_backward",
+            # Normal/deferred Wgrad must retain FC2 output separately.
+            op="backward",
             device_type="cpu",
             device_index=None,
             ep_group_id=100,
@@ -1186,6 +1193,63 @@ def test_delayed_fc2_wgrad_reads_output_before_safe_dgrad_slot_reuse(
     assert fc2_output.data_ptr() != fc2_dgrad.data_ptr()
     torch.testing.assert_close(delayed_wgrad_read, expected_fc2_output)
     lease.release(_FakeEvent(ready=True))
+
+
+def test_fused_only_uses_three_slots_while_normal_keeps_fc2_output_separate(
+    transformer_engine_import_stub,
+):
+    """Only fused mode may rely on immediate Wgrad before the FC2 dgrad write."""
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    registry = registry_type()
+    profile = profile_type(max_input_rows=8, hidden_size=2, topk=2, ep_size=2)
+
+    def workspace(op):
+        return registry.get_or_create(
+            key_type(
+                op=op,
+                device_type="cpu",
+                device_index=None,
+                ep_group_id=102,
+                dtype=torch.float32,
+                shape_profile=profile,
+            ),
+            lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+        )
+
+    names = ("fc1_input", "fc1_output", "fc2_output", "fc2_dgrad", "fc1_dgrad")
+    fused = workspace("fused_forward_backward")
+    fused_lease = fused.acquire_expert_activation()
+    fused_ptrs = {
+        name: fused_lease.tensor(
+            name, (2, 2), dtype=torch.float32, device="cpu"
+        ).data_ptr()
+        for name in names
+    }
+    assert fused_ptrs["fc2_output"] == fused_ptrs["fc2_dgrad"]
+    assert fused_ptrs["fc2_dgrad"] == fused_ptrs["fc1_dgrad"]
+    assert len(set(fused_ptrs.values())) == 3
+    fused_lease.release(_FakeEvent(ready=True))
+
+    normal = workspace("backward")
+    normal_lease = normal.acquire_expert_activation()
+    normal_ptrs = {
+        name: normal_lease.tensor(
+            name, (2, 2), dtype=torch.float32, device="cpu"
+        ).data_ptr()
+        for name in names
+    }
+    assert normal_ptrs["fc2_output"] != normal_ptrs["fc2_dgrad"]
+    assert normal_ptrs["fc2_dgrad"] == normal_ptrs["fc1_dgrad"]
+    normal_lease.release(_FakeEvent(ready=True))
 
 
 def test_fc1_dgrad_reuses_fc2_dgrad_only_after_swiglu_consumes_it(
