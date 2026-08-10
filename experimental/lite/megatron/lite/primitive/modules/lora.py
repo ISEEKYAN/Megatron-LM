@@ -19,12 +19,7 @@ import torch.nn.functional as F
 LORA_DEFAULT_RANK = 0
 LORA_DEFAULT_ALPHA = None
 LORA_DEFAULT_DROPOUT = 0.0
-LORA_DEFAULT_TARGET_MODULES = (
-    "linear_qkv",
-    "linear_proj",
-    "linear_fc1",
-    "linear_fc2",
-)
+LORA_DEFAULT_TARGET_MODULES = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
 LORA_DEFAULT_USE_RSLORA = False
 _DEFAULT_IGNORE_PATTERNS = (
     "lm_head",
@@ -135,10 +130,7 @@ def normalize_lora_spec(config: LoraSpec | dict[str, Any] | None) -> LoraSpec:
             f"LoRA spec must be LoraSpec, dict, or None, got {type(config)!r}."
         )
     values = dict(config)
-    if (
-        "enabled" not in values
-        and int(values.get("rank", LORA_DEFAULT_RANK) or 0) > 0
-    ):
+    if "enabled" not in values and int(values.get("rank", LORA_DEFAULT_RANK) or 0) > 0:
         warnings.warn(
             "LoRA rank alone is inert; LoRA requires enabled=True.",
             UserWarning,
@@ -347,10 +339,16 @@ class _AllGatherLastDim(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         flat = grad.movedim(-1, 0).contiguous().view(grad.shape[-1], -1)
-        start = ctx.group_rank * ctx.local_width
-        out = flat.narrow(0, start, ctx.local_width).contiguous()
         if ctx.reduce_backward:
-            dist.all_reduce(out, op=dist.ReduceOp.SUM, group=ctx.group)
+            # Forward concatenates rank-local *last-dimension* chunks.  Move
+            # that dimension to dim0, sum the complete gradient plane across
+            # output shards, then take this rank's local-width chunk.
+            dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=ctx.group)
+            start = ctx.group_rank * ctx.local_width
+            out = flat.narrow(0, start, ctx.local_width).contiguous()
+        else:
+            start = ctx.group_rank * ctx.local_width
+            out = flat.narrow(0, start, ctx.local_width).contiguous()
         return (
             out.view(ctx.local_width, *grad.shape[:-1]).movedim(0, -1).contiguous(),
             None,

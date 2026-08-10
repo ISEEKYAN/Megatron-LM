@@ -14,7 +14,10 @@ import pytest
 import torch
 import torch.nn as nn
 from megatron.lite.model.qwen3_moe.lite import multi_lora
-from megatron.lite.model.qwen3_moe.lite.checkpoint import Qwen3MoEWeightSpec
+from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+    PLACEMENT_FN,
+    Qwen3MoEWeightSpec,
+)
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.ckpt.hf_weights import (
@@ -26,17 +29,21 @@ from megatron.lite.primitive.ckpt.identity import (
     require_checkpoint_identity_match,
 )
 from megatron.lite.primitive.ckpt import dcp
+from megatron.lite.primitive.ckpt import hf_weights
 from megatron.lite.primitive.modules import multi_lora_kernel
 from megatron.lite.primitive.modules import multi_lora_bank
 from megatron.lite.primitive.modules.lora import LoraSpec
 from megatron.lite.primitive.modules.multi_lora import BatchedLoraDelta
 from megatron.lite.primitive.modules.multi_lora_bank import (
     DenseLoraBank,
+    LoraBankPartition,
     MultiLoraSpec,
     MultiLoraTrainingState,
     NamedLoraBankRegistry,
+    apply_batched_lora_delta,
     validate_multi_lora_parallel_support,
 )
+from torch.distributed.tensor import Shard
 
 # isort: on
 
@@ -139,6 +146,486 @@ def test_batched_lora_delta_matches_dense_reference_for_sorted_slots():
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_batched_lora_linear_stage_cpu_oracle_forward_backward_and_empty():
+    torch.manual_seed(9)
+    x = torch.randn(4, 3, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(3, 2, 3, dtype=torch.float64, requires_grad=True)
+    slots = torch.tensor([0, 0, 2, 2], dtype=torch.int64)
+    actual = multi_lora_kernel.batched_lora_linear_stage(x, weight, slots, scale=0.75)
+    actual.square().sum().backward()
+    actual_grads = (x.grad.detach().clone(), weight.grad.detach().clone())
+    ref_x = x.detach().clone().requires_grad_()
+    ref_w = weight.detach().clone().requires_grad_()
+    reference = (
+        torch.stack([ref_w[slot] @ row for row, slot in zip(ref_x, slots)]) * 0.75
+    )
+    reference.square().sum().backward()
+    torch.testing.assert_close(actual, reference)
+    torch.testing.assert_close(actual_grads[0], ref_x.grad)
+    torch.testing.assert_close(actual_grads[1], ref_w.grad)
+    assert actual_grads[1][1].eq(0).all()
+    with pytest.raises(ValueError, match="slots sorted"):
+        multi_lora_kernel.batched_lora_linear_stage(
+            x.detach(), weight.detach(), torch.tensor([2, 0, 2, 0]), scale=0.75
+        )
+    empty = multi_lora_kernel.batched_lora_linear_stage(
+        torch.empty(0, 3, dtype=torch.bfloat16),
+        torch.ones(3, 2, 3, dtype=torch.bfloat16),
+        torch.empty(0, dtype=torch.int64),
+        output_dtype=torch.bfloat16,
+        max_g_size_hint=4,
+    )
+    assert empty.shape == (0, 2) and empty.dtype is torch.bfloat16
+
+
+def test_attention_bank_delta_matches_dense_oracle_and_only_updates_selected_slots():
+    """The generic attention carrier keeps per-token slots and zero banks inert."""
+    x = torch.tensor([[1.0, 2.0], [3.0, -1.0], [2.0, 4.0]], requires_grad=True)
+    a_bank = nn.Parameter(torch.tensor([[[1.0, 0.0]], [[0.0, 2.0]], [[3.0, 1.0]]]))
+    b_bank = nn.Parameter(torch.tensor([[[2.0]], [[-1.0]], [[0.0]]]))
+    slots = torch.tensor([1, 0, 1], dtype=torch.int64)
+    actual = apply_batched_lora_delta(
+        DenseLoraBank(a_bank, b_bank), x, slots, scale=0.5
+    )
+    expected = torch.stack(
+        [0.5 * (b_bank[slot] @ a_bank[slot] @ row) for row, slot in zip(x, slots)]
+    )
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    assert a_bank.grad[2].eq(0).all() and b_bank.grad[2].eq(0).all()
+
+    zero_bank = DenseLoraBank(
+        nn.Parameter(torch.ones(1, 1, 2)), nn.Parameter(torch.zeros(1, 1, 1))
+    )
+    assert (
+        apply_batched_lora_delta(
+            zero_bank, x.detach(), torch.zeros(3, dtype=torch.int64), scale=1.0
+        )
+        .eq(0)
+        .all()
+    )
+
+
+def test_tp_attention_builder_uses_linear_lora_partition_shapes(monkeypatch):
+    """TP2 attention banks must have the same local A/B layouts as LinearLoRA."""
+    fake_model = types.ModuleType("megatron.lite.model.qwen3_moe.lite.model")
+    fake_model.MTPLossAutoScaler = type("MTPLossAutoScaler", (), {})
+    fake_model.Qwen3MoEModel = nn.Module
+    monkeypatch.setitem(
+        sys.modules, "megatron.lite.model.qwen3_moe.lite.model", fake_model
+    )
+    protocol = importlib.import_module("megatron.lite.model.qwen3_moe.lite.protocol")
+
+    class FakeLayer:
+        layer_idx = 0
+        attn = SimpleNamespace(
+            qkv=SimpleNamespace(
+                local_out=4, linear=SimpleNamespace(), use_sp=True, tp_size=2
+            ),
+            proj=SimpleNamespace(local_in=2, use_sp=True),
+        )
+
+    class FakeChunk(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1))
+            self.layers = [FakeLayer()]
+
+    config = Qwen3MoEConfig(
+        num_hidden_layers=1,
+        hidden_size=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=2,
+        vocab_size=8,
+        num_experts=1,
+        num_experts_per_tok=1,
+        moe_intermediate_size=4,
+        layer_types=["full_attention"],
+    )
+    state = protocol._build_multi_lora_training_state(
+        [FakeChunk()], config, MultiLoraSpec(names=("alpha", "bravo"), rank=4)
+    )
+    qkv, proj = state.attention_banks_for_layer(0)
+    # QKV: A rank is TP-local, B keeps the local column-parallel output.
+    assert qkv.a_bank.shape == (2, 2, 4)
+    assert qkv.b_bank.shape == (2, 4, 4)
+    # O-proj: A sees row-parallel local input, B is output-partitioned.
+    assert proj.a_bank.shape == (2, 4, 2)
+    assert proj.b_bank.shape == (2, 2, 4)
+    # Registry-owned metadata must drive both optimizer placement and export
+    # materialization; no second names/slot authority is allowed.
+    assert qkv.partition.rank_partitioned_a is True
+    assert proj.partition.output_partitioned_b is True
+    # Optimizer metadata follows the explicit bank partition, not parameter
+    # dimensionality: attention factors are TP shards, dense expert banks are
+    # replicas and therefore need the data-parallel all-reduce hook.
+    fc1, fc2 = state.banks_for_layer(0)
+    for bank in (qkv, proj):
+        for parameter in (bank.a_bank, bank.b_bank):
+            assert parameter.tensor_model_parallel is True
+            assert parameter.allreduce is True
+    for bank in (fc1, fc2):
+        for parameter in (bank.a_bank, bank.b_bank):
+            assert parameter.tensor_model_parallel is False
+            assert parameter.allreduce is False
+
+
+def test_tp_attention_builder_rejects_rank_not_divisible_by_tp():
+    with pytest.raises(ValueError, match="rank.*divisible.*TP"):
+        validate_multi_lora_parallel_support(
+            MultiLoraSpec(names=("alpha",), rank=3),
+            tp_size=2,
+            etp_size=1,
+            use_deepep=False,
+        )
+
+
+def test_attention_bank_checkpoint_placement_never_shards_slot_dimension():
+    qkv_a = MultiLoraTrainingState.parameter_name(
+        "layers.0.attn.qkv.linear.weight", "a"
+    )
+    qkv_b = MultiLoraTrainingState.parameter_name(
+        "layers.0.attn.qkv.linear.weight", "b"
+    )
+    proj_a = MultiLoraTrainingState.parameter_name(
+        "layers.0.attn.proj.linear.weight", "a"
+    )
+    proj_b = MultiLoraTrainingState.parameter_name(
+        "layers.0.attn.proj.linear.weight", "b"
+    )
+    # [slot, rank, input/output]: TP must use rank/output/input axes only.
+    assert PLACEMENT_FN(qkv_a)[-1] == Shard(1)
+    assert PLACEMENT_FN(qkv_b)[-1] == Shard(1)
+    assert PLACEMENT_FN(proj_a)[-1] == Shard(2)
+    assert PLACEMENT_FN(proj_b)[-1] == Shard(1)
+
+
+def test_qkv_tp_carrier_collective_trace_has_hidden_rank_gather(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        multi_lora_bank,
+        "_gather_sequence_parallel",
+        lambda value, group: (
+            calls.append(("sp_gather", value.shape)) or torch.cat((value, value), dim=0)
+        ),
+    )
+    monkeypatch.setattr(
+        multi_lora_bank,
+        "_all_gather_last_dim",
+        lambda value, group, reduce_backward: (
+            calls.append(("rank_gather", value.shape, reduce_backward))
+            or torch.cat((value, value), dim=-1)
+        ),
+        raising=False,
+    )
+
+    monkeypatch.setattr(
+        multi_lora_kernel,
+        "batched_lora_linear_stage",
+        lambda value, weight, slots, **kwargs: (
+            calls.append(("A" if weight.shape[1] == 2 else "B", value.shape))
+            or value.new_zeros((value.shape[0], weight.shape[1]))
+        ),
+    )
+    bank = DenseLoraBank(
+        torch.ones(2, 2, 4),
+        torch.ones(2, 4, 4),
+        LoraBankPartition(tp_size=2, rank_partitioned_a=True),
+    )
+    result = apply_batched_lora_delta(
+        bank,
+        torch.ones(2, 1, 4),
+        torch.tensor([0, 1], dtype=torch.int64),
+        scale=1.0,
+        tp_group=object(),
+        sequence_parallel_input=True,
+    )
+    assert calls == [
+        ("sp_gather", (2, 4)),
+        ("sp_gather", (2, 1)),
+        ("A", (4, 4)),
+        ("rank_gather", (4, 2), True),
+        ("B", (4, 4)),
+    ]
+    # The mocked SP all-gather doubles token rows at TP2, so the post-
+    # collective output must not be reshaped with the pre-gather row count.
+    assert result.shape == (4, 1, 4)
+
+
+def test_qkv_sp_accepts_global_slots_without_second_slot_gather(monkeypatch):
+    """Production SP passes local rows but logical-global adapter slots."""
+    calls = []
+
+    def gather(value, _group):
+        calls.append(tuple(value.shape))
+        return torch.cat((value, value + 1), dim=0)
+
+    monkeypatch.setattr(multi_lora_bank, "_gather_sequence_parallel", gather)
+    monkeypatch.setattr(
+        multi_lora_bank,
+        "_all_gather_last_dim",
+        lambda value, _group, reduce_backward: torch.cat((value, value), dim=-1),
+    )
+    bank = DenseLoraBank(
+        torch.arange(2 * 2 * 4, dtype=torch.float32).reshape(2, 2, 4) / 16,
+        torch.arange(2 * 4 * 4, dtype=torch.float32).reshape(2, 4, 4) / 16,
+        LoraBankPartition(tp_size=2, rank_partitioned_a=True),
+    )
+    local_rows = torch.randn(2, 1, 4, requires_grad=True)
+    global_slots = torch.tensor([0, 1, 0, 1])
+    actual = apply_batched_lora_delta(
+        bank,
+        local_rows,
+        global_slots,
+        scale=0.5,
+        tp_group=object(),
+        sequence_parallel_input=True,
+    )
+    explicit_rows = torch.cat(
+        (local_rows.detach(), local_rows.detach() + 1), dim=0
+    ).requires_grad_()
+    expected = apply_batched_lora_delta(
+        bank, explicit_rows, global_slots, scale=0.5, tp_group=object()
+    )
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(
+        local_rows.grad, explicit_rows.grad[:2] + explicit_rows.grad[2:]
+    )
+    assert calls == [(2, 4)]
+
+
+def test_qkv_sp_rejects_slots_neither_local_nor_global(monkeypatch):
+    monkeypatch.setattr(
+        multi_lora_bank,
+        "_gather_sequence_parallel",
+        lambda value, _group: torch.cat((value, value), dim=0),
+    )
+    bank = DenseLoraBank(
+        torch.ones(2, 2, 4),
+        torch.ones(2, 4, 4),
+        LoraBankPartition(tp_size=2, rank_partitioned_a=True),
+    )
+    with pytest.raises(ValueError, match="SP LoRA indices"):
+        apply_batched_lora_delta(
+            bank,
+            torch.ones(2, 1, 4),
+            torch.tensor([0, 1, 0]),
+            scale=1.0,
+            tp_group=object(),
+            sequence_parallel_input=True,
+        )
+
+
+def test_proj_tp_carrier_collective_trace_has_local_b_then_output_gather(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        multi_lora_bank,
+        "_all_reduce_sum",
+        lambda value, group: calls.append(("rank_reduce", value.shape)) or value,
+    )
+    monkeypatch.setattr(
+        multi_lora_bank,
+        "_all_gather_last_dim",
+        lambda value, group, reduce_backward: (
+            calls.append(("output_gather", value.shape, reduce_backward))
+            or torch.cat((value, value), dim=-1)
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        multi_lora_bank,
+        "_scatter_sequence_parallel",
+        lambda value, group, rank: (
+            calls.append(("sp_scatter", value.shape, rank)) or value[rank::2]
+        ),
+    )
+
+    monkeypatch.setattr(
+        multi_lora_kernel,
+        "batched_lora_linear_stage",
+        lambda value, weight, slots, **kwargs: (
+            calls.append(("A" if weight.shape[1] == 4 else "B", value.shape))
+            or value.new_zeros((value.shape[0], weight.shape[1]))
+        ),
+    )
+    bank = DenseLoraBank(
+        torch.ones(2, 4, 2),
+        torch.ones(2, 2, 4),
+        LoraBankPartition(tp_size=2, output_partitioned_b=True),
+    )
+    result = apply_batched_lora_delta(
+        bank,
+        torch.ones(2, 1, 2),
+        torch.tensor([0, 1], dtype=torch.int64),
+        scale=1.0,
+        tp_group=object(),
+        tp_rank=1,
+        input_parallel_reduce=True,
+        sequence_parallel_scatter_output=True,
+    )
+    assert calls == [
+        ("A", (2, 2)),
+        ("rank_reduce", (2, 4)),
+        ("B", (2, 4)),
+        # LinearLoRA.forward uses the default reduce_backward=False here: the
+        # hidden gradient already crossed the preceding all-reduce.
+        ("output_gather", (2, 2), False),
+        ("sp_scatter", (2, 4), 1),
+    ]
+    # The SP scatter returns one rank's half of the rows; reshape follows its
+    # actual result rather than the two input rows.
+    assert result.shape == (1, 1, 4)
+
+
+def test_tp_named_export_materializes_internal_partitions_before_base_gathers(
+    monkeypatch,
+):
+    """Adapter-internal gathers precede native QKV-B/O-proj-A placement gathers."""
+
+    class PartitionedBank:
+        def __init__(self, a_bank, b_bank, partition):
+            self.a_bank = a_bank
+            self.b_bank = b_bank
+            self.partition = partition
+
+        @property
+        def slots(self):
+            return self.a_bank.shape[0]
+
+    qkv_surface = "layers.0.attn.qkv.linear.weight"
+    proj_surface = "layers.0.attn.proj.linear.weight"
+    # Rank 0's local QKV-A and O-proj-B shards use values distinguishable from
+    # the mocked rank 1 shard returned by allgather_concat below.
+    qkv_a = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4)
+    qkv_b = torch.arange(16, dtype=torch.float32).reshape(1, 4, 4)
+    proj_a = torch.arange(8, dtype=torch.float32).reshape(1, 4, 2)
+    proj_b = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4)
+    # This is the red contract for the future partition-aware validator: its
+    # current homogeneous-rank guard is itself the missing capability, so keep
+    # the export assertion independently reachable.
+    monkeypatch.setattr(NamedLoraBankRegistry, "__post_init__", lambda self: None)
+    registry = NamedLoraBankRegistry(
+        banks={
+            qkv_surface: PartitionedBank(
+                qkv_a, qkv_b, LoraBankPartition(tp_size=2, rank_partitioned_a=True)
+            ),
+            proj_surface: PartitionedBank(
+                proj_a, proj_b, LoraBankPartition(tp_size=2, output_partitioned_b=True)
+            ),
+        },
+        names={"alpha": 0},
+        rank=4,
+        alpha=4,
+        base_model_identity={},
+    )
+    calls = []
+    materialized = []
+    events = []
+
+    def _materialize(value):
+        materialized.append(tuple(value.shape))
+        events.append(("materialize", tuple(value.shape)))
+        return value
+
+    def _gather(value, world_size, group, *, dim):
+        calls.append((tuple(value.shape), dim, value.flatten()[0].item()))
+        events.append(("gather", tuple(value.shape), dim))
+        return torch.cat((value, value + 100), dim=dim)
+
+    monkeypatch.setattr(hf_weights, "allgather_concat", _gather)
+    monkeypatch.setattr(hf_weights, "_materialize_dtensor", _materialize)
+    config = Qwen3MoEConfig(
+        num_hidden_layers=1,
+        hidden_size=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=2,
+        vocab_size=8,
+        num_experts=1,
+        num_experts_per_tok=1,
+        moe_intermediate_size=4,
+        layer_types=["full_attention"],
+    )
+    exported = registry.export_hf_state(
+        "alpha",
+        Qwen3MoEWeightSpec(config),
+        SimpleNamespace(tp_size=2, tp_group=object(), etp_size=1, etp_group=None),
+    )
+    assert calls == [
+        ((2, 4), 0, 0.0),  # QKV rank-partitioned A
+        ((4, 4), 0, 0.0),  # QKV column-parallel B
+        ((2, 4), 0, 0.0),  # O-proj output-partitioned B
+        ((4, 2), 1, 0.0),  # O-proj row-parallel A
+    ]
+    # The selected pair is materialized before the metadata-directed gather.
+    # The legacy exporter may materialize its plain inputs again, but it must
+    # not introduce a second partition gather.
+    assert events[:3] == [
+        ("materialize", (2, 4)),
+        ("materialize", (4, 4)),
+        ("gather", (2, 4), 0),
+    ]
+    proj_internal = events.index(("gather", (2, 4), 0), 3)
+    assert events[proj_internal - 2 : proj_internal + 1] == [
+        ("materialize", (4, 2)),
+        ("materialize", (2, 4)),
+        ("gather", (2, 4), 0),
+    ]
+    assert materialized
+    q_prefix = f"{VLLM_LORA_NAME_PREFIX}model.layers.0.self_attn"
+    assert exported[f"{q_prefix}.q_proj.lora_A.weight"].shape == (4, 4)
+    assert exported[f"{q_prefix}.k_proj.lora_B.weight"].shape == (2, 4)
+    assert exported[f"{q_prefix}.v_proj.lora_B.weight"].shape == (2, 4)
+    assert exported[f"{q_prefix}.o_proj.lora_A.weight"].shape == (4, 4)
+    assert exported[f"{q_prefix}.o_proj.lora_B.weight"].shape == (4, 4)
+    torch.testing.assert_close(
+        exported[f"{q_prefix}.q_proj.lora_A.weight"],
+        torch.tensor(
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+                [100.0, 101.0, 102.0, 103.0],
+                [104.0, 105.0, 106.0, 107.0],
+            ]
+        ),
+    )
+    # Native fused QKV B is gathered on output rows before native_to_hf splits
+    # it; the mocked rank-1 rows therefore appear in K/V rather than Q.
+    torch.testing.assert_close(
+        exported[f"{q_prefix}.k_proj.lora_B.weight"],
+        torch.tensor([[100.0, 101.0, 102.0, 103.0], [104.0, 105.0, 106.0, 107.0]]),
+    )
+    torch.testing.assert_close(
+        exported[f"{q_prefix}.v_proj.lora_B.weight"],
+        torch.tensor([[108.0, 109.0, 110.0, 111.0], [112.0, 113.0, 114.0, 115.0]]),
+    )
+    torch.testing.assert_close(
+        exported[f"{q_prefix}.o_proj.lora_A.weight"],
+        torch.tensor(
+            [
+                [0.0, 1.0, 100.0, 101.0],
+                [2.0, 3.0, 102.0, 103.0],
+                [4.0, 5.0, 104.0, 105.0],
+                [6.0, 7.0, 106.0, 107.0],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        exported[f"{q_prefix}.o_proj.lora_B.weight"],
+        torch.tensor(
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0, 7.0],
+                [100.0, 101.0, 102.0, 103.0],
+                [104.0, 105.0, 106.0, 107.0],
+            ]
+        ),
+    )
 
 
 def test_batched_lora_delta_backward_matches_reference_for_repeated_slots():
@@ -574,10 +1061,7 @@ def test_model_owned_checkpoint_identity_is_pp_global_and_rejects_contract_chang
             alpha=alpha,
             base_model_identity={},
         )
-        return MultiLoraTrainingState(
-            registry,
-            {layer_idx: (fc1_surface, fc2_surface)},
-        )
+        return MultiLoraTrainingState(registry, {layer_idx: (fc1_surface, fc2_surface)})
 
     source = nn.Module()
     source.add_module("multi_lora_training_state", build_state(("alpha", "bravo")))
@@ -630,11 +1114,7 @@ def test_semantic_bank_parameter_names_survive_reordered_registry_and_pp_stages(
             banks=banks, names={"alpha": 0}, rank=1, alpha=1, base_model_identity={}
         )
         return MultiLoraTrainingState(
-            registry,
-            {
-                0: (surfaces[0], surfaces[1]),
-                1: (surfaces[2], surfaces[3]),
-            },
+            registry, {0: (surfaces[0], surfaces[1]), 1: (surfaces[2], surfaces[3])}
         )
 
     source = nn.Module()
@@ -674,10 +1154,10 @@ def test_semantic_bank_parameter_names_survive_reordered_registry_and_pp_stages(
     assert all("." not in name for name in stage_zero | stage_one)
 
 
-def test_model_owned_sidecar_has_no_explicit_ep_gradient_owner(
+def test_model_owned_fc_sidecar_has_explicit_ep_gradient_owner(
     monkeypatch, transformer_engine_import_stub
 ):
-    """Production injection, not a tensor attribute, selects dense finalize ownership."""
+    """Model-owned replicated FC banks retain their explicit EP owner."""
     state = MultiLoraTrainingState(
         NamedLoraBankRegistry(
             banks={
@@ -714,14 +1194,14 @@ def test_model_owned_sidecar_has_no_explicit_ep_gradient_owner(
     protocol = importlib.import_module("megatron.lite.model.qwen3_moe.lite.protocol")
     protocol._inject_multi_lora_sidecars(injected, Batch(), state)
     owned = injected["multi_lora_sidecars"][0]
-    assert owned.requires_explicit_ep_sync is False
+    assert owned.requires_explicit_ep_sync is True
 
     # Test the real model.py selector, not a hand-passed ``None`` argument.
     transformer_engine_import_stub()
     sys.modules.pop("megatron.lite.model.qwen3_moe.lite.model", None)
     model = importlib.import_module("megatron.lite.model.qwen3_moe.lite.model")
     ps = SimpleNamespace(ep_size=2, ep_group=object())
-    assert model._sidecar_ep_sync_group(ps, owned) is None
+    assert model._sidecar_ep_sync_group(ps, owned) is ps.ep_group
 
     # The legacy external contract still selects one explicit EP group for
     # each of its two model call sites (fc1 and fc2).
@@ -821,6 +1301,10 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
 
     class FakeLayer:
         layer_idx = 0
+        attn = SimpleNamespace(
+            qkv=SimpleNamespace(local_out=8, linear=SimpleNamespace()),
+            proj=SimpleNamespace(local_in=4),
+        )
 
     class FakeChunk(nn.Module):
         def __init__(self):
@@ -861,19 +1345,38 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
     )
     assert state is chunk.multi_lora_training_state
     fc1, fc2 = state.banks_for_layer(0)
+    qkv, proj = state.attention_banks_for_layer(0)
     assert fc1.a_bank.shape == (2, 24, 4)
     assert fc1.b_bank.shape == (2, 12, 24)
     assert fc2.a_bank.shape == (2, 24, 6)
     assert fc2.b_bank.shape == (2, 4, 24)
+    assert qkv.a_bank.shape == (2, 24, 4)
+    assert qkv.b_bank.shape == (2, 8, 24)
+    assert proj.a_bank.shape == (2, 24, 4)
+    assert proj.b_bank.shape == (2, 4, 24)
+    for bank in (fc1, fc2):
+        for parameter in (bank.a_bank, bank.b_bank):
+            assert parameter.tensor_model_parallel is False
+            assert parameter.allreduce is False
+    for bank in (qkv, proj):
+        for parameter in (bank.a_bank, bank.b_bank):
+            assert parameter.tensor_model_parallel is False
+            assert parameter.allreduce is True
     assert set(state.registry.banks) == {
         "layers.0.moe.experts._fc1_weight_0",
         "layers.0.moe.experts._fc2_weight_0",
+        "layers.0.attn.qkv.linear.weight",
+        "layers.0.attn.proj.linear.weight",
     }
     assert {id(parameter) for parameter in state.parameters()} == {
         id(fc1.a_bank),
         id(fc1.b_bank),
         id(fc2.a_bank),
         id(fc2.b_bank),
+        id(state.registry.banks["layers.0.attn.qkv.linear.weight"].a_bank),
+        id(state.registry.banks["layers.0.attn.qkv.linear.weight"].b_bank),
+        id(state.registry.banks["layers.0.attn.proj.linear.weight"].a_bank),
+        id(state.registry.banks["layers.0.attn.proj.linear.weight"].b_bank),
     }
     optimizer_parameter_ids = {
         id(parameter)
@@ -890,11 +1393,13 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
         for surface in (
             "layers.0.moe.experts._fc1_weight_0",
             "layers.0.moe.experts._fc2_weight_0",
+            "layers.0.attn.qkv.linear.weight",
+            "layers.0.attn.proj.linear.weight",
         )
         for factor in ("a", "b")
     } <= set(checkpoint_state)
     selected = state.registry.select("alpha")
-    assert len(selected) == 2
+    assert len(selected) == 4
     selected_fc1_a, selected_fc1_b = selected["layers.0.moe.experts._fc1_weight_0"]
     selected_fc2_a, selected_fc2_b = selected["layers.0.moe.experts._fc2_weight_0"]
     torch.testing.assert_close(selected_fc1_a, fc1.a_bank[0])
@@ -928,6 +1433,9 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
         f"model.layers.0.mlp.experts.{expert_idx}.{projection}"
         for expert_idx in range(config.num_experts)
         for projection in ("gate_proj", "up_proj", "down_proj")
+    } | {
+        f"model.layers.0.self_attn.{projection}"
+        for projection in ("q_proj", "k_proj", "v_proj", "o_proj")
     }
     expected_keys = {
         f"{VLLM_LORA_NAME_PREFIX}{module}.lora_{factor}.weight"
@@ -936,7 +1444,7 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
     }
     generated_keys = [key for key, _ in generated]
     assert set(generated_keys) == expected_keys
-    assert len(generated_keys) == len(expected_keys) == config.num_experts * 3 * 2
+    assert len(generated_keys) == len(expected_keys) == (config.num_experts * 3 + 4) * 2
     assert len(generated_keys) == len(set(generated_keys))
     assert (
         set(state.registry.export_hf_state("alpha", Qwen3MoEWeightSpec(config), ps))
@@ -960,19 +1468,17 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
     sidecar = output["multi_lora_sidecars"][0]
     assert bundle.extras["multi_lora_registry"] is state.registry
     assert sidecar.fc1 is fc1 and sidecar.fc2 is fc2
+    assert sidecar.qkv is qkv and sidecar.proj is proj
     assert sidecar.lora_indices is batch.extras["multi_lora_slots"][0]
 
 
-def test_multi_lora_parallel_contract_rejects_etp_and_deepep():
+def test_multi_lora_parallel_contract_allows_tp_and_rejects_etp_and_deepep():
     spec = multi_lora_bank.MultiLoraSpec(names=("alpha",), rank=2)
     with pytest.raises(ValueError, match="ETP"):
         validate_multi_lora_parallel_support(
             spec, tp_size=1, etp_size=2, use_deepep=False
         )
-    with pytest.raises(ValueError, match="TP"):
-        validate_multi_lora_parallel_support(
-            spec, tp_size=2, etp_size=1, use_deepep=False
-        )
+    validate_multi_lora_parallel_support(spec, tp_size=2, etp_size=1, use_deepep=False)
     with pytest.raises(ValueError, match="DeepEP"):
         validate_multi_lora_parallel_support(
             spec, tp_size=1, etp_size=1, use_deepep=True
@@ -1014,6 +1520,27 @@ def test_qwen_moe_sidecar_sorts_then_restores_unsorted_slots():
     expected = torch.stack(expected_rows)
 
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(("tp_rank", "expected"), [(0, [0, 1]), (1, [2, 3])])
+def test_moe_sp_global_slots_follow_contiguous_scatter_order(
+    transformer_engine_import_stub, tp_rank, expected
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite.model import _local_moe_lora_indices
+
+    slots = torch.tensor([0, 1, 2, 3])
+    actual = _local_moe_lora_indices(slots, local_rows=2, tp_size=2, tp_rank=tp_rank)
+    assert actual.tolist() == expected
+    # Local input is already in SP-scatter order and must not be sliced again.
+    assert (
+        _local_moe_lora_indices(actual, local_rows=2, tp_size=2, tp_rank=tp_rank)
+        is actual
+    )
+    with pytest.raises(ValueError, match="local or TP-global"):
+        _local_moe_lora_indices(
+            torch.tensor([0, 1, 2]), local_rows=2, tp_size=2, tp_rank=tp_rank
+        )
 
 
 def test_ep_gradient_sync_is_identity_in_forward_and_all_reduces_in_backward(
