@@ -21,7 +21,6 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
@@ -29,7 +28,7 @@ import torch.nn.utils.parametrize as parametrize
 
 def _checkpoint_module():
     checkpoint_path = (
-        Path(__file__).resolve().parents[3]
+        Path(__file__).resolve().parents[5]
         / "megatron"
         / "lite"
         / "model"
@@ -128,15 +127,24 @@ def test_ds4_load_hf_resolves_local_pp_layer_to_global(tmp_path):
 
 def test_ds4_load_hf_canonicalizes_qat_state_before_dynamic_mapping(tmp_path):
     from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+    from megatron.lite.primitive.quantization.qat import QATSpec, WeightFakeQuant
     from safetensors.torch import save_file
 
     ckpt = _checkpoint_module()
     dim = 4
     model = _QATStage([4], dim)
     linear = model.layers["0"].self_attn.self_attn.wq_a
-    parametrize.register_parametrization(linear, "weight", nn.Identity())
+    parametrize.register_parametrization(
+        linear,
+        "weight",
+        WeightFakeQuant(
+            QATSpec(enabled=True, format="int8", group_size=-1),
+            linear.weight.shape,
+        ),
+    )
     master = linear.parametrizations.weight.original
     master.data.zero_()
+    assert any(".parametrizations.weight.0.amax" in name for name in model.state_dict())
 
     expected = torch.arange(dim * dim, dtype=torch.float32).reshape(dim, dim)
     save_file(

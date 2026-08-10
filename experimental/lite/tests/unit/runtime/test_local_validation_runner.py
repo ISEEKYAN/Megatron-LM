@@ -198,6 +198,12 @@ def test_marker_defaults_describe_cpu_hopper_and_600_seconds():
     assert gpu.min_architecture == "hopper"
 
 
+def test_legacy_mlite_coverage_marker_remains_registered():
+    assert any(
+        description.startswith("mlite:") for description in markers.MARKER_DESCRIPTIONS
+    )
+
+
 def test_marker_scopes_merge_environment_and_closest_values_win():
     item = _FakeItem(
         gpus=[_marker(4, min_architecture="blackwell"), _marker(2)],

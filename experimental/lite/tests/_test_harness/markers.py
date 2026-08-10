@@ -16,6 +16,7 @@ ARCHITECTURE_CAPABILITIES = {"hopper": (9, 0), "blackwell": (10, 0)}
 ENVIRONMENT_VARIABLES = {"CUDA_DEVICE_MAX_CONNECTIONS"}
 
 MARKER_DESCRIPTIONS = (
+    "mlite: mark a test as Megatron Lite validation coverage",
     "gpus(count, min_architecture='hopper'): request count GPUs and declare the minimum "
     "supported GPU architecture; an absent marker means a CPU test",
     "env(**variables): set an allowlisted per-test environment variable to a string, or "
