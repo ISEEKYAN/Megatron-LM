@@ -2257,8 +2257,8 @@ class _EPChunkOperationBase:
                     grad_probs = expert_grads[1]
                     if grad_probs is None:
                         grad_probs = torch.zeros_like(probs)
-                # FC1 dgrad aliases FC2 output. Keep FC1 input as the
-                # distinct post-Wgrad local-scatter destination instead.
+                # FC1 dgrad aliases FC2 dgrad. Keep FC1 input as the delayed-
+                # Wgrad-flush local-scatter destination instead.
                 local_state["hidden_reuse_base"] = dispatched.detach()
                 local_state.pop("grad_expert_out")
                 local_state["grad_dispatched"] = grad_dispatched
