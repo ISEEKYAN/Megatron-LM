@@ -229,6 +229,8 @@ class _EPChunkAllocationArena:
 
 
 _EXPERT_ACTIVATION_SIZE_CLASS_BYTES = 8 * 1024 * 1024
+_EXPERT_ACTIVATION_GROWTH_NUMERATOR = 3
+_EXPERT_ACTIVATION_GROWTH_DENOMINATOR = 2
 
 # Normal saved-context backward keeps FC2 output separate because its delayed
 # FC2 Wgrad remains deferred. FC2 dgrad is consumed by SwiGLU before FC1 dgrad
@@ -255,6 +257,20 @@ def _expert_activation_capacity_bytes(requested_bytes: int) -> int:
         (requested_bytes + _EXPERT_ACTIVATION_SIZE_CLASS_BYTES - 1)
         // _EXPERT_ACTIVATION_SIZE_CLASS_BYTES
     ) * _EXPERT_ACTIVATION_SIZE_CLASS_BYTES
+
+
+def _expert_activation_growth_capacity_bytes(
+    requested_bytes: int, previous_capacity_bytes: int | None
+) -> int:
+    """Use bounded geometric headroom after the first observed high-watermark."""
+    requested_capacity = _expert_activation_capacity_bytes(requested_bytes)
+    if previous_capacity_bytes is None:
+        return requested_capacity
+    geometric_capacity = _expert_activation_capacity_bytes(
+        (previous_capacity_bytes * _EXPERT_ACTIVATION_GROWTH_NUMERATOR)
+        // _EXPERT_ACTIVATION_GROWTH_DENOMINATOR
+    )
+    return max(requested_capacity, geometric_capacity)
 
 
 @dataclass(frozen=True)
@@ -342,12 +358,13 @@ class _EPChunkExpertActivationArenaCoordinator:
     ) -> torch.Tensor:
         requested = tuple(int(dim) for dim in shape)
         profile = self.key.shape_profile
-        ceiling, expected_dtype = {
+        contract = {
             "fc1_input": (
                 (profile.max_expert_rows, profile.hidden_size),
                 self.key.dtype,
             )
-        }.get(name, (requested, dtype))
+        }.get(name)
+        ceiling, expected_dtype = (requested, dtype) if contract is None else contract
         if (
             not requested
             or any(dim < 0 for dim in requested)
@@ -386,7 +403,26 @@ class _EPChunkExpertActivationArenaCoordinator:
                 f"{storage_name!r} during an active lease"
             )
         if existing is None or growing:
-            capacity_bytes = _expert_activation_capacity_bytes(requested_bytes)
+            requested_capacity_bytes = _expert_activation_capacity_bytes(requested_bytes)
+            previous_capacity_bytes = (
+                None
+                if existing is None
+                else existing.numel() * existing.element_size()
+            )
+            capacity_bytes = _expert_activation_growth_capacity_bytes(
+                requested_bytes, previous_capacity_bytes
+            )
+            if contract is not None:
+                ceiling_numel = 1
+                for dim in ceiling:
+                    ceiling_numel *= dim
+                ceiling_capacity_bytes = _expert_activation_capacity_bytes(
+                    ceiling_numel * element_size
+                )
+                capacity_bytes = max(
+                    requested_capacity_bytes,
+                    min(capacity_bytes, ceiling_capacity_bytes),
+                )
             capacity_numel = (capacity_bytes + element_size - 1) // element_size
             with self.arena.allocate():
                 existing = torch.empty((capacity_numel,), dtype=dtype, device=device)

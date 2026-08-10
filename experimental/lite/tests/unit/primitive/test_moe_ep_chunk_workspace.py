@@ -1320,6 +1320,108 @@ def test_per_op_phase_handoff_keeps_one_physical_arena_until_final_release(
     assert not registry._expert_activation_arenas
 
 
+def test_geometric_activation_growth_bounds_rising_48_layer_trace_and_stabilizes(
+    monkeypatch, transformer_engine_import_stub
+):
+    """One shared arena avoids one replacement per small routed-row increase."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    monkeypatch.setattr(overlap, "_EXPERT_ACTIVATION_SIZE_CLASS_BYTES", 64)
+    growth_calls = []
+    original_growth_capacity = overlap._expert_activation_growth_capacity_bytes
+
+    def growth_capacity(requested_bytes, previous_capacity_bytes):
+        capacity = original_growth_capacity(requested_bytes, previous_capacity_bytes)
+        growth_calls.append((requested_bytes, previous_capacity_bytes, capacity))
+        return capacity
+
+    monkeypatch.setattr(
+        overlap, "_expert_activation_growth_capacity_bytes", growth_capacity
+    )
+    registry = overlap.EPChunkWorkspaceRegistry()
+    profile = overlap.EPChunkShapeProfile(
+        max_input_rows=20_000, hidden_size=4, topk=2, ep_size=2
+    )
+
+    def workspace(op):
+        return registry.get_or_create(
+            overlap.EPChunkWorkspaceKey(
+                op=op,
+                device_type="cpu",
+                device_index=None,
+                ep_group_id=4817,
+                dtype=torch.float32,
+                shape_profile=profile,
+            ),
+            lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+        )
+
+    workspaces = {
+        op: workspace(op)
+        for op in ("forward", "backward", "fused_forward_backward")
+    }
+    ops = tuple(workspaces)
+    coordinator = workspaces["forward"]._expert_activation_owner.coordinator
+    assert len(
+        {id(item._expert_activation_owner.coordinator) for item in workspaces.values()}
+    ) == 1
+
+    def request(item, rows):
+        lease = item.acquire_expert_activation()
+        views = {
+            name: lease.tensor(name, (rows, 4), dtype=torch.float32, device="cpu")
+            for name in ("fc1_input", "fc1_output", "fc2_output")
+        }
+        lease.release(_FakeEvent(ready=True))
+        return {name: view.data_ptr() for name, view in views.items()}
+
+    # This is a CPU lifecycle trace of 48 layers by eight microbatches, with
+    # small routed-row increases throughout warmup.  The old 64-byte size
+    # class policy replaces each storage at nearly every step.
+    requested_rows = []
+    for microbatch in range(8):
+        for layer in range(48):
+            rows = 5 + (microbatch * 48 + layer) // 4
+            requested_rows.append(rows)
+            request(workspaces[ops[(microbatch + layer) % 3]], rows)
+
+    linear_growths = (
+        len(
+            {
+                overlap._expert_activation_capacity_bytes(rows * 4 * 4)
+                for rows in requested_rows
+            }
+        )
+        - 1
+    ) * 3
+    assert coordinator.grows * 2 < linear_growths
+    assert all(
+        grown >= previous * 3 // 2
+        for _requested, previous, grown in growth_calls
+        if previous is not None
+    )
+
+    initial_ptrs = request(workspaces["forward"], 16_000)
+    high_watermark_ptrs = request(workspaces["backward"], 18_000)
+    assert high_watermark_ptrs != initial_ptrs
+    assert request(workspaces["backward"], 18_000) == high_watermark_ptrs
+    assert request(workspaces["fused_forward_backward"], 18_000) == high_watermark_ptrs
+    assert request(workspaces["forward"], 18_000) == high_watermark_ptrs
+
+    request(workspaces["forward"], profile.max_expert_rows)
+    fc1_input_capacity = coordinator.capacity_bytes["fc1_input"]
+    assert fc1_input_capacity == overlap._expert_activation_capacity_bytes(
+        profile.max_expert_rows * profile.hidden_size * 4
+    )
+
+    owners = tuple(item._expert_activation_owner for item in workspaces.values())
+    for item in workspaces.values():
+        registry.release(item.key)
+    assert not registry._expert_activation_arenas
+    assert all(not owner.arena.tensors for owner in owners)
+
+
 def test_delayed_fc2_wgrad_reads_output_before_safe_dgrad_slot_reuse(
     transformer_engine_import_stub,
 ):
