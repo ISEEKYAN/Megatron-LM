@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Two-GPU production lifecycle proof for model-owned Qwen3-MoE multi-LoRA."""
 
-
 from __future__ import annotations
 
 import hashlib
@@ -384,9 +383,9 @@ def _bank_surface_kind(bundle, parameter: torch.Tensor) -> str:
     for surface, bank in state.registry.banks.items():
         if parameter is bank.a_bank or parameter is bank.b_bank:
             matches.append(surface)
-    assert (
-        len(matches) == 1
-    ), f"bank parameter has ambiguous/missing registry surface: {matches}"
+    assert len(matches) == 1, (
+        f"bank parameter has ambiguous/missing registry surface: {matches}"
+    )
     surface = matches[0]
     if ".moe.experts._fc" in surface:
         return "fc"
@@ -608,7 +607,7 @@ def _bank_sync_absolute_oracle(
         ),
     )
     print(
-        "MULTI_LORA_COLLECTIVE_PREFLIGHT " f"rank={dist.get_rank()} records={records}",
+        f"MULTI_LORA_COLLECTIVE_PREFLIGHT rank={dist.get_rank()} records={records}",
         flush=True,
     )
     if preflight_done is not None:
@@ -652,13 +651,13 @@ def _bank_sync_absolute_oracle(
         def validate_records(records) -> None:
             _assert_owner_group_contract(bundle, name, records)
             seen = {record["factor"] for record in records}
-            assert (
-                len(seen) == 1
-            ), f"missing or inconsistent owner-group factor for {name}"
+            assert len(seen) == 1, (
+                f"missing or inconsistent owner-group factor for {name}"
+            )
             factor = seen.pop()
-            assert (
-                factor == expected_factor
-            ), f"owner-group factor for {name} is {factor}, expected {expected_factor}"
+            assert factor == expected_factor, (
+                f"owner-group factor for {name} is {factor}, expected {expected_factor}"
+            )
 
         records = lora_dist_utils.gather_owner_factor_records_or_raise(
             owner_group,
@@ -691,9 +690,9 @@ def _reconstruct_optimizer_owned_bank_grads(bundle) -> dict[str, torch.Tensor]:
             if owned is not None:
                 leaf_index, owner, param_range, buffer, bucket = owned
                 reduced = bucket.grad_data.view(-1)[
-                    param_range["gbuf_world_in_bucket"]
-                    .start : param_range["gbuf_world_in_bucket"]
-                    .end
+                    param_range["gbuf_world_in_bucket"].start : param_range[
+                        "gbuf_world_in_bucket"
+                    ].end
                 ].detach()
                 local["shard"] = {
                     **_owner_group_record(bundle, leaf_index, owner, buffer),
@@ -883,15 +882,15 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
     candidate_sha = os.environ.get("MLITE_CANDIDATE_SHA")
     candidate_tree = os.environ.get("MLITE_CANDIDATE_TREE_SHA")
     candidate_diff = os.environ.get("MLITE_CANDIDATE_DIFF_SHA")
-    assert (
-        candidate_sha and candidate_tree and candidate_diff
-    ), "candidate commit, tree, and diff hashes must bind the phase artifact"
+    assert candidate_sha and candidate_tree and candidate_diff, (
+        "candidate commit, tree, and diff hashes must bind the phase artifact"
+    )
 
     if phase == "ep2_oracle":
         if dist.get_rank() == 0:
-            assert (
-                not artifact_dir.exists()
-            ), "phase artifact directory already exists; refuse stale COMPLETE/checkpoint reuse"
+            assert not artifact_dir.exists(), (
+                "phase artifact directory already exists; refuse stale COMPLETE/checkpoint reuse"
+            )
             artifact_dir.mkdir(parents=True)
         dist.barrier()
         bundle = _build_bundle(

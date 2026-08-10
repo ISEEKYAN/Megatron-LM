@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from megatron.lite.model.qwen3_moe.lite.multi_lora import _AllReduceGradient
 from megatron.lite.primitive.modules import multi_lora_kernel
 from megatron.lite.primitive.modules.lora import (
     LinearLoRA,
@@ -23,7 +24,6 @@ from megatron.lite.primitive.modules.multi_lora_bank import (
     LoraBankPartition,
     apply_batched_lora_delta,
 )
-from megatron.lite.model.qwen3_moe.lite.multi_lora import _AllReduceGradient
 
 pytestmark = [pytest.mark.mlite, pytest.mark.distributed]
 
@@ -562,6 +562,9 @@ def _multi_lora_proj_tp_worker(rank, world_size, init_file, queue):
         queue.put(
             {
                 "rank": rank,
+                "input_rows": x_local.shape[0],
+                "slot_rows": slots.numel(),
+                "output_rows": actual.shape[0],
                 "forward": (actual - y_ref[token_slice]).abs().max().item(),
                 "x": (x_local.grad - x_ref.grad[:, input_slice]).abs().max().item(),
                 "a": (a_local.grad - a_ref.grad[:, :, input_slice]).abs().max().item(),
@@ -584,6 +587,22 @@ def test_multi_lora_proj_tp2_sp_matches_tp1_forward_and_gradients(tmp_path):
     for result in results:
         for key in ("forward", "x", "a", "b"):
             assert result[key] <= 3e-6, results
+    if init_file.exists():
+        os.unlink(init_file)
+
+
+def test_attention_proj_tp2_sp_keeps_logical_slots_until_scatter(tmp_path):
+    """Row-parallel attention O-proj consumes global rows then SP-scatters output."""
+    init_file = tmp_path / "attention-proj-tp2-sp-slots"
+    queue = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(
+        _multi_lora_proj_tp_worker, args=(2, str(init_file), queue), nprocs=2, join=True
+    )
+    results = sorted((queue.get() for _ in range(2)), key=lambda result: result["rank"])
+    for result in results:
+        assert result["input_rows"] == result["slot_rows"] == 4
+        assert result["output_rows"] == 2
+        assert result["forward"] <= 3e-6
     if init_file.exists():
         os.unlink(init_file)
 

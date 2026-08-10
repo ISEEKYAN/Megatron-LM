@@ -37,6 +37,7 @@ from megatron.lite.primitive.parallel import (
     roll_packed_thd_left,
     scatter_to_sequence_parallel,
 )
+from megatron.lite.primitive.utils import build_fp8_recipe
 
 
 def _local_moe_lora_indices(
@@ -50,8 +51,6 @@ def _local_moe_lora_indices(
         return lora_indices.chunk(tp_size)[tp_rank]
     raise ValueError("MoE multi-LoRA indices must describe local or TP-global rows.")
 
-
-from megatron.lite.primitive.utils import build_fp8_recipe
 
 # isort: on
 

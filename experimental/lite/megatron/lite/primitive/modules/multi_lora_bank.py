@@ -166,7 +166,7 @@ class MultiLoraSpec:
 
 
 def normalize_multi_lora_spec(
-    config: MultiLoraSpec | Mapping[str, Any] | None
+    config: MultiLoraSpec | Mapping[str, Any] | None,
 ) -> MultiLoraSpec:
     """Normalize runtime config without allowing an unowned registry injection."""
     if config is None:

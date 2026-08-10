@@ -308,8 +308,9 @@ def test_qkv_tp_carrier_collective_trace_has_hidden_rank_gather(monkeypatch):
     monkeypatch.setattr(
         multi_lora_bank,
         "_gather_sequence_parallel",
-        lambda value, group: calls.append(("sp_gather", value.shape))
-        or torch.cat((value, value), dim=0),
+        lambda value, group: (
+            calls.append(("sp_gather", value.shape)) or torch.cat((value, value), dim=0)
+        ),
     )
     monkeypatch.setattr(
         multi_lora_bank,
