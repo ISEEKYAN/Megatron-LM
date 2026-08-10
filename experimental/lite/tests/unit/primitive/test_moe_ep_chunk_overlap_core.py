@@ -2297,8 +2297,8 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_delayed_wgrad(
     colored_fc2_dgrad = lease.tensor(
         "fc2_dgrad", (2, 3), dtype=torch.bfloat16, device="cpu"
     )
-    assert colored_fc2_out.data_ptr() == colored_fc1_dgrad.data_ptr()
-    assert colored_fc2_out.data_ptr() == colored_fc2_dgrad.data_ptr()
+    assert colored_fc2_out.data_ptr() != colored_fc1_dgrad.data_ptr()
+    assert colored_fc2_dgrad.data_ptr() == colored_fc1_dgrad.data_ptr()
 
     fc1 = Linear()
     fc2 = Linear()

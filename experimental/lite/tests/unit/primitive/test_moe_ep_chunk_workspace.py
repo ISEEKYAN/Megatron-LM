@@ -1094,16 +1094,17 @@ def test_shared_owner_reuses_all_large_activation_names_across_ops(
         ).data_ptr()
         for name in names
     }
-    # FC2 output is phase-reused by its input-gradient and then FC1's
-    # input-gradient; the shared physical allocation is raw-byte storage.
-    assert first_ptrs["fc1_dgrad"] == first_ptrs["fc2_output"]
-    assert first_ptrs["fc2_dgrad"] == first_ptrs["fc2_output"]
-    assert len(set(first_ptrs.values())) == 3
+    # FC2 output remains live through delayed FC2 Wgrad.  Only its dgrad and
+    # the later FC1 dgrad can share a physical slot after SwiGLU consumes it.
+    assert first_ptrs["fc1_dgrad"] == first_ptrs["fc2_dgrad"]
+    assert first_ptrs["fc2_output"] != first_ptrs["fc2_dgrad"]
+    assert len(set(first_ptrs.values())) == 4
     owner = forward._expert_activation_owner
     assert set(owner.arena.tensors) == {
         "fc1_input",
         "fc1_output",
         "fc2_output",
+        "fc2_dgrad",
     }
     pending = _FakeEvent(ready=False)
     first.release(pending)
@@ -1143,6 +1144,50 @@ def test_shared_owner_reuses_all_large_activation_names_across_ops(
     assert not owner.arena.tensors
 
 
+def test_delayed_fc2_wgrad_reads_output_before_safe_dgrad_slot_reuse(
+    transformer_engine_import_stub,
+):
+    """FC2 output must survive until its delayed Wgrad callback consumes it."""
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="fused_forward_backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=100,
+            dtype=torch.float32,
+            shape_profile=profile_type(
+                max_input_rows=8, hidden_size=2, topk=2, ep_size=2
+            ),
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    lease = workspace.acquire_expert_activation()
+    fc2_output = lease.tensor("fc2_output", (2, 2), dtype=torch.float32, device="cpu")
+    fc2_dgrad = lease.tensor("fc2_dgrad", (2, 2), dtype=torch.float32, device="cpu")
+    expected_fc2_output = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    fc2_output.copy_(expected_fc2_output)
+    delayed_wgrad_read = torch.empty_like(fc2_output)
+
+    # This is the production ordering bug: FC2 dgrad is written before the
+    # delayed FC2 Wgrad callback reads its saved forward input.
+    fc2_dgrad.fill_(17.0)
+    delayed_wgrad_read.copy_(fc2_output)
+
+    assert fc2_output.data_ptr() != fc2_dgrad.data_ptr()
+    torch.testing.assert_close(delayed_wgrad_read, expected_fc2_output)
+    lease.release(_FakeEvent(ready=True))
+
+
 def test_colored_storage_cannot_grow_after_its_first_active_lease_view(
     transformer_engine_import_stub,
 ):
@@ -1178,7 +1223,7 @@ def test_colored_storage_cannot_grow_after_its_first_active_lease_view(
     first_ptr = first_view.data_ptr()
     with pytest.raises(RuntimeError, match="during an active lease"):
         first.tensor(
-            "fc2_output", (1, first_width + 1), dtype=torch.float32, device="cpu"
+            "fc1_dgrad", (1, first_width + 1), dtype=torch.float32, device="cpu"
         )
     assert first_view.data_ptr() == first_ptr
     first.release(_FakeEvent(ready=True))
@@ -1187,7 +1232,7 @@ def test_colored_storage_cannot_grow_after_its_first_active_lease_view(
     # after the preceding consumer event has become ready.
     second = workspace.acquire_expert_activation()
     second_view = second.tensor(
-        "fc2_output", (1, first_width + 1), dtype=torch.float32, device="cpu"
+        "fc1_dgrad", (1, first_width + 1), dtype=torch.float32, device="cpu"
     )
     assert second_view.data_ptr() != first_ptr
     second.release(_FakeEvent(ready=True))

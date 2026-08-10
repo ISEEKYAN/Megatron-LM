@@ -230,14 +230,13 @@ class _EPChunkAllocationArena:
 
 _EXPERT_ACTIVATION_SIZE_CLASS_BYTES = 8 * 1024 * 1024
 
-# These names are logical TE buffers.  FC2 output has an external consumer;
-# only after that consumer completes may its raw bytes be reused first for
-# FC2's input-gradient and then for FC1's input-gradient.  The latter two have
-# different widths, so the storage contract is byte-capacity based rather than
-# a tensor-shape alias.  FC1 input/output retain delayed or SwiGLU consumers.
+# These names are logical TE buffers. FC2 output remains live through delayed
+# FC2 Wgrad, so it must not share physical bytes with either dgrad. FC2 dgrad
+# is consumed by SwiGLU before FC1 dgrad is written, making that pair the only
+# safe raw-byte alias in the four-slot baseline. FC1 input/output retain their
+# delayed or SwiGLU consumers.
 _EXPERT_ACTIVATION_STORAGE_SLOTS = {
-    "fc1_dgrad": "fc2_output",
-    "fc2_dgrad": "fc2_output",
+    "fc1_dgrad": "fc2_dgrad",
 }
 
 
