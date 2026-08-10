@@ -331,6 +331,92 @@ def test_qwen3_moe_resets_only_its_forward_workspace_phase():
     assert resets == [(forward_key, stream)]
 
 
+@pytest.mark.parametrize("mode", ["train", "inference", "headless"])
+def test_qwen3_resets_after_last_moe_and_before_head_work(
+    monkeypatch, mode, transformer_engine_import_stub
+):
+    """MTP MoE must finish before the sole forward-arena reset and head work."""
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import model
+
+    events = []
+
+    class MainMoE:
+        ep_chunk_forward = object()
+
+        def reset_ep_chunk_workspace_tensors(self, *, phase, stream):
+            assert phase == "forward"
+            assert stream is None
+            events.append("reset")
+
+    class MainLayer:
+        moe = MainMoE()
+
+        def __call__(self, hidden_states, **_kwargs):
+            events.append("main_moe")
+            return hidden_states
+
+    class MTP(torch.nn.Module):
+        def forward(self, *, hidden_states, **_kwargs):
+            events.append("mtp_moe")
+            return (hidden_states,)
+
+    class Norm(torch.nn.Module):
+        def forward(self, hidden_states):
+            events.append("norm")
+            return hidden_states
+
+    class Head(torch.nn.Module):
+        def forward(self, hidden_states):
+            events.append("head")
+            return hidden_states
+
+        def gather(self, logits):
+            events.append("gather")
+            return logits
+
+    monkeypatch.setattr(
+        model,
+        "vocab_parallel_cross_entropy",
+        lambda logits, labels, _group: events.append("ce")
+        or torch.ones_like(labels, dtype=logits.dtype),
+    )
+    monkeypatch.setattr(
+        model,
+        "roll_packed_thd_left",
+        lambda value, **_kwargs: (value, torch.tensor(value.numel())),
+    )
+
+    qwen = model.Qwen3MoEModel.__new__(model.Qwen3MoEModel)
+    torch.nn.Module.__init__(qwen)
+    qwen.embed = None
+    qwen._input_tensor = None
+    qwen.fp8 = False
+    qwen.layers = [MainLayer()]
+    qwen.ps = SimpleNamespace(tp_group=None)
+    qwen.norm = Norm()
+    qwen.head = None if mode == "headless" else Head()
+    qwen.mtp = MTP() if mode == "train" else None
+    qwen.mtp_enable_train = mode == "train"
+    qwen.mtp_loss_scaling_factor = 1.0
+
+    hidden_states = torch.ones(1, 1, 1)
+    labels = torch.ones(1, 1, dtype=torch.long) if mode == "train" else None
+    input_ids = torch.ones(1, 1, dtype=torch.long) if mode == "train" else None
+    qwen(hidden_states=hidden_states, input_ids=input_ids, labels=labels)
+
+    assert events.count("reset") == 1
+    reset = events.index("reset")
+    assert events.index("main_moe") < reset
+    if mode == "train":
+        assert events.index("mtp_moe") < reset
+        assert events.index("head", reset) < events.index("ce", reset)
+    elif mode == "inference":
+        assert reset < events.index("head")
+    else:
+        assert "head" not in events
+
+
 @pytest.mark.parametrize(
     "full_recompute,expected_ops",
     [

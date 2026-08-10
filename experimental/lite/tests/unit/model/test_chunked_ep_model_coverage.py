@@ -26,8 +26,6 @@ def test_only_qwen3_moe_composes_the_chunked_ep_primitive():
     assert "get_ep_chunk_workspace(" in qwen_model
     assert "max_input_rows=ep_chunk_max_token_rows_per_rank" in qwen_model
     assert "materialize_ep_chunk_workspaces" in qwen_model
-    assert "reset_ep_chunk_workspace_tensors" in qwen_model
-    assert 'phase="forward", stream=stream' in qwen_model
     assert "park_ep_chunk_workspace" not in qwen_model
     assert "workspace.materialize(device=device)" in qwen_model
     assert "workspace.warmup(device=" not in qwen_model
