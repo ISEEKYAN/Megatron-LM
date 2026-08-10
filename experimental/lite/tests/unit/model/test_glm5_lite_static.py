@@ -269,6 +269,8 @@ def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
     assert dsa_kernels._select_indexer_forward(None) is None
 
 
+@pytest.mark.gpus(1)
+@pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
     import pytest
     import torch
@@ -366,6 +368,8 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
     }
 
 
+@pytest.mark.gpus(1)
+@pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
     import pytest
     import torch
@@ -431,6 +435,7 @@ def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
     assert calls["sparse"] == {"topk_length_is_set": True, "value_dim": 4}
 
 
+@pytest.mark.gpus(1)
 def test_glm5_lite_model_exports_native_state_names():
     from megatron.lite.model.glm5.config import Glm5Config
 
@@ -490,6 +495,7 @@ def test_glm52_index_share_shared_layers_omit_indexer_modules():
     )
 
 
+@pytest.mark.gpus(1)
 def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     import torch
     from safetensors import safe_open
@@ -572,6 +578,7 @@ def test_glm5_hf_export_rejects_missing_model_config():
         next(export_hf_weights(None, None, ParallelState()))
 
 
+@pytest.mark.gpus(1)
 def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
     import torch
 
@@ -734,6 +741,7 @@ def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp
     )
 
 
+@pytest.mark.gpus(1)
 def test_glm5_router_modules_use_current_names_and_bias_buffers():
     import torch
 
@@ -865,6 +873,8 @@ def test_glm5_protocol_uses_mlite_optimizer_api():
     assert "build_dist_opt_training_optimizer" in protocol_text
 
 
+@pytest.mark.gpus(1)
+@pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 def test_glm5_lite_tiny_forward_backward(monkeypatch):
     import pytest
     import torch
