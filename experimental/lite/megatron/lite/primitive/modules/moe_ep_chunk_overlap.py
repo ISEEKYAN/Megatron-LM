@@ -384,9 +384,10 @@ class _EPChunkExpertActivationArenaCoordinator:
         storage_name = name if storage_name is None else storage_name
         trailing_shape = requested[1:]
         previous_trailing_shape = self.logical_trailing_shapes.get(name)
-        if previous_trailing_shape is None:
-            self.logical_trailing_shapes[name] = trailing_shape
-        elif previous_trailing_shape != trailing_shape:
+        if (
+            previous_trailing_shape is not None
+            and previous_trailing_shape != trailing_shape
+        ):
             raise RuntimeError(
                 f"EP chunk expert activation {name!r} trailing shape {trailing_shape} "
                 f"does not match logical activation trailing shape "
@@ -398,9 +399,6 @@ class _EPChunkExpertActivationArenaCoordinator:
             requested_numel *= dim
         element_size = int(torch.empty((), dtype=dtype).element_size())
         requested_bytes = requested_numel * element_size
-        self.max_requested_bytes[storage_name] = max(
-            self.max_requested_bytes.get(storage_name, 0), requested_bytes
-        )
         incompatible = existing is not None and (
             existing.dtype != dtype or existing.device != torch.device(device)
         )
@@ -444,6 +442,11 @@ class _EPChunkExpertActivationArenaCoordinator:
             self.allocations += 1
             self.grows += int(growing)
             self.capacity_bytes[storage_name] = capacity_bytes
+        if previous_trailing_shape is None:
+            self.logical_trailing_shapes[name] = trailing_shape
+        self.max_requested_bytes[storage_name] = max(
+            self.max_requested_bytes.get(storage_name, 0), requested_bytes
+        )
         self.issued_storage_slots.add(storage_name)
         return existing.narrow(0, 0, requested_numel).view(requested).detach()
 

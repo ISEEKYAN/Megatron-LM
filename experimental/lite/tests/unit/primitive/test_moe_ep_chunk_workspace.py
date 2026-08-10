@@ -1709,10 +1709,10 @@ def test_fc1_dgrad_reuses_fc2_dgrad_only_after_swiglu_consumes_it(
     lease.release(_FakeEvent(ready=True))
 
 
-def test_colored_storage_cannot_grow_after_its_first_active_lease_view(
+def test_failed_colored_alias_grow_does_not_bind_or_raise_high_watermark(
     transformer_engine_import_stub,
 ):
-    """A larger same-lease raw view must not strand the earlier storage alias."""
+    """A failed new logical alias request must not become a sticky binding."""
     (
         _chunk_count,
         _forward_op,
@@ -1747,15 +1747,18 @@ def test_colored_storage_cannot_grow_after_its_first_active_lease_view(
             "fc1_dgrad", (1, first_width + 1), dtype=torch.float32, device="cpu"
         )
     assert first_view.data_ptr() == first_ptr
+    coordinator = workspace._expert_activation_owner.coordinator
+    assert "fc1_dgrad" not in coordinator.logical_trailing_shapes
+    assert coordinator.max_requested_bytes["fc2_output"] == first_width * 4
     first.release(_FakeEvent(ready=True))
 
-    # The next lease is safe to grow because acquire clears issued slots only
-    # after the preceding consumer event has become ready.
+    # The failed width must not bind fc1_dgrad: the next lease can issue its
+    # smaller, compatible logical view from the already allocated raw slot.
     second = workspace.acquire_expert_activation()
     second_view = second.tensor(
-        "fc1_dgrad", (1, first_width + 1), dtype=torch.float32, device="cpu"
+        "fc1_dgrad", (1, first_width), dtype=torch.float32, device="cpu"
     )
-    assert second_view.data_ptr() != first_ptr
+    assert second_view.data_ptr() == first_ptr
     second.release(_FakeEvent(ready=True))
 
 
