@@ -229,8 +229,6 @@ class _EPChunkAllocationArena:
 
 
 _EXPERT_ACTIVATION_SIZE_CLASS_BYTES = 8 * 1024 * 1024
-_EXPERT_ACTIVATION_GROWTH_NUMERATOR = 3
-_EXPERT_ACTIVATION_GROWTH_DENOMINATOR = 2
 _EXPERT_ACTIVATION_LOGICAL_NAMES = frozenset(
     {"fc1_input", "fc1_output", "fc2_output", "fc1_dgrad", "fc2_dgrad"}
 )
@@ -260,20 +258,6 @@ def _expert_activation_capacity_bytes(requested_bytes: int) -> int:
         (requested_bytes + _EXPERT_ACTIVATION_SIZE_CLASS_BYTES - 1)
         // _EXPERT_ACTIVATION_SIZE_CLASS_BYTES
     ) * _EXPERT_ACTIVATION_SIZE_CLASS_BYTES
-
-
-def _expert_activation_growth_capacity_bytes(
-    requested_bytes: int, previous_capacity_bytes: int | None
-) -> int:
-    """Use bounded geometric headroom after the first observed high-watermark."""
-    requested_capacity = _expert_activation_capacity_bytes(requested_bytes)
-    if previous_capacity_bytes is None:
-        return requested_capacity
-    geometric_capacity = _expert_activation_capacity_bytes(
-        (previous_capacity_bytes * _EXPERT_ACTIVATION_GROWTH_NUMERATOR)
-        // _EXPERT_ACTIVATION_GROWTH_DENOMINATOR
-    )
-    return max(requested_capacity, geometric_capacity)
 
 
 @dataclass(frozen=True)
@@ -417,14 +401,7 @@ class _EPChunkExpertActivationArenaCoordinator:
             )
         if existing is None or growing:
             requested_capacity_bytes = _expert_activation_capacity_bytes(requested_bytes)
-            previous_capacity_bytes = (
-                None
-                if existing is None
-                else existing.numel() * existing.element_size()
-            )
-            capacity_bytes = _expert_activation_growth_capacity_bytes(
-                requested_bytes, previous_capacity_bytes
-            )
+            capacity_bytes = requested_capacity_bytes
             ceiling_numel = 1
             for dim in ceiling:
                 ceiling_numel *= dim
