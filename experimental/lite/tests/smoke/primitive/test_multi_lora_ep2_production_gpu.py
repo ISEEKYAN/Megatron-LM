@@ -14,6 +14,10 @@ import torch
 import torch.distributed as dist
 
 from megatron.lite.primitive.ckpt import dcp
+from megatron.lite.primitive.distributed_test_utils import (
+    gather_owner_factor_records_or_raise,
+    select_lora_bank_owner_group,
+)
 from megatron.lite.primitive.train_step import run_microbatch_loop
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
@@ -453,8 +457,8 @@ def _optimizer_param_range(
     """Resolve this rank's optional dist-opt shard for one dense bank.
 
     ``model_param_gbuf_map`` describes locally owned reduce-scatter ranges, so
-    a valid rank may own none of a small bank.  Global ownership is checked
-    only after gathering the local records below.
+    a valid rank may own none of a small bank.  Owner-group membership is
+    checked only after gathering that group's local records below.
     """
     is_fc = _bank_surface_kind(bundle, parameter) == "fc"
     owners = [
@@ -472,8 +476,8 @@ def _optimizer_param_range(
     param_range = range_map["param_map"][parameter]
     buffer = optimizer.buffers[gbuf_index]
     bucket = buffer.buckets[bucket_index]
-    expected_group = (
-        bundle.parallel_state.ep_dp_group if is_fc else bundle.parallel_state.dp_group
+    expected_group = select_lora_bank_owner_group(
+        bundle.parallel_state, is_expert_bank=is_fc
     )
     expected_ranks = _group_ranks(expected_group)
     assert _group_ranks(optimizer.data_parallel_group) == expected_ranks
@@ -489,10 +493,10 @@ def _assert_model_owned_bank_allreduce(parameter: torch.Tensor, *, is_fc: bool) 
     assert bool(value) == (not is_fc)
 
 
-def _dense_owner_record(
+def _owner_group_record(
     bundle, leaf_index: int, optimizer, buffer
 ) -> dict[str, object]:
-    """Serialize the leaf/group contract for cross-rank ownership validation."""
+    """Serialize one optimizer leaf's owner-group contract."""
     return {
         "leaf_index": leaf_index,
         "owner_group_ranks": _group_ranks(optimizer.data_parallel_group),
@@ -500,14 +504,14 @@ def _dense_owner_record(
     }
 
 
-def _assert_dense_owner_contract(
+def _assert_owner_group_contract(
     bundle, name: str, records: list[dict[str, object]]
 ) -> None:
-    """Prove every local shard maps to one dense leaf, never the EP child."""
+    """Prove every local shard maps to the intended owner-group leaf."""
     assert records, f"no distributed-optimizer shard found for semantic bank {name}"
     is_fc = _bank_surface_kind(bundle, _bank_parameters(bundle)[name]) == "fc"
     expected_ranks = _group_ranks(
-        bundle.parallel_state.ep_dp_group if is_fc else bundle.parallel_state.dp_group
+        select_lora_bank_owner_group(bundle.parallel_state, is_expert_bank=is_fc)
     )
     assert len({record["leaf_index"] for record in records}) == 1
     assert all(record["owner_group_ranks"] == expected_ranks for record in records)
@@ -522,10 +526,23 @@ def _local_full_bank_contributions(bundle) -> dict[str, torch.Tensor]:
     }
 
 
+def _local_owner_factor_record(bundle, name: str) -> dict[str, object] | None:
+    """Inspect one local factor only inside its owner-lane error envelope."""
+    parameter = _bank_parameters(bundle)[name]
+    owned = _optimizer_param_range(bundle, parameter)
+    if owned is None:
+        return None
+    leaf_index, owner, _param_range, buffer, bucket = owned
+    return {
+        **_owner_group_record(bundle, leaf_index, owner, buffer),
+        "factor": float(bucket.gradient_scaling_factor),
+    }
+
+
 def _bank_sync_absolute_oracle(
     bundle, local_contributions: dict[str, torch.Tensor]
 ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
-    """Reference FC as EP→expert-DP; attention as dense-DP only."""
+    """Reference FC and attention gradients over their respective owner groups."""
     expected: dict[str, torch.Tensor] = {}
     for name, contribution in local_contributions.items():
         if _bank_surface_kind(bundle, _bank_parameters(bundle)[name]) == "fc":
@@ -549,37 +566,36 @@ def _bank_sync_absolute_oracle(
             value.div_(bundle.parallel_state.dp_size)
         expected[name] = value.cpu()
     expected_keys = set(local_contributions)
-    local_factors: dict[str, dict[str, object]] = {}
-    for name, parameter in _bank_parameters(bundle).items():
-        owned = _optimizer_param_range(bundle, parameter)
-        if owned is None:
-            continue
-        leaf_index, owner, _param_range, buffer, bucket = owned
-        local_factors[name] = {
-            **_dense_owner_record(bundle, leaf_index, owner, buffer),
-            "factor": float(bucket.gradient_scaling_factor),
-        }
-    gathered_factors = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered_factors, local_factors)
     optimizer_expected: dict[str, torch.Tensor] = {}
     factors: dict[str, float] = {}
     for name in sorted(expected_keys):
         is_fc = _bank_surface_kind(bundle, _bank_parameters(bundle)[name]) == "fc"
+        owner_group = select_lora_bank_owner_group(
+            bundle.parallel_state, is_expert_bank=is_fc
+        )
         expected_factor = 1.0 / (
             bundle.parallel_state.expert_dp_size
             if is_fc
             else bundle.parallel_state.dp_size
         )
-        records = [
-            factor_map[name] for factor_map in gathered_factors if name in factor_map
-        ]
-        _assert_dense_owner_contract(bundle, name, records)
-        seen = {record["factor"] for record in records}
-        assert len(seen) == 1, f"missing or inconsistent dense-DP factor for {name}"
-        factor = seen.pop()
-        assert (
-            factor == expected_factor
-        ), f"owner bucket factor for {name} is {factor}, expected {expected_factor}"
+
+        def validate_records(records) -> None:
+            _assert_owner_group_contract(bundle, name, records)
+            seen = {record["factor"] for record in records}
+            assert (
+                len(seen) == 1
+            ), f"missing or inconsistent owner-group factor for {name}"
+            factor = seen.pop()
+            assert (
+                factor == expected_factor
+            ), f"owner-group factor for {name} is {factor}, expected {expected_factor}"
+
+        records = gather_owner_factor_records_or_raise(
+            owner_group,
+            lambda: _local_owner_factor_record(bundle, name),
+            validate_records,
+        )
+        factor = records[0]["factor"]
         factors[name] = factor
         optimizer_expected[name] = expected[name]
     return optimizer_expected, factors
@@ -610,7 +626,7 @@ def _reconstruct_optimizer_owned_bank_grads(bundle) -> dict[str, torch.Tensor]:
                     .end
                 ].detach()
                 local["shard"] = {
-                    **_dense_owner_record(bundle, leaf_index, owner, buffer),
+                    **_owner_group_record(bundle, leaf_index, owner, buffer),
                     "start": param_range["param"].start,
                     "end": param_range["param"].end,
                     "shape": tuple(parameter.shape),
@@ -634,7 +650,7 @@ def _reconstruct_optimizer_owned_bank_grads(bundle) -> dict[str, torch.Tensor]:
             assert end - start == values.numel()
             ranges.append((start, end))
             flat[start:end].copy_(values)
-        _assert_dense_owner_contract(bundle, name, records)
+        _assert_owner_group_contract(bundle, name, records)
         offset = 0
         for start, end in sorted(ranges):
             assert start == offset, f"non-contiguous dist-opt shard coverage for {name}"
