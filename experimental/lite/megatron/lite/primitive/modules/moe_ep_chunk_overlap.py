@@ -237,9 +237,10 @@ _NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS = {
     "fc1_dgrad": "fc2_dgrad",
 }
 
-# Fused backward first completes an overlapping FC2 Wgrad synchronously, then
-# writes FC2 dgrad and finally FC1 dgrad after SwiGLU consumes it. That permits
-# all three logical tensors to use FC2-output raw storage in this OP only.
+# Fused backward enqueues overlapping FC2 Wgrad on the current stream before
+# writing FC2 dgrad, then writes FC1 dgrad after SwiGLU consumes it. Same-stream
+# ordering makes the overwrite safe without a CUDA synchronize and permits all
+# three logical tensors to use FC2-output raw storage in this OP only.
 _FUSED_EXPERT_ACTIVATION_STORAGE_SLOTS = {
     "fc1_dgrad": "fc2_output",
     "fc2_dgrad": "fc2_output",

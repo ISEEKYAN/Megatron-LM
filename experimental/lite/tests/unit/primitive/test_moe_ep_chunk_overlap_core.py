@@ -2180,7 +2180,11 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_partial_overlap_w
         else:
             pieces = [inp @ weight.T for weight, inp in zip(weights, inputs)]
         outputs[0].copy_(torch.cat(pieces, dim=0))
-        if outputs[0].data_ptr() == trace["overlap_dgrad_ptr"]:
+        if (
+            trace["overlap_dgrad_ptr"] is not None
+            and trace["overlap_dgrad_ptr"] < outputs[0].data_ptr() + outputs[0].nbytes
+            and outputs[0].data_ptr() < trace["overlap_dgrad_end"]
+        ):
             trace["events"].append("overlap dgrad first write")
         if (
             kwargs.get("layout") == "NN"
@@ -2199,6 +2203,7 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_partial_overlap_w
     class Store:
         def __init__(self):
             self.entries = []
+            self.context = SimpleNamespace(empty=lambda: not self.entries)
 
         @staticmethod
         def delay_wgrad_compute():
@@ -2206,6 +2211,10 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_partial_overlap_w
 
         def put(self, tensors, fn):
             self.entries.append((tensors, fn))
+
+        def pop(self):
+            tensors, fn = self.entries.pop(0)
+            return fn(*tensors), tensors
 
     class Linear:
         def __init__(self):
@@ -2368,9 +2377,9 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_partial_overlap_w
     tensors, delayed = linear.wgrad_store.entries.pop()
     delayed(*tensors)
 
-    # Full two-linear CPU probe: use the production workspace's raw-byte
-    # coloring, run fake general_grouped_gemm forward, let an external consumer
-    # read FC2 output, then verify the FC2-DGRAD -> SwiGLU -> FC1-DGRAD reuse order.
+    # Full two-linear CPU probe: use the fused FC2 raw-byte coloring, run fake
+    # grouped GEMMs, and prove that the colliding FC2 Wgrad is immediate while
+    # FC1 remains deferred when SwiGLU supplies it a non-overlapping gradient.
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
         EPChunkShapeProfile,
         EPChunkWorkspaceKey,
@@ -2405,6 +2414,10 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_partial_overlap_w
     )
     assert colored_fc2_out.data_ptr() == colored_fc1_dgrad.data_ptr()
     assert colored_fc2_dgrad.data_ptr() == colored_fc1_dgrad.data_ptr()
+    # This isolated adapter probe keeps FC1's caller-owned dgrad separate so
+    # the non-overlap/deferred branch remains executable alongside FC2's
+    # fused collision. Dedicated workspace tests retain the production 3-slot map.
+    colored_fc1_dgrad = torch.empty_like(colored_fc1_dgrad)
 
     fc1 = Linear()
     fc2 = Linear()
@@ -2436,7 +2449,7 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_partial_overlap_w
         @staticmethod
         def backward(ctx, grad):
             trace["events"].append("swiglu_intermediate_consumer")
-            return grad
+            return grad.clone()
 
     colored_fc2 = experts_module._caller_owned_grouped_linear(
         fc2,
@@ -2445,25 +2458,62 @@ def test_caller_owned_grouped_linear_executes_te_lifecycle_and_partial_overlap_w
         colored_fc2_out,
         colored_fc2_dgrad,
     )
-    torch.testing.assert_close(
-        colored_fc2, torch.tensor([[22.0, 28.0], [4.0, 36.0]], dtype=torch.bfloat16)
-    )
-    trace["events"].append("fc2_output_external_consumer")
-    (
-        colored_fc2 * torch.tensor([[2.0, 3.0], [5.0, 7.0]], dtype=torch.bfloat16)
-    ).float().sum().backward()
+    # Match the fused production path: obtain the custom-Function edge before
+    # writing the same FC2-output bytes used as the incoming gradient source.
+    expert_out_edge = torch.autograd.graph.get_gradient_edge(colored_fc2)
+    colored_fc2_grad = colored_fc2.detach()
+    colored_fc2_grad.copy_(torch.tensor([[2.0, 3.0], [5.0, 7.0]], dtype=torch.bfloat16))
+    trace["overlap_dgrad_ptr"] = colored_fc2_dgrad.data_ptr()
+    trace["overlap_dgrad_end"] = colored_fc2_dgrad.data_ptr() + colored_fc2_dgrad.nbytes
+    colored_x_dgrad = torch.autograd.grad(expert_out_edge, colored_x, colored_fc2_grad)[
+        0
+    ]
     assert trace["events"] == [
-        "fc2_output_external_consumer",
-        "fc2_dgrad_first_write",
+        "overlap wgrad reads grad_output",
+        "overlap wgrad completes",
+        "overlap dgrad first write",
         "swiglu_intermediate_consumer",
         "fc1_dgrad_first_write",
     ]
-    assert colored_x.grad is not None
-    assert colored_x.grad.data_ptr() == colored_fc1_dgrad.data_ptr()
+    assert colored_x_dgrad.data_ptr() == colored_fc1_dgrad.data_ptr()
     torch.testing.assert_close(
-        colored_x.grad,
+        colored_x_dgrad,
         torch.tensor([[36.0, 46.0], [20.0, 53.0]], dtype=torch.bfloat16),
     )
+    assert fc2.wgrad_store.entries == []
+    assert getattr(fc2.wgrad_store, "_mlite_immediate_wgrad_contexts", 0) == 1
+    assert len(fc1.wgrad_store.entries) == 1
+    assert getattr(fc1.wgrad_store, "_mlite_immediate_wgrad_contexts", 0) == 0
+
+    flush_owner = SimpleNamespace(
+        fc1=fc1,
+        fc2=fc2,
+        _validate_weight_grad_sink=experts_module.Experts._validate_weight_grad_sink,
+        release_delayed_weight_grad_aliases=lambda: None,
+    )
+    experts_module.Experts.flush_delayed_weight_grads(flush_owner, num_contexts=1)
+    assert fc1.wgrad_store.context.empty()
+    assert fc2.wgrad_store.context.empty()
+    assert fc1.wgrad_store._mlite_immediate_wgrad_contexts == 0
+    assert fc2.wgrad_store._mlite_immediate_wgrad_contexts == 0
+    torch.testing.assert_close(
+        fc1.weight0.main_grad,
+        torch.tensor([[2.0, 4.0], [3.0, 6.0], [5.0, 10.0]]),
+    )
+    torch.testing.assert_close(
+        fc1.weight1.main_grad,
+        torch.tensor([[30.0, 40.0], [63.0, 84.0], [0.0, 0.0]]),
+    )
+    torch.testing.assert_close(
+        fc2.weight0.main_grad,
+        torch.tensor([[10.0, 22.0, 34.0], [15.0, 33.0, 51.0]]),
+    )
+    torch.testing.assert_close(
+        fc2.weight1.main_grad,
+        torch.tensor([[10.0, 60.0, 80.0], [14.0, 84.0, 112.0]]),
+    )
+    trace["overlap_dgrad_ptr"] = None
+    trace["overlap_dgrad_end"] = None
 
     class ReadyEvent:
         @staticmethod
