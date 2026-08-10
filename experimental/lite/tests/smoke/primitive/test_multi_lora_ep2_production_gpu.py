@@ -15,7 +15,9 @@ import torch.distributed as dist
 
 from megatron.lite.primitive.ckpt import dcp
 from megatron.lite.primitive.distributed_test_utils import (
+    build_lora_collective_descriptor,
     gather_owner_factor_records_or_raise,
+    preflight_lora_bank_collective_order,
     select_lora_bank_owner_group,
 )
 from megatron.lite.primitive.train_step import run_microbatch_loop
@@ -544,7 +546,20 @@ def _bank_sync_absolute_oracle(
 ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     """Reference FC and attention gradients over their respective owner groups."""
     expected: dict[str, torch.Tensor] = {}
-    for name, contribution in local_contributions.items():
+    records = preflight_lora_bank_collective_order(
+        local_contributions,
+        lambda name: build_lora_collective_descriptor(
+            _bank_surface_kind(bundle, _bank_parameters(bundle)[name]),
+            local_contributions[name],
+            _bank_parameters(bundle)[name].dtype,
+        ),
+    )
+    print(
+        "MULTI_LORA_COLLECTIVE_PREFLIGHT " f"rank={dist.get_rank()} records={records}",
+        flush=True,
+    )
+    for name, _kind, _shape, _dtype in records:
+        contribution = local_contributions[name]
         if _bank_surface_kind(bundle, _bank_parameters(bundle)[name]) == "fc":
             bank_dtype = _bank_parameters(bundle)[name].dtype
             assert bank_dtype is torch.bfloat16

@@ -10,7 +10,10 @@ import torch
 import torch.distributed as dist
 
 from megatron.lite.primitive.distributed_test_utils import (
+    build_lora_collective_descriptor,
+    canonical_lora_bank_names,
     gather_owner_factor_records_or_raise,
+    preflight_lora_bank_collective_order,
     select_lora_bank_owner_group,
 )
 from megatron.lite.primitive.parallel import init_parallel
@@ -145,5 +148,283 @@ def test_attention_and_fc_owner_groups_cover_tp_ep_boundaries_gloo(tmp_path, tp,
         _owner_boundary_worker,
         args=(2, str(tmp_path / f"tp{tp}_ep{ep}_owner_boundary"), tp, ep),
         nprocs=2,
+        join=True,
+    )
+
+
+def test_canonical_lora_bank_names_stabilize_rank_local_insertion_order():
+    """Every rank must enter mixed FC/attention collectives in one order."""
+    rank_zero_order = {
+        "layers.0.attn.qkv.linear.weight": object(),
+        "layers.0.mlp.experts.linear_fc1.weight": object(),
+        "layers.0.attn.proj.linear.weight": object(),
+    }
+    rank_two_order = {
+        "layers.0.mlp.experts.linear_fc1.weight": object(),
+        "layers.0.attn.proj.linear.weight": object(),
+        "layers.0.attn.qkv.linear.weight": object(),
+    }
+    expected = (
+        "layers.0.attn.proj.linear.weight",
+        "layers.0.attn.qkv.linear.weight",
+        "layers.0.mlp.experts.linear_fc1.weight",
+    )
+    assert canonical_lora_bank_names(rank_zero_order) == expected
+    assert canonical_lora_bank_names(rank_two_order) == expected
+
+
+def _assert_two_owner_records(values) -> None:
+    assert len(values) == 2
+    assert all(value["factor"] == 0.5 for value in values)
+
+
+def _mixed_bank_collective_order_worker(rank: int, world: int, init_file: str) -> None:
+    _init_gloo(rank, world, init_file)
+    try:
+        ps = init_parallel(SimpleNamespace(tp=2, ep=2, etp=1, cp=1, pp=1))
+        ordered = (
+            "layers.0.mlp.experts.linear_fc1.weight",
+            "layers.0.attn.qkv.linear.weight",
+        )
+        local_banks = {
+            name: torch.tensor(float(rank + 1))
+            for name in (ordered if rank % 2 == 0 else tuple(reversed(ordered)))
+        }
+        kinds = {ordered[0]: "fc", ordered[1]: "attention"}
+        records = preflight_lora_bank_collective_order(
+            local_banks,
+            lambda name: (
+                kinds[name],
+                tuple(local_banks[name].shape),
+                str(local_banks[name].dtype),
+            ),
+        )
+        assert records == (
+            (ordered[0], "fc", (), "torch.float32"),
+            (ordered[1], "attention", (), "torch.float32"),
+        )
+
+        actual = {}
+        for name, _kind, _shape, _dtype in records:
+            value = local_banks[name].clone()
+            if kinds[name] == "fc":
+                dist.all_reduce(value, group=ps.ep_group)
+                dist.all_reduce(value, group=ps.ep_dp_group)
+                assert value.item() == 10.0
+            else:
+                dist.all_reduce(value, group=ps.dp_group)
+                assert value.item() == (4.0 if rank % 2 == 0 else 6.0)
+            actual[name] = value.item()
+        gathered = [None] * world
+        dist.all_gather_object(gathered, actual, group=dist.group.WORLD)
+        assert all(record[ordered[0]] == 10.0 for record in gathered)
+        assert [record[ordered[1]] for record in gathered] == [4.0, 6.0, 4.0, 6.0]
+        gather_owner_factor_records_or_raise(
+            ps.dp_group,
+            lambda: {"rank": rank, "factor": 0.5},
+            _assert_two_owner_records,
+        )
+        dist.barrier(group=dist.group.WORLD)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.distributed
+def test_mixed_fc_attention_collectives_have_canonical_world4_order_gloo(tmp_path):
+    torch.multiprocessing.spawn(
+        _mixed_bank_collective_order_worker,
+        args=(4, str(tmp_path / "mixed_fc_attention_collective_order")),
+        nprocs=4,
+        join=True,
+    )
+
+
+def _mixed_bank_preflight_mismatch_worker(
+    rank: int, world: int, init_file: str
+) -> None:
+    _init_gloo(rank, world, init_file)
+    try:
+        banks = {"layers.0.mlp.experts.linear_fc1.weight": torch.ones(2, 3)}
+
+        def describe_bank(name):
+            assert name in banks
+            return (
+                "attention" if rank == 0 else "fc",
+                tuple(banks[name].shape),
+                str(banks[name].dtype),
+            )
+
+        try:
+            preflight_lora_bank_collective_order(banks, describe_bank)
+        except RuntimeError as error:
+            result = str(error)
+        else:
+            result = None
+        results = [None] * world
+        dist.all_gather_object(results, result, group=dist.group.WORLD)
+        assert (
+            result
+            == "mixed LoRA bank collective preflight failed: records differ across WORLD"
+        )
+        assert results == [result] * world
+        dist.barrier(group=dist.group.WORLD)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.distributed
+def test_mixed_bank_preflight_mismatch_fails_whole_world_without_hanging_gloo(tmp_path):
+    torch.multiprocessing.spawn(
+        _mixed_bank_preflight_mismatch_worker,
+        args=(4, str(tmp_path / "mixed_bank_preflight_mismatch")),
+        nprocs=4,
+        join=True,
+    )
+
+
+def _invalid_descriptor_worker(rank: int, world: int, init_file: str) -> None:
+    _init_gloo(rank, world, init_file)
+    try:
+        banks = {"layers.0.attn.qkv.linear.weight": torch.ones(2, 3)}
+        try:
+            preflight_lora_bank_collective_order(
+                banks, lambda _name: ("invalid", (2, 3), "torch.float32")
+            )
+        except RuntimeError as error:
+            result = str(error)
+        else:
+            result = None
+        results = [None] * world
+        dist.all_gather_object(results, result, group=dist.group.WORLD)
+        expected = (
+            "mixed LoRA bank collective preflight failed: local record error: "
+            "AssertionError: invalid LoRA bank kind: invalid"
+        )
+        assert results == [expected] * world
+        dist.barrier(group=dist.group.WORLD)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.distributed
+def test_invalid_preflight_descriptor_fails_whole_world_without_hanging_gloo(tmp_path):
+    torch.multiprocessing.spawn(
+        _invalid_descriptor_worker,
+        args=(4, str(tmp_path / "invalid_preflight_descriptor")),
+        nprocs=4,
+        join=True,
+    )
+
+
+def _descriptor_builder_error_worker(rank: int, world: int, init_file: str) -> None:
+    _init_gloo(rank, world, init_file)
+    try:
+        banks = {"layers.0.attn.qkv.linear.weight": torch.ones(2, 3)}
+
+        def build_descriptor(_name):
+            if rank == 0:
+                raise AssertionError("malformed descriptor")
+            return ("attention", (2, 3), "torch.float32")
+
+        try:
+            preflight_lora_bank_collective_order(banks, build_descriptor)
+        except RuntimeError as error:
+            result = str(error)
+        else:
+            result = None
+        results = [None] * world
+        dist.all_gather_object(results, result, group=dist.group.WORLD)
+        expected = (
+            "mixed LoRA bank collective preflight failed: local record error: "
+            "AssertionError: malformed descriptor"
+        )
+        assert results == [expected] * world
+        dist.barrier(group=dist.group.WORLD)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.distributed
+def test_descriptor_builder_error_fails_whole_world_without_hanging_gloo(tmp_path):
+    torch.multiprocessing.spawn(
+        _descriptor_builder_error_worker,
+        args=(4, str(tmp_path / "descriptor_builder_error")),
+        nprocs=4,
+        join=True,
+    )
+
+
+def _fc_bank_dtype_drift_worker(rank: int, world: int, init_file: str) -> None:
+    _init_gloo(rank, world, init_file)
+    try:
+        banks = {"layers.0.mlp.experts.linear_fc1.weight": torch.ones(2, 3)}
+
+        def build_descriptor(_name):
+            bank_dtype = torch.float32 if rank == 0 else torch.bfloat16
+            return build_lora_collective_descriptor("fc", banks[_name], bank_dtype)
+
+        try:
+            preflight_lora_bank_collective_order(banks, build_descriptor)
+        except RuntimeError as error:
+            result = str(error)
+        else:
+            result = None
+        results = [None] * world
+        dist.all_gather_object(results, result, group=dist.group.WORLD)
+        expected = (
+            "mixed LoRA bank collective preflight failed: local record error: "
+            "AssertionError: FC LoRA bank dtype must be torch.bfloat16"
+        )
+        assert results == [expected] * world
+        dist.barrier(group=dist.group.WORLD)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.distributed
+def test_fc_bank_dtype_drift_fails_whole_world_in_preflight_gloo(tmp_path):
+    torch.multiprocessing.spawn(
+        _fc_bank_dtype_drift_worker,
+        args=(4, str(tmp_path / "fc_bank_dtype_drift")),
+        nprocs=4,
+        join=True,
+    )
+
+
+def _fc_contribution_dtype_drift_worker(rank: int, world: int, init_file: str) -> None:
+    _init_gloo(rank, world, init_file)
+    try:
+        banks = {"layers.0.mlp.experts.linear_fc1.weight": torch.ones(2, 3)}
+
+        def build_descriptor(_name):
+            reduction_tensor = banks[_name].double() if rank == 0 else banks[_name]
+            return build_lora_collective_descriptor(
+                "fc", reduction_tensor, torch.bfloat16
+            )
+
+        try:
+            preflight_lora_bank_collective_order(banks, build_descriptor)
+        except RuntimeError as error:
+            result = str(error)
+        else:
+            result = None
+        results = [None] * world
+        dist.all_gather_object(results, result, group=dist.group.WORLD)
+        expected = (
+            "mixed LoRA bank collective preflight failed: local record error: "
+            "AssertionError: LoRA reduction tensor dtype must be torch.float32"
+        )
+        assert results == [expected] * world
+        dist.barrier(group=dist.group.WORLD)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.distributed
+def test_fc_contribution_dtype_drift_fails_whole_world_in_preflight_gloo(tmp_path):
+    torch.multiprocessing.spawn(
+        _fc_contribution_dtype_drift_worker,
+        args=(4, str(tmp_path / "fc_contribution_dtype_drift")),
+        nprocs=4,
         join=True,
     )
