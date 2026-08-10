@@ -7,6 +7,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -27,7 +28,9 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     export_hf_weights,
     stream_export_to_shards,
 )
+from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
 from megatron.lite.primitive.quantization.qat import QATSpec, apply_qat_to_chunks
+from megatron.lite.runtime.contracts.config import ParallelConfig
 
 
 def test_safe_tensor_reader_context_reuses_and_closes_shard(
@@ -139,6 +142,208 @@ def test_stream_export_nonzero_rank_drains_iterator_for_collectives(
 
 def test_export_defaults_to_device_resident_tensors() -> None:
     assert inspect.signature(export_hf_weights).parameters["cpu"].default is False
+
+
+def test_export_uses_wrapped_bucket_stream_without_materializing_module_parameters() -> (
+    None
+):
+    class Wrapped(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.module = nn.Linear(4, 3, bias=False)
+            self.expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+            self.module.weight.data = torch.empty(0)
+            self.stream_calls = 0
+
+        def stream_full_parameters(self):
+            self.stream_calls += 1
+            yield "weight", nn.Parameter(self.expected.clone())
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def is_expert(_name):
+            return False
+
+        @staticmethod
+        def tp_spec(_name):
+            return None
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+    wrapped = Wrapped()
+
+    exported = dict(export_hf_weights(wrapped, Spec(), ps))
+
+    assert wrapped.stream_calls == 1
+    assert wrapped.module.weight.numel() == 0
+    assert torch.equal(exported["weight"], wrapped.expected)
+
+
+def test_cpu_export_copies_borrowed_bucket_before_advancing_stream() -> None:
+    class Wrapped(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.module = nn.Linear(2, 2, bias=False)
+            self.module.weight.data = torch.empty(0)
+            self.storage = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+            self.borrowed_calls = 0
+
+        def stream_full_parameters(self):
+            raise AssertionError("CPU DP-only export should use the borrowed stream")
+
+        def stream_borrowed_full_parameters(self):
+            self.borrowed_calls += 1
+            yield "first", nn.Parameter(self.storage)
+            self.storage.add_(10)
+            yield "second", nn.Parameter(self.storage)
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def is_expert(_name):
+            return False
+
+        @staticmethod
+        def tp_spec(_name):
+            return None
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+    wrapped = Wrapped()
+
+    exported = dict(export_hf_weights(wrapped, Spec(), ps, cpu=True))
+
+    assert wrapped.borrowed_calls == 1
+    assert torch.equal(
+        exported["first"], torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    )
+    assert torch.equal(
+        exported["second"], torch.arange(10, 14, dtype=torch.float32).reshape(2, 2)
+    )
+    assert exported["first"].data_ptr() != wrapped.storage.data_ptr()
+
+
+def test_export_uses_real_mfsdp_stream_and_training_can_continue() -> None:
+    class Unit(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = nn.Linear(4, 3, bias=False)
+
+        def forward(self, value):
+            return torch.nn.functional.gelu(self.linear(value))
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.unit = Unit()
+            self.out = nn.Linear(3, 2, bias=False)
+
+        def forward(self, value):
+            return self.out(self.unit(value))
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def is_expert(_name):
+            return False
+
+        @staticmethod
+        def tp_spec(_name):
+            return None
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    torch.manual_seed(123)
+    model = Model()
+    expected = {
+        name: param.detach().clone() for name, param in model.named_parameters()
+    }
+    ps = SimpleNamespace(
+        dp_cp_group=None,
+        dp_group=None,
+        ep_dp_group=None,
+        ep_group=None,
+        etp_group=None,
+        tp_group=None,
+        pp_group=None,
+        dp_cp_size=1,
+        expert_dp_size=1,
+        pp_size=1,
+        tp_size=1,
+        ep_size=1,
+        etp_size=1,
+    )
+    opt = SimpleNamespace(
+        optimizer="adam",
+        lr=1.0e-3,
+        min_lr=0.0,
+        weight_decay=0.0,
+        clip_grad=1.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_eps=1.0e-8,
+        override_optimizer_config={"mfsdp_sharding_strategy": "optim_grads_params"},
+    )
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        engine_cfg=SimpleNamespace(
+            parallel=ParallelConfig(tp=1, ep=1, etp=1, pp=1, vpp=1, cp=1), optimizer=opt
+        ),
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(Unit,),
+    )
+    chunk = chunks[0]
+
+    exported = dict(export_hf_weights(chunk, Spec(), ps))
+
+    assert exported.keys() == expected.keys()
+    for name, tensor in exported.items():
+        assert torch.equal(tensor, expected[name]), name
+    assert all(bucket._full_lease is None for bucket in chunk.param_sync.buckets)
+
+    optimizer.zero_grad()
+    value = torch.randn(3, 4)
+    chunk(value).square().mean().backward()
+    optimizer.finish_grad_sync()
+    assert optimizer.step()[0]
+    assert torch.isfinite(chunk(value)).all()
 
 
 @pytest.mark.gpus(1)

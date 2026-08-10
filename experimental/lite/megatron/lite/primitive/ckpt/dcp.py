@@ -8,6 +8,8 @@ HF weight loading/saving is model-specific and lives in models/<name>/checkpoint
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import os
 import random
 from collections.abc import Iterable
@@ -19,15 +21,18 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.distributed.checkpoint as dcp  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-from torch.distributed.device_mesh import DeviceMesh  # pyright: ignore[reportMissingImports]
-from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
     PlacementFn,
     default_expert_classifier,
     default_placement_fn,
+)
+from torch.distributed.device_mesh import DeviceMesh  # pyright: ignore[reportMissingImports]
+from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
+from torch.distributed.tensor import (  # pyright: ignore[reportMissingImports]
+    Replicate,
+    Shard,
 )
 
 
@@ -67,6 +72,23 @@ def save_training_checkpoint(
         if save_rng:
             _save_rng_sidecar(ckpt_path)
         log_rank0(f"Saved dist_opt checkpoint at step {step} to {ckpt_path}")
+        return
+    mfsdp_chunks = _mfsdp_chunks(model)
+    if mfsdp_chunks is not None:
+        ckpt_path = os.path.join(path, f"step_{step}")
+        os.makedirs(ckpt_path, exist_ok=True)
+        _save_mfsdp_checkpoint(
+            mfsdp_chunks,
+            optimizer,
+            step,
+            ckpt_path,
+            ps=ps,
+            save_model=save_model,
+            save_optimizer=save_optimizer,
+        )
+        if save_rng:
+            _save_rng_sidecar(ckpt_path)
+        log_rank0(f"Saved M-FSDP checkpoint at step {step} to {ckpt_path}")
         return
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
@@ -130,6 +152,20 @@ def load_training_checkpoint(
         if load_rng:
             _load_rng_sidecar(ckpt_path)
         log_rank0(f"Loaded dist_opt checkpoint from {path} at step {step}")
+        return step
+    mfsdp_chunks = _mfsdp_chunks(model)
+    if mfsdp_chunks is not None:
+        step = _load_mfsdp_checkpoint(
+            mfsdp_chunks,
+            optimizer,
+            ckpt_path,
+            ps=ps,
+            load_model=load_model,
+            load_optimizer=load_optimizer,
+        )
+        if load_rng:
+            _load_rng_sidecar(ckpt_path)
+        log_rank0(f"Loaded M-FSDP checkpoint from {path} at step {step}")
         return step
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
@@ -261,6 +297,417 @@ def _model_chunks(model: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:
     if not all(isinstance(chunk, nn.Module) for chunk in chunks):
         raise TypeError("checkpoint model chunks must be nn.Module instances.")
     return chunks
+
+
+def _mfsdp_chunks(model: nn.Module | Iterable[nn.Module]) -> list[nn.Module] | None:
+    if isinstance(model, nn.ModuleList):
+        chunks = list(model)
+    else:
+        chunks = _model_chunks(model)
+    if chunks and all(
+        hasattr(chunk, "param_and_grad_buffer")
+        and hasattr(chunk, "named_optimizer_parameters")
+        for chunk in chunks
+    ):
+        return chunks
+    return None
+
+
+def _mfsdp_optimizer_parts(optimizer):
+    inner = getattr(optimizer, "_inner_optimizer", None)
+    torch_optimizer = getattr(inner, "optimizer", None)
+    params = getattr(inner, "params", None)
+    if inner is None or torch_optimizer is None or params is None:
+        raise TypeError(
+            "M-FSDP DCP requires the standalone MFSdpOptimizer state interface."
+        )
+    return inner, torch_optimizer
+
+
+def _mfsdp_bucket_identity(bucket) -> bytes:
+    layout = [
+        (spec.name, tuple(spec.shape), int(spec.full_offset), int(spec.numel))
+        for spec in bucket.specs
+    ]
+    payload = repr(
+        (
+            int(bucket.bucket_id),
+            int(bucket.logical_numel),
+            int(bucket.chunk_size_factor),
+            bool(bucket.is_expert),
+            layout,
+        )
+    ).encode("utf-8")
+    return hashlib.sha256(payload).digest()
+
+
+def _mfsdp_bucket_mesh(bucket) -> DeviceMesh:
+    if not dist.is_initialized():
+        raise RuntimeError("M-FSDP DCP requires torch.distributed initialization.")
+    group = bucket.process_group or dist.group.WORLD
+    return DeviceMesh.from_group(group, bucket.main_param_buffer.device.type)
+
+
+def _mfsdp_standard_shard_range(logical_numel: int, world_size: int, rank: int):
+    chunk_size = (logical_numel + world_size - 1) // world_size
+    start = min(rank * chunk_size, logical_numel)
+    end = min(start + chunk_size, logical_numel)
+    return start, end
+
+
+def _mfsdp_gather_padded_bucket(bucket, local: torch.Tensor) -> torch.Tensor:
+    if local.numel() != bucket.local_numel:
+        raise RuntimeError(
+            f"M-FSDP bucket {bucket.bucket_id} local tensor has {local.numel()} "
+            f"elements, expected {bucket.local_numel}."
+        )
+    if bucket.world_size == 1:
+        return local.detach().clone()
+    full = torch.empty(bucket.full_numel, dtype=local.dtype, device=local.device)
+    dist.all_gather_into_tensor(full, local.contiguous(), group=bucket.process_group)
+    return full
+
+
+def _mfsdp_logical_dtensor(bucket, local_padded: torch.Tensor) -> DTensor:
+    full = _mfsdp_gather_padded_bucket(bucket, local_padded)
+    start, end = _mfsdp_standard_shard_range(
+        bucket.logical_numel, bucket.world_size, bucket.rank
+    )
+    local = full.narrow(0, start, end - start).clone()
+    return DTensor.from_local(
+        local,
+        _mfsdp_bucket_mesh(bucket),
+        [Shard(0)],
+        run_check=False,
+        shape=torch.Size((bucket.logical_numel,)),
+        stride=(1,),
+    )
+
+
+def _mfsdp_replicated_dtensor(bucket, tensor: torch.Tensor) -> DTensor:
+    return DTensor.from_local(
+        tensor,
+        _mfsdp_bucket_mesh(bucket),
+        [Replicate()],
+        run_check=False,
+        shape=tensor.shape,
+        stride=tensor.stride(),
+    )
+
+
+def _mfsdp_pack_optimizer_tensor(bucket, torch_optimizer, state_name: str):
+    packed = torch.zeros(
+        bucket.local_numel,
+        dtype=bucket.main_param_buffer.dtype,
+        device=bucket.main_param_buffer.device,
+    )
+    for spec in bucket.specs:
+        if spec.shard_param is None or not spec.full_param.requires_grad:
+            continue
+        value = torch_optimizer.state.get(spec.shard_param, {}).get(state_name)
+        if value is None:
+            continue
+        if not torch.is_tensor(value) or value.numel() != spec.shard_numel:
+            raise RuntimeError(
+                f"M-FSDP optimizer state {state_name!r} for {spec.name!r} "
+                "does not match its parameter shard."
+            )
+        packed.narrow(0, spec.local_offset, spec.shard_numel).copy_(
+            value.detach().reshape(-1).to(dtype=packed.dtype)
+        )
+    return packed
+
+
+def _mfsdp_optimizer_metadata(bucket, torch_optimizer):
+    initialized = torch.zeros(
+        len(bucket.specs), dtype=torch.uint8, device=bucket.main_param_buffer.device
+    )
+    step_present = torch.zeros_like(initialized)
+    steps = torch.zeros(
+        len(bucket.specs), dtype=torch.float64, device=bucket.main_param_buffer.device
+    )
+    for index, spec in enumerate(bucket.specs):
+        if spec.shard_param is None or not spec.full_param.requires_grad:
+            continue
+        state = torch_optimizer.state.get(spec.shard_param, {})
+        if not state:
+            continue
+        initialized[index] = 1
+        if "step" in state:
+            step_present[index] = 1
+            step = state["step"]
+            steps[index] = float(step.item() if torch.is_tensor(step) else step)
+    if bucket.world_size > 1:
+        # Empty local parameter shards intentionally have no FusedAdam state.
+        # Metadata is nevertheless checkpointed as Replicate(), so make it
+        # genuinely rank-invariant: a parameter is initialized when any DP
+        # rank owns state, and all initialized shards share the same schema and
+        # step value.
+        dist.all_reduce(initialized, op=dist.ReduceOp.MAX, group=bucket.process_group)
+        dist.all_reduce(step_present, op=dist.ReduceOp.MAX, group=bucket.process_group)
+        dist.all_reduce(steps, op=dist.ReduceOp.MAX, group=bucket.process_group)
+    return initialized, step_present, steps
+
+
+_MFSDP_GROUP_STEP_PRESENT = "_mfsdp_group_step_present"
+
+
+def _mfsdp_optimizer_param_groups(torch_optimizer) -> list[dict[str, Any]]:
+    """Return DP-independent optimizer-group options without parameter objects."""
+    saved_groups = []
+    for group in torch_optimizer.param_groups:
+        saved = {
+            key: copy.deepcopy(value) for key, value in group.items() if key != "params"
+        }
+        if _MFSDP_GROUP_STEP_PRESENT in saved:
+            raise RuntimeError(
+                f"Optimizer parameter group uses reserved M-FSDP key "
+                f"{_MFSDP_GROUP_STEP_PRESENT!r}."
+            )
+        # TE FusedAdam creates its group-level update counter lazily on the
+        # first step. DCP only loads keys present in the destination template,
+        # so always request a fixed ``step`` slot and separately preserve
+        # whether the source optimizer actually owned that key.
+        saved[_MFSDP_GROUP_STEP_PRESENT] = "step" in saved
+        saved.setdefault("step", 0)
+        saved_groups.append(saved)
+    return saved_groups
+
+
+def _mfsdp_restore_optimizer_param_groups(
+    torch_optimizer, saved_groups: list[dict[str, Any]]
+) -> None:
+    if len(saved_groups) != len(torch_optimizer.param_groups):
+        raise RuntimeError(
+            "M-FSDP checkpoint optimizer parameter-group count does not match "
+            "the target optimizer."
+        )
+    for group, saved_group in zip(
+        torch_optimizer.param_groups, saved_groups, strict=True
+    ):
+        saved = copy.deepcopy(saved_group)
+        step_present = bool(saved.pop(_MFSDP_GROUP_STEP_PRESENT, False))
+        if not step_present:
+            saved.pop("step", None)
+        params = group["params"]
+        group.clear()
+        group.update(saved)
+        group["params"] = params
+
+
+def _mfsdp_domain_key(bucket, ps) -> str:
+    if ps is None:
+        if dist.get_world_size() != bucket.world_size:
+            raise ValueError(
+                "M-FSDP cross-DP DCP requires ParallelState to distinguish "
+                "fixed model-parallel coordinates."
+            )
+        return "expert.pp0.ep0.etp0" if bucket.is_expert else "dense.pp0.cp0.tp0"
+    if bucket.is_expert:
+        return (
+            f"expert.pp{int(getattr(ps, 'pp_rank', 0))}."
+            f"ep{int(getattr(ps, 'ep_rank', 0))}."
+            f"etp{int(getattr(ps, 'etp_rank', 0))}"
+        )
+    return (
+        f"dense.pp{int(getattr(ps, 'pp_rank', 0))}."
+        f"cp{int(getattr(ps, 'cp_rank', 0))}."
+        f"tp{int(getattr(ps, 'tp_rank', 0))}"
+    )
+
+
+def _mfsdp_checkpoint_template(
+    chunks,
+    optimizer,
+    ps,
+    *,
+    include_model: bool,
+    include_optimizer: bool,
+):
+    torch_optimizer = None
+    if include_optimizer:
+        _inner, torch_optimizer = _mfsdp_optimizer_parts(optimizer)
+    domains: dict[str, dict[str, dict[str, Any]]] = {}
+    for chunk_index, chunk in enumerate(chunks):
+        for bucket in chunk.param_and_grad_buffer.buckets:
+            identity = torch.tensor(
+                list(_mfsdp_bucket_identity(bucket)),
+                dtype=torch.uint8,
+                device=bucket.main_param_buffer.device,
+            )
+            bucket_state = {
+                "identity": _mfsdp_replicated_dtensor(bucket, identity),
+            }
+            if include_model:
+                bucket_state["main_param"] = _mfsdp_logical_dtensor(
+                    bucket, bucket.main_param_buffer
+                )
+            if include_optimizer and bucket.requires_grad:
+                assert torch_optimizer is not None
+                initialized, step_present, steps = _mfsdp_optimizer_metadata(
+                    bucket, torch_optimizer
+                )
+                bucket_state["state_initialized"] = _mfsdp_replicated_dtensor(
+                    bucket, initialized
+                )
+                bucket_state["step_present"] = _mfsdp_replicated_dtensor(
+                    bucket, step_present
+                )
+                bucket_state["step"] = _mfsdp_replicated_dtensor(bucket, steps)
+                bucket_state["exp_avg"] = _mfsdp_logical_dtensor(
+                    bucket,
+                    _mfsdp_pack_optimizer_tensor(bucket, torch_optimizer, "exp_avg"),
+                )
+                bucket_state["exp_avg_sq"] = _mfsdp_logical_dtensor(
+                    bucket,
+                    _mfsdp_pack_optimizer_tensor(bucket, torch_optimizer, "exp_avg_sq"),
+                )
+            domain = domains.setdefault(_mfsdp_domain_key(bucket, ps), {})
+            chunk_state = domain.setdefault(str(chunk_index), {})
+            chunk_state[str(bucket.bucket_id)] = bucket_state
+    return {"version": 3, "domains": domains}
+
+
+def _save_mfsdp_checkpoint(
+    chunks,
+    optimizer,
+    step: int,
+    path: str,
+    *,
+    ps,
+    save_model: bool,
+    save_optimizer: bool,
+) -> None:
+    if save_optimizer and optimizer is None:
+        raise ValueError("M-FSDP optimizer checkpointing requires an optimizer.")
+    state_dict: dict[str, Any] = {"step": int(step)}
+    if save_model or save_optimizer:
+        state_dict["mfsdp"] = _mfsdp_checkpoint_template(
+            chunks,
+            optimizer,
+            ps,
+            include_model=save_model,
+            include_optimizer=save_optimizer,
+        )
+    if save_optimizer:
+        _inner, torch_optimizer = _mfsdp_optimizer_parts(optimizer)
+        state_dict["optimizer_param_groups"] = _mfsdp_optimizer_param_groups(
+            torch_optimizer
+        )
+    dcp.save(state_dict, checkpoint_id=path)
+
+
+def _mfsdp_copy_logical_to_bucket(bucket, logical: torch.Tensor, target: torch.Tensor):
+    target.zero_()
+    local_start = bucket.rank * bucket.local_numel
+    local_end = min(local_start + bucket.local_numel, bucket.logical_numel)
+    if local_end > local_start:
+        target.narrow(0, 0, local_end - local_start).copy_(
+            logical.narrow(0, local_start, local_end - local_start)
+        )
+
+
+def _mfsdp_unpack_optimizer_tensor(
+    bucket,
+    torch_optimizer,
+    logical: torch.Tensor,
+    state_name: str,
+    initialized: torch.Tensor,
+    step_present: torch.Tensor,
+    steps: torch.Tensor,
+) -> None:
+    local = torch.zeros_like(bucket.main_param_buffer)
+    _mfsdp_copy_logical_to_bucket(bucket, logical, local)
+    for index, spec in enumerate(bucket.specs):
+        if spec.shard_param is None or not spec.full_param.requires_grad:
+            continue
+        if not bool(initialized[index].item()):
+            torch_optimizer.state.pop(spec.shard_param, None)
+            continue
+        state = torch_optimizer.state.setdefault(spec.shard_param, {})
+        state[state_name] = (
+            local.narrow(0, spec.local_offset, spec.shard_numel)
+            .view_as(spec.shard_param)
+            .clone()
+        )
+        if bool(step_present[index].item()):
+            state["step"] = torch.tensor(
+                float(steps[index].item()),
+                dtype=torch.float32,
+                device=spec.shard_param.device,
+            )
+        else:
+            state.pop("step", None)
+
+
+def _load_mfsdp_checkpoint(
+    chunks, optimizer, path: str, *, ps, load_model: bool, load_optimizer: bool
+) -> int:
+    if not load_model and not load_optimizer:
+        state_dict: dict[str, Any] = {"step": 0}
+        dcp.load(state_dict, checkpoint_id=path)
+        return int(state_dict.get("step", 0))
+    if load_optimizer and optimizer is None:
+        raise ValueError("M-FSDP optimizer checkpoint loading requires an optimizer.")
+    state_dict: dict[str, Any] = {
+        "step": 0,
+        "mfsdp": _mfsdp_checkpoint_template(
+            chunks,
+            optimizer,
+            ps,
+            include_model=load_model,
+            include_optimizer=load_optimizer,
+        ),
+    }
+    torch_optimizer = None
+    if load_optimizer:
+        _inner, torch_optimizer = _mfsdp_optimizer_parts(optimizer)
+        state_dict["optimizer_param_groups"] = _mfsdp_optimizer_param_groups(
+            torch_optimizer
+        )
+    dcp.load(state_dict, checkpoint_id=path)
+    if load_optimizer:
+        assert torch_optimizer is not None
+        _mfsdp_restore_optimizer_param_groups(
+            torch_optimizer, state_dict["optimizer_param_groups"]
+        )
+    loaded_domains = state_dict["mfsdp"]["domains"]
+    for chunk_index, chunk in enumerate(chunks):
+        for bucket in chunk.param_and_grad_buffer.buckets:
+            loaded_bucket = loaded_domains[_mfsdp_domain_key(bucket, ps)][
+                str(chunk_index)
+            ][str(bucket.bucket_id)]
+            loaded_identity = bytes(loaded_bucket["identity"].to_local().cpu().tolist())
+            expected_identity = _mfsdp_bucket_identity(bucket)
+            if loaded_identity != expected_identity:
+                raise RuntimeError(
+                    f"M-FSDP checkpoint bucket layout mismatch for bucket "
+                    f"{bucket.bucket_id}."
+                )
+            if load_model:
+                logical_param = loaded_bucket["main_param"].full_tensor()
+                _mfsdp_copy_logical_to_bucket(
+                    bucket, logical_param, bucket.main_param_buffer
+                )
+                bucket.copy_main_weights_to_model_weights()
+                bucket.invalidate_full_parameters()
+            if load_optimizer and bucket.requires_grad:
+                assert torch_optimizer is not None
+                initialized = loaded_bucket["state_initialized"].to_local()
+                step_present = loaded_bucket["step_present"].to_local()
+                steps = loaded_bucket["step"].to_local()
+                for state_name in ("exp_avg", "exp_avg_sq"):
+                    logical_state = loaded_bucket[state_name].full_tensor()
+                    _mfsdp_unpack_optimizer_tensor(
+                        bucket,
+                        torch_optimizer,
+                        logical_state,
+                        state_name,
+                        initialized,
+                        step_present,
+                        steps,
+                    )
+    return int(state_dict.get("step", 0))
 
 
 def _to_local_tensor(tensor: Any) -> torch.Tensor:
@@ -494,6 +941,11 @@ def _load_local_training_checkpoint(
         raise RuntimeError("Checkpoint model chunk count does not match target model.")
     for chunk, chunk_state in zip(chunks, chunk_states, strict=True):
         _load_chunk_tensor_state(chunk, chunk_state)
+        sync_full_parameters_to_shards = getattr(
+            chunk, "sync_full_parameters_to_shards", None
+        )
+        if callable(sync_full_parameters_to_shards):
+            sync_full_parameters_to_shards()
     if optimizer is not None and state.get("optimizer") is not None:
         optimizer.load_state_dict(state["optimizer"])
         parameter_state_name = state.get("optimizer_parameter_state")

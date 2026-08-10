@@ -432,6 +432,8 @@ def test_qwen35_export_maps_linear_attention_to_hf_checkpoint_names() -> None:
         exported["model.language_model.layers.0.linear_attn.in_proj_qkv.weight"].shape[0]
         == qk_dim * 2 + v_dim
     )
+    qkv = exported["model.language_model.layers.0.linear_attn.in_proj_qkv.weight"]
+    assert qkv.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
     assert exported["model.language_model.layers.0.linear_attn.in_proj_z.weight"].shape[0] == v_dim
     assert (
         exported["model.language_model.layers.0.linear_attn.in_proj_b.weight"].shape[0]

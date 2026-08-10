@@ -257,6 +257,25 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
         )
         optimizer_backend = "dist_opt"
+    elif impl_cfg.optimizer == "mfsdp":
+        optimizer_backend = "mfsdp"
+
+        def _post_model_load_hook():
+            from megatron.lite.model.qwen3_moe.lite.model import TransformerLayer
+            from megatron.lite.primitive.optimizers.mfsdp import (
+                build_mfsdp_training_optimizer,
+            )
+
+            optimizer, finalize = build_mfsdp_training_optimizer(
+                chunks,
+                impl_cfg=impl_cfg,
+                ps=ps,
+                is_expert=is_expert_param,
+                fsdp_unit_modules=(TransformerLayer,),
+            )
+            return {"optimizer": optimizer, "finalize_grads": finalize}
+
+        post_model_load_hook = _post_model_load_hook
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 

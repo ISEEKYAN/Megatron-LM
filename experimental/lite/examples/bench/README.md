@@ -152,6 +152,69 @@ Compare `loss`, `grad_norm`, `avg_step_ms`, `tok_per_s`, peak memory, and
 `tflops_per_gpu` in the two JSON outputs. Benchmarks are performance evidence;
 they are not a replacement for precision tests.
 
+## Standalone M-FSDP
+
+The native Qwen3 MoE and Qwen3.5 implementations accept `mfsdp` as the
+optimizer selected through `impl_cfg_json`. For the memory-efficient MCore
+lifecycle without optimizer offload, keep optimizer state and parameter shards
+on GPU (`offload_fraction=0.0`) and use the storage-resize allocator path. Set
+the communication-unit budget explicitly from the workload's FSDP units.
+MCore's automatic rule is `max(1_000_000_000, 2 * average_unit_elements)`;
+an explicit value is workload tuning, not an upstream recommended default. The
+value below (`508559360` elements) is the largest full-parameter bucket in this
+exact truncated 8-layer/8-expert Qwen3.5 benchmark. It was validated for this
+layout and must be recomputed and revalidated for a different model layout:
+
+This standalone delivery rejects nonzero `offload_fraction`; optimizer offload
+is a separate implementation and validation path.
+
+```bash
+unset CUDA_DEVICE_MAX_CONNECTIONS
+unset PYTORCH_CUDA_ALLOC_CONF
+
+torchrun --standalone --nproc_per_node 8 \
+  experimental/lite/examples/bench/bench.py \
+  --backend mlite \
+  --hf-path /models/Qwen3.5-35B-A3B \
+  --model-name qwen3_5 \
+  --steps 20 \
+  --warmup 5 \
+  --seq-len 1024 \
+  --num-microbatches 4 \
+  --truncate-layers 8 \
+  --keep-experts 8 \
+  --disable-mtp \
+  --same-data-across-dp \
+  --impl-cfg-json '{"optimizer":"mfsdp","mount_vision_model":false,"calculate_per_token_loss":false}' \
+  --override-optimizer-json \
+    '{"offload_fraction":0.0,"fsdp_double_buffer":false,"megatron_fsdp_max_pool_double_buffer":false,"nccl_ub":false,"fsdp_manual_registration":false,"suggested_communication_unit_size":508559360,"gradient_accumulation_fusion":false,"megatron_fsdp_main_params_dtype":"fp32","megatron_fsdp_main_grads_dtype":"bf16","megatron_fsdp_grad_comm_dtype":"bf16"}' \
+  --output-json /tmp/qwen35_mfsdp_bench.json
+```
+
+The storage-resize path allocates each communication bucket only while its
+lifetime is active. NCCL user buffers, double buffering, and manual registration
+remain optional throughput-oriented MCore capabilities, but they retain a
+larger communication pool and therefore need a separate memory/performance
+validation before being enabled. FP32 main parameters remain the
+optimizer/checkpoint source of truth; BF16 main gradients and gradient
+communication follow the MCore precision-aware recipe and must still pass the
+workload's numerical-accuracy gate. The official Megatron-FSDP H100 and MoE
+recipes disable gradient-accumulation fusion, so the recommended command does
+so explicitly; set it to `true` only when separately validating MCore's
+zero-copy fused-wgrad path for the target model and runtime.
+The standalone FusedAdam path uses TransformerEngine's decoupled-gradient
+interface, matching MCore: the BF16 reduced gradient shard is consumed directly
+without allocating an FP32 `param.grad` copy.
+
+For an FSDP2 comparison, keep the workload unchanged, select `fsdp2`, and
+enable FP32 parameter shards without changing other FSDP2-specific options:
+
+```bash
+--impl-cfg-json '{"optimizer":"fsdp2","mount_vision_model":false}' \
+--override-optimizer-json \
+  '{"fsdp2_use_fp32_shards":true,"offload_fraction":0.0}'
+```
+
 ## Deterministic Correctness
 
 Use `correctness.py` for strict deterministic parity. It emits exact scalar

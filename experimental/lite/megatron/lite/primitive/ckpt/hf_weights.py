@@ -1366,6 +1366,15 @@ def export_hf_weights(
     rank = dist.get_rank() if dist.is_initialized() else 0
     resolved_export_dtype = _resolve_export_dtype(export_dtype)
 
+    # A borrowed M-FSDP bucket can be copied directly to CPU before its stream
+    # advances, avoiding a second full-bucket GPU allocation. Device-side TP,
+    # ETP, EP, or PP collectives may retain or batch native tensors, so those
+    # topologies keep using the owning stream below.
+    can_copy_borrowed_to_cpu = cpu and all(
+        getattr(ps, size_name, 1) <= 1
+        for size_name in ("tp_size", "etp_size", "ep_size", "pp_size")
+    )
+
     def _iter_native_tensors():
         """Yield parameters plus persistent buffers present in the HF load plan."""
         for chunk in chunks:
@@ -1379,9 +1388,29 @@ def export_hf_weights(
                 if hasattr(base_chunk, "layer_indices")
                 else {}
             )
-            for name, param in base_chunk.named_parameters():
+            stream_full_parameters = getattr(chunk, "stream_full_parameters", None)
+            stream_borrowed_full_parameters = getattr(
+                chunk, "stream_borrowed_full_parameters", None
+            )
+            using_borrowed_stream = can_copy_borrowed_to_cpu and callable(
+                stream_borrowed_full_parameters
+            )
+            if using_borrowed_stream:
+                named_parameters = stream_borrowed_full_parameters()
+            elif callable(stream_full_parameters):
+                named_parameters = stream_full_parameters()
+            else:
+                named_parameters = base_chunk.named_parameters()
+            for name, param in named_parameters:
                 logical_name = canonical_state_key(name)
-                yield to_global_layer_name(logical_name, layer_map), param.data.detach()
+                tensor = param.data.detach()
+                if using_borrowed_stream:
+                    # The next() call releases/reuses the backing gather bucket.
+                    # Make the CPU result independently owned while this lease
+                    # is still live. ``copy=True`` also preserves this contract
+                    # for CPU-only tests and CPU-resident model parameters.
+                    tensor = tensor.to(device="cpu", copy=True)
+                yield to_global_layer_name(logical_name, layer_map), tensor
             persistent_buffers = [
                 (name, buffer)
                 for name, buffer in base_chunk.named_buffers()

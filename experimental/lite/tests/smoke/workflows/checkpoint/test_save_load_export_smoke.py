@@ -330,6 +330,10 @@ _TP1_ONLY = {"glm5", "deepseek_v4"}
 
 
 def _topology(model_name: str, backend: str) -> ParallelConfig:
+    if backend == "mfsdp":
+        # Exercise the production acceptance topology: one outer Qwen layer
+        # unit per bucket, sharded across all eight data-parallel ranks.
+        return ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=1)
     if backend == "fsdp2":
         # fsdp2 + pp2: FSDP2 shards over dp(=4) within each of 2 pipeline stages,
         # so save/load is exercised with pipeline parallelism (not just pure DP).
@@ -387,11 +391,15 @@ def _build_handle(
     bundle = protocol.build_model(cfg, impl_cfg=impl_cfg)
     chunks = bundle.chunks
 
-    if bundle.extras.get("optimizer_backend") == "fsdp2":
+    optimizer_backend = bundle.extras.get("optimizer_backend")
+    finalize_grads = bundle.finalize_grads
+    if optimizer_backend in ("fsdp2", "mfsdp"):
         for chunk in chunks:
             if hasattr(chunk, "initialize_weights"):
                 chunk.initialize_weights()
-        optimizer = bundle.extras["post_model_load_hook"]()["optimizer"]
+        built = bundle.extras["post_model_load_hook"]()
+        optimizer = built["optimizer"]
+        finalize_grads = built.get("finalize_grads", finalize_grads)
     else:
         optimizer = bundle.optimizer
         _BUILT_PARALLEL_STATES.append(bundle.parallel_state)
@@ -401,7 +409,7 @@ def _build_handle(
         {
             "model_chunks": chunks,
             "forward_step": bundle.forward_step,
-            "finalize_grads": bundle.finalize_grads,
+            "finalize_grads": finalize_grads,
             "protocol": protocol,
         }
     )
@@ -592,6 +600,24 @@ def test_save_load_roundtrip(model_name, backend, tmp_path):
     _assert_params_bitwise_equal(saved, loaded)
 
 
+def test_qwen3_5_mfsdp_save_load_roundtrip(tmp_path):
+    """M-FSDP DCP restores a fresh DP8 model bit-exactly."""
+    if dist.get_world_size() != 8:
+        pytest.skip("M-FSDP save/load smoke requires exactly 8 GPUs.")
+
+    set_deterministic(2026)
+    saved, cfg, _protocol = _build_handle("qwen3_5", "mfsdp", seed=4242)
+    _train_step(saved, "mfsdp", cfg)
+
+    ckpt_dir = _shared_tmp_path(tmp_path, "mfsdp_ckpt")
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime.save_checkpoint(saved, ckpt_dir, step=1)
+
+    loaded, _cfg2, _proto2 = _build_handle("qwen3_5", "mfsdp", seed=9999)
+    assert runtime.load_checkpoint(loaded, ckpt_dir) == 1
+    _assert_params_bitwise_equal(saved, loaded)
+
+
 @pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 @pytest.mark.parametrize("model_name", list(MODELS))
 def test_export_hf_bf16_reload(model_name, tmp_path):
@@ -613,6 +639,19 @@ def test_export_hf_bf16_reload(model_name, tmp_path):
 
     export_dir = _shared_tmp_path(tmp_path, "hf_export")
     _export_and_reload(handle, cfg, protocol, export_dir, model_name)
+
+
+def test_qwen3_5_mfsdp_export_hf_bf16_reload(tmp_path):
+    """Live M-FSDP bounded export writes complete reloadable HF shards."""
+    if dist.get_world_size() != 8:
+        pytest.skip("M-FSDP HF export smoke requires exactly 8 GPUs.")
+
+    set_deterministic(2026)
+    handle, cfg, protocol = _build_handle("qwen3_5", "mfsdp", seed=4242)
+    _train_step(handle, "mfsdp", cfg)
+
+    export_dir = _shared_tmp_path(tmp_path, "mfsdp_hf_export")
+    _export_and_reload(handle, cfg, protocol, export_dir, "qwen3_5")
 
 
 # ──────────────────────────────────────────────────────────────────────────
