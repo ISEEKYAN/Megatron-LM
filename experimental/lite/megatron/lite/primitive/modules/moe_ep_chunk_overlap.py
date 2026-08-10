@@ -240,6 +240,14 @@ _NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS = {
     "fc1_dgrad": "fc2_dgrad",
 }
 
+# Forward runs under no-grad. Experts finishes the FC1/SwiGLU allocation scope
+# before FC2 starts, and FC2 reads only h, so its output may overwrite the
+# now-dead FC1 input. Requires-grad paths deliberately do not use this mapping.
+_FORWARD_EXPERT_ACTIVATION_STORAGE_SLOTS = {
+    **_NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS,
+    "fc2_output": "fc1_input",
+}
+
 # Fused backward enqueues overlapping FC2 Wgrad on the current stream before
 # writing FC2 dgrad, then writes FC1 dgrad after SwiGLU consumes it. Same-stream
 # ordering makes the overwrite safe without a CUDA synchronize and permits all
@@ -878,11 +886,12 @@ class EPChunkWorkspace:
         event before this method can be called.
         """
         requested = tuple(int(dim) for dim in shape)
-        storage_slots = (
-            _FUSED_EXPERT_ACTIVATION_STORAGE_SLOTS
-            if self.key.op == "fused_forward_backward"
-            else _NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS
-        )
+        if self.key.op == "forward":
+            storage_slots = _FORWARD_EXPERT_ACTIVATION_STORAGE_SLOTS
+        elif self.key.op == "fused_forward_backward":
+            storage_slots = _FUSED_EXPERT_ACTIVATION_STORAGE_SLOTS
+        else:
+            storage_slots = _NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS
         return self._expert_activation_owner.tensor(
             name,
             requested,

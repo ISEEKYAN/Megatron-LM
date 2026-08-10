@@ -1114,14 +1114,15 @@ def test_multilayer_microbatch_probe_separates_owner_lifetime_from_slot_growth(
                 if entry["op"] == workspace.key.op
             ]
             assert len(set(activation_ptrs[4:])) == 1
-    for name in ("fc1_input", "fc1_output", "fc2_output"):
-        assert len(
-            {
-                entry["activation_ptrs"][name]
-                for entry in trace
-                if entry["microbatch"] >= 2
-            }
-        ) == 1
+    # The forward-only FC2 output reuses FC1-input raw storage; backward and
+    # fused retain their own lifetimes, so same-named logical tensors need not
+    # share one pointer across OPs.
+    forward_trace = [entry for entry in trace if entry["op"] == "forward"]
+    assert all(
+        entry["activation_ptrs"]["fc1_input"]
+        == entry["activation_ptrs"]["fc2_output"]
+        for entry in forward_trace
+    )
     coordinator = workspaces["forward"]._expert_activation_owner.coordinator
     assert coordinator.max_requested_bytes == {
         "fc1_input": 144,
@@ -1193,16 +1194,16 @@ def test_each_op_reuses_its_own_large_activation_names_across_layers(
         ).data_ptr()
         for name in names
     }
-    # FC2 output remains live through delayed FC2 Wgrad.  Only its dgrad and
-    # the later FC1 dgrad can share a physical slot after SwiGLU consumes it.
+    # No-grad forward recycles FC1 input for FC2 output, while preserving the
+    # normal dgrad alias.  It therefore owns three physical slots.
+    assert first_ptrs["fc1_input"] == first_ptrs["fc2_output"]
     assert first_ptrs["fc1_dgrad"] == first_ptrs["fc2_dgrad"]
     assert first_ptrs["fc2_output"] != first_ptrs["fc2_dgrad"]
-    assert len(set(first_ptrs.values())) == 4
+    assert len(set(first_ptrs.values())) == 3
     owner = forward._expert_activation_owner
     assert set(owner.arena.tensors) == {
         "fc1_input",
         "fc1_output",
-        "fc2_output",
         "fc2_dgrad",
     }
     pending = _FakeEvent(ready=False)
@@ -1220,7 +1221,7 @@ def test_each_op_reuses_its_own_large_activation_names_across_layers(
     # physical base addresses after the forward lease's consumer event.
     assert second_ptrs["fc1_input"] == first_ptrs["fc1_input"]
     assert second_ptrs["fc1_output"] == first_ptrs["fc1_output"]
-    assert second_ptrs["fc2_output"] == first_ptrs["fc2_output"]
+    assert second_ptrs["fc2_output"] != first_ptrs["fc2_output"]
     assert second_ptrs["fc2_dgrad"] == second_ptrs["fc2_output"]
     assert second_ptrs["fc1_dgrad"] == second_ptrs["fc2_output"]
     assert forward._expert_activation_owner.grows == 0
@@ -1519,10 +1520,10 @@ def test_delayed_fc2_wgrad_reads_output_before_safe_dgrad_slot_reuse(
     lease.release(_FakeEvent(ready=True))
 
 
-def test_fused_only_uses_three_slots_while_normal_keeps_fc2_output_separate(
+def test_forward_reuses_fc1_input_only_while_backward_and_fused_keep_their_contracts(
     transformer_engine_import_stub,
 ):
-    """Only fused mode may rely on immediate Wgrad before the FC2 dgrad write."""
+    """Only no-grad forward may recycle its dead FC1-input raw storage for FC2."""
     (
         _chunk_count,
         _forward_op,
@@ -1550,6 +1551,19 @@ def test_fused_only_uses_three_slots_while_normal_keeps_fc2_output_separate(
         )
 
     names = ("fc1_input", "fc1_output", "fc2_output", "fc2_dgrad", "fc1_dgrad")
+    forward = workspace("forward")
+    forward_lease = forward.acquire_expert_activation()
+    forward_ptrs = {
+        name: forward_lease.tensor(
+            name, (2, 2), dtype=torch.float32, device="cpu"
+        ).data_ptr()
+        for name in names
+    }
+    assert forward_ptrs["fc1_input"] == forward_ptrs["fc2_output"]
+    assert forward_ptrs["fc2_output"] != forward_ptrs["fc2_dgrad"]
+    assert forward_ptrs["fc2_dgrad"] == forward_ptrs["fc1_dgrad"]
+    forward_lease.release(_FakeEvent(ready=True))
+
     fused = workspace("fused_forward_backward")
     fused_lease = fused.acquire_expert_activation()
     fused_ptrs = {
@@ -1560,6 +1574,7 @@ def test_fused_only_uses_three_slots_while_normal_keeps_fc2_output_separate(
     }
     assert fused_ptrs["fc2_output"] == fused_ptrs["fc2_dgrad"]
     assert fused_ptrs["fc2_dgrad"] == fused_ptrs["fc1_dgrad"]
+    assert fused_ptrs["fc1_input"] != fused_ptrs["fc2_output"]
     assert len(set(fused_ptrs.values())) == 3
     fused_lease.release(_FakeEvent(ready=True))
 
@@ -1573,6 +1588,7 @@ def test_fused_only_uses_three_slots_while_normal_keeps_fc2_output_separate(
     }
     assert normal_ptrs["fc2_output"] != normal_ptrs["fc2_dgrad"]
     assert normal_ptrs["fc2_dgrad"] == normal_ptrs["fc1_dgrad"]
+    assert normal_ptrs["fc1_input"] != normal_ptrs["fc2_output"]
     normal_lease.release(_FakeEvent(ready=True))
 
 
