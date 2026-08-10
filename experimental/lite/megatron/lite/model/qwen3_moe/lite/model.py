@@ -76,6 +76,15 @@ class _Qwen3TransformerLayerFullRecomputeFunction(torch.autograd.Function):
                 "Qwen3 full-recompute position_ids must not require gradients"
             )
         ctx.param_ids = tuple(id(param) for param in params)
+        ctx.cpu_rng_state = torch.get_rng_state()
+        ctx.cuda_device = (
+            x.device if x.is_cuda and torch.cuda.is_initialized() else None
+        )
+        ctx.cuda_rng_state = (
+            torch.cuda.get_rng_state(ctx.cuda_device)
+            if ctx.cuda_device is not None
+            else None
+        )
         del params
         ctx.layer = layer
         ctx.position_ids = position_ids
@@ -104,26 +113,42 @@ class _Qwen3TransformerLayerFullRecomputeFunction(torch.autograd.Function):
             )
         ):
             raise RuntimeError("Qwen3 full-recompute parameter order changed")
-        with torch.enable_grad():
-            attention_out = layer.attn(
-                x,
-                position_ids=ctx.position_ids,
-                packed_seq_params=ctx.packed_seq_params,
-            )
-            residual = x + attention_out
-            norm_out = layer.mlp_norm(residual)
-            assert layer.moe.ep_chunk_fused is not None
-            grad_norm, router_grads, expert_grads = (
-                layer.moe.ep_chunk_fused.forward_backward(norm_out, grad_output)
-            )
-            differentiable = (x, *attention_params, *norm_params)
-            required = tuple(value for value in differentiable if value.requires_grad)
-            required_grads = torch.autograd.grad(
-                (norm_out, residual),
-                required,
-                (grad_norm, grad_output),
-                allow_unused=True,
-            )
+        current_cpu_rng_state = torch.get_rng_state()
+        current_cuda_rng_state = (
+            torch.cuda.get_rng_state(ctx.cuda_device)
+            if ctx.cuda_device is not None
+            else None
+        )
+        try:
+            torch.set_rng_state(ctx.cpu_rng_state)
+            if ctx.cuda_rng_state is not None:
+                torch.cuda.set_rng_state(ctx.cuda_rng_state, ctx.cuda_device)
+            with torch.enable_grad():
+                attention_out = layer.attn(
+                    x,
+                    position_ids=ctx.position_ids,
+                    packed_seq_params=ctx.packed_seq_params,
+                )
+                residual = x + attention_out
+                norm_out = layer.mlp_norm(residual)
+                assert layer.moe.ep_chunk_fused is not None
+                grad_norm, router_grads, expert_grads = (
+                    layer.moe.ep_chunk_fused.forward_backward(norm_out, grad_output)
+                )
+                differentiable = (x, *attention_params, *norm_params)
+                required = tuple(
+                    value for value in differentiable if value.requires_grad
+                )
+                required_grads = torch.autograd.grad(
+                    (norm_out, residual),
+                    required,
+                    (grad_norm, grad_output),
+                    allow_unused=True,
+                )
+        finally:
+            torch.set_rng_state(current_cpu_rng_state)
+            if current_cuda_rng_state is not None:
+                torch.cuda.set_rng_state(current_cuda_rng_state, ctx.cuda_device)
 
         grads_by_id = {
             id(value): grad

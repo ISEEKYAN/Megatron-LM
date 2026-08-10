@@ -802,6 +802,78 @@ def test_qwen3_full_layer_recompute_rejects_differentiable_position_ids(
         )
 
 
+def test_qwen3_full_layer_recompute_restores_rng_for_dropout_replay(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite.model import (
+        _Qwen3TransformerLayerFullRecomputeFunction,
+    )
+
+    samples = []
+
+    class RandomAttention(torch.nn.Module):
+        def forward(self, value, **_kwargs):
+            sample = torch.rand_like(value)
+            samples.append(sample)
+            return value + sample
+
+    class IdentityScale(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, value):
+            return value * self.scale
+
+    class Forward:
+        def __call__(self, value):
+            return value
+
+    class Fused:
+        def forward_backward(self, _value, grad_output):
+            return grad_output, [], []
+
+    class Layer:
+        def __init__(self):
+            self.attn = RandomAttention()
+            self.mlp_norm = IdentityScale()
+            self.moe = SimpleNamespace(
+                router=torch.nn.Identity(),
+                experts=torch.nn.Identity(),
+                ep_chunk_forward=Forward(),
+                ep_chunk_fused=Fused(),
+            )
+
+        def _ep_chunk_full_recompute_forward(self, value, **_kwargs):
+            residual = value + self.attn(value)
+            return residual + self.moe.ep_chunk_forward(self.mlp_norm(residual))
+
+    layer = Layer()
+    value = torch.ones(2, 2, requires_grad=True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_rng_state",
+        lambda *_args, **_kwargs: pytest.fail(
+            "CPU recompute must not initialize CUDA RNG"
+        ),
+    )
+    torch.manual_seed(20260810)
+    expected_sample = torch.rand_like(value)
+    expected_after = torch.get_rng_state()
+    torch.manual_seed(20260810)
+
+    output = _Qwen3TransformerLayerFullRecomputeFunction.apply(
+        value, None, None, layer, *layer.mlp_norm.parameters()
+    )
+    output.sum().backward()
+
+    assert len(samples) == 2
+    torch.testing.assert_close(samples[0], expected_sample)
+    torch.testing.assert_close(samples[1], expected_sample)
+    assert torch.equal(torch.get_rng_state(), expected_after)
+
+
 def test_qwen3_chunked_ep_fails_loud_without_deepep_or_ep(
     transformer_engine_import_stub,
 ):
