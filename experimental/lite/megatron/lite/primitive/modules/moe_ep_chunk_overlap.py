@@ -259,7 +259,19 @@ def _expert_activation_capacity_bytes(requested_bytes: int) -> int:
 
 @dataclass(frozen=True)
 class _EPChunkExpertActivationKey:
-    """Physical activation ownership deliberately excludes the logical op."""
+    """Physical activation ownership is shared across layers of one EP op."""
+
+    op: EPChunkOpName
+    device_type: str
+    device_index: int | None
+    ep_group_id: int
+    dtype: torch.dtype
+    shape_profile: EPChunkShapeProfile
+
+
+@dataclass(frozen=True)
+class _EPChunkExpertActivationArenaKey:
+    """Physical storage compatibility deliberately excludes the logical op."""
 
     device_type: str
     device_index: int | None
@@ -269,17 +281,21 @@ class _EPChunkExpertActivationKey:
 
 
 @dataclass
-class _EPChunkSharedExpertActivationOwner:
-    key: _EPChunkExpertActivationKey
+class _EPChunkExpertActivationArenaCoordinator:
+    key: _EPChunkExpertActivationArenaKey
     arena: _EPChunkAllocationArena = field(default_factory=_EPChunkAllocationArena)
-    in_use: bool = False
+    claimed_op: EPChunkOpName | None = None
     consumer_event: Any | None = None
     waits: int = 0
     allocations: int = 0
     grows: int = 0
     issued_storage_slots: set[str] = field(default_factory=set)
+    max_requested_bytes: dict[str, int] = field(default_factory=dict)
+    capacity_bytes: dict[str, int] = field(default_factory=dict)
 
-    def acquire(self, *, stream: Any | None, device: torch.device) -> None:
+    def acquire(
+        self, *, op: EPChunkOpName, stream: Any | None, device: torch.device
+    ) -> None:
         if self.arena.device is None:
             # A strong reference to each caller-owned tensor is sufficient to
             # stabilize its address after warmup.  Do not place persistent
@@ -287,8 +303,11 @@ class _EPChunkSharedExpertActivationOwner:
             # slots own custom pools, avoiding cross-pool nesting and extra
             # allocator residency.
             self.arena.device = device
-        if self.in_use:
-            raise RuntimeError("EP chunk expert activation arena is already leased")
+        if self.claimed_op is not None:
+            raise RuntimeError(
+                "EP chunk expert activation coordinator is already claimed by "
+                f"{self.claimed_op}"
+            )
         event = self.consumer_event
         if event is not None and not (
             bool(event.query()) if hasattr(event, "query") else False
@@ -303,12 +322,14 @@ class _EPChunkSharedExpertActivationOwner:
                 )
             self.waits += 1
         self.consumer_event = None
-        self.in_use = True
+        self.claimed_op = op
         self.issued_storage_slots.clear()
 
-    def release(self, event: Any) -> None:
+    def release(self, *, op: EPChunkOpName, event: Any) -> None:
+        if self.claimed_op != op:
+            raise RuntimeError("EP chunk expert activation coordinator release lost owner")
         self.consumer_event = event
-        self.in_use = False
+        self.claimed_op = None
 
     def tensor(
         self,
@@ -345,6 +366,9 @@ class _EPChunkSharedExpertActivationOwner:
             requested_numel *= dim
         element_size = int(torch.empty((), dtype=dtype).element_size())
         requested_bytes = requested_numel * element_size
+        self.max_requested_bytes[storage_name] = max(
+            self.max_requested_bytes.get(storage_name, 0), requested_bytes
+        )
         incompatible = existing is not None and (
             existing.dtype != dtype or existing.device != torch.device(device)
         )
@@ -369,8 +393,65 @@ class _EPChunkSharedExpertActivationOwner:
             self.arena.tensors[storage_name] = existing
             self.allocations += 1
             self.grows += int(growing)
+            self.capacity_bytes[storage_name] = capacity_bytes
         self.issued_storage_slots.add(storage_name)
         return existing.narrow(0, 0, requested_numel).view(requested).detach()
+
+
+@dataclass
+class _EPChunkLogicalExpertActivationOwner:
+    """Per-OP lease identity layered over one profile-compatible arena."""
+
+    key: _EPChunkExpertActivationKey
+    coordinator: _EPChunkExpertActivationArenaCoordinator
+    in_use: bool = False
+    waits: int = 0
+    allocations: int = 0
+    grows: int = 0
+
+    @property
+    def arena(self) -> _EPChunkAllocationArena:
+        return self.coordinator.arena
+
+    @property
+    def consumer_event(self) -> Any | None:
+        return self.coordinator.consumer_event
+
+    def acquire(self, *, stream: Any | None, device: torch.device) -> None:
+        if self.in_use:
+            raise RuntimeError("EP chunk expert activation arena is already leased")
+        waits_before = self.coordinator.waits
+        self.coordinator.acquire(op=self.key.op, stream=stream, device=device)
+        self.waits += self.coordinator.waits - waits_before
+        self.in_use = True
+
+    def release(self, event: Any) -> None:
+        if not self.in_use:
+            raise RuntimeError("EP chunk expert activation arena is not leased")
+        self.coordinator.release(op=self.key.op, event=event)
+        self.in_use = False
+
+    def tensor(
+        self,
+        name: str,
+        shape: tuple[int, ...] | torch.Size,
+        *,
+        dtype: torch.dtype,
+        device: torch.device | str,
+        storage_name: str | None = None,
+    ) -> torch.Tensor:
+        allocations_before = self.coordinator.allocations
+        grows_before = self.coordinator.grows
+        tensor = self.coordinator.tensor(
+            name,
+            shape,
+            dtype=dtype,
+            device=device,
+            storage_name=storage_name,
+        )
+        self.allocations += self.coordinator.allocations - allocations_before
+        self.grows += self.coordinator.grows - grows_before
+        return tensor
 
 
 class _EPChunkExpertActivationLease:
@@ -495,14 +576,25 @@ class EPChunkWorkspace:
         self._allocation_arenas = [
             _EPChunkAllocationArena() for _ in range(EP_CHUNK_COUNT)
         ]
-        self._expert_activation_owner = _EPChunkSharedExpertActivationOwner(
-            _EPChunkExpertActivationKey(
-                key.device_type,
-                key.device_index,
-                key.ep_group_id,
-                key.dtype,
-                key.shape_profile,
-            )
+        activation_key = _EPChunkExpertActivationKey(
+            key.op,
+            key.device_type,
+            key.device_index,
+            key.ep_group_id,
+            key.dtype,
+            key.shape_profile,
+        )
+        self._expert_activation_owner = _EPChunkLogicalExpertActivationOwner(
+            activation_key,
+            _EPChunkExpertActivationArenaCoordinator(
+                _EPChunkExpertActivationArenaKey(
+                    key.device_type,
+                    key.device_index,
+                    key.ep_group_id,
+                    key.dtype,
+                    key.shape_profile,
+                )
+            ),
         )
         self._allocations = 0
         self._runtime_allocations = 0
@@ -889,6 +981,7 @@ class EPChunkWorkspace:
                     "nbytes": tensor.numel() * tensor.element_size(),
                 }
         owner = self._expert_activation_owner
+        coordinator = owner.coordinator
         expert_activation_tensors = {
             name: {
                 "data_ptr": tensor.data_ptr(),
@@ -928,6 +1021,12 @@ class EPChunkWorkspace:
             "expert_activation_grows": owner.grows,
             "expert_activation_in_use": owner.in_use,
             "expert_activation_event_guarded": (owner.consumer_event is not None),
+            "expert_activation_arena_id": id(coordinator),
+            "expert_activation_arena_claimed_op": coordinator.claimed_op,
+            "expert_activation_max_requested_bytes": dict(
+                coordinator.max_requested_bytes
+            ),
+            "expert_activation_capacity_bytes": dict(coordinator.capacity_bytes),
             "expert_activation_tensors": expert_activation_tensors,
             "active_lease_count": sum(slot.in_use for slot in self._slots),
             "consumer_event_guard_count": sum(
@@ -992,7 +1091,10 @@ class EPChunkWorkspaceRegistry:
     def __init__(self):
         self._workspaces: dict[EPChunkWorkspaceKey, EPChunkWorkspace] = {}
         self._expert_activation_owners: dict[
-            _EPChunkExpertActivationKey, _EPChunkSharedExpertActivationOwner
+            _EPChunkExpertActivationKey, _EPChunkLogicalExpertActivationOwner
+        ] = {}
+        self._expert_activation_arenas: dict[
+            _EPChunkExpertActivationArenaKey, _EPChunkExpertActivationArenaCoordinator
         ] = {}
 
     def get_or_create(
@@ -1005,15 +1107,27 @@ class EPChunkWorkspaceRegistry:
             workspace = EPChunkWorkspace(key, dispatcher_factory)
             workspace._registry = self
             activation_key = _EPChunkExpertActivationKey(
+                key.op,
                 key.device_type,
                 key.device_index,
                 key.ep_group_id,
                 key.dtype,
                 key.shape_profile,
             )
+            arena_key = _EPChunkExpertActivationArenaKey(
+                key.device_type,
+                key.device_index,
+                key.ep_group_id,
+                key.dtype,
+                key.shape_profile,
+            )
+            coordinator = self._expert_activation_arenas.setdefault(
+                arena_key, _EPChunkExpertActivationArenaCoordinator(arena_key)
+            )
             workspace._expert_activation_owner = (
                 self._expert_activation_owners.setdefault(
-                    activation_key, _EPChunkSharedExpertActivationOwner(activation_key)
+                    activation_key,
+                    _EPChunkLogicalExpertActivationOwner(activation_key, coordinator),
                 )
             )
             self._workspaces[key] = workspace
@@ -1031,6 +1145,12 @@ class EPChunkWorkspaceRegistry:
             self._expert_activation_owners[activation_key] = workspace._expert_activation_owner
         elif current_owner is not workspace._expert_activation_owner:
             raise RuntimeError("Cannot rematerialize an EP chunk workspace with a replaced activation owner")
+        arena_key = workspace._expert_activation_owner.coordinator.key
+        current_arena = self._expert_activation_arenas.get(arena_key)
+        if current_arena is None:
+            self._expert_activation_arenas[arena_key] = workspace._expert_activation_owner.coordinator
+        elif current_arena is not workspace._expert_activation_owner.coordinator:
+            raise RuntimeError("Cannot rematerialize an EP chunk workspace with a replaced activation arena")
         self._workspaces[workspace.key] = workspace
 
     def release(
@@ -1052,24 +1172,31 @@ class EPChunkWorkspaceRegistry:
             for candidate in self._workspaces.values()
         ):
             owner = self._expert_activation_owners.pop(activation_key, None)
-            if owner is not None:
-                if owner.in_use:
+            if owner is not None and owner.in_use:
+                raise RuntimeError("Cannot release leased EP chunk expert activation owner")
+        coordinator = workspace._expert_activation_owner.coordinator
+        if not any(
+            candidate._expert_activation_owner.coordinator is coordinator
+            for candidate in self._workspaces.values()
+        ):
+            event = coordinator.consumer_event
+            if event is not None and not (
+                bool(event.query()) if hasattr(event, "query") else False
+            ):
+                if stream is None or not hasattr(stream, "wait_event"):
                     raise RuntimeError(
-                        "Cannot release leased EP chunk expert activation owner"
+                        "Cannot release EP chunk expert activation arena with pending event"
                     )
-                event = owner.consumer_event
-                if event is not None and not (
-                    bool(event.query()) if hasattr(event, "query") else False
-                ):
-                    if stream is None or not hasattr(stream, "wait_event"):
-                        raise RuntimeError(
-                            "Cannot release EP chunk expert activation owner with pending event"
-                        )
-                    stream.wait_event(event)
-                owner.consumer_event = None
-                owner.arena.tensors.clear()
-                owner.arena.allocation_pool = None
-                owner.arena.device = None
+                stream.wait_event(event)
+            if coordinator.claimed_op is not None:
+                raise RuntimeError("Cannot release leased EP chunk expert activation arena")
+            self._expert_activation_arenas.pop(coordinator.key, None)
+            coordinator.consumer_event = None
+            coordinator.arena.tensors.clear()
+            coordinator.arena.allocation_pool = None
+            coordinator.arena.device = None
+            coordinator.max_requested_bytes.clear()
+            coordinator.capacity_bytes.clear()
 
 
 _EP_CHUNK_WORKSPACES = EPChunkWorkspaceRegistry()
