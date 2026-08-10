@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,8 +17,6 @@ from megatron.lite.model.registry import (
     resolve_runtime_model_name,
 )
 from megatron.lite.runtime.contracts.config import ParallelConfig
-
-pytestmark = pytest.mark.mlite
 
 LITE_ROOT = Path(__file__).resolve().parents[3]
 
@@ -899,6 +898,42 @@ def test_qwen3_chunked_ep_fails_loud_without_deepep_or_ep(
                 enable_ep_chunk_overlap=True,
             ),
         )
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        (None, ("1", "1", "1")),
+        ("auto", ("1", "1", "1")),
+        ("flash", ("1", "0", "0")),
+        ("fused", ("0", "1", "0")),
+        ("unfused", ("0", "0", "1")),
+        ("local", ("0", "0", "1")),
+    ],
+)
+def test_qwen35_attention_backend_override_resets_te_environment(
+    transformer_engine_import_stub, monkeypatch, backend, expected
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_5.lite.model import _apply_attention_backend_override
+
+    for name in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"):
+        monkeypatch.setenv(name, "polluted")
+
+    _apply_attention_backend_override(backend)
+
+    assert tuple(
+        os.environ[name]
+        for name in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN")
+    ) == expected
+
+
+def test_qwen35_attention_backend_override_rejects_unknown_value(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_5.lite.model import _apply_attention_backend_override
+
+    with pytest.raises(ValueError, match="attention_backend_override"):
+        _apply_attention_backend_override("unknown")
 
 
 def test_qwen_lite_protocols_reexport_checkpoint_hook_names():

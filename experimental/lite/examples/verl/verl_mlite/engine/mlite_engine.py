@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import os
+import weakref
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any
@@ -923,6 +924,8 @@ class MegatronLiteEngine(BaseEngine):
         return output
 
     def _make_runtime_loss_fn(self, loss_function, num_microbatches: int, output_lst=None):
+        loss_fn_ref = None
+
         def _loss_fn(
             raw_output: dict[str, torch.Tensor],
             runtime_batch: PackedBatch,
@@ -951,8 +954,9 @@ class MegatronLiteEngine(BaseEngine):
                 )
 
             raw_output["_verl_metrics"] = metrics
+            assert loss_fn_ref is not None
             if output_lst is not None and not getattr(
-                _loss_fn, "runtime_collects_outputs", False
+                loss_fn_ref(), "runtime_collects_outputs", False
             ):
                 output_lst.append(
                     {
@@ -963,6 +967,8 @@ class MegatronLiteEngine(BaseEngine):
                 )
             return (loss * num_microbatches if loss_function is not None else loss), metrics
 
+        # Avoid a strong self-reference while preserving the runtime hook attributes.
+        loss_fn_ref = weakref.ref(_loss_fn)
         _loss_fn.runtime_output_collector = output_lst
         _loss_fn.runtime_output_extractor = lambda output: output["_verl_model_output"]
         # The static collector records ``loss`` before this hook applies the
