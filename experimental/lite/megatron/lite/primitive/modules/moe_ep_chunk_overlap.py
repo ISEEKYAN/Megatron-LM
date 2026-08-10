@@ -1069,7 +1069,6 @@ class EPChunkWorkspace:
             "materialized_device": (
                 None if self._bound_device is None else str(self._bound_device)
             ),
-            "caller_owned_recv_proven": False,
             "materialized": self._materialized,
         }
 

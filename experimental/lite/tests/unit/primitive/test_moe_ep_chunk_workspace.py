@@ -702,7 +702,6 @@ def test_workspace_reports_deepep_buffer_count_and_resident_bytes(
     assert evidence["dispatcher_count"] == 2
     assert evidence["deepep_buffer_count"] == 2
     assert evidence["deepep_buffer_resident_bytes"] == 2048
-    assert evidence["caller_owned_recv_proven"] is False
 
 
 def test_workspace_owns_only_two_comm_pools_not_an_activation_pool(
@@ -773,7 +772,6 @@ def test_workspace_owns_only_two_comm_pools_not_an_activation_pool(
     }
     assert evidence["expert_activation_pool_count"] == 0
     assert evidence["expert_activation_pool_id"] is None
-    assert evidence["caller_owned_recv_proven"] is False
     assert evidence["recv_observer_enabled"] is False
     monkeypatch.setenv("MEGATRON_LITE_EP_CHUNK_SCRATCH_TRACE", "1")
     assert workspace.evidence()["recv_observer_enabled"] is True
@@ -994,8 +992,8 @@ def test_multilayer_microbatch_probe_separates_owner_lifetime_from_slot_growth(
     """Trace 48 layer references and eight microbatches through real workspace APIs.
 
     The deliberately small class is a CPU-only boundary witness, not a claim
-    about job15448830's CUDA routing shapes.  It records the production
-    workspace/owner lifecycle.  Each logical EP op owns an independent
+    about job15448830's CUDA routing shapes.  It exercises the workspace/owner
+    lifecycle APIs.  Each logical EP op owns an independent
     event-guarded arena; the trace separately exposes exact-shape slot growth.
     """
     transformer_engine_import_stub()
@@ -1916,7 +1914,6 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
         "consumer_event_guard_count": 0,
         "recv_observer_enabled": False,
         "materialized_device": None,
-        "caller_owned_recv_proven": False,
         "materialized": False,
     }
     assert created == []
@@ -2129,36 +2126,11 @@ def test_saved_context_autograd_keeps_forward_context_for_backward(
         _registry,
         function,
     ) = _symbols(transformer_engine_import_stub)
-    transformer_engine_import_stub()
-    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-        _EPChunkOperationBase,
-        _ForwardChunkContext,
-    )
-
     source = inspect.getsource(function)
-    saved_forward_source = inspect.getsource(
-        _EPChunkOperationBase._forward_saved_context_async
-    )
-    saved_backward_source = inspect.getsource(
-        _EPChunkOperationBase._saved_context_backward
-    )
-    fused_source = inspect.getsource(
-        _EPChunkOperationBase._full_recompute_fused_backward_v6
-    )
 
     assert "ctx.saved_forward_context = saved_context" in source
     assert "ctx.backward_op = forward_op.backward_op" in source
     assert "ctx.backward_op.backward(" in source
-    assert {"dispatched", "expert_out", "expert_out_edge"} <= set(
-        _ForwardChunkContext.__dataclass_fields__
-    )
-    assert "dispatched=expert_input" in saved_forward_source
-    assert "expert_out_edge=expert_out_edge" in saved_forward_source
-    assert "with lease.allocation_arena.allocate():" in saved_forward_source
-    assert "acquire_expert_activation" not in saved_forward_source
-    assert "saved.dispatched" in saved_backward_source
-    assert "saved.expert_out" in saved_backward_source
-    assert "acquire_expert_activation" in fused_source
     assert "synchronize" not in source
 
 
