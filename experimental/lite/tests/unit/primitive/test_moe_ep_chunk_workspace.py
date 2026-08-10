@@ -1320,6 +1320,123 @@ def test_per_op_phase_handoff_keeps_one_physical_arena_until_final_release(
     assert not registry._expert_activation_arenas
 
 
+def test_all_caller_owned_activations_bound_rows_and_bind_logical_trailing_shape(
+    transformer_engine_import_stub,
+):
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    profile = profile_type(max_input_rows=4, hidden_size=2, topk=2, ep_size=2)
+    registry = registry_type()
+    workspace = registry.get_or_create(
+        key_type(
+            op="backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=4818,
+            dtype=torch.float32,
+            shape_profile=profile,
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    names = ("fc1_output", "fc2_output", "fc2_dgrad", "fc1_dgrad")
+    lease = workspace.acquire_expert_activation()
+    with pytest.raises(RuntimeError, match="Unknown EP chunk expert activation"):
+        lease.tensor("unknown", (1, 5), dtype=torch.float32, device="cpu")
+    with pytest.raises(RuntimeError, match="exceeds profile ceiling"):
+        lease.tensor(
+            "fc1_output",
+            (profile.max_expert_rows, 5, 1),
+            dtype=torch.float32,
+            device="cpu",
+        )
+    with pytest.raises(RuntimeError, match="exceeds profile ceiling"):
+        lease.tensor(
+            "fc1_output",
+            (profile.max_expert_rows, 5),
+            dtype=torch.float64,
+            device="cpu",
+        )
+    for name in names:
+        lease.tensor(
+            name,
+            (profile.max_expert_rows, 5),
+            dtype=torch.float32,
+            device="cpu",
+        )
+    for name in names:
+        with pytest.raises(RuntimeError, match="exceeds profile ceiling"):
+            lease.tensor(
+                name,
+                (profile.max_expert_rows + 1, 5),
+                dtype=torch.float32,
+                device="cpu",
+            )
+    with pytest.raises(RuntimeError, match="exceeds profile ceiling"):
+        lease.tensor(
+            "fc1_input",
+            (profile.max_expert_rows, profile.hidden_size + 1),
+            dtype=torch.float32,
+            device="cpu",
+        )
+    with pytest.raises(RuntimeError, match="exceeds profile ceiling"):
+        lease.tensor(
+            "fc1_input",
+            (profile.max_expert_rows + 1, profile.hidden_size),
+            dtype=torch.float32,
+            device="cpu",
+        )
+    lease.release(_FakeEvent(ready=True))
+
+    rebound = workspace.acquire_expert_activation()
+    with pytest.raises(RuntimeError, match="trailing shape"):
+        rebound.tensor(
+            "fc1_output",
+            (profile.max_expert_rows, 6),
+            dtype=torch.float32,
+            device="cpu",
+        )
+    rebound.release(_FakeEvent(ready=True))
+
+    fused = registry.get_or_create(
+        key_type(
+            op="fused_forward_backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=4819,
+            dtype=torch.float32,
+            shape_profile=profile,
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    fused_lease = fused.acquire_expert_activation()
+    fc2_output = fused_lease.tensor(
+        "fc2_output", (profile.max_expert_rows, 6), dtype=torch.float32, device="cpu"
+    )
+    fc2_dgrad = fused_lease.tensor(
+        "fc2_dgrad", (profile.max_expert_rows, 5), dtype=torch.float32, device="cpu"
+    )
+    fc1_dgrad = fused_lease.tensor(
+        "fc1_dgrad", (profile.max_expert_rows, 4), dtype=torch.float32, device="cpu"
+    )
+    assert fc2_output.data_ptr() == fc2_dgrad.data_ptr() == fc1_dgrad.data_ptr()
+    fused_lease.release(_FakeEvent(ready=True))
+
+    coordinator = workspace._expert_activation_owner.coordinator
+    registry.release(workspace.key)
+    assert not coordinator.logical_trailing_shapes
+    fused_coordinator = fused._expert_activation_owner.coordinator
+    registry.release(fused.key)
+    assert not fused_coordinator.logical_trailing_shapes
+
+
 def test_geometric_activation_growth_bounds_rising_48_layer_trace_and_stabilizes(
     monkeypatch, transformer_engine_import_stub
 ):
@@ -1395,7 +1512,19 @@ def test_geometric_activation_growth_bounds_rising_48_layer_trace_and_stabilizes
         )
         - 1
     ) * 3
-    assert coordinator.grows * 2 < linear_growths
+    initial_capacity = overlap._expert_activation_capacity_bytes(5 * 4 * 4)
+    maximum_capacity = overlap._expert_activation_capacity_bytes(
+        max(requested_rows) * 4 * 4
+    )
+    geometric_growth_bound = 0
+    geometric_capacity = initial_capacity
+    while geometric_capacity < maximum_capacity:
+        geometric_capacity = overlap._expert_activation_capacity_bytes(
+            geometric_capacity * 3 // 2
+        )
+        geometric_growth_bound += 1
+    assert coordinator.grows <= geometric_growth_bound * 3
+    assert coordinator.grows < linear_growths
     assert all(
         grown >= previous * 3 // 2
         for _requested, previous, grown in growth_calls
@@ -2000,11 +2129,36 @@ def test_saved_context_autograd_keeps_forward_context_for_backward(
         _registry,
         function,
     ) = _symbols(transformer_engine_import_stub)
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+        _ForwardChunkContext,
+    )
+
     source = inspect.getsource(function)
+    saved_forward_source = inspect.getsource(
+        _EPChunkOperationBase._forward_saved_context_async
+    )
+    saved_backward_source = inspect.getsource(
+        _EPChunkOperationBase._saved_context_backward
+    )
+    fused_source = inspect.getsource(
+        _EPChunkOperationBase._full_recompute_fused_backward_v6
+    )
 
     assert "ctx.saved_forward_context = saved_context" in source
     assert "ctx.backward_op = forward_op.backward_op" in source
     assert "ctx.backward_op.backward(" in source
+    assert {"dispatched", "expert_out", "expert_out_edge"} <= set(
+        _ForwardChunkContext.__dataclass_fields__
+    )
+    assert "dispatched=expert_input" in saved_forward_source
+    assert "expert_out_edge=expert_out_edge" in saved_forward_source
+    assert "with lease.allocation_arena.allocate():" in saved_forward_source
+    assert "acquire_expert_activation" not in saved_forward_source
+    assert "saved.dispatched" in saved_backward_source
+    assert "saved.expert_out" in saved_backward_source
+    assert "acquire_expert_activation" in fused_source
     assert "synchronize" not in source
 
 

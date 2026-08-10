@@ -231,6 +231,9 @@ class _EPChunkAllocationArena:
 _EXPERT_ACTIVATION_SIZE_CLASS_BYTES = 8 * 1024 * 1024
 _EXPERT_ACTIVATION_GROWTH_NUMERATOR = 3
 _EXPERT_ACTIVATION_GROWTH_DENOMINATOR = 2
+_EXPERT_ACTIVATION_LOGICAL_NAMES = frozenset(
+    {"fc1_input", "fc1_output", "fc2_output", "fc1_dgrad", "fc2_dgrad"}
+)
 
 # Normal saved-context backward keeps FC2 output separate because its delayed
 # FC2 Wgrad remains deferred. FC2 dgrad is consumed by SwiGLU before FC1 dgrad
@@ -308,6 +311,7 @@ class _EPChunkExpertActivationArenaCoordinator:
     issued_storage_slots: set[str] = field(default_factory=set)
     max_requested_bytes: dict[str, int] = field(default_factory=dict)
     capacity_bytes: dict[str, int] = field(default_factory=dict)
+    logical_trailing_shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
 
     def acquire(
         self, *, op: EPChunkOpName, stream: Any | None, device: torch.device
@@ -357,26 +361,37 @@ class _EPChunkExpertActivationArenaCoordinator:
         storage_name: str | None = None,
     ) -> torch.Tensor:
         requested = tuple(int(dim) for dim in shape)
+        if name not in _EXPERT_ACTIVATION_LOGICAL_NAMES:
+            raise RuntimeError(f"Unknown EP chunk expert activation {name!r}")
         profile = self.key.shape_profile
-        contract = {
-            "fc1_input": (
-                (profile.max_expert_rows, profile.hidden_size),
-                self.key.dtype,
-            )
-        }.get(name)
-        ceiling, expected_dtype = (requested, dtype) if contract is None else contract
+        ceiling = (
+            (profile.max_expert_rows, profile.hidden_size)
+            if name == "fc1_input"
+            else (profile.max_expert_rows, *requested[1:])
+        )
         if (
             not requested
             or any(dim < 0 for dim in requested)
-            or len(requested) != len(ceiling)
-            or any(want > limit for want, limit in zip(requested, ceiling, strict=True))
-            or requested[1:] != ceiling[1:]
-            or dtype != expected_dtype
+            or len(requested) != 2
+            or requested[0] > profile.max_expert_rows
+            or dtype != self.key.dtype
+            or (name == "fc1_input" and requested[1:] != ceiling[1:])
         ):
             raise RuntimeError(
-                f"EP chunk expert activation {name!r} shape {requested} dtype {dtype} exceeds profile ceiling {ceiling} dtype {expected_dtype}"
+                f"EP chunk expert activation {name!r} shape {requested} dtype {dtype} "
+                f"exceeds profile ceiling {ceiling} dtype {self.key.dtype}"
             )
         storage_name = name if storage_name is None else storage_name
+        trailing_shape = requested[1:]
+        previous_trailing_shape = self.logical_trailing_shapes.get(name)
+        if previous_trailing_shape is None:
+            self.logical_trailing_shapes[name] = trailing_shape
+        elif previous_trailing_shape != trailing_shape:
+            raise RuntimeError(
+                f"EP chunk expert activation {name!r} trailing shape {trailing_shape} "
+                f"does not match logical activation trailing shape "
+                f"{previous_trailing_shape}"
+            )
         existing = self.arena.tensors.get(storage_name)
         requested_numel = 1
         for dim in requested:
@@ -412,17 +427,16 @@ class _EPChunkExpertActivationArenaCoordinator:
             capacity_bytes = _expert_activation_growth_capacity_bytes(
                 requested_bytes, previous_capacity_bytes
             )
-            if contract is not None:
-                ceiling_numel = 1
-                for dim in ceiling:
-                    ceiling_numel *= dim
-                ceiling_capacity_bytes = _expert_activation_capacity_bytes(
-                    ceiling_numel * element_size
-                )
-                capacity_bytes = max(
-                    requested_capacity_bytes,
-                    min(capacity_bytes, ceiling_capacity_bytes),
-                )
+            ceiling_numel = 1
+            for dim in ceiling:
+                ceiling_numel *= dim
+            ceiling_capacity_bytes = _expert_activation_capacity_bytes(
+                ceiling_numel * element_size
+            )
+            capacity_bytes = max(
+                requested_capacity_bytes,
+                min(capacity_bytes, ceiling_capacity_bytes),
+            )
             capacity_numel = (capacity_bytes + element_size - 1) // element_size
             with self.arena.allocate():
                 existing = torch.empty((capacity_numel,), dtype=dtype, device=device)
@@ -884,26 +898,6 @@ class EPChunkWorkspace:
         event before this method can be called.
         """
         requested = tuple(int(dim) for dim in shape)
-        profile = self.key.shape_profile
-        contracts = {
-            "fc1_input": (
-                (profile.max_expert_rows, profile.hidden_size),
-                self.key.dtype,
-            ),
-        }
-        ceiling, expected_dtype = contracts.get(name, (requested, dtype))
-        if (
-            not requested
-            or any(dim < 0 for dim in requested)
-            or len(requested) != len(ceiling)
-            or any(want > limit for want, limit in zip(requested, ceiling, strict=True))
-            or requested[1:] != ceiling[1:]
-            or dtype != expected_dtype
-        ):
-            raise RuntimeError(
-                f"EP chunk expert activation {name!r} shape {requested} dtype {dtype} "
-                f"exceeds profile ceiling {ceiling} dtype {expected_dtype}"
-            )
         storage_slots = (
             _FUSED_EXPERT_ACTIVATION_STORAGE_SLOTS
             if self.key.op == "fused_forward_backward"
@@ -1233,6 +1227,7 @@ class EPChunkWorkspaceRegistry:
             coordinator.arena.device = None
             coordinator.max_requested_bytes.clear()
             coordinator.capacity_bytes.clear()
+            coordinator.logical_trailing_shapes.clear()
 
 
 _EP_CHUNK_WORKSPACES = EPChunkWorkspaceRegistry()
