@@ -172,10 +172,16 @@ def test_activation_pool_parks_between_ops_at_observed_high_watermark(
     pool = coordinator.arena.allocation_pool
     assert coordinator.arena.tensors
     assert coordinator.rehydrates == 0
-    registry.park(backward.key, stream=stream)
+    scratch_lease = backward.acquire(0, require_dispatcher=False)
+    scratch_lease.tensor(
+        "grad_expert_out", (3, 4), dtype=torch.float32, device="cpu"
+    )
+    scratch_lease.release(_FakeEvent(ready=True))
+    backward.reset_tensors(stream=stream)
     assert stream.waited == [pending]
     assert coordinator.arena.tensors == {}
     assert coordinator.parks == 1
+    assert backward.evidence()["data_ptrs"] == {}
 
     second = fused.acquire_expert_activation(stream=stream)
     smaller = {
@@ -601,6 +607,59 @@ def test_reset_tensors_waits_for_consumers_and_keeps_dispatchers(
     assert evidence["data_ptrs"] == {}
     assert evidence["tensor_details"] == {}
     assert tensor.shape == (9, 4)
+
+
+@pytest.mark.parametrize("failure", ["leased_slot", "pending_slot"])
+def test_reset_preflight_failure_preserves_activation_arena_atomically(
+    failure, transformer_engine_import_stub
+):
+    """A rejected reset must not park activation state before slot preflight passes."""
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=230,
+            dtype=torch.float32,
+            shape_profile=profile_type(
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=2
+            ),
+        ),
+        lambda slot: f"dispatcher-{slot}",
+    )
+    activation = workspace.acquire_expert_activation()
+    activation.tensor("fc1_input", (4, 4), dtype=torch.float32, device="cpu")
+    activation_event = _FakeEvent(ready=True)
+    activation.release(activation_event)
+    coordinator = workspace._expert_activation_owner.coordinator
+    tensors_before = dict(coordinator.arena.tensors)
+    counters_before = (coordinator.parks, coordinator.rehydrates)
+
+    slot = workspace.acquire(0, require_dispatcher=False)
+    if failure == "pending_slot":
+        slot.release(_FakeEvent(ready=False))
+        expected = "pending consumer event"
+    else:
+        expected = "slot 0 is leased"
+
+    with pytest.raises(RuntimeError, match=expected):
+        workspace.reset_tensors()
+
+    assert coordinator.arena.tensors == tensors_before
+    assert coordinator.consumer_event is activation_event
+    assert (coordinator.parks, coordinator.rehydrates) == counters_before
+    if failure == "leased_slot":
+        slot.release(_FakeEvent(ready=True))
 
 
 def test_workspace_evidence_reports_actual_scratch_shape_dtype_and_bytes(
@@ -1338,8 +1397,8 @@ def test_each_op_reuses_its_own_large_activation_names_across_layers(
     )
     assert isolated._expert_activation_owner is not forward._expert_activation_owner
     registry.release(forward.key, stream=stream)
-    assert fused._expert_activation_owner.arena.tensors
-    assert forward._expert_activation_owner.arena.tensors
+    assert not fused._expert_activation_owner.arena.tensors
+    assert not forward._expert_activation_owner.arena.tensors
     registry.release(fused.key)
     assert not fused._expert_activation_owner.arena.tensors
 
@@ -1397,14 +1456,15 @@ def test_per_op_phase_handoff_keeps_one_physical_arena_until_final_release(
     assert forward._expert_activation_owner.coordinator is fused._expert_activation_owner.coordinator
     coordinator = forward._expert_activation_owner.coordinator
     registry.release(forward.key, stream=stream)
-    assert coordinator.arena.tensors
-    assert fused._expert_activation_owner.arena.tensors
+    assert not coordinator.arena.tensors
+    assert not fused._expert_activation_owner.arena.tensors
     next_forward_lease = forward.acquire_expert_activation()
     next_forward_tensor = next_forward_lease.tensor(
         "fc1_input", (5, 4), dtype=torch.float32, device="cpu"
     )
     next_forward_lease.release(_FakeEvent(ready=True))
-    assert next_forward_tensor.data_ptr() == forward_tensor.data_ptr()
+    assert next_forward_tensor.data_ptr() != 0
+    assert coordinator.rehydrates == 1
     registry.release(forward.key)
     registry.release(fused.key)
     assert not coordinator.arena.tensors

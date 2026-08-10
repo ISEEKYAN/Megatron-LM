@@ -305,25 +305,30 @@ def test_qwen3_model_build_propagates_logical_chunk_count_to_decoder_and_mtp(
     } == {expected_chunk_count}
 
 
-def test_qwen3_moe_parks_through_the_public_workspace_key_api(monkeypatch):
-    """The composition layer must not inspect ChunkedEP primitive internals."""
+def test_qwen3_moe_resets_only_its_forward_workspace_phase():
+    """The composition layer uses its existing public forward reset boundary."""
     from megatron.lite.model.qwen3_moe.lite import model
 
+    resets = []
+
+    class Workspace:
+        def __init__(self, key):
+            self.key = key
+
+        def reset_tensors(self, *, stream=None):
+            resets.append((self.key, stream))
+
+    layer = object.__new__(model.MoELayer)
     forward_key = object()
     backward_key = object()
-    parked = []
-    layer = object.__new__(model.MoELayer)
-    layer.ep_chunk_forward = SimpleNamespace(workspace=SimpleNamespace(key=forward_key))
-    layer.ep_chunk_backward = SimpleNamespace(workspace=SimpleNamespace(key=backward_key))
+    layer.ep_chunk_forward = SimpleNamespace(workspace=Workspace(forward_key))
+    layer.ep_chunk_backward = SimpleNamespace(workspace=Workspace(backward_key))
     layer.ep_chunk_fused = None
-    monkeypatch.setattr(
-        model, "park_ep_chunk_workspace", lambda key, stream=None: parked.append((key, stream))
-    )
 
     stream = object()
-    layer.park_ep_chunk_activations(stream=stream)
+    layer.reset_ep_chunk_workspace_tensors(phase="forward", stream=stream)
 
-    assert parked == [(forward_key, stream)]
+    assert resets == [(forward_key, stream)]
 
 
 @pytest.mark.parametrize(

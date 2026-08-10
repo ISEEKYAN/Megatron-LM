@@ -818,14 +818,10 @@ class EPChunkWorkspace:
         self._materialized = False
 
     def reset_tensors(self, *, stream: Any | None = None) -> None:
-        """Drop reusable scratch after its consumers without releasing DeepEP state."""
+        """Park activations and drop slot scratch without releasing DeepEP state."""
         if not self._materialized:
             return
         self._prepare_slots_for_reset(stream=stream, operation="reset tensors")
-
-    def park_expert_activations(self, *, stream: Any | None = None) -> None:
-        """Park activation references while retaining the shared MemPool/high-watermark."""
-        self._expert_activation_owner.coordinator.park(stream=stream)
 
     def _prepare_slots_for_reset(
         self,
@@ -833,30 +829,39 @@ class EPChunkWorkspace:
         stream: Any | None,
         operation: str,
     ) -> None:
-        if self._expert_activation_owner.in_use:
+        coordinator = self._expert_activation_owner.coordinator
+        if coordinator.claimed_op is not None:
             raise RuntimeError(
                 f"Cannot {operation} in EP chunk workspace: expert activation arena "
                 "is leased"
             )
-        activation_event = self._expert_activation_owner.consumer_event
-        if activation_event is not None:
-            ready = (
-                bool(activation_event.query())
-                if hasattr(activation_event, "query")
-                else False
-            )
-            if not ready:
-                if stream is None or not hasattr(stream, "wait_event"):
-                    raise RuntimeError(
-                        f"Cannot {operation} in EP chunk workspace with a pending "
-                        "expert activation event"
-                    )
-                stream.wait_event(activation_event)
         for slot_idx, slot in enumerate(self._slots):
             if slot.in_use:
                 raise RuntimeError(
                     f"Cannot {operation} in EP chunk workspace: slot {slot_idx} is leased"
                 )
+        activation_event = coordinator.consumer_event
+        if activation_event is not None and not (
+            bool(activation_event.query()) if hasattr(activation_event, "query") else False
+        ) and not (
+            (stream is not None and hasattr(stream, "wait_event"))
+            or hasattr(activation_event, "current_stream_wait")
+        ):
+            raise RuntimeError(
+                f"Cannot {operation} in EP chunk workspace with a pending "
+                "expert activation event"
+            )
+        for slot in self._slots:
+            event = slot.consumer_event
+            if event is not None and not (
+                bool(event.query()) if hasattr(event, "query") else False
+            ) and (stream is None or not hasattr(stream, "wait_event")):
+                raise RuntimeError(
+                    f"Cannot {operation} in EP chunk workspace with a pending "
+                    "consumer event"
+                )
+
+        coordinator.park(stream=stream)
         for slot in self._slots:
             event = slot.consumer_event
             if event is not None:
@@ -1254,13 +1259,6 @@ class EPChunkWorkspaceRegistry:
             coordinator.parks = 0
             coordinator.rehydrates = 0
 
-    def park(self, key: EPChunkWorkspaceKey, *, stream: Any | None = None) -> None:
-        """Park one workspace's shared activation arena without releasing its pool."""
-        workspace = self._workspaces.get(key)
-        if workspace is not None:
-            workspace.park_expert_activations(stream=stream)
-
-
 _EP_CHUNK_WORKSPACES = EPChunkWorkspaceRegistry()
 
 
@@ -1279,15 +1277,6 @@ def release_ep_chunk_workspace(
 ) -> None:
     """Close and unregister a process-local EP chunk workspace."""
     _EP_CHUNK_WORKSPACES.release(key, stream=stream)
-
-
-def park_ep_chunk_workspace(
-    key: EPChunkWorkspaceKey,
-    *,
-    stream: Any | None = None,
-) -> None:
-    """Drop activation tensor references at a model-owned phase boundary."""
-    _EP_CHUNK_WORKSPACES.park(key, stream=stream)
 
 
 def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
@@ -2919,6 +2908,5 @@ __all__ = [
     "EPChunkWorkspaceKey",
     "EPChunkWorkspaceRegistry",
     "get_ep_chunk_workspace",
-    "park_ep_chunk_workspace",
     "release_ep_chunk_workspace",
 ]
