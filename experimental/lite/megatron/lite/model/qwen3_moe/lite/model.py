@@ -52,30 +52,99 @@ from megatron.lite.primitive.utils import build_fp8_recipe
 # ---------------------------------------------------------------------------
 
 
-class _Qwen3EPChunkFullRecomputeFunction(torch.autograd.Function):
+class _Qwen3TransformerLayerFullRecomputeFunction(torch.autograd.Function):
+    """Full layer checkpoint with ChunkedEP owning only MoE recomputation."""
+
     @staticmethod
-    def forward(ctx, x: torch.Tensor, layer: "MoELayer", *params: torch.Tensor):
-        # torch.autograd.Function.apply runs forward with grad disabled. Keep this
-        # fail-loud guard because the initial full-recompute forward must not build a graph.
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        packed_seq_params,
+        layer: "TransformerLayer",
+        *params: torch.Tensor,
+    ):
+        # ``Function.apply`` must make the initial whole-layer pass graph-free:
+        # saving a post-attention residual or the MLP norm output would restore
+        # the 48-layer activation growth that full recompute is meant to remove.
         if torch.is_grad_enabled():
             raise RuntimeError(
-                "Qwen3 full-recompute custom forward must run with grad disabled"
+                "Qwen3 full-recompute layer forward must run with grad disabled"
             )
+        if torch.is_tensor(position_ids) and position_ids.requires_grad:
+            raise RuntimeError(
+                "Qwen3 full-recompute position_ids must not require gradients"
+            )
+        ctx.param_ids = tuple(id(param) for param in params)
         del params
         ctx.layer = layer
+        ctx.position_ids = position_ids
+        ctx.packed_seq_params = packed_seq_params
         ctx.save_for_backward(x.detach())
-        assert layer.ep_chunk_forward is not None
-        return layer.ep_chunk_forward(x).detach()
+        return layer._ep_chunk_full_recompute_forward(
+            x, position_ids=position_ids, packed_seq_params=packed_seq_params
+        ).detach()
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (x_saved,) = ctx.saved_tensors
         layer = ctx.layer
-        assert layer.ep_chunk_fused is not None
-        grad_x, router_grads, expert_grads = layer.ep_chunk_fused.forward_backward(
-            x_saved, grad_output
+        x = x_saved.detach().requires_grad_(True)
+        attention_params = tuple(layer.attn.parameters())
+        norm_params = tuple(layer.mlp_norm.parameters())
+        router_params = tuple(layer.moe.router.parameters())
+        expert_params = tuple(layer.moe.experts.parameters())
+        if ctx.param_ids != tuple(
+            id(param)
+            for param in (
+                *attention_params,
+                *norm_params,
+                *router_params,
+                *expert_params,
+            )
+        ):
+            raise RuntimeError("Qwen3 full-recompute parameter order changed")
+        with torch.enable_grad():
+            attention_out = layer.attn(
+                x,
+                position_ids=ctx.position_ids,
+                packed_seq_params=ctx.packed_seq_params,
+            )
+            residual = x + attention_out
+            norm_out = layer.mlp_norm(residual)
+            assert layer.moe.ep_chunk_fused is not None
+            grad_norm, router_grads, expert_grads = (
+                layer.moe.ep_chunk_fused.forward_backward(norm_out, grad_output)
+            )
+            differentiable = (x, *attention_params, *norm_params)
+            required = tuple(value for value in differentiable if value.requires_grad)
+            required_grads = torch.autograd.grad(
+                (norm_out, residual),
+                required,
+                (grad_norm, grad_output),
+                allow_unused=True,
+            )
+
+        grads_by_id = {
+            id(value): grad
+            for value, grad in zip(required, required_grads, strict=True)
+        }
+        grad_x = grads_by_id.get(id(x))
+        param_grads = (
+            *[grads_by_id.get(id(param)) for param in attention_params],
+            *[grads_by_id.get(id(param)) for param in norm_params],
+            *router_grads,
+            *expert_grads,
         )
-        return grad_x, None, *router_grads, *expert_grads
+        if len(param_grads) != len(ctx.param_ids):
+            raise RuntimeError("Qwen3 full-recompute parameter gradient order changed")
+        return (
+            grad_x,
+            None,
+            None,
+            None,
+            *param_grads,
+        )
 
 
 class MoELayer(nn.Module):
@@ -184,10 +253,7 @@ class MoELayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.ep_chunk_forward is not None:
             if self.ep_chunk_full_recompute:
-                params = tuple(self.router.parameters()) + tuple(
-                    self.experts.parameters()
-                )
-                return _Qwen3EPChunkFullRecomputeFunction.apply(x, self, *params)
+                return self.ep_chunk_forward(x)
             assert self.ep_chunk_forward is not None
             return self.ep_chunk_forward(x)
 
@@ -409,12 +475,39 @@ class TransformerLayer(nn.Module):
             lora_config=lora_config,
         )
 
+    def _ep_chunk_full_recompute_forward(
+        self,
+        x: torch.Tensor,
+        *,
+        position_ids: torch.Tensor | None,
+        packed_seq_params,
+    ) -> torch.Tensor:
+        """Run the graph-free initial pass for the composition-owned checkpoint."""
+        residual = x
+        h = self.attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
+        x = residual + h
+        residual = x
+        h = self.mlp_norm(x)
+        assert self.moe.ep_chunk_forward is not None
+        moe_out = self.moe.ep_chunk_forward(h)
+        return residual + moe_out
+
     def forward(
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         packed_seq_params=None,
     ) -> torch.Tensor:
+        if self.moe.ep_chunk_full_recompute and torch.is_grad_enabled():
+            params = (
+                *tuple(self.attn.parameters()),
+                *tuple(self.mlp_norm.parameters()),
+                *tuple(self.moe.router.parameters()),
+                *tuple(self.moe.experts.parameters()),
+            )
+            return _Qwen3TransformerLayerFullRecomputeFunction.apply(
+                x, position_ids, packed_seq_params, self, *params
+            )
         residual = x
         h = self.attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
         x = residual + h

@@ -178,12 +178,10 @@ def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
 def _qwen3_recompute_modules_for_ep_chunk_overlap(
     modules: list[str], *, enabled: bool
 ) -> list[str]:
-    """Replace Qwen3's outer MoE checkpoint when the fused op owns recompute."""
+    """Let the Qwen composition own full ChunkedEP layer recomputation."""
     if not enabled:
         return modules
-    if "full" in modules:
-        return ["attn"]
-    return [name for name in modules if name != "moe"]
+    return []
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:

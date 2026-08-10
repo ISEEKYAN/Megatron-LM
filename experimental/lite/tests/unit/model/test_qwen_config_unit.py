@@ -567,7 +567,7 @@ def test_qwen3_compose_layer_owns_moe_activation_recompute_selection(
     )
 
 
-def test_qwen3_compose_layer_replaces_only_its_outer_moe_checkpoint(
+def test_qwen3_full_chunked_recompute_owns_the_entire_layer_checkpoint(
     transformer_engine_import_stub,
 ):
     transformer_engine_import_stub()
@@ -578,19 +578,20 @@ def test_qwen3_compose_layer_replaces_only_its_outer_moe_checkpoint(
         protocol._qwen3_recompute_modules_for_ep_chunk_overlap(requested, enabled=False)
         == requested
     )
-    assert protocol._qwen3_recompute_modules_for_ep_chunk_overlap(
-        requested, enabled=True
-    ) == ["core_attn", "mlp"]
-    assert protocol._qwen3_recompute_modules_for_ep_chunk_overlap(
-        ["full"], enabled=True
-    ) == ["attn"]
+    assert (
+        protocol._qwen3_recompute_modules_for_ep_chunk_overlap(requested, enabled=True)
+        == []
+    )
+    assert (
+        protocol._qwen3_recompute_modules_for_ep_chunk_overlap(["full"], enabled=True)
+        == []
+    )
 
 
 @pytest.mark.parametrize(
     "full_recompute,expected_counts",
     [
         (False, {"forward": 1, "backward": 1, "fused": 0}),
-        (True, {"forward": 1, "backward": 0, "fused": 1}),
     ],
 )
 def test_qwen3_training_mode_matches_no_recompute_and_full_recompute_parity(
@@ -686,77 +687,76 @@ def test_qwen3_training_mode_matches_no_recompute_and_full_recompute_parity(
     assert calls == expected_counts
 
 
-def test_qwen3_full_recompute_initial_forward_runs_no_grad_then_fused_backward(
-    monkeypatch, transformer_engine_import_stub
+def test_qwen3_full_layer_recompute_runs_no_grad_once_and_recomputes_moe_once(
+    transformer_engine_import_stub,
 ):
     transformer_engine_import_stub()
-    from megatron.lite.model.qwen3_moe.lite import model
+    from megatron.lite.model.qwen3_moe.lite.model import (
+        _Qwen3TransformerLayerFullRecomputeFunction,
+    )
 
-    calls = {"forward": 0, "backward": 0, "fused": 0, "reset": 0}
+    calls = {"forward": 0, "fused": 0}
 
-    class FakeWorkspace:
-        def __init__(self, key):
-            self.key = key
+    class Scale(torch.nn.Module):
+        def __init__(self, scale):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(float(scale)))
 
-        def reset_tensors(self, *, stream=None):
-            del stream
-            calls["reset"] += 1
+        def forward(self, value, **_kwargs):
+            return value * self.scale
 
     class FakeForward:
-        def __init__(self, *, backward_op=None, **_kwargs):
-            assert backward_op is None
-            self.backward_op = backward_op
-
         def __call__(self, x):
             assert torch.is_grad_enabled() is False
-            assert self.backward_op is None
             calls["forward"] += 1
             return x * 2
 
-    class ForbiddenBackward:
-        def __init__(self, **_kwargs):
-            calls["backward"] += 1
-            raise AssertionError("full recompute must not construct BackwardOp")
-
     class FakeFused:
-        def __init__(self, **kwargs):
-            self.workspace = kwargs["workspace"]
-
-        def forward_backward(self, _x_saved, grad_output, _routing_input=None):
+        def forward_backward(self, _x_saved, grad_output):
             calls["fused"] += 1
-            return grad_output * 3, [], []
+            return grad_output * 5, [torch.tensor(7.0)], [torch.tensor(8.0)]
 
-    monkeypatch.setattr(
-        model, "TopKRouter", lambda *_args, **_kwargs: torch.nn.Identity()
-    )
-    monkeypatch.setattr(model, "Experts", lambda *_args, **_kwargs: torch.nn.Identity())
-    monkeypatch.setattr(
-        model,
-        "get_ep_chunk_workspace",
-        lambda key, _factory: FakeWorkspace(key),
-    )
-    monkeypatch.setattr(model, "EPChunkForwardOp", FakeForward)
-    monkeypatch.setattr(model, "EPChunkBackwardOp", ForbiddenBackward)
-    monkeypatch.setattr(model, "EPChunkFusedForwardBackwardOp", FakeFused)
-    monkeypatch.setattr(model.torch.cuda, "current_device", lambda: 0)
-    layer = model.MoELayer(
-        SimpleNamespace(num_experts=8, hidden_size=4, num_experts_per_tok=2),
-        SimpleNamespace(ep_size=2, tp_ep_group=object()),
-        use_deepep=True,
-        enable_ep_chunk_overlap=True,
-        ep_chunk_max_token_rows_per_rank=8,
-        ep_chunk_full_recompute=True,
-    )
-    value = torch.randn(2, 4, requires_grad=True)
+    class FakeLayer:
+        def __init__(self):
+            self.attn = Scale(2)
+            self.mlp_norm = Scale(3)
+            self.moe = SimpleNamespace(
+                router=Scale(1),
+                experts=Scale(1),
+                ep_chunk_forward=FakeForward(),
+                ep_chunk_fused=FakeFused(),
+            )
 
-    with torch.enable_grad():
-        assert torch.is_grad_enabled() is True
-        actual = layer(value)
-    torch.testing.assert_close(actual, value.detach() * 2)
+        def _ep_chunk_full_recompute_forward(
+            self, x, *, position_ids, packed_seq_params
+        ):
+            del position_ids, packed_seq_params
+            residual = x
+            x = residual + self.attn(x)
+            residual = x
+            h = self.mlp_norm(x)
+            return residual + self.moe.ep_chunk_forward(h)
+
+    layer = FakeLayer()
+    value = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+    params = (
+        *layer.attn.parameters(),
+        *layer.mlp_norm.parameters(),
+        *layer.moe.router.parameters(),
+        *layer.moe.experts.parameters(),
+    )
+    actual = _Qwen3TransformerLayerFullRecomputeFunction.apply(
+        value, None, None, layer, *params
+    )
+    torch.testing.assert_close(actual, value.detach() * 21)
     actual.sum().backward()
 
-    torch.testing.assert_close(value.grad, torch.full_like(value, 3))
-    assert calls == {"forward": 1, "backward": 0, "fused": 1, "reset": 0}
+    torch.testing.assert_close(value.grad, torch.full_like(value, 48))
+    assert calls == {"forward": 1, "fused": 1}
+    torch.testing.assert_close(layer.attn.scale.grad, torch.tensor(160.0))
+    torch.testing.assert_close(layer.mlp_norm.scale.grad, torch.tensor(150.0))
+    torch.testing.assert_close(layer.moe.router.scale.grad, torch.tensor(7.0))
+    torch.testing.assert_close(layer.moe.experts.scale.grad, torch.tensor(8.0))
 
 
 def test_qwen3_full_recompute_custom_function_forward_is_framework_no_grad(
@@ -764,7 +764,7 @@ def test_qwen3_full_recompute_custom_function_forward_is_framework_no_grad(
 ):
     transformer_engine_import_stub()
     from megatron.lite.model.qwen3_moe.lite.model import (
-        _Qwen3EPChunkFullRecomputeFunction,
+        _Qwen3TransformerLayerFullRecomputeFunction,
     )
 
     class Forward:
@@ -775,13 +775,31 @@ def test_qwen3_full_recompute_custom_function_forward_is_framework_no_grad(
                 )
             return value * 2
 
-    layer = SimpleNamespace(ep_chunk_forward=Forward())
+    layer = SimpleNamespace(
+        _ep_chunk_full_recompute_forward=lambda value, **_kwargs: Forward()(value)
+    )
     value = torch.randn(2, 4, requires_grad=True)
 
-    output = _Qwen3EPChunkFullRecomputeFunction.apply(value, layer)
+    output = _Qwen3TransformerLayerFullRecomputeFunction.apply(value, None, None, layer)
 
     assert output.requires_grad
     assert output.grad_fn is not None
+
+
+def test_qwen3_full_layer_recompute_rejects_differentiable_position_ids(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite.model import (
+        _Qwen3TransformerLayerFullRecomputeFunction,
+    )
+
+    value = torch.ones(1, 1, requires_grad=True)
+    position_ids = torch.ones(1, 1, requires_grad=True)
+    with pytest.raises(RuntimeError, match="position_ids must not require gradients"):
+        _Qwen3TransformerLayerFullRecomputeFunction.apply(
+            value, position_ids, None, SimpleNamespace()
+        )
 
 
 def test_qwen3_chunked_ep_fails_loud_without_deepep_or_ep(
