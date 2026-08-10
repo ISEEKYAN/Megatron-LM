@@ -1025,6 +1025,12 @@ class EPChunkWorkspaceRegistry:
             raise RuntimeError(
                 "Cannot rematerialize an EP chunk workspace after its key was reused"
             )
+        activation_key = workspace._expert_activation_owner.key
+        current_owner = self._expert_activation_owners.get(activation_key)
+        if current_owner is None:
+            self._expert_activation_owners[activation_key] = workspace._expert_activation_owner
+        elif current_owner is not workspace._expert_activation_owner:
+            raise RuntimeError("Cannot rematerialize an EP chunk workspace with a replaced activation owner")
         self._workspaces[workspace.key] = workspace
 
     def release(

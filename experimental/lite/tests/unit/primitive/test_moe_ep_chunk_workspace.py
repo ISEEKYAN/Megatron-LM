@@ -182,11 +182,7 @@ def test_logical_chunk_count_is_profile_contract_but_workspace_stays_two_slots(
     )
 
     profile = EPChunkShapeProfile(
-        max_input_rows=17,
-        hidden_size=4,
-        topk=2,
-        ep_size=4,
-        chunk_count=chunk_count,
+        max_input_rows=17, hidden_size=4, topk=2, ep_size=4, chunk_count=chunk_count
     )
     workspace = EPChunkWorkspaceRegistry().get_or_create(
         EPChunkWorkspaceKey(
@@ -228,12 +224,7 @@ def test_three_ops_get_independent_cross_layer_workspaces(
         created.append((slot, dispatcher))
         return dispatcher
 
-    profile = profile_type(
-        max_input_rows=128,
-        hidden_size=64,
-        topk=8,
-        ep_size=8,
-    )
+    profile = profile_type(max_input_rows=128, hidden_size=64, topk=8, ep_size=8)
     common = dict(
         device_type="cpu",
         device_index=None,
@@ -282,12 +273,7 @@ def test_workspace_slots_are_stable_and_consumer_event_guarded(
         device_index=None,
         ep_group_id=3,
         dtype=torch.float32,
-        shape_profile=profile_type(
-            max_input_rows=8,
-            hidden_size=4,
-            topk=2,
-            ep_size=4,
-        ),
+        shape_profile=profile_type(max_input_rows=8, hidden_size=4, topk=2, ep_size=4),
     )
     workspace = registry_type().get_or_create(key, lambda slot: f"dispatcher-{slot}")
 
@@ -335,12 +321,7 @@ def test_expert_scratch_can_exceed_recv_rows_but_not_expert_row_capacity(
         device_index=None,
         ep_group_id=5,
         dtype=torch.float32,
-        shape_profile=profile_type(
-            max_input_rows=8,
-            hidden_size=4,
-            topk=2,
-            ep_size=4,
-        ),
+        shape_profile=profile_type(max_input_rows=8, hidden_size=4, topk=2, ep_size=4),
     )
     workspace = registry_type().get_or_create(key, lambda slot: slot)
     workspace.materialize(device="cpu")
@@ -362,8 +343,7 @@ def test_expert_scratch_can_exceed_recv_rows_but_not_expert_row_capacity(
 
 @pytest.mark.parametrize("op", ["backward", "fused_forward_backward"])
 def test_op_scratch_is_actual_shape_lazy_then_steady_state_stable(
-    op,
-    transformer_engine_import_stub,
+    op, transformer_engine_import_stub
 ):
     (
         _chunk_count,
@@ -375,12 +355,7 @@ def test_op_scratch_is_actual_shape_lazy_then_steady_state_stable(
         registry_type,
         _function,
     ) = _symbols(transformer_engine_import_stub)
-    profile = profile_type(
-        max_input_rows=8,
-        hidden_size=4,
-        topk=2,
-        ep_size=4,
-    )
+    profile = profile_type(max_input_rows=8, hidden_size=4, topk=2, ep_size=4)
     workspace = registry_type().get_or_create(
         key_type(
             op=op,
@@ -443,10 +418,7 @@ def test_backward_scratch_only_lease_does_not_materialize_dispatchers_or_pools(
             ep_group_id=17,
             dtype=torch.float32,
             shape_profile=profile_type(
-                max_input_rows=8,
-                hidden_size=4,
-                topk=2,
-                ep_size=4,
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=4
             ),
         ),
         lambda slot: created.append(slot) or f"dispatcher-{slot}",
@@ -486,10 +458,7 @@ def test_dispatcher_backed_lease_still_materializes_two_dispatchers(
             ep_group_id=19,
             dtype=torch.float32,
             shape_profile=profile_type(
-                max_input_rows=8,
-                hidden_size=4,
-                topk=2,
-                ep_size=4,
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=4
             ),
         ),
         lambda slot: created.append(slot) or f"dispatcher-{slot}",
@@ -524,10 +493,7 @@ def test_reset_tensors_waits_for_consumers_and_keeps_dispatchers(
             ep_group_id=23,
             dtype=torch.float32,
             shape_profile=profile_type(
-                max_input_rows=8,
-                hidden_size=4,
-                topk=2,
-                ep_size=4,
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=4
             ),
         ),
         lambda slot: f"dispatcher-{slot}",
@@ -571,10 +537,7 @@ def test_workspace_evidence_reports_actual_scratch_shape_dtype_and_bytes(
             ep_group_id=29,
             dtype=torch.float32,
             shape_profile=profile_type(
-                max_input_rows=8,
-                hidden_size=4,
-                topk=2,
-                ep_size=4,
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=4
             ),
         ),
         lambda slot: f"dispatcher-{slot}",
@@ -589,7 +552,7 @@ def test_workspace_evidence_reports_actual_scratch_shape_dtype_and_bytes(
             "shape": (9, 4),
             "dtype": "torch.float32",
             "nbytes": 9 * 4 * 4,
-        },
+        }
     }
 
 
@@ -614,10 +577,7 @@ def test_scratch_only_lease_allocates_from_its_own_backward_arena(
             ep_group_id=31,
             dtype=torch.float32,
             shape_profile=profile_type(
-                max_input_rows=8,
-                hidden_size=4,
-                topk=2,
-                ep_size=4,
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=4
             ),
         ),
         lambda slot: f"unused-{slot}",
@@ -662,10 +622,7 @@ def test_fused_dispatcher_lease_allocates_scratch_from_its_own_slot_arena(
             ep_group_id=41,
             dtype=torch.float32,
             shape_profile=profile_type(
-                max_input_rows=8,
-                hidden_size=4,
-                topk=2,
-                ep_size=4,
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=4
             ),
         ),
         lambda slot: f"fused-{slot}",
@@ -704,12 +661,7 @@ def test_profile_rejects_input_rows_beyond_qwen_capacity(
         _registry,
         _function,
     ) = _symbols(transformer_engine_import_stub)
-    profile = profile_type(
-        max_input_rows=8,
-        hidden_size=4,
-        topk=2,
-        ep_size=4,
-    )
+    profile = profile_type(max_input_rows=8, hidden_size=4, topk=2, ep_size=4)
 
     with pytest.raises(RuntimeError, match="exceeds two-slot profile"):
         profile.validate_input_rows(9)
@@ -728,18 +680,10 @@ def test_workspace_reports_deepep_buffer_count_and_resident_bytes(
         registry_type,
         _function,
     ) = _symbols(transformer_engine_import_stub)
-    profile = profile_type(
-        max_input_rows=8,
-        hidden_size=4,
-        topk=2,
-        ep_size=2,
-    )
+    profile = profile_type(max_input_rows=8, hidden_size=4, topk=2, ep_size=2)
 
     def dispatcher(_slot):
-        return SimpleNamespace(
-            buffer=object(),
-            deepep_buffer_resident_bytes=1024,
-        )
+        return SimpleNamespace(buffer=object(), deepep_buffer_resident_bytes=1024)
 
     workspace = registry_type().get_or_create(
         key_type(
@@ -813,10 +757,7 @@ def test_workspace_owns_only_two_comm_pools_not_an_activation_pool(
             ep_group_id=31,
             dtype=torch.bfloat16,
             shape_profile=profile_type(
-                max_input_rows=8,
-                hidden_size=4,
-                topk=2,
-                ep_size=2,
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=2
             ),
         ),
         lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
@@ -892,12 +833,7 @@ def test_three_ops_share_one_compatible_expert_activation_owner(
     monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
     monkeypatch.setattr(overlap.torch.cuda, "MemPool", lambda **_kwargs: object())
     registry = registry_type()
-    profile = profile_type(
-        max_input_rows=8,
-        hidden_size=4,
-        topk=2,
-        ep_size=2,
-    )
+    profile = profile_type(max_input_rows=8, hidden_size=4, topk=2, ep_size=2)
     workspaces = []
     for op in ("forward", "backward", "fused_forward_backward"):
         workspace = registry.get_or_create(
@@ -962,10 +898,7 @@ def test_expert_activation_arena_waits_only_for_its_consumer_event(
             ep_group_id=41,
             dtype=torch.bfloat16,
             shape_profile=profile_type(
-                max_input_rows=8,
-                hidden_size=4,
-                topk=2,
-                ep_size=2,
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=2
             ),
         ),
         lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
@@ -1007,10 +940,7 @@ def test_expert_activation_lease_size_classes_adjacent_rows_without_growth(
             ep_group_id=43,
             dtype=torch.float32,
             shape_profile=profile_type(
-                max_input_rows=8,
-                hidden_size=4,
-                topk=2,
-                ep_size=2,
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=2
             ),
         ),
         lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
@@ -1424,10 +1354,7 @@ def test_unbound_workspace_binds_to_first_runtime_stream_device(
             ep_group_id=37,
             dtype=torch.bfloat16,
             shape_profile=profile_type(
-                max_input_rows=8,
-                hidden_size=4,
-                topk=2,
-                ep_size=2,
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=2
             ),
         ),
         lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
@@ -1471,12 +1398,7 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
         device_index=None,
         ep_group_id=23,
         dtype=torch.float32,
-        shape_profile=profile_type(
-            max_input_rows=8,
-            hidden_size=4,
-            topk=2,
-            ep_size=2,
-        ),
+        shape_profile=profile_type(max_input_rows=8, hidden_size=4, topk=2, ep_size=2),
     )
     created = []
 
@@ -1530,12 +1452,16 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
         lease.tensor("grad_expert_out", (4, 4), dtype=torch.float32, device="cpu")
         lease.release(_FakeEvent(ready=True))
     first_ptrs = set(workspace.evidence()["data_ptrs"].values())
+    activation = workspace.acquire_expert_activation()
+    activation.tensor("fc1_input", (4, 4), dtype=torch.float32, device="cpu")
+    activation.release(_FakeEvent(ready=True))
     assert workspace.evidence()["dispatcher_count"] == 2
 
     registry.release(key)
     assert workspace.evidence()["dispatcher_count"] == 0
     assert workspace.evidence()["deepep_buffer_resident_bytes"] == 0
     assert workspace.evidence()["data_ptrs"] == {}
+    assert not workspace._expert_activation_owner.arena.tensors
     registry.release(key)
 
     workspace.materialize(device="cpu")
@@ -1545,8 +1471,12 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
         lease = workspace.acquire(slot)
         lease.tensor("grad_expert_out", (4, 4), dtype=torch.float32, device="cpu")
         lease.release(_FakeEvent(ready=True))
-    assert set(workspace.evidence()["data_ptrs"].values()).isdisjoint(first_ptrs)
+    assert workspace.evidence()["data_ptrs"]
+    activation = workspace.acquire_expert_activation()
+    activation.tensor("fc1_input", (4, 4), dtype=torch.float32, device="cpu")
+    activation.release(_FakeEvent(ready=True))
     registry.release(key)
+    assert not workspace._expert_activation_owner.arena.tensors
 
     rebuilt = registry.get_or_create(key, factory)
     assert rebuilt is not workspace
@@ -1558,7 +1488,13 @@ def test_workspace_is_lazy_and_registry_release_rebuilds_without_old_state(
     assert all(
         rebuilt.dispatcher(slot) is not first_dispatchers[slot] for slot in range(2)
     )
-    assert set(rebuilt.evidence()["data_ptrs"].values()).isdisjoint(first_ptrs)
+    assert rebuilt.evidence()["data_ptrs"]
+    registry.release(key)
+    registry._expert_activation_owners[workspace._expert_activation_owner.key] = (
+        object()
+    )
+    with pytest.raises(RuntimeError, match="replaced activation owner"):
+        workspace.materialize(device="cpu")
 
 
 def test_workspace_release_rejects_active_lease_and_pending_event(
@@ -1580,12 +1516,7 @@ def test_workspace_release_rejects_active_lease_and_pending_event(
         device_index=None,
         ep_group_id=29,
         dtype=torch.float32,
-        shape_profile=profile_type(
-            max_input_rows=8,
-            hidden_size=4,
-            topk=2,
-            ep_size=2,
-        ),
+        shape_profile=profile_type(max_input_rows=8, hidden_size=4, topk=2, ep_size=2),
     )
     registry = registry_type()
     workspace = registry.get_or_create(key, lambda slot: SimpleNamespace(slot=slot))
@@ -1636,10 +1567,7 @@ def test_profile_checks_actual_flattened_rows_for_batched_and_packed_inputs(
         _function,
     ) = _symbols(transformer_engine_import_stub)
     profile = profile_type.for_two_slot_chunked_ep(
-        max_input_rows=9,
-        hidden_size=4,
-        topk=2,
-        ep_size=8,
+        max_input_rows=9, hidden_size=4, topk=2, ep_size=8
     )
 
     with pytest.raises(RuntimeError, match="input rows 10"):
@@ -1661,10 +1589,7 @@ def test_qwen3_profile_freezes_deepep_worst_case_receive_capacity(
     ) = _symbols(transformer_engine_import_stub)
 
     profile = profile_type.for_two_slot_chunked_ep(
-        max_input_rows=17,
-        hidden_size=64,
-        topk=8,
-        ep_size=8,
+        max_input_rows=17, hidden_size=64, topk=8, ep_size=8
     )
 
     assert profile.max_recv_rows == 9 * 8
@@ -1683,9 +1608,7 @@ def test_shape_profile_accepts_recv_rows_at_or_below_capacity(
     profile.validate_recv_rows(rows)
 
 
-def test_shape_profile_rejects_recv_rows_above_capacity(
-    transformer_engine_import_stub,
-):
+def test_shape_profile_rejects_recv_rows_above_capacity(transformer_engine_import_stub):
     profile = _symbols(transformer_engine_import_stub)[4](
         max_input_rows=17, hidden_size=4, topk=8, ep_size=8
     )
@@ -1779,11 +1702,6 @@ def test_saved_forward_context_does_not_pin_two_shared_slots_across_layers(
     context_saved = forward_source.index("saved_chunks[chunk_idx] =")
     slot_released = forward_source.index("lease.release(consumed)")
     assert expert_finished < context_saved < slot_released
-    for saved_tensor in (
-        "recv_probs_base",
-        "dispatched",
-        "probs",
-        "expert_out_edge",
-    ):
+    for saved_tensor in ("recv_probs_base", "dispatched", "probs", "expert_out_edge"):
         assert saved_tensor in fields
     assert 'handle=state["handle"]' in forward_source
