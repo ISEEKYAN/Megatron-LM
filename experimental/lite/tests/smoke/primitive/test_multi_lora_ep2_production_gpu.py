@@ -7,12 +7,13 @@ import hashlib
 import json
 import os
 import re
+import traceback
 from pathlib import Path
+from typing import Callable
 
 import pytest
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.ckpt import dcp
 from megatron.lite.primitive.distributed_test_utils import (
     build_lora_collective_descriptor,
@@ -30,6 +31,8 @@ pytestmark = [
     pytest.mark.gpu,
     pytest.mark.distributed,
 ]
+
+_TINY_QWEN_EXPERTS = 4
 
 
 def _qwen_symbols():
@@ -68,7 +71,7 @@ def _config():
         num_key_value_heads=2,
         head_dim=4,
         vocab_size=64,
-        num_experts=4,
+        num_experts=_TINY_QWEN_EXPERTS,
         num_experts_per_tok=1,
         moe_intermediate_size=8,
         max_position_embeddings=16,
@@ -138,6 +141,19 @@ def _tensor_record(tensor: torch.Tensor) -> dict[str, object]:
         "shape": list(cpu.shape),
         "dtype": str(cpu.dtype),
     }
+
+
+def _write_phase_a_flight_record(
+    artifact_dir: Path, **updates: object
+) -> dict[str, object]:
+    """Atomically persist rank-local Phase A progress without a collective."""
+    path = artifact_dir / f"phase_a_rank_{dist.get_rank():05d}.json"
+    record = json.loads(path.read_text()) if path.exists() else {}
+    record.update(updates)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(record, sort_keys=True))
+    os.replace(temporary, path)
+    return record
 
 
 def _named_parameters(bundle) -> dict[str, torch.Tensor]:
@@ -297,10 +313,18 @@ def _impl_contract(*, tp: int = 1, ep: int) -> dict[str, object]:
 
 
 def _fixed_local_router(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Route every token to expert zero, available in both EP1 and EP2."""
+    """Route every token to expert zero for production empty-rank coverage."""
     return (
         torch.ones((x.shape[0], 1), device=x.device, dtype=x.dtype),
         torch.zeros((x.shape[0], 1), device=x.device, dtype=torch.long),
+    )
+
+
+def _phase_a_balanced_router(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cycle tiny-Qwen experts so Phase A reaches both EP partitions."""
+    return (
+        torch.ones((x.shape[0], 1), device=x.device, dtype=x.dtype),
+        (torch.arange(x.shape[0], device=x.device) % _TINY_QWEN_EXPERTS).view(-1, 1),
     )
 
 
@@ -542,7 +566,10 @@ def _local_owner_factor_record(bundle, name: str) -> dict[str, object] | None:
 
 
 def _bank_sync_absolute_oracle(
-    bundle, local_contributions: dict[str, torch.Tensor]
+    bundle,
+    local_contributions: dict[str, torch.Tensor],
+    *,
+    preflight_done: Callable[[], None] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     """Reference FC and attention gradients over their respective owner groups."""
     expected: dict[str, torch.Tensor] = {}
@@ -558,6 +585,8 @@ def _bank_sync_absolute_oracle(
         "MULTI_LORA_COLLECTIVE_PREFLIGHT " f"rank={dist.get_rank()} records={records}",
         flush=True,
     )
+    if preflight_done is not None:
+        preflight_done()
     for name, _kind, _shape, _dtype in records:
         contribution = local_contributions[name]
         if _bank_surface_kind(bundle, _bank_parameters(bundle)[name]) == "fc":
@@ -700,6 +729,9 @@ def _run_unsynchronized_reference(
         return original_dispatch(*args, **kwargs)
 
     dispatcher.dispatch = capture_dispatch
+    router = qwen.layers[0].moe.router
+    original_router = router.forward
+    router.forward = _phase_a_balanced_router
     _Qwen3MoEConfig, _model, protocol = _qwen_symbols()
     original_sidecar = protocol.MoELoraSidecar
 
@@ -716,6 +748,7 @@ def _run_unsynchronized_reference(
         assert dispatch_calls == [True]
     finally:
         dispatcher.dispatch = original_dispatch
+        router.forward = original_router
         protocol.MoELoraSidecar = original_sidecar
     return float(output["loss"].detach().cpu()), _local_full_bank_contributions(bundle)
 
@@ -867,15 +900,31 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
         export_path = artifact_dir / f"adapter_exports_rank_{dist.get_rank():05d}.pt"
         torch.save(adapter_exports, export_path)
         dist.barrier()
+        _write_phase_a_flight_record(artifact_dir, export_complete=True)
         parameter_semantics = _checkpoint_semantics(bundle)
-        loss, local_contributions = _run_unsynchronized_reference(bundle, batch)
+        _write_phase_a_flight_record(artifact_dir, reference_enter=True)
+        try:
+            loss, local_contributions = _run_unsynchronized_reference(bundle, batch)
+        except Exception as error:
+            _write_phase_a_flight_record(
+                artifact_dir,
+                reference_error=f"{type(error).__name__}: {error}",
+                traceback=traceback.format_exc(),
+            )
+            raise
+        _write_phase_a_flight_record(artifact_dir, reference_done=True)
         expected_keys = _expected_semantic_bank_keys(
             bundle.extras["multi_lora_training_state"]
         )
         assert set(local_contributions) == expected_keys
         oracle_grads, normalization_by_key = _bank_sync_absolute_oracle(
-            bundle, local_contributions
+            bundle,
+            local_contributions,
+            preflight_done=lambda: _write_phase_a_flight_record(
+                artifact_dir, preflight_done=True
+            ),
         )
+        _write_phase_a_flight_record(artifact_dir, oracle_done=True)
         assert set(oracle_grads) == expected_keys
         assert all(gradient.abs().max() > 0 for gradient in oracle_grads.values())
         gathered_contributions = [None] * dist.get_world_size(
@@ -996,6 +1045,7 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
             temporary_complete.write_text(json.dumps(complete_payload, sort_keys=True))
             os.replace(temporary_complete, complete_path)
         dist.barrier()
+        _write_phase_a_flight_record(artifact_dir, phase_a_complete=True)
         return
 
     complete = json.loads(complete_path.read_text())

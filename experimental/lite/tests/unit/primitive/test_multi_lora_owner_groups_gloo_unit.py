@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.distributed_test_utils import (
     build_lora_collective_descriptor,
     canonical_lora_bank_names,
@@ -171,6 +172,81 @@ def test_canonical_lora_bank_names_stabilize_rank_local_insertion_order():
     )
     assert canonical_lora_bank_names(rank_zero_order) == expected
     assert canonical_lora_bank_names(rank_two_order) == expected
+
+
+def _fixed_router_ep_coverage_worker(rank: int, world: int, init_file: str) -> None:
+    _init_gloo(rank, world, init_file)
+    try:
+        smoke_path = (
+            Path(__file__).parents[2]
+            / "smoke/primitive/test_multi_lora_ep2_production_gpu.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "multi_lora_ep2_smoke", smoke_path
+        )
+        assert spec is not None and spec.loader is not None
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        flight_dir = Path(init_file).parent / "phase_a_flight_records"
+        flight_dir.mkdir(exist_ok=True)
+        smoke._write_phase_a_flight_record(flight_dir, export_complete=True)
+        smoke._write_phase_a_flight_record(flight_dir, reference_enter=True)
+        smoke._write_phase_a_flight_record(flight_dir, reference_done=True)
+        smoke._write_phase_a_flight_record(flight_dir, preflight_done=True)
+        smoke._write_phase_a_flight_record(flight_dir, oracle_done=True)
+        flight_record = smoke._write_phase_a_flight_record(
+            flight_dir, phase_a_complete=True
+        )
+        assert flight_record == {
+            "export_complete": True,
+            "oracle_done": True,
+            "phase_a_complete": True,
+            "preflight_done": True,
+            "reference_done": True,
+            "reference_enter": True,
+        }
+        assert (flight_dir / f"phase_a_rank_{rank:05d}.json").is_file()
+        rows = torch.zeros(4, 8)
+        _scores, production_experts = smoke._fixed_local_router(rows)
+        _scores, phase_a_experts = smoke._phase_a_balanced_router(rows)
+        production_routes = tuple(int(value) for value in production_experts.flatten())
+        phase_a_routes = tuple(int(value) for value in phase_a_experts.flatten())
+        local_experts = (0, 1) if rank % 2 == 0 else (2, 3)
+        record = {
+            "rank": rank,
+            "production_routes": production_routes,
+            "production_receives_tokens": any(
+                expert in local_experts for expert in production_routes
+            ),
+            "phase_a_routes": phase_a_routes,
+            "phase_a_receives_tokens": any(
+                expert in local_experts for expert in phase_a_routes
+            ),
+        }
+        records = [None] * world
+        dist.all_gather_object(records, record, group=dist.group.WORLD)
+        assert all(item["production_routes"] == (0, 0, 0, 0) for item in records)
+        assert [item["production_receives_tokens"] for item in records] == [
+            True,
+            False,
+            True,
+            False,
+        ]
+        assert all(item["phase_a_routes"] == (0, 1, 2, 3) for item in records)
+        assert all(item["phase_a_receives_tokens"] for item in records)
+        dist.barrier(group=dist.group.WORLD)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.distributed
+def test_production_and_phase_a_routers_cover_their_tp2_ep2_contracts_gloo(tmp_path):
+    torch.multiprocessing.spawn(
+        _fixed_router_ep_coverage_worker,
+        args=(4, str(tmp_path / "fixed_router_ep_coverage")),
+        nprocs=4,
+        join=True,
+    )
 
 
 def _assert_two_owner_records(values) -> None:
