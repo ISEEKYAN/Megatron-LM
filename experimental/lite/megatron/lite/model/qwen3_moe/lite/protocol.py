@@ -169,6 +169,10 @@ def _inject_multi_lora_sidecars(kwargs, batch: PackedBatch, multi_lora_state) ->
         )
     slots = batch.extras.get("multi_lora_slots")
     if slots is None:
+        if multi_lora_state is not None:
+            raise ValueError(
+                "enabled impl_cfg.multi_lora requires multi_lora_slots in batch.extras"
+            )
         return
     if multi_lora_state is None:
         raise ValueError("multi_lora_slots requires enabled impl_cfg.multi_lora.")

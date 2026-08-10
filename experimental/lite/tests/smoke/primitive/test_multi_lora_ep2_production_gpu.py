@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Two-GPU production lifecycle proof for model-owned Qwen3-MoE multi-LoRA."""
 
+
 from __future__ import annotations
 
 import hashlib
@@ -11,18 +12,13 @@ import traceback
 from pathlib import Path
 from typing import Callable
 
+import megatron.lite.primitive.distributed_test_utils as lora_dist_utils
+import megatron.lite.runtime.contracts.config as runtime_config
 import pytest
 import torch
 import torch.distributed as dist
 from megatron.lite.primitive.ckpt import dcp
-from megatron.lite.primitive.distributed_test_utils import (
-    build_lora_collective_descriptor,
-    gather_owner_factor_records_or_raise,
-    preflight_lora_bank_collective_order,
-    select_lora_bank_owner_group,
-)
 from megatron.lite.primitive.train_step import run_microbatch_loop
-from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
 pytestmark = [
@@ -86,9 +82,9 @@ def _build_bundle(*, tp: int = 1, ep: int, model_seed: int):
     return protocol.build_model(
         _config(),
         impl_cfg=protocol.ImplConfig(
-            parallel=ParallelConfig(tp=tp, ep=ep, etp=1, pp=1, cp=1),
+            parallel=runtime_config.ParallelConfig(tp=tp, ep=ep, etp=1, pp=1, cp=1),
             optimizer="dist_opt",
-            optimizer_config=OptimizerConfig(
+            optimizer_config=runtime_config.OptimizerConfig(
                 optimizer="adam", lr=1.0e-3, weight_decay=0.0, clip_grad=1.0
             ),
             multi_lora={"names": ("alpha", "bravo"), "rank": 2, "alpha": 4},
@@ -144,16 +140,36 @@ def _tensor_record(tensor: torch.Tensor) -> dict[str, object]:
 
 
 def _write_phase_a_flight_record(
-    artifact_dir: Path, **updates: object
+    artifact_dir: Path, *, remove: tuple[str, ...] = (), **updates: object
 ) -> dict[str, object]:
     """Atomically persist rank-local Phase A progress without a collective."""
     path = artifact_dir / f"phase_a_rank_{dist.get_rank():05d}.json"
     record = json.loads(path.read_text()) if path.exists() else {}
+    for key in remove:
+        record.pop(key, None)
     record.update(updates)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(record, sort_keys=True))
     os.replace(temporary, path)
     return record
+
+
+def _run_phase_a_stage(artifact_dir: Path, stage: str, action):
+    """Record any rank-local Phase A failure before a later collective."""
+    _write_phase_a_flight_record(artifact_dir, current_stage=stage)
+    try:
+        value = action()
+    except Exception as error:
+        _write_phase_a_flight_record(
+            artifact_dir,
+            stage_error=f"{type(error).__name__}: {error}",
+            traceback=traceback.format_exc(),
+        )
+        raise
+    _write_phase_a_flight_record(
+        artifact_dir, remove=("stage_error", "traceback"), **{f"{stage}_done": True}
+    )
+    return value
 
 
 def _named_parameters(bundle) -> dict[str, torch.Tensor]:
@@ -321,10 +337,11 @@ def _fixed_local_router(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _phase_a_balanced_router(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Cycle tiny-Qwen experts so Phase A reaches both EP partitions."""
+    """Route TP-local rows across both EP partitions in Phase A."""
+    experts_per_ep = _TINY_QWEN_EXPERTS // 2
     return (
         torch.ones((x.shape[0], 1), device=x.device, dtype=x.dtype),
-        (torch.arange(x.shape[0], device=x.device) % _TINY_QWEN_EXPERTS).view(-1, 1),
+        ((torch.arange(x.shape[0], device=x.device) % 2) * experts_per_ep).view(-1, 1),
     )
 
 
@@ -344,6 +361,13 @@ def _configure_fixed_router(bundle) -> None:
     for chunk in bundle.chunks:
         qwen = getattr(chunk, "module", chunk)
         qwen.layers[0].moe.router.forward = _fixed_local_router
+
+
+def _configure_phase_a_balanced_router(bundle) -> None:
+    """Bind Phase A oracle and Phase B parity runs to the same route graph."""
+    for chunk in bundle.chunks:
+        qwen = getattr(chunk, "module", chunk)
+        qwen.layers[0].moe.router.forward = _phase_a_balanced_router
 
 
 def _bank_parameters(bundle) -> dict[str, torch.Tensor]:
@@ -415,7 +439,7 @@ def _run_bank_gradient_contract(bundle) -> None:
 
 def _adapter_export_oracle(bundle) -> dict[str, dict[str, torch.Tensor]]:
     """Export both slots through the real TP materialization + native mapper."""
-    from megatron.lite.model.qwen3_moe.lite.checkpoint import Qwen3MoEWeightSpec
+    import megatron.lite.model.qwen3_moe.lite.checkpoint as qwen_checkpoint
     from megatron.lite.primitive.ckpt.hf_weights import VLLM_LORA_NAME_PREFIX
 
     state = bundle.extras["multi_lora_training_state"]
@@ -434,7 +458,7 @@ def _adapter_export_oracle(bundle) -> dict[str, dict[str, torch.Tensor]]:
     }
     exported = {
         name: state.registry.export_hf_state(
-            name, Qwen3MoEWeightSpec(_config()), bundle.parallel_state
+            name, qwen_checkpoint.Qwen3MoEWeightSpec(_config()), bundle.parallel_state
         )
         for name in ("alpha", "bravo")
     }
@@ -502,7 +526,7 @@ def _optimizer_param_range(
     param_range = range_map["param_map"][parameter]
     buffer = optimizer.buffers[gbuf_index]
     bucket = buffer.buckets[bucket_index]
-    expected_group = select_lora_bank_owner_group(
+    expected_group = lora_dist_utils.select_lora_bank_owner_group(
         bundle.parallel_state, is_expert_bank=is_fc
     )
     expected_ranks = _group_ranks(expected_group)
@@ -537,7 +561,9 @@ def _assert_owner_group_contract(
     assert records, f"no distributed-optimizer shard found for semantic bank {name}"
     is_fc = _bank_surface_kind(bundle, _bank_parameters(bundle)[name]) == "fc"
     expected_ranks = _group_ranks(
-        select_lora_bank_owner_group(bundle.parallel_state, is_expert_bank=is_fc)
+        lora_dist_utils.select_lora_bank_owner_group(
+            bundle.parallel_state, is_expert_bank=is_fc
+        )
     )
     assert len({record["leaf_index"] for record in records}) == 1
     assert all(record["owner_group_ranks"] == expected_ranks for record in records)
@@ -573,9 +599,9 @@ def _bank_sync_absolute_oracle(
 ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     """Reference FC and attention gradients over their respective owner groups."""
     expected: dict[str, torch.Tensor] = {}
-    records = preflight_lora_bank_collective_order(
+    records = lora_dist_utils.preflight_lora_bank_collective_order(
         local_contributions,
-        lambda name: build_lora_collective_descriptor(
+        lambda name: lora_dist_utils.build_lora_collective_descriptor(
             _bank_surface_kind(bundle, _bank_parameters(bundle)[name]),
             local_contributions[name],
             _bank_parameters(bundle)[name].dtype,
@@ -614,7 +640,7 @@ def _bank_sync_absolute_oracle(
     factors: dict[str, float] = {}
     for name in sorted(expected_keys):
         is_fc = _bank_surface_kind(bundle, _bank_parameters(bundle)[name]) == "fc"
-        owner_group = select_lora_bank_owner_group(
+        owner_group = lora_dist_utils.select_lora_bank_owner_group(
             bundle.parallel_state, is_expert_bank=is_fc
         )
         expected_factor = 1.0 / (
@@ -634,7 +660,7 @@ def _bank_sync_absolute_oracle(
                 factor == expected_factor
             ), f"owner-group factor for {name} is {factor}, expected {expected_factor}"
 
-        records = gather_owner_factor_records_or_raise(
+        records = lora_dist_utils.gather_owner_factor_records_or_raise(
             owner_group,
             lambda: _local_owner_factor_record(bundle, name),
             validate_records,
@@ -901,32 +927,44 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
         torch.save(adapter_exports, export_path)
         dist.barrier()
         _write_phase_a_flight_record(artifact_dir, export_complete=True)
-        parameter_semantics = _checkpoint_semantics(bundle)
-        _write_phase_a_flight_record(artifact_dir, reference_enter=True)
-        try:
-            loss, local_contributions = _run_unsynchronized_reference(bundle, batch)
-        except Exception as error:
-            _write_phase_a_flight_record(
-                artifact_dir,
-                reference_error=f"{type(error).__name__}: {error}",
-                traceback=traceback.format_exc(),
-            )
-            raise
-        _write_phase_a_flight_record(artifact_dir, reference_done=True)
-        expected_keys = _expected_semantic_bank_keys(
-            bundle.extras["multi_lora_training_state"]
+        parameter_semantics = _run_phase_a_stage(
+            artifact_dir, "checkpoint_semantics", lambda: _checkpoint_semantics(bundle)
         )
-        assert set(local_contributions) == expected_keys
-        oracle_grads, normalization_by_key = _bank_sync_absolute_oracle(
-            bundle,
-            local_contributions,
-            preflight_done=lambda: _write_phase_a_flight_record(
-                artifact_dir, preflight_done=True
+        loss, local_contributions = _run_phase_a_stage(
+            artifact_dir,
+            "reference",
+            lambda: _run_unsynchronized_reference(bundle, batch),
+        )
+        expected_keys = _run_phase_a_stage(
+            artifact_dir,
+            "key_validation",
+            lambda: _expected_semantic_bank_keys(
+                bundle.extras["multi_lora_training_state"]
             ),
         )
+
+        def validate_local_keys() -> None:
+            assert set(local_contributions) == expected_keys
+
+        _run_phase_a_stage(artifact_dir, "key_validation", validate_local_keys)
+        oracle_grads, normalization_by_key = _run_phase_a_stage(
+            artifact_dir,
+            "oracle_collective",
+            lambda: _bank_sync_absolute_oracle(
+                bundle,
+                local_contributions,
+                preflight_done=lambda: _write_phase_a_flight_record(
+                    artifact_dir, preflight_done=True
+                ),
+            ),
+        )
+
+        def validate_oracle() -> None:
+            assert set(oracle_grads) == expected_keys
+            assert all(gradient.abs().max() > 0 for gradient in oracle_grads.values())
+
+        _run_phase_a_stage(artifact_dir, "oracle_validation", validate_oracle)
         _write_phase_a_flight_record(artifact_dir, oracle_done=True)
-        assert set(oracle_grads) == expected_keys
-        assert all(gradient.abs().max() > 0 for gradient in oracle_grads.values())
         gathered_contributions = [None] * dist.get_world_size(
             bundle.parallel_state.dp_group
         )
@@ -1006,6 +1044,10 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
                 "batch_by_rank": batches,
                 "loss_by_rank": losses,
                 "loss_normalization": "model token-loss mean",
+                "router_contract": {
+                    "oracle_and_verify": "balanced_global_experts_0_2",
+                    "production_smoke": "expert0_only",
+                },
                 "dense_dp_gradient_scaling_by_key": normalization_by_key,
                 "semantic_bank_keys": sorted(expected_keys),
                 "semantic_bank_tensors_by_rank": oracle_tensors_by_rank,
@@ -1064,6 +1106,10 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
     assert manifest["schema_version"] == 3
     assert manifest["seeds"] == {"model": 3100, "batch_base": 4100}
     assert manifest["loss_normalization"] == "model token-loss mean"
+    assert manifest["router_contract"] == {
+        "oracle_and_verify": "balanced_global_experts_0_2",
+        "production_smoke": "expert0_only",
+    }
     assert set(manifest["dense_dp_gradient_scaling_by_key"]) == set(
         manifest["semantic_bank_keys"]
     )
@@ -1223,7 +1269,11 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
             assert torch.equal(value.cpu(), adapter_export_oracle[adapter][key])
     assert _config().to_dict() == manifest["model_config"]
     assert expected_impl == manifest["impl_config"]["verify"]
-    _configure_fixed_router(bundle)
+    assert (
+        manifest["router_contract"]["oracle_and_verify"]
+        == "balanced_global_experts_0_2"
+    )
+    _configure_phase_a_balanced_router(bundle)
     _loss, production_grads = _run_production_forward_and_finalize(bundle, batch)
     assert set(production_grads) == expected_keys
     for name, oracle in oracle_grads.items():

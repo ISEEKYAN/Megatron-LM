@@ -1,22 +1,18 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """CPU Gloo contracts for multi-LoRA dist-opt bank owner groups."""
 
+
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import megatron.lite.primitive.distributed_test_utils as lora_dist_utils
 import pytest
 import torch
 import torch.distributed as dist
-from megatron.lite.primitive.distributed_test_utils import (
-    build_lora_collective_descriptor,
-    canonical_lora_bank_names,
-    gather_owner_factor_records_or_raise,
-    preflight_lora_bank_collective_order,
-    select_lora_bank_owner_group,
-)
 from megatron.lite.primitive.parallel import init_parallel
 
 
@@ -33,8 +29,10 @@ def _tp2_ep2_factor_lane_worker(rank: int, world: int, init_file: str) -> None:
         # Attention and FC banks select their distinct owner groups.
         expected_dp = (0, 2) if rank % 2 == 0 else (1, 3)
         expected_ep = (0, 1) if rank < 2 else (2, 3)
-        attention_group = select_lora_bank_owner_group(ps, is_expert_bank=False)
-        fc_group = select_lora_bank_owner_group(ps, is_expert_bank=True)
+        attention_group = lora_dist_utils.select_lora_bank_owner_group(
+            ps, is_expert_bank=False
+        )
+        fc_group = lora_dist_utils.select_lora_bank_owner_group(ps, is_expert_bank=True)
         assert attention_group is ps.dp_group
         assert fc_group is ps.ep_dp_group
         assert tuple(dist.get_process_group_ranks(attention_group)) == expected_dp
@@ -49,7 +47,7 @@ def _tp2_ep2_factor_lane_worker(rank: int, world: int, init_file: str) -> None:
             assert len(values) == 1
             assert values[0]["factor"] == 0.5
 
-        records = gather_owner_factor_records_or_raise(
+        records = lora_dist_utils.gather_owner_factor_records_or_raise(
             attention_group,
             lambda: {"rank": rank, "factor": 0.5} if rank < 2 else None,
             validate_records,
@@ -73,7 +71,9 @@ def _malformed_factor_worker(rank: int, world: int, init_file: str) -> None:
     _init_gloo(rank, world, init_file)
     try:
         ps = init_parallel(SimpleNamespace(tp=2, ep=2, etp=1, cp=1, pp=1))
-        owner_group = select_lora_bank_owner_group(ps, is_expert_bank=False)
+        owner_group = lora_dist_utils.select_lora_bank_owner_group(
+            ps, is_expert_bank=False
+        )
 
         def build_record():
             if rank == 0:
@@ -81,7 +81,7 @@ def _malformed_factor_worker(rank: int, world: int, init_file: str) -> None:
             return {"rank": rank, "factor": 0.5}
 
         try:
-            gather_owner_factor_records_or_raise(
+            lora_dist_utils.gather_owner_factor_records_or_raise(
                 owner_group, build_record, lambda values: None
             )
         except RuntimeError as error:
@@ -115,8 +115,10 @@ def _owner_boundary_worker(
     _init_gloo(rank, world, init_file)
     try:
         ps = init_parallel(SimpleNamespace(tp=tp, ep=ep, etp=1, cp=1, pp=1))
-        attention_group = select_lora_bank_owner_group(ps, is_expert_bank=False)
-        fc_group = select_lora_bank_owner_group(ps, is_expert_bank=True)
+        attention_group = lora_dist_utils.select_lora_bank_owner_group(
+            ps, is_expert_bank=False
+        )
+        fc_group = lora_dist_utils.select_lora_bank_owner_group(ps, is_expert_bank=True)
         assert attention_group is ps.dp_group
         assert fc_group is ps.ep_dp_group
         expected_attention = 1 if (tp, ep) == (2, 1) else 2
@@ -130,10 +132,10 @@ def _owner_boundary_worker(
         def validate_fc(values) -> None:
             assert len(values) == expected_fc
 
-        attention_records = gather_owner_factor_records_or_raise(
+        attention_records = lora_dist_utils.gather_owner_factor_records_or_raise(
             attention_group, lambda: {"rank": rank, "factor": 0.5}, validate_attention
         )
-        fc_records = gather_owner_factor_records_or_raise(
+        fc_records = lora_dist_utils.gather_owner_factor_records_or_raise(
             fc_group, lambda: {"rank": rank, "factor": 0.5}, validate_fc
         )
         assert all(record["factor"] == 0.5 for record in attention_records)
@@ -170,8 +172,8 @@ def test_canonical_lora_bank_names_stabilize_rank_local_insertion_order():
         "layers.0.attn.qkv.linear.weight",
         "layers.0.mlp.experts.linear_fc1.weight",
     )
-    assert canonical_lora_bank_names(rank_zero_order) == expected
-    assert canonical_lora_bank_names(rank_two_order) == expected
+    assert lora_dist_utils.canonical_lora_bank_names(rank_zero_order) == expected
+    assert lora_dist_utils.canonical_lora_bank_names(rank_two_order) == expected
 
 
 def _fixed_router_ep_coverage_worker(rank: int, world: int, init_file: str) -> None:
@@ -206,7 +208,30 @@ def _fixed_router_ep_coverage_worker(rank: int, world: int, init_file: str) -> N
             "reference_enter": True,
         }
         assert (flight_dir / f"phase_a_rank_{rank:05d}.json").is_file()
-        rows = torch.zeros(4, 8)
+        try:
+            smoke._run_phase_a_stage(
+                flight_dir,
+                "reference",
+                lambda: (_ for _ in ()).throw(AssertionError("reference failure")),
+            )
+        except AssertionError:
+            pass
+        failed_record = json.loads(
+            (flight_dir / f"phase_a_rank_{rank:05d}.json").read_text()
+        )
+        assert failed_record["current_stage"] == "reference"
+        assert failed_record["stage_error"] == "AssertionError: reference failure"
+        assert "reference failure" in failed_record["traceback"]
+        smoke._run_phase_a_stage(flight_dir, "reference", lambda: None)
+        repaired_record = json.loads(
+            (flight_dir / f"phase_a_rank_{rank:05d}.json").read_text()
+        )
+        assert "stage_error" not in repaired_record
+        assert "traceback" not in repaired_record
+        assert repaired_record["reference_done"] is True
+        dist.barrier(group=dist.group.WORLD)
+        assert not list(flight_dir.glob(".phase_a_rank_*.tmp"))
+        rows = torch.zeros(2, 8)
         _scores, production_experts = smoke._fixed_local_router(rows)
         _scores, phase_a_experts = smoke._phase_a_balanced_router(rows)
         production_routes = tuple(int(value) for value in production_experts.flatten())
@@ -225,14 +250,14 @@ def _fixed_router_ep_coverage_worker(rank: int, world: int, init_file: str) -> N
         }
         records = [None] * world
         dist.all_gather_object(records, record, group=dist.group.WORLD)
-        assert all(item["production_routes"] == (0, 0, 0, 0) for item in records)
+        assert all(item["production_routes"] == (0, 0) for item in records)
         assert [item["production_receives_tokens"] for item in records] == [
             True,
             False,
             True,
             False,
         ]
-        assert all(item["phase_a_routes"] == (0, 1, 2, 3) for item in records)
+        assert all(item["phase_a_routes"] == (0, 2) for item in records)
         assert all(item["phase_a_receives_tokens"] for item in records)
         dist.barrier(group=dist.group.WORLD)
     finally:
@@ -267,7 +292,7 @@ def _mixed_bank_collective_order_worker(rank: int, world: int, init_file: str) -
             for name in (ordered if rank % 2 == 0 else tuple(reversed(ordered)))
         }
         kinds = {ordered[0]: "fc", ordered[1]: "attention"}
-        records = preflight_lora_bank_collective_order(
+        records = lora_dist_utils.preflight_lora_bank_collective_order(
             local_banks,
             lambda name: (
                 kinds[name],
@@ -295,7 +320,7 @@ def _mixed_bank_collective_order_worker(rank: int, world: int, init_file: str) -
         dist.all_gather_object(gathered, actual, group=dist.group.WORLD)
         assert all(record[ordered[0]] == 10.0 for record in gathered)
         assert [record[ordered[1]] for record in gathered] == [4.0, 6.0, 4.0, 6.0]
-        gather_owner_factor_records_or_raise(
+        lora_dist_utils.gather_owner_factor_records_or_raise(
             ps.dp_group,
             lambda: {"rank": rank, "factor": 0.5},
             _assert_two_owner_records,
@@ -331,7 +356,7 @@ def _mixed_bank_preflight_mismatch_worker(
             )
 
         try:
-            preflight_lora_bank_collective_order(banks, describe_bank)
+            lora_dist_utils.preflight_lora_bank_collective_order(banks, describe_bank)
         except RuntimeError as error:
             result = str(error)
         else:
@@ -363,7 +388,7 @@ def _invalid_descriptor_worker(rank: int, world: int, init_file: str) -> None:
     try:
         banks = {"layers.0.attn.qkv.linear.weight": torch.ones(2, 3)}
         try:
-            preflight_lora_bank_collective_order(
+            lora_dist_utils.preflight_lora_bank_collective_order(
                 banks, lambda _name: ("invalid", (2, 3), "torch.float32")
             )
         except RuntimeError as error:
@@ -403,7 +428,9 @@ def _descriptor_builder_error_worker(rank: int, world: int, init_file: str) -> N
             return ("attention", (2, 3), "torch.float32")
 
         try:
-            preflight_lora_bank_collective_order(banks, build_descriptor)
+            lora_dist_utils.preflight_lora_bank_collective_order(
+                banks, build_descriptor
+            )
         except RuntimeError as error:
             result = str(error)
         else:
@@ -437,10 +464,14 @@ def _fc_bank_dtype_drift_worker(rank: int, world: int, init_file: str) -> None:
 
         def build_descriptor(_name):
             bank_dtype = torch.float32 if rank == 0 else torch.bfloat16
-            return build_lora_collective_descriptor("fc", banks[_name], bank_dtype)
+            return lora_dist_utils.build_lora_collective_descriptor(
+                "fc", banks[_name], bank_dtype
+            )
 
         try:
-            preflight_lora_bank_collective_order(banks, build_descriptor)
+            lora_dist_utils.preflight_lora_bank_collective_order(
+                banks, build_descriptor
+            )
         except RuntimeError as error:
             result = str(error)
         else:
@@ -474,12 +505,14 @@ def _fc_contribution_dtype_drift_worker(rank: int, world: int, init_file: str) -
 
         def build_descriptor(_name):
             reduction_tensor = banks[_name].double() if rank == 0 else banks[_name]
-            return build_lora_collective_descriptor(
+            return lora_dist_utils.build_lora_collective_descriptor(
                 "fc", reduction_tensor, torch.bfloat16
             )
 
         try:
-            preflight_lora_bank_collective_order(banks, build_descriptor)
+            lora_dist_utils.preflight_lora_bank_collective_order(
+                banks, build_descriptor
+            )
         except RuntimeError as error:
             result = str(error)
         else:
