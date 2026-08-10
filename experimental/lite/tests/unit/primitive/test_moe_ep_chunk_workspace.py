@@ -1188,6 +1188,64 @@ def test_delayed_fc2_wgrad_reads_output_before_safe_dgrad_slot_reuse(
     lease.release(_FakeEvent(ready=True))
 
 
+def test_fc1_dgrad_reuses_fc2_dgrad_only_after_swiglu_consumes_it(
+    transformer_engine_import_stub,
+):
+    """The shared dgrad slot is overwritten only after its SwiGLU consumer."""
+    (
+        _chunk_count,
+        _forward_op,
+        _backward_op,
+        _fused_op,
+        profile_type,
+        key_type,
+        registry_type,
+        _function,
+    ) = _symbols(transformer_engine_import_stub)
+    workspace = registry_type().get_or_create(
+        key_type(
+            op="fused_forward_backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=101,
+            dtype=torch.float32,
+            shape_profile=profile_type(
+                max_input_rows=8, hidden_size=2, topk=2, ep_size=2
+            ),
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    lease = workspace.acquire_expert_activation()
+    fc2_dgrad = lease.tensor("fc2_dgrad", (2, 2), dtype=torch.float32, device="cpu")
+    fc1_dgrad = lease.tensor("fc1_dgrad", (2, 2), dtype=torch.float32, device="cpu")
+    expected_fc2_dgrad = torch.tensor([[2.0, 3.0], [5.0, 7.0]])
+    fc2_dgrad.copy_(expected_fc2_dgrad)
+    events = []
+    consumed = torch.empty_like(fc2_dgrad)
+
+    class SwiGLUConsumer(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):
+            return value
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            events.append("swiglu consumes fc2_dgrad")
+            consumed.copy_(grad_output)
+            return grad_output
+
+    input_value = torch.ones_like(fc2_dgrad, requires_grad=True)
+    torch.autograd.grad(SwiGLUConsumer.apply(input_value), input_value, fc2_dgrad)
+    assert events == ["swiglu consumes fc2_dgrad"]
+    fc1_dgrad.fill_(19.0)
+    events.append("fc1 writes shared dgrad")
+
+    assert fc1_dgrad.data_ptr() == fc2_dgrad.data_ptr()
+    assert events == ["swiglu consumes fc2_dgrad", "fc1 writes shared dgrad"]
+    torch.testing.assert_close(consumed, expected_fc2_dgrad)
+    lease.release(_FakeEvent(ready=True))
+
+
 def test_colored_storage_cannot_grow_after_its_first_active_lease_view(
     transformer_engine_import_stub,
 ):
