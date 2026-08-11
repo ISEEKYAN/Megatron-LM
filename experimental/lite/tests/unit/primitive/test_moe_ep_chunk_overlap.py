@@ -144,6 +144,7 @@ def test_three_ops_direct_behavior_contracts(transformer_engine_import_stub):
             ),
             dispatcher=lambda slot: dispatchers[slot],
             reset_tensors=lambda **_kwargs: None,
+            park_expert_activations=lambda **_kwargs: None,
         )
 
     router = torch.nn.Identity()

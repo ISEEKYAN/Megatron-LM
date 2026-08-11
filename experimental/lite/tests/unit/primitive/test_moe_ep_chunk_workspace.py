@@ -407,6 +407,88 @@ def test_graph_owned_park_drops_views_without_eager_allocator_marking(
     assert coordinator.backing_tensors == {"fc1_input": tensor}
 
 
+def test_activation_only_park_preserves_workspace_slots_and_deepep_state(
+    transformer_engine_import_stub,
+):
+    """Fused lifecycle parking must not reset dispatcher slots or their scratch."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    profile = overlap.EPChunkShapeProfile(
+        max_input_rows=8, hidden_size=4, topk=2, ep_size=2
+    )
+    workspace = overlap.EPChunkWorkspaceRegistry().get_or_create(
+        overlap.EPChunkWorkspaceKey(
+            op="fused_forward_backward",
+            device_type="cuda",
+            device_index=0,
+            ep_group_id=996,
+            dtype=torch.float32,
+            shape_profile=profile,
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    workspace._materialized = True
+    coordinator = workspace._expert_activation_owner.coordinator
+    activation = _RecordableCudaTensor()
+    pending = _FakeEvent(ready=False)
+    stream = _FakeStream()
+    slot = workspace._slots[0]
+    dispatcher = object()
+    scratch = object()
+    slot.dispatcher = dispatcher
+    slot.tensors["scratch"] = scratch
+    coordinator.arena.tensors["fc1_input"] = activation
+    coordinator.backing_tensors["fc1_input"] = activation
+    coordinator.consumer_event = pending
+
+    workspace.park_expert_activations(stream=stream)
+
+    assert stream.waited == [pending]
+    assert activation.recorded_streams == [stream]
+    assert coordinator.arena.tensors == {}
+    assert coordinator.backing_tensors == {}
+    assert slot.dispatcher is dispatcher
+    assert slot.tensors == {"scratch": scratch}
+
+
+def test_activation_only_park_keeps_capture_owned_backing(
+    transformer_engine_import_stub,
+):
+    """The public lifecycle facade retains capture/replay backing."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    profile = overlap.EPChunkShapeProfile(
+        max_input_rows=8, hidden_size=4, topk=2, ep_size=2
+    )
+    workspace = overlap.EPChunkWorkspaceRegistry().get_or_create(
+        overlap.EPChunkWorkspaceKey(
+            op="fused_forward_backward",
+            device_type="cuda",
+            device_index=0,
+            ep_group_id=997,
+            dtype=torch.float32,
+            shape_profile=profile,
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    workspace._materialized = True
+    coordinator = workspace._expert_activation_owner.coordinator
+    activation = _RecordableCudaTensor()
+    stream = _FakeStream()
+    coordinator.graph_backing_owned = True
+    coordinator.arena.tensors["fc1_input"] = activation
+    coordinator.backing_tensors["fc1_input"] = activation
+    coordinator.consumer_event = _FakeEvent(ready=False)
+
+    workspace.park_expert_activations(stream=stream)
+
+    assert coordinator.arena.tensors == {}
+    assert coordinator.backing_tensors == {"fc1_input": activation}
+    assert activation.recorded_streams == []
+
+
 def test_activation_pool_parks_between_ops_at_observed_high_watermark(
     monkeypatch, transformer_engine_import_stub
 ):

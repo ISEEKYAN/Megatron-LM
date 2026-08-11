@@ -1437,6 +1437,32 @@ def test_saved_context_wrapper_keeps_scratch_until_explicit_lifecycle_reset(
     assert "cuda.synchronize" not in source
 
 
+def test_fused_backward_parks_only_activation_after_materializing_outputs(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkFusedForwardBackwardOp,
+        _EPChunkOperationBase,
+    )
+
+    fused_source = inspect.getsource(EPChunkFusedForwardBackwardOp.forward_backward)
+    backward_source = inspect.getsource(
+        _EPChunkOperationBase._full_recompute_fused_backward_v6
+    )
+
+    assert "torch.cuda.current_stream(grad_2d.device).wait_event(done)" in backward_source
+    assert backward_source.index("wait_event(done)") < backward_source.index(
+        "router_grads_out = _materialize"
+    )
+    assert fused_source.index("_full_recompute_fused_backward(") < fused_source.index(
+        "grad_x = grad_x.view_as(x_saved)"
+    ) < fused_source.index("self.workspace.park_expert_activations(")
+    assert "torch.cuda.current_stream(x_saved.device)" in fused_source
+    assert "reset_tensors" not in fused_source
+    assert "synchronize" not in fused_source
+
+
 def test_saved_backward_reuses_manual_unpermute_storage_only_after_wgrad_flush(
     transformer_engine_import_stub,
 ):

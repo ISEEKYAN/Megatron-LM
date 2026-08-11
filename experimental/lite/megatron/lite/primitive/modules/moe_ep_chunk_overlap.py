@@ -967,6 +967,17 @@ class EPChunkWorkspace:
             return
         self._prepare_slots_for_reset(stream=stream, operation="reset tensors")
 
+    def park_expert_activations(self, *, stream: Any | None = None) -> None:
+        """Park only the shared expert-activation coordinator.
+
+        This lifecycle boundary deliberately preserves workspace slots, their
+        DeepEP dispatchers, and slot scratch.  It is safe after a fused
+        backward has materialized its caller-visible outputs.
+        """
+        if not self._materialized:
+            return
+        self._expert_activation_owner.coordinator.park(stream=stream)
+
     def _prepare_slots_for_reset(
         self,
         *,
@@ -2864,7 +2875,12 @@ class EPChunkFusedForwardBackwardOp(_EPChunkOperationBase):
             grad_x, router_grads, expert_grads = self._full_recompute_fused_backward(
                 x_2d, grad_2d
             )
-        return grad_x.view_as(x_saved), router_grads, expert_grads
+        grad_x = grad_x.view_as(x_saved)
+        # _full_recompute_fused_backward has made the caller stream wait for
+        # its terminal compute event before materializing these outputs.
+        stream = torch.cuda.current_stream(x_saved.device) if x_saved.is_cuda else None
+        self.workspace.park_expert_activations(stream=stream)
+        return grad_x, router_grads, expert_grads
 
 
 def _manual_unpermute_backward(
