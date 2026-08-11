@@ -155,13 +155,17 @@ they are not a replacement for precision tests.
 ## Standalone M-FSDP
 
 The native Qwen3 MoE and Qwen3.5 implementations accept `mfsdp` as the
-optimizer selected through `impl_cfg_json`. For the no-offload path, keep
-optimizer state and parameter shards on GPU (`offload_fraction=0.0`). The
-communication-unit budget follows MCore's automatic rule unless an application
-explicitly overrides and revalidates it.
+optimizer selected through `impl_cfg_json`. With `offload_fraction=0.0`, model
+and optimizer shards remain on GPU. With full training offload
+(`offload_fraction=1.0`), the local BF16 parameter shard and FP32 Adam master,
+first moment, and second moment remain on pinned CPU memory. M-FSDP stages one
+bounded local parameter shard on GPU for each forward/backward all-gather and
+keeps the sharded FP32 main gradient on GPU until the CPU optimizer consumes it.
 
-This standalone delivery rejects nonzero `offload_fraction`; optimizer offload
-is a separate implementation and validation path.
+Full training offload selects the memory-first MCore communication policy: one
+bucket-sized communication budget and no parameter-gather prefetch. Explicit
+communication overrides are preserved and must be revalidated for the target
+workload.
 
 ```bash
 unset CUDA_DEVICE_MAX_CONNECTIONS
@@ -185,6 +189,28 @@ torchrun --standalone --nproc_per_node 8 \
     '{"offload_fraction":0.0,"use_precision_aware_optimizer":false,"gradient_accumulation_fusion":false,"megatron_fsdp_main_params_dtype":"fp32","megatron_fsdp_main_grads_dtype":"fp32","megatron_fsdp_grad_comm_dtype":"fp32"}' \
   --output-json /tmp/qwen35_mfsdp_bench.json
 ```
+
+To run the full training-offload path, keep the command unchanged except for:
+
+```bash
+--override-optimizer-json \
+  '{"offload_fraction":1.0,"gradient_accumulation_fusion":false,"megatron_fsdp_main_grads_dtype":"fp32","megatron_fsdp_grad_comm_dtype":"fp32"}'
+```
+
+Colocated train/rollout runtimes reclaim the complete training allocation via
+the existing runtime transfer boundary:
+
+```python
+runtime.to(handle, "cpu", model=True, optimizer=True, grad=True)
+# Run rollout while M-FSDP training state is offloaded.
+runtime.to(handle, "cuda", model=True, optimizer=True, grad=True)
+```
+
+The first call atomically releases communication scratch, retains the parameter
+and Adam shards on CPU, and drops the GPU main-gradient shard instead of making
+a persistent CPU gradient copy. The second call recreates an empty GPU gradient
+shard and restores training. Both calls must occur at an optimizer-step
+boundary.
 
 The storage-resize path allocates each communication bucket only while its
 lifetime is active. NCCL user buffers and fixed communication pools are not part
