@@ -33,8 +33,12 @@ from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
 )
 from megatron.lite.primitive.modules.router import TopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
+from megatron.lite.primitive.ops.chunked_linear_cross_entropy import (
+    chunked_vocab_parallel_linear_cross_entropy,
+)
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
+from megatron.lite.model.qwen3_moe.lite.head_loss import use_chunked_head_loss
 from megatron.lite.primitive.parallel import (
     ParallelState,
     VanillaColumnParallelLinear,
@@ -974,6 +978,29 @@ class Qwen3MoEModel(nn.Module):
                         output["log_probs"] = log_probs.transpose(0, 1).contiguous()
                     if calculate_entropy:
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
+                elif use_chunked_head_loss(
+                    has_labels=True,
+                    use_fused_kernels=False,
+                    calculate_entropy=calculate_entropy,
+                    has_chunked_ep=any(
+                        layer.moe.ep_chunk_forward is not None
+                        or layer.moe.ep_chunk_backward is not None
+                        or layer.moe.ep_chunk_fused is not None
+                        for layer in self.layers
+                    )
+                    and self.mtp is None,
+                ):
+                    token_loss = chunked_vocab_parallel_linear_cross_entropy(
+                        hidden_for_head,
+                        self.head.col.linear.weight,
+                        labels_sb,
+                        tp_group=self.ps.tp_group,
+                        sequence_parallel=self.ps.tp_size > 1,
+                        temperature=temperature_value,
+                    )
+                    output["loss"] = token_loss.mean()
+                    if return_log_probs:
+                        output["log_probs"] = (-token_loss).transpose(0, 1).contiguous()
                 else:
                     logits = self.head(hidden_for_head)
                     if temperature_value != 1.0:
