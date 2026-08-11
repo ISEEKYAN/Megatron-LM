@@ -234,6 +234,55 @@ def test_explicit_frozen_activation_reservation_eager_park_releases_backing(
     assert not coordinator.frozen
 
 
+def test_zero_row_activation_is_a_non_allocating_logical_view(
+    transformer_engine_import_stub,
+):
+    """Zero-token experts must not materialize a capacity-sized activation."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    profile = overlap.EPChunkShapeProfile(
+        max_input_rows=8, hidden_size=4, topk=2, ep_size=2
+    )
+    coordinator = overlap._EPChunkExpertActivationArenaCoordinator(
+        overlap._EPChunkExpertActivationArenaKey(
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=998,
+            dtype=torch.float32,
+            shape_profile=profile,
+        )
+    )
+    zero = coordinator.tensor("fc1_input", (0, 4), dtype=torch.float32, device="cpu")
+    assert zero.shape == (0, 4) and zero.dtype == torch.float32
+    assert not zero.requires_grad
+    assert coordinator.arena.tensors == {}
+    assert coordinator.capacity_bytes == {}
+    assert coordinator.issued_storage_slots == set()
+    assert coordinator.rehydrates == coordinator.grows == coordinator.allocations == 0
+
+    # Zero access is not a lease claim: the later nonzero alias can allocate normally.
+    nonzero = coordinator.tensor("fc1_input", (2, 4), dtype=torch.float32, device="cpu")
+    assert nonzero.shape == (2, 4)
+    assert coordinator.issued_storage_slots == {"fc1_input"}
+
+    coordinator.arena.tensors.clear()
+    coordinator.issued_storage_slots.clear()
+    coordinator.frozen = True
+    coordinator.capacity_bytes["fc1_input"] = 32
+    parked_zero = coordinator.tensor(
+        "fc1_input", (0, 4), dtype=torch.float32, device="cpu"
+    )
+    assert parked_zero.numel() == 0
+    assert coordinator.arena.tensors == {}
+    assert coordinator.rehydrates == 0
+    assert coordinator.capacity_bytes == {"fc1_input": 32}
+    with pytest.raises(RuntimeError, match="shape"):
+        coordinator.tensor("fc1_input", (0, 5), dtype=torch.float32, device="cpu")
+    with pytest.raises(RuntimeError, match="dtype"):
+        coordinator.tensor("fc1_input", (0, 4), dtype=torch.bfloat16, device="cpu")
+
+
 def test_capture_signature_rejects_only_a_changed_backing_slot(
     transformer_engine_import_stub,
 ):

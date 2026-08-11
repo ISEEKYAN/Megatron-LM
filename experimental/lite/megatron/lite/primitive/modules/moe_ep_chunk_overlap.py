@@ -527,6 +527,18 @@ class _EPChunkExpertActivationArenaCoordinator:
                 f"EP chunk expert activation {name!r} does not match colored storage "
                 f"{storage_name!r}"
             )
+        if requested_numel == 0:
+            # A zero-token expert is a logical view, not a request for the
+            # allocator's positive-size reuse class.  In particular, a parked
+            # frozen reservation must not rehydrate merely to represent it.
+            if previous_trailing_shape is None:
+                self.logical_trailing_shapes[name] = trailing_shape
+            self.max_requested_bytes[storage_name] = max(
+                self.max_requested_bytes.get(storage_name, 0), 0
+            )
+            if existing is not None:
+                return existing.narrow(0, 0, 0).view(requested).detach()
+            return torch.empty(requested, dtype=dtype, device=device).detach()
         reserved_capacity_bytes = self.capacity_bytes.get(storage_name, 0)
         rehydrating = existing is None and reserved_capacity_bytes > 0
         capture_now = self.frozen and self._is_current_stream_capturing()
