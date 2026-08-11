@@ -67,6 +67,35 @@ def _record_immediate_wgrad_context(store: Any) -> None:
     store._mlite_immediate_wgrad_contexts = count + 1
 
 
+def _caller_owned_dummy_is_capturing(main_grad: torch.Tensor) -> bool:
+    """Whether a dummy wgrad must retain CUDA-graph replay pointer stability."""
+    return main_grad.is_cuda and bool(torch.cuda.is_current_stream_capturing())
+
+
+def _caller_owned_dummy_wgrad(
+    main_grad: torch.Tensor, weight: torch.Tensor, *, zero: bool
+) -> torch.Tensor:
+    """Return the custom-DDP hook sentinel without retaining eager allocations.
+
+    MCore requires a non-None gradient to keep the parameter hook on the main
+    backward thread when ``grad_added_to_main_grad`` is set.  TE's provider is
+    process-global, which is correct for its native module but unnecessarily
+    retains caller-owned ChunkedEP sentinels across eager steps.  CUDA graph
+    capture is the narrow exception: TE's keyed cache supplies a replay-stable
+    address until a graph lifecycle owner is available here.
+    """
+    if _caller_owned_dummy_is_capturing(main_grad):
+        from transformer_engine.pytorch.module.base import get_dummy_wgrad
+
+        return get_dummy_wgrad(list(main_grad.shape), weight.dtype, zero=zero)
+    dummy = torch.empty(
+        tuple(main_grad.shape), dtype=weight.dtype, device=main_grad.device
+    )
+    if zero:
+        dummy.zero_()
+    return dummy.detach()
+
+
 class _CallerOwnedGroupedLinear(torch.autograd.Function):
     """TE 2.15 BF16 grouped-GEMM internals with explicit arena-owned outputs.
 
@@ -162,7 +191,6 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
         from transformer_engine.pytorch.module.base import (
             _2X_ACC_DGRAD,
             _2X_ACC_WGRAD,
-            get_dummy_wgrad,
         )
 
         inp, *weights = ctx.saved_tensors
@@ -239,9 +267,9 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
             if weight is not None and hasattr(weight, "grad_added_to_main_grad"):
                 weight.grad_added_to_main_grad = True
                 wgrad_returns.append(
-                    get_dummy_wgrad(
-                        list(main_grad.shape),
-                        weight.dtype,
+                    _caller_owned_dummy_wgrad(
+                        main_grad,
+                        weight,
                         zero=getattr(weight, "zero_out_wgrad", False),
                     )
                 )

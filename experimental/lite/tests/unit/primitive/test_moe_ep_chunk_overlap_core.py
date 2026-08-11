@@ -2163,6 +2163,55 @@ def test_caller_owned_grouped_linear_keeps_te_delayed_wgrad_contract(
     assert "torch.empty_like(inp)" not in source
 
 
+def test_caller_owned_dummy_wgrad_is_eager_scoped_and_capture_stable(
+    monkeypatch, transformer_engine_import_stub
+):
+    """Eager dummies must not become TE's process-global allocation cache."""
+    transformer_engine_import_stub()
+    import gc
+    import sys
+    import weakref
+
+    from megatron.lite.primitive.modules import experts as experts_module
+
+    base = sys.modules["transformer_engine.pytorch.module.base"]
+    cached = torch.full((2, 3), 9.0, dtype=torch.bfloat16)
+    cache_calls = []
+
+    def fake_te_dummy(shape, dtype, zero=False):
+        cache_calls.append((shape, dtype, zero))
+        if zero:
+            cached.zero_()
+        return cached
+
+    monkeypatch.setattr(base, "get_dummy_wgrad", fake_te_dummy, raising=False)
+    main_grad = torch.ones(2, 3, dtype=torch.float32)
+    weight = torch.nn.Parameter(torch.ones(2, 3, dtype=torch.bfloat16))
+
+    monkeypatch.setattr(experts_module, "_caller_owned_dummy_is_capturing", lambda _x: False)
+    first = experts_module._caller_owned_dummy_wgrad(main_grad, weight, zero=True)
+    second = experts_module._caller_owned_dummy_wgrad(main_grad, weight, zero=False)
+
+    assert first is not None and second is not None
+    assert first.shape == main_grad.shape == second.shape
+    assert first.dtype == weight.dtype == second.dtype
+    assert torch.count_nonzero(first) == 0
+    assert first.data_ptr() != second.data_ptr()
+    assert cache_calls == []
+    first_ref, second_ref = weakref.ref(first), weakref.ref(second)
+    del first, second
+    gc.collect()
+    assert first_ref() is None and second_ref() is None
+
+    monkeypatch.setattr(experts_module, "_caller_owned_dummy_is_capturing", lambda _x: True)
+    captured_first = experts_module._caller_owned_dummy_wgrad(main_grad, weight, zero=False)
+    captured_second = experts_module._caller_owned_dummy_wgrad(main_grad, weight, zero=True)
+
+    assert captured_first.data_ptr() == captured_second.data_ptr()
+    assert torch.count_nonzero(captured_second) == 0
+    assert cache_calls == [([2, 3], torch.bfloat16, False), ([2, 3], torch.bfloat16, True)]
+
+
 def test_caller_owned_grouped_linear_executes_te_lifecycle_and_partial_overlap_wgrad(
     monkeypatch, transformer_engine_import_stub
 ):
