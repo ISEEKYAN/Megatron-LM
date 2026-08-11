@@ -26,6 +26,16 @@ class _FakeStream:
         self.waited.append(event)
 
 
+class _RecordableCudaTensor:
+    is_cuda = True
+
+    def __init__(self):
+        self.recorded_streams = []
+
+    def record_stream(self, stream) -> None:
+        self.recorded_streams.append(stream)
+
+
 def test_allocation_arena_reenters_one_pool_once_and_restores_depth_after_error(
     monkeypatch, transformer_engine_import_stub
 ):
@@ -110,10 +120,10 @@ def test_owned_expert_tensor_enters_the_dedicated_activation_pool(
     lease.release(_FakeEvent(ready=True))
 
 
-def test_explicit_frozen_activation_reservation_parks_without_tensor_ownership(
+def test_explicit_frozen_activation_reservation_eager_park_releases_backing(
     monkeypatch, transformer_engine_import_stub
 ):
-    """A frozen profile retains fixed backing while park drops operation views."""
+    """Eager park drops views and backing but retains frozen capacity metadata."""
     transformer_engine_import_stub()
     import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
 
@@ -133,6 +143,7 @@ def test_explicit_frozen_activation_reservation_parks_without_tensor_ownership(
         overlap.torch.cuda, "MemPool", lambda **_kwargs: pools.append(object()) or pools[-1]
     )
     monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
+    monkeypatch.setattr(overlap.torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(overlap, "_EXPERT_ACTIVATION_SIZE_CLASS_BYTES", 1)
     profile = overlap.EPChunkShapeProfile(
         max_input_rows=8,
@@ -165,14 +176,18 @@ def test_explicit_frozen_activation_reservation_parks_without_tensor_ownership(
     assert coordinator.arena.allocation_pool is pools[0]
 
     first = forward.acquire_expert_activation(stream=stream)
-    fc1_input = first.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
-    first_input_ptr = fc1_input.data_ptr()
+    first.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
     assert set(coordinator.arena.tensors) == {"fc1_input"}
-    assert set(coordinator.backing_tensors) == {"fc1_input"}
+    assert coordinator.backing_tensors == {}
     first.release(_FakeEvent(ready=True))
     forward.reset_tensors()
     assert coordinator.arena.tensors == {}
-    assert set(coordinator.backing_tensors) == {"fc1_input"}
+    assert coordinator.backing_tensors == {}
+    assert coordinator.capacity_bytes == {
+        "fc1_input": 48,
+        "fc1_output": 72,
+        "fc2_output": 48,
+    }
 
     rehydrated = forward.acquire_expert_activation(stream=stream)
     rehydrated_input = rehydrated.tensor(
@@ -182,10 +197,11 @@ def test_explicit_frozen_activation_reservation_parks_without_tensor_ownership(
     rehydrated_fc2 = rehydrated.tensor(
         "fc2_output", (3, 4), dtype=torch.float32, device="cpu"
     )
-    assert rehydrated_input.data_ptr() == first_input_ptr
-    assert rehydrated_fc2.data_ptr() == first_input_ptr
+    assert rehydrated_fc2.data_ptr() == rehydrated_input.data_ptr()
     rehydrated.release(_FakeEvent(ready=True))
     forward.reset_tensors()
+    assert coordinator.arena.tensors == {}
+    assert coordinator.backing_tensors == {}
 
     second = fused.acquire_expert_activation(stream=stream)
     fused_fc1_input = second.tensor(
@@ -195,8 +211,10 @@ def test_explicit_frozen_activation_reservation_parks_without_tensor_ownership(
     second.tensor("fc2_output", (3, 4), dtype=torch.float32, device="cpu")
     second.release(_FakeEvent(ready=True))
     assert fused.evidence()["expert_activation_pool_id"] == forward.evidence()["expert_activation_pool_id"]
-    assert fused_fc1_input.data_ptr() == fc1_input.data_ptr()
+    assert fused_fc1_input.data_ptr() != 0
+    assert coordinator.grows == 0
     fused.reset_tensors()
+    assert coordinator.backing_tensors == {}
 
     third = forward.acquire_expert_activation(stream=stream)
     third.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
@@ -216,7 +234,7 @@ def test_explicit_frozen_activation_reservation_parks_without_tensor_ownership(
     assert not coordinator.frozen
 
 
-def test_frozen_signature_rejects_only_a_changed_backing_slot(
+def test_capture_signature_rejects_only_a_changed_backing_slot(
     transformer_engine_import_stub,
 ):
     """Slot-set growth is valid; an existing storage name may never move."""
@@ -235,12 +253,158 @@ def test_frozen_signature_rejects_only_a_changed_backing_slot(
         )
     )
     coordinator.frozen = True
+    coordinator.graph_backing_owned = True
     coordinator._record_pointer_signature("forward", {"fc1_input": 101})
     coordinator._record_pointer_signature(
         "forward", {"fc1_input": 101, "fc1_output": 202}
     )
     with pytest.raises(RuntimeError, match=r"fc1_input.*previous=101.*current=303"):
         coordinator._record_pointer_signature("forward", {"fc1_input": 303})
+
+
+def test_capture_owned_backing_survives_park_and_close_releases_everything(
+    monkeypatch, transformer_engine_import_stub
+):
+    """Capture ownership retains stable backing across replay, unlike eager park."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    @contextmanager
+    def use_device(_device):
+        yield
+
+    eager_pool_entries = []
+
+    @contextmanager
+    def use_pool(_pool, device=None):
+        assert device == torch.device("cuda", 0)
+        eager_pool_entries.append(_pool)
+        yield
+
+    capturing = {"value": True}
+    monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
+    monkeypatch.setattr(overlap.torch.cuda, "MemPool", lambda **_kwargs: object())
+    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
+    monkeypatch.setattr(overlap.torch.cuda, "is_current_stream_capturing", lambda: capturing["value"])
+    monkeypatch.setattr(overlap, "_EXPERT_ACTIVATION_SIZE_CLASS_BYTES", 1)
+    profile = overlap.EPChunkShapeProfile(
+        max_input_rows=8,
+        hidden_size=4,
+        topk=2,
+        ep_size=2,
+        expert_intermediate_size=3,
+    )
+    registry = overlap.EPChunkWorkspaceRegistry()
+
+    def workspace(op):
+        return registry.get_or_create(
+            overlap.EPChunkWorkspaceKey(
+                op=op,
+                device_type="cuda",
+                device_index=0,
+                ep_group_id=993,
+                dtype=torch.float32,
+                shape_profile=profile,
+            ),
+            lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+        )
+
+    forward, fused = workspace("forward"), workspace("fused_forward_backward")
+    stream = SimpleNamespace(device=torch.device("cuda", 0))
+    forward.reserve_expert_activations(max_expert_rows=3, device=stream.device)
+    coordinator = forward._expert_activation_owner.coordinator
+
+    capture = forward.acquire_expert_activation(stream=stream)
+    initial = capture.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
+    initial_ptr = initial.data_ptr()
+    capture.release(_FakeEvent(ready=True))
+    forward.reset_tensors()
+    assert coordinator.arena.tensors == {}
+    assert coordinator.graph_backing_owned
+    assert set(coordinator.backing_tensors) == {"fc1_input"}
+    assert eager_pool_entries == []
+
+    capturing["value"] = False
+    replay = fused.acquire_expert_activation(stream=stream)
+    replay_input = replay.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
+    assert replay_input.data_ptr() == initial_ptr
+    replay.release(_FakeEvent(ready=True))
+    fused.reset_tensors()
+    assert set(coordinator.backing_tensors) == {"fc1_input"}
+
+    registry.release(forward.key)
+    registry.release(fused.key)
+    assert coordinator.arena.tensors == {}
+    assert coordinator.backing_tensors == {}
+    assert coordinator.capacity_bytes == {}
+    assert coordinator.arena.allocation_pool is None
+    assert not coordinator.graph_backing_owned
+
+
+def test_eager_park_waits_then_records_reset_stream_before_releasing_views(
+    transformer_engine_import_stub,
+):
+    """A cross-stream reset cannot make a pending expert allocation reusable."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    coordinator = overlap._EPChunkExpertActivationArenaCoordinator(
+        overlap._EPChunkExpertActivationArenaKey(
+            device_type="cuda",
+            device_index=0,
+            ep_group_id=994,
+            dtype=torch.float32,
+            shape_profile=overlap.EPChunkShapeProfile(
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=2
+            ),
+        )
+    )
+    tensor = _RecordableCudaTensor()
+    event = _FakeEvent(ready=False)
+    stream = _FakeStream()
+    coordinator.arena.tensors["fc1_input"] = tensor
+    coordinator.consumer_event = event
+
+    coordinator.park(stream=stream)
+
+    assert stream.waited == [event]
+    assert tensor.recorded_streams == [stream]
+    assert coordinator.arena.tensors == {}
+    assert coordinator.backing_tensors == {}
+
+
+def test_graph_owned_park_drops_views_without_eager_allocator_marking(
+    transformer_engine_import_stub,
+):
+    """Graph replay retains backing and must not take the eager release path."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    coordinator = overlap._EPChunkExpertActivationArenaCoordinator(
+        overlap._EPChunkExpertActivationArenaKey(
+            device_type="cuda",
+            device_index=0,
+            ep_group_id=995,
+            dtype=torch.float32,
+            shape_profile=overlap.EPChunkShapeProfile(
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=2
+            ),
+        )
+    )
+    tensor = _RecordableCudaTensor()
+    event = _FakeEvent(ready=False)
+    stream = _FakeStream()
+    coordinator.graph_backing_owned = True
+    coordinator.arena.tensors["fc1_input"] = tensor
+    coordinator.backing_tensors["fc1_input"] = tensor
+    coordinator.consumer_event = event
+
+    coordinator.park(stream=stream)
+
+    assert stream.waited == [event]
+    assert tensor.recorded_streams == []
+    assert coordinator.arena.tensors == {}
+    assert coordinator.backing_tensors == {"fc1_input": tensor}
 
 
 def test_activation_pool_parks_between_ops_at_observed_high_watermark(

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
@@ -313,6 +313,9 @@ class _EPChunkExpertActivationArenaCoordinator:
         default_factory=dict
     )
     backing_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    # A graph owns captured allocations through replay. Keep Python backing
+    # references only for that lifetime; eager park returns them to the pool.
+    graph_backing_owned: bool = False
     frozen: bool = False
 
     def reserve(
@@ -322,7 +325,7 @@ class _EPChunkExpertActivationArenaCoordinator:
         expert_intermediate_size: int,
         device: torch.device,
     ) -> None:
-        """Freeze caller-declared capacities; backing is created on first use."""
+        """Freeze caller-declared capacities; physical backing remains lazy."""
         profile = self.key.shape_profile
         if not 0 < max_expert_rows <= profile.max_expert_rows:
             raise ValueError(
@@ -392,7 +395,7 @@ class _EPChunkExpertActivationArenaCoordinator:
     def release(self, *, op: EPChunkOpName, event: Any) -> None:
         if self.claimed_op != op:
             raise RuntimeError("EP chunk expert activation coordinator release lost owner")
-        if self.frozen:
+        if self.frozen and self.graph_backing_owned:
             self._record_pointer_signature(
                 op,
                 {
@@ -425,7 +428,12 @@ class _EPChunkExpertActivationArenaCoordinator:
         previous.update(current)
 
     def park(self, *, stream: Any | None) -> None:
-        """Drop cross-OP tensor references at an explicit model lifecycle boundary."""
+        """Park views after the consumer event without a device-wide sync.
+
+        Eager execution releases physical backing to the dedicated pool while
+        retaining frozen capacity. CUDA graph capture/replay owns backing until
+        explicit close, matching graph-private allocator lifetime.
+        """
         if self.claimed_op is not None:
             raise RuntimeError("Cannot park a leased EP chunk expert activation arena")
         event = self.consumer_event
@@ -442,9 +450,26 @@ class _EPChunkExpertActivationArenaCoordinator:
                 )
             self.waits += 1
         self.consumer_event = None
+        if stream is not None and not self.graph_backing_owned:
+            # The reset stream waits for the final expert consumer. Recording it
+            # before dropping the last eager reference keeps pool reuse ordered.
+            for tensor in self.arena.tensors.values():
+                if tensor.is_cuda:
+                    tensor.record_stream(stream)
         if self.arena.tensors:
             self.parks += 1
             self.arena.tensors.clear()
+        if not self.graph_backing_owned:
+            self.backing_tensors.clear()
+            # Eager re-acquisition may receive a new pool address; stability is
+            # a CUDA graph capture/replay contract only.
+            self.pointer_signatures_by_op.clear()
+
+    def _is_current_stream_capturing(self) -> bool:
+        """Read capture state without taking ownership of a graph pool."""
+        return self.key.device_type == "cuda" and bool(
+            torch.cuda.is_current_stream_capturing()
+        )
 
     def tensor(
         self,
@@ -504,7 +529,11 @@ class _EPChunkExpertActivationArenaCoordinator:
             )
         reserved_capacity_bytes = self.capacity_bytes.get(storage_name, 0)
         rehydrating = existing is None and reserved_capacity_bytes > 0
-        if existing is None and self.frozen:
+        capture_now = self.frozen and self._is_current_stream_capturing()
+        if capture_now:
+            # The outer graph manager owns graph_pool_handle and replay lifetime.
+            self.graph_backing_owned = True
+        if existing is None and self.frozen and self.graph_backing_owned:
             existing = self.backing_tensors.get(storage_name)
             if existing is not None:
                 self.arena.tensors[storage_name] = existing
@@ -532,10 +561,13 @@ class _EPChunkExpertActivationArenaCoordinator:
             )
             capacity_bytes = min(capacity_bytes, ceiling_capacity_bytes)
             capacity_numel = (capacity_bytes + element_size - 1) // element_size
-            with self.arena.allocate():
+            # MCore supplies graph_pool_handle to the outer torch.cuda.graph;
+            # do not override that graph-private allocator during capture.
+            allocation_scope = nullcontext() if capture_now else self.arena.allocate()
+            with allocation_scope:
                 existing = torch.empty((capacity_numel,), dtype=dtype, device=device)
             self.arena.tensors[storage_name] = existing
-            if self.frozen:
+            if self.frozen and self.graph_backing_owned:
                 self.backing_tensors[storage_name] = existing
             self.allocations += int(reserved_capacity_bytes == 0)
             self.grows += int(growing)
@@ -830,8 +862,8 @@ class EPChunkWorkspace:
         """Declare a bounded activation arena for capture or frozen measurement.
 
         This is opt-in: absent a caller capacity the arena preserves lazy-growth
-        behavior.  Frozen slots acquire fixed backing lazily; ``reset_tensors``
-        clears only operation views, while registry close drops backing and pool.
+        behavior. Frozen capacity survives eager ``reset_tensors``, but physical
+        backing survives only CUDA graph capture/replay; close drops both and pool.
         """
         profile_device = self._bind(device) if not self._materialized else self._bound_device
         if profile_device is None:
@@ -1370,6 +1402,7 @@ class EPChunkWorkspaceRegistry:
             coordinator.capacity_bytes.clear()
             coordinator.logical_trailing_shapes.clear()
             coordinator.pointer_signatures_by_op.clear()
+            coordinator.graph_backing_owned = False
             coordinator.frozen = False
             coordinator.parks = 0
             coordinator.rehydrates = 0
