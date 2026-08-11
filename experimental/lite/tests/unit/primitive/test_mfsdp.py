@@ -1207,9 +1207,10 @@ def test_mfsdp_full_offload_preserves_explicit_mcore_communication_policy():
     assert config.overlap_param_gather is True
 
 
-def test_mfsdp_full_optimizer_offload_has_six_device_bytes_per_bf16_param():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_mfsdp_full_optimizer_offload_keeps_only_grad_shards_on_device():
     _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(1.0)
-    model = _Model().to(dtype=torch.bfloat16)
+    model = _Model().to(device="cuda", dtype=torch.bfloat16)
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
         [model],
         engine_cfg=engine_cfg,
@@ -1221,12 +1222,13 @@ def test_mfsdp_full_optimizer_offload_has_six_device_bytes_per_bf16_param():
     cpu_group = inner.cpu_group
     assert cpu_group is not None
     total_numel = sum(param.numel() for param in inner.params)
-    device_param_bytes = sum(param.numel() * param.element_size() for param in inner.params)
+    assert all(param.device.type == "cpu" and param.is_pinned() for param in inner.params)
     device_grad_bytes = sum(
         bucket.main_grad_buffer.numel() * bucket.main_grad_buffer.element_size()
         for bucket in chunks[0].param_sync.buckets
     )
-    assert device_param_bytes + device_grad_bytes == 6 * total_numel
+    assert device_grad_bytes == 4 * total_numel
+    assert all(bucket.main_grad_buffer.device.type == "cuda" for bucket in chunks[0].param_sync.buckets)
     assert sum(param.numel() * param.element_size() for param in cpu_group._cpu_params) == (
         4 * total_numel
     )
@@ -1385,18 +1387,27 @@ def test_mfsdp_cuda_training_and_rollout_offloads_round_trip():
     optimizer.finish_grad_sync()
     assert optimizer.step()[0]
     assert cpu_group.d2h_bytes > 0
-    assert cpu_group.h2d_bytes > 0
+    assert cpu_group.h2d_bytes == 0
     assert any(
         not torch.equal(before, after)
         for before, after in zip(masters_before, cpu_group._cpu_params, strict=True)
     )
     assert all(bucket.device.type == "cuda" for bucket in chunks[0].param_sync.buckets)
+    assert all(
+        bucket.main_param_buffer.device.type == "cpu"
+        and bucket.main_param_buffer.is_pinned()
+        for bucket in chunks[0].param_sync.buckets
+    )
 
     optimizer.offload_for_rollout()
     assert all(bucket.device.type == "cpu" for bucket in chunks[0].param_sync.buckets)
     assert all(bucket.main_grad_buffer.numel() == 0 for bucket in chunks[0].param_sync.buckets)
     optimizer.load_from_rollout()
     assert all(bucket.device.type == "cuda" for bucket in chunks[0].param_sync.buckets)
+    assert all(
+        bucket.main_param_buffer.device.type == "cpu"
+        for bucket in chunks[0].param_sync.buckets
+    )
 
     optimizer.zero_grad()
     torch.nn.functional.mse_loss(chunks[0](value), target).backward()

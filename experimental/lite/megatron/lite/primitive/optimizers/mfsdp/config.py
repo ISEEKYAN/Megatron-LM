@@ -51,8 +51,8 @@ class MFSDPConfig:
     gradient_accumulation_fusion: bool = False
     all_gather_in_start_param_sync: bool = True
     # Full training-time optimizer offload keeps the authoritative FP32
-    # master in the CPU optimizer.  The persistent device shard is therefore
-    # the compute-dtype mirror, not a second FP32 master.
+    # master and the compute-dtype local shard on CPU. Only the current unit's
+    # bounded all-gather input is staged on device during forward/backward.
     full_optimizer_offload: bool = False
 
 

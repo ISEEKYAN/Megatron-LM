@@ -123,15 +123,15 @@ class _PinnedGradRing:
     ) -> None:
         target = param.detach().reshape(-1).narrow(0, start, length)
         source = master.reshape(-1).narrow(0, start, length)
-        if self.use_cuda:
+        if target.device.type == "cuda":
             self._ensure_runtime()
             assert self._h2d_stream is not None
             with torch.cuda.stream(self._h2d_stream):
                 target.copy_(source, non_blocking=True)
                 self._last_h2d_event = self._h2d_stream.record_event()
+            self.h2d_bytes += length * target.element_size()
         else:
             target.copy_(source.to(dtype=target.dtype))
-        self.h2d_bytes += length * target.element_size()
 
     def drain(self) -> None:
         if self._last_h2d_event is not None:
@@ -150,7 +150,7 @@ class _PinnedGradRing:
 
 
 class CpuAdamGroup:
-    """M-FSDP adapter around the shared FP32 AdamW local-shard kernel."""
+    """CPU AdamW plus bounded GPU-gradient transfers for M-FSDP shards."""
 
     _FORMAT_VERSION = 2
 
@@ -169,7 +169,11 @@ class CpuAdamGroup:
         total_numel = sum(param.numel() for param in self._gpu_params)
         use_cuda = bool(
             torch.cuda.is_available()
-            and any(param.device.type == "cuda" for param in self._gpu_params)
+            and any(
+                torch.device(getattr(param, "_mfsdp_compute_device", param.device)).type
+                == "cuda"
+                for param in self._gpu_params
+            )
         )
         self._ring = _PinnedGradRing(
             capacity=int(bucket_size), total_numel=total_numel, use_cuda=use_cuda

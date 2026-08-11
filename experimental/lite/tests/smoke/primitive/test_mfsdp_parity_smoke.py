@@ -750,7 +750,12 @@ def test_mfsdp_training_and_rollout_offload_distributed_smoke():
         return float(loss.item())
 
     first_loss = run_step(17331)
-    assert cpu_group.d2h_bytes > 0 and cpu_group.h2d_bytes > 0
+    assert cpu_group.d2h_bytes > 0 and cpu_group.h2d_bytes == 0
+    assert all(
+        bucket.main_param_buffer.device.type == "cpu"
+        and bucket.main_param_buffer.is_pinned()
+        for bucket in chunk.param_sync.buckets
+    )
     assert cpu_group.live_transfer_leases == 0
     assert cpu_group.ring_high_water_elements <= min(
         sum(param.numel() for param in cpu_group.gpu_params), 2 * 17
@@ -767,6 +772,10 @@ def test_mfsdp_training_and_rollout_offload_distributed_smoke():
     assert all(bucket.main_grad_buffer.numel() == 0 for bucket in chunk.param_sync.buckets)
     optimizer.load_from_rollout()
     assert all(bucket.device.type == "cuda" for bucket in chunk.param_sync.buckets)
+    assert all(
+        bucket.main_param_buffer.device.type == "cpu"
+        for bucket in chunk.param_sync.buckets
+    )
     second_loss = run_step(17341)
 
     if dist.get_rank() == 0:
