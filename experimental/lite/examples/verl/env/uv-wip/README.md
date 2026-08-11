@@ -24,7 +24,10 @@ environment. It prepends, in order, the uv site, VERL source, Megatron source,
 Megatron Lite package, and the local VERL integration package. Existing
 `PYTHONPATH` entries remain last. `OMP_NUM_THREADS` and `MKL_NUM_THREADS` are
 forced to `1` because the container's MKL path is not safe with the inherited
-thread defaults used by the cluster launcher.
+thread defaults used by the cluster launcher. `CC` and `CXX` are fixed to the
+container's system compilers and the CUDA/system binary directories are
+prepended to `PATH`; this prevents an inherited conda compiler from breaking
+Triton's runtime helper build against `/usr/bin/python3`.
 
 When `UV_WIP_KERNEL_SITE` is set, the launcher validates and appends both its
 `nvidia_cutlass_dsl/python_packages` directory and the site root. They stay

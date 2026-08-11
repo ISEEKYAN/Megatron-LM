@@ -39,7 +39,7 @@ def test_env_sh_exports_online_source_order_and_execs_command(tmp_path: Path) ->
     command = (
         "import json, os; "
         "print(json.dumps({k: os.environ[k] for k in "
-        "['PYTHONPATH', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS']}))"
+        "['PYTHONPATH', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'CC', 'CXX', 'PATH']}))"
     )
 
     result = subprocess.run(
@@ -68,6 +68,9 @@ def test_env_sh_exports_online_source_order_and_execs_command(tmp_path: Path) ->
     ]
     assert exported["OMP_NUM_THREADS"] == "1"
     assert exported["MKL_NUM_THREADS"] == "1"
+    assert exported["CC"] == "/usr/bin/gcc"
+    assert exported["CXX"] == "/usr/bin/g++"
+    assert exported["PATH"].split(os.pathsep)[:2] == ["/usr/local/cuda/bin", "/usr/bin"]
 
 
 def test_env_sh_fails_before_exec_when_source_contract_is_missing(

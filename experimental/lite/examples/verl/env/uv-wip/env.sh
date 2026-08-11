@@ -42,5 +42,8 @@ export PYTHONPATH="$(IFS=:; printf '%s' "${python_roots[*]}")${PYTHONPATH:+:${PY
 export PYTHONNOUSERSITE=1
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
+export CC=/usr/bin/gcc
+export CXX=/usr/bin/g++
+export PATH="/usr/local/cuda/bin:/usr/bin${PATH:+:${PATH}}"
 
 exec "$@"
