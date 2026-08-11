@@ -110,6 +110,121 @@ def test_owned_expert_tensor_enters_the_dedicated_activation_pool(
     lease.release(_FakeEvent(ready=True))
 
 
+def test_explicit_frozen_activation_reservation_parks_without_tensor_ownership(
+    monkeypatch, transformer_engine_import_stub
+):
+    """A frozen profile owns capacity in one pool, never persistent tensors."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    pools = []
+
+    @contextmanager
+    def use_device(_device):
+        yield
+
+    @contextmanager
+    def use_pool(_pool, device=None):
+        assert device == torch.device("cuda", 0)
+        yield
+
+    monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
+    monkeypatch.setattr(
+        overlap.torch.cuda, "MemPool", lambda **_kwargs: pools.append(object()) or pools[-1]
+    )
+    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
+    monkeypatch.setattr(overlap, "_EXPERT_ACTIVATION_SIZE_CLASS_BYTES", 1)
+    real_empty = torch.empty
+    pool_blocks = {}
+
+    def pool_empty(shape, *args, **kwargs):
+        """Model free-block reuse; production uses CUDA MemPool for this."""
+        if isinstance(shape, tuple) and len(shape) == 1 and shape[0] > 1:
+            key = (shape, tuple(sorted(kwargs.items())))
+            return pool_blocks.setdefault(key, real_empty(shape, *args, **kwargs))
+        return real_empty(shape, *args, **kwargs)
+
+    monkeypatch.setattr(overlap.torch, "empty", pool_empty)
+    profile = overlap.EPChunkShapeProfile(
+        max_input_rows=8,
+        hidden_size=4,
+        topk=2,
+        ep_size=2,
+        expert_intermediate_size=3,
+    )
+    registry = overlap.EPChunkWorkspaceRegistry()
+
+    def workspace(op):
+        return registry.get_or_create(
+            overlap.EPChunkWorkspaceKey(
+                op=op,
+                device_type="cuda",
+                device_index=0,
+                ep_group_id=991,
+                dtype=torch.float32,
+                shape_profile=profile,
+            ),
+            lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+        )
+
+    forward, fused = workspace("forward"), workspace("fused_forward_backward")
+    stream = SimpleNamespace(device=torch.device("cuda", 0))
+    forward.reserve_expert_activations(max_expert_rows=3, device=stream.device)
+    coordinator = forward._expert_activation_owner.coordinator
+    assert coordinator.frozen
+    assert coordinator.arena.tensors == {}
+    assert coordinator.arena.allocation_pool is pools[0]
+
+    first = forward.acquire_expert_activation(stream=stream)
+    fc1_input = first.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
+    fc1_output = first.tensor("fc1_output", (3, 6), dtype=torch.float32, device="cpu")
+    fc2_output = first.tensor("fc2_output", (3, 4), dtype=torch.float32, device="cpu")
+    assert set(coordinator.arena.tensors) == {"fc1_input", "fc1_output"}
+    assert fc2_output.data_ptr() == fc1_input.data_ptr()
+    first_signature = tuple(
+        sorted((name, tensor.data_ptr()) for name, tensor in coordinator.arena.tensors.items())
+    )
+    first.release(_FakeEvent(ready=True))
+    forward.reset_tensors()
+    assert coordinator.arena.tensors == {}
+    assert not hasattr(coordinator, "reserved_tensors")
+    del fc1_input, fc1_output, fc2_output
+
+    rehydrated = forward.acquire_expert_activation(stream=stream)
+    rehydrated.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
+    rehydrated.tensor("fc1_output", (3, 6), dtype=torch.float32, device="cpu")
+    rehydrated.tensor("fc2_output", (3, 4), dtype=torch.float32, device="cpu")
+    assert tuple(
+        sorted((name, tensor.data_ptr()) for name, tensor in coordinator.arena.tensors.items())
+    ) == first_signature
+    rehydrated.release(_FakeEvent(ready=True))
+    forward.reset_tensors()
+
+    second = fused.acquire_expert_activation(stream=stream)
+    second.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
+    second.tensor("fc1_output", (3, 6), dtype=torch.float32, device="cpu")
+    second.tensor("fc2_output", (3, 4), dtype=torch.float32, device="cpu")
+    second.release(_FakeEvent(ready=True))
+    assert fused.evidence()["expert_activation_pool_id"] == forward.evidence()["expert_activation_pool_id"]
+    fused.reset_tensors()
+
+    third = forward.acquire_expert_activation(stream=stream)
+    third.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
+    third.tensor("fc1_output", (3, 6), dtype=torch.float32, device="cpu")
+    third.tensor("fc2_output", (3, 4), dtype=torch.float32, device="cpu")
+    with pytest.raises(RuntimeError, match="Frozen EP chunk expert activation"):
+        third.tensor("fc1_input", (4, 4), dtype=torch.float32, device="cpu")
+    third.release(_FakeEvent(ready=True))
+    forward.reset_tensors()
+
+    registry.release(forward.key)
+    registry.release(fused.key)
+    assert coordinator.arena.allocation_pool is None
+    assert coordinator.capacity_bytes == {}
+    assert coordinator.pointer_signatures_by_op == {}
+    assert not coordinator.frozen
+
+
 def test_activation_pool_parks_between_ops_at_observed_high_watermark(
     monkeypatch, transformer_engine_import_stub
 ):

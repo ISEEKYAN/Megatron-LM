@@ -34,6 +34,7 @@ class EPChunkShapeProfile:
     topk: int
     ep_size: int
     chunk_count: int = 2
+    expert_intermediate_size: int | None = None
     max_recv_rows: int = field(init=False)
     max_expert_rows: int = field(init=False)
 
@@ -46,6 +47,7 @@ class EPChunkShapeProfile:
         topk: int,
         ep_size: int,
         chunk_count: int = 2,
+        expert_intermediate_size: int | None = None,
     ) -> "EPChunkShapeProfile":
         if ep_size <= 1:
             raise ValueError("Two-slot EP chunk profile requires EP > 1")
@@ -57,6 +59,7 @@ class EPChunkShapeProfile:
             topk=topk,
             ep_size=ep_size,
             chunk_count=chunk_count,
+            expert_intermediate_size=expert_intermediate_size,
         )
 
     def __post_init__(self) -> None:
@@ -306,7 +309,48 @@ class _EPChunkExpertActivationArenaCoordinator:
     max_requested_bytes: dict[str, int] = field(default_factory=dict)
     capacity_bytes: dict[str, int] = field(default_factory=dict)
     logical_trailing_shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    pointer_signatures_by_op: dict[EPChunkOpName, tuple[tuple[str, int], ...]] = field(
+        default_factory=dict
+    )
+    frozen: bool = False
 
+    def reserve(
+        self,
+        *,
+        max_expert_rows: int,
+        expert_intermediate_size: int,
+        device: torch.device,
+    ) -> None:
+        """Freeze caller-declared activation capacities without retaining tensors."""
+        profile = self.key.shape_profile
+        if not 0 < max_expert_rows <= profile.max_expert_rows:
+            raise ValueError(
+                "EP chunk max_expert_rows must be positive and within the profile ceiling"
+            )
+        if expert_intermediate_size <= 0:
+            raise ValueError("EP chunk expert_intermediate_size must be positive")
+        capacities = {
+            "fc1_input": max_expert_rows * profile.hidden_size,
+            "fc1_output": max_expert_rows * 2 * expert_intermediate_size,
+            "fc2_output": max_expert_rows * profile.hidden_size,
+        }
+        itemsize = torch.empty((), dtype=self.key.dtype).element_size()
+        capacities = {
+            name: _expert_activation_capacity_bytes(elements * itemsize)
+            for name, elements in capacities.items()
+        }
+        if self.frozen:
+            if capacities != self.capacity_bytes:
+                raise RuntimeError("EP chunk expert activation reservation is already frozen")
+            return
+        self.arena.device = self.arena.device or device
+        if self.key.device_type == "cuda" and self.arena.allocation_pool is None:
+            with torch.cuda.device(device):
+                self.arena.allocation_pool = torch.cuda.MemPool(
+                    allocator=None, use_on_oom=False, no_split=False
+                )
+        self.capacity_bytes = capacities
+        self.frozen = True
     def acquire(
         self, *, op: EPChunkOpName, stream: Any | None, device: torch.device
     ) -> None:
@@ -347,6 +391,15 @@ class _EPChunkExpertActivationArenaCoordinator:
     def release(self, *, op: EPChunkOpName, event: Any) -> None:
         if self.claimed_op != op:
             raise RuntimeError("EP chunk expert activation coordinator release lost owner")
+        if self.frozen:
+            signature = tuple(
+                sorted((name, tensor.data_ptr()) for name, tensor in self.arena.tensors.items())
+            )
+            previous_signature = self.pointer_signatures_by_op.setdefault(op, signature)
+            if previous_signature != signature:
+                raise RuntimeError(
+                    "EP chunk expert activation pointers changed after frozen rehydrate"
+                )
         self.consumer_event = event
         self.claimed_op = None
 
@@ -433,6 +486,11 @@ class _EPChunkExpertActivationArenaCoordinator:
         growing = requested_bytes > reserved_capacity_bytes > 0
         if existing is not None:
             growing = growing or requested_bytes > existing.numel() * existing.element_size()
+        if self.frozen and requested_bytes > reserved_capacity_bytes:
+            raise RuntimeError(
+                f"Frozen EP chunk expert activation {storage_name!r} requested "
+                f"{requested_bytes} bytes over reserved {reserved_capacity_bytes}"
+            )
         if growing and storage_name in self.issued_storage_slots:
             raise RuntimeError(
                 "EP chunk expert activation cannot grow colored storage "
@@ -734,6 +792,33 @@ class EPChunkWorkspace:
             self._validate_bound_device(device)
             return
         self._bind(device)
+
+    def reserve_expert_activations(
+        self,
+        *,
+        max_expert_rows: int,
+        expert_intermediate_size: int | None = None,
+        device: torch.device | str | None = None,
+    ) -> None:
+        """Declare a bounded activation arena for capture or frozen measurement.
+
+        This is opt-in: absent a caller capacity the arena preserves lazy-growth
+        behavior.  Reservation owns only MemPool capacity metadata; tensor
+        references remain operation-local and are cleared by ``reset_tensors``.
+        """
+        profile_device = self._bind(device) if not self._materialized else self._bound_device
+        if profile_device is None:
+            raise RuntimeError("EP chunk workspace has no bound device")
+        intermediate = expert_intermediate_size
+        if intermediate is None:
+            intermediate = self.key.shape_profile.expert_intermediate_size
+        if intermediate is None:
+            raise ValueError("EP chunk reservation requires expert_intermediate_size")
+        self._expert_activation_owner.coordinator.reserve(
+            max_expert_rows=max_expert_rows,
+            expert_intermediate_size=intermediate,
+            device=profile_device,
+        )
 
     def acquire(
         self,
@@ -1256,6 +1341,8 @@ class EPChunkWorkspaceRegistry:
             coordinator.max_requested_bytes.clear()
             coordinator.capacity_bytes.clear()
             coordinator.logical_trailing_shapes.clear()
+            coordinator.pointer_signatures_by_op.clear()
+            coordinator.frozen = False
             coordinator.parks = 0
             coordinator.rehydrates = 0
 

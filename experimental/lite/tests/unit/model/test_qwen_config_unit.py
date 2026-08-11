@@ -145,6 +145,7 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
             self.key = key
             self.materialize_devices = []
             self.prepare_scratch_devices = []
+            self.activation_reservations = []
 
         def reset_tensors(self, *, stream=None):
             del stream
@@ -154,6 +155,9 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
 
         def prepare_scratch(self, *, device=None):
             self.prepare_scratch_devices.append(device)
+
+        def reserve_expert_activations(self, *, max_expert_rows, device=None):
+            self.activation_reservations.append((max_expert_rows, device))
 
     class FakeOp:
         def __init__(self, **kwargs):
@@ -190,6 +194,7 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
         num_experts=128,
         hidden_size=64,
         num_experts_per_tok=8,
+        moe_intermediate_size=32,
         max_position_embeddings=17,
     )
     ps = SimpleNamespace(ep_size=8, tp_ep_group=object())
@@ -205,13 +210,16 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
     assert all(
         workspace.key.shape_profile.max_input_rows == 33
         and workspace.key.shape_profile.max_recv_rows == 17 * 8
+        and workspace.key.shape_profile.expert_intermediate_size == 32
         and workspace.key.device_index is None
         for workspace in workspaces
     )
     assert all(workspace.materialize_devices == [] for workspace in workspaces)
+    assert all(workspace.activation_reservations == [] for workspace in workspaces)
     by_op = {workspace.key.op: workspace for workspace in workspaces}
     layer.materialize_ep_chunk_workspaces(device=model.torch.device("cuda", 3))
     assert by_op["forward"].materialize_devices == [model.torch.device("cuda", 3)]
+    assert by_op["forward"].activation_reservations == []
     assert by_op["backward"].materialize_devices == []
 
     layer.materialize_ep_chunk_workspaces(
@@ -219,6 +227,15 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
     )
     assert by_op["backward"].materialize_devices == []
     assert by_op["backward"].prepare_scratch_devices == [model.torch.device("cuda", 3)]
+    assert by_op["backward"].activation_reservations == []
+
+    layer.materialize_ep_chunk_workspaces(
+        device=model.torch.device("cuda", 3), expert_activation_max_rows=19
+    )
+    assert by_op["forward"].activation_reservations == [
+        (19, model.torch.device("cuda", 3))
+    ]
+    assert by_op["backward"].activation_reservations == []
 
     stream = object()
     layer.release_ep_chunk_workspaces(phase="forward", stream=stream)

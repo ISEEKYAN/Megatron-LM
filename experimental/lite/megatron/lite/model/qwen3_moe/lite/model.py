@@ -223,6 +223,9 @@ class MoELayer(nn.Module):
             shape_profile = EPChunkShapeProfile.for_two_slot_chunked_ep(
                 max_input_rows=ep_chunk_max_token_rows_per_rank,
                 hidden_size=config.hidden_size,
+                expert_intermediate_size=getattr(
+                    config, "moe_intermediate_size", None
+                ),
                 topk=config.num_experts_per_tok,
                 ep_size=ps.ep_size,
                 chunk_count=ep_chunk_count,
@@ -355,8 +358,9 @@ class MoELayer(nn.Module):
         *,
         phase: str = "forward",
         device: torch.device | str | None = None,
+        expert_activation_max_rows: int | None = None,
     ) -> None:
-        """Materialize only the workspace needed by the requested execution phase."""
+        """Materialize one phase, optionally freezing caller-declared activations."""
         for workspace, require_dispatcher in self._ep_chunk_requirements_for_phase(
             phase
         ):
@@ -364,6 +368,11 @@ class MoELayer(nn.Module):
                 workspace.materialize(device=device)
             else:
                 workspace.prepare_scratch(device=device)
+            if expert_activation_max_rows is not None:
+                workspace.reserve_expert_activations(
+                    max_expert_rows=expert_activation_max_rows,
+                    device=device,
+                )
 
     def ep_chunk_workspace_evidence(self) -> dict[str, dict]:
         return {
