@@ -13,6 +13,7 @@ import torch.multiprocessing as mp
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops import chunked_linear_cross_entropy as chunked_lce
 from megatron.lite.primitive.ops.chunked_linear_cross_entropy import (
+    _forward_chunk_loss,
     _reuse_logits_storage_for_grad_logits,
     chunked_vocab_parallel_linear_cross_entropy,
 )
@@ -54,6 +55,35 @@ def test_chunked_linear_cross_entropy_releases_previous_softmax_before_next_wind
     chunked_vocab_parallel_linear_cross_entropy(
         hidden, weight, labels, chunk_size=2
     ).sum().backward()
+
+
+def test_chunked_linear_cross_entropy_releases_forward_logits_at_window_scope(monkeypatch):
+    torch.manual_seed(13)
+    hidden = torch.randn(6, 1, 4, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(9, 4, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.randint(0, 9, (6, 1))
+    original = chunked_lce._chunk_loss_and_softmax
+    captured_logits = []
+
+    def checked_chunk_loss(logits, *args, **kwargs):
+        captured_logits.append(weakref.ref(logits))
+        return original(logits, *args, **kwargs)
+
+    monkeypatch.setattr(chunked_lce, "_chunk_loss_and_softmax", checked_chunk_loss)
+    with torch.no_grad():
+        _forward_chunk_loss(
+            hidden.reshape(-1, 4),
+            weight,
+            labels.reshape(-1),
+            0,
+            2,
+            None,
+            0,
+            9,
+            1.25,
+        )
+    gc.collect()
+    assert captured_logits[0]() is None
 
 
 def _reference_loss(hidden, weight, labels, temperature, group=None):

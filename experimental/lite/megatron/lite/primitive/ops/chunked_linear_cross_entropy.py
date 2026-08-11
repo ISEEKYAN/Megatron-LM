@@ -27,6 +27,33 @@ def _reuse_logits_storage_for_grad_logits(
     return logits
 
 
+def _forward_chunk_loss(
+    hidden_2d: torch.Tensor,
+    weight: torch.Tensor,
+    target_1d: torch.Tensor,
+    start: int,
+    end: int,
+    tp_group,
+    vocab_start: int,
+    vocab_end: int,
+    temperature: float,
+) -> torch.Tensor:
+    """Compute one forward CE window and release its vocab logits on return."""
+    logits = hidden_2d[start:end].matmul(weight.t())
+    if temperature != 1.0:
+        logits.div_(temperature)
+    loss, _, _, _ = _chunk_loss_and_softmax(
+        logits,
+        target_1d[start:end],
+        tp_group,
+        vocab_start,
+        vocab_end,
+        return_softmax=False,
+    )
+    del logits
+    return loss
+
+
 class _ChunkedVocabParallelLinearCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -64,16 +91,16 @@ class _ChunkedVocabParallelLinearCrossEntropy(torch.autograd.Function):
         loss = torch.empty(target_1d.shape, dtype=torch.float32, device=hidden.device)
         for start in range(0, target_1d.numel(), chunk_size):
             end = min(start + chunk_size, target_1d.numel())
-            logits = hidden_2d[start:end].matmul(weight.t())
-            if temperature != 1.0:
-                logits = logits / temperature
-            loss[start:end], _, _, _ = _chunk_loss_and_softmax(
-                logits,
-                target_1d[start:end],
+            loss[start:end] = _forward_chunk_loss(
+                hidden_2d,
+                weight,
+                target_1d,
+                start,
+                end,
                 tp_group,
                 vocab_start,
                 vocab_end,
-                return_softmax=False,
+                temperature,
             )
 
         ctx.save_for_backward(total_hidden, weight, target)
