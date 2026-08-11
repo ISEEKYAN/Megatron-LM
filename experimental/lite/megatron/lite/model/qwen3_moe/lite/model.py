@@ -62,6 +62,7 @@ class _Qwen3TransformerLayerFullRecomputeFunction(torch.autograd.Function):
         position_ids: torch.Tensor | None,
         packed_seq_params,
         layer: "TransformerLayer",
+        park_chunked_ep_after_backward: bool,
         *params: torch.Tensor,
     ):
         # ``Function.apply`` must make the initial whole-layer pass graph-free:
@@ -87,6 +88,7 @@ class _Qwen3TransformerLayerFullRecomputeFunction(torch.autograd.Function):
         )
         del params
         ctx.layer = layer
+        ctx.park_chunked_ep_after_backward = park_chunked_ep_after_backward
         ctx.position_ids = position_ids
         ctx.packed_seq_params = packed_seq_params
         ctx.save_for_backward(x.detach())
@@ -145,6 +147,11 @@ class _Qwen3TransformerLayerFullRecomputeFunction(torch.autograd.Function):
                     (grad_norm, grad_output),
                     allow_unused=True,
                 )
+                if ctx.park_chunked_ep_after_backward:
+                    stream = torch.cuda.current_stream(x.device) if x.is_cuda else None
+                    layer.moe.ep_chunk_fused.workspace.park_expert_activations(
+                        stream=stream
+                    )
         finally:
             torch.set_rng_state(current_cpu_rng_state)
             if current_cuda_rng_state is not None:
@@ -165,6 +172,7 @@ class _Qwen3TransformerLayerFullRecomputeFunction(torch.autograd.Function):
             raise RuntimeError("Qwen3 full-recompute parameter gradient order changed")
         return (
             grad_x,
+            None,
             None,
             None,
             None,
@@ -530,6 +538,7 @@ class TransformerLayer(nn.Module):
         x: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         packed_seq_params=None,
+        park_chunked_ep_after_backward: bool = False,
     ) -> torch.Tensor:
         if self.moe.ep_chunk_full_recompute and torch.is_grad_enabled():
             params = (
@@ -539,7 +548,7 @@ class TransformerLayer(nn.Module):
                 *tuple(self.moe.experts.parameters()),
             )
             return _Qwen3TransformerLayerFullRecomputeFunction.apply(
-                x, position_ids, packed_seq_params, self, *params
+                x, position_ids, packed_seq_params, self, park_chunked_ep_after_backward, *params
             )
         residual = x
         h = self.attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
@@ -903,9 +912,14 @@ class Qwen3MoEModel(nn.Module):
         with fp8_ctx:
             if self.embed is not None:
                 h = scatter_to_sequence_parallel(h, self.ps)
+            final_local_backward_chunked_ep = next(
+                (layer for layer in self.layers if layer.moe.ep_chunk_fused is not None),
+                None,
+            )
             for layer in self.layers:
                 h = layer(
-                    h, position_ids=position_ids, packed_seq_params=packed_seq_params
+                    h, position_ids=position_ids, packed_seq_params=packed_seq_params,
+                    park_chunked_ep_after_backward=layer is final_local_backward_chunked_ep,
                 )
             # Head path is SP-aware: norm runs on SP-sharded [S/tp, B, H] and
             # head's internal all-gather happens inside VocabParallelOutput.

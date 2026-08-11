@@ -360,6 +360,7 @@ def test_qwen3_resets_chunked_ep_views_after_last_moe_before_head_work(
 
     class MainMoE:
         ep_chunk_forward = object()
+        ep_chunk_fused = None
 
         def reset_ep_chunk_workspace_tensors(self, *, phase, stream):
             assert phase == "forward"
@@ -432,6 +433,57 @@ def test_qwen3_resets_chunked_ep_views_after_last_moe_before_head_work(
     else:
         assert events.index("main_moe") < reset
         assert "head" not in events
+
+
+def test_qwen3_marks_only_final_local_backward_moe_for_one_park(
+    transformer_engine_import_stub,
+):
+    """Forward L0/L1 maps to reverse backward L1/L0 with one final park."""
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import model
+
+    events = []
+
+    class Workspace:
+        def park_expert_activations(self, **_kwargs):
+            events.append("park")
+
+    workspace = Workspace()
+
+    class Layer:
+        def __init__(self, name):
+            self.name = name
+            self.moe = SimpleNamespace(
+                ep_chunk_forward=None,
+                ep_chunk_fused=SimpleNamespace(workspace=workspace),
+            )
+
+        def __call__(self, hidden_states, *, park_chunked_ep_after_backward, **_kwargs):
+            events.append((self.name, park_chunked_ep_after_backward))
+            return hidden_states
+
+    qwen = model.Qwen3MoEModel.__new__(model.Qwen3MoEModel)
+    torch.nn.Module.__init__(qwen)
+    qwen.embed = None
+    qwen._input_tensor = None
+    qwen.fp8 = False
+    qwen.layers = [Layer("L0"), Layer("L1")]
+    qwen.ps = SimpleNamespace(tp_group=None)
+    qwen.norm = None
+    qwen.head = None
+    qwen.mtp = None
+    qwen.mtp_enable_train = False
+    qwen(hidden_states=torch.ones(1, 1, 1))
+
+    assert events[:2] == [("L0", True), ("L1", False)]
+    # Simulate autograd's reverse callback order: L1 first must not park;
+    # L0 is the final local MoE consumer and parks after its output/grad.
+    for name, should_park in reversed(events[:2]):
+        events.append(f"{name}:output_grad")
+        if should_park:
+            workspace.park_expert_activations()
+    assert events[-3:] == ["L1:output_grad", "L0:output_grad", "park"]
+    assert events.count("park") == 1
 
 
 @pytest.mark.parametrize(
@@ -874,7 +926,7 @@ def test_qwen3_full_layer_recompute_runs_no_grad_once_and_recomputes_moe_once(
         *layer.moe.experts.parameters(),
     )
     actual = _Qwen3TransformerLayerFullRecomputeFunction.apply(
-        value, None, None, layer, *params
+        value, None, None, layer, False, *params
     )
     torch.testing.assert_close(actual, value.detach() * 21)
     actual.sum().backward()
@@ -908,7 +960,9 @@ def test_qwen3_full_recompute_custom_function_forward_is_framework_no_grad(
     )
     value = torch.randn(2, 4, requires_grad=True)
 
-    output = _Qwen3TransformerLayerFullRecomputeFunction.apply(value, None, None, layer)
+    output = _Qwen3TransformerLayerFullRecomputeFunction.apply(
+        value, None, None, layer, False
+    )
 
     assert output.requires_grad
     assert output.grad_fn is not None
@@ -926,7 +980,7 @@ def test_qwen3_full_layer_recompute_rejects_differentiable_position_ids(
     position_ids = torch.ones(1, 1, requires_grad=True)
     with pytest.raises(RuntimeError, match="position_ids must not require gradients"):
         _Qwen3TransformerLayerFullRecomputeFunction.apply(
-            value, position_ids, None, SimpleNamespace()
+            value, position_ids, None, SimpleNamespace(), False
         )
 
 
@@ -992,7 +1046,7 @@ def test_qwen3_full_layer_recompute_restores_rng_for_dropout_replay(
     torch.manual_seed(20260810)
 
     output = _Qwen3TransformerLayerFullRecomputeFunction.apply(
-        value, None, None, layer, *layer.mlp_norm.parameters()
+        value, None, None, layer, False, *layer.mlp_norm.parameters()
     )
     output.sum().backward()
 

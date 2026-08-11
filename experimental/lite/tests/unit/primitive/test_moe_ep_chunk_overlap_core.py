@@ -1437,7 +1437,7 @@ def test_saved_context_wrapper_keeps_scratch_until_explicit_lifecycle_reset(
     assert "cuda.synchronize" not in source
 
 
-def test_fused_backward_parks_activation_views_after_consumer_completion(
+def test_fused_backward_leaves_parking_to_qwen_composition(
     transformer_engine_import_stub,
 ):
     transformer_engine_import_stub()
@@ -1458,18 +1458,15 @@ def test_fused_backward_parks_activation_views_after_consumer_completion(
     assert fused_source.index("_full_recompute_fused_backward(") < fused_source.index(
         "grad_x = grad_x.view_as(x_saved)"
     )
-    assert "self.workspace.park_expert_activations(" in fused_source
-    assert fused_source.index("grad_x = grad_x.view_as(x_saved)") < fused_source.index(
-        "self.workspace.park_expert_activations("
-    )
+    assert "self.workspace.park_expert_activations(" not in fused_source
     assert "reset_tensors" not in fused_source
     assert "synchronize" not in fused_source
 
 
-def test_fused_backward_parks_after_each_completed_step(
+def test_fused_backward_does_not_park_per_layer(
     transformer_engine_import_stub,
 ):
-    """The fused boundary releases views while its dedicated pool retains blocks."""
+    """Primitive fused recompute leaves the composition boundary to park once."""
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
         EPChunkFusedForwardBackwardOp,
@@ -1496,7 +1493,7 @@ def test_fused_backward_parks_after_each_completed_step(
         grad_x, router_grads, expert_grads = op.forward_backward(x, grad)
         torch.testing.assert_close(grad_x, grad)
         assert router_grads == expert_grads == []
-    assert workspace.park_calls == 2
+    assert workspace.park_calls == 0
 
 
 def test_saved_backward_reuses_manual_unpermute_storage_only_after_wgrad_flush(
