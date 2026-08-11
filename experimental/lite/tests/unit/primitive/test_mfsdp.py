@@ -19,6 +19,7 @@ from megatron.lite.primitive.optimizers.mfsdp import buffer as mfsdp_buffer
 from megatron.lite.primitive.optimizers.mfsdp import config as mfsdp_config
 from megatron.lite.primitive.optimizers.mfsdp import fused_ops as mfsdp_fused_ops
 from megatron.lite.primitive.optimizers.mfsdp import optimizer as mfsdp_optimizer
+from megatron.lite.primitive.optimizers.mfsdp import wrapper as mfsdp_wrapper
 from megatron.lite.runtime.contracts.config import ParallelConfig
 
 
@@ -1255,6 +1256,52 @@ def test_mfsdp_parallel_metadata_uses_topology_and_explicit_classifier():
     assert model.routed_matrix.tensor_model_parallel is False
     assert model.routed_matrix.allreduce is False
     assert model.replicated_matrix.tensor_model_parallel is False
+
+
+def test_mfsdp_intersecting_parallel_groups_disable_param_gather_overlap(
+    monkeypatch, caplog
+):
+    config = mfsdp_config.MFSDPConfig(overlap_param_gather=True)
+    ps = SimpleNamespace(
+        tp_size=2,
+        cp_size=2,
+        ep_size=2,
+        etp_size=2,
+        dp_cp_size=2,
+        expert_dp_size=1,
+    )
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+
+    with caplog.at_level("WARNING"):
+        ordered_config = mfsdp_optimizer._order_param_gathers_for_parallel_collectives(
+            config, ps
+        )
+
+    assert ordered_config.overlap_param_gather is False
+    assert "intersecting process groups" in caplog.text
+
+
+def test_mfsdp_start_param_sync_materializes_synchronously_when_overlap_is_disabled():
+    events = []
+    module = SimpleNamespace(
+        mfsdp_config=SimpleNamespace(
+            overlap_param_gather=False,
+            all_gather_in_start_param_sync=True,
+        ),
+        param_sync=SimpleNamespace(
+            buckets=[object()],
+            materialize_all=lambda: events.append("materialize"),
+        ),
+        all_gather_pipeline=SimpleNamespace(
+            async_bucket_gather=lambda bucket_id: events.append(
+                ("async_bucket_gather", bucket_id)
+            )
+        ),
+    )
+
+    mfsdp_wrapper.MFSdpModule.start_param_sync(module)
+
+    assert events == ["materialize"]
 
 
 def test_mfsdp_marks_sequence_parallel_shards_for_tp_gradient_sync():

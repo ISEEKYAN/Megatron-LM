@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable, Iterable
 from dataclasses import replace
@@ -30,6 +31,8 @@ from megatron.lite.primitive.optimizers.mfsdp.grad_norm import (
     resolve_torch_dtype,
 )
 from megatron.lite.primitive.optimizers.mfsdp.wrapper import MFSdpModule
+
+logger = logging.getLogger(__name__)
 
 ExpertClassifierFn = Callable[[str], bool]
 _MFSDP_PARAM_VALUES_KEY = "_mfsdp_param_values"

@@ -1308,13 +1308,17 @@ def _resolve_param_name(name: str, state_dict: dict) -> str | None:
     canonical = {canonical_state_key(key): key for key in state_dict}
     if name in canonical:
         return canonical[name]
+    wrapper_segments = {"module", "_fsdp_wrapped_module"}
+    suffix = f".{name}"
     for logical_name, key in canonical.items():
-        # Wrapped modules may prefix the logical key (for example
-        # ``module.layers.0...``), but an arbitrary substring is not a valid
-        # parameter match.  In particular, a PP stage without the final
-        # ``norm.weight`` used to bind that stage-global tensor to a local
-        # ``q_norm.weight`` and then fail with a misleading shape mismatch.
-        if logical_name.endswith(f".{name}"):
+        # Wrapped modules may add known transparent prefixes to the complete
+        # logical key.  Do not accept an arbitrary suffix: on a non-final PP
+        # stage, bare ``norm.weight`` would otherwise bind to the distinct
+        # layer-local ``layers.N.linear_attn.norm.weight``.
+        if not logical_name.endswith(suffix):
+            continue
+        prefix = logical_name[: -len(suffix)]
+        if prefix and all(part in wrapper_segments for part in prefix.split(".")):
             return key
     return None
 

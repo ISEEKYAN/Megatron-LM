@@ -221,10 +221,11 @@ class MegatronFSDP(nn.Module):
         return output
 
     def start_param_sync(self, *_args, force_sync: bool = False, **_kwargs) -> None:
-        if force_sync:
+        if force_sync or not self.mfsdp_config.overlap_param_gather:
             self.param_sync.materialize_all()
         elif (
-            self.mfsdp_config.all_gather_in_start_param_sync and self.param_sync.buckets
+            self.mfsdp_config.all_gather_in_start_param_sync
+            and self.param_sync.buckets
         ):
             self.all_gather_pipeline.async_bucket_gather(0)
 

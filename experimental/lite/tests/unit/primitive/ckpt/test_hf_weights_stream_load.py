@@ -8,10 +8,24 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
+    _resolve_param_name,
     SafeTensorReader,
     export_hf_weights,
     load_hf_weights,
 )
+
+
+def test_resolve_param_name_accepts_only_transparent_wrapper_prefixes() -> None:
+    state = {
+        "module._fsdp_wrapped_module.layers.0.weight": torch.zeros(1),
+        "layers.0.linear_attn.norm.weight": torch.zeros(128),
+    }
+
+    assert (
+        _resolve_param_name("layers.0.weight", state)
+        == "module._fsdp_wrapped_module.layers.0.weight"
+    )
+    assert _resolve_param_name("norm.weight", state) is None
 
 
 def _stub_parallel_import(monkeypatch) -> None:
@@ -181,8 +195,10 @@ def test_dense_mappings_copy_before_reading_the_next_mapping(monkeypatch) -> Non
     ]
 
 
-def test_pp_stage_without_final_norm_does_not_match_layer_q_norm(monkeypatch) -> None:
-    """A stage-global ``norm.weight`` must not substring-match ``q_norm.weight``."""
+def test_pp_stage_without_final_norm_does_not_match_nested_layer_norms(
+    monkeypatch,
+) -> None:
+    """A stage-global ``norm.weight`` must not suffix-match a layer-local norm."""
     _stub_parallel_import(monkeypatch)
 
     class Model(nn.Module):
@@ -193,6 +209,9 @@ def test_pp_stage_without_final_norm_does_not_match_layer_q_norm(monkeypatch) ->
             self.layers[0].attn = nn.Module()
             self.layers[0].attn.q_norm = nn.Module()
             self.layers[0].attn.q_norm.weight = nn.Parameter(torch.zeros(128))
+            self.layers[0].linear_attn = nn.Module()
+            self.layers[0].linear_attn.norm = nn.Module()
+            self.layers[0].linear_attn.norm.weight = nn.Parameter(torch.zeros(128))
 
     model = Model()
 
@@ -238,6 +257,7 @@ def test_pp_stage_without_final_norm_does_not_match_layer_q_norm(monkeypatch) ->
     load_hf_weights(model, "unused", Spec(), ps)
 
     assert torch.count_nonzero(model.layers[0].attn.q_norm.weight) == 0
+    assert torch.count_nonzero(model.layers[0].linear_attn.norm.weight) == 0
 
 
 @pytest.mark.parametrize("tp_rank", [0, 1])

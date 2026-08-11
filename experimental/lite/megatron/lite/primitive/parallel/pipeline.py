@@ -688,7 +688,9 @@ def _run_pipeline_chunk_forward(
 ) -> dict:
     _set_aux_loss_scale(pre_forward_hook, num_microbatches)
     if not is_first_stage:
-        model.set_input_tensor(input_tensor)
+        from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
+
+        unwrap_model(model).set_input_tensor(input_tensor)
     out = forward_step_fn(model, batch)
     if is_last_stage:
         _apply_external_loss(out, batch, loss_fn)
