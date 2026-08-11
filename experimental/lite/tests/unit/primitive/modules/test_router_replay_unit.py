@@ -186,7 +186,7 @@ def test_supported_moe_protocols_expose_mtp_safe_replay_roots(protocol_name):
     from pathlib import Path
 
     protocol_path = (
-        Path(__file__).parents[3]
+        Path(__file__).parents[4]
         / "megatron"
         / "lite"
         / "model"
