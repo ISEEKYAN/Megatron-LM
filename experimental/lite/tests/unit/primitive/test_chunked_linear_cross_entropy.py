@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import math
 import socket
 import weakref
 
@@ -85,6 +86,38 @@ def test_chunked_linear_cross_entropy_cuda_fast_path_materializes_stride_zero_dl
         monkeypatch.undo()
 
     assert kernel_strides == [(1,), (1,)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton")
+@pytest.mark.parametrize("rows", [14135, 14136, 16384])
+def test_chunked_linear_cross_entropy_cuda_row_base_offsets_support_large_vocab_windows(rows):
+    vocab = 151936
+    logits = torch.zeros((rows, vocab), device="cuda", dtype=torch.bfloat16)
+    target = torch.zeros(rows, device="cuda", dtype=torch.long)
+
+    loss = chunked_lce._cuda_lce.token_loss(logits, target)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(loss, torch.full_like(loss, math.log(vocab)))
+
+    if rows == 16384:
+        grad_output = torch.ones(rows, device="cuda", dtype=torch.float32)
+        grad_logits = chunked_lce._cuda_lce.inplace_gradient(
+            logits, target, grad_output, 1.0
+        )
+        torch.cuda.synchronize()
+        assert grad_logits.data_ptr() == logits.data_ptr()
+        torch.testing.assert_close(
+            grad_logits[:, 0].float(),
+            torch.full((rows,), -(1.0 - 1.0 / vocab), device="cuda"),
+            rtol=0.0,
+            atol=0.004,
+        )
+        torch.testing.assert_close(
+            grad_logits[:, 1].float(),
+            torch.full((rows,), 1.0 / vocab, device="cuda"),
+            rtol=0.0,
+            atol=0.004,
+        )
 
 
 def test_chunked_linear_cross_entropy_reuses_logits_storage_for_bf16_dlogits():

@@ -38,15 +38,15 @@ if triton is not None:
     @triton.jit
     def _partial_max_kernel(logits, partial, vocab: tl.constexpr, tiles: tl.constexpr, BLOCK: tl.constexpr):
         program = tl.program_id(0)
-        row = program // tiles
+        row = (program // tiles).to(tl.int64)
         tile = program % tiles
         columns = tile * BLOCK + tl.arange(0, BLOCK)
         values = tl.load(logits + row * vocab + columns, mask=columns < vocab, other=-float("inf"))
-        tl.store(partial + program, tl.max(values.to(tl.float32), axis=0))
+        tl.store(partial + row * tiles + tile, tl.max(values.to(tl.float32), axis=0))
 
     @triton.jit
     def _final_max_kernel(partial, row_max, tiles: tl.constexpr, REDUCE_BLOCK: tl.constexpr):
-        row = tl.program_id(0)
+        row = tl.program_id(0).to(tl.int64)
         offsets = tl.arange(0, REDUCE_BLOCK)
         values = tl.load(partial + row * tiles + offsets, mask=offsets < tiles, other=-float("inf"))
         tl.store(row_max + row, tl.max(values, axis=0))
@@ -54,24 +54,24 @@ if triton is not None:
     @triton.jit
     def _partial_sum_kernel(logits, row_max, partial, vocab: tl.constexpr, tiles: tl.constexpr, BLOCK: tl.constexpr):
         program = tl.program_id(0)
-        row = program // tiles
+        row = (program // tiles).to(tl.int64)
         tile = program % tiles
         columns = tile * BLOCK + tl.arange(0, BLOCK)
         values = tl.load(logits + row * vocab + columns, mask=columns < vocab, other=-float("inf")).to(tl.float32)
         values -= tl.load(row_max + row)
         exp_values = tl.exp(values)
-        tl.store(partial + program, tl.sum(exp_values, axis=0))
+        tl.store(partial + row * tiles + tile, tl.sum(exp_values, axis=0))
 
     @triton.jit
     def _final_sum_kernel(partial, row_sum, tiles: tl.constexpr, REDUCE_BLOCK: tl.constexpr):
-        row = tl.program_id(0)
+        row = tl.program_id(0).to(tl.int64)
         offsets = tl.arange(0, REDUCE_BLOCK)
         values = tl.load(partial + row * tiles + offsets, mask=offsets < tiles, other=0.0)
         tl.store(row_sum + row, tl.sum(values, axis=0))
 
     @triton.jit
     def _final_loss_kernel(logits, target, row_max, row_sum, loss, vocab: tl.constexpr):
-        row = tl.program_id(0)
+        row = tl.program_id(0).to(tl.int64)
         target_column = tl.load(target + row)
         target_logit = tl.load(logits + row * vocab + target_column).to(tl.float32)
         tl.store(loss + row, tl.log(tl.load(row_sum + row)) + tl.load(row_max + row) - target_logit)
@@ -89,7 +89,7 @@ if triton is not None:
         BLOCK: tl.constexpr,
     ):
         program = tl.program_id(0)
-        row = program // tiles
+        row = (program // tiles).to(tl.int64)
         tile = program % tiles
         columns = tile * BLOCK + tl.arange(0, BLOCK)
         values = tl.load(logits + row * vocab + columns, mask=columns < vocab, other=-float("inf")).to(tl.float32)
