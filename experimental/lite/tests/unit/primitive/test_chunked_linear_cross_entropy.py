@@ -13,13 +13,78 @@ import torch.multiprocessing as mp
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops import chunked_linear_cross_entropy as chunked_lce
 from megatron.lite.primitive.ops.chunked_linear_cross_entropy import (
+    _cuda_tp1_fast_path_eligible,
     _forward_chunk_loss,
+    _row_reduce_workspace_shape,
     _reuse_logits_storage_for_grad_logits,
     chunked_vocab_parallel_linear_cross_entropy,
 )
 
 
 pytestmark = pytest.mark.mlite
+
+
+@pytest.mark.parametrize(
+    ("is_cuda", "dtype", "tp_world_size", "triton_available", "expected"),
+    [
+        (True, torch.bfloat16, 1, True, True),
+        (False, torch.bfloat16, 1, True, False),
+        (True, torch.float32, 1, True, False),
+        (True, torch.float64, 1, True, False),
+        (True, torch.bfloat16, 2, True, False),
+        (True, torch.bfloat16, 1, False, False),
+    ],
+)
+def test_chunked_linear_cross_entropy_cuda_fast_path_is_tp1_only(
+    is_cuda, dtype, tp_world_size, triton_available, expected
+):
+    assert (
+        _cuda_tp1_fast_path_eligible(
+            is_cuda=is_cuda,
+            dtype=dtype,
+            tp_world_size=tp_world_size,
+            triton_available=triton_available,
+        )
+        is expected
+    )
+
+
+def test_chunked_linear_cross_entropy_cuda_row_reduce_workspace_is_not_vocab_shaped():
+    rows, vocab, block = 1024, 151936, 4096
+
+    partial_shape, row_shape = _row_reduce_workspace_shape(rows, vocab, block)
+
+    assert partial_shape == (rows, 38)
+    assert row_shape == (rows,)
+    assert partial_shape != (rows, vocab)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton")
+def test_chunked_linear_cross_entropy_cuda_fast_path_materializes_stride_zero_dloss():
+    torch.manual_seed(19)
+    hidden = torch.randn(4, 3, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(11, 3, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.randint(0, 11, (4,), device="cuda")
+    kernel_strides = []
+    original = chunked_lce._cuda_lce.inplace_gradient
+
+    def record_gradient(logits, target, grad_output, temperature):
+        kernel_strides.append(grad_output.stride())
+        return original(logits, target, grad_output, temperature)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(chunked_lce._cuda_lce, "inplace_gradient", record_gradient)
+    try:
+        loss = chunked_vocab_parallel_linear_cross_entropy(
+            hidden, weight, labels, chunk_size=2
+        )
+        upstream = torch.ones(1, device="cuda").expand_as(loss)
+        assert upstream.stride() == (0,)
+        loss.backward(upstream)
+    finally:
+        monkeypatch.undo()
+
+    assert kernel_strides == [(1,), (1,)]
 
 
 def test_chunked_linear_cross_entropy_reuses_logits_storage_for_bf16_dlogits():

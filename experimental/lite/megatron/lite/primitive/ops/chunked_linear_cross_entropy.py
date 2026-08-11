@@ -11,12 +11,27 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
+from megatron.lite.primitive.ops import _chunked_linear_cross_entropy_cuda as _cuda_lce
 from megatron.lite.primitive.ops.cross_entropy import (
     _DEFAULT_CHUNK_SIZE,
     _chunk_loss_and_softmax,
     _tp_info,
     _vocab_range,
 )
+
+
+def _cuda_tp1_fast_path_eligible(
+    *, is_cuda: bool, dtype: torch.dtype, tp_world_size: int, triton_available: bool
+) -> bool:
+    """Keep the row-reduction implementation strictly to CUDA BF16 TP1."""
+    return is_cuda and dtype is torch.bfloat16 and tp_world_size == 1 and triton_available
+
+
+def _row_reduce_workspace_shape(
+    rows: int, vocab: int, block: int = _cuda_lce.ROW_BLOCK
+) -> tuple[tuple[int, int], tuple[int]]:
+    """Expose the private fast-path workspace contract to focused tests."""
+    return _cuda_lce.workspace_shape(rows, vocab, block)
 
 
 def _reuse_logits_storage_for_grad_logits(
@@ -37,19 +52,23 @@ def _forward_chunk_loss(
     vocab_start: int,
     vocab_end: int,
     temperature: float,
+    use_cuda_fast_path: bool = False,
 ) -> torch.Tensor:
     """Compute one forward CE window and release its vocab logits on return."""
     logits = hidden_2d[start:end].matmul(weight.t())
     if temperature != 1.0:
         logits.div_(temperature)
-    loss, _, _, _ = _chunk_loss_and_softmax(
-        logits,
-        target_1d[start:end],
-        tp_group,
-        vocab_start,
-        vocab_end,
-        return_softmax=False,
-    )
+    if use_cuda_fast_path:
+        loss = _cuda_lce.token_loss(logits, target_1d[start:end])
+    else:
+        loss, _, _, _ = _chunk_loss_and_softmax(
+            logits,
+            target_1d[start:end],
+            tp_group,
+            vocab_start,
+            vocab_end,
+            return_softmax=False,
+        )
     del logits
     return loss
 
@@ -89,6 +108,12 @@ class _ChunkedVocabParallelLinearCrossEntropy(torch.autograd.Function):
         hidden_2d = total_hidden.reshape(-1, total_hidden.shape[-1])
         target_1d = target.reshape(-1)
         loss = torch.empty(target_1d.shape, dtype=torch.float32, device=hidden.device)
+        use_cuda_fast_path = _cuda_tp1_fast_path_eligible(
+            is_cuda=hidden.is_cuda,
+            dtype=hidden.dtype,
+            tp_world_size=world_size,
+            triton_available=_cuda_lce.is_available(),
+        )
         for start in range(0, target_1d.numel(), chunk_size):
             end = min(start + chunk_size, target_1d.numel())
             loss[start:end] = _forward_chunk_loss(
@@ -101,6 +126,7 @@ class _ChunkedVocabParallelLinearCrossEntropy(torch.autograd.Function):
                 vocab_start,
                 vocab_end,
                 temperature,
+                use_cuda_fast_path,
             )
 
         ctx.save_for_backward(total_hidden, weight, target)
@@ -111,6 +137,7 @@ class _ChunkedVocabParallelLinearCrossEntropy(torch.autograd.Function):
         ctx.vocab_start = vocab_start
         ctx.vocab_end = vocab_end
         ctx.world_size = world_size
+        ctx.cuda_fast_path = use_cuda_fast_path
         ctx.local_sequence = hidden.shape[0]
         return loss.reshape_as(target)
 
@@ -119,7 +146,10 @@ class _ChunkedVocabParallelLinearCrossEntropy(torch.autograd.Function):
         total_hidden, weight, target = ctx.saved_tensors
         hidden_2d = total_hidden.reshape(-1, total_hidden.shape[-1])
         target_1d = target.reshape(-1)
-        grad_output_1d = grad_output.reshape(-1)
+        # ``loss.sum().backward()`` supplies a stride-0 expanded dLoss view.
+        # Triton indexes this row-wise, so materialize only the O(tokens)
+        # scale vector before handing it to the CUDA TP1 path.
+        grad_output_1d = grad_output.reshape(-1).contiguous()
         grad_hidden_full = torch.empty_like(total_hidden).reshape_as(hidden_2d)
         grad_weight = torch.zeros_like(weight)
 
@@ -127,28 +157,40 @@ class _ChunkedVocabParallelLinearCrossEntropy(torch.autograd.Function):
             end = min(start + ctx.chunk_size, target_1d.numel())
             logits = hidden_2d[start:end].matmul(weight.t())
             if ctx.temperature != 1.0:
-                logits = logits / ctx.temperature
-            _, softmax, target_mask, masked_target = _chunk_loss_and_softmax(
-                logits,
-                target_1d[start:end],
-                ctx.tp_group,
-                ctx.vocab_start,
-                ctx.vocab_end,
-                return_softmax=True,
-            )
-            row_indices = torch.arange(end - start, device=softmax.device)
-            softmax[row_indices, masked_target] -= 1.0 - target_mask.float()
-            softmax.mul_(grad_output_1d[start:end].unsqueeze(-1))
-            if ctx.temperature != 1.0:
-                softmax.div_(ctx.temperature)
-            # CE owns FP32 probability math; the vanilla BF16 head backward
-            # consumes a BF16 dlogits. Reuse logits storage so a second BF16
-            # vocab window is not live beside logits and FP32 softmax.
-            grad_logits = _reuse_logits_storage_for_grad_logits(logits, softmax)
+                logits.div_(ctx.temperature)
+            if ctx.cuda_fast_path:
+                # The CUDA TP1 kernel keeps row-reduction math tile-local in
+                # FP32 and writes BF16 dlogits directly into this allocation.
+                grad_logits = _cuda_lce.inplace_gradient(
+                    logits,
+                    target_1d[start:end],
+                    grad_output_1d[start:end],
+                    ctx.temperature,
+                )
+            else:
+                _, softmax, target_mask, masked_target = _chunk_loss_and_softmax(
+                    logits,
+                    target_1d[start:end],
+                    ctx.tp_group,
+                    ctx.vocab_start,
+                    ctx.vocab_end,
+                    return_softmax=True,
+                )
+                row_indices = torch.arange(end - start, device=softmax.device)
+                softmax[row_indices, masked_target] -= 1.0 - target_mask.float()
+                softmax.mul_(grad_output_1d[start:end].unsqueeze(-1))
+                if ctx.temperature != 1.0:
+                    softmax.div_(ctx.temperature)
+                # CE owns FP32 probability math; the vanilla BF16 head backward
+                # consumes a BF16 dlogits. Reuse logits storage so a second BF16
+                # vocab window is not live beside logits and FP32 softmax.
+                grad_logits = _reuse_logits_storage_for_grad_logits(logits, softmax)
             grad_hidden_full[start:end].copy_(grad_logits.matmul(weight))
             grad_weight.add_(grad_logits.t().matmul(hidden_2d[start:end]))
             # Keep every vocab-shaped temporary scoped to one token window.
-            del row_indices, masked_target, target_mask, softmax, grad_logits, logits
+            if not ctx.cuda_fast_path:
+                del row_indices, masked_target, target_mask, softmax
+            del grad_logits, logits
 
         if ctx.sequence_parallel and ctx.world_size > 1:
             grad_hidden = torch.empty(
