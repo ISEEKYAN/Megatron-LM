@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import subprocess
 import sys
 import types
 from dataclasses import dataclass
@@ -10,7 +12,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 import torch.nn as nn
-
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.backends.mlite.runtime import (
@@ -19,9 +20,17 @@ from megatron.lite.runtime.backends.mlite.runtime import (
     _build_impl_cfg,
     _pipeline_callbacks,
 )
-from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
+from megatron.lite.runtime.contracts.config import (
+    OptimizerConfig,
+    ParallelConfig,
+    RuntimeConfig,
+)
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from megatron.lite.runtime.contracts.loss import LossContext, get_loss_context, use_loss_context
+from megatron.lite.runtime.contracts.loss import (
+    LossContext,
+    get_loss_context,
+    use_loss_context,
+)
 
 
 def test_runtime_returns_loss_separately_from_microbatch_metrics():
@@ -49,7 +58,10 @@ def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
     forward, loss = _pipeline_callbacks(
         lambda _model, batch: seen.append((batch, get_loss_context()))
         or {"loss": torch.tensor(1.0)},
-        lambda out, batch, ctx: (out["loss"], {"batch": batch, "source": ctx.source_batch}),
+        lambda out, batch, ctx: (
+            out["loss"],
+            {"batch": batch, "source": ctx.source_batch},
+        ),
     )
 
     output = forward(None, ("wrapped", context))
@@ -83,7 +95,8 @@ def test_runtime_config_accepts_mlite_backend_cfg():
 
 def test_mlite_config_defaults_and_parallel_fields():
     cfg = MegatronLiteConfig(
-        model_name="qwen3_moe", parallel=ParallelConfig(tp=4, etp=1, ep=8, pp=2, vpp=2, cp=2)
+        model_name="qwen3_moe",
+        parallel=ParallelConfig(tp=4, etp=1, ep=8, pp=2, vpp=2, cp=2),
     )
 
     assert cfg.model_name == "qwen3_moe"
@@ -212,7 +225,9 @@ class HookedOptimizer:
 
 def test_runtime_to_prefers_optimizer_specific_offload_hooks():
     optimizer = HookedOptimizer()
-    handle = ModelHandle(model=nn.Linear(2, 2), optimizer=optimizer, _extras={"model_chunks": []})
+    handle = ModelHandle(
+        model=nn.Linear(2, 2), optimizer=optimizer, _extras={"model_chunks": []}
+    )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
     runtime.to(handle, "cpu", model=False, optimizer=True, grad=False)
@@ -256,9 +271,7 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty-cache"))
     chunk = Chunk()
     handle = ModelHandle(
-        model=chunk,
-        optimizer=Optimizer(),
-        _extras={"model_chunks": [chunk]},
+        model=chunk, optimizer=Optimizer(), _extras={"model_chunks": [chunk]}
     )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
@@ -277,12 +290,65 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
     ]
 
 
+def test_training_transfer_releases_unique_ep_workspaces_before_model_offload(
+    monkeypatch,
+):
+    events = []
+
+    class Module:
+        def release_ep_chunk_workspaces(self, *, phase, stream):
+            assert phase is None and stream == "stream"
+            events.append("release-ep")
+
+    class Chunk:
+        def __init__(self, modules):
+            self._modules = modules
+
+        def modules(self):
+            return iter(self._modules)
+
+        def release_export_scratch(self):
+            events.append("release-scratch")
+
+    import megatron.lite.runtime.megatron_utils as megatron_utils
+
+    monkeypatch.setattr(
+        megatron_utils, "offload_model_to_cpu", lambda _: events.append("offload-model")
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
+    monkeypatch.setattr(
+        "megatron.lite.runtime.backends.mlite.runtime.gc.collect",
+        lambda: events.append("gc"),
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty"))
+    module = Module()
+    chunks = [Chunk([module, module]), Chunk([module])]
+    handle = ModelHandle(model=chunks[0], _extras={"model_chunks": chunks})
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(
+        handle, "cpu", optimizer=False, grad=True
+    )
+    assert events == [
+        "release-ep",
+        "offload-model",
+        "release-scratch",
+        "release-scratch",
+        "sync",
+        "gc",
+        "empty",
+    ]
+
+
 def test_export_transfer_does_not_move_optimizer_or_release_scratch(monkeypatch):
     events = []
 
     class Chunk:
         def release_export_scratch(self):
             events.append("release-scratch")
+
+        def release_ep_chunk_workspaces(self, *, phase, stream):
+            events.append("release-ep")
 
     import megatron.lite.runtime.megatron_utils as megatron_utils
 
@@ -293,9 +359,7 @@ def test_export_transfer_does_not_move_optimizer_or_release_scratch(monkeypatch)
     )
     chunk = Chunk()
     handle = ModelHandle(
-        model=chunk,
-        optimizer=HookedOptimizer(),
-        _extras={"model_chunks": [chunk]},
+        model=chunk, optimizer=HookedOptimizer(), _extras={"model_chunks": [chunk]}
     )
 
     MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(
@@ -303,6 +367,37 @@ def test_export_transfer_does_not_move_optimizer_or_release_scratch(monkeypatch)
     )
 
     assert events == ["offload-model"]
+
+
+def test_training_transfer_uses_no_ep_stream_without_cuda(monkeypatch):
+    events = []
+
+    class Chunk:
+        def release_ep_chunk_workspaces(self, *, phase, stream):
+            assert phase is None
+            assert stream is None
+            events.append("release-ep")
+
+        def release_export_scratch(self):
+            events.append("release-scratch")
+
+    import megatron.lite.runtime.megatron_utils as megatron_utils
+
+    monkeypatch.setattr(
+        megatron_utils, "offload_model_to_cpu", lambda _: events.append("offload-model")
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda: pytest.fail("unexpected stream")
+    )
+    chunk = Chunk()
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(
+        ModelHandle(model=chunk, _extras={"model_chunks": [chunk]}),
+        "cpu",
+        optimizer=False,
+        grad=True,
+    )
+    assert events == ["release-ep", "offload-model", "release-scratch"]
 
 
 class _FakeStorage:
@@ -411,7 +506,10 @@ def test_megatron_ddp_detection_accepts_ddp_and_subclasses(monkeypatch):
 
 @pytest.mark.parametrize("model_cls", [_FakeMegatronDDP, _FakeMegatronDDPSubclass])
 def test_megatron_ddp_model_move_helpers_use_buffer_path(monkeypatch, model_cls):
-    from megatron.lite.runtime.megatron_utils import load_model_to_gpu, offload_model_to_cpu
+    from megatron.lite.runtime.megatron_utils import (
+        load_model_to_gpu,
+        offload_model_to_cpu,
+    )
 
     _install_fake_megatron_ddp(monkeypatch)
     model = model_cls()
@@ -438,7 +536,10 @@ def test_megatron_ddp_model_move_helpers_use_buffer_path(monkeypatch, model_cls)
 
 
 def test_native_model_move_helpers_do_not_require_megatron_core(monkeypatch):
-    from megatron.lite.runtime.megatron_utils import load_model_to_gpu, offload_model_to_cpu
+    from megatron.lite.runtime.megatron_utils import (
+        load_model_to_gpu,
+        offload_model_to_cpu,
+    )
 
     monkeypatch.setitem(sys.modules, "megatron.core", None)
     monkeypatch.setitem(sys.modules, "megatron.core.distributed", None)
@@ -497,7 +598,9 @@ def test_model_handle_dp_from_parallel_state():
 def test_model_handle_cp_range_and_config_properties():
     cfg = {"tp": 8, "ep": 4}
     default_handle = ModelHandle(model=MagicMock())
-    configured_handle = ModelHandle(model=MagicMock(), config=cfg, _extras={"cp_range": (1, 8)})
+    configured_handle = ModelHandle(
+        model=MagicMock(), config=cfg, _extras={"cp_range": (1, 8)}
+    )
 
     assert default_handle.cp_range == (1, 1)
     assert configured_handle.cp_range == (1, 8)
@@ -511,7 +614,9 @@ def test_runtime_dispatch_creates_mlite_backend():
 
         runtime = create_runtime(
             RuntimeConfig(
-                backend="mlite", hf_path="/models/test", backend_cfg={"model_name": "qwen3"}
+                backend="mlite",
+                hf_path="/models/test",
+                backend_cfg={"model_name": "qwen3"},
             )
         )
 
@@ -522,3 +627,111 @@ def test_runtime_dispatch_creates_mlite_backend():
 def test_runtime_dispatch_unknown_backend_raises():
     with pytest.raises(KeyError):
         create_runtime(RuntimeConfig(backend="nonexistent"))
+
+
+def _run_verl_sft_dry_run(script: Path, tmp_path: Path, **env_overrides: str) -> str:
+    env = {
+        **os.environ,
+        "MODEL_PATH": "/tmp/mlite-model",
+        "TRAIN_FILES": "/tmp/mlite-train.parquet",
+        "OUTPUT_ROOT": str(tmp_path),
+        "DRY_RUN": "1",
+        "NUM_GPUS": "1",
+        "NPROC_PER_NODE": "1",
+        "TP_SIZE": "1",
+        "PP_SIZE": "1",
+        "CP_SIZE": "1",
+        "EP_SIZE": "1",
+        "ETP_SIZE": "1",
+        **env_overrides,
+    }
+    completed = subprocess.run(
+        [str(script)], env=env, text=True, capture_output=True, check=True
+    )
+    return completed.stdout
+
+
+def test_verl_sft_script_maps_offload_env_to_backend_args(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[5]
+        / "examples"
+        / "verl"
+        / "scripts"
+        / "run_qwen3moe_sft.sh"
+    )
+
+    command = _run_verl_sft_dry_run(
+        script,
+        tmp_path,
+        PARAM_OFFLOAD="True",
+        OPTIMIZER_OFFLOAD="True",
+        OPTIMIZER_STATE_OFFLOAD_FRACTION="0.75",
+    )
+
+    assert "engine.param_offload=True" in command
+    assert "engine.optimizer_offload=True" in command
+    assert "+optim.override_optimizer_config.offload_fraction=0.75" in command
+    assert (
+        "+optim.override_optimizer_config.use_precision_aware_optimizer=True" in command
+    )
+
+
+def test_verl_sft_script_does_not_emit_optimizer_state_offload_when_disabled(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[5]
+        / "examples"
+        / "verl"
+        / "scripts"
+        / "run_qwen3moe_sft.sh"
+    )
+
+    command = _run_verl_sft_dry_run(
+        script, tmp_path, PARAM_OFFLOAD="False", OPTIMIZER_OFFLOAD="False"
+    )
+
+    assert "engine.param_offload=False" in command
+    assert "engine.optimizer_offload=False" in command
+    assert "override_optimizer_config.offload_fraction" not in command
+
+
+def test_verl_sft_script_emits_explicit_dynamic_cp_switch_when_disabled(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[5]
+        / "examples"
+        / "verl"
+        / "scripts"
+        / "run_qwen3moe_sft.sh"
+    )
+
+    command = _run_verl_sft_dry_run(script, tmp_path, DYNAMIC_CONTEXT_PARALLEL="False")
+
+    assert (
+        "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel.enabled=False"
+        in command
+    )
+
+
+def test_verl_sft_dynamic_cp_acceptance_requires_full_cp_size_coverage(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[5]
+        / "examples"
+        / "verl"
+        / "scripts"
+        / "run_qwen3moe_sft.sh"
+    )
+
+    command = _run_verl_sft_dry_run(
+        script,
+        tmp_path,
+        DYNAMIC_CONTEXT_PARALLEL="True",
+        MAX_SEQLEN_PER_DP_CP_RANK="4096",
+    )
+
+    assert (
+        "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel."
+        "require_full_cp_size_coverage=True"
+    ) in command
+    assert (
+        "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel.enabled=True"
+        in command
+    )
