@@ -312,6 +312,7 @@ class _EPChunkExpertActivationArenaCoordinator:
     pointer_signatures_by_op: dict[EPChunkOpName, tuple[tuple[str, int], ...]] = field(
         default_factory=dict
     )
+    backing_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     frozen: bool = False
 
     def reserve(
@@ -321,7 +322,7 @@ class _EPChunkExpertActivationArenaCoordinator:
         expert_intermediate_size: int,
         device: torch.device,
     ) -> None:
-        """Freeze caller-declared activation capacities without retaining tensors."""
+        """Freeze caller-declared capacities; backing is created on first use."""
         profile = self.key.shape_profile
         if not 0 < max_expert_rows <= profile.max_expert_rows:
             raise ValueError(
@@ -483,6 +484,10 @@ class _EPChunkExpertActivationArenaCoordinator:
             )
         reserved_capacity_bytes = self.capacity_bytes.get(storage_name, 0)
         rehydrating = existing is None and reserved_capacity_bytes > 0
+        if existing is None and self.frozen:
+            existing = self.backing_tensors.get(storage_name)
+            if existing is not None:
+                self.arena.tensors[storage_name] = existing
         growing = requested_bytes > reserved_capacity_bytes > 0
         if existing is not None:
             growing = growing or requested_bytes > existing.numel() * existing.element_size()
@@ -510,6 +515,8 @@ class _EPChunkExpertActivationArenaCoordinator:
             with self.arena.allocate():
                 existing = torch.empty((capacity_numel,), dtype=dtype, device=device)
             self.arena.tensors[storage_name] = existing
+            if self.frozen:
+                self.backing_tensors[storage_name] = existing
             self.allocations += int(reserved_capacity_bytes == 0)
             self.grows += int(growing)
             self.rehydrates += int(rehydrating)
@@ -803,8 +810,8 @@ class EPChunkWorkspace:
         """Declare a bounded activation arena for capture or frozen measurement.
 
         This is opt-in: absent a caller capacity the arena preserves lazy-growth
-        behavior.  Reservation owns only MemPool capacity metadata; tensor
-        references remain operation-local and are cleared by ``reset_tensors``.
+        behavior.  Frozen slots acquire fixed backing lazily; ``reset_tensors``
+        clears only operation views, while registry close drops backing and pool.
         """
         profile_device = self._bind(device) if not self._materialized else self._bound_device
         if profile_device is None:
@@ -1336,6 +1343,7 @@ class EPChunkWorkspaceRegistry:
             self._expert_activation_arenas.pop(coordinator.key, None)
             coordinator.consumer_event = None
             coordinator.arena.tensors.clear()
+            coordinator.backing_tensors.clear()
             coordinator.arena.allocation_pool = None
             coordinator.arena.device = None
             coordinator.max_requested_bytes.clear()
