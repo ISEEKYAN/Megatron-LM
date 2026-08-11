@@ -38,7 +38,10 @@ from megatron.lite.primitive.ops.chunked_linear_cross_entropy import (
 )
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
-from megatron.lite.model.qwen3_moe.lite.head_loss import use_chunked_head_loss
+from megatron.lite.model.qwen3_moe.lite.head_loss import (
+    balanced_head_loss_chunk_size,
+    use_chunked_head_loss,
+)
 from megatron.lite.primitive.parallel import (
     ParallelState,
     VanillaColumnParallelLinear,
@@ -794,6 +797,7 @@ class Qwen3MoEModel(nn.Module):
         self.config = config
         self.ps = ps
         self.fp8 = fp8
+        self._head_loss_chunk_count = ep_chunk_count
         self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self._input_tensor: torch.Tensor | None = None
@@ -997,6 +1001,9 @@ class Qwen3MoEModel(nn.Module):
                         tp_group=self.ps.tp_group,
                         sequence_parallel=self.ps.tp_size > 1,
                         temperature=temperature_value,
+                        chunk_size=balanced_head_loss_chunk_size(
+                            labels_sb.numel(), self._head_loss_chunk_count
+                        ),
                     )
                     output["loss"] = token_loss.mean()
                     if return_log_probs:

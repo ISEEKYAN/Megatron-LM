@@ -146,3 +146,17 @@ def test_qwen3_chunked_head_loss_selection_contract(
         )
         is expected
     )
+
+
+@pytest.mark.parametrize(
+    ("token_count", "chunk_count", "expected"),
+    [(1, 1, 1), (1025, 3, 342), (32768, 2, 16384)],
+)
+def test_qwen3_head_loss_balances_tokens_across_configured_ep_chunks(
+    token_count, chunk_count, expected
+):
+    from megatron.lite.model.qwen3_moe.lite.head_loss import (
+        balanced_head_loss_chunk_size,
+    )
+
+    assert balanced_head_loss_chunk_size(token_count, chunk_count) == expected
