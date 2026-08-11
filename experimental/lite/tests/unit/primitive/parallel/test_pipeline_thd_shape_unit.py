@@ -43,49 +43,6 @@ class _MockModel(torch.nn.Module):
         self._input_tensor = t
 
 
-def test_pipeline_chunk_sets_base_input_but_runs_lifecycle_wrapper_forward():
-    events = []
-
-    class Base(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.input_tensor = None
-
-        def set_input_tensor(self, value):
-            events.append("set_input")
-            self.input_tensor = value
-
-        def forward(self, _batch):
-            assert self.input_tensor is not None
-            return {"hidden_states": self.input_tensor + 1}
-
-    class LifecycleWrapper(torch.nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-
-        def forward(self, *args, **kwargs):
-            events.append("wrapper_forward")
-            return self.module(*args, **kwargs)
-
-    base = Base()
-    wrapper = LifecycleWrapper(base)
-    activation = torch.ones(2, 1, 4)
-
-    output = pl._run_pipeline_chunk_forward(
-        lambda model, batch: model(batch),
-        wrapper,
-        {},
-        activation,
-        is_first_stage=False,
-        is_last_stage=False,
-        num_microbatches=1,
-    )
-
-    assert events == ["set_input", "wrapper_forward"]
-    torch.testing.assert_close(output["hidden_states"], activation + 1)
-
-
 def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
     """Run the real _1f1b_schedule for one rank with _send_recv_pipeline mocked to
     play the peer (recv tensor of the peer-sent shape, in transfer order); records

@@ -522,11 +522,10 @@ class Qwen35WeightSpec:
             return [(f"{prefix}.input_layernorm.weight", tensor)]
         if suffix == "linear_attn.in_proj.linear.weight":
             q, k, value, z, b, a = _split_linear_attn_in_proj(tensor, cfg=self.config)
-            qkv = tensor.narrow(0, 0, q.shape[0] + k.shape[0] + value.shape[0])
             return [
                 (
                     f"{prefix}.linear_attn.in_proj_qkv.weight",
-                    qkv,
+                    torch.cat([q, k, value], dim=0).contiguous(),
                 ),
                 (f"{prefix}.linear_attn.in_proj_z.weight", z.contiguous()),
                 (f"{prefix}.linear_attn.in_proj_b.weight", b.contiguous()),
@@ -625,11 +624,10 @@ class Qwen35WeightSpec:
             return [(f"{prefix}.input_layernorm.weight", tensor)]
         if suffix == "linear_attn.in_proj.linear.weight":
             q, k, value, z, b, a = _split_linear_attn_in_proj(tensor, cfg=self.config)
-            qkv = tensor.narrow(0, 0, q.shape[0] + k.shape[0] + value.shape[0])
             return [
                 (
                     f"{prefix}.linear_attn.in_proj_qkv.weight",
-                    qkv,
+                    torch.cat([q, k, value], dim=0).contiguous(),
                 ),
                 (f"{prefix}.linear_attn.in_proj_z.weight", z.contiguous()),
                 (f"{prefix}.linear_attn.in_proj_b.weight", b.contiguous()),

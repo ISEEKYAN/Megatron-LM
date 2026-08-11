@@ -170,29 +170,11 @@ def _compact_pipeline_output(out: dict | None) -> dict:
     if "loss" in out and out["loss"] is not None:
         loss = out["loss"]
         compact["loss"] = loss.detach().item() if isinstance(loss, torch.Tensor) else float(loss)
-    if "num_tokens" in out and out["num_tokens"] is not None:
-        num_tokens = out["num_tokens"]
-        compact["num_tokens"] = (
-            num_tokens.detach().clone()
-            if isinstance(num_tokens, torch.Tensor)
-            else torch.tensor(int(num_tokens), dtype=torch.int64, device="cuda")
-        )
     if "_loss_fn_metrics" in out:
         compact["metrics"] = out["_loss_fn_metrics"]
     elif "metrics" in out:
         compact["metrics"] = out["metrics"]
     return compact
-
-
-def _loss_for_backward(out: dict, num_microbatches: int) -> torch.Tensor | None:
-    if "loss_sum" in out:
-        num_tokens = out.get("num_tokens")
-        if not isinstance(num_tokens, torch.Tensor) or num_tokens.numel() != 1:
-            raise ValueError("Per-token loss output requires a scalar num_tokens tensor.")
-        return out["loss_sum"]
-    if "loss" not in out:
-        return None
-    return out["loss"] / num_microbatches
 
 
 def _no_pipeline(
@@ -219,8 +201,7 @@ def _no_pipeline(
             assert loss is not None
         else:
             loss = output["loss"]
-        loss = _loss_for_backward(output, num_microbatches)
-        assert loss is not None
+        loss = loss / num_microbatches
         loss.backward()
         outputs.append(_compact_pipeline_output(output))
     return outputs
@@ -329,7 +310,7 @@ def _1f1b_schedule(
         current_input = fwd_input
         out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
-        loss_s = _loss_for_backward(out, num_microbatches) if ps.pp_is_last else None
+        loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
 
         # Recv the next forward input for every remaining warmup mb AND — on the
         # last warmup step — for the first STEADY mb (num_steady > 0). Middle
@@ -360,7 +341,7 @@ def _1f1b_schedule(
         mb_idx += 1
         out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
-        loss_s = _loss_for_backward(out, num_microbatches) if ps.pp_is_last else None
+        loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
 
         input_tensors.append(fwd_input if not ps.pp_is_first else None)
         output_hiddens.append(hidden)
@@ -688,9 +669,7 @@ def _run_pipeline_chunk_forward(
 ) -> dict:
     _set_aux_loss_scale(pre_forward_hook, num_microbatches)
     if not is_first_stage:
-        from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
-
-        unwrap_model(model).set_input_tensor(input_tensor)
+        model.set_input_tensor(input_tensor)
     out = forward_step_fn(model, batch)
     if is_last_stage:
         _apply_external_loss(out, batch, loss_fn)
@@ -861,7 +840,7 @@ def _interleaved_1f1b_schedule(
                         f"chunk={chunk_id} hidden_shape={hidden_shape}",
                         flush=True,
                     )
-                loss = _loss_for_backward(out, num_microbatches) if is_last_stage else None
+                loss = out["loss"] / num_microbatches if is_last_stage and "loss" in out else None
                 saved[stage_id] = (activation, hidden, loss, out)
 
                 if is_last_stage:

@@ -83,19 +83,6 @@ def _qwen_mrope_section(config: Qwen35Config) -> list[int]:
 class SharedExpert(nn.Module):
     _stream: torch.cuda.Stream | None = None
 
-    class _BackwardStreamWait(torch.autograd.Function):
-        """Match MCore shared-expert overlap's backward stream dependency."""
-
-        @staticmethod
-        def forward(ctx, tensor: torch.Tensor, stream: torch.cuda.Stream):
-            ctx.stream = stream
-            return tensor
-
-        @staticmethod
-        def backward(ctx, grad: torch.Tensor):
-            ctx.stream.wait_stream(torch.cuda.current_stream())
-            return grad, None
-
     class _CopyToTPRegion(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, group):
@@ -107,19 +94,6 @@ class SharedExpert(nn.Module):
             group = ctx.group
             if group is not None and dist.get_world_size(group) > 1:
                 dist.all_reduce(grad, group=group)
-            return grad, None
-
-    class _ReduceFromTPRegion(torch.autograd.Function):
-        """Match MCore's reduce-from-TP autograd boundary."""
-
-        @staticmethod
-        def forward(ctx, x, group):
-            if group is not None and dist.get_world_size(group) > 1:
-                dist.all_reduce(x, group=group)
-            return x
-
-        @staticmethod
-        def backward(ctx, grad):
             return grad, None
 
     class _PlainTELinear(nn.Module):
@@ -153,11 +127,6 @@ class SharedExpert(nn.Module):
         self.shared_gate = nn.Linear(config.hidden_size, 1, bias=False)
         self.tp_group = ps.tp_group
         self.use_mcore_overlap_graph = bool(use_plain_te_linear and ps.tp_size == 1)
-        self._cached_fc1_input: torch.Tensor | None = None
-        self._cached_fc2_input: torch.Tensor | None = None
-        self._cached_fc2_output: torch.Tensor | None = None
-        self._cached_output: torch.Tensor | None = None
-        self._cached_gate: torch.Tensor | None = None
 
     @staticmethod
     def _get_stream() -> torch.cuda.Stream:
@@ -166,102 +135,20 @@ class SharedExpert(nn.Module):
         return SharedExpert._stream
 
     @staticmethod
-    def _set_grad_fn_sequence_sr(tensor: torch.Tensor, sequence_nr: int) -> None:
+    def _set_grad_fn_sequence_sr(tensor: torch.Tensor) -> None:
         grad_fn = getattr(tensor, "grad_fn", None)
         if grad_fn is not None and hasattr(grad_fn, "_set_sequence_nr"):
-            grad_fn._set_sequence_nr(sequence_nr)
-
-    def wait_current_stream(self) -> None:
-        """Wait for work already queued by the routed path."""
-        self._get_stream().wait_stream(torch.cuda.current_stream())
-
-    def pre_forward(self, x: torch.Tensor) -> None:
-        """Match MCore shared-expert ``pre_forward_comm`` for TP=1."""
-        if any(
-            value is not None
-            for value in (
-                self._cached_fc1_input,
-                self._cached_fc2_input,
-                self._cached_fc2_output,
-                self._cached_output,
-                self._cached_gate,
-            )
-        ):
-            raise RuntimeError(
-                "Shared-expert overlap state was not drained by the prior forward."
-            )
-        self._cached_gate = self.shared_gate(x).sigmoid()
-        self._cached_fc1_input = self._CopyToTPRegion.apply(x, self.tp_group)
-        self._set_grad_fn_sequence_sr(
-            self._cached_fc1_input, torch.iinfo(torch.int).max
-        )
-
-    def linear_fc1_forward_and_act(
-        self, overlapped_routed_output: torch.Tensor
-    ) -> None:
-        """Launch shared FC1 after routed dispatch and mirror its backward order."""
-        if self._cached_fc1_input is None:
-            raise RuntimeError("Shared-expert FC1 launched before pre_forward.")
-        stream = self._get_stream()
-        with torch.cuda.stream(stream):
-            intermediate = _swiglu(self.gate_up(self._cached_fc1_input))
-            self._cached_fc1_input = None
-
-        routed_grad_fn = getattr(overlapped_routed_output, "grad_fn", None)
-        if routed_grad_fn is not None and hasattr(routed_grad_fn, "_sequence_nr"):
-            self._set_grad_fn_sequence_sr(
-                intermediate, int(routed_grad_fn._sequence_nr()) - 1
-            )
-            intermediate = self._BackwardStreamWait.apply(intermediate, stream)
-        self._cached_fc2_input = intermediate
-
-    def linear_fc2_forward(self, overlapped_routed_output: torch.Tensor) -> None:
-        """Launch shared FC2 only after routed experts, before routed combine."""
-        if self._cached_fc2_input is None:
-            raise RuntimeError("Shared-expert FC2 launched before FC1.")
-        self._set_grad_fn_sequence_sr(
-            overlapped_routed_output, torch.iinfo(torch.int).max
-        )
-        with torch.cuda.stream(self._get_stream()):
-            self._cached_fc2_output = self.down(self._cached_fc2_input)
-            self._cached_fc2_input = None
-
-    def post_forward_comm(self) -> None:
-        """Match MCore's reduce-from-TP stage after shared FC2."""
-        if self._cached_fc2_output is None:
-            raise RuntimeError("Shared-expert post-forward launched before FC2.")
-        with torch.cuda.stream(self._get_stream()):
-            self._cached_output = self._ReduceFromTPRegion.apply(
-                self._cached_fc2_output, self.tp_group
-            )
-            self._cached_fc2_output = None
-        assert self._cached_output is not None
-        self._set_grad_fn_sequence_sr(
-            self._cached_output, torch.iinfo(torch.int).max
-        )
-
-    def get_output(self) -> torch.Tensor:
-        """Finish the shared gate on its stream and join the routed stream."""
-        if self._cached_output is None or self._cached_gate is None:
-            raise RuntimeError("Shared-expert output requested before post-forward communication.")
-        stream = self._get_stream()
-        with torch.cuda.stream(stream):
-            output = self._cached_output * self._cached_gate
-            self._cached_output = None
-            self._cached_gate = None
-        torch.cuda.current_stream().wait_stream(stream)
-        return output
+            grad_fn._set_sequence_nr(torch.iinfo(torch.int).max)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_val = self.shared_gate(x).sigmoid()
         fc1_input = x
         if self.use_mcore_overlap_graph:
             fc1_input = self._CopyToTPRegion.apply(x, self.tp_group)
-            self._set_grad_fn_sequence_sr(fc1_input, torch.iinfo(torch.int).max)
-        intermediate = _swiglu(self.gate_up(fc1_input))
-        output = self.down(intermediate)
+            self._set_grad_fn_sequence_sr(fc1_input)
+        output = self.down(_swiglu(self.gate_up(fc1_input)))
         if self.use_mcore_overlap_graph:
-            self._set_grad_fn_sequence_sr(output, torch.iinfo(torch.int).max)
+            self._set_grad_fn_sequence_sr(output)
         return output * gate_val
 
 
@@ -309,26 +196,13 @@ class MoELayer(nn.Module):
 
         shared_out = None
         side_stream = None
-        staged_shared_overlap = bool(
-            x_2d.is_cuda and self.shared_expert.use_mcore_overlap_graph
-        )
-        if staged_shared_overlap:
-            side_stream = SharedExpert._get_stream()
-        elif x_2d.is_cuda:
+        if x_2d.is_cuda:
             side_stream = SharedExpert._get_stream()
             side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side_stream):
                 shared_out = self.shared_expert(shared_input)
         scores, indices = self.router(router_input)
-        if staged_shared_overlap:
-            assert side_stream is not None
-            side_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side_stream):
-                self.shared_expert.pre_forward(shared_input)
-            self.shared_expert.wait_current_stream()
         dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_2d, scores, indices)
-        if staged_shared_overlap:
-            self.shared_expert.linear_fc1_forward_and_act(dispatched)
         del scores, indices
         self.dispatcher.wait_dispatch_event()
         expert_out = self.experts(
@@ -337,15 +211,9 @@ class MoELayer(nn.Module):
             permuted_probs,
             tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
         )
-        if staged_shared_overlap:
-            self.shared_expert.wait_current_stream()
-            self.shared_expert.linear_fc2_forward(expert_out)
-            self.shared_expert.post_forward_comm()
         routed_out = self.dispatcher.combine(expert_out)
 
-        if staged_shared_overlap:
-            shared_out = self.shared_expert.get_output()
-        elif shared_out is None:
+        if shared_out is None:
             shared_out = self.shared_expert(shared_input)
         else:
             assert side_stream is not None
@@ -445,25 +313,6 @@ def _temperature_to_float(temperature: float | torch.Tensor) -> float:
     return float(temperature)
 
 
-def _masked_token_loss(
-    token_loss: torch.Tensor, loss_mask: torch.Tensor | None
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return reporting mean, raw numerator, and local valid-token count."""
-    if loss_mask is None:
-        loss_mask = torch.ones_like(token_loss, dtype=torch.float32)
-    elif loss_mask.shape != token_loss.shape:
-        raise ValueError(
-            "Qwen3.5 loss_mask must match the token-loss layout: "
-            f"loss={tuple(token_loss.shape)} mask={tuple(loss_mask.shape)}."
-        )
-    losses = token_loss.float()
-    mask = loss_mask.to(device=losses.device, dtype=losses.dtype)
-    loss_sum = (losses * mask).sum()
-    num_tokens = loss_mask.sum(dtype=torch.int64)
-    loss = loss_sum / num_tokens.to(dtype=loss_sum.dtype).clamp_min(1)
-    return loss, loss_sum, num_tokens
-
-
 def _ensure_mrope_position_ids(position_ids: torch.Tensor | None) -> torch.Tensor | None:
     if position_ids is None:
         return None
@@ -519,7 +368,6 @@ class Qwen35Model(nn.Module):
         mtp_detach_encoder: bool = False,
         mount_vision_model: bool = False,
         gdn_cp_mode: str = "headwise",
-        calculate_per_token_loss: bool = False,
     ):
         super().__init__()
         _apply_attention_backend_override(attention_backend_override)
@@ -528,7 +376,6 @@ class Qwen35Model(nn.Module):
         self.ps = ps
         self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
-        self.calculate_per_token_loss = bool(calculate_per_token_loss)
         self._input_tensor: torch.Tensor | None = None
 
         layout = build_pipeline_chunk_layout(
@@ -693,7 +540,7 @@ class Qwen35Model(nn.Module):
                         temperature_value,
                         self.ps.tp_group,
                     )
-                    token_loss = -log_probs
+                    output["loss"] = (-log_probs).mean()
                     output["log_probs"] = log_probs.transpose(0, 1).contiguous()
                     if calculate_entropy:
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
@@ -701,27 +548,12 @@ class Qwen35Model(nn.Module):
                     logits = self.head(hidden_for_head)
                     if temperature_value != 1.0:
                         logits = logits / temperature_value
-                    token_loss = vocab_parallel_cross_entropy(
-                        logits, labels_sb, self.ps.tp_group
-                    )
-                    output["log_probs"] = (-token_loss).transpose(0, 1).contiguous()
+                    loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                    output["loss"] = loss.mean()
+                    output["log_probs"] = (-loss).transpose(0, 1).contiguous()
                     if calculate_entropy:
                         entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
-                if self.calculate_per_token_loss:
-                    mask_sb = (
-                        None
-                        if loss_mask is None
-                        else loss_mask.transpose(0, 1).contiguous()
-                    )
-                    loss, loss_sum, num_tokens = _masked_token_loss(token_loss, mask_sb)
-                    output["loss"] = loss
-                    output["loss_sum"] = loss_sum
-                    output["num_tokens"] = num_tokens
-                else:
-                    # Preserve MLite's existing mean-loss contract outside the
-                    # explicit MCore per-token path.
-                    output["loss"] = token_loss.mean()
             else:
                 logits = self.head(hidden_for_head)
                 output["logits"] = self.head.gather(logits).transpose(0, 1).contiguous()
@@ -756,11 +588,6 @@ class Qwen35Model(nn.Module):
         )
         mtp_labels = labels.clone()
         mtp_loss_mask = loss_mask.clone()
-        original_num_tokens = (
-            loss_mask.sum().to(dtype=torch.float32)
-            if self.calculate_per_token_loss
-            else None
-        )
         mtp_loss_values = []
         for mtp_hidden in mtp_hidden_states:
             mtp_labels, _ = roll_mtp_tensor_left(
@@ -791,15 +618,8 @@ class Qwen35Model(nn.Module):
             num_tokens = num_tokens.to(dtype=token_loss.dtype).clamp_min(1.0)
             mtp_loss_values.append(token_loss.sum() / num_tokens)
             mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
-            if self.calculate_per_token_loss:
-                assert original_num_tokens is not None
-                mtp_backward_loss = token_loss * (
-                    original_num_tokens.to(dtype=token_loss.dtype) / num_tokens
-                )
-            else:
-                mtp_backward_loss = token_loss / num_tokens
             hidden_states = MTPLossAutoScaler.apply(
-                hidden_states, mtp_loss_scale * mtp_backward_loss
+                hidden_states, mtp_loss_scale * token_loss / num_tokens
             )
 
         if not mtp_loss_values:

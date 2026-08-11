@@ -1304,6 +1304,18 @@ def test_mfsdp_start_param_sync_materializes_synchronously_when_overlap_is_disab
     assert events == ["materialize"]
 
 
+def test_mfsdp_pipeline_input_delegates_to_wrapped_module():
+    received = []
+    module = SimpleNamespace(
+        module=SimpleNamespace(set_input_tensor=lambda value: received.append(value))
+    )
+    activation = torch.ones(2, 1, 4)
+
+    mfsdp_wrapper.MFSdpModule.set_input_tensor(module, activation)
+
+    assert received == [activation]
+
+
 def test_mfsdp_marks_sequence_parallel_shards_for_tp_gradient_sync():
     model = _GlooModel()
     model.sp_params = [model.out.weight]

@@ -48,7 +48,6 @@ def run_microbatch_loop(
     """
     last_out = None
     all_metrics: list[dict] = []
-    total_num_tokens: torch.Tensor | None = None
     for mb in range(num_microbatches):
         batch, loss_context = split_loss_context(next(data_iter))
         if pre_forward_hook is not None:
@@ -68,27 +67,10 @@ def run_microbatch_loop(
             out["loss"] = loss.detach()
             all_metrics.append(metrics)
         elif not forward_only:
-            loss_sum = out.get("loss_sum")
-            if loss_sum is None:
-                (out["loss"] / num_microbatches).backward()
-            else:
-                num_tokens = out.get("num_tokens")
-                if not isinstance(num_tokens, torch.Tensor) or num_tokens.numel() != 1:
-                    raise ValueError(
-                        "Per-token loss output requires a scalar num_tokens tensor."
-                    )
-                loss_sum.backward()
-                detached_tokens = num_tokens.detach()
-                total_num_tokens = (
-                    detached_tokens.clone()
-                    if total_num_tokens is None
-                    else total_num_tokens + detached_tokens
-                )
+            (out["loss"] / num_microbatches).backward()
         last_out = out
     if last_out is not None and all_metrics:
         last_out["_loss_fn_metrics"] = all_metrics
-    if last_out is not None and total_num_tokens is not None:
-        last_out["_num_tokens_total"] = total_num_tokens
     return last_out
 
 

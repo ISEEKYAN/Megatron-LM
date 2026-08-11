@@ -220,6 +220,15 @@ class MegatronFSDP(nn.Module):
                     raise
         return output
 
+    def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
+        """Forward the pipeline input API without bypassing this wrapper's forward."""
+        setter = getattr(self.module, "set_input_tensor", None)
+        if setter is None:
+            raise AttributeError(
+                f"{type(self.module).__name__} does not define set_input_tensor"
+            )
+        setter(input_tensor)
+
     def start_param_sync(self, *_args, force_sync: bool = False, **_kwargs) -> None:
         if force_sync or not self.mfsdp_config.overlap_param_gather:
             self.param_sync.materialize_all()

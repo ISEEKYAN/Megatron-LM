@@ -185,35 +185,6 @@ def test_train_step_microbatch_loop_and_grad_clip_cpu_contract():
     assert model.weight.grad.norm() <= 0.25 + 1.0e-6
 
 
-def test_train_step_per_token_loss_backprops_raw_sums_and_accumulates_tokens():
-    weight = nn.Parameter(torch.tensor(2.0))
-    model = nn.ParameterList([weight])
-    data = iter(
-        [
-            {"coefficient": torch.tensor(3.0), "tokens": torch.tensor(2)},
-            {"coefficient": torch.tensor(5.0), "tokens": torch.tensor(7)},
-        ]
-    )
-
-    def forward_fn(module, batch):
-        loss_sum = module[0] * batch["coefficient"]
-        return {
-            "loss": loss_sum / batch["tokens"],
-            "loss_sum": loss_sum,
-            "num_tokens": batch["tokens"],
-        }
-
-    output = run_microbatch_loop(model, data, 2, forward_fn)
-
-    assert output is not None
-    # Per-token mode follows MCore: backpropagate each local numerator without
-    # dividing by the microbatch count, then normalize the reduced gradients
-    # once by the global token count in finalize_grads.
-    torch.testing.assert_close(weight.grad, torch.tensor(8.0))
-    torch.testing.assert_close(output["loss"], torch.tensor(10.0 / 7.0))
-    assert int(output["_num_tokens_total"].item()) == 9
-
-
 def test_utils_ensure_divisible_returns_quotient_and_reports_context():
     assert ensure_divisible(12, 3, "tp") == 4
     with pytest.raises(ValueError, match=r"10 is not divisible by 4 \(tp\)"):

@@ -90,7 +90,6 @@ class ImplConfig:
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
     mount_vision_model: bool = False
-    calculate_per_token_loss: bool = False
     # GatedDeltaNet context-parallel mode: "headwise" (default, head-parallel a2a;
     # bitwise-exact vs CP-off and memory-sharded), "replicated" (all-gather, exact but
     # full sequence replicated on every rank), or "chunkwise" (FLA ring; seq-shard +
@@ -153,13 +152,11 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     return unpack_thd_forward_output(model, batch, output)
 
 
-def _make_aux_loss_hook(*, calculate_per_token_loss: bool = False):
+def _make_aux_loss_hook():
     from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
     from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 
     def hook(scale: torch.Tensor) -> None:
-        if calculate_per_token_loss:
-            scale = torch.ones((), dtype=scale.dtype, device=scale.device)
         MoEAuxLossAutoScaler.set_loss_scale(scale)
         MTPLossAutoScaler.set_loss_scale(scale)
 
@@ -192,12 +189,6 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
-    if impl_cfg.calculate_per_token_loss and impl_cfg.optimizer != "mfsdp":
-        raise ValueError(
-            "Qwen3.5 calculate_per_token_loss currently requires optimizer='mfsdp'; "
-            "other optimizer backends do not implement the MCore global-token "
-            "gradient-finalization contract."
-        )
 
     if impl_cfg.router_aux_loss_coef is not None:
         model_cfg.router_aux_loss_coef = impl_cfg.router_aux_loss_coef
@@ -240,7 +231,6 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
         mount_vision_model=impl_cfg.mount_vision_model,
         gdn_cp_mode=impl_cfg.gdn_cp_mode,
-        calculate_per_token_loss=impl_cfg.calculate_per_token_loss,
     )
 
     if vpp is None:
@@ -303,7 +293,6 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
                 ps=ps,
                 is_expert=is_expert_param,
                 fsdp_unit_modules=_mfsdp_unit_modules(),
-                calculate_per_token_loss=impl_cfg.calculate_per_token_loss,
             )
             return {"optimizer": optimizer, "finalize_grads": finalize}
 
@@ -341,11 +330,8 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         extras={
             "model_cfg": model_cfg,
             "optimizer_backend": optimizer_backend,
-            "calculate_per_token_loss": impl_cfg.calculate_per_token_loss,
             "post_model_load_hook": post_model_load_hook,
-            "pre_forward_hook": _make_aux_loss_hook(
-                calculate_per_token_loss=impl_cfg.calculate_per_token_loss
-            ),
+            "pre_forward_hook": _make_aux_loss_hook(),
         },
     )
 
