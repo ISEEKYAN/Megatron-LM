@@ -349,10 +349,10 @@ def test_qwen3_moe_resets_only_its_forward_workspace_phase():
 
 
 @pytest.mark.parametrize("mode", ["train", "inference", "headless"])
-def test_qwen3_forward_keeps_chunked_ep_backing_until_explicit_release(
+def test_qwen3_resets_chunked_ep_views_after_last_moe_before_head_work(
     monkeypatch, mode, transformer_engine_import_stub
 ):
-    """Ordinary forward must not reset shared ChunkedEP backing."""
+    """The model composition boundary parks forward views before head work."""
     transformer_engine_import_stub()
     from megatron.lite.model.qwen3_moe.lite import model
 
@@ -422,13 +422,15 @@ def test_qwen3_forward_keeps_chunked_ep_backing_until_explicit_release(
     input_ids = torch.ones(1, 1, dtype=torch.long) if mode == "train" else None
     qwen(hidden_states=hidden_states, input_ids=input_ids, labels=labels)
 
-    assert "reset" not in events
+    assert events.count("reset") == 1
+    reset = events.index("reset")
     if mode == "train":
-        assert events.index("main_moe") < events.index("mtp_moe")
-        assert events.index("mtp_moe") < events.index("head") < events.index("ce")
+        assert events.index("main_moe") < events.index("mtp_moe") < reset
+        assert reset < events.index("head", reset) < events.index("ce", reset)
     elif mode == "inference":
-        assert events.index("main_moe") < events.index("head")
+        assert events.index("main_moe") < reset < events.index("head")
     else:
+        assert events.index("main_moe") < reset
         assert "head" not in events
 
 

@@ -2893,10 +2893,11 @@ class EPChunkFusedForwardBackwardOp(_EPChunkOperationBase):
                 x_2d, grad_2d
             )
         grad_x = grad_x.view_as(x_saved)
-        # Keep event-guarded activation backing through subsequent layers,
-        # microbatches, and training steps.  Explicit workspace reset/close is
-        # the offload boundary; parking here would force allocator churn before
-        # the next fused recompute can reuse the shared coordinator.
+        # The recompute path has made the caller stream wait for its terminal
+        # compute event before materializing these outputs. Park logical views
+        # here; the dedicated MemPool keeps matching physical blocks reusable.
+        stream = torch.cuda.current_stream(x_saved.device) if x_saved.is_cuda else None
+        self.workspace.park_expert_activations(stream=stream)
         return grad_x, router_grads, expert_grads
 
 

@@ -913,6 +913,16 @@ class Qwen3MoEModel(nn.Module):
 
         output = {"hidden_states": h}
 
+        def reset_forward_chunked_ep() -> None:
+            """Park the shared forward arena after all Qwen3 MoE consumers."""
+            stream = torch.cuda.current_stream(h.device) if h.is_cuda else None
+            for layer in self.layers:
+                if layer.moe.ep_chunk_forward is not None:
+                    layer.moe.reset_ep_chunk_workspace_tensors(
+                        phase="forward", stream=stream
+                    )
+                    break
+
         if self.head is not None:
             hidden_for_head = self.norm(h)
 
@@ -931,6 +941,7 @@ class Qwen3MoEModel(nn.Module):
                 if mtp_result is not None:
                     hidden_for_head, mtp_loss = mtp_result
                     output["mtp_loss"] = mtp_loss
+                reset_forward_chunked_ep()
                 labels_sb = labels.transpose(0, 1).contiguous()
                 if use_fused_kernels:
                     hidden_full = gather_from_sequence_parallel(
@@ -964,8 +975,11 @@ class Qwen3MoEModel(nn.Module):
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
 
             if labels is None:
+                reset_forward_chunked_ep()
                 logits = self.head(hidden_for_head)
                 output["logits"] = self.head.gather(logits)
+        else:
+            reset_forward_chunked_ep()
 
         return output
 
