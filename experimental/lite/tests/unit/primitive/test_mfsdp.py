@@ -1100,6 +1100,79 @@ def test_mfsdp_offload_zero_does_not_construct_cpu_optimizer(monkeypatch):
     assert optimizer._inner_optimizer.cpu_group is None
 
 
+def test_mfsdp_partial_optimizer_offload_updates_cpu_and_gpu_groups():
+    _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(0.5)
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    inner = optimizer._inner_optimizer
+    assert inner.cpu_group is not None
+    assert inner.optimizer.param_groups
+    cpu_ids = {id(param) for param in inner.cpu_group.gpu_params}
+    gpu_ids = {
+        id(param)
+        for group in inner.optimizer.param_groups
+        for param in group["params"]
+    }
+    assert cpu_ids and gpu_ids and cpu_ids.isdisjoint(gpu_ids)
+
+    optimizer.zero_grad()
+    value = torch.randn(3, 4)
+    target = torch.randn(3, 2)
+    torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+    optimizer.finish_grad_sync()
+    assert optimizer.step()[0]
+
+
+def test_mfsdp_offloaded_checkpoint_matches_loaded_next_step():
+    _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(1.0)
+    torch.manual_seed(55)
+    model_a = _Model()
+    model_b = copy.deepcopy(model_a)
+    chunks_a, optimizer_a = mfsdp_optimizer.build_mfsdp_stack(
+        [model_a],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    chunks_b, optimizer_b = mfsdp_optimizer.build_mfsdp_stack(
+        [model_b],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    first_value = torch.randn(3, 4)
+    first_target = torch.randn(3, 2)
+    optimizer_a.zero_grad()
+    torch.nn.functional.mse_loss(chunks_a[0](first_value), first_target).backward()
+    optimizer_a.finish_grad_sync()
+    assert optimizer_a.step()[0]
+
+    saved = copy.deepcopy(optimizer_a.state_dict())
+    assert saved["cpu"]["format_version"] == 2
+    optimizer_b.load_state_dict(saved)
+
+    next_value = torch.randn(3, 4)
+    next_target = torch.randn(3, 2)
+    for chunks, optimizer in ((chunks_a, optimizer_a), (chunks_b, optimizer_b)):
+        optimizer.zero_grad()
+        torch.nn.functional.mse_loss(chunks[0](next_value), next_target).backward()
+        optimizer.finish_grad_sync()
+        assert optimizer.step()[0]
+
+    params_a = dict(chunks_a[0].stream_full_parameters())
+    params_b = dict(chunks_b[0].stream_full_parameters())
+    assert params_a.keys() == params_b.keys()
+    for name in params_a:
+        assert torch.equal(params_a[name], params_b[name]), name
+
+
 def test_mfsdp_rollout_offload_drops_grad_storage_and_restores_next_step():
     _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(1.0)
     chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
