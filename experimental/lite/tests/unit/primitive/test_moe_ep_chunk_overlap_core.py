@@ -1328,7 +1328,7 @@ def test_two_chunk_forward_keeps_next_dispatch_ahead_of_first_combine_release(
         assert first_dispatch < next_dispatch < first_combine
 
 
-def test_saved_forward_routes_next_chunk_on_comm_stream():
+def test_saved_forward_routes_on_compute_then_hands_off_dispatch_to_comm_stream():
     tree = ast.parse(SOURCE.read_text())
     function = next(
         node
@@ -1352,7 +1352,14 @@ def test_saved_forward_routes_next_chunk_on_comm_stream():
         and isinstance(item.context_expr.args[0], ast.Name)
     ]
 
-    assert stream_contexts == ["comm_stream"]
+    assert stream_contexts == ["compute_stream", "comm_stream"]
+    source = ast.unparse(submit)
+    assert source.index("scores, indices = self._route") < source.index(
+        "route_ready.record(compute_stream)"
+    )
+    assert source.index("route_ready.record(compute_stream)") < source.index(
+        "comm_stream.wait_event(route_ready)"
+    ) < source.index("dispatcher.submit_deepep_dispatch")
 
 
 def test_saved_backward_chains_first_combine_to_caller_grad_readiness(

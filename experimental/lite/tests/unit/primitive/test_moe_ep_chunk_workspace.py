@@ -2573,3 +2573,32 @@ def test_saved_forward_context_does_not_pin_two_shared_slots_across_layers(
     for saved_tensor in ("recv_probs_base", "dispatched", "probs", "expert_out_edge"):
         assert saved_tensor in fields
     assert 'handle=state["handle"]' in forward_source
+
+
+def test_forward_router_runs_on_compute_stream_before_comm_dispatch(
+    transformer_engine_import_stub,
+):
+    """Routing stays on the caller stream; comm only consumes its ready event."""
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        _EPChunkOperationBase,
+    )
+
+    for method in (
+        _EPChunkOperationBase._forward_output_async,
+        _EPChunkOperationBase._forward_saved_context_async,
+    ):
+        source = inspect.getsource(method)
+        compute_route = source.index("with torch.cuda.stream(compute_stream):")
+        route = source.index("scores, indices = self._route", compute_route)
+        route_ready = source.index("route_ready.record(compute_stream)", route)
+        comm_dispatch = source.index("with torch.cuda.stream(comm_stream):", route_ready)
+        comm_wait = source.index("comm_stream.wait_event(route_ready)", comm_dispatch)
+        dispatch = source.index("dispatcher.submit_deepep_dispatch(", comm_wait)
+
+        assert compute_route < route < route_ready < comm_dispatch < comm_wait < dispatch
+        handoff = source[route_ready:dispatch]
+        assert "x_chunk.record_stream(comm_stream)" in handoff
+        assert "scores.record_stream(comm_stream)" in handoff
+        assert "indices.record_stream(comm_stream)" in handoff
+        assert "synchronize" not in source

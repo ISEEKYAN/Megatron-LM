@@ -1735,9 +1735,19 @@ class _EPChunkOperationBase:
                 chunk_idx % EP_CHUNK_COUNT, stream=comm_stream
             )
             dispatcher = lease.dispatcher
-            with torch.cuda.stream(comm_stream):
-                comm_stream.wait_event(input_ready)
+            with torch.cuda.stream(compute_stream):
+                compute_stream.wait_event(input_ready)
                 scores, indices = self._route(x_chunk, start, end)
+                route_ready = torch.cuda.Event()
+                route_ready.record(compute_stream)
+            with torch.cuda.stream(comm_stream):
+                comm_stream.wait_event(route_ready)
+                if x_chunk.is_cuda:
+                    x_chunk.record_stream(comm_stream)
+                if scores.is_cuda:
+                    scores.record_stream(comm_stream)
+                if indices.is_cuda:
+                    indices.record_stream(comm_stream)
                 with _ep_chunk_nvtx("forward.dispatch", chunk_idx):
                     with lease.deepep_recv_allocation():
                         state = dispatcher.submit_deepep_dispatch(
@@ -1897,9 +1907,19 @@ class _EPChunkOperationBase:
                 chunk_idx % EP_CHUNK_COUNT, stream=comm_stream
             )
             dispatcher = lease.dispatcher
-            with torch.cuda.stream(comm_stream):
-                comm_stream.wait_event(input_ready)
+            with torch.cuda.stream(compute_stream):
+                compute_stream.wait_event(input_ready)
                 scores, indices = self._route(x_chunk, start, end)
+                route_ready = torch.cuda.Event()
+                route_ready.record(compute_stream)
+            with torch.cuda.stream(comm_stream):
+                comm_stream.wait_event(route_ready)
+                if x_chunk.is_cuda:
+                    x_chunk.record_stream(comm_stream)
+                if scores.is_cuda:
+                    scores.record_stream(comm_stream)
+                if indices.is_cuda:
+                    indices.record_stream(comm_stream)
                 with _ep_chunk_nvtx("forward.dispatch", chunk_idx):
                     with lease.deepep_recv_allocation():
                         state = dispatcher.submit_deepep_dispatch(
