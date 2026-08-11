@@ -19,6 +19,14 @@ from megatron.lite.primitive.ops.cross_entropy import (
 )
 
 
+def _reuse_logits_storage_for_grad_logits(
+    logits: torch.Tensor, softmax: torch.Tensor
+) -> torch.Tensor:
+    """Overwrite BF16 logits with BF16 dlogits without a second vocab window."""
+    logits.copy_(softmax)
+    return logits
+
+
 class _ChunkedVocabParallelLinearCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -107,10 +115,13 @@ class _ChunkedVocabParallelLinearCrossEntropy(torch.autograd.Function):
             if ctx.temperature != 1.0:
                 softmax.div_(ctx.temperature)
             # CE owns FP32 probability math; the vanilla BF16 head backward
-            # consumes a BF16 dlogits, exactly as the non-chunked path does.
-            grad_logits = softmax.to(dtype=weight.dtype)
+            # consumes a BF16 dlogits. Reuse logits storage so a second BF16
+            # vocab window is not live beside logits and FP32 softmax.
+            grad_logits = _reuse_logits_storage_for_grad_logits(logits, softmax)
             grad_hidden_full[start:end].copy_(grad_logits.matmul(weight))
             grad_weight.add_(grad_logits.t().matmul(hidden_2d[start:end]))
+            # Keep every vocab-shaped temporary scoped to one token window.
+            del row_indices, masked_target, target_mask, softmax, grad_logits, logits
 
         if ctx.sequence_parallel and ctx.world_size > 1:
             grad_hidden = torch.empty(

@@ -1,7 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import gc
 import socket
+import weakref
 
 import pytest
 import torch
@@ -9,12 +11,49 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
+from megatron.lite.primitive.ops import chunked_linear_cross_entropy as chunked_lce
 from megatron.lite.primitive.ops.chunked_linear_cross_entropy import (
+    _reuse_logits_storage_for_grad_logits,
     chunked_vocab_parallel_linear_cross_entropy,
 )
 
 
 pytestmark = pytest.mark.mlite
+
+
+def test_chunked_linear_cross_entropy_reuses_logits_storage_for_bf16_dlogits():
+    logits = torch.empty(3, 7, dtype=torch.bfloat16)
+    softmax = torch.rand(3, 7, dtype=torch.float32)
+
+    grad_logits = _reuse_logits_storage_for_grad_logits(logits, softmax)
+
+    assert grad_logits.dtype is torch.bfloat16
+    assert grad_logits.data_ptr() == logits.data_ptr()
+    torch.testing.assert_close(grad_logits.float(), softmax, rtol=0.0, atol=0.004)
+
+
+def test_chunked_linear_cross_entropy_releases_previous_softmax_before_next_window(
+    monkeypatch,
+):
+    torch.manual_seed(11)
+    hidden = torch.randn(6, 1, 4, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(9, 4, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.randint(0, 9, (6, 1))
+    original = chunked_lce._chunk_loss_and_softmax
+    prior_softmax = []
+
+    def checked_chunk_loss(*args, **kwargs):
+        gc.collect()
+        assert all(ref() is None for ref in prior_softmax)
+        result = original(*args, **kwargs)
+        if result[1] is not None:
+            prior_softmax.append(weakref.ref(result[1]))
+        return result
+
+    monkeypatch.setattr(chunked_lce, "_chunk_loss_and_softmax", checked_chunk_loss)
+    chunked_vocab_parallel_linear_cross_entropy(
+        hidden, weight, labels, chunk_size=2
+    ).sum().backward()
 
 
 def _reference_loss(hidden, weight, labels, temperature, group=None):
