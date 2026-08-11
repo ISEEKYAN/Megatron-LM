@@ -337,6 +337,11 @@ class _EPChunkExpertActivationArenaCoordinator:
             "fc1_input": max_expert_rows * profile.hidden_size,
             "fc1_output": max_expert_rows * 2 * expert_intermediate_size,
             "fc2_output": max_expert_rows * profile.hidden_size,
+            # Normal backward aliases FC1 dgrad into FC2 dgrad storage.  The
+            # shared raw slot therefore must cover the wider of SwiGLU's
+            # intermediate gradient and FC1's hidden-size gradient.
+            "fc2_dgrad": max_expert_rows
+            * max(profile.hidden_size, expert_intermediate_size),
         }
         itemsize = torch.empty((), dtype=self.key.dtype).element_size()
         capacities = {
@@ -2888,10 +2893,10 @@ class EPChunkFusedForwardBackwardOp(_EPChunkOperationBase):
                 x_2d, grad_2d
             )
         grad_x = grad_x.view_as(x_saved)
-        # _full_recompute_fused_backward has made the caller stream wait for
-        # its terminal compute event before materializing these outputs.
-        stream = torch.cuda.current_stream(x_saved.device) if x_saved.is_cuda else None
-        self.workspace.park_expert_activations(stream=stream)
+        # Keep event-guarded activation backing through subsequent layers,
+        # microbatches, and training steps.  Explicit workspace reset/close is
+        # the offload boundary; parking here would force allocator churn before
+        # the next fused recompute can reuse the shared coordinator.
         return grad_x, router_grads, expert_grads
 
 

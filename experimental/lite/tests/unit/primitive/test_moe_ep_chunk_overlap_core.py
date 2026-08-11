@@ -1437,7 +1437,7 @@ def test_saved_context_wrapper_keeps_scratch_until_explicit_lifecycle_reset(
     assert "cuda.synchronize" not in source
 
 
-def test_fused_backward_parks_only_activation_after_materializing_outputs(
+def test_fused_backward_keeps_activation_backing_until_explicit_reset(
     transformer_engine_import_stub,
 ):
     transformer_engine_import_stub()
@@ -1457,10 +1457,43 @@ def test_fused_backward_parks_only_activation_after_materializing_outputs(
     )
     assert fused_source.index("_full_recompute_fused_backward(") < fused_source.index(
         "grad_x = grad_x.view_as(x_saved)"
-    ) < fused_source.index("self.workspace.park_expert_activations(")
-    assert "torch.cuda.current_stream(x_saved.device)" in fused_source
+    )
+    assert "self.workspace.park_expert_activations(" not in fused_source
     assert "reset_tensors" not in fused_source
     assert "synchronize" not in fused_source
+
+
+def test_fused_backward_does_not_implicitly_park_between_steps(
+    transformer_engine_import_stub,
+):
+    """The fused OP must leave reuse to explicit workspace lifecycle calls."""
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        EPChunkFusedForwardBackwardOp,
+    )
+
+    class Workspace:
+        def __init__(self):
+            self.park_calls = 0
+
+        def park_expert_activations(self, **_kwargs):
+            self.park_calls += 1
+
+    workspace = Workspace()
+    op = EPChunkFusedForwardBackwardOp(
+        router=torch.nn.Identity(),
+        experts=object(),
+        workspace=workspace,
+    )
+    op._full_recompute_fused_backward = lambda x, grad: (grad.clone(), [], [])
+    x = torch.ones(2, 3)
+    grad = torch.full_like(x, 2)
+
+    for _ in range(2):
+        grad_x, router_grads, expert_grads = op.forward_backward(x, grad)
+        torch.testing.assert_close(grad_x, grad)
+        assert router_grads == expert_grads == []
+    assert workspace.park_calls == 0
 
 
 def test_saved_backward_reuses_manual_unpermute_storage_only_after_wgrad_flush(

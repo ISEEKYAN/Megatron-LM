@@ -187,6 +187,7 @@ def test_explicit_frozen_activation_reservation_eager_park_releases_backing(
         "fc1_input": 48,
         "fc1_output": 72,
         "fc2_output": 48,
+        "fc2_dgrad": 48,
     }
 
     rehydrated = forward.acquire_expert_activation(stream=stream)
@@ -232,6 +233,106 @@ def test_explicit_frozen_activation_reservation_eager_park_releases_backing(
     assert coordinator.pointer_signatures_by_op == {}
     assert coordinator.backing_tensors == {}
     assert not coordinator.frozen
+
+
+@pytest.mark.parametrize(("hidden_size", "expert_intermediate_size"), [(4, 7), (7, 4)])
+def test_frozen_normal_backward_reserves_widest_fc2_dgrad_alias(
+    hidden_size, expert_intermediate_size, transformer_engine_import_stub
+):
+    """Normal backward's shared dgrad slot must fit both logical widths."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    profile = overlap.EPChunkShapeProfile(
+        max_input_rows=8,
+        hidden_size=hidden_size,
+        topk=2,
+        ep_size=2,
+        expert_intermediate_size=expert_intermediate_size,
+    )
+    registry = overlap.EPChunkWorkspaceRegistry()
+    workspace = registry.get_or_create(
+        overlap.EPChunkWorkspaceKey(
+            op="backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=993,
+            dtype=torch.float32,
+            shape_profile=profile,
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    workspace.reserve_expert_activations(max_expert_rows=3, device="cpu")
+    coordinator = workspace._expert_activation_owner.coordinator
+    assert coordinator.capacity_bytes["fc2_dgrad"] == (
+        overlap._expert_activation_capacity_bytes(
+            3
+            * max(hidden_size, expert_intermediate_size)
+            * torch.empty((), dtype=torch.float32).element_size()
+        )
+    )
+
+    lease = workspace.acquire_expert_activation()
+    fc2_dgrad = lease.tensor(
+        "fc2_dgrad", (3, expert_intermediate_size), dtype=torch.float32, device="cpu"
+    )
+    fc1_dgrad = lease.tensor(
+        "fc1_dgrad", (3, hidden_size), dtype=torch.float32, device="cpu"
+    )
+    assert fc2_dgrad.data_ptr() == fc1_dgrad.data_ptr()
+    assert workspace._expert_activation_owner.grows == 0
+    lease.release(_FakeEvent(ready=True))
+    registry.release(workspace.key)
+
+
+def test_fused_training_reuses_backing_until_explicit_reset(
+    transformer_engine_import_stub,
+):
+    """Fused-step releases retain event-guarded backing for the next step."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    profile = overlap.EPChunkShapeProfile(
+        max_input_rows=8,
+        hidden_size=4,
+        topk=2,
+        ep_size=2,
+        expert_intermediate_size=7,
+    )
+    registry = overlap.EPChunkWorkspaceRegistry()
+    workspace = registry.get_or_create(
+        overlap.EPChunkWorkspaceKey(
+            op="fused_forward_backward",
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=994,
+            dtype=torch.float32,
+            shape_profile=profile,
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    workspace.reserve_expert_activations(max_expert_rows=3, device="cpu")
+    coordinator = workspace._expert_activation_owner.coordinator
+
+    first = workspace.acquire_expert_activation()
+    first_tensor = first.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
+    first.release(_FakeEvent(ready=True))
+    allocations, rehydrates = coordinator.allocations, coordinator.rehydrates
+
+    second = workspace.acquire_expert_activation()
+    second_tensor = second.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
+    assert second_tensor.data_ptr() == first_tensor.data_ptr()
+    assert (coordinator.allocations, coordinator.rehydrates) == (allocations, rehydrates)
+    second.release(_FakeEvent(ready=True))
+
+    workspace.reset_tensors()
+    assert coordinator.arena.tensors == {}
+    assert coordinator.backing_tensors == {}
+    rebuilt = workspace.acquire_expert_activation()
+    rebuilt.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
+    assert coordinator.rehydrates == rehydrates + 1
+    rebuilt.release(_FakeEvent(ready=True))
+    registry.release(workspace.key)
 
 
 def test_zero_row_activation_is_a_non_allocating_logical_view(
