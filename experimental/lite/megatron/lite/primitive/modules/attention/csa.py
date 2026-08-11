@@ -18,10 +18,18 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
-    FusedCSAIndexerSparseAttnFromTopkFunc,
-    csa_sparse_attn,
-)
+# MCore moved the fused CSA entry points in the development branch. Keep the
+# Lite adapter compatible with both layouts while downstream snapshots migrate.
+try:
+    from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+        FusedCSAIndexerSparseAttnFromTopkFunc,
+        csa_sparse_attn,
+    )
+except ImportError:
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
+        FusedCSAIndexerSparseAttnFromTopkFunc,
+        csa_sparse_attn,
+    )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,

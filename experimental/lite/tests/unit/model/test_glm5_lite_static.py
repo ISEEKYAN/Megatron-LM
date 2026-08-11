@@ -244,6 +244,8 @@ def test_lite_csa_imports_core_csa_kernel_namespace():
     )
     assert "FusedCSAIndexerSparseAttnFromTopkFunc" in csa_text
     assert "csa_sparse_attn" in csa_text
+    assert "except ImportError:" in csa_text
+    assert "csa_utils.fused_sparse_attention import" in csa_text
     assert (
         "from megatron.core.transformer.experimental_attention_variant.dsa_kernels import"
         not in csa_text
