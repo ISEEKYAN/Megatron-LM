@@ -44,6 +44,14 @@ def _tiny_config() -> Qwen35Config:
     )
 
 
+def _tiny_dense_config() -> Qwen35Config:
+    return replace(
+        _tiny_config(),
+        model_type="qwen3_5",
+        intermediate_size=12,
+    )
+
+
 def _single_rank_parallel_state() -> SimpleNamespace:
     return SimpleNamespace(
         pp_size=1, tp_size=1, tp_group=None, ep_size=1, ep_group=None, etp_size=1, etp_group=None
@@ -348,6 +356,91 @@ def test_qwen35_export_maps_top_level_and_layer_norm_names() -> None:
         exported = dict(spec.native_to_hf(native_name, tensor))
         assert set(exported) == {hf_name}
         assert torch.equal(exported[hf_name], tensor)
+
+
+def test_qwen35_dense_load_and_export_map_gated_mlp_weights() -> None:
+    cfg = _tiny_dense_config()
+    spec = Qwen35WeightSpec(cfg)
+    weight_map = spec.weight_map()
+    gate = torch.arange(cfg.intermediate_size * cfg.hidden_size).reshape(
+        cfg.intermediate_size, cfg.hidden_size
+    )
+    up = gate + 1000
+    down = torch.arange(cfg.hidden_size * cfg.intermediate_size).reshape(
+        cfg.hidden_size, cfg.intermediate_size
+    )
+
+    assert weight_map["layers.0.mlp.gate_up.linear.layer_norm_weight"] == [
+        "model.language_model.layers.0.post_attention_layernorm.weight"
+    ]
+    assert weight_map["layers.0.mlp.gate_up.linear.weight"] == [
+        "model.language_model.layers.0.mlp.gate_proj.weight",
+        "model.language_model.layers.0.mlp.up_proj.weight",
+    ]
+    assert weight_map["layers.0.mlp.down.linear.weight"] == [
+        "model.language_model.layers.0.mlp.down_proj.weight"
+    ]
+    assert not any(".moe." in name for name in weight_map)
+
+    gate_up = spec.hf_to_native("layers.0.mlp.gate_up.linear.weight", [gate, up])
+    exported = dict(spec.native_to_hf("layers.0.mlp.gate_up.linear.weight", gate_up))
+    exported.update(spec.native_to_hf("layers.0.mlp.down.linear.weight", down))
+
+    assert torch.equal(
+        exported["model.language_model.layers.0.mlp.gate_proj.weight"], gate
+    )
+    assert torch.equal(
+        exported["model.language_model.layers.0.mlp.up_proj.weight"], up
+    )
+    assert torch.equal(
+        exported["model.language_model.layers.0.mlp.down_proj.weight"], down
+    )
+
+
+def test_qwen35_hf_text_prefix_selects_composite_and_standalone_names() -> None:
+    composite = Qwen35WeightSpec(
+        replace(_tiny_dense_config(), hf_text_prefix="model.language_model")
+    )
+    standalone = Qwen35WeightSpec(
+        replace(_tiny_dense_config(), hf_text_prefix="model")
+    )
+    native_name = "layers.0.mlp.down.linear.weight"
+    tensor = torch.arange(12)
+
+    assert composite.weight_map()[native_name] == [
+        "model.language_model.layers.0.mlp.down_proj.weight"
+    ]
+    assert standalone.weight_map()[native_name] == [
+        "model.layers.0.mlp.down_proj.weight"
+    ]
+    assert set(dict(composite.native_to_hf(native_name, tensor))) == {
+        "model.language_model.layers.0.mlp.down_proj.weight"
+    }
+    assert set(dict(standalone.native_to_hf(native_name, tensor))) == {
+        "model.layers.0.mlp.down_proj.weight"
+    }
+
+
+def test_qwen35_dense_mlp_tp_specs_and_placements() -> None:
+    spec = Qwen35WeightSpec(_tiny_dense_config())
+    gate_up = "layers.0.mlp.gate_up.linear.weight"
+    down = "layers.0.mlp.down.linear.weight"
+    gate = torch.arange(48).reshape(6, 8)
+    up = gate + 1000
+    shards = [
+        torch.cat([gate.chunk(2)[rank], up.chunk(2)[rank]], dim=0)
+        for rank in range(2)
+    ]
+
+    assert type(PLACEMENT_FN(gate_up)[-1]).__name__ == "Shard"
+    assert PLACEMENT_FN(gate_up)[-1].dim == 0
+    assert type(PLACEMENT_FN(down)[-1]).__name__ == "Shard"
+    assert PLACEMENT_FN(down)[-1].dim == 1
+    assert spec.tp_spec(gate_up) == (0, 0)
+    assert spec.tp_spec(down) == (1, 0)
+    assert torch.equal(
+        spec.merge_dense_shards(gate_up, shards), torch.cat([gate, up], dim=0)
+    )
 
 
 def test_qwen35_export_unpacks_full_attention_q_gate() -> None:

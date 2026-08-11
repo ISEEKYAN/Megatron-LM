@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -86,14 +87,30 @@ def _full_attn_module(layer, name: str):
     return getattr(full_attn, name, None) if full_attn is not None else None
 
 
+def _maybe(module_name: str) -> Callable[[nn.Module], nn.Module | None]:
+    def getter(layer: nn.Module) -> nn.Module | None:
+        return getattr(layer, module_name, None)
+
+    return getter
+
+
+def _moe_module(name: str) -> Callable[[nn.Module], nn.Module | None]:
+    def getter(layer: nn.Module) -> nn.Module | None:
+        moe = getattr(layer, "moe", None)
+        return getattr(moe, name, None) if moe is not None else None
+
+    return getter
+
+
 MODULE_MAP = {
     "core_attn": lambda layer: _full_attn_module(layer, "core_attn"),
-    "experts": lambda layer: layer.moe.experts,
-    "moe": lambda layer: layer.moe,
-    "router": lambda layer: layer.moe.router,
-    "mlp_norm": lambda layer: layer.mlp_norm,
+    "experts": _moe_module("experts"),
+    "moe": _maybe("moe"),
+    "router": _moe_module("router"),
+    "mlp": _maybe("mlp"),
+    "mlp_norm": _maybe("mlp_norm"),
     "attn_proj": lambda layer: _full_attn_module(layer, "proj"),
-    "linear_attn": lambda layer: layer.linear_attn,
+    "linear_attn": _maybe("linear_attn"),
 }
 
 
