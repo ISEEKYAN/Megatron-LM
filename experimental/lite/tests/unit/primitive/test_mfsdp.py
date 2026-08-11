@@ -1002,8 +1002,8 @@ def test_mfsdp_optimizer_checkpoint_round_trips_fp32_shard_values():
         assert torch.equal(param, expected_param)
 
 
-@pytest.mark.parametrize("offload_fraction", [-0.01, 0.5, 1.0, 1.01])
-def test_mfsdp_rejects_optimizer_offload(offload_fraction):
+@pytest.mark.parametrize("offload_fraction", [-0.01, 1.01, float("nan")])
+def test_mfsdp_rejects_invalid_optimizer_offload_fraction(offload_fraction):
     _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(offload_fraction)
 
     with pytest.raises(ValueError, match="offload_fraction"):
@@ -1014,6 +1014,172 @@ def test_mfsdp_rejects_optimizer_offload(offload_fraction):
             is_expert=lambda _name: False,
             fsdp_unit_modules=(_Unit,),
         )
+
+
+def test_mfsdp_full_optimizer_offload_uses_bounded_cpu_state_and_fp32_main_grad():
+    _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(1.0)
+    engine_cfg.optimizer.override_optimizer_config["bucket_size"] = 5
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+
+    cpu_group = optimizer._inner_optimizer.cpu_group
+    assert cpu_group is not None
+    assert optimizer._inner_optimizer.optimizer.param_groups == []
+    for bucket in chunks[0].param_sync.buckets:
+        assert bucket.main_param_buffer.dtype == bucket.policy.compute_dtype
+        assert bucket.main_grad_buffer.dtype == torch.float32
+
+    value = torch.randn(3, 4)
+    target = torch.randn(3, 2)
+    optimizer.zero_grad()
+    torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+    optimizer.finish_grad_sync()
+    assert all(
+        mfsdp_optimizer._optimizer_grad(param) is not None
+        and mfsdp_optimizer._optimizer_grad(param).dtype == torch.float32
+        for param in cpu_group.gpu_params
+        if param.numel()
+    )
+    assert optimizer.step()[0]
+
+    assert cpu_group.live_transfer_leases == 0
+    assert cpu_group.ring_allocated_elements <= min(
+        sum(param.numel() for param in cpu_group.gpu_params),
+        2 * 5,
+    )
+    for state in cpu_group._optimizer.state.values():
+        assert state["master_param"].device.type == "cpu"
+        assert state["exp_avg"].device.type == "cpu"
+        assert state["exp_avg_sq"].device.type == "cpu"
+
+
+def test_mfsdp_full_optimizer_offload_has_six_device_bytes_per_bf16_param():
+    _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(1.0)
+    model = _Model().to(dtype=torch.bfloat16)
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [model],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    inner = optimizer._inner_optimizer
+    cpu_group = inner.cpu_group
+    assert cpu_group is not None
+    total_numel = sum(param.numel() for param in inner.params)
+    device_param_bytes = sum(param.numel() * param.element_size() for param in inner.params)
+    device_grad_bytes = sum(
+        bucket.main_grad_buffer.numel() * bucket.main_grad_buffer.element_size()
+        for bucket in chunks[0].param_sync.buckets
+    )
+    assert device_param_bytes + device_grad_bytes == 6 * total_numel
+    assert sum(param.numel() * param.element_size() for param in cpu_group._cpu_params) == (
+        4 * total_numel
+    )
+
+
+def test_mfsdp_offload_zero_does_not_construct_cpu_optimizer(monkeypatch):
+    _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(0.0)
+
+    def reject_cpu_optimizer(*args, **kwargs):
+        raise AssertionError("offload=0 constructed CPU offload state")
+
+    monkeypatch.setattr(mfsdp_optimizer, "CpuAdamGroup", reject_cpu_optimizer)
+    _chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    assert optimizer._inner_optimizer.cpu_group is None
+
+
+def test_mfsdp_rollout_offload_drops_grad_storage_and_restores_next_step():
+    _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(1.0)
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    before = {
+        name: param.detach().clone()
+        for name, param in chunks[0].stream_full_parameters()
+    }
+
+    optimizer.offload_for_rollout()
+    assert all(bucket.main_grad_buffer.numel() == 0 for bucket in chunks[0].param_sync.buckets)
+    with pytest.raises(RuntimeError, match="offloaded for rollout"):
+        optimizer.zero_grad()
+
+    optimizer.load_from_rollout()
+    assert all(
+        bucket.main_grad_buffer.numel()
+        == (bucket.local_numel if bucket.requires_grad else 0)
+        for bucket in chunks[0].param_sync.buckets
+    )
+    after = {
+        name: param.detach().clone()
+        for name, param in chunks[0].stream_full_parameters()
+    }
+    assert before.keys() == after.keys()
+    for name in before:
+        assert torch.equal(before[name], after[name]), name
+
+    optimizer.zero_grad()
+    value = torch.randn(3, 4)
+    target = torch.randn(3, 2)
+    torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+    optimizer.finish_grad_sync()
+    assert optimizer.step()[0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_mfsdp_cuda_training_and_rollout_offloads_round_trip():
+    _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(1.0)
+    engine_cfg.optimizer.override_optimizer_config["bucket_size"] = 7
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model().to(device="cuda", dtype=torch.bfloat16)],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+    cpu_group = optimizer._inner_optimizer.cpu_group
+    assert cpu_group is not None
+    masters_before = [param.clone() for param in cpu_group._cpu_params]
+
+    value = torch.randn(3, 4, device="cuda", dtype=torch.bfloat16)
+    target = torch.randn(3, 2, device="cuda", dtype=torch.bfloat16)
+    optimizer.zero_grad()
+    torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+    optimizer.finish_grad_sync()
+    assert optimizer.step()[0]
+    assert cpu_group.d2h_bytes > 0
+    assert cpu_group.h2d_bytes > 0
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(masters_before, cpu_group._cpu_params, strict=True)
+    )
+    assert all(bucket.device.type == "cuda" for bucket in chunks[0].param_sync.buckets)
+
+    optimizer.offload_for_rollout()
+    assert all(bucket.device.type == "cpu" for bucket in chunks[0].param_sync.buckets)
+    assert all(bucket.main_grad_buffer.numel() == 0 for bucket in chunks[0].param_sync.buckets)
+    optimizer.load_from_rollout()
+    assert all(bucket.device.type == "cuda" for bucket in chunks[0].param_sync.buckets)
+
+    optimizer.zero_grad()
+    torch.nn.functional.mse_loss(chunks[0](value), target).backward()
+    optimizer.finish_grad_sync()
+    assert optimizer.step()[0]
 
 
 def _single_rank_mfsdp_stack(*, override_optimizer_config=None):

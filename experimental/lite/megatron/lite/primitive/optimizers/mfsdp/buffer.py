@@ -259,7 +259,9 @@ class ParamBucket:
         self.device = specs[0].full_param.device
         compute_dtype = specs[0].full_param.dtype
         main_params_dtype = (
-            compute_dtype if not self.requires_grad else config.main_params_dtype
+            compute_dtype
+            if not self.requires_grad or config.full_optimizer_offload
+            else config.main_params_dtype
         )
         self.policy = MixedPrecisionPolicy(
             compute_dtype=compute_dtype,
@@ -597,6 +599,7 @@ class ParamBucket:
     def move_model_state(self, device: torch.device, *, load_grad: bool) -> None:
         """Move persistent sharded storage without breaking optimizer aliases."""
         device = torch.device(device)
+        persistent_full = None if self.is_fsdp_unit else self.full_buffer
         self.release_full_parameters()
         self.discard_full_parameter_views()
         if self._grad_reduce_launched:
@@ -621,7 +624,25 @@ class ParamBucket:
             else self.model_param_buffer.to(device)
         )
         grad_comm_shares_main = self.local_grad_comm_buffer is self.main_grad_buffer
-        self.main_grad_buffer = self.main_grad_buffer.to(device)
+        grad_numel = self.local_numel if self.requires_grad else 0
+        if load_grad:
+            if self.main_grad_buffer.numel() == grad_numel:
+                self.main_grad_buffer = self.main_grad_buffer.to(device)
+            else:
+                # Rollout offload deliberately drops gradients.  Re-entering
+                # training creates a fresh zeroed shard instead of retaining a
+                # useless 4 B/parameter CPU copy.
+                self.main_grad_buffer = torch.zeros(
+                    grad_numel,
+                    dtype=self.policy.main_grads_dtype,
+                    device=device,
+                )
+        else:
+            self.main_grad_buffer = torch.empty(
+                0,
+                dtype=self.policy.main_grads_dtype,
+                device=device,
+            )
         self.grad_shard_buffer = self.main_grad_buffer
         self.local_compute_buffer = self.model_param_buffer
         self.local_grad_comm_buffer = (
@@ -630,8 +651,10 @@ class ParamBucket:
             else self.local_grad_comm_buffer.to(device)
         )
         self.device = device
-        self.full_buffer = torch.empty(
-            0, dtype=self.policy.compute_dtype, device=device
+        self.full_buffer = (
+            torch.empty(0, dtype=self.policy.compute_dtype, device=device)
+            if persistent_full is None
+            else persistent_full.to(device)
         )
         self.full_main_grad_buffer = torch.empty(
             0, dtype=self.policy.main_grads_dtype, device=device
@@ -657,7 +680,13 @@ class ParamBucket:
                 else:
                     spec.shard_param.grad = None
                     spec.shard_param.main_grad = None
-                spec.full_param.data = self.full_buffer
+                spec.full_param.data = (
+                    self.full_buffer
+                    if self.is_fsdp_unit
+                    else self.full_buffer.narrow(
+                        0, spec.full_offset, spec.numel
+                    ).view(spec.shape)
+                )
 
     def release_scratch_keep_weights(self) -> None:
         """Drop the all-gather scratch while leaving the sharded weights resident.

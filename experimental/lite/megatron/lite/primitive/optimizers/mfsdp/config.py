@@ -50,6 +50,10 @@ class MFSDPConfig:
     use_decoupled_grad: bool = False
     gradient_accumulation_fusion: bool = False
     all_gather_in_start_param_sync: bool = True
+    # Full training-time optimizer offload keeps the authoritative FP32
+    # master in the CPU optimizer.  The persistent device shard is therefore
+    # the compute-dtype mirror, not a second FP32 master.
+    full_optimizer_offload: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -422,6 +422,18 @@ class MegatronLiteRuntime(RuntimeBase):
         # scratch buffers or optimizer residency.
         training_transfer = model and grad
         if device == "cpu":
+            rollout_offload = (
+                getattr(handle._optimizer, "offload_for_rollout", None)
+                if training_transfer and handle._optimizer is not None
+                else None
+            )
+            if callable(rollout_offload):
+                rollout_offload()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                return
             if model:
                 offload_model_to_cpu(model_chunks)
             if (optimizer or training_transfer) and handle._optimizer is not None:
@@ -442,6 +454,14 @@ class MegatronLiteRuntime(RuntimeBase):
                     gc.collect()
                     torch.cuda.empty_cache()
         elif device == "cuda":
+            rollout_load = (
+                getattr(handle._optimizer, "load_from_rollout", None)
+                if training_transfer and handle._optimizer is not None
+                else None
+            )
+            if callable(rollout_load):
+                rollout_load()
+                return
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
             if (optimizer or training_transfer) and handle._optimizer is not None:
