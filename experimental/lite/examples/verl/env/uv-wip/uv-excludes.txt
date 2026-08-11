@@ -1,0 +1,18 @@
+# The base container owns the complete PyTorch/CUDA stack. Keep these packages
+# out of uv's resolution rather than installing and deleting them afterwards.
+torch
+torchvision
+torchaudio
+torchcodec
+torch-c-dlpack-ext
+functorch
+triton
+nvidia-cudnn-frontend
+nvidia-cutlass-dsl
+nvidia-cuda-cccl
+nvidia-cuda-crt
+nvidia-cuda-nvcc
+nvidia-cuda-nvrtc
+nvidia-cuda-runtime
+nvidia-ml-py
+nvidia-nvvm

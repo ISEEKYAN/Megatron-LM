@@ -1,0 +1,23 @@
+# Runtime dependencies declared by VERL's online source tree. VERL itself is
+# deliberately absent: env.sh exposes that checkout through PYTHONPATH.
+accelerate
+codetiming
+datasets
+dill
+hydra-core
+# VERL currently declares numpy<2, but vLLM main requires
+# opencv-python-headless>=4.13, whose wheel contract requires numpy>=2.
+# The WIP environment follows vLLM main and validates VERL by source import.
+numpy>=2
+pandas
+peft
+pyarrow>=19.0.0
+pybind11
+pylatexenc
+ray[default]>=2.41.0
+torchdata
+tensordict>=0.8.0,<=0.10.0,!=0.9.0
+transformers
+wandb
+packaging>=20.0
+tensorboard
