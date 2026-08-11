@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from megatron.lite.primitive.optimizers.fp32_adamw import FP32AdamW
+from megatron.lite.primitive.optimizers.fp32_adamw import FP32AdamW, STATE_DICT_TYPE
 
 
 @pytest.mark.parametrize("slice_capacity", [None, 3])
@@ -113,3 +113,19 @@ def test_shared_fp32_adamw_has_no_backend_imports():
         "megatron.lite.model",
     ):
         assert forbidden not in rendered
+
+
+def test_shared_fp32_adamw_state_tag_does_not_collide_with_fsdp2():
+    param = torch.nn.Parameter(torch.ones(2))
+    optimizer = FP32AdamW(
+        [param],
+        lr=1.0e-3,
+        weight_decay=0.0,
+        betas=(0.9, 0.999),
+        eps=1.0e-8,
+    )
+
+    assert STATE_DICT_TYPE == "mlite_fp32_adamw_v1"
+    assert optimizer.state_dict()["type"] == STATE_DICT_TYPE
+    with pytest.raises(ValueError, match="Invalid FP32 AdamW"):
+        optimizer.load_state_dict({"type": "fp32_adamw"})

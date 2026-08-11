@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from megatron.lite.primitive.optimizers.fp32_adamw import FP32AdamW
+from megatron.lite.primitive.optimizers.fp32_adamw import FP32AdamW, STATE_DICT_TYPE
 
 
 @dataclass(slots=True)
@@ -248,8 +248,13 @@ class CpuAdamGroup:
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self._ring.drain()
         optimizer_state = state_dict.get("optimizer", state_dict)
-        if optimizer_state.get("type") == "fp32_adamw":
+        if optimizer_state.get("type") == STATE_DICT_TYPE:
             self._optimizer.load_state_dict(optimizer_state)
+        elif optimizer_state.get("type") is not None:
+            raise ValueError(
+                "Invalid M-FSDP CPU optimizer state_dict type: "
+                f"{optimizer_state.get('type')!r}."
+            )
         else:
             self._optimizer.load_state_dict(self._convert_legacy_state(state_dict))
         self._ring.drain()
@@ -333,7 +338,7 @@ class CpuAdamGroup:
             else list(master_params)
         )
         return {
-            "type": "fp32_adamw",
+            "type": STATE_DICT_TYPE,
             "step_count": max(steps, default=0),
             "master_params": masters,
             "exp_avgs": exp_avgs,

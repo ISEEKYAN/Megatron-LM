@@ -670,7 +670,10 @@ class ParamBucket:
                     main_grad = self.main_grad_buffer.narrow(
                         0, spec.local_offset, spec.shard_numel
                     ).view_as(spec.shard_param)
-                    if spec.shard_param.dtype == main_grad.dtype:
+                    if (
+                        spec.shard_param.dtype == main_grad.dtype
+                        and not self.config.use_decoupled_grad
+                    ):
                         spec.shard_param.grad = main_grad
                         if hasattr(spec.shard_param, "main_grad"):
                             delattr(spec.shard_param, "main_grad")
@@ -813,7 +816,10 @@ class ParamBucket:
                 spec.shard_param.grad = None
                 spec.shard_param.main_grad = None
                 continue
-            if spec.shard_param.dtype == main_grad.dtype:
+            if (
+                spec.shard_param.dtype == main_grad.dtype
+                and not self.config.use_decoupled_grad
+            ):
                 spec.shard_param.grad = main_grad
                 if hasattr(spec.shard_param, "main_grad"):
                     delattr(spec.shard_param, "main_grad")

@@ -13,6 +13,7 @@ import torch.nn as nn
 LocalTensorFn = Callable[[nn.Parameter], torch.Tensor]
 LocalGradFn = Callable[[nn.Parameter], torch.Tensor | None]
 CopyMasterSliceFn = Callable[[nn.Parameter, torch.Tensor, int, int], None]
+STATE_DICT_TYPE = "mlite_fp32_adamw_v1"
 
 
 class GradTransferPolicy(Protocol):
@@ -266,7 +267,7 @@ class FP32AdamW:
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "type": "fp32_adamw",
+            "type": STATE_DICT_TYPE,
             "step_count": self.step_count,
             "master_params": [
                 self.state[param]["master_param"] for param in self.params
@@ -289,7 +290,7 @@ class FP32AdamW:
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        if state_dict.get("type") != "fp32_adamw":
+        if state_dict.get("type") != STATE_DICT_TYPE:
             raise ValueError("Invalid FP32 AdamW state_dict.")
         self.step_count = int(state_dict.get("step_count", 0))
         for source_name, target_name in (

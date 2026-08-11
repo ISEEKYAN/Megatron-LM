@@ -341,6 +341,20 @@ def test_training_transfer_prefers_atomic_mfsdp_rollout_transition(monkeypatch):
     assert events == ["mfsdp-offload", "mfsdp-load"]
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_mfsdp_training_transfer_without_atomic_hook_fails_loud(device, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    handle = ModelHandle(
+        model=nn.Linear(2, 2),
+        optimizer=object(),
+        _extras={"model_chunks": [], "optimizer_backend": "mfsdp"},
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    with pytest.raises(RuntimeError, match="requires atomic"):
+        runtime.to(handle, device, model=True, optimizer=False, grad=True)
+
+
 def test_export_transfer_does_not_move_optimizer_or_release_scratch(monkeypatch):
     events = []
 

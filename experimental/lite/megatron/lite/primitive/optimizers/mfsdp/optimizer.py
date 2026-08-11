@@ -63,6 +63,22 @@ def _override(opt: Any, name: str, default: Any) -> Any:
     return values.get(name, getattr(opt, name, default))
 
 
+def _resolve_offload_fraction(opt: Any) -> float:
+    """Resolve the stable field and MCore-compatible raw override aliases."""
+    values = dict(getattr(opt, "override_optimizer_config", None) or {})
+    value = getattr(opt, "offload_fraction", None)
+    if value is None:
+        value = values.get("offload_fraction", values.get("optimizer_offload_fraction"))
+    if value is None and values.get("optimizer_cpu_offload"):
+        value = 1.0
+    return float(value or 0.0)
+
+
+def _has_explicit_option(opt: Any, name: str) -> bool:
+    values = dict(getattr(opt, "override_optimizer_config", None) or {})
+    return name in values or (hasattr(opt, name) and getattr(opt, name) is not None)
+
+
 class _StandaloneOptimizer:
     """Torch optimizer adapter with M-FSDP-aware norm and state movement."""
 
@@ -457,7 +473,7 @@ def build_mfsdp_stack(
     )
     opt = engine_cfg.optimizer
     classifier = is_expert or (lambda _name: False)
-    offload_fraction = float(getattr(opt, "offload_fraction", 0.0) or 0.0)
+    offload_fraction = _resolve_offload_fraction(opt)
     if not math.isfinite(offload_fraction) or not 0.0 <= offload_fraction <= 1.0:
         raise ValueError(
             f"M-FSDP offload_fraction must be in [0, 1], got {offload_fraction}."
@@ -465,8 +481,6 @@ def build_mfsdp_stack(
     config = build_mfsdp_config(
         opt, calculate_per_token_loss=calculate_per_token_loss
     )
-    if offload_fraction == 1.0:
-        config = replace(config, full_optimizer_offload=True)
     if (
         config.suggested_communication_unit_size is None
         and suggested_communication_unit_size is not None
@@ -476,6 +490,28 @@ def build_mfsdp_stack(
         config = replace(
             config,
             suggested_communication_unit_size=int(suggested_communication_unit_size),
+        )
+    if offload_fraction == 1.0:
+        # These are MCore's native communication controls. Full optimizer
+        # offload is memory-first: bound the communication queue to one bucket
+        # and avoid retaining a prefetched full-parameter bucket. Explicit user
+        # choices remain authoritative.
+        config = replace(
+            config,
+            full_optimizer_offload=True,
+            suggested_communication_unit_size=(
+                config.suggested_communication_unit_size
+                if (
+                    suggested_communication_unit_size is not None
+                    or _has_explicit_option(opt, "suggested_communication_unit_size")
+                )
+                else config.bucket_size
+            ),
+            overlap_param_gather=(
+                config.overlap_param_gather
+                if _has_explicit_option(opt, "overlap_param_gather")
+                else False
+            ),
         )
     config = _order_param_gathers_for_parallel_collectives(config, ps)
     groups = build_mfsdp_process_groups(ps)

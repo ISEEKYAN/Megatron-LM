@@ -434,6 +434,10 @@ class MegatronLiteRuntime(RuntimeBase):
                     gc.collect()
                     torch.cuda.empty_cache()
                 return
+            if training_transfer and handle._extras.get("optimizer_backend") == "mfsdp":
+                raise RuntimeError(
+                    "M-FSDP training transfer requires atomic offload_for_rollout()."
+                )
             if model:
                 offload_model_to_cpu(model_chunks)
             if (optimizer or training_transfer) and handle._optimizer is not None:
@@ -462,6 +466,10 @@ class MegatronLiteRuntime(RuntimeBase):
             if callable(rollout_load):
                 rollout_load()
                 return
+            if training_transfer and handle._extras.get("optimizer_backend") == "mfsdp":
+                raise RuntimeError(
+                    "M-FSDP training transfer requires atomic load_from_rollout()."
+                )
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
             if (optimizer or training_transfer) and handle._optimizer is not None:

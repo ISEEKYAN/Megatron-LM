@@ -1016,6 +1016,23 @@ def test_mfsdp_rejects_invalid_optimizer_offload_fraction(offload_fraction):
         )
 
 
+def test_mfsdp_accepts_raw_override_only_offload_fraction():
+    _Model, _Unit, ps, engine_cfg = _build_optimizer_stack()
+    del engine_cfg.optimizer.offload_fraction
+    engine_cfg.optimizer.override_optimizer_config["offload_fraction"] = 1.0
+
+    _chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+
+    assert optimizer._inner_optimizer.cpu_group is not None
+    assert optimizer._inner_optimizer.optimizer.param_groups == []
+
+
 def test_mfsdp_full_optimizer_offload_uses_bounded_cpu_state_and_fp32_main_grad():
     _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(1.0)
     engine_cfg.optimizer.override_optimizer_config["bucket_size"] = 5
@@ -1056,6 +1073,138 @@ def test_mfsdp_full_optimizer_offload_uses_bounded_cpu_state_and_fp32_main_grad(
         assert state["master_param"].device.type == "cpu"
         assert state["exp_avg"].device.type == "cpu"
         assert state["exp_avg_sq"].device.type == "cpu"
+
+
+def test_mfsdp_cpu_adam_group_matches_torch_adamw_across_steps():
+    initial = torch.tensor([1.0, -2.0, 3.0, -4.0, 5.0])
+    candidate = torch.nn.Parameter(initial.clone())
+    reference = torch.nn.Parameter(initial.clone())
+    candidate_group = mfsdp_optimizer.CpuAdamGroup(
+        [{"params": [candidate], "weight_decay": 0.2}],
+        lr=0.03,
+        betas=(0.8, 0.95),
+        eps=1.0e-6,
+        bucket_size=2,
+    )
+    reference_optimizer = torch.optim.AdamW(
+        [{"params": [reference], "weight_decay": 0.2}],
+        lr=0.03,
+        betas=(0.8, 0.95),
+        eps=1.0e-6,
+        foreach=False,
+    )
+
+    for grad in (
+        torch.tensor([0.5, -0.25, 0.0, 1.0, -0.5]),
+        torch.tensor([-0.2, 0.4, -0.6, 0.8, -1.0]),
+        torch.tensor([0.3, 0.1, -0.1, -0.3, 0.7]),
+    ):
+        candidate.main_grad = grad.clone()
+        reference.grad = grad.clone()
+        candidate_group.step()
+        reference_optimizer.step()
+
+    torch.testing.assert_close(candidate, reference, atol=0.0, rtol=0.0)
+    state = candidate_group._optimizer.state[candidate]
+    reference_state = reference_optimizer.state[reference]
+    assert state["step"] == 3
+    torch.testing.assert_close(
+        state["exp_avg"], reference_state["exp_avg"], atol=2.0e-8, rtol=2.0e-7
+    )
+    torch.testing.assert_close(
+        state["exp_avg_sq"], reference_state["exp_avg_sq"], atol=2.0e-8, rtol=2.0e-7
+    )
+
+
+def test_mfsdp_same_dtype_reduced_grad_uses_decoupled_optimizer_contract(monkeypatch):
+    _Model, _Unit, ps, engine_cfg = _build_optimizer_stack()
+    engine_cfg.optimizer.override_optimizer_config["use_precision_aware_optimizer"] = True
+
+    class _DecoupledOptimizer:
+        def __init__(self, groups):
+            self.param_groups = groups
+            self.state = {}
+
+        def zero_grad(self):
+            for group in self.param_groups:
+                for param in group["params"]:
+                    param.grad = None
+                    param.decoupled_grad = None
+
+        def step(self):
+            assert all(
+                param.grad is None and getattr(param, "decoupled_grad", None) is not None
+                for group in self.param_groups
+                for param in group["params"]
+                if param.numel()
+            )
+
+        def state_dict(self):
+            return {"state": {}, "param_groups": []}
+
+    monkeypatch.setattr(
+        mfsdp_optimizer,
+        "_build_optimizer_algorithm",
+        lambda groups, *_args, **_kwargs: _DecoupledOptimizer(groups),
+    )
+    chunks, optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+
+    optimizer.zero_grad()
+    torch.nn.functional.mse_loss(
+        chunks[0](torch.randn(3, 4)), torch.randn(3, 2)
+    ).backward()
+    optimizer.finish_grad_sync()
+
+    params = [param for param in _optimizer_params(optimizer) if param.numel()]
+    assert all(param.grad is None for param in params)
+    assert all(getattr(param, "decoupled_grad", None) is param.main_grad for param in params)
+    assert optimizer.step()[0]
+
+
+def test_mfsdp_full_offload_defaults_to_mcore_memory_first_communication_policy():
+    _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(1.0)
+    engine_cfg.optimizer.override_optimizer_config["bucket_size"] = 5
+
+    chunks, _optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+
+    config = chunks[0].mfsdp_config
+    assert config.suggested_communication_unit_size == 5
+    assert config.overlap_param_gather is False
+
+
+def test_mfsdp_full_offload_preserves_explicit_mcore_communication_policy():
+    _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(1.0)
+    engine_cfg.optimizer.override_optimizer_config.update(
+        {
+            "bucket_size": 5,
+            "suggested_communication_unit_size": 9,
+            "overlap_param_gather": True,
+        }
+    )
+
+    chunks, _optimizer = mfsdp_optimizer.build_mfsdp_stack(
+        [_Model()],
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=lambda _name: False,
+        fsdp_unit_modules=(_Unit,),
+    )
+
+    config = chunks[0].mfsdp_config
+    assert config.suggested_communication_unit_size == 9
+    assert config.overlap_param_gather is True
 
 
 def test_mfsdp_full_optimizer_offload_has_six_device_bytes_per_bf16_param():
