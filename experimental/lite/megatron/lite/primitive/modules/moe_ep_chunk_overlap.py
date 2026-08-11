@@ -309,7 +309,7 @@ class _EPChunkExpertActivationArenaCoordinator:
     max_requested_bytes: dict[str, int] = field(default_factory=dict)
     capacity_bytes: dict[str, int] = field(default_factory=dict)
     logical_trailing_shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
-    pointer_signatures_by_op: dict[EPChunkOpName, tuple[tuple[str, int], ...]] = field(
+    pointer_signatures_by_op: dict[EPChunkOpName, dict[str, int]] = field(
         default_factory=dict
     )
     backing_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -393,16 +393,36 @@ class _EPChunkExpertActivationArenaCoordinator:
         if self.claimed_op != op:
             raise RuntimeError("EP chunk expert activation coordinator release lost owner")
         if self.frozen:
-            signature = tuple(
-                sorted((name, tensor.data_ptr()) for name, tensor in self.arena.tensors.items())
+            self._record_pointer_signature(
+                op,
+                {
+                    name: tensor.data_ptr()
+                    for name, tensor in self.arena.tensors.items()
+                },
             )
-            previous_signature = self.pointer_signatures_by_op.setdefault(op, signature)
-            if previous_signature != signature:
-                raise RuntimeError(
-                    "EP chunk expert activation pointers changed after frozen rehydrate"
-                )
         self.consumer_event = event
         self.claimed_op = None
+
+    def _record_pointer_signature(
+        self, op: EPChunkOpName, current: dict[str, int]
+    ) -> None:
+        """Reject moved frozen backing, while allowing later lazy slot creation."""
+        previous = self.pointer_signatures_by_op.setdefault(op, {})
+        changed = {
+            name: (previous[name], pointer)
+            for name, pointer in current.items()
+            if name in previous and previous[name] != pointer
+        }
+        if changed:
+            details = ", ".join(
+                f"{name}: previous={old} current={new}"
+                for name, (old, new) in sorted(changed.items())
+            )
+            raise RuntimeError(
+                "EP chunk expert activation backing pointers changed after frozen rehydrate: "
+                f"{details}"
+            )
+        previous.update(current)
 
     def park(self, *, stream: Any | None) -> None:
         """Drop cross-OP tensor references at an explicit model lifecycle boundary."""

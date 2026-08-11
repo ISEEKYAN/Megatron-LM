@@ -166,26 +166,24 @@ def test_explicit_frozen_activation_reservation_parks_without_tensor_ownership(
 
     first = forward.acquire_expert_activation(stream=stream)
     fc1_input = first.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
-    first.tensor("fc1_output", (3, 6), dtype=torch.float32, device="cpu")
-    fc2_output = first.tensor("fc2_output", (3, 4), dtype=torch.float32, device="cpu")
-    assert set(coordinator.arena.tensors) == {"fc1_input", "fc1_output"}
-    assert fc2_output.data_ptr() == fc1_input.data_ptr()
-    assert set(coordinator.backing_tensors) == {"fc1_input", "fc1_output"}
-    first_signature = tuple(
-        sorted((name, tensor.data_ptr()) for name, tensor in coordinator.arena.tensors.items())
-    )
+    first_input_ptr = fc1_input.data_ptr()
+    assert set(coordinator.arena.tensors) == {"fc1_input"}
+    assert set(coordinator.backing_tensors) == {"fc1_input"}
     first.release(_FakeEvent(ready=True))
     forward.reset_tensors()
     assert coordinator.arena.tensors == {}
-    assert set(coordinator.backing_tensors) == {"fc1_input", "fc1_output"}
+    assert set(coordinator.backing_tensors) == {"fc1_input"}
 
     rehydrated = forward.acquire_expert_activation(stream=stream)
-    rehydrated.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
+    rehydrated_input = rehydrated.tensor(
+        "fc1_input", (3, 4), dtype=torch.float32, device="cpu"
+    )
     rehydrated.tensor("fc1_output", (3, 6), dtype=torch.float32, device="cpu")
-    rehydrated.tensor("fc2_output", (3, 4), dtype=torch.float32, device="cpu")
-    assert tuple(
-        sorted((name, tensor.data_ptr()) for name, tensor in coordinator.arena.tensors.items())
-    ) == first_signature
+    rehydrated_fc2 = rehydrated.tensor(
+        "fc2_output", (3, 4), dtype=torch.float32, device="cpu"
+    )
+    assert rehydrated_input.data_ptr() == first_input_ptr
+    assert rehydrated_fc2.data_ptr() == first_input_ptr
     rehydrated.release(_FakeEvent(ready=True))
     forward.reset_tensors()
 
@@ -216,6 +214,33 @@ def test_explicit_frozen_activation_reservation_parks_without_tensor_ownership(
     assert coordinator.pointer_signatures_by_op == {}
     assert coordinator.backing_tensors == {}
     assert not coordinator.frozen
+
+
+def test_frozen_signature_rejects_only_a_changed_backing_slot(
+    transformer_engine_import_stub,
+):
+    """Slot-set growth is valid; an existing storage name may never move."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    coordinator = overlap._EPChunkExpertActivationArenaCoordinator(
+        overlap._EPChunkExpertActivationArenaKey(
+            device_type="cpu",
+            device_index=None,
+            ep_group_id=992,
+            dtype=torch.float32,
+            shape_profile=overlap.EPChunkShapeProfile(
+                max_input_rows=8, hidden_size=4, topk=2, ep_size=2
+            ),
+        )
+    )
+    coordinator.frozen = True
+    coordinator._record_pointer_signature("forward", {"fc1_input": 101})
+    coordinator._record_pointer_signature(
+        "forward", {"fc1_input": 101, "fc1_output": 202}
+    )
+    with pytest.raises(RuntimeError, match=r"fc1_input.*previous=101.*current=303"):
+        coordinator._record_pointer_signature("forward", {"fc1_input": 303})
 
 
 def test_activation_pool_parks_between_ops_at_observed_high_watermark(
