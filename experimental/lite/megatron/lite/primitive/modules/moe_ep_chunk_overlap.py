@@ -216,6 +216,18 @@ class _EPChunkAllocationArena:
             return
         if self.device is None:
             raise RuntimeError("EP chunk allocation arena has no bound device")
+        # Graph capture/replay is owned by the outer graph manager's
+        # graph_pool_handle.  An eager-compatible pool must never override it.
+        if self.device.type == "cuda":
+            try:
+                capture_now = torch.cuda.is_current_stream_capturing()
+            except RuntimeError:
+                # CPU contract tests may bind a fake CUDA device without a
+                # CUDA runtime.  A real capture query is available on CUDA.
+                capture_now = False
+            if capture_now:
+                yield
+                return
         if self._allocation_depth:
             self._allocation_depth += 1
             try:
@@ -816,7 +828,7 @@ class EPChunkWorkspace:
         return self._allocation_arenas[slot]
 
     def materialize(self, *, device: torch.device | str | None = None) -> None:
-        """Create this op's dispatchers and empty per-slot allocation pools."""
+        """Create this op's dispatchers bound to one compatible physical pool."""
         if self._materialized:
             self._validate_bound_device(device)
             if all(slot.dispatcher is not None for slot in self._slots):
@@ -828,24 +840,17 @@ class EPChunkWorkspace:
                 )
         else:
             profile_device = self._bind(device)
+        allocation_pool = self._bind_eager_physical_pool(profile_device)
         if self.key.device_type == "cuda":
             with torch.cuda.device(profile_device):
                 dispatchers = [
                     self._dispatcher_factory(slot) for slot in range(EP_CHUNK_COUNT)
                 ]
-                allocation_pools = [
-                    torch.cuda.MemPool(
-                        allocator=None,
-                        use_on_oom=False,
-                        no_split=False,
-                    )
-                    for _ in range(EP_CHUNK_COUNT)
-                ]
         else:
             dispatchers = [
                 self._dispatcher_factory(slot) for slot in range(EP_CHUNK_COUNT)
             ]
-            allocation_pools = [None for _ in range(EP_CHUNK_COUNT)]
+        allocation_pools = [allocation_pool for _ in range(EP_CHUNK_COUNT)]
         if len({id(dispatcher) for dispatcher in dispatchers}) != EP_CHUNK_COUNT:
             raise RuntimeError("EP chunk workspace requires two distinct dispatchers")
         for chunk_idx, dispatcher in enumerate(dispatchers):
@@ -863,11 +868,12 @@ class EPChunkWorkspace:
         self._materialized = True
 
     def prepare_scratch(self, *, device: torch.device | str | None = None) -> None:
-        """Bind scratch ownership without constructing a dispatcher or CUDA pool."""
+        """Bind scratch ownership without constructing a dispatcher."""
         if self._materialized:
             self._validate_bound_device(device)
             return
-        self._bind(device)
+        profile_device = self._bind(device)
+        self._bind_eager_physical_pool(profile_device)
 
     def reserve_expert_activations(
         self,
@@ -885,6 +891,7 @@ class EPChunkWorkspace:
         profile_device = self._bind(device) if not self._materialized else self._bound_device
         if profile_device is None:
             raise RuntimeError("EP chunk workspace has no bound device")
+        self._bind_eager_physical_pool(profile_device)
         intermediate = expert_intermediate_size
         if intermediate is None:
             intermediate = self.key.shape_profile.expert_intermediate_size
@@ -908,9 +915,11 @@ class EPChunkWorkspace:
         if require_dispatcher:
             self.materialize(device=runtime_device)
         elif not self._materialized:
-            self._bind(runtime_device)
+            self._bind_eager_physical_pool(self._bind(runtime_device))
         else:
             self._validate_bound_device(runtime_device)
+            if self._bound_device is not None:
+                self._bind_eager_physical_pool(self._bound_device)
         state = self._slots[slot]
         if state.in_use:
             raise RuntimeError(f"EP chunk workspace slot {slot} is already leased")
@@ -948,8 +957,37 @@ class EPChunkWorkspace:
                 raise RuntimeError(
                     "Materialized EP chunk workspace has no bound device"
                 )
+        self._bind_eager_physical_pool(profile_device)
         self._expert_activation_owner.acquire(stream=stream, device=profile_device)
         return _EPChunkExpertActivationLease(self)
+
+    def _bind_eager_physical_pool(self, device: torch.device) -> Any | None:
+        """Attach all logical slots to the registry's compatible eager pool.
+
+        Dispatchers and leases remain per-OP/per-slot.  Only physical allocator
+        ownership is shared, so a parked microbatch can donate blocks to the
+        next compatible logical consumer without prolonging its tensor lifetime.
+        """
+        if self.key.device_type != "cuda":
+            return None
+        if self._registry is None:
+            if self._expert_activation_owner.arena.allocation_pool is None:
+                with torch.cuda.device(device):
+                    self._expert_activation_owner.arena.allocation_pool = torch.cuda.MemPool(
+                        allocator=None, use_on_oom=False, no_split=False
+                    )
+            pool = self._expert_activation_owner.arena.allocation_pool
+        else:
+            pool = self._registry._eager_physical_pool(
+                self._expert_activation_owner.coordinator.key, device
+            )
+        self._expert_activation_owner.arena.allocation_pool = pool
+        self._expert_activation_owner.arena.device = device
+        for slot, arena in zip(self._slots, self._allocation_arenas, strict=True):
+            slot.allocation_pool = pool
+            arena.allocation_pool = pool
+            arena.device = device
+        return pool
 
     def _bind(self, device: torch.device | str | None) -> torch.device:
         """Claim registry identity and bind a runtime device without allocating."""
@@ -1326,6 +1364,26 @@ class EPChunkWorkspaceRegistry:
         self._expert_activation_arenas: dict[
             _EPChunkExpertActivationArenaKey, _EPChunkExpertActivationArenaCoordinator
         ] = {}
+        # Eager physical allocator ownership is keyed only by storage
+        # compatibility.  Per-op owners and two logical slots remain separate.
+        self._eager_physical_pools: dict[
+            tuple[_EPChunkExpertActivationArenaKey, int], Any
+        ] = {}
+
+    def _eager_physical_pool(
+        self, key: _EPChunkExpertActivationArenaKey, device: torch.device
+    ) -> Any:
+        if device.index is None:
+            raise RuntimeError("EP chunk eager physical pool requires a concrete CUDA device")
+        pool_key = (key, device.index)
+        pool = self._eager_physical_pools.get(pool_key)
+        if pool is None:
+            with torch.cuda.device(device):
+                pool = torch.cuda.MemPool(
+                    allocator=None, use_on_oom=False, no_split=False
+                )
+            self._eager_physical_pools[pool_key] = pool
+        return pool
 
     def get_or_create(
         self,
@@ -1434,6 +1492,9 @@ class EPChunkWorkspaceRegistry:
             coordinator.frozen = False
             coordinator.parks = 0
             coordinator.rehydrates = 0
+            for pool_key in tuple(self._eager_physical_pools):
+                if pool_key[0] == coordinator.key:
+                    self._eager_physical_pools.pop(pool_key)
 
 _EP_CHUNK_WORKSPACES = EPChunkWorkspaceRegistry()
 
