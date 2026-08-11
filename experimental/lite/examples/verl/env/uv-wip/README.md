@@ -19,9 +19,10 @@ bash experimental/lite/examples/verl/env/uv-wip/env.sh \
   /usr/bin/python3 -c 'import torch, vllm; import verl_mlite.engine'
 ```
 
-The launcher validates identifying package directories before changing the
-environment. It prepends, in order, the uv site, VERL source, Megatron source,
-Megatron Lite package, and the local VERL integration package. Existing
+The launcher validates identifying package directories and the uv site's
+`.uv-wip-ready` publication marker before changing the environment. It
+prepends, in order, the uv site, VERL source, Megatron source, Megatron Lite
+package, and the local VERL integration package. Existing
 `PYTHONPATH` entries remain last. `OMP_NUM_THREADS` and `MKL_NUM_THREADS` are
 forced to `1` because the container's MKL path is not safe with the inherited
 thread defaults used by the cluster launcher. `CC` and `CXX` are fixed to the
@@ -36,8 +37,9 @@ after the required uv/VERL/Megatron/MLite source prefix but before inherited
 
 The uv site is expected to be built inside the target container with
 `/usr/bin/python3`. It must not contain distributions named `torch`,
-`torchvision`, `torchaudio`, `functorch`, `triton`, or `nvidia-*`; those would
-override the CUDA and PyTorch stack supplied by the base image.
+`torchvision`, `torchaudio`, `torchcodec`, `torch-c-dlpack-ext`, `functorch`,
+`triton`, or `nvidia-*`; those would override the CUDA and PyTorch stack
+supplied by the base image.
 
 `bootstrap.sh` enforces that contract while resolving the dependencies of an
 explicit prebuilt vLLM wheel. Both the target and wheel URL are caller-owned so
@@ -51,10 +53,13 @@ bash experimental/lite/examples/verl/env/uv-wip/bootstrap.sh
 ```
 
 The target must not exist. The script first performs a dry resolution and
-rejects a plan containing a container-owned package; only then does it install.
-It finishes by auditing distribution metadata and rechecking the native torch
-version. `source-requirements.txt` supplies VERL's runtime dependencies without
-installing VERL, Megatron-Core, or Megatron Lite themselves.
+rejects a plan containing a container-owned package. It then installs into a
+temporary sibling directory, audits distribution metadata, and rechecks the
+native torch version. Only a successful audit writes `.uv-wip-ready` and
+atomically renames that directory to the requested target; failures remove the
+staging directory and leave no runnable target. `source-requirements.txt`
+supplies VERL's runtime dependencies without installing VERL, Megatron-Core,
+or Megatron Lite themselves.
 
 The WIP source requirements intentionally use NumPy 2. vLLM main requires
 `opencv-python-headless>=4.13`, which in turn requires NumPy 2, while VERL's

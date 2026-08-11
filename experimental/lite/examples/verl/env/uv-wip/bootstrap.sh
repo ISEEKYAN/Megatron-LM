@@ -60,24 +60,30 @@ fi
 cleanup_plan
 trap - EXIT
 
+BUILD_TARGET="$(mktemp -d "${PLAN_PARENT}/.uv-wip-build.XXXXXX")"
+cleanup_build() {
+  rm -rf -- "${BUILD_TARGET}"
+}
+trap cleanup_build EXIT
+
 uv pip install \
   --python /usr/bin/python3 \
-  --target "${UV_WIP_SITE}" \
+  --target "${BUILD_TARGET}" \
   --excludes "${EXCLUDES}" \
   --requirements "${SOURCE_REQUIREMENTS}" \
   "${VLLM_WHEEL_URL}"
 
 # vLLM main imports its bundled kernels through the historical top-level
 # package name before VERL's runtime compatibility hook can install an alias.
-if [[ -d "${UV_WIP_SITE}/vllm/third_party/triton_kernels" && ! -e "${UV_WIP_SITE}/triton_kernels" ]]; then
+if [[ -d "${BUILD_TARGET}/vllm/third_party/triton_kernels" && ! -e "${BUILD_TARGET}/triton_kernels" ]]; then
   (
-    cd "${UV_WIP_SITE}"
+    cd "${BUILD_TARGET}"
     ln -s vllm/third_party/triton_kernels triton_kernels
   )
 fi
 
-UV_WIP_SITE="${UV_WIP_SITE}" EXPECTED_TORCH_VERSION="${EXPECTED_TORCH_VERSION}" \
-PYTHONPATH="${UV_WIP_SITE}" /usr/bin/python3 - <<'PY'
+UV_WIP_SITE="${BUILD_TARGET}" EXPECTED_TORCH_VERSION="${EXPECTED_TORCH_VERSION}" \
+PYTHONPATH="${BUILD_TARGET}" /usr/bin/python3 - <<'PY'
 import importlib.metadata
 import json
 import os
@@ -113,3 +119,9 @@ for distribution in distributions:
 print("UV_WIP_DIST_INFO=" + json.dumps(sorted(distributions, key=lambda item: item["name"])))
 print(f"UV_WIP_BASE_TORCH={torch.__version__} {torch.__file__}")
 PY
+
+# Publish only a completely installed and audited site. The staging directory
+# is on the target filesystem, so this rename is atomic to env.sh readers.
+touch "${BUILD_TARGET}/.uv-wip-ready"
+mv -T -- "${BUILD_TARGET}" "${UV_WIP_SITE}"
+trap - EXIT

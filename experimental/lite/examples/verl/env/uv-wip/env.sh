@@ -16,6 +16,8 @@ require_root() {
 }
 
 require_root UV_WIP_SITE vllm
+[[ -f "${UV_WIP_SITE}/.uv-wip-ready" ]] || \
+  fail "UV_WIP_SITE=${UV_WIP_SITE} does not contain .uv-wip-ready"
 require_root VERL_ROOT verl
 require_root MEGATRON_ROOT megatron/core
 require_root MLITE_ROOT experimental/lite/megatron/lite
