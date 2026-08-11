@@ -224,6 +224,44 @@ compressed-tensors plus `verl.utils.qat.vllm_patch`, with paired
 [QAT.md](QAT.md) for the exact arm semantics, validation scope, safe
 exclusions, and required MXFP4 JSON schema.
 
+### DeepSeek V4 MXFP4 QAT A/B
+
+The DeepSeek V4 DAPO launcher exposes the same controlled training-side QAT
+decision without replacing its model-specific resync path. Keep every input,
+seed, topology, and rollout setting fixed, and run the two arms with only
+`ENABLE_QAT` changed:
+
+```bash
+MODEL_PATH=/path/to/deepseek-v4-proxy \
+TRAIN_FILES=/path/to/dapo-math-17k.parquet \
+VAL_FILES=/path/to/aime-2024.parquet \
+NNODES=1 NGPUS_PER_NODE=8 \
+ACTOR_PP=2 ACTOR_CP=2 ACTOR_EP=2 ROLLOUT_TP=8 \
+ROLLOUT_WEIGHT_BITS=4 ENABLE_R3=False ENABLE_QAT=False \
+bash experimental/lite/examples/verl/scripts/run_deepseek_v4_dapo.sh
+
+MODEL_PATH=/path/to/deepseek-v4-proxy \
+TRAIN_FILES=/path/to/dapo-math-17k.parquet \
+VAL_FILES=/path/to/aime-2024.parquet \
+NNODES=1 NGPUS_PER_NODE=8 \
+ACTOR_PP=2 ACTOR_CP=2 ACTOR_EP=2 ROLLOUT_TP=8 \
+ROLLOUT_WEIGHT_BITS=4 ENABLE_R3=False ENABLE_QAT=True \
+bash experimental/lite/examples/verl/scripts/run_deepseek_v4_dapo.sh
+```
+
+`ENABLE_QAT=True` registers MLite MXFP4 fake quantization on the BF16 master
+weights before optimizer construction. The launcher rejects that setting unless
+the rollout also uses MXFP4 (`ROLLOUT_WEIGHT_BITS=4`); it never silently pairs
+MXFP4 training with FP8 rollout. The off/on arms have byte-identical rollout
+arguments, and both enable rollout log-prob calculation plus rollout correction,
+so compare `rollout_probs_diff` metrics as the primary train/inference
+consistency signal. Reward is secondary.
+
+An 8-GPU truncated proxy exercises the real DeepSeek V4 protocol, QAT
+parametrization, checkpoint load, MXFP4 export/resync, vLLM rollout, backward,
+and optimizer step. It does not establish full-scale memory capacity or
+throughput for the 43-layer, 256-expert release.
+
 ## Smoke / Dry-Run Checks
 
 Checked on this branch on 2026-06-07. These checks cover shell syntax,
@@ -235,6 +273,7 @@ cover end-to-end SFT or GRPO training.
   - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_gsm8k_sft.sh`
   - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_gsm8k_grpo.sh`
   - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_mxfp4_qat.sh`
+  - `bash -n experimental/lite/examples/verl/scripts/run_deepseek_v4_dapo.sh`
 - Python import compilation:
   - `PYTHONPYCACHEPREFIX="$(mktemp -d)" python3 -m compileall -q experimental/lite/examples/verl/verl_mlite`
 - GSM8K SFT dry run:
