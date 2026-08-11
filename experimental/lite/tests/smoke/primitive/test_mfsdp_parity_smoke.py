@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from types import SimpleNamespace
@@ -705,6 +706,80 @@ def test_mfsdp_non_fused_wgrad_accumulates_in_fp32_per_microbatch():
                     "single_backward_bf16_roundtrip_exact": True,
                     "multi_microbatch_value": float(consumed_grad[0]),
                     "multi_microbatch_bf16_roundtrip_exact": False,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+
+def test_mfsdp_training_and_rollout_offload_distributed_smoke():
+    """Exercise both offload contracts with real NCCL sharding on every rank."""
+    parallel = _dense_parallel_config()
+    ps = _parallel_state(parallel)
+    chunks = [_new_model(17321, TinyTEQwen3MoE)]
+    optimizer_config = _optimizer_cfg(use_fused_optimizer=False)
+    optimizer_config.offload_fraction = 1.0
+    optimizer_config.override_optimizer_config.update(
+        {"gradient_accumulation_fusion": True, "bucket_size": 17}
+    )
+    impl_cfg = SimpleNamespace(parallel=parallel, optimizer_config=optimizer_config)
+    optimizer, finalize = build_mfsdp_training_optimizer(
+        chunks,
+        impl_cfg=impl_cfg,
+        ps=ps,
+        is_expert=lambda name: ".expert." in name,
+        fsdp_unit_modules=(TinyTETransformerLayer,),
+    )
+    chunk = chunks[0]
+    cpu_group = optimizer._inner_optimizer.cpu_group
+    assert cpu_group is not None
+
+    def run_step(seed: int) -> float:
+        optimizer.zero_grad()
+        generator = torch.Generator(device="cuda")
+        generator.manual_seed(seed + dist.get_rank())
+        value = torch.randn(
+            64, 8, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+        loss = chunk(value).float().square().mean()
+        loss.backward()
+        finalize()
+        success, grad_norm, _num_zeros = optimizer.step()
+        assert success and math.isfinite(grad_norm)
+        return float(loss.item())
+
+    first_loss = run_step(17331)
+    assert cpu_group.d2h_bytes > 0 and cpu_group.h2d_bytes > 0
+    assert cpu_group.live_transfer_leases == 0
+    assert cpu_group.ring_high_water_elements <= min(
+        sum(param.numel() for param in cpu_group.gpu_params), 2 * 17
+    )
+    assert all(
+        state["master_param"].device.type == "cpu"
+        and state["exp_avg"].device.type == "cpu"
+        and state["exp_avg_sq"].device.type == "cpu"
+        for state in cpu_group._optimizer.state.values()
+    )
+
+    optimizer.offload_for_rollout()
+    assert all(bucket.device.type == "cpu" for bucket in chunk.param_sync.buckets)
+    assert all(bucket.main_grad_buffer.numel() == 0 for bucket in chunk.param_sync.buckets)
+    optimizer.load_from_rollout()
+    assert all(bucket.device.type == "cuda" for bucket in chunk.param_sync.buckets)
+    second_loss = run_step(17341)
+
+    if dist.get_rank() == 0:
+        print(
+            "[MFSDP_TWO_OFFLOADS] "
+            + json.dumps(
+                {
+                    "world_size": dist.get_world_size(),
+                    "first_loss": first_loss,
+                    "second_loss": second_loss,
+                    "d2h_bytes": cpu_group.d2h_bytes,
+                    "h2d_bytes": cpu_group.h2d_bytes,
+                    "ring_high_water_elements": cpu_group.ring_high_water_elements,
                 },
                 sort_keys=True,
             ),
