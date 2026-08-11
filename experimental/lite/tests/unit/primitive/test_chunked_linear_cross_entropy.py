@@ -90,7 +90,9 @@ def test_chunked_linear_cross_entropy_cuda_fast_path_materializes_stride_zero_dl
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton")
 @pytest.mark.parametrize("rows", [14135, 14136, 16384])
-def test_chunked_linear_cross_entropy_cuda_row_base_offsets_support_large_vocab_windows(rows):
+def test_chunked_linear_cross_entropy_cuda_row_base_offsets_support_large_vocab_windows(
+    rows,
+):
     vocab = 151936
     logits = torch.zeros((rows, vocab), device="cuda", dtype=torch.bfloat16)
     target = torch.zeros(rows, device="cuda", dtype=torch.long)
@@ -155,7 +157,9 @@ def test_chunked_linear_cross_entropy_releases_previous_softmax_before_next_wind
     ).sum().backward()
 
 
-def test_chunked_linear_cross_entropy_releases_forward_logits_at_window_scope(monkeypatch):
+def test_chunked_linear_cross_entropy_releases_forward_logits_at_window_scope(
+    monkeypatch,
+):
     torch.manual_seed(13)
     hidden = torch.randn(6, 1, 4, dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(9, 4, dtype=torch.bfloat16, requires_grad=True)

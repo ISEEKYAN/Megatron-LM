@@ -26,7 +26,9 @@ def is_available() -> bool:
     return triton is not None
 
 
-def workspace_shape(rows: int, vocab: int, block: int = ROW_BLOCK) -> tuple[tuple[int, int], tuple[int]]:
+def workspace_shape(
+    rows: int, vocab: int, block: int = ROW_BLOCK
+) -> tuple[tuple[int, int], tuple[int]]:
     """Return the bounded FP32 partial and row workspaces for a CE window."""
     if rows < 0 or vocab <= 0 or block <= 0:
         raise ValueError("rows must be non-negative and vocab/block must be positive")
@@ -36,37 +38,58 @@ def workspace_shape(rows: int, vocab: int, block: int = ROW_BLOCK) -> tuple[tupl
 if triton is not None:
 
     @triton.jit
-    def _partial_max_kernel(logits, partial, vocab: tl.constexpr, tiles: tl.constexpr, BLOCK: tl.constexpr):
+    def _partial_max_kernel(
+        logits, partial, vocab: tl.constexpr, tiles: tl.constexpr, BLOCK: tl.constexpr
+    ):
         program = tl.program_id(0)
         row = (program // tiles).to(tl.int64)
         tile = program % tiles
         columns = tile * BLOCK + tl.arange(0, BLOCK)
-        values = tl.load(logits + row * vocab + columns, mask=columns < vocab, other=-float("inf"))
+        values = tl.load(
+            logits + row * vocab + columns, mask=columns < vocab, other=-float("inf")
+        )
         tl.store(partial + row * tiles + tile, tl.max(values.to(tl.float32), axis=0))
 
     @triton.jit
-    def _final_max_kernel(partial, row_max, tiles: tl.constexpr, REDUCE_BLOCK: tl.constexpr):
+    def _final_max_kernel(
+        partial, row_max, tiles: tl.constexpr, REDUCE_BLOCK: tl.constexpr
+    ):
         row = tl.program_id(0).to(tl.int64)
         offsets = tl.arange(0, REDUCE_BLOCK)
-        values = tl.load(partial + row * tiles + offsets, mask=offsets < tiles, other=-float("inf"))
+        values = tl.load(
+            partial + row * tiles + offsets, mask=offsets < tiles, other=-float("inf")
+        )
         tl.store(row_max + row, tl.max(values, axis=0))
 
     @triton.jit
-    def _partial_sum_kernel(logits, row_max, partial, vocab: tl.constexpr, tiles: tl.constexpr, BLOCK: tl.constexpr):
+    def _partial_sum_kernel(
+        logits,
+        row_max,
+        partial,
+        vocab: tl.constexpr,
+        tiles: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
         program = tl.program_id(0)
         row = (program // tiles).to(tl.int64)
         tile = program % tiles
         columns = tile * BLOCK + tl.arange(0, BLOCK)
-        values = tl.load(logits + row * vocab + columns, mask=columns < vocab, other=-float("inf")).to(tl.float32)
+        values = tl.load(
+            logits + row * vocab + columns, mask=columns < vocab, other=-float("inf")
+        ).to(tl.float32)
         values -= tl.load(row_max + row)
         exp_values = tl.exp(values)
         tl.store(partial + row * tiles + tile, tl.sum(exp_values, axis=0))
 
     @triton.jit
-    def _final_sum_kernel(partial, row_sum, tiles: tl.constexpr, REDUCE_BLOCK: tl.constexpr):
+    def _final_sum_kernel(
+        partial, row_sum, tiles: tl.constexpr, REDUCE_BLOCK: tl.constexpr
+    ):
         row = tl.program_id(0).to(tl.int64)
         offsets = tl.arange(0, REDUCE_BLOCK)
-        values = tl.load(partial + row * tiles + offsets, mask=offsets < tiles, other=0.0)
+        values = tl.load(
+            partial + row * tiles + offsets, mask=offsets < tiles, other=0.0
+        )
         tl.store(row_sum + row, tl.sum(values, axis=0))
 
     @triton.jit
@@ -74,7 +97,10 @@ if triton is not None:
         row = tl.program_id(0).to(tl.int64)
         target_column = tl.load(target + row)
         target_logit = tl.load(logits + row * vocab + target_column).to(tl.float32)
-        tl.store(loss + row, tl.log(tl.load(row_sum + row)) + tl.load(row_max + row) - target_logit)
+        tl.store(
+            loss + row,
+            tl.log(tl.load(row_sum + row)) + tl.load(row_max + row) - target_logit,
+        )
 
     @triton.jit
     def _inplace_gradient_kernel(
@@ -92,10 +118,12 @@ if triton is not None:
         row = (program // tiles).to(tl.int64)
         tile = program % tiles
         columns = tile * BLOCK + tl.arange(0, BLOCK)
-        values = tl.load(logits + row * vocab + columns, mask=columns < vocab, other=-float("inf")).to(tl.float32)
+        values = tl.load(
+            logits + row * vocab + columns, mask=columns < vocab, other=-float("inf")
+        ).to(tl.float32)
         probabilities = tl.exp(values - tl.load(row_max + row)) / tl.load(row_sum + row)
         target_column = tl.load(target + row)
-        gradient = (probabilities - (columns == target_column).to(tl.float32))
+        gradient = probabilities - (columns == target_column).to(tl.float32)
         gradient *= tl.load(grad_output + row).to(tl.float32) / temperature
         tl.store(logits + row * vocab + columns, gradient, mask=columns < vocab)
 
@@ -108,16 +136,22 @@ def _workspaces(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int, 
     return partial, row_values, vocab, partial_shape[1]
 
 
-def _row_statistics(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+def _row_statistics(
+    logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Return bounded workspaces containing row max and exp sums."""
     if triton is None:
         raise RuntimeError("Triton is unavailable")
     partial, row_max, vocab, tiles = _workspaces(logits)
     rows = logits.shape[0]
     reduce_block = triton.next_power_of_2(tiles)
-    _partial_max_kernel[(rows * tiles,)](logits, partial, vocab=vocab, tiles=tiles, BLOCK=ROW_BLOCK)
+    _partial_max_kernel[(rows * tiles,)](
+        logits, partial, vocab=vocab, tiles=tiles, BLOCK=ROW_BLOCK
+    )
     _final_max_kernel[(rows,)](partial, row_max, tiles=tiles, REDUCE_BLOCK=reduce_block)
-    _partial_sum_kernel[(rows * tiles,)](logits, row_max, partial, vocab=vocab, tiles=tiles, BLOCK=ROW_BLOCK)
+    _partial_sum_kernel[(rows * tiles,)](
+        logits, row_max, partial, vocab=vocab, tiles=tiles, BLOCK=ROW_BLOCK
+    )
     row_sum = torch.empty_like(row_max)
     _final_sum_kernel[(rows,)](partial, row_sum, tiles=tiles, REDUCE_BLOCK=reduce_block)
     return partial, row_max, row_sum, tiles
@@ -139,7 +173,10 @@ def token_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 def inplace_gradient(
-    logits: torch.Tensor, target: torch.Tensor, grad_output: torch.Tensor, temperature: float
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    grad_output: torch.Tensor,
+    temperature: float,
 ) -> torch.Tensor:
     """Overwrite BF16 logits with BF16 dlogits, keeping FP32 math tile-local."""
     _partial_sum, row_max, row_sum, tiles = _row_statistics(logits)
