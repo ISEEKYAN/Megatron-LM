@@ -15,7 +15,6 @@ import importlib
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,113 +31,11 @@ from megatron.lite.primitive.optimizers.mfsdp.config import (
 from torch.distributed import _coalescing_manager
 
 
-class NCCLUserBuffer:
-    """MCore NCCL memory-pool adapter used by persistent communication buffers."""
-
-    def __init__(
-        self,
-        *,
-        enabled: bool,
-        groups: tuple[dist.ProcessGroup, ...],
-        symmetric: bool,
-        manual_registration: bool,
-    ) -> None:
-        self.enabled = bool(enabled and torch.cuda.is_available())
-        self.groups = groups
-        self.symmetric = symmetric
-        self.manual_registration = manual_registration
-        self.module: Any | None = None
-        self.pool: Any | None = None
-        self.allocator_kind: str | None = None
-        self.already_registered = False
-        if self.enabled:
-            self._initialize()
-
-    @property
-    def active(self) -> bool:
-        return self.module is not None and self.pool is not None
-
-    def _initialize(self) -> None:
-        try:
-            try:
-                module = importlib.import_module("megatron.core.nccl_allocator")
-                allocator_kind = "mcore"
-            except ImportError:
-                module = importlib.import_module("apex.contrib.nccl_allocator")
-                allocator_kind = "apex"
-            if self.manual_registration and allocator_kind != "mcore":
-                raise RuntimeError(
-                    "M-FSDP manual NCCL registration requires "
-                    "megatron.core.nccl_allocator."
-                )
-            module.init()
-            try:
-                pool = module.create_nccl_mem_pool(symmetric=self.symmetric)
-            except TypeError:
-                pool = module.create_nccl_mem_pool()
-            self.module = module
-            self.pool = pool
-            self.allocator_kind = allocator_kind
-        except (ImportError, AttributeError, RuntimeError, TypeError) as error:
-            self._fail(f"NCCL user-buffer allocation unavailable: {error}")
-
-    def allocation_context(self):
-        if not self.active:
-            return nullcontext()
-        try:
-            if self.manual_registration:
-                return self.module.MemPoolAllocatorWithoutRegistration(self.pool)
-            if len(self.groups) > 1 and hasattr(
-                self.module, "MultiGroupMemPoolAllocator"
-            ):
-                return self.module.MultiGroupMemPoolAllocator(
-                    self.pool,
-                    groups=list(self.groups),
-                    symmetric=self.symmetric,
-                )
-            group = self.groups[0] if self.groups else None
-            if group is None:
-                return nullcontext()
-            try:
-                return self.module.nccl_mem(
-                    self.pool, group=group, symmetric=self.symmetric
-                )
-            except TypeError:
-                return self.module.nccl_mem(self.pool, group=group)
-        except (AttributeError, RuntimeError, TypeError) as error:
-            self._fail(f"NCCL user-buffer context failed: {error}")
-
-    def manual_buffer_registration(self) -> None:
-        if not self.manual_registration or self.already_registered:
-            return
-        if not self.active or self.allocator_kind != "mcore":
-            self._fail("MCore manual NCCL registration is unavailable.")
-        torch.cuda.synchronize()
-        if dist.is_initialized():
-            dist.barrier()
-        torch.cuda.synchronize()
-        for group in self.groups:
-            try:
-                self.module.register_mem_pool(
-                    self.pool, group, symmetric=self.symmetric
-                )
-            except (AttributeError, RuntimeError, TypeError) as error:
-                self._fail(f"Manual NCCL user-buffer registration failed: {error}")
-        self.already_registered = True
-
-    def _fail(self, reason: str) -> None:
-        self.module = None
-        self.pool = None
-        raise RuntimeError(reason)
-
-
 @dataclass(slots=True)
 class BufferLease:
     tensor: torch.Tensor
     owner: "TemporaryBufferAllocator"
     key: tuple[Any, ...]
-    slot: int | None = None
-    registered: bool = False
     _released: bool = False
 
     def release(self) -> None:
@@ -150,9 +47,6 @@ class BufferLease:
 class TemporaryBufferAllocator:
     """Allocate communication storage and release it at the pipeline boundary."""
 
-    def __init__(self, user_buffer: NCCLUserBuffer | None = None) -> None:
-        self.user_buffer = user_buffer
-
     def allocate(
         self,
         numel: int,
@@ -163,21 +57,8 @@ class TemporaryBufferAllocator:
         key: tuple[Any, ...],
         pool_key: tuple[Any, ...] | None = None,
     ) -> BufferLease:
-        context = (
-            self.user_buffer.allocation_context()
-            if self.user_buffer is not None
-            else nullcontext()
-        )
-        registered = bool(self.user_buffer is not None and self.user_buffer.active)
-        try:
-            with context:
-                tensor = torch.empty(numel, dtype=dtype, device=device)
-        except (RuntimeError, TypeError) as error:
-            if self.user_buffer is not None:
-                self.user_buffer._fail(f"Registered allocation failed: {error}")
-            tensor = torch.empty(numel, dtype=dtype, device=device)
-            registered = False
-        return BufferLease(tensor=tensor, owner=self, key=key, registered=registered)
+        tensor = torch.empty(numel, dtype=dtype, device=device)
+        return BufferLease(tensor=tensor, owner=self, key=key)
 
     def release(self, lease: BufferLease) -> None:
         _free_storage(lease.tensor)
@@ -196,7 +77,7 @@ class StorageResizeBufferAllocator(TemporaryBufferAllocator):
     """
 
     def __init__(self) -> None:
-        super().__init__(user_buffer=None)
+        super().__init__()
         self._buckets: dict[tuple[Any, ...], torch.Tensor] = {}
         self._busy: set[tuple[Any, ...]] = set()
 
@@ -245,229 +126,6 @@ class StorageResizeBufferAllocator(TemporaryBufferAllocator):
         self._busy.clear()
 
 
-class DoubleBufferAllocator(TemporaryBufferAllocator):
-    """MCore fixed-pool allocator for the modal, symmetric FSDP units.
-
-    MCore does not retain two buffers for every distinct layer layout.  It
-    finds the largest depth-wise family of units with equal bucket sizes and
-    dtypes, assigns two alternating slots to each bucket offset in that
-    family, and falls back to storage-resize for asymmetric units such as
-    embeddings and output heads.
-    """
-
-    def __init__(
-        self,
-        user_buffer: NCCLUserBuffer | None = None,
-        *,
-        dtype_fn: Callable[["ParamBucket"], torch.dtype] | None = None,
-    ) -> None:
-        super().__init__(user_buffer)
-        self._dtype_fn = dtype_fn or (lambda bucket: bucket.policy.compute_dtype)
-        self._configured = False
-        self._eligible_bucket_ids: set[int] = set()
-        self._bucket_offsets: dict[int, int] = {}
-        self._planned_slots: dict[int, int] = {}
-        self._backup_allocator = StorageResizeBufferAllocator()
-        self._slots: dict[tuple[Any, ...], list[torch.Tensor | None]] = {}
-        self._busy: dict[tuple[Any, ...], set[int]] = {}
-        self._reuse_events: dict[tuple[Any, ...], list[Any | None]] = {}
-
-    def _slot_numel(
-        self, bucket_id: int, requested_numel: int, dtype: torch.dtype
-    ) -> int:
-        del bucket_id, dtype
-        return requested_numel
-
-    def configure(
-        self,
-        buckets: list["ParamBucket"],
-        unit_bucket_groups: Iterable[Iterable[int]],
-    ) -> None:
-        """Select the same modal symmetric unit family as MCore FixedPool."""
-        groups = [
-            tuple(group)
-            for group in unit_bucket_groups
-            if group and all(buckets[bucket_id].is_fsdp_unit for bucket_id in group)
-        ]
-        if not groups:
-            raise AssertionError("Found no FSDP units to use fixed-size buffering")
-
-        signature_groups: dict[
-            tuple[tuple[int, torch.dtype], ...], list[tuple[int, ...]]
-        ] = {}
-        for group in groups:
-            signature = tuple(
-                (buckets[bucket_id].full_numel, self._dtype_fn(buckets[bucket_id]))
-                for bucket_id in group
-            )
-            signature_groups.setdefault(signature, []).append(group)
-        modal_groups = max(signature_groups.values(), key=len)
-        self._eligible_bucket_ids = {
-            bucket_id for group in modal_groups for bucket_id in group
-        }
-        self._bucket_offsets = {
-            bucket_id: offset
-            for group in modal_groups
-            for offset, bucket_id in enumerate(group)
-        }
-        self._configured = True
-
-    def allocate(
-        self,
-        numel: int,
-        *,
-        dtype: torch.dtype,
-        device: torch.device,
-        group: dist.ProcessGroup | None,
-        key: tuple[Any, ...],
-        pool_key: tuple[Any, ...] | None = None,
-    ) -> BufferLease:
-        if not self._configured:
-            raise RuntimeError("M-FSDP fixed pool must be configured before allocation.")
-        bucket_id = int(key[1])
-        if bucket_id not in self._eligible_bucket_ids:
-            return self._backup_allocator.allocate(
-                numel,
-                dtype=dtype,
-                device=device,
-                group=group,
-                key=key,
-                pool_key=pool_key,
-            )
-
-        resolved_pool_key = (self._bucket_offsets[bucket_id], dtype, device)
-        slot_numel = self._slot_numel(bucket_id, numel, dtype)
-        slots = self._slots.setdefault(resolved_pool_key, [None, None])
-        busy = self._busy.setdefault(resolved_pool_key, set())
-        reuse_events = self._reuse_events.setdefault(resolved_pool_key, [None, None])
-        planned = self._planned_slots.get(bucket_id)
-        candidate_slots = (
-            (planned, 1 - planned) if planned is not None else (0, 1)
-        )
-        for slot in candidate_slots:
-            if slot in busy:
-                continue
-            tensor = slots[slot]
-            if tensor is None or tensor.numel() < slot_numel:
-                lease = super().allocate(
-                    slot_numel,
-                    dtype=dtype,
-                    device=device,
-                    group=group,
-                    key=resolved_pool_key,
-                )
-                tensor = lease.tensor
-                slots[slot] = tensor
-                registered = lease.registered
-            else:
-                registered = bool(
-                    self.user_buffer is not None and self.user_buffer.active
-                )
-            _wait_for_reuse_event(reuse_events[slot], tensor)
-            reuse_events[slot] = None
-            busy.add(slot)
-            if planned is None:
-                self._planned_slots[bucket_id] = slot
-            return BufferLease(
-                tensor=tensor.narrow(0, 0, numel),
-                owner=self,
-                key=resolved_pool_key,
-                slot=slot,
-                registered=registered,
-            )
-        raise RuntimeError(
-            "M-FSDP fixed-pool capacity exhausted; release a completed "
-            "bucket before acquiring another slot."
-        )
-
-    def release(self, lease: BufferLease) -> None:
-        if lease.slot is not None:
-            events = self._reuse_events.setdefault(lease.key, [None, None])
-            events[lease.slot] = _record_reuse_event(lease.tensor)
-            self._busy.get(lease.key, set()).discard(lease.slot)
-
-    def release_cached(self, *, force: bool = False) -> None:
-        # The busy check catches genuine misuse — releasing the cache while a
-        # collective is legitimately in flight — on the normal path. On an
-        # exception-driven teardown (``force=True``) a slot may be left busy by
-        # an aborted collective; raising here would replace the primary error
-        # (e.g. the OOM that triggered the teardown) with a misleading
-        # "active buffers" RuntimeError, so force-drop the cache instead.
-        if not force and any(self._busy.values()):
-            raise RuntimeError("Cannot release active M-FSDP communication buffers.")
-        self._backup_allocator.release_cached(force=force)
-        self._slots.clear()
-        self._busy.clear()
-        self._reuse_events.clear()
-        self._planned_slots.clear()
-
-
-class MaxPoolBufferAllocator(DoubleBufferAllocator):
-    """MCore max-pool double buffer for asymmetric FSDP units.
-
-    For each communication dtype, every unit's buckets are ordered from largest
-    to smallest.  Each offset is sized to the maximum bucket assigned to that
-    offset across all units, so the same two alternating slot groups can serve
-    hybrid layer layouts without falling back to dynamic storage.
-    """
-
-    def __init__(
-        self,
-        user_buffer: NCCLUserBuffer | None = None,
-        *,
-        dtype_fn: Callable[["ParamBucket"], torch.dtype] | None = None,
-    ) -> None:
-        super().__init__(user_buffer, dtype_fn=dtype_fn)
-        self._pool_capacities: dict[tuple[torch.dtype, int], int] = {}
-
-    def configure(
-        self,
-        buckets: list["ParamBucket"],
-        unit_bucket_groups: Iterable[Iterable[int]],
-    ) -> None:
-        groups = [
-            tuple(group)
-            for group in unit_bucket_groups
-            if group and all(buckets[bucket_id].is_fsdp_unit for bucket_id in group)
-        ]
-        if not groups:
-            raise AssertionError("Found no FSDP units to use max-sized buffering")
-
-        self._eligible_bucket_ids.clear()
-        self._bucket_offsets.clear()
-        self._pool_capacities.clear()
-        for group in groups:
-            by_dtype: dict[torch.dtype, list[int]] = defaultdict(list)
-            for bucket_id in group:
-                by_dtype[self._dtype_fn(buckets[bucket_id])].append(bucket_id)
-            for dtype, bucket_ids in by_dtype.items():
-                bucket_ids.sort(
-                    key=lambda bucket_id: buckets[bucket_id].full_numel,
-                    reverse=True,
-                )
-                for offset, bucket_id in enumerate(bucket_ids):
-                    self._eligible_bucket_ids.add(bucket_id)
-                    self._bucket_offsets[bucket_id] = offset
-                    capacity_key = (dtype, offset)
-                    self._pool_capacities[capacity_key] = max(
-                        self._pool_capacities.get(capacity_key, 0),
-                        buckets[bucket_id].full_numel,
-                    )
-        self._configured = True
-
-    def _slot_numel(
-        self, bucket_id: int, requested_numel: int, dtype: torch.dtype
-    ) -> int:
-        offset = self._bucket_offsets[bucket_id]
-        capacity = self._pool_capacities[(dtype, offset)]
-        if requested_numel > capacity:
-            raise RuntimeError(
-                "M-FSDP max-pool capacity is smaller than its assigned bucket: "
-                f"bucket={bucket_id} requested={requested_numel} capacity={capacity}."
-            )
-        return capacity
-
-
 class MCoreBufferAllocators:
     """Route weights and gradients through MCore's distinct allocators."""
 
@@ -507,81 +165,13 @@ class MCoreBufferAllocators:
         self.weight_allocator.release_cached(force=force)
         self.grad_allocator.release_cached(force=force)
 
-    def configure(
-        self,
-        buckets: list["ParamBucket"],
-        unit_bucket_groups: Iterable[Iterable[int]],
-    ) -> None:
-        for allocator in (self.weight_allocator, self.grad_allocator):
-            configure = getattr(allocator, "configure", None)
-            if configure is not None:
-                configure(buckets, unit_bucket_groups)
-
-    def manual_buffer_registration(self) -> None:
-        """Register the shared MCore pool once after first-iteration allocation."""
-        user_buffer = self.weight_allocator.user_buffer
-        if user_buffer is not None:
-            user_buffer.manual_buffer_registration()
-
-    def persistent_allocation_context(self):
-        """Allocate MCore's persistent parameter/gradient buffers from the UB pool."""
-        user_buffer = self.weight_allocator.user_buffer
-        return (
-            user_buffer.allocation_context()
-            if user_buffer is not None
-            else nullcontext()
-        )
-
-    @property
-    def _slots(self) -> dict[tuple[Any, ...], list[torch.Tensor | None]]:
-        """Expose aggregate state for lifecycle diagnostics and tests."""
-        result = {}
-        for prefix, allocator in (
-            ("weight", self.weight_allocator),
-            ("grad", self.grad_allocator),
-        ):
-            slots = getattr(allocator, "_slots", {})
-            if not isinstance(slots, dict):
-                continue
-            for key, value in slots.items():
-                result[(prefix, *key)] = value
-        return result
-
-    @property
-    def _busy(self) -> dict[tuple[Any, ...], set[int]]:
-        """Expose aggregate in-flight slots without owning their lifecycle."""
-        result = {}
-        for prefix, allocator in (
-            ("weight", self.weight_allocator),
-            ("grad", self.grad_allocator),
-        ):
-            busy = getattr(allocator, "_busy", {})
-            if not isinstance(busy, dict):
-                continue
-            for key, value in busy.items():
-                result[(prefix, *key)] = value
-        return result
-
-
-def _record_reuse_event(tensor: torch.Tensor) -> Any | None:
-    if tensor.device.type != "cuda":
-        return None
-    event = torch.cuda.Event()
-    event.record(torch.cuda.current_stream(tensor.device))
-    return event
-
-
-def _wait_for_reuse_event(event: Any | None, tensor: torch.Tensor) -> None:
-    if event is not None:
-        torch.cuda.current_stream(tensor.device).wait_event(event)
-
 
 def _free_storage(tensor: torch.Tensor) -> None:
     """Physically release completed temporary communication storage.
 
     Replacing a tensor view does not return its allocation while the lease still
     owns that view.  MCore releases temporary bucket storage after completion;
-    mirror that lifecycle for non-registered, non-double-buffer allocations.
+    mirror that lifecycle for temporary communication allocations.
     """
     if tensor.numel() == 0 or tensor.storage_offset() != 0:
         return
@@ -606,29 +196,7 @@ def _allocate_storage(tensor: torch.Tensor) -> None:
     storage.resize_(expected_nbytes)
 
 
-def build_temporary_allocator(
-    config: MFSDPConfig, groups: tuple[dist.ProcessGroup, ...]
-) -> MCoreBufferAllocators:
-    user_buffer = NCCLUserBuffer(
-        enabled=config.nccl_ub,
-        groups=groups,
-        symmetric=not config.disable_symmetric_registration,
-        manual_registration=config.fsdp_manual_registration,
-    )
-    if config.fsdp_double_buffer:
-        allocator_type = (
-            MaxPoolBufferAllocator
-            if config.maxpool_double_buffer
-            else DoubleBufferAllocator
-        )
-        return MCoreBufferAllocators(
-            allocator_type(
-                user_buffer, dtype_fn=lambda bucket: bucket.policy.compute_dtype
-            ),
-            allocator_type(
-                user_buffer, dtype_fn=lambda bucket: bucket.policy.grad_comm_dtype
-            ),
-        )
+def build_temporary_allocator() -> MCoreBufferAllocators:
     return MCoreBufferAllocators(
         StorageResizeBufferAllocator(), TemporaryBufferAllocator()
     )
@@ -719,32 +287,31 @@ class ParamBucket:
             )
             spec.param_offset = min(spec.numel, max(0, intersection_begin - spec_begin))
 
-        with self.allocator.persistent_allocation_context():
-            self.main_param_buffer = torch.zeros(
+        self.main_param_buffer = torch.zeros(
+            self.local_numel,
+            dtype=self.policy.main_params_dtype,
+            device=self.device,
+        )
+        # Match MCore's two persistent sharded weight buffers: optimizer state
+        # updates the high-precision main shard, while parameter all-gathers
+        # always consume the compute-precision model shard. Keeping this shard
+        # resident avoids an FP32 -> BF16 allocation/copy on every forward and
+        # backward gather; it is refreshed once after a successful optimizer
+        # step instead.
+        self.model_param_buffer = (
+            self.main_param_buffer
+            if self.policy.main_params_dtype == self.policy.compute_dtype
+            else torch.zeros(
                 self.local_numel,
-                dtype=self.policy.main_params_dtype,
+                dtype=self.policy.compute_dtype,
                 device=self.device,
             )
-            # Match MCore's two persistent sharded weight buffers: optimizer state
-            # updates the high-precision main shard, while parameter all-gathers
-            # always consume the compute-precision model shard. Keeping this shard
-            # resident avoids an FP32 -> BF16 allocation/copy on every forward and
-            # backward gather; it is refreshed once after a successful optimizer
-            # step instead.
-            self.model_param_buffer = (
-                self.main_param_buffer
-                if self.policy.main_params_dtype == self.policy.compute_dtype
-                else torch.zeros(
-                    self.local_numel,
-                    dtype=self.policy.compute_dtype,
-                    device=self.device,
-                )
-            )
-            self.main_grad_buffer = torch.zeros(
-                self.local_numel if self.requires_grad else 0,
-                dtype=self.policy.main_grads_dtype,
-                device=self.device,
-            )
+        )
+        self.main_grad_buffer = torch.zeros(
+            self.local_numel if self.requires_grad else 0,
+            dtype=self.policy.main_grads_dtype,
+            device=self.device,
+        )
         self.grad_shard_buffer = self.main_grad_buffer
         # Compatibility alias for the all-gather pipeline and checkpoint tests.
         # Unlike the previous implementation this is persistent, just like
@@ -867,9 +434,8 @@ class ParamBucket:
             raise RuntimeError("Frozen M-FSDP buckets do not own gradient storage.")
         if self._full_main_grad_lease is None:
             self._enforce_main_grad_slot_limit()
-            # MCore keeps non-double-buffer gradient staging dynamically
-            # allocated; the double-buffer path may share slots only across
-            # identical unit layouts.
+            # MCore keeps the default-path gradient staging dynamically
+            # allocated and releases it when reduce-scatter completes.
             self._full_main_grad_lease = self.allocator.allocate(
                 self.full_numel,
                 dtype=self.policy.main_grads_dtype,
@@ -1099,7 +665,7 @@ class ParamBucket:
         This is ``move_model_state``'s scratch-release prologue without the
         device move: release the full-parameter all-gather buffer, discard the
         full-parameter views, drain any in-flight grad reduce, and hand the
-        allocator's cached double-buffer slots back to the driver -- but keep
+        allocator's cached communication storage back to the driver -- but keep
         ``main_param_buffer`` (and the optimizer-aliased shard views installed by
         ``release_full_parameters``) on their current device. A later bounded
         export can gather from those resident shards without moving persistent
@@ -1151,10 +717,8 @@ class ParamBucket:
         # Match MCore's fully-sharded reduce-scatter layout: NCCL writes the
         # reduced local shard into its rank-local view of the unsharded
         # communication bucket.  The result is copied/accumulated into the
-        # persistent sharded main-grad buffer after the collective.  Allocating
-        # a second MaxPool lease for this local output consumes both fixed slots
-        # for one unit on later microbatches and makes the next unit fail as a
-        # spurious third allocation.
+        # persistent sharded main-grad buffer after the collective. Reusing the
+        # rank-local view avoids a redundant output allocation.
         local_begin = self.rank * self.local_numel
         self.local_grad_comm_buffer = grad_input.narrow(
             0, local_begin, self.local_numel
@@ -1360,24 +924,16 @@ class ParamAndGradBuffer:
         self.module = module
         self.groups = groups
         self.config = config
-        self.allocator = build_temporary_allocator(config, groups.registration_groups())
+        self.allocator = build_temporary_allocator()
         self.buckets, self.owners, self.collective_groups = self._build(
             is_expert=is_expert, unit_modules=unit_modules or ()
         )
-        # FixedPool is laid out by complete FSDP units in MCore.  Dense and
-        # expert buckets use different process groups and therefore different
-        # collective groups, but they are still offsets of the same unit-level
-        # double buffer and must be selected/configured together.
-        self.allocator.configure(self.buckets, self.owners.values())
         self._bucket_id_by_param_id: dict[int, int] = {}
         for bucket in self.buckets:
             for spec in bucket.specs:
                 self._bucket_id_by_param_id[id(spec.full_param)] = bucket.bucket_id
                 if spec.shard_param is not None:
                     self._bucket_id_by_param_id[id(spec.shard_param)] = bucket.bucket_id
-
-    def manual_buffer_registration(self) -> None:
-        self.allocator.manual_buffer_registration()
 
     @torch.no_grad()
     def scale_gradients(self, scaling_factor: float | torch.Tensor) -> None:
@@ -1784,32 +1340,6 @@ class AllGatherPipeline:
             for index, group in enumerate(self._bucket_groups)
             for bucket_id in group
         }
-        lifecycle_groups = fsdp_unit_bucket_ids or self._bucket_groups
-        self._fsdp_unit_by_bucket: dict[int, int | None] = {
-            bucket.bucket_id: None for bucket in buckets
-        }
-        next_unit_id = 0
-        for group in lifecycle_groups:
-            unit_bucket_ids = tuple(
-                bucket_id
-                for bucket_id in group
-                if getattr(buckets[bucket_id], "is_fsdp_unit", True)
-            )
-            if not unit_bucket_ids:
-                continue
-            for bucket_id in unit_bucket_ids:
-                self._fsdp_unit_by_bucket[bucket_id] = next_unit_id
-            next_unit_id += 1
-        # A caller that supplies only communication groups may omit an FSDP
-        # bucket from the lifecycle list. Keep that bucket safe by treating it
-        # as its own unit instead of silently counting it as non-unit.
-        for bucket in buckets:
-            if (
-                getattr(bucket, "is_fsdp_unit", True)
-                and self._fsdp_unit_by_bucket[bucket.bucket_id] is None
-            ):
-                self._fsdp_unit_by_bucket[bucket.bucket_id] = next_unit_id
-                next_unit_id += 1
         device = buckets[0].device if buckets else torch.device("cpu")
         self.comm_stream = CommunicationStream(device)
         self._forward_cursor = 0
@@ -1909,25 +1439,8 @@ class AllGatherPipeline:
         # program order across ranks.
         if not self.overlap:
             return
-        double_buffer = bool(
-            getattr(self.buckets[0].config, "fsdp_double_buffer", False)
-        )
-        resident_units = {
-            self._fsdp_unit_by_bucket[bucket_id] for bucket_id in bucket_ids
-        }
-        if double_buffer and len(resident_units) > 2:
-            raise ValueError(
-                "M-FSDP double buffers cannot materialize more than two owners at once."
-            )
         for bucket_id in bucket_ids:
             self.async_bucket_gather(bucket_id, bwd=bwd)
-
-        # MCore explicitly disables prefetch when a double-buffer request is
-        # entirely outside an FSDP unit. Otherwise a root-owned norm can
-        # prefetch the head before embed/layer execution and consume a third
-        # slot from the two-buffer pool.
-        if double_buffer and resident_units == {None}:
-            return
 
         direction = -1 if bwd else 1
         edge_bucket = bucket_ids[0] if bwd else bucket_ids[-1]
@@ -1937,13 +1450,6 @@ class AllGatherPipeline:
             if prefetched >= self.suggested_prefetch_elements:
                 break
             group = self._bucket_groups[group_index]
-            if double_buffer:
-                candidate_units = {
-                    self._fsdp_unit_by_bucket[bucket_id] for bucket_id in group
-                }
-                if len(resident_units | candidate_units) > 2:
-                    break
-                resident_units.update(candidate_units)
             for bucket_id in group:
                 self.async_bucket_gather(bucket_id, bwd=bwd)
                 prefetched += self.buckets[bucket_id].full_numel
@@ -2007,11 +1513,6 @@ class GradReducePipeline:
             for group in (capacity_owner_bucket_ids or owner_bucket_ids or ())
         )
         capacity_groups = tuple(group for group in capacity_groups if group)
-        self._double_buffer_unit_by_bucket_id = {
-            bucket_id: unit_id
-            for unit_id, group in enumerate(capacity_groups)
-            for bucket_id in group
-        }
         self._bucket_ids = {
             id(bucket): getattr(bucket, "bucket_id", index)
             for index, bucket in enumerate(buckets)
@@ -2056,41 +1557,6 @@ class GradReducePipeline:
         completed.wait_grad_reduce()
         self._pending_elements -= completed_elements
 
-    def _enforce_double_buffer_limit(self, incoming: ParamBucket) -> None:
-        """Keep at most two live FSDP units in the gradient pool.
-
-        This follows MCore's ``GradReducePipeline._enforce_double_buffer_limit``:
-        the incoming bucket contributes its enclosing FSDP unit, queued
-        reductions contribute theirs in newest-to-oldest order, and complete
-        oldest reductions are retired only when a third distinct unit would be
-        live. Dense and expert collective groups from one enclosing unit share
-        one lifecycle slot even though their collectives remain separate.
-        """
-        if not incoming.config.fsdp_double_buffer:
-            return
-        incoming_bucket_id = self._bucket_ids[id(incoming)]
-        incoming_unit_id = self._double_buffer_unit_by_bucket_id.get(
-            incoming_bucket_id
-        )
-        if incoming_unit_id is None:
-            return
-
-        live_units = {incoming_unit_id}
-        keep_n = len(self._pending)
-        for pending_bucket, _elements in reversed(self._pending):
-            pending_bucket_id = self._bucket_ids[id(pending_bucket)]
-            pending_unit_id = self._double_buffer_unit_by_bucket_id.get(
-                pending_bucket_id
-            )
-            if pending_unit_id is None:
-                continue
-            live_units.add(pending_unit_id)
-            if len(live_units) > 2:
-                keep_n -= 1
-
-        while len(self._pending) > keep_n:
-            self._retire_oldest()
-
     def _prepare_main_grad_allocate(self, incoming: ParamBucket) -> None:
         # This standalone bucket object owns one staging lease. Retire an
         # earlier use in FIFO order before the same bucket is reused. The
@@ -2105,7 +1571,6 @@ class GradReducePipeline:
             # microbatch's begin_backward() reset. Re-open the bucket for the
             # reduction that will be produced by the current backward.
             incoming.start_microbatch()
-        self._enforce_double_buffer_limit(incoming)
 
     def _ready_bucket_group(self, bucket: ParamBucket) -> tuple[int, ...] | None:
         """Return the deterministic owner group once every bucket is ready.
@@ -2396,7 +1861,7 @@ class CommunicationPipelines:
         """Reclaim every bucket's all-gather scratch, keeping weights resident.
 
         Per-bucket counterpart to ``move_model_state`` that stops short of the
-        device move: it hands retained double-buffer slots back to the driver
+        device move: it hands retained communication storage back to the driver
         while leaving sharded weights and optimizer aliases in place as the
         source for later bounded materialization. See
         ``ParamBucket.release_scratch_keep_weights``.
@@ -2466,10 +1931,8 @@ __all__ = [
     "BufferLease",
     "CommunicationPipelines",
     "CommunicationStream",
-    "DoubleBufferAllocator",
     "GradReducePipeline",
     "MCoreBufferAllocators",
-    "NCCLUserBuffer",
     "ParamAndGradBuffer",
     "ParamBucket",
     "ParamSpec",

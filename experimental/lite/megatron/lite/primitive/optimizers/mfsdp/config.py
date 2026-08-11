@@ -18,6 +18,14 @@ _REQUIRED_DDP_KNOB_VALUES = {
     "use_megatron_fsdp": True,
 }
 _UNSUPPORTED_OPTIMIZATION_KNOBS = {"use_hsdp", "hsdp"}
+_UNSHIPPED_BUFFER_KNOBS = {
+    "nccl_ub",
+    "fsdp_double_buffer",
+    "megatron_fsdp_max_pool_double_buffer",
+    "maxpool_double_buffer",
+    "fsdp_manual_registration",
+    "disable_symmetric_registration",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,11 +49,6 @@ class MFSDPConfig:
     grad_comm_dtype: torch.dtype = torch.float32
     use_decoupled_grad: bool = False
     gradient_accumulation_fusion: bool = False
-    nccl_ub: bool = False
-    fsdp_double_buffer: bool = False
-    maxpool_double_buffer: bool = False
-    fsdp_manual_registration: bool = False
-    disable_symmetric_registration: bool = False
     all_gather_in_start_param_sync: bool = True
 
 
@@ -88,14 +91,6 @@ class MFSDPProcessGroups:
 
     def gather_group(self, *, expert: bool) -> dist.ProcessGroup | None:
         return self.expert_ag if expert else self.dense_ag
-
-    def registration_groups(self) -> tuple[dist.ProcessGroup, ...]:
-        groups: list[dist.ProcessGroup] = []
-        for group in (self.dense_dp, self.expert_dp, self.dense_ag, self.expert_ag):
-            if group is not None and all(group is not existing for existing in groups):
-                groups.append(group)
-        return tuple(groups)
-
 
 def build_mfsdp_process_groups(ps: Any) -> MFSDPProcessGroups:
     """Read groups already owned by MLite; never initialize global MCore state."""
@@ -170,6 +165,7 @@ def build_mfsdp_config(
 ) -> MFSDPConfig:
     """Lower runtime optimizer options into the supported M-FSDP surface."""
     values = dict(getattr(opt, "override_optimizer_config", None) or {})
+    _reject_unshipped_buffer_knobs(opt, values)
 
     def option(name: str, default: Any, *aliases: str) -> Any:
         for key in (name, *aliases):
@@ -231,19 +227,6 @@ def build_mfsdp_config(
             "M-FSDP main parameter and main gradient dtypes must be FP32 when "
             "use_precision_aware_optimizer is disabled."
         )
-    nccl_ub = bool(option("nccl_ub", False))
-    maxpool_double_buffer = bool(
-        option(
-            "megatron_fsdp_max_pool_double_buffer",
-            False,
-            "maxpool_double_buffer",
-        )
-    )
-    fsdp_manual_registration = bool(option("fsdp_manual_registration", False))
-    if fsdp_manual_registration and not nccl_ub:
-        raise ValueError(
-            "M-FSDP fsdp_manual_registration requires nccl_ub=True."
-        )
     return MFSDPConfig(
         sharding_strategy=strategy,
         bucket_size=bucket_size,
@@ -266,20 +249,6 @@ def build_mfsdp_config(
         # than forcing the Megatron-LM CLI default onto every TE module.
         gradient_accumulation_fusion=bool(
             option("gradient_accumulation_fusion", False)
-        ),
-        nccl_ub=nccl_ub,
-        # MCore keeps the additional communication residency opt-in.  NCCL user
-        # buffers are the exception: registered allocations require alternating
-        # slots and therefore force the bounded double-buffer path.
-        fsdp_double_buffer=(
-            bool(option("fsdp_double_buffer", False))
-            or nccl_ub
-            or maxpool_double_buffer
-        ),
-        maxpool_double_buffer=maxpool_double_buffer,
-        fsdp_manual_registration=fsdp_manual_registration,
-        disable_symmetric_registration=bool(
-            option("disable_symmetric_registration", False)
         ),
         all_gather_in_start_param_sync=bool(
             option("fsdp_all_gather_in_start_param_sync", True)
@@ -353,6 +322,7 @@ def _precision_aware_enabled(opt) -> bool:
 def validate_optimization_knobs(opt) -> None:
     """Validate optimizer and communication knobs before construction."""
     values = dict(getattr(opt, "override_optimizer_config", None) or {})
+    _reject_unshipped_buffer_knobs(opt, values)
     for key in _UNSUPPORTED_OPTIMIZATION_KNOBS:
         value = values.get(key, getattr(opt, key, None))
         if _truthy_feature_value(value):
@@ -375,12 +345,6 @@ def validate_optimization_knobs(opt) -> None:
                 "optimizer_impl='megatron_fsdp' does not support "
                 "num_distributed_optimizer_instances>1."
             )
-    nccl_ub = values.get("nccl_ub", getattr(opt, "nccl_ub", None))
-    if _truthy_feature_value(nccl_ub) and _cuda_alloc_conf_expands_segments():
-        raise ValueError(
-            "optimizer_impl='megatron_fsdp' requires PYTORCH_CUDA_ALLOC_CONF without "
-            "expandable_segments:True when nccl_ub=True; unset it before enabling UBR."
-        )
     for key, required_value in _REQUIRED_DDP_KNOB_VALUES.items():
         value = values.get(key, getattr(opt, key, required_value))
         if value != required_value:
@@ -414,18 +378,14 @@ def _truthy_feature_value(value: Any) -> bool:
     return True
 
 
-def _cuda_alloc_conf_expands_segments() -> bool:
-    value = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-    for item in value.split(","):
-        key, _, raw = item.strip().partition(":")
-        if key.lower() == "expandable_segments" and raw.lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            return True
-    return False
+def _reject_unshipped_buffer_knobs(opt: Any, values: dict[str, Any]) -> None:
+    for key in _UNSHIPPED_BUFFER_KNOBS:
+        value = values.get(key, getattr(opt, key, None))
+        if _truthy_feature_value(value):
+            raise ValueError(
+                f"optimizer_impl='megatron_fsdp' does not ship {key}; "
+                "use the verified default allocator path."
+            )
 
 
 def _invalid_distributed_optimizer_instances(value: Any) -> bool:

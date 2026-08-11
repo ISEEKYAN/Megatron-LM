@@ -204,8 +204,8 @@ class MegatronFSDP(nn.Module):
             output = tree_map_only(torch.Tensor, attach_backward, output)
         except BaseException:
             primary_failure = True
-            # A failed module forward can leave a registered double-buffer slot
-            # busy.  Both cleanup phases are best-effort: neither may replace
+            # A failed module forward can leave communication storage busy.
+            # Both cleanup phases are best-effort: neither may replace
             # the original module failure.
             try:
                 self.param_sync.abort()
@@ -252,9 +252,6 @@ class MegatronFSDP(nn.Module):
     def zero_grad_buffer(self) -> None:
         self.param_sync.reset_grad_state()
 
-    def manual_buffer_registration(self) -> None:
-        self.param_and_grad_buffer.manual_buffer_registration()
-
     def move_model_state(
         self, device: torch.device | str, *, load_grad: bool = True
     ) -> None:
@@ -264,7 +261,7 @@ class MegatronFSDP(nn.Module):
     def release_export_scratch(self) -> None:
         """Reclaim all-gather scratch while retaining sharded export sources.
 
-        This releases persistent double-buffer slots and full-parameter views,
+        This releases communication scratch and full-parameter views,
         but keeps optimizer-owned parameter shards resident so a subsequent
         bounded export can gather from them. Draining the caching allocator
         makes the reclaimed capacity available to the next GPU consumer.

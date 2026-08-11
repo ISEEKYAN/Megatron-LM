@@ -279,7 +279,6 @@ class MFSdpOptimizer:
         self._inner_optimizer = optimizer
         self._model_chunks = model_chunks
         self._grad_sync_enabled = False
-        self._first_step_complete = False
 
     @property
     def grad_sync_enabled(self) -> bool:
@@ -318,11 +317,6 @@ class MFSdpOptimizer:
         for chunk in self._model_chunks:
             chunk.param_sync.copy_main_weights_to_model_weights()
             chunk.param_sync.invalidate_parameters()
-        if not self._first_step_complete:
-            for chunk in self._model_chunks:
-                if chunk.mfsdp_config.fsdp_manual_registration:
-                    chunk.manual_buffer_registration()
-            self._first_step_complete = True
         self.grad_sync_enabled = False
         return result
 

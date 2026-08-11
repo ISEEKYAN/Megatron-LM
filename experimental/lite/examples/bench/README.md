@@ -182,16 +182,15 @@ torchrun --standalone --nproc_per_node 8 \
   --same-data-across-dp \
   --impl-cfg-json '{"optimizer":"mfsdp","mount_vision_model":false,"calculate_per_token_loss":false}' \
   --override-optimizer-json \
-    '{"offload_fraction":0.0,"use_precision_aware_optimizer":false,"fsdp_double_buffer":false,"megatron_fsdp_max_pool_double_buffer":false,"nccl_ub":false,"fsdp_manual_registration":false,"gradient_accumulation_fusion":false,"megatron_fsdp_main_params_dtype":"fp32","megatron_fsdp_main_grads_dtype":"fp32","megatron_fsdp_grad_comm_dtype":"fp32"}' \
+    '{"offload_fraction":0.0,"use_precision_aware_optimizer":false,"gradient_accumulation_fusion":false,"megatron_fsdp_main_params_dtype":"fp32","megatron_fsdp_main_grads_dtype":"fp32","megatron_fsdp_grad_comm_dtype":"fp32"}' \
   --output-json /tmp/qwen35_mfsdp_bench.json
 ```
 
 The storage-resize path allocates each communication bucket only while its
-lifetime is active. NCCL user buffers, double buffering, and manual registration
-remain optional throughput-oriented MCore capabilities, but they retain a
-larger communication pool and therefore need separate memory/performance
-validation before being enabled. FP32 main parameters and sharded main
-gradients are the optimizer/checkpoint sources of truth in this configuration.
+lifetime is active. NCCL user buffers and fixed communication pools are not part
+of this standalone delivery; enabling their knobs fails before construction.
+FP32 main parameters and sharded main gradients are the optimizer/checkpoint
+sources of truth in this configuration.
 The official Megatron-FSDP H100 and MoE recipes disable
 gradient-accumulation fusion, so the command does so explicitly; set it to
 `true` only after separately validating MCore's zero-copy fused-wgrad path for
