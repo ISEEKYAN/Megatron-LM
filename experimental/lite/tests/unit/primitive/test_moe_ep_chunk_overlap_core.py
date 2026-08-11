@@ -1946,8 +1946,6 @@ def test_forward_and_fused_split_expert_activation_from_slot_output_arenas(
     forward_release = forward_source.index(
         "expert_activation_lease.release(expert_ready)", forward_expert
     )
-    saved_arena = saved_forward_source.index("with lease.allocation_arena.allocate():")
-    saved_expert = saved_forward_source.index("expert_out = self.experts(", saved_arena)
     fused_acquire = fused_source.index("acquire_expert_activation(")
     fused_dispatch_finish = fused_source.index(
         "finish_deepep_dispatch_external_with_options("
@@ -1962,7 +1960,7 @@ def test_forward_and_fused_split_expert_activation_from_slot_output_arenas(
     )
     assert "output_allocation=_expert_activation_output_allocation(" in forward_source
     assert "wgrad_done" not in forward_source
-    assert saved_arena < saved_expert
+    assert "allocation_arena" not in saved_forward_source
     assert "activation_allocation=" not in saved_forward_source
     assert fused_dispatch_finish < fused_acquire < fused_expert
     assert "activation_allocation=expert_activation_lease.allocate" in fused_source

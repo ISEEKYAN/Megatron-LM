@@ -36,43 +36,10 @@ class _RecordableCudaTensor:
         self.recorded_streams.append(stream)
 
 
-def test_allocation_arena_reenters_one_pool_once_and_restores_depth_after_error(
+def test_owned_expert_tensor_uses_the_default_allocator(
     monkeypatch, transformer_engine_import_stub
 ):
-    """Nested expert allocation scopes must not nest CUDA MemPool contexts."""
-    transformer_engine_import_stub()
-    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
-
-    entered = []
-
-    @contextmanager
-    def use_pool(pool, device=None):
-        entered.append((pool, device))
-        yield
-
-    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
-    arena = overlap._EPChunkAllocationArena(
-        allocation_pool=object(), device=torch.device("cuda", 0)
-    )
-
-    with arena.allocate():
-        with arena.allocate():
-            assert arena._allocation_depth == 2
-    assert entered == [(arena.allocation_pool, torch.device("cuda", 0))]
-    assert arena._allocation_depth == 0
-
-    with pytest.raises(RuntimeError, match="boom"):
-        with arena.allocate():
-            with arena.allocate():
-                raise RuntimeError("boom")
-    assert arena._allocation_depth == 0
-    assert entered == [(arena.allocation_pool, torch.device("cuda", 0))] * 2
-
-
-def test_owned_expert_tensor_enters_the_dedicated_activation_pool(
-    monkeypatch, transformer_engine_import_stub
-):
-    """Caller-owned activation allocations use the shared activation MemPool."""
+    """Caller-owned eager activations do not enter a private CUDA pool."""
     transformer_engine_import_stub()
     import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
 
@@ -88,7 +55,6 @@ def test_owned_expert_tensor_enters_the_dedicated_activation_pool(
         yield
 
     monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
-    monkeypatch.setattr(overlap.torch.cuda, "MemPool", lambda **_kwargs: object())
     monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
     profile = overlap.EPChunkShapeProfile(
         max_input_rows=8, hidden_size=4, topk=2, ep_size=2
@@ -114,10 +80,87 @@ def test_owned_expert_tensor_enters_the_dedicated_activation_pool(
         )
 
     assert tuple(tensor.shape) == (3, 4)
-    assert len(entered) == 1
-    assert entered[0][1] == torch.device("cuda", 0)
-    assert workspace.evidence()["expert_activation_pool_count"] == 1
+    assert entered == []
+    assert workspace.evidence()["expert_activation_pool_count"] == 0
     lease.release(_FakeEvent(ready=True))
+
+
+def test_eager_workspace_never_uses_a_private_cuda_pool(
+    monkeypatch, transformer_engine_import_stub
+):
+    """Eager ChunkedEP must leave reusable blocks in PyTorch's default allocator."""
+    transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
+
+    @contextmanager
+    def use_device(_device):
+        yield
+
+    def private_pool_forbidden(*_args, **_kwargs):
+        raise AssertionError("eager ChunkedEP must not instantiate torch.cuda.MemPool")
+
+    @contextmanager
+    def private_scope_forbidden(*_args, **_kwargs):
+        raise AssertionError("eager ChunkedEP must not enter torch.cuda.use_mem_pool")
+        yield
+
+    monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
+    monkeypatch.setattr(overlap.torch.cuda, "MemPool", private_pool_forbidden)
+    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", private_scope_forbidden)
+    monkeypatch.setattr(overlap.torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(overlap, "_EXPERT_ACTIVATION_SIZE_CLASS_BYTES", 1)
+    profile = overlap.EPChunkShapeProfile(
+        max_input_rows=8,
+        hidden_size=4,
+        topk=2,
+        ep_size=2,
+        expert_intermediate_size=3,
+    )
+    registry = overlap.EPChunkWorkspaceRegistry()
+    workspace = registry.get_or_create(
+        overlap.EPChunkWorkspaceKey(
+            op="forward",
+            device_type="cuda",
+            device_index=0,
+            ep_group_id=700,
+            dtype=torch.float32,
+            shape_profile=profile,
+        ),
+        lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
+    )
+    stream = SimpleNamespace(device=torch.device("cuda", 0))
+    workspace.materialize()
+    workspace.reserve_expert_activations(max_expert_rows=3, device=stream.device)
+    scratch = workspace.acquire(0, stream=stream)
+    with scratch.deepep_recv_allocation():
+        first_scratch = scratch.tensor(
+            "grad_expert_out", (3, 4), dtype=torch.float32, device="cpu"
+        )
+    first_scratch_ptr = first_scratch.data_ptr()
+    scratch.release(_FakeEvent(ready=True))
+    reacquired_scratch = workspace.acquire(0, stream=stream)
+    with reacquired_scratch.deepep_recv_allocation():
+        second_scratch = reacquired_scratch.tensor(
+            "grad_expert_out", (3, 4), dtype=torch.float32, device="cpu"
+        )
+    assert second_scratch.data_ptr() == first_scratch_ptr
+    reacquired_scratch.release(_FakeEvent(ready=True))
+    first = workspace.acquire_expert_activation(stream=stream)
+    first.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
+    first.release(_FakeEvent(ready=True))
+    workspace.park_expert_activations(stream=stream)
+    second = workspace.acquire_expert_activation(stream=stream)
+    second.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
+    second.release(_FakeEvent(ready=True))
+    workspace.close(stream=stream)
+    registry.release(workspace.key, stream=stream)
+
+    evidence = workspace.evidence()
+    assert evidence["allocation_pool_count"] == 0
+    assert evidence["allocation_pool_ids"] == {}
+    assert evidence["expert_activation_pool_count"] == 0
+    assert evidence["expert_activation_pool_id"] is None
+    assert workspace._expert_activation_owner.coordinator.capacity_bytes == {}
 
 
 def test_explicit_frozen_activation_reservation_eager_park_releases_backing(
@@ -127,22 +170,11 @@ def test_explicit_frozen_activation_reservation_eager_park_releases_backing(
     transformer_engine_import_stub()
     import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
 
-    pools = []
-
     @contextmanager
     def use_device(_device):
         yield
 
-    @contextmanager
-    def use_pool(_pool, device=None):
-        assert device == torch.device("cuda", 0)
-        yield
-
     monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
-    monkeypatch.setattr(
-        overlap.torch.cuda, "MemPool", lambda **_kwargs: pools.append(object()) or pools[-1]
-    )
-    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
     monkeypatch.setattr(overlap.torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(overlap, "_EXPERT_ACTIVATION_SIZE_CLASS_BYTES", 1)
     profile = overlap.EPChunkShapeProfile(
@@ -174,7 +206,6 @@ def test_explicit_frozen_activation_reservation_eager_park_releases_backing(
 
     assert coordinator.frozen
     assert coordinator.arena.tensors == {}
-    assert coordinator.arena.allocation_pool is pools[0]
 
     first = forward.acquire_expert_activation(stream=stream)
     first.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
@@ -229,7 +260,6 @@ def test_explicit_frozen_activation_reservation_eager_park_releases_backing(
 
     registry.release(forward.key)
     registry.release(fused.key)
-    assert coordinator.arena.allocation_pool is None
     assert coordinator.capacity_bytes == {}
     assert coordinator.pointer_signatures_by_op == {}
     assert coordinator.backing_tensors == {}
@@ -430,7 +460,13 @@ def test_capture_owned_backing_survives_park_and_close_releases_everything(
 
     capturing = {"value": True}
     monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
-    monkeypatch.setattr(overlap.torch.cuda, "MemPool", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        overlap.torch.cuda,
+        "MemPool",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("capture must not instantiate an eager MemPool")
+        ),
+    )
     monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
     monkeypatch.setattr(overlap.torch.cuda, "is_current_stream_capturing", lambda: capturing["value"])
     monkeypatch.setattr(overlap, "_EXPERT_ACTIVATION_SIZE_CLASS_BYTES", 1)
@@ -465,24 +501,28 @@ def test_capture_owned_backing_survives_park_and_close_releases_everything(
     # intentionally stronger than inspecting activation storage alone.
     scratch = forward.acquire(0, stream=stream)
     with scratch.deepep_recv_allocation():
-        pass
+        scratch_tensor = scratch.tensor(
+            "grad_expert_out", (3, 4), dtype=torch.float32, device="cpu"
+        )
+    scratch_ptr = scratch_tensor.data_ptr()
     scratch.release(_FakeEvent(ready=True))
 
     capture = forward.acquire_expert_activation(stream=stream)
     initial = capture.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
     initial_ptr = initial.data_ptr()
     capture.release(_FakeEvent(ready=True))
-    forward.reset_tensors()
+    forward.park_expert_activations(stream=stream)
     assert coordinator.arena.tensors == {}
     assert coordinator.graph_backing_owned
     assert set(coordinator.backing_tensors) == {"fc1_input"}
+    assert forward._slots[0].tensors["grad_expert_out"].data_ptr() == scratch_ptr
 
     capturing["value"] = False
     replay = fused.acquire_expert_activation(stream=stream)
     replay_input = replay.tensor("fc1_input", (3, 4), dtype=torch.float32, device="cpu")
     assert replay_input.data_ptr() == initial_ptr
     replay.release(_FakeEvent(ready=True))
-    fused.reset_tensors()
+    fused.park_expert_activations(stream=stream)
     assert set(coordinator.backing_tensors) == {"fc1_input"}
 
     registry.release(forward.key)
@@ -490,7 +530,6 @@ def test_capture_owned_backing_survives_park_and_close_releases_everything(
     assert coordinator.arena.tensors == {}
     assert coordinator.backing_tensors == {}
     assert coordinator.capacity_bytes == {}
-    assert coordinator.arena.allocation_pool is None
     assert not coordinator.graph_backing_owned
 
 
@@ -642,31 +681,18 @@ def test_activation_only_park_keeps_capture_owned_backing(
     assert activation.recorded_streams == []
 
 
-def test_activation_pool_parks_between_ops_at_observed_high_watermark(
+def test_activation_arena_parks_between_ops_at_observed_high_watermark(
     monkeypatch, transformer_engine_import_stub
 ):
-    """Only explicit park hands one pool to the next OP without tensor residency."""
+    """Only explicit park hands compatible logical storage to the next OP."""
     transformer_engine_import_stub()
     import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
-
-    pools = []
 
     @contextmanager
     def use_device(_device):
         yield
 
-    @contextmanager
-    def use_pool(_pool, device=None):
-        assert device == torch.device("cuda", 0)
-        yield
-
     monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
-    monkeypatch.setattr(
-        overlap.torch.cuda,
-        "MemPool",
-        lambda **_kwargs: pools.append(object()) or pools[-1],
-    )
-    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
     profile = overlap.EPChunkShapeProfile(
         max_input_rows=32, hidden_size=4, topk=2, ep_size=2
     )
@@ -693,7 +719,7 @@ def test_activation_pool_parks_between_ops_at_observed_high_watermark(
     for name in names:
         first.tensor(name, (16, 4), dtype=torch.float32, device="cpu")
     first.release(_FakeEvent(ready=True))
-    # Per-chunk and per-layer leases retain their three storage references.
+    # The active lease retains its three logical storage references.
     repeated = backward.acquire_expert_activation(stream=stream)
     for name in names:
         repeated.tensor(name, (3, 4), dtype=torch.float32, device="cpu")
@@ -701,7 +727,6 @@ def test_activation_pool_parks_between_ops_at_observed_high_watermark(
     repeated.release(pending)
     coordinator = backward._expert_activation_owner.coordinator
     capacity = coordinator.capacity_bytes["fc1_input"]
-    pool = coordinator.arena.allocation_pool
     assert coordinator.arena.tensors
     assert coordinator.rehydrates == 0
     scratch_lease = backward.acquire(0, require_dispatcher=False)
@@ -723,15 +748,12 @@ def test_activation_pool_parks_between_ops_at_observed_high_watermark(
     assert stream.waited == [pending]
     assert all(tensor.numel() == 12 for tensor in smaller.values())
     assert coordinator.capacity_bytes["fc1_input"] == capacity
-    assert coordinator.arena.allocation_pool is pool
     assert coordinator.rehydrates == 3
     second.release(_FakeEvent(ready=True))
     assert coordinator.arena.tensors
-    assert pools == [pool]
 
     registry.release(backward.key)
     registry.release(fused.key)
-    assert coordinator.arena.allocation_pool is None
     assert coordinator.capacity_bytes == {}
     assert coordinator.parks == coordinator.rehydrates == 0
 
@@ -1234,7 +1256,7 @@ def test_workspace_evidence_reports_actual_scratch_shape_dtype_and_bytes(
     }
 
 
-def test_scratch_only_lease_allocates_from_its_own_backward_arena(
+def test_scratch_only_lease_allocates_from_its_own_backward_slot(
     transformer_engine_import_stub,
 ):
     (
@@ -1260,26 +1282,15 @@ def test_scratch_only_lease_allocates_from_its_own_backward_arena(
         ),
         lambda slot: f"unused-{slot}",
     )
-    entered = []
-
-    class FakeArena:
-        @contextmanager
-        def allocate(self):
-            entered.append("enter")
-            yield
-            entered.append("exit")
-
-    workspace._allocation_arenas[0] = FakeArena()
     lease = workspace.acquire(0, require_dispatcher=False)
     lease.tensor("grad_expert_out", (9, 4), dtype=torch.float32, device="cpu")
 
-    assert entered == ["enter", "exit"]
     assert workspace.evidence()["dispatcher_count"] == 0
-    assert lease.allocation_arena is workspace.allocation_arena(0)
+    assert "grad_expert_out" in workspace._slots[0].tensors
     lease.release(_FakeEvent(ready=True))
 
 
-def test_fused_dispatcher_lease_allocates_scratch_from_its_own_slot_arena(
+def test_fused_dispatcher_lease_allocates_scratch_from_its_own_slot(
     transformer_engine_import_stub,
 ):
     (
@@ -1305,24 +1316,10 @@ def test_fused_dispatcher_lease_allocates_scratch_from_its_own_slot_arena(
         ),
         lambda slot: f"fused-{slot}",
     )
-    entered = []
-
-    class FakeArena:
-        allocation_pool = None
-        device = None
-
-        @contextmanager
-        def allocate(self):
-            entered.append("enter")
-            yield
-            entered.append("exit")
-
-    workspace._allocation_arenas[0] = FakeArena()
     lease = workspace.acquire(0)
     lease.tensor("grad_expert_out", (9, 4), dtype=torch.float32, device="cpu")
 
-    assert entered == ["enter", "exit"]
-    assert lease.allocation_arena is workspace.allocation_arena(0)
+    assert "grad_expert_out" in workspace._slots[0].tensors
     lease.release(_FakeEvent(ready=True))
 
 
@@ -1382,7 +1379,7 @@ def test_workspace_reports_deepep_buffer_count_and_resident_bytes(
     assert evidence["deepep_buffer_resident_bytes"] == 2048
 
 
-def test_workspace_owns_two_comm_pools_and_one_activation_pool(
+def test_workspace_uses_default_allocator_for_comm_and_activation_storage(
     monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
@@ -1398,33 +1395,13 @@ def test_workspace_owns_two_comm_pools_and_one_activation_pool(
         registry_type,
         _function,
     ) = _symbols(transformer_engine_import_stub)
-    created = []
-    entered = []
     creation_devices = []
-
-    class FakePool:
-        pass
-
-    @contextmanager
-    def use_pool(pool, device=None):
-        entered.append((pool, device))
-        yield
 
     @contextmanager
     def use_device(device):
         creation_devices.append(device)
         yield
 
-    def make_pool(*, allocator=None, use_on_oom=False, no_split=False):
-        assert allocator is None
-        assert use_on_oom is False
-        assert no_split is False
-        pool = FakePool()
-        created.append(pool)
-        return pool
-
-    monkeypatch.setattr(overlap.torch.cuda, "MemPool", make_pool)
-    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
     monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
     workspace = registry_type().get_or_create(
         key_type(
@@ -1440,13 +1417,12 @@ def test_workspace_owns_two_comm_pools_and_one_activation_pool(
         lambda slot: SimpleNamespace(slot=slot, use_deepep=True),
     )
     workspace.materialize()
-    assert len(created) == 1
-    assert creation_devices == [torch.device("cuda", 3)] * 2
+    assert creation_devices == [torch.device("cuda", 3)]
     evidence = workspace.evidence()
-    assert evidence["allocation_pool_count"] == 2
-    assert set(evidence["allocation_pool_ids"].values()) == {id(created[0])}
-    assert evidence["expert_activation_pool_count"] == 1
-    assert evidence["expert_activation_pool_id"] == id(created[0])
+    assert evidence["allocation_pool_count"] == 0
+    assert evidence["allocation_pool_ids"] == {}
+    assert evidence["expert_activation_pool_count"] == 0
+    assert evidence["expert_activation_pool_id"] is None
     assert evidence["recv_observer_enabled"] is False
     monkeypatch.setenv("MEGATRON_LITE_EP_CHUNK_SCRATCH_TRACE", "1")
     assert workspace.evidence()["recv_observer_enabled"] is True
@@ -1457,7 +1433,6 @@ def test_workspace_owns_two_comm_pools_and_one_activation_pool(
         pass
     with lease0.deepep_recv_allocation():
         pass
-    assert entered == [(created[0], torch.device("cuda", 3))] * 2
     lease0.release(_FakeEvent(ready=True))
     assert workspace.evidence()["consumer_event_guard_count"] == 1
 
@@ -1465,26 +1440,24 @@ def test_workspace_owns_two_comm_pools_and_one_activation_pool(
         stream=SimpleNamespace(device=torch.device("cuda", 3))
     )
     activation.release(_FakeEvent(ready=True))
-    assert workspace.evidence()["expert_activation_pool_count"] == 1
-    assert workspace.evidence()["expert_activation_pool_id"] == id(created[0])
+    assert workspace.evidence()["expert_activation_pool_count"] == 0
+    assert workspace.evidence()["expert_activation_pool_id"] is None
 
     lease1 = workspace.acquire(1)
     with lease1.deepep_recv_allocation():
         pass
-    assert len(created) == 1
     lease1.release(_FakeEvent(ready=True))
-    assert workspace.evidence()["allocation_pool_count"] == 2
+    assert workspace.evidence()["allocation_pool_count"] == 0
 
     workspace.release()
     assert workspace.evidence()["allocation_pool_count"] == 0
-    # Direct workspace close does not tear down the registry-shared pool.
-    assert workspace.evidence()["expert_activation_pool_count"] == 1
+    assert workspace.evidence()["expert_activation_pool_count"] == 0
     assert workspace._registry is not None
     workspace._registry.release(workspace.key)
     assert workspace.evidence()["expert_activation_pool_count"] == 0
 
 
-def test_compatible_three_ops_share_one_eager_physical_pool_but_keep_logical_owners(
+def test_compatible_three_ops_keep_logical_owners_without_eager_private_pools(
     monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
@@ -1505,11 +1478,7 @@ def test_compatible_three_ops_share_one_eager_physical_pool_but_keep_logical_own
     def use_device(_device):
         yield
 
-    pools = []
     monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
-    monkeypatch.setattr(
-        overlap.torch.cuda, "MemPool", lambda **_kwargs: pools.append(object()) or pools[-1]
-    )
     registry = registry_type()
     profile = profile_type(max_input_rows=8, hidden_size=4, topk=2, ep_size=2)
     workspaces = []
@@ -1528,14 +1497,14 @@ def test_compatible_three_ops_share_one_eager_physical_pool_but_keep_logical_own
         if op == "backward":
             workspace.prepare_scratch(device=torch.device("cuda", 3))
             assert workspace.evidence()["dispatcher_count"] == 0
-            assert workspace.evidence()["allocation_pool_count"] == 2
-            assert workspace.evidence()["expert_activation_pool_count"] == 1
+            assert workspace.evidence()["allocation_pool_count"] == 0
+            assert workspace.evidence()["expert_activation_pool_count"] == 0
             lease = workspace.acquire_expert_activation(
                 stream=SimpleNamespace(device=torch.device("cuda", 3))
             )
             lease.release(_FakeEvent(ready=True))
             assert workspace.evidence()["dispatcher_count"] == 0
-            assert workspace.evidence()["allocation_pool_count"] == 2
+            assert workspace.evidence()["allocation_pool_count"] == 0
         else:
             workspace.materialize()
         workspaces.append(workspace)
@@ -1545,39 +1514,27 @@ def test_compatible_three_ops_share_one_eager_physical_pool_but_keep_logical_own
         for workspace in workspaces
         for pool_id in workspace.evidence()["allocation_pool_ids"].values()
     }
-    assert len(
-        {workspace.evidence()["expert_activation_pool_id"] for workspace in workspaces}
-    ) == 1
-    assert None not in {
-        workspace.evidence()["expert_activation_pool_id"] for workspace in workspaces
-    }
-    assert [workspace.evidence()["allocation_pool_count"] for workspace in workspaces] == [2, 2, 2]
-    assert len(comm_ids) == 1
-    assert None not in comm_ids
+    assert {workspace.evidence()["expert_activation_pool_id"] for workspace in workspaces} == {None}
+    assert [workspace.evidence()["allocation_pool_count"] for workspace in workspaces] == [0, 0, 0]
+    assert comm_ids == set()
     assert len({id(workspace._expert_activation_owner) for workspace in workspaces}) == 3
     assert len(
         {id(workspace._expert_activation_owner.coordinator) for workspace in workspaces}
     ) == 1
-    assert len(pools) == 1
 
 
-def test_shared_eager_pool_lives_until_last_owner_then_rematerializes(
+def test_eager_private_pool_is_absent_through_release_and_rematerialize(
     monkeypatch, transformer_engine_import_stub
 ):
-    """One registry-compatible physical pool outlives individual logical OPs."""
+    """Release and rematerialize keep eager allocation on the default allocator."""
     transformer_engine_import_stub()
     import megatron.lite.primitive.modules.moe_ep_chunk_overlap as overlap
-
-    created = []
 
     @contextmanager
     def use_device(_device):
         yield
 
     monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
-    monkeypatch.setattr(
-        overlap.torch.cuda, "MemPool", lambda **_kwargs: created.append(object()) or created[-1]
-    )
     profile = overlap.EPChunkShapeProfile(max_input_rows=8, hidden_size=4, topk=2, ep_size=2)
     registry = overlap.EPChunkWorkspaceRegistry()
 
@@ -1590,17 +1547,15 @@ def test_shared_eager_pool_lives_until_last_owner_then_rematerializes(
     forward, fused = get("forward"), get("fused_forward_backward")
     forward.materialize()
     fused.materialize()
-    pool = forward.evidence()["expert_activation_pool_id"]
-    assert pool == fused.evidence()["expert_activation_pool_id"]
-    assert len(created) == 1
+    assert forward.evidence()["expert_activation_pool_id"] is None
+    assert fused.evidence()["expert_activation_pool_id"] is None
     registry.release(forward.key)
-    assert fused.evidence()["expert_activation_pool_id"] == pool
+    assert fused.evidence()["expert_activation_pool_id"] is None
     registry.release(fused.key)
-    assert not registry._eager_physical_pools
+    assert not hasattr(registry, "_eager_physical_pools")
 
     rematerialized = get("forward")
     rematerialized.materialize()
-    assert len(created) == 2
 
 
 def test_expert_activation_arena_waits_only_for_its_consumer_event(
@@ -2477,13 +2432,7 @@ def test_unbound_workspace_binds_to_first_runtime_stream_device(
         device_contexts.append(torch.device(device))
         yield
 
-    @contextmanager
-    def use_pool(_pool, device=None):
-        yield
-
     monkeypatch.setattr(overlap.torch.cuda, "device", use_device)
-    monkeypatch.setattr(overlap.torch.cuda, "MemPool", lambda **_kwargs: object())
-    monkeypatch.setattr(overlap.torch.cuda, "use_mem_pool", use_pool)
     workspace = registry_type().get_or_create(
         key_type(
             op="forward",
@@ -2501,9 +2450,7 @@ def test_unbound_workspace_binds_to_first_runtime_stream_device(
 
     lease = workspace.acquire(0, stream=stream)
 
-    # One context constructs the registry pool; the second constructs this
-    # workspace's still-independent dispatcher pair.
-    assert device_contexts == [torch.device("cuda", 5)] * 2
+    assert device_contexts == [torch.device("cuda", 5)]
     assert workspace.evidence()["materialized_device"] == "cuda:5"
     lease.release(_FakeEvent(ready=True))
 
@@ -2514,9 +2461,7 @@ def test_unbound_workspace_binds_to_first_runtime_stream_device(
     rebound = workspace.acquire(
         0, stream=SimpleNamespace(device=torch.device("cuda", 6))
     )
-    assert device_contexts == [torch.device("cuda", 5)] * 2 + [
-        torch.device("cuda", 6)
-    ] * 2
+    assert device_contexts == [torch.device("cuda", 5), torch.device("cuda", 6)]
     assert workspace.evidence()["materialized_device"] == "cuda:6"
     rebound.release(_FakeEvent(ready=True))
 
