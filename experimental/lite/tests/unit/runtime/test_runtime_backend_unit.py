@@ -270,8 +270,8 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
     runtime.to(handle, "cuda", model=True, optimizer=False, grad=True)
 
     assert events == [
-        "offload-model",
         "offload-optimizer",
+        "offload-model",
         "release-scratch",
         "synchronize",
         "collect",
