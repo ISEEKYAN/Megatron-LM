@@ -413,8 +413,12 @@ def _build_handle(
             "protocol": protocol,
         }
     )
+    # Match MegatronLiteRuntime.build_model(): the non-pipeline runtime calls
+    # forward_step with the sole chunk, while pipeline schedules receive the
+    # complete chunk list through ``model_chunks``.
+    model = chunks[0] if len(chunks) == 1 else chunks
     handle = ModelHandle(
-        model=chunks,
+        model=model,
         optimizer=optimizer,
         parallel_state=bundle.parallel_state,
         config=SimpleNamespace(parallel=parallel),

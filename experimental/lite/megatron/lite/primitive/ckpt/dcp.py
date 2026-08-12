@@ -425,6 +425,12 @@ def _mfsdp_pack_optimizer_tensor(bucket, inner, state_name: str):
         if spec.shard_param is None or not spec.full_param.requires_grad:
             continue
         value = _mfsdp_param_optimizer_state(inner, spec.shard_param).get(state_name)
+        if value is None and state_name == "master_param":
+            # A partial-offload checkpoint may be restored with another DP
+            # size, moving the deterministic CPU/GPU split boundary.  GPU-owned
+            # shards already are the FP32 master, so save them in the common
+            # master field as well instead of leaving an unrecoverable zero.
+            value = spec.shard_param.detach()
         if value is None:
             continue
         if not torch.is_tensor(value) or value.numel() != spec.shard_numel:

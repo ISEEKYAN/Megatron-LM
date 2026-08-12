@@ -3156,13 +3156,21 @@ def test_mfsdp_dcp_optimizer_only_template_omits_model_weights(
         dist.destroy_process_group()
 
 
-def _run_mfsdp_dcp_source(rank: int, world_size: int, init_file: str, root: str):
+def _run_mfsdp_dcp_source(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    root: str,
+    offload_fraction: float,
+):
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
     )
     try:
-        _model, chunk, optimizer, ps, _opt = _dcp_test_stack(world_size, rank)
+        _model, chunk, optimizer, ps, _opt = _dcp_test_stack(
+            world_size, rank, offload_fraction=offload_fraction
+        )
         torch.manual_seed(3000 + rank)
         value = torch.randn(3, 4)
         target = torch.randn(3, 2)
@@ -3171,7 +3179,7 @@ def _run_mfsdp_dcp_source(rank: int, world_size: int, init_file: str, root: str)
         optimizer.finish_grad_sync()
         assert optimizer.step()[0]
 
-        torch_optimizer = optimizer._inner_optimizer.optimizer
+        inner_optimizer = optimizer._inner_optimizer
         expected = {
             "params": {
                 name: param.detach().cpu().clone()
@@ -3183,20 +3191,20 @@ def _run_mfsdp_dcp_source(rank: int, world_size: int, init_file: str, root: str)
             exp_avg = checkpoint_dcp._mfsdp_gather_padded_bucket(
                 bucket,
                 checkpoint_dcp._mfsdp_pack_optimizer_tensor(
-                    bucket, torch_optimizer, "exp_avg"
+                    bucket, inner_optimizer, "exp_avg"
                 ),
             )
             exp_avg_sq = checkpoint_dcp._mfsdp_gather_padded_bucket(
                 bucket,
                 checkpoint_dcp._mfsdp_pack_optimizer_tensor(
-                    bucket, torch_optimizer, "exp_avg_sq"
+                    bucket, inner_optimizer, "exp_avg_sq"
                 ),
             )
             (
                 _initialized,
                 _step_present,
                 steps,
-            ) = checkpoint_dcp._mfsdp_optimizer_metadata(bucket, torch_optimizer)
+            ) = checkpoint_dcp._mfsdp_optimizer_metadata(bucket, inner_optimizer)
             for index, spec in enumerate(bucket.specs):
                 expected["optimizer"][spec.name] = {
                     "step": steps[index].cpu().clone(),
@@ -3224,15 +3232,23 @@ def _run_mfsdp_dcp_source(rank: int, world_size: int, init_file: str, root: str)
         dist.destroy_process_group()
 
 
-def _run_mfsdp_dcp_target(rank: int, world_size: int, init_file: str, root: str):
+def _run_mfsdp_dcp_target(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    root: str,
+    offload_fraction: float,
+):
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
     )
     try:
-        _model, chunk, optimizer, ps, opt = _dcp_test_stack(world_size, rank)
-        torch_optimizer = optimizer._inner_optimizer.optimizer
-        for group in torch_optimizer.param_groups:
+        _model, chunk, optimizer, ps, opt = _dcp_test_stack(
+            world_size, rank, offload_fraction=offload_fraction
+        )
+        inner_optimizer = optimizer._inner_optimizer
+        for group in inner_optimizer.param_groups:
             group["lr"] = 0.25
         step = checkpoint_dcp.load_training_checkpoint(
             chunk,
@@ -3243,7 +3259,8 @@ def _run_mfsdp_dcp_target(rank: int, world_size: int, init_file: str, root: str)
             load_rng=False,
         )
         assert step == 13
-        assert all(group["lr"] == opt.lr for group in torch_optimizer.param_groups)
+        assert inner_optimizer.param_groups
+        assert all(group["lr"] == opt.lr for group in inner_optimizer.param_groups)
         expected = torch.load(
             os.path.join(root, "expected.pt"), map_location="cpu", weights_only=False
         )
@@ -3291,20 +3308,31 @@ def _run_mfsdp_dcp_target(rank: int, world_size: int, init_file: str, root: str)
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("offload_fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize(("source_world", "target_world"), [(2, 4), (4, 2)])
 def test_mfsdp_dcp_cross_dp_reshard_matches_next_step(
-    tmp_path, source_world, target_world
+    tmp_path, source_world, target_world, offload_fraction
 ):
     root = str(tmp_path)
     mp.spawn(
         _run_mfsdp_dcp_source,
-        args=(source_world, str(tmp_path / "source-init"), root),
+        args=(
+            source_world,
+            str(tmp_path / "source-init"),
+            root,
+            offload_fraction,
+        ),
         nprocs=source_world,
         join=True,
     )
     mp.spawn(
         _run_mfsdp_dcp_target,
-        args=(target_world, str(tmp_path / "target-init"), root),
+        args=(
+            target_world,
+            str(tmp_path / "target-init"),
+            root,
+            offload_fraction,
+        ),
         nprocs=target_world,
         join=True,
     )
