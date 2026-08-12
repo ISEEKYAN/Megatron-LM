@@ -17,7 +17,11 @@ from megatron.lite.primitive.optimizers.fsdp2 import (
     fsdp2_available,
     wrap_fsdp2,
 )
-from megatron.lite.primitive.optimizers.fsdp2.adamw import iter_torch_optimizers, to_local_tensor
+from megatron.lite.primitive.optimizers.fsdp2.adamw import (
+    iter_torch_optimizers,
+    shares_local_storage,
+    to_local_tensor,
+)
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
@@ -191,6 +195,18 @@ def _optimizer_state_devices(optimizer) -> set[str]:
     return devices
 
 
+def _master_param_aliases(optimizer) -> list[bool]:
+    aliases: list[bool] = []
+    for child in iter_torch_optimizers(optimizer.optimizer):
+        for param, param_state in getattr(child, "state", {}).items():
+            if not isinstance(param_state, dict):
+                continue
+            master = param_state.get("master_param")
+            if isinstance(master, torch.Tensor):
+                aliases.append(shares_local_storage(master, param))
+    return aliases
+
+
 def test_fsdp2_runtime_model_and_optimizer_offload_roundtrip_single_gpu():
     model, ps = _build_fsdp2_model()
     optimizer = _build_optimizer(model, ps, offload_fraction=0.0)
@@ -209,6 +225,27 @@ def test_fsdp2_runtime_model_and_optimizer_offload_roundtrip_single_gpu():
     runtime.to(handle, "cuda", model=True, optimizer=True, grad=True)
     assert _local_param_devices(model) == {"cuda"}
     assert _optimizer_state_devices(optimizer) == {"cuda"}
+
+
+def test_fsdp2_runtime_offload_rebinds_fp32_master_after_model_roundtrip_single_gpu():
+    model, ps = _build_fsdp2_model(dtype=torch.float32)
+    optimizer = _build_optimizer(model, ps, offload_fraction=0.0)
+    handle = ModelHandle(
+        model=model, optimizer=optimizer, parallel_state=ps, _extras={"model_chunks": [model]}
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    before = _master_param_aliases(optimizer)
+    assert before and all(before)
+
+    runtime.to(handle, "cpu", model=True, optimizer=True, grad=True)
+    assert _local_param_devices(model) == {"cpu"}
+    assert _optimizer_state_devices(optimizer) == {"cpu"}
+
+    runtime.to(handle, "cuda", model=True, optimizer=True, grad=True)
+    assert _local_param_devices(model) == {"cuda"}
+    assert _optimizer_state_devices(optimizer) == {"cuda"}
+    assert all(_master_param_aliases(optimizer))
 
 
 def test_fsdp2_offload_fraction_keeps_optimizer_update_state_on_cpu_single_gpu():
