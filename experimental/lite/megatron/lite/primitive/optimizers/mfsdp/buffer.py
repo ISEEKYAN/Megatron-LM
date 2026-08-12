@@ -399,6 +399,11 @@ class ParamBucket:
                 )
                 _copy_parameter_metadata(spec.full_param, shard_param)
                 shard_param._mfsdp_original_ndim = spec.full_param.ndim
+                # Optimizer-offload placement must be identical on every DP
+                # rank and remain stable when a checkpoint is resharded.  A
+                # local shard can be smaller (or empty) on boundary ranks, so
+                # retain the logical parameter size for placement accounting.
+                shard_param._mfsdp_global_numel = spec.numel
                 shard_param._mfsdp_compute_device = self._training_compute_device
                 spec.shard_param = shard_param
                 # TE returns a dummy ``.grad`` when its wgrad GEMM writes the

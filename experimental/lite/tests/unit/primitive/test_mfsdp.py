@@ -1033,6 +1033,30 @@ def test_mfsdp_accepts_raw_override_only_offload_fraction():
     assert optimizer._inner_optimizer.optimizer.param_groups == []
 
 
+def test_mfsdp_offload_split_uses_dp_invariant_logical_parameter_sizes():
+    def rank_params(local_sizes):
+        params = [nn.Parameter(torch.empty(size)) for size in local_sizes]
+        params[0]._mfsdp_global_numel = 8
+        params[1]._mfsdp_global_numel = 4
+        return params
+
+    placements = []
+    for local_sizes in ((0, 4), (8, 0)):
+        params = rank_params(local_sizes)
+        indices = {id(param): index for index, param in enumerate(params)}
+        gpu, cpu = mfsdp_optimizer._split_param_groups_by_fraction(
+            [{"params": params, "weight_decay": 0.0}], 0.5
+        )
+        placements.append(
+            (
+                [indices[id(param)] for group in gpu for param in group["params"]],
+                [indices[id(param)] for group in cpu for param in group["params"]],
+            )
+        )
+
+    assert placements == [([1], [0]), ([1], [0])]
+
+
 def test_mfsdp_full_optimizer_offload_uses_bounded_cpu_state_and_fp32_main_grad():
     _Model, _Unit, ps, engine_cfg = _build_optimizer_stack(1.0)
     engine_cfg.optimizer.override_optimizer_config["bucket_size"] = 5

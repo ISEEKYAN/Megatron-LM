@@ -645,8 +645,16 @@ def _order_param_gathers_for_parallel_collectives(
 def _split_param_groups_by_fraction(
     param_groups: list[dict[str, Any]], offload_fraction: float
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Match HDO's deterministic leading-numel split without splitting a tensor."""
-    total_numel = sum(param.numel() for group in param_groups for param in group["params"])
+    """Choose whole logical parameters identically on every DP rank."""
+
+    def placement_numel(param: nn.Parameter) -> int:
+        return int(getattr(param, "_mfsdp_global_numel", param.numel()))
+
+    total_numel = sum(
+        placement_numel(param)
+        for group in param_groups
+        for param in group["params"]
+    )
     cpu_target = int(total_numel * offload_fraction)
     cpu_numel = 0
     gpu_groups: list[dict[str, Any]] = []
@@ -657,7 +665,7 @@ def _split_param_groups_by_fraction(
         for param in group["params"]:
             if cpu_numel < cpu_target:
                 cpu_params.append(param)
-                cpu_numel += param.numel()
+                cpu_numel += placement_numel(param)
             else:
                 gpu_params.append(param)
         for params, target in ((gpu_params, gpu_groups), (cpu_params, cpu_groups)):
