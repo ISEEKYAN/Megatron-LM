@@ -2932,7 +2932,9 @@ def test_mfsdp_dcp_same_topology_restores_flat_master_and_adam_state(tmp_path):
         dist.destroy_process_group()
 
 
-def _dcp_test_stack(world_size: int, rank: int):
+def _dcp_test_stack(
+    world_size: int, rank: int, *, offload_fraction: float = 0.0
+):
     torch.manual_seed(2468)
     model = _GlooModel()
     ps = SimpleNamespace(
@@ -2954,6 +2956,7 @@ def _dcp_test_stack(world_size: int, rank: int):
     )
     opt = SimpleNamespace(
         optimizer="adam",
+        offload_fraction=offload_fraction,
         lr=1.0e-3,
         min_lr=0.0,
         weight_decay=0.0,
@@ -2973,6 +2976,90 @@ def _dcp_test_stack(world_size: int, rank: int):
         fsdp_unit_modules=(_GlooUnit,),
     )
     return model, chunks[0], optimizer, ps, opt
+
+
+def test_mfsdp_dcp_full_offload_restores_cpu_adam_and_next_step(tmp_path):
+    init_file = str(tmp_path / "mfsdp-dcp-full-offload-init")
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=0, world_size=1
+    )
+    try:
+        torch.manual_seed(97531)
+        _model, uninterrupted, uninterrupted_optimizer, ps, _opt = _dcp_test_stack(
+            1, 0, offload_fraction=1.0
+        )
+        first_value = torch.randn(3, 4)
+        first_target = torch.randn(3, 2)
+        next_value = torch.randn(4, 4)
+        next_target = torch.randn(4, 2)
+
+        uninterrupted_optimizer.zero_grad()
+        torch.nn.functional.mse_loss(
+            uninterrupted(first_value), first_target
+        ).backward()
+        uninterrupted_optimizer.finish_grad_sync()
+        assert uninterrupted_optimizer.step()[0]
+
+        expected_cpu_state = copy.deepcopy(
+            uninterrupted_optimizer._inner_optimizer.cpu_group.state_dict()
+        )
+        checkpoint_dcp.save_training_checkpoint(
+            uninterrupted,
+            uninterrupted_optimizer,
+            31,
+            str(tmp_path / "full-offload-checkpoint"),
+            ps=ps,
+            use_dcp=True,
+            save_rng=False,
+        )
+
+        uninterrupted_optimizer.zero_grad()
+        torch.nn.functional.mse_loss(
+            uninterrupted(next_value), next_target
+        ).backward()
+        uninterrupted_optimizer.finish_grad_sync()
+        uninterrupted_result = uninterrupted_optimizer.step()
+        expected_params = {
+            name: param.detach().clone()
+            for name, param in uninterrupted.stream_full_parameters()
+        }
+
+        _model, resumed, resumed_optimizer, resumed_ps, _opt = _dcp_test_stack(
+            1, 0, offload_fraction=1.0
+        )
+        step = checkpoint_dcp.load_training_checkpoint(
+            resumed,
+            resumed_optimizer,
+            str(tmp_path / "full-offload-checkpoint"),
+            ps=resumed_ps,
+            use_dcp=True,
+            load_rng=False,
+        )
+        assert step == 31
+        actual_cpu_state = resumed_optimizer._inner_optimizer.cpu_group.state_dict()
+        for key in ("master_params", "exp_avgs", "exp_avg_sqs"):
+            for actual, expected in zip(
+                actual_cpu_state["optimizer"][key],
+                expected_cpu_state["optimizer"][key],
+                strict=True,
+            ):
+                assert torch.equal(actual, expected), key
+        assert actual_cpu_state["optimizer"]["steps"] == expected_cpu_state[
+            "optimizer"
+        ]["steps"]
+
+        resumed_optimizer.zero_grad()
+        torch.nn.functional.mse_loss(resumed(next_value), next_target).backward()
+        resumed_optimizer.finish_grad_sync()
+        resumed_result = resumed_optimizer.step()
+        actual_params = dict(resumed.stream_full_parameters())
+
+        assert resumed_result == uninterrupted_result
+        assert actual_params.keys() == expected_params.keys()
+        for name, tensor in actual_params.items():
+            assert torch.equal(tensor, expected_params[name]), name
+    finally:
+        dist.destroy_process_group()
 
 
 def test_mfsdp_dcp_model_only_round_trip_does_not_require_optimizer(tmp_path):
