@@ -1035,7 +1035,7 @@ def test_mfsdp_accepts_raw_override_only_offload_fraction():
 
 def test_mfsdp_offload_split_uses_dp_invariant_logical_parameter_sizes():
     def rank_params(local_sizes):
-        params = [nn.Parameter(torch.empty(size)) for size in local_sizes]
+        params = [torch.nn.Parameter(torch.empty(size)) for size in local_sizes]
         params[0]._mfsdp_global_numel = 8
         params[1]._mfsdp_global_numel = 4
         return params
