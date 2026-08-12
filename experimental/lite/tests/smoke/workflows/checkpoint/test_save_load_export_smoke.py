@@ -618,6 +618,34 @@ def test_qwen3_5_mfsdp_save_load_roundtrip(tmp_path):
     _assert_params_bitwise_equal(saved, loaded)
 
 
+def test_qwen3_5_mfsdp_full_offload_dcp_continues_next_step(tmp_path):
+    """Full-offload DCP restores CPU master/moments for the next update."""
+    if dist.get_world_size() != 8:
+        pytest.skip("M-FSDP full-offload DCP smoke requires exactly 8 GPUs.")
+
+    set_deterministic(2026)
+    uninterrupted, cfg, _protocol = _build_handle(
+        "qwen3_5", "mfsdp", seed=4242, offload_fraction=1.0
+    )
+    _train_step(uninterrupted, "mfsdp", cfg)
+
+    ckpt_dir = _shared_tmp_path(tmp_path, "mfsdp_full_offload_ckpt")
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime.save_checkpoint(uninterrupted, ckpt_dir, step=1)
+
+    resumed, _cfg2, _proto2 = _build_handle(
+        "qwen3_5", "mfsdp", seed=9999, offload_fraction=1.0
+    )
+    assert runtime.load_checkpoint(resumed, ckpt_dir) == 1
+    _assert_params_bitwise_equal(uninterrupted, resumed)
+
+    set_deterministic(3031)
+    _train_step(uninterrupted, "mfsdp", cfg)
+    set_deterministic(3031)
+    _train_step(resumed, "mfsdp", cfg)
+    _assert_params_bitwise_equal(uninterrupted, resumed)
+
+
 @pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 @pytest.mark.parametrize("model_name", list(MODELS))
 def test_export_hf_bf16_reload(model_name, tmp_path):

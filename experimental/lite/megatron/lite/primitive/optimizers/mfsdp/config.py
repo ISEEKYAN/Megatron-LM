@@ -299,7 +299,7 @@ def validate_mfsdp_topology(parallel_cfg) -> None:
     vpp = int(getattr(parallel_cfg, "vpp", 1) or 1)
 
     if vpp > 1 and pp <= 1:
-        raise ValueError("optimizer_impl='megatron_fsdp' requires pp>1 when vpp>1.")
+        raise ValueError("optimizer='mfsdp' requires pp>1 when vpp>1.")
 
 
 def validate_optimizer_name(
@@ -307,7 +307,7 @@ def validate_optimizer_name(
 ) -> None:
     if optimizer_name not in _SUPPORTED_OPTIMIZERS and not has_optimizer_factory:
         raise ValueError(
-            "optimizer_impl='megatron_fsdp' supports only adam/sgd, "
+            "optimizer='mfsdp' supports only adam/sgd, "
             f"got {optimizer_name!r}; provide optimizer_factory for an optional "
             "algorithm such as Muon."
         )
