@@ -166,6 +166,7 @@ class CpuAdamGroup:
         self._gpu_params = [
             param for group in gpu_param_groups for param in group["params"]
         ]
+        self._gpu_param_ids = {id(param) for param in self._gpu_params}
         total_numel = sum(param.numel() for param in self._gpu_params)
         use_cuda = bool(
             torch.cuda.is_available()
@@ -238,6 +239,54 @@ class CpuAdamGroup:
 
     def step(self) -> None:
         self._optimizer.step()
+
+    def owns_param(self, param: nn.Parameter) -> bool:
+        """Return whether this CPU group owns ``param``'s AdamW state."""
+        return id(param) in self._gpu_param_ids
+
+    def checkpoint_state(self, param: nn.Parameter) -> dict[str, Any]:
+        """Expose one shard's canonical FP32 state to the DCP adapter."""
+        if not self.owns_param(param):
+            raise KeyError("Parameter is not owned by this M-FSDP CPU Adam group.")
+        return self._optimizer.state[param]
+
+    def checkpoint_metadata(self) -> dict[str, Any]:
+        """Return non-tensor optimizer metadata independent of DP sharding."""
+        self._ring.drain()
+        return {
+            "format_version": self._FORMAT_VERSION,
+            "step_count": int(self._optimizer.step_count),
+            "param_groups": [
+                {
+                    key: value
+                    for key, value in group.items()
+                    if key != "params"
+                }
+                for group in self._optimizer.param_groups
+            ],
+            "betas": tuple(float(value) for value in self._optimizer.betas),
+            "eps": float(self._optimizer.eps),
+        }
+
+    def load_checkpoint_metadata(self, metadata: dict[str, Any]) -> None:
+        """Restore DCP metadata while preserving live parameter identities."""
+        self._ring.drain()
+        saved_groups = metadata.get("param_groups")
+        if not isinstance(saved_groups, list) or len(saved_groups) != len(
+            self._optimizer.param_groups
+        ):
+            raise ValueError("Invalid M-FSDP CPU AdamW parameter-group metadata.")
+        for group, saved in zip(
+            self._optimizer.param_groups, saved_groups, strict=True
+        ):
+            params = group["params"]
+            group.clear()
+            group.update(saved)
+            group["params"] = params
+        self._optimizer.step_count = int(metadata.get("step_count", 0))
+        loaded_betas = metadata.get("betas", self._optimizer.betas)
+        self._optimizer.betas = tuple(float(value) for value in loaded_betas)
+        self._optimizer.eps = float(metadata.get("eps", self._optimizer.eps))
 
     def release_transfer_state(self) -> None:
         self._ring.release_runtime()

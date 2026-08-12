@@ -345,7 +345,7 @@ def _mfsdp_bucket_mesh(bucket) -> DeviceMesh:
     if not dist.is_initialized():
         raise RuntimeError("M-FSDP DCP requires torch.distributed initialization.")
     group = bucket.process_group or dist.group.WORLD
-    return DeviceMesh.from_group(group, bucket.main_param_buffer.device.type)
+    return DeviceMesh.from_group(group, bucket.device.type)
 
 
 def _mfsdp_standard_shard_range(logical_numel: int, world_size: int, rank: int):
@@ -361,10 +361,17 @@ def _mfsdp_gather_padded_bucket(bucket, local: torch.Tensor) -> torch.Tensor:
             f"M-FSDP bucket {bucket.bucket_id} local tensor has {local.numel()} "
             f"elements, expected {bucket.local_numel}."
         )
+    communication_local = local.detach().to(bucket.device)
     if bucket.world_size == 1:
-        return local.detach().clone()
-    full = torch.empty(bucket.full_numel, dtype=local.dtype, device=local.device)
-    dist.all_gather_into_tensor(full, local.contiguous(), group=bucket.process_group)
+        return communication_local.clone()
+    full = torch.empty(
+        bucket.full_numel,
+        dtype=communication_local.dtype,
+        device=bucket.device,
+    )
+    dist.all_gather_into_tensor(
+        full, communication_local.contiguous(), group=bucket.process_group
+    )
     return full
 
 
@@ -385,6 +392,7 @@ def _mfsdp_logical_dtensor(bucket, local_padded: torch.Tensor) -> DTensor:
 
 
 def _mfsdp_replicated_dtensor(bucket, tensor: torch.Tensor) -> DTensor:
+    tensor = tensor.to(bucket.device)
     return DTensor.from_local(
         tensor,
         _mfsdp_bucket_mesh(bucket),
@@ -395,16 +403,24 @@ def _mfsdp_replicated_dtensor(bucket, tensor: torch.Tensor) -> DTensor:
     )
 
 
-def _mfsdp_pack_optimizer_tensor(bucket, torch_optimizer, state_name: str):
+def _mfsdp_param_optimizer_state(inner, param) -> dict[str, Any]:
+    cpu_group = getattr(inner, "cpu_group", None)
+    if cpu_group is not None and cpu_group.owns_param(param):
+        return cpu_group.checkpoint_state(param)
+    torch_optimizer = getattr(inner, "optimizer", inner)
+    return torch_optimizer.state.get(param, {})
+
+
+def _mfsdp_pack_optimizer_tensor(bucket, inner, state_name: str):
     packed = torch.zeros(
         bucket.local_numel,
-        dtype=bucket.main_param_buffer.dtype,
-        device=bucket.main_param_buffer.device,
+        dtype=torch.float32,
+        device=bucket.device,
     )
     for spec in bucket.specs:
         if spec.shard_param is None or not spec.full_param.requires_grad:
             continue
-        value = torch_optimizer.state.get(spec.shard_param, {}).get(state_name)
+        value = _mfsdp_param_optimizer_state(inner, spec.shard_param).get(state_name)
         if value is None:
             continue
         if not torch.is_tensor(value) or value.numel() != spec.shard_numel:
@@ -418,18 +434,18 @@ def _mfsdp_pack_optimizer_tensor(bucket, torch_optimizer, state_name: str):
     return packed
 
 
-def _mfsdp_optimizer_metadata(bucket, torch_optimizer):
+def _mfsdp_optimizer_metadata(bucket, inner):
     initialized = torch.zeros(
-        len(bucket.specs), dtype=torch.uint8, device=bucket.main_param_buffer.device
+        len(bucket.specs), dtype=torch.uint8, device=bucket.device
     )
     step_present = torch.zeros_like(initialized)
     steps = torch.zeros(
-        len(bucket.specs), dtype=torch.float64, device=bucket.main_param_buffer.device
+        len(bucket.specs), dtype=torch.float64, device=bucket.device
     )
     for index, spec in enumerate(bucket.specs):
         if spec.shard_param is None or not spec.full_param.requires_grad:
             continue
-        state = torch_optimizer.state.get(spec.shard_param, {})
+        state = _mfsdp_param_optimizer_state(inner, spec.shard_param)
         if not state:
             continue
         initialized[index] = 1
@@ -495,6 +511,32 @@ def _mfsdp_restore_optimizer_param_groups(
         group["params"] = params
 
 
+def _mfsdp_optimizer_group_state(inner) -> list[dict[str, Any]] | dict[str, Any]:
+    gpu = _mfsdp_optimizer_param_groups(inner.optimizer)
+    if inner.cpu_group is None:
+        return gpu
+    return {"gpu": gpu, "cpu": inner.cpu_group.checkpoint_metadata()}
+
+
+def _mfsdp_restore_optimizer_group_state(
+    inner, saved: list[dict[str, Any]] | dict[str, Any]
+) -> None:
+    if inner.cpu_group is None:
+        if not isinstance(saved, list):
+            raise RuntimeError(
+                "M-FSDP checkpoint contains CPU optimizer metadata but the "
+                "target optimizer has no CPU-offloaded group."
+            )
+        _mfsdp_restore_optimizer_param_groups(inner.optimizer, saved)
+        return
+    if not isinstance(saved, dict) or "gpu" not in saved or "cpu" not in saved:
+        raise RuntimeError(
+            "M-FSDP CPU-offloaded DCP requires both GPU and CPU optimizer metadata."
+        )
+    _mfsdp_restore_optimizer_param_groups(inner.optimizer, saved["gpu"])
+    inner.cpu_group.load_checkpoint_metadata(saved["cpu"])
+
+
 def _mfsdp_domain_key(bucket, ps) -> str:
     if ps is None:
         if dist.get_world_size() != bucket.world_size:
@@ -524,9 +566,9 @@ def _mfsdp_checkpoint_template(
     include_model: bool,
     include_optimizer: bool,
 ):
-    torch_optimizer = None
+    inner = None
     if include_optimizer:
-        _inner, torch_optimizer = _mfsdp_optimizer_parts(optimizer)
+        inner, _torch_optimizer = _mfsdp_optimizer_parts(optimizer)
     domains: dict[str, dict[str, dict[str, Any]]] = {}
     for chunk_index, chunk in enumerate(chunks):
         for bucket in chunk.param_and_grad_buffer.buckets:
@@ -543,9 +585,9 @@ def _mfsdp_checkpoint_template(
                     bucket, bucket.main_param_buffer
                 )
             if include_optimizer and bucket.requires_grad:
-                assert torch_optimizer is not None
+                assert inner is not None
                 initialized, step_present, steps = _mfsdp_optimizer_metadata(
-                    bucket, torch_optimizer
+                    bucket, inner
                 )
                 bucket_state["state_initialized"] = _mfsdp_replicated_dtensor(
                     bucket, initialized
@@ -556,12 +598,19 @@ def _mfsdp_checkpoint_template(
                 bucket_state["step"] = _mfsdp_replicated_dtensor(bucket, steps)
                 bucket_state["exp_avg"] = _mfsdp_logical_dtensor(
                     bucket,
-                    _mfsdp_pack_optimizer_tensor(bucket, torch_optimizer, "exp_avg"),
+                    _mfsdp_pack_optimizer_tensor(bucket, inner, "exp_avg"),
                 )
                 bucket_state["exp_avg_sq"] = _mfsdp_logical_dtensor(
                     bucket,
-                    _mfsdp_pack_optimizer_tensor(bucket, torch_optimizer, "exp_avg_sq"),
+                    _mfsdp_pack_optimizer_tensor(bucket, inner, "exp_avg_sq"),
                 )
+                if inner.cpu_group is not None:
+                    bucket_state["master_param"] = _mfsdp_logical_dtensor(
+                        bucket,
+                        _mfsdp_pack_optimizer_tensor(
+                            bucket, inner, "master_param"
+                        ),
+                    )
             domain = domains.setdefault(_mfsdp_domain_key(bucket, ps), {})
             chunk_state = domain.setdefault(str(chunk_index), {})
             chunk_state[str(bucket.bucket_id)] = bucket_state
@@ -590,10 +639,8 @@ def _save_mfsdp_checkpoint(
             include_optimizer=save_optimizer,
         )
     if save_optimizer:
-        _inner, torch_optimizer = _mfsdp_optimizer_parts(optimizer)
-        state_dict["optimizer_param_groups"] = _mfsdp_optimizer_param_groups(
-            torch_optimizer
-        )
+        inner, _torch_optimizer = _mfsdp_optimizer_parts(optimizer)
+        state_dict["optimizer_param_groups"] = _mfsdp_optimizer_group_state(inner)
     dcp.save(state_dict, checkpoint_id=path)
 
 
@@ -602,40 +649,73 @@ def _mfsdp_copy_logical_to_bucket(bucket, logical: torch.Tensor, target: torch.T
     local_start = bucket.rank * bucket.local_numel
     local_end = min(local_start + bucket.local_numel, bucket.logical_numel)
     if local_end > local_start:
+        source = logical.narrow(0, local_start, local_end - local_start)
         target.narrow(0, 0, local_end - local_start).copy_(
-            logical.narrow(0, local_start, local_end - local_start)
+            source.to(device=target.device, dtype=target.dtype)
         )
 
 
 def _mfsdp_unpack_optimizer_tensor(
     bucket,
-    torch_optimizer,
+    inner,
     logical: torch.Tensor,
     state_name: str,
     initialized: torch.Tensor,
     step_present: torch.Tensor,
     steps: torch.Tensor,
 ) -> None:
-    local = torch.zeros_like(bucket.main_param_buffer)
+    local = torch.zeros(
+        bucket.local_numel,
+        dtype=logical.dtype,
+        device=logical.device,
+    )
     _mfsdp_copy_logical_to_bucket(bucket, logical, local)
     for index, spec in enumerate(bucket.specs):
         if spec.shard_param is None or not spec.full_param.requires_grad:
             continue
-        if not bool(initialized[index].item()):
-            torch_optimizer.state.pop(spec.shard_param, None)
+        if state_name == "master_param" and (
+            inner.cpu_group is None
+            or not inner.cpu_group.owns_param(spec.shard_param)
+        ):
             continue
-        state = torch_optimizer.state.setdefault(spec.shard_param, {})
-        state[state_name] = (
+        if not bool(initialized[index].item()):
+            if inner.cpu_group is None or not inner.cpu_group.owns_param(
+                spec.shard_param
+            ):
+                inner.optimizer.state.pop(spec.shard_param, None)
+            continue
+        state = _mfsdp_param_optimizer_state(inner, spec.shard_param)
+        value = (
             local.narrow(0, spec.local_offset, spec.shard_numel)
             .view_as(spec.shard_param)
-            .clone()
         )
+        current = state.get(state_name)
+        if torch.is_tensor(current):
+            current.copy_(value.to(device=current.device, dtype=current.dtype))
+        else:
+            state[state_name] = value.to(spec.shard_param.device).clone()
+        if state_name == "master_param":
+            master = state[state_name]
+            with torch.no_grad():
+                spec.shard_param.copy_(
+                    master.to(
+                        device=spec.shard_param.device,
+                        dtype=spec.shard_param.dtype,
+                    )
+                )
         if bool(step_present[index].item()):
-            state["step"] = torch.tensor(
-                float(steps[index].item()),
-                dtype=torch.float32,
-                device=spec.shard_param.device,
-            )
+            step_value = float(steps[index].item())
+            current_step = state.get("step")
+            if torch.is_tensor(current_step):
+                current_step.fill_(step_value)
+            elif current_step is not None:
+                state["step"] = int(step_value)
+            else:
+                state["step"] = torch.tensor(
+                    step_value,
+                    dtype=torch.float32,
+                    device=spec.shard_param.device,
+                )
         else:
             state.pop("step", None)
 
@@ -659,17 +739,15 @@ def _load_mfsdp_checkpoint(
             include_optimizer=load_optimizer,
         ),
     }
-    torch_optimizer = None
+    inner = None
     if load_optimizer:
-        _inner, torch_optimizer = _mfsdp_optimizer_parts(optimizer)
-        state_dict["optimizer_param_groups"] = _mfsdp_optimizer_param_groups(
-            torch_optimizer
-        )
+        inner, _torch_optimizer = _mfsdp_optimizer_parts(optimizer)
+        state_dict["optimizer_param_groups"] = _mfsdp_optimizer_group_state(inner)
     dcp.load(state_dict, checkpoint_id=path)
     if load_optimizer:
-        assert torch_optimizer is not None
-        _mfsdp_restore_optimizer_param_groups(
-            torch_optimizer, state_dict["optimizer_param_groups"]
+        assert inner is not None
+        _mfsdp_restore_optimizer_group_state(
+            inner, state_dict["optimizer_param_groups"]
         )
     loaded_domains = state_dict["mfsdp"]["domains"]
     for chunk_index, chunk in enumerate(chunks):
@@ -692,7 +770,7 @@ def _load_mfsdp_checkpoint(
                 bucket.copy_main_weights_to_model_weights()
                 bucket.invalidate_full_parameters()
             if load_optimizer and bucket.requires_grad:
-                assert torch_optimizer is not None
+                assert inner is not None
                 initialized = loaded_bucket["state_initialized"].to_local()
                 step_present = loaded_bucket["step_present"].to_local()
                 steps = loaded_bucket["step"].to_local()
@@ -700,9 +778,20 @@ def _load_mfsdp_checkpoint(
                     logical_state = loaded_bucket[state_name].full_tensor()
                     _mfsdp_unpack_optimizer_tensor(
                         bucket,
-                        torch_optimizer,
+                        inner,
                         logical_state,
                         state_name,
+                        initialized,
+                        step_present,
+                        steps,
+                    )
+                if "master_param" in loaded_bucket:
+                    logical_master = loaded_bucket["master_param"].full_tensor()
+                    _mfsdp_unpack_optimizer_tensor(
+                        bucket,
+                        inner,
+                        logical_master,
+                        "master_param",
                         initialized,
                         step_present,
                         steps,
