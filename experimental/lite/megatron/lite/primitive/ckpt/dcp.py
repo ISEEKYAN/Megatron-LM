@@ -403,11 +403,15 @@ def _mfsdp_replicated_dtensor(bucket, tensor: torch.Tensor) -> DTensor:
     )
 
 
-def _mfsdp_param_optimizer_state(inner, param) -> dict[str, Any]:
+def _mfsdp_param_optimizer_state(
+    inner, param, *, create: bool = False
+) -> dict[str, Any]:
     cpu_group = getattr(inner, "cpu_group", None)
     if cpu_group is not None and cpu_group.owns_param(param):
         return cpu_group.checkpoint_state(param)
     torch_optimizer = getattr(inner, "optimizer", inner)
+    if create:
+        return torch_optimizer.state.setdefault(param, {})
     return torch_optimizer.state.get(param, {})
 
 
@@ -684,7 +688,7 @@ def _mfsdp_unpack_optimizer_tensor(
             ):
                 inner.optimizer.state.pop(spec.shard_param, None)
             continue
-        state = _mfsdp_param_optimizer_state(inner, spec.shard_param)
+        state = _mfsdp_param_optimizer_state(inner, spec.shard_param, create=True)
         value = (
             local.narrow(0, spec.local_offset, spec.shard_numel)
             .view_as(spec.shard_param)
