@@ -87,6 +87,8 @@ def test_runtime_source_does_not_branch_on_mfsdp():
     source = open(runtime.__file__, encoding="utf-8").read()
     assert '== "mfsdp"' not in source
     assert "M-FSDP" not in source
+    assert "offload_for_rollout" not in source
+    assert "load_from_rollout" not in source
 
 
 def test_runtime_config_defaults_to_mlite_backend():
@@ -278,7 +280,7 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
     monkeypatch.setattr(
-        "megatron.lite.runtime.backends.mlite.runtime.gc.collect",
+        "megatron.lite.primitive.optimizers.runtime_adapter.gc.collect",
         lambda: events.append("collect"),
     )
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty-cache"))
@@ -303,6 +305,66 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
         "load-model",
         "load-optimizer",
     ]
+
+
+def test_training_transfer_prefers_atomic_mfsdp_rollout_transition(monkeypatch):
+    events = []
+
+    class Optimizer:
+        def offload_for_rollout(self):
+            events.append("mfsdp-offload")
+
+        def load_from_rollout(self):
+            events.append("mfsdp-load")
+
+    from megatron.lite.primitive.optimizers.mfsdp.backend import MegatronFSDPBackend
+
+    import megatron.lite.runtime.megatron_utils as megatron_utils
+
+    monkeypatch.setattr(
+        megatron_utils,
+        "offload_model_to_cpu",
+        lambda chunks: pytest.fail("generic model offload must not run"),
+    )
+    monkeypatch.setattr(
+        megatron_utils,
+        "load_model_to_gpu",
+        lambda chunks, load_grad: pytest.fail("generic model load must not run"),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    handle = ModelHandle(
+        model=nn.Linear(2, 2),
+        optimizer=Optimizer(),
+        _extras={
+            "model_chunks": [],
+            "optimizer_runtime_backend": MegatronFSDPBackend(),
+        },
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    runtime.to(handle, "cpu", model=True, optimizer=False, grad=True)
+    runtime.to(handle, "cuda", model=True, optimizer=False, grad=True)
+
+    assert events == ["mfsdp-offload", "mfsdp-load"]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_mfsdp_training_transfer_without_atomic_hook_fails_loud(device, monkeypatch):
+    from megatron.lite.primitive.optimizers.mfsdp.backend import MegatronFSDPBackend
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    handle = ModelHandle(
+        model=nn.Linear(2, 2),
+        optimizer=None,
+        _extras={
+            "model_chunks": [],
+            "optimizer_runtime_backend": MegatronFSDPBackend(),
+        },
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    with pytest.raises(RuntimeError, match="requires an optimizer"):
+        runtime.to(handle, device, model=True, optimizer=False, grad=True)
 
 
 def test_export_transfer_does_not_move_optimizer_or_release_scratch(monkeypatch):

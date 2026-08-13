@@ -149,7 +149,7 @@ class MCoreBufferAllocators:
     ) -> BufferLease:
         allocator = (
             self.weight_allocator
-            if key and key[0] == "param"
+            if key and key[0] in {"param", "param_local"}
             else self.grad_allocator
         )
         return allocator.allocate(
@@ -257,9 +257,15 @@ class ParamBucket:
         if any(spec.full_param.requires_grad != self.requires_grad for spec in specs):
             raise ValueError("M-FSDP bucket mixes trainable and frozen parameters.")
         self.device = specs[0].full_param.device
+        self._training_compute_device = self.device
+        self._training_param_offload = bool(
+            config.full_optimizer_offload and self.device.type == "cuda"
+        )
         compute_dtype = specs[0].full_param.dtype
         main_params_dtype = (
-            compute_dtype if not self.requires_grad else config.main_params_dtype
+            compute_dtype
+            if not self.requires_grad or config.full_optimizer_offload
+            else config.main_params_dtype
         )
         self.policy = MixedPrecisionPolicy(
             compute_dtype=compute_dtype,
@@ -287,10 +293,14 @@ class ParamBucket:
             )
             spec.param_offset = min(spec.numel, max(0, intersection_begin - spec_begin))
 
+        param_storage_device = (
+            torch.device("cpu") if self._training_param_offload else self.device
+        )
         self.main_param_buffer = torch.zeros(
             self.local_numel,
             dtype=self.policy.main_params_dtype,
-            device=self.device,
+            device=param_storage_device,
+            pin_memory=self._training_param_offload,
         )
         # Match MCore's two persistent sharded weight buffers: optimizer state
         # updates the high-precision main shard, while parameter all-gathers
@@ -327,6 +337,7 @@ class ParamBucket:
             0, dtype=self.policy.main_grads_dtype, device=self.device
         )
         self._full_lease: BufferLease | None = None
+        self._local_compute_lease: BufferLease | None = None
         self._full_main_grad_lease: BufferLease | None = None
         self._grad_lease: BufferLease | None = None
         self._param_gather_work: Any | None = None
@@ -388,6 +399,12 @@ class ParamBucket:
                 )
                 _copy_parameter_metadata(spec.full_param, shard_param)
                 shard_param._mfsdp_original_ndim = spec.full_param.ndim
+                # Optimizer-offload placement must be identical on every DP
+                # rank and remain stable when a checkpoint is resharded.  A
+                # local shard can be smaller (or empty) on boundary ranks, so
+                # retain the logical parameter size for placement accounting.
+                shard_param._mfsdp_global_numel = spec.numel
+                shard_param._mfsdp_compute_device = self._training_compute_device
                 spec.shard_param = shard_param
                 # TE returns a dummy ``.grad`` when its wgrad GEMM writes the
                 # real gradient directly into ``main_grad``.
@@ -516,6 +533,23 @@ class ParamBucket:
                 ),
             )
             self.full_buffer = self._full_lease.tensor
+        if self._training_param_offload and self._local_compute_lease is None:
+            self._local_compute_lease = self.allocator.allocate(
+                self.local_numel,
+                dtype=self.policy.compute_dtype,
+                device=self.device,
+                group=self.gather_group,
+                key=("param_local", self.bucket_id),
+                pool_key=(
+                    "param_local",
+                    id(self.gather_group),
+                    self.allocator_layout_key,
+                ),
+            )
+            self.local_compute_buffer = self._local_compute_lease.tensor
+            self.local_compute_buffer.copy_(
+                self.model_param_buffer, non_blocking=self.model_param_buffer.is_pinned()
+            )
         return self.full_buffer, self.local_compute_buffer
 
     def mark_param_gather_launched(
@@ -582,8 +616,9 @@ class ParamBucket:
             self._full_ready = False
 
     def _release_local_compute_buffer(self) -> None:
-        # MCore retains the compute-precision model-weight shard for the whole
-        # training lifetime.  Only the unsharded all-gather output is scratch.
+        if self._local_compute_lease is not None:
+            self._local_compute_lease.release()
+            self._local_compute_lease = None
         self.local_compute_buffer = self.model_param_buffer
 
     def _release_local_grad_comm_buffer(self) -> None:
@@ -597,6 +632,7 @@ class ParamBucket:
     def move_model_state(self, device: torch.device, *, load_grad: bool) -> None:
         """Move persistent sharded storage without breaking optimizer aliases."""
         device = torch.device(device)
+        persistent_full = None if self.is_fsdp_unit else self.full_buffer
         self.release_full_parameters()
         self.discard_full_parameter_views()
         if self._grad_reduce_launched:
@@ -614,14 +650,35 @@ class ParamBucket:
             for spec in self.specs
         }
         compute_shares_main = self.model_param_buffer is self.main_param_buffer
-        self.main_param_buffer = self.main_param_buffer.to(device)
-        self.model_param_buffer = (
-            self.main_param_buffer
-            if compute_shares_main
-            else self.model_param_buffer.to(device)
-        )
+        if not self._training_param_offload:
+            self.main_param_buffer = self.main_param_buffer.to(device)
+            self.model_param_buffer = (
+                self.main_param_buffer
+                if compute_shares_main
+                else self.model_param_buffer.to(device)
+            )
+        elif self.main_param_buffer.device.type != "cpu":
+            raise RuntimeError("M-FSDP training-offload parameter shard left CPU.")
         grad_comm_shares_main = self.local_grad_comm_buffer is self.main_grad_buffer
-        self.main_grad_buffer = self.main_grad_buffer.to(device)
+        grad_numel = self.local_numel if self.requires_grad else 0
+        if load_grad:
+            if self.main_grad_buffer.numel() == grad_numel:
+                self.main_grad_buffer = self.main_grad_buffer.to(device)
+            else:
+                # Rollout offload deliberately drops gradients.  Re-entering
+                # training creates a fresh zeroed shard instead of retaining a
+                # useless 4 B/parameter CPU copy.
+                self.main_grad_buffer = torch.zeros(
+                    grad_numel,
+                    dtype=self.policy.main_grads_dtype,
+                    device=device,
+                )
+        else:
+            self.main_grad_buffer = torch.empty(
+                0,
+                dtype=self.policy.main_grads_dtype,
+                device=device,
+            )
         self.grad_shard_buffer = self.main_grad_buffer
         self.local_compute_buffer = self.model_param_buffer
         self.local_grad_comm_buffer = (
@@ -630,8 +687,13 @@ class ParamBucket:
             else self.local_grad_comm_buffer.to(device)
         )
         self.device = device
-        self.full_buffer = torch.empty(
-            0, dtype=self.policy.compute_dtype, device=device
+        for spec in self.specs:
+            if spec.shard_param is not None:
+                spec.shard_param._mfsdp_compute_device = device
+        self.full_buffer = (
+            torch.empty(0, dtype=self.policy.compute_dtype, device=device)
+            if persistent_full is None
+            else persistent_full.to(device)
         )
         self.full_main_grad_buffer = torch.empty(
             0, dtype=self.policy.main_grads_dtype, device=device
@@ -647,7 +709,10 @@ class ParamBucket:
                     main_grad = self.main_grad_buffer.narrow(
                         0, spec.local_offset, spec.shard_numel
                     ).view_as(spec.shard_param)
-                    if spec.shard_param.dtype == main_grad.dtype:
+                    if (
+                        spec.shard_param.dtype == main_grad.dtype
+                        and not self.config.use_decoupled_grad
+                    ):
                         spec.shard_param.grad = main_grad
                         if hasattr(spec.shard_param, "main_grad"):
                             delattr(spec.shard_param, "main_grad")
@@ -657,7 +722,13 @@ class ParamBucket:
                 else:
                     spec.shard_param.grad = None
                     spec.shard_param.main_grad = None
-                spec.full_param.data = self.full_buffer
+                spec.full_param.data = (
+                    self.full_buffer
+                    if self.is_fsdp_unit
+                    else self.full_buffer.narrow(
+                        0, spec.full_offset, spec.numel
+                    ).view(spec.shape)
+                )
 
     def release_scratch_keep_weights(self) -> None:
         """Drop the all-gather scratch while leaving the sharded weights resident.
@@ -784,7 +855,10 @@ class ParamBucket:
                 spec.shard_param.grad = None
                 spec.shard_param.main_grad = None
                 continue
-            if spec.shard_param.dtype == main_grad.dtype:
+            if (
+                spec.shard_param.dtype == main_grad.dtype
+                and not self.config.use_decoupled_grad
+            ):
                 spec.shard_param.grad = main_grad
                 if hasattr(spec.shard_param, "main_grad"):
                     delattr(spec.shard_param, "main_grad")

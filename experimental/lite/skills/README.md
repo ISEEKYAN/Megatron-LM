@@ -76,7 +76,9 @@ validation commands instead of copying long design background.
 - `primitive.parallel.pp`
 - `primitive.parallel.cp`
 - `primitive.optimizer.fsdp`
+- `primitive.optimizer.mfsdp`
 - `primitive.optimizer.distopt`
+- `primitive.checkpoint.mfsdp`
 - `primitive.module.moe`
 - `primitive.module.gqa`
 - `primitive.module.thd`

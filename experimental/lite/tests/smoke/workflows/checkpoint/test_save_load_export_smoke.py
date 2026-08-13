@@ -413,8 +413,12 @@ def _build_handle(
             "protocol": protocol,
         }
     )
+    # Match MegatronLiteRuntime.build_model(): the non-pipeline runtime calls
+    # forward_step with the sole chunk, while pipeline schedules receive the
+    # complete chunk list through ``model_chunks``.
+    model = chunks[0] if len(chunks) == 1 else chunks
     handle = ModelHandle(
-        model=chunks,
+        model=model,
         optimizer=optimizer,
         parallel_state=bundle.parallel_state,
         config=SimpleNamespace(parallel=parallel),
@@ -616,6 +620,34 @@ def test_qwen3_5_mfsdp_save_load_roundtrip(tmp_path):
     loaded, _cfg2, _proto2 = _build_handle("qwen3_5", "mfsdp", seed=9999)
     assert runtime.load_checkpoint(loaded, ckpt_dir) == 1
     _assert_params_bitwise_equal(saved, loaded)
+
+
+def test_qwen3_5_mfsdp_full_offload_dcp_continues_next_step(tmp_path):
+    """Full-offload DCP restores CPU master/moments for the next update."""
+    if dist.get_world_size() != 8:
+        pytest.skip("M-FSDP full-offload DCP smoke requires exactly 8 GPUs.")
+
+    set_deterministic(2026)
+    uninterrupted, cfg, _protocol = _build_handle(
+        "qwen3_5", "mfsdp", seed=4242, offload_fraction=1.0
+    )
+    _train_step(uninterrupted, "mfsdp", cfg)
+
+    ckpt_dir = _shared_tmp_path(tmp_path, "mfsdp_full_offload_ckpt")
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime.save_checkpoint(uninterrupted, ckpt_dir, step=1)
+
+    resumed, _cfg2, _proto2 = _build_handle(
+        "qwen3_5", "mfsdp", seed=9999, offload_fraction=1.0
+    )
+    assert runtime.load_checkpoint(resumed, ckpt_dir) == 1
+    _assert_params_bitwise_equal(uninterrupted, resumed)
+
+    set_deterministic(3031)
+    _train_step(uninterrupted, "mfsdp", cfg)
+    set_deterministic(3031)
+    _train_step(resumed, "mfsdp", cfg)
+    _assert_params_bitwise_equal(uninterrupted, resumed)
 
 
 @pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")

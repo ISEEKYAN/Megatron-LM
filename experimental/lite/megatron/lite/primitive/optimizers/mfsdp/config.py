@@ -50,6 +50,10 @@ class MFSDPConfig:
     use_decoupled_grad: bool = False
     gradient_accumulation_fusion: bool = False
     all_gather_in_start_param_sync: bool = True
+    # Full training-time optimizer offload keeps the authoritative FP32
+    # master and the compute-dtype local shard on CPU. Only the current unit's
+    # bounded all-gather input is staged on device during forward/backward.
+    full_optimizer_offload: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,7 +299,7 @@ def validate_mfsdp_topology(parallel_cfg) -> None:
     vpp = int(getattr(parallel_cfg, "vpp", 1) or 1)
 
     if vpp > 1 and pp <= 1:
-        raise ValueError("optimizer_impl='megatron_fsdp' requires pp>1 when vpp>1.")
+        raise ValueError("optimizer='mfsdp' requires pp>1 when vpp>1.")
 
 
 def validate_optimizer_name(
@@ -303,7 +307,7 @@ def validate_optimizer_name(
 ) -> None:
     if optimizer_name not in _SUPPORTED_OPTIMIZERS and not has_optimizer_factory:
         raise ValueError(
-            "optimizer_impl='megatron_fsdp' supports only adam/sgd, "
+            "optimizer='mfsdp' supports only adam/sgd, "
             f"got {optimizer_name!r}; provide optimizer_factory for an optional "
             "algorithm such as Muon."
         )

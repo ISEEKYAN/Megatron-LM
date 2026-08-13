@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import gc
 import os
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import fields as dc_fields
@@ -263,12 +262,11 @@ class MegatronLiteRuntime(RuntimeBase):
         if bundle.forward_step is None:
             raise ValueError("Megatron Lite model bundles must provide a typed forward_step.")
 
-        optimizer_backend_name = bundle.extras.get("optimizer_backend")
-        optimizer_runtime_backend = None
-        if optimizer_backend_name not in (None, "none"):
-            from megatron.lite.primitive.optimizers import get_optimizer_backend
+        from megatron.lite.primitive.optimizers import get_optimizer_backend
 
-            optimizer_runtime_backend = get_optimizer_backend(optimizer_backend_name)
+        optimizer_runtime_backend = get_optimizer_backend(
+            bundle.extras.get("optimizer_backend")
+        )
 
         p = rt_cfg.parallel
         model = bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks
@@ -391,10 +389,10 @@ class MegatronLiteRuntime(RuntimeBase):
     def release_export_scratch(self, handle: ModelHandle) -> None:
         """Release retained full-parameter scratch before colocated rollout wake."""
         model_chunks = handle._extras.get("model_chunks", [handle._model])
-        for chunk in model_chunks:
-            release = getattr(chunk, "release_export_scratch", None)
-            if callable(release):
-                release()
+        from megatron.lite.primitive.optimizers import get_optimizer_backend
+
+        backend = handle._extras.get("optimizer_runtime_backend")
+        (backend or get_optimizer_backend(None)).release_export_scratch(model_chunks)
 
     # ── Memory ──
 
@@ -408,48 +406,17 @@ class MegatronLiteRuntime(RuntimeBase):
         grad: bool = True,
     ) -> None:
         model_chunks = handle._extras.get("model_chunks", [handle._model])
-        from megatron.lite.runtime.megatron_utils import (
-            load_model_to_gpu,
-            load_optimizer,
-            offload_model_to_cpu,
-            offload_optimizer,
-        )
+        from megatron.lite.primitive.optimizers import get_optimizer_backend
 
-        # A model+gradient transfer is the training context boundary.  On its
-        # CPU side the colocated rollout is about to map its sleeping weights;
-        # on its CUDA side training is taking the device back.  Keep the whole
-        # release/restore contract here rather than teaching VERL about backend
-        # scratch buffers or optimizer residency.
-        training_transfer = model and grad
-        if device == "cpu":
-            if model:
-                offload_model_to_cpu(model_chunks)
-            if (optimizer or training_transfer) and handle._optimizer is not None:
-                offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
-                if callable(offload_state):
-                    offload_state()
-                else:
-                    offload_optimizer(handle._optimizer)
-            if training_transfer:
-                self.release_export_scratch(handle)
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    # R3/full-recompute may leave CUDA tensors reachable only
-                    # through dead Python cycles until the next periodic GC.
-                    # vLLM remaps its sleeping weights immediately after this
-                    # boundary, so collect those cycles before asking the CUDA
-                    # allocator to return their now-unused blocks.
-                    gc.collect()
-                    torch.cuda.empty_cache()
-        elif device == "cuda":
-            if model:
-                load_model_to_gpu(model_chunks, load_grad=grad)
-            if (optimizer or training_transfer) and handle._optimizer is not None:
-                load_state = getattr(handle._optimizer, "load_state_to_device", None)
-                if callable(load_state):
-                    load_state()
-                else:
-                    load_optimizer(handle._optimizer)
+        backend = handle._extras.get("optimizer_runtime_backend")
+        (backend or get_optimizer_backend(None)).transfer_training_state(
+            handle._optimizer,
+            model_chunks,
+            device,
+            model=model,
+            optimizer_state=optimizer,
+            grad=grad,
+        )
 
     # ── Mode switching ──
 

@@ -20,6 +20,7 @@ from megatron.lite.primitive.optimizers.mfsdp.config import (
     build_mfsdp_process_groups,
     validate_mfsdp_config,
 )
+from megatron.lite.primitive.optimizers.mfsdp.cpu_offload import CpuAdamGroup
 from megatron.lite.primitive.optimizers.mfsdp.fully_shard import fully_shard_model
 from megatron.lite.primitive.optimizers.mfsdp.fused_ops import (
     OptimizerFactory,
@@ -37,9 +38,45 @@ logger = logging.getLogger(__name__)
 ExpertClassifierFn = Callable[[str], bool]
 _MFSDP_PARAM_VALUES_KEY = "_mfsdp_param_values"
 
+
+class _NullOptimizer:
+    """Torch-optimizer surface for the all-CPU-update case."""
+
+    param_groups: list[dict[str, Any]] = []
+    state: dict[Any, Any] = {}
+
+    def step(self) -> None:
+        pass
+
+    def zero_grad(self, *args, **kwargs) -> None:
+        pass
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"state": {}, "param_groups": []}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if state_dict not in ({}, {"state": {}, "param_groups": []}):
+            raise ValueError("Invalid empty GPU optimizer state.")
+
 def _override(opt: Any, name: str, default: Any) -> Any:
     values = dict(getattr(opt, "override_optimizer_config", None) or {})
     return values.get(name, getattr(opt, name, default))
+
+
+def _resolve_offload_fraction(opt: Any) -> float:
+    """Resolve the stable field and MCore-compatible raw override aliases."""
+    values = dict(getattr(opt, "override_optimizer_config", None) or {})
+    value = getattr(opt, "offload_fraction", None)
+    if value is None:
+        value = values.get("offload_fraction", values.get("optimizer_offload_fraction"))
+    if value is None and values.get("optimizer_cpu_offload"):
+        value = 1.0
+    return float(value or 0.0)
+
+
+def _has_explicit_option(opt: Any, name: str) -> bool:
+    values = dict(getattr(opt, "override_optimizer_config", None) or {})
+    return name in values or (hasattr(opt, name) and getattr(opt, name) is not None)
 
 
 class _StandaloneOptimizer:
@@ -56,6 +93,7 @@ class _StandaloneOptimizer:
         expert_params: Iterable[nn.Parameter],
         expert_grad_scale: float,
         use_decoupled_grad: bool = False,
+        cpu_group: CpuAdamGroup | None = None,
     ) -> None:
         self.optimizer = optimizer
         self.params = params
@@ -82,10 +120,17 @@ class _StandaloneOptimizer:
         self._expert_grads_scaled = False
         self._tp_replicated_grads_synced = False
         self._offloaded_state_devices: dict[tuple[int, str], torch.device] = {}
+        self.cpu_group = cpu_group
+        self._cpu_param_ids = (
+            set() if cpu_group is None else {id(param) for param in cpu_group.gpu_params}
+        )
 
     @property
     def param_groups(self) -> list[dict[str, Any]]:
-        return list(self.optimizer.param_groups)
+        groups = list(self.optimizer.param_groups)
+        if self.cpu_group is not None:
+            groups.extend(self.cpu_group.param_groups)
+        return groups
 
     def zero_grad(self) -> None:
         self.optimizer.zero_grad()
@@ -99,6 +144,8 @@ class _StandaloneOptimizer:
         if not math.isfinite(grad_norm):
             return False, grad_norm, 0
         self.optimizer.step()
+        if self.cpu_group is not None:
+            self.cpu_group.step()
         return True, grad_norm, 0
 
     @torch.no_grad()
@@ -106,6 +153,13 @@ class _StandaloneOptimizer:
         """Install reduced shards using MCore's standard or decoupled grad path."""
         for group in self.optimizer.param_groups:
             for param in group["params"]:
+                if id(param) in self._cpu_param_ids:
+                    # CPU AdamW consumes the FP32 M-FSDP main-grad directly;
+                    # installing it as a BF16 .grad would discard precision.
+                    param.grad = None
+                    if hasattr(param, "decoupled_grad"):
+                        param.decoupled_grad = None
+                    continue
                 main_grad = getattr(param, "main_grad", None)
                 if main_grad is None or main_grad.numel() == 0:
                     continue
@@ -169,7 +223,14 @@ class _StandaloneOptimizer:
         return float(total_norm.float().item())
 
     def state_dict(self) -> dict[str, Any]:
-        state = self.optimizer.state_dict()
+        state = (
+            self.optimizer.state_dict()
+            if self.cpu_group is None
+            else {
+                "gpu": self.optimizer.state_dict(),
+                "cpu": self.cpu_group.state_dict(),
+            }
+        )
         state[_MFSDP_PARAM_VALUES_KEY] = [
             [param.detach().cpu().clone() for param in group["params"]]
             for group in self.optimizer.param_groups
@@ -179,7 +240,16 @@ class _StandaloneOptimizer:
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         state = dict(state_dict)
         param_values = state.pop(_MFSDP_PARAM_VALUES_KEY, None)
-        self.optimizer.load_state_dict(state)
+        if self.cpu_group is None:
+            self.optimizer.load_state_dict(state.get("gpu", state))
+        elif "gpu" not in state or "cpu" not in state:
+            raise ValueError(
+                "M-FSDP CPU-offloaded optimizer checkpoint requires both "
+                "'gpu' and 'cpu' states."
+            )
+        else:
+            self.optimizer.load_state_dict(state["gpu"])
+            self.cpu_group.load_state_dict(state["cpu"])
         if param_values is not None:
             with torch.no_grad():
                 for group, group_values in zip(
@@ -189,6 +259,8 @@ class _StandaloneOptimizer:
                         param.copy_(value.to(device=param.device, dtype=param.dtype))
 
     def offload_state_to_cpu(self) -> None:
+        if self.cpu_group is not None:
+            self.cpu_group.release_transfer_state()
         self._offloaded_state_devices.clear()
         for param, state in self.optimizer.state.items():
             for key, value in tuple(state.items()):
@@ -279,6 +351,8 @@ class MFSdpOptimizer:
         self._inner_optimizer = optimizer
         self._model_chunks = model_chunks
         self._grad_sync_enabled = False
+        self._rollout_offloaded = False
+        self._pre_rollout_devices: list[torch.device] = []
 
     @property
     def grad_sync_enabled(self) -> bool:
@@ -295,12 +369,14 @@ class MFSdpOptimizer:
         return self._inner_optimizer.param_groups
 
     def zero_grad(self) -> None:
+        self._require_training_resident("zero_grad")
         self.grad_sync_enabled = False
         self._inner_optimizer.zero_grad()
         for chunk in self._model_chunks:
             chunk.zero_grad_buffer()
 
     def finish_grad_sync(self, *, update_optimizer_grads: bool = True) -> None:
+        self._require_training_resident("finish_grad_sync")
         for chunk in self._model_chunks:
             chunk.finish_grad_sync()
         if update_optimizer_grads:
@@ -313,6 +389,7 @@ class MFSdpOptimizer:
         return self._inner_optimizer.clip_grad_norm()
 
     def step(self) -> tuple[bool, float, int]:
+        self._require_training_resident("step")
         result = self._inner_optimizer.step()
         for chunk in self._model_chunks:
             chunk.param_sync.copy_main_weights_to_model_weights()
@@ -335,6 +412,46 @@ class MFSdpOptimizer:
     def load_state_to_device(self) -> None:
         self._inner_optimizer.load_state_to_device()
 
+    def offload_for_rollout(self) -> None:
+        """Move the complete training state out of GPU at an optimizer boundary."""
+        if self._rollout_offloaded:
+            return
+        if self.grad_sync_enabled:
+            raise RuntimeError(
+                "M-FSDP train-to-rollout offload requires an optimizer-step boundary; "
+                "gradient synchronization is still enabled."
+            )
+        self._pre_rollout_devices = [
+            (
+                chunk.param_sync.buckets[0].device
+                if chunk.param_sync.buckets
+                else torch.device("cpu")
+            )
+            for chunk in self._model_chunks
+        ]
+        for chunk in self._model_chunks:
+            chunk.move_model_state("cpu", load_grad=False)
+        self._inner_optimizer.offload_state_to_cpu()
+        self._rollout_offloaded = True
+
+    def load_from_rollout(self) -> None:
+        """Restore training shards and state after colocated rollout sleeps."""
+        if not self._rollout_offloaded:
+            return
+        for chunk, device in zip(
+            self._model_chunks, self._pre_rollout_devices, strict=True
+        ):
+            chunk.move_model_state(device, load_grad=True)
+        self._inner_optimizer.load_state_to_device()
+        self._pre_rollout_devices = []
+        self._rollout_offloaded = False
+
+    def _require_training_resident(self, operation: str) -> None:
+        if self._rollout_offloaded:
+            raise RuntimeError(
+                f"M-FSDP cannot {operation} while training state is offloaded for rollout."
+            )
+
 
 def build_mfsdp_stack(
     model_chunks: list[nn.Module],
@@ -356,11 +473,10 @@ def build_mfsdp_stack(
     )
     opt = engine_cfg.optimizer
     classifier = is_expert or (lambda _name: False)
-    offload_fraction = float(getattr(opt, "offload_fraction", 0.0) or 0.0)
-    if not math.isfinite(offload_fraction) or offload_fraction != 0.0:
+    offload_fraction = _resolve_offload_fraction(opt)
+    if not math.isfinite(offload_fraction) or not 0.0 <= offload_fraction <= 1.0:
         raise ValueError(
-            "M-FSDP optimizer offload is not part of the offload=0 standalone "
-            f"implementation; expected offload_fraction=0.0, got {offload_fraction}."
+            f"M-FSDP offload_fraction must be in [0, 1], got {offload_fraction}."
         )
     config = build_mfsdp_config(
         opt, calculate_per_token_loss=calculate_per_token_loss
@@ -374,6 +490,28 @@ def build_mfsdp_stack(
         config = replace(
             config,
             suggested_communication_unit_size=int(suggested_communication_unit_size),
+        )
+    if offload_fraction == 1.0:
+        # These are MCore's native communication controls. Full optimizer
+        # offload is memory-first: bound the communication queue to one bucket
+        # and avoid retaining a prefetched full-parameter bucket. Explicit user
+        # choices remain authoritative.
+        config = replace(
+            config,
+            full_optimizer_offload=True,
+            suggested_communication_unit_size=(
+                config.suggested_communication_unit_size
+                if (
+                    suggested_communication_unit_size is not None
+                    or _has_explicit_option(opt, "suggested_communication_unit_size")
+                )
+                else config.bucket_size
+            ),
+            overlap_param_gather=(
+                config.overlap_param_gather
+                if _has_explicit_option(opt, "overlap_param_gather")
+                else False
+            ),
         )
     config = _order_param_gathers_for_parallel_collectives(config, ps)
     groups = build_mfsdp_process_groups(ps)
@@ -409,12 +547,42 @@ def build_mfsdp_stack(
         weight_decay=float(getattr(opt, "weight_decay", 0.01)),
         apply_wd_to_qk_layernorm=bool(getattr(opt, "apply_wd_to_qk_layernorm", False)),
     )
-    torch_optimizer = _build_optimizer_algorithm(
-        param_groups,
-        opt,
-        optimizer_factory=optimizer_factory,
-        use_decoupled_grad=config.use_decoupled_grad,
-    )
+    cpu_group = None
+    if offload_fraction > 0.0:
+        optimizer_name = str(getattr(opt, "optimizer", "adam")).lower()
+        if optimizer_name not in {"adam", "adamw"}:
+            raise ValueError(
+                "M-FSDP CPU optimizer offload supports AdamW only; "
+                f"got {optimizer_name!r}."
+            )
+        if optimizer_factory is not None:
+            raise ValueError(
+                "M-FSDP CPU optimizer offload cannot preserve an injected "
+                "optimizer_factory algorithm."
+            )
+        gpu_param_groups, cpu_param_groups = _split_param_groups_by_fraction(
+            param_groups, offload_fraction
+        )
+        torch_optimizer = (
+            _build_optimizer_algorithm(
+                gpu_param_groups,
+                opt,
+                optimizer_factory=None,
+                use_decoupled_grad=config.use_decoupled_grad,
+            )
+            if gpu_param_groups
+            else _NullOptimizer()
+        )
+        cpu_group = _build_cpu_adam_group(
+            cpu_param_groups, opt, bucket_size=config.bucket_size
+        )
+    else:
+        torch_optimizer = _build_optimizer_algorithm(
+            param_groups,
+            opt,
+            optimizer_factory=optimizer_factory,
+            use_decoupled_grad=config.use_decoupled_grad,
+        )
 
     standalone_optimizer = _StandaloneOptimizer(
         torch_optimizer,
@@ -434,6 +602,7 @@ def build_mfsdp_stack(
             )
         ),
         use_decoupled_grad=config.use_decoupled_grad,
+        cpu_group=cpu_group,
     )
     optimizer = MFSdpOptimizer(standalone_optimizer, wrapped_chunks)
     return wrapped_chunks, optimizer
@@ -471,6 +640,63 @@ def _order_param_gathers_for_parallel_collectives(
             "and model-parallel collectives span intersecting process groups."
         )
     return replace(config, overlap_param_gather=False)
+
+
+def _split_param_groups_by_fraction(
+    param_groups: list[dict[str, Any]], offload_fraction: float
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Choose whole logical parameters identically on every DP rank."""
+
+    def placement_numel(param: nn.Parameter) -> int:
+        return int(getattr(param, "_mfsdp_global_numel", param.numel()))
+
+    total_numel = sum(
+        placement_numel(param)
+        for group in param_groups
+        for param in group["params"]
+    )
+    cpu_target = int(total_numel * offload_fraction)
+    cpu_numel = 0
+    gpu_groups: list[dict[str, Any]] = []
+    cpu_groups: list[dict[str, Any]] = []
+    for group in param_groups:
+        gpu_params: list[nn.Parameter] = []
+        cpu_params: list[nn.Parameter] = []
+        for param in group["params"]:
+            if cpu_numel < cpu_target:
+                cpu_params.append(param)
+                cpu_numel += placement_numel(param)
+            else:
+                gpu_params.append(param)
+        for params, target in ((gpu_params, gpu_groups), (cpu_params, cpu_groups)):
+            if params:
+                copied = dict(group)
+                copied["params"] = params
+                target.append(copied)
+    return gpu_groups, cpu_groups
+
+
+def _build_cpu_adam_group(
+    cpu_param_groups: list[dict[str, Any]], opt: Any, *, bucket_size: int | None
+) -> CpuAdamGroup:
+    beta1 = getattr(opt, "adam_beta1", None)
+    beta2 = getattr(opt, "adam_beta2", None)
+    eps = getattr(opt, "adam_eps", None)
+    capacity = bucket_size or max(
+        1,
+        max(
+            param.numel()
+            for group in cpu_param_groups
+            for param in group["params"]
+        ),
+    )
+    return CpuAdamGroup(
+        cpu_param_groups,
+        lr=float(getattr(opt, "lr", 1.0e-4)),
+        betas=(0.9 if beta1 is None else beta1, 0.999 if beta2 is None else beta2),
+        eps=1.0e-8 if eps is None else eps,
+        bucket_size=capacity,
+    )
 
 
 def _mark_mfsdp_parallel_attrs(
