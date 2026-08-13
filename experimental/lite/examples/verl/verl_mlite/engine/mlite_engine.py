@@ -26,6 +26,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
+from verl_mlite import qat_export
 from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
 
 try:
@@ -398,7 +399,7 @@ class MegatronLiteEngine(BaseEngine):
         # alone must not mutate rollout export behavior.
         lora_enabled = bool(lora_cfg.get("enabled", False)) if hasattr(lora_cfg, "get") else False
         if not lora_enabled:
-            return self.runtime.export_weights(self.handle, **export_kwargs), None
+            return self._export_rollout_weights(export_kwargs), None
 
         merge_mode = self._lora_rollout_sync_is_merge(lora_cfg)
         if merge_mode:
@@ -411,20 +412,26 @@ class MegatronLiteEngine(BaseEngine):
             # not representable (e.g. OLoRA/PiSSA, whose residual base makes
             # adapter-only numerically wrong).
             export_kwargs["merge_lora"] = True
-            return self.runtime.export_weights(self.handle, **export_kwargs), None
+            return self._export_rollout_weights(export_kwargs), None
 
         self._assert_adapter_rollout_contract(lora_cfg)
         peft_config = self._build_vllm_peft_config(lora_cfg)
         if not kwargs.get("base_sync_done", False):
             # Phase 1: the frozen base, exported verbatim. LoRA training never
             # touches it, so this runs once per rollout engine lifetime.
-            return self.runtime.export_weights(self.handle, **export_kwargs), peft_config
+            return self._export_rollout_weights(export_kwargs), peft_config
 
         adapter_kwargs = {
             key: export_kwargs[key] for key in ("export_dtype",) if key in export_kwargs
         }
         adapter_stream = self.runtime.export_lora_adapter(self.handle, **adapter_kwargs)
         return self._checked_adapter_stream(adapter_stream), peft_config
+
+    def _export_rollout_weights(self, export_kwargs):
+        weights = self.runtime.export_weights(self.handle, **export_kwargs)
+        if self.engine_config.qat.get("enable", False):
+            weights = qat_export.export_qat_weights(weights, self.engine_config.qat)
+        return weights
 
     @staticmethod
     def _lora_rollout_sync_is_merge(lora_cfg) -> bool:

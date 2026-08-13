@@ -169,6 +169,49 @@ def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
     }
 
 
+def test_online_qat_export_uses_mlite_owned_exporter(monkeypatch) -> None:
+    engine = _engine(
+        engine_config=_engine_config(
+            qat={
+                "enable": True,
+                "apply_modelopt_fake_quant": False,
+                "mode": "mxfp4",
+                "group_size": 32,
+            }
+        )
+    )
+    source_weights = iter(
+        [("model.layers.0.mlp.experts.0.gate_proj.weight", torch.ones(2, 32))]
+    )
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            return source_weights
+
+    def fake_export(weights, qat_config):
+        captured.update(weights=weights, qat_config=qat_config)
+        return iter([("packed.weight", torch.ones(2, 16, dtype=torch.int8))])
+
+    monkeypatch.setattr("verl_mlite.qat_export.export_qat_weights", fake_export)
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine._initial_sync_cache_cleared = True
+
+    weights, metadata = engine.get_per_tensor_param()
+
+    assert [name for name, _ in weights] == ["packed.weight"]
+    assert metadata is None
+    assert captured["weights"] is source_weights
+    assert captured["qat_config"] == engine.engine_config.qat
+
+
+def test_qat_export_rejects_native_resync_format_double_quantization() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _engine_config(qat={"enable": True, "mode": "mxfp4"}, resync_format="mxfp4")
+
+
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
     optimizer = SimpleNamespace(param_groups=[{"lr": 0.0, "weight_decay": 0.1}])
     opt = SimpleNamespace(
