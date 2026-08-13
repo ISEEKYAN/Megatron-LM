@@ -114,6 +114,10 @@ class MegatronFSDPBackend:
     name: str = "mfsdp"
     runtime_backend: str = "megatron_fsdp"
 
+    def pipeline_model_chunks(self, model_chunks: list[Any]) -> list[Any]:
+        """The sharding wrappers own M-FSDP's forward/backward lifecycle."""
+        return list(model_chunks)
+
     def zero_grad(self, optimizer: Any) -> None:
         optimizer.zero_grad()
 

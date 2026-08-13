@@ -140,11 +140,10 @@ def _checkpoint_module(model: Any) -> torch.nn.Module:
     )
 
 
-def _pipeline_model_chunks(model_chunks: list, optimizer_backend: str) -> list:
-    """Keep lifecycle-owning wrappers on the pipeline execution path."""
-    if optimizer_backend == "mfsdp":
-        return list(model_chunks)
-
+def _pipeline_model_chunks(model_chunks: list, optimizer_backend: Any | None) -> list:
+    """Ask the optimizer adapter which modules own pipeline execution."""
+    if optimizer_backend is not None:
+        return list(optimizer_backend.pipeline_model_chunks(model_chunks))
     from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
 
     return [unwrap_model(chunk) for chunk in model_chunks]
@@ -264,6 +263,13 @@ class MegatronLiteRuntime(RuntimeBase):
         if bundle.forward_step is None:
             raise ValueError("Megatron Lite model bundles must provide a typed forward_step.")
 
+        optimizer_backend_name = bundle.extras.get("optimizer_backend")
+        optimizer_runtime_backend = None
+        if optimizer_backend_name not in (None, "none"):
+            from megatron.lite.primitive.optimizers import get_optimizer_backend
+
+            optimizer_runtime_backend = get_optimizer_backend(optimizer_backend_name)
+
         p = rt_cfg.parallel
         model = bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks
         return ModelHandle(
@@ -281,6 +287,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 "world_size": dist.get_world_size(),
                 "cp_range": (p.cp, p.cp),
                 **bundle.extras,
+                "optimizer_runtime_backend": optimizer_runtime_backend,
             },
         )
 
@@ -501,7 +508,7 @@ class MegatronLiteRuntime(RuntimeBase):
 
             model_chunks = handle._extras.get("model_chunks", [handle._model])
             pipeline_chunks = _pipeline_model_chunks(
-                model_chunks, handle._extras.get("optimizer_backend", "none")
+                model_chunks, handle._extras.get("optimizer_runtime_backend")
             )
             pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
             try:
