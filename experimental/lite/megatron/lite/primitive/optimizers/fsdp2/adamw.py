@@ -170,8 +170,6 @@ class FP32AdamW:
                 self._master_for_param[param] = master
 
     def master_param_aliases_param(self, param: nn.Parameter) -> bool:
-        # How the master was built, not where it lives now, so this survives an
-        # offload swapping ``param.data``.
         return not self.cpu_update and param.dtype is torch.float32
 
     def _init_master_param(self, param: nn.Parameter) -> torch.Tensor:
@@ -235,8 +233,6 @@ class FP32AdamW:
         return grad.detach().to(dtype=torch.float32)
 
     def _copy_master_to_param(self, param: nn.Parameter, master: torch.Tensor) -> None:
-        # Observed, not ``master_param_aliases_param``: a caller may install a
-        # non-aliasing master, and skipping its copy would stop updating the param.
         if not self.cpu_update and shares_local_storage(param, master):
             return
         model_dtype = self._model_param_dtype(param)

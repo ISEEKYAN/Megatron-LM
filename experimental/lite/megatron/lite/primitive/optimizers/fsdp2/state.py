@@ -51,8 +51,6 @@ def move_optimizer_state_to_cpu(
                     local_value = to_local_tensor(value)
                     if not isinstance(local_value, torch.Tensor) or not local_value.is_cuda:
                         continue
-                    # ``MegatronLiteRuntime.to`` moves the model first, so the shared
-                    # storage is already on CPU: follow the param instead of copying.
                     offloaded[(id(param), key)] = OffloadedStateEntry(
                         device=local_value.device, aliases_param=True
                     )
@@ -98,7 +96,6 @@ def move_offloaded_optimizer_state_to_device(
                 if param_id != id(param) or state_key not in param_state:
                     continue
                 if entry.aliases_param:
-                    # The model reload already put ``param`` back on device.
                     param_state[state_key] = param.detach()
                     remaining.pop(key, None)
                     continue
@@ -121,8 +118,6 @@ def move_offloaded_optimizer_state_to_device(
 
 
 def _state_aliases_param(optimizer: Any, param: Any, key: str) -> bool:
-    # Asked of the optimizer that built the state: by the time state moves, the
-    # model offload has swapped ``param.data`` and the sharing is unobservable.
     return (
         key == "master_param"
         and isinstance(optimizer, FP32AdamW)
