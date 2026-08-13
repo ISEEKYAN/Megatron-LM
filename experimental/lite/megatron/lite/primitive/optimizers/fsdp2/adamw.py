@@ -147,7 +147,6 @@ class FP32AdamW:
         self.step_count = 0
         self.state: dict[nn.Parameter, dict[str, torch.Tensor]] = {}
         self._master_for_param: dict[nn.Parameter, torch.Tensor] = {}
-        self._master_param_alias_ids: set[int] = set()
         self._model_param_dtypes_by_id = dict(model_param_dtypes or {})
         self._model_dtype_for_param: dict[nn.Parameter, torch.dtype] = {}
 
@@ -169,24 +168,22 @@ class FP32AdamW:
                     "step": 0,
                 }
                 self._master_for_param[param] = master
-                if shares_local_storage(master, param):
-                    self._master_param_alias_ids.add(id(param))
+
+    def master_param_aliases_param(self, param: nn.Parameter) -> bool:
+        # How the master was built, not where it lives now, so this survives an
+        # offload swapping ``param.data``.
+        return not self.cpu_update and param.dtype is torch.float32
 
     def _init_master_param(self, param: nn.Parameter) -> torch.Tensor:
+        if self.master_param_aliases_param(param):
+            return param.detach()
         if self.cpu_update:
             local_param = to_local_tensor(param.detach())
             return local_param.detach().to(device="cpu", dtype=torch.float32).clone()
-        return (
-            param.detach()
-            if param.dtype is torch.float32
-            else param.detach().to(dtype=torch.float32).clone()
-        )
+        return param.detach().to(dtype=torch.float32).clone()
 
     def _model_param_dtype(self, param: nn.Parameter) -> torch.dtype | None:
         return self._model_dtype_for_param.get(param) or fsdp2_model_param_dtype(param)
-
-    def master_param_aliases_param(self, param: nn.Parameter) -> bool:
-        return id(param) in self._master_param_alias_ids
 
     def zero_grad(self, *args, **kwargs) -> None:
         set_to_none = kwargs.get("set_to_none", False)
@@ -238,6 +235,8 @@ class FP32AdamW:
         return grad.detach().to(dtype=torch.float32)
 
     def _copy_master_to_param(self, param: nn.Parameter, master: torch.Tensor) -> None:
+        # Observed, not ``master_param_aliases_param``: a caller may install a
+        # non-aliasing master, and skipping its copy would stop updating the param.
         if not self.cpu_update and shares_local_storage(param, master):
             return
         model_dtype = self._model_param_dtype(param)
