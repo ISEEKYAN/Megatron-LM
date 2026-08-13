@@ -147,6 +147,7 @@ class FP32AdamW:
         self.step_count = 0
         self.state: dict[nn.Parameter, dict[str, torch.Tensor]] = {}
         self._master_for_param: dict[nn.Parameter, torch.Tensor] = {}
+        self._master_param_alias_ids: set[int] = set()
         self._model_param_dtypes_by_id = dict(model_param_dtypes or {})
         self._model_dtype_for_param: dict[nn.Parameter, torch.dtype] = {}
 
@@ -168,6 +169,8 @@ class FP32AdamW:
                     "step": 0,
                 }
                 self._master_for_param[param] = master
+                if shares_local_storage(master, param):
+                    self._master_param_alias_ids.add(id(param))
 
     def _init_master_param(self, param: nn.Parameter) -> torch.Tensor:
         if self.cpu_update:
@@ -181,6 +184,9 @@ class FP32AdamW:
 
     def _model_param_dtype(self, param: nn.Parameter) -> torch.dtype | None:
         return self._model_dtype_for_param.get(param) or fsdp2_model_param_dtype(param)
+
+    def master_param_aliases_param(self, param: nn.Parameter) -> bool:
+        return id(param) in self._master_param_alias_ids
 
     def zero_grad(self, *args, **kwargs) -> None:
         set_to_none = kwargs.get("set_to_none", False)

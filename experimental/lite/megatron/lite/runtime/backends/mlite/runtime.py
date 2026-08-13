@@ -405,14 +405,14 @@ class MegatronLiteRuntime(RuntimeBase):
         # scratch buffers or optimizer residency.
         training_transfer = model and grad
         if device == "cpu":
+            if model:
+                offload_model_to_cpu(model_chunks)
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
                 if callable(offload_state):
                     offload_state()
                 else:
                     offload_optimizer(handle._optimizer)
-            if model:
-                offload_model_to_cpu(model_chunks)
             if training_transfer:
                 self.release_export_scratch(handle)
                 if torch.cuda.is_available():

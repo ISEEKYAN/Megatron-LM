@@ -51,7 +51,7 @@ def move_optimizer_state_to_cpu(
                     local_value = value.to_local()
                     if not isinstance(local_value, torch.Tensor) or not local_value.is_cuda:
                         continue
-                    rebind_to_param = _should_rebind_state_to_param(key, param, value)
+                    rebind_to_param = _should_rebind_state_to_param(child, key, param, value)
                     offloaded[(id(param), key)] = OffloadedStateEntry(
                         device=local_value.device,
                         is_dtensor=True,
@@ -66,7 +66,7 @@ def move_optimizer_state_to_cpu(
 
                 if not isinstance(value, torch.Tensor) or not value.is_cuda:
                     continue
-                rebind_to_param = _should_rebind_state_to_param(key, param, value)
+                rebind_to_param = _should_rebind_state_to_param(child, key, param, value)
                 offloaded[(id(param), key)] = OffloadedStateEntry(
                     device=value.device, rebind_to_param=rebind_to_param
                 )
@@ -116,9 +116,15 @@ def move_offloaded_optimizer_state_to_device(
         offloaded.pop(key, None)
 
 
-def _should_rebind_state_to_param(key: str, param: Any, value: Any) -> bool:
+def _should_rebind_state_to_param(optimizer: Any, key: str, param: Any, value: Any) -> bool:
     if key != "master_param" or not isinstance(param, torch.Tensor):
         return False
+    aliases_param = getattr(optimizer, "master_param_aliases_param", None)
+    if callable(aliases_param):
+        try:
+            return bool(aliases_param(param))
+        except (AttributeError, RuntimeError, TypeError):
+            pass
     try:
         return shares_local_storage(value, param)
     except (AttributeError, RuntimeError, TypeError):
