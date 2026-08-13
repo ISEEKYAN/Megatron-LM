@@ -8,8 +8,7 @@ grad_offload: false
 forward_only: false
 dtype: bfloat16
 export_dtype: bfloat16
-# Optional verl-owned export_qat_weights passthrough. It is not used by the
-# vLLM compressed-tensors MXFP4 rollout path; see ../../../../QAT.md.
+# Optional MLite-owned QAT rollout export configuration.
 qat: {}
 resync_format: null
 resync_config: {}

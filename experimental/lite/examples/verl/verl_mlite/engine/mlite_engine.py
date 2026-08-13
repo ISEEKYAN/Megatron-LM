@@ -28,6 +28,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
+from verl_mlite import qat_export
 from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
 
 try:
@@ -401,12 +402,7 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
         weights = self.runtime.export_weights(self.handle, **export_kwargs)
         if self.engine_config.qat.get("enable", False):
-            from verl.utils.modelopt import export_qat_weights
-
-            qat_config = SimpleNamespace(**self.engine_config.qat)
-            weights = export_qat_weights(
-                weights, [self.module], qat_config, bridge=None
-            )
+            weights = qat_export.export_qat_weights(weights, self.engine_config.qat)
         return weights, None
 
     def get_data_parallel_size(self):
