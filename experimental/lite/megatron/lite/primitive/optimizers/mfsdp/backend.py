@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 import torch.distributed as dist
 from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
@@ -20,6 +22,8 @@ from torch.distributed.checkpoint.planner import (
 )
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
+
+from megatron.lite.primitive.optimizers.runtime_adapter import DefaultOptimizerRuntimeAdapter
 
 
 def gather_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
@@ -110,13 +114,43 @@ def _walk_state(
 
 
 @dataclass(frozen=True, slots=True)
-class MegatronFSDPBackend:
+class MegatronFSDPBackend(DefaultOptimizerRuntimeAdapter):
     name: str = "mfsdp"
     runtime_backend: str = "megatron_fsdp"
 
     def pipeline_model_chunks(self, model_chunks: list[Any]) -> list[Any]:
         """The sharding wrappers own M-FSDP's forward/backward lifecycle."""
         return list(model_chunks)
+
+    def transfer_training_state(
+        self,
+        optimizer: Any | None,
+        model_chunks: list[Any],
+        device: str,
+        *,
+        model: bool,
+        optimizer_state: bool,
+        grad: bool,
+    ) -> None:
+        if not (model and grad):
+            return super().transfer_training_state(
+                optimizer,
+                model_chunks,
+                device,
+                model=model,
+                optimizer_state=optimizer_state,
+                grad=grad,
+            )
+        if optimizer is None:
+            raise RuntimeError("M-FSDP training transfer requires an optimizer.")
+        if device == "cpu":
+            optimizer.offload_for_rollout()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+        elif device == "cuda":
+            optimizer.load_from_rollout()
 
     def zero_grad(self, optimizer: Any) -> None:
         optimizer.zero_grad()

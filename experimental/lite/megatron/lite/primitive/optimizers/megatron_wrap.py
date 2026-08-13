@@ -11,6 +11,7 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
 from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
+from megatron.lite.primitive.optimizers.runtime_adapter import DefaultOptimizerRuntimeAdapter
 
 
 def validate_dist_opt_config(engine_cfg) -> None:
@@ -409,7 +410,7 @@ def _build_pg_collection(ps, engine_cfg):
 
 
 @dataclass(frozen=True, slots=True)
-class DistOptBackend:
+class DistOptBackend(DefaultOptimizerRuntimeAdapter):
     name: str = "dist_opt"
     runtime_backend: str = "dist_opt"
 

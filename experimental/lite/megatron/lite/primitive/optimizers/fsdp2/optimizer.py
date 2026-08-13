@@ -40,6 +40,7 @@ from megatron.lite.primitive.optimizers.fsdp2.wrap import (
     wrap_fsdp2,
     wrap_fsdp2_module,
 )
+from megatron.lite.primitive.optimizers.runtime_adapter import DefaultOptimizerRuntimeAdapter
 from megatron.lite.primitive.parallel.state import ParallelState
 
 _DEFAULT_RESHARD_AFTER_FORWARD: bool | int | None = True
@@ -645,7 +646,7 @@ def _matches_megatron_no_weight_decay(
 
 
 @dataclass(frozen=True, slots=True)
-class FSDP2OptimizerBackend:
+class FSDP2OptimizerBackend(DefaultOptimizerRuntimeAdapter):
     name: str = "fsdp2"
     runtime_backend: str = "fsdp2"
 
