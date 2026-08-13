@@ -169,16 +169,15 @@ class FP32AdamW:
                 }
                 self._master_for_param[param] = master
 
-    def master_param_aliases_param(self, param: nn.Parameter) -> bool:
-        return not self.cpu_update and param.dtype is torch.float32
-
     def _init_master_param(self, param: nn.Parameter) -> torch.Tensor:
-        if self.master_param_aliases_param(param):
-            return param.detach()
         if self.cpu_update:
             local_param = to_local_tensor(param.detach())
             return local_param.detach().to(device="cpu", dtype=torch.float32).clone()
-        return param.detach().to(dtype=torch.float32).clone()
+        return (
+            param.detach()
+            if param.dtype is torch.float32
+            else param.detach().to(dtype=torch.float32).clone()
+        )
 
     def _model_param_dtype(self, param: nn.Parameter) -> torch.dtype | None:
         return self._model_dtype_for_param.get(param) or fsdp2_model_param_dtype(param)
