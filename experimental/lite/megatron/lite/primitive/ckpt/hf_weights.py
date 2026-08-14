@@ -1104,7 +1104,7 @@ def load_hf_weights(
                         )
 
             converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-            (target.to_local() if isinstance(target, DTensor) else target.data).copy_(converted)
+            (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
             if replica_ranks is not None:
                 assert source_global_rank is not None
                 dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1203,7 +1203,7 @@ def _load_expert_weight(
                 tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
     converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-    (target.to_local() if isinstance(target, DTensor) else target.data).copy_(converted)
+    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
     if replica_ranks is not None:
         assert source_global_rank is not None
         dist.broadcast(target.data, src=source_global_rank, group=replica_group)
