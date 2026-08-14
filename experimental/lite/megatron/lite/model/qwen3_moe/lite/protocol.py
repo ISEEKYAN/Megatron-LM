@@ -20,6 +20,7 @@ Protocol convention (what runtime calls):
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,6 @@ from megatron.lite.primitive.modules.lora import (
     normalize_lora_config,
     trainable_param_stats,
 )
-from megatron.lite.primitive.optimizers.fsdp2.optimizer import defer_large_parameters
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.quantization import (
     QATSpec,
@@ -89,7 +89,7 @@ class ImplConfig:
     router_bias_rate: float = 0.0
     # User-level OptimizerConfig threaded through the runtime.
     optimizer_config: OptimizerConfig | None = None
-    fsdp2_meta_init_threshold: int | None = 1_000_000
+    load_hf_weights: bool = True
     mtp_enable: bool = False
     mtp_enable_train: bool = False
     mtp_detach_encoder: bool = False
@@ -198,17 +198,17 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     )
 
     vpp = None if p.vpp == 1 else p.vpp
+    meta_init = impl_cfg.optimizer == "fsdp2" and impl_cfg.load_hf_weights
+    def build_chunk(**kwargs):
+        with torch.device("meta") if meta_init else nullcontext():
+            chunk = Qwen3MoEModel(model_cfg, ps, **kwargs, **model_kwargs).to(torch.bfloat16)
+        chunk._mlite_meta_init = meta_init
+        return chunk if meta_init else chunk.cuda()
+
     if vpp is None:
-        threshold = impl_cfg.fsdp2_meta_init_threshold if impl_cfg.optimizer == "fsdp2" else None
-        chunks = [defer_large_parameters(Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16), threshold)]
+        chunks = [build_chunk()]
     else:
-        chunks = []
-        for i in range(vpp):
-            chunks.append(
-                Qwen3MoEModel(model_cfg, ps, vpp=vpp, vpp_chunk_id=i, **model_kwargs)
-                .to(torch.bfloat16)
-                .cuda()
-            )
+        chunks = [build_chunk(vpp=vpp, vpp_chunk_id=i) for i in range(vpp)]
 
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 

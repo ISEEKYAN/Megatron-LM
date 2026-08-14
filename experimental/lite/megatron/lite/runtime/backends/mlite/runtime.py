@@ -27,6 +27,8 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     # may pass knobs (e.g. cross_entropy_fusion) that some models don't model.
     impl_cfg_kwargs = {key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields}
     impl_cfg_kwargs["parallel"] = rt_cfg.parallel
+    if "load_hf_weights" in init_fields:
+        impl_cfg_kwargs["load_hf_weights"] = rt_cfg.load_hf_weights
     if (
         "attention_backend_override" in init_fields
         and impl_cfg_kwargs.get("attention_backend_override") is None
@@ -223,8 +225,6 @@ class MegatronLiteRuntime(RuntimeBase):
         # ── build model (model owns ps + optimizer + everything) ──
         bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
         if any(param.is_meta for chunk in bundle.chunks for param in chunk.parameters()):
-            if not (rt_cfg.load_hf_weights and rt_cfg.hf_path):
-                raise RuntimeError("Deferred parameters require HF weights")
             bundle.optimizer = bundle.extras.pop("post_model_load_hook")()["optimizer"]
 
         # ── load HF weights (optional) ──

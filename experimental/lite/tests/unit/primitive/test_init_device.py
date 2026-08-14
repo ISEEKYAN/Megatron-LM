@@ -1,59 +1,57 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from types import SimpleNamespace
+
+import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
-from megatron.lite.primitive.optimizers.fsdp2.optimizer import (
-    _materialize_deferred_parameters,
-    defer_large_parameters,
-)
+
+def _build_with_load_setting(monkeypatch, transformer_engine_import_stub, load_hf_weights):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import protocol
+
+    seen = []
+
+    class Model(nn.Module):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+            seen.append(self.weight.device.type)
+
+    monkeypatch.setattr(protocol, "Qwen3MoEModel", Model)
+    monkeypatch.setattr(protocol, "init_parallel", lambda _p: SimpleNamespace())
+    monkeypatch.setattr(protocol, "normalize_lora_config", lambda _cfg: SimpleNamespace(enabled=False))
+    monkeypatch.setattr(protocol, "parse_recompute_spec", lambda _cfg: [])
+    monkeypatch.setattr(protocol, "set_cross_entropy_fusion", lambda *_args: None)
+    monkeypatch.setattr(protocol, "apply_qat_to_chunks", lambda *_args: None)
+    monkeypatch.setattr(nn.Module, "cuda", lambda self: self)
+    cfg = SimpleNamespace(num_nextn_predict_layers=0)
+    protocol.build_model(cfg, impl_cfg=protocol.ImplConfig(optimizer="fsdp2", load_hf_weights=load_hf_weights))
+    return seen
 
 
-class MixedModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.large = nn.Parameter(torch.ones(8))
-        self.small = nn.Parameter(torch.full((2,), 3.0))
-        self.register_buffer("table", torch.full((2,), 5.0))
+@pytest.mark.parametrize(("load_hf_weights", "device"), [(True, "meta"), (False, "cpu")])
+def test_fsdp2_init_device_follows_load_setting(
+    monkeypatch, transformer_engine_import_stub, load_hf_weights, device
+) -> None:
+    assert _build_with_load_setting(
+        monkeypatch, transformer_engine_import_stub, load_hf_weights
+    ) == [device]
 
 
-def test_defer_large_parameters_keeps_small_state_initialized() -> None:
-    model = defer_large_parameters(
-        MixedModel().to(torch.bfloat16), threshold=4, device="cpu"
-    )
-
-    assert model.large.is_meta
-    assert model.large.dtype == torch.bfloat16
-    assert model.small.device.type == "cpu"
-    assert torch.equal(model.small, torch.full((2,), 3.0, dtype=torch.bfloat16))
-    assert torch.equal(model.table, torch.full((2,), 5.0))
-
-
-def test_defer_large_parameters_disabled_is_the_eager_path() -> None:
-    model = defer_large_parameters(
-        MixedModel().to(torch.bfloat16), threshold=None, device="cpu"
-    )
-
-    assert all(not param.is_meta for param in model.parameters())
-    assert {param.dtype for param in model.parameters()} == {torch.bfloat16}
-
-
-def test_materialize_changes_only_deferred_fsdp_shards(tmp_path) -> None:
+def test_fully_sharded_meta_model_supports_to_empty(tmp_path) -> None:
     dist.init_process_group(
         "gloo", init_method=f"file://{tmp_path / 'store'}", rank=0, world_size=1
     )
     try:
-        model = defer_large_parameters(
-            MixedModel().to(torch.bfloat16), threshold=4, device="cpu"
-        )
+        with torch.device("meta"):
+            model = nn.Linear(8, 2).to(torch.bfloat16)
         fully_shard(model, mesh=init_device_mesh("cpu", (1,)))
-        _materialize_deferred_parameters(model, device="cpu")
-
-        assert model.large.to_local().device.type == "cpu"
-        assert model.large._mlite_deferred is True
-        assert torch.equal(model.small.full_tensor(), torch.full((2,), 3.0).bfloat16())
-        assert torch.equal(model.table, torch.full((2,), 5.0))
+        model.to_empty(device="cpu")
+        assert model.weight.to_local().device.type == "cpu"
+        assert model.weight.dtype == torch.bfloat16
     finally:
         dist.destroy_process_group()

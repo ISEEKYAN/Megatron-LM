@@ -142,6 +142,7 @@ def test_mlite_config_from_dict_rejects_num_microbatches():
 class _FakeImplConfig:
     parallel: object
     hf_path: str = ""
+    load_hf_weights: bool = True
     optimizer_config: object = None
     attention_backend_override: str | None = None
 
@@ -149,13 +150,17 @@ class _FakeImplConfig:
 def test_build_impl_cfg_backfills_top_level_hf_path_and_runtime_fields():
     proto = type("Proto", (), {"ImplConfig": _FakeImplConfig})
     cfg = MegatronLiteConfig(
-        model_name="qwen3", hf_path="/models/top", attention_backend_override="local"
+        model_name="qwen3",
+        hf_path="/models/top",
+        load_hf_weights=False,
+        attention_backend_override="local",
     )
 
     impl_cfg = _build_impl_cfg(proto, cfg)
 
     assert impl_cfg.parallel is cfg.parallel
     assert impl_cfg.hf_path == "/models/top"
+    assert impl_cfg.load_hf_weights is False
     assert impl_cfg.optimizer_config is cfg.optimizer
     assert impl_cfg.attention_backend_override == "local"
 

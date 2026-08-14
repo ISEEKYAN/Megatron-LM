@@ -1114,7 +1114,7 @@ def load_hf_weights(
     for name, _param in base_model.named_parameters():
         if name in loaded_names or "lora" in name.lower() or "adapter" in name.lower():
             continue
-        elif getattr(_param, "_mlite_deferred", False):
+        elif getattr(base_model, "_mlite_meta_init", False):
             raise RuntimeError(f"Deferred parameter {name!r} was not filled by the checkpoint")
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")

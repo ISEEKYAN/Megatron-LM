@@ -407,7 +407,7 @@ def test_mapped_persistent_buffer_missing_from_checkpoint_fails(monkeypatch) -> 
 def test_deferred_parameter_missing_from_checkpoint_fails(monkeypatch) -> None:
     _stub_parallel_import(monkeypatch)
     model = nn.Linear(1, 1)
-    model.weight._mlite_deferred = True
+    model._mlite_meta_init = True
 
     class Reader:
         def __init__(self, _path):
