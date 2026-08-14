@@ -277,6 +277,16 @@ class SafeTensorReader:
                 tensor = f.get_tensor(name)
         return tensor if device.type == "cpu" else tensor.to(device)
 
+    def get_raw_tensor(
+        self,
+        name: str,
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Read a serialized tensor without implicit quantized-weight conversion."""
+        target_device = torch.device(self.device if device is None else device)
+        return self._get_raw_tensor(name, target_device)
+
     def _get_groupwise_int4(self, name: str, device: torch.device) -> torch.Tensor:
         packed = self._get_raw_tensor(f"{name}_packed", device)
         scale = self._get_raw_tensor(f"{name}_scale", device)
@@ -1243,6 +1253,7 @@ def _read_hf_tensors(
 ) -> list[torch.Tensor]:
     candidate_hook = getattr(spec, "hf_name_candidates", None)
     shape_hook = getattr(spec, "hf_target_shape", None)
+    raw_source_hook = getattr(spec, "read_hf_source_raw", None)
     tensors: list[torch.Tensor] = []
     for index, hf_name in enumerate(hf_names):
         candidates = (
@@ -1264,12 +1275,20 @@ def _read_hf_tensors(
             )
         else:
             target_shape = None
-        tensor = reader.get_tensor(
-            resolved,
-            device=target.device,
-            target_shape=target_shape,
-            target_dtype=target.dtype,
+        read_raw = (
+            raw_source_hook(native_name, index, resolved)
+            if callable(raw_source_hook)
+            else False
         )
+        if read_raw:
+            tensor = reader.get_raw_tensor(resolved, device=target.device)
+        else:
+            tensor = reader.get_tensor(
+                resolved,
+                device=target.device,
+                target_shape=target_shape,
+                target_dtype=target.dtype,
+            )
         transform_source = getattr(spec, "transform_hf_source", None)
         if callable(transform_source):
             tensor = transform_source(native_name, index, resolved, tensor)

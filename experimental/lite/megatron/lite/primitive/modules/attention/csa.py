@@ -10,10 +10,18 @@ import transformer_engine.pytorch as te
 # and CuTeDSL layout kernels rather than vendoring them; see the module docstring
 # of ``csa_cp_utils`` / ``csa_cp_layout_kernels`` for the exact contracts.
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.experimental_attention_variant import (
-    csa_cp_layout_kernels,
-    csa_cp_utils as cp_utils,
-)
+try:
+    from megatron.core.transformer.experimental_attention_variant import (
+        csa_cp_layout_kernels,
+        csa_cp_utils as cp_utils,
+    )
+except ImportError:
+    # MCore dev moved the CP helpers under csa_utils.  Keep Lite compatible
+    # with both the preview layout and the current upstream package layout.
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        cp_layout_kernels as csa_cp_layout_kernels,
+        cp_utils,
+    )
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,

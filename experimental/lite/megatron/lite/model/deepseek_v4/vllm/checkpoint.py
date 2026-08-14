@@ -1,0 +1,495 @@
+"""BF16 master-state load and shared online-FP8 export contracts."""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Iterable, Iterator
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.quantization.checkpoint_block_fp8 import (
+    BLOCK_SHAPE,
+    BlockFP8CheckpointDequantAdapter,
+)
+from megatron.lite.primitive.quantization.deployment_block_fp8 import (
+    quantize_block_fp8_weight,
+    requantize_block_fp8_weight,
+)
+from megatron.lite.primitive.quantization.mxfp4 import (
+    dequantize_mxfp4,
+)
+
+_LAYER_RE = re.compile(r"^layers\.(\d+)\.(.+)$")
+_TOP_LEVEL = {
+    "embed_tokens.embedding.weight": "embed.weight",
+    "norm.weight": "norm.weight",
+    "hc_head.hc_fn": "hc_head_fn",
+    "hc_head.hc_base": "hc_head_base",
+    "hc_head.hc_scale": "hc_head_scale",
+    "lm_head.col.linear.weight": "head.weight",
+}
+
+
+def EXPERT_CLASSIFIER(name: str) -> bool:
+    return ".experts." in name and ".shared_experts." not in name
+
+
+def PLACEMENT_FN(param_name: str) -> list:
+    from torch.distributed.tensor import Replicate
+
+    del param_name
+    return [Replicate(), Replicate(), Replicate(), Replicate()]
+
+
+def _hf_names(native_name: str) -> list[str]:
+    if native_name in _TOP_LEVEL:
+        return [_TOP_LEVEL[native_name]]
+    match = _LAYER_RE.match(native_name)
+    if match is None:
+        return []
+    layer_idx, attr = match.groups()
+    prefix = f"layers.{layer_idx}"
+    direct = {
+        "input_layernorm.weight": "attn_norm.weight",
+        "post_attention_layernorm.weight": "ffn_norm.weight",
+        "attn_hc.hc_fn": "hc_attn_fn",
+        "attn_hc.hc_base": "hc_attn_base",
+        "attn_hc.hc_scale": "hc_attn_scale",
+        "ffn_hc.hc_fn": "hc_ffn_fn",
+        "ffn_hc.hc_base": "hc_ffn_base",
+        "ffn_hc.hc_scale": "hc_ffn_scale",
+        "self_attn.q_norm": "attn.q_norm.weight",
+        "self_attn.kv_norm": "attn.kv_norm.weight",
+        "self_attn.wq_b": "attn.wq_b.weight",
+        "self_attn.wo_a": "attn.wo_a.weight",
+        "self_attn.wo_b": "attn.wo_b.weight",
+        "self_attn.attn_sink": "attn.attn_sink",
+        "self_attn.compressor.ape": "attn.compressor.ape",
+        "self_attn.compressor.norm.weight": "attn.compressor.norm.weight",
+        "self_attn.indexer.wq_b": "attn.indexer.wq_b.weight",
+        "self_attn.indexer.weights_proj": "attn.indexer.weights_proj.weight",
+        "self_attn.indexer.compressor.ape": "attn.indexer.compressor.ape",
+        "self_attn.indexer.compressor.norm.weight": (
+            "attn.indexer.compressor.norm.weight"
+        ),
+    }
+    if attr in direct:
+        return [f"{prefix}.{direct[attr]}"]
+    if attr == "self_attn.fused_wqa_wkv":
+        return [f"{prefix}.attn.wq_a.weight", f"{prefix}.attn.wkv.weight"]
+    compressor_fused = {
+        "self_attn.compressor.fused_wkv_wgate": "attn.compressor",
+        "self_attn.indexer.compressor.fused_wkv_wgate": (
+            "attn.indexer.compressor"
+        ),
+    }
+    if attr in compressor_fused:
+        base = f"{prefix}.{compressor_fused[attr]}"
+        return [f"{base}.wkv.weight", f"{base}.wgate.weight"]
+    if attr == "mlp.gate.gate.weight":
+        return [f"{prefix}.ffn.gate.weight"]
+    if attr == "mlp.gate.tid2eid":
+        return [f"{prefix}.ffn.gate.tid2eid"]
+    if attr == "mlp.gate.expert_bias":
+        return [f"{prefix}.ffn.gate.bias"]
+    if attr == "mlp.shared_experts.gate_up.weight":
+        base = f"{prefix}.ffn.shared_experts"
+        return [f"{base}.w1.weight", f"{base}.w3.weight"]
+    if attr == "mlp.shared_experts.down.weight":
+        return [f"{prefix}.ffn.shared_experts.w2.weight"]
+    return []
+
+
+def _is_block_fp8_weight(native_name: str) -> bool:
+    return (
+        ".self_attn.fused_wqa_wkv" in native_name
+        or ".self_attn.wq_b" in native_name
+        or ".self_attn.indexer.wq_b" in native_name
+        or ".self_attn.wo_a" in native_name
+        or ".self_attn.wo_b" in native_name
+        or ".mlp.shared_experts.gate_up.weight" in native_name
+        or ".mlp.shared_experts.down.weight" in native_name
+        or re.match(
+            r"^layers\.\d+\.mlp\.experts\.(?:w13|w2)\.\d+$",
+            native_name,
+        )
+        is not None
+    )
+
+
+def _is_fp32_hf_tensor(native_name: str) -> bool:
+    return native_name.endswith(
+        (
+            ".hc_fn",
+            ".hc_base",
+            ".hc_scale",
+            ".attn_sink",
+            ".compressor.ape",
+            ".mlp.gate.expert_bias",
+        )
+    )
+
+
+def _scale_to_float32(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype == torch.float32:
+        return scale
+    if scale.dtype == torch.uint8:
+        return (scale.to(torch.int32) << 23).view(torch.float32)
+    if scale.dtype == torch.float8_e8m0fnu:
+        return (scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+    raise TypeError(f"unsupported checkpoint block scale dtype {scale.dtype}")
+
+
+class DeepseekV4WeightSpec:
+    """Small shared-loader adapter for skeleton-owned state."""
+
+    def __init__(
+        self,
+        config: DeepseekV4Config,
+        *,
+        source_block_fp8: bool = True,
+    ):
+        self.config = config
+        self.source_block_fp8 = source_block_fp8
+        self.ps = ParallelState()
+        self.source_block_scales: dict[str, torch.Tensor] = {}
+
+    @property
+    def num_experts(self) -> int:
+        return self.config.n_routed_experts
+
+    def weight_map(self) -> dict[str, list[str]]:
+        return {}
+
+    def validate_load(self, ps: ParallelState) -> None:
+        if (ps.tp_size, ps.etp_size, ps.pp_size, ps.cp_size) != (1, 1, 1, 1):
+            raise NotImplementedError("vLLM layer-0 checkpoint load requires dense ranks=1.")
+        if ps.ep_size not in (1, 2):
+            raise NotImplementedError("vLLM layer-0 checkpoint load supports EP=1/2.")
+        self.ps = ps
+
+    def _expert_hf_names(self, native_name: str) -> list[str]:
+        match = re.match(r"^layers\.(\d+)\.mlp\.experts\.(w13|w2)\.(\d+)$", native_name)
+        if match is None:
+            return []
+        layer, kind, local_id = match.groups()
+        local_count = self.config.n_routed_experts // self.ps.ep_size
+        expert_id = self.ps.ep_rank * local_count + int(local_id)
+        base = f"layers.{layer}.ffn.experts.{expert_id}"
+        if kind == "w13":
+            return [f"{base}.w1.weight", f"{base}.w3.weight"]
+        return [f"{base}.w2.weight"]
+
+    def _names(self, native_name: str) -> list[str]:
+        return self._expert_hf_names(native_name) or _hf_names(native_name)
+
+    def _load_names(self, native_name: str) -> list[str]:
+        names = self._names(native_name)
+        if not self.source_block_fp8 or not _is_block_fp8_weight(native_name):
+            return names
+        paired: list[str] = []
+        for name in names:
+            if not name.endswith(".weight"):
+                raise ValueError(
+                    f"block-FP8 checkpoint source must end in .weight: {name}"
+                )
+            paired.extend((name, name.removesuffix(".weight") + ".scale"))
+        return paired
+
+    def load_weight_map(
+        self,
+        base_model: nn.Module,
+        ps: ParallelState,
+        logical_state_keys: tuple[str, ...],
+    ) -> dict[str, list[str]]:
+        del base_model
+        self.validate_load(ps)
+        return {
+            name: names
+            for name in logical_state_keys
+            if (names := self._load_names(name))
+        }
+
+    def hf_to_native(
+        self, native_name: str, hf_tensors: list[torch.Tensor]
+    ) -> torch.Tensor:
+        if self.source_block_fp8 and _is_block_fp8_weight(native_name):
+            source_names = self._names(native_name)
+            if len(hf_tensors) != 2 * len(source_names):
+                raise ValueError(
+                    f"{native_name} requires weight/scale pairs for "
+                    f"{len(source_names)} source weights"
+                )
+            dequant = BlockFP8CheckpointDequantAdapter()
+            masters: list[torch.Tensor] = []
+            fp8_scales: list[torch.Tensor] = []
+            for source_name, qweight, source_scale in zip(
+                source_names,
+                hf_tensors[::2],
+                hf_tensors[1::2],
+                strict=True,
+            ):
+                if qweight.dtype == torch.float8_e4m3fn:
+                    scale = _scale_to_float32(source_scale)
+                    master = dequant(qweight, source_scale)
+                    reconstructed = requantize_block_fp8_weight(master, scale)
+                    if not torch.equal(reconstructed.qweight, qweight):
+                        mismatch = int((reconstructed.qweight != qweight).sum().item())
+                        raise RuntimeError(
+                            f"{source_name} is not reversible through BF16 master: "
+                            f"{mismatch}/{qweight.numel()} FP8 values changed"
+                        )
+                    fp8_scales.append(scale)
+                elif qweight.dtype == torch.int8:
+                    # The release checkpoint is mixed: dense projections use
+                    # block FP8 while routed experts use packed MXFP4 (two
+                    # E2M1 values per int8 byte with one E8M0 scale per 32).
+                    master = dequantize_mxfp4(qweight, source_scale).to(torch.bfloat16)
+                else:
+                    raise TypeError(
+                        f"unsupported quantized checkpoint dtype for {source_name}: "
+                        f"{qweight.dtype}"
+                    )
+                masters.append(master)
+            if fp8_scales:
+                if len(fp8_scales) != len(source_names):
+                    raise RuntimeError(
+                        f"{native_name} mixes FP8 and MXFP4 within one fused parameter"
+                    )
+                self.source_block_scales[native_name] = (
+                    torch.cat(fp8_scales, dim=0)
+                    if len(fp8_scales) > 1
+                    else fp8_scales[0]
+                )
+            return torch.cat(masters, dim=0) if len(masters) > 1 else masters[0]
+        output = (
+            torch.cat(hf_tensors, dim=0)
+            if len(hf_tensors) == 2
+            else hf_tensors[0]
+        )
+        if native_name.endswith("tid2eid"):
+            return output.to(dtype=torch.int32)
+        if output.is_floating_point():
+            return output.to(
+                dtype=(
+                    torch.float32
+                    if _is_fp32_hf_tensor(native_name)
+                    else torch.bfloat16
+                )
+            )
+        return output
+
+    def hf_target_shape(
+        self, native_name: str, source_index: int, target_shape: torch.Size
+    ) -> torch.Size:
+        names = self._names(native_name)
+        paired = self.source_block_fp8 and _is_block_fp8_weight(native_name)
+        pair_index = source_index // 2 if paired else source_index
+        if native_name.endswith("self_attn.fused_wqa_wkv"):
+            rows = (self.config.q_lora_rank, self.config.head_dim)[pair_index]
+            weight_shape = torch.Size((rows, target_shape[1]))
+        elif len(names) == 2:
+            weight_shape = torch.Size(
+                (target_shape[0] // 2, *target_shape[1:])
+            )
+        else:
+            weight_shape = target_shape
+        if paired and source_index % 2:
+            return torch.Size(
+                tuple(
+                    (size + block - 1) // block
+                    for size, block in zip(
+                        weight_shape, BLOCK_SHAPE, strict=True
+                    )
+                )
+            )
+        return weight_shape
+
+    def read_hf_source_raw(
+        self, native_name: str, source_index: int, source_name: str
+    ) -> bool:
+        """Keep explicit FP8 weight/scale pairs serialized until fused dequant."""
+        del source_index, source_name
+        return self.source_block_fp8 and _is_block_fp8_weight(native_name)
+
+    def bind_source_scales(self, base_model: nn.Module) -> None:
+        parameters = dict(base_model.named_parameters())
+        missing = sorted(set(self.source_block_scales) - set(parameters))
+        if missing:
+            raise RuntimeError(
+                "cannot bind reversible FP8 scales to parameters: "
+                + ", ".join(missing)
+            )
+        for native_name, scales in self.source_block_scales.items():
+            parameter = parameters[native_name]
+            parameter._fp8_source_scales = scales.to(
+                device=parameter.device, dtype=torch.float32
+            ).contiguous()
+            parameter._fp8_source_scale_version = parameter._version
+
+    @staticmethod
+    def replica_group_for_load(native_name: str, ps: ParallelState):
+        if _is_block_fp8_weight(native_name):
+            # The shared loader only broadcasts native BF16 tensors, not the
+            # source scales required by the reversible deployment contract.
+            return None
+        if EXPERT_CLASSIFIER(native_name):
+            # EP ranks own disjoint expert IDs.  Only expert-DP replicas may
+            # share a load; broadcasting over dense DP would copy rank 0's
+            # local experts onto every EP rank.
+            return ps.ep_dp_group
+        return ps.dp_cp_group
+
+    @staticmethod
+    def replica_source_rank_for_load(native_name: str, ps: ParallelState) -> int:
+        del native_name, ps
+        return 0
+
+    def native_to_hf(
+        self, native_name: str, tensor: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
+        names = self._names(native_name)
+        if len(names) == 2:
+            if native_name.endswith("self_attn.fused_wqa_wkv"):
+                tensors = tensor.split(
+                    [self.config.q_lora_rank, self.config.head_dim], dim=0
+                )
+            else:
+                tensors = tensor.chunk(2, dim=0)
+        else:
+            tensors = (tensor,) if names else ()
+        if _is_block_fp8_weight(native_name):
+            outputs: list[tuple[str, torch.Tensor]] = []
+            for name, source in zip(names, tensors, strict=True):
+                canonical = quantize_block_fp8_weight(source)
+                outputs.extend(
+                    (
+                        (name, canonical.qweight),
+                        (
+                            name.removesuffix(".weight") + ".scale",
+                            canonical.scales,
+                        ),
+                    )
+                )
+            return outputs
+        return list(zip(names, tensors, strict=True))
+
+    def qkv_spec(self, native_name: str):
+        del native_name
+        return None
+
+    def tp_spec(self, native_name: str):
+        del native_name
+        return None
+
+    def is_expert(self, native_name: str) -> bool:
+        return EXPERT_CLASSIFIER(native_name)
+
+    def expert_global_id(self, native_name: str):
+        match = re.match(r"^layers\.\d+\.mlp\.experts\.(?:w13|w2)\.(\d+)$", native_name)
+        if match is None:
+            return None
+        local_count = self.config.n_routed_experts // self.ps.ep_size
+        return self.ps.ep_rank * local_count + int(match.group(1))
+
+    @staticmethod
+    def expert_local_name(native_name: str, local_idx: int) -> str:
+        if re.match(r"^layers\.\d+\.mlp\.experts\.(?:w13|w2)\.\d+$", native_name) is None:
+            raise ValueError(f"not a routed-expert parameter: {native_name}")
+        return native_name.rsplit(".", 1)[0] + f".{local_idx}"
+
+
+def _models(chunks: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:
+    return [chunks] if isinstance(chunks, nn.Module) else list(chunks)
+
+
+def export_hf_weights(
+    chunks: nn.Module | Iterable[nn.Module],
+    model_cfg: DeepseekV4Config,
+    ps: ParallelState,
+    **kwargs,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    del kwargs
+    if (ps.tp_size, ps.etp_size, ps.pp_size, ps.cp_size) != (1, 1, 1, 1):
+        raise NotImplementedError(
+            "vLLM BF16-master/online-FP8 export requires dense ranks=1."
+        )
+    spec = DeepseekV4WeightSpec(model_cfg)
+    spec.validate_load(ps)
+    for model in _models(chunks):
+        for native_name, tensor in model.state_dict().items():
+            if not tensor.is_floating_point():
+                output = tensor.detach()
+            else:
+                output = tensor.detach().to(
+                    dtype=(
+                        torch.float32
+                        if _is_fp32_hf_tensor(native_name)
+                        else torch.bfloat16
+                    )
+                )
+            yield from spec.native_to_hf(native_name, output)
+
+
+def load_hf_weights(
+    chunk: nn.Module,
+    hf_path: str,
+    model_cfg: DeepseekV4Config,
+    ps: ParallelState,
+) -> None:
+    if not hf_path:
+        return
+    from megatron.lite.primitive.ckpt.hf_weights import load_hf_weights as _load
+
+    index_path = Path(hf_path) / "model.safetensors.index.json"
+    source_block_fp8 = False
+    if index_path.is_file():
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+        weight_map = payload.get("weight_map")
+        if not isinstance(weight_map, dict):
+            raise ValueError(f"{index_path} has no weight_map")
+        source_block_fp8 = any(str(name).endswith(".scale") for name in weight_map)
+    spec = DeepseekV4WeightSpec(
+        model_cfg,
+        source_block_fp8=source_block_fp8,
+    )
+    _load(
+        chunk,
+        hf_path,
+        spec,
+        ps,
+        vocab_size=model_cfg.vocab_size,
+    )
+    spec.bind_source_scales(chunk)
+
+
+def save_hf_weights(
+    chunks: nn.Module | Iterable[nn.Module],
+    path: str,
+    model_cfg: DeepseekV4Config,
+    ps: ParallelState,
+    **kwargs,
+) -> None:
+    from megatron.lite.primitive.ckpt.hf_weights import stream_export_to_shards
+
+    shard_size_bytes = int(kwargs.pop("shard_size_bytes", 5 * 1024**3))
+    stream_export_to_shards(
+        export_hf_weights(chunks, model_cfg, ps, **kwargs),
+        path,
+        shard_size_bytes=shard_size_bytes,
+    )
+
+
+__all__ = [
+    "EXPERT_CLASSIFIER",
+    "DeepseekV4WeightSpec",
+    "PLACEMENT_FN",
+    "export_hf_weights",
+    "load_hf_weights",
+    "save_hf_weights",
+]

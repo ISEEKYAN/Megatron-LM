@@ -101,13 +101,13 @@ case "${ROLLOUT_WEIGHT_BITS}" in
   4)
     ROLLOUT_RESYNC_FORMAT=mxfp4
     ROLLOUT_EXPERT_DTYPE=fp4
-    ROLLOUT_MOE_BACKEND=marlin
+    ROLLOUT_MOE_BACKEND="${ROLLOUT_MOE_BACKEND:-marlin}"
     ROLLOUT_SCALE_FMT=ue8m0
     ;;
   8)
     ROLLOUT_RESYNC_FORMAT=block_fp8
     ROLLOUT_EXPERT_DTYPE=fp8
-    ROLLOUT_MOE_BACKEND=flashinfer_cutlass
+    ROLLOUT_MOE_BACKEND="${ROLLOUT_MOE_BACKEND:-flashinfer_cutlass}"
     ROLLOUT_SCALE_FMT=float32
     ;;
   *)
@@ -375,7 +375,9 @@ if [[ "${COMPOSE_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
-python3 "${VALIDATOR}" environment
+if [[ "${VALIDATE_DS4_ENVIRONMENT:-1}" == "1" ]]; then
+  python3 "${VALIDATOR}" environment
+fi
 
 echo "[ds4-dapo] weights=expert-w${ROLLOUT_WEIGHT_BITS}/dense-w8 qat=${ENABLE_QAT} r3=${ENABLE_R3}"
 echo "[ds4-dapo] train=${TRAIN_FILES} val=${VAL_FILES} cmd=${CMD_FILE}"

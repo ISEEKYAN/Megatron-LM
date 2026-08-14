@@ -3,4 +3,38 @@
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from .vllm_ds4 import (
+    DS4KVInsertAdapter,
+    DS4TopKAdapter,
+    DeepEPAdapter,
+    DeepEPMode,
+    FlashMLAAdapter,
+    FusedExpertsAdapter,
+    FusedQKVRMSNormAdapter,
+    GateLinearAdapter,
+    GroupedDeepGemmExpertsAdapter,
+    GroupedFP8ExpertWeights,
+    HashRouteAdapter,
+    KVCacheLayout,
+    MHCKernel,
+    MHCTileLangAdapter,
+    SharedExpertsAdapter,
+)
+
+__all__ = [
+    "DS4KVInsertAdapter",
+    "DS4TopKAdapter",
+    "DeepEPAdapter",
+    "DeepEPMode",
+    "FlashMLAAdapter",
+    "FusedExpertsAdapter",
+    "FusedQKVRMSNormAdapter",
+    "GateLinearAdapter",
+    "GroupedDeepGemmExpertsAdapter",
+    "GroupedFP8ExpertWeights",
+    "HashRouteAdapter",
+    "KVCacheLayout",
+    "MHCKernel",
+    "MHCTileLangAdapter",
+    "SharedExpertsAdapter",
+]

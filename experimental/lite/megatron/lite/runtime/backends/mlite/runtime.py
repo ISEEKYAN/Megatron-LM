@@ -558,6 +558,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 loss=loss_tensor,
                 vocab_parallel_logits=out.get("logits") if out else None,
                 log_probs=out.get("log_probs") if out else None,
+                hidden_states=out.get("hidden_states") if out else None,
                 routed_experts=out.get("routed_experts") if out else None,
             ),
             metrics=metrics,
@@ -577,8 +578,26 @@ class MegatronLiteRuntime(RuntimeBase):
     def optimizer_step(self, handle: ModelHandle) -> tuple[bool, float, int | None]:
         if handle._optimizer is None:
             return True, 0.0, 0
-        update_successful, grad_norm, num_zeros = handle._optimizer.step()
-        return update_successful, float(grad_norm), num_zeros
+        result = handle._optimizer.step()
+        # Megatron optimizers return (success, norm, zero-count); native torch
+        # optimizers return an optional closure loss.  The DS4 vLLM protocol
+        # intentionally uses native AdamW over its BF16 masters.
+        if isinstance(result, tuple) and len(result) == 3:
+            update_successful, grad_norm, num_zeros = result
+            return update_successful, float(grad_norm), num_zeros
+        # Only native optimizers need a fallback norm.  FSDP2 parameters can
+        # span distinct dense/expert DeviceMeshes, so touching their DTensor
+        # gradients here (before inspecting the optimizer result) is invalid.
+        gradients = [
+            parameter.grad
+            for parameter in handle._model.parameters()
+            if parameter.grad is not None
+        ]
+        fallback_norm = 0.0
+        if gradients:
+            norms = torch._foreach_norm(gradients, 2)
+            fallback_norm = float(torch.linalg.vector_norm(torch.stack(norms)))
+        return True, fallback_norm, None
 
     def lr_scheduler_step(self, handle: ModelHandle) -> float | list[float]:
         if handle._lr_scheduler is not None:

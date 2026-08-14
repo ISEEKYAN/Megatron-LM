@@ -1,0 +1,538 @@
+"""Attention-core owner spanning KV cache insertion and sparse FlashMLA."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+from typing import Any
+
+import torch
+
+from ._contract import own_visible_tensor
+
+
+def _tensor_diagnostics(value):
+    detached = value.detach().float()
+    finite = torch.isfinite(detached)
+    finite_values = detached[finite]
+    return {
+        "shape": list(value.shape),
+        "dtype": str(value.dtype),
+        "finite_ratio": float(finite.float().mean()),
+        "min": float(finite_values.min()) if finite_values.numel() else None,
+        "max": float(finite_values.max()) if finite_values.numel() else None,
+        "abs_max": float(finite_values.abs().max()) if finite_values.numel() else None,
+    }
+
+
+def _sparse_contract_diagnostics(q, kv, out, grad_out, lse, sink, indices, scale, length):
+    """Return compact reference checks for a failing vendor backward call."""
+    flat_kv = kv.detach().reshape(-1, kv.shape[-1])
+    flat_indices = indices.detach()[:, 0] if indices.ndim == 3 else indices.detach()
+    ordinal = torch.arange(flat_indices.shape[-1], device=flat_indices.device)
+    valid = flat_indices >= 0
+    if length is not None:
+        valid &= ordinal.unsqueeze(0) < length.detach().reshape(-1, 1)
+    in_range = valid & (flat_indices < flat_kv.shape[0])
+    safe = flat_indices.clamp(0, max(0, flat_kv.shape[0] - 1)).long()
+    selected = flat_kv.float().index_select(0, safe.flatten()).view(
+        *safe.shape, flat_kv.shape[-1]
+    )
+    scores = torch.einsum("shd,std->sht", q.detach().float(), selected) * scale
+    scores = scores.masked_fill(~in_range.unsqueeze(1), float("-inf"))
+    kv_lse = torch.logsumexp(scores, dim=-1)
+    sink_scores = sink.detach().float().view(1, -1, 1).expand(q.shape[0], -1, -1)
+    probabilities = torch.softmax(torch.cat((scores, sink_scores), dim=-1), dim=-1)
+    out_reference = torch.einsum(
+        "sht,std->shd", probabilities[..., :-1], selected[..., : out.shape[-1]]
+    )
+    out_flat = out.detach().float().flatten()
+    ref_flat = out_reference.flatten()
+    sample_rows = sorted(
+        {row for row in (0, 1, 126, 127, 128, flat_indices.shape[0] - 1) if 0 <= row < flat_indices.shape[0]}
+    )
+    return {
+        "inputs": {
+            name: _tensor_diagnostics(value)
+            for name, value in (
+                ("q", q),
+                ("kv", kv),
+                ("out", out),
+                ("grad_out", grad_out),
+                ("lse", lse),
+                ("sink", sink),
+            )
+        },
+        "indices": {
+            "shape": list(flat_indices.shape),
+            "min": int(flat_indices.min()),
+            "max": int(flat_indices.max()),
+            "valid": int(valid.sum()),
+            "valid_out_of_range": int((valid & ~in_range).sum()),
+            "length_min": int(length.min()) if length is not None else None,
+            "length_max": int(length.max()) if length is not None else None,
+            "samples": {
+                str(row): {
+                    "length": int(length[row]) if length is not None else None,
+                    "prefix": flat_indices[row, :8].tolist(),
+                    "valid_prefix": flat_indices[row, : int(length[row])].tolist()[:8]
+                    if length is not None
+                    else [],
+                    "lse_finite_ratio": float(torch.isfinite(lse[row]).float().mean()),
+                    "out_abs_max": float(out[row].detach().float().abs().max()),
+                }
+                for row in sample_rows
+            },
+        },
+        "reference": {
+            "out_cosine": float(torch.nn.functional.cosine_similarity(out_flat, ref_flat, dim=0)),
+            "out_max_abs": float((out_flat - ref_flat).abs().max()),
+            "lse_max_abs_vs_natural_kv_only": float((lse.detach().float() - kv_lse).abs().max()),
+            "lse_max_abs_vs_log2_kv_only": float(
+                (lse.detach().float() - kv_lse * math.log2(math.e)).abs().max()
+            ),
+        },
+    }
+
+
+def _rope_and_qnorm(value, positions, cache, rope_dim, eps, *, normalize):
+    x = value.float()
+    if normalize:
+        x = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+    prefix, rope = x[..., :-rope_dim], x[..., -rope_dim:]
+    selected = cache.index_select(0, positions.long()).float()
+    cos = selected[..., : rope_dim // 2]
+    sin = selected[..., rope_dim // 2 : rope_dim]
+    while cos.ndim < rope.ndim:
+        cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
+    even, odd = rope[..., 0::2], rope[..., 1::2]
+    rotated = torch.stack((even * cos - odd * sin, odd * cos + even * sin), dim=-1)
+    return torch.cat((prefix, rotated.flatten(-2)), dim=-1).to(value.dtype)
+
+
+def _default_sparse_backward(q, kv, out, grad_out, lse, sink, indices, scale, length):
+    from megatron.lite.primitive.kernels import dsa_kernels
+
+    # The pinned DSA SM90 overlay still uses the pre-4.6 type annotation
+    # ``cute.core.ThrMma``.  CUTLASS 4.6 keeps the same class at
+    # ``cute.ThrMma`` but removed only that compatibility re-export.  Restore
+    # the alias locally before the overlay lazily imports its kernel modules;
+    # no runtime object or kernel behavior is changed.
+    import cutlass.cute as cute
+    import cutlass.cute.core as cute_core
+
+    if not hasattr(cute_core, "ThrMma"):
+        cute_core.ThrMma = cute.ThrMma
+    dsa_kernels._ensure_dsa_namespace()
+    # vLLM keeps the prefill workspace request-major even for batch=1
+    # ([S_kv, 1, D]), while the cuDNN DSA backward API consumes the flattened
+    # logical KV sequence ([total_S_kv, D]).  The query/output side is already
+    # token-major.  Flatten only the singleton/request dimension here so the
+    # visible forward layout remains untouched.
+    if kv.ndim > 2:
+        kv = kv.reshape(-1, kv.shape[-1])
+    if indices.ndim == 3 and indices.shape[1] == 1:
+        indices = indices[:, 0]
+    result = dsa_kernels._DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        grad_out,
+        lse,
+        sink,
+        indices,
+        softmax_scale=scale,
+        topk_length=length,
+    )
+    return result["dq"], result["dkv"]
+
+
+def _compressed_sequence_graph(
+    kv_score,
+    ape,
+    norm_weight,
+    positions,
+    cache,
+    *,
+    ratio,
+    head_dim,
+    rope_dim,
+    eps,
+):
+    """Differentiable compressor graph before the visible cache quantization."""
+    blocks = kv_score.shape[0] // ratio
+    if blocks == 0:
+        return kv_score.new_empty((0, head_dim))
+    cutoff = blocks * ratio
+    coff = 2 if ratio == 4 else 1
+    width = coff * head_dim
+    content, gate = kv_score[:cutoff].split((width, width), dim=-1)
+    content = content.view(blocks, ratio, coff, head_dim)
+    gate = gate.view_as(content) + ape.view(1, ratio, coff, head_dim)
+    if ratio == 4:
+        expanded_content = content.new_zeros((blocks, 2 * ratio, head_dim))
+        expanded_gate = gate.new_full((blocks, 2 * ratio, head_dim), float("-inf"))
+        expanded_content[:, ratio:] = content[:, :, 1]
+        expanded_gate[:, ratio:] = gate[:, :, 1]
+        if blocks > 1:
+            expanded_content[1:, :ratio] = content[:-1, :, 0]
+            expanded_gate[1:, :ratio] = gate[:-1, :, 0]
+        content, gate = expanded_content, expanded_gate
+    else:
+        content, gate = content.squeeze(2), gate.squeeze(2)
+    weights = torch.softmax(gate.float(), dim=1).to(content.dtype)
+    compressed = (content * weights).sum(dim=1).float()
+    compressed = compressed * torch.rsqrt(
+        compressed.square().mean(dim=-1, keepdim=True) + eps
+    )
+    compressed = compressed * norm_weight.float()
+    return _rope_and_qnorm(
+        compressed.to(kv_score.dtype),
+        positions[:cutoff:ratio],
+        cache,
+        min(rope_dim, head_dim),
+        eps,
+        normalize=False,
+    )
+
+
+def attach_indexer_aux_loss(
+    output,
+    q,
+    index_q,
+    index_kv_score,
+    index_weights,
+    main_kv_score,
+    index_ape,
+    index_norm,
+    main_ape,
+    main_norm,
+    positions,
+    cos_sin_cache,
+    topk_indices,
+    *,
+    ratio,
+    rope_dim,
+    eps,
+    softmax_scale,
+    loss_coeff,
+):
+    """Attach the established sparse IndexShare loss to visible vLLM output.
+
+    The visible indexer owns selection.  This graph replays exactly those
+    indices and differentiates only the scores on that fixed active set.
+    Attention query/KV targets are detached, matching Lite DSA semantics.
+    """
+    from megatron.lite.primitive.kernels.dsa_kernels import cp_indexer_loss
+    from megatron.lite.primitive.modules.attention.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
+
+    index_k = _compressed_sequence_graph(
+        index_kv_score,
+        index_ape,
+        index_norm,
+        positions,
+        cos_sin_cache,
+        ratio=ratio,
+        head_dim=index_q.shape[-1],
+        rope_dim=rope_dim,
+        eps=eps,
+    )
+    main_k = _compressed_sequence_graph(
+        main_kv_score,
+        main_ape,
+        main_norm,
+        positions,
+        cos_sin_cache,
+        ratio=ratio,
+        head_dim=q.shape[-1],
+        rope_dim=rope_dim,
+        eps=eps,
+    ).detach()
+    index_q_visible = _rope_and_qnorm(
+        index_q,
+        positions,
+        cos_sin_cache,
+        rope_dim,
+        eps,
+        normalize=False,
+    )
+    q_target = _rope_and_qnorm(
+        q,
+        positions,
+        cos_sin_cache,
+        rope_dim,
+        eps,
+        normalize=True,
+    ).detach()
+
+    fixed_topk = topk_indices.detach()
+    if fixed_topk.ndim == 2:
+        fixed_topk = fixed_topk.unsqueeze(0)
+    elif fixed_topk.ndim == 3 and fixed_topk.shape[1] == 1:
+        fixed_topk = fixed_topk[:, 0].unsqueeze(0)
+    if fixed_topk.ndim != 3 or fixed_topk.shape[0] != 1:
+        raise ValueError(
+            "DS4 vLLM indexer auxiliary loss currently requires one request; "
+            f"got topk shape {tuple(topk_indices.shape)}"
+        )
+    if fixed_topk.shape[1] != q.shape[0]:
+        raise ValueError("indexer top-k query rows do not match attention query rows")
+
+    query_rows = torch.arange(q.shape[0], device=q.device)
+    key_rows = torch.arange(index_k.shape[0], device=q.device)
+    valid_counts = (query_rows + 1).div(ratio, rounding_mode="floor")
+    mask = torch.where(
+        key_rows.unsqueeze(0) < valid_counts.unsqueeze(1),
+        torch.zeros((), device=q.device, dtype=torch.float32),
+        torch.full((), float("-inf"), device=q.device, dtype=torch.float32),
+    )
+    # Lite's indexer loss expects weights pre-scaled by H^-1/2; it applies
+    # D^-1/2 internally to the QK score.
+    scaled_weights = index_weights * (index_q.shape[1] ** -0.5)
+    indexer_loss = cp_indexer_loss(
+        index_q_visible.unsqueeze(1),
+        index_k.unsqueeze(1),
+        scaled_weights.unsqueeze(1),
+        fixed_topk,
+        q_target.unsqueeze(1),
+        main_k.unsqueeze(1),
+        mask=mask,
+        softmax_scale=softmax_scale,
+        loss_coeff=loss_coeff,
+        sparse_loss=True,
+        calculate_per_token_loss=False,
+    )
+    return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+
+
+class _VLLMAttentionCoreFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        visible_op,
+        backward_op,
+        scale,
+        eps,
+        rope_dim,
+        q,
+        kv,
+        workspace,
+        indices,
+        topk_length,
+        sink,
+        slots,
+        positions,
+        cos_sin_cache,
+        compressor_kv_score,
+        compressor_ape,
+        compressor_norm,
+        compressor_ratio,
+    ):
+        visible = visible_op(q, kv)
+        if not isinstance(visible, (tuple, list)) or len(visible) < 2:
+            raise RuntimeError("FlashMLA training forward must return output and lse")
+        out, lse = visible[:2]
+        q_visible = visible[2] if len(visible) > 2 else q
+        # Some vLLM metadata is finalized inside the visible call. In
+        # particular, prepare_flash replaces the initial compressor-only
+        # indices with the combined [compressed | SWA] tensor after KV insert.
+        # Save the tensors actually consumed by FlashMLA, not the stale
+        # arguments evaluated before visible_op ran.
+        workspace_visible = visible[3] if len(visible) > 3 else workspace
+        indices_visible = visible[4] if len(visible) > 4 else indices
+        topk_length_visible = visible[5] if len(visible) > 5 else topk_length
+        ctx.save_for_backward(
+            q,
+            kv,
+            q_visible,
+            workspace_visible,
+            indices_visible,
+            topk_length_visible,
+            sink,
+            slots,
+            positions,
+            cos_sin_cache,
+            out,
+            lse,
+            compressor_kv_score,
+            compressor_ape,
+            compressor_norm,
+        )
+        ctx.backward_op = backward_op or _default_sparse_backward
+        ctx.scale, ctx.eps, ctx.rope_dim = scale, eps, rope_dim
+        ctx.compressor_ratio = compressor_ratio
+        return own_visible_tensor(out)
+
+    @staticmethod
+    def backward(ctx: Any, grad_out):
+        (
+            q,
+            kv,
+            q_visible,
+            workspace,
+            indices,
+            topk_length,
+            sink,
+            slots,
+            positions,
+            cache,
+            out,
+            lse,
+            compressor_kv_score,
+            compressor_ape,
+            compressor_norm,
+        ) = ctx.saved_tensors
+        dq_visible, dworkspace = ctx.backward_op(
+            q_visible,
+            workspace,
+            out,
+            grad_out,
+            lse,
+            sink,
+            indices,
+            ctx.scale,
+            topk_length,
+        )
+        dq_finite = bool(torch.isfinite(dq_visible).all())
+        dworkspace_finite = bool(torch.isfinite(dworkspace).all())
+        if not dq_finite or not dworkspace_finite:
+            diagnostics = ""
+            if os.environ.get("DS4_DSA_DEBUG") == "1":
+                diagnostics = "; diagnostics=" + json.dumps(
+                    _sparse_contract_diagnostics(
+                        q_visible,
+                        workspace,
+                        out,
+                        grad_out,
+                        lse,
+                        sink,
+                        indices,
+                        ctx.scale,
+                        topk_length,
+                    ),
+                    sort_keys=True,
+                )
+            raise FloatingPointError(
+                "FlashMLA sparse backward produced non-finite gradients: "
+                f"compressor_ratio={ctx.compressor_ratio}, "
+                f"dq_finite={dq_finite}, dkv_finite={dworkspace_finite}"
+                f"{diagnostics}"
+            )
+        flat_dkv = dworkspace.reshape(-1, dworkspace.shape[-1])
+        valid = slots >= 0
+        compressed_len = (
+            compressor_kv_score.shape[0] // ctx.compressor_ratio
+            if ctx.compressor_ratio > 1
+            else 0
+        )
+        safe_slots = slots.clamp_min(0).long() + compressed_len
+        dkv_visible = flat_dkv.index_select(0, safe_slots)
+        dkv_visible = dkv_visible * valid.unsqueeze(-1)
+        with torch.enable_grad():
+            q_replay = q.detach().requires_grad_(True)
+            kv_replay = kv.detach().requires_grad_(True)
+            q_functional = _rope_and_qnorm(
+                q_replay,
+                positions,
+                cache,
+                ctx.rope_dim,
+                ctx.eps,
+                normalize=True,
+            )
+            kv_functional = _rope_and_qnorm(
+                kv_replay,
+                positions,
+                cache,
+                ctx.rope_dim,
+                ctx.eps,
+                normalize=False,
+            )
+            dq, dkv = torch.autograd.grad(
+                (q_functional, kv_functional),
+                (q_replay, kv_replay),
+                (dq_visible, dkv_visible),
+            )
+        dcompressor = dape = dcompressor_norm = None
+        if ctx.compressor_ratio > 1 and compressed_len:
+            with torch.enable_grad():
+                replay_inputs = tuple(
+                    value.detach().requires_grad_(True)
+                    for value in (
+                        compressor_kv_score,
+                        compressor_ape,
+                        compressor_norm,
+                    )
+                )
+                compressed = _compressed_sequence_graph(
+                    *replay_inputs,
+                    positions,
+                    cache,
+                    ratio=ctx.compressor_ratio,
+                    head_dim=dworkspace.shape[-1],
+                    rope_dim=ctx.rope_dim,
+                    eps=ctx.eps,
+                )
+                dcompressor, dape, dcompressor_norm = torch.autograd.grad(
+                    compressed,
+                    replay_inputs,
+                    dworkspace.reshape(-1, dworkspace.shape[-1])[:compressed_len],
+                )
+        return (
+            (None,) * 5
+            + (dq, dkv)
+            + (None,) * 7
+            + (dcompressor, dape, dcompressor_norm, None)
+        )
+
+
+def attention_core(
+    visible_op,
+    q,
+    kv,
+    workspace,
+    indices,
+    topk_length,
+    sink,
+    slots,
+    positions,
+    cos_sin_cache,
+    *,
+    softmax_scale: float,
+    eps: float,
+    rope_dim: int,
+    backward_op=None,
+    compressor_kv_score=None,
+    compressor_ape=None,
+    compressor_norm=None,
+    compressor_ratio: int = 1,
+):
+    if compressor_kv_score is None:
+        compressor_kv_score = q.new_empty((0, workspace.shape[-1]))
+        compressor_ape = q.new_empty((0, workspace.shape[-1]))
+        compressor_norm = q.new_empty((workspace.shape[-1],))
+    return _VLLMAttentionCoreFunction.apply(
+        visible_op,
+        backward_op,
+        softmax_scale,
+        eps,
+        rope_dim,
+        q,
+        kv,
+        workspace,
+        indices,
+        topk_length,
+        sink,
+        slots,
+        positions,
+        cos_sin_cache,
+        compressor_kv_score,
+        compressor_ape,
+        compressor_norm,
+        compressor_ratio,
+    )
+
+
+__all__ = ["attention_core"]

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import weakref
@@ -79,6 +81,44 @@ def _is_no_padding_pad_mode(pad_mode: Any) -> bool:
         or getattr(pad_mode, "value", None) == "no_padding"
         or str(pad_mode) in {"no_padding", "DatasetPadMode.NO_PADDING"}
     )
+
+
+def _write_parameter_snapshot(module: torch.nn.Module, *, phase: str, rank: int) -> None:
+    root = os.environ.get("VERL_MLITE_PARAM_SNAPSHOT_DIR")
+    if not root:
+        return
+    digest = hashlib.sha256()
+    tensor_count = 0
+    parameter_count = 0
+    for name, parameter in module.named_parameters():
+        value = parameter.detach()
+        if value.is_meta:
+            continue
+        flat = value.contiguous().view(torch.uint8).reshape(-1)
+        sample = (
+            flat
+            if flat.numel() <= 128
+            else torch.cat((flat[:64], flat[-64:]))
+        ).cpu()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(sample.numpy().tobytes())
+        tensor_count += 1
+        parameter_count += value.numel()
+    output = {
+        "schema_version": 1,
+        "phase": phase,
+        "rank": rank,
+        "sampled_sha256": digest.hexdigest(),
+        "tensor_count": tensor_count,
+        "parameter_count": parameter_count,
+    }
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, f"rank{rank:05d}.{phase}.json")
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(output, stream, indent=2, sort_keys=True)
+        stream.write("\n")
 
 
 class _MegatronLiteLRScheduler:
@@ -297,6 +337,7 @@ class MegatronLiteEngine(BaseEngine):
         )
         self.handle = self.runtime.build_model()
         self.module = self._extract_primary_module()
+        _write_parameter_snapshot(self.module, phase="pre_step", rank=self._rank)
 
         if self.handle._optimizer is not None and self.handle._lr_scheduler is None:
             self.handle._lr_scheduler = _build_lr_scheduler(
@@ -325,6 +366,7 @@ class MegatronLiteEngine(BaseEngine):
     def optimizer_step(self):
         self._require_initialized()
         _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
+        _write_parameter_snapshot(self.module, phase="post_step", rank=self._rank)
         return grad_norm
 
     def lr_scheduler_step(self):
@@ -627,11 +669,10 @@ class MegatronLiteEngine(BaseEngine):
 
     def _build_impl_cfg(self) -> dict[str, Any]:
         impl_cfg = dict(self.engine_config.impl_cfg)
-        if impl_cfg.get("use_thd", True) is not True:
-            raise ValueError(
-                "MegatronLiteEngine supports only THD/no-padding SFT; set engine.impl_cfg.use_thd=True."
-            )
-        impl_cfg["use_thd"] = True
+        # The engine always transports a flattened PackedBatch. Model protocols
+        # decide whether to materialize THD metadata; vLLM-kernel DS4 consumes
+        # the same packed tokens with its own runtime metadata instead.
+        impl_cfg.setdefault("use_thd", True)
         cross_entropy_fusion = getattr(self.engine_config, "cross_entropy_fusion", None)
         if cross_entropy_fusion is None:
             cross_entropy_fusion = getattr(self.engine_config, "use_fused_kernels", False)
