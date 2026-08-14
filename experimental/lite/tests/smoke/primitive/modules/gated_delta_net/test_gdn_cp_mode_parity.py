@@ -331,7 +331,11 @@ def main():
     ],
 )
 @pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
+@pytest.mark.optional
 def test_gdn_cp_mode_parity(expected_world_size):
+    pytest.importorskip(
+        "fla", reason="GatedDeltaNet CP parity smoke requires the FLA cp_context ring kernel."
+    )
     assert int(os.environ["WORLD_SIZE"]) == expected_world_size
     main()
 
