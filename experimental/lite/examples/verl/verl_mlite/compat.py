@@ -11,6 +11,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
@@ -1114,10 +1115,16 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
 
             context = copy_context()
             worker_future = executor.submit(context.run, produce)
+            timeout_s = float(os.environ.get("MLITE_WEIGHT_SYNC_TIMEOUT_S", "300"))
+            deadline = time.monotonic() + timeout_s
             while True:
                 try:
                     result = ready_results.get(timeout=0.1)
                 except queue.Empty:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"MLite weight prefetch exceeded {timeout_s:g} seconds"
+                        )
                     if worker_future.done():
                         worker_future.result()
                         raise RuntimeError("MLite weight prefetch stopped without a terminal result")

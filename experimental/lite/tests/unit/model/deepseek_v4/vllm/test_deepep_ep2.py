@@ -9,7 +9,12 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.lite.primitive.kernels.vllm_ds4 import DeepEPAdapter, DeepEPMode
+from megatron.lite.primitive.kernels.vllm_ds4 import (
+    DeepEPAdapter,
+    DeepEPMode,
+    HashRouteAdapter,
+)
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 
 
 def test_deepep_adapter_cpu_dispatch_combine_contract() -> None:
@@ -106,3 +111,171 @@ def test_torchrun_ep2_real_low_latency_dispatch_combine() -> None:
         buffer.destroy()
         if created_group:
             dist.destroy_process_group()
+
+
+@pytest.mark.gpus(2)
+def test_torchrun_ep2_rl_shape_normal_dispatch_is_memory_safe() -> None:
+    reason = _ep2_skip_reason()
+    if reason:
+        pytest.skip(reason)
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    created_group = not dist.is_initialized()
+    if created_group:
+        dist.init_process_group("nccl")
+    group = dist.group.WORLD
+    rank = dist.get_rank(group)
+    torch.manual_seed(47 + rank)
+
+    tokens, hidden, experts, topk = 640, 4096, 256, 6
+    parallel_state = SimpleNamespace(ep_size=2, tp_ep_group=group)
+    dispatcher = TokenDispatcher(
+        experts,
+        hidden,
+        parallel_state,
+        use_deepep=True,
+        deepep_align_to_low_latency=True,
+    )
+    hidden_states = torch.randn(
+        tokens,
+        hidden,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    topk_ids = torch.randint(
+        0,
+        experts,
+        (tokens, topk),
+        device="cuda",
+        dtype=torch.int64,
+    )
+    topk_weights = torch.softmax(
+        torch.randn(tokens, topk, device="cuda", dtype=torch.float32),
+        dim=-1,
+    )
+    compact, counts, probs = dispatcher.dispatch(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+    )
+    torch.cuda.synchronize()
+    assert compact.ndim == 2 and compact.shape[1] == hidden
+    assert counts.shape == (experts // 2,)
+    assert probs is not None and probs.dtype == torch.float32
+    dist.barrier(group=group)
+    for buffer in (dispatcher.buffer, dispatcher.route_buffer):
+        destroy = getattr(buffer, "destroy", None)
+        if callable(destroy):
+            destroy()
+    if created_group:
+        dist.destroy_process_group()
+
+
+@pytest.mark.gpus(8)
+def test_torchrun_dp4_ep2_four_layer_dispatch_is_memory_safe() -> None:
+    if importlib.util.find_spec("deep_ep") is None:
+        pytest.skip("requires the DeepEP Python package and compiled kernels")
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 8:
+        pytest.skip("requires eight visible CUDA GPUs")
+    if int(os.environ.get("WORLD_SIZE", "1")) != 8:
+        pytest.skip("requires torchrun --standalone --nproc-per-node=8")
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    created_group = not dist.is_initialized()
+    if created_group:
+        dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    ep_groups = [
+        dist.new_group(ranks=[start, start + 1], backend="nccl")
+        for start in range(0, 8, 2)
+    ]
+    ep_group = ep_groups[rank // 2]
+    torch.manual_seed(53 + rank)
+
+    tokens, hidden, experts, topk = 640, 4096, 256, 6
+    parallel_state = SimpleNamespace(ep_size=2, tp_ep_group=ep_group)
+    dispatchers = [
+        TokenDispatcher(
+            experts,
+            hidden,
+            parallel_state,
+            use_deepep=True,
+            deepep_align_to_low_latency=True,
+        )
+        for _ in range(4)
+    ]
+    hidden_states = torch.randn(
+        tokens,
+        hidden,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    topk_ids = torch.randint(
+        0,
+        experts,
+        (tokens, topk),
+        device="cuda",
+        dtype=torch.int64,
+    )
+    topk_weights = torch.softmax(
+        torch.randn(tokens, topk, device="cuda", dtype=torch.float32),
+        dim=-1,
+    )
+    hash_logits = torch.randn(
+        tokens,
+        experts,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    token_ids = torch.randint(
+        0,
+        129280,
+        (tokens,),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    hash_table = torch.randint(
+        0,
+        experts,
+        (129280, topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    hash_weights, hash_ids = HashRouteAdapter()(
+        hash_logits,
+        token_ids,
+        hash_table,
+        topk=topk,
+        renormalize=True,
+        routed_scaling_factor=1.5,
+    )
+    for dispatcher in dispatchers:
+        compact, counts, probs = dispatcher.dispatch(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+        )
+        torch.cuda.synchronize()
+        assert compact.ndim == 2 and compact.shape[1] == hidden
+        assert counts.shape == (experts // 2,)
+        assert probs is not None and probs.dtype == torch.float32
+    for dispatcher in dispatchers:
+        compact, counts, probs = dispatcher.dispatch(
+            hidden_states,
+            hash_weights,
+            hash_ids,
+        )
+        torch.cuda.synchronize()
+        assert compact.ndim == 2 and compact.shape[1] == hidden
+        assert counts.shape == (experts // 2,)
+        assert probs is not None and probs.dtype == torch.float32
+    dist.barrier()
+    for dispatcher in dispatchers:
+        for buffer in (dispatcher.buffer, dispatcher.route_buffer):
+            destroy = getattr(buffer, "destroy", None)
+            if callable(destroy) and getattr(buffer, "explicitly_destroy", False):
+                destroy()
+    if created_group:
+        dist.destroy_process_group()

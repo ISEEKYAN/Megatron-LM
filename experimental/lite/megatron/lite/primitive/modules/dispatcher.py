@@ -383,7 +383,7 @@ class TokenDispatcher:
             return_route_positions=True,
             expected_route_count=expected_route_count,
         )
-        _validate_and_order_route_preserving_outputs(
+        metadata_route_rows = _validate_and_order_route_preserving_outputs(
             expert_hidden,
             received_hidden,
             sanitized_indices,
@@ -394,10 +394,12 @@ class TokenDispatcher:
             received_route_weights.reshape(-1),
             order_outputs=False,
             route_positions=positions,
+            return_route_rows=True,
         )
 
         self._aligned_received_output_index = output_index
         self._aligned_received_positions = positions
+        self._aligned_metadata_route_rows = metadata_route_rows
         self._aligned_route_handle = route_handle
         self._aligned_source_indices = topk_indices
         self._aligned_source_weights = topk_scores
@@ -410,11 +412,9 @@ class TokenDispatcher:
     def _combine_low_latency_aligned(
         self, expert_output: torch.Tensor
     ) -> torch.Tensor:
-        positions = self._aligned_received_positions
-        route_rows = self._aligned_received_output_index[
-            positions[:, 0], positions[:, 1]
-        ]
-        route_outputs = expert_output.index_select(0, route_rows)
+        route_outputs = expert_output.index_select(
+            0, self._aligned_metadata_route_rows
+        )
         if self.ep_size > 1:
             source_routes = _DeepEPCombine.apply(
                 self.route_buffer,
@@ -436,6 +436,7 @@ class TokenDispatcher:
         for name in (
             "_aligned_received_output_index",
             "_aligned_received_positions",
+            "_aligned_metadata_route_rows",
             "_aligned_route_handle",
             "_aligned_source_indices",
             "_aligned_source_weights",

@@ -22,15 +22,21 @@ from megatron.lite.primitive.kernels.vllm_ds4 import (
     GroupedDeepGemmExpertsAdapter,
     HashRouteAdapter,
 )
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.quantization.deployment_block_fp8 import (
     DeploymentBlockFP8Adapter,
 )
 
 
+def _kernel_topk_weights(weights: torch.Tensor) -> torch.Tensor:
+    """Restore the FP32 grouped-kernel boundary after FSDP input casting."""
+    return weights if weights.dtype == torch.float32 else weights.float()
+
+
 @dataclass
 class MoEKernelMetadata:
-    """Caller-owned vLLM router and exact LL grouped-MoE lifecycle."""
+    """Caller-owned vLLM router metadata."""
 
     gate_linear: Callable[[torch.Tensor], Any] | None
     build_grouped_moe: Callable[[Any], Any] | None = None
@@ -135,6 +141,7 @@ class _LocalExpertsState(nn.Module):
         topk_ids: torch.Tensor,
         *,
         build_kernel: Callable[[Any], Any],
+        dispatcher: TokenDispatcher,
         global_num_experts: int,
     ) -> torch.Tensor:
         def visible(hidden, probs, ids, *weights):
@@ -143,9 +150,13 @@ class _LocalExpertsState(nn.Module):
                 hidden,
                 weights[:split],
                 weights[split:],
-                probs,
+                # FSDP2 mixed precision casts router outputs to BF16, while
+                # the official grouped-MoE kernel requires FP32 top-k weights.
+                _kernel_topk_weights(probs),
                 ids,
-                build_kernel=build_kernel,
+                build_kernel=lambda packed: build_kernel(
+                    packed, dispatcher=dispatcher
+                ),
                 global_num_experts=global_num_experts,
                 expert_map=self.expert_map,
             )
@@ -181,6 +192,13 @@ class DeepseekV4MoE(nn.Module):
         self.is_hash_layer = layer_idx < config.num_hash_layers
         self.gate = _RouterState(config, hash_layer=self.is_hash_layer)
         self.experts = _LocalExpertsState(config, self.ps)
+        self.dispatcher = TokenDispatcher(
+            config.n_routed_experts,
+            config.hidden_size,
+            self.ps,
+            use_deepep=use_deepep,
+            deepep_align_to_low_latency=True,
+        )
         self.shared_experts = (
             _SharedExpertsState(config) if config.n_shared_experts > 0 else None
         )
@@ -248,14 +266,14 @@ class DeepseekV4MoE(nn.Module):
             raise NotImplementedError("stage 'deepep' was not executed")
         if not self.use_deepep or metadata.build_grouped_moe is None:
             raise NotImplementedError(
-                "MoE requires an official DeepEPLLPrepareAndFinalize + "
-                "BatchedDeepGemmExperts kernel builder"
+                "MoE requires normal DeepEP transport aligned to low-latency semantics"
             )
         output = self.experts(
             hidden_states,
             topk_weights=topk_weights,
             topk_ids=topk_ids.to(dtype=torch.int64),
             build_kernel=metadata.build_grouped_moe,
+            dispatcher=self.dispatcher,
             global_num_experts=self.config.n_routed_experts,
         )
         if self.shared_experts is not None:

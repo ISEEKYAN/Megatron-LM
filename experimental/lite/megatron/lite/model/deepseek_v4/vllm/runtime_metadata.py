@@ -266,8 +266,11 @@ class DS4SparseAttentionMetadataBuilderAdapter:
             not isinstance(cos_sin_cache, torch.Tensor)
             or cos_sin_cache.ndim != 2
             or cos_sin_cache.device != self.device
+            or cos_sin_cache.dtype != torch.float32
         ):
-            raise ValueError("cos_sin_cache must be a 2D tensor on the runtime device")
+            raise ValueError(
+                "cos_sin_cache must be a 2D float32 tensor on the runtime device"
+            )
 
     @classmethod
     def from_hf(
@@ -290,7 +293,14 @@ class DS4SparseAttentionMetadataBuilderAdapter:
             compress_ratio=1,
             device=device,
         )
-        return cls(config, device=device, cos_sin_cache=rotary.cos_sin_cache)
+        return cls(
+            config,
+            device=device,
+            cos_sin_cache=rotary.cos_sin_cache.to(
+                device=device,
+                dtype=torch.float32,
+            ),
+        )
 
     def _cache_and_layout(self, seq_len: int) -> tuple[torch.Tensor, DS4RuntimeLayout]:
         if seq_len <= 0:
@@ -606,8 +616,14 @@ class DS4SparseIndexerCompressorMetadataAdapter:
             raise ValueError(
                 "official DS4 metadata requires head_dim=512/index_dim=128"
             )
-        if cos_sin_cache.ndim != 2 or cos_sin_cache.device != self.device:
-            raise ValueError("cos_sin_cache must be 2D and on the runtime device")
+        if (
+            cos_sin_cache.ndim != 2
+            or cos_sin_cache.device != self.device
+            or cos_sin_cache.dtype != torch.float32
+        ):
+            raise ValueError(
+                "cos_sin_cache must be 2D float32 and on the runtime device"
+            )
 
     @classmethod
     def from_hf(
@@ -634,7 +650,10 @@ class DS4SparseIndexerCompressorMetadataAdapter:
             config,
             layer_idx=layer_idx,
             device=device,
-            cos_sin_cache=rotary.cos_sin_cache,
+            cos_sin_cache=rotary.cos_sin_cache.to(
+                device=device,
+                dtype=torch.float32,
+            ),
         )
 
     def _base_prefill(self, num_tokens: int):
@@ -1400,14 +1419,14 @@ class DS4SparseIndexerCompressorMetadataAdapter:
 
 
 class DS4MoEKernelMetadataBuilderAdapter:
-    """Build the router and the previously exact vLLM LL grouped-MoE path."""
+    """Build vLLM router metadata, optionally with the LL oracle kernel."""
 
     def __init__(
         self,
         config: DeepseekV4Config,
         *,
         device: torch.device | str,
-        deepep_buffer: Any,
+        deepep_buffer: Any | None = None,
         ep_size: int,
         max_tokens_per_rank: int,
         layer_idx: int = 0,

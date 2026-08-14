@@ -612,6 +612,7 @@ def _validate_and_order_route_preserving_outputs(
     *,
     order_outputs: bool = True,
     route_positions: torch.Tensor | None = None,
+    return_route_rows: bool = False,
 ) -> torch.Tensor:
     """Return expert outputs in the route handle's receive order.
 
@@ -644,22 +645,83 @@ def _validate_and_order_route_preserving_outputs(
             f"{tuple(route_fingerprints.shape)} != {tuple(expected_fingerprints.shape)}"
         )
 
-    torch._assert_async(
-        torch.all(expected_indices == route_indices.to(dtype=expected_indices.dtype)),
-        "Route-preserving DeepEP metadata changed local expert order",
+    def stable_key_order(
+        fingerprints: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Lexicographically order exact route identity without hashing."""
+        order = torch.arange(
+            indices.numel(), device=indices.device, dtype=torch.long
+        )
+        fingerprint_bits = fingerprints.contiguous().view(torch.int16)
+        weight_bits = weights.contiguous().view(torch.int32)
+        columns = [
+            *(fingerprint_bits[:, column] for column in range(fingerprint_bits.shape[1])),
+            indices.to(dtype=torch.long),
+            weight_bits.to(dtype=torch.long),
+        ]
+        # Stable least-significant-to-most-significant sorts implement a
+        # deterministic lexicographic order and retain duplicate multiplicity.
+        for column in reversed(columns):
+            permutation = torch.argsort(
+                column.index_select(0, order), stable=True
+            )
+            order = order.index_select(0, permutation)
+        return order
+
+    primary_order = stable_key_order(
+        expected_fingerprints, expected_indices, expected_weights
+    )
+    metadata_order = stable_key_order(
+        route_fingerprints,
+        route_indices.to(dtype=expected_indices.dtype),
+        route_weights.to(dtype=expected_weights.dtype),
     )
     torch._assert_async(
-        torch.all(expected_weights == route_weights.to(dtype=expected_weights.dtype)),
-        "Route-preserving DeepEP metadata changed route probability order",
+        torch.all(
+            expected_indices.index_select(0, primary_order)
+            == route_indices.to(dtype=expected_indices.dtype).index_select(
+                0, metadata_order
+            )
+        ),
+        "Route-preserving DeepEP metadata changed expert identities",
     )
     torch._assert_async(
-        torch.all(expected_fingerprints == route_fingerprints),
-        "Route-preserving DeepEP metadata changed source-token order",
+        torch.all(
+            expected_weights.contiguous().view(torch.int32).index_select(
+                0, primary_order
+            )
+            == route_weights.to(dtype=expected_weights.dtype)
+            .contiguous()
+            .view(torch.int32)
+            .index_select(0, metadata_order)
+        ),
+        "Route-preserving DeepEP metadata changed exact route probabilities",
+    )
+    torch._assert_async(
+        torch.all(
+            expected_fingerprints.contiguous()
+            .view(torch.int16)
+            .index_select(0, primary_order)
+            == route_fingerprints.contiguous()
+            .view(torch.int16)
+            .index_select(0, metadata_order)
+        ),
+        "Route-preserving DeepEP metadata changed source fingerprints",
     )
 
+    # metadata_to_primary[m] is the corresponding route occurrence in the
+    # primary hidden dispatch.  Stable ordering gives duplicate identities a
+    # deterministic one-to-one pairing; identical duplicates are semantically
+    # interchangeable.
+    metadata_to_primary = torch.empty_like(metadata_order)
+    metadata_to_primary.scatter_(0, metadata_order, primary_order)
+    primary_route_rows = output_index[token_rows, topk_slots].to(dtype=torch.long)
+    route_rows = primary_route_rows.index_select(0, metadata_to_primary)
+    if return_route_rows:
+        return route_rows
     if not order_outputs:
         return expert_outputs
-    route_rows = output_index[token_rows, topk_slots].to(dtype=torch.long)
     return expert_outputs.index_select(0, route_rows)
-
 

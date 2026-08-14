@@ -302,10 +302,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     selected_layers = impl_cfg.selector.global_layer_ids
     attention_builders = None
     moe_metadata = None
-    deepep_buffer = None
 
     def ensure_runtime_assets():
-        nonlocal attention_builders, moe_metadata, deepep_buffer
+        nonlocal attention_builders, moe_metadata
         if attention_builders is not None and moe_metadata is not None:
             return attention_builders, moe_metadata
         device = next(model.parameters()).device
@@ -326,17 +325,10 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 if layer_idx > 0
             },
         }
-        deepep_buffer = DS4MoEKernelMetadataBuilderAdapter.create_deepep_buffer(
-            model_cfg,
-            group=parallel_state.ep_group,
-            ep_size=parallel_state.ep_size,
-            max_tokens_per_rank=impl_cfg.max_tokens_per_rank,
-        )
         moe_metadata = {
             layer_idx: DS4MoEKernelMetadataBuilderAdapter(
                 model_cfg,
                 device=device,
-                deepep_buffer=deepep_buffer,
                 ep_size=parallel_state.ep_size,
                 max_tokens_per_rank=impl_cfg.max_tokens_per_rank,
                 layer_idx=layer_idx,
@@ -435,6 +427,10 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                         # path records and restores each parameter's model
                         # dtype for forward execution.
                         use_fp32_shards=True,
+                        # DS4 vLLM kernels own their mixed-dtype boundaries
+                        # (BF16 hidden states, FP32 RoPE/router/mHC metadata).
+                        # Recursive FSDP casting corrupts those contracts.
+                        cast_forward_inputs=False,
                     )
                 }
 

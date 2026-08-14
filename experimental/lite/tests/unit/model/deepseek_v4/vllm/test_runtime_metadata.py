@@ -97,7 +97,7 @@ def test_vllm_forward_context_gathers_tokens_on_ep_group(monkeypatch) -> None:
 
 def test_layer0_rope_uses_official_vllm_config_loader(monkeypatch) -> None:
     hf_config = SimpleNamespace()
-    cos = torch.empty(32, 64)
+    cos = torch.empty(32, 64, dtype=torch.bfloat16)
     rotary = SimpleNamespace(cos_sin_cache=cos)
     get_config = Mock(return_value=hf_config)
     build = Mock(return_value=rotary)
@@ -114,7 +114,8 @@ def test_layer0_rope_uses_official_vllm_config_loader(monkeypatch) -> None:
 
     get_config.assert_called_once_with("/model", trust_remote_code=True)
     build.assert_called_once()
-    assert metadata.cos_sin_cache is cos
+    assert metadata.cos_sin_cache.dtype == torch.float32
+    torch.testing.assert_close(metadata.cos_sin_cache, cos.float(), rtol=0, atol=0)
 
 
 def test_rope_custom_op_is_built_in_scoped_vllm_config(monkeypatch) -> None:
@@ -149,7 +150,7 @@ def test_rope_custom_op_is_built_in_scoped_vllm_config(monkeypatch) -> None:
 def test_layer0_prefill_metadata_exact_contract(monkeypatch) -> None:
     gather = Mock()
     monkeypatch.setattr(runtime, "_symbol", lambda _module, _name: gather)
-    cos = torch.empty(256, 128, dtype=torch.bfloat16)
+    cos = torch.empty(256, 128, dtype=torch.float32)
     metadata = runtime.DS4SparseAttentionMetadataBuilderAdapter(
         _config(), device="cpu", cos_sin_cache=cos
     ).build_prefill(130)
@@ -188,7 +189,7 @@ def test_layer0_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> Non
     metadata = runtime.DS4SparseAttentionMetadataBuilderAdapter(
         _config(),
         device="cpu",
-        cos_sin_cache=torch.empty(256, 128, dtype=torch.bfloat16),
+        cos_sin_cache=torch.empty(256, 128, dtype=torch.float32),
     ).build_prefill_batch([3, 2])
 
     assert metadata.positions.tolist() == [0, 1, 2, 0, 1]
@@ -435,7 +436,7 @@ def test_prefill_indices_are_bitwise_official_vllm() -> None:
     builder = runtime.DS4SparseAttentionMetadataBuilderAdapter(
         config,
         device="cuda",
-        cos_sin_cache=torch.empty(512, 128, dtype=torch.bfloat16, device="cuda"),
+        cos_sin_cache=torch.empty(512, 128, dtype=torch.float32, device="cuda"),
     )
     candidate = builder.build_prefill(num_tokens)
     reference_indices, reference_lens = combine_topk_swa_indices(

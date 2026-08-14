@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import time
 import weakref
 from enum import Enum
 from types import SimpleNamespace
@@ -283,7 +284,16 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
     def __exit__(self, exc_type, exc_val, exc_tb):
         assert self._runtime_ctx is not None
         self._runtime_ctx.__exit__(exc_type, exc_val, exc_tb)
-        super().__exit__(exc_type, exc_val, exc_tb)
+        try:
+            super().__exit__(exc_type, exc_val, exc_tb)
+        except Exception as cleanup_error:
+            if exc_type is None:
+                raise
+            print(
+                "MLITE_CONTEXT_CLEANUP_ERROR "
+                f"preserving original {exc_type.__name__}: {cleanup_error!r}",
+                flush=True,
+            )
         return False
 
 
@@ -322,12 +332,23 @@ class MegatronLiteEngine(BaseEngine):
         return self.engine_config.optimizer_offload
 
     def initialize(self):
+        started_at = time.monotonic()
+
+        def log_stage(stage: str) -> None:
+            print(
+                f"MLITE_INIT_STAGE rank={self._rank} stage={stage} "
+                f"elapsed_s={time.monotonic() - started_at:.3f}",
+                flush=True,
+            )
+
+        log_stage("begin")
         if self.engine_config.full_determinism:
             from verl.workers.engine.utils import enable_full_determinism
 
             enable_full_determinism(seed=self.engine_config.seed)
 
         self._mlite_config = self._build_mlite_config()
+        log_stage("config_built")
         self.runtime = create_runtime(
             RuntimeConfig(
                 backend="mlite",
@@ -335,14 +356,19 @@ class MegatronLiteEngine(BaseEngine):
                 backend_cfg=self._mlite_config,
             )
         )
+        log_stage("runtime_created")
+        log_stage("build_model_begin")
         self.handle = self.runtime.build_model()
+        log_stage("build_model_done")
         self.module = self._extract_primary_module()
         _write_parameter_snapshot(self.module, phase="pre_step", rank=self._rank)
+        log_stage("parameter_snapshot_done")
 
         if self.handle._optimizer is not None and self.handle._lr_scheduler is None:
             self.handle._lr_scheduler = _build_lr_scheduler(
                 self.handle._optimizer, self._mlite_config.optimizer
             )
+        log_stage("scheduler_ready")
 
         self.to(
             device="cpu",
@@ -350,6 +376,7 @@ class MegatronLiteEngine(BaseEngine):
             optimizer=self.is_optimizer_offload_enabled,
             grad=self.is_param_offload_enabled,
         )
+        log_stage("offload_done")
 
     def train_mode(self, **kwargs):
         self._require_initialized()

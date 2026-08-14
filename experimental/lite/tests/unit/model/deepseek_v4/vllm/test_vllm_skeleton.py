@@ -18,11 +18,41 @@ from megatron.lite.model.deepseek_v4.vllm.model import (
     AttentionAdapters,
     AttentionKernelMetadata,
     DeepseekV4Model,
+    _AttentionState,
 )
-from megatron.lite.model.deepseek_v4.vllm.moe import MoEKernelMetadata
+from megatron.lite.model.deepseek_v4.vllm.moe import (
+    MoEKernelMetadata,
+    _kernel_topk_weights,
+)
 from megatron.lite.primitive.autograd import inference_only
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.runtime.contracts import ParallelConfig
+
+
+def test_attention_restores_fp32_rope_after_fsdp_input_cast() -> None:
+    attention = _AttentionState.__new__(_AttentionState)
+    torch.nn.Module.__init__(attention)
+    metadata = SimpleNamespace(
+        cos_sin_cache=torch.empty(8, 4, dtype=torch.bfloat16)
+    )
+
+    class _StopAfterBoundary(Exception):
+        pass
+
+    def stop(_stage):
+        raise _StopAfterBoundary
+
+    attention._selected = stop
+    with pytest.raises(_StopAfterBoundary):
+        attention.forward(torch.empty(2, 4), metadata=metadata)
+    assert metadata.cos_sin_cache.dtype == torch.float32
+
+
+def test_grouped_moe_restores_fp32_router_weights_after_fsdp_cast() -> None:
+    weights = torch.tensor([[0.25, 0.75]], dtype=torch.bfloat16)
+    restored = _kernel_topk_weights(weights)
+    assert restored.dtype == torch.float32
+    torch.testing.assert_close(restored, weights.float(), rtol=0, atol=0)
 
 
 def _tiny_config() -> DeepseekV4Config:
@@ -225,6 +255,7 @@ def test_build_contract_defers_fsdp2_until_after_weight_load(monkeypatch) -> Non
     assert calls["config"] is optimizer_config
     assert calls["ps"] is parallel_state
     assert calls["kwargs"]["use_fp32_shards"] is True
+    assert calls["kwargs"]["cast_forward_inputs"] is False
 
 
 def test_verl_packed_batch_builds_per_layer_runtime_metadata(monkeypatch) -> None:

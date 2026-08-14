@@ -745,10 +745,13 @@ class GroupedFP8ExpertWeights:
 
 
 class GroupedDeepGemmExpertsAdapter(_Adapter):
-    """BF16 masters into the official DeepEP + BatchedDeepGemm pipeline."""
+    """BF16 masters into the official batched-DeepGEMM pipeline."""
 
     _EXPERTS_CLASS = "BatchedDeepGemmExperts"
-    _PREPARE_CLASS = "DeepEPLLPrepareAndFinalize"
+    _PREPARE_CLASSES = {
+        "DeepEPLLPrepareAndFinalize",
+        "_NormalDeepEPAlignedPrepareAndFinalize",
+    }
 
     def __init__(
         self,
@@ -826,11 +829,11 @@ class GroupedDeepGemmExpertsAdapter(_Adapter):
             )
         if (
             prepare_finalize is None
-            or prepare_finalize.__class__.__name__ != self._PREPARE_CLASS
+            or prepare_finalize.__class__.__name__ not in self._PREPARE_CLASSES
         ):
             raise RuntimeError(
                 "grouped MoE builder must return FusedMoEKernel with "
-                "DeepEPLLPrepareAndFinalize"
+                "a supported DeepEP prepare/finalize"
             )
         for name, expected in (
             ("w1_scale", packed.w13_scale),
@@ -865,7 +868,7 @@ class GroupedDeepGemmExpertsAdapter(_Adapter):
 
 
 class GroupedMoEKernelBuilderAdapter:
-    """Construct the official DeepEP-LL + BatchedDeepGemm kernel per forward."""
+    """Construct official BatchedDeepGemm with LL or aligned normal DeepEP."""
 
     def __init__(
         self,
@@ -881,8 +884,6 @@ class GroupedMoEKernelBuilderAdapter:
         num_dispatchers: int,
         use_fp8_dispatch: bool = True,
     ) -> None:
-        if deepep_buffer is None:
-            raise ValueError("grouped MoE builder requires a DeepEP buffer")
         positive = {
             "num_experts": num_experts,
             "num_local_experts": num_local_experts,
@@ -906,7 +907,7 @@ class GroupedMoEKernelBuilderAdapter:
         self.num_dispatchers = num_dispatchers
         self.use_fp8_dispatch = use_fp8_dispatch
 
-    def __call__(self, packed: GroupedFP8ExpertWeights) -> Any:
+    def __call__(self, packed: GroupedFP8ExpertWeights, *, dispatcher=None) -> Any:
         config_module = (
             "vllm.model_executor.layers.fused_moe.config"
         )
@@ -935,15 +936,31 @@ class GroupedMoEKernelBuilderAdapter:
             in_dtype=torch.bfloat16,
             max_num_tokens=self.max_tokens_per_rank,
         )
-        prepare = _symbol(
-            "vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll",
-            "DeepEPLLPrepareAndFinalize",
-        )(
-            self.deepep_buffer,
-            max_tokens_per_rank=self.max_tokens_per_rank,
-            num_dispatchers=self.num_dispatchers,
-            use_fp8_dispatch=self.use_fp8_dispatch,
-        )
+        if dispatcher is None:
+            if self.deepep_buffer is None:
+                raise ValueError(
+                    "grouped MoE builder requires either an LL buffer or "
+                    "an aligned normal-DeepEP dispatcher"
+                )
+            prepare = _symbol(
+                "vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll",
+                "DeepEPLLPrepareAndFinalize",
+            )(
+                self.deepep_buffer,
+                max_tokens_per_rank=self.max_tokens_per_rank,
+                num_dispatchers=self.num_dispatchers,
+                use_fp8_dispatch=self.use_fp8_dispatch,
+            )
+        else:
+            from megatron.lite.primitive.alignment.vllm_batched_prepare import (
+                NormalDeepEPAlignedPrepareAndFinalize,
+            )
+
+            prepare = NormalDeepEPAlignedPrepareAndFinalize.build(
+                dispatcher,
+                max_tokens_per_rank=self.max_tokens_per_rank,
+                num_dispatchers=self.num_dispatchers,
+            )
         experts = _symbol(
             "vllm.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe",
             "BatchedDeepGemmExperts",

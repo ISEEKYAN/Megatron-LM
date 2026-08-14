@@ -111,6 +111,30 @@ def test_mhc_export_preserves_fp32_values() -> None:
     )
 
 
+def test_export_materializes_fsdp2_dtensor_before_conversion() -> None:
+    source = torch.tensor([0.6337993144989014], dtype=torch.bfloat16)
+    calls = []
+
+    class _DTensorProxy:
+        def full_tensor(self):
+            calls.append("full_tensor")
+            return source
+
+    class _Model(torch.nn.Module):
+        def state_dict(self, *args, **kwargs):
+            return {"hc_head.hc_fn": _DTensorProxy()}
+
+    exported = dict(
+        checkpoint.export_hf_weights(
+            _Model(),
+            DeepseekV4Config(hidden_size=128),
+            ParallelState(),
+        )
+    )
+    assert calls == ["full_tensor"]
+    torch.testing.assert_close(exported["hc_head_fn"], source.float(), rtol=0, atol=0)
+
+
 def test_bf16_master_checkpoint_load_skips_fp8_scale_pairs() -> None:
     config = DeepseekV4Config(
         hidden_size=128,

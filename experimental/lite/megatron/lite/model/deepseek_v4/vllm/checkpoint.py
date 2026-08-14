@@ -423,6 +423,12 @@ def export_hf_weights(
     spec.validate_load(ps)
     for model in _models(chunks):
         for native_name, tensor in model.state_dict().items():
+            full_tensor = getattr(tensor, "full_tensor", None)
+            if callable(full_tensor):
+                # FSDP2 state_dict values are DTensors. Export is an online
+                # inference boundary and must materialize each BF16 master
+                # parameter before dtype conversion and bucket packing.
+                tensor = full_tensor()
             if not tensor.is_floating_point():
                 output = tensor.detach()
             else:

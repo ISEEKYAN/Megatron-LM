@@ -285,6 +285,12 @@ class _AttentionState(nn.Module):
             raise ValueError("layer-0 attention requires flat [tokens, hidden]")
         if metadata is None:
             raise NotImplementedError("layer-0 attention requires explicit metadata")
+        # FSDP2 mixed precision recursively casts floating forward inputs,
+        # including tensors nested in this metadata dataclass. FlashMLA's RoPE
+        # kernels require the cache to remain FP32, so restore that boundary
+        # after the FSDP pre-forward hook has run.
+        if metadata.cos_sin_cache.dtype != torch.float32:
+            metadata.cos_sin_cache = metadata.cos_sin_cache.float()
         self._selected("linear")
         qr_kv, projection_outputs = self._input_projections(hidden_states)
         compressor_kv_score, indexer_weights, indexer_kv_score = projection_outputs
