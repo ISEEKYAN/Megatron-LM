@@ -10,6 +10,10 @@ pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu]
 
 
 def _make_dsa():
+    pytest.importorskip(
+        "flash_mla",
+        reason="GLM5 DSA accept-with-proof needs FlashMLA sparse attention kernels.",
+    )
     pytest.importorskip("cudnn", reason="GLM5 DSA accept-with-proof needs cudnn DSA.")
     from megatron.lite.primitive.modules.attention import DynamicSparseAttention
 
