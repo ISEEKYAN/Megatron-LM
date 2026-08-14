@@ -94,9 +94,11 @@ def test_four_arm_launcher_selects_only_the_intended_features(
     assert _add_or_override(
         tokens, "actor_rollout_ref.actor.engine.impl_cfg.qat.group_size"
     ) == expected_group_size
+    # Recompute is deliberately owned by the base launcher.  Repeating it in
+    # this QAT wrapper makes Hydra reject otherwise valid composed jobs.
     assert _add_or_override(
         tokens, "actor_rollout_ref.actor.engine.impl_cfg.recompute"
-    ) == "full"
+    ) is None
     assert _add_or_override(
         tokens, "actor_rollout_ref.actor.engine.router_replay_mode"
     ) == ("R3" if router_replay else None)

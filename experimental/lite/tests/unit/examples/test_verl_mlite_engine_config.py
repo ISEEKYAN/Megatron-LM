@@ -93,12 +93,16 @@ def test_verl_loss_hook_has_no_strong_self_reference():
     assert all(cell.cell_contents is not hook for cell in (hook.__closure__ or ()))
 
 
-def test_verl_loss_hook_honors_runtime_output_collector():
+def test_verl_loss_hook_honors_runtime_output_collector(monkeypatch):
     engine = _engine(engine_config=_engine_config())
     outputs = []
     engine._build_verl_model_output = lambda **_kwargs: {"log_probs": torch.tensor(1.0)}
     hook = engine._make_runtime_loss_fn(None, num_microbatches=1, output_lst=outputs)
 
+    # This is a CPU contract test for the collector branch.  The production
+    # training hook runs on the runtime-selected accelerator; pin that lookup
+    # to CPU here so an empty loss does not turn this test into a CUDA probe.
+    monkeypatch.setattr("verl_mlite.engine.mlite_engine.get_device_id", lambda: "cpu")
     hook.runtime_collects_outputs = True
     hook({}, object(), LossContext(source_batch=object()))
 
