@@ -22,63 +22,12 @@ if importlib.util.find_spec("safetensors") is None:
 
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
-    _copy_loaded_tensor_,
-    _read_hf_tensors,
     _iter_bucketed_materialized_tensors,
     bucketed_all_gather_into_tensor,
     export_hf_weights,
     stream_export_to_shards,
 )
 from megatron.lite.primitive.quantization.qat import QATSpec, apply_qat_to_chunks
-
-
-def test_copy_loaded_tensor_slices_cpu_source_for_dtensor(monkeypatch) -> None:
-    source = torch.arange(24, dtype=torch.float32).reshape(6, 4)
-    local = torch.empty(3, 4)
-
-    class FakeDTensor:
-        shape = source.shape
-        device_mesh = object()
-        placements = (object(),)
-
-        def to_local(self):
-            return local
-
-    monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights._is_dtensor", lambda tensor: True
-    )
-    monkeypatch.setattr(
-        "torch.distributed.tensor._utils.compute_local_shape_and_global_offset",
-        lambda shape, mesh, placements: ((3, 4), (3, 0)),
-    )
-
-    _copy_loaded_tensor_(FakeDTensor(), source)
-
-    assert torch.equal(local, source[3:])
-
-
-def test_hf_reader_keeps_full_source_on_cpu_for_dtensor(monkeypatch) -> None:
-    calls = []
-
-    class FakeTarget:
-        shape = torch.Size((6, 4))
-        device = torch.device("cuda")
-        dtype = torch.bfloat16
-
-    class FakeReader:
-        def get_tensor(self, name, **kwargs):
-            calls.append((name, kwargs))
-            return torch.zeros(6, 4)
-
-    monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights._is_dtensor", lambda tensor: True
-    )
-
-    _read_hf_tensors(
-        FakeReader(), object(), "proj.weight", ["model.proj.weight"], FakeTarget()
-    )
-
-    assert calls[0][1]["device"] == "cpu"
 
 
 def test_safe_tensor_reader_context_reuses_and_closes_shard(

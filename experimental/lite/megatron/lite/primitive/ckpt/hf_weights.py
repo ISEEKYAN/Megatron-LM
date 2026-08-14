@@ -35,7 +35,6 @@ except Exception:  # pragma: no cover - older torch without DTensor
 from megatron.lite.primitive.ckpt.weight_sync_probe import (  # isort: skip
     get_weight_sync_probe,
 )
-from megatron.lite.primitive.init_device import record_materialized_tensor
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -985,7 +984,6 @@ def load_hf_weights(
                 )
                 if loaded_name is not None:
                     loaded_names.add(loaded_name)
-                    record_materialized_tensor(base_model, loaded_name)
                 continue
 
             actual = _resolve_param_name(mapped, state)
@@ -1015,8 +1013,7 @@ def load_hf_weights(
             replica_ranks: list[int] | None = None
             source_global_rank: int | None = None
             if (
-                not _is_dtensor(target)
-                and replica_group is not None
+                replica_group is not None
                 and dist.is_initialized()
                 and dist.get_world_size(replica_group) > 1
             ):
@@ -1036,7 +1033,6 @@ def load_hf_weights(
                         target.data, src=source_global_rank, group=replica_group
                     )
                     loaded_names.add(actual)
-                    record_materialized_tensor(base_model, actual)
                     continue
 
             try:
@@ -1097,13 +1093,13 @@ def load_hf_weights(
                             tensor, ps.etp_rank, ps.etp_size, dim=split_d
                         )
 
-            _copy_loaded_tensor_(target, tensor)
+            converted = tensor.to(device=target.device, dtype=target.dtype)
+            target.data.copy_(converted)
             if replica_ranks is not None:
                 assert source_global_rank is not None
                 dist.broadcast(target.data, src=source_global_rank, group=replica_group)
             loaded_names.add(actual)
-            record_materialized_tensor(base_model, actual)
-            del hf_tensors, tensor
+            del hf_tensors, tensor, converted
 
     for name, _param in base_model.named_parameters():
         if name in loaded_names or "lora" in name.lower() or "adapter" in name.lower():
@@ -1157,8 +1153,7 @@ def _load_expert_weight(
     replica_ranks: list[int] | None = None
     source_global_rank: int | None = None
     if (
-        not _is_dtensor(target)
-        and replica_group is not None
+        replica_group is not None
         and dist.is_initialized()
         and dist.get_world_size(replica_group) > 1
     ):
@@ -1195,38 +1190,13 @@ def _load_expert_weight(
             else:
                 tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
-    _copy_loaded_tensor_(target, tensor)
+    converted = tensor.to(device=target.device, dtype=target.dtype)
+    target.data.copy_(converted)
     if replica_ranks is not None:
         assert source_global_rank is not None
         dist.broadcast(target.data, src=source_global_rank, group=replica_group)
-    del hf_tensors, tensor
+    del hf_tensors, tensor, converted
     return actual
-
-
-def _is_dtensor(tensor: torch.Tensor) -> bool:
-    return DTensor is not None and isinstance(tensor, DTensor)
-
-
-def _copy_loaded_tensor_(target: torch.Tensor, source: torch.Tensor) -> None:
-    """Copy a CPU checkpoint tensor without staging a full FSDP shard on GPU."""
-
-    with torch.no_grad():
-        if _is_dtensor(target):
-            from torch.distributed.tensor._utils import (
-                compute_local_shape_and_global_offset,
-            )
-
-            local_shape, offset = compute_local_shape_and_global_offset(
-                tuple(target.shape), target.device_mesh, target.placements
-            )
-            slices = tuple(
-                slice(dim_offset, dim_offset + dim_size)
-                for dim_offset, dim_size in zip(offset, local_shape, strict=True)
-            )
-            local = target.to_local()
-            local.copy_(source[slices].to(device=local.device, dtype=local.dtype))
-            return
-        target.copy_(source.to(device=target.device, dtype=target.dtype))
 
 
 def _handle_missing_hf_tensors(
@@ -1296,7 +1266,7 @@ def _read_hf_tensors(
             target_shape = None
         tensor = reader.get_tensor(
             resolved,
-            device="cpu" if _is_dtensor(target) else target.device,
+            device=target.device,
             target_shape=target_shape,
             target_dtype=target.dtype,
         )

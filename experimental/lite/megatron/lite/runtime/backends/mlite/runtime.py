@@ -161,22 +161,6 @@ def _pipeline_callbacks(forward_step: Callable, loss_fn: Callable | None):
     return wrapped_forward_step, wrapped_loss_fn
 
 
-def _apply_model_hook_updates(bundle, updates) -> None:
-    if updates is None:
-        return
-    if not isinstance(updates, dict):
-        raise TypeError("model load hooks must return a dict or None.")
-    if "optimizer" in updates:
-        bundle.optimizer = updates["optimizer"]
-    if "finalize_grads" in updates:
-        bundle.finalize_grads = updates["finalize_grads"]
-    extra_updates = updates.get("extras")
-    if extra_updates:
-        if not isinstance(extra_updates, dict):
-            raise TypeError("model load hook extras update must be a dict.")
-        bundle.extras.update(extra_updates)
-
-
 class MegatronLiteRuntime(RuntimeBase):
     """Megatron Lite default training backend (Megatron-style 5D parallel)."""
 
@@ -239,24 +223,6 @@ class MegatronLiteRuntime(RuntimeBase):
         # ── build model (model owns ps + optimizer + everything) ──
         bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
 
-        # Meta-built FSDP2 models must be wrapped before any parameter storage
-        # reaches CUDA. Eager backends keep the historical post-load ordering.
-        meta_init = any(
-            param.device.type == "meta"
-            for chunk in bundle.chunks
-            for param in chunk.parameters()
-        )
-        pre_load_hook = bundle.extras.pop("pre_model_load_hook", None)
-        if meta_init and pre_load_hook is None:
-            pre_load_hook = bundle.extras.pop("post_model_load_hook", None)
-        if callable(pre_load_hook):
-            _apply_model_hook_updates(bundle, pre_load_hook())
-        if meta_init:
-            from megatron.lite.primitive.init_device import materialize_meta_module
-
-            for chunk in bundle.chunks:
-                materialize_meta_module(chunk, device=torch.cuda.current_device())
-
         # ── load HF weights (optional) ──
         loaded_hf_weights = False
         if rt_cfg.load_hf_weights and rt_cfg.hf_path and hasattr(proto, "load_hf_weights"):
@@ -264,15 +230,21 @@ class MegatronLiteRuntime(RuntimeBase):
                 proto.load_hf_weights(chunk, rt_cfg.hf_path, model_cfg, bundle.parallel_state)
             loaded_hf_weights = True
 
-        if meta_init:
-            from megatron.lite.primitive.init_device import finalize_meta_materialization
-
-            for chunk in bundle.chunks:
-                finalize_meta_materialization(chunk)
-
         post_load_hook = bundle.extras.pop("post_model_load_hook", None)
         if callable(post_load_hook):
-            _apply_model_hook_updates(bundle, post_load_hook())
+            post_load_updates = post_load_hook()
+            if post_load_updates is not None:
+                if not isinstance(post_load_updates, dict):
+                    raise TypeError("post_model_load_hook must return a dict or None.")
+                if "optimizer" in post_load_updates:
+                    bundle.optimizer = post_load_updates["optimizer"]
+                if "finalize_grads" in post_load_updates:
+                    bundle.finalize_grads = post_load_updates["finalize_grads"]
+                extra_updates = post_load_updates.get("extras")
+                if extra_updates:
+                    if not isinstance(extra_updates, dict):
+                        raise TypeError("post_model_load_hook extras update must be a dict.")
+                    bundle.extras.update(extra_updates)
 
         if loaded_hf_weights and bundle.optimizer is not None:
             reload_model_params = getattr(bundle.optimizer, "reload_model_params", None)

@@ -810,9 +810,7 @@ class DynamicSparseAttention(nn.Module):
             )
         self.register_buffer(
             "attn_sink",
-            torch.full(
-                (num_attention_heads,), -1.0e20, dtype=torch.float32, device="cpu"
-            ),
+            torch.full((num_attention_heads,), -1.0e20, dtype=torch.float32),
             persistent=False,
         )
 

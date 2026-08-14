@@ -40,7 +40,6 @@ from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLA
 from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
-from megatron.lite.primitive.init_device import build_module_on_device, use_fsdp2_meta_init
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     freeze_non_lora_params,
@@ -89,7 +88,6 @@ class ImplConfig:
     router_bias_rate: float = 0.0
     # User-level OptimizerConfig threaded through the runtime.
     optimizer_config: OptimizerConfig | None = None
-    fsdp2_meta_init: bool = True
     mtp_enable: bool = False
     mtp_enable_train: bool = False
     mtp_detach_encoder: bool = False
@@ -198,32 +196,15 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     )
 
     vpp = None if p.vpp == 1 else p.vpp
-    fsdp2_meta = use_fsdp2_meta_init(impl_cfg)
     if vpp is None:
-        chunks = [
-            build_module_on_device(
-                Qwen3MoEModel,
-                model_cfg,
-                ps,
-                **model_kwargs,
-                use_meta=fsdp2_meta,
-                dtype=torch.bfloat16,
-            )
-        ]
+        chunks = [Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
     else:
         chunks = []
         for i in range(vpp):
             chunks.append(
-                build_module_on_device(
-                    Qwen3MoEModel,
-                    model_cfg,
-                    ps,
-                    vpp=vpp,
-                    vpp_chunk_id=i,
-                    **model_kwargs,
-                    use_meta=fsdp2_meta,
-                    dtype=torch.bfloat16,
-                )
+                Qwen3MoEModel(model_cfg, ps, vpp=vpp, vpp_chunk_id=i, **model_kwargs)
+                .to(torch.bfloat16)
+                .cuda()
             )
 
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)

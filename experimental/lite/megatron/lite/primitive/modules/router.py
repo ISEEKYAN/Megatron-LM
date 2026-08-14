@@ -87,9 +87,7 @@ class TopKRouter(nn.Module):
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.register_buffer(
-            "expert_bias",
-            torch.zeros(config.num_experts, dtype=torch.float32, device="cpu"),
-            persistent=False,
+            "expert_bias", torch.zeros(config.num_experts, dtype=torch.float32), persistent=False
         )
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
@@ -206,7 +204,7 @@ class SigmoidTopKRouter(nn.Module):
         self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
         self.register_buffer(
             "expert_bias",
-            torch.zeros(config.n_routed_experts, dtype=torch.float32, device="cpu"),
+            torch.zeros(config.n_routed_experts, dtype=torch.float32),
             persistent=expert_bias_persistent,
         )
 
