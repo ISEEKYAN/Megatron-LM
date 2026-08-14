@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -18,7 +19,6 @@ def _build_fsdp2(monkeypatch, transformer_engine_import_stub):
         def __init__(self, *_args, **_kwargs):
             super().__init__()
             self.weight = nn.Parameter(torch.ones(1))
-            self.explicit_weight = nn.Parameter(torch.ones(1, device="cpu"))
             seen.append(self.weight.device.type)
 
     monkeypatch.setattr(protocol, "Qwen3MoEModel", Model)
@@ -36,8 +36,34 @@ def _build_fsdp2(monkeypatch, transformer_engine_import_stub):
 def test_fsdp2_always_builds_on_meta(monkeypatch, transformer_engine_import_stub) -> None:
     assert _build_fsdp2(monkeypatch, transformer_engine_import_stub) == (
         ["meta"],
-        ["meta", "meta"],
+        ["meta"],
     )
+
+
+def test_meta_parameter_check_reports_explicit_cuda_module(
+    transformer_engine_import_stub,
+) -> None:
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite.protocol import _validate_meta_parameters
+
+    class ExplicitCudaModule(nn.Module):
+        def named_parameters(self, *args, **kwargs):
+            del args, kwargs
+            parameter = SimpleNamespace(
+                device=torch.device("cuda"),
+                numel=lambda: 8,
+                element_size=lambda: 2,
+            )
+            return iter((("weight", parameter),))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _validate_meta_parameters(ExplicitCudaModule())
+
+    message = str(exc_info.value)
+    assert "weight" in message
+    assert "ExplicitCudaModule" in message
+    assert "device=cuda" in message
+    assert "bytes=16" in message
 
 
 def test_fully_sharded_meta_model_supports_to_empty(tmp_path) -> None:

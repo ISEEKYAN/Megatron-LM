@@ -100,6 +100,22 @@ class ImplConfig:
     qat: QATSpec | dict | None = None
 
 
+def _validate_meta_parameters(model: torch.nn.Module) -> None:
+    non_meta = []
+    for module_name, module in model.named_modules():
+        for parameter_name, parameter in module.named_parameters(recurse=False):
+            if parameter.device.type == "meta":
+                continue
+            name = f"{module_name}.{parameter_name}" if module_name else parameter_name
+            size = parameter.numel() * parameter.element_size()
+            non_meta.append(
+                f"{name} (module={type(module).__name__}, device={parameter.device}, bytes={size})"
+            )
+    if non_meta:
+        details = "\n".join(non_meta)
+        raise RuntimeError(f"FSDP2 meta initialization left materialized parameters:\n{details}")
+
+
 # ---------------------------------------------------------------------------
 # Module map for recompute/offload
 # ---------------------------------------------------------------------------
@@ -202,8 +218,8 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     def build_chunk(**kwargs):
         with torch.device("meta") if meta_init else nullcontext():
             chunk = Qwen3MoEModel(model_cfg, ps, **kwargs, **model_kwargs).to(torch.bfloat16)
-        if meta_init and any(param.device.type != "meta" for param in chunk.parameters()):
-            chunk.to_empty(device="meta")
+        if meta_init:
+            _validate_meta_parameters(chunk)
         chunk._mlite_meta_init = meta_init
         return chunk if meta_init else chunk.cuda()
 
