@@ -55,3 +55,18 @@ def test_fully_sharded_meta_model_supports_to_empty(tmp_path) -> None:
         assert model.weight.dtype == torch.bfloat16
     finally:
         dist.destroy_process_group()
+
+
+def test_dispatcher_metadata_stays_materialized_in_meta_context() -> None:
+    from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+
+    with torch.device("meta"):
+        dispatcher = TokenDispatcher(
+            num_experts=4,
+            hidden_size=8,
+            ps=SimpleNamespace(ep_size=2),
+            use_deepep=False,
+        )
+
+    assert dispatcher._sort_by_experts == [0, 2, 1, 3]
+    assert dispatcher._restore_by_ranks == [0, 2, 1, 3]
