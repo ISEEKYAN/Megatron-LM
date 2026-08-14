@@ -228,7 +228,10 @@ class MegatronLiteRuntime(RuntimeBase):
 
         # ── build model (model owns ps + optimizer + everything) ──
         bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
-        if any(param.is_meta for chunk in bundle.chunks for param in chunk.parameters()):
+        meta_initialized = any(
+            param.is_meta for chunk in bundle.chunks for param in chunk.parameters()
+        )
+        if meta_initialized:
             bundle.optimizer = bundle.extras.pop("post_model_load_hook")()["optimizer"]
             if not rt_cfg.load_hf_weights:
                 for chunk in bundle.chunks:
@@ -257,7 +260,7 @@ class MegatronLiteRuntime(RuntimeBase):
                         raise TypeError("post_model_load_hook extras update must be a dict.")
                     bundle.extras.update(extra_updates)
 
-        if loaded_hf_weights and bundle.optimizer is not None:
+        if (loaded_hf_weights or meta_initialized) and bundle.optimizer is not None:
             reload_model_params = getattr(bundle.optimizer, "reload_model_params", None)
             if callable(reload_model_params):
                 reload_model_params()

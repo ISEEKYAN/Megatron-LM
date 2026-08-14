@@ -181,6 +181,106 @@ def test_reset_parameters_helper_reinitializes_each_module_via_apply():
     assert calls == ["first", "second"]
 
 
+@pytest.mark.parametrize(
+    "load_hf_weights", [True, False], ids=["checkpoint", "random-reset"]
+)
+def test_runtime_meta_init_refreshes_fsdp2_master_after_weights_are_ready(
+    monkeypatch, load_hf_weights
+):
+    from megatron.lite.primitive.bundle import ModelBundle
+    from megatron.lite.primitive.optimizers.fsdp2.adamw import build_adamw_optimizer
+    from megatron.lite.primitive.optimizers.fsdp2.optimizer import FSDP2Optimizer
+
+    loaded_value = torch.tensor([1.5, -2.25], dtype=torch.bfloat16)
+
+    class Chunk(nn.Module):
+        def __init__(self, *, device):
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.empty(2, dtype=torch.bfloat16, device=device)
+            )
+
+        def reset_parameters(self):
+            if not self.weight.is_meta:
+                with torch.no_grad():
+                    self.weight.copy_(loaded_value)
+
+    def make_optimizer(param):
+        inner = build_adamw_optimizer(
+            [{"params": [param], "weight_decay": 0.0}],
+            all_params=[param],
+            lr=0.1,
+            weight_decay=0.0,
+            betas=(0.9, 0.99),
+            eps=1.0e-8,
+            foreach=False,
+            use_fp32_master=True,
+            cpu_update=False,
+            model_param_dtypes={id(param): torch.bfloat16},
+            opt=types.SimpleNamespace(),
+        )
+        return FSDP2Optimizer(inner, [param], clip_grad=100.0)
+
+    chunk = Chunk(device="meta")
+
+    class Protocol:
+        ImplConfig = _FakeImplConfig
+
+        @staticmethod
+        def build_model_config(_hf_path):
+            return types.SimpleNamespace()
+
+        @staticmethod
+        def build_model(_model_cfg, *, impl_cfg):
+            del impl_cfg
+
+            def post_model_load_hook():
+                chunk.to_empty(device="cpu")
+                with torch.no_grad():
+                    chunk.weight.zero_()
+                return {"optimizer": make_optimizer(chunk.weight)}
+
+            return ModelBundle(
+                chunks=[chunk],
+                parallel_state=types.SimpleNamespace(),
+                forward_step=lambda *_args: None,
+                extras={"post_model_load_hook": post_model_load_hook},
+            )
+
+        @staticmethod
+        def load_hf_weights(model, _path, _model_cfg, _ps):
+            with torch.no_grad():
+                model.weight.copy_(loaded_value)
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
+    monkeypatch.setattr(torch.cuda, "manual_seed", lambda _seed: None)
+
+    cfg = MegatronLiteConfig(
+        model_name="qwen3_moe",
+        hf_path="/known" if load_hf_weights else "",
+        load_hf_weights=load_hf_weights,
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime._cfg = cfg
+    runtime._hf_path = cfg.hf_path
+    runtime._load_protocol = lambda _cfg: Protocol
+    handle = runtime.build_model()
+
+    eager_param = nn.Parameter(loaded_value.clone())
+    eager_optimizer = make_optimizer(eager_param)
+    grad = torch.tensor([0.25, -0.5], dtype=torch.bfloat16)
+    chunk.weight.grad = grad.clone()
+    eager_param.grad = grad.clone()
+
+    assert handle._optimizer.step()[0]
+    assert eager_optimizer.step()[0]
+    torch.testing.assert_close(chunk.weight, eager_param, rtol=0, atol=0)
+
+
 def test_build_impl_cfg_preserves_explicit_impl_hf_path():
     proto = type("Proto", (), {"ImplConfig": _FakeImplConfig})
     cfg = MegatronLiteConfig(
