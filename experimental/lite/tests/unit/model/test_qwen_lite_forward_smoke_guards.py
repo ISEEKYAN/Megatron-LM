@@ -19,3 +19,21 @@ def test_qwen35_tp_replication_smoke_requests_four_gpus():
     markers = module.test_qwen35_tp2_tp4_mixed_attention_parity_and_backward.pytestmark
     gpus = next(marker for marker in markers if marker.name == "gpus")
     assert gpus.args == (4,)
+
+
+def test_qwen35_numeric_roundtrip_smoke_allows_its_external_stack_prerequisite():
+    path = (
+        Path(__file__).parents[3]
+        / "tests/smoke/model/qwen3_5/lite/test_qwen35_hf_numeric_roundtrip_smoke.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "qwen35_numeric_roundtrip_guard", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert {
+        marker.name
+        for marker in module.test_qwen35_save_load_numeric_roundtrip.pytestmark
+    } == {"optional"}
