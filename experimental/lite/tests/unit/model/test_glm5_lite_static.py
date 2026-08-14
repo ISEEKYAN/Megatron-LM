@@ -658,35 +658,17 @@ def test_glm52_checkpoint_mapping_skips_shared_indexer_without_te():
         tensor,
     ) == [("model.layers.6.self_attn.indexer.wq_b.weight", tensor)]
 
-    base_names = {
-        "model.layers.3.self_attn.q_a_proj.weight",
-        "model.layers.3.self_attn.q_a_layernorm.weight",
-        "model.layers.3.self_attn.q_b_proj.weight",
-        "model.layers.3.self_attn.kv_a_proj_with_mqa.weight",
-        "model.layers.3.self_attn.kv_a_layernorm.weight",
-        "model.layers.3.self_attn.kv_b_proj.weight",
-        "model.layers.3.self_attn.o_proj.weight",
+    # Loading is now driven by the declarative HFWeights map rather than the
+    # removed private _load_attention helper.  A shared-indexer layer must
+    # retain every regular attention mapping while omitting every indexer one.
+    weight_map = spec.weight_map()
+    layer3 = {
+        native_name: hf_names
+        for native_name, hf_names in weight_map.items()
+        if native_name.startswith("layers.3.self_attention.self_attention.")
     }
-
-    class Reader:
-        index = {name: "model.safetensors" for name in base_names}
-
-        def get_tensor(self, name):
-            if name not in self.index:
-                raise KeyError(name)
-            return torch.ones(1)
-
-    out = {}
-    checkpoint_module._load_attention(
-        out,
-        local_prefix="layers.3",
-        hf_prefix="model.layers.3.self_attn",
-        reader=Reader(),
-        ps=object(),
-        load_indexer=False,
-    )
-    assert "layers.3.self_attention.self_attention.q_a_proj.weight" in out
-    assert not any(".indexer." in name for name in out)
+    assert "layers.3.self_attention.self_attention.q_a_proj.weight" in layer3
+    assert not any(".indexer." in name for name in layer3)
 
 
 def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp_path):
