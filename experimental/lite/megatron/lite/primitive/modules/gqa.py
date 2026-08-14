@@ -23,7 +23,7 @@ from megatron.lite.primitive.parallel import (
     RowParallelLinear,
     all_gather_last_dim_with_grad_reduce,
 )
-from megatron.lite.primitive.utils import ensure_divisible
+from megatron.lite.primitive.utils import ensure_divisible, ensure_te_module_init_device
 from megatron.lite.primitive.utils.rope import _apply_rotary_pos_emb_bshd, _apply_rotary_pos_emb_thd
 from megatron.lite.primitive.utils.rotary import RotaryEmbedding
 
@@ -108,11 +108,11 @@ class GQAttention(nn.Module):
             eps=rms_norm_eps,
             zero_centered_gamma=zero_centered_gamma,
         )
-        self.q_norm = te.RMSNorm(
-            head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
+        self.q_norm = ensure_te_module_init_device(
+            te.RMSNorm(head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma)
         )
-        self.k_norm = te.RMSNorm(
-            head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
+        self.k_norm = ensure_te_module_init_device(
+            te.RMSNorm(head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma)
         )
 
         lora = normalize_lora_config(lora_config)

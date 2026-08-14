@@ -62,7 +62,7 @@ from megatron.lite.primitive.parallel.thd import (
     reconstruct_packed_from_cp_parts,
     split_packed_to_cp_local,
 )
-from megatron.lite.primitive.utils import ensure_divisible
+from megatron.lite.primitive.utils import ensure_divisible, ensure_te_module_init_device
 
 
 try:
@@ -195,7 +195,9 @@ class GatedDeltaNet(nn.Module):
             if self._replicate_heads
             else torch.zeros(self.num_v_heads_local, dtype=torch.float32)
         )
-        self.norm = te.RMSNorm(self.dv, eps=rms_norm_eps, zero_centered_gamma=True)
+        self.norm = ensure_te_module_init_device(
+            te.RMSNorm(self.dv, eps=rms_norm_eps, zero_centered_gamma=True)
+        )
         self.o_proj = RowParallelLinear(self.v_dim, hidden_size, ps, bias=False)
         # (global cu_seqlens, FLA cp_context) keyed on (seq_len_global, batch, device)
         # for the non-packed chunkwise path, where both are static across forwards.

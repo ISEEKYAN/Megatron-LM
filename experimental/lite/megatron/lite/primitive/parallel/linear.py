@@ -10,7 +10,7 @@ import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 import transformer_engine.pytorch as te  # pyright: ignore[reportMissingImports]
 
-from megatron.lite.primitive.utils import ensure_divisible
+from megatron.lite.primitive.utils import ensure_divisible, ensure_te_module_init_device
 
 
 def _transformer_engine_init_device() -> torch.device:
@@ -196,31 +196,35 @@ class ColumnParallelLinear(nn.Module):
             ps.tp_size > 1 and not gather_output if sequence_parallel is None else sequence_parallel
         )
         if normalization is not None:
-            self.linear = te.LayerNormLinear(
-                in_features,
-                out_features,
-                bias=bias,
-                normalization=normalization,
-                eps=eps,
-                zero_centered_gamma=zero_centered_gamma,
-                params_dtype=torch.bfloat16,
-                parallel_mode="column",
-                sequence_parallel=self.use_sp,
-                tp_group=ps.tp_group,
-                tp_size=ps.tp_size,
-                device=_transformer_engine_init_device(),
+            self.linear = ensure_te_module_init_device(
+                te.LayerNormLinear(
+                    in_features,
+                    out_features,
+                    bias=bias,
+                    normalization=normalization,
+                    eps=eps,
+                    zero_centered_gamma=zero_centered_gamma,
+                    params_dtype=torch.bfloat16,
+                    parallel_mode="column",
+                    sequence_parallel=self.use_sp,
+                    tp_group=ps.tp_group,
+                    tp_size=ps.tp_size,
+                    device=_transformer_engine_init_device(),
+                )
             )
         else:
-            self.linear = te.Linear(
-                in_features,
-                out_features,
-                bias=bias,
-                params_dtype=torch.bfloat16,
-                parallel_mode="column",
-                sequence_parallel=self.use_sp,
-                tp_group=ps.tp_group,
-                tp_size=ps.tp_size,
-                device=_transformer_engine_init_device(),
+            self.linear = ensure_te_module_init_device(
+                te.Linear(
+                    in_features,
+                    out_features,
+                    bias=bias,
+                    params_dtype=torch.bfloat16,
+                    parallel_mode="column",
+                    sequence_parallel=self.use_sp,
+                    tp_group=ps.tp_group,
+                    tp_size=ps.tp_size,
+                    device=_transformer_engine_init_device(),
+                )
             )
         self.gather_output = gather_output
 
@@ -248,16 +252,18 @@ class RowParallelLinear(nn.Module):
         self.tp_group = ps.tp_group
         self.use_sp = ps.tp_size > 1
         self.local_in = ensure_divisible(in_features, ps.tp_size)
-        self.linear = te.Linear(
-            in_features,
-            out_features,
-            bias=bias,
-            params_dtype=torch.bfloat16,
-            parallel_mode="row",
-            sequence_parallel=self.use_sp,
-            tp_group=ps.tp_group,
-            tp_size=ps.tp_size,
-            device=_transformer_engine_init_device(),
+        self.linear = ensure_te_module_init_device(
+            te.Linear(
+                in_features,
+                out_features,
+                bias=bias,
+                params_dtype=torch.bfloat16,
+                parallel_mode="row",
+                sequence_parallel=self.use_sp,
+                tp_group=ps.tp_group,
+                tp_size=ps.tp_size,
+                device=_transformer_engine_init_device(),
+            )
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

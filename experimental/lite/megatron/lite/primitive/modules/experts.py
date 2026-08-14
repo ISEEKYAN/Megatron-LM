@@ -20,7 +20,7 @@ from megatron.lite.primitive.modules.lora import (
 )
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.recompute import CheckpointWithoutOutput
-from megatron.lite.primitive.utils import ensure_divisible
+from megatron.lite.primitive.utils import ensure_divisible, ensure_te_module_init_device
 
 __all__ = ["Experts", "_AllReduceETP"]
 
@@ -88,21 +88,25 @@ class Experts(nn.Module):
         te_device = torch.get_default_device()
         te_device = te_device if te_device.type == "meta" else torch.device("cuda")
 
-        self.fc1 = te.GroupedLinear(
-            self.num_local_experts,
-            config.hidden_size,
-            config.moe_intermediate_size * 2 // ps.etp_size,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            device=te_device,
+        self.fc1 = ensure_te_module_init_device(
+            te.GroupedLinear(
+                self.num_local_experts,
+                config.hidden_size,
+                config.moe_intermediate_size * 2 // ps.etp_size,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device=te_device,
+            )
         )
-        self.fc2 = te.GroupedLinear(
-            self.num_local_experts,
-            config.moe_intermediate_size // ps.etp_size,
-            config.hidden_size,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            device=te_device,
+        self.fc2 = ensure_te_module_init_device(
+            te.GroupedLinear(
+                self.num_local_experts,
+                config.moe_intermediate_size // ps.etp_size,
+                config.hidden_size,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device=te_device,
+            )
         )
         lora = normalize_lora_config(lora_config)
         self.fc1_lora: SharedGroupedLinearLoRA | None = None

@@ -18,9 +18,14 @@ def ensure_divisible(numerator: int, denominator: int, msg: str = "") -> int:
     return numerator // denominator
 
 
+def ensure_te_module_init_device(module: torch.nn.Module) -> torch.nn.Module:
+    device = torch.get_default_device()
+    return module.to_empty(device=device) if device.type == "meta" else module
+
+
 def log_rank0(msg: str) -> None:
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         print(f"[megatron.lite] {msg}", flush=True)
 
 
-__all__ = ["build_fp8_recipe", "ensure_divisible", "log_rank0"]
+__all__ = ["build_fp8_recipe", "ensure_divisible", "ensure_te_module_init_device", "log_rank0"]

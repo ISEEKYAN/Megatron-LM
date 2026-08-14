@@ -130,7 +130,8 @@ def test_expert_grouped_linears_follow_meta_context(
     class GroupedLinear(nn.Module):
         def __init__(self, *_args, device, **_kwargs):
             super().__init__()
-            self.weight = nn.Parameter(torch.empty(1, device=device))
+            del device
+            self.weight = nn.Parameter(torch.empty(1, device="cpu"))
 
     monkeypatch.setattr(experts.te, "GroupedLinear", GroupedLinear, raising=False)
     monkeypatch.setattr(
@@ -169,7 +170,7 @@ def test_te_parallel_linears_follow_meta_context(
         def __init__(self, in_features, out_features, *, device, **_kwargs):
             super().__init__()
             seen.append(device.type)
-            self.weight = nn.Parameter(torch.empty(out_features, in_features, device=device))
+            self.weight = nn.Parameter(torch.empty(out_features, in_features, device="cpu"))
 
         def forward(self, x):
             return x
