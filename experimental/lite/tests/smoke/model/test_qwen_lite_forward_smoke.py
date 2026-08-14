@@ -169,6 +169,7 @@ def test_qwen35_lite_tiny_forward_backward_smoke():
     _assert_loss_and_backward(output, model)
 
 
+@pytest.mark.gpus(4)
 def test_qwen35_tp2_tp4_mixed_attention_parity_and_backward():
     if dist.get_world_size() < 4 or dist.get_world_size() % 4 != 0:
         pytest.skip("Qwen3.5 TP replication smoke requires a world size divisible by 4.")
