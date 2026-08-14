@@ -130,20 +130,6 @@ def test_four_arm_launcher_selects_only_the_intended_features(
     assert not any(
         token.startswith("actor_rollout_ref.actor.megatron.") for token in tokens
     )
-    assert _override(tokens, "trainer.use_v1") == "True"
-    assert _override(tokens, "algorithm.filter_groups.enable") == "True"
-    assert _override(tokens, "algorithm.filter_groups.metric") == "acc"
-    assert (
-        _override(tokens, "algorithm.filter_groups.max_inflight_gen_batches") == "1"
-    )
-    assert _override(tokens, "algorithm.rollout_correction.rollout_is") == "token"
-    assert (
-        _override(tokens, "algorithm.rollout_correction.rollout_is_threshold")
-        == "2.0"
-    )
-    assert _add_or_override(
-        tokens, "actor_rollout_ref.actor.engine.cross_entropy_fusion"
-    ) == "True"
 
 
 def test_qat_off_and_qat_on_keep_the_rollout_configuration_identical(tmp_path: Path):

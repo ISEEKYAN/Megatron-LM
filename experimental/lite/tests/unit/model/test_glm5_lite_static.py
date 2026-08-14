@@ -49,6 +49,26 @@ def _use_cpu_transformer_engine_stubs(monkeypatch):
                     f"weight{index}", nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
                 )
 
+    class _LayerNormLinear(nn.Module):
+        def __init__(
+            self,
+            in_features,
+            out_features,
+            *,
+            bias=True,
+            params_dtype=None,
+            **_,
+        ):
+            super().__init__()
+            dtype = params_dtype or torch.get_default_dtype()
+            self.layer_norm_weight = nn.Parameter(torch.zeros(in_features, dtype=dtype))
+            self.weight = nn.Parameter(
+                torch.empty(out_features, in_features, dtype=dtype)
+            )
+            self.bias = (
+                nn.Parameter(torch.zeros(out_features, dtype=dtype)) if bias else None
+            )
+
     def _linear(in_features, out_features, *, bias=True, params_dtype=None, **_):
         return nn.Linear(
             in_features,
@@ -65,6 +85,7 @@ def _use_cpu_transformer_engine_stubs(monkeypatch):
         )
 
     monkeypatch.setattr(te, "GroupedLinear", _GroupedLinear)
+    monkeypatch.setattr(te, "LayerNormLinear", _LayerNormLinear)
     monkeypatch.setattr(te, "Linear", _linear)
     monkeypatch.setattr(te, "RMSNorm", _rms_norm)
     import megatron.lite.primitive.modules.attention.dsa as dsa
