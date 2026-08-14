@@ -10,8 +10,8 @@ from typing import Any
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-import transformer_engine.pytorch as te  # pyright: ignore[reportMissingImports]
 
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
@@ -20,7 +20,7 @@ from megatron.lite.primitive.modules.lora import (
 )
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.recompute import CheckpointWithoutOutput
-from megatron.lite.primitive.utils import ensure_divisible, ensure_te_module_init_device
+from megatron.lite.primitive.utils import ensure_divisible
 
 __all__ = ["Experts", "_AllReduceETP"]
 
@@ -85,28 +85,19 @@ class Experts(nn.Module):
         self.moe_act_recompute = moe_act_recompute
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
-        te_device = torch.get_default_device()
-        te_device = te_device if te_device.type == "meta" else torch.device("cuda")
-
-        self.fc1 = ensure_te_module_init_device(
-            te.GroupedLinear(
-                self.num_local_experts,
-                config.hidden_size,
-                config.moe_intermediate_size * 2 // ps.etp_size,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                device=te_device,
-            )
+        self.fc1 = te.GroupedLinear(
+            self.num_local_experts,
+            config.hidden_size,
+            config.moe_intermediate_size * 2 // ps.etp_size,
+            bias=False,
+            params_dtype=torch.bfloat16,
         )
-        self.fc2 = ensure_te_module_init_device(
-            te.GroupedLinear(
-                self.num_local_experts,
-                config.moe_intermediate_size // ps.etp_size,
-                config.hidden_size,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                device=te_device,
-            )
+        self.fc2 = te.GroupedLinear(
+            self.num_local_experts,
+            config.moe_intermediate_size // ps.etp_size,
+            config.hidden_size,
+            bias=False,
+            params_dtype=torch.bfloat16,
         )
         lora = normalize_lora_config(lora_config)
         self.fc1_lora: SharedGroupedLinearLoRA | None = None

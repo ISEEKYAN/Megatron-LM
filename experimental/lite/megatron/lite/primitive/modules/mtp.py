@@ -7,8 +7,8 @@ from collections.abc import Callable
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
 
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.parallel import (
     ParallelState,
     VanillaColumnParallelLinear,
@@ -16,7 +16,6 @@ from megatron.lite.primitive.parallel import (
     roll_packed_thd_left,
     scatter_to_sequence_parallel,
 )
-from megatron.lite.primitive.utils import ensure_te_module_init_device
 
 __all__ = ["MTPBlock", "MTPDecoderLayer", "MTPLossAutoScaler", "roll_mtp_tensor_left"]
 
@@ -72,19 +71,13 @@ class MTPDecoderLayer(nn.Module):
         self.ps = ps
         self.embedding = embedding
         self.detach_encoder = detach_encoder
-        self.enorm = ensure_te_module_init_device(
-            te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
-        )
-        self.hnorm = ensure_te_module_init_device(
-            te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
-        )
+        self.enorm = te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
+        self.hnorm = te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
         self.eh_proj = VanillaColumnParallelLinear(
             hidden_size * 2, hidden_size, ps, sp=ps.tp_size > 1, gather_output=True
         )
         self.transformer_layer = transformer_layer
-        self.final_layernorm = ensure_te_module_init_device(
-            te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
-        )
+        self.final_layernorm = te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
 
     def forward(
         self,

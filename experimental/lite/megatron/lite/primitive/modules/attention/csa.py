@@ -4,7 +4,8 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
+
+from megatron.lite.primitive import transformer_engine as te
 # Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core. The
 # lite CSA module reuses Core's differentiable kernels, CP row-mapping utilities,
 # and CuTeDSL layout kernels rather than vendoring them; see the module docstring
@@ -36,7 +37,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.lite.primitive.modules.attention.dsa import rotate_activation
 from megatron.lite.primitive.parallel.state import ParallelState
-from megatron.lite.primitive.utils import ensure_te_module_init_device
 from megatron.lite.primitive.utils.rotary import (
     _yarn_find_correction_range,
     _yarn_linear_ramp_mask,
@@ -167,7 +167,7 @@ class CompressedSequenceCompressor(nn.Module):
         self.ape = nn.Parameter(
             torch.empty(compress_ratio, self.coff * head_dim, dtype=torch.float32)
         )
-        self.norm = ensure_te_module_init_device(te.RMSNorm(head_dim, eps=config.rms_norm_eps))
+        self.norm = te.RMSNorm(head_dim, eps=config.rms_norm_eps)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -373,14 +373,10 @@ class CompressedSparseAttention(nn.Module):
         else:
             self.compress_ratio = 0
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
-        self.q_norm = ensure_te_module_init_device(
-            te.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        )
+        self.q_norm = te.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
         self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-        self.kv_norm = ensure_te_module_init_device(
-            te.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
-        )
+        self.kv_norm = te.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.wo_a = GroupedLinear(
             self.num_heads_per_group * self.head_dim,
             config.o_groups * config.o_lora_rank,

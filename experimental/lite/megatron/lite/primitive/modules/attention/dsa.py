@@ -12,14 +12,14 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
+
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 from megatron.lite.primitive.modules.attention.cp import iter_cp_sources
 from megatron.lite.primitive.parallel.cp import (
     contiguous_position_ids_for_cp,
     contiguous_slice_for_cp,
 )
-from megatron.lite.primitive.utils import ensure_te_module_init_device
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
@@ -86,7 +86,7 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
 
 
 def RMSNorm(*args, **kwargs):
-    return ensure_te_module_init_device(te.RMSNorm(*args, **kwargs))
+    return te.RMSNorm(*args, **kwargs)
 
 
 def _hadamard_transform_torch(x: torch.Tensor, scale: float) -> torch.Tensor:

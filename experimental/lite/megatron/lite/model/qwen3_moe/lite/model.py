@@ -12,8 +12,8 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
 
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -33,7 +33,7 @@ from megatron.lite.primitive.parallel import (
     roll_packed_thd_left,
     scatter_to_sequence_parallel,
 )
-from megatron.lite.primitive.utils import build_fp8_recipe, ensure_te_module_init_device
+from megatron.lite.primitive.utils import build_fp8_recipe
 
 # ---------------------------------------------------------------------------
 # MoE Layer (thin assembly over megatron.lite.primitive.modules)
@@ -147,9 +147,7 @@ class TransformerLayer(nn.Module):
             qkv_layout="mcore",
             lora_config=lora_config,
         )
-        self.mlp_norm = ensure_te_module_init_device(
-            te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        )
+        self.mlp_norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.moe = MoELayer(
             config,
             ps,
@@ -220,12 +218,8 @@ class MultiTokenPredictionLayer(nn.Module):
         self.ps = ps
         self.embedding = embedding
         self.detach_encoder = detach_encoder
-        self.enorm = ensure_te_module_init_device(
-            te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        )
-        self.hnorm = ensure_te_module_init_device(
-            te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        )
+        self.enorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = VanillaColumnParallelLinear(
             config.hidden_size * 2, config.hidden_size, ps, sp=ps.tp_size > 1, gather_output=True
         )
@@ -240,9 +234,7 @@ class MultiTokenPredictionLayer(nn.Module):
             use_thd=use_thd,
             lora_config=lora_config,
         )
-        self.final_layernorm = ensure_te_module_init_device(
-            te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        )
+        self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -411,9 +403,7 @@ class Qwen3MoEModel(nn.Module):
         self.norm: nn.Module | None = None
         self.head: VocabParallelOutput | None = None
         if has_head:
-            self.norm = ensure_te_module_init_device(
-                te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            )
+            self.norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
 
         self.mtp_embed: VocabParallelEmbedding | None = None
