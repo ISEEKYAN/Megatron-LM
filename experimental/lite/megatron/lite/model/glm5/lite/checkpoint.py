@@ -169,7 +169,7 @@ class Glm5WeightSpec:
         del base_model, ps
         weight_map = self.weight_map()
         if "mtp_embed.embedding.weight" not in logical_state_keys:
-            weight_map.pop("mtp_embed.embedding.weight")
+            weight_map.pop("mtp_embed.embedding.weight", None)
         return weight_map
 
     def hf_to_native(
