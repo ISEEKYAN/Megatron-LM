@@ -34,6 +34,44 @@ def _make_glm5_model(cfg, ps=None, **kwargs):
     return Glm5Model(cfg, _make_train_config(ps), ps, **kwargs)
 
 
+def _use_cpu_transformer_engine_stubs(monkeypatch):
+    """Make state-layout tests independent of Transformer Engine's CUDA default."""
+    import torch
+    import torch.nn as nn
+    import transformer_engine.pytorch as te
+
+    class _GroupedLinear(nn.Module):
+        def __init__(self, num_gemms, in_features, out_features, *, params_dtype=None, **_):
+            super().__init__()
+            dtype = params_dtype or torch.get_default_dtype()
+            for index in range(num_gemms):
+                self.register_parameter(
+                    f"weight{index}", nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
+                )
+
+    def _linear(in_features, out_features, *, bias=True, params_dtype=None, **_):
+        return nn.Linear(
+            in_features,
+            out_features,
+            bias=bias,
+            dtype=params_dtype or torch.get_default_dtype(),
+        )
+
+    def _rms_norm(normalized_shape, *, eps=None, params_dtype=None, **_):
+        return nn.RMSNorm(
+            normalized_shape,
+            eps=eps,
+            dtype=params_dtype or torch.get_default_dtype(),
+        )
+
+    monkeypatch.setattr(te, "GroupedLinear", _GroupedLinear)
+    monkeypatch.setattr(te, "Linear", _linear)
+    monkeypatch.setattr(te, "RMSNorm", _rms_norm)
+    import megatron.lite.primitive.modules.attention.dsa as dsa
+
+    monkeypatch.setattr(dsa, "RMSNorm", _rms_norm)
+
+
 def _tiny_config_kwargs():
     return dict(
         num_hidden_layers=2,
@@ -451,7 +489,7 @@ def test_glm5_lite_model_exports_native_state_names():
     assert "head.col.linear.weight" in keys
 
 
-def test_glm52_index_share_shared_layers_omit_indexer_modules():
+def test_glm52_index_share_shared_layers_omit_indexer_modules(monkeypatch):
     import pytest
 
     try:
@@ -460,6 +498,8 @@ def test_glm52_index_share_shared_layers_omit_indexer_modules():
         pytest.skip(f"Transformer Engine is not importable in this environment: {exc}")
 
     from megatron.lite.model.glm5.config import Glm5Config
+
+    _use_cpu_transformer_engine_stubs(monkeypatch)
 
     cfg = Glm5Config(
         **{
@@ -671,7 +711,9 @@ def test_glm52_checkpoint_mapping_skips_shared_indexer_without_te():
     assert not any(".indexer." in name for name in layer3)
 
 
-def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp_path):
+def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(
+    tmp_path, monkeypatch
+):
     import pytest
     import torch
 
@@ -684,6 +726,8 @@ def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp
     from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights, load_hf_weights
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
     from megatron.lite.primitive.parallel import ParallelState
+
+    _use_cpu_transformer_engine_stubs(monkeypatch)
 
     cfg = Glm5Config(
         **{
