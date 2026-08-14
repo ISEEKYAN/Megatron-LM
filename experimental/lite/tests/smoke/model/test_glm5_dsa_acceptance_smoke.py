@@ -216,6 +216,7 @@ def _max_param_grad_abs(a: dict, b: dict) -> float:
     return max(_max_abs(a["param_grads"][name], b["param_grads"][name]) for name in common)
 
 
+@pytest.mark.optional
 def test_glm5_dsa_run_to_run_accept_with_proof():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for GLM5 DSA accept-with-proof smoke.")

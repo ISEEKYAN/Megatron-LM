@@ -43,3 +43,6 @@ def test_glm5_dsa_smoke_declares_flashmla_before_constructing_dsa(monkeypatch):
             "GLM5 DSA accept-with-proof needs FlashMLA sparse attention kernels.",
         )
     ]
+    assert {
+        marker.name for marker in module.test_glm5_dsa_run_to_run_accept_with_proof.pytestmark
+    } == {"optional"}
