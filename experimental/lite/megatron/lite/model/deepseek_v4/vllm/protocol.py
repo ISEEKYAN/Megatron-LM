@@ -349,7 +349,17 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     vllm_config = VllmConfig()
 
     def forward_step(model: nn.Module, batch) -> dict[str, torch.Tensor]:
-        current_attention_builders, current_moe_metadata = ensure_runtime_assets()
+        attention_metadata = getattr(batch, "attention_metadata", None)
+        moe_metadata = getattr(batch, "moe_metadata", None)
+        if (attention_metadata is None) != (moe_metadata is None):
+            raise ValueError(
+                "caller-owned attention_metadata and moe_metadata must be "
+                "provided together"
+            )
+        current_attention_builders = None
+        current_moe_metadata = None
+        if attention_metadata is None or moe_metadata is None:
+            current_attention_builders, current_moe_metadata = ensure_runtime_assets()
         seq_lens = getattr(batch, "seq_lens", None)
         if seq_lens is None:
             token_counts = [int(batch.input_ids.numel())]
@@ -360,14 +370,19 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 f"packed batch has {sum(token_counts)} tokens, exceeding "
                 f"max_tokens_per_rank={impl_cfg.max_tokens_per_rank}"
             )
-        attention_metadata = {
-            layer_idx: (
-                current_attention_builders[layer_idx].build_prefill(token_counts[0])
-                if len(token_counts) == 1
-                else current_attention_builders[layer_idx].build_prefill_batch(token_counts)
-            )
-            for layer_idx in selected_layers
-        }
+        if attention_metadata is None:
+            assert current_attention_builders is not None
+            attention_metadata = {
+                layer_idx: (
+                    current_attention_builders[layer_idx].build_prefill(token_counts[0])
+                    if len(token_counts) == 1
+                    else current_attention_builders[layer_idx].build_prefill_batch(token_counts)
+                )
+                for layer_idx in selected_layers
+            }
+        if moe_metadata is None:
+            assert current_moe_metadata is not None
+            moe_metadata = current_moe_metadata
         with ds4_vllm_forward_context(
             batch,
             parallel_state,
@@ -377,7 +392,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 model,
                 batch,
                 attention_metadata=attention_metadata,
-                moe_metadata=current_moe_metadata,
+                moe_metadata=moe_metadata,
             )
 
     optimizer = None

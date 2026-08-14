@@ -288,6 +288,61 @@ def test_verl_packed_batch_builds_per_layer_runtime_metadata(monkeypatch) -> Non
     assert calls["moe_metadata"] == {0: "moe"}
 
 
+def test_forward_step_reuses_caller_owned_runtime_assets(monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setattr(protocol, "initialize_ds4_vllm_batch_invariance", lambda: None)
+    monkeypatch.setattr(
+        protocol,
+        "init_parallel",
+        lambda _config: ParallelState(ep_size=1, ep_rank=0),
+    )
+    monkeypatch.setattr(
+        protocol.DS4SparseAttentionMetadataBuilderAdapter,
+        "from_hf",
+        lambda *_args, **_kwargs: pytest.fail("rebuilt caller-owned attention assets"),
+    )
+    monkeypatch.setattr(
+        protocol.DS4MoEKernelMetadataBuilderAdapter,
+        "create_deepep_buffer",
+        lambda *_args, **_kwargs: pytest.fail("created a second DeepEP buffer"),
+    )
+    monkeypatch.setattr(
+        protocol,
+        "ds4_vllm_forward_context",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.config",
+        SimpleNamespace(VllmConfig=lambda: object()),
+    )
+    monkeypatch.setattr(
+        protocol,
+        "_forward_step",
+        lambda _model, _batch, **kwargs: captured.update(kwargs)
+        or {"loss": torch.tensor(0.0)},
+    )
+    impl = protocol.ImplConfig(
+        parallel=ParallelConfig(ep=2),
+        use_deepep=True,
+        hf_path="/proxy",
+        selector=protocol.SelectorConfig((0,), ("attn", "moe")),
+    )
+    bundle = protocol.build_model(_tiny_config(), impl_cfg=impl)
+    attention_metadata = {0: object()}
+    moe_metadata = {0: object()}
+    batch = SimpleNamespace(
+        input_ids=torch.tensor([1, 2, 3]),
+        attention_metadata=attention_metadata,
+        moe_metadata=moe_metadata,
+    )
+
+    bundle.forward_step(bundle.chunks[0], batch)
+
+    assert captured["attention_metadata"] is attention_metadata
+    assert captured["moe_metadata"] is moe_metadata
+
+
 def test_forward_step_passes_training_batch_fields(monkeypatch) -> None:
     captured = {}
     monkeypatch.setattr(
