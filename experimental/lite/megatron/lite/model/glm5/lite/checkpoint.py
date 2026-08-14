@@ -160,6 +160,18 @@ class Glm5WeightSpec:
                 )
         return weight_map
 
+    def load_weight_map(
+        self,
+        base_model: nn.Module,
+        ps: ParallelState,
+        logical_state_keys: tuple[str, ...],
+    ) -> dict[str, list[str]]:
+        del base_model, ps
+        weight_map = self.weight_map()
+        if "mtp_embed.embedding.weight" not in logical_state_keys:
+            weight_map.pop("mtp_embed.embedding.weight")
+        return weight_map
+
     def hf_to_native(
         self, native_name: str, hf_tensors: list[torch.Tensor]
     ) -> torch.Tensor:
