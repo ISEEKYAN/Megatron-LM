@@ -85,6 +85,8 @@ class Experts(nn.Module):
         self.moe_act_recompute = moe_act_recompute
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
+        te_device = torch.get_default_device()
+        te_device = te_device if te_device.type == "meta" else torch.device("cuda")
 
         self.fc1 = te.GroupedLinear(
             self.num_local_experts,
@@ -92,6 +94,7 @@ class Experts(nn.Module):
             config.moe_intermediate_size * 2 // ps.etp_size,
             bias=False,
             params_dtype=torch.bfloat16,
+            device=te_device,
         )
         self.fc2 = te.GroupedLinear(
             self.num_local_experts,
@@ -99,6 +102,7 @@ class Experts(nn.Module):
             config.hidden_size,
             bias=False,
             params_dtype=torch.bfloat16,
+            device=te_device,
         )
         lora = normalize_lora_config(lora_config)
         self.fc1_lora: SharedGroupedLinearLoRA | None = None

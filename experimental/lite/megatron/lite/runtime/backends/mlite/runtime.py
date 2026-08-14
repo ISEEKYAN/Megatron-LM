@@ -27,8 +27,6 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     # may pass knobs (e.g. cross_entropy_fusion) that some models don't model.
     impl_cfg_kwargs = {key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields}
     impl_cfg_kwargs["parallel"] = rt_cfg.parallel
-    if "load_hf_weights" in init_fields:
-        impl_cfg_kwargs["load_hf_weights"] = rt_cfg.load_hf_weights
     if (
         "attention_backend_override" in init_fields
         and impl_cfg_kwargs.get("attention_backend_override") is None
@@ -51,6 +49,12 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     ):
         impl_cfg_kwargs["optimizer_config"] = rt_cfg.optimizer
     return proto.ImplConfig(**impl_cfg_kwargs)
+
+
+def _reset_parameters(module: torch.nn.Module) -> None:
+    reset = getattr(module, "reset_parameters", None)
+    if callable(reset):
+        reset()
 
 
 def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
@@ -226,6 +230,9 @@ class MegatronLiteRuntime(RuntimeBase):
         bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
         if any(param.is_meta for chunk in bundle.chunks for param in chunk.parameters()):
             bundle.optimizer = bundle.extras.pop("post_model_load_hook")()["optimizer"]
+            if not rt_cfg.load_hf_weights:
+                for chunk in bundle.chunks:
+                    chunk.apply(_reset_parameters)
 
         # ── load HF weights (optional) ──
         loaded_hf_weights = False

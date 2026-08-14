@@ -89,7 +89,6 @@ class ImplConfig:
     router_bias_rate: float = 0.0
     # User-level OptimizerConfig threaded through the runtime.
     optimizer_config: OptimizerConfig | None = None
-    load_hf_weights: bool = True
     mtp_enable: bool = False
     mtp_enable_train: bool = False
     mtp_detach_encoder: bool = False
@@ -198,10 +197,13 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     )
 
     vpp = None if p.vpp == 1 else p.vpp
-    meta_init = impl_cfg.optimizer == "fsdp2" and impl_cfg.load_hf_weights
+    meta_init = impl_cfg.optimizer == "fsdp2"
+
     def build_chunk(**kwargs):
         with torch.device("meta") if meta_init else nullcontext():
             chunk = Qwen3MoEModel(model_cfg, ps, **kwargs, **model_kwargs).to(torch.bfloat16)
+        if meta_init and any(param.device.type != "meta" for param in chunk.parameters()):
+            chunk.to_empty(device="meta")
         chunk._mlite_meta_init = meta_init
         return chunk if meta_init else chunk.cuda()
 

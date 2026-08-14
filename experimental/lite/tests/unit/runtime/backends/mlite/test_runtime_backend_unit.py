@@ -18,6 +18,7 @@ from megatron.lite.runtime.backends.mlite.runtime import (
     _apply_attention_backend_env,
     _build_impl_cfg,
     _pipeline_callbacks,
+    _reset_parameters,
 )
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
@@ -142,7 +143,6 @@ def test_mlite_config_from_dict_rejects_num_microbatches():
 class _FakeImplConfig:
     parallel: object
     hf_path: str = ""
-    load_hf_weights: bool = True
     optimizer_config: object = None
     attention_backend_override: str | None = None
 
@@ -160,9 +160,25 @@ def test_build_impl_cfg_backfills_top_level_hf_path_and_runtime_fields():
 
     assert impl_cfg.parallel is cfg.parallel
     assert impl_cfg.hf_path == "/models/top"
-    assert impl_cfg.load_hf_weights is False
     assert impl_cfg.optimizer_config is cfg.optimizer
     assert impl_cfg.attention_backend_override == "local"
+
+
+def test_reset_parameters_helper_reinitializes_each_module_via_apply():
+    calls = []
+
+    class Resettable(nn.Module):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def reset_parameters(self):
+            calls.append(self.name)
+
+    model = nn.Sequential(Resettable("first"), Resettable("second"))
+    model.apply(_reset_parameters)
+
+    assert calls == ["first", "second"]
 
 
 def test_build_impl_cfg_preserves_explicit_impl_hf_path():

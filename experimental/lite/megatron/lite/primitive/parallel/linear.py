@@ -12,6 +12,12 @@ import transformer_engine.pytorch as te  # pyright: ignore[reportMissingImports]
 
 from megatron.lite.primitive.utils import ensure_divisible
 
+
+def _transformer_engine_init_device() -> torch.device:
+    device = torch.get_default_device()
+    return device if device.type == "meta" else torch.device("cuda")
+
+
 if TYPE_CHECKING:
     from megatron.lite.primitive.parallel.state import ParallelState
 
@@ -126,6 +132,9 @@ class _VanillaColLinear(nn.Module):
         self.sp = sp
         local_out = ensure_divisible(out_features, ps.tp_size)
         self.weight = nn.Parameter(torch.empty(local_out, in_features, dtype=torch.bfloat16))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -199,6 +208,7 @@ class ColumnParallelLinear(nn.Module):
                 sequence_parallel=self.use_sp,
                 tp_group=ps.tp_group,
                 tp_size=ps.tp_size,
+                device=_transformer_engine_init_device(),
             )
         else:
             self.linear = te.Linear(
@@ -210,6 +220,7 @@ class ColumnParallelLinear(nn.Module):
                 sequence_parallel=self.use_sp,
                 tp_group=ps.tp_group,
                 tp_size=ps.tp_size,
+                device=_transformer_engine_init_device(),
             )
         self.gather_output = gather_output
 
@@ -246,6 +257,7 @@ class RowParallelLinear(nn.Module):
             sequence_parallel=self.use_sp,
             tp_group=ps.tp_group,
             tp_size=ps.tp_size,
+            device=_transformer_engine_init_device(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
