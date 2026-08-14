@@ -15,6 +15,17 @@ from typing import Any
 import torch
 from megatron.lite.primitive.quantization.mxfp4 import MXFP4_BLOCK_SIZE, quantize_mxfp4
 
+# These are HF checkpoint paths, deliberately distinct from QATSpec's
+# Megatron-module component defaults.  An enabled rollout exporter that omits
+# ``ignore_patterns`` must still leave fragile output, embedding, and router
+# tensors in BF16; callers can explicitly provide a different list when their
+# checkpoint naming requires it.
+_DEFAULT_IGNORE_PATTERNS = (
+    "lm_head",
+    "embed_tokens",
+    "re:.*mlp.gate$",
+)
+
 
 def _get_field(config: Any, name: str, default: Any) -> Any:
     if isinstance(config, Mapping):
@@ -74,7 +85,10 @@ def export_qat_weights(
             f"MXFP4 QAT export requires group_size={MXFP4_BLOCK_SIZE}, got {group_size}"
         )
     patterns = [
-        str(pattern) for pattern in _get_field(qat_config, "ignore_patterns", [])
+        str(pattern)
+        for pattern in _get_field(
+            qat_config, "ignore_patterns", _DEFAULT_IGNORE_PATTERNS
+        )
     ]
     return _process_weights(weights, patterns)
 
