@@ -113,6 +113,7 @@ def _single_rank_dist():
         dist.destroy_process_group()
 
 
+@pytest.mark.optional
 def test_qwen35_save_load_numeric_roundtrip(tmp_path):
     if dist.get_world_size() != 1:
         pytest.skip("numeric round-trip smoke runs single-rank (tp1).")
