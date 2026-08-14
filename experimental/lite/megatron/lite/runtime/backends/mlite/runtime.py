@@ -222,6 +222,10 @@ class MegatronLiteRuntime(RuntimeBase):
 
         # ── build model (model owns ps + optimizer + everything) ──
         bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
+        if any(param.is_meta for chunk in bundle.chunks for param in chunk.parameters()):
+            if not (rt_cfg.load_hf_weights and rt_cfg.hf_path):
+                raise RuntimeError("Deferred parameters require HF weights")
+            bundle.optimizer = bundle.extras.pop("post_model_load_hook")()["optimizer"]
 
         # ── load HF weights (optional) ──
         loaded_hf_weights = False

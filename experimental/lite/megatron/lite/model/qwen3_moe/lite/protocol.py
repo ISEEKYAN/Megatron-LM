@@ -46,6 +46,7 @@ from megatron.lite.primitive.modules.lora import (
     normalize_lora_config,
     trainable_param_stats,
 )
+from megatron.lite.primitive.optimizers.fsdp2.optimizer import defer_large_parameters
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.quantization import (
     QATSpec,
@@ -88,6 +89,7 @@ class ImplConfig:
     router_bias_rate: float = 0.0
     # User-level OptimizerConfig threaded through the runtime.
     optimizer_config: OptimizerConfig | None = None
+    fsdp2_meta_init_threshold: int | None = 1_000_000
     mtp_enable: bool = False
     mtp_enable_train: bool = False
     mtp_detach_encoder: bool = False
@@ -197,7 +199,8 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
     vpp = None if p.vpp == 1 else p.vpp
     if vpp is None:
-        chunks = [Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
+        threshold = impl_cfg.fsdp2_meta_init_threshold if impl_cfg.optimizer == "fsdp2" else None
+        chunks = [defer_large_parameters(Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16), threshold)]
     else:
         chunks = []
         for i in range(vpp):

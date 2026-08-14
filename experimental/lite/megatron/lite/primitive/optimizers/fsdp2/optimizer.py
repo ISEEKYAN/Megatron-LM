@@ -54,6 +54,24 @@ _DEFAULT_USE_FP32_MASTER = True
 _DEFAULT_ADAMW_FOREACH: bool | str = "auto"
 
 
+def defer_large_parameters(module, threshold, device="cuda"):
+    for owner in module.modules():
+        for name, param in owner.named_parameters(recurse=False):
+            if threshold is not None and param.numel() >= threshold:
+                deferred = nn.Parameter(param.to("meta"), requires_grad=param.requires_grad)
+                vars(deferred).update(vars(param), _mlite_deferred=True)
+                setattr(owner, name, deferred)
+    return module._apply(lambda tensor: tensor if tensor.is_meta else tensor.to(device))
+def _materialize_deferred_parameters(module, device="cuda"):
+    from torch.distributed.tensor import DTensor
+    for param in (param for param in module.parameters() if param.is_meta):
+        value = DTensor.from_local(
+            torch.empty_like(param.to_local(), device=device), param.device_mesh,
+            param.placements, shape=param.shape, stride=param.stride()
+        ).requires_grad_(param.requires_grad)
+        vars(value).update(vars(param), _mlite_deferred=True)
+        torch.utils.swap_tensors(param, value)
+
 class FSDP2Optimizer:
     """Adapt an optimizer to Megatron Lite's FSDP2 optimizer contract."""
 
@@ -450,6 +468,7 @@ def build_fsdp2_training_optimizer(
             ignored_params=ignored_expert_params or None,
             shard_placement_fn=dense_shard_placement_fn,
         )
+        _materialize_deferred_parameters(chunk)
     if model_param_dtypes:
         _restore_model_param_dtypes(model_chunks, model_param_dtypes)
 
