@@ -13,6 +13,7 @@ import torch.nn as nn  # pyright: ignore[reportMissingImports]
 import transformer_engine.pytorch as te  # pyright: ignore[reportMissingImports]
 
 from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.lite.primitive.init_device import transformer_engine_init_device
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     SharedGroupedLinearLoRA,
@@ -92,6 +93,7 @@ class Experts(nn.Module):
             config.moe_intermediate_size * 2 // ps.etp_size,
             bias=False,
             params_dtype=torch.bfloat16,
+            device=transformer_engine_init_device(),
         )
         self.fc2 = te.GroupedLinear(
             self.num_local_experts,
@@ -99,6 +101,7 @@ class Experts(nn.Module):
             config.hidden_size,
             bias=False,
             params_dtype=torch.bfloat16,
+            device=transformer_engine_init_device(),
         )
         lora = normalize_lora_config(lora_config)
         self.fc1_lora: SharedGroupedLinearLoRA | None = None

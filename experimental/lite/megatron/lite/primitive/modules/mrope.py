@@ -25,7 +25,10 @@ class MultimodalRotaryEmbedding(nn.Module):
     ):
         super().__init__()
         dim = int(kv_channels * rotary_percent)
-        inv_freq = 1.0 / (rotary_base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        inv_freq = 1.0 / (
+            rotary_base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device="cpu") / dim)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.cp_group = cp_group
 

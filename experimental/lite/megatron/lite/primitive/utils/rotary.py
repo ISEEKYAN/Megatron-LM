@@ -14,7 +14,13 @@ from megatron.lite.primitive.utils.rope import get_pos_emb_on_this_cp_rank
 
 
 def _default_rope_device(use_cpu_initialization: bool) -> str | torch.device:
-    if use_cpu_initialization or not torch.cuda.is_available():
+    # Meta construction defers parameters, but these small non-parameter RoPE
+    # tables must retain their explicit values for later materialization.
+    if (
+        use_cpu_initialization
+        or torch.get_default_device().type == "meta"
+        or not torch.cuda.is_available()
+    ):
         return "cpu"
     return torch.device("cuda", torch.cuda.current_device())
 

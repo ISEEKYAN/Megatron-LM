@@ -34,7 +34,9 @@ class DeepseekV4MoE(nn.Module):
         if self.is_hash_layer:
             self.gate.register_buffer(
                 "tid2eid",
-                torch.zeros(config.vocab_size, self.topk, dtype=torch.int64),
+                torch.zeros(
+                    config.vocab_size, self.topk, dtype=torch.int64, device="cpu"
+                ),
                 persistent=True,
             )
         else:

@@ -24,6 +24,7 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import export_hf_weights as _ex
 from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.init_device import build_module_on_device, use_fsdp2_meta_init
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.quantization import (
     QATSpec,
@@ -66,6 +67,7 @@ class ImplConfig:
     router_bias_rate: float = 0.0
     deterministic: bool = True
     optimizer_config: OptimizerConfig | None = None
+    fsdp2_meta_init: bool = True
     mtp_enable: bool = False
     mtp_enable_train: bool = False
     mtp_detach_encoder: bool = False
@@ -215,23 +217,42 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         gdn_cp_mode=impl_cfg.gdn_cp_mode,
     )
 
+    fsdp2_meta = use_fsdp2_meta_init(impl_cfg)
     if vpp is None:
-        chunks = [Qwen35Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
+        chunks = [
+            build_module_on_device(
+                Qwen35Model,
+                model_cfg,
+                train_cfg,
+                ps,
+                **model_kwargs,
+                use_meta=fsdp2_meta,
+                dtype=torch.bfloat16,
+            )
+        ]
     else:
         chunks = [
-            Qwen35Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **model_kwargs)
-            .to(torch.bfloat16)
-            .cuda()
+            build_module_on_device(
+                Qwen35Model,
+                model_cfg,
+                train_cfg,
+                ps,
+                vpp_chunk_id=i,
+                **model_kwargs,
+                use_meta=fsdp2_meta,
+                dtype=torch.bfloat16,
+            )
             for i in range(vpp)
         ]
 
     # GDN state is physically replicated when TP exceeds its head count.
     # Synchronize the initial copies before any optimizer/FSDP wrapping so a
     # from-scratch model is TP-invariant just like a model loaded from HF.
-    for chunk in chunks:
-        for module in chunk.modules():
-            if isinstance(module, GatedDeltaNet):
-                module.sync_tp_replicated_parameters()
+    if not fsdp2_meta:
+        for chunk in chunks:
+            for module in chunk.modules():
+                if isinstance(module, GatedDeltaNet):
+                    module.sync_tp_replicated_parameters()
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
     if recompute_spec:

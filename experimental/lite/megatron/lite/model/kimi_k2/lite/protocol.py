@@ -20,6 +20,7 @@ from megatron.lite.model.protocol_utils import (
     unpack_thd_forward_output,
 )
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.init_device import build_module_on_device, use_fsdp2_meta_init
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.primitive.quantization import (
@@ -88,6 +89,7 @@ class ImplConfig:
     router_bias_rate: float = 0.0
     deterministic: bool = True
     optimizer_config: OptimizerConfig | None = None
+    fsdp2_meta_init: bool = True
     mtp_enable: bool = False
     mtp_enable_train: bool = False
     mtp_detach_encoder: bool = False
@@ -189,19 +191,31 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
     )
 
+    fsdp2_meta = use_fsdp2_meta_init(impl_cfg)
     if vpp is None:
-        chunks = [KimiK2Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
+        chunks = [
+            build_module_on_device(
+                KimiK2Model,
+                model_cfg,
+                train_cfg,
+                ps,
+                **model_kwargs,
+                use_meta=fsdp2_meta,
+                dtype=torch.bfloat16,
+            )
+        ]
     else:
         chunks = [
-            KimiK2Model(
+            build_module_on_device(
+                KimiK2Model,
                 model_cfg,
                 train_cfg,
                 ps,
                 vpp_chunk_id=i,
                 **model_kwargs,
+                use_meta=fsdp2_meta,
+                dtype=torch.bfloat16,
             )
-            .to(torch.bfloat16)
-            .cuda()
             for i in range(vpp)
         ]
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)

@@ -23,6 +23,7 @@ from megatron.lite.model.protocol_utils import (
     router_replay_roots as router_replay_roots,
 )
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.init_device import build_module_on_device, use_fsdp2_meta_init
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
     contiguous_position_ids_for_cp,
@@ -54,6 +55,7 @@ class ImplConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
     optimizer: str | None = "dist_opt"
     optimizer_config: OptimizerConfig | None = None
+    fsdp2_meta_init: bool = True
     hf_path: str = ""
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
@@ -387,24 +389,24 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         fp8=False,
         use_deepep=impl_cfg.use_deepep,
     )
+    fsdp2_meta = use_fsdp2_meta_init(impl_cfg)
 
     def _chunk(i: int | None = None):
-        return (
-            DeepseekV4Model(
-                model_cfg,
-                train_cfg,
-                ps,
-                vpp_chunk_id=i,
-                use_deepep=impl_cfg.use_deepep,
-                use_thd=impl_cfg.use_thd,
-                hf_path=impl_cfg.hf_path,
-                attention_backend_override=impl_cfg.attention_backend_override,
-                mtp_enable=mtp_enable,
-                mtp_enable_train=mtp_enable_train,
-                mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
-            )
-            .to(torch.bfloat16)
-            .cuda()
+        return build_module_on_device(
+            DeepseekV4Model,
+            model_cfg,
+            train_cfg,
+            ps,
+            vpp_chunk_id=i,
+            use_deepep=impl_cfg.use_deepep,
+            use_thd=impl_cfg.use_thd,
+            hf_path=impl_cfg.hf_path,
+            attention_backend_override=impl_cfg.attention_backend_override,
+            mtp_enable=mtp_enable,
+            mtp_enable_train=mtp_enable_train,
+            mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
+            use_meta=fsdp2_meta,
+            dtype=torch.bfloat16,
         )
 
     chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
