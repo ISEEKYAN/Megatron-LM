@@ -22,6 +22,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive import (
     mhc_post_pre,
     mhc_pre_broadcast,
     o_projection,
+    visible_linear,
 )
 from megatron.lite.primitive.autograd import inference_only
 from megatron.lite.primitive.kernels.vllm_ds4 import (
@@ -73,6 +74,7 @@ class AttentionKernelMetadata:
 class AttentionAdapters:
     fused_linear: Callable[[torch.Tensor, nn.Parameter], torch.Tensor]
     q_linear: Callable[[torch.Tensor, nn.Parameter], torch.Tensor]
+    indexer_q_linear: Callable[[torch.Tensor, nn.Parameter], torch.Tensor]
     norm: Callable[..., tuple[torch.Tensor, torch.Tensor]]
     kv_insert: Callable[..., torch.Tensor]
     flash: FlashMLAAdapter
@@ -90,10 +92,15 @@ class AttentionAdapters:
 def _default_attention_adapters() -> AttentionAdapters:
     fused = DeploymentBlockFP8Adapter(cache_weight=True)
     q_proj = DeploymentBlockFP8Adapter(cache_weight=True)
+    indexer_q_proj = DeploymentBlockFP8Adapter(cache_weight=True)
     return AttentionAdapters(
         fused_linear=fused,
         q_linear=q_proj,
-        bf16_linear=F.linear,
+        indexer_q_linear=indexer_q_proj,
+        bf16_linear=lambda value, weight: __import__(
+            "vllm.model_executor.layers.batch_invariant",
+            fromlist=["linear_batch_invariant"],
+        ).linear_batch_invariant(value, weight),
         fp32_linear=lambda value, weight: torch.mm(
             value.contiguous(), weight.T, out_dtype=torch.float32
         ),
@@ -247,8 +254,10 @@ class _AttentionState(nn.Module):
                 self.compressor.fused_wkv_wgate,
             )
         if self.indexer is not None:
-            aux_fns[1] = lambda: self.adapters.bf16_linear(
-                hidden_states, self.indexer.weights_proj
+            aux_fns[1] = lambda: visible_linear(
+                self.adapters.bf16_linear,
+                hidden_states,
+                self.indexer.weights_proj,
             )
             aux_fns[2] = lambda: block_fp8_linear(
                 self.adapters.fp32_linear,
@@ -309,9 +318,13 @@ class _AttentionState(nn.Module):
             .clone(memory_format=torch.contiguous_format)
         )
         index_q = (
-            self.adapters.bf16_linear(qr, self.indexer.wq_b).view(
-                -1, self.config.index_n_heads, self.config.index_head_dim
-            ).contiguous()
+            block_fp8_linear(
+                self.adapters.indexer_q_linear,
+                qr,
+                self.indexer.wq_b,
+            )
+            .view(-1, self.config.index_n_heads, self.config.index_head_dim)
+            .contiguous()
             if self.indexer is not None
             else None
         )

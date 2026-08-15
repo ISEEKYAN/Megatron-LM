@@ -11,6 +11,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.models.deepseek_v4.common.ops.cache_utils import (
+    _canonicalize_sparse_topk_indices,
+)
+
 from megatron.lite.model import registry
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.vllm import protocol
@@ -27,6 +31,21 @@ from megatron.lite.model.deepseek_v4.vllm.moe import (
 from megatron.lite.primitive.autograd import inference_only
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.runtime.contracts import ParallelConfig
+
+
+def test_sparse_prefill_topk_has_canonical_reduction_order() -> None:
+    unordered = torch.tensor(
+        [[5, -1, 2, 9], [3, 7, -1, 1]], dtype=torch.int32
+    )
+
+    actual = _canonicalize_sparse_topk_indices(unordered)
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor([[9, 5, 2, -1], [7, 3, 1, -1]], dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_attention_restores_fp32_rope_after_fsdp_input_cast() -> None:
@@ -494,6 +513,7 @@ def test_attention_calls_every_adapter_and_rejects_backward() -> None:
     adapters = AttentionAdapters(
         fused_linear=linear,
         q_linear=linear,
+        indexer_q_linear=linear,
         norm=norm,
         kv_insert=insert,
         flash=_FakeFlash(calls),
@@ -612,6 +632,10 @@ def test_layer2_attention_calls_compressor_and_indexer_in_order() -> None:
         calls.append("bf16_linear")
         return torch.ones(x.shape[0], weight.shape[0], dtype=torch.bfloat16)
 
+    def indexer_q_linear(x, weight):
+        calls.append("indexer_q_linear")
+        return torch.ones(x.shape[0], weight.shape[0], dtype=torch.bfloat16)
+
     def fp32_linear(x, weight):
         calls.append("fp32_linear")
         return torch.ones(x.shape[0], weight.shape[0], dtype=torch.float32)
@@ -649,6 +673,7 @@ def test_layer2_attention_calls_compressor_and_indexer_in_order() -> None:
     adapters = AttentionAdapters(
         fused_linear=linear,
         q_linear=linear,
+        indexer_q_linear=indexer_q_linear,
         bf16_linear=bf16_linear,
         fp32_linear=fp32_linear,
         norm=norm,
@@ -690,7 +715,7 @@ def test_layer2_attention_calls_compressor_and_indexer_in_order() -> None:
         "fp32_linear",
         "norm",
         "linear",
-        "bf16_linear",
+        "indexer_q_linear",
         ("compressor", cfg.head_dim),
         ("compressor", cfg.index_head_dim),
         "indexer",

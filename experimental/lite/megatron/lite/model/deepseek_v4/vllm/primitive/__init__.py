@@ -1,6 +1,6 @@
 """Autograd owners for the DS4 vLLM-visible training path."""
 
-from .linear import block_fp8_linear, gate_linear
+from .linear import block_fp8_linear, gate_linear, visible_linear
 from .attention import attention_core, attach_indexer_aux_loss
 from .mhc import mhc_head, mhc_post, mhc_post_pre, mhc_pre_broadcast
 from .moe import TrainingRouteTape, deep_ep_moe
@@ -16,6 +16,7 @@ __all__ = [
     "fused_qkv_rms_norm",
     "fixed_route_vjp",
     "gate_linear",
+    "visible_linear",
     "mhc_head",
     "mhc_post",
     "mhc_post_pre",

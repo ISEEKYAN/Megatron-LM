@@ -77,6 +77,16 @@ def block_fp8_linear(
 ) -> torch.Tensor:
     """Run the unchanged deployment GEMM and attach BF16-master VJP."""
 
+    return visible_linear(visible_op, value, master_weight)
+
+
+def visible_linear(
+    visible_op: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    value: torch.Tensor,
+    master_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Run an exact deployment linear forward with the BF16-master VJP."""
+
     return _VLLMBlockFP8LinearFunction.apply(value, master_weight, visible_op)
 
 
@@ -95,4 +105,5 @@ __all__ = [
     "_VLLMGateLinearFunction",
     "block_fp8_linear",
     "gate_linear",
+    "visible_linear",
 ]
