@@ -299,6 +299,37 @@ class MegatronLiteRuntime(RuntimeBase):
             },
         )
 
+    def close(self, handle: ModelHandle) -> None:
+        """Collectively destroy caller-owned DeepEP buffers in stable order."""
+
+        buffers: list[Any] = []
+        owners: list[tuple[Any, str]] = []
+        seen: set[int] = set()
+        chunks = handle._extras.get("model_chunks", [handle._model])
+        for chunk in chunks:
+            for _, module in sorted(chunk.named_modules(), key=lambda item: item[0]):
+                for attr in ("buffer", "route_buffer"):
+                    value = getattr(module, attr, None)
+                    if value is None:
+                        continue
+                    if not type(value).__module__.startswith("deep_ep"):
+                        continue
+                    if not callable(getattr(value, "destroy", None)):
+                        continue
+                    owners.append((module, attr))
+                    if id(value) in seen:
+                        continue
+                    seen.add(id(value))
+                    buffers.append(value)
+
+        for value in buffers:
+            if getattr(value, "runtime", None) is not None:
+                value.destroy()
+        for module, attr in owners:
+            setattr(module, attr, None)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
     def _load_protocol(self, rt_cfg: MegatronLiteConfig):
         """Load and return the model protocol module."""
         from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES, resolve_runtime_model_name

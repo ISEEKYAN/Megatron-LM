@@ -53,7 +53,14 @@ def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
             config.get_rdma_buffer_size_hint(hidden_bytes, group_size), num_rdma_bytes
         )
 
-    return deep_ep.Buffer(group=group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=num_rdma_bytes)
+    # DeepEP's own tests use explicit destruction before process-group
+    # teardown.  Runtime.close owns that collective lifecycle for MLite.
+    return deep_ep.Buffer(
+        group=group,
+        num_nvl_bytes=num_nvl_bytes,
+        num_rdma_bytes=num_rdma_bytes,
+        explicitly_destroy=True,
+    )
 
 
 def _use_moe_permute_fusion() -> bool:

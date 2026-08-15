@@ -23,7 +23,9 @@ def test_real_flashmla_sparse_backward_matches_reference_direction() -> None:
     from flash_mla import flash_mla_sparse_fwd
 
     torch.manual_seed(37)
-    sequence, physical_kv, heads, dim, topk = 5, 128, 64, 576, 128
+    # Validate the production DS4 training contract.  The earlier five-row
+    # diagnostic is not representative of the required 1024-token sequence.
+    sequence, physical_kv, heads, dim, topk = 1024, 1024, 64, 576, 128
     scale = dim**-0.5
     q = (
         torch.randn(sequence, heads, dim, device="cuda") / math.sqrt(dim)
@@ -35,10 +37,13 @@ def test_real_flashmla_sparse_backward_matches_reference_direction() -> None:
     indices = torch.full(
         (sequence, topk), -1, device="cuda", dtype=torch.int32
     )
-    lengths = torch.arange(1, sequence + 1, device="cuda", dtype=torch.int32)
+    lengths = torch.arange(
+        1, sequence + 1, device="cuda", dtype=torch.int32
+    ).clamp_max_(topk)
     for row in range(sequence):
-        indices[row, : row + 1] = torch.arange(
-            row + 1, device="cuda", dtype=torch.int32
+        length = min(row + 1, topk)
+        indices[row, :length] = torch.arange(
+            row + 1 - length, row + 1, device="cuda", dtype=torch.int32
         )
     sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
     out, _max_logits, lse = flash_mla_sparse_fwd(
