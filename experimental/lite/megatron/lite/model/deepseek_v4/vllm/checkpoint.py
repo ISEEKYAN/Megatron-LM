@@ -476,6 +476,14 @@ def export_hf_weights(
     source_scale_count = 0
     current_source_scale_count = 0
     for model in _models(chunks):
+        layer_map = (
+            {
+                local_idx: model.layer_indices[local_idx]
+                for local_idx in range(len(model.layer_indices))
+            }
+            if hasattr(model, "layer_indices")
+            else {}
+        )
         model_scale_registry = getattr(model, "_fp8_source_scales_by_name", {})
         model_scale_registry_valid = bool(
             getattr(model, "_fp8_source_scales_valid", False)
@@ -487,6 +495,11 @@ def export_hf_weights(
         # prefer the live Parameter whenever the key names one.
         parameters = dict(model.named_parameters())
         for native_name, state_tensor in model.state_dict(keep_vars=True).items():
+            # Pipeline stages store their layers under stage-local ModuleDict
+            # indices.  The rollout model is PP1 and expects global layer IDs,
+            # so globalize only the exported name; live parameters and the
+            # durable source-scale registry remain keyed by the local name.
+            global_native_name = to_global_layer_name(native_name, layer_map)
             tensor = parameters.get(native_name, state_tensor)
             if _is_block_fp8_weight(native_name):
                 fp8_export_count += 1
@@ -545,7 +558,7 @@ def export_hf_weights(
                     device=output.device, dtype=torch.float32
                 ).contiguous()
                 output._fp8_source_scale_version = output._version
-            yield from spec.native_to_hf(native_name, output)
+            yield from spec.native_to_hf(global_native_name, output)
     if os.getenv("MLITE_WEIGHT_SYNC_FINGERPRINT", "").strip().lower() in {
         "1",
         "true",

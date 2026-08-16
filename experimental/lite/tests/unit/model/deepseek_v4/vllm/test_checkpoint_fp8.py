@@ -135,6 +135,36 @@ def test_mhc_export_preserves_fp32_values() -> None:
     )
 
 
+def test_pipeline_stage_export_uses_global_layer_indices() -> None:
+    class _SecondStage(torch.nn.Module):
+        layer_indices = [2, 3]
+
+        def state_dict(self, *args, **kwargs):
+            assert kwargs.get("keep_vars") is True
+            return {
+                "layers.0.self_attn.compressor.ape": torch.ones(
+                    4, dtype=torch.float32
+                ),
+                "layers.1.self_attn.indexer.compressor.ape": torch.full(
+                    (4,), 2, dtype=torch.float32
+                ),
+            }
+
+    exported = dict(
+        checkpoint.export_hf_weights(
+            _SecondStage(),
+            DeepseekV4Config(hidden_size=128),
+            ParallelState(),
+        )
+    )
+
+    assert set(exported) == {
+        "layers.2.attn.compressor.ape",
+        "layers.3.attn.indexer.compressor.ape",
+    }
+    assert "layers.0.attn.compressor.ape" not in exported
+
+
 def test_export_materializes_fsdp2_dtensor_before_conversion() -> None:
     source = torch.tensor([0.6337993144989014], dtype=torch.bfloat16)
     calls = []
