@@ -194,7 +194,7 @@ def test_torchrun_dp4_ep2_four_layer_dispatch_is_memory_safe() -> None:
     ep_group = ep_groups[rank // 2]
     torch.manual_seed(53 + rank)
 
-    tokens, hidden, experts, topk = 640, 4096, 256, 6
+    hidden, experts, topk = 4096, 256, 6
     parallel_state = SimpleNamespace(ep_size=2, tp_ep_group=ep_group)
     dispatchers = [
         TokenDispatcher(
@@ -206,71 +206,48 @@ def test_torchrun_dp4_ep2_four_layer_dispatch_is_memory_safe() -> None:
         )
         for _ in range(4)
     ]
-    hidden_states = torch.randn(
-        tokens,
-        hidden,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    topk_ids = torch.randint(
-        0,
-        experts,
-        (tokens, topk),
-        device="cuda",
-        dtype=torch.int64,
-    )
-    topk_weights = torch.softmax(
-        torch.randn(tokens, topk, device="cuda", dtype=torch.float32),
-        dim=-1,
-    )
-    hash_logits = torch.randn(
-        tokens,
-        experts,
-        device="cuda",
-        dtype=torch.float32,
-    )
-    token_ids = torch.randint(
-        0,
-        129280,
-        (tokens,),
-        device="cuda",
-        dtype=torch.int32,
-    )
+    # The RL actor executes all four dispatchers on variable-length ~2K-token
+    # microbatches, combines through the route-fingerprint handle, and reuses
+    # the same DeepEP buffers over many rollout/training cycles.  A one-shot
+    # dispatch-only check misses corruption that is first observed on a later
+    # route-buffer dispatch, so exercise the complete communication lifecycle.
+    token_jitter = (109, 286, 171, 920, 249, 179, 337, 512)
     hash_table = torch.randint(
-        0,
-        experts,
-        (129280, topk),
-        device="cuda",
-        dtype=torch.int32,
+        0, experts, (129280, topk), device="cuda", dtype=torch.int32
     )
-    hash_weights, hash_ids = HashRouteAdapter()(
-        hash_logits,
-        token_ids,
-        hash_table,
-        topk=topk,
-        renormalize=True,
-        routed_scaling_factor=1.5,
-    )
-    for dispatcher in dispatchers:
-        compact, counts, probs = dispatcher.dispatch(
-            hidden_states,
-            topk_weights,
-            topk_ids,
+    for iteration in range(12):
+        tokens = 2048 + token_jitter[(iteration + rank) % len(token_jitter)]
+        hidden_states = torch.randn(
+            tokens, hidden, device="cuda", dtype=torch.bfloat16
         )
-        torch.cuda.synchronize()
-        assert compact.ndim == 2 and compact.shape[1] == hidden
-        assert counts.shape == (experts // 2,)
-        assert probs is not None and probs.dtype == torch.float32
-    for dispatcher in dispatchers:
-        compact, counts, probs = dispatcher.dispatch(
-            hidden_states,
-            hash_weights,
-            hash_ids,
+        hash_logits = torch.randn(
+            tokens, experts, device="cuda", dtype=torch.float32
         )
-        torch.cuda.synchronize()
-        assert compact.ndim == 2 and compact.shape[1] == hidden
-        assert counts.shape == (experts // 2,)
-        assert probs is not None and probs.dtype == torch.float32
+        token_ids = torch.randint(
+            0, 129280, (tokens,), device="cuda", dtype=torch.int32
+        )
+        hash_weights, hash_ids = HashRouteAdapter()(
+            hash_logits,
+            token_ids,
+            hash_table,
+            topk=topk,
+            renormalize=True,
+            routed_scaling_factor=1.5,
+        )
+        for dispatcher in dispatchers:
+            compact, counts, probs = dispatcher.dispatch(
+                hidden_states, hash_weights, hash_ids
+            )
+            torch.cuda.synchronize()
+            assert compact.ndim == 2 and compact.shape[1] == hidden
+            assert counts.shape == (experts // 2,)
+            assert probs is not None and probs.dtype == torch.float32
+
+            combined = dispatcher.combine(compact)
+            torch.cuda.synchronize()
+            assert combined.shape == hidden_states.shape
+            assert torch.isfinite(combined).all()
+            del compact, counts, probs, combined
     dist.barrier()
     for dispatcher in dispatchers:
         for buffer in (dispatcher.buffer, dispatcher.route_buffer):
