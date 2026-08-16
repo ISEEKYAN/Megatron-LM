@@ -178,14 +178,21 @@ def test_export_registry_preserves_scales_on_gathered_pipeline_tensor() -> None:
     spec.export_source_block_scales[native] = source_scales
 
     # A PP broadcast produces a fresh tensor without arbitrary Parameter attrs.
-    gathered = torch.ones(384, 128, dtype=torch.float32)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    gathered = torch.ones(384, 128, dtype=torch.float32, device=device)
     exported = dict(spec.native_to_hf(native, gathered))
 
     torch.testing.assert_close(
-        exported["layers.2.attn.wq_a.scale"], source_scales[:2], rtol=0, atol=0
+        exported["layers.2.attn.wq_a.scale"],
+        source_scales[:2].to(device),
+        rtol=0,
+        atol=0,
     )
     torch.testing.assert_close(
-        exported["layers.2.attn.wkv.scale"], source_scales[2:], rtol=0, atol=0
+        exported["layers.2.attn.wkv.scale"],
+        source_scales[2:].to(device),
+        rtol=0,
+        atol=0,
     )
 
 

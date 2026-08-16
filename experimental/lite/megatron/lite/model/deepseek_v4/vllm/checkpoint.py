@@ -416,6 +416,10 @@ class DeepseekV4WeightSpec:
             row_sizes = [tensor.shape[0]] if names else []
             tensors = (tensor,) if names else ()
         if _is_block_fp8_weight(native_name):
+            if source_scales_are_current:
+                source_scales = source_scales.to(
+                    device=tensor.device, dtype=torch.float32
+                ).contiguous()
             scale_tensors = (
                 source_scales.split(
                     [rows // BLOCK_SHAPE[0] for rows in row_sizes], dim=0
