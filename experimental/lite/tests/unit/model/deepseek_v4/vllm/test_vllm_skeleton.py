@@ -275,43 +275,37 @@ def test_cp_forward_inputs_match_lite_contiguous_padded_layout() -> None:
         seq_lens=torch.tensor([3, 4]),
     )
 
-    inputs, padded_lengths = protocol._prepare_cp_forward_inputs(model, batch)
+    inputs, padded_lengths, packed_seq_params = protocol._prepare_cp_forward_inputs(
+        model, batch
+    )
 
     assert padded_lengths == [4, 4]
     assert inputs["input_ids"].shape == (4,)
     assert inputs["position_ids"].shape == (4,)
     assert inputs["labels"].shape == (4,)
     assert inputs["loss_mask"].shape == (4,)
+    assert packed_seq_params is not None
 
 
-def test_attention_cp_gathers_through_model_owned_group(monkeypatch) -> None:
+def test_attention_cp_dispatches_native_path_without_hidden_gather(monkeypatch) -> None:
     attention = _AttentionState.__new__(_AttentionState)
     nn.Module.__init__(attention)
     group = object()
     attention.ps = SimpleNamespace(cp_size=2, cp_rank=0, cp_group=group)
     metadata = SimpleNamespace(cos_sin_cache=torch.empty(8, 4, dtype=torch.float32))
     local = torch.arange(8, dtype=torch.float32).view(2, 4)
-    gathered = []
+    expected = local + 7
+    seen = []
 
-    def fake_all_gather(value, *, group):
-        assert group is attention.ps.cp_group
-        return (value, value + 100)
+    def native(value, received_metadata):
+        seen.append((value, received_metadata))
+        return expected
 
-    monkeypatch.setattr(torch.distributed.nn.functional, "all_gather", fake_all_gather)
+    monkeypatch.setattr(attention, "_forward_native_cp", native)
+    actual = attention.forward(local, metadata=metadata)
 
-    class _Stop(Exception):
-        pass
-
-    def capture(value):
-        gathered.append(value)
-        raise _Stop
-
-    attention._selected = lambda _stage: None
-    attention._input_projections = capture
-    with pytest.raises(_Stop):
-        attention.forward(local, metadata=metadata)
-
-    assert torch.equal(gathered[0], torch.cat((local, local + 100), dim=0))
+    assert actual is expected
+    assert seen == [(local, metadata)]
 
 
 def test_build_contract_preserves_release_master_dtypes(monkeypatch) -> None:

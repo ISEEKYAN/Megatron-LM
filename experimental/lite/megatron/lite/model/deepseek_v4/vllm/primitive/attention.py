@@ -222,6 +222,62 @@ def _compressed_sequence_graph_packed(
     return torch.cat(parts) if parts else kv_score.new_empty((0, kwargs["head_dim"]))
 
 
+def compressed_compact_graph(
+    kv_score,
+    ape,
+    norm_weight,
+    compressed_group_ids,
+    cache,
+    *,
+    ratio,
+    head_dim,
+    rope_dim,
+    eps,
+):
+    """Differentiable compressor on MCore's fixed-capacity CP group layout."""
+    groups = compressed_group_ids.numel()
+    if groups == 0:
+        return kv_score.new_empty((0, head_dim))
+    coff = 2 if ratio == 4 else 1
+    width = coff * head_dim
+    content, gate = kv_score.split((width, width), dim=-1)
+    content = content.view(groups, ratio, coff, head_dim)
+    gate = gate.view_as(content) + ape.view(1, ratio, coff, head_dim)
+    if ratio == 4:
+        expanded_content = content.new_zeros((groups, 2 * ratio, head_dim))
+        expanded_gate = gate.new_full((groups, 2 * ratio, head_dim), float("-inf"))
+        expanded_content[:, ratio:] = content[:, :, 1]
+        expanded_gate[:, ratio:] = gate[:, :, 1]
+        previous_valid = compressed_group_ids != 0
+        if groups > 1:
+            expanded_content[1:, :ratio] = torch.where(
+                previous_valid[1:, None, None], content[:-1, :, 0], 0
+            )
+            expanded_gate[1:, :ratio] = torch.where(
+                previous_valid[1:, None, None],
+                gate[:-1, :, 0],
+                torch.full_like(gate[:-1, :, 0], float("-inf")),
+            )
+        content, gate = expanded_content, expanded_gate
+    else:
+        content, gate = content.squeeze(2), gate.squeeze(2)
+    weights = torch.softmax(gate.float(), dim=1).to(content.dtype)
+    compressed = (content * weights).sum(dim=1).float()
+    compressed = compressed * torch.rsqrt(
+        compressed.square().mean(dim=-1, keepdim=True) + eps
+    )
+    compressed = compressed * norm_weight.float()
+    positions = compressed_group_ids.clamp_min(0).long() * ratio
+    return _rope_and_qnorm(
+        compressed.to(kv_score.dtype),
+        positions,
+        cache,
+        min(rope_dim, head_dim),
+        eps,
+        normalize=False,
+    ).to(norm_weight.dtype)
+
+
 def attach_indexer_aux_loss(
     output,
     q,
@@ -587,4 +643,65 @@ def attention_core(
     )
 
 
-__all__ = ["attention_core"]
+class _VisibleSparseAttentionFunction(torch.autograd.Function):
+    """Differentiate an official sparse-attention visible invocation.
+
+    Native CP constructs Q and the compact KV workspace as straight-through
+    tensors whose forward values already match vLLM.  This owner therefore
+    needs only the vendor sparse-attention VJP; communication, compaction and
+    projections remain ordinary autograd edges outside the function.
+    """
+
+    @staticmethod
+    def forward(ctx, visible_op, backward_op, scale, q, kv, indices, length, sink):
+        result = visible_op(q.detach(), kv.detach())
+        if not isinstance(result, (tuple, list)) or len(result) < 2:
+            raise RuntimeError("native CP FlashMLA must return output and lse")
+        out = result[0]
+        lse = result[2] if len(result) >= 3 else result[1]
+        ctx.save_for_backward(q.detach(), kv.detach(), out, lse, indices, length, sink)
+        ctx.backward_op = backward_op or _default_sparse_backward
+        ctx.scale = scale
+        return own_visible_tensor(out)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, kv, out, lse, indices, length, sink = ctx.saved_tensors
+        dq, dkv = ctx.backward_op(
+            q, kv, out, grad_out, lse, sink, indices, ctx.scale, length
+        )
+        dkv = dkv.reshape_as(kv)
+        if not bool(torch.isfinite(dq).all()) or not bool(torch.isfinite(dkv).all()):
+            raise FloatingPointError("native CP sparse attention produced non-finite gradients")
+        return None, None, None, dq, dkv, None, None, None
+
+
+def visible_sparse_attention(
+    visible_op,
+    q,
+    kv,
+    indices,
+    topk_length,
+    sink,
+    *,
+    softmax_scale: float,
+    backward_op=None,
+):
+    return _VisibleSparseAttentionFunction.apply(
+        visible_op,
+        backward_op,
+        softmax_scale,
+        q,
+        kv,
+        indices,
+        topk_length,
+        sink,
+    )
+
+
+__all__ = [
+    "attention_core",
+    "attach_indexer_aux_loss",
+    "compressed_compact_graph",
+    "visible_sparse_attention",
+]

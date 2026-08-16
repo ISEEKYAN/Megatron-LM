@@ -321,12 +321,14 @@ def pack_r3_replay_mask(model: nn.Module, batch) -> torch.Tensor:
     return _pack_r3_replay_mask(model, batch, contiguous=True)
 
 
-def _prepare_cp_forward_inputs(model: nn.Module, batch) -> tuple[dict[str, Any], list[int]]:
+def _prepare_cp_forward_inputs(
+    model: nn.Module, batch
+) -> tuple[dict[str, Any], list[int], Any | None]:
     """Pad then slice packed rows using DS4 lite's contiguous CP layout."""
 
     ps = parallel_state_from_model(model)
     if ps is None or ps.cp_size <= 1:
-        return {}, [int(value) for value in batch.seq_lens.detach().cpu().tolist()]
+        return {}, [int(value) for value in batch.seq_lens.detach().cpu().tolist()], None
     packed = pack_nested_thd(
         nested_from_packed(batch.input_ids, batch.seq_lens),
         tp_size=ps.tp_size,
@@ -353,7 +355,11 @@ def _prepare_cp_forward_inputs(model: nn.Module, batch) -> tuple[dict[str, Any],
         "labels": local(packed.labels),
         "loss_mask": local(packed.loss_mask),
     }
-    return inputs, [int(value) for value in packed.padded_lengths.detach().cpu().tolist()]
+    return (
+        inputs,
+        [int(value) for value in packed.padded_lengths.detach().cpu().tolist()],
+        packed.packed_seq_params,
+    )
 
 
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
@@ -445,8 +451,11 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 raise ValueError("DeepSeek V4 vLLM CP requires batch.seq_lens")
             forward_inputs = {}
             token_counts = [int(batch.input_ids.numel())]
+            cp_packed_seq_params = None
         else:
-            forward_inputs, token_counts = _prepare_cp_forward_inputs(model, batch)
+            forward_inputs, token_counts, cp_packed_seq_params = _prepare_cp_forward_inputs(
+                model, batch
+            )
         local_tokens = sum(token_counts) // parallel_state.cp_size
         if local_tokens > impl_cfg.max_tokens_per_rank:
             raise ValueError(
@@ -455,17 +464,47 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             )
         if attention_metadata is None:
             assert current_attention_builders is not None
-            attention_metadata = {
-                layer_idx: (
-                    current_attention_builders[layer_idx].build_prefill(token_counts[0])
-                    if len(token_counts) == 1
-                    else current_attention_builders[layer_idx].build_prefill_batch(token_counts)
+            if parallel_state.cp_size > 1:
+                from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
+                    build_native_cp_attention_metadata,
                 )
-                for layer_idx in selected_layers
-            }
+
+                attention_metadata = {
+                    layer_idx: build_native_cp_attention_metadata(
+                        model_cfg,
+                        layer_idx=layer_idx,
+                        cos_sin_cache=current_attention_builders[layer_idx].cos_sin_cache,
+                        local_positions=forward_inputs["position_ids"],
+                        packed_seq_params=cp_packed_seq_params,
+                    )
+                    for layer_idx in selected_layers
+                }
+            else:
+                attention_metadata = {
+                    layer_idx: (
+                        current_attention_builders[layer_idx].build_prefill(token_counts[0])
+                        if len(token_counts) == 1
+                        else current_attention_builders[layer_idx].build_prefill_batch(token_counts)
+                    )
+                    for layer_idx in selected_layers
+                }
         if moe_metadata is None:
             assert current_moe_metadata is not None
             moe_metadata = current_moe_metadata
+        if parallel_state.cp_size > 1:
+            if cp_packed_seq_params is None:
+                raise RuntimeError("DeepSeek V4 vLLM CP requires packed sequence metadata")
+            local_positions = forward_inputs.get("position_ids")
+            if local_positions is None:
+                raise RuntimeError("DeepSeek V4 vLLM CP requires local position ids")
+            values = (
+                attention_metadata.values()
+                if isinstance(attention_metadata, dict)
+                else (attention_metadata,)
+            )
+            for layer_metadata in values:
+                layer_metadata.cp_packed_seq_params = cp_packed_seq_params
+                layer_metadata.cp_positions = local_positions
         with ds4_vllm_forward_context(
             batch,
             parallel_state,

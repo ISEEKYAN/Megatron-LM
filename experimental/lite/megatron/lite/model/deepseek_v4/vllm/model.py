@@ -23,6 +23,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive import (
     mhc_pre_broadcast,
     o_projection,
     visible_linear,
+    visible_sparse_attention,
 )
 from megatron.lite.primitive.autograd import inference_only
 from megatron.lite.primitive.kernels.vllm_ds4 import (
@@ -122,6 +123,14 @@ class AttentionKernelMetadata:
     compressor_metadata: Any | None = None
     indexer_operation: Callable[..., Any] | None = None
     indexer_metadata: Any | None = None
+    # Native contiguous context-parallel layout.  The vLLM-visible CP1 cache
+    # metadata above remains caller-owned; CP2 consumes only the packed
+    # sequence geometry and local positions from this explicit side contract.
+    cp_packed_seq_params: Any | None = None
+    cp_positions: torch.Tensor | None = None
+    cp_compressor_operation: Callable[..., Any] | None = None
+    cp_compressor_metadata: Any | None = None
+    cp_debug: dict[str, torch.Tensor] | None = None
 
 
 @dataclass
@@ -363,6 +372,364 @@ class _AttentionState(nn.Module):
                 output.record_stream(current_stream)
         return default_output, aux_outputs
 
+    def _forward_native_cp(
+        self, hidden_states: torch.Tensor, metadata: AttentionKernelMetadata
+    ) -> torch.Tensor:
+        """Run local-Q CSA with boundary exchange and compressed-KV all-gather."""
+        if self.ps is None or self.ps.cp_size <= 1 or self.ps.cp_group is None:
+            raise RuntimeError("native DS4 CP requires a model-owned CP group")
+        if metadata.cp_packed_seq_params is None or metadata.cp_positions is None:
+            raise RuntimeError("native DS4 CP requires packed sequence geometry")
+        if metadata.flash_kind != "prefill":
+            raise NotImplementedError("native DS4 training CP supports prefill only")
+        if self.indexer_loss_coeff:
+            raise NotImplementedError(
+                "native DS4 CP indexer auxiliary loss is not implemented"
+            )
+
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+            cp_layout_kernels,
+            cp_utils,
+        )
+        from megatron.lite.model.deepseek_v4.vllm.native_cp import (
+            c128_all_visible_topk,
+            compressed_width,
+            official_indexer_topk,
+            official_local_qk_visible,
+            quantized_main_k_visible,
+        )
+        from megatron.lite.model.deepseek_v4.vllm.primitive.attention import (
+            compressed_compact_graph,
+        )
+        from megatron.lite.primitive.modules.attention.cp_geometry import (
+            gather_cp_compressed_rows,
+            prepare_cp_compression_geometry,
+        )
+
+        psp = metadata.cp_packed_seq_params
+        cu_seqlens = (
+            psp.cu_seqlens_q_padded
+            if psp.cu_seqlens_q_padded is not None
+            else psp.cu_seqlens_q
+        )
+        if cu_seqlens is None:
+            raise RuntimeError("native DS4 CP requires cu_seqlens_q")
+        l_local = hidden_states.shape[0]
+        global_start = self.ps.cp_rank * l_local
+        positions = metadata.cp_positions.reshape(-1).to(torch.int64)
+        if positions.numel() != l_local:
+            raise RuntimeError("native DS4 CP position rows do not match local tokens")
+        if metadata.cos_sin_cache.dtype != torch.float32:
+            metadata.cos_sin_cache = metadata.cos_sin_cache.float()
+
+        self._selected("linear")
+        qr_kv, projection_outputs = self._input_projections(hidden_states)
+        compressor_kv_score, indexer_weights, indexer_kv_score = projection_outputs
+        qr, kv = qr_kv.split([self.config.q_lora_rank, self.config.head_dim], dim=-1)
+        qr, kv = fused_qkv_rms_norm(
+            self.adapters.norm,
+            qr,
+            kv,
+            self.q_norm,
+            self.kv_norm,
+            self.config.rms_norm_eps,
+        )
+        q = block_fp8_linear(self.adapters.q_linear, qr, self.wq_b).view(
+            -1, self.config.num_attention_heads, self.config.head_dim
+        ).contiguous()
+        q_visible, kv_visible = official_local_qk_visible(
+            q,
+            kv,
+            positions,
+            metadata.cos_sin_cache,
+            self.adapters.kv_insert,
+            eps=self.config.rms_norm_eps,
+            rope_dim=self.config.qk_rope_head_dim,
+            padded_heads=self.config.num_attention_heads,
+        )
+
+        boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
+            hidden_states,
+            self.compress_ratio,
+            self.config.sliding_window,
+            self.ps.cp_group,
+        )
+        d_window = boundary_hidden.shape[0]
+        boundary_qr_kv = block_fp8_linear(
+            self.adapters.fused_linear, boundary_hidden, self.fused_wqa_wkv
+        )
+        boundary_qr, boundary_kv = boundary_qr_kv.split(
+            [self.config.q_lora_rank, self.config.head_dim], dim=-1
+        )
+        _, boundary_kv = fused_qkv_rms_norm(
+            self.adapters.norm,
+            boundary_qr,
+            boundary_kv,
+            self.q_norm,
+            self.kv_norm,
+            self.config.rms_norm_eps,
+        )
+        boundary_positions = cp_utils._thd_cp_position_ids(
+            cu_seqlens, global_start - d_window, d_window
+        ).to(torch.int64)
+        boundary_dummy_q = boundary_kv.new_zeros(
+            (
+                d_window,
+                self.config.num_attention_heads,
+                self.config.head_dim,
+            )
+        )
+        _, boundary_k_visible = official_local_qk_visible(
+            boundary_dummy_q,
+            boundary_kv,
+            boundary_positions,
+            metadata.cos_sin_cache,
+            self.adapters.kv_insert,
+            eps=self.config.rms_norm_eps,
+            rope_dim=self.config.qk_rope_head_dim,
+            padded_heads=self.config.num_attention_heads,
+        )
+
+        compressed_rank_major = hidden_states.new_empty((0, self.config.head_dim))
+        cu_seqlens_compressed = None
+        seq_to_rank_row = None
+        compressed_topk = None
+        ratio = max(1, self.compress_ratio)
+        if self.compressor is not None and ratio > 1:
+            compression_geometry = prepare_cp_compression_geometry(
+                hidden_states,
+                boundary_hidden,
+                cu_seqlens,
+                global_start=global_start,
+                cp_size=self.ps.cp_size,
+                ratio=ratio,
+            )
+            cu_seqlens_compressed = compression_geometry.cu_seqlens_compressed
+            hidden_compact = compression_geometry.hidden_compact
+            group_ids = compression_geometry.compressed_group_ids
+            seq_to_rank_row = compression_geometry.seq_to_rank_row
+            compact_score = block_fp8_linear(
+                self.adapters.fp32_linear,
+                hidden_compact,
+                self.compressor.fused_wkv_wgate,
+            )
+            compressed_graph = compressed_compact_graph(
+                compact_score,
+                self.compressor.ape,
+                self.compressor.norm.weight,
+                group_ids,
+                metadata.cos_sin_cache,
+                ratio=ratio,
+                head_dim=self.config.head_dim,
+                rope_dim=self.config.qk_rope_head_dim,
+                eps=self.config.rms_norm_eps,
+            )
+            if ratio in (4, 128):
+                from megatron.lite.model.deepseek_v4.vllm.native_cp import (
+                    official_compact_compressed_visible,
+                )
+
+                if (
+                    metadata.cp_compressor_operation is None
+                    or metadata.cp_compressor_metadata is None
+                ):
+                    raise RuntimeError(
+                        "C4/C128 native CP requires caller-owned official compressor metadata"
+                    )
+                compressed_graph = official_compact_compressed_visible(
+                    compressed_graph,
+                    compact_score,
+                    self.compressor.ape,
+                    self.compressor.norm.weight,
+                    group_ids,
+                    metadata.cos_sin_cache,
+                    operation=metadata.cp_compressor_operation,
+                    runtime_metadata=metadata.cp_compressor_metadata,
+                    ratio=ratio,
+                    head_dim=self.config.head_dim,
+                )
+                compressed_local = compressed_graph
+            else:
+                compressed_local = quantized_main_k_visible(compressed_graph)
+            compressed_rank_major, _ = gather_cp_compressed_rows(
+                compressed_local,
+                seq_to_rank_row,
+                cp_group=self.ps.cp_group,
+            )
+
+            width = compressed_width(
+                int(psp.max_seqlen_q), ratio, self.config.index_topk
+            )
+            if self.indexer is not None:
+                if indexer_kv_score is None or indexer_weights is None:
+                    raise RuntimeError("C4 native CP requires indexer projections")
+                index_q = block_fp8_linear(
+                    self.adapters.indexer_q_linear, qr, self.indexer.wq_b
+                ).view(-1, self.config.index_n_heads, self.config.index_head_dim)
+                compact_index_score = block_fp8_linear(
+                    self.adapters.fp32_linear,
+                    hidden_compact.detach(),
+                    self.indexer.compressor.fused_wkv_wgate,
+                )
+                index_k_local = compressed_compact_graph(
+                    compact_index_score,
+                    self.indexer.compressor.ape.detach(),
+                    self.indexer.compressor.norm.weight.detach(),
+                    group_ids,
+                    metadata.cos_sin_cache,
+                    ratio=ratio,
+                    head_dim=self.config.index_head_dim,
+                    rope_dim=self.config.qk_rope_head_dim,
+                    eps=self.config.rms_norm_eps,
+                )
+                index_k_rank_major, index_k_seq_major = gather_cp_compressed_rows(
+                    index_k_local,
+                    seq_to_rank_row,
+                    cp_group=self.ps.cp_group,
+                )
+                compressed_topk = official_indexer_topk(
+                    index_q,
+                    indexer_weights,
+                    index_k_seq_major,
+                    positions,
+                    metadata.cos_sin_cache,
+                    cu_seqlens,
+                    cu_seqlens_compressed,
+                    global_start=global_start,
+                    ratio=ratio,
+                    topk=width,
+                )
+            else:
+                compressed_topk = c128_all_visible_topk(
+                    positions, width=width, ratio=ratio
+                )
+        else:
+            width = 0
+
+        workspace = torch.cat(
+            (boundary_k_visible, kv_visible, compressed_rank_major), dim=0
+        ).view(-1, 1, self.config.head_dim)
+        self._selected("kv_flashmla")
+        if compressed_topk is not None:
+            # vLLM's BI combine canonicalizes the unordered compressed set in
+            # descending logical-index order before appending chronological SWA.
+            compressed_topk = torch.sort(
+                compressed_topk, dim=-1, descending=True
+            ).values
+        indices, topk_length, _ = cp_layout_kernels.build_attention_indices(
+            cu_seqlens,
+            global_start,
+            l_local,
+            d_window,
+            self.config.sliding_window,
+            ratio,
+            width,
+            compressed_topk,
+            cu_seqlens_compressed=cu_seqlens_compressed,
+            seq_to_rank_row=seq_to_rank_row,
+            for_indexer_loss=False,
+        )
+        if topk_length is None:
+            raise RuntimeError("native DS4 CP index lowering must return lengths")
+        if compressed_topk is not None:
+            # MCore's normal selected layout is compact [window | compressed].
+            # vLLM FlashMLA consumes compact [compressed | window], so rotate
+            # only the valid prefix without changing either selected set.
+            window_count = torch.minimum(
+                positions + 1,
+                torch.tensor(
+                    self.config.sliding_window,
+                    dtype=positions.dtype,
+                    device=positions.device,
+                ),
+            ).to(torch.int64)
+            compressed_count = topk_length.to(torch.int64) - window_count
+            columns = torch.arange(indices.shape[-1], device=indices.device).unsqueeze(0)
+            source = torch.where(
+                columns < compressed_count.unsqueeze(1),
+                window_count.unsqueeze(1) + columns,
+                columns - compressed_count.unsqueeze(1),
+            ).clamp_min(0)
+            indices = torch.gather(indices, 1, source)
+            indices = torch.where(
+                columns < topk_length.to(torch.int64).unsqueeze(1),
+                indices,
+                torch.full_like(indices, -1),
+            )
+        indices = indices.unsqueeze(1)
+        scale = metadata.softmax_scale or self.config.head_dim**-0.5
+        sink = (
+            metadata.attn_sink
+            if metadata.attn_sink is not None
+            else self.attn_sink.float().contiguous()
+        )
+        output_buffer = torch.empty_like(q_visible)
+
+        def visible_attention(q_value, kv_value):
+            return self.adapters.flash.sparse(
+                q_value,
+                kv_value,
+                indices,
+                sm_scale=scale,
+                attn_sink=sink,
+                topk_length=topk_length,
+                out=output_buffer,
+            )
+
+        result = visible_sparse_attention(
+            visible_attention,
+            q_visible,
+            workspace,
+            indices,
+            topk_length,
+            sink,
+            softmax_scale=scale,
+        )
+        if os.environ.get("MLITE_CP_DEBUG") == "1":
+            metadata.cp_debug = {
+                "q": q_visible.detach(),
+                "workspace": workspace.detach(),
+                "indices": indices.detach(),
+                "topk_length": topk_length.detach(),
+                "flash_output": result.detach(),
+                "boundary_k": boundary_k_visible.detach(),
+                "local_k": kv_visible.detach(),
+                "compressed_rank_major": compressed_rank_major.detach(),
+                "seq_to_rank_row": (
+                    seq_to_rank_row.detach()
+                    if seq_to_rank_row is not None
+                    else torch.empty(0, dtype=torch.int32, device=hidden_states.device)
+                ),
+            }
+        result = result[:, : self.config.num_attention_heads, :]
+        self._selected("o_proj")
+        heads_per_group = self.config.num_attention_heads // self.config.o_groups
+        nope_dim = self.config.head_dim - self.config.qk_rope_head_dim
+        return o_projection(
+            lambda o, wa, wb: self.adapters.o_project(
+                o,
+                positions,
+                metadata.cos_sin_cache,
+                wa,
+                wb,
+                n_groups=self.config.o_groups,
+                heads_per_group=heads_per_group,
+                nope_dim=nope_dim,
+                rope_dim=self.config.qk_rope_head_dim,
+                o_lora_rank=self.config.o_lora_rank,
+            ),
+            result,
+            self.wo_a,
+            self.wo_b,
+            positions=positions,
+            cos_sin_cache=metadata.cos_sin_cache,
+            n_groups=self.config.o_groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=self.config.qk_rope_head_dim,
+            o_lora_rank=self.config.o_lora_rank,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -373,16 +740,8 @@ class _AttentionState(nn.Module):
             raise ValueError("layer-0 attention requires flat [tokens, hidden]")
         if metadata is None:
             raise NotImplementedError("layer-0 attention requires explicit metadata")
-        local_tokens = hidden_states.shape[0]
         if self.ps is not None and self.ps.cp_size > 1:
-            if self.ps.cp_group is None:
-                raise RuntimeError("DeepSeek V4 vLLM CP requires ps.cp_group")
-            from torch.distributed.nn.functional import all_gather
-
-            hidden_states = torch.cat(
-                list(all_gather(hidden_states.contiguous(), group=self.ps.cp_group)),
-                dim=0,
-            )
+            return self._forward_native_cp(hidden_states, metadata)
         # FSDP2 mixed precision recursively casts floating forward inputs,
         # including tensors nested in this metadata dataclass. FlashMLA's RoPE
         # kernels require the cache to remain FP32, so restore that boundary
@@ -506,6 +865,14 @@ class _AttentionState(nn.Module):
                     topk_length=metadata.topk_length,
                     out=metadata.output,
                 )
+                if os.environ.get("MLITE_CP_DEBUG") == "1":
+                    metadata.cp_debug = {
+                        "q": q_visible.detach(),
+                        "workspace": metadata.kv_workspace.detach(),
+                        "indices": metadata.indices.detach(),
+                        "topk_length": metadata.topk_length.detach(),
+                        "flash_output": flash_result[0].detach(),
+                    }
                 if not isinstance(flash_result, (tuple, list)) or len(flash_result) < 2:
                     raise RuntimeError(
                         "training FlashMLA prefill must return output and lse"
@@ -642,9 +1009,6 @@ class _AttentionState(nn.Module):
             rope_dim=self.config.qk_rope_head_dim,
             o_lora_rank=self.config.o_lora_rank,
         )
-        if self.ps is not None and self.ps.cp_size > 1:
-            start = self.ps.cp_rank * local_tokens
-            output = output.narrow(0, start, local_tokens).contiguous()
         return output
 
 

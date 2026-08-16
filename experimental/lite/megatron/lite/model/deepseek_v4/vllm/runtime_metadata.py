@@ -225,6 +225,69 @@ class DS4IndexerRuntimeMetadata:
     max_total_seq_len: int
 
 
+def build_native_cp_attention_metadata(
+    config: DeepseekV4Config,
+    *,
+    layer_idx: int,
+    cos_sin_cache: torch.Tensor,
+    local_positions: torch.Tensor,
+    packed_seq_params: Any,
+):
+    """Allocate only local/native-CP metadata, never CP1 paged caches."""
+    from megatron.lite.model.deepseek_v4.vllm.model import AttentionKernelMetadata
+
+    device = local_positions.device
+    empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=device)
+    empty_u8 = torch.empty(0, dtype=torch.uint8, device=device)
+    empty_bf16 = torch.empty(0, dtype=torch.bfloat16, device=device)
+    ratio = max(1, config.compress_ratios[layer_idx])
+    cp_compressor_operation = None
+    cp_compressor_metadata = None
+    if ratio in (4, 128):
+        local_rows = local_positions.numel()
+        d_comp = 8 if ratio == 4 else ratio
+        group_alignment = 32 // math.gcd(32, ratio)
+        capacity = max(1, (local_rows + d_comp) // ratio)
+        capacity = (
+            (capacity + group_alignment - 1) // group_alignment
+        ) * group_alignment
+        synthetic_tokens = capacity * ratio
+        synthetic_cos = torch.empty(
+            (synthetic_tokens, cos_sin_cache.shape[1]),
+            dtype=cos_sin_cache.dtype,
+            device=device,
+        )
+        adapter = DS4SparseIndexerCompressorMetadataAdapter(
+            config,
+            layer_idx=layer_idx,
+            device=device,
+            cos_sin_cache=synthetic_cos,
+        )
+        cp_compressor_operation = adapter.compressor_operation
+        cp_compressor_metadata = adapter._compressor_metadata(
+            synthetic_tokens,
+            head_dim=config.head_dim,
+            token_bytes=adapter._MAIN_TOKEN_BYTES,
+        )
+    return AttentionKernelMetadata(
+        positions=local_positions,
+        slot_mapping=empty_i64,
+        cos_sin_cache=cos_sin_cache,
+        swa_cache=empty_u8,
+        block_size=DS4_SWA_BLOCK_SIZE,
+        flash_kind="prefill",
+        indices=empty_i32,
+        topk_length=empty_i32,
+        output=empty_bf16,
+        padded_heads=config.num_attention_heads,
+        cp_packed_seq_params=packed_seq_params,
+        cp_positions=local_positions,
+        cp_compressor_operation=cp_compressor_operation,
+        cp_compressor_metadata=cp_compressor_metadata,
+    )
+
+
 class DS4SparseAttentionMetadataBuilderAdapter:
     """Build production metadata for DS4's layer-0 SWA-only attention.
 
