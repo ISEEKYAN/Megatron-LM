@@ -98,12 +98,39 @@ def test_ds4_hash_router_records_and_replays_its_layer_column():
     _, recorded = module._hash_route(x, token_ids)
     assert torch.equal(gate.router_replay.recorded_topk_idx, recorded)
 
+    # Reversed slots describe the same expert sets. Keep the native order so
+    # the deterministic weighted gather remains on its validated path.
     target = torch.tensor([[1, 0], [3, 2]])
     RouterReplay.set_replay_data([target], replay_mask=torch.tensor([True, True]))
     RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
     weights, replayed = module._hash_route(x, token_ids)
-    assert torch.equal(replayed, target)
+    assert torch.equal(replayed, recorded)
     torch.testing.assert_close(weights.sum(dim=-1), torch.ones(2))
+
+
+def test_replay_substitutes_only_genuinely_different_expert_sets():
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+    replay = RouterReplay()
+    native = torch.tensor([[4, 2, 7], [1, 5, 3]])
+    target = torch.tensor([[7, 4, 2], [1, 6, 3]])
+    RouterReplay.set_replay_data([target])
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    RouterReplay.reset_replay_stats()
+
+    selected = replay.select_indices(native)
+
+    assert torch.equal(selected, torch.tensor([[4, 2, 7], [1, 6, 3]]))
+    assert RouterReplay.replay_stats() == {
+        "calls": 1,
+        "rows": 6,
+        "changed": 1,
+        "sets_changed": 1,
+    }
 
 
 def test_r3_mask_replays_every_causal_row_except_last():
