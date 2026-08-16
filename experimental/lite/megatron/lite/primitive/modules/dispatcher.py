@@ -267,6 +267,15 @@ class TokenDispatcher:
         if self.use_deepep:
             assert ps.tp_ep_group is not None
             self.buffer = _build_deepep_buffer(ps.tp_ep_group, hidden_size)
+            if self.deepep_align_to_low_latency:
+                # DeepEP normal mode requires a 32-byte-aligned payload.  The
+                # second dispatch transports only a 16xBF16 route fingerprint,
+                # but its handle later combines full-width expert outputs.  The
+                # allocation therefore has to cover ``hidden_size`` even though
+                # the metadata communication itself stays 32 bytes per route.
+                self.route_buffer = _build_deepep_buffer(
+                    ps.tp_ep_group, hidden_size
+                )
 
         self._row_id_map: torch.Tensor | None = None
         self._restore_shape: tuple | None = None
@@ -377,13 +386,7 @@ class TokenDispatcher:
                 _,
                 route_handle,
             ) = _DeepEPDispatch.apply(
-                # Reuse the normal DeepEP buffer, matching MCore/slime's
-                # process-wide buffer contract.  The primary handle is not
-                # retained by the aligned path, while this route-level handle
-                # is the one used for combine.  A second live Buffer is both
-                # unnecessary and can overlap DeepEP/NVSHMEM internal state
-                # under colocated rollout/training memory pressure.
-                self.buffer,
+                self.route_buffer,
                 route_fingerprints,
                 route_indices,
                 route_weights,
@@ -484,7 +487,7 @@ class TokenDispatcher:
         )
         if self.ep_size > 1:
             source_routes = _DeepEPCombine.apply(
-                self.buffer,
+                self.route_buffer,
                 route_outputs,
                 self._aligned_route_handle,
                 False,
