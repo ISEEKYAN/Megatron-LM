@@ -249,8 +249,13 @@ def test_torchrun_dp4_ep2_four_layer_dispatch_is_memory_safe() -> None:
             assert torch.isfinite(combined).all()
             del compact, counts, probs, combined
     dist.barrier()
+    destroyed: set[int] = set()
     for dispatcher in dispatchers:
-        for buffer in (dispatcher.buffer, dispatcher.route_buffer):
+        for name in ("buffer", "route_buffer"):
+            buffer = getattr(dispatcher, name, None)
+            if buffer is None or id(buffer) in destroyed:
+                continue
+            destroyed.add(id(buffer))
             destroy = getattr(buffer, "destroy", None)
             if callable(destroy) and getattr(buffer, "explicitly_destroy", False):
                 destroy()
