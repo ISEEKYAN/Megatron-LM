@@ -177,20 +177,15 @@ class RouterReplay:
                 "router replay target shape does not match live routing: "
                 f"target={tuple(target.shape)} live={tuple(native_indices.shape)}."
             )
-        # A top-k expert set is the routing decision; slot order is an
-        # implementation detail of the router kernel.  DS4's rollout and actor
-        # may return the same set in different slot orders even when their MoE
-        # outputs are bitwise identical.  Replaying that permutation changes
-        # the deterministic weighted-gather order and creates a regression.
-        # Preserve the actor's already-validated slot order when the sets are
-        # equal, and substitute rollout order only for a genuinely different
-        # expert set.
+        # R3 replays the rollout tensor exactly, including its top-k slot order.
+        # The order is observable to deterministic dispatch/combine kernels and
+        # therefore belongs to the replay contract, even when the expert set is
+        # unchanged.  ``same_set`` is diagnostic evidence only.
         same_set = torch.eq(
             target.sort(dim=-1).values, native_indices.sort(dim=-1).values
         ).all(dim=-1, keepdim=True)
-        replayed = torch.where(same_set, native_indices, target)
         if mask is None:
-            selected = replayed
+            selected = target
         else:
             mask = mask.to(device=native_indices.device, dtype=torch.bool).reshape(
                 -1, 1
@@ -199,7 +194,7 @@ class RouterReplay:
                 raise ValueError(
                     f"router replay mask length does not match routing rows: mask={mask.size(0)} rows={target.size(0)}."
                 )
-            selected = torch.where(mask, replayed, native_indices)
+            selected = torch.where(mask, target, native_indices)
         self._record_replay_stats(native_indices, selected, same_set, mask)
         return selected
 
