@@ -190,3 +190,67 @@ def test_official_learned_router_is_bitwise_through_adapter() -> None:
     )
     torch.testing.assert_close(candidate_weights, reference_weights, rtol=0, atol=0)
     assert torch.equal(candidate_ids, reference_ids)
+
+
+def test_r3_official_route_is_exact_mlite_native_noop() -> None:
+    """Keep vLLM's captured token/layer/slot order through exact R3 replay."""
+    import os
+
+    if not _router_ready():
+        if os.environ.get("MLITE_REQUIRE_VLLM_R3_GPU_GATE") == "1":
+            pytest.fail("the exact R3 gate requires CUDA and the official vLLM package")
+        pytest.skip("requires CUDA and the official vLLM DS4 learned router")
+
+    import torch.nn as nn
+
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+    from megatron.lite.primitive.modules.router import SigmoidTopKRouter
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+    from vllm.model_executor.layers.fused_moe.router.dsv4_topk import dsv4_topk
+
+    config = DeepseekV4Config(hidden_size=256)
+    ps = Mock(tp_size=1, tp_group=None)
+    router = SigmoidTopKRouter(config, ps, compute_aux_loss=False).cuda()
+    # Feed the same logits to both implementations without introducing a
+    # second GEMM whose numeric mode could obscure the route contract.
+    router.gate = nn.Identity()
+    base = torch.linspace(-4.0, 4.0, 256, dtype=torch.float32, device="cuda")
+    logits = torch.stack(
+        (base, base.flip(0), base.roll(73), torch.sin(torch.arange(256, device="cuda")))
+    )
+    correction_bias = torch.linspace(
+        0.125, -0.125, 256, dtype=torch.float32, device="cuda"
+    )
+    router.expert_bias.copy_(correction_bias)
+
+    _, captured_ids = dsv4_topk(
+        logits,
+        correction_bias,
+        torch.int64,
+        config.routed_scaling_factor,
+    )
+    native_scores, native_ids = router(logits)
+
+    # This is deliberately an elementwise slot comparison, not a set compare.
+    assert torch.equal(native_ids, captured_ids)
+    assert not torch.equal(native_ids, native_ids.sort(dim=-1).values)
+
+    RouterReplay.clear_global_router_replay_instances()
+    router.router_replay = RouterReplay()
+    RouterReplay.set_replay_data([captured_ids])
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    RouterReplay.reset_replay_stats()
+    replay_scores, replay_ids = router(logits)
+
+    assert torch.equal(replay_ids, native_ids)
+    assert torch.equal(replay_scores, native_scores)
+    assert RouterReplay.replay_stats() == {
+        "calls": 1,
+        "rows": native_ids.numel(),
+        "changed": 0,
+        "sets_changed": 0,
+    }
+    RouterReplay.clear_global_router_replay_instances()
