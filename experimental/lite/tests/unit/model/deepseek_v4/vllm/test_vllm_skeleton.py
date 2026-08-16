@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import inspect
 import sys
+import textwrap
 from contextlib import nullcontext
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -22,6 +24,7 @@ from megatron.lite.model.deepseek_v4.vllm import protocol
 from megatron.lite.model.deepseek_v4.vllm.model import (
     AttentionAdapters,
     AttentionKernelMetadata,
+    DeepseekV4Layer,
     DeepseekV4Model,
     _AttentionState,
     _RMSNormState,
@@ -58,7 +61,7 @@ def test_final_rmsnorm_uses_vllm_batch_invariant_kernel(monkeypatch) -> None:
     from vllm.model_executor.layers import batch_invariant
 
     norm = _RMSNormState(8)
-    value = torch.randn(3, 8, dtype=torch.bfloat16)
+    value = torch.randn(3, 8, dtype=torch.bfloat16, requires_grad=True)
     sentinel = torch.full_like(value, 7)
     calls = []
 
@@ -69,8 +72,55 @@ def test_final_rmsnorm_uses_vllm_batch_invariant_kernel(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setattr(batch_invariant, "rms_norm_batch_invariant", fake_rms_norm)
 
-    assert norm(value, 1e-6) is sentinel
+    output = norm(value, 1e-6)
+    assert output is sentinel
     assert calls == [(value, norm.weight, 1e-6)]
+
+    output.sum().backward()
+    assert value.grad is not None
+    assert norm.weight.grad is not None
+
+    reference_value = value.detach().clone().requires_grad_(True)
+    reference_weight = norm.weight.detach().clone().requires_grad_(True)
+    reference = torch.nn.functional.rms_norm(
+        reference_value,
+        (reference_value.shape[-1],),
+        reference_weight,
+        1e-6,
+    )
+    reference.sum().backward()
+    torch.testing.assert_close(value.grad, reference_value.grad, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        norm.weight.grad,
+        reference_weight.grad,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def test_recompute_tracks_cross_layer_mhc_state_as_positional_inputs() -> None:
+    signature = inspect.signature(DeepseekV4Layer.forward)
+    for name in ("residual", "post_mix", "res_mix"):
+        assert signature.parameters[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+
+    # The reentrant recompute owner saves positional tensor inputs. Capturing
+    # these differentiable streams as kwargs would reconnect recomputation to
+    # the original preceding-layer graph and backward it twice.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(DeepseekV4Model.forward)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "layer"
+    ]
+    assert len(calls) == 1
+    assert [node.id for node in calls[0].args[:4]] == [
+        "hidden_states",
+        "residual",
+        "post_mix",
+        "res_mix",
+    ]
 
 
 def test_attention_restores_fp32_rope_after_fsdp_input_cast() -> None:
@@ -243,7 +293,6 @@ def test_r3_replays_ids_and_recomputes_live_actor_weights(hash_layer: bool) -> N
     [
         ParallelConfig(tp=2),
         ParallelConfig(etp=2),
-        ParallelConfig(pp=2),
         ParallelConfig(vpp=2),
     ],
 )
@@ -261,6 +310,17 @@ def test_parallel_contract_accepts_cp_with_required_ep_deepep() -> None:
         protocol.ImplConfig(
             parallel=ParallelConfig(cp=2, ep=2),
             use_deepep=True,
+        ),
+    )
+
+
+def test_parallel_contract_accepts_pp2_cp2_ep4() -> None:
+    protocol._validate_contract(
+        _tiny_config(),
+        protocol.ImplConfig(
+            parallel=ParallelConfig(pp=2, cp=2, ep=4),
+            use_deepep=True,
+            recompute=("full",),
         ),
     )
 
@@ -1056,8 +1116,9 @@ def test_model_agnostic_boundary_rejects_backward() -> None:
 
 def test_protocol_does_not_install_training_features() -> None:
     source = inspect.getsource(protocol.build_model)
-    for forbidden in ("apply_qat", "apply_recompute", "apply_offload", "register_training_hooks"):
+    for forbidden in ("apply_qat", "apply_offload", "register_training_hooks"):
         assert forbidden not in source
+    assert "apply_recompute" in source
 
 
 def test_protocol_owns_vllm_workspace_lifecycle() -> None:

@@ -22,6 +22,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive import (
     mhc_post_pre,
     mhc_pre_broadcast,
     o_projection,
+    rms_norm,
     visible_linear,
     visible_sparse_attention,
 )
@@ -36,6 +37,11 @@ from megatron.lite.primitive.kernels.vllm_ds4 import (
     MHCKernel,
     MHCTileLangAdapter,
     OProjectionAdapter,
+)
+from megatron.lite.primitive.parallel import ParallelState, build_pipeline_chunk_layout
+from megatron.lite.primitive.parallel.mhc import (
+    fold_mhc_hidden_for_pipeline,
+    unfold_mhc_hidden_from_pipeline,
 )
 from megatron.lite.primitive.quantization.deployment_block_fp8 import (
     DeploymentBlockFP8Adapter,
@@ -192,7 +198,12 @@ class _RMSNormState(nn.Module):
                 rms_norm_batch_invariant,
             )
 
-            return rms_norm_batch_invariant(value, self.weight, eps)
+            return rms_norm(
+                rms_norm_batch_invariant,
+                value,
+                self.weight,
+                eps,
+            )
         return F.rms_norm(value, (value.shape[-1],), self.weight, eps)
 
 
@@ -264,7 +275,7 @@ class _AttentionState(nn.Module):
         super().__init__()
         h, qrank, dim = config.hidden_size, config.q_lora_rank, config.head_dim
         self.config = config
-        self.ps = ps
+        self.ps = ps or ParallelState()
         self.layer_idx = layer_idx
         configured_ratio = (
             config.compress_ratios[layer_idx]
@@ -1053,15 +1064,15 @@ class DeepseekV4Layer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        post_mix: torch.Tensor | None = None,
+        res_mix: torch.Tensor | None = None,
         *,
         attention_metadata: (
             AttentionKernelMetadata | dict[int, AttentionKernelMetadata] | None
         ) = None,
         moe_metadata: MoEKernelMetadata | dict[int, MoEKernelMetadata] | None = None,
         input_ids: torch.Tensor | None = None,
-        residual: torch.Tensor | None = None,
-        post_mix: torch.Tensor | None = None,
-        res_mix: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if "mhc" not in self.selected_stages:
             raise NotImplementedError("layer-0 stage 'mhc' was not executed")
@@ -1074,9 +1085,13 @@ class DeepseekV4Layer(nn.Module):
             .contiguous()
         )
         if residual is None:
-            adapter = MHCTileLangAdapter(MHCKernel.PRE_BROADCAST)
-            residual, post_mix, res_mix, hidden_states = mhc_pre_broadcast(
-                lambda hidden, fn, scale, base, norm_weight: adapter(
+            broadcast = hidden_states.ndim == 2
+            adapter = MHCTileLangAdapter(
+                MHCKernel.PRE_BROADCAST if broadcast else MHCKernel.PRE
+            )
+
+            def visible_pre(hidden, fn, scale, base, norm_weight):
+                common = (
                     hidden,
                     fn,
                     scale,
@@ -1086,12 +1101,23 @@ class DeepseekV4Layer(nn.Module):
                     self.config.hc_eps,
                     2.0,
                     self.config.hc_sinkhorn_iters,
-                    norm_weight=norm_weight,
-                    norm_eps=self.config.rms_norm_eps,
-                    fn_broadcast=fn.view(
+                )
+                kwargs = {
+                    "norm_weight": norm_weight,
+                    "norm_eps": self.config.rms_norm_eps,
+                }
+                if broadcast:
+                    kwargs["fn_broadcast"] = fn.view(
                         -1, self.config.hc_mult, self.config.hidden_size
-                    ).sum(dim=1).contiguous(),
-                ),
+                    ).sum(dim=1).contiguous()
+                    return adapter(*common, **kwargs)
+                # PRE consumes the residual streams already materialized by
+                # the preceding PP stage.  Preserve those streams as the
+                # residual output expected by the functional training graph.
+                return (hidden, *adapter(*common, **kwargs))
+
+            residual, post_mix, res_mix, hidden_states = mhc_pre_broadcast(
+                visible_pre,
                 hidden_states,
                 attn_fn,
                 attn_scale,
@@ -1238,15 +1264,25 @@ class DeepseekV4Model(nn.Module):
         del use_thd, hf_path, attention_backend_override, mtp_enable_train
         del mtp_detach_encoder
         if vpp_chunk_id is not None:
-            raise NotImplementedError("The vLLM skeleton does not support VPP chunks.")
+            raise NotImplementedError("The vLLM implementation does not support VPP chunks.")
         if mtp_enable:
             raise NotImplementedError("The vLLM skeleton does not support MTP.")
         self.config = config
         self.train_config = train_config
-        self.ps = ps
-        self.layer_indices = list(range(config.num_hidden_layers))
+        self.ps = ps or ParallelState()
+        layout = build_pipeline_chunk_layout(
+            config.num_hidden_layers,
+            self.ps,
+            None,
+            None,
+        )
+        self.layer_indices = layout.layer_indices
+        self.pre_process = layout.has_embed
+        self.post_process = layout.has_head
         selected_ids = frozenset(selected_layer_ids)
-        self.selected_layer_ids = tuple(sorted(selected_ids))
+        self.selected_layer_ids = tuple(
+            layer_idx for layer_idx in self.layer_indices if layer_idx in selected_ids
+        )
         aliases = {
             "attn": ("mhc", "linear", "kv_flashmla", "o_proj"),
             "moe": ("router_moe", "deepep"),
@@ -1257,13 +1293,15 @@ class DeepseekV4Model(nn.Module):
             for stage in aliases.get(name, (name,))
         )
         self.prefix_audit = bool(selected_names)
-        self.embed_tokens = nn.Module()
-        self.embed_tokens.embedding = nn.Embedding(
-            config.vocab_size, config.hidden_size, dtype=torch.bfloat16
-        )
+        self.embed_tokens: nn.Module | None = None
+        if self.pre_process:
+            self.embed_tokens = nn.Module()
+            self.embed_tokens.embedding = nn.Embedding(
+                config.vocab_size, config.hidden_size, dtype=torch.bfloat16
+            )
         self.layers = nn.ModuleDict(
             {
-                str(layer_idx): DeepseekV4Layer(
+                str(local_idx): DeepseekV4Layer(
                     config,
                     ps,
                     layer_idx=layer_idx,
@@ -1273,12 +1311,20 @@ class DeepseekV4Model(nn.Module):
                     indexer_loss_coeff=indexer_loss_coeff,
                     attention_adapters=attention_adapters,
                 )
-                for layer_idx in self.layer_indices
+                for local_idx, layer_idx in enumerate(self.layer_indices)
             }
         )
-        self.norm = _RMSNormState(config.hidden_size)
-        self.hc_head = _HyperConnectionState(config.hidden_size, config.hc_mult, head=True)
-        self.lm_head = _LMHeadState(config.hidden_size, config.vocab_size)
+        self.norm = _RMSNormState(config.hidden_size) if self.post_process else None
+        self.hc_head = (
+            _HyperConnectionState(config.hidden_size, config.hc_mult, head=True)
+            if self.post_process
+            else None
+        )
+        self.lm_head = (
+            _LMHeadState(config.hidden_size, config.vocab_size)
+            if self.post_process
+            else None
+        )
         self.mtp = nn.ModuleList()  # First skeleton iteration intentionally disables MTP.
         self._input_tensor: torch.Tensor | None = None
         self._shared_projection_streams: list[torch.cuda.Stream] | None = None
@@ -1304,10 +1350,16 @@ class DeepseekV4Model(nn.Module):
         **unused,
     ) -> dict[str, torch.Tensor]:
         del unused
+        pipeline_streams = False
         if hidden_states is None:
-            if input_ids is None:
+            if not self.pre_process:
                 hidden_states = self._input_tensor
-            else:
+                if hidden_states is not None:
+                    hidden_states = unfold_mhc_hidden_from_pipeline(
+                        hidden_states, hc_mult=self.config.hc_mult
+                    ).reshape(-1, self.config.hc_mult, self.config.hidden_size)
+                    pipeline_streams = True
+            elif input_ids is not None:
                 if os.getenv("MLITE_VALIDATE_INDICES") == "1" and input_ids.numel():
                     minimum, maximum = torch.aminmax(input_ids)
                     if int(minimum.item()) < 0 or int(maximum.item()) >= self.config.vocab_size:
@@ -1316,10 +1368,11 @@ class DeepseekV4Model(nn.Module):
                             f"min={int(minimum.item())}, max={int(maximum.item())}, "
                             f"vocab={self.config.vocab_size}"
                         )
+                assert self.embed_tokens is not None
                 hidden_states = self.embed_tokens.embedding(input_ids)
         if hidden_states is None:
             raise ValueError("input_ids or hidden_states is required.")
-        if hidden_states.ndim != 2:
+        if hidden_states.ndim != 2 and not pipeline_streams:
             hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         if hidden_states.device.type == "cuda":
             if self._shared_projection_streams is None:
@@ -1332,9 +1385,17 @@ class DeepseekV4Model(nn.Module):
             raise NotImplementedError(
                 "DeepSeek-V4 vLLM forward requires a non-empty contiguous layer prefix."
             )
-        residual = post_mix = res_mix = None
+        residual = hidden_states if pipeline_streams else None
+        post_mix = res_mix = None
+        if pipeline_streams:
+            # The canonical PP tensor is the already-combined mHC residual
+            # streams.  Passing it as the first local layer's residual would
+            # incorrectly require stale post/comb state, so let PRE_BROADCAST
+            # consume the streams directly.
+            residual = None
         for layer_idx in self.selected_layer_ids:
-            layer = self.layers[str(layer_idx)]
+            local_idx = self.layer_indices.index(layer_idx)
+            layer = self.layers[str(local_idx)]
             layer_attention_metadata = (
                 attention_metadata.get(layer_idx)
                 if isinstance(attention_metadata, dict)
@@ -1347,12 +1408,12 @@ class DeepseekV4Model(nn.Module):
             )
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
+                residual,
+                post_mix,
+                res_mix,
                 attention_metadata=layer_attention_metadata,
                 moe_metadata=layer_moe_metadata,
                 input_ids=input_ids,
-                residual=residual,
-                post_mix=post_mix,
-                res_mix=res_mix,
             )
             _validate_finite(
                 f"layer_{layer_idx}.output",
@@ -1361,12 +1422,24 @@ class DeepseekV4Model(nn.Module):
                 post_mix=post_mix,
                 res_mix=res_mix,
             )
-        if labels is not None and len(self.selected_layer_ids) != self.config.num_hidden_layers:
-            raise ValueError("training loss requires the complete decoder layer set")
-        if (
-            labels is None
-            and len(self.selected_layer_ids) != self.config.num_hidden_layers
-        ):
+        if not self.post_process:
+            if residual is None or post_mix is None or res_mix is None:
+                raise RuntimeError("pipeline stage did not produce complete mHC state")
+            adapter = MHCTileLangAdapter(MHCKernel.POST)
+            streams = mhc_post(
+                lambda *args: adapter(*args),
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+            )
+            # Pipeline P2P is [S, B, hc_mult*H].  Packed DS4 uses B=1.
+            return {
+                "hidden_states": fold_mhc_hidden_for_pipeline(
+                    streams.unsqueeze(1)
+                )
+            }
+        if labels is None and len(self.selected_layer_ids) != len(self.layer_indices):
             # Layer-prefix audit mode deliberately stops at the native decoder
             # boundary.  Running the head here would compare a different graph
             # from the corresponding vLLM layer hook.
@@ -1376,6 +1449,8 @@ class DeepseekV4Model(nn.Module):
                 "post_mix": post_mix,
                 "res_mix": res_mix,
             }
+        if self.norm is None or self.hc_head is None or self.lm_head is None:
+            raise RuntimeError("final pipeline stage is missing the output head")
         post_adapter = MHCTileLangAdapter(MHCKernel.POST)
         hidden_states = mhc_post(
             lambda *args: post_adapter(*args),

@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.ckpt.hf_weights import to_global_layer_name
 from megatron.lite.primitive.quantization.checkpoint_block_fp8 import (
     BLOCK_SHAPE,
     BlockFP8CheckpointDequantAdapter,
@@ -168,12 +169,14 @@ class DeepseekV4WeightSpec:
         return {}
 
     def validate_load(self, ps: ParallelState) -> None:
-        if (ps.tp_size, ps.etp_size, ps.pp_size) != (1, 1, 1):
+        if (ps.tp_size, ps.etp_size) != (1, 1):
             raise NotImplementedError(
-                "vLLM checkpoint load requires TP/ETP/PP=1; CP is replicated."
+                "vLLM checkpoint load requires TP/ETP=1; PP/CP are supported."
             )
-        if ps.ep_size not in (1, 2):
-            raise NotImplementedError("vLLM layer-0 checkpoint load supports EP=1/2.")
+        if ps.ep_size <= 0 or self.config.n_routed_experts % ps.ep_size:
+            raise ValueError(
+                f"EP={ps.ep_size} must divide {self.config.n_routed_experts} routed experts."
+            )
         self.ps = ps
 
     def _expert_hf_names(self, native_name: str) -> list[str]:
@@ -210,12 +213,20 @@ class DeepseekV4WeightSpec:
         ps: ParallelState,
         logical_state_keys: tuple[str, ...],
     ) -> dict[str, list[str]]:
-        del base_model
         self.validate_load(ps)
+        layer_map = (
+            {
+                local_idx: base_model.layer_indices[local_idx]
+                for local_idx in range(len(base_model.layer_indices))
+            }
+            if hasattr(base_model, "layer_indices")
+            else {}
+        )
         return {
-            name: names
+            global_name: names
             for name in logical_state_keys
-            if (names := self._load_names(name))
+            if (global_name := to_global_layer_name(name, layer_map))
+            if (names := self._load_names(global_name))
         }
 
     def hf_to_native(
@@ -455,9 +466,9 @@ def export_hf_weights(
     **kwargs,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     del kwargs
-    if (ps.tp_size, ps.etp_size, ps.pp_size) != (1, 1, 1):
+    if (ps.tp_size, ps.etp_size) != (1, 1):
         raise NotImplementedError(
-            "vLLM BF16-master/online-FP8 export requires TP/ETP/PP=1."
+            "vLLM BF16-master/online-FP8 export requires TP/ETP=1."
         )
     spec = DeepseekV4WeightSpec(model_cfg)
     spec.validate_load(ps)

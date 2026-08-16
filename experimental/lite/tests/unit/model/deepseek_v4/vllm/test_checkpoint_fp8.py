@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
@@ -11,6 +13,28 @@ from megatron.lite.primitive.quantization.mxfp4 import (
     dequantize_mxfp4,
     quantize_mxfp4,
 )
+
+
+def test_pp_load_map_translates_local_layer_names_to_global_hf_layers() -> None:
+    config = DeepseekV4Config(hidden_size=128, n_routed_experts=4)
+    spec = DeepseekV4WeightSpec(config, source_block_fp8=False)
+    model = SimpleNamespace(layer_indices=[2, 3])
+
+    weight_map = spec.load_weight_map(
+        model,
+        ParallelState(pp_size=2, pp_rank=1),
+        (
+            "layers.0.input_layernorm.weight",
+            "layers.1.post_attention_layernorm.weight",
+            "layers.1.mlp.experts.w2.0",
+        ),
+    )
+
+    assert weight_map == {
+        "layers.2.input_layernorm.weight": ["layers.2.attn_norm.weight"],
+        "layers.3.post_attention_layernorm.weight": ["layers.3.ffn_norm.weight"],
+        "layers.3.mlp.experts.w2.0": ["layers.3.ffn.experts.0.w2.weight"],
+    }
 
 
 def test_fused_attention_loads_weight_scale_pairs_with_unequal_rows() -> None:

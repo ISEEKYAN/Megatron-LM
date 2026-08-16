@@ -41,6 +41,7 @@ from megatron.lite.primitive.parallel.thd import (
     thd_pack_meta,
     unpack_thd_to_nested,
 )
+from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 
 _CANONICAL_STAGES = frozenset(
@@ -51,6 +52,16 @@ _ALIASES = {
     "moe": ("router_moe", "deepep"),
 }
 _SELECTABLE_MODULES = _CANONICAL_STAGES | _ALIASES.keys()
+
+_RECOMPUTE_MODULE_MAP = {
+    "attn": lambda layer: layer.self_attn,
+    "core_attn": lambda layer: layer.self_attn,
+    "moe": lambda layer: layer.mlp,
+    "experts": lambda layer: layer.mlp.experts,
+    "router": lambda layer: layer.mlp.gate,
+    "attn_norm": lambda layer: layer.input_layernorm,
+    "ffn_norm": lambda layer: layer.post_attention_layernorm,
+}
 
 
 @dataclass(frozen=True)
@@ -174,21 +185,24 @@ def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> Non
     unsupported = {
         name: size
         for name, size in dimensions.items()
-        if name != "cp" and size > 1
+        if name not in ("cp", "pp") and size > 1
     }
     if unsupported:
         values = ", ".join(f"{name}={size}" for name, size in unsupported.items())
         raise NotImplementedError(
-            f"DeepSeek V4 vLLM keeps TP/ETP/PP/VPP at one; got {values}."
+            f"DeepSeek V4 vLLM keeps TP/ETP/VPP at one; got {values}."
         )
-    if parallel.ep != 2 or not impl_cfg.use_deepep:
+    if parallel.ep <= 0 or model_cfg.n_routed_experts % parallel.ep:
+        raise ValueError(
+            f"EP={parallel.ep} must divide {model_cfg.n_routed_experts} routed experts."
+        )
+    if not impl_cfg.use_deepep:
         raise NotImplementedError(
-            "DeepSeek V4 vLLM layer-0 requires EP=2 and use_deepep=True."
+            "DeepSeek V4 vLLM requires normal DeepEP training transport."
         )
     if impl_cfg.mtp_enable:
         raise NotImplementedError("DeepSeek V4 vLLM skeleton does not support MTP yet.")
     disabled_features = {
-        "recompute": impl_cfg.recompute,
         "offload": impl_cfg.offload,
         "use_thd": impl_cfg.use_thd,
         # The vLLM implementation always executes its explicit FlashMLA stage.
@@ -376,6 +390,13 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         selected_module_names=impl_cfg.selector.module_names,
         indexer_loss_coeff=impl_cfg.dsa_indexer_loss_coeff,
     )
+    recompute_spec = parse_recompute_spec(impl_cfg.recompute)
+    if recompute_spec:
+        apply_recompute(
+            list(model.layers.values()),
+            recompute_spec,
+            _RECOMPUTE_MODULE_MAP,
+        )
     # The runtime loads replicated HF tensors through NCCL before the deferred
     # FSDP2 wrap.  Keep that lifecycle identical to the Lite protocol: masters
     # must already live on the rank-local CUDA device during checkpoint load.
@@ -392,7 +413,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
         if not is_workspace_manager_initialized():
             init_workspace_manager(next(model.parameters()).device, num_ubatches=1)
-    selected_layers = impl_cfg.selector.global_layer_ids
+    selected_layers = model.selected_layer_ids
     attention_builders = None
     moe_metadata = None
 
@@ -402,21 +423,21 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             return attention_builders, moe_metadata
         device = next(model.parameters()).device
         attention_builders = {
-            0: DS4SparseAttentionMetadataBuilderAdapter.from_hf(
-                impl_cfg.hf_path,
-                model_cfg,
-                device=device,
-            ),
-            **{
-                layer_idx: DS4SparseIndexerCompressorMetadataAdapter.from_hf(
+            layer_idx: (
+                DS4SparseAttentionMetadataBuilderAdapter.from_hf(
+                    impl_cfg.hf_path,
+                    model_cfg,
+                    device=device,
+                )
+                if layer_idx == 0
+                else DS4SparseIndexerCompressorMetadataAdapter.from_hf(
                     impl_cfg.hf_path,
                     model_cfg,
                     layer_idx=layer_idx,
                     device=device,
                 )
-                for layer_idx in selected_layers
-                if layer_idx > 0
-            },
+            )
+            for layer_idx in selected_layers
         }
         moe_metadata = {
             layer_idx: DS4MoEKernelMetadataBuilderAdapter(
