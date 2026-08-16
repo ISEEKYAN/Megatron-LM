@@ -5,7 +5,10 @@ Route ordering follows THUDM/slime a74ae3a0; execution uses vLLM primitives.
 
 from __future__ import annotations
 
+import os
+
 import torch
+import torch.distributed as dist
 
 _BACKWARD_CHUNK_ROWS = 1024
 
@@ -687,16 +690,36 @@ def _validate_and_order_route_preserving_outputs(
         ),
         "Route-preserving DeepEP metadata changed expert identities",
     )
-    torch._assert_async(
-        torch.all(
-            expected_weights.contiguous().view(torch.int32).index_select(
-                0, primary_order
-            )
-            == route_weights.to(dtype=expected_weights.dtype)
-            .contiguous()
-            .view(torch.int32)
+    expected_weight_bits = expected_weights.contiguous().view(torch.int32).index_select(
+        0, primary_order
+    )
+    route_weight_bits = (
+        route_weights.to(dtype=expected_weights.dtype)
+        .contiguous()
+        .view(torch.int32)
+        .index_select(0, metadata_order)
+    )
+    weight_bits_equal = expected_weight_bits == route_weight_bits
+    if os.environ.get("MLITE_DEEPEP_ROUTE_DIAGNOSTICS") == "1" and not bool(
+        torch.all(weight_bits_equal).item()
+    ):
+        mismatch = torch.nonzero(~weight_bits_equal, as_tuple=False).reshape(-1)
+        first = mismatch[:8]
+        primary_values = expected_weights.index_select(0, primary_order).index_select(0, first)
+        metadata_values = (
+            route_weights.to(dtype=expected_weights.dtype)
             .index_select(0, metadata_order)
-        ),
+            .index_select(0, first)
+        )
+        raise RuntimeError(
+            "Route-preserving DeepEP metadata changed exact route probabilities: "
+            f"rank={dist.get_rank()} mismatches={mismatch.numel()}/{weight_bits_equal.numel()} "
+            f"first_positions={first.cpu().tolist()} "
+            f"primary={primary_values.cpu().tolist()} "
+            f"metadata={metadata_values.cpu().tolist()}"
+        )
+    torch._assert_async(
+        torch.all(weight_bits_equal),
         "Route-preserving DeepEP metadata changed exact route probabilities",
     )
     torch._assert_async(
@@ -724,4 +747,3 @@ def _validate_and_order_route_preserving_outputs(
     if not order_outputs:
         return expert_outputs
     return expert_outputs.index_select(0, route_rows)
-
