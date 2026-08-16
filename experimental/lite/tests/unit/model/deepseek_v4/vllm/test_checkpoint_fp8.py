@@ -211,12 +211,24 @@ def test_pipeline_export_reuses_common_streaming_collectives(monkeypatch) -> Non
     monkeypatch.setattr(hf_weights, "export_hf_weights", _fake_common)
     model = torch.nn.Module()
 
-    exported = list(checkpoint.export_hf_weights(model, config, ps))
+    exported = list(
+        checkpoint.export_hf_weights(
+            model,
+            config,
+            ps,
+            target="block_fp8",
+            resync_config={"expert_dtype": "fp8"},
+            export_dtype="bfloat16",
+        )
+    )
 
     assert exported[0][0] == "sentinel"
     assert seen[0][0] is model
     assert seen[0][2] is ps
     assert seen[0][3]["vocab_size"] == config.vocab_size
+    assert seen[0][3]["export_dtype"] == "bfloat16"
+    assert "target" not in seen[0][3]
+    assert "resync_config" not in seen[0][3]
 
 
 def test_export_materializes_fsdp2_dtensor_before_conversion() -> None:

@@ -532,6 +532,26 @@ def export_hf_weights(
     ps: ParallelState,
     **kwargs,
 ) -> Iterator[tuple[str, torch.Tensor]]:
+    target = kwargs.pop("target", None)
+    resync_config = kwargs.pop("resync_config", None)
+    if target not in {None, "block_fp8"}:
+        raise ValueError(
+            "DS4-vLLM online export only supports target='block_fp8', "
+            f"got {target!r}"
+        )
+    if resync_config:
+        options = dict(resync_config)
+        unsupported = sorted(set(options).difference({"expert_dtype"}))
+        if unsupported:
+            raise ValueError(
+                "unsupported DS4-vLLM resync_config keys: "
+                + ", ".join(unsupported)
+            )
+        if options.get("expert_dtype") not in {None, "fp8"}:
+            raise ValueError(
+                "DS4-vLLM block_fp8 export requires expert_dtype='fp8', "
+                f"got {options.get('expert_dtype')!r}"
+            )
     if (ps.tp_size, ps.etp_size) != (1, 1):
         raise NotImplementedError(
             "vLLM BF16-master/online-FP8 export requires TP/ETP=1."
