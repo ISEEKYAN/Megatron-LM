@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.primitive.parallel import ParallelState
@@ -160,6 +161,7 @@ class DeepseekV4WeightSpec:
         self.source_block_fp8 = source_block_fp8
         self.ps = ParallelState()
         self.source_block_scales: dict[str, torch.Tensor] = {}
+        self.export_source_block_scales: dict[str, torch.Tensor] = {}
 
     @property
     def num_experts(self) -> int:
@@ -381,8 +383,16 @@ class DeepseekV4WeightSpec:
         names = self._names(native_name)
         source_scales = getattr(tensor, "_fp8_source_scales", None)
         source_scale_version = getattr(tensor, "_fp8_source_scale_version", None)
+        source_scales_from_export_registry = False
+        if source_scales is None and native_name in self.export_source_block_scales:
+            source_scales = self.export_source_block_scales[native_name]
+            source_scales_from_export_registry = True
         source_scales_are_current = (
-            source_scales is not None and source_scale_version == tensor._version
+            source_scales is not None
+            and (
+                source_scales_from_export_registry
+                or source_scale_version == tensor._version
+            )
         )
         if len(names) == 2:
             if native_name.endswith("self_attn.fused_wqa_wkv"):
@@ -459,19 +469,93 @@ def invalidate_bound_source_scales(model: nn.Module) -> None:
     model._fp8_source_scales_by_name = {}
 
 
+def _pipeline_export_source_scales(
+    chunks: nn.Module | Iterable[nn.Module], ps: ParallelState
+) -> dict[str, torch.Tensor]:
+    """Replicate the small reversible-scale registry across PP stages.
+
+    The common HF exporter already streams full parameters over TP/EP/PP.  The
+    registry is model-specific metadata rather than state_dict data, so gather
+    only these CPU scale tensors and let the common exporter own weight traffic.
+    """
+
+    local: dict[str, torch.Tensor] = {}
+    for model in _models(chunks):
+        if not bool(getattr(model, "_fp8_source_scales_valid", False)):
+            continue
+        layer_map = (
+            {
+                local_idx: model.layer_indices[local_idx]
+                for local_idx in range(len(model.layer_indices))
+            }
+            if hasattr(model, "layer_indices")
+            else {}
+        )
+        for native_name, scale in getattr(
+            model, "_fp8_source_scales_by_name", {}
+        ).items():
+            global_name = to_global_layer_name(native_name, layer_map)
+            value = scale.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            previous = local.get(global_name)
+            if previous is not None and not torch.equal(previous, value):
+                raise RuntimeError(
+                    f"conflicting reversible FP8 scales for {global_name}"
+                )
+            local[global_name] = value
+
+    if ps.pp_size <= 1:
+        return local
+    if not dist.is_initialized() or ps.pp_group is None:
+        raise RuntimeError("PP resync requires an initialized pipeline group")
+    stage_registries: list[dict[str, torch.Tensor] | None] = [None] * ps.pp_size
+    dist.all_gather_object(stage_registries, local, group=ps.pp_group)
+    combined: dict[str, torch.Tensor] = {}
+    for registry in stage_registries:
+        if registry is None:
+            raise RuntimeError("PP source-scale gather returned an empty stage")
+        overlap = set(combined).intersection(registry)
+        conflicts = sorted(
+            name for name in overlap if not torch.equal(combined[name], registry[name])
+        )
+        if conflicts:
+            raise RuntimeError(
+                "conflicting reversible FP8 scales across PP stages: "
+                + ", ".join(conflicts)
+            )
+        combined.update(registry)
+    return combined
+
+
 def export_hf_weights(
     chunks: nn.Module | Iterable[nn.Module],
     model_cfg: DeepseekV4Config,
     ps: ParallelState,
     **kwargs,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    del kwargs
     if (ps.tp_size, ps.etp_size) != (1, 1):
         raise NotImplementedError(
             "vLLM BF16-master/online-FP8 export requires TP/ETP=1."
         )
     spec = DeepseekV4WeightSpec(model_cfg)
     spec.validate_load(ps)
+    if ps.pp_size > 1:
+        # Reuse the same bounded TP/EP/PP streaming exporter as mlite.lite.
+        # Only the checkpoint's reversible block scales are DS4-vLLM-specific;
+        # replicate that small registry so native_to_hf can preserve the
+        # original deployment bytes after each PP-stage tensor is broadcast.
+        from megatron.lite.primitive.ckpt.hf_weights import (
+            export_hf_weights as _export_common,
+        )
+
+        spec.export_source_block_scales = _pipeline_export_source_scales(chunks, ps)
+        yield from _export_common(
+            chunks,
+            spec,
+            ps,
+            vocab_size=model_cfg.vocab_size,
+            **kwargs,
+        )
+        return
     fp8_export_count = 0
     source_scale_count = 0
     current_source_scale_count = 0

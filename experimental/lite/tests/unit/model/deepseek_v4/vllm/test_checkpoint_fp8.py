@@ -165,6 +165,60 @@ def test_pipeline_stage_export_uses_global_layer_indices() -> None:
     assert "layers.0.attn.compressor.ape" not in exported
 
 
+def test_export_registry_preserves_scales_on_gathered_pipeline_tensor() -> None:
+    config = DeepseekV4Config(
+        hidden_size=128,
+        q_lora_rank=256,
+        head_dim=128,
+        num_attention_heads=2,
+    )
+    native = "layers.2.self_attn.fused_wqa_wkv"
+    source_scales = torch.tensor([[0.5], [1.0], [2.0]], dtype=torch.float32)
+    spec = DeepseekV4WeightSpec(config)
+    spec.export_source_block_scales[native] = source_scales
+
+    # A PP broadcast produces a fresh tensor without arbitrary Parameter attrs.
+    gathered = torch.ones(384, 128, dtype=torch.bfloat16)
+    exported = dict(spec.native_to_hf(native, gathered))
+
+    torch.testing.assert_close(
+        exported["layers.2.attn.wq_a.scale"], source_scales[:2], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        exported["layers.2.attn.wkv.scale"], source_scales[2:], rtol=0, atol=0
+    )
+
+
+def test_pipeline_export_reuses_common_streaming_collectives(monkeypatch) -> None:
+    config = DeepseekV4Config(hidden_size=128, n_routed_experts=4)
+    scales = {"layers.2.self_attn.wq_b": torch.ones(1, 1)}
+    ps = SimpleNamespace(tp_size=1, etp_size=1, ep_size=1, pp_size=2)
+    seen = []
+
+    monkeypatch.setattr(
+        checkpoint,
+        "_pipeline_export_source_scales",
+        lambda chunks, parallel_state: scales,
+    )
+
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    def _fake_common(chunks, spec, parallel_state, **kwargs):
+        seen.append((chunks, spec, parallel_state, kwargs))
+        assert spec.export_source_block_scales is scales
+        yield "sentinel", torch.ones(1)
+
+    monkeypatch.setattr(hf_weights, "export_hf_weights", _fake_common)
+    model = torch.nn.Module()
+
+    exported = list(checkpoint.export_hf_weights(model, config, ps))
+
+    assert exported[0][0] == "sentinel"
+    assert seen[0][0] is model
+    assert seen[0][2] is ps
+    assert seen[0][3]["vocab_size"] == config.vocab_size
+
+
 def test_export_materializes_fsdp2_dtensor_before_conversion() -> None:
     source = torch.tensor([0.6337993144989014], dtype=torch.bfloat16)
     calls = []
