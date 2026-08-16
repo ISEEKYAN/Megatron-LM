@@ -178,7 +178,7 @@ def test_export_registry_preserves_scales_on_gathered_pipeline_tensor() -> None:
     spec.export_source_block_scales[native] = source_scales
 
     # A PP broadcast produces a fresh tensor without arbitrary Parameter attrs.
-    gathered = torch.ones(384, 128, dtype=torch.bfloat16)
+    gathered = torch.ones(384, 128, dtype=torch.float32)
     exported = dict(spec.native_to_hf(native, gathered))
 
     torch.testing.assert_close(

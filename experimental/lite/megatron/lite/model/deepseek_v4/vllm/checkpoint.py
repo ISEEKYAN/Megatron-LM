@@ -394,6 +394,17 @@ class DeepseekV4WeightSpec:
                 or source_scale_version == tensor._version
             )
         )
+        if _is_block_fp8_weight(native_name) and tensor.dtype != torch.bfloat16:
+            if not tensor.is_floating_point():
+                raise TypeError(
+                    "block-FP8 export source must be floating point, "
+                    f"got {tensor.dtype} for {native_name}"
+                )
+            # The common TP/EP/PP exporter gathers the optimizer's FP32 master
+            # tensor and applies export_dtype after native_to_hf.  Deployment
+            # block-FP8 quantization is defined from the BF16 training-visible
+            # weight, so establish that boundary before requantization.
+            tensor = tensor.to(dtype=torch.bfloat16)
         if len(names) == 2:
             if native_name.endswith("self_attn.fused_wqa_wkv"):
                 row_sizes = [self.config.q_lora_rank, self.config.head_dim]
