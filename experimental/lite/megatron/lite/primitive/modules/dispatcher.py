@@ -44,7 +44,13 @@ def _validate_finite(stage: str, **tensors: torch.Tensor) -> None:
 
 
 def _debug_cuda_boundary(stage: str, tensor: torch.Tensor, *, call: int) -> None:
-    if os.environ.get("MLITE_CUDA_SYNC_BOUNDARIES") != "1":
+    sync_all = os.environ.get("MLITE_CUDA_SYNC_BOUNDARIES") == "1"
+    sync_stages = {
+        item.strip()
+        for item in os.environ.get("MLITE_CUDA_SYNC_BOUNDARY_STAGES", "").split(",")
+        if item.strip()
+    }
+    if not sync_all and stage not in sync_stages:
         return
     torch.cuda.synchronize(tensor.device)
     print(
