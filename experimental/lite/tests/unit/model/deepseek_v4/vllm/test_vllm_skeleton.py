@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
     _canonicalize_sparse_topk_indices,
@@ -26,12 +27,17 @@ from megatron.lite.model.deepseek_v4.vllm.model import (
     _RMSNormState,
 )
 from megatron.lite.model.deepseek_v4.vllm.moe import (
+    DeepseekV4MoE,
     MoEKernelMetadata,
     _kernel_topk_weights,
 )
 from megatron.lite.primitive.autograd import inference_only
+from megatron.lite.primitive.modules.router_replay import (
+    RouterReplay,
+    RouterReplayAction,
+)
 from megatron.lite.primitive.parallel import ParallelState
-from megatron.lite.runtime.contracts import ParallelConfig
+from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
 
 
 def test_sparse_prefill_topk_has_canonical_reduction_order() -> None:
@@ -171,6 +177,65 @@ def test_impl_config_normalizes_hydra_selector_mapping() -> None:
     assert config.selector.global_layer_ids == (0, 1)
     assert config.selector.selects(1, "kv_flashmla")
     assert config.selector.selects(1, "deepep")
+
+
+def test_r3_protocol_uses_contiguous_ds4_token_layout() -> None:
+    model = nn.Module()
+    model.ps = SimpleNamespace(
+        tp_size=1,
+        tp_rank=0,
+        cp_size=2,
+        cp_rank=1,
+        cp_group=None,
+    )
+    batch = PackedBatch(
+        input_ids=torch.arange(8),
+        labels=torch.arange(8),
+        seq_lens=torch.tensor([4, 4]),
+        r3_replay_mask=torch.tensor(
+            [True, False, True, False, False, True, False, True]
+        ),
+    )
+    routes = torch.arange(8).view(2, 4, 1, 1)
+
+    packed = protocol.pack_routed_experts(model, batch, routes)
+    mask = protocol.pack_r3_replay_mask(model, batch)
+
+    assert len(packed) == 1
+    assert torch.equal(packed[0], torch.arange(4, 8).view(4, 1))
+    assert torch.equal(mask, batch.r3_replay_mask[4:])
+
+
+@pytest.mark.parametrize("hash_layer", [True, False])
+def test_r3_replays_ids_and_recomputes_live_actor_weights(hash_layer: bool) -> None:
+    config = _tiny_config()
+    moe = DeepseekV4MoE(
+        config,
+        ParallelState(),
+        layer_idx=0 if hash_layer else 1,
+    )
+    replay = RouterReplay()
+    moe.gate.router_replay = replay
+    logits = torch.tensor(
+        [[-2.0, -0.5, 0.5, 2.0], [1.5, -1.0, 0.25, -0.25]],
+        dtype=torch.float32,
+    )
+    native_ids = torch.tensor([[0, 1], [2, 3]])
+    native_weights = torch.full((2, 2), -1.0)
+    target = torch.tensor([[3, 2], [0, 1]])
+    replay.target_topk_idx = target
+    replay.target_replay_mask = torch.tensor([True, False])
+    replay.router_replay_action = RouterReplayAction.REPLAY_FORWARD
+
+    weights, ids = moe._replay_route(logits, native_weights, native_ids)
+
+    expected_ids = torch.tensor([[3, 2], [2, 3]])
+    dense = torch.sqrt(torch.nn.functional.softplus(logits))
+    expected_weights = dense.gather(-1, expected_ids)
+    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+    expected_weights *= config.routed_scaling_factor
+    assert torch.equal(ids, expected_ids)
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

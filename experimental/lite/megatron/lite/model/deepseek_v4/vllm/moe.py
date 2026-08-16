@@ -23,6 +23,7 @@ from megatron.lite.primitive.kernels.vllm_ds4 import (
     HashRouteAdapter,
 )
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+from megatron.lite.primitive.modules.router_replay import RouterReplay
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.quantization.deployment_block_fp8 import (
     DeploymentBlockFP8Adapter,
@@ -45,6 +46,7 @@ class MoEKernelMetadata:
 class _RouterState(nn.Module):
     def __init__(self, config: DeepseekV4Config, *, hash_layer: bool):
         super().__init__()
+        self.router_replay: RouterReplay | None = None
         self.gate = nn.Linear(
             config.hidden_size,
             config.n_routed_experts,
@@ -206,6 +208,27 @@ class DeepseekV4MoE(nn.Module):
         self.hash_route_adapter = HashRouteAdapter()
         self.learned_route_adapter = DS4TopKAdapter()
 
+    def _replay_route(
+        self,
+        logits: torch.Tensor,
+        weights: torch.Tensor,
+        ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Replay IDs while retaining weights from this actor's live router."""
+
+        replay = self.gate.router_replay
+        if replay is None:
+            return weights, ids
+        selected = replay.select_indices(ids)
+        if selected is ids:
+            return weights, ids
+        dense = torch.sqrt(F.softplus(logits.float()))
+        weights = dense.gather(-1, selected.long())
+        if self.config.norm_topk_prob and selected.size(-1) > 1:
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        weights = weights * self.config.routed_scaling_factor
+        return weights.to(dtype=logits.dtype), selected
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -234,8 +257,8 @@ class DeepseekV4MoE(nn.Module):
         if self.is_hash_layer:
             token_ids = input_ids.reshape(-1).to(dtype=torch.int32)
             tid2eid = self.gate.tid2eid.to(dtype=torch.int32).contiguous()
-            topk_weights, topk_ids = fixed_route_vjp(
-                lambda value: self.hash_route_adapter(
+            def hash_route(value):
+                weights, ids = self.hash_route_adapter(
                     value,
                     token_ids,
                     tid2eid,
@@ -243,20 +266,29 @@ class DeepseekV4MoE(nn.Module):
                     renormalize=self.config.norm_topk_prob,
                     routed_scaling_factor=self.config.routed_scaling_factor,
                     indices_dtype=torch.int64,
-                ),
+                )
+                return self._replay_route(value, weights, ids)
+
+            topk_weights, topk_ids = fixed_route_vjp(
+                hash_route,
                 logits,
                 renormalize=self.config.norm_topk_prob,
                 route_scale=self.config.routed_scaling_factor,
             )
         else:
             correction_bias = self.gate.expert_bias.float().contiguous()
-            topk_weights, topk_ids = fixed_route_vjp(
-                lambda value: self.learned_route_adapter(
+
+            def learned_route(value):
+                weights, ids = self.learned_route_adapter(
                     value,
                     correction_bias,
                     indices_dtype=torch.int64,
                     routed_scaling_factor=self.config.routed_scaling_factor,
-                ),
+                )
+                return self._replay_route(value, weights, ids)
+
+            topk_weights, topk_ids = fixed_route_vjp(
+                learned_route,
                 logits,
                 renormalize=True,
                 route_scale=self.config.routed_scaling_factor,

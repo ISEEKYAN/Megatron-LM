@@ -25,7 +25,13 @@ from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
     ds4_vllm_forward_context,
     initialize_ds4_vllm_batch_invariance,
 )
-from megatron.lite.model.protocol_utils import add_loss_context_kwargs, nested_from_packed
+from megatron.lite.model.protocol_utils import (
+    add_loss_context_kwargs,
+    nested_from_packed,
+    pack_r3_replay_mask as _pack_r3_replay_mask,
+    pack_routed_experts as _pack_routed_experts,
+    router_replay_roots as router_replay_roots,
+)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
@@ -279,6 +285,18 @@ def _forward_step(
 def unpack_forward_output(model: nn.Module, batch, output) -> Any:
     del model
     return nested_from_packed(output, batch.seq_lens)
+
+
+def pack_routed_experts(model: nn.Module, batch, routed_experts):
+    """Pack rollout routes in the contiguous token order used by DS4 vLLM."""
+
+    return _pack_routed_experts(model, batch, routed_experts, contiguous=True)
+
+
+def pack_r3_replay_mask(model: nn.Module, batch) -> torch.Tensor:
+    """Pack the causal replay mask in the contiguous DS4 vLLM token order."""
+
+    return _pack_r3_replay_mask(model, batch, contiguous=True)
 
 
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:

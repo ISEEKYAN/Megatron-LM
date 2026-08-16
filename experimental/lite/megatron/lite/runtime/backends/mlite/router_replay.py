@@ -18,7 +18,14 @@ from megatron.lite.primitive.modules.router_replay import (
 from megatron.lite.primitive.parallel.thd import parallel_state_from_model
 
 R3_SUPPORTED_MODELS = frozenset(
-    {"qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2"}
+    {
+        "qwen3_moe",
+        "qwen3_5",
+        "deepseek_v4",
+        "deepseek_v4_vllm",
+        "glm5",
+        "kimi_k2",
+    }
 )
 
 
