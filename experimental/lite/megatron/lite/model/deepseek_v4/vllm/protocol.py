@@ -14,6 +14,7 @@ from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.vllm.checkpoint import (
     EXPERT_CLASSIFIER,
     export_hf_weights,
+    invalidate_bound_source_scales,
     load_hf_weights,
     save_hf_weights,
 )
@@ -299,6 +300,17 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     # must already live on the rank-local CUDA device during checkpoint load.
     if torch.cuda.is_available():
         model = model.cuda()
+        # The production vLLM GPUWorker creates this process-global manager
+        # before constructing its model runner.  The mLite runtime directly
+        # reuses vLLM sparse-indexer and attention kernels, so it must honor
+        # the same lifecycle even though it does not instantiate GPUWorker.
+        from vllm.v1.worker.workspace import (
+            init_workspace_manager,
+            is_workspace_manager_initialized,
+        )
+
+        if not is_workspace_manager_initialized():
+            init_workspace_manager(next(model.parameters()).device, num_ubatches=1)
     selected_layers = impl_cfg.selector.global_layer_ids
     attention_builders = None
     moe_metadata = None
@@ -463,6 +475,13 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         "optimizer_backend": optimizer_backend,
         "selector": impl_cfg.selector,
     }
+    if torch.cuda.is_available():
+        from vllm.v1.worker.workspace import reset_workspace_manager
+
+        extras["close_hook"] = reset_workspace_manager
+    extras["post_optimizer_step_hook"] = lambda: invalidate_bound_source_scales(
+        model
+    )
     if post_model_load_hook is not None:
         extras["post_model_load_hook"] = post_model_load_hook
 

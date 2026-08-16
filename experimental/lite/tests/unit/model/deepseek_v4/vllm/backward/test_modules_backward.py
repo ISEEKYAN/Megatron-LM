@@ -462,6 +462,56 @@ def test_attention_core_replays_slots_and_precache_rope_vjp() -> None:
     torch.testing.assert_close(kv.grad, rkv.grad)
 
 
+def test_attention_core_packed_batch_uses_workspace_coordinates() -> None:
+    """Paged-cache slots must never address the padded FlashMLA workspace."""
+    torch.manual_seed(20260815)
+    counts = (3, 2)
+    tokens, heads, dim, rope_dim = sum(counts), 2, 6, 4
+    workspace_width = max(counts)
+    q = torch.randn(tokens, heads, dim, requires_grad=True)
+    kv = torch.randn(tokens, dim, requires_grad=True)
+    workspace = torch.randn(len(counts) * workspace_width, 1, dim)
+    dworkspace = torch.randn_like(workspace)
+    positions = torch.tensor([0, 1, 2, 0, 1], dtype=torch.int64)
+    # The second request owns a distant physical cache page.  Using these as
+    # workspace rows reproduces the RL device-side gather assertion.
+    physical_slots = torch.tensor([0, 1, 2, 64, 65], dtype=torch.int64)
+    workspace_slots = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64)
+    query_start = torch.tensor([0, 3, 5], dtype=torch.int32)
+    cache = torch.randn(max(physical_slots).item() + 1, rope_dim)
+    q_visible = _rope_and_qnorm(
+        q.detach(), positions, cache, rope_dim, 1e-6, normalize=True
+    )
+
+    output = attention_core(
+        lambda *_: (q_visible, torch.zeros(tokens, heads), q_visible),
+        q,
+        kv,
+        workspace,
+        torch.zeros(tokens, 1, 1, dtype=torch.int32),
+        torch.ones(tokens, dtype=torch.int32),
+        torch.zeros(heads),
+        workspace_slots,
+        positions,
+        cache,
+        softmax_scale=0.5,
+        eps=1e-6,
+        rope_dim=rope_dim,
+        backward_op=lambda *_: (torch.zeros_like(q_visible), dworkspace),
+        query_start_loc=query_start,
+    )
+    output.sum().backward()
+
+    reference = kv.detach().requires_grad_(True)
+    functional = _rope_and_qnorm(
+        reference, positions, cache, rope_dim, 1e-6, normalize=False
+    )
+    functional.backward(
+        dworkspace.reshape(-1, dim).index_select(0, workspace_slots)
+    )
+    torch.testing.assert_close(kv.grad, reference.grad)
+
+
 def test_attention_core_saves_metadata_finalized_inside_visible_call() -> None:
     tokens, heads, dim = 3, 2, 6
     q = torch.randn(tokens, heads, dim, requires_grad=True)

@@ -23,6 +23,7 @@ from megatron.lite.model.deepseek_v4.vllm.model import (
     AttentionKernelMetadata,
     DeepseekV4Model,
     _AttentionState,
+    _RMSNormState,
 )
 from megatron.lite.model.deepseek_v4.vllm.moe import (
     MoEKernelMetadata,
@@ -37,7 +38,6 @@ def test_sparse_prefill_topk_has_canonical_reduction_order() -> None:
     unordered = torch.tensor(
         [[5, -1, 2, 9], [3, 7, -1, 1]], dtype=torch.int32
     )
-
     actual = _canonicalize_sparse_topk_indices(unordered)
 
     torch.testing.assert_close(
@@ -46,6 +46,25 @@ def test_sparse_prefill_topk_has_canonical_reduction_order() -> None:
         rtol=0,
         atol=0,
     )
+
+
+def test_final_rmsnorm_uses_vllm_batch_invariant_kernel(monkeypatch) -> None:
+    from vllm.model_executor.layers import batch_invariant
+
+    norm = _RMSNormState(8)
+    value = torch.randn(3, 8, dtype=torch.bfloat16)
+    sentinel = torch.full_like(value, 7)
+    calls = []
+
+    def fake_rms_norm(input_value, weight, eps):
+        calls.append((input_value, weight, eps))
+        return sentinel
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(batch_invariant, "rms_norm_batch_invariant", fake_rms_norm)
+
+    assert norm(value, 1e-6) is sentinel
+    assert calls == [(value, norm.weight, 1e-6)]
 
 
 def test_attention_restores_fp32_rope_after_fsdp_input_cast() -> None:
@@ -922,6 +941,12 @@ def test_protocol_does_not_install_training_features() -> None:
     source = inspect.getsource(protocol.build_model)
     for forbidden in ("apply_qat", "apply_recompute", "apply_offload", "register_training_hooks"):
         assert forbidden not in source
+
+
+def test_protocol_owns_vllm_workspace_lifecycle() -> None:
+    source = inspect.getsource(protocol.build_model)
+    assert "init_workspace_manager" in source
+    assert 'extras["close_hook"] = reset_workspace_manager' in source
 
 
 @pytest.mark.gpus(1)

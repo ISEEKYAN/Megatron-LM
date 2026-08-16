@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -325,12 +326,23 @@ class DeepseekV4WeightSpec:
                 "cannot bind reversible FP8 scales to parameters: "
                 + ", ".join(missing)
             )
+        registry: dict[str, torch.Tensor] = {}
         for native_name, scales in self.source_block_scales.items():
             parameter = parameters[native_name]
             parameter._fp8_source_scales = scales.to(
                 device=parameter.device, dtype=torch.float32
             ).contiguous()
             parameter._fp8_source_scale_version = parameter._version
+            # FSDP2 CPU offload/reload may replace its DTensor Parameter and
+            # thereby drop arbitrary Parameter attributes.  Keep one small
+            # CPU-side source-scale registry on the model as the durable
+            # initial-sync contract.  Routed MXFP4 experts do not enter this
+            # map, so its footprint is limited to checkpoint block-FP8 state.
+            registry[native_name] = scales.detach().to(
+                device="cpu", dtype=torch.float32
+            ).contiguous()
+        base_model._fp8_source_scales_by_name = registry
+        base_model._fp8_source_scales_valid = True
 
     @staticmethod
     def replica_group_for_load(native_name: str, ps: ParallelState):
@@ -354,19 +366,38 @@ class DeepseekV4WeightSpec:
         self, native_name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:
         names = self._names(native_name)
+        source_scales = getattr(tensor, "_fp8_source_scales", None)
+        source_scale_version = getattr(tensor, "_fp8_source_scale_version", None)
+        source_scales_are_current = (
+            source_scales is not None and source_scale_version == tensor._version
+        )
         if len(names) == 2:
             if native_name.endswith("self_attn.fused_wqa_wkv"):
-                tensors = tensor.split(
-                    [self.config.q_lora_rank, self.config.head_dim], dim=0
-                )
+                row_sizes = [self.config.q_lora_rank, self.config.head_dim]
+                tensors = tensor.split(row_sizes, dim=0)
             else:
+                row_sizes = [tensor.shape[0] // 2] * 2
                 tensors = tensor.chunk(2, dim=0)
         else:
+            row_sizes = [tensor.shape[0]] if names else []
             tensors = (tensor,) if names else ()
         if _is_block_fp8_weight(native_name):
+            scale_tensors = (
+                source_scales.split(
+                    [rows // BLOCK_SHAPE[0] for rows in row_sizes], dim=0
+                )
+                if source_scales_are_current
+                else (None,) * len(tensors)
+            )
             outputs: list[tuple[str, torch.Tensor]] = []
-            for name, source in zip(names, tensors, strict=True):
-                canonical = quantize_block_fp8_weight(source)
+            for name, source, scale in zip(
+                names, tensors, scale_tensors, strict=True
+            ):
+                canonical = (
+                    requantize_block_fp8_weight(source, scale)
+                    if scale is not None
+                    else quantize_block_fp8_weight(source)
+                )
                 outputs.extend(
                     (
                         (name, canonical.qweight),
@@ -408,6 +439,13 @@ def _models(chunks: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:
     return [chunks] if isinstance(chunks, nn.Module) else list(chunks)
 
 
+def invalidate_bound_source_scales(model: nn.Module) -> None:
+    """Invalidate checkpoint scales after the first successful optimizer step."""
+
+    model._fp8_source_scales_valid = False
+    model._fp8_source_scales_by_name = {}
+
+
 def export_hf_weights(
     chunks: nn.Module | Iterable[nn.Module],
     model_cfg: DeepseekV4Config,
@@ -421,14 +459,58 @@ def export_hf_weights(
         )
     spec = DeepseekV4WeightSpec(model_cfg)
     spec.validate_load(ps)
+    fp8_export_count = 0
+    source_scale_count = 0
+    current_source_scale_count = 0
     for model in _models(chunks):
-        for native_name, tensor in model.state_dict().items():
+        model_scale_registry = getattr(model, "_fp8_source_scales_by_name", {})
+        model_scale_registry_valid = bool(
+            getattr(model, "_fp8_source_scales_valid", False)
+        )
+        # FSDP2's state-dict hook may synthesize DTensor values even with
+        # ``keep_vars=True``.  Custom Parameter metadata is restored on the
+        # actual named parameters by the FSDP wrapper, not copied to those
+        # synthesized state values.  Preserve state_dict ordering/buffers but
+        # prefer the live Parameter whenever the key names one.
+        parameters = dict(model.named_parameters())
+        for native_name, state_tensor in model.state_dict(keep_vars=True).items():
+            tensor = parameters.get(native_name, state_tensor)
+            if _is_block_fp8_weight(native_name):
+                fp8_export_count += 1
+            source_scales = getattr(tensor, "_fp8_source_scales", None)
+            source_scale_version = getattr(
+                tensor, "_fp8_source_scale_version", None
+            )
+            source_scales_from_registry = False
+            if (
+                source_scales is None
+                and model_scale_registry_valid
+                and native_name in model_scale_registry
+            ):
+                source_scales = model_scale_registry[native_name]
+                source_scales_from_registry = True
+            if source_scales is not None:
+                source_scale_count += 1
+            source_scales_are_current = (
+                source_scales is not None
+                and (
+                    source_scales_from_registry
+                    or source_scale_version == getattr(tensor, "_version", None)
+                )
+            )
+            if source_scales_are_current:
+                current_source_scale_count += 1
             full_tensor = getattr(tensor, "full_tensor", None)
             if callable(full_tensor):
                 # FSDP2 state_dict values are DTensors. Export is an online
                 # inference boundary and must materialize each BF16 master
                 # parameter before dtype conversion and bucket packing.
                 tensor = full_tensor()
+            if source_scales_are_current:
+                tensor._fp8_source_scales = source_scales.to(
+                    device=tensor.device, dtype=torch.float32
+                ).contiguous()
+                tensor._fp8_source_scale_version = tensor._version
             if not tensor.is_floating_point():
                 output = tensor.detach()
             else:
@@ -439,7 +521,37 @@ def export_hf_weights(
                         else torch.bfloat16
                     )
                 )
+            # ``detach`` and ``to`` return a fresh Tensor and therefore drop
+            # the reversible checkpoint-scale metadata carried by the BF16
+            # master Parameter/DTensor.  Reattach it at the final tensor
+            # boundary consumed by ``native_to_hf``; otherwise initial RL
+            # synchronization silently recomputes scales and changes the FP8
+            # bytes loaded by rollout before the first optimizer step.
+            if source_scales_are_current:
+                output._fp8_source_scales = source_scales.to(
+                    device=output.device, dtype=torch.float32
+                ).contiguous()
+                output._fp8_source_scale_version = output._version
             yield from spec.native_to_hf(native_name, output)
+    if os.getenv("MLITE_WEIGHT_SYNC_FINGERPRINT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        print(
+            "MLITE_FP8_EXPORT_SCALE_COVERAGE "
+            + json.dumps(
+                {
+                    "rank": int(getattr(ps, "rank", 0)),
+                    "fp8_parameter_count": fp8_export_count,
+                    "source_scale_count": source_scale_count,
+                    "current_source_scale_count": current_source_scale_count,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
 
 def load_hf_weights(
@@ -496,6 +608,7 @@ __all__ = [
     "DeepseekV4WeightSpec",
     "PLACEMENT_FN",
     "export_hf_weights",
+    "invalidate_bound_source_scales",
     "load_hf_weights",
     "save_hf_weights",
 ]

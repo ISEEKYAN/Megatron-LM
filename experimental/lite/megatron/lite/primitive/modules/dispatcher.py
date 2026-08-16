@@ -29,6 +29,20 @@ except ImportError:
     EventOverlap = None  # type: ignore
 
 
+def _validate_finite(stage: str, **tensors: torch.Tensor) -> None:
+    if os.environ.get("MLITE_VALIDATE_FINITE") != "1":
+        return
+    for name, tensor in tensors.items():
+        if tensor.is_floating_point():
+            finite = torch.isfinite(tensor)
+            if not bool(finite.all()):
+                raise FloatingPointError(
+                    f"MLITE_NONFINITE stage={stage} tensor={name} "
+                    f"dtype={tensor.dtype} shape={tuple(tensor.shape)} "
+                    f"nonfinite={int((~finite).sum().item())}"
+                )
+
+
 def _hidden_bytes(hidden_size: int) -> int:
     return hidden_size * 2
 
@@ -305,6 +319,14 @@ class TokenDispatcher:
         topk_scores = topk_scores.float().contiguous()
 
         if self.ep_size > 1:
+            # Upstream DS4 attention deliberately uses auxiliary CUDA streams.
+            # Its event joins order work on PyTorch's current stream, whereas
+            # DeepEP crosses into a separately managed communication stream
+            # and a host-side rank rendezvous.  Complete that current-stream
+            # dependency before entering the external collective; otherwise a
+            # fast rank can enter DeepEP while a peer still owns outstanding
+            # auxiliary work, leading to an eventual CPU receive timeout.
+            torch.cuda.current_stream(hidden_states.device).synchronize()
             (
                 received_hidden,
                 received_indices,
@@ -419,8 +441,16 @@ class TokenDispatcher:
     def _combine_low_latency_aligned(
         self, expert_output: torch.Tensor
     ) -> torch.Tensor:
+        _validate_finite(
+            "deepep.aligned_combine.input",
+            expert_output=expert_output,
+        )
         route_outputs = expert_output.index_select(
             0, self._aligned_metadata_route_rows
+        )
+        _validate_finite(
+            "deepep.aligned_combine.route_outputs",
+            route_outputs=route_outputs,
         )
         if self.ep_size > 1:
             source_routes = _DeepEPCombine.apply(
@@ -432,6 +462,10 @@ class TokenDispatcher:
             )
         else:
             source_routes = route_outputs
+        _validate_finite(
+            "deepep.aligned_combine.source_routes",
+            source_routes=source_routes,
+        )
         output = _VLLMEPGatherWithBF16Backward.apply(
             source_routes,
             self._aligned_source_indices,
@@ -439,6 +473,10 @@ class TokenDispatcher:
             self._aligned_source_output_index,
             True,
             self._aligned_source_all_routes_valid,
+        )
+        _validate_finite(
+            "deepep.aligned_combine.output",
+            output=output,
         )
         for name in (
             "_aligned_received_output_index",
@@ -700,10 +738,6 @@ class TokenDispatcher:
     ):
         if isinstance(recv_per_expert, torch.Tensor):
             recv_per_expert = [int(x) for x in recv_per_expert.detach().cpu().tolist()]
-        local_tpe = torch.tensor(
-            recv_per_expert[: self.num_local_experts], dtype=torch.int64, device=recv_hidden.device
-        )
-        self._local_tpe_list = [int(x) for x in recv_per_expert[: self.num_local_experts]]
         rows = recv_hidden.size(0)
         recv_indices = recv_indices.to(torch.long)
         routing_map = torch.zeros(
@@ -717,8 +751,20 @@ class TokenDispatcher:
         row_ids = row_ids.expand_as(recv_indices)[valid]
         expert_ids = recv_indices[valid]
         routing_map[row_ids, expert_ids] = True
-        probs_2d[row_ids, expert_ids] = recv_probs[valid]
-        num_out = sum(int(x) for x in recv_per_expert)
+        # DS4 hash routing can map multiple top-k slots of one token to the
+        # same expert. The boolean routing map intentionally deduplicates those
+        # routes, so their weights must be accumulated and expert counts must
+        # be derived from that same deduplicated map. Using DeepEP's raw slot
+        # counts here over-allocates permute rows and feeds uninitialized
+        # expert outputs into combine.
+        probs_2d.index_put_(
+            (row_ids, expert_ids),
+            recv_probs[valid],
+            accumulate=True,
+        )
+        local_tpe = routing_map.sum(dim=0).to(torch.int64)
+        self._local_tpe_list = [int(x) for x in local_tpe.detach().cpu().tolist()]
+        num_out = int(local_tpe.sum().item())
         dispatched, permuted_probs, sorted_indices = permute(
             recv_hidden,
             routing_map,
@@ -779,18 +825,21 @@ class TokenDispatcher:
             self._deepep_event = None
 
     def _combine_deepep(self, expert_output):
+        _validate_finite("deepep.combine.input", expert_output=expert_output)
         rank_grouped = unpermute(
             expert_output,
             self._row_id_map,
             restore_shape=self._restore_shape,
             fused=self.moe_permute_fusion,
         )
+        _validate_finite("deepep.combine.unpermute", rank_grouped=rank_grouped)
         if torch.is_grad_enabled():
             combined = _DeepEPCombine.apply(self.buffer, rank_grouped, self._handle, False, False)
         else:
             combined = self.buffer.combine(rank_grouped, self._handle)
         if isinstance(combined, tuple):
             combined = combined[0]
+        _validate_finite("deepep.combine.output", combined=combined)
         self._row_id_map = None
         self._restore_shape = None
         self._handle = None

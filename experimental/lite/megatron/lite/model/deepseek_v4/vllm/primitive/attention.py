@@ -197,6 +197,31 @@ def _compressed_sequence_graph(
     )
 
 
+def _compressed_sequence_graph_packed(
+    kv_score,
+    ape,
+    norm_weight,
+    positions,
+    cache,
+    query_start_loc,
+    **kwargs,
+):
+    """Replay compression independently for every packed request."""
+    starts = query_start_loc.detach().cpu().tolist()
+    parts = [
+        _compressed_sequence_graph(
+            kv_score[start:end],
+            ape,
+            norm_weight,
+            positions[start:end],
+            cache,
+            **kwargs,
+        )
+        for start, end in zip(starts[:-1], starts[1:], strict=True)
+    ]
+    return torch.cat(parts) if parts else kv_score.new_empty((0, kwargs["head_dim"]))
+
+
 def attach_indexer_aux_loss(
     output,
     q,
@@ -330,6 +355,8 @@ class _VLLMAttentionCoreFunction(torch.autograd.Function):
         compressor_ape,
         compressor_norm,
         compressor_ratio,
+        compressor_workspace_slots,
+        query_start_loc,
     ):
         visible = visible_op(q, kv)
         if not isinstance(visible, (tuple, list)) or len(visible) < 2:
@@ -360,6 +387,8 @@ class _VLLMAttentionCoreFunction(torch.autograd.Function):
             compressor_kv_score,
             compressor_ape,
             compressor_norm,
+            compressor_workspace_slots,
+            query_start_loc,
         )
         ctx.backward_op = backward_op or _default_sparse_backward
         ctx.scale, ctx.eps, ctx.rope_dim = scale, eps, rope_dim
@@ -384,6 +413,8 @@ class _VLLMAttentionCoreFunction(torch.autograd.Function):
             compressor_kv_score,
             compressor_ape,
             compressor_norm,
+            compressor_workspace_slots,
+            query_start_loc,
         ) = ctx.saved_tensors
         dq_visible, dworkspace = ctx.backward_op(
             q_visible,
@@ -423,12 +454,8 @@ class _VLLMAttentionCoreFunction(torch.autograd.Function):
             )
         flat_dkv = dworkspace.reshape(-1, dworkspace.shape[-1])
         valid = slots >= 0
-        compressed_len = (
-            compressor_kv_score.shape[0] // ctx.compressor_ratio
-            if ctx.compressor_ratio > 1
-            else 0
-        )
-        safe_slots = slots.clamp_min(0).long() + compressed_len
+        compressed_len = compressor_workspace_slots.numel()
+        safe_slots = slots.clamp_min(0).long()
         dkv_visible = flat_dkv.index_select(0, safe_slots)
         dkv_visible = dkv_visible * valid.unsqueeze(-1)
         with torch.enable_grad():
@@ -466,10 +493,11 @@ class _VLLMAttentionCoreFunction(torch.autograd.Function):
                         compressor_norm,
                     )
                 )
-                compressed = _compressed_sequence_graph(
+                compressed = _compressed_sequence_graph_packed(
                     *replay_inputs,
                     positions,
                     cache,
+                    query_start_loc,
                     ratio=ctx.compressor_ratio,
                     head_dim=dworkspace.shape[-1],
                     rope_dim=ctx.rope_dim,
@@ -478,13 +506,15 @@ class _VLLMAttentionCoreFunction(torch.autograd.Function):
                 dcompressor, dape, dcompressor_norm = torch.autograd.grad(
                     compressed,
                     replay_inputs,
-                    dworkspace.reshape(-1, dworkspace.shape[-1])[:compressed_len],
+                    dworkspace.reshape(-1, dworkspace.shape[-1]).index_select(
+                        0, compressor_workspace_slots.long()
+                    ),
                 )
         return (
             (None,) * 5
             + (dq, dkv)
             + (None,) * 7
-            + (dcompressor, dape, dcompressor_norm, None)
+            + (dcompressor, dape, dcompressor_norm, None, None, None)
         )
 
 
@@ -508,11 +538,31 @@ def attention_core(
     compressor_ape=None,
     compressor_norm=None,
     compressor_ratio: int = 1,
+    compressor_workspace_slots=None,
+    query_start_loc=None,
 ):
     if compressor_kv_score is None:
         compressor_kv_score = q.new_empty((0, workspace.shape[-1]))
         compressor_ape = q.new_empty((0, workspace.shape[-1]))
         compressor_norm = q.new_empty((workspace.shape[-1],))
+    if compressor_workspace_slots is None:
+        compressed_len = (
+            compressor_kv_score.shape[0] // compressor_ratio
+            if compressor_ratio > 1
+            else 0
+        )
+        # Backward compatibility for direct single-request callers: their
+        # ``slots`` are SWA-local and the compressed prefix precedes them.
+        # Production metadata always supplies absolute workspace coordinates.
+        if compressed_len:
+            slots = slots + compressed_len
+        compressor_workspace_slots = torch.arange(
+            compressed_len, dtype=torch.int64, device=q.device
+        )
+    if query_start_loc is None:
+        query_start_loc = torch.tensor(
+            [0, q.shape[0]], dtype=torch.int32, device=q.device
+        )
     return _VLLMAttentionCoreFunction.apply(
         visible_op,
         backward_op,
@@ -532,6 +582,8 @@ def attention_core(
         compressor_ape,
         compressor_norm,
         compressor_ratio,
+        compressor_workspace_slots,
+        query_start_loc,
     )
 
 

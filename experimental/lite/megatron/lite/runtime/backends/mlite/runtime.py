@@ -327,6 +327,9 @@ class MegatronLiteRuntime(RuntimeBase):
                 value.destroy()
         for module, attr in owners:
             setattr(module, attr, None)
+        close_hook = handle._extras.pop("close_hook", None)
+        if callable(close_hook):
+            close_hook()
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
@@ -640,6 +643,10 @@ class MegatronLiteRuntime(RuntimeBase):
         # intentionally uses native AdamW over its BF16 masters.
         if isinstance(result, tuple) and len(result) == 3:
             update_successful, grad_norm, num_zeros = result
+            if update_successful:
+                hook = handle._extras.get("post_optimizer_step_hook")
+                if callable(hook):
+                    hook()
             return update_successful, float(grad_norm), num_zeros
         # Only native optimizers need a fallback norm.  FSDP2 parameters can
         # span distinct dense/expert DeviceMeshes, so touching their DTensor
@@ -653,6 +660,9 @@ class MegatronLiteRuntime(RuntimeBase):
         if gradients:
             norms = torch._foreach_norm(gradients, 2)
             fallback_norm = float(torch.linalg.vector_norm(torch.stack(norms)))
+        hook = handle._extras.get("post_optimizer_step_hook")
+        if callable(hook):
+            hook()
         return True, fallback_norm, None
 
     def lr_scheduler_step(self, handle: ModelHandle) -> float | list[float]:

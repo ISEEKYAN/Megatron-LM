@@ -60,3 +60,40 @@ def test_ll_alignment_preserves_duplicate_slots_and_fp32_gather(monkeypatch) -> 
         )
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_normal_deepep_finish_deduplicates_hash_routes() -> None:
+    dispatcher = TokenDispatcher.__new__(TokenDispatcher)
+    dispatcher.num_local_experts = 2
+    dispatcher.moe_permute_fusion = False
+    dispatcher._local_tpe_list = None
+    dispatcher._row_id_map = None
+    dispatcher._restore_shape = None
+
+    hidden = torch.stack(
+        (
+            torch.ones(16, dtype=torch.bfloat16),
+            torch.full((16,), 2, dtype=torch.bfloat16),
+        )
+    )
+    indices = torch.tensor([[0, 0], [1, 0]], dtype=torch.int64)
+    weights = torch.tensor([[0.25, 0.75], [0.4, 0.6]], dtype=torch.float32)
+
+    dispatched, tokens_per_expert, routed_weights = (
+        dispatcher._finish_deepep_dispatch(
+            hidden,
+            indices,
+            weights,
+            # DeepEP counts top-k slots before duplicate expert IDs are folded.
+            [3, 1],
+        )
+    )
+
+    assert tokens_per_expert.tolist() == [2, 1]
+    assert dispatched.shape == (3, 16)
+    torch.testing.assert_close(
+        routed_weights,
+        torch.tensor([1.0, 0.6, 0.4], dtype=torch.float32),
+        rtol=0,
+        atol=0,
+    )

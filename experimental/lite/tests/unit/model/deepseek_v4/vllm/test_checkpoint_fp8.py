@@ -255,6 +255,158 @@ def test_fp8_loads_are_replica_local_to_preserve_source_scales() -> None:
     )
 
 
+def test_fused_fp8_export_preserves_bound_source_scales() -> None:
+    config = DeepseekV4Config(
+        hidden_size=128,
+        q_lora_rank=256,
+        head_dim=128,
+        num_attention_heads=2,
+    )
+    spec = DeepseekV4WeightSpec(config)
+    master = torch.nn.Parameter(torch.ones(384, 128, dtype=torch.bfloat16))
+    master._fp8_source_scales = torch.tensor(
+        [[0.5], [1.0], [2.0]], dtype=torch.float32
+    )
+    master._fp8_source_scale_version = master._version
+
+    exported = dict(spec.native_to_hf("layers.0.self_attn.fused_wqa_wkv", master))
+
+    torch.testing.assert_close(
+        exported["layers.0.attn.wq_a.scale"],
+        master._fp8_source_scales[:2],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        exported["layers.0.attn.wkv.scale"],
+        master._fp8_source_scales[2:],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_full_export_preserves_bound_source_scales_across_detach() -> None:
+    config = DeepseekV4Config(
+        hidden_size=128,
+        q_lora_rank=256,
+        head_dim=128,
+        num_attention_heads=2,
+    )
+    master = torch.nn.Parameter(torch.ones(384, 128, dtype=torch.bfloat16))
+    master._fp8_source_scales = torch.tensor(
+        [[0.5], [1.0], [2.0]], dtype=torch.float32
+    )
+    master._fp8_source_scale_version = master._version
+
+    class _Model(torch.nn.Module):
+        def state_dict(self, *args, **kwargs):
+            assert kwargs.get("keep_vars") is True
+            return {"layers.0.self_attn.fused_wqa_wkv": master}
+
+    exported = dict(checkpoint.export_hf_weights(_Model(), config, ParallelState()))
+
+    torch.testing.assert_close(
+        exported["layers.0.attn.wq_a.scale"],
+        master._fp8_source_scales[:2],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        exported["layers.0.attn.wkv.scale"],
+        master._fp8_source_scales[2:],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_full_export_prefers_metadata_on_live_parameter_over_state_value() -> None:
+    config = DeepseekV4Config(
+        hidden_size=128,
+        q_lora_rank=256,
+        head_dim=128,
+        num_attention_heads=2,
+    )
+    master = torch.nn.Parameter(torch.ones(384, 128, dtype=torch.bfloat16))
+    master._fp8_source_scales = torch.tensor(
+        [[0.5], [1.0], [2.0]], dtype=torch.float32
+    )
+    master._fp8_source_scale_version = master._version
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_parameter("master", master)
+
+        def named_parameters(self, *args, **kwargs):
+            del args, kwargs
+            yield "layers.0.self_attn.fused_wqa_wkv", self.master
+
+        def state_dict(self, *args, **kwargs):
+            assert kwargs.get("keep_vars") is True
+            # Mirrors an FSDP state-dict hook returning a fresh value without
+            # arbitrary attributes attached to the live Parameter.
+            return {
+                "layers.0.self_attn.fused_wqa_wkv": self.master.detach().clone()
+            }
+
+    exported = dict(checkpoint.export_hf_weights(_Model(), config, ParallelState()))
+
+    torch.testing.assert_close(
+        exported["layers.0.attn.wq_a.scale"],
+        master._fp8_source_scales[:2],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        exported["layers.0.attn.wkv.scale"],
+        master._fp8_source_scales[2:],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_model_scale_registry_survives_parameter_metadata_loss_then_invalidates() -> None:
+    config = DeepseekV4Config(
+        hidden_size=128,
+        q_lora_rank=256,
+        head_dim=128,
+        num_attention_heads=2,
+    )
+    native = "layers.0.self_attn.fused_wqa_wkv"
+    source_scales = torch.tensor([[0.5], [1.0], [2.0]], dtype=torch.float32)
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.master = torch.nn.Parameter(
+                torch.ones(384, 128, dtype=torch.bfloat16)
+            )
+
+        def named_parameters(self, *args, **kwargs):
+            del args, kwargs
+            yield native, self.master
+
+        def state_dict(self, *args, **kwargs):
+            assert kwargs.get("keep_vars") is True
+            return {native: self.master}
+
+    model = _Model()
+    model._fp8_source_scales_by_name = {native: source_scales}
+    model._fp8_source_scales_valid = True
+
+    exported = dict(checkpoint.export_hf_weights(model, config, ParallelState()))
+    torch.testing.assert_close(
+        exported["layers.0.attn.wq_a.scale"], source_scales[:2], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        exported["layers.0.attn.wkv.scale"], source_scales[2:], rtol=0, atol=0
+    )
+
+    checkpoint.invalidate_bound_source_scales(model)
+    assert model._fp8_source_scales_valid is False
+    assert model._fp8_source_scales_by_name == {}
+
+
 def test_router_checkpoint_names_follow_hash_prefix_semantics() -> None:
     config = DeepseekV4Config(
         num_hidden_layers=4,

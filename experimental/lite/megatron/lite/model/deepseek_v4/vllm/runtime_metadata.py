@@ -389,6 +389,8 @@ class DS4SparseAttentionMetadataBuilderAdapter:
             topk_length=topk_length,
             output=output,
             kv_workspace=workspace_3d.view(-1, 1, self.config.head_dim),
+            kv_workspace_slot_mapping=positions.clone(),
+            query_start_loc=layout.query_start_loc,
             padded_heads=self.config.num_attention_heads,
             prepare_flash=prepare_flash,
         )
@@ -502,6 +504,14 @@ class DS4SparseAttentionMetadataBuilderAdapter:
             topk_length=torch.cat(topk_lengths).contiguous(),
             output=output,
             kv_workspace=workspace_3d.view(-1, 1, self.config.head_dim),
+            kv_workspace_slot_mapping=torch.cat(
+                [
+                    batch_index * max_tokens
+                    + torch.arange(count, dtype=torch.int64, device=self.device)
+                    for batch_index, count in enumerate(token_counts)
+                ]
+            ).contiguous(),
+            query_start_loc=layout.query_start_loc,
             padded_heads=self.config.num_attention_heads,
             prepare_flash=prepare_flash,
         )
@@ -1175,6 +1185,14 @@ class DS4SparseIndexerCompressorMetadataAdapter:
             topk_length=combined_lens,
             output=base.output,
             kv_workspace=workspace.view(-1, 1, self.config.head_dim),
+            kv_workspace_slot_mapping=(
+                compressed_len
+                + torch.arange(num_tokens, dtype=torch.int64, device=self.device)
+            ),
+            compressor_workspace_slot_mapping=torch.arange(
+                compressed_len, dtype=torch.int64, device=self.device
+            ),
+            query_start_loc=base.runtime_layout.query_start_loc,
             padded_heads=self.config.num_attention_heads,
             compressor_operation=self.compressor_operation,
             compressor_metadata=main,
@@ -1346,6 +1364,26 @@ class DS4SparseIndexerCompressorMetadataAdapter:
             topk_length=combined_lens,
             output=base.output,
             kv_workspace=workspace.view(-1, 1, self.config.head_dim),
+            kv_workspace_slot_mapping=torch.cat(
+                [
+                    batch_index * workspace_width
+                    + max_compressed
+                    + torch.arange(count, dtype=torch.int64, device=self.device)
+                    for batch_index, count in enumerate(token_counts)
+                ]
+            ).contiguous(),
+            compressor_workspace_slot_mapping=torch.cat(
+                [
+                    batch_index * workspace_width
+                    + torch.arange(
+                        count // self.compress_ratio,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    for batch_index, count in enumerate(token_counts)
+                ]
+            ).contiguous(),
+            query_start_loc=base.runtime_layout.query_start_loc,
             padded_heads=self.config.num_attention_heads,
             compressor_operation=self.compressor_operation,
             compressor_metadata=main,

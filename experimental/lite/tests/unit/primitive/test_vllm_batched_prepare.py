@@ -4,8 +4,24 @@ import pytest
 import torch
 
 from megatron.lite.primitive.alignment.vllm_batched_prepare import (
+    _compact_fused_expert_output,
     _quantize_batched_input,
 )
+
+
+def test_compact_output_accepts_token_major_expert_layout() -> None:
+    output = torch.full((3, 2, 1), float("nan"))
+    output[:2, 0, 0] = torch.tensor([10.0, 11.0])
+    output[:1, 1, 0] = 20.0
+
+    compact = _compact_fused_expert_output(output, (2, 1))
+
+    torch.testing.assert_close(
+        compact,
+        torch.tensor([[10.0], [11.0], [20.0]]),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.gpus(1)

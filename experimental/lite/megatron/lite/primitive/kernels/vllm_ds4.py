@@ -99,6 +99,25 @@ def _tensor(
         )
 
 
+def _validate_finite(stage: str, **tensors: Tensor) -> None:
+    if os.environ.get("MLITE_VALIDATE_FINITE") != "1":
+        return
+    for name, tensor in tensors.items():
+        if not tensor.is_floating_point():
+            continue
+        finite = torch.isfinite(
+            tensor.float()
+            if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            else tensor
+        )
+        if not bool(finite.all()):
+            raise FloatingPointError(
+                f"MLITE_NONFINITE stage={stage} tensor={name} "
+                f"dtype={tensor.dtype} shape={tuple(tensor.shape)} "
+                f"nonfinite={int((~finite).sum().item())}"
+            )
+
+
 def _same_device(named: dict[str, Tensor]) -> None:
     devices = {value.device for value in named.values()}
     if len(devices) != 1:
@@ -819,13 +838,25 @@ class GroupedDeepGemmExpertsAdapter(_Adapter):
             raise ValueError("expert_map must contain every global expert")
 
         packed = self.pack(w13, w2)
+        _validate_finite(
+            "grouped_moe.input",
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            w13=packed.w13,
+            w2=packed.w2,
+            w13_scale=packed.w13_scale,
+            w2_scale=packed.w2_scale,
+        )
         kernel = build_kernel(packed)
         fused_experts = getattr(kernel, "fused_experts", None)
         prepare_finalize = getattr(kernel, "prepare_finalize", None)
-        if fused_experts is None or fused_experts.__class__.__name__ != self._EXPERTS_CLASS:
+        if (
+            fused_experts is None
+            or fused_experts.__class__.__name__ != self._EXPERTS_CLASS
+        ):
             raise RuntimeError(
                 "grouped MoE builder must return FusedMoEKernel with "
-                "BatchedDeepGemmExperts"
+                f"{self._EXPERTS_CLASS}"
             )
         if (
             prepare_finalize is None
@@ -970,6 +1001,7 @@ class GroupedMoEKernelBuilderAdapter:
             max_num_tokens=self.max_tokens_per_rank,
             num_dispatchers=self.num_dispatchers,
         )
+
         kernel_cls = _symbol(
             "vllm.model_executor.layers.fused_moe.modular_kernel",
             "FusedMoEKernel",

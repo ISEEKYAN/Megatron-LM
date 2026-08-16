@@ -41,6 +41,53 @@ from megatron.lite.primitive.quantization.deployment_block_fp8 import (
 )
 
 
+def _validate_finite(stage: str, **tensors: torch.Tensor | None) -> None:
+    if os.environ.get("MLITE_VALIDATE_FINITE") != "1":
+        return
+    for name, tensor in tensors.items():
+        if tensor is None or not tensor.is_floating_point():
+            continue
+        finite = torch.isfinite(tensor)
+        if bool(finite.all()):
+            continue
+        raise FloatingPointError(
+            f"MLITE_NONFINITE stage={stage} tensor={name} "
+            f"dtype={tensor.dtype} shape={tuple(tensor.shape)} "
+            f"nonfinite={int((~finite).sum().item())}"
+        )
+
+
+def _vllm_selected_log_probs(
+    logits: torch.Tensor, labels: torch.Tensor, temperature: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match vLLM's selected-token reduction without changing its gradient.
+
+    Rollout records selected-token log probabilities with vLLM's bounded-memory
+    Triton reduction.  PyTorch's full ``log_softmax`` has the same mathematics
+    but can differ by a few FP32 ulps for large vocabularies.  Use the official
+    vLLM primitive for the forward value and the differentiable PyTorch result
+    for the (mathematically identical) backward.  Keeping the full tensor here
+    is temporary; LinearCE remains the memory-saving P1 replacement.
+    """
+    scaled_logits = logits.float() / temperature
+    token_log_probs = F.log_softmax(scaled_logits, dim=-1)
+    reference = token_log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    if not scaled_logits.is_cuda:
+        return reference, token_log_probs
+
+    from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
+
+    # vLLM keeps raw head logits at temperature=1.  Its sampler only creates
+    # FP32 processed logits when temperature (or another processor) requires
+    # it, so preserve that dtype boundary here as well.
+    rollout_logits = logits if temperature == 1.0 else scaled_logits
+    rollout_value = compute_token_logprobs(rollout_logits, labels.unsqueeze(-1)).squeeze(
+        -1
+    )
+    selected = reference + (rollout_value - reference).detach()
+    return selected, token_log_probs
+
+
 _STAGES = frozenset({"mhc", "linear", "kv_flashmla", "o_proj", "router_moe", "deepep"})
 
 
@@ -58,6 +105,13 @@ class AttentionKernelMetadata:
     topk_length: torch.Tensor
     output: torch.Tensor
     kv_workspace: torch.Tensor | None = None
+    # Backward addresses the request-major, padded FlashMLA workspace, not the
+    # paged-cache storage addressed by ``slot_mapping``.  They coincide only
+    # for a single unpadded request, so keep the two coordinate systems
+    # explicit for packed RL batches.
+    kv_workspace_slot_mapping: torch.Tensor | None = None
+    compressor_workspace_slot_mapping: torch.Tensor | None = None
+    query_start_loc: torch.Tensor | None = None
     tile_scheduler_metadata: Any | None = None
     attn_sink: torch.Tensor | None = None
     softmax_scale: float | None = None
@@ -119,6 +173,17 @@ class _RMSNormState(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.bfloat16))
 
     def forward(self, value: torch.Tensor, eps: float) -> torch.Tensor:
+        # Match the rollout runtime's final RMSNorm reduction exactly.  vLLM
+        # switches RMSNorm to this fixed, row-wise reduction whenever batch
+        # invariance is enabled; torch.nn.functional.rms_norm can otherwise
+        # differ by one BF16 ULP for a small subset of rows even when its input
+        # and weight are byte-identical.
+        if os.getenv("VLLM_BATCH_INVARIANT", "0") == "1":
+            from vllm.model_executor.layers.batch_invariant import (
+                rms_norm_batch_invariant,
+            )
+
+            return rms_norm_batch_invariant(value, self.weight, eps)
         return F.rms_norm(value, (value.shape[-1],), self.weight, eps)
 
 
@@ -275,7 +340,7 @@ class _AttentionState(nn.Module):
         assert self._projection_events is not None
         from vllm.utils.multi_stream_utils import execute_in_parallel
 
-        return execute_in_parallel(
+        default_output, aux_outputs = execute_in_parallel(
             fused_projection,
             aux_fns,
             self._projection_events[0],
@@ -283,6 +348,18 @@ class _AttentionState(nn.Module):
             self._projection_streams,
             enable=True,
         )
+        # ``execute_in_parallel`` establishes the execution dependency with
+        # CUDA events, but the auxiliary outputs were allocated on their
+        # respective streams.  Tell the caching allocator that the current
+        # stream also owns their lifetime before they are consumed below.
+        # Without this, a later allocation can recycle their storage while a
+        # current-stream kernel is still reading it; full launch blocking hid
+        # that race in the RL integration test.
+        current_stream = torch.cuda.current_stream(hidden_states.device)
+        for output in aux_outputs:
+            if isinstance(output, torch.Tensor):
+                output.record_stream(current_stream)
+        return default_output, aux_outputs
 
     def forward(
         self,
@@ -443,7 +520,11 @@ class _AttentionState(nn.Module):
                 metadata.indices,
                 metadata.topk_length,
                 sink,
-                metadata.slot_mapping,
+                (
+                    metadata.kv_workspace_slot_mapping
+                    if metadata.kv_workspace_slot_mapping is not None
+                    else metadata.slot_mapping
+                ),
                 metadata.positions,
                 metadata.cos_sin_cache,
                 softmax_scale=scale,
@@ -459,6 +540,12 @@ class _AttentionState(nn.Module):
                     else None
                 ),
                 compressor_ratio=self.compress_ratio,
+                compressor_workspace_slots=(
+                    metadata.compressor_workspace_slot_mapping
+                    if metadata.compressor_workspace_slot_mapping is not None
+                    else None
+                ),
+                query_start_loc=metadata.query_start_loc,
             )
             if self.indexer is not None and torch.is_grad_enabled():
                 assert indexer_topk is not None
@@ -671,7 +758,18 @@ class DeepseekV4Layer(nn.Module):
                 eps=self.config.hc_eps,
                 norm_eps=self.config.rms_norm_eps,
             )
+        _validate_finite(
+            f"layer_{self.layer_idx}.mhc_pre_attn",
+            hidden_states=hidden_states,
+            residual=residual,
+            post_mix=post_mix,
+            res_mix=res_mix,
+        )
         hidden_states = self.self_attn(hidden_states, metadata=attention_metadata)
+        _validate_finite(
+            f"layer_{self.layer_idx}.attention",
+            hidden_states=hidden_states,
+        )
         adapter = MHCTileLangAdapter(MHCKernel.POST_PRE)
         residual, post_mix, res_mix, hidden_states = mhc_post_pre(
             lambda hidden, residual_, post, comb, fn, scale, base, norm_weight: adapter(
@@ -705,8 +803,19 @@ class DeepseekV4Layer(nn.Module):
             eps=self.config.hc_eps,
             norm_eps=self.config.rms_norm_eps,
         )
+        _validate_finite(
+            f"layer_{self.layer_idx}.mhc_pre_ffn",
+            hidden_states=hidden_states,
+            residual=residual,
+            post_mix=post_mix,
+            res_mix=res_mix,
+        )
         hidden_states = self.mlp(
             hidden_states, input_ids=input_ids, metadata=moe_metadata
+        )
+        _validate_finite(
+            f"layer_{self.layer_idx}.moe",
+            hidden_states=hidden_states,
         )
         return hidden_states, residual, post_mix, res_mix
 
@@ -865,6 +974,13 @@ class DeepseekV4Model(nn.Module):
                 post_mix=post_mix,
                 res_mix=res_mix,
             )
+            _validate_finite(
+                f"layer_{layer_idx}.output",
+                hidden_states=hidden_states,
+                residual=residual,
+                post_mix=post_mix,
+                res_mix=res_mix,
+            )
         if labels is not None and len(self.selected_layer_ids) != self.config.num_hidden_layers:
             raise ValueError("training loss requires the complete decoder layer set")
         if (
@@ -888,6 +1004,7 @@ class DeepseekV4Model(nn.Module):
             post_mix,
             res_mix,
         )
+        _validate_finite("model.mhc_post", hidden_states=hidden_states)
         head_adapter = MHCTileLangAdapter(MHCKernel.HEAD)
         hidden_states = mhc_head(
             lambda *args: head_adapter(
@@ -899,8 +1016,11 @@ class DeepseekV4Model(nn.Module):
             self.hc_head.hc_base.float().contiguous(),
             eps=self.config.hc_eps,
         )
+        _validate_finite("model.mhc_head", hidden_states=hidden_states)
         hidden_states = self.norm(hidden_states, self.config.rms_norm_eps)
+        _validate_finite("model.norm", hidden_states=hidden_states)
         logits = self.lm_head(hidden_states)
+        _validate_finite("model.logits", logits=logits)
         result = {
             "hidden_states": hidden_states,
             "logits": logits,
@@ -924,10 +1044,12 @@ class DeepseekV4Model(nn.Module):
                         f"min={int(minimum.item())}, max={int(maximum.item())}, "
                         f"vocab={logits.shape[-1]}"
                     )
-            scaled_logits = logits.float() / temperature_value
-            token_log_probs = F.log_softmax(scaled_logits, dim=-1)
-            token_loss = F.nll_loss(token_log_probs, flat_labels, reduction="none")
-            result["log_probs"] = -token_loss
+            selected_log_probs, token_log_probs = _vllm_selected_log_probs(
+                logits, flat_labels, temperature_value
+            )
+            token_loss = -selected_log_probs
+            result["log_probs"] = selected_log_probs
+            _validate_finite("model.selected_log_probs", log_probs=result["log_probs"])
             if calculate_entropy:
                 result["entropy"] = -(
                     token_log_probs.exp() * token_log_probs

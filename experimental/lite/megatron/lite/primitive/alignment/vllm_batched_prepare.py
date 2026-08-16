@@ -7,6 +7,8 @@ official batched DeepGEMM path.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 
@@ -62,6 +64,33 @@ def _quantize_batched_input(
         )
         scales[expert].copy_(expert_scales)
     return quantized, scales
+
+
+def _compact_fused_expert_output(
+    fused_expert_output: torch.Tensor,
+    counts: tuple[int, ...],
+) -> torch.Tensor:
+    expert_axis = 0 if fused_expert_output.shape[0] == len(counts) else 1
+    if (
+        fused_expert_output.ndim != 3
+        or fused_expert_output.shape[expert_axis] != len(counts)
+    ):
+        raise RuntimeError(
+            "normal DeepEP cannot locate expert axis in output "
+            f"{tuple(fused_expert_output.shape)} for {len(counts)} experts"
+        )
+    rows = [
+        (
+            fused_expert_output[expert, :count]
+            if expert_axis == 0
+            else fused_expert_output[:count, expert]
+        )
+        for expert, count in enumerate(counts)
+        if count
+    ]
+    if rows:
+        return torch.cat(rows, dim=0)
+    return fused_expert_output.new_empty((0, fused_expert_output.shape[-1]))
 
 
 class NormalDeepEPAlignedPrepareAndFinalize:
@@ -183,18 +212,20 @@ class NormalDeepEPAlignedPrepareAndFinalize:
                     raise TypeError("normal DeepEP finalize requires delegated gather")
                 if self._counts is None:
                     raise RuntimeError("normal DeepEP finalize called without prepare")
-                rows = [
-                    fused_expert_output[expert, :count]
-                    for expert, count in enumerate(self._counts)
-                    if count
-                ]
-                compact = (
-                    torch.cat(rows, dim=0)
-                    if rows
-                    else fused_expert_output.new_empty(
-                        (0, fused_expert_output.shape[-1])
-                    )
+                compact = _compact_fused_expert_output(
+                    fused_expert_output,
+                    self._counts,
                 )
+                if (
+                    os.environ.get("MLITE_VALIDATE_FINITE") == "1"
+                    and not bool(torch.isfinite(compact).all())
+                ):
+                    raise FloatingPointError(
+                        "MLITE_NONFINITE "
+                        "stage=normal_deepep.finalize_compact "
+                        f"fused_shape={tuple(fused_expert_output.shape)} "
+                        f"nonfinite={int((~torch.isfinite(compact)).sum().item())}"
+                    )
                 combined = self.dispatcher.combine(compact)
                 output.copy_(combined)
                 self._counts = None

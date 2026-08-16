@@ -394,6 +394,16 @@ class MegatronLiteEngine(BaseEngine):
         self._require_initialized()
         _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
         _write_parameter_snapshot(self.module, phase="post_step", rank=self._rank)
+        grad_norm_value = (
+            float(grad_norm.detach().float().cpu())
+            if isinstance(grad_norm, torch.Tensor)
+            else float(grad_norm)
+        )
+        print(
+            f"MLITE_OPTIMIZER_STEP rank={self._rank} "
+            f"grad_norm={grad_norm_value:.9g}",
+            flush=True,
+        )
         return grad_norm
 
     def lr_scheduler_step(self):

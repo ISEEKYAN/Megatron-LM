@@ -97,6 +97,10 @@ class _VLLMDeepEPMoEFunction(torch.autograd.Function):
             )
         grad_hidden_all, grad_probs_all, *grad_weights = grads
         if dist.is_available() and dist.is_initialized():
+            # Autograd may return a strided view for the indexed probability
+            # gradient. NCCL collectives require dense contiguous inputs.
+            grad_hidden_all = grad_hidden_all.contiguous()
+            grad_probs_all = grad_probs_all.contiguous()
             dist.all_reduce(grad_hidden_all, group=ctx.group)
             dist.all_reduce(grad_probs_all, group=ctx.group)
         offset = sum(counts[:rank])
