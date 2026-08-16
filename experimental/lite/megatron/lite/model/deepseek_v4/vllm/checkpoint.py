@@ -162,6 +162,10 @@ class DeepseekV4WeightSpec:
         self.ps = ParallelState()
         self.source_block_scales: dict[str, torch.Tensor] = {}
         self.export_source_block_scales: dict[str, torch.Tensor] = {}
+        # The common PP exporter rewrites local expert suffixes to global IDs
+        # before calling native_to_hf. Loading and the PP1 exporter still pass
+        # stage-local suffixes, so keep that distinction explicit.
+        self.export_expert_names_are_global = False
 
     @property
     def num_experts(self) -> int:
@@ -186,8 +190,11 @@ class DeepseekV4WeightSpec:
         if match is None:
             return []
         layer, kind, local_id = match.groups()
-        local_count = self.config.n_routed_experts // self.ps.ep_size
-        expert_id = self.ps.ep_rank * local_count + int(local_id)
+        if self.export_expert_names_are_global:
+            expert_id = int(local_id)
+        else:
+            local_count = self.config.n_routed_experts // self.ps.ep_size
+            expert_id = self.ps.ep_rank * local_count + int(local_id)
         base = f"layers.{layer}.ffn.experts.{expert_id}"
         if kind == "w13":
             return [f"{base}.w1.weight", f"{base}.w3.weight"]
@@ -583,6 +590,7 @@ def export_hf_weights(
         )
 
         spec.export_source_block_scales = _pipeline_export_source_scales(chunks, ps)
+        spec.export_expert_names_are_global = True
         yield from _export_common(
             chunks,
             spec,

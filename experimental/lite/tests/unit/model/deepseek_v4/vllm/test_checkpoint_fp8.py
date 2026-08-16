@@ -238,6 +238,24 @@ def test_pipeline_export_reuses_common_streaming_collectives(monkeypatch) -> Non
     assert "resync_config" not in seen[0][3]
 
 
+def test_pipeline_gathered_expert_name_is_not_offset_twice() -> None:
+    """Common PP export names already carry their global expert suffix."""
+    config = DeepseekV4Config(hidden_size=128, n_routed_experts=256)
+    spec = DeepseekV4WeightSpec(config)
+    spec.ps = SimpleNamespace(ep_size=4, ep_rank=3)
+
+    assert spec._expert_hf_names("layers.2.mlp.experts.w13.7") == [
+        "layers.2.ffn.experts.199.w1.weight",
+        "layers.2.ffn.experts.199.w3.weight",
+    ]
+
+    spec.export_expert_names_are_global = True
+    assert spec._expert_hf_names("layers.2.mlp.experts.w13.71") == [
+        "layers.2.ffn.experts.71.w1.weight",
+        "layers.2.ffn.experts.71.w3.weight",
+    ]
+
+
 def test_export_materializes_fsdp2_dtensor_before_conversion() -> None:
     source = torch.tensor([0.6337993144989014], dtype=torch.bfloat16)
     calls = []
