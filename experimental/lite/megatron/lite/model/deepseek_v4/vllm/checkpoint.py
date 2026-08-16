@@ -492,9 +492,11 @@ def invalidate_bound_source_scales(model: nn.Module) -> None:
 
 
 def _pipeline_export_source_scales(
-    chunks: nn.Module | Iterable[nn.Module], ps: ParallelState
+    chunks: nn.Module | Iterable[nn.Module],
+    ps: ParallelState,
+    num_experts: int,
 ) -> dict[str, torch.Tensor]:
-    """Replicate the small reversible-scale registry across PP stages.
+    """Replicate the reversible-scale registry across EP and PP.
 
     The common HF exporter already streams full parameters over TP/EP/PP.  The
     registry is model-specific metadata rather than state_dict data, so gather
@@ -524,6 +526,39 @@ def _pipeline_export_source_scales(
                     f"conflicting reversible FP8 scales for {global_name}"
                 )
             local[global_name] = value
+
+    # Expert parameters use stage-local suffixes in the model. The common
+    # exporter first gathers their weights across EP and rewrites those
+    # suffixes to global expert IDs, so globalize the matching scales before
+    # native_to_hf sees either object. Dense entries are replicated and must be
+    # bitwise identical across EP ranks.
+    if ps.ep_size > 1:
+        if not dist.is_initialized() or ps.ep_group is None:
+            raise RuntimeError("EP resync requires an initialized expert group")
+        ep_registries: list[dict[str, torch.Tensor] | None] = [None] * ps.ep_size
+        dist.all_gather_object(ep_registries, local, group=ps.ep_group)
+        experts_per_rank = num_experts // ps.ep_size
+        globalized: dict[str, torch.Tensor] = {}
+        for ep_rank, registry in enumerate(ep_registries):
+            if registry is None:
+                raise RuntimeError("EP source-scale gather returned an empty rank")
+            for name, value in registry.items():
+                match = re.match(
+                    r"^(layers\.\d+\.mlp\.experts\.(?:w13|w2)\.)(\d+)$",
+                    name,
+                )
+                global_name = (
+                    f"{match.group(1)}{ep_rank * experts_per_rank + int(match.group(2))}"
+                    if match is not None
+                    else name
+                )
+                previous = globalized.get(global_name)
+                if previous is not None and not torch.equal(previous, value):
+                    raise RuntimeError(
+                        f"conflicting reversible FP8 scales across EP for {global_name}"
+                    )
+                globalized[global_name] = value
+        local = globalized
 
     if ps.pp_size <= 1:
         return local
@@ -589,7 +624,9 @@ def export_hf_weights(
             export_hf_weights as _export_common,
         )
 
-        spec.export_source_block_scales = _pipeline_export_source_scales(chunks, ps)
+        spec.export_source_block_scales = _pipeline_export_source_scales(
+            chunks, ps, model_cfg.n_routed_experts
+        )
         spec.export_expert_names_are_global = True
         yield from _export_common(
             chunks,

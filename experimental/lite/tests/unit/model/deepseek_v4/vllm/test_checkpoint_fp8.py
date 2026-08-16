@@ -205,7 +205,7 @@ def test_pipeline_export_reuses_common_streaming_collectives(monkeypatch) -> Non
     monkeypatch.setattr(
         checkpoint,
         "_pipeline_export_source_scales",
-        lambda chunks, parallel_state: scales,
+        lambda chunks, parallel_state, num_experts: scales,
     )
 
     from megatron.lite.primitive.ckpt import hf_weights
@@ -254,6 +254,45 @@ def test_pipeline_gathered_expert_name_is_not_offset_twice() -> None:
         "layers.2.ffn.experts.71.w1.weight",
         "layers.2.ffn.experts.71.w3.weight",
     ]
+
+
+def test_pipeline_source_scales_are_globalized_across_ep(monkeypatch) -> None:
+    model = torch.nn.Module()
+    model._fp8_source_scales_valid = True
+    model._fp8_source_scales_by_name = {
+        "layers.0.mlp.experts.w2.0": torch.tensor([[1.0]]),
+        "layers.0.self_attn.wq_b": torch.tensor([[4.0]]),
+    }
+    ps = SimpleNamespace(
+        ep_size=2,
+        ep_group=object(),
+        pp_size=1,
+        pp_group=None,
+    )
+
+    monkeypatch.setattr(checkpoint.dist, "is_initialized", lambda: True)
+
+    def _fake_all_gather(output, local, *, group):
+        assert group is ps.ep_group
+        output[:] = [
+            local,
+            {
+                "layers.0.mlp.experts.w2.0": torch.tensor([[2.0]]),
+                "layers.0.self_attn.wq_b": torch.tensor([[4.0]]),
+            },
+        ]
+
+    monkeypatch.setattr(checkpoint.dist, "all_gather_object", _fake_all_gather)
+    scales = checkpoint._pipeline_export_source_scales(model, ps, num_experts=4)
+
+    assert set(scales) == {
+        "layers.0.mlp.experts.w2.0",
+        "layers.0.mlp.experts.w2.2",
+        "layers.0.self_attn.wq_b",
+    }
+    torch.testing.assert_close(
+        scales["layers.0.mlp.experts.w2.2"], torch.tensor([[2.0]]), rtol=0, atol=0
+    )
 
 
 def test_export_materializes_fsdp2_dtensor_before_conversion() -> None:
