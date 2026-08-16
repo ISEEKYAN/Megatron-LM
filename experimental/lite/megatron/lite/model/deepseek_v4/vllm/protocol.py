@@ -34,6 +34,13 @@ from megatron.lite.model.protocol_utils import (
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import init_parallel
+from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
+from megatron.lite.primitive.parallel.thd import (
+    pack_nested_thd,
+    parallel_state_from_model,
+    thd_pack_meta,
+    unpack_thd_to_nested,
+)
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 
 _CANONICAL_STAGES = frozenset(
@@ -164,11 +171,15 @@ def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> Non
         "vpp": parallel.vpp,
         "cp": parallel.cp,
     }
-    unsupported = {name: size for name, size in dimensions.items() if size > 1}
+    unsupported = {
+        name: size
+        for name, size in dimensions.items()
+        if name != "cp" and size > 1
+    }
     if unsupported:
         values = ", ".join(f"{name}={size}" for name, size in unsupported.items())
         raise NotImplementedError(
-            f"DeepSeek V4 vLLM layer-0 keeps TP/ETP/PP/VPP/CP at one; got {values}."
+            f"DeepSeek V4 vLLM keeps TP/ETP/PP/VPP at one; got {values}."
         )
     if parallel.ep != 2 or not impl_cfg.use_deepep:
         raise NotImplementedError(
@@ -259,6 +270,7 @@ def _forward_step(
     *,
     attention_metadata=None,
     moe_metadata=None,
+    forward_inputs: Mapping[str, Any] | None = None,
 ) -> dict[str, torch.Tensor]:
     seq_lens = getattr(batch, "seq_lens", None)
     kwargs = {
@@ -278,12 +290,22 @@ def _forward_step(
         "loss_mask": _roll_packed_targets(getattr(batch, "loss_mask", None), seq_lens),
         "temperature": getattr(batch, "temperature", 1.0),
     }
+    if forward_inputs is not None:
+        kwargs.update(forward_inputs)
     add_loss_context_kwargs(kwargs)
     return model(**kwargs)
 
 
 def unpack_forward_output(model: nn.Module, batch, output) -> Any:
-    del model
+    ps = parallel_state_from_model(model)
+    if ps is not None and ps.cp_size > 1:
+        meta = thd_pack_meta(
+            batch.seq_lens,
+            tp_size=ps.tp_size,
+            cp_size=ps.cp_size,
+            cp_group=ps.cp_group,
+        )
+        return unpack_thd_to_nested(output, meta, contiguous=True)
     return nested_from_packed(output, batch.seq_lens)
 
 
@@ -297,6 +319,41 @@ def pack_r3_replay_mask(model: nn.Module, batch) -> torch.Tensor:
     """Pack the causal replay mask in the contiguous DS4 vLLM token order."""
 
     return _pack_r3_replay_mask(model, batch, contiguous=True)
+
+
+def _prepare_cp_forward_inputs(model: nn.Module, batch) -> tuple[dict[str, Any], list[int]]:
+    """Pad then slice packed rows using DS4 lite's contiguous CP layout."""
+
+    ps = parallel_state_from_model(model)
+    if ps is None or ps.cp_size <= 1:
+        return {}, [int(value) for value in batch.seq_lens.detach().cpu().tolist()]
+    packed = pack_nested_thd(
+        nested_from_packed(batch.input_ids, batch.seq_lens),
+        tp_size=ps.tp_size,
+        cp_size=ps.cp_size,
+        cp_rank=ps.cp_rank,
+        cp_group=ps.cp_group,
+        split_cp=False,
+        labels=nested_from_packed(batch.labels, batch.seq_lens),
+        loss_mask=nested_from_packed(batch.loss_mask, batch.seq_lens),
+        roll_labels=batch.labels is not None,
+        roll_loss_mask=batch.loss_mask is not None,
+    )
+
+    def local(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        return contiguous_slice_for_cp(
+            tensor, ps.cp_rank, ps.cp_size, seq_dim=1
+        ).reshape(-1).contiguous()
+
+    inputs = {
+        "input_ids": local(packed.input_ids),
+        "position_ids": local(packed.position_ids),
+        "labels": local(packed.labels),
+        "loss_mask": local(packed.loss_mask),
+    }
+    return inputs, [int(value) for value in packed.padded_lengths.detach().cpu().tolist()]
 
 
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
@@ -384,12 +441,16 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             current_attention_builders, current_moe_metadata = ensure_runtime_assets()
         seq_lens = getattr(batch, "seq_lens", None)
         if seq_lens is None:
+            if parallel_state.cp_size > 1:
+                raise ValueError("DeepSeek V4 vLLM CP requires batch.seq_lens")
+            forward_inputs = {}
             token_counts = [int(batch.input_ids.numel())]
         else:
-            token_counts = [int(value) for value in seq_lens.detach().cpu().tolist()]
-        if sum(token_counts) > impl_cfg.max_tokens_per_rank:
+            forward_inputs, token_counts = _prepare_cp_forward_inputs(model, batch)
+        local_tokens = sum(token_counts) // parallel_state.cp_size
+        if local_tokens > impl_cfg.max_tokens_per_rank:
             raise ValueError(
-                f"packed batch has {sum(token_counts)} tokens, exceeding "
+                f"CP-local packed batch has {local_tokens} tokens, exceeding "
                 f"max_tokens_per_rank={impl_cfg.max_tokens_per_rank}"
             )
         if attention_metadata is None:
@@ -415,6 +476,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 batch,
                 attention_metadata=attention_metadata,
                 moe_metadata=moe_metadata,
+                forward_inputs=forward_inputs,
             )
 
     optimizer = None

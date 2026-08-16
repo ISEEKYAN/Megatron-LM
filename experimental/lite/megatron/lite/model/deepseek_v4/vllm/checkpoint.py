@@ -168,8 +168,10 @@ class DeepseekV4WeightSpec:
         return {}
 
     def validate_load(self, ps: ParallelState) -> None:
-        if (ps.tp_size, ps.etp_size, ps.pp_size, ps.cp_size) != (1, 1, 1, 1):
-            raise NotImplementedError("vLLM layer-0 checkpoint load requires dense ranks=1.")
+        if (ps.tp_size, ps.etp_size, ps.pp_size) != (1, 1, 1):
+            raise NotImplementedError(
+                "vLLM checkpoint load requires TP/ETP/PP=1; CP is replicated."
+            )
         if ps.ep_size not in (1, 2):
             raise NotImplementedError("vLLM layer-0 checkpoint load supports EP=1/2.")
         self.ps = ps
@@ -453,9 +455,9 @@ def export_hf_weights(
     **kwargs,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     del kwargs
-    if (ps.tp_size, ps.etp_size, ps.pp_size, ps.cp_size) != (1, 1, 1, 1):
+    if (ps.tp_size, ps.etp_size, ps.pp_size) != (1, 1, 1):
         raise NotImplementedError(
-            "vLLM BF16-master/online-FP8 export requires dense ranks=1."
+            "vLLM BF16-master/online-FP8 export requires TP/ETP/PP=1."
         )
     spec = DeepseekV4WeightSpec(model_cfg)
     spec.validate_load(ps)

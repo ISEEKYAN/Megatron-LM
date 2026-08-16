@@ -245,7 +245,6 @@ def test_r3_replays_ids_and_recomputes_live_actor_weights(hash_layer: bool) -> N
         ParallelConfig(etp=2),
         ParallelConfig(pp=2),
         ParallelConfig(vpp=2),
-        ParallelConfig(cp=2),
     ],
 )
 def test_parallel_contract_fails_closed(parallel: ParallelConfig) -> None:
@@ -254,6 +253,65 @@ def test_parallel_contract_fails_closed(parallel: ParallelConfig) -> None:
             _tiny_config(),
             protocol.ImplConfig(parallel=parallel),
         )
+
+
+def test_parallel_contract_accepts_cp_with_required_ep_deepep() -> None:
+    protocol._validate_contract(
+        _tiny_config(),
+        protocol.ImplConfig(
+            parallel=ParallelConfig(cp=2, ep=2),
+            use_deepep=True,
+        ),
+    )
+
+
+def test_cp_forward_inputs_match_lite_contiguous_padded_layout() -> None:
+    model = nn.Module()
+    model.ps = ParallelState(cp_size=2, cp_rank=1, tp_size=1)
+    batch = PackedBatch(
+        input_ids=torch.arange(7),
+        labels=torch.arange(10, 17),
+        loss_mask=torch.ones(7),
+        seq_lens=torch.tensor([3, 4]),
+    )
+
+    inputs, padded_lengths = protocol._prepare_cp_forward_inputs(model, batch)
+
+    assert padded_lengths == [4, 4]
+    assert inputs["input_ids"].shape == (4,)
+    assert inputs["position_ids"].shape == (4,)
+    assert inputs["labels"].shape == (4,)
+    assert inputs["loss_mask"].shape == (4,)
+
+
+def test_attention_cp_gathers_through_model_owned_group(monkeypatch) -> None:
+    attention = _AttentionState.__new__(_AttentionState)
+    nn.Module.__init__(attention)
+    group = object()
+    attention.ps = SimpleNamespace(cp_size=2, cp_rank=0, cp_group=group)
+    metadata = SimpleNamespace(cos_sin_cache=torch.empty(8, 4, dtype=torch.float32))
+    local = torch.arange(8, dtype=torch.float32).view(2, 4)
+    gathered = []
+
+    def fake_all_gather(value, *, group):
+        assert group is attention.ps.cp_group
+        return (value, value + 100)
+
+    monkeypatch.setattr(torch.distributed.nn.functional, "all_gather", fake_all_gather)
+
+    class _Stop(Exception):
+        pass
+
+    def capture(value):
+        gathered.append(value)
+        raise _Stop
+
+    attention._selected = lambda _stage: None
+    attention._input_projections = capture
+    with pytest.raises(_Stop):
+        attention.forward(local, metadata=metadata)
+
+    assert torch.equal(gathered[0], torch.cat((local, local + 100), dim=0))
 
 
 def test_build_contract_preserves_release_master_dtypes(monkeypatch) -> None:

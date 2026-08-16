@@ -246,6 +246,7 @@ class _AttentionState(nn.Module):
         self,
         config: DeepseekV4Config,
         *,
+        ps=None,
         layer_idx: int,
         selected_stages: frozenset[str],
         indexer_loss_coeff: float = 0.0,
@@ -254,6 +255,7 @@ class _AttentionState(nn.Module):
         super().__init__()
         h, qrank, dim = config.hidden_size, config.q_lora_rank, config.head_dim
         self.config = config
+        self.ps = ps
         self.layer_idx = layer_idx
         configured_ratio = (
             config.compress_ratios[layer_idx]
@@ -371,6 +373,16 @@ class _AttentionState(nn.Module):
             raise ValueError("layer-0 attention requires flat [tokens, hidden]")
         if metadata is None:
             raise NotImplementedError("layer-0 attention requires explicit metadata")
+        local_tokens = hidden_states.shape[0]
+        if self.ps is not None and self.ps.cp_size > 1:
+            if self.ps.cp_group is None:
+                raise RuntimeError("DeepSeek V4 vLLM CP requires ps.cp_group")
+            from torch.distributed.nn.functional import all_gather
+
+            hidden_states = torch.cat(
+                list(all_gather(hidden_states.contiguous(), group=self.ps.cp_group)),
+                dim=0,
+            )
         # FSDP2 mixed precision recursively casts floating forward inputs,
         # including tensors nested in this metadata dataclass. FlashMLA's RoPE
         # kernels require the cache to remain FP32, so restore that boundary
@@ -630,6 +642,9 @@ class _AttentionState(nn.Module):
             rope_dim=self.config.qk_rope_head_dim,
             o_lora_rank=self.config.o_lora_rank,
         )
+        if self.ps is not None and self.ps.cp_size > 1:
+            start = self.ps.cp_rank * local_tokens
+            output = output.narrow(0, start, local_tokens).contiguous()
         return output
 
 
@@ -655,6 +670,7 @@ class DeepseekV4Layer(nn.Module):
         self.post_attention_layernorm = _RMSNormState(config.hidden_size)
         self.self_attn = _AttentionState(
             config,
+            ps=ps,
             layer_idx=layer_idx,
             selected_stages=self.selected_stages,
             indexer_loss_coeff=indexer_loss_coeff,
