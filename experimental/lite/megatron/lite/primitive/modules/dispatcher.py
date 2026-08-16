@@ -43,6 +43,17 @@ def _validate_finite(stage: str, **tensors: torch.Tensor) -> None:
                 )
 
 
+def _debug_cuda_boundary(stage: str, tensor: torch.Tensor, *, call: int) -> None:
+    if os.environ.get("MLITE_CUDA_SYNC_BOUNDARIES") != "1":
+        return
+    torch.cuda.synchronize(tensor.device)
+    print(
+        f"MLITE_CUDA_BOUNDARY stage={stage} call={call} "
+        f"rank={dist.get_rank()} shape={tuple(tensor.shape)}",
+        flush=True,
+    )
+
+
 def _hidden_bytes(hidden_size: int) -> int:
     return hidden_size * 2
 
@@ -266,6 +277,7 @@ class TokenDispatcher:
         self._output_splits: list[int] | None = None
         self._handle = None
         self._deepep_event = None
+        self._debug_dispatch_calls = 0
 
         if self.ep_size > 1 and self.num_local_experts > 1:
             chunk_idxs = torch.arange(self.ep_size * self.num_local_experts)
@@ -309,6 +321,10 @@ class TokenDispatcher:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Normal DeepEP transport with vLLM LL route/layout semantics."""
 
+        self._debug_dispatch_calls += 1
+        debug_call = self._debug_dispatch_calls
+        _debug_cuda_boundary("aligned_dispatch.input", hidden_states, call=debug_call)
+
         if hidden_states.ndim != 2 or hidden_states.dtype != torch.bfloat16:
             raise TypeError("aligned DeepEP requires BF16 [tokens, hidden]")
         if hidden_states.shape[1] < 16:
@@ -342,6 +358,9 @@ class TokenDispatcher:
                 False,
                 False,
             )
+            _debug_cuda_boundary(
+                "aligned_dispatch.primary", received_hidden, call=debug_call
+            )
             (
                 route_indices,
                 route_weights,
@@ -368,6 +387,9 @@ class TokenDispatcher:
                 self.num_experts,
                 False,
                 False,
+            )
+            _debug_cuda_boundary(
+                "aligned_dispatch.fingerprint", received_fingerprints, call=debug_call
             )
         else:
             received_hidden = hidden_states
@@ -425,6 +447,9 @@ class TokenDispatcher:
             route_positions=positions,
             return_route_rows=True,
         )
+        _debug_cuda_boundary(
+            "aligned_dispatch.scatter", expert_hidden, call=debug_call
+        )
 
         self._aligned_received_output_index = output_index
         self._aligned_received_positions = positions
@@ -441,6 +466,8 @@ class TokenDispatcher:
     def _combine_low_latency_aligned(
         self, expert_output: torch.Tensor
     ) -> torch.Tensor:
+        debug_call = self._debug_dispatch_calls
+        _debug_cuda_boundary("aligned_combine.input", expert_output, call=debug_call)
         _validate_finite(
             "deepep.aligned_combine.input",
             expert_output=expert_output,
@@ -460,6 +487,9 @@ class TokenDispatcher:
                 False,
                 False,
             )
+            _debug_cuda_boundary(
+                "aligned_combine.route", source_routes, call=debug_call
+            )
         else:
             source_routes = route_outputs
         _validate_finite(
@@ -474,6 +504,7 @@ class TokenDispatcher:
             True,
             self._aligned_source_all_routes_valid,
         )
+        _debug_cuda_boundary("aligned_combine.output", output, call=debug_call)
         _validate_finite(
             "deepep.aligned_combine.output",
             output=output,
