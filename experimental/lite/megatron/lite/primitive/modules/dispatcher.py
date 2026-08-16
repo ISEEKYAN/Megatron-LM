@@ -367,6 +367,18 @@ class TokenDispatcher:
             _debug_cuda_boundary(
                 "aligned_dispatch.primary", received_hidden, call=debug_call
             )
+            # The aligned path performs two normal-DeepEP collectives back to
+            # back: the rank-deduplicated hidden dispatch and the route-slot
+            # metadata dispatch.  Normal DeepEP does not put a cross-rank
+            # completion fence at the end of dispatch.  With large, skewed
+            # batches a fast rank can therefore enter the second Buffer while
+            # a peer is still using the first one, and the following combine
+            # can overwrite DeepEP's sender/receiver signals.  MCore's usual
+            # one-dispatch MoE path gets this separation from expert compute;
+            # the metadata-only extension has no such gap.  Fence the EP group
+            # at this new collective boundary.  Use the model-owned group, not
+            # global parallel_state.
+            dist.barrier(group=self.ps.tp_ep_group)
             (
                 route_indices,
                 route_weights,
