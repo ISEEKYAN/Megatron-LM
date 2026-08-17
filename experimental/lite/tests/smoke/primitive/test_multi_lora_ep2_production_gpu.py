@@ -665,7 +665,7 @@ def _bank_sync_absolute_oracle(
             dist.all_reduce(value, group=bundle.parallel_state.ep_group)
             value = value.float()
             dist.all_reduce(value, group=bundle.parallel_state.ep_dp_group)
-            value.div_(bundle.parallel_state.expert_dp_size)
+            value.div_(lora_dist_utils.lora_bank_dp_cp_group_size(bundle.parallel_state))
         else:
             assert (
                 _bank_surface_kind(bundle, _bank_parameters(bundle)[name])
@@ -685,10 +685,8 @@ def _bank_sync_absolute_oracle(
         owner_group = lora_dist_utils.select_lora_bank_owner_group(
             bundle.parallel_state, is_expert_bank=is_fc
         )
-        expected_factor = 1.0 / (
-            bundle.parallel_state.expert_dp_size
-            if is_fc
-            else bundle.parallel_state.dp_size
+        expected_factor = lora_dist_utils.lora_bank_bucket_gradient_factor(
+            bundle.parallel_state
         )
 
         def validate_records(records) -> None:
@@ -1352,7 +1350,7 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
                         for rank in group_ranks
                     )
                 ).float()
-                / bundle.parallel_state.expert_dp_size
+                / lora_dist_utils.lora_bank_dp_cp_group_size(bundle.parallel_state)
             )
             torch.testing.assert_close(
                 unsynced_grads[name].cpu(), expected, rtol=0, atol=0

@@ -22,6 +22,37 @@ def _init_gloo(rank: int, world: int, init_file: str) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("tp", "ep", "owner_size", "dp_cp_size", "expected_factor"),
+    [
+        (1, 2, 1, 2, 0.5),
+        (2, 1, 2, 1, 1.0),
+    ],
+)
+def test_model_owned_bank_bucket_factor_uses_dp_cp_not_expert_dp(
+    monkeypatch, tp, ep, owner_size, dp_cp_size, expected_factor
+):
+    """FC ownership and MCore bucket scaling deliberately use different groups."""
+    owner_group = object()
+    dp_cp_group = object()
+    ps = SimpleNamespace(
+        ep_dp_group=owner_group,
+        dp_cp_group=dp_cp_group,
+        expert_dp_size=owner_size,
+        tp_size=tp,
+        ep_size=ep,
+    )
+    monkeypatch.setattr(
+        lora_dist_utils.dist,
+        "get_world_size",
+        lambda group: dp_cp_size if group is dp_cp_group else owner_size,
+    )
+
+    assert lora_dist_utils.select_lora_bank_owner_group(ps, is_expert_bank=True) is owner_group
+    assert lora_dist_utils.lora_bank_dp_cp_group_size(ps) == dp_cp_size
+    assert lora_dist_utils.lora_bank_bucket_gradient_factor(ps) == expected_factor
+
+
 def _tp2_ep2_factor_lane_worker(rank: int, world: int, init_file: str) -> None:
     _init_gloo(rank, world, init_file)
     try:

@@ -70,6 +70,19 @@ def select_lora_bank_owner_group(parallel_state, *, is_expert_bank: bool):
     return parallel_state.ep_dp_group if is_expert_bank else parallel_state.dp_group
 
 
+def lora_bank_dp_cp_group_size(parallel_state) -> int:
+    """Return the actual bucket-scaling group size for a model-owned LoRA bank."""
+    group = parallel_state.dp_cp_group
+    if group is None:
+        raise RuntimeError("model-owned LoRA bank requires a dp_cp_group")
+    return dist.get_world_size(group)
+
+
+def lora_bank_bucket_gradient_factor(parallel_state) -> float:
+    """Return MCore's bucket gradient scale for every model-owned LoRA bank."""
+    return 1.0 / lora_bank_dp_cp_group_size(parallel_state)
+
+
 def gather_owner_factor_records_or_raise(
     owner_group,
     build_record: Callable[[], Any],
