@@ -427,6 +427,30 @@ class TokenDispatcher:
             if route_handle is not None
             else int((received_indices >= 0).sum().item())
         )
+        if os.environ.get("MLITE_DEEPEP_ROUTE_DIAGNOSTICS") == "1":
+            # This is intentionally a diagnostic-only synchronization.  It
+            # records the public DeepEP receive contract before the compacting
+            # kernel, so a later device assertion cannot hide which side of
+            # the primary-vs-route-metadata invariant diverged.
+            local_experts = int(received_per_expert.numel())
+            valid_received = (received_indices >= 0) & (
+                received_indices < local_experts
+            )
+            valid_count = int(valid_received.sum().item())
+            received_tpe_sum = int(sum(received_per_expert.tolist()))
+            invalid_low = int((received_indices < -1).sum().item())
+            invalid_high = int((received_indices >= local_experts).sum().item())
+            print(
+                "MLITE_DEEPEP_ROUTE_DIAGNOSTIC "
+                f"call={debug_call} rank={dist.get_rank()} "
+                f"source_tokens={hidden_states.shape[0]} "
+                f"primary_tokens={received_hidden.shape[0]} "
+                f"primary_valid_routes={valid_count} "
+                f"metadata_routes={expected_route_count} "
+                f"tokens_per_expert_sum={received_tpe_sum} "
+                f"invalid_low={invalid_low} invalid_high={invalid_high}",
+                flush=True,
+            )
         (
             expert_hidden,
             expert_probs,
