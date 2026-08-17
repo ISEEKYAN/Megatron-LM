@@ -124,6 +124,16 @@ def _inner_optimizers(optimizer):
     yield optimizer
 
 
+def _finish_dist_opt_grad_sync(optimizer):
+    """ChainedOptimizer delegates grad sync to its leaf dist-opt optimizers."""
+    leaves = list(_inner_optimizers(optimizer))
+    assert leaves
+    for leaf in leaves:
+        finish = getattr(leaf, "finish_grad_sync", None)
+        if finish is not None:
+            finish()
+
+
 def _local_optimizer_slices(chunks, optimizer):
     model = getattr(chunks[0], "module", chunks[0])
     parameter = dict(model.named_parameters())[_BANK_NAME]
@@ -225,7 +235,7 @@ def _poison_optimizer_state(chunks, optimizer, oracle):
     """Materialize target Adam state before making its values detectably wrong."""
     loss = getattr(chunks[0], "module", chunks[0])()
     loss.backward()
-    optimizer.finish_grad_sync()
+    _finish_dist_opt_grad_sync(optimizer)
     optimizer.step()
     optimizer.zero_grad()
     for parameter in chunks[0].parameters():
@@ -268,7 +278,7 @@ def test_shared_fc_bank_distopt_dcp_tp2_ep1_to_tp1_ep2():
     if phase == "save":
         loss = getattr(chunks[0], "module", chunks[0])()
         loss.backward()
-        optimizer.finish_grad_sync()
+        _finish_dist_opt_grad_sync(optimizer)
         optimizer.step()
         optimizer.zero_grad()
         oracle = _global_optimizer_oracle(chunks, optimizer)
