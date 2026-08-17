@@ -34,6 +34,7 @@ class MegatronLiteEngineConfig(EngineConfig):
     qat: dict[str, Any] = field(default_factory=dict)
     resync_format: str | None = None
     resync_config: dict[str, Any] = field(default_factory=dict)
+    multi_lora_name: str | None = None
     router_replay_mode: str = "disabled"
     load_hf_weights: bool = True
     impl_cfg: dict[str, Any] = field(default_factory=dict)
@@ -62,6 +63,8 @@ class MegatronLiteEngineConfig(EngineConfig):
         object.__setattr__(self, "qat", dict(self.qat))
         if self.resync_config and self.resync_format is None:
             raise ValueError("resync_config requires resync_format")
+        if self.multi_lora_name is not None and not self.multi_lora_name:
+            raise ValueError("multi_lora_name must be a non-empty string when set")
         if self.qat.get("enable", False) and self.resync_format is not None:
             raise ValueError(
                 "qat online export and native resync_format are mutually exclusive"

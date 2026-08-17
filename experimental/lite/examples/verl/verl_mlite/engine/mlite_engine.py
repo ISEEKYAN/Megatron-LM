@@ -3,11 +3,10 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
-import weakref
 from enum import Enum
-from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -15,6 +14,15 @@ import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
 from megatron.lite.primitive.modules import router_replay
+from megatron.lite.primitive.modules.lora import (
+    LORA_DEFAULT_ALPHA,
+    LORA_DEFAULT_DROPOUT,
+    LORA_DEFAULT_RANK,
+    LORA_DEFAULT_TARGET_MODULES,
+    LORA_DEFAULT_USE_RSLORA,
+    lora_init_uses_residual_base,
+    resolve_lora_alpha,
+)
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
@@ -39,6 +47,8 @@ except Exception:  # pragma: no cover - older VERL without Metric
     _VerlMetric = None
 
 from .config import MegatronLiteEngineConfig
+
+logger = logging.getLogger(__name__)
 
 _patch_bucketed_weight_sender()
 
@@ -400,10 +410,223 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
-        weights = self.runtime.export_weights(self.handle, **export_kwargs)
-        if self.engine_config.qat.get("enable", False):
-            weights = qat_export.export_qat_weights(weights, self.engine_config.qat)
-        return weights, None
+        registry_getter = getattr(self.runtime, "multi_lora_registry", None)
+        multi_lora_registry = (
+            registry_getter(self.handle)
+            if callable(registry_getter)
+            else getattr(self.handle, "_extras", {}).get("multi_lora_registry")
+        )
+        lora_cfg = (self._mlite_config.impl_cfg or {}).get("lora") if self._mlite_config else None
+        # Duck-typed: hydra hands us OmegaConf DictConfig for nested sections, which
+        # fails isinstance(dict). ``enabled`` is the authoritative opt-in; rank
+        # alone must not mutate rollout export behavior.
+        lora_enabled = bool(lora_cfg.get("enabled", False)) if hasattr(lora_cfg, "get") else False
+
+        def _export_base_or_merged_weights():
+            weights = self.runtime.export_weights(self.handle, **export_kwargs)
+            if self.engine_config.qat.get("enable", False):
+                weights = qat_export.export_qat_weights(weights, self.engine_config.qat)
+            return weights
+
+        if multi_lora_registry is not None:
+            multi_lora_cfg = {
+                "enabled": True,
+                "rank": multi_lora_registry.rank,
+                "alpha": multi_lora_registry.alpha,
+                "use_rslora": bool(
+                    getattr(getattr(multi_lora_registry, "lora_spec", None), "use_rslora", False)
+                ),
+            }
+            peft_config = self._build_vllm_peft_config(multi_lora_cfg)
+            if not kwargs.get("base_sync_done", False):
+                return _export_base_or_merged_weights(), peft_config
+            caller_multi_lora_name = kwargs.get("multi_lora_name")
+            configured_multi_lora_name = getattr(
+                self.engine_config, "multi_lora_name", None
+            )
+            if (
+                caller_multi_lora_name is not None
+                and configured_multi_lora_name is not None
+                and caller_multi_lora_name != configured_multi_lora_name
+            ):
+                raise ValueError(
+                    "multi_lora_name from the caller disagrees with engine configuration."
+                )
+            multi_lora_name = caller_multi_lora_name or configured_multi_lora_name
+            if not multi_lora_name:
+                raise ValueError(
+                    "model-owned multi-LoRA adapter-only sync requires multi_lora_name."
+                )
+            multi_lora_registry.slot_for(multi_lora_name)
+            self._assert_adapter_rollout_contract(multi_lora_cfg)
+            adapter_kwargs = {"multi_lora_name": multi_lora_name}
+            if "export_dtype" in export_kwargs:
+                adapter_kwargs["export_dtype"] = export_kwargs["export_dtype"]
+            adapter_stream = self.runtime.export_lora_adapter(self.handle, **adapter_kwargs)
+            return self._checked_adapter_stream(adapter_stream), peft_config
+
+        if not lora_enabled:
+            return _export_base_or_merged_weights(), None
+
+        merge_mode = self._lora_rollout_sync_is_merge(lora_cfg)
+        if merge_mode:
+            # Opt-in legacy path. Merging happens in the rollout dtype (bf16), so
+            # every adapter element smaller than half an ulp of the frozen base
+            # weight is rounded away: measured on a real r=128/alpha=256/rsLoRA
+            # checkpoint, 36% of elements at lr=1e-5 and ~70% at lr=3e-6 reach
+            # vLLM completely unchanged, and the resulting logit error is ~6000x
+            # larger than the adapter path. Keep this only where adapter-only is
+            # not representable (e.g. OLoRA/PiSSA, whose residual base makes
+            # adapter-only numerically wrong).
+            export_kwargs["merge_lora"] = True
+            return _export_base_or_merged_weights(), None
+
+        self._assert_adapter_rollout_contract(lora_cfg)
+        peft_config = self._build_vllm_peft_config(lora_cfg)
+        if not kwargs.get("base_sync_done", False):
+            # Phase 1: the frozen base, exported verbatim. LoRA training never
+            # touches it, so this runs once per rollout engine lifetime.
+            return _export_base_or_merged_weights(), peft_config
+
+        adapter_kwargs = {
+            key: export_kwargs[key] for key in ("export_dtype",) if key in export_kwargs
+        }
+        adapter_stream = self.runtime.export_lora_adapter(self.handle, **adapter_kwargs)
+        return self._checked_adapter_stream(adapter_stream), peft_config
+
+    @staticmethod
+    def _lora_rollout_sync_is_merge(lora_cfg) -> bool:
+        """Resolve the rollout sync mode; adapter-only is the default."""
+        mode = str(lora_cfg.get("rollout_sync", "adapter") or "adapter").lower()
+        if mode not in ("adapter", "merge"):
+            raise ValueError(
+                f"Unknown lora.rollout_sync={mode!r}; expected 'adapter' or 'merge'."
+            )
+        init = str(lora_cfg.get("init", "default") or "default").lower()
+        if lora_init_uses_residual_base(init):
+            # These initializations subtract the adapter's starting delta from the
+            # base weight, so the rollout base is *not* the pretrained weight and
+            # an adapter-only sync would apply the delta to the wrong operand.
+            if mode == "adapter":
+                logger.warning(
+                    "LoRA init=%s carries a residual base; forcing rollout_sync='merge' "
+                    "(adapter-only sync is numerically wrong for this init).",
+                    init,
+                )
+            return True
+        return mode == "merge"
+
+    def _assert_adapter_rollout_contract(self, lora_cfg) -> None:
+        """Refuse adapter-only sync unless the rollout side can actually receive it.
+
+        One decision, two independent switches: ours
+        (``actor.engine.impl_cfg.lora.rollout_sync``) and VERL's
+        (``model.lora.merge`` / ``model.lora.rank``). The latter is what turns on
+        vLLM's ``enable_lora`` -- VERL zeroes ``lora_rank`` when ``merge`` is
+        set, so ``merge=True`` leaves the rollout engine with no LoRA slots at
+        all. Push adapter tensors into that and vLLM resolves the names against
+        nothing: it keeps serving the base policy, logs nothing, and training
+        looks healthy while the rollout never moves. Reward does not crash, it
+        simply never rises, which is far harder to notice than a crash.
+
+        The two switches agreeing has so far been a matter of writing both by
+        hand in the launcher. This turns that luck into a guarantee.
+        """
+        verl_lora = getattr(self.model_config, "lora", None)
+        if not hasattr(verl_lora, "get"):
+            raise RuntimeError(
+                "lora.rollout_sync='adapter' requires VERL's model.lora section "
+                "to be present so vLLM can be put in LoRA mode; found "
+                f"model.lora={verl_lora!r}. Set model.lora.rank>0 and "
+                "model.lora.merge=false, or use lora.rollout_sync='merge'."
+            )
+        merge = bool(verl_lora.get("merge", False))
+        rank = int(verl_lora.get("rank", LORA_DEFAULT_RANK) or 0)
+        if merge or rank <= 0:
+            raise RuntimeError(
+                "lora.rollout_sync='adapter' but VERL's rollout side is not in "
+                f"LoRA mode (model.lora.merge={merge}, model.lora.rank={rank}). "
+                "VERL zeroes lora_rank when merge is set, so vLLM would start "
+                "without enable_lora and would silently discard every adapter "
+                "tensor we push -- rollout would keep serving the base policy "
+                "with no error and a reward that simply never rises. "
+                "Set model.lora.rank>0 and model.lora.merge=false to match "
+                "impl_cfg.lora.rollout_sync='adapter'."
+            )
+
+        engine_rank = int(lora_cfg.get("rank", LORA_DEFAULT_RANK) or 0)
+        if engine_rank != rank:
+            raise RuntimeError(
+                f"LoRA rank disagrees across the two config surfaces: training "
+                f"impl_cfg.lora.rank={engine_rank} vs rollout model.lora.rank="
+                f"{rank}. vLLM sizes its LoRA buffers from the latter, so a "
+                "mismatch truncates or mis-shapes every adapter tensor."
+            )
+
+        # Adapter-only sync deliberately does not push the frozen base; the
+        # rollout engine loads it from disk itself. That is only correct while
+        # both sides start from the same checkpoint. They do here by
+        # construction -- the training runtime is built from the very same
+        # ``model_config.local_path`` (see initialize()) -- so assert the field
+        # is actually populated rather than trusting the convention.
+        base_path = getattr(self.model_config, "local_path", None)
+        if not base_path:
+            raise RuntimeError(
+                "lora.rollout_sync='adapter' leaves the frozen base to the "
+                "rollout engine's own loader, but model_config.local_path is "
+                f"empty ({base_path!r}); the two sides cannot be shown to start "
+                "from the same checkpoint."
+            )
+        logger.info(
+            "LORA_ADAPTER_SYNC_CONTRACT rollout_sync=adapter engine_rank=%s "
+            "verl_rank=%s verl_merge=%s shared_base=%s",
+            engine_rank,
+            rank,
+            merge,
+            base_path,
+        )
+
+    def _build_vllm_peft_config(self, lora_cfg) -> dict:
+        """Build the ``peft_config`` vLLM's ``PEFTHelper`` consumes.
+
+        Built here rather than via VERL's ``build_peft_config_for_vllm`` because
+        that helper omits ``use_rslora``; ``PEFTHelper.from_dict`` silently drops
+        unknown keys and silently defaults the flag to False, which would make
+        vLLM apply ``alpha/rank`` while training used ``alpha/sqrt(rank)``.
+        VERL b9 deliberately uses ``all-linear`` as a PEFTHelper placeholder:
+        the adapter tensor names, not this metadata field, select vLLM modules.
+        """
+        rank = int(lora_cfg.get("rank", LORA_DEFAULT_RANK))
+        alpha = lora_cfg.get("alpha", LORA_DEFAULT_ALPHA)
+        use_rslora = bool(lora_cfg.get("use_rslora", LORA_DEFAULT_USE_RSLORA))
+        return {
+            "task_type": "CAUSAL_LM",
+            "r": rank,
+            "lora_alpha": resolve_lora_alpha(rank, alpha),
+            "use_rslora": use_rslora,
+            "target_modules": "all-linear",
+            "bias": "none",
+            "lora_dropout": float(lora_cfg.get("dropout", LORA_DEFAULT_DROPOUT)),
+        }
+
+    def _checked_adapter_stream(self, stream):
+        """Fail loudly if the expert adapter surface is incomplete."""
+        from megatron.lite.primitive.ckpt.hf_weights import (
+            expected_global_expert_count,
+            guard_expert_adapter_completeness,
+        )
+
+        cfg = getattr(self, "_model_cfg", None) or self.handle._extras.get("model_cfg")
+        lora_cfg = (self._mlite_config.impl_cfg or {}).get("lora") if self._mlite_config else None
+        expected = expected_global_expert_count(
+            num_experts=getattr(cfg, "num_experts", None),
+            target_modules=(
+                lora_cfg.get("target_modules", LORA_DEFAULT_TARGET_MODULES)
+                if hasattr(lora_cfg, "get")
+                else LORA_DEFAULT_TARGET_MODULES
+            ),
+        )
+        yield from guard_expert_adapter_completeness(stream, expected)
 
     def get_data_parallel_size(self):
         if self.handle is None:
@@ -841,14 +1064,10 @@ class MegatronLiteEngine(BaseEngine):
     def _loss_mask_for_packing(
         micro_batch: TensorDict, input_ids: torch.Tensor
     ) -> torch.Tensor | None:
-        if "loss_mask" in micro_batch.keys():
-            mask_key = "loss_mask"
-        elif "response_mask" in micro_batch.keys():
-            mask_key = "response_mask"
-        else:
+        if "loss_mask" not in micro_batch.keys():
             return None
 
-        loss_mask = micro_batch[mask_key]
+        loss_mask = micro_batch["loss_mask"]
         input_lengths = input_ids.offsets().diff().tolist()
         if getattr(loss_mask, "is_nested", False):
             # VERL delivers ``response_mask`` / ``loss_mask`` as a *response-only*
@@ -897,10 +1116,8 @@ class MegatronLiteEngine(BaseEngine):
     def _r3_replay_mask_for_packing(
         micro_batch: TensorDict, input_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Build the R3 mask while inputs are still jagged."""
-        return router_replay.build_r3_replay_mask(
-            input_ids, micro_batch["response_mask"]
-        )
+        """Reuse VERL's canonical R3 semantics while inputs are still jagged."""
+        return router_replay.build_r3_replay_mask(input_ids, micro_batch["response_mask"])
 
     def _build_verl_model_output(
         self,
@@ -924,8 +1141,6 @@ class MegatronLiteEngine(BaseEngine):
         return output
 
     def _make_runtime_loss_fn(self, loss_function, num_microbatches: int, output_lst=None):
-        loss_fn_ref = None
-
         def _loss_fn(
             raw_output: dict[str, torch.Tensor],
             runtime_batch: PackedBatch,
@@ -954,10 +1169,7 @@ class MegatronLiteEngine(BaseEngine):
                 )
 
             raw_output["_verl_metrics"] = metrics
-            assert loss_fn_ref is not None
-            if output_lst is not None and not getattr(
-                loss_fn_ref(), "runtime_collects_outputs", False
-            ):
+            if output_lst is not None:
                 output_lst.append(
                     {
                         "model_output": model_output,
@@ -967,14 +1179,6 @@ class MegatronLiteEngine(BaseEngine):
                 )
             return (loss * num_microbatches if loss_function is not None else loss), metrics
 
-        # Avoid a strong self-reference while preserving the runtime hook attributes.
-        loss_fn_ref = weakref.ref(_loss_fn)
-        _loss_fn.runtime_output_collector = output_lst
-        _loss_fn.runtime_output_extractor = lambda output: output["_verl_model_output"]
-        # The static collector records ``loss`` before this hook applies the
-        # microbatch multiplier used for backward.  Runtime sidecars must report
-        # that same application-level value even when they reschedule batches.
-        _loss_fn.runtime_output_loss_scale = 1 / num_microbatches
         return _loss_fn
 
     def _mtp_enable_train(self) -> bool:
@@ -987,9 +1191,9 @@ class MegatronLiteEngine(BaseEngine):
 
     def _reduce_mtp_metric(self, mtp_loss: torch.Tensor) -> torch.Tensor:
         mtp_loss = mtp_loss.detach().float().clone()
-        metric_group = self.handle.metric_group
-        if dist.is_initialized() and metric_group is not None:
-            dist.all_reduce(mtp_loss, op=dist.ReduceOp.AVG, group=metric_group)
+        dp_group = self.get_data_parallel_group()
+        if dist.is_initialized() and dp_group is not None:
+            dist.all_reduce(mtp_loss, op=dist.ReduceOp.AVG, group=dp_group)
         return mtp_loss
 
     @staticmethod

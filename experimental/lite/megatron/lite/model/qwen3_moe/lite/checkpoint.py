@@ -9,6 +9,8 @@ model-specific: the weight map and tensor conversions.
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
+from megatron.lite.model.qwen3_moe.common import decode_bank_surface
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.ckpt.dcp import (  # noqa: F401 — re-export
     canonicalize_fc1_for_dcp,
@@ -133,6 +135,17 @@ class Qwen3MoEWeightSpec:
                     f"{mp}.experts.{e}.down_proj.weight"
                 ]
         return wm
+
+    def load_weight_map(
+        self, base_model: nn.Module, ps, logical_state_keys: tuple[str, ...]
+    ) -> dict[str, list[str]]:
+        """Exclude the optional standalone MTP embedding when it is absent."""
+
+        del base_model, ps
+        weight_map = self.weight_map()
+        if "mtp_embed.embedding.weight" not in logical_state_keys:
+            weight_map.pop("mtp_embed.embedding.weight", None)
+        return weight_map
 
     def hf_to_native(
         self, native_name: str, hf_tensors: list[torch.Tensor]
@@ -276,11 +289,7 @@ def export_hf_weights(model, config: Qwen3MoEConfig, ps, **kwargs):
     target = kwargs.pop("target", "hf")
     resync_config = kwargs.pop("resync_config", None)
     weights = _export(
-        model,
-        Qwen3MoEWeightSpec(config),
-        ps,
-        vocab_size=config.vocab_size,
-        **kwargs,
+        model, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size, **kwargs
     )
     if target in {"hf", ResyncFormat.BF16.value}:
         if resync_config:
@@ -319,6 +328,34 @@ def _export_mxfp4_weights(weights):
         yield f"{name[:-7]}.weight_scale", scale.view(torch.uint8)
 
 
+def export_hf_lora_adapter(model, config: Qwen3MoEConfig, ps, **kwargs):
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        export_hf_lora_adapter as _export_adapter,
+    )
+
+    registry = kwargs.pop("multi_lora_registry", None)
+    name = kwargs.pop("multi_lora_name", None)
+    if registry is not None:
+        if name is None:
+            raise ValueError("multi_lora_registry export requires multi_lora_name.")
+        # The named-bank path intentionally enters at the same HF boundary as
+        # attached LoRA: it cannot bypass TP/EP placement, WeightSpec mapping,
+        # or the consumer-scale compensation.
+        yield from registry.export_hf_state(
+            name,
+            Qwen3MoEWeightSpec(config),
+            ps,
+            export_dtype=kwargs.pop("export_dtype", None),
+        ).items()
+        if kwargs:
+            raise TypeError(
+                f"Unexpected named multi-LoRA export arguments: {sorted(kwargs)}"
+            )
+        return
+
+    yield from _export_adapter(model, Qwen3MoEWeightSpec(config), ps, **kwargs)
+
+
 def save_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import save_hf_weights as _save
 
@@ -326,10 +363,25 @@ def save_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
+    if decode_bank_surface(name) is not None:
+        return False
     return "experts" in name and "router" not in name
 
 
 def PLACEMENT_FN(param_name: str) -> list:
+    if (surface := decode_bank_surface(param_name)) is not None:
+        factor = param_name.rsplit("_", 1)[-1]
+        if ".attn.qkv." in surface:
+            return [Replicate(), Replicate(), Replicate(), Shard(1)]
+        if ".attn.proj." in surface:
+            return [
+                Replicate(),
+                Replicate(),
+                Replicate(),
+                Shard(2 if factor == "a" else 1),
+            ]
+        # FC banks are shared adapter tensors, not native expert weights.
+        return [Replicate(), Replicate(), Replicate(), Replicate()]
     if "experts" in param_name and "router" not in param_name:
         if "fc1" in param_name:
             return [Replicate(), Replicate(), Shard(0), Shard(0)]

@@ -6,19 +6,23 @@ defines the model-specific composition (Layer stacking, PP layout,
 loss computation).
 """
 
+# isort: off
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
-
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+from megatron.lite.model.qwen3_moe.lite.multi_lora import (
+    MoELoraSidecar,
+    apply_dense_lora_delta,
+)
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.gqa import GQAttention
-from megatron.lite.primitive.modules.lora import LoraConfig
 from megatron.lite.primitive.modules.router import TopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
@@ -35,6 +39,29 @@ from megatron.lite.primitive.parallel import (
 )
 from megatron.lite.primitive.utils import build_fp8_recipe
 
+
+def _local_moe_lora_indices(
+    lora_indices: torch.Tensor, *, local_rows: int, tp_size: int, tp_rank: int
+) -> torch.Tensor:
+    """Normalize logical SP slots to the local MoE row order."""
+    if lora_indices.numel() == local_rows:
+        return lora_indices
+    if tp_size > 1 and lora_indices.numel() == local_rows * tp_size:
+        # SP scatter uses contiguous TP chunks; MoE must slice that same axis.
+        return lora_indices.chunk(tp_size)[tp_rank]
+    raise ValueError("MoE multi-LoRA indices must describe local or TP-global rows.")
+
+
+# isort: on
+
+
+def _sidecar_ep_sync_group(ps, sidecar: MoELoraSidecar):
+    """Return the sole explicit EP reduction owner for an external sidecar."""
+    if sidecar.requires_explicit_ep_sync and ps.ep_size > 1:
+        return ps.ep_group
+    return None
+
+
 # ---------------------------------------------------------------------------
 # MoE Layer (thin assembly over megatron.lite.primitive.modules)
 # ---------------------------------------------------------------------------
@@ -50,36 +77,78 @@ class MoELayer(nn.Module):
         router_bias_rate: float = 0.0,
         fp8: bool = False,
         moe_act_recompute: bool = False,
-        lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
         # Match Qwen3-MoE's `load_balancing_type="none"` setting: no aux loss.
         self.router = TopKRouter(
             config, ps, router_bias_rate=router_bias_rate, compute_aux_loss=False
         )
-        self.experts = Experts(
-            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute, lora_config=lora_config
-        )
+        self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
         self.dispatcher = TokenDispatcher(
             config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
         )
+        self.ps = ps
+        self._use_deepep_requested = use_deepep
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, *, multi_lora_sidecar: MoELoraSidecar | None = None
+    ) -> torch.Tensor:
         input_shape = x.shape
         if x.dim() == 3:
             x_2d = x.view(-1, x.size(-1))
         else:
             x_2d = x
 
+        fc1_delta = None
+        if multi_lora_sidecar is not None:
+            if self.ps.etp_size != 1:
+                raise RuntimeError("multi-LoRA MoE sidecars do not support ETP.")
+            if self._use_deepep_requested:
+                raise RuntimeError("multi-LoRA MoE sidecars do not support DeepEP.")
+            lora_indices = _local_moe_lora_indices(
+                multi_lora_sidecar.lora_indices,
+                local_rows=x_2d.shape[0],
+                tp_size=self.ps.tp_size,
+                tp_rank=self.ps.tp_rank,
+            )
+            fc1_delta = apply_dense_lora_delta(
+                multi_lora_sidecar.fc1,
+                x_2d,
+                lora_indices,
+                scale=multi_lora_sidecar.scale,
+                gradient_sync_group=_sidecar_ep_sync_group(self.ps, multi_lora_sidecar),
+            )
+
         scores, indices = self.router(x_2d)
-        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_2d, scores, indices)
+        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(
+            x_2d, scores, indices
+        )
         del scores, indices
+        routed_fc1_delta = None
+        routed_lora_indices = None
+        if multi_lora_sidecar is not None:
+            assert fc1_delta is not None
+            routed_fc1_delta = self.dispatcher.dispatch_sidecar(fc1_delta)
+            routed_lora_indices = self.dispatcher.dispatch_sidecar(lora_indices)
         self.dispatcher.wait_dispatch_event()
+
+        def _fc2_delta(h: torch.Tensor) -> torch.Tensor:
+            assert multi_lora_sidecar is not None and routed_lora_indices is not None
+            return apply_dense_lora_delta(
+                multi_lora_sidecar.fc2,
+                h,
+                routed_lora_indices,
+                scale=multi_lora_sidecar.scale,
+                gradient_sync_group=_sidecar_ep_sync_group(self.ps, multi_lora_sidecar),
+            )
+
         expert_out = self.experts(
             dispatched,
             tpe,
             permuted_probs,
             tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
+            fc1_delta=routed_fc1_delta,
+            fc2_delta_fn=_fc2_delta if multi_lora_sidecar is not None else None,
         )
         del dispatched, tpe, permuted_probs
         combined = self.dispatcher.combine(expert_out)
@@ -125,7 +194,6 @@ class TransformerLayer(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         use_thd: bool = False,
-        lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -145,7 +213,6 @@ class TransformerLayer(nn.Module):
             rope_theta=config.rope_theta,
             use_thd=use_thd,
             qkv_layout="mcore",
-            lora_config=lora_config,
         )
         self.mlp_norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.moe = MoELayer(
@@ -155,19 +222,27 @@ class TransformerLayer(nn.Module):
             router_bias_rate=router_bias_rate,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
-            lora_config=lora_config,
         )
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        multi_lora_sidecar: MoELoraSidecar | None = None,
     ) -> torch.Tensor:
         residual = x
-        h = self.attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
+        h = self.attn(
+            x,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            multi_lora_sidecar=multi_lora_sidecar,
+        )
         x = residual + h
 
         residual = x
         h = self.mlp_norm(x)
-        moe_out = self.moe(h)
+        moe_out = self.moe(h, multi_lora_sidecar=multi_lora_sidecar)
         x = residual + moe_out
 
         return x
@@ -186,7 +261,9 @@ class MTPLossAutoScaler(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (mtp_loss,) = ctx.saved_tensors
-        scaled_mtp_grad = torch.ones_like(mtp_loss) * MTPLossAutoScaler.main_loss_backward_scale
+        scaled_mtp_grad = (
+            torch.ones_like(mtp_loss) * MTPLossAutoScaler.main_loss_backward_scale
+        )
         return grad_output, scaled_mtp_grad
 
     @staticmethod
@@ -212,7 +289,6 @@ class MultiTokenPredictionLayer(nn.Module):
         moe_act_recompute: bool,
         use_thd: bool,
         detach_encoder: bool,
-        lora_config: LoraConfig | dict | None,
     ):
         super().__init__()
         self.ps = ps
@@ -221,7 +297,11 @@ class MultiTokenPredictionLayer(nn.Module):
         self.enorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = VanillaColumnParallelLinear(
-            config.hidden_size * 2, config.hidden_size, ps, sp=ps.tp_size > 1, gather_output=True
+            config.hidden_size * 2,
+            config.hidden_size,
+            ps,
+            sp=ps.tp_size > 1,
+            gather_output=True,
         )
         self.transformer_layer = TransformerLayer(
             config,
@@ -232,7 +312,6 @@ class MultiTokenPredictionLayer(nn.Module):
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
             use_thd=use_thd,
-            lora_config=lora_config,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -248,7 +327,9 @@ class MultiTokenPredictionLayer(nn.Module):
         attention_position_ids = (
             rotary_position_ids if rotary_position_ids is not None else position_ids
         )
-        input_ids, _ = roll_packed_thd_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
+        input_ids, _ = roll_packed_thd_left(
+            input_ids, packed_seq_params=packed_seq_params, dims=-1
+        )
         if position_ids is not None:
             position_ids, _ = roll_packed_thd_left(
                 position_ids, packed_seq_params=packed_seq_params, dims=-1
@@ -266,7 +347,9 @@ class MultiTokenPredictionLayer(nn.Module):
         hidden_states = self.eh_proj(hidden_states)
         hidden_states = scatter_to_sequence_parallel(hidden_states, self.ps)
         hidden_states = self.transformer_layer(
-            hidden_states, position_ids=attention_position_ids, packed_seq_params=packed_seq_params
+            hidden_states,
+            position_ids=attention_position_ids,
+            packed_seq_params=packed_seq_params,
         )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids
@@ -286,7 +369,6 @@ class MultiTokenPredictionBlock(nn.Module):
         use_thd: bool,
         detach_encoder: bool,
         repeated_layer: bool,
-        lora_config: LoraConfig | dict | None,
     ):
         super().__init__()
         self.num_layers = config.num_nextn_predict_layers
@@ -305,7 +387,6 @@ class MultiTokenPredictionBlock(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     detach_encoder=detach_encoder,
-                    lora_config=lora_config,
                 )
                 for idx in range(layers_to_build)
             ]
@@ -360,7 +441,6 @@ class Qwen3MoEModel(nn.Module):
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
-        lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
         self.config = config
@@ -369,7 +449,9 @@ class Qwen3MoEModel(nn.Module):
         self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self._input_tensor: torch.Tensor | None = None
-        layout = build_pipeline_chunk_layout(config.num_hidden_layers, ps, vpp, vpp_chunk_id)
+        layout = build_pipeline_chunk_layout(
+            config.num_hidden_layers, ps, vpp, vpp_chunk_id
+        )
         self.layer_indices = layout.layer_indices
         has_embed = layout.has_embed
         has_head = layout.has_head
@@ -379,7 +461,9 @@ class Qwen3MoEModel(nn.Module):
 
         self.embed: VocabParallelEmbedding | None = None
         if has_embed:
-            self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+            self.embed = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, ps
+            )
 
         _recompute = recompute_modules or []
         moe_act_recompute = "moe_act" in _recompute and "moe" not in _recompute
@@ -394,7 +478,6 @@ class Qwen3MoEModel(nn.Module):
                     fp8=fp8,
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
-                    lora_config=lora_config,
                 )
                 for idx in self.layer_indices
             ]
@@ -411,7 +494,9 @@ class Qwen3MoEModel(nn.Module):
         if mtp_enable and config.num_nextn_predict_layers > 0 and self.head is not None:
             mtp_embedding = self.embed
             if mtp_embedding is None:
-                mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
+                mtp_embedding = VocabParallelEmbedding(
+                    config.vocab_size, config.hidden_size, ps
+                )
                 self.mtp_embed = mtp_embedding
             self.mtp = MultiTokenPredictionBlock(
                 config,
@@ -424,7 +509,6 @@ class Qwen3MoEModel(nn.Module):
                 use_thd=use_thd,
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
-                lora_config=lora_config,
             )
 
         self.sp_params: list[nn.Parameter] = []
@@ -434,7 +518,9 @@ class Qwen3MoEModel(nn.Module):
     def set_input_tensor(self, input_tensor):
         if isinstance(input_tensor, list):
             if len(input_tensor) > 1:
-                raise ValueError("Qwen3MoEModel expects a single pipeline input tensor.")
+                raise ValueError(
+                    "Qwen3MoEModel expects a single pipeline input tensor."
+                )
             input_tensor = input_tensor[0] if input_tensor else None
         self._input_tensor = input_tensor
 
@@ -450,6 +536,7 @@ class Qwen3MoEModel(nn.Module):
         use_fused_kernels: bool = False,
         calculate_entropy: bool = False,
         return_log_probs: bool = True,
+        multi_lora_sidecars: Mapping[int, MoELoraSidecar] | None = None,
     ) -> dict:
         if self.embed is not None:
             assert input_ids is not None
@@ -470,7 +557,16 @@ class Qwen3MoEModel(nn.Module):
             if self.embed is not None:
                 h = scatter_to_sequence_parallel(h, self.ps)
             for layer in self.layers:
-                h = layer(h, position_ids=position_ids, packed_seq_params=packed_seq_params)
+                h = layer(
+                    h,
+                    position_ids=position_ids,
+                    packed_seq_params=packed_seq_params,
+                    multi_lora_sidecar=(
+                        None
+                        if multi_lora_sidecars is None
+                        else multi_lora_sidecars.get(layer.layer_idx)
+                    ),
+                )
             # Head path is SP-aware: norm runs on SP-sharded [S/tp, B, H] and
             # head's internal all-gather happens inside VocabParallelOutput.
             # Mirrors MC GPTModel's final_layernorm → output_layer(sp=True).
@@ -497,7 +593,9 @@ class Qwen3MoEModel(nn.Module):
                     output["mtp_loss"] = mtp_loss
                 labels_sb = labels.transpose(0, 1).contiguous()
                 if use_fused_kernels:
-                    hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
+                    hidden_full = gather_from_sequence_parallel(
+                        hidden_for_head, self.ps
+                    )
                     log_probs, entropy = linear_cross_entropy(
                         hidden_full,
                         self._head_weight_for_fused_ce(hidden_full),
@@ -515,7 +613,9 @@ class Qwen3MoEModel(nn.Module):
                     logits = self.head(hidden_for_head)
                     if temperature_value != 1.0:
                         logits = logits / temperature_value
-                    token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                    token_loss = vocab_parallel_cross_entropy(
+                        logits, labels_sb, self.ps.tp_group
+                    )
                     output["loss"] = token_loss.mean()
                     if return_log_probs:
                         output["log_probs"] = (-token_loss).transpose(0, 1).contiguous()
@@ -586,12 +686,16 @@ class Qwen3MoEModel(nn.Module):
                 logits = self.head(mtp_hidden)
                 if temperature != 1.0:
                     logits = logits / temperature
-                token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                token_loss = vocab_parallel_cross_entropy(
+                    logits, labels_sb, self.ps.tp_group
+                )
             token_loss = token_loss * mask_sb.to(dtype=token_loss.dtype)
             num_tokens = num_tokens.to(dtype=token_loss.dtype).clamp_min(1.0)
             mtp_loss_values.append(token_loss.sum() / num_tokens)
 
-            mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
+            mtp_loss_scale = self.mtp_loss_scaling_factor / max(
+                len(mtp_hidden_states), 1
+            )
             hidden_states = MTPLossAutoScaler.apply(
                 hidden_states, mtp_loss_scale * token_loss / num_tokens
             )

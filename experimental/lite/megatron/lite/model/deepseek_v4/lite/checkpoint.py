@@ -421,6 +421,16 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
         yield from weights
 
 
+def export_hf_lora_adapter(
+    model, config: DeepseekV4Config, ps: ParallelState, **kwargs
+):
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        export_hf_lora_adapter as _export_adapter,
+    )
+
+    yield from _export_adapter(model, DeepseekV4WeightSpec(config), ps, **kwargs)
+
+
 def save_hf_weights(
     model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs
 ) -> None:

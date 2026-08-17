@@ -1,18 +1,22 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """MoE expert compute: SwiGLU fusions, _AllReduceETP, and Experts."""
 
+# isort: off
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive import transformer_engine as te
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.lite.primitive.kernels.swiglu import (
+    bias_swiglu_impl,
+    weighted_bias_swiglu_impl,
+)
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     SharedGroupedLinearLoRA,
@@ -22,12 +26,17 @@ from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.recompute import CheckpointWithoutOutput
 from megatron.lite.primitive.utils import ensure_divisible
 
+# isort: on
+
 __all__ = ["Experts", "_AllReduceETP"]
 
 
 @contextmanager
 def _expert_nvtx_range(name: str):
-    if os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1" or not torch.cuda.is_available():
+    if (
+        os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1"
+        or not torch.cuda.is_available()
+    ):
         yield
         return
     torch.cuda.nvtx.range_push(name)
@@ -69,7 +78,6 @@ class _AllReduceETP(torch.autograd.Function):
 
 
 class Experts(nn.Module):
-
     def __init__(
         self,
         config: Any,
@@ -77,7 +85,6 @@ class Experts(nn.Module):
         *,
         fp8: bool = False,
         moe_act_recompute: bool = False,
-        lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
@@ -85,6 +92,7 @@ class Experts(nn.Module):
         self.moe_act_recompute = moe_act_recompute
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
+
         self.fc1 = te.GroupedLinear(
             self.num_local_experts,
             config.hidden_size,
@@ -99,32 +107,9 @@ class Experts(nn.Module):
             bias=False,
             params_dtype=torch.bfloat16,
         )
-        lora = normalize_lora_config(lora_config)
-        self.fc1_lora: SharedGroupedLinearLoRA | None = None
-        self.fc2_lora: SharedGroupedLinearLoRA | None = None
-        if lora.enabled and lora.targets_module("linear_fc1"):
-            self.fc1_lora = SharedGroupedLinearLoRA(
-                self.num_local_experts,
-                config.hidden_size,
-                config.moe_intermediate_size * 2 // ps.etp_size,
-                lora.rank,
-                alpha=lora.alpha,
-                dropout=lora.dropout,
-            )
-        if lora.enabled and lora.targets_module("linear_fc2"):
-            self.fc2_lora = SharedGroupedLinearLoRA(
-                self.num_local_experts,
-                config.moe_intermediate_size // ps.etp_size,
-                config.hidden_size,
-                lora.rank,
-                alpha=lora.alpha,
-                dropout=lora.dropout,
-            )
         if ps.tp_size > 1 and ps.ep_size == 1 and ps.etp_size == 1:
             tp_group = ps.tp_group
-            for module in (self.fc1, self.fc2, self.fc1_lora, self.fc2_lora):
-                if module is None:
-                    continue
+            for module in (self.fc1, self.fc2):
                 for param in module.parameters():
 
                     def _ar(grad, g=tp_group):
@@ -139,6 +124,8 @@ class Experts(nn.Module):
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor | None = None,
         tokens_per_expert_list: list[int] | None = None,
+        fc1_delta: torch.Tensor | None = None,
+        fc2_delta_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         m_splits = (
             tokens_per_expert.tolist()
@@ -147,7 +134,9 @@ class Experts(nn.Module):
         )
         pad_mask = None
         if self.fp8:
-            x, permuted_probs, m_splits, pad_mask = self._fp8_pad(x, permuted_probs, m_splits)
+            x, permuted_probs, m_splits, pad_mask = self._fp8_pad(
+                x, permuted_probs, m_splits
+            )
 
         etp_real_len = x.shape[0]
         if self.etp_group is not None:
@@ -159,7 +148,10 @@ class Experts(nn.Module):
                     [
                         x,
                         torch.zeros(
-                            max_len - etp_real_len, x.shape[1], dtype=x.dtype, device=x.device
+                            max_len - etp_real_len,
+                            x.shape[1],
+                            dtype=x.dtype,
+                            device=x.device,
                         ),
                     ],
                     dim=0,
@@ -169,7 +161,9 @@ class Experts(nn.Module):
                         [
                             permuted_probs,
                             torch.zeros(
-                                max_len - etp_real_len, dtype=permuted_probs.dtype, device=x.device
+                                max_len - etp_real_len,
+                                dtype=permuted_probs.dtype,
+                                device=x.device,
                             ),
                         ],
                         dim=0,
@@ -178,25 +172,39 @@ class Experts(nn.Module):
                 m_splits[-1] += max_len - etp_real_len
 
         probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
+        if fc1_delta is not None and fc1_delta.shape[0] != x.shape[0]:
+            raise ValueError("fc1_delta must have one row per routed token.")
         with _expert_nvtx_range("ep_experts.forward"):
             if self.moe_act_recompute and probs is not None:
                 act_ckpt = CheckpointWithoutOutput(preserve_rng_state=True)
                 fc1_out = self.fc1(x, m_splits)
-                if self.fc1_lora is not None:
-                    fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs, self.swiglu_limit)
+                if fc1_delta is not None:
+                    if fc1_delta.shape != fc1_out.shape:
+                        raise ValueError(
+                            "fc1_delta must match the grouped fc1 output shape."
+                        )
+                    fc1_out = fc1_out + fc1_delta
+                h = act_ckpt.checkpoint(
+                    swiglu_with_probs, fc1_out, probs, self.swiglu_limit
+                )
+                fc2_delta = fc2_delta_fn(h) if fc2_delta_fn is not None else None
                 out = self.fc2(h, m_splits)
-                if self.fc2_lora is not None:
-                    out = out + self.fc2_lora(h, m_splits)
+                if fc2_delta is not None:
+                    out = out + fc2_delta
                 act_ckpt.discard_output_and_register_recompute(out)
             else:
                 fc1_out = self.fc1(x, m_splits)
-                if self.fc1_lora is not None:
-                    fc1_out = fc1_out + self.fc1_lora(x, m_splits)
+                if fc1_delta is not None:
+                    if fc1_delta.shape != fc1_out.shape:
+                        raise ValueError(
+                            "fc1_delta must match the grouped fc1 output shape."
+                        )
+                    fc1_out = fc1_out + fc1_delta
                 h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
+                fc2_delta = fc2_delta_fn(h) if fc2_delta_fn is not None else None
                 out = self.fc2(h, m_splits)
-                if self.fc2_lora is not None:
-                    out = out + self.fc2_lora(h, m_splits)
+                if fc2_delta is not None:
+                    out = out + fc2_delta
 
         if self.etp_group is not None:
             out = _AllReduceETP.apply(out, self.etp_group)
@@ -217,13 +225,17 @@ class Experts(nn.Module):
         mask = torch.zeros(total_padded, dtype=torch.bool, device=device)
         probs_pad = None
         if permuted_probs is not None:
-            probs_pad = torch.zeros(total_padded, device=device, dtype=permuted_probs.dtype)
+            probs_pad = torch.zeros(
+                total_padded, device=device, dtype=permuted_probs.dtype
+            )
         src_off, dst_off = 0, 0
         for real, pad in zip(m_splits, padded, strict=True):
             x_pad[dst_off : dst_off + real] = x[src_off : src_off + real]
             mask[dst_off : dst_off + real] = True
             if probs_pad is not None:
-                probs_pad[dst_off : dst_off + real] = permuted_probs[src_off : src_off + real]
+                probs_pad[dst_off : dst_off + real] = permuted_probs[
+                    src_off : src_off + real
+                ]
             src_off += real
             dst_off += pad
         return x_pad, probs_pad, padded, mask

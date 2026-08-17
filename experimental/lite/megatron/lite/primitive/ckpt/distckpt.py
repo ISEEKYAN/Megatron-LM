@@ -15,6 +15,11 @@ import torch.nn as nn
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.ckpt.identity import (
+    IDENTITY_STATE_KEY,
+    model_checkpoint_identity_metadata,
+    require_checkpoint_identity_match,
+)
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
     PlacementFn,
@@ -46,10 +51,14 @@ def attach_model_sharded_state_dict(
         chunk._mlite_dist_opt_parallel_state = ps  # type: ignore[attr-defined]
 
 
-def supports_dist_opt_distckpt(model: nn.Module | Iterable[nn.Module], optimizer: Any) -> bool:
+def supports_dist_opt_distckpt(
+    model: nn.Module | Iterable[nn.Module], optimizer: Any
+) -> bool:
     """Return whether this model/optimizer pair can use mcore dist_checkpointing."""
 
-    if optimizer is not None and not callable(getattr(optimizer, "sharded_state_dict", None)):
+    if optimizer is not None and not callable(
+        getattr(optimizer, "sharded_state_dict", None)
+    ):
         return False
     return all(
         bool(getattr(chunk, "_mlite_dist_opt_sharded_state_dict", False))
@@ -75,9 +84,14 @@ def save_dist_opt_checkpoint(
     state_dict: dict[str, Any] = {"step": int(step)}
     if save_model:
         state_dict.update(model_sd)
+        identity = model_checkpoint_identity_metadata(model)
+        if identity:
+            state_dict[IDENTITY_STATE_KEY] = identity
     if save_optimizer and optimizer is not None:
         _synchronize_native_optimizer_steps(optimizer)
-        patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=step)
+        patches = _patch_empty_native_optimizer_state_dicts(
+            optimizer, fallback_step=step
+        )
         try:
             state_dict["optimizer"] = optimizer.sharded_state_dict(
                 _single_or_all_model_state(model_sd), metadata=metadata
@@ -107,6 +121,9 @@ def load_dist_opt_checkpoint(
     load_sd: dict[str, Any] = {"step": 0}
     if load_model:
         load_sd.update(model_sd)
+        identity = model_checkpoint_identity_metadata(model)
+        if identity:
+            load_sd[IDENTITY_STATE_KEY] = None
     if load_optimizer and optimizer is not None:
         patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=0)
         try:
@@ -132,6 +149,8 @@ def load_dist_opt_checkpoint(
     finally:
         torch.load = _orig_torch_load
     if load_model:
+        if identity:
+            require_checkpoint_identity_match(model, state_dict.get(IDENTITY_STATE_KEY))
         _load_model_state_dict(model, state_dict)
     if load_optimizer and optimizer is not None and "optimizer" in state_dict:
         load_patches = _patch_native_optimizer_step_load(optimizer)
@@ -180,7 +199,9 @@ def _patch_empty_native_optimizer_state_dicts(
         original_state_dict = dist_opt.state_dict
 
         def patched_state_dict(
-            original_state_dict=original_state_dict, dist_opt=dist_opt, fallback_step=fallback_step
+            original_state_dict=original_state_dict,
+            dist_opt=dist_opt,
+            fallback_step=fallback_step,
         ):
             try:
                 return original_state_dict()
@@ -203,9 +224,14 @@ def _patch_native_optimizer_step_load(optimizer: Any) -> list[tuple[Any, Any]]:
         original_set_state = dist_opt._set_main_param_and_optimizer_states
 
         def patched_set_state(
-            model_param, tensors, dist_opt=dist_opt, original_set_state=original_set_state
+            model_param,
+            tensors,
+            dist_opt=dist_opt,
+            original_set_state=original_set_state,
         ):
-            removed_step = _pop_optimizer_step_for_model_param(dist_opt, model_param, tensors)
+            removed_step = _pop_optimizer_step_for_model_param(
+                dist_opt, model_param, tensors
+            )
             try:
                 return original_set_state(model_param, tensors)
             finally:
@@ -267,11 +293,17 @@ def _dist_opt_checkpoint_metadata(optimizer: Any) -> dict[str, Any]:
     dist_opts = tuple(_iter_distributed_optimizers(optimizer))
     return {
         **_DISTOPT_METADATA,
-        "distrib_optim_fully_reshardable_mem_efficient": bool(dist_opts) and all(getattr(opt, "data_parallel_group_gloo", None) is not None for opt in dist_opts),
+        "distrib_optim_fully_reshardable_mem_efficient": bool(dist_opts)
+        and all(
+            getattr(opt, "data_parallel_group_gloo", None) is not None
+            for opt in dist_opts
+        ),
     }
 
 
-def _iter_optimizer_children(obj: Any, *, known_inner: Any | None = None) -> Iterable[Any]:
+def _iter_optimizer_children(
+    obj: Any, *, known_inner: Any | None = None
+) -> Iterable[Any]:
     chained = getattr(obj, "chained_optimizers", None)
     if isinstance(chained, Iterable):
         yield from chained
@@ -294,7 +326,9 @@ def _safe_inner_optimizer(obj: Any) -> Any | None:
     return getattr(obj, "optimizer", None)
 
 
-def _empty_native_optimizer_state_dict(dist_opt: Any, fallback_step: int) -> dict[str, Any]:
+def _empty_native_optimizer_state_dict(
+    dist_opt: Any, fallback_step: int
+) -> dict[str, Any]:
     inner_state_dict = dist_opt.optimizer.state_dict()
     optimizer_state = {
         key: ([group.copy() for group in value] if key == "param_groups" else value)
@@ -398,7 +432,9 @@ def _make_sharded_tensor(
     expert: bool,
     sharded_offsets: tuple[tuple[int, int, int], ...] = (),
 ) -> ShardedTensor:
-    rank_offsets, replica_id = _rank_offsets_and_replica_id(placements, ps, expert=expert)
+    rank_offsets, replica_id = _rank_offsets_and_replica_id(
+        placements, ps, expert=expert
+    )
     return ShardedTensor.from_rank_offsets(
         key, tensor, *sharded_offsets, *rank_offsets, replica_id=replica_id
     )
@@ -413,14 +449,20 @@ def _rank_offsets_and_replica_id(
         if _is_shard_placement(placement):
             dim = _shard_dim(placement)
             if dim is None:
-                raise ValueError(f"Unsupported Shard placement without dim: {placement!r}.")
+                raise ValueError(
+                    f"Unsupported Shard placement without dim: {placement!r}."
+                )
             prev_rank, prev_size = axis_fragments.get(dim, (0, 1))
             axis_fragments[dim] = (prev_rank * size + rank, prev_size * size)
-    rank_offsets = tuple((dim, rank, size) for dim, (rank, size) in axis_fragments.items())
+    rank_offsets = tuple(
+        (dim, rank, size) for dim, (rank, size) in axis_fragments.items()
+    )
     return rank_offsets, _replica_id(placements, ps, expert=expert)
 
 
-def _replica_id(placements: list, ps: ParallelState, *, expert: bool) -> tuple[int, int, int]:
+def _replica_id(
+    placements: list, ps: ParallelState, *, expert: bool
+) -> tuple[int, int, int]:
     # PP stages own different parameters. They are not replicas of one
     # another, so PP rank must not make a shard non-main.
     if expert:
@@ -445,7 +487,9 @@ def _placement_is_sharded(placements: list, axis: int) -> bool:
     return axis < len(placements) and _is_shard_placement(placements[axis])
 
 
-def _mesh_ranks_and_sizes(ps: ParallelState, *, expert: bool) -> tuple[list[int], list[int]]:
+def _mesh_ranks_and_sizes(
+    ps: ParallelState, *, expert: bool
+) -> tuple[list[int], list[int]]:
     if expert:
         return (
             [ps.pp_rank, ps.expert_dp_rank, ps.ep_rank, ps.etp_rank],
@@ -490,7 +534,9 @@ def _model_chunk_key(ps: ParallelState | None, idx: int, num_chunks: int) -> str
     return f"model{idx}"
 
 
-def _model_chunk_sharded_key_prefix(ps: ParallelState | None, idx: int, num_chunks: int) -> str:
+def _model_chunk_sharded_key_prefix(
+    ps: ParallelState | None, idx: int, num_chunks: int
+) -> str:
     if ps is None and num_chunks == 1:
         return ""
     if ps is not None and ps.pp_size <= 1 and num_chunks == 1:
@@ -498,7 +544,9 @@ def _model_chunk_sharded_key_prefix(ps: ParallelState | None, idx: int, num_chun
     return f"{_model_chunk_key(ps, idx, num_chunks)}."
 
 
-def _chunk_sharded_state_dict(chunk: nn.Module, sharded_key_prefix: str) -> dict[str, Any]:
+def _chunk_sharded_state_dict(
+    chunk: nn.Module, sharded_key_prefix: str
+) -> dict[str, Any]:
     chunk_sd = chunk.sharded_state_dict()  # type: ignore[attr-defined]
     if not sharded_key_prefix:
         return chunk_sd

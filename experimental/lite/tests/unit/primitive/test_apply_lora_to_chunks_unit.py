@@ -1,0 +1,586 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""CPU unit tests for apply_lora_to_chunks post-build applicator."""
+
+from __future__ import annotations
+
+import copy
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn as nn
+import torch.nn.utils.parametrize as parametrize
+from megatron.lite.primitive.modules.lora import (
+    LinearLoRA,
+    LoraSpec,
+    _weight_owner,
+    normalize_lora_spec,
+)
+from megatron.lite.primitive.modules.lora_apply import (
+    LoRAWrappedLinear,
+    apply_lora_to_chunks,
+)
+
+pytestmark = pytest.mark.mlite
+
+
+@pytest.fixture(autouse=True)
+def _te_stub(transformer_engine_import_stub):
+    transformer_engine_import_stub()
+
+
+@pytest.fixture(autouse=True)
+def _disable_torch_compile():
+    import torch._dynamo
+
+    prev = torch._dynamo.config.disable
+    torch._dynamo.config.disable = True
+    yield
+    torch._dynamo.config.disable = prev
+
+
+def _swiglu_mlp():
+    from megatron.lite.primitive.modules.mlp import SwiGLUMLP
+
+    return SwiGLUMLP
+
+
+def test_lora_spec_enabled_is_authoritative_not_rank():
+    with pytest.warns(UserWarning, match="requires enabled=True"):
+        assert not normalize_lora_spec({"rank": 8}).enabled
+    assert normalize_lora_spec({"enabled": True, "rank": 4}).enabled
+    assert not normalize_lora_spec({"enabled": False, "rank": 8}).enabled
+
+
+def test_disabled_apply_is_bit_identical():
+    SwiGLUMLP = _swiglu_mlp()
+    mlp = SwiGLUMLP(8, 16)
+    chunk = nn.Module()
+    chunk.mlp = mlp
+    before = copy.deepcopy(chunk.state_dict())
+    stats = apply_lora_to_chunks([chunk], LoraSpec(enabled=False, rank=8))
+    assert stats["attached_modules"] == 0
+    torch.testing.assert_close(chunk.state_dict(), before)
+
+
+def test_apply_wraps_swiglu_and_freezes_base():
+    SwiGLUMLP = _swiglu_mlp()
+    mlp = SwiGLUMLP(8, 16)
+    chunk = nn.Module()
+    chunk.mlp = mlp
+    spec = LoraSpec(enabled=True, rank=2, alpha=4)
+    stats = apply_lora_to_chunks([chunk], spec)
+    assert stats["attached_modules"] == 2
+    assert isinstance(mlp.gate_up, LoRAWrappedLinear)
+    assert isinstance(mlp.down, LoRAWrappedLinear)
+    trainable = [n for n, p in chunk.named_parameters() if p.requires_grad]
+    assert all("lora" in n.lower() for n in trainable)
+    assert stats["trainable_tensors"] > 0
+    assert stats["frozen_tensors"] > 0
+
+
+def test_apply_honors_exact_ignore_path_components():
+    SwiGLUMLP = _swiglu_mlp()
+    chunk = nn.Module()
+    chunk.mlp = SwiGLUMLP(8, 16)
+
+    stats = apply_lora_to_chunks(
+        [chunk],
+        LoraSpec(
+            enabled=True,
+            rank=2,
+            target_modules=("linear_fc1", "linear_fc2"),
+            ignore_patterns=("gate_up",),
+        ),
+    )
+
+    assert not isinstance(chunk.mlp.gate_up, LoRAWrappedLinear)
+    assert isinstance(chunk.mlp.down, LoRAWrappedLinear)
+    assert stats["skipped_ignored"] == 1
+
+
+def test_lora_etp_gt_one_fails_loud_before_mutating_model():
+    SwiGLUMLP = _swiglu_mlp()
+    chunk = nn.Module()
+    chunk.mlp = SwiGLUMLP(8, 16)
+    before = copy.deepcopy(chunk.state_dict())
+    ps = SimpleNamespace(tp_size=1, tp_group=None, ep_size=1, etp_size=2)
+
+    with pytest.raises(NotImplementedError, match="does not support ETP"):
+        apply_lora_to_chunks(
+            [chunk],
+            LoraSpec(enabled=True, rank=2),
+            ps=ps,
+        )
+
+    torch.testing.assert_close(chunk.state_dict(), before)
+
+
+def test_apply_threads_tp_group_to_replicated_expert_adapters():
+    from megatron.lite.primitive.modules.experts import Experts
+    from megatron.lite.primitive.modules.lora_apply import LoRAWrappedGroupedLinear
+
+    class _GroupedSurface(nn.Module):
+        def __init__(self, num_experts, in_features, out_features):
+            super().__init__()
+            for expert_idx in range(num_experts):
+                self.register_parameter(
+                    f"weight{expert_idx}",
+                    nn.Parameter(torch.empty(out_features, in_features)),
+                )
+
+    experts = Experts.__new__(Experts)
+    nn.Module.__init__(experts)
+    experts.num_local_experts = 2
+    experts.fc1 = _GroupedSurface(2, 8, 16)
+    experts.fc2 = _GroupedSurface(2, 4, 8)
+    chunk = nn.Module()
+    chunk.experts = experts
+    tp_group = object()
+    ps = SimpleNamespace(tp_size=2, tp_group=tp_group, ep_size=1, etp_size=1)
+
+    stats = apply_lora_to_chunks(
+        [chunk], LoraSpec(enabled=True, rank=2, target_modules=("linear_fc1",)), ps=ps
+    )
+
+    assert stats["attached_modules"] == 1
+    assert isinstance(experts.fc1, LoRAWrappedGroupedLinear)
+    assert experts.fc1.adapter.tp_group is tp_group
+
+
+def test_qwen_protocol_loads_canonical_weights_before_lora_attach(monkeypatch):
+    """Regression for HF load seeing ``.base.`` names after early LoRA attach."""
+    from megatron.lite.model.qwen3_moe.lite import protocol
+
+    SwiGLUMLP = _swiglu_mlp()
+
+    class _CpuQwenProxy(nn.Module):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].mlp = SwiGLUMLP(8, 16)
+
+        def cuda(self):
+            return self
+
+    monkeypatch.setattr(protocol, "Qwen3MoEModel", _CpuQwenProxy)
+    monkeypatch.setattr(
+        protocol,
+        "init_parallel",
+        lambda _cfg: SimpleNamespace(
+            tp_size=1, ep_size=1, etp_size=1, pp_size=1, cp_size=1
+        ),
+    )
+    monkeypatch.setattr(protocol, "set_cross_entropy_fusion", lambda *_args: None)
+
+    cfg = SimpleNamespace(
+        router_aux_loss_coef=0.0,
+        num_nextn_predict_layers=0,
+        mtp_loss_scaling_factor=0.1,
+    )
+    bundle = protocol.build_model(
+        cfg,
+        impl_cfg=protocol.ImplConfig(
+            optimizer=None,
+            lora={
+                "enabled": True,
+                "rank": 2,
+                "target_modules": ("linear_fc1", "linear_fc2"),
+            },
+        ),
+    )
+    chunk = bundle.chunks[0]
+    mlp = chunk.layers[0].mlp
+
+    # Canonical checkpoint names must still exist at load time.
+    assert not isinstance(mlp.gate_up, LoRAWrappedLinear)
+    checkpoint = {
+        name: torch.full_like(param, 0.25) for name, param in chunk.state_dict().items()
+    }
+    incompatible = chunk.load_state_dict(checkpoint, strict=False)
+    assert incompatible.missing_keys == []
+    assert incompatible.unexpected_keys == []
+
+    x = torch.randn(4, 8, dtype=torch.bfloat16)
+    with torch.no_grad():
+        base_t0 = mlp(x).clone()
+
+    updates = bundle.extras["post_model_load_hook"]()
+    assert updates["extras"]["lora_stats"]["attached_modules"] == 2
+    assert isinstance(mlp.gate_up, LoRAWrappedLinear)
+    assert isinstance(mlp.down, LoRAWrappedLinear)
+    assert torch.count_nonzero(mlp.gate_up.adapter.lora_b) == 0
+    assert torch.count_nonzero(mlp.down.adapter.lora_b) == 0
+    with torch.no_grad():
+        lora_t0 = mlp(x)
+    assert torch.equal(lora_t0, base_t0)
+
+
+def test_tiny_qwen_hf_load_has_full_coverage_before_lora_attach(tmp_path, capsys):
+    from safetensors.torch import save_file
+
+    from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+    from megatron.lite.model.qwen3_moe.lite import protocol
+    from megatron.lite.primitive.modules.experts import Experts
+    from megatron.lite.primitive.modules.gqa import GQAttention
+
+    class _LinearSurface(nn.Module):
+        def __init__(self, in_features, out_features, *, layer_norm=False):
+            super().__init__()
+            self.linear = nn.Module()
+            self.linear.weight = nn.Parameter(torch.empty(out_features, in_features))
+            if layer_norm:
+                self.linear.layer_norm_weight = nn.Parameter(torch.empty(in_features))
+                self.linear.eps = 1e-6
+                self.linear.zero_centered_gamma = False
+                self.linear.return_layernorm_output = False
+                self.linear.return_layernorm_output_gathered = False
+            self.use_sp = False
+
+        def forward(self, x):
+            if hasattr(self.linear, "layer_norm_weight"):
+                return self.forward_with_normalized_input(x)[0]
+            return torch.nn.functional.linear(x, self.linear.weight)
+
+        def forward_with_normalized_input(self, x):
+            normalized = torch.nn.functional.rms_norm(
+                x,
+                (x.shape[-1],),
+                self.linear.layer_norm_weight,
+                self.linear.eps,
+            )
+            return (
+                torch.nn.functional.linear(normalized, self.linear.weight),
+                normalized,
+            )
+
+    class _GroupedSurface(nn.Module):
+        def __init__(self, num_experts, in_features, out_features):
+            super().__init__()
+            for expert_idx in range(num_experts):
+                self.register_parameter(
+                    f"weight{expert_idx}",
+                    nn.Parameter(torch.empty(out_features, in_features)),
+                )
+
+    class _TinyQwenLoadProxy(nn.Module):
+        def __init__(self, cfg, ps):
+            super().__init__()
+            padded_vocab_size = 128
+            self.embed = nn.Module()
+            self.embed.embedding = nn.Embedding(padded_vocab_size, cfg.hidden_size)
+            self.norm = nn.Module()
+            self.norm.weight = nn.Parameter(torch.empty(cfg.hidden_size))
+            self.head = nn.Module()
+            self.head.col = nn.Module()
+            self.head.col.linear = nn.Linear(
+                cfg.hidden_size, padded_vocab_size, bias=False
+            )
+
+            layer = nn.Module()
+            layer.attn = GQAttention.__new__(GQAttention)
+            nn.Module.__init__(layer.attn)
+            layer.attn.ps = ps
+            layer.attn.qkv = _LinearSurface(
+                cfg.hidden_size, cfg.qkv_size, layer_norm=True
+            )
+            layer.attn.proj = _LinearSurface(cfg.hidden_size, cfg.hidden_size)
+            layer.attn.q_norm = nn.Module()
+            layer.attn.q_norm.weight = nn.Parameter(torch.empty(cfg.head_dim))
+            layer.attn.k_norm = nn.Module()
+            layer.attn.k_norm.weight = nn.Parameter(torch.empty(cfg.head_dim))
+
+            layer.mlp_norm = nn.Module()
+            layer.mlp_norm.weight = nn.Parameter(torch.empty(cfg.hidden_size))
+            layer.moe = nn.Module()
+            layer.moe.router = nn.Module()
+            layer.moe.router.gate = nn.Linear(
+                cfg.hidden_size, cfg.num_experts, bias=False
+            )
+            layer.moe.experts = Experts.__new__(Experts)
+            nn.Module.__init__(layer.moe.experts)
+            layer.moe.experts.num_local_experts = cfg.num_experts
+            layer.moe.experts.fc1 = _GroupedSurface(
+                cfg.num_experts, cfg.hidden_size, 2 * cfg.moe_intermediate_size
+            )
+            layer.moe.experts.fc2 = _GroupedSurface(
+                cfg.num_experts, cfg.moe_intermediate_size, cfg.hidden_size
+            )
+            self.layers = nn.ModuleList([layer])
+
+    cfg = Qwen3MoEConfig(
+        num_hidden_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=16,
+        num_experts=2,
+        num_experts_per_tok=1,
+        moe_intermediate_size=4,
+        layer_types=["full_attention"],
+    )
+    ps = SimpleNamespace(
+        tp_size=1,
+        tp_rank=0,
+        tp_group=None,
+        etp_size=1,
+        etp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+    )
+    chunk = _TinyQwenLoadProxy(cfg, ps).to(torch.bfloat16)
+    hf_state = {
+        "model.embed_tokens.weight": torch.full((16, 8), 0.01),
+        "model.norm.weight": torch.full((8,), 0.02),
+        "lm_head.weight": torch.full((16, 8), 0.03),
+        "model.layers.0.input_layernorm.weight": torch.full((8,), 0.04),
+        "model.layers.0.self_attn.q_proj.weight": torch.full((8, 8), 0.05),
+        "model.layers.0.self_attn.k_proj.weight": torch.full((4, 8), 0.06),
+        "model.layers.0.self_attn.v_proj.weight": torch.full((4, 8), 0.07),
+        "model.layers.0.self_attn.q_norm.weight": torch.full((4,), 0.08),
+        "model.layers.0.self_attn.k_norm.weight": torch.full((4,), 0.09),
+        "model.layers.0.self_attn.o_proj.weight": torch.full((8, 8), 0.10),
+        "model.layers.0.post_attention_layernorm.weight": torch.full((8,), 0.11),
+        "model.layers.0.mlp.gate.weight": torch.full((2, 8), 0.12),
+    }
+    for expert_idx in range(cfg.num_experts):
+        prefix = f"model.layers.0.mlp.experts.{expert_idx}"
+        hf_state[f"{prefix}.gate_proj.weight"] = torch.full((4, 8), 0.13)
+        hf_state[f"{prefix}.up_proj.weight"] = torch.full((4, 8), 0.14)
+        hf_state[f"{prefix}.down_proj.weight"] = torch.full((8, 4), 0.15)
+    save_file(hf_state, tmp_path / "model.safetensors")
+
+    protocol.load_hf_weights(chunk, str(tmp_path), cfg, ps)
+    assert "WARNING:" not in capsys.readouterr().out
+
+    x = torch.randn(3, cfg.hidden_size, dtype=torch.bfloat16)
+    with torch.no_grad():
+        qkv_t0 = chunk.layers[0].attn.qkv(x).clone()
+        proj_t0 = chunk.layers[0].attn.proj(x).clone()
+    stats = apply_lora_to_chunks(
+        [chunk],
+        LoraSpec(
+            enabled=True,
+            rank=2,
+            target_modules=(
+                "linear_qkv",
+                "linear_proj",
+                "linear_fc1",
+                "linear_fc2",
+            ),
+        ),
+        ps=ps,
+    )
+    assert stats["attached_modules"] == 4
+    with torch.no_grad():
+        assert torch.equal(chunk.layers[0].attn.qkv(x), qkv_t0)
+        assert torch.equal(chunk.layers[0].attn.proj(x), proj_t0)
+
+
+def test_qwen3_30b_lora_attachment_and_parameter_contract():
+    from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+
+    cfg = Qwen3MoEConfig()
+    rank = 16
+    target_ep = 8
+    targets = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
+
+    assert cfg.num_hidden_layers * len(targets) == 192
+    qkv_out = (cfg.num_attention_heads + 2 * cfg.num_key_value_heads) * cfg.head_dim
+    attention_lora = (
+        cfg.num_hidden_layers
+        * rank
+        * (cfg.hidden_size + qkv_out + cfg.hidden_size + cfg.hidden_size)
+    )
+    expert_lora = (
+        cfg.num_hidden_layers
+        * target_ep
+        * rank
+        * (
+            (cfg.hidden_size + 2 * cfg.moe_intermediate_size)
+            + (cfg.moe_intermediate_size + cfg.hidden_size)
+        )
+    )
+    trainable_numel = attention_lora + expert_lora
+    total_numel = 30_532_122_624
+
+    assert trainable_numel == 47_972_352
+    assert trainable_numel / total_numel == pytest.approx(0.0015712092012329002)
+
+
+class _IdentityWeightTransform(parametrize.Module):
+    def forward(self, weight: torch.Tensor) -> torch.Tensor:
+        return weight * 1.0
+
+
+def _apply_fake_qat_to_linears(model: nn.Module) -> None:
+    for module in model.modules():
+        if isinstance(module, LoRAWrappedLinear):
+            owner = _weight_owner(module.base)
+        else:
+            owner = _weight_owner(module)
+        if owner is None or parametrize.is_parametrized(owner, "weight"):
+            continue
+        parametrize.register_parametrization(
+            owner, "weight", _IdentityWeightTransform(), unsafe=True
+        )
+
+
+def test_qat_and_lora_four_combos():
+    SwiGLUMLP = _swiglu_mlp()
+    combos = [(False, False), (True, False), (False, True), (True, True)]
+    outputs = []
+    torch.manual_seed(42)
+    base_state = SwiGLUMLP(8, 16).state_dict()
+    x = torch.randn(4, 8)
+    for qat_on, lora_on in combos:
+        mlp = SwiGLUMLP(8, 16)
+        mlp.load_state_dict(base_state)
+        chunk = nn.Module()
+        chunk.mlp = mlp
+        if qat_on:
+            _apply_fake_qat_to_linears(chunk)
+        apply_lora_to_chunks([chunk], LoraSpec(enabled=lora_on, rank=2))
+        if lora_on:
+            for name, param in chunk.named_parameters():
+                if "lora_b" in name:
+                    param.data.fill_(0.25)
+        with torch.no_grad():
+            outputs.append(mlp(x).clone())
+
+    # Identity QAT parametrization must not change the base forward.
+    torch.testing.assert_close(outputs[0], outputs[1])
+    assert not torch.allclose(outputs[0], outputs[2])
+    assert outputs[3].shape == outputs[0].shape
+
+
+def test_lora_wrapped_linear_forwards_base_attrs():
+    base = nn.Linear(4, 3, bias=False)
+    base.weight.data.fill_(0.5)
+    adapter = LinearLoRA(4, 3, rank=2, alpha=2, dropout=0.0)
+    wrapped = LoRAWrappedLinear(base, adapter)
+    assert wrapped.weight is base.weight
+    x = torch.randn(2, 4)
+    expected = base(x) + adapter(x)
+    torch.testing.assert_close(wrapped(x), expected)
+
+
+def test_qkv_normalized_surface_requires_exact_base_output_protocol():
+    from megatron.lite.primitive.modules.lora_apply import (
+        _enable_qkv_normalized_output,
+    )
+
+    base_qkv = nn.Module()
+    base_qkv.linear = nn.Module()
+    base_qkv.linear.layer_norm_weight = nn.Parameter(torch.ones(4))
+
+    with pytest.raises(TypeError, match="does not expose its normalized linear input"):
+        _enable_qkv_normalized_output(base_qkv)
+
+
+def test_qkv_adapter_consumes_exact_base_normalized_output_object():
+    class _NormalizedOutputBase(nn.Module):
+        def forward_with_normalized_input(self, x):
+            self.normalized_output = x.detach().clone()
+            return torch.zeros_like(x), self.normalized_output
+
+    class _RecordingAdapter(nn.Module):
+        def forward(self, x):
+            self.input = x
+            return torch.zeros_like(x)
+
+    base = _NormalizedOutputBase()
+    adapter = _RecordingAdapter()
+    wrapped = LoRAWrappedLinear(base, adapter, use_base_normalized_input=True)
+
+    wrapped(torch.randn(2, 4))
+
+    assert adapter.input is base.normalized_output
+    assert torch.equal(adapter.input, base.normalized_output)
+
+
+def test_apply_lora_tp_layout_on_gqa_adapters():
+    from megatron.lite.primitive.modules.lora_apply import (
+        _attach_gqa_proj,
+        _attach_gqa_qkv,
+    )
+    from megatron.lite.primitive.parallel.linear import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+    )
+
+    class _FakeLayerNormLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(12, 16, dtype=torch.bfloat16))
+            self.layer_norm_weight = nn.Parameter(torch.ones(16, dtype=torch.bfloat16))
+            self.return_layernorm_output = False
+            self.return_layernorm_output_gathered = False
+
+        def forward(self, x):
+            normalized = torch.nn.functional.rms_norm(
+                x, (x.shape[-1],), self.layer_norm_weight
+            )
+            out = normalized @ self.weight.t()
+            if self.return_layernorm_output:
+                return out, normalized
+            return out
+
+    def _column_surface():
+        surface = ColumnParallelLinear.__new__(ColumnParallelLinear)
+        nn.Module.__init__(surface)
+        surface.tp_size = 2
+        surface.tp_rank = 0
+        surface.tp_group = object()
+        surface.local_out = 12
+        surface.use_sp = True
+        surface.linear = _FakeLayerNormLinear()
+        surface.gather_output = False
+        return surface
+
+    def _row_surface():
+        surface = RowParallelLinear.__new__(RowParallelLinear)
+        nn.Module.__init__(surface)
+        surface.tp_size = 2
+        surface.tp_rank = 0
+        surface.tp_group = object()
+        surface.local_in = 12
+        surface.use_sp = True
+        surface.linear = nn.Linear(12, 16, bias=False, dtype=torch.bfloat16)
+        return surface
+
+    class _MockAttn:
+        def __init__(self):
+            from types import SimpleNamespace
+
+            self.ps = SimpleNamespace(tp_group=object(), tp_size=2, tp_rank=0)
+            self.qkv = _column_surface()
+            self.proj = _row_surface()
+
+    attn = _MockAttn()
+    spec = LoraSpec(enabled=True, rank=4, target_modules=("linear_qkv", "linear_proj"))
+    assert _attach_gqa_qkv(attn, spec)
+    assert _attach_gqa_proj(attn, spec)
+    assert attn.qkv.weight is attn.qkv.base.linear.weight
+    assert attn.proj.weight is attn.proj.base.linear.weight
+    qkv_adapter = attn.qkv.adapter
+    proj_adapter = attn.proj.adapter
+    assert qkv_adapter.lora_a.dtype == torch.bfloat16
+    assert proj_adapter.lora_a.dtype == torch.bfloat16
+    assert qkv_adapter.lora_a.shape == (2, 16)
+    assert qkv_adapter.lora_b.shape == (12, 4)
+    assert qkv_adapter.rank_partitioned_a is True
+    assert qkv_adapter.lora_a.tensor_model_parallel is True
+    assert qkv_adapter.lora_b.tensor_model_parallel is True
+    assert attn.qkv._use_base_normalized_input is True
+    assert attn.qkv.base.linear.return_layernorm_output is True
+    assert attn.qkv.base.linear.return_layernorm_output_gathered is False
+    _, normalized_input = attn.qkv.base.forward_with_normalized_input(
+        torch.randn(2, 16, dtype=torch.bfloat16)
+    )
+    assert normalized_input.shape == (2, 16)
+    assert proj_adapter.lora_a.shape == (4, 12)
+    assert proj_adapter.lora_b.shape == (8, 4)
+    assert proj_adapter.input_parallel_reduce is True
+    assert proj_adapter.output_partitioned_b is True

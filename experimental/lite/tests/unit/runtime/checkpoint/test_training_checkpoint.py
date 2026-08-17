@@ -14,6 +14,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     _replace_state_dict_keys_with_sharded_keys,
 )
 from megatron.lite.primitive.ckpt import dcp
+from megatron.lite.primitive.ckpt.identity import IDENTITY_STATE_KEY
 from megatron.lite.primitive.ckpt.distckpt import (
     _dist_opt_checkpoint_metadata,
     _model_sharded_state_dict,
@@ -22,13 +23,33 @@ from megatron.lite.primitive.ckpt.distckpt import (
     _synchronize_native_optimizer_steps,
     attach_model_sharded_state_dict,
 )
+from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
+from megatron.lite.primitive.modules.multi_lora_bank import MultiLoraTrainingState
 from megatron.lite.primitive.parallel import ParallelState
-from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
+from megatron.lite.primitive.protocols import (
+    default_expert_classifier,
+    default_placement_fn,
+)
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 
-@pytest.mark.parametrize("groups, expected", [([], False), ([object(), object()], True), ([object(), None], False)])
+class IdentityModule(torch.nn.Module):
+    """Tiny model-owned state stand-in for checkpoint bridge contract tests."""
+
+    def __init__(self, names=("alpha", "bravo")):
+        super().__init__()
+        self.bank_parameter_0 = torch.nn.Parameter(torch.ones(2, 2))
+        self._names = tuple(names)
+
+    def checkpoint_identity_metadata(self):
+        return {"schema_version": 1, "names_by_slot": self._names, "rank": 2}
+
+
+@pytest.mark.parametrize(
+    "groups, expected",
+    [([], False), ([object(), object()], True), ([object(), None], False)],
+)
 def test_dist_opt_checkpoint_memory_efficient_metadata(groups, expected) -> None:
     opts = [
         SimpleNamespace(
@@ -120,7 +141,9 @@ DISTOPT_METADATA = {
 }
 
 
-def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path) -> None:
+def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(
+    monkeypatch, tmp_path
+) -> None:
     model = torch.nn.Linear(4, 2)
     optimizer = FakeDistOpt()
     ps = ParallelState(pp_rank=1, tp_rank=2, dp_cp_rank=3)
@@ -132,7 +155,9 @@ def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path)
         saved["checkpoint_dir"] = checkpoint_dir
         saved["kwargs"] = kwargs
 
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.save", fake_save)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.save", fake_save
+    )
 
     dcp.save_training_checkpoint(model, optimizer, 5, str(tmp_path), use_dcp=True)
 
@@ -203,6 +228,96 @@ def test_dist_opt_replica_id_groups_sharded_axes_by_placement() -> None:
     assert expert_replica_id == (0, 0, 0)
 
 
+def test_encoded_multi_lora_banks_use_dense_checkpoint_meshes(
+    monkeypatch,
+) -> None:
+    import megatron.lite.primitive.ckpt.distckpt as distckpt
+
+    fc_name = MultiLoraTrainingState.parameter_name(
+        "layers.0.moe.experts._fc1_weight_0", "a"
+    )
+    attention_name = MultiLoraTrainingState.parameter_name(
+        "layers.0.attn.qkv.linear.weight", "a"
+    )
+    module = torch.nn.Module()
+    module.register_parameter(fc_name, torch.nn.Parameter(torch.ones(2, 2)))
+    module.register_parameter(attention_name, torch.nn.Parameter(torch.ones(2, 2)))
+    records = {}
+
+    class CapturedShardedTensor:
+        @staticmethod
+        def from_rank_offsets(key, tensor, *offsets, replica_id):
+            records[key] = {"offsets": offsets, "replica_id": replica_id}
+            return records[key]
+
+    monkeypatch.setattr(distckpt, "ShardedTensor", CapturedShardedTensor)
+    ps = ParallelState(
+        tp_size=2,
+        tp_rank=1,
+        ep_size=2,
+        ep_rank=1,
+        etp_size=1,
+        etp_rank=0,
+        dp_size=5,
+        dp_rank=4,
+        dp_cp_size=5,
+        dp_cp_rank=4,
+        expert_dp_size=3,
+        expert_dp_rank=2,
+    )
+
+    distckpt._module_sharded_state_dict(
+        module, ps, get_placements=PLACEMENT_FN, is_expert=EXPERT_CLASSIFIER
+    )
+
+    assert records[fc_name]["replica_id"] == (0, 1, 4)
+    assert records[attention_name]["replica_id"] == (0, 0, 4)
+
+
+def test_dist_opt_optimizer_save_uses_dense_encoded_bank_model_state(
+    monkeypatch, tmp_path
+) -> None:
+    import megatron.lite.primitive.ckpt.distckpt as distckpt
+
+    fc_name = MultiLoraTrainingState.parameter_name(
+        "layers.0.moe.experts._fc1_weight_0", "a"
+    )
+    attention_name = MultiLoraTrainingState.parameter_name(
+        "layers.0.attn.qkv.linear.weight", "a"
+    )
+    model = torch.nn.Module()
+    model.register_parameter(fc_name, torch.nn.Parameter(torch.ones(2, 2)))
+    model.register_parameter(attention_name, torch.nn.Parameter(torch.ones(2, 2)))
+    optimizer = FakeDistOpt()
+    attach_model_sharded_state_dict(
+        [model],
+        ParallelState(tp_size=2, tp_rank=1, dp_size=5, dp_rank=4, dp_cp_size=5, dp_cp_rank=4),
+        get_placements=PLACEMENT_FN,
+        is_expert=EXPERT_CLASSIFIER,
+    )
+    saved = {}
+    monkeypatch.setattr(
+        distckpt.dist_checkpointing,
+        "save",
+        lambda state_dict, *args, **kwargs: saved.update(state_dict),
+    )
+
+    dcp.save_training_checkpoint(
+        model,
+        optimizer,
+        1,
+        str(tmp_path),
+        use_dcp=True,
+        save_model=False,
+        save_optimizer=True,
+    )
+
+    assert set(optimizer.save_model_sd) == {fc_name, attention_name}
+    assert optimizer.save_model_sd[fc_name].replica_id == (0, 1, 4)
+    assert optimizer.save_model_sd[attention_name].replica_id == (0, 0, 4)
+    assert saved["optimizer"] == {"is_loading": False}
+
+
 def test_dist_opt_replica_id_does_not_treat_pp_as_a_replica_axis() -> None:
     rank_offsets, replica_id = _rank_offsets_and_replica_id(
         [Replicate(), Replicate(), Replicate(), Shard(0)],
@@ -222,14 +337,18 @@ def test_dist_opt_replica_id_does_not_treat_pp_as_a_replica_axis() -> None:
     assert replica_id == (0, 0, 0)
 
 
-def test_dist_opt_pp_rank_one_model_keys_survive_torch_dist_main_replica_filter() -> None:
+def test_dist_opt_pp_rank_one_model_keys_survive_torch_dist_main_replica_filter() -> (
+    None
+):
     ps = ParallelState(pp_size=2, pp_rank=1, pp_is_first=False, pp_is_last=True)
     model = torch.nn.Linear(4, 2)
     attach_model_sharded_state_dict([model], ps)
 
     model_sd = _model_sharded_state_dict(model)
-    filtered_sd, _flat_mapping, _rename_mapping = _replace_state_dict_keys_with_sharded_keys(
-        model_sd, keep_only_main_replica=True
+    filtered_sd, _flat_mapping, _rename_mapping = (
+        _replace_state_dict_keys_with_sharded_keys(
+            model_sd, keep_only_main_replica=True
+        )
     )
 
     assert set(filtered_sd) == {"model_pp1.weight", "model_pp1.bias"}
@@ -280,9 +399,13 @@ def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) ->
             "optimizer": {"loaded": True},
         }
 
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load", fake_load)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load", fake_load
+    )
 
-    step = dcp.load_training_checkpoint(model, optimizer, str(tmp_path / "step_5"), use_dcp=True)
+    step = dcp.load_training_checkpoint(
+        model, optimizer, str(tmp_path / "step_5"), use_dcp=True
+    )
 
     assert step == 5
     assert not model.wrapper_load_called
@@ -291,11 +414,100 @@ def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) ->
     assert optimizer.loaded_state == {"loaded": True}
 
 
-def test_dist_opt_step_sync_traverses_multi_optimizer_chain_without_optimizer_property() -> None:
+def test_dist_opt_checkpoint_roundtrips_model_identity_and_rejects_slot_reorder(
+    monkeypatch, tmp_path
+) -> None:
+    """Checkpoint bridge carries versioned slot identity beside model tensors."""
+    model = IdentityModule()
+    optimizer = FakeDistOpt()
+    attach_model_sharded_state_dict([model], ParallelState())
+    captured = {}
+
+    def fake_save(state_dict, checkpoint_dir, **kwargs):
+        captured.update(state_dict)
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.save", fake_save
+    )
+    dcp.save_training_checkpoint(model, optimizer, 3, str(tmp_path), use_dcp=True)
+    assert captured[IDENTITY_STATE_KEY] == {
+        "chunk0": {"schema_version": 1, "names_by_slot": ("alpha", "bravo"), "rank": 2}
+    }
+
+    expected_weight = torch.full_like(model.bank_parameter_0, 7.0)
+
+    def fake_load(sharded_state_dict, checkpoint_dir, **kwargs):
+        assert sharded_state_dict[IDENTITY_STATE_KEY] is None
+        return {
+            "step": 3,
+            "model": {"bank_parameter_0": expected_weight},
+            IDENTITY_STATE_KEY: captured[IDENTITY_STATE_KEY],
+            "optimizer": {"loaded": True},
+        }
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load", fake_load
+    )
+    assert (
+        dcp.load_training_checkpoint(
+            model, optimizer, str(tmp_path / "step_3"), use_dcp=True
+        )
+        == 3
+    )
+    torch.testing.assert_close(model.bank_parameter_0, expected_weight)
+
+    reordered = IdentityModule(("bravo", "alpha"))
+    attach_model_sharded_state_dict([reordered], ParallelState())
+    with pytest.raises(ValueError, match="identity mismatch"):
+        dcp.load_training_checkpoint(
+            reordered, FakeDistOpt(), str(tmp_path / "step_3"), use_dcp=True
+        )
+
+
+def test_local_checkpoint_roundtrips_identity_and_fails_closed_on_missing_or_reordered_metadata(
+    tmp_path,
+) -> None:
+    """The local backend validates identity before copying model tensors too."""
+    model = IdentityModule()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    original = torch.full_like(model.bank_parameter_0, 5.0)
+    with torch.no_grad():
+        model.bank_parameter_0.copy_(original)
+    dcp.save_training_checkpoint(model, optimizer, 9, str(tmp_path), use_dcp=False)
+    ckpt_file = tmp_path / "training_state.pt"
+    stored = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+    assert stored[IDENTITY_STATE_KEY] == {
+        "chunk0": {"schema_version": 1, "names_by_slot": ("alpha", "bravo"), "rank": 2}
+    }
+
+    with torch.no_grad():
+        model.bank_parameter_0.zero_()
+    assert (
+        dcp.load_training_checkpoint(model, optimizer, str(tmp_path), use_dcp=False)
+        == 9
+    )
+    torch.testing.assert_close(model.bank_parameter_0, original)
+
+    missing = dict(stored)
+    missing.pop(IDENTITY_STATE_KEY)
+    torch.save(missing, ckpt_file)
+    with pytest.raises(ValueError, match="identity mismatch"):
+        dcp.load_training_checkpoint(model, optimizer, str(tmp_path), use_dcp=False)
+
+    torch.save(stored, ckpt_file)
+    reordered = IdentityModule(("bravo", "alpha"))
+    with pytest.raises(ValueError, match="identity mismatch"):
+        dcp.load_training_checkpoint(reordered, None, str(tmp_path), use_dcp=False)
+
+
+def test_dist_opt_step_sync_traverses_multi_optimizer_chain_without_optimizer_property() -> (
+    None
+):
     class FakeTorchOptimizer:
         def __init__(self, steps):
             self.state = {
-                object(): {"step": torch.tensor(step, dtype=torch.int64)} for step in steps
+                object(): {"step": torch.tensor(step, dtype=torch.int64)}
+                for step in steps
             }
 
     class FakeDistOpt:
@@ -333,8 +545,12 @@ def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(
         calls["load"] = (model, optimizer, path, config, ps, kwargs)
         return 7
 
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.save_training_checkpoint", fake_save)
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.load_training_checkpoint", fake_load)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.save_training_checkpoint", fake_save
+    )
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.load_training_checkpoint", fake_load
+    )
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     model = torch.nn.Linear(1, 1)

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import gc
 import os
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from dataclasses import fields as dc_fields
 from datetime import timedelta
 from itertools import chain
@@ -177,14 +177,6 @@ class MegatronLiteRuntime(RuntimeBase):
             if isinstance(cfg, MegatronLiteConfig)
             else MegatronLiteConfig.from_dict(hf_path, cfg)
         )
-        plugins = self._cfg.impl_cfg.get("runtime_plugins", {})
-        if not isinstance(plugins, Mapping):
-            raise TypeError("impl_cfg.runtime_plugins must be a mapping.")
-        dynamic_cp = plugins.get("dynamic_context_parallel")
-        if dynamic_cp:
-            from megatron.lite.runtime.backends.mlite.dynamic_cp import install
-
-            install(self, dynamic_cp)
 
     # ── build_model ──
 
@@ -228,6 +220,7 @@ class MegatronLiteRuntime(RuntimeBase):
 
         # ── build model (model owns ps + optimizer + everything) ──
         bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
+
         meta_initialized = any(
             param.is_meta for chunk in bundle.chunks for param in chunk.parameters()
         )
@@ -259,6 +252,10 @@ class MegatronLiteRuntime(RuntimeBase):
                     if not isinstance(extra_updates, dict):
                         raise TypeError("post_model_load_hook extras update must be a dict.")
                     bundle.extras.update(extra_updates)
+
+        olora_hook = bundle.extras.get("olora_hook")
+        if callable(olora_hook) and loaded_hf_weights:
+            olora_hook()
 
         if (loaded_hf_weights or meta_initialized) and bundle.optimizer is not None:
             reload_model_params = getattr(bundle.optimizer, "reload_model_params", None)
@@ -384,6 +381,44 @@ class MegatronLiteRuntime(RuntimeBase):
         else:
             for chunk in model_chunks:
                 yield from chunk.named_parameters()
+
+    def export_lora_adapter(
+        self, handle: ModelHandle, **kwargs
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Export LoRA factors in vLLM/PEFT naming for adapter-only rollout sync."""
+        model_chunks = handle._extras.get("model_chunks", [handle._model])
+        proto = handle._extras.get("protocol")
+        model_cfg = handle._extras.get("model_cfg")
+        ps = handle._parallel_state
+
+        exporter = getattr(proto, "export_hf_lora_adapter", None) if proto else None
+        if exporter is None:
+            raise NotImplementedError(
+                f"Model protocol {type(proto).__name__} does not implement "
+                "export_hf_lora_adapter; adapter-only rollout sync is unavailable. "
+                "Set the LoRA rollout sync mode to 'merge' to fall back."
+            )
+        registry = self.multi_lora_registry(handle)
+        if registry is not None:
+            if "multi_lora_registry" in kwargs:
+                raise ValueError("multi-LoRA registry must be supplied by the model handle only.")
+            kwargs["multi_lora_registry"] = registry
+        yield from exporter(model_chunks, model_cfg, ps, **kwargs)
+
+    @staticmethod
+    def multi_lora_registry(handle: ModelHandle):
+        """Return the model-owned named-bank registry, if this model has one."""
+        registry = handle._extras.get("multi_lora_registry")
+        model_chunks = handle._extras.get("model_chunks", [handle._model])
+        for chunk in model_chunks:
+            state = getattr(chunk, "multi_lora_training_state", None)
+            chunk_registry = getattr(state, "registry", None)
+            if chunk_registry is None:
+                continue
+            if registry is not None and registry is not chunk_registry:
+                raise ValueError("model chunks disagree on their multi-LoRA registry.")
+            registry = chunk_registry
+        return registry
 
     def release_export_scratch(self, handle: ModelHandle) -> None:
         """Release retained full-parameter scratch before colocated rollout wake."""

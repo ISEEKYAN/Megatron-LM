@@ -12,8 +12,21 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.primitive.modules.lora import LoraConfig, normalize_lora_config
+from megatron.lite.primitive.modules.lora import (
+    LoraConfig,
+    normalize_lora_config,
+    resolve_lora_alpha,
+)
+from megatron.lite.primitive.modules.lora_apply import (
+    get_grouped_lora_adapter,
+    get_linear_lora_adapter,
+    iter_lora_adapter_modules,
+)
 from megatron.lite.primitive.parallel import ParallelState
+
+# This model needs no model-specific targets beyond the primitive's built-in
+# GQA, SwiGLU, and grouped-expert surfaces.
+LORA_TARGETS = ()
 
 _PEFT_PREFIX = "base_model.model.model"
 
@@ -182,10 +195,6 @@ def _state_target_modules(state: dict[str, torch.Tensor]) -> set[str]:
     return out
 
 
-def _effective_lora_alpha(lora_config: LoraConfig) -> int:
-    return lora_config.rank if lora_config.alpha is None else int(lora_config.alpha)
-
-
 def _peft_target_set(value: Any) -> set[str] | None:
     if value is None:
         return None
@@ -209,17 +218,7 @@ def _infer_state_rank(state: dict[str, torch.Tensor]) -> int | None:
 
 def _iter_native_lora_modules(chunks: list[nn.Module] | tuple[nn.Module, ...]):
     for chunk in _iter_qwen_chunks(list(chunks)):
-        for layer in chunk.layers:
-            attn = layer.attn
-            if attn.qkv_lora is not None:
-                yield attn.qkv_lora
-            if attn.proj_lora is not None:
-                yield attn.proj_lora
-            experts = layer.moe.experts
-            if experts.fc1_lora is not None:
-                yield experts.fc1_lora
-            if experts.fc2_lora is not None:
-                yield experts.fc2_lora
+        yield from iter_lora_adapter_modules(chunk)
 
 
 def _infer_native_alpha(chunks: list[nn.Module] | tuple[nn.Module, ...]) -> int | None:
@@ -279,10 +278,11 @@ def _validate_adapter_config(
             raise ValueError(
                 f"Adapter config rank r={config_rank} does not match expected rank {expected.rank}."
             )
-        if config_alpha is not None and int(config_alpha) != _effective_lora_alpha(expected):
+        expected_alpha = resolve_lora_alpha(expected.rank, expected.alpha)
+        if config_alpha is not None and int(config_alpha) != expected_alpha:
             raise ValueError(
                 "Adapter config lora_alpha="
-                f"{config_alpha} does not match expected alpha {_effective_lora_alpha(expected)}."
+                f"{config_alpha} does not match expected alpha {expected_alpha}."
             )
         if config_targets is not None and config_targets != expected_targets:
             raise ValueError(
@@ -345,14 +345,14 @@ def export_lora_adapter_state(
         for layer in chunk.layers:
             layer_idx = int(layer.layer_idx)
             attn = layer.attn
-
-            if attn.qkv_lora is not None:
-                if _is_rank_partitioned_lora_a(attn.qkv_lora, ps):
-                    qkv_a = _gather_lora_rank_partition(attn.qkv_lora.lora_a.detach(), ps)
+            qkv_lora = get_linear_lora_adapter(attn, "qkv")
+            if qkv_lora is not None:
+                if _is_rank_partitioned_lora_a(qkv_lora, ps):
+                    qkv_a = _gather_lora_rank_partition(qkv_lora.lora_a.detach(), ps)
                 else:
-                    qkv_a = _select_tp_replicated(attn.qkv_lora.lora_a.detach(), ps)
+                    qkv_a = _select_tp_replicated(qkv_lora.lora_a.detach(), ps)
                 q_b_local, k_b_local, v_b_local = _split_local_mcore_qkv_b(
-                    attn.qkv_lora.lora_b.detach(),
+                    qkv_lora.lora_b.detach(),
                     num_heads_local=q_heads_local,
                     num_kv_heads_local=kv_heads_local,
                     head_dim=model_cfg.head_dim,
@@ -368,20 +368,22 @@ def export_lora_adapter_state(
                     state[_attn_key(layer_idx, "v_proj", "lora_A")] = qkv_a.clone()
                     state[_attn_key(layer_idx, "v_proj", "lora_B")] = v_b
 
-            if attn.proj_lora is not None:
-                proj_a = _all_gather_cat(attn.proj_lora.lora_a.detach(), ps.tp_group, dim=1)
-                if _is_output_partitioned_lora_b(attn.proj_lora, ps):
-                    proj_b = _all_gather_cat(attn.proj_lora.lora_b.detach(), ps.tp_group, dim=0)
+            proj_lora = get_linear_lora_adapter(attn, "proj")
+            if proj_lora is not None:
+                proj_a = _all_gather_cat(proj_lora.lora_a.detach(), ps.tp_group, dim=1)
+                if _is_output_partitioned_lora_b(proj_lora, ps):
+                    proj_b = _all_gather_cat(proj_lora.lora_b.detach(), ps.tp_group, dim=0)
                 else:
-                    proj_b = _select_tp_replicated(attn.proj_lora.lora_b.detach(), ps)
+                    proj_b = _select_tp_replicated(proj_lora.lora_b.detach(), ps)
                 if _rank() == 0:
                     state[_attn_key(layer_idx, "o_proj", "lora_A")] = proj_a
                     state[_attn_key(layer_idx, "o_proj", "lora_B")] = proj_b
 
             experts = layer.moe.experts
-            if experts.fc1_lora is not None:
+            fc1_lora = get_grouped_lora_adapter(experts, "fc1")
+            if fc1_lora is not None:
                 fc1_a_local, fc1_b_local = _expand_shared_expert_lora(
-                    experts.fc1_lora, experts.num_local_experts
+                    fc1_lora, experts.num_local_experts
                 )
                 fc1_a = _all_gather_cat(fc1_a_local, ps.ep_group, dim=0)
                 fc1_b = _all_gather_cat(fc1_b_local, ps.ep_group, dim=0)
@@ -401,9 +403,10 @@ def export_lora_adapter_state(
                             expert_idx
                         ]
 
-            if experts.fc2_lora is not None:
+            fc2_lora = get_grouped_lora_adapter(experts, "fc2")
+            if fc2_lora is not None:
                 fc2_a_local, fc2_b_local = _expand_shared_expert_lora(
-                    experts.fc2_lora, experts.num_local_experts
+                    fc2_lora, experts.num_local_experts
                 )
                 fc2_a = _all_gather_cat(fc2_a_local, ps.ep_group, dim=0)
                 fc2_b = _all_gather_cat(fc2_b_local, ps.ep_group, dim=0)
@@ -453,7 +456,7 @@ def save_lora_adapter(
             "base_model_name_or_path": base_model_name_or_path,
             "inference_mode": False,
             "r": lora.rank,
-            "lora_alpha": _effective_lora_alpha(lora),
+            "lora_alpha": resolve_lora_alpha(lora.rank, lora.alpha),
             "lora_dropout": lora.dropout,
             "target_modules": _target_modules_from_lora_config(lora),
             "bias": "none",
@@ -467,11 +470,14 @@ def save_lora_adapter(
             "expert_lora_representation": (
                 "shared_local_expert_group"
                 if any(
-                    _expert_lora_is_shared(getattr(layer.moe.experts, attr))
+                    _expert_lora_is_shared(adapter)
                     for chunk in _iter_qwen_chunks(list(chunks))
                     for layer in chunk.layers
-                    for attr in ("fc1_lora", "fc2_lora")
-                    if getattr(layer.moe.experts, attr) is not None
+                    for adapter in (
+                        get_grouped_lora_adapter(layer.moe.experts, "fc1"),
+                        get_grouped_lora_adapter(layer.moe.experts, "fc2"),
+                    )
+                    if adapter is not None
                 )
                 else "per_expert"
             ),
@@ -547,9 +553,10 @@ def load_lora_adapter_state(
         for layer in chunk.layers:
             layer_idx = int(layer.layer_idx)
             attn = layer.attn
-            if attn.qkv_lora is not None:
+            qkv_lora = get_linear_lora_adapter(attn, "qkv")
+            if qkv_lora is not None:
                 q_a = _require_tensor(state, _attn_key(layer_idx, "q_proj", "lora_A")).to(
-                    device=attn.qkv_lora.lora_a.device, dtype=attn.qkv_lora.lora_a.dtype
+                    device=qkv_lora.lora_a.device, dtype=qkv_lora.lora_a.dtype
                 )
                 k_a = _require_tensor(state, _attn_key(layer_idx, "k_proj", "lora_A")).to(q_a)
                 v_a = _require_tensor(state, _attn_key(layer_idx, "v_proj", "lora_A")).to(q_a)
@@ -559,32 +566,32 @@ def load_lora_adapter_state(
                     )
                 q_a_local = (
                     _slice_lora_rank_partition(q_a, ps)
-                    if _is_rank_partitioned_lora_a(attn.qkv_lora, ps)
+                    if _is_rank_partitioned_lora_a(qkv_lora, ps)
                     else q_a.contiguous()
                 )
                 q_b = _slice_tp_output(
                     _require_tensor(state, _attn_key(layer_idx, "q_proj", "lora_B")).to(
-                        device=attn.qkv_lora.lora_b.device, dtype=attn.qkv_lora.lora_b.dtype
+                        device=qkv_lora.lora_b.device, dtype=qkv_lora.lora_b.dtype
                     ),
                     q_width_local,
                     ps,
                 )
                 k_b = _slice_tp_output(
                     _require_tensor(state, _attn_key(layer_idx, "k_proj", "lora_B")).to(
-                        device=attn.qkv_lora.lora_b.device, dtype=attn.qkv_lora.lora_b.dtype
+                        device=qkv_lora.lora_b.device, dtype=qkv_lora.lora_b.dtype
                     ),
                     kv_width_local,
                     ps,
                 )
                 v_b = _slice_tp_output(
                     _require_tensor(state, _attn_key(layer_idx, "v_proj", "lora_B")).to(
-                        device=attn.qkv_lora.lora_b.device, dtype=attn.qkv_lora.lora_b.dtype
+                        device=qkv_lora.lora_b.device, dtype=qkv_lora.lora_b.dtype
                     ),
                     kv_width_local,
                     ps,
                 )
-                attn.qkv_lora.lora_a.data.copy_(q_a_local)
-                attn.qkv_lora.lora_b.data.copy_(
+                qkv_lora.lora_a.data.copy_(q_a_local)
+                qkv_lora.lora_b.data.copy_(
                     _pack_local_mcore_qkv_b(
                         q_b,
                         k_b,
@@ -596,28 +603,30 @@ def load_lora_adapter_state(
                 )
                 loaded += 2
 
-            if attn.proj_lora is not None:
+            proj_lora = get_linear_lora_adapter(attn, "proj")
+            if proj_lora is not None:
                 proj_a = _slice_tp_input(
                     _require_tensor(state, _attn_key(layer_idx, "o_proj", "lora_A")).to(
-                        device=attn.proj_lora.lora_a.device, dtype=attn.proj_lora.lora_a.dtype
+                        device=proj_lora.lora_a.device, dtype=proj_lora.lora_a.dtype
                     ),
                     attn_in_width_local,
                     ps,
                 )
                 proj_b = _require_tensor(state, _attn_key(layer_idx, "o_proj", "lora_B")).to(
-                    device=attn.proj_lora.lora_b.device, dtype=attn.proj_lora.lora_b.dtype
+                    device=proj_lora.lora_b.device, dtype=proj_lora.lora_b.dtype
                 )
-                if _is_output_partitioned_lora_b(attn.proj_lora, ps):
-                    proj_b = _slice_tp_output(proj_b, attn.proj_lora.lora_b.shape[0], ps)
-                attn.proj_lora.lora_a.data.copy_(proj_a)
-                attn.proj_lora.lora_b.data.copy_(proj_b)
+                if _is_output_partitioned_lora_b(proj_lora, ps):
+                    proj_b = _slice_tp_output(proj_b, proj_lora.lora_b.shape[0], ps)
+                proj_lora.lora_a.data.copy_(proj_a)
+                proj_lora.lora_b.data.copy_(proj_b)
                 loaded += 2
 
             experts = layer.moe.experts
             expert_start = ps.ep_rank * experts.num_local_experts
             expert_stop = expert_start + experts.num_local_experts
-            if experts.fc1_lora is not None:
-                if _expert_lora_is_shared(experts.fc1_lora):
+            fc1_lora = get_grouped_lora_adapter(experts, "fc1")
+            if fc1_lora is not None:
+                if _expert_lora_is_shared(fc1_lora):
                     local_gate_a = []
                     local_gate_b = []
                     local_up_b = []
@@ -625,8 +634,8 @@ def load_lora_adapter_state(
                         gate_a = _require_tensor(
                             state, _expert_key(layer_idx, expert_idx, "gate_proj", "lora_A")
                         ).to(
-                            device=experts.fc1_lora.lora_a.device,
-                            dtype=experts.fc1_lora.lora_a.dtype,
+                            device=fc1_lora.lora_a.device,
+                            dtype=fc1_lora.lora_a.dtype,
                         )
                         up_a = _require_tensor(
                             state, _expert_key(layer_idx, expert_idx, "up_proj", "lora_A")
@@ -640,16 +649,16 @@ def load_lora_adapter_state(
                             _require_tensor(
                                 state, _expert_key(layer_idx, expert_idx, "gate_proj", "lora_B")
                             ).to(
-                                device=experts.fc1_lora.lora_b.device,
-                                dtype=experts.fc1_lora.lora_b.dtype,
+                                device=fc1_lora.lora_b.device,
+                                dtype=fc1_lora.lora_b.dtype,
                             )
                         )
                         local_up_b.append(
                             _require_tensor(
                                 state, _expert_key(layer_idx, expert_idx, "up_proj", "lora_B")
                             ).to(
-                                device=experts.fc1_lora.lora_b.device,
-                                dtype=experts.fc1_lora.lora_b.dtype,
+                                device=fc1_lora.lora_b.device,
+                                dtype=fc1_lora.lora_b.dtype,
                             )
                         )
                     if strict:
@@ -672,8 +681,8 @@ def load_lora_adapter_state(
                                 "Megatron Lite shared expert fc1_lora can only import PEFT adapters "
                                 "whose local expert up lora_B tensors are identical."
                             )
-                    experts.fc1_lora.lora_a.data.copy_(local_gate_a[0])
-                    experts.fc1_lora.lora_b.data.copy_(
+                    fc1_lora.lora_a.data.copy_(local_gate_a[0])
+                    fc1_lora.lora_b.data.copy_(
                         torch.cat([local_gate_b[0], local_up_b[0]], dim=0)
                     )
                     loaded += 2
@@ -682,8 +691,8 @@ def load_lora_adapter_state(
                         gate_a = _require_tensor(
                             state, _expert_key(layer_idx, expert_idx, "gate_proj", "lora_A")
                         ).to(
-                            device=experts.fc1_lora.lora_a.device,
-                            dtype=experts.fc1_lora.lora_a.dtype,
+                            device=fc1_lora.lora_a.device,
+                            dtype=fc1_lora.lora_a.dtype,
                         )
                         up_a = _require_tensor(
                             state, _expert_key(layer_idx, expert_idx, "up_proj", "lora_A")
@@ -695,23 +704,24 @@ def load_lora_adapter_state(
                         gate_b = _require_tensor(
                             state, _expert_key(layer_idx, expert_idx, "gate_proj", "lora_B")
                         ).to(
-                            device=experts.fc1_lora.lora_b.device,
-                            dtype=experts.fc1_lora.lora_b.dtype,
+                            device=fc1_lora.lora_b.device,
+                            dtype=fc1_lora.lora_b.dtype,
                         )
                         up_b = _require_tensor(
                             state, _expert_key(layer_idx, expert_idx, "up_proj", "lora_B")
                         ).to(
-                            device=experts.fc1_lora.lora_b.device,
-                            dtype=experts.fc1_lora.lora_b.dtype,
+                            device=fc1_lora.lora_b.device,
+                            dtype=fc1_lora.lora_b.dtype,
                         )
-                        experts.fc1_lora.lora_a.data[local_idx].copy_(gate_a)
-                        experts.fc1_lora.lora_b.data[local_idx].copy_(
+                        fc1_lora.lora_a.data[local_idx].copy_(gate_a)
+                        fc1_lora.lora_b.data[local_idx].copy_(
                             torch.cat([gate_b, up_b], dim=0)
                         )
                         loaded += 2
 
-            if experts.fc2_lora is not None:
-                if _expert_lora_is_shared(experts.fc2_lora):
+            fc2_lora = get_grouped_lora_adapter(experts, "fc2")
+            if fc2_lora is not None:
+                if _expert_lora_is_shared(fc2_lora):
                     local_a = []
                     local_b = []
                     for expert_idx in range(expert_start, expert_stop):
@@ -719,16 +729,16 @@ def load_lora_adapter_state(
                             _require_tensor(
                                 state, _expert_key(layer_idx, expert_idx, "down_proj", "lora_A")
                             ).to(
-                                device=experts.fc2_lora.lora_a.device,
-                                dtype=experts.fc2_lora.lora_a.dtype,
+                                device=fc2_lora.lora_a.device,
+                                dtype=fc2_lora.lora_a.dtype,
                             )
                         )
                         local_b.append(
                             _require_tensor(
                                 state, _expert_key(layer_idx, expert_idx, "down_proj", "lora_B")
                             ).to(
-                                device=experts.fc2_lora.lora_b.device,
-                                dtype=experts.fc2_lora.lora_b.dtype,
+                                device=fc2_lora.lora_b.device,
+                                dtype=fc2_lora.lora_b.dtype,
                             )
                         )
                     if strict:
@@ -742,25 +752,25 @@ def load_lora_adapter_state(
                                 "Megatron Lite shared expert fc2_lora can only import PEFT adapters "
                                 "whose local expert down lora_B tensors are identical."
                             )
-                    experts.fc2_lora.lora_a.data.copy_(local_a[0])
-                    experts.fc2_lora.lora_b.data.copy_(local_b[0])
+                    fc2_lora.lora_a.data.copy_(local_a[0])
+                    fc2_lora.lora_b.data.copy_(local_b[0])
                     loaded += 2
                 else:
                     for local_idx, expert_idx in enumerate(range(expert_start, expert_stop)):
-                        experts.fc2_lora.lora_a.data[local_idx].copy_(
+                        fc2_lora.lora_a.data[local_idx].copy_(
                             _require_tensor(
                                 state, _expert_key(layer_idx, expert_idx, "down_proj", "lora_A")
                             ).to(
-                                device=experts.fc2_lora.lora_a.device,
-                                dtype=experts.fc2_lora.lora_a.dtype,
+                                device=fc2_lora.lora_a.device,
+                                dtype=fc2_lora.lora_a.dtype,
                             )
                         )
-                        experts.fc2_lora.lora_b.data[local_idx].copy_(
+                        fc2_lora.lora_b.data[local_idx].copy_(
                             _require_tensor(
                                 state, _expert_key(layer_idx, expert_idx, "down_proj", "lora_B")
                             ).to(
-                                device=experts.fc2_lora.lora_b.device,
-                                dtype=experts.fc2_lora.lora_b.dtype,
+                                device=fc2_lora.lora_b.device,
+                                dtype=fc2_lora.lora_b.dtype,
                             )
                         )
                         loaded += 2

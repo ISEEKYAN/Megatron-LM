@@ -809,6 +809,14 @@ def _export_mxfp4_weights(weights):
         yield f"{name[:-7]}.weight_scale", scale.view(torch.uint8)
 
 
+def export_hf_lora_adapter(model, config: Qwen35Config, ps: ParallelState, **kwargs):
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        export_hf_lora_adapter as _export_adapter,
+    )
+
+    yield from _export_adapter(model, Qwen35WeightSpec(config), ps, **kwargs)
+
+
 def save_hf_weights(
     model: nn.Module | list[nn.Module],
     path: str,
