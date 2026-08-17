@@ -21,6 +21,7 @@ Protocol convention (what runtime calls):
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -56,6 +57,7 @@ from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.lora import (
     LoraSpec,
     apply_olora_tail_init,
+    normalize_lora_config,
     normalize_lora_spec,
 )
 from megatron.lite.primitive.modules.multi_lora_bank import (
@@ -143,6 +145,23 @@ MODULE_MAP = {
 # ---------------------------------------------------------------------------
 # Required: build_model_config
 # ---------------------------------------------------------------------------
+
+
+def _validate_meta_parameters(model: torch.nn.Module) -> None:
+    non_meta = []
+    for module_name, module in model.named_modules():
+        for parameter_name, parameter in module.named_parameters(recurse=False):
+            if parameter.device.type == "meta":
+                continue
+            name = f"{module_name}.{parameter_name}" if module_name else parameter_name
+            size = parameter.numel() * parameter.element_size()
+            non_meta.append(
+                f"{name} (module={type(module).__name__}, device={parameter.device}, bytes={size})"
+            )
+    if non_meta:
+        raise RuntimeError(
+            "FSDP2 meta initialization left materialized parameters:\n" + "\n".join(non_meta)
+        )
 
 
 def build_model_config(source: str | Path | dict, **overrides) -> Qwen3MoEConfig:

@@ -236,17 +236,16 @@ class TokenDispatcher:
         self._deepep_event = None
 
         if self.ep_size > 1 and self.num_local_experts > 1:
-            chunk_idxs = torch.arange(self.ep_size * self.num_local_experts)
-            self._sort_by_experts = (
-                chunk_idxs.reshape(self.ep_size, self.num_local_experts)
-                .T.ravel()
-                .tolist()
-            )
-            self._restore_by_ranks = (
-                chunk_idxs.reshape(self.num_local_experts, self.ep_size)
-                .T.ravel()
-                .tolist()
-            )
+            self._sort_by_experts = [
+                rank * self.num_local_experts + expert
+                for expert in range(self.num_local_experts)
+                for rank in range(self.ep_size)
+            ]
+            self._restore_by_ranks = [
+                expert * self.ep_size + rank
+                for rank in range(self.ep_size)
+                for expert in range(self.num_local_experts)
+            ]
 
     def dispatch(
         self,

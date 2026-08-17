@@ -51,6 +51,12 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     return proto.ImplConfig(**impl_cfg_kwargs)
 
 
+def _reset_parameters(module: torch.nn.Module) -> None:
+    reset = getattr(module, "reset_parameters", None)
+    if callable(reset):
+        reset()
+
+
 def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
     if backend is None:
         return
@@ -214,6 +220,15 @@ class MegatronLiteRuntime(RuntimeBase):
 
         # ── build model (model owns ps + optimizer + everything) ──
         bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
+
+        meta_initialized = any(
+            param.is_meta for chunk in bundle.chunks for param in chunk.parameters()
+        )
+        if meta_initialized:
+            bundle.optimizer = bundle.extras.pop("post_model_load_hook")()["optimizer"]
+            if not rt_cfg.load_hf_weights:
+                for chunk in bundle.chunks:
+                    chunk.apply(_reset_parameters)
 
         # ── load HF weights (optional) ──
         loaded_hf_weights = False

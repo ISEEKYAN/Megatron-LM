@@ -561,6 +561,9 @@ class LinearLoRA(nn.Module):
         self.lora_b = nn.Parameter(torch.empty(self.local_out_features, rank))
         self.lora_a.tensor_model_parallel = bool(a_tensor_model_parallel)
         self.lora_b.tensor_model_parallel = bool(b_tensor_model_parallel)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
         nn.init.zeros_(self.lora_b)
 
@@ -739,11 +742,14 @@ class SharedGroupedLinearLoRA(nn.Module):
         self.lora_b = nn.Parameter(torch.empty(out_features, rank))
         self.lora_a.tensor_model_parallel = False
         self.lora_b.tensor_model_parallel = False
-        nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
-        nn.init.zeros_(self.lora_b)
+        self.reset_parameters()
         if self.tp_group is not None:
             self.lora_a.register_hook(self._all_reduce_tp_grad)
             self.lora_b.register_hook(self._all_reduce_tp_grad)
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
+        nn.init.zeros_(self.lora_b)
 
     def _all_reduce_tp_grad(self, grad: torch.Tensor) -> torch.Tensor:
         return _all_reduce_sum(grad, self.tp_group)
