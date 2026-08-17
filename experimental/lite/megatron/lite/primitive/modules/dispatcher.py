@@ -30,6 +30,7 @@ except ImportError:
 
 
 _deepep_buffer = None
+_token_dispatcher_instances = 0
 
 
 def _validate_finite(stage: str, **tensors: torch.Tensor) -> None:
@@ -130,6 +131,56 @@ def _tensor_hidden_bytes(x: torch.Tensor) -> int:
     return x.size(1) * max(x.element_size(), 2)
 
 
+def _dispatch_deepep_raw(
+    group,
+    hidden_states: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_scores: torch.Tensor,
+    num_experts: int,
+    *,
+    async_finish: bool,
+    allocate_on_comm_stream: bool,
+):
+    """Run the shared normal-DeepEP dispatch without owning autograd state."""
+    buffer = _get_deepep_buffer(group, _tensor_hidden_bytes(hidden_states))
+    hidden_states = hidden_states.contiguous()
+    topk_indices = topk_indices.contiguous()
+    topk_scores = topk_scores.float().contiguous()
+    previous_event = (
+        EventOverlap(EventHandle())
+        if async_finish and EventHandle is not None and EventOverlap is not None
+        else None
+    )
+    (
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
+        is_token_in_rank,
+        event,
+    ) = buffer.get_dispatch_layout(
+        topk_indices,
+        num_experts=num_experts,
+        previous_event=previous_event,
+        async_finish=async_finish,
+        allocate_on_comm_stream=allocate_on_comm_stream,
+    )
+    result = buffer.dispatch(
+        hidden_states,
+        topk_idx=topk_indices,
+        topk_weights=topk_scores,
+        num_tokens_per_rank=num_tokens_per_rank,
+        num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+        is_token_in_rank=is_token_in_rank,
+        num_tokens_per_expert=num_tokens_per_expert,
+        previous_event=event,
+        async_finish=async_finish,
+        allocate_on_comm_stream=allocate_on_comm_stream,
+    )
+    if async_finish:
+        result[-1].current_stream_wait()
+    return result
+
+
 class _DeepEPDispatch(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -142,48 +193,22 @@ class _DeepEPDispatch(torch.autograd.Function):
         async_finish: bool,
         allocate_on_comm_stream: bool,
     ):
-        buffer = _get_deepep_buffer(group, _tensor_hidden_bytes(hidden_states))
-        # DeepEP's public C++ contract requires all three dispatch inputs to be
-        # contiguous. Router replay and hash-router indexing can return valid
-        # 2-D views with non-contiguous strides, so normalize at the backend
-        # boundary rather than imposing layout requirements on every router.
-        hidden_states = hidden_states.contiguous()
-        topk_indices = topk_indices.contiguous()
-        topk_scores = topk_scores.float().contiguous()
-        previous_event = (
-            EventOverlap(EventHandle())
-            if async_finish and EventHandle is not None and EventOverlap is not None
-            else None
-        )
         (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-            is_token_in_rank,
-            event,
-        ) = buffer.get_dispatch_layout(
+            recv_hidden,
+            recv_indices,
+            recv_probs,
+            recv_per_expert,
+            handle,
+            _,
+        ) = _dispatch_deepep_raw(
+            group,
+            hidden_states,
             topk_indices,
-            num_experts=num_experts,
-            previous_event=previous_event,
+            topk_scores,
+            num_experts,
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
-        (recv_hidden, recv_indices, recv_probs, recv_per_expert, handle, after_event) = (
-            buffer.dispatch(
-                hidden_states,
-                topk_idx=topk_indices,
-                topk_weights=topk_scores,
-                num_tokens_per_rank=num_tokens_per_rank,
-                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-                is_token_in_rank=is_token_in_rank,
-                num_tokens_per_expert=num_tokens_per_expert,
-                previous_event=event,
-                async_finish=async_finish,
-                allocate_on_comm_stream=allocate_on_comm_stream,
-            )
-        )
-        if async_finish:
-            after_event.current_stream_wait()
 
         ctx.group = group
         ctx.handle = handle
@@ -287,6 +312,9 @@ class TokenDispatcher:
         moe_permute_fusion: bool | None = None,
         capacity_factor: float | None = None,
     ):
+        global _token_dispatcher_instances
+        self._debug_dispatcher_id = _token_dispatcher_instances
+        _token_dispatcher_instances += 1
         self.ps = ps
         self.num_experts = num_experts
         self.ep_size = ps.ep_size
@@ -305,7 +333,18 @@ class TokenDispatcher:
         if self.use_deepep:
             assert ps.tp_ep_group is not None
             self._deepep_group = ps.tp_ep_group
-            self.buffer = _build_deepep_buffer(ps.tp_ep_group, hidden_size)
+            # Match MCore's _DeepepManager initialization exactly.  DeepEP's
+            # SM allocation is process-global; leaving it at the package
+            # default makes this shared dispatcher differ from both mLite.lite
+            # through MCore and Slime, and can starve later collectives while
+            # grouped expert kernels are active.
+            deep_ep.Buffer.set_num_sms(20)
+            # Match MCore/Slime: get_buffer() is entered by the first dispatch,
+            # after a colocated trainer has woken and restored its CUDA state.
+            # Eager construction here makes the DeepEP runtime span VERL's
+            # initial model offload/empty-cache boundary, a lifecycle that the
+            # mature fused_a2a manager deliberately avoids.
+            self.buffer = None
 
         self._row_id_map: torch.Tensor | None = None
         self._restore_shape: tuple | None = None
@@ -323,6 +362,16 @@ class TokenDispatcher:
             self._restore_by_ranks = (
                 chunk_idxs.reshape(self.num_local_experts, self.ep_size).T.ravel().tolist()
             )
+
+    def _ensure_deepep_buffer(self, hidden_states: torch.Tensor):
+        """Lazily enter MCore/Slime's process-wide normal DeepEP runtime."""
+
+        if not self.use_deepep:
+            raise RuntimeError("DeepEP buffer requested while DeepEP is disabled")
+        self.buffer = _get_deepep_buffer(
+            self._deepep_group, _tensor_hidden_bytes(hidden_states)
+        )
+        return self.buffer
 
     def dispatch(
         self,
@@ -379,9 +428,20 @@ class TokenDispatcher:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Normal DeepEP transport with vLLM LL route/layout semantics."""
 
+        if self.use_deepep:
+            self._ensure_deepep_buffer(hidden_states)
+
         self._debug_dispatch_calls += 1
         debug_call = self._debug_dispatch_calls
         _debug_cuda_boundary("aligned_dispatch.input", hidden_states, call=debug_call)
+        route_diagnostics = os.environ.get("MLITE_DEEPEP_ROUTE_DIAGNOSTICS") == "1"
+        if route_diagnostics:
+            print(
+                "MLITE_DEEPEP_COLLECTIVE_DIAGNOSTIC "
+                f"call={debug_call} rank={dist.get_rank()} stage=primary.begin "
+                f"tokens={hidden_states.shape[0]}",
+                flush=True,
+            )
 
         if hidden_states.ndim != 2 or hidden_states.dtype != torch.bfloat16:
             raise TypeError("aligned DeepEP requires BF16 [tokens, hidden]")
@@ -391,6 +451,24 @@ class TokenDispatcher:
             raise ValueError("top-k IDs and scores must have identical shapes")
         topk_indices = topk_indices.long().contiguous()
         topk_scores = topk_scores.float().contiguous()
+
+        route_dump_dir = os.environ.get("MLITE_DEEPEP_ROUTE_DUMP_DIR")
+        if route_dump_dir:
+            os.makedirs(route_dump_dir, exist_ok=True)
+            torch.save(
+                {
+                    "topk_indices": topk_indices.detach().cpu(),
+                    "topk_scores": topk_scores.detach().cpu(),
+                    "hidden_rows": hidden_states.shape[0],
+                    "num_experts": self.num_experts,
+                    "ep_size": self.ep_size,
+                },
+                os.path.join(
+                    route_dump_dir,
+                    f"rank{dist.get_rank():02d}.dispatcher{self._debug_dispatcher_id:02d}."
+                    f"call{debug_call:02d}.pt",
+                ),
+            )
 
         if self.ep_size > 1:
             (
@@ -411,11 +489,26 @@ class TokenDispatcher:
             _debug_cuda_boundary(
                 "aligned_dispatch.primary", received_hidden, call=debug_call
             )
-            # Match slime/MCore ownership: keep the primary DeepEP outputs
-            # alive unchanged while the route-fingerprint dispatch reuses the
-            # process-wide buffer.  Rebinding caller-owned clones here drops
-            # the original output owners before the second dispatch and is not
-            # part of the mature lifecycle.
+            if route_diagnostics:
+                primary_counts = received_per_expert.tolist()
+                print(
+                    "MLITE_DEEPEP_COLLECTIVE_DIAGNOSTIC "
+                    f"call={debug_call} rank={dist.get_rank()} stage=primary.done "
+                    f"received_tokens={received_hidden.shape[0]} "
+                    f"received_routes={sum(primary_counts)} "
+                    f"max_expert_routes={max(primary_counts, default=0)} "
+                    f"nonempty_experts={sum(count > 0 for count in primary_counts)}",
+                    flush=True,
+                )
+                # Snapshot only the route-bearing primary outputs.  This is a
+                # diagnostic probe for DeepEP output ownership when the same
+                # process-wide buffer is used by the metadata dispatch below;
+                # it is deliberately absent from the production path.
+                primary_indices_before_metadata = received_indices.clone()
+                primary_weights_before_metadata = received_weights.clone()
+                primary_fingerprints_before_metadata = (
+                    received_hidden.detach().narrow(1, 0, 16).clone()
+                )
             (
                 route_indices,
                 route_weights,
@@ -428,24 +521,102 @@ class TokenDispatcher:
                 topk_scores,
                 assume_all_routes_valid=source_fixed_topk_valid,
             )
+            if route_diagnostics:
+                print(
+                    "MLITE_DEEPEP_COLLECTIVE_DIAGNOSTIC "
+                    f"call={debug_call} rank={dist.get_rank()} stage=metadata.begin "
+                    f"routes={route_indices.shape[0]}",
+                    flush=True,
+                )
             (
                 received_fingerprints,
                 received_route_indices,
                 received_route_weights,
                 _,
                 route_handle,
-            ) = _DeepEPDispatch.apply(
+                _,
+            ) = _dispatch_deepep_raw(
                 self._deepep_group,
                 route_fingerprints,
                 route_indices,
                 route_weights,
                 self.num_experts,
-                False,
-                False,
+                async_finish=False,
+                allocate_on_comm_stream=False,
             )
             _debug_cuda_boundary(
                 "aligned_dispatch.fingerprint", received_fingerprints, call=debug_call
             )
+            if route_diagnostics:
+                print(
+                    "MLITE_DEEPEP_COLLECTIVE_DIAGNOSTIC "
+                    f"call={debug_call} rank={dist.get_rank()} stage=metadata.done",
+                    flush=True,
+                )
+                indices_changed = int(
+                    (received_indices != primary_indices_before_metadata).sum().item()
+                )
+                weights_changed = int(
+                    (received_weights != primary_weights_before_metadata).sum().item()
+                )
+                source_weights_nonfinite = int(
+                    (~torch.isfinite(topk_scores)).sum().item()
+                )
+                primary_weights_nonfinite = int(
+                    (~torch.isfinite(received_weights)).sum().item()
+                )
+                metadata_weights_nonfinite = int(
+                    (~torch.isfinite(received_route_weights)).sum().item()
+                )
+                fingerprints_changed = int(
+                    (
+                        received_hidden.detach().narrow(1, 0, 16)
+                        != primary_fingerprints_before_metadata
+                    )
+                    .sum()
+                    .item()
+                )
+                local_experts = int(received_per_expert.numel())
+                primary_valid = received_indices[
+                    (received_indices >= 0) & (received_indices < local_experts)
+                ].long()
+                metadata_flat = received_route_indices.reshape(-1).long()
+                metadata_valid = metadata_flat[
+                    (metadata_flat >= 0) & (metadata_flat < local_experts)
+                ]
+                primary_histogram = torch.bincount(
+                    primary_valid, minlength=local_experts
+                )
+                metadata_histogram = torch.bincount(
+                    metadata_valid, minlength=local_experts
+                )
+                histogram_delta = metadata_histogram - primary_histogram
+                differing_experts = torch.nonzero(
+                    histogram_delta != 0, as_tuple=False
+                ).reshape(-1)
+                differing_preview = [
+                    (
+                        int(expert),
+                        int(primary_histogram[expert]),
+                        int(metadata_histogram[expert]),
+                    )
+                    for expert in differing_experts[:16].tolist()
+                ]
+                print(
+                    "MLITE_DEEPEP_ROUTE_OWNERSHIP_DIAGNOSTIC "
+                    f"call={debug_call} rank={dist.get_rank()} "
+                    f"indices_changed={indices_changed} "
+                    f"weights_changed={weights_changed} "
+                    f"source_weights_nonfinite={source_weights_nonfinite} "
+                    f"primary_weights_nonfinite={primary_weights_nonfinite} "
+                    f"metadata_weights_nonfinite={metadata_weights_nonfinite} "
+                    f"fingerprints_changed={fingerprints_changed} "
+                    f"primary_hist_sum={int(primary_histogram.sum().item())} "
+                    f"metadata_hist_sum={int(metadata_histogram.sum().item())} "
+                    f"differing_experts={int(differing_experts.numel())} "
+                    f"differing_preview={differing_preview}",
+                    flush=True,
+                )
         else:
             received_hidden = hidden_states
             received_indices = topk_indices
@@ -549,6 +720,13 @@ class TokenDispatcher:
     ) -> torch.Tensor:
         debug_call = self._debug_dispatch_calls
         _debug_cuda_boundary("aligned_combine.input", expert_output, call=debug_call)
+        route_diagnostics = os.environ.get("MLITE_DEEPEP_ROUTE_DIAGNOSTICS") == "1"
+        if route_diagnostics:
+            print(
+                "MLITE_DEEPEP_COLLECTIVE_DIAGNOSTIC "
+                f"call={debug_call} rank={dist.get_rank()} stage=combine.begin",
+                flush=True,
+            )
         _validate_finite(
             "deepep.aligned_combine.input",
             expert_output=expert_output,
@@ -561,6 +739,12 @@ class TokenDispatcher:
             route_outputs=route_outputs,
         )
         if self.ep_size > 1:
+            # Match Slime's route-preserving DeepEP lifecycle in both training
+            # and forward-only execution: submit combine asynchronously through
+            # the autograd wrapper, then make the current stream wait for the
+            # returned event.  Calling Buffer.combine synchronously only in
+            # no-grad mode leaves a different channel/handle completion order
+            # across pipeline microbatches.
             source_routes = _DeepEPCombine.apply(
                 self._deepep_group,
                 route_outputs,
@@ -571,6 +755,12 @@ class TokenDispatcher:
             _debug_cuda_boundary(
                 "aligned_combine.route", source_routes, call=debug_call
             )
+            if route_diagnostics:
+                print(
+                    "MLITE_DEEPEP_COLLECTIVE_DIAGNOSTIC "
+                    f"call={debug_call} rank={dist.get_rank()} stage=combine.done",
+                    flush=True,
+                )
         else:
             source_routes = route_outputs
         _validate_finite(
@@ -795,9 +985,7 @@ class TokenDispatcher:
             if EventHandle is not None and EventOverlap is not None
             else None
         )
-        buffer = _get_deepep_buffer(
-            self._deepep_group, _tensor_hidden_bytes(hidden_states)
-        )
+        buffer = self._ensure_deepep_buffer(hidden_states)
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -918,6 +1106,7 @@ class TokenDispatcher:
         return dispatched, local_tpe, permuted_probs
 
     def _dispatch_deepep(self, hidden_states, topk_scores, topk_indices):
+        self._ensure_deepep_buffer(hidden_states)
         if torch.is_grad_enabled():
             recv_hidden, recv_indices, recv_probs, recv_per_expert, handle = _DeepEPDispatch.apply(
                 self._deepep_group,

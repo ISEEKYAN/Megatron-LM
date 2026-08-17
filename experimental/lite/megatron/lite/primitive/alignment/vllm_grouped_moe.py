@@ -7,7 +7,6 @@ import torch.nn.functional as F
 
 from megatron.lite.primitive.modules.experts import swiglu_with_probs
 from megatron.lite.primitive.quantization.deployment_block_fp8 import (
-    pack_block_fp8_activation,
     pack_grouped_block_fp8_weight,
 )
 
@@ -54,6 +53,40 @@ def _build_m_indices(counts: tuple[int, ...], device: torch.device) -> torch.Ten
     return output
 
 
+def _vllm_quantize_contiguous_input(
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match the vLLM LL dispatch quant contract in contiguous layout."""
+    import vllm.envs as envs
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+        per_token_group_quant_fp8_packed_for_deepgemm,
+    )
+    from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
+
+    scale_format = DeepGemmQuantScaleFMT.from_oracle()
+    if scale_format == DeepGemmQuantScaleFMT.UE8M0:
+        return per_token_group_quant_fp8_packed_for_deepgemm(
+            value,
+            128,
+            use_ue8m0=True,
+        )
+    if scale_format != DeepGemmQuantScaleFMT.FLOAT32:
+        raise RuntimeError(
+            "contiguous DS4 input requires FLOAT32 or packed UE8M0 scales, "
+            f"got {scale_format}"
+        )
+    return per_token_group_quant_fp8(
+        value,
+        128,
+        eps=1e-10,
+        dtype=torch.float8_e4m3fn,
+        column_major_scales=True,
+        tma_aligned_scales=bool(envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES),
+        use_ue8m0=False,
+    )
+
+
 def _vllm_silu_mul_quant(
     gate_up: torch.Tensor,
     *,
@@ -61,6 +94,8 @@ def _vllm_silu_mul_quant(
     swiglu_limit: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        ds4_silu_mul_quant_fp8,
+        is_ds4_alignment_quant_enabled,
         per_token_group_quant_fp8_packed_for_deepgemm,
         silu_mul_per_token_group_quant_fp8_colmajor,
         silu_mul_quant_fp8_packed_triton,
@@ -68,6 +103,20 @@ def _vllm_silu_mul_quant(
     from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
 
     scale_format = DeepGemmQuantScaleFMT.from_oracle()
+    if is_ds4_alignment_quant_enabled():
+        if swiglu_limit > 0:
+            # BatchedDeepGemmExperts, which is the rollout reference for this
+            # DS4 path, exposes plain SiLU*up at this fused quant boundary.
+            # Keep the argument for the BF16 fallback/VJP contract, but do not
+            # introduce a training-only clamp into the visible forward.
+            pass
+        return ds4_silu_mul_quant_fp8(
+            gate_up,
+            output_q=output,
+            use_ue8m0=(scale_format == DeepGemmQuantScaleFMT.UE8M0),
+            masked_m=None,
+            group_size=128,
+        )
     if scale_format == DeepGemmQuantScaleFMT.UE8M0:
         return silu_mul_quant_fp8_packed_triton(
             input=gate_up,
@@ -105,11 +154,11 @@ def _vllm_grouped_forward(
         return hidden_states.new_empty((0, hidden_states.shape[1]))
     padded, padded_counts, valid_rows = _pad_expert_rows(hidden_states, counts)
     m_indices = _build_m_indices(padded_counts, hidden_states.device)
-    packed_input = pack_block_fp8_activation(padded)
+    packed_input = _vllm_quantize_contiguous_input(padded)
     packed_w13 = pack_grouped_block_fp8_weight(w13)
     gate_up = hidden_states.new_empty((padded.shape[0], w13[0].shape[0]))
     m_grouped_fp8_gemm_nt_contiguous(
-        (packed_input.qactivation, packed_input.scales),
+        packed_input,
         (packed_w13.qweight, packed_w13.scales),
         gate_up,
         m_indices,
@@ -193,4 +242,3 @@ class VLLMGroupedMoEWithBF16Backward(torch.autograd.Function):
                     grad_w2[expert].add_(grad_fc2)
             offset += count
         return grad_hidden, None, None, None, *grad_w13, *grad_w2
-

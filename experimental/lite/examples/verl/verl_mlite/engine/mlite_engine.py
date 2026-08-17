@@ -9,6 +9,7 @@ import math
 import os
 import time
 import weakref
+from contextlib import nullcontext
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any
@@ -843,14 +844,20 @@ class MegatronLiteEngine(BaseEngine):
                 "router_replay_mode='R3' requires routed_experts on every "
                 "actor micro-batch in a step."
             )
-        result = self.runtime.forward_backward(
-            self.handle,
-            iter(runtime_batches),
-            loss_fn=runtime_loss_fn,
-            num_microbatches=num_micro_batches,
-            forward_only=forward_only,
-            router_replay={"action": "replay"} if replay_enabled else None,
-        )
+        # Match Slime's @torch.no_grad forward_only entrypoint and the other
+        # VERL engines.  Besides avoiding useless activation storage during
+        # old-logprob evaluation, this prevents training-only communication
+        # handles from being retained across MoE layers in an inference pass.
+        grad_context = torch.no_grad() if forward_only else nullcontext()
+        with grad_context:
+            result = self.runtime.forward_backward(
+                self.handle,
+                iter(runtime_batches),
+                loss_fn=runtime_loss_fn,
+                num_microbatches=num_micro_batches,
+                forward_only=forward_only,
+                router_replay={"action": "replay"} if replay_enabled else None,
+            )
         if reduced_outputs is not None:
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
         metrics = dict(result.metrics)

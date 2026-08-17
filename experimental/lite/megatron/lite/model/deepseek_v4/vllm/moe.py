@@ -12,14 +12,15 @@ import torch.nn.functional as F
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.vllm.primitive import (
     block_fp8_linear,
-    deep_ep_moe,
     fixed_route_vjp,
     gate_linear as training_gate_linear,
+)
+from megatron.lite.primitive.alignment.vllm_grouped_moe import (
+    VLLMGroupedMoEWithBF16Backward,
 )
 from megatron.lite.primitive.kernels.vllm_ds4 import (
     DS4TopKAdapter,
     GateLinearAdapter,
-    GroupedDeepGemmExpertsAdapter,
     HashRouteAdapter,
 )
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
@@ -127,51 +128,36 @@ class _LocalExpertsState(nn.Module):
                 for _ in range(self.local_count)
             ]
         )
-        expert_map = torch.full(
-            (config.n_routed_experts,), -1, dtype=torch.int32
-        )
-        expert_map[self.global_start : self.global_start + self.local_count] = (
-            torch.arange(self.local_count, dtype=torch.int32)
-        )
-        self.register_buffer("expert_map", expert_map, persistent=False)
-        self.grouped_adapter = GroupedDeepGemmExpertsAdapter()
+        # The rollout BatchedDeepGemm path currently exposes plain SiLU*up for
+        # routed experts.  The compute-only VJP must differentiate that same
+        # visible function, not the clamped Lite expert fallback.
+        self.visible_swiglu_limit = 0.0
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor | None,
         *,
-        build_kernel: Callable[[Any], Any],
-        dispatcher: TokenDispatcher,
-        global_num_experts: int,
+        tokens_per_expert_list: list[int] | None = None,
     ) -> torch.Tensor:
-        def visible(hidden, probs, ids, *weights):
-            split = len(weights) // 2
-            return self.grouped_adapter(
-                hidden,
-                weights[:split],
-                weights[split:],
-                # FSDP2 mixed precision casts router outputs to BF16, while
-                # the official grouped-MoE kernel requires FP32 top-k weights.
-                _kernel_topk_weights(probs),
-                ids,
-                build_kernel=lambda packed: build_kernel(
-                    packed, dispatcher=dispatcher
-                ),
-                global_num_experts=global_num_experts,
-                expert_map=self.expert_map,
+        if tokens_per_expert_list is not None:
+            tokens_per_expert = torch.tensor(
+                tokens_per_expert_list,
+                device=tokens_per_expert.device,
+                dtype=tokens_per_expert.dtype,
             )
-
-        return deep_ep_moe(
-            visible,
+        if permuted_probs is None:
+            permuted_probs = hidden_states.new_zeros(
+                (hidden_states.shape[0],), dtype=torch.float32
+            )
+        return VLLMGroupedMoEWithBF16Backward.apply(
             hidden_states,
-            topk_weights,
-            topk_ids,
-            self.w13,
-            self.w2,
-            group=self.ps.ep_group,
-            global_expert_start=self.global_start,
+            tokens_per_expert,
+            permuted_probs,
+            self.visible_swiglu_limit,
+            *self.w13,
+            *self.w2,
         )
 
 
@@ -296,18 +282,25 @@ class DeepseekV4MoE(nn.Module):
 
         if "deepep" not in self.selected_stages:
             raise NotImplementedError("stage 'deepep' was not executed")
-        if not self.use_deepep or metadata.build_grouped_moe is None:
+        if not self.use_deepep:
             raise NotImplementedError(
                 "MoE requires normal DeepEP transport aligned to low-latency semantics"
             )
-        output = self.experts(
+        dispatched, tokens_per_expert, permuted_probs = self.dispatcher.dispatch(
             hidden_states,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids.to(dtype=torch.int64),
-            build_kernel=metadata.build_grouped_moe,
-            dispatcher=self.dispatcher,
-            global_num_experts=self.config.n_routed_experts,
+            _kernel_topk_weights(topk_weights),
+            topk_ids.to(dtype=torch.int64),
         )
+        self.dispatcher.wait_dispatch_event()
+        output = self.experts(
+            dispatched,
+            tokens_per_expert,
+            permuted_probs,
+            tokens_per_expert_list=getattr(
+                self.dispatcher, "_local_tpe_list", None
+            ),
+        )
+        output = self.dispatcher.combine(output)
         if self.shared_experts is not None:
             output = output + self.shared_experts(hidden_states)
         return output

@@ -6,6 +6,66 @@ from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.parallel import ParallelState
 
 
+def test_deepep_initialization_matches_mcore_num_sms(monkeypatch) -> None:
+    import megatron.lite.primitive.modules.dispatcher as dispatcher_module
+
+    calls = []
+
+    class FakeBuffer:
+        @staticmethod
+        def set_num_sms(value):
+            calls.append(value)
+
+    group = object()
+    monkeypatch.setattr(
+        dispatcher_module,
+        "deep_ep",
+        type("FakeDeepEP", (), {"Buffer": FakeBuffer}),
+    )
+    ps = types.SimpleNamespace(ep_size=2, tp_ep_group=group)
+
+    dispatcher = TokenDispatcher(4, 16, ps, use_deepep=True)
+
+    assert calls == [20]
+    assert dispatcher.buffer is None
+
+
+def test_deepep_buffer_is_created_lazily_at_dispatch(monkeypatch) -> None:
+    import megatron.lite.primitive.modules.dispatcher as dispatcher_module
+
+    class FakeBuffer:
+        @staticmethod
+        def set_num_sms(_value):
+            pass
+
+    group = object()
+    sentinel = object()
+    monkeypatch.setattr(
+        dispatcher_module,
+        "deep_ep",
+        type("FakeDeepEP", (), {"Buffer": FakeBuffer}),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_get_deepep_buffer",
+        lambda actual_group, _hidden_bytes: (
+            sentinel if actual_group is group else None
+        ),
+    )
+    dispatcher = TokenDispatcher(
+        4,
+        16,
+        types.SimpleNamespace(ep_size=2, tp_ep_group=group),
+        use_deepep=True,
+        deepep_align_to_low_latency=True,
+    )
+    dispatcher._ensure_deepep_buffer(
+        torch.zeros(2, 16, dtype=torch.bfloat16)
+    )
+
+    assert dispatcher.buffer is sentinel
+
+
 def _capture_aligned_dispatch_contract(dispatcher, monkeypatch):
     captured = {}
 
