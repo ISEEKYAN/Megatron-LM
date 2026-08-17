@@ -440,19 +440,30 @@ class MegatronLiteEngine(BaseEngine):
             peft_config = self._build_vllm_peft_config(multi_lora_cfg)
             if not kwargs.get("base_sync_done", False):
                 return _export_base_or_merged_weights(), peft_config
-            multi_lora_name = kwargs.get(
-                "multi_lora_name", getattr(self.engine_config, "multi_lora_name", None)
+            caller_multi_lora_name = kwargs.get("multi_lora_name")
+            configured_multi_lora_name = getattr(
+                self.engine_config, "multi_lora_name", None
             )
+            if (
+                caller_multi_lora_name is not None
+                and configured_multi_lora_name is not None
+                and caller_multi_lora_name != configured_multi_lora_name
+            ):
+                raise ValueError(
+                    "multi_lora_name from the caller disagrees with engine configuration."
+                )
+            multi_lora_name = caller_multi_lora_name or configured_multi_lora_name
             if not multi_lora_name:
                 raise ValueError(
                     "model-owned multi-LoRA adapter-only sync requires multi_lora_name."
                 )
-            return (
-                self.runtime.export_weights(
-                    self.handle, multi_lora_name=multi_lora_name
-                ),
-                peft_config,
-            )
+            multi_lora_registry.slot_for(multi_lora_name)
+            self._assert_adapter_rollout_contract(multi_lora_cfg)
+            adapter_kwargs = {"multi_lora_name": multi_lora_name}
+            if "export_dtype" in export_kwargs:
+                adapter_kwargs["export_dtype"] = export_kwargs["export_dtype"]
+            adapter_stream = self.runtime.export_lora_adapter(self.handle, **adapter_kwargs)
+            return self._checked_adapter_stream(adapter_stream), peft_config
 
         if not lora_enabled:
             return _export_base_or_merged_weights(), None

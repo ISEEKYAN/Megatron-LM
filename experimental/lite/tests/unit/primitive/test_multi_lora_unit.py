@@ -1544,7 +1544,9 @@ def test_runtime_exports_named_adapter_from_model_owned_registry():
     )
     runtime = SimpleNamespace(multi_lora_registry=MegatronLiteRuntime.multi_lora_registry)
 
-    exported = list(MegatronLiteRuntime.export_weights(runtime, handle, multi_lora_name="alpha"))
+    exported = list(
+        MegatronLiteRuntime.export_lora_adapter(runtime, handle, multi_lora_name="alpha")
+    )
     assert exported[0][0] == "adapter.weight"
     torch.testing.assert_close(exported[0][1], torch.ones(1))
     assert captured["chunks"] == [chunk]
