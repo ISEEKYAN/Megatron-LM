@@ -20,6 +20,7 @@ Protocol convention (what runtime calls):
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,22 @@ class ImplConfig:
     lora: LoraConfig | dict | None = None
     # Weight-only QAT: float fp8_e4m3 / mxfp4 or int8 / int4. Default None = disabled.
     qat: QATSpec | dict | None = None
+
+
+def _validate_meta_parameters(model: torch.nn.Module) -> None:
+    non_meta = []
+    for module_name, module in model.named_modules():
+        for parameter_name, parameter in module.named_parameters(recurse=False):
+            if parameter.device.type == "meta":
+                continue
+            name = f"{module_name}.{parameter_name}" if module_name else parameter_name
+            size = parameter.numel() * parameter.element_size()
+            non_meta.append(
+                f"{name} (module={type(module).__name__}, device={parameter.device}, bytes={size})"
+            )
+    if non_meta:
+        details = "\n".join(non_meta)
+        raise RuntimeError(f"FSDP2 meta initialization left materialized parameters:\n{details}")
 
 
 # ---------------------------------------------------------------------------
@@ -196,16 +213,20 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     )
 
     vpp = None if p.vpp == 1 else p.vpp
+    meta_init = impl_cfg.optimizer == "fsdp2"
+
+    def build_chunk(**kwargs):
+        with torch.device("meta") if meta_init else nullcontext():
+            chunk = Qwen3MoEModel(model_cfg, ps, **kwargs, **model_kwargs).to(torch.bfloat16)
+        if meta_init:
+            _validate_meta_parameters(chunk)
+        chunk._mlite_meta_init = meta_init
+        return chunk if meta_init else chunk.cuda()
+
     if vpp is None:
-        chunks = [Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
+        chunks = [build_chunk()]
     else:
-        chunks = []
-        for i in range(vpp):
-            chunks.append(
-                Qwen3MoEModel(model_cfg, ps, vpp=vpp, vpp_chunk_id=i, **model_kwargs)
-                .to(torch.bfloat16)
-                .cuda()
-            )
+        chunks = [build_chunk(vpp=vpp, vpp_chunk_id=i) for i in range(vpp)]
 
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 

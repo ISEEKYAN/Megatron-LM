@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
 
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.modules.gqa_utils import (
     split_grouped_qkvg,
     split_grouped_qkvg_for_tp,
@@ -108,12 +108,8 @@ class GQAttention(nn.Module):
             eps=rms_norm_eps,
             zero_centered_gamma=zero_centered_gamma,
         )
-        self.q_norm = te.RMSNorm(
-            head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
-        )
-        self.k_norm = te.RMSNorm(
-            head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
-        )
+        self.q_norm = te.RMSNorm(head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma)
+        self.k_norm = te.RMSNorm(head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma)
 
         lora = normalize_lora_config(lora_config)
         self.qkv_lora: LinearLoRA | None = None
