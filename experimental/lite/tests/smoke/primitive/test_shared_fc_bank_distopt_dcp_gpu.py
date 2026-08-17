@@ -136,14 +136,23 @@ def _inner_optimizers(optimizer):
     yield optimizer
 
 
+def _model_param_range_or_none(optimizer, parameter):
+    """A non-owning dist-opt leaf has no model-param map on this MCore surface."""
+    if not hasattr(optimizer, "model_param_gbuf_map"):
+        return None
+    try:
+        return optimizer._get_model_param_range_map(parameter)
+    except KeyError:
+        return None
+
+
 def _local_optimizer_slices(chunks, optimizer):
     model = getattr(chunks[0], "module", chunks[0])
     parameter = dict(model.named_parameters())[_BANK_NAME]
     result = []
     for wrapped in _inner_optimizers(optimizer):
-        try:
-            ranges = wrapped._get_model_param_range_map(parameter)
-        except KeyError:
+        ranges = _model_param_range_or_none(wrapped, parameter)
+        if ranges is None:
             continue
         param_range = ranges["param"]
         master = parameter.main_param

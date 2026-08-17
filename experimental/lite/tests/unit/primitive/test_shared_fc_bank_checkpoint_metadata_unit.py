@@ -35,3 +35,21 @@ def test_dist_opt_finalization_precedes_outer_optimizer_step(monkeypatch):
     shared_fc_gpu._production_finalize_grads(chunks, optimizer)()
     OuterOptimizer().step()
     assert calls == ["finalize_model_grads", "outer_step"]
+
+
+def test_nonowning_dist_opt_leaf_does_not_supply_a_parameter_range():
+    parameter = object()
+
+    class NonOwner:
+        pass
+
+    class Owner:
+        model_param_gbuf_map = {parameter: object()}
+
+        @staticmethod
+        def _get_model_param_range_map(actual_parameter):
+            assert actual_parameter is parameter
+            return {"param": slice(0, 4)}
+
+    assert shared_fc_gpu._model_param_range_or_none(NonOwner(), parameter) is None
+    assert shared_fc_gpu._model_param_range_or_none(Owner(), parameter) == {"param": slice(0, 4)}
