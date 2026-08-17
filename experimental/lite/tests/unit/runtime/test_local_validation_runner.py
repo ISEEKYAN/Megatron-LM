@@ -65,6 +65,15 @@ class _FakeItem:
         return iter(self._markers.get(name, []))
 
 
+class _FakeConfig:
+    def __init__(self) -> None:
+        self.marker_descriptions = []
+
+    def addinivalue_line(self, name: str, value: str) -> None:
+        assert name == "markers"
+        self.marker_descriptions.append(value)
+
+
 def _marker(*args, **kwargs):
     return SimpleNamespace(args=args, kwargs=kwargs)
 
@@ -196,6 +205,19 @@ def test_marker_defaults_describe_cpu_hopper_and_600_seconds():
     assert cpu.timeout_seconds == 600
     assert gpu.gpus == 2
     assert gpu.min_architecture == "hopper"
+
+
+def test_legacy_gpu_and_mlite_smoke_markers_are_registered_and_scheduled():
+    config = _FakeConfig()
+    markers.register(config)
+
+    registered = "\n".join(config.marker_descriptions)
+    assert "gpu:" in registered
+    assert "mlite:" in registered
+    assert "smoke:" in registered
+    legacy_gpu = markers.execution_for_item(_FakeItem(gpu=[_marker()]))
+    assert legacy_gpu.gpus == 1
+    assert legacy_gpu.min_architecture == "hopper"
 
 
 def test_marker_scopes_merge_environment_and_closest_values_win():
