@@ -324,6 +324,29 @@ def test_encoded_bank_names_have_explicit_dense_checkpoint_semantics():
     )
 
 
+@pytest.mark.parametrize(
+    "name",
+    (
+        "bank__a",
+        "bank_zz_a",
+        "bank_ff_a",
+        "bank_4C61796572732e30_a",
+        "bank_6c61796572732e30_a_extra",
+    ),
+)
+def test_decode_bank_surface_rejects_empty_malformed_noncanonical_and_non_utf8_names(name):
+    assert decode_bank_surface(name) is None
+
+
+def test_native_expert_checkpoint_semantics_remain_unchanged():
+    native_fc = "layers.0.moe.experts._fc1_weight_0"
+    assert decode_bank_surface(native_fc) is None
+    assert is_expert_param(native_fc)
+    assert EXPERT_CLASSIFIER(native_fc)
+    assert type(PLACEMENT_FN(native_fc)[2]).__name__ == "Shard"
+    assert type(PLACEMENT_FN(native_fc)[3]).__name__ == "Shard"
+
+
 def test_qkv_tp_carrier_collective_trace_has_hidden_rank_gather(monkeypatch):
     calls = []
     monkeypatch.setattr(

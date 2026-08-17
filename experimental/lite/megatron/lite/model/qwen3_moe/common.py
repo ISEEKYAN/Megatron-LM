@@ -16,12 +16,15 @@ def decode_bank_surface(name: str) -> str | None:
         encoded, factor = encoded_factor[len(marker) :].rsplit("_", 1)
     except ValueError:
         return None
-    if factor not in {"a", "b"}:
+    if not encoded or encoded != encoded.lower() or factor not in {"a", "b"}:
         return None
     try:
-        return bytes.fromhex(encoded).decode("utf-8")
+        surface = bytes.fromhex(encoded).decode("utf-8")
     except (UnicodeDecodeError, ValueError):
         return None
+    if not surface or surface.encode("utf-8").hex() != encoded:
+        return None
+    return surface
 
 
 def is_expert_param(name: str) -> bool:
