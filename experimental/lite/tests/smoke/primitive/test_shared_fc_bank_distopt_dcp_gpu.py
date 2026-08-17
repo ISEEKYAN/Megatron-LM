@@ -27,7 +27,7 @@ _BANK_NAME = MultiLoraTrainingState.parameter_name(
 
 
 def _skip_or_fail(message: str) -> None:
-    if os.environ.get("MLITE_TEST_HARNESS") == "1":
+    if os.environ.get("MLITE_SHARED_FC_DCP_RUNNER") == "1":
         pytest.fail(message)
     pytest.skip(message)
 
@@ -35,6 +35,9 @@ def _skip_or_fail(message: str) -> None:
 @pytest.fixture(scope="module", autouse=True)
 def _two_rank_cuda_process_group():
     """Make the standalone torchrun carrier establish its own NCCL group."""
+    from megatron.core import parallel_state as mpu
+
+    mpu_was_initialized = mpu.is_initialized()
     if not torch.cuda.is_available():
         _skip_or_fail("CUDA is required for the shared-FC DCP smoke.")
     if int(os.environ.get("WORLD_SIZE", "1")) != 2:
@@ -46,9 +49,7 @@ def _two_rank_cuda_process_group():
         created = True
     yield
     try:
-        from megatron.core import parallel_state as mpu
-
-        if mpu.is_initialized():
+        if not mpu_was_initialized and mpu.is_initialized():
             mpu.destroy_model_parallel()
     finally:
         if created and dist.is_initialized():
