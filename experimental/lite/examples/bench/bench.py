@@ -52,6 +52,7 @@ class BenchCliConfig:
     use_thd: bool = False
     same_data_across_dp: bool = False
     no_optimizer: bool = False
+    forward_only: bool = False
     skip_load_hf_weights: bool = False
     skip_optimizer_build: bool = False
     keep_experts: int | None = None
@@ -316,6 +317,7 @@ def build_session_config(cfg: BenchCliConfig) -> PretrainSessionConfig:
         use_thd=cfg.use_thd,
         same_data_across_dp=cfg.same_data_across_dp,
         no_optimizer=cfg.no_optimizer,
+        forward_only=cfg.forward_only,
     )
 
 
@@ -447,6 +449,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-thd", action="store_true")
     parser.add_argument("--same-data-across-dp", action="store_true")
     parser.add_argument("--no-optimizer", action="store_true")
+    parser.add_argument(
+        "--forward-only",
+        action="store_true",
+        help="Run the public runtime's eval/no-grad forward-only schedule.",
+    )
     parser.add_argument("--skip-load-hf-weights", action="store_true")
     parser.add_argument("--skip-optimizer-build", action="store_true")
     parser.add_argument("--keep-experts", type=int, default=None)

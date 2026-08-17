@@ -27,6 +27,7 @@ class PretrainSessionConfig:
     use_thd: bool = False
     same_data_across_dp: bool = False
     no_optimizer: bool = False
+    forward_only: bool = False
 
 
 def _is_cuda_device(device: str) -> bool:
@@ -179,20 +180,26 @@ def run_pretrain_session(
     timings: list[float] = []
 
     _reset_peak_memory(cfg.device)
-    with rt.train_mode(handle):
+    mode = rt.eval_mode(handle) if cfg.forward_only else rt.train_mode(handle)
+    with mode:
         for step in range(cfg.steps):
             if step == cfg.warmup:
                 _reset_peak_memory(cfg.device)
 
-            rt.zero_grad(handle)
+            if not cfg.forward_only:
+                rt.zero_grad(handle)
             _sync(cfg.device)
             t0 = time.perf_counter()
             result = rt.forward_backward(
-                handle, data_iter, loss_fn=None, num_microbatches=cfg.num_microbatches
+                handle,
+                data_iter,
+                loss_fn=None,
+                num_microbatches=cfg.num_microbatches,
+                forward_only=cfg.forward_only,
             )
             if post_backward_observer is not None:
                 post_backward_observer(step, handle, result)
-            if cfg.no_optimizer:
+            if cfg.forward_only or cfg.no_optimizer:
                 grad_norm = 0.0
             else:
                 _, grad_norm, _ = rt.optimizer_step(handle)

@@ -281,6 +281,7 @@ class TokenDispatcher:
         use_deepep: bool = True,
         deepep_align_to_low_latency: bool = False,
         moe_permute_fusion: bool | None = None,
+        capacity_factor: float | None = None,
     ):
         self.ps = ps
         self.num_experts = num_experts
@@ -292,6 +293,7 @@ class TokenDispatcher:
 
         self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
         self.deepep_align_to_low_latency = bool(deepep_align_to_low_latency)
+        self.capacity_factor = capacity_factor
         if self.deepep_align_to_low_latency and ps.ep_size > 1 and not self.use_deepep:
             raise RuntimeError(
                 "low-latency semantic alignment at EP>1 requires normal DeepEP"
@@ -319,11 +321,31 @@ class TokenDispatcher:
             )
 
     def dispatch(
-        self, hidden_states: torch.Tensor, topk_scores: torch.Tensor, topk_indices: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        topk_scores: torch.Tensor,
+        topk_indices: torch.Tensor,
+        *,
+        router_token_masks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        # Match slime's _DeepepManager.setup_metadata contract.  The fixed-topk
+        # route path is valid only when neither expert-capacity dropping nor a
+        # router token mask can introduce -1 sentinels.
+        source_fixed_topk_valid = (
+            self.capacity_factor is None and router_token_masks is None
+        )
+        if self.capacity_factor is not None:
+            topk_indices = topk_indices.masked_fill(topk_scores == 0, -1)
+        if router_token_masks is not None:
+            topk_indices = topk_indices.masked_fill(
+                router_token_masks.view(-1, 1), -1
+            )
         if self.deepep_align_to_low_latency:
             return self._dispatch_low_latency_aligned(
-                hidden_states, topk_scores, topk_indices
+                hidden_states,
+                topk_scores,
+                topk_indices,
+                source_fixed_topk_valid=source_fixed_topk_valid,
             )
         if self.ep_size <= 1:
             return self._dispatch_local(hidden_states, topk_scores, topk_indices)
@@ -348,6 +370,8 @@ class TokenDispatcher:
         hidden_states: torch.Tensor,
         topk_scores: torch.Tensor,
         topk_indices: torch.Tensor,
+        *,
+        source_fixed_topk_valid: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Normal DeepEP transport with vLLM LL route/layout semantics."""
 
@@ -365,14 +389,6 @@ class TokenDispatcher:
         topk_scores = topk_scores.float().contiguous()
 
         if self.ep_size > 1:
-            # Upstream DS4 attention deliberately uses auxiliary CUDA streams.
-            # Its event joins order work on PyTorch's current stream, whereas
-            # DeepEP crosses into a separately managed communication stream
-            # and a host-side rank rendezvous.  Complete that current-stream
-            # dependency before entering the external collective; otherwise a
-            # fast rank can enter DeepEP while a peer still owns outstanding
-            # auxiliary work, leading to an eventual CPU receive timeout.
-            torch.cuda.current_stream(hidden_states.device).synchronize()
             (
                 received_hidden,
                 received_indices,
@@ -391,12 +407,11 @@ class TokenDispatcher:
             _debug_cuda_boundary(
                 "aligned_dispatch.primary", received_hidden, call=debug_call
             )
-            # A second dispatch re-enters the same process-wide DeepEP buffer.
-            # Preserve the primary route metadata as caller-owned tensors; the
-            # full hidden output is already a separate dispatch result and is
-            # intentionally not copied.
-            received_indices = received_indices.clone()
-            received_weights = received_weights.clone()
+            # Match slime/MCore ownership: keep the primary DeepEP outputs
+            # alive unchanged while the route-fingerprint dispatch reuses the
+            # process-wide buffer.  Rebinding caller-owned clones here drops
+            # the original output owners before the second dispatch and is not
+            # part of the mature lifecycle.
             (
                 route_indices,
                 route_weights,
@@ -407,7 +422,7 @@ class TokenDispatcher:
                 hidden_states,
                 topk_indices,
                 topk_scores,
-                assume_all_routes_valid=True,
+                assume_all_routes_valid=source_fixed_topk_valid,
             )
             (
                 received_fingerprints,

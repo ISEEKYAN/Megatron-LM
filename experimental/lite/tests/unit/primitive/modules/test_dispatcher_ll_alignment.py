@@ -1,7 +1,64 @@
+import types
+
 import torch
 
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.parallel import ParallelState
+
+
+def _capture_aligned_dispatch_contract(dispatcher, monkeypatch):
+    captured = {}
+
+    def fake_aligned(self, hidden, scores, indices, *, source_fixed_topk_valid):
+        captured["indices"] = indices
+        captured["source_fixed_topk_valid"] = source_fixed_topk_valid
+        return hidden, torch.empty(0, dtype=torch.int64), scores
+
+    monkeypatch.setattr(
+        dispatcher,
+        "_dispatch_low_latency_aligned",
+        types.MethodType(fake_aligned, dispatcher),
+    )
+    return captured
+
+
+def test_aligned_dispatch_fixed_topk_contract_matches_slime(monkeypatch) -> None:
+    dispatcher = TokenDispatcher.__new__(TokenDispatcher)
+    dispatcher.capacity_factor = None
+    dispatcher.deepep_align_to_low_latency = True
+    captured = _capture_aligned_dispatch_contract(dispatcher, monkeypatch)
+    hidden = torch.zeros(2, 16, dtype=torch.bfloat16)
+    scores = torch.ones(2, 2, dtype=torch.float32)
+    indices = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+
+    dispatcher.dispatch(hidden, scores, indices)
+
+    assert captured["source_fixed_topk_valid"] is True
+    assert captured["indices"] is indices
+
+
+def test_aligned_dispatch_masks_routes_like_slime(monkeypatch) -> None:
+    dispatcher = TokenDispatcher.__new__(TokenDispatcher)
+    dispatcher.capacity_factor = 1.0
+    dispatcher.deepep_align_to_low_latency = True
+    captured = _capture_aligned_dispatch_contract(dispatcher, monkeypatch)
+    hidden = torch.zeros(2, 16, dtype=torch.bfloat16)
+    scores = torch.tensor([[1.0, 0.0], [0.5, 0.5]], dtype=torch.float32)
+    indices = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+    token_mask = torch.tensor([False, True])
+
+    dispatcher.dispatch(
+        hidden,
+        scores,
+        indices,
+        router_token_masks=token_mask,
+    )
+
+    assert captured["source_fixed_topk_valid"] is False
+    assert torch.equal(
+        captured["indices"],
+        torch.tensor([[0, -1], [-1, -1]], dtype=torch.int64),
+    )
 
 
 def test_aligned_deepep_buffer_matches_mcore_process_wide_reuse(monkeypatch) -> None:
