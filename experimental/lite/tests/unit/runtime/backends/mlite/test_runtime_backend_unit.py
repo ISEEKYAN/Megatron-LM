@@ -18,6 +18,7 @@ from megatron.lite.runtime.backends.mlite.runtime import (
     _apply_attention_backend_env,
     _build_impl_cfg,
     _pipeline_callbacks,
+    _pipeline_model_chunks,
 )
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
@@ -59,6 +60,33 @@ def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
 
     assert seen == [("wrapped", context), ("presplit", context)]
     assert metrics == {"batch": "presplit", "source": "source"}
+
+
+def test_pipeline_chunks_are_selected_by_backend_contract():
+    base = nn.Linear(2, 2)
+
+    class Wrapper(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+    wrapper = Wrapper(base)
+
+    class KeepWrapperBackend:
+        @staticmethod
+        def pipeline_model_chunks(model_chunks):
+            return list(model_chunks)
+
+    assert _pipeline_model_chunks([wrapper], KeepWrapperBackend()) == [wrapper]
+    assert _pipeline_model_chunks([wrapper], None) == [base]
+
+
+def test_runtime_source_does_not_branch_on_mfsdp():
+    from megatron.lite.runtime.backends.mlite import runtime
+
+    source = open(runtime.__file__, encoding="utf-8").read()
+    assert '== "mfsdp"' not in source
+    assert "M-FSDP" not in source
 
 
 def test_runtime_config_defaults_to_mlite_backend():

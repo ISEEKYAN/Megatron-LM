@@ -140,6 +140,15 @@ def _checkpoint_module(model: Any) -> torch.nn.Module:
     )
 
 
+def _pipeline_model_chunks(model_chunks: list, optimizer_backend: Any | None) -> list:
+    """Ask the optimizer adapter which modules own pipeline execution."""
+    if optimizer_backend is not None:
+        return list(optimizer_backend.pipeline_model_chunks(model_chunks))
+    from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
+
+    return [unwrap_model(chunk) for chunk in model_chunks]
+
+
 def _pipeline_callbacks(forward_step: Callable, loss_fn: Callable | None):
     def wrapped_forward_step(model, item):
         batch, loss_context = split_loss_context(item)
@@ -254,6 +263,13 @@ class MegatronLiteRuntime(RuntimeBase):
         if bundle.forward_step is None:
             raise ValueError("Megatron Lite model bundles must provide a typed forward_step.")
 
+        optimizer_backend_name = bundle.extras.get("optimizer_backend")
+        optimizer_runtime_backend = None
+        if optimizer_backend_name not in (None, "none"):
+            from megatron.lite.primitive.optimizers import get_optimizer_backend
+
+            optimizer_runtime_backend = get_optimizer_backend(optimizer_backend_name)
+
         p = rt_cfg.parallel
         model = bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks
         return ModelHandle(
@@ -271,6 +287,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 "world_size": dist.get_world_size(),
                 "cp_range": (p.cp, p.cp),
                 **bundle.extras,
+                "optimizer_runtime_backend": optimizer_runtime_backend,
             },
         )
 
@@ -477,7 +494,6 @@ class MegatronLiteRuntime(RuntimeBase):
         if ps.pp_size > 1:
             from types import SimpleNamespace
 
-            from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
             from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
 
             first_item = next(data_iter)
@@ -491,7 +507,9 @@ class MegatronLiteRuntime(RuntimeBase):
             tensor_shape = _infer_pipeline_tensor_shape(first_batch, model_cfg, ps)
 
             model_chunks = handle._extras.get("model_chunks", [handle._model])
-            pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
+            pipeline_chunks = _pipeline_model_chunks(
+                model_chunks, handle._extras.get("optimizer_runtime_backend")
+            )
             pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
             try:
                 outputs = forward_backward_pipelining(

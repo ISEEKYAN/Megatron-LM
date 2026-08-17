@@ -51,6 +51,24 @@ def is_expert_param(name: str) -> bool:
     return "experts" in name and "router" not in name and "shared" not in name
 
 
+def _mfsdp_unit_modules() -> tuple[type[nn.Module], ...]:
+    """Return Qwen3.5 compute boundaries that own M-FSDP lifetimes.
+
+    MCore buckets shared experts under their enclosing TransformerLayer; they
+    are not nested FSDP units. Qwen3.5 does not tie its input and output word
+    matrices, so both vocabulary modules must also be units; otherwise their
+    complete BF16 compute weights remain resident on every DP rank while
+    FSDP2 shards the equivalent root parameters.
+    """
+    from megatron.lite.model.qwen3_5.lite.model import Qwen35Layer
+    from megatron.lite.primitive.parallel import (
+        VocabParallelEmbedding,
+        VocabParallelOutput,
+    )
+
+    return (Qwen35Layer, VocabParallelEmbedding, VocabParallelOutput)
+
+
 @dataclass(frozen=True)
 class ImplConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
@@ -261,6 +279,24 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         )
         register_training_hooks(chunks, optimizer)
         optimizer_backend = "dist_opt"
+    elif impl_cfg.optimizer == "mfsdp":
+        optimizer_backend = "mfsdp"
+
+        def _post_model_load_hook():
+            from megatron.lite.primitive.optimizers.mfsdp import (
+                build_mfsdp_training_optimizer,
+            )
+
+            optimizer, finalize = build_mfsdp_training_optimizer(
+                chunks,
+                impl_cfg=impl_cfg,
+                ps=ps,
+                is_expert=is_expert_param,
+                fsdp_unit_modules=_mfsdp_unit_modules(),
+            )
+            return {"optimizer": optimizer, "finalize_grads": finalize}
+
+        post_model_load_hook = _post_model_load_hook
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 

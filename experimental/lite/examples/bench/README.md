@@ -152,6 +152,59 @@ Compare `loss`, `grad_norm`, `avg_step_ms`, `tok_per_s`, peak memory, and
 `tflops_per_gpu` in the two JSON outputs. Benchmarks are performance evidence;
 they are not a replacement for precision tests.
 
+## Standalone M-FSDP
+
+The native Qwen3 MoE and Qwen3.5 implementations accept `mfsdp` as the
+optimizer selected through `impl_cfg_json`. For the no-offload path, keep
+optimizer state and parameter shards on GPU (`offload_fraction=0.0`). The
+communication-unit budget follows MCore's automatic rule unless an application
+explicitly overrides and revalidates it.
+
+This standalone delivery rejects nonzero `offload_fraction`; optimizer offload
+is a separate implementation and validation path.
+
+```bash
+unset CUDA_DEVICE_MAX_CONNECTIONS
+unset PYTORCH_CUDA_ALLOC_CONF
+
+torchrun --standalone --nproc_per_node 8 \
+  experimental/lite/examples/bench/bench.py \
+  --backend mlite \
+  --hf-path /models/Qwen3.5-35B-A3B \
+  --model-name qwen3_5 \
+  --steps 20 \
+  --warmup 5 \
+  --seq-len 1024 \
+  --num-microbatches 4 \
+  --truncate-layers 8 \
+  --keep-experts 8 \
+  --disable-mtp \
+  --same-data-across-dp \
+  --impl-cfg-json '{"optimizer":"mfsdp","mount_vision_model":false,"calculate_per_token_loss":false}' \
+  --override-optimizer-json \
+    '{"offload_fraction":0.0,"use_precision_aware_optimizer":false,"gradient_accumulation_fusion":false,"megatron_fsdp_main_params_dtype":"fp32","megatron_fsdp_main_grads_dtype":"fp32","megatron_fsdp_grad_comm_dtype":"fp32"}' \
+  --output-json /tmp/qwen35_mfsdp_bench.json
+```
+
+The storage-resize path allocates each communication bucket only while its
+lifetime is active. NCCL user buffers and fixed communication pools are not part
+of this standalone delivery; enabling their knobs fails before construction.
+FP32 main parameters and sharded main gradients are the optimizer/checkpoint
+sources of truth in this configuration.
+The official Megatron-FSDP H100 and MoE recipes disable
+gradient-accumulation fusion, so the command does so explicitly; set it to
+`true` only after separately validating MCore's zero-copy fused-wgrad path for
+the target model and runtime.
+
+For an FSDP2 comparison, keep the workload unchanged, select `fsdp2`, and
+enable FP32 parameter shards without changing other FSDP2-specific options:
+
+```bash
+--impl-cfg-json '{"optimizer":"fsdp2","mount_vision_model":false}' \
+--override-optimizer-json \
+  '{"fsdp2_use_fp32_shards":true,"offload_fraction":0.0}'
+```
+
 ## Deterministic Correctness
 
 Use `correctness.py` for strict deterministic parity. It emits exact scalar

@@ -413,6 +413,11 @@ class DistOptBackend:
     name: str = "dist_opt"
     runtime_backend: str = "dist_opt"
 
+    def pipeline_model_chunks(self, model_chunks: list[nn.Module]) -> list[nn.Module]:
+        from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
+
+        return [unwrap_model(chunk) for chunk in model_chunks]
+
     def zero_grad(self, optimizer: Any) -> None:
         optimizer.zero_grad()
 

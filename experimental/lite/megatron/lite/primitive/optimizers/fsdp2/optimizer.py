@@ -649,6 +649,11 @@ class FSDP2OptimizerBackend:
     name: str = "fsdp2"
     runtime_backend: str = "fsdp2"
 
+    def pipeline_model_chunks(self, model_chunks: list[nn.Module]) -> list[nn.Module]:
+        from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
+
+        return [unwrap_model(chunk) for chunk in model_chunks]
+
     def zero_grad(self, optimizer: FSDP2Optimizer) -> None:
         optimizer.zero_grad()
 
