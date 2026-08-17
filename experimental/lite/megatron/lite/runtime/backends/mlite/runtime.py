@@ -376,25 +376,6 @@ class MegatronLiteRuntime(RuntimeBase):
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
 
-        registry = self.multi_lora_registry(handle)
-        multi_lora_name = kwargs.pop("multi_lora_name", None)
-        if registry is not None and multi_lora_name is not None:
-            exporter = getattr(proto, "export_hf_lora_adapter", None) if proto else None
-            if exporter is None:
-                raise NotImplementedError(
-                    f"Model protocol {type(proto).__name__} does not implement "
-                    "export_hf_lora_adapter; named multi-LoRA export is unavailable."
-                )
-            yield from exporter(
-                model_chunks,
-                model_cfg,
-                ps,
-                multi_lora_registry=registry,
-                multi_lora_name=multi_lora_name,
-                **kwargs,
-            )
-            return
-
         if proto and hasattr(proto, "export_hf_weights"):
             yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
         else:
