@@ -440,7 +440,9 @@ class MegatronLiteEngine(BaseEngine):
             peft_config = self._build_vllm_peft_config(multi_lora_cfg)
             if not kwargs.get("base_sync_done", False):
                 return _export_base_or_merged_weights(), peft_config
-            multi_lora_name = kwargs.get("multi_lora_name")
+            multi_lora_name = kwargs.get(
+                "multi_lora_name", getattr(self.engine_config, "multi_lora_name", None)
+            )
             if not multi_lora_name:
                 raise ValueError(
                     "model-owned multi-LoRA adapter-only sync requires multi_lora_name."

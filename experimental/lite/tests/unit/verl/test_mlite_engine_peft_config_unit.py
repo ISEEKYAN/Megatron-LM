@@ -109,7 +109,11 @@ def test_model_owned_registry_routes_verl_resync_to_the_named_adapter():
         is_param_offload_enabled=False,
         _initial_sync_cache_cleared=True,
         engine_config=SimpleNamespace(
-            resync_format=None, resync_config=None, export_dtype=None, qat={"enable": False}
+            resync_format=None,
+            resync_config=None,
+            export_dtype=None,
+            qat={"enable": False},
+            multi_lora_name="alpha",
         ),
         _mlite_config=SimpleNamespace(impl_cfg={}),
         runtime=Runtime(),
@@ -118,11 +122,14 @@ def test_model_owned_registry_routes_verl_resync_to_the_named_adapter():
         _build_vllm_peft_config=lambda config: {"r": config["rank"]},
     )
 
-    weights, metadata = export(engine, base_sync_done=True, multi_lora_name="alpha")
+    # VERL's real caller does not pass a multi_lora_name to this method.  The
+    # engine config is the explicit selection surface for the named adapter.
+    weights, metadata = export(engine, base_sync_done=True)
 
     assert list(weights) == []
     assert metadata == {"r": 8}
     assert captured == {"handle": engine.handle, "kwargs": {"multi_lora_name": "alpha"}}
+    engine.engine_config.multi_lora_name = None
     with pytest.raises(ValueError, match="requires multi_lora_name"):
         export(engine, base_sync_done=True)
 
