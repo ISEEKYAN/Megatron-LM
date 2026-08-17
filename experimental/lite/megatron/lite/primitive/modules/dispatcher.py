@@ -160,6 +160,7 @@ class _DeepEPDispatch(torch.autograd.Function):
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
+        _debug_cuda_boundary("deepep.layout", hidden_states, call=-1)
         (recv_hidden, recv_indices, recv_probs, recv_per_expert, handle, after_event) = (
             buffer.dispatch(
                 hidden_states,
@@ -174,6 +175,7 @@ class _DeepEPDispatch(torch.autograd.Function):
                 allocate_on_comm_stream=allocate_on_comm_stream,
             )
         )
+        _debug_cuda_boundary("deepep.transport", recv_hidden, call=-1)
         if async_finish:
             after_event.current_stream_wait()
 
@@ -411,6 +413,9 @@ class TokenDispatcher:
                 topk_indices,
                 topk_scores,
                 assume_all_routes_valid=True,
+            )
+            _debug_cuda_boundary(
+                "aligned_dispatch.metadata_input", route_fingerprints, call=debug_call
             )
             (
                 received_fingerprints,
