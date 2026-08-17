@@ -276,7 +276,7 @@ def _assert_tp_ep_membership(bundle, *, tp: int, ep: int) -> None:
     assert dist.get_rank() in topology["ep_group_ranks"]
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(seconds=120)
 def test_tp2_ep1_attention_multi_lora_production_groups():
     """GPU production builder must expose a real TP2 attention-bank path."""
     if dist.get_world_size() != 2:
@@ -290,7 +290,7 @@ def test_tp2_ep1_attention_multi_lora_production_groups():
     _run_bank_gradient_contract(bundle)
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(seconds=120)
 def test_tp2_ep2_attention_and_expert_multi_lora_production_groups():
     """Four-rank production construction keeps TP attention orthogonal to EP experts."""
     if dist.get_world_size() != 4:
@@ -383,9 +383,9 @@ def _bank_surface_kind(bundle, parameter: torch.Tensor) -> str:
     for surface, bank in state.registry.banks.items():
         if parameter is bank.a_bank or parameter is bank.b_bank:
             matches.append(surface)
-    assert len(matches) == 1, (
-        f"bank parameter has ambiguous/missing registry surface: {matches}"
-    )
+    assert (
+        len(matches) == 1
+    ), f"bank parameter has ambiguous/missing registry surface: {matches}"
     surface = matches[0]
     if ".moe.experts._fc" in surface:
         return "fc"
@@ -651,13 +651,13 @@ def _bank_sync_absolute_oracle(
         def validate_records(records) -> None:
             _assert_owner_group_contract(bundle, name, records)
             seen = {record["factor"] for record in records}
-            assert len(seen) == 1, (
-                f"missing or inconsistent owner-group factor for {name}"
-            )
+            assert (
+                len(seen) == 1
+            ), f"missing or inconsistent owner-group factor for {name}"
             factor = seen.pop()
-            assert factor == expected_factor, (
-                f"owner-group factor for {name} is {factor}, expected {expected_factor}"
-            )
+            assert (
+                factor == expected_factor
+            ), f"owner-group factor for {name} is {factor}, expected {expected_factor}"
 
         records = lora_dist_utils.gather_owner_factor_records_or_raise(
             owner_group,
@@ -690,9 +690,9 @@ def _reconstruct_optimizer_owned_bank_grads(bundle) -> dict[str, torch.Tensor]:
             if owned is not None:
                 leaf_index, owner, param_range, buffer, bucket = owned
                 reduced = bucket.grad_data.view(-1)[
-                    param_range["gbuf_world_in_bucket"].start : param_range[
-                        "gbuf_world_in_bucket"
-                    ].end
+                    param_range["gbuf_world_in_bucket"]
+                    .start : param_range["gbuf_world_in_bucket"]
+                    .end
                 ].detach()
                 local["shard"] = {
                     **_owner_group_record(bundle, leaf_index, owner, buffer),
@@ -868,7 +868,7 @@ def _expected_semantic_bank_keys(state) -> set[str]:
     }
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(seconds=120)
 def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
     """Same-topology TP/EP oracle and DCP prove each bank's one reduction."""
     _Qwen3MoEConfig, model, protocol = _qwen_symbols()
@@ -882,15 +882,15 @@ def test_production_builder_distopt_finalize_and_identity_roundtrip(tmp_path):
     candidate_sha = os.environ.get("MLITE_CANDIDATE_SHA")
     candidate_tree = os.environ.get("MLITE_CANDIDATE_TREE_SHA")
     candidate_diff = os.environ.get("MLITE_CANDIDATE_DIFF_SHA")
-    assert candidate_sha and candidate_tree and candidate_diff, (
-        "candidate commit, tree, and diff hashes must bind the phase artifact"
-    )
+    assert (
+        candidate_sha and candidate_tree and candidate_diff
+    ), "candidate commit, tree, and diff hashes must bind the phase artifact"
 
     if phase == "ep2_oracle":
         if dist.get_rank() == 0:
-            assert not artifact_dir.exists(), (
-                "phase artifact directory already exists; refuse stale COMPLETE/checkpoint reuse"
-            )
+            assert (
+                not artifact_dir.exists()
+            ), "phase artifact directory already exists; refuse stale COMPLETE/checkpoint reuse"
             artifact_dir.mkdir(parents=True)
         dist.barrier()
         bundle = _build_bundle(
