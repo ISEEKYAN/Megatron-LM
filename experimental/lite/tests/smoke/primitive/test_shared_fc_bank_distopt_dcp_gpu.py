@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,7 +83,11 @@ class SharedFCBank(nn.Module):
         qkv_shape = _qkv_local_shape(2 if _phase() == "save" else 1)
         self.register_parameter(
             _QKV_BANK_NAME,
-            nn.Parameter(torch.arange(2 * 16 * 8, device="cuda", dtype=torch.bfloat16).reshape(qkv_shape)),
+            nn.Parameter(
+                torch.arange(math.prod(qkv_shape), device="cuda", dtype=torch.bfloat16).reshape(
+                    qkv_shape
+                )
+            ),
         )
         qkv = getattr(self, _QKV_BANK_NAME)
         qkv.allreduce = True
