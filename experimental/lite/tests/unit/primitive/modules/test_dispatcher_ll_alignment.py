@@ -4,6 +4,48 @@ from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.parallel import ParallelState
 
 
+def test_normal_deepep_buffer_is_process_shared(monkeypatch) -> None:
+    import megatron.lite.primitive.modules.dispatcher as dispatcher_module
+
+    class FakeConfig:
+        def get_nvl_buffer_size_hint(self, hidden_bytes, group_size):
+            return hidden_bytes * group_size
+
+        def get_rdma_buffer_size_hint(self, hidden_bytes, group_size):
+            return hidden_bytes * group_size * 2
+
+    class FakeBuffer:
+        created = 0
+
+        @staticmethod
+        def get_dispatch_config(group_size):
+            return FakeConfig()
+
+        @staticmethod
+        def get_combine_config(group_size):
+            return FakeConfig()
+
+        def __init__(self, *, group, num_nvl_bytes, num_rdma_bytes, explicitly_destroy):
+            type(self).created += 1
+            self.group = group
+            self.num_nvl_bytes = num_nvl_bytes
+            self.num_rdma_bytes = num_rdma_bytes
+            self.explicitly_destroy = explicitly_destroy
+            self.runtime = object()
+
+    group = object()
+    monkeypatch.setattr(dispatcher_module, "deep_ep", type("FakeDeepEP", (), {"Buffer": FakeBuffer}))
+    monkeypatch.setattr(dispatcher_module.dist, "get_world_size", lambda *, group: 4)
+    monkeypatch.setattr(dispatcher_module, "_deepep_buffer", None)
+
+    layer0_primary = dispatcher_module._build_deepep_buffer(group, 4096)
+    layer0_metadata = dispatcher_module._build_deepep_buffer(group, 4096)
+    layer1_primary = dispatcher_module._build_deepep_buffer(group, 4096)
+
+    assert layer0_primary is layer0_metadata is layer1_primary
+    assert FakeBuffer.created == 1
+
+
 def test_ll_alignment_preserves_duplicate_slots_and_fp32_gather(monkeypatch) -> None:
     import vllm.model_executor.layers.fused_moe.deep_gemm_utils as deep_gemm_utils
 

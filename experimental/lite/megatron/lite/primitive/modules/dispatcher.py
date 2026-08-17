@@ -29,6 +29,14 @@ except ImportError:
     EventOverlap = None  # type: ignore
 
 
+# Match MCore fused_a2a and slime's alignment path: a process owns one normal
+# DeepEP buffer for its EP group and reuses it for every layer as well as the
+# small route-metadata dispatch.  DeepEP's normal-mode control/signalling state
+# is process-scoped; constructing independent buffers per layer is outside the
+# mature integration contract and allows their lifecycles to overlap.
+_deepep_buffer = None
+
+
 def _validate_finite(stage: str, **tensors: torch.Tensor) -> None:
     if os.environ.get("MLITE_VALIDATE_FINITE") != "1":
         return
@@ -65,6 +73,7 @@ def _hidden_bytes(hidden_size: int) -> int:
 
 
 def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
+    global _deepep_buffer
     if deep_ep is None:
         raise RuntimeError("DeepEP buffer requested but deep_ep is not installed.")
 
@@ -84,14 +93,26 @@ def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
             config.get_rdma_buffer_size_hint(hidden_bytes, group_size), num_rdma_bytes
         )
 
-    # DeepEP's own tests use explicit destruction before process-group
-    # teardown.  Runtime.close owns that collective lifecycle for MLite.
-    return deep_ep.Buffer(
-        group=group,
-        num_nvl_bytes=num_nvl_bytes,
-        num_rdma_bytes=num_rdma_bytes,
-        explicitly_destroy=True,
+    buffer_is_live = (
+        _deepep_buffer is not None
+        and getattr(_deepep_buffer, "runtime", None) is not None
     )
+    if (
+        not buffer_is_live
+        or _deepep_buffer.group != group
+        or _deepep_buffer.num_nvl_bytes < num_nvl_bytes
+        or _deepep_buffer.num_rdma_bytes < num_rdma_bytes
+    ):
+        # DeepEP's own tests use explicit destruction before process-group
+        # teardown. Runtime.close discovers this shared object through the
+        # module owners, de-duplicates it, and destroys it collectively.
+        _deepep_buffer = deep_ep.Buffer(
+            group=group,
+            num_nvl_bytes=num_nvl_bytes,
+            num_rdma_bytes=num_rdma_bytes,
+            explicitly_destroy=True,
+        )
+    return _deepep_buffer
 
 
 def _use_moe_permute_fusion() -> bool:
