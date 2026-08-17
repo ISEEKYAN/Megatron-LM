@@ -504,6 +504,7 @@ class TokenDispatcher:
             sanitized_indices,
             _,
             all_routes_valid,
+            device_tokens_per_expert,
             positions,
         ) = _scatter_deepep_routes_with_padding(
             received_hidden,
@@ -539,6 +540,7 @@ class TokenDispatcher:
         self._aligned_source_shape = hidden_states.shape
         self._aligned_source_output_index = source_output_index
         self._aligned_source_all_routes_valid = source_all_routes_valid
+        self._aligned_device_tokens_per_expert = device_tokens_per_expert
         self._local_tpe_list = received_per_expert.tolist()
         return expert_hidden, received_per_expert, expert_probs
 
@@ -598,6 +600,7 @@ class TokenDispatcher:
             "_aligned_source_shape",
             "_aligned_source_output_index",
             "_aligned_source_all_routes_valid",
+            "_aligned_device_tokens_per_expert",
         ):
             delattr(self, name)
         self._local_tpe_list = None

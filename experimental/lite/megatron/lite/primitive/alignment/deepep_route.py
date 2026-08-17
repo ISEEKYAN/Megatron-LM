@@ -310,6 +310,7 @@ def _scatter_deepep_routes_with_padding(
     torch.Tensor,
     torch.Tensor,
     bool,
+    torch.Tensor,
 ]:
     """Build vLLM LL's expert-major DeepEP layout deterministically."""
     if hidden_states.ndim != 2 or topk_indices.ndim != 2:
@@ -429,6 +430,7 @@ def _scatter_deepep_routes_with_padding(
         sanitized_indices,
         routing_map,
         all_routes_valid,
+        real_counts,
     )
     if return_route_positions:
         return (*result, occurrences)
