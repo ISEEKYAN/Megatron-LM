@@ -189,6 +189,14 @@ class FP32AdamW:
     def step(self) -> None:
         self._step_param_groups()
 
+    @torch.no_grad()
+    def reload_model_params(self) -> None:
+        """Refresh FP32 masters after model weights are loaded or initialized."""
+        for param in self.params:
+            master = to_local_tensor(self.state[param]["master_param"])
+            model_param = to_local_tensor(param.detach())
+            master.copy_(model_param.to(device=master.device, dtype=master.dtype))
+
     def _step_param_groups(self) -> None:
         self.step_count += 1
         beta1, beta2 = self.betas

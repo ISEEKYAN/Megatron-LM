@@ -181,6 +181,65 @@ def test_dense_mappings_copy_before_reading_the_next_mapping(monkeypatch) -> Non
     ]
 
 
+def test_pp_stage_without_final_norm_does_not_match_layer_q_norm(monkeypatch) -> None:
+    """A stage-global ``norm.weight`` must not substring-match ``q_norm.weight``."""
+    _stub_parallel_import(monkeypatch)
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layer_indices = [0]
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].attn = nn.Module()
+            self.layers[0].attn.q_norm = nn.Module()
+            self.layers[0].attn.q_norm.weight = nn.Parameter(torch.zeros(128))
+
+    model = Model()
+
+    class Reader:
+        def __init__(self, path):
+            assert path == "unused"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            pass
+
+        def get_tensor(self, name, *, device, target_shape=None, target_dtype=None):
+            assert name == "model.norm.weight"
+            return torch.ones(2048, device=device, dtype=target_dtype)
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def weight_map():
+            return {"norm.weight": ["model.norm.weight"]}
+
+        @staticmethod
+        def expert_global_id(name):
+            return None
+
+        @staticmethod
+        def hf_to_native(name, tensors):
+            return tensors[0]
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+    ps = _parallel_state()
+    ps.pp_size = 2
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader
+    )
+
+    load_hf_weights(model, "unused", Spec(), ps)
+
+    assert torch.count_nonzero(model.layers[0].attn.q_norm.weight) == 0
+
+
 @pytest.mark.parametrize("tp_rank", [0, 1])
 def test_dense_fused_gate_up_uses_interleaved_tp2_shard(monkeypatch, tp_rank) -> None:
     _stub_parallel_import(monkeypatch)
@@ -343,6 +402,33 @@ def test_mapped_persistent_buffer_missing_from_checkpoint_fails(monkeypatch) -> 
         match=r"Spec.*router_expert_bias.*hf\.router_expert_bias",
     ):
         load_hf_weights(Model(), "unused", Spec(), _parallel_state())
+
+
+def test_deferred_parameter_missing_from_checkpoint_fails(monkeypatch) -> None:
+    _stub_parallel_import(monkeypatch)
+    model = nn.Linear(1, 1)
+    model._mlite_meta_init = True
+
+    class Reader:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def weight_map():
+            return {}
+
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader)
+    with pytest.raises(RuntimeError, match="Deferred parameter 'weight'"):
+        load_hf_weights(model, "unused", Spec(), _parallel_state())
 
 
 def test_buffer_cannot_be_both_optional_and_expected(monkeypatch) -> None:

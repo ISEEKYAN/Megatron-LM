@@ -12,10 +12,15 @@ from typing import Any
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-import transformer_engine.pytorch as te  # pyright: ignore[reportMissingImports]
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.kernels.swiglu import (
     bias_swiglu_impl,
     weighted_bias_swiglu_impl,
+)
+from megatron.lite.primitive.modules.lora import (
+    LoraConfig,
+    SharedGroupedLinearLoRA,
+    normalize_lora_config,
 )
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.recompute import CheckpointWithoutOutput

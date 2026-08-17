@@ -453,18 +453,19 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     )
 
     vpp = None if p.vpp == 1 else p.vpp
-    if vpp is None:
-        chunks = [
-            Qwen3MoEModel(model_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()
-        ]
-    else:
-        chunks = []
-        for i in range(vpp):
-            chunks.append(
-                Qwen3MoEModel(model_cfg, ps, vpp=vpp, vpp_chunk_id=i, **model_kwargs)
-                .to(torch.bfloat16)
-                .cuda()
-            )
+    meta_init = impl_cfg.optimizer == "fsdp2"
+
+    def build_chunk(**kwargs):
+        with torch.device("meta") if meta_init else nullcontext():
+            chunk = Qwen3MoEModel(model_cfg, ps, **kwargs, **model_kwargs).to(torch.bfloat16)
+        if meta_init:
+            _validate_meta_parameters(chunk)
+        chunk._mlite_meta_init = meta_init
+        return chunk if meta_init else chunk.cuda()
+
+    chunks = [build_chunk()] if vpp is None else [
+        build_chunk(vpp=vpp, vpp_chunk_id=i) for i in range(vpp)
+    ]
 
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 

@@ -7,13 +7,13 @@ import logging
 import math
 import os
 from enum import Enum
-from types import SimpleNamespace
 from typing import Any
 
 import torch
 import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+from megatron.lite.primitive.modules import router_replay
 from megatron.lite.primitive.modules.lora import (
     LORA_DEFAULT_ALPHA,
     LORA_DEFAULT_DROPOUT,
@@ -36,6 +36,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
+from verl_mlite import qat_export
 from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
 
 try:
@@ -418,12 +419,7 @@ class MegatronLiteEngine(BaseEngine):
         def _export_base_or_merged_weights():
             weights = self.runtime.export_weights(self.handle, **export_kwargs)
             if self.engine_config.qat.get("enable", False):
-                from verl.utils.modelopt import export_qat_weights
-
-                qat_config = SimpleNamespace(**self.engine_config.qat)
-                weights = export_qat_weights(
-                    weights, [self.module], qat_config, bridge=None
-                )
+                weights = qat_export.export_qat_weights(weights, self.engine_config.qat)
             return weights
 
         if not lora_enabled:
@@ -1084,9 +1080,7 @@ class MegatronLiteEngine(BaseEngine):
         micro_batch: TensorDict, input_ids: torch.Tensor
     ) -> torch.Tensor:
         """Reuse VERL's canonical R3 semantics while inputs are still jagged."""
-        from verl.utils.megatron.router_replay_utils import build_r3_replay_mask
-
-        return build_r3_replay_mask(input_ids, micro_batch["response_mask"])
+        return router_replay.build_r3_replay_mask(input_ids, micro_batch["response_mask"])
 
     def _build_verl_model_output(
         self,

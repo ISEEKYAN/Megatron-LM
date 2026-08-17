@@ -359,7 +359,7 @@ class TokenDispatcher:
         probs_2d = torch.zeros(
             t, e, dtype=topk_scores.dtype, device=hidden_states.device
         )
-        probs_2d.scatter_(1, topk_indices, topk_scores)
+        probs_2d.scatter_add_(1, topk_indices, topk_scores)
 
         permuted, permuted_probs, sorted_indices = permute(
             hidden_states,
@@ -403,7 +403,7 @@ class TokenDispatcher:
         probs_2d = torch.zeros(
             t, e, dtype=topk_scores.dtype, device=hidden_states.device
         )
-        probs_2d.scatter_(1, topk_indices, topk_scores)
+        probs_2d.scatter_add_(1, topk_indices, topk_scores)
 
         permuted, permuted_probs, sorted_indices = permute(
             hidden_states,

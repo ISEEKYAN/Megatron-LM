@@ -14,7 +14,7 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.qwen3_moe.lite.multi_lora import (
     MoELoraSidecar,

@@ -34,6 +34,65 @@ def _make_glm5_model(cfg, ps=None, **kwargs):
     return Glm5Model(cfg, _make_train_config(ps), ps, **kwargs)
 
 
+def _use_cpu_transformer_engine_stubs(monkeypatch):
+    """Make state-layout tests independent of Transformer Engine's CUDA default."""
+    import torch
+    import torch.nn as nn
+    import transformer_engine.pytorch as te
+
+    class _GroupedLinear(nn.Module):
+        def __init__(self, num_gemms, in_features, out_features, *, params_dtype=None, **_):
+            super().__init__()
+            dtype = params_dtype or torch.get_default_dtype()
+            for index in range(num_gemms):
+                self.register_parameter(
+                    f"weight{index}", nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
+                )
+
+    class _LayerNormLinear(nn.Module):
+        def __init__(
+            self,
+            in_features,
+            out_features,
+            *,
+            bias=True,
+            params_dtype=None,
+            **_,
+        ):
+            super().__init__()
+            dtype = params_dtype or torch.get_default_dtype()
+            self.layer_norm_weight = nn.Parameter(torch.zeros(in_features, dtype=dtype))
+            self.weight = nn.Parameter(
+                torch.empty(out_features, in_features, dtype=dtype)
+            )
+            self.bias = (
+                nn.Parameter(torch.zeros(out_features, dtype=dtype)) if bias else None
+            )
+
+    def _linear(in_features, out_features, *, bias=True, params_dtype=None, **_):
+        return nn.Linear(
+            in_features,
+            out_features,
+            bias=bias,
+            dtype=params_dtype or torch.get_default_dtype(),
+        )
+
+    def _rms_norm(normalized_shape, *, eps=None, params_dtype=None, **_):
+        return nn.RMSNorm(
+            normalized_shape,
+            eps=eps,
+            dtype=params_dtype or torch.get_default_dtype(),
+        )
+
+    monkeypatch.setattr(te, "GroupedLinear", _GroupedLinear)
+    monkeypatch.setattr(te, "LayerNormLinear", _LayerNormLinear)
+    monkeypatch.setattr(te, "Linear", _linear)
+    monkeypatch.setattr(te, "RMSNorm", _rms_norm)
+    import megatron.lite.primitive.modules.attention.dsa as dsa
+
+    monkeypatch.setattr(dsa, "RMSNorm", _rms_norm)
+
+
 def _tiny_config_kwargs():
     return dict(
         num_hidden_layers=2,
@@ -234,6 +293,22 @@ def test_glm5_lite_uses_shared_mla_and_dsa_primitive():
     assert "torch.matmul" not in primitive_text
 
 
+def test_lite_csa_imports_core_csa_kernel_namespace():
+    root = Path(__file__).resolve().parents[3] / "megatron" / "lite"
+    csa_text = (root / "primitive" / "modules" / "attention" / "csa.py").read_text()
+
+    assert (
+        "from megatron.core.transformer.experimental_attention_variant.csa_kernels import"
+        in csa_text
+    )
+    assert "FusedCSAIndexerSparseAttnFromTopkFunc" in csa_text
+    assert "csa_sparse_attn" in csa_text
+    assert (
+        "from megatron.core.transformer.experimental_attention_variant.dsa_kernels import"
+        not in csa_text
+    )
+
+
 def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
     from megatron.lite.primitive.kernels import dsa_kernels
 
@@ -253,6 +328,8 @@ def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
     assert dsa_kernels._select_indexer_forward(None) is None
 
 
+@pytest.mark.gpus(1)
+@pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
     import pytest
     import torch
@@ -350,6 +427,8 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
     }
 
 
+@pytest.mark.gpus(1)
+@pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
     import pytest
     import torch
@@ -415,6 +494,7 @@ def test_glm5_dsa_eval_forward_uses_fused_sparse_attention(monkeypatch):
     assert calls["sparse"] == {"topk_length_is_set": True, "value_dim": 4}
 
 
+@pytest.mark.gpus(1)
 def test_glm5_lite_model_exports_native_state_names():
     from megatron.lite.model.glm5.config import Glm5Config
 
@@ -430,7 +510,7 @@ def test_glm5_lite_model_exports_native_state_names():
     assert "head.col.linear.weight" in keys
 
 
-def test_glm52_index_share_shared_layers_omit_indexer_modules():
+def test_glm52_index_share_shared_layers_omit_indexer_modules(monkeypatch):
     import pytest
 
     try:
@@ -439,6 +519,8 @@ def test_glm52_index_share_shared_layers_omit_indexer_modules():
         pytest.skip(f"Transformer Engine is not importable in this environment: {exc}")
 
     from megatron.lite.model.glm5.config import Glm5Config
+
+    _use_cpu_transformer_engine_stubs(monkeypatch)
 
     cfg = Glm5Config(
         **{
@@ -474,6 +556,7 @@ def test_glm52_index_share_shared_layers_omit_indexer_modules():
     )
 
 
+@pytest.mark.gpus(1)
 def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     import torch
     from safetensors import safe_open
@@ -556,6 +639,7 @@ def test_glm5_hf_export_rejects_missing_model_config():
         next(export_hf_weights(None, None, ParallelState()))
 
 
+@pytest.mark.gpus(1)
 def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
     import torch
 
@@ -635,38 +719,22 @@ def test_glm52_checkpoint_mapping_skips_shared_indexer_without_te():
         tensor,
     ) == [("model.layers.6.self_attn.indexer.wq_b.weight", tensor)]
 
-    base_names = {
-        "model.layers.3.self_attn.q_a_proj.weight",
-        "model.layers.3.self_attn.q_a_layernorm.weight",
-        "model.layers.3.self_attn.q_b_proj.weight",
-        "model.layers.3.self_attn.kv_a_proj_with_mqa.weight",
-        "model.layers.3.self_attn.kv_a_layernorm.weight",
-        "model.layers.3.self_attn.kv_b_proj.weight",
-        "model.layers.3.self_attn.o_proj.weight",
+    # Loading is now driven by the declarative HFWeights map rather than the
+    # removed private _load_attention helper.  A shared-indexer layer must
+    # retain every regular attention mapping while omitting every indexer one.
+    weight_map = spec.weight_map()
+    layer3 = {
+        native_name: hf_names
+        for native_name, hf_names in weight_map.items()
+        if native_name.startswith("layers.3.self_attention.self_attention.")
     }
-
-    class Reader:
-        index = {name: "model.safetensors" for name in base_names}
-
-        def get_tensor(self, name):
-            if name not in self.index:
-                raise KeyError(name)
-            return torch.ones(1)
-
-    out = {}
-    checkpoint_module._load_attention(
-        out,
-        local_prefix="layers.3",
-        hf_prefix="model.layers.3.self_attn",
-        reader=Reader(),
-        ps=object(),
-        load_indexer=False,
-    )
-    assert "layers.3.self_attention.self_attention.q_a_proj.weight" in out
-    assert not any(".indexer." in name for name in out)
+    assert "layers.3.self_attention.self_attention.q_a_proj.weight" in layer3
+    assert not any(".indexer." in name for name in layer3)
 
 
-def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp_path):
+def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(
+    tmp_path, monkeypatch
+):
     import pytest
     import torch
 
@@ -679,6 +747,8 @@ def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp
     from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights, load_hf_weights
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
     from megatron.lite.primitive.parallel import ParallelState
+
+    _use_cpu_transformer_engine_stubs(monkeypatch)
 
     cfg = Glm5Config(
         **{
@@ -718,6 +788,7 @@ def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp
     )
 
 
+@pytest.mark.gpus(1)
 def test_glm5_router_modules_use_current_names_and_bias_buffers():
     import torch
 
@@ -849,6 +920,8 @@ def test_glm5_protocol_uses_mlite_optimizer_api():
     assert "build_dist_opt_training_optimizer" in protocol_text
 
 
+@pytest.mark.gpus(1)
+@pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 def test_glm5_lite_tiny_forward_backward(monkeypatch):
     import pytest
     import torch

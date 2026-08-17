@@ -242,7 +242,7 @@ class MegatronLiteRuntime(RuntimeBase):
         if callable(olora_hook) and loaded_hf_weights:
             olora_hook()
 
-        if loaded_hf_weights and bundle.optimizer is not None:
+        if (loaded_hf_weights or meta_initialized) and bundle.optimizer is not None:
             reload_model_params = getattr(bundle.optimizer, "reload_model_params", None)
             if callable(reload_model_params):
                 reload_model_params()

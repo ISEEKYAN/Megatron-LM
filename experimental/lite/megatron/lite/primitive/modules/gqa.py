@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.modules.gqa_utils import (
     split_grouped_qkvg,
     split_grouped_qkvg_for_tp,
