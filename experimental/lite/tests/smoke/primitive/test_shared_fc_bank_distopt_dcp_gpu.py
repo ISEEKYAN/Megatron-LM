@@ -26,21 +26,33 @@ _BANK_NAME = MultiLoraTrainingState.parameter_name(
 )
 
 
+def _skip_or_fail(message: str) -> None:
+    if os.environ.get("MLITE_TEST_HARNESS") == "1":
+        pytest.fail(message)
+    pytest.skip(message)
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _two_rank_cuda_process_group():
     """Make the standalone torchrun carrier establish its own NCCL group."""
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for the shared-FC DCP smoke.")
+        _skip_or_fail("CUDA is required for the shared-FC DCP smoke.")
     if int(os.environ.get("WORLD_SIZE", "1")) != 2:
-        pytest.skip("run this smoke through two-rank torchrun")
+        _skip_or_fail("run this smoke through two-rank torchrun")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     created = False
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://")
         created = True
     yield
-    if created and dist.is_initialized():
-        dist.destroy_process_group()
+    try:
+        from megatron.core import parallel_state as mpu
+
+        if mpu.is_initialized():
+            mpu.destroy_model_parallel()
+    finally:
+        if created and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 class SharedFCBank(nn.Module):
@@ -50,7 +62,9 @@ class SharedFCBank(nn.Module):
         super().__init__()
         self.register_parameter(
             _BANK_NAME,
-            nn.Parameter(torch.arange(16, device="cuda", dtype=torch.bfloat16).reshape(2, 2, 4)),
+            nn.Parameter(
+                torch.arange(4096, device="cuda", dtype=torch.bfloat16).reshape(2, 32, 64)
+            ),
         )
         parameter = getattr(self, _BANK_NAME)
         parameter.allreduce = False
@@ -63,14 +77,14 @@ class SharedFCBank(nn.Module):
 def _phase() -> str:
     phase = os.environ.get("MLITE_SHARED_FC_DCP_PHASE")
     if phase not in {"save", "load"}:
-        pytest.skip("set MLITE_SHARED_FC_DCP_PHASE to save or load")
+        _skip_or_fail("set MLITE_SHARED_FC_DCP_PHASE to save or load")
     return phase
 
 
 def _artifact_dir() -> Path:
     raw = os.environ.get("MLITE_SHARED_FC_DCP_ARTIFACT_DIR")
     if raw is None:
-        pytest.skip("set MLITE_SHARED_FC_DCP_ARTIFACT_DIR")
+        _skip_or_fail("set MLITE_SHARED_FC_DCP_ARTIFACT_DIR")
     return Path(raw)
 
 
@@ -137,13 +151,21 @@ def _local_optimizer_slices(chunks, optimizer):
 
 
 def _global_optimizer_oracle(chunks, optimizer):
+    parameter = dict(getattr(chunks[0], "module", chunks[0]).named_parameters())[_BANK_NAME]
     local = _local_optimizer_slices(chunks, optimizer)
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, local)
+    assert len(gathered) == 2 and all(len(rank_slices) == 1 for rank_slices in gathered)
+    source_ranges = sorted(item["range"] for rank_slices in gathered for item in rank_slices)
+    assert source_ranges[0][0] == 0
+    assert source_ranges[0][1] == source_ranges[1][0]
+    assert source_ranges[1][1] == parameter.numel()
     all_slices = [item for rank_slices in gathered for item in rank_slices]
-    assert all_slices, "at least one rank must own a dist-opt shard"
-    parameter = dict(getattr(chunks[0], "module", chunks[0]).named_parameters())[_BANK_NAME]
-    result = {"model": parameter.detach().cpu().float().clone()}
+    model_gathered = [None] * dist.get_world_size()
+    source_model = parameter.detach().cpu().clone()
+    dist.all_gather_object(model_gathered, source_model)
+    assert all(torch.equal(model, source_model) for model in model_gathered)
+    result = {"model": source_model.float()}
     for key in ("fp32_param", "exp_avg", "exp_avg_sq"):
         size = parameter.numel()
         full = torch.empty(size, dtype=all_slices[0][key].dtype)
