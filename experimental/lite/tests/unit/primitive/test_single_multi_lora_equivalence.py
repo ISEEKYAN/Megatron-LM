@@ -10,15 +10,16 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from megatron.lite.primitive.ckpt.hf_weights import VLLM_LORA_NAME_PREFIX
 from megatron.lite.primitive.modules import lora as lora_module
 from megatron.lite.primitive.modules import multi_lora_bank, multi_lora_kernel
-from megatron.lite.primitive.ckpt.hf_weights import VLLM_LORA_NAME_PREFIX
-from megatron.lite.primitive.modules.lora import (
+
+from megatron.lite.primitive.modules.lora import (  # isort: skip
     LinearLoRA,
     LoraSpec,
     SharedGroupedLinearLoRA,
 )
-from megatron.lite.primitive.modules.multi_lora_bank import (
+from megatron.lite.primitive.modules.multi_lora_bank import (  # isort: skip
     DenseLoraBank,
     LoraBankPartition,
     MultiLoraTrainingState,
@@ -30,11 +31,7 @@ pytestmark = [pytest.mark.mlite]
 
 
 def _assert_single_slot_pair(
-    adapter: LinearLoRA,
-    x: torch.Tensor,
-    grad_out: torch.Tensor,
-    *,
-    bank_kwargs=None,
+    adapter: LinearLoRA, x: torch.Tensor, grad_out: torch.Tensor, *, bank_kwargs=None
 ) -> None:
     bank_a = adapter.lora_a.detach().clone().unsqueeze(0).requires_grad_()
     bank_b = adapter.lora_b.detach().clone().unsqueeze(0).requires_grad_()
@@ -56,7 +53,9 @@ def _assert_single_slot_pair(
     torch.testing.assert_close(adapter.lora_b.grad, bank_b.grad[0])
 
 
-@pytest.mark.parametrize(("alpha", "use_rslora"), [(None, False), (8, False), (8, True)])
+@pytest.mark.parametrize(
+    ("alpha", "use_rslora"), [(None, False), (8, False), (8, True)]
+)
 def test_linear_lora_matches_one_slot_bank_forward_and_all_gradients(alpha, use_rslora):
     torch.manual_seed(17)
     adapter = LinearLoRA(5, 7, 3, alpha=alpha, use_rslora=use_rslora).double()
@@ -141,7 +140,9 @@ def test_nonzero_dropout_preserves_the_single_lora_compatibility_path(monkeypatc
     assert adapter(torch.randn(5, 3)).shape == (5, 4)
 
 
-def _tp_pair_worker(rank: int, world_size: int, init_file: str, kind: str, queue) -> None:
+def _tp_pair_worker(
+    rank: int, world_size: int, init_file: str, kind: str, queue
+) -> None:
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
     )
@@ -241,10 +242,7 @@ def test_tp2_sp_single_matches_one_slot_bank_forward_and_gradients(tmp_path, kin
     init_file = tmp_path / f"single-bank-{kind}-init"
     queue = mp.get_context("spawn").SimpleQueue()
     mp.spawn(
-        _tp_pair_worker,
-        args=(2, str(init_file), kind, queue),
-        nprocs=2,
-        join=True,
+        _tp_pair_worker, args=(2, str(init_file), kind, queue), nprocs=2, join=True
     )
     results = sorted((queue.get() for _ in range(2)), key=lambda item: item["rank"])
     assert [item["error"] for item in results] == pytest.approx([0.0, 0.0], abs=1e-12)

@@ -474,7 +474,7 @@ class LinearLoRA(nn.Module):
         # established implementation because neither is part of the dense-bank
         # contract and silently changing either would change semantics.
         if self.dropout_p == 0.0 and not self.row_parallel_output:
-            from megatron.lite.primitive.modules.multi_lora_bank import (
+            from megatron.lite.primitive.modules.multi_lora_bank import (  # isort: skip
                 DenseLoraBank,
                 LoraBankPartition,
                 apply_batched_lora_delta,
@@ -623,10 +623,23 @@ class GroupedLinearLoRA(nn.Module):
             if size == 0:
                 outputs.append(x_i.new_empty((0, self.lora_b.shape[1])))
             else:
-                dropped = F.dropout(x_i, p=self.dropout_p, training=self.training) if self.dropout_p else x_i
-                outputs.append(dropped.matmul(self.lora_a[expert_idx].t()).matmul(self.lora_b[expert_idx].t()) * self.scale)
+                dropped = (
+                    F.dropout(x_i, p=self.dropout_p, training=self.training)
+                    if self.dropout_p
+                    else x_i
+                )
+                outputs.append(
+                    dropped.matmul(self.lora_a[expert_idx].t()).matmul(
+                        self.lora_b[expert_idx].t()
+                    )
+                    * self.scale
+                )
             offset += size
-        return torch.cat(outputs, dim=0) if outputs else x.new_empty((0, self.lora_b.shape[1]))
+        return (
+            torch.cat(outputs, dim=0)
+            if outputs
+            else x.new_empty((0, self.lora_b.shape[1]))
+        )
 
 
 class SharedGroupedLinearLoRA(nn.Module):
@@ -677,7 +690,7 @@ class SharedGroupedLinearLoRA(nn.Module):
                 f"SharedGroupedLinearLoRA expected {self.num_local_experts} splits, got {len(splits)}."
             )
         if self.dropout_p == 0.0:
-            from megatron.lite.primitive.modules.multi_lora_bank import (
+            from megatron.lite.primitive.modules.multi_lora_bank import (  # isort: skip
                 DenseLoraBank,
                 apply_batched_lora_delta,
             )
@@ -740,7 +753,7 @@ def _weight_owner(module: nn.Module) -> nn.Module | None:
 def apply_olora_tail_init(model: nn.Module) -> dict[str, int]:
     """Initialize supported dense adapters and warn for unsupported grouped experts."""
 
-    from megatron.lite.primitive.modules.lora_apply import (
+    from megatron.lite.primitive.modules.lora_apply import (  # isort: skip
         LoRAWrappedGroupedLinear,
         LoRAWrappedLinear,
     )

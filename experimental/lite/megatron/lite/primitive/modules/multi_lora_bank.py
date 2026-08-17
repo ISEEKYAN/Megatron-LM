@@ -19,7 +19,9 @@ import torch.nn as nn
 from megatron.lite.primitive.ckpt import hf_weights
 from megatron.lite.primitive.ckpt.hf_weights import export_hf_lora_bank_adapter
 from megatron.lite.primitive.modules import multi_lora_kernel
-from megatron.lite.primitive.modules.lora import (
+from megatron.lite.primitive.modules.multi_lora import BatchedLoraDelta
+
+from megatron.lite.primitive.modules.lora import (  # isort: skip
     LoraSpec,
     _all_gather_last_dim,
     _all_reduce_sum,
@@ -27,7 +29,6 @@ from megatron.lite.primitive.modules.lora import (
     _scatter_sequence_parallel,
     resolve_lora_alpha,
 )
-from megatron.lite.primitive.modules.multi_lora import BatchedLoraDelta
 
 
 @dataclass(frozen=True)
@@ -109,9 +110,7 @@ class _SequenceParallelSingleLora(torch.autograd.Function):
     def forward(ctx, x, lora_a, lora_b, scale, group):
         world_size = dist.get_world_size(group) if group is not None else 1
         gathered = (
-            _all_gather_sequence_forward(x, group, world_size)
-            if world_size > 1
-            else x
+            _all_gather_sequence_forward(x, group, world_size) if world_size > 1 else x
         )
         hidden_local = gathered.matmul(lora_a.t())
         hidden = _all_gather_last_dim_forward(hidden_local, group, world_size)
@@ -131,9 +130,7 @@ class _SequenceParallelSingleLora(torch.autograd.Function):
         x, lora_a, lora_b = ctx.saved_tensors
         world_size, group = ctx.world_size, ctx.group
         gathered = (
-            _all_gather_sequence_forward(x, group, world_size)
-            if world_size > 1
-            else x
+            _all_gather_sequence_forward(x, group, world_size) if world_size > 1 else x
         )
         hidden_local = gathered.matmul(lora_a.t())
         hidden = _all_gather_last_dim_forward(hidden_local, group, world_size)
@@ -161,9 +158,7 @@ class _SequenceParallelSingleLora(torch.autograd.Function):
         grad_gathered = grad_hidden_local.matmul(lora_a)
         if world_size > 1:
             grad_x = torch.empty_like(x)
-            dist.reduce_scatter_tensor(
-                grad_x, grad_gathered.contiguous(), group=group
-            )
+            dist.reduce_scatter_tensor(grad_x, grad_gathered.contiguous(), group=group)
         else:
             grad_x = grad_gathered
         return grad_x, grad_a, grad_b, None, None
@@ -199,7 +194,9 @@ def _validate_single_slot_indices(
     if sequence_parallel_input and tp_group is not None:
         valid_rows.add(local_rows * dist.get_world_size(tp_group))
     if lora_indices.numel() not in valid_rows:
-        raise ValueError("single-slot LoRA indices must describe local or gathered tokens.")
+        raise ValueError(
+            "single-slot LoRA indices must describe local or gathered tokens."
+        )
     if lora_indices.numel() and bool(torch.any(lora_indices != 0)):
         raise IndexError("lora_indices contains a slot out of range.")
     return True
@@ -225,9 +222,7 @@ def _apply_single_lora_delta(
         and not partition.output_partitioned_b
         and not sequence_parallel_scatter_output
     ):
-        return _SequenceParallelSingleLora.apply(
-            x, lora_a, lora_b, scale, tp_group
-        )
+        return _SequenceParallelSingleLora.apply(x, lora_a, lora_b, scale, tp_group)
     rows = x.reshape(-1, x.shape[-1])
     if sequence_parallel_input:
         rows = _gather_sequence_parallel(rows, tp_group)
@@ -362,7 +357,7 @@ class MultiLoraSpec:
 
 
 def normalize_multi_lora_spec(
-    config: MultiLoraSpec | Mapping[str, Any] | None,
+    config: MultiLoraSpec | Mapping[str, Any] | None
 ) -> MultiLoraSpec:
     """Normalize runtime config without allowing an unowned registry injection."""
     if config is None:
