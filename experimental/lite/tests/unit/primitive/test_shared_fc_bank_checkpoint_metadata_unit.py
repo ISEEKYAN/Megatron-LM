@@ -53,3 +53,12 @@ def test_nonowning_dist_opt_leaf_does_not_supply_a_parameter_range():
 
     assert shared_fc_gpu._model_param_range_or_none(NonOwner(), parameter) is None
     assert shared_fc_gpu._model_param_range_or_none(Owner(), parameter) == {"param": slice(0, 4)}
+
+
+def test_dist_opt_step_is_read_from_master_parameter_group():
+    master = object()
+
+    class Wrapped:
+        optimizer = type("Optimizer", (), {"param_groups": [{"params": [master], "step": 7}]})()
+
+    assert shared_fc_gpu._parameter_group_for_master(Wrapped(), master)["step"] == 7

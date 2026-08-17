@@ -146,6 +146,14 @@ def _model_param_range_or_none(optimizer, parameter):
         return None
 
 
+def _parameter_group_for_master(optimizer, master):
+    for group in optimizer.optimizer.param_groups:
+        if any(candidate is master for candidate in group["params"]):
+            assert "step" in group
+            return group
+    raise AssertionError("master parameter has no optimizer param group")
+
+
 def _local_optimizer_slices(chunks, optimizer):
     model = getattr(chunks[0], "module", chunks[0])
     parameter = dict(model.named_parameters())[_BANK_NAME]
@@ -159,6 +167,7 @@ def _local_optimizer_slices(chunks, optimizer):
         if master is None:
             continue
         state = wrapped.optimizer.state[master]
+        param_group = _parameter_group_for_master(wrapped, master)
         assert master.numel() == param_range.end - param_range.start
         result.append(
             {
@@ -166,7 +175,7 @@ def _local_optimizer_slices(chunks, optimizer):
                 "fp32_param": master.detach().cpu().clone(),
                 "exp_avg": state["exp_avg"].detach().cpu().clone(),
                 "exp_avg_sq": state["exp_avg_sq"].detach().cpu().clone(),
-                "step": _step_value(state["step"]),
+                "step": _step_value(param_group["step"]),
             }
         )
     return result
@@ -258,10 +267,11 @@ def _poison_optimizer_state(chunks, optimizer, oracle, finalize_grads):
                 state = wrapped.optimizer.state[master]
                 state["exp_avg"].fill_(322)
                 state["exp_avg_sq"].fill_(323)
-                if torch.is_tensor(state["step"]):
-                    state["step"].fill_(99)
+                param_group = _parameter_group_for_master(wrapped, master)
+                if torch.is_tensor(param_group["step"]):
+                    param_group["step"].fill_(99)
                 else:
-                    state["step"] = 99
+                    param_group["step"] = 99
     local = _local_optimizer_slices(chunks, optimizer)
     for item in local:
         start, end = item["range"]
