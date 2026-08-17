@@ -4,7 +4,7 @@ from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.parallel import ParallelState
 
 
-def test_normal_deepep_buffer_is_process_shared(monkeypatch) -> None:
+def test_aligned_deepep_buffers_are_isolated_per_handle(monkeypatch) -> None:
     import megatron.lite.primitive.modules.dispatcher as dispatcher_module
 
     class FakeConfig:
@@ -36,14 +36,12 @@ def test_normal_deepep_buffer_is_process_shared(monkeypatch) -> None:
     group = object()
     monkeypatch.setattr(dispatcher_module, "deep_ep", type("FakeDeepEP", (), {"Buffer": FakeBuffer}))
     monkeypatch.setattr(dispatcher_module.dist, "get_world_size", lambda *, group: 4)
-    monkeypatch.setattr(dispatcher_module, "_deepep_buffer", None)
-
     layer0_primary = dispatcher_module._build_deepep_buffer(group, 4096)
     layer0_metadata = dispatcher_module._build_deepep_buffer(group, 4096)
     layer1_primary = dispatcher_module._build_deepep_buffer(group, 4096)
 
-    assert layer0_primary is layer0_metadata is layer1_primary
-    assert FakeBuffer.created == 1
+    assert len({id(layer0_primary), id(layer0_metadata), id(layer1_primary)}) == 3
+    assert FakeBuffer.created == 3
 
 
 def test_ll_alignment_preserves_duplicate_slots_and_fp32_gather(monkeypatch) -> None:

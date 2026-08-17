@@ -29,14 +29,6 @@ except ImportError:
     EventOverlap = None  # type: ignore
 
 
-# Match MCore fused_a2a and slime's alignment path: a process owns one normal
-# DeepEP buffer for its EP group and reuses it for every layer as well as the
-# small route-metadata dispatch.  DeepEP's normal-mode control/signalling state
-# is process-scoped; constructing independent buffers per layer is outside the
-# mature integration contract and allows their lifecycles to overlap.
-_deepep_buffer = None
-
-
 def _validate_finite(stage: str, **tensors: torch.Tensor) -> None:
     if os.environ.get("MLITE_VALIDATE_FINITE") != "1":
         return
@@ -73,7 +65,6 @@ def _hidden_bytes(hidden_size: int) -> int:
 
 
 def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
-    global _deepep_buffer
     if deep_ep is None:
         raise RuntimeError("DeepEP buffer requested but deep_ep is not installed.")
 
@@ -93,26 +84,17 @@ def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
             config.get_rdma_buffer_size_hint(hidden_bytes, group_size), num_rdma_bytes
         )
 
-    buffer_is_live = (
-        _deepep_buffer is not None
-        and getattr(_deepep_buffer, "runtime", None) is not None
+    # Keep primary and route-metadata handles isolated per dispatcher.  The
+    # aligned path keeps both handles alive through expert compute/backward;
+    # sharing one process-wide communication workspace across layers corrupts
+    # their received top-k metadata.  This is the lifecycle validated by the
+    # report-23 20-step RL baseline.
+    return deep_ep.Buffer(
+        group=group,
+        num_nvl_bytes=num_nvl_bytes,
+        num_rdma_bytes=num_rdma_bytes,
+        explicitly_destroy=True,
     )
-    if (
-        not buffer_is_live
-        or _deepep_buffer.group != group
-        or _deepep_buffer.num_nvl_bytes < num_nvl_bytes
-        or _deepep_buffer.num_rdma_bytes < num_rdma_bytes
-    ):
-        # DeepEP's own tests use explicit destruction before process-group
-        # teardown. Runtime.close discovers this shared object through the
-        # module owners, de-duplicates it, and destroys it collectively.
-        _deepep_buffer = deep_ep.Buffer(
-            group=group,
-            num_nvl_bytes=num_nvl_bytes,
-            num_rdma_bytes=num_rdma_bytes,
-            explicitly_destroy=True,
-        )
-    return _deepep_buffer
 
 
 def _use_moe_permute_fusion() -> bool:
@@ -160,7 +142,6 @@ class _DeepEPDispatch(torch.autograd.Function):
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
-        _debug_cuda_boundary("deepep.layout", hidden_states, call=-1)
         (recv_hidden, recv_indices, recv_probs, recv_per_expert, handle, after_event) = (
             buffer.dispatch(
                 hidden_states,
@@ -175,7 +156,6 @@ class _DeepEPDispatch(torch.autograd.Function):
                 allocate_on_comm_stream=allocate_on_comm_stream,
             )
         )
-        _debug_cuda_boundary("deepep.transport", recv_hidden, call=-1)
         if async_finish:
             after_event.current_stream_wait()
 
@@ -387,31 +367,9 @@ class TokenDispatcher:
                 False,
                 False,
             )
-            # The aligned protocol immediately reuses the normal DeepEP
-            # buffer for a second, route-level dispatch.  On the validated
-            # DeepEP fork the primary recv top-k metadata may alias reusable
-            # communication workspace: real RL batches showed a finite
-            # ``recv_probs`` tensor acquire NaNs after the metadata dispatch.
-            # Preserve only the small IDs/FP32 weights before re-entry.  The
-            # full hidden payload remains zero-copy, and clone keeps the
-            # probability autograd edge intact.
-            received_indices = received_indices.clone()
-            received_weights = received_weights.clone()
             _debug_cuda_boundary(
                 "aligned_dispatch.primary", received_hidden, call=debug_call
             )
-            # The aligned path performs two normal-DeepEP collectives back to
-            # back: the rank-deduplicated hidden dispatch and the route-slot
-            # metadata dispatch.  Normal DeepEP does not put a cross-rank
-            # completion fence at the end of dispatch.  With large, skewed
-            # batches a fast rank can therefore enter the second Buffer while
-            # a peer is still using the first one, and the following combine
-            # can overwrite DeepEP's sender/receiver signals.  MCore's usual
-            # one-dispatch MoE path gets this separation from expert compute;
-            # the metadata-only extension has no such gap.  Fence the EP group
-            # at this new collective boundary.  Use the model-owned group, not
-            # global parallel_state.
-            dist.barrier(group=self.ps.tp_ep_group)
             (
                 route_indices,
                 route_weights,
@@ -423,9 +381,6 @@ class TokenDispatcher:
                 topk_indices,
                 topk_scores,
                 assume_all_routes_valid=True,
-            )
-            _debug_cuda_boundary(
-                "aligned_dispatch.metadata_input", route_fingerprints, call=debug_call
             )
             (
                 received_fingerprints,
