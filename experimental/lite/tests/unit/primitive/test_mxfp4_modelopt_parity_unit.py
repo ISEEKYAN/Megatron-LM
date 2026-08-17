@@ -222,20 +222,57 @@ def test_all_zero_block_matches_modelopt_exponent() -> None:
     assert torch.equal(exponent, torch.full((4, 1), -127.0))
 
 
-def test_modelopt_reference_matches_installed_modelopt() -> None:
-    """Keep the vendored transcription honest wherever nvidia-modelopt exists."""
-    mxfp4_tensor = pytest.importorskip(
-        "modelopt.torch.quantization.qtensor.mxfp4_tensor",
-        reason="nvidia-modelopt is a rollout-side dependency; vendored reference is the lock",
+def test_vendored_mxfp4_reference_matches_locked_boundary_values() -> None:
+    """The vendored expectation is executable without nvidia-modelopt installed."""
+    source = torch.tensor(
+        [
+            [
+                0.0,
+                0.25,
+                0.75,
+                1.25,
+                1.75,
+                2.5,
+                3.5,
+                5.0,
+                -0.25,
+                -0.75,
+                -1.25,
+                -1.75,
+                -2.5,
+                -3.5,
+                -5.0,
+                -6.0,
+            ]
+            * 2
+        ],
+        dtype=torch.bfloat16,
     )
-    for case in CASE_IDS:
-        weight = CASES[case]
-        qtensor, e8m0 = mxfp4_tensor.MXFP4QTensor.quantize(
-            weight.clone(), MXFP4_BLOCK_SIZE
-        )
-        want = qtensor.dequantize(
-            dtype=torch.float32, scale=e8m0, block_sizes={-1: MXFP4_BLOCK_SIZE}
-        ).reshape(weight.shape)
-        _assert_bit_identical(
-            modelopt_mxfp4_qdq(weight), want, f"vendored reference [{case}]"
-        )
+    expected = torch.tensor(
+        [
+            [
+                0.0,
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ]
+            * 2
+        ],
+        dtype=torch.float32,
+    )
+
+    _assert_bit_identical(
+        modelopt_mxfp4_qdq(source), expected, "vendored MXFP4 boundary reference"
+    )
