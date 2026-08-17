@@ -594,7 +594,7 @@ class TokenDispatcher:
         row_ids = row_ids.expand_as(recv_indices)[valid]
         expert_ids = recv_indices[valid]
         routing_map[row_ids, expert_ids] = True
-        probs_2d[row_ids, expert_ids] = recv_probs[valid]
+        probs_2d.index_put_((row_ids, expert_ids), recv_probs[valid], accumulate=True)
         num_out = sum(int(x) for x in recv_per_expert)
         dispatched, permuted_probs, sorted_indices = permute(
             recv_hidden,
