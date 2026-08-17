@@ -36,6 +36,12 @@ def _qkv_local_shape(tp: int) -> tuple[int, int, int]:
     return (2, 16 // tp, 8)
 
 
+def _qkv_bank_values(tp: int) -> torch.Tensor:
+    """Build the TP-local QKV bank on CPU before the carrier moves it to CUDA."""
+    qkv_shape = _qkv_local_shape(tp)
+    return torch.arange(math.prod(qkv_shape), dtype=torch.bfloat16).reshape(qkv_shape)
+
+
 def _skip_or_fail(message: str) -> None:
     if os.environ.get("MLITE_SHARED_FC_DCP_RUNNER") == "1":
         pytest.fail(message)
@@ -80,14 +86,10 @@ class SharedFCBank(nn.Module):
         parameter = getattr(self, _BANK_NAME)
         parameter.allreduce = False
         parameter.tensor_model_parallel = False
-        qkv_shape = _qkv_local_shape(2 if _phase() == "save" else 1)
+        qkv = _qkv_bank_values(2 if _phase() == "save" else 1).to(device="cuda")
         self.register_parameter(
             _QKV_BANK_NAME,
-            nn.Parameter(
-                torch.arange(math.prod(qkv_shape), device="cuda", dtype=torch.bfloat16).reshape(
-                    qkv_shape
-                )
-            ),
+            nn.Parameter(qkv),
         )
         qkv = getattr(self, _QKV_BANK_NAME)
         qkv.allreduce = True

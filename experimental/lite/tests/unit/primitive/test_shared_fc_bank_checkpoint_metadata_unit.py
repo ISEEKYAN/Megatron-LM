@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 from torch.distributed.tensor import Shard
 
@@ -77,9 +75,13 @@ def test_qkv_bank_uses_shard_one_and_tp_shapes():
     assert shared_fc_gpu._qkv_local_shape(1) == (2, 16, 8)
 
 
-def test_qkv_bank_values_match_the_tp_local_shape_for_both_dcp_phases():
-    for tp in (2, 1):
-        qkv_shape = shared_fc_gpu._qkv_local_shape(tp)
-        qkv = torch.arange(math.prod(qkv_shape), dtype=torch.bfloat16).reshape(qkv_shape)
-        assert qkv.shape == qkv_shape
-        assert qkv.numel() == math.prod(qkv_shape)
+def test_qkv_bank_helper_matches_each_dcp_phase_shape_and_element_count():
+    tp2 = shared_fc_gpu._qkv_bank_values(2)
+    assert tp2.device.type == "cpu"
+    assert tp2.shape == (2, 8, 8)
+    assert tp2.numel() == 128
+
+    tp1 = shared_fc_gpu._qkv_bank_values(1)
+    assert tp1.device.type == "cpu"
+    assert tp1.shape == (2, 16, 8)
+    assert tp1.numel() == 256
