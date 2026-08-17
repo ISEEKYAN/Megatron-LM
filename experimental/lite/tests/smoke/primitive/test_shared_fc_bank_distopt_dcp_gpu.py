@@ -19,11 +19,28 @@ from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_stac
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpus(2), pytest.mark.distributed]
 
 _BANK_NAME = MultiLoraTrainingState.parameter_name(
     "layers.0.moe.experts._fc1_weight_0", "a"
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _two_rank_cuda_process_group():
+    """Make the standalone torchrun carrier establish its own NCCL group."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the shared-FC DCP smoke.")
+    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
+        pytest.skip("run this smoke through two-rank torchrun")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    created = False
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+        created = True
+    yield
+    if created and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 class SharedFCBank(nn.Module):
@@ -101,18 +118,19 @@ def _local_optimizer_slices(chunks, optimizer):
             ranges = wrapped._get_model_param_range_map(parameter)
         except KeyError:
             continue
-        world_range = ranges["gbuf_world"]
+        param_range = ranges["param"]
         master = parameter.main_param
         if master is None:
             continue
         state = wrapped.optimizer.state[master]
+        assert master.numel() == param_range.end - param_range.start
         result.append(
             {
-                "range": (world_range.start, world_range.end),
+                "range": (param_range.start, param_range.end),
                 "fp32_param": master.detach().cpu().clone(),
                 "exp_avg": state["exp_avg"].detach().cpu().clone(),
                 "exp_avg_sq": state["exp_avg_sq"].detach().cpu().clone(),
-                "step": state["step"],
+                "step": _step_value(state["step"]),
             }
         )
     return result
@@ -124,20 +142,23 @@ def _global_optimizer_oracle(chunks, optimizer):
     dist.all_gather_object(gathered, local)
     all_slices = [item for rank_slices in gathered for item in rank_slices]
     assert all_slices, "at least one rank must own a dist-opt shard"
-    result = {"model": dict(getattr(chunks[0], "module", chunks[0]).named_parameters())[_BANK_NAME].detach().cpu().float().clone()}
+    parameter = dict(getattr(chunks[0], "module", chunks[0]).named_parameters())[_BANK_NAME]
+    result = {"model": parameter.detach().cpu().float().clone()}
     for key in ("fp32_param", "exp_avg", "exp_avg_sq"):
-        size = max(item["range"][1] for item in all_slices)
+        size = parameter.numel()
         full = torch.empty(size, dtype=all_slices[0][key].dtype)
-        covered = torch.zeros(size, dtype=torch.bool)
+        coverage = torch.zeros(size, dtype=torch.int)
         for item in all_slices:
             start, end = item["range"]
+            assert 0 <= start <= end <= size
+            assert end - start == item[key].numel()
             full[start:end].copy_(item[key].reshape(-1))
-            covered[start:end] = True
-        assert covered.all(), f"incomplete global {key} oracle"
+            coverage[start:end] += 1
+        assert torch.equal(coverage, torch.ones_like(coverage)), f"invalid global {key} coverage"
         result[key] = full
-    steps = {item["step"] for item in all_slices}
-    assert len(steps) == 1 and next(iter(steps)) > 0
-    result["step"] = next(iter(steps))
+    steps = [item["step"] for item in all_slices]
+    assert len(set(steps)) == 1 and steps[0] > 0
+    result["step"] = steps[0]
     assert result["exp_avg"].abs().max() > 0 and result["exp_avg_sq"].abs().max() > 0
     return result
 
@@ -145,14 +166,18 @@ def _global_optimizer_oracle(chunks, optimizer):
 def _assert_loaded_slices(chunks, optimizer, oracle):
     model = dict(getattr(chunks[0], "module", chunks[0]).named_parameters())[_BANK_NAME]
     torch.testing.assert_close(model.cpu().float(), oracle["model"], rtol=0, atol=0)
-    for item in _local_optimizer_slices(chunks, optimizer):
+    local = _local_optimizer_slices(chunks, optimizer)
+    assert local, "every load rank must own the complete shared bank"
+    expected = (0, model.numel())
+    assert [item["range"] for item in local] == [expected]
+    for item in local:
         start, end = item["range"]
         assert item["step"] == oracle["step"]
         for key in ("fp32_param", "exp_avg", "exp_avg_sq"):
             torch.testing.assert_close(item[key].reshape(-1), oracle[key][start:end], rtol=0, atol=0)
 
 
-def _assert_dense_replicated_state(chunk):
+def _assert_dense_replicated_state(chunk, phase: str):
     state = chunk.sharded_state_dict()
     tensor = state[_BANK_NAME]
     assert tuple(tensor.global_shape) == tuple(tensor.local_shape)
@@ -160,8 +185,47 @@ def _assert_dense_replicated_state(chunk):
     replicas = [tuple(tensor.replica_id)]
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, replicas[0])
-    assert all(isinstance(replica, tuple) and len(replica) == 3 for replica in gathered)
-    assert sum(replica == (0, 0, 0) for replica in gathered) == 1
+    expected = (
+        {(0, 0, 0), (0, 1, 0)} if phase == "save" else {(0, 0, 0), (0, 0, 1)}
+    )
+    assert set(gathered) == expected
+    assert len(gathered) == len(expected)
+
+
+def _step_value(step) -> int:
+    return int(step.detach().cpu().item()) if torch.is_tensor(step) else int(step)
+
+
+def _poison_optimizer_state(chunks, optimizer, oracle):
+    """Materialize target Adam state before making its values detectably wrong."""
+    loss = getattr(chunks[0], "module", chunks[0])()
+    loss.backward()
+    optimizer.finish_grad_sync()
+    optimizer.step()
+    optimizer.zero_grad()
+    for parameter in chunks[0].parameters():
+        parameter.data.fill_(123)
+    for wrapped in _inner_optimizers(optimizer):
+        for group in getattr(wrapped, "shard_fp32_from_float16_groups", ()):
+            for master in group:
+                master.data.fill_(321)
+                state = wrapped.optimizer.state[master]
+                state["exp_avg"].fill_(322)
+                state["exp_avg_sq"].fill_(323)
+                if torch.is_tensor(state["step"]):
+                    state["step"].fill_(99)
+                else:
+                    state["step"] = 99
+    local = _local_optimizer_slices(chunks, optimizer)
+    for item in local:
+        start, end = item["range"]
+        assert not torch.equal(item["fp32_param"].reshape(-1), oracle["fp32_param"][start:end])
+        assert not torch.equal(item["exp_avg"].reshape(-1), oracle["exp_avg"][start:end])
+        assert not torch.equal(item["exp_avg_sq"].reshape(-1), oracle["exp_avg_sq"][start:end])
+        assert item["step"] != oracle["step"]
+    has_local_state = torch.tensor(int(bool(local)), device="cuda")
+    dist.all_reduce(has_local_state, op=dist.ReduceOp.MAX)
+    assert has_local_state.item() == 1, "target topology must materialize Adam state"
 
 
 def test_shared_fc_bank_distopt_dcp_tp2_ep1_to_tp1_ep2():
@@ -174,7 +238,7 @@ def test_shared_fc_bank_distopt_dcp_tp2_ep1_to_tp1_ep2():
         parallel = ParallelConfig(tp=1, ep=2, etp=1, pp=1, cp=1)
     chunks, optimizer, _ps = _build(parallel)
     assert set(dict(getattr(chunks[0], "module", chunks[0]).named_parameters())) == {_BANK_NAME}
-    _assert_dense_replicated_state(chunks[0])
+    _assert_dense_replicated_state(chunks[0], phase)
     checkpoint_dir = artifact / "checkpoint"
     if phase == "save":
         loss = getattr(chunks[0], "module", chunks[0])()
@@ -193,16 +257,7 @@ def test_shared_fc_bank_distopt_dcp_tp2_ep1_to_tp1_ep2():
         dist.barrier()
         return
     oracle = torch.load(artifact / f"oracle_rank_{dist.get_rank()}.pt", weights_only=True)
-    for parameter in chunks[0].parameters():
-        parameter.data.fill_(123)
-    for wrapped in _inner_optimizers(optimizer):
-        for group in getattr(wrapped, "shard_fp32_from_float16_groups", ()):
-            for master in group:
-                master.data.fill_(321)
-                state = wrapped.optimizer.state[master]
-                state["exp_avg"].fill_(322)
-                state["exp_avg_sq"].fill_(323)
-                state["step"] = type(state["step"])(99)
+    _poison_optimizer_state(chunks, optimizer, oracle)
     assert dcp.load_training_checkpoint(
         chunks[0], optimizer, str(checkpoint_dir), use_dcp=True, load_optimizer=True
     ) == 1
