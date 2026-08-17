@@ -649,6 +649,56 @@ def test_batched_lora_delta_backward_matches_reference_for_repeated_slots():
         torch.testing.assert_close(actual_grad, reference_tensor.grad)
 
 
+def test_triton_eligible_dense_backward_propagates_kernel_failure(monkeypatch):
+    """An eligible BGMV backward failure must not be silently rerouted to eager."""
+    x, a_bank, b_bank, indices = _inputs(dtype=torch.float32)
+
+    def eager_forward(x, a_bank, b_bank, slots, scale):
+        hidden = torch.bmm(a_bank.index_select(0, slots), x.unsqueeze(-1)).squeeze(-1)
+        delta = torch.bmm(b_bank.index_select(0, slots), hidden.unsqueeze(-1)).squeeze(-1)
+        return delta * scale, hidden
+
+    class SentinelError(RuntimeError):
+        pass
+
+    def raise_sentinel(*_args, **_kwargs):
+        raise SentinelError("dense backward sentinel")
+
+    monkeypatch.setattr(multi_lora_kernel, "dense_batched_lora_forward", eager_forward)
+    monkeypatch.setattr(multi_lora_kernel, "_can_use_triton", lambda *_args: True)
+    monkeypatch.setattr(multi_lora_kernel.multi_lora_bgmv, "bgmv_bwd", raise_sentinel)
+
+    with pytest.raises(SentinelError, match="dense backward sentinel"):
+        BatchedLoraDelta.apply(x, a_bank, b_bank, indices, 0.75).sum().backward()
+
+
+def test_triton_eligible_stage_backward_propagates_kernel_failure(monkeypatch):
+    """An eligible stage backward failure must not be silently rerouted to eager."""
+    x = torch.ones(2, 3, dtype=torch.float32, requires_grad=True)
+    weight = torch.ones(2, 4, 3, dtype=torch.float32, requires_grad=True)
+    slots = torch.tensor([0, 1], dtype=torch.int64)
+
+    def eager_stage_forward(x, weight, slots, **_kwargs):
+        return torch.bmm(weight.index_select(0, slots), x.unsqueeze(-1)).squeeze(-1)
+
+    class SentinelError(RuntimeError):
+        pass
+
+    def raise_sentinel(*_args, **_kwargs):
+        raise SentinelError("stage backward sentinel")
+
+    monkeypatch.setattr(
+        multi_lora_kernel, "dense_batched_lora_stage_forward", eager_stage_forward
+    )
+    monkeypatch.setattr(multi_lora_kernel, "_can_use_triton", lambda *_args: True)
+    monkeypatch.setattr(
+        multi_lora_kernel.multi_lora_bgmv, "bgmv_stage_bwd", raise_sentinel
+    )
+
+    with pytest.raises(SentinelError, match="stage backward sentinel"):
+        multi_lora_kernel.batched_lora_linear_stage(x, weight, slots).sum().backward()
+
+
 def test_fp32_backward_reference_matches_float64_autograd_truth():
     """Validate FP32-single-cast backward against random float64 autograd truth."""
     torch.manual_seed(23)
