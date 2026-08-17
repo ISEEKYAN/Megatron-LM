@@ -122,11 +122,16 @@ def apply_batched_lora_delta(
         restore = torch.empty_like(order)
         restore[order] = torch.arange(order.numel(), device=order.device)
         rows, slots = rows.index_select(0, order), slots.index_select(0, order)
+        stage_dtype = (
+            torch.float32
+            if rows.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            else rows.dtype
+        )
         hidden = multi_lora_kernel.batched_lora_linear_stage(
             rows,
             bank.a_bank,
             slots,
-            output_dtype=torch.float32,
+            output_dtype=stage_dtype,
             max_g_size_hint=rows.shape[0],
         )
         if partition.rank_partitioned_a:

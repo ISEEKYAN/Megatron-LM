@@ -119,6 +119,17 @@ def test_single_and_one_slot_bank_share_the_dense_executor(monkeypatch):
     assert calls == 2
 
 
+def test_nonzero_dropout_preserves_the_single_lora_compatibility_path(monkeypatch):
+    def unexpected_bank_dispatch(*args, **kwargs):
+        raise AssertionError("dropout LoRA must retain its established execution path")
+
+    monkeypatch.setattr(
+        multi_lora_kernel, "dense_batched_lora_forward", unexpected_bank_dispatch
+    )
+    adapter = LinearLoRA(3, 4, 2, dropout=0.25)
+    assert adapter(torch.randn(5, 3)).shape == (5, 4)
+
+
 def _tp_pair_worker(rank: int, world_size: int, init_file: str, kind: str, queue) -> None:
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size

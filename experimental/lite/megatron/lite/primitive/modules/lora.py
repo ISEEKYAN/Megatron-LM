@@ -356,100 +356,6 @@ class _AllGatherLastDim(torch.autograd.Function):
         )
 
 
-class _SequenceParallelRankPartitionedLoRA(torch.autograd.Function):
-    """QKV LoRA path that recomputes gathered activations in backward.
-
-    The ordinary composition of all-gather + matmul saves the full
-    sequence-parallel gathered input for every layer. For QKV LoRA that input
-    is much larger than the low-rank hidden activation. This function saves
-    only the local input plus LoRA weights, then repeats the small gather/matmul
-    sequence during backward.
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        x: torch.Tensor,
-        lora_a: torch.Tensor,
-        lora_b: torch.Tensor,
-        scale: float,
-        group,
-    ):
-        world_size = dist.get_world_size(group) if group is not None else 1
-        if world_size > 1:
-            gathered = _all_gather_sequence_forward(x, group, world_size)
-        else:
-            gathered = x
-        hidden_local = gathered.matmul(lora_a.t())
-        hidden = _all_gather_last_dim_forward(hidden_local, group, world_size)
-        out = hidden.matmul(lora_b.t()) * scale
-        ctx.save_for_backward(x, lora_a, lora_b)
-        ctx.group = group
-        ctx.world_size = world_size
-        ctx.local_seq = x.shape[0]
-        ctx.local_rank_width = hidden_local.shape[-1]
-        ctx.scale = float(scale)
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        x, lora_a, lora_b = ctx.saved_tensors
-        world_size = ctx.world_size
-        group = ctx.group
-        if world_size > 1:
-            gathered = _all_gather_sequence_forward(x, group, world_size)
-        else:
-            gathered = x
-        hidden_local = gathered.matmul(lora_a.t())
-        hidden = _all_gather_last_dim_forward(hidden_local, group, world_size)
-
-        grad_out_scaled = grad_out * ctx.scale
-        grad_b = (
-            grad_out_scaled.reshape(-1, grad_out_scaled.shape[-1])
-            .t()
-            .matmul(hidden.reshape(-1, hidden.shape[-1]))
-        )
-        grad_hidden = grad_out_scaled.matmul(lora_b)
-        if world_size > 1:
-            grad_hidden_local = _split_last_dim(
-                grad_hidden, dist.get_rank(group), ctx.local_rank_width
-            )
-            dist.all_reduce(grad_hidden_local, op=dist.ReduceOp.SUM, group=group)
-        else:
-            grad_hidden_local = grad_hidden
-        grad_a = (
-            grad_hidden_local.reshape(-1, grad_hidden_local.shape[-1])
-            .t()
-            .matmul(gathered.reshape(-1, gathered.shape[-1]))
-        )
-        grad_gathered = grad_hidden_local.matmul(lora_a)
-        if world_size > 1:
-            grad_x = _reduce_scatter_sequence_forward(
-                grad_gathered, group, ctx.local_seq
-            )
-        else:
-            grad_x = grad_gathered
-        return grad_x, grad_a, grad_b, None, None
-
-
-def _all_gather_sequence_forward(
-    x: torch.Tensor, group, world_size: int
-) -> torch.Tensor:
-    out = torch.empty(
-        (x.shape[0] * world_size, *x.shape[1:]), dtype=x.dtype, device=x.device
-    )
-    dist.all_gather_into_tensor(out, x.contiguous(), group=group)
-    return out
-
-
-def _reduce_scatter_sequence_forward(
-    x: torch.Tensor, group, local_seq: int
-) -> torch.Tensor:
-    out = torch.empty((local_seq, *x.shape[1:]), dtype=x.dtype, device=x.device)
-    dist.reduce_scatter_tensor(out, x.contiguous(), group=group)
-    return out
-
-
 def _all_gather_last_dim_forward(
     x: torch.Tensor, group, world_size: int
 ) -> torch.Tensor:
@@ -466,11 +372,6 @@ def _all_gather_last_dim_forward(
         .movedim(0, -1)
         .contiguous()
     )
-
-
-def _split_last_dim(x: torch.Tensor, group_rank: int, local_width: int) -> torch.Tensor:
-    start = int(group_rank) * local_width
-    return x.narrow(-1, start, local_width).contiguous()
 
 
 class LinearLoRA(nn.Module):
@@ -568,25 +469,42 @@ class LinearLoRA(nn.Module):
         nn.init.zeros_(self.lora_b)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if (
-            self.sequence_parallel_input
-            and self.rank_partitioned_a
-            and not self.training
-        ):
-            # Keep eval/inference on the simple path; the memory optimization
-            # matters only when autograd needs to retain forward activations.
-            pass
-        elif (
-            self.sequence_parallel_input
-            and self.rank_partitioned_a
-            and not self.input_parallel_reduce
-            and not self.output_partitioned_b
-            and not self.row_parallel_output
-            and not self.sequence_parallel_scatter_output
-            and self.dropout_p == 0.0
-        ):
-            return _SequenceParallelRankPartitionedLoRA.apply(
-                x, self.lora_a, self.lora_b, self.scale, self.tp_group
+        # A one-slot bank is the canonical dropout-free execution path. Keep
+        # activation dropout and the legacy reduce-scatter mode on their
+        # established implementation because neither is part of the dense-bank
+        # contract and silently changing either would change semantics.
+        if self.dropout_p == 0.0 and not self.row_parallel_output:
+            from megatron.lite.primitive.modules.multi_lora_bank import (
+                DenseLoraBank,
+                LoraBankPartition,
+                apply_batched_lora_delta,
+            )
+
+            partition_size = (
+                self.rank_partition_size
+                if self.rank_partitioned_a
+                else self.output_partition_size
+            )
+            bank = DenseLoraBank(
+                self.lora_a.unsqueeze(0),
+                self.lora_b.unsqueeze(0),
+                LoraBankPartition(
+                    tp_size=partition_size,
+                    rank_partitioned_a=self.rank_partitioned_a,
+                    output_partitioned_b=self.output_partitioned_b,
+                ),
+            )
+            rows = x.numel() // x.shape[-1]
+            return apply_batched_lora_delta(
+                bank,
+                x,
+                torch.zeros(rows, dtype=torch.long, device=x.device),
+                scale=self.scale,
+                tp_group=self.tp_group,
+                tp_rank=self.tp_rank,
+                sequence_parallel_input=self.sequence_parallel_input,
+                input_parallel_reduce=self.input_parallel_reduce,
+                sequence_parallel_scatter_output=self.sequence_parallel_scatter_output,
             )
         if self.sequence_parallel_input:
             x = _gather_sequence_parallel(x, self.tp_group)
@@ -759,11 +677,19 @@ class SharedGroupedLinearLoRA(nn.Module):
             raise ValueError(
                 f"SharedGroupedLinearLoRA expected {self.num_local_experts} splits, got {len(splits)}."
             )
-        dropped = (
-            F.dropout(x, p=self.dropout_p, training=self.training)
-            if self.dropout_p
-            else x
-        )
+        if self.dropout_p == 0.0:
+            from megatron.lite.primitive.modules.multi_lora_bank import (
+                DenseLoraBank,
+                apply_batched_lora_delta,
+            )
+
+            return apply_batched_lora_delta(
+                DenseLoraBank(self.lora_a.unsqueeze(0), self.lora_b.unsqueeze(0)),
+                x,
+                torch.zeros(x.shape[0], dtype=torch.long, device=x.device),
+                scale=self.scale,
+            )
+        dropped = F.dropout(x, p=self.dropout_p, training=self.training)
         return dropped.matmul(self.lora_a.t()).matmul(self.lora_b.t()) * self.scale
 
     def materialized_lora_factors(
