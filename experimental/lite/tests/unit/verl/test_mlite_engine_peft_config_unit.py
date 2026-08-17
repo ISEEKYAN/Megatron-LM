@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import ast
 import copy
-import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -73,18 +71,6 @@ def _load_production_weight_exporter():
     module = ast.fix_missing_locations(ast.Module([method], []))
     exec(compile(module, engine_path, "exec"), namespace)
     return namespace[method.name]
-
-
-def _install_identity_verl_target_converter(monkeypatch):
-    verl = types.ModuleType("verl")
-    utils = types.ModuleType("verl.utils")
-    peft_utils = types.ModuleType("verl.utils.megatron_peft_utils")
-    peft_utils.convert_megatron_to_hf_target_modules = list
-    verl.utils = utils
-    utils.megatron_peft_utils = peft_utils
-    monkeypatch.setitem(sys.modules, "verl", verl)
-    monkeypatch.setitem(sys.modules, "verl.utils", utils)
-    monkeypatch.setitem(sys.modules, "verl.utils.megatron_peft_utils", peft_utils)
 
 
 def test_model_owned_registry_routes_verl_resync_to_the_named_adapter():
@@ -181,16 +167,101 @@ def test_model_owned_registry_routes_verl_resync_to_the_named_adapter():
 @pytest.mark.parametrize(
     "alpha,use_rslora",
     [
+        pytest.param(None, False, id="default-alpha-standard"),
+        pytest.param(None, True, id="default-alpha-rslora"),
+        pytest.param(24, False, id="explicit-alpha-standard"),
+        pytest.param(24, True, id="explicit-alpha-rslora"),
+    ],
+)
+def test_single_and_named_adapter_sync_share_the_pin_peft_metadata(alpha, use_rslora):
+    """Both exporter branches must give vLLM the same placeholder contract."""
+
+    export = _load_production_weight_exporter()
+    builder = _load_production_vllm_peft_builder()
+
+    class Registry:
+        rank = 8
+
+        def __init__(self):
+            self.alpha = alpha
+            self.lora_spec = SimpleNamespace(use_rslora=use_rslora)
+
+        @staticmethod
+        def slot_for(name):
+            assert name == "alpha"
+            return 0
+
+    def metadata_for(*, registry):
+        class Runtime:
+            @staticmethod
+            def multi_lora_registry(_handle):
+                return registry
+
+            @staticmethod
+            def export_weights(_handle, **_kwargs):
+                return iter(())
+
+            @staticmethod
+            def export_lora_adapter(_handle, **_kwargs):
+                return iter(())
+
+        engine = SimpleNamespace(
+            _require_initialized=lambda: None,
+            is_param_offload_enabled=False,
+            _initial_sync_cache_cleared=True,
+            engine_config=SimpleNamespace(
+                resync_format=None,
+                resync_config=None,
+                export_dtype="bfloat16",
+                qat={"enable": False},
+                multi_lora_name="alpha",
+            ),
+            _mlite_config=SimpleNamespace(
+                impl_cfg={
+                    "lora": {
+                        "enabled": True,
+                        "rank": 8,
+                        "alpha": alpha,
+                        "use_rslora": use_rslora,
+                        "target_modules": ["linear_qkv"],
+                        "exclude_modules": ["linear_fc2"],
+                    }
+                }
+            ),
+            runtime=Runtime(),
+            handle=object(),
+            _resolve_model_name=lambda: "qwen3_moe",
+            _build_vllm_peft_config=lambda config: builder(None, config),
+            _lora_rollout_sync_is_merge=lambda _config: False,
+            _assert_adapter_rollout_contract=lambda _config: None,
+            _checked_adapter_stream=lambda stream: stream,
+        )
+        _, metadata = export(engine, base_sync_done=False)
+        return metadata
+
+    single = metadata_for(registry=None)
+    named = metadata_for(registry=Registry())
+
+    assert named == single
+    assert named["target_modules"] == "all-linear"
+    assert "exclude_modules" not in named
+    assert {key: named[key] for key in ("r", "lora_alpha", "use_rslora")} == {
+        "r": 8,
+        "lora_alpha": 8 if alpha is None else alpha,
+        "use_rslora": use_rslora,
+    }
+
+
+@pytest.mark.parametrize(
+    "alpha,use_rslora",
+    [
         pytest.param(None, False, id="omitted-alpha"),
         pytest.param(24, False, id="explicit-alpha"),
         pytest.param(24, True, id="rslora"),
     ],
 )
-def test_alpha_scaling_matches_training_and_production_vllm_builder(
-    monkeypatch, alpha, use_rslora
-):
+def test_alpha_scaling_matches_training_and_production_vllm_builder(alpha, use_rslora):
     """One raw config must resolve identically on both sides."""
-    _install_identity_verl_target_converter(monkeypatch)
     builder = _load_production_vllm_peft_builder()
     spec = lora_module.LoraSpec(
         enabled=True,
@@ -221,4 +292,25 @@ def test_alpha_scaling_matches_training_and_production_vllm_builder(
     assert peft_config["r"] == spec.rank
     assert peft_config["use_rslora"] is spec.use_rslora
     assert peft_config["lora_dropout"] == spec.dropout
-    assert peft_config["target_modules"] == list(spec.target_modules)
+    assert peft_config["target_modules"] == "all-linear"
+    assert "exclude_modules" not in peft_config
+
+
+def test_production_vllm_builder_uses_pin_placeholder_not_target_metadata():
+    builder = _load_production_vllm_peft_builder()
+
+    config = builder(
+        None,
+        {
+            "rank": 16,
+            "alpha": 32,
+            "use_rslora": True,
+            "target_modules": ["linear_qkv", "linear_fc1", "linear_qkv", "router"],
+            "exclude_modules": ["linear_fc2", "linear_fc2"],
+        },
+    )
+
+    assert config["target_modules"] == "all-linear"
+    assert "exclude_modules" not in config
+    assert config["lora_alpha"] == 32
+    assert config["use_rslora"] is True

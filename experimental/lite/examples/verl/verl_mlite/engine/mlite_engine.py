@@ -592,25 +592,19 @@ class MegatronLiteEngine(BaseEngine):
         Built here rather than via VERL's ``build_peft_config_for_vllm`` because
         that helper omits ``use_rslora``; ``PEFTHelper.from_dict`` silently drops
         unknown keys and silently defaults the flag to False, which would make
-        vLLM apply ``alpha/rank`` while training used ``alpha/sqrt(rank)``. Only
-        the megatron->HF module-name table is reused from VERL.
+        vLLM apply ``alpha/rank`` while training used ``alpha/sqrt(rank)``.
+        VERL b9 deliberately uses ``all-linear`` as a PEFTHelper placeholder:
+        the adapter tensor names, not this metadata field, select vLLM modules.
         """
-        from verl.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules
-
         rank = int(lora_cfg.get("rank", LORA_DEFAULT_RANK))
         alpha = lora_cfg.get("alpha", LORA_DEFAULT_ALPHA)
         use_rslora = bool(lora_cfg.get("use_rslora", LORA_DEFAULT_USE_RSLORA))
-        target_modules = list(
-            lora_cfg.get("target_modules", LORA_DEFAULT_TARGET_MODULES)
-        )
-        exclude_modules = list(lora_cfg.get("exclude_modules", []) or [])
         return {
             "task_type": "CAUSAL_LM",
             "r": rank,
             "lora_alpha": resolve_lora_alpha(rank, alpha),
             "use_rslora": use_rslora,
-            "target_modules": convert_megatron_to_hf_target_modules(target_modules),
-            "exclude_modules": convert_megatron_to_hf_target_modules(exclude_modules),
+            "target_modules": "all-linear",
             "bias": "none",
             "lora_dropout": float(lora_cfg.get("dropout", LORA_DEFAULT_DROPOUT)),
         }
