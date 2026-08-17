@@ -71,7 +71,10 @@ def _vllm_quantize_contiguous_input(
             128,
             use_ue8m0=True,
         )
-    if scale_format != DeepGemmQuantScaleFMT.FLOAT32:
+    if scale_format not in (
+        DeepGemmQuantScaleFMT.FLOAT32,
+        DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0,
+    ):
         raise RuntimeError(
             "contiguous DS4 input requires FLOAT32 or packed UE8M0 scales, "
             f"got {scale_format}"
@@ -114,6 +117,7 @@ def _vllm_silu_mul_quant(
             gate_up,
             output_q=output,
             use_ue8m0=(scale_format == DeepGemmQuantScaleFMT.UE8M0),
+            round_scale=(scale_format != DeepGemmQuantScaleFMT.FLOAT32),
             masked_m=None,
             group_size=128,
         )
