@@ -387,6 +387,16 @@ class TokenDispatcher:
                 False,
                 False,
             )
+            # The aligned protocol immediately reuses the normal DeepEP
+            # buffer for a second, route-level dispatch.  On the validated
+            # DeepEP fork the primary recv top-k metadata may alias reusable
+            # communication workspace: real RL batches showed a finite
+            # ``recv_probs`` tensor acquire NaNs after the metadata dispatch.
+            # Preserve only the small IDs/FP32 weights before re-entry.  The
+            # full hidden payload remains zero-copy, and clone keeps the
+            # probability autograd edge intact.
+            received_indices = received_indices.clone()
+            received_weights = received_weights.clone()
             _debug_cuda_boundary(
                 "aligned_dispatch.primary", received_hidden, call=debug_call
             )
