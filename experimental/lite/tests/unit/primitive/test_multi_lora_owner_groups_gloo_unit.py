@@ -12,6 +12,7 @@ import lora_distributed_test_utils as lora_dist_utils
 import pytest
 import torch
 import torch.distributed as dist
+from megatron.lite.primitive.modules.multi_lora_bank import MultiLoraTrainingState
 from megatron.lite.primitive.parallel import init_parallel
 
 
@@ -124,6 +125,27 @@ def _owner_boundary_worker(
         expected_fc = 2 if (tp, ep) == (2, 1) else 1
         assert dist.get_world_size(attention_group) == expected_attention
         assert dist.get_world_size(fc_group) == expected_fc
+        if (tp, ep) == (2, 1):
+            fc_parameter = torch.nn.Parameter(torch.ones(1))
+            fc_parameter.allreduce = False
+            attention_parameter = torch.nn.Parameter(torch.ones(1))
+            attention_parameter.allreduce = True
+            fc_name = MultiLoraTrainingState.parameter_name(
+                "layers.0.moe.experts._fc1_weight_0", "a"
+            )
+            assert fc_name.startswith("bank_")
+            assert (
+                lora_dist_utils.select_lora_bank_owner_group(
+                    ps, is_expert_bank=not fc_parameter.allreduce
+                )
+                is ps.ep_dp_group
+            )
+            assert (
+                lora_dist_utils.select_lora_bank_owner_group(
+                    ps, is_expert_bank=not attention_parameter.allreduce
+                )
+                is ps.dp_group
+            )
 
         def validate_attention(values) -> None:
             assert len(values) == expected_attention

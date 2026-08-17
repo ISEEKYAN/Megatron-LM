@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from megatron.lite.model.qwen3_moe.common import decode_bank_surface
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.ckpt.dcp import (  # noqa: F401 — re-export
     canonicalize_fc1_for_dcp,
@@ -362,16 +363,13 @@ def save_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
+    if decode_bank_surface(name) is not None:
+        return False
     return "experts" in name and "router" not in name
 
 
 def PLACEMENT_FN(param_name: str) -> list:
-    if ".bank_" in param_name or param_name.startswith("bank_"):
-        encoded = param_name.rsplit("_", 1)[0].split("bank_", 1)[1]
-        try:
-            surface = bytes.fromhex(encoded).decode("utf-8")
-        except ValueError:
-            surface = ""
+    if (surface := decode_bank_surface(param_name)) is not None:
         factor = param_name.rsplit("_", 1)[-1]
         if ".attn.qkv." in surface:
             return [Replicate(), Replicate(), Replicate(), Shard(1)]
@@ -382,6 +380,8 @@ def PLACEMENT_FN(param_name: str) -> list:
                 Replicate(),
                 Shard(2 if factor == "a" else 1),
             ]
+        # FC banks are shared adapter tensors, not native expert weights.
+        return [Replicate(), Replicate(), Replicate(), Replicate()]
     if "experts" in param_name and "router" not in param_name:
         if "fc1" in param_name:
             return [Replicate(), Replicate(), Shard(0), Shard(0)]

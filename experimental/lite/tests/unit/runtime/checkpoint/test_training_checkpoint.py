@@ -23,6 +23,8 @@ from megatron.lite.primitive.ckpt.distckpt import (
     _synchronize_native_optimizer_steps,
     attach_model_sharded_state_dict,
 )
+from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
+from megatron.lite.primitive.modules.multi_lora_bank import MultiLoraTrainingState
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     default_expert_classifier,
@@ -224,6 +226,96 @@ def test_dist_opt_replica_id_groups_sharded_axes_by_placement() -> None:
 
     assert expert_offsets == ((0, 1, 2), (1, 1, 2))
     assert expert_replica_id == (0, 0, 0)
+
+
+def test_encoded_multi_lora_banks_use_dense_checkpoint_meshes(
+    monkeypatch,
+) -> None:
+    import megatron.lite.primitive.ckpt.distckpt as distckpt
+
+    fc_name = MultiLoraTrainingState.parameter_name(
+        "layers.0.moe.experts._fc1_weight_0", "a"
+    )
+    attention_name = MultiLoraTrainingState.parameter_name(
+        "layers.0.attn.qkv.linear.weight", "a"
+    )
+    module = torch.nn.Module()
+    module.register_parameter(fc_name, torch.nn.Parameter(torch.ones(2, 2)))
+    module.register_parameter(attention_name, torch.nn.Parameter(torch.ones(2, 2)))
+    records = {}
+
+    class CapturedShardedTensor:
+        @staticmethod
+        def from_rank_offsets(key, tensor, *offsets, replica_id):
+            records[key] = {"offsets": offsets, "replica_id": replica_id}
+            return records[key]
+
+    monkeypatch.setattr(distckpt, "ShardedTensor", CapturedShardedTensor)
+    ps = ParallelState(
+        tp_size=2,
+        tp_rank=1,
+        ep_size=2,
+        ep_rank=1,
+        etp_size=1,
+        etp_rank=0,
+        dp_size=5,
+        dp_rank=4,
+        dp_cp_size=5,
+        dp_cp_rank=4,
+        expert_dp_size=3,
+        expert_dp_rank=2,
+    )
+
+    distckpt._module_sharded_state_dict(
+        module, ps, get_placements=PLACEMENT_FN, is_expert=EXPERT_CLASSIFIER
+    )
+
+    assert records[fc_name]["replica_id"] == (0, 1, 4)
+    assert records[attention_name]["replica_id"] == (0, 0, 4)
+
+
+def test_dist_opt_optimizer_save_uses_dense_encoded_bank_model_state(
+    monkeypatch, tmp_path
+) -> None:
+    import megatron.lite.primitive.ckpt.distckpt as distckpt
+
+    fc_name = MultiLoraTrainingState.parameter_name(
+        "layers.0.moe.experts._fc1_weight_0", "a"
+    )
+    attention_name = MultiLoraTrainingState.parameter_name(
+        "layers.0.attn.qkv.linear.weight", "a"
+    )
+    model = torch.nn.Module()
+    model.register_parameter(fc_name, torch.nn.Parameter(torch.ones(2, 2)))
+    model.register_parameter(attention_name, torch.nn.Parameter(torch.ones(2, 2)))
+    optimizer = FakeDistOpt()
+    attach_model_sharded_state_dict(
+        [model],
+        ParallelState(tp_size=2, tp_rank=1, dp_size=5, dp_rank=4, dp_cp_size=5, dp_cp_rank=4),
+        get_placements=PLACEMENT_FN,
+        is_expert=EXPERT_CLASSIFIER,
+    )
+    saved = {}
+    monkeypatch.setattr(
+        distckpt.dist_checkpointing,
+        "save",
+        lambda state_dict, *args, **kwargs: saved.update(state_dict),
+    )
+
+    dcp.save_training_checkpoint(
+        model,
+        optimizer,
+        1,
+        str(tmp_path),
+        use_dcp=True,
+        save_model=False,
+        save_optimizer=True,
+    )
+
+    assert set(optimizer.save_model_sd) == {fc_name, attention_name}
+    assert optimizer.save_model_sd[fc_name].replica_id == (0, 1, 4)
+    assert optimizer.save_model_sd[attention_name].replica_id == (0, 0, 4)
+    assert saved["optimizer"] == {"is_loading": False}
 
 
 def test_dist_opt_replica_id_does_not_treat_pp_as_a_replica_axis() -> None:

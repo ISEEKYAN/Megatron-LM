@@ -15,9 +15,11 @@ import torch
 import torch.nn as nn
 from megatron.lite.model.qwen3_moe.lite import multi_lora
 from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+    EXPERT_CLASSIFIER,
     PLACEMENT_FN,
     Qwen3MoEWeightSpec,
 )
+from megatron.lite.model.qwen3_moe.common import decode_bank_surface, is_expert_param
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.ckpt.hf_weights import (
@@ -301,6 +303,25 @@ def test_attention_bank_checkpoint_placement_never_shards_slot_dimension():
     assert PLACEMENT_FN(qkv_b)[-1] == Shard(1)
     assert PLACEMENT_FN(proj_a)[-1] == Shard(2)
     assert PLACEMENT_FN(proj_b)[-1] == Shard(1)
+
+
+def test_encoded_bank_names_have_explicit_dense_checkpoint_semantics():
+    fc_name = MultiLoraTrainingState.parameter_name(
+        "layers.0.moe.experts._fc1_weight_0", "a"
+    )
+    attention_name = MultiLoraTrainingState.parameter_name(
+        "layers.0.attn.qkv.linear.weight", "a"
+    )
+
+    assert decode_bank_surface(fc_name) == "layers.0.moe.experts._fc1_weight_0"
+    assert decode_bank_surface(attention_name) == "layers.0.attn.qkv.linear.weight"
+    assert not is_expert_param(fc_name)
+    assert not EXPERT_CLASSIFIER(fc_name)
+    assert not is_expert_param(attention_name)
+    assert not EXPERT_CLASSIFIER(attention_name)
+    assert all(
+        type(placement).__name__ == "Replicate" for placement in PLACEMENT_FN(fc_name)
+    )
 
 
 def test_qkv_tp_carrier_collective_trace_has_hidden_rank_gather(monkeypatch):
