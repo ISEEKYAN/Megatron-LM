@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
+
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 from megatron.lite.primitive.modules.attention.cp import iter_cp_sources
 from megatron.lite.primitive.parallel.cp import (
@@ -84,7 +85,8 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
             DSAIndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
 
-RMSNorm = te.RMSNorm
+def RMSNorm(*args, **kwargs):
+    return te.RMSNorm(*args, **kwargs)
 
 
 def _hadamard_transform_torch(x: torch.Tensor, scale: float) -> torch.Tensor:

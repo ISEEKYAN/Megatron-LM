@@ -9,8 +9,8 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import transformer_engine.pytorch as te
 
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.kimi_k2.config import KimiK2Config
 from megatron.lite.primitive.modules.attention import MultiLatentAttention
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher

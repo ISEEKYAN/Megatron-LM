@@ -36,8 +36,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import transformer_engine.pytorch as te
 
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.kernels.jit import jit_fuser
 from megatron.lite.primitive.ops.gated_delta_rule import (
     l2norm,

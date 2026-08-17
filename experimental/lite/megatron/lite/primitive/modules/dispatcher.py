@@ -218,7 +218,7 @@ class TokenDispatcher:
         self._deepep_event = None
 
         if self.ep_size > 1 and self.num_local_experts > 1:
-            chunk_idxs = torch.arange(self.ep_size * self.num_local_experts)
+            chunk_idxs = torch.arange(self.ep_size * self.num_local_experts, device="cpu")
             self._sort_by_experts = (
                 chunk_idxs.reshape(self.ep_size, self.num_local_experts).T.ravel().tolist()
             )

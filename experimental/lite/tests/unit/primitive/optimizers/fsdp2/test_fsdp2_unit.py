@@ -515,6 +515,50 @@ def test_fp32_adamw_state_dict_roundtrip_cpu():
     assert loaded_state["steps"] == state["steps"]
 
 
+@pytest.mark.parametrize(
+    "loaded_value",
+    [
+        torch.tensor([1.5, -2.25], dtype=torch.bfloat16),
+        torch.tensor([-0.75, 3.0], dtype=torch.bfloat16),
+    ],
+    ids=["checkpoint", "random-reset"],
+)
+def test_fsdp2_meta_init_refreshes_master_before_first_step_cpu(loaded_value):
+    def build(initial_value):
+        param = nn.Parameter(initial_value.clone())
+        inner = build_adamw_optimizer(
+            [{"params": [param], "weight_decay": 0.0}],
+            all_params=[param],
+            lr=0.1,
+            weight_decay=0.0,
+            betas=(0.9, 0.99),
+            eps=1.0e-8,
+            foreach=False,
+            use_fp32_master=True,
+            cpu_update=False,
+            model_param_dtypes={id(param): torch.bfloat16},
+            opt=SimpleNamespace(),
+        )
+        return param, FSDP2Optimizer(inner, [param], clip_grad=100.0)
+
+    # The meta path materializes storage and constructs FSDP2 before either HF
+    # loading or local-shard reset. Poison that pre-load value so a stale master
+    # deterministically overwrites the real weight on the first optimizer step.
+    meta_param, meta_optimizer = build(torch.zeros_like(loaded_value))
+    with torch.no_grad():
+        meta_param.copy_(loaded_value)
+    meta_optimizer.reload_model_params()
+
+    eager_param, eager_optimizer = build(loaded_value)
+    grad = torch.tensor([0.25, -0.5], dtype=torch.bfloat16)
+    meta_param.grad = grad.clone()
+    eager_param.grad = grad.clone()
+
+    assert meta_optimizer.step()[0]
+    assert eager_optimizer.step()[0]
+    torch.testing.assert_close(meta_param, eager_param, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("cpu_update", [False, True])
 def test_fp32_adamw_load_matches_uninterrupted_next_step_cpu(cpu_update: bool):
     def build(initial_value: torch.Tensor):

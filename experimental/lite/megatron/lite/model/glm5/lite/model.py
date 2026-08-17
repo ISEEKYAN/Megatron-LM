@@ -30,7 +30,8 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import transformer_engine.pytorch as te
+
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.glm5.config import Glm5Config
 from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl
 from megatron.lite.primitive.modules.attention import (
