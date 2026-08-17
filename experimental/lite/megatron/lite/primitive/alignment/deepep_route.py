@@ -5,10 +5,7 @@ Route ordering follows THUDM/slime a74ae3a0; execution uses vLLM primitives.
 
 from __future__ import annotations
 
-import os
-
 import torch
-import torch.distributed as dist
 
 _BACKWARD_CHUNK_ROWS = 1024
 
@@ -619,10 +616,12 @@ def _validate_and_order_route_preserving_outputs(
 ) -> torch.Tensor:
     """Return expert outputs in the route handle's receive order.
 
-    DeepEP currently produces the same source-token/slot order for the primary
-    rank-deduplicated dispatch and the virtual-token metadata dispatch.  Do not
-    merely assume that invariant: validate expert ID, exact FP32 weight and an
-    sixteen-BF16 source fingerprint before using the route handle.
+    Normal DeepEP's primary dispatch is rank-deduplicated: its received route
+    probabilities are not a reliable per-(token, slot) identity when one token
+    reaches multiple experts on the same rank.  Pair the primary hidden rows
+    with the route-preserving metadata by expert ID and a sixteen-BF16 source
+    fingerprint.  The metadata dispatch and the caller-owned source weights
+    remain authoritative for exact route probabilities.
     """
     if expert_outputs.ndim != 2 or received_tokens.ndim != 2:
         raise ValueError("Route-preserving DeepEP expects 2D hidden tensors")
@@ -640,7 +639,6 @@ def _validate_and_order_route_preserving_outputs(
     token_rows = positions[:, 0]
     topk_slots = positions[:, 1]
     expected_indices = received_topk_indices[token_rows, topk_slots].reshape(-1)
-    expected_weights = received_topk_weights[token_rows, topk_slots].reshape(-1)
     expected_fingerprints = received_tokens.narrow(1, 0, 16).index_select(0, token_rows)
     if route_fingerprints.shape != expected_fingerprints.shape:
         raise RuntimeError(
@@ -651,18 +649,15 @@ def _validate_and_order_route_preserving_outputs(
     def stable_key_order(
         fingerprints: torch.Tensor,
         indices: torch.Tensor,
-        weights: torch.Tensor,
     ) -> torch.Tensor:
         """Lexicographically order exact route identity without hashing."""
         order = torch.arange(
             indices.numel(), device=indices.device, dtype=torch.long
         )
         fingerprint_bits = fingerprints.contiguous().view(torch.int16)
-        weight_bits = weights.contiguous().view(torch.int32)
         columns = [
             *(fingerprint_bits[:, column] for column in range(fingerprint_bits.shape[1])),
             indices.to(dtype=torch.long),
-            weight_bits.to(dtype=torch.long),
         ]
         # Stable least-significant-to-most-significant sorts implement a
         # deterministic lexicographic order and retain duplicate multiplicity.
@@ -673,13 +668,10 @@ def _validate_and_order_route_preserving_outputs(
             order = order.index_select(0, permutation)
         return order
 
-    primary_order = stable_key_order(
-        expected_fingerprints, expected_indices, expected_weights
-    )
+    primary_order = stable_key_order(expected_fingerprints, expected_indices)
     metadata_order = stable_key_order(
         route_fingerprints,
         route_indices.to(dtype=expected_indices.dtype),
-        route_weights.to(dtype=expected_weights.dtype),
     )
     torch._assert_async(
         torch.all(
@@ -690,37 +682,9 @@ def _validate_and_order_route_preserving_outputs(
         ),
         "Route-preserving DeepEP metadata changed expert identities",
     )
-    expected_weight_bits = expected_weights.contiguous().view(torch.int32).index_select(
-        0, primary_order
-    )
-    route_weight_bits = (
-        route_weights.to(dtype=expected_weights.dtype)
-        .contiguous()
-        .view(torch.int32)
-        .index_select(0, metadata_order)
-    )
-    weight_bits_equal = expected_weight_bits == route_weight_bits
-    if os.environ.get("MLITE_DEEPEP_ROUTE_DIAGNOSTICS") == "1" and not bool(
-        torch.all(weight_bits_equal).item()
-    ):
-        mismatch = torch.nonzero(~weight_bits_equal, as_tuple=False).reshape(-1)
-        first = mismatch[:8]
-        primary_values = expected_weights.index_select(0, primary_order).index_select(0, first)
-        metadata_values = (
-            route_weights.to(dtype=expected_weights.dtype)
-            .index_select(0, metadata_order)
-            .index_select(0, first)
-        )
-        raise RuntimeError(
-            "Route-preserving DeepEP metadata changed exact route probabilities: "
-            f"rank={dist.get_rank()} mismatches={mismatch.numel()}/{weight_bits_equal.numel()} "
-            f"first_positions={first.cpu().tolist()} "
-            f"primary={primary_values.cpu().tolist()} "
-            f"metadata={metadata_values.cpu().tolist()}"
-        )
     torch._assert_async(
-        torch.all(weight_bits_equal),
-        "Route-preserving DeepEP metadata changed exact route probabilities",
+        torch.all(torch.isfinite(route_weights)),
+        "Route-preserving DeepEP metadata contains nonfinite route probabilities",
     )
     torch._assert_async(
         torch.all(
