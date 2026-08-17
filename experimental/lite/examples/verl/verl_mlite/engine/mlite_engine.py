@@ -841,10 +841,14 @@ class MegatronLiteEngine(BaseEngine):
     def _loss_mask_for_packing(
         micro_batch: TensorDict, input_ids: torch.Tensor
     ) -> torch.Tensor | None:
-        if "loss_mask" not in micro_batch.keys():
+        if "loss_mask" in micro_batch.keys():
+            mask_key = "loss_mask"
+        elif "response_mask" in micro_batch.keys():
+            mask_key = "response_mask"
+        else:
             return None
 
-        loss_mask = micro_batch["loss_mask"]
+        loss_mask = micro_batch[mask_key]
         input_lengths = input_ids.offsets().diff().tolist()
         if getattr(loss_mask, "is_nested", False):
             # VERL delivers ``response_mask`` / ``loss_mask`` as a *response-only*
