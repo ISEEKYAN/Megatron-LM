@@ -1472,14 +1472,18 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
         id(state.registry.banks["layers.0.attn.proj.linear.weight"].a_bank),
         id(state.registry.banks["layers.0.attn.proj.linear.weight"].b_bank),
     }
+    qwen3_moe_protocol._set_multi_lora_trainable_parameters([chunk], state)
     optimizer_parameter_ids = {
         id(parameter)
-        for group in torch.optim.SGD(chunk.parameters(), lr=0.1).param_groups
+        for group in torch.optim.SGD(
+            (parameter for parameter in chunk.parameters() if parameter.requires_grad), lr=0.1
+        ).param_groups
         for parameter in group["params"]
     }
-    assert {
-        id(parameter) for parameter in state.parameters()
-    } <= optimizer_parameter_ids
+    assert optimizer_parameter_ids == {
+        id(parameter) for parameter in chunk.parameters() if parameter.requires_grad
+    } == {id(parameter) for parameter in state.parameters()}
+    assert chunk.anchor.requires_grad is False
     checkpoint_state = chunk.state_dict()
     assert {
         "multi_lora_training_state."

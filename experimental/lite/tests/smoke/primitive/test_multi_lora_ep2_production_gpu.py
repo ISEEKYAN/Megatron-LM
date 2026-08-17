@@ -179,6 +179,20 @@ def _named_parameters(bundle) -> dict[str, torch.Tensor]:
     return parameters
 
 
+def _assert_only_model_owned_banks_are_trainable(bundle) -> None:
+    """Production bundle must freeze every base parameter before dist-opt sees it."""
+    state = bundle.extras["multi_lora_training_state"]
+    expected = {
+        f"multi_lora_training_state.{name}" for name, _parameter in state.named_parameters()
+    }
+    parameters = _named_parameters(bundle)
+    actual = {name for name, parameter in parameters.items() if parameter.requires_grad}
+    assert actual == expected
+    assert sum(parameters[name].numel() for name in actual) == sum(
+        parameter.numel() for parameter in state.parameters()
+    )
+
+
 def _checkpoint_semantics(bundle) -> dict[str, dict[str, object]]:
     """Bind every named model parameter plus dense/expert/bank DCP semantics."""
     parameters = _named_parameters(bundle)
@@ -283,6 +297,7 @@ def test_tp2_ep1_attention_multi_lora_production_groups():
         pytest.skip("TP2/EP1 production smoke requires exactly two ranks")
     bundle = _build_bundle(tp=2, ep=1, model_seed=3201)
     _assert_tp_ep_membership(bundle, tp=2, ep=1)
+    _assert_only_model_owned_banks_are_trainable(bundle)
     state = bundle.extras["multi_lora_training_state"]
     qkv, proj = state.attention_banks_for_layer(0)
     assert qkv.partition.rank_partitioned_a and proj.partition.output_partitioned_b
@@ -297,6 +312,7 @@ def test_tp2_ep2_attention_and_expert_multi_lora_production_groups():
         pytest.skip("TP2/EP2 production smoke requires exactly four ranks")
     bundle = _build_bundle(tp=2, ep=2, model_seed=3202)
     _assert_tp_ep_membership(bundle, tp=2, ep=2)
+    _assert_only_model_owned_banks_are_trainable(bundle)
     state = bundle.extras["multi_lora_training_state"]
     fc1, fc2 = state.banks_for_layer(0)
     qkv, proj = state.attention_banks_for_layer(0)
@@ -406,6 +422,8 @@ def _run_bank_gradient_contract(bundle) -> None:
     _configure_fixed_router(bundle)
     batch = _production_batch(bundle)
     parameters = _bank_parameters(bundle)
+    bank_ids = {id(parameter) for parameter in state.parameters()}
+    all_parameters = _named_parameters(bundle)
 
     def assert_slots(gradients, *, active: tuple[int, ...]) -> None:
         assert set(gradients) == _expected_semantic_bank_keys(state)
@@ -422,9 +440,19 @@ def _run_bank_gradient_contract(bundle) -> None:
     # alpha.  Its bravo gradients must be exactly zero before the mixed arm.
     batch.extras["multi_lora_slots"][0].zero_()
     loss, gradients = _run_production_forward_and_finalize(bundle, batch)
-    assert torch.isfinite(loss)
+    assert torch.isfinite(torch.tensor(loss))
     assert_slots(gradients, active=(0,))
     _clear_gradients(bundle)
+    base_before = {
+        name: parameter.detach().clone()
+        for name, parameter in all_parameters.items()
+        if id(parameter) not in bank_ids
+    }
+    bank_before = {
+        name: parameter.detach().clone()
+        for name, parameter in all_parameters.items()
+        if id(parameter) in bank_ids
+    }
 
     # A separate lifecycle establishes that the same semantic A/B slot axis
     # receives gradients for both adapters under mixed token routing.
@@ -432,8 +460,23 @@ def _run_bank_gradient_contract(bundle) -> None:
         torch.tensor([0, 1, 0, 1], device="cuda", dtype=torch.long)
     )
     loss, gradients = _run_production_forward_and_finalize(bundle, batch)
-    assert torch.isfinite(loss)
+    assert torch.isfinite(torch.tensor(loss))
     assert_slots(gradients, active=(0, 1))
+    for name, parameter in all_parameters.items():
+        if id(parameter) in bank_ids:
+            continue
+        assert parameter.grad is None, name
+        main_grad = getattr(parameter, "main_grad", None)
+        assert main_grad is None or main_grad.eq(0).all(), name
+    update_success, _grad_norm, _num_zeros = bundle.optimizer.step()
+    assert update_success
+    for name, expected in base_before.items():
+        assert torch.equal(all_parameters[name], expected), name
+    assert any(
+        not torch.equal(all_parameters[name], expected)
+        for name, expected in bank_before.items()
+    )
+    _clear_gradients(bundle)
 
 
 def _adapter_export_oracle(bundle) -> dict[str, dict[str, torch.Tensor]]:

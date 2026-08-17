@@ -412,6 +412,35 @@ def _build_multi_lora_training_state(
     return state
 
 
+def _set_multi_lora_trainable_parameters(
+    chunks: list[nn.Module], multi_lora_state: MultiLoraTrainingState | None
+) -> None:
+    """Freeze base weights while retaining exactly the model-owned bank objects.
+
+    This runs after QAT so ``weight.original`` masters are included in the base
+    set, and before DDP/dist-opt captures the trainable parameter list.
+    """
+    if multi_lora_state is None:
+        return
+    bank_ids = {id(parameter) for parameter in multi_lora_state.parameters()}
+    if not bank_ids:
+        raise RuntimeError("enabled multi-LoRA state owns no bank parameters.")
+    seen_bank_ids = {
+        id(parameter)
+        for chunk in chunks
+        for parameter in chunk.parameters()
+        if id(parameter) in bank_ids
+    }
+    if seen_bank_ids != bank_ids:
+        raise RuntimeError(
+            "multi-LoRA bank parameters must be registered on the model chunks before "
+            "freezing base parameters."
+        )
+    for chunk in chunks:
+        for parameter in chunk.parameters():
+            parameter.requires_grad_(id(parameter) in bank_ids)
+
+
 def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBundle:
     """Build lite Qwen3MoE: model, parallel state, optimizer — everything.
 
@@ -528,6 +557,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     # Weight-only QAT (fake-quant/STE on the BF16 master, including MoE experts).
     # Must run before optimizer construction so dist_opt captures weight.original.
     apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
+    _set_multi_lora_trainable_parameters(chunks, multi_lora_state)
 
     # ── optimizer (model chooses which primitive) ──
     optimizer = None
