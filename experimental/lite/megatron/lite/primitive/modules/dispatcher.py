@@ -29,6 +29,13 @@ except ImportError:
     EventOverlap = None  # type: ignore
 
 
+# Route metadata expands fixed top-k routing into one virtual token per slot.
+# Keep each normal-DeepEP collective small and rank-synchronous, following the
+# staging rule used by slime for long low-latency prefill.  Sequence length
+# changes the number of stages, never the communication allocation contract.
+_DEEPEP_ROUTE_METADATA_CHUNK_ROWS = 4096
+
+
 def _validate_finite(stage: str, **tensors: torch.Tensor) -> None:
     if os.environ.get("MLITE_VALIDATE_FINITE") != "1":
         return
@@ -382,20 +389,61 @@ class TokenDispatcher:
                 topk_scores,
                 assume_all_routes_valid=True,
             )
-            (
-                received_fingerprints,
-                received_route_indices,
-                received_route_weights,
-                _,
-                route_handle,
-            ) = _DeepEPDispatch.apply(
-                self.route_buffer,
-                route_fingerprints,
-                route_indices,
-                route_weights,
-                self.num_experts,
-                False,
-                False,
+            local_route_chunks = (
+                route_fingerprints.shape[0]
+                + _DEEPEP_ROUTE_METADATA_CHUNK_ROWS
+                - 1
+            ) // _DEEPEP_ROUTE_METADATA_CHUNK_ROWS
+            synchronized_chunks = torch.tensor(
+                local_route_chunks,
+                device=hidden_states.device,
+                dtype=torch.int32,
+            )
+            dist.all_reduce(
+                synchronized_chunks,
+                op=dist.ReduceOp.MAX,
+                group=self.ps.tp_ep_group,
+            )
+            num_route_chunks = int(synchronized_chunks.item())
+            received_fingerprint_chunks = []
+            received_route_index_chunks = []
+            received_route_weight_chunks = []
+            route_handles = []
+            route_received_rows = []
+            for chunk_index in range(num_route_chunks):
+                start = chunk_index * _DEEPEP_ROUTE_METADATA_CHUNK_ROWS
+                chunk_rows = min(
+                    _DEEPEP_ROUTE_METADATA_CHUNK_ROWS,
+                    max(route_fingerprints.shape[0] - start, 0),
+                )
+                (
+                    chunk_fingerprints,
+                    chunk_route_indices,
+                    chunk_route_weights,
+                    _,
+                    chunk_route_handle,
+                ) = _DeepEPDispatch.apply(
+                    self.route_buffer,
+                    route_fingerprints.narrow(0, start, chunk_rows).contiguous(),
+                    route_indices.narrow(0, start, chunk_rows).contiguous(),
+                    route_weights.narrow(0, start, chunk_rows).contiguous(),
+                    self.num_experts,
+                    False,
+                    False,
+                )
+                received_fingerprint_chunks.append(chunk_fingerprints)
+                received_route_index_chunks.append(chunk_route_indices)
+                received_route_weight_chunks.append(chunk_route_weights)
+                route_handles.append(chunk_route_handle)
+                route_received_rows.append(chunk_fingerprints.shape[0])
+            received_fingerprints = torch.cat(
+                received_fingerprint_chunks, dim=0
+            )
+            received_route_indices = torch.cat(
+                received_route_index_chunks, dim=0
+            )
+            received_route_weights = torch.cat(
+                received_route_weight_chunks, dim=0
             )
             _debug_cuda_boundary(
                 "aligned_dispatch.fingerprint", received_fingerprints, call=debug_call
@@ -412,7 +460,8 @@ class TokenDispatcher:
             ).index_select(0, token_rows)
             received_route_indices = topk_indices[token_rows, topk_slots]
             received_route_weights = topk_scores[token_rows, topk_slots]
-            route_handle = None
+            route_handles = []
+            route_received_rows = []
             source_output_index = torch.arange(
                 topk_indices.numel(), device=topk_indices.device, dtype=torch.long
             ).reshape_as(topk_indices)
@@ -423,8 +472,8 @@ class TokenDispatcher:
             )
 
         expected_route_count = (
-            _deepep_route_handle_received_rows(route_handle)
-            if route_handle is not None
+            sum(_deepep_route_handle_received_rows(handle) for handle in route_handles)
+            if route_handles
             else int((received_indices >= 0).sum().item())
         )
         if os.environ.get("MLITE_DEEPEP_ROUTE_DIAGNOSTICS") == "1":
@@ -487,7 +536,8 @@ class TokenDispatcher:
         self._aligned_received_output_index = output_index
         self._aligned_received_positions = positions
         self._aligned_metadata_route_rows = metadata_route_rows
-        self._aligned_route_handle = route_handle
+        self._aligned_route_handles = route_handles
+        self._aligned_route_received_rows = route_received_rows
         self._aligned_source_indices = topk_indices
         self._aligned_source_weights = topk_scores
         self._aligned_source_shape = hidden_states.shape
@@ -513,13 +563,24 @@ class TokenDispatcher:
             route_outputs=route_outputs,
         )
         if self.ep_size > 1:
-            source_routes = _DeepEPCombine.apply(
-                self.route_buffer,
-                route_outputs,
-                self._aligned_route_handle,
-                False,
-                False,
+            received_chunks = route_outputs.split(
+                self._aligned_route_received_rows, dim=0
             )
+            source_route_chunks = [
+                _DeepEPCombine.apply(
+                    self.route_buffer,
+                    received_chunk,
+                    route_handle,
+                    False,
+                    False,
+                )
+                for received_chunk, route_handle in zip(
+                    received_chunks,
+                    self._aligned_route_handles,
+                    strict=True,
+                )
+            ]
+            source_routes = torch.cat(source_route_chunks, dim=0)
             _debug_cuda_boundary(
                 "aligned_combine.route", source_routes, call=debug_call
             )
@@ -546,7 +607,8 @@ class TokenDispatcher:
             "_aligned_received_output_index",
             "_aligned_received_positions",
             "_aligned_metadata_route_rows",
-            "_aligned_route_handle",
+            "_aligned_route_handles",
+            "_aligned_route_received_rows",
             "_aligned_source_indices",
             "_aligned_source_weights",
             "_aligned_source_shape",
