@@ -204,7 +204,9 @@ def _assert_dense_replicated_state(chunk, phase: str):
     state = chunk.sharded_state_dict()
     tensor = state[_BANK_NAME]
     assert tuple(tensor.global_shape) == tuple(tensor.local_shape)
-    assert tuple(tensor.rank_offsets) == ()
+    assert tuple(tensor.global_offset) == (0,) * len(tensor.local_shape)
+    assert tuple(tensor.axis_fragmentations) == (1,) * len(tensor.local_shape)
+    assert tensor.flattened_range is None
     replicas = [tuple(tensor.replica_id)]
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, replicas[0])
