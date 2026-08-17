@@ -186,15 +186,27 @@ class NormalDeepEPAlignedPrepareAndFinalize:
                 if source != compact.shape[0]:
                     raise RuntimeError("normal DeepEP expert counts do not cover all rows")
 
+                # Normal DeepEP/MCore owns receive-count metadata on CPU.  The
+                # masked DeepGEMM ABI is the first consumer that requires a
+                # CUDA pointer, so materialize its device view here, after the
+                # two dispatches and route scatter have established their
+                # stream dependencies.  In particular, do not make the
+                # metadata-only fingerprint dispatch allocate an unused CUDA
+                # count tensor at the communication boundary.
+                device_tokens_per_expert = torch.tensor(
+                    counts,
+                    device=compact.device,
+                    dtype=torch.int64,
+                )
                 quantized, scales = _quantize_batched_input(
                     batched,
                     quant_config.quant_dtype,
                     quant_config.block_shape,
-                    tokens_per_expert,
+                    device_tokens_per_expert,
                 )
                 self._counts = counts
                 metadata = mk.ExpertTokensMetadata(
-                    expert_num_tokens=tokens_per_expert.to(dtype=torch.int32),
+                    expert_num_tokens=device_tokens_per_expert.to(dtype=torch.int32),
                     expert_num_tokens_cpu=None,
                 )
                 return quantized, scales, metadata, None, None
