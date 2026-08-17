@@ -1472,6 +1472,40 @@ def test_production_builder_owns_native_banks_and_injects_sidecars(monkeypatch):
     assert sidecar.lora_indices is batch.extras["multi_lora_slots"][0]
 
 
+def test_runtime_exports_named_adapter_from_model_owned_registry():
+    """The runtime must find the registry on the model, not only handle extras."""
+    from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
+
+    registry = object()
+    captured = {}
+    chunk = nn.Module()
+    chunk.multi_lora_training_state = SimpleNamespace(registry=registry)
+
+    class Protocol:
+        @staticmethod
+        def export_hf_lora_adapter(chunks, model_cfg, ps, **kwargs):
+            captured.update(chunks=chunks, model_cfg=model_cfg, ps=ps, kwargs=kwargs)
+            yield "adapter.weight", torch.ones(1)
+
+    handle = SimpleNamespace(
+        _extras={"model_chunks": [chunk], "protocol": Protocol(), "model_cfg": "cfg"},
+        _model=chunk,
+        _parallel_state="ps",
+    )
+    runtime = SimpleNamespace(multi_lora_registry=MegatronLiteRuntime.multi_lora_registry)
+
+    exported = list(MegatronLiteRuntime.export_weights(runtime, handle, multi_lora_name="alpha"))
+    assert exported[0][0] == "adapter.weight"
+    torch.testing.assert_close(exported[0][1], torch.ones(1))
+    assert captured["chunks"] == [chunk]
+    assert captured["model_cfg"] == "cfg"
+    assert captured["ps"] == "ps"
+    assert captured["kwargs"] == {
+        "multi_lora_registry": registry,
+        "multi_lora_name": "alpha",
+    }
+
+
 def test_multi_lora_parallel_contract_allows_tp_and_rejects_etp_and_deepep():
     spec = multi_lora_bank.MultiLoraSpec(names=("alpha",), rank=2)
     with pytest.raises(ValueError, match="ETP"):

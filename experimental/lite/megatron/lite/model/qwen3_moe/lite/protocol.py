@@ -209,8 +209,8 @@ def _inject_multi_lora_sidecars(kwargs, batch: PackedBatch, multi_lora_state) ->
             *multi_lora_state.banks_for_layer(layer_idx),
             lora_indices=layer_slots,
             scale=multi_lora_state.scale,
-            # FC banks are EP-replicated while attention banks stay on their
-            # TP carrier; this flag is consumed only by MoE FC sidecar calls.
+            # Model-owned banks retain the established explicit EP sidecar
+            # reduction; the same selector covers both FC call sites.
             requires_explicit_ep_sync=True,
             qkv=None if attention_banks is None else attention_banks[0],
             proj=None if attention_banks is None else attention_banks[1],

@@ -410,6 +410,12 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
+        registry_getter = getattr(self.runtime, "multi_lora_registry", None)
+        multi_lora_registry = (
+            registry_getter(self.handle)
+            if callable(registry_getter)
+            else getattr(self.handle, "_extras", {}).get("multi_lora_registry")
+        )
         lora_cfg = (self._mlite_config.impl_cfg or {}).get("lora") if self._mlite_config else None
         # Duck-typed: hydra hands us OmegaConf DictConfig for nested sections, which
         # fails isinstance(dict). ``enabled`` is the authoritative opt-in; rank
@@ -421,6 +427,30 @@ class MegatronLiteEngine(BaseEngine):
             if self.engine_config.qat.get("enable", False):
                 weights = qat_export.export_qat_weights(weights, self.engine_config.qat)
             return weights
+
+        if multi_lora_registry is not None:
+            multi_lora_cfg = {
+                "enabled": True,
+                "rank": multi_lora_registry.rank,
+                "alpha": multi_lora_registry.alpha,
+                "use_rslora": bool(
+                    getattr(getattr(multi_lora_registry, "lora_spec", None), "use_rslora", False)
+                ),
+            }
+            peft_config = self._build_vllm_peft_config(multi_lora_cfg)
+            if not kwargs.get("base_sync_done", False):
+                return _export_base_or_merged_weights(), peft_config
+            multi_lora_name = kwargs.get("multi_lora_name")
+            if not multi_lora_name:
+                raise ValueError(
+                    "model-owned multi-LoRA adapter-only sync requires multi_lora_name."
+                )
+            return (
+                self.runtime.export_weights(
+                    self.handle, multi_lora_name=multi_lora_name
+                ),
+                peft_config,
+            )
 
         if not lora_enabled:
             return _export_base_or_merged_weights(), None

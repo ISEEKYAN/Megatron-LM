@@ -422,7 +422,7 @@ def _run_bank_gradient_contract(bundle) -> None:
     # alpha.  Its bravo gradients must be exactly zero before the mixed arm.
     batch.extras["multi_lora_slots"][0].zero_()
     loss, gradients = _run_production_forward_and_finalize(bundle, batch)
-    assert loss == loss
+    assert torch.isfinite(loss)
     assert_slots(gradients, active=(0,))
     _clear_gradients(bundle)
 
@@ -432,7 +432,7 @@ def _run_bank_gradient_contract(bundle) -> None:
         torch.tensor([0, 1, 0, 1], device="cuda", dtype=torch.long)
     )
     loss, gradients = _run_production_forward_and_finalize(bundle, batch)
-    assert loss == loss
+    assert torch.isfinite(loss)
     assert_slots(gradients, active=(0, 1))
 
 

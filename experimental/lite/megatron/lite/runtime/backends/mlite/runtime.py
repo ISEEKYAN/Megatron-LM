@@ -376,6 +376,25 @@ class MegatronLiteRuntime(RuntimeBase):
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
 
+        registry = self.multi_lora_registry(handle)
+        multi_lora_name = kwargs.pop("multi_lora_name", None)
+        if registry is not None and multi_lora_name is not None:
+            exporter = getattr(proto, "export_hf_lora_adapter", None) if proto else None
+            if exporter is None:
+                raise NotImplementedError(
+                    f"Model protocol {type(proto).__name__} does not implement "
+                    "export_hf_lora_adapter; named multi-LoRA export is unavailable."
+                )
+            yield from exporter(
+                model_chunks,
+                model_cfg,
+                ps,
+                multi_lora_registry=registry,
+                multi_lora_name=multi_lora_name,
+                **kwargs,
+            )
+            return
+
         if proto and hasattr(proto, "export_hf_weights"):
             yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
         else:
@@ -398,12 +417,27 @@ class MegatronLiteRuntime(RuntimeBase):
                 "export_hf_lora_adapter; adapter-only rollout sync is unavailable. "
                 "Set the LoRA rollout sync mode to 'merge' to fall back."
             )
-        registry = handle._extras.get("multi_lora_registry")
+        registry = self.multi_lora_registry(handle)
         if registry is not None:
             if "multi_lora_registry" in kwargs:
                 raise ValueError("multi-LoRA registry must be supplied by the model handle only.")
             kwargs["multi_lora_registry"] = registry
         yield from exporter(model_chunks, model_cfg, ps, **kwargs)
+
+    @staticmethod
+    def multi_lora_registry(handle: ModelHandle):
+        """Return the model-owned named-bank registry, if this model has one."""
+        registry = handle._extras.get("multi_lora_registry")
+        model_chunks = handle._extras.get("model_chunks", [handle._model])
+        for chunk in model_chunks:
+            state = getattr(chunk, "multi_lora_training_state", None)
+            chunk_registry = getattr(state, "registry", None)
+            if chunk_registry is None:
+                continue
+            if registry is not None and registry is not chunk_registry:
+                raise ValueError("model chunks disagree on their multi-LoRA registry.")
+            registry = chunk_registry
+        return registry
 
     def release_export_scratch(self, handle: ModelHandle) -> None:
         """Release retained full-parameter scratch before colocated rollout wake."""
