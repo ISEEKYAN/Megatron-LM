@@ -29,11 +29,7 @@ except ImportError:
     EventOverlap = None  # type: ignore
 
 
-# Route metadata expands fixed top-k routing into one virtual token per slot.
-# Keep each normal-DeepEP collective small and rank-synchronous, following the
-# staging rule used by slime for long low-latency prefill.  Sequence length
-# changes the number of stages, never the communication allocation contract.
-_DEEPEP_ROUTE_METADATA_CHUNK_ROWS = 4096
+_deepep_buffer = None
 
 
 def _validate_finite(stage: str, **tensors: torch.Tensor) -> None:
@@ -71,12 +67,21 @@ def _hidden_bytes(hidden_size: int) -> int:
     return hidden_size * 2
 
 
-def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
+def _get_deepep_buffer(group: dist.ProcessGroup, hidden_bytes: int):
+    """Return MCore's process-wide normal-DeepEP communication buffer.
+
+    This deliberately mirrors ``megatron.core.transformer.moe.fused_a2a``:
+    dispatch and combine look the buffer up from their process group and the
+    payload width on every forward/backward entry.  In particular, the tiny
+    route-fingerprint dispatch reuses the full-width primary buffer instead of
+    creating a second per-layer DeepEP runtime.
+    """
+
     if deep_ep is None:
         raise RuntimeError("DeepEP buffer requested but deep_ep is not installed.")
 
+    global _deepep_buffer
     group_size = dist.get_world_size(group=group)
-    hidden_bytes = _hidden_bytes(hidden_size)
     num_nvl_bytes = 0
     num_rdma_bytes = 0
 
@@ -87,21 +92,34 @@ def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
         num_nvl_bytes = max(
             config.get_nvl_buffer_size_hint(hidden_bytes, group_size), num_nvl_bytes
         )
-        num_rdma_bytes = max(
-            config.get_rdma_buffer_size_hint(hidden_bytes, group_size), num_rdma_bytes
-        )
+        # Match MCore: a node-local EP group neither needs an RDMA heap nor can
+        # assume that a DeepEP build exposes internode size hints.
+        if group_size > torch.cuda.device_count():
+            num_rdma_bytes = max(
+                config.get_rdma_buffer_size_hint(hidden_bytes, group_size),
+                num_rdma_bytes,
+            )
 
-    # Keep primary and route-metadata handles isolated per dispatcher.  The
-    # aligned path keeps both handles alive through expert compute/backward;
-    # sharing one process-wide communication workspace across layers corrupts
-    # their received top-k metadata.  This is the lifecycle validated by the
-    # report-23 20-step RL baseline.
-    return deep_ep.Buffer(
-        group=group,
-        num_nvl_bytes=num_nvl_bytes,
-        num_rdma_bytes=num_rdma_bytes,
-        explicitly_destroy=True,
-    )
+    if (
+        _deepep_buffer is None
+        or getattr(_deepep_buffer, "runtime", None) is None
+        or _deepep_buffer.group != group
+        or _deepep_buffer.num_nvl_bytes < num_nvl_bytes
+        or _deepep_buffer.num_rdma_bytes < num_rdma_bytes
+    ):
+        _deepep_buffer = deep_ep.Buffer(
+            group=group,
+            num_nvl_bytes=num_nvl_bytes,
+            num_rdma_bytes=num_rdma_bytes,
+            explicitly_destroy=True,
+        )
+    return _deepep_buffer
+
+
+def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
+    """Compatibility wrapper for callers that specify a BF16 hidden width."""
+
+    return _get_deepep_buffer(group, _hidden_bytes(hidden_size))
 
 
 def _use_moe_permute_fusion() -> bool:
@@ -116,7 +134,7 @@ class _DeepEPDispatch(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        buffer,
+        group,
         hidden_states: torch.Tensor,
         topk_indices: torch.Tensor,
         topk_scores: torch.Tensor,
@@ -124,6 +142,7 @@ class _DeepEPDispatch(torch.autograd.Function):
         async_finish: bool,
         allocate_on_comm_stream: bool,
     ):
+        buffer = _get_deepep_buffer(group, _tensor_hidden_bytes(hidden_states))
         # DeepEP's public C++ contract requires all three dispatch inputs to be
         # contiguous. Router replay and hash-router indexing can return valid
         # 2-D views with non-contiguous strides, so normalize at the backend
@@ -166,7 +185,7 @@ class _DeepEPDispatch(torch.autograd.Function):
         if async_finish:
             after_event.current_stream_wait()
 
-        ctx.buffer = buffer
+        ctx.group = group
         ctx.handle = handle
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
@@ -185,8 +204,9 @@ class _DeepEPDispatch(torch.autograd.Function):
             if ctx.async_finish and EventHandle is not None and EventOverlap is not None
             else None
         )
+        buffer = _get_deepep_buffer(ctx.group, _tensor_hidden_bytes(grad_recv_hidden))
         grad_scores = None if grad_recv_probs is None else grad_recv_probs.float()
-        grad_hidden, grad_topk_scores, after_event = ctx.buffer.combine(
+        grad_hidden, grad_topk_scores, after_event = buffer.combine(
             grad_recv_hidden.contiguous(),
             ctx.handle,
             topk_weights=grad_scores,
@@ -203,12 +223,13 @@ class _DeepEPCombine(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        buffer,
+        group,
         rank_grouped: torch.Tensor,
         handle,
         async_finish: bool,
         allocate_on_comm_stream: bool,
     ):
+        buffer = _get_deepep_buffer(group, _tensor_hidden_bytes(rank_grouped))
         previous_event = (
             EventOverlap(EventHandle())
             if async_finish and EventHandle is not None and EventOverlap is not None
@@ -223,7 +244,7 @@ class _DeepEPCombine(torch.autograd.Function):
         )
         if async_finish:
             after_event.current_stream_wait()
-        ctx.buffer = buffer
+        ctx.group = group
         ctx.handle = handle
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
@@ -236,7 +257,8 @@ class _DeepEPCombine(torch.autograd.Function):
             if ctx.async_finish and EventHandle is not None and EventOverlap is not None
             else None
         )
-        grad_rank_grouped, _, _, _, _, after_event = ctx.buffer.dispatch(
+        buffer = _get_deepep_buffer(ctx.group, _tensor_hidden_bytes(grad_output))
+        grad_rank_grouped, _, _, _, _, after_event = buffer.dispatch(
             grad_output.contiguous(),
             handle=ctx.handle,
             previous_event=previous_event,
@@ -276,16 +298,8 @@ class TokenDispatcher:
             )
         if self.use_deepep:
             assert ps.tp_ep_group is not None
+            self._deepep_group = ps.tp_ep_group
             self.buffer = _build_deepep_buffer(ps.tp_ep_group, hidden_size)
-            if self.deepep_align_to_low_latency:
-                # DeepEP normal mode requires a 32-byte-aligned payload.  The
-                # second dispatch transports only a 16xBF16 route fingerprint,
-                # but its handle later combines full-width expert outputs.  The
-                # allocation therefore has to cover ``hidden_size`` even though
-                # the metadata communication itself stays 32 bytes per route.
-                self.route_buffer = _build_deepep_buffer(
-                    ps.tp_ep_group, hidden_size
-                )
 
         self._row_id_map: torch.Tensor | None = None
         self._restore_shape: tuple | None = None
@@ -366,7 +380,7 @@ class TokenDispatcher:
                 received_per_expert,
                 _,
             ) = _DeepEPDispatch.apply(
-                self.buffer,
+                self._deepep_group,
                 hidden_states,
                 topk_indices,
                 topk_scores,
@@ -377,6 +391,12 @@ class TokenDispatcher:
             _debug_cuda_boundary(
                 "aligned_dispatch.primary", received_hidden, call=debug_call
             )
+            # A second dispatch re-enters the same process-wide DeepEP buffer.
+            # Preserve the primary route metadata as caller-owned tensors; the
+            # full hidden output is already a separate dispatch result and is
+            # intentionally not copied.
+            received_indices = received_indices.clone()
+            received_weights = received_weights.clone()
             (
                 route_indices,
                 route_weights,
@@ -389,61 +409,20 @@ class TokenDispatcher:
                 topk_scores,
                 assume_all_routes_valid=True,
             )
-            local_route_chunks = (
-                route_fingerprints.shape[0]
-                + _DEEPEP_ROUTE_METADATA_CHUNK_ROWS
-                - 1
-            ) // _DEEPEP_ROUTE_METADATA_CHUNK_ROWS
-            synchronized_chunks = torch.tensor(
-                local_route_chunks,
-                device=hidden_states.device,
-                dtype=torch.int32,
-            )
-            dist.all_reduce(
-                synchronized_chunks,
-                op=dist.ReduceOp.MAX,
-                group=self.ps.tp_ep_group,
-            )
-            num_route_chunks = int(synchronized_chunks.item())
-            received_fingerprint_chunks = []
-            received_route_index_chunks = []
-            received_route_weight_chunks = []
-            route_handles = []
-            route_received_rows = []
-            for chunk_index in range(num_route_chunks):
-                start = chunk_index * _DEEPEP_ROUTE_METADATA_CHUNK_ROWS
-                chunk_rows = min(
-                    _DEEPEP_ROUTE_METADATA_CHUNK_ROWS,
-                    max(route_fingerprints.shape[0] - start, 0),
-                )
-                (
-                    chunk_fingerprints,
-                    chunk_route_indices,
-                    chunk_route_weights,
-                    _,
-                    chunk_route_handle,
-                ) = _DeepEPDispatch.apply(
-                    self.route_buffer,
-                    route_fingerprints.narrow(0, start, chunk_rows).contiguous(),
-                    route_indices.narrow(0, start, chunk_rows).contiguous(),
-                    route_weights.narrow(0, start, chunk_rows).contiguous(),
-                    self.num_experts,
-                    False,
-                    False,
-                )
-                received_fingerprint_chunks.append(chunk_fingerprints)
-                received_route_index_chunks.append(chunk_route_indices)
-                received_route_weight_chunks.append(chunk_route_weights)
-                route_handles.append(chunk_route_handle)
-                route_received_rows.append(chunk_fingerprints.shape[0])
-            received_fingerprints = torch.cat(
-                received_fingerprint_chunks, dim=0
-            )
-            received_route_indices = torch.cat(
-                received_route_index_chunks, dim=0
-            )
-            received_route_weights = torch.cat(
-                received_route_weight_chunks, dim=0
+            (
+                received_fingerprints,
+                received_route_indices,
+                received_route_weights,
+                _,
+                route_handle,
+            ) = _DeepEPDispatch.apply(
+                self._deepep_group,
+                route_fingerprints,
+                route_indices,
+                route_weights,
+                self.num_experts,
+                False,
+                False,
             )
             _debug_cuda_boundary(
                 "aligned_dispatch.fingerprint", received_fingerprints, call=debug_call
@@ -460,8 +439,7 @@ class TokenDispatcher:
             ).index_select(0, token_rows)
             received_route_indices = topk_indices[token_rows, topk_slots]
             received_route_weights = topk_scores[token_rows, topk_slots]
-            route_handles = []
-            route_received_rows = []
+            route_handle = None
             source_output_index = torch.arange(
                 topk_indices.numel(), device=topk_indices.device, dtype=torch.long
             ).reshape_as(topk_indices)
@@ -472,8 +450,8 @@ class TokenDispatcher:
             )
 
         expected_route_count = (
-            sum(_deepep_route_handle_received_rows(handle) for handle in route_handles)
-            if route_handles
+            _deepep_route_handle_received_rows(route_handle)
+            if route_handle is not None
             else int((received_indices >= 0).sum().item())
         )
         if os.environ.get("MLITE_DEEPEP_ROUTE_DIAGNOSTICS") == "1":
@@ -536,8 +514,7 @@ class TokenDispatcher:
         self._aligned_received_output_index = output_index
         self._aligned_received_positions = positions
         self._aligned_metadata_route_rows = metadata_route_rows
-        self._aligned_route_handles = route_handles
-        self._aligned_route_received_rows = route_received_rows
+        self._aligned_route_handle = route_handle
         self._aligned_source_indices = topk_indices
         self._aligned_source_weights = topk_scores
         self._aligned_source_shape = hidden_states.shape
@@ -563,24 +540,13 @@ class TokenDispatcher:
             route_outputs=route_outputs,
         )
         if self.ep_size > 1:
-            received_chunks = route_outputs.split(
-                self._aligned_route_received_rows, dim=0
+            source_routes = _DeepEPCombine.apply(
+                self._deepep_group,
+                route_outputs,
+                self._aligned_route_handle,
+                True,
+                False,
             )
-            source_route_chunks = [
-                _DeepEPCombine.apply(
-                    self.route_buffer,
-                    received_chunk,
-                    route_handle,
-                    False,
-                    False,
-                )
-                for received_chunk, route_handle in zip(
-                    received_chunks,
-                    self._aligned_route_handles,
-                    strict=True,
-                )
-            ]
-            source_routes = torch.cat(source_route_chunks, dim=0)
             _debug_cuda_boundary(
                 "aligned_combine.route", source_routes, call=debug_call
             )
@@ -607,8 +573,7 @@ class TokenDispatcher:
             "_aligned_received_output_index",
             "_aligned_received_positions",
             "_aligned_metadata_route_rows",
-            "_aligned_route_handles",
-            "_aligned_route_received_rows",
+            "_aligned_route_handle",
             "_aligned_source_indices",
             "_aligned_source_weights",
             "_aligned_source_shape",
@@ -635,7 +600,10 @@ class TokenDispatcher:
             if EventHandle is not None and EventOverlap is not None
             else None
         )
-        combined = self.buffer.combine(
+        buffer = _get_deepep_buffer(
+            self._deepep_group, _tensor_hidden_bytes(rank_grouped)
+        )
+        combined = buffer.combine(
             rank_grouped,
             self._handle,
             previous_event=previous_event,
@@ -805,13 +773,16 @@ class TokenDispatcher:
             if EventHandle is not None and EventOverlap is not None
             else None
         )
+        buffer = _get_deepep_buffer(
+            self._deepep_group, _tensor_hidden_bytes(hidden_states)
+        )
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
             num_tokens_per_expert,
             is_token_in_rank,
             event,
-        ) = self.buffer.get_dispatch_layout(
+        ) = buffer.get_dispatch_layout(
             topk_indices,
             num_experts=self.num_experts,
             previous_event=previous_event,
@@ -820,7 +791,7 @@ class TokenDispatcher:
         )
 
         recv_hidden, recv_indices, recv_probs, recv_per_expert, handle, event = (
-            self.buffer.dispatch(
+            buffer.dispatch(
                 hidden_states,
                 topk_idx=topk_indices,
                 topk_weights=topk_scores,
@@ -927,7 +898,7 @@ class TokenDispatcher:
     def _dispatch_deepep(self, hidden_states, topk_scores, topk_indices):
         if torch.is_grad_enabled():
             recv_hidden, recv_indices, recv_probs, recv_per_expert, handle = _DeepEPDispatch.apply(
-                self.buffer,
+                self._deepep_group,
                 hidden_states,
                 topk_indices,
                 topk_scores.float(),
@@ -960,9 +931,14 @@ class TokenDispatcher:
         )
         _validate_finite("deepep.combine.unpermute", rank_grouped=rank_grouped)
         if torch.is_grad_enabled():
-            combined = _DeepEPCombine.apply(self.buffer, rank_grouped, self._handle, False, False)
+            combined = _DeepEPCombine.apply(
+                self._deepep_group, rank_grouped, self._handle, False, False
+            )
         else:
-            combined = self.buffer.combine(rank_grouped, self._handle)
+            buffer = _get_deepep_buffer(
+                self._deepep_group, _tensor_hidden_bytes(rank_grouped)
+            )
+            combined = buffer.combine(rank_grouped, self._handle)
         if isinstance(combined, tuple):
             combined = combined[0]
         _validate_finite("deepep.combine.output", combined=combined)

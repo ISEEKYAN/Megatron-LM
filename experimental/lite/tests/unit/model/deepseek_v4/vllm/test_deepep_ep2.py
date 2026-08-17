@@ -164,10 +164,9 @@ def test_torchrun_ep2_rl_shape_normal_dispatch_is_memory_safe() -> None:
     assert counts.shape == (experts // 2,)
     assert probs is not None and probs.dtype == torch.float32
     dist.barrier(group=group)
-    for buffer in (dispatcher.buffer, dispatcher.route_buffer):
-        destroy = getattr(buffer, "destroy", None)
-        if callable(destroy):
-            destroy()
+    destroy = getattr(dispatcher.buffer, "destroy", None)
+    if callable(destroy):
+        destroy()
     if created_group:
         dist.destroy_process_group()
 
@@ -249,10 +248,10 @@ def test_torchrun_dp4_ep2_four_layer_dispatch_is_memory_safe() -> None:
             assert torch.isfinite(combined).all()
             del compact, counts, probs, combined
     dist.barrier()
-    for dispatcher in dispatchers:
-        for buffer in (dispatcher.buffer, dispatcher.route_buffer):
-            destroy = getattr(buffer, "destroy", None)
-            if callable(destroy) and getattr(buffer, "explicitly_destroy", False):
-                destroy()
+    buffer = dispatchers[0].buffer
+    assert all(dispatcher.buffer is buffer for dispatcher in dispatchers)
+    destroy = getattr(buffer, "destroy", None)
+    if callable(destroy) and getattr(buffer, "explicitly_destroy", False):
+        destroy()
     if created_group:
         dist.destroy_process_group()
