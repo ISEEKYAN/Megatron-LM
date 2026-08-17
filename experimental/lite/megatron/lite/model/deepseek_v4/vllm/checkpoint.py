@@ -479,6 +479,21 @@ class DeepseekV4WeightSpec:
             raise ValueError(f"not a routed-expert parameter: {native_name}")
         return native_name.rsplit(".", 1)[0] + f".{local_idx}"
 
+    @staticmethod
+    def export_expert_local_id(native_name: str) -> int:
+        """Return the local expert suffix from a DS4-vLLM native parameter."""
+        match = re.match(
+            r"^layers\.\d+\.mlp\.experts\.(?:w13|w2)\.(\d+)$", native_name
+        )
+        if match is None:
+            raise ValueError(f"not a routed-expert parameter: {native_name}")
+        return int(match.group(1))
+
+    @staticmethod
+    def export_expert_name(native_name: str, expert_id: int) -> str:
+        """Rewrite a DS4-vLLM native parameter with a gathered global ID."""
+        return DeepseekV4WeightSpec.expert_local_name(native_name, expert_id)
+
 
 def _models(chunks: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:
     return [chunks] if isinstance(chunks, nn.Module) else list(chunks)

@@ -256,6 +256,58 @@ def test_pipeline_gathered_expert_name_is_not_offset_twice() -> None:
     ]
 
 
+def test_pipeline_export_expert_name_contract_covers_global_ids() -> None:
+    """The common EP exporter must not apply its ``weight<N>`` parser to DS4."""
+    spec = DeepseekV4WeightSpec(
+        DeepseekV4Config(hidden_size=128, n_routed_experts=256)
+    )
+    source = "layers.2.mlp.experts.w13.31"
+
+    assert spec.export_expert_local_id(source) == 31
+    assert spec.export_expert_name(source, 255) == (
+        "layers.2.mlp.experts.w13.255"
+    )
+
+
+def test_common_ep4_gather_keeps_all_ds4_vllm_expert_shards(monkeypatch) -> None:
+    """Regression: the legacy ``weight<N>`` parser collapsed all four shards."""
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    spec = DeepseekV4WeightSpec(
+        DeepseekV4Config(hidden_size=128, n_routed_experts=256)
+    )
+    ps = SimpleNamespace(
+        ep_size=4,
+        ep_group=object(),
+        etp_size=1,
+        etp_group=None,
+    )
+
+    def _fake_ep_all_gather(outputs, tensor, group):
+        assert group is ps.ep_group
+        for ep_rank, output in enumerate(outputs):
+            output.copy_(tensor + ep_rank)
+
+    monkeypatch.setattr(hf_weights, "_ep_all_gather", _fake_ep_all_gather)
+    gathered = {}
+    hf_weights._gather_expert(
+        "layers.2.mlp.experts.w2.31",
+        torch.tensor([10.0]),
+        spec,
+        ps,
+        gathered,
+        cpu=False,
+    )
+
+    assert list(gathered) == [
+        "layers.2.mlp.experts.w2.31",
+        "layers.2.mlp.experts.w2.95",
+        "layers.2.mlp.experts.w2.159",
+        "layers.2.mlp.experts.w2.223",
+    ]
+    assert [value.item() for value in gathered.values()] == [10.0, 11.0, 12.0, 13.0]
+
+
 def test_pipeline_source_scales_are_globalized_across_ep(monkeypatch) -> None:
     model = torch.nn.Module()
     model._fp8_source_scales_valid = True
