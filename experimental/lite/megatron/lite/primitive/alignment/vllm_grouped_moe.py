@@ -11,6 +11,7 @@ from megatron.lite.primitive.quantization.deployment_block_fp8 import (
 )
 
 _M_ALIGNMENT = 128
+_EXPERTS_PER_FORWARD_GROUP = 4
 _BACKWARD_CHUNK_ROWS = 1024
 
 
@@ -156,36 +157,69 @@ def _vllm_grouped_forward(
 
     if hidden_states.shape[0] == 0:
         return hidden_states.new_empty((0, hidden_states.shape[1]))
-    padded, padded_counts, valid_rows = _pad_expert_rows(hidden_states, counts)
-    m_indices = _build_m_indices(padded_counts, hidden_states.device)
-    packed_input = _vllm_quantize_contiguous_input(padded)
-    packed_w13 = pack_grouped_block_fp8_weight(w13)
-    gate_up = hidden_states.new_empty((padded.shape[0], w13[0].shape[0]))
-    m_grouped_fp8_gemm_nt_contiguous(
-        packed_input,
-        (packed_w13.qweight, packed_w13.scales),
-        gate_up,
-        m_indices,
+    # Slime's BI path deliberately launches contiguous DeepGEMM over at most
+    # four adjacent experts at a time.  Apart from bounding transient packed
+    # weights and activation workspaces, that is the production scheduling
+    # contract under which normal DeepEP is composed with the next layer's
+    # communication.  Keep the same grouping instead of issuing one oversized
+    # launch over every EP-local expert.
+    compact_output = hidden_states.new_empty(
+        (hidden_states.shape[0], w2[0].shape[0])
     )
-    activated_q = torch.empty(
-        (padded.shape[0], w2[0].shape[1]),
-        device=hidden_states.device,
-        dtype=torch.float8_e4m3fn,
-    )
-    activated_q, activated_scale = _vllm_silu_mul_quant(
-        gate_up,
-        output=activated_q,
-        swiglu_limit=swiglu_limit,
-    )
-    packed_w2 = pack_grouped_block_fp8_weight(w2)
-    output = hidden_states.new_empty((padded.shape[0], w2[0].shape[0]))
-    m_grouped_fp8_gemm_nt_contiguous(
-        (activated_q, activated_scale),
-        (packed_w2.qweight, packed_w2.scales),
-        output,
-        m_indices,
-    )
-    return output if valid_rows is None else output.index_select(0, valid_rows)
+    token_offset = 0
+    for expert_start in range(0, len(counts), _EXPERTS_PER_FORWARD_GROUP):
+        expert_end = min(
+            expert_start + _EXPERTS_PER_FORWARD_GROUP,
+            len(counts),
+        )
+        group_counts = counts[expert_start:expert_end]
+        group_tokens = sum(group_counts)
+        if group_tokens == 0:
+            continue
+        group_hidden = hidden_states.narrow(0, token_offset, group_tokens)
+        padded, padded_counts, valid_rows = _pad_expert_rows(
+            group_hidden, group_counts
+        )
+        m_indices = _build_m_indices(padded_counts, hidden_states.device)
+        packed_input = _vllm_quantize_contiguous_input(padded)
+        packed_w13 = pack_grouped_block_fp8_weight(w13[expert_start:expert_end])
+        gate_up = hidden_states.new_empty((padded.shape[0], w13[0].shape[0]))
+        m_grouped_fp8_gemm_nt_contiguous(
+            packed_input,
+            (packed_w13.qweight, packed_w13.scales),
+            gate_up,
+            m_indices,
+        )
+        activated_q = torch.empty(
+            (padded.shape[0], w2[0].shape[1]),
+            device=hidden_states.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        activated_q, activated_scale = _vllm_silu_mul_quant(
+            gate_up,
+            output=activated_q,
+            swiglu_limit=swiglu_limit,
+        )
+        packed_w2 = pack_grouped_block_fp8_weight(w2[expert_start:expert_end])
+        group_output = hidden_states.new_empty(
+            (padded.shape[0], w2[0].shape[0])
+        )
+        m_grouped_fp8_gemm_nt_contiguous(
+            (activated_q, activated_scale),
+            (packed_w2.qweight, packed_w2.scales),
+            group_output,
+            m_indices,
+        )
+        if valid_rows is not None:
+            group_output = group_output.index_select(0, valid_rows)
+        compact_output.narrow(0, token_offset, group_tokens).copy_(group_output)
+        token_offset += group_tokens
+    if token_offset != hidden_states.shape[0]:
+        raise RuntimeError(
+            "grouped MoE expert counts do not cover all expert-major rows: "
+            f"{token_offset} != {hidden_states.shape[0]}"
+        )
+    return compact_output
 
 
 class VLLMGroupedMoEWithBF16Backward(torch.autograd.Function):
