@@ -370,6 +370,13 @@ class TokenDispatcher:
             _debug_cuda_boundary(
                 "aligned_dispatch.primary", received_hidden, call=debug_call
             )
+            # This aligned path adds a second normal-DeepEP collective that
+            # is absent from the stock one-dispatch MCore path.  A local CUDA
+            # sync does not order ranks: with EP4 route skew, a fast rank can
+            # enter the metadata buffer while a peer is still in the primary
+            # dispatch.  Separate per-handle buffers prevent workspace alias,
+            # and this group fence establishes the missing collective phase.
+            dist.barrier(group=self.ps.tp_ep_group)
             (
                 route_indices,
                 route_weights,
