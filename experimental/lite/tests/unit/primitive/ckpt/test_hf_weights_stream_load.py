@@ -404,6 +404,33 @@ def test_mapped_persistent_buffer_missing_from_checkpoint_fails(monkeypatch) -> 
         load_hf_weights(Model(), "unused", Spec(), _parallel_state())
 
 
+def test_deferred_parameter_missing_from_checkpoint_fails(monkeypatch) -> None:
+    _stub_parallel_import(monkeypatch)
+    model = nn.Linear(1, 1)
+    model._mlite_meta_init = True
+
+    class Reader:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    class Spec:
+        num_experts = 0
+
+        @staticmethod
+        def weight_map():
+            return {}
+
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader)
+    with pytest.raises(RuntimeError, match="Deferred parameter 'weight'"):
+        load_hf_weights(model, "unused", Spec(), _parallel_state())
+
+
 def test_buffer_cannot_be_both_optional_and_expected(monkeypatch) -> None:
     _stub_parallel_import(monkeypatch)
 
