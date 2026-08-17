@@ -108,6 +108,32 @@ def test_aligned_deepep_buffer_matches_mcore_process_wide_reuse(monkeypatch) -> 
     assert FakeBuffer.created == 2
 
 
+def test_deepep_receive_counts_keep_mcore_cpu_contract(monkeypatch) -> None:
+    import megatron.lite.primitive.modules.dispatcher as dispatcher_module
+
+    class FakeBuffer:
+        def get_dispatch_layout(self, *_args, **_kwargs):
+            return None, None, None, None, None
+
+        def dispatch(self, hidden, **_kwargs):
+            return hidden, None, None, [3, 5], (), None
+
+    monkeypatch.setattr(dispatcher_module, "_get_deepep_buffer", lambda *_args: FakeBuffer())
+    ctx = types.SimpleNamespace()
+    hidden = torch.zeros(2, 16, dtype=torch.bfloat16)
+    indices = torch.zeros(2, 1, dtype=torch.int64)
+    scores = torch.ones(2, 1, dtype=torch.float32)
+
+    result = dispatcher_module._DeepEPDispatch.forward(
+        ctx, object(), hidden, indices, scores, 2, False, False
+    )
+
+    counts = result[3]
+    assert counts.device.type == "cpu"
+    assert counts.dtype == torch.int64
+    assert counts.tolist() == [3, 5]
+
+
 def test_ll_alignment_preserves_duplicate_slots_and_fp32_gather(monkeypatch) -> None:
     import vllm.model_executor.layers.fused_moe.deep_gemm_utils as deep_gemm_utils
 

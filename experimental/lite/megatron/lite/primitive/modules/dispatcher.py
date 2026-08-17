@@ -189,9 +189,13 @@ class _DeepEPDispatch(torch.autograd.Function):
         ctx.handle = handle
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        recv_per_expert_tensor = torch.tensor(
-            recv_per_expert, dtype=torch.int64, device=recv_hidden.device
-        )
+        # Match MCore/Slime's normal-DeepEP contract: the public API returns
+        # receive counts as a Python list and the dispatcher materializes that
+        # metadata on CPU.  Do not enqueue an unrelated CUDA allocation while
+        # DeepEP's communication result is becoming visible.  The aligned
+        # scatter consumes CPU counts directly and derives its CUDA counts from
+        # the received route metadata when needed.
+        recv_per_expert_tensor = torch.tensor(recv_per_expert, dtype=torch.int64)
         return recv_hidden, recv_indices, recv_probs, recv_per_expert_tensor, handle
 
     @staticmethod
