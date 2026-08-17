@@ -132,7 +132,6 @@ bash experimental/lite/examples/bench/scripts/run_qwen35_correctness_pair.sh
 - [Porting Notes](docs/porting.md)
 - [Skills](skills/README.md)
 - [Bench Example](examples/bench/README.md)
-- [VERL LoRA](examples/verl/LoRA.md)
 
 ## Acknowledgements
 

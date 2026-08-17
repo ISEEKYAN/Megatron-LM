@@ -11,7 +11,7 @@ import traceback
 from pathlib import Path
 from typing import Callable
 
-import megatron.lite.primitive.distributed_test_utils as lora_dist_utils
+import lora_distributed_test_utils as lora_dist_utils
 import megatron.lite.runtime.contracts.config as runtime_config
 import pytest
 import torch
@@ -104,7 +104,7 @@ def _main_grad(param: torch.Tensor) -> torch.Tensor:
 def _phase_artifact_dir() -> Path:
     raw = os.environ.get("MLITE_MULTI_LORA_PHASE_ARTIFACT_DIR")
     if raw is None:
-        pytest.skip("run through the two-phase production multi-LoRA sbatch")
+        pytest.skip("run through the two-phase production multi-LoRA orchestrator")
     return Path(raw)
 
 

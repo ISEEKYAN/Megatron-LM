@@ -18,9 +18,9 @@ def build_lora_collective_descriptor(
     kind: str, reduction_tensor: torch.Tensor, bank_dtype: torch.dtype
 ) -> tuple[str, tuple[int, ...], str]:
     """Describe the actual tensor dtype and shape consumed by a bank collective."""
-    assert reduction_tensor.dtype is torch.float32, (
-        "LoRA reduction tensor dtype must be torch.float32"
-    )
+    assert (
+        reduction_tensor.dtype is torch.float32
+    ), "LoRA reduction tensor dtype must be torch.float32"
     if kind == "fc":
         assert bank_dtype is torch.bfloat16, "FC LoRA bank dtype must be torch.bfloat16"
         collective_dtype = bank_dtype
@@ -77,7 +77,7 @@ def gather_owner_factor_records_or_raise(
 ) -> list[Any]:
     """Validate factor records without allowing lane-local errors to strand WORLD.
 
-    The owner lane always exchanges an envelope first.  Every rank then enters
+    The owner lane always exchanges an envelope first. Every rank then enters
     one WORLD error bridge, so a malformed local shard makes all ranks raise
     the same error before the next world collective can begin.
     """

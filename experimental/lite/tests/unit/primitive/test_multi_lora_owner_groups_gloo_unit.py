@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import megatron.lite.primitive.distributed_test_utils as lora_dist_utils
+import lora_distributed_test_utils as lora_dist_utils
 import pytest
 import torch
 import torch.distributed as dist
