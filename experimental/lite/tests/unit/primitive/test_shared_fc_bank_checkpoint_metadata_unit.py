@@ -5,9 +5,7 @@ from __future__ import annotations
 import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
-from experimental.lite.tests.smoke.primitive.test_shared_fc_bank_distopt_dcp_gpu import (
-    _finish_dist_opt_grad_sync,
-)
+from experimental.lite.tests.smoke.primitive import test_shared_fc_bank_distopt_dcp_gpu as shared_fc_gpu
 
 
 def test_unsharded_sharded_tensor_surface_has_no_slice_metadata():
@@ -20,19 +18,20 @@ def test_unsharded_sharded_tensor_surface_has_no_slice_metadata():
     assert tensor.flattened_range is None
 
 
-def test_chained_dist_opt_sync_reaches_only_leaf_optimizers():
+def test_dist_opt_finalization_precedes_outer_optimizer_step(monkeypatch):
     calls = []
+    chunks, optimizer = [object()], object()
 
-    class Leaf:
-        def __init__(self, name):
-            self.name = name
+    def production_finalize(actual_chunks, actual_optimizer):
+        assert actual_chunks is chunks
+        assert actual_optimizer is optimizer
+        calls.append("finalize_model_grads")
 
-        def finish_grad_sync(self):
-            calls.append(self.name)
+    class OuterOptimizer:
+        def step(self):
+            calls.append("outer_step")
 
-    class Chain:
-        def __init__(self, *children):
-            self.chained_optimizers = children
-
-    _finish_dist_opt_grad_sync(Chain(Leaf("dense"), Chain(Leaf("expert"))))
-    assert calls == ["dense", "expert"]
+    monkeypatch.setattr(shared_fc_gpu, "finalize_dist_opt_grads", production_finalize)
+    shared_fc_gpu._production_finalize_grads(chunks, optimizer)()
+    OuterOptimizer().step()
+    assert calls == ["finalize_model_grads", "outer_step"]

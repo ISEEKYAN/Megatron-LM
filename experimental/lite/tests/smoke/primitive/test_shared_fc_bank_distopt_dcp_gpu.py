@@ -15,7 +15,10 @@ from megatron.lite.model.qwen3_moe.common import is_expert_param
 from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
 from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict, dcp
 from megatron.lite.primitive.modules.multi_lora_bank import MultiLoraTrainingState
-from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_stack
+from megatron.lite.primitive.optimizers.megatron_wrap import (
+    build_dist_opt_stack,
+    finalize_dist_opt_grads,
+)
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 
@@ -112,7 +115,16 @@ def _build(parallel: ParallelConfig):
     attach_model_sharded_state_dict(
         chunks, ps, get_placements=PLACEMENT_FN, is_expert=EXPERT_CLASSIFIER
     )
-    return chunks, optimizer, ps
+    return chunks, optimizer, ps, _production_finalize_grads(chunks, optimizer)
+
+
+def _production_finalize_grads(chunks, optimizer):
+    """Use the runtime's MCore DDP finalization before the outer optimizer step."""
+
+    def finalize_grads():
+        finalize_dist_opt_grads(chunks, optimizer)
+
+    return finalize_grads
 
 
 def _inner_optimizers(optimizer):
@@ -122,16 +134,6 @@ def _inner_optimizers(optimizer):
             yield from _inner_optimizers(item)
         return
     yield optimizer
-
-
-def _finish_dist_opt_grad_sync(optimizer):
-    """ChainedOptimizer delegates grad sync to its leaf dist-opt optimizers."""
-    leaves = list(_inner_optimizers(optimizer))
-    assert leaves
-    for leaf in leaves:
-        finish = getattr(leaf, "finish_grad_sync", None)
-        if finish is not None:
-            finish()
 
 
 def _local_optimizer_slices(chunks, optimizer):
@@ -231,11 +233,11 @@ def _step_value(step) -> int:
     return int(step.detach().cpu().item()) if torch.is_tensor(step) else int(step)
 
 
-def _poison_optimizer_state(chunks, optimizer, oracle):
+def _poison_optimizer_state(chunks, optimizer, oracle, finalize_grads):
     """Materialize target Adam state before making its values detectably wrong."""
     loss = getattr(chunks[0], "module", chunks[0])()
     loss.backward()
-    _finish_dist_opt_grad_sync(optimizer)
+    finalize_grads()
     optimizer.step()
     optimizer.zero_grad()
     for parameter in chunks[0].parameters():
@@ -271,14 +273,14 @@ def test_shared_fc_bank_distopt_dcp_tp2_ep1_to_tp1_ep2():
         parallel = ParallelConfig(tp=2, ep=1, etp=1, pp=1, cp=1)
     else:
         parallel = ParallelConfig(tp=1, ep=2, etp=1, pp=1, cp=1)
-    chunks, optimizer, _ps = _build(parallel)
+    chunks, optimizer, _ps, finalize_grads = _build(parallel)
     assert set(dict(getattr(chunks[0], "module", chunks[0]).named_parameters())) == {_BANK_NAME}
     _assert_dense_replicated_state(chunks[0], phase)
     checkpoint_dir = artifact / "checkpoint"
     if phase == "save":
         loss = getattr(chunks[0], "module", chunks[0])()
         loss.backward()
-        _finish_dist_opt_grad_sync(optimizer)
+        finalize_grads()
         optimizer.step()
         optimizer.zero_grad()
         oracle = _global_optimizer_oracle(chunks, optimizer)
@@ -292,7 +294,7 @@ def test_shared_fc_bank_distopt_dcp_tp2_ep1_to_tp1_ep2():
         dist.barrier()
         return
     oracle = torch.load(artifact / f"oracle_rank_{dist.get_rank()}.pt", weights_only=True)
-    _poison_optimizer_state(chunks, optimizer, oracle)
+    _poison_optimizer_state(chunks, optimizer, oracle, finalize_grads)
     assert dcp.load_training_checkpoint(
         chunks[0], optimizer, str(checkpoint_dir), use_dcp=True, load_optimizer=True
     ) == 1
