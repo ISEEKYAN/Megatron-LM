@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import torch
+from torch.distributed.tensor import Shard
 
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.lite.model.qwen3_moe.lite.checkpoint import PLACEMENT_FN
+from megatron.lite.primitive.modules.multi_lora_bank import MultiLoraTrainingState
 from experimental.lite.tests.smoke.primitive import test_shared_fc_bank_distopt_dcp_gpu as shared_fc_gpu
 
 
@@ -62,3 +65,11 @@ def test_dist_opt_step_is_read_from_master_parameter_group():
         optimizer = type("Optimizer", (), {"param_groups": [{"params": [master], "step": 7}]})()
 
     assert shared_fc_gpu._parameter_group_for_master(Wrapped(), master)["step"] == 7
+
+
+def test_qkv_bank_uses_shard_one_and_tp_shapes():
+    name = MultiLoraTrainingState.parameter_name("layers.0.attn.qkv.linear.weight", "a")
+    placements = PLACEMENT_FN(name)
+    assert isinstance(placements[3], Shard) and placements[3].dim == 1
+    assert shared_fc_gpu._qkv_local_shape(2) == (2, 8, 8)
+    assert shared_fc_gpu._qkv_local_shape(1) == (2, 16, 8)

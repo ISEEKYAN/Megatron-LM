@@ -27,6 +27,12 @@ pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpus(2), pytest.
 _BANK_NAME = MultiLoraTrainingState.parameter_name(
     "layers.0.moe.experts._fc1_weight_0", "a"
 )
+_QKV_BANK_NAME = MultiLoraTrainingState.parameter_name("layers.0.attn.qkv.linear.weight", "a")
+
+
+def _qkv_local_shape(tp: int) -> tuple[int, int, int]:
+    assert 16 % tp == 0
+    return (2, 16 // tp, 8)
 
 
 def _skip_or_fail(message: str) -> None:
@@ -60,7 +66,7 @@ def _two_rank_cuda_process_group():
 
 
 class SharedFCBank(nn.Module):
-    """Adapter-only state: no native Qwen expert key may enter this proof."""
+    """FC bank plus a real dense QKV-A bank; no native Qwen expert key enters."""
 
     def __init__(self):
         super().__init__()
@@ -73,9 +79,17 @@ class SharedFCBank(nn.Module):
         parameter = getattr(self, _BANK_NAME)
         parameter.allreduce = False
         parameter.tensor_model_parallel = False
+        qkv_shape = _qkv_local_shape(2 if _phase() == "save" else 1)
+        self.register_parameter(
+            _QKV_BANK_NAME,
+            nn.Parameter(torch.arange(2 * 16 * 8, device="cuda", dtype=torch.bfloat16).reshape(qkv_shape)),
+        )
+        qkv = getattr(self, _QKV_BANK_NAME)
+        qkv.allreduce = True
+        qkv.tensor_model_parallel = True
 
     def forward(self):
-        return getattr(self, _BANK_NAME).float().square().mean()
+        return getattr(self, _BANK_NAME).float().square().mean() + getattr(self, _QKV_BANK_NAME).float().square().mean()
 
 
 def _phase() -> str:
@@ -293,7 +307,7 @@ def test_shared_fc_bank_distopt_dcp_tp2_ep1_to_tp1_ep2():
     else:
         parallel = ParallelConfig(tp=1, ep=2, etp=1, pp=1, cp=1)
     chunks, optimizer, _ps, finalize_grads = _build(parallel)
-    assert set(dict(getattr(chunks[0], "module", chunks[0]).named_parameters())) == {_BANK_NAME}
+    assert set(dict(getattr(chunks[0], "module", chunks[0]).named_parameters())) == {_BANK_NAME, _QKV_BANK_NAME}
     _assert_dense_replicated_state(chunks[0], phase)
     checkpoint_dir = artifact / "checkpoint"
     if phase == "save":
