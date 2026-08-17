@@ -494,11 +494,10 @@ class LinearLoRA(nn.Module):
                     output_partitioned_b=self.output_partitioned_b,
                 ),
             )
-            rows = x.numel() // x.shape[-1]
             return apply_batched_lora_delta(
                 bank,
                 x,
-                torch.zeros(rows, dtype=torch.long, device=x.device),
+                None,
                 scale=self.scale,
                 tp_group=self.tp_group,
                 tp_rank=self.tp_rank,
@@ -686,7 +685,7 @@ class SharedGroupedLinearLoRA(nn.Module):
             return apply_batched_lora_delta(
                 DenseLoraBank(self.lora_a.unsqueeze(0), self.lora_b.unsqueeze(0)),
                 x,
-                torch.zeros(x.shape[0], dtype=torch.long, device=x.device),
+                None,
                 scale=self.scale,
             )
         dropped = F.dropout(x, p=self.dropout_p, training=self.training)

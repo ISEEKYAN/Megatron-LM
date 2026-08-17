@@ -10,7 +10,8 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from megatron.lite.primitive.modules import multi_lora_kernel
+from megatron.lite.primitive.modules import lora as lora_module
+from megatron.lite.primitive.modules import multi_lora_bank, multi_lora_kernel
 from megatron.lite.primitive.ckpt.hf_weights import VLLM_LORA_NAME_PREFIX
 from megatron.lite.primitive.modules.lora import (
     LinearLoRA,
@@ -94,29 +95,39 @@ def test_grouped_shared_lora_matches_one_slot_bank_and_preserves_split_validatio
         adapter(x, [6])
 
 
-def test_single_and_one_slot_bank_share_the_dense_executor(monkeypatch):
+def test_single_and_one_slot_bank_share_the_bank_executor(monkeypatch):
     """Numerical parity alone must not leave two independent implementations."""
     calls = 0
-    original = multi_lora_kernel.dense_batched_lora_forward
+    original = multi_lora_bank.apply_batched_lora_delta
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(multi_lora_kernel, "dense_batched_lora_forward", counted)
+    monkeypatch.setattr(multi_lora_bank, "apply_batched_lora_delta", counted)
     adapter = LinearLoRA(3, 4, 2)
     with torch.no_grad():
         adapter.lora_b.normal_()
     x = torch.randn(5, 3)
     adapter(x)
-    apply_batched_lora_delta(
+    multi_lora_bank.apply_batched_lora_delta(
         DenseLoraBank(adapter.lora_a.unsqueeze(0), adapter.lora_b.unsqueeze(0)),
         x,
         torch.zeros(5, dtype=torch.long),
         scale=adapter.scale,
     )
     assert calls == 2
+
+
+def test_single_lora_forward_does_not_allocate_dense_slot_indices(monkeypatch):
+    adapter = LinearLoRA(3, 4, 2)
+
+    def unexpected_zeros(*args, **kwargs):
+        raise AssertionError("single LoRA must not allocate per-token slot indices")
+
+    monkeypatch.setattr(lora_module.torch, "zeros", unexpected_zeros)
+    assert adapter(torch.randn(5, 3)).shape == (5, 4)
 
 
 def test_nonzero_dropout_preserves_the_single_lora_compatibility_path(monkeypatch):
@@ -191,7 +202,12 @@ def _tp_pair_worker(rank: int, world_size: int, init_file: str, kind: str, queue
         bank_x = x.clone().requires_grad_()
         bank_a = a_local.clone().unsqueeze(0).requires_grad_()
         bank_b = b_local.clone().unsqueeze(0).requires_grad_()
-        single = adapter(single_x)
+        saved_shapes = []
+        with torch.autograd.graph.saved_tensors_hooks(
+            lambda tensor: saved_shapes.append(tuple(tensor.shape)) or tensor,
+            lambda tensor: tensor,
+        ):
+            single = adapter(single_x)
         bank = apply_batched_lora_delta(
             DenseLoraBank(bank_a, bank_b, partition),
             bank_x,
@@ -204,15 +220,16 @@ def _tp_pair_worker(rank: int, world_size: int, init_file: str, kind: str, queue
         (single * grad).sum().backward()
         (bank * grad).sum().backward()
         queue.put(
-            (
-                rank,
-                max(
+            {
+                "rank": rank,
+                "error": max(
                     (single - bank).abs().max().item(),
                     (single_x.grad - bank_x.grad).abs().max().item(),
                     (adapter.lora_a.grad - bank_a.grad[0]).abs().max().item(),
                     (adapter.lora_b.grad - bank_b.grad[0]).abs().max().item(),
                 ),
-            )
+                "saved_shapes": saved_shapes,
+            }
         )
     finally:
         dist.destroy_process_group()
@@ -229,9 +246,14 @@ def test_tp2_sp_single_matches_one_slot_bank_forward_and_gradients(tmp_path, kin
         nprocs=2,
         join=True,
     )
-    assert [error for _, error in sorted(queue.get() for _ in range(2))] == pytest.approx(
-        [0.0, 0.0], abs=1e-12
-    )
+    results = sorted((queue.get() for _ in range(2)), key=lambda item: item["rank"])
+    assert [item["error"] for item in results] == pytest.approx([0.0, 0.0], abs=1e-12)
+    if kind == "qkv":
+        # The rank-partitioned SP fastpath may save local x and both factors,
+        # but never the globally gathered activation rows retained by the
+        # generic two-stage bank autograd path.
+        for item in results:
+            assert sorted(item["saved_shapes"]) == [(2, 4), (2, 4), (3, 4)]
     if init_file.exists():
         os.unlink(init_file)
 

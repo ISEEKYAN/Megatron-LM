@@ -9,10 +9,12 @@ accidentally choose a different slot on another surface.
 
 from __future__ import annotations
 
+import numbers
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from megatron.lite.primitive.ckpt import hf_weights
 from megatron.lite.primitive.ckpt.hf_weights import export_hf_lora_bank_adapter
@@ -72,10 +74,180 @@ class DenseLoraBank:
         return BatchedLoraDelta.apply(x, self.a_bank, self.b_bank, lora_indices, scale)
 
 
+def _all_gather_sequence_forward(
+    x: torch.Tensor, group, world_size: int
+) -> torch.Tensor:
+    out = torch.empty(
+        (x.shape[0] * world_size, *x.shape[1:]), dtype=x.dtype, device=x.device
+    )
+    dist.all_gather_into_tensor(out, x.contiguous(), group=group)
+    return out
+
+
+def _all_gather_last_dim_forward(
+    x: torch.Tensor, group, world_size: int
+) -> torch.Tensor:
+    if world_size == 1:
+        return x
+    local_width = x.shape[-1]
+    flat = x.movedim(-1, 0).contiguous().view(local_width, -1)
+    gathered = torch.empty(
+        (local_width * world_size, flat.shape[1]), dtype=x.dtype, device=x.device
+    )
+    dist.all_gather_into_tensor(gathered, flat, group=group)
+    return (
+        gathered.view(local_width * world_size, *x.shape[:-1])
+        .movedim(0, -1)
+        .contiguous()
+    )
+
+
+class _SequenceParallelSingleLora(torch.autograd.Function):
+    """One-slot QKV path that recomputes gathered SP activations in backward."""
+
+    @staticmethod
+    def forward(ctx, x, lora_a, lora_b, scale, group):
+        world_size = dist.get_world_size(group) if group is not None else 1
+        gathered = (
+            _all_gather_sequence_forward(x, group, world_size)
+            if world_size > 1
+            else x
+        )
+        hidden_local = gathered.matmul(lora_a.t())
+        hidden = _all_gather_last_dim_forward(hidden_local, group, world_size)
+        out = hidden.matmul(lora_b.t()) * scale
+        # Deliberately save only the SP-local activation and factors. Saving
+        # ``gathered`` here costs TP times the activation storage per layer.
+        ctx.save_for_backward(x, lora_a, lora_b)
+        ctx.group = group
+        ctx.world_size = world_size
+        ctx.local_seq = x.shape[0]
+        ctx.local_rank_width = hidden_local.shape[-1]
+        ctx.scale = float(scale)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, lora_a, lora_b = ctx.saved_tensors
+        world_size, group = ctx.world_size, ctx.group
+        gathered = (
+            _all_gather_sequence_forward(x, group, world_size)
+            if world_size > 1
+            else x
+        )
+        hidden_local = gathered.matmul(lora_a.t())
+        hidden = _all_gather_last_dim_forward(hidden_local, group, world_size)
+        grad_out_scaled = grad_out * ctx.scale
+        grad_b = (
+            grad_out_scaled.reshape(-1, grad_out_scaled.shape[-1])
+            .t()
+            .matmul(hidden.reshape(-1, hidden.shape[-1]))
+        )
+        grad_hidden = grad_out_scaled.matmul(lora_b)
+        if world_size > 1:
+            rank = dist.get_rank(group)
+            start = rank * ctx.local_rank_width
+            grad_hidden_local = grad_hidden.narrow(
+                -1, start, ctx.local_rank_width
+            ).contiguous()
+            dist.all_reduce(grad_hidden_local, op=dist.ReduceOp.SUM, group=group)
+        else:
+            grad_hidden_local = grad_hidden
+        grad_a = (
+            grad_hidden_local.reshape(-1, grad_hidden_local.shape[-1])
+            .t()
+            .matmul(gathered.reshape(-1, gathered.shape[-1]))
+        )
+        grad_gathered = grad_hidden_local.matmul(lora_a)
+        if world_size > 1:
+            grad_x = torch.empty_like(x)
+            dist.reduce_scatter_tensor(
+                grad_x, grad_gathered.contiguous(), group=group
+            )
+        else:
+            grad_x = grad_gathered
+        return grad_x, grad_a, grad_b, None, None
+
+
+def _validate_single_slot_indices(
+    bank: DenseLoraBank,
+    x: torch.Tensor,
+    lora_indices: torch.Tensor | None,
+    *,
+    scale: float,
+    tp_group,
+    sequence_parallel_input: bool,
+) -> bool:
+    if bank.slots != 1:
+        return False
+    if not isinstance(scale, numbers.Real):
+        raise TypeError("scale must be a real scalar.")
+    if x.device != bank.a_bank.device or x.device != bank.b_bank.device:
+        raise ValueError("x, banks, and lora_indices must share a device.")
+    if x.dtype != bank.a_bank.dtype or x.dtype != bank.b_bank.dtype:
+        raise ValueError("x, A_bank, and B_bank must share a dtype.")
+    if bank.a_bank.shape[2] != x.shape[-1]:
+        raise ValueError("A_bank input features must match x.")
+    if lora_indices is None:
+        return True
+    if lora_indices.device != x.device:
+        raise ValueError("x, banks, and lora_indices must share a device.")
+    if lora_indices.dtype != torch.int64:
+        raise ValueError("lora_indices must use torch.int64.")
+    local_rows = x.numel() // x.shape[-1]
+    valid_rows = {local_rows}
+    if sequence_parallel_input and tp_group is not None:
+        valid_rows.add(local_rows * dist.get_world_size(tp_group))
+    if lora_indices.numel() not in valid_rows:
+        raise ValueError("single-slot LoRA indices must describe local or gathered tokens.")
+    if lora_indices.numel() and bool(torch.any(lora_indices != 0)):
+        raise IndexError("lora_indices contains a slot out of range.")
+    return True
+
+
+def _apply_single_lora_delta(
+    bank: DenseLoraBank,
+    x: torch.Tensor,
+    *,
+    scale: float,
+    tp_group,
+    tp_rank: int,
+    sequence_parallel_input: bool,
+    input_parallel_reduce: bool,
+    sequence_parallel_scatter_output: bool,
+) -> torch.Tensor:
+    partition = bank.partition
+    lora_a, lora_b = bank.a_bank[0], bank.b_bank[0]
+    if (
+        sequence_parallel_input
+        and partition.rank_partitioned_a
+        and not input_parallel_reduce
+        and not partition.output_partitioned_b
+        and not sequence_parallel_scatter_output
+    ):
+        return _SequenceParallelSingleLora.apply(
+            x, lora_a, lora_b, scale, tp_group
+        )
+    rows = x.reshape(-1, x.shape[-1])
+    if sequence_parallel_input:
+        rows = _gather_sequence_parallel(rows, tp_group)
+    hidden = rows.matmul(lora_a.t())
+    if partition.rank_partitioned_a:
+        hidden = _all_gather_last_dim(hidden, tp_group, reduce_backward=True)
+    if input_parallel_reduce:
+        hidden = _all_reduce_sum(hidden, tp_group)
+    delta = hidden.matmul(lora_b.t()) * scale
+    if partition.output_partitioned_b:
+        delta = _all_gather_last_dim(delta, tp_group, reduce_backward=False)
+    if sequence_parallel_scatter_output:
+        delta = _scatter_sequence_parallel(delta, tp_group, tp_rank)
+    return delta.reshape(-1, *x.shape[1:-1], delta.shape[-1])
+
+
 def apply_batched_lora_delta(
     bank: DenseLoraBank,
     x: torch.Tensor,
-    lora_indices: torch.Tensor,
+    lora_indices: torch.Tensor | None,
     *,
     scale: float,
     tp_group=None,
@@ -87,6 +259,25 @@ def apply_batched_lora_delta(
     """Apply a selected bank with the established LinearLoRA TP/SP collectives."""
     if x.ndim < 2:
         raise ValueError("batched LoRA input must have a feature dimension.")
+    if _validate_single_slot_indices(
+        bank,
+        x,
+        lora_indices,
+        scale=scale,
+        tp_group=tp_group,
+        sequence_parallel_input=sequence_parallel_input,
+    ):
+        return _apply_single_lora_delta(
+            bank,
+            x,
+            scale=scale,
+            tp_group=tp_group,
+            tp_rank=tp_rank,
+            sequence_parallel_input=sequence_parallel_input,
+            input_parallel_reduce=input_parallel_reduce,
+            sequence_parallel_scatter_output=sequence_parallel_scatter_output,
+        )
+    assert lora_indices is not None
     rows = x.reshape(-1, x.shape[-1])
     slots = lora_indices.reshape(-1)
     if sequence_parallel_input:
