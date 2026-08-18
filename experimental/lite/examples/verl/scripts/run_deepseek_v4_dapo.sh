@@ -300,6 +300,7 @@ ROLLOUT=(
   "actor_rollout_ref.rollout.max_model_len=${MAX_SEQ_LEN}"
   "actor_rollout_ref.rollout.max_num_seqs=32"
   "actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
+  "actor_rollout_ref.rollout.enable_chunked_prefill=True"
   "actor_rollout_ref.rollout.temperature=1.0"
   "actor_rollout_ref.rollout.top_p=1.0"
   "actor_rollout_ref.rollout.top_k=-1"
