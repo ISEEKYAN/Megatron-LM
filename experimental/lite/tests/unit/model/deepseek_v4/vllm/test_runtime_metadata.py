@@ -254,6 +254,45 @@ def test_moe_metadata_builder_uses_tp_independent_runtime_gate() -> None:
     assert not hasattr(metadata, "build_grouped_moe")
 
 
+def test_sm100_batch_invariant_router_uses_fp32_mm(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, "_use_sm100_batch_invariant_router", lambda: True)
+    expected = torch.ones(2, 3, dtype=torch.float32)
+    mm = Mock(return_value=expected)
+    monkeypatch.setattr(torch, "mm", mm)
+    gate = runtime._RuntimeGateLinear(4, 3, device=torch.device("cpu"))
+    hidden = torch.zeros(2, 4, dtype=torch.bfloat16)
+
+    output, bias = gate(hidden)
+
+    assert output is expected
+    assert bias is None
+    mm.assert_called_once()
+    call_args, call_kwargs = mm.call_args
+    assert call_args[0] is hidden
+    assert torch.equal(call_args[1], gate.weight.T)
+    assert call_kwargs == {"out_dtype": torch.float32}
+
+
+def test_sm90_router_preserves_low_latency_kernel(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, "_use_sm100_batch_invariant_router", lambda: False)
+    available = Mock(return_value=True)
+    kernel_output = torch.ones(2, 3, dtype=torch.bfloat16)
+    kernel = Mock(return_value=kernel_output)
+
+    def symbol(_module, name):
+        return available if name == "is_available" else kernel
+
+    monkeypatch.setattr(runtime, "_symbol", symbol)
+    gate = runtime._RuntimeGateLinear(4, 3, device=torch.device("cpu"))
+    hidden = torch.zeros(2, 4, dtype=torch.bfloat16)
+
+    output, bias = gate(hidden)
+
+    assert output is kernel_output
+    assert bias is None
+    kernel.assert_called_once_with(hidden, gate.weight)
+
+
 def test_moe_metadata_builder_has_no_deepep_buffer_factory() -> None:
     assert not hasattr(
         runtime.DS4MoEKernelMetadataBuilderAdapter, "create_deepep_buffer"

@@ -36,6 +36,14 @@ def _kernel_topk_weights(weights: torch.Tensor) -> torch.Tensor:
     return weights if weights.dtype == torch.float32 else weights.float()
 
 
+def _use_sm100_exact_shared_swiglu() -> bool:
+    """Select the SM100-visible fused forward without changing SM90."""
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] >= 10
+    )
+
+
 @dataclass
 class MoEKernelMetadata:
     """Caller-owned vLLM router metadata."""
@@ -82,15 +90,30 @@ class _SharedExpertsState(nn.Module):
         )
         self.gate_up_fp8 = DeploymentBlockFP8Adapter(cache_weight=True)
         self.down_fp8 = DeploymentBlockFP8Adapter(cache_weight=True)
+        self.swiglu_limit = float(config.swiglu_limit)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_up = block_fp8_linear(
             self.gate_up_fp8, hidden_states, self.gate_up.weight
         )
         gate, up = gate_up.chunk(2, dim=-1)
+        if _use_sm100_exact_shared_swiglu():
+            native = (
+                F.silu(torch.clamp(gate.float(), max=self.swiglu_limit))
+                * torch.clamp(
+                    up.float(), min=-self.swiglu_limit, max=self.swiglu_limit
+                )
+            ).to(gate_up.dtype)
+            exact = torch.empty_like(native)
+            torch.ops._C.silu_and_mul_with_clamp(
+                exact, gate_up, self.swiglu_limit, 1.0, 0.0
+            )
+            activation = native + (exact - native).detach()
+        else:
+            activation = F.silu(gate) * up
         return block_fp8_linear(
             self.down_fp8,
-            F.silu(gate) * up,
+            activation,
             self.down.weight,
         )
 
