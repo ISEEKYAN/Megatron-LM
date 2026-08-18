@@ -2,13 +2,29 @@ import types
 
 import torch
 
+import megatron.lite.primitive.modules.dispatcher as dispatcher_module
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.parallel import ParallelState
 
 
-def test_deepep_initialization_matches_mcore_num_sms(monkeypatch) -> None:
-    import megatron.lite.primitive.modules.dispatcher as dispatcher_module
+def test_deepep_disables_unsafe_deterministic_empty_fill(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dispatcher_module.torch,
+        "are_deterministic_algorithms_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        dispatcher_module.torch.utils.deterministic,
+        "fill_uninitialized_memory",
+        True,
+    )
 
+    dispatcher_module._configure_deepep_deterministic_allocator()
+
+    assert not dispatcher_module.torch.utils.deterministic.fill_uninitialized_memory
+
+
+def test_deepep_initialization_matches_mcore_num_sms(monkeypatch) -> None:
     calls = []
 
     class FakeBuffer:

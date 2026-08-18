@@ -33,6 +33,26 @@ _deepep_buffer = None
 _token_dispatcher_instances = 0
 
 
+def _configure_deepep_deterministic_allocator() -> None:
+    """Avoid DeepEP's known deterministic ``torch.empty`` stream race.
+
+    Legacy normal DeepEP waits its communication stream before allocating
+    output tensors.  PyTorch's deterministic debug fill is consequently
+    enqueued after that wait on the compute stream and can race DeepEP's
+    communication-stream writers.  ``fill_uninitialized_memory`` is only an
+    uninitialized-memory debugging aid; disabling it does not relax PyTorch's
+    deterministic algorithm selection.
+
+    See https://github.com/deepseek-ai/DeepEP/issues/589.
+    """
+
+    if (
+        torch.are_deterministic_algorithms_enabled()
+        and torch.utils.deterministic.fill_uninitialized_memory
+    ):
+        torch.utils.deterministic.fill_uninitialized_memory = False
+
+
 def _validate_finite(stage: str, **tensors: torch.Tensor) -> None:
     if os.environ.get("MLITE_VALIDATE_FINITE") != "1":
         return
@@ -80,6 +100,8 @@ def _get_deepep_buffer(group: dist.ProcessGroup, hidden_bytes: int):
 
     if deep_ep is None:
         raise RuntimeError("DeepEP buffer requested but deep_ep is not installed.")
+
+    _configure_deepep_deterministic_allocator()
 
     global _deepep_buffer
     group_size = dist.get_world_size(group=group)
