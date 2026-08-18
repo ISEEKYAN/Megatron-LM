@@ -28,6 +28,17 @@ DS4_FP8_MLA_TOKEN_BYTES = 584
 DS4_FLASHMLA_INDEX_ALIGNMENT = 128
 
 
+def _use_sm100_batch_invariant_router() -> bool:
+    """Use vLLM's SM100 BI router accumulation without changing SM90."""
+    from vllm import envs
+
+    return (
+        envs.VLLM_BATCH_INVARIANT
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] >= 10
+    )
+
+
 def _symbol(module: str, name: str) -> Any:
     try:
         return getattr(importlib.import_module(module), name)
@@ -149,6 +160,15 @@ class _RuntimeGateLinear(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor):
+        if _use_sm100_batch_invariant_router():
+            return (
+                torch.mm(
+                    hidden_states,
+                    self.weight.T,
+                    out_dtype=torch.float32,
+                ),
+                None,
+            )
         if hidden_states.shape[0] <= 16:
             is_available = _symbol(
                 "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16",

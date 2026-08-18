@@ -127,7 +127,16 @@ def test_torchrun_ep2_grouped_deepgemm_matches_official_kernel_bitwise() -> None
     group = dist.group.WORLD
     rank = dist.get_rank(group)
 
-    tokens, hidden, intermediate, experts, topk = 4, 2048, 128, 2, 1
+    if (
+        torch.cuda.get_device_capability()[0] >= 10
+        and os.environ.get("VLLM_BATCH_INVARIANT_KERNEL_LIB")
+    ):
+        # The SM100 batch-invariant kernel's scheduler
+        # requires the real 2048-wide expert intermediate rather than the old
+        # 128-wide unit fixture. Keep the Hopper fixture unchanged.
+        tokens, hidden, intermediate, experts, topk = 4, 4096, 2048, 2, 1
+    else:
+        tokens, hidden, intermediate, experts, topk = 4, 2048, 128, 2, 1
     max_tokens = 8
     bytes_needed = deep_ep.Buffer.get_low_latency_rdma_size_hint(
         max_tokens, hidden, 2, experts

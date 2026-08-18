@@ -98,7 +98,11 @@ def test_o_projection_rejects_bad_shape_before_vllm_lookup(monkeypatch) -> None:
     importlib.util.find_spec("vllm") is None,
     reason="requires official vLLM inverse-RoPE, FP8 einsum, and DeepGEMM kernels",
 )
-def test_official_vllm_o_projection_is_bitwise_through_candidate_callable() -> None:
+@pytest.mark.parametrize("num_tokens", [1, 2, 7, 32])
+def test_official_vllm_o_projection_is_bitwise_through_candidate_callable(
+    num_tokens: int,
+) -> None:
+    import deep_gemm
     from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
         compute_fp8_einsum_recipe,
         deep_gemm_fp8_o_proj,
@@ -112,9 +116,11 @@ def test_official_vllm_o_projection_is_bitwise_through_candidate_callable() -> N
 
     torch.manual_seed(29)
     device = "cuda"
-    o = torch.randn(2, 2, 128, dtype=torch.bfloat16, device=device)
-    positions = torch.tensor([0, 1], dtype=torch.int64, device=device)
-    cos = torch.ones(8, 64, dtype=torch.float32, device=device)
+    deep_gemm.set_batch_invariant(True)
+    assert deep_gemm.get_batch_invariant()
+    o = torch.randn(num_tokens, 2, 128, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos = torch.ones(max(8, num_tokens), 64, dtype=torch.float32, device=device)
     master_a = torch.randn(128, 256, dtype=torch.bfloat16, device=device)
     qweight, scales = per_block_cast_to_fp8(
         master_a, block_size=[128, 128], use_ue8m0=False
@@ -129,6 +135,9 @@ def test_official_vllm_o_projection_is_bitwise_through_candidate_callable() -> N
     )
     wo_a = type("_PackedGroupedWeight", (), {})()
     wo_a.weight, wo_a.weight_scale = qweight, scales
+    if torch.cuda.get_device_capability()[0] >= 10:
+        assert scales.dtype == torch.int32
+        assert scales.numel() != 1 * (128 // 128) * (256 // 128)
     master_b = torch.randn(128, 128, dtype=torch.bfloat16, device=device)
     wb_q, wb_s = per_block_cast_to_fp8(
         master_b, block_size=[128, 128], use_ue8m0=False

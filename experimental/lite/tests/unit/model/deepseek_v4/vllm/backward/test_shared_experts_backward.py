@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from megatron.lite.model.deepseek_v4.vllm import moe
 from megatron.lite.model.deepseek_v4.vllm.moe import _SharedExpertsState
 from megatron.lite.primitive.modules.experts import swiglu_with_probs
 
@@ -13,6 +14,37 @@ from megatron.lite.primitive.modules.experts import swiglu_with_probs
 class _VisibleLinear(nn.Module):
     def forward(self, value, weight):
         return F.linear(value, weight)
+
+
+def test_sm90_shared_expert_preserves_native_swiglu(monkeypatch) -> None:
+    config = SimpleNamespace(
+        hidden_size=4,
+        n_shared_experts=1,
+        moe_intermediate_size=2,
+        swiglu_limit=10.0,
+    )
+    shared = _SharedExpertsState(config)
+    hidden = torch.zeros(2, 4, dtype=torch.bfloat16)
+    gate_up = torch.tensor(
+        [[1.0, -2.0, 3.0, 4.0], [-1.0, 2.0, -3.0, 4.0]],
+        dtype=torch.bfloat16,
+    )
+    captured = {}
+
+    def visible(adapter, value, _weight):
+        if adapter is shared.gate_up_fp8:
+            return gate_up
+        captured["activation"] = value
+        return hidden
+
+    monkeypatch.setattr(moe, "block_fp8_linear", visible)
+    monkeypatch.setattr(moe, "_use_sm100_exact_shared_swiglu", lambda: False)
+
+    output = shared(hidden)
+
+    gate, up = gate_up.chunk(2, dim=-1)
+    assert output is hidden
+    assert torch.equal(captured["activation"], F.silu(gate) * up)
 
 
 def test_shared_experts_block_fp8_bridges_cover_bf16_master_gradients() -> None:
