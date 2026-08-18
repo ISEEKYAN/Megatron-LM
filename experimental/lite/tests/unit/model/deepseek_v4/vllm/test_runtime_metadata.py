@@ -97,7 +97,7 @@ def test_vllm_forward_context_gathers_tokens_on_ep_group(monkeypatch) -> None:
 
 def test_layer0_rope_uses_official_vllm_config_loader(monkeypatch) -> None:
     hf_config = SimpleNamespace()
-    cos = torch.empty(32, 64, dtype=torch.bfloat16)
+    cos = torch.arange(32 * 64, dtype=torch.bfloat16).reshape(32, 64)
     rotary = SimpleNamespace(cos_sin_cache=cos)
     get_config = Mock(return_value=hf_config)
     build = Mock(return_value=rotary)
@@ -272,6 +272,43 @@ def test_layer1_extended_builder_reuses_swa_only_contract(monkeypatch) -> None:
     assert metadata.compressor_operation is None
     assert metadata.indexer_operation is None
     assert metadata.indices.shape == (5, 1, 128)
+
+
+def test_extended_builder_covers_every_full_model_layer() -> None:
+    ratios = [0, 0] + [4, 128] * 20 + [4, 0]
+    config = _config(
+        num_hidden_layers=len(ratios),
+        compress_ratios=ratios,
+        max_position_embeddings=512,
+    )
+    cos_sin_cache = torch.empty(512, 128, dtype=torch.float32)
+
+    builders = [
+        runtime.DS4SparseIndexerCompressorMetadataAdapter(
+            config,
+            layer_idx=layer_idx,
+            device="cpu",
+            cos_sin_cache=cos_sin_cache,
+        )
+        for layer_idx in range(1, config.num_hidden_layers)
+    ]
+
+    assert [builder.layer_idx for builder in builders] == list(
+        range(1, config.num_hidden_layers)
+    )
+    assert {builder.compress_ratio for builder in builders} == {1, 4, 128}
+
+
+@pytest.mark.parametrize("layer_idx", [0, 44])
+def test_extended_builder_rejects_layers_outside_nonzero_model_range(layer_idx) -> None:
+    ratios = [0, 0] + [4, 128] * 20 + [4, 0]
+    with pytest.raises(ValueError, match="non-zero decoder layer"):
+        runtime.DS4SparseIndexerCompressorMetadataAdapter(
+            _config(num_hidden_layers=len(ratios), compress_ratios=ratios),
+            layer_idx=layer_idx,
+            device="cpu",
+            cos_sin_cache=torch.empty(256, 128, dtype=torch.float32),
+        )
 
 
 def test_layer2_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> None:

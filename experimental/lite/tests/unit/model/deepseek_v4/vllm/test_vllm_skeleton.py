@@ -126,6 +126,7 @@ def test_recompute_tracks_cross_layer_mhc_state_as_positional_inputs() -> None:
 def test_attention_restores_fp32_rope_after_fsdp_input_cast() -> None:
     attention = _AttentionState.__new__(_AttentionState)
     torch.nn.Module.__init__(attention)
+    attention.ps = None
     metadata = SimpleNamespace(
         cos_sin_cache=torch.empty(8, 4, dtype=torch.bfloat16)
     )
@@ -165,6 +166,7 @@ def _tiny_config() -> DeepseekV4Config:
         n_shared_experts=1,
         num_experts_per_tok=2,
         num_hash_layers=1,
+        compress_ratios=[0, 0],
         hc_mult=2,
         num_nextn_predict_layers=1,
     )
@@ -547,10 +549,8 @@ def test_forward_step_reuses_caller_owned_runtime_assets(monkeypatch) -> None:
         "from_hf",
         lambda *_args, **_kwargs: pytest.fail("rebuilt caller-owned attention assets"),
     )
-    monkeypatch.setattr(
-        protocol.DS4MoEKernelMetadataBuilderAdapter,
-        "create_deepep_buffer",
-        lambda *_args, **_kwargs: pytest.fail("created a second DeepEP buffer"),
+    assert not hasattr(
+        protocol.DS4MoEKernelMetadataBuilderAdapter, "create_deepep_buffer"
     )
     monkeypatch.setattr(
         protocol,
@@ -923,7 +923,7 @@ def test_layer2_attention_calls_compressor_and_indexer_in_order() -> None:
     assert torch.all(metadata.topk_length == 1)
 
 
-def test_four_layer_selector_requires_release_config() -> None:
+def test_full_layer_selector_accepts_supported_ratios_and_rejects_unknown() -> None:
     cfg = _tiny_4l_config()
     impl = protocol.ImplConfig(
         parallel=ParallelConfig(ep=2),
@@ -932,6 +932,8 @@ def test_four_layer_selector_requires_release_config() -> None:
     )
     protocol._validate_contract(cfg, impl)
     cfg.compress_ratios = [1, 1, 1, 1]
+    protocol._validate_contract(cfg, impl)
+    cfg.compress_ratios = [1, 1, 2, 128]
     with pytest.raises(ValueError, match="compress_ratios"):
         protocol._validate_contract(cfg, impl)
 

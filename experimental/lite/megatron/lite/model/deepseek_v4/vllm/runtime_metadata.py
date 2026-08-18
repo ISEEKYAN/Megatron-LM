@@ -640,7 +640,7 @@ class DS4SparseAttentionMetadataBuilderAdapter:
 
 
 class DS4SparseIndexerCompressorMetadataAdapter:
-    """Runtime metadata for DS4 layers 1--3 without a vLLM model instance.
+    """Runtime metadata for any non-zero DS4 decoder layer.
 
     Parameters remain owned by the mLite model.  This adapter owns only
     ephemeral cache/state tensors and calls vLLM's operation-level compressor,
@@ -674,8 +674,16 @@ class DS4SparseIndexerCompressorMetadataAdapter:
         device: torch.device | str,
         cos_sin_cache: torch.Tensor,
     ) -> None:
-        if layer_idx < 1 or layer_idx > 3:
-            raise ValueError("extended metadata adapter supports layers 1 through 3")
+        if not 1 <= layer_idx < config.num_hidden_layers:
+            raise ValueError(
+                f"layer_idx must select a non-zero decoder layer; got {layer_idx} "
+                f"for num_hidden_layers={config.num_hidden_layers}"
+            )
+        if layer_idx >= len(config.compress_ratios):
+            raise ValueError(
+                f"compress_ratios has {len(config.compress_ratios)} entries but "
+                f"layer {layer_idx} was selected"
+            )
         self.config = config
         self.layer_idx = layer_idx
         self.device = torch.device(device)
@@ -1527,98 +1535,29 @@ class DS4SparseIndexerCompressorMetadataAdapter:
 
 
 class DS4MoEKernelMetadataBuilderAdapter:
-    """Build vLLM router metadata, optionally with the LL oracle kernel."""
+    """Build the caller-owned vLLM router projection metadata."""
 
     def __init__(
         self,
         config: DeepseekV4Config,
         *,
         device: torch.device | str,
-        deepep_buffer: Any | None = None,
-        ep_size: int,
-        max_tokens_per_rank: int,
         layer_idx: int = 0,
     ) -> None:
         if not 0 <= layer_idx < config.num_hidden_layers:
             raise ValueError(f"layer_idx is outside the model: {layer_idx}")
-        if ep_size <= 0 or config.n_routed_experts % ep_size:
-            raise ValueError("routed experts must divide evenly across EP ranks")
         self.config = config
         self.device = torch.device(device)
-        self.ep_size = ep_size
         self.layer_idx = layer_idx
-        max_tokens_per_rank = self.align_max_tokens_per_rank(
-            max_tokens_per_rank, ep_size
-        )
         self.gate_linear = _RuntimeGateLinear(
             config.hidden_size,
             config.n_routed_experts,
             device=self.device,
         )
-        from megatron.lite.primitive.kernels.vllm_ds4 import (
-            GroupedMoEKernelBuilderAdapter,
-        )
-
-        self.grouped_kernel = GroupedMoEKernelBuilderAdapter(
-            deepep_buffer,
-            device=self.device,
-            num_experts=config.n_routed_experts,
-            num_local_experts=config.n_routed_experts // ep_size,
-            experts_per_token=config.num_experts_per_tok,
-            hidden_dim=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            max_tokens_per_rank=max_tokens_per_rank,
-            num_dispatchers=ep_size,
-            use_fp8_dispatch=True,
-        )
-
-    @staticmethod
-    def align_max_tokens_per_rank(max_tokens_per_rank: int, ep_size: int) -> int:
-        if max_tokens_per_rank <= 0 or ep_size <= 0:
-            raise ValueError("DeepEP token capacity and EP size must be positive")
-        alignment = 4 // math.gcd(ep_size, 4)
-        return _round_up(max_tokens_per_rank, alignment)
-
-    @staticmethod
-    def create_deepep_buffer(
-        config: DeepseekV4Config,
-        *,
-        group: dist.ProcessGroup,
-        ep_size: int,
-        max_tokens_per_rank: int,
-    ) -> Any:
-        """Create the caller-owned low-latency buffer used by vLLM's oracle."""
-
-        if config.n_routed_experts % ep_size:
-            raise ValueError("routed experts must be divisible by EP size")
-        local_experts = config.n_routed_experts // ep_size
-        max_tokens_per_rank = (
-            DS4MoEKernelMetadataBuilderAdapter.align_max_tokens_per_rank(
-                max_tokens_per_rank, ep_size
-            )
-        )
-        buffer_cls = _symbol("deep_ep", "Buffer")
-        rdma_bytes = buffer_cls.get_low_latency_rdma_size_hint(
-            max_tokens_per_rank,
-            config.hidden_size,
-            ep_size,
-            config.n_routed_experts,
-        )
-        return buffer_cls(
-            group,
-            num_rdma_bytes=rdma_bytes,
-            low_latency_mode=True,
-            num_qps_per_rank=local_experts,
-            allow_nvlink_for_low_latency_mode=True,
-            explicitly_destroy=True,
-        )
 
     def build(self):
         from megatron.lite.model.deepseek_v4.vllm.moe import MoEKernelMetadata
-        return MoEKernelMetadata(
-            gate_linear=self.gate_linear,
-            build_grouped_moe=self.grouped_kernel,
-        )
+        return MoEKernelMetadata(gate_linear=self.gate_linear)
 
 
 # Compatibility for existing layer-0 callers.

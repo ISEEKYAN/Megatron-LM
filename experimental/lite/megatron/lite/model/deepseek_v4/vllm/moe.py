@@ -41,7 +41,6 @@ class MoEKernelMetadata:
     """Caller-owned vLLM router metadata."""
 
     gate_linear: Callable[[torch.Tensor], Any] | None
-    build_grouped_moe: Callable[[Any], Any] | None = None
 
 
 class _RouterState(nn.Module):

@@ -236,17 +236,27 @@ def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> Non
                 "DeepSeek V4 vLLM selectors must form a contiguous global-layer "
                 f"prefix starting at zero; got {selected_ids}, expected {expected_prefix}."
             )
-    if selected_ids and max(selected_ids) >= 3:
-        ratios = tuple(model_cfg.compress_ratios[:4])
-        if ratios != (0, 0, 4, 128):
-            raise ValueError(
-                "DeepSeek V4 4-layer audit requires compress_ratios[:4] "
-                f"to be (0, 0, 4, 128); got {ratios}."
-            )
-        if model_cfg.num_hash_layers != 3:
-            raise ValueError(
-                "DeepSeek V4 4-layer audit requires num_hash_layers=3."
-            )
+    if len(model_cfg.compress_ratios) < model_cfg.num_hidden_layers:
+        raise ValueError(
+            "compress_ratios must cover every decoder layer; got "
+            f"{len(model_cfg.compress_ratios)} entries for "
+            f"{model_cfg.num_hidden_layers} layers."
+        )
+    unsupported_ratios = {
+        layer_id: model_cfg.compress_ratios[layer_id]
+        for layer_id in selected_ids
+        if max(1, model_cfg.compress_ratios[layer_id]) not in (1, 4, 128)
+    }
+    if unsupported_ratios:
+        raise ValueError(
+            "DeepSeek V4 vLLM metadata compress_ratios supports only 1, 4, and "
+            f"128; got {unsupported_ratios}."
+        )
+    if 0 in selected_ids and max(1, model_cfg.compress_ratios[0]) != 1:
+        raise ValueError(
+            "decoder layer 0 must use the official SWA-only ratio-1 metadata "
+            f"contract; got compress_ratio={model_cfg.compress_ratios[0]}."
+        )
     if 0 in impl_cfg.selector.global_layer_ids:
         missing = _CANONICAL_STAGES - set(impl_cfg.selector.module_names)
         if missing:
@@ -443,8 +453,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             layer_idx: DS4MoEKernelMetadataBuilderAdapter(
                 model_cfg,
                 device=device,
-                ep_size=parallel_state.ep_size,
-                max_tokens_per_rank=impl_cfg.max_tokens_per_rank,
                 layer_idx=layer_idx,
             ).build()
             for layer_idx in selected_layers
