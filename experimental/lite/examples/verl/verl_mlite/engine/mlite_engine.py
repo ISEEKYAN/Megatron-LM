@@ -958,9 +958,13 @@ class MegatronLiteEngine(BaseEngine):
             if output_lst is not None and not getattr(
                 loss_fn_ref(), "runtime_collects_outputs", False
             ):
+                detached_model_output = {
+                    k: (v.detach() if isinstance(v, torch.Tensor) else v)
+                    for k, v in model_output.items()
+                }
                 output_lst.append(
                     {
-                        "model_output": model_output,
+                        "model_output": detached_model_output,
                         "loss": float(loss.detach().item()),
                         "metrics": metrics,
                     }
