@@ -76,7 +76,7 @@ def test_mhc_contract_rejects_bad_dtype_before_kernel_lookup(monkeypatch) -> Non
     lookup.assert_not_called()
 
 
-def test_cross_layer_state_runs_attention_post_pre_before_attention(monkeypatch) -> None:
+def test_layer_matches_lite_unfused_pre_block_post_sequence(monkeypatch) -> None:
     hidden_size, hc_mult, tokens = 8, 2, 3
     config = type(
         "Config",
@@ -92,6 +92,7 @@ def test_cross_layer_state_runs_attention_post_pre_before_attention(monkeypatch)
     layer = DeepseekV4Layer.__new__(DeepseekV4Layer)
     nn.Module.__init__(layer)
     layer.config = config
+    layer.layer_idx = 0
     layer.selected_stages = frozenset({"mhc"})
 
     def hc_state():
@@ -125,26 +126,34 @@ def test_cross_layer_state_runs_attention_post_pre_before_attention(monkeypatch)
         def __init__(self, kernel):
             calls.append(kernel)
 
-        def __call__(self, hidden, residual, post_mix, res_mix, *args, **kwargs):
-            return residual, post_mix, res_mix, hidden + 1
+        def __call__(self, *args, **kwargs):
+            del kwargs
+            kernel = calls[-1]
+            if kernel is MHCKernel.PRE:
+                streams = args[0]
+                post = torch.zeros(tokens, hc_mult, 1)
+                comb = torch.zeros(tokens, hc_mult, hc_mult)
+                return post, comb, streams[:, 0] + 1
+            if kernel is MHCKernel.POST:
+                return args[1]
+            raise AssertionError(kernel)
 
     monkeypatch.setattr(model_module, "MHCTileLangAdapter", FakeAdapter)
-    hidden = torch.zeros(tokens, hidden_size, dtype=torch.bfloat16)
-    residual = torch.zeros(tokens, hc_mult, hidden_size, dtype=torch.bfloat16)
-    post_mix = torch.zeros(tokens, hc_mult, 1)
-    res_mix = torch.zeros(tokens, hc_mult, hc_mult)
+    streams = torch.zeros(tokens, hc_mult, hidden_size, dtype=torch.bfloat16)
 
     layer(
-        hidden,
-        residual=residual,
-        post_mix=post_mix,
-        res_mix=res_mix,
+        streams,
         attention_metadata=object(),
         moe_metadata=object(),
     )
 
-    assert calls == [MHCKernel.POST_PRE, MHCKernel.POST_PRE]
-    torch.testing.assert_close(attention_inputs[0], hidden + 1)
+    assert calls == [
+        MHCKernel.PRE,
+        MHCKernel.POST,
+        MHCKernel.PRE,
+        MHCKernel.POST,
+    ]
+    torch.testing.assert_close(attention_inputs[0], streams[:, 0] + 1)
 
 
 @pytest.mark.gpus(1)
@@ -160,3 +169,79 @@ def test_mhc_post_official_kernel_is_bitwise_through_adapter() -> None:
     reference = mhc_post_tilelang(*(value.clone() for value in args))
     candidate = MHCTileLangAdapter("post")(*(value.clone() for value in args))
     torch.testing.assert_close(candidate, reference, rtol=0, atol=0)
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+@pytest.mark.skipif(
+    importlib.util.find_spec("vllm") is None,
+    reason="requires the official vLLM package and compiled TileLang kernels",
+)
+@pytest.mark.parametrize("kernel", [MHCKernel.PRE_BROADCAST, MHCKernel.PRE])
+def test_mhc_pre_is_bitwise_invariant_to_batch_composition(kernel: MHCKernel) -> None:
+    torch.manual_seed(42)
+    mult, hidden, mixed_tokens, target_index = 4, 128, 17, 7
+    width = mult * hidden
+    mixes = (2 + mult) * mult
+    target = torch.randn(
+        1,
+        hidden if kernel is MHCKernel.PRE_BROADCAST else mult,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    if kernel is MHCKernel.PRE:
+        target = torch.randn(1, mult, hidden, dtype=torch.bfloat16, device="cuda")
+        mixed = torch.randn(
+            mixed_tokens, mult, hidden, dtype=torch.bfloat16, device="cuda"
+        )
+    else:
+        mixed = torch.randn(
+            mixed_tokens, hidden, dtype=torch.bfloat16, device="cuda"
+        )
+    mixed[target_index].copy_(target[0])
+    fn = torch.randn(mixes, width, dtype=torch.float32, device="cuda")
+    scale = torch.randn(3, dtype=torch.float32, device="cuda")
+    base = torch.randn(mixes, dtype=torch.float32, device="cuda")
+    norm_weight = torch.randn(hidden, dtype=torch.bfloat16, device="cuda")
+    common = (fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 2)
+    kwargs = {"norm_weight": norm_weight, "norm_eps": 1e-6}
+    if kernel is MHCKernel.PRE_BROADCAST:
+        kwargs["fn_broadcast"] = (
+            fn.view(-1, mult, hidden).sum(dim=1).contiguous()
+        )
+
+    target_outputs = MHCTileLangAdapter(kernel)(target, *common, **kwargs)
+    mixed_outputs = MHCTileLangAdapter(kernel)(mixed, *common, **kwargs)
+    if kernel is MHCKernel.PRE_BROADCAST:
+        # PRE_BROADCAST additionally materializes the residual streams.
+        target_outputs = target_outputs[1:]
+        mixed_outputs = mixed_outputs[1:]
+    for target_output, mixed_output in zip(target_outputs, mixed_outputs):
+        assert torch.equal(target_output[0], mixed_output[target_index])
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+@pytest.mark.skipif(
+    importlib.util.find_spec("vllm") is None,
+    reason="requires the official vLLM package and compiled TileLang kernels",
+)
+def test_mhc_post_is_bitwise_invariant_to_batch_composition() -> None:
+    torch.manual_seed(43)
+    mult, hidden, mixed_tokens, target_index = 4, 128, 17, 7
+
+    def values(tokens: int) -> tuple[torch.Tensor, ...]:
+        return (
+            torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda"),
+            torch.randn(tokens, mult, hidden, dtype=torch.bfloat16, device="cuda"),
+            torch.randn(tokens, mult, 1, dtype=torch.float32, device="cuda"),
+            torch.randn(tokens, mult, mult, dtype=torch.float32, device="cuda"),
+        )
+
+    target = values(1)
+    mixed = values(mixed_tokens)
+    for target_value, mixed_value in zip(target, mixed):
+        mixed_value[target_index].copy_(target_value[0])
+    target_output = MHCTileLangAdapter(MHCKernel.POST)(*target)
+    mixed_output = MHCTileLangAdapter(MHCKernel.POST)(*mixed)
+    assert torch.equal(target_output[0], mixed_output[target_index])

@@ -19,7 +19,6 @@ from megatron.lite.model.deepseek_v4.vllm.primitive import (
     fused_qkv_rms_norm,
     mhc_head,
     mhc_post,
-    mhc_post_pre,
     mhc_pre_broadcast,
     o_projection,
     rms_norm,
@@ -1061,6 +1060,75 @@ class DeepseekV4Layer(nn.Module):
         self.attn_hc = _HyperConnectionState(config.hidden_size, config.hc_mult)
         self.ffn_hc = _HyperConnectionState(config.hidden_size, config.hc_mult)
 
+    def _mhc_pre(
+        self,
+        hidden_states: torch.Tensor,
+        hc: _HyperConnectionState,
+        norm_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Match lite/official-vLLM unfused HyperConnection pre."""
+        fn = hc.hc_fn.float().contiguous()
+        scale = hc.hc_scale.float().contiguous()
+        base = hc.hc_base.float().contiguous()
+        broadcast = hidden_states.ndim == 2
+        adapter = MHCTileLangAdapter(
+            MHCKernel.PRE_BROADCAST if broadcast else MHCKernel.PRE
+        )
+
+        def visible_pre(hidden, fn_, scale_, base_, norm_weight_):
+            common = (
+                hidden,
+                fn_,
+                scale_,
+                base_,
+                self.config.rms_norm_eps,
+                self.config.hc_eps,
+                self.config.hc_eps,
+                2.0,
+                self.config.hc_sinkhorn_iters,
+            )
+            kwargs = {
+                "norm_weight": norm_weight_,
+                "norm_eps": self.config.rms_norm_eps,
+            }
+            if broadcast:
+                kwargs["fn_broadcast"] = (
+                    fn_.view(-1, self.config.hc_mult, self.config.hidden_size)
+                    .sum(dim=1)
+                    .contiguous()
+                )
+                return adapter(*common, **kwargs)
+            return (hidden, *adapter(*common, **kwargs))
+
+        return mhc_pre_broadcast(
+            visible_pre,
+            hidden_states,
+            fn,
+            scale,
+            base,
+            norm_weight,
+            mult=self.config.hc_mult,
+            iters=self.config.hc_sinkhorn_iters,
+            eps=self.config.hc_eps,
+            norm_eps=self.config.rms_norm_eps,
+        )
+
+    @staticmethod
+    def _mhc_post(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        adapter = MHCTileLangAdapter(MHCKernel.POST)
+        return mhc_post(
+            lambda *args: adapter(*args),
+            hidden_states,
+            residual,
+            post_mix,
+            res_mix,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1073,97 +1141,13 @@ class DeepseekV4Layer(nn.Module):
         ) = None,
         moe_metadata: MoEKernelMetadata | dict[int, MoEKernelMetadata] | None = None,
         input_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, None, None, None]:
         if "mhc" not in self.selected_stages:
             raise NotImplementedError("layer-0 stage 'mhc' was not executed")
-        attn_fn = self.attn_hc.hc_fn.float().contiguous()
-        attn_base = self.attn_hc.hc_base.float().contiguous()
-        attn_scale = self.attn_hc.hc_scale.float().contiguous()
-        fn_broadcast = (
-            attn_fn.view(-1, self.config.hc_mult, self.config.hidden_size)
-            .sum(dim=1)
-            .contiguous()
+        del residual, post_mix, res_mix
+        residual, post_mix, res_mix, hidden_states = self._mhc_pre(
+            hidden_states, self.attn_hc, self.input_layernorm.weight
         )
-        if residual is None:
-            broadcast = hidden_states.ndim == 2
-            adapter = MHCTileLangAdapter(
-                MHCKernel.PRE_BROADCAST if broadcast else MHCKernel.PRE
-            )
-
-            def visible_pre(hidden, fn, scale, base, norm_weight):
-                common = (
-                    hidden,
-                    fn,
-                    scale,
-                    base,
-                    self.config.rms_norm_eps,
-                    self.config.hc_eps,
-                    self.config.hc_eps,
-                    2.0,
-                    self.config.hc_sinkhorn_iters,
-                )
-                kwargs = {
-                    "norm_weight": norm_weight,
-                    "norm_eps": self.config.rms_norm_eps,
-                }
-                if broadcast:
-                    kwargs["fn_broadcast"] = fn.view(
-                        -1, self.config.hc_mult, self.config.hidden_size
-                    ).sum(dim=1).contiguous()
-                    return adapter(*common, **kwargs)
-                # PRE consumes the residual streams already materialized by
-                # the preceding PP stage.  Preserve those streams as the
-                # residual output expected by the functional training graph.
-                return (hidden, *adapter(*common, **kwargs))
-
-            residual, post_mix, res_mix, hidden_states = mhc_pre_broadcast(
-                visible_pre,
-                hidden_states,
-                attn_fn,
-                attn_scale,
-                attn_base,
-                self.input_layernorm.weight,
-                mult=self.config.hc_mult,
-                iters=self.config.hc_sinkhorn_iters,
-                eps=self.config.hc_eps,
-                norm_eps=self.config.rms_norm_eps,
-            )
-        else:
-            if post_mix is None or res_mix is None:
-                raise ValueError("cross-layer MHC state requires post_mix and res_mix")
-            adapter = MHCTileLangAdapter(MHCKernel.POST_PRE)
-            residual, post_mix, res_mix, hidden_states = mhc_post_pre(
-                lambda hidden, residual_, post, comb, fn, scale, base, norm_weight: adapter(
-                    hidden,
-                    residual_,
-                    post,
-                    comb,
-                    fn,
-                    scale,
-                    base,
-                    self.config.rms_norm_eps,
-                    self.config.hc_eps,
-                    self.config.hc_eps,
-                    2.0,
-                    self.config.hc_sinkhorn_iters,
-                    n_splits=1,
-                    tile_n=1,
-                    norm_weight=norm_weight,
-                    norm_eps=self.config.rms_norm_eps,
-                ),
-                hidden_states,
-                residual,
-                post_mix,
-                res_mix,
-                attn_fn,
-                attn_scale,
-                attn_base,
-                self.input_layernorm.weight,
-                mult=self.config.hc_mult,
-                iters=self.config.hc_sinkhorn_iters,
-                eps=self.config.hc_eps,
-                norm_eps=self.config.rms_norm_eps,
-            )
         _validate_finite(
             f"layer_{self.layer_idx}.mhc_pre_attn",
             hidden_states=hidden_states,
@@ -1176,38 +1160,11 @@ class DeepseekV4Layer(nn.Module):
             f"layer_{self.layer_idx}.attention",
             hidden_states=hidden_states,
         )
-        adapter = MHCTileLangAdapter(MHCKernel.POST_PRE)
-        residual, post_mix, res_mix, hidden_states = mhc_post_pre(
-            lambda hidden, residual_, post, comb, fn, scale, base, norm_weight: adapter(
-                hidden,
-                residual_,
-                post,
-                comb,
-                fn,
-                scale,
-                base,
-                self.config.rms_norm_eps,
-                self.config.hc_eps,
-                self.config.hc_eps,
-                2.0,
-                self.config.hc_sinkhorn_iters,
-                n_splits=1,
-                tile_n=1,
-                norm_weight=norm_weight,
-                norm_eps=self.config.rms_norm_eps,
-            ),
-            hidden_states,
-            residual,
-            post_mix,
-            res_mix,
-            self.ffn_hc.hc_fn.float().contiguous(),
-            self.ffn_hc.hc_scale.float().contiguous(),
-            self.ffn_hc.hc_base.float().contiguous(),
-            self.post_attention_layernorm.weight,
-            mult=self.config.hc_mult,
-            iters=self.config.hc_sinkhorn_iters,
-            eps=self.config.hc_eps,
-            norm_eps=self.config.rms_norm_eps,
+        hidden_states = self._mhc_post(
+            hidden_states, residual, post_mix, res_mix
+        )
+        residual, post_mix, res_mix, hidden_states = self._mhc_pre(
+            hidden_states, self.ffn_hc, self.post_attention_layernorm.weight
         )
         _validate_finite(
             f"layer_{self.layer_idx}.mhc_pre_ffn",
@@ -1223,7 +1180,10 @@ class DeepseekV4Layer(nn.Module):
             f"layer_{self.layer_idx}.moe",
             hidden_states=hidden_states,
         )
-        return hidden_states, residual, post_mix, res_mix
+        hidden_states = self._mhc_post(
+            hidden_states, residual, post_mix, res_mix
+        )
+        return hidden_states, None, None, None
 
 
 class _LMHeadState(nn.Module):
@@ -1385,14 +1345,7 @@ class DeepseekV4Model(nn.Module):
             raise NotImplementedError(
                 "DeepSeek-V4 vLLM forward requires a non-empty contiguous layer prefix."
             )
-        residual = hidden_states if pipeline_streams else None
-        post_mix = res_mix = None
-        if pipeline_streams:
-            # The canonical PP tensor is the already-combined mHC residual
-            # streams.  Passing it as the first local layer's residual would
-            # incorrectly require stale post/comb state, so let PRE_BROADCAST
-            # consume the streams directly.
-            residual = None
+        residual = post_mix = res_mix = None
         for layer_idx in self.selected_layer_ids:
             local_idx = self.layer_indices.index(layer_idx)
             layer = self.layers[str(local_idx)]
@@ -1423,20 +1376,10 @@ class DeepseekV4Model(nn.Module):
                 res_mix=res_mix,
             )
         if not self.post_process:
-            if residual is None or post_mix is None or res_mix is None:
-                raise RuntimeError("pipeline stage did not produce complete mHC state")
-            adapter = MHCTileLangAdapter(MHCKernel.POST)
-            streams = mhc_post(
-                lambda *args: adapter(*args),
-                hidden_states,
-                residual,
-                post_mix,
-                res_mix,
-            )
             # Pipeline P2P is [S, B, hc_mult*H].  Packed DS4 uses B=1.
             return {
                 "hidden_states": fold_mhc_hidden_for_pipeline(
-                    streams.unsqueeze(1)
+                    hidden_states.unsqueeze(1)
                 )
             }
         if labels is None and len(self.selected_layer_ids) != len(self.layer_indices):
@@ -1451,15 +1394,6 @@ class DeepseekV4Model(nn.Module):
             }
         if self.norm is None or self.hc_head is None or self.lm_head is None:
             raise RuntimeError("final pipeline stage is missing the output head")
-        post_adapter = MHCTileLangAdapter(MHCKernel.POST)
-        hidden_states = mhc_post(
-            lambda *args: post_adapter(*args),
-            hidden_states,
-            residual,
-            post_mix,
-            res_mix,
-        )
-        _validate_finite("model.mhc_post", hidden_states=hidden_states)
         head_adapter = MHCTileLangAdapter(MHCKernel.HEAD)
         hidden_states = mhc_head(
             lambda *args: head_adapter(
