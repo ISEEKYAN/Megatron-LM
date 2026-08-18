@@ -32,6 +32,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
+from verl_mlite import qat_export
 from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
 
 try:
@@ -481,12 +482,7 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
         weights = self.runtime.export_weights(self.handle, **export_kwargs)
         if self.engine_config.qat.get("enable", False):
-            from verl.utils.modelopt import export_qat_weights
-
-            qat_config = SimpleNamespace(**self.engine_config.qat)
-            weights = export_qat_weights(
-                weights, [self.module], qat_config, bridge=None
-            )
+            weights = qat_export.export_qat_weights(weights, self.engine_config.qat)
         return weights, None
 
     def get_data_parallel_size(self):
@@ -930,10 +926,14 @@ class MegatronLiteEngine(BaseEngine):
     def _loss_mask_for_packing(
         micro_batch: TensorDict, input_ids: torch.Tensor
     ) -> torch.Tensor | None:
-        if "loss_mask" not in micro_batch.keys():
+        if "loss_mask" in micro_batch.keys():
+            mask_key = "loss_mask"
+        elif "response_mask" in micro_batch.keys():
+            mask_key = "response_mask"
+        else:
             return None
 
-        loss_mask = micro_batch["loss_mask"]
+        loss_mask = micro_batch[mask_key]
         input_lengths = input_ids.offsets().diff().tolist()
         if getattr(loss_mask, "is_nested", False):
             # VERL delivers ``response_mask`` / ``loss_mask`` as a *response-only*
@@ -1043,9 +1043,13 @@ class MegatronLiteEngine(BaseEngine):
             if output_lst is not None and not getattr(
                 loss_fn_ref(), "runtime_collects_outputs", False
             ):
+                detached_model_output = {
+                    k: (v.detach() if isinstance(v, torch.Tensor) else v)
+                    for k, v in model_output.items()
+                }
                 output_lst.append(
                     {
-                        "model_output": model_output,
+                        "model_output": detached_model_output,
                         "loss": float(loss.detach().item()),
                         "metrics": metrics,
                     }

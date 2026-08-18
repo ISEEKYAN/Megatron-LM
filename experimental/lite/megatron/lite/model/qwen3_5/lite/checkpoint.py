@@ -51,10 +51,6 @@ def PLACEMENT_FN(param_name: str) -> list:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
     if "down" in param_name and "shared" in param_name:
         return [Replicate(), Replicate(), Replicate(), Shard(1)]
-    if ".mlp.gate_up.linear.weight" in param_name:
-        return [Replicate(), Replicate(), Replicate(), Shard(0)]
-    if ".mlp.down.linear.weight" in param_name:
-        return [Replicate(), Replicate(), Replicate(), Shard(1)]
     if "embed" in param_name or "head" in param_name:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
     if "conv1d" in param_name:
@@ -284,15 +280,14 @@ class Qwen35WeightSpec:
 
     def weight_map(self) -> dict[str, list[str]]:
         c = self.config
-        text_prefix = c.hf_text_prefix
         weight_map: dict[str, list[str]] = {
-            "embed.embedding.weight": [f"{text_prefix}.embed_tokens.weight"],
-            "norm.weight": [f"{text_prefix}.norm.weight"],
+            "embed.embedding.weight": ["model.language_model.embed_tokens.weight"],
+            "norm.weight": ["model.language_model.norm.weight"],
             "head.col.linear.weight": ["lm_head.weight"],
         }
         for layer_idx in range(c.num_hidden_layers):
             local_prefix = f"layers.{layer_idx}"
-            hf_prefix = f"{text_prefix}.layers.{layer_idx}"
+            hf_prefix = f"model.language_model.layers.{layer_idx}"
             mlp = f"{hf_prefix}.mlp"
             if c.layer_type_at(layer_idx) == "full_attention":
                 attention = f"{hf_prefix}.self_attn"
@@ -343,49 +338,33 @@ class Qwen35WeightSpec:
                         ],
                     }
                 )
-            if c.is_moe:
-                weight_map.update(
-                    {
-                        f"{local_prefix}.mlp_norm.weight": [
-                            f"{hf_prefix}.post_attention_layernorm.weight"
-                        ],
-                        f"{local_prefix}.moe.router.gate.weight": [f"{mlp}.gate.weight"],
-                        f"{local_prefix}.moe.shared_expert.gate_up.linear.weight": [
-                            f"{mlp}.shared_expert.gate_proj.weight",
-                            f"{mlp}.shared_expert.up_proj.weight",
-                        ],
-                        f"{local_prefix}.moe.shared_expert.down.linear.weight": [
-                            f"{mlp}.shared_expert.down_proj.weight"
-                        ],
-                        f"{local_prefix}.moe.shared_expert.shared_gate.weight": [
-                            f"{mlp}.shared_expert_gate.weight"
-                        ],
-                    }
-                )
-                for expert_idx in range(c.num_experts):
-                    weight_map[f"{local_prefix}.moe.experts.fc1.weight{expert_idx}"] = [
-                        f"{mlp}.experts.{expert_idx}.gate_proj.weight",
-                        f"{mlp}.experts.{expert_idx}.up_proj.weight",
-                    ]
-                for expert_idx in range(c.num_experts):
-                    weight_map[f"{local_prefix}.moe.experts.fc2.weight{expert_idx}"] = [
-                        f"{mlp}.experts.{expert_idx}.down_proj.weight"
-                    ]
-            else:
-                weight_map.update(
-                    {
-                        f"{local_prefix}.mlp.gate_up.linear.layer_norm_weight": [
-                            f"{hf_prefix}.post_attention_layernorm.weight"
-                        ],
-                        f"{local_prefix}.mlp.gate_up.linear.weight": [
-                            f"{mlp}.gate_proj.weight",
-                            f"{mlp}.up_proj.weight",
-                        ],
-                        f"{local_prefix}.mlp.down.linear.weight": [
-                            f"{mlp}.down_proj.weight"
-                        ],
-                    }
-                )
+            weight_map.update(
+                {
+                    f"{local_prefix}.mlp_norm.weight": [
+                        f"{hf_prefix}.post_attention_layernorm.weight"
+                    ],
+                    f"{local_prefix}.moe.router.gate.weight": [f"{mlp}.gate.weight"],
+                    f"{local_prefix}.moe.shared_expert.gate_up.linear.weight": [
+                        f"{mlp}.shared_expert.gate_proj.weight",
+                        f"{mlp}.shared_expert.up_proj.weight",
+                    ],
+                    f"{local_prefix}.moe.shared_expert.down.linear.weight": [
+                        f"{mlp}.shared_expert.down_proj.weight"
+                    ],
+                    f"{local_prefix}.moe.shared_expert.shared_gate.weight": [
+                        f"{mlp}.shared_expert_gate.weight"
+                    ],
+                }
+            )
+            for expert_idx in range(c.num_experts):
+                weight_map[f"{local_prefix}.moe.experts.fc1.weight{expert_idx}"] = [
+                    f"{mlp}.experts.{expert_idx}.gate_proj.weight",
+                    f"{mlp}.experts.{expert_idx}.up_proj.weight",
+                ]
+            for expert_idx in range(c.num_experts):
+                weight_map[f"{local_prefix}.moe.experts.fc2.weight{expert_idx}"] = [
+                    f"{mlp}.experts.{expert_idx}.down_proj.weight"
+                ]
         return weight_map
 
     def hf_to_native(
@@ -471,12 +450,7 @@ class Qwen35WeightSpec:
             if _linear_attn_head_replication(self.config, ps.tp_size):
                 return shards[0]
             return torch.cat(shards, dim=0).contiguous()
-        if native_name.endswith(
-            (
-                ".mlp.gate_up.linear.weight",
-                ".moe.shared_expert.gate_up.linear.weight",
-            )
-        ):
+        if native_name.endswith(".moe.shared_expert.gate_up.linear.weight"):
             return _merge_gate_up_tp_shards(_allgather_tp_shards(tensor, ps))
         return None
 
@@ -491,12 +465,7 @@ class Qwen35WeightSpec:
             if _linear_attn_head_replication(self.config, len(shards)):
                 return shards[0]
             return torch.cat(shards, dim=0).contiguous()
-        if native_name.endswith(
-            (
-                ".mlp.gate_up.linear.weight",
-                ".moe.shared_expert.gate_up.linear.weight",
-            )
-        ):
+        if native_name.endswith(".moe.shared_expert.gate_up.linear.weight"):
             return _merge_gate_up_tp_shards(shards)
         return None
 
@@ -515,9 +484,9 @@ class Qwen35WeightSpec:
             return self._native_to_vllm(native_name, tensor)
 
         if native_name == "embed.embedding.weight":
-            return [(f"{self.config.hf_text_prefix}.embed_tokens.weight", tensor)]
+            return [("model.language_model.embed_tokens.weight", tensor)]
         if native_name == "norm.weight":
-            return [(f"{self.config.hf_text_prefix}.norm.weight", tensor)]
+            return [("model.language_model.norm.weight", tensor)]
         if native_name == "head.col.linear.weight":
             return [("lm_head.weight", tensor)]
         if native_name == "mtp_embed.embedding.weight" or native_name.startswith(
@@ -531,7 +500,7 @@ class Qwen35WeightSpec:
 
         layer_idx = int(match.group(1))
         suffix = match.group(2)
-        prefix = f"{self.config.hf_text_prefix}.layers.{layer_idx}"
+        prefix = f"model.language_model.layers.{layer_idx}"
 
         if suffix == "full_attn.qkv.linear.layer_norm_weight":
             return [(f"{prefix}.input_layernorm.weight", tensor)]
@@ -575,16 +544,6 @@ class Qwen35WeightSpec:
 
         if suffix == "mlp_norm.weight":
             return [(f"{prefix}.post_attention_layernorm.weight", tensor)]
-        if suffix == "mlp.gate_up.linear.layer_norm_weight":
-            return [(f"{prefix}.post_attention_layernorm.weight", tensor)]
-        if suffix == "mlp.gate_up.linear.weight":
-            gate, up = tensor.chunk(2, dim=0)
-            return [
-                (f"{prefix}.mlp.gate_proj.weight", gate.contiguous()),
-                (f"{prefix}.mlp.up_proj.weight", up.contiguous()),
-            ]
-        if suffix == "mlp.down.linear.weight":
-            return [(f"{prefix}.mlp.down_proj.weight", tensor)]
         if suffix == "moe.router.gate.weight":
             return [(f"{prefix}.mlp.gate.weight", tensor)]
         if suffix == "moe.shared_expert.gate_up.linear.weight":
@@ -687,16 +646,6 @@ class Qwen35WeightSpec:
 
         if suffix == "mlp_norm.weight":
             return [(f"{prefix}.post_attention_layernorm.weight", tensor)]
-        if suffix == "mlp.gate_up.linear.layer_norm_weight":
-            return [(f"{prefix}.post_attention_layernorm.weight", tensor)]
-        if suffix == "mlp.gate_up.linear.weight":
-            gate, up = tensor.chunk(2, dim=0)
-            return [
-                (f"{prefix}.mlp.gate_proj.weight", gate.contiguous()),
-                (f"{prefix}.mlp.up_proj.weight", up.contiguous()),
-            ]
-        if suffix == "mlp.down.linear.weight":
-            return [(f"{prefix}.mlp.down_proj.weight", tensor)]
         if suffix == "moe.router.gate.weight":
             return [(f"{prefix}.mlp.gate.weight", tensor)]
         if suffix == "moe.shared_expert.gate_up.linear.weight":
@@ -755,10 +704,6 @@ class Qwen35WeightSpec:
         if native_name.endswith(".linear_attn.in_proj.linear.weight"):
             return (0, 0)
         if native_name.endswith(".linear_attn.o_proj.linear.weight"):
-            return (1, 0)
-        if native_name.endswith(".mlp.gate_up.linear.weight"):
-            return (0, 0)
-        if native_name.endswith(".mlp.down.linear.weight"):
             return (1, 0)
         if native_name.endswith(".moe.shared_expert.gate_up.linear.weight"):
             return (0, 0)

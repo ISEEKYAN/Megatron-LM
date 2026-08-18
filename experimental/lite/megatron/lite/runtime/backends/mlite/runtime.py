@@ -52,6 +52,12 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     return proto.ImplConfig(**impl_cfg_kwargs)
 
 
+def _reset_parameters(module: torch.nn.Module) -> None:
+    reset = getattr(module, "reset_parameters", None)
+    if callable(reset):
+        reset()
+
+
 def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
     if backend is None:
         return
@@ -241,6 +247,14 @@ class MegatronLiteRuntime(RuntimeBase):
         log_stage("protocol_build_model_begin")
         bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
         log_stage("protocol_build_model_done")
+        meta_initialized = any(
+            param.is_meta for chunk in bundle.chunks for param in chunk.parameters()
+        )
+        if meta_initialized:
+            bundle.optimizer = bundle.extras.pop("post_model_load_hook")()["optimizer"]
+            if not rt_cfg.load_hf_weights:
+                for chunk in bundle.chunks:
+                    chunk.apply(_reset_parameters)
 
         # ── load HF weights (optional) ──
         loaded_hf_weights = False
@@ -269,7 +283,7 @@ class MegatronLiteRuntime(RuntimeBase):
                     bundle.extras.update(extra_updates)
             log_stage("post_load_hook_done")
 
-        if loaded_hf_weights and bundle.optimizer is not None:
+        if (loaded_hf_weights or meta_initialized) and bundle.optimizer is not None:
             reload_model_params = getattr(bundle.optimizer, "reload_model_params", None)
             if callable(reload_model_params):
                 log_stage("reload_model_params_begin")

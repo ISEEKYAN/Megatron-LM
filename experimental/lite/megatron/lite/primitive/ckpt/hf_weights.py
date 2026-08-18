@@ -31,6 +31,7 @@ try:
     from torch.distributed.tensor import DTensor
 except Exception:  # pragma: no cover - older torch without DTensor
     DTensor = None  # type: ignore[assignment]
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from megatron.lite.primitive.ckpt.weight_sync_probe import (  # isort: skip
     get_weight_sync_probe,
@@ -39,6 +40,15 @@ from megatron.lite.primitive.ckpt.weight_sync_probe import (  # isort: skip
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return tensor.numel() * tensor.element_size()
+
+
+def _local_source(target, source):
+    if DTensor is not None and isinstance(target, DTensor):
+        shape, offset = compute_local_shape_and_global_offset(
+            target.shape, target.device_mesh, target.placements
+        )
+        return source[tuple(slice(start, start + size) for start, size in zip(offset, shape))]
+    return source
 
 
 def _to_cpu(tensor: torch.Tensor) -> torch.Tensor:
@@ -1122,8 +1132,8 @@ def load_hf_weights(
                             tensor, ps.etp_rank, ps.etp_size, dim=split_d
                         )
 
-            converted = tensor.to(device=target.device, dtype=target.dtype)
-            target.data.copy_(converted)
+            converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
+            (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
             if replica_ranks is not None:
                 assert source_global_rank is not None
                 dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1133,6 +1143,8 @@ def load_hf_weights(
     for name, _param in base_model.named_parameters():
         if name in loaded_names or "lora" in name.lower() or "adapter" in name.lower():
             continue
+        elif getattr(base_model, "_mlite_meta_init", False):
+            raise RuntimeError(f"Deferred parameter {name!r} was not filled by the checkpoint")
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
     missing_expected_buffers = required_buffers.keys() - loaded_names
@@ -1219,8 +1231,8 @@ def _load_expert_weight(
             else:
                 tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
-    converted = tensor.to(device=target.device, dtype=target.dtype)
-    target.data.copy_(converted)
+    converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
+    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
     if replica_ranks is not None:
         assert source_global_rank is not None
         dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1299,12 +1311,13 @@ def _read_hf_tensors(
             if callable(raw_source_hook)
             else False
         )
+        read_device = "cpu" if isinstance(target, DTensor) else target.device
         if read_raw:
-            tensor = reader.get_raw_tensor(resolved, device=target.device)
+            tensor = reader.get_raw_tensor(resolved, device=read_device)
         else:
             tensor = reader.get_tensor(
                 resolved,
-                device=target.device,
+                device=read_device,
                 target_shape=target_shape,
                 target_dtype=target.dtype,
             )

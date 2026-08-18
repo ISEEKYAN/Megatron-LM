@@ -94,12 +94,16 @@ def test_verl_loss_hook_has_no_strong_self_reference():
     assert all(cell.cell_contents is not hook for cell in (hook.__closure__ or ()))
 
 
-def test_verl_loss_hook_honors_runtime_output_collector():
+def test_verl_loss_hook_honors_runtime_output_collector(monkeypatch):
     engine = _engine(engine_config=_engine_config())
     outputs = []
     engine._build_verl_model_output = lambda **_kwargs: {"log_probs": torch.tensor(1.0)}
     hook = engine._make_runtime_loss_fn(None, num_microbatches=1, output_lst=outputs)
 
+    # This is a CPU contract test for the collector branch.  The production
+    # training hook runs on the runtime-selected accelerator; pin that lookup
+    # to CPU here so an empty loss does not turn this test into a CUDA probe.
+    monkeypatch.setattr("verl_mlite.engine.mlite_engine.get_device_id", lambda: "cpu")
     hook.runtime_collects_outputs = True
     hook({}, object(), LossContext(source_batch=object()))
 
@@ -257,7 +261,7 @@ def test_qwen3_moe_online_weight_export_does_not_pass_unsupported_target() -> No
     assert "target" not in captured["kwargs"]
 
 
-def test_online_qat_export_wraps_mlite_hf_weight_stream(monkeypatch) -> None:
+def test_online_qat_export_uses_mlite_owned_exporter(monkeypatch) -> None:
     engine = _engine(
         engine_config=_engine_config(
             qat={
@@ -279,21 +283,13 @@ def test_online_qat_export_wraps_mlite_hf_weight_stream(monkeypatch) -> None:
         def export_weights(handle, **kwargs):
             return source_weights
 
-    def fake_export(weights, modules, qat_config, bridge):
-        captured.update(
-            weights=weights,
-            modules=modules,
-            qat_config=qat_config,
-            bridge=bridge,
-        )
+    def fake_export(weights, qat_config):
+        captured.update(weights=weights, qat_config=qat_config)
         return iter([("packed.weight", torch.ones(2, 16, dtype=torch.uint8))])
 
-    fake_modelopt = types.ModuleType("verl.utils.modelopt")
-    fake_modelopt.export_qat_weights = fake_export
-    monkeypatch.setitem(sys.modules, "verl.utils.modelopt", fake_modelopt)
+    monkeypatch.setattr("verl_mlite.qat_export.export_qat_weights", fake_export)
     engine.runtime = Runtime()
     engine.handle = object()
-    engine.module = object()
     engine._initial_sync_cache_cleared = True
 
     weights, metadata = engine.get_per_tensor_param()
@@ -301,11 +297,7 @@ def test_online_qat_export_wraps_mlite_hf_weight_stream(monkeypatch) -> None:
     assert [name for name, _ in weights] == ["packed.weight"]
     assert metadata is None
     assert captured["weights"] is source_weights
-    assert captured["modules"] == [engine.module]
-    assert captured["bridge"] is None
-    assert captured["qat_config"].mode == "mxfp4"
-    assert captured["qat_config"].group_size == 32
-    assert captured["qat_config"].apply_modelopt_fake_quant is False
+    assert captured["qat_config"] == engine.engine_config.qat
 
 
 def test_qat_export_rejects_native_resync_format_double_quantization() -> None:
