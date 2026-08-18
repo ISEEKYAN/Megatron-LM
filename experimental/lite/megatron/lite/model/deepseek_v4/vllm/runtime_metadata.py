@@ -1388,7 +1388,14 @@ class DS4SparseIndexerCompressorMetadataAdapter:
                 k_cache_prefix=f"mlite.layers.{self.layer_idx}.indexer.k_cache",
                 topk_indices=topk,
                 max_model_len=self.config.max_position_embeddings // 4,
-                max_total_seq_len=max(count // 4 for count in token_counts),
+                # SparseAttnIndexer uses this value to allocate the gathered-K
+                # workspace for the whole prefill chunk, not one request.  The
+                # official vLLM module supplies a scheduler-wide total-token
+                # upper bound; this caller-owned runtime can use the exact
+                # packed-microbatch total instead.
+                max_total_seq_len=sum(
+                    count // self.compress_ratio for count in token_counts
+                ),
             )
 
         compressed_lens = [count // self.compress_ratio for count in token_counts]

@@ -303,6 +303,9 @@ def test_layer2_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> Non
     assert indexer.k_slot_mapping.tolist() == main.k_slot_mapping.tolist()
     assert metadata.indexer_metadata.attention_metadata.seq_lens.tolist() == [5, 9]
     assert metadata.indexer_metadata.attention_metadata.max_seq_len == 9
+    # The official SparseAttnIndexer workspace covers every compressed K row
+    # in the packed chunk: floor(5 / 4) + floor(9 / 4), not max(1, 2).
+    assert metadata.indexer_metadata.max_total_seq_len == 3
     assert metadata.kv_workspace.shape == (22, 1, 512)
 
 
