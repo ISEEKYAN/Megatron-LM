@@ -61,7 +61,10 @@ class MoELayer(nn.Module):
             config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute, lora_config=lora_config
         )
         self.dispatcher = TokenDispatcher(
-            config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
+            config.num_experts,
+            config.hidden_size,
+            ps,
+            moe_token_dispatcher_type="deepep" if use_deepep else "alltoall",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

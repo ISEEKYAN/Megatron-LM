@@ -1031,7 +1031,7 @@ class DeepseekV4Layer(nn.Module):
         *,
         selected_layer_ids: frozenset[int] = frozenset(),
         selected_module_names: frozenset[str] = frozenset(),
-        use_deepep: bool = False,
+        moe_token_dispatcher_type: str = "deepep",
         indexer_loss_coeff: float = 0.0,
         attention_adapters: AttentionAdapters | None = None,
     ):
@@ -1055,7 +1055,7 @@ class DeepseekV4Layer(nn.Module):
             ps,
             layer_idx=layer_idx,
             selected_stages=self.selected_stages,
-            use_deepep=use_deepep,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
         )
         self.attn_hc = _HyperConnectionState(config.hidden_size, config.hc_mult)
         self.ffn_hc = _HyperConnectionState(config.hidden_size, config.hc_mult)
@@ -1214,7 +1214,7 @@ class DeepseekV4Model(nn.Module):
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
-        use_deepep: bool = False,
+        moe_token_dispatcher_type: str = "deepep",
         indexer_loss_coeff: float = 0.0,
         selected_layer_ids: tuple[int, ...] = (),
         selected_module_names: tuple[str, ...] = (),
@@ -1267,7 +1267,7 @@ class DeepseekV4Model(nn.Module):
                     layer_idx=layer_idx,
                     selected_layer_ids=selected_ids,
                     selected_module_names=selected_names,
-                    use_deepep=use_deepep,
+                    moe_token_dispatcher_type=moe_token_dispatcher_type,
                     indexer_loss_coeff=indexer_loss_coeff,
                     attention_adapters=attention_adapters,
                 )

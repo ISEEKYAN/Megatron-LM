@@ -313,7 +313,7 @@ class MoELayer(nn.Module):
             config.num_experts,
             config.hidden_size,
             ps,
-            use_deepep=use_deepep,
+            moe_token_dispatcher_type="deepep" if use_deepep else "alltoall",
         )
         self.shared_expert = SharedExpert(config, ps)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import pytest
+from types import SimpleNamespace
+
 import torch
 
 from megatron.lite.primitive.alignment.vllm_batched_prepare import (
@@ -24,33 +25,49 @@ def test_compact_output_accepts_token_major_expert_layout() -> None:
     )
 
 
-@pytest.mark.gpus(1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_batched_quantization_uses_2d_cuda_kernel_per_expert() -> None:
-    torch.manual_seed(43)
-    source = torch.randn(
-        2,
-        5,
-        128,
-        device="cuda",
-        dtype=torch.bfloat16,
+def test_batched_quantization_uses_exact_vllm_ll_entrypoint(
+    monkeypatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe import utils
+
+    source = torch.randn(2, 5, 128, dtype=torch.bfloat16)
+    expected_quantized = torch.empty(
+        10, 128, dtype=torch.float8_e4m3fn
+    )
+    expected_scales = torch.ones(2, 5, 1)
+    calls = []
+
+    def quantize(*args):
+        calls.append(args)
+        return expected_quantized, expected_scales
+
+    monkeypatch.setattr(utils, "moe_kernel_quantize_input", quantize)
+    monkeypatch.setattr(
+        utils,
+        "normalize_batched_scales_shape",
+        lambda scales, experts: scales,
+    )
+    config = SimpleNamespace(
+        a1_scale=None,
+        quant_dtype=torch.float8_e4m3fn,
+        per_act_token_quant=True,
+        block_shape=[128, 128],
     )
     quantized, scales = _quantize_batched_input(
         source,
-        torch.float8_e4m3fn,
-        [128, 128],
-        torch.tensor([5, 5], device=source.device, dtype=torch.int64),
+        config,
+        torch.tensor([5, 5], dtype=torch.int64),
     )
 
     assert quantized.shape == source.shape
-    assert quantized.dtype == torch.float8_e4m3fn
-    assert scales.shape == (2, 5, 1)
-    assert scales.dtype == torch.float32
-    assert scales.stride() == (5, 1, 5)
-    reconstructed = quantized.float() * scales
-    torch.testing.assert_close(
-        reconstructed,
-        source.float(),
-        rtol=0.15,
-        atol=0.15,
+    assert quantized.data_ptr() == expected_quantized.data_ptr()
+    assert scales is expected_scales
+    assert len(calls) == 1
+    assert calls[0][0].shape == (10, 128)
+    assert calls[0][0].data_ptr() == source.data_ptr()
+    assert calls[0][1:] == (
+        None,
+        torch.float8_e4m3fn,
+        True,
+        [128, 128],
     )

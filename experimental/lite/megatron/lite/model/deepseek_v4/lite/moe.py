@@ -54,7 +54,7 @@ class DeepseekV4MoE(nn.Module):
             config.n_routed_experts,
             config.hidden_size,
             ps,
-            use_deepep=use_deepep,
+            moe_token_dispatcher_type="deepep" if use_deepep else "alltoall",
         )
 
     def _hash_route(

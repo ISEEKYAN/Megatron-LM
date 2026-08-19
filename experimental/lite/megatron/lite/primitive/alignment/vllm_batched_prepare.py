@@ -14,55 +14,44 @@ import torch
 
 def _quantize_batched_input(
     batched,
-    quant_dtype,
-    block_shape,
+    quant_config,
     tokens_per_expert,
 ):
     """Use vLLM's official FP8 quantizer with the LL scale layout."""
-    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-        per_token_group_quant_fp8,
+    from vllm.model_executor.layers.fused_moe.utils import (
+        moe_kernel_quantize_input,
+        normalize_batched_scales_shape,
     )
 
-    if block_shape != [128, 128]:
+    if quant_config.block_shape != [128, 128]:
         raise ValueError("vLLM LL-compatible quantization requires 128-wide groups")
-    if quant_dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-        raise TypeError(f"unsupported vLLM LL activation dtype: {quant_dtype}")
+    if quant_config.quant_dtype not in (
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ):
+        raise TypeError(
+            "unsupported vLLM LL activation dtype: "
+            f"{quant_config.quant_dtype}"
+        )
     if batched.ndim != 3:
         raise ValueError("vLLM batched expert input must be rank-3")
     if tokens_per_expert.ndim != 1 or tokens_per_expert.shape[0] != batched.shape[0]:
         raise ValueError("tokens_per_expert must describe every local expert")
 
-    # The libtorch-stable CUDA op currently requires output_s.dim() == 2,
-    # although the Python API advertises ndim >= 2 and allocates rank-3 scales
-    # for batched experts. Quantize each expert as an official 2D call, then
-    # copy its column-major scales into the expected batched TMA layout.
-    experts, capacity, hidden = batched.shape
-    groups = hidden // 128
-    quantized = torch.empty_like(batched, dtype=quant_dtype)
-    # BatchedDeepGemmExperts consumes the compact batched scale contract from
-    # ``scales_shape_stride_dtype``: (E, T, G) with strides (T*G, 1, T).
-    # The official 2-D quantizer may use a larger TMA-aligned leading dimension
-    # for its per-expert temporary when T is small.  That padding is private to
-    # the temporary and must not become the expert stride of the batched tensor;
-    # DeepGEMM's masked grouped kernel requires adjacent expert scale blocks.
-    scales = torch.empty_strided(
-        (experts, capacity, groups),
-        (capacity * groups, 1, capacity),
-        device=batched.device,
-        dtype=torch.float32,
+    # Keep this call identical to DeepEPLLPrepareAndFinalize._do_quant. In
+    # particular, the active DeepGEMM oracle decides FLOAT32 versus packed
+    # UE8M0 scales; a transport adapter must not choose a second scale format.
+    experts, _, hidden = batched.shape
+    flat = batched.view(-1, hidden)
+    quantized, scales = moe_kernel_quantize_input(
+        flat,
+        quant_config.a1_scale,
+        quant_config.quant_dtype,
+        quant_config.per_act_token_quant,
+        quant_config.block_shape,
     )
-    for expert in range(experts):
-        _, expert_scales = per_token_group_quant_fp8(
-            batched[expert],
-            128,
-            eps=1e-10,
-            dtype=quant_dtype,
-            column_major_scales=True,
-            tma_aligned_scales=True,
-            out_q=quantized[expert],
-            use_ue8m0=False,
-        )
-        scales[expert].copy_(expert_scales)
+    quantized = quantized.view_as(batched)
+    scales = normalize_batched_scales_shape(scales, experts)
     return quantized, scales
 
 
@@ -202,8 +191,7 @@ class NormalDeepEPAlignedPrepareAndFinalize:
                     device_tokens_per_expert = tokens_per_expert
                 quantized, scales = _quantize_batched_input(
                     batched,
-                    quant_config.quant_dtype,
-                    quant_config.block_shape,
+                    quant_config,
                     device_tokens_per_expert,
                 )
                 self._counts = counts

@@ -913,8 +913,11 @@ class GroupedMoEKernelBuilderAdapter:
         intermediate_size: int,
         max_tokens_per_rank: int,
         num_dispatchers: int,
+        max_tokens_per_dispatcher_expert: int | None = None,
         use_fp8_dispatch: bool = True,
     ) -> None:
+        if max_tokens_per_dispatcher_expert is None:
+            max_tokens_per_dispatcher_expert = max_tokens_per_rank
         positive = {
             "num_experts": num_experts,
             "num_local_experts": num_local_experts,
@@ -922,6 +925,9 @@ class GroupedMoEKernelBuilderAdapter:
             "hidden_dim": hidden_dim,
             "intermediate_size": intermediate_size,
             "max_tokens_per_rank": max_tokens_per_rank,
+            "max_tokens_per_dispatcher_expert": (
+                max_tokens_per_dispatcher_expert
+            ),
             "num_dispatchers": num_dispatchers,
         }
         invalid = [name for name, value in positive.items() if value <= 0]
@@ -935,6 +941,9 @@ class GroupedMoEKernelBuilderAdapter:
         self.hidden_dim = hidden_dim
         self.intermediate_size = intermediate_size
         self.max_tokens_per_rank = max_tokens_per_rank
+        self.max_tokens_per_dispatcher_expert = (
+            max_tokens_per_dispatcher_expert
+        )
         self.num_dispatchers = num_dispatchers
         self.use_fp8_dispatch = use_fp8_dispatch
 
@@ -998,7 +1007,7 @@ class GroupedMoEKernelBuilderAdapter:
         )(
             moe_config=moe_config,
             quant_config=quant,
-            max_num_tokens=self.max_tokens_per_rank,
+            max_num_tokens=self.max_tokens_per_dispatcher_expert,
             num_dispatchers=self.num_dispatchers,
         )
 

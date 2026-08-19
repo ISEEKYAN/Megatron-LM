@@ -312,6 +312,12 @@ def test_extended_builder_rejects_layers_outside_nonzero_model_range(layer_idx) 
 
 
 def test_layer2_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> None:
+    def combine(*_args, out, **_kwargs):
+        indices, lengths = out
+        indices.fill_(-1)
+        lengths.zero_()
+        return indices, lengths
+
     def symbol(_module, name):
         if name == "DeepseekV32IndexerMetadata":
             return lambda **kwargs: SimpleNamespace(**kwargs)
@@ -319,6 +325,10 @@ def test_layer2_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> Non
             return lambda chunks: SimpleNamespace(chunks=chunks)
         if name == "build_prefill_chunk_metadata":
             return lambda *_args: None
+        if name == "dequantize_and_gather_k_cache":
+            return lambda *_args, **_kwargs: None
+        if name == "combine_topk_swa_indices":
+            return combine
         raise AssertionError(name)
 
     monkeypatch.setattr(runtime, "_symbol", symbol)
@@ -344,6 +354,21 @@ def test_layer2_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> Non
     # in the packed chunk: floor(5 / 4) + floor(9 / 4), not max(1, 2).
     assert metadata.indexer_metadata.max_total_seq_len == 3
     assert metadata.kv_workspace.shape == (22, 1, 512)
+    metadata.prepare_flash()
+    finalized_indices = metadata.indices
+    finalized_lengths = metadata.topk_length
+    assert finalized_indices.ndim == 3
+
+    # Activation recompute reruns the indexer against the same metadata object.
+    metadata.indices = torch.zeros(
+        finalized_indices.shape[0],
+        512,
+        dtype=torch.int32,
+    )
+    metadata.topk_length = torch.full_like(finalized_lengths, -1)
+    metadata.prepare_flash()
+    assert torch.equal(metadata.indices, finalized_indices)
+    assert torch.equal(metadata.topk_length, finalized_lengths)
 
 
 def test_layer3_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> None:

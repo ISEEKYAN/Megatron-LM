@@ -306,12 +306,29 @@ def test_parallel_contract_fails_closed(parallel: ParallelConfig) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "dispatcher_type", ["alltoall", "deepep", "hybridep"]
+)
+def test_impl_config_accepts_explicit_dispatchers(
+    dispatcher_type: str,
+) -> None:
+    config = protocol.ImplConfig(
+        moe_token_dispatcher_type=dispatcher_type
+    )
+    assert config.moe_token_dispatcher_type == dispatcher_type
+
+
+def test_impl_config_rejects_unknown_dispatcher() -> None:
+    with pytest.raises(ValueError, match="alltoall.*deepep.*hybridep"):
+        protocol.ImplConfig(moe_token_dispatcher_type="flex")
+
+
 def test_parallel_contract_accepts_cp_with_required_ep_deepep() -> None:
     protocol._validate_contract(
         _tiny_config(),
         protocol.ImplConfig(
             parallel=ParallelConfig(cp=2, ep=2),
-            use_deepep=True,
+            moe_token_dispatcher_type="deepep",
         ),
     )
 
@@ -321,7 +338,7 @@ def test_parallel_contract_accepts_pp2_cp2_ep4() -> None:
         _tiny_config(),
         protocol.ImplConfig(
             parallel=ParallelConfig(pp=2, cp=2, ep=4),
-            use_deepep=True,
+            moe_token_dispatcher_type="deepep",
             recompute=("full",),
         ),
     )
@@ -388,7 +405,7 @@ def test_build_contract_preserves_release_master_dtypes(monkeypatch) -> None:
     )
     impl = protocol.ImplConfig(
         parallel=ParallelConfig(ep=2),
-        use_deepep=True,
+        moe_token_dispatcher_type="deepep",
         selector=protocol.SelectorConfig((0,), ("attn", "moe")),
     )
     bundle = protocol.build_model(_tiny_config(), impl_cfg=impl)
@@ -424,7 +441,7 @@ def test_build_contract_can_construct_training_optimizer(monkeypatch) -> None:
     )
     impl = protocol.ImplConfig(
         parallel=ParallelConfig(ep=2),
-        use_deepep=True,
+        moe_token_dispatcher_type="deepep",
         optimizer="adamw",
         optimizer_config=protocol.OptimizerConfig(lr=2e-4, weight_decay=0.1),
         selector=protocol.SelectorConfig((0,), ("attn", "moe")),
@@ -457,7 +474,7 @@ def test_build_contract_defers_fsdp2_until_after_weight_load(monkeypatch) -> Non
     optimizer_config = protocol.OptimizerConfig(lr=2e-4, offload_fraction=1.0)
     impl = protocol.ImplConfig(
         parallel=ParallelConfig(ep=2),
-        use_deepep=True,
+        moe_token_dispatcher_type="deepep",
         optimizer="fsdp2",
         optimizer_config=optimizer_config,
         attention_backend_override="flash",
@@ -515,7 +532,7 @@ def test_verl_packed_batch_builds_per_layer_runtime_metadata(monkeypatch) -> Non
     )
     impl = protocol.ImplConfig(
         parallel=ParallelConfig(ep=2),
-        use_deepep=True,
+        moe_token_dispatcher_type="deepep",
         hf_path="/proxy",
         selector=protocol.SelectorConfig((0,), ("attn", "moe")),
     )
@@ -570,7 +587,7 @@ def test_forward_step_reuses_caller_owned_runtime_assets(monkeypatch) -> None:
     )
     impl = protocol.ImplConfig(
         parallel=ParallelConfig(ep=2),
-        use_deepep=True,
+        moe_token_dispatcher_type="deepep",
         hf_path="/proxy",
         selector=protocol.SelectorConfig((0,), ("attn", "moe")),
     )
@@ -927,7 +944,7 @@ def test_full_layer_selector_accepts_supported_ratios_and_rejects_unknown() -> N
     cfg = _tiny_4l_config()
     impl = protocol.ImplConfig(
         parallel=ParallelConfig(ep=2),
-        use_deepep=True,
+        moe_token_dispatcher_type="deepep",
         selector=protocol.SelectorConfig((0, 1, 2, 3), ("attn", "moe")),
     )
     protocol._validate_contract(cfg, impl)
@@ -952,7 +969,7 @@ def test_layer0_audit_rejects_missing_stage() -> None:
             _tiny_config(),
             protocol.ImplConfig(
                 parallel=ParallelConfig(ep=2),
-                use_deepep=True,
+                moe_token_dispatcher_type="deepep",
                 selector=protocol.SelectorConfig((0,), ("linear",)),
             ),
         )
@@ -965,7 +982,7 @@ def test_hash_moe_calls_gate_route_and_training_dispatcher() -> None:
     model = DeepseekV4Model(
         cfg,
         ps=ps,
-        use_deepep=True,
+        moe_token_dispatcher_type="deepep",
         selected_layer_ids=(0,),
         selected_module_names=("router_moe", "deepep"),
     )
@@ -1029,7 +1046,7 @@ def test_learned_moe_uses_fp32_logits_and_bias_without_token_ids() -> None:
     moe = DeepseekV4Model(
         cfg,
         ps=ParallelState(ep_size=1, ep_rank=0),
-        use_deepep=True,
+        moe_token_dispatcher_type="deepep",
         selected_layer_ids=(0, 1),
         selected_module_names=("router_moe", "deepep"),
     ).layers["1"].mlp

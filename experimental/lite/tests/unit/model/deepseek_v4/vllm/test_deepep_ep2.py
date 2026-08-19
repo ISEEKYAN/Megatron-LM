@@ -134,7 +134,7 @@ def test_torchrun_ep2_rl_shape_normal_dispatch_is_memory_safe() -> None:
         experts,
         hidden,
         parallel_state,
-        use_deepep=True,
+        moe_token_dispatcher_type="deepep",
         deepep_align_to_low_latency=True,
     )
     hidden_states = torch.randn(
@@ -200,7 +200,7 @@ def test_torchrun_dp4_ep2_four_layer_dispatch_is_memory_safe() -> None:
             experts,
             hidden,
             parallel_state,
-            use_deepep=True,
+            moe_token_dispatcher_type="deepep",
             deepep_align_to_low_latency=True,
         )
         for _ in range(4)

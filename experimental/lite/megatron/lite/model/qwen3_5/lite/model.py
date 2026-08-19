@@ -182,7 +182,7 @@ class MoELayer(nn.Module):
             config.num_experts,
             config.hidden_size,
             ps,
-            use_deepep=use_deepep,
+            moe_token_dispatcher_type="deepep" if use_deepep else "alltoall",
             moe_permute_fusion=moe_permute_fusion,
         )
         self.shared_expert = SharedExpert(config, ps, use_plain_te_linear=shared_expert_plain_te)

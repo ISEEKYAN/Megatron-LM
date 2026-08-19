@@ -169,13 +169,12 @@ class DeepseekV4MoE(nn.Module):
         *,
         layer_idx: int,
         selected_stages: frozenset[str] = frozenset(),
-        use_deepep: bool = False,
+        moe_token_dispatcher_type: str = "deepep",
     ):
         super().__init__()
         self.config = config
         self.ps = ps or ParallelState()
         self.selected_stages = selected_stages
-        self.use_deepep = use_deepep
         self.is_hash_layer = layer_idx < config.num_hash_layers
         self.gate = _RouterState(config, hash_layer=self.is_hash_layer)
         self.experts = _LocalExpertsState(config, self.ps)
@@ -183,8 +182,8 @@ class DeepseekV4MoE(nn.Module):
             config.n_routed_experts,
             config.hidden_size,
             self.ps,
-            use_deepep=use_deepep,
             deepep_align_to_low_latency=True,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
         )
         self.shared_experts = (
             _SharedExpertsState(config) if config.n_shared_experts > 0 else None
@@ -192,6 +191,39 @@ class DeepseekV4MoE(nn.Module):
         self.gate_adapter = GateLinearAdapter()
         self.hash_route_adapter = HashRouteAdapter()
         self.learned_route_adapter = DS4TopKAdapter()
+
+    def forward_with_fixed_routes(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the production training MoE body with caller-owned routes."""
+
+        if hidden_states.ndim != 2:
+            raise ValueError("MoE requires flat [tokens, hidden]")
+        if topk_weights.shape != topk_ids.shape:
+            raise ValueError("fixed-route weights and IDs must have identical shapes")
+        if topk_ids.ndim != 2 or topk_ids.shape[0] != hidden_states.shape[0]:
+            raise ValueError("fixed routes must describe every input token")
+        if topk_ids.shape[1] != self.config.num_experts_per_tok:
+            raise ValueError("fixed routes use the wrong top-k width")
+
+        dispatched, tokens_per_expert, permuted_probs = self.dispatcher.dispatch(
+            hidden_states,
+            _kernel_topk_weights(topk_weights),
+            topk_ids.to(dtype=torch.int64),
+        )
+        self.dispatcher.wait_dispatch_event()
+        output = self.experts(
+            dispatched,
+            tokens_per_expert,
+            permuted_probs,
+            tokens_per_expert_list=getattr(
+                self.dispatcher, "_local_tpe_list", None
+            ),
+        )
+        return self.dispatcher.combine(output)
 
     def _replay_route(
         self,
@@ -281,25 +313,11 @@ class DeepseekV4MoE(nn.Module):
 
         if "deepep" not in self.selected_stages:
             raise NotImplementedError("stage 'deepep' was not executed")
-        if not self.use_deepep:
-            raise NotImplementedError(
-                "MoE requires normal DeepEP transport aligned to low-latency semantics"
-            )
-        dispatched, tokens_per_expert, permuted_probs = self.dispatcher.dispatch(
+        output = self.forward_with_fixed_routes(
             hidden_states,
-            _kernel_topk_weights(topk_weights),
-            topk_ids.to(dtype=torch.int64),
+            topk_weights,
+            topk_ids,
         )
-        self.dispatcher.wait_dispatch_event()
-        output = self.experts(
-            dispatched,
-            tokens_per_expert,
-            permuted_probs,
-            tokens_per_expert_list=getattr(
-                self.dispatcher, "_local_tpe_list", None
-            ),
-        )
-        output = self.dispatcher.combine(output)
         if self.shared_experts is not None:
             output = output + self.shared_experts(hidden_states)
         return output

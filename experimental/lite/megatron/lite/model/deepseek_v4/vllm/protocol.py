@@ -111,7 +111,7 @@ class ImplConfig:
     recompute: tuple[str, ...] = ()
     offload: tuple[str, ...] = ()
     use_thd: bool = False
-    use_deepep: bool = False
+    moe_token_dispatcher_type: str = "deepep"
     attention_backend_override: str | None = None
     deterministic: bool = True
     qat: Any | None = None
@@ -122,6 +122,15 @@ class ImplConfig:
     def __post_init__(self) -> None:
         if isinstance(self.selector, Mapping):
             object.__setattr__(self, "selector", SelectorConfig(**dict(self.selector)))
+        if self.moe_token_dispatcher_type not in {
+            "alltoall",
+            "deepep",
+            "hybridep",
+        }:
+            raise ValueError(
+                "moe_token_dispatcher_type must be one of "
+                "'alltoall', 'deepep', or 'hybridep'"
+            )
 
 
 def is_expert_param(name: str) -> bool:
@@ -195,10 +204,6 @@ def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> Non
     if parallel.ep <= 0 or model_cfg.n_routed_experts % parallel.ep:
         raise ValueError(
             f"EP={parallel.ep} must divide {model_cfg.n_routed_experts} routed experts."
-        )
-    if not impl_cfg.use_deepep:
-        raise NotImplementedError(
-            "DeepSeek V4 vLLM requires normal DeepEP training transport."
         )
     if impl_cfg.mtp_enable:
         raise NotImplementedError("DeepSeek V4 vLLM skeleton does not support MTP yet.")
@@ -395,7 +400,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     model = DeepseekV4Model(
         model_cfg,
         ps=parallel_state,
-        use_deepep=impl_cfg.use_deepep,
+        moe_token_dispatcher_type=impl_cfg.moe_token_dispatcher_type,
         selected_layer_ids=impl_cfg.selector.global_layer_ids,
         selected_module_names=impl_cfg.selector.module_names,
         indexer_loss_coeff=impl_cfg.dsa_indexer_loss_coeff,

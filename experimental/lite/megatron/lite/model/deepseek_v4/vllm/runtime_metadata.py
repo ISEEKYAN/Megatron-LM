@@ -1276,6 +1276,11 @@ class DS4SparseIndexerCompressorMetadataAdapter:
         def prepare_flash() -> None:
             nonlocal prepared
             if prepared:
+                # Recompute reruns the indexer and temporarily replaces
+                # metadata.indices with its 2-D compressed top-k output.
+                # Restore the finalized FlashMLA [tokens, 1, width] view.
+                metadata.indices = combined.unsqueeze(1)
+                metadata.topk_length = combined_lens
                 return
             gather = _symbol(
                 "vllm.models.deepseek_v4.common.ops",
@@ -1475,6 +1480,10 @@ class DS4SparseIndexerCompressorMetadataAdapter:
         def prepare_flash() -> None:
             nonlocal prepared
             if prepared:
+                # See the single-sequence path above: activation recompute
+                # mutates metadata.indices before invoking this closure again.
+                metadata.indices = combined.unsqueeze(1)
+                metadata.topk_length = combined_lens
                 return
             gather = _symbol(
                 "vllm.models.deepseek_v4.common.ops",

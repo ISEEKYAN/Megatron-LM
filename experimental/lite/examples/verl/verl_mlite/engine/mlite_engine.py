@@ -97,7 +97,11 @@ def _write_parameter_snapshot(module: torch.nn.Module, *, phase: str, rank: int)
         value = parameter.detach()
         if value.is_meta:
             continue
-        flat = value.contiguous().view(torch.uint8).reshape(-1)
+        # FSDP2 exposes sharded parameters as DTensor subclasses.  NumPy
+        # conversion is unsupported on the wrapper, so fingerprint this
+        # rank's concrete local shard while retaining global shape metadata.
+        local_value = value.to_local() if hasattr(value, "to_local") else value
+        flat = local_value.contiguous().view(torch.uint8).reshape(-1)
         sample = (
             flat
             if flat.numel() <= 128
