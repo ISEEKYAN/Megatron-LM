@@ -4,7 +4,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+from megatron.lite.primitive.modules.dispatcher import (
+    TokenDispatcher,
+    TokenDispatcherType,
+)
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.mlp import SwiGLUMLP
 from megatron.lite.primitive.modules.router import SigmoidTopKRouter
@@ -23,7 +26,7 @@ class DeepseekV4MoE(nn.Module):
         ps: ParallelState,
         *,
         layer_idx: int,
-        use_deepep: bool = False,
+        moe_token_dispatcher_type: TokenDispatcherType = "alltoall",
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -54,7 +57,7 @@ class DeepseekV4MoE(nn.Module):
             config.n_routed_experts,
             config.hidden_size,
             ps,
-            use_deepep=use_deepep,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
         )
 
     def _hash_route(

@@ -129,7 +129,7 @@ def test_qwen3_moe_lite_tiny_forward_backward_smoke():
     _Qwen3MoEConfig, Qwen3MoEModel = _qwen3_symbols()
     config = _tiny_qwen3_config()
     model = (
-        Qwen3MoEModel(config, _parallel_state(), use_deepep=False)
+        Qwen3MoEModel(config, _parallel_state(), moe_token_dispatcher_type="alltoall")
         .cuda()
         .to(torch.bfloat16)
     )
@@ -152,7 +152,7 @@ def test_qwen35_lite_tiny_forward_backward_smoke():
         pp=1,
         cp=1,
         vpp=None,
-        use_deepep=False,
+        moe_token_dispatcher_type="alltoall",
         fp8=False,
         recompute_modules=[],
         deterministic=True,
@@ -222,7 +222,7 @@ def test_qwen35_tp2_tp4_mixed_attention_parity_and_backward():
             pp=1,
             cp=1,
             vpp=None,
-            use_deepep=False,
+            moe_token_dispatcher_type="alltoall",
             fp8=False,
             recompute_modules=[],
             deterministic=True,

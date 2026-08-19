@@ -267,7 +267,7 @@ def test_dispatcher_metadata_stays_materialized_in_meta_context() -> None:
             num_experts=4,
             hidden_size=8,
             ps=SimpleNamespace(ep_size=2),
-            use_deepep=False,
+            moe_token_dispatcher_type="alltoall",
         )
 
     assert dispatcher._sort_by_experts == [0, 2, 1, 3]

@@ -13,10 +13,9 @@ from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
-from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.qwen3_5.config import Qwen35Config
-from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+from megatron.lite.primitive import transformer_engine as te
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcher, TokenDispatcherType
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
 from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
 from megatron.lite.primitive.modules.gqa import GQAttention as FullAttention
@@ -158,7 +157,7 @@ class MoELayer(nn.Module):
         config: Qwen35Config,
         ps: ParallelState,
         *,
-        use_deepep: bool,
+        moe_token_dispatcher_type: TokenDispatcherType,
         router_bias_rate: float,
         fp8: bool,
         moe_act_recompute: bool,
@@ -182,7 +181,7 @@ class MoELayer(nn.Module):
             config.num_experts,
             config.hidden_size,
             ps,
-            use_deepep=use_deepep,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
             moe_permute_fusion=moe_permute_fusion,
         )
         self.shared_expert = SharedExpert(config, ps, use_plain_te_linear=shared_expert_plain_te)
@@ -232,7 +231,7 @@ class Qwen35Layer(nn.Module):
         ps: ParallelState,
         layer_idx: int,
         *,
-        use_deepep: bool = False,
+        moe_token_dispatcher_type: TokenDispatcherType = "alltoall",
         router_bias_rate: float = 0.0,
         fp8: bool = False,
         moe_act_recompute: bool = False,
@@ -280,7 +279,7 @@ class Qwen35Layer(nn.Module):
         self.moe = MoELayer(
             config,
             ps,
-            use_deepep=use_deepep,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
             router_bias_rate=router_bias_rate,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
@@ -403,7 +402,7 @@ class Qwen35Model(nn.Module):
                     config,
                     ps,
                     idx,
-                    use_deepep=train_config.use_deepep,
+                    moe_token_dispatcher_type=train_config.moe_token_dispatcher_type,
                     router_bias_rate=router_bias_rate,
                     fp8=train_config.fp8,
                     moe_act_recompute=moe_act_recompute,
@@ -441,7 +440,7 @@ class Qwen35Model(nn.Module):
                         config,
                         ps,
                         config.num_hidden_layers + layer_idx,
-                        use_deepep=train_config.use_deepep,
+                        moe_token_dispatcher_type=train_config.moe_token_dispatcher_type,
                         router_bias_rate=router_bias_rate,
                         fp8=train_config.fp8,
                         moe_act_recompute=moe_act_recompute,

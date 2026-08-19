@@ -23,6 +23,7 @@ from megatron.lite.model.protocol_utils import (
     router_replay_roots as router_replay_roots,
 )
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcherType
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
     contiguous_position_ids_for_cp,
@@ -58,7 +59,7 @@ class ImplConfig:
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_thd: bool = False
-    use_deepep: bool = False
+    moe_token_dispatcher_type: TokenDispatcherType = "alltoall"
     attention_backend_override: str | None = None
     deterministic: bool = True
     mtp_enable: bool = True
@@ -385,7 +386,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         cp=ps.cp_size,
         vpp=vpp,
         fp8=False,
-        use_deepep=impl_cfg.use_deepep,
+        moe_token_dispatcher_type=impl_cfg.moe_token_dispatcher_type,
     )
 
     def _chunk(i: int | None = None):
@@ -395,7 +396,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 train_cfg,
                 ps,
                 vpp_chunk_id=i,
-                use_deepep=impl_cfg.use_deepep,
+                moe_token_dispatcher_type=impl_cfg.moe_token_dispatcher_type,
                 use_thd=impl_cfg.use_thd,
                 hf_path=impl_cfg.hf_path,
                 attention_backend_override=impl_cfg.attention_backend_override,

@@ -294,7 +294,7 @@ def _train_config():
         pp=1,
         cp=1,
         vpp=None,
-        use_deepep=False,
+        moe_token_dispatcher_type="alltoall",
         fp8=False,
         recompute_modules=[],
         offload_modules=[],
@@ -323,7 +323,7 @@ def _real_tiny_model(model_name: str, monkeypatch):
             max_position_embeddings=16,
             layer_types=["full_attention", "full_attention"],
         )
-        return Qwen3MoEModel(config, ps, use_deepep=False)
+        return Qwen3MoEModel(config, ps, moe_token_dispatcher_type="alltoall")
     if model_name == "qwen3_5":
         from megatron.lite.model.qwen3_5.config import Qwen35Config
         from megatron.lite.model.qwen3_5.lite.model import Qwen35Model

@@ -111,7 +111,7 @@ def _train_cfg(cp: int):
         pp=1,
         cp=cp,
         vpp=None,
-        use_deepep=False,
+        moe_token_dispatcher_type="alltoall",
         fp8=False,
         recompute_modules={},
         deterministic=False,

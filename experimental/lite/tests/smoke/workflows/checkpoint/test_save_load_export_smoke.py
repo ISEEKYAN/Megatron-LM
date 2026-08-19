@@ -381,7 +381,7 @@ def _build_handle(
         parallel=parallel,
         optimizer=backend,
         optimizer_config=_optimizer_config(offload_fraction),
-        use_deepep=False,
+        moe_token_dispatcher_type="alltoall",
         deterministic=True,
     )
     bundle = protocol.build_model(cfg, impl_cfg=impl_cfg)
