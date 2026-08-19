@@ -769,10 +769,13 @@ class TokenDispatcher:
             self.num_local_experts,
         )
         self._hybridep_handle = handle
-        tokens_per_expert = tokens_per_expert.to(torch.int64)
         # combine() needs the permuted size to allocate its output; without a static
-        # budget it is only knowable after dispatch (this .sum() is the D2H sync).
-        self._hybridep_num_permuted_tokens = tokens_per_expert.sum()
+        # budget it is only knowable after dispatch. HybridEP hands tokens_per_expert
+        # back on the host, so read the total here while it is free.
+        self._hybridep_num_permuted_tokens = int(tokens_per_expert.sum())
+        # ...but every other backend returns tokens_per_expert on the compute device,
+        # and the expert grouping downstream indexes with it. Match them.
+        tokens_per_expert = tokens_per_expert.to(device=dispatched.device, dtype=torch.int64)
         return dispatched, tokens_per_expert, dispatched_probs
 
     def _combine_hybridep(self, expert_output):
