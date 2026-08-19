@@ -12,13 +12,9 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
-
-from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.primitive.modules.dispatcher import (
-    TokenDispatcher,
-    TokenDispatcherType,
-)
+from megatron.lite.primitive import transformer_engine as te
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcher, TokenDispatcherType
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.gqa import GQAttention
 from megatron.lite.primitive.modules.lora import LoraConfig
@@ -64,7 +60,10 @@ class MoELayer(nn.Module):
             config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute, lora_config=lora_config
         )
         self.dispatcher = TokenDispatcher(
-            config.num_experts, config.hidden_size, ps, moe_token_dispatcher_type=moe_token_dispatcher_type
+            config.num_experts,
+            config.hidden_size,
+            ps,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

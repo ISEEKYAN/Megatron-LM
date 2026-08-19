@@ -27,10 +27,7 @@ def _ps(ep_size: int) -> ParallelState:
 
 def _build(ep_size: int, dispatcher_type: str) -> TokenDispatcher:
     return TokenDispatcher(
-        num_experts=4,
-        hidden_size=2,
-        ps=_ps(ep_size),
-        moe_token_dispatcher_type=dispatcher_type,
+        num_experts=4, hidden_size=2, ps=_ps(ep_size), moe_token_dispatcher_type=dispatcher_type
     )
 
 
