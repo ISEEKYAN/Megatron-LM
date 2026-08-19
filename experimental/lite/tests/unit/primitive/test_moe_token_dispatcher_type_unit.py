@@ -1,17 +1,24 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Backend selection for moe_token_dispatcher_type.
 
-These run on CPU with neither DeepEP nor HybridEP installed, which is exactly the state
-that used to be indistinguishable from "the backend is off": the old `use_deepep` flag
-was ANDed with `deep_ep is not None`, so a requested DeepEP run silently became an
-AllToAll run. The typed option is required to say so instead.
+The case worth pinning is a missing optional dependency, which used to be
+indistinguishable from "the backend is off": the old `use_deepep` flag was ANDed with
+`deep_ep is not None`, so a requested DeepEP run silently became an AllToAll run. The
+typed option has to say so instead.
+
+Absence is simulated rather than assumed -- DeepEP is installed in the validation
+container and absent on a laptop, and this suite has to mean the same thing in both.
 """
 
 import pytest
 import torch
 
+from megatron.lite.primitive.modules import dispatcher as dispatcher_mod
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.parallel import ParallelState
+
+#: Module global that each backend's availability is read from.
+_BACKEND_SYMBOL = {"deepep": "deep_ep", "hybridep": "HybridEPBuffer"}
 
 
 def _ps(ep_size: int) -> ParallelState:
@@ -27,12 +34,21 @@ def _build(ep_size: int, dispatcher_type: str) -> TokenDispatcher:
     )
 
 
+@pytest.fixture
+def without_backend(monkeypatch):
+    def _uninstall(dispatcher_type):
+        monkeypatch.setattr(dispatcher_mod, _BACKEND_SYMBOL[dispatcher_type], None)
+
+    return _uninstall
+
+
 @pytest.mark.parametrize(
     "dispatcher_type, hint",
     [("deepep", "github.com/deepseek-ai/DeepEP"), ("hybridep", "hybrid-ep")],
 )
-def test_requesting_an_uninstalled_backend_fails_loud(dispatcher_type, hint):
-    # Neither package is importable here, so this is the "dependency missing" case.
+def test_requesting_an_uninstalled_backend_fails_loud(dispatcher_type, hint, without_backend):
+    without_backend(dispatcher_type)
+
     with pytest.raises(RuntimeError) as excinfo:
         _build(ep_size=2, dispatcher_type=dispatcher_type)
 
@@ -45,10 +61,25 @@ def test_requesting_an_uninstalled_backend_fails_loud(dispatcher_type, hint):
 
 
 @pytest.mark.parametrize("dispatcher_type", ["deepep", "hybridep"])
-def test_uninstalled_backend_does_not_silently_become_alltoall(dispatcher_type):
+def test_uninstalled_backend_does_not_silently_become_alltoall(dispatcher_type, without_backend):
     # The regression guard proper. Under the old `use_deepep` flag this construction
     # succeeded and quietly ran AllToAll; nothing downstream could tell.
+    without_backend(dispatcher_type)
+
     with pytest.raises(RuntimeError):
+        _build(ep_size=2, dispatcher_type=dispatcher_type)
+
+
+@pytest.mark.parametrize("dispatcher_type", ["deepep", "hybridep"])
+def test_installed_backend_without_a_process_group_fails_loud(dispatcher_type, monkeypatch):
+    # Both backends dispatch over the ETPxEP group. Reaching this point with an
+    # uninitialised ParallelState used to trip a bare `assert`, which says nothing about
+    # what to do next -- and disappears entirely under `python -O`.
+    # Presence is simulated so this runs the same way with or without DeepEP installed;
+    # the group check comes first, so the stand-in is never called.
+    monkeypatch.setattr(dispatcher_mod, _BACKEND_SYMBOL[dispatcher_type], object())
+
+    with pytest.raises(RuntimeError, match="tp_ep_group"):
         _build(ep_size=2, dispatcher_type=dispatcher_type)
 
 

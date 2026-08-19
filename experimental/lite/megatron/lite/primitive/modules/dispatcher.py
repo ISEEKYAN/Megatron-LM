@@ -337,11 +337,15 @@ class TokenDispatcher:
         if self.backend == "hybridep" and HybridEPBuffer is None:
             raise RuntimeError(_missing_backend_message("hybridep", ps.ep_size))
 
+        if self.backend in ("deepep", "hybridep") and ps.tp_ep_group is None:
+            raise RuntimeError(
+                f"moe_token_dispatcher_type={self.backend!r} dispatches over the ETPxEP "
+                "group, but ParallelState.tp_ep_group is unset. Build the dispatcher from "
+                "an initialised ParallelState (init_parallel), or use "
+                "moe_token_dispatcher_type='alltoall'."
+            )
         if self.backend == "deepep":
-            assert ps.tp_ep_group is not None
             self.buffer = _build_deepep_buffer(ps.tp_ep_group, hidden_size)
-        if self.backend == "hybridep":
-            assert ps.tp_ep_group is not None
 
         self._hybridep_handle = None
         self._hybridep_num_permuted_tokens: int | None = None
