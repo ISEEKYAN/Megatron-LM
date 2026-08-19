@@ -139,7 +139,7 @@ def test_ep_token_dispatcher_sums_scores_for_duplicate_experts(
     from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 
     ps = ParallelState(ep_size=1, ep_rank=0)
-    dispatcher = TokenDispatcher(num_experts=3, hidden_size=2, ps=ps, use_deepep=False)
+    dispatcher = TokenDispatcher(num_experts=3, hidden_size=2, ps=ps, moe_token_dispatcher_type="alltoall")
     hidden = torch.tensor([[1.0, 10.0], [2.0, 20.0]])
     topk_indices = torch.tensor([[1, 1, 2], [0, 2, 0]])
     topk_scores = torch.tensor([[0.2, 0.3, 0.5], [0.1, 0.4, 0.5]], requires_grad=True)
@@ -178,7 +178,7 @@ def test_alltoall_dispatch_sums_scores_for_duplicate_experts(
         num_experts=4,
         hidden_size=2,
         ps=ParallelState(ep_size=2, ep_rank=0, ep_group=object()),
-        use_deepep=False,
+        moe_token_dispatcher_type="alltoall",
     )
     hidden = torch.tensor([[1.0, 10.0], [2.0, 20.0]])
     topk_indices = torch.tensor([[1, 1, 0], [0, 1, 0]])
@@ -202,7 +202,7 @@ def test_deepep_dispatch_finish_sums_scores_for_duplicate_experts(
         num_experts=3,
         hidden_size=2,
         ps=ParallelState(ep_size=1, ep_rank=0),
-        use_deepep=False,
+        moe_token_dispatcher_type="alltoall",
     )
     recv_hidden = torch.tensor([[1.0, 10.0], [2.0, 20.0]])
     recv_indices = torch.tensor([[1, 1, 2], [0, 2, 0]])

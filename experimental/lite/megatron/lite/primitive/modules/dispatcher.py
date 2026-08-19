@@ -733,7 +733,10 @@ class TokenDispatcher:
         routing_map = torch.zeros(t, e, dtype=torch.bool, device=hidden_states.device)
         routing_map.scatter_(1, topk_indices, True)
         probs_2d = torch.zeros(t, e, dtype=topk_scores.dtype, device=hidden_states.device)
-        probs_2d.scatter_(1, topk_indices, topk_scores)
+        # scatter_add_, not scatter_: hash routing (ds4) can send a token to the same
+        # expert twice, and the duplicate slots' probabilities have to accumulate. Same
+        # reasoning as the alltoall and local paths above.
+        probs_2d.scatter_add_(1, topk_indices, topk_scores)
 
         # HybridEP dispatch requires every rank in the group to hand it the same token
         # count, so pad up to the group-wide max (and to the kernels' 64-token chunk).
