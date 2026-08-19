@@ -70,9 +70,14 @@ def validate_geometry(
             f"PP{expected_topology[0]}/CP{expected_topology[1]}/EP{expected_topology[2]}, got "
             f"PP{actor_pp}/CP{actor_cp}/EP{actor_ep}"
         )
-    if max_sequence_length != 8192 or ppo_max_tokens_per_gpu != 4096:
+    expected_sequence_length = 4096 if world_size == 4 else 8192
+    if (
+        max_sequence_length != expected_sequence_length
+        or ppo_max_tokens_per_gpu != 4096
+    ):
         raise SystemExit(
-            "DS4 production token contract requires max_sequence_length=8192 "
+            "DS4 token contract requires "
+            f"max_sequence_length={expected_sequence_length} "
             f"and ppo_max_tokens_per_gpu=4096, got {max_sequence_length}/"
             f"{ppo_max_tokens_per_gpu}"
         )
