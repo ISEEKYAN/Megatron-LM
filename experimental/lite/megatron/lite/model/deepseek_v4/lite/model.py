@@ -43,6 +43,7 @@ from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE
 from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
 from megatron.lite.primitive.modules.attention.hca import HyperConnection
 from megatron.lite.primitive.modules.attention.mhc import MultiHeadHyperConnectionHead
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcherType
 from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
@@ -146,7 +147,7 @@ class DeepseekV4Layer(nn.Module):
         ps: ParallelState,
         layer_idx: int,
         *,
-        use_deepep: bool = False,
+        moe_token_dispatcher_type: TokenDispatcherType = "alltoall",
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -156,7 +157,7 @@ class DeepseekV4Layer(nn.Module):
         # DS4 ONLY: CSA attention behind the SBHD shim (Kimi builds MLA here).
         self.self_attn = DeepseekV4CSAAttention(config, layer_idx=layer_idx, ps=ps)
         # DS4 ONLY: hash-routed MoE family (shared Experts/Router/dispatcher).
-        self.mlp = DeepseekV4MoE(config, ps, layer_idx=layer_idx, use_deepep=use_deepep)
+        self.mlp = DeepseekV4MoE(config, ps, layer_idx=layer_idx, moe_token_dispatcher_type=moe_token_dispatcher_type)
         # DS4 ONLY: per-layer multi-head hyper-connections wrapping attn + ffn.
         self.attn_hc = HyperConnection(
             config.hidden_size, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps
@@ -214,10 +215,10 @@ class DeepseekV4MTPLayer(DeepseekV4Layer):
         layer_idx: int,
         *,
         embedding: VocabParallelEmbedding,
-        use_deepep: bool,
+        moe_token_dispatcher_type: TokenDispatcherType,
         detach_encoder: bool,
     ):
-        super().__init__(config, ps, layer_idx, use_deepep=use_deepep)
+        super().__init__(config, ps, layer_idx, moe_token_dispatcher_type=moe_token_dispatcher_type)
         self.config = config
         object.__setattr__(self, "embedding", embedding)
         self.detach_encoder = detach_encoder
@@ -310,7 +311,7 @@ class DeepseekV4Model(nn.Module):
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
-        use_deepep: bool = False,
+        moe_token_dispatcher_type: TokenDispatcherType = "alltoall",
     ):
         super().__init__()
         del hf_path, use_thd  # DS4 CSA derives its own masking from position_ids.
@@ -352,7 +353,7 @@ class DeepseekV4Model(nn.Module):
         # for its dense-vs-MoE / per-layer logic.
         self.layers = nn.ModuleDict(
             {
-                str(local): DeepseekV4Layer(config, ps, global_idx, use_deepep=use_deepep)
+                str(local): DeepseekV4Layer(config, ps, global_idx, moe_token_dispatcher_type=moe_token_dispatcher_type)
                 for local, global_idx in enumerate(self.layer_indices)
             }
         )
@@ -381,7 +382,7 @@ class DeepseekV4Model(nn.Module):
                         ps,
                         config.num_hidden_layers + idx,
                         embedding=mtp_embedding,
-                        use_deepep=use_deepep,
+                        moe_token_dispatcher_type=moe_token_dispatcher_type,
                         detach_encoder=mtp_detach_encoder,
                     )
                     for idx in range(config.num_nextn_predict_layers)

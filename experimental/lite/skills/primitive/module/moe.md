@@ -33,7 +33,7 @@ def moe(task, implementation, config, reference, budget):
         "boundaries": ["module owns routing math; EP owns distributed expert placement; DeepEP owns dispatch/combine transport"],
     }
     usage_contract = {
-        "config": require_config_keys(config, ["num_experts", "top_k", "expert_parallel_size", "use_deepep"]),
+        "config": require_config_keys(config, ["num_experts", "top_k", "expert_parallel_size", "moe_token_dispatcher_type"]),
         "choose_when": ["model architecture has sparse experts", "expert count justifies EP or grouped GEMM"],
         "avoid_when": ["router tie behavior cannot be stabilized", "DeepEP metadata cannot be validated against all-to-all"],
         "compose_with": ["primitive.parallel.ep", "DeepEP dispatcher when EP>1", "primitive.parallel.tp for expert MLP if explicit"],

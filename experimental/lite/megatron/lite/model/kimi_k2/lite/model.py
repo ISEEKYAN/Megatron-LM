@@ -13,7 +13,10 @@ import torch.nn.functional as F
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.kimi_k2.config import KimiK2Config
 from megatron.lite.primitive.modules.attention import MultiLatentAttention
-from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+from megatron.lite.primitive.modules.dispatcher import (
+    TokenDispatcher,
+    TokenDispatcherType,
+)
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 from megatron.lite.primitive.modules.router import SigmoidTopKRouter
@@ -127,7 +130,7 @@ class MoELayer(nn.Module):
         config: KimiK2Config,
         ps: ParallelState,
         *,
-        use_deepep: bool,
+        moe_token_dispatcher_type: TokenDispatcherType,
         router_bias_rate: float,
         fp8: bool,
         moe_act_recompute: bool,
@@ -154,7 +157,7 @@ class MoELayer(nn.Module):
             config.num_experts,
             config.hidden_size,
             ps,
-            use_deepep=use_deepep,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
         )
         self.shared_expert = SharedExpert(config, ps)
 
@@ -186,7 +189,7 @@ class KimiK2Layer(nn.Module):
         ps: ParallelState,
         layer_idx: int,
         *,
-        use_deepep: bool = False,
+        moe_token_dispatcher_type: TokenDispatcherType = "alltoall",
         router_bias_rate: float = 0.0,
         fp8: bool = False,
         moe_act_recompute: bool = False,
@@ -216,7 +219,7 @@ class KimiK2Layer(nn.Module):
             self.moe: MoELayer | None = MoELayer(
                 config,
                 ps,
-                use_deepep=use_deepep,
+                moe_token_dispatcher_type=moe_token_dispatcher_type,
                 router_bias_rate=router_bias_rate,
                 fp8=fp8,
                 moe_act_recompute=moe_act_recompute,
@@ -259,7 +262,7 @@ class KimiK2MTPLayer(nn.Module):
         layer_idx: int,
         *,
         embedding: VocabParallelEmbedding,
-        use_deepep: bool,
+        moe_token_dispatcher_type: TokenDispatcherType,
         router_bias_rate: float,
         fp8: bool,
         moe_act_recompute: bool,
@@ -283,7 +286,7 @@ class KimiK2MTPLayer(nn.Module):
             config,
             ps,
             config.num_hidden_layers + layer_idx,
-            use_deepep=use_deepep,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
             router_bias_rate=router_bias_rate,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
@@ -330,7 +333,7 @@ class KimiK2MTPBlock(nn.Module):
         ps: ParallelState,
         *,
         embedding: VocabParallelEmbedding,
-        use_deepep: bool,
+        moe_token_dispatcher_type: TokenDispatcherType,
         router_bias_rate: float,
         fp8: bool,
         moe_act_recompute: bool,
@@ -349,7 +352,7 @@ class KimiK2MTPBlock(nn.Module):
                     ps,
                     idx,
                     embedding=embedding,
-                    use_deepep=use_deepep,
+                    moe_token_dispatcher_type=moe_token_dispatcher_type,
                     router_bias_rate=router_bias_rate,
                     fp8=fp8,
                     moe_act_recompute=moe_act_recompute,
@@ -464,7 +467,7 @@ class KimiK2Model(nn.Module):
                     config,
                     ps,
                     idx,
-                    use_deepep=train_config.use_deepep,
+                    moe_token_dispatcher_type=train_config.moe_token_dispatcher_type,
                     router_bias_rate=router_bias_rate,
                     fp8=train_config.fp8,
                     moe_act_recompute=moe_act_recompute,
@@ -491,7 +494,7 @@ class KimiK2Model(nn.Module):
                 config,
                 ps,
                 embedding=mtp_embedding,
-                use_deepep=train_config.use_deepep,
+                moe_token_dispatcher_type=train_config.moe_token_dispatcher_type,
                 router_bias_rate=router_bias_rate,
                 fp8=train_config.fp8,
                 moe_act_recompute=moe_act_recompute,

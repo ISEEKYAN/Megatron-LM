@@ -20,7 +20,7 @@ def _make_train_config(ps):
         pp=ps.pp_size,
         cp=ps.cp_size,
         vpp=None,
-        use_deepep=False,
+        moe_token_dispatcher_type="alltoall",
         fp8=False,
         recompute_modules=[],
         deterministic=True,

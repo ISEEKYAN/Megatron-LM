@@ -98,7 +98,7 @@ def _build_handle(model_seed: int) -> ModelHandle:
         optimizer_config=OptimizerConfig(
             optimizer="adam", lr=1.0e-3, weight_decay=0.0, clip_grad=1.0
         ),
-        use_deepep=False,
+        moe_token_dispatcher_type="alltoall",
         deterministic=True,
     )
     bundle = protocol.build_model(model_cfg, impl_cfg=impl_cfg)

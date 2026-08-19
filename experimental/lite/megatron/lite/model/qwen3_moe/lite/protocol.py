@@ -41,6 +41,7 @@ from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLA
 from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcherType
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     freeze_non_lora_params,
@@ -82,7 +83,7 @@ class ImplConfig:
     optimizer: str | None = "dist_opt"  # None = no optimizer (inference)
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
-    use_deepep: bool = False
+    moe_token_dispatcher_type: TokenDispatcherType = "alltoall"
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     router_aux_loss_coef: float | None = None
@@ -177,8 +178,10 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     lora_config = normalize_lora_config(impl_cfg.lora)
 
     # ── validation ──
-    if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
-        raise ValueError("use_deepep and etp>1 are mutually exclusive")
+    if impl_cfg.moe_token_dispatcher_type == "deepep" and (p.etp is not None and p.etp > 1):
+        raise ValueError(
+            "moe_token_dispatcher_type='deepep' and etp>1 are mutually exclusive"
+        )
 
     # ── override model config from impl_cfg ──
     if impl_cfg.router_aux_loss_coef is not None:
@@ -201,7 +204,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     # ── build chunks ──
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     model_kwargs: dict[str, Any] = dict(
-        use_deepep=impl_cfg.use_deepep,
+        moe_token_dispatcher_type=impl_cfg.moe_token_dispatcher_type,
         fp8=False,
         recompute_modules=recompute_spec,
         router_bias_rate=impl_cfg.router_bias_rate,

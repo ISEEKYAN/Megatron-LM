@@ -114,7 +114,7 @@ def test_ep_token_dispatcher_local_roundtrip_is_independent_of_deepep(
     from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 
     ps = ParallelState(ep_size=1, ep_rank=0)
-    dispatcher = TokenDispatcher(num_experts=3, hidden_size=2, ps=ps, use_deepep=False)
+    dispatcher = TokenDispatcher(num_experts=3, hidden_size=2, ps=ps, moe_token_dispatcher_type="alltoall")
     hidden = torch.tensor([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]], requires_grad=True)
     topk_indices = torch.tensor([[0], [2], [1], [2]])
     topk_scores = torch.ones(4, 1)

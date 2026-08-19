@@ -34,6 +34,7 @@ from megatron.lite.model.protocol_utils import (
     set_cross_entropy_fusion,
 )
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcherType
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
 from megatron.lite.primitive.parallel.thd import (
@@ -103,7 +104,7 @@ class ImplConfig:
     optimizer: str | None = "dist_opt"
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
-    use_deepep: bool = False
+    moe_token_dispatcher_type: TokenDispatcherType = "alltoall"
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     hf_path: str = ""
@@ -266,8 +267,10 @@ def _build_dist_opt_optimizer(
 def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     p = impl_cfg.parallel
     _validate_parallel_scope(p)
-    if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
-        raise ValueError("use_deepep and etp>1 are mutually exclusive")
+    if impl_cfg.moe_token_dispatcher_type == "deepep" and (p.etp is not None and p.etp > 1):
+        raise ValueError(
+            "moe_token_dispatcher_type='deepep' and etp>1 are mutually exclusive"
+        )
     if impl_cfg.router_aux_loss_coef is not None:
         # GLM-5 has no aux_loss_alpha HF field; honour an explicit override only.
         model_cfg.aux_loss_alpha = impl_cfg.router_aux_loss_coef
@@ -296,7 +299,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         pp=ps.pp_size,
         cp=ps.cp_size,
         vpp=vpp,
-        use_deepep=impl_cfg.use_deepep,
+        moe_token_dispatcher_type=impl_cfg.moe_token_dispatcher_type,
         fp8=False,
         recompute_modules=recompute_spec,
         offload_modules=list(impl_cfg.offload),
