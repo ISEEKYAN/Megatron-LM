@@ -253,8 +253,8 @@ class _HybridEPDispatch(torch.autograd.Function):
             num_tokens, hidden_dim = hidden_states.shape[-2:]
             init_hybrid_ep_buffer(group, hidden_dim, num_tokens, num_local_experts)
         # num_permuted_tokens is left unset: MLite is dropless, so there is no static
-        # budget to size the buffers with, and HybridEP resolves the size itself (at the
-        # cost of a D2H sync).
+        # budget to size the buffers with. HybridEP then resolves the size itself off
+        # host-side metadata, which costs a D2H sync (its use_host_meta default).
         dispatched_hidden, dispatched_probs, _, tokens_per_expert, handle = (
             _hybrid_ep_buffer.dispatch_with_permute(
                 hidden=hidden_states,
@@ -264,7 +264,6 @@ class _HybridEPDispatch(torch.autograd.Function):
                 num_of_experts_per_rank=num_local_experts,
                 pad_multiple=None,
                 num_permuted_tokens=None,
-                non_blocking=False,
             )
         )
         ctx.handle = handle
