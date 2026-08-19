@@ -37,6 +37,7 @@ ENABLE_QAT="${ENABLE_QAT:-False}"
 # ---------------------------------------------------------------------------
 
 : "${MODEL_PATH:?set MODEL_PATH to the official DeepSeek-V4 checkpoint}"
+: "${WANDB_API_KEY:?set WANDB_API_KEY for production DAPO telemetry}"
 DAPO_DATA_DIR="${DAPO_DATA_DIR:-}"
 TRAIN_FILES="${TRAIN_FILES:-${DAPO_DATA_DIR:+${DAPO_DATA_DIR}/dapo-math-17k.parquet}}"
 VAL_FILES="${VAL_FILES:-${DAPO_DATA_DIR:+${DAPO_DATA_DIR}/aime-2024.parquet}}"
@@ -45,14 +46,18 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-}"
 NNODES="${NNODES:-1}"
 NGPUS_PER_NODE="${NGPUS_PER_NODE:-${NPROC_PER_NODE:-8}}"
 ACTOR_PP="${ACTOR_PP:-4}"
-ACTOR_CP="${ACTOR_CP:-4}"
+ACTOR_CP="${ACTOR_CP:-2}"
 ACTOR_EP="${ACTOR_EP:-8}"
-ROLLOUT_TP="${ROLLOUT_TP:-8}"
+ROLLOUT_TP="${ROLLOUT_TP:-1}"
+ROLLOUT_DP="${ROLLOUT_DP:-32}"
+ROLLOUT_EP="${ROLLOUT_EP:-8}"
 
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-6144}"
+PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-4096}"
+LOGPROB_MAX_TOKEN_LEN_PER_GPU="${LOGPROB_MAX_TOKEN_LEN_PER_GPU:-4096}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
@@ -179,7 +184,11 @@ export VERL_FILE_LOGGER_PATH="${JSONL_FILE}"
 
 python3 "${VALIDATOR}" geometry \
   --model-config "${MODEL_PATH}/config.json" \
-  --rollout-tp "${ROLLOUT_TP}"
+  --rollout-tp "${ROLLOUT_TP}" \
+  --world-size "$((NNODES * NGPUS_PER_NODE))" \
+  --actor-pp "${ACTOR_PP}" --actor-cp "${ACTOR_CP}" --actor-ep "${ACTOR_EP}" \
+  --max-sequence-length "${MAX_SEQ_LEN}" \
+  --ppo-max-tokens-per-gpu "${PPO_MAX_TOKEN_LEN_PER_GPU}"
 
 DS4_CHAT_TEMPLATE="${DEEPSEEK_V4_FLASH_CHAT_TEMPLATE:-$(<"${CHAT_TEMPLATE_FILE}")}"
 
@@ -230,7 +239,7 @@ ACTOR=(
   "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}"
   "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1"
   "actor_rollout_ref.actor.use_dynamic_bsz=True"
-  "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${MAX_SEQ_LEN}"
+  "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}"
   "actor_rollout_ref.actor.use_kl_loss=False"
   "actor_rollout_ref.actor.kl_loss_coef=0.0"
   "actor_rollout_ref.actor.entropy_coeff=0"
@@ -289,11 +298,13 @@ ROLLOUT=(
   "actor_rollout_ref.rollout.name=vllm"
   "actor_rollout_ref.rollout.mode=async"
   "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}"
+  "actor_rollout_ref.rollout.data_parallel_size=${ROLLOUT_DP}"
+  "actor_rollout_ref.rollout.expert_parallel_size=${ROLLOUT_EP}"
   "actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION}"
   "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
   "actor_rollout_ref.rollout.calculate_log_probs=True"
   "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True"
-  "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${MAX_SEQ_LEN}"
+  "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${LOGPROB_MAX_TOKEN_LEN_PER_GPU}"
   "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1"
   "actor_rollout_ref.rollout.prompt_length=${MAX_PROMPT_LENGTH}"
   "actor_rollout_ref.rollout.response_length=${MAX_RESPONSE_LENGTH}"
@@ -327,7 +338,7 @@ ROLLOUT=(
 TRAINER=(
   "critic.enable=False"
   "trainer.balance_batch=True"
-  "trainer.logger=[console,file]"
+  "trainer.logger=[console,file,wandb]"
   "trainer.project_name=verl-mlite-ds4-dapo"
   "trainer.experiment_name=${RUN_NAME}"
   "trainer.n_gpus_per_node=${NGPUS_PER_NODE}"
