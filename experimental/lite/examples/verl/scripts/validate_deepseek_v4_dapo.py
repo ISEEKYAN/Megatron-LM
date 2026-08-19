@@ -27,7 +27,7 @@ MINIMUM_DEPENDENCIES = {
     "transformer-engine": "2.15.0",
     "nvidia-cudnn-frontend": "1.27.0",
 }
-EXPECTED_VERL_COMMIT = "01d2ab3e"
+EXPECTED_VERL_COMMIT = "01d2ab350c459c78f0350d3679d442e2a8ddba64"
 
 
 def installed(name: str) -> str:
@@ -129,11 +129,16 @@ def validate_environment() -> None:
     import transformer_engine.pytorch as te
     from cudnn import DSA
 
-    if not torch.__version__.startswith("2.12.0a0") or torch.version.cuda != "13.2":
+    if torch.version.cuda is None or Version(torch.version.cuda) < Version("12.8"):
         raise SystemExit(
-            "DS4 requires PyTorch 2.12 nv26.05 / CUDA 13.2, "
-            f"got torch={torch.__version__} cuda={torch.version.cuda}"
+            "DS4 requires CUDA-enabled PyTorch with CUDA >=12.8, "
+            f"got {torch.version.cuda}"
         )
+    if not torch.cuda.is_available():
+        raise SystemExit("DS4 requires a visible CUDA device")
+    capability = torch.cuda.get_device_capability()
+    if capability[0] < 9:
+        raise SystemExit(f"DS4 requires SM90 or newer, got capability={capability}")
     if "q_causal_offsets" not in inspect.signature(
         DSA.indexer_forward_wrapper
     ).parameters:
@@ -146,6 +151,7 @@ def validate_environment() -> None:
         "DS4_DEPENDENCY_CONTRACT_PASSED "
         f"verl={declared_verl} python={sys.version.split()[0]} "
         f"torch={torch.__version__} torch_cuda={torch.version.cuda} "
+        f"gpu_capability={capability[0]}.{capability[1]} "
         f"vllm={actual['vllm']} te={actual['transformer-engine']} "
         f"cudnn_frontend={actual['nvidia-cudnn-frontend']} "
         f"flashinfer={actual['flashinfer-python']} "
