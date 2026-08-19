@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-from ._contract import check_parameter_versions, own_visible_tensor, parameter_versions
+from ._contract import own_visible_tensor
 
 
 def _own(value):
@@ -20,19 +20,14 @@ def _own(value):
 
 class _VisibleFunctionalVJP(torch.autograd.Function):
     @staticmethod
-    def forward(ctx: Any, visible_op, functional_op, version_indices, *inputs):
+    def forward(ctx: Any, visible_op, functional_op, *inputs):
         output = _own(visible_op(*inputs))
         ctx.functional_op = functional_op
         ctx.inputs = inputs
-        ctx.version_indices = tuple(version_indices)
-        versioned = tuple(inputs[index] for index in ctx.version_indices)
-        ctx.versions = parameter_versions(versioned)
         return output
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs):
-        versioned = tuple(ctx.inputs[index] for index in ctx.version_indices)
-        check_parameter_versions(versioned, ctx.versions)
         with torch.enable_grad():
             recompute_inputs = tuple(
                 value.detach().requires_grad_(value.is_floating_point())
@@ -54,16 +49,12 @@ class _VisibleFunctionalVJP(torch.autograd.Function):
             next(grad_iter) if value.requires_grad else None
             for value in recompute_inputs
         )
-        return None, None, None, *input_grads
+        return None, None, *input_grads
 
 
 def visible_functional_vjp(
     visible_op: Callable,
     functional_op: Callable,
     inputs: tuple[torch.Tensor, ...],
-    *,
-    version_indices: tuple[int, ...] = (),
 ):
-    return _VisibleFunctionalVJP.apply(
-        visible_op, functional_op, version_indices, *inputs
-    )
+    return _VisibleFunctionalVJP.apply(visible_op, functional_op, *inputs)

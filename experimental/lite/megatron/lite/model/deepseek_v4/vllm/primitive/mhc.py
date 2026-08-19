@@ -48,7 +48,6 @@ def mhc_pre_broadcast(
         visible_op,
         functional,
         (x, fn, scale, base, norm_weight),
-        version_indices=(1, 2, 3, 4),
     )
 
 
@@ -79,5 +78,5 @@ def mhc_head(
         return torch.sum(pre.unsqueeze(-1) * x_.float(), dim=-2).to(x_.dtype)
 
     return visible_functional_vjp(
-        visible_op, functional, (x, fn, scale, base), version_indices=(1, 2, 3)
+        visible_op, functional, (x, fn, scale, base)
     )

@@ -19,7 +19,6 @@ def rms_norm(visible_op: Callable, value, weight, eps):
         lambda value_, weight_: visible_op(value_, weight_, eps),
         lambda value_, weight_: _norm(value_, weight_, eps),
         (value, weight),
-        version_indices=(1,),
     )
 
 
@@ -31,5 +30,4 @@ def fused_qkv_rms_norm(visible_op: Callable, q, kv, q_weight, kv_weight, eps):
             _norm(kv_, kvw_, eps),
         ),
         (q, kv, q_weight, kv_weight),
-        version_indices=(2, 3),
     )

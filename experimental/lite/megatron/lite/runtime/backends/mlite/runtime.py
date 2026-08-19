@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import gc
 import os
-import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import fields as dc_fields
 from datetime import timedelta
@@ -195,17 +194,6 @@ class MegatronLiteRuntime(RuntimeBase):
         cfg: MegatronLiteConfig | dict[str, Any] | None = None,
         **kwargs,
     ) -> ModelHandle:
-        started_at = time.monotonic()
-
-        def log_stage(stage: str) -> None:
-            rank = dist.get_rank() if dist.is_initialized() else os.environ.get("RANK", "?")
-            print(
-                f"MLITE_RUNTIME_STAGE rank={rank} stage={stage} "
-                f"elapsed_s={time.monotonic() - started_at:.3f}",
-                flush=True,
-            )
-
-        log_stage("begin")
         if cfg is not None and isinstance(cfg, dict):
             rt_cfg = MegatronLiteConfig.from_dict(hf_path or self._hf_path, cfg)
         elif cfg is not None and isinstance(cfg, MegatronLiteConfig):
@@ -217,13 +205,11 @@ class MegatronLiteRuntime(RuntimeBase):
         if not dist.is_initialized():
             timeout_s = float(os.environ.get("MLITE_DISTRIBUTED_TIMEOUT_S", "300"))
             dist.init_process_group("nccl", timeout=timedelta(seconds=timeout_s))
-        log_stage("distributed_ready")
         torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
         torch.cuda.manual_seed(42)
 
         # ── load model protocol module ──
         proto = self._load_protocol(rt_cfg)
-        log_stage("protocol_loaded")
 
         _apply_attention_backend_env(
             rt_cfg.attention_backend_override, tag=f"{rt_cfg.model_name}:{rt_cfg.impl}"
@@ -235,18 +221,14 @@ class MegatronLiteRuntime(RuntimeBase):
 
         # ── construct impl_cfg (parallel injected) ──
         impl_cfg = _build_impl_cfg(proto, rt_cfg)
-        log_stage("impl_config_built")
 
         # ── build model config ──
         model_cfg = proto.build_model_config(rt_cfg.hf_path)
         if callable(rt_cfg.model_config_hook):
             model_cfg = rt_cfg.model_config_hook(model_cfg)
-        log_stage("model_config_built")
 
         # ── build model (model owns ps + optimizer + everything) ──
-        log_stage("protocol_build_model_begin")
         bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
-        log_stage("protocol_build_model_done")
         meta_initialized = any(
             param.is_meta for chunk in bundle.chunks for param in chunk.parameters()
         )
@@ -259,15 +241,12 @@ class MegatronLiteRuntime(RuntimeBase):
         # ── load HF weights (optional) ──
         loaded_hf_weights = False
         if rt_cfg.load_hf_weights and rt_cfg.hf_path and hasattr(proto, "load_hf_weights"):
-            log_stage("load_hf_weights_begin")
             for chunk in bundle.chunks:
                 proto.load_hf_weights(chunk, rt_cfg.hf_path, model_cfg, bundle.parallel_state)
             loaded_hf_weights = True
-            log_stage("load_hf_weights_done")
 
         post_load_hook = bundle.extras.pop("post_model_load_hook", None)
         if callable(post_load_hook):
-            log_stage("post_load_hook_begin")
             post_load_updates = post_load_hook()
             if post_load_updates is not None:
                 if not isinstance(post_load_updates, dict):
@@ -281,14 +260,11 @@ class MegatronLiteRuntime(RuntimeBase):
                     if not isinstance(extra_updates, dict):
                         raise TypeError("post_model_load_hook extras update must be a dict.")
                     bundle.extras.update(extra_updates)
-            log_stage("post_load_hook_done")
 
         if (loaded_hf_weights or meta_initialized) and bundle.optimizer is not None:
             reload_model_params = getattr(bundle.optimizer, "reload_model_params", None)
             if callable(reload_model_params):
-                log_stage("reload_model_params_begin")
                 reload_model_params()
-                log_stage("reload_model_params_done")
 
         if bundle.forward_step is None:
             raise ValueError("Megatron Lite model bundles must provide a typed forward_step.")
@@ -651,33 +627,11 @@ class MegatronLiteRuntime(RuntimeBase):
     def optimizer_step(self, handle: ModelHandle) -> tuple[bool, float, int | None]:
         if handle._optimizer is None:
             return True, 0.0, 0
-        result = handle._optimizer.step()
-        # Megatron optimizers return (success, norm, zero-count); native torch
-        # optimizers return an optional closure loss.  The DS4 vLLM protocol
-        # intentionally uses native AdamW over its BF16 masters.
-        if isinstance(result, tuple) and len(result) == 3:
-            update_successful, grad_norm, num_zeros = result
-            if update_successful:
-                hook = handle._extras.get("post_optimizer_step_hook")
-                if callable(hook):
-                    hook()
-            return update_successful, float(grad_norm), num_zeros
-        # Only native optimizers need a fallback norm.  FSDP2 parameters can
-        # span distinct dense/expert DeviceMeshes, so touching their DTensor
-        # gradients here (before inspecting the optimizer result) is invalid.
-        gradients = [
-            parameter.grad
-            for parameter in handle._model.parameters()
-            if parameter.grad is not None
-        ]
-        fallback_norm = 0.0
-        if gradients:
-            norms = torch._foreach_norm(gradients, 2)
-            fallback_norm = float(torch.linalg.vector_norm(torch.stack(norms)))
+        update_successful, grad_norm, num_zeros = handle._optimizer.step()
         hook = handle._extras.get("post_optimizer_step_hook")
-        if callable(hook):
+        if update_successful and callable(hook):
             hook()
-        return True, fallback_norm, None
+        return update_successful, float(grad_norm), num_zeros
 
     def lr_scheduler_step(self, handle: ModelHandle) -> float | list[float]:
         if handle._lr_scheduler is not None:

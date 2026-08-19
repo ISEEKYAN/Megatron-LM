@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-
 import torch
 
 
@@ -9,30 +7,6 @@ def own_visible_tensor(value: torch.Tensor) -> torch.Tensor:
     if not isinstance(value, torch.Tensor):
         raise TypeError("a vLLM training bridge must own a tensor output")
     return value.clone() if value.is_inference() else value
-
-
-def parameter_versions(parameters: Iterable[torch.Tensor]) -> tuple[int, ...]:
-    return tuple(
-        -1 if parameter.is_inference() else parameter._version
-        for parameter in parameters
-    )
-
-
-def check_parameter_versions(
-    parameters: Iterable[torch.Tensor], expected: tuple[int, ...]
-) -> None:
-    parameters = tuple(parameters)
-    actual = parameter_versions(parameters)
-    if actual != expected:
-        changed = [
-            index
-            for index, (before, after) in enumerate(zip(expected, actual, strict=True))
-            if before != after
-        ]
-        raise RuntimeError(
-            "DS4 vLLM master parameter changed between forward and backward; "
-            f"changed dependency indices={changed}, versions={expected}->{actual}"
-        )
 
 
 def fp32_linear_vjp(

@@ -42,5 +42,5 @@ def o_projection(
         return F.linear(z.flatten(1), wb_.float()).to(o_.dtype)
 
     return visible_functional_vjp(
-        visible_op, functional, (o, wo_a, wo_b), version_indices=(1, 2)
+        visible_op, functional, (o, wo_a, wo_b)
     )
