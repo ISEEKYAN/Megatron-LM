@@ -8,13 +8,14 @@ import torch
 def own_visible_tensor(value: torch.Tensor) -> torch.Tensor:
     if not isinstance(value, torch.Tensor):
         raise TypeError("a vLLM training bridge must own a tensor output")
-    if value.is_inference():
-        raise RuntimeError("the vLLM training model cannot run under inference_mode")
-    return value
+    return value.clone() if value.is_inference() else value
 
 
 def parameter_versions(parameters: Iterable[torch.Tensor]) -> tuple[int, ...]:
-    return tuple(parameter._version for parameter in parameters)
+    return tuple(
+        -1 if parameter.is_inference() else parameter._version
+        for parameter in parameters
+    )
 
 
 def check_parameter_versions(
