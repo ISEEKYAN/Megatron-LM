@@ -60,6 +60,14 @@ def test_visible_linear_value_and_master_vjp(fused: bool) -> None:
         torch.testing.assert_close(actual.grad.float(), reference.grad, rtol=1e-5, atol=1e-6)
 
 
+def test_visible_linear_supports_verl_forward_only_inference_mode() -> None:
+    x = torch.randn(3, 4)
+    weight = torch.randn(5, 4)
+    with torch.inference_mode():
+        output = block_fp8_linear(F.linear, x, weight)
+    torch.testing.assert_close(output, F.linear(x, weight), rtol=0, atol=0)
+
+
 def test_gate_linear_uses_bound_master_vjp() -> None:
     x = torch.randn(4, 6, requires_grad=True)
     weight = torch.randn(9, 6, requires_grad=True)
