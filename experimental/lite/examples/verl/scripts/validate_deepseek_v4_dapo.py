@@ -17,17 +17,29 @@ from pathlib import Path
 from packaging.version import Version
 
 
-EXACT_DEPENDENCIES = {
-    "vllm": "0.25.1",
-    "flashinfer-python": "0.6.13",
-    "nvidia-cutlass-dsl": "4.5.2",
-    "tilelang": "0.1.9",
+SUPPORTED_PROFILES = {
+    "nv26.05-cuda13.2": {
+        "torch": "2.12.0a0",
+        "cuda": "13.2",
+        "vllm": "0.26.1rc1.dev631+g5426311d9",
+        "flashinfer-python": "0.6.16.post3",
+        "nvidia-cutlass-dsl": "4.5.2",
+        "tilelang": "0.1.12",
+    },
+    "ds4-vllm-align-cuda13.0": {
+        "torch": "2.13.0",
+        "cuda": "13.0",
+        "vllm": "0.26.1rc1.dev682+g7aa248fcf",
+        "flashinfer-python": "0.6.16.post3",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "tilelang": "0.1.12",
+    },
 }
 MINIMUM_DEPENDENCIES = {
     "transformer-engine": "2.15.0",
     "nvidia-cudnn-frontend": "1.27.0",
 }
-EXPECTED_VERL_COMMIT = "b9c513c4"
+EXPECTED_VERL_COMMIT = "087f8b7a"
 
 
 def installed(name: str) -> str:
@@ -71,24 +83,35 @@ def verl_commit() -> str:
     return declared
 
 
+def match_profile(actual: dict[str, str], torch_version: str, cuda: str) -> str | None:
+    for name, profile in SUPPORTED_PROFILES.items():
+        if not torch_version.startswith(profile["torch"]) or cuda != profile["cuda"]:
+            continue
+        if all(
+            Version(actual[package]) == Version(wanted)
+            for package, wanted in profile.items()
+            if package not in {"torch", "cuda"}
+        ):
+            return name
+    return None
+
+
 def validate_environment() -> None:
-    actual = {
-        name: installed(name) for name in EXACT_DEPENDENCIES | MINIMUM_DEPENDENCIES
-    }
-    bad_exact = {
-        name: (actual[name], wanted)
-        for name, wanted in EXACT_DEPENDENCIES.items()
-        if Version(actual[name]) != Version(wanted)
-    }
+    packages = set(MINIMUM_DEPENDENCIES)
+    packages.update(
+        package
+        for profile in SUPPORTED_PROFILES.values()
+        for package in profile
+        if package not in {"torch", "cuda"}
+    )
+    actual = {name: installed(name) for name in packages}
     bad_minimum = {
         name: (actual[name], wanted)
         for name, wanted in MINIMUM_DEPENDENCIES.items()
         if Version(actual[name]) < Version(wanted)
     }
-    if bad_exact or bad_minimum:
-        raise SystemExit(
-            f"DS4 dependency mismatch: exact={bad_exact} minimum={bad_minimum}"
-        )
+    if bad_minimum:
+        raise SystemExit(f"DS4 dependency mismatch: minimum={bad_minimum}")
     if sys.version_info[:2] != (3, 12):
         raise SystemExit(f"DS4 requires Python 3.12, got {sys.version}")
 
@@ -97,10 +120,11 @@ def validate_environment() -> None:
     import transformer_engine.pytorch as te
     from cudnn import DSA
 
-    if not torch.__version__.startswith("2.12.0a0") or torch.version.cuda != "13.2":
+    profile = match_profile(actual, torch.__version__, torch.version.cuda)
+    if profile is None:
         raise SystemExit(
-            "DS4 requires PyTorch 2.12 nv26.05 / CUDA 13.2, "
-            f"got torch={torch.__version__} cuda={torch.version.cuda}"
+            "DS4 runtime is not one of the pinned release profiles; "
+            f"got torch={torch.__version__} cuda={torch.version.cuda} deps={actual}"
         )
     if "q_causal_offsets" not in inspect.signature(
         DSA.indexer_forward_wrapper
@@ -112,7 +136,7 @@ def validate_environment() -> None:
     declared_verl = verl_commit()
     print(
         "DS4_DEPENDENCY_CONTRACT_PASSED "
-        f"verl={declared_verl} python={sys.version.split()[0]} "
+        f"profile={profile} verl={declared_verl} python={sys.version.split()[0]} "
         f"torch={torch.__version__} torch_cuda={torch.version.cuda} "
         f"vllm={actual['vllm']} te={actual['transformer-engine']} "
         f"cudnn_frontend={actual['nvidia-cudnn-frontend']} "

@@ -12,13 +12,6 @@ from megatron.lite.primitive.modules.moe import _AllToAll
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.moe import permute, unpermute
-from megatron.lite.primitive.alignment.deepep_route import (
-    _VLLMEPGatherWithBF16Backward,
-    _compact_route_preserving_metadata_inputs,
-    _deepep_route_handle_received_rows,
-    _scatter_deepep_routes_with_padding,
-    _validate_and_order_route_preserving_outputs,
-)
 
 try:
     import deep_ep  # pyright: ignore[reportMissingImports]
@@ -411,6 +404,13 @@ class TokenDispatcher:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Normal DeepEP transport with vLLM LL route/layout semantics."""
 
+        from vllm.models.deepseek_v4.training_deepep import (
+            _compact_route_preserving_metadata_inputs,
+            _deepep_route_handle_received_rows,
+            _scatter_deepep_routes_with_padding,
+            _validate_and_order_route_preserving_outputs,
+        )
+
         if self.use_deepep:
             self._ensure_deepep_buffer(hidden_states)
 
@@ -540,6 +540,10 @@ class TokenDispatcher:
     def _combine_low_latency_aligned(
         self, expert_output: torch.Tensor
     ) -> torch.Tensor:
+        from vllm.models.deepseek_v4.training_deepep import (
+            _VLLMEPGatherWithBF16Backward,
+        )
+
         route_outputs = expert_output.index_select(
             0, self._aligned_metadata_route_rows
         )

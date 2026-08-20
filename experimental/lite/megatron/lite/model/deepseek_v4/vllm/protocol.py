@@ -27,7 +27,6 @@ from megatron.lite.model.deepseek_v4.lite.protocol import (
 )
 from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
     DS4SparseIndexerCompressorMetadataAdapter,
-    build_moe_metadata,
     ds4_vllm_forward_context,
     initialize_ds4_vllm_batch_invariance,
 )
@@ -46,13 +45,10 @@ from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_s
 class ImplConfig(LiteImplConfig):
     optimizer: str | None = None
     mtp_enable: bool = False
-    dsa_indexer_loss_coeff: float = 0.0
     max_tokens_per_rank: int = 8192
 
 
 def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
-    if impl_cfg.dsa_indexer_loss_coeff < 0.0:
-        raise ValueError("dsa_indexer_loss_coeff must be >= 0")
     if impl_cfg.max_tokens_per_rank <= 0:
         raise ValueError("max_tokens_per_rank must be positive")
     if not 0 <= model_cfg.num_hash_layers <= model_cfg.num_hidden_layers:
@@ -134,7 +130,6 @@ def _forward_step(
     batch,
     *,
     attention_metadata=None,
-    moe_metadata=None,
     forward_inputs: Mapping[str, Any] | None = None,
 ) -> dict[str, torch.Tensor]:
     kwargs = {
@@ -144,11 +139,6 @@ def _forward_step(
             getattr(batch, "attention_metadata", None)
             if attention_metadata is None
             else attention_metadata
-        ),
-        "moe_metadata": (
-            getattr(batch, "moe_metadata", None)
-            if moe_metadata is None
-            else moe_metadata
         ),
         "labels": getattr(batch, "labels", None),
         "loss_mask": getattr(batch, "loss_mask", None),
@@ -202,7 +192,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         model_cfg,
         ps=parallel_state,
         use_deepep=impl_cfg.use_deepep,
-        indexer_loss_coeff=impl_cfg.dsa_indexer_loss_coeff,
     )
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     if recompute_spec:
@@ -229,12 +218,11 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             init_workspace_manager(next(model.parameters()).device, num_ubatches=1)
     selected_layers = tuple(model.layer_indices)
     attention_builders = None
-    moe_metadata = None
 
     def ensure_runtime_assets():
-        nonlocal attention_builders, moe_metadata
-        if attention_builders is not None and moe_metadata is not None:
-            return attention_builders, moe_metadata
+        nonlocal attention_builders
+        if attention_builders is not None:
+            return attention_builders
         device = next(model.parameters()).device
         attention_builders = {
             layer_idx: DS4SparseIndexerCompressorMetadataAdapter.from_hf(
@@ -245,27 +233,16 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             )
             for layer_idx in selected_layers
         }
-        moe_metadata = {
-            layer_idx: build_moe_metadata(model_cfg, device)
-            for layer_idx in selected_layers
-        }
-        return attention_builders, moe_metadata
+        return attention_builders
     from vllm.config import VllmConfig
 
     vllm_config = VllmConfig()
 
     def forward_step(model: nn.Module, batch) -> dict[str, torch.Tensor]:
         attention_metadata = getattr(batch, "attention_metadata", None)
-        moe_metadata = getattr(batch, "moe_metadata", None)
-        if (attention_metadata is None) != (moe_metadata is None):
-            raise ValueError(
-                "caller-owned attention_metadata and moe_metadata must be "
-                "provided together"
-            )
         current_attention_builders = None
-        current_moe_metadata = None
-        if attention_metadata is None or moe_metadata is None:
-            current_attention_builders, current_moe_metadata = ensure_runtime_assets()
+        if attention_metadata is None:
+            current_attention_builders = ensure_runtime_assets()
         seq_lens = getattr(batch, "seq_lens", None)
         if seq_lens is None:
             if parallel_state.cp_size > 1:
@@ -307,9 +284,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                     ].build_prefill_batch(token_counts)
                     for layer_idx in selected_layers
                 }
-        if moe_metadata is None:
-            assert current_moe_metadata is not None
-            moe_metadata = current_moe_metadata
         if parallel_state.cp_size > 1:
             if cp_packed_seq_params is None:
                 raise RuntimeError("DeepSeek V4 vLLM CP requires packed sequence metadata")
@@ -333,7 +307,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 model,
                 batch,
                 attention_metadata=attention_metadata,
-                moe_metadata=moe_metadata,
                 forward_inputs=forward_inputs,
             )
 

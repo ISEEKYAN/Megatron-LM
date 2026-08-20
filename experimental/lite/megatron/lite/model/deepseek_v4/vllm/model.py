@@ -12,11 +12,10 @@ from megatron.lite.model.deepseek_v4.lite.model import (
     DeepseekV4Layer as LiteDeepseekV4Layer,
     DeepseekV4Model as LiteDeepseekV4Model,
 )
-from megatron.lite.model.deepseek_v4.vllm.moe import DeepseekV4MoE, MoEKernelMetadata
+from megatron.lite.model.deepseek_v4.vllm.moe import DeepseekV4MoE
 from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import AttentionKernelMetadata
 from megatron.lite.model.deepseek_v4.vllm.primitive import (
     attention_core,
-    attach_indexer_aux_loss,
     block_fp8_linear,
     fused_block_fp8_linear,
     fused_qkv_rms_norm,
@@ -30,7 +29,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive import (
 )
 from megatron.lite.primitive.modules.attention.hca import HyperConnection
 from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
-from megatron.lite.primitive.kernels.vllm_ds4 import (
+from vllm.models.deepseek_v4.training_kernels import (
     DS4KVInsertAdapter,
     FlashMLAAdapter,
     FusedQKVRMSNormAdapter,
@@ -48,6 +47,7 @@ from megatron.lite.primitive.parallel.mhc import (
 from megatron.lite.primitive.quantization.deployment_block_fp8 import (
     DeploymentBlockFP8Adapter,
     DeploymentFusedBlockFP8Adapter,
+    quantize_block_fp8_weight,
 )
 
 
@@ -68,7 +68,7 @@ def _default_attention_ops() -> SimpleNamespace:
         norm=FusedQKVRMSNormAdapter(),
         kv_insert=DS4KVInsertAdapter(KVCacheLayout.FP8_DS_MLA),
         flash=FlashMLAAdapter(),
-        o_project=OProjectionAdapter(),
+        o_project=OProjectionAdapter(quantize_block_fp8_weight),
     )
 
 
@@ -79,7 +79,6 @@ class _AttentionState(CompressedSparseAttention):
         *,
         ps=None,
         layer_idx: int,
-        indexer_loss_coeff: float = 0.0,
     ):
         ps = ps or ParallelState()
         super().__init__(config, layer_idx=layer_idx, ps=ps)
@@ -90,7 +89,6 @@ class _AttentionState(CompressedSparseAttention):
             else 0
         )
         self.compress_ratio = max(1, configured_ratio)
-        self.indexer_loss_coeff = indexer_loss_coeff
         self.adapters = _default_attention_ops()
         self._projection_streams: list[torch.cuda.Stream] | None = None
         self._projection_events: list[torch.cuda.Event] | None = None
@@ -159,16 +157,11 @@ class _AttentionState(CompressedSparseAttention):
             raise RuntimeError("native DS4 CP requires a model-owned CP group")
         if metadata.cp_packed_seq_params is None or metadata.cp_positions is None:
             raise RuntimeError("native DS4 CP requires packed sequence geometry")
-        if self.indexer_loss_coeff:
-            raise NotImplementedError(
-                "native DS4 CP indexer auxiliary loss is not implemented"
-            )
-
         from megatron.core.transformer.experimental_attention_variant.csa_utils import (
             cp_layout_kernels,
             cp_utils,
         )
-        from megatron.lite.model.deepseek_v4.vllm.native_cp import (
+        from vllm.models.deepseek_v4.training_cp import (
             c128_all_visible_topk,
             compressed_width,
             official_indexer_topk,
@@ -176,6 +169,7 @@ class _AttentionState(CompressedSparseAttention):
             quantized_main_k_visible,
         )
         from megatron.lite.model.deepseek_v4.vllm.primitive.attention import (
+            _rope_and_qnorm,
             compressed_compact_graph,
         )
         from megatron.lite.primitive.modules.attention.cp_geometry import (
@@ -219,6 +213,7 @@ class _AttentionState(CompressedSparseAttention):
             positions,
             metadata.cos_sin_cache,
             self.adapters.kv_insert,
+            _rope_and_qnorm,
             eps=self.config.rms_norm_eps,
             rope_dim=self.config.qk_rope_head_dim,
             padded_heads=self.config.num_attention_heads,
@@ -264,6 +259,7 @@ class _AttentionState(CompressedSparseAttention):
             boundary_positions,
             metadata.cos_sin_cache,
             self.adapters.kv_insert,
+            _rope_and_qnorm,
             eps=self.config.rms_norm_eps,
             rope_dim=self.config.qk_rope_head_dim,
             padded_heads=self.config.num_attention_heads,
@@ -305,7 +301,7 @@ class _AttentionState(CompressedSparseAttention):
                 eps=self.config.rms_norm_eps,
             )
             if ratio in (4, 128):
-                from megatron.lite.model.deepseek_v4.vllm.native_cp import (
+                from vllm.models.deepseek_v4.training_cp import (
                     official_compact_compressed_visible,
                 )
 
@@ -647,31 +643,6 @@ class _AttentionState(CompressedSparseAttention):
             compressor_workspace_slots=metadata.compressor_workspace_slot_mapping,
             query_start_loc=metadata.query_start_loc,
         )
-        if self.indexer is not None and torch.is_grad_enabled():
-            assert indexer_topk is not None
-            assert index_q is not None
-            assert indexer_kv_score is not None and indexer_weights is not None
-            assert compressor_kv_score is not None and self.compressor is not None
-            result = attach_indexer_aux_loss(
-                result,
-                q,
-                index_q,
-                indexer_kv_score,
-                indexer_weights,
-                compressor_kv_score,
-                self.indexer.compressor.ape,
-                self.indexer.compressor.norm.weight,
-                self.compressor.ape,
-                self.compressor.norm.weight,
-                metadata.positions,
-                metadata.cos_sin_cache,
-                indexer_topk,
-                ratio=self.compress_ratio,
-                rope_dim=self.config.qk_rope_head_dim,
-                eps=self.config.rms_norm_eps,
-                softmax_scale=scale,
-                loss_coeff=self.indexer_loss_coeff,
-            )
         result = result.reshape(hidden_states.shape[0], -1, self.config.head_dim)
         result = result[:, : self.config.num_attention_heads, :]
 
@@ -705,17 +676,6 @@ class _AttentionState(CompressedSparseAttention):
 
 
 class _VLLMCSAAttention(LiteDeepseekV4CSAAttention):
-    def __init__(
-        self,
-        config: DeepseekV4Config,
-        *,
-        ps: ParallelState,
-        layer_idx: int,
-        indexer_loss_coeff: float,
-    ):
-        self._indexer_loss_coeff = indexer_loss_coeff
-        super().__init__(config, layer_idx=layer_idx, ps=ps)
-
     def _build_attention(
         self, config: DeepseekV4Config, *, layer_idx: int, ps: ParallelState
     ) -> nn.Module:
@@ -723,7 +683,6 @@ class _VLLMCSAAttention(LiteDeepseekV4CSAAttention):
             config,
             ps=ps,
             layer_idx=layer_idx,
-            indexer_loss_coeff=self._indexer_loss_coeff,
         )
 
     def forward(
@@ -743,10 +702,8 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         layer_idx: int = 0,
         *,
         use_deepep: bool = False,
-        indexer_loss_coeff: float = 0.0,
     ):
         self.config = config
-        self._vllm_indexer_loss_coeff = indexer_loss_coeff
         super().__init__(
             config,
             ps or ParallelState(),
@@ -761,7 +718,6 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
             config,
             ps=ps,
             layer_idx=layer_idx,
-            indexer_loss_coeff=self._vllm_indexer_loss_coeff,
         )
 
     def _build_moe(
@@ -867,7 +823,7 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         x: torch.Tensor,
         *,
         input_ids: torch.Tensor | None,
-        metadata: MoEKernelMetadata | None = None,
+        metadata=None,
     ) -> torch.Tensor:
         residual, post_mix, res_mix, hidden_states = self._mhc_pre(
             x, self.ffn_hc, self.post_attention_layernorm.weight
@@ -886,10 +842,8 @@ class DeepseekV4Model(LiteDeepseekV4Model):
         ps=None,
         *,
         use_deepep: bool = False,
-        indexer_loss_coeff: float = 0.0,
     ):
         ps = ps or ParallelState()
-        self._vllm_indexer_loss_coeff = indexer_loss_coeff
         train_config = train_config or SimpleNamespace(vpp=1, fp8=False)
         super().__init__(
             config,
@@ -935,7 +889,6 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             ps,
             layer_idx=layer_idx,
             use_deepep=use_deepep,
-            indexer_loss_coeff=self._vllm_indexer_loss_coeff,
         )
 
     def forward(
@@ -944,7 +897,6 @@ class DeepseekV4Model(LiteDeepseekV4Model):
         hidden_states: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_metadata: AttentionKernelMetadata | None = None,
-        moe_metadata: MoEKernelMetadata | None = None,
         labels: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
         temperature: float | torch.Tensor = 1.0,
@@ -983,16 +935,10 @@ class DeepseekV4Model(LiteDeepseekV4Model):
                 if isinstance(attention_metadata, dict)
                 else attention_metadata
             )
-            layer_moe_metadata = (
-                moe_metadata.get(layer_idx)
-                if isinstance(moe_metadata, dict)
-                else moe_metadata
-            )
             hidden_states = layer(
                 hidden_states,
                 position_ids=position_ids,
                 attention_metadata=layer_attention_metadata,
-                moe_metadata=layer_moe_metadata,
                 input_ids=input_ids,
             )
         if not self.post_process:

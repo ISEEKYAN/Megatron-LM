@@ -4,12 +4,7 @@ from collections.abc import Callable
 
 import torch
 
-from ._contract import (
-    check_parameter_versions,
-    fp32_linear_vjp,
-    own_visible_tensor,
-    parameter_versions,
-)
+from ._contract import fp32_linear_vjp, own_visible_tensor
 
 
 class _VisibleLinear(torch.autograd.Function):
@@ -20,12 +15,10 @@ class _VisibleLinear(torch.autograd.Function):
             output = output[0]
         ctx.save_for_backward(value)
         ctx.weights = weights
-        ctx.versions = parameter_versions(weights)
         return own_visible_tensor(output)
 
     @staticmethod
     def backward(ctx, grad_output):
-        check_parameter_versions(ctx.weights, ctx.versions)
         (value,) = ctx.saved_tensors
         fused = torch.cat(ctx.weights, dim=0)
         grad_value, grad_weight = fp32_linear_vjp(grad_output, value, fused)
