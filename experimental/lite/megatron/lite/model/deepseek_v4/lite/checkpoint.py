@@ -413,6 +413,30 @@ class DeepseekV4WeightSpec:
         return self._source_is_quantized(native_name)
 
     def bind_source_scales(self, model: nn.Module, ps: ParallelState) -> None:
+        dense_scales = {
+            name: scale.detach().cpu().float().contiguous()
+            for name, scale in self.source_block_scales.items()
+            if not EXPERT_CLASSIFIER(name)
+        }
+        dense_group = getattr(ps, "dp_cp_group", None)
+        if (
+            dense_group is not None
+            and dist.is_initialized()
+            and dist.get_world_size(dense_group) > 1
+        ):
+            dense_ranks = dist.get_process_group_ranks(dense_group)
+            source_rank = dense_ranks[0]
+            payload = [dense_scales if dist.get_rank() == source_rank else None]
+            dist.broadcast_object_list(
+                payload,
+                src=source_rank,
+                group=dense_group,
+            )
+            dense_scales = payload[0]
+            if not isinstance(dense_scales, dict):
+                raise RuntimeError("dense FP8 source-scale broadcast returned no mapping")
+            self.source_block_scales.update(dense_scales)
+
         parameters = dict(model.named_parameters())
         registry: dict[str, torch.Tensor] = {}
         global_to_local = {

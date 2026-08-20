@@ -226,6 +226,40 @@ def test_ds4_source_scales_bind_global_expert_to_ep_local_parameter():
     assert "layers.0.mlp.experts.fc1.weight128" in model._fp8_source_scales_by_name
 
 
+def test_ds4_source_scales_broadcast_dense_metadata_to_replicas(monkeypatch):
+    ckpt = _checkpoint_module()
+    model = nn.Module()
+    model.register_parameter(
+        "weight", nn.Parameter(torch.zeros(128, 128, dtype=torch.bfloat16))
+    )
+    cfg = ckpt.DeepseekV4Config(n_routed_experts=4)
+    spec = ckpt.DeepseekV4WeightSpec(cfg, source_block_fp8=True)
+    scale = torch.full((1, 1), 0.5, dtype=torch.float32)
+    group = object()
+    ps = SimpleNamespace(ep_size=4, ep_rank=1, dp_cp_group=group)
+
+    monkeypatch.setattr(ckpt.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(ckpt.dist, "get_world_size", lambda _group: 4)
+    monkeypatch.setattr(
+        ckpt.dist, "get_process_group_ranks", lambda _group: [0, 1, 2, 3]
+    )
+    monkeypatch.setattr(ckpt.dist, "get_rank", lambda: 1)
+
+    def broadcast_object_list(payload, *, src, group):
+        assert src == 0
+        assert group is ps.dp_cp_group
+        assert payload == [None]
+        payload[0] = {"weight": scale}
+
+    monkeypatch.setattr(ckpt.dist, "broadcast_object_list", broadcast_object_list)
+
+    spec.bind_source_scales(model, ps)
+
+    assert torch.equal(model.weight._fp8_source_scales, scale)
+    assert model.weight._fp8_source_scale_version == model.weight._version
+    assert torch.equal(model._fp8_source_scales_by_name["weight"], scale)
+
+
 def test_ds4_export_streams_router_buffers_from_every_pp_stage(monkeypatch):
     from megatron.lite.primitive.ckpt import hf_weights
 
