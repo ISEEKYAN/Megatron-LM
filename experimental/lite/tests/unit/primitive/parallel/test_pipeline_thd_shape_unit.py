@@ -138,6 +138,7 @@ def _dynamic_shape_worker(rank, world, port, results):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port),
                       RANK=str(rank), WORLD_SIZE=str(world))
     pl._PIPELINE_TENSOR_DTYPE = torch.float32  # gloo-safe; sizing is dtype-agnostic
+    pl._pipeline_device = lambda: torch.device("cpu")
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
         ps = _make_ps(2, rank)
@@ -161,6 +162,7 @@ def _fixed_buffer_worker(rank, world, port, results):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port),
                       RANK=str(rank), WORLD_SIZE=str(world))
     pl._PIPELINE_TENSOR_DTYPE = torch.float32
+    pl._pipeline_device = lambda: torch.device("cpu")
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
         ps = _make_ps(2, rank)

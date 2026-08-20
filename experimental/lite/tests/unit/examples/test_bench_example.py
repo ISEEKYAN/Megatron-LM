@@ -139,7 +139,17 @@ class _FakeRuntime:
     def zero_grad(self, handle) -> None:
         pass
 
-    def forward_backward(self, handle, data, loss_fn, *, num_microbatches: int = 1):
+    def forward_backward(
+        self,
+        handle,
+        data,
+        loss_fn,
+        *,
+        num_microbatches: int = 1,
+        forward_only: bool = False,
+        router_replay=None,
+    ):
+        del forward_only, router_replay
         self.loss += 1
         return ForwardResult(model_output=ModelOutputs(loss=torch.tensor(float(self.loss))))
 
@@ -184,10 +194,24 @@ def test_pretrain_session_observes_backward_before_optimizer():
     events = []
 
     class ObservedRuntime(_FakeRuntime):
-        def forward_backward(self, handle, data, loss_fn, *, num_microbatches=1):
+        def forward_backward(
+            self,
+            handle,
+            data,
+            loss_fn,
+            *,
+            num_microbatches=1,
+            forward_only=False,
+            router_replay=None,
+        ):
             events.append("backward")
             return super().forward_backward(
-                handle, data, loss_fn, num_microbatches=num_microbatches
+                handle,
+                data,
+                loss_fn,
+                num_microbatches=num_microbatches,
+                forward_only=forward_only,
+                router_replay=router_replay,
             )
 
         def optimizer_step(self, handle):

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from vllm.model_executor.layers.quantization.utils import fp8_utils
 
 from megatron.lite.model import registry
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
@@ -15,6 +16,15 @@ from megatron.lite.model.deepseek_v4.vllm.moe import DeepseekV4MoE
 from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
+
+
+@pytest.fixture(autouse=True)
+def _batch_invariant_kernel_available(monkeypatch) -> None:
+    monkeypatch.setattr(
+        fp8_utils,
+        "is_batch_invariant_quant_kernel_enabled",
+        lambda: True,
+    )
 
 
 def _tiny_config(*, layers: int = 2) -> DeepseekV4Config:

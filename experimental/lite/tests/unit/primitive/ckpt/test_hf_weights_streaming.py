@@ -685,10 +685,18 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
 
     assert set(groups) == {"nccl-pp"}
     assert exported.keys() == {"weight", "router_bias", "weight2", "router_bias2"}
-    assert torch.equal(exported["weight"], local_weight)
-    assert torch.equal(exported["router_bias"], torch.tensor([1.0, 2.0]))
-    assert torch.equal(exported["weight2"], remote_weight)
-    assert torch.equal(exported["router_bias2"], remote_bias)
+    assert torch.equal(exported["weight"], local_weight.to(exported["weight"].device))
+    assert torch.equal(
+        exported["router_bias"],
+        torch.tensor([1.0, 2.0], device=exported["router_bias"].device),
+    )
+    assert torch.equal(
+        exported["weight2"], remote_weight.to(exported["weight2"].device)
+    )
+    assert torch.equal(
+        exported["router_bias2"],
+        remote_bias.to(exported["router_bias2"].device),
+    )
 
 
 def test_persistent_buffer_load_export_mapping_must_match() -> None:
@@ -845,5 +853,5 @@ def test_pp_export_never_materializes_the_whole_stage(monkeypatch) -> None:
     first_name, first_tensor = next(stream)
 
     assert first_name == "weight_a"
-    assert torch.equal(first_tensor, params["weight_a"])
+    assert torch.equal(first_tensor, params["weight_a"].to(first_tensor.device))
     assert visited == ["weight_a"]

@@ -220,6 +220,14 @@ def _is_native_metadata_key(name: str) -> bool:
     return name.endswith("._extra_state")
 
 
+def _has_block_fp8_source(path: str) -> bool:
+    index_path = Path(path) / "model.safetensors.index.json"
+    if not index_path.is_file():
+        return False
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    return any(str(name).endswith(".scale") for name in payload.get("weight_map", {}))
+
+
 def load_hf_weights(
     model: nn.Module, path: str, config: DeepseekV4Config, ps: ParallelState
 ) -> None:
@@ -228,14 +236,8 @@ def load_hf_weights(
         unwrap_model,
     )
 
-    index_path = Path(path) / "model.safetensors.index.json"
-    source_block_fp8 = False
-    if index_path.is_file():
-        payload = json.loads(index_path.read_text(encoding="utf-8"))
-        weight_map = payload.get("weight_map", {})
-        source_block_fp8 = any(str(name).endswith(".scale") for name in weight_map)
     spec = DeepseekV4WeightSpec(
-        config, source_block_fp8=source_block_fp8
+        config, source_block_fp8=_has_block_fp8_source(path)
     )
     _load(model, path, spec, ps, vocab_size=config.vocab_size)
     spec.bind_source_scales(unwrap_model(model), ps)

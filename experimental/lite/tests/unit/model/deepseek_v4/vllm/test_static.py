@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import pytest
 import torch
+from vllm.model_executor.layers.quantization.utils import fp8_utils
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.model import (
@@ -15,6 +17,15 @@ from megatron.lite.model.deepseek_v4.vllm.model import (
     DeepseekV4Model,
 )
 from megatron.lite.model.deepseek_v4.vllm.moe import DeepseekV4MoE
+
+
+@pytest.fixture(autouse=True)
+def _batch_invariant_kernel_available(monkeypatch) -> None:
+    monkeypatch.setattr(
+        fp8_utils,
+        "is_batch_invariant_quant_kernel_enabled",
+        lambda: True,
+    )
 
 
 def _tiny_config() -> DeepseekV4Config:

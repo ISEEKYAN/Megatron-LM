@@ -96,7 +96,12 @@ def test_reset_clears_counters():
     r.select_indices(torch.tensor([[0, 1]]))
     assert RouterReplay.replay_stats()["rows"] == 2
     RouterReplay.reset_replay_stats()
-    assert RouterReplay.replay_stats() == {"calls": 0, "rows": 0, "changed": 0}
+    assert RouterReplay.replay_stats() == {
+        "calls": 0,
+        "rows": 0,
+        "changed": 0,
+        "sets_changed": 0,
+    }
 
 
 # ------------------------------------------------------- the VOID (liveness) paths

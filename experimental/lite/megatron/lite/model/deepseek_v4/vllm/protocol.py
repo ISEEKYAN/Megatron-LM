@@ -12,7 +12,7 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     export_hf_weights,
     invalidate_bound_source_scales,
     load_hf_weights,
-    save_hf_weights,
+    save_hf_weights as _save_hf_weights_impl,
 )
 from megatron.lite.model.deepseek_v4.lite.protocol import (
     ImplConfig as LiteImplConfig,
@@ -384,3 +384,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
 def vocab_size(model_cfg: DeepseekV4Config) -> int | None:
     return model_cfg.vocab_size
+
+
+def save_hf_weights(chunks, path, model_cfg, ps, **kwargs) -> None:
+    _save_hf_weights_impl(chunks, path, model_cfg, ps, **kwargs)

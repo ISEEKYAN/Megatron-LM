@@ -47,6 +47,7 @@ def test_every_model_applies_qat_before_optimizer_construction(model_name: str):
             and (
                 "optimizer" in node.func.id
                 or node.func.id.startswith("_build_dist_opt")
+                or node.func.id == "build_training_backend"
             )
         )
         or (isinstance(node.func, ast.Attribute) and "optimizer" in node.func.attr)
