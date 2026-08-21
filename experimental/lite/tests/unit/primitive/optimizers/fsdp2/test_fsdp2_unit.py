@@ -20,6 +20,7 @@ from megatron.lite.primitive.optimizers.fsdp2 import (
 from megatron.lite.primitive.optimizers.fsdp2.adamw import (
     build_adamw_optimizer,
     local_grad_sq_sum,
+    to_local_tensor,
 )
 from megatron.lite.primitive.optimizers.fsdp2.wrap import build_fsdp2_shard_placement_fn
 from megatron.lite.primitive.parallel.state import ParallelState
@@ -27,6 +28,7 @@ from megatron.lite.primitive.parallel.state import ParallelState
 fsdp2_wrap = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.wrap")
 fsdp2_optimizer = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.optimizer")
 fsdp2_grad_clip = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.grad_clip")
+fsdp2_adamw = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.adamw")
 
 
 class ToyBlock(nn.Module):
@@ -689,3 +691,43 @@ def test_fused_sq_sum_allocates_no_full_size_temporary():
     # to(float32).pow(2) would add 4x the grad here.
     assert torch.cuda.max_memory_allocated() - before < 1 << 20
     assert float(total) == pytest.approx(_reference_sq_sum([grad.cpu()]), rel=1e-3)
+
+
+@pytest.mark.parametrize("cpu_update", [False, True])
+def test_fp32_adamw_bf16_grad_matches_legacy_fp32_grad_copy(monkeypatch, cpu_update):
+    def legacy_prepare_grad(self, grad, master):
+        if self.cpu_update:
+            return to_local_tensor(grad).detach().to(device=master.device, dtype=torch.float32)
+        return grad.detach().to(dtype=torch.float32)
+
+    torch.manual_seed(0)
+    grad = torch.randn(512, dtype=torch.bfloat16)
+
+    def run():
+        torch.manual_seed(1)
+        param = nn.Parameter(torch.randn(512, dtype=torch.bfloat16))
+        optimizer = build_adamw_optimizer(
+            [{"params": [param], "weight_decay": 0.01}],
+            all_params=[param],
+            lr=0.1,
+            weight_decay=0.01,
+            betas=(0.9, 0.99),
+            eps=1.0e-8,
+            foreach=False,
+            use_fp32_master=True,
+            cpu_update=cpu_update,
+            model_param_dtypes={id(param): torch.bfloat16},
+            opt=SimpleNamespace(),
+        )
+        assert isinstance(optimizer, fsdp2_adamw.FP32AdamW)
+        for _ in range(4):  # several steps so bias correction and state carry-over count
+            param.grad = grad.clone()
+            optimizer.step()
+        state = optimizer.state_dict()
+        keys = ("exp_avgs", "exp_avg_sqs", "master_params")
+        return (param.detach().clone(), *(state[key][0].clone() for key in keys))
+
+    current = run()
+    monkeypatch.setattr(fsdp2_adamw.FP32AdamW, "_prepare_grad", legacy_prepare_grad)
+    for from_current, from_legacy in zip(current, run()):
+        assert torch.equal(from_current, from_legacy)

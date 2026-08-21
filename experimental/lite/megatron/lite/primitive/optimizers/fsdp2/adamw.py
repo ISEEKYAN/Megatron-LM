@@ -230,10 +230,11 @@ class FP32AdamW:
                 self._copy_master_to_param(param, master)
 
     def _prepare_grad(self, grad: torch.Tensor, master: torch.Tensor) -> torch.Tensor:
+        # No .to(float32): add_()/addcmul_() promote into the FP32 accumulators, so a
+        # full-size cast here would only cost peak memory.
         if self.cpu_update:
-            grad = to_local_tensor(grad)
-            return grad.detach().to(device=master.device, dtype=torch.float32)
-        return grad.detach().to(dtype=torch.float32)
+            return to_local_tensor(grad).detach().to(device=master.device)
+        return grad.detach()
 
     def _copy_master_to_param(self, param: nn.Parameter, master: torch.Tensor) -> None:
         model_dtype = self._model_param_dtype(param)
