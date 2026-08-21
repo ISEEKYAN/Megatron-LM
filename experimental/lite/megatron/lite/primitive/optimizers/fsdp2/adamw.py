@@ -11,6 +11,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from megatron.lite.primitive.optimizers.fsdp2.grad_clip import fused_sq_sum
+
 
 def local_grad_sq_sum(
     params: Iterable[nn.Parameter],
@@ -18,18 +20,19 @@ def local_grad_sq_sum(
     dtype: torch.dtype,
     default_device: torch.device | None = None,
 ) -> torch.Tensor:
-    total: torch.Tensor | None = None
+    grads: list[torch.Tensor] = []
+    device: torch.device | None = None
     for param in params:
         grad = param.grad
         if grad is None:
             continue
-        grad = to_local_tensor(grad)
-        if total is None:
-            total = torch.zeros((), device=grad.device, dtype=dtype)
-        total += grad.detach().to(dtype).pow(2).sum()
-    if total is None:
+        grad = to_local_tensor(grad).detach()
+        if device is None:
+            device = grad.device
+        grads.append(grad)
+    if device is None:
         return torch.zeros((), device=default_device or torch.device("cpu"), dtype=dtype)
-    return total
+    return fused_sq_sum(grads, dtype=dtype, device=device)
 
 
 def to_local_tensor(tensor):
