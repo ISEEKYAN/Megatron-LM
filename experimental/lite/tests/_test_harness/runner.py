@@ -31,8 +31,7 @@ if str(HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(HARNESS_ROOT))
 
 from markers import ARCHITECTURE_CAPABILITIES  # noqa: E402
-from markers import (
-    ARCHITECTURE_ORDER,
+from markers import (  # noqa: E402
     DEFAULT_TIMEOUT_SECONDS,
     ENVIRONMENT_VARIABLES,
     architecture_supports,
@@ -241,6 +240,7 @@ def _load_torch():
 
 def _sanitized_environment(environ: dict[str, str] | None = None) -> dict[str, str]:
     base = dict(os.environ if environ is None else environ)
+    dependency_paths = base.get("MLITE_TEST_DEPENDENCY_PATHS", "")
     for key in tuple(base):
         if (
             key in _DISTRIBUTED_ENV
@@ -251,7 +251,10 @@ def _sanitized_environment(environ: dict[str, str] | None = None) -> dict[str, s
             base.pop(key)
     base.pop("PYTEST_ADDOPTS", None)
     base.pop("PYTEST_PLUGINS", None)
-    base["PYTHONPATH"] = os.pathsep.join((str(REPO_ROOT), str(LITE_ROOT)))
+    source_roots = [
+        path for path in dependency_paths.split(os.pathsep) if path
+    ] + [str(REPO_ROOT), str(LITE_ROOT)]
+    base["PYTHONPATH"] = os.pathsep.join(source_roots)
     base["PYTHONDONTWRITEBYTECODE"] = "1"
     base["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     base["PYTHONHASHSEED"] = "0"
