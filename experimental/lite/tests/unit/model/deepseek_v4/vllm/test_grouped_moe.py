@@ -56,6 +56,34 @@ def test_vllm_visible_silu_quant_has_no_layout_dependent_fallback(monkeypatch):
     assert calls[0][1]["masked_m"] is None
 
 
+def test_contiguous_input_ceil_scale_uses_ue8m0_quantization(monkeypatch):
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+    from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
+
+    calls = []
+
+    def quantize(value, group_size, **kwargs):
+        calls.append((value, group_size, kwargs))
+        return value.to(torch.float8_e4m3fn), torch.ones(
+            value.shape[0], value.shape[1] // group_size
+        )
+
+    monkeypatch.setattr(
+        DeepGemmQuantScaleFMT,
+        "from_oracle",
+        staticmethod(
+            lambda: DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
+        ),
+    )
+    monkeypatch.setattr(fp8_utils, "per_token_group_quant_fp8", quantize)
+    value = torch.randn(2, 256, dtype=torch.bfloat16)
+
+    vllm_grouped_moe._vllm_quantize_contiguous_input(value)
+
+    assert calls[0][1] == 128
+    assert calls[0][2]["use_ue8m0"] is True
+
+
 def test_grouped_moe_preserves_clamped_forward_and_bf16_master_vjp(
     monkeypatch,
 ) -> None:
