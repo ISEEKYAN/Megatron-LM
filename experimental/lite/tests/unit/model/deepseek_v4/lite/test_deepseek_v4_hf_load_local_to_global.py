@@ -245,6 +245,10 @@ def test_ds4_quantized_resync_preserves_fp32_release_parameters(monkeypatch):
         ckpt, "_export_unquantized_weights", fake_unquantized_export
     )
     cfg = DeepseekV4Config(num_hidden_layers=1, n_routed_experts=8)
+    cfg.quantization_config = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
     ps = SimpleNamespace(pp_size=1)
 
     exported = dict(
