@@ -229,6 +229,42 @@ def test_ds4_nonreversible_fp8_falls_back_to_online_quantization(monkeypatch):
     assert spec.source_block_scales == {}
 
 
+def test_ds4_quantized_resync_preserves_fp32_release_parameters(monkeypatch):
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+
+    ckpt = _checkpoint_module()
+    source = torch.tensor([1.0 + 2**-20], dtype=torch.float32)
+    captured = {}
+
+    def fake_unquantized_export(model, config, ps, **kwargs):
+        del model, config, ps
+        captured.update(kwargs)
+        yield "layers.0.attn.compressor.hc_fn", source
+
+    monkeypatch.setattr(
+        ckpt, "_export_unquantized_weights", fake_unquantized_export
+    )
+    cfg = DeepseekV4Config(num_hidden_layers=1, n_routed_experts=8)
+    ps = SimpleNamespace(pp_size=1)
+
+    exported = dict(
+        ckpt.export_hf_weights(
+            nn.Module(),
+            cfg,
+            ps,
+            target="block_fp8",
+            resync_config={"expert_dtype": "fp8"},
+            export_dtype="bfloat16",
+        )
+    )
+
+    assert "export_dtype" not in captured
+    actual = exported["layers.0.attn.compressor.hc_fn"]
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, source)
+    assert not torch.equal(actual, source.to(torch.bfloat16).to(torch.float32))
+
+
 def _mock_dense_replica_receiver(monkeypatch, master, source_scale):
     from megatron.lite.primitive.ckpt import hf_weights
 

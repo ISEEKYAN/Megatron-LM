@@ -632,6 +632,11 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
     resync_config = kwargs.pop("resync_config", None)
     if target not in {"hf", ResyncFormat.BF16.value, *_QUANTIZED_RESYNC_TARGETS}:
         raise ValueError(f"Unsupported DeepSeek-V4 export target: {target!r}")
+    if target in _QUANTIZED_RESYNC_TARGETS:
+        # Quantized matrices are converted by the model-owned resync adapter
+        # below. A global export cast would also truncate release FP32 tensors
+        # (mHC, compressor, indexer) before they reach vLLM.
+        kwargs.pop("export_dtype", None)
     source_scales = (
         _export_source_scales(model, config, ps)
         if target in _QUANTIZED_RESYNC_TARGETS

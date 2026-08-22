@@ -75,7 +75,7 @@ def export_resync_weights(
     resync_config: Mapping[str, Any] | None = None,
     source_scales: Mapping[str, torch.Tensor] | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Convert gathered DS4 BF16 weights to original checkpoint representation."""
+    """Quantize DS4 matrix masters while preserving release FP32 tensors."""
     expert_dtype, block_shape, ignored = _quantization_contract(config, resync_config)
     # vLLM's FP8 expert online-reload path materializes block scales as
     # float32 ``weight_scale_inv`` tensors.  Keep W8 resync scales in that
