@@ -680,6 +680,7 @@ def test_grad_norm_paths_accumulate_bf16_in_fp32():
     assert float(fsdp2_grad_clip.sharded_grad_abs_max([param, plain])) == pytest.approx(7.0)
 
 
+@pytest.mark.gpus(1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE multi_tensor_l2norm is CUDA-only.")
 def test_fused_sq_sum_allocates_no_full_size_temporary():
     grad = torch.randn(64 * 1024 * 1024, dtype=torch.bfloat16, device="cuda")
