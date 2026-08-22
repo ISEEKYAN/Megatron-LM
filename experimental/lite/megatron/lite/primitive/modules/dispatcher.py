@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Token dispatcher: AllToAll and DeepEP dispatch/combine."""
+"""Token dispatcher: AllToAll, DeepEP, and HybridEP dispatch/combine."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 
 from megatron.lite.primitive.modules.moe import _AllToAll
+from megatron.lite.primitive.modules import hybridep
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.moe import permute, unpermute
@@ -20,6 +21,18 @@ except ImportError:
     deep_ep = None  # type: ignore
     EventHandle = None  # type: ignore
     EventOverlap = None  # type: ignore
+
+
+MOE_TOKEN_DISPATCHER_TYPES = frozenset(("alltoall", "deepep", "hybridep"))
+
+
+def validate_moe_token_dispatcher_type(value: str) -> str:
+    if value not in MOE_TOKEN_DISPATCHER_TYPES:
+        raise ValueError(
+            "moe_token_dispatcher_type must be one of "
+            "'alltoall', 'deepep', or 'hybridep'"
+        )
+    return value
 
 
 def _hidden_bytes(hidden_size: int) -> int:
@@ -194,7 +207,7 @@ class TokenDispatcher:
         hidden_size: int,
         ps: ParallelState,
         *,
-        use_deepep: bool = True,
+        moe_token_dispatcher_type: str = "alltoall",
         moe_permute_fusion: bool | None = None,
     ):
         self.ps = ps
@@ -205,10 +218,33 @@ class TokenDispatcher:
             _use_moe_permute_fusion() if moe_permute_fusion is None else bool(moe_permute_fusion)
         )
 
-        self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
-        if self.use_deepep:
+        self.moe_token_dispatcher_type = validate_moe_token_dispatcher_type(
+            moe_token_dispatcher_type
+        )
+        self._deepep_enabled = (
+            self.moe_token_dispatcher_type == "deepep" and ps.ep_size > 1
+        )
+        self._hybridep_enabled = (
+            self.moe_token_dispatcher_type == "hybridep" and ps.ep_size > 1
+        )
+        if self._deepep_enabled:
+            if deep_ep is None:
+                raise RuntimeError(
+                    "deepep requires the DeepEP runtime when expert parallelism is enabled"
+                )
             assert ps.tp_ep_group is not None
             self.buffer = _build_deepep_buffer(ps.tp_ep_group, hidden_size)
+        self._hybridep_group = None
+        self._hybridep_buffer = None
+        self._hybridep_handle = None
+        if self._hybridep_enabled:
+            hybridep.require_available()
+            if getattr(ps, "ep_group", None) is None:
+                raise RuntimeError(
+                    "hybridep requires an expert-parallel process group"
+                )
+            self._hybridep_group = ps.ep_group
+            hybridep.validate_topology(self._hybridep_group)
 
         self._row_id_map: torch.Tensor | None = None
         self._restore_shape: tuple | None = None
@@ -231,8 +267,12 @@ class TokenDispatcher:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if self.ep_size <= 1:
             return self._dispatch_local(hidden_states, topk_scores, topk_indices)
-        if self.use_deepep:
+        if self._deepep_enabled:
             return self._dispatch_deepep(hidden_states, topk_scores, topk_indices)
+        if self._hybridep_enabled:
+            return self._dispatch_hybridep(
+                hidden_states, topk_scores, topk_indices
+            )
         dispatched, tpe, sorted_scores = self._dispatch_alltoall(
             hidden_states, topk_scores, topk_indices
         )
@@ -241,14 +281,16 @@ class TokenDispatcher:
     def combine(self, expert_output: torch.Tensor) -> torch.Tensor:
         if self.ep_size <= 1:
             return self._combine_local(expert_output)
-        if self.use_deepep:
+        if self._deepep_enabled:
             return self._combine_deepep(expert_output)
+        if self._hybridep_enabled:
+            return self._combine_hybridep(expert_output)
         return self._combine_alltoall(expert_output)
 
     def submit_deepep_combine(
         self, expert_output: torch.Tensor, *, allocate_on_comm_stream: bool = False
     ):
-        if not self.use_deepep:
+        if not self._deepep_enabled:
             raise RuntimeError("submit_deepep_combine requires DeepEP combine.")
         rank_grouped = unpermute(
             expert_output,
@@ -276,7 +318,7 @@ class TokenDispatcher:
         return {"combined": combined, "event": event}
 
     def finish_deepep_combine(self, state):
-        if not self.use_deepep:
+        if not self._deepep_enabled:
             raise RuntimeError("finish_deepep_combine requires DeepEP combine.")
         event = state.get("event")
         if event is not None:
@@ -421,7 +463,7 @@ class TokenDispatcher:
     def submit_deepep_dispatch(
         self, hidden_states, topk_scores, topk_indices, *, allocate_on_comm_stream: bool = False
     ):
-        if not self.use_deepep:
+        if not self._deepep_enabled:
             raise RuntimeError("submit_deepep_dispatch requires DeepEP dispatch.")
         previous_event = (
             EventOverlap(EventHandle())
@@ -467,7 +509,7 @@ class TokenDispatcher:
         }
 
     def finish_deepep_dispatch(self, state):
-        if not self.use_deepep:
+        if not self._deepep_enabled:
             raise RuntimeError("finish_deepep_dispatch requires DeepEP dispatch.")
         self._handle = state["handle"]
         self._deepep_event = state["event"]
@@ -566,6 +608,57 @@ class TokenDispatcher:
             self._deepep_event.current_stream_wait()
             self._deepep_event = None
 
+    def _dispatch_hybridep(
+        self,
+        hidden_states: torch.Tensor,
+        topk_scores: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ):
+        if self._hybridep_handle is not None:
+            raise RuntimeError(
+                "hybridep dispatch requires the previous handle to be combined"
+            )
+        buffer = hybridep.get_buffer(
+            self._hybridep_group,
+            hidden_states.shape[1],
+            self.num_local_experts,
+            hidden_states.shape[0],
+        )
+        self._hybridep_buffer = buffer
+        dispatched, permuted_probs, tokens_per_expert, handle = (
+            hybridep.Dispatch.apply(
+                buffer,
+                hidden_states,
+                topk_indices,
+                topk_scores,
+                self.num_experts,
+                self.num_local_experts,
+            )
+        )
+        self._hybridep_handle = handle
+        self._local_tpe_list = [
+            int(value)
+            for value in tokens_per_expert.detach().cpu().tolist()
+        ]
+        return dispatched, tokens_per_expert, permuted_probs
+
+    def _combine_hybridep(self, expert_output: torch.Tensor):
+        if self._hybridep_handle is None:
+            raise RuntimeError("hybridep combine has no matching dispatch handle")
+        if self._hybridep_buffer is None:
+            raise RuntimeError("hybridep combine lost its dispatch buffer")
+        handle = self._hybridep_handle
+        try:
+            return hybridep.Combine.apply(
+                self._hybridep_buffer,
+                expert_output,
+                handle,
+            )
+        finally:
+            self._hybridep_buffer = None
+            self._hybridep_handle = None
+            self._local_tpe_list = None
+
     def _combine_deepep(self, expert_output):
         rank_grouped = unpermute(
             expert_output,
@@ -586,4 +679,8 @@ class TokenDispatcher:
         return combined
 
 
-__all__ = ["TokenDispatcher"]
+__all__ = [
+    "MOE_TOKEN_DISPATCHER_TYPES",
+    "TokenDispatcher",
+    "validate_moe_token_dispatcher_type",
+]

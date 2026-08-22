@@ -23,7 +23,7 @@ class DeepseekV4MoE(nn.Module):
         ps: ParallelState,
         *,
         layer_idx: int,
-        use_deepep: bool = False,
+        moe_token_dispatcher_type: str = "alltoall",
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -54,7 +54,7 @@ class DeepseekV4MoE(nn.Module):
             config.n_routed_experts,
             config.hidden_size,
             ps,
-            use_deepep=use_deepep,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
         )
 
     def _hash_route(

@@ -24,6 +24,9 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import export_hf_weights as _ex
 from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.modules.dispatcher import (
+    validate_moe_token_dispatcher_type,
+)
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.quantization import (
     QATSpec,
@@ -57,7 +60,7 @@ class ImplConfig:
     optimizer: str | None = "dist_opt"
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
-    use_deepep: bool = False
+    moe_token_dispatcher_type: str = "alltoall"
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     hf_path: str = ""
@@ -79,6 +82,9 @@ class ImplConfig:
     # upstream Megatron linear_cp_mode='chunkwise').
     gdn_cp_mode: str = "headwise"
     qat: QATSpec | dict | None = None
+
+    def __post_init__(self) -> None:
+        validate_moe_token_dispatcher_type(self.moe_token_dispatcher_type)
 
 
 def _full_attn_module(layer, name: str):
@@ -169,8 +175,14 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
     p = impl_cfg.parallel
 
-    if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
-        raise ValueError("use_deepep and etp>1 are mutually exclusive")
+    if (
+        impl_cfg.moe_token_dispatcher_type != "alltoall"
+        and p.etp is not None
+        and p.etp > 1
+    ):
+        raise ValueError(
+            "deepep/hybridep and etp>1 are mutually exclusive"
+        )
 
     if impl_cfg.router_aux_loss_coef is not None:
         model_cfg.router_aux_loss_coef = impl_cfg.router_aux_loss_coef
@@ -198,7 +210,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         pp=ps.pp_size,
         cp=ps.cp_size,
         vpp=vpp,
-        use_deepep=impl_cfg.use_deepep,
+        moe_token_dispatcher_type=impl_cfg.moe_token_dispatcher_type,
         fp8=False,
         recompute_modules=recompute_spec,
         deterministic=deterministic,

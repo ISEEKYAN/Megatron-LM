@@ -28,15 +28,16 @@ def moe(task, implementation, config, reference, budget):
         "reference": reference or "HuggingFace/Megatron MoE layer or first-principles weighted sum",
     }
     implementation_contract = {
-        "details": ["router", "topk", "token dispatcher", "DeepEP dispatcher", "expert MLP", "combine weights"],
-        "state": ["expert params", "router dtype", "capacity/drop policy", "DeepEP dispatch metadata"],
-        "boundaries": ["module owns routing math; EP owns distributed expert placement; DeepEP owns dispatch/combine transport"],
+        "details": ["router", "topk", "token dispatcher", "AllToAll/DeepEP/HybridEP transport", "expert MLP", "combine weights"],
+        "state": ["expert params", "router dtype", "capacity/drop policy", "transport dispatch handle"],
+        "boundaries": ["module owns routing math; EP owns distributed expert placement; the selected dispatcher owns dispatch/combine transport"],
     }
     usage_contract = {
-        "config": require_config_keys(config, ["num_experts", "top_k", "expert_parallel_size", "use_deepep"]),
+        "config": require_config_keys(config, ["num_experts", "top_k", "expert_parallel_size", "moe_token_dispatcher_type"]),
+        "allowed_dispatchers": ["alltoall", "deepep", "hybridep"],
         "choose_when": ["model architecture has sparse experts", "expert count justifies EP or grouped GEMM"],
-        "avoid_when": ["router tie behavior cannot be stabilized", "DeepEP metadata cannot be validated against all-to-all"],
-        "compose_with": ["primitive.parallel.ep", "DeepEP dispatcher when EP>1", "primitive.parallel.tp for expert MLP if explicit"],
+        "avoid_when": ["router tie behavior cannot be stabilized", "selected transport runtime or topology cannot be validated"],
+        "compose_with": ["primitive.parallel.ep", "one explicit dispatcher transport when EP>1", "primitive.parallel.tp for expert MLP if explicit"],
     }
     ep_validation = None
     if config.expert_parallel_size > 1:
@@ -45,7 +46,7 @@ def moe(task, implementation, config, reference, budget):
             return blocked("MoE EP composition failed", evidence=ep_validation)
 
     validation = primitive.validate(task, primitive=implementation.moe, implementation=implementation, budget=budget)
-    risks = ["router tie sensitivity", "expert capacity mismatch", "DeepEP metadata mismatch", "hidden state flattening bug"]
+    risks = ["router tie sensitivity", "expert capacity mismatch", "transport metadata mismatch", "HybridEP topology mismatch", "hidden state flattening bug"]
     if not validation.done:
         return blocked("MoE validation failed", evidence=validation)
     return done(

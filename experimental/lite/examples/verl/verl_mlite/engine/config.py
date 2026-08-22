@@ -29,6 +29,7 @@ class MegatronLiteEngineConfig(EngineConfig):
 
     attention_backend_override: str | None = "flash"
     router_aux_loss_coef: float | None = None
+    moe_token_dispatcher_type: str = "alltoall"
     cross_entropy_fusion: bool | None = None
     export_dtype: str | None = "bfloat16"
     qat: dict[str, Any] = field(default_factory=dict)
@@ -43,6 +44,15 @@ class MegatronLiteEngineConfig(EngineConfig):
         if self.strategy != "mlite":
             raise ValueError(
                 f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}"
+            )
+        if self.moe_token_dispatcher_type not in {
+            "alltoall",
+            "deepep",
+            "hybridep",
+        }:
+            raise ValueError(
+                "moe_token_dispatcher_type must be one of "
+                "'alltoall', 'deepep', or 'hybridep'"
             )
         if self.custom_backend_module:
             importlib.import_module(self.custom_backend_module)

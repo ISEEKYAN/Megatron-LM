@@ -64,6 +64,11 @@ def _engine_config(**kwargs):
     return MegatronLiteEngineConfig(**values)
 
 
+def test_verl_config_rejects_unknown_moe_dispatcher() -> None:
+    with pytest.raises(ValueError, match="alltoall.*deepep.*hybridep"):
+        _engine_config(moe_token_dispatcher_type="auto")
+
+
 @pytest.mark.parametrize("num_microbatches", [1, 4])
 def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     engine = _engine(engine_config=_engine_config())
@@ -158,6 +163,7 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
             cp=1,
             optimizer_offload=True,
             attention_backend_override="flash",
+            moe_token_dispatcher_type="hybridep",
             impl_cfg={"use_thd": True, "deterministic": False},
         )
     )
@@ -171,6 +177,7 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
     assert config.parallel.etp == 1
     assert config.optimizer.offload_fraction == 1.0
     assert config.attention_backend_override == "flash"
+    assert config.impl_cfg["moe_token_dispatcher_type"] == "hybridep"
     assert config.impl_cfg["use_thd"] is True
     assert config.impl_cfg["deterministic"] is False
 

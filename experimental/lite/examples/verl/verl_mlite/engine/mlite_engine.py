@@ -623,6 +623,9 @@ class MegatronLiteEngine(BaseEngine):
 
     def _build_impl_cfg(self) -> dict[str, Any]:
         impl_cfg = dict(self.engine_config.impl_cfg)
+        impl_cfg["moe_token_dispatcher_type"] = (
+            self.engine_config.moe_token_dispatcher_type
+        )
         if impl_cfg.get("use_thd", True) is not True:
             raise ValueError(
                 "MegatronLiteEngine supports only THD/no-padding SFT; set engine.impl_cfg.use_thd=True."

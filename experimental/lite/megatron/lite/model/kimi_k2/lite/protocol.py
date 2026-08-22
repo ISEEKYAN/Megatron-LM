@@ -20,6 +20,9 @@ from megatron.lite.model.protocol_utils import (
     unpack_thd_forward_output,
 )
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.modules.dispatcher import (
+    validate_moe_token_dispatcher_type,
+)
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.primitive.quantization import (
@@ -79,7 +82,7 @@ class ImplConfig:
     optimizer: str | None = "dist_opt"
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
-    use_deepep: bool = False
+    moe_token_dispatcher_type: str = "alltoall"
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     hf_path: str = ""
@@ -94,6 +97,9 @@ class ImplConfig:
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
     qat: QATSpec | dict | None = None
+
+    def __post_init__(self) -> None:
+        validate_moe_token_dispatcher_type(self.moe_token_dispatcher_type)
 
 
 def build_model_config(source: str | Path | dict, **overrides) -> KimiK2Config:
@@ -147,8 +153,14 @@ def _build_dist_opt_optimizer(
 
 def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     p = impl_cfg.parallel
-    if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
-        raise ValueError("use_deepep and etp>1 are mutually exclusive")
+    if (
+        impl_cfg.moe_token_dispatcher_type != "alltoall"
+        and p.etp is not None
+        and p.etp > 1
+    ):
+        raise ValueError(
+            "deepep/hybridep and etp>1 are mutually exclusive"
+        )
     if impl_cfg.router_aux_loss_coef is not None:
         model_cfg.aux_loss_alpha = impl_cfg.router_aux_loss_coef
     mtp_enable = bool(impl_cfg.mtp_enable)
@@ -174,7 +186,7 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
         pp=ps.pp_size,
         cp=ps.cp_size,
         vpp=vpp,
-        use_deepep=impl_cfg.use_deepep,
+        moe_token_dispatcher_type=impl_cfg.moe_token_dispatcher_type,
         fp8=False,
         recompute_modules=recompute_spec,
         deterministic=impl_cfg.deterministic,

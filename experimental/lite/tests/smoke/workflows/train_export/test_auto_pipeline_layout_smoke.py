@@ -411,7 +411,7 @@ def _build_handle_from_config(
         parallel=parallel,
         optimizer="dist_opt",
         optimizer_config=_optimizer_config(),
-        use_deepep=False,
+        moe_token_dispatcher_type="alltoall",
         deterministic=True,
     )
     if impl_overrides:

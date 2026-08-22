@@ -38,6 +38,7 @@ def test_mlite_config_from_dict_preserves_parallel_optimizer_and_impl_cfg():
             },
             "impl_cfg": {"attn_impl": "mcore", "moe_impl": "ml"},
             "use_thd": True,
+            "moe_token_dispatcher_type": "hybridep",
             "precision_aware_opt": True,
         },
     )
@@ -51,6 +52,7 @@ def test_mlite_config_from_dict_preserves_parallel_optimizer_and_impl_cfg():
     assert cfg.impl_cfg["attn_impl"] == "mcore"
     assert cfg.impl_cfg["moe_impl"] == "ml"
     assert cfg.impl_cfg["use_thd"] is True
+    assert cfg.impl_cfg["moe_token_dispatcher_type"] == "hybridep"
     assert cfg.impl_cfg["precision_aware_opt"] is True
 
 
@@ -58,6 +60,14 @@ def test_mlite_config_rejects_num_microbatches_in_backend_config():
     with pytest.raises(ValueError, match="num_microbatches"):
         MegatronLiteConfig.from_dict(
             "/models/qwen", {"model_name": "qwen3_moe", "num_microbatches": 2}
+        )
+
+
+def test_mlite_config_rejects_unknown_moe_dispatcher():
+    with pytest.raises(ValueError, match="alltoall.*deepep.*hybridep"):
+        MegatronLiteConfig.from_dict(
+            "/models/qwen",
+            {"moe_token_dispatcher_type": "auto"},
         )
 
 

@@ -6,6 +6,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from megatron.lite.primitive.modules.dispatcher import (
+    validate_moe_token_dispatcher_type,
+)
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, pick_fields
 
 
@@ -79,9 +82,13 @@ class MegatronLiteConfig:
         for k in list(impl_cfg):
             if k in cfg:
                 impl_cfg[k] = cfg[k]
-        for k in ("recompute", "use_thd", "use_deepep", "precision_aware_opt"):
+        for k in ("recompute", "use_thd", "moe_token_dispatcher_type", "precision_aware_opt"):
             if k in cfg and k not in impl_cfg:
                 impl_cfg[k] = cfg[k]
+        if "moe_token_dispatcher_type" in impl_cfg:
+            validate_moe_token_dispatcher_type(
+                impl_cfg["moe_token_dispatcher_type"]
+            )
 
         skip = {"parallel", "optimizer", "impl_cfg", "debug"}
         return cls(
