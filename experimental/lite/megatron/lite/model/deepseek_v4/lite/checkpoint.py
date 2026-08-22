@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import warnings
 from pathlib import Path
 
 import torch
@@ -346,6 +347,7 @@ class DeepseekV4WeightSpec:
                 )
             masters: list[torch.Tensor] = []
             scales: list[torch.Tensor] = []
+            preserve_source_scales = True
             for name, weight, scale in zip(
                 names, hf_tensors[::2], hf_tensors[1::2], strict=True
             ):
@@ -357,9 +359,13 @@ class DeepseekV4WeightSpec:
                     restored = requantize_block_fp8_weight(master, fp32_scale)
                     if not torch.equal(restored.qweight, weight):
                         changed = int((restored.qweight != weight).sum().item())
-                        raise RuntimeError(
+                        preserve_source_scales = False
+                        warnings.warn(
                             f"{name} is not reversible through BF16: "
-                            f"{changed}/{weight.numel()} FP8 bytes changed"
+                            f"{changed}/{weight.numel()} FP8 bytes changed; "
+                            "falling back to canonical online FP8",
+                            RuntimeWarning,
+                            stacklevel=2,
                         )
                     scales.append(fp32_scale)
                 elif weight.dtype == torch.int8:
@@ -369,11 +375,11 @@ class DeepseekV4WeightSpec:
                         f"unsupported quantized checkpoint dtype {weight.dtype} for {name}"
                     )
                 masters.append(master)
-            if scales:
-                if len(scales) != len(names):
-                    raise RuntimeError(
-                        f"{native_name} mixes FP8 and MXFP4 source tensors"
-                    )
+            if scales and len(scales) != len(names):
+                raise RuntimeError(
+                    f"{native_name} mixes FP8 and MXFP4 source tensors"
+                )
+            if scales and preserve_source_scales:
                 self.source_block_scales[native_name] = (
                     torch.cat(scales, dim=0) if len(scales) > 1 else scales[0]
                 )

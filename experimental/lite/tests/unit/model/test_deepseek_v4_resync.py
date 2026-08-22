@@ -25,12 +25,25 @@ _SPEC.loader.exec_module(_MODULE)
 export_resync_weights = _MODULE.export_resync_weights
 
 
-def test_fp8_resync_exports_float32_block_scales() -> None:
+def test_fp8_resync_uses_deployment_quantizer_and_exports_float32_scales(
+    monkeypatch,
+) -> None:
     config = SimpleNamespace(
         expert_dtype="fp8",
         quantization_config={"weight_block_size": [128, 128]},
     )
     source = torch.randn(128, 128, dtype=torch.bfloat16)
+    qweight = torch.zeros_like(source, dtype=torch.float8_e4m3fn)
+    scale = torch.ones(1, 1, dtype=torch.float32)
+    calls = []
+
+    def fake_deployment_quantizer(tensor):
+        calls.append(tensor)
+        return SimpleNamespace(qweight=qweight, scales=scale)
+
+    monkeypatch.setattr(
+        _MODULE, "quantize_block_fp8_weight", fake_deployment_quantizer
+    )
 
     exported = dict(
         export_resync_weights(
@@ -40,7 +53,9 @@ def test_fp8_resync_exports_float32_block_scales() -> None:
         )
     )
 
-    assert exported["layers.0.ffn.experts.0.up_proj.scale"].dtype == torch.float32
+    assert calls == [source]
+    assert exported["layers.0.ffn.experts.0.up_proj.weight"] is qweight
+    assert exported["layers.0.ffn.experts.0.up_proj.scale"] is scale
 
 
 def test_fp8_resync_reuses_checkpoint_scale_and_bytes() -> None:

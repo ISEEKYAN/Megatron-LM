@@ -18,7 +18,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe.grouped import (
     VLLMGroupedMoEWithBF16Backward,
 )
-from megatron.lite.primitive.modules.experts import Experts
+from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     DeploymentBlockFP8Adapter,
@@ -125,7 +125,7 @@ class _VLLMVisibleExperts(Experts):
         return VLLMGroupedMoEWithBF16Backward.apply(
             hidden_states,
             tokens_per_expert,
-            0.0,
+            self.swiglu_limit,
             *w13,
             *w2,
         )
@@ -183,10 +183,9 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
             hidden_states,
             self.shared_experts.gate_up.weight,
         )
-        gate, up = gate_up.chunk(2, dim=-1)
         return block_fp8_linear(
             self.shared_down_fp8,
-            F.silu(gate) * up,
+            swiglu_with_probs(gate_up, None, self.config.swiglu_limit),
             self.shared_experts.down.weight,
         )
 

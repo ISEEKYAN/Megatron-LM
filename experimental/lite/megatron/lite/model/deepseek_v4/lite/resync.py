@@ -9,8 +9,12 @@ from typing import Any
 import torch
 
 from megatron.lite.model.deepseek_v4.quantization import (
+    BLOCK_SHAPE,
     is_release_unquantized_weight,
     requantize_block_fp8_weight,
+)
+from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
+    quantize_block_fp8_weight,
 )
 from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
 from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
@@ -111,6 +115,13 @@ def export_resync_weights(
                 )
         elif is_routed_expert(name) and expert_dtype == "fp4":
             quantized, scale = quantize_mxfp4(tensor)
+        elif expert_dtype == "fp8":
+            if block_shape != BLOCK_SHAPE:
+                raise ValueError(
+                    f"online FP8 requires block shape {BLOCK_SHAPE}, got {block_shape}"
+                )
+            canonical = quantize_block_fp8_weight(tensor.to(torch.bfloat16))
+            quantized, scale = canonical.qweight, canonical.scales
         else:
             quantized, scale = quantize_block_fp8(
                 tensor, block_shape, scale_format=fp8_scale_format

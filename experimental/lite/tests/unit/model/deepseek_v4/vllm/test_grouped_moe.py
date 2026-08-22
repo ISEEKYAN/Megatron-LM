@@ -48,12 +48,13 @@ def test_vllm_visible_silu_quant_has_no_layout_dependent_fallback(monkeypatch):
     output = torch.empty(2, 128, dtype=torch.float8_e4m3fn)
 
     quantized, _scales = vllm_grouped_moe._vllm_silu_mul_quant(
-        value, output=output, swiglu_limit=0.0
+        value, output=output, swiglu_limit=10.0
     )
 
     assert quantized is output
     assert len(calls) == 1
     assert calls[0][1]["masked_m"] is None
+    assert calls[0][1]["swiglu_limit"] == 10.0
 
 
 def test_grouped_moe_preserves_clamped_forward_and_bf16_master_vjp(

@@ -199,6 +199,36 @@ def test_ds4_shared_checkpoint_preserves_reversible_fp8_source_scale(tmp_path):
     )
 
 
+def test_ds4_nonreversible_fp8_falls_back_to_online_quantization(monkeypatch):
+    from types import SimpleNamespace
+
+    import pytest
+
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+
+    ckpt = _checkpoint_module()
+    qweight = torch.ones(128, 128, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([[0.25]], dtype=torch.float32)
+    monkeypatch.setattr(
+        ckpt,
+        "requantize_block_fp8_weight",
+        lambda master, source_scale: SimpleNamespace(
+            qweight=torch.zeros_like(qweight)
+        ),
+    )
+    cfg = DeepseekV4Config(num_hidden_layers=1, n_routed_experts=8)
+    spec = ckpt.DeepseekV4WeightSpec(cfg, source_block_fp8=True)
+
+    with pytest.warns(RuntimeWarning, match="falling back to canonical online FP8"):
+        master = spec.hf_to_native(
+            "layers.0.self_attn.self_attn.wq_a.weight",
+            [qweight, scale],
+        )
+
+    assert master.dtype == torch.bfloat16
+    assert spec.source_block_scales == {}
+
+
 def _mock_dense_replica_receiver(monkeypatch, master, source_scale):
     from megatron.lite.primitive.ckpt import hf_weights
 
