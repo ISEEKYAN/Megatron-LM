@@ -258,6 +258,39 @@ def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
     }
 
 
+def test_online_weight_export_preserves_model_dtypes_by_default() -> None:
+    engine = _engine(engine_config=_engine_config())
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            captured["kwargs"] = kwargs
+            return iter(
+                (
+                    ("bf16_weight", torch.tensor([1.0], dtype=torch.bfloat16)),
+                    (
+                        "fp32_coefficient",
+                        torch.tensor([1.0001], dtype=torch.float32),
+                    ),
+                )
+            )
+
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine._initial_sync_cache_cleared = True
+
+    weights, _ = engine.get_per_tensor_param()
+    exported = dict(weights)
+
+    assert "export_dtype" not in captured["kwargs"]
+    assert exported["bf16_weight"].dtype == torch.bfloat16
+    assert exported["fp32_coefficient"].dtype == torch.float32
+    assert exported["fp32_coefficient"].item() != float(
+        exported["fp32_coefficient"].bfloat16().float().item()
+    )
+
+
 def test_qwen3_moe_online_weight_export_does_not_pass_unsupported_target() -> None:
     engine = _engine(engine_config=_engine_config())
     engine.model_config.hf_config = {"model_type": "qwen3_moe"}
