@@ -42,6 +42,7 @@ from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _lo
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.dispatcher import (
+    validate_hybridep_max_tokens_per_rank,
     validate_moe_token_dispatcher_type,
 )
 from megatron.lite.primitive.modules.lora import (
@@ -86,6 +87,7 @@ class ImplConfig:
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     moe_token_dispatcher_type: str = "alltoall"
+    hybridep_max_tokens_per_rank: int | None = None
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     router_aux_loss_coef: float | None = None
@@ -104,6 +106,10 @@ class ImplConfig:
 
     def __post_init__(self) -> None:
         validate_moe_token_dispatcher_type(self.moe_token_dispatcher_type)
+        validate_hybridep_max_tokens_per_rank(
+            self.moe_token_dispatcher_type,
+            self.hybridep_max_tokens_per_rank,
+        )
 
 
 def _validate_meta_parameters(model: torch.nn.Module) -> None:
@@ -214,6 +220,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     model_kwargs: dict[str, Any] = dict(
         moe_token_dispatcher_type=impl_cfg.moe_token_dispatcher_type,
+        hybridep_max_tokens_per_rank=impl_cfg.hybridep_max_tokens_per_rank,
         fp8=False,
         recompute_modules=recompute_spec,
         router_bias_rate=impl_cfg.router_bias_rate,

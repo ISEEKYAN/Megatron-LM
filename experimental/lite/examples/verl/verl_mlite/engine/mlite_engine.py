@@ -626,6 +626,9 @@ class MegatronLiteEngine(BaseEngine):
         impl_cfg["moe_token_dispatcher_type"] = (
             self.engine_config.moe_token_dispatcher_type
         )
+        impl_cfg["hybridep_max_tokens_per_rank"] = (
+            self.engine_config.hybridep_max_tokens_per_rank
+        )
         if impl_cfg.get("use_thd", True) is not True:
             raise ValueError(
                 "MegatronLiteEngine supports only THD/no-padding SFT; set engine.impl_cfg.use_thd=True."

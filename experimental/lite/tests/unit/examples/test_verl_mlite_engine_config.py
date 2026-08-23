@@ -69,6 +69,11 @@ def test_verl_config_rejects_unknown_moe_dispatcher() -> None:
         _engine_config(moe_token_dispatcher_type="auto")
 
 
+def test_verl_config_requires_positive_hybridep_capacity() -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        _engine_config(moe_token_dispatcher_type="hybridep")
+
+
 @pytest.mark.parametrize("num_microbatches", [1, 4])
 def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     engine = _engine(engine_config=_engine_config())
@@ -164,6 +169,7 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
             optimizer_offload=True,
             attention_backend_override="flash",
             moe_token_dispatcher_type="hybridep",
+            hybridep_max_tokens_per_rank=4096,
             impl_cfg={"use_thd": True, "deterministic": False},
         )
     )
@@ -178,6 +184,7 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
     assert config.optimizer.offload_fraction == 1.0
     assert config.attention_backend_override == "flash"
     assert config.impl_cfg["moe_token_dispatcher_type"] == "hybridep"
+    assert config.impl_cfg["hybridep_max_tokens_per_rank"] == 4096
     assert config.impl_cfg["use_thd"] is True
     assert config.impl_cfg["deterministic"] is False
 

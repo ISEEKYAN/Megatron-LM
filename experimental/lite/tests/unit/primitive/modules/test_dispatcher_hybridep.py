@@ -67,13 +67,17 @@ def _install_hybridep(monkeypatch, hybridep_module):
     monkeypatch.setattr(
         hybridep_module.dist, "get_world_size", lambda *, group: 2
     )
-    monkeypatch.setattr(
-        hybridep_module, "get_buffer", lambda *_args: fake_buffer
-    )
+    capacities = []
+
+    def get_buffer(*args):
+        capacities.append(args[-1])
+        return fake_buffer
+
+    monkeypatch.setattr(hybridep_module, "get_buffer", get_buffer)
     monkeypatch.setenv(
         "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "2"
     )
-    return fake_buffer
+    return fake_buffer, capacities
 
 
 def test_dispatcher_type_validation_and_deepep_fail_closed(
@@ -86,6 +90,18 @@ def test_dispatcher_type_validation_and_deepep_fail_closed(
         assert module.validate_moe_token_dispatcher_type(value) == value
     with pytest.raises(ValueError, match="alltoall.*deepep.*hybridep"):
         module.validate_moe_token_dispatcher_type("auto")
+    for value in (None, 0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            module.validate_hybridep_max_tokens_per_rank("hybridep", value)
+    assert module.validate_hybridep_max_tokens_per_rank("hybridep", 8) == 8
+    assert module.validate_hybridep_max_tokens_per_rank("alltoall", None) is None
+    with pytest.raises(ValueError, match="positive integer"):
+        module.TokenDispatcher(
+            4,
+            2,
+            SimpleNamespace(ep_size=1),
+            moe_token_dispatcher_type="hybridep",
+        )
 
     monkeypatch.setattr(module, "deep_ep", None)
     with pytest.raises(RuntimeError, match="requires the DeepEP runtime"):
@@ -116,6 +132,8 @@ def test_all_regular_moe_protocols_use_dispatcher_type_api() -> None:
             / "protocol.py"
         ).read_text()
         assert "moe_token_dispatcher_type" in source
+        assert "hybridep_max_tokens_per_rank" in source
+        assert "validate_hybridep_max_tokens_per_rank" in source
         assert "validate_moe_token_dispatcher_type" in source
         assert "use_deepep" not in source
 
@@ -139,6 +157,46 @@ def test_hybridep_topology_fails_closed(monkeypatch):
         hybridep.validate_topology(object())
 
 
+def test_hybridep_buffer_uses_explicit_static_capacity(monkeypatch):
+    from megatron.lite.primitive.modules import hybridep
+
+    created = []
+
+    class Buffer:
+        runtime = object()
+        num_of_hybrid_ep_ranks_per_nvlink_domain = 2
+
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+    monkeypatch.setattr(
+        hybridep,
+        "deep_ep",
+        SimpleNamespace(HybridEPBuffer=Buffer),
+    )
+    monkeypatch.setattr(
+        hybridep.dist, "get_world_size", lambda *, group: 2
+    )
+    monkeypatch.setattr(hybridep, "detect_accessible_ranks", lambda group: 2)
+    monkeypatch.setenv(
+        "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "2"
+    )
+    monkeypatch.setattr(hybridep, "_buffer", None)
+    monkeypatch.setattr(hybridep, "_buffer_signature", None)
+
+    group = object()
+    hybridep.get_buffer(group, 256, 2, 8, 32)
+    hybridep.get_buffer(group, 256, 2, 16, 32)
+
+    assert len(created) == 1
+    assert created[0]["max_num_of_tokens_per_rank"] == 32
+    with pytest.raises(RuntimeError, match="below required"):
+        hybridep.get_buffer(group, 256, 2, 33, 32)
+    hybridep.get_buffer(group, 256, 2, 33, 64)
+    assert len(created) == 2
+    assert created[1]["max_num_of_tokens_per_rank"] == 64
+
+
 def test_hybridep_native_topk_dispatch_combine_backward(
     monkeypatch, transformer_engine_import_stub
 ):
@@ -146,13 +204,14 @@ def test_hybridep_native_topk_dispatch_combine_backward(
     from megatron.lite.primitive.modules import dispatcher as module
     from megatron.lite.primitive.modules import hybridep
 
-    _install_hybridep(monkeypatch, hybridep)
+    _, capacities = _install_hybridep(monkeypatch, hybridep)
     group = object()
     dispatcher = module.TokenDispatcher(
         4,
         2,
         SimpleNamespace(ep_size=2, ep_group=group),
         moe_token_dispatcher_type="hybridep",
+        hybridep_max_tokens_per_rank=8,
     )
     hidden = torch.tensor(
         [[1.0, 2.0], [3.0, 4.0]], requires_grad=True
@@ -170,6 +229,7 @@ def test_hybridep_native_topk_dispatch_combine_backward(
     )
 
     torch.testing.assert_close(counts, torch.tensor([2, 2]))
+    assert capacities == [8]
     torch.testing.assert_close(output, hidden)
     assert dispatcher._hybridep_handle is None
 
@@ -193,6 +253,7 @@ def test_hybridep_handle_must_be_combined(
         2,
         SimpleNamespace(ep_size=2, ep_group=object()),
         moe_token_dispatcher_type="hybridep",
+        hybridep_max_tokens_per_rank=8,
     )
     hidden = torch.ones(2, 2)
     scores = torch.full((2, 2), 0.5)

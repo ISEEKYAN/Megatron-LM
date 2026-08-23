@@ -24,6 +24,7 @@ from megatron.lite.model.protocol_utils import (
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.dispatcher import (
+    validate_hybridep_max_tokens_per_rank,
     validate_moe_token_dispatcher_type,
 )
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
@@ -62,6 +63,7 @@ class ImplConfig:
     offload: list[str] = field(default_factory=list)
     use_thd: bool = False
     moe_token_dispatcher_type: str = "alltoall"
+    hybridep_max_tokens_per_rank: int | None = None
     attention_backend_override: str | None = None
     deterministic: bool = True
     mtp_enable: bool = True
@@ -74,6 +76,10 @@ class ImplConfig:
 
     def __post_init__(self) -> None:
         validate_moe_token_dispatcher_type(self.moe_token_dispatcher_type)
+        validate_hybridep_max_tokens_per_rank(
+            self.moe_token_dispatcher_type,
+            self.hybridep_max_tokens_per_rank,
+        )
 
 
 MODULE_MAP = {
@@ -392,6 +398,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         vpp=vpp,
         fp8=False,
         moe_token_dispatcher_type=impl_cfg.moe_token_dispatcher_type,
+        hybridep_max_tokens_per_rank=impl_cfg.hybridep_max_tokens_per_rank,
     )
 
     def _chunk(i: int | None = None):
@@ -402,6 +409,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 ps,
                 vpp_chunk_id=i,
                 moe_token_dispatcher_type=impl_cfg.moe_token_dispatcher_type,
+                hybridep_max_tokens_per_rank=impl_cfg.hybridep_max_tokens_per_rank,
                 use_thd=impl_cfg.use_thd,
                 hf_path=impl_cfg.hf_path,
                 attention_backend_override=impl_cfg.attention_backend_override,

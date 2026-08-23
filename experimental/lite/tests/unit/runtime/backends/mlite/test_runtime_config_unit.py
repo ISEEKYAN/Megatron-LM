@@ -39,6 +39,7 @@ def test_mlite_config_from_dict_preserves_parallel_optimizer_and_impl_cfg():
             "impl_cfg": {"attn_impl": "mcore", "moe_impl": "ml"},
             "use_thd": True,
             "moe_token_dispatcher_type": "hybridep",
+            "hybridep_max_tokens_per_rank": 4096,
             "precision_aware_opt": True,
         },
     )
@@ -53,6 +54,7 @@ def test_mlite_config_from_dict_preserves_parallel_optimizer_and_impl_cfg():
     assert cfg.impl_cfg["moe_impl"] == "ml"
     assert cfg.impl_cfg["use_thd"] is True
     assert cfg.impl_cfg["moe_token_dispatcher_type"] == "hybridep"
+    assert cfg.impl_cfg["hybridep_max_tokens_per_rank"] == 4096
     assert cfg.impl_cfg["precision_aware_opt"] is True
 
 
@@ -68,6 +70,18 @@ def test_mlite_config_rejects_unknown_moe_dispatcher():
         MegatronLiteConfig.from_dict(
             "/models/qwen",
             {"moe_token_dispatcher_type": "auto"},
+        )
+
+
+def test_mlite_config_requires_positive_hybridep_capacity():
+    with pytest.raises(ValueError, match="positive integer"):
+        MegatronLiteConfig.from_dict(
+            "/models/qwen",
+            {"moe_token_dispatcher_type": "hybridep"},
+        )
+    with pytest.raises(ValueError, match="positive integer"):
+        MegatronLiteConfig(
+            impl_cfg={"moe_token_dispatcher_type": "hybridep"}
         )
 
 

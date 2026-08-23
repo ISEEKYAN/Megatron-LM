@@ -35,6 +35,20 @@ def validate_moe_token_dispatcher_type(value: str) -> str:
     return value
 
 
+def validate_hybridep_max_tokens_per_rank(
+    moe_token_dispatcher_type: str,
+    value: int | None,
+) -> int | None:
+    if moe_token_dispatcher_type == "hybridep" and (
+        not isinstance(value, int) or isinstance(value, bool) or value <= 0
+    ):
+        raise ValueError(
+            "hybridep_max_tokens_per_rank must be a positive integer when "
+            "moe_token_dispatcher_type='hybridep'"
+        )
+    return value
+
+
 def _hidden_bytes(hidden_size: int) -> int:
     return hidden_size * 2
 
@@ -208,6 +222,7 @@ class TokenDispatcher:
         ps: ParallelState,
         *,
         moe_token_dispatcher_type: str = "alltoall",
+        hybridep_max_tokens_per_rank: int | None = None,
         moe_permute_fusion: bool | None = None,
     ):
         self.ps = ps
@@ -220,6 +235,12 @@ class TokenDispatcher:
 
         self.moe_token_dispatcher_type = validate_moe_token_dispatcher_type(
             moe_token_dispatcher_type
+        )
+        self.hybridep_max_tokens_per_rank = (
+            validate_hybridep_max_tokens_per_rank(
+                self.moe_token_dispatcher_type,
+                hybridep_max_tokens_per_rank,
+            )
         )
         self._deepep_enabled = (
             self.moe_token_dispatcher_type == "deepep" and ps.ep_size > 1
@@ -623,6 +644,7 @@ class TokenDispatcher:
             hidden_states.shape[1],
             self.num_local_experts,
             hidden_states.shape[0],
+            self.hybridep_max_tokens_per_rank,
         )
         self._hybridep_buffer = buffer
         dispatched, permuted_probs, tokens_per_expert, handle = (
@@ -682,5 +704,6 @@ class TokenDispatcher:
 __all__ = [
     "MOE_TOKEN_DISPATCHER_TYPES",
     "TokenDispatcher",
+    "validate_hybridep_max_tokens_per_rank",
     "validate_moe_token_dispatcher_type",
 ]

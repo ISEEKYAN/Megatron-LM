@@ -24,6 +24,7 @@ class DeepseekV4MoE(nn.Module):
         *,
         layer_idx: int,
         moe_token_dispatcher_type: str = "alltoall",
+        hybridep_max_tokens_per_rank: int | None = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -55,6 +56,7 @@ class DeepseekV4MoE(nn.Module):
             config.hidden_size,
             ps,
             moe_token_dispatcher_type=moe_token_dispatcher_type,
+            hybridep_max_tokens_per_rank=hybridep_max_tokens_per_rank,
         )
 
     def _hash_route(

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from megatron.lite.primitive.modules.dispatcher import (
+    validate_hybridep_max_tokens_per_rank,
     validate_moe_token_dispatcher_type,
 )
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, pick_fields
@@ -55,6 +56,16 @@ class MegatronLiteConfig:
     # ── bench-only hook: mutate model_cfg after build (e.g. expert truncation) ──
     model_config_hook: Any = None
 
+    def __post_init__(self) -> None:
+        dispatcher_type = self.impl_cfg.get(
+            "moe_token_dispatcher_type", "alltoall"
+        )
+        validate_moe_token_dispatcher_type(dispatcher_type)
+        validate_hybridep_max_tokens_per_rank(
+            dispatcher_type,
+            self.impl_cfg.get("hybridep_max_tokens_per_rank"),
+        )
+
     @classmethod
     def from_dict(cls, hf_path: str, cfg: dict[str, Any]) -> MegatronLiteConfig:
         """Construct MegatronLiteConfig from a flat dict (legacy / OmegaConf path)."""
@@ -82,13 +93,21 @@ class MegatronLiteConfig:
         for k in list(impl_cfg):
             if k in cfg:
                 impl_cfg[k] = cfg[k]
-        for k in ("recompute", "use_thd", "moe_token_dispatcher_type", "precision_aware_opt"):
+        for k in (
+            "recompute",
+            "use_thd",
+            "moe_token_dispatcher_type",
+            "hybridep_max_tokens_per_rank",
+            "precision_aware_opt",
+        ):
             if k in cfg and k not in impl_cfg:
                 impl_cfg[k] = cfg[k]
-        if "moe_token_dispatcher_type" in impl_cfg:
-            validate_moe_token_dispatcher_type(
-                impl_cfg["moe_token_dispatcher_type"]
-            )
+        dispatcher_type = impl_cfg.get("moe_token_dispatcher_type", "alltoall")
+        validate_moe_token_dispatcher_type(dispatcher_type)
+        validate_hybridep_max_tokens_per_rank(
+            dispatcher_type,
+            impl_cfg.get("hybridep_max_tokens_per_rank"),
+        )
 
         skip = {"parallel", "optimizer", "impl_cfg", "debug"}
         return cls(

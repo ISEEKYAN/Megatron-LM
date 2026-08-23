@@ -147,6 +147,7 @@ class DeepseekV4Layer(nn.Module):
         layer_idx: int,
         *,
         moe_token_dispatcher_type: str = "alltoall",
+        hybridep_max_tokens_per_rank: int | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -156,7 +157,13 @@ class DeepseekV4Layer(nn.Module):
         # DS4 ONLY: CSA attention behind the SBHD shim (Kimi builds MLA here).
         self.self_attn = DeepseekV4CSAAttention(config, layer_idx=layer_idx, ps=ps)
         # DS4 ONLY: hash-routed MoE family (shared Experts/Router/dispatcher).
-        self.mlp = DeepseekV4MoE(config, ps, layer_idx=layer_idx, moe_token_dispatcher_type=moe_token_dispatcher_type)
+        self.mlp = DeepseekV4MoE(
+            config,
+            ps,
+            layer_idx=layer_idx,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
+            hybridep_max_tokens_per_rank=hybridep_max_tokens_per_rank,
+        )
         # DS4 ONLY: per-layer multi-head hyper-connections wrapping attn + ffn.
         self.attn_hc = HyperConnection(
             config.hidden_size, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps
@@ -215,9 +222,16 @@ class DeepseekV4MTPLayer(DeepseekV4Layer):
         *,
         embedding: VocabParallelEmbedding,
         moe_token_dispatcher_type: str,
+        hybridep_max_tokens_per_rank: int | None = None,
         detach_encoder: bool,
     ):
-        super().__init__(config, ps, layer_idx, moe_token_dispatcher_type=moe_token_dispatcher_type)
+        super().__init__(
+            config,
+            ps,
+            layer_idx,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
+            hybridep_max_tokens_per_rank=hybridep_max_tokens_per_rank,
+        )
         self.config = config
         object.__setattr__(self, "embedding", embedding)
         self.detach_encoder = detach_encoder
@@ -311,6 +325,7 @@ class DeepseekV4Model(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         moe_token_dispatcher_type: str = "alltoall",
+        hybridep_max_tokens_per_rank: int | None = None,
     ):
         super().__init__()
         del hf_path, use_thd  # DS4 CSA derives its own masking from position_ids.
@@ -352,7 +367,13 @@ class DeepseekV4Model(nn.Module):
         # for its dense-vs-MoE / per-layer logic.
         self.layers = nn.ModuleDict(
             {
-                str(local): DeepseekV4Layer(config, ps, global_idx, moe_token_dispatcher_type=moe_token_dispatcher_type)
+                str(local): DeepseekV4Layer(
+                    config,
+                    ps,
+                    global_idx,
+                    moe_token_dispatcher_type=moe_token_dispatcher_type,
+                    hybridep_max_tokens_per_rank=hybridep_max_tokens_per_rank,
+                )
                 for local, global_idx in enumerate(self.layer_indices)
             }
         )
@@ -382,6 +403,7 @@ class DeepseekV4Model(nn.Module):
                         config.num_hidden_layers + idx,
                         embedding=mtp_embedding,
                         moe_token_dispatcher_type=moe_token_dispatcher_type,
+                        hybridep_max_tokens_per_rank=hybridep_max_tokens_per_rank,
                         detach_encoder=mtp_detach_encoder,
                     )
                     for idx in range(config.num_nextn_predict_layers)

@@ -35,6 +35,7 @@ from megatron.lite.model.protocol_utils import (
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.dispatcher import (
+    validate_hybridep_max_tokens_per_rank,
     validate_moe_token_dispatcher_type,
 )
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
@@ -107,6 +108,7 @@ class ImplConfig:
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     moe_token_dispatcher_type: str = "alltoall"
+    hybridep_max_tokens_per_rank: int | None = None
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     hf_path: str = ""
@@ -128,6 +130,10 @@ class ImplConfig:
 
     def __post_init__(self) -> None:
         validate_moe_token_dispatcher_type(self.moe_token_dispatcher_type)
+        validate_hybridep_max_tokens_per_rank(
+            self.moe_token_dispatcher_type,
+            self.hybridep_max_tokens_per_rank,
+        )
         if self.dsa_cp_mode not in {"native", "legacy_gather_all"}:
             raise ValueError(
                 "dsa_cp_mode must be 'native' or 'legacy_gather_all', "
@@ -307,6 +313,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         cp=ps.cp_size,
         vpp=vpp,
         moe_token_dispatcher_type=impl_cfg.moe_token_dispatcher_type,
+        hybridep_max_tokens_per_rank=impl_cfg.hybridep_max_tokens_per_rank,
         fp8=False,
         recompute_modules=recompute_spec,
         offload_modules=list(impl_cfg.offload),

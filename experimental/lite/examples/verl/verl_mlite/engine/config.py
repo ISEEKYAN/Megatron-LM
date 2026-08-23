@@ -8,6 +8,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from megatron.lite.primitive.modules.dispatcher import (
+    validate_hybridep_max_tokens_per_rank,
+    validate_moe_token_dispatcher_type,
+)
 from verl.workers.config.engine import EngineConfig
 
 
@@ -30,6 +34,7 @@ class MegatronLiteEngineConfig(EngineConfig):
     attention_backend_override: str | None = "flash"
     router_aux_loss_coef: float | None = None
     moe_token_dispatcher_type: str = "alltoall"
+    hybridep_max_tokens_per_rank: int | None = None
     cross_entropy_fusion: bool | None = None
     export_dtype: str | None = "bfloat16"
     qat: dict[str, Any] = field(default_factory=dict)
@@ -45,15 +50,11 @@ class MegatronLiteEngineConfig(EngineConfig):
             raise ValueError(
                 f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}"
             )
-        if self.moe_token_dispatcher_type not in {
-            "alltoall",
-            "deepep",
-            "hybridep",
-        }:
-            raise ValueError(
-                "moe_token_dispatcher_type must be one of "
-                "'alltoall', 'deepep', or 'hybridep'"
-            )
+        validate_moe_token_dispatcher_type(self.moe_token_dispatcher_type)
+        validate_hybridep_max_tokens_per_rank(
+            self.moe_token_dispatcher_type,
+            self.hybridep_max_tokens_per_rank,
+        )
         if self.custom_backend_module:
             importlib.import_module(self.custom_backend_module)
         if self.resync_format is not None:

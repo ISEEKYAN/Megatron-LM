@@ -15,7 +15,6 @@ except ImportError:  # pragma: no cover - runtime-image dependent
 
 
 _buffer = None
-_buffer_capacity = 0
 _buffer_signature = None
 
 
@@ -78,37 +77,30 @@ def get_buffer(
     hidden_size: int,
     num_local_experts: int,
     required_capacity: int,
+    capacity: int,
 ):
     require_available()
     domain_size = validate_topology(group)
-    capacity_value = os.environ.get(
-        "MLITE_HYBRIDEP_MAX_ROUTE_TOKENS_PER_RANK"
-    )
-    if capacity_value is None:
-        raise RuntimeError(
-            "hybridep requires explicit "
-            "MLITE_HYBRIDEP_MAX_ROUTE_TOKENS_PER_RANK so every rank "
-            "uses the same static buffer capacity"
-        )
-    try:
-        capacity = int(capacity_value)
-    except ValueError as exc:
-        raise RuntimeError(
-            "MLITE_HYBRIDEP_MAX_ROUTE_TOKENS_PER_RANK must be an integer"
-        ) from exc
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity <= 0:
+        raise ValueError("HybridEP token capacity must be a positive integer")
     if capacity < required_capacity:
         raise RuntimeError(
             f"HybridEP token capacity {capacity} is below required "
             f"{required_capacity}"
         )
 
-    signature = (group, hidden_size, num_local_experts, domain_size)
-    global _buffer, _buffer_capacity, _buffer_signature
+    signature = (
+        group,
+        hidden_size,
+        num_local_experts,
+        domain_size,
+        capacity,
+    )
+    global _buffer, _buffer_signature
     if (
         _buffer is None
         or getattr(_buffer, "runtime", None) is None
         or _buffer_signature != signature
-        or _buffer_capacity < capacity
     ):
         detected = detect_accessible_ranks(group)
         if detected != domain_size:
@@ -123,7 +115,6 @@ def get_buffer(
             num_local_experts=num_local_experts,
             use_fp8=False,
         )
-        _buffer_capacity = capacity
         _buffer_signature = signature
         setattr(_buffer, "_mlite_detected_nvlink_domain_ranks", detected)
 

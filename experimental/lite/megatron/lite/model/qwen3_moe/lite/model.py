@@ -47,6 +47,7 @@ class MoELayer(nn.Module):
         ps: ParallelState,
         *,
         moe_token_dispatcher_type: str = "deepep",
+        hybridep_max_tokens_per_rank: int | None = None,
         router_bias_rate: float = 0.0,
         fp8: bool = False,
         moe_act_recompute: bool = False,
@@ -61,7 +62,11 @@ class MoELayer(nn.Module):
             config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute, lora_config=lora_config
         )
         self.dispatcher = TokenDispatcher(
-            config.num_experts, config.hidden_size, ps, moe_token_dispatcher_type=moe_token_dispatcher_type
+            config.num_experts,
+            config.hidden_size,
+            ps,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
+            hybridep_max_tokens_per_rank=hybridep_max_tokens_per_rank,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -121,6 +126,7 @@ class TransformerLayer(nn.Module):
         layer_idx: int,
         *,
         moe_token_dispatcher_type: str = "deepep",
+        hybridep_max_tokens_per_rank: int | None = None,
         router_bias_rate: float = 0.0,
         fp8: bool = False,
         moe_act_recompute: bool = False,
@@ -152,6 +158,7 @@ class TransformerLayer(nn.Module):
             config,
             ps,
             moe_token_dispatcher_type=moe_token_dispatcher_type,
+            hybridep_max_tokens_per_rank=hybridep_max_tokens_per_rank,
             router_bias_rate=router_bias_rate,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
@@ -207,6 +214,7 @@ class MultiTokenPredictionLayer(nn.Module):
         *,
         embedding: VocabParallelEmbedding,
         moe_token_dispatcher_type: str,
+        hybridep_max_tokens_per_rank: int | None = None,
         router_bias_rate: float,
         fp8: bool,
         moe_act_recompute: bool,
@@ -228,6 +236,7 @@ class MultiTokenPredictionLayer(nn.Module):
             ps,
             config.num_hidden_layers + layer_idx,
             moe_token_dispatcher_type=moe_token_dispatcher_type,
+            hybridep_max_tokens_per_rank=hybridep_max_tokens_per_rank,
             router_bias_rate=router_bias_rate,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
@@ -280,6 +289,7 @@ class MultiTokenPredictionBlock(nn.Module):
         *,
         embedding: VocabParallelEmbedding,
         moe_token_dispatcher_type: str,
+        hybridep_max_tokens_per_rank: int | None = None,
         router_bias_rate: float,
         fp8: bool,
         moe_act_recompute: bool,
@@ -300,6 +310,7 @@ class MultiTokenPredictionBlock(nn.Module):
                     idx,
                     embedding=embedding,
                     moe_token_dispatcher_type=moe_token_dispatcher_type,
+                    hybridep_max_tokens_per_rank=hybridep_max_tokens_per_rank,
                     router_bias_rate=router_bias_rate,
                     fp8=fp8,
                     moe_act_recompute=moe_act_recompute,
@@ -353,6 +364,7 @@ class Qwen3MoEModel(nn.Module):
         vpp_chunk_id: int | None = None,
         *,
         moe_token_dispatcher_type: str = "alltoall",
+        hybridep_max_tokens_per_rank: int | None = None,
         fp8: bool = False,
         recompute_modules: list[str] | None = None,
         router_bias_rate: float = 0.0,
@@ -390,6 +402,7 @@ class Qwen3MoEModel(nn.Module):
                     ps,
                     idx,
                     moe_token_dispatcher_type=moe_token_dispatcher_type,
+                    hybridep_max_tokens_per_rank=hybridep_max_tokens_per_rank,
                     router_bias_rate=router_bias_rate,
                     fp8=fp8,
                     moe_act_recompute=moe_act_recompute,
@@ -418,6 +431,7 @@ class Qwen3MoEModel(nn.Module):
                 ps,
                 embedding=mtp_embedding,
                 moe_token_dispatcher_type=moe_token_dispatcher_type,
+                hybridep_max_tokens_per_rank=hybridep_max_tokens_per_rank,
                 router_bias_rate=router_bias_rate,
                 fp8=fp8,
                 moe_act_recompute=moe_act_recompute,

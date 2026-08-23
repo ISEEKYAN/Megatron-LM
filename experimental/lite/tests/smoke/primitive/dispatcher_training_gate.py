@@ -91,6 +91,7 @@ def main() -> None:
             tp_ep_group=group,
         ),
         moe_token_dispatcher_type=args.backend,
+        hybridep_max_tokens_per_rank=8 if args.backend == "hybridep" else None,
     )
 
     generator = torch.Generator(device="cuda")
