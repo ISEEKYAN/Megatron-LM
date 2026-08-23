@@ -135,7 +135,6 @@ def test_mlite_config_impl_cfg_optimizer_and_load_gate():
         impl_cfg={"recompute": "full"},
         optimizer=OptimizerConfig(lr=1e-4, weight_decay=0.1, adam_beta1=0.9),
         load_hf_weights=False,
-        model_config_overrides={"num_hidden_layers": 4},
         model_config_hook=hook,
     )
 
@@ -143,7 +142,6 @@ def test_mlite_config_impl_cfg_optimizer_and_load_gate():
     assert cfg.optimizer.lr == 1e-4
     assert cfg.optimizer.adam_beta1 == 0.9
     assert cfg.load_hf_weights is False
-    assert cfg.model_config_overrides == {"num_hidden_layers": 4}
     assert cfg.model_config_hook is hook
 
 

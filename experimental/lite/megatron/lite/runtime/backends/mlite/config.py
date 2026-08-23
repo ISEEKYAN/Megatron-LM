@@ -42,7 +42,6 @@ class MegatronLiteConfig:
     attention_backend_override: str | None = "flash"
     router_aux_loss_coef: float | None = None
     load_hf_weights: bool = True
-    model_config_overrides: dict[str, Any] = field(default_factory=dict)
 
     # ── impl-specific (each impl reads its own keys) ──
     impl_cfg: dict[str, Any] = field(default_factory=dict)

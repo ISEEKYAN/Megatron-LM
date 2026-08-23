@@ -43,20 +43,12 @@ def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
     )
 
 
-def _engine(
-    *,
-    engine_config: object,
-    optimizer_config: SimpleNamespace | None = None,
-    model_overrides: dict | None = None,
-):
+def _engine(*, engine_config: object, optimizer_config: SimpleNamespace | None = None):
     from verl_mlite.engine.mlite_engine import MegatronLiteEngine
 
     return MegatronLiteEngine(
         model_config=SimpleNamespace(
-            local_path="/tmp/qwen35",
-            hf_config={"model_type": "qwen3_5_moe"},
-            mtp=None,
-            override_config=model_overrides or {},
+            local_path="/tmp/qwen35", hf_config={"model_type": "qwen3_5_moe"}, mtp=None
         ),
         engine_config=engine_config,
         optimizer_config=optimizer_config or _optimizer_config(),
@@ -197,24 +189,6 @@ def test_mlite_config_preserves_protocol_owned_non_thd_layout() -> None:
     assert config.impl == "vllm"
     assert config.impl_cfg["use_thd"] is False
     assert config.impl_cfg["use_deepep"] is True
-
-
-@pytest.mark.parametrize(
-    "override_config",
-    [
-        {"num_hidden_layers": 4},
-        {"model_config": {"num_hidden_layers": 4}},
-    ],
-)
-def test_mlite_config_forwards_verl_model_overrides(override_config) -> None:
-    engine = _engine(
-        engine_config=_engine_config(model_name="deepseek_v4", impl="vllm"),
-        model_overrides=override_config,
-    )
-
-    config = engine._build_mlite_config()
-
-    assert config.model_config_overrides == {"num_hidden_layers": 4}
 
 
 @pytest.mark.parametrize("zero_grad_on_exit, expected_calls", [(True, 1), (False, 0)])

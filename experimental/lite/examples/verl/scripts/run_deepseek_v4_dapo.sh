@@ -36,13 +36,6 @@ ENABLE_QAT="${ENABLE_QAT:-False}"
 # ---------------------------------------------------------------------------
 
 : "${MODEL_PATH:?set MODEL_PATH to the official DeepSeek-V4 checkpoint}"
-MODEL_NUM_HIDDEN_LAYERS="${MODEL_NUM_HIDDEN_LAYERS:-}"
-if [[ -n "${MODEL_NUM_HIDDEN_LAYERS}" ]] && {
-  [[ ! "${MODEL_NUM_HIDDEN_LAYERS}" =~ ^[1-9][0-9]*$ ]];
-}; then
-  echo "MODEL_NUM_HIDDEN_LAYERS must be a positive integer" >&2
-  exit 2
-fi
 DAPO_DATA_DIR="${DAPO_DATA_DIR:-}"
 TRAIN_FILES="${TRAIN_FILES:-${DAPO_DATA_DIR:+${DAPO_DATA_DIR}/dapo-math-17k.parquet}}"
 VAL_FILES="${VAL_FILES:-${DAPO_DATA_DIR:+${DAPO_DATA_DIR}/aime-2024.parquet}}"
@@ -220,12 +213,6 @@ MODEL=(
   "actor_rollout_ref.model.custom_chat_template='${DS4_CHAT_TEMPLATE}'"
 )
 
-if [[ -n "${MODEL_NUM_HIDDEN_LAYERS}" ]]; then
-  MODEL+=(
-    "+actor_rollout_ref.model.override_config.num_hidden_layers=${MODEL_NUM_HIDDEN_LAYERS}"
-  )
-fi
-
 ACTOR=(
   "actor@actor_rollout_ref.actor=mlite_actor"
   "actor_rollout_ref.actor.optim.lr=1e-6"
@@ -331,12 +318,6 @@ ROLLOUT=(
   "+${VLLM_QUANT_CONFIG}.scale_fmt=ue8m0"
   "+${VLLM_QUANT_CONFIG}.weight_block_size=[128,128]"
 )
-
-if [[ -n "${MODEL_NUM_HIDDEN_LAYERS}" ]]; then
-  ROLLOUT+=(
-    "+${VLLM_CONFIG}.hf_overrides.num_hidden_layers=${MODEL_NUM_HIDDEN_LAYERS}"
-  )
-fi
 
 TRAINER=(
   "critic.enable=False"

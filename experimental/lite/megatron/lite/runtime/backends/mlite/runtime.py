@@ -222,9 +222,7 @@ class MegatronLiteRuntime(RuntimeBase):
         impl_cfg = _build_impl_cfg(proto, rt_cfg)
 
         # ── build model config ──
-        model_cfg = proto.build_model_config(
-            rt_cfg.hf_path, **rt_cfg.model_config_overrides
-        )
+        model_cfg = proto.build_model_config(rt_cfg.hf_path)
         if callable(rt_cfg.model_config_hook):
             model_cfg = rt_cfg.model_config_hook(model_cfg)
 

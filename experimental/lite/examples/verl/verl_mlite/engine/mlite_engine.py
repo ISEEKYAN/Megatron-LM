@@ -587,9 +587,6 @@ class MegatronLiteEngine(BaseEngine):
             raise RuntimeError("MegatronLiteEngine is not initialized yet.")
 
     def _build_mlite_config(self) -> MegatronLiteConfig:
-        model_config_overrides = getattr(self.model_config, "override_config", {}) or {}
-        if "model_config" in model_config_overrides:
-            model_config_overrides = model_config_overrides["model_config"]
         return MegatronLiteConfig(
             model_name=self._resolve_model_name(),
             impl=self.engine_config.impl,
@@ -615,7 +612,6 @@ class MegatronLiteEngine(BaseEngine):
                 else self.engine_config.router_aux_loss_coef
             ),
             load_hf_weights=self.engine_config.load_hf_weights,
-            model_config_overrides=dict(model_config_overrides),
             impl_cfg=self._build_impl_cfg(),
         )
 
