@@ -287,3 +287,39 @@ def test_post_optimizer_step_invalidates_all_deployment_weights() -> None:
     assert model._fp8_source_scales_by_name == {}
     assert model[0]._fp8_source_scales_by_parameter == {}
     assert [module.cleared for module in model] == [1, 1]
+
+
+def test_vllm_load_starts_with_dynamic_deployment_quantization(monkeypatch) -> None:
+    class CacheOwner(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+            self.cleared = 0
+
+        def clear_deployment_weight_cache(self) -> None:
+            self.cleared += 1
+
+    model = CacheOwner()
+    calls = []
+
+    def fake_load(target, path, config, parallel_state) -> None:
+        calls.append((target, path, config, parallel_state))
+        scale = torch.ones(1)
+        target._fp8_source_scales_valid = True
+        target._fp8_source_scales_by_name = {"weight": scale}
+        target._fp8_source_scales_by_parameter = {"weight": scale}
+        target.weight._fp8_source_scales = scale
+        target.weight._fp8_source_scale_version = target.weight._version
+
+    monkeypatch.setattr(protocol, "_load_hf_weights", fake_load)
+    config = object()
+    parallel_state = object()
+    protocol.load_hf_weights(model, "/checkpoint", config, parallel_state)
+
+    assert calls == [(model, "/checkpoint", config, parallel_state)]
+    assert model._fp8_source_scales_valid is False
+    assert model._fp8_source_scales_by_name == {}
+    assert model._fp8_source_scales_by_parameter == {}
+    assert not hasattr(model.weight, "_fp8_source_scales")
+    assert not hasattr(model.weight, "_fp8_source_scale_version")
+    assert model.cleared == 1

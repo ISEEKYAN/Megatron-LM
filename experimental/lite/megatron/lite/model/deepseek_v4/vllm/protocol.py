@@ -14,7 +14,7 @@ from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     export_hf_weights as export_hf_weights,
     invalidate_bound_source_scales,
-    load_hf_weights as load_hf_weights,
+    load_hf_weights as _load_hf_weights,
     save_hf_weights as save_hf_weights,
 )
 from megatron.lite.model.deepseek_v4.lite.protocol import (
@@ -107,6 +107,19 @@ def _post_optimizer_step(model: nn.Module) -> None:
         clear_cache = getattr(module, "clear_deployment_weight_cache", None)
         if clear_cache is not None:
             clear_cache()
+
+
+def load_hf_weights(model, path, config, parallel_state) -> None:
+    """Load vLLM-aligned masters and select one quantization contract.
+
+    Checkpoint source scales reproduce the serialized FP8 weights, but the
+    rollout receiver requantizes the BF16 training masters dynamically.  The
+    actor must use that same dynamic contract from its first forward, rather
+    than switching to it only after the first successful optimizer step.
+    """
+
+    _load_hf_weights(model, path, config, parallel_state)
+    _post_optimizer_step(model)
 
 
 def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
