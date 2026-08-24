@@ -13,6 +13,7 @@ from megatron.lite.primitive.modules.dispatcher import (
     _DeepEPDispatch,
     deep_ep,
 )
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe import hybridep
 
 
 @triton.jit
@@ -684,19 +685,65 @@ def _validate_and_order_route_preserving_outputs(
         )
 
     expected_weights = received_topk_weights[token_rows, topk_slots].reshape(-1)
+    # The hidden-state and metadata dispatches are separate DeepEP operations.
+    # At full-model scale they may preserve the same routes while choosing a
+    # different arrival order within an expert. Match the two streams by a
+    # bitwise route fingerprint before validating and building combine rows.
+    def _route_hashes(
+        fingerprints: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        words = fingerprints.contiguous().view(torch.int16).reshape(
+            fingerprints.shape[0], -1
+        )
+        hashes = torch.full(
+            (words.shape[0],),
+            1469598103934665603,
+            dtype=torch.int64,
+            device=words.device,
+        )
+        for column in range(words.shape[1]):
+            hashes = (hashes ^ (words[:, column].to(torch.int64) & 0xFFFF)) * 1099511628211
+        hashes = (hashes ^ indices.to(torch.int64)) * 1099511628211
+        weight_bits = weights.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+        return (hashes ^ weight_bits) * 1099511628211
+
+    expected_hashes = _route_hashes(
+        expected_fingerprints, expected_indices, expected_weights
+    )
+    route_hashes = _route_hashes(
+        route_fingerprints,
+        route_indices.to(dtype=expected_indices.dtype),
+        route_weights.to(dtype=expected_weights.dtype),
+    )
+    expected_order = torch.argsort(expected_hashes, stable=True)
+    route_order = torch.argsort(route_hashes, stable=True)
+    expected_for_route = torch.empty_like(expected_order)
+    expected_for_route.scatter_(0, route_order, expected_order)
+    expected_indices = expected_indices.index_select(0, expected_for_route)
+    expected_weights = expected_weights.index_select(0, expected_for_route)
+    expected_fingerprints = expected_fingerprints.index_select(0, expected_for_route)
     torch._assert_async(
         torch.all(expected_indices == route_indices.to(dtype=expected_indices.dtype)),
         "Route-preserving DeepEP metadata changed local expert order",
     )
     torch._assert_async(
-        torch.all(expected_weights == route_weights.to(dtype=expected_weights.dtype)),
+        torch.all(
+            expected_weights.contiguous().view(torch.int32)
+            == route_weights.to(dtype=expected_weights.dtype)
+            .contiguous()
+            .view(torch.int32)
+        ),
         "Route-preserving DeepEP metadata changed route probability order",
     )
     torch._assert_async(
         torch.all(expected_fingerprints == route_fingerprints),
         "Route-preserving DeepEP metadata changed source-token order",
     )
-    primary_route_rows = output_index[token_rows, topk_slots].to(dtype=torch.long)
+    primary_route_rows = output_index[token_rows, topk_slots].to(
+        dtype=torch.long
+    ).index_select(0, expected_for_route)
     route_rows = primary_route_rows
     if return_route_rows:
         return route_rows
@@ -952,3 +999,70 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
         self._source_all_routes_valid = source_all_routes_valid
         self._local_tpe_list = received_per_expert.tolist()
         return expert_hidden, received_per_expert, expert_probs
+
+
+class VLLMAlignedHybridEPDispatcher(TokenDispatcher):
+    """Preserve vLLM route slots over the dedicated HybridEP transport."""
+
+    def __init__(
+        self,
+        *args,
+        hybridep_max_tokens_per_rank: int | None = None,
+        **kwargs,
+    ):
+        if (
+            not isinstance(hybridep_max_tokens_per_rank, int)
+            or isinstance(hybridep_max_tokens_per_rank, bool)
+            or hybridep_max_tokens_per_rank <= 0
+        ):
+            raise ValueError(
+                "hybridep_max_tokens_per_rank must be a positive integer"
+            )
+        kwargs["use_deepep"] = False
+        super().__init__(*args, **kwargs)
+        if self.ep_size <= 1:
+            raise RuntimeError("hybridep requires expert parallel size greater than one")
+        if self.ps.ep_group is None:
+            raise RuntimeError("hybridep requires an expert-parallel process group")
+        hybridep.require_available()
+        self._hybridep_group = self.ps.ep_group
+        self._hybridep_max_tokens_per_rank = hybridep_max_tokens_per_rank
+        self._hybridep_state = None
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_scores: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._hybridep_state is not None:
+            raise RuntimeError("hybridep dispatch state is still awaiting combine")
+        result = hybridep.dispatch_routes(
+            hidden_states,
+            topk_scores.float().contiguous(),
+            topk_indices.long().contiguous(),
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            group=self._hybridep_group,
+            hybridep_max_tokens_per_rank=self._hybridep_max_tokens_per_rank,
+        )
+        self._hybridep_state = result.state
+        self._local_tpe_list = result.tokens_per_expert.tolist()
+        return result.hidden, result.tokens_per_expert, result.probs
+
+    def combine(self, expert_output: torch.Tensor) -> torch.Tensor:
+        if self._hybridep_state is None:
+            raise RuntimeError("hybridep combine has no matching dispatch state")
+        state = self._hybridep_state
+        source_routes = hybridep.combine_routes(expert_output, state)
+        output = _VLLMEPGatherWithBF16Backward.apply(
+            source_routes,
+            state.source_indices,
+            state.source_weights,
+            state.source_output_index,
+            False,
+            state.source_all_routes_valid,
+        )
+        self._hybridep_state = None
+        self._local_tpe_list = None
+        return output
