@@ -6,31 +6,19 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.primitive import transformer_engine as te
-# Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core. The
-# lite CSA module reuses Core's differentiable kernels, CP row-mapping utilities,
-# and CuTeDSL layout kernels rather than vendoring them; see the module docstring
-# of ``csa_cp_utils`` / ``csa_cp_layout_kernels`` for the exact contracts.
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.experimental_attention_variant import (
-    csa_cp_layout_kernels,
-    csa_cp_utils as cp_utils,
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_layout_kernels as csa_cp_layout_kernels,
+    cp_utils,
 )
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
-# MCore moved the fused CSA entry points in the development branch. Keep the
-# Lite adapter compatible with both layouts while downstream snapshots migrate.
-try:
-    from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
-        FusedCSAIndexerSparseAttnFromTopkFunc,
-        csa_sparse_attn,
-    )
-except ImportError:
-    from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
-        FusedCSAIndexerSparseAttnFromTopkFunc,
-        csa_sparse_attn,
-    )
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
+    FusedCSAIndexerSparseAttnFromTopkFunc,
+    csa_sparse_attn,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,

@@ -6,8 +6,7 @@ from __future__ import annotations
 import math
 import os
 import weakref
-from enum import Enum
-from types import SimpleNamespace
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -25,33 +24,15 @@ from tensordict import TensorDict
 
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
+from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
+from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
+from verl.workers.engine.utils import postprocess_batch_func, prepare_micro_batches
 from verl_mlite import qat_export
-from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
-
-try:
-    # Recent VERL wraps per-step metric values in a Metric aggregator that
-    # reduce_metrics() knows how to fold; older VERL expects list-of-scalars.
-    from verl.utils.metric import Metric as _VerlMetric
-except Exception:  # pragma: no cover - older VERL without Metric
-    _VerlMetric = None
 
 from .config import MegatronLiteEngineConfig
-
-_patch_bucketed_weight_sender()
-
-BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches = (
-    load_verl_engine_api()
-)
-
-try:
-    from verl.utils.dataset.dataset_utils import DatasetPadMode
-except ImportError:
-
-    class DatasetPadMode(Enum):
-        NO_PADDING = "no_padding"
 
 
 _LR_SCHEDULER_STATE = "lr_scheduler.pt"
@@ -244,7 +225,26 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
     def __exit__(self, exc_type, exc_val, exc_tb):
         assert self._runtime_ctx is not None
         self._runtime_ctx.__exit__(exc_type, exc_val, exc_tb)
-        super().__exit__(exc_type, exc_val, exc_tb)
+        try:
+            # Match every native VERL train engine: gradients are a train-call
+            # lifetime, not model state.  Clearing them before BaseEngineCtx
+            # offloads the module is especially important for FSDP2 because
+            # Module.to() also moves attached Parameter.grad tensors.  Keeping
+            # stale CPU grads here makes the following forward-only weight
+            # export reload both parameters and a second model-sized grad copy.
+            if self.mode == "train" and (
+                self.zero_grad_on_exit or exc_type is not None
+            ):
+                self.engine.optimizer_zero_grad()
+            super().__exit__(exc_type, exc_val, exc_tb)
+        except Exception as cleanup_error:
+            if exc_type is None:
+                raise
+            print(
+                "MLITE_CONTEXT_CLEANUP_ERROR "
+                f"preserving original {exc_type.__name__}: {cleanup_error!r}",
+                flush=True,
+            )
         return False
 
 
@@ -303,7 +303,6 @@ class MegatronLiteEngine(BaseEngine):
             self.handle._lr_scheduler = _build_lr_scheduler(
                 self.handle._optimizer, self._mlite_config.optimizer
             )
-
         self.to(
             device="cpu",
             model=self.is_param_offload_enabled,
@@ -623,11 +622,10 @@ class MegatronLiteEngine(BaseEngine):
 
     def _build_impl_cfg(self) -> dict[str, Any]:
         impl_cfg = dict(self.engine_config.impl_cfg)
-        if impl_cfg.get("use_thd", True) is not True:
-            raise ValueError(
-                "MegatronLiteEngine supports only THD/no-padding SFT; set engine.impl_cfg.use_thd=True."
-            )
-        impl_cfg["use_thd"] = True
+        # The engine always transports a flattened PackedBatch. Model protocols
+        # decide whether to materialize THD metadata; vLLM-kernel DS4 consumes
+        # the same packed tokens with its own runtime metadata instead.
+        impl_cfg.setdefault("use_thd", True)
         cross_entropy_fusion = getattr(self.engine_config, "cross_entropy_fusion", None)
         if cross_entropy_fusion is None:
             cross_entropy_fusion = getattr(self.engine_config, "use_fused_kernels", False)
@@ -761,14 +759,20 @@ class MegatronLiteEngine(BaseEngine):
                 "router_replay_mode='R3' requires routed_experts on every "
                 "actor micro-batch in a step."
             )
-        result = self.runtime.forward_backward(
-            self.handle,
-            iter(runtime_batches),
-            loss_fn=runtime_loss_fn,
-            num_microbatches=num_micro_batches,
-            forward_only=forward_only,
-            router_replay={"action": "replay"} if replay_enabled else None,
-        )
+        # Match Slime's @torch.no_grad forward_only entrypoint and the other
+        # VERL engines.  Besides avoiding useless activation storage during
+        # old-logprob evaluation, this prevents training-only communication
+        # handles from being retained across MoE layers in an inference pass.
+        grad_context = torch.no_grad() if forward_only else nullcontext()
+        with grad_context:
+            result = self.runtime.forward_backward(
+                self.handle,
+                iter(runtime_batches),
+                loss_fn=runtime_loss_fn,
+                num_microbatches=num_micro_batches,
+                forward_only=forward_only,
+                router_replay={"action": "replay"} if replay_enabled else None,
+            )
         if reduced_outputs is not None:
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
         metrics = dict(result.metrics)
@@ -777,13 +781,8 @@ class MegatronLiteEngine(BaseEngine):
         return {
             "model_output": {},
             "loss": losses,
-            # Pass Metric aggregators through unchanged (reduce_metrics folds them);
-            # list-wrap plain scalars as the legacy contract expects.
             "metrics": {
-                key: value
-                if isinstance(value, list)
-                or (_VerlMetric is not None and isinstance(value, _VerlMetric))
-                else [value]
+                key: value if isinstance(value, list) else [value]
                 for key, value in metrics.items()
             },
         }

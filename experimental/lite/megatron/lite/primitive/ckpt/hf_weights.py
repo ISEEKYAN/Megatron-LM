@@ -86,6 +86,19 @@ def _native_to_hf(spec: HFWeights, name: str, tensor: torch.Tensor):
         return mapped
 
 
+def _sync_replica_load_metadata(
+    spec: HFWeights,
+    native_name: str,
+    target: torch.Tensor,
+    ps,
+    replica_group,
+    source_global_rank: int,
+) -> None:
+    hook = getattr(spec, "sync_replica_load_metadata", None)
+    if callable(hook):
+        hook(native_name, target, ps, replica_group, source_global_rank)
+
+
 DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES = 2 * 1024**3
 
 
@@ -286,6 +299,16 @@ class SafeTensorReader:
             with safe_open(str(filepath), framework="pt", device="cpu") as f:
                 tensor = f.get_tensor(name)
         return tensor if device.type == "cpu" else tensor.to(device)
+
+    def get_raw_tensor(
+        self,
+        name: str,
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Read a serialized tensor without implicit quantized-weight conversion."""
+        target_device = torch.device(self.device if device is None else device)
+        return self._get_raw_tensor(name, target_device)
 
     def _get_groupwise_int4(self, name: str, device: torch.device) -> torch.Tensor:
         packed = self._get_raw_tensor(f"{name}_packed", device)
@@ -1042,6 +1065,14 @@ def load_hf_weights(
                     dist.broadcast(
                         target.data, src=source_global_rank, group=replica_group
                     )
+                    _sync_replica_load_metadata(
+                        spec,
+                        mapped,
+                        target,
+                        ps,
+                        replica_group,
+                        source_global_rank,
+                    )
                     loaded_names.add(actual)
                     continue
 
@@ -1108,6 +1139,14 @@ def load_hf_weights(
             if replica_ranks is not None:
                 assert source_global_rank is not None
                 dist.broadcast(target.data, src=source_global_rank, group=replica_group)
+                _sync_replica_load_metadata(
+                    spec,
+                    mapped,
+                    target,
+                    ps,
+                    replica_group,
+                    source_global_rank,
+                )
             loaded_names.add(actual)
             del hf_tensors, tensor, converted
 
@@ -1180,6 +1219,14 @@ def _load_expert_weight(
         source_global_rank = replica_ranks[source_group_rank]
         if dist.get_rank() != source_global_rank:
             dist.broadcast(target.data, src=source_global_rank, group=replica_group)
+            _sync_replica_load_metadata(
+                spec,
+                native_name,
+                target,
+                ps,
+                replica_group,
+                source_global_rank,
+            )
             return actual
 
     try:
@@ -1207,6 +1254,14 @@ def _load_expert_weight(
     if replica_ranks is not None:
         assert source_global_rank is not None
         dist.broadcast(target.data, src=source_global_rank, group=replica_group)
+        _sync_replica_load_metadata(
+            spec,
+            native_name,
+            target,
+            ps,
+            replica_group,
+            source_global_rank,
+        )
     del hf_tensors, tensor, converted
     return actual
 
@@ -1255,6 +1310,7 @@ def _read_hf_tensors(
 ) -> list[torch.Tensor]:
     candidate_hook = getattr(spec, "hf_name_candidates", None)
     shape_hook = getattr(spec, "hf_target_shape", None)
+    raw_source_hook = getattr(spec, "read_hf_source_raw", None)
     tensors: list[torch.Tensor] = []
     for index, hf_name in enumerate(hf_names):
         candidates = (
@@ -1276,12 +1332,21 @@ def _read_hf_tensors(
             )
         else:
             target_shape = None
-        tensor = reader.get_tensor(
-            resolved,
-            device="cpu" if isinstance(target, DTensor) else target.device,
-            target_shape=target_shape,
-            target_dtype=target.dtype,
+        read_raw = (
+            raw_source_hook(native_name, index, resolved)
+            if callable(raw_source_hook)
+            else False
         )
+        read_device = "cpu" if isinstance(target, DTensor) else target.device
+        if read_raw:
+            tensor = reader.get_raw_tensor(resolved, device=read_device)
+        else:
+            tensor = reader.get_tensor(
+                resolved,
+                device=read_device,
+                target_shape=target_shape,
+                target_dtype=target.dtype,
+            )
         transform_source = getattr(spec, "transform_hf_source", None)
         if callable(transform_source):
             tensor = transform_source(native_name, index, resolved, tensor)
@@ -1382,6 +1447,9 @@ def export_hf_weights(
         """Yield parameters plus persistent buffers present in the HF load plan."""
         for chunk in chunks:
             base_chunk = unwrap_model(chunk)
+            logical_dtypes = getattr(
+                chunk, "_fsdp2_model_param_dtypes_by_name", {}
+            )
             state = base_chunk.state_dict()
             layer_map = (
                 {
@@ -1393,7 +1461,12 @@ def export_hf_weights(
             )
             for name, param in base_chunk.named_parameters():
                 logical_name = canonical_state_key(name)
-                yield to_global_layer_name(logical_name, layer_map), param.data.detach()
+                global_name = to_global_layer_name(logical_name, layer_map)
+                tensor = param.data.detach()
+                logical_dtype = logical_dtypes.get(name)
+                if isinstance(logical_dtype, torch.dtype):
+                    tensor = tensor.to(logical_dtype)
+                yield global_name, tensor
             persistent_buffers = [
                 (name, buffer)
                 for name, buffer in base_chunk.named_buffers()

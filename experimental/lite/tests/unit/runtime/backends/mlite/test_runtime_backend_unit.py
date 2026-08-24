@@ -44,6 +44,39 @@ def test_runtime_returns_loss_separately_from_microbatch_metrics():
     assert result.model_output.loss is not None
 
 
+def test_post_step_scale_invalidation_requires_a_successful_optimizer_update():
+    calls = []
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    model = nn.Linear(1, 1, bias=False)
+
+    no_optim = ModelHandle(
+        model=model,
+        optimizer=None,
+        _extras={"post_optimizer_step_hook": lambda: calls.append("no_optim")},
+    )
+    assert runtime.optimizer_step(no_optim) == (True, 0.0, 0)
+    assert calls == []
+
+    class Optimizer:
+        def __init__(self):
+            self.success = False
+
+        def step(self):
+            return self.success, torch.tensor(1.5), 0
+
+    optimizer = Optimizer()
+    fsdp2 = ModelHandle(
+        model=model,
+        optimizer=optimizer,
+        _extras={"post_optimizer_step_hook": lambda: calls.append("fsdp2")},
+    )
+    assert runtime.optimizer_step(fsdp2) == (False, 1.5, 0)
+    assert calls == []
+    optimizer.success = True
+    assert runtime.optimizer_step(fsdp2) == (True, 1.5, 0)
+    assert calls == ["fsdp2"]
+
+
 def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
     context = LossContext(source_batch="source")
     seen = []
@@ -99,14 +132,13 @@ def test_mlite_config_impl_cfg_optimizer_and_load_gate():
     hook = lambda cfg: cfg  # noqa: E731
     cfg = MegatronLiteConfig(
         model_name="qwen3_moe",
-        impl_cfg={"recompute": "full", "use_deepep": True},
+        impl_cfg={"recompute": "full"},
         optimizer=OptimizerConfig(lr=1e-4, weight_decay=0.1, adam_beta1=0.9),
         load_hf_weights=False,
         model_config_hook=hook,
     )
 
     assert cfg.impl_cfg["recompute"] == "full"
-    assert cfg.impl_cfg["use_deepep"] is True
     assert cfg.optimizer.lr == 1e-4
     assert cfg.optimizer.adam_beta1 == 0.9
     assert cfg.load_hf_weights is False

@@ -592,6 +592,10 @@ class MegatronLiteRuntime(RuntimeBase):
         if handle._optimizer is None:
             return True, 0.0, 0
         update_successful, grad_norm, num_zeros = handle._optimizer.step()
+        if update_successful:
+            hook = handle._extras.get("post_optimizer_step_hook")
+            if callable(hook):
+                hook()
         return update_successful, float(grad_norm), num_zeros
 
     def lr_scheduler_step(self, handle: ModelHandle) -> float | list[float]:
