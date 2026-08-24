@@ -31,7 +31,7 @@ def _reference(
     ("scale_format_name", "expected_quantizer", "expected_use_ue8m0"),
     [
         ("FLOAT32", "float32", False),
-        ("FLOAT32_CEIL_UE8M0", "float32", True),
+        ("FLOAT32_CEIL_UE8M0", "float32", False),
         ("UE8M0", "packed", True),
     ],
 )
