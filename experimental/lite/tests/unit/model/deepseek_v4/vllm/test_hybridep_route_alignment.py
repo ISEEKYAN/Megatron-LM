@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +13,11 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.moe.communication import (
 class _FakeHybridBuffer:
     runtime = object()
 
+    def __init__(self):
+        self.dispatch_calls = 0
+
     def dispatch_with_permute(self, *, hidden, topk_idx=None, handle=None, **kwargs):
+        self.dispatch_calls += 1
         if handle is not None:
             route_rows = handle[0]
             output = hidden.new_zeros(
@@ -128,7 +133,13 @@ def test_hybridep_dispatcher_requires_positive_capacity() -> None:
             )
 
 
-def test_hybridep_rejects_invalid_topology(monkeypatch) -> None:
+def test_hybridep_dispatcher_reuses_host_expert_counts() -> None:
+    source = inspect.getsource(VLLMAlignedHybridEPDispatcher.dispatch)
+    assert "result.tokens_per_expert_list" in source
+    assert "result.tokens_per_expert.tolist()" not in source
+
+
+def test_hybridep_defers_topology_to_native_runtime(monkeypatch) -> None:
     monkeypatch.setattr(
         hybridep, "deep_ep", SimpleNamespace(HybridEPBuffer=object)
     )
@@ -136,19 +147,20 @@ def test_hybridep_rejects_invalid_topology(monkeypatch) -> None:
     monkeypatch.setattr(
         hybridep.dist, "get_world_size", lambda *, group: 4
     )
-    with pytest.raises(RuntimeError, match="not divisible"):
-        VLLMAlignedHybridEPDispatcher(
-            4,
-            16,
-            SimpleNamespace(ep_size=2, ep_group=object()),
-            hybridep_max_tokens_per_rank=128,
-        )
+    dispatcher = VLLMAlignedHybridEPDispatcher(
+        4,
+        16,
+        SimpleNamespace(ep_size=2, ep_group=object()),
+        hybridep_max_tokens_per_rank=128,
+    )
+    assert dispatcher._hybridep_max_tokens_per_rank == 128
 
 
 def test_hybridep_preserves_duplicate_slots_and_compacts_invalid_routes(
     monkeypatch,
 ) -> None:
     observed = {}
+    fake_buffer = _FakeHybridBuffer()
 
     def fake_get_buffer(
         _group,
@@ -158,7 +170,7 @@ def test_hybridep_preserves_duplicate_slots_and_compacts_invalid_routes(
         capacity,
     ):
         observed["capacity"] = capacity
-        return _FakeHybridBuffer()
+        return fake_buffer
 
     monkeypatch.setattr(hybridep, "_get_buffer", fake_get_buffer)
     hidden, weights, indices = _inputs()
@@ -172,14 +184,25 @@ def test_hybridep_preserves_duplicate_slots_and_compacts_invalid_routes(
         hybridep_max_tokens_per_rank=128,
     )
 
+    assert result.tokens_per_expert.device.type == "cpu"
     assert result.tokens_per_expert.tolist() == [128, 128]
+    assert result.tokens_per_expert_list == [128, 128]
+    assert fake_buffer.dispatch_calls == 1
     assert observed["capacity"] == 128
     assert result.hidden.shape == (256, 16)
     assert result.state.source_output_index.tolist() == [[0, 1], [2, -1]]
     source = hybridep.combine_routes(result.hidden, result.state)
+    assert fake_buffer.dispatch_calls == 1
     torch.testing.assert_close(source[0], hidden[0])
     torch.testing.assert_close(source[1], hidden[0])
     torch.testing.assert_close(source[2], hidden[1])
+
+
+def test_hybridep_hot_path_has_no_tensor_item_or_cpu_roundtrip() -> None:
+    source = inspect.getsource(hybridep.dispatch_routes)
+    assert ".item()" not in source
+    assert ".cpu()" not in source
+    assert "padded_counts.to(" not in source
 
 
 def test_hybridep_keeps_zero_route_rank_in_collective(monkeypatch) -> None:
@@ -201,7 +224,9 @@ def test_hybridep_keeps_zero_route_rank_in_collective(monkeypatch) -> None:
         hybridep_max_tokens_per_rank=128,
     )
     assert result.hidden.shape == (0, hidden.shape[1])
+    assert result.tokens_per_expert.device.type == "cpu"
     assert result.tokens_per_expert.tolist() == [0, 0]
+    assert result.tokens_per_expert_list == [0, 0]
     assert torch.equal(
         result.state.source_output_index,
         torch.full_like(indices, -1),

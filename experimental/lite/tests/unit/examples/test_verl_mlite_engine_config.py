@@ -191,6 +191,29 @@ def test_mlite_config_preserves_protocol_owned_non_thd_layout() -> None:
     assert config.impl_cfg["use_deepep"] is True
 
 
+def test_profiling_proxy_forces_all_verl_offload_flags_off() -> None:
+    config = _engine_config(
+        profiling_proxy_mode=True,
+        param_offload=True,
+        optimizer_offload=True,
+        grad_offload=True,
+    )
+    engine = _engine(engine_config=config)
+
+    assert config.param_offload is False
+    assert config.optimizer_offload is False
+    assert config.grad_offload is False
+    assert engine._build_impl_cfg()["profiling_proxy_mode"] is True
+
+
+def test_profiling_proxy_rejects_activation_offload() -> None:
+    with pytest.raises(ValueError, match="activation offload"):
+        _engine_config(
+            profiling_proxy_mode=True,
+            impl_cfg={"offload": ["full"]},
+        )
+
+
 @pytest.mark.parametrize("zero_grad_on_exit, expected_calls", [(True, 1), (False, 0)])
 def test_train_mode_clears_grads_before_context_offload(
     zero_grad_on_exit, expected_calls

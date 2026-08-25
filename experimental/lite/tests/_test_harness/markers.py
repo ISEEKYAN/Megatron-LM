@@ -27,6 +27,9 @@ MARKER_DESCRIPTIONS = (
     "optional: exclude a test from the standard run_tests.sh workflow",
     "mlite: label a test as Megatron Lite owned",
     "smoke: label a broad integration or acceptance test",
+    "vllm_parity_ep: official-vLLM versus mLite expert-parallel forward gate",
+    "vllm_parity_cp: official-vLLM versus mLite context-parallel forward gate",
+    "vllm_parity_graph: official-vLLM versus mLite CUDA-graph forward gate",
 )
 
 

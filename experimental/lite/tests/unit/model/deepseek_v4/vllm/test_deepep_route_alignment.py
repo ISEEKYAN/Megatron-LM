@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import torch
-import pytest
 
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe.communication import (
+    _compact_route_dispatch_inputs,
     _ordered_route_backward,
-    _validate_and_order_route_preserving_outputs,
 )
 
 
@@ -38,71 +37,24 @@ def test_ordered_route_backward_ignores_padded_slots() -> None:
     assert grad_weights[1, 0] == torch.dot(grad_output[1], route_values[1])
 
 
-def test_route_metadata_requires_slime_receive_order() -> None:
-    received_tokens = torch.arange(4 * 16, dtype=torch.bfloat16).reshape(4, 16)
-    received_indices = torch.tensor([[0], [1], [0], [1]], dtype=torch.int64)
-    received_weights = torch.tensor([[0.1], [0.2], [0.3], [0.4]])
-    output_index = torch.tensor([[0], [2], [1], [3]], dtype=torch.int64)
-    expert_outputs = torch.tensor([[10.0], [30.0], [20.0], [40.0]])
-    route_fingerprints = received_tokens.clone()
-    route_indices = received_indices.reshape(-1).clone()
-    route_weights = received_weights.reshape(-1).clone()
-
-    route_rows = _validate_and_order_route_preserving_outputs(
-        expert_outputs,
-        received_tokens,
-        received_indices,
-        received_weights,
-        output_index,
-        route_fingerprints,
-        route_indices,
-        route_weights,
-        return_route_rows=True,
+def test_route_slot_compaction_preserves_duplicate_order_and_weight_bits() -> None:
+    hidden = torch.arange(3 * 16, dtype=torch.bfloat16).reshape(3, 16)
+    indices = torch.tensor([[1, 1], [-1, 0], [1, 9]], dtype=torch.int64)
+    weight_bits = torch.tensor(
+        [0x3E800001, 0x3F000001, 0x7FC00001, 0x3F400001, 0x3F600001, 0x3F700001],
+        dtype=torch.int32,
     )
-    assert torch.equal(route_rows, torch.tensor([0, 2, 1, 3]))
-    ordered = _validate_and_order_route_preserving_outputs(
-        expert_outputs,
-        received_tokens,
-        received_indices,
-        received_weights,
-        output_index,
-        route_fingerprints,
-        route_indices,
-        route_weights,
+    weights = weight_bits.view(torch.float32).reshape(3, 2)
+
+    route_indices, route_weights, route_hidden, output_index, all_valid = (
+        _compact_route_dispatch_inputs(hidden, indices, weights, num_experts=2)
     )
-    assert torch.equal(ordered, torch.tensor([10.0, 20.0, 30.0, 40.0]).unsqueeze(1))
 
-
-@pytest.mark.parametrize("field", ["order", "expert", "weight", "fingerprint"])
-def test_route_metadata_rejects_reordered_or_changed_identity(field: str) -> None:
-    received_tokens = torch.arange(4 * 16, dtype=torch.bfloat16).reshape(4, 16)
-    received_indices = torch.tensor([[0], [1], [0], [1]], dtype=torch.int64)
-    received_weights = torch.tensor([[0.1], [0.2], [0.3], [0.4]])
-    output_index = torch.tensor([[0], [2], [1], [3]], dtype=torch.int64)
-    expert_outputs = torch.tensor([[10.0], [30.0], [20.0], [40.0]])
-    route_fingerprints = received_tokens.clone()
-    route_indices = received_indices.reshape(-1).clone()
-    route_weights = received_weights.reshape(-1).clone()
-    if field == "order":
-        permutation = torch.tensor([2, 0, 3, 1])
-        route_fingerprints = route_fingerprints.index_select(0, permutation)
-        route_indices = route_indices.index_select(0, permutation)
-        route_weights = route_weights.index_select(0, permutation)
-    elif field == "expert":
-        route_indices[0] = 1
-    elif field == "weight":
-        route_weights[0] += 0.01
-    else:
-        route_fingerprints[0, 0] += 1
-
-    with pytest.raises(RuntimeError):
-        _validate_and_order_route_preserving_outputs(
-            expert_outputs,
-            received_tokens,
-            received_indices,
-            received_weights,
-            output_index,
-            route_fingerprints,
-            route_indices,
-            route_weights,
-        )
+    assert not all_valid
+    assert route_indices.reshape(-1).tolist() == [1, 1, 0, 1]
+    assert output_index.tolist() == [[0, 1], [-1, 2], [3, -1]]
+    assert torch.equal(route_hidden, hidden.index_select(0, torch.tensor([0, 0, 1, 2])))
+    assert torch.equal(
+        route_weights.reshape(-1).view(torch.int32),
+        weight_bits.index_select(0, torch.tensor([0, 1, 3, 4])),
+    )

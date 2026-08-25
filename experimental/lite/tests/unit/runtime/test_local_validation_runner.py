@@ -422,7 +422,11 @@ def test_optional_cases_are_isolated_into_skip_tolerant_suites():
 
 @pytest.mark.parametrize(
     ("capabilities", "expected_profile"),
-    [([(9, 0)] * 8, "standard"), ([(10, 0)] * 4, "blackwell")],
+    [
+        ([(9, 0)] * 8, "standard"),
+        ([(10, 0)] * 4, "blackwell"),
+        ([(10, 3)] * 4, "blackwell"),
+    ],
 )
 def test_default_hardware_detection_selects_supported_profile(
     capabilities, expected_profile
@@ -443,7 +447,8 @@ def test_default_hardware_detection_rejects_unsupported_or_mixed_topology(capabi
 
 
 @pytest.mark.parametrize(
-    "capabilities", [[(9, 0)], [(9, 0)] * 2, [(10, 0)], [(10, 0)] * 3]
+    "capabilities",
+    [[(9, 0)], [(9, 0)] * 2, [(10, 0)], [(10, 0)] * 3, [(10, 3)] * 4],
 )
 def test_subset_hardware_accepts_any_positive_homogeneous_supported_gpu_count(
     capabilities,

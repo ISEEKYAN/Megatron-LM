@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+from contextlib import nullcontext
 from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
@@ -401,7 +402,6 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
         lambda chunks, load_grad: events.append("load-model"),
     )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
     monkeypatch.setattr(
         "megatron.lite.runtime.backends.mlite.runtime.gc.collect",
         lambda: events.append("collect"),
@@ -414,20 +414,84 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
         _extras={"model_chunks": [chunk]},
     )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime._transfer_stats = {"d2h_calls": 0, "h2d_calls": 0, "d2h_host_waits": 0}
+
+    class Completion:
+        def __init__(self, direction):
+            self.direction = direction
+
+        def synchronize(self):
+            events.append(f"{self.direction}-event-synchronize")
+
+    class Consumer:
+        def wait_event(self, event):
+            events.append(f"consumer-wait-{event.direction}")
+
+    def run_transfer(direction, operation):
+        events.append(f"{direction}-stream")
+        operation()
+        return Consumer(), Completion(direction)
+
+    runtime._run_cuda_transfer = run_transfer
 
     runtime.to(handle, "cpu", model=True, optimizer=False, grad=True)
     runtime.to(handle, "cuda", model=True, optimizer=False, grad=True)
 
     assert events == [
+        "d2h-stream",
         "offload-model",
         "offload-optimizer",
+        "d2h-event-synchronize",
         "release-scratch",
-        "synchronize",
         "collect",
         "empty-cache",
+        "h2d-stream",
         "load-model",
         "load-optimizer",
+        "consumer-wait-h2d",
     ]
+    assert runtime.transfer_stats()["d2h_host_waits"] == 1
+
+
+def test_transfer_stream_uses_latest_producer_and_consumer_events(monkeypatch):
+    events = []
+
+    class Event:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            events.append(("record", self.name, stream))
+
+    class Stream:
+        def wait_event(self, event):
+            events.append(("wait", "transfer", event.name))
+
+    current = object()
+    transfer = Stream()
+    producer = Event("producer")
+    complete = Event("complete")
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime._transfer_stats = {"d2h_calls": 0, "h2d_calls": 0, "d2h_host_waits": 0}
+    runtime._transfer_assets = lambda _direction: (transfer, producer, complete)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(
+        torch.autograd.profiler, "record_function", lambda _name: nullcontext()
+    )
+
+    returned_current, returned_complete = runtime._run_cuda_transfer(
+        "d2h", lambda: events.append(("copy",))
+    )
+
+    assert events == [
+        ("record", "producer", current),
+        ("wait", "transfer", "producer"),
+        ("copy",),
+        ("record", "complete", transfer),
+    ]
+    assert returned_current is current
+    assert returned_complete is complete
 
 
 def test_export_transfer_does_not_move_optimizer_or_release_scratch(monkeypatch):

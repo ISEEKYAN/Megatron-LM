@@ -253,6 +253,66 @@ def test_vllm_attention_cp2_packed_requests_are_bitwise_batch_invariant() -> Non
     distractor_b = torch.randn(
         seq_len, config.hidden_size, generator=generator, device="cuda", dtype=torch.bfloat16
     )
+
+    def run_cp1(*requests: torch.Tensor) -> torch.Tensor:
+        attention.ps = ParallelState(cp_size=1, cp_rank=0, cp_group=None)
+        lengths = [request.shape[0] for request in requests]
+        boundaries = [0]
+        for length in lengths:
+            boundaries.append(boundaries[-1] + length)
+        cu = torch.tensor(boundaries, device="cuda", dtype=torch.int32)
+        packed = PackedSeqParams.from_cu_seqlens(cu, max_seqlen=max(lengths))
+        positions = torch.cat(
+            [
+                torch.arange(length, device="cuda", dtype=torch.int64)
+                for length in lengths
+            ]
+        )
+        with torch.no_grad():
+            output = attention(
+                torch.cat(requests, dim=0),
+                metadata=builder.build(positions, packed),
+            )
+        torch.cuda.synchronize()
+        return output
+
+    ragged_target = torch.randn(
+        3073, config.hidden_size, generator=generator, device="cuda", dtype=torch.bfloat16
+    )
+    short_distractor = torch.randn(
+        511, config.hidden_size, generator=generator, device="cuda", dtype=torch.bfloat16
+    )
+    long_distractor = torch.randn(
+        1024, config.hidden_size, generator=generator, device="cuda", dtype=torch.bfloat16
+    )
+    cp1_solo = run_cp1(ragged_target)
+    cp1_packed = run_cp1(short_distractor, ragged_target, long_distractor)
+    assert torch.equal(cp1_solo, cp1_packed[511 : 511 + ragged_target.shape[0]])
+
+    # Force every compressed Indexer score to tie while leaving attention KV
+    # nonzero.  Tie resolution must remain request-local and independent of
+    # unrelated requests in the packed batch.
+    saved_indexer_q = attention.indexer.wq_b.weight.detach().clone()
+    attention.indexer.wq_b.weight.data.zero_()
+    attention.clear_deployment_weight_cache()
+    tied_cp1_solo = run_cp1(ragged_target)
+    tied_cp1_solo_repeat = run_cp1(ragged_target)
+    assert torch.equal(tied_cp1_solo, tied_cp1_solo_repeat)
+    tied_cp1_packed = run_cp1(short_distractor, ragged_target, long_distractor)
+    assert torch.equal(
+        tied_cp1_solo,
+        tied_cp1_packed[511 : 511 + ragged_target.shape[0]],
+    )
+    attention.indexer.wq_b.weight.data.copy_(saved_indexer_q)
+    attention.clear_deployment_weight_cache()
+
+    attention.ps = ParallelState(
+        cp_size=cp_size,
+        cp_rank=rank,
+        cp_group=group,
+        cp_global_ranks=list(range(cp_size)),
+    )
+
     def run(*requests: torch.Tensor) -> torch.Tensor:
         lengths = [request.shape[0] for request in requests]
         boundaries = [0]

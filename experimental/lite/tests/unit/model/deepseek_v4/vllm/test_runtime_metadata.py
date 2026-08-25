@@ -110,6 +110,43 @@ def test_training_metadata_has_only_local_packed_state(
         assert metadata.indexer_compressor_metadata is None
 
 
+def test_training_metadata_reuses_shape_workspace_after_warmup() -> None:
+    builder = runtime.AttentionMetadataBuilder(
+        _config(),
+        layer_idx=2,
+        cos_sin_cache=torch.zeros(8192, 128, dtype=torch.float32),
+    )
+
+    warmup = builder.build(torch.arange(37), object())
+    repeated = builder.build(torch.arange(37), object())
+    resized = builder.build(torch.arange(41), object())
+
+    assert repeated.compressor_metadata is warmup.compressor_metadata
+    assert (
+        repeated.indexer_compressor_metadata
+        is warmup.indexer_compressor_metadata
+    )
+    assert resized.compressor_metadata is not warmup.compressor_metadata
+    assert builder.workspace_stats() == {"hits": 1, "misses": 2, "entries": 2}
+
+
+def test_training_metadata_workspace_cache_is_lru_bounded() -> None:
+    builder = runtime.AttentionMetadataBuilder(
+        _config(),
+        layer_idx=2,
+        cos_sin_cache=torch.zeros(8192, 128, dtype=torch.float32),
+    )
+    builder._workspace_cache_max_entries = 2
+
+    first = builder.build(torch.arange(17), object())
+    builder.build(torch.arange(19), object())
+    builder.build(torch.arange(23), object())
+    rebuilt = builder.build(torch.arange(17), object())
+
+    assert builder.workspace_stats() == {"hits": 0, "misses": 4, "entries": 2}
+    assert rebuilt.compressor_metadata is not first.compressor_metadata
+
+
 def _compressor_metadata(tokens: int = 4):
     return runtime.DS4CompressorMetadata(
         state_cache=torch.zeros(1, 4, 512, dtype=torch.float32),

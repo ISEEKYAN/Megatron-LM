@@ -81,7 +81,7 @@ def _run_microbatch(
     assert any(0 < int(count) < 128 for count in actual_counts)
     expert_output = VLLMGroupedMoEWithBF16Backward.apply(
         expert_input,
-        actual_counts,
+        dispatcher._local_tpe_list,
         0.0,
         *weights,
     )

@@ -183,3 +183,85 @@ def test_indexer_compressor_and_topk_use_vllm_kernels_bitwise(
     assert actual_topk[3].ge(0).all()
     assert actual_topk[3].lt(row_ends[3]).all()
     assert actual_topk[3].unique().numel() == 512
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 32])
+def test_official_indexer_topk_launch_count_is_batch_constant(
+    transformer_engine_import_stub,
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+) -> None:
+    transformer_engine_import_stub()
+    from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import (
+        official_indexer_topk,
+    )
+    from vllm import _custom_ops as ops
+    from vllm.models.deepseek_v4.common.ops import fused_indexer_q as fused_q_module
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+    from vllm.utils import deep_gemm
+
+    device = torch.device("cuda")
+    calls = 0
+
+    def fake_fused(positions, q, cos_sin, weights, *args, **kwargs):
+        return q[..., 0].to(torch.float8_e4m3fn), weights.float()
+
+    def fake_quant(k, *args, **kwargs):
+        return k.to(torch.float8_e4m3fn), torch.ones(
+            (k.shape[0], 1), dtype=torch.float32, device=device
+        )
+
+    def fake_logits(q, kv, weights, row_starts, row_ends, clean_logits):
+        nonlocal calls
+        calls += 1
+        return torch.zeros(
+            (weights.shape[0], kv[0].shape[0]), dtype=torch.float32, device=device
+        )
+
+    def fake_topk(
+        logits,
+        row_starts,
+        row_ends,
+        output,
+        num_rows,
+        stride_m,
+        stride_n,
+        topk,
+    ):
+        output.fill_(-1)
+        output[:, 0] = row_starts
+
+    monkeypatch.setattr(
+        fused_q_module, "fused_indexer_q_rope_quant", fake_fused
+    )
+    monkeypatch.setattr(fp8_utils, "per_token_group_quant_fp8", fake_quant)
+    monkeypatch.setattr(deep_gemm, "fp8_fp4_mqa_logits", fake_logits)
+    monkeypatch.setattr(ops, "top_k_per_row_prefill", fake_topk)
+
+    lengths = torch.tensor(
+        [2048 if index % 2 == 0 else 6144 for index in range(batch_size)],
+        dtype=torch.int32,
+        device=device,
+    )
+    compressed = lengths // 4
+    cu = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+    cu_compressed = torch.cat(
+        (torch.zeros(1, dtype=torch.int32, device=device), compressed.cumsum(0))
+    )
+    rows = batch_size
+    actual = official_indexer_topk(
+        torch.zeros((rows, 64, 128), dtype=torch.bfloat16, device=device),
+        torch.zeros((rows, 64), dtype=torch.bfloat16, device=device),
+        torch.zeros(
+            (int(compressed.sum().cpu()), 128), dtype=torch.bfloat16, device=device
+        ),
+        lengths.to(torch.int64) - 1,
+        torch.zeros((8192, 64), dtype=torch.float32, device=device),
+        cu,
+        cu_compressed,
+        global_start=0,
+        ratio=4,
+        topk=1,
+    )
+    assert calls == 1
+    assert actual.eq(0).all()

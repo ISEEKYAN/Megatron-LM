@@ -198,7 +198,8 @@ def _probe_hardware(torch_module, profile: str) -> HardwareSelection:
         (
             name
             for name, expected_capability in ARCHITECTURE_CAPABILITIES.items()
-            if expected_capability == capability
+            if expected_capability[0] == capability[0]
+            and capability >= expected_capability
         ),
         None,
     )
