@@ -73,8 +73,9 @@ class _TorchGroupedAdapter:
         )
 
 
-def test_padding_layout_reuses_ragged_zero_expert_metadata() -> None:
+def test_padding_layout_reuses_ragged_zero_expert_metadata(monkeypatch) -> None:
     vllm_grouped_moe._LAYOUT_CACHE.clear()
+    monkeypatch.setattr(vllm_grouped_moe, "_m_alignment", lambda: 128)
     counts = (3, 0, 129)
 
     first = vllm_grouped_moe._get_forward_layout(counts, torch.device("cpu"))
@@ -119,6 +120,47 @@ def test_grouped_weight_pack_cache_hits_and_invalidates_on_version(
     assert len(calls) == 2
 
 
+def test_scale_validation_follows_runtime_deepgemm_mode(monkeypatch) -> None:
+    non_power_of_two = torch.tensor([1.5], dtype=torch.float32)
+    monkeypatch.setattr(vllm_grouped_moe, "_deep_gemm_uses_e8m0", lambda: False)
+    vllm_grouped_moe._require_power_of_two_scales(
+        "hopper float32", non_power_of_two
+    )
+
+    monkeypatch.setattr(vllm_grouped_moe, "_deep_gemm_uses_e8m0", lambda: True)
+    vllm_grouped_moe._require_power_of_two_scales(
+        "blackwell ue8m0", torch.ones(1, dtype=torch.float32)
+    )
+
+
+def test_packed_scale_validation_is_debug_only(monkeypatch) -> None:
+    cache = vllm_grouped_moe._GroupedWeightPackCache()
+    weights = (torch.nn.Parameter(torch.randn(2, 2)),)
+    packed = SimpleNamespace(
+        qweight=torch.empty(1),
+        scales=torch.ones(1),
+        cache_key=tuple(
+            vllm_grouped_moe._weight_cache_key(weight) for weight in weights
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_grouped_moe, "pack_grouped_block_fp8_weight", lambda _weights: packed
+    )
+    monkeypatch.setattr(
+        vllm_grouped_moe,
+        "_require_power_of_two_scales",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("debug validation ran")),
+    )
+
+    monkeypatch.delenv("MLITE_VALIDATE_PACKED_SCALES", raising=False)
+    assert cache.get(weights) is packed
+
+    cache.clear()
+    monkeypatch.setenv("MLITE_VALIDATE_PACKED_SCALES", "1")
+    with pytest.raises(AssertionError, match="debug validation ran"):
+        cache.get(weights)
+
+
 @pytest.mark.parametrize("num_experts", [1, 5, 9])
 def test_forward_launch_contract_is_constant_across_experts(
     monkeypatch, num_experts: int
@@ -158,6 +200,7 @@ def test_forward_launch_contract_is_constant_across_experts(
         "_vllm_silu_mul_quant",
         lambda _value, *, output, swiglu_limit: (output, torch.ones(1)),
     )
+    monkeypatch.setattr(vllm_grouped_moe, "_m_alignment", lambda: 128)
     monkeypatch.setattr(vllm_grouped_moe._PACKED_WEIGHT_CACHE, "get", packed)
 
     output = vllm_grouped_moe._vllm_grouped_forward(
@@ -598,8 +641,12 @@ def test_visible_experts_forward_preserves_model_clamp(monkeypatch) -> None:
     reason="requires CUDA and vLLM grouped DeepGEMM",
 )
 def test_real_grouped_deepgemm_forward_has_bf16_master_vjp() -> None:
-    from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
+    from vllm.utils.deep_gemm import (
+        DeepGemmQuantScaleFMT,
+        is_deep_gemm_e8m0_used,
+    )
 
+    is_deep_gemm_e8m0_used()
     DeepGemmQuantScaleFMT.init_oracle_cache()
     torch.manual_seed(11)
     counts = (2, 1)
@@ -617,6 +664,23 @@ def test_real_grouped_deepgemm_forward_has_bf16_master_vjp() -> None:
         )
         for _ in counts
     )
+    padded, _layout = vllm_grouped_moe._pad_expert_rows(hidden.detach(), counts)
+    _input_q, input_scale = vllm_grouped_moe._vllm_quantize_contiguous_input(
+        padded
+    )
+    packed_w13 = vllm_grouped_moe._PACKED_WEIGHT_CACHE.get(w13)
+    for name, scale in (
+        ("input", input_scale),
+        ("weight", packed_w13.scales),
+    ):
+        if scale.dtype == torch.float32 and vllm_grouped_moe._deep_gemm_uses_e8m0():
+            invalid = (scale.contiguous().view(torch.int32) & 0x807FFFFF) != 0
+            assert not bool(invalid.any().item()), (
+                f"{name} scale is not UE8M0: "
+                f"dtype={scale.dtype} shape={tuple(scale.shape)} stride={scale.stride()}"
+            )
+        elif scale.dtype != torch.float32:
+            assert scale.dtype in (torch.int32, torch.uint8, torch.float8_e8m0fnu)
     output = vllm_grouped_moe.VLLMGroupedMoEWithBF16Backward.apply(
         hidden,
         counts,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+import os
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -11,10 +13,10 @@ import torch
 from megatron.lite.primitive.modules.experts import swiglu_with_probs
 from megatron.lite.primitive.kernels.swiglu import swiglu_back
 from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
+    _deep_gemm_uses_e8m0,
     pack_grouped_block_fp8_weight,
 )
 
-_M_ALIGNMENT = 128
 _MAX_PACK_CACHE_ENTRIES = 32
 _MAX_LAYOUT_CACHE_ENTRIES = 64
 
@@ -59,7 +61,8 @@ class _GroupedWeightPackCache:
                 return packed
 
         packed = pack_grouped_block_fp8_weight(weights)
-        _require_power_of_two_scales("grouped weight", packed.scales)
+        if os.environ.get("MLITE_VALIDATE_PACKED_SCALES", "0") == "1":
+            _require_power_of_two_scales("grouped weight", packed.scales)
         self._entries[identities] = (
             tuple(weakref.ref(weight) for weight in weights),
             packed,
@@ -84,7 +87,7 @@ _LAYOUT_CACHE: OrderedDict[
 
 
 def _require_power_of_two_scales(name: str, scales: torch.Tensor) -> None:
-    if scales.dtype != torch.float32:
+    if scales.dtype != torch.float32 or not _deep_gemm_uses_e8m0():
         return
     bits = scales.contiguous().view(torch.int32)
     invalid = (bits & 0x807FFFFF) != 0
@@ -92,6 +95,16 @@ def _require_power_of_two_scales(name: str, scales: torch.Tensor) -> None:
         torch.all(~invalid),
         f"{name} contains non-UE8M0 FP32 scales",
     )
+
+
+@functools.cache
+def _m_alignment() -> int:
+    from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
+
+    m_alignment, _k_alignment = get_mk_alignment_for_contiguous_layout()
+    if m_alignment <= 0:
+        raise RuntimeError(f"DeepGEMM returned invalid M alignment: {m_alignment}")
+    return int(m_alignment)
 
 
 def _get_forward_layout(
@@ -103,8 +116,9 @@ def _get_forward_layout(
         _LAYOUT_CACHE.move_to_end(key)
         return cached
 
+    m_alignment = _m_alignment()
     padded_counts = tuple(
-        ((count + _M_ALIGNMENT - 1) // _M_ALIGNMENT) * _M_ALIGNMENT if count else 0
+        ((count + m_alignment - 1) // m_alignment) * m_alignment if count else 0
         for count in counts
     )
     valid_rows = None

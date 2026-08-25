@@ -16,6 +16,13 @@ from megatron.lite.model.deepseek_v4.quantization import (
 )
 
 
+def _deep_gemm_uses_e8m0() -> bool:
+    from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
+
+    DeepGemmQuantScaleFMT.init_oracle_cache()
+    return DeepGemmQuantScaleFMT.from_oracle() != DeepGemmQuantScaleFMT.FLOAT32
+
+
 @dataclass(frozen=True)
 class PackedBlockFP8Weight:
     qweight: torch.Tensor
@@ -60,7 +67,9 @@ def quantize_block_fp8_weight(weight: torch.Tensor):
         from vllm.utils.deep_gemm import per_block_cast_to_fp8
 
         qweight, scales = per_block_cast_to_fp8(
-            weight.detach(), block_size=list(BLOCK_SHAPE), use_ue8m0=False
+            weight.detach(),
+            block_size=list(BLOCK_SHAPE),
+            use_ue8m0=_deep_gemm_uses_e8m0(),
         )
     return CanonicalBlockFP8Weight(qweight, scales)
 
@@ -88,7 +97,10 @@ def _post_process(qweight, scales):
         )
 
         return deepgemm_post_process_fp8_weight_block(
-            wq=qweight, ws=scales, quant_block_shape=BLOCK_SHAPE, use_e8m0=True
+            wq=qweight,
+            ws=scales,
+            quant_block_shape=BLOCK_SHAPE,
+            use_e8m0=_deep_gemm_uses_e8m0(),
         )
 
 
@@ -103,15 +115,22 @@ def pack_grouped_block_fp8_weight(weights: Iterable[nn.Parameter]):
     if not weights:
         raise ValueError("grouped block-FP8 packing requires at least one expert")
     canonical = tuple(quantize_block_fp8_weight(weight) for weight in weights)
-    # Requantization to UE8M0 is a 2-D in-place operation. Applying it after
-    # stacking experts passes a 3-D tensor through a 2-D kernel and corrupts
-    # synthetic/BF16-master scales. Process each expert first, then form the
-    # grouped DeepGEMM tensors. Checkpoint E8M0 scales take the same layout path.
-    processed = tuple(
-        _post_process(item.qweight, item.scales) for item in canonical
+    qweight = torch.stack([item.qweight for item in canonical])
+    scales = torch.stack([item.scales for item in canonical])
+    # BF16 masters are quantized directly with UE8M0 above; release checkpoint
+    # scales are already powers of two. Only perform the grouped scale-layout
+    # transform here. Stacking separately post-processed expert layouts gives
+    # an invalid stride(-3) for grouped DeepGEMM.
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_weight_scale_block,
     )
-    qweight = torch.stack([item[0] for item in processed])
-    scales = torch.stack([item[1] for item in processed])
+    scales = deepgemm_post_process_weight_scale_block(
+        ws=scales,
+        mn=qweight.size(1),
+        k=qweight.size(2),
+        quant_block_shape=BLOCK_SHAPE,
+        num_groups=qweight.size(0),
+    )
     return PackedBlockFP8Weight(
         qweight, scales, tuple(_key(weight) for weight in weights)
     )
