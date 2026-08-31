@@ -518,7 +518,14 @@ class MegatronLiteEngine(BaseEngine):
         if dist.is_initialized():
             dist.barrier()
 
-        proto.save_hf_weights(model_chunks, hf_local_path, model_cfg, ps)
+        save_kwargs: dict[str, Any] = {}
+        if self.engine_config.resync_format is not None:
+            save_kwargs["target"] = self.engine_config.resync_format
+            if self.engine_config.resync_config:
+                save_kwargs["resync_config"] = dict(self.engine_config.resync_config)
+        if self.engine_config.export_dtype:
+            save_kwargs["export_dtype"] = self.engine_config.export_dtype
+        proto.save_hf_weights(model_chunks, hf_local_path, model_cfg, ps, **save_kwargs)
 
         if self._rank == 0:
             hf_config = getattr(self.model_config, "hf_config", None)

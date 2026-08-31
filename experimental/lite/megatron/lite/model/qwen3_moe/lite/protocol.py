@@ -361,10 +361,11 @@ def save_hf_weights(
     path: str,
     model_cfg: Qwen3MoEConfig,
     ps: ParallelState,
+    **kwargs,
 ) -> None:
     from megatron.lite.model.qwen3_moe.lite.checkpoint import save_hf_weights as _save
 
-    _save(chunks, path, model_cfg, ps)
+    _save(chunks, path, model_cfg, ps, **kwargs)
 
 
 # ---------------------------------------------------------------------------

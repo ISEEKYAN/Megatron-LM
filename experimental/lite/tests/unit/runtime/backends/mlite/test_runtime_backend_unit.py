@@ -181,6 +181,26 @@ def test_reset_parameters_helper_reinitializes_each_module_via_apply():
     assert calls == ["first", "second"]
 
 
+def test_reset_parameters_helper_preserves_replaced_parameter_identity():
+    class ReplacingReset(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor([1.0]))
+
+        def reset_parameters(self):
+            self.weight = nn.Parameter(torch.tensor([3.0]))
+
+    model = ReplacingReset()
+    original = model.weight
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    model.apply(_reset_parameters)
+
+    assert optimizer.param_groups[0]["params"][0] is model.weight
+    assert model.weight is original
+    torch.testing.assert_close(model.weight, torch.tensor([3.0]))
+
+
 @pytest.mark.parametrize(
     "load_hf_weights", [True, False], ids=["checkpoint", "random-reset"]
 )
