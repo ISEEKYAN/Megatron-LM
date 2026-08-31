@@ -240,8 +240,30 @@ class DeepseekV4WeightSpec:
     ``weight<local>`` ids to global before calling ``native_to_hf``.
     """
 
+    # HF names whose released dtype is fp32.  These tensors are declared fp32
+    # at construction (see ``mhc.py`` / attention sinks / compressor.ape) but
+    # the protocol's module-wide ``.to(bfloat16)`` downcasts them; the export
+    # path re-materializes them as fp32 so the saved checkpoint matches the
+    # DeepSeek-V4-Flash release byte-for-byte in dtype.
+    _FP32_HF_SUFFIXES: tuple[str, ...] = (
+        ".attn_sink",
+        ".compressor.ape",
+        ".indexer.compressor.ape",
+        ".ffn.gate.bias",
+    )
+    _FP32_HF_INFIXES: tuple[str, ...] = ("hc_head_", ".hc_attn_", ".hc_ffn_")
+
     def __init__(self, config: DeepseekV4Config):
         self.config = config
+
+    def hf_export_dtype_override(self, hf_name: str) -> torch.dtype | None:
+        """Return an explicit export dtype for ``hf_name``, or ``None`` when
+        the shared exporter's default (usually the training dtype) is fine."""
+        if hf_name.endswith(self._FP32_HF_SUFFIXES):
+            return torch.float32
+        if any(marker in hf_name for marker in self._FP32_HF_INFIXES):
+            return torch.float32
+        return None
 
     @property
     def num_experts(self) -> int:
@@ -382,7 +404,14 @@ def _export_unquantized_weights(
     )
 
     spec = DeepseekV4WeightSpec(config)
-    yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
+    for name, tensor in _export(
+        model, spec, ps, vocab_size=config.vocab_size, **kwargs
+    ):
+        if tensor.is_floating_point():
+            override = spec.hf_export_dtype_override(name)
+            if override is not None and tensor.dtype != override:
+                tensor = tensor.to(override)
+        yield name, tensor
 
 
 def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):

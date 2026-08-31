@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
@@ -53,8 +54,35 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
 
 def _reset_parameters(module: torch.nn.Module) -> None:
     reset = getattr(module, "reset_parameters", None)
-    if callable(reset):
-        reset()
+    if not callable(reset):
+        return
+
+    original_parameters = dict(module.named_parameters(recurse=False))
+    reset()
+    with torch.no_grad():
+        for name, original in original_parameters.items():
+            replacement = module._parameters.get(name)
+            if replacement is None:
+                raise RuntimeError(f"{type(module).__name__}.reset_parameters() removed {name!r}.")
+            if replacement is original:
+                continue
+            original_local = original.to_local() if isinstance(original, DTensor) else original
+            replacement_local = (
+                replacement.to_local() if isinstance(replacement, DTensor) else replacement
+            )
+            if original_local.shape != replacement_local.shape:
+                raise RuntimeError(
+                    f"{type(module).__name__}.reset_parameters() changed {name!r} shape "
+                    f"from {tuple(original_local.shape)} to {tuple(replacement_local.shape)}."
+                )
+            if original_local.data_ptr() != replacement_local.data_ptr():
+                original_local.copy_(
+                    replacement_local.to(
+                        device=original_local.device,
+                        dtype=original_local.dtype,
+                    )
+                )
+            module._parameters[name] = original
 
 
 def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:

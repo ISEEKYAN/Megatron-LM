@@ -8,6 +8,8 @@ model-specific: the weight map and tensor conversions.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.ckpt.dcp import (  # noqa: F401 — re-export
@@ -20,6 +22,9 @@ from megatron.lite.primitive.ckpt.hf_weights import extract_layer_idx, parse_exp
 from megatron.lite.primitive.quantization.mxfp4 import MXFP4_BLOCK_SIZE, quantize_mxfp4
 from megatron.lite.runtime.contracts.weights import ResyncFormat
 from torch.distributed.tensor import Replicate, Shard
+
+
+logger = logging.getLogger(__name__)
 
 
 def _pack_mcore_qkv(
@@ -319,9 +324,15 @@ def _export_mxfp4_weights(weights):
         yield f"{name[:-7]}.weight_scale", scale.view(torch.uint8)
 
 
-def save_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:
+def save_hf_weights(model, path: str, config: Qwen3MoEConfig, ps, **kwargs) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import save_hf_weights as _save
 
+    # Qwen3-MoE has no MXFP4/block-FP8 save-time resync path, so the engine-level
+    # export kwargs are accepted for signature-compatibility but not consumed.
+    if kwargs:
+        logger.warning(
+            "Qwen3-MoE save_hf_weights ignoring unsupported kwargs: %s", kwargs
+        )
     _save(model, path, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size)
 
 
