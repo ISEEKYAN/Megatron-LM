@@ -59,20 +59,16 @@ def local_compressed_sequence_boundaries(
 
     d_comp = 8 if ratio == 4 else ratio
     local_end = global_start + local_rows
-    first_range_group_start = global_start - d_comp
     compressed = [0]
     for seq_start, seq_end in zip(sequence_boundaries, sequence_boundaries[1:]):
         if seq_end <= seq_start:
             raise ValueError("sequence boundaries must be strictly increasing")
-        local_seq_end = min(seq_end, local_end)
-        if seq_start >= local_seq_end or global_start >= local_seq_end:
+        owned_start = max(global_start, seq_start)
+        owned_end = min(local_end, seq_end)
+        if owned_start >= owned_end:
             compressed.append(compressed[-1])
             continue
-
-        first_visible_numer = max(0, first_range_group_start - seq_start)
-        first_visible_group = (first_visible_numer + ratio - 1) // ratio
-        stop_visible_group = (local_seq_end - seq_start) // ratio
-        compressed.append(
-            compressed[-1] + max(0, stop_visible_group - first_visible_group)
-        )
+        first_group = max(0, (owned_start - seq_start - d_comp + ratio - 1) // ratio)
+        last_group = max(0, (owned_end - seq_start) // ratio)
+        compressed.append(compressed[-1] + max(0, last_group - first_group))
     return tuple(compressed)

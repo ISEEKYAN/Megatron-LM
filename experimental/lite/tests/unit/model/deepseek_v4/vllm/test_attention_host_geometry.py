@@ -37,7 +37,7 @@ def test_compressed_geometry_floors_each_request(
     assert compressed_sequence_boundaries(boundaries, ratio=ratio) == expected
 
 
-@pytest.mark.parametrize("distance", range(1, 8))
+@pytest.mark.parametrize("distance", range(0, 8))
 def test_local_compressed_geometry_ignores_left_boundary_only_sequences(
     distance: int,
 ) -> None:
