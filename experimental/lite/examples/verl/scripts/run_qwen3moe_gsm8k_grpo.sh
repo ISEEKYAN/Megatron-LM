@@ -89,6 +89,15 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 # - fsdp2: Megatron Lite FSDP2 wrapper + optimizer.
 MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-dist_opt}"
 
+# Rollout-correction bypass takes old_log_probs from the vLLM rollout instead
+# of recomputing them with the actor. The rollout-vs-actor divergence grows
+# with sequence length (measured on identical weights: ppo_kl ~0.22 at ~460
+# tokens, 1.2-1.4 at ~3400 tokens), which distorts every importance ratio in
+# the PPO loss. An A/B ablation on DAPO-Math-17k showed ppo_kl dropping from
+# 1.3 to 0.023 and val accuracy going from decline to hold when bypass is
+# disabled, so it defaults to False here.
+ROLLOUT_CORRECTION_BYPASS="${ROLLOUT_CORRECTION_BYPASS:-False}"
+
 ACTOR_LR="${ACTOR_LR:-1e-6}"
 POLICY_LOSS_MODE="${POLICY_LOSS_MODE:-vanilla}"
 LOSS_AGG_MODE="${LOSS_AGG_MODE:-seq-mean-token-sum-norm}"
@@ -166,7 +175,7 @@ ALGORITHM=(
   "algorithm.adv_estimator=grpo"
   "algorithm.use_kl_in_reward=${USE_KL_IN_REWARD:-False}"
   "algorithm.kl_ctrl.kl_coef=${KL_COEF:-0.0}"
-  "algorithm.rollout_correction.bypass_mode=True"
+  "algorithm.rollout_correction.bypass_mode=${ROLLOUT_CORRECTION_BYPASS}"
   "algorithm.norm_adv_by_std_in_grpo=False"
 )
 
