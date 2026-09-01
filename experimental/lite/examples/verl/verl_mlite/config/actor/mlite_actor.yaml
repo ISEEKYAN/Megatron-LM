@@ -8,3 +8,18 @@ defaults:
 _target_: verl.workers.config.ActorConfig
 
 strategy: mlite
+
+# Training hyperparameters for the Qwen3-MoE GRPO example. These used to be baked
+# into the launcher shell (run_qwen3moe_gsm8k_grpo.sh) as CLI overrides; they now
+# live here so the resolved config has a single source of truth and the launcher
+# only handles environment/orchestration. Values below reproduce the example's
+# prior behaviour EXCEPT betas: it is intentionally left unset so it inherits the
+# verl upstream default [0.9, 0.999] (the launcher previously smuggled
+# [0.9, 0.95]). Anything not listed here inherits optim@megatron / the actor base
+# defaults, which already match verl upstream (clip_grad=1.0, lr_decay_style=
+# constant, lr_warmup_init=0.0, entropy_coeff=0, policy_loss.loss_mode=vanilla).
+loss_agg_mode: seq-mean-token-sum-norm
+optim:
+  lr: 1e-6
+  weight_decay: 0.1
+  lr_warmup_steps: 0

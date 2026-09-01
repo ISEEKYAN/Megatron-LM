@@ -89,15 +89,13 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 # - fsdp2: Megatron Lite FSDP2 wrapper + optimizer.
 MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-dist_opt}"
 
-ACTOR_LR="${ACTOR_LR:-1e-6}"
-POLICY_LOSS_MODE="${POLICY_LOSS_MODE:-vanilla}"
-LOSS_AGG_MODE="${LOSS_AGG_MODE:-seq-mean-token-sum-norm}"
-WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
-BETAS="${BETAS:-[0.9,0.95]}"
-CLIP_GRAD="${CLIP_GRAD:-1.0}"
-LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
-LR_DECAY_STYLE="${LR_DECAY_STYLE:-constant}"
-ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
+# Training hyperparameters (lr / betas / weight_decay / clip_grad / warmup /
+# decay style / loss aggregation / entropy / policy-loss mode) are NOT set here.
+# They live in the verl_mlite config (actor/mlite_actor.yaml -> optim@megatron)
+# so the resolved config has a single source of truth; override explicitly on
+# the command line via the trailing EXTRA_ARGS passthrough when needed. Notably
+# betas now inherits the verl upstream default [0.9, 0.999] instead of a
+# launcher-baked [0.9, 0.95].
 USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
 PARAM_OFFLOAD="${PARAM_OFFLOAD:-False}"
 OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-True}"
@@ -152,8 +150,9 @@ CKPT_DIR="${CKPT_DIR:-${OUTPUT_ROOT}/checkpoints/${RUN_NAME}}"
 LOG_FILE="${LOG_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.log}"
 JSONL_FILE="${JSONL_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.jsonl}"
 CMD_FILE="${CMD_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.cmd.sh}"
+RESOLVED_CONFIG_FILE="${RESOLVED_CONFIG_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.resolved.yaml}"
 
-mkdir -p "${OUTPUT_ROOT}" "${CKPT_DIR}" "$(dirname "${LOG_FILE}")" "$(dirname "${JSONL_FILE}")" "$(dirname "${CMD_FILE}")"
+mkdir -p "${OUTPUT_ROOT}" "${CKPT_DIR}" "$(dirname "${LOG_FILE}")" "$(dirname "${JSONL_FILE}")" "$(dirname "${CMD_FILE}")" "$(dirname "${RESOLVED_CONFIG_FILE}")"
 export VERL_FILE_LOGGER_PATH="${JSONL_FILE}"
 
 CACHE_ROOT="${VERL_MLITE_CACHE_ROOT:-${TMPDIR:-/tmp}/verl_mlite}"
@@ -166,7 +165,6 @@ ALGORITHM=(
   "algorithm.adv_estimator=grpo"
   "algorithm.use_kl_in_reward=${USE_KL_IN_REWARD:-False}"
   "algorithm.kl_ctrl.kl_coef=${KL_COEF:-0.0}"
-  "algorithm.rollout_correction.bypass_mode=True"
   "algorithm.norm_adv_by_std_in_grpo=False"
 )
 
@@ -190,22 +188,12 @@ MODEL=(
 
 ACTOR=(
   "actor@actor_rollout_ref.actor=mlite_actor"
-  "actor_rollout_ref.actor.optim.lr=${ACTOR_LR}"
-  "actor_rollout_ref.actor.optim.weight_decay=${WEIGHT_DECAY}"
-  "actor_rollout_ref.actor.optim.betas=${BETAS}"
-  "actor_rollout_ref.actor.optim.clip_grad=${CLIP_GRAD}"
-  "actor_rollout_ref.actor.optim.lr_warmup_steps=${LR_WARMUP_STEPS}"
-  "actor_rollout_ref.actor.optim.lr_warmup_init=0"
-  "actor_rollout_ref.actor.optim.lr_decay_style=${LR_DECAY_STYLE}"
   "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}"
   "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU}"
   "actor_rollout_ref.actor.use_dynamic_bsz=${USE_DYNAMIC_BSZ}"
   "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}"
   "actor_rollout_ref.actor.use_kl_loss=${USE_KL_LOSS:-False}"
   "actor_rollout_ref.actor.kl_loss_coef=${KL_LOSS_COEF:-0.0}"
-  "actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}"
-  "actor_rollout_ref.actor.policy_loss.loss_mode=${POLICY_LOSS_MODE}"
-  "actor_rollout_ref.actor.loss_agg_mode=${LOSS_AGG_MODE}"
   "actor_rollout_ref.actor.engine.dtype=${DTYPE}"
   "actor_rollout_ref.actor.engine.model_name=${MLITE_MODEL_NAME}"
   "actor_rollout_ref.actor.engine.impl=${MLITE_IMPL}"
@@ -312,6 +300,15 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   printf '%q ' "${COMMAND[@]}"
   printf '\n'
   exit 0
+fi
+
+# Dump the Hydra-resolved config to the output dir as run-alignment evidence.
+# `--cfg job --resolve` composes and resolves without launching training, so it
+# is CPU-cheap. Kept non-fatal so a resolver hiccup never blocks the real run.
+if [[ "${DUMP_RESOLVED_CONFIG:-1}" == "1" ]]; then
+  "${COMMAND[@]}" --cfg job --resolve > "${RESOLVED_CONFIG_FILE}" 2>/dev/null \
+    && echo "[mlite] resolved_config=${RESOLVED_CONFIG_FILE}" \
+    || echo "[mlite] resolved_config dump skipped (hydra --cfg failed)" >&2
 fi
 
 echo "[mlite] output_root=${OUTPUT_ROOT}"
