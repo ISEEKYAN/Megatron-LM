@@ -2,6 +2,13 @@
 
 """Native GLM-5 lite implementation."""
 
-from megatron.lite.model.glm5.lite.model import Glm5Model
-
 __all__ = ["Glm5Model"]
+
+
+def __getattr__(name: str):
+    """Keep protocol-only CPU checks independent of Transformer Engine."""
+    if name == "Glm5Model":
+        from megatron.lite.model.glm5.lite.model import Glm5Model
+
+        return Glm5Model
+    raise AttributeError(name)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
@@ -189,42 +190,65 @@ ModuleMap = dict[str, Callable[[nn.Module], nn.Module | None]]
 """Maps module name → lambda that extracts a sub-module from a layer."""
 
 
+@dataclass(frozen=True)
+class RecomputeApplication:
+    """The observable result of applying a recompute request."""
+
+    requested: tuple[str, ...]
+    units: int
+    matched: int
+    wrapped: int
+
+
 def apply_recompute(
     layers: nn.ModuleList,
     module_names: list[str],
     module_map: ModuleMap,
     no_rng_modules: set[str] | None = None,
-) -> None:
-    """Wrap specified sub-modules with activation checkpointing for recomputation."""
+) -> RecomputeApplication:
+    """Wrap requested modules and return the observed application result.
+
+    A non-empty feature request which selects no module is a configuration
+    error.  Silently accepting it makes an OOM look unrelated to recompute.
+    """
     if not module_names:
-        return
+        return RecomputeApplication(requested=(), units=len(layers), matched=0, wrapped=0)
+    if not layers:
+        raise ValueError(
+            f"recompute requested for {module_names!r}, but received 0 transformer units. "
+            "Check transformer-unit enumeration."
+        )
     no_rng = no_rng_modules or set()
+    matched = 0
+    wrapped = 0
     for layer in layers:
         if "full" in module_names:
-            wrap_checkpoint(layer)
+            matched += 1
+            wrapped += wrap_checkpoint(layer)
         else:
             for mod_name in module_names:
                 if mod_name in module_map:
                     submod = module_map[mod_name](layer)
                     if submod is not None:
-                        wrap_checkpoint(submod, preserve_rng_state=mod_name not in no_rng)
+                        matched += 1
+                        wrapped += wrap_checkpoint(submod, preserve_rng_state=mod_name not in no_rng)
+    if matched == 0:
+        raise ValueError(
+            f"recompute requested for {module_names!r}, but matched 0 modules. "
+            "Check transformer-unit enumeration and the model module map."
+        )
+    return RecomputeApplication(
+        requested=tuple(module_names), units=len(layers), matched=matched, wrapped=wrapped
+    )
 
 
 def apply_offload(layers: nn.ModuleList, module_names: list[str], module_map: ModuleMap) -> None:
-    """Wrap specified sub-modules with activation offloading to CPU."""
+    """Reject activation-offload requests until a real offload backend exists."""
     if not module_names:
         return
-    try:
-        from torch.utils.checkpoint import CheckpointPolicy  # noqa: F401
-    except ImportError:
-        log_rank0("WARNING: torch.utils.checkpoint policy_fn not available, skipping offload")
-        return
-    for layer in layers:
-        for mod_name in module_names:
-            if mod_name in module_map:
-                submod = module_map[mod_name](layer)
-                if submod is not None:
-                    wrap_offload(submod)
+    raise NotImplementedError(
+        "activation offload was requested, but Megatron Lite has no activation-offload backend"
+    )
 
 
 class CheckpointFunction(torch.autograd.Function):
@@ -246,7 +270,7 @@ class CheckpointFunction(torch.autograd.Function):
         # Save RNG states for deterministic recomputation.
         if preserve_rng_state:
             ctx.cpu_rng_state = torch.get_rng_state()
-            ctx.cuda_rng_state = torch.cuda.get_rng_state()
+            ctx.cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
 
         # Run forward without gradient tracking — discard intermediate activations.
         with torch.no_grad():
@@ -268,9 +292,10 @@ class CheckpointFunction(torch.autograd.Function):
         # Fork RNG: restore forward-time states, then reset to current after recompute.
         if ctx.preserve_rng_state:
             current_cpu_rng = torch.get_rng_state()
-            current_cuda_rng = torch.cuda.get_rng_state()
+            current_cuda_rng = torch.cuda.get_rng_state() if ctx.cuda_rng_state is not None else None
             torch.set_rng_state(ctx.cpu_rng_state)
-            torch.cuda.set_rng_state(ctx.cuda_rng_state)
+            if ctx.cuda_rng_state is not None:
+                torch.cuda.set_rng_state(ctx.cuda_rng_state)
 
         # Recompute forward pass with gradients enabled.
         detached = tuple(
@@ -283,7 +308,8 @@ class CheckpointFunction(torch.autograd.Function):
         # Restore RNG states.
         if ctx.preserve_rng_state:
             torch.set_rng_state(current_cpu_rng)
-            torch.cuda.set_rng_state(current_cuda_rng)
+            if current_cuda_rng is not None:
+                torch.cuda.set_rng_state(current_cuda_rng)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
@@ -304,8 +330,10 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> None:
-    """Wrap a module's forward with reentrant activation checkpointing."""
+def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> int:
+    """Wrap a module once with reentrant activation checkpointing."""
+    if getattr(module, "_megatron_lite_recompute_wrapped", False):
+        return 0
     original_forward = module.forward
     _routers = [m for m in module.modules() if hasattr(m, "expert_bias")]
 
@@ -339,18 +367,8 @@ def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> No
         return CheckpointFunction.apply(_fn, preserve_rng_state, *args)
 
     module.forward = _checkpointed_forward
-
-
-def wrap_offload(module: nn.Module) -> None:
-    """Wrap a module's forward with activation offloading."""
-    original_forward = module.forward
-
-    def _offloaded_forward(*args, **kwargs):
-        return torch.utils.checkpoint.checkpoint(
-            original_forward, *args, use_reentrant=False, **kwargs
-        )
-
-    module.forward = _offloaded_forward
+    module._megatron_lite_recompute_wrapped = True
+    return 1
 
 
 def log_rank0(msg: str) -> None:
@@ -373,9 +391,9 @@ __all__ = [
     "CheckpointFunction",
     "CheckpointWithoutOutput",
     "ModuleMap",
+    "RecomputeApplication",
     "apply_offload",
     "apply_recompute",
     "parse_recompute_spec",
     "wrap_checkpoint",
-    "wrap_offload",
 ]

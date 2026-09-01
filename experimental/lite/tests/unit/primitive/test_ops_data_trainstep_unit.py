@@ -6,13 +6,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.data import _resolve_thd_padding, fixed_batches
 from megatron.lite.primitive.deterministic import deterministic_requested
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.gated_delta_rule import l2norm, torch_chunk_gated_delta_rule
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_log_probs_from_logits
-from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
+from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.recompute import apply_offload, apply_recompute, parse_recompute_spec
 from megatron.lite.primitive.train_step import compute_and_clip_grad_norm, run_microbatch_loop
 from megatron.lite.primitive.utils import ensure_divisible
 
@@ -144,18 +146,69 @@ def test_recompute_parser_and_wrapper_replays_forward_on_backward():
             self.inner = CountingModule()
 
     layer = Layer()
-    apply_recompute(
+    wrapped = apply_recompute(
         nn.ModuleList([layer]),
         ["inner"],
         {"inner": lambda module: module.inner},
         no_rng_modules={"inner"},
     )
+    assert wrapped.wrapped == 1
+    assert wrapped.matched == 1
 
     x = torch.tensor([2.0, -3.0], requires_grad=True)
     layer.inner(x).sum().backward()
 
     assert layer.inner.calls == 2
     torch.testing.assert_close(x.grad, torch.tensor([4.0, -6.0]))
+
+
+def test_memory_feature_requests_fail_loud_when_configuration_cannot_take_effect():
+    empty_layers = nn.ModuleList()
+
+    with pytest.raises(ValueError, match=r"recompute requested.*0 transformer units"):
+        apply_recompute(empty_layers, ["full"], {})
+    with pytest.raises(NotImplementedError, match=r"no activation-offload backend"):
+        apply_offload(empty_layers, ["full"], {})
+
+
+def test_recompute_reports_matches_and_does_not_double_wrap():
+    layer = nn.Module()
+    layer.inner = nn.Linear(2, 2)
+    layers = nn.ModuleList([layer])
+    module_map = {"inner": lambda module: module.inner}
+
+    first = apply_recompute(layers, ["inner"], module_map)
+    second = apply_recompute(layers, ["inner"], module_map)
+
+    assert (first.units, first.matched, first.wrapped) == (1, 1, 1)
+    assert (second.units, second.matched, second.wrapped) == (1, 1, 0)
+
+
+def test_model_bundle_reports_actual_memory_feature_effects(capsys):
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner = nn.Linear(2, 2)
+            self.experts = nn.ModuleList([nn.Linear(2, 2)])
+
+    class Optimizer:
+        def __init__(self):
+            self.state = {"step": torch.tensor(1)}
+
+    layer = Layer()
+    apply_recompute(nn.ModuleList([layer]), ["inner"], {"inner": lambda module: module.inner})
+
+    ModelBundle(
+        chunks=[layer],
+        parallel_state=ParallelState(ep_size=4),
+        optimizer=Optimizer(),
+    )
+
+    output = capsys.readouterr().out
+    assert "recompute_wrapped=1" in output
+    assert "activation_offload=unsupported" in output
+    assert "expert_shard_ratio=n/a (no DTensor expert params)" in output
+    assert "optimizer_state_devices=cpu" in output
 
 
 def test_train_step_microbatch_loop_and_grad_clip_cpu_contract():
