@@ -422,6 +422,32 @@ def test_ds4_source_scales_bind_global_expert_to_ep_local_parameter():
     assert "layers.2.mlp.experts.fc1.weight128" in model._fp8_source_scales_by_name
 
 
+def test_ds4_source_scale_export_keeps_bound_global_layer_names():
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+
+    ckpt = _checkpoint_module()
+    model = nn.Module()
+    model.layer_indices = [2]
+    model._fp8_source_scales_valid = True
+    model._fp8_source_scales_by_name = {
+        "layers.0.self_attn.self_attn.wq_a.weight": torch.ones(1, 1),
+        "layers.2.self_attn.self_attn.wq_a.weight": torch.full((1, 1), 2.0),
+    }
+    ps = SimpleNamespace(
+        ep_size=1,
+        ep_group=None,
+        pp_size=1,
+        pp_group=None,
+    )
+
+    scales = ckpt._export_source_scales(
+        model, DeepseekV4Config(num_hidden_layers=4), ps
+    )
+
+    assert torch.equal(scales["layers.0.attn.wq_a.weight"], torch.ones(1, 1))
+    assert torch.equal(scales["layers.2.attn.wq_a.weight"], torch.full((1, 1), 2.0))
+
+
 def test_ds4_source_scale_export_gathers_remote_ep_experts(monkeypatch):
     ckpt = _checkpoint_module()
     local = {"layers.0.ffn.experts.0.w1.weight": torch.tensor([[1.0]])}

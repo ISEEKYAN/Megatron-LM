@@ -574,7 +574,11 @@ def invalidate_bound_source_scales(model: nn.Module) -> None:
 
 
 def _export_source_scales(
-    model, config: DeepseekV4Config, ps: ParallelState
+    model,
+    config: DeepseekV4Config,
+    ps: ParallelState,
+    *,
+    local_expert_shard: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Collect initial checkpoint scales under their exported HF names."""
 
@@ -583,15 +587,14 @@ def _export_source_scales(
     for chunk in chunks:
         if not bool(getattr(chunk, "_fp8_source_scales_valid", False)):
             continue
-        layer_map = {
-            local_idx: chunk.layer_indices[local_idx]
-            for local_idx in range(len(getattr(chunk, "layer_indices", ())))
-        }
         for native_name, scale in getattr(
             chunk, "_fp8_source_scales_by_name", {}
         ).items():
-            global_name = to_global_layer_name(native_name, layer_map)
-            names = _hf_names_for_state_key(global_name, config)
+            # ``bind_source_scales`` stores this registry under global layer
+            # names.  Remapping it a second time aliases global layer 0 with
+            # the first local layer on nonzero PP stages (for example both
+            # become layer 2 on PP rank 2), producing a false scale conflict.
+            names = _hf_names_for_state_key(native_name, config)
             values = scale.chunk(2, dim=0) if len(names) == 2 else (scale,)
             for name, value in zip(names, values, strict=True):
                 value = value.detach().cpu().float().contiguous()
@@ -600,12 +603,13 @@ def _export_source_scales(
                     raise RuntimeError(f"conflicting source scales for {name}")
                 local[name] = value
 
-    local = _gather_source_scale_registry(
-        local,
-        size=ps.ep_size,
-        group=ps.ep_group,
-        parallelism="EP",
-    )
+    if not local_expert_shard:
+        local = _gather_source_scale_registry(
+            local,
+            size=ps.ep_size,
+            group=ps.ep_group,
+            parallelism="EP",
+        )
     return _gather_source_scale_registry(
         local,
         size=ps.pp_size,
@@ -655,10 +659,13 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
     """
     target = kwargs.pop("target", "hf")
     resync_config = kwargs.pop("resync_config", None)
+    local_expert_shard = bool(kwargs.get("local_expert_shard", False))
     if target not in {"hf", ResyncFormat.BF16.value, *_QUANTIZED_RESYNC_TARGETS}:
         raise ValueError(f"Unsupported DeepSeek-V4 export target: {target!r}")
     source_scales = (
-        _export_source_scales(model, config, ps)
+        _export_source_scales(
+            model, config, ps, local_expert_shard=local_expert_shard
+        )
         if target in _QUANTIZED_RESYNC_TARGETS
         else {}
     )

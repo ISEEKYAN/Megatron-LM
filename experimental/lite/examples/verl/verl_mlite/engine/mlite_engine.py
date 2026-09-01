@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import weakref
@@ -12,13 +14,21 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
-from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+from megatron.lite.primitive.ckpt import (
+    load_training_checkpoint,
+    save_training_checkpoint,
+)
 from megatron.lite.primitive.modules import router_replay
-from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
+from megatron.lite.primitive.protocols import (
+    default_expert_classifier,
+    default_placement_fn,
+)
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts import LossContext, PackedBatch
-from megatron.lite.runtime.contracts.config import OptimizerConfig as MegatronLiteOptimizerConfig
+from megatron.lite.runtime.contracts.config import (
+    OptimizerConfig as MegatronLiteOptimizerConfig,
+)
 from megatron.lite.runtime.contracts.config import ParallelConfig, RuntimeConfig
 from tensordict import TensorDict
 
@@ -31,11 +41,39 @@ from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
 from verl.workers.engine.utils import postprocess_batch_func, prepare_micro_batches
 from verl_mlite import qat_export
+from verl_mlite.weight_sync import (
+    PPBroadcastContext,
+    PPBroadcastWeightStream,
+    PPBucketPlanCache,
+    install_pp_bucketed_sender,
+)
 
 from .config import MegatronLiteEngineConfig
 
 
 _LR_SCHEDULER_STATE = "lr_scheduler.pt"
+
+
+def _fingerprint_resync_stream(weights, output_path: str):
+    """Record exact wire-tensor hashes without changing the resync stream."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as output:
+        count = 0
+        for name, tensor in weights:
+            cpu = tensor.detach().contiguous().cpu()
+            byte_view = cpu.view(torch.uint8).numpy()
+            record = {
+                "name": name,
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+                "sha256": hashlib.sha256(byte_view).hexdigest(),
+            }
+            output.write(json.dumps(record, sort_keys=True) + "\n")
+            output.flush()
+            count += 1
+            yield name, tensor
+    with open(output_path + ".complete", "w", encoding="utf-8") as marker:
+        marker.write(f"{count}\n")
 
 
 def _isolate_compile_cache_per_rank() -> None:
@@ -273,6 +311,8 @@ class MegatronLiteEngine(BaseEngine):
         self.module = None
         self._mlite_config = None
         self._rank = dist.get_rank() if dist.is_initialized() else 0
+        self._pp_weight_plan = PPBucketPlanCache()
+        self._pp_bucketed_sender_installed = install_pp_bucketed_sender()
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -348,7 +388,9 @@ class MegatronLiteEngine(BaseEngine):
 
         tu.assign_non_tensor(data, sp_size=self.engine_config.cp)
 
-        token_mask = data["loss_mask"] if "loss_mask" in data.keys() else data["response_mask"]
+        token_mask = (
+            data["loss_mask"] if "loss_mask" in data.keys() else data["response_mask"]
+        )
         batch_num_tokens = token_mask.sum().to(get_device_id())
         torch.distributed.all_reduce(
             batch_num_tokens,
@@ -359,7 +401,9 @@ class MegatronLiteEngine(BaseEngine):
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
         micro_batches, indices = prepare_micro_batches(
-            data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
+            data=data,
+            dp_group=self.get_data_parallel_group(),
+            same_micro_num_in_dp=True,
         )
 
         # Megatron drives every forward through the runtime's forward_backward
@@ -399,10 +443,83 @@ class MegatronLiteEngine(BaseEngine):
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
-        weights = self.runtime.export_weights(self.handle, **export_kwargs)
+        weights = self._export_weights_for_verl(export_kwargs, kwargs)
         if self.engine_config.qat.get("enable", False):
             weights = qat_export.export_qat_weights(weights, self.engine_config.qat)
+        hash_dir = os.environ.get("MLITE_RESYNC_HASH_DIR")
+        if hash_dir:
+            sync_index = getattr(self, "_resync_hash_index", 0)
+            self._resync_hash_index = sync_index + 1
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            weights = _fingerprint_resync_stream(
+                weights,
+                os.path.join(hash_dir, f"rank{rank}.sync{sync_index}.jsonl"),
+            )
         return weights, None
+
+    def _export_weights_for_verl(self, export_kwargs, request_kwargs):
+        """Use PP-owner export when VERL's colocated bucket sender can fan it out."""
+        ps = self.handle._parallel_state
+        pp_size = int(getattr(ps, "pp_size", 1) or 1)
+        diagnostic_export = bool(os.environ.get("MLITE_RESYNC_HASH_DIR"))
+        filtered_export = any(
+            key in request_kwargs
+            for key in ("limit", "include_mtp_only", "include_local_prefixes")
+        )
+        can_export_local_pp = (
+            pp_size > 1
+            and self._pp_bucketed_sender_installed
+            and not diagnostic_export
+            and not filtered_export
+            and not self.engine_config.qat.get("enable", False)
+            and getattr(ps, "pp_group", None) is not None
+            and getattr(ps, "pp_global_ranks", None) is not None
+        )
+        if not can_export_local_pp:
+            return self.runtime.export_weights(self.handle, **export_kwargs)
+
+        export_kwargs = dict(export_kwargs)
+        if self._can_route_local_expert_shard(ps):
+            export_kwargs["local_expert_shard"] = True
+        local_weights = self.runtime.export_weights(
+            self.handle, local_pipeline_stage=True, **export_kwargs
+        )
+        context = PPBroadcastContext(
+            rank=int(ps.pp_rank),
+            size=pp_size,
+            global_ranks=tuple(ps.pp_global_ranks),
+            group=ps.pp_group,
+            cpu_group=getattr(ps, "pp_cpu_group", None),
+        )
+        return PPBroadcastWeightStream(local_weights, context, self._pp_weight_plan)
+
+    def _can_route_local_expert_shard(self, ps) -> bool:
+        """Whether the paired vLLM rank owns the actor rank's EP shard.
+
+        The colocated VERL mesh is row-major.  With rollout TP=1 its expert
+        coordinate is ``global_rank % rollout_ep``.  mLite's expert layout has
+        the same coordinate, and every rank in one PP group keeps that EP rank.
+        Requiring all of these invariants makes the fast path topology-driven;
+        mismatched or unsupported layouts retain the full-EP export path.
+        """
+        ep_size = int(getattr(ps, "ep_size", 1) or 1)
+        rollout_ep = int(getattr(self.engine_config, "rollout_ep", 1) or 1)
+        rollout_tp = int(getattr(self.engine_config, "rollout_tp", 1) or 1)
+        proto = self.handle._extras.get("protocol")
+        if (
+            not getattr(proto, "SUPPORTS_LOCAL_EXPERT_SHARD", False)
+            or ep_size <= 1
+            or rollout_ep != ep_size
+            or rollout_tp != 1
+            or int(getattr(ps, "etp_size", 1) or 1) != 1
+        ):
+            return False
+        global_rank = dist.get_rank() if dist.is_initialized() else self._rank
+        ep_rank = int(getattr(ps, "ep_rank", 0))
+        pp_ranks = tuple(getattr(ps, "pp_global_ranks", ()) or ())
+        return global_rank % rollout_ep == ep_rank and all(
+            rank % rollout_ep == ep_rank for rank in pp_ranks
+        )
 
     def get_data_parallel_size(self):
         if self.handle is None:
@@ -431,11 +548,15 @@ class MegatronLiteEngine(BaseEngine):
             return None
         return self.handle.dp_group
 
-    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+    def to(
+        self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True
+    ):
         self._require_initialized()
         if model or not (optimizer or grad):
             super().to(device=device, model=model, optimizer=optimizer, grad=grad)
-        self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
+        self.runtime.to(
+            self.handle, device, model=model, optimizer=optimizer, grad=grad
+        )
 
     def save_checkpoint(
         self,
@@ -524,7 +645,9 @@ class MegatronLiteEngine(BaseEngine):
             if hf_config is not None:
                 auto_map = getattr(hf_config, "auto_map", None)
                 if isinstance(auto_map, dict) and None in auto_map:
-                    hf_config.auto_map = {k: v for k, v in auto_map.items() if k is not None}
+                    hf_config.auto_map = {
+                        k: v for k, v in auto_map.items() if k is not None
+                    }
                 hf_config.save_pretrained(hf_local_path)
             tokenizer = getattr(self.model_config, "tokenizer", None)
             if tokenizer is not None:
@@ -564,7 +687,9 @@ class MegatronLiteEngine(BaseEngine):
             )
             scheduler_path = os.path.join(local_path, _LR_SCHEDULER_STATE)
             if self.handle._lr_scheduler is not None and os.path.exists(scheduler_path):
-                state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
+                state = torch.load(
+                    scheduler_path, map_location="cpu", weights_only=False
+                )
                 self.handle._lr_scheduler.load_state_dict(state)
             if dist.is_initialized():
                 dist.barrier()
@@ -579,7 +704,9 @@ class MegatronLiteEngine(BaseEngine):
             tp_rank = rank % self.engine_config.tp
             cp_rank = (rank // self.engine_config.tp) % self.engine_config.cp
             pp_rank = rank // (self.engine_config.tp * self.engine_config.cp * dense_dp)
-            return tp_rank == 0 and cp_rank == 0 and pp_rank == self.engine_config.pp - 1
+            return (
+                tp_rank == 0 and cp_rank == 0 and pp_rank == self.engine_config.pp - 1
+            )
         return self.runtime.is_mp_src_rank_with_outputs(self.handle)
 
     def _require_initialized(self) -> None:
@@ -628,15 +755,21 @@ class MegatronLiteEngine(BaseEngine):
         impl_cfg.setdefault("use_thd", True)
         cross_entropy_fusion = getattr(self.engine_config, "cross_entropy_fusion", None)
         if cross_entropy_fusion is None:
-            cross_entropy_fusion = getattr(self.engine_config, "use_fused_kernels", False)
+            cross_entropy_fusion = getattr(
+                self.engine_config, "use_fused_kernels", False
+            )
         impl_cfg.setdefault("cross_entropy_fusion", bool(cross_entropy_fusion))
         mtp_cfg = getattr(self.model_config, "mtp", None)
         if mtp_cfg is not None:
             mtp_enable = bool(getattr(mtp_cfg, "enable", False))
-            mtp_enable_train = mtp_enable and bool(getattr(mtp_cfg, "enable_train", False))
+            mtp_enable_train = mtp_enable and bool(
+                getattr(mtp_cfg, "enable_train", False)
+            )
             impl_cfg["mtp_enable"] = mtp_enable
             impl_cfg["mtp_enable_train"] = mtp_enable_train
-            impl_cfg["mtp_detach_encoder"] = bool(getattr(mtp_cfg, "detach_encoder", False))
+            impl_cfg["mtp_detach_encoder"] = bool(
+                getattr(mtp_cfg, "detach_encoder", False)
+            )
             impl_cfg["mtp_loss_scaling_factor"] = float(
                 getattr(mtp_cfg, "mtp_loss_scaling_factor", 0.1)
             )
@@ -661,11 +794,15 @@ class MegatronLiteEngine(BaseEngine):
         min_lr = getattr(self.optimizer_config, "min_lr", None)
         min_lr_ratio = getattr(self.optimizer_config, "min_lr_ratio", None)
         if min_lr is None:
-            min_lr = 0.0 if min_lr_ratio is None else self.optimizer_config.lr * min_lr_ratio
+            min_lr = (
+                0.0 if min_lr_ratio is None else self.optimizer_config.lr * min_lr_ratio
+            )
 
         lr_decay_style = getattr(self.optimizer_config, "lr_decay_style", None)
         if lr_decay_style is None:
-            lr_decay_style = getattr(self.optimizer_config, "lr_scheduler_type", "constant")
+            lr_decay_style = getattr(
+                self.optimizer_config, "lr_scheduler_type", "constant"
+            )
 
         return MegatronLiteOptimizerConfig(
             optimizer=optimizer_name,
@@ -682,8 +819,12 @@ class MegatronLiteEngine(BaseEngine):
             weight_decay_incr_style=getattr(
                 self.optimizer_config, "weight_decay_incr_style", "constant"
             ),
-            lr_wsd_decay_style=getattr(self.optimizer_config, "lr_wsd_decay_style", "exponential"),
-            lr_wsd_decay_steps=getattr(self.optimizer_config, "lr_wsd_decay_steps", None),
+            lr_wsd_decay_style=getattr(
+                self.optimizer_config, "lr_wsd_decay_style", "exponential"
+            ),
+            lr_wsd_decay_steps=getattr(
+                self.optimizer_config, "lr_wsd_decay_steps", None
+            ),
             use_checkpoint_opt_param_scheduler=getattr(
                 self.optimizer_config, "use_checkpoint_opt_param_scheduler", False
             ),
@@ -709,7 +850,9 @@ class MegatronLiteEngine(BaseEngine):
         model = self.handle._model
         if isinstance(model, list | tuple):
             if not model:
-                raise RuntimeError("Megatron Lite runtime returned an empty model chunk list.")
+                raise RuntimeError(
+                    "Megatron Lite runtime returned an empty model chunk list."
+                )
             if len(model) > 1:
                 return torch.nn.ModuleList(model)
             return model[0]
@@ -726,14 +869,20 @@ class MegatronLiteEngine(BaseEngine):
     ) -> dict[str, Any]:
         runtime_batches = []
         num_micro_batches = len(micro_batches)
-        batch_num_tokens = tu.get_non_tensor_data(data=data, key="batch_num_tokens", default=None)
+        batch_num_tokens = tu.get_non_tensor_data(
+            data=data, key="batch_num_tokens", default=None
+        )
         if batch_num_tokens is None:
             raise ValueError(
                 "MegatronLiteEngine PP/CP SFT requires batch_num_tokens for VERL-compatible loss scaling."
             )
         if batch_num_tokens <= 0:
-            raise ValueError(f"batch_num_tokens must be positive, got {batch_num_tokens}.")
-        loss_scale = self.get_data_parallel_size() * num_micro_batches / float(batch_num_tokens)
+            raise ValueError(
+                f"batch_num_tokens must be positive, got {batch_num_tokens}."
+            )
+        loss_scale = (
+            self.get_data_parallel_size() * num_micro_batches / float(batch_num_tokens)
+        )
         for micro_idx, micro_batch in enumerate(micro_batches):
             tu.assign_non_tensor(micro_batch, micro_batch_idx=micro_idx)
             micro_batch = micro_batch.to(get_device_id())
@@ -745,9 +894,16 @@ class MegatronLiteEngine(BaseEngine):
             )
 
         runtime_loss_fn = None
-        reduced_outputs = [] if (loss_function is not None or forward_only) and self.is_mp_src_rank_with_outputs() else None
+        reduced_outputs = (
+            []
+            if (loss_function is not None or forward_only)
+            and self.is_mp_src_rank_with_outputs()
+            else None
+        )
         if loss_function is not None or forward_only:
-            runtime_loss_fn = self._make_runtime_loss_fn(loss_function, num_micro_batches, reduced_outputs)
+            runtime_loss_fn = self._make_runtime_loss_fn(
+                loss_function, num_micro_batches, reduced_outputs
+            )
 
         replay_specs = [
             runtime_batch.routed_experts is not None
@@ -774,10 +930,16 @@ class MegatronLiteEngine(BaseEngine):
                 router_replay={"action": "replay"} if replay_enabled else None,
             )
         if reduced_outputs is not None:
-            return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
+            return postprocess_batch_func(
+                output_lst=reduced_outputs, indices=indices, data=data
+            )
         metrics = dict(result.metrics)
         loss = result.model_output.loss
-        losses = [] if loss is None else torch.as_tensor(loss).detach().flatten().cpu().tolist()
+        losses = (
+            []
+            if loss is None
+            else torch.as_tensor(loss).detach().flatten().cpu().tolist()
+        )
         return {
             "model_output": {},
             "loss": losses,
@@ -804,7 +966,9 @@ class MegatronLiteEngine(BaseEngine):
         if self.engine_config.router_replay_mode == "R3":
             r3_replay_mask = self._r3_replay_mask_for_packing(micro_batch, input_ids)
         routed_experts = micro_batch.get("routed_experts", None)
-        if routed_experts is not None and not getattr(routed_experts, "is_nested", False):
+        if routed_experts is not None and not getattr(
+            routed_experts, "is_nested", False
+        ):
             raise ValueError(
                 "R3 routed_experts must use VERL's jagged no-padding layout; "
                 f"got shape {tuple(routed_experts.shape)}."
@@ -812,7 +976,9 @@ class MegatronLiteEngine(BaseEngine):
         return PackedBatch(
             input_ids=input_ids.values().contiguous(),
             labels=input_ids.values().contiguous(),
-            loss_mask=None if loss_mask is None else loss_mask.values().contiguous().float(),
+            loss_mask=(
+                None if loss_mask is None else loss_mask.values().contiguous().float()
+            ),
             seq_lens=input_ids.offsets().diff().to(dtype=torch.int64),
             routed_experts=routed_experts,
             r3_replay_mask=(
@@ -829,7 +995,9 @@ class MegatronLiteEngine(BaseEngine):
         return LossContext(
             temperature=float(self._scalar_temperature(micro_batch)),
             calculate_entropy=bool(
-                tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
+                tu.get_non_tensor_data(
+                    data=micro_batch, key="calculate_entropy", default=False
+                )
             ),
             return_log_probs=True,
             loss_scale=loss_scale,
@@ -886,7 +1054,9 @@ class MegatronLiteEngine(BaseEngine):
                 raise ValueError(
                     f"response loss mask has {response_tokens} tokens but packed input sequence has {seq_len} tokens"
                 )
-            full_mask = torch.zeros(seq_len, dtype=row_mask.dtype, device=row_mask.device)
+            full_mask = torch.zeros(
+                seq_len, dtype=row_mask.dtype, device=row_mask.device
+            )
             if response_tokens:
                 full_mask[-response_tokens:] = row_mask[:response_tokens]
             rows.append(full_mask)
@@ -909,7 +1079,9 @@ class MegatronLiteEngine(BaseEngine):
     ) -> dict[str, torch.Tensor]:
         log_probs = raw_output.get("log_probs")
         if log_probs is None:
-            raise ValueError("Megatron Lite THD model output must contain token log_probs.")
+            raise ValueError(
+                "Megatron Lite THD model output must contain token log_probs."
+            )
         proto = self.handle._extras.get("protocol")
         unpack = getattr(proto, "unpack_forward_output", None)
         if unpack is None:
@@ -922,7 +1094,9 @@ class MegatronLiteEngine(BaseEngine):
             output["entropy"] = unpack(self.module, runtime_batch, entropy)
         return output
 
-    def _make_runtime_loss_fn(self, loss_function, num_microbatches: int, output_lst=None):
+    def _make_runtime_loss_fn(
+        self, loss_function, num_microbatches: int, output_lst=None
+    ):
         loss_fn_ref = None
 
         def _loss_fn(
@@ -949,7 +1123,9 @@ class MegatronLiteEngine(BaseEngine):
                 metrics = dict(metrics)
                 mtp_loss = self._reduce_mtp_metric(raw_output["mtp_loss"])
                 metrics["mtp_losses/mtp_1_loss"] = (
-                    float(mtp_loss.item()) if mtp_loss.numel() == 1 else mtp_loss.cpu().tolist()
+                    float(mtp_loss.item())
+                    if mtp_loss.numel() == 1
+                    else mtp_loss.cpu().tolist()
                 )
 
             raw_output["_verl_metrics"] = metrics
@@ -968,7 +1144,9 @@ class MegatronLiteEngine(BaseEngine):
                         "metrics": metrics,
                     }
                 )
-            return (loss * num_microbatches if loss_function is not None else loss), metrics
+            return (
+                loss * num_microbatches if loss_function is not None else loss
+            ), metrics
 
         # Avoid a strong self-reference while preserving the runtime hook attributes.
         loss_fn_ref = weakref.ref(_loss_fn)
@@ -1019,5 +1197,7 @@ class MegatronLiteEngine(BaseEngine):
     def _checkpoint_hooks(self):
         proto = self.handle._extras.get("protocol")
         placement_fn = getattr(proto, "PLACEMENT_FN", default_placement_fn)
-        expert_classifier = getattr(proto, "EXPERT_CLASSIFIER", default_expert_classifier)
+        expert_classifier = getattr(
+            proto, "EXPERT_CLASSIFIER", default_expert_classifier
+        )
         return placement_fn, expert_classifier

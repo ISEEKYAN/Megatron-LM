@@ -17,6 +17,7 @@ import re
 import warnings
 from collections.abc import Generator, Iterable
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -42,12 +43,38 @@ def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return tensor.numel() * tensor.element_size()
 
 
+def local_pipeline_stage_state(ps):
+    """Return a parallel-state view that exports only the current PP stage.
+
+    TP/ETP/EP groups stay intact, so model protocols still produce complete HF
+    tensors for the stage they own.  Only PP collectives are disabled.  Weight
+    transports can then route the stage-owned stream without forcing the
+    generic exporter to reconstruct the full model on every PP rank.
+    """
+    if int(getattr(ps, "pp_size", 1) or 1) <= 1:
+        return ps
+    return replace(
+        ps,
+        pp_group=None,
+        pp_cpu_group=None,
+        pp_global_ranks=None,
+        pp_size=1,
+        pp_rank=0,
+        pp_is_first=True,
+        pp_is_last=True,
+        pp_next_rank=-1,
+        pp_prev_rank=-1,
+    )
+
+
 def _local_source(target, source):
     if DTensor is not None and isinstance(target, DTensor):
         shape, offset = compute_local_shape_and_global_offset(
             target.shape, target.device_mesh, target.placements
         )
-        return source[tuple(slice(start, start + size) for start, size in zip(offset, shape))]
+        return source[
+            tuple(slice(start, start + size) for start, size in zip(offset, shape))
+        ]
     return source
 
 
@@ -605,7 +632,8 @@ def bucketed_all_gather_into_tensor(
                 tensor,
                 [
                     recv_buffer[
-                        rank * total_numel + offsets[idx] : rank * total_numel
+                        rank * total_numel
+                        + offsets[idx] : rank * total_numel
                         + offsets[idx]
                         + numel_per_tensor[idx]
                     ].view_as(tensor)
@@ -1134,8 +1162,12 @@ def load_hf_weights(
                             tensor, ps.etp_rank, ps.etp_size, dim=split_d
                         )
 
-            converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-            (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+            converted = _local_source(target, tensor).to(
+                device=target.device, dtype=target.dtype
+            )
+            (
+                target.to_local().data if isinstance(target, DTensor) else target.data
+            ).copy_(converted)
             if replica_ranks is not None:
                 assert source_global_rank is not None
                 dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1154,7 +1186,9 @@ def load_hf_weights(
         if name in loaded_names or "lora" in name.lower() or "adapter" in name.lower():
             continue
         elif getattr(base_model, "_mlite_meta_init", False):
-            raise RuntimeError(f"Deferred parameter {name!r} was not filled by the checkpoint")
+            raise RuntimeError(
+                f"Deferred parameter {name!r} was not filled by the checkpoint"
+            )
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
     missing_expected_buffers = required_buffers.keys() - loaded_names
@@ -1249,8 +1283,12 @@ def _load_expert_weight(
             else:
                 tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
-    converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+    converted = _local_source(target, tensor).to(
+        device=target.device, dtype=target.dtype
+    )
+    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(
+        converted
+    )
     if replica_ranks is not None:
         assert source_global_rank is not None
         dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1425,6 +1463,7 @@ def export_hf_weights(
     export_dtype: str | torch.dtype | None = None,
     cpu: bool = False,
     buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+    local_expert_shard: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Export model weights as HF-format (name, tensor) pairs.
 
@@ -1447,9 +1486,7 @@ def export_hf_weights(
         """Yield parameters plus persistent buffers present in the HF load plan."""
         for chunk in chunks:
             base_chunk = unwrap_model(chunk)
-            logical_dtypes = getattr(
-                chunk, "_fsdp2_model_param_dtypes_by_name", {}
-            )
+            logical_dtypes = getattr(chunk, "_fsdp2_model_param_dtypes_by_name", {})
             state = base_chunk.state_dict()
             layer_map = (
                 {
@@ -1499,7 +1536,7 @@ def export_hf_weights(
         packed_expert_buffers: dict[str, dict[int, torch.Tensor]] = {}
         expert_bucket_limit_bytes = (
             buffer_max_size_bytes
-            if ps.ep_size <= 1
+            if ps.ep_size <= 1 or local_expert_shard
             else max(buffer_max_size_bytes // ps.ep_size, 1)
         )
         dense_bucket: list[tuple[str, torch.Tensor]] = []
@@ -1543,6 +1580,36 @@ def export_hf_weights(
             nonlocal expert_bucket, expert_bucket_bytes
             if not expert_bucket:
                 return
+            if local_expert_shard:
+                experts_per_rank = spec.num_experts // ps.ep_size
+                if experts_per_rank * ps.ep_size != spec.num_experts:
+                    raise ValueError(
+                        f"{type(spec).__name__} has {spec.num_experts} experts, "
+                        f"which is not divisible by EP={ps.ep_size}"
+                    )
+                local_bucket = expert_bucket
+                expert_bucket = []
+                expert_bucket_bytes = 0
+                for native_name, tensor in local_bucket:
+                    packed_group_name = getattr(
+                        spec, "packed_expert_group_name", None
+                    )
+                    if callable(packed_group_name) and packed_group_name(native_name):
+                        raise ValueError(
+                            "local_expert_shard does not support packed expert groups"
+                        )
+                    local_idx = parse_expert_idx(native_name)
+                    if local_idx >= experts_per_rank:
+                        raise ValueError(
+                            f"Local expert index {local_idx} is outside the EP shard "
+                            f"size {experts_per_rank} for {native_name!r}"
+                        )
+                    global_idx = ps.ep_rank * experts_per_rank + local_idx
+                    global_name = set_expert_idx(native_name, global_idx)
+                    yield from _iter_mapped(
+                        {global_name: _maybe_cpu(tensor, cpu=cpu)}
+                    )
+                return
             gathered_bucket = bucketed_all_gather_into_tensor(
                 expert_bucket,
                 group=ps.ep_group,
@@ -1567,9 +1634,9 @@ def export_hf_weights(
                     if packed_name is None:
                         yield from _iter_mapped({global_name: export_shard})
                         continue
-                    packed_expert_buffers.setdefault(packed_name, {})[global_idx] = (
-                        export_shard
-                    )
+                    packed_expert_buffers.setdefault(packed_name, {})[
+                        global_idx
+                    ] = export_shard
                 if packed_name is not None:
                     packed = packed_expert_buffers[packed_name]
                     if len(packed) == spec.num_experts:
