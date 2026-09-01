@@ -130,6 +130,7 @@ bash experimental/lite/examples/bench/scripts/run_qwen35_correctness_pair.sh
 - [Runtime](docs/runtime.md)
 - [Models](docs/models.md)
 - [Porting Notes](docs/porting.md)
+- [FP8 Training Architecture Study](docs/fp8-training-design.md)
 - [Skills](skills/README.md)
 - [Bench Example](examples/bench/README.md)
 
