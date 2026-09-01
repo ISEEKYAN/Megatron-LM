@@ -45,6 +45,15 @@ def to_local_tensor(tensor):
     return tensor
 
 
+def shares_local_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
+    left_local = to_local_tensor(left)
+    right_local = to_local_tensor(right)
+    return (
+        left_local.device == right_local.device
+        and left_local.data_ptr() == right_local.data_ptr()
+    )
+
+
 def fsdp2_model_param_dtype(param: nn.Parameter) -> torch.dtype | None:
     dtype = getattr(param, "_fsdp2_model_param_dtype", None)
     return dtype if isinstance(dtype, torch.dtype) else None
@@ -167,8 +176,6 @@ class FP32AdamW:
         if self.cpu_update:
             local_param = to_local_tensor(param.detach())
             return local_param.detach().to(device="cpu", dtype=torch.float32).clone()
-        if self._model_param_dtype(param) is not None:
-            return param.detach().to(dtype=torch.float32).clone()
         return (
             param.detach()
             if param.dtype is torch.float32
@@ -237,6 +244,8 @@ class FP32AdamW:
         return grad.detach()
 
     def _copy_master_to_param(self, param: nn.Parameter, master: torch.Tensor) -> None:
+        if not self.cpu_update and shares_local_storage(param, master):
+            return
         model_dtype = self._model_param_dtype(param)
         if model_dtype is not None:
             master = master.to(dtype=model_dtype).to(dtype=param.dtype)
