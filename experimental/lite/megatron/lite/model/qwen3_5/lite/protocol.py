@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,12 +10,10 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-
 from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     pack_thd_forward_kwargs,
-    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
@@ -88,30 +85,14 @@ def _full_attn_module(layer, name: str):
     return getattr(full_attn, name, None) if full_attn is not None else None
 
 
-def _maybe(module_name: str) -> Callable[[nn.Module], nn.Module | None]:
-    def getter(layer: nn.Module) -> nn.Module | None:
-        return getattr(layer, module_name, None)
-
-    return getter
-
-
-def _moe_module(name: str) -> Callable[[nn.Module], nn.Module | None]:
-    def getter(layer: nn.Module) -> nn.Module | None:
-        moe = getattr(layer, "moe", None)
-        return getattr(moe, name, None) if moe is not None else None
-
-    return getter
-
-
 MODULE_MAP = {
     "core_attn": lambda layer: _full_attn_module(layer, "core_attn"),
-    "experts": _moe_module("experts"),
-    "moe": _maybe("moe"),
-    "router": _moe_module("router"),
-    "mlp": _maybe("mlp"),
-    "mlp_norm": _maybe("mlp_norm"),
+    "experts": lambda layer: layer.moe.experts,
+    "moe": lambda layer: layer.moe,
+    "router": lambda layer: layer.moe.router,
+    "mlp_norm": lambda layer: layer.mlp_norm,
     "attn_proj": lambda layer: _full_attn_module(layer, "proj"),
-    "linear_attn": _maybe("linear_attn"),
+    "linear_attn": lambda layer: layer.linear_attn,
 }
 
 
@@ -166,7 +147,9 @@ def _make_aux_loss_hook():
 def _build_dist_opt_optimizer(
     chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState
 ):
-    from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_training_optimizer
+    from megatron.lite.primitive.optimizers.megatron_wrap import (
+        build_dist_opt_training_optimizer,
+    )
 
     return build_dist_opt_training_optimizer(
         chunks,
@@ -187,11 +170,6 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
-    if impl_cfg.attention_backend_override == "magi":
-        raise ValueError(
-            "Qwen3.5 MagiAttention is not supported because its linear-attention layers "
-            "require an order-preserving CP layout. Use qwen3_moe for the initial backend."
-        )
 
     if impl_cfg.router_aux_loss_coef is not None:
         model_cfg.router_aux_loss_coef = impl_cfg.router_aux_loss_coef
@@ -336,9 +314,9 @@ def export_hf_weights(
 
 
 def save_hf_weights(
-    chunks: list[nn.Module], path: str, model_cfg: Qwen35Config, ps: ParallelState, **kwargs
+    chunks: list[nn.Module], path: str, model_cfg: Qwen35Config, ps: ParallelState
 ) -> None:
-    _save_hf_weights_impl(chunks, path, model_cfg, ps, **kwargs)
+    _save_hf_weights_impl(chunks, path, model_cfg, ps)
 
 
 def vocab_size(model_cfg) -> int | None:

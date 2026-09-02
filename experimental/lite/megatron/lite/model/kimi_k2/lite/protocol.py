@@ -15,7 +15,6 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     pack_thd_forward_kwargs,
-    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
@@ -29,6 +28,9 @@ from megatron.lite.primitive.quantization import (
 )
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
+
+
+SUPPORTS_LOCAL_EXPERT_SHARD = True
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -288,10 +290,10 @@ def export_hf_weights(chunks, model_cfg: KimiK2Config, ps: ParallelState, **kwar
     yield from export_impl(chunks, model_cfg, ps, **kwargs)
 
 
-def save_hf_weights(chunks, path: str, model_cfg: KimiK2Config, ps: ParallelState, **kwargs) -> None:
+def save_hf_weights(chunks, path: str, model_cfg: KimiK2Config, ps: ParallelState) -> None:
     from megatron.lite.model.kimi_k2.lite.checkpoint import save_hf_weights as save_impl
 
-    save_impl(chunks, path, model_cfg, ps, **kwargs)
+    save_impl(chunks, path, model_cfg, ps)
 
 
 def vocab_size(model_cfg) -> int | None:
@@ -303,6 +305,7 @@ __all__ = [
     "EXPERT_CLASSIFIER",
     "ImplConfig",
     "PLACEMENT_FN",
+    "SUPPORTS_LOCAL_EXPERT_SHARD",
     "build_model",
     "build_model_config",
     "export_hf_weights",

@@ -163,7 +163,7 @@ class FSDP2Optimizer:
             if grad is not None:
                 grad.mul_(self.expert_sharded_grad_scale)
 
-    def clip_grad_norm(self) -> float:
+    def compute_grad_norm(self) -> torch.Tensor:
         excluded_sharded_param_ids = (
             self._replicated_grad_param_ids
             | self._tp_replicated_grad_param_ids
@@ -253,7 +253,10 @@ class FSDP2Optimizer:
         ):
             all_reduce_scalar_(total_sq, op=dist.ReduceOp.SUM, group=self.ps.pp_group)
 
-        grad_norm = total_sq.sqrt()
+        return total_sq.sqrt()
+
+    def clip_grad_norm(self) -> float:
+        grad_norm = self.compute_grad_norm()
         if torch.isfinite(grad_norm):
             clip_grads_with_sharded_norm_(self.params, self.clip_grad, grad_norm)
         return float(grad_norm.float().item())
@@ -352,6 +355,7 @@ def build_fsdp2_training_optimizer(
     *,
     unit_modules: tuple[type[nn.Module] | str, ...],
     expert_classifier: Callable[[str], bool] | None = None,
+    replicated_param_classifier: Callable[[str, nn.Parameter], bool] | None = None,
     expert_module_leaf_name: str = "experts",
     deterministic: bool | None = None,
     vpp: int | None = 1,
@@ -362,6 +366,7 @@ def build_fsdp2_training_optimizer(
     backward_prefetch_depth: int = _DEFAULT_BACKWARD_PREFETCH_DEPTH,
     param_dtype: str | torch.dtype | None = _DEFAULT_PARAM_DTYPE,
     reduce_dtype: str | torch.dtype | None = _DEFAULT_REDUCE_DTYPE,
+    cast_forward_inputs: bool | None = True,
     use_fp32_shards: bool | None = None,
     use_fp32_master: bool | None = None,
     adamw_foreach: bool | str = _DEFAULT_ADAMW_FOREACH,
@@ -372,6 +377,12 @@ def build_fsdp2_training_optimizer(
         raise ValueError("optimizer='fsdp2' requires pp>1 when vpp>1.")
 
     expert_params = _collect_expert_params(model_chunks, ps, expert_classifier)
+    replicated_grad_params = _collect_replicated_params(
+        model_chunks, replicated_param_classifier
+    )
+    replicated_params = set(replicated_grad_params)
+    if expert_params & replicated_params:
+        raise ValueError("FSDP2 expert and replicated parameter sets must not overlap.")
     expert_modules = _collect_expert_modules(
         model_chunks, ps, expert_classifier, expert_module_leaf_name=expert_module_leaf_name
     )
@@ -417,6 +428,7 @@ def build_fsdp2_training_optimizer(
         backward_prefetch_depth=_fsdp2_prefetch_depth(ps, default_depth=backward_prefetch_depth),
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
+        cast_forward_inputs=cast_forward_inputs,
     )
     if effective_use_fp32_shards:
         model_param_dtypes = _collect_model_param_dtypes(model_chunks)
@@ -447,12 +459,13 @@ def build_fsdp2_training_optimizer(
             )
 
     ignored_expert_params = _collect_module_params(expert_modules)
+    ignored_root_params = ignored_expert_params | replicated_params
     for chunk in model_chunks:
         wrap_fsdp2(
             chunk,
             ps,
             fsdp2_config,
-            ignored_params=ignored_expert_params or None,
+            ignored_params=ignored_root_params or None,
             shard_placement_fn=dense_shard_placement_fn,
         )
         if any(param.is_meta for param in chunk.parameters()):
@@ -467,6 +480,10 @@ def build_fsdp2_training_optimizer(
         model_chunks,
         opt,
         ps,
+        replicated_grad_params=replicated_grad_params,
+        replicated_grad_sync_group=(ps.dp_cp_group or ps.dp_group)
+        if replicated_params
+        else None,
         expert_sharded_grad_params=list(ignored_expert_params),
         expert_sharded_grad_scale=(
             float(ps.expert_dp_size) / float(ps.dp_cp_size) if ignored_expert_params else None
@@ -492,6 +509,20 @@ def _collect_expert_params(
         for name, param in chunk.named_parameters()
         if expert_classifier(name)
     }
+
+
+def _collect_replicated_params(
+    chunks: Iterable[nn.Module],
+    classifier: Callable[[str, nn.Parameter], bool] | None,
+) -> list[nn.Parameter]:
+    if classifier is None:
+        return []
+    return [
+        param
+        for chunk in chunks
+        for name, param in chunk.named_parameters()
+        if classifier(name, param)
+    ]
 
 
 def _collect_expert_modules(
@@ -539,10 +570,13 @@ def _restore_model_param_dtypes(
     chunks: Iterable[nn.Module], model_param_dtypes: dict[tuple[int, str], torch.dtype]
 ) -> None:
     for chunk_idx, chunk in enumerate(chunks):
+        chunk_dtypes: dict[str, torch.dtype] = {}
         for name, param in chunk.named_parameters():
             model_dtype = model_param_dtypes.get((chunk_idx, name))
             if model_dtype is not None:
                 param._fsdp2_model_param_dtype = model_dtype
+                chunk_dtypes[name] = model_dtype
+        chunk._fsdp2_model_param_dtypes_by_name = chunk_dtypes
 
 
 def _collect_tp_replicated_grad_param_names(chunks: Iterable[nn.Module]) -> list[tuple[int, str]]:

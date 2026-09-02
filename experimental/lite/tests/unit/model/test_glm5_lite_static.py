@@ -298,7 +298,7 @@ def test_lite_csa_imports_core_csa_kernel_namespace():
     csa_text = (root / "primitive" / "modules" / "attention" / "csa.py").read_text()
 
     assert (
-        "from megatron.core.transformer.experimental_attention_variant.csa_utils"
+        "from megatron.core.transformer.experimental_attention_variant.csa_kernels import"
         in csa_text
     )
     assert "FusedCSAIndexerSparseAttnFromTopkFunc" in csa_text

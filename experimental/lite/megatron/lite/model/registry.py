@@ -88,7 +88,7 @@ register_model(
 register_model(
     "qwen3_5",
     package="megatron.lite.model.qwen3_5",
-    hf_model_types=["qwen3_5", "qwen3_5_moe"],
+    hf_model_types=["qwen3_5_moe"],
     impls={"lite": "megatron.lite.model.qwen3_5.lite.protocol"},
 )
 
@@ -110,7 +110,10 @@ register_model(
     "deepseek_v4",
     package="megatron.lite.model.deepseek_v4",
     hf_model_types=["deepseek_v4"],
-    impls={"lite": "megatron.lite.model.deepseek_v4.lite.protocol"},
+    impls={
+        "lite": "megatron.lite.model.deepseek_v4.lite.protocol",
+        "vllm": "megatron.lite.model.deepseek_v4.vllm.protocol",
+    },
 )
 
 
