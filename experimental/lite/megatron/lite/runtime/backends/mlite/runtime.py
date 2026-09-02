@@ -681,7 +681,12 @@ def _checkpoint_hooks(handle: ModelHandle):
     from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 
     proto = handle._extras.get("protocol")
-    return (
-        getattr(proto, "PLACEMENT_FN", default_placement_fn),
-        getattr(proto, "EXPERT_CLASSIFIER", default_expert_classifier),
-    )
+    get_placements = getattr(proto, "PLACEMENT_FN", default_placement_fn)
+    make_placement_fn = getattr(proto, "make_placement_fn", None)
+    model_cfg = handle._extras.get("model_cfg")
+    if callable(make_placement_fn) and model_cfg is not None:
+        # Config-exact placements (e.g. Qwen3.5 GDN state, TP-sharded only
+        # while tp_size <= linear-attention heads) so DCP metadata matches
+        # what shard_for_load actually put on each rank.
+        get_placements = make_placement_fn(model_cfg, handle._parallel_state.tp_size)
+    return (get_placements, getattr(proto, "EXPERT_CLASSIFIER", default_expert_classifier))

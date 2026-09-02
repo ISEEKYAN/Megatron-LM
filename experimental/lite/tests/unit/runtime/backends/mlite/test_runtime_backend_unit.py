@@ -17,6 +17,7 @@ from megatron.lite.runtime.backends.mlite.runtime import (
     MegatronLiteRuntime,
     _apply_attention_backend_env,
     _build_impl_cfg,
+    _checkpoint_hooks,
     _pipeline_callbacks,
     _reset_parameters,
 )
@@ -663,3 +664,35 @@ def test_runtime_dispatch_creates_mlite_backend():
 def test_runtime_dispatch_unknown_backend_raises():
     with pytest.raises(KeyError):
         create_runtime(RuntimeConfig(backend="nonexistent"))
+
+
+def test_checkpoint_hooks_prefer_config_exact_placements():
+    """Protocols that expose make_placement_fn(cfg, tp_size) get placements that
+    match what shard_for_load put on each rank (Qwen3.5 GDN state is TP-sharded
+    only while tp_size <= linear-attention heads); others keep PLACEMENT_FN."""
+    from types import SimpleNamespace
+
+    from megatron.lite.model.qwen3_5.config import Qwen35Config
+    from megatron.lite.model.qwen3_5.lite import protocol as qwen35_protocol
+
+    cfg = Qwen35Config(
+        num_hidden_layers=1,
+        layer_types=["linear_attention"],
+        linear_num_key_heads=8,
+        linear_num_value_heads=8,
+    )
+    name = "layers.0.linear_attn.A_log"
+
+    def hooks(tp_size, proto=qwen35_protocol):
+        handle = SimpleNamespace(
+            _extras={"protocol": proto, "model_cfg": cfg},
+            _parallel_state=SimpleNamespace(tp_size=tp_size),
+        )
+        return _checkpoint_hooks(handle)[0]
+
+    sharded = hooks(4)(name)
+    assert type(sharded[-1]).__name__ == "Shard" and sharded[-1].dim == 0
+    assert type(hooks(16)(name)[-1]).__name__ == "Replicate"
+
+    plain = SimpleNamespace(PLACEMENT_FN=lambda _name: ["plain"], EXPERT_CLASSIFIER=lambda _name: False)
+    assert hooks(4, proto=plain)(name) == ["plain"]
