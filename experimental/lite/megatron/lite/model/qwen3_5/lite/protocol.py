@@ -20,7 +20,7 @@ from megatron.lite.model.protocol_utils import (
     unpack_thd_forward_output,
 )
 from megatron.lite.model.qwen3_5.config import Qwen35Config
-from megatron.lite.model.qwen3_5.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
+from megatron.lite.model.qwen3_5.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN, make_placement_fn
 from megatron.lite.model.qwen3_5.lite.checkpoint import export_hf_weights as _export_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
@@ -43,6 +43,7 @@ __all__ = [
     "build_model_config",
     "export_hf_weights",
     "load_hf_weights",
+    "make_placement_fn",
     "save_hf_weights",
     "vocab_size",
 ]
@@ -274,7 +275,10 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
         attach_model_sharded_state_dict(
-            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
+            chunks,
+            ps,
+            get_placements=make_placement_fn(model_cfg, ps.tp_size),
+            is_expert=is_expert_param,
         )
         register_training_hooks(chunks, optimizer)
         optimizer_backend = "dist_opt"

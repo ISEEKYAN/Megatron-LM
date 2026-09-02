@@ -9,6 +9,7 @@ from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import (
     PLACEMENT_FN,
     Qwen35WeightSpec,
+    make_placement_fn,
     _merge_full_attn_qkvg,
     _merge_gate_up_tp_shards,
     _merge_linear_attn_conv1d_tp_shards,
@@ -625,13 +626,22 @@ def test_qwen35_linear_attention_tp4_replicated_heads_roundtrip() -> None:
     )
 
 
-def test_qwen35_linear_attention_state_is_tp_replicated() -> None:
-    spec = Qwen35WeightSpec(_tiny_config())
+def test_qwen35_linear_attention_state_placement_follows_head_layout() -> None:
+    replicated_cfg = _tiny_config()  # 2 linear heads: replicated under tp_size=4
+    sharded_cfg = replace(replicated_cfg, linear_num_key_heads=8, linear_num_value_heads=8)
+    spec = Qwen35WeightSpec(replicated_cfg)
 
-    assert type(PLACEMENT_FN("layers.0.linear_attn.dt_bias")[-1]).__name__ == "Replicate"
-    assert type(PLACEMENT_FN("layers.0.linear_attn.A_log")[-1]).__name__ == "Replicate"
-    assert spec.tp_spec("layers.0.linear_attn.dt_bias") is None
-    assert spec.tp_spec("layers.0.linear_attn.A_log") is None
+    for name in ("layers.0.linear_attn.dt_bias", "layers.0.linear_attn.A_log"):
+        # name-only fallback keeps the replicated placement ...
+        assert type(PLACEMENT_FN(name)[-1]).__name__ == "Replicate"
+        assert type(make_placement_fn(replicated_cfg, tp_size=4)(name)[-1]).__name__ == "Replicate"
+        # ... the config-exact placement shards exactly like shard_for_load
+        exact = make_placement_fn(sharded_cfg, tp_size=4)(name)
+        assert type(exact[-1]).__name__ == "Shard" and exact[-1].dim == 0
+        # export always TP-gathers; the merge returns one replica when replicated
+        assert spec.tp_spec(name) == (0, 0)
+        state = torch.arange(2)
+        assert torch.equal(spec.merge_dense_shards(name, [state] * 4), state)
 
 
 def test_qwen35_linear_attention_state_load_matches_head_layout() -> None:
@@ -962,3 +972,94 @@ def test_qwen35_export_packs_base_expert_fc2_and_expert_metadata() -> None:
     assert spec.expert_global_id(native_name) == 2
     assert spec.expert_local_name(native_name, 0) == "layers.0.moe.experts.fc2.weight0"
     assert spec.tp_spec(native_name) == (1, 1)
+
+
+def _gdn_config() -> Qwen35Config:
+    return replace(
+        _tiny_dense_config(),
+        layer_types=["linear_attention"],
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+    )
+
+
+def test_qwen35_gdn_state_export_and_placement_follow_load_sharding() -> None:
+    """dt_bias / A_log are chunked across TP at load time (one slice of the
+    value heads per rank); export merging and DCP placement must undo exactly
+    that, and fall back to a single replica only when TP exceeds the heads."""
+    cfg = _gdn_config()
+    spec = Qwen35WeightSpec(cfg)
+    full = torch.arange(cfg.linear_num_value_heads, dtype=torch.float32)
+    for name in ("layers.0.linear_attn.dt_bias", "layers.0.linear_attn.A_log"):
+        shards = [
+            spec.shard_for_load(name, full, SimpleNamespace(tp_size=4, tp_rank=rank))
+            for rank in range(4)
+        ]
+        assert [shard.numel() for shard in shards] == [2, 2, 2, 2]
+        assert spec.tp_spec(name) == (0, 0)
+        assert torch.equal(spec.merge_dense_shards(name, shards), full)
+        exact = make_placement_fn(cfg, tp_size=4)(name)
+        assert type(exact[-1]).__name__ == "Shard" and exact[-1].dim == 0
+
+        whole = spec.shard_for_load(name, full, SimpleNamespace(tp_size=16, tp_rank=3))
+        assert torch.equal(whole, full)
+        assert torch.equal(spec.merge_dense_shards(name, [full] * 16), full)
+        assert all(
+            type(p).__name__ == "Replicate" for p in make_placement_fn(cfg, tp_size=16)(name)
+        )
+    # everything else is untouched by the factory
+    assert make_placement_fn(cfg, tp_size=16)("layers.0.mlp.down.linear.weight") == PLACEMENT_FN(
+        "layers.0.mlp.down.linear.weight"
+    )
+
+
+def test_qwen35_export_gathers_gdn_state_across_tp(monkeypatch) -> None:
+    """Regression: with tp_size=4 the exporter used to emit this rank's 2-head
+    slice as the whole tensor (vLLM then fails loading a [heads/tp] A_log)."""
+    cfg = _gdn_config()
+    tp_size = 4
+
+    class TinyGDN(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].linear_attn = nn.Module()
+            self.layers[0].linear_attn.register_parameter(
+                "dt_bias", nn.Parameter(torch.tensor([0.0, 1.0]))
+            )
+            self.layers[0].linear_attn.register_parameter(
+                "A_log", nn.Parameter(torch.tensor([10.0, 11.0]))
+            )
+
+    ps = SimpleNamespace(
+        pp_size=1,
+        tp_size=tp_size,
+        tp_group=object(),
+        ep_size=1,
+        ep_group=None,
+        etp_size=1,
+        etp_group=None,
+    )
+
+    def fake_all_gather(output, tensor, group=None):
+        del group
+        numel = tensor.numel()
+        for rank in range(tp_size):
+            output[rank * numel : (rank + 1) * numel].copy_(tensor + 100 * rank)
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor",
+        fake_all_gather,
+    )
+
+    exported = dict(export_hf_weights(TinyGDN(), cfg, ps))
+
+    dt_bias = exported["model.language_model.layers.0.linear_attn.dt_bias"]
+    a_log = exported["model.language_model.layers.0.linear_attn.A_log"]
+    assert dt_bias.shape == (cfg.linear_num_value_heads,)
+    assert torch.equal(
+        dt_bias, torch.cat([torch.tensor([0.0, 1.0]) + 100 * rank for rank in range(tp_size)])
+    )
+    assert torch.equal(
+        a_log, torch.cat([torch.tensor([10.0, 11.0]) + 100 * rank for rank in range(tp_size)])
+    )

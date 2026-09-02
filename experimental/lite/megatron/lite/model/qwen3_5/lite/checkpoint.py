@@ -64,6 +64,10 @@ def PLACEMENT_FN(param_name: str) -> list:
     if "conv1d" in param_name:
         return [Replicate(), Replicate(), Replicate(), Shard(0)]
     if "dt_bias" in param_name or "A_log" in param_name:
+        # GDN per-value-head state is Replicate only while the heads are
+        # replicated (tp_size > heads); ``shard_for_load`` otherwise chunks it
+        # across TP. This name-only fallback cannot tell the two apart, so the
+        # protocol and runtime take placements from ``make_placement_fn``.
         return [Replicate(), Replicate(), Replicate(), Replicate()]
     return [Replicate(), Replicate(), Replicate(), Replicate()]
 
@@ -128,6 +132,24 @@ def _tp_linear_attn_state(
     if _linear_attn_head_replication(cfg, ps.tp_size):
         return tensor
     return _tp(tensor, ps.tp_rank, ps.tp_size)
+
+
+def make_placement_fn(cfg: Qwen35Config, tp_size: int):
+    """Config-exact DCP placements: GDN state follows ``shard_for_load``.
+
+    ``PLACEMENT_FN`` is name-only and assumes the usual layout where every TP
+    rank owns a slice of the linear-attention heads. When ``tp_size`` exceeds
+    the head count the loader keeps ``dt_bias`` / ``A_log`` whole on every rank
+    (``_tp_linear_attn_state``), so their placement must be Replicate instead.
+    """
+    replicated = _linear_attn_head_replication(cfg, tp_size)
+
+    def placement_fn(param_name: str) -> list:
+        if not replicated and ("dt_bias" in param_name or "A_log" in param_name):
+            return [Replicate(), Replicate(), Replicate(), Shard(0)]
+        return PLACEMENT_FN(param_name)
+
+    return placement_fn
 
 
 def _merge_full_attn_qkvg(
@@ -772,6 +794,10 @@ class Qwen35WeightSpec:
             native_name.endswith(suffix) for suffix in (".linear_attn.conv1d.weight",)
         ):
             return (0, 0)
+        if native_name.endswith((".linear_attn.dt_bias", ".linear_attn.A_log")):
+            # Chunked across TP by shard_for_load; merge_dense_shards / gather_dense
+            # return the single replica when the heads are replicated instead.
+            return (0, 0)
         return None
 
     def is_expert(self, native_name: str) -> bool:
@@ -894,5 +920,6 @@ __all__ = [
     "Qwen35WeightSpec",
     "export_hf_weights",
     "load_hf_weights",
+    "make_placement_fn",
     "save_hf_weights",
 ]
