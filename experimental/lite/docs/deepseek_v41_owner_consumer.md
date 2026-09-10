@@ -1,119 +1,94 @@
-# DeepSeek-V4.1-Flash: CED and CSA2 ownership contract
+# DeepSeek-V4.1-Flash: CSA2 owner/consumer contract and CED gate
 
-This is the implementation boundary for the DeepSeek-V4.1-Flash port.  It is
-derived from the official `config.json` and the *DeepSeek-V4.1 Technical
-Report*, §2.2--2.3.  It deliberately describes the 40 backbone layers only:
-DSpark forward/rollout is not part of this port.
+This is an auditable boundary, not an implementation claim.  The official
+`DeepSeek-V4.1-Flash/main` snapshot downloaded 2026-09-10 has SHA-256
+`model.py=4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65`,
+`config.json=8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879`,
+and `model.safetensors.index.json=74b0686a3d2891980d5e303251b075a3bccae2c2ff650747db2620a649b98fa8`.
 
-## Ownership graph
+## The CED fact, and the definition a port must add
 
-```text
-vision encoder -> pixel-unshuffle -> vision projector --\
-text embedding ----------------------------------------+-> language input
-                                                           |
-                                             CED encoder (layers 0..19)
-                                                           |
-                                      H[19] --global-KV projection--> decoder CSA2 Full
-                                                           |                        |
-                                      encoder local SWA KV             shared global KV/indexer K
-                                                           |                        |
-                                  bounded replay consumer <--- decoder local SWA KV
-                                                           |
-                                                 CED decoder (layers 20..39)
-                                                           |
-                                                    norm -> LM head
-```
+Official `inference/model.py` does **not** implement CED and does **not**
+define `H_{L/2}`.  It builds all `range(args.n_layers)` blocks at lines
+1201--1205, is inference-only (`@torch.inference_mode()`, lines 1241--1242),
+and executes them in the single ordered loop at lines 1261--1267.  Therefore
+the exact official definition is: **`H_{L/2}` is undefined.**  The prior
+claim that it feeds layer-20 KV was false.
 
-The owners and consumers are intentionally separate:
-
-| State / decision | Single owner | Consumers | Contract |
-| --- | --- | --- | --- |
-| multimodal token embeddings | vision encoder + projector, then language embedding | layer 0 | The projector inserts visual embeddings at image-token positions before the language stack; no CSA2 module accepts raw images. |
-| CED split and encoder terminal hidden state | V4.1 language model | CSA2 Full layer 20 | Layers `0..19` are the causal encoder; `H[19]` is the sole source of decoder **global** KV projections. |
-| local SWA KV | the current language layer | that same layer's local-attention branch | Every layer owns its own SWA KV.  Decoder SWA is populated by bounded replay; it must not be substituted with encoder SWA KV. |
-| global main KV and indexer K | most recent CSA2 Full layer | later Reindex/Reuse layers | A Full layer produces main KV; indexer K is projected from that KV.  Under CED, decoder Full layer 20 projects its global KV from `H[19]`, not its own hidden state. |
-| indexer Q and fresh Top-K | current Full or Reindex layer | its attention and later Reuse layers | Reindex has its own Q, scores the shared indexer K, and publishes a new Top-K.  In the decoder it searches the Full-20 candidate pool. |
-| reused Top-K | latest Full/Reindex layer for the active KV source | Reuse layers | Reuse has no indexer-Q or score computation; it reads the latest compatible Top-K. |
-| static schedule validation | V4.1 config builder | model constructor and CSA2 primitive | `compress_ratios`, `kv_source_layer_ids`, and `index_source_layer_ids` are immutable model configuration, not runtime routing decisions. |
-
-`protocol.py` owns batch normalization, packed-sequence/CP adaptation, and the
-public forward call.  It does **not** choose a CSA2 mode or slice CED states.
-The V4.1 model owns the encoder/decoder transition and passes an explicit,
-validated per-layer assignment into the shared CSA2 primitive.  This preserves
-the existing model/protocol boundary and prevents a second CP implementation
-from appearing inside attention.
-
-## CED boundary
-
-For `L = 40`, CED partitions the backbone at `L / 2 = 20`:
-
-| Phase | Layers executed over the full prompt | Global KV source | Local/SWA work |
-| --- | --- | --- | --- |
-| prefill | encoder `0..19` | encoder Full layers make their normal global KV; decoder layer 20 projects global KV from `H[19]` | decoder local state is reconstructed only through bounded replay of the trailing window |
-| decode | encoder state plus decoder `20..39` | decoder Full-20 global KV remains the source; later decoder CSA2 layers reuse it | every decoder layer uses its own, current-layer SWA KV |
-
-The key prohibition is that CED shares **global** KV only.  It neither shares
-decoder hidden states nor turns the decoder into an ordinary cross-attention
-stack.  Position IDs, causal masking, packed-sequence metadata, and CP layout
-therefore continue through the language-model forward boundary unchanged.
-
-## Static CSA2 assignment
-
-The table is mechanically derived from the official arrays:
+A training CED port must introduce, and test, this exact definition instead:
 
 ```text
-Full    := layer in kv_source_layer_ids
-Reindex := layer in index_source_layer_ids but not kv_source_layer_ids
-Reuse   := compress_ratio > 0 and neither source array contains the layer
-SWA     := compress_ratio == 0
+L = config.text_config.num_hidden_layers = 40
+H_{L/2} = H_20 = h after Block(19) returns at official model.py:1267
+P_20 = the paired pre_mix returned at that same line
 ```
 
-| Layer(s) | CED side | attention / ratio | mode | global-KV source | Top-K producer / consumer |
-| --- | --- | --- | --- | --- | --- |
-| 0--1 | encoder | SWA only | — | — | — |
-| 2 | encoder | CSA2 / 2 | Full | 2 | produces Top-K for 2--7 |
-| 3--7 | encoder | CSA2 / 2 | Reuse | 2 | consume Top-K from 2 |
-| 8 | encoder | CSA2 / 2 | Full | 8 | produces Top-K for 8--13 |
-| 9--13 | encoder | CSA2 / 2 | Reuse | 8 | consume Top-K from 8 |
-| 14 | encoder | CSA2 / 2 | Full | 14 | produces Top-K for 14--19 |
-| 15--19 | encoder | CSA2 / 2 | Reuse | 14 | consume Top-K from 14 |
-| 20 | decoder | CSA2 / 1 | Full | 20, projected from `H[19]` | full-range index; creates the hierarchical candidate pool and Top-K |
-| 21--23 | decoder | CSA2 / 1 | Reuse | 20 | consume Top-K from 20 |
-| 24 | decoder | CSA2 / 1 | Reindex | 20 | fresh Top-K within layer-20 candidate pool |
-| 25--27 | decoder | CSA2 / 1 | Reuse | 20 | consume Top-K from 24 |
-| 28 | decoder | CSA2 / 1 | Reindex | 20 | fresh Top-K within layer-20 candidate pool |
-| 29--31 | decoder | CSA2 / 1 | Reuse | 20 | consume Top-K from 28 |
-| 32 | decoder | CSA2 / 1 | Reindex | 20 | fresh Top-K within layer-20 candidate pool |
-| 33--35 | decoder | CSA2 / 1 | Reuse | 20 | consume Top-K from 32 |
-| 36 | decoder | CSA2 / 1 | Reindex | 20 | fresh Top-K within layer-20 candidate pool |
-| 37--39 | decoder | CSA2 / 1 | Reuse | 20 | consume Top-K from 36 |
+Layer 20 continuation consumes `(H_20, P_20)`; a CED global-KV projection may
+consume only `H_20`.  Keeping `P_20` is mandatory because the official loop
+updates both state values.  This is a port contract, not released behavior.
 
-Thus the only global-KV producers are `2`, `8`, `14`, and `20`; the
-index-producing layers are `2`, `8`, `14`, `20`, `24`, `28`, `32`, and `36`.
-All other CSA2 layers are consumers.  `ratio=1` is an uncompressed main-KV
-CSA2 setting, not a request to fall back to DS4 CSA or HCA.
+## 40-layer static assignment
 
-## CSA2 mode interface
+From official config: `kv_source_layer_ids=[2,8,14,20]`,
+`index_source_layer_ids=[2,8,14,20,24,28,32,36]`.  Source code selects the KV
+owner at lines 653--661, readers at 739--765, and Top-K publishers/readers at
+721--737.  `K` and `T` are unique KV and Top-K sources. `—` is local SWA.
 
-Every CSA2 invocation receives its per-layer static assignment plus a
-read-only shared-state handle.  The primitive has the following minimal
-responsibilities:
+| layer | side | ratio | mode | K | T | consumer gradient route |
+| ---: | --- | ---: | --- | ---: | ---: | --- |
+| 0 | encoder | 0 | SWA | — | — | local |
+| 1 | encoder | 0 | SWA | — | — | local |
+| 2 | encoder | 2 | Full | 2 | 2 | owner; sum consumers 3--7 |
+| 3 | encoder | 2 | Reuse | 2 | 2 | 3→K2,T2→θKV2,θI2 |
+| 4 | encoder | 2 | Reuse | 2 | 2 | 4→K2,T2→θKV2,θI2 |
+| 5 | encoder | 2 | Reuse | 2 | 2 | 5→K2,T2→θKV2,θI2 |
+| 6 | encoder | 2 | Reuse | 2 | 2 | 6→K2,T2→θKV2,θI2 |
+| 7 | encoder | 2 | Reuse | 2 | 2 | 7→K2,T2→θKV2,θI2 |
+| 8 | encoder | 2 | Full | 8 | 8 | owner; sum consumers 9--13 |
+| 9 | encoder | 2 | Reuse | 8 | 8 | 9→K8,T8→θKV8,θI8 |
+| 10 | encoder | 2 | Reuse | 8 | 8 | 10→K8,T8→θKV8,θI8 |
+| 11 | encoder | 2 | Reuse | 8 | 8 | 11→K8,T8→θKV8,θI8 |
+| 12 | encoder | 2 | Reuse | 8 | 8 | 12→K8,T8→θKV8,θI8 |
+| 13 | encoder | 2 | Reuse | 8 | 8 | 13→K8,T8→θKV8,θI8 |
+| 14 | encoder | 2 | Full | 14 | 14 | owner; sum consumers 15--19 |
+| 15 | encoder | 2 | Reuse | 14 | 14 | 15→K14,T14→θKV14,θI14 |
+| 16 | encoder | 2 | Reuse | 14 | 14 | 16→K14,T14→θKV14,θI14 |
+| 17 | encoder | 2 | Reuse | 14 | 14 | 17→K14,T14→θKV14,θI14 |
+| 18 | encoder | 2 | Reuse | 14 | 14 | 18→K14,T14→θKV14,θI14 |
+| 19 | encoder | 2 | Reuse | 14 | 14 | 19→K14,T14→θKV14,θI14 |
+| 20 | decoder | 1 | Full | 20 | 20 | owner; sum KV consumers 21--39 |
+| 21 | decoder | 1 | Reuse | 20 | 20 | 21→K20,T20→θKV20,θI20 |
+| 22 | decoder | 1 | Reuse | 20 | 20 | 22→K20,T20→θKV20,θI20 |
+| 23 | decoder | 1 | Reuse | 20 | 20 | 23→K20,T20→θKV20,θI20 |
+| 24 | decoder | 1 | Reindex | 20 | 24 | 24→K20→θKV20; T24→θI24 |
+| 25 | decoder | 1 | Reuse | 20 | 24 | 25→K20,T24→θKV20,θI24 |
+| 26 | decoder | 1 | Reuse | 20 | 24 | 26→K20,T24→θKV20,θI24 |
+| 27 | decoder | 1 | Reuse | 20 | 24 | 27→K20,T24→θKV20,θI24 |
+| 28 | decoder | 1 | Reindex | 20 | 28 | 28→K20→θKV20; T28→θI28 |
+| 29 | decoder | 1 | Reuse | 20 | 28 | 29→K20,T28→θKV20,θI28 |
+| 30 | decoder | 1 | Reuse | 20 | 28 | 30→K20,T28→θKV20,θI28 |
+| 31 | decoder | 1 | Reuse | 20 | 28 | 31→K20,T28→θKV20,θI28 |
+| 32 | decoder | 1 | Reindex | 20 | 32 | 32→K20→θKV20; T32→θI32 |
+| 33 | decoder | 1 | Reuse | 20 | 32 | 33→K20,T32→θKV20,θI32 |
+| 34 | decoder | 1 | Reuse | 20 | 32 | 34→K20,T32→θKV20,θI32 |
+| 35 | decoder | 1 | Reuse | 20 | 32 | 35→K20,T32→θKV20,θI32 |
+| 36 | decoder | 1 | Reindex | 20 | 36 | 36→K20→θKV20; T36→θI36 |
+| 37 | decoder | 1 | Reuse | 20 | 36 | 37→K20,T36→θKV20,θI36 |
+| 38 | decoder | 1 | Reuse | 20 | 36 | 38→K20,T36→θKV20,θI36 |
+| 39 | decoder | 1 | Reuse | 20 | 36 | 39→K20,T36→θKV20,θI36 |
 
-| Mode | Current-layer computation | Reads | Publishes |
-| --- | --- | --- | --- |
-| Full | main Q, main KV, indexer K from main KV, indexer Q, scores, Top-K, SWA KV | none (except CED's `H[19]` input for decoder Full-20 KV projection) | KV-source record and Top-K record; Full-20 also publishes candidate pool |
-| Reindex | main Q, indexer Q, scores, fresh Top-K, SWA KV | most recent Full main KV + indexer K; decoder candidate pool | Top-K record, associated with the reused KV source |
-| Reuse | main Q and SWA KV | most recent Full main KV + indexer K and latest compatible Top-K | attention output only |
+Every consumer has one reachable K and one reachable T.  A Reindex owns only
+its T; it never creates K.  For a training port, keep these values
+differentiable (not cache-detached) and assert `dL/dθo=dLowner/dθo+Σc dLc/dθo`.
 
-An implementation must reject an assignment that has no preceding Full source,
-or a Reuse row whose Top-K is associated with another KV source.  It must also
-reject a decoder Reindex without Full-20's candidate pool.  Those checks make
-the owner/consumer graph executable rather than a comment-only convention.
+## Exact checkpoint ownership assertion
 
-## Scope hand-off
-
-This document decides ownership only.  The checkpoint-key contract (including
-the three MTP layers), individual CSA-to-CSA2 operator deltas, and optimizer
-parameter groups belong to their dedicated follow-up work.  DSpark metadata
-(`dspark_target_layer_ids = [37, 38, 39]`) may be loaded/mapped by the
-checkpoint path, but DSpark forward and rollout are expressly out of scope.
+For KV owner `i`, the complete owner key set is every index key with prefix
+`layers.{i}.attn.compressor.`; for index owner `j`, every key with prefix
+`layers.{j}.attn.indexer.`.  Required suffixes are `compressor.{norm.weight,
+wkv.weight[,wgate.weight]}` and `indexer.{wq_b.weight,weights_proj.weight,
+`wk.weight,k_norm.weight` only when that indexer is also a KV owner; plus any
+index-present scales).  The validator
+compares the union to **all** compressor/indexer keys in the 96,085-key
+`weight_map`, rejects modules on non-owner layers, and checks every layer's
+unique provenance.  It is not a sampled check.
