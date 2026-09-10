@@ -1,0 +1,38 @@
+{
+  "kind": "expected vector, not implementation acceptance",
+  "reference": "Algorithm 1; decimal precision 70; N injected after momentum; K=11 tau=0.001 epsilon=1e-20",
+  "N": [
+    [
+      1,
+      2
+    ],
+    [
+      3,
+      4
+    ],
+    [
+      0,
+      0
+    ]
+  ],
+  "mask": [
+    false,
+    false,
+    true
+  ],
+  "delta_decimal": [
+    [
+      "0.8944271660210036645461327004299092296166995790857624792660197759136492",
+      "1.095445135405528170282978822898011723280211034986940361359856459720551"
+    ],
+    [
+      "1.095445094615135524080044683972013295227993613886220618673500249406638",
+      "0.8944272159788278600323541626535642409310385087166854368241048933826618"
+    ],
+    [
+      "0E+401",
+      "0E+396"
+    ]
+  ],
+  "comparison": "No implementation tolerance approved; decimal strings are rounded reference values."
+}
