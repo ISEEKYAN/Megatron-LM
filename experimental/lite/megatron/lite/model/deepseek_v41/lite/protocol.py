@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Text-only single-rank protocol. Distributed and optimizer routing are separate."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import torch
@@ -17,12 +18,14 @@ from megatron.lite.runtime.contracts import ParallelConfig
 from torch.nn import functional as F
 
 from .checkpoint import export_model, load_model, save_model
+from .optimizer_groups import OptimizerConfig, V41Optimizer
 
 
 @dataclass(frozen=True)
 class ImplConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
     optimizer: str | None = None
+    optimizer_config: OptimizerConfig | None = None
     device: str = 'cuda'
     dtype: torch.dtype = torch.bfloat16
     quantized: bool = True
@@ -53,9 +56,15 @@ def build_model(model_cfg, *, impl_cfg):
         raise NotImplementedError('V4.1 assembly currently requires single-rank parallelism')
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
         raise NotImplementedError('Distributed V4.1 construction requires the parallel integration')
-    if impl_cfg.optimizer is not None:
-        raise NotImplementedError(
-            'Optimizer construction requires the V4.1 object-based routing integration'
+    if impl_cfg.optimizer not in (None, 'muon'):
+        raise ValueError('V4.1 optimizer must be explicitly selected as muon')
+    if impl_cfg.optimizer is None and impl_cfg.optimizer_config is not None:
+        raise ValueError('optimizer_config requires selecting the V4.1 optimizer')
+    if impl_cfg.optimizer == 'muon' and not isinstance(
+        impl_cfg.optimizer_config, OptimizerConfig
+    ):
+        raise ValueError(
+            'V4.1 Muon requires explicit optimizer_config including NS backend settings'
         )
     if impl_cfg.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
@@ -83,16 +92,44 @@ def build_model(model_cfg, *, impl_cfg):
             module.output_dtype = impl_cfg.dtype
     if model.engram_hash is not None:
         model.engram_hash.to(device=impl_cfg.device)
+    optimizer = None
+    if impl_cfg.optimizer == 'muon':
+        if impl_cfg.device == 'meta':
+            raise ValueError(
+                'Materialize V4.1 parameters before constructing optimizer state'
+            )
+        # Persistent FP32 owners receive FP32 wgrad from the numerical providers.
+        # No post-hoc BF16 gradient widening is used.
+        from .attention import Linear
+
+        for module in model.modules():
+            if isinstance(module, Linear):
+                module.native_fp32 = True
+                module.weight.data = module.weight.data.float()
+        for p in model.parameters():
+            if p.requires_grad:
+                p.data = p.data.float()
+                p.main_grad = None
+                p.register_post_accumulate_grad_hook(_publish_main_grad)
+        model.residual_dtype = impl_cfg.dtype
+        optimizer = V41Optimizer(model, impl_cfg.optimizer_config)
     return ModelBundle(
         [model],
         ParallelState(),
+        optimizer=optimizer,
         forward_step=_forward_step,
         extras={
             'model_cfg': model_cfg,
-            'optimizer_backend': 'none',
+            'optimizer_backend': 'none' if optimizer is None else 'v41',
             'parameter_bindings': model.parameter_bindings,
         },
     )
+
+
+def _publish_main_grad(parameter):
+    if parameter.grad.dtype != torch.float32:
+        raise RuntimeError('V4.1 gradient producer did not return native FP32')
+    parameter.main_grad = parameter.grad
 
 
 def _forward_step(model, batch):
@@ -127,7 +164,16 @@ def _forward_step(model, batch):
     temperature = 1.0 if context is None else context.temperature
     if temperature <= 0:
         raise ValueError('Temperature must be positive')
-    logits = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens)['logits'][0] / temperature
+    precision = (
+        torch.autocast(device_type=batch.input_ids.device.type, enabled=False)
+        if hasattr(model, 'residual_dtype')
+        else nullcontext()
+    )
+    with precision:
+        logits = (
+            model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens)['logits'][0]
+            / temperature
+        )
     result = {'logits': logits}
     if batch.labels is not None:
         if batch.labels.shape != batch.input_ids.shape:

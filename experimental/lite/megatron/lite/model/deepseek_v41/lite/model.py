@@ -65,6 +65,16 @@ class FP4Linear(Linear):
         self.quantized = quantized
 
     def forward(self, x):
+        if getattr(self, 'native_fp32', False):
+            from megatron.lite.primitive.modules.native_fp32_linear import (
+                native_fp32_linear,
+            )
+            from megatron.lite.primitive.quantization.ds41_index import fake_quant_index
+
+            return native_fp32_linear(
+                fake_quant_index(x, enabled=self.quantized),
+                fake_quant_index(self.weight, enabled=self.quantized),
+            )
         if not self.quantized:
             return F.linear(x, self.weight)
         from megatron.lite.primitive.quantization.ds41_index import fake_quant_index
@@ -424,6 +434,8 @@ class DeepseekV41Model(nn.Module):
         elif token_types is not None:
             if token_types.shape != input_ids.shape or (token_types != TEXT).any():
                 raise ValueError('Image token types require image inputs')
+        if hasattr(self, 'residual_dtype'):
+            embeddings = embeddings.to(self.residual_dtype)
         hidden, pre = expand_hc(embeddings, self.hc_mult)
         if cu_seqlens is None:
             hidden, pre = self._sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
