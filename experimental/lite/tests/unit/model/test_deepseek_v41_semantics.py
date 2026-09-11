@@ -503,6 +503,7 @@ def _assembly_bundle(device='cpu', trainable_engram=False):
     proto = registry.get_train_runtime_module(
         registry.resolve_runtime_model_name('deepseek_v41', 'lite')
     )
+
     return proto, proto.build_model(
         cfg,
         impl_cfg=proto.ImplConfig(
@@ -513,6 +514,248 @@ def _assembly_bundle(device='cpu', trainable_engram=False):
             trainable_engram=trainable_engram,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    'device', ['cpu', pytest.param('cuda', marks=pytest.mark.gpus(1))]
+)
+def test_v41_headwise_muon_distinct_heads_and_resume(device):
+    from copy import deepcopy
+
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz
+    from megatron.lite.primitive.optimizers.headwise_muon import HeadwiseMuon
+
+    torch.manual_seed(712)
+    weight = torch.nn.Parameter(torch.randn(6, 5, device=device))
+    expected = weight.detach().clone()
+    momentum = torch.zeros_like(weight)
+    opt = HeadwiseMuon(
+        [{'params': [weight], 'matrix_shape': (2, 3, 5)}],
+        lr=0.03,
+        ns_steps=5,
+        coefficient_type='quintic',
+    )
+    for step in range(3):
+        gradient = torch.randn_like(weight)
+        gradient[3:] *= 17
+        weight.grad = gradient
+        momentum = 0.95 * momentum + 0.05 * gradient
+        nesterov = 0.95 * momentum + 0.05 * gradient
+        directions = []
+        for head in nesterov.split(3):
+            update = newton_schulz(head, 5, coefficient_type='quintic')
+            directions.append(update * (0.18 / update.square().mean().sqrt()))
+        expected = expected * (1 - 0.03 * 0.1) - 0.03 * torch.cat(directions)
+        vanilla = newton_schulz(nesterov, 5, coefficient_type='quintic')
+        vanilla *= 0.18 / vanilla.square().mean().sqrt()
+        assert not torch.allclose(vanilla, torch.cat(directions), atol=1e-3, rtol=1e-3)
+        assert opt.step()
+        torch.testing.assert_close(weight, expected, atol=0, rtol=0)
+        torch.testing.assert_close(opt.state[weight]['momentum_buffer'], momentum)
+        assert opt.state[weight]['momentum_buffer'].dtype == torch.float32
+        if step == 1:
+            saved = deepcopy(opt.state_dict())
+            opt = HeadwiseMuon(
+                [{'params': [weight], 'matrix_shape': (2, 3, 5)}],
+                lr=0.03,
+                ns_steps=5,
+                coefficient_type='quintic',
+            )
+            opt.load_state_dict(saved)
+
+
+def test_v41_headwise_muon_rejects_layout_and_atomic_nonfinite():
+    from megatron.lite.primitive.optimizers.headwise_muon import HeadwiseMuon
+
+    a = torch.nn.Parameter(torch.ones(6, 5))
+    b = torch.nn.Parameter(torch.ones(6, 5))
+    settings = dict(lr=0.01, ns_steps=5, coefficient_type='quintic')
+    with pytest.raises(ValueError, match='logical'):
+        HeadwiseMuon([{'params': [a], 'matrix_shape': (4, 3, 5)}], **settings)
+    opt = HeadwiseMuon([{'params': [a, b], 'matrix_shape': (2, 3, 5)}], **settings)
+    a.grad = torch.ones_like(a)
+    b.grad = torch.full_like(b, float('nan'))
+    assert not opt.step()
+    assert not opt.state
+    assert torch.equal(a, torch.ones_like(a))
+    assert torch.equal(b, torch.ones_like(b))
+
+
+@pytest.mark.parametrize('trainable', [False, True])
+@pytest.mark.parametrize(
+    'device', ['cpu', pytest.param('cuda', marks=pytest.mark.gpus(1))]
+)
+def test_v41_actual_optimizer_routes_and_native_gradients(moe, trainable, device):
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import OptimizerConfig
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    torch.manual_seed(41)
+    bundle = protocol.build_model(
+        _assembly_config(),
+        impl_cfg=protocol.ImplConfig(
+            device=device,
+            quantized=device == 'cuda',
+            dtype=torch.bfloat16,
+            token_map=list(range(256)),
+            trainable_engram=trainable,
+            optimizer='muon',
+            optimizer_config=OptimizerConfig(
+                lr=1e-3, ns_steps=5, coefficient_type='quintic'
+            ),
+        ),
+    )
+    model, opt = bundle.chunks[0], bundle.optimizer
+    groups = {g['owner_key']: g for g in opt.param_groups}
+    a = model.layers[0].attn
+    assert groups['layers.0.attn.wq_a.weight']['matrix_shape'] == tuple(
+        a.wq_a.weight.shape
+    )
+    assert groups['layers.0.attn.wkv.weight']['matrix_shape'] == tuple(
+        a.wkv.weight.shape
+    )
+    assert groups['layers.0.attn.wq_b.weight']['matrix_shape'] == (8, 64, 64)
+    assert all('indexer' not in key for key in groups)
+    assert {id(p) for g in opt.param_groups for p in g['params']} == {
+        id(p) for p in model.parameters() if p.requires_grad
+    }
+    assert len([p for g in opt.param_groups for p in g['params']]) == len(groups)
+    for block in model.layers:
+        if block.engram is not None:
+            table = block.engram.embed
+            assert (table.master is not None) == trainable
+            assert table.weight.dtype == torch.float8_e4m3fn
+    assert {type(o).__name__ for o in opt.optimizers} == {
+        'HeadwiseMuon',
+        'Sinkhorn',
+        'AdamW',
+    }
+    for key, group in groups.items():
+        if '.engram.' in key:
+            assert group['lr'] == 5e-3
+        if key.endswith(('q_weight', 'k_weight')):
+            assert group['algorithm'] == 'adamw' and group['weight_decay'] == 0.1
+    ids = torch.tensor([3, 4, 3, 5], device=device)
+    batch = PackedBatch(
+        ids, ids, torch.tensor([4], device=device), torch.ones(4, device=device)
+    )
+    bundle.forward_step(model, batch)['loss'].backward()
+    gradient = a.wq_b.weight.main_grad
+    assert gradient.dtype == torch.float32 and gradient is a.wq_b.weight.grad
+    assert not torch.equal(gradient, gradient.bfloat16().float())
+    before = a.wq_b.weight.detach().clone()
+    success, norm, _ = opt.step()
+    assert success and norm > 0 and not torch.equal(before, a.wq_b.weight)
+    for backend in opt.optimizers:
+        for state in backend.state.values():
+            for key, value in state.items():
+                if 'momentum' in key:
+                    assert value.dtype == torch.float32
+    opt.zero_grad()
+    assert a.wq_b.weight.grad is None and a.wq_b.weight.main_grad is None
+
+
+def test_v41_native_linear_accumulates_unrounded_weight_gradients():
+    from megatron.lite.primitive.modules.native_fp32_linear import native_fp32_linear
+
+    torch.manual_seed(417)
+    weight = torch.nn.Parameter(torch.randn(7, 5))
+    reference = torch.zeros_like(weight)
+    for _ in range(2):
+        x = torch.randn(11, 5).bfloat16().requires_grad_()
+        grad = torch.randn(11, 7).bfloat16()
+        output = native_fp32_linear(x, weight)
+        assert torch.equal(output, torch.nn.functional.linear(x, weight.bfloat16()))
+        with torch.autocast('cpu', dtype=torch.bfloat16):
+            output.backward(grad)
+        reference += grad.float().T @ x.float()
+    assert torch.equal(weight.grad, reference)
+    assert not torch.equal(weight.grad, weight.grad.bfloat16().float())
+
+
+def test_v41_optimizer_resume_and_atomic_skip(moe, monkeypatch):
+    from copy import deepcopy
+
+    from megatron.lite.model.deepseek_v41.lite import optimizer_groups, protocol
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    config = optimizer_groups.OptimizerConfig(
+        lr=1e-3, ns_steps=5, coefficient_type='quintic'
+    )
+    impl = protocol.ImplConfig(
+        device='cpu',
+        quantized=False,
+        dtype=torch.bfloat16,
+        token_map=list(range(256)),
+        trainable_engram=True,
+        optimizer='muon',
+        optimizer_config=config,
+    )
+    bundle = protocol.build_model(_assembly_config(), impl_cfg=impl)
+    model, opt = bundle.chunks[0], bundle.optimizer
+    ids = torch.tensor([2, 3, 4])
+    batch = PackedBatch(ids, ids, torch.tensor([3]), torch.ones(3))
+    bundle.forward_step(model, batch)['loss'].backward()
+    assert opt.step()[0]
+    saved_weights, saved_opt = deepcopy(model.state_dict()), deepcopy(opt.state_dict())
+    # A nonfinite gradient in AdamW must not let Muon or Sinkhorn publish first.
+    p = model.norm.weight
+    old = p.main_grad.clone()
+    p.main_grad.fill_(float('inf'))
+    assert not opt.step()[0]
+    p.main_grad.copy_(old)
+    for key, value in model.state_dict().items():
+        assert torch.equal(
+            value.view(torch.uint8), saved_weights[key].view(torch.uint8)
+        )
+
+    def reject_publication(*args, **kwargs):
+        raise RuntimeError('publication probe')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(optimizer_groups, 'quantize_block_fp8', reject_publication)
+        with pytest.raises(RuntimeError, match='publication probe'):
+            opt.step()
+    for key, value in model.state_dict().items():
+        assert torch.equal(
+            value.view(torch.uint8), saved_weights[key].view(torch.uint8)
+        )
+    restored = protocol.build_model(_assembly_config(), impl_cfg=impl)
+    restored.chunks[0].load_state_dict(saved_weights)
+    restored.optimizer.load_state_dict(saved_opt)
+    for candidate in (bundle, restored):
+        candidate.optimizer.zero_grad()
+        candidate.forward_step(candidate.chunks[0], batch)['loss'].backward()
+        assert candidate.optimizer.step()[0]
+    for p, q in zip(model.parameters(), restored.chunks[0].parameters()):
+        torch.testing.assert_close(p, q, atol=0, rtol=0)
+
+
+def test_v41_optimizer_rejects_unknown_alias_and_live_indexer(moe):
+    from dataclasses import replace
+
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import parameter_groups
+
+    _, bundle = _assembly_bundle()
+    model = bundle.chunks[0]
+    model.extra = torch.nn.Parameter(torch.ones(2, 2))
+    with pytest.raises(ValueError):
+        parameter_groups(model, lr=1e-3)
+    del model.extra
+    binding = model.tensor_bindings['layers.0.attn.wq_b.weight']
+    model.tensor_bindings['layers.0.attn.wq_b.weight'] = replace(
+        binding, head_count=None
+    )
+    with pytest.raises(ValueError, match='head'):
+        parameter_groups(model, lr=1e-3)
+    model.tensor_bindings['layers.0.attn.wq_b.weight'] = binding
+    model.extra = model.layers[0].attn.wq_a.weight
+    with pytest.raises(ValueError, match='alias'):
+        parameter_groups(model, lr=1e-3)
+    del model.extra
+    model.layers[2].attn.indexer.requires_grad_(True)
+    with pytest.raises(ValueError, match='indexer'):
+        parameter_groups(model, lr=1e-3)
 
 
 def test_v41_registry_assembly_forward_and_parameter_owners(moe):

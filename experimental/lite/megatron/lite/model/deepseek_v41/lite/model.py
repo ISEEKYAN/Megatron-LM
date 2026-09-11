@@ -63,6 +63,16 @@ class FP4Linear(Linear):
         self.quantized = quantized
 
     def forward(self, x):
+        if getattr(self, 'native_fp32', False):
+            from megatron.lite.primitive.modules.native_fp32_linear import (
+                native_fp32_linear,
+            )
+            from megatron.lite.primitive.quantization.ds41_index import fake_quant_index
+
+            return native_fp32_linear(
+                fake_quant_index(x, enabled=self.quantized),
+                fake_quant_index(self.weight, enabled=self.quantized),
+            )
         if not self.quantized:
             return F.linear(x, self.weight)
         from megatron.lite.primitive.quantization.ds41_index import fake_quant_index
@@ -373,7 +383,10 @@ class DeepseekV41Model(nn.Module):
             raise NotImplementedError('Multimodal inputs require vision/aligner integration')
         if input_ids.ndim != 2 or input_ids.dtype != torch.int64 or not input_ids.shape[1]:
             raise ValueError('Expected nonempty int64 input_ids [B,S]')
-        hidden, pre = expand_hc(self.embed(input_ids), self.hc_mult)
+        tokens = self.embed(input_ids)
+        if hasattr(self, 'residual_dtype'):
+            tokens = tokens.to(self.residual_dtype)
+        hidden, pre = expand_hc(tokens, self.hc_mult)
         if cu_seqlens is None:
             hidden, pre = self._sequence(hidden, pre, input_ids=input_ids)
         else:
