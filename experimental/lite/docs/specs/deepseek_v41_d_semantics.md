@@ -60,3 +60,48 @@ The D-only review diff is against `fd18aa0d0`. Regression acceptance retains
 `d8e010069` (mainparent job 18354480) as the baseline and compares both
 failure/error set differences against it. Test skips remain
 skips, and added passing semantic cases do not erase baseline failures.
+
+## Text-only model assembly
+
+`DeepseekV41Config` reads the nested release JSON without flattening or dropping
+inactive metadata. `deepseek_v41` is registered with the `lite` protocol. The
+single-rank model composes all 40 D blocks, both Engram modules, embedding, final
+shifted-HC contraction, norm and head. `ImplConfig.token_map` is required for
+Engram execution; real token IDs must use the tokenizer-derived map, while the
+C reduced fixture deliberately uses its specified identity map. `quantized=False`
+is an explicit floating diagnostic. Quantized execution uses D's native FP8
+linears and group32 FP4 numerical/STE expert providers; it does not claim native
+FP4 GEMM performance. CPU diagnostics are not GPU parity evidence.
+
+`model.parameter_bindings()` enumerates actual live parameter objects once,
+including frozen indexers. Each binding exposes `owner`, `attribute`, `role`,
+`tensor`, and the query projection's `head_count`. Consumers must inspect these
+objects and roles instead of inferring optimizer groups from checkpoint names.
+`bind_checkpoint(model, records, store=...)` validates coverage and active
+shape/dtype/scale layout, then links keys to those same owners, headers and store.
+The C manifest exercises all 3,204 reduced entries. A separate meta allocation
+checks all 96,085 release keys from the A2 contract, including 2,401 MTP keys;
+that key-only check does not claim real release-header or payload inspection.
+
+`save_model` / protocol `save_hf_weights` stream lossless active masters and
+unchanged archival payloads. Plain master weights have no quantization scale
+siblings, following C's plain-export decoder contract. Frozen Engram storage
+keeps its FP8 values/scales. Trainable tables export FP32 masters and regenerate
+resident storage on reload; callers must use `refresh_storage()` after accepted
+optimizer steps. Original nested config is retained. This is a training export,
+not a deployment quantization conversion. Saving requires the inactive vision
+and aligner bytes to be present; it cannot fabricate checkpoint data for
+unimplemented modules.
+
+The multimodal handoff consists of `model.vision` and `model.aligner` archival
+subtrees, image-vector archival owners, `encode_image(patches, n_vit_h, n_vit_w)`,
+and `forward(..., images=..., token_types=...)`. These execution interfaces raise
+`NotImplementedError`; the multimodal integration supplies their computation and
+trainability. `model.mtp` retains its archival subtree and `forward_spec` rejects
+DSpark execution. Neither subtree is silently dropped in text-only mode.
+
+The protocol accepts unpadded `PackedBatch`, restarts CSA2/Engram state per sample,
+shifts labels and masks within each sample and masks terminal targets. It returns
+loss/log-probabilities and honors loss-context temperature/entropy. Distributed
+construction, optimizer creation, and routing replay explicitly require their
+separate integrations. No distributed or full-size training claim is made here.
