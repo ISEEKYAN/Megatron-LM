@@ -30,3 +30,17 @@ Validation steps: first run missing-module tests in
 then run exact codes/scales/values plus nonuniform input gradients and independent
 switch combinations. Execute the pinned official kernels via Slurm separately;
 CPU cards and identity-gradient policy do not certify GPU parity.
+
+SWA applies FP8 to the full post-RoPE vector in groups of 32 with E8M0 scales.
+Linear independently quantizes each activation row in groups of 32 and each
+weight matrix in 32x32 blocks. `dynamic_fp8_linear(x, weight)` accepts floating
+training tensors, performs actual native FP8 `_scaled_mm` per K block, applies
+detached per-row/per-block scales, and accumulates in FP32 before casting to the
+input dtype. This correctness implementation is unfused across K blocks.
+Its O14 backward uses decoded floating operands for input and weight derivatives.
+It requires CUDA and never silently replaces the forward with BF16 GEMM.
+
+Independent FP8 card: a block containing `.265625`, `.296875` and maximum `448`
+has scale 1 (E8M0 byte 127), rounding those first values to `.25` and `.3125`.
+All-zero groups use scale 2^-22 (E8M0 byte 105). SWA and Linear policies have
+separate entry points even though their present activation codecs agree.
