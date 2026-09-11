@@ -45,3 +45,30 @@ def test_empty_requests_and_invalid_ids():
         lookup.raw_rows(values, scales, torch.tensor([2]))
     with pytest.raises(ValueError):
         RowLookup((0, 2, 1))
+
+
+def test_provider_runs_engram_projection_and_multiple_forward_contexts():
+    import copy
+    from megatron.lite.model.deepseek_v41.lite.engram import Engram
+
+    q = quantize_swa(torch.linspace(-1, 1, 7 * 256).reshape(7, 256))
+    provider = ShardedEngramTable(q.values, q.scale, RowLookup((0, 7)), trainable=True)
+    projection = torch.nn.Linear(6144, 6, bias=False, dtype=torch.bfloat16)
+    actual = Engram(2, 2, provider, projection)
+    reference = copy.deepcopy(actual)
+    reference.embed = EngramTable(q.values, q.scale, trainable=True)
+    hidden = torch.tensor([[[[1.0, 2.0], [3.0, -4.0]]]], requires_grad=True)
+    expected_hidden = hidden.detach().clone().requires_grad_()
+    first = torch.tensor([[[0, 6, 2, 6] * 6]])
+    second = torch.tensor([[[1, 5, 3, 1] * 6]])
+    # Keep both forward contexts live before backward. A module-level last-ID
+    # cache would send the first microbatch's gradients to the second's rows.
+    a = actual(hidden, first).float().sum() + 3 * actual(hidden, second).float().sum()
+    b = reference(expected_hidden, first).float().sum() + 3 * reference(expected_hidden, second).float().sum()
+    torch.testing.assert_close(a, b, atol=0, rtol=0)
+    a.backward()
+    b.backward()
+    torch.testing.assert_close(hidden.grad, expected_hidden.grad, atol=0, rtol=0)
+    for (name, param), (ref_name, ref_param) in zip(actual.named_parameters(), reference.named_parameters()):
+        assert name == ref_name
+        torch.testing.assert_close(param.grad, ref_param.grad, atol=0, rtol=0)
