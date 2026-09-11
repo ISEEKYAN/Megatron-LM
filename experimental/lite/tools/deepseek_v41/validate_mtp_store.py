@@ -20,16 +20,23 @@ def main():
     args = parser.parse_args()
     if args.storage_ranks < 1:
         parser.error("storage-ranks must be positive")
-    spec = Path(__file__).resolve().parents[2] / "docs/contracts/deepseek_v41/weights.json"
+    spec = (
+        Path(__file__).resolve().parents[2] / "docs/contracts/deepseek_v41/weights.json"
+    )
     families = json.loads(spec.read_text())["families"]
     expected = sorted(
         family["pattern"].format(*indices)
-        for family in families if family["pattern"].startswith("mtp.")
+        for family in families
+        if family["pattern"].startswith("mtp.")
         for indices in itertools.product(*family["indices"])
     )
     assert len(expected) == len(set(expected)) == 2401
-    index = json.loads((args.checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
-    assert {k for k in index if k.startswith("mtp.")} == set(expected), "MTP index coverage"
+    index = json.loads((args.checkpoint / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    assert {k for k in index if k.startswith("mtp.")} == set(
+        expected
+    ), "MTP index coverage"
     files = sorted({index[k] for k in expected})
     root = args.checkpoint.resolve()
     paths = [(root / name).resolve() for name in files]
@@ -44,20 +51,34 @@ def main():
     assert config["text_config"]["dspark_block_size"] == 5
     args.output.mkdir(parents=True, exist_ok=False)
     for rank in range(args.storage_ranks):
-        store.shard(rank, args.storage_ranks).save(args.output / f"mtp-{rank:05d}.safetensors")
-    restored = CheckpointTensorStore.load(sorted(args.output.glob("mtp-*.safetensors")), expected_keys=expected)
+        store.shard(rank, args.storage_ranks).save(
+            args.output / f"mtp-{rank:05d}.safetensors"
+        )
+    restored = CheckpointTensorStore.load(
+        sorted(args.output.glob("mtp-*.safetensors")), expected_keys=expected
+    )
     total = 0
     for name, before in store.entries.items():
         after = restored.entries[name]
-        assert (before.dtype, before.shape, before.byte_length, before.payload_digest) == (
-            after.dtype, after.shape, after.byte_length, after.payload_digest
-        ), name
+        assert (
+            before.dtype,
+            before.shape,
+            before.byte_length,
+            before.payload_digest,
+        ) == (after.dtype, after.shape, after.byte_length, after.payload_digest), name
         total += before.byte_length
     (args.output / "config.json").write_bytes(config_bytes)
-    evidence = dict(keys=len(expected), payload_bytes=total, storage_ranks=args.storage_ranks,
-                    tensors=restored.manifest(), scope="supplied-checkpoint-mtp-byte-roundtrip")
+    evidence = dict(
+        keys=len(expected),
+        payload_bytes=total,
+        storage_ranks=args.storage_ranks,
+        tensors=restored.manifest(),
+        scope="supplied-checkpoint-mtp-byte-roundtrip",
+    )
     (args.output / "manifest.json").write_text(json.dumps(evidence, indent=2) + "\n")
-    print(f"MTP_BYTE_ROUNDTRIP_OK keys={len(expected)} bytes={total} ranks={args.storage_ranks}")
+    print(
+        f"MTP_BYTE_ROUNDTRIP_OK keys={len(expected)} bytes={total} ranks={args.storage_ranks}"
+    )
 
 
 if __name__ == "__main__":

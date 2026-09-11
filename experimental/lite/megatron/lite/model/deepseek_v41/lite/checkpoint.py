@@ -24,7 +24,9 @@ def _tensor(store, name):
     if entry.byte_length == 0:
         return torch.empty(entry.shape, dtype=dtype)
     # Own the backing storage; neither the immutable entry nor a mapped file is mutated.
-    return torch.frombuffer(bytearray(store.read(name)), dtype=dtype).reshape(entry.shape)
+    return torch.frombuffer(bytearray(store.read(name)), dtype=dtype).reshape(
+        entry.shape
+    )
 
 
 def load_weight(store, name, *, output_dtype=torch.bfloat16):
@@ -62,11 +64,17 @@ def load_weight(store, name, *, output_dtype=torch.bfloat16):
             row_block = 1 if name.endswith(".engram.embed.weight") else 32
             expected = ((rows + row_block - 1) // row_block, (columns + 31) // 32)
             if tuple(scale.shape) != expected:
-                raise ValueError(f"scale shape mismatch: {tuple(scale.shape)} != {expected}")
+                raise ValueError(
+                    f"scale shape mismatch: {tuple(scale.shape)} != {expected}"
+                )
             # Reuse the aligned primitive, allowing a final partially occupied block.
-            padded = torch.zeros(expected[0] * row_block, expected[1] * 32, dtype=weight.dtype)
+            padded = torch.zeros(
+                expected[0] * row_block, expected[1] * 32, dtype=weight.dtype
+            )
             padded[:rows, :columns] = weight
-            result = dequantize_block_fp8(padded, scale, (row_block, 32))[:rows, :columns]
+            result = dequantize_block_fp8(padded, scale, (row_block, 32))[
+                :rows, :columns
+            ]
         else:
             raise TypeError(f"unsupported weight dtype: {weight.dtype}")
     result = result.to(output_dtype)

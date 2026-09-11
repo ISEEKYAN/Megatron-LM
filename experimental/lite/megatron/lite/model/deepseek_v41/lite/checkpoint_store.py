@@ -14,9 +14,22 @@ from pathlib import Path
 from types import MappingProxyType
 
 _DTYPE_BYTES = {
-    "BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1,
-    "I16": 2, "U16": 2, "F16": 2, "BF16": 2,
-    "I32": 4, "U32": 4, "F32": 4, "I64": 8, "U64": 8, "F64": 8,
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "F8_E8M0": 1,
+    "I16": 2,
+    "U16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "I32": 4,
+    "U32": 4,
+    "F32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F64": 8,
 }
 _CHUNK = 8 * 1024 * 1024
 
@@ -43,7 +56,9 @@ def _coverage(entries, expected_keys):
         raise ValueError("duplicate expected keys")
     missing, extra = set(expected) - entries.keys(), entries.keys() - set(expected)
     if missing or extra:
-        raise ValueError(f"key coverage mismatch: missing={len(missing)} extra={len(extra)}")
+        raise ValueError(
+            f"key coverage mismatch: missing={len(missing)} extra={len(extra)}"
+        )
 
 
 @dataclass(frozen=True)
@@ -92,7 +107,9 @@ class CheckpointTensorStore:
                 length = struct.unpack("<Q", prefix)[0]
                 if length > min(100_000_000, size - 8):
                     raise ValueError("invalid safetensors header length")
-                header = json.loads(source.read(length), object_pairs_hook=_unique_object)
+                header = json.loads(
+                    source.read(length), object_pairs_hook=_unique_object
+                )
             if not isinstance(header, dict):
                 raise ValueError("header must be an object")
             cursor = 0
@@ -100,19 +117,32 @@ class CheckpointTensorStore:
             for name, record in header.items():
                 if name == "__metadata__":
                     if not isinstance(record, dict) or not all(
-                        isinstance(k, str) and isinstance(v, str) for k, v in record.items()
+                        isinstance(k, str) and isinstance(v, str)
+                        for k, v in record.items()
                     ):
                         raise ValueError("invalid safetensors metadata")
                     continue
-                if not isinstance(record, dict) or set(record) != {"dtype", "shape", "data_offsets"}:
+                if not isinstance(record, dict) or set(record) != {
+                    "dtype",
+                    "shape",
+                    "data_offsets",
+                }:
                     raise ValueError(f"invalid tensor header: {name}")
-                dtype, shape, offsets = record["dtype"], record["shape"], record["data_offsets"]
+                dtype, shape, offsets = (
+                    record["dtype"],
+                    record["shape"],
+                    record["data_offsets"],
+                )
                 if not isinstance(dtype, str) or dtype not in _DTYPE_BYTES:
                     raise ValueError(f"unsupported header dtype: {dtype}")
-                if not isinstance(shape, list) or any(type(n) is not int or n < 0 for n in shape):
+                if not isinstance(shape, list) or any(
+                    type(n) is not int or n < 0 for n in shape
+                ):
                     raise ValueError(f"invalid shape: {name}")
-                if not isinstance(offsets, list) or len(offsets) != 2 or any(
-                    type(n) is not int or n < 0 for n in offsets
+                if (
+                    not isinstance(offsets, list)
+                    or len(offsets) != 2
+                    or any(type(n) is not int or n < 0 for n in offsets)
                 ):
                     raise ValueError(f"invalid offsets: {name}")
                 start, end = offsets
@@ -127,8 +157,12 @@ class CheckpointTensorStore:
                     continue
                 if name in entries:
                     raise ValueError(f"duplicate tensor: {name}")
-                entry = TensorEntry(name, dtype, shape, end - start, str(path), 8 + length + start, "")
-                entries[name] = TensorEntry(**{**asdict(entry), "payload_digest": _stream(entry)})
+                entry = TensorEntry(
+                    name, dtype, shape, end - start, str(path), 8 + length + start, ""
+                )
+                entries[name] = TensorEntry(
+                    **{**asdict(entry), "payload_digest": _stream(entry)}
+                )
             if cursor != size - 8 - length:
                 raise ValueError("unaccounted trailing payload bytes")
         _coverage(entries, expected_keys)
@@ -147,9 +181,16 @@ class CheckpointTensorStore:
         return output.getvalue()
 
     def shard(self, rank, world_size):
-        if type(world_size) is not int or world_size < 1 or type(rank) is not int or not 0 <= rank < world_size:
+        if (
+            type(world_size) is not int
+            or world_size < 1
+            or type(rank) is not int
+            or not 0 <= rank < world_size
+        ):
             raise ValueError("invalid archival rank/world size")
-        return type(self)({key: self.entries[key] for key in list(self.entries)[rank::world_size]})
+        return type(self)(
+            {key: self.entries[key] for key in list(self.entries)[rank::world_size]}
+        )
 
     @classmethod
     def merge(cls, stores, *, expected_keys):
@@ -169,8 +210,11 @@ class CheckpointTensorStore:
             raise FileExistsError(path)
         header, cursor = {}, 0
         for name, entry in self.entries.items():
-            header[name] = dict(dtype=entry.dtype, shape=list(entry.shape),
-                                data_offsets=[cursor, cursor + entry.byte_length])
+            header[name] = dict(
+                dtype=entry.dtype,
+                shape=list(entry.shape),
+                data_offsets=[cursor, cursor + entry.byte_length],
+            )
             cursor += entry.byte_length
         encoded = json.dumps(header, separators=(",", ":")).encode()
         encoded += b" " * (-len(encoded) % 8)
