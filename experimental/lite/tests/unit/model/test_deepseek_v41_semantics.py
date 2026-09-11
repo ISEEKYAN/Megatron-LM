@@ -983,3 +983,415 @@ def test_v41_image_processor_rejects_mutations(monkeypatch, mutation):
         monkeypatch.setattr(data, 'image_token_types', wrong)
     with pytest.raises(AssertionError):
         test_v41_image_processor_official((125, 97), None, monkeypatch)
+def test_v41_packed_record_preserves_every_sequence(moe):
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+        attach_router_replay,
+        detach_router_replay,
+    )
+
+    _, bundle = _assembly_bundle()
+    model = bundle.chunks[0]
+    try:
+        assert attach_router_replay(model) == 40
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        ids = torch.tensor([[3, 4, 5, 6, 7]])
+        with torch.no_grad():
+            model(ids, cu_seqlens=torch.tensor([0, 2, 5], dtype=torch.int32))
+        actual = [x.clone() for x in RouterReplay.get_recorded_data()]
+        assert all(
+            x.shape == (5, 6) for x in actual
+        ), 'G2_PACKED_RECORD_LOSS: [2,3] sequences must retain all five routing rows'
+        expected = []
+        for row in (ids[:, :2], ids[:, 2:]):
+            with torch.no_grad():
+                model(row)
+            expected.append([x.clone() for x in RouterReplay.get_recorded_data()])
+        assert all(
+            torch.equal(x, torch.cat([a, b])) for x, a, b in zip(actual, *expected)
+        ), 'G2_PACKED_BOUNDARY: packed routing differs from independent sequence routing'
+    finally:
+        RouterReplay.clear_global_state()
+        detach_router_replay(model)
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.parametrize('cp_rank', [0, 1])
+def test_v41_replay_contiguous_cp_pp_alignment(cp_rank):
+    from megatron.lite.model import protocol_utils
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.runtime.backends.mlite.router_replay import (
+        RouterReplayDriver,
+        _protocol_fn,
+    )
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    ps = SimpleNamespace(
+        tp_size=1,
+        tp_rank=0,
+        cp_size=2,
+        cp_rank=cp_rank,
+        cp_group=None,
+        pp_size=2,
+        pp_rank=1,
+    )
+    model = SimpleNamespace(ps=ps)
+    ids = torch.arange(12)
+    mask = torch.tensor([1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0], dtype=torch.bool)
+    batch = PackedBatch(ids, ids, torch.tensor([5, 7]), r3_replay_mask=mask)
+    rows = [
+        torch.arange(5 * 4 * 2).reshape(5, 4, 2),
+        torch.arange(7 * 4 * 2).reshape(7, 4, 2) + 100,
+    ]
+    routed = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+    driver = RouterReplayDriver(SimpleNamespace(_extras={}, _model=model), 'replay')
+    driver._ps, driver._num_routers, driver._pp_offset, driver._pp_total = ps, 2, 2, 4
+    local_layers = driver._select_local_layers(routed)
+    pack = _protocol_fn(
+        protocol, 'pack_routed_experts', protocol_utils.pack_routed_experts
+    )
+    pack_mask = _protocol_fn(
+        protocol, 'pack_r3_replay_mask', protocol_utils.pack_r3_replay_mask
+    )
+    actual, actual_mask = pack(model, batch, local_layers), pack_mask(model, batch)
+    # E contiguous metadata pads [5,7] to [6,8]; CP cuts inside sample two.
+    full = torch.zeros(14, 4, 2, dtype=torch.long)
+    full[:5], full[6:13] = rows
+    full_mask = torch.zeros(14, dtype=torch.bool)
+    full_mask[:5], full_mask[6:13] = mask[:5], mask[5:]
+    expected = full[cp_rank * 7 : (cp_rank + 1) * 7, 2:4]
+    assert torch.equal(
+        torch.stack(actual, dim=1), expected
+    ), 'G2_CONTIGUOUS_ROUTES: CP token order or PP global layer selection differs'
+    assert torch.equal(
+        actual_mask, full_mask[cp_rank * 7 : (cp_rank + 1) * 7]
+    ), 'G2_CONTIGUOUS_MASK: replay mask must share the contiguous CP token layout'
+
+
+def test_v41_driver_record_replay_roundtrip_and_fail_loud(moe):
+    from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    proto, bundle = _assembly_bundle()
+    model = bundle.chunks[0]
+    ids = torch.tensor([3, 4, 5, 6, 7])
+    batch = PackedBatch(
+        ids,
+        ids,
+        torch.tensor([2, 3]),
+        torch.ones(5),
+        r3_replay_mask=torch.tensor([1, 0, 1, 1, 0], dtype=torch.bool),
+    )
+    handle = SimpleNamespace(_model=model, _extras={'protocol': proto})
+    record = RouterReplayDriver(handle, 'record')
+    try:
+        record.begin()
+        expected = record.wrap(bundle.forward_step)(model, batch)
+        assert (
+            'routed_experts' in expected
+        ), 'G2_RECORD_OUTPUT: runtime must return recorded routes'
+        expected['loss'].backward()
+        gradients = {
+            name: p.grad.clone()
+            for name, p in model.named_parameters()
+            if p.grad is not None
+        }
+    finally:
+        record.end()
+    model.zero_grad(set_to_none=True)
+    batch.routed_experts = expected['routed_experts']
+    replay = RouterReplayDriver(handle, 'replay')
+    try:
+        replay.begin()
+        actual = replay.wrap(bundle.forward_step)(model, batch)
+        torch.testing.assert_close(
+            actual['logits'],
+            expected['logits'],
+            atol=3e-5,
+            rtol=3e-5,
+            msg='G2_REPLAY_LOGITS: identical-weight record/replay baseline differs',
+        )
+        actual['loss'].backward()
+        for name, p in model.named_parameters():
+            if name in gradients:
+                torch.testing.assert_close(
+                    p.grad,
+                    gradients[name],
+                    atol=3e-5,
+                    rtol=3e-5,
+                    msg=f'G2_REPLAY_GRADIENT: identical-route backward differs: {name}',
+                )
+    finally:
+        replay.end()
+    with pytest.raises(RuntimeError, match='active replay driver'):
+        bundle.forward_step(model, batch)
+
+
+def test_v41_replay_stage_roots_follow_e_global_slots():
+    from megatron.lite.model.deepseek_v41.lite import protocol
+
+    a, b = torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)
+    stage = SimpleNamespace(layers=[None, None, a, b], local_layer_range=(2, 4))
+    assert protocol.router_replay_roots(SimpleNamespace(module=stage)) == [a, b]
+    stage.layers[0] = a
+    with pytest.raises(ValueError, match='stage-owned global layer slots'):
+        protocol.router_replay_roots(stage)
+
+
+def _v41_replay_parallel_worker(rank, rendezvous, pp, tp):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.primitive.modules.router import SigmoidTopKRouter
+    from megatron.lite.primitive.modules.router_replay import (
+        PackedRouterReplay,
+        RouterReplay,
+        RouterReplayAction,
+        attach_router_replay,
+        detach_router_replay,
+    )
+    from megatron.lite.primitive.parallel.state import init_parallel
+    from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+    from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
+
+    torch.cuda.set_device(rank)
+    device = torch.device('cuda', rank)
+    dist.init_process_group(
+        'nccl',
+        init_method=rendezvous,
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=120),
+    )
+    model = torch.nn.Module()
+    try:
+        ps = init_parallel(ParallelConfig(tp=tp, cp=2, pp=pp, ep=2))
+        start, end = ((0, 1) if ps.pp_rank == 0 else (1, 4)) if pp == 2 else (0, 4)
+        cfg = SimpleNamespace(
+            hidden_size=4,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            routed_scaling_factor=1.0,
+        )
+        model.layers = torch.nn.ModuleList(
+            [
+                (
+                    SigmoidTopKRouter(cfg, ps, compute_aux_loss=False).to(device)
+                    if start <= i < end
+                    else None
+                )
+                for i in range(4)
+            ]
+        )
+        model.ps, model.local_layer_range = ps, (start, end)
+        ids = torch.arange(12, device=device)
+        mask = torch.tensor(
+            [1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 1, 0], device=device, dtype=torch.bool
+        )
+        batch = PackedBatch(
+            ids, ids, torch.tensor([5, 7], device=device), r3_replay_mask=mask
+        )
+        # Independent E padding: TP1 [6,8], TP2 [8,8]; retain global sample positions.
+        second_start, total = (6, 14) if tp == 1 else (8, 16)
+        local_size = total // (2 * tp)
+        offset = ps.cp_rank * (total // 2) + ps.tp_rank * local_size
+        tokens = torch.arange(offset, offset + local_size, device=device)
+        base = torch.stack([((tokens + i) % 7).float() / 3 for i in range(4)], dim=-1)
+        local_routers = protocol.router_replay_roots(model)
+        # No-feature baseline, before any hook is attached.
+        baseline = [
+            router.route_logits(base.roll(start + i, dims=-1))
+            for i, router in enumerate(local_routers)
+        ]
+        attach_router_replay(model)
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        scope = PackedRouterReplay(local_size)
+        recorded_scores = [[] for _ in local_routers]
+        # Two segments exercise per-checkpoint concatenation independently of the scheduler.
+        for lo, hi in ((0, 1), (1, local_size)):
+            with scope.sequence(lo, hi):
+                for i, router in enumerate(local_routers):
+                    scores, _ = router.route_logits(
+                        base[lo:hi].roll(start + i, dims=-1)
+                    )
+                    recorded_scores[i].append(scores)
+        scope.finish()
+        recorded = RouterReplay.get_recorded_data()
+        for i, (scores, indices) in enumerate(baseline):
+            assert torch.equal(
+                recorded[i], indices
+            ), 'G2_GPU_BASELINE: recording changed native routes'
+            torch.testing.assert_close(
+                torch.cat(recorded_scores[i]),
+                scores,
+                atol=0,
+                rtol=0,
+                msg='G2_GPU_BASELINE: recording changed native scores',
+            )
+        # All stage-local forwards have finished; this is the E post-drain seam.
+        dist.barrier()
+        routes = protocol.unpack_recorded_routed_experts(
+            model, batch, recorded, pipeline_drained=True
+        )
+        assert all(
+            row.shape[1:] == (4, 2) for row in routes.unbind()
+        ), 'G2_GPU_PP_GATHER: variable-width stage routes lost global layer columns'
+        batch.routed_experts = routes
+        detach_router_replay(model)
+        RouterReplay.clear_global_router_replay_instances()
+        driver = RouterReplayDriver(
+            SimpleNamespace(_model=model, _extras={'protocol': protocol}), 'replay'
+        )
+        driver.begin()
+        try:
+            local_routes = driver._select_local_layers(routes)
+            targets = protocol.pack_routed_experts(model, batch, local_routes)
+            local_mask = protocol.pack_r3_replay_mask(model, batch)
+            expected_mask = torch.zeros(total, dtype=torch.bool, device=device)
+            expected_mask[:5], expected_mask[second_start : second_start + 7] = (
+                mask[:5],
+                mask[5:],
+            )
+            assert torch.equal(
+                local_mask, expected_mask[offset : offset + local_size]
+            ), 'G2_GPU_CP_MASK: mask differs from independently sliced contiguous tokens'
+            for actual, expected in zip(targets, recorded):
+                assert torch.equal(
+                    actual[local_mask], expected[local_mask]
+                ), 'G2_GPU_CP_PP_ROUTES: record/gather/pack changed active token or layer positions'
+            logits = (-base).detach().requires_grad_()
+
+            def forward(_model, _batch):
+                scope = PackedRouterReplay(local_size)
+                outputs = [[] for _ in local_routers]
+                for lo, hi in ((0, 1), (1, local_size)):
+                    with scope.sequence(lo, hi):
+                        for i, router in enumerate(local_routers):
+                            scores, indices = router.route_logits(
+                                logits[lo:hi].roll(start + i, dims=-1)
+                            )
+                            outputs[i].append(scores * (indices + 1))
+                scope.finish()
+                return {
+                    'loss': sum(torch.cat(parts).square().sum() for parts in outputs)
+                }
+
+            actual = driver.wrap(forward)(model, batch)['loss']
+            actual.backward()
+            reference_logits = logits.detach().clone().requires_grad_()
+            reference = 0
+            for i, target in enumerate(targets):
+                dense = reference_logits.roll(start + i, dims=-1).sigmoid()
+                native = torch.sort(dense.topk(2, dim=-1).indices, dim=-1).values
+                selected = torch.where(local_mask[:, None], target, native)
+                scores = dense.gather(1, selected)
+                scores = scores / scores.sum(-1, keepdim=True)
+                reference = reference + (scores * (selected + 1)).square().sum()
+            reference.backward()
+            torch.testing.assert_close(
+                actual,
+                reference,
+                atol=2e-5,
+                rtol=2e-5,
+                msg='G2_GPU_REPLAY_VALUE: replay differs from independent live scores',
+            )
+            torch.testing.assert_close(
+                logits.grad,
+                reference_logits.grad,
+                atol=2e-5,
+                rtol=2e-5,
+                msg='G2_GPU_REPLAY_GRADIENT: route/mask boundary gradient differs',
+            )
+        finally:
+            driver.end()
+    finally:
+        RouterReplay.clear_global_state()
+        RouterReplay.clear_global_router_replay_instances()
+        dist.destroy_process_group()
+
+
+@pytest.mark.gpus(4)
+@pytest.mark.parametrize('pp,tp', [(2, 1), (1, 2)])
+def test_v41_replay_parallel_primitives(tmp_path, pp, tp):
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() < 4:
+        pytest.skip(
+            'Routing replay parallel coverage requires at least 4 visible GPUs.'
+        )
+
+    mp.spawn(
+        _v41_replay_parallel_worker,
+        args=(f'file://{tmp_path / "replay-rendezvous"}', pp, tp),
+        nprocs=4,
+        join=True,
+    )
+
+
+def test_v41_pp_record_fails_before_stage_collectives():
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.primitive.parallel import ParallelState
+    from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+
+    model = SimpleNamespace(layers=[torch.nn.Linear(2, 2)], ps=ParallelState(pp_size=2))
+    handle = SimpleNamespace(_model=model, _extras={'protocol': protocol})
+    with pytest.raises(NotImplementedError, match='post-drain route collection'):
+        RouterReplayDriver(handle, 'record').begin()
+
+
+def test_v41_replay_forward_keeps_named_boundary_failure():
+    from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+
+    batch = SimpleNamespace(routed_experts=torch.zeros(1, 1, 1, 1, dtype=torch.long))
+    proto = SimpleNamespace(
+        pack_routed_experts=lambda *args: [], pack_r3_replay_mask=lambda *args: None
+    )
+    driver = RouterReplayDriver(
+        SimpleNamespace(_model=None, _extras={'protocol': proto}), 'replay'
+    )
+    driver._num_routers = 1
+
+    def unavailable(model, batch):
+        raise NotImplementedError('E_PIPELINE_BOUNDARY_NOT_READY')
+
+    with pytest.raises(NotImplementedError, match='E_PIPELINE_BOUNDARY_NOT_READY'):
+        driver.wrap(unavailable)(None, batch)
+
+
+def test_v41_replay_keeps_legacy_padding_default():
+    from megatron.lite.model import protocol_utils
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.primitive.parallel import ParallelState
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    model = SimpleNamespace(ps=ParallelState(cp_size=2))
+    batch = PackedBatch(torch.arange(12), torch.arange(12), torch.tensor([5, 7]))
+    routes = torch.nested.as_nested_tensor(
+        [torch.arange(5).reshape(5, 1, 1), torch.arange(7).reshape(7, 1, 1) + 10],
+        layout=torch.jagged,
+    )
+    legacy = protocol_utils.pack_routed_experts(model, batch, routes, contiguous=True)[
+        0
+    ]
+    current = protocol.pack_routed_experts(model, batch, routes)[0]
+    assert legacy[:, 0].tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        0,
+        0,
+        0,
+    ], 'G2_LEGACY_PADDING: existing DS4/GLM contiguous slicing must keep its old alignment'
+    assert current[:, 0].tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        0,
+        10,
+    ], 'G2_E_PADDING: V4.1 must use E TP*CP alignment and keep the cross-sample CP boundary'
