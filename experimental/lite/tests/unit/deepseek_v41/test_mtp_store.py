@@ -20,7 +20,9 @@ def write_archive(path, tensors):
     for name, (dtype, shape, raw) in tensors.items():
         start = len(payload)
         payload.extend(raw)
-        header[name] = dict(dtype=dtype, shape=shape, data_offsets=[start, len(payload)])
+        header[name] = dict(
+            dtype=dtype, shape=shape, data_offsets=[start, len(payload)]
+        )
     encoded = json.dumps(header).encode()
     encoded += b" " * (-len(encoded) % 8)
     path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
@@ -50,37 +52,59 @@ def test_byte_cards_roundtrip_and_repartition(tmp_path):
             assert restored.read(name) == raw
             assert restored.entries[name].dtype == dtype
             assert restored.entries[name].shape == tuple(shape)
-            assert restored.entries[name].payload_digest == original[name]["payload_digest"]
+            assert (
+                restored.entries[name].payload_digest
+                == original[name]["payload_digest"]
+            )
 
 
 def test_complete_synthetic_mtp_namespace(tmp_path):
-    spec = Path(__file__).resolve().parents[3] / "docs/contracts/deepseek_v41/weights.json"
+    spec = (
+        Path(__file__).resolve().parents[3] / "docs/contracts/deepseek_v41/weights.json"
+    )
     families = json.loads(spec.read_text())["families"]
     names = sorted(
         family["pattern"].format(*indices)
-        for family in families if family["pattern"].startswith("mtp.")
+        for family in families
+        if family["pattern"].startswith("mtp.")
         for indices in itertools.product(*family["indices"])
     )
     assert len(names) == len(set(names)) == 2401
-    tensors = {name: ("I8", [4], i.to_bytes(4, "little")) for i, name in enumerate(names)}
+    tensors = {
+        name: ("I8", [4], i.to_bytes(4, "little")) for i, name in enumerate(names)
+    }
     src = tmp_path / "synthetic.safetensors"
     write_archive(src, tensors)
     store = CheckpointTensorStore.load([src], expected_keys=names)
-    merged = CheckpointTensorStore.merge([store.shard(r, 7) for r in range(7)], expected_keys=names)
+    merged = CheckpointTensorStore.merge(
+        [store.shard(r, 7) for r in range(7)], expected_keys=names
+    )
     dst = tmp_path / "repartitioned.safetensors"
     merged.save(dst)
     restored = CheckpointTensorStore.load([dst], expected_keys=names)
     assert {k: restored.read(k) for k in names} == {k: v[2] for k, v in tensors.items()}
-    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
-        "weight_map": {name: src.name for name in names}
-    }))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: src.name for name in names}})
+    )
     config = b'{"text_config":{"dspark_block_size":5}}\n'
     (tmp_path / "config.json").write_bytes(config)
-    validator = Path(__file__).resolve().parents[3] / "tools/deepseek_v41/validate_mtp_store.py"
-    result = subprocess.run([
-        sys.executable, str(validator), "--checkpoint", str(tmp_path),
-        "--output", str(tmp_path / "validated"), "--storage-ranks", "7",
-    ], text=True, capture_output=True)
+    validator = (
+        Path(__file__).resolve().parents[3] / "tools/deepseek_v41/validate_mtp_store.py"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(validator),
+            "--checkpoint",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "validated"),
+            "--storage-ranks",
+            "7",
+        ],
+        text=True,
+        capture_output=True,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "MTP_BYTE_ROUNDTRIP_OK keys=2401 bytes=9604 ranks=7" in result.stdout
     assert (tmp_path / "validated/config.json").read_bytes() == config
@@ -108,14 +132,17 @@ def test_missing_extra_duplicate_and_backing_mutation(tmp_path):
     assert not (tmp_path / "bad.safetensors").exists()
 
 
-@pytest.mark.parametrize("header,payload", [
-    ({"x": dict(dtype="I8", shape=[2], data_offsets=[0, 1])}, b"x"),
-    ({"x": dict(dtype="I8", shape=[-1], data_offsets=[0, 1])}, b"x"),
-    ({"x": dict(dtype="UNKNOWN", shape=[1], data_offsets=[0, 1])}, b"x"),
-    ({"x": dict(dtype="I8", shape=[1], data_offsets=[1, 2])}, b"xy"),
-    ({"x": dict(dtype="I8", shape=[2], data_offsets=[0, 2])}, b"x"),
-    ({"x": dict(dtype="I8", shape=[1], data_offsets=[0, 1])}, b"xy"),
-])
+@pytest.mark.parametrize(
+    "header,payload",
+    [
+        ({"x": dict(dtype="I8", shape=[2], data_offsets=[0, 1])}, b"x"),
+        ({"x": dict(dtype="I8", shape=[-1], data_offsets=[0, 1])}, b"x"),
+        ({"x": dict(dtype="UNKNOWN", shape=[1], data_offsets=[0, 1])}, b"x"),
+        ({"x": dict(dtype="I8", shape=[1], data_offsets=[1, 2])}, b"xy"),
+        ({"x": dict(dtype="I8", shape=[2], data_offsets=[0, 2])}, b"x"),
+        ({"x": dict(dtype="I8", shape=[1], data_offsets=[0, 1])}, b"xy"),
+    ],
+)
 def test_invalid_headers_fail(tmp_path, header, payload):
     encoded = json.dumps(header).encode()
     src = tmp_path / "invalid.safetensors"
@@ -147,7 +174,9 @@ def test_mixed_release_shard_and_independent_reader(tmp_path):
         for name, (_, shape, raw) in CARDS.items():
             tensor = reader.get_tensor(name)
             assert list(tensor.shape) == shape
-            assert bytes(tensor.view(__import__("torch").uint8).flatten().tolist()) == raw
+            assert (
+                bytes(tensor.view(__import__("torch").uint8).flatten().tolist()) == raw
+            )
 
 
 def test_immutable_entries_and_invalid_rank(tmp_path):
