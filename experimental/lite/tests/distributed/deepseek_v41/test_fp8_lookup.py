@@ -45,3 +45,29 @@ def test_published_lookup_native_gemm_and_backward(trainable, monkeypatch):
                 expected_grad[ids[token, head]] += contribution[head]
         assert table.master.grad.dtype == torch.float32
         torch.testing.assert_close(table.master.grad, expected_grad, atol=1e-3, rtol=1e-5)
+
+
+def test_streamed_checkpoint_provider_stays_on_gpu(tmp_path):
+    from safetensors.torch import save_file
+    from megatron.lite.model.deepseek_v41.lite.checkpoint_store import CheckpointTensorStore
+    from megatron.lite.model.deepseek_v41.lite.engram import ShardedEngramTable
+    from megatron.lite.primitive.modules.engram_lookup import RowLookup
+
+    assert os.environ.get('SLURM_JOB_ID') and torch.cuda.is_available()
+    name = 'layers.0.engram.embed.weight'
+    values = (torch.arange(7 * 256) % 120).byte().reshape(7, 256).view(torch.float8_e4m3fn)
+    scales = torch.full((7, 8), 127, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    path = tmp_path / 'table.safetensors'
+    save_file({name: values, name[:-6] + 'scale': scales}, path)
+    store = CheckpointTensorStore.load([path], expected_keys=[name, name[:-6] + 'scale'])
+    ids = torch.tensor([[6, 0, 6]], device='cuda')
+    for trainable in (False, True):
+        table = ShardedEngramTable.from_checkpoint(store, name, RowLookup((0, 7)), device='cuda', trainable=trainable, chunk_rows=2)
+        raw, scale, master = table.lookup_fp8(ids)
+        assert table.weight.device.type == table.scale.device.type == 'cuda'
+        assert torch.equal(raw.view(torch.uint8).cpu(), values.view(torch.uint8)[ids.cpu()])
+        assert torch.equal(scale.view(torch.uint8).cpu(), scales.view(torch.uint8)[ids.cpu()])
+        if trainable:
+            assert master.device.type == 'cuda' and master.dtype == torch.float32
+        else:
+            assert master is None and not list(table.parameters())

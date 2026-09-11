@@ -58,3 +58,26 @@ def test_loaded_provider_keeps_frozen_bytes_and_trainable_master(tmp_path):
         assert (table.master is not None) == trainable
         if trainable:
             assert table.master.dtype == torch.float32
+
+
+def test_stream_read_bound_is_chunk_rows_not_table_size(tmp_path, monkeypatch):
+    import builtins
+    store, name, _, _ = make_store(tmp_path)
+    original = builtins.open
+    requests = []
+    class Reader:
+        def __init__(self, file):
+            self.file = file
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.file.close()
+        def seek(self, offset):
+            return self.file.seek(offset)
+        def read(self, size=-1):
+            assert 0 <= size <= 2 * 256
+            requests.append(size)
+            return self.file.read(size)
+    monkeypatch.setattr(builtins, 'open', lambda *args, **kwargs: Reader(original(*args, **kwargs)))
+    load_engram_rows(store, name, intervals=((0, 3), (3, 7)), rank=1, device='cpu', chunk_rows=2)
+    assert max(requests) == 512
