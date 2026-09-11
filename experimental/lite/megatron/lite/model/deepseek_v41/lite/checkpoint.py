@@ -77,7 +77,7 @@ def load_weight(store, name, *, output_dtype=torch.bfloat16):
 # Assembly bindings retain exact module objects, including scale consumers.
 # Header validation is separate from key-only topology checks: the latter never
 # claim to have inspected release payloads or release tensor dimensions.
-def bind_checkpoint(model, records, *, store=None):
+def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
     from dataclasses import replace
 
     records = list(records)
@@ -92,7 +92,7 @@ def bind_checkpoint(model, records, *, store=None):
     available = {**model.tensor_bindings, **model.archival_bindings}
     expected = set(available)
     # The C reduced fixture intentionally excludes the complete inactive MTP tree.
-    if not any(name.startswith('mtp.') for name in names):
+    if allow_missing_mtp and not any(name.startswith('mtp.') for name in names):
         expected = {name for name in expected if not name.startswith('mtp.')}
     # Plain numerical exports have no quantization scale siblings.
     for name, header in headers.items():
@@ -190,9 +190,9 @@ def save_model(model, path):
     if path.exists():
         raise FileExistsError(path)
     archive = model.archival_store
-    required = {k for k in model.archival_bindings if not k.startswith('mtp.')}
+    required = set(model.archival_bindings)
     if archive is None or not required <= archive.entries.keys():
-        raise ValueError('Complete vision/aligner archival storage is required for export')
+        raise ValueError('Complete MTP/vision/aligner archival storage is required for export')
     if archive.entries.keys() - model.archival_bindings.keys():
         raise ValueError('Unknown archival keys')
     path.parent.mkdir(parents=True, exist_ok=True)

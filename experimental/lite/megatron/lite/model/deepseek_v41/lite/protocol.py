@@ -164,6 +164,8 @@ def export_hf_weights(chunks, model_cfg, ps, **kwargs):
     if kwargs:
         raise ValueError('Unsupported export options')
     model = _single(chunks)
+    if model.archival_store is None or set(model.archival_store.entries) != set(model.archival_bindings):
+        raise ValueError('Complete archival storage is required for export')
     yield from export_model(model)
     if model.archival_store is not None:
         from .checkpoint import _tensor

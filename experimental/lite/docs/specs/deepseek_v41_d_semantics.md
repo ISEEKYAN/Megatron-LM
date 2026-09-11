@@ -79,7 +79,8 @@ including frozen indexers. Each binding exposes `owner`, `attribute`, `role`,
 objects and roles instead of inferring optimizer groups from checkpoint names.
 `bind_checkpoint(model, records, store=...)` validates coverage and active
 shape/dtype/scale layout, then links keys to those same owners, headers and store.
-The C manifest exercises all 3,204 reduced entries. A separate meta allocation
+The C manifest exercises all 3,204 reduced entries with explicit
+`allow_missing_mtp=True`; production loads require the complete MTP key set. A separate meta allocation
 checks all 96,085 release keys from the A2 contract, including 2,401 MTP keys;
 that key-only check does not claim real release-header or payload inspection.
 
@@ -89,7 +90,7 @@ siblings, following C's plain-export decoder contract. Frozen Engram storage
 keeps its FP8 values/scales. Trainable tables export FP32 masters and regenerate
 resident storage on reload; callers must use `refresh_storage()` after accepted
 optimizer steps. Original nested config is retained. This is a training export,
-not a deployment quantization conversion. Saving requires the inactive vision
+not a deployment quantization conversion. Saving requires the inactive MTP, vision
 and aligner bytes to be present; it cannot fabricate checkpoint data for
 unimplemented modules.
 

@@ -473,14 +473,20 @@ def test_v41_config_rejects_unimplemented_topology(field, value):
 def _assembly_config():
     import json
     from pathlib import Path
-    from tools.deepseek_v41.config_mapping import MAPPING
-    from tools.deepseek_v41.fixtures import reduced_overrides
+    import importlib.util
     from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 
     root = Path(__file__).parents[2] / 'fixtures/deepseek_v41'
     release = json.loads((root / 'reference/config.json').read_text())
-    overrides = reduced_overrides()
-    for path, target in MAPPING.items():
+    modules = {}
+    for name in ('config_mapping', 'fixtures'):
+        path = Path(__file__).parents[3] / 'tools/deepseek_v41' / (name + '.py')
+        spec = importlib.util.spec_from_file_location('c4_' + name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        modules[name] = module
+    overrides = modules['fixtures'].reduced_overrides()
+    for path, target in modules['config_mapping'].MAPPING.items():
         if target in overrides:
             parts = path.split('.')
             section = release
@@ -564,18 +570,20 @@ def test_v41_fixture_headers_and_complete_release_key_owners(moe):
         'tensors'
     ]
     _, bundle = _assembly_bundle(device='meta')
-    bindings = bind_checkpoint(bundle.chunks[0], records)
+    bindings = bind_checkpoint(bundle.chunks[0], records, allow_missing_mtp=True)
     assert len(bindings) == 3204
+    with pytest.raises(ValueError, match='coverage'):
+        bind_checkpoint(bundle.chunks[0], records)
     # Quantization scales are owned by the same live module as their weights.
     assert bindings['layers.0.attn.wo_a.scale'].owner is bundle.chunks[0].layers[0].attn.wo_a
     bad = [dict(r) for r in records]
     next(r for r in bad if r['name'] == 'layers.0.attn.wq_a.weight')['shape'] = [1, 1]
     with pytest.raises(ValueError, match='shape'):
-        bind_checkpoint(bundle.chunks[0], bad)
+        bind_checkpoint(bundle.chunks[0], bad, allow_missing_mtp=True)
     with pytest.raises(ValueError, match='coverage'):
-        bind_checkpoint(bundle.chunks[0], records[1:])
+        bind_checkpoint(bundle.chunks[0], records[1:], allow_missing_mtp=True)
     with pytest.raises(ValueError, match='duplicate'):
-        bind_checkpoint(bundle.chunks[0], records + records[:1])
+        bind_checkpoint(bundle.chunks[0], records + records[:1], allow_missing_mtp=True)
     release = json.loads((root / 'tests/fixtures/deepseek_v41/reference/config.json').read_text())
     with torch.device('meta'):
         model = DeepseekV41Model(DeepseekV41Config(release))
