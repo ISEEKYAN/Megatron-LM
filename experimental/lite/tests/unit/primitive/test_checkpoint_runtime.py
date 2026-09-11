@@ -118,7 +118,9 @@ class DistOptLike:
         self.update_legacy_format = update_legacy_format
 
 
-def test_runtime_local_checkpoint_uses_optimizer_parameter_state_contract(tmp_path):
+def test_runtime_local_checkpoint_uses_optimizer_parameter_state_contract(tmp_path, monkeypatch):
+    # This test exercises single-process file names, independent of suite order.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     torch.manual_seed(2030)
     model = TinyMLP()
     optimizer = DistOptLike(torch.optim.AdamW(model.parameters(), lr=1.0e-3))
@@ -204,7 +206,9 @@ def test_runtime_local_checkpoint_uses_rank_specific_files_when_distributed(tmp_
         )
 
 
-def test_primitive_local_checkpoint_keeps_optimizer_checkpoints_local(tmp_path):
+def test_primitive_local_checkpoint_keeps_optimizer_checkpoints_local(tmp_path, monkeypatch):
+    # This test exercises single-process file names, independent of suite order.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     model = TinyMLP()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
 

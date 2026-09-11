@@ -670,7 +670,9 @@ def _weight_owner(module: nn.Module) -> nn.Module | None:
 
 def apply_olora_tail_init(model: nn.Module) -> dict[str, int]:
     from megatron.lite.primitive.modules.lora_apply import (
-        LoRAWrappedGroupedLinear, LoRAWrappedLinear)
+        LoRAWrappedGroupedLinear,
+        LoRAWrappedLinear,
+    )
 
     stats = {"initialized": 0, "skipped": 0}
     for module in model.modules():

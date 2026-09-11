@@ -206,5 +206,4 @@ def _optional_verl_imports():
     pytest.importorskip("verl", reason="VERL is required for this optional example test.")
     global MegatronLiteEngineConfig, MegatronLiteEngine, _build_lr_scheduler
     from verl_mlite.engine.config import MegatronLiteEngineConfig
-    from verl_mlite.engine.mlite_engine import (MegatronLiteEngine,
-                                                _build_lr_scheduler)
+    from verl_mlite.engine.mlite_engine import MegatronLiteEngine, _build_lr_scheduler

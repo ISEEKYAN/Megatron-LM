@@ -10,12 +10,14 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from megatron.lite.primitive.optimizers.fsdp2 import (
-    FSDP2Config, FSDP2Optimizer, all_reduce_scalar_,
-    clip_grads_with_sharded_norm_, fsdp2_available)
-from megatron.lite.primitive.optimizers.fsdp2.adamw import \
-    build_adamw_optimizer
-from megatron.lite.primitive.optimizers.fsdp2.wrap import \
-    build_fsdp2_shard_placement_fn
+    FSDP2Config,
+    FSDP2Optimizer,
+    all_reduce_scalar_,
+    clip_grads_with_sharded_norm_,
+    fsdp2_available,
+)
+from megatron.lite.primitive.optimizers.fsdp2.adamw import build_adamw_optimizer
+from megatron.lite.primitive.optimizers.fsdp2.wrap import build_fsdp2_shard_placement_fn
 from megatron.lite.primitive.parallel.state import ParallelState
 
 pytestmark = pytest.mark.mlite

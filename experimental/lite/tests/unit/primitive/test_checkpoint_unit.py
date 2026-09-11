@@ -6,7 +6,6 @@ import copy
 import pytest
 import torch
 import torch.nn as nn
-
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
@@ -108,7 +107,9 @@ class DistOptLike:
         self.parameter_load_calls = int(state["parameter_save_calls"])
 
 
-def test_runtime_checkpoint_uses_optimizer_state_dict_contract(tmp_path):
+def test_runtime_checkpoint_uses_optimizer_state_dict_contract(tmp_path, monkeypatch):
+    # This test exercises single-process file names, independent of suite order.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     torch.manual_seed(2030)
     model = TinyMLP()
     optimizer = DistOptLike(torch.optim.AdamW(model.parameters(), lr=1.0e-3))

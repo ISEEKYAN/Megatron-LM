@@ -5,32 +5,28 @@ from typing import Any
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
-# Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core. The
-# lite CSA module reuses Core's differentiable kernels, CP row-mapping utilities,
-# and CuTeDSL layout kernels rather than vendoring them; see the module docstring
-# of ``csa_cp_utils`` / ``csa_cp_layout_kernels`` for the exact contracts.
+from megatron.lite.primitive.modules.attention.dsa import rotate_activation
+from megatron.lite.primitive.parallel.state import ParallelState
+from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range, _yarn_linear_ramp_mask
+
+# Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core.
+# The development branch groups them under the csa_utils package.
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.experimental_attention_variant import (
-    csa_cp_layout_kernels,
-    csa_cp_utils as cp_utils,
-)
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_utils,
+    thd_layout_kernels,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
+    FusedCSAIndexerSparseAttnFromTopkFunc,
+    csa_sparse_attn,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
-)
-from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
-    FusedIndexerSparseAttnFromTopkFunc,
-    dsa_sparse_attn,
-)
-from megatron.lite.primitive.modules.attention.dsa import rotate_activation
-from megatron.lite.primitive.parallel.state import ParallelState
-from megatron.lite.primitive.utils.rotary import (
-    _yarn_find_correction_range,
-    _yarn_linear_ramp_mask,
 )
 
 
@@ -41,6 +37,9 @@ class GroupedLinear(nn.Module):
         self.out_features = out_features
         self.n_groups = n_groups
         self.weight = nn.Parameter(torch.empty(out_features, in_features_per_group))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -149,13 +148,17 @@ class CompressedSequenceCompressor(nn.Module):
         self.overlap = compress_ratio == 4
         self.coff = 2 if self.overlap else 1
         self.rotate = rotate
+        self.initializer_range = config.initializer_range
         self.wkv = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
         self.wgate = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
         self.ape = nn.Parameter(
             torch.empty(compress_ratio, self.coff * head_dim, dtype=torch.float32)
         )
         self.norm = te.RMSNorm(head_dim, eps=config.rms_norm_eps)
-        nn.init.normal_(self.ape, mean=0.0, std=config.initializer_range)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.ape, mean=0.0, std=self.initializer_range)
 
     def _overlap_transform(self, tensor: torch.Tensor, fill_value: float) -> torch.Tensor:
         bsz, n_blocks, ratio, _, head_dim = tensor.shape
@@ -226,6 +229,7 @@ class CompressedSequenceCompressor(nn.Module):
         *,
         max_seqlen_q: int,
         compressed_group_ids: torch.Tensor,
+        compressed_position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, None]:
         """Pre-grouped THD compression for the DSv4 CP path.
 
@@ -233,7 +237,9 @@ class CompressedSequenceCompressor(nn.Module):
         already packed into ratio-sized groups by
         ``cp_utils.prepare_cp_compressor_input``; ``compressed_group_ids`` is
         ``(compact_group_capacity,)`` int32 giving each compressed group's
-        per-sequence compressed id (its RoPE position is ``id * ratio``).
+        per-sequence compressed id. ``compressed_position_ids`` optionally
+        supplies the graph-safe RoPE positions emitted by Core's compaction
+        kernel.
 
         Reproduces Core ``Compressor._forward_thd`` pre-grouped semantics using
         lite's compressor params (``wkv``/``wgate``/``ape``/``norm``) and lite's
@@ -263,7 +269,11 @@ class CompressedSequenceCompressor(nn.Module):
         weights = torch.softmax(gate_grouped.float(), dim=1).to(kv_grouped.dtype)
         compressed = (kv_grouped * weights).sum(dim=1)  # (total_comp, 1, head_dim)
         compressed = self.norm(compressed)
-        positions = compressed_group_ids[:total_comp].clamp_min(0).to(torch.long) * ratio
+        positions = (
+            compressed_position_ids[:total_comp]
+            if compressed_position_ids is not None
+            else compressed_group_ids[:total_comp].clamp_min(0) * ratio
+        ).to(torch.long)
         cos, sin = build_compressed_rope_cos_sin(
             positions.view(1, total_comp),
             self.rope_head_dim,
@@ -866,26 +876,20 @@ class CompressedSparseAttention(nn.Module):
         calculate_per_token_loss = self.calculate_per_token_loss
 
         if self.compressor is not None and ratio > 1:
-            compressed_lens = torch.div(
-                cu_seqlens[1:] - cu_seqlens[:-1], ratio, rounding_mode="floor"
+            (
+                hidden_compact,
+                compressed_group_ids,
+                compressed_position_ids,
+                _local_cu_seqlens,
+                _local_cu_seqlens_compressed,
+                cu_seqlens_compressed,
+                seq_to_rank_row,
+            ) = cp_utils.prepare_cp_compressor_input(
+                x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
             )
-            cu_seqlens_compressed = torch.cat(
-                (
-                    torch.zeros_like(cu_seqlens[:1]),
-                    torch.cumsum(compressed_lens, dim=0, dtype=torch.int32),
-                )
-            )
-            hidden_compact, compressed_group_ids, seq_to_rank_row = (
-                cp_utils.prepare_cp_compressor_input(
-                    x,
-                    boundary_hidden,
-                    cu_seqlens,
-                    cu_seqlens_compressed,
-                    global_start,
-                    cp_size,
-                    ratio,
-                )
-            )
+            # TODO(lite): Thread the local prefixes through once Lite adopts Core's
+            # fused-compressor dispatch. Lite currently owns a separate eager
+            # ``_forward_thd`` implementation, so passing them alone has no effect.
 
             if indexer is not None:
                 indexer_x, indexer_qr = x.detach(), qr.detach()
@@ -920,6 +924,7 @@ class CompressedSparseAttention(nn.Module):
                     cu_seqlens,
                     max_seqlen_q=max_seqlen_q,
                     compressed_group_ids=compressed_group_ids,
+                    compressed_position_ids=compressed_position_ids,
                 )
                 k_indexer_rank_major = gather_from_sequence_parallel_region(
                     indexer_compressed_local.squeeze(1), group=cp_group
@@ -946,6 +951,7 @@ class CompressedSparseAttention(nn.Module):
                 cu_seqlens,
                 max_seqlen_q=max_seqlen_q,
                 compressed_group_ids=compressed_group_ids,
+                compressed_position_ids=compressed_position_ids,
             )
             compressed_kv_rank_major = gather_from_sequence_parallel_region(
                 compressed_kv_local.squeeze(1), group=cp_group
@@ -960,8 +966,8 @@ class CompressedSparseAttention(nn.Module):
             if compressed_topk is not None
             else (max_seqlen_q // ratio if ratio > 1 else 0)
         )
-        topk_idxs, topk_length, indexer_topk_rank_major = (
-            csa_cp_layout_kernels.build_attention_indices(
+        topk_idxs, topk_length, indexer_topk_rank_major, _ = (
+            thd_layout_kernels.build_attention_indices(
                 cu_seqlens,
                 global_start,
                 l_local,
@@ -973,6 +979,7 @@ class CompressedSparseAttention(nn.Module):
                 cu_seqlens_compressed=cu_seqlens_compressed,
                 seq_to_rank_row=seq_to_rank_row,
                 for_indexer_loss=use_indexer_loss,
+                compressed_rows=compressed_kv_rank_major.shape[0],
             )
         )
 
@@ -1007,7 +1014,7 @@ class CompressedSparseAttention(nn.Module):
                 positions = global_rows - cu_seqlens[batch_ids]
                 q_padding_mask = positions >= real_seqlens[batch_ids]
             apply_from_topk = (
-                FusedIndexerSparseAttnFromTopkFunc.apply
+                FusedCSAIndexerSparseAttnFromTopkFunc.apply
                 if self.apply_dsa_kernel_fusion
                 else _unfused_indexer_sparse_attn_from_topk
             )
@@ -1043,7 +1050,7 @@ class CompressedSparseAttention(nn.Module):
             return output.unsqueeze(1)
 
         if self.apply_dsa_kernel_fusion:
-            output = dsa_sparse_attn(
+            output = csa_sparse_attn(
                 query,
                 kv_full_thd,
                 self.sinks.float(),
