@@ -5,6 +5,7 @@ Exit 0 means no candidate-only failures; it does not mean either suite passed
 or that both logs exercised the same test inventory.
 """
 
+import gzip
 import hashlib
 import json
 import re
@@ -14,6 +15,8 @@ from pathlib import Path
 
 def read(path):
     raw = Path(path).read_bytes()
+    if str(path).endswith(".gz"):
+        raw = gzip.decompress(raw)
     text = raw.decode()
     outcomes = []
     for match in re.finditer(

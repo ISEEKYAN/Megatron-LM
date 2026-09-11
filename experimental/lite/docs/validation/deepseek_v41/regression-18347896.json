@@ -1,0 +1,36 @@
+{
+  "baseline": {
+    "path": "experimental/lite/docs/validation/deepseek_v41/regression-baseline-18342583.txt.gz",
+    "sha256": "d2d8dcadd7cc5e8f220b01d6bffbabc9c5c8c79bc6ee2016d6a82f41b52b3922",
+    "summary": "8 failed, 792 passed, 19 skipped, 1 xfailed, 31 warnings, 2 errors in 116.19s (0:01:56)",
+    "failures_and_errors": [
+      "ERROR collecting test_mlite_engine_metrics.py",
+      "ERROR collecting test_verl_mlite_engine_response_mask_packing.py",
+      "test_dynamic_shape_variable_len_recv_gloo",
+      "test_ep2_export_gather_matches_single_rank_reference_bitwise",
+      "test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch[deepseek_v4-deepseek_v4-_write_deepseek_v4_config-128-lengths2]",
+      "test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch[glm5-glm_moe_dsa-_write_glm5_config-32-lengths1]",
+      "test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch[kimi_k2-deepseek_v3-_write_kimi_config-128-lengths0]",
+      "test_pp_export_never_materializes_the_whole_stage",
+      "test_pp_export_streams_over_nccl_and_matches_materialized",
+      "test_tp2_fused_gate_up_load_and_export_match_full_tensor_bitwise"
+    ]
+  },
+  "candidate": {
+    "path": "experimental/lite/docs/validation/deepseek_v41/regression-18347896.txt.gz",
+    "sha256": "f0924e4f2d01800503fc2e740acd7750f1ada1b47f2f2d24767dc143915e8dad",
+    "summary": "3 failed, 464 passed, 42 skipped, 1 xfailed, 37 warnings in 121.38s (0:02:01)",
+    "failures_and_errors": [
+      "test_dynamic_shape_variable_len_recv_gloo",
+      "test_pp_export_never_materializes_the_whole_stage",
+      "test_pp_export_streams_over_nccl_and_matches_materialized"
+    ]
+  },
+  "candidate_minus_baseline": [],
+  "regression_gate_passed": true,
+  "comparison_exit_code": 0,
+  "validated_code_commit": "9f72c3257f25bef83f729fb06a65c26b52bd1399",
+  "slurm_exit_code": "1:0",
+  "baseline_unit_test_files": 75,
+  "candidate_unit_test_files": 61
+}
