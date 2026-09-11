@@ -36,7 +36,8 @@ def main():
     ):
         name = f"packed{i}"
         seq.append(dict(id=name, tokens=packed["input_ids"][start:end]))
-        first = (end - start) if i == 0 else end - start - 2
+        # Start the shortest sequence before any ratio-2 group is complete.
+        first = 1 if i == 0 else end - start - 2
         chunks[name] = [dict(start_pos=0, length=first)] + [
             dict(start_pos=p, length=1) for p in range(first, end - start)
         ]
