@@ -1,0 +1,55 @@
+{
+  "artifacts": [
+    {
+      "artifact": "visual_classes",
+      "producer": "C4-I",
+      "consumers": [
+        "F3-I"
+      ]
+    },
+    {
+      "artifact": "injected_attention",
+      "producer": "D2-I",
+      "consumers": [
+        "D3-I"
+      ]
+    },
+    {
+      "artifact": "native_candidates_and_integration",
+      "producer": "D3-I",
+      "consumers": [
+        "D7-I"
+      ]
+    },
+    {
+      "artifact": "table_representation",
+      "producer": "E1e-S",
+      "consumers": [
+        "C4-I",
+        "F2-I"
+      ]
+    },
+    {
+      "artifact": "optimizer_representation",
+      "producer": "E2-S",
+      "consumers": [
+        "C4-I",
+        "F2-I"
+      ]
+    },
+    {
+      "artifact": "optimizer_algorithm",
+      "producer": "F1-I",
+      "consumers": [
+        "F2-I"
+      ]
+    },
+    {
+      "artifact": "indexer_training",
+      "producer": "D6-I",
+      "consumers": [
+        "G1-I"
+      ]
+    }
+  ]
+}

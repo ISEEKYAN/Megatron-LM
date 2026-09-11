@@ -1,0 +1,2329 @@
+[
+  {
+    "id": "B3-S",
+    "title": "B3-S: fixture dimensions, weights, position/margin/tie rules from A1\u2013A4",
+    "acceptance_criteria": [
+      "fixture dimensions, weights, position/margin/tie rules from A1\u2013A4",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "G1 actual dimensions and weights; never label a reduced fixture full-model parity",
+    "source": "deepseek_v41_phases_bg_v4.md (row B3)"
+  },
+  {
+    "id": "B1-S",
+    "title": "B1-S: official wrapper input/output and instrumentation contract",
+    "acceptance_criteria": [
+      "official wrapper input/output and instrumentation contract",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "G1 full-size official generation/forward comparison",
+    "source": "deepseek_v41_phases_bg_v4.md (row B1)"
+  },
+  {
+    "id": "B2-S",
+    "title": "B2-S: independent report-derived differentiable equations, objectives and update vectors; list unknown training choices",
+    "acceptance_criteria": [
+      "independent report-derived differentiable equations, objectives and update vectors; list unknown training choices",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O16"
+    ],
+    "blocking_open": [
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "D/F native backward/update; unknown official objectives remain blocked",
+    "source": "deepseek_v41_phases_bg_v4.md (row B2)"
+  },
+  {
+    "id": "C1-S",
+    "title": "C1-S: A2 header/payload/decode contract",
+    "acceptance_criteria": [
+      "A2 header/payload/decode contract",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "C4 full binding; G1 actual shards",
+    "source": "deepseek_v41_phases_bg_v4.md (row C1)"
+  },
+  {
+    "id": "C2a-S",
+    "title": "C2a-S: A3 main KV E2M1, group16/E4M3, no second global scale, post-RoPE, post-training only",
+    "acceptance_criteria": [
+      "A3 main KV E2M1, group16/E4M3, no second global scale, post-RoPE, post-training only",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O15"
+    ],
+    "blocking_open": [
+      "O15"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "D2 sparse ABI and G1 phase transition",
+    "source": "deepseek_v41_phases_bg_v4.md (row C2a)"
+  },
+  {
+    "id": "C2b-S",
+    "title": "C2b-S: A3 index Q/K E2M1 group32/E8M0, independent QAT switch",
+    "acceptance_criteria": [
+      "A3 index Q/K E2M1 group32/E8M0, independent QAT switch",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "D2/D6",
+    "source": "deepseek_v41_phases_bg_v4.md (row C2b)"
+  },
+  {
+    "id": "C2c-S",
+    "title": "C2c-S: A3 SWA full-vector post-RoPE FP8 and Linear dynamic activation FP8, separate policies",
+    "acceptance_criteria": [
+      "A3 SWA full-vector post-RoPE FP8 and Linear dynamic activation FP8, separate policies",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "D2/D4 and G1; BF16 decode+GEMM alone is insufficient",
+    "source": "deepseek_v41_phases_bg_v4.md (row C2c)"
+  },
+  {
+    "id": "C3-S",
+    "title": "C3-S: A2 inactive MTP carrier, original config, independent execution flag",
+    "acceptance_criteria": [
+      "A2 inactive MTP carrier, original config, independent execution flag",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "C4/G1; MTP excluded from trainable coverage but included in checkpoint coverage",
+    "source": "deepseek_v41_phases_bg_v4.md (row C3)"
+  },
+  {
+    "id": "C4-S",
+    "title": "C4-S: consume A1\u2013A4, all 96085 keys and 87 config leaves; declare canonical owner/alias, header\u2192logical weight binding and protocol contract",
+    "acceptance_criteria": [
+      "consume A1\u2013A4, all 96085 keys and 87 config leaves; declare canonical owner/alias, header\u2192logical weight binding and protocol contract",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "F2 actual optimizer enumeration; E distributed binding and G1 real-size all-key load",
+    "source": "deepseek_v41_phases_bg_v4.md (row C4)"
+  },
+  {
+    "id": "E1e-S",
+    "title": "E1e-S: repeated/unvisited rows and FP8 update publication contract below",
+    "acceptance_criteria": [
+      "repeated/unvisited rows and FP8 update publication contract below",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance.",
+      "Obtain evidence or approved policy for post-training Engram trainability before update implementation; O08/O09 remain unresolved. If frozen, obtain explicit scope adjustment and separately audit token embedding/head optimizer needs.",
+      "Verify native FP32 main_grad rather than widened BF16 gradients, and FP32 momentum; state dtype policy does not resolve table trainability."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O08",
+      "O09",
+      "O17"
+    ],
+    "blocking_open": [
+      "O08",
+      "O09",
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion.",
+      "Engram tables/scales remain GPU-resident; no CPU table offload or host/RDMA prefetch; account for approved state/workspace in memory budget."
+    ],
+    "deferred_gate": "E2/E5 distributed updates",
+    "source": "deepseek_v41_phases_bg_v4.md (row E1e)"
+  },
+  {
+    "id": "E2-S",
+    "title": "E2-S: A4 Algorithm1, logical whole-matrix statistics and training-state precision decisions",
+    "acceptance_criteria": [
+      "A4 Algorithm1, logical whole-matrix statistics and training-state precision decisions",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance.",
+      "Obtain evidence or approved policy for post-training Engram trainability before update implementation; O08/O09 remain unresolved. If frozen, obtain explicit scope adjustment and separately audit token embedding/head optimizer needs.",
+      "Verify native FP32 main_grad rather than widened BF16 gradients, and FP32 momentum; state dtype policy does not resolve table trainability."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O08",
+      "O09"
+    ],
+    "blocking_open": [
+      "O08",
+      "O09"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E4 mixed backend/E5 restore",
+    "source": "deepseek_v41_phases_bg_v4.md (row E2)"
+  },
+  {
+    "id": "D1-S",
+    "title": "D1-S: corrected A1 shifted mHC and paired CED state",
+    "acceptance_criteria": [
+      "corrected A1 shifted mHC and paired CED state",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E3 paired payload, recompute, PP",
+    "source": "deepseek_v41_phases_bg_v4.md (row D1)"
+  },
+  {
+    "id": "D2-S",
+    "title": "D2-S: corrected A1/A3 owner/mode/operator decisions and C formats",
+    "acceptance_criteria": [
+      "corrected A1/A3 owner/mode/operator decisions and C formats",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O15"
+    ],
+    "blocking_open": [
+      "O15"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E3/E4 state transport and kernel ABI; G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row D2)"
+  },
+  {
+    "id": "D3-S",
+    "title": "D3-S: A3 two-level candidate builder, post-training switch",
+    "acceptance_criteria": [
+      "A3 two-level candidate builder, post-training switch",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E4 CP positions",
+    "source": "deepseek_v41_phases_bg_v4.md (row D3)"
+  },
+  {
+    "id": "D4-S",
+    "title": "D4-S: official Engram hash and computation",
+    "acceptance_criteria": [
+      "official Engram hash and computation",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E1/E2 table training",
+    "source": "deepseek_v41_phases_bg_v4.md (row D4)"
+  },
+  {
+    "id": "D5-S",
+    "title": "D5-S: modality-specific load update reference, rate 0.001 and sequence auxiliary coefficient 0.0001; unresolved reduction scope stays explicit",
+    "acceptance_criteria": [
+      "modality-specific load update reference, rate 0.001 and sequence auxiliary coefficient 0.0001; unresolved reduction scope stays explicit",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O16"
+    ],
+    "blocking_open": [
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E4 cross-rank reduction/atomic step; E5 restart; G2 replay",
+    "source": "deepseek_v41_phases_bg_v4.md (row D5)"
+  },
+  {
+    "id": "D6-S",
+    "title": "D6-S: exact indexer objective, coefficient, normalization, detach, consumer contribution table; unknown choices block official training acceptance",
+    "acceptance_criteria": [
+      "exact indexer objective, coefficient, normalization, detach, consumer contribution table; unknown choices block official training acceptance",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O12",
+      "O16"
+    ],
+    "blocking_open": [
+      "O12",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E3/E4 shared owner gradient delivery; G1 training",
+    "source": "deepseek_v41_phases_bg_v4.md (row D6)"
+  },
+  {
+    "id": "D7-S",
+    "title": "D7-S: A1/A3 packed sequence-local history and visibility",
+    "acceptance_criteria": [
+      "A1/A3 packed sequence-local history and visibility",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E4 real runtime full-THD\u2192CP-local and non-skip gradient parity",
+    "source": "deepseek_v41_phases_bg_v4.md (row D7)"
+  },
+  {
+    "id": "E0-S",
+    "title": "E0-S: owner/replica/optimizer-shard layout and relation to dense/expert rank decompositions",
+    "acceptance_criteria": [
+      "owner/replica/optimizer-shard layout and relation to dense/expert rank decompositions",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E1\u2013E4 collective execution",
+    "source": "deepseek_v41_phases_bg_v4.md (row E0)"
+  },
+  {
+    "id": "E1a-S",
+    "title": "E1a-S: 24 rows/token \u00d7256=6144 features, routing IDs/scales",
+    "acceptance_criteria": [
+      "24 rows/token \u00d7256=6144 features, routing IDs/scales",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion.",
+      "Engram tables/scales remain GPU-resident; no CPU table offload or host/RDMA prefetch; account for approved state/workspace in memory budget."
+    ],
+    "deferred_gate": "G1 size",
+    "source": "deepseek_v41_phases_bg_v4.md (row E1a)"
+  },
+  {
+    "id": "E1b-S",
+    "title": "E1b-S: A2 streaming intervals/header identity",
+    "acceptance_criteria": [
+      "A2 streaming intervals/header identity",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion.",
+      "Engram tables/scales remain GPU-resident; no CPU table offload or host/RDMA prefetch; account for approved state/workspace in memory budget."
+    ],
+    "deferred_gate": "G1 actual table load",
+    "source": "deepseek_v41_phases_bg_v4.md (row E1b)"
+  },
+  {
+    "id": "E1c-S",
+    "title": "E1c-S: FP8 values/scales ABI, distinct numerical and performance contracts",
+    "acceptance_criteria": [
+      "FP8 values/scales ABI, distinct numerical and performance contracts",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion.",
+      "Engram tables/scales remain GPU-resident; no CPU table offload or host/RDMA prefetch; account for approved state/workspace in memory budget."
+    ],
+    "deferred_gate": "G1 representative performance",
+    "source": "deepseek_v41_phases_bg_v4.md (row E1c)"
+  },
+  {
+    "id": "E1d-S",
+    "title": "E1d-S: local-batch prefetch before stage microbatches; buffered gradient return after backbone backward, dependency events",
+    "acceptance_criteria": [
+      "local-batch prefetch before stage microbatches; buffered gradient return after backbone backward, dependency events",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion.",
+      "Engram tables/scales remain GPU-resident; no CPU table offload or host/RDMA prefetch; account for approved state/workspace in memory budget."
+    ],
+    "deferred_gate": "F3 overlap/G1 performance",
+    "source": "deepseek_v41_phases_bg_v4.md (row E1d)"
+  },
+  {
+    "id": "E3-S",
+    "title": "E3-S: paired HC/CED payload, shadow indexers, per-microbatch state lifetime",
+    "acceptance_criteria": [
+      "paired HC/CED payload, shadow indexers, per-microbatch state lifetime",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E5/G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row E3)"
+  },
+  {
+    "id": "E4-S",
+    "title": "E4-S: TP score reduction, EP modality loads, CP global/local positions and mixed backend state contract",
+    "acceptance_criteria": [
+      "TP score reduction, EP modality loads, CP global/local positions and mixed backend state contract",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance.",
+      "Verify native FP32 main_grad rather than widened BF16 gradients, and FP32 momentum; state dtype policy does not resolve table trainability."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O17"
+    ],
+    "blocking_open": [
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E5/G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row E4)"
+  },
+  {
+    "id": "E5t-S",
+    "title": "E5t-S: text training restart trajectory",
+    "acceptance_criteria": [
+      "text training restart trajectory",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O17"
+    ],
+    "blocking_open": [
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row E5t)"
+  },
+  {
+    "id": "E5v-S",
+    "title": "E5v-S: F3 multimodal stage transition restart",
+    "acceptance_criteria": [
+      "F3 multimodal stage transition restart",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance.",
+      "Use explicit post-training trainability mask; O05/O06 pretraining unfreeze/LR transitions are N/A and do not establish that vision is frozen."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O17"
+    ],
+    "blocking_open": [
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row E5v)"
+  },
+  {
+    "id": "F1-S",
+    "title": "F1-S: A4 logical head/matrix split and audited Muon backend revision/API",
+    "acceptance_criteria": [
+      "A4 logical head/matrix split and audited Muon backend revision/API",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance.",
+      "Audit actual DS4 algorithm/group/shape/LR/decay for inherited families; reject unsupported vision mapping or silent numeric defaults. Apply Engram e_proj/e_norm 5x only if trainable."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E4 TP/FSDP logical reassembly",
+    "source": "deepseek_v41_phases_bg_v4.md (row F1)"
+  },
+  {
+    "id": "F2-S",
+    "title": "F2-S: A4 all-column OPEN ledger below, active-phase resolution records",
+    "acceptance_criteria": [
+      "A4 all-column OPEN ledger below, active-phase resolution records",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance.",
+      "Use explicit post-training trainability mask; O05/O06 pretraining unfreeze/LR transitions are N/A and do not establish that vision is frozen.",
+      "Audit actual DS4 algorithm/group/shape/LR/decay for inherited families; reject unsupported vision mapping or silent numeric defaults. Apply Engram e_proj/e_norm 5x only if trainable.",
+      "Verify native FP32 main_grad rather than widened BF16 gradients, and FP32 momentum; state dtype policy does not resolve table trainability."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E4 mixed backend/E5/G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row F2)"
+  },
+  {
+    "id": "F3-S",
+    "title": "F3-S: A4 visual schedule, preprocessing, spans, external-encoder sync and gradient contract",
+    "acceptance_criteria": [
+      "A4 visual schedule, preprocessing, spans, external-encoder sync and gradient contract",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance.",
+      "Use explicit post-training trainability mask; O05/O06 pretraining unfreeze/LR transitions are N/A and do not establish that vision is frozen."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E5v/G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row F3)"
+  },
+  {
+    "id": "G2-S",
+    "title": "G2-S: external routes payload coordinates and segment contract",
+    "acceptance_criteria": [
+      "external routes payload coordinates and segment contract",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "G1 combined training",
+    "source": "deepseek_v41_phases_bg_v4.md (row G2)"
+  },
+  {
+    "id": "G1-S",
+    "title": "G1-S: actual config/weights, memory placement, dtype/phase matrix, numeric thresholds and runtime fixture manifest",
+    "acceptance_criteria": [
+      "actual config/weights, memory placement, dtype/phase matrix, numeric thresholds and runtime fixture manifest",
+      "Publish reviewed interfaces, precision and independent expected fixtures; consume the named A prerequisites and resolved policy without reopening them.",
+      "Enumerate active decision IDs and run validate_deepseek_v41_plan.py with each --active-decision ID; unresolved active choices block acceptance."
+    ],
+    "dependencies": [],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        2,
+        6
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O15"
+    ],
+    "blocking_open": [
+      "O15"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "Final acceptance; cannot close on resource readiness alone",
+    "source": "deepseek_v41_phases_bg_v4.md (row G1)"
+  },
+  {
+    "id": "B3-I",
+    "title": "B3-I: `tests/fixtures/deepseek_v41/manifest.json` and generator; retain 40-layer ownership, all three CSA2 modes, both Engrams, CED boundary, nonaligned packed/image spans",
+    "acceptance_criteria": [
+      "`tests/fixtures/deepseek_v41/manifest.json` and generator; retain 40-layer ownership, all three CSA2 modes, both Engrams, CED boundary, nonaligned packed/image spans",
+      "`test_fixtures.py`: check generated shapes, owner identities, reproducibility and hand-known sentinels",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "B3-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "G1 actual dimensions and weights; never label a reduced fixture full-model parity",
+    "source": "deepseek_v41_phases_bg_v4.md (row B3)"
+  },
+  {
+    "id": "B1-I",
+    "title": "B1-I: `tools/deepseek_v41/oracle.py`; build official ModelArgs and converted shards from B3, execute original methods, expose all-token head output and named CED intermediates",
+    "acceptance_criteria": [
+      "`tools/deepseek_v41/oracle.py`; build official ModelArgs and converted shards from B3, execute original methods, expose all-token head output and named CED intermediates",
+      "`test_oracle.py`: independent official execution comparison, complete weight/token coverage, deterministic seeds; use A5 AST-extracted executable dataflow probes, including their eleven mutations",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "B1-S",
+      "B3-I"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        24,
+        64
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "G1 full-size official generation/forward comparison",
+    "source": "deepseek_v41_phases_bg_v4.md (row B1)"
+  },
+  {
+    "id": "B2-I",
+    "title": "B2-I: `tests/reference/deepseek_v41/training.py`; scalar/float64 reference independent of native kernels",
+    "acceptance_criteria": [
+      "`tests/reference/deepseek_v41/training.py`; scalar/float64 reference independent of native kernels",
+      "`test_training_reference.py`: analytical versus finite-difference checks where smooth, detach and sum-of-consumer checks; discrete selections held fixed",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "B2-S",
+      "B3-I"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O12"
+    ],
+    "blocking_open": [
+      "O12",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "D/F native backward/update; unknown official objectives remain blocked",
+    "source": "deepseek_v41_phases_bg_v4.md (row B2)"
+  },
+  {
+    "id": "E0-I",
+    "title": "E0-I: `model/deepseek_v41/lite/parallel.py`",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/parallel.py`",
+      "`test_ownership.py`: logical coverage/no overlap, aliases/shadows one owner; dedicated groups do not imply a new orthogonal axis",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "B3-I",
+      "E0-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E1\u2013E4 collective execution",
+    "source": "deepseek_v41_phases_bg_v4.md (row E0)"
+  },
+  {
+    "id": "C1-I",
+    "title": "C1-I: `model/deepseek_v41/lite/checkpoint.py` FP4 packed I8 and FP8 block [32,32] decoding",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/checkpoint.py` FP4 packed I8 and FP8 block [32,32] decoding",
+      "`test_checkpoint_decode.py`: independent official decode, known code values and loaded GEMM; separate raw-byte roundtrip including header dtype/shape/digest",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "B1-I",
+      "C1-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "C4 full binding; G1 actual shards",
+    "source": "deepseek_v41_phases_bg_v4.md (row C1)"
+  },
+  {
+    "id": "C2a-I",
+    "title": "C2a-I: `primitive/quantization/ds41_kv.py`",
+    "acceptance_criteria": [
+      "`primitive/quantization/ds41_kv.py`",
+      "`test_kv_quantization.py`: codes/scales, rounding/ties, zero, saturation, dequantized values and separately approved fake-quant derivative",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "B1-I",
+      "C2a-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O15"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "D2 sparse ABI and G1 phase transition",
+    "source": "deepseek_v41_phases_bg_v4.md (row C2a)"
+  },
+  {
+    "id": "C2b-I",
+    "title": "C2b-I: `primitive/quantization/ds41_index.py`",
+    "acceptance_criteria": [
+      "`primitive/quantization/ds41_index.py`",
+      "`test_index_quantization.py`: the same distinct format-level checks plus input gradients; main-KV off must not disable index QAT",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "B1-I",
+      "C2b-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "D2/D6",
+    "source": "deepseek_v41_phases_bg_v4.md (row C2b)"
+  },
+  {
+    "id": "C2c-I",
+    "title": "C2c-I: `primitive/quantization/ds41_fp8.py`",
+    "acceptance_criteria": [
+      "`primitive/quantization/ds41_fp8.py`",
+      "`test_fp8_quantization.py`: official rounding/scale/saturation and actual Linear GEMM, input/weight derivatives under declared training policy",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "B1-I",
+      "C2c-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "D2/D4 and G1; BF16 decode+GEMM alone is insufficient",
+    "source": "deepseek_v41_phases_bg_v4.md (row C2c)"
+  },
+  {
+    "id": "D1-I",
+    "title": "D1-I: `model/deepseek_v41/lite/block.py`; attention consumes pre_mix, FFN consumes attn_pre, return ffn_pre, initial/final contraction",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/block.py`; attention consumes pre_mix, FFN consumes attn_pre, return ffn_pre, initial/final contraction",
+      "`test_hc_boundary.py`: B1 real sublayer/CED values and B2 gradients; distinct residual copies and old/new coefficients make wrong contraction observable",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "B1-I",
+      "B2-I",
+      "D1-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O12",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E3 paired payload, recompute, PP",
+    "source": "deepseek_v41_phases_bg_v4.md (row D1)"
+  },
+  {
+    "id": "D5-I",
+    "title": "D5-I: `model/deepseek_v41/lite/moe.py` and generic router capability extension in `primitive/modules/router.py`",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/moe.py` and generic router capability extension in `primitive/modules/router.py`",
+      "`test_moe.py`: bias crosses selected/unselected boundary, unbiased gate weights stay correct; compare two bias updates' signs/values and empty-modality behavior",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "B1-I",
+      "B2-I",
+      "D5-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O12",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E4 cross-rank reduction/atomic step; E5 restart; G2 replay",
+    "source": "deepseek_v41_phases_bg_v4.md (row D5)"
+  },
+  {
+    "id": "F1-I",
+    "title": "F1-I: `primitive/optimizers/headwise_muon.py`",
+    "acceptance_criteria": [
+      "`primitive/optimizers/headwise_muon.py`",
+      "`test_muon.py`: at least two distinct heads with independently different whole-matrix/head-wise updates; reject always-vanilla; actual backend type and state checked",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution.",
+      "Audit actual DS4 algorithm/group/shape/LR/decay for inherited families; reject unsupported vision mapping or silent numeric defaults. Apply Engram e_proj/e_norm 5x only if trainable."
+    ],
+    "dependencies": [
+      "B2-I",
+      "F1-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O12",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E4 TP/FSDP logical reassembly",
+    "source": "deepseek_v41_phases_bg_v4.md (row F1)"
+  },
+  {
+    "id": "C3-I",
+    "title": "C3-I: `model/deepseek_v41/lite/checkpoint_store.py`; 2401 MTP keys in file/CPU carrier and independent storage shards",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/checkpoint_store.py`; 2401 MTP keys in file/CPU carrier and independent storage shards",
+      "`test_mtp_store.py`: load/save/repartition bytes identical; original dspark_block_size=5 accepted with enable_dspark_execution=False; execution request raises NotImplementedError",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "C1-I",
+      "C3-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "C4/G1; MTP excluded from trainable coverage but included in checkpoint coverage",
+    "source": "deepseek_v41_phases_bg_v4.md (row C3)"
+  },
+  {
+    "id": "E1b-I",
+    "title": "E1b-I: checkpoint loader row streaming",
+    "acceptance_criteria": [
+      "checkpoint loader row streaming",
+      "`test_table_load.py`: reconstruct source bytes, reject gaps/overlaps without materializing full table per rank",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "C1-I",
+      "E0-I",
+      "E1b-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [],
+    "blocked_by_open": false,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion.",
+      "Engram tables/scales remain GPU-resident; no CPU table offload or host/RDMA prefetch; account for approved state/workspace in memory budget."
+    ],
+    "deferred_gate": "G1 actual table load",
+    "source": "deepseek_v41_phases_bg_v4.md (row E1b)"
+  },
+  {
+    "id": "D4-I",
+    "title": "D4-I: `model/deepseek_v41/lite/engram.py`; NFKC/accent removal/lowercase, odd multiplier with 10007*layer_id, prime buckets, token_mask excludes images, no short causal convolution; wkv and per-HC-copy RMS, signed-sqrt sigmoid gate",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/engram.py`; NFKC/accent removal/lowercase, odd multiplier with 10007*layer_id, prime buckets, token_mask excludes images, no short causal convolution; wkv and per-HC-copy RMS, signed-sqrt sigmoid gate",
+      "`test_engram.py`: known integer hashes plus B1 forward/B2 derivatives, perturb seed/offset/reset and reject specific wrong values",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "B1-I",
+      "B2-I",
+      "C2c-I",
+      "D4-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O12",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E1/E2 table training",
+    "source": "deepseek_v41_phases_bg_v4.md (row D4)"
+  },
+  {
+    "id": "D2-I",
+    "title": "D2-I: `model/deepseek_v41/lite/attention.py`; explicit source state and CSA2 modes without extra decoder projection",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/attention.py`; explicit source state and CSA2 modes without extra decoder projection",
+      "`test_attention.py`: B1 CED intermediates and all consumer outputs using injected official candidate masks (no native builder claim), B2 floating KV gradient sums; ranking-reversal fixture crosses Top-K boundary; same-source replay is positive equivalence",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "C2a-I",
+      "C2b-I",
+      "C2c-I",
+      "D1-I",
+      "D2-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        24,
+        64
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O12",
+      "O15",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E3/E4 state transport and kernel ABI; G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row D2)"
+  },
+  {
+    "id": "E1a-I",
+    "title": "E1a-I: `primitive/modules/engram_lookup.py`",
+    "acceptance_criteria": [
+      "`primitive/modules/engram_lookup.py`",
+      "Slurm `tests/distributed/deepseek_v41/test_lookup.py`: sharded versus unsharded raw values/scales bitwise, uneven shards/repeated IDs",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "D4-I",
+      "E0-I",
+      "E1a-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O12",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion.",
+      "Engram tables/scales remain GPU-resident; no CPU table offload or host/RDMA prefetch; account for approved state/workspace in memory budget."
+    ],
+    "deferred_gate": "G1 size",
+    "source": "deepseek_v41_phases_bg_v4.md (row E1a)"
+  },
+  {
+    "id": "D3-I",
+    "title": "D3-I: `model/deepseek_v41/lite/candidates.py`",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/candidates.py`",
+      "`test_candidates.py`: independently compare layer20 pool membership then later Reindex selection; newest reachable block pinned, -inf blocks excluded, incomplete/empty tails handled, pool-outside winner from different later scores; mandatory native D2+D3 consumer integration parity after D3",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "D2-I",
+      "D3-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O12",
+      "O15",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E4 CP positions",
+    "source": "deepseek_v41_phases_bg_v4.md (row D3)"
+  },
+  {
+    "id": "D6-I",
+    "title": "D6-I: `model/deepseek_v41/lite/indexer_loss.py`; consume loss autoscaler through protocol",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/indexer_loss.py`; consume loss autoscaler through protocol",
+      "`test_indexer_loss.py`: independent objective value, input/parameter gradients and distinct multiple-consumer sums; reject wrong sign, coefficient, normalization, detach and omitted consumer",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "B2-I",
+      "D2-I",
+      "D6-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O12"
+    ],
+    "blocking_open": [
+      "O12",
+      "O15",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E3/E4 shared owner gradient delivery; G1 training",
+    "source": "deepseek_v41_phases_bg_v4.md (row D6)"
+  },
+  {
+    "id": "E1c-I",
+    "title": "E1c-I: lookup\u2192FP8 GEMM adapter",
+    "acceptance_criteria": [
+      "lookup\u2192FP8 GEMM adapter",
+      "Slurm `test_fp8_lookup.py`: actual values/scales passed to GEMM, independently matched arithmetic with approved thresholds",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "C2c-I",
+      "E1a-I",
+      "E1b-I",
+      "E1c-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O12",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion.",
+      "Engram tables/scales remain GPU-resident; no CPU table offload or host/RDMA prefetch; account for approved state/workspace in memory budget."
+    ],
+    "deferred_gate": "G1 representative performance",
+    "source": "deepseek_v41_phases_bg_v4.md (row E1c)"
+  },
+  {
+    "id": "D7-I",
+    "title": "D7-I: `model/deepseek_v41/lite/packing.py`, protocol shared THD split helper",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/packing.py`, protocol shared THD split helper",
+      "`test_packing.py`: independent versus packed with fixed weights/bias/RNG/loss normalization and isolated auxiliary statistics; backprop only B loss, perturb A, compare B output/input gradients/parameter contribution and integer hash/visibility",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "D3-I",
+      "D4-I",
+      "D5-I",
+      "D7-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O12",
+      "O15",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E4 real runtime full-THD\u2192CP-local and non-skip gradient parity",
+    "source": "deepseek_v41_phases_bg_v4.md (row D7)"
+  },
+  {
+    "id": "E1d-I",
+    "title": "E1d-I: `model/deepseek_v41/lite/prefetch.py`",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/prefetch.py`",
+      "Slurm `test_prefetch.py`: nonzero distinct step/microbatch gradient tags; reject lost, duplicate, stale returns; compare actual accumulated vectors",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "E1c-I",
+      "E1d-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O12",
+      "O16"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion.",
+      "Engram tables/scales remain GPU-resident; no CPU table offload or host/RDMA prefetch; account for approved state/workspace in memory budget."
+    ],
+    "deferred_gate": "F3 overlap/G1 performance",
+    "source": "deepseek_v41_phases_bg_v4.md (row E1d)"
+  },
+  {
+    "id": "C4-I",
+    "title": "C4-I: `model/deepseek_v41/{config.py,__init__.py,lite/model.py,lite/protocol.py,lite/checkpoint.py,lite/vision.py}` plus `model/registry.py`; compose D modules, backbone, vision and aligner, preserve full module tree in text-only mode",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/{config.py,__init__.py,lite/model.py,lite/protocol.py,lite/checkpoint.py,lite/vision.py}` plus `model/registry.py`; compose D modules, backbone, vision and aligner, preserve full module tree in text-only mode",
+      "`test_model_binding.py`: nested config reaches actual behavior, every key has a header/store/owner mapping, every active parameter is bound once; construct via registry and run protocol; forward/binding first; training export subgate after active decisions close: backbone changed, MTP bytes unchanged",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "C3-I",
+      "C4-S",
+      "D7-I",
+      "E1e-S",
+      "E2-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        24,
+        64
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O09"
+    ],
+    "blocking_open": [
+      "O08",
+      "O09",
+      "O12",
+      "O15",
+      "O16",
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "F2 actual optimizer enumeration; E distributed binding and G1 real-size all-key load",
+    "source": "deepseek_v41_phases_bg_v4.md (row C4)"
+  },
+  {
+    "id": "E1e-I",
+    "title": "E1e-I: `model/deepseek_v41/lite/table_state.py`",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/table_state.py`",
+      "`test_table_update.py`: sub-FP8-step repeated updates accumulate, repeated row coalescing, momentum updates unvisited rows, next-step version and restore",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution.",
+      "Obtain evidence or approved policy for post-training Engram trainability before update implementation; O08/O09 remain unresolved. If frozen, obtain explicit scope adjustment and separately audit token embedding/head optimizer needs.",
+      "Verify native FP32 main_grad rather than widened BF16 gradients, and FP32 momentum; state dtype policy does not resolve table trainability."
+    ],
+    "dependencies": [
+      "B2-I",
+      "E1d-I",
+      "E1e-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O08",
+      "O09",
+      "O12",
+      "O16",
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion.",
+      "Engram tables/scales remain GPU-resident; no CPU table offload or host/RDMA prefetch; account for approved state/workspace in memory budget."
+    ],
+    "deferred_gate": "E2/E5 distributed updates",
+    "source": "deepseek_v41_phases_bg_v4.md (row E1e)"
+  },
+  {
+    "id": "E3-I",
+    "title": "E3-I: protocol/pipeline payload extension",
+    "acceptance_criteria": [
+      "protocol/pipeline payload extension",
+      "Slurm `test_pipeline.py`: different consumer gradient vectors match exact reference sum, single owner update; interleaving/recompute retain p20 and generation tags; stale reads rejected",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "C4-I",
+      "E0-I",
+      "E3-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        24,
+        64
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O08",
+      "O09",
+      "O12",
+      "O15",
+      "O16",
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E5/G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row E3)"
+  },
+  {
+    "id": "F2-I",
+    "title": "F2-I: `model/deepseek_v41/lite/optimizer_groups.py`",
+    "acceptance_criteria": [
+      "`model/deepseek_v41/lite/optimizer_groups.py`",
+      "`test_optimizer_groups.py`: enumerate C4 actual objects, exactly one justified group per owner, reject unknown/alias duplicate/unresolved active field; no catch-all defaults",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution.",
+      "Use explicit post-training trainability mask; O05/O06 pretraining unfreeze/LR transitions are N/A and do not establish that vision is frozen.",
+      "Audit actual DS4 algorithm/group/shape/LR/decay for inherited families; reject unsupported vision mapping or silent numeric defaults. Apply Engram e_proj/e_norm 5x only if trainable.",
+      "Verify native FP32 main_grad rather than widened BF16 gradients, and FP32 momentum; state dtype policy does not resolve table trainability."
+    ],
+    "dependencies": [
+      "C4-I",
+      "E1e-S",
+      "E2-S",
+      "F1-I",
+      "F2-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O08",
+      "O09"
+    ],
+    "blocking_open": [
+      "O08",
+      "O09",
+      "O12",
+      "O15",
+      "O16",
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E4 mixed backend/E5/G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row F2)"
+  },
+  {
+    "id": "E2-I",
+    "title": "E2-I: `primitive/optimizers/sinkhorn.py`",
+    "acceptance_criteria": [
+      "`primitive/optimizers/sinkhorn.py`",
+      "`test_sinkhorn.py` and Slurm `test_sinkhorn_shards.py`: actual W/M after several steps versus independent A4 scalar reference across row/column cuts/replicas",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution.",
+      "Obtain evidence or approved policy for post-training Engram trainability before update implementation; O08/O09 remain unresolved. If frozen, obtain explicit scope adjustment and separately audit token embedding/head optimizer needs.",
+      "Verify native FP32 main_grad rather than widened BF16 gradients, and FP32 momentum; state dtype policy does not resolve table trainability."
+    ],
+    "dependencies": [
+      "E0-I",
+      "E1e-I",
+      "E2-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        24,
+        48
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": "~1200 lines discussed for Sinkhorn; unvalidated estimate, contingent on trainability"
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O08",
+      "O09",
+      "O12",
+      "O16",
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E4 mixed backend/E5 restore",
+    "source": "deepseek_v41_phases_bg_v4.md (row E2)"
+  },
+  {
+    "id": "F3-I",
+    "title": "F3-I: protocol vision schedule consuming C4-owned `model/deepseek_v41/lite/vision.py`; F3 does not define the visual model classes",
+    "acceptance_criteria": [
+      "protocol vision schedule consuming C4-owned `model/deepseek_v41/lite/vision.py`; F3 does not define the visual model classes",
+      "`test_vision.py` then Slurm `test_vision_schedule.py`: official processor forward, independent differentiable serial baseline, real external copies/sync, trainable exceptions and transitions",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution.",
+      "Use explicit post-training trainability mask; O05/O06 pretraining unfreeze/LR transitions are N/A and do not establish that vision is frozen."
+    ],
+    "dependencies": [
+      "B1-I",
+      "B2-I",
+      "C4-I",
+      "F2-I",
+      "F3-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        24,
+        64
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O08",
+      "O09",
+      "O12",
+      "O15",
+      "O16",
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E5v/G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row F3)"
+  },
+  {
+    "id": "E4-I",
+    "title": "E4-I: generic transport/optimizer adapters plus V4.1 protocol wiring",
+    "acceptance_criteria": [
+      "generic transport/optimizer adapters plus V4.1 protocol wiring",
+      "Slurm `test_parallel_training.py`: real full packed THD split before local CP, forward/backward/update parity; actual mixed optimizer state placement, GPU-resident Engram tables, clip/atomic skip and bias updates; no Engram CPU offload",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution.",
+      "Verify native FP32 main_grad rather than widened BF16 gradients, and FP32 momentum; state dtype policy does not resolve table trainability."
+    ],
+    "dependencies": [
+      "E2-I",
+      "E3-I",
+      "E4-S",
+      "F2-I"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        24,
+        64
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O08",
+      "O09",
+      "O12",
+      "O15",
+      "O16",
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "E5/G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row E4)"
+  },
+  {
+    "id": "E5t-I",
+    "title": "E5t-I: checkpoint integration",
+    "acceptance_criteria": [
+      "checkpoint integration",
+      "Slurm `test_restart_text.py`: N uninterrupted versus k+save/load+(N-k), same data/RNG/scheduler; momentum/shards/bias/phase/owner state restored, pending prefetch drained/rebuilt",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "E4-I",
+      "E5t-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O08",
+      "O09",
+      "O12",
+      "O15",
+      "O16",
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row E5t)"
+  },
+  {
+    "id": "E5v-I",
+    "title": "E5v-I: visual/external encoder optimizer and scheduler restore",
+    "acceptance_criteria": [
+      "visual/external encoder optimizer and scheduler restore",
+      "Slurm `test_restart_vision.py`: same-total-step trajectory across save/load with the explicit post-training trainability mask; replicas and LR/state restored",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution.",
+      "Use explicit post-training trainability mask; O05/O06 pretraining unfreeze/LR transitions are N/A and do not establish that vision is frozen."
+    ],
+    "dependencies": [
+      "E4-I",
+      "E5v-S",
+      "F3-I"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O08",
+      "O09",
+      "O12",
+      "O15",
+      "O16",
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "G1",
+    "source": "deepseek_v41_phases_bg_v4.md (row E5v)"
+  },
+  {
+    "id": "G2-I",
+    "title": "G2-I: extend `primitive/modules/router_replay.py` and V4.1 protocol adapters",
+    "acceptance_criteria": [
+      "extend `primitive/modules/router_replay.py` and V4.1 protocol adapters",
+      "`test_replay.py` and Slurm `test_replay_parallel.py`: actual replay routing map, weights and gradients; D5 auxiliary/phase compatibility",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "C4-I",
+      "D5-I",
+      "E4-I",
+      "G2-S"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        8,
+        24
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [],
+    "blocking_open": [
+      "O08",
+      "O09",
+      "O12",
+      "O15",
+      "O16",
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "G1 combined training",
+    "source": "deepseek_v41_phases_bg_v4.md (row G2)"
+  },
+  {
+    "id": "G1-I",
+    "title": "G1-I: `tests/integration/deepseek_v41/run_acceptance.py` and Slurm recipe",
+    "acceptance_criteria": [
+      "`tests/integration/deepseek_v41/run_acceptance.py` and Slurm recipe",
+      "Real 40-layer/all-key model protocol: all-token text and multi-image forward against B1, loss/input+parameter gradients against declared references, real update/export, long-boundary cases, restart and replay",
+      "Run actual implementation against the S fixtures; record commands, exit status, numerical thresholds and applicable discriminating mutations. GPU tests require Slurm job ID, sacct rc=0 and non-skip execution."
+    ],
+    "dependencies": [
+      "D6-I",
+      "E5t-I",
+      "E5v-I",
+      "F3-I",
+      "G1-S",
+      "G2-I"
+    ],
+    "external_prerequisites": [
+      "Corrected A1/A3 and A2/A4 specifications named in plan section 0; verify content/ancestry before implementation"
+    ],
+    "estimate": {
+      "engineer_hours": [
+        24,
+        64
+      ],
+      "basis": "Planning range including independent fixtures, focused implementation and qualification; GPU queue excluded",
+      "conditional_loc": null
+    },
+    "direct_open": [
+      "O12",
+      "O16"
+    ],
+    "blocking_open": [
+      "O08",
+      "O09",
+      "O12",
+      "O15",
+      "O16",
+      "O17"
+    ],
+    "blocked_by_open": true,
+    "activation_note": "Conservative full training gate; O15 activates only for requested FP4-off diagnostics. An inactive decision requires an explicit profile; it is not automatically resolved.",
+    "constraints": [
+      "Post-training scope only; no DSpark forward or rollout generation.",
+      "Full-gate dependencies below are mandatory for acceptance; forward-only partial progress is not completion."
+    ],
+    "deferred_gate": "Final acceptance; cannot close on resource readiness alone",
+    "source": "deepseek_v41_phases_bg_v4.md (row G1)"
+  }
+]

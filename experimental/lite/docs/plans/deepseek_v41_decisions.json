@@ -1,0 +1,430 @@
+[
+  {
+    "id": "O01",
+    "question": "Engram e_proj LR",
+    "candidates": [
+      "1x",
+      "5x"
+    ],
+    "evidence_gap": "Policy resolved; implementation must demonstrate the selected DS4 backend behavior. See evidence note for unavailable DS4 equivalents.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "Engram active",
+    "blocks": [
+      "F2-I"
+    ],
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "5x base LR for Engram e_proj when trainable; does not decide table trainability",
+      "phase": "post-training (SFT/RL/OPD); conditional on owner being trainable",
+      "owners": [
+        "Engram wkv/e_proj"
+      ],
+      "approver": "bayan, 2026-09-11 project policy ruling",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    },
+    "prior_evidence_gap": "A4 lacks e_proj multiplier"
+  },
+  {
+    "id": "O02",
+    "question": "Engram e_norm LR",
+    "candidates": [
+      "1x",
+      "5x"
+    ],
+    "evidence_gap": "Policy resolved; implementation must demonstrate the selected DS4 backend behavior. See evidence note for unavailable DS4 equivalents.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "Engram active",
+    "blocks": [
+      "F2-I"
+    ],
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "5x base LR for Engram e_norm when trainable; does not decide table trainability",
+      "phase": "post-training (SFT/RL/OPD); conditional on owner being trainable",
+      "owners": [
+        "Engram q_weight/k_weight/e_norm"
+      ],
+      "approver": "bayan, 2026-09-11 project policy ruling",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    },
+    "prior_evidence_gap": "A4 lacks e_norm multiplier"
+  },
+  {
+    "id": "O03",
+    "question": "wo_a grouped Muon lowering",
+    "candidates": [
+      "logical grouped matrices",
+      "explicit approved lowering"
+    ],
+    "evidence_gap": "Policy resolved; implementation must demonstrate the selected DS4 backend behavior. See evidence note for unavailable DS4 equivalents.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "backbone training",
+    "blocks": [
+      "F1-I",
+      "F2-I"
+    ],
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "Inherit DS4 existing logical representation and optimizer grouping for wo_a; no new grouped-Muon lowering in this post-training port",
+      "phase": "post-training (SFT/RL/OPD); conditional on owner being trainable",
+      "owners": [
+        "backbone attn.wo_a"
+      ],
+      "approver": "bayan, 2026-09-11 project policy ruling",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    },
+    "prior_evidence_gap": "A4 grouping unresolved"
+  },
+  {
+    "id": "O04",
+    "question": "Vision fused gate/up grouping",
+    "candidates": [
+      "split logical gate/up",
+      "fused matrix"
+    ],
+    "evidence_gap": "Policy resolved; implementation must demonstrate the selected DS4 backend behavior. See evidence note for unavailable DS4 equivalents.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "vision unfrozen",
+    "blocks": [
+      "F2-I"
+    ],
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "Inherit DS4 existing fused gate/up representation and optimizer routing; no new split-Muon policy",
+      "phase": "post-training (SFT/RL/OPD); conditional on owner being trainable",
+      "owners": [
+        "vision gate/up"
+      ],
+      "approver": "bayan, 2026-09-11 project policy ruling",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    },
+    "prior_evidence_gap": "A4 fused grouping unresolved"
+  },
+  {
+    "id": "O05",
+    "question": "Encoder unfreeze LR",
+    "candidates": [
+      "evidence-derived smaller LR",
+      "approved port value"
+    ],
+    "evidence_gap": "Policy resolved; implementation must demonstrate the selected DS4 backend behavior. See evidence note for unavailable DS4 equivalents.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "vision unfreeze",
+    "blocks": [
+      "F2-I",
+      "F3-I"
+    ],
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "N/A: pretraining encoder unfreeze schedule and smaller LR are outside post-training scope; this does not assert a frozen encoder",
+      "phase": "post-training (SFT/RL/OPD); conditional on owner being trainable",
+      "owners": [
+        "vision encoder"
+      ],
+      "approver": "bayan, 2026-09-11 project policy ruling",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    },
+    "prior_evidence_gap": "smaller LR has no value"
+  },
+  {
+    "id": "O06",
+    "question": "vision.norm unfreeze LR",
+    "candidates": [
+      "retain prior group",
+      "encoder LR"
+    ],
+    "evidence_gap": "Policy resolved; implementation must demonstrate the selected DS4 backend behavior. See evidence note for unavailable DS4 equivalents.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "vision unfreeze",
+    "blocks": [
+      "F2-I",
+      "F3-I"
+    ],
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "N/A: pretraining vision.norm unfreeze transition is outside post-training scope; preserve the selected post-training trainability mask",
+      "phase": "post-training (SFT/RL/OPD); conditional on owner being trainable",
+      "owners": [
+        "vision.norm"
+      ],
+      "approver": "bayan, 2026-09-11 project policy ruling",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    },
+    "prior_evidence_gap": "A4 transition unresolved"
+  },
+  {
+    "id": "O07",
+    "question": "Image vectors optimizer/representation/LR/decay",
+    "candidates": [
+      "explicit Adam group",
+      "approved matrix representation and optimizer"
+    ],
+    "evidence_gap": "Policy resolved; implementation must demonstrate the selected DS4 backend behavior. See evidence note for unavailable DS4 equivalents.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "image vectors trained",
+    "blocks": [
+      "F2-I"
+    ],
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "Inherit DS4 non-matrix parameter optimizer, representation, LR and decay policy for image vectors; no reshape into Muon matrices",
+      "phase": "post-training (SFT/RL/OPD); conditional on owner being trainable",
+      "owners": [
+        "image_start",
+        "image_end",
+        "image_newline"
+      ],
+      "approver": "bayan, 2026-09-11 project policy ruling",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    },
+    "prior_evidence_gap": "A4 image vectors unresolved"
+  },
+  {
+    "id": "O08",
+    "question": "FP8 scale regeneration",
+    "candidates": [
+      "published quantizer",
+      "approved training regeneration"
+    ],
+    "evidence_gap": "Report section 5 (printed pages 25\u201336) does not identify Engram trainable/frozen parameter groups. Section 3.1.3 describes generic updates and GPU residency, not a post-training trainability mask. Trainability and FP8 scale regeneration require evidence or explicit approval.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "quantized table training",
+    "blocks": [
+      "E1e-S",
+      "E2-S",
+      "F2-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O09",
+    "question": "Master weight existence/representation/dtype",
+    "candidates": [
+      "persistent high precision master",
+      "qualified alternative"
+    ],
+    "evidence_gap": "Report section 5 (printed pages 25\u201336) does not identify Engram trainable/frozen parameter groups. Section 3.1.3 describes generic updates and GPU residency, not a post-training trainability mask. Trainability and Master weight existence/representation/dtype require evidence or explicit approval.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "quantized table training",
+    "blocks": [
+      "E1e-S",
+      "E2-S",
+      "C4-I",
+      "F2-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O10",
+    "question": "Gradient accumulation/storage/reduction dtype/order",
+    "candidates": [
+      "FP32 main_grad",
+      "qualified alternative"
+    ],
+    "evidence_gap": "Policy resolved; implementation must demonstrate the selected DS4 backend behavior. See evidence note for unavailable DS4 equivalents.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "quantized table training",
+    "blocks": [
+      "E1e-S",
+      "E2-S",
+      "F2-I"
+    ],
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "FP32 main_grad accumulation/storage/reduction; require native FP32 gradient production, not BF16 gradient cast to FP32; reduction order follows selected DS4 backend",
+      "phase": "post-training (SFT/RL/OPD); conditional on owner being trainable",
+      "owners": [
+        "trainable backbone",
+        "trainable vision",
+        "Engram if trainability approved"
+      ],
+      "approver": "bayan, 2026-09-11 project policy ruling",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    },
+    "prior_evidence_gap": "training gradient state unspecified"
+  },
+  {
+    "id": "O11",
+    "question": "Momentum dtype/rounding",
+    "candidates": [
+      "FP32",
+      "qualified alternative"
+    ],
+    "evidence_gap": "Policy resolved; implementation must demonstrate the selected DS4 backend behavior. See evidence note for unavailable DS4 equivalents.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "Sinkhorn active",
+    "blocks": [
+      "E2-S",
+      "F2-I"
+    ],
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "FP32 momentum storage; Sinkhorn execution remains conditional on Engram trainability and O09, not authorized by dtype alone",
+      "phase": "post-training (SFT/RL/OPD); conditional on owner being trainable",
+      "owners": [
+        "optimizer momentum",
+        "Engram Sinkhorn momentum if active"
+      ],
+      "approver": "bayan, 2026-09-11 project policy ruling",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    },
+    "prior_evidence_gap": "Algorithm1 does not settle storage dtype"
+  },
+  {
+    "id": "O12",
+    "question": "Indexer objective/coefficient/detach/contributors",
+    "candidates": [
+      "evidence-defined auxiliary objective",
+      "approved port objective"
+    ],
+    "evidence_gap": "inference integer Top-K supplies no backward recipe; no specific resolution in the 2026-09-11 ruling; retain OPEN",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "indexer training",
+    "blocks": [
+      "B2-I",
+      "D6-S",
+      "D6-I",
+      "G1-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O13",
+    "question": "Modality load reduction scope",
+    "candidates": [
+      "global valid tokens per modality",
+      "approved alternative"
+    ],
+    "evidence_gap": "Policy resolved; implementation must demonstrate the selected DS4 backend behavior. See evidence note for unavailable DS4 equivalents.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "MoE bias/auxiliary updates",
+    "blocks": [
+      "D5-S",
+      "D5-I",
+      "E4-I"
+    ],
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "Inherit DS4 SigmoidTopKRouter reduction: int64 per-expert counts summed across TP group, total tokens local count times TP size (local when TP=1); preserve this scope separately for each modality, including zero-count handling",
+      "phase": "post-training (SFT/RL/OPD); conditional on owner being trainable",
+      "owners": [
+        "modality router statistics"
+      ],
+      "approver": "bayan, 2026-09-11 project policy ruling",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    },
+    "prior_evidence_gap": "rate alone does not settle reduction"
+  },
+  {
+    "id": "O14",
+    "question": "Fake-quant derivatives",
+    "candidates": [
+      "approved STE",
+      "evidence-derived alternative"
+    ],
+    "evidence_gap": "Policy resolved; implementation must demonstrate the selected DS4 backend behavior. See evidence note for unavailable DS4 equivalents.",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "quantization backward",
+    "blocks": [
+      "C2a-S",
+      "C2b-S",
+      "C2c-S",
+      "B2-I"
+    ],
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "Straight-through estimator: quantized forward, identity derivative with respect to floating input; scales detached. Port policy, not an official inference-derived backward recipe",
+      "phase": "post-training (SFT/RL/OPD); conditional on owner being trainable",
+      "owners": [
+        "main KV fake quant",
+        "index Q/K fake quant",
+        "SWA and Linear fake quant"
+      ],
+      "approver": "bayan, 2026-09-11 project policy ruling",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    },
+    "prior_evidence_gap": "forward quantizer does not specify derivative"
+  },
+  {
+    "id": "O15",
+    "question": "Main KV FP4-off precision/reference",
+    "candidates": [
+      "explicit BF16/FP32 branch",
+      "approved controlled reference"
+    ],
+    "evidence_gap": "published post-training path does not settle pretraining reference; no specific resolution in the 2026-09-11 ruling; retain OPEN",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "explicit FP4-off diagnostic/reference experiment only; not required for published post-training production path",
+    "blocks": [
+      "C2a-S",
+      "D2-S",
+      "G1-S"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O16",
+    "question": "Global objective normalization/runtime scaling",
+    "candidates": [
+      "valid-token weighted",
+      "sequence weighted",
+      "equal-microbatch objective"
+    ],
+    "evidence_gap": "numerator/denominator and applied runtime scales unresolved; no specific resolution in the 2026-09-11 ruling; retain OPEN",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "any training objective",
+    "blocks": [
+      "B2-S",
+      "D5-S",
+      "D6-S",
+      "G1-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O17",
+    "question": "Atomic skip semantics",
+    "candidates": [
+      "skip all optimizer/scheduler/bias/publication effects",
+      "documented framework policy"
+    ],
+    "evidence_gap": "framework overflow/skip contract not yet audited; no specific resolution in the 2026-09-11 ruling; retain OPEN",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "mixed optimizer training",
+    "blocks": [
+      "E1e-S",
+      "E4-S",
+      "E5t-S",
+      "E5v-S"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  }
+]
