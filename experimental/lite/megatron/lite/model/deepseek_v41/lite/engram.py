@@ -219,13 +219,16 @@ class Engram(nn.Module):
         self.q_weight = nn.Parameter(torch.ones(copies, hidden_size))
         self.k_weight = nn.Parameter(torch.ones(copies, hidden_size))
 
-    def forward(self, hidden, hash_ids, token_mask=None):
+    def forward(self, hidden, hash_ids, token_mask=None, *, embedding=None):
         if hidden.ndim != 4 or hidden.shape[-2:] != (self.copies, self.dim):
             raise ValueError("Expected residual stream [B,S,HC,D]")
+        # A microbatch-scoped prefetched provider does not replace the registered
+        # table, so parameter ownership/enumeration remains stable.
+        provider = self.embed if embedding is None else embedding
         if isinstance(self.wkv, EngramFP8Projection):
-            kv = self.wkv.forward_lookup(self.embed, hash_ids)
+            kv = self.wkv.forward_lookup(provider, hash_ids)
         else:
-            kv = self.wkv(self.embed(hash_ids).flatten(-2))
+            kv = self.wkv(provider(hash_ids).flatten(-2))
         key, value = kv.split([self.copies * self.dim, self.dim], -1)
         key = key.float().unflatten(-1, (self.copies, self.dim))
         h = hidden.float()

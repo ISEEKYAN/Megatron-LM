@@ -97,3 +97,69 @@ This blockwise correctness kernel is not a performance-qualified fused kernel.
 requantization, and checks native output/dW/table gradients against independent
 exactly representable inputs with atol=1e-3, rtol=1e-5. Performance remains a
 separate representative-size gate.
+
+## Batch prefetch and delayed gradient return
+
+`EngramPrefetch(state).start(step, {microbatch_id: ids})` acquires one table
+publication and performs one concatenated row lookup before stage microbatches.
+Empty microbatches remain explicit entries. Each `batch.view(id)` is a provider
+for `Engram.forward(..., embedding=view)` or the FP8 projection. The override does
+not replace the registered embedding parameter, so ownership/enumeration remains
+unchanged. IDs must exactly match the prefetched microbatch. The provider can be
+reused in nonreentrant activation recomputation without another lookup.
+
+Trainable cached rows are detached FP32 leaves. Their hooks retain gradient
+returns tagged by `(step, publication_version, microbatch_id)`, rather than
+immediately traversing the original lookup autograd graph. `batch.flush()` runs
+only after backbone backward, rejects missing/duplicate/stale returns, and calls
+backward through that original lookup once with the combined FP32 vector.
+Repeated global IDs consequently coalesce at the row owner using the existing
+lookup primitive. The result lands in the state-owned native FP32 `main_grad`;
+it is not a BF16 parameter gradient widened after accumulation. Each scheduled
+microbatch contributes once per backward, including explicit empty microbatches.
+Multiple separate backward calls on the same microbatch are rejected as duplicate
+returns; combine its consumers into one backward graph.
+
+An optional prefetch CUDA stream waits for the producer stream. Ready events are
+waited on before consuming cached IDs/rows; return events are waited on before
+flush. Buffers record consumer-stream use. CPU runs the same state machine
+synchronously. CPU tests verify ordering through an injected event recorder;
+actual CUDA stream overlap and multi-rank scheduling are not certified here.
+Frozen views retain only published values/scales and require consumption but no
+gradient return. Closing a batch invalidates its views and releases cached rows,
+IDs, return vectors, and the original lookup graph.
+
+## Full-row state and publication transaction
+
+`EngramTableState` owns the full local-shard FP32 gradient and momentum matrices.
+It prepares `M = beta*M_previous + (1-beta)*G` and
+`N = beta*M + (1-beta)*G` over **all** local rows, including unvisited rows.
+`step(update_rule, lr=..., beta=.95)` requires an explicit full-matrix direction
+function of current N. Tests use the identity function solely as a Nesterov/state
+reference. This is not a substitute for Sinkhorn: its logical-matrix collectives,
+normalization and LR factors are supplied by the subsequent optimizer work.
+There is no persistent normalization cache or warm-start state in this layer.
+
+Only after candidate master, momentum, values and scales have been prepared does
+publication advance its version. Skips/nonfinite updates leave all four unchanged
+and consume only the attempt's step tag. A failed quantization keeps the ready
+gradient available for retry. A step with a live batch cannot update or checkpoint.
+Checkpoint/restore is allowed only between attempts and preserves master,
+momentum, raw FP8/E8M0 bytes, publication version and the last attempt tag.
+Frozen checkpoints contain no master/momentum and never regenerate release
+quantization. Parameter identity stays stable across update and restore.
+
+These APIs are the sole publication path while managed prefetch is in use;
+callers must not separately mutate/refresh the table during a live attempt.
+Replica gradient reduction, optimizer-state sharding and globally agreed atomic
+skip remain integration work. Full-size memory budgeting must include the local
+master/gradient/momentum, cached row leaves/returns and candidate/publication
+workspace, not only FP8 storage. This implementation does not claim a 196B-table
+memory or throughput result.
+
+CPU tests exercise eager-vs-prefetched Engram recompute gradients, delayed return,
+exact FP32 accumulation of `1 + 2^-10`, wrong/missing/duplicate generation tags,
+sub-FP8 repeated updates, unvisited historical momentum, failed-publication retry,
+frozen state and restored next-step trajectories. Hand-computed unvisited-row
+example: after G=4 at beta=.95 and lr=.1, M=.2 and W=.961; next step G=0 still
+produces M=.19, N=.1805 and W=.94295. A visited-row-only update is incorrect.
