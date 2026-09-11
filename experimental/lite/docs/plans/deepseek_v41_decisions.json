@@ -200,7 +200,7 @@
       "published quantizer",
       "approved training regeneration"
     ],
-    "evidence_gap": "Report section 5 (printed pages 25\u201336) does not identify Engram trainable/frozen parameter groups. Section 3.1.3 describes generic updates and GPU residency, not a post-training trainability mask. Trainability and FP8 scale regeneration require evidence or explicit approval.",
+    "evidence_gap": "Report section 5 (printed pages 25–36) does not identify Engram trainable/frozen parameter groups. Section 3.1.3 describes generic updates and GPU residency, not a post-training trainability mask. Trainability and FP8 scale regeneration require evidence or explicit approval.",
     "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
     "active_when": "quantized table training",
     "blocks": [
@@ -218,7 +218,7 @@
       "persistent high precision master",
       "qualified alternative"
     ],
-    "evidence_gap": "Report section 5 (printed pages 25\u201336) does not identify Engram trainable/frozen parameter groups. Section 3.1.3 describes generic updates and GPU residency, not a post-training trainability mask. Trainability and Master weight existence/representation/dtype require evidence or explicit approval.",
+    "evidence_gap": "Report section 5 (printed pages 25–36) does not identify Engram trainable/frozen parameter groups. Section 3.1.3 describes generic updates and GPU residency, not a post-training trainability mask. Trainability and Master weight existence/representation/dtype require evidence or explicit approval.",
     "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
     "active_when": "quantized table training",
     "blocks": [
@@ -385,8 +385,19 @@
       "D2-S",
       "G1-S"
     ],
-    "status": "OPEN",
-    "resolution": null
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "explicit BF16/FP32 branch, matching the DS4 QAT path's uncompressed reference",
+      "phase": "post-training only; FP4 main-KV QAT is post-training-introduced",
+      "owners": [
+        "main KV cache"
+      ],
+      "approver": "bayan, 2026-09-11 ruling: non-Engram parameters follow current DS4 behaviour",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy",
+        "DS4 QAT reference path in this tree"
+      ]
+    }
   },
   {
     "id": "O16",
@@ -405,8 +416,18 @@
       "D6-S",
       "G1-I"
     ],
-    "status": "OPEN",
-    "resolution": null
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "valid-token weighted, matching the DS4 objective currently in this tree",
+      "phase": "post-training (SFT/RL/OPD)",
+      "owners": [
+        "global loss normalization"
+      ],
+      "approver": "bayan, 2026-09-11 ruling: non-Engram behaviour follows DS4",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    }
   },
   {
     "id": "O17",
@@ -424,7 +445,17 @@
       "E5t-S",
       "E5v-S"
     ],
-    "status": "OPEN",
-    "resolution": null
+    "status": "RESOLVED",
+    "resolution": {
+      "value": "documented framework policy: reuse the DS4 optimizer's existing overflow/skip contract unchanged",
+      "phase": "post-training (SFT/RL/OPD)",
+      "owners": [
+        "optimizer skip-step"
+      ],
+      "approver": "bayan, 2026-09-11 ruling: non-Engram behaviour follows DS4",
+      "evidence": [
+        "deepseek_v41_a8_evidence.md#approved-port-policy"
+      ]
+    }
   }
 ]

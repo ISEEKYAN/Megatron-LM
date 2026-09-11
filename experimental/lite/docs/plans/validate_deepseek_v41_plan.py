@@ -87,7 +87,11 @@ def mutations(text, ownership, decisions):
     missing = copy.deepcopy(decisions)
     missing[15]['blocks'] = []
     cases.append(('missing normalization blockers', text, ownership, missing, ()))
-    cases.append(('unresolved active objective', text, ownership, decisions, ('O16',)))
+    # Pick a decision that is still OPEN rather than naming one: hard-coding an id
+    # makes this case silently stop testing anything once that id is resolved.
+    still_open = next((d['id'] for d in decisions if d['status'] == 'OPEN'), None)
+    assert still_open, 'no OPEN decision left to exercise the active-decision gate'
+    cases.append(('unresolved active objective', text, ownership, decisions, (still_open,)))
     for name, t, o, d, active in cases:
         try:
             check(t, o, d, active)
