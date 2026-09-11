@@ -4,12 +4,18 @@
 from dataclasses import dataclass, field
 
 import torch
-from torch.nn import functional as F
-
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+from megatron.lite.model.protocol_utils import (
+    pack_r3_replay_mask as _pack_r3_replay_mask,
+)
+from megatron.lite.model.protocol_utils import (
+    pack_routed_experts as _pack_routed_experts,
+)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.runtime.contracts import ParallelConfig
+from torch.nn import functional as F
+
 from .checkpoint import export_model, load_model, save_model
 
 
@@ -90,8 +96,22 @@ def build_model(model_cfg, *, impl_cfg):
 
 
 def _forward_step(model, batch):
-    if batch.routed_experts is not None or batch.r3_replay_mask is not None:
-        raise NotImplementedError('Routing replay requires the replay integration')
+    if batch.routed_experts is not None:
+        from megatron.lite.primitive.modules.router_replay import RouterReplayAction
+
+        routers = [
+            module
+            for root in router_replay_roots(model)
+            for module in root.modules()
+            if hasattr(module, 'router_replay')
+        ]
+        if not routers or any(
+            module.router_replay is None
+            or module.router_replay.router_replay_action
+            != RouterReplayAction.REPLAY_FORWARD
+            for module in routers
+        ):
+            raise RuntimeError('V4.1 routed inputs require an active replay driver')
     if batch.extras:
         raise NotImplementedError('Text-only protocol does not accept extra modality fields')
     if batch.input_ids.ndim != 1 or batch.total_tokens != batch.input_ids.numel():
@@ -182,3 +202,116 @@ def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
 
 def vocab_size(model_cfg):
     return model_cfg.to_hf_dict()['text_config']['vocab_size']
+
+
+def pack_routed_experts(model, batch, routed_experts):
+    """Use shared THD padding followed by contiguous CP and then TP slicing."""
+    return _pack_routed_experts(
+        model, batch, routed_experts, contiguous=True, contiguous_padding=True
+    )
+
+
+def pack_r3_replay_mask(model, batch):
+    """Keep the causal replay mask in exactly the same token layout as routes."""
+    return _pack_r3_replay_mask(model, batch, contiguous=True, contiguous_padding=True)
+
+
+def router_replay_roots(chunk):
+    """E stages retain global layer slots; absent/nonlocal slots contain None."""
+    while hasattr(chunk, 'module'):
+        chunk = chunk.module
+    layers = chunk.layers
+    start, end = getattr(chunk, 'local_layer_range', (0, len(layers)))
+    if not 0 <= start < end <= len(layers):
+        raise ValueError('Invalid V4.1 replay layer interval')
+    if any((layer is not None) != (start <= i < end) for i, layer in enumerate(layers)):
+        raise ValueError(
+            'V4.1 replay requires contiguous stage-owned global layer slots'
+        )
+    return list(layers[start:end])
+
+
+def validate_router_replay(chunks, action):
+    """Fail before collectives for scheduler interfaces not implemented by E yet."""
+    from megatron.lite.primitive.parallel.thd import parallel_state_from_model
+
+    if len(chunks) != 1:
+        raise NotImplementedError(
+            'V4.1 replay requires one local PP chunk; VPP is not wired'
+        )
+    ps = parallel_state_from_model(chunks[0]) or ParallelState()
+    router_replay_roots(chunks[0])
+    if action == 'record' and ps.pp_size > 1:
+        raise NotImplementedError(
+            'V4.1 PP record requires E post-drain route collection; '
+            'a collective inside stage forward would deadlock'
+        )
+
+
+def unpack_recorded_routed_experts(model, batch, recorded, *, pipeline_drained=False):
+    """Invert local route packing. PP record needs E's post-drain scheduler hook."""
+    import torch.distributed as dist
+    from megatron.lite.primitive.parallel.thd import (
+        parallel_state_from_model,
+        thd_pack_meta,
+    )
+
+    ps = parallel_state_from_model(model) or ParallelState()
+    if ps.pp_size > 1 and not pipeline_drained:
+        validate_router_replay([model], 'record')
+    if not recorded or any(row is None for row in recorded):
+        raise RuntimeError('V4.1 record did not visit every local router')
+    full = torch.stack(recorded, dim=1)
+    for size, group in ((ps.tp_size, ps.tp_group), (ps.cp_size, ps.cp_group)):
+        if size > 1:
+            if group is None:
+                raise RuntimeError(
+                    'V4.1 route gather requires the corresponding parallel group'
+                )
+            parts = [torch.empty_like(full) for _ in range(size)]
+            dist.all_gather(parts, full.contiguous(), group=group)
+            full = torch.cat(parts, dim=0)
+    if ps.pp_size > 1:
+        if ps.pp_group is None:
+            raise RuntimeError(
+                'V4.1 PP route gather requires pp_group after pipeline drain'
+            )
+        counts = [
+            torch.empty(1, dtype=torch.long, device=full.device)
+            for _ in range(ps.pp_size)
+        ]
+        dist.all_gather(
+            counts,
+            torch.tensor([full.shape[1]], dtype=torch.long, device=full.device),
+            group=ps.pp_group,
+        )
+        widths = [int(count.item()) for count in counts]
+        current = model
+        while hasattr(current, 'module'):
+            current = current.module
+        expected_range = (sum(widths[: ps.pp_rank]), sum(widths[: ps.pp_rank + 1]))
+        valid = torch.tensor(
+            [getattr(current, 'local_layer_range', None) == expected_range],
+            dtype=torch.int32,
+            device=full.device,
+        )
+        dist.all_reduce(valid, op=dist.ReduceOp.MIN, group=ps.pp_group)
+        if not valid.item():
+            raise ValueError(
+                'V4.1 PP router counts disagree with global stage layer order'
+            )
+        padded = full.new_zeros(full.shape[0], max(widths), full.shape[2])
+        padded[:, : full.shape[1]] = full
+        parts = [torch.empty_like(padded) for _ in widths]
+        dist.all_gather(parts, padded, group=ps.pp_group)
+        full = torch.cat([part[:, :width] for part, width in zip(parts, widths)], dim=1)
+    meta = thd_pack_meta(
+        batch.seq_lens, tp_size=ps.tp_size, cp_size=ps.cp_size, contiguous=True
+    )
+    if full.shape[0] != int(meta.cu_seqlens_padded[-1]):
+        raise ValueError('V4.1 recorded rows differ from the shared THD token layout')
+    rows = [
+        full[int(start) : int(start) + int(length)]
+        for start, length in zip(meta.cu_seqlens_padded[:-1], meta.lengths)
+    ]
+    return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
