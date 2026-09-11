@@ -71,3 +71,18 @@ def test_streamed_checkpoint_provider_stays_on_gpu(tmp_path):
             assert master.device.type == 'cuda' and master.dtype == torch.float32
         else:
             assert master is None and not list(table.parameters())
+
+
+@pytest.mark.parametrize('tokens', [0, 1, 3])
+def test_native_projection_handles_empty_and_uneven_token_batches(tokens):
+    from megatron.lite.primitive.quantization.ds41_fp8 import published_fp8_linear
+    assert os.environ.get('SLURM_JOB_ID') and torch.cuda.is_available()
+    values = torch.ones(tokens, 64, device='cuda').to(torch.float8_e4m3fn)
+    scales = torch.ones(tokens, 2, device='cuda').to(torch.float8_e8m0fnu)
+    weight = torch.ones(32, 64, device='cuda', requires_grad=True)
+    master = torch.ones(tokens, 64, device='cuda', requires_grad=True)
+    result = published_fp8_linear(values, scales, weight, master=master, output_dtype=torch.float32)
+    torch.testing.assert_close(result, torch.full((tokens, 32), 64.0, device='cuda'), atol=0, rtol=0)
+    result.sum().backward()
+    torch.testing.assert_close(weight.grad, torch.full_like(weight, float(tokens)), atol=0, rtol=0)
+    torch.testing.assert_close(master.grad, torch.full_like(master, 32.0), atol=0, rtol=0)
