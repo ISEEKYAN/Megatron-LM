@@ -687,6 +687,101 @@ def test_v41_actual_optimizer_routes_and_native_gradients(moe, trainable, device
     assert a.wq_b.weight.grad is None and a.wq_b.weight.main_grad is None
 
 
+def test_v41_optimizer_routing_ignores_misleading_names(moe, monkeypatch):
+    from dataclasses import replace
+
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import parameter_groups
+
+    _, bundle = _assembly_bundle()
+    model = bundle.chunks[0]
+    from megatron.lite.model.deepseek_v41.lite.training import VisionTrainability
+
+    VisionTrainability(False, False, False, False).apply(model)
+    a = model.layers[0].attn
+    # Both public naming surfaces lie: the shared matrices look like per-head Q.
+    labels = {
+        id(a.wq_a.weight): "decoy.attn.wq_b.weight",
+        id(a.wkv.weight): "decoy.query_projection.weight",
+        id(a.wq_b.weight): "decoy.shared_latent.weight",
+    }
+    named = model.named_parameters
+    monkeypatch.setattr(
+        model,
+        "named_parameters",
+        lambda *args, **kwargs: (
+            (labels.get(id(p), name), p) for name, p in named(*args, **kwargs)
+        ),
+    )
+    for key, binding in list(model.tensor_bindings.items()):
+        if id(binding.tensor) in labels:
+            model.tensor_bindings[key] = replace(
+                binding, release_key=labels[id(binding.tensor)]
+            )
+    groups = parameter_groups(model, lr=1e-3)
+    by_id = {id(p): g for g in groups for p in g["params"]}
+    assert by_id[id(a.wq_a.weight)]["matrix_shape"] == tuple(a.wq_a.weight.shape)
+    assert by_id[id(a.wkv.weight)]["matrix_shape"] == tuple(a.wkv.weight.shape)
+    assert by_id[id(a.wq_b.weight)]["matrix_shape"] == (8, 64, 64)
+    indexer_ids = {
+        id(p)
+        for block in model.layers
+        if block.attn.indexer is not None
+        for p in block.attn.indexer.parameters()
+    }
+    assert indexer_ids and indexer_ids.isdisjoint(by_id)
+
+
+@pytest.mark.parametrize("trainable", [False, True])
+def test_v41_optimizer_engram_persistent_master_and_reencoding(moe, trainable):
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import (
+        OptimizerConfig,
+        V41Optimizer,
+    )
+    from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+
+    _, bundle = _assembly_bundle(trainable_engram=trainable)
+    model = bundle.chunks[0]
+    from megatron.lite.model.deepseek_v41.lite.training import VisionTrainability
+
+    VisionTrainability(False, False, False, False).apply(model)
+    from megatron.lite.model.deepseek_v41.lite.training import VisionTrainability
+
+    VisionTrainability(False, False, False, False).apply(model)
+    opt = V41Optimizer(
+        model, OptimizerConfig(lr=0.1, ns_steps=5, coefficient_type="quintic")
+    )
+    tables = [b.engram.embed for b in model.layers if b.engram is not None]
+    before = [(t.weight.clone(), t.scale.clone()) for t in tables]
+    masters = [t.master for t in tables]
+    for t in tables:
+        if trainable:
+            assert t.master.dtype == torch.float32
+            # Force a scale boundary crossing so stale scale publication is observable.
+            with torch.no_grad():
+                t.master.mul_(128)
+            t.master.grad = torch.randn_like(t.master)
+        else:
+            assert t.master is None and not list(t.parameters())
+    assert opt.step()[0]
+    for t, master, (weight, scale) in zip(tables, masters, before):
+        assert t.master is master
+        if trainable:
+            expected_weight, expected_scale = quantize_block_fp8(
+                master, (1, 32), scale_format="e8m0"
+            )
+            assert torch.equal(
+                t.weight.view(torch.uint8), expected_weight.view(torch.uint8)
+            )
+            assert torch.equal(
+                t.scale.view(torch.uint8), expected_scale.view(torch.uint8)
+            )
+            assert not torch.equal(t.weight.view(torch.uint8), weight.view(torch.uint8))
+            assert not torch.equal(t.scale.view(torch.uint8), scale.view(torch.uint8))
+        else:
+            assert torch.equal(t.weight.view(torch.uint8), weight.view(torch.uint8))
+            assert torch.equal(t.scale.view(torch.uint8), scale.view(torch.uint8))
+
+
 def test_v41_native_linear_accumulates_unrounded_weight_gradients():
     from megatron.lite.primitive.modules.native_fp32_linear import native_fp32_linear
 
@@ -1928,3 +2023,33 @@ def test_v41_delimiter_reduction_preserves_native_fp32():
     assert torch.equal(
         newline.grad, torch.full((2,), 1 + 2**-8)
     ), 'Delimiter row reduction rounded in BF16 before FP32 accumulation'
+
+
+@pytest.mark.parametrize('mutation', ['frozen_norm', 'missing_aligner'])
+def test_v41_visual_optimizer_rejects_mask_mutations(moe, mutation):
+    from megatron.lite.model.deepseek_v41.lite import protocol
+
+    bundle = protocol.build_model(
+        _assembly_config(),
+        impl_cfg=protocol.ImplConfig(
+            device='cpu',
+            dtype=torch.float32,
+            quantized=False,
+            token_map=list(range(256)),
+            optimizer='muon',
+            optimizer_config=protocol.OptimizerConfig(0.001, 5, 'quintic'),
+            vision_trainability=protocol.VisionTrainability(False, True, True, False),
+        ),
+    )
+    model, optimizer = bundle.chunks[0], bundle.optimizer
+    if mutation == 'frozen_norm':
+        model.vision.norm.requires_grad_(False)
+    else:
+        for backend in optimizer.optimizers:
+            backend.param_groups[:] = [
+                g
+                for g in backend.param_groups
+                if all(p is not model.aligner.w1.weight for p in g['params'])
+            ]
+    with pytest.raises(ValueError, match='Trainability changed'):
+        optimizer.step()
