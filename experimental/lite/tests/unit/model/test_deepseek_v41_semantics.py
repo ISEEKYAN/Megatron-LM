@@ -525,6 +525,8 @@ def test_v41_headwise_muon_distinct_heads_and_resume(device):
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz
     from megatron.lite.primitive.optimizers.headwise_muon import HeadwiseMuon
 
+    from emerging_optimizers.utils import fp32_matmul_precision
+
     torch.manual_seed(712)
     weight = torch.nn.Parameter(torch.randn(6, 5, device=device))
     expected = weight.detach().clone()
@@ -542,12 +544,14 @@ def test_v41_headwise_muon_distinct_heads_and_resume(device):
         momentum = 0.95 * momentum + 0.05 * gradient
         nesterov = 0.95 * momentum + 0.05 * gradient
         directions = []
-        for head in nesterov.split(3):
-            update = newton_schulz(head, 5, coefficient_type='quintic')
-            directions.append(update * (0.18 / update.square().mean().sqrt()))
-        expected = expected * (1 - 0.03 * 0.1) - 0.03 * torch.cat(directions)
-        vanilla = newton_schulz(nesterov, 5, coefficient_type='quintic')
-        vanilla *= 0.18 / vanilla.square().mean().sqrt()
+        # Match the declared FP32 NS arithmetic, independent of ambient TF32 settings.
+        with fp32_matmul_precision('highest'):
+            for head in nesterov.split(3):
+                update = newton_schulz(head, 5, coefficient_type='quintic')
+                directions.append(update * (0.18 / update.square().mean().sqrt()))
+            expected = expected * (1 - 0.03 * 0.1) - 0.03 * torch.cat(directions)
+            vanilla = newton_schulz(nesterov, 5, coefficient_type='quintic')
+            vanilla *= 0.18 / vanilla.square().mean().sqrt()
         assert not torch.allclose(vanilla, torch.cat(directions), atol=1e-3, rtol=1e-3)
         assert opt.step()
         torch.testing.assert_close(weight, expected, atol=0, rtol=0)
