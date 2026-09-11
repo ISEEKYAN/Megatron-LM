@@ -81,3 +81,37 @@ def load_weight(store, name, *, output_dtype=torch.bfloat16):
     if not torch.isfinite(result).all():
         raise ValueError(f"nonfinite decoded weight: {name}")
     return result
+
+
+def load_engram_rows(store, name, *, intervals, rank, device, chunk_rows=4096):
+    """Load only the assigned FP8/E8M0 rows, with bounded host staging.
+
+    CPU is supported for byte-level fixtures; runtime callers pass their CUDA
+    device. No decoded full table or persistent host replica is created.
+    """
+    if not name.endswith('.engram.embed.weight'):
+        raise ValueError('Require exact Engram weight family')
+    weight = store.entries[name]
+    scale_name = name[:-6] + 'scale'
+    scale = store.entries[scale_name]
+    if (weight.dtype != 'F8_E4M3' or len(weight.shape) != 2
+            or weight.shape[1] % 32 or scale.dtype != 'F8_E8M0'
+            or scale.shape != (weight.shape[0], weight.shape[1] // 32)):
+        raise ValueError('Engram requires FP8 values and matching row/block32 E8M0 scales')
+    intervals = tuple(intervals)
+    cursor = 0
+    for begin, end in intervals:
+        if type(begin) is not int or type(end) is not int or begin != cursor or end < begin:
+            raise ValueError('Row coverage has gaps, overlaps or invalid intervals')
+        cursor = end
+    if cursor != weight.shape[0] or not 0 <= rank < len(intervals):
+        raise ValueError('Row coverage or rank does not match logical table')
+    begin, end = intervals[rank]
+    tensors = []
+    for key, entry in ((name, weight), (scale_name, scale)):
+        result = torch.empty((end - begin, entry.shape[1]), device=device, dtype=torch.uint8)
+        for first, raw in store.iter_rows(key, begin, end, chunk_rows=chunk_rows):
+            chunk = torch.frombuffer(bytearray(raw), dtype=torch.uint8).reshape(-1, entry.shape[1])
+            result[first - begin:first - begin + chunk.shape[0]].copy_(chunk)
+        tensors.append(result.view(_TORCH_DTYPES[entry.dtype]))
+    return tuple(tensors)

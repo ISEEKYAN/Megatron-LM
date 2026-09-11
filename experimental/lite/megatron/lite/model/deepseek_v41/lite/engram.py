@@ -191,6 +191,12 @@ class EngramTable(nn.Module):
             decoded = floating + (decoded - floating).detach()
         return decoded.to(self.output_dtype)
 
+    def lookup_fp8(self, ids):
+        rows = self.weight.view(torch.uint8)[ids].view(self.weight.dtype)
+        scales = self.scale.view(torch.uint8)[ids].view(self.scale.dtype)
+        master = None if self.master is None else self.master[ids]
+        return rows, scales, master
+
     @torch.no_grad()
     def refresh_storage(self):
         if self.master is None:
@@ -216,7 +222,10 @@ class Engram(nn.Module):
     def forward(self, hidden, hash_ids, token_mask=None):
         if hidden.ndim != 4 or hidden.shape[-2:] != (self.copies, self.dim):
             raise ValueError("Expected residual stream [B,S,HC,D]")
-        kv = self.wkv(self.embed(hash_ids).flatten(-2))
+        if isinstance(self.wkv, EngramFP8Projection):
+            kv = self.wkv.forward_lookup(self.embed, hash_ids)
+        else:
+            kv = self.wkv(self.embed(hash_ids).flatten(-2))
         key, value = kv.split([self.copies * self.dim, self.dim], -1)
         key = key.float().unflatten(-1, (self.copies, self.dim))
         h = hidden.float()
@@ -248,9 +257,42 @@ class ShardedEngramTable(EngramTable):
             raise ValueError("Table rows do not match lookup ownership interval")
         self.lookup = lookup
 
+    @classmethod
+    def from_checkpoint(cls, store, name, lookup, *, device, trainable=False,
+                        output_dtype=torch.bfloat16, chunk_rows=4096):
+        from .checkpoint import load_engram_rows
+
+        if lookup.group is not None and torch.device(device).type != 'cuda':
+            raise ValueError("Distributed Engram checkpoint load requires a CUDA device")
+        values, scales = load_engram_rows(
+            store, name, intervals=tuple(zip(lookup.boundaries, lookup.boundaries[1:])),
+            rank=lookup.rank, device=device, chunk_rows=chunk_rows)
+        return cls(values, scales, lookup, trainable=trainable, output_dtype=output_dtype)
+
+    def lookup_fp8(self, ids):
+        return self.lookup.fetch(self.weight, self.scale, ids, self.master)
+
     def forward(self, ids):
-        rows, scales, floating = self.lookup.fetch(self.weight, self.scale, ids, self.master)
+        rows, scales, floating = self.lookup_fp8(ids)
         decoded = rows.float() * scales.float().repeat_interleave(32, -1)
         if floating is not None:
             decoded = floating + (decoded - floating).detach()
         return decoded.to(self.output_dtype)
+
+
+class EngramFP8Projection(nn.Module):
+    """Projection consuming the table's published FP8 values without requantizing."""
+
+    def __init__(self, weight, *, output_dtype=torch.bfloat16):
+        super().__init__()
+        self.weight = nn.Parameter(weight.detach().clone())
+        self.output_dtype = output_dtype
+
+    def forward_lookup(self, table, ids):
+        from megatron.lite.primitive.quantization.ds41_fp8 import published_fp8_linear
+
+        values, scales, master = table.lookup_fp8(ids)
+        return published_fp8_linear(
+            values.flatten(-2), scales.flatten(-2), self.weight,
+            master=None if master is None else master.flatten(-2),
+            output_dtype=self.output_dtype)

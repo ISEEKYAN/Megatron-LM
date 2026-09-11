@@ -180,6 +180,36 @@ class CheckpointTensorStore:
             raise ValueError(f"payload digest mismatch: {name}")
         return output.getvalue()
 
+    def iter_rows(self, name, begin, end, *, chunk_rows=4096):
+        """Yield bounded local row bytes while verifying the full source digest.
+
+        The release manifest has a whole-tensor digest, not per-row digests.
+        Verification therefore scans the payload, but retains only one chunk.
+        Consumers must exhaust this iterator before publishing any loaded state.
+        """
+        entry = self.entries[name]
+        if (entry.release_key != name or len(entry.shape) != 2
+                or not 0 <= begin <= end <= entry.shape[0]
+                or type(chunk_rows) is not int or chunk_rows <= 0):
+            raise ValueError("Invalid row interval or checkpoint identity")
+        row_bytes = entry.shape[1] * _DTYPE_BYTES[entry.dtype]
+        if row_bytes <= 0 or entry.byte_length != entry.shape[0] * row_bytes:
+            raise ValueError("Invalid matrix byte length")
+        digest = hashlib.sha256()
+        with open(entry.source_shard, "rb") as source:
+            source.seek(entry.offset)
+            for first in range(0, entry.shape[0], chunk_rows):
+                last = min(first + chunk_rows, entry.shape[0])
+                raw = source.read((last - first) * row_bytes)
+                if len(raw) != (last - first) * row_bytes:
+                    raise ValueError(f"truncated payload: {name}")
+                digest.update(raw)
+                lo, hi = max(first, begin), min(last, end)
+                if lo < hi:
+                    yield lo, raw[(lo - first) * row_bytes:(hi - first) * row_bytes]
+        if digest.hexdigest() != entry.payload_digest:
+            raise ValueError(f"payload digest mismatch: {name}")
+
     def shard(self, rank, world_size):
         if (
             type(world_size) is not int

@@ -73,3 +73,27 @@ requesters. It compares raw values/scales bitwise and FP32 gradients against
 independently accumulated request vectors. Missing Slurm/four GPUs fails rather
 than skips. These reduced fixtures do not establish full-size memory, performance,
 or combined model TP/EP/CP/PP acceptance.
+
+## Streaming load and native projection
+
+`load_engram_rows` validates a complete disjoint interval partition, then allocates
+only the local value/scale tensors on the requested device. `iter_rows` limits
+host staging to `chunk_rows` rows. The immutable release entry identifies the
+key, dtype, shape, file offset and whole-tensor digest. Since that manifest has
+no per-row hashes, integrity verification scans the entire source tensor using
+bounded memory; this is not a claim of partition-proportional disk traffic.
+Both iterators must finish successfully before the factory publishes the table.
+`ShardedEngramTable.from_checkpoint` binds the loaded interval to the same lookup
+boundaries; a distributed provider rejects CPU destination storage.
+
+`EngramFP8Projection` obtains `lookup_fp8` directly from the table provider and
+flattens 24 rows and their 24×8 E8M0 scales in the same order. The native
+`published_fp8_linear` passes these bytes to the existing `_fp8_gemm`, quantizing
+only the floating projection weight. There is no activation re-quantization or
+BF16 decode before GEMM. Backward decodes published operands for FP32 derivative
+arithmetic and routes the identity-STE contribution into the optional master.
+This blockwise correctness kernel is not a performance-qualified fused kernel.
+`test_fp8_lookup.py` observes the actual kernel operands, forbids activation
+requantization, and checks native output/dW/table gradients against independent
+exactly representable inputs with atol=1e-3, rtol=1e-5. Performance remains a
+separate representative-size gate.
