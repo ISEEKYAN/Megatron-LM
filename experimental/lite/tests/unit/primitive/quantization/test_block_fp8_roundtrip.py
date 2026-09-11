@@ -336,6 +336,17 @@ def test_engram_bounded_row_loader(tmp_path, damage, monkeypatch, _engram_cpu):
             )
             for r in range(2)
         ]
+        from megatron.lite.primitive.modules import engram_lookup
+
+        table = checkpoint.load_engram_table(
+            SimpleNamespace(entries=entries),
+            name,
+            engram_lookup.RowLookup((0, 7)),
+            device='cpu',
+            chunk_rows=2,
+        )
+        assert torch.equal(table.weight.view(torch.uint8), values)
+        assert table.master is None
         for i, expected in enumerate((values, scales)):
             assert torch.equal(
                 torch.cat([chunk[i].view(torch.uint8) for chunk in chunks]), expected

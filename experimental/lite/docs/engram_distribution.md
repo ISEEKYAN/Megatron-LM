@@ -15,7 +15,7 @@ Megatron Core remains an environment dependency.
   composition. `trainable=False` retains only published bytes; `True` adds a
   persistent FP32 master (a port choice, not an official training recipe).
   No table is offloaded to CPU. Distributed lookup requires CUDA storage.
-- `from_checkpoint` consumes a validated manifest with `entries[name]` containing
+- `load_engram_table` in the model checkpoint module consumes a validated manifest with `entries[name]` containing
   release key, dtype, shape, byte length, source shard, offset and SHA256 digest.
   Only local rows are allocated; host staging is bounded by `chunk_rows`.
   Whole-tensor digests require a full streaming scan, not full materialization.

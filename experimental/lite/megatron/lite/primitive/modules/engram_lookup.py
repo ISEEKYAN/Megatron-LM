@@ -250,36 +250,6 @@ class ShardedEngramTable(EngramTable):
             raise ValueError("Table rows do not match lookup ownership interval")
         self.lookup = lookup
 
-    @classmethod
-    def from_checkpoint(
-        cls,
-        store,
-        name,
-        lookup,
-        *,
-        device,
-        trainable=False,
-        output_dtype=torch.bfloat16,
-        chunk_rows=4096
-    ):
-        from megatron.lite.model.deepseek_v41.lite import checkpoint
-
-        if lookup.group is not None and torch.device(device).type != 'cuda':
-            raise ValueError(
-                "Distributed Engram checkpoint load requires a CUDA device"
-            )
-        values, scales = checkpoint.load_engram_rows(
-            store,
-            name,
-            intervals=tuple(zip(lookup.boundaries, lookup.boundaries[1:])),
-            rank=lookup.rank,
-            device=device,
-            chunk_rows=chunk_rows,
-        )
-        return cls(
-            values, scales, lookup, trainable=trainable, output_dtype=output_dtype
-        )
-
     def lookup_fp8(self, ids):
         return self.lookup.fetch(self.weight, self.scale, ids, self.master)
 

@@ -83,3 +83,31 @@ def load_engram_rows(store, name, *, intervals, rank, device, chunk_rows=4096):
             )
         )
     return tuple(tensors)
+
+
+def load_engram_table(
+    store,
+    name,
+    lookup,
+    *,
+    device,
+    trainable=False,
+    output_dtype=torch.bfloat16,
+    chunk_rows=4096
+):
+    """Compose the model's release loader with the generic resident provider."""
+    from megatron.lite.primitive.modules import engram_lookup
+
+    if lookup.group is not None and torch.device(device).type != 'cuda':
+        raise ValueError('Distributed Engram checkpoint load requires a CUDA device')
+    values, scales = load_engram_rows(
+        store,
+        name,
+        intervals=tuple(zip(lookup.boundaries, lookup.boundaries[1:])),
+        rank=lookup.rank,
+        device=device,
+        chunk_rows=chunk_rows,
+    )
+    return engram_lookup.ShardedEngramTable(
+        values, scales, lookup, trainable=trainable, output_dtype=output_dtype
+    )
