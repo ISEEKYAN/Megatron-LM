@@ -1,0 +1,2 @@
+OFFICIAL_FP4_GPU_OK cases=8 job=7079615 device=NVIDIA GB200 torch=2.13.0a0+8145d630e8.nv26.06
+OFFICIAL_FP8_GPU_OK activation_cases=4 gemm_max_error=0.0 derivatives=2 job=7079615

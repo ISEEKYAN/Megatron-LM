@@ -1,0 +1,8 @@
+{
+  "keys": 2401,
+  "payload_bytes": 7932874632,
+  "storage_ranks": 7,
+  "scope": "supplied-checkpoint-mtp-byte-roundtrip",
+  "full_manifest_sha256": "e12ba7864500971cc845789a2a5caae4b386950b247435ebf19dbaaf7acc136f",
+  "full_manifest_path": "/tmp/ds41-c-mtp-roundtrip/manifest.json"
+}

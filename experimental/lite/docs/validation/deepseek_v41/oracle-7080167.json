@@ -1,0 +1,41 @@
+{
+  "scope": "reduced-official-forward",
+  "job": "7080167",
+  "sequences": [
+    {
+      "sequence": "packed0",
+      "tokens": 3,
+      "captures": 711,
+      "bound_weights": 3164,
+      "targeted_experts": 320
+    },
+    {
+      "sequence": "packed1",
+      "tokens": 9,
+      "captures": 2130,
+      "bound_weights": 3164,
+      "targeted_experts": 320
+    },
+    {
+      "sequence": "packed2",
+      "tokens": 129,
+      "captures": 2130,
+      "bound_weights": 3164,
+      "targeted_experts": 320
+    },
+    {
+      "sequence": "images",
+      "tokens": 37,
+      "captures": 711,
+      "bound_weights": 3164,
+      "targeted_experts": 320
+    }
+  ],
+  "sequence_isolation_exact": true,
+  "baseline_instrumented_exact": true,
+  "ast_capture_additions": [
+    "__capture_index__('index.scores.intermediate', locals())",
+    "__capture_index__('index.scores.intermediate', locals())",
+    "__capture_index__('index.scores.final', locals())"
+  ]
+}

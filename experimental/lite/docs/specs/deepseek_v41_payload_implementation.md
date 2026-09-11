@@ -33,8 +33,10 @@ Execution increments (each a focused 2–5 minute step):
    duplicate/missing keys, and storage repartition.
 3. Expand the A2 MTP names with synthetic payloads and verify exact 2,401-key
    coverage through repartition. This is a synthetic namespace test only.
-4. Run the same streaming path on pinned real MTP shards when available, compare
-   dtype/shape/bytes/digests. This required release gate remains outstanding.
+4. Run the same streaming path on pinned real MTP shards, comparing
+   dtype/shape/bytes/digests. The release run preserved all 2,401 keys and
+   7,932,874,632 payload bytes through seven storage ranks; source digests are
+   recorded in `deepseek_v41_mtp_provenance.json`.
    Entry point: `PYTHONPATH=experimental/lite python experimental/lite/tools/deepseek_v41/validate_mtp_store.py --checkpoint <release-directory> --output <new-directory> --storage-ranks 7`.
 
 The later C1 numerical decoder and B1 official GPU oracle remain separate gates.
