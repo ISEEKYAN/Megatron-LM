@@ -130,6 +130,9 @@ class Indexer(nn.Module):
         if owns_k:
             self.wk = Linear(config.head_dim, config.index_dim)
             self.k_norm = RMSNorm(config.index_dim, config.eps)
+        # Post-training port policy: selection is frozen, with no indexer loss.
+        # Shared compressor/Q projections outside this module remain trainable.
+        self.requires_grad_(False)
 
 
 class CSA2Attention(nn.Module):

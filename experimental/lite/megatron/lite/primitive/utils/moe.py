@@ -7,20 +7,33 @@ from typing import Optional, Tuple
 
 import torch
 
-from transformer_engine.pytorch.cpp_extensions import general_gemm
-from transformer_engine.pytorch.module import base as te_module_base
-from transformer_engine.pytorch.permutation import moe_permute as fused_permute
-from transformer_engine.pytorch.permutation import (
-    moe_permute_and_pad_with_probs as fused_permute_and_pad_with_probs,
+
+# Keep unfused routing usable on CPU without importing GPU-only TE extensions.
+# Fused execution still imports and invokes the original TE operation; no fallback.
+def _lazy_te(module, name):
+    def call(*args, **kwargs):
+        from importlib import import_module
+
+        return getattr(import_module(module), name)(*args, **kwargs)
+
+    return call
+
+
+general_gemm = _lazy_te("transformer_engine.pytorch.cpp_extensions", "general_gemm")
+fused_permute = _lazy_te("transformer_engine.pytorch.permutation", "moe_permute")
+fused_permute_and_pad_with_probs = _lazy_te(
+    "transformer_engine.pytorch.permutation", "moe_permute_and_pad_with_probs"
 )
-from transformer_engine.pytorch.permutation import (
-    moe_permute_with_probs as fused_permute_with_probs,
+fused_permute_with_probs = _lazy_te(
+    "transformer_engine.pytorch.permutation", "moe_permute_with_probs"
 )
-from transformer_engine.pytorch.permutation import moe_unpermute as fused_unpermute
-from transformer_engine.pytorch.router import (
-    fused_compute_score_for_moe_aux_loss,
-    fused_moe_aux_loss,
-    fused_topk_with_score_function,
+fused_unpermute = _lazy_te("transformer_engine.pytorch.permutation", "moe_unpermute")
+fused_compute_score_for_moe_aux_loss = _lazy_te(
+    "transformer_engine.pytorch.router", "fused_compute_score_for_moe_aux_loss"
+)
+fused_moe_aux_loss = _lazy_te("transformer_engine.pytorch.router", "fused_moe_aux_loss")
+fused_topk_with_score_function = _lazy_te(
+    "transformer_engine.pytorch.router", "fused_topk_with_score_function"
 )
 
 
@@ -34,6 +47,8 @@ def _te_general_gemm(
     bias: torch.Tensor | None = None,
     grad: bool = False,
 ):
+    from transformer_engine.pytorch.module import base as te_module_base
+
     if (get_workspace := getattr(te_module_base, "get_workspace", None)) is None:
         return None
     kwargs = dict(

@@ -169,3 +169,29 @@ def test_composed_state_is_per_call_and_reindex_preserves_owner():
         block.contract_hc(out, final_pre).square().sum(), [a, b], allow_unused=True
     )
     assert ga is None and torch.count_nonzero(gb)
+
+
+def test_frozen_indexers_are_excluded_from_optimizer_and_kv_still_trains():
+    modules = torch.nn.ModuleList(
+        [attn.CSA2Attention(config(), i).float() for i in range(40)]
+    )
+    index_params = [
+        p for m in modules if m.indexer is not None for p in m.indexer.parameters()
+    ]
+    assert index_params and all(not p.requires_grad for p in index_params)
+    optimizer = torch.optim.SGD(
+        (p for p in modules.parameters() if p.requires_grad), lr=0.01
+    )
+    optimized = {id(p) for group in optimizer.param_groups for p in group['params']}
+    assert optimized.isdisjoint(map(id, index_params))
+    before = [p.clone() for p in index_params]
+    x = torch.randn(1, 4, 32, requires_grad=True)
+    _, state = modules[20](x, attn.AttentionState())
+    y, _ = modules[21](x, state)
+    y.square().sum().backward()
+    assert modules[20].compressor.wkv.weight.grad.abs().sum() > 0
+    assert modules[21].wq_a.weight.grad.abs().sum() > 0
+    assert all(p.grad is None for p in index_params)
+    optimizer.step()
+    for p, old in zip(index_params, before):
+        torch.testing.assert_close(p, old, atol=0, rtol=0)

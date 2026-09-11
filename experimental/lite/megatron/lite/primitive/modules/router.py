@@ -189,14 +189,23 @@ class SigmoidTopKRouter(nn.Module):
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = self.gate(x)
+        return self.route_logits(self.gate(x))
+
+    def route_logits(
+        self, logits: torch.Tensor, *, expert_bias: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route supplied logits with an optional per-token selection-only bias."""
         logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
         probs_dense, routing_map = topk_routing_with_score_function(
             logits,
             self.topk,
             score_function=self.score_function,
-            expert_bias=self.expert_bias.to(logits.dtype),
+            expert_bias=(
+                self.expert_bias.to(logits.dtype)
+                if expert_bias is None
+                else expert_bias
+            ),
             scaling_factor=(self.scaling_factor or None),
             fused=self.moe_router_fusion,
         )

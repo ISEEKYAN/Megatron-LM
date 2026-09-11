@@ -1,8 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Engram computation, with explicit table/projection providers.
 
-Storage, sharding and the unresolved FP8 training state policy are owned by the
-providers. This module never creates a floating master or updates FP8 scales.
+The local table provider supports frozen FP8 and trainable FP32-master modes.
+FP32 master representation is an approved port choice, not an official recipe.
+Sharding and optimizer-step publication hooks belong to the distributed layer.
 """
 
 import numpy as np
@@ -118,15 +119,9 @@ class NgramHash(nn.Module):
         if cu_seqlens is not None:
             if b != 1:
                 raise ValueError("THD packing requires B=1")
-            bounds = cu_seqlens.tolist()
-            if (
-                not bounds
-                or bounds[0] != 0
-                or bounds[-1] != length
-                or any(y <= x for x, y in zip(bounds, bounds[1:]))
-            ):
-                raise ValueError("Packed lengths must strictly partition the input")
-            for begin, end in zip(bounds, bounds[1:]):
+            from megatron.lite.primitive.utils.packed_seq import packed_sequence_ranges
+
+            for begin, end in packed_sequence_ranges(cu_seqlens, length):
                 starts[:, begin:end] = begin
         blocked = torch.zeros_like(positions, dtype=torch.bool)
         history = []
@@ -140,6 +135,67 @@ class NgramHash(nn.Module):
             rolling = torch.bitwise_xor(rolling, products[..., i])
             hashes.append(rolling.unsqueeze(-1) % self.primes[:, i - 1])
         return torch.cat(hashes, -1) + self.offsets
+
+
+class EngramTable(nn.Module):
+    """Resident FP8 rows with one construction-time trainability switch.
+
+    Trainable mode uses a persistent FP32 master and identity STE on gathered
+    rows. Call refresh_storage after an accepted optimizer step. Forward and
+    recompute do not publish or mutate storage. No host offload is performed.
+    """
+
+    def __init__(self, weight, scale, *, trainable=False, output_dtype=torch.bfloat16):
+        super().__init__()
+        if (
+            weight.ndim != 2
+            or weight.shape[1] % 32
+            or weight.dtype != torch.float8_e4m3fn
+            or scale.dtype != torch.float8_e8m0fnu
+            or scale.shape != (weight.shape[0], weight.shape[1] // 32)
+            or scale.device != weight.device
+        ):
+            raise ValueError("Expected FP8 table [rows,D] and E8M0 row/block32 scales")
+        self.output_dtype = output_dtype
+        self.register_buffer("weight", weight.detach().clone())
+        self.register_buffer("scale", scale.detach().clone())
+        if trainable:
+            master = weight.float() * scale.float().repeat_interleave(32, -1)
+            self.master = nn.Parameter(master)
+        else:
+            self.register_parameter("master", None)
+
+    def _apply(self, fn, recurse=True):
+        # A parent .bfloat16() must not widen FP8 storage or round the master.
+        # Probe only the destination device/dtype, without a lossy round-trip.
+        def preserve_dtype(tensor):
+            probe = fn(torch.empty(0, dtype=tensor.dtype, device=tensor.device))
+            if probe.dtype == tensor.dtype:
+                return fn(tensor)
+            return tensor.to(device=probe.device)
+
+        return super()._apply(preserve_dtype, recurse=recurse)
+
+    def forward(self, ids):
+        # Byte indexing works for FP8 on CPU as well as CUDA; only fetched rows
+        # are dequantized, so frozen execution never materializes a full master.
+        rows = self.weight.view(torch.uint8)[ids].view(self.weight.dtype).float()
+        scales = self.scale.view(torch.uint8)[ids].view(self.scale.dtype).float()
+        decoded = rows * scales.repeat_interleave(32, -1)
+        if self.master is not None:
+            floating = self.master[ids]
+            decoded = floating + (decoded - floating).detach()
+        return decoded.to(self.output_dtype)
+
+    @torch.no_grad()
+    def refresh_storage(self):
+        if self.master is None:
+            return
+        from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+
+        weight, scale = quantize_block_fp8(self.master, (1, 32), scale_format="e8m0")
+        self.weight.copy_(weight)
+        self.scale.copy_(scale)
 
 
 class Engram(nn.Module):

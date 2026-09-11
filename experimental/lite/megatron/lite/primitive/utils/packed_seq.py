@@ -58,4 +58,25 @@ class PackedSeqParams:
         )
 
 
-__all__ = ["PackedSeqParams"]
+__all__ = ["PackedSeqParams", "packed_sequence_ranges"]
+
+
+def packed_sequence_ranges(
+    cu_seqlens: Tensor, total_tokens: int
+) -> list[tuple[int, int]]:
+    """Validate and split an unpadded single-rank THD sequence partition.
+
+    This shared helper is for sequence-local semantic execution; padded CP
+    partitions must first go through the parallel THD transport helpers.
+    """
+    if cu_seqlens.ndim != 1 or cu_seqlens.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Expected one-dimensional integer cu_seqlens")
+    bounds = cu_seqlens.tolist()
+    if (
+        len(bounds) < 2
+        or bounds[0] != 0
+        or bounds[-1] != total_tokens
+        or any(end <= start for start, end in zip(bounds, bounds[1:]))
+    ):
+        raise ValueError("cu_seqlens must strictly partition all tokens")
+    return list(zip(bounds, bounds[1:]))
