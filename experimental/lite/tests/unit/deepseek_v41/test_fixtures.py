@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 
 import torch
@@ -9,6 +10,66 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 fixtures = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(fixtures)
+
+
+def test_generated_manifest_shapes_and_scale_layouts():
+    manifest = json.loads(
+        (_ROOT / "tests/fixtures/deepseek_v41/manifest.json").read_text()
+    )
+    records = {r["name"]: r for r in manifest["tensors"]}
+    assert len(records) == 3204
+    assert len(manifest["converted_keys"]) == 3164
+    dimensions = {
+        "attn.wq_a.weight": [64, 128],
+        "attn.wq_b.weight": [512, 64],
+        "attn.wkv.weight": [64, 128],
+        "attn.wo_a.weight": [256, 64],
+        "attn.wo_b.weight": [128, 256],
+        "attn.q_norm.weight": [64],
+        "attn.kv_norm.weight": [64],
+        "attn.attn_sink": [8],
+        "attn_norm.weight": [128],
+        "ffn_norm.weight": [128],
+        "ffn.gate.weight": [8, 128],
+        "ffn.gate.bias": [8],
+        "ffn.gate.bias_vl": [8],
+        "hc_attn_fn": [24, 512],
+        "hc_ffn_fn": [24, 512],
+        "hc_attn_base": [24],
+        "hc_ffn_base": [24],
+        "hc_attn_scale": [3],
+        "hc_ffn_scale": [3],
+    }
+    for layer in range(40):
+        for suffix, shape in dimensions.items():
+            assert records[f"layers.{layer}.{suffix}"]["shape"] == shape
+        for expert in range(8):
+            for matrix, shape in {
+                "w1": [64, 64],
+                "w3": [64, 64],
+                "w2": [128, 32],
+            }.items():
+                name = f"layers.{layer}.ffn.experts.{expert}.{matrix}.weight"
+                assert records[name]["shape"] == shape
+                assert records[name]["dtype"] == "torch.int8"
+    for name, record in records.items():
+        if name.endswith(".scale"):
+            weight = records[name[:-5] + "weight"]
+            rows, cols = weight["shape"]
+            expected = (
+                [rows, cols // 16]
+                if weight["dtype"] == "torch.int8"
+                else (
+                    [rows, 1]
+                    if ".engram.embed." in name
+                    else [(rows + 31) // 32, (cols + 31) // 32]
+                )
+            )
+            assert record["shape"] == expected, name
+    assert records["layers.1.engram.embed.weight"]["shape"] == [1998, 32]
+    assert records["layers.14.engram.embed.weight"]["shape"] == [5014, 32]
+    assert records["aligner.w1.weight"]["shape"] == [128, 576]
+    assert records["vision.patch_embed.proj.weight"]["shape"] == [64, 588]
 
 
 def test_40_layer_owner_identities():

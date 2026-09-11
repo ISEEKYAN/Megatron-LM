@@ -41,6 +41,24 @@ def snapshot(value):
     return value
 
 
+def tensor_metadata(value):
+    """Serialize capture descriptors only after the producing forward finishes."""
+    if isinstance(value, torch.Tensor):
+        raw = value.contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
+        return dict(
+            shape=list(value.shape),
+            dtype=str(value.dtype),
+            device=str(value.device),
+            byte_length=len(raw),
+            sha256=hashlib.sha256(raw).hexdigest(),
+        )
+    if isinstance(value, dict):
+        return {key: tensor_metadata(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [tensor_metadata(item) for item in value]
+    return value
+
+
 def forward_all_tokens(model, *args, _record_head=None, **kwargs):
     captured = []
     handle = model.head.register_forward_pre_hook(
@@ -436,6 +454,10 @@ def _execute(
     finally:
         if session:
             session.close()
+    if recorder:
+        for record in recorder.records:
+            record["rank"] = 0
+            record["tensor_metadata"] = tensor_metadata(record["value"])
     return dict(
         logits=torch.cat(outputs),
         last_logits=last_outputs,

@@ -149,6 +149,12 @@ def main():
         isolated["sequences"][1]["logits"], result["sequences"][1]["logits"]
     ), "stale sequence state"
     options.output.mkdir(parents=True, exist_ok=False)
+    capture_manifest = [
+        {key: value for key, value in record.items() if key != "value"}
+        for record in result["captures"]
+    ]
+    capture_bytes = (json.dumps(capture_manifest, indent=2) + "\n").encode()
+    (options.output / "captures.json").write_bytes(capture_bytes)
     evidence = dict(
         scope="reduced-official-forward",
         job=os.environ["SLURM_JOB_ID"],
@@ -156,6 +162,8 @@ def main():
         sequence_isolation_exact=True,
         baseline_instrumented_exact=True,
         ast_capture_additions=result["sequences"][0]["ast_capture_additions"],
+        capture_count=len(capture_manifest),
+        capture_manifest_sha256=hashlib.sha256(capture_bytes).hexdigest(),
     )
     (options.output / "evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(
