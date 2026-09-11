@@ -73,8 +73,9 @@ class _DynamicLinear(torch.autograd.Function):
             weight, (32, 32), scale_format="e8m0"
         )
         decoded_weight = dequantize_block_fp8(encoded_weight, scales, (32, 32)).to(
-            weight.dtype
+            x.dtype
         )
+        ctx.weight_dtype = weight.dtype
         ctx.save_for_backward(
             activation.decoded.reshape(-1, x.shape[-1]), decoded_weight
         )
@@ -91,8 +92,13 @@ class _DynamicLinear(torch.autograd.Function):
     def backward(ctx, grad):
         activation, weight = ctx.saved_tensors
         flat_grad = grad.reshape(-1, weight.shape[0]).float()
-        dx = (flat_grad @ weight.float()).reshape(ctx.input_shape).to(activation.dtype)
-        dw = (flat_grad.T @ activation.float()).to(weight.dtype)
+        with torch.autocast(device_type=grad.device.type, enabled=False):
+            dx = (
+                (flat_grad @ weight.float())
+                .reshape(ctx.input_shape)
+                .to(activation.dtype)
+            )
+            dw = (flat_grad.T @ activation.float()).to(ctx.weight_dtype)
         return dx, dw
 
 
@@ -110,6 +116,10 @@ def dynamic_fp8_linear(x, weight):
         raise ValueError(
             "Linear requires matching K and weight dimensions divisible by 32"
         )
-    if x.device != weight.device or x.dtype != weight.dtype:
-        raise ValueError("floating activation and weight must share device and dtype")
+    if x.device != weight.device or (
+        x.dtype != weight.dtype and weight.dtype != torch.float32
+    ):
+        raise ValueError(
+            "activation and weight must share device and compute dtype, or use an FP32 master"
+        )
     return _DynamicLinear.apply(x, weight)

@@ -94,6 +94,12 @@ class Linear(nn.Linear):
         self.fp8 = fp8
 
     def forward(self, x):
+        if getattr(self, 'native_fp32', False) and not self.fp8:
+            from megatron.lite.primitive.modules.native_fp32_linear import (
+                native_fp32_linear,
+            )
+
+            return native_fp32_linear(x, self.weight)
         return (
             ds41_fp8.dynamic_fp8_linear(x, self.weight)
             if self.fp8
@@ -275,5 +281,18 @@ class CSA2Attention(nn.Module):
         output = rotate(output, positions, c, ratio, inverse=True)
         grouped = output.reshape(b, length, c.groups, -1)
         weight = self.wo_a.weight.reshape(c.groups, c.o_rank, -1)
-        output = torch.einsum('bsgd,grd->bsgr', grouped, weight).flatten(2)
+        if getattr(self.wo_a, 'native_fp32', False):
+            from megatron.lite.primitive.modules.native_fp32_linear import (
+                native_fp32_linear,
+            )
+
+            output = torch.stack(
+                [
+                    native_fp32_linear(grouped[:, :, i], weight[i])
+                    for i in range(c.groups)
+                ],
+                dim=2,
+            ).flatten(2)
+        else:
+            output = torch.einsum('bsgd,grd->bsgr', grouped, weight).flatten(2)
         return self.wo_b(output), state

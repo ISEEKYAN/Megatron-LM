@@ -1,7 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Single-rank packed multimodal protocol with explicit vision scheduling."""
 
-from dataclasses import dataclass, field
+import math
+from contextlib import nullcontext
+from dataclasses import dataclass, field, replace
 
 import torch
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
@@ -11,6 +13,7 @@ from megatron.lite.runtime.contracts import ParallelConfig
 from torch.nn import functional as F
 
 from .checkpoint import export_model, load_model, save_model
+from .optimizer_groups import OptimizerConfig, V41Optimizer, VisionOptimizerConfig
 from .training import VisionSchedule, VisionTrainability
 
 
@@ -18,6 +21,7 @@ from .training import VisionSchedule, VisionTrainability
 class ImplConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
     optimizer: str | None = None
+    optimizer_config: OptimizerConfig | None = None
     device: str = 'cuda'
     dtype: torch.dtype = torch.bfloat16
     quantized: bool = True
@@ -49,14 +53,22 @@ def build_model(model_cfg, *, impl_cfg):
         or p.etp not in (None, 1)
         or p.pp_layout is not None
     ):
-        raise NotImplementedError('V4.1 assembly currently requires single-rank parallelism')
+        raise NotImplementedError(
+            'V4.1 assembly currently requires single-rank parallelism'
+        )
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
         raise NotImplementedError(
             'Distributed V4.1 construction requires the parallel integration'
         )
-    if impl_cfg.optimizer is not None:
-        raise NotImplementedError(
-            'Optimizer construction requires the V4.1 object-based routing integration'
+    if impl_cfg.optimizer not in (None, 'muon'):
+        raise ValueError('V4.1 optimizer must be explicitly selected as muon')
+    if impl_cfg.optimizer is None and impl_cfg.optimizer_config is not None:
+        raise ValueError('optimizer_config requires selecting the V4.1 optimizer')
+    if impl_cfg.optimizer == 'muon' and not isinstance(
+        impl_cfg.optimizer_config, OptimizerConfig
+    ):
+        raise ValueError(
+            'V4.1 Muon requires explicit optimizer_config including NS backend settings'
         )
     if impl_cfg.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
@@ -86,6 +98,30 @@ def build_model(model_cfg, *, impl_cfg):
         model.engram_hash.to(device=impl_cfg.device)
     if impl_cfg.vision_trainability is not None:
         impl_cfg.vision_trainability.apply(model)
+    optimizer = None
+    if impl_cfg.optimizer == 'muon':
+        if impl_cfg.vision_trainability is None:
+            raise ValueError(
+                'Optimizer construction requires an explicit visual trainability mask'
+            )
+        if impl_cfg.device == 'meta':
+            raise ValueError(
+                'Materialize V4.1 parameters before constructing optimizer state'
+            )
+        # Persistent FP32 owners receive FP32 wgrad from the numerical providers.
+        # No post-hoc BF16 gradient widening is used.
+        from .attention import Linear
+
+        for module in model.modules():
+            if isinstance(module, Linear):
+                module.native_fp32 = True
+                module.weight.data = module.weight.data.float()
+        for p in model.parameters():
+            if p.requires_grad:
+                p.data = p.data.float()
+                p.main_grad = None
+        model.residual_dtype = impl_cfg.dtype
+        optimizer = V41Optimizer(model, impl_cfg.optimizer_config)
     if impl_cfg.external_vision_device is not None:
         if impl_cfg.vision_trainability is None:
             raise ValueError('External vision requires an explicit post-training mask')
@@ -93,14 +129,53 @@ def build_model(model_cfg, *, impl_cfg):
     return ModelBundle(
         [model],
         ParallelState(),
+        optimizer=optimizer,
         forward_step=_forward_step,
         extras={
             'model_cfg': model_cfg,
             'vision_schedule': model.vision_schedule,
-            'optimizer_backend': 'none',
+            'prepare_microbatches': prepare_microbatches,
+            'optimizer_backend': 'none' if optimizer is None else 'v41',
             'parameter_bindings': model.parameter_bindings,
         },
     )
+
+
+def prepare_microbatches(data_iter, count):
+    """Use one valid-token denominator for all SFT microbatches (O16)."""
+    from megatron.lite.runtime.contracts.loss import LossContext, split_loss_context
+
+    if count < 1:
+        raise ValueError('Microbatch count must be positive')
+    items = [split_loss_context(next(data_iter)) for _ in range(count)]
+    total = 0.0
+    for batch, _ in items:
+        if batch.labels is None:
+            raise ValueError('SFT normalization requires labels')
+        mask = (
+            torch.ones_like(batch.labels, dtype=torch.float32)
+            if batch.loss_mask is None
+            else batch.loss_mask
+        )
+        if (
+            mask.shape != batch.input_ids.shape
+            or not torch.isfinite(mask).all()
+            or (mask < 0).any()
+        ):
+            raise ValueError('Expected finite nonnegative token loss weights')
+        offset = 0
+        for length in batch.seq_lens.tolist():
+            total += float(mask[offset + 1 : offset + length].sum())
+            offset += length
+    # The generic runtime divides every microbatch by count after this loss.
+    denominator = max(total, 1.0) / count
+    return [
+        (
+            batch,
+            replace(context or LossContext(), normalization_denominator=denominator),
+        )
+        for batch, context in items
+    ]
 
 
 def _forward_step(model, batch):
@@ -124,7 +199,12 @@ def _forward_step_impl(model, batch):
         raise ValueError('Expected packed 1-D tokens matching seq_lens')
     if batch.position_ids is not None and not torch.equal(
         batch.position_ids,
-        torch.cat([torch.arange(int(n), device=batch.input_ids.device) for n in batch.seq_lens]),
+        torch.cat(
+            [
+                torch.arange(int(n), device=batch.input_ids.device)
+                for n in batch.seq_lens
+            ]
+        ),
     ):
         raise ValueError('Only sequence-local positions are supported')
     from megatron.lite.runtime.contracts.loss import get_loss_context
@@ -138,10 +218,18 @@ def _forward_step_impl(model, batch):
         if modality['token_types'].shape != batch.input_ids.shape:
             raise ValueError('Packed token types must match the input IDs')
         modality['token_types'] = modality['token_types'][None]
-    logits = (
-        model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality)['logits'][0]
-        / temperature
+    precision = (
+        torch.autocast(device_type=batch.input_ids.device.type, enabled=False)
+        if hasattr(model, 'residual_dtype')
+        else nullcontext()
     )
+    with precision:
+        logits = (
+            model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality)[
+                'logits'
+            ][0]
+            / temperature
+        )
     result = {'logits': logits}
     if model.vision_schedule is not None and model.vision_schedule.stage != 'idle':
         result['backward'] = model.vision_schedule.backward
@@ -164,7 +252,14 @@ def _forward_step_impl(model, batch):
             labels[end - 1], mask[end - 1] = 0, 0
             offset = end
         token_loss = F.cross_entropy(logits, labels, reduction='none')
-        result['loss'] = (token_loss * mask).sum() / mask.sum().clamp_min(1)
+        denominator = mask.sum().clamp_min(1)
+        if context is not None and context.normalization_denominator is not None:
+            denominator = context.normalization_denominator
+            if not math.isfinite(denominator) or denominator <= 0:
+                raise ValueError('Loss denominator must be finite and positive')
+        result['loss'] = (token_loss * mask).sum() / denominator
+        if context is not None:
+            result['loss'] = result['loss'] * context.loss_scale
         if context is None or context.return_log_probs:
             result['log_probs'] = -token_loss
     if context is not None and context.calculate_entropy:
@@ -175,13 +270,18 @@ def _forward_step_impl(model, batch):
 
 def unpack_forward_output(model, batch, output):
     if isinstance(output, dict):
-        return {key: unpack_forward_output(model, batch, value) for key, value in output.items()}
+        return {
+            key: unpack_forward_output(model, batch, value)
+            for key, value in output.items()
+        }
     if (
         isinstance(output, torch.Tensor)
         and output.ndim > 0
         and output.shape[0] == batch.total_tokens
     ):
-        return torch.nested.as_nested_tensor(list(output.split(batch.seq_lens.tolist())))
+        return torch.nested.as_nested_tensor(
+            list(output.split(batch.seq_lens.tolist()))
+        )
     return output
 
 

@@ -27,8 +27,17 @@ class VisionTrainability:
     def apply(self, model):
         schedule = getattr(model, 'vision_schedule', None)
         if schedule is not None and schedule.stage != 'idle':
-            raise RuntimeError('Cannot change trainability with a pending vision backward')
+            raise RuntimeError(
+                'Cannot change trainability with a pending vision backward'
+            )
         model.vision_trainability = self
+        model._vision_trainability.copy_(
+            torch.tensor(
+                [self.encoder, self.norm, self.aligner, self.delimiter],
+                dtype=torch.int8,
+                device=model._vision_trainability.device,
+            )
+        )
         for parameter in model.vision.parameters():
             parameter.requires_grad_(self.encoder)
         for parameter in model.vision.norm.parameters():
@@ -68,13 +77,18 @@ class VisionSchedule:
         self.leaves = []
 
     def _pairs(self):
-        for owner, copy in ((self.model.vision, self.vision), (self.model.aligner, self.aligner)):
+        for owner, copy in (
+            (self.model.vision, self.vision),
+            (self.model.aligner, self.aligner),
+        ):
             yield from zip(owner.parameters(), copy.parameters(), strict=True)
 
     @torch.no_grad()
     def sync_weights(self):
         if self.stage != 'idle':
-            raise RuntimeError('Cannot synchronize weights with a pending vision backward')
+            raise RuntimeError(
+                'Cannot synchronize weights with a pending vision backward'
+            )
         for owner, replica in self._pairs():
             replica.copy_(owner)
             replica.requires_grad_(owner.requires_grad)
@@ -94,7 +108,9 @@ class VisionSchedule:
                     weight = self.vision.patch_embed.proj.weight
                     patches = img.patches.to(device=weight.device, dtype=weight.dtype)
                     feature = self.aligner(
-                        self.vision(patches, img.n_vit_h, img.n_vit_w), img.n_vit_h, img.n_vit_w
+                        self.vision(patches, img.n_vit_h, img.n_vit_w),
+                        img.n_vit_h,
+                        img.n_vit_w,
                     )
                     leaf = feature.detach().to(self.model.embed.weight.device)
                     leaf.requires_grad_(feature.requires_grad)
@@ -127,7 +143,8 @@ class VisionSchedule:
         ]
         if active:
             torch.autograd.backward(
-                [value for value, _ in active], [grad.to(value.device) for value, grad in active]
+                [value for value, _ in active],
+                [grad.to(value.device) for value, grad in active],
             )
         for owner, replica in self._pairs():
             if owner.requires_grad and replica.grad is not None:
@@ -148,7 +165,10 @@ class VisionSchedule:
         """
         if self.stage != 'idle':
             raise RuntimeError('Checkpoint requires a completed vision backward')
-        return {'version': 1, 'trainability': vars(self.model.vision_trainability).copy()}
+        return {
+            'version': 1,
+            'trainability': vars(self.model.vision_trainability).copy(),
+        }
 
     def load_state_dict(self, state):
         if self.stage != 'idle':
