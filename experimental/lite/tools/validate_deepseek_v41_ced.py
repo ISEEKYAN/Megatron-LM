@@ -1,5 +1,7 @@
 """Execute pinned official control flow with CPU probes, not production kernels."""
+import argparse
 import ast
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import torch
@@ -116,6 +118,19 @@ def validate(source):
         try:
             check_dataflow(source.replace(old, new))
         except (AssertionError, RuntimeError):
+            print(f'ok: rejected dataflow mutation: {old} -> {new}')
             continue
         raise AssertionError(f'wrong dataflow accepted: {new}')
     print(f'ok: official CPU dataflow probes; {len(mutations)} rejected mutations (without hash gate)')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--official-model', '--model', dest='model', type=Path, required=True,
+                        help='Official model.py source to execute with CPU probes')
+    args = parser.parse_args()
+    validate(args.model.read_text())
+
+
+if __name__ == '__main__':
+    main()

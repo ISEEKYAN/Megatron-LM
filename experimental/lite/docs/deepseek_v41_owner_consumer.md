@@ -106,6 +106,15 @@ unique provenance.  It is not a sampled check.
 
 ## Executable validation and limits
 
+Run the CPU dataflow probes independently (each rejected mutation is reported):
+
+```sh
+python experimental/lite/tools/validate_deepseek_v41_ced.py \
+  --official-model /path/to/model.py
+```
+
+The complete owner/consumer check also calls these same probes:
+
 ```sh
 python experimental/lite/tools/validate_deepseek_v41_owner_consumer.py \
   --model /path/to/model.py --config /path/to/config.json \
