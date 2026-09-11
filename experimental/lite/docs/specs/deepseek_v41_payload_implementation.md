@@ -39,3 +39,20 @@ Execution increments (each a focused 2–5 minute step):
 
 The later C1 numerical decoder and B1 official GPU oracle remain separate gates.
 CPU archival tests cannot certify official quantized execution or full-model parity.
+
+## Numerical decoding interface
+
+`load_weight(store, name, output_dtype=torch.bfloat16)` reads a digest-checked
+weight and its exact sibling `scale`. I8 weights use the existing MXFP4 decoder
+(low nibble first, E2M1, 32-element groups, E8M0 scales). E4M3 matrices use the
+existing block-FP8 decoder with 32x32 scales; Engram `embed.weight` uses explicit
+row-by-32 scale layout. BF16/F16/F32 exports pass through without a scale;
+an unexpected sibling scale fails. The result is a detached numerical binding,
+not an executable Linear or a training master-weight policy.
+
+Independent code card: bytes `10 32 54 76 98 ba dc fe`, repeated twice, decode
+to `[0,.5,1,1.5,2,3,4,6,-0,-.5,-1,-1.5,-2,-3,-4,-6]` repeated twice at scale 1.
+At scale 2 every value doubles; two rows dotted with all-ones produce zero.
+For FP8 input ones `[64,64]` with scales `[[.5,1],[2,4]]`, an all-ones vector
+produces first 32 outputs 48 and last 32 outputs 192. These CPU cards are exact;
+official kernel comparison and loaded GPU GEMM remain required separately.
