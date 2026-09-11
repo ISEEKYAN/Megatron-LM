@@ -9,7 +9,6 @@ from unittest.mock import patch
 import numpy as np
 import torch
 import torch.nn as nn
-
 from megatron.lite.primitive.ckpt import save_training_checkpoint
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import ParallelConfig
@@ -230,7 +229,7 @@ def test_primitive_explicit_dcp_saves_optimizer_rank_sidecar(tmp_path):
         patch("megatron.lite.primitive.ckpt.dcp.dcp.save") as dcp_save_mock,
     ):
         save_training_checkpoint(
-            model, optimizer, 12, str(tmp_path), parallel, object(), use_dcp=True
+            model, optimizer, 12, str(tmp_path), parallel, SimpleNamespace(pp_size=1), use_dcp=True
         )
 
     dcp_save_mock.assert_called_once()

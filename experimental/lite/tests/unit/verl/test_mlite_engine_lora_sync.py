@@ -15,9 +15,10 @@ invariant if it sits where that invariant is still visible.
 from __future__ import annotations
 
 import pytest
-from verl_mlite.engine.mlite_engine import MegatronLiteEngine
 
-resolve = MegatronLiteEngine._lora_rollout_sync_is_merge
+
+def resolve(config):
+    return MegatronLiteEngine._lora_rollout_sync_is_merge(config)
 
 
 def test_default_is_adapter_only_when_the_key_is_absent():
@@ -73,3 +74,10 @@ def test_ordinary_init_does_not_trigger_the_override():
         )
         is False
     )
+
+
+@pytest.fixture(autouse=True)
+def _optional_verl_imports():
+    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
+    global MegatronLiteEngine
+    from verl_mlite.engine.mlite_engine import MegatronLiteEngine

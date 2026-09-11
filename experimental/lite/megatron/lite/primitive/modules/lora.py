@@ -92,7 +92,7 @@ def normalize_lora_spec(config: LoraSpec | dict[str, Any] | None) -> LoraSpec:
     if isinstance(config, LoraSpec):
         return config
     if not isinstance(config, dict):
-        raise TypeError(f"LoRA spec must be LoraSpec, dict, or None, got {type(config)!r}.")
+        raise TypeError(f"LoRA config must be LoraSpec, dict, or None, got {type(config)!r}.")
     values = dict(config)
     if values.get("enabled") is False:
         values["rank"] = 0
@@ -543,6 +543,57 @@ class LinearLoRA(nn.Module):
             base_weight.sub_(delta.to(base_weight.dtype))
 
 
+class GroupedLinearLoRA(nn.Module):
+    """Per-local-expert LoRA delta for `te.GroupedLinear` expert surfaces."""
+
+    def __init__(
+        self,
+        num_local_experts: int,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        *,
+        alpha: int | None = None,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("LoRA rank must be positive for GroupedLinearLoRA.")
+        self.num_local_experts = int(num_local_experts)
+        self.rank = int(rank)
+        self.scale = float(rank if alpha is None else alpha) / float(rank)
+        self.dropout_p = float(dropout)
+        self.lora_a = nn.Parameter(torch.empty(num_local_experts, rank, in_features))
+        self.lora_b = nn.Parameter(torch.empty(num_local_experts, out_features, rank))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
+        nn.init.zeros_(self.lora_b)
+
+    def forward(self, x: torch.Tensor, splits: list[int]) -> torch.Tensor:
+        if len(splits) != self.num_local_experts:
+            raise ValueError(
+                f"GroupedLinearLoRA expected {self.num_local_experts} splits, got {len(splits)}."
+            )
+        outputs = []
+        offset = 0
+        for expert_idx, size in enumerate(splits):
+            x_i = x[offset : offset + size]
+            if size == 0:
+                outputs.append(x_i.new_empty((0, self.lora_b.shape[1])))
+            else:
+                dropped = (
+                    F.dropout(x_i, p=self.dropout_p, training=self.training)
+                    if self.dropout_p
+                    else x_i
+                )
+                h_i = dropped.matmul(self.lora_a[expert_idx].t())
+                outputs.append(h_i.matmul(self.lora_b[expert_idx].t()) * self.scale)
+            offset += size
+        return torch.cat(outputs, dim=0) if outputs else x.new_empty((0, self.lora_b.shape[1]))
+
+
 class SharedGroupedLinearLoRA(nn.Module):
     """LoRA delta shared by all local experts in a GroupedLinear."""
 
@@ -619,9 +670,7 @@ def _weight_owner(module: nn.Module) -> nn.Module | None:
 
 def apply_olora_tail_init(model: nn.Module) -> dict[str, int]:
     from megatron.lite.primitive.modules.lora_apply import (
-        LoRAWrappedGroupedLinear,
-        LoRAWrappedLinear,
-    )
+        LoRAWrappedGroupedLinear, LoRAWrappedLinear)
 
     stats = {"initialized": 0, "skipped": 0}
     for module in model.modules():
@@ -638,6 +687,7 @@ def apply_olora_tail_init(model: nn.Module) -> dict[str, int]:
 
 
 __all__ = [
+    "GroupedLinearLoRA",
     "LinearLoRA",
     "LoraConfig",
     "LoraSpec",

@@ -19,10 +19,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from megatron.lite.model.deepseek_v4.lite.protocol import \
+    _nested_from_packed_tensor
 from tensordict import TensorDict
-
-from verl_mlite.engine.mlite_engine import MegatronLiteEngine
-from megatron.lite.model.deepseek_v4.lite.protocol import _nested_from_packed_tensor
 
 pytestmark = pytest.mark.mlite
 
@@ -120,3 +119,10 @@ def test_response_longer_than_input_is_rejected():
     )
     with pytest.raises(ValueError, match="tokens but packed input"):
         MegatronLiteEngine._loss_mask_for_packing(micro_batch, input_ids)
+
+
+@pytest.fixture(autouse=True)
+def _optional_verl_imports():
+    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
+    global MegatronLiteEngine
+    from verl_mlite.engine.mlite_engine import MegatronLiteEngine

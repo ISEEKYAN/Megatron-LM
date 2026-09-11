@@ -1,11 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from __future__ import annotations
+
 from types import SimpleNamespace
 
 import pytest
 import torch
-
-from verl_mlite.engine.config import MegatronLiteEngineConfig
-from verl_mlite.engine.mlite_engine import MegatronLiteEngine, _build_lr_scheduler
 from megatron.lite.runtime.contracts import LossContext
 
 
@@ -200,3 +199,12 @@ def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
 
     assert scheduler.state_dict() == state
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.7)
+
+
+@pytest.fixture(autouse=True)
+def _optional_verl_imports():
+    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
+    global MegatronLiteEngineConfig, MegatronLiteEngine, _build_lr_scheduler
+    from verl_mlite.engine.config import MegatronLiteEngineConfig
+    from verl_mlite.engine.mlite_engine import (MegatronLiteEngine,
+                                                _build_lr_scheduler)
