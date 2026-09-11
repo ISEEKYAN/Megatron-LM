@@ -42,7 +42,7 @@ class _MockModel(torch.nn.Module):
         self._input_tensor = t
 
 
-def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
+def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8, terminal="loss"):
     """Run the real _1f1b_schedule for one rank with _send_recv_pipeline mocked to
     play the peer (recv tensor of the peer-sent shape, in transfer order); records
     recv shapes to prove each recv maps to the right mb."""
@@ -80,7 +80,8 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
         hidden_t = base * m.weight.sum()
         out = {"hidden_states": hidden_t}
         if ps.pp_is_last:
-            out["loss"] = hidden_t.float().sum()
+            out["loss" if terminal == "loss" else "hidden_states"] = (
+                hidden_t.detach() if terminal == "detached" else hidden_t).float().sum()
         return out
 
     batches = [{"S": s} for s in seq_lens]
@@ -91,6 +92,7 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
             num_mb, SimpleNamespace(num_microbatches=num_mb), ps, fwd_shapes[0])
     finally:
         pl._send_recv_pipeline = orig_srp
+    assert (model.weight.grad is None) == (terminal == "detached")
     return recorded_fwd, recorded_bwd, fwd_shapes
 
 
@@ -104,8 +106,9 @@ def test_middle_stage_recv_shapes_match_each_microbatch(pp_rank):
     assert rf == fs and rb == fs, (rf, rb, fs)
 
 
-def test_last_stage_recv_shapes_match_each_microbatch():
-    rf, rb, fs = _run_schedule(4, 3, VARLEN)  # last: every fwd input, no bwd recv
+@pytest.mark.parametrize("terminal", ["loss", "no_loss", "detached"])
+def test_last_stage_recv_shapes_match_each_microbatch(terminal):
+    rf, rb, fs = _run_schedule(4, 3, VARLEN, terminal=terminal)  # last: every fwd input, no bwd recv
     assert rf == fs and rb == [], (rf, rb, fs)
 
 

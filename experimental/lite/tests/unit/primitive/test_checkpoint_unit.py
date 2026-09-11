@@ -42,12 +42,17 @@ def _assert_model_close(lhs: nn.Module, rhs: nn.Module):
         torch.testing.assert_close(lhs_param, rhs_param, atol=0.0, rtol=0.0)
 
 
-def test_runtime_checkpoint_load_matches_uninterrupted_training(tmp_path):
+@pytest.mark.parametrize("recompute", [False, True])
+def test_runtime_checkpoint_load_matches_uninterrupted_training(tmp_path, recompute):
     torch.manual_seed(2029)
     base = TinyMLP()
     ckpt_model, ckpt_optimizer = _clone_model_and_optimizer(base)
     direct_model, direct_optimizer = _clone_model_and_optimizer(base)
     loaded_model, loaded_optimizer = _clone_model_and_optimizer(base)
+    if recompute:
+        from megatron.lite.primitive.recompute import wrap_checkpoint
+        for model in (ckpt_model, loaded_model):
+            wrap_checkpoint(model.layers[1])
     x0, y0 = torch.randn(3, 4), torch.randn(3, 2)
     x1, y1 = torch.randn(3, 4), torch.randn(3, 2)
 
