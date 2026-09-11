@@ -270,7 +270,7 @@ def generate(reference_dir, output):
         quantize_block_fp8,
         dequantize_block_fp8,
     )
-    from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
+    from megatron.lite.primitive.quantization.ds41_index import quantize_index
     from config_mapping import map_release_config
 
     reference_dir, output = Path(reference_dir), Path(output)
@@ -347,7 +347,8 @@ def generate(reference_dir, output):
         dense = dense_values(shape, ordinal, role)
         scale_name = name[:-6] + "scale"
         if fp4:
-            value, scale = quantize_mxfp4(dense)
+            quantized = quantize_index(dense)
+            value, scale = quantized.packed, quantized.scale
             release[name], release[scale_name] = value, scale
             converted[name], converted[scale_name] = value, scale
         elif target.dtype == torch.float8_e4m3fn or name.endswith(".wo_a.weight"):

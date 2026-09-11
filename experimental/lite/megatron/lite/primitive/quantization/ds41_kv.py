@@ -5,7 +5,15 @@ from dataclasses import dataclass
 
 import torch
 
-from .mxfp4 import _quantize_nibbles
+def _quantize_nibbles(values):
+    """Official PTX cvt.rn E2M1; ModelOpt's weight codec uses different ties."""
+    magnitude = values.abs()
+    index = torch.zeros_like(magnitude, dtype=torch.uint8)
+    for boundary in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
+        index += (magnitude > boundary).to(torch.uint8)
+    for boundary in (0.75, 1.75, 3.5):
+        index += (magnitude == boundary).to(torch.uint8)
+    return index | (values.signbit().to(torch.uint8) << 3)
 
 
 @dataclass(frozen=True)

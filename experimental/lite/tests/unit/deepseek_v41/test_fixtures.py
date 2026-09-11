@@ -18,7 +18,7 @@ def test_generated_manifest_shapes_and_scale_layouts():
     )
     records = {r["name"]: r for r in manifest["tensors"]}
     assert len(records) == 3204
-    assert len(manifest["converted_keys"]) == 3164
+    assert manifest["converted_key_count"] == 3164
     dimensions = {
         "attn.wq_a.weight": [64, 128],
         "attn.wq_b.weight": [512, 64],
