@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import wraps
 from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
+from torch.utils._pytree import tree_flatten, tree_unflatten
 
 # ── CheckpointWithoutOutput ───────────────────────────────────────────────────
 # Zero-copy C++ extension: makes dst's UntypedStorage point to src's data.
@@ -65,7 +67,9 @@ class _CheckpointWithoutOutputFn(torch.autograd.Function):
             ctx.cpu_rng_state = torch.get_rng_state()
             ctx.cuda_rng_state = torch.cuda.get_rng_state()
 
-        ctx.tensor_indices = [i for i, a in enumerate(args) if isinstance(a, torch.Tensor)]
+        ctx.tensor_indices = [
+            i for i, a in enumerate(args) if isinstance(a, torch.Tensor)
+        ]
         ctx.non_tensor_args = [
             (i, a) for i, a in enumerate(args) if not isinstance(a, torch.Tensor)
         ]
@@ -87,7 +91,9 @@ class _CheckpointWithoutOutputFn(torch.autograd.Function):
         torch.autograd.backward(outputs, grad_outputs)
         ctx.outputs = None
         ctx.inputs = None
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs)
+        grads = tuple(
+            inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs
+        )
         return (None, None) + grads
 
 
@@ -124,7 +130,9 @@ class CheckpointWithoutOutput:
             self._cuda_rng = torch.cuda.get_rng_state()
 
         outputs = _CheckpointWithoutOutputFn.apply(run_function, self, *args)
-        self.outputs = (outputs,) if isinstance(outputs, torch.Tensor) else tuple(outputs)
+        self.outputs = (
+            (outputs,) if isinstance(outputs, torch.Tensor) else tuple(outputs)
+        )
         return outputs
 
     def _recompute(self, _) -> None:
@@ -207,17 +215,23 @@ def apply_recompute(
                 if mod_name in module_map:
                     submod = module_map[mod_name](layer)
                     if submod is not None:
-                        wrap_checkpoint(submod, preserve_rng_state=mod_name not in no_rng)
+                        wrap_checkpoint(
+                            submod, preserve_rng_state=mod_name not in no_rng
+                        )
 
 
-def apply_offload(layers: nn.ModuleList, module_names: list[str], module_map: ModuleMap) -> None:
+def apply_offload(
+    layers: nn.ModuleList, module_names: list[str], module_map: ModuleMap
+) -> None:
     """Wrap specified sub-modules with activation offloading to CPU."""
     if not module_names:
         return
     try:
         from torch.utils.checkpoint import CheckpointPolicy  # noqa: F401
     except ImportError:
-        log_rank0("WARNING: torch.utils.checkpoint policy_fn not available, skipping offload")
+        log_rank0(
+            "WARNING: torch.utils.checkpoint policy_fn not available, skipping offload"
+        )
         return
     for layer in layers:
         for mod_name in module_names:
@@ -246,7 +260,9 @@ class CheckpointFunction(torch.autograd.Function):
         # Save RNG states for deterministic recomputation.
         if preserve_rng_state:
             ctx.cpu_rng_state = torch.get_rng_state()
-            ctx.cuda_rng_state = torch.cuda.get_rng_state()
+            ctx.cuda_rng_state = (
+                torch.cuda.get_rng_state() if torch.cuda.is_initialized() else None
+            )
 
         # Run forward without gradient tracking — discard intermediate activations.
         with torch.no_grad():
@@ -268,22 +284,30 @@ class CheckpointFunction(torch.autograd.Function):
         # Fork RNG: restore forward-time states, then reset to current after recompute.
         if ctx.preserve_rng_state:
             current_cpu_rng = torch.get_rng_state()
-            current_cuda_rng = torch.cuda.get_rng_state()
+            current_cuda_rng = (
+                torch.cuda.get_rng_state() if ctx.cuda_rng_state is not None else None
+            )
             torch.set_rng_state(ctx.cpu_rng_state)
-            torch.cuda.set_rng_state(ctx.cuda_rng_state)
+            if ctx.cuda_rng_state is not None:
+                torch.cuda.set_rng_state(ctx.cuda_rng_state)
 
         # Recompute forward pass with gradients enabled.
         detached = tuple(
-            t.detach().requires_grad_(t.requires_grad) if isinstance(t, torch.Tensor) else t
+            (
+                t.detach().requires_grad_(t.requires_grad)
+                if isinstance(t, torch.Tensor)
+                else t
+            )
             for t in inputs
         )
-        with torch.enable_grad():
-            outputs = ctx.run_function(*detached)
-
-        # Restore RNG states.
-        if ctx.preserve_rng_state:
-            torch.set_rng_state(current_cpu_rng)
-            torch.cuda.set_rng_state(current_cuda_rng)
+        try:
+            with torch.enable_grad():
+                outputs = ctx.run_function(*detached)
+        finally:
+            if ctx.preserve_rng_state:
+                torch.set_rng_state(current_cpu_rng)
+                if current_cuda_rng is not None:
+                    torch.cuda.set_rng_state(current_cuda_rng)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
@@ -299,7 +323,9 @@ class CheckpointFunction(torch.autograd.Function):
         if outputs_with_grad:
             torch.autograd.backward(outputs_with_grad, grad_for_outputs)
 
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached)
+        grads = tuple(
+            inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached
+        )
         # None for run_function, None for preserve_rng_state, then grads for each input.
         return (None, None) + grads
 
@@ -309,6 +335,7 @@ def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> No
     original_forward = module.forward
     _routers = [m for m in module.modules() if hasattr(m, "expert_bias")]
 
+    @wraps(original_forward)
     def _checkpointed_forward(*args, **kwargs):
         # expert_bias is modified in-place by the router during forward.
         # Save and restore it so the recomputation in backward sees the same values.
@@ -326,17 +353,35 @@ def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> No
         else:
             _fwd = original_forward
 
-        # CheckpointFunction.apply only accepts positional tensor args.
-        # Wrap kwargs into the function closure.
-        if kwargs:
+        # Make every tensor leaf visible to autograd, including keyword-only
+        # and nested inputs. Repeated references share one detached replay leaf;
+        # distinct views remain distinct Function inputs with their original edges.
+        leaves, spec = tree_flatten((args, kwargs))
+        tensors = []
+        tensor_ids = {}
+        positions = {}
+        for i, leaf in enumerate(leaves):
+            if isinstance(leaf, torch.Tensor):
+                key = id(leaf)
+                if key not in tensor_ids:
+                    tensor_ids[key] = len(tensors)
+                    tensors.append(leaf)
+                positions[i] = tensor_ids[key]
+        # Do not retain tensor kwargs in the closure: save_for_backward owns them.
+        constants = [None if i in positions else leaf for i, leaf in enumerate(leaves)]
 
-            def _fn(*a):
-                return _fwd(*a, **kwargs)
+        def _fn(*tensor_inputs):
+            rebuilt = list(constants)
+            for i, tensor_index in positions.items():
+                rebuilt[i] = tensor_inputs[tensor_index]
+            call_args, call_kwargs = tree_unflatten(rebuilt, spec)
+            return _fwd(*call_args, **call_kwargs)
 
-        else:
-            _fn = _fwd
-
-        return CheckpointFunction.apply(_fn, preserve_rng_state, *args)
+        if not any(t.requires_grad for t in tensors):
+            # A reentrant Function cannot see captured parameter gradients. Run
+            # normally in this case, preserving the caller's grad mode.
+            return _fn(*tensors)
+        return CheckpointFunction.apply(_fn, preserve_rng_state, *tensors)
 
     module.forward = _checkpointed_forward
 
