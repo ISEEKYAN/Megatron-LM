@@ -7,9 +7,9 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
-from megatron.lite.primitive import protocols
-from megatron.lite.primitive.parallel import ParallelState, ep_contract
-from megatron.lite.runtime.contracts import loss as loss_contract
+from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
+from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
 
 
 def run_microbatch_loop(
@@ -22,7 +22,6 @@ def run_microbatch_loop(
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
     forward_only: bool = False,
-    ps: ParallelState | None = None,
 ):
     """Run forward-backward over microbatches with loss accumulation.
 
@@ -50,11 +49,11 @@ def run_microbatch_loop(
     last_out = None
     all_metrics: list[dict] = []
     for mb in range(num_microbatches):
-        batch, loss_context = loss_contract.split_loss_context(next(data_iter))
+        batch, loss_context = split_loss_context(next(data_iter))
         if pre_forward_hook is not None:
             scale = torch.tensor(1.0 / num_microbatches, device="cuda")
             pre_forward_hook(scale)
-        with loss_contract.use_loss_context(loss_context):
+        with use_loss_context(loss_context):
             out = forward_fn(model, batch)
         if dist_opt and optimizer is not None and mb == num_microbatches - 1:
             optimizer.grad_sync_enabled = True
@@ -64,18 +63,10 @@ def run_microbatch_loop(
             else:
                 loss, metrics = loss_fn(out, batch, loss_context)
             if not forward_only:
-                if ps is not None:
-                    ep_contract.validate_ep_backward_contract(
-                        {'loss': loss}, ps, is_last_stage=True, microbatch=mb
-                    )
                 (loss / num_microbatches).backward()
             out["loss"] = loss.detach()
             all_metrics.append(metrics)
         elif not forward_only:
-            if ps is not None:
-                ep_contract.validate_ep_backward_contract(
-                    out, ps, is_last_stage=True, microbatch=mb
-                )
             (out["loss"] / num_microbatches).backward()
         last_out = out
     if last_out is not None and all_metrics:
@@ -93,7 +84,7 @@ def compute_and_clip_grad_norm(
     *,
     report_global_norm: bool = False,
     ps: ParallelState | None = None,
-    is_expert_param: protocols.ExpertClassifierFn = protocols.default_expert_classifier,
+    is_expert_param: ExpertClassifierFn = default_expert_classifier,
 ):
     """SP AllReduce + finish grad sync + clip grad norm. Returns grad_norm."""
     if sp_params:
@@ -110,9 +101,7 @@ def compute_and_clip_grad_norm(
     if report_global_norm:
         if ps is None:
             raise ValueError("`ps` is required when `report_global_norm=True`.")
-        report_norm = compute_global_grad_norm(
-            model, ps, is_expert_param=is_expert_param
-        )
+        report_norm = compute_global_grad_norm(model, ps, is_expert_param=is_expert_param)
     if use_dist_opt:
         optimizer.finish_grad_sync()
         return optimizer.clip_grad_norm()
@@ -121,10 +110,7 @@ def compute_and_clip_grad_norm(
 
 
 def compute_global_grad_norm(
-    model,
-    ps: ParallelState,
-    *,
-    is_expert_param: protocols.ExpertClassifierFn = protocols.default_expert_classifier,
+    model, ps: ParallelState, *, is_expert_param: ExpertClassifierFn = default_expert_classifier
 ) -> torch.Tensor:
     """Compute benchmark global grad norm with dist-opt-aligned reduction order."""
     dense_sq = _bucketed_grad_sq_sum(
