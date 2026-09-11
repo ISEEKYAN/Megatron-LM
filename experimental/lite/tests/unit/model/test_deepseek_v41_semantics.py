@@ -1021,6 +1021,11 @@ def _v41_replay_parallel_worker(rank, rendezvous, pp, tp):
 def test_v41_replay_parallel_primitives(tmp_path, pp, tp):
     import torch.multiprocessing as mp
 
+    if torch.cuda.device_count() < 4:
+        pytest.skip(
+            'Routing replay parallel coverage requires at least 4 visible GPUs.'
+        )
+
     mp.spawn(
         _v41_replay_parallel_worker,
         args=(f'file://{tmp_path / "replay-rendezvous"}', pp, tp),
