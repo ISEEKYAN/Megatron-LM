@@ -172,7 +172,8 @@ def test_v41_mhc_source_destination_orientation(copies):
         torch.testing.assert_close(a, b)
 
 
-def test_v41_mhc_two_sublayer_shift_uses_unequal_coefficients():
+@pytest.mark.parametrize("copies", [2, 3, 4])
+def test_v41_mhc_two_sublayer_shift_uses_unequal_coefficients(copies):
     """Independently derive the two shifted HC inputs, not block internals."""
 
     class FixedMix(torch.nn.Module):
@@ -182,7 +183,7 @@ def test_v41_mhc_two_sublayer_shift_uses_unequal_coefficients():
 
         def forward(self, hidden):
             copies = hidden.shape[-2]
-            post = torch.zeros_like(self.pre)
+            post = torch.full_like(self.pre, 0.25)
             comb = torch.eye(copies).expand(*hidden.shape[:2], -1, -1)
             return self.pre, post, comb
 
@@ -196,26 +197,232 @@ def test_v41_mhc_two_sublayer_shift_uses_unequal_coefficients():
             self.inputs.append(x.detach().clone())
             return x + self.increment
 
-    hidden = torch.tensor(
-        [[[[1.0, 2.0], [3.0, 5.0], [7.0, 11.0]]]], dtype=torch.float32
+    hidden = torch.arange(1, 1 + copies * 2).reshape(1, 1, copies, 2).float()
+    pre_mix = torch.arange(1, copies + 1).reshape(1, 1, copies).float()
+    pre_mix = pre_mix / pre_mix.sum(-1, keepdim=True)
+    expected_hidden, expected_pre = hidden.clone(), pre_mix.clone()
+    for layer in range(2):
+        attn_pre = pre_mix.roll(layer + 1, -1) * (layer + 2)
+        ffn_pre = pre_mix.flip(-1) * (layer + 3)
+        attention, ffn = RecordInput(17), RecordInput(-9)
+        block = hc.DeepseekV41Block(2, copies, attention, ffn)
+        block.attn_norm = torch.nn.Identity()
+        block.ffn_norm = torch.nn.Identity()
+        block.attn_mixes = FixedMix(attn_pre)
+        block.ffn_mixes = FixedMix(ffn_pre)
+
+        hidden, returned_pre = block(hidden, pre_mix)
+
+        # Independent equations across both sublayers AND the next block boundary.
+        expected_attn_input = (expected_hidden * expected_pre.unsqueeze(-1)).sum(-2)
+        expected_hidden = expected_hidden + 0.25 * (expected_attn_input + 17).unsqueeze(
+            -2
+        )
+        expected_ffn_input = (expected_hidden * attn_pre.unsqueeze(-1)).sum(-2)
+        wrong_ffn_input = (expected_hidden * expected_pre.unsqueeze(-1)).sum(-2)
+        expected_hidden = expected_hidden + 0.25 * (expected_ffn_input - 9).unsqueeze(
+            -2
+        )
+        torch.testing.assert_close(attention.inputs[0], expected_attn_input)
+        torch.testing.assert_close(ffn.inputs[0], expected_ffn_input)
+        torch.testing.assert_close(hidden, expected_hidden)
+        torch.testing.assert_close(returned_pre, ffn_pre)
+        assert not torch.allclose(expected_ffn_input, wrong_ffn_input)
+        pre_mix, expected_pre = returned_pre, ffn_pre.clone()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("length", [1, 9])
+def test_v41_ced_boundaries_match_pinned_official_oracle(dtype, length, monkeypatch):
+    """Compare the real block's CED chain with B1's pinned pre-RoPE methods.
+
+    Execute original methods as CPU cards, as in C's test_oracle.py. Stop the
+    official indexer at its k_norm hook: RoPE/FP4 publication follows this AC's
+    boundary and is deliberately outside this floating-point comparison.
+    """
+    import ast
+    import hashlib
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    monkeypatch.syspath_prepend(str(root / "tools/deepseek_v41"))
+    from fixtures import REFERENCE_SHA256, dense_values, reduced_overrides
+    from oracle import Recorder
+
+    reference = root / "tests/fixtures/deepseek_v41/reference"
+    for name in ("model.py", "config.json", "inference_config.json"):
+        assert (
+            hashlib.sha256((reference / name).read_bytes()).hexdigest()
+            == REFERENCE_SHA256[name]
+        )
+    source = reference / "model.py"
+    classes = {
+        node.name: node
+        for node in ast.parse(source.read_text()).body
+        if isinstance(node, ast.ClassDef)
+    }
+
+    def official_method(cls, method):
+        node = next(
+            node
+            for node in classes[cls].body
+            if isinstance(node, ast.FunctionDef) and node.name == method
+        )
+        namespace = {"torch": torch}
+        exec(
+            compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"),
+            namespace,
+        )
+        return namespace[method]
+
+    # Only method containers are constructed here; no official arithmetic is rewritten.
+    namespace = {"torch": torch, "nn": torch.nn}
+    exec(
+        compile(
+            ast.Module(body=[classes["RMSNorm"]], type_ignores=[]), str(source), "exec"
+        ),
+        namespace,
     )
-    pre_mix = torch.tensor([[[0.55, 0.30, 0.15]]])
-    attn_pre = torch.tensor([[[0.10, 0.25, 0.65]]])
-    ffn_pre = torch.tensor([[[0.70, 0.20, 0.10]]])
-    attention, ffn = RecordInput(17), RecordInput(-9)
-    block = hc.DeepseekV41Block(2, 3, attention, ffn)
-    block.attn_norm = torch.nn.Identity()
-    block.ffn_norm = torch.nn.Identity()
-    block.attn_mixes = FixedMix(attn_pre)
-    block.ffn_mixes = FixedMix(ffn_pre)
+    official_norm = namespace["RMSNorm"]
+    official_compressor = type(
+        "OfficialCompressor",
+        (torch.nn.Module,),
+        {"forward": official_method("Compressor", "forward")},
+    )()
+    official_indexer = type(
+        "OfficialIndexer",
+        (torch.nn.Module,),
+        {"forward": official_method("Indexer", "forward")},
+    )()
+    args = reduced_overrides()
+    rows = json.loads((root / "tests/fixtures/deepseek_v41/manifest.json").read_text())[
+        "tensors"
+    ]
+    rows = {row["name"]: (ordinal, row) for ordinal, row in enumerate(rows)}
 
-    returned_hidden, returned_pre = block(hidden, pre_mix)
+    def bind(module, name):
+        ordinal, row = rows["layers.20." + name]
+        assert list(module.weight.shape) == row["shape"]
+        role = "norm" if "norm" in name else "weight"
+        # Reconstruct exactly the C fixture payload before optional FP32 diagnostics.
+        value = dense_values(row["shape"], ordinal, role).to(
+            getattr(torch, row["dtype"].split(".")[1])
+        )
+        with torch.no_grad():
+            module.weight.copy_(value)
 
-    # This is the V4.1 two-sublayer chain written directly from its equations.
-    expected_attn_input = (hidden * pre_mix.unsqueeze(-1)).sum(-2)
-    expected_ffn_input = (hidden * attn_pre.unsqueeze(-1)).sum(-2)
-    torch.testing.assert_close(attention.inputs[0], expected_attn_input)
-    torch.testing.assert_close(ffn.inputs[0], expected_ffn_input)
-    torch.testing.assert_close(returned_hidden, hidden)
-    torch.testing.assert_close(returned_pre, ffn_pre)
-    assert not torch.allclose(expected_ffn_input, expected_attn_input)
+    torch.manual_seed(1729)
+    config = attn.CSA2Config(
+        dim=args["dim"],
+        heads=args["n_heads"],
+        head_dim=args["head_dim"],
+        rope_dim=args["rope_head_dim"],
+        q_rank=args["q_lora_rank"],
+        o_rank=args["o_lora_rank"],
+        groups=args["o_groups"],
+        index_heads=args["index_n_heads"],
+        index_dim=args["index_head_dim"],
+        eps=args["norm_eps"],
+        linear_fp8=False,
+        main_qat=False,
+        index_qat=False,
+        swa_fp8=False,
+    )
+    attention = attn.CSA2Attention(config, 20).to(dtype)
+    block = hc.DeepseekV41Block(
+        config.dim, args["hc_mult"], attention, torch.nn.Identity(), norm_eps=config.eps
+    ).to(dtype)
+    official_attn_norm = official_norm(config.dim, config.eps).to(dtype)
+    official_compressor.compress_ratio = 1
+    official_compressor.wkv = torch.nn.Linear(
+        config.dim, config.head_dim, bias=False, dtype=dtype
+    )
+    official_compressor.norm = official_norm(config.head_dim, config.eps).to(dtype)
+    official_indexer.owns_k = True
+    official_indexer.compress_ratio = 1
+    official_indexer.rope_head_dim = config.rope_dim
+    official_indexer.freqs_cis = torch.ones(length, config.rope_dim // 2)
+    official_indexer.wk = torch.nn.Linear(
+        config.head_dim, config.index_dim, bias=False, dtype=dtype
+    )
+    official_indexer.k_norm = official_norm(config.index_dim, config.eps).to(dtype)
+    for actual, expected, name in (
+        (block.attn_norm, official_attn_norm, "attn_norm.weight"),
+        (
+            attention.compressor.wkv,
+            official_compressor.wkv,
+            "attn.compressor.wkv.weight",
+        ),
+        (
+            attention.compressor.norm,
+            official_compressor.norm,
+            "attn.compressor.norm.weight",
+        ),
+        (attention.indexer.wk, official_indexer.wk, "attn.indexer.wk.weight"),
+        (
+            attention.indexer.k_norm,
+            official_indexer.k_norm,
+            "attn.indexer.k_norm.weight",
+        ),
+    ):
+        bind(actual, name)
+        bind(expected, name)
+    hidden = dense_values((1, length, args["hc_mult"], config.dim), 10001).to(dtype)
+    pre_mix = dense_values(hidden.shape[:-1], 10002, "multiplier").roll(1, -1)
+    assert not torch.equal(hidden[:, :, 0], hidden[:, :, 1])
+    recorder = Recorder("ced-component")
+    recorder.layer, recorder.length = 20, length
+    x20 = official_attn_norm(official_method("Block", "hc_pre")(None, hidden, pre_mix))
+    recorder.add("ced.x20", x20)
+    latent20 = official_compressor(x20, 0)
+    recorder.add("compressor.latent_pre_rope", latent20)
+
+    class BoundaryCaptured(Exception):
+        pass
+
+    def capture_index(module, inputs, output):
+        recorder.add("index.k_pre_rope", output)
+        raise BoundaryCaptured("official pre-RoPE boundary reached")
+
+    handle = official_indexer.k_norm.register_forward_hook(capture_index)
+    try:
+        with pytest.raises(
+            BoundaryCaptured, match="official pre-RoPE boundary reached"
+        ):
+            official_indexer(x20, None, latent20, 0, 0)
+    finally:
+        handle.remove()
+    actual = {}
+    handles = [
+        attention.register_forward_pre_hook(
+            lambda module, inputs: actual.update(
+                {"ced.x20": inputs[0].detach().clone()}
+            )
+        )
+    ]
+    for module, stage in (
+        (attention.compressor, "compressor.latent_pre_rope"),
+        (attention.indexer.k_norm, "index.k_pre_rope"),
+    ):
+        handles.append(
+            module.register_forward_hook(
+                lambda module, inputs, output, stage=stage: actual.update(
+                    {stage: output.detach().clone()}
+                )
+            )
+        )
+    try:
+        block.forward_with_state(hidden, pre_mix, attn.AttentionState())
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert set(actual) == {record["stage"] for record in recorder.records}
+    for record in recorder.records:
+        torch.testing.assert_close(
+            actual[record["stage"]],
+            record["value"],
+            rtol=0,
+            atol=0,
+            msg=record["stage"],
+        )

@@ -27,8 +27,28 @@ environment dependency and is not copied or modified by this change. Native
 FP8 linear requires CUDA. Disabled-quantization diagnostics do not establish
 native quantized-kernel parity.
 
+This change is stacked on PR #212, commit
+`fd18aa0d02bdfbeb8ff1daf035e46dd9d9911371`, and must merge after #212.
+The oracle tools, pinned reference and fixture manifest come from that base.
+
 Focused cases are parameterized in
-`tests/unit/model/test_deepseek_v41_semantics.py`:
+`tests/unit/model/test_deepseek_v41_semantics.py`. The shifted-HC test independently
+derives two consecutive blocks with 2/3/4 unequal copies and nonzero residual
+updates. The CED test executes the pinned official `Block.hc_pre`, `RMSNorm`,
+`Compressor.forward` and the pre-RoPE portion of `Indexer.forward`, using C's
+fixture dimensions, weight recipe and oracle recorder. It compares `x20`,
+`latent20` and `index_k20` from the actual MLite block/attention call, at FP32 and
+BF16 with sequence lengths 1 and 9, with zero tolerance. A hook ends the official
+indexer after `k_norm`; this tests the three CED equations, not the subsequent
+native RoPE/FP4 kernels or a complete official model forward.
+
+```text
+x20       = attn_norm_20(hc_pre(h20, p20))
+latent20  = compressor_norm_20(compressor_wkv_20(x20))
+index_k20 = k_norm_20(wk_20(latent20))
+```
+
+Run the focused cases with:
 
 ```bash
 PYTHONPATH=experimental/lite OMP_NUM_THREADS=1 python -m pytest -c /dev/null \
@@ -36,6 +56,7 @@ PYTHONPATH=experimental/lite OMP_NUM_THREADS=1 python -m pytest -c /dev/null \
   experimental/lite/tests/unit/model/test_deepseek_v41_semantics.py
 ```
 
-The delivery branch starts at `d8e010069`. Regression acceptance compares both
-failure/error set differences against that exact parent. Test skips remain
+The D-only review diff is against `fd18aa0d0`. Regression acceptance retains
+`d8e010069` (mainparent job 18354480) as the baseline and compares both
+failure/error set differences against it. Test skips remain
 skips, and added passing semantic cases do not erase baseline failures.
