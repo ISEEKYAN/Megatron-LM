@@ -110,3 +110,62 @@ def test_quantizers_consume_rotated_vectors_and_independent_switches():
     _, other = layer(x, attn.AttentionState())
     torch.testing.assert_close(other.index_k, state.index_k, rtol=0, atol=0)
     assert not torch.equal(other.main_kv, state.main_kv)
+
+
+def test_composed_ced_block_state_and_recompute_gradients():
+    from megatron.lite.model.deepseek_v41.lite import block
+    from torch.utils.checkpoint import checkpoint
+
+    torch.manual_seed(71)
+    owner = block.DeepseekV41Block(
+        32, 2, attn.CSA2Attention(config(), 20).float(), torch.nn.Linear(32, 32)
+    )
+    consumer = block.DeepseekV41Block(
+        32, 2, attn.CSA2Attention(config(), 21).float(), torch.nn.Linear(32, 32)
+    )
+    h = torch.randn(1, 4, 2, 32, requires_grad=True)
+    p = torch.tensor([0.2, 0.8]).expand(1, 4, 2).clone().requires_grad_()
+
+    def run(h, p):
+        a, ap, state = owner.forward_with_state(h, p, attn.AttentionState())
+        expected = owner.attn.compressor(owner.attn_norm(block.contract_hc(h, p)))
+        torch.testing.assert_close(state.latent, expected)
+        b, bp, reused = consumer.forward_with_state(a, ap, state)
+        assert reused.main_kv is state.main_kv
+        assert reused.indices is state.indices
+        return block.contract_hc(b, bp)
+
+    inputs = [h, p, owner.attn.compressor.wkv.weight, consumer.attn.wq_b.weight]
+    expected = torch.autograd.grad(run(h, p).square().sum(), inputs)
+    actual = torch.autograd.grad(
+        checkpoint(run, h, p, use_reentrant=False).square().sum(), inputs
+    )
+    for a, b in zip(actual, expected):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+        assert torch.count_nonzero(a)
+
+
+def test_composed_state_is_per_call_and_reindex_preserves_owner():
+    from megatron.lite.model.deepseek_v41.lite import block
+
+    torch.manual_seed(72)
+    owner = block.DeepseekV41Block(
+        32, 2, attn.CSA2Attention(config(), 20).float(), torch.nn.Identity()
+    )
+    reindex = block.DeepseekV41Block(
+        32, 2, attn.CSA2Attention(config(), 24).float(), torch.nn.Identity()
+    )
+    a = torch.randn(1, 4, 2, 32, requires_grad=True)
+    b = torch.randn_like(a, requires_grad=True)
+    pre = torch.tensor([0.2, 0.8]).expand(1, 4, 2)
+    _, _, state_a = owner.forward_with_state(a, pre, attn.AttentionState())
+    bh, bp, state_b = owner.forward_with_state(b, pre, attn.AttentionState())
+    out, final_pre, final_state = reindex.forward_with_state(bh, bp, state_b)
+    assert final_state.kv_owner == 20 and final_state.index_owner == 24
+    assert final_state.main_kv is state_b.main_kv
+    assert final_state.index_k is state_b.index_k
+    assert state_a.main_kv is not state_b.main_kv
+    ga, gb = torch.autograd.grad(
+        block.contract_hc(out, final_pre).square().sum(), [a, b], allow_unused=True
+    )
+    assert ga is None and torch.count_nonzero(gb)

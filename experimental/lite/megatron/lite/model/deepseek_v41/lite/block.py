@@ -106,11 +106,31 @@ class DeepseekV41Block(nn.Module):
         self.ffn_mixes = HCMixes(hidden_size, copies, norm_eps, hc_eps, iterations)
 
     def forward(self, hidden, pre_mix, *, attention_kwargs=None, ffn_kwargs=None):
+        hidden, pre_mix, _ = self._forward(
+            hidden, pre_mix, attention_kwargs, ffn_kwargs, None, False
+        )
+        return hidden, pre_mix
+
+    def forward_with_state(
+        self, hidden, pre_mix, state, *, attention_kwargs=None, ffn_kwargs=None
+    ):
+        """Return hidden, shifted pre-mix and caller-owned CSA2 state.
+
+        State is an explicit graph input/output, never a module cache. Callers
+        must preserve it alongside both HC tensors across layer boundaries.
+        """
+        return self._forward(hidden, pre_mix, attention_kwargs, ffn_kwargs, state, True)
+
+    def _forward(self, hidden, pre_mix, attention_kwargs, ffn_kwargs, state, stateful):
         attn_pre, attn_post, attn_comb = self.attn_mixes(hidden)
         x = self.attn_norm(contract_hc(hidden, pre_mix))
-        x = self.attn(x, **({} if attention_kwargs is None else attention_kwargs))
+        kwargs = {} if attention_kwargs is None else attention_kwargs
+        if stateful:
+            x, state = self.attn(x, state, **kwargs)
+        else:
+            x = self.attn(x, **kwargs)
         hidden = mix_residual(x, hidden, attn_post, attn_comb)
         ffn_pre, ffn_post, ffn_comb = self.ffn_mixes(hidden)
         x = self.ffn_norm(contract_hc(hidden, attn_pre))
         x = self.ffn(x, **({} if ffn_kwargs is None else ffn_kwargs))
-        return mix_residual(x, hidden, ffn_post, ffn_comb), ffn_pre
+        return mix_residual(x, hidden, ffn_post, ffn_comb), ffn_pre, state

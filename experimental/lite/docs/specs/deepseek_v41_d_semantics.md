@@ -10,7 +10,8 @@ deepseek_v41_tasks.json`. Its D8 boundary work is part of D1/D2.
 
 ## Implemented interfaces and diagnostic cards
 
-All paths below are relative to `experimental/lite/`. These are callable local
+Module paths below are relative to `experimental/lite/megatron/lite/`; test paths
+are relative to `experimental/lite/`. These are callable local
 building blocks, not protocol registration or checkpoint-key binding.
 
 | Interface | Behavior | Executable cards |
@@ -26,10 +27,13 @@ last returned pre-mix. At the CED boundary the caller must supply
 `latent20 = compressor_norm20(compressor_wkv20(x20))`; no decoder projection is
 introduced. A caller must keep both h20 and p20 alive through recompute/transport.
 
-`CSA2Attention.forward` returns `(output, AttentionState)`, whereas the current
-block injection expects a tensor-returning attention sublayer. Their composition
-adapter, full-layer driver and protocol ownership transport are not implemented
-in this snapshot. Reuse never owns an indexer; Reindex uses its own Q and the
+`CSA2Attention.forward` returns `(output, AttentionState)`. The block now offers
+`forward_with_state(hidden, pre_mix, state)`, returning
+`(hidden, next_pre_mix, state)` through the same shifted-HC arithmetic as its
+tensor-only forward. State remains an explicit per-call graph value. Composed
+CPU cards cover layer20 CED, layer21 Reuse, layer24 Reindex, non-reentrant
+recompute gradients and isolation between equal-shaped independent calls.
+The full-layer driver and protocol ownership transport remain unimplemented. Reuse never owns an indexer; Reindex uses its own Q and the
 existing index K. State lifetime is caller-owned; shape checks alone do not prove
 microbatch identity. Do not reuse state between equal-shaped independent samples.
 
@@ -90,8 +94,9 @@ implementation. One candidate-card expected result was corrected from offsets
 
 After the remaining recipe/scope contract is settled, proceed in small steps:
 
-1. Specify the tensor/state composition adapter in `block.py`, add a red
-   composed CED test to `test_attention.py`, then implement and run that file.
+1. Extend the tensor/state composition cards in `test_attention.py` to the full
+   owner/consumer schedule and all parameter VJPs; the initial two-layer cards
+   are diagnostic coverage, not D1/D2 acceptance.
 2. Add independent pinned-official comparisons to
    `tools/deepseek_v41/validate_d_semantics.py`; run first on the smallest B3
    fixture before broadening coverage or invoking Slurm.
