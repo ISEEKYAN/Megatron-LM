@@ -1,0 +1,41 @@
+{
+  "schema": "deepseek-v41-oracle-v1",
+  "kind": "independent_specification_expectations",
+  "profile": "published-forward-only",
+  "active_decisions": [],
+  "head": {
+    "input": [[[1, 2], [3, 5], [7, 11]]],
+    "weight": [[1, 0], [0, 1], [2, -1]],
+    "all_logits": [[[1, 2, 0], [3, 5, 1], [7, 11, 3]]],
+    "last_logits": [[7, 11, 3]],
+    "atol": 0,
+    "rtol": 0
+  },
+  "ced_dataflow_probe": {
+    "warning": "Norm, projection, RoPE, quantizer and hc_post doubles; not quantized model arithmetic",
+    "residual": [[[[1, 2], [5, 10]]]],
+    "incoming_mix": [[[0.25, 0.75]]],
+    "attention_mix": [[[0.75, 0.25]]],
+    "returned_ffn_mix": [[[0.5, 0.5]]],
+    "collapsed": [[[4, 8]]],
+    "x20": [[[17, 21]]],
+    "latent20": [[[56, 68]]],
+    "index_k20": [[[291, 351]]],
+    "index_k_published": [[[596, 716]]],
+    "main_kv20": [[[126, 150]]],
+    "ffn_collapsed": [[[2, 4]]],
+    "atol": 0,
+    "rtol": 0
+  },
+  "visibility": {
+    "ratio": 2,
+    "query_positions": [0, 1, 2, 3, 4],
+    "completed_counts": [0, 1, 1, 2, 2],
+    "completed_key_positions": [0, 2]
+  },
+  "packed": {
+    "lengths": [3, 2],
+    "cu_seqlens": [0, 3, 5],
+    "positions": [0, 1, 2, 0, 1]
+  }
+}

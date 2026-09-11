@@ -20,9 +20,13 @@ class FP8Values:
 def _quantize_rows(x):
     _validate_input(x, 32)
     rows = x.reshape(-1, x.shape[-1])
-    values, scale = quantize_block_fp8(rows, (1,32), scale_format="e8m0")
-    decoded = dequantize_block_fp8(values, scale, (1,32)).to(x.dtype)
-    return FP8Values(values.reshape(x.shape), scale.reshape(*x.shape[:-1], -1), decoded.reshape(x.shape))
+    values, scale = quantize_block_fp8(rows, (1, 32), scale_format="e8m0")
+    decoded = dequantize_block_fp8(values, scale, (1, 32)).to(x.dtype)
+    return FP8Values(
+        values.reshape(x.shape),
+        scale.reshape(*x.shape[:-1], -1),
+        decoded.reshape(x.shape),
+    )
 
 
 def quantize_swa(post_rope):
@@ -46,11 +50,18 @@ def _fp8_gemm(a, a_scale, b, b_scale):
     for group, start in enumerate(range(0, a.shape[1], 32)):
         # Scalar unit scales ensure native FP8 multiplication; actual block scales
         # are applied separately, as in the published blockwise accumulation.
-        product = torch._scaled_mm(a[:, start:start+32].contiguous(),
-                                   b[:, start:start+32].contiguous().T,
-                                   unit, unit, out_dtype=torch.float32)
-        output += (product * a_scale[:, group].float()[:, None]
-                   * b_scale[:, group].float().repeat_interleave(32)[None, :])
+        product = torch._scaled_mm(
+            a[:, start : start + 32].contiguous(),
+            b[:, start : start + 32].contiguous().T,
+            unit,
+            unit,
+            out_dtype=torch.float32,
+        )
+        output += (
+            product
+            * a_scale[:, group].float()[:, None]
+            * b_scale[:, group].float().repeat_interleave(32)[None, :]
+        )
     return output
 
 
@@ -58,12 +69,22 @@ class _DynamicLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight):
         activation = quantize_linear_activation(x)
-        encoded_weight, scales = quantize_block_fp8(weight, (32,32), scale_format="e8m0")
-        decoded_weight = dequantize_block_fp8(encoded_weight, scales, (32,32)).to(weight.dtype)
-        ctx.save_for_backward(activation.decoded.reshape(-1, x.shape[-1]), decoded_weight)
+        encoded_weight, scales = quantize_block_fp8(
+            weight, (32, 32), scale_format="e8m0"
+        )
+        decoded_weight = dequantize_block_fp8(encoded_weight, scales, (32, 32)).to(
+            weight.dtype
+        )
+        ctx.save_for_backward(
+            activation.decoded.reshape(-1, x.shape[-1]), decoded_weight
+        )
         ctx.input_shape = x.shape
-        result = _fp8_gemm(activation.values.reshape(-1, x.shape[-1]),
-                           activation.scale.reshape(-1, x.shape[-1] // 32), encoded_weight, scales)
+        result = _fp8_gemm(
+            activation.values.reshape(-1, x.shape[-1]),
+            activation.scale.reshape(-1, x.shape[-1] // 32),
+            encoded_weight,
+            scales,
+        )
         return result.reshape(*x.shape[:-1], weight.shape[0]).to(x.dtype)
 
     @staticmethod
@@ -80,8 +101,15 @@ def dynamic_fp8_linear(x, weight):
         raise RuntimeError("dynamic FP8 Linear requires CUDA; no CPU GEMM fallback")
     _validate_input(x, 32)
     _validate_input(weight, 32)
-    if x.ndim < 2 or weight.ndim != 2 or weight.shape[0] % 32 or x.shape[-1] != weight.shape[-1]:
-        raise ValueError("Linear requires matching K and weight dimensions divisible by 32")
+    if (
+        x.ndim < 2
+        or weight.ndim != 2
+        or weight.shape[0] % 32
+        or x.shape[-1] != weight.shape[-1]
+    ):
+        raise ValueError(
+            "Linear requires matching K and weight dimensions divisible by 32"
+        )
     if x.device != weight.device or x.dtype != weight.dtype:
         raise ValueError("floating activation and weight must share device and dtype")
     return _DynamicLinear.apply(x, weight)
