@@ -426,3 +426,56 @@ def test_v41_ced_boundaries_match_pinned_official_oracle(dtype, length, monkeypa
             atol=0,
             msg=record["stage"],
         )
+
+
+def test_v41_nested_config_drives_attention(tmp_path):
+    import copy
+    import json
+    from pathlib import Path
+    from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+
+    reference = Path(__file__).parents[2] / 'fixtures/deepseek_v41/reference/config.json'
+    release = json.loads(reference.read_text())
+    tiny = copy.deepcopy(release)
+    tiny['text_config'].update(
+        hidden_size=32, num_attention_heads=2, head_dim=32,
+        qk_rope_head_dim=4, q_lora_rank=32, o_lora_rank=4, o_groups=2,
+        index_n_heads=2, index_head_dim=32, sliding_window=1,
+    )
+    config = DeepseekV41Config._from_hf_dict(tiny)
+    source = tmp_path / 'config.json'
+    source.write_text(json.dumps(tiny))
+    assert DeepseekV41Config.from_hf(source).to_hf_dict() == tiny
+    assert config.to_hf_dict() == tiny
+    tiny['text_config']['sliding_window'] = 4
+    other = DeepseekV41Config._from_hf_dict(tiny)
+    flags = dict(linear_fp8=False, main_qat=False, index_qat=False, swa_fp8=False)
+    short = attn.CSA2Attention(config.attention_config(**flags), 0).float()
+    long = attn.CSA2Attention(other.attention_config(**flags), 0).float()
+    long.load_state_dict(short.state_dict())
+    torch.manual_seed(991)
+    x = torch.randn(1, 4, 32)
+    y_short, _ = short(x, attn.AttentionState())
+    y_long, _ = long(x, attn.AttentionState())
+    torch.testing.assert_close(y_short[:, 0], y_long[:, 0])
+    assert not torch.allclose(y_short[:, 1:], y_long[:, 1:])
+    assert config.to_hf_dict()['text_config']['sliding_window'] == 1
+
+
+@pytest.mark.parametrize('field,value', [
+    ('kv_source_layer_ids', [2, 8, 14]),
+    ('index_source_layer_ids', [2, 8, 14, 20]),
+    ('candidate_source_layer_id', 24),
+    ('num_hidden_layers', 39),
+    ('compress_ratios', [0] * 43),
+])
+def test_v41_config_rejects_unimplemented_topology(field, value):
+    import json
+    from pathlib import Path
+    from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+
+    reference = Path(__file__).parents[2] / 'fixtures/deepseek_v41/reference/config.json'
+    release = json.loads(reference.read_text())
+    release['text_config'][field] = value
+    with pytest.raises(ValueError, match=field):
+        DeepseekV41Config._from_hf_dict(release)
