@@ -170,3 +170,52 @@ def test_v41_mhc_source_destination_orientation(copies):
         torch.autograd.grad(expected.square().sum(), args),
     ):
         torch.testing.assert_close(a, b)
+
+
+def test_v41_mhc_two_sublayer_shift_uses_unequal_coefficients():
+    """Independently derive the two shifted HC inputs, not block internals."""
+
+    class FixedMix(torch.nn.Module):
+        def __init__(self, pre):
+            super().__init__()
+            self.pre = pre
+
+        def forward(self, hidden):
+            copies = hidden.shape[-2]
+            post = torch.zeros_like(self.pre)
+            comb = torch.eye(copies).expand(*hidden.shape[:2], -1, -1)
+            return self.pre, post, comb
+
+    class RecordInput(torch.nn.Module):
+        def __init__(self, increment):
+            super().__init__()
+            self.increment = increment
+            self.inputs = []
+
+        def forward(self, x):
+            self.inputs.append(x.detach().clone())
+            return x + self.increment
+
+    hidden = torch.tensor(
+        [[[[1.0, 2.0], [3.0, 5.0], [7.0, 11.0]]]], dtype=torch.float32
+    )
+    pre_mix = torch.tensor([[[0.55, 0.30, 0.15]]])
+    attn_pre = torch.tensor([[[0.10, 0.25, 0.65]]])
+    ffn_pre = torch.tensor([[[0.70, 0.20, 0.10]]])
+    attention, ffn = RecordInput(17), RecordInput(-9)
+    block = hc.DeepseekV41Block(2, 3, attention, ffn)
+    block.attn_norm = torch.nn.Identity()
+    block.ffn_norm = torch.nn.Identity()
+    block.attn_mixes = FixedMix(attn_pre)
+    block.ffn_mixes = FixedMix(ffn_pre)
+
+    returned_hidden, returned_pre = block(hidden, pre_mix)
+
+    # This is the V4.1 two-sublayer chain written directly from its equations.
+    expected_attn_input = (hidden * pre_mix.unsqueeze(-1)).sum(-2)
+    expected_ffn_input = (hidden * attn_pre.unsqueeze(-1)).sum(-2)
+    torch.testing.assert_close(attention.inputs[0], expected_attn_input)
+    torch.testing.assert_close(ffn.inputs[0], expected_ffn_input)
+    torch.testing.assert_close(returned_hidden, hidden)
+    torch.testing.assert_close(returned_pre, ffn_pre)
+    assert not torch.allclose(expected_ffn_input, expected_attn_input)
