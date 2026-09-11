@@ -7,7 +7,15 @@ Source revision provenance must be established independently of this I/O check.
 import argparse
 import itertools
 import json
+import sys
 from pathlib import Path
+
+# Keep this validator directly executable from a release-validation job.  Its
+# sibling package lives at experimental/lite, which is not implicitly on
+# sys.path when Python is given this script's absolute path.
+LITE_ROOT = Path(__file__).resolve().parents[2]
+if str(LITE_ROOT) not in sys.path:
+    sys.path.insert(0, str(LITE_ROOT))
 
 from megatron.lite.model.deepseek_v41.lite.checkpoint_store import CheckpointTensorStore
 
