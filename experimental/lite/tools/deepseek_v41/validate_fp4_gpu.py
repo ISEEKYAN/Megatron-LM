@@ -6,14 +6,13 @@ import importlib.util
 import os
 
 import torch
-
-from megatron.lite.primitive.quantization.ds41_index import quantize_index
-from megatron.lite.primitive.quantization.ds41_kv import quantize_main_kv
+from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
 from megatron.lite.primitive.quantization.ds41_fp8 import (
     dynamic_fp8_linear,
     quantize_swa,
 )
-from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+from megatron.lite.primitive.quantization.ds41_index import quantize_index
+from megatron.lite.primitive.quantization.ds41_kv import quantize_main_kv
 
 
 def main():

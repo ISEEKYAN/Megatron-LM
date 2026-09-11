@@ -2,10 +2,9 @@
 
 import pytest
 import torch
-from safetensors.torch import save_file
-
 from megatron.lite.model.deepseek_v41.lite.checkpoint import load_weight
 from megatron.lite.model.deepseek_v41.lite.checkpoint_store import CheckpointTensorStore
+from safetensors.torch import save_file
 
 
 def store_tensors(tmp_path, tensors, filename="source.safetensors"):

@@ -9,10 +9,9 @@ import sys
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file
-
 from fixtures import REFERENCE_SHA256
 from oracle import run_forward
+from safetensors.torch import load_file
 
 
 def main():

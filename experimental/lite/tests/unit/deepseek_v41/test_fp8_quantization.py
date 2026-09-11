@@ -1,6 +1,5 @@
 import pytest
 import torch
-
 from megatron.lite.primitive.quantization.ds41_fp8 import (
     dynamic_fp8_linear,
     fake_quant_swa,

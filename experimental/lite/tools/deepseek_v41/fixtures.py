@@ -265,13 +265,13 @@ def generate(reference_dir, output):
     import sys
     from pathlib import Path
 
-    from safetensors.torch import save_file
+    from config_mapping import map_release_config
     from megatron.lite.primitive.quantization.block_fp8 import (
-        quantize_block_fp8,
         dequantize_block_fp8,
+        quantize_block_fp8,
     )
     from megatron.lite.primitive.quantization.ds41_index import quantize_index
-    from config_mapping import map_release_config
+    from safetensors.torch import save_file
 
     reference_dir, output = Path(reference_dir), Path(output)
     validate_reference(reference_dir)

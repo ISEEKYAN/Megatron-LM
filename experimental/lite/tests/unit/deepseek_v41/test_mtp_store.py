@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from megatron.lite.model.deepseek_v41.lite.checkpoint_store import (
     CheckpointTensorStore,
     validate_execution,

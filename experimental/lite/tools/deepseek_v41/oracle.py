@@ -16,17 +16,16 @@ import types
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file
-
+from config_mapping import MAPPING, WAIVERS, map_release_config
 from fixtures import (
-    IdentityTokenizer,
-    validate_reference,
     REFERENCE_SHA256,
-    reduced_overrides,
+    IdentityTokenizer,
     ownership_rows,
+    reduced_overrides,
+    validate_reference,
 )
-from config_mapping import map_release_config, MAPPING, WAIVERS
 from megatron.lite.model.deepseek_v41.lite.checkpoint_store import validate_execution
+from safetensors.torch import load_file
 
 _MODULE_IDS = itertools.count()
 

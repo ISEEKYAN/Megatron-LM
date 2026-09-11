@@ -1,4 +1,5 @@
 """CPU assertions for the Phase A contract; no production implementation."""
+
 import argparse
 import hashlib
 import itertools
@@ -14,8 +15,9 @@ def expand(contract):
         indices = list(itertools.product(*family['indices']))
         assert len(indices) == family['count']
         assert family['exclusion'] is None
-        pairs.extend((family['pattern'].format(*i), family['target'].format(*i))
-                     for i in indices)
+        pairs.extend(
+            (family['pattern'].format(*i), family['target'].format(*i)) for i in indices
+        )
     assert len(pairs) == len(dict(pairs)) == len({v for _, v in pairs}) == 96085
     return dict(pairs)
 
@@ -66,9 +68,12 @@ def main():
             raise AssertionError('Negative control accepted')
     assert {k for k in mtp if '.main_norm.' in k} == {'mtp.0.main_norm.weight'}
     assert {k for k in mtp if '.confidence_head.' in k} == {
-        'mtp.2.confidence_head.proj.weight'}
-    print(f'keys={len(actual)}/96085 mtp={len(mtp)}/2401 config={len(rows)} '
-          'shard_layouts=5 negative_controls=2 PASS (schema only)')
+        'mtp.2.confidence_head.proj.weight'
+    }
+    print(
+        f'keys={len(actual)}/96085 mtp={len(mtp)}/2401 config={len(rows)} '
+        'shard_layouts=5 negative_controls=2 PASS (schema only)'
+    )
 
 
 if __name__ == '__main__':

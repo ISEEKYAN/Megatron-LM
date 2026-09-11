@@ -3,7 +3,12 @@
 
 import torch
 
-from .ds41_kv import QuantizedValues, _IdentityGradient, _quantize_nibbles, _validate_input
+from .ds41_kv import (
+    QuantizedValues,
+    _IdentityGradient,
+    _quantize_nibbles,
+    _validate_input,
+)
 from .mxfp4 import dequantize_mxfp4
 
 

@@ -11,15 +11,17 @@ TOOLS = Path(__file__).resolve().parents[3] / "tools/deepseek_v41"
 sys.path.insert(0, str(TOOLS))
 from config_mapping import MAPPING, WAIVERS, leaves, map_release_config
 from fixtures import REFERENCE_SHA256
-from oracle import (forward_all_tokens, snapshot, tensor_metadata,
-                    validate_sequences)
+from oracle import forward_all_tokens, snapshot, tensor_metadata, validate_sequences
 
 REFERENCE = Path(__file__).resolve().parents[2] / "fixtures/deepseek_v41/reference"
 
 
 def test_bundled_reference_matches_pinned_source():
     for name in ("model.py", "config.json", "inference_config.json"):
-        assert hashlib.sha256((REFERENCE / name).read_bytes()).hexdigest() == REFERENCE_SHA256[name]
+        assert (
+            hashlib.sha256((REFERENCE / name).read_bytes()).hexdigest()
+            == REFERENCE_SHA256[name]
+        )
 
 
 def test_capture_clone_survives_publication_mutation():
@@ -35,7 +37,7 @@ def test_capture_clone_survives_publication_mutation():
 
 
 def test_all_token_head_original_method_card():
-    source = (REFERENCE / "model.py")
+    source = REFERENCE / "model.py"
     tree = ast.parse(source.read_text())
     head_class = next(
         node

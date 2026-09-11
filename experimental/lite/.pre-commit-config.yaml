@@ -1,3 +1,5 @@
+# Preserve the byte-exact upstream source used by the oracle's SHA256 checks.
+exclude: ^experimental/lite/tests/fixtures/deepseek_v41/reference/
 repos:
 - repo: local
   hooks:
@@ -6,6 +8,7 @@ repos:
     entry: isort
     language: python
     additional_dependencies: ["isort==5.13.2"]
+    args: ["--profile", "black"]
     files: ^experimental/lite/.*\.py$
   - id: black
     name: black

@@ -92,9 +92,9 @@ def main():
         legacy, _, _ = run(160000 if ratio > 1 else 10000, ratio > 1)
         per_pos = (legacy - ref).abs().amax(dim=(0, 2, 3)).tolist()
         if ratio == 1:
-            assert max(per_pos[1:]) > 1, (
-                "Negative control did not detect ratio=1 regression"
-            )
+            assert (
+                max(per_pos[1:]) > 1
+            ), "Negative control did not detect ratio=1 regression"
         else:
             torch.testing.assert_close(legacy, ref, atol=1e-6, rtol=1e-6)
         results[str(ratio)] = {

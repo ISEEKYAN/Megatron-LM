@@ -10,11 +10,10 @@ import json
 from pathlib import Path
 
 import torch
-from safetensors import safe_open
-from safetensors.torch import save_file
-
 from megatron.lite.model.deepseek_v41.lite.checkpoint import load_weight
 from megatron.lite.model.deepseek_v41.lite.checkpoint_store import CheckpointTensorStore
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 
 def main():

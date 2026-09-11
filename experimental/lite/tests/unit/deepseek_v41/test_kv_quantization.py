@@ -1,6 +1,5 @@
 import pytest
 import torch
-
 from megatron.lite.primitive.quantization.ds41_kv import (
     fake_quant_main_kv,
     quantize_main_kv,

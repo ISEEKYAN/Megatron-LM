@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
+
 def _quantize_nibbles(values):
     """Official PTX cvt.rn E2M1; ModelOpt's weight codec uses different ties."""
     magnitude = values.abs()

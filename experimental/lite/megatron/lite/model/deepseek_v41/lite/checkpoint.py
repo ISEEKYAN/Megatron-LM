@@ -2,7 +2,6 @@
 """Numerical bindings of V4.1 checkpoint bytes; archival storage stays unchanged."""
 
 import torch
-
 from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
 from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 

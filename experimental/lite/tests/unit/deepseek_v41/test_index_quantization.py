@@ -1,5 +1,4 @@
 import torch
-
 from megatron.lite.primitive.quantization.ds41_index import (
     fake_quant_index,
     quantize_index,
