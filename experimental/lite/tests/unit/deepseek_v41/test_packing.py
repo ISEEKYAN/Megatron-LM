@@ -9,7 +9,6 @@ from megatron.lite.model.deepseek_v41.lite.engram import Engram, NgramHash
 from megatron.lite.model.deepseek_v41.lite.moe import DeepseekV41MoE, SwiGLUExpert
 from megatron.lite.model.deepseek_v41.lite.packing import packed_forward
 from test_attention import config
-from test_moe import make_router
 from torch import nn
 
 
@@ -32,7 +31,7 @@ class Sequence(nn.Module):
             scoring_func='sqrtsoftplus',
         )
         self.layers = nn.ModuleList()
-        for i in (20, 21, 24):
+        for i in (2, 3, 8, 14, 20, 21, 24):
             router = ModalityRouter(cfg, SimpleNamespace(tp_size=1))
             experts = [
                 SwiGLUExpert(nn.Linear(32, 16), nn.Linear(16, 32), nn.Linear(32, 16))
@@ -61,6 +60,21 @@ class Sequence(nn.Module):
 def test_packed_b_only_gradient_and_parameter_contributions_ignore_a():
     torch.manual_seed(84)
     model = Sequence()
+    captured = []
+    handles = [
+        layer.ffn.gate.register_forward_hook(
+            lambda module, inputs, output: captured.append(output[2])
+        )
+        for layer in model.layers
+    ]
+    original_bias = [
+        torch.stack([layer.ffn.gate.bias, layer.ffn.gate.bias_vl]).clone()
+        for layer in model.layers
+    ]
+
+    def latest_stats():
+        return captured[-len(model.layers) :]
+
     h = torch.randn(1, 9, 2, 32, requires_grad=True)
     p = torch.randn(1, 9, 2, requires_grad=True)
     ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 1, 2]])
@@ -73,8 +87,10 @@ def test_packed_b_only_gradient_and_parameter_contributions_ignore_a():
         return contract_hc(out, mix)[:, 4:]
 
     actual = run(h, p, ids)
+    actual_stats = latest_stats()
     bh, bp = model(h[:, 4:], p[:, 4:], input_ids=ids[:, 4:], image_mask=mask[:, 4:])
     expected = contract_hc(bh, bp)
+    expected_stats = latest_stats()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     ga = torch.autograd.grad(actual.square().mean(), [h, p, *params], allow_unused=True)
     gb = torch.autograd.grad(
@@ -92,6 +108,19 @@ def test_packed_b_only_gradient_and_parameter_contributions_ignore_a():
     ids2 = ids.clone()
     ids2[:, :4] = 7
     perturbed = run(changed, p, ids2)
+    for a, b, c in zip(actual_stats, expected_stats, latest_stats()):
+        torch.testing.assert_close(a.counts, b.counts, atol=0, rtol=0)
+        torch.testing.assert_close(a.counts, c.counts, atol=0, rtol=0)
+        torch.testing.assert_close(a.total_tokens, c.total_tokens, atol=0, rtol=0)
+    for layer, old in zip(model.layers, original_bias):
+        torch.testing.assert_close(
+            torch.stack([layer.ffn.gate.bias, layer.ffn.gate.bias_vl]),
+            old,
+            atol=0,
+            rtol=0,
+        )
+    for handle in handles:
+        handle.remove()
     torch.testing.assert_close(perturbed, expected, atol=0, rtol=0)
     gc = torch.autograd.grad(
         perturbed.square().mean(), [changed, p, *params], allow_unused=True

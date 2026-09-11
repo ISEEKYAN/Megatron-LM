@@ -166,6 +166,10 @@ class EngramTable(nn.Module):
             self.register_parameter("master", None)
 
     def _apply(self, fn, recurse=True):
+        self.output_dtype = fn(
+            torch.empty(0, dtype=self.output_dtype, device=self.weight.device)
+        ).dtype
+
         # A parent .bfloat16() must not widen FP8 storage or round the master.
         # Probe only the destination device/dtype, without a lossy round-trip.
         def preserve_dtype(tensor):

@@ -44,7 +44,7 @@ relative to `experimental/lite/`.
 | `model/deepseek_v41/lite/candidates.py` | Per-block maxima, newest reachable block pinned; native selection within the pool | `test_candidates.py`: outside-pool winner and incomplete/empty prefixes; `test_d_reference.py`: original pinned function with multiple budgets |
 | `model/deepseek_v41/lite/engram.py` | Official normalization/hash layout and sequence/image resets; per-copy signed-sqrt gate; local frozen/trainable FP8 provider | `test_engram.py`: integer cards, masked gradients, FP32 master and scale refresh; `test_d_reference.py`: original tokenizer map, prime/multiplier layout, hash, floating forward and every parameter VJP/update |
 | `model/deepseek_v41/lite/moe.py` | DS4 shared router extension for explicit per-token selection bias; modality statistics; explicit updates; local expert dispatch with weight applied before down projection | `test_moe.py`: unbiased weights/gradients, two updates, empty modality, TP reduction call contract, dispatch; `test_d_reference.py`: original Gate/Expert output and parameter VJPs/updates |
-| `model/deepseek_v41/lite/packing.py` | Unpadded single-rank THD splitting through shared `primitive/utils/packed_seq.py`; pure per-sequence callable | `test_packing.py`: Engram→Full/Reuse/Reindex→MoE; fixed weights/bias/RNG and B-only loss; perturb A and compare B output, input gradients and all parameter contributions |
+| `model/deepseek_v41/lite/packing.py` | Unpadded single-rank THD splitting through shared `primitive/utils/packed_seq.py`; pure per-sequence callable | `test_packing.py`: Engram→ratio2/ratio1 Full/Reuse/Reindex→MoE; fixed weights/bias/RNG and B-only loss; perturb A and compare B output, input gradients, all parameter contributions and per-sequence modality statistics |
 
 Initial HC contraction selects copy zero; final contraction consumes the last
 returned pre-mix. Layer20 receives
@@ -63,6 +63,11 @@ per-head gather/softmax equation. Its FP32 diagnostic results and autodiff
 updates verify the floating port contract; they **do not certify native quantized
 kernels, the official training recipe, or a runnable 40-layer model bundle**.
 The scalar mHC card independently transcribes the pinned kernel equations.
+The mutation suite verifies rejection of wrong ratio1 RoPE, reintroduced query
+RMS, stale HC pre-mix, trainable indexer, bias-contaminated weights, wrong hash
+seed, zero master STE and packed shared history. These are named discriminators,
+not a claim of exhaustive mutation coverage.
+
 Other floating Gate/Expert/Engram methods and integer hash/candidate functions
 run directly from the pinned source. Tests fail on missing or changed references;
 `DS41_REFERENCE_DIR` can point to another exact copy of that snapshot.
@@ -98,7 +103,8 @@ PYTHONPATH=experimental/lite OMP_NUM_THREADS=1 python -m pytest \
   experimental/lite/tests/unit/deepseek_v41/test_engram.py \
   experimental/lite/tests/unit/deepseek_v41/test_moe.py \
   experimental/lite/tests/unit/deepseek_v41/test_packing.py \
-  experimental/lite/tests/unit/deepseek_v41/test_d_reference.py
+  experimental/lite/tests/unit/deepseek_v41/test_d_reference.py \
+  experimental/lite/tests/unit/deepseek_v41/test_d_mutations.py
 ```
 
 Also run the existing Sigmoid router auxiliary/replay regressions after shared

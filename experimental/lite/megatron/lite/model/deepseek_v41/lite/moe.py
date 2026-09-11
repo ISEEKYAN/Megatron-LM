@@ -46,6 +46,15 @@ class ModalityRouter(nn.Module):
         self.register_buffer("bias", torch.zeros(config.n_routed_experts))
         self.register_buffer("bias_vl", torch.zeros(config.n_routed_experts))
 
+    def _apply(self, fn, recurse=True):
+        def preserve_bias(tensor):
+            if tensor is self.bias or tensor is self.bias_vl:
+                destination = fn(tensor.new_empty(0))
+                return tensor.to(device=destination.device, dtype=torch.float32)
+            return fn(tensor)
+
+        return super()._apply(preserve_bias, recurse=recurse)
+
     def forward(self, x, image_mask=None):
         x = x.reshape(-1, self.router.gate.in_features)
         if image_mask is None:

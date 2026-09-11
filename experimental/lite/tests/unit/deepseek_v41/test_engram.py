@@ -95,3 +95,19 @@ def test_table_module_dtype_conversion_preserves_storage_and_master():
     assert table.scale.dtype == torch.float8_e8m0fnu
     assert table.master.dtype == torch.float32
     torch.testing.assert_close(table.master, original, atol=0, rtol=0)
+
+
+def test_table_composes_with_parent_float_conversion():
+    from megatron.lite.model.deepseek_v41.lite.engram import EngramTable
+    from megatron.lite.primitive.quantization.ds41_fp8 import quantize_swa
+
+    quantized = quantize_swa(torch.ones(3, 32))
+    for trainable in (False, True):
+        table = EngramTable(quantized.values, quantized.scale, trainable=trainable)
+        model = Engram(2, 2, table, nn.Linear(32, 6, bias=False)).float()
+        h = torch.randn(1, 2, 2, 2, requires_grad=True)
+        out = model(h, torch.tensor([[[0], [1]]]))
+        out.sum().backward()
+        assert torch.isfinite(h.grad).all()
+        assert table.weight.dtype == torch.float8_e4m3fn
+        assert (table.master is not None) == trainable

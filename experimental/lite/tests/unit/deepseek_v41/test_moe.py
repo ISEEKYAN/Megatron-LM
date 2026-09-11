@@ -111,3 +111,15 @@ def test_ds4_tp_count_scope_keeps_both_modality_reductions(monkeypatch):
     assert stats.counts.tolist() == [[1, 2, 1], [1, 0, 1]]
     # DS4 denominator deliberately uses local count * TP, not a global recount.
     assert stats.total_tokens.tolist() == [2, 0]
+
+
+def test_parent_dtype_conversion_keeps_modality_bias_fp32():
+    router = make_router()
+    with torch.no_grad():
+        router.bias.add_(0.0012345)
+        router.bias_vl.add_(0.0012345)
+    before = [router.bias.clone(), router.bias_vl.clone()]
+    router.bfloat16()
+    for bias, expected in zip((router.bias, router.bias_vl), before):
+        assert bias.dtype == torch.float32
+        torch.testing.assert_close(bias, expected, atol=0, rtol=0)
