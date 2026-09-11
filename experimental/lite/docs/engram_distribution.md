@@ -105,7 +105,7 @@ backward, distinct replica contributions and multi-step W/M plus save/load;
 W bounds are atol=rtol=3e-6, momentum atol=2e-5/rtol=3e-6. These are explicit test
 thresholds for the reduced fixtures, not a full-scale or BF16 tolerance approval.
 
-## Pipeline integration boundary (E3 design, pending C4 model/protocol)
+## Paired pipeline components and model integration boundary
 
 Consume corrected A1 `2b2c7e0c3` and B2-S `f725fe983`; O12 supersedes the older
 A1 auxiliary-objective OPEN rows: indexer parameters are frozen, with no indexer
@@ -126,7 +126,27 @@ A C4 pipeline adapter needs a per-microbatch record with these distinct fields:
 | Index-K/Top-K and shadow indexer identity | Frozen dependency, matching publication generation and CP global positions | No parameter/indexer-loss gradient |
 | Step, microbatch, virtual chunk, generation, source layer, CP token range | Exact integer metadata; validated before a read | A return must match its outstanding forward record |
 
-The common pipeline transport currently accepts one rank-3 tensor and casts it
+`model.deepseek_v41.lite.pipeline.PairedPayload` carries these tensor fields,
+while `PipelineTag` identifies step, microbatch, virtual chunk, generation and
+source owners. `PipelineLedger` retains each graph until its exact consumer set
+returns all cotangents, then invokes backward once. `finish_step` retires stale
+generations and bounds bookkeeping after the scheduler drains a step.
+
+`primitive.parallel.tensor_payload` sends integer shape/dtype/generation headers
+and exact tensor bytes over P2P. The receiver acknowledges generation/schema
+acceptance before data transfer. FP8/E8M0 publication and int64 positions therefore
+retain their representation; floating tensors become independent autograd leaves
+whose cotangents must be returned explicitly. Both peers must follow a matching
+schedule. This component does not register parameters or schedule microbatches.
+
+`test_deepseek_v41_pipeline.py` exercises this transport on four NCCL ranks with
+two interleaved microbatches, reverse backward order, nonreentrant recomputation,
+three distinct consumer vectors and an independently derived owner update.
+It also checks FP8/E8M0 values, integers above float32's exact range, rejected
+wire generations and ledger lifetime errors. This is a transport/graph component
+fixture, not the actual source-20 attention/compressor or a full PP model run.
+
+The common pipeline scheduler currently accepts one rank-3 tensor and casts it
 to its configured pipeline dtype. It cannot silently carry this mixed-dtype
 record: tensor fields require explicit dtype/shape-preserving transport, and
 integer generations must not be packed into floating hidden activations. C4's
