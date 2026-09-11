@@ -17,6 +17,8 @@ PAYLOAD_FIELDS = (
     'index_scale',
     'topk',
     'positions',
+    'latent',
+    'candidates',
 )
 
 
@@ -59,6 +61,8 @@ class PairedPayload:
     index_scale: torch.Tensor | None = None
     topk: torch.Tensor | None = None
     positions: torch.Tensor | None = None
+    latent: torch.Tensor | None = None
+    candidates: torch.Tensor | None = None
 
     def __post_init__(self):
         if not isinstance(self.h, torch.Tensor) or not isinstance(self.p, torch.Tensor):
@@ -83,6 +87,7 @@ class PairedPayload:
             'index_scale',
             'topk',
             'positions',
+            'candidates',
         ):
             value = getattr(self, name)
             if value is not None and value.requires_grad:
@@ -91,9 +96,9 @@ class PairedPayload:
                 )
         for name in ('topk', 'positions'):
             value = getattr(self, name)
-            if value is not None and value.dtype != torch.int64:
+            if value is not None and value.dtype not in (torch.int32, torch.int64):
                 raise ValueError(
-                    'Pipeline selection and position metadata must be int64'
+                    'Pipeline selection and position metadata must be integer tensors'
                 )
 
     def tensors(self):

@@ -283,7 +283,7 @@ def test_engram_bounded_row_loader(tmp_path, damage, monkeypatch, _engram_cpu):
     import hashlib
     from types import SimpleNamespace
 
-    from megatron.lite.model.deepseek_v41.lite import checkpoint
+    from megatron.lite.model.deepseek_v41.lite import engram_checkpoint
 
     name = 'layers.0.engram.embed.weight'
     values, scales = torch.arange(7 * 256).byte().reshape(7, 256), torch.full(
@@ -316,7 +316,7 @@ def test_engram_bounded_row_loader(tmp_path, damage, monkeypatch, _engram_cpu):
             f.write(b'\x00')
     if damage:
         with pytest.raises(ValueError):
-            checkpoint.load_engram_rows(
+            engram_checkpoint.load_engram_rows(
                 SimpleNamespace(entries=entries),
                 name,
                 intervals=intervals,
@@ -326,7 +326,7 @@ def test_engram_bounded_row_loader(tmp_path, damage, monkeypatch, _engram_cpu):
             )
     else:
         chunks = [
-            checkpoint.load_engram_rows(
+            engram_checkpoint.load_engram_rows(
                 SimpleNamespace(entries=entries),
                 name,
                 intervals=intervals,
@@ -338,7 +338,7 @@ def test_engram_bounded_row_loader(tmp_path, damage, monkeypatch, _engram_cpu):
         ]
         from megatron.lite.primitive.modules import engram_lookup
 
-        table = checkpoint.load_engram_table(
+        table = engram_checkpoint.load_engram_table(
             SimpleNamespace(entries=entries),
             name,
             engram_lookup.RowLookup((0, 7)),
