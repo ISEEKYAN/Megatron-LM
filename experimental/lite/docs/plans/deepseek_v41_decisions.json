@@ -1,0 +1,302 @@
+[
+  {
+    "id": "O01",
+    "question": "Engram e_proj LR",
+    "candidates": [
+      "1x",
+      "5x"
+    ],
+    "evidence_gap": "A4 lacks e_proj multiplier",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "Engram active",
+    "blocks": [
+      "F2-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O02",
+    "question": "Engram e_norm LR",
+    "candidates": [
+      "1x",
+      "5x"
+    ],
+    "evidence_gap": "A4 lacks e_norm multiplier",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "Engram active",
+    "blocks": [
+      "F2-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O03",
+    "question": "wo_a grouped Muon lowering",
+    "candidates": [
+      "logical grouped matrices",
+      "explicit approved lowering"
+    ],
+    "evidence_gap": "A4 grouping unresolved",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "backbone training",
+    "blocks": [
+      "F1-I",
+      "F2-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O04",
+    "question": "Vision fused gate/up grouping",
+    "candidates": [
+      "split logical gate/up",
+      "fused matrix"
+    ],
+    "evidence_gap": "A4 fused grouping unresolved",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "vision unfrozen",
+    "blocks": [
+      "F2-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O05",
+    "question": "Encoder unfreeze LR",
+    "candidates": [
+      "evidence-derived smaller LR",
+      "approved port value"
+    ],
+    "evidence_gap": "smaller LR has no value",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "vision unfreeze",
+    "blocks": [
+      "F2-I",
+      "F3-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O06",
+    "question": "vision.norm unfreeze LR",
+    "candidates": [
+      "retain prior group",
+      "encoder LR"
+    ],
+    "evidence_gap": "A4 transition unresolved",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "vision unfreeze",
+    "blocks": [
+      "F2-I",
+      "F3-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O07",
+    "question": "Image vectors optimizer/representation/LR/decay",
+    "candidates": [
+      "explicit Adam group",
+      "approved matrix representation and optimizer"
+    ],
+    "evidence_gap": "A4 image vectors unresolved",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "image vectors trained",
+    "blocks": [
+      "F2-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O08",
+    "question": "FP8 scale regeneration",
+    "candidates": [
+      "published quantizer",
+      "approved training regeneration"
+    ],
+    "evidence_gap": "training scale/rounding unspecified",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "quantized table training",
+    "blocks": [
+      "E1e-S",
+      "E2-S",
+      "F2-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O09",
+    "question": "Master weight existence/representation/dtype",
+    "candidates": [
+      "persistent high precision master",
+      "qualified alternative"
+    ],
+    "evidence_gap": "published FP8 is not training state evidence",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "quantized table training",
+    "blocks": [
+      "E1e-S",
+      "E2-S",
+      "C4-I",
+      "F2-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O10",
+    "question": "Gradient accumulation/storage/reduction dtype/order",
+    "candidates": [
+      "FP32 main_grad",
+      "qualified alternative"
+    ],
+    "evidence_gap": "training gradient state unspecified",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "quantized table training",
+    "blocks": [
+      "E1e-S",
+      "E2-S",
+      "F2-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O11",
+    "question": "Momentum dtype/rounding",
+    "candidates": [
+      "FP32",
+      "qualified alternative"
+    ],
+    "evidence_gap": "Algorithm1 does not settle storage dtype",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "Sinkhorn active",
+    "blocks": [
+      "E2-S",
+      "F2-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O12",
+    "question": "Indexer objective/coefficient/detach/contributors",
+    "candidates": [
+      "evidence-defined auxiliary objective",
+      "approved port objective"
+    ],
+    "evidence_gap": "inference integer Top-K supplies no backward recipe",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "indexer training",
+    "blocks": [
+      "B2-I",
+      "D6-S",
+      "D6-I",
+      "G1-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O13",
+    "question": "Modality load reduction scope",
+    "candidates": [
+      "global valid tokens per modality",
+      "approved alternative"
+    ],
+    "evidence_gap": "rate alone does not settle reduction",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "MoE bias/auxiliary updates",
+    "blocks": [
+      "D5-S",
+      "D5-I",
+      "E4-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O14",
+    "question": "Fake-quant derivatives",
+    "candidates": [
+      "approved STE",
+      "evidence-derived alternative"
+    ],
+    "evidence_gap": "forward quantizer does not specify derivative",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "quantization backward",
+    "blocks": [
+      "C2a-S",
+      "C2b-S",
+      "C2c-S",
+      "B2-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O15",
+    "question": "Main KV FP4-off precision/reference",
+    "candidates": [
+      "explicit BF16/FP32 branch",
+      "approved controlled reference"
+    ],
+    "evidence_gap": "published post-training path does not settle pretraining reference",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "main KV FP4 disabled",
+    "blocks": [
+      "C2a-S",
+      "D2-S",
+      "G1-S"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O16",
+    "question": "Global objective normalization/runtime scaling",
+    "candidates": [
+      "valid-token weighted",
+      "sequence weighted",
+      "equal-microbatch objective"
+    ],
+    "evidence_gap": "numerator/denominator and applied runtime scales unresolved",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "any training objective",
+    "blocks": [
+      "B2-S",
+      "D5-S",
+      "D6-S",
+      "G1-I"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  },
+  {
+    "id": "O17",
+    "question": "Atomic skip semantics",
+    "candidates": [
+      "skip all optimizer/scheduler/bias/publication effects",
+      "documented framework policy"
+    ],
+    "evidence_gap": "framework overflow/skip contract not yet audited",
+    "authority": "Model recipe owner supplies cited evidence; project maintainer approves any explicit port deviation",
+    "active_when": "mixed optimizer training",
+    "blocks": [
+      "E1e-S",
+      "E4-S",
+      "E5t-S",
+      "E5v-S"
+    ],
+    "status": "OPEN",
+    "resolution": null
+  }
+]
