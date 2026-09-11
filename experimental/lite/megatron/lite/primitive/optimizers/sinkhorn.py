@@ -126,6 +126,11 @@ class Sinkhorn(torch.optim.Optimizer):
         )
         self.replica_rank = 0 if replica_group is None else dist.get_rank(replica_group)
         self._prepared = None
+        if self.replica_size > 1 and row_group is None:
+            raise ValueError('Replica-owned rows require a logical row group')
+        parameters = [p for group in self.param_groups for p in group['params']]
+        if len({id(p) for p in parameters}) != len(parameters):
+            raise ValueError('Each Sinkhorn parameter owner must appear once')
         for group in self.param_groups:
             for parameter in group['params']:
                 if (
@@ -238,6 +243,11 @@ class Sinkhorn(torch.optim.Optimizer):
         self._prepared = prepared
         return True
 
+    def agree_skip(self, skip):
+        """OR a publication/skip decision across the logical matrix grid."""
+        parameter = self.param_groups[0]['params'][0]
+        return _any(skip, parameter.device, self.row_group, self.column_group)
+
     def candidates(self):
         if self._prepared is None:
             raise RuntimeError('No prepared Sinkhorn step')
@@ -270,8 +280,12 @@ class Sinkhorn(torch.optim.Optimizer):
         if self._prepared is not None:
             raise RuntimeError('Cannot checkpoint a prepared Sinkhorn step')
         result = super().state_dict()
+        ranks = tuple(
+            None if group is None else tuple(dist.get_process_group_ranks(group))
+            for group in (self.row_group, self.column_group, self.replica_group)
+        )
         result['sinkhorn_layout'] = [
-            (tuple(p.shape), self.replica_size, self.replica_rank)
+            (tuple(p.shape), self.replica_size, self.replica_rank, ranks)
             for group in self.param_groups
             for p in group['params']
         ]
@@ -283,9 +297,28 @@ class Sinkhorn(torch.optim.Optimizer):
         current = self.state_dict()['sinkhorn_layout']
         if state_dict.get('sinkhorn_layout') != current:
             raise ValueError('Sinkhorn checkpoint layout differs; reshard explicitly')
-        for saved in state_dict['state'].values():
-            if set(saved) != {'momentum'} or saved['momentum'].dtype != torch.float32:
-                raise ValueError('Sinkhorn checkpoint requires FP32 momentum only')
+        saved_ids = [
+            pid for group in state_dict['param_groups'] for pid in group['params']
+        ]
+        parameters = [p for group in self.param_groups for p in group['params']]
+        if len(saved_ids) != len(parameters):
+            raise ValueError('Sinkhorn checkpoint parameter count differs')
+        for pid, parameter in zip(saved_ids, parameters):
+            saved = state_dict['state'].get(pid)
+            if saved is None:
+                continue
+            start, end = _span(parameter.shape[0], self.replica_size, self.replica_rank)
+            momentum = saved.get('momentum')
+            if (
+                set(saved) != {'momentum'}
+                or not isinstance(momentum, torch.Tensor)
+                or momentum.dtype != torch.float32
+                or momentum.shape != (end - start, parameter.shape[1])
+                or not torch.isfinite(momentum).all()
+            ):
+                raise ValueError(
+                    'Sinkhorn checkpoint requires matching finite FP32 momentum'
+                )
         super().load_state_dict(
             {k: v for k, v in state_dict.items() if k != 'sinkhorn_layout'}
         )

@@ -121,3 +121,68 @@ def test_sinkhorn_stages_before_atomic_commit():
     assert not optimizer.step()
     assert torch.equal(p, old)
     assert torch.equal(optimizer.state[p]['momentum'], old_m)
+
+
+def test_engram_sinkhorn_publication_restore_and_retry(monkeypatch):
+    from megatron.lite.model.deepseek_v41.lite import table_state
+    from megatron.lite.primitive.modules import engram_lookup
+
+    def construct():
+        table = engram_lookup.ShardedEngramTable(
+            torch.full((4, 32), 256.0).to(torch.float8_e4m3fn),
+            torch.full((4, 1), 1 / 256).to(torch.float8_e8m0fnu),
+            engram_lookup.RowLookup((0, 4)),
+            trainable=True,
+        )
+        return table_state.EngramSinkhornState(table)
+
+    state = construct()
+    expected = state.table.master.detach().double()
+    momentum = torch.zeros_like(expected)
+    for step in range(3):
+        gradient = torch.zeros(4, 32)
+        gradient[step % 2] = torch.arange(1.0, 33.0)
+        state.begin(step)
+        state.accept_gradient(step, gradient)
+        if step == 1:
+            previous = state.table.master.detach().clone()
+            with monkeypatch.context() as patch:
+
+                def fail(*args, **kwargs):
+                    raise RuntimeError('publication fault')
+
+                patch.setattr(table_state, 'quantize_block_fp8', fail)
+                with pytest.raises(RuntimeError, match='publication'):
+                    state.step(lr=0.001)
+            assert torch.equal(state.table.master, previous)
+            assert state.active_step == step
+        expected, momentum = scalar_step(
+            expected.tolist(), momentum.tolist(), gradient.tolist(), 0.001, 5
+        )
+        assert state.step(lr=0.001)
+        torch.testing.assert_close(
+            state.table.master.double(), expected, atol=2e-6, rtol=2e-6
+        )
+        torch.testing.assert_close(
+            state.momentum.double(), momentum, atol=2e-6, rtol=2e-6
+        )
+        assert state.main_grad.dtype == torch.float32
+        saved = state.state_dict()
+        state = construct()
+        state.load_state_dict(saved)
+        assert state.version == step + 1
+
+
+def test_sinkhorn_rejects_damaged_checkpoint_without_changing_state():
+    from megatron.lite.primitive.optimizers.sinkhorn import Sinkhorn
+
+    p = torch.nn.Parameter(torch.ones(2, 2))
+    optimizer = Sinkhorn([p], lr=1.0)
+    p.grad = torch.ones_like(p)
+    assert optimizer.step()
+    old = optimizer.state[p]['momentum'].clone()
+    saved = optimizer.state_dict()
+    saved['state'] = {0: {'momentum': torch.zeros(1, 2)}}
+    with pytest.raises(ValueError, match='momentum'):
+        optimizer.load_state_dict(saved)
+    assert torch.equal(optimizer.state[p]['momentum'], old)

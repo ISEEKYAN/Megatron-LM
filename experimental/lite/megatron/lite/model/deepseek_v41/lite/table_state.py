@@ -16,7 +16,7 @@ class EngramTableState:
     distributed optimizer integration. This object does not implement Sinkhorn.
     """
 
-    def __init__(self, table):
+    def __init__(self, table, *, momentum_rows=None):
         self.table = table
         self.version = 0
         self.last_step = -1
@@ -26,7 +26,13 @@ class EngramTableState:
         if master is not None and master.dtype != torch.float32:
             raise ValueError('Engram state requires a native FP32 master')
         self.main_grad = None if master is None else torch.zeros_like(master)
-        self.momentum = None if master is None else torch.zeros_like(master)
+        self.momentum = (
+            None
+            if master is None
+            else torch.zeros_like(
+                master if momentum_rows is None else master[slice(*momentum_rows)]
+            )
+        )
 
     def begin(self, step):
         if self.active_step is not None:
@@ -172,3 +178,109 @@ class EngramTableState:
             self.main_grad.zero_()
         self.table.weight, self.table.scale = prepared['weight'], prepared['scale']
         self.version, self.last_step = state['version'], state['last_step']
+
+
+class EngramSinkhornState(EngramTableState):
+    """Connect resident table gradients/publication to sharded Algorithm 1.
+
+    Engram uses 5x base LR and gamma .18 exactly once in the optimizer. The
+    FP32 master remains the lookup/STE carrier; only optimizer-owned rows retain
+    momentum. Quantization is prepared before any live weight or momentum moves.
+    """
+
+    def __init__(self, table, *, row_group=None, column_group=None, replica_group=None):
+        import torch.distributed as dist
+        from megatron.lite.primitive.optimizers.sinkhorn import Sinkhorn
+
+        from .parallel import _interval
+
+        size = 1 if replica_group is None else dist.get_world_size(replica_group)
+        rank = 0 if replica_group is None else dist.get_rank(replica_group)
+        super().__init__(
+            table, momentum_rows=_interval(table.weight.shape[0], size, rank)
+        )
+        self.optimizer = None
+        if table.master is not None:
+            self.optimizer = Sinkhorn(
+                [{'params': [table.master], 'multiplier': 5.0}],
+                lr=0.0,
+                row_group=row_group,
+                column_group=column_group,
+                replica_group=replica_group,
+            )
+            table.master.main_grad = self.main_grad
+            self.optimizer.state[table.master]['momentum'] = self.momentum
+
+    @torch.no_grad()
+    def step(self, *, lr, skip=False):
+        if self.active_step is None or not self._ready:
+            raise RuntimeError('Table gradients are pending or no step is active')
+        if not math.isfinite(lr) or lr < 0:
+            raise ValueError('Invalid learning rate')
+        if self.optimizer is None:
+            self._finish()
+            return False
+        optimizer = self.optimizer
+        if optimizer.agree_skip(skip):
+            self._finish()
+            return False
+        optimizer.param_groups[0]['lr'] = lr
+        if not optimizer.prepare_step():
+            self._finish()
+            return False
+        _, candidate = optimizer.candidates()[0]
+        error = None
+        try:
+            values, scales = quantize_block_fp8(candidate, (1, 32), scale_format='e8m0')
+        except Exception as exc:
+            error = exc
+        if optimizer.agree_skip(error is not None):
+            optimizer.discard_step()
+            # Keep the active step/gradient for retry on every rank.
+            raise RuntimeError('Engram publication failed on a matrix rank') from error
+        invalid = (
+            not torch.isfinite(values.float()).all()
+            or not torch.isfinite(scales.float()).all()
+        )
+        if optimizer.agree_skip(invalid):
+            optimizer.discard_step()
+            self._finish()
+            return False
+        optimizer.commit_step()
+        self.momentum = optimizer.state[self.table.master]['momentum']
+        self.table.weight, self.table.scale = values, scales
+        self.version += 1
+        self._finish()
+        return True
+
+    def state_dict(self):
+        state = super().state_dict()
+        state['sinkhorn'] = (
+            None
+            if self.optimizer is None
+            else {
+                'layout': self.optimizer.state_dict()['sinkhorn_layout'],
+                'lr': self.optimizer.param_groups[0]['lr'],
+            }
+        )
+        return state
+
+    def load_state_dict(self, state):
+        if 'sinkhorn' not in state:
+            raise ValueError('Expected an Engram Sinkhorn checkpoint')
+        metadata = state['sinkhorn']
+        if self.optimizer is None:
+            if metadata is not None:
+                raise ValueError('Frozen table cannot restore optimizer state')
+        elif (
+            not isinstance(metadata, dict)
+            or set(metadata) != {'layout', 'lr'}
+            or metadata['layout'] != self.optimizer.state_dict()['sinkhorn_layout']
+            or not math.isfinite(metadata['lr'])
+            or metadata['lr'] < 0
+        ):
+            raise ValueError('Incompatible Engram Sinkhorn layout or LR')
+        super().load_state_dict({k: v for k, v in state.items() if k != 'sinkhorn'})
+        if self.optimizer is not None:
+            self.optimizer.param_groups[0]['lr'] = metadata['lr']
+            self.optimizer.state[self.table.master]['momentum'] = self.momentum
