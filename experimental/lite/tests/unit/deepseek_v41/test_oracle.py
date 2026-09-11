@@ -8,7 +8,7 @@ import torch
 
 TOOLS = Path(__file__).resolve().parents[3] / "tools/deepseek_v41"
 sys.path.insert(0, str(TOOLS))
-from oracle import snapshot, forward_all_tokens, validate_sequences
+from oracle import snapshot, tensor_metadata, forward_all_tokens, validate_sequences
 from config_mapping import map_release_config, leaves, MAPPING, WAIVERS
 
 
@@ -18,6 +18,10 @@ def test_capture_clone_survives_publication_mutation():
     source.add_(7).mul_(2)
     assert saved["latent"].tolist() == [56.0, 68.0]
     assert source.tolist() == [126.0, 150.0]
+    info = tensor_metadata(saved)["latent"]
+    assert info["shape"] == [2] and info["dtype"] == "torch.float32"
+    assert info["byte_length"] == 8
+    assert info["sha256"] != tensor_metadata(source)["sha256"]
 
 
 def test_all_token_head_original_method_card():
