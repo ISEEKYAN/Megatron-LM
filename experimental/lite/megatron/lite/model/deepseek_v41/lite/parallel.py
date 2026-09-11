@@ -87,8 +87,26 @@ class EngramLayout:
         """
         import torch.distributed as dist
 
-        if any(tuple(sorted(group)) != group for group in self.rank_groups):
-            raise ValueError("Collective row groups require ascending global ranks")
+        if any(
+            tuple(sorted(group)) != tuple(group)
+            for group in (*self.rank_groups, *self.replica_groups)
+        ):
+            raise ValueError(
+                "Collective row and replica groups require ascending global ranks"
+            )
         lookup = [dist.new_group(list(group)) for group in self.rank_groups]
         replicas = [dist.new_group(sorted(group)) for group in self.replica_groups]
         return lookup, replicas
+
+    def create_optimizer_group(self):
+        """All WORLD ranks call after create_groups in the same table order.
+
+        Replica-owned momentum pieces partition the logical rows once; their
+        statistics span all existing table ranks, not one physical replica.
+        Reuse this group for tables with the same rank map.
+        """
+        import torch.distributed as dist
+
+        return dist.new_group(
+            sorted(rank for group in self.rank_groups for rank in group)
+        )

@@ -155,6 +155,7 @@ def test_sinkhorn_shards(configuration, tmp_path):
 
 
 def _run_engram(rank, rendezvous, checkpoint_root, trainable):
+    import megatron.lite.model.deepseek_v41.lite.parallel as engram_parallel
     from megatron.lite.model.deepseek_v41.lite import prefetch, table_state
     from megatron.lite.primitive.modules import engram_lookup
     from megatron.lite.primitive.quantization import block_fp8
@@ -168,8 +169,9 @@ def _run_engram(rank, rendezvous, checkpoint_root, trainable):
         timeout=timedelta(seconds=120),
     )
     try:
-        row_groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
-        replicas = [dist.new_group([0, 2]), dist.new_group([1, 3])]
+        layout = engram_parallel.EngramLayout(5, ((0, 1), (2, 3)), world_size=4)
+        row_groups, replicas = layout.create_groups()
+        optimizer_group = layout.create_optimizer_group()
         begin, end = span(5, 2, rank % 2)
 
         def construct():
@@ -185,7 +187,7 @@ def _run_engram(rank, rendezvous, checkpoint_root, trainable):
                 output_dtype=torch.float32,
             )
             return table_state.EngramSinkhornState(
-                table, row_group=dist.group.WORLD, replica_group=replicas[rank % 2]
+                table, row_group=optimizer_group, replica_group=replicas[rank % 2]
             )
 
         state = construct()
@@ -287,3 +289,20 @@ def test_engram_sinkhorn_lookup_prefetch_restart(trainable, tmp_path):
         nprocs=4,
         join=True,
     )
+
+
+@pytest.mark.gpus(1)
+def test_sinkhorn_epsilon_first_division_cuda():
+    from megatron.lite.primitive.optimizers.sinkhorn import sinkhorn_direction
+
+    assert os.getenv('SLURM_JOB_ID') and torch.cuda.is_available()
+    observed = []
+    output = sinkhorn_direction(
+        torch.tensor([[1e-20]], device='cuda', dtype=torch.float32),
+        trace=lambda iteration, value: observed.append(value),
+    )
+    assert len(observed) == 11
+    torch.testing.assert_close(
+        observed[0], torch.tensor([[0.5]], device='cuda'), atol=0, rtol=0
+    )
+    torch.testing.assert_close(output, torch.ones_like(output), atol=1e-6, rtol=0)

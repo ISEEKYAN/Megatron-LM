@@ -32,12 +32,13 @@ def _any(flag, device, row_group, column_group):
     return bool(value.item())
 
 
-def sinkhorn_direction(nesterov, *, row_group=None, column_group=None):
+def sinkhorn_direction(nesterov, *, row_group=None, column_group=None, trace=None):
     """Fresh current-N direction; groups partition rows and columns respectively.
 
     A replica's optimizer-owned rows are disjoint matrix rows too, and therefore
     belong in row_group. Padding must already be stripped. None means local,
     never WORLD. All ranks participate, including zero-row/zero-column shards.
+    Optional trace(iteration, U) receives detached copies for A4 stage auditing.
     """
     if nesterov.ndim != 2 or nesterov.dtype != torch.float32:
         raise ValueError('Sinkhorn requires an FP32 matrix [m, n]')
@@ -53,9 +54,20 @@ def sinkhorn_direction(nesterov, *, row_group=None, column_group=None):
         raise ValueError('Sinkhorn requires a finite logical matrix')
 
     def norm(matrix, axis):
-        squares = matrix.square().sum(dim=axis, keepdim=True)
+        # Scale before squaring so finite large/tiny FP32 N retains its norm.
+        group = column_group if axis == 1 else row_group
+        shape = list(matrix.shape)
+        shape[axis] = 1
+        maximum = (
+            matrix.abs().amax(dim=axis, keepdim=True)
+            if matrix.shape[axis]
+            else matrix.new_zeros(shape)
+        )
+        _reduce(maximum, group, dist.ReduceOp.MAX)
+        scale = torch.where(maximum == 0, torch.ones_like(maximum), maximum)
+        squares = (matrix / scale).square().sum(dim=axis, keepdim=True)
         _reduce(squares, column_group if axis == 1 else row_group)
-        return squares.sqrt()
+        return squares.sqrt() * maximum
 
     rho = norm(nesterov, 1)
     mean = _reduce(rho.sum(), row_group) / rows
@@ -64,6 +76,8 @@ def sinkhorn_direction(nesterov, *, row_group=None, column_group=None):
     for iteration in range(K):
         axis = 1 if iteration % 2 == 0 else 0
         update = update / (norm(update, axis) + EPS)
+        if trace is not None:
+            trace(iteration + 1, update.detach().clone())
     return update * math.sqrt(columns.item())
 
 

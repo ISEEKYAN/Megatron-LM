@@ -53,6 +53,7 @@ def scalar_step(weight, momentum, gradient, lr, multiplier=1):
         [[1.0], [1999.0]],
         [[0.0, 0.0], [0.0, 0.0]],
         [[1e-20]],
+        [[1e30, -2e30], [0.0, 1e30]],
     ],
 )
 def test_a4_fresh_direction(matrix):
@@ -186,3 +187,48 @@ def test_sinkhorn_rejects_damaged_checkpoint_without_changing_state():
     with pytest.raises(ValueError, match='momentum'):
         optimizer.load_state_dict(saved)
     assert torch.equal(optimizer.state[p]['momentum'], old)
+
+
+@pytest.mark.parametrize('matrix', [[[1e-20]], [[1.0, 2.0], [3.0, 4.0], [0.0, 0.0]]])
+def test_a4_normalization_intermediates(matrix):
+    from megatron.lite.primitive.optimizers.sinkhorn import sinkhorn_direction
+
+    observed = []
+    sinkhorn_direction(
+        torch.tensor(matrix, dtype=torch.float32),
+        trace=lambda iteration, value: observed.append(value.double()),
+    )
+    assert len(observed) == 11
+    if len(matrix) == 1:
+        torch.testing.assert_close(
+            observed[0],
+            torch.tensor([[0.5]], dtype=torch.float64),
+            atol=2e-6,
+            rtol=2e-6,
+        )
+    else:
+        u = [[float(v) for v in row] for row in matrix]
+        for iteration in range(11):
+            if iteration % 2 == 0:
+                for i, row in enumerate(u):
+                    norm = math.sqrt(math.fsum(v * v for v in row)) + 1e-20
+                    u[i] = [v / norm for v in row]
+            else:
+                for j in range(2):
+                    norm = math.sqrt(math.fsum(row[j] ** 2 for row in u)) + 1e-20
+                    for row in u:
+                        row[j] /= norm
+            torch.testing.assert_close(
+                observed[iteration],
+                torch.tensor(u, dtype=torch.float64),
+                atol=2e-6,
+                rtol=2e-6,
+            )
+
+
+def test_engram_replica_order_cannot_silently_change_optimizer_owner():
+    from megatron.lite.model.deepseek_v41.lite.parallel import EngramLayout
+
+    layout = EngramLayout(5, ((2, 3), (0, 1)), world_size=4)
+    with pytest.raises(ValueError, match='ascending'):
+        layout.create_groups()
