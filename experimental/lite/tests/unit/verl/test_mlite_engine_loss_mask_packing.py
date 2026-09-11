@@ -19,8 +19,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from megatron.lite.model.deepseek_v4.lite.protocol import \
-    _nested_from_packed_tensor
+from megatron.lite.model.deepseek_v4.lite.protocol import _nested_from_packed_tensor
 from tensordict import TensorDict
 
 pytestmark = pytest.mark.mlite

@@ -48,10 +48,9 @@ class _Stage(nn.Module):
 
 
 def test_ds4_load_hf_resolves_local_pp_layer_to_global(tmp_path):
-    from safetensors.torch import save_file
-
     from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
     from megatron.lite.model.deepseek_v4.lite import checkpoint as ckpt
+    from safetensors.torch import save_file
 
     dim = 4
     global_ids = [4, 5]  # this stage owns global layers 4 and 5, keyed local 0 and 1
@@ -118,7 +117,7 @@ def test_ds4_export_streams_router_buffers_from_every_pp_stage(monkeypatch):
     ps = SimpleNamespace(pp_size=2, pp_rank=1, pp_global_ranks=[0, 1], pp_group=object())
     cfg = SimpleNamespace(num_hash_layers=1, vocab_size=8)
 
-    exported = dict(ckpt._export_unquantized_weights(StageOne(), cfg, ps))
+    exported = dict(ckpt._export_unquantized_weights(StageOne(), cfg, ps, cpu=True))
 
     assert torch.equal(exported["layers.0.ffn.gate.tid2eid"], remote)
     assert torch.equal(exported["layers.1.ffn.gate.bias"], torch.tensor([0.25, -0.5]))

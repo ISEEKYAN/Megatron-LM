@@ -72,3 +72,11 @@ this delivery. O14 supplies the tested quantized-operator derivative policy, and
 O15 permits explicit disabled-quantization diagnostics. Published
 `dspark_block_size=5` remains unchanged in archival config; only the separate
 execution flag rejects DSpark execution. MTP storage is not a model factory.
+
+## Existing-suite regression follow-up
+
+The supplied dev7064 failure-set comparison is documented in
+[the regression report](../validation/deepseek_v41/regression-validation.md).
+Final Slurm job 18347896 has zero candidate-only failures or collection errors;
+its three remaining failures also occur in the baseline. The report preserves
+the actual exit codes, test-inventory boundary, raw logs and reproducible comparator.
