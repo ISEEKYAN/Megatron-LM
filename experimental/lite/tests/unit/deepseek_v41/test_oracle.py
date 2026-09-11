@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -8,8 +9,17 @@ import torch
 
 TOOLS = Path(__file__).resolve().parents[3] / "tools/deepseek_v41"
 sys.path.insert(0, str(TOOLS))
-from oracle import snapshot, tensor_metadata, forward_all_tokens, validate_sequences
-from config_mapping import map_release_config, leaves, MAPPING, WAIVERS
+from config_mapping import MAPPING, WAIVERS, leaves, map_release_config
+from fixtures import REFERENCE_SHA256
+from oracle import (forward_all_tokens, snapshot, tensor_metadata,
+                    validate_sequences)
+
+REFERENCE = Path(__file__).resolve().parents[2] / "fixtures/deepseek_v41/reference"
+
+
+def test_bundled_reference_matches_pinned_source():
+    for name in ("model.py", "config.json", "inference_config.json"):
+        assert hashlib.sha256((REFERENCE / name).read_bytes()).hexdigest() == REFERENCE_SHA256[name]
 
 
 def test_capture_clone_survives_publication_mutation():
@@ -25,7 +35,7 @@ def test_capture_clone_survives_publication_mutation():
 
 
 def test_all_token_head_original_method_card():
-    source = Path("/tmp/ds41-review/model.py")
+    source = (REFERENCE / "model.py")
     tree = ast.parse(source.read_text())
     head_class = next(
         node
@@ -99,8 +109,8 @@ def test_all_87_config_leaves_map_or_have_explicit_scope():
     import copy
     import json
 
-    release = json.loads(Path("/tmp/ds41-review/config.json").read_text())
-    tree = ast.parse(Path("/tmp/ds41-review/model.py").read_text())
+    release = json.loads((REFERENCE / "config.json").read_text())
+    tree = ast.parse((REFERENCE / "model.py").read_text())
     args = next(
         node
         for node in tree.body
@@ -117,7 +127,7 @@ def test_all_87_config_leaves_map_or_have_explicit_scope():
     assert len(leaves(release)) == 87
     assert set(leaves(release)) == set(MAPPING) | set(WAIVERS)
     mapped = map_release_config(release, defaults)
-    inference = json.loads(Path("/tmp/ds41-review/inference_config.json").read_text())
+    inference = json.loads((REFERENCE / "inference_config.json").read_text())
     assert all(mapped[name] == value for name, value in inference.items())
     altered = copy.deepcopy(release)
     altered["text_config"]["hidden_size"] = 640
