@@ -1,0 +1,20 @@
+[
+  {
+    "file": "model-00044-of-00048.safetensors",
+    "sha256": "9a6b39fb88a2510487a8efaef77aa7864e8061f6b62c95a0f010e9dd538f3b05",
+    "bytes": 2652728736,
+    "revision": "df42c109f1defefcbfcedbe7d905718a12266e40"
+  },
+  {
+    "file": "model-00045-of-00048.safetensors",
+    "sha256": "0cc9d5f6ca3a2158ccc63ce2c70c76aeda8177d54913340481af566680329eb5",
+    "bytes": 2573998176,
+    "revision": "df42c109f1defefcbfcedbe7d905718a12266e40"
+  },
+  {
+    "file": "model-00046-of-00048.safetensors",
+    "sha256": "e625902027b9d23d416f8818c665fab4704e0b96dc1bc778321601b700475a9d",
+    "bytes": 2706402896,
+    "revision": "df42c109f1defefcbfcedbe7d905718a12266e40"
+  }
+]
