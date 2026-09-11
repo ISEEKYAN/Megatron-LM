@@ -9,16 +9,13 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 from megatron.lite.primitive.optimizers.fsdp2 import (
-    FSDP2Config,
-    FSDP2Optimizer,
-    all_reduce_scalar_,
-    clip_grads_with_sharded_norm_,
-    fsdp2_available,
-)
-from megatron.lite.primitive.optimizers.fsdp2.adamw import build_adamw_optimizer
-from megatron.lite.primitive.optimizers.fsdp2.wrap import build_fsdp2_shard_placement_fn
+    FSDP2Config, FSDP2Optimizer, all_reduce_scalar_,
+    clip_grads_with_sharded_norm_, fsdp2_available)
+from megatron.lite.primitive.optimizers.fsdp2.adamw import \
+    build_adamw_optimizer
+from megatron.lite.primitive.optimizers.fsdp2.wrap import \
+    build_fsdp2_shard_placement_fn
 from megatron.lite.primitive.parallel.state import ParallelState
 
 pytestmark = pytest.mark.mlite
@@ -225,6 +222,7 @@ def test_fsdp2_rejects_non_module_unit_path():
 
 
 def test_wrap_fsdp2_requires_distributed_when_mesh_is_not_provided(monkeypatch):
+    monkeypatch.setattr(fsdp2_wrap.dist, "is_initialized", lambda: False)
     monkeypatch.setattr(fsdp2_wrap, "_load_fully_shard", lambda: lambda module, **kwargs: module)
 
     with pytest.raises(RuntimeError, match="torch.distributed"):

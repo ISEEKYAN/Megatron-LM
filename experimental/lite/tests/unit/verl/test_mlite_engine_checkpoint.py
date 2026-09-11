@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from __future__ import annotations
+
 from types import SimpleNamespace
 
 import pytest
 import torch
-from verl_mlite.engine.config import MegatronLiteEngineConfig
-from verl_mlite.engine.mlite_engine import MegatronLiteEngine
 
 
 class _Scheduler:
@@ -257,3 +257,11 @@ def test_hf_model_only_save_uses_protocol_and_writes_hf_metadata(tmp_path, monke
         ("processor", hf_path),
     ]
     assert hf_config.auto_map == {"AutoModel": "modeling.Model"}
+
+
+@pytest.fixture(autouse=True)
+def _optional_verl_imports():
+    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
+    global MegatronLiteEngineConfig, MegatronLiteEngine
+    from verl_mlite.engine.config import MegatronLiteEngineConfig
+    from verl_mlite.engine.mlite_engine import MegatronLiteEngine
