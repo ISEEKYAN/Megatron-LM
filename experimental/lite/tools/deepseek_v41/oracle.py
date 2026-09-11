@@ -595,8 +595,12 @@ def run_forward(request):
                 request["images"].get(name),
                 request["token_types"].get(name),
             )
-            baseline = _execute(*common, capture=False)
-            instrumented = _execute(*common, capture=True)
+            # The published launcher sets the default CUDA device for factories
+            # in forward (notably cached SWA indices), as well as construction.
+            # Scope it so the caller's default device is restored on failure.
+            with torch.device(execution["device"]):
+                baseline = _execute(*common, capture=False)
+                instrumented = _execute(*common, capture=True)
             if not torch.equal(baseline["logits"], instrumented["logits"]):
                 raise ValueError(
                     "instrumentation changed official outputs; tolerance qualification required"
