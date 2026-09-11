@@ -232,3 +232,25 @@ class Engram(nn.Module):
         if token_mask is not None:
             gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
         return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(hidden.dtype)
+
+
+class ShardedEngramTable(EngramTable):
+    """Engram provider with resident local rows and collective request routing.
+
+    Replica gradient reduction and optimizer-state sharding are step operations,
+    outside lookup. All ranks in the row group must execute backward together.
+    """
+
+    def __init__(self, weight, scale, lookup, *, trainable=False, output_dtype=torch.bfloat16):
+        super().__init__(weight, scale, trainable=trainable, output_dtype=output_dtype)
+        expected = lookup.boundaries[lookup.rank + 1] - lookup.boundaries[lookup.rank]
+        if weight.shape[0] != expected:
+            raise ValueError("Table rows do not match lookup ownership interval")
+        self.lookup = lookup
+
+    def forward(self, ids):
+        rows, scales, floating = self.lookup.fetch(self.weight, self.scale, ids, self.master)
+        decoded = rows.float() * scales.float().repeat_interleave(32, -1)
+        if floating is not None:
+            decoded = floating + (decoded - floating).detach()
+        return decoded.to(self.output_dtype)
