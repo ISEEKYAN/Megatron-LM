@@ -63,15 +63,24 @@ def run_microbatch_loop(
             else:
                 loss, metrics = loss_fn(out, batch, loss_context)
             if not forward_only:
-                (loss / num_microbatches).backward()
+                backward_output(out, loss / num_microbatches)
             out["loss"] = loss.detach()
             all_metrics.append(metrics)
         elif not forward_only:
-            (out["loss"] / num_microbatches).backward()
+            backward_output(out, out["loss"] / num_microbatches)
         last_out = out
     if last_out is not None and all_metrics:
         last_out["_loss_fn_metrics"] = all_metrics
     return last_out
+
+
+def backward_output(output, loss):
+    """Allow a model to finish staged backward after the scaled runtime loss."""
+    callback = output.get("backward")
+    if callback is None:
+        loss.backward()
+    else:
+        callback(loss)
 
 
 def compute_and_clip_grad_norm(

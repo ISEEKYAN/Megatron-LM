@@ -120,3 +120,34 @@ shifts labels and masks within each sample and masks terminal targets. It return
 loss/log-probabilities and honors loss-context temperature/entropy. Distributed
 construction, optimizer creation, and routing replay explicitly require their
 separate integrations. No distributed or full-size training claim is made here.
+
+### Explicit post-training vision schedule
+
+`ImplConfig(vision_trainability=VisionTrainability(encoder=False, norm=True,
+aligner=True, delimiter=True), external_vision_device='cuda')` explicitly
+chooses the trainable visual owners. There is no inferred pretraining unfreeze
+schedule. `norm` refers to the final `vision.norm`; block norms follow
+`encoder`. O12 indexers retain their existing frozen policy. Engram trainability
+continues to use `trainable_engram`.
+
+The packed protocol accepts `extras['images']` as the existing batch list of
+`ImageInput` lists and optional one-dimensional `extras['token_types']` matching
+`input_ids`. External vision uses separate parameter storage outside the model
+module tree. Before each microbatch, model-owned weights are copied to that
+storage. The protocol returns a `backward` callback; the single-rank runtime
+passes it the scaled SFT or external RL loss. The callback completes LLM
+backward, then vision backward, then adds visual gradients to their model
+owners. Checkpoints and optimizers must enumerate the model owners only.
+Direct callers must invoke `output['backward'](scaled_loss)` for a scheduled
+output, rather than only calling `loss.backward()`.
+
+Only one microbatch may be pending. `VisionSchedule.state_dict()` records the
+explicit mask at a completed microbatch boundary; model and optimizer state
+must be saved separately. Restore this mask before constructing optimizer
+groups. Pending autograd graphs are not serialized: mid-microbatch restart
+requires replay. `abort()` releases a failed or abandoned graph; a caller must
+also discard partial LLM gradients after a failed backward. This is a serial
+single-rank implementation, without distributed external-encoder replication
+or overlap. Actual mixed-optimizer routing and complete training-checkpoint
+continuity remain integration requirements, not claims established by the
+standalone schedule tests.

@@ -983,3 +983,232 @@ def test_v41_image_processor_rejects_mutations(monkeypatch, mutation):
         monkeypatch.setattr(data, 'image_token_types', wrong)
     with pytest.raises(AssertionError):
         test_v41_image_processor_official((125, 97), None, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    'encoder,norm,aligner,delimiter',
+    [(False, True, True, True), (True, False, False, False), (False, False, False, False)],
+)
+def test_v41_post_training_mask(moe, encoder, norm, aligner, delimiter):
+    from megatron.lite.model.deepseek_v41.lite.training import VisionTrainability
+
+    _, bundle = _assembly_bundle()
+    model = bundle.chunks[0]
+    mask = VisionTrainability(encoder=encoder, norm=norm, aligner=aligner, delimiter=delimiter)
+    mask.apply(model)
+    for name, parameter in model.vision.named_parameters():
+        expected = norm if name == 'norm.weight' else encoder
+        assert parameter.requires_grad == expected, 'Vision mask boundary mismatch'
+    assert all(p.requires_grad == aligner for p in model.aligner.parameters())
+    assert all(
+        getattr(model, key).requires_grad == delimiter
+        for key in ('image_start', 'image_end', 'image_newline')
+    )
+    assert all(
+        not p.requires_grad
+        for layer in model.layers
+        if layer.attn.indexer is not None
+        for p in layer.attn.indexer.parameters()
+    ), 'Indexer must remain frozen'
+
+
+@pytest.mark.parametrize(
+    'encoder,norm,aligner,delimiter',
+    [(False, True, True, True), (True, False, False, False), (False, False, False, False)],
+)
+def test_v41_external_schedule_protocol_serial_parity(
+    moe, encoder, norm, aligner, delimiter, device='cpu'
+):
+    from copy import deepcopy
+
+    from megatron.lite.model.deepseek_v41.lite import image_data as data
+    from megatron.lite.model.deepseek_v41.lite import protocol as proto
+    from megatron.lite.model.deepseek_v41.lite.training import VisionTrainability
+    from megatron.lite.primitive.train_step import run_microbatch_loop
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    torch.manual_seed(812)
+    cfg = _assembly_config()
+    bundle = proto.build_model(
+        cfg,
+        impl_cfg=proto.ImplConfig(
+            device=device,
+            dtype=torch.float32,
+            quantized=False,
+            token_map=list(range(256)),
+            vision_trainability=VisionTrainability(
+                encoder=encoder, norm=norm, aligner=aligner, delimiter=delimiter
+            ),
+            external_vision_device=device,
+        ),
+    )
+    model = bundle.chunks[0]
+    baseline = deepcopy(model)
+    baseline.vision_schedule = None
+    schedule = bundle.extras['vision_schedule']
+    assert schedule.vision is not model.vision, 'External vision must be a real copy'
+    batches = []
+    for _ in range(2):
+        ids = torch.tensor([1, 99, 99, 99, 99, 2])
+        img = data.ImageInput(1, torch.randn(4, 3, 14, 14), 2, 2, data.image_token_types(1, 1))
+        batches.append(
+            PackedBatch(ids, ids, torch.tensor([6]), torch.ones(6), extras={'images': [[img]]})
+        )
+    run_microbatch_loop(model, iter(batches), 2, bundle.forward_step)
+    for batch in batches:
+        (proto._forward_step(baseline, batch)['loss'] / 2).backward()
+    for (name, p), (other, q) in zip(model.named_parameters(), baseline.named_parameters()):
+        assert name == other
+        assert (p.grad is None) == (q.grad is None), f'Gradient owner mismatch: {name}'
+        if p.grad is not None:
+            torch.testing.assert_close(
+                p.grad, q.grad, rtol=0, atol=0, msg=lambda m: f'{name}: {m}'
+            )
+    assert schedule.stage == 'idle', 'Vision backward must finish before next microbatch'
+    for parameter, trainable in (
+        (model.vision.norm.weight, norm),
+        (model.aligner.w1.weight, aligner),
+        (model.image_start, delimiter),
+    ):
+        if trainable:
+            assert parameter.grad.abs().sum() > 0, 'Trainable visual exception lost its gradient'
+        else:
+            assert parameter.grad is None, 'Frozen visual owner received a gradient'
+    original = {name: p.detach().clone() for name, p in model.named_parameters()}
+    # Diagnostic SGD checks the mask and copy direction; F2 integration uses its own backends.
+    optimizer = torch.optim.SGD((p for p in model.parameters() if p.requires_grad), lr=0.01)
+    optimizer.step()
+    schedule.sync_weights()
+    for owner, replica in schedule._pairs():
+        torch.testing.assert_close(owner, replica, rtol=0, atol=0)
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            torch.testing.assert_close(original[name], parameter, rtol=0, atol=0)
+    for name, trainable in (
+        ('vision.norm.weight', norm),
+        ('aligner.w1.weight', aligner),
+        ('image_start', delimiter),
+        ('image_end', delimiter),
+        ('image_newline', delimiter),
+    ):
+        if trainable:
+            assert not torch.equal(
+                original[name], dict(model.named_parameters())[name]
+            ), f'No update: {name}'
+
+
+@pytest.mark.gpus(1)
+def test_v41_external_schedule_cuda_serial_parity(moe):
+    assert torch.cuda.is_available()
+    with torch.device('cuda'):
+        test_v41_external_schedule_protocol_serial_parity(
+            moe, True, True, True, True, device='cuda'
+        )
+
+
+@pytest.mark.parametrize(
+    'mutation', ['none', 'weight_direction', 'gradient_direction', 'early_backward']
+)
+def test_v41_schedule_order_sync_mutations(moe, monkeypatch, mutation):
+    from megatron.lite.model.deepseek_v41.lite.image_data import ImageInput, image_token_types
+    from megatron.lite.model.deepseek_v41.lite.training import VisionSchedule, VisionTrainability
+
+    _, bundle = _assembly_bundle()
+    model = bundle.chunks[0]
+    VisionTrainability(encoder=True, norm=True, aligner=True, delimiter=True).apply(model)
+    schedule = VisionSchedule(model, 'cpu')
+    events = []
+    model.head.weight.register_hook(lambda grad: events.append('llm_backward'))
+    schedule.vision.norm.weight.register_hook(lambda grad: events.append('vision_backward'))
+    with torch.no_grad():
+        model.vision.norm.weight.add_(0.3)
+    if mutation == 'weight_direction':
+        monkeypatch.setattr(schedule, 'sync_weights', lambda: None)
+    features = schedule.forward(
+        [[ImageInput(0, torch.randn(4, 3, 14, 14), 2, 2, image_token_types(1, 1))]]
+    )
+    if mutation == 'weight_direction':
+        with pytest.raises(AssertionError, match='Owner-to-copy synchronization'):
+            assert torch.equal(
+                model.vision.norm.weight, schedule.vision.norm.weight
+            ), 'Owner-to-copy synchronization missing'
+        return
+    with pytest.raises(RuntimeError, match='pending'):
+        schedule.sync_weights()
+    if mutation == 'early_backward':
+        with pytest.raises(RuntimeError, match='must follow completed LLM backward'):
+            schedule.finish_backward()
+        return
+    loss = torch.nn.functional.linear(features[0][0], model.head.weight).square().mean()
+    if mutation == 'gradient_direction':
+        monkeypatch.setattr(schedule, '_pairs', lambda: iter(()))
+    schedule.backward(loss)
+    assert events == [
+        'llm_backward',
+        'vision_backward',
+    ], 'Vision backward ran before LLM backward completed'
+    if mutation == 'gradient_direction':
+        with pytest.raises(AssertionError, match='Copy-to-owner gradient'):
+            assert (
+                model.vision.norm.weight.grad is not None
+            ), 'Copy-to-owner gradient synchronization missing'
+    else:
+        assert (
+            model.vision.norm.weight.grad.abs().sum() > 0
+        ), 'Copy-to-owner gradient synchronization missing'
+    assert schedule.stage == 'idle'
+
+
+def test_v41_schedule_stage_restore(moe):
+    from copy import deepcopy
+
+    from megatron.lite.model.deepseek_v41.lite.image_data import ImageInput, image_token_types
+    from megatron.lite.model.deepseek_v41.lite.training import VisionSchedule, VisionTrainability
+
+    _, bundle = _assembly_bundle()
+    model = bundle.chunks[0]
+    frozen = VisionTrainability(encoder=False, norm=False, aligner=False, delimiter=False)
+    frozen.apply(model)
+    model.vision_schedule = schedule = VisionSchedule(model, 'cpu')
+    saved = deepcopy(schedule.state_dict())
+    active = VisionTrainability(encoder=True, norm=True, aligner=True, delimiter=True)
+    active.apply(model)
+    images = [[ImageInput(0, torch.randn(4, 3, 14, 14), 2, 2, image_token_types(1, 1))]]
+    features = schedule.forward(images)
+    for call in (
+        schedule.state_dict,
+        lambda: frozen.apply(model),
+        lambda: schedule.load_state_dict(saved),
+    ):
+        with pytest.raises(RuntimeError, match='pending|completed'):
+            call()
+    schedule.backward(features[0][0].square().sum())
+    active_state = deepcopy(schedule.state_dict())
+    schedule.load_state_dict(saved)
+    assert not any(p.requires_grad for p in model.vision.parameters()), 'Restored frozen mask lost'
+    assert not any(
+        p.grad is not None for p in model.vision.parameters()
+    ), 'Restore kept stale frozen gradients'
+    schedule.load_state_dict(active_state)
+    assert all(p.requires_grad for p in model.vision.parameters()), 'Restored active mask lost'
+    for owner, replica in schedule._pairs():
+        assert owner.requires_grad == replica.requires_grad
+        torch.testing.assert_close(owner, replica, atol=0, rtol=0)
+
+
+def test_v41_schedule_failed_forward_releases_graph(moe):
+    from megatron.lite.model.deepseek_v41.lite.training import VisionTrainability, VisionSchedule
+    from megatron.lite.model.deepseek_v41.lite.image_data import ImageInput, image_token_types
+
+    _, bundle = _assembly_bundle()
+    model = bundle.chunks[0]
+    VisionTrainability(encoder=True, norm=True, aligner=True, delimiter=True).apply(model)
+    schedule = VisionSchedule(model, 'cpu')
+    valid = ImageInput(0, torch.randn(4, 3, 14, 14), 2, 2, image_token_types(1, 1))
+    invalid = ImageInput(4, torch.randn(3, 3, 14, 14), 2, 2, image_token_types(1, 1))
+    with pytest.raises(ValueError, match='Patch count'):
+        schedule.forward([[valid, invalid]])
+    assert schedule.stage == 'idle' and not schedule.features, 'Failed vision forward retained stale graphs'
+    result = schedule.forward([[valid]])
+    assert len(schedule.features) == 1, 'Retry reused features from failed microbatch'
+    schedule.backward(result[0][0].square().sum())

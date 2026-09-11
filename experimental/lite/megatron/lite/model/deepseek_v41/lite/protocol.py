@@ -1,16 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Text-only single-rank protocol. Distributed and optimizer routing are separate."""
+"""Single-rank packed multimodal protocol with explicit vision scheduling."""
 
 from dataclasses import dataclass, field
 
 import torch
-from torch.nn import functional as F
-
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.runtime.contracts import ParallelConfig
+from torch.nn import functional as F
+
 from .checkpoint import export_model, load_model, save_model
+from .training import VisionSchedule, VisionTrainability
 
 
 @dataclass(frozen=True)
@@ -25,13 +26,17 @@ class ImplConfig:
     gate_temperature: float = 1.0
     bias_rate: float = 0.001
     enable_dspark_execution: bool = False
+    vision_trainability: VisionTrainability | None = None
+    external_vision_device: str | None = None
 
 
 def build_model_config(source, **overrides):
     if overrides:
         raise ValueError('Apply overrides to the explicit nested source config')
     return (
-        DeepseekV41Config(source) if isinstance(source, dict) else DeepseekV41Config.from_hf(source)
+        DeepseekV41Config(source)
+        if isinstance(source, dict)
+        else DeepseekV41Config.from_hf(source)
     )
 
 
@@ -46,7 +51,9 @@ def build_model(model_cfg, *, impl_cfg):
     ):
         raise NotImplementedError('V4.1 assembly currently requires single-rank parallelism')
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
-        raise NotImplementedError('Distributed V4.1 construction requires the parallel integration')
+        raise NotImplementedError(
+            'Distributed V4.1 construction requires the parallel integration'
+        )
     if impl_cfg.optimizer is not None:
         raise NotImplementedError(
             'Optimizer construction requires the V4.1 object-based routing integration'
@@ -77,12 +84,19 @@ def build_model(model_cfg, *, impl_cfg):
             module.output_dtype = impl_cfg.dtype
     if model.engram_hash is not None:
         model.engram_hash.to(device=impl_cfg.device)
+    if impl_cfg.vision_trainability is not None:
+        impl_cfg.vision_trainability.apply(model)
+    if impl_cfg.external_vision_device is not None:
+        if impl_cfg.vision_trainability is None:
+            raise ValueError('External vision requires an explicit post-training mask')
+        model.vision_schedule = VisionSchedule(model, impl_cfg.external_vision_device)
     return ModelBundle(
         [model],
         ParallelState(),
         forward_step=_forward_step,
         extras={
             'model_cfg': model_cfg,
+            'vision_schedule': model.vision_schedule,
             'optimizer_backend': 'none',
             'parameter_bindings': model.parameter_bindings,
         },
@@ -90,10 +104,22 @@ def build_model(model_cfg, *, impl_cfg):
 
 
 def _forward_step(model, batch):
+    schedule = model.vision_schedule
+    if schedule is not None and schedule.stage != 'idle':
+        raise RuntimeError('Previous microbatch requires completed vision backward')
+    try:
+        return _forward_step_impl(model, batch)
+    except Exception:
+        if schedule is not None:
+            schedule.abort()
+        raise
+
+
+def _forward_step_impl(model, batch):
     if batch.routed_experts is not None or batch.r3_replay_mask is not None:
         raise NotImplementedError('Routing replay requires the replay integration')
-    if batch.extras:
-        raise NotImplementedError('Text-only protocol does not accept extra modality fields')
+    if set(batch.extras) - {'images', 'token_types'}:
+        raise NotImplementedError('Unsupported V4.1 modality fields')
     if batch.input_ids.ndim != 1 or batch.total_tokens != batch.input_ids.numel():
         raise ValueError('Expected packed 1-D tokens matching seq_lens')
     if batch.position_ids is not None and not torch.equal(
@@ -107,8 +133,18 @@ def _forward_step(model, batch):
     temperature = 1.0 if context is None else context.temperature
     if temperature <= 0:
         raise ValueError('Temperature must be positive')
-    logits = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens)['logits'][0] / temperature
+    modality = dict(batch.extras)
+    if 'token_types' in modality:
+        if modality['token_types'].shape != batch.input_ids.shape:
+            raise ValueError('Packed token types must match the input IDs')
+        modality['token_types'] = modality['token_types'][None]
+    logits = (
+        model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality)['logits'][0]
+        / temperature
+    )
     result = {'logits': logits}
+    if model.vision_schedule is not None and model.vision_schedule.stage != 'idle':
+        result['backward'] = model.vision_schedule.backward
     if batch.labels is not None:
         if batch.labels.shape != batch.input_ids.shape:
             raise ValueError('Labels must match packed input shape')
@@ -164,7 +200,9 @@ def export_hf_weights(chunks, model_cfg, ps, **kwargs):
     if kwargs:
         raise ValueError('Unsupported export options')
     model = _single(chunks)
-    if model.archival_store is None or set(model.archival_store.entries) != set(model.archival_bindings):
+    if model.archival_store is None or set(model.archival_store.entries) != set(
+        model.archival_bindings
+    ):
         raise ValueError('Complete archival storage is required for export')
     yield from export_model(model)
     if model.archival_store is not None:

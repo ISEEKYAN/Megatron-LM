@@ -16,10 +16,10 @@ from .attention import AttentionState, CSA2Attention, Linear
 from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc
 from .checkpoint_store import validate_execution
 from .engram import Engram, EngramTable, NgramHash, hash_multipliers, prime_buckets
+from .image_data import TEXT, merge_image_embeddings
 from .moe import DeepseekV41MoE, ModalityRouter, SwiGLUExpert
 from .packing import packed_forward
-from .vision import ViT, Aligner
-from .image_data import merge_image_embeddings, TEXT
+from .vision import Aligner, ViT
 
 
 @dataclass(frozen=True)
@@ -90,6 +90,7 @@ class DeepseekV41Model(nn.Module):
         cfg = config.to_hf_dict()
         t, v = cfg['text_config'], cfg['vision_config']
         self.hc_mult = t['hc_mult']
+        self.vision_schedule = None
         self.tensor_bindings = {}
         self.archival_bindings = {}
         self.archival_store = None
@@ -244,7 +245,9 @@ class DeepseekV41Model(nn.Module):
     def _bind(self, key, owner, attribute, role, head_count=None, encoding=None):
         if key in self.tensor_bindings:
             raise ValueError(f'duplicate binding: {key}')
-        self.tensor_bindings[key] = TensorBinding(key, owner, attribute, role, head_count, encoding)
+        self.tensor_bindings[key] = TensorBinding(
+            key, owner, attribute, role, head_count, encoding
+        )
         if encoding in ('I8', 'F8_E4M3') and role != 'engram_table':
             scale = key[:-6] + 'scale'
             self.tensor_bindings[scale] = TensorBinding(
@@ -412,8 +415,8 @@ class DeepseekV41Model(nn.Module):
                             for a, b in zip(boundaries, boundaries[1:])
                         ):
                             raise ValueError('Image span crosses a packed sequence boundary')
-                    expected_types[batch, img.start : img.start + img.types.numel()] = img.types.to(
-                        input_ids.device
+                    expected_types[batch, img.start : img.start + img.types.numel()] = (
+                        img.types.to(input_ids.device)
                     )
             if token_types is not None and not torch.equal(
                 token_types.to(input_ids.device), expected_types
@@ -440,10 +443,14 @@ class DeepseekV41Model(nn.Module):
         return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
 
     def merge_image_embeddings(self, images, h):
-        features = [
-            [self.encode_image(img.patches, img.n_vit_h, img.n_vit_w) for img in sample or ()]
-            for sample in images
-        ]
+        features = (
+            self.vision_schedule.forward(images)
+            if self.vision_schedule is not None
+            else [
+                [self.encode_image(img.patches, img.n_vit_h, img.n_vit_w) for img in sample or ()]
+                for sample in images
+            ]
+        )
         return merge_image_embeddings(
             h, images, features, self.image_start, self.image_end, self.image_newline
         )
