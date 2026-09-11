@@ -64,6 +64,7 @@ def _pipeline_worker(rank, rendezvous):
         timeout=timedelta(seconds=120),
     )
     group = dist.group.WORLD
+    owner_error = None
     tags = [pipeline.PipelineTag(7, mb, 1, 3) for mb in range(2)]
     try:
         if rank == 0:
@@ -136,14 +137,21 @@ def _pipeline_worker(rank, rendezvous):
                     * coefficients
                 )
                 expected_mix += current * coefficients
-            torch.testing.assert_close(x.grad, expected_x, atol=0, rtol=0)
-            torch.testing.assert_close(mix.grad, expected_mix, atol=0, rtol=0)
-            before_x, before_mix = x.detach().clone(), mix.detach().clone()
-            optimizer.step()
-            torch.testing.assert_close(x, before_x - 0.125 * expected_x, atol=0, rtol=0)
-            torch.testing.assert_close(
-                mix, before_mix - 0.125 * expected_mix, atol=0, rtol=0
-            )
+            try:
+                torch.testing.assert_close(x.grad, expected_x, atol=0, rtol=0)
+                torch.testing.assert_close(mix.grad, expected_mix, atol=0, rtol=0)
+                before_x, before_mix = x.detach().clone(), mix.detach().clone()
+                optimizer.step()
+                torch.testing.assert_close(
+                    x, before_x - 0.125 * expected_x, atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    mix, before_mix - 0.125 * expected_mix, atol=0, rtol=0
+                )
+            except AssertionError as exc:
+                # Drain matching P2P before all ranks report the same numerical
+                # failure; teardown must not replace it with a peer timeout.
+                owner_error = str(exc)
             with pytest.raises(RuntimeError, match='generation'):
                 ledger.read(tags[0])
             with pytest.raises(RuntimeError, match='generation'):
@@ -214,7 +222,14 @@ def _pipeline_worker(rank, rendezvous):
                     transport.recv_tensor_payload(
                         (98, 0), peer=0, group=group, device=device
                     )
-        dist.barrier()
+        errors = [None] * dist.get_world_size()
+        dist.all_gather_object(errors, owner_error)
+        failure = next((error for error in errors if error is not None), None)
+        if failure is not None:
+            raise AssertionError(
+                'Paired HC/CED owner gradient or update differs from the '
+                'independent saved-coefficient reference: ' + failure
+            )
     finally:
         dist.destroy_process_group()
 
