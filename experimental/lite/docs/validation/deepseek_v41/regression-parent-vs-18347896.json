@@ -1,0 +1,42 @@
+{
+  "baseline": {
+    "path": "experimental/lite/docs/validation/deepseek_v41/regression-parent-18348391.txt.gz",
+    "sha256": "797892069f8d0500dfe96843f09c3066e3fa36899e979b84dff8eba4b3ce45c4",
+    "summary": "16 failed, 294 passed, 21 skipped, 24 warnings, 5 errors in 104.17s (0:01:44)",
+    "failures_and_errors": [
+      "ERROR collecting test_deepseek_v4_recompute_units.py",
+      "ERROR collecting test_mlite_engine_checkpoint.py",
+      "ERROR collecting test_mlite_engine_config.py",
+      "ERROR collecting test_mlite_engine_loss_mask_packing.py",
+      "ERROR collecting test_thd_packing_consistency.py",
+      "test_ds4_export_streams_router_buffers_from_every_pp_stage",
+      "test_ds4_load_hf_resolves_local_pp_layer_to_global",
+      "test_ds4_replay_roots_exclude_mtp_layers",
+      "test_dynamic_shape_variable_len_recv_gloo",
+      "test_kimi_k2_mtp_and_pp_layout_rules_are_explicit",
+      "test_pp_export_never_materializes_the_whole_stage",
+      "test_pp_export_streams_over_nccl_and_matches_materialized",
+      "test_primitive_explicit_dcp_saves_optimizer_rank_sidecar",
+      "test_primitive_local_checkpoint_keeps_optimizer_checkpoints_local",
+      "test_runtime_checkpoint_load_matches_uninterrupted_training",
+      "test_runtime_checkpoint_uses_optimizer_state_dict_contract",
+      "test_runtime_local_checkpoint_load_matches_uninterrupted_training",
+      "test_runtime_local_checkpoint_restores_rng_state",
+      "test_runtime_local_checkpoint_uses_optimizer_parameter_state_contract",
+      "test_runtime_local_checkpoint_uses_rank_specific_files_when_distributed",
+      "test_wrap_fsdp2_requires_distributed_when_mesh_is_not_provided"
+    ]
+  },
+  "candidate": {
+    "path": "experimental/lite/docs/validation/deepseek_v41/regression-18347896.txt.gz",
+    "sha256": "f0924e4f2d01800503fc2e740acd7750f1ada1b47f2f2d24767dc143915e8dad",
+    "summary": "3 failed, 464 passed, 42 skipped, 1 xfailed, 37 warnings in 121.38s (0:02:01)",
+    "failures_and_errors": [
+      "test_dynamic_shape_variable_len_recv_gloo",
+      "test_pp_export_never_materializes_the_whole_stage",
+      "test_pp_export_streams_over_nccl_and_matches_materialized"
+    ]
+  },
+  "candidate_minus_baseline": [],
+  "regression_gate_passed": true
+}

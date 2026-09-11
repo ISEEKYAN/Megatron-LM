@@ -1,0 +1,37 @@
+{
+  "source_commit": "15cba8e9bb0a0f41bfdc23cc466d1445d3e7a8ae",
+  "baseline_commit": "a50244d7b",
+  "baseline_job": 18348391,
+  "full_job": 18349573,
+  "csa_job": 18349574,
+  "full_slurm_exit": "1:0",
+  "csa_slurm_exit": "0:0",
+  "comparator_exit": 0,
+  "new_failures_or_errors": [],
+  "removed_failures_or_errors": [
+    "ERROR collecting test_deepseek_v4_recompute_units.py",
+    "ERROR collecting test_mlite_engine_checkpoint.py",
+    "ERROR collecting test_mlite_engine_config.py",
+    "ERROR collecting test_mlite_engine_loss_mask_packing.py",
+    "ERROR collecting test_thd_packing_consistency.py",
+    "test_ds4_export_streams_router_buffers_from_every_pp_stage",
+    "test_ds4_load_hf_resolves_local_pp_layer_to_global",
+    "test_ds4_replay_roots_exclude_mtp_layers",
+    "test_kimi_k2_mtp_and_pp_layout_rules_are_explicit",
+    "test_primitive_explicit_dcp_saves_optimizer_rank_sidecar",
+    "test_primitive_local_checkpoint_keeps_optimizer_checkpoints_local",
+    "test_runtime_checkpoint_load_matches_uninterrupted_training",
+    "test_runtime_checkpoint_uses_optimizer_state_dict_contract",
+    "test_runtime_local_checkpoint_load_matches_uninterrupted_training",
+    "test_runtime_local_checkpoint_restores_rng_state",
+    "test_runtime_local_checkpoint_uses_optimizer_parameter_state_contract",
+    "test_runtime_local_checkpoint_uses_rank_specific_files_when_distributed",
+    "test_wrap_fsdp2_requires_distributed_when_mesh_is_not_provided"
+  ],
+  "raw_log_sha256": {
+    "regression-parent-18348391.txt.gz": "797892069f8d0500dfe96843f09c3066e3fa36899e979b84dff8eba4b3ce45c4",
+    "regression-18349573.txt.gz": "201c552412235da5dd7cb361e47525221c7efe1455abfd9608deee3791f0474c",
+    "regression-csa-18349574.txt.gz": "a67f24438e2d53abf646b8403032fd7f038d999146bc86b9f177e9dbdcc3a628"
+  },
+  "gpu_scope": "Exact published source only; later D additions are covered by the separate 85-case CPU run."
+}

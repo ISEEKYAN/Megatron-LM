@@ -75,8 +75,15 @@ execution flag rejects DSpark execution. MTP storage is not a model factory.
 
 ## Existing-suite regression follow-up
 
-The supplied dev7064 failure-set comparison is documented in
-[the regression report](../validation/deepseek_v41/regression-validation.md).
-Final Slurm job 18347896 has zero candidate-only failures or collection errors;
-its three remaining failures also occur in the baseline. The report preserves
-the actual exit codes, test-inventory boundary, raw logs and reproducible comparator.
+The acceptance baseline is parent `a50244d7b`, job 18348391. The previous
+`dev7064` acceptance claim is superseded by
+[the corrected regression report](../validation/deepseek_v41/regression-validation.md).
+Historical job 18347358 (source 735e89e70, 7 failed / 459 passed) has three new
+CSA failures and 17 removed failure/error outcomes against that parent.
+The report distinguishes subsequent repairs and fresh exact-source verification
+from that earlier failed run, preserving raw logs and actual exit codes.
+
+Fresh exact-source `15cba8e9b` job 18349573 reports 3 failed / 464 passed,
+with zero new failures/errors against the correct parent (comparator exit 0;
+Slurm exit 1:0). CSA-specific job 18349574 reports 5 passed, zero skipped,
+Slurm exit 0:0. These results do not claim GPU validation of later D additions.
