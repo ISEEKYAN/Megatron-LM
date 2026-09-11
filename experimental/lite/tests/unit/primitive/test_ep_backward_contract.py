@@ -234,7 +234,9 @@ def test_cpu_gloo_contract_and_real_backward(tmp_path):
         args=(str(tmp_path / 'init'), str(tmp_path)),
         nprocs=2,
         join=True,
-        start_method='fork',
+        # The full suite may already have initialized autograd/CUDA threads.
+        # Fork inherits that engine state and cannot safely execute backward.
+        start_method='spawn',
     )
     rows = [json.loads((tmp_path / f'{rank}.json').read_text()) for rank in range(2)]
     assert rows[0]['cases'] == rows[1]['cases']
