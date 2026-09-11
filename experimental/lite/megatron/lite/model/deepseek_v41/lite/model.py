@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Single-rank text assembly with explicit live tensor and archival owners.
 
-Vision/aligner and DSpark have storage owners but no execution implementation.
+Vision/aligner have live differentiable owners; DSpark remains archival.
 The floating diagnostic mode is explicit; it is not native quantized parity.
 """
 
@@ -18,6 +18,8 @@ from .checkpoint_store import validate_execution
 from .engram import Engram, EngramTable, NgramHash, hash_multipliers, prime_buckets
 from .moe import DeepseekV41MoE, ModalityRouter, SwiGLUExpert
 from .packing import packed_forward
+from .vision import ViT, Aligner
+from .image_data import merge_image_embeddings, TEXT
 
 
 @dataclass(frozen=True)
@@ -210,15 +212,33 @@ class DeepseekV41Model(nn.Module):
                 )
                 for attr in ('q_weight', 'k_weight'):
                     self._bind(prefix + '.' + attr, module, attr, 'engram_norm')
-        self.vision = DeferredModule('vision')
-        self.aligner = DeferredModule('aligner')
+        vision_args = SimpleNamespace(
+            vision_dim=v['hidden_size'],
+            vision_n_heads=v['num_attention_heads'],
+            vision_n_layers=v['num_hidden_layers'],
+            vision_inter_dim=v['intermediate_size'],
+            vision_patch_size=v['patch_size'],
+            vision_rope_theta=v['rope_theta'],
+            vision_downsample_ratio=v['downsample_ratio'],
+            dim=t['hidden_size'],
+        )
+        self.vision = ViT(vision_args)
+        self.aligner = Aligner(vision_args)
+        for root in ('vision', 'aligner'):
+            module = getattr(self, root)
+            for name, parameter in module.named_parameters():
+                path, attribute = name.rsplit('.', 1)
+                self._bind(root + '.' + name, module.get_submodule(path), attribute, root)
+        for key in ('image_start', 'image_end', 'image_newline'):
+            self.register_parameter(key, nn.Parameter(torch.zeros(t['hidden_size'])))
+            self._bind(key, self, key, 'image_delimiter')
         self.mtp = DeferredModule('DSpark')
         for root, key in self._archive_keys(t, v):
+            if root != 'mtp':
+                continue
             module = getattr(self, root)
             owner = module.leaf_owner(key[len(root) + 1 :])
             self.archival_bindings[key] = TensorBinding(key, owner, None, 'archival')
-        for key in ('image_start', 'image_end', 'image_newline'):
-            self.archival_bindings[key] = TensorBinding(key, self.vision, None, 'archival')
         self.validate_parameter_bindings()
 
     def _bind(self, key, owner, attribute, role, head_count=None, encoding=None):
@@ -355,37 +375,77 @@ class DeepseekV41Model(nn.Module):
         if len(ids) != len(set(ids)) or set(ids) != {id(p) for p in self.parameters()}:
             raise ValueError('Every parameter must have exactly one binding')
 
-    def _sequence(self, hidden, pre, *, input_ids):
+    def _sequence(self, hidden, pre, *, input_ids, image_mask=None):
         hashes = None
         if self.engram_layer_ids:
             if self.engram_hash is None:
                 raise ValueError('Engram execution requires an explicit tokenizer token_map')
-            hashes = self.engram_hash(input_ids)
+            hashes = self.engram_hash(input_ids, None if image_mask is None else ~image_mask)
         state = AttentionState()
         for index, layer in enumerate(self.layers):
             if layer.engram is not None:
-                hidden = layer.engram(hidden, hashes[:, :, self.engram_layer_ids.index(index)])
-            hidden, pre, state = layer.forward_with_state(hidden, pre, state)
+                hidden = layer.engram(
+                    hidden,
+                    hashes[:, :, self.engram_layer_ids.index(index)],
+                    None if image_mask is None else ~image_mask,
+                )
+            hidden, pre, state = layer.forward_with_state(
+                hidden, pre, state, ffn_kwargs={'image_mask': image_mask}
+            )
         return hidden, pre
 
     def forward(self, input_ids, *, cu_seqlens=None, images=None, token_types=None):
-        if images is not None or token_types is not None:
-            raise NotImplementedError('Multimodal inputs require vision/aligner integration')
         if input_ids.ndim != 2 or input_ids.dtype != torch.int64 or not input_ids.shape[1]:
             raise ValueError('Expected nonempty int64 input_ids [B,S]')
-        hidden, pre = expand_hc(self.embed(input_ids), self.hc_mult)
+        embeddings = self.embed(input_ids)
+        image_mask = None
+        if images is not None:
+            if len(images) != len(input_ids):
+                raise ValueError('Image batch size differs from input IDs')
+            expected_types = torch.full_like(input_ids, TEXT)
+            for batch, sample in enumerate(images):
+                for img in sample or ():
+                    if cu_seqlens is not None:
+                        boundaries = cu_seqlens.tolist()
+                        if not any(
+                            a <= img.start and img.start + img.types.numel() <= b
+                            for a, b in zip(boundaries, boundaries[1:])
+                        ):
+                            raise ValueError('Image span crosses a packed sequence boundary')
+                    expected_types[batch, img.start : img.start + img.types.numel()] = img.types.to(
+                        input_ids.device
+                    )
+            if token_types is not None and not torch.equal(
+                token_types.to(input_ids.device), expected_types
+            ):
+                raise ValueError('Token types disagree with image spans')
+            embeddings = self.merge_image_embeddings(images, embeddings)
+            image_mask = expected_types >= 0
+        elif token_types is not None:
+            if token_types.shape != input_ids.shape or (token_types != TEXT).any():
+                raise ValueError('Image token types require image inputs')
+        hidden, pre = expand_hc(embeddings, self.hc_mult)
         if cu_seqlens is None:
-            hidden, pre = self._sequence(hidden, pre, input_ids=input_ids)
+            hidden, pre = self._sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
         else:
             hidden, pre = packed_forward(
-                self._sequence, hidden, pre, cu_seqlens, input_ids=input_ids
+                self._sequence, hidden, pre, cu_seqlens, input_ids=input_ids, image_mask=image_mask
             )
         hidden = self.norm(contract_hc(hidden, pre))
         return {'logits': F.linear(hidden.float(), self.head.weight.float())}
 
     def encode_image(self, patches, n_vit_h, n_vit_w):
-        raise NotImplementedError(
-            'encode_image(patches, n_vit_h, n_vit_w) requires F3 vision/aligner'
+        weight = self.vision.patch_embed.proj.weight
+        patches = patches.to(device=weight.device, dtype=weight.dtype)
+        return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
+
+    def merge_image_embeddings(self, images, h):
+        features = [
+            [self.encode_image(img.patches, img.n_vit_h, img.n_vit_w) for img in sample or ()]
+            for sample in images
+        ]
+        return merge_image_embeddings(
+            h, images, features, self.image_start, self.image_end, self.image_newline
         )
 
     def forward_spec(self, *args, **kwargs):

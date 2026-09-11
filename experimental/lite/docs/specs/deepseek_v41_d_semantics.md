@@ -90,16 +90,30 @@ siblings, following C's plain-export decoder contract. Frozen Engram storage
 keeps its FP8 values/scales. Trainable tables export FP32 masters and regenerate
 resident storage on reload; callers must use `refresh_storage()` after accepted
 optimizer steps. Original nested config is retained. This is a training export,
-not a deployment quantization conversion. Saving requires the inactive MTP, vision
-and aligner bytes to be present; it cannot fabricate checkpoint data for
-unimplemented modules.
+not a deployment quantization conversion. Saving requires the inactive MTP
+bytes to be present; it cannot fabricate checkpoint data for unimplemented modules.
 
-The multimodal handoff consists of `model.vision` and `model.aligner` archival
-subtrees, image-vector archival owners, `encode_image(patches, n_vit_h, n_vit_w)`,
-and `forward(..., images=..., token_types=...)`. These execution interfaces raise
-`NotImplementedError`; the multimodal integration supplies their computation and
-trainability. `model.mtp` retains its archival subtree and `forward_spec` rejects
-DSpark execution. Neither subtree is silently dropped in text-only mode.
+The model exposes live `vision`, `aligner`, `image_start`, `image_end` and
+`image_newline` parameters through the same checkpoint binding contract.
+`encode_image(patches, n_vit_h, n_vit_w)` is differentiable. The aligner pads
+right/bottom and unfolds channel-first cells; 2D RoPE uses height then width.
+`image_data.ImageConfig` defaults to patch size 14, downsample ratio 3, 1024
+image tokens and 295936 minimum pixels. `prepare_image_inputs` consumes decoded
+PIL images and token IDs, returning expanded IDs, token types and sample-local
+`ImageInput` spans; URL loading and tokenization remain caller responsibilities.
+`forward(..., images=..., token_types=...)` replaces spans before HC expansion,
+propagates modality masks through MoE/Engram, and rejects spans crossing packed
+sample boundaries. `merge_image_embeddings(images, h)` returns a new tensor.
+The generic `PackedBatch` protocol, trainability policy, optimizer routing and
+three-stage external vision scheduling require the training integration.
+`model.mtp` remains archival and `forward_spec` rejects DSpark execution.
+
+Independent vision/processor tests read hash-checked reference files from
+`DS41_REFERENCE_DIR` (default `/tmp/ds41-fixture-reference`). No new official
+source is vendored. Reduced FP32/BF16 checks compare forward and every input/
+parameter gradient; mutation checks exercise spatial order, padding, RoPE,
+patch order, delimiters and the tower/aligner boundary. These are reduced
+numerical semantics checks, not full-size model acceptance.
 
 The protocol accepts unpadded `PackedBatch`, restarts CSA2/Engram state per sample,
 shifts labels and masks within each sample and masks terminal targets. It returns
