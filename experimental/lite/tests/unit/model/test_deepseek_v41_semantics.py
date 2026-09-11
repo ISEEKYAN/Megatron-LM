@@ -105,9 +105,7 @@ def test_v41_modality_bias_selection_and_vjp(image, moe):
         routed_scaling_factor=1.5,
         scoring_func='sqrtsoftplus',
     )
-    router = moe.ModalityRouter(
-        config, SimpleNamespace(tp_size=1), gate_temperature=0.7
-    )
+    router = moe.ModalityRouter(config, SimpleNamespace(tp_size=1), gate_temperature=0.7)
     with torch.no_grad():
         router.router.gate.weight.copy_(torch.eye(3))
         (router.bias_vl if image else router.bias)[2] = 4
@@ -126,9 +124,7 @@ def test_v41_modality_bias_selection_and_vjp(image, moe):
     router.update_bias(stats)
     delta = torch.zeros(2, 3)
     delta[int(image)] = torch.tensor([-0.001, 0.001, -0.001])
-    torch.testing.assert_close(
-        torch.stack([router.bias, router.bias_vl]), before + delta
-    )
+    torch.testing.assert_close(torch.stack([router.bias, router.bias_vl]), before + delta)
     assert not router.router.compute_aux_loss
 
 
@@ -215,14 +211,10 @@ def test_v41_mhc_two_sublayer_shift_uses_unequal_coefficients(copies):
 
         # Independent equations across both sublayers AND the next block boundary.
         expected_attn_input = (expected_hidden * expected_pre.unsqueeze(-1)).sum(-2)
-        expected_hidden = expected_hidden + 0.25 * (expected_attn_input + 17).unsqueeze(
-            -2
-        )
+        expected_hidden = expected_hidden + 0.25 * (expected_attn_input + 17).unsqueeze(-2)
         expected_ffn_input = (expected_hidden * attn_pre.unsqueeze(-1)).sum(-2)
         wrong_ffn_input = (expected_hidden * expected_pre.unsqueeze(-1)).sum(-2)
-        expected_hidden = expected_hidden + 0.25 * (expected_ffn_input - 9).unsqueeze(
-            -2
-        )
+        expected_hidden = expected_hidden + 0.25 * (expected_ffn_input - 9).unsqueeze(-2)
         torch.testing.assert_close(attention.inputs[0], expected_attn_input)
         torch.testing.assert_close(ffn.inputs[0], expected_ffn_input)
         torch.testing.assert_close(hidden, expected_hidden)
@@ -252,10 +244,7 @@ def test_v41_ced_boundaries_match_pinned_official_oracle(dtype, length, monkeypa
 
     reference = root / "tests/fixtures/deepseek_v41/reference"
     for name in ("model.py", "config.json", "inference_config.json"):
-        assert (
-            hashlib.sha256((reference / name).read_bytes()).hexdigest()
-            == REFERENCE_SHA256[name]
-        )
+        assert hashlib.sha256((reference / name).read_bytes()).hexdigest() == REFERENCE_SHA256[name]
     source = reference / "model.py"
     classes = {
         node.name: node
@@ -279,9 +268,7 @@ def test_v41_ced_boundaries_match_pinned_official_oracle(dtype, length, monkeypa
     # Only method containers are constructed here; no official arithmetic is rewritten.
     namespace = {"torch": torch, "nn": torch.nn}
     exec(
-        compile(
-            ast.Module(body=[classes["RMSNorm"]], type_ignores=[]), str(source), "exec"
-        ),
+        compile(ast.Module(body=[classes["RMSNorm"]], type_ignores=[]), str(source), "exec"),
         namespace,
     )
     official_norm = namespace["RMSNorm"]
@@ -296,9 +283,7 @@ def test_v41_ced_boundaries_match_pinned_official_oracle(dtype, length, monkeypa
         {"forward": official_method("Indexer", "forward")},
     )()
     args = reduced_overrides()
-    rows = json.loads((root / "tests/fixtures/deepseek_v41/manifest.json").read_text())[
-        "tensors"
-    ]
+    rows = json.loads((root / "tests/fixtures/deepseek_v41/manifest.json").read_text())["tensors"]
     rows = {row["name"]: (ordinal, row) for ordinal, row in enumerate(rows)}
 
     def bind(module, name):
@@ -335,9 +320,7 @@ def test_v41_ced_boundaries_match_pinned_official_oracle(dtype, length, monkeypa
     ).to(dtype)
     official_attn_norm = official_norm(config.dim, config.eps).to(dtype)
     official_compressor.compress_ratio = 1
-    official_compressor.wkv = torch.nn.Linear(
-        config.dim, config.head_dim, bias=False, dtype=dtype
-    )
+    official_compressor.wkv = torch.nn.Linear(config.dim, config.head_dim, bias=False, dtype=dtype)
     official_compressor.norm = official_norm(config.head_dim, config.eps).to(dtype)
     official_indexer.owns_k = True
     official_indexer.compress_ratio = 1
@@ -387,18 +370,14 @@ def test_v41_ced_boundaries_match_pinned_official_oracle(dtype, length, monkeypa
 
     handle = official_indexer.k_norm.register_forward_hook(capture_index)
     try:
-        with pytest.raises(
-            BoundaryCaptured, match="official pre-RoPE boundary reached"
-        ):
+        with pytest.raises(BoundaryCaptured, match="official pre-RoPE boundary reached"):
             official_indexer(x20, None, latent20, 0, 0)
     finally:
         handle.remove()
     actual = {}
     handles = [
         attention.register_forward_pre_hook(
-            lambda module, inputs: actual.update(
-                {"ced.x20": inputs[0].detach().clone()}
-            )
+            lambda module, inputs: actual.update({"ced.x20": inputs[0].detach().clone()})
         )
     ]
     for module, stage in (
@@ -432,12 +411,9 @@ def test_v41_nested_config_drives_attention(tmp_path):
     import copy
     import json
     from pathlib import Path
-
     from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 
-    reference = (
-        Path(__file__).parents[2] / 'fixtures/deepseek_v41/reference/config.json'
-    )
+    reference = Path(__file__).parents[2] / 'fixtures/deepseek_v41/reference/config.json'
     release = json.loads(reference.read_text())
     tiny = copy.deepcopy(release)
     tiny['text_config'].update(
@@ -485,12 +461,9 @@ def test_v41_nested_config_drives_attention(tmp_path):
 def test_v41_config_rejects_unimplemented_topology(field, value):
     import json
     from pathlib import Path
-
     from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 
-    reference = (
-        Path(__file__).parents[2] / 'fixtures/deepseek_v41/reference/config.json'
-    )
+    reference = Path(__file__).parents[2] / 'fixtures/deepseek_v41/reference/config.json'
     release = json.loads(reference.read_text())
     release['text_config'][field] = value
     with pytest.raises(ValueError, match=field):
@@ -498,10 +471,9 @@ def test_v41_config_rejects_unimplemented_topology(field, value):
 
 
 def _assembly_config():
-    import importlib.util
     import json
     from pathlib import Path
-
+    import importlib.util
     from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 
     root = Path(__file__).parents[2] / 'fixtures/deepseek_v41'
@@ -531,7 +503,6 @@ def _assembly_bundle(device='cpu', trainable_engram=False):
     proto = registry.get_train_runtime_module(
         registry.resolve_runtime_model_name('deepseek_v41', 'lite')
     )
-
     return proto, proto.build_model(
         cfg,
         impl_cfg=proto.ImplConfig(
@@ -894,9 +865,7 @@ def test_v41_registry_assembly_forward_and_parameter_owners(moe):
     model = bundle.chunks[0]
     assert resolve_model_type_from_hf(_assembly_config().to_hf_dict()) == 'deepseek_v41'
     assert len(model.layers) == 40
-    assert (
-        model.vision is not None and model.aligner is not None and model.mtp is not None
-    )
+    assert model.vision is not None and model.aligner is not None and model.mtp is not None
     owners = list(model.parameter_bindings())
     assert len({id(b.tensor) for b in owners}) == len(owners)
     assert {id(b.tensor) for b in owners} == {id(p) for p in model.parameters()}
@@ -909,9 +878,7 @@ def test_v41_registry_assembly_forward_and_parameter_owners(moe):
     assert output['log_probs'].shape == (6,)
     assert torch.isfinite(output['log_probs']).all()
     targets = torch.tensor([5, 6, 0, 8, 3, 0])
-    expected_loss = torch.nn.functional.cross_entropy(
-        output['logits'], targets, reduction='none'
-    )
+    expected_loss = torch.nn.functional.cross_entropy(output['logits'], targets, reduction='none')
     torch.testing.assert_close(output['log_probs'], -expected_loss)
     torch.testing.assert_close(output['loss'], expected_loss[[0, 1, 3, 4]].mean())
     output['loss'].backward()
@@ -919,13 +886,11 @@ def test_v41_registry_assembly_forward_and_parameter_owners(moe):
     assert model.layers[20].attn.compressor.wkv.weight.grad.abs().sum() > 0
     assert all(p.grad is None for p in model.layers[20].attn.indexer.parameters())
     # Each packed sample gets fresh attention/Engram state and local positions.
-    independent = torch.cat(
-        [model(ids[:3][None])['logits'], model(ids[3:][None])['logits']], 1
-    )
-    torch.testing.assert_close(
-        model(ids[None], cu_seqlens=batch.cu_seqlens)['logits'], independent
-    )
-    for call in (lambda: model.forward_spec(ids[None]),):
+    independent = torch.cat([model(ids[:3][None])['logits'], model(ids[3:][None])['logits']], 1)
+    torch.testing.assert_close(model(ids[None], cu_seqlens=batch.cu_seqlens)['logits'], independent)
+    for call in (
+        lambda: model.forward_spec(ids[None]),
+    ):
         with pytest.raises(NotImplementedError):
             call()
 
@@ -934,25 +899,21 @@ def test_v41_fixture_headers_and_complete_release_key_owners(moe):
     import itertools
     import json
     from pathlib import Path
-
     from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
     from megatron.lite.model.deepseek_v41.lite.checkpoint import bind_checkpoint
     from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
 
     root = Path(__file__).parents[3]
-    records = json.loads(
-        (root / 'tests/fixtures/deepseek_v41/manifest.json').read_text()
-    )['tensors']
+    records = json.loads((root / 'tests/fixtures/deepseek_v41/manifest.json').read_text())[
+        'tensors'
+    ]
     _, bundle = _assembly_bundle(device='meta')
     bindings = bind_checkpoint(bundle.chunks[0], records, allow_missing_mtp=True)
     assert len(bindings) == 3204
     with pytest.raises(ValueError, match='coverage'):
         bind_checkpoint(bundle.chunks[0], records)
     # Quantization scales are owned by the same live module as their weights.
-    assert (
-        bindings['layers.0.attn.wo_a.scale'].owner
-        is bundle.chunks[0].layers[0].attn.wo_a
-    )
+    assert bindings['layers.0.attn.wo_a.scale'].owner is bundle.chunks[0].layers[0].attn.wo_a
     bad = [dict(r) for r in records]
     next(r for r in bad if r['name'] == 'layers.0.attn.wq_a.weight')['shape'] = [1, 1]
     with pytest.raises(ValueError, match='shape'):
@@ -961,35 +922,25 @@ def test_v41_fixture_headers_and_complete_release_key_owners(moe):
         bind_checkpoint(bundle.chunks[0], records[1:], allow_missing_mtp=True)
     with pytest.raises(ValueError, match='duplicate'):
         bind_checkpoint(bundle.chunks[0], records + records[:1], allow_missing_mtp=True)
-    release = json.loads(
-        (root / 'tests/fixtures/deepseek_v41/reference/config.json').read_text()
-    )
+    release = json.loads((root / 'tests/fixtures/deepseek_v41/reference/config.json').read_text())
     with torch.device('meta'):
         model = DeepseekV41Model(DeepseekV41Config(release))
-    families = json.loads(
-        (root / 'docs/contracts/deepseek_v41/weights.json').read_text()
-    )['families']
-    keys = [
-        f['pattern'].format(*ix)
-        for f in families
-        for ix in itertools.product(*f['indices'])
+    families = json.loads((root / 'docs/contracts/deepseek_v41/weights.json').read_text())[
+        'families'
     ]
+    keys = [f['pattern'].format(*ix) for f in families for ix in itertools.product(*f['indices'])]
     all_bindings = bind_checkpoint(model, keys)
     assert len(all_bindings) == 96085
     assert sum(k.startswith('mtp.') for k in all_bindings) == 2401
     assert all(b.owner is not None for b in all_bindings.values())
-    assert {id(b.tensor) for b in model.parameter_bindings()} == {
-        id(p) for p in model.parameters()
-    }
+    assert {id(b.tensor) for b in model.parameter_bindings()} == {id(p) for p in model.parameters()}
     with pytest.raises(ValueError, match='coverage'):
         bind_checkpoint(model, keys + ['layers.3.attn.compressor.wkv.weight'])
 
 
 def test_v41_assembly_checkpoint_updates_backbone_preserves_archive(tmp_path, moe):
     from megatron.lite.model.deepseek_v41.lite.checkpoint import load_model, save_model
-    from megatron.lite.model.deepseek_v41.lite.checkpoint_store import (
-        CheckpointTensorStore,
-    )
+    from megatron.lite.model.deepseek_v41.lite.checkpoint_store import CheckpointTensorStore
     from safetensors.torch import save_file
 
     _, bundle = _assembly_bundle(trainable_engram=True)
@@ -1009,8 +960,7 @@ def test_v41_assembly_checkpoint_updates_backbone_preserves_archive(tmp_path, mo
     load_model(restored.chunks[0], output)
     torch.testing.assert_close(restored.chunks[0].embed.weight, before + 0.25)
     torch.testing.assert_close(
-        restored.chunks[0].layers[1].engram.embed.master,
-        model.layers[1].engram.embed.master,
+        restored.chunks[0].layers[1].engram.embed.master, model.layers[1].engram.embed.master
     )
     for binding in restored.chunks[0].checkpoint_bindings.values():
         assert binding.header is not None and binding.store is not None
@@ -1025,8 +975,7 @@ def test_v41_assembly_final_shifted_mix_and_engram_reachability(moe, monkeypatch
     model = bundle.chunks[0]
     calls = []
     hooks = [
-        model.layers[i].engram.register_forward_hook(lambda *args: calls.append(1))
-        for i in (1, 14)
+        model.layers[i].engram.register_forward_hook(lambda *args: calls.append(1)) for i in (1, 14)
     ]
     ids = torch.tensor([[1, 3, 5]])
     model(ids)
@@ -1036,9 +985,7 @@ def test_v41_assembly_final_shifted_mix_and_engram_reachability(moe, monkeypatch
     h = torch.randn(1, 3, 4, 128)
     p = torch.tensor([0.1, 0.7, 0.2, 0.4]).expand(1, 3, 4)
     monkeypatch.setattr(model, '_sequence', lambda *args, **kwargs: (h, p))
-    expected = torch.nn.functional.linear(
-        model.norm((h * p[..., None]).sum(2)), model.head.weight
-    )
+    expected = torch.nn.functional.linear(model.norm((h * p[..., None]).sum(2)), model.head.weight)
     torch.testing.assert_close(model(ids)['logits'], expected)
     # Alias injection must be rejected even when the key count stays unchanged.
     from dataclasses import replace
@@ -1060,7 +1007,9 @@ def test_v41_registry_quantized_cuda_forward_backward(moe):
     bundle = proto.build_model(
         _assembly_config(),
         impl_cfg=proto.ImplConfig(
-            device='cuda', token_map=list(range(256)), quantized=True
+            device='cuda',
+            token_map=list(range(256)),
+            quantized=True,
         ),
     )
     model = bundle.chunks[0]
@@ -1070,33 +1019,23 @@ def test_v41_registry_quantized_cuda_forward_backward(moe):
     assert torch.isfinite(output['loss'])
     output['loss'].backward()
     gradient = model.layers[20].attn.compressor.wkv.weight.grad
-    assert (
-        gradient is not None
-        and torch.isfinite(gradient).all()
-        and gradient.abs().sum() > 0
-    )
+    assert gradient is not None and torch.isfinite(gradient).all() and gradient.abs().sum() > 0
 
 
 def _check_vision_official(monkeypatch, dtype):
     import hashlib
     import importlib.util
     from pathlib import Path
-
     from megatron.lite.model.deepseek_v41.lite import vision
 
     root = Path(__file__).resolve().parents[3]
-    monkeypatch.syspath_prepend(str(root / 'tools/deepseek_v41'))
+    monkeypatch.syspath_prepend(str(root / "tools/deepseek_v41"))
     import os
 
     from fixtures import REFERENCE_SHA256
 
-    path = (
-        Path(os.environ.get('DS41_REFERENCE_DIR', '/tmp/ds41-fixture-reference'))
-        / 'vision.py'
-    )
-    assert (
-        hashlib.sha256(path.read_bytes()).hexdigest() == REFERENCE_SHA256['vision.py']
-    )
+    path = Path(os.environ.get('DS41_REFERENCE_DIR', '/tmp/ds41-fixture-reference')) / 'vision.py'
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == REFERENCE_SHA256['vision.py']
     spec = importlib.util.spec_from_file_location('official_vision', path)
     official = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(official)
@@ -1112,9 +1051,7 @@ def _check_vision_official(monkeypatch, dtype):
     )
     torch.manual_seed(19)
     actual = torch.nn.Sequential(vision.ViT(args), vision.Aligner(args)).to(dtype)
-    reference = torch.nn.Sequential(official.ViT(args), official.Aligner(args)).to(
-        dtype
-    )
+    reference = torch.nn.Sequential(official.ViT(args), official.Aligner(args)).to(dtype)
     reference.load_state_dict(actual.state_dict())
     for height, width in [(3, 6), (4, 5), (1, 2)]:
         x = torch.randn(height * width, 3, 14, 14, dtype=dtype, requires_grad=True)
@@ -1153,9 +1090,7 @@ def test_v41_multimage_copy_gradient():
     merged = image_data.merge_image_embeddings(text, images, [features], *delimiters)
     expanded, _ = hc.expand_hc(merged, 3)
     probe = torch.arange(expanded.numel()).reshape_as(expanded).float()
-    gradients = torch.autograd.grad(
-        (expanded * probe).sum(), (text, *features, *delimiters)
-    )
+    gradients = torch.autograd.grad((expanded * probe).sum(), (text, *features, *delimiters))
     expected = text.clone()
     for start, feature in zip((1, 7), features):
         expected[:, start : start + 5] = torch.stack(
@@ -1174,9 +1109,7 @@ def test_v41_multimage_copy_gradient():
         torch.testing.assert_close(grad, summed[0, list(offsets)].sum(0))
 
 
-@pytest.mark.parametrize(
-    'size', [(17, 23), (125, 97), (2000, 7), (7, 2000), (1024, 768)]
-)
+@pytest.mark.parametrize('size', [(17, 23), (125, 97), (2000, 7), (7, 2000), (1024, 768)])
 @pytest.mark.parametrize('max_ratio', [None, 4])
 def test_v41_image_processor_official(size, max_ratio, monkeypatch):
     import hashlib
@@ -1185,13 +1118,12 @@ def test_v41_image_processor_official(size, max_ratio, monkeypatch):
     import os
     import sys
     from pathlib import Path
-
     import numpy as np
     from megatron.lite.model.deepseek_v41.lite import image_data as data
     from PIL import Image
 
     root = Path(__file__).resolve().parents[3]
-    monkeypatch.syspath_prepend(str(root / 'tools/deepseek_v41'))
+    monkeypatch.syspath_prepend(str(root / "tools/deepseek_v41"))
     from fixtures import REFERENCE_SHA256
 
     path = (
@@ -1221,9 +1153,7 @@ def test_v41_image_processor_official(size, max_ratio, monkeypatch):
     actual = data.preprocess_image(image, config)
     assert actual[1:] == expected[1:]
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
-    ids, types, images = data.prepare_image_inputs(
-        [1, 99, 2, 99, 3], [image, image], 99, config
-    )
+    ids, types, images = data.prepare_image_inputs([1, 99, 2, 99, 3], [image, image], 99, config)
     layout = official.image_token_types(*actual[-2:])
     assert images[0].start == 1 and images[1].start == len(layout) + 2
     assert ids == [1] + [99] * len(layout) + [2] + [99] * len(layout) + [3]
@@ -1297,10 +1227,7 @@ def test_v41_image_span_rejects_invalid(fault):
     features = torch.ones(3 if fault == 'features' else 2, 4)
     with pytest.raises(ValueError):
         data.merge_image_embeddings(
-            torch.zeros(1, 5, 4),
-            [[image]],
-            [[features]],
-            *[torch.ones(4) for _ in range(3)],
+            torch.zeros(1, 5, 4), [[image]], [[features]], *[torch.ones(4) for _ in range(3)]
         )
 
 
@@ -1346,23 +1273,16 @@ def test_v41_multimage_packed_model_forward(moe, device='cpu'):
     model = bundle.chunks[0]
     first, second = [torch.randn(4, 3, 14, 14, requires_grad=True) for _ in range(2)]
     layout = data.image_token_types(1, 1)
-    images = [
-        [
-            data.ImageInput(1, first, 2, 2, layout),
-            data.ImageInput(7, second, 2, 2, layout),
-        ]
-    ]
+    images = [[data.ImageInput(1, first, 2, 2, layout), data.ImageInput(7, second, 2, 2, layout)]]
     ids = torch.tensor([[1, 99, 99, 99, 99, 2, 3, 99, 99, 99, 99, 4]])
     types = torch.tensor([[-1, 0, 1, 2, 3, -1] * 2])
-    result = model(
-        ids, cu_seqlens=torch.tensor([0, 6, 12]), images=images, token_types=types
-    )['logits']
+    result = model(ids, cu_seqlens=torch.tensor([0, 6, 12]), images=images, token_types=types)[
+        'logits'
+    ]
     independent = []
     for index, patches in enumerate((first, second)):
         local = [[data.ImageInput(1, patches, 2, 2, layout)]]
-        independent.append(
-            model(ids[:, index * 6 : (index + 1) * 6], images=local)['logits']
-        )
+        independent.append(model(ids[:, index * 6 : (index + 1) * 6], images=local)['logits'])
     torch.testing.assert_close(result, torch.cat(independent, 1))
     gradients = torch.autograd.grad(
         result[:, 6:].square().sum(), (first, second, model.image_start)

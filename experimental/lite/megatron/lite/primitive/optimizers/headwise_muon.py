@@ -60,21 +60,6 @@ class HeadwiseMuon(torch.optim.Optimizer):
                 raise ValueError(
                     'An explicit positive logical matrix shape is required'
                 )
-            partitions = group.get('matrix_partitions')
-            if partitions is not None and (
-                not isinstance(partitions, (list, tuple))
-                or not partitions
-                or any(
-                    not isinstance(part, (list, tuple))
-                    or len(part) not in (2, 3)
-                    or any(type(d) is not int or d < 1 for d in part)
-                    for part in partitions
-                )
-                or sum(math.prod(part) for part in partitions) != math.prod(shape)
-            ):
-                raise ValueError(
-                    'Logical partitions must cover the physical matrix exactly'
-                )
             for key in ('lr', 'weight_decay', 'momentum', 'update_rms'):
                 if not math.isfinite(group[key]) or group[key] < 0:
                     raise ValueError(f'Invalid Muon {key}')
@@ -123,16 +108,8 @@ class HeadwiseMuon(torch.optim.Optimizer):
                 nesterov = beta * momentum + (1 - beta) * grad
                 from emerging_optimizers.utils import fp32_matmul_precision
 
-                shapes = group.get('matrix_partitions') or (group['matrix_shape'],)
-                chunks = nesterov.flatten().split(
-                    [math.prod(shape) for shape in shapes]
-                )
-                logical = [chunk.reshape(shape) for chunk, shape in zip(chunks, shapes)]
-                matrices = [
-                    matrix
-                    for part in logical
-                    for matrix in (part.unbind(0) if part.ndim == 3 else (part,))
-                ]
+                logical = nesterov.reshape(group['matrix_shape'])
+                matrices = logical.unbind(0) if logical.ndim == 3 else (logical,)
                 directions = []
                 with torch.autocast(
                     device_type=p.device.type, enabled=False
@@ -147,7 +124,7 @@ class HeadwiseMuon(torch.optim.Optimizer):
                         directions.append(
                             update * (group['update_rms'] / rms.clamp_min(1e-30))
                         )
-                update = torch.cat([direction.flatten() for direction in directions])
+                update = torch.stack(directions) if logical.ndim == 3 else directions[0]
                 candidate = p * (1 - group['lr'] * group['weight_decay'])
                 candidate = candidate - group['lr'] * update.reshape_as(p)
                 if (
@@ -195,7 +172,6 @@ class HeadwiseMuon(torch.optim.Optimizer):
         saved = state_dict['param_groups']
         if len(saved) != len(self.param_groups) or any(
             tuple(a['matrix_shape']) != tuple(b['matrix_shape'])
-            or a.get('matrix_partitions') != b.get('matrix_partitions')
             for a, b in zip(saved, self.param_groups)
         ):
             raise ValueError('Muon logical layout changed; reshard explicitly')

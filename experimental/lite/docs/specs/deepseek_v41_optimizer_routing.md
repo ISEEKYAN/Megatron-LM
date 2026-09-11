@@ -4,9 +4,9 @@ The single-rank text protocol constructs an actual Muon/Sinkhorn/AdamW stack.
 It consumes module objects and validates their checkpoint bindings. Parameter
 names are audit labels only. An unknown owner, alias, active indexer, unresolved
 head count, unsupported backend, or missing NS configuration raises an error.
-DSpark tensors are archival. Live visual owners use the explicit post-training
-mask and visual policy described in `deepseek_v41_d_semantics.md`; there is no
-matrix-shaped catch-all route.
+Archival vision and DSpark tensors are not trainable parameters. A future active
+vision implementation must register its explicit routing and trainability mask;
+there is no matrix-shaped catch-all route.
 
 ## Backend and numerical contract
 

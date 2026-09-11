@@ -77,13 +77,9 @@ def plan_image_grid(width, height, config=ImageConfig()):
             best_h, best_w = cell, (budget - 3) * cell
         else:
             scale = min(
-                math.floor(floating_w) * cell / width,
-                math.floor(floating_h) * cell / height,
+                math.floor(floating_w) * cell / width, math.floor(floating_h) * cell / height
             )
-            best_h, best_w = (
-                math.floor(height * scale / p) * p,
-                math.floor(width * scale / p) * p,
-            )
+            best_h, best_w = (math.floor(height * scale / p) * p, math.floor(width * scale / p) * p)
         gh, gw = grid(best_h, best_w)
     if min(gh, gw) < 1 or gh * (gw + 1) + 2 > budget:
         raise ValueError('Image resize cannot satisfy token budget')
@@ -93,22 +89,15 @@ def plan_image_grid(width, height, config=ImageConfig()):
 def preprocess_image(image, config=ImageConfig()):
     image = image.convert('RGB')
     gh, gw, height, width = plan_image_grid(image.width, image.height, config)
-    if (
-        config.max_wh_ratio is not None
-        and image.width >= config.max_wh_ratio * image.height
-    ):
+    if config.max_wh_ratio is not None and image.width >= config.max_wh_ratio * image.height:
         image = image.resize((width, height))
     else:
         image = ImageOps.pad(image, (width, height), color=(127, 127, 127))
-    pixels = (
-        torch.from_numpy(np.asarray(image, dtype=np.float32)).permute(2, 0, 1) / 255
-    )
+    pixels = torch.from_numpy(np.asarray(image, dtype=np.float32)).permute(2, 0, 1) / 255
     pixels = ((pixels - 0.5) / 0.5).to(torch.bfloat16)
     p = config.patch_size
     nh, nw = height // p, width // p
-    patches = (
-        pixels.reshape(3, nh, p, nw, p).permute(1, 3, 0, 2, 4).reshape(nh * nw, 3, p, p)
-    )
+    patches = pixels.reshape(3, nh, p, nw, p).permute(1, 3, 0, 2, 4).reshape(nh * nw, 3, p, p)
     return patches, nh, nw, gh, gw
 
 
@@ -131,9 +120,7 @@ def prepare_image_inputs(tokens, images, image_token_id, config=ImageConfig()):
     return ids, types, spans or None
 
 
-def merge_image_embeddings(
-    tokens, images, features, image_start, image_end, image_newline
-):
+def merge_image_embeddings(tokens, images, features, image_start, image_end, image_newline):
     """Out-of-place differentiable replacement of validated [B,S,D] spans.
 
     ``features[b][i]`` is the aligner output for ``images[b][i]``. Call this

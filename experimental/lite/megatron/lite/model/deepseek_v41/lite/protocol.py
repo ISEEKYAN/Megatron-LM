@@ -6,14 +6,15 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 
 import torch
+from torch.nn import functional as F
+
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.runtime.contracts import ParallelConfig
-from torch.nn import functional as F
 
 from .checkpoint import export_model, load_model, save_model
-from .optimizer_groups import OptimizerConfig, V41Optimizer, VisionOptimizerConfig
+from .optimizer_groups import OptimizerConfig, V41Optimizer
 from .training import VisionSchedule, VisionTrainability
 
 
@@ -38,9 +39,7 @@ def build_model_config(source, **overrides):
     if overrides:
         raise ValueError('Apply overrides to the explicit nested source config')
     return (
-        DeepseekV41Config(source)
-        if isinstance(source, dict)
-        else DeepseekV41Config.from_hf(source)
+        DeepseekV41Config(source) if isinstance(source, dict) else DeepseekV41Config.from_hf(source)
     )
 
 
@@ -53,13 +52,9 @@ def build_model(model_cfg, *, impl_cfg):
         or p.etp not in (None, 1)
         or p.pp_layout is not None
     ):
-        raise NotImplementedError(
-            'V4.1 assembly currently requires single-rank parallelism'
-        )
+        raise NotImplementedError('V4.1 assembly currently requires single-rank parallelism')
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
-        raise NotImplementedError(
-            'Distributed V4.1 construction requires the parallel integration'
-        )
+        raise NotImplementedError('Distributed V4.1 construction requires the parallel integration')
     if impl_cfg.optimizer not in (None, 'muon'):
         raise ValueError('V4.1 optimizer must be explicitly selected as muon')
     if impl_cfg.optimizer is None and impl_cfg.optimizer_config is not None:
@@ -120,6 +115,7 @@ def build_model(model_cfg, *, impl_cfg):
             if p.requires_grad:
                 p.data = p.data.float()
                 p.main_grad = None
+                p.register_post_accumulate_grad_hook(_publish_main_grad)
         model.residual_dtype = impl_cfg.dtype
         optimizer = V41Optimizer(model, impl_cfg.optimizer_config)
     if impl_cfg.external_vision_device is not None:
@@ -139,6 +135,12 @@ def build_model(model_cfg, *, impl_cfg):
             'parameter_bindings': model.parameter_bindings,
         },
     )
+
+
+def _publish_main_grad(parameter):
+    if parameter.grad.dtype != torch.float32:
+        raise RuntimeError('V4.1 gradient producer did not return native FP32')
+    parameter.main_grad = parameter.grad
 
 
 def prepare_microbatches(data_iter, count):
@@ -199,12 +201,7 @@ def _forward_step_impl(model, batch):
         raise ValueError('Expected packed 1-D tokens matching seq_lens')
     if batch.position_ids is not None and not torch.equal(
         batch.position_ids,
-        torch.cat(
-            [
-                torch.arange(int(n), device=batch.input_ids.device)
-                for n in batch.seq_lens
-            ]
-        ),
+        torch.cat([torch.arange(int(n), device=batch.input_ids.device) for n in batch.seq_lens]),
     ):
         raise ValueError('Only sequence-local positions are supported')
     from megatron.lite.runtime.contracts.loss import get_loss_context
@@ -225,9 +222,7 @@ def _forward_step_impl(model, batch):
     )
     with precision:
         logits = (
-            model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality)[
-                'logits'
-            ][0]
+            model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality)['logits'][0]
             / temperature
         )
     result = {'logits': logits}
@@ -270,18 +265,13 @@ def _forward_step_impl(model, batch):
 
 def unpack_forward_output(model, batch, output):
     if isinstance(output, dict):
-        return {
-            key: unpack_forward_output(model, batch, value)
-            for key, value in output.items()
-        }
+        return {key: unpack_forward_output(model, batch, value) for key, value in output.items()}
     if (
         isinstance(output, torch.Tensor)
         and output.ndim > 0
         and output.shape[0] == batch.total_tokens
     ):
-        return torch.nested.as_nested_tensor(
-            list(output.split(batch.seq_lens.tolist()))
-        )
+        return torch.nested.as_nested_tensor(list(output.split(batch.seq_lens.tolist())))
     return output
 
 
@@ -300,9 +290,7 @@ def export_hf_weights(chunks, model_cfg, ps, **kwargs):
     if kwargs:
         raise ValueError('Unsupported export options')
     model = _single(chunks)
-    if model.archival_store is None or set(model.archival_store.entries) != set(
-        model.archival_bindings
-    ):
+    if model.archival_store is None or set(model.archival_store.entries) != set(model.archival_bindings):
         raise ValueError('Complete archival storage is required for export')
     yield from export_model(model)
     if model.archival_store is not None:

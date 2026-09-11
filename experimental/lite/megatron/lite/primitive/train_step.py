@@ -8,10 +8,7 @@ from collections.abc import Callable
 import torch
 import torch.distributed as dist
 from megatron.lite.primitive.parallel import ParallelState
-from megatron.lite.primitive.protocols import (
-    ExpertClassifierFn,
-    default_expert_classifier,
-)
+from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
 from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
 
 
@@ -116,9 +113,7 @@ def compute_and_clip_grad_norm(
     if report_global_norm:
         if ps is None:
             raise ValueError("`ps` is required when `report_global_norm=True`.")
-        report_norm = compute_global_grad_norm(
-            model, ps, is_expert_param=is_expert_param
-        )
+        report_norm = compute_global_grad_norm(model, ps, is_expert_param=is_expert_param)
     if use_dist_opt:
         optimizer.finish_grad_sync()
         return optimizer.clip_grad_norm()
@@ -127,10 +122,7 @@ def compute_and_clip_grad_norm(
 
 
 def compute_global_grad_norm(
-    model,
-    ps: ParallelState,
-    *,
-    is_expert_param: ExpertClassifierFn = default_expert_classifier,
+    model, ps: ParallelState, *, is_expert_param: ExpertClassifierFn = default_expert_classifier
 ) -> torch.Tensor:
     """Compute benchmark global grad norm with dist-opt-aligned reduction order."""
     dense_sq = _bucketed_grad_sq_sum(

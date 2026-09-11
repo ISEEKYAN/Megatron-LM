@@ -148,23 +148,18 @@ groups. Pending autograd graphs are not serialized: mid-microbatch restart
 requires replay. `abort()` releases a failed or abandoned graph; a caller must
 also discard partial LLM gradients after a failed backward. This is a serial
 single-rank implementation, without distributed external-encoder replication
-or overlap. The protocol also constructs the real mixed optimizer when `optimizer='muon'`.
-Use `OptimizerConfig(..., vision_policy=VisionOptimizerConfig(
-encoder_lr_multiplier=0.5, image_vector_lr_multiplier=1.0,
-image_vector_weight_decay=0.0))` together with an explicit trainability mask.
-These numbers are an example caller-selected post-training recipe, not official
-pretraining LR defaults. Active encoder or image-vector groups require this
-explicit policy. Image vectors retain non-matrix AdamW storage; fused vision
-Q/K each split into heads while V remains one matrix, and fused gate/up keeps
-its existing physical matrix. Norms use AdamW with .1 decay; linear weights
-use Muon; biases use AdamW without decay.
+or overlap.
 
-The model state dict persists the mask. Restore it before loading optimizer
-state; an optimizer whose groups disagree with a changed mask rejects stepping
-and loading. Use `optimizer.zero_grad()` and `optimizer.reconfigure_vision(mask)` to change
-a training stage. Common owners retain their optimizer state; frozen owners
-release state and newly active owners start with empty state. A pending vision backward also prevents stepping or saving optimizer
-state. Runtime-owned SFT normalization uses the total valid-token denominator
+The model state dict persists the mask. Restore it before constructing optimizer
+groups. Mixed-optimizer integration is not yet available with active visual
+owners: the current optimizer dependency does not enumerate those owners.
+The integration tests intentionally remain red until the optimizer provides
+explicit visual LR/decay policy, physical-owner Q/K-head and whole-V partitions,
+and stage reconfiguration preserving common-owner state. Pending visual backward
+must also prevent optimizer stepping and saving. These are required integration
+contracts, not capabilities supplied by the schedule itself.
+
+Runtime-owned SFT normalization uses the total valid-token denominator
 across microbatches; external RL losses retain responsibility for their own
 normalization. Single-rank runtime calls consume the model's
 `prepare_microbatches` and `backward` hooks.
