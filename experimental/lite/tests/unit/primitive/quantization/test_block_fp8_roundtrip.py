@@ -401,3 +401,24 @@ def test_engram_published_fp8_projection(tokens, trainable, monkeypatch, _engram
         torch.testing.assert_close(
             master.grad, torch.full_like(master, 32), atol=0, rtol=0
         )
+
+
+def test_sinkhorn_algorithm1_restarts_from_current_n_and_preserves_momentum():
+    """Algorithm 1 has 11 fresh-N passes, no decay, and a 5x Engram LR route."""
+    from megatron.lite.primitive.optimizers.sinkhorn import algorithm1_update
+
+    weight = torch.ones(2, 2)
+    momentum = torch.zeros_like(weight)
+    gradient = torch.ones_like(weight)
+    first, momentum, nesterov = algorithm1_update(
+        weight, momentum, gradient, lr=1.0, multiplier=5.0
+    )
+    # Uniform N normalizes to ones and sqrt(n) restores a unit direction.
+    torch.testing.assert_close(first, torch.full_like(weight, 0.1), atol=1e-6, rtol=0)
+    torch.testing.assert_close(momentum, torch.full_like(weight, 0.05))
+    torch.testing.assert_close(nesterov, torch.full_like(weight, 0.0975))
+    second, momentum, _ = algorithm1_update(
+        first, momentum, torch.zeros_like(weight), lr=1.0, multiplier=5.0
+    )
+    assert torch.all(second < first)  # historical momentum remains active.
+    torch.testing.assert_close(momentum, torch.full_like(weight, 0.0475))
