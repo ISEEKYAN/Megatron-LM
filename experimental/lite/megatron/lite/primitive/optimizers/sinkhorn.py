@@ -36,7 +36,9 @@ def sinkhorn_direction(nesterov: torch.Tensor) -> torch.Tensor:
     update[mask] = 0
     for iteration in range(K):
         axis = 1 if iteration % 2 == 0 else 0
-        update = update / (torch.linalg.vector_norm(update, dim=axis, keepdim=True) + EPS)
+        update = update / (
+            torch.linalg.vector_norm(update, dim=axis, keepdim=True) + EPS
+        )
     return update * math.sqrt(n.shape[1])
 
 
@@ -54,7 +56,10 @@ def algorithm1_update(
     ``lr * multiplier`` is supplied by the group router; Engram uses a 5x
     multiplier.  There is no decay and no normalized-state cache.
     """
-    if any(x.shape != weight.shape or x.dtype != torch.float32 for x in (momentum, gradient)):
+    if any(
+        x.shape != weight.shape or x.dtype != torch.float32
+        for x in (momentum, gradient)
+    ):
         raise ValueError('Algorithm 1 requires matching FP32 momentum and gradient')
     if weight.ndim != 2 or not all(math.isfinite(x) for x in (lr, beta, multiplier)):
         raise ValueError('Invalid Algorithm 1 inputs')

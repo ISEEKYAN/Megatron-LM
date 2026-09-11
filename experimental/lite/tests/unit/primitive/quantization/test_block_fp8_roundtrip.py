@@ -369,7 +369,13 @@ def test_engram_published_fp8_projection(tokens, trainable, monkeypatch, _engram
     scales = (2.0 ** (torch.arange(tokens * 2).reshape(tokens, 2) % 3 - 1)).to(
         torch.float8_e8m0fnu
     )
-    weight = torch.ones(32, 64, requires_grad=True)
+    # Distinct output-block scales make a one-column scale roll observable.
+    weight = (
+        torch.tensor([[1.0, 2.0], [4.0, 8.0]])
+        .repeat_interleave(32, 0)
+        .repeat_interleave(32, 1)
+        .requires_grad_()
+    )
     # No local/login-node CUDA execution; GPU arithmetic is exercised by Slurm.
     if not os.getenv('SLURM_JOB_ID') or not torch.cuda.is_available():
         with pytest.raises(RuntimeError, match='CUDA'):
@@ -381,16 +387,19 @@ def test_engram_published_fp8_projection(tokens, trainable, monkeypatch, _engram
         torch.ones(tokens, 64, device='cuda', requires_grad=True) if trainable else None
     )
     native = fp8._fp8_gemm
+    calls = []
 
     def observe(a, a_scale, b, b_scale):
         assert torch.equal(a.view(torch.uint8), values.view(torch.uint8))
         assert torch.equal(a_scale.view(torch.uint8), scales.view(torch.uint8))
+        calls.append(a.shape)
         return native(a, a_scale, b, b_scale)
 
     monkeypatch.setattr(fp8, '_fp8_gemm', observe)
     result = fp8.published_fp8_linear(
         values, scales, weight, master=master, output_dtype=torch.float32
     )
+    assert calls == [values.shape]
     decoded = values.float() * scales.float().repeat_interleave(32, -1)
     torch.testing.assert_close(result, decoded @ weight.T, atol=0, rtol=0)
     result.sum().backward()
@@ -399,7 +408,7 @@ def test_engram_published_fp8_projection(tokens, trainable, monkeypatch, _engram
     )
     if trainable:
         torch.testing.assert_close(
-            master.grad, torch.full_like(master, 32), atol=0, rtol=0
+            master.grad, weight.sum(0).expand_as(master), atol=0, rtol=0
         )
 
 
