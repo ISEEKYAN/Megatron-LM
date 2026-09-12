@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import multiprocessing
+import sys
 import time
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,13 +17,14 @@ import torch.distributed as dist
 pytestmark = pytest.mark.mlite
 
 
-@pytest.fixture(autouse=True)
-def _te_import_stub(transformer_engine_import_stub):
-    transformer_engine_import_stub()
-
-
 def _worker(rank, rendezvous, results, release, mode):
+    # Spawned interpreters reuse the shared CPU-only TE import fixture.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from conftest import transformer_engine_import_stub
+
+    transformer_engine_import_stub.__wrapped__(pytest.MonkeyPatch())()
     torch.set_num_threads(1)
+    torch.set_default_device("cpu")
     dist.init_process_group(
         "gloo",
         init_method=rendezvous,
@@ -49,7 +52,12 @@ def _worker(rank, rendezvous, results, release, mode):
         if mode == "phase_mismatch":
             if rank == 2:
                 _AllToAll.backward(
-                    SimpleNamespace(group=ps.ep_group, input_splits=[1] * 8, output_splits=[1] * 8),
+                    SimpleNamespace(
+                        group=ps.ep_group,
+                        input_splits=[1] * 8,
+                        output_splits=[1] * 8,
+                        ep_sequence=0,
+                    ),
                     x[:1].expand(8, 2),
                 )
             else:
@@ -59,6 +67,10 @@ def _worker(rank, rendezvous, results, release, mode):
                 release.wait(20)
                 return
             _AllToAll.apply(x[:1].expand(8, 2), [1] * 8, [1] * 8, ps.ep_group)
+        elif mode == "backward_identity":
+            first = _AllToAll.apply(x[:1].expand(8, 2), [1] * 8, [1] * 8, ps.ep_group)
+            second = _AllToAll.apply(x[:1].expand(8, 2), [1] * 8, [1] * 8, ps.ep_group)
+            (first if rank == 2 else second).sum().backward()
         elif mode == "backward_missing":
             y = _AllToAll.apply(x[:1].expand(8, 2), [1] * 8, [1] * 8, ps.ep_group)
             if rank == 2:
@@ -86,8 +98,8 @@ def _worker(rank, rendezvous, results, release, mode):
 
 
 def _run(tmp_path, mode):
-    # fork avoids eight independent TE/CUDA imports; workers only execute CPU ops.
-    ctx = multiprocessing.get_context("fork")
+    # The full suite may already have used autograd/CUDA: never fork that state.
+    ctx = multiprocessing.get_context("spawn")
     results, release = ctx.Queue(), ctx.Event()
     processes = [
         ctx.Process(
@@ -106,7 +118,7 @@ def _run(tmp_path, mode):
         for process in processes:
             process.start()
         expected = 7 if mode.endswith("missing") else 8
-        rows = [results.get(timeout=18) for _ in range(expected)]
+        rows = [results.get(timeout=60) for _ in range(expected)]
         return rows
     finally:
         release.set()
@@ -142,4 +154,12 @@ def test_forward_backward_order_mismatch(tmp_path):
     for _, message, elapsed in rows:
         assert "EP participation" in message, message
         assert "alltoall.forward" in message and "alltoall.backward" in message, message
+        assert elapsed < 5, (message, elapsed)
+
+
+def test_skipped_backward_cannot_impersonate_another_collective(tmp_path):
+    rows = _run(tmp_path, "backward_identity")
+    for _, message, elapsed in rows:
+        assert "EP participation" in message, message
+        assert "alltoall.backward" in message, message
         assert elapsed < 5, (message, elapsed)

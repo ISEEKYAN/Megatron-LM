@@ -161,6 +161,10 @@ def test_alltoall_dispatch_sums_scores_for_duplicate_experts(
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules import dispatcher as dispatcher_module
 
+    # This is a local routing arithmetic test; distributed participation is
+    # covered by the real eight-process EP tests.
+    monkeypatch.setattr(dispatcher_module, "check_ep_participation", lambda group, phase: None)
+
     def fake_all_gather(output, local_counts, group):
         del group
         output.zero_()

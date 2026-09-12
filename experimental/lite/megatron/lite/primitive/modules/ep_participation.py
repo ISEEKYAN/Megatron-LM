@@ -63,7 +63,7 @@ class _Participation:
                 )
                 raise RuntimeError(self.failure)
             if not missing:
-                return
+                return sequence
             time.sleep(0.001)
 
 
@@ -85,4 +85,4 @@ def check_ep_participation(group, phase):
     if state is None:
         state = _Participation(group)
         _participation[group] = state
-    state.check(phase)
+    return state.check(phase)
