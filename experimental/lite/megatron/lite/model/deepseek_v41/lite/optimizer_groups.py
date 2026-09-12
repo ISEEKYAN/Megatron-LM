@@ -245,6 +245,24 @@ class V41Optimizer(MixedOptimizer):
             if b.engram is not None and b.engram.embed.master is not None
         ]
         super().__init__(groups, config, tables)
+        from .training import RoutingStep
+
+        if model.routing_step is None:
+            model.routing_step = RoutingStep()
+
+    def zero_grad(self, set_to_none=True):
+        super().zero_grad(set_to_none=set_to_none)
+        self.model.routing_step.clear()
+
+    def step(self):
+        result = super().step()
+        try:
+            if result[0]:
+                self.model.routing_step.publish()
+        finally:
+            # Both committed and skipped steps consume their microbatch loads.
+            self.model.routing_step.clear()
+        return result
 
     def reconfigure_vision(self, mask):
         """Change a completed training stage, retaining common owners' momentum.

@@ -120,8 +120,11 @@ class DeepseekV41MoE(nn.Module):
         if len(self.experts) != router.router.num_experts:
             raise ValueError("Provide one expert module per routed expert")
 
-    def forward(self, x, *, image_mask=None):
-        return self.forward_with_stats(x, image_mask=image_mask)[0]
+    def forward(self, x, *, image_mask=None, load_stats=None):
+        output, stats = self.forward_with_stats(x, image_mask=image_mask)
+        if load_stats is not None:
+            load_stats.append((self.gate, stats))
+        return output
 
     def forward_with_stats(self, x, *, image_mask=None):
         flat = x.reshape(-1, x.shape[-1])

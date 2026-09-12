@@ -159,3 +159,27 @@ class VisionSchedule:
         self.pending = []
         self.weights = {}
         self.stage = 'idle'
+
+
+class RoutingStep:
+    """Caller-owned loads; accumulate original forwards, publish after a commit."""
+
+    def __init__(self):
+        self.loads = {}
+
+    def accumulate(self, loads):
+        from .moe import ModalityLoad
+
+        for router, stats in loads:
+            previous = self.loads.get(router)
+            self.loads[router] = stats if previous is None else ModalityLoad(
+                previous.counts + stats.counts,
+                previous.total_tokens + stats.total_tokens,
+            )
+
+    def publish(self):
+        for router, stats in self.loads.items():
+            router.update_bias(stats)
+
+    def clear(self):
+        self.loads.clear()

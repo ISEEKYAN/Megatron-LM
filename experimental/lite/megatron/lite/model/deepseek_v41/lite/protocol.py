@@ -267,10 +267,10 @@ def _forward_step_impl(model, batch):
             raise ValueError('Packed token types must match the input IDs')
         modality['token_types'] = modality['token_types'][None]
     with precision:
-        logits = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality)[
-            'logits'
-        ][0]
-    result = _text_output(logits, batch)
+        output = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality)
+    result = _text_output(output['logits'][0], batch)
+    if model.routing_step is not None and model.training and torch.is_grad_enabled():
+        model.routing_step.accumulate(output['modality_loads'])
     if model.vision_schedule is not None and model.vision_schedule.stage != 'idle':
         result['backward'] = model.vision_schedule.backward
     return result
