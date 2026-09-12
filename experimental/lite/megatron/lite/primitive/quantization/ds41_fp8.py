@@ -23,19 +23,16 @@ def _quantize_rows(x):
     values, scale = quantize_block_fp8(rows, (1, 32), scale_format="e8m0")
     decoded = dequantize_block_fp8(values, scale, (1, 32)).to(x.dtype)
     return FP8Values(
-        values.reshape(x.shape),
-        scale.reshape(*x.shape[:-1], -1),
-        decoded.reshape(x.shape),
+        values.reshape(x.shape), scale.reshape(*x.shape[:-1], -1), decoded.reshape(x.shape)
     )
 
 
+# SWA (including its rotated tail) and Linear activations share row/block32 E8M0.
+quantize_linear_activation = _quantize_rows
+
+
 def quantize_swa(post_rope):
-    """Quantize every channel, including the entire rotated tail."""
     return _quantize_rows(post_rope)
-
-
-def quantize_linear_activation(x):
-    return _quantize_rows(x)
 
 
 def fake_quant_swa(post_rope):
@@ -69,16 +66,10 @@ class _DynamicLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight):
         activation = quantize_linear_activation(x)
-        encoded_weight, scales = quantize_block_fp8(
-            weight, (32, 32), scale_format="e8m0"
-        )
-        decoded_weight = dequantize_block_fp8(encoded_weight, scales, (32, 32)).to(
-            x.dtype
-        )
+        encoded_weight, scales = quantize_block_fp8(weight, (32, 32), scale_format="e8m0")
+        decoded_weight = dequantize_block_fp8(encoded_weight, scales, (32, 32)).to(x.dtype)
         ctx.weight_dtype = weight.dtype
-        ctx.save_for_backward(
-            activation.decoded.reshape(-1, x.shape[-1]), decoded_weight
-        )
+        ctx.save_for_backward(activation.decoded.reshape(-1, x.shape[-1]), decoded_weight)
         ctx.input_shape = x.shape
         result = _fp8_gemm(
             activation.values.reshape(-1, x.shape[-1]),
@@ -93,11 +84,7 @@ class _DynamicLinear(torch.autograd.Function):
         activation, weight = ctx.saved_tensors
         flat_grad = grad.reshape(-1, weight.shape[0]).float()
         with torch.autocast(device_type=grad.device.type, enabled=False):
-            dx = (
-                (flat_grad @ weight.float())
-                .reshape(ctx.input_shape)
-                .to(activation.dtype)
-            )
+            dx = (flat_grad @ weight.float()).reshape(ctx.input_shape).to(activation.dtype)
             dw = (flat_grad.T @ activation.float()).to(ctx.weight_dtype)
         return dx, dw
 
@@ -107,18 +94,9 @@ def dynamic_fp8_linear(x, weight):
         raise RuntimeError("dynamic FP8 Linear requires CUDA; no CPU GEMM fallback")
     _validate_input(x, 32)
     _validate_input(weight, 32)
-    if (
-        x.ndim < 2
-        or weight.ndim != 2
-        or weight.shape[0] % 32
-        or x.shape[-1] != weight.shape[-1]
-    ):
-        raise ValueError(
-            "Linear requires matching K and weight dimensions divisible by 32"
-        )
-    if x.device != weight.device or (
-        x.dtype != weight.dtype and weight.dtype != torch.float32
-    ):
+    if x.ndim < 2 or weight.ndim != 2 or weight.shape[0] % 32 or x.shape[-1] != weight.shape[-1]:
+        raise ValueError("Linear requires matching K and weight dimensions divisible by 32")
+    if x.device != weight.device or (x.dtype != weight.dtype and weight.dtype != torch.float32):
         raise ValueError(
             "activation and weight must share device and compute dtype, or use an FP32 master"
         )

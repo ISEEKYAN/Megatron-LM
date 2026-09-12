@@ -57,16 +57,18 @@ def quantize_main_kv(post_rope):
     table = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=post_rope.device)
     decoded = table[(codes & 7).long()] * torch.where((codes & 8) != 0, -1.0, 1.0)
     decoded = decoded.reshape(blocks.shape) * scale.float().unsqueeze(-1)
-    return QuantizedValues(
-        packed, scale, decoded.reshape(post_rope.shape).to(post_rope.dtype)
-    )
+    return QuantizedValues(packed, scale, decoded.reshape(post_rope.shape).to(post_rope.dtype))
 
 
-def fake_quant_main_kv(post_rope, *, enabled=True, phase="post-training"):
+def _fake_quant(post_rope, enabled, quantize, phase="post-training"):
     if type(enabled) is not bool:
         raise TypeError("enabled must be bool")
     if phase != "post-training":
         raise ValueError("main-KV QAT is supported only for post-training")
     if not enabled:
         return post_rope
-    return _IdentityGradient.apply(post_rope, quantize_main_kv(post_rope).decoded)
+    return _IdentityGradient.apply(post_rope, quantize(post_rope).decoded)
+
+
+def fake_quant_main_kv(post_rope, *, enabled=True, phase="post-training"):
+    return _fake_quant(post_rope, enabled, quantize_main_kv, phase)

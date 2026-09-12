@@ -3,12 +3,7 @@
 
 import torch
 
-from .ds41_kv import (
-    QuantizedValues,
-    _IdentityGradient,
-    _quantize_nibbles,
-    _validate_input,
-)
+from .ds41_kv import QuantizedValues, _fake_quant, _quantize_nibbles, _validate_input
 from .mxfp4 import dequantize_mxfp4
 
 
@@ -30,8 +25,4 @@ def quantize_index(post_rope):
 
 
 def fake_quant_index(post_rope, *, enabled=True):
-    if type(enabled) is not bool:
-        raise TypeError("enabled must be bool")
-    if not enabled:
-        return post_rope
-    return _IdentityGradient.apply(post_rope, quantize_index(post_rope).decoded)
+    return _fake_quant(post_rope, enabled, quantize_index)

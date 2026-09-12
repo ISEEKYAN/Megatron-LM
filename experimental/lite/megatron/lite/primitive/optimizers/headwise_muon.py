@@ -224,18 +224,20 @@ class MixedOptimizer:
                     p._v41_main_grad_hook = p.register_post_accumulate_grad_hook(_publish_main_grad)
         self.config = config
         self.optimizers = []
-        recipes = (
-            (
-                'muon',
-                HeadwiseMuon,
-                dict(ns_steps=config.ns_steps, coefficient_type=config.coefficient_type),
-            ),
-            ('sinkhorn', Sinkhorn, {}),
-            ('adamw', torch.optim.AdamW, dict(betas=(0.9, 0.95), eps=1e-20, foreach=False)),
-        )
-        for algorithm, optimizer, kwargs in recipes:
+        for algorithm, optimizer in (
+            ('muon', HeadwiseMuon),
+            ('sinkhorn', Sinkhorn),
+            ('adamw', torch.optim.AdamW),
+        ):
             selected = [g for g in groups if g['algorithm'] == algorithm]
             if selected:
+                kwargs = {}
+                if algorithm == 'muon':
+                    kwargs = dict(
+                        ns_steps=config.ns_steps, coefficient_type=config.coefficient_type
+                    )
+                elif algorithm == 'adamw':
+                    kwargs = dict(betas=(0.9, 0.95), eps=1e-20, foreach=False)
                 self.optimizers.append(optimizer(selected, lr=config.lr, **kwargs))
         self.tables = list(tables)
 

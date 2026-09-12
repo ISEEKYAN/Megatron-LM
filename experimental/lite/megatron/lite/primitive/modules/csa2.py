@@ -5,14 +5,14 @@ This is the single-rank correctness implementation. It materializes attention
 scores; it does not claim the fused sparse kernel's performance or CP support.
 """
 
-import math
 from dataclasses import dataclass, replace
 
 import torch
-from megatron.lite.primitive.modules.native_fp32_linear import Linear
+from megatron.lite.primitive.modules.native_fp32_linear import Linear, native_fp32_linear
 from megatron.lite.primitive.quantization import ds41_fp8
 from megatron.lite.primitive.quantization.ds41_index import fake_quant_index
 from megatron.lite.primitive.quantization.ds41_kv import fake_quant_main_kv
+from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range
 from torch import nn
 from torch.nn import functional as F
 
@@ -65,25 +65,15 @@ def rotate(x, positions, config, ratio, *, inverse=False):
     freqs = 1 / theta ** (dims / rd)
     if ratio != 0 and config.original_length > 0:
 
-        def correction(rotations):
-            return (
-                rd
-                * math.log(config.original_length / (rotations * 2 * math.pi))
-                / (2 * math.log(theta))
-            )
-
-        low = max(math.floor(correction(config.beta_fast)), 0)
-        high = min(math.ceil(correction(config.beta_slow)), rd - 1)
-        ramp = (
-            (torch.arange(rd // 2, device=x.device) - low) / max(high - low, 1e-3)
-        ).clamp(0, 1)
+        low, high = _yarn_find_correction_range(
+            config.beta_fast, config.beta_slow, rd, theta, config.original_length
+        )
+        ramp = ((torch.arange(rd // 2, device=x.device) - low) / max(high - low, 1e-3)).clamp(0, 1)
         freqs = freqs / config.factor * ramp + freqs * (1 - ramp)
     angles = positions.float().unsqueeze(-1) * freqs
     phase = torch.polar(torch.ones_like(angles), -angles if inverse else angles)
     phase = phase.reshape(1, positions.numel(), *([1] * (x.ndim - 3)), rd // 2)
-    tail = torch.view_as_complex(
-        x[..., -rd:].float().contiguous().unflatten(-1, (-1, 2))
-    )
+    tail = torch.view_as_complex(x[..., -rd:].float().contiguous().unflatten(-1, (-1, 2)))
     rotated = torch.view_as_real(tail * phase).flatten(-2).to(x.dtype)
     return torch.cat([x[..., :-rd], rotated], -1)
 
@@ -123,9 +113,7 @@ class Indexer(nn.Module):
 
 
 class CSA2Attention(nn.Module):
-    def __init__(
-        self, config, layer_id, *, ratio, kv_owner, index_owner, candidate_mode
-    ):
+    def __init__(self, config, layer_id, *, ratio, kv_owner, index_owner, candidate_mode):
         super().__init__()
         if (
             config.heads % config.groups
@@ -139,19 +127,14 @@ class CSA2Attention(nn.Module):
         self.owns_kv, self.owns_index = layer_id == kv_owner, layer_id == index_owner
         self.wq_a = Linear(config.dim, config.q_rank, fp8=config.linear_fp8)
         self.q_norm = RMSNorm(config.q_rank, config.eps)
-        self.wq_b = Linear(
-            config.q_rank, config.heads * config.head_dim, fp8=config.linear_fp8
-        )
+        self.wq_b = Linear(config.q_rank, config.heads * config.head_dim, fp8=config.linear_fp8)
         self.wkv = Linear(config.dim, config.head_dim, fp8=config.linear_fp8)
         self.kv_norm = RMSNorm(config.head_dim, config.eps)
         self.attn_sink = nn.Parameter(torch.zeros(config.heads, dtype=torch.float32))
         self.wo_a = Linear(
-            config.heads * config.head_dim // config.groups,
-            config.groups * config.o_rank,
+            config.heads * config.head_dim // config.groups, config.groups * config.o_rank
         )
-        self.wo_b = Linear(
-            config.groups * config.o_rank, config.dim, fp8=config.linear_fp8
-        )
+        self.wo_b = Linear(config.groups * config.o_rank, config.dim, fp8=config.linear_fp8)
         self.compressor = Compressor(config, self.ratio) if self.owns_kv else None
         self.indexer = Indexer(config, self.owns_kv) if self.owns_index else None
 
@@ -161,9 +144,7 @@ class CSA2Attention(nn.Module):
         positions = torch.arange(length, device=x.device)
         qr = self.q_norm(self.wq_a(x))
         # V4.1 deliberately has no per-query-head RMS after wq_b.
-        q = rotate(
-            self.wq_b(qr).unflatten(-1, (c.heads, c.head_dim)), positions, c, ratio
-        )
+        q = rotate(self.wq_b(qr).unflatten(-1, (c.heads, c.head_dim)), positions, c, ratio)
         window = rotate(self.kv_norm(self.wkv(x)), positions, c, ratio)
         if c.swa_fp8:
             window = ds41_fp8.fake_quant_swa(window)
@@ -178,43 +159,25 @@ class CSA2Attention(nn.Module):
                 cp = torch.arange(latent.shape[1], device=x.device) * ratio
                 # Index keys branch BEFORE main RoPE/QAT. No in-place aliasing.
                 index_k = self.indexer.k_norm(self.indexer.wk(latent))
-                index_k = fake_quant_index(
-                    rotate(index_k, cp, c, ratio), enabled=c.index_qat
-                )
-                main = fake_quant_main_kv(
-                    rotate(latent, cp, c, ratio), enabled=c.main_qat
-                )
-                state = AttentionState(
-                    kv_owner=layer, latent=latent, main_kv=main, index_k=index_k
-                )
-            if (
-                state.kv_owner != self.kv_owner
-                or state.main_kv is None
-                or state.index_k is None
-            ):
+                index_k = fake_quant_index(rotate(index_k, cp, c, ratio), enabled=c.index_qat)
+                main = fake_quant_main_kv(rotate(latent, cp, c, ratio), enabled=c.main_qat)
+                state = AttentionState(kv_owner=layer, latent=latent, main_kv=main, index_k=index_k)
+            if state.kv_owner != self.kv_owner or state.main_kv is None or state.index_k is None:
                 raise ValueError("Missing or incorrect CSA2 KV source state")
             if state.main_kv.shape[:2] != (b, length // ratio):
                 raise ValueError("Shared KV belongs to a different sequence shape")
             lengths = ((positions + 1) // ratio).unsqueeze(-1)
             if self.owns_index:
                 iq = self.indexer.wq_b(qr).unflatten(-1, (c.index_heads, c.index_dim))
-                iq = fake_quant_index(
-                    rotate(iq, positions, c, ratio), enabled=c.index_qat
-                )
-                weights = self.indexer.weights_proj(x) * (
-                    c.index_dim**-0.5 * c.index_heads**-0.5
-                )
+                iq = fake_quant_index(rotate(iq, positions, c, ratio), enabled=c.index_qat)
+                weights = self.indexer.weights_proj(x) * (c.index_dim**-0.5 * c.index_heads**-0.5)
                 scores = (
-                    torch.einsum('bshd,btd->bsht', iq, state.index_k).relu()
-                    * weights.unsqueeze(-1)
+                    torch.einsum('bshd,btd->bsht', iq, state.index_k).relu() * weights.unsqueeze(-1)
                 ).sum(2)
                 pool = state.candidates
                 if self.candidate_mode == 'build':
                     pool = candidate_blocks(
-                        scores,
-                        lengths,
-                        topk_blocks=c.candidate_blocks,
-                        block_size=c.block_size,
+                        scores, lengths, topk_blocks=c.candidate_blocks, block_size=c.block_size
                     )
                 injected_pool = pool if candidate_mask is None else candidate_mask
                 if self.candidate_mode == 'reuse' and injected_pool is None:
@@ -223,32 +186,19 @@ class CSA2Attention(nn.Module):
                     scores,
                     lengths,
                     c.topk,
-                    candidates=(
-                        injected_pool if self.candidate_mode == 'reuse' else None
-                    ),
+                    candidates=(injected_pool if self.candidate_mode == 'reuse' else None),
                 )
-                state = replace(
-                    state, index_owner=layer, indices=selected, candidates=pool
-                )
-            else:
-                if state.index_owner != self.index_owner or state.indices is None:
-                    raise ValueError("Missing or incorrect CSA2 index source state")
+                state = replace(state, index_owner=layer, indices=selected, candidates=pool)
+            elif state.index_owner != self.index_owner or state.indices is None:
+                raise ValueError("Missing or incorrect CSA2 index source state")
             kv = torch.cat([window, state.main_kv], 1)
-            global_mask = torch.zeros(
-                b, length, state.main_kv.shape[1], dtype=torch.bool, device=x.device
+            counts = torch.zeros(
+                b, length, state.main_kv.shape[1], dtype=torch.int32, device=x.device
             )
-            if state.indices.numel():
-                # Clamp padding only for scatter addressing; false -1 entries
-                # cannot overwrite a valid selection of position zero.
-                counts = torch.zeros_like(global_mask, dtype=torch.int32)
-                counts.scatter_add_(
-                    -1, state.indices.clamp_min(0).long(), (state.indices >= 0).int()
-                )
-                global_mask = counts > 0
-            mask = torch.cat([mask, global_mask], -1)
-        logits = (
-            torch.einsum('bshd,btd->bsht', q.float(), kv.float()) * c.head_dim**-0.5
-        )
+            # Additive scatter keeps padded -1 slots from erasing a valid position zero.
+            counts.scatter_add_(-1, state.indices.clamp_min(0).long(), (state.indices >= 0).int())
+            mask = torch.cat([mask, counts > 0], -1)
+        logits = torch.einsum('bshd,btd->bsht', q.float(), kv.float()) * c.head_dim**-0.5
         logits = logits.masked_fill(~mask.unsqueeze(2), -torch.inf)
         sink = self.attn_sink.expand(b, length, -1).unsqueeze(-1)
         probabilities = torch.cat([logits, sink], -1).softmax(-1)[..., :-1]
@@ -257,16 +207,8 @@ class CSA2Attention(nn.Module):
         grouped = output.reshape(b, length, c.groups, -1)
         weight = self.wo_a.weight.reshape(c.groups, c.o_rank, -1)
         if getattr(self.wo_a, 'native_fp32', False):
-            from megatron.lite.primitive.modules.native_fp32_linear import (
-                native_fp32_linear,
-            )
-
             output = torch.stack(
-                [
-                    native_fp32_linear(grouped[:, :, i], weight[i])
-                    for i in range(c.groups)
-                ],
-                dim=2,
+                [native_fp32_linear(grouped[:, :, i], weight[i]) for i in range(c.groups)], dim=2
             ).flatten(2)
         else:
             output = torch.einsum('bsgd,grd->bsgr', grouped, weight).flatten(2)
@@ -278,9 +220,7 @@ def _visible(scores, lengths):
     return torch.arange(scores.shape[-1], device=scores.device) < lengths
 
 
-def candidate_blocks(
-    scores, lengths, *, topk_blocks=2048, block_size=8, phase="post-training"
-):
+def candidate_blocks(scores, lengths, *, topk_blocks=2048, block_size=8, phase="post-training"):
     if phase != "post-training":
         raise ValueError("Two-level candidates are a post-training policy")
     if block_size <= 0 or topk_blocks <= 0:
