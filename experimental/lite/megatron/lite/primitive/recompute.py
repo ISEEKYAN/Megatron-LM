@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
@@ -326,17 +327,8 @@ def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> No
         else:
             _fwd = original_forward
 
-        # CheckpointFunction.apply only accepts positional tensor args.
-        # Wrap kwargs into the function closure.
-        if kwargs:
-
-            def _fn(*a):
-                return _fwd(*a, **kwargs)
-
-        else:
-            _fn = _fwd
-
-        return CheckpointFunction.apply(_fn, preserve_rng_state, *args)
+        # Differentiable tensors must be positional; capture only metadata here.
+        return CheckpointFunction.apply(partial(_fwd, **kwargs), preserve_rng_state, *args)
 
     module.forward = _checkpointed_forward
 

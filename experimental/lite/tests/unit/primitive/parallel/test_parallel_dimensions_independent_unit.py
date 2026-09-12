@@ -161,6 +161,10 @@ def test_alltoall_dispatch_sums_scores_for_duplicate_experts(
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules import dispatcher as dispatcher_module
 
+    # This is a local routing arithmetic test; distributed participation is
+    # covered by the real eight-process EP tests.
+    monkeypatch.setattr(dispatcher_module, "check_ep_participation", lambda group, phase: None)
+
     def fake_all_gather(output, local_counts, group):
         del group
         output.zero_()
@@ -216,3 +220,41 @@ def test_deepep_dispatch_finish_sums_scores_for_duplicate_experts(
     torch.testing.assert_close(dispatched_probs, torch.tensor([0.6, 0.5, 0.5, 0.4]))
     dispatched_probs.sum().backward()
     torch.testing.assert_close(recv_probs.grad, torch.ones_like(recv_probs))
+
+
+def _peers(count=4):
+    from megatron.lite.primitive.modules import ep_participation
+
+    store = torch.distributed.HashStore()
+    ranks = list(range(count))
+    return [ep_participation._Participation(store, ranks, rank) for rank in ranks]
+
+
+def _arrive(*calls):
+    """Peers enter their rendezvous concurrently, as real ranks do."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        return [f.result() for f in [pool.submit(p.check, phase) for p, phase in calls]]
+
+
+@pytest.fixture
+def _fast_rendezvous(monkeypatch):
+    monkeypatch.setattr(
+        "megatron.lite.primitive.modules.ep_participation._TIMEOUT", 0.2, raising=False
+    )
+
+
+def test_ep_participation_names_the_absent_peer(_fast_rendezvous):
+    peers = _peers()
+    assert _arrive(*[(p, "dispatch") for p in peers]) == [1] * len(peers)
+    with pytest.raises(RuntimeError, match="EP participation") as excinfo:
+        _arrive(*[(p, "dispatch") for p in peers[:-1]])
+    assert "rank 3 expected=2 actual=1" in str(excinfo.value)
+    assert "expected participants=4 actual=3" in str(excinfo.value)
+
+
+def test_ep_participation_rejects_same_shaped_work_at_the_wrong_phase(_fast_rendezvous):
+    peers = _peers()
+    with pytest.raises(RuntimeError, match="EP participation"):
+        _arrive((peers[0], "backward"), *[(p, "forward") for p in peers[1:]])

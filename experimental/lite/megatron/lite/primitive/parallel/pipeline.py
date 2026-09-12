@@ -278,12 +278,10 @@ def _1f1b_schedule(
         return out
 
     def _run_backward(inp_t, hid_t, loss_t, grad_t):
-        if ps.pp_is_last:
-            if loss_t is not None:
-                loss_t.backward()
-        else:
-            if hid_t is not None and hid_t.requires_grad:
-                torch.autograd.backward(hid_t, grad_t)
+        # Match Core backward_step: the output, not local loss presence, gates backward.
+        output = loss_t if ps.pp_is_last and loss_t is not None else hid_t
+        if output.requires_grad:
+            torch.autograd.backward(output, grad_t)
         return inp_t.grad if inp_t is not None else None
 
     def _p2p(send_fwd=None, send_bwd=None, recv_fwd=False, recv_bwd=False):
@@ -887,11 +885,9 @@ def _interleaved_1f1b_schedule(
                 pending_grad = None
                 if _dbg:
                     print(f"[VPP r{rank}] mb={mb_id} bwd stage={stage_id}", flush=True)
-                if is_last_stage:
-                    if loss is not None:
-                        loss.backward()
-                elif out_t is not None and out_t.requires_grad:
-                    torch.autograd.backward(out_t, grad)
+                output = loss if is_last_stage and loss is not None else out_t
+                if output.requires_grad:
+                    torch.autograd.backward(output, grad)
                 if not is_first_stage:
                     inp_grad = inp.grad if inp is not None else None
 
