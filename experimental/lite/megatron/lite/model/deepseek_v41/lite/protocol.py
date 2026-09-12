@@ -80,10 +80,6 @@ def build_model(model_cfg, *, impl_cfg):
         raise NotImplementedError(
             'Data parallel construction requires the distributed integration'
         )
-    if p.pp > 1 and impl_cfg.optimizer is not None:
-        raise NotImplementedError(
-            'Pipeline optimizer construction requires distributed routing integration'
-        )
     if impl_cfg.optimizer not in (None, 'muon'):
         raise ValueError('V4.1 optimizer must be explicitly selected as muon')
     if impl_cfg.optimizer is None and impl_cfg.optimizer_config is not None:
@@ -145,7 +141,7 @@ def build_model(model_cfg, *, impl_cfg):
                 p.main_grad = None
                 p.register_post_accumulate_grad_hook(_publish_main_grad)
         model.residual_dtype = impl_cfg.dtype
-        optimizer = V41Optimizer(model, impl_cfg.optimizer_config)
+        optimizer = V41Optimizer(model, impl_cfg.optimizer_config, parallel_state=ps)
     from .pipeline import PackedPipelineAdapter
 
     return ModelBundle(

@@ -939,7 +939,7 @@ def test_v41_packed_pipeline_matches_monolithic(moe):
             )
 
 
-def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False):
+def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False, mixed=False):
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -949,12 +949,26 @@ def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False):
 
     torch.cuda.set_device(rank)
     device = torch.device('cuda', rank)
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import OptimizerConfig
+
+    optimizer_options = (
+        dict(
+            optimizer='muon',
+            trainable_engram=True,
+            optimizer_config=OptimizerConfig(
+                lr=1e-4, ns_steps=5, coefficient_type='quintic', clip_grad=0.5
+            ),
+        )
+        if mixed
+        else {}
+    )
     torch.manual_seed(1729)
     # Compute an independent monolithic reference, retain only this rank's
     # weights/gradients, then discard the full model before PP construction.
     bundle = protocol.build_model(
         _assembly_config(),
         impl_cfg=protocol.ImplConfig(
+            **optimizer_options,
             device=str(device),
             dtype=torch.float32,
             quantized=False,
@@ -1005,6 +1019,20 @@ def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False):
         for binding in bindings
         if binding.tensor.requires_grad
     }
+    original_parameters = (
+        {name: t.detach().clone() for name, t in model.state_dict().items()}
+        if mixed
+        else {}
+    )
+    reference_update, reference_norm = {}, None
+    if mixed:
+        success, reference_norm, _ = bundle.optimizer.step()
+        assert success
+        reference_update = {
+            binding.release_key: binding.tensor.detach().clone() for binding in bindings
+        }
+        model.load_state_dict(original_parameters, strict=True)
+        del original_parameters
     if model.engram_hash is not None:
         owned_modules.append(model.engram_hash)
     owned_values = {
@@ -1037,6 +1065,7 @@ def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False):
     bundle = protocol.build_model(
         _assembly_config(),
         impl_cfg=protocol.ImplConfig(
+            **optimizer_options,
             device=str(device),
             dtype=torch.float32,
             quantized=False,
@@ -1221,13 +1250,56 @@ def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False):
             else:
                 compare(p.grad, expected, binding.release_key + ' gradient')
         before = {id(p): p.detach().clone() for p in params}
-        torch.optim.SGD(params, lr=1e-4).step()
+        if mixed:
+            success, norm, _ = bundle.optimizer.step()
+            assert success
+            compare(
+                torch.tensor(norm), torch.tensor(reference_norm), 'global clip norm'
+            )
+        else:
+            torch.optim.SGD(params, lr=1e-4).step()
         for binding in bindings:
             p = binding.tensor
             if p.requires_grad:
                 g = reference_grads[binding.release_key]
-                expected = before[id(p)] if g is None else before[id(p)] - 1e-4 * g
+                expected = (
+                    reference_update[binding.release_key]
+                    if mixed
+                    else before[id(p)] if g is None else before[id(p)] - 1e-4 * g
+                )
                 compare(p, expected, binding.release_key + ' single owner update')
+        if mixed:
+            from copy import deepcopy
+
+            opt = bundle.optimizer
+            saved = deepcopy(opt.state_dict())
+            weights = {n: p.detach().clone() for n, p in model.named_parameters()}
+            opt.zero_grad()
+            for p in params:
+                p.grad = torch.zeros_like(p)
+                p.main_grad = p.grad
+            if rank == 0:
+                params[0].main_grad.flatten()[0] = float('nan')
+            assert not opt.step()[0], 'Nonfinite peer must skip every PP optimizer'
+            _g1_equal(opt.state_dict(), saved, 'PP_ATOMIC_STATE')
+            for n, p in model.named_parameters():
+                torch.testing.assert_close(p, weights[n], atol=0, rtol=0)
+            for p in params:
+                p.grad.zero_()
+            backend = opt.optimizers[0]
+            prepare = backend.prepare_step
+            if rank == 1:
+
+                def rejected():
+                    prepare()
+                    return False
+
+                backend.prepare_step = rejected
+            assert not opt.step()[0], 'Failed staged peer must abort all PP commits'
+            backend.prepare_step = prepare
+            _g1_equal(opt.state_dict(), saved, 'PP_STAGED_ATOMIC_STATE')
+            for n, p in model.named_parameters():
+                torch.testing.assert_close(p, weights[n], atol=0, rtol=0)
         all_errors = [None] * 4
         dist.all_gather_object(all_errors, errors)
         failures = [message for rank_errors in all_errors for message in rank_errors]
@@ -2862,3 +2934,47 @@ def test_packed_pipeline_scheduler_local_gradients_and_lifetime(moe, recompute):
         adapter.backward(0, None)
     with pytest.raises(RuntimeError, match='active'):
         adapter.finish()
+
+
+def test_v41_pipeline_optimizer_groups_cover_local_owners(moe):
+    from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import parameter_groups
+
+    _, bundle = _assembly_bundle()
+    expected = {g['owner_key'] for g in parameter_groups(bundle.chunks[0], lr=1e-3)}
+    actual = set()
+    for start, end in ((0, 10), (10, 20), (20, 30), (30, 40)):
+        model = DeepseekV41Model(
+            _assembly_config(),
+            token_map=list(range(256)),
+            quantized=False,
+            layer_range=(start, end),
+        )
+        for binding in model.parameter_bindings():
+            if binding.role in ('vision', 'aligner', 'image_delimiter'):
+                binding.tensor.requires_grad_(False)
+        groups = parameter_groups(model, lr=1e-3)
+        owned = {g['owner_key'] for g in groups}
+        assert not owned & actual
+        actual.update(owned)
+        assert {id(p) for g in groups for p in g['params']} == {
+            id(p) for p in model.parameters() if p.requires_grad
+        }
+    assert actual == expected
+
+
+@pytest.mark.gpus(4)
+def test_real_packed_pipeline_mixed_optimizer_clip_and_atomic_skip(tmp_path):
+    import os
+
+    import torch.multiprocessing as mp
+
+    assert os.getenv('SLURM_JOB_ID'), 'Mixed PP validation requires Slurm'
+    if torch.cuda.device_count() < 4:
+        pytest.skip('Requires the declared four-GPU allocation')
+    mp.spawn(
+        _real_model_worker,
+        args=(f'file://{tmp_path}/mixed-pp', True, True, True),
+        nprocs=4,
+        join=True,
+    )

@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from megatron.lite.primitive.optimizers.headwise_muon import HeadwiseMuon
 from megatron.lite.primitive.optimizers.sinkhorn import Sinkhorn
 from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
@@ -71,10 +72,14 @@ def parameter_groups(model, *, lr):
     def norm(module, role='norm'):
         add(module.weight, 'adamw', role=role)
 
-    add(model.embed.weight, 'sinkhorn', role='embedding', decay=0)
-    add(model.head.weight, 'sinkhorn', role='head', decay=0)
-    norm(model.norm)
+    if model.embed is not None:
+        add(model.embed.weight, 'sinkhorn', role='embedding', decay=0)
+    if model.head is not None:
+        add(model.head.weight, 'sinkhorn', role='head', decay=0)
+        norm(model.norm)
     for block in model.layers:
+        if block is None:
+            continue
         a, c = block.attn, block.attn.config
         for module, role in (
             (a.wq_a, 'wq_a'),
@@ -162,7 +167,7 @@ class V41Optimizer:
     owned by the parallel integration rather than silently approximated here.
     """
 
-    def __init__(self, model, config):
+    def __init__(self, model, config, *, parallel_state=None):
         if not isinstance(config, OptimizerConfig):
             raise TypeError('V4.1 requires an explicit model OptimizerConfig')
         if not math.isfinite(config.clip_grad) or config.clip_grad < 0:
@@ -173,6 +178,8 @@ class V41Optimizer:
         ):
             raise ValueError('V4.1 optimizer requires native FP32 parameter masters')
         self.config = config
+        self.parallel_state = parallel_state
+        self.commit_group = None if parallel_state is None else parallel_state.pp_group
         self.optimizers = []
         for algorithm in ('muon', 'sinkhorn', 'adamw'):
             selected = [g for g in groups if g['algorithm'] == algorithm]
@@ -195,7 +202,9 @@ class V41Optimizer:
         self.tables = [
             b.engram.embed
             for b in model.layers
-            if b.engram is not None and b.engram.embed.master is not None
+            if b is not None
+            and b.engram is not None
+            and b.engram.embed.master is not None
         ]
 
     @property
@@ -219,11 +228,14 @@ class V41Optimizer:
         active = [g for g in gradients if g is not None]
         if any(g.dtype != torch.float32 or g.is_sparse for g in active):
             raise ValueError('Expected native dense FP32 main_grad')
-        norm = (
-            torch.stack([g.double().square().sum() for g in active]).sum().sqrt()
+        norm_squared = (
+            torch.stack([g.double().square().sum() for g in active]).sum()
             if active
-            else torch.tensor(0.0)
+            else torch.zeros((), dtype=torch.float64, device=parameters[0].device)
         )
+        if self.commit_group is not None:
+            dist.all_reduce(norm_squared, group=self.commit_group)
+        norm = norm_squared.sqrt()
         if not torch.isfinite(norm):
             return False, float(norm), None
         coefficient = (
@@ -234,6 +246,7 @@ class V41Optimizer:
         # Reversible gradient views permit retry on failed publication.
         original = [(p, p.grad, getattr(p, 'main_grad', None)) for p in parameters]
         staged_adam, candidates = [], {}
+        ready = True
         try:
             for p, g in zip(parameters, gradients):
                 p.grad = None if g is None else g * coefficient
@@ -254,27 +267,33 @@ class V41Optimizer:
                         for v in s.values()
                         if isinstance(v, torch.Tensor)
                     ):
-                        return False, float(norm), None
+                        ready = False
                     staged_adam.append((backend, candidate))
                 else:
                     if not backend.prepare_step():
-                        return False, float(norm), None
-                    candidates.update(
-                        (id(p), value) for p, value in backend.candidates()
-                    )
-            if any(not torch.isfinite(p).all() for p in candidates.values()):
+                        ready = False
+                    else:
+                        candidates.update(
+                            (id(p), value) for p, value in backend.candidates()
+                        )
+            ready = ready and all(torch.isfinite(p).all() for p in candidates.values())
+            if not self._all_ready(ready, parameters[0].device):
                 return False, float(norm), None
             storage = []
             for table in self.tables:
                 weight, scale = quantize_block_fp8(
-                    candidates[id(table.master)], (1, 32), scale_format='e8m0'
+                    candidates.get(id(table.master), table.master),
+                    (1, 32),
+                    scale_format='e8m0',
                 )
                 if (
                     not torch.isfinite(weight.float()).all()
                     or not torch.isfinite(scale.float()).all()
                 ):
-                    return False, float(norm), None
+                    ready = False
                 storage.append((table, weight, scale))
+            if not self._all_ready(ready, parameters[0].device):
+                return False, float(norm), None
             for backend in self.optimizers:
                 if not isinstance(backend, torch.optim.AdamW):
                     backend.commit_step()
@@ -293,6 +312,12 @@ class V41Optimizer:
                     backend.discard_step()
             for p, grad, main in original:
                 p.grad, p.main_grad = grad, main
+
+    def _all_ready(self, ready, device):
+        flag = torch.tensor(int(bool(ready)), dtype=torch.int32, device=device)
+        if self.commit_group is not None:
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self.commit_group)
+        return bool(flag.item())
 
     def state_dict(self):
         return dict(
