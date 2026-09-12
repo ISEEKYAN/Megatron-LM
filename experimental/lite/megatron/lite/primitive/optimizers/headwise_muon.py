@@ -3,6 +3,7 @@
 
 import math
 from copy import deepcopy
+from functools import partial
 
 import torch
 from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
@@ -245,24 +246,21 @@ class MixedOptimizer:
                     )
         self.config = config
         self.optimizers = []
-        for algorithm in ('muon', 'sinkhorn', 'adamw'):
+        backends = {
+            'muon': partial(
+                HeadwiseMuon,
+                ns_steps=config.ns_steps,
+                coefficient_type=config.coefficient_type,
+            ),
+            'sinkhorn': Sinkhorn,
+            'adamw': partial(
+                torch.optim.AdamW, betas=(0.9, 0.95), eps=1e-20, foreach=False
+            ),
+        }
+        for algorithm, factory in backends.items():
             selected = [g for g in groups if g['algorithm'] == algorithm]
-            if not selected:
-                continue
-            if algorithm == 'muon':
-                backend = HeadwiseMuon(
-                    selected,
-                    lr=config.lr,
-                    ns_steps=config.ns_steps,
-                    coefficient_type=config.coefficient_type,
-                )
-            elif algorithm == 'sinkhorn':
-                backend = Sinkhorn(selected, lr=config.lr)
-            else:
-                backend = torch.optim.AdamW(
-                    selected, lr=config.lr, betas=(0.9, 0.95), eps=1e-20, foreach=False
-                )
-            self.optimizers.append(backend)
+            if selected:
+                self.optimizers.append(factory(selected, lr=config.lr))
         self.tables = list(tables)
 
     def _validate_trainability(self):

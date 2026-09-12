@@ -9,6 +9,7 @@ multimodal assembly; frozen visual and archival MTP owners allocate no state.
 import math
 from copy import deepcopy
 from dataclasses import dataclass
+from operator import attrgetter
 
 import torch
 from megatron.lite.primitive.optimizers.headwise_muon import MixedOptimizer
@@ -97,36 +98,32 @@ def parameter_groups(model, *, lr, vision_policy=None):
             )
         )
 
-    def norm(module, role='norm'):
-        add(module.weight, 'adamw', role=role)
+    def route(owner, paths, algorithm, role, **policy):
+        for path in paths.split():
+            add(attrgetter(path)(owner), algorithm, role=role, **policy)
 
-    add(model.embed.weight, 'sinkhorn', role='embedding', decay=0)
-    add(model.head.weight, 'sinkhorn', role='head', decay=0)
-    norm(model.norm)
+    route(model, 'embed.weight', 'sinkhorn', 'embedding', decay=0)
+    route(model, 'head.weight', 'sinkhorn', 'head', decay=0)
+    route(model, 'norm.weight', 'adamw', 'norm')
     for block in model.layers:
         a, c = block.attn, block.attn.config
-        for module, role in (
-            (a.wq_a, 'wq_a'),
-            (a.wkv, 'wkv'),
-            (a.wo_a, 'wo_a'),
-            (a.wo_b, 'wo_b'),
-        ):
-            add(module.weight, 'muon', role=role)
-        add(
-            a.wq_b.weight,
+        for role in ('wq_a', 'wkv', 'wo_a', 'wo_b'):
+            route(a, role + '.weight', 'muon', role)
+        route(
+            a,
+            'wq_b.weight',
             'muon',
-            role='wq_b',
+            'wq_b',
             shape=(c.heads, c.head_dim, c.q_rank),
             heads=c.heads,
         )
-        norm(a.q_norm)
-        norm(a.kv_norm)
-        add(a.attn_sink, 'adamw', role='attention_sink', decay=0)
+        route(a, 'q_norm.weight kv_norm.weight', 'adamw', 'norm')
+        route(a, 'attn_sink', 'adamw', 'attention_sink', decay=0)
         if a.compressor is not None:
-            add(a.compressor.wkv.weight, 'muon', role='compressor')
-            norm(a.compressor.norm, 'compressor')
+            route(a.compressor, 'wkv.weight', 'muon', 'compressor')
+            route(a.compressor, 'norm.weight', 'adamw', 'compressor')
             if hasattr(a.compressor, 'wgate'):
-                add(a.compressor.wgate.weight, 'muon', role='compressor')
+                route(a.compressor, 'wgate.weight', 'muon', 'compressor')
         if a.indexer is not None:
             for p in a.indexer.parameters():
                 if p.requires_grad:
@@ -134,33 +131,26 @@ def parameter_groups(model, *, lr, vision_policy=None):
                 if id(p) not in bindings or bindings[id(p)].role != 'indexer':
                     raise ValueError('Unknown indexer parameter')
                 seen.add(id(p))
-        norm(block.attn_norm)
-        norm(block.ffn_norm)
+        route(block, 'attn_norm.weight ffn_norm.weight', 'adamw', 'norm')
         for mixes in (block.attn_mixes, block.ffn_mixes):
-            add(mixes.fn, 'muon', role='hyper_connection')
-            add(mixes.base, 'adamw', role='hyper_connection', decay=0)
-            add(mixes.scale, 'adamw', role='hyper_connection', decay=0)
-        add(block.ffn.gate.router.gate.weight, 'muon', role='router')
-        for expert in block.ffn.experts:
-            for module in (expert.w1, expert.w2, expert.w3):
-                add(module.weight, 'muon', role='expert')
-        shared = block.ffn.shared_experts
-        if shared is not None:
-            for module in (shared.w1, shared.w2, shared.w3):
-                add(module.weight, 'muon', role='shared_expert')
+            route(mixes, 'fn', 'muon', 'hyper_connection')
+            route(mixes, 'base scale', 'adamw', 'hyper_connection', decay=0)
+        route(block.ffn, 'gate.router.gate.weight', 'muon', 'router')
+        for role, experts in (
+            ('expert', block.ffn.experts),
+            ('shared_expert', [block.ffn.shared_experts]),
+        ):
+            for expert in experts:
+                if expert is not None:
+                    route(expert, 'w1.weight w2.weight w3.weight', 'muon', role)
         if block.engram is not None:
             e = block.engram
             if e.embed.master is not None:
-                add(
-                    e.embed.master,
-                    'sinkhorn',
-                    role='engram_table',
-                    multiplier=5,
-                    decay=0,
+                route(
+                    e, 'embed.master', 'sinkhorn', 'engram_table', multiplier=5, decay=0
                 )
-            add(e.wkv.weight, 'muon', role='engram_projection', multiplier=5)
-            for p in (e.q_weight, e.k_weight):
-                add(p, 'adamw', role='engram_norm', multiplier=5)
+            route(e, 'wkv.weight', 'muon', 'engram_projection', multiplier=5)
+            route(e, 'q_weight k_weight', 'adamw', 'engram_norm', multiplier=5)
     # Enumerate live visual objects explicitly; frozen owners are still audited.
     vision = model.vision
     if hasattr(vision, 'patch_embed'):
@@ -225,7 +215,7 @@ def parameter_groups(model, *, lr, vision_policy=None):
                 visual_linear(module, 'vision', multiplier=multiplier)
             for module in (block.norm1, block.norm2):
                 add(module.weight, 'adamw', role='vision', multiplier=multiplier)
-        norm(vision.norm, 'vision')
+        route(vision, 'norm.weight', 'adamw', 'vision')
         for module in (model.aligner.w1, model.aligner.w2):
             visual_linear(module, 'aligner')
         for vector in vectors:

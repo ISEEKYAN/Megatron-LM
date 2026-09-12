@@ -307,14 +307,7 @@ def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
 
 
 def _header_dtype(dtype):
-    return {
-        'torch.float32': 'F32',
-        'torch.bfloat16': 'BF16',
-        'torch.float16': 'F16',
-        'torch.int8': 'I8',
-        'torch.float8_e4m3fn': 'F8_E4M3',
-        'torch.float8_e8m0fnu': 'F8_E8M0',
-    }.get(dtype, dtype)
+    return {str(value): key for key, value in _TORCH_DTYPES.items()}.get(dtype, dtype)
 
 
 def export_model(model):
@@ -344,12 +337,7 @@ def export_model(model):
 
 def save_model(model, path):
     """Stream masters plus byte-identical archival entries to an atomic directory."""
-    import hashlib
-    import json
-    import os
     import shutil
-    import tempfile
-    from pathlib import Path
 
     path = Path(path)
     if path.exists():
@@ -396,9 +384,6 @@ def save_model(model, path):
 @torch.no_grad()
 def load_model(model, path):
     """Bind every header before loading any live tensor, retaining archive bytes."""
-    import json
-    from pathlib import Path
-
     from .engram import EngramTable
 
     path = Path(path)
@@ -410,8 +395,6 @@ def load_model(model, path):
         paths = [path / shard for shard in sorted(set(mapping.values()))]
         expected = list(mapping)
     else:
-        import struct
-
         paths = [path / 'model.safetensors']
         with paths[0].open('rb') as source:
             size = struct.unpack('<Q', source.read(8))[0]

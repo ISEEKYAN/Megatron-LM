@@ -51,14 +51,6 @@ class DeferredModule(nn.Module):
             f'{self.scope} execution is not implemented in text-only mode'
         )
 
-    def leaf_owner(self, path):
-        owner = self
-        for part in path.split('.')[:-1]:
-            if part not in owner._modules:
-                owner.add_module(part, DeferredModule(f'{owner.scope}.{part}'))
-            owner = owner._modules[part]
-        return owner
-
 
 class DeepseekV41Model(nn.Module):
     def __init__(
@@ -277,12 +269,10 @@ class DeepseekV41Model(nn.Module):
                 )
                 self._bind(key, self, key, 'image_delimiter')
         self.mtp = DeferredModule('DSpark')
-        for root, key in self._archive_keys(t, v):
-            if root != 'mtp':
-                continue
-            module = getattr(self, root)
-            owner = module.leaf_owner(key[len(root) + 1 :])
-            self.archival_bindings[key] = TensorBinding(key, owner, None, 'archival')
+        self.archival_bindings = {
+            key: TensorBinding(key, self.mtp, None, 'archival')
+            for key in self._archive_keys(t)
+        }
         self.validate_parameter_bindings()
 
     def _bind(self, key, owner, attribute, role, head_count=None, encoding=None):
@@ -355,48 +345,44 @@ class DeepseekV41Model(nn.Module):
                     )
 
     @staticmethod
-    def _archive_keys(t, v):
+    def _archive_keys(t):
         for index in range(t['num_nextn_predict_layers']):
             prefix = f'mtp.{index}.'
-            for suffix in (
-                'attn.attn_sink',
-                'attn.kv_norm.weight',
-                'attn.q_norm.weight',
-                'attn_norm.weight',
-                'ffn_norm.weight',
-                'ffn.gate.weight',
-                'ffn.gate.bias',
-                'ffn.gate.bias_vl',
-            ):
-                yield 'mtp', prefix + suffix
-            for name in ('wkv', 'wo_a', 'wo_b', 'wq_a', 'wq_b'):
-                for suffix in ('weight', 'scale'):
-                    yield 'mtp', prefix + f'attn.{name}.{suffix}'
-            for side in ('attn', 'ffn'):
-                for suffix in ('fn', 'base', 'scale'):
-                    yield 'mtp', prefix + f'hc_{side}_{suffix}'
+            plain = (
+                'attn.attn_sink attn.kv_norm.weight attn.q_norm.weight '
+                'attn_norm.weight ffn_norm.weight ffn.gate.weight '
+                'ffn.gate.bias ffn.gate.bias_vl'
+            ).split()
+            matrices = [
+                f'attn.{name}' for name in ('wkv', 'wo_a', 'wo_b', 'wq_a', 'wq_b')
+            ]
+            plain += [
+                f'hc_{side}_{suffix}'
+                for side in ('attn', 'ffn')
+                for suffix in ('fn', 'base', 'scale')
+            ]
             experts = [f'experts.{i}' for i in range(t['dspark_n_routed_experts'])]
             if t['n_shared_experts']:
                 experts.append('shared_experts')
-            for expert in experts:
-                for name in ('w1', 'w2', 'w3'):
-                    for suffix in ('weight', 'scale'):
-                        yield 'mtp', prefix + f'ffn.{expert}.{name}.{suffix}'
+            matrices += [
+                f'ffn.{expert}.{name}'
+                for expert in experts
+                for name in ('w1', 'w2', 'w3')
+            ]
             if index == 0:
-                for suffix in (
-                    'main_norm.weight',
-                    'main_proj.weight',
-                    'main_proj.scale',
-                ):
-                    yield 'mtp', prefix + suffix
+                plain.append('main_norm.weight')
+                matrices.append('main_proj')
             if index == t['num_nextn_predict_layers'] - 1:
-                for suffix in (
-                    'confidence_head.proj.weight',
-                    'markov_head.embed.weight',
-                    'markov_head.head.weight',
-                    'norm.weight',
-                ):
-                    yield 'mtp', prefix + suffix
+                plain += (
+                    'confidence_head.proj.weight markov_head.embed.weight '
+                    'markov_head.head.weight norm.weight'
+                ).split()
+            yield from (prefix + name for name in plain)
+            yield from (
+                prefix + name + '.' + suffix
+                for name in matrices
+                for suffix in ('weight', 'scale')
+            )
 
     def parameter_bindings(self):
         return (

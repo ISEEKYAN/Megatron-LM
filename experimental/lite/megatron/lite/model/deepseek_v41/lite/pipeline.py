@@ -1,26 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Paired PP payload lifetime; the C4 protocol owns scheduling and layer binding."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
 from megatron.lite.primitive.parallel.tensor_payload import PipelineLedger, PipelineTag
-
-PAYLOAD_FIELDS = (
-    'h',
-    'p',
-    'ced_h',
-    'ced_p',
-    'kv',
-    'kv_values',
-    'kv_scale',
-    'index_k',
-    'index_scale',
-    'topk',
-    'positions',
-    'latent',
-    'candidates',
-)
 
 
 @dataclass(frozen=True)
@@ -91,3 +75,6 @@ class PairedPayload:
         if len(tensors) != len(PAYLOAD_FIELDS):
             raise ValueError('Pipeline payload field count differs')
         return cls(**dict(zip(PAYLOAD_FIELDS, tensors)))
+
+
+PAYLOAD_FIELDS = tuple(field.name for field in fields(PairedPayload))

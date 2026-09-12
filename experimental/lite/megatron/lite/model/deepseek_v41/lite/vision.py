@@ -6,30 +6,24 @@ Trainability and distributed synchronization belong to the training protocol.
 """
 
 import torch
+from megatron.lite.primitive.modules.hyper_connection import RMSNorm as _RMSNorm
 from torch import nn
 from torch.nn import functional as F
 
 
-class RMSNorm(nn.Module):
-    """Keep one FP32 cast so backward accumulates before returning to BF16."""
-
+class RMSNorm(_RMSNorm):
     def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.eps = eps
-
-    def forward(self, x):
-        dtype = x.dtype
-        value = x.float()
-        value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + self.eps)
-        return (self.weight * value).to(dtype)
+        super().__init__(dim, eps)
+        self.weight.data = self.weight.data.float()
 
 
 def get_vision_cos_sin(n_h, n_w, dim, theta, device=None):
     frequency = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
     # Height frequencies precede width frequencies in each half of the head.
     height, width = torch.meshgrid(
-        torch.arange(n_h, device=device), torch.arange(n_w, device=device), indexing='ij'
+        torch.arange(n_h, device=device),
+        torch.arange(n_w, device=device),
+        indexing='ij',
     )
     phase = (
         (torch.stack((height, width), -1).reshape(-1, 2, 1).float() * frequency)
@@ -41,7 +35,9 @@ def get_vision_cos_sin(n_h, n_w, dim, theta, device=None):
 
 def apply_rotary(x, cos, sin):
     first, second = x.float().chunk(2, -1)
-    return torch.cat((first * cos - second * sin, second * cos + first * sin), -1).to(x.dtype)
+    return torch.cat((first * cos - second * sin, second * cos + first * sin), -1).to(
+        x.dtype
+    )
 
 
 class PatchEmbed(nn.Module):
@@ -65,7 +61,8 @@ class Attention(nn.Module):
 
     def forward(self, x, cos, sin):
         q, k, v = [
-            part.reshape(len(x), self.n_heads, self.head_dim) for part in self.wqkv(x).chunk(3, -1)
+            part.reshape(len(x), self.n_heads, self.head_dim)
+            for part in self.wqkv(x).chunk(3, -1)
         ]
         q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
         result = F.scaled_dot_product_attention(
@@ -109,7 +106,9 @@ class ViT(nn.Module):
         if min(n_h, n_w) < 1 or len(patches) != n_h * n_w:
             raise ValueError('Patch count must equal the positive image grid area')
         x = self.patch_embed(patches)
-        cos, sin = get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta, x.device)
+        cos, sin = get_vision_cos_sin(
+            n_h, n_w, self.rope_dim, self.rope_theta, x.device
+        )
         for block in self.blocks:
             x = block(x, cos, sin)
         return self.norm(x)
