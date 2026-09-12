@@ -241,6 +241,20 @@ def compare_correctness_artifacts(
             mismatches.append({"step": idx, "field": "loss"})
         if not grad_matches:
             mismatches.append({"step": idx, "field": "grad_norm"})
+        base_grad = base.get("grad_fingerprint")
+        cand_grad = cand.get("grad_fingerprint")
+        if base_grad is not None or cand_grad is not None:
+            # The aggregate digest already covers names, dtypes and bytes.
+            # Optional diagnostic details do not change the comparison.
+            if (
+                not isinstance(base_grad, dict)
+                or not isinstance(cand_grad, dict)
+                or not base_grad.get("sha256")
+                or base_grad.get("sha256") != cand_grad.get("sha256")
+                or base_grad.get("tensor_count") is None
+                or base_grad.get("tensor_count") != cand_grad.get("tensor_count")
+            ):
+                mismatches.append({"step": idx, "field": "grad_fingerprint"})
         for field in ("post_step_weights", "update_successful", "num_zeros"):
             if base.get(field) != cand.get(field):
                 mismatches.append({"step": idx, "field": field})

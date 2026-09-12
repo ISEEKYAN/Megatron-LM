@@ -785,13 +785,19 @@ def _patch_verl_dsv4_native_layerwise_reload() -> bool:
         rollout_utils = importlib.import_module(
             "verl.workers.rollout.vllm_rollout.utils"
         )
-    except Exception:
-        return False
+    except Exception as exc:
+        raise RuntimeError(
+            "Cannot install DS4 native layerwise reload: failed to import VERL "
+            "reload dependencies. Refusing unsafe legacy FP8 finalization."
+        ) from exc
     original_prepare = getattr(fp8_utils, "prepare_quanted_weights_for_loading", None)
     original_process = getattr(fp8_utils, "process_quanted_weights_after_loading", None)
     original_load = getattr(fp8_utils, "load_quanted_weights", None)
     if original_prepare is None or original_process is None or original_load is None:
-        return False
+        raise RuntimeError(
+            "Cannot install DS4 native layerwise reload: VERL FP8 reload APIs "
+            "are missing. Refusing unsafe legacy FP8 finalization."
+        )
     if getattr(original_prepare, "_verl_mlite_ds4_layerwise", False):
         return True
 

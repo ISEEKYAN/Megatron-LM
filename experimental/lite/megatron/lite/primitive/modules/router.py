@@ -267,10 +267,12 @@ class SigmoidTopKRouter(nn.Module):
         )
         if apply_aux_loss:
             _reject_aux_loss_during_replay(self.router_replay)
-            _, aux_scores = compute_routing_scores_for_aux_loss(
+            aux_routing_map, aux_scores = compute_routing_scores_for_aux_loss(
                 logits, self.topk, score_function=self.score_function, fused=self.moe_router_fusion
             )
-            tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
+            # Balance the same unbiased, unrestricted affinities used by
+            # aux_scores, independently of dispatch groups and expert bias.
+            tokens_per_expert = aux_routing_map.sum(dim=0).to(torch.int64)
             total_num_tokens = num_tokens
             if self._aux_loss_group is not None:
                 dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
