@@ -239,29 +239,50 @@ class V41Optimizer(MixedOptimizer):
             raise ValueError('Invalid gradient clipping threshold')
         groups = parameter_groups(model, lr=config.lr, vision_policy=config.vision_policy)
         self.model = model
+        self.routers = [block.ffn.gate for block in model.layers]
+        self._modality_loads = [None] * len(self.routers)
         tables = [
             b.engram.embed
             for b in model.layers
             if b.engram is not None and b.engram.embed.master is not None
         ]
         super().__init__(groups, config, tables)
-        from .training import RoutingStep
 
-        if model.routing_step is None:
-            model.routing_step = RoutingStep()
+    def accumulate_modality_loads(self, loads):
+        """One forward snapshot: global layer order, then packed sample order."""
+        from .moe import ModalityLoad
+
+        for index, (previous, entries) in enumerate(
+            zip(self._modality_loads, loads, strict=True)
+        ):
+            for stats in entries:
+                previous = ModalityLoad(
+                    (
+                        stats.counts.detach().clone()
+                        if previous is None
+                        else previous.counts + stats.counts
+                    ),
+                    (
+                        stats.total_tokens.detach().clone()
+                        if previous is None
+                        else previous.total_tokens + stats.total_tokens
+                    ),
+                )
+            self._modality_loads[index] = previous
 
     def zero_grad(self, set_to_none=True):
         super().zero_grad(set_to_none=set_to_none)
-        self.model.routing_step.clear()
+        self._modality_loads = [None] * len(self.routers)
 
     def step(self):
         result = super().step()
-        try:
-            if result[0]:
-                self.model.routing_step.publish()
-        finally:
-            # Both committed and skipped steps consume their microbatch loads.
-            self.model.routing_step.clear()
+        if result[0]:
+            for router, stats in zip(self.routers, self._modality_loads, strict=True):
+                if stats is not None:
+                    router.update_bias(stats)
+        # Successful publication and overflow skips both finish this window.
+        # Exceptions from the transactional backend retain statistics for retry.
+        self._modality_loads = [None] * len(self.routers)
         return result
 
     def reconfigure_vision(self, mask):

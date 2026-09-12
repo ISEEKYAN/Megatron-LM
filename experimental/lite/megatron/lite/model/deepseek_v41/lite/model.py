@@ -91,7 +91,6 @@ class DeepseekV41Model(nn.Module):
         dim, copies, eps = t.hidden_size, t.hc_mult, t.rms_norm_eps
         self.hc_mult = copies
         self.vision_schedule = None
-        self.routing_step = None
         self.register_buffer(
             '_vision_trainability', torch.full((4,), -1, dtype=torch.int8)
         )
@@ -389,7 +388,16 @@ class DeepseekV41Model(nn.Module):
             raise ValueError('Every parameter must have exactly one binding')
 
     def _layers(
-        self, hidden, pre, input_ids, start, end, state, ced, image_mask=None, load_stats=None
+        self,
+        hidden,
+        pre,
+        input_ids,
+        start,
+        end,
+        state,
+        ced,
+        image_mask=None,
+        modality_loads=None,
     ):
         token_mask = None if image_mask is None else ~image_mask
         hashes = None
@@ -406,14 +414,23 @@ class DeepseekV41Model(nn.Module):
                     hidden, hashes[:, :, self.engram_layer_ids.index(index)], token_mask
                 )
             hidden, pre, state = layer.forward_with_state(
-                hidden, pre, state,
-                ffn_kwargs={'image_mask': image_mask, 'load_stats': load_stats},
+                hidden,
+                pre,
+                state,
+                ffn_kwargs={
+                    'image_mask': image_mask,
+                    'load_sink': (
+                        None if modality_loads is None else modality_loads[index]
+                    ),
+                },
             )
             if index == 19:
                 ced = hidden, pre
         return hidden, pre, state, ced
 
-    def _sequence(self, hidden, pre, *, input_ids, image_mask=None, load_stats=None):
+    def _sequence(
+        self, hidden, pre, *, input_ids, image_mask=None, modality_loads=None
+    ):
         return self._layers(
             hidden,
             pre,
@@ -423,7 +440,7 @@ class DeepseekV41Model(nn.Module):
             AttentionState(),
             (None, None),
             image_mask,
-            load_stats,
+            modality_loads,
         )[:2]
 
     def forward_pipeline_range(
@@ -537,8 +554,8 @@ class DeepseekV41Model(nn.Module):
             if token_types.shape != input_ids.shape or (token_types != TEXT).any():
                 raise ValueError('Image token types require image inputs')
         hidden, pre = expand_hc(embeddings, self.hc_mult)
-        load_stats = []
-        sequence = partial(self._sequence, load_stats=load_stats)
+        loads = [[] for _ in self.layers]
+        sequence = partial(self._sequence, modality_loads=loads)
         if cu_seqlens is None:
             hidden, pre = sequence(
                 hidden, pre, input_ids=input_ids, image_mask=image_mask
@@ -553,9 +570,11 @@ class DeepseekV41Model(nn.Module):
                 image_mask=image_mask,
             )
         hidden = self.norm(contract_hc(hidden, pre))
+        # Freeze membership before backward: recompute may revisit a sink, but
+        # its statistics must not be submitted as another training microbatch.
         return {
             'logits': F.linear(hidden.float(), self.head.weight.float()),
-            'modality_loads': load_stats,
+            'modality_loads': tuple(tuple(entries) for entries in loads),
         }
 
     @staticmethod

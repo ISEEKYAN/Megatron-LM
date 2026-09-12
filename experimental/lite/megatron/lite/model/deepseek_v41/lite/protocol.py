@@ -4,6 +4,7 @@
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
+from functools import partial
 
 import torch
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
@@ -155,7 +156,7 @@ def build_model(model_cfg, *, impl_cfg):
         [model],
         ps,
         optimizer=optimizer,
-        forward_step=_forward_step,
+        forward_step=partial(_forward_step, optimizer=optimizer),
         extras={
             'model_cfg': model_cfg,
             'vision_schedule': model.vision_schedule,
@@ -241,19 +242,19 @@ def _validate_text_batch(batch, *, multimodal=False):
         raise ValueError('Only sequence-local positions are supported')
 
 
-def _forward_step(model, batch):
+def _forward_step(model, batch, *, optimizer=None):
     schedule = model.vision_schedule
     if schedule is not None and schedule.stage != 'idle':
         raise RuntimeError('Previous microbatch requires completed vision backward')
     try:
-        return _forward_step_impl(model, batch)
+        return _forward_step_impl(model, batch, optimizer=optimizer)
     except Exception:
         if schedule is not None:
             schedule.abort()
         raise
 
 
-def _forward_step_impl(model, batch):
+def _forward_step_impl(model, batch, *, optimizer=None):
     _validate_text_batch(batch, multimodal=True)
     _validate_replay(model, batch)
     precision = (
@@ -269,8 +270,8 @@ def _forward_step_impl(model, batch):
     with precision:
         output = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality)
     result = _text_output(output['logits'][0], batch)
-    if model.routing_step is not None and model.training and torch.is_grad_enabled():
-        model.routing_step.accumulate(output['modality_loads'])
+    if optimizer is not None and model.training and torch.is_grad_enabled():
+        optimizer.accumulate_modality_loads(output['modality_loads'])
     if model.vision_schedule is not None and model.vision_schedule.stage != 'idle':
         result['backward'] = model.vision_schedule.backward
     return result
