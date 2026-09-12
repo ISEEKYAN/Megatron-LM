@@ -1973,3 +1973,105 @@ def test_v41_visual_optimizer_rejects_mask_mutations(moe, mutation):
             ]
     with pytest.raises(ValueError, match='Trainability changed'):
         optimizer.step()
+
+
+@pytest.mark.parametrize('guard', [
+    'boolean_mask', 'mask_pending', 'sync_pending', 'llm_before_vision',
+    'vision_before_llm', 'save_pending', 'restore_pending', 'checkpoint_version',
+    'checkpoint_mask', 'protocol_pending', 'external_without_mask',
+])
+def test_v41_visual_schedule_individual_guard(moe, guard):
+    """Each case exercises exactly one guard; mutation receipts remove one at a time."""
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.model.deepseek_v41.lite.image_data import ImageInput, image_token_types
+    from megatron.lite.model.deepseek_v41.lite.training import VisionSchedule, VisionTrainability
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    mask = VisionTrainability(True, True, True, True)
+    if guard == 'boolean_mask':
+        with pytest.raises(TypeError, match='explicit booleans'):
+            VisionTrainability(1, True, True, True)
+        return
+    if guard == 'external_without_mask':
+        with pytest.raises(ValueError, match='explicit post-training mask'):
+            protocol.build_model(_assembly_config(), impl_cfg=protocol.ImplConfig(
+                device='cpu', quantized=False, token_map=list(range(256)),
+                external_vision_device='cpu',
+            ))
+        return
+    _, bundle = _assembly_bundle()
+    model = bundle.chunks[0]
+    mask.apply(model)
+    model.vision_schedule = schedule = VisionSchedule(model, 'cpu')
+    state = schedule.state_dict()
+    if guard == 'llm_before_vision':
+        with pytest.raises(RuntimeError, match='exactly one vision forward'):
+            schedule.backward(model.head.weight.square().sum())
+        return
+    if guard == 'vision_before_llm':
+        with pytest.raises(RuntimeError, match='must follow completed LLM backward'):
+            schedule.finish_backward()
+        return
+    if guard == 'checkpoint_version':
+        state['version'] = 2
+        with pytest.raises(ValueError, match='Unsupported vision schedule checkpoint'):
+            schedule.load_state_dict(state)
+        return
+    if guard == 'checkpoint_mask':
+        weights = model.state_dict()
+        weights['_vision_trainability'] = torch.tensor([2, 1, 1, 1], dtype=torch.int8)
+        with pytest.raises(ValueError, match='Invalid post-training mask in checkpoint'):
+            model.load_state_dict(weights)
+        return
+    image = ImageInput(1, torch.randn(4, 3, 14, 14), 2, 2, image_token_types(1, 1))
+    schedule.forward([[image]])
+    if guard == 'mask_pending':
+        call, message = lambda: mask.apply(model), 'Cannot change trainability'
+    elif guard == 'sync_pending':
+        call, message = schedule.sync_weights, 'Cannot synchronize weights'
+    elif guard == 'save_pending':
+        call, message = schedule.state_dict, 'Checkpoint requires a completed'
+    elif guard == 'restore_pending':
+        call, message = lambda: schedule.load_state_dict(state), 'Restore requires a completed'
+    else:
+        ids = torch.tensor([1, 99, 99, 99, 99, 2])
+        batch = PackedBatch(ids, ids, torch.tensor([6]), torch.ones(6), extras={'images': [[image]]})
+        call, message = lambda: bundle.forward_step(model, batch), 'Previous microbatch'
+    with pytest.raises(RuntimeError, match=message):
+        call()
+    schedule.abort()
+
+
+@pytest.mark.parametrize('entry', ['mask', 'merge', 'vision_forward', 'weight_sync',
+                                  'runtime_backward', 'llm_backward', 'vision_backward'])
+def test_v41_visual_schedule_protocol_entry_reachable(moe, monkeypatch, entry):
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.model.deepseek_v41.lite.image_data import ImageInput, image_token_types
+    from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
+    from megatron.lite.model.deepseek_v41.lite.training import VisionSchedule, VisionTrainability
+    from megatron.lite.primitive import train_step
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    targets = {
+        'mask': (VisionTrainability, 'apply'),
+        'merge': (DeepseekV41Model, 'merge_image_embeddings'),
+        'vision_forward': (VisionSchedule, 'forward'),
+        'weight_sync': (VisionSchedule, 'sync_weights'),
+        'runtime_backward': (train_step, 'backward_output'),
+        'llm_backward': (VisionSchedule, 'backward'),
+        'vision_backward': (VisionSchedule, 'finish_backward'),
+    }
+    def sentinel(*args, **kwargs):
+        raise RuntimeError('REACHABILITY:' + entry)
+    owner, method = targets[entry]
+    monkeypatch.setattr(owner, method, sentinel)
+    with pytest.raises(RuntimeError, match='REACHABILITY:' + entry):
+        bundle = protocol.build_model(_assembly_config(), impl_cfg=protocol.ImplConfig(
+            device='cpu', dtype=torch.float32, quantized=False, token_map=list(range(256)),
+            vision_trainability=VisionTrainability(True, True, True, True),
+            external_vision_device='cpu',
+        ))
+        ids = torch.tensor([1, 99, 99, 99, 99, 2])
+        image = ImageInput(1, torch.randn(4, 3, 14, 14), 2, 2, image_token_types(1, 1))
+        batch = PackedBatch(ids, ids, torch.tensor([6]), torch.ones(6), extras={'images': [[image]]})
+        train_step.run_microbatch_loop(bundle.chunks[0], iter([batch]), 1, bundle.forward_step)
