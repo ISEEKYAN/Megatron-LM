@@ -6,6 +6,8 @@ backward, including members with no requests. Request counts are host metadata;
 no table or fetched value is offloaded. Group=None explicitly means local.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -14,13 +16,13 @@ from torch import nn
 from .moe import _AllToAll
 
 
+@dataclass
 class _Route:
-    def __init__(self, group, order, local_ids, send_counts, recv_counts):
-        self.group = group
-        self.order = order
-        self.local_ids = local_ids
-        self.send_counts = send_counts
-        self.recv_counts = recv_counts
+    group: object
+    order: torch.Tensor
+    local_ids: torch.Tensor | None
+    send_counts: list[int]
+    recv_counts: list[int]
 
     def exchange(self, tensor, send_counts, recv_counts):
         if self.group is None:
@@ -45,21 +47,39 @@ class RowLookup:
             or self.boundaries[0] != 0
             or any(a > b for a, b in zip(self.boundaries, self.boundaries[1:]))
         ):
-            raise ValueError(
-                "Require monotone row boundaries matching process group size"
-            )
+            raise ValueError("Require monotone row boundaries matching process group size")
+
+    def _check(self, invalid, reference, message):
+        device = reference.device
+        if self.group is not None and device.type != 'cuda':
+            device = torch.device('cuda', torch.cuda.current_device())
+        flag = torch.tensor(int(invalid), device=device)
+        if self.group is not None:
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.group)
+        if flag.item():
+            raise ValueError(message)
+
+    def _schema(self, descriptor, device):
+        if self.group is not None:
+            low = torch.tensor(descriptor, device=device)
+            high = low.clone()
+            dist.all_reduce(low, op=dist.ReduceOp.MIN, group=self.group)
+            dist.all_reduce(high, op=dist.ReduceOp.MAX, group=self.group)
+            if not torch.equal(low, high):
+                raise ValueError('Lookup ranks disagree on row widths, dtype or trainability')
 
     def route(self, ids):
-        if ids.dtype != torch.int64:
-            raise ValueError("Row IDs must be int64")
-        if self.group is not None and ids.device.type != 'cuda':
-            raise ValueError("Distributed Engram lookup requires GPU-resident tensors")
+        self._check(
+            ids.dtype != torch.int64 or (self.group is not None and not ids.is_cuda),
+            ids,
+            'Row IDs must be int64 and distributed requests must be GPU-resident',
+        )
         flat = ids.reshape(-1)
-        invalid = ((flat < 0) | (flat >= self.boundaries[-1])).any().to(torch.int32)
-        if self.group is not None:
-            dist.all_reduce(invalid, op=dist.ReduceOp.MAX, group=self.group)
-        if invalid.item():
-            raise ValueError("Row ID outside logical table on a lookup group member")
+        self._check(
+            ((flat < 0) | (flat >= self.boundaries[-1])).any(),
+            ids,
+            'Row ID outside logical table on a lookup group member',
+        )
         cuts = torch.tensor(self.boundaries[1:-1], device=ids.device, dtype=torch.int64)
         owners = torch.bucketize(flat, cuts, right=True)
         order = torch.argsort(owners, stable=True)
@@ -76,57 +96,60 @@ class RowLookup:
         route.local_ids = routed - self.boundaries[self.rank]
         return route
 
-    def _validate_storage(self, values, scales, ids):
+    def _validate_rows(self, tensors, ids, valid_dtype, message):
         rows = self.boundaries[self.rank + 1] - self.boundaries[self.rank]
-        invalid = (
-            values.ndim != 2
-            or scales.ndim != 2
-            or values.shape[0] != rows
-            or scales.shape[0] != rows
-            or values.device != ids.device
-            or scales.device != ids.device
-            or values.element_size() != 1
-            or scales.element_size() != 1
-            or ids.dtype != torch.int64
+        invalid = any(
+            t.ndim != 2 or t.shape[0] != rows or t.device != ids.device or not valid_dtype(t)
+            for t in tensors
         )
-        if self.group is not None:
-            if ids.device.type != "cuda":
-                raise ValueError(
-                    "Distributed Engram lookup requires GPU-resident tensors"
-                )
-            flag = torch.tensor(int(invalid), device=ids.device)
-            dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.group)
-            invalid = bool(flag.item())
-        if invalid:
-            raise ValueError(
-                "Expected colocated resident byte-valued row and scale shards and int64 IDs"
-            )
+        self._check(
+            invalid or ids.dtype != torch.int64 or (self.group is not None and not ids.is_cuda),
+            ids,
+            message,
+        )
+
+    def _validate_storage(self, values, scales, ids):
+        self._validate_rows(
+            (values, scales),
+            ids,
+            lambda t: t.element_size() == 1,
+            'Expected colocated resident byte-valued row and scale shards and int64 IDs',
+        )
+
+    def gather_rows(self, values, ids):
+        """Gather floating parameter rows with symmetric validation and additive VJP."""
+        dtypes = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+        self._validate_rows(
+            (values,),
+            ids,
+            lambda t: t.dtype in dtypes,
+            'Expected colocated floating row shard and int64 IDs',
+        )
+        self._schema(
+            [values.shape[1], dtypes.index(values.dtype), int(values.requires_grad)], ids.device
+        )
+        route = self.route(ids)
+        return route.return_rows(values[route.local_ids]).reshape(*ids.shape, values.shape[1])
 
     def fetch(self, values, scales, ids, master=None):
         self._validate_storage(values, scales, ids)
-        if self.group is not None:
-            descriptor = torch.tensor(
-                [values.shape[1], scales.shape[1], int(master is not None)],
-                device=ids.device,
-            )
-            low, high = descriptor.clone(), descriptor.clone()
-            dist.all_reduce(low, op=dist.ReduceOp.MIN, group=self.group)
-            dist.all_reduce(high, op=dist.ReduceOp.MAX, group=self.group)
-            if not torch.equal(low, high):
-                raise ValueError("Lookup ranks disagree on row widths or trainability")
+        self._schema(
+            [
+                values.shape[1],
+                scales.shape[1],
+                int(master is not None),
+                int(master is not None and master.requires_grad),
+            ],
+            ids.device,
+        )
         if master is not None:
-            invalid = (
+            self._check(
                 master.shape != values.shape
                 or master.dtype != torch.float32
-                or master.device != values.device
+                or master.device != values.device,
+                ids,
+                'Require resident FP32 master matching local row shard',
             )
-            flag = torch.tensor(int(invalid), device=ids.device)
-            if self.group is not None:
-                dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.group)
-            if flag.item():
-                raise ValueError(
-                    "Require resident FP32 master matching local row shard"
-                )
         route = self.route(ids)
         raw = route.return_rows(values.view(torch.uint8)[route.local_ids])
         scale = route.return_rows(scales.view(torch.uint8)[route.local_ids])
@@ -135,14 +158,11 @@ class RowLookup:
         scale = scale.view(scales.dtype).reshape(*shape, scales.shape[1])
         floating = None
         if master is not None:
-            floating = route.return_rows(master[route.local_ids]).reshape(
-                *shape, values.shape[1]
-            )
+            floating = route.return_rows(master[route.local_ids]).reshape(*shape, values.shape[1])
         return raw, scale, floating
 
     def raw_rows(self, values, scales, ids):
-        raw, scale, _ = self.fetch(values, scales, ids)
-        return raw, scale
+        return self.fetch(values, scales, ids)[:2]
 
 
 class EngramTable(nn.Module):
@@ -207,9 +227,7 @@ class EngramTable(nn.Module):
             return
         from megatron.lite.primitive.quantization import block_fp8
 
-        weight, scale = block_fp8.quantize_block_fp8(
-            self.master, (1, 32), scale_format="e8m0"
-        )
+        weight, scale = block_fp8.quantize_block_fp8(self.master, (1, 32), scale_format="e8m0")
         self.weight.copy_(weight)
         self.scale.copy_(scale)
 
@@ -221,9 +239,7 @@ class ShardedEngramTable(EngramTable):
     outside lookup. All ranks in the row group must execute backward together.
     """
 
-    def __init__(
-        self, weight, scale, lookup, *, trainable=False, output_dtype=torch.bfloat16
-    ):
+    def __init__(self, weight, scale, lookup, *, trainable=False, output_dtype=torch.bfloat16):
         super().__init__(weight, scale, trainable=trainable, output_dtype=output_dtype)
         expected = lookup.boundaries[lookup.rank + 1] - lookup.boundaries[lookup.rank]
         if weight.shape[0] != expected:
@@ -319,9 +335,7 @@ class NgramHash(nn.Module):
             raise ValueError("Hash layout and multiplier shape mismatch")
         self.pad_id = int(mapping[pad_id])
         self.register_buffer("token_map", mapping, persistent=False)
-        self.register_buffer(
-            "multipliers", multipliers.to(torch.int64), persistent=False
-        )
+        self.register_buffer("multipliers", multipliers.to(torch.int64), persistent=False)
         self.register_buffer("primes", primes.to(torch.int64), persistent=False)
         flat = primes.flatten(1)
         self.register_buffer("offsets", flat.cumsum(-1) - flat, persistent=False)

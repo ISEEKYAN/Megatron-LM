@@ -6,8 +6,7 @@ callers retain autograd graphs and explicitly send cotangents in backward order.
 A rejected generation is acknowledged before payload transfer so both peers fail.
 """
 
-import math
-from dataclasses import dataclass
+from dataclasses import astuple, dataclass
 
 import torch
 import torch.distributed as dist
@@ -30,12 +29,7 @@ _MAGIC = 4101
 
 def send_tensor_payload(tensors, tag, *, peer, group, device):
     tensors, tag = tuple(tensors), tuple(tag)
-    if (
-        not tag
-        or len(tag) > 16
-        or any(type(v) is not int for v in tag)
-        or len(tensors) > 32
-    ):
+    if not tag or len(tag) > 16 or any(type(v) is not int for v in tag) or len(tensors) > 32:
         raise ValueError('Invalid tensor payload tag or field count')
     metadata = [_MAGIC, len(tag), len(tensors), *tag]
     device = torch.device(device)
@@ -46,12 +40,7 @@ def send_tensor_payload(tensors, tag, *, peer, group, device):
             if value.device != device or value.dtype not in _DTYPES or value.ndim > 8:
                 raise ValueError('Unsupported tensor payload device/dtype/dimensions')
             metadata.extend(
-                (
-                    _DTYPES.index(value.dtype),
-                    value.ndim,
-                    int(value.requires_grad),
-                    *value.shape,
-                )
+                (_DTYPES.index(value.dtype), value.ndim, int(value.requires_grad), *value.shape)
             )
     header = torch.tensor(metadata, dtype=torch.int64, device=device)
     size = torch.tensor([header.numel()], dtype=torch.int64, device=device)
@@ -109,11 +98,7 @@ def recv_tensor_payload(expected_tag, *, peer, group, device):
             raise ValueError('Unexpected tensor payload header tail')
     except (ValueError, IndexError) as exc:
         error = exc
-    dist.send(
-        torch.tensor(int(error is None), dtype=torch.int64, device=device),
-        peer,
-        group=group,
-    )
+    dist.send(torch.tensor(int(error is None), dtype=torch.int64, device=device), peer, group=group)
     if error is not None:
         raise RuntimeError('Rejected tensor payload generation or schema') from error
     result = []
@@ -122,15 +107,9 @@ def recv_tensor_payload(expected_tag, *, peer, group, device):
             result.append(None)
             continue
         dtype, shape, gradient = descriptor
-        length = math.prod(shape)
-        raw = torch.empty(
-            length * torch.empty((), dtype=dtype).element_size(),
-            dtype=torch.uint8,
-            device=device,
-        )
-        if length:
-            dist.recv(raw, peer, group=group)
-        value = raw.view(dtype).reshape(shape)
+        value = torch.empty(shape, dtype=dtype, device=device)
+        if value.numel():
+            dist.recv(value.reshape(-1).view(torch.uint8), peer, group=group)
         value.requires_grad_(gradient)
         result.append(value)
     return tuple(result)
@@ -152,24 +131,11 @@ class PipelineTag:
             raise ValueError('Invalid pipeline source owner')
 
     def as_tuple(self):
-        return (
-            self.step,
-            self.microbatch,
-            self.chunk,
-            self.generation,
-            self.kv_owner,
-            self.index_owner,
-        )
+        return astuple(self)
 
 
 class PipelineLedger:
-    """Keep each generation live through recompute and all consumer returns.
-
-    A return names a consumer explicitly and supplies every differentiable field
-    (zero for an unused path). Indexers/Top-K never enter autograd. Backward runs
-    once after the exact expected consumer set has returned; no optimizer is
-    registered here, so C4/F2 retain canonical parameter ownership.
-    """
+    """Retain graphs until every consumer returns all floating cotangents once."""
 
     def __init__(self):
         self._live = {}
@@ -207,10 +173,10 @@ class PipelineLedger:
             raise ValueError('Gradient fields differ from the floating owner paths')
         for name, tensor in fields.items():
             gradient = gradients[name]
-            if (
-                gradient.shape != tensor.shape
-                or gradient.dtype != tensor.dtype
-                or gradient.device != tensor.device
+            if (gradient.shape, gradient.dtype, gradient.device) != (
+                tensor.shape,
+                tensor.dtype,
+                tensor.device,
             ):
                 raise ValueError('Pipeline gradient shape/dtype/device differs')
         for name, gradient in gradients.items():
@@ -226,9 +192,7 @@ class PipelineLedger:
             raise RuntimeError('Cannot release pipeline state with missing returns')
         fields = payload.differentiable()
         if fields:
-            torch.autograd.backward(
-                tuple(fields.values()), tuple(total[name] for name in fields)
-            )
+            torch.autograd.backward(tuple(fields.values()), tuple(total[name] for name in fields))
         del self._live[tag]
 
     def assert_quiescent(self):
