@@ -1,5 +1,3 @@
-# Preserve the byte-exact upstream source used by the oracle's SHA256 checks.
-exclude: ^experimental/lite/tests/fixtures/deepseek_v41/reference/
 repos:
 - repo: local
   hooks:
