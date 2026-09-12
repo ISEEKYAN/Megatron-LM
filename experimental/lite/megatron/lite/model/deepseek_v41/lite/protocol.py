@@ -35,6 +35,7 @@ class ImplConfig:
     gate_temperature: float = 1.0
     bias_rate: float = 0.001
     enable_dspark_execution: bool = False
+    pipeline_recompute: bool = False
 
 
 def build_model_config(source, **overrides):
@@ -145,6 +146,8 @@ def build_model(model_cfg, *, impl_cfg):
                 p.register_post_accumulate_grad_hook(_publish_main_grad)
         model.residual_dtype = impl_cfg.dtype
         optimizer = V41Optimizer(model, impl_cfg.optimizer_config)
+    from .pipeline import PackedPipelineAdapter
+
     return ModelBundle(
         [model],
         ps,
@@ -154,6 +157,11 @@ def build_model(model_cfg, *, impl_cfg):
             'model_cfg': model_cfg,
             'optimizer_backend': 'none' if optimizer is None else 'v41',
             'parameter_bindings': model.parameter_bindings,
+            'pipeline_payload_adapter': (
+                PackedPipelineAdapter(model, ps, recompute=impl_cfg.pipeline_recompute)
+                if ps.pp_size > 1
+                else None
+            ),
         },
     )
 

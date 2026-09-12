@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
 
@@ -28,6 +27,7 @@ def forward_backward_pipelining(
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
     forward_only: bool = False,
+    payload_adapter=None,
 ) -> list[dict]:
     """
     Run forward and backward passes with pipeline parallelism.
@@ -57,6 +57,15 @@ def forward_backward_pipelining(
     Returns:
         List of output dicts from forward passes.
     """
+    if payload_adapter is not None:
+        return _payload_pipeline_schedule(
+            payload_adapter,
+            data_iter,
+            _num_microbatches_from_config(config, ps),
+            loss_fn=loss_fn,
+            forward_only=forward_only,
+        )
+
     if ps.pp_size <= 1:
         if forward_only:
             return _forward_only_no_pipeline(
@@ -127,6 +136,32 @@ def forward_backward_pipelining(
 # ══════════════════════════════════════════════════════════════════════
 # No pipeline (PP=1)
 # ══════════════════════════════════════════════════════════════════════
+def _payload_pipeline_schedule(adapter, data_iter, count, *, loss_fn, forward_only):
+    """Drain a model-owned typed carrier, retaining distinct microbatch graphs.
+
+    Model adapters own schemas, P2P and generation validation. This fill/drain
+    schedule forwards in input order and returns cotangents in reverse order;
+    it does not reinterpret paired state as a single hidden tensor.
+    """
+    outputs = []
+    adapter.begin(count, forward_only=forward_only)
+    for microbatch in range(count):
+        item = next(data_iter)
+        batch, context = split_loss_context(item)
+        with use_loss_context(context):
+            out = adapter.forward(batch, microbatch)
+            if out:
+                _apply_external_loss(out, item, loss_fn)
+        outputs.append(out)
+    if not forward_only:
+        for microbatch in reversed(range(count)):
+            out = outputs[microbatch]
+            loss = out.get('loss')
+            adapter.backward(microbatch, None if loss is None else loss / count)
+    adapter.finish()
+    return [_compact_pipeline_output(out) for out in outputs]
+
+
 def _num_microbatches_from_config(config, ps: ParallelState) -> int:
     explicit = getattr(config, "num_microbatches", None)
     if explicit is not None:
@@ -169,7 +204,9 @@ def _compact_pipeline_output(out: dict | None) -> dict:
         compact["model_output"] = out["model_output"]
     if "loss" in out and out["loss"] is not None:
         loss = out["loss"]
-        compact["loss"] = loss.detach().item() if isinstance(loss, torch.Tensor) else float(loss)
+        compact["loss"] = (
+            loss.detach().item() if isinstance(loss, torch.Tensor) else float(loss)
+        )
     if "_loss_fn_metrics" in out:
         compact["metrics"] = out["_loss_fn_metrics"]
     elif "metrics" in out:
@@ -208,7 +245,14 @@ def _no_pipeline(
 
 
 def _forward_only_no_pipeline(
-    forward_step_fn, model, data_iter, config, ps, *, pre_forward_hook=None, loss_fn=None
+    forward_step_fn,
+    model,
+    data_iter,
+    config,
+    ps,
+    *,
+    pre_forward_hook=None,
+    loss_fn=None,
 ):
     num_microbatches = _num_microbatches_from_config(config, ps)
     del ps
@@ -290,13 +334,7 @@ def _1f1b_schedule(
         # Megatron dynamic shape exchange: the recv buffer is sized from the shape
         # the sender transmits, so no per-mb shape has to be tracked here.
         return _send_recv_pipeline(
-            send_fwd,
-            send_bwd,
-            recv_fwd,
-            recv_bwd,
-            ps,
-            tensor_shape,
-            dynamic_shape=True,
+            send_fwd, send_bwd, recv_fwd, recv_bwd, ps, tensor_shape, dynamic_shape=True
         )
 
     # ── Warmup: pure forward passes ──
@@ -310,7 +348,9 @@ def _1f1b_schedule(
         current_input = fwd_input
         out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
-        loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
+        loss_s = (
+            out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
+        )
 
         # Recv the next forward input for every remaining warmup mb AND — on the
         # last warmup step — for the first STEADY mb (num_steady > 0). Middle
@@ -341,7 +381,9 @@ def _1f1b_schedule(
         mb_idx += 1
         out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
-        loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
+        loss_s = (
+            out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
+        )
 
         input_tensors.append(fwd_input if not ps.pp_is_first else None)
         output_hiddens.append(hidden)
@@ -431,10 +473,14 @@ def _communicate_shapes(
     """
     device = _pipeline_device()
     recv_fwd_t = (
-        torch.empty(_PIPELINE_SHAPE_NDIM, dtype=torch.int64, device=device) if recv_fwd else None
+        torch.empty(_PIPELINE_SHAPE_NDIM, dtype=torch.int64, device=device)
+        if recv_fwd
+        else None
     )
     recv_bwd_t = (
-        torch.empty(_PIPELINE_SHAPE_NDIM, dtype=torch.int64, device=device) if recv_bwd else None
+        torch.empty(_PIPELINE_SHAPE_NDIM, dtype=torch.int64, device=device)
+        if recv_bwd
+        else None
     )
     send_fwd_t = (
         torch.tensor(tuple(send_fwd.size()), dtype=torch.int64, device=device)
@@ -574,12 +620,18 @@ def _send_recv_pipeline(
         ops.append(dist.P2POp(dist.isend, t, ps.pp_next_rank, p2p_group))
     if recv_fwd:
         if dynamic_shape:
-            fwd_buf = torch.empty(recv_fwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
+            fwd_buf = torch.empty(
+                recv_fwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device()
+            )
         else:
             fwd_buf = (
                 fwd_recv_buf
                 if fwd_recv_buf is not None
-                else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
+                else torch.empty(
+                    tensor_shape,
+                    dtype=_PIPELINE_TENSOR_DTYPE,
+                    device=_pipeline_device(),
+                )
             )
         ops.append(dist.P2POp(dist.irecv, fwd_buf, ps.pp_prev_rank, p2p_group))
     if send_bwd is not None:
@@ -587,12 +639,18 @@ def _send_recv_pipeline(
         ops.append(dist.P2POp(dist.isend, t, ps.pp_prev_rank, p2p_group))
     if recv_bwd:
         if dynamic_shape:
-            bwd_buf = torch.empty(recv_bwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
+            bwd_buf = torch.empty(
+                recv_bwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device()
+            )
         else:
             bwd_buf = (
                 bwd_recv_buf
                 if bwd_recv_buf is not None
-                else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
+                else torch.empty(
+                    tensor_shape,
+                    dtype=_PIPELINE_TENSOR_DTYPE,
+                    device=_pipeline_device(),
+                )
             )
         ops.append(dist.P2POp(dist.irecv, bwd_buf, ps.pp_next_rank, p2p_group))
 
@@ -646,7 +704,9 @@ def _pipeline_stage_barrier(ps: ParallelState) -> None:
         dist.barrier(group=ps.pp_cpu_group)
 
 
-def _set_virtual_pipeline_rank(ps: ParallelState, chunk_id: int | None, num_chunks: int) -> None:
+def _set_virtual_pipeline_rank(
+    ps: ParallelState, chunk_id: int | None, num_chunks: int
+) -> None:
     if chunk_id is None or num_chunks <= 1:
         ps.virtual_pipeline_size = None
         ps.virtual_pipeline_rank = None
@@ -748,7 +808,9 @@ def _forward_only_pipeline_schedule(
                 if recv_next:
                     pending_activation = fwd_buf
 
-        outputs.append(_compact_pipeline_output(last_output) if last_output is not None else {})
+        outputs.append(
+            _compact_pipeline_output(last_output) if last_output is not None else {}
+        )
 
     _set_virtual_pipeline_rank(ps, None, num_chunks)
     return outputs
@@ -795,7 +857,8 @@ def _interleaved_1f1b_schedule(
         batch = next(data_iter)
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
         saved: dict[
-            int, tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, dict]
+            int,
+            tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, dict],
         ] = {}
         pending_activation: torch.Tensor | None = None
 
@@ -814,7 +877,9 @@ def _interleaved_1f1b_schedule(
                 activation = None if is_first_stage else pending_activation
                 pending_activation = None
                 if _dbg:
-                    activation_shape = None if activation is None else tuple(activation.shape)
+                    activation_shape = (
+                        None if activation is None else tuple(activation.shape)
+                    )
                     print(
                         f"[VPP r{rank}] mb={mb_id} fwd stage={stage_id} "
                         f"chunk={chunk_id} activation_shape={activation_shape}",
@@ -840,7 +905,11 @@ def _interleaved_1f1b_schedule(
                         f"chunk={chunk_id} hidden_shape={hidden_shape}",
                         flush=True,
                     )
-                loss = out["loss"] / num_microbatches if is_last_stage and "loss" in out else None
+                loss = (
+                    out["loss"] / num_microbatches
+                    if is_last_stage and "loss" in out
+                    else None
+                )
                 saved[stage_id] = (activation, hidden, loss, out)
 
                 if is_last_stage:
