@@ -7,14 +7,30 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("groups,bias", [(1, False), (2, False), (2, True)])
 def test_sigmoid_aux_gradient_matches_unrestricted_reference(
-    transformer_engine_import_stub, monkeypatch, groups, bias
+    transformer_engine_import_stub, monkeypatch, groups, bias, fused
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
     from megatron.lite.primitive.modules.router import SigmoidTopKRouter
+    from megatron.lite.primitive.utils import moe as moe_utils
 
+    # Exercise the real fused dispatch/aux branches on CPU, replacing only
+    # their TE entrypoints. This is wiring coverage, not CUDA kernel validation.
+    fused_calls = []
+
+    def fused_topk(**kwargs):
+        fused_calls.append("dispatch")
+        return moe_utils.topk_routing_with_score_function(**kwargs, fused=False)
+
+    def fused_aux(**kwargs):
+        fused_calls.append("aux")
+        return moe_utils.compute_routing_scores_for_aux_loss(**kwargs, fused=False)
+
+    monkeypatch.setattr(moe_utils, "fused_topk_with_score_function", fused_topk)
+    monkeypatch.setattr(moe_utils, "fused_compute_score_for_moe_aux_loss", fused_aux)
     monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
     config = SimpleNamespace(
         hidden_size=4,
@@ -25,13 +41,16 @@ def test_sigmoid_aux_gradient_matches_unrestricted_reference(
         n_group=groups,
         topk_group=1,
     )
-    router = SigmoidTopKRouter(config, SimpleNamespace(tp_size=1))
+    router = SigmoidTopKRouter(
+        config, SimpleNamespace(tp_size=1), moe_router_fusion=fused
+    )
     with torch.no_grad():
         router.gate.weight.copy_(torch.eye(4))
         if bias:
             router.expert_bias.copy_(torch.tensor([0.0, 0.0, 2.0, 2.0]))
     x = torch.tensor([[3.0, -2.0, 2.0, 1.0], [4.0, -3.0, 1.5, 0.5]], requires_grad=True)
     scores, indices = router(x)
+    assert fused_calls == (["dispatch", "aux"] if fused else [])
     # Zero task gradient isolates the actual autoscaler-attached aux gradient.
     (scores.sum() * 0).backward()
 
