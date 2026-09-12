@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from enum import Enum
 
 import torch
@@ -202,6 +203,166 @@ class RouterReplay:
             RouterReplay.replay_rows_changed += int((selected != native).sum().item())
 
 
+class PackedRouterReplay:
+    """Bind one packed invocation to its routes before visiting logical samples.
+
+    This adapter does not execute a model or choose a CP layout. Its offsets
+    refer to the router-local token buffer, after protocol packing/CP/TP slicing.
+    A recomputed *whole* packed invocation consumes one legacy FIFO entry per
+    router, not one entry per sample. Checkpoints inside a sample should use
+    ``router_replay_checkpoint_contexts`` to bind their own immutable targets.
+    """
+
+    def __init__(self, total_tokens):
+        self.total_tokens = total_tokens
+        self.entries = []
+        self.next_begin = 0
+        for replay in RouterReplay.global_router_replay_instances:
+            action = replay.router_replay_action
+            target, mask = replay.target_topk_idx, replay.target_replay_mask
+            if action == RouterReplayAction.REPLAY_BACKWARD:
+                if not replay.replay_backward_list:
+                    raise RuntimeError('Packed replay backward target queue is empty')
+                target = replay.replay_backward_list.pop(0)
+                mask = replay.replay_backward_mask_list.pop(0)
+            if action in (
+                RouterReplayAction.REPLAY_FORWARD,
+                RouterReplayAction.REPLAY_BACKWARD,
+            ):
+                if target is None or target.shape[0] != total_tokens:
+                    raise ValueError(
+                        'Packed replay target must match the local token buffer'
+                    )
+                if mask is not None and mask.numel() != total_tokens:
+                    raise ValueError(
+                        'Packed replay mask must match the local token buffer'
+                    )
+            self.entries.append((replay, action, target, mask, []))
+
+    @contextmanager
+    def sequence(self, begin, end):
+        if begin != self.next_begin or not begin < end <= self.total_tokens:
+            raise ValueError(
+                'Packed replay ranges must partition the token buffer in order'
+            )
+        saved = []
+        try:
+            for replay, action, target, mask, records in self.entries:
+                saved.append(
+                    (
+                        replay,
+                        replay.router_replay_action,
+                        replay.target_topk_idx,
+                        replay.target_replay_mask,
+                    )
+                )
+                if action == RouterReplayAction.RECORD:
+                    replay.recorded_topk_idx = None
+                elif action in (
+                    RouterReplayAction.REPLAY_FORWARD,
+                    RouterReplayAction.REPLAY_BACKWARD,
+                ):
+                    replay.router_replay_action = RouterReplayAction.REPLAY_FORWARD
+                    replay.target_topk_idx = target[begin:end]
+                    replay.target_replay_mask = (
+                        None if mask is None else mask[begin:end]
+                    )
+            yield
+            for replay, action, target, mask, records in self.entries:
+                if action == RouterReplayAction.RECORD:
+                    result = replay.recorded_topk_idx
+                    if result is None or result.shape[0] != end - begin:
+                        raise RuntimeError(
+                            'Packed record did not visit every local router/token'
+                        )
+                    records.append(result.detach().clone())
+            self.next_begin = end
+        finally:
+            for replay, action, target, mask in saved:
+                replay.router_replay_action = action
+                replay.target_topk_idx = target
+                replay.target_replay_mask = mask
+
+    def finish(self):
+        if self.next_begin != self.total_tokens:
+            raise RuntimeError('Packed replay token partition is incomplete')
+        for replay, action, target, mask, records in self.entries:
+            if action == RouterReplayAction.RECORD:
+                replay.recorded_topk_idx = torch.cat(records, dim=0)
+
+
+def router_replay_checkpoint_contexts(model=None):
+    """Context factory for ``checkpoint(..., use_reentrant=False, context_fn=...)``.
+
+    Capture at the checkpoint's forward, inside the packed sample scope. Later
+    recomputation may run in reverse segment order after newer microbatches;
+    it must not read mutable global targets or consume a pipeline FIFO entry.
+    No model payload, parameter, or checkpoint storage contract is changed.
+    """
+    entries = []
+    instances = (
+        RouterReplay.global_router_replay_instances
+        if model is None
+        else [
+            module.router_replay
+            for module in model.modules()
+            if getattr(module, 'router_replay', None) is not None
+        ]
+    )
+    for replay in instances:
+        action = replay.router_replay_action
+        if action == RouterReplayAction.REPLAY_BACKWARD:
+            raise RuntimeError(
+                'Create checkpoint replay contexts during forward, not backward'
+            )
+        target = replay.target_topk_idx
+        mask = replay.target_replay_mask
+        entries.append(
+            [
+                replay,
+                action,
+                None if target is None else target.detach().clone(),
+                None if mask is None else mask.detach().clone(),
+            ]
+        )
+
+    @contextmanager
+    def forward():
+        yield
+        for entry in entries:
+            replay, action, _, _ = entry
+            if action == RouterReplayAction.RECORD:
+                if replay.recorded_topk_idx is None:
+                    raise RuntimeError('Checkpoint record did not visit its router')
+                entry[2] = replay.recorded_topk_idx.detach().clone()
+                entry[3] = None
+
+    @contextmanager
+    def recompute():
+        saved = []
+        try:
+            for replay, action, target, mask in entries:
+                saved.append(
+                    (
+                        replay,
+                        replay.router_replay_action,
+                        replay.target_topk_idx,
+                        replay.target_replay_mask,
+                    )
+                )
+                replay.router_replay_action = (
+                    RouterReplayAction.REPLAY_FORWARD if action is not None else None
+                )
+                replay.target_topk_idx, replay.target_replay_mask = target, mask
+            yield
+        finally:
+            for replay, action, target, mask in saved:
+                replay.router_replay_action = action
+                replay.target_topk_idx, replay.target_replay_mask = target, mask
+
+    return forward(), recompute()
+
+
 def attach_router_replay(model: nn.Module, *, reset: bool = True) -> int:
     if reset:
         RouterReplay.clear_global_router_replay_instances()
@@ -255,6 +416,8 @@ def gather_replayed_router_scores(
 
 
 __all__ = [
+    "PackedRouterReplay",
+    "router_replay_checkpoint_contexts",
     "RouterReplay",
     "RouterReplayAction",
     "attach_router_replay",
