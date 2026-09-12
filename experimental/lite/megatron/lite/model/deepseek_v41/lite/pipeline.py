@@ -203,3 +203,172 @@ class PipelineLedger:
             for identity, generation in self._latest.items()
             if identity[0] > step
         }
+
+
+class PackedPipelineAdapter:
+    """Sequence-preserving paired transport for the common PP scheduler.
+
+    Each packed sequence has its own ledger and wire tag; no sequence dimension
+    is flattened into another sample's CSA2 state. Frozen source index keys and
+    candidates are read-only shadows. Only floating owner paths return gradients.
+    """
+
+    def __init__(self, model, parallel_state, *, recompute=False):
+        self.model, self.ps = model, parallel_state
+        self.recompute = recompute
+        self.step = 0
+        self._active = False
+        self._records = {}
+        self._ledgers = {}
+
+    def begin(self, count, *, forward_only=False):
+        if self._active or self._records:
+            raise RuntimeError('Pipeline step is still live')
+        if count < 1:
+            raise ValueError('Require at least one pipeline microbatch')
+        self._active = True
+        self._count = count
+        self._forward_only = forward_only
+
+    @staticmethod
+    def owners(boundary):
+        layer = boundary - 1
+        if layer < 2:
+            return (-1, -1)
+        kv = 20 if layer >= 20 else 14 if layer >= 14 else 8 if layer >= 8 else 2
+        index = 20 + ((layer - 20) // 4) * 4 if layer >= 20 else kv
+        return kv, index
+
+    def _tag(self, boundary, microbatch):
+        return PipelineTag(self.step, microbatch, boundary, 0, *self.owners(boundary))
+
+    def _transfer(self, tensors, boundary, microbatch, sequence, phase, *, send):
+        from megatron.lite.primitive.parallel import tensor_payload
+
+        tag = (*self._tag(boundary, microbatch).as_tuple(), sequence, phase)
+        forward = phase != 1
+        peer = self.ps.pp_next_rank if send == forward else self.ps.pp_prev_rank
+        kwargs = dict(
+            peer=peer,
+            group=self.ps.pp_group,
+            device=next(self.model.parameters()).device,
+        )
+        if send:
+            return tensor_payload.send_tensor_payload(tensors, tag, **kwargs)
+        return tensor_payload.recv_tensor_payload(tag, **kwargs)
+
+    def forward(self, batch, microbatch):
+        from .protocol import packed_pipeline_forward_step
+
+        if (
+            not self._active
+            or microbatch in self._records
+            or not 0 <= microbatch < self._count
+        ):
+            raise RuntimeError('Unknown or duplicate pipeline microbatch')
+        start, end = self.model.local_layer_range
+        state = None
+        if self.ps.pp_rank:
+            (lengths,) = self._transfer(None, start, microbatch, 0, 2, send=False)
+            if not torch.equal(lengths, batch.seq_lens):
+                raise ValueError(
+                    'Packed pipeline sequence boundaries differ across stages'
+                )
+            state = tuple(
+                (
+                    PairedPayload.from_tensors(
+                        self._transfer(None, start, microbatch, sequence, 0, send=False)
+                    ),
+                    self.owners(start),
+                )
+                for sequence in range(len(batch.seq_lens))
+            )
+
+        def run():
+            return packed_pipeline_forward_step(
+                self.model, batch, start=start, end=end, state=state
+            )
+
+        if self._forward_only:
+            with torch.no_grad():
+                out = run()
+        elif self.recompute:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(run, use_reentrant=False, preserve_rng_state=True)
+        else:
+            out = run()
+        outputs = out['packed_pipeline_state']
+        self._records[microbatch] = (state, len(outputs))
+        if self.ps.pp_rank < self.ps.pp_size - 1:
+            self._transfer((batch.seq_lens,), end, microbatch, 0, 2, send=True)
+            for sequence, (payload, owners) in enumerate(outputs):
+                if owners != self.owners(end):
+                    raise ValueError('Pipeline range changed canonical source owners')
+                if not self._forward_only:
+                    ledger = self._ledgers.setdefault(sequence, PipelineLedger())
+                    ledger.publish(
+                        self._tag(end, microbatch),
+                        payload,
+                        consumers=(self.ps.pp_next_rank,),
+                    )
+                self._transfer(
+                    payload.tensors(), end, microbatch, sequence, 0, send=True
+                )
+        # Graph ownership is retained by ledger or by final-stage loss, not metrics.
+        return {
+            key: value for key, value in out.items() if key != 'packed_pipeline_state'
+        }
+
+    def backward(self, microbatch, loss):
+        if not self._active or self._forward_only or microbatch not in self._records:
+            raise RuntimeError('Unknown, stale or released pipeline microbatch')
+        state, sequences = self._records[microbatch]
+        start, end = self.model.local_layer_range
+        if self.ps.pp_rank == self.ps.pp_size - 1:
+            if loss is None:
+                raise ValueError('Final pipeline stage requires a scalar loss')
+            loss.backward()
+        else:
+            for sequence in range(sequences):
+                values = self._transfer(None, end, microbatch, sequence, 1, send=False)
+                ledger = self._ledgers[sequence]
+                tag = self._tag(end, microbatch)
+                ledger.return_gradients(
+                    tag,
+                    self.ps.pp_next_rank,
+                    {
+                        name: value
+                        for name, value in zip(PAYLOAD_FIELDS, values)
+                        if value is not None
+                    },
+                )
+                ledger.backward(tag)
+        if state is not None:
+            for sequence, (payload, _) in enumerate(state):
+                gradients = {
+                    name: torch.zeros_like(value) if value.grad is None else value.grad
+                    for name, value in payload.differentiable().items()
+                }
+                self._transfer(
+                    tuple(gradients.get(name) for name in PAYLOAD_FIELDS),
+                    start,
+                    microbatch,
+                    sequence,
+                    1,
+                    send=True,
+                )
+        del self._records[microbatch]
+
+    def finish(self):
+        if not self._active:
+            raise RuntimeError('No active pipeline step')
+        if self._forward_only:
+            self._records.clear()
+        if self._records:
+            raise RuntimeError('Pipeline microbatches are still live')
+        for ledger in self._ledgers.values():
+            ledger.assert_quiescent()
+            ledger.finish_step(self.step)
+        self._active = False
+        self.step += 1

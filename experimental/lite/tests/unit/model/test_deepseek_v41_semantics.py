@@ -862,6 +862,37 @@ def test_v41_pipeline_constructor_allocates_only_local_owners(moe, monkeypatch):
     assert assigned == expected, 'PP local owners do not cover the monolithic model'
 
 
+def test_v41_pipeline_rejects_range_outside_local_stage(moe):
+    from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
+
+    stage = DeepseekV41Model(
+        _assembly_config(),
+        token_map=list(range(256)),
+        quantized=False,
+        layer_range=(0, 20),
+    )
+    with pytest.raises(
+        ValueError, match='^Requested range is outside this pipeline stage$'
+    ):
+        stage.forward_pipeline_range(torch.tensor([[3, 4]]), start=0, end=21)
+
+
+def test_v41_pipeline_rejects_output_on_nonfinal_stage(moe):
+    from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
+
+    stage = DeepseekV41Model(
+        _assembly_config(),
+        token_map=list(range(256)),
+        quantized=False,
+        layer_range=(0, 20),
+    )
+    payload, _ = stage.forward_pipeline_range(torch.tensor([[3, 4]]), start=0, end=20)
+    with pytest.raises(
+        RuntimeError, match='^Only the final pipeline stage owns the output head$'
+    ):
+        stage.finish_pipeline(payload)
+
+
 def test_v41_packed_pipeline_matches_monolithic(moe):
     from megatron.lite.runtime.contracts import PackedBatch
 
@@ -908,7 +939,7 @@ def test_v41_packed_pipeline_matches_monolithic(moe):
             )
 
 
-def _real_model_worker(rank, rendezvous):
+def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False):
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -948,10 +979,14 @@ def _real_model_worker(rank, rendezvous):
     bindings = [b for b in model.parameter_bindings() if id(b.tensor) in owned_ids]
     assert {id(b.tensor) for b in bindings} == owned_ids
     params = [b.tensor for b in bindings if b.tensor.requires_grad]
-    inputs = [torch.arange(3 + mb, 11 + mb, device=device)[None] for mb in range(2)]
+    lengths = ((5, 8, 3), (4, 7)) if scheduled else ((8,), (8,))
+    inputs = [
+        torch.arange(3 + mb, 3 + mb + sum(ns), device=device)[None]
+        for mb, ns in enumerate(lengths)
+    ]
     batches = [
-        PackedBatch(ids[0], None, torch.tensor([ids.numel()], device=device))
-        for ids in inputs
+        PackedBatch(ids[0], None, torch.tensor(ns, device=device))
+        for ids, ns in zip(inputs, lengths)
     ]
     reference_logits = []
     for mb, ids in enumerate(inputs):
@@ -960,7 +995,7 @@ def _real_model_worker(rank, rendezvous):
         coefficients = torch.linspace(
             -0.5, 1.0, logits.numel(), device=device
         ).reshape_as(logits)
-        (logits * coefficients * (mb + 1)).sum().backward()
+        ((logits * coefficients * (mb + 1)).sum() / (2 if scheduled else 1)).backward()
     reference_grads = {
         binding.release_key: (
             None
@@ -1007,6 +1042,7 @@ def _real_model_worker(rank, rendezvous):
             quantized=False,
             token_map=list(range(256)),
             parallel=ParallelConfig(pp=4),
+            pipeline_recompute=recompute,
         ),
     )
     model = bundle.chunks[0]
@@ -1051,81 +1087,125 @@ def _real_model_worker(rank, rendezvous):
             errors.append(label + ': ' + str(exc))
 
     try:
-        for mb, ids in enumerate(inputs):
-            payload = None
-            if rank:
-                payload = pipeline.PairedPayload.from_tensors(
-                    transport.recv_tensor_payload(
-                        (*tag_at(start, mb).as_tuple(), 0),
+        if scheduled:
+            from types import SimpleNamespace
+
+            from megatron.lite.primitive.parallel.pipeline import (
+                forward_backward_pipelining,
+            )
+
+            adapter = bundle.extras['pipeline_payload_adapter']
+            seen = []
+
+            def objective(out, batch):
+                mb = next(
+                    i for i, candidate in enumerate(batches) if candidate is batch
+                )
+                logits = out['logits']
+                compare(logits, reference_logits[mb], 'packed scheduled logits')
+                seen.append(mb)
+                coefficients = torch.linspace(
+                    -0.5, 1.0, logits.numel(), device=device
+                ).reshape_as(logits)
+                return (logits * coefficients * (mb + 1)).sum(), {}
+
+            forward_backward_pipelining(
+                bundle.forward_step,
+                [model],
+                iter(batches),
+                SimpleNamespace(num_microbatches=2),
+                bundle.parallel_state,
+                loss_fn=objective,
+                payload_adapter=adapter,
+            )
+            assert seen == ([0, 1] if rank == 3 else [])
+            assert adapter.step == 1 and not adapter._records
+            with pytest.raises(RuntimeError, match='stale'):
+                adapter.backward(0, None)
+        else:
+            for mb, ids in enumerate(inputs):
+                payload = None
+                if rank:
+                    payload = pipeline.PairedPayload.from_tensors(
+                        transport.recv_tensor_payload(
+                            (*tag_at(start, mb).as_tuple(), 0),
+                            peer=rank - 1,
+                            group=group,
+                            device=device,
+                        )
+                    )
+                incoming.append(payload)
+                stage_result = protocol.pipeline_forward_step(
+                    model,
+                    batches[mb],
+                    start=start,
+                    end=end,
+                    payload=payload,
+                    owners=owners_at(start),
+                )
+                output, owners = (
+                    stage_result['pipeline_payload'],
+                    stage_result['pipeline_owners'],
+                )
+                stage_results.append(stage_result)
+                assert owners == owners_at(
+                    end
+                ), 'Real C4 range changed the canonical owner'
+                outputs.append(output)
+                if rank < 3:
+                    ledger.publish(tag_at(end, mb), output, consumers=(rank + 1,))
+                    transport.send_tensor_payload(
+                        output.tensors(),
+                        (*tag_at(end, mb).as_tuple(), 0),
+                        peer=rank + 1,
+                        group=group,
+                        device=device,
+                    )
+                else:
+                    compare(
+                        stage_result['logits'], reference_logits[mb], 'real C4 logits'
+                    )
+            for mb in reversed(range(2)):
+                if rank == 3:
+                    logits = stage_results[mb]['logits']
+                    coefficients = torch.linspace(
+                        -0.5, 1.0, logits.numel(), device=device
+                    ).reshape_as(logits)
+                    (logits * coefficients * (mb + 1)).sum().backward()
+                else:
+                    returned = transport.recv_tensor_payload(
+                        (*tag_at(end, mb).as_tuple(), 1),
+                        peer=rank + 1,
+                        group=group,
+                        device=device,
+                    )
+                    ledger.return_gradients(
+                        tag_at(end, mb),
+                        rank + 1,
+                        {
+                            name: value
+                            for name, value in zip(pipeline.PAYLOAD_FIELDS, returned)
+                            if value is not None
+                        },
+                    )
+                    ledger.backward(tag_at(end, mb))
+                if rank:
+                    fields = incoming[mb].differentiable()
+                    returned = {
+                        name: (
+                            torch.zeros_like(value)
+                            if value.grad is None
+                            else value.grad
+                        )
+                        for name, value in fields.items()
+                    }
+                    transport.send_tensor_payload(
+                        tuple(returned.get(name) for name in pipeline.PAYLOAD_FIELDS),
+                        (*tag_at(start, mb).as_tuple(), 1),
                         peer=rank - 1,
                         group=group,
                         device=device,
                     )
-                )
-            incoming.append(payload)
-            stage_result = protocol.pipeline_forward_step(
-                model,
-                batches[mb],
-                start=start,
-                end=end,
-                payload=payload,
-                owners=owners_at(start),
-            )
-            output, owners = (
-                stage_result['pipeline_payload'],
-                stage_result['pipeline_owners'],
-            )
-            stage_results.append(stage_result)
-            assert owners == owners_at(end), 'Real C4 range changed the canonical owner'
-            outputs.append(output)
-            if rank < 3:
-                ledger.publish(tag_at(end, mb), output, consumers=(rank + 1,))
-                transport.send_tensor_payload(
-                    output.tensors(),
-                    (*tag_at(end, mb).as_tuple(), 0),
-                    peer=rank + 1,
-                    group=group,
-                    device=device,
-                )
-            else:
-                compare(stage_result['logits'], reference_logits[mb], 'real C4 logits')
-        for mb in reversed(range(2)):
-            if rank == 3:
-                logits = stage_results[mb]['logits']
-                coefficients = torch.linspace(
-                    -0.5, 1.0, logits.numel(), device=device
-                ).reshape_as(logits)
-                (logits * coefficients * (mb + 1)).sum().backward()
-            else:
-                returned = transport.recv_tensor_payload(
-                    (*tag_at(end, mb).as_tuple(), 1),
-                    peer=rank + 1,
-                    group=group,
-                    device=device,
-                )
-                ledger.return_gradients(
-                    tag_at(end, mb),
-                    rank + 1,
-                    {
-                        name: value
-                        for name, value in zip(pipeline.PAYLOAD_FIELDS, returned)
-                        if value is not None
-                    },
-                )
-                ledger.backward(tag_at(end, mb))
-            if rank:
-                fields = incoming[mb].differentiable()
-                returned = {
-                    name: torch.zeros_like(value) if value.grad is None else value.grad
-                    for name, value in fields.items()
-                }
-                transport.send_tensor_payload(
-                    tuple(returned.get(name) for name in pipeline.PAYLOAD_FIELDS),
-                    (*tag_at(start, mb).as_tuple(), 1),
-                    peer=rank - 1,
-                    group=group,
-                    device=device,
-                )
         ledger.assert_quiescent()
         for binding in bindings:
             p = binding.tensor
@@ -2713,3 +2793,72 @@ def test_v41_g1_stage_export_boundary(moe):
         stage = DeepseekV41Model(_assembly_config(), layer_range=(0, 20))
     with pytest.raises(NotImplementedError, match='distributed checkpoint assembly'):
         next(export_model(stage))
+
+
+@pytest.mark.gpus(4)
+@pytest.mark.parametrize('recompute', [False, True])
+def test_real_packed_pipeline_scheduler_forward_backward_update(tmp_path, recompute):
+    import os
+
+    import torch.multiprocessing as mp
+
+    assert os.getenv('SLURM_JOB_ID'), 'Packed pipeline validation requires Slurm'
+    if torch.cuda.device_count() < 4:
+        pytest.skip('Requires the declared four-GPU allocation')
+    mp.spawn(
+        _real_model_worker,
+        args=(f'file://{tmp_path}/packed-scheduler', True, recompute),
+        nprocs=4,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize('recompute', [False, True])
+def test_packed_pipeline_scheduler_local_gradients_and_lifetime(moe, recompute):
+    from types import SimpleNamespace
+
+    from megatron.lite.model.deepseek_v41.lite.pipeline import PackedPipelineAdapter
+    from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    _, bundle = _assembly_bundle()
+    model = bundle.chunks[0]
+    batches = [
+        PackedBatch(torch.arange(3, 3 + sum(ns)), None, torch.tensor(ns))
+        for ns in ((5, 8, 3), (4, 7))
+    ]
+    expected = [bundle.forward_step(model, batch)['logits'] for batch in batches]
+    sum(logits.float().square().sum() / 2 for logits in expected).backward()
+    gradients = {
+        name: None if p.grad is None else p.grad.clone()
+        for name, p in model.named_parameters()
+    }
+    model.zero_grad(set_to_none=True)
+    adapter = PackedPipelineAdapter(model, bundle.parallel_state, recompute=recompute)
+    seen = []
+
+    def objective(out, batch):
+        index = next(i for i, candidate in enumerate(batches) if candidate is batch)
+        torch.testing.assert_close(out['logits'], expected[index], atol=0, rtol=0)
+        seen.append(index)
+        return out['logits'].float().square().sum(), {}
+
+    forward_backward_pipelining(
+        bundle.forward_step,
+        [model],
+        iter(batches),
+        SimpleNamespace(num_microbatches=2),
+        bundle.parallel_state,
+        loss_fn=objective,
+        payload_adapter=adapter,
+    )
+    assert seen == [0, 1] and adapter.step == 1
+    for name, p in model.named_parameters():
+        if gradients[name] is None:
+            assert p.grad is None
+        else:
+            torch.testing.assert_close(p.grad, gradients[name], atol=1e-5, rtol=1e-5)
+    with pytest.raises(RuntimeError, match='stale'):
+        adapter.backward(0, None)
+    with pytest.raises(RuntimeError, match='active'):
+        adapter.finish()
