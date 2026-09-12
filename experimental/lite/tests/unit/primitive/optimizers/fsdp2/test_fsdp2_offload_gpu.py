@@ -132,8 +132,11 @@ def _single_node_cuda_dist():
     if not dist.is_initialized():
         job_id = os.environ.get("SLURM_JOB_ID", os.getpid())
         rdzv = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"rdzv-{job_id}-offload")
-        dist.init_process_group(backend="nccl", init_method=f"file://{rdzv}",
-                                rank=int(os.environ["RANK"]), world_size=int(os.environ["WORLD_SIZE"]))
+        method = f"file://{rdzv}" if "SLURM_JOB_ID" in os.environ else "env://"
+        dist.init_process_group(
+            backend="nccl", init_method=method,
+            rank=int(os.environ["RANK"]), world_size=int(os.environ["WORLD_SIZE"]),
+        )
         created_pg = True
     yield
     if created_pg and dist.is_initialized():
