@@ -939,7 +939,9 @@ def test_v41_packed_pipeline_matches_monolithic(moe):
             )
 
 
-def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False, mixed=False):
+def _real_model_worker(
+    rank, rendezvous, scheduled=False, recompute=False, mixed=False, context_parallel=1
+):
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -962,6 +964,12 @@ def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False, mixed
         if mixed
         else {}
     )
+    if context_parallel > 1:
+        torch.set_float32_matmul_precision('highest')
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    stage_rank = rank // context_parallel
+    stages = 4 // context_parallel
     torch.manual_seed(1729)
     # Compute an independent monolithic reference, retain only this rank's
     # weights/gradients, then discard the full model before PP construction.
@@ -977,15 +985,15 @@ def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False, mixed
     )
     model = bundle.chunks[0]
     reference_parameter_count = sum(p.numel() for p in model.parameters())
-    boundaries = (0, 10, 20, 30, 40)
-    start, end = boundaries[rank : rank + 2]
+    boundaries = tuple(range(0, 41, 40 // stages))
+    start, end = boundaries[stage_rank : stage_rank + 2]
     owned_modules = list(model.layers[start:end])
-    if rank == 0:
+    if stage_rank == 0:
         owned_modules.extend((model.embed, model.vision, model.aligner))
-    if rank == 3:
+    if stage_rank == stages - 1:
         owned_modules.extend((model.norm, model.head))
     owned_ids = {id(p) for module in owned_modules for p in module.parameters()}
-    if rank == 0:
+    if stage_rank == 0:
         owned_ids.update(
             id(getattr(model, key))
             for key in ('image_start', 'image_end', 'image_newline')
@@ -1070,7 +1078,7 @@ def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False, mixed
             dtype=torch.float32,
             quantized=False,
             token_map=list(range(256)),
-            parallel=ParallelConfig(pp=4),
+            parallel=ParallelConfig(pp=stages, cp=context_parallel),
             pipeline_recompute=recompute,
         ),
     )
@@ -1091,7 +1099,10 @@ def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False, mixed
     owned_ids = {id(p) for p in model.parameters()}
     assert {id(binding.tensor) for binding in bindings} == owned_ids
     params = [binding.tensor for binding in bindings if binding.tensor.requires_grad]
-    assert bundle.parallel_state.pp_rank == rank and bundle.parallel_state.pp_size == 4
+    assert (
+        bundle.parallel_state.pp_rank == stage_rank
+        and bundle.parallel_state.pp_size == stages
+    )
     group = bundle.parallel_state.pp_group
     ledger = pipeline.PipelineLedger()
     incoming, outputs, errors = [], [], []
@@ -1147,7 +1158,7 @@ def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False, mixed
                 loss_fn=objective,
                 payload_adapter=adapter,
             )
-            assert seen == ([0, 1] if rank == 3 else [])
+            assert seen == ([0, 1] if stage_rank == stages - 1 else [])
             assert adapter.step == 1 and not adapter._records
             with pytest.raises(RuntimeError, match='stale'):
                 adapter.backward(0, None)
@@ -1236,6 +1247,7 @@ def _real_model_worker(rank, rendezvous, scheduled=False, recompute=False, mixed
                         device=device,
                     )
         ledger.assert_quiescent()
+        bundle.finalize_grads()
         for binding in bindings:
             p = binding.tensor
             if not p.requires_grad:
@@ -3123,4 +3135,21 @@ def test_real_contiguous_context_packed_forward_backward_update(tmp_path):
         pytest.skip('Requires the declared two-GPU allocation')
     mp.spawn(
         _context_model_worker, args=(f'file://{tmp_path}/context',), nprocs=2, join=True
+    )
+
+
+@pytest.mark.gpus(4)
+def test_real_packed_pp_cp_mixed_recompute_and_atomic_skip(tmp_path):
+    import os
+
+    import torch.multiprocessing as mp
+
+    assert os.getenv('SLURM_JOB_ID'), 'PP+CP validation requires Slurm'
+    if torch.cuda.device_count() < 4:
+        pytest.skip('Requires the declared four-GPU allocation')
+    mp.spawn(
+        _real_model_worker,
+        args=(f'file://{tmp_path}/pp-cp', True, True, True, 2),
+        nprocs=4,
+        join=True,
     )

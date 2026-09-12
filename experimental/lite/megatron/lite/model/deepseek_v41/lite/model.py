@@ -500,7 +500,7 @@ class DeepseekV41Model(nn.Module):
         return hidden, pre
 
     def forward_pipeline_range(
-        self, input_ids, *, start, end, payload=None, owners=(-1, -1)
+        self, input_ids, *, start, end, payload=None, owners=(-1, -1), cp_context=None
     ):
         """Execute a contiguous real layer range with explicit, graph-bearing state.
 
@@ -522,13 +522,16 @@ class DeepseekV41Model(nn.Module):
         if (
             input_ids.ndim != 2
             or input_ids.dtype != torch.int64
-            or not input_ids.shape[1]
+            or (not input_ids.shape[1] and cp_context is None)
         ):
             raise ValueError('Expected nonempty int64 input_ids [B,S]')
         if start == 0:
             if payload is not None or owners != (-1, -1):
                 raise ValueError('First pipeline range must start with fresh state')
-            hidden, pre = expand_hc(self.embed(input_ids), self.hc_mult)
+            embedding = self.embed(input_ids)
+            if hasattr(self, 'residual_dtype'):
+                embedding = embedding.to(self.residual_dtype)
+            hidden, pre = expand_hc(embedding, self.hc_mult)
             state = AttentionState()
             ced_h = ced_p = None
         else:
@@ -553,7 +556,14 @@ class DeepseekV41Model(nn.Module):
                 raise ValueError(
                     'Engram execution requires an explicit tokenizer token_map'
                 )
-            hashes = self.engram_hash(input_ids)
+            if cp_context is None:
+                hashes = self.engram_hash(input_ids)
+            else:
+                offset = sum(cp_context.layout.lengths[: cp_context.index])
+                full_ids = cp_context.layout.batch.input_ids[
+                    offset : offset + cp_context.length
+                ][None]
+                hashes = cp_context.slice(self.engram_hash(full_ids))
         for index in range(start, end):
             if index == 20:
                 # Block(19)'s shifted coefficients belong to h20. They cannot
@@ -564,7 +574,14 @@ class DeepseekV41Model(nn.Module):
                 hidden = layer.engram(
                     hidden, hashes[:, :, self.engram_layer_ids.index(index)]
                 )
-            hidden, pre, state = layer.forward_with_state(hidden, pre, state)
+            hidden, pre, state = layer.forward_with_state(
+                hidden,
+                pre,
+                state,
+                attention_kwargs=(
+                    None if cp_context is None else {'context': cp_context}
+                ),
+            )
             if index == 19:
                 ced_h, ced_p = hidden, pre
         return PairedPayload(

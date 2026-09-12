@@ -60,8 +60,6 @@ def build_model(model_cfg, *, impl_cfg):
         raise NotImplementedError(
             'V4.1 stage construction supports PP only; TP/EP/CP/VPP remain pending'
         )
-    if p.cp > 1 and p.pp > 1:
-        raise NotImplementedError('Combined paired PP and CP transport is pending')
     ps = ParallelState()
     layer_range = None
     if p.pp > 1 or p.cp > 1:
@@ -281,20 +279,49 @@ def packed_pipeline_forward_step(model, batch, *, start, end, state=None):
         state = tuple((None, (-1, -1)) for _ in lengths)
     elif state is None or len(state) != len(lengths):
         raise ValueError('Packed pipeline requires one state per sequence')
+    layout = None
+    if model.ps.cp_size > 1:
+        from .parallel import PackedContextLayout
+
+        layout = PackedContextLayout(
+            batch,
+            cp_size=model.ps.cp_size,
+            cp_rank=model.ps.cp_rank,
+            cp_group=model.ps.cp_group,
+            tp_size=model.ps.tp_size,
+        )
     outputs = []
     offset = 0
-    for length, (payload, owners) in zip(lengths, state):
+    for sequence_index, (length, (payload, owners)) in enumerate(zip(lengths, state)):
+        context = None if layout is None else layout.sequence(sequence_index)
         payload, owners = model.forward_pipeline_range(
-            batch.input_ids[offset : offset + length][None],
+            (
+                batch.input_ids[offset : offset + length][None]
+                if context is None
+                else context.input_ids()
+            ),
             start=start,
             end=end,
             payload=payload,
             owners=owners,
+            cp_context=context,
         )
         outputs.append((payload, owners))
         offset += length
     result = {'packed_pipeline_state': tuple(outputs)}
     if end == len(model.layers):
+        if layout is not None:
+            logits = torch.cat(
+                [
+                    layout.sequence(index).gather(
+                        model.finish_pipeline(payload), replicated_loss=True
+                    )
+                    for index, (payload, _) in enumerate(outputs)
+                ],
+                dim=1,
+            )[0]
+            result.update(_text_output(logits, batch))
+            return result
         from .pipeline import PairedPayload
 
         final = PairedPayload(

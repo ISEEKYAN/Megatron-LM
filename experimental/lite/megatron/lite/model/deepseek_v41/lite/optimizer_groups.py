@@ -236,7 +236,7 @@ class V41Optimizer:
         if self.commit_group is not None:
             dist.all_reduce(norm_squared, group=self.commit_group)
         norm = norm_squared.sqrt()
-        if not torch.isfinite(norm):
+        if not self._all_ready(torch.isfinite(norm), parameters[0].device):
             return False, float(norm), None
         coefficient = (
             min(1.0, self.config.clip_grad / (float(norm) + 1e-6))
@@ -317,6 +317,10 @@ class V41Optimizer:
         flag = torch.tensor(int(bool(ready)), dtype=torch.int32, device=device)
         if self.commit_group is not None:
             dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self.commit_group)
+        if self.parallel_state is not None and self.parallel_state.cp_size > 1:
+            dist.all_reduce(
+                flag, op=dist.ReduceOp.MIN, group=self.parallel_state.cp_group
+            )
         return bool(flag.item())
 
     def state_dict(self):

@@ -293,9 +293,12 @@ class PackedPipelineAdapter:
             with torch.no_grad():
                 out = run()
         elif self.recompute:
-            from torch.utils.checkpoint import checkpoint
+            from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
-            out = checkpoint(run, use_reentrant=False, preserve_rng_state=True)
+            # All CP peers must replay the complete collective sequence, even
+            # when their local valid-token counts (and autograd paths) differ.
+            with set_checkpoint_early_stop(False):
+                out = checkpoint(run, use_reentrant=False, preserve_rng_state=True)
         else:
             out = run()
         outputs = out['packed_pipeline_state']
