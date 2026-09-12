@@ -159,3 +159,139 @@ def test_staged_optimizer_guards(action, prepared, message):
     )
     with pytest.raises((ValueError, RuntimeError), match=message):
         getattr(opt, action)(*args)
+
+
+@pytest.mark.parametrize('recompute', [False, True])
+def test_step_publishes_accumulated_modality_bias(
+    moe, model_config, monkeypatch, recompute
+):
+    from megatron.lite.model.deepseek_v41.lite import image_data, protocol
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import OptimizerConfig
+    from megatron.lite.runtime.contracts import PackedBatch
+    from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
+
+    torch.manual_seed(43)
+    bundle = protocol.build_model(
+        model_config,
+        impl_cfg=protocol.ImplConfig(
+            device='cpu',
+            dtype=torch.float32,
+            quantized=False,
+            token_map=list(range(256)),
+            bias_rate=0.125,
+            optimizer='muon',
+            optimizer_config=OptimizerConfig(0.0, 1, 'quintic'),
+        ),
+    )
+    model, optimizer = bundle.chunks[0], bundle.optimizer
+    routers = [block.ffn.gate for block in model.layers]
+    seen = []
+
+    def observe(router, args, output):
+        mask = args[1]
+        indices = output[1].detach().cpu()
+        mask = (
+            torch.zeros(indices.shape[0], dtype=torch.bool)
+            if mask is None
+            else mask.cpu().flatten()
+        )
+        counts = [[0] * router.router.num_experts for _ in range(2)]
+        for image, row in zip(mask.tolist(), indices.tolist()):
+            for expert in row:
+                counts[int(image)][expert] += 1
+        seen.append((router, counts))
+
+    for block in model.layers:
+        gate = block.ffn.gate
+        assert gate.router.compute_aux_loss is False
+        with torch.no_grad():
+            gate.router.gate.weight.zero_()
+            gate.bias.copy_(torch.tensor([0.25, -0.25, 0.0, 0.0]))
+            gate.bias_vl.copy_(-gate.bias)
+        gate.register_forward_hook(observe)
+        if recompute:
+            original = block.ffn.forward
+
+            def replay(x, *, original=original, **kwargs):
+                with set_checkpoint_early_stop(False):
+                    return checkpoint(original, x, use_reentrant=False, **kwargs)
+
+            monkeypatch.setattr(block.ffn, 'forward', replay)
+    ids = torch.tensor([1, 99, 99, 99, 99, 2, 5, 6, 7])
+    image = image_data.ImageInput(
+        1, torch.randn(4, 3, 14, 14), 2, 2, image_data.image_token_types(1, 1)
+    )
+    batches = [
+        PackedBatch(
+            ids, ids, torch.tensor([6, 3]), torch.ones(9), extras={'images': [[image]]}
+        ),
+        PackedBatch(ids[:5], ids[:5], torch.tensor([2, 3]), torch.ones(5)),
+    ]
+
+    def biases():
+        return {r: torch.stack((r.bias, r.bias_vl)).clone() for r in routers}
+
+    changed = False
+    for step in range(4):
+        optimizer.zero_grad()
+        before = biases()
+        counts = {r: [[0] * r.router.num_experts for _ in range(2)] for r in routers}
+        for batch in batches:
+            seen.clear()
+            output = bundle.forward_step(model, batch)
+            forward_visits = len(seen)
+            for router, rows in seen:
+                for modality, row in enumerate(rows):
+                    for expert, count in enumerate(row):
+                        counts[router][modality][expert] += count
+            for router, actual in biases().items():
+                torch.testing.assert_close(
+                    actual, before[router], atol=0, rtol=0, msg='forward mutated bias'
+                )
+            (output['loss'] / len(batches)).backward()
+            if recompute:
+                assert len(seen) > forward_visits, 'recompute was not exercised'
+            for router, actual in biases().items():
+                torch.testing.assert_close(
+                    actual,
+                    before[router],
+                    atol=0,
+                    rtol=0,
+                    msg='backward/recompute mutated bias',
+                )
+        skipped = step == 1
+        if skipped:
+            model.embed.weight.grad.fill_(float('nan'))
+        assert optimizer.step()[0] is not skipped
+        for router, actual in biases().items():
+            expected = before[router].tolist()
+            if not skipped:
+                for modality, row in enumerate(counts[router]):
+                    mean = sum(row) / len(row)
+                    for expert, count in enumerate(row):
+                        expected[modality][expert] += 0.125 * (
+                            (mean > count) - (mean < count)
+                        )
+            torch.testing.assert_close(
+                actual,
+                torch.tensor(expected),
+                atol=0,
+                rtol=0,
+                msg='step-time modality bias differs from accumulated routing counts',
+            )
+            changed |= not torch.equal(actual, before[router])
+        # A repeated step with no new forward must not republish stale counts,
+        # including counts discarded by an overflow skip.
+        snapshot = biases()
+        for parameter in model.parameters():
+            parameter.grad = parameter.main_grad = None
+        assert optimizer.step()[0]
+        for router, actual in biases().items():
+            torch.testing.assert_close(
+                actual,
+                snapshot[router],
+                atol=0,
+                rtol=0,
+                msg='stale bias statistics reused',
+            )
+    assert changed, 'successful steps never changed load-balancing biases'
