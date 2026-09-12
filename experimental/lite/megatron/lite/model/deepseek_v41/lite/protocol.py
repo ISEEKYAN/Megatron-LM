@@ -277,41 +277,20 @@ def _forward_step_impl(model, batch):
 
 
 def pipeline_forward_step(model, batch, *, start, end, payload=None, owners=(-1, -1)):
-    """Model/protocol range boundary; a scheduler owns transport and generation.
-
-    Packed multi-sequence/CP partitioning is a separate integration. Reject it
-    explicitly until the scheduler can carry separate CSA2 state per sample.
-    """
-    _validate_text_batch(batch)
-    if batch.routed_experts is not None or batch.r3_replay_mask is not None:
-        raise NotImplementedError(
-            'Pipeline routing replay requires scheduler integration'
-        )
+    """Single-sequence adapter for the shared paired range protocol."""
+    _validate_pipeline_batch(batch)
     if batch.seq_lens.numel() != 1:
         raise NotImplementedError(
             'Pipeline packed sequences require per-sample state routing'
         )
-    payload, owners = model.forward_pipeline_range(
-        batch.input_ids[None], start=start, end=end, payload=payload, owners=owners
-    )
-    result = {'pipeline_payload': payload, 'pipeline_owners': owners}
-    if end == len(model.layers):
-        result.update(_text_output(model.finish_pipeline(payload)[0], batch))
-    return result
+    states, result = _pipeline_ranges(model, batch, start, end, ((payload, owners),))
+    payload, owners = states[0]
+    return {'pipeline_payload': payload, 'pipeline_owners': owners, **result}
 
 
 def packed_pipeline_forward_step(model, batch, *, start, end, state=None):
-    """CP1 packed range with an independent carrier per unpadded sequence.
-
-    State is an ordered tuple of (PairedPayload, owners) pairs. Transport must
-    preserve this sequence order and all native compressed-state shapes. This
-    entry does not partition CP or replace the distributed PP scheduler.
-    """
-    _validate_text_batch(batch)
-    if batch.routed_experts is not None or batch.r3_replay_mask is not None:
-        raise NotImplementedError(
-            'Pipeline routing replay requires scheduler integration'
-        )
+    """CP1 THD adapter: one carrier per sample, in original sequence order."""
+    _validate_pipeline_batch(batch)
     lengths = batch.seq_lens.tolist()
     if not lengths or any(length <= 0 for length in lengths):
         raise ValueError('Packed pipeline requires positive sequence lengths')
@@ -321,28 +300,35 @@ def packed_pipeline_forward_step(model, batch, *, start, end, state=None):
         state = tuple((None, (-1, -1)) for _ in lengths)
     elif state is None or len(state) != len(lengths):
         raise ValueError('Packed pipeline requires one state per sequence')
-    outputs = []
-    offset = 0
-    for length, (payload, owners) in zip(lengths, state):
-        payload, owners = model.forward_pipeline_range(
-            batch.input_ids[offset : offset + length][None],
-            start=start,
-            end=end,
-            payload=payload,
-            owners=owners,
-        )
-        outputs.append((payload, owners))
-        offset += length
-    result = {'packed_pipeline_state': tuple(outputs)}
-    if end == len(model.layers):
-        from .pipeline import PairedPayload
+    states, result = _pipeline_ranges(model, batch, start, end, state)
+    return {'packed_pipeline_state': states, **result}
 
-        final = PairedPayload(
-            h=torch.cat([payload.h for payload, _ in outputs], dim=1),
-            p=torch.cat([payload.p for payload, _ in outputs], dim=1),
+
+def _validate_pipeline_batch(batch):
+    _validate_text_batch(batch)
+    if batch.routed_experts is not None or batch.r3_replay_mask is not None:
+        raise NotImplementedError(
+            'Pipeline routing replay requires scheduler integration'
         )
-        result.update(_text_output(model.finish_pipeline(final)[0], batch))
-    return result
+
+
+def _pipeline_ranges(model, batch, start, end, states):
+    from .pipeline import PairedPayload
+
+    outputs = tuple(
+        model.forward_pipeline_range(
+            ids[None], start=start, end=end, payload=p, owners=o
+        )
+        for ids, (p, o) in zip(batch.input_ids.split(batch.seq_lens.tolist()), states)
+    )
+    result = {}
+    if end == len(model.layers):
+        final = PairedPayload(
+            h=torch.cat([p.h for p, _ in outputs], dim=1),
+            p=torch.cat([p.p for p, _ in outputs], dim=1),
+        )
+        result = _text_output(model.finish_pipeline(final)[0], batch)
+    return outputs, result
 
 
 def _text_output(logits, batch):
