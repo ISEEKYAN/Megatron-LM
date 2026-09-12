@@ -7,7 +7,7 @@ import pytest
 import torch
 
 
-def scalar_direction(matrix):
+def scalar_direction(matrix, trace=None):
     """Float64 Python scalars; no production normalization or distributed helpers."""
     u = [[float(value) for value in row] for row in matrix]
     rows, columns = len(u), len(u[0])
@@ -28,6 +28,8 @@ def scalar_direction(matrix):
                 )
                 for i in range(rows):
                     u[i][j] /= denominator
+        if trace is not None:
+            trace.append(torch.tensor(u, dtype=torch.float64))
     return torch.tensor(u, dtype=torch.float64) * math.sqrt(columns)
 
 
@@ -59,10 +61,16 @@ def scalar_step(weight, momentum, gradient, lr, multiplier=1):
 def test_a4_fresh_direction(matrix):
     from megatron.lite.primitive.optimizers.sinkhorn import sinkhorn_direction
 
-    actual = sinkhorn_direction(torch.tensor(matrix, dtype=torch.float32))
-    torch.testing.assert_close(
-        actual.double(), scalar_direction(matrix), atol=2e-6, rtol=2e-6
+    expected_trace, actual_trace = [], []
+    expected = scalar_direction(matrix, expected_trace)
+    actual = sinkhorn_direction(
+        torch.tensor(matrix, dtype=torch.float32),
+        trace=lambda _, value: actual_trace.append(value.double()),
     )
+    torch.testing.assert_close(actual.double(), expected, atol=2e-6, rtol=2e-6)
+    assert len(actual_trace) == 11
+    for observed, reference in zip(actual_trace, expected_trace):
+        torch.testing.assert_close(observed, reference, atol=2e-6, rtol=2e-6)
 
 
 @pytest.mark.parametrize('restore', [False, True])
@@ -189,46 +197,35 @@ def test_sinkhorn_rejects_damaged_checkpoint_without_changing_state():
     assert torch.equal(optimizer.state[p]['momentum'], old)
 
 
-@pytest.mark.parametrize('matrix', [[[1e-20]], [[1.0, 2.0], [3.0, 4.0], [0.0, 0.0]]])
-def test_a4_normalization_intermediates(matrix):
-    from megatron.lite.primitive.optimizers.sinkhorn import sinkhorn_direction
-
-    observed = []
-    sinkhorn_direction(
-        torch.tensor(matrix, dtype=torch.float32),
-        trace=lambda iteration, value: observed.append(value.double()),
-    )
-    assert len(observed) == 11
-    if len(matrix) == 1:
-        torch.testing.assert_close(
-            observed[0],
-            torch.tensor([[0.5]], dtype=torch.float64),
-            atol=2e-6,
-            rtol=2e-6,
-        )
-    else:
-        u = [[float(v) for v in row] for row in matrix]
-        for iteration in range(11):
-            if iteration % 2 == 0:
-                for i, row in enumerate(u):
-                    norm = math.sqrt(math.fsum(v * v for v in row)) + 1e-20
-                    u[i] = [v / norm for v in row]
-            else:
-                for j in range(2):
-                    norm = math.sqrt(math.fsum(row[j] ** 2 for row in u)) + 1e-20
-                    for row in u:
-                        row[j] /= norm
-            torch.testing.assert_close(
-                observed[iteration],
-                torch.tensor(u, dtype=torch.float64),
-                atol=2e-6,
-                rtol=2e-6,
-            )
-
-
 def test_engram_replica_order_cannot_silently_change_optimizer_owner():
     from megatron.lite.model.deepseek_v41.lite.parallel import EngramLayout
 
     layout = EngramLayout(5, ((2, 3), (0, 1)), world_size=4)
     with pytest.raises(ValueError, match='ascending'):
         layout.create_groups()
+
+
+@pytest.mark.parametrize(
+    'action,prepared,message',
+    [
+        ('candidates', False, 'No prepared Sinkhorn step'),
+        ('commit_step', False, 'No prepared Sinkhorn step'),
+        ('state_dict', True, 'Cannot checkpoint a prepared Sinkhorn step'),
+        ('load_state_dict', True, 'Cannot restore a prepared Sinkhorn step'),
+        ('step', False, 'Sinkhorn requires explicit accumulated gradients'),
+    ],
+)
+def test_staged_optimizer_guards(action, prepared, message):
+    from megatron.lite.primitive.optimizers.sinkhorn import Sinkhorn
+
+    opt = Sinkhorn([torch.nn.Parameter(torch.ones(2, 2))], lr=0.1)
+    saved = opt.state_dict()
+    if prepared:
+        assert opt.prepare_step()
+    args = (
+        (saved,)
+        if action == 'load_state_dict'
+        else ((lambda: None,) if action == 'step' else ())
+    )
+    with pytest.raises((ValueError, RuntimeError), match=message):
+        getattr(opt, action)(*args)

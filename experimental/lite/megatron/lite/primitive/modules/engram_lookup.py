@@ -205,13 +205,9 @@ class EngramTable(nn.Module):
         return super()._apply(preserve_dtype, recurse=recurse)
 
     def forward(self, ids):
-        # Byte indexing works for FP8 on CPU as well as CUDA; only fetched rows
-        # are dequantized, so frozen execution never materializes a full master.
-        rows = self.weight.view(torch.uint8)[ids].view(self.weight.dtype).float()
-        scales = self.scale.view(torch.uint8)[ids].view(self.scale.dtype).float()
-        decoded = rows * scales.repeat_interleave(32, -1)
-        if self.master is not None:
-            floating = self.master[ids]
+        rows, scales, floating = self.lookup_fp8(ids)
+        decoded = rows.float() * scales.float().repeat_interleave(32, -1)
+        if floating is not None:
             decoded = floating + (decoded - floating).detach()
         return decoded.to(self.output_dtype)
 
@@ -252,13 +248,6 @@ class ShardedEngramTable(EngramTable):
 
     def lookup_fp8(self, ids):
         return self.lookup.fetch(self.weight, self.scale, ids, self.master)
-
-    def forward(self, ids):
-        rows, scales, floating = self.lookup_fp8(ids)
-        decoded = rows.float() * scales.float().repeat_interleave(32, -1)
-        if floating is not None:
-            decoded = floating + (decoded - floating).detach()
-        return decoded.to(self.output_dtype)
 
 
 class EngramFP8Projection(nn.Module):

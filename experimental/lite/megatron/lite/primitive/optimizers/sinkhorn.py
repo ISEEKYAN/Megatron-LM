@@ -1,10 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Fresh-N Algorithm-1 Sinkhorn direction for logical parameter matrices.
-
-Row/column process groups describe disjoint pieces of one logical matrix.
-Only norm vectors are reduced; the logical table is never gathered. Replica
-gradients are reduce-scattered before momentum and normalization.
-"""
+"""Fresh-N Algorithm-1 Sinkhorn direction for logical parameter matrices."""
 
 from __future__ import annotations
 
@@ -12,6 +7,8 @@ import math
 
 import torch
 import torch.distributed as dist
+
+from .headwise_muon import StagedMatrixOptimizer
 
 K = 11
 TAU = 1e-3
@@ -33,13 +30,7 @@ def _any(flag, device, row_group, column_group):
 
 
 def sinkhorn_direction(nesterov, *, row_group=None, column_group=None, trace=None):
-    """Fresh current-N direction; groups partition rows and columns respectively.
-
-    A replica's optimizer-owned rows are disjoint matrix rows too, and therefore
-    belong in row_group. Padding must already be stripped. None means local,
-    never WORLD. All ranks participate, including zero-row/zero-column shards.
-    Optional trace(iteration, U) receives detached copies for A4 stage auditing.
-    """
+    """Fresh current-N direction; groups partition rows and columns respectively."""
     if nesterov.ndim != 2 or nesterov.dtype != torch.float32:
         raise ValueError('Sinkhorn requires an FP32 matrix [m, n]')
     rows = _reduce(torch.tensor(nesterov.shape[0], device=nesterov.device), row_group)
@@ -90,11 +81,7 @@ def algorithm1_update(
     beta: float = 0.95,
     multiplier: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One exact local Algorithm-1 update, returning ``(W_next, M, N)``.
-
-    ``lr * multiplier`` is supplied by the group router; Engram uses a 5x
-    multiplier.  There is no decay and no normalized-state cache.
-    """
+    """One exact local Algorithm-1 update, returning ``(W_next, M, N)``."""
     if any(
         x.shape != weight.shape or x.dtype != torch.float32
         for x in (momentum, gradient)
@@ -116,17 +103,10 @@ def _span(rows, parts, rank):
     return begin, begin + size + (rank < extra)
 
 
-class Sinkhorn(torch.optim.Optimizer):
-    """FP32 Algorithm 1 with replica-sharded momentum and staged publication.
+class Sinkhorn(StagedMatrixOptimizer):
+    _label, _momentum_key = 'Sinkhorn', 'momentum'
 
-    Parameters are resident FP32 masters. A native FP32 ``main_grad`` takes
-    precedence over ``grad``; low precision gradients are rejected, never widened.
-    Replica gradients are summed (loss normalization belongs to the caller).
-    Each replica retains momentum only for its balanced contiguous row interval.
-    row_group spans all disjoint optimizer-owned row intervals; column_group
-    spans feature partitions. These caller-created groups must form a rectangle.
-    No parameter, state or gradient is offloaded.
-    """
+    """FP32 Algorithm 1 with replica-sharded momentum and staged publication."""
 
     def __init__(
         self, params, *, lr, row_group=None, column_group=None, replica_group=None
@@ -193,11 +173,7 @@ class Sinkhorn(torch.optim.Optimizer):
 
     @torch.no_grad()
     def prepare_step(self):
-        """Stage W/M without changing live weights or state; return false on inf.
-
-        The mixed optimizer coordinator can quantize candidate tables and agree
-        on clip/skip before commit_step. No warm-start state is ever staged.
-        """
+        """Stage W/M without changing live weights or state; return false on inf."""
         if self._prepared is not None:
             raise RuntimeError('A Sinkhorn step is already prepared')
         inputs = []
@@ -262,37 +238,7 @@ class Sinkhorn(torch.optim.Optimizer):
         parameter = self.param_groups[0]['params'][0]
         return _any(skip, parameter.device, self.row_group, self.column_group)
 
-    def candidates(self):
-        if self._prepared is None:
-            raise RuntimeError('No prepared Sinkhorn step')
-        return tuple(
-            (parameter, candidate) for parameter, candidate, _ in self._prepared
-        )
-
-    @torch.no_grad()
-    def commit_step(self):
-        if self._prepared is None:
-            raise RuntimeError('No prepared Sinkhorn step')
-        for parameter, candidate, momentum in self._prepared:
-            parameter.copy_(candidate)
-            self.state[parameter]['momentum'] = momentum
-        self._prepared = None
-
-    def discard_step(self):
-        self._prepared = None
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        if closure is not None:
-            raise ValueError('Sinkhorn requires explicit accumulated gradients')
-        if not self.prepare_step():
-            return False
-        self.commit_step()
-        return True
-
     def state_dict(self):
-        if self._prepared is not None:
-            raise RuntimeError('Cannot checkpoint a prepared Sinkhorn step')
         result = super().state_dict()
         ranks = tuple(
             None if group is None else tuple(dist.get_process_group_ranks(group))
@@ -306,8 +252,7 @@ class Sinkhorn(torch.optim.Optimizer):
         return result
 
     def load_state_dict(self, state_dict):
-        if self._prepared is not None:
-            raise RuntimeError('Cannot restore a prepared Sinkhorn step')
+        self._idle('restore')
         current = self.state_dict()['sinkhorn_layout']
         if state_dict.get('sinkhorn_layout') != current:
             raise ValueError('Sinkhorn checkpoint layout differs; reshard explicitly')
@@ -318,21 +263,10 @@ class Sinkhorn(torch.optim.Optimizer):
         if len(saved_ids) != len(parameters):
             raise ValueError('Sinkhorn checkpoint parameter count differs')
         for pid, parameter in zip(saved_ids, parameters):
-            saved = state_dict['state'].get(pid)
-            if saved is None:
-                continue
             start, end = _span(parameter.shape[0], self.replica_size, self.replica_rank)
-            momentum = saved.get('momentum')
-            if (
-                set(saved) != {'momentum'}
-                or not isinstance(momentum, torch.Tensor)
-                or momentum.dtype != torch.float32
-                or momentum.shape != (end - start, parameter.shape[1])
-                or not torch.isfinite(momentum).all()
-            ):
-                raise ValueError(
-                    'Sinkhorn checkpoint requires matching finite FP32 momentum'
-                )
+            self._validate_momentum(
+                state_dict['state'].get(pid), (end - start, parameter.shape[1])
+            )
         super().load_state_dict(
             {k: v for k, v in state_dict.items() if k != 'sinkhorn_layout'}
         )
