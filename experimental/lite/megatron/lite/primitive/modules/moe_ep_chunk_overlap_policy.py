@@ -46,9 +46,7 @@ def ep_chunk_ranges(
     if num_tokens < chunk_count:
         if chunk_count == 2:
             raise ValueError("EP chunk overlap requires at least two tokens")
-        raise ValueError(
-            f"EP chunk overlap requires at least {chunk_count} tokens"
-        )
+        raise ValueError(f"EP chunk overlap requires at least {chunk_count} tokens")
     base, remainder = divmod(num_tokens, chunk_count)
     ranges = []
     start = 0
@@ -59,7 +57,24 @@ def ep_chunk_ranges(
     return ranges
 
 
+def runtime_ep_chunk_ranges(
+    num_tokens: int, *, chunk_count: int
+) -> list[tuple[int, int]]:
+    """Reduce active chunks without changing EP collective participation.
+
+    Empty ranges are communication slots, not dummy tokens. A rank with no
+    local rows can still receive remote expert work and must dispatch/combine
+    in the same order as ranks with a full microbatch.
+    """
+    if 0 <= num_tokens < chunk_count:
+        return [
+            (min(i, num_tokens), min(i + 1, num_tokens)) for i in range(chunk_count)
+        ]
+    return ep_chunk_ranges(num_tokens, chunk_count=chunk_count)
+
+
 __all__ = [
     "ep_chunk_ranges",
+    "runtime_ep_chunk_ranges",
     "validate_ep_chunk_overlap_config",
 ]

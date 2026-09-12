@@ -15,7 +15,7 @@ import torch.nn as nn
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
-    ep_chunk_ranges,
+    runtime_ep_chunk_ranges,
 )
 from megatron.lite.primitive.utils.moe import unpermute
 
@@ -2053,7 +2053,9 @@ class _EPChunkOperationBase:
         x_saved: torch.Tensor,
         grad_2d: torch.Tensor,
     ):
-        ranges = ep_chunk_ranges(x_saved.size(0), chunk_count=self._logical_chunk_count)
+        ranges = runtime_ep_chunk_ranges(
+            x_saved.size(0), chunk_count=self._logical_chunk_count
+        )
         router_params = tuple(self.router.parameters())
         expert_params = tuple(self.experts.parameters())
         return self._full_recompute_fused_backward_v6(
@@ -2709,7 +2711,7 @@ class _SavedContextEPChunkFunction(torch.autograd.Function):
             x_graph = x_2d.detach().requires_grad_(True)
             output, saved_context = forward_op._forward_saved_context_async(
                 x_graph,
-                ep_chunk_ranges(
+                runtime_ep_chunk_ranges(
                     x_graph.size(0),
                     chunk_count=forward_op._logical_chunk_count,
                 ),
@@ -2761,7 +2763,9 @@ class EPChunkForwardOp(_EPChunkOperationBase):
                 x.dtype,
                 *params,
             )
-        ranges = ep_chunk_ranges(x_2d.size(0), chunk_count=self._logical_chunk_count)
+        ranges = runtime_ep_chunk_ranges(
+            x_2d.size(0), chunk_count=self._logical_chunk_count
+        )
         with self._routing_context(routing_input):
             return self._forward_output_async(
                 x_2d,

@@ -41,7 +41,13 @@ def moe(task, implementation, config, reference, budget):
         "choose_when": ["model architecture has sparse experts", "expert count justifies EP or grouped GEMM"],
         "avoid_when": ["router tie behavior cannot be stabilized", "DeepEP metadata cannot be validated against all-to-all"],
         "compose_with": ["primitive.parallel.ep", "DeepEP dispatcher when EP>1", "primitive.parallel.tp for expert MLP if explicit"],
+        "head_loss_composition": [
+            "Qwen3 cross_entropy_fusion can coexist with ChunkedEP and takes precedence over non-fused chunked head CE",
+            "Qwen3 calculate_entropy=True without fusion uses full-vocabulary head fallback; bounded chunked head CE does not supply entropy",
+            "These head selections do not reject the MoE composition, unlike MTP and conflicting recompute settings",
+        ],
         "unsupported_combinations": [
+            "Qwen3 bounded non-fused chunked head CE with entropy output or fused CE selection (uses the documented alternative head path)",
             "Qwen3 ChunkedEP with MTP (auxiliary head loss is not bounded)",
             "ChunkedEP without DeepEP or with EP<=1",
             "ChunkedEP with top_k>expert_parallel_size",

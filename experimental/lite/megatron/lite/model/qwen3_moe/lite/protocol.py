@@ -25,6 +25,9 @@ Qwen3 ChunkedEP fields in ``ImplConfig``:
   composition. ChunkedEP requires DeepEP, EP>1, top-k<=EP, and an explicit
   capacity. Full recompute requires ChunkedEP; normal ChunkedEP rejects outer
   ``moe``/``full`` recompute. ChunkedEP with MTP is rejected before allocation.
+  ``cross_entropy_fusion`` can coexist with ChunkedEP and takes precedence over
+  its non-fused chunked head loss. Without fusion, ``calculate_entropy=True``
+  uses the full-vocabulary head fallback (not the bounded chunked CE path).
 """
 
 from __future__ import annotations
