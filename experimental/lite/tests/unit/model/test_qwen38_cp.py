@@ -53,12 +53,13 @@ def test_cp_padding_fill(key, fill):
     assert (out[key][:, 1:] == fill).all(), 'CP_PAD_FILL'
 
 
-def test_cp_unknown_batch_key_rejected():
+@pytest.mark.parametrize('value', [None, torch.ones(1, 5)])
+def test_cp_unknown_batch_key_rejected(value):
     with pytest.raises(ValueError, match='CP_UNKNOWN_BATCH_KEYS.*token_weights'):
         cp.shard_batch_for_qwen3_8_flash_next_cp(
-            mesh(0, 1),
+            mesh(1, 2),
             None,
-            {'input_ids': torch.ones(1, 5, dtype=torch.long), 'token_weights': None},
+            {'input_ids': torch.ones(1, 5, dtype=torch.long), 'token_weights': value},
         )
 
 

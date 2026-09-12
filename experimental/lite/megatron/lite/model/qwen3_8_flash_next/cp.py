@@ -132,7 +132,10 @@ def shard_batch_for_qwen3_8_flash_next_cp(
         'padding_mask': True,
         'loss_mask': 0,
     }
-    unknown = batch.keys() - fills.keys() - {'seq_lens', 'cu_seqlens'}
+    # These describe global document lengths/boundaries, not per-token values.
+    # Every CP rank needs them intact to reset hash and convolution history.
+    metadata_keys = {'seq_lens', 'cu_seqlens'}
+    unknown = batch.keys() - fills.keys() - metadata_keys
     if unknown:
         raise ValueError(f'CP_UNKNOWN_BATCH_KEYS: {sorted(unknown)}')
     size, rank = cp_mesh.size(), cp_mesh.get_local_rank()
