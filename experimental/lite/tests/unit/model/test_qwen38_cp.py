@@ -14,6 +14,104 @@ def mesh(rank, size):
 
 
 @pytest.mark.parametrize('packed', [False, True])
+def test_cp_int32_hash_matches_int64(packed):
+    from megatron.lite.model.qwen3_8_flash_next.engram import (
+        Qwen3_8_FlashNextNGramEmbedding,
+    )
+
+    m = Qwen3_8_FlashNextNGramEmbedding(None)
+    ids = torch.tensor([[248319, 9, 248044, 11, 13, 200001]], dtype=torch.int32)
+    _, batch, _ = cp.shard_batch_for_qwen3_8_flash_next_cp(
+        mesh(0, 1), None, {'input_ids': ids}
+    )
+    ids = batch['_qwen3_8_flash_next_cp_context'].global_input_ids
+    cu = torch.tensor([0, 3, 8]) if packed else None
+    actual = m.hash_ids(ids, cu)
+    assert actual.dtype == torch.int64
+    assert torch.equal(actual, m.hash_ids(ids.long(), cu)), 'CP_INT32_HASH_EXACT'
+
+
+@pytest.mark.parametrize(
+    'key,fill',
+    [
+        ('input_ids', 42),
+        ('labels', -100),
+        ('position_ids', 0),
+        ('attention_mask', 0),
+        ('padding_mask', True),
+        ('loss_mask', 0),
+    ],
+)
+def test_cp_padding_fill(key, fill):
+    ids = torch.arange(5).reshape(1, 5)
+    value = ids.bool() if key == 'padding_mask' else ids.clone()
+    batch = {'input_ids': ids, key: value}
+    _, out, _ = cp.shard_batch_for_qwen3_8_flash_next_cp(
+        mesh(1, 2), None, batch, padding_token_id=42
+    )
+    assert torch.equal(out[key][:, :1], value[:, 4:])
+    assert (out[key][:, 1:] == fill).all(), 'CP_PAD_FILL'
+
+
+def test_cp_unknown_batch_key_rejected():
+    with pytest.raises(ValueError, match='CP_UNKNOWN_BATCH_KEYS.*token_weights'):
+        cp.shard_batch_for_qwen3_8_flash_next_cp(
+            mesh(0, 1),
+            None,
+            {'input_ids': torch.ones(1, 5, dtype=torch.long), 'token_weights': None},
+        )
+
+
+@pytest.mark.parametrize('metadata', ['none', 'seq_lens', 'cu_seqlens'])
+@pytest.mark.parametrize('dtype', [torch.int32, torch.int64])
+def test_ple_cp_padding_matches_separate_sequences(metadata, dtype):
+    from megatron.lite.model.qwen3_8_flash_next.engram import (
+        Qwen3_8_FlashNextNGramEmbedding,
+        Qwen3_8_FlashNextPLELayer,
+    )
+
+    torch.manual_seed(38)
+    embedding = Qwen3_8_FlashNextNGramEmbedding(
+        lambda ids: (ids.remainder(31).float() / 31).unsqueeze(-1)
+    )
+    m = Qwen3_8_FlashNextPLELayer(
+        embedding, hidden_size=2, hc_count=4, ple_embed_dim=16, dtype=torch.float32
+    )
+    with torch.no_grad():
+        m.conv1d.weight.fill_(0.2)
+    # Left, interior, right and alignment padding; nonzero pad IDs expose leakage.
+    ids = torch.tensor([[99, 99, 1, 2, 3, 4, 99, 5, 6, 7, 8, 99, 99]], dtype=dtype)
+    batch = {'input_ids': ids, 'padding_mask': ids == 99}
+    if metadata == 'seq_lens':
+        batch[metadata] = torch.tensor([7, 6, -1000])
+    elif metadata == 'cu_seqlens':
+        batch[metadata] = torch.tensor([0, 7, 13])
+    _, out, _ = cp.shard_batch_for_qwen3_8_flash_next_cp(mesh(0, 1), None, batch)
+    x = torch.randn(1, out['input_ids'].shape[1], 8, requires_grad=True)
+    actual = m(x, out['input_ids'], cp_context=out['_qwen3_8_flash_next_cp_context'])
+    for a, b in [(2, 6), (7, 11)]:
+        expected = m(x[:, a:b], ids[:, a:b].long())
+        torch.testing.assert_close(actual[:, a:b], expected, atol=1e-6, rtol=1e-5)
+    actual[:, [2, 3, 4, 5, 7, 8, 9, 10]].sum().backward()
+    assert torch.isfinite(x.grad).all()
+    assert (x.grad[:, [0, 1, 6, 11, 12, 13, 14, 15]] == 0).all(), 'PLE_PAD_GRAD'
+
+
+def test_unassembled_runtime_diagnostic():
+    from megatron.lite.model.registry import (
+        get_train_runtime_module,
+        resolve_runtime_model_name,
+    )
+
+    for resolve, args in [
+        (get_train_runtime_module, ()),
+        (resolve_runtime_model_name, ('lite',)),
+    ]:
+        with pytest.raises(ValueError, match='not yet assembled'):
+            resolve('qwen3_8_flash_next', *args)
+
+
+@pytest.mark.parametrize('packed', [False, True])
 def test_contiguous_packed_padded(packed):
     ids = torch.arange(7).reshape(1, 7)
     batch = {'input_ids': ids, 'labels': ids.clone()}

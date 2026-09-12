@@ -124,6 +124,17 @@ def shard_batch_for_qwen3_8_flash_next_cp(
 ):
     if tp_mesh is not None and tp_mesh.size() > 1:
         raise ValueError('CP_TP_UNSUPPORTED')
+    fills = {
+        'input_ids': padding_token_id,
+        'labels': -100,
+        'position_ids': 0,
+        'attention_mask': 0,
+        'padding_mask': True,
+        'loss_mask': 0,
+    }
+    unknown = batch.keys() - fills.keys() - {'seq_lens', 'cu_seqlens'}
+    if unknown:
+        raise ValueError(f'CP_UNKNOWN_BATCH_KEYS: {sorted(unknown)}')
     size, rank = cp_mesh.size(), cp_mesh.get_local_rank()
     ids = batch['input_ids']
     length = ids.shape[1]
@@ -162,25 +173,9 @@ def shard_batch_for_qwen3_8_flash_next_cp(
     if loss_mask is not None:
         output['loss_mask'] = loss_mask
     for key, value in list(output.items()):
-        if (
-            key
-            in (
-                'input_ids',
-                'labels',
-                'position_ids',
-                'attention_mask',
-                'padding_mask',
-                'loss_mask',
-            )
-            and value is not None
-        ):
-            fill = (
-                -100
-                if key == 'labels'
-                else padding_token_id if key == 'input_ids' else key == 'padding_mask'
-            )
+        if key in fills and value is not None:
             output[key] = contiguous_slice_for_cp(
-                F.pad(value, (0, total - length), value=fill), rank, size
+                F.pad(value, (0, total - length), value=fills[key]), rank, size
             )
     output['_qwen3_8_flash_next_cp_context'] = context
     return (

@@ -58,8 +58,10 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
         self.register_buffer('ngram_heads_offsets', offsets)
 
     def hash_ids(self, ids, cu_seqlens=None):
-        if ids.ndim != 2 or ids.dtype != torch.int64:
-            raise ValueError('HASH_IDS_INT64_BS')
+        if ids.ndim != 2 or ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError('HASH_IDS_INTEGER_BS')
+        # Promote before history construction and every multiply/XOR operation.
+        ids = ids.long()
         b, s = ids.shape
         pos = torch.arange(s, device=ids.device).expand(b, -1)
         eos = torch.where(ids == self.eos_token_id, pos, -1).cummax(1).values
@@ -105,11 +107,6 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
 
     def _hash_input_ids(self, input_ids):
         return self.hash_ids(input_ids)
-
-    def _forward_global_slice(self, global_input_ids, *, sequence_start, sequence_end):
-        return self.ngram_embedding(
-            self.hash_ids(global_input_ids)[:, sequence_start:sequence_end]
-        ).flatten(-2)
 
 
 @dataclass(frozen=True)
@@ -217,20 +214,17 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
 
         if cp_context is None:
             embeddings = self.ple_embedding(input_ids, cu_seqlens)
-        elif cp_context.global_cu_seqlens is not None:
+        else:
+            global_ids = cp_context.global_input_ids.masked_fill(
+                cp_context.global_padding_mask, self.ple_embedding.eos_token_id
+            )
             cu = cp_context.global_cu_seqlens
-            if int(cu[-1]) < cp_context.global_sequence_length:
+            if cu is not None and int(cu[-1]) < cp_context.global_sequence_length:
                 cu = torch.cat((cu, cu.new_tensor([cp_context.global_sequence_length])))
-            ids = self.ple_embedding.hash_ids(cp_context.global_input_ids, cu)
+            ids = self.ple_embedding.hash_ids(global_ids, cu)
             embeddings = self.ple_embedding.ngram_embedding(
                 ids[:, cp_context.local_sequence_start : cp_context.local_sequence_end]
             ).flatten(-2)
-        else:
-            embeddings = self.ple_embedding._forward_global_slice(
-                cp_context.global_input_ids,
-                sequence_start=cp_context.local_sequence_start,
-                sequence_end=cp_context.local_sequence_end,
-            )
         embeddings = embeddings.to(self.key_proj.weight.dtype)
         key = self.key_proj(embeddings).unflatten(-1, (self.hc_count, self.hidden_size))
         query = hidden_states.unflatten(-1, (self.hc_count, self.hidden_size))
@@ -244,6 +238,9 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
         )
         history = 3 * (self.conv1d.kernel_size[0] - 1)
         if cp_context is not None:
+            start, end = cp_context.local_sequence_start, cp_context.local_sequence_end
+            mask = cp_context.global_padding_mask
+            normalized = normalized.masked_fill(mask[:, start:end, None], 0)
             normalized = torch.cat(
                 (
                     qwen3_8_flash_next_cp_left_halo(
@@ -253,28 +250,25 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
                 ),
                 1,
             )
-            if cp_context.global_cu_seqlens is None:
-                convolution = F.silu(self.conv1d(normalized.transpose(1, 2))).transpose(
-                    1, 2
+            positions = torch.arange(mask.shape[1], device=normalized.device)
+            # Padding splits independent token spans, including across CP ranks.
+            starts = torch.where(mask, positions + 1, 0).cummax(1).values[:, start:end]
+            positions = positions[start:end]
+            cu = cp_context.global_cu_seqlens
+            if cu is not None:
+                starts = torch.maximum(
+                    starts, cu[torch.bucketize(positions, cu[1:], right=True)]
                 )
-            else:
-                positions = torch.arange(
-                    cp_context.local_sequence_start,
-                    cp_context.local_sequence_end,
-                    device=normalized.device,
+            convolution = normalized.new_zeros(hidden_states.shape)
+            for i in range(self.conv1d.kernel_size[0]):
+                valid = (positions - history + 3 * i >= starts).unsqueeze(-1)
+                convolution = (
+                    convolution
+                    + normalized[:, 3 * i : 3 * i + hidden_states.shape[1]]
+                    * self.conv1d.weight[:, 0, i]
+                    * valid
                 )
-                cu = cp_context.global_cu_seqlens
-                starts = cu[torch.bucketize(positions, cu[1:], right=True)]
-                convolution = normalized.new_zeros(hidden_states.shape)
-                for i in range(self.conv1d.kernel_size[0]):
-                    valid = (positions - history + 3 * i >= starts)[None, :, None]
-                    convolution = (
-                        convolution
-                        + normalized[:, 3 * i : 3 * i + hidden_states.shape[1]]
-                        * self.conv1d.weight[:, 0, i]
-                        * valid
-                    )
-                convolution = F.silu(convolution)
+            convolution = F.silu(convolution)
         elif cu_seqlens is not None:
             convolution = torch.cat(
                 [

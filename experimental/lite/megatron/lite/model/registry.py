@@ -143,12 +143,24 @@ def get_model_package(model_name: str):
 def get_train_runtime_module(model_name: str):
     if model_name in TRAIN_RUNTIME_MODULES:
         return importlib.import_module(TRAIN_RUNTIME_MODULES[model_name])
+    if model_name in MODEL_PACKAGES and not any(
+        name == model_name for name, _ in _IMPL_TO_RUNTIME_MODEL
+    ):
+        raise ValueError(
+            f"Model {model_name!r} is not yet assembled: no training protocol is registered."
+        )
     raise ValueError(f"No protocol module for: {model_name!r}")
 
 
 def resolve_runtime_model_name(model_name: str, impl: str) -> str:
     key = (model_name, impl)
     if key not in _IMPL_TO_RUNTIME_MODEL:
+        if model_name in MODEL_PACKAGES and not any(
+            name == model_name for name, _ in _IMPL_TO_RUNTIME_MODEL
+        ):
+            raise ValueError(
+                f"Model {model_name!r} is not yet assembled: no runtime implementation is registered."
+            )
         raise ValueError(
             f"No runtime for ({model_name!r}, {impl!r}). "
             f"Known: {list(_IMPL_TO_RUNTIME_MODEL)}"

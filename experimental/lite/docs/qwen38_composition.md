@@ -10,7 +10,7 @@ Budget: model 700 + primitive extensions 600 + tests 650 + documentation 50 = 20
 | Identity | `qwen4_exp` / `qwen4_exp_text`; unwrap `text_config`, retain vision config separately. |
 | Decoder | H=2560, 48 layers, explicit `layer_types`: 36 GDN + 12 QSA; full-attention interval 4. |
 | GDN | QK heads=16, V heads=48, head dims=128, convolution width=4; output gate is sigmoid. |
-| QSA/RoPE | Q=24, KV=2, head dim=256, rotary dim=64, theta=10000000; index Q=4/K=1, dim=128, compression=4, token budget=2048. |
+| QSA/RoPE | Q=24, KV=2, head dim=256, rotary dim=64, default theta=10000 (checkpoint config may override); index Q=4/K=1, dim=128, compression=4, token budget=2048. |
 | MoE/HC | 512 experts, top-10, expert/shared width=640; four persistent streams, read bottleneck=320. |
 | PLE | `ple_layer_ids=[2]` is one-based (decoder index 1); 16 heads of width 160, 128 physical shards, padded rows=320001536. |
 

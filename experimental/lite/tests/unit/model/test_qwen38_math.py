@@ -101,7 +101,7 @@ def test_sparse_attention_value_and_backward():
 @pytest.mark.parametrize(
     'case,tag',
     [
-        ('ids', 'HASH_IDS_INT64_BS'),
+        ('ids', 'HASH_IDS_INTEGER_BS'),
         ('packed', 'HASH_PACKED_BOUNDARIES'),
         ('hc_dim', 'HC_DIMENSIONS'),
         ('hc_width', 'HC_STREAM_WIDTH'),
