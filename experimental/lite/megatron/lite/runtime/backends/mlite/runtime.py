@@ -573,6 +573,7 @@ class MegatronLiteRuntime(RuntimeBase):
                     forward_step,
                     optimizer=handle._optimizer if not forward_only else None,
                     dist_opt=not forward_only,
+                    prepare_microbatches=handle._extras.get("prepare_microbatches"),
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),
                     loss_fn=loss_fn,
                     forward_only=forward_only,

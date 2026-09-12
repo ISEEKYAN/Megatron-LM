@@ -202,7 +202,9 @@ def _no_pipeline(
         else:
             loss = output["loss"]
         loss = loss / num_microbatches
-        loss.backward()
+        from megatron.lite.primitive.train_step import backward_output
+
+        backward_output(output, loss)
         outputs.append(_compact_pipeline_output(output))
     return outputs
 
