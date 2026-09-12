@@ -168,12 +168,12 @@ def test_hc_nonzero_gates_reference():
 
 
 def test_qsa_module_packed_padded_gradient():
-    from megatron.lite.model.qwen3_8_flash_next.config import (
-        Qwen3_8_FlashNextTextConfig as Qwen38Config,
-    )
-    from megatron.lite.model.qwen3_8_flash_next.qsa import (
-        Qwen3_8_FlashNextQSAAttention as QSA,
-    )
+    from megatron.lite.model.qwen3_8_flash_next import config as qwen_config
+
+    Qwen38Config = qwen_config.Qwen3_8_FlashNextTextConfig
+    from megatron.lite.model.qwen3_8_flash_next import qsa as qwen_qsa
+
+    QSA = qwen_qsa.Qwen3_8_FlashNextQSAAttention
 
     c = Qwen38Config(
         hidden_size=4,
@@ -224,9 +224,9 @@ def expect_guard(tag):
 
 
 def test_canonical_hash_and_owner_boundary():
-    from megatron.lite.model.qwen3_8_flash_next.engram import (
-        Qwen3_8_FlashNextEngramTableConfig,
-    )
+    from megatron.lite.model.qwen3_8_flash_next import engram as qwen_engram
+
+    Qwen3_8_FlashNextEngramTableConfig = qwen_engram.Qwen3_8_FlashNextEngramTableConfig
 
     with expect_guard('HASH_RELEASE_LAYOUT'):
         NgramEmbedding(None, heads_per_ngram=1)

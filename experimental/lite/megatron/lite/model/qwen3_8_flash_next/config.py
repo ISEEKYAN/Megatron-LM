@@ -53,14 +53,14 @@ class Qwen3_8_FlashNextTextConfig:
     ngram_size: int = 3
     heads_per_ngram: int = 8
     split_ngram_parts: int = 128
-    ple_embed_dim: int = 2560
+    ple_embed_dim: int | None = None
     ple_conv_kernel_size: int = 4
-    ple_layer_ids: list[int] = field(default_factory=lambda: [2])
+    ple_layer_ids: list[int] | None = None
     layer_types: list[str] = field(default_factory=list)
     full_attention_interval: int = 4
     rms_norm_eps: float = 1e-6
-    rope_theta: float = 10000000.0
-    partial_rotary_factor: float = 0.25
+    rope_theta: float | None = None
+    partial_rotary_factor: float | None = None
     mrope_section: list[int] = field(default_factory=lambda: [11, 11, 10])
     output_gate_type: str = 'sigmoid'
     eos_token_id: int = 248044
@@ -96,6 +96,15 @@ class Qwen3_8_FlashNextTextConfig:
         return cls(**values)
 
     def __post_init__(self):
+        rope = self.rope_parameters or {}
+        if self.rope_theta is None:
+            self.rope_theta = rope.get('rope_theta', 10000.0)
+        if self.partial_rotary_factor is None:
+            self.partial_rotary_factor = rope.get('partial_rotary_factor', 0.25)
+        if self.ple_layer_ids is None:
+            self.ple_layer_ids = []
+        if self.ple_embed_dim is None:
+            self.ple_embed_dim = self.hidden_size
         if self.full_attention_interval < 1 or self.num_hidden_layers < 1:
             raise ValueError('QWEN38_LAYER_COUNT')
         if not self.layer_types:

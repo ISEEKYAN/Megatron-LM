@@ -18,6 +18,7 @@ def test_config_alias_and_rope():
             'model_type': 'qwen4_exp',
             'text_config': {
                 'model_type': 'qwen4_exp_text',
+                'ple_layer_ids': [2],
                 'rope_parameters': {'rope_theta': 123.0},
             },
             'vision_config': {'depth': 27},
@@ -61,7 +62,9 @@ def test_coverage_does_not_hide_unknown_or_modalities():
         'model.visual.patch_embed.proj.weight',
         'mtp.fc_hidden.weight',
     ]
-    p = checkpoint_plan({'weight_map': dict.fromkeys(keys, 'source')}, Qwen38Config())
+    p = checkpoint_plan(
+        {'weight_map': dict.fromkeys(keys, 'source')}, Qwen38Config(ple_layer_ids=[2])
+    )
     assert p['counts'] == dict(
         mapped=2, vision=1, mtp=1, unknown=1
     ), 'CHECKPOINT_COVERAGE_COUNTS'
