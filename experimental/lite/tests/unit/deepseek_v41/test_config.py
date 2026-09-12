@@ -3,8 +3,16 @@ import pytest
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 
 
-@pytest.mark.parametrize('field', ['kv_source_layer_ids', 'index_source_layer_ids',
-    'candidate_source_layer_id', 'compress_ratios', 'num_hidden_layers'])
+@pytest.mark.parametrize(
+    'field',
+    [
+        'kv_source_layer_ids',
+        'index_source_layer_ids',
+        'candidate_source_layer_id',
+        'compress_ratios',
+        'num_hidden_layers',
+    ],
+)
 def test_topology_guards(model_config, field):
     config = model_config.to_hf_dict()
     value = config['text_config'][field]
