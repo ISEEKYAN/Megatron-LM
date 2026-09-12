@@ -862,6 +862,37 @@ def test_v41_pipeline_constructor_allocates_only_local_owners(moe, monkeypatch):
     assert assigned == expected, 'PP local owners do not cover the monolithic model'
 
 
+def test_v41_pipeline_rejects_range_outside_local_stage(moe):
+    from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
+
+    stage = DeepseekV41Model(
+        _assembly_config(),
+        token_map=list(range(256)),
+        quantized=False,
+        layer_range=(0, 20),
+    )
+    with pytest.raises(
+        ValueError, match='^Requested range is outside this pipeline stage$'
+    ):
+        stage.forward_pipeline_range(torch.tensor([[3, 4]]), start=0, end=21)
+
+
+def test_v41_pipeline_rejects_output_on_nonfinal_stage(moe):
+    from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
+
+    stage = DeepseekV41Model(
+        _assembly_config(),
+        token_map=list(range(256)),
+        quantized=False,
+        layer_range=(0, 20),
+    )
+    payload, _ = stage.forward_pipeline_range(torch.tensor([[3, 4]]), start=0, end=20)
+    with pytest.raises(
+        RuntimeError, match='^Only the final pipeline stage owns the output head$'
+    ):
+        stage.finish_pipeline(payload)
+
+
 def test_v41_packed_pipeline_matches_monolithic(moe):
     from megatron.lite.runtime.contracts import PackedBatch
 
