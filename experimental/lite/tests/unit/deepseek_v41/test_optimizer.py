@@ -261,8 +261,12 @@ def test_step_publishes_accumulated_modality_bias(
                 )
         skipped = step == 1
         if skipped:
-            model.embed.weight.grad.fill_(float('nan'))
-        assert optimizer.step()[0] is not skipped
+            model.embed.weight.grad.fill_(float('inf'))
+        published, *_ = optimizer.step()
+        if skipped:
+            assert not published, 'infinite gradients must skip the optimizer step'
+        else:
+            assert published, 'finite gradients must publish the optimizer step'
         for router, actual in biases().items():
             expected = before[router].tolist()
             if not skipped:
@@ -292,6 +296,6 @@ def test_step_publishes_accumulated_modality_bias(
                 snapshot[router],
                 atol=0,
                 rtol=0,
-                msg='stale bias statistics reused',
+                msg=f'stale bias statistics reused after {"skipped" if skipped else "successful"} step',
             )
     assert changed, 'successful steps never changed load-balancing biases'
