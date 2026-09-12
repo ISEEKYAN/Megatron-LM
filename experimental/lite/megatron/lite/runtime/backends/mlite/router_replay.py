@@ -18,7 +18,7 @@ from megatron.lite.primitive.modules.router_replay import (
 from megatron.lite.primitive.parallel.thd import parallel_state_from_model
 
 R3_SUPPORTED_MODELS = frozenset(
-    {"qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2"}
+    {"qwen3_moe", "qwen3_5", "deepseek_v4", "deepseek_v41", "glm5", "kimi_k2"}
 )
 
 
@@ -65,6 +65,9 @@ class RouterReplayDriver:
         return cls(handle, action)
 
     def begin(self) -> None:
+        validate = getattr(self._protocol, "validate_router_replay", None)
+        if validate is not None:
+            validate(self._chunks, self.action)
         RouterReplay.clear_global_router_replay_instances()
         self._num_routers = sum(
             attach_router_replay(root, reset=False) for root in self._replay_roots()
@@ -99,7 +102,18 @@ class RouterReplayDriver:
     def _wrap_record(self, forward_step: Callable) -> Callable:
         def stepped(model, batch):
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
-            return forward_step(model, batch)
+            result = forward_step(model, batch)
+            unpack = getattr(self._protocol, "unpack_recorded_routed_experts", None)
+            if unpack is not None:
+                if not isinstance(result, dict):
+                    raise TypeError(
+                        "Router recording requires dictionary forward output"
+                    )
+                result = dict(result)
+                result["routed_experts"] = unpack(
+                    model, batch, RouterReplay.get_recorded_data()
+                )
+            return result
 
         return stepped
 
@@ -121,9 +135,10 @@ class RouterReplayDriver:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             RouterReplay.reset_replay_stats()
             try:
-                return forward_step(model, batch)
-            finally:
+                result = forward_step(model, batch)
                 self._emit_replay_evidence()
+                return result
+            finally:
                 # Pipeline schedules may recompute checkpointed router forwards
                 # after one or more newer micro-batches have run.  Those calls
                 # must consume the saved per-microbatch FIFO, not the latest

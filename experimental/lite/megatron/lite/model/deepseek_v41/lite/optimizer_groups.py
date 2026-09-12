@@ -132,6 +132,23 @@ def parameter_groups(model, *, lr):
             add(e.wkv.weight, 'muon', role='engram_projection', multiplier=5)
             for p in (e.q_weight, e.k_weight):
                 add(p, 'adamw', role='engram_norm', multiplier=5)
+    # F3a owners stay live for archive/export but text-only training freezes them.
+    for module, role in ((model.vision, 'vision'), (model.aligner, 'aligner')):
+        if module is not None:
+            for p in module.parameters():
+                if p.requires_grad:
+                    raise ValueError(
+                        'Trainable visual owners require multimodal optimizer routing'
+                    )
+                add(p, 'adamw', role=role)
+    for attribute in ('image_start', 'image_end', 'image_newline'):
+        p = getattr(model, attribute, None)
+        if p is not None:
+            if p.requires_grad:
+                raise ValueError(
+                    'Trainable image delimiters require multimodal optimizer routing'
+                )
+            add(p, 'adamw', role='image_delimiter')
     if seen != set(bindings):
         raise ValueError('Unknown parameter owner; no catch-all optimizer route')
     return groups

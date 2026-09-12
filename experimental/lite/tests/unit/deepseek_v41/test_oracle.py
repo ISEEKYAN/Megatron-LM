@@ -1,6 +1,7 @@
 import ast
 import hashlib
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -13,10 +14,24 @@ from config_mapping import MAPPING, WAIVERS, leaves, map_release_config
 from fixtures import REFERENCE_SHA256
 from oracle import forward_all_tokens, snapshot, tensor_metadata, validate_sequences
 
-REFERENCE = Path(__file__).resolve().parents[2] / "fixtures/deepseek_v41/reference"
+REFERENCE = Path(os.environ.get("DS41_REFERENCE_DIR", "/tmp/ds41-fixture-reference"))
 
 
-def test_bundled_reference_matches_pinned_source():
+def _reference_text(name):
+    raw = (REFERENCE / name).read_bytes()
+    assert (
+        hashlib.sha256(raw).hexdigest() == REFERENCE_SHA256[name]
+    ), f"G1_REFERENCE_HASH: {name}"
+    return raw.decode()
+
+
+def test_external_reference_matches_pinned_source():
+    bundled = (
+        Path(__file__).resolve().parents[2] / "fixtures/deepseek_v41/reference/model.py"
+    )
+    assert (
+        not bundled.exists()
+    ), "G1_EXTERNAL_REFERENCE: official source must stay outside the repository"
     for name in ("model.py", "config.json", "inference_config.json"):
         assert (
             hashlib.sha256((REFERENCE / name).read_bytes()).hexdigest()
@@ -38,7 +53,7 @@ def test_capture_clone_survives_publication_mutation():
 
 def test_all_token_head_original_method_card():
     source = REFERENCE / "model.py"
-    tree = ast.parse(source.read_text())
+    tree = ast.parse(_reference_text("model.py"))
     head_class = next(
         node
         for node in tree.body
@@ -111,8 +126,8 @@ def test_all_87_config_leaves_map_or_have_explicit_scope():
     import copy
     import json
 
-    release = json.loads((REFERENCE / "config.json").read_text())
-    tree = ast.parse((REFERENCE / "model.py").read_text())
+    release = json.loads(_reference_text("config.json"))
+    tree = ast.parse(_reference_text("model.py"))
     args = next(
         node
         for node in tree.body
@@ -129,7 +144,7 @@ def test_all_87_config_leaves_map_or_have_explicit_scope():
     assert len(leaves(release)) == 87
     assert set(leaves(release)) == set(MAPPING) | set(WAIVERS)
     mapped = map_release_config(release, defaults)
-    inference = json.loads((REFERENCE / "inference_config.json").read_text())
+    inference = json.loads(_reference_text("inference_config.json"))
     assert all(mapped[name] == value for name, value in inference.items())
     altered = copy.deepcopy(release)
     altered["text_config"]["hidden_size"] = 640
