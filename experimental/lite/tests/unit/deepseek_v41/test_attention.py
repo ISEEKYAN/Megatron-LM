@@ -45,7 +45,6 @@ def test_ced_chain_and_gradient(official, model_config, dtype):
     p = torch.randn(1, 5, 3, requires_grad=True)
     assert not torch.equal(h[:, :, 0], h[:, :, 1])
     x = norm(ref[0], collapse(None, h, p))
-    # Run the pinned compressor method with independent Torch projections/norms.
     projection = lambda value: torch.nn.functional.linear(value, ref[1].weight)
     normalization = lambda value: norm(ref[2], value)
     latent = compress(

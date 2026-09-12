@@ -30,21 +30,14 @@ def official(monkeypatch):
     def load(name, cls=None, method=None):
         path = root / name
         if cls:
-            node = next(
-                n
-                for n in ast.parse(path.read_text()).body
-                if isinstance(n, ast.ClassDef) and n.name == cls
-            )
-            node = next(
-                n
-                for n in node.body
-                if isinstance(n, ast.FunctionDef) and n.name == method
-            )
+            def named(nodes, kind, label):
+                return next(n for n in nodes if isinstance(n, kind) and n.name == label)
+
+            node = named(ast.parse(path.read_text()).body, ast.ClassDef, cls)
+            node = named(node.body, ast.FunctionDef, method)
             namespace = {'torch': torch, 'nn': torch.nn}
-            exec(
-                compile(ast.Module(body=[node], type_ignores=[]), str(path), 'exec'),
-                namespace,
-            )
+            tree = ast.Module(body=[node], type_ignores=[])
+            exec(compile(tree, str(path), 'exec'), namespace)
             return namespace[method]
         spec = importlib.util.spec_from_file_location('official_' + path.stem, path)
         module = importlib.util.module_from_spec(spec)
