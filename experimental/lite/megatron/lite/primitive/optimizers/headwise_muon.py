@@ -2,8 +2,10 @@
 """Muon on explicitly declared logical matrices, with FP32 owner state."""
 
 import math
+from copy import deepcopy
 
 import torch
+from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
 
 
 def _matrix_shape(shape):
@@ -222,3 +224,168 @@ class HeadwiseMuon(StagedMatrixOptimizer):
                 self._validate_momentum(state_dict['state'].get(pid), parameter.shape)
         super().load_state_dict(state_dict)
         self._validate_groups()
+
+
+class MixedOptimizer:
+    """Atomic local publication across matrix optimizers, AdamW and FP8 storage."""
+
+    def __init__(self, groups, config, tables=()):
+        from .sinkhorn import Sinkhorn
+
+        if not groups or any(
+            p.dtype != torch.float32 for g in groups for p in g['params']
+        ):
+            raise ValueError('V4.1 optimizer requires native FP32 parameter masters')
+        for group in groups:
+            for p in group['params']:
+                if not hasattr(p, '_v41_main_grad_hook'):
+                    p.main_grad = p.grad
+                    p._v41_main_grad_hook = p.register_post_accumulate_grad_hook(
+                        _publish_main_grad
+                    )
+        self.config = config
+        self.optimizers = []
+        for algorithm in ('muon', 'sinkhorn', 'adamw'):
+            selected = [g for g in groups if g['algorithm'] == algorithm]
+            if not selected:
+                continue
+            if algorithm == 'muon':
+                backend = HeadwiseMuon(
+                    selected,
+                    lr=config.lr,
+                    ns_steps=config.ns_steps,
+                    coefficient_type=config.coefficient_type,
+                )
+            elif algorithm == 'sinkhorn':
+                backend = Sinkhorn(selected, lr=config.lr)
+            else:
+                backend = torch.optim.AdamW(
+                    selected, lr=config.lr, betas=(0.9, 0.95), eps=1e-20, foreach=False
+                )
+            self.optimizers.append(backend)
+        self.tables = list(tables)
+
+    def _validate_trainability(self):
+        """The assembling model supplies phase and trainability validation."""
+
+    @property
+    def param_groups(self):
+        return [g for o in self.optimizers for g in o.param_groups]
+
+    def zero_grad(self, set_to_none=True):
+        for backend in self.optimizers:
+            backend.zero_grad(set_to_none=set_to_none)
+        for group in self.param_groups:
+            for p in group['params']:
+                p.main_grad = p.grad
+
+    @torch.no_grad()
+    def step(self):
+        self._validate_trainability()
+        parameters = [p for g in self.param_groups for p in g['params']]
+        gradients = [
+            p.main_grad if getattr(p, 'main_grad', None) is not None else p.grad
+            for p in parameters
+        ]
+        active = [g for g in gradients if g is not None]
+        if any(g.dtype != torch.float32 or g.is_sparse for g in active):
+            raise ValueError('Expected native dense FP32 main_grad')
+        norm = (
+            torch.stack([g.double().square().sum() for g in active]).sum().sqrt()
+            if active
+            else torch.tensor(0.0)
+        )
+        if not torch.isfinite(norm):
+            return False, float(norm), None
+        coefficient = (
+            min(1.0, self.config.clip_grad / (float(norm) + 1e-6))
+            if self.config.clip_grad
+            else 1.0
+        )
+        # Reversible gradient views permit retry on failed publication.
+        original = [(p, p.grad, getattr(p, 'main_grad', None)) for p in parameters]
+        staged_adam, candidates = [], {}
+        try:
+            for p, g in zip(parameters, gradients):
+                p.grad = None if g is None else g * coefficient
+                p.main_grad = p.grad
+            for backend in self.optimizers:
+                if isinstance(backend, torch.optim.AdamW):
+                    candidate = deepcopy(backend)
+                    for old, new in zip(backend.param_groups, candidate.param_groups):
+                        for p, q in zip(old['params'], new['params']):
+                            q.grad = p.grad
+                    candidate.step()
+                    for old, new in zip(backend.param_groups, candidate.param_groups):
+                        for p, q in zip(old['params'], new['params']):
+                            candidates[id(p)] = q
+                    if any(
+                        not torch.isfinite(v).all()
+                        for s in candidate.state.values()
+                        for v in s.values()
+                        if isinstance(v, torch.Tensor)
+                    ):
+                        return False, float(norm), None
+                    staged_adam.append((backend, candidate))
+                else:
+                    if not backend.prepare_step():
+                        return False, float(norm), None
+                    candidates.update(
+                        (id(p), value) for p, value in backend.candidates()
+                    )
+            if any(not torch.isfinite(p).all() for p in candidates.values()):
+                return False, float(norm), None
+            storage = []
+            for table in self.tables:
+                weight, scale = quantize_block_fp8(
+                    candidates[id(table.master)], (1, 32), scale_format='e8m0'
+                )
+                if (
+                    not torch.isfinite(weight.float()).all()
+                    or not torch.isfinite(scale.float()).all()
+                ):
+                    return False, float(norm), None
+                storage.append((table, weight, scale))
+            for backend in self.optimizers:
+                if not isinstance(backend, torch.optim.AdamW):
+                    backend.commit_step()
+            for backend, candidate in staged_adam:
+                for old, new in zip(backend.param_groups, candidate.param_groups):
+                    for p, q in zip(old['params'], new['params']):
+                        p.copy_(q)
+                backend.load_state_dict(candidate.state_dict())
+            for table, weight, scale in storage:
+                table.weight.copy_(weight)
+                table.scale.copy_(scale)
+            return True, float(norm), None
+        finally:
+            for backend in self.optimizers:
+                if not isinstance(backend, torch.optim.AdamW):
+                    backend.discard_step()
+            for p, grad, main in original:
+                p.grad, p.main_grad = grad, main
+
+    def state_dict(self):
+        self._validate_trainability()
+        return dict(
+            owners=[g['owner_key'] for g in self.param_groups],
+            clip_grad=self.config.clip_grad,
+            optimizers=[o.state_dict() for o in self.optimizers],
+        )
+
+    def load_state_dict(self, state):
+        self._validate_trainability()
+        if state.get('clip_grad') != self.config.clip_grad:
+            raise ValueError('Optimizer clipping contract differs')
+        if state.get('owners') != [g['owner_key'] for g in self.param_groups] or len(
+            state['optimizers']
+        ) != len(self.optimizers):
+            raise ValueError('Optimizer owner layout differs')
+        for backend, saved in zip(self.optimizers, state['optimizers']):
+            backend.load_state_dict(saved)
+
+
+def _publish_main_grad(parameter):
+    if parameter.grad.dtype != torch.float32:
+        raise RuntimeError('V4.1 gradient producer did not return native FP32')
+    parameter.main_grad = parameter.grad
