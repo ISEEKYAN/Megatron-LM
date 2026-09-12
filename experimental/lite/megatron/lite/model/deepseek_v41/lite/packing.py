@@ -2,6 +2,7 @@
 """Unpadded single-rank THD execution with sequence-local state lifetimes."""
 
 import torch
+from megatron.lite.primitive.modules.router_replay import PackedRouterReplay
 from megatron.lite.primitive.utils.packed_seq import packed_sequence_ranges
 
 
@@ -21,13 +22,18 @@ def packed_forward(
         if tensor is not None and tensor.shape != hidden.shape[:2]:
             raise ValueError("Token inputs must match packed [1,T] dimensions")
     outputs, mixes = [], []
+    replay = PackedRouterReplay(hidden.shape[1])
     for begin, end in packed_sequence_ranges(cu_seqlens, hidden.shape[1]):
         kwargs = {}
         if input_ids is not None:
             kwargs['input_ids'] = input_ids[:, begin:end]
         if image_mask is not None:
             kwargs['image_mask'] = image_mask[:, begin:end]
-        h, p = sequence_forward(hidden[:, begin:end], pre_mix[:, begin:end], **kwargs)
+        with replay.sequence(begin, end):
+            h, p = sequence_forward(
+                hidden[:, begin:end], pre_mix[:, begin:end], **kwargs
+            )
         outputs.append(h)
         mixes.append(p)
+    replay.finish()
     return torch.cat(outputs, dim=1), torch.cat(mixes, dim=1)
