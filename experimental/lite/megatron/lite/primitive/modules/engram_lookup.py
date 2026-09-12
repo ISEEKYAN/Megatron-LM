@@ -36,6 +36,19 @@ class _Route:
         return result
 
 
+def _gather_rows(tensor, ids, route=None):
+    if tensor is None:
+        return None
+    # Index FP8 storage as bytes; floating masters retain their autograd edge.
+    rows = tensor.view(torch.uint8) if tensor.element_size() == 1 else tensor
+    rows = rows[ids if route is None else route.local_ids]
+    if route is not None:
+        rows = route.return_rows(rows)
+    if tensor.element_size() == 1:
+        rows = rows.view(tensor.dtype)
+    return rows.reshape(*ids.shape, tensor.shape[1])
+
+
 class RowLookup:
     def __init__(self, boundaries, group=None):
         self.boundaries = tuple(boundaries)
@@ -108,14 +121,6 @@ class RowLookup:
             message,
         )
 
-    def _validate_storage(self, values, scales, ids):
-        self._validate_rows(
-            (values, scales),
-            ids,
-            lambda t: t.element_size() == 1,
-            'Expected colocated resident byte-valued row and scale shards and int64 IDs',
-        )
-
     def gather_rows(self, values, ids):
         """Gather floating parameter rows with symmetric validation and additive VJP."""
         dtypes = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
@@ -132,7 +137,12 @@ class RowLookup:
         return route.return_rows(values[route.local_ids]).reshape(*ids.shape, values.shape[1])
 
     def fetch(self, values, scales, ids, master=None):
-        self._validate_storage(values, scales, ids)
+        self._validate_rows(
+            (values, scales),
+            ids,
+            lambda t: t.element_size() == 1,
+            'Expected colocated resident byte-valued row and scale shards and int64 IDs',
+        )
         self._schema(
             [
                 values.shape[1],
@@ -151,15 +161,7 @@ class RowLookup:
                 'Require resident FP32 master matching local row shard',
             )
         route = self.route(ids)
-        raw = route.return_rows(values.view(torch.uint8)[route.local_ids])
-        scale = route.return_rows(scales.view(torch.uint8)[route.local_ids])
-        shape = ids.shape
-        raw = raw.view(values.dtype).reshape(*shape, values.shape[1])
-        scale = scale.view(scales.dtype).reshape(*shape, scales.shape[1])
-        floating = None
-        if master is not None:
-            floating = route.return_rows(master[route.local_ids]).reshape(*shape, values.shape[1])
-        return raw, scale, floating
+        return tuple(_gather_rows(t, ids, route) for t in (values, scales, master))
 
     def raw_rows(self, values, scales, ids):
         return self.fetch(values, scales, ids)[:2]
@@ -216,10 +218,7 @@ class EngramTable(nn.Module):
         return decoded.to(self.output_dtype)
 
     def lookup_fp8(self, ids):
-        rows = self.weight.view(torch.uint8)[ids].view(self.weight.dtype)
-        scales = self.scale.view(torch.uint8)[ids].view(self.scale.dtype)
-        master = None if self.master is None else self.master[ids]
-        return rows, scales, master
+        return tuple(_gather_rows(t, ids) for t in (self.weight, self.scale, self.master))
 
     @torch.no_grad()
     def refresh_storage(self):
@@ -282,34 +281,28 @@ def hash_multipliers(layer_ids, max_ngram_size, vocab_size):
     if vocab_size < 1 or max_ngram_size < 2:
         raise ValueError("Require nonempty compressed vocabulary and ngram order >= 2")
     bound = max(1, (np.iinfo(np.int64).max // vocab_size) // 2)
-    return torch.stack(
-        [
-            torch.from_numpy(
-                np.random.default_rng(10007 * layer).integers(
-                    0, bound, size=max_ngram_size, dtype=np.int64
-                )
-                * 2
-                + 1
-            )
-            for layer in layer_ids
-        ]
-    )
+    def multiplier(layer):
+        rng = np.random.default_rng(10007 * layer)
+        values = rng.integers(0, bound, size=max_ngram_size, dtype=np.int64)
+        return torch.from_numpy(values * 2 + 1)
+
+    return torch.stack([multiplier(layer) for layer in layer_ids])
 
 
 def prime_buckets(layer_ids, max_ngram_size, heads, vocab_size):
     from sympy import nextprime
 
-    current, result = vocab_size - 1, []
-    for _ in layer_ids:
-        layer = []
-        for _ in range(max_ngram_size - 1):
-            sizes = []
-            for _ in range(heads):
-                current = int(nextprime(current))
-                sizes.append(current)
-            layer.append(sizes)
-        result.append(layer)
-    return torch.tensor(result, dtype=torch.int64)
+    current = vocab_size - 1
+
+    def bucket():
+        nonlocal current
+        current = int(nextprime(current))
+        return current
+
+    return torch.tensor(
+        [[[bucket() for _ in range(heads)] for _ in range(max_ngram_size - 1)] for _ in layer_ids],
+        dtype=torch.int64,
+    )
 
 
 class NgramHash(nn.Module):
