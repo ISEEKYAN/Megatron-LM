@@ -5,6 +5,20 @@ vision and object-based optimizer routing. Single-rank full-sequence training
 is supported; distributed execution is being consolidated separately.
 
 Use the released nested config with the `deepseek_v41` / `lite` registry entry.
+Inspect model assembly without allocating the released weights:
+
+```python
+import os
+from megatron.lite.model.deepseek_v41.lite.protocol import (
+    ImplConfig, build_model, build_model_config,
+)
+config = build_model_config(os.environ["DS41_MODEL_DIR"])
+bundle = build_model(config, impl_cfg=ImplConfig(device="meta"))
+print(sum(p.numel() for p in bundle.chunks[0].parameters()))
+```
+
+Execution additionally requires the tokenizer-derived Engram token map and
+materialized checkpoint weights. Meta construction only inspects assembly.
 Select post-training trainability explicitly. Indexers remain frozen without
 an auxiliary loss. Engram uses frozen FP8 storage or a persistent FP32 master
 with regenerated FP8 scales; tables are resident, not offloaded.

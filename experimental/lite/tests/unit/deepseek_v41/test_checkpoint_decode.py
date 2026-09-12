@@ -3,7 +3,7 @@
 import pytest
 import torch
 from megatron.lite.model.deepseek_v41.lite.checkpoint import load_weight
-from megatron.lite.model.deepseek_v41.lite.checkpoint_store import CheckpointTensorStore
+from megatron.lite.model.deepseek_v41.lite.checkpoint import CheckpointTensorStore
 from safetensors.torch import save_file
 
 
@@ -84,3 +84,20 @@ def test_plain_weight_rejects_stale_scale(tmp_path):
     )
     with pytest.raises(ValueError, match="scale"):
         load_weight(store, name)
+
+
+@pytest.mark.parametrize("damage", ["length", "offset", "shape", "duplicate"])
+def test_archive_rejects_malformed_header(tmp_path, damage):
+    import json, struct
+    path = tmp_path / "bad.safetensors"
+    header = {"x": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    if damage == "offset":
+        header["x"]["data_offsets"] = [1, 5]
+    if damage == "shape":
+        header["x"]["shape"] = [2]
+    raw = json.dumps(header).encode()
+    if damage == "duplicate":
+        raw = raw[:-1] + b',"x":' + json.dumps(header["x"]).encode() + b'}'
+    path.write_bytes(struct.pack("<Q", len(raw) + (100 if damage == "length" else 0)) + raw + bytes(4))
+    with pytest.raises(ValueError):
+        CheckpointTensorStore.load([path], expected_keys=["x"])

@@ -14,7 +14,7 @@ from torch.nn import functional as F
 
 from .attention import AttentionState, CSA2Attention, Linear
 from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc
-from .checkpoint_store import validate_execution
+from .checkpoint import validate_execution
 from .engram import Engram, EngramTable, NgramHash, hash_multipliers, prime_buckets
 from .image_data import TEXT, merge_image_embeddings
 from .moe import DeepseekV41MoE, ModalityRouter, SwiGLUExpert
@@ -387,27 +387,6 @@ class DeepseekV41Model(nn.Module):
 
     @staticmethod
     def _archive_keys(t, v):
-        for index in range(v['num_hidden_layers']):
-            for suffix in (
-                'attn.wo.bias',
-                'attn.wo.weight',
-                'attn.wqkv.bias',
-                'attn.wqkv.weight',
-                'mlp.w1.weight',
-                'mlp.w2.weight',
-                'norm1.weight',
-                'norm2.weight',
-            ):
-                yield 'vision', f'vision.blocks.{index}.{suffix}'
-        for suffix in (
-            'norm.weight',
-            'patch_embed.proj.bias',
-            'patch_embed.proj.weight',
-        ):
-            yield 'vision', 'vision.' + suffix
-        for name in ('w1', 'w2'):
-            for suffix in ('weight', 'bias'):
-                yield 'aligner', f'aligner.{name}.{suffix}'
         for index in range(t['num_nextn_predict_layers']):
             prefix = f'mtp.{index}.'
             for suffix in (
