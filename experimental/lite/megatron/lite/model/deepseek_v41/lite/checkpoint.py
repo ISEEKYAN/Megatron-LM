@@ -10,10 +10,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
 
-from safetensors import SafetensorError, safe_open
 import torch
 from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
 from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
+from safetensors import SafetensorError, safe_open
 
 _CHUNK = 8 * 1024 * 1024
 
@@ -92,7 +92,9 @@ class CheckpointTensorStore:
                 raise ValueError(f"invalid safetensors file: {path}") from error
             with path.open("rb") as source:
                 length = struct.unpack("<Q", source.read(8))[0]
-                header = json.loads(source.read(length), object_pairs_hook=_unique_object)
+                header = json.loads(
+                    source.read(length), object_pairs_hook=_unique_object
+                )
             for name in keys:
                 if key_prefix is not None and not name.startswith(key_prefix):
                     continue
@@ -101,17 +103,19 @@ class CheckpointTensorStore:
                 record = header[name]
                 start, end = record["data_offsets"]
                 entry = TensorEntry(
-                    name, record["dtype"], tuple(record["shape"]),
-                    end - start, str(path), 8 + length + start, "",
+                    name,
+                    record["dtype"],
+                    tuple(record["shape"]),
+                    end - start,
+                    str(path),
+                    8 + length + start,
+                    "",
                 )
                 entries[name] = TensorEntry(
                     **{**asdict(entry), "payload_digest": _stream(entry)}
                 )
         _coverage(entries, expected_keys)
         return cls(entries)
-
-    def manifest(self):
-        return {name: asdict(entry) for name, entry in self.entries.items()}
 
     def read(self, name):
         import io
@@ -121,29 +125,6 @@ class CheckpointTensorStore:
         if _stream(entry, output) != entry.payload_digest:
             raise ValueError(f"payload digest mismatch: {name}")
         return output.getvalue()
-
-    def shard(self, rank, world_size):
-        if (
-            type(world_size) is not int
-            or world_size < 1
-            or type(rank) is not int
-            or not 0 <= rank < world_size
-        ):
-            raise ValueError("invalid archival rank/world size")
-        return type(self)(
-            {key: self.entries[key] for key in list(self.entries)[rank::world_size]}
-        )
-
-    @classmethod
-    def merge(cls, stores, *, expected_keys):
-        entries = {}
-        for store in stores:
-            for name, entry in store.entries.items():
-                if name in entries:
-                    raise ValueError(f"duplicate tensor: {name}")
-                entries[name] = entry
-        _coverage(entries, expected_keys)
-        return cls(entries)
 
     def save(self, path):
         """Stream to a new file, publishing only after every payload digest agrees."""
@@ -174,7 +155,6 @@ class CheckpointTensorStore:
             os.link(temporary, path)
         finally:
             os.unlink(temporary)
-
 
 
 _TORCH_DTYPES = {
@@ -370,7 +350,6 @@ def save_model(model, path):
     import shutil
     import tempfile
     from pathlib import Path
-
 
     path = Path(path)
     if path.exists():

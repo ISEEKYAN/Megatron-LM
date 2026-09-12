@@ -9,6 +9,7 @@ import math
 from dataclasses import dataclass, replace
 
 import torch
+from megatron.lite.primitive.modules.native_fp32_linear import Linear
 from megatron.lite.primitive.quantization import ds41_fp8
 from megatron.lite.primitive.quantization.ds41_index import fake_quant_index
 from megatron.lite.primitive.quantization.ds41_kv import fake_quant_main_kv
@@ -86,25 +87,6 @@ def rotate(x, positions, config, ratio, *, inverse=False):
     )
     rotated = torch.view_as_real(tail * phase).flatten(-2).to(x.dtype)
     return torch.cat([x[..., :-rd], rotated], -1)
-
-
-class Linear(nn.Linear):
-    def __init__(self, input_size, output_size, *, fp8=False, dtype=torch.bfloat16):
-        super().__init__(input_size, output_size, bias=False, dtype=dtype)
-        self.fp8 = fp8
-
-    def forward(self, x):
-        if getattr(self, 'native_fp32', False) and not self.fp8:
-            from megatron.lite.primitive.modules.native_fp32_linear import (
-                native_fp32_linear,
-            )
-
-            return native_fp32_linear(x, self.weight)
-        return (
-            ds41_fp8.dynamic_fp8_linear(x, self.weight)
-            if self.fp8
-            else F.linear(x, self.weight)
-        )
 
 
 class Compressor(nn.Module):

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
+from megatron.lite.primitive.modules.native_fp32_linear import FP4Linear
 from torch import nn
 from torch.nn import functional as F
 
@@ -59,31 +60,6 @@ class DeferredModule(nn.Module):
         return owner
 
 
-class FP4Linear(Linear):
-    """Group32 E8M0/E2M1 numerical provider with STE, not a native FP4 GEMM."""
-
-    def __init__(self, input_size, output_size, *, quantized):
-        super().__init__(input_size, output_size)
-        self.quantized = quantized
-
-    def forward(self, x):
-        if getattr(self, 'native_fp32', False):
-            from megatron.lite.primitive.modules.native_fp32_linear import (
-                native_fp32_linear,
-            )
-            from megatron.lite.primitive.quantization.ds41_index import fake_quant_index
-
-            return native_fp32_linear(
-                fake_quant_index(x, enabled=self.quantized),
-                fake_quant_index(self.weight, enabled=self.quantized),
-            )
-        if not self.quantized:
-            return F.linear(x, self.weight)
-        from megatron.lite.primitive.quantization.ds41_index import fake_quant_index
-
-        return F.linear(fake_quant_index(x), fake_quant_index(self.weight))
-
-
 class DeepseekV41Model(nn.Module):
     def __init__(
         self,
@@ -104,7 +80,9 @@ class DeepseekV41Model(nn.Module):
         t, v = cfg['text_config'], cfg['vision_config']
         self.hc_mult = t['hc_mult']
         self.vision_schedule = None
-        self.register_buffer('_vision_trainability', torch.full((4,), -1, dtype=torch.int8))
+        self.register_buffer(
+            '_vision_trainability', torch.full((4,), -1, dtype=torch.int8)
+        )
         self.register_load_state_dict_post_hook(self._restore_vision_trainability)
         count = t['num_hidden_layers']
         start, end = (0, count) if layer_range is None else layer_range
@@ -338,51 +316,42 @@ class DeepseekV41Model(nn.Module):
             swiglu_limit=t['swiglu_limit'],
         )
 
+    def _bind_weight(self, prefix, owner, name, role, heads=None, encoding=None):
+        self._bind(
+            f'{prefix}.{name}.weight',
+            getattr(owner, name),
+            'weight',
+            role,
+            heads,
+            encoding,
+        )
+
     def _bind_expert(self, prefix, expert, role, encoding):
         for name in ('w1', 'w2', 'w3'):
-            self._bind(
-                prefix + '.' + name + '.weight',
-                getattr(expert, name),
-                'weight',
-                role,
-                encoding=encoding,
-            )
+            self._bind_weight(prefix, expert, name, role, encoding=encoding)
 
     def _bind_attention(self, prefix, a, t):
         for name in ('wq_a', 'wq_b', 'wkv', 'wo_a', 'wo_b'):
             heads = t['num_attention_heads'] if name == 'wq_b' else None
-            self._bind(
-                prefix + '.' + name + '.weight',
-                getattr(a, name),
-                'weight',
-                name,
-                heads,
-                'F8_E4M3',
-            )
+            self._bind_weight(prefix, a, name, name, heads, 'F8_E4M3')
         for name in ('q_norm', 'kv_norm'):
-            self._bind(
-                prefix + '.' + name + '.weight', getattr(a, name), 'weight', 'norm'
-            )
+            self._bind_weight(prefix, a, name, 'norm')
         self._bind(prefix + '.attn_sink', a, 'attn_sink', 'attention_sink')
-        if a.compressor is not None:
-            for name in ('wkv', 'norm', 'wgate'):
-                if hasattr(a.compressor, name):
-                    self._bind(
-                        prefix + '.compressor.' + name + '.weight',
-                        getattr(a.compressor, name),
-                        'weight',
-                        'compressor',
-                    )
-        if a.indexer is not None:
-            for name in ('wq_b', 'weights_proj', 'wk', 'k_norm'):
-                if hasattr(a.indexer, name):
-                    self._bind(
-                        prefix + '.indexer.' + name + '.weight',
-                        getattr(a.indexer, name),
-                        'weight',
-                        'indexer',
-                        t['index_n_heads'] if name == 'wq_b' else None,
-                        'F8_E4M3' if name == 'wq_b' else None,
+        for role, names in (
+            ('compressor', ('wkv', 'norm', 'wgate')),
+            ('indexer', ('wq_b', 'weights_proj', 'wk', 'k_norm')),
+        ):
+            owner = getattr(a, role)
+            for name in names:
+                if hasattr(owner, name):
+                    indexed = role == 'indexer' and name == 'wq_b'
+                    self._bind_weight(
+                        f'{prefix}.{role}',
+                        owner,
+                        name,
+                        role,
+                        t['index_n_heads'] if indexed else None,
+                        'F8_E4M3' if indexed else None,
                     )
 
     @staticmethod

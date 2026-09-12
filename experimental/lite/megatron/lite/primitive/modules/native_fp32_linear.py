@@ -33,3 +33,30 @@ class _NativeLinear(torch.autograd.Function):
 
 def native_fp32_linear(x, weight):
     return _NativeLinear.apply(x, weight)
+
+
+class Linear(torch.nn.Linear):
+    """Bias-free floating, block-FP8 or group32-FP4 projection."""
+
+    def __init__(self, input_size, output_size, *, fp8=False, dtype=torch.bfloat16):
+        super().__init__(input_size, output_size, bias=False, dtype=dtype)
+        self.fp8 = fp8
+
+    def forward(self, x):
+        weight = self.weight
+        if getattr(self, 'quantized', False):
+            from megatron.lite.primitive.quantization.ds41_index import fake_quant_index
+
+            x, weight = fake_quant_index(x), fake_quant_index(weight)
+        if self.fp8:
+            from megatron.lite.primitive.quantization.ds41_fp8 import dynamic_fp8_linear
+
+            return dynamic_fp8_linear(x, weight)
+        linear = native_fp32_linear if getattr(self, 'native_fp32', False) else F.linear
+        return linear(x, weight)
+
+
+class FP4Linear(Linear):
+    def __init__(self, input_size, output_size, *, quantized):
+        super().__init__(input_size, output_size)
+        self.quantized = quantized
