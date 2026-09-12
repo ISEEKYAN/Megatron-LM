@@ -130,9 +130,7 @@ def test_qwen3_moe_canonical_state_key_maps_grouped_expert_master():
     )
 
 
-def test_qwen3_moe_mxfp4_resync_exports_compressed_tensors_stream(
-    monkeypatch,
-):
+def test_qwen3_moe_mxfp4_resync_exports_compressed_tensors_stream(monkeypatch):
     from megatron.lite.primitive.ckpt import hf_weights as hf_weights_module
 
     expert = torch.arange(64, dtype=torch.float32).reshape(2, 32) - 31
@@ -153,11 +151,7 @@ def test_qwen3_moe_mxfp4_resync_exports_compressed_tensors_stream(
 
     exported = dict(
         export_hf_weights(
-            object(),
-            SimpleNamespace(vocab_size=128),
-            object(),
-            target="mxfp4",
-            limit=4,
+            object(), SimpleNamespace(vocab_size=128), object(), target="mxfp4", limit=4
         )
     )
 
@@ -174,8 +168,7 @@ def test_qwen3_moe_mxfp4_resync_exports_compressed_tensors_stream(
     assert exported[f"{dense_prefix}.weight_scale"].shape == (2, 1)
     assert torch.equal(exported["model.layers.0.mlp.gate.weight"], router)
     assert torch.equal(
-        exported["model.layers.0.input_layernorm.weight"],
-        torch.ones(32),
+        exported["model.layers.0.input_layernorm.weight"], torch.ones(32)
     )
 
 

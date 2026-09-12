@@ -9,7 +9,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 from megatron.lite.primitive.optimizers.fsdp2 import (
     FSDP2Config,
     FSDP2Optimizer,
@@ -26,8 +25,12 @@ from megatron.lite.primitive.optimizers.fsdp2.wrap import build_fsdp2_shard_plac
 from megatron.lite.primitive.parallel.state import ParallelState
 
 fsdp2_wrap = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.wrap")
-fsdp2_optimizer = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.optimizer")
-fsdp2_grad_clip = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.grad_clip")
+fsdp2_optimizer = importlib.import_module(
+    "megatron.lite.primitive.optimizers.fsdp2.optimizer"
+)
+fsdp2_grad_clip = importlib.import_module(
+    "megatron.lite.primitive.optimizers.fsdp2.grad_clip"
+)
 fsdp2_adamw = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.adamw")
 
 
@@ -109,11 +112,7 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
     expert_mesh = SimpleNamespace(name="expert_dp")
     optimizer = object()
     ps = ParallelState(
-        pp_size=2,
-        ep_size=2,
-        dp_cp_size=4,
-        expert_dp_size=2,
-        ep_dp_group=object(),
+        pp_size=2, ep_size=2, dp_cp_size=4, expert_dp_size=2, ep_dp_group=object()
     )
 
     def fake_wrap_expert(module, _ps, config, **kwargs):
@@ -132,9 +131,7 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
     monkeypatch.setattr(fsdp2_optimizer, "wrap_fsdp2_module", fake_wrap_expert)
     monkeypatch.setattr(fsdp2_optimizer, "wrap_fsdp2", fake_wrap_dense)
     monkeypatch.setattr(
-        fsdp2_optimizer,
-        "build_fsdp2_adamw",
-        lambda *args, **kwargs: optimizer,
+        fsdp2_optimizer, "build_fsdp2_adamw", lambda *args, **kwargs: optimizer
     )
 
     result = fsdp2_optimizer.build_fsdp2_training_optimizer(
@@ -191,7 +188,9 @@ def test_fsdp2_optimizer_offloads_dtensor_state_without_extra_knob(monkeypatch):
     optimizer = FSDP2Optimizer(torch_optimizer, model.parameters())
     calls: list[bool] = []
 
-    def fake_move_optimizer_state_to_cpu(_optimizer, _offloaded_state, *, include_dtensor_state):
+    def fake_move_optimizer_state_to_cpu(
+        _optimizer, _offloaded_state, *, include_dtensor_state
+    ):
         calls.append(include_dtensor_state)
 
     monkeypatch.setattr(
@@ -228,7 +227,9 @@ def test_fsdp2_rejects_non_module_unit_path():
 
 
 def test_wrap_fsdp2_requires_distributed_when_mesh_is_not_provided(monkeypatch):
-    monkeypatch.setattr(fsdp2_wrap, "_load_fully_shard", lambda: lambda module, **kwargs: module)
+    monkeypatch.setattr(
+        fsdp2_wrap, "_load_fully_shard", lambda: lambda module, **kwargs: module
+    )
 
     with pytest.raises(RuntimeError, match="torch.distributed"):
         fsdp2_wrap.wrap_fsdp2(ToyModel(), ParallelState(), FSDP2Config())
@@ -284,7 +285,9 @@ def test_wrap_fsdp2_accepts_unit_module_import_paths(monkeypatch):
 
 def test_wrap_fsdp2_uses_container_order_without_nested_unit_duplicates(monkeypatch):
     model = nn.Module()
-    model.layers = nn.ModuleDict({"10": NestedToyBlock(), "2": ToyBlock(), "11": ToyBlock()})
+    model.layers = nn.ModuleDict(
+        {"10": NestedToyBlock(), "2": ToyBlock(), "11": ToyBlock()}
+    )
     calls: list[nn.Module] = []
 
     def fake_fully_shard(module, **kwargs):
@@ -395,7 +398,9 @@ def test_clip_grads_with_sharded_norm_scales_cpu_grads_once():
 
 
 @pytest.mark.gpus(1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for NCCL scalar test.")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required for NCCL scalar test."
+)
 def test_all_reduce_scalar_moves_cpu_value_to_nccl_device(monkeypatch):
     group = object()
     reduced_devices: list[str] = []
@@ -420,11 +425,7 @@ def test_all_reduce_scalar_moves_cpu_value_to_nccl_device(monkeypatch):
 
 def test_fsdp2_optimizer_uses_scalar_all_reduce_for_all_norm_groups(monkeypatch):
     groups = SimpleNamespace(
-        dp_cp=object(),
-        tp=object(),
-        replicated=object(),
-        expert=object(),
-        pp=object(),
+        dp_cp=object(), tp=object(), replicated=object(), expert=object(), pp=object()
     )
     reduced_groups: list[object] = []
 
@@ -449,11 +450,7 @@ def test_fsdp2_optimizer_uses_scalar_all_reduce_for_all_norm_groups(monkeypatch)
     optimizer = FSDP2Optimizer(
         torch.optim.SGD([sharded, replicated, expert, tp_replicated], lr=0.0),
         [sharded, replicated, expert, tp_replicated],
-        ParallelState(
-            dp_cp_group=groups.dp_cp,
-            tp_group=groups.tp,
-            pp_group=groups.pp,
-        ),
+        ParallelState(dp_cp_group=groups.dp_cp, tp_group=groups.tp, pp_group=groups.pp),
         clip_grad=100.0,
         replicated_grad_params=[replicated],
         replicated_grad_norm_group=groups.replicated,
@@ -492,7 +489,10 @@ def test_fp32_adamw_state_dict_roundtrip_cpu():
     param.grad = torch.tensor([0.5, -0.25], dtype=torch.bfloat16)
     optimizer.step()
     state = optimizer.state_dict()
-    expected = {key: state[key][0].clone() for key in ("master_params", "exp_avgs", "exp_avg_sqs")}
+    expected = {
+        key: state[key][0].clone()
+        for key in ("master_params", "exp_avgs", "exp_avg_sqs")
+    }
     for key, value in expected.items():
         state[key][0] = SimpleNamespace(_local_tensor=value)
 
@@ -514,7 +514,9 @@ def test_fp32_adamw_state_dict_roundtrip_cpu():
     loaded_state = loaded_optimizer.state_dict()
 
     assert loaded_state["step_count"] == state["step_count"]
-    torch.testing.assert_close(loaded_param, expected["master_params"].to(torch.bfloat16))
+    torch.testing.assert_close(
+        loaded_param, expected["master_params"].to(torch.bfloat16)
+    )
     for key, value in expected.items():
         torch.testing.assert_close(loaded_state[key][0], value)
     assert loaded_state["steps"] == state["steps"]
@@ -613,7 +615,9 @@ def test_fp32_adamw_load_matches_uninterrupted_next_step_cpu(cpu_update: bool):
     loaded_state = loaded_optimizer.state_dict()
     assert loaded_state["step_count"] == direct_state["step_count"]
     for key in ("master_params", "exp_avgs", "exp_avg_sqs"):
-        torch.testing.assert_close(loaded_state[key][0], direct_state[key][0], atol=0.0, rtol=0.0)
+        torch.testing.assert_close(
+            loaded_state[key][0], direct_state[key][0], atol=0.0, rtol=0.0
+        )
     assert loaded_state["steps"] == direct_state["steps"]
 
 
@@ -629,7 +633,9 @@ def test_fused_sq_sum_matches_reference():
         torch.randn(64, 64)[:, ::2],
         torch.randn(0),
     ]
-    total = fsdp2_grad_clip.fused_sq_sum(tensors, dtype=torch.float32, device=torch.device("cpu"))
+    total = fsdp2_grad_clip.fused_sq_sum(
+        tensors, dtype=torch.float32, device=torch.device("cpu")
+    )
     assert total.ndim == 0 and total.dtype is torch.float32
     assert float(total) == pytest.approx(_reference_sq_sum(tensors), rel=1e-5)
 
@@ -645,11 +651,16 @@ def test_fused_sq_sum_launches_one_kernel_per_dtype(monkeypatch):
         assert len({t.dtype for t in bucket}) == 1
         assert all(t.is_contiguous() for t in bucket)
         launches.append((len(bucket), bucket[0].dtype))
-        return torch.tensor([_reference_sq_sum(bucket) ** 0.5], dtype=torch.float32), None
+        return (
+            torch.tensor([_reference_sq_sum(bucket) ** 0.5], dtype=torch.float32),
+            None,
+        )
 
     # CPU-only test env: force the CUDA-eligibility check so the bucket path runs.
     monkeypatch.setattr(fsdp2_grad_clip, "multi_tensor_applier", fake_applier)
-    monkeypatch.setattr(fsdp2_grad_clip, "_is_fused_eligible", lambda t: t.is_contiguous())
+    monkeypatch.setattr(
+        fsdp2_grad_clip, "_is_fused_eligible", lambda t: t.is_contiguous()
+    )
 
     torch.manual_seed(0)
     tensors = [
@@ -658,7 +669,9 @@ def test_fused_sq_sum_launches_one_kernel_per_dtype(monkeypatch):
         torch.randn(128),
         torch.randn(64, 64)[:, ::2],
     ]
-    total = fsdp2_grad_clip.fused_sq_sum(tensors, dtype=torch.float32, device=torch.device("cpu"))
+    total = fsdp2_grad_clip.fused_sq_sum(
+        tensors, dtype=torch.float32, device=torch.device("cpu")
+    )
     assert sorted(launches) == [(1, torch.float32), (2, torch.bfloat16)]
     assert float(total) == pytest.approx(_reference_sq_sum(tensors), rel=1e-5)
 
@@ -677,17 +690,23 @@ def test_grad_norm_paths_accumulate_bf16_in_fp32():
     ):
         assert actual.dtype is torch.float32
         assert float(actual) == pytest.approx(expected, rel=1e-5)
-    assert float(fsdp2_grad_clip.sharded_grad_abs_max([param, plain])) == pytest.approx(7.0)
+    assert float(fsdp2_grad_clip.sharded_grad_abs_max([param, plain])) == pytest.approx(
+        7.0
+    )
 
 
 @pytest.mark.gpus(1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="TE multi_tensor_l2norm is CUDA-only.")
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="TE multi_tensor_l2norm is CUDA-only."
+)
 def test_fused_sq_sum_allocates_no_full_size_temporary():
     grad = torch.randn(64 * 1024 * 1024, dtype=torch.bfloat16, device="cuda")
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     before = torch.cuda.memory_allocated()
-    total = fsdp2_grad_clip.fused_sq_sum([grad], dtype=torch.float32, device=grad.device)
+    total = fsdp2_grad_clip.fused_sq_sum(
+        [grad], dtype=torch.float32, device=grad.device
+    )
     torch.cuda.synchronize()
     # to(float32).pow(2) would add 4x the grad here.
     assert torch.cuda.max_memory_allocated() - before < 1 << 20
@@ -698,7 +717,11 @@ def test_fused_sq_sum_allocates_no_full_size_temporary():
 def test_fp32_adamw_bf16_grad_matches_legacy_fp32_grad_copy(monkeypatch, cpu_update):
     def legacy_prepare_grad(self, grad, master):
         if self.cpu_update:
-            return to_local_tensor(grad).detach().to(device=master.device, dtype=torch.float32)
+            return (
+                to_local_tensor(grad)
+                .detach()
+                .to(device=master.device, dtype=torch.float32)
+            )
         return grad.detach().to(dtype=torch.float32)
 
     torch.manual_seed(0)
@@ -721,7 +744,9 @@ def test_fp32_adamw_bf16_grad_matches_legacy_fp32_grad_copy(monkeypatch, cpu_upd
             opt=SimpleNamespace(),
         )
         assert isinstance(optimizer, fsdp2_adamw.FP32AdamW)
-        for _ in range(4):  # several steps so bias correction and state carry-over count
+        for _ in range(
+            4
+        ):  # several steps so bias correction and state carry-over count
             param.grad = grad.clone()
             optimizer.step()
         state = optimizer.state_dict()

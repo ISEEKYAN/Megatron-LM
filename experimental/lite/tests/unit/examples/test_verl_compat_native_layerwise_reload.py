@@ -47,11 +47,11 @@ def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:
             events.append(("exit-config", config))
 
     vllm_config.set_current_vllm_config = set_current_vllm_config
-    reload_api.initialize_layerwise_reload = (
-        lambda model: events.append(("initialize", model))
+    reload_api.initialize_layerwise_reload = lambda model: events.append(
+        ("initialize", model)
     )
-    reload_api.finalize_layerwise_processing = (
-        lambda model, config: events.append(("finalize", model, config))
+    reload_api.finalize_layerwise_processing = lambda model, config: events.append(
+        ("finalize", model, config)
     )
     rollout_utils.load_quanted_weights = fp8_utils.load_quanted_weights
     for module in (
@@ -85,7 +85,9 @@ def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:
     fp8_utils.process_quanted_weights_after_loading(runner, state)
     assert model._verl_mlite_ds4_layerwise_reload_active is False
     assert "legacy-prepare" not in events
-    assert not any(isinstance(event, tuple) and event[0] == "legacy-process" for event in events)
+    assert not any(
+        isinstance(event, tuple) and event[0] == "legacy-process" for event in events
+    )
     assert events == [
         ("enter-config", config),
         ("initialize", model),

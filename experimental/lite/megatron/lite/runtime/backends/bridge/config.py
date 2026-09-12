@@ -6,7 +6,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, pick_fields
+from megatron.lite.runtime.contracts.config import (
+    OptimizerConfig,
+    ParallelConfig,
+    pick_fields,
+)
 
 
 @dataclass
@@ -53,7 +57,9 @@ class BridgeConfig:
 
         parallel_src = cfg.get("parallel")
         parallel_data = (
-            pick_fields(ParallelConfig, parallel_src) if isinstance(parallel_src, dict) else {}
+            pick_fields(ParallelConfig, parallel_src)
+            if isinstance(parallel_src, dict)
+            else {}
         )
         parallel_data.update(pick_fields(ParallelConfig, cfg))
         parallel = ParallelConfig(**parallel_data)

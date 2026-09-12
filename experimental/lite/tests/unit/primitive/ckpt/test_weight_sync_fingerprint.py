@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import torch
-
 from megatron.lite.primitive.ckpt.weight_sync_fingerprint import (
     _sample_indices,
     stream_fingerprint,

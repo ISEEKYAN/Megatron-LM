@@ -17,7 +17,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 from megatron.lite.primitive.parallel.state import ParallelState
 
 UnitModule = type[nn.Module] | str
@@ -77,7 +76,9 @@ def fsdp2_available() -> bool:
     return True
 
 
-def build_fsdp2_device_mesh(ps: ParallelState, config: FSDP2Config | None = None) -> Any:
+def build_fsdp2_device_mesh(
+    ps: ParallelState, config: FSDP2Config | None = None
+) -> Any:
     """Build the default one-dimensional FSDP2 DeviceMesh from ``ParallelState``."""
 
     cfg = config or FSDP2Config()
@@ -111,7 +112,9 @@ def build_fsdp2_process_group_mesh(
 
     from torch.distributed import DeviceMesh
 
-    return DeviceMesh.from_group(group, device_type=device_type, mesh_dim_names=(mesh_dim_name,))
+    return DeviceMesh.from_group(
+        group, device_type=device_type, mesh_dim_names=(mesh_dim_name,)
+    )
 
 
 def build_fsdp2_shard_placement_fn(fsdp_size: int) -> Callable[[nn.Parameter], Any]:
@@ -169,7 +172,9 @@ def wrap_fsdp2(
     )
 
     wrapped_units: list[nn.Module] = []
-    unit_modules = list(_iter_fsdp2_unit_modules(model, unit_types, cfg.leaf_module_names))
+    unit_modules = list(
+        _iter_fsdp2_unit_modules(model, unit_types, cfg.leaf_module_names)
+    )
     for idx, sub_module in enumerate(unit_modules):
         kwargs = dict(common_kwargs)
         _set_optional_reshard_after_forward(
@@ -316,7 +321,9 @@ def _load_fully_shard():
     return fully_shard
 
 
-def _resolve_unit_module_types(unit_modules: Iterable[UnitModule]) -> tuple[type[nn.Module], ...]:
+def _resolve_unit_module_types(
+    unit_modules: Iterable[UnitModule],
+) -> tuple[type[nn.Module], ...]:
     resolved: list[type[nn.Module]] = []
     for item in unit_modules:
         if isinstance(item, str):
@@ -336,12 +343,16 @@ def _import_module_type(path: str) -> type[nn.Module]:
     module = importlib.import_module(module_name)
     obj = getattr(module, attr_name)
     if not isinstance(obj, type) or not issubclass(obj, nn.Module):
-        raise TypeError(f"FSDP2 unit module path does not resolve to nn.Module: {path!r}")
+        raise TypeError(
+            f"FSDP2 unit module path does not resolve to nn.Module: {path!r}"
+        )
     return obj
 
 
 def _iter_fsdp2_unit_modules(
-    root: nn.Module, unit_types: tuple[type[nn.Module], ...], leaf_module_names: tuple[str, ...]
+    root: nn.Module,
+    unit_types: tuple[type[nn.Module], ...],
+    leaf_module_names: tuple[str, ...],
 ) -> Iterable[nn.Module]:
     leaf_names = set(leaf_module_names)
     if not unit_types and not leaf_names:
@@ -387,7 +398,11 @@ def _is_fsdp2_module(module: nn.Module) -> bool:
 
 
 def _apply_fsdp2_prefetch(
-    root: nn.Module, wrapped_units: list[nn.Module], *, forward_depth: int, backward_depth: int
+    root: nn.Module,
+    wrapped_units: list[nn.Module],
+    *,
+    forward_depth: int,
+    backward_depth: int,
 ) -> None:
     fsdp_units = [module for module in wrapped_units if _is_fsdp2_module(module)]
     fsdp_root = root if _is_fsdp2_module(root) else None
@@ -408,7 +423,9 @@ def _apply_fsdp2_prefetch(
                 fsdp_units[idx].set_modules_to_backward_prefetch(targets)
 
 
-def _unit_reshard_after_forward(cfg: FSDP2Config, idx: int, total_units: int) -> bool | int | None:
+def _unit_reshard_after_forward(
+    cfg: FSDP2Config, idx: int, total_units: int
+) -> bool | int | None:
     if total_units > 0 and idx == total_units - 1:
         return cfg.last_unit_reshard_after_forward
     return cfg.reshard_after_forward
@@ -445,7 +462,11 @@ def _fully_shard_kwargs(
 
 
 def _mixed_precision_policy_from_config(cfg: FSDP2Config) -> Any | None:
-    if cfg.param_dtype is None and cfg.reduce_dtype is None and cfg.output_dtype is None:
+    if (
+        cfg.param_dtype is None
+        and cfg.reduce_dtype is None
+        and cfg.output_dtype is None
+    ):
         return None
     try:
         from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -471,7 +492,9 @@ def _resolve_torch_dtype(dtype: str | torch.dtype | None) -> torch.dtype | None:
     name = dtype.removeprefix("torch.")
     resolved = getattr(torch, name, None)
     if not isinstance(resolved, torch.dtype):
-        raise ValueError(f"Unsupported torch dtype for FSDP2 mixed precision: {dtype!r}")
+        raise ValueError(
+            f"Unsupported torch dtype for FSDP2 mixed precision: {dtype!r}"
+        )
     return resolved
 
 
@@ -479,7 +502,9 @@ def _save_param_attrs(module: nn.Module) -> dict[str, dict[str, Any]]:
     return {name: dict(vars(param)) for name, param in module.named_parameters()}
 
 
-def _restore_param_attrs(module: nn.Module, saved_attrs: dict[str, dict[str, Any]]) -> None:
+def _restore_param_attrs(
+    module: nn.Module, saved_attrs: dict[str, dict[str, Any]]
+) -> None:
     for name, param in module.named_parameters():
         for attr_name, attr_value in saved_attrs.get(name, {}).items():
             setattr(param, attr_name, attr_value)

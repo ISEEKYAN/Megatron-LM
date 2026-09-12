@@ -83,7 +83,9 @@ def test_gqa_split_grouped_qkvg_preserves_q_gate_kv_order():
     split_grouped_qkvg = _split_grouped_qkvg()
     qkv = torch.arange(24).reshape(1, 24)
 
-    query, gate, key, value = split_grouped_qkvg(qkv, num_heads=4, num_kv_heads=2, head_dim=2)
+    query, gate, key, value = split_grouped_qkvg(
+        qkv, num_heads=4, num_kv_heads=2, head_dim=2
+    )
 
     assert query.shape == (1, 4, 2)
     assert gate.shape == (1, 4, 2)
@@ -130,12 +132,7 @@ def test_gqa_kv_replication_selects_distinct_queries_and_reuses_kv():
 
     per_rank = [
         split_grouped_qkvg_for_tp(
-            qkvg,
-            num_heads=8,
-            num_kv_heads=2,
-            head_dim=1,
-            tp_rank=rank,
-            tp_size=4,
+            qkvg, num_heads=8, num_kv_heads=2, head_dim=1, tp_rank=rank, tp_size=4
         )
         for rank in range(4)
     ]
@@ -306,8 +303,7 @@ def test_router_replay_rejects_nonzero_aux_loss(router_kind):
     router.router_replay = RouterReplay()
     router.train()
     RouterReplay.set_replay_data(
-        [torch.tensor([[0, 1], [1, 2]])],
-        replay_mask=torch.tensor([True, True]),
+        [torch.tensor([[0, 1], [1, 2]])], replay_mask=torch.tensor([True, True])
     )
     RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
@@ -389,33 +385,17 @@ def test_dsa_index_share_pipeline_guard_rejects_cross_stage_sources():
     )
 
     validate_dsa_index_share_pipeline_split(
-        [0, 1, 2, 3],
-        topk_freq=4,
-        skip_topk_offset=3,
+        [0, 1, 2, 3], topk_freq=4, skip_topk_offset=3
     )
     with pytest.raises(ValueError, match="cannot cross pipeline stages"):
         validate_dsa_index_share_pipeline_split(
-            [3, 4, 5],
-            topk_freq=4,
-            skip_topk_offset=3,
+            [3, 4, 5], topk_freq=4, skip_topk_offset=3
         )
     with pytest.raises(ValueError, match="must execute before"):
-        validate_dsa_index_share_pipeline_split(
-            [3, 2],
-            topk_freq=4,
-            skip_topk_offset=3,
-        )
+        validate_dsa_index_share_pipeline_split([3, 2], topk_freq=4, skip_topk_offset=3)
     # Global layer index 3 is the first MTP layer for a 3-layer trunk in this
     # configuration.  It is shared from trunk layer 2 and must not sit alone on
     # the final pipeline stage.
     with pytest.raises(ValueError, match="cannot cross pipeline stages"):
-        validate_dsa_index_share_pipeline_split(
-            [3],
-            topk_freq=4,
-            skip_topk_offset=3,
-        )
-    validate_dsa_index_share_pipeline_split(
-        [2, 3],
-        topk_freq=4,
-        skip_topk_offset=3,
-    )
+        validate_dsa_index_share_pipeline_split([3], topk_freq=4, skip_topk_offset=3)
+    validate_dsa_index_share_pipeline_split([2, 3], topk_freq=4, skip_topk_offset=3)

@@ -8,7 +8,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 from megatron.lite.primitive.optimizers.fsdp2 import (
     FSDP2Config,
     build_fsdp2_adamw,
@@ -16,7 +15,10 @@ from megatron.lite.primitive.optimizers.fsdp2 import (
     fsdp2_available,
     wrap_fsdp2,
 )
-from megatron.lite.primitive.optimizers.fsdp2.adamw import iter_torch_optimizers, to_local_tensor
+from megatron.lite.primitive.optimizers.fsdp2.adamw import (
+    iter_torch_optimizers,
+    to_local_tensor,
+)
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import ParallelConfig
@@ -94,7 +96,9 @@ def _checkpoint_config():
     return SimpleNamespace(parallel=ParallelConfig())
 
 
-def _build_fsdp2_model(dtype: torch.dtype = torch.bfloat16) -> tuple[nn.Module, ParallelState]:
+def _build_fsdp2_model(
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[nn.Module, ParallelState]:
     torch.manual_seed(1234)
     model = TinyModel().cuda().to(dtype=dtype)
     ps = _parallel_state()
@@ -163,14 +167,19 @@ def _assert_local_params_close(lhs: nn.Module, rhs: nn.Module):
     rhs_params = _local_named_params(rhs)
     assert lhs_params.keys() == rhs_params.keys()
     for name in lhs_params:
-        torch.testing.assert_close(lhs_params[name], rhs_params[name], atol=0.0, rtol=0.0)
+        torch.testing.assert_close(
+            lhs_params[name], rhs_params[name], atol=0.0, rtol=0.0
+        )
 
 
 def test_fsdp2_runtime_model_and_optimizer_offload_roundtrip_single_node():
     model, ps = _build_fsdp2_model()
     optimizer = _build_optimizer(model, ps, offload_fraction=0.0)
     handle = ModelHandle(
-        model=model, optimizer=optimizer, parallel_state=ps, _extras={"model_chunks": [model]}
+        model=model,
+        optimizer=optimizer,
+        parallel_state=ps,
+        _extras={"model_chunks": [model]},
     )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 

@@ -65,13 +65,22 @@ class DeepseekV4Config:
     @classmethod
     def _from_hf_dict(cls, hf: dict[str, Any], **overrides) -> DeepseekV4Config:
         hf_fields = {item.name for item in fields(cls)}
-        kwargs = {key: value for key, value in hf.items() if key in hf_fields and value is not None}
-        if "num_nextn_predict_layers" not in kwargs and hf.get("num_nextn_predict") is not None:
+        kwargs = {
+            key: value
+            for key, value in hf.items()
+            if key in hf_fields and value is not None
+        }
+        if (
+            "num_nextn_predict_layers" not in kwargs
+            and hf.get("num_nextn_predict") is not None
+        ):
             kwargs["num_nextn_predict_layers"] = int(hf["num_nextn_predict"])
         rope_parameters = hf.get("rope_parameters")
         if isinstance(rope_parameters, dict):
             if "rope_theta" not in kwargs:
-                kwargs["rope_theta"] = float(rope_parameters.get("rope_theta", cls.rope_theta))
+                kwargs["rope_theta"] = float(
+                    rope_parameters.get("rope_theta", cls.rope_theta)
+                )
         rope_scaling = hf.get("rope_scaling")
         if isinstance(rope_scaling, dict):
             if rope_scaling.get("factor") is not None:

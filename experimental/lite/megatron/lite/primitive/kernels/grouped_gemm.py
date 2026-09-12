@@ -5,7 +5,9 @@ from __future__ import annotations
 
 try:
     import grouped_gemm  # pyright: ignore[reportMissingImports]
-except Exception:  # pragma: no cover - optional fused kernel or missing shared libraries.
+except (
+    Exception
+):  # pragma: no cover - optional fused kernel or missing shared libraries.
     grouped_gemm = None  # type: ignore[assignment]
 
 

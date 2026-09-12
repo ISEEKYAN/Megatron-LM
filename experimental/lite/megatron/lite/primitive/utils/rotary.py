@@ -8,9 +8,8 @@ from functools import lru_cache
 from typing import Optional
 
 import torch
-from torch import Tensor, nn
-
 from megatron.lite.primitive.utils.rope import get_pos_emb_on_this_cp_rank
+from torch import Tensor, nn
 
 
 def _default_rope_device(use_cpu_initialization: bool) -> str | torch.device:
@@ -42,10 +41,13 @@ class RotaryEmbedding(nn.Module):
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         device = _default_rope_device(use_cpu_initialization)
         self.inv_freq = 1.0 / (
-            rotary_base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+            rotary_base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
         )
         if rope_scaling:
-            self.inv_freq = self._apply_scaling(self.inv_freq, factor=rope_scaling_factor)
+            self.inv_freq = self._apply_scaling(
+                self.inv_freq, factor=rope_scaling_factor
+            )
         self.cp_group = cp_group
 
     def _apply_scaling(
@@ -61,9 +63,9 @@ class RotaryEmbedding(nn.Module):
 
         wavelen = 2 * math.pi / freqs
         inv_freq_llama = torch.where(wavelen > low_freq_wavelen, freqs / factor, freqs)
-        smooth_factor = (original_max_position_embeddings / wavelen - low_freq_factor) / (
-            high_freq_factor - low_freq_factor
-        )
+        smooth_factor = (
+            original_max_position_embeddings / wavelen - low_freq_factor
+        ) / (high_freq_factor - low_freq_factor)
         smoothed_inv_freq = (
             1 - smooth_factor
         ) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
@@ -72,7 +74,9 @@ class RotaryEmbedding(nn.Module):
 
     def get_freqs_non_repeated(self, max_seq_len: int, offset: int = 0) -> Tensor:
         seq = (
-            torch.arange(max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+            torch.arange(
+                max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype
+            )
             + offset
         )
         if self.seq_len_interpolation_factor is not None:
@@ -149,12 +153,18 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         device = _default_rope_device(use_cpu_initialization)
         self.inv_freq_extra = 1.0 / (
             self.rotary_base
-            ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
+            ** (
+                torch.arange(0, self.dim, 2, dtype=torch.float32, device=device)
+                / self.dim
+            )
         )
         self.inv_freq_inter = 1.0 / (
             self.scaling_factor
             * self.rotary_base
-            ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
+            ** (
+                torch.arange(0, self.dim, 2, dtype=torch.float32, device=device)
+                / self.dim
+            )
         )
         super().__init__(
             kv_channels=kv_channels,
@@ -166,17 +176,25 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             cp_group=cp_group,
         )
         self._set_cos_sin_cache(
-            self.original_max_position_embeddings, offset=0, dtype=torch.get_default_dtype()
+            self.original_max_position_embeddings,
+            offset=0,
+            dtype=torch.get_default_dtype(),
         )
         self.forward.cache_clear()
 
     def get_emb(self, max_seq_len: int, offset: int = 0) -> tuple[Tensor, float]:
         if self.rotary_interleaved:
-            raise AssertionError("YARN RoPE does not support interleaved rotary embeddings")
+            raise AssertionError(
+                "YARN RoPE does not support interleaved rotary embeddings"
+            )
         if self.inv_freq_extra.device.type == "cpu" and torch.cuda.is_available():
-            self.inv_freq_extra = self.inv_freq_extra.to(device=torch.cuda.current_device())
+            self.inv_freq_extra = self.inv_freq_extra.to(
+                device=torch.cuda.current_device()
+            )
         if self.inv_freq_inter.device.type == "cpu" and torch.cuda.is_available():
-            self.inv_freq_inter = self.inv_freq_inter.to(device=torch.cuda.current_device())
+            self.inv_freq_inter = self.inv_freq_inter.to(
+                device=torch.cuda.current_device()
+            )
 
         low, high = _yarn_find_correction_range(
             self.beta_fast,
@@ -189,10 +207,15 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(
             low, high, self.dim // 2, device=self.inv_freq_extra.device
         ).to(dtype=torch.float32)
-        inv_freq = self.inv_freq_inter * (1 - inv_freq_mask) + self.inv_freq_extra * inv_freq_mask
+        inv_freq = (
+            self.inv_freq_inter * (1 - inv_freq_mask)
+            + self.inv_freq_extra * inv_freq_mask
+        )
         seq = (
             torch.arange(
-                max_seq_len, device=self.inv_freq_extra.device, dtype=self.inv_freq_extra.dtype
+                max_seq_len,
+                device=self.inv_freq_extra.device,
+                dtype=self.inv_freq_extra.dtype,
             )
             + offset
         )
@@ -218,21 +241,34 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
         return emb, concentration
 
-    def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq=False, cp_group=None):
+    def _set_cos_sin_cache(
+        self, seq_len, offset, dtype, packed_seq=False, cp_group=None
+    ):
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset
         self.dtype_cached = dtype
         self.packed_seq_cached = packed_seq
-        emb, concentration = self.forward(seq_len, offset, packed_seq=packed_seq, cp_group=cp_group)
-        self.register_buffer(
-            "cos_cached", (emb.cos() * concentration).to(dtype).contiguous(), persistent=False
+        emb, concentration = self.forward(
+            seq_len, offset, packed_seq=packed_seq, cp_group=cp_group
         )
         self.register_buffer(
-            "sin_cached", (emb.sin() * concentration).to(dtype).contiguous(), persistent=False
+            "cos_cached",
+            (emb.cos() * concentration).to(dtype).contiguous(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sin_cached",
+            (emb.sin() * concentration).to(dtype).contiguous(),
+            persistent=False,
         )
 
     def get_cached_cos_sin(
-        self, seq_len, offset=0, dtype=torch.get_default_dtype(), packed_seq=False, cp_group=None
+        self,
+        seq_len,
+        offset=0,
+        dtype=torch.get_default_dtype(),
+        packed_seq=False,
+        cp_group=None,
     ):
         if (
             seq_len > self.max_seq_len_cached
@@ -245,7 +281,10 @@ class YarnRotaryEmbedding(RotaryEmbedding):
 
 
 def _yarn_find_correction_dim(
-    num_rotations: float, dim: int, rotary_base: float = 10000, max_position_embeddings: int = 2048
+    num_rotations: float,
+    dim: int,
+    rotary_base: float = 10000,
+    max_position_embeddings: int = 2048,
 ) -> float:
     return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
         2 * math.log(rotary_base)
@@ -261,7 +300,9 @@ def _yarn_find_correction_range(
     round_to_int: bool = True,
 ) -> tuple[int, int]:
     low = _yarn_find_correction_dim(low_rot, dim, rotary_base, max_position_embeddings)
-    high = _yarn_find_correction_dim(high_rot, dim, rotary_base, max_position_embeddings)
+    high = _yarn_find_correction_dim(
+        high_rot, dim, rotary_base, max_position_embeddings
+    )
     if round_to_int:
         low = math.floor(low)
         high = math.ceil(high)
@@ -292,7 +333,8 @@ def _yarn_get_concentration_factor(
     if mscale is None or mscale_all_dim is None:
         return _yarn_get_mscale(scaling_factor)
     return float(
-        _yarn_get_mscale(scaling_factor, mscale) / _yarn_get_mscale(scaling_factor, mscale_all_dim)
+        _yarn_get_mscale(scaling_factor, mscale)
+        / _yarn_get_mscale(scaling_factor, mscale_all_dim)
     )
 
 

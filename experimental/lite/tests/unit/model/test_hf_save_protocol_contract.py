@@ -8,9 +8,7 @@ import importlib
 from pathlib import Path
 
 import pytest
-
 from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES
-
 
 LITE_ROOT = Path(__file__).resolve().parents[3]
 _REGISTERED_PROTOCOLS = sorted(TRAIN_RUNTIME_MODULES.items())
@@ -32,9 +30,9 @@ def test_registered_protocol_exposes_hf_save(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
-    assert "save_hf_weights" in functions, (
-        f"{runtime_name} ({module_name}) cannot honor save_contents=['hf_model']"
-    )
+    assert (
+        "save_hf_weights" in functions
+    ), f"{runtime_name} ({module_name}) cannot honor save_contents=['hf_model']"
 
 
 @pytest.mark.parametrize("model_name", ["kimi_k2", "qwen3_moe"])
@@ -56,19 +54,9 @@ def test_new_hf_save_protocols_delegate_all_arguments(
     )
     chunks, model_cfg, parallel_state = object(), object(), object()
 
-    protocol.save_hf_weights(
-        chunks,
-        "/tmp/hf-save-contract",
-        model_cfg,
-        parallel_state,
-    )
+    protocol.save_hf_weights(chunks, "/tmp/hf-save-contract", model_cfg, parallel_state)
 
-    assert calls == [
-        (
-            (chunks, "/tmp/hf-save-contract", model_cfg, parallel_state),
-            {},
-        )
-    ]
+    assert calls == [((chunks, "/tmp/hf-save-contract", model_cfg, parallel_state), {})]
 
 
 # Engine-side ``save_contents=['hf_model']`` unconditionally forwards

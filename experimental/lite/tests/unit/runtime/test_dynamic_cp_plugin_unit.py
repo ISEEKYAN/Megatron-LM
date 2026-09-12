@@ -431,12 +431,7 @@ def test_dynamic_cp_enables_transformer_engine_batched_p2p(monkeypatch):
     monkeypatch.setenv("NVTE_BATCH_MHA_P2P_COMM", "0")
     pool, singleton, cp2 = _Group(4), _Group(1), _Group(2)
     ps = SimpleNamespace(
-        dp_size=4,
-        dp_rank=0,
-        dp_group=pool,
-        dp_cp_group=pool,
-        cp_size=1,
-        pp_size=1,
+        dp_size=4, dp_rank=0, dp_group=pool, dp_cp_group=pool, cp_size=1, pp_size=1
     )
     handle = ModelHandle(
         model=object(),
@@ -449,11 +444,7 @@ def test_dynamic_cp_enables_transformer_engine_batched_p2p(monkeypatch):
     )
     plugin = DynamicCPPlugin(
         {"max_seqlen_per_dp_cp_rank": 8},
-        create_groups=lambda _ps, _minimum, _parallel: {
-            1: singleton,
-            2: cp2,
-            4: pool,
-        },
+        create_groups=lambda _ps, _minimum, _parallel: {1: singleton, 2: cp2, 4: pool},
     )
 
     plugin.initialize(handle)

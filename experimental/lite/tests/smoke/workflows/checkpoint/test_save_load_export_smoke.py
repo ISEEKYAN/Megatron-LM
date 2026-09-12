@@ -24,7 +24,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.deterministic import set_deterministic
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
@@ -172,7 +171,9 @@ def _glm5():
 
 
 def _deepseek_v4():
-    pytest.importorskip("cudnn", reason="deepseek_v4 fused DSA needs the cudnn DSA stack.")
+    pytest.importorskip(
+        "cudnn", reason="deepseek_v4 fused DSA needs the cudnn DSA stack."
+    )
     _require_te()
     from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
     from megatron.lite.model.deepseek_v4.lite import protocol
@@ -451,7 +452,9 @@ def _local_named_params(handle: ModelHandle) -> dict[str, torch.Tensor]:
     params: dict[str, torch.Tensor] = {}
     for chunk_idx, chunk in enumerate(handle._extras["model_chunks"]):
         for name, param in chunk.named_parameters():
-            params[f"{chunk_idx}.{name}"] = to_local_tensor(param.detach()).cpu().float().clone()
+            params[f"{chunk_idx}.{name}"] = (
+                to_local_tensor(param.detach()).cpu().float().clone()
+            )
     return params
 
 
@@ -465,7 +468,9 @@ def _assert_params_bitwise_equal(lhs: ModelHandle, rhs: ModelHandle) -> None:
         if not torch.equal(lhs_params[name], rhs_params[name]):
             diff = (lhs_params[name] - rhs_params[name]).abs().max().item()
             mismatches.append(f"{name} (max_abs_diff={diff})")
-    assert not mismatches, "save/load not bitwise; mismatched params:\n" + "\n".join(mismatches)
+    assert not mismatches, "save/load not bitwise; mismatched params:\n" + "\n".join(
+        mismatches
+    )
 
 
 def _is_valid_hf_export_key(key: str, model_name: str) -> bool:
@@ -487,7 +492,9 @@ def _is_valid_hf_export_key(key: str, model_name: str) -> bool:
     return key.startswith("model.") or key in ("lm_head.weight",)
 
 
-def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str, model_name: str) -> None:
+def _export_and_reload(
+    handle: ModelHandle, cfg, protocol, out_dir: str, model_name: str
+) -> None:
     """Export HF weights (bf16) and assert the reloaded shards are valid.
 
     Prefer the model's ``save_hf_weights`` wrapper; some models only expose the
@@ -535,17 +542,21 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str, model_n
                         if key.endswith(".e_score_correction_bias")
                         else torch.bfloat16
                     )
-                    assert tensor.dtype == expected_dtype, (
-                        f"{key} exported as {tensor.dtype}, want {expected_dtype}"
-                    )
+                    assert (
+                        tensor.dtype == expected_dtype
+                    ), f"{key} exported as {tensor.dtype}, want {expected_dtype}"
                 else:
-                    assert tensor.dtype in (torch.int64, torch.int32, torch.bool), (
-                        f"{key} exported as unexpected non-float dtype {tensor.dtype}"
-                    )
-                assert torch.isfinite(tensor.float()).all(), f"{key} has non-finite values"
-                assert _is_valid_hf_export_key(key, model_name), (
-                    f"unexpected non-HF export key: {key}"
-                )
+                    assert tensor.dtype in (
+                        torch.int64,
+                        torch.int32,
+                        torch.bool,
+                    ), f"{key} exported as unexpected non-float dtype {tensor.dtype}"
+                assert torch.isfinite(
+                    tensor.float()
+                ).all(), f"{key} has non-finite values"
+                assert _is_valid_hf_export_key(
+                    key, model_name
+                ), f"unexpected non-HF export key: {key}"
                 keys.add(key)
     assert keys, "exported zero tensors"
     # PP-gather completeness: the rank-0 export must carry EVERY decoder layer's
@@ -671,7 +682,10 @@ def _iter_opt_state_tensors(handle: ModelHandle, backend: str):
 def _opt_state_devices(handle: ModelHandle, backend: str) -> set[str]:
     from megatron.lite.primitive.optimizers.fsdp2.adamw import to_local_tensor
 
-    return {to_local_tensor(v).device.type for _, v in _iter_opt_state_tensors(handle, backend)}
+    return {
+        to_local_tensor(v).device.type
+        for _, v in _iter_opt_state_tensors(handle, backend)
+    }
 
 
 def _opt_state_snapshot(handle: ModelHandle, backend: str) -> dict[str, torch.Tensor]:
@@ -700,7 +714,9 @@ def _assert_named_bitwise_equal(lhs: dict, rhs: dict, label: str) -> None:
         if not torch.equal(lhs[name], rhs[name]):
             diff = (lhs[name] - rhs[name]).abs().max().item()
             mismatches.append(f"{name} (max_abs_diff={diff})")
-    assert not mismatches, f"{label} not bitwise after offload/onload:\n" + "\n".join(mismatches)
+    assert not mismatches, f"{label} not bitwise after offload/onload:\n" + "\n".join(
+        mismatches
+    )
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -724,18 +740,24 @@ def test_offload_onload_roundtrip(model_name, backend, tmp_path):
     assert _opt_state_devices(handle, backend) == {"cuda"}
 
     runtime.to(handle, "cpu", model=True, optimizer=True, grad=True)
-    assert _opt_state_devices(handle, backend) == {"cpu"}, "optimizer state not offloaded to CPU."
+    assert _opt_state_devices(handle, backend) == {
+        "cpu"
+    }, "optimizer state not offloaded to CPU."
     if backend == "fsdp2":
         # fsdp2 moves params to CPU directly; dist_opt instead frees the GPU
         # buffer storage (params keep a 0-size cuda handle), so assert only fsdp2.
         assert _local_param_devices(handle) == {"cpu"}, "params not offloaded to CPU."
 
     runtime.to(handle, "cuda", model=True, optimizer=True, grad=True)
-    assert _opt_state_devices(handle, backend) == {"cuda"}, "optimizer state not back on GPU."
+    assert _opt_state_devices(handle, backend) == {
+        "cuda"
+    }, "optimizer state not back on GPU."
     assert _local_param_devices(handle) == {"cuda"}, "params not back on GPU."
 
     _assert_named_bitwise_equal(params_before, _local_named_params(handle), "param")
-    _assert_named_bitwise_equal(opt_before, _opt_state_snapshot(handle, backend), "optimizer-state")
+    _assert_named_bitwise_equal(
+        opt_before, _opt_state_snapshot(handle, backend), "optimizer-state"
+    )
 
     _train_step(handle, backend, cfg)  # continues training after onload
 
@@ -758,7 +780,7 @@ def test_offload_fraction_keeps_optimizer_state_on_cpu(model_name, backend, tmp_
         offload_fraction=1.0,
     )
     _train_step(handle, backend, cfg)
-    assert "cpu" in _opt_state_devices(handle, backend), (
-        "offload_fraction=1.0 should keep optimizer update state on CPU."
-    )
+    assert "cpu" in _opt_state_devices(
+        handle, backend
+    ), "offload_fraction=1.0 should keep optimizer update state on CPU."
     _train_step(handle, backend, cfg)  # trains with the offloaded update state

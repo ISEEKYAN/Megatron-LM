@@ -124,12 +124,24 @@ def _install_miles_parallel_state(ps) -> None:
         return
     state = parallel_mod.ParallelState(
         intra_dp=_group(ps.dp_rank, ps.dp_size, ps.dp_group),
-        intra_dp_cp=_group(getattr(ps, "dp_cp_rank", ps.dp_rank), getattr(ps, "dp_cp_size", ps.dp_size), getattr(ps, "dp_cp_group", ps.dp_group)),
+        intra_dp_cp=_group(
+            getattr(ps, "dp_cp_rank", ps.dp_rank),
+            getattr(ps, "dp_cp_size", ps.dp_size),
+            getattr(ps, "dp_cp_group", ps.dp_group),
+        ),
         cp=_group(ps.cp_rank, ps.cp_size, ps.cp_group),
         tp=_group(ps.tp_rank, ps.tp_size, ps.tp_group),
         pp=_group(ps.pp_rank, ps.pp_size, ps.pp_group),
-        ep=_group(getattr(ps, "ep_rank", 0), getattr(ps, "ep_size", 1), getattr(ps, "ep_group", None)),
-        etp=_group(getattr(ps, "etp_rank", 0), getattr(ps, "etp_size", 1), getattr(ps, "etp_group", None)),
+        ep=_group(
+            getattr(ps, "ep_rank", 0),
+            getattr(ps, "ep_size", 1),
+            getattr(ps, "ep_group", None),
+        ),
+        etp=_group(
+            getattr(ps, "etp_rank", 0),
+            getattr(ps, "etp_size", 1),
+            getattr(ps, "etp_group", None),
+        ),
         cp_comm_type=getattr(ps, "cp_comm_type", None),
         is_pp_last_stage=ps.pp_rank == ps.pp_size - 1,
         vpp_size=1,
@@ -141,7 +153,10 @@ def _install_miles_parallel_state(ps) -> None:
 class _MLiteTrainRayActorMixin:
     def _build_mlite_config(self, args: Namespace):
         from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-        from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
+        from megatron.lite.runtime.contracts.config import (
+            OptimizerConfig,
+            ParallelConfig,
+        )
 
         validate_mlite_args(args)
         parallel = ParallelConfig(
@@ -197,9 +212,13 @@ class _MLiteTrainRayActorMixin:
     ) -> int | None:
         super().init(args, role, with_ref, with_opd_teacher=with_opd_teacher)
         if role != "actor":
-            raise NotImplementedError("Megatron Lite miles backend supports actor training only.")
+            raise NotImplementedError(
+                "Megatron Lite miles backend supports actor training only."
+            )
         if with_ref or with_opd_teacher:
-            raise NotImplementedError("Reference/teacher model swapping is not implemented for the MLite patch.")
+            raise NotImplementedError(
+                "Reference/teacher model swapping is not implemented for the MLite patch."
+            )
 
         if args.debug_rollout_only:
             self.args = args
@@ -209,7 +228,9 @@ class _MLiteTrainRayActorMixin:
 
         self._cfg = self._build_mlite_config(args)
         self.runtime = create_runtime(
-            RuntimeConfig(backend="mlite", hf_path=args.hf_checkpoint, backend_cfg=self._cfg)
+            RuntimeConfig(
+                backend="mlite", hf_path=args.hf_checkpoint, backend_cfg=self._cfg
+            )
         )
         self.handle = self.runtime.build_model()
         _install_set_input_tensor_proxy(self.handle)
@@ -251,18 +272,32 @@ class _MLiteTrainRayActorMixin:
                         args.load,
                     )
 
-        if getattr(args, "offload_train", False) or getattr(args, "mlite_param_offload", False):
+        if getattr(args, "offload_train", False) or getattr(
+            args, "mlite_param_offload", False
+        ):
             self.sleep()
         return start_rollout_id
 
     def _process_rollout_data(self, rollout_data_ref):
         data_mod = importlib.import_module("miles.utils.data")
         ps = self.handle._parallel_state
-        rollout_data = data_mod.process_rollout_data(self.args, rollout_data_ref, ps.dp_rank, ps.dp_size)
-        rollout_data["tokens"] = [torch.as_tensor(t, dtype=torch.long) for t in rollout_data["tokens"]]
-        rollout_data["loss_masks"] = [torch.as_tensor(t, dtype=torch.float32) for t in rollout_data["loss_masks"]]
+        rollout_data = data_mod.process_rollout_data(
+            self.args, rollout_data_ref, ps.dp_rank, ps.dp_size
+        )
+        rollout_data["tokens"] = [
+            torch.as_tensor(t, dtype=torch.long) for t in rollout_data["tokens"]
+        ]
+        rollout_data["loss_masks"] = [
+            torch.as_tensor(t, dtype=torch.float32) for t in rollout_data["loss_masks"]
+        ]
         device = torch.device("cuda", torch.cuda.current_device())
-        for key in ("rollout_log_probs", "log_probs", "ref_log_probs", "advantages", "returns"):
+        for key in (
+            "rollout_log_probs",
+            "log_probs",
+            "ref_log_probs",
+            "advantages",
+            "returns",
+        ):
             if key in rollout_data and rollout_data[key] is not None:
                 rollout_data[key] = [
                     torch.as_tensor(t, dtype=torch.float32, device=device).reshape(-1)
@@ -311,7 +346,9 @@ class _MLiteTrainRayActorMixin:
 
     def train(self, rollout_id: int, rollout_data_ref) -> None:
         self._last_rollout_id = rollout_id
-        if getattr(self.args, "offload_train", False) or getattr(self.args, "mlite_param_offload", False):
+        if getattr(self.args, "offload_train", False) or getattr(
+            self.args, "mlite_param_offload", False
+        ):
             self.wake_up()
 
         rollout_data = self._process_rollout_data(rollout_data_ref)
@@ -319,8 +356,12 @@ class _MLiteTrainRayActorMixin:
             return None
 
         loss_type = getattr(self.args, "loss_type", "sft_loss")
-        if loss_type == "policy_loss" and getattr(self.args, "compute_advantages_and_returns", True):
-            if not getattr(self.args, "use_rollout_logprobs", False) or getattr(self.args, "get_mismatch_metrics", False):
+        if loss_type == "policy_loss" and getattr(
+            self.args, "compute_advantages_and_returns", True
+        ):
+            if not getattr(self.args, "use_rollout_logprobs", False) or getattr(
+                self.args, "get_mismatch_metrics", False
+            ):
                 log_probs = self._compute_log_probs(rollout_data)
                 if log_probs is not None:
                     rollout_data["log_probs"] = log_probs
@@ -391,15 +432,14 @@ class _MLiteTrainRayActorMixin:
         loaded = None
         if verify_load:
             loaded = self.runtime.load_checkpoint(
-                self.handle,
-                save_dir,
-                load_optimizer=save_optimizer,
-                load_rng=save_rng,
+                self.handle, save_dir, load_optimizer=save_optimizer, load_rng=save_rng
             )
             if probe_key is not None and before is not None:
                 after_param = _find_local_parameter(self.handle, probe_key)
                 if after_param is None:
-                    raise RuntimeError(f"checkpoint load probe parameter missing after load: {probe_key}")
+                    raise RuntimeError(
+                        f"checkpoint load probe parameter missing after load: {probe_key}"
+                    )
                 after = after_param.detach().float().cpu()
                 max_abs = float(torch.max(torch.abs(after - before)).item())
                 if max_abs != 0.0:
@@ -430,8 +470,12 @@ class _MLiteTrainRayActorMixin:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
         if info is None:
-            raise ValueError("update_weights requires rollout engine info from the miles rollout manager.")
-        if getattr(self.args, "offload_train", False) or getattr(self.args, "mlite_param_offload", False):
+            raise ValueError(
+                "update_weights requires rollout engine info from the miles rollout manager."
+            )
+        if getattr(self.args, "offload_train", False) or getattr(
+            self.args, "mlite_param_offload", False
+        ):
             self.wake_up()
 
         rollout_engines = info.rollout_engines
@@ -454,22 +498,32 @@ class _MLiteTrainRayActorMixin:
                 ray.get(self.rollout_manager.clear_updatable_has_new_engines.remote())
 
         if getattr(self.args, "debug_skip_weight_update", False):
-            logger.warning("Skipping MLite actor-to-rollout weight update because --debug-skip-weight-update is set.")
+            logger.warning(
+                "Skipping MLite actor-to-rollout weight update because --debug-skip-weight-update is set."
+            )
             return
         self.weight_updater.update_weights()
 
     def sleep(self, *args, **kwargs) -> None:
-        if not (getattr(self.args, "offload_train", False) or getattr(self.args, "mlite_param_offload", False)):
+        if not (
+            getattr(self.args, "offload_train", False)
+            or getattr(self.args, "mlite_param_offload", False)
+        ):
             return
         self.runtime.to(self.handle, "cpu")
 
     def wake_up(self, *args, **kwargs) -> None:
-        if not (getattr(self.args, "offload_train", False) or getattr(self.args, "mlite_param_offload", False)):
+        if not (
+            getattr(self.args, "offload_train", False)
+            or getattr(self.args, "mlite_param_offload", False)
+        ):
             return
         self.runtime.to(self.handle, "cuda")
 
     def connect_actor_critic(self, critic_group=None, **kwargs):
-        raise NotImplementedError("Megatron Lite miles backend does not support critic training yet.")
+        raise NotImplementedError(
+            "Megatron Lite miles backend does not support critic training yet."
+        )
 
     def _get_parallel_config(self):
         return self.train_parallel_config
@@ -488,7 +542,11 @@ def _load_or_synthesize_actor_module(import_error: ImportError) -> ModuleType:
 
     parent_mod = importlib.import_module(actor_mod.__package__)
     setattr(parent_mod, "actor", actor_mod)
-    logger.warning("Using synthetic %s because the original module failed to import: %s", module_name, import_error)
+    logger.warning(
+        "Using synthetic %s because the original module failed to import: %s",
+        module_name,
+        import_error,
+    )
     return actor_mod
 
 

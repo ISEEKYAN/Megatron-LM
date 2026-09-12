@@ -24,9 +24,7 @@ def test_pure_fp8_ds4_prepare_state_is_promoted(monkeypatch) -> None:
     dsv4_utils = ModuleType("verl.utils.vllm.vllm_dsv4_fp8_utils")
     dsv4_utils.is_deepseek_v4_model = lambda model: True
 
-    routed_module = ModuleType(
-        "vllm.model_executor.layers.fused_moe.routed_experts"
-    )
+    routed_module = ModuleType("vllm.model_executor.layers.fused_moe.routed_experts")
     fp8_module = ModuleType("vllm.model_executor.layers.quantization.fp8")
 
     class RoutedExperts:
@@ -58,9 +56,7 @@ def test_non_ds4_false_prepare_state_stays_false(monkeypatch) -> None:
     fp8_utils.prepare_quanted_weights_for_loading = lambda model_runner: False
     dsv4_utils = ModuleType("verl.utils.vllm.vllm_dsv4_fp8_utils")
     dsv4_utils.is_deepseek_v4_model = lambda model: False
-    routed_module = ModuleType(
-        "vllm.model_executor.layers.fused_moe.routed_experts"
-    )
+    routed_module = ModuleType("vllm.model_executor.layers.fused_moe.routed_experts")
     fp8_module = ModuleType("vllm.model_executor.layers.quantization.fp8")
     routed_module.RoutedExperts = type("RoutedExperts", (), {})
     fp8_module.Fp8MoEMethod = type("Fp8MoEMethod", (), {})

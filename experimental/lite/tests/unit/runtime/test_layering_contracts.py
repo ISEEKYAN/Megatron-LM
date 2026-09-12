@@ -59,7 +59,7 @@ DENIED_IMPORT_PREFIXES = {
 IMPORT_ALLOWLIST: dict[str, tuple[str, ...]] = {
     "megatron/lite/primitive/ops/linear_cross_entropy.py": (
         "verl.utils.kernel.linear_cross_entropy",
-    ),
+    )
 }
 
 
@@ -128,7 +128,9 @@ def _allow_ranges(path: Path) -> list[range]:
 
     ranges: list[range] = []
     start: int | None = None
-    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for lineno, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         if ALLOW_BEGIN in line:
             if start is not None:
                 raise AssertionError(f"nested allow range in {path}")

@@ -27,7 +27,9 @@ def vocab_parallel_log_probs_from_logits(
     return gathered.transpose(0, 1).contiguous() if transposed else gathered
 
 
-def _all_reduce_if_needed(tensor: torch.Tensor, group=None, op=dist.ReduceOp.SUM) -> torch.Tensor:
+def _all_reduce_if_needed(
+    tensor: torch.Tensor, group=None, op=dist.ReduceOp.SUM
+) -> torch.Tensor:
     if group is not None and dist.is_initialized() and dist.get_world_size(group) > 1:
         dist.all_reduce(tensor, op=op, group=group)
     return tensor
@@ -70,4 +72,6 @@ def _align_labels_to_logits(
     ):
         return labels.transpose(0, 1).contiguous(), True
 
-    raise ValueError(f"Could not align labels {labels.shape} with logits {logits.shape}.")
+    raise ValueError(
+        f"Could not align labels {labels.shape} with logits {logits.shape}."
+    )

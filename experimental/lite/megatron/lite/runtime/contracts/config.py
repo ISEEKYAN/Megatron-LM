@@ -82,7 +82,9 @@ class RuntimeConfig:
 
     backend: str = "mlite"
     hf_path: str = ""
-    backend_cfg: MegatronLiteConfig | BridgeConfig | dict[str, Any] = field(default_factory=dict)
+    backend_cfg: MegatronLiteConfig | BridgeConfig | dict[str, Any] = field(
+        default_factory=dict
+    )
 
 
 __all__ = ["OptimizerConfig", "ParallelConfig", "RuntimeConfig"]

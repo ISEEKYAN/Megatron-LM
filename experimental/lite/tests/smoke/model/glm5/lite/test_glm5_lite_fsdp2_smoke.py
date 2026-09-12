@@ -67,7 +67,6 @@ def _tiny_config_kwargs():
 
 def test_glm5_tiny_model_builds_and_steps_with_fsdp2_backend(cuda_dist):
     import torch
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite import protocol
     from megatron.lite.primitive.optimizers.fsdp2 import FSDP2Optimizer, fsdp2_available
@@ -82,7 +81,11 @@ def test_glm5_tiny_model_builds_and_steps_with_fsdp2_backend(cuda_dist):
         parallel=ParallelConfig(),
         optimizer="fsdp2",
         optimizer_config=OptimizerConfig(
-            optimizer="adam", lr=1.0e-3, weight_decay=0.0, clip_grad=1.0, offload_fraction=0.0
+            optimizer="adam",
+            lr=1.0e-3,
+            weight_decay=0.0,
+            clip_grad=1.0,
+            offload_fraction=0.0,
         ),
         deterministic=True,
     )

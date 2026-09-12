@@ -193,10 +193,9 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     from verl_mlite.compat import apply_runtime_patches
 
     apply_runtime_patches()
+    from megatron.lite.runtime.contracts import PackedBatch
     from verl_mlite.engine.config import MegatronLiteEngineConfig
     from verl_mlite.engine.mlite_engine import MegatronLiteEngine
-
-    from megatron.lite.runtime.contracts import PackedBatch
 
     device = _init_dist_or_skip()
     world = dist.get_world_size()
@@ -206,9 +205,7 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
 
     engine = MegatronLiteEngine(
         model_config=SimpleNamespace(
-            local_path=str(hf_path),
-            hf_config={"model_type": model_type},
-            mtp=None,
+            local_path=str(hf_path), hf_config={"model_type": model_type}, mtp=None
         ),
         engine_config=MegatronLiteEngineConfig(
             model_name=model_name,
@@ -231,7 +228,9 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
         config.load_hf_weights = False
         return config
 
-    engine._build_mlite_config = MethodType(_build_config_without_loading_weights, engine)
+    engine._build_mlite_config = MethodType(
+        _build_config_without_loading_weights, engine
+    )
     engine.initialize()
     engine.optimizer_zero_grad()
 

@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-pytestmark = [
-    pytest.mark.gpus(2),
-    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
-]
+pytestmark = [pytest.mark.gpus(2), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
 
 
 def _make_train_config(ps):
@@ -90,12 +87,16 @@ def _tiny_hf_parity_config_kwargs():
 def _fused_dsa_seq_len(world: int) -> int:
     seq = 512
     if seq % (2 * world) != 0:
-        pytest.skip(f"GLM5 fused DSA CP smoke requires seq={seq} divisible by 2*world={2 * world}.")
+        pytest.skip(
+            f"GLM5 fused DSA CP smoke requires seq={seq} divisible by 2*world={2 * world}."
+        )
     return seq
 
 
 def _to_hf_deepseek_v3_config(cfg):
-    from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+    from transformers.models.deepseek_v3.configuration_deepseek_v3 import (
+        DeepseekV3Config,
+    )
 
     return DeepseekV3Config(
         hidden_size=cfg.hidden_size,
@@ -140,7 +141,9 @@ def _distributed_diff_stats(actual, expected) -> tuple[float, float]:
 
     diff = (actual.float() - expected.float()).abs()
     max_abs = diff.max()
-    scale = torch.maximum(actual.float().abs().max(), expected.float().abs().max()).clamp_min(1e-6)
+    scale = torch.maximum(
+        actual.float().abs().max(), expected.float().abs().max()
+    ).clamp_min(1e-6)
     stats = torch.stack([max_abs, scale])
     if dist.is_initialized():
         dist.all_reduce(stats, op=dist.ReduceOp.MAX)
@@ -179,9 +182,11 @@ def _make_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
 def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     import torch
     import torch.distributed as dist
-
     from megatron.lite.primitive.modules.attention import build_rope_cache
-    from megatron.lite.primitive.parallel.cp import zigzag_position_ids_for_cp, zigzag_slice_for_cp
+    from megatron.lite.primitive.parallel.cp import (
+        zigzag_position_ids_for_cp,
+        zigzag_slice_for_cp,
+    )
     from megatron.lite.primitive.parallel.state import ParallelState
 
     device = _init_dist_or_skip()
@@ -199,14 +204,22 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     batch, seq = 1, _fused_dsa_seq_len(world)
     torch.manual_seed(99)
     full_x = torch.randn(batch, seq, 128, device=device, dtype=torch.bfloat16)
-    local_x = zigzag_slice_for_cp(full_x, rank, world, seq_dim=1).detach().requires_grad_(True)
+    local_x = (
+        zigzag_slice_for_cp(full_x, rank, world, seq_dim=1)
+        .detach()
+        .requires_grad_(True)
+    )
     ref_x = full_x.detach().clone().requires_grad_(True)
 
     cos, sin = build_rope_cache(
         dim=64, max_position_embeddings=seq, rope_theta=1_000_000.0, device=device
     )
     local_pos = zigzag_position_ids_for_cp(seq, rank, world, device).expand(batch, -1)
-    full_pos = torch.arange(seq, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+    full_pos = (
+        torch.arange(seq, device=device, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(batch, -1)
+    )
 
     cp_out = cp_attn(local_x, cos=cos, sin=sin, position_ids=local_pos)
     ref_out = ref_attn(ref_x, cos=cos, sin=sin, position_ids=full_pos)
@@ -224,7 +237,6 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
 def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
     import torch
     import torch.distributed as dist
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
@@ -247,7 +259,9 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
 
     batch, seq = 1, _fused_dsa_seq_len(world)
     torch.manual_seed(100)
-    full_hidden = torch.randn(batch, seq, cfg.hidden_size, device=device, dtype=torch.bfloat16)
+    full_hidden = torch.randn(
+        batch, seq, cfg.hidden_size, device=device, dtype=torch.bfloat16
+    )
     local_hidden = zigzag_slice_for_cp(full_hidden, rank, world, seq_dim=1).contiguous()
 
     with torch.no_grad():
@@ -262,7 +276,6 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
 def test_glm5_tiny_model_cp2_forward_backward_smoke():
     import torch
     import torch.distributed as dist
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
@@ -302,7 +315,6 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
 def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     import torch
     import torch.distributed as dist
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.protocol import (
         _forward_step,
@@ -316,9 +328,7 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     rank = dist.get_rank()
     cfg_kwargs = _tiny_config_kwargs()
     cfg_kwargs.update(
-        max_position_embeddings=64,
-        num_hidden_layers=6,
-        num_nextn_predict_layers=1,
+        max_position_embeddings=64, num_hidden_layers=6, num_nextn_predict_layers=1
     )
     indexer_types = ["full", "full", "full", "shared", "shared", "shared"]
     cfg = Glm5Config(
@@ -392,13 +402,14 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
 def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     import torch
     import torch.distributed as dist
-    from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
-
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
+    from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+        DeepseekV3ForCausalLM,
+    )
 
     device = _init_dist_or_skip()
     world = dist.get_world_size()
@@ -460,19 +471,26 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     for layer_idx, (actual, full_expected) in enumerate(
         zip(native_layer_outputs, hf_layer_outputs, strict=True)
     ):
-        expected = zigzag_slice_for_cp(full_expected, rank, world, seq_dim=1).contiguous()
+        expected = zigzag_slice_for_cp(
+            full_expected, rank, world, seq_dim=1
+        ).contiguous()
         max_abs, max_rel = _distributed_diff_stats(actual, expected)
         if rank == 0:
             print(
                 f"glm5_hf_native_parity layer={layer_idx} "
                 f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
             )
-        torch.testing.assert_close(actual.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1)
+        torch.testing.assert_close(
+            actual.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1
+        )
 
     expected = zigzag_slice_for_cp(hf_logits, rank, world, seq_dim=1).contiguous()
     max_abs, max_rel = _distributed_diff_stats(native_logits, expected)
     if rank == 0:
         print(
-            "glm5_hf_native_parity logits " f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
+            "glm5_hf_native_parity logits "
+            f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
         )
-    torch.testing.assert_close(native_logits.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1)
+    torch.testing.assert_close(
+        native_logits.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1
+    )

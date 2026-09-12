@@ -5,15 +5,20 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from megatron.lite.primitive.data import _resolve_thd_padding, fixed_batches
 from megatron.lite.primitive.deterministic import deterministic_requested
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
-from megatron.lite.primitive.ops.gated_delta_rule import l2norm, torch_chunk_gated_delta_rule
+from megatron.lite.primitive.ops.gated_delta_rule import (
+    l2norm,
+    torch_chunk_gated_delta_rule,
+)
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_log_probs_from_logits
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
-from megatron.lite.primitive.train_step import compute_and_clip_grad_norm, run_microbatch_loop
+from megatron.lite.primitive.train_step import (
+    compute_and_clip_grad_norm,
+    run_microbatch_loop,
+)
 from megatron.lite.primitive.utils import ensure_divisible
 
 
@@ -47,7 +52,9 @@ def test_logprob_selects_labels_in_batch_sequence_or_sequence_batch_layout():
 
     torch.testing.assert_close(selected, expected)
     with pytest.raises(ValueError, match="Could not align"):
-        vocab_parallel_log_probs_from_logits(logits, torch.zeros(4, 2, dtype=torch.long))
+        vocab_parallel_log_probs_from_logits(
+            logits, torch.zeros(4, 2, dtype=torch.long)
+        )
 
 
 def test_linear_cross_entropy_fallback_matches_explicit_matmul():
@@ -108,8 +115,12 @@ def test_data_padding_env_and_fixed_batches_are_deterministic(monkeypatch):
     with pytest.raises(ValueError, match="PAD_MULTIPLE"):
         _resolve_thd_padding(seq_len=7, cp_size=2)
 
-    batches_a = fixed_batches(11, seq_len=4, num_steps=2, batch_size=2, device="cpu", seed=123)
-    batches_b = fixed_batches(11, seq_len=4, num_steps=2, batch_size=2, device="cpu", seed=123)
+    batches_a = fixed_batches(
+        11, seq_len=4, num_steps=2, batch_size=2, device="cpu", seed=123
+    )
+    batches_b = fixed_batches(
+        11, seq_len=4, num_steps=2, batch_size=2, device="cpu", seed=123
+    )
     for (ids_a, labels_a), (ids_b, labels_b) in zip(batches_a, batches_b, strict=True):
         torch.testing.assert_close(ids_a, ids_b)
         torch.testing.assert_close(labels_a, labels_b)
@@ -179,7 +190,9 @@ def test_train_step_microbatch_loop_and_grad_clip_cpu_contract():
     assert model.weight.grad is not None
     assert torch.isfinite(model.weight.grad).all()
 
-    grad_norm = compute_and_clip_grad_norm(model, optimizer=None, max_norm=0.25, use_dist_opt=False)
+    grad_norm = compute_and_clip_grad_norm(
+        model, optimizer=None, max_norm=0.25, use_dist_opt=False
+    )
 
     assert torch.isfinite(grad_norm)
     assert model.weight.grad.norm() <= 0.25 + 1.0e-6

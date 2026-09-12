@@ -20,7 +20,6 @@ from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.runtime.contracts.weights import ResyncFormat
 from torch.distributed.tensor import Replicate, Shard
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -353,7 +352,9 @@ class Qwen35WeightSpec:
                         f"{local_prefix}.mlp_norm.weight": [
                             f"{hf_prefix}.post_attention_layernorm.weight"
                         ],
-                        f"{local_prefix}.moe.router.gate.weight": [f"{mlp}.gate.weight"],
+                        f"{local_prefix}.moe.router.gate.weight": [
+                            f"{mlp}.gate.weight"
+                        ],
                         f"{local_prefix}.moe.shared_expert.gate_up.linear.weight": [
                             f"{mlp}.shared_expert.gate_proj.weight",
                             f"{mlp}.shared_expert.up_proj.weight",
@@ -476,10 +477,7 @@ class Qwen35WeightSpec:
                 return shards[0]
             return torch.cat(shards, dim=0).contiguous()
         if native_name.endswith(
-            (
-                ".mlp.gate_up.linear.weight",
-                ".moe.shared_expert.gate_up.linear.weight",
-            )
+            (".mlp.gate_up.linear.weight", ".moe.shared_expert.gate_up.linear.weight")
         ):
             return _merge_gate_up_tp_shards(_allgather_tp_shards(tensor, ps))
         return None
@@ -496,10 +494,7 @@ class Qwen35WeightSpec:
                 return shards[0]
             return torch.cat(shards, dim=0).contiguous()
         if native_name.endswith(
-            (
-                ".mlp.gate_up.linear.weight",
-                ".moe.shared_expert.gate_up.linear.weight",
-            )
+            (".mlp.gate_up.linear.weight", ".moe.shared_expert.gate_up.linear.weight")
         ):
             return _merge_gate_up_tp_shards(shards)
         return None
@@ -835,11 +830,7 @@ def export_hf_weights(
         return
     yield from _export_mxfp4_weights(
         _export(
-            model,
-            Qwen35WeightSpec(config),
-            ps,
-            vocab_size=config.vocab_size,
-            **kwargs,
+            model, Qwen35WeightSpec(config), ps, vocab_size=config.vocab_size, **kwargs
         )
     )
 
@@ -875,9 +866,7 @@ def save_hf_weights(
     ps: ParallelState,
     **kwargs,
 ) -> None:
-    from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
-        save_hf_weights as _save,
-    )
+    from megatron.lite.primitive.ckpt.hf_weights import save_hf_weights as _save
 
     # Qwen3.5 has no MXFP4/block-FP8 save-time resync path, so the engine-level
     # export kwargs are accepted for signature-compatibility but not consumed.

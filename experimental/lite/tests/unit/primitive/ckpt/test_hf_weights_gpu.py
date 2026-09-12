@@ -12,18 +12,13 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from safetensors.torch import save_file
-
 from megatron.lite.model.kimi_k2.config import KimiK2Config
 from megatron.lite.model.kimi_k2.lite.checkpoint import KimiK2WeightSpec
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import Qwen35WeightSpec
-from megatron.lite.primitive.ckpt.hf_weights import (
-    export_hf_weights,
-    load_hf_weights,
-)
+from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights, load_hf_weights
 from megatron.lite.primitive.quantization.qat import QATSpec, apply_qat_to_chunks
-
+from safetensors.torch import save_file
 
 pytestmark = pytest.mark.mlite
 
@@ -105,9 +100,7 @@ def _shared_checkpoint(tensors: dict[str, torch.Tensor]) -> str:
         )
         paths[0] = path
     dist.broadcast_object_list(
-        paths,
-        src=0,
-        device=torch.device("cuda", torch.cuda.current_device()),
+        paths, src=0, device=torch.device("cuda", torch.cuda.current_device())
     )
     dist.barrier()
     assert isinstance(paths[0], str)
@@ -141,17 +134,13 @@ def test_ep2_export_gather_matches_single_rank_reference_bitwise() -> None:
             for local_idx in range(config.num_experts // 2):
                 global_idx = rank * (config.num_experts // 2) + local_idx
                 self.layers[0].moe.experts.fc1.register_parameter(
-                    f"weight{local_idx}",
-                    nn.Parameter(_expert_tensor(global_idx)),
+                    f"weight{local_idx}", nn.Parameter(_expert_tensor(global_idx))
                 )
 
     model = CudaMoE()
     exported = dict(
         export_hf_weights(
-            model,
-            Qwen35WeightSpec(config),
-            _parallel_state(ep_size=2),
-            cpu=False,
+            model, Qwen35WeightSpec(config), _parallel_state(ep_size=2), cpu=False
         )
     )
 
@@ -277,8 +266,7 @@ def test_incomplete_packed_expert_group_fails_loud_on_cuda_moe() -> None:
             self.layers[0].moe.experts.fc1 = nn.Module()
             for expert_idx in range(config.num_experts - 1):
                 self.layers[0].moe.experts.fc1.register_parameter(
-                    f"weight{expert_idx}",
-                    nn.Parameter(_expert_tensor(expert_idx)),
+                    f"weight{expert_idx}", nn.Parameter(_expert_tensor(expert_idx))
                 )
 
     model = IncompleteCudaMoE()
@@ -289,10 +277,7 @@ def test_incomplete_packed_expert_group_fails_loud_on_cuda_moe() -> None:
     ):
         list(
             export_hf_weights(
-                model,
-                Qwen35WeightSpec(config),
-                _parallel_state(),
-                cpu=False,
+                model, Qwen35WeightSpec(config), _parallel_state(), cpu=False
             )
         )
 
@@ -316,8 +301,7 @@ def test_qat_on_and_off_export_the_same_hf_keys_from_cuda_model() -> None:
     qat_on = SharedExpert()
     qat_on.load_state_dict(qat_off.state_dict())
     stats = apply_qat_to_chunks(
-        [qat_on],
-        QATSpec(enabled=True, format="int8", group_size=-1),
+        [qat_on], QATSpec(enabled=True, format="int8", group_size=-1)
     )
     assert stats["quantized_modules"] == 1
     master = qat_on.layers[

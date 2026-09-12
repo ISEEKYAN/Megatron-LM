@@ -15,18 +15,12 @@ def _config(*, num_nextn_predict_layers: int) -> Qwen3MoEConfig:
 
 
 def test_weight_map_omits_mtp_embedding_when_config_has_no_mtp() -> None:
-    weight_map = Qwen3MoEWeightSpec(
-        _config(num_nextn_predict_layers=0)
-    ).weight_map()
+    weight_map = Qwen3MoEWeightSpec(_config(num_nextn_predict_layers=0)).weight_map()
 
     assert "mtp_embed.embedding.weight" not in weight_map
 
 
 def test_weight_map_includes_mtp_embedding_when_config_has_mtp() -> None:
-    weight_map = Qwen3MoEWeightSpec(
-        _config(num_nextn_predict_layers=1)
-    ).weight_map()
+    weight_map = Qwen3MoEWeightSpec(_config(num_nextn_predict_layers=1)).weight_map()
 
-    assert weight_map["mtp_embed.embedding.weight"] == [
-        "model.embed_tokens.weight"
-    ]
+    assert weight_map["mtp_embed.embedding.weight"] == ["model.embed_tokens.weight"]

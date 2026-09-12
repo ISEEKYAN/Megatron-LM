@@ -47,7 +47,9 @@ def _local_source(target, source):
         shape, offset = compute_local_shape_and_global_offset(
             target.shape, target.device_mesh, target.placements
         )
-        return source[tuple(slice(start, start + size) for start, size in zip(offset, shape))]
+        return source[
+            tuple(slice(start, start + size) for start, size in zip(offset, shape))
+        ]
     return source
 
 
@@ -582,7 +584,8 @@ def bucketed_all_gather_into_tensor(
                 tensor,
                 [
                     recv_buffer[
-                        rank * total_numel + offsets[idx] : rank * total_numel
+                        rank * total_numel
+                        + offsets[idx] : rank * total_numel
                         + offsets[idx]
                         + numel_per_tensor[idx]
                     ].view_as(tensor)
@@ -879,10 +882,7 @@ def gather_gate_up(
 
 
 def _load_weight_map_for_model(
-    base_model: nn.Module,
-    spec: HFWeights,
-    ps,
-    state: dict[str, torch.Tensor],
+    base_model: nn.Module, spec: HFWeights, ps, state: dict[str, torch.Tensor]
 ) -> dict[str, list[str]]:
     """Build the one native-to-HF plan shared by load and export."""
     logical_state_keys = tuple(
@@ -1103,8 +1103,12 @@ def load_hf_weights(
                             tensor, ps.etp_rank, ps.etp_size, dim=split_d
                         )
 
-            converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-            (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+            converted = _local_source(target, tensor).to(
+                device=target.device, dtype=target.dtype
+            )
+            (
+                target.to_local().data if isinstance(target, DTensor) else target.data
+            ).copy_(converted)
             if replica_ranks is not None:
                 assert source_global_rank is not None
                 dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1115,7 +1119,9 @@ def load_hf_weights(
         if name in loaded_names or "lora" in name.lower() or "adapter" in name.lower():
             continue
         elif getattr(base_model, "_mlite_meta_init", False):
-            raise RuntimeError(f"Deferred parameter {name!r} was not filled by the checkpoint")
+            raise RuntimeError(
+                f"Deferred parameter {name!r} was not filled by the checkpoint"
+            )
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
     missing_expected_buffers = required_buffers.keys() - loaded_names
@@ -1127,15 +1133,7 @@ def load_hf_weights(
 
 
 def _load_expert_weight(
-    native_name,
-    hf_names,
-    reader,
-    spec,
-    ps,
-    state,
-    targets,
-    expert_gid,
-    expert_shard,
+    native_name, hf_names, reader, spec, ps, state, targets, expert_gid, expert_shard
 ) -> str | None:
     if expert_shard is None:
         raise RuntimeError(
@@ -1202,8 +1200,12 @@ def _load_expert_weight(
             else:
                 tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
-    converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+    converted = _local_source(target, tensor).to(
+        device=target.device, dtype=target.dtype
+    )
+    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(
+        converted
+    )
     if replica_ranks is not None:
         assert source_global_rank is not None
         dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1212,10 +1214,7 @@ def _load_expert_weight(
 
 
 def _handle_missing_hf_tensors(
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
-    error: KeyError,
+    spec: HFWeights, native_name: str, hf_names: list[str], error: KeyError
 ) -> None:
     """Fail on required HF sources and explain every optional fallback.
 
@@ -1290,10 +1289,7 @@ def _read_hf_tensors(
 
 
 def _present_hf_sources(
-    reader: SafeTensorReader,
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
+    reader: SafeTensorReader, spec: HFWeights, native_name: str, hf_names: list[str]
 ) -> list[str]:
     """Return mapped checkpoint sources that exist without loading payloads."""
     resolve = getattr(reader, "first_available", None)
@@ -1494,9 +1490,9 @@ def export_hf_weights(
                     if packed_name is None:
                         yield from _iter_mapped({global_name: export_shard})
                         continue
-                    packed_expert_buffers.setdefault(packed_name, {})[global_idx] = (
-                        export_shard
-                    )
+                    packed_expert_buffers.setdefault(packed_name, {})[
+                        global_idx
+                    ] = export_shard
                 if packed_name is not None:
                     packed = packed_expert_buffers[packed_name]
                     if len(packed) == spec.num_experts:

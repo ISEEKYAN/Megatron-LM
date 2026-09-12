@@ -44,7 +44,12 @@ def _auto_layout(
     )
 
     if rows is None:
-        units = ["embedding"] + ["decoder"] * num_hidden_layers + ["mtp"] * max(num_mtp_layers, 0) + ["loss"]
+        units = (
+            ["embedding"]
+            + ["decoder"] * num_hidden_layers
+            + ["mtp"] * max(num_mtp_layers, 0)
+            + ["loss"]
+        )
         base, remainder = divmod(len(units), pp_size)
         rows, pos = [], 0
         for size in (base + (1 if s < remainder else 0) for s in range(pp_size)):
@@ -54,8 +59,7 @@ def _auto_layout(
 
 
 def _validate_decoder_layer_groups(
-    num_hidden_layers: int,
-    decoder_layer_groups: Sequence[Sequence[int]],
+    num_hidden_layers: int, decoder_layer_groups: Sequence[Sequence[int]]
 ) -> list[list[int]]:
     groups = [list(group) for group in decoder_layer_groups]
     if any(not group for group in groups):
@@ -102,12 +106,7 @@ def _auto_layout_with_decoder_groups(
     first: dict[int, tuple[int, int, int, int | None]] = {}
     for end in range(n_groups + 1):
         cells = overhead(0) + prefix[end]
-        first[end] = (
-            cells,
-            1 if end == 0 else 0,
-            abs(cells - target_cells[0]),
-            None,
-        )
+        first[end] = (cells, 1 if end == 0 else 0, abs(cells - target_cells[0]), None)
     dp.append(first)
 
     for stage in range(1, pp_size):
@@ -151,12 +150,7 @@ def _auto_layout_with_decoder_groups(
             row.extend(["mtp"] * max(num_mtp_layers, 0))
             row.append("loss")
         rows.append(row)
-    return _auto_layout(
-        num_hidden_layers,
-        pp_size,
-        num_mtp_layers,
-        rows=rows,
-    )
+    return _auto_layout(num_hidden_layers, pp_size, num_mtp_layers, rows=rows)
 
 
 def build_pipeline_chunk_layout(
@@ -170,9 +164,12 @@ def build_pipeline_chunk_layout(
 ) -> PipelineChunkLayout:
     """``layer_indices`` / ``has_embed`` / ``has_head`` / ``has_mtp`` for this PP rank,
     from ``ps.pp_layout`` (custom) or an auto-balanced layout. ``has_mtp`` follows the
-    layout's ``m`` placement, so MTP is built where the layout says, not a fixed rank."""
+    layout's ``m`` placement, so MTP is built where the layout says, not a fixed rank.
+    """
     if (vpp is not None and vpp > 1) or vpp_chunk_id is not None:
-        raise NotImplementedError("VPP / interleaved pipeline layout is not supported (use vpp=1).")
+        raise NotImplementedError(
+            "VPP / interleaved pipeline layout is not supported (use vpp=1)."
+        )
 
     if ps.pp_size <= 1:  # no pipeline: this stage owns everything
         return PipelineChunkLayout(
@@ -189,9 +186,13 @@ def build_pipeline_chunk_layout(
 
     pp_layout = getattr(ps, "pp_layout", None)
     if pp_layout is not None:
-        layout = PipelineParallelLayerLayout(pp_layout, pipeline_model_parallel_size=ps.pp_size)
+        layout = PipelineParallelLayerLayout(
+            pp_layout, pipeline_model_parallel_size=ps.pp_size
+        )
         if layout.virtual_pipeline_model_parallel_size > 1:
-            raise NotImplementedError("VPP pp_layout is not supported (one stage per pp rank).")
+            raise NotImplementedError(
+                "VPP pp_layout is not supported (one stage per pp rank)."
+            )
     elif decoder_layer_groups is not None:
         layout = _auto_layout_with_decoder_groups(
             num_hidden_layers, ps.pp_size, num_mtp_layers, decoder_layer_groups
@@ -208,10 +209,15 @@ def build_pipeline_chunk_layout(
             "layout (set only `pp`), or place `m` on the same stage as `L`."
         )
     return PipelineChunkLayout(
-        layer_indices=layout.get_layer_id_list(LayerType.decoder, vp_stage=0, pp_rank=ps.pp_rank),
+        layer_indices=layout.get_layer_id_list(
+            LayerType.decoder, vp_stage=0, pp_rank=ps.pp_rank
+        ),
         has_embed=ps.pp_is_first,
         has_head=ps.pp_is_last,
-        has_mtp=layout.get_num_layers_to_build(LayerType.mtp, vp_stage=0, pp_rank=ps.pp_rank) > 0,
+        has_mtp=layout.get_num_layers_to_build(
+            LayerType.mtp, vp_stage=0, pp_rank=ps.pp_rank
+        )
+        > 0,
     )
 
 

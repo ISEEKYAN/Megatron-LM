@@ -26,9 +26,7 @@ def test_safe_tensor_reader_dequantizes_fp8_weight_with_block_scale() -> None:
         "w.scale": torch.full((1, 1), 2.0, dtype=torch.float32),
     }
     actual = _reader(tensors).get_tensor(
-        "w.weight",
-        target_shape=torch.Size((2, 2)),
-        target_dtype=torch.bfloat16,
+        "w.weight", target_shape=torch.Size((2, 2)), target_dtype=torch.bfloat16
     )
 
     torch.testing.assert_close(actual, weight.float() * 2.0)
@@ -47,9 +45,7 @@ def test_safe_tensor_reader_rejects_one_byte_quantized_weight_without_scale(
     if source_dtype is None:
         pytest.skip("torch float8_e4m3fn is required")
 
-    tensors = {
-        "missing.weight": torch.ones((2, 2), dtype=source_dtype),
-    }
+    tensors = {"missing.weight": torch.ones((2, 2), dtype=source_dtype)}
 
     with pytest.raises(
         RuntimeError,
@@ -91,8 +87,7 @@ def test_multi_source_mapping_dequantizes_each_fp8_block_scaled_source() -> None
     actual = Spec.hf_to_native("fused.weight", sources)
 
     torch.testing.assert_close(
-        actual,
-        torch.cat([first.float() * 2.0, second.float() * 0.5], dim=0),
+        actual, torch.cat([first.float() * 2.0, second.float() * 0.5], dim=0)
     )
 
 
@@ -108,8 +103,7 @@ def test_multi_source_block_scale_rejects_shape_that_cannot_be_inferred() -> Non
     }
 
     with pytest.raises(
-        RuntimeError,
-        match=r"first\.weight.*target_shape is required.*first\.scale",
+        RuntimeError, match=r"first\.weight.*target_shape is required.*first\.scale"
     ):
         _read_hf_tensors(
             _reader(tensors),

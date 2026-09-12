@@ -22,12 +22,15 @@ if str(_EXPERIMENTAL_LITE_ROOT) not in sys.path:
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(_REPO_ROOT))
 
-from megatron.lite.primitive.deterministic import set_deterministic
-from megatron.lite.runtime import create_runtime
-
-from examples.bench.bench import BenchCliConfig, build_runtime_config, build_session_config
+from examples.bench.bench import (
+    BenchCliConfig,
+    build_runtime_config,
+    build_session_config,
+)
 from examples.bench.results import compare_correctness_artifacts, load_result_artifact
 from examples.bench.session import _make_data_iter
+from megatron.lite.primitive.deterministic import set_deterministic
+from megatron.lite.runtime import create_runtime
 
 
 def _distributed_rank() -> int:
@@ -145,7 +148,9 @@ def _resolve_probe_module(modules: dict[str, Any], name: str) -> tuple[str, Any]
 
 
 @contextmanager
-def _activation_probe_context(handle, probe_names: list[str], *, record_grad: bool = False):
+def _activation_probe_context(
+    handle, probe_names: list[str], *, record_grad: bool = False
+):
     records: list[dict[str, Any]] = []
     hooks = []
     tensor_hooks = []
@@ -182,12 +187,18 @@ def _activation_probe_context(handle, probe_names: list[str], *, record_grad: bo
                         record_grad=record_grad,
                         tensor_hooks=tensor_hooks,
                     )
-                    records[-1]["resolved_name"] = f"{_resolved_name}::{_method_name}:input"
+                    records[-1][
+                        "resolved_name"
+                    ] = f"{_resolved_name}::{_method_name}:input"
                     records[-1]["module_type"] = _module_type
                     return _original(*args, **kwargs)
                 output = _original(*args, **kwargs)
                 _record_activation_probe(
-                    records, _probe_name, output, record_grad=record_grad, tensor_hooks=tensor_hooks
+                    records,
+                    _probe_name,
+                    output,
+                    record_grad=record_grad,
+                    tensor_hooks=tensor_hooks,
                 )
                 records[-1]["resolved_name"] = f"{_resolved_name}::{_method_name}"
                 records[-1]["module_type"] = _module_type
@@ -205,9 +216,15 @@ def _activation_probe_context(handle, probe_names: list[str], *, record_grad: bo
 
         if record_input:
 
-            def _pre_hook(_module, args, probe_name=name, resolved_probe_name=resolved_name):
+            def _pre_hook(
+                _module, args, probe_name=name, resolved_probe_name=resolved_name
+            ):
                 _record_activation_probe(
-                    records, probe_name, args, record_grad=record_grad, tensor_hooks=tensor_hooks
+                    records,
+                    probe_name,
+                    args,
+                    record_grad=record_grad,
+                    tensor_hooks=tensor_hooks,
                 )
                 records[-1]["resolved_name"] = f"{resolved_probe_name}:input"
                 records[-1]["module_type"] = (
@@ -217,12 +234,20 @@ def _activation_probe_context(handle, probe_names: list[str], *, record_grad: bo
             hooks.append(module.register_forward_pre_hook(_pre_hook))
             continue
 
-        def _hook(_module, _args, output, probe_name=name, resolved_probe_name=resolved_name):
+        def _hook(
+            _module, _args, output, probe_name=name, resolved_probe_name=resolved_name
+        ):
             _record_activation_probe(
-                records, probe_name, output, record_grad=record_grad, tensor_hooks=tensor_hooks
+                records,
+                probe_name,
+                output,
+                record_grad=record_grad,
+                tensor_hooks=tensor_hooks,
             )
             records[-1]["resolved_name"] = resolved_probe_name
-            records[-1]["module_type"] = type(_module).__module__ + "." + type(_module).__qualname__
+            records[-1]["module_type"] = (
+                type(_module).__module__ + "." + type(_module).__qualname__
+            )
 
         hooks.append(module.register_forward_hook(_hook))
     try:
@@ -306,14 +331,14 @@ def _weight_fingerprint(rt, handle) -> dict[str, Any]:
 
 def _forward_logits(rt, handle, batch: Any) -> torch.Tensor | None:
     result = rt.forward_backward(
-        handle,
-        iter([batch]),
-        loss_fn=None,
-        num_microbatches=1,
-        forward_only=True,
+        handle, iter([batch]), loss_fn=None, num_microbatches=1, forward_only=True
     )
     output = result.model_output
-    return output.vocab_parallel_logits if output.vocab_parallel_logits is not None else (-output.log_probs if output.log_probs is not None else None)
+    return (
+        output.vocab_parallel_logits
+        if output.vocab_parallel_logits is not None
+        else (-output.log_probs if output.log_probs is not None else None)
+    )
 
 
 def run_backend(
@@ -347,11 +372,18 @@ def run_backend(
                 rt.zero_grad(handle)
                 _sync(session_cfg.device)
                 result = rt.forward_backward(
-                    handle, data_iter, loss_fn=None, num_microbatches=session_cfg.num_microbatches
+                    handle,
+                    data_iter,
+                    loss_fn=None,
+                    num_microbatches=session_cfg.num_microbatches,
                 )
                 _sync(session_cfg.device)
                 output = result.model_output
-                logits = _hash_tensor(output.vocab_parallel_logits if output.vocab_parallel_logits is not None else (-output.log_probs if output.log_probs is not None else None))
+                logits = _hash_tensor(
+                    output.vocab_parallel_logits
+                    if output.vocab_parallel_logits is not None
+                    else (-output.log_probs if output.log_probs is not None else None)
+                )
                 grads = _grad_fingerprint(handle)
 
                 if session_cfg.no_optimizer:
@@ -373,7 +405,9 @@ def run_backend(
                     "grad_norm": _scalar(grad_norm),
                     "update_successful": bool(update_successful),
                     "num_zeros": None if num_zeros is None else int(num_zeros),
-                    "post_step_weights": _weight_fingerprint(rt, handle) if hash_weights else None,
+                    "post_step_weights": (
+                        _weight_fingerprint(rt, handle) if hash_weights else None
+                    ),
                     "train_activation_probes": train_activation_probes,
                 }
             )
@@ -398,7 +432,9 @@ def run_backend(
 
 
 def _add_run_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--backend", choices=["mlite", "bridge", "mbridge"], required=True)
+    parser.add_argument(
+        "--backend", choices=["mlite", "bridge", "mbridge"], required=True
+    )
     parser.add_argument("--hf-path", required=True)
     parser.add_argument("--model-name", default="qwen3_5")
     parser.add_argument("--impl", default="lite")
@@ -441,15 +477,21 @@ def _activation_probe_names(raw: str, backend: str) -> list[str]:
     if isinstance(value, dict):
         selected = value.get(backend, [])
         if not isinstance(selected, list):
-            raise ValueError(f"activation probe list for {backend!r} must be a JSON list.")
+            raise ValueError(
+                f"activation probe list for {backend!r} must be a JSON list."
+            )
         return [str(item) for item in selected]
-    raise ValueError("activation_probes_json must be a JSON list or backend-to-list mapping.")
+    raise ValueError(
+        "activation_probes_json must be a JSON list or backend-to-list mapping."
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    run_p = sub.add_parser("run", help="run one backend and write a correctness artifact")
+    run_p = sub.add_parser(
+        "run", help="run one backend and write a correctness artifact"
+    )
     _add_run_args(run_p)
 
     cmp_p = sub.add_parser("compare", help="strictly compare two correctness artifacts")
@@ -488,12 +530,18 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         return result
 
     cfg = BenchCliConfig(
-        **{k: v for k, v in vars(ns).items() if k in BenchCliConfig.__dataclass_fields__}
+        **{
+            k: v
+            for k, v in vars(ns).items()
+            if k in BenchCliConfig.__dataclass_fields__
+        }
     )
     artifact = run_backend(
         cfg,
         hash_weights=not ns.skip_weight_hash,
-        activation_probe_names=_activation_probe_names(ns.activation_probes_json, cfg.backend),
+        activation_probe_names=_activation_probe_names(
+            ns.activation_probes_json, cfg.backend
+        ),
     )
     if _distributed_rank() == 0:
         text = json.dumps(artifact, indent=2, sort_keys=True)

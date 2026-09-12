@@ -10,10 +10,9 @@ gradient into every parameter below the router.
 
 from types import SimpleNamespace
 
+import megatron.lite.primitive.modules.router as router_module
 import pytest
 import torch
-
-import megatron.lite.primitive.modules.router as router_module
 from megatron.lite.primitive.modules.router import SigmoidTopKRouter, TopKRouter
 
 
@@ -60,7 +59,9 @@ def counting_scaler(monkeypatch):
 @pytest.mark.gpus(1)
 @pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 @pytest.mark.parametrize("coef,expected_calls", [(0.0, 0), (0.001, 1)])
-def test_topk_router_skips_aux_loss_when_coef_zero(counting_scaler, coef, expected_calls):
+def test_topk_router_skips_aux_loss_when_coef_zero(
+    counting_scaler, coef, expected_calls
+):
     if not torch.cuda.is_available():
         pytest.skip("TopKRouter gating GEMM requires CUDA")
     router = TopKRouter(_config(coef), _ps()).cuda()
@@ -73,7 +74,9 @@ def test_topk_router_skips_aux_loss_when_coef_zero(counting_scaler, coef, expect
 
 
 @pytest.mark.parametrize("coef,expected_calls", [(0.0, 0), (0.001, 1)])
-def test_sigmoid_router_skips_aux_loss_when_coef_zero(counting_scaler, coef, expected_calls):
+def test_sigmoid_router_skips_aux_loss_when_coef_zero(
+    counting_scaler, coef, expected_calls
+):
     router = SigmoidTopKRouter(_config(coef), _ps())
     router.train()
     x = torch.randn(6, 8, requires_grad=True)

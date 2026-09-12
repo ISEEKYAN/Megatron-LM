@@ -21,4 +21,9 @@ def default_placement_fn(name: str) -> list:
     return [Replicate(), Replicate(), Replicate(), Replicate()]
 
 
-__all__ = ["ExpertClassifierFn", "PlacementFn", "default_expert_classifier", "default_placement_fn"]
+__all__ = [
+    "ExpertClassifierFn",
+    "PlacementFn",
+    "default_expert_classifier",
+    "default_placement_fn",
+]

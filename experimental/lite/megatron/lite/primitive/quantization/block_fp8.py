@@ -69,9 +69,7 @@ def quantize_block_fp8(
 
 
 def dequantize_block_fp8(
-    tensor: torch.Tensor,
-    scale: torch.Tensor,
-    block_shape: tuple[int, int] = (128, 128),
+    tensor: torch.Tensor, scale: torch.Tensor, block_shape: tuple[int, int] = (128, 128)
 ) -> torch.Tensor:
     """Dequantize a tensor emitted by :func:`quantize_block_fp8`."""
     _validate(tensor, block_shape)

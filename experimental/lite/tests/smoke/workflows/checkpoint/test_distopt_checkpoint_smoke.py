@@ -8,25 +8,26 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.tensor import Replicate, Shard
-
 from megatron.core.dist_checkpointing import load_plain_tensors
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed import (
+    DistributedDataParallel,
+    DistributedDataParallelConfig,
+)
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
 from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_stack
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
-from megatron.lite.runtime.contracts.config import OptimizerConfig as LiteOptimizerConfig
+from megatron.lite.runtime.contracts.config import (
+    OptimizerConfig as LiteOptimizerConfig,
+)
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
+from torch.distributed.tensor import Replicate, Shard
 
-pytestmark = [
-    pytest.mark.gpus(2),
-    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
-]
+pytestmark = [pytest.mark.gpus(2), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
 
 
 class TinyDense(nn.Module):
@@ -46,12 +47,16 @@ class TinyTopologyAwareState(nn.Module):
     def __init__(self, ps: ParallelState):
         super().__init__()
         self.dense_weight = nn.Parameter(
-            _local_shard(_global_tensor(self.dense_shape, 1.0), 0, ps.tp_rank, ps.tp_size)
+            _local_shard(
+                _global_tensor(self.dense_shape, 1.0), 0, ps.tp_rank, ps.tp_size
+            )
             .cuda()
             .bfloat16()
         )
         self.experts_weight = nn.Parameter(
-            _local_shard(_global_tensor(self.expert_shape, 101.0), 0, ps.etp_rank, ps.etp_size)
+            _local_shard(
+                _global_tensor(self.expert_shape, 101.0), 0, ps.etp_rank, ps.etp_size
+            )
             .cuda()
             .bfloat16()
         )
@@ -100,7 +105,9 @@ def _single_node_cuda_dist_opt():
 
 
 def _global_tensor(shape: tuple[int, ...], offset: float) -> torch.Tensor:
-    return torch.arange(offset, offset + int(torch.tensor(shape).prod().item())).reshape(shape)
+    return torch.arange(
+        offset, offset + int(torch.tensor(shape).prod().item())
+    ).reshape(shape)
 
 
 def _local_shard(tensor: torch.Tensor, dim: int, rank: int, size: int) -> torch.Tensor:
@@ -138,11 +145,18 @@ def _build_sharded_model_and_dist_opt(parallel: ParallelConfig):
         deterministic=False,
     )
     wrapped_chunks, optimizer = build_dist_opt_stack(
-        [model], model_cfg=model_cfg, engine_cfg=engine_cfg, ps=ps, is_expert=_is_expert_param
+        [model],
+        model_cfg=model_cfg,
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=_is_expert_param,
     )
     _seed_optimizer_state(optimizer)
     attach_model_sharded_state_dict(
-        wrapped_chunks, ps, get_placements=_topology_placements, is_expert=_is_expert_param
+        wrapped_chunks,
+        ps,
+        get_placements=_topology_placements,
+        is_expert=_is_expert_param,
     )
     return wrapped_chunks, optimizer, ps
 
@@ -172,7 +186,9 @@ def _inner_optimizers(optimizer):
         yield optimizer
 
 
-def _dist_opt_handle(wrapped_chunks, optimizer, ps: ParallelState, parallel: ParallelConfig):
+def _dist_opt_handle(
+    wrapped_chunks, optimizer, ps: ParallelState, parallel: ParallelConfig
+):
     return ModelHandle(
         model=wrapped_chunks,
         optimizer=optimizer,
@@ -195,7 +211,9 @@ def _build_model_and_dist_opt():
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
     )
     optimizer = get_megatron_optimizer(
-        OptimizerConfig(optimizer="adam", lr=1.0e-3, bf16=True, use_distributed_optimizer=True),
+        OptimizerConfig(
+            optimizer="adam", lr=1.0e-3, bf16=True, use_distributed_optimizer=True
+        ),
         [wrapped],
     )
     attach_model_sharded_state_dict([wrapped], _single_node_parallel_state())
@@ -226,7 +244,10 @@ def _train_step(model, optimizer, x: torch.Tensor):
 
 
 def _local_named_params(model) -> dict[str, torch.Tensor]:
-    return {name: param.detach().cpu().float().clone() for name, param in model.named_parameters()}
+    return {
+        name: param.detach().cpu().float().clone()
+        for name, param in model.named_parameters()
+    }
 
 
 def _assert_model_close(lhs, rhs):
@@ -234,7 +255,9 @@ def _assert_model_close(lhs, rhs):
     rhs_params = _local_named_params(rhs)
     assert lhs_params.keys() == rhs_params.keys()
     for name in lhs_params:
-        torch.testing.assert_close(lhs_params[name], rhs_params[name], atol=0.0, rtol=0.0)
+        torch.testing.assert_close(
+            lhs_params[name], rhs_params[name], atol=0.0, rtol=0.0
+        )
 
 
 def test_dist_opt_checkpoint_load_matches_uninterrupted_training_single_node(tmp_path):
@@ -289,7 +312,9 @@ def test_dist_opt_checkpoint_reshards_from_pp_ep_to_tp_pp_ep_etp(tmp_path):
     source_parallel = ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=1)
     target_parallel = ParallelConfig(tp=2, ep=2, etp=2, pp=2, cp=1)
 
-    source_chunks, source_optimizer, source_ps = _build_sharded_model_and_dist_opt(source_parallel)
+    source_chunks, source_optimizer, source_ps = _build_sharded_model_and_dist_opt(
+        source_parallel
+    )
     runtime.save_checkpoint(
         _dist_opt_handle(source_chunks, source_optimizer, source_ps, source_parallel),
         source_dir,
@@ -297,10 +322,14 @@ def test_dist_opt_checkpoint_reshards_from_pp_ep_to_tp_pp_ep_etp(tmp_path):
         save_rng=False,
     )
 
-    target_chunks, target_optimizer, target_ps = _build_sharded_model_and_dist_opt(target_parallel)
+    target_chunks, target_optimizer, target_ps = _build_sharded_model_and_dist_opt(
+        target_parallel
+    )
     assert (
         runtime.load_checkpoint(
-            _dist_opt_handle(target_chunks, target_optimizer, target_ps, target_parallel),
+            _dist_opt_handle(
+                target_chunks, target_optimizer, target_ps, target_parallel
+            ),
             source_dir,
             load_rng=False,
         )

@@ -20,10 +20,7 @@ def test_dense_cp_layout_keeps_local_queries_and_restores_global_kv_order():
     from megatron.lite.primitive.modules.attention.dsa import _dense_cp_layout
 
     query_positions, kv_reorder = _dense_cp_layout(
-        local_seq=4,
-        cp_size=2,
-        cp_rank=0,
-        device=torch.device("cpu"),
+        local_seq=4, cp_size=2, cp_rank=0, device=torch.device("cpu")
     )
 
     assert query_positions.tolist() == [0, 1, 2, 3]
@@ -36,10 +33,7 @@ def test_packed_cp_layout_uses_contiguous_global_coordinates():
 
     cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
     query_positions, kv_reorder = _packed_cp_layout(
-        cu_seqlens,
-        cp_size=2,
-        cp_rank=0,
-        device=torch.device("cpu"),
+        cu_seqlens, cp_size=2, cp_rank=0, device=torch.device("cpu")
     )
 
     assert query_positions.tolist() == list(range(8))
@@ -48,9 +42,7 @@ def test_packed_cp_layout_uses_contiguous_global_coordinates():
 
 
 def test_cp_projected_kv_is_physically_aligned_for_cudnn_topk():
-    from megatron.lite.primitive.modules.attention.dsa import (
-        _pad_cp_projected_kv,
-    )
+    from megatron.lite.primitive.modules.attention.dsa import _pad_cp_projected_kv
 
     kv = torch.arange(520 * 3, dtype=torch.float32).view(520, 1, 3)
     index_k = torch.arange(520 * 2, dtype=torch.float32).view(520, 1, 2)
@@ -73,11 +65,7 @@ def test_cp_causal_mask_blocks_future_and_cross_packed_sequence_keys():
     key_positions = torch.arange(20, dtype=torch.long)
     cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
 
-    mask = _build_cp_causal_mask(
-        query_positions,
-        key_positions,
-        cu_seqlens=cu_seqlens,
-    )
+    mask = _build_cp_causal_mask(query_positions, key_positions, cu_seqlens=cu_seqlens)
     valid = mask == 0
 
     assert valid[0].nonzero().flatten().tolist() == [0, 1]
@@ -159,12 +147,7 @@ def test_dense_cp_native_collective_only_receives_projected_kv_and_indexer_k():
     )
     x = torch.randn(1, 4, 64)
     result = DynamicSparseAttention._forward_dense_cp_native(
-        fake,
-        x,
-        torch.empty(0),
-        torch.empty(0),
-        torch.empty(0),
-        index_share_state=None,
+        fake, x, torch.empty(0), torch.empty(0), torch.empty(0), index_share_state=None
     )
 
     assert result is sentinel
@@ -210,8 +193,7 @@ def test_packed_cp_native_explicitly_selects_contiguous_projected_gather():
         _project_cp_output=lambda out, weight: sentinel,
     )
     params = SimpleNamespace(
-        cp_layout="contiguous",
-        cu_seqlens_q=torch.tensor([0, 8], dtype=torch.int32),
+        cp_layout="contiguous", cu_seqlens_q=torch.tensor([0, 8], dtype=torch.int32)
     )
     result = DynamicSparseAttention._forward_packed_cp_native(
         fake,
@@ -240,10 +222,14 @@ def test_cp_indexer_topk_respects_explicit_global_position_mask():
 
     _scores, actual = indexer_topk_with_mask(q, k, weights, 4, mask, 4**-0.5)
     reference = torch.einsum("qbhd,kbd->bqhk", q.float(), k.float())
-    reference = torch.relu(reference).mul(weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
+    reference = (
+        torch.relu(reference).mul(weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
+    )
     reference = reference * (4**-0.5) + mask.unsqueeze(0)
     values, expected = torch.topk(reference, k=4, dim=-1)
-    expected = torch.where(torch.isfinite(values), expected, torch.full_like(expected, -1))
+    expected = torch.where(
+        torch.isfinite(values), expected, torch.full_like(expected, -1)
+    )
 
     assert torch.equal(actual, expected.int())
     assert (actual[0, 0][actual[0, 0] >= 0] < 2).all()
@@ -283,7 +269,9 @@ def test_cp_dense_indexer_loss_matches_full_score_reference_and_backpropagates()
     )
 
     index_logits = torch.einsum("qbhd,kbd->bqhk", q.float(), k.float())
-    index_logits = torch.relu(index_logits).mul(weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
+    index_logits = (
+        torch.relu(index_logits).mul(weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
+    )
     index_logits = index_logits * (4**-0.5) + mask.unsqueeze(0)
     predict = torch.softmax(index_logits, dim=-1)
     attn_logits = torch.einsum("qbhd,kbd->bqhk", query.float(), kv.float())

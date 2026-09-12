@@ -1,13 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
-
 from megatron.lite.runtime.contracts.weights import ResyncFormat
 
 
 @pytest.mark.parametrize(
-    "expected",
-    [ResyncFormat.BF16, ResyncFormat.BLOCK_FP8, ResyncFormat.MXFP4],
+    "expected", [ResyncFormat.BF16, ResyncFormat.BLOCK_FP8, ResyncFormat.MXFP4]
 )
 def test_resync_format_round_trip(expected: ResyncFormat) -> None:
     assert ResyncFormat.parse(expected.value) is expected

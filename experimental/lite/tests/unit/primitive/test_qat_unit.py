@@ -330,8 +330,7 @@ def test_export_roundtrip_matches_fake_quant(fmt, group_size):
 
 
 @pytest.mark.parametrize(
-    "fmt,group_size",
-    [("fp8", 0), ("fp8", -1), ("fp8", 32), ("mxfp4", 32)],
+    "fmt,group_size", [("fp8", 0), ("fp8", -1), ("fp8", 32), ("mxfp4", 32)]
 )
 def test_float_export_roundtrip_matches_fake_quant(fmt, group_size):
     torch.manual_seed(13)
@@ -475,8 +474,7 @@ def _copy_via_checkpoint_primitive(
 
 
 @pytest.mark.parametrize(
-    "fmt,group_size",
-    [("int8", -1), ("int4", -1), ("fp8_e4m3", -1), ("mxfp4", 32)],
+    "fmt,group_size", [("int8", -1), ("int4", -1), ("fp8_e4m3", -1), ("mxfp4", 32)]
 )
 def test_apply_before_load_still_loads_master_weight(fmt, group_size):
     torch.manual_seed(7)
@@ -491,8 +489,7 @@ def test_apply_before_load_still_loads_master_weight(fmt, group_size):
     real_qkv = torch.randn(12, 64, dtype=torch.bfloat16)
     real_proj = torch.randn(12, 64, dtype=torch.bfloat16)
     _copy_via_checkpoint_primitive(
-        chunk,
-        {"qkv.linear.weight": real_qkv, "proj.linear.weight": real_proj},
+        chunk, {"qkv.linear.weight": real_qkv, "proj.linear.weight": real_proj}
     )
 
     # 3) the BF16 master (.original) must hold the real weights — not random init.

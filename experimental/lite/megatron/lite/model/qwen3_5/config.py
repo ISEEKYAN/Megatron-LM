@@ -67,7 +67,13 @@ class Qwen35Config:
     linear_conv_kernel_dim: int = 4
     layer_types: list[str] = field(
         default_factory=lambda: (
-            ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 10
+            [
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ]
+            * 10
         )
     )
     partial_rotary_factor: float = 0.25
@@ -108,7 +114,8 @@ class Qwen35Config:
         if (
             self.num_nextn_predict_layers > 0
             and not self.mtp_layer_types
-            and len(self.layer_types) == self.num_hidden_layers + self.num_nextn_predict_layers
+            and len(self.layer_types)
+            == self.num_hidden_layers + self.num_nextn_predict_layers
         ):
             self.mtp_layer_types = self.layer_types[self.num_hidden_layers :]
             self.layer_types = self.layer_types[: self.num_hidden_layers]
@@ -171,7 +178,10 @@ class Qwen35Config:
             f"num_key_value_heads({self.num_key_value_heads})",
         )
         if self.is_moe:
-            _check(self.num_experts >= 1, f"num_experts must be >= 1, got {self.num_experts}")
+            _check(
+                self.num_experts >= 1,
+                f"num_experts must be >= 1, got {self.num_experts}",
+            )
             _check(
                 1 <= self.num_experts_per_tok <= self.num_experts,
                 f"num_experts_per_tok({self.num_experts_per_tok}) must be in "
@@ -228,10 +238,14 @@ class Qwen35Config:
             )
         valid_types = {"linear_attention", "full_attention"}
         for i, lt in enumerate(self.layer_types):
-            _check(lt in valid_types, f"layer_types[{i}] must be one of {valid_types}, got '{lt}'")
+            _check(
+                lt in valid_types,
+                f"layer_types[{i}] must be one of {valid_types}, got '{lt}'",
+            )
         for i, lt in enumerate(self.mtp_layer_types):
             _check(
-                lt in valid_types, f"mtp_layer_types[{i}] must be one of {valid_types}, got '{lt}'"
+                lt in valid_types,
+                f"mtp_layer_types[{i}] must be one of {valid_types}, got '{lt}'",
             )
 
         if errors:
@@ -267,7 +281,10 @@ class Qwen35Config:
         kwargs["model_type"] = model_type
         kwargs["hf_text_prefix"] = "model.language_model" if is_composite else "model"
         mtp_num_hidden_layers = kwargs.pop("mtp_num_hidden_layers", None)
-        if kwargs.get("num_nextn_predict_layers") is None and mtp_num_hidden_layers is not None:
+        if (
+            kwargs.get("num_nextn_predict_layers") is None
+            and mtp_num_hidden_layers is not None
+        ):
             kwargs["num_nextn_predict_layers"] = int(mtp_num_hidden_layers)
         if "rope_parameters" in hf and isinstance(hf["rope_parameters"], dict):
             rp = hf["rope_parameters"]

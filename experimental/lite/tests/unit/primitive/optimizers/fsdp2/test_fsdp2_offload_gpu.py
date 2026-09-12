@@ -8,7 +8,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 from megatron.lite.primitive.optimizers.fsdp2 import (
     FSDP2Config,
     build_fsdp2_adamw,
@@ -17,7 +16,10 @@ from megatron.lite.primitive.optimizers.fsdp2 import (
     fsdp2_available,
     wrap_fsdp2,
 )
-from megatron.lite.primitive.optimizers.fsdp2.adamw import iter_torch_optimizers, to_local_tensor
+from megatron.lite.primitive.optimizers.fsdp2.adamw import (
+    iter_torch_optimizers,
+    to_local_tensor,
+)
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
@@ -150,7 +152,9 @@ def _parallel_state() -> ParallelState:
     )
 
 
-def _build_fsdp2_model(dtype: torch.dtype = torch.bfloat16) -> tuple[nn.Module, ParallelState]:
+def _build_fsdp2_model(
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[nn.Module, ParallelState]:
     torch.manual_seed(1234)
     model = TinyModel().cuda().to(dtype=dtype)
     ps = _parallel_state()
@@ -197,7 +201,10 @@ def test_fsdp2_runtime_model_and_optimizer_offload_roundtrip_single_gpu():
     model, ps = _build_fsdp2_model()
     optimizer = _build_optimizer(model, ps, offload_fraction=0.0)
     handle = ModelHandle(
-        model=model, optimizer=optimizer, parallel_state=ps, _extras={"model_chunks": [model]}
+        model=model,
+        optimizer=optimizer,
+        parallel_state=ps,
+        _extras={"model_chunks": [model]},
     )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
@@ -281,9 +288,9 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
     def assert_grad_devices(device: str) -> None:
         grads = [param.grad for param in model.parameters()]
         assert all(grad is not None for grad in grads)
-        assert {to_local_tensor(grad).device.type for grad in grads if grad is not None} == {
-            device
-        }
+        assert {
+            to_local_tensor(grad).device.type for grad in grads if grad is not None
+        } == {device}
 
     def check_expert_shard_after_forward(_module, _inputs, _output) -> None:
         assert_experts_are_local_shards("cuda")
@@ -306,7 +313,10 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
     train_backward(4321)
 
     handle = ModelHandle(
-        model=model, optimizer=optimizer, parallel_state=ps, _extras={"model_chunks": [model]}
+        model=model,
+        optimizer=optimizer,
+        parallel_state=ps,
+        _extras={"model_chunks": [model]},
     )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     runtime.to(handle, "cpu", model=True, optimizer=True, grad=True)
@@ -366,7 +376,9 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
         unit.experts.register_forward_hook(check_stress_expert_shard)
         for unit in stress_model.units
     ]
-    device_bytes = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+    device_bytes = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).total_memory
     memory_limit_bytes = resident_bytes + 3 * expert_bytes
     memory_fraction = min(0.9, memory_limit_bytes / device_bytes)
     torch.cuda.set_per_process_memory_fraction(memory_fraction)
@@ -398,8 +410,10 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
     # barrier: parameters are intentionally left materialized after forward,
     # then runtime.to(..., "cpu") must reshard them before Module.to() sees
     # their DTensor state.
-    materialized_model = TinyPipelineMoEModel(hidden_size=512, num_units=1).cuda().to(
-        dtype=torch.bfloat16
+    materialized_model = (
+        TinyPipelineMoEModel(hidden_size=512, num_units=1)
+        .cuda()
+        .to(dtype=torch.bfloat16)
     )
     materialized_expert_numels = {
         name: param.numel()
@@ -444,7 +458,9 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
         local = to_local_tensor(param.detach())
         assert local.device.type == "cpu"
         if name in materialized_expert_numels:
-            assert local.numel() == materialized_expert_numels[name] // ps.expert_dp_size
+            assert (
+                local.numel() == materialized_expert_numels[name] // ps.expert_dp_size
+            )
 
     runtime.to(materialized_handle, "cuda", model=True, optimizer=False, grad=False)
     assert _local_param_devices(materialized_model) == {"cuda"}

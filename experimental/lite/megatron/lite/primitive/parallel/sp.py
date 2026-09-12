@@ -6,7 +6,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.ops.sp_ops import (
     AllGatherDim0,
     AllGatherDim0ForNonSPConsumer,

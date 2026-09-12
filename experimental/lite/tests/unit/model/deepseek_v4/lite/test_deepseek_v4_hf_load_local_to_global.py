@@ -138,8 +138,7 @@ def test_ds4_load_hf_canonicalizes_qat_state_before_dynamic_mapping(tmp_path):
         linear,
         "weight",
         WeightFakeQuant(
-            QATSpec(enabled=True, format="int8", group_size=-1),
-            linear.weight.shape,
+            QATSpec(enabled=True, format="int8", group_size=-1), linear.weight.shape
         ),
     )
     master = linear.parametrizations.weight.original
@@ -182,16 +181,7 @@ def test_ds4_export_streams_router_buffers_from_every_pp_stage(monkeypatch):
 
     remote = torch.tensor([3, 1, 4], dtype=torch.int64)
     remote_headers = iter(
-        [
-            [
-                (
-                    "layers.0.mlp.gate.tid2eid",
-                    tuple(remote.shape),
-                    remote.dtype,
-                )
-            ],
-            [],
-        ]
+        [[("layers.0.mlp.gate.tid2eid", tuple(remote.shape), remote.dtype)], []]
     )
 
     def fake_broadcast_object_list(header, *, src, **_kwargs):

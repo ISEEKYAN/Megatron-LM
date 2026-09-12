@@ -113,8 +113,7 @@ def test_qat_export_real_mxfp4_matches_modelopt_reference_encoding() -> None:
     assert torch.equal(
         packed,
         torch.tensor(
-            [[0x00, 0x21, 0x43, 0x65, 0x98, 0xBA, 0xDC, 0xFE] * 2],
-            dtype=torch.uint8,
+            [[0x00, 0x21, 0x43, 0x65, 0x98, 0xBA, 0xDC, 0xFE] * 2], dtype=torch.uint8
         ),
     )
     assert torch.equal(scale, torch.tensor([[127]], dtype=torch.uint8))

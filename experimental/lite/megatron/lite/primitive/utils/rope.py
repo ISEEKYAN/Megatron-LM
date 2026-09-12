@@ -14,7 +14,9 @@ def get_pos_emb_on_this_cp_rank(
     pos_emb: Tensor, seq_dim: int, cp_group: torch.distributed.ProcessGroup
 ) -> Tensor:
     if cp_group is None:
-        raise ValueError("cp_group must be provided to get positional embedding per CP rank")
+        raise ValueError(
+            "cp_group must be provided to get positional embedding per CP rank"
+        )
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
     cp_idx = torch.tensor(
@@ -118,12 +120,17 @@ def _apply_rotary_pos_emb_thd(
         for i, x in enumerate(sequence_splits):
             seq_start_offset = cu_seqlens[i].item()
             freq_slices.append(
-                _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
+                _get_thd_freqs_on_this_cp_rank(
+                    cp_rank, cp_size, x, freqs, seq_start_offset
+                )
             )
         freqs_packed = torch.cat(freq_slices, dim=0)
     else:
         freqs_packed = torch.cat(
-            [_get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs) for x in sequence_splits],
+            [
+                _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs)
+                for x in sequence_splits
+            ],
             dim=0,
         )
 

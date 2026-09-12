@@ -6,7 +6,6 @@ import copy
 import pytest
 import torch
 import torch.nn as nn
-
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
@@ -20,7 +19,9 @@ class TinyMLP(nn.Module):
         return self.layers(x)
 
 
-def _step(model: nn.Module, optimizer: torch.optim.Optimizer, x: torch.Tensor, y: torch.Tensor):
+def _step(
+    model: nn.Module, optimizer: torch.optim.Optimizer, x: torch.Tensor, y: torch.Tensor
+):
     optimizer.zero_grad(set_to_none=True)
     loss = torch.nn.functional.mse_loss(model(x), y)
     loss.backward()
@@ -56,12 +57,16 @@ def test_runtime_checkpoint_load_matches_uninterrupted_training(tmp_path):
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     ckpt_handle = ModelHandle(
-        model=ckpt_model, optimizer=ckpt_optimizer, _extras={"model_chunks": [ckpt_model]}
+        model=ckpt_model,
+        optimizer=ckpt_optimizer,
+        _extras={"model_chunks": [ckpt_model]},
     )
     runtime.save_checkpoint(ckpt_handle, str(tmp_path), step=1, use_dcp=False)
 
     loaded_handle = ModelHandle(
-        model=loaded_model, optimizer=loaded_optimizer, _extras={"model_chunks": [loaded_model]}
+        model=loaded_model,
+        optimizer=loaded_optimizer,
+        _extras={"model_chunks": [loaded_model]},
     )
     assert runtime.load_checkpoint(loaded_handle, str(tmp_path), use_dcp=False) == 1
 
@@ -101,7 +106,9 @@ class DistOptLike:
         self.parameter_save_calls += 1
         torch.save({"parameter_save_calls": self.parameter_save_calls}, filename)
 
-    def load_parameter_state(self, filename: str, *, update_legacy_format: bool = False):
+    def load_parameter_state(
+        self, filename: str, *, update_legacy_format: bool = False
+    ):
         state = torch.load(filename)
         self.parameter_load_calls = int(state["parameter_save_calls"])
 
@@ -117,16 +124,22 @@ def test_runtime_checkpoint_uses_optimizer_state_dict_contract(tmp_path):
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     runtime.save_checkpoint(
-        ModelHandle(model=model, optimizer=optimizer, _extras={"model_chunks": [model]}),
+        ModelHandle(
+            model=model, optimizer=optimizer, _extras={"model_chunks": [model]}
+        ),
         str(tmp_path),
         step=7,
         use_dcp=False,
     )
 
     loaded_model = TinyMLP()
-    loaded_optimizer = DistOptLike(torch.optim.AdamW(loaded_model.parameters(), lr=1.0e-3))
+    loaded_optimizer = DistOptLike(
+        torch.optim.AdamW(loaded_model.parameters(), lr=1.0e-3)
+    )
     loaded_handle = ModelHandle(
-        model=loaded_model, optimizer=loaded_optimizer, _extras={"model_chunks": [loaded_model]}
+        model=loaded_model,
+        optimizer=loaded_optimizer,
+        _extras={"model_chunks": [loaded_model]},
     )
 
     assert runtime.load_checkpoint(loaded_handle, str(tmp_path), use_dcp=False) == 7

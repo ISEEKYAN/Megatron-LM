@@ -193,7 +193,9 @@ def _load_indexer_fwd_sm100():
     global _indexer_fwd_sm100
     if _indexer_fwd_sm100 is None:
         try:
-            module = import_module("cudnn.deepseek_sparse_attention.indexer_forward._interface")
+            module = import_module(
+                "cudnn.deepseek_sparse_attention.indexer_forward._interface"
+            )
             _indexer_fwd_sm100 = module.indexer_fwd
         except (AttributeError, ImportError) as exc:
             raise ImportError(
@@ -337,7 +339,9 @@ def build_flat_topk_idxs(
             # CUDA still work. Production callers always go through the CUDA
             # path above.
             valid_mask = global_idxs >= 0
-            sorted_indices = valid_mask.int().argsort(dim=-1, descending=True, stable=True)
+            sorted_indices = valid_mask.int().argsort(
+                dim=-1, descending=True, stable=True
+            )
             global_idxs = global_idxs.gather(-1, sorted_indices)
             topk_length_flat = valid_mask.sum(dim=-1).int()
 
@@ -443,7 +447,14 @@ def dsa_sparse_attn(
     kv_flat = kv.reshape(skv * b, d)
 
     out_flat, _lse, _lse_indexer = SparseAttnFunc.apply(
-        q_flat, kv_flat, attn_sink, topk_idxs, topk_length, softmax_scale, indexer_topk, value_dim
+        q_flat,
+        kv_flat,
+        attn_sink,
+        topk_idxs,
+        topk_length,
+        softmax_scale,
+        indexer_topk,
+        value_dim,
     )
 
     d_v = out_flat.shape[-1]
@@ -574,7 +585,9 @@ def indexer_topk(
     q_bshd, k_bsd, _w_bsh_raw, w_bsh_scaled = _sbhd_to_bshd_indexer_inputs(
         q_indexer, k_indexer, weights, indexer_softmax_scale
     )
-    topk_indices, topk_length, _ = _indexer_topk_bshd(q_bshd, k_bsd, w_bsh_scaled, topk, ratio)
+    topk_indices, topk_length, _ = _indexer_topk_bshd(
+        q_bshd, k_bsd, w_bsh_scaled, topk, ratio
+    )
     return topk_indices, topk_length
 
 
@@ -608,11 +621,7 @@ def _cudnn_topk_block(
             f"seq_lens range=[{min_seq_len}, {max_seq_len}], num_cols={num_cols}."
         )
     result = dsa_namespace.indexer_top_k_wrapper(
-        scores,
-        seq_lens,
-        top_k=width,
-        next_n=next_n,
-        return_val=False,
+        scores, seq_lens, top_k=width, next_n=next_n, return_val=False
     )
     indices = result["indices"]
     valid = (indices >= 0) & (indices < num_cols)
@@ -654,18 +663,16 @@ def indexer_topk_with_mask(
     block_size = 2048
     for start in range(0, sk, block_size):
         end = min(start + block_size, sk)
-        scores = torch.einsum("bqhd,bkd->bqhk", q_bshd.float(), k_bsd[:, start:end].float())
+        scores = torch.einsum(
+            "bqhd,bkd->bqhk", q_bshd.float(), k_bsd[:, start:end].float()
+        )
         scores = torch.relu(scores).mul(w_bsh_scaled.float().unsqueeze(-1)).sum(dim=2)
         scores = scores + mask[:, start:end].unsqueeze(0)
         block_width = min(width, end - start)
         if scores.is_cuda:
             _ensure_dsa_namespace()
             flat_scores = scores.reshape(b * sq, end - start).contiguous()
-            values, indices = _cudnn_topk_block(
-                _DSA,
-                flat_scores,
-                block_width,
-            )
+            values, indices = _cudnn_topk_block(_DSA, flat_scores, block_width)
             values = values.view(b, sq, block_width)
             indices = indices.view(b, sq, block_width)
         else:
@@ -680,7 +687,9 @@ def indexer_topk_with_mask(
         best_values, best_indices = values, indices
     assert best_values is not None and best_indices is not None
     values, indices = best_values, best_indices
-    indices = torch.where(torch.isfinite(values), indices, torch.full_like(indices, -1)).int()
+    indices = torch.where(
+        torch.isfinite(values), indices, torch.full_like(indices, -1)
+    ).int()
     if width < topk:
         indices = torch.nn.functional.pad(indices, (0, topk - width), value=-1)
     return q_bshd.new_empty(0), indices
@@ -732,7 +741,9 @@ def cp_indexer_loss(
             2,
             safe.unsqueeze(-1).expand(-1, -1, -1, k_bsd.shape[-1]),
         )
-        index_logits = torch.einsum("bqhd,bqtd->bqht", q_bshd.float(), selected_k.float())
+        index_logits = torch.einsum(
+            "bqhd,bqtd->bqht", q_bshd.float(), selected_k.float()
+        )
         index_logits = torch.relu(index_logits).mul(w_scaled.unsqueeze(-1)).sum(dim=2)
         selected_kv = torch.gather(
             kv_bkd.unsqueeze(1).expand(-1, sq, -1, -1),
@@ -743,11 +754,15 @@ def cp_indexer_loss(
         attn_logits = attn_logits * float(softmax_scale)
         selected_valid = topk_indices >= 0
         row_valid = selected_valid.any(dim=-1, keepdim=True)
-        index_logits = torch.where(row_valid, index_logits, torch.zeros_like(index_logits))
+        index_logits = torch.where(
+            row_valid, index_logits, torch.zeros_like(index_logits)
+        )
         attn_logits = torch.where(
             row_valid.unsqueeze(2), attn_logits, torch.zeros_like(attn_logits)
         )
-        index_logits = index_logits.masked_fill(~selected_valid & row_valid, float("-inf"))
+        index_logits = index_logits.masked_fill(
+            ~selected_valid & row_valid, float("-inf")
+        )
         attn_logits = attn_logits.masked_fill(
             ((~selected_valid) & row_valid).unsqueeze(2), float("-inf")
         )
@@ -797,7 +812,9 @@ def cp_indexer_loss(
             idx = idx.masked_fill(~block_valid, float("-inf"))
             attn = attn.masked_fill(~block_valid.unsqueeze(2), float("-inf"))
             predict_log = idx - safe_index_lse.unsqueeze(-1)
-            predict_log = torch.where(block_valid, predict_log, torch.zeros_like(predict_log))
+            predict_log = torch.where(
+                block_valid, predict_log, torch.zeros_like(predict_log)
+            )
             target = torch.exp(attn - safe_attn_lse.unsqueeze(-1)).mean(dim=2)
             target = torch.where(block_valid, target, torch.zeros_like(target))
             term = target * (torch.log(target + 1.0e-10) - predict_log)
@@ -1014,7 +1031,9 @@ def _kl_loss_from_dense_scores(
     # ``0 · log(0/p) = 0`` convention. Without this gate, the eps-clamp
     # on target makes the term ``eps · (log eps - (-inf)) = +inf``.
     position_valid = torch.isfinite(index_score)
-    safe_index_score = torch.where(position_valid, index_score, torch.zeros_like(index_score))
+    safe_index_score = torch.where(
+        position_valid, index_score, torch.zeros_like(index_score)
+    )
     log_predict = safe_index_score - safe_lse.unsqueeze(-1)
 
     kl_terms = target_clamped * (torch.log(target_clamped) - log_predict)
@@ -1088,7 +1107,9 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         )  # topk_indices_cmp: (b, sq, effective_topk) int32; indexer_scores: (b, sq, n_comp) fp32
 
         # ---- 3. Combine indices (indexer first, then window). --------------
-        compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1)
+        compress_topk_idxs = torch.where(
+            topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1
+        )
         if requested_topk > effective_topk:
             pad = torch.full(
                 (b, sq, requested_topk - effective_topk),
@@ -1117,7 +1138,9 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         # ---- 5. Derive predict from indexer_scores, compute target. --------
         # Attention-path tensors (detached — loss is not differentiable through them).
         q_attn_bshd = query.detach().permute(1, 0, 2, 3).contiguous()
-        k_attn_compressed_bsd = kv_full[kv_offset:].detach().permute(1, 0, 2).contiguous()
+        k_attn_compressed_bsd = (
+            kv_full[kv_offset:].detach().permute(1, 0, 2).contiguous()
+        )
         lse_indexer_bsqh = lse_indexer.reshape(sq, b, np_).permute(1, 0, 2)
 
         if sparse_loss:
@@ -1140,7 +1163,11 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
 
             if loss_coeff > 0:
                 indexer_loss = _kl_loss_from_target_predict(
-                    target, predict, topk_indices_cmp, loss_coeff, calculate_per_token_loss
+                    target,
+                    predict,
+                    topk_indices_cmp,
+                    loss_coeff,
+                    calculate_per_token_loss,
                 )
             else:
                 indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
@@ -1213,7 +1240,9 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                     block_I=128,
                 )
             # BSHD -> SBHD (match input layout).
-            precomputed_grad_q_indexer = ig["d_index_q"].permute(1, 0, 2, 3).contiguous()
+            precomputed_grad_q_indexer = (
+                ig["d_index_q"].permute(1, 0, 2, 3).contiguous()
+            )
             precomputed_grad_k_indexer = ig["d_index_k"].permute(1, 0, 2).contiguous()
             precomputed_grad_weights = ig["d_weights"].permute(1, 0, 2).contiguous()
         else:

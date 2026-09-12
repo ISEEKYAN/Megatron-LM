@@ -11,10 +11,17 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_optimizer_config
+from megatron.lite.primitive.optimizers.megatron_wrap import (
+    build_dist_opt_optimizer_config,
+)
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.bridge.config import BridgeConfig
-from megatron.lite.runtime.contracts.data import Batch, ForwardResult, ModelOutputs, PackedBatch
+from megatron.lite.runtime.contracts.data import (
+    Batch,
+    ForwardResult,
+    ModelOutputs,
+    PackedBatch,
+)
 from megatron.lite.runtime.contracts.handle import ModelHandle
 from megatron.lite.runtime.megatron_utils import (
     build_sharded_state_dict,
@@ -128,7 +135,9 @@ def _configure_provider(provider, cfg: BridgeConfig) -> None:
 def _register_bridge_compat_aliases() -> None:
     """Register local Megatron-Bridge aliases for supported checkpoint variants."""
     from megatron.bridge.models.conversion import model_bridge
-    from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
+    from megatron.bridge.models.conversion.mapping_registry import (
+        MegatronMappingRegistry,
+    )
     from megatron.bridge.models.conversion.param_mapping import (
         AutoMapping,
         GatedMLPMapping,
@@ -148,7 +157,8 @@ def _register_bridge_compat_aliases() -> None:
 
         def __init__(self, megatron_param: str, qkv: str, z: str, b: str, a: str):
             super().__init__(
-                megatron_param=megatron_param, hf_param={"qkv": qkv, "z": z, "b": b, "a": a}
+                megatron_param=megatron_param,
+                hf_param={"qkv": qkv, "z": z, "b": b, "a": a},
             )
             self._tp_mapping = AutoMapping(megatron_param, megatron_param)
 
@@ -159,12 +169,16 @@ def _register_bridge_compat_aliases() -> None:
                 config = self._get_config(megatron_module)
                 qkvz = torch.cat([hf_weights["qkv"], hf_weights["z"]], dim=0)
                 ba = torch.cat([hf_weights["b"], hf_weights["a"]], dim=0)
-                merged = merge_gdn_linear_weights(config, qkvz, ba, tp_size=self.tp_size)
+                merged = merge_gdn_linear_weights(
+                    config, qkvz, ba, tp_size=self.tp_size
+                )
             else:
                 merged = None
             return self._tp_mapping.hf_to_megatron(merged, megatron_module)
 
-        def megatron_to_hf(self, megatron_weights, megatron_module) -> dict[str, torch.Tensor]:
+        def megatron_to_hf(
+            self, megatron_weights, megatron_module
+        ) -> dict[str, torch.Tensor]:
             if megatron_weights is not None:
                 megatron_weights = self.maybe_dequantize(megatron_weights)
 
@@ -174,7 +188,9 @@ def _register_bridge_compat_aliases() -> None:
                 config = self._get_config(megatron_module)
                 config = self.broadcast_obj_from_pp_rank(config)
 
-            packed_dict = self._tp_mapping.megatron_to_hf(megatron_weights, megatron_module)
+            packed_dict = self._tp_mapping.megatron_to_hf(
+                megatron_weights, megatron_module
+            )
             if not packed_dict:
                 return {}
 
@@ -194,7 +210,11 @@ def _register_bridge_compat_aliases() -> None:
         def resolve(self, captures):
             megatron_param, hf_param = self._resolve_names(captures)
             return type(self)(
-                megatron_param, hf_param["qkv"], hf_param["z"], hf_param["b"], hf_param["a"]
+                megatron_param,
+                hf_param["qkv"],
+                hf_param["z"],
+                hf_param["b"],
+                hf_param["a"],
             )
 
     class Qwen35PackedExpertDownMapping(AutoMapping):
@@ -202,16 +222,22 @@ def _register_bridge_compat_aliases() -> None:
 
         def __init__(self, megatron_param: str, hf_param: str, permute_dims=None):
             super().__init__(
-                megatron_param=megatron_param, hf_param=hf_param, permute_dims=permute_dims
+                megatron_param=megatron_param,
+                hf_param=hf_param,
+                permute_dims=permute_dims,
             )
             self.allow_hf_name_mismatch = True
 
-        def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module) -> torch.Tensor:
+        def hf_to_megatron(
+            self, hf_weights: torch.Tensor, megatron_module
+        ) -> torch.Tensor:
             expert_number = extract_expert_number_from_param(self.megatron_param)
             expert_weight = hf_weights[expert_number].contiguous()
             return super().hf_to_megatron(expert_weight, megatron_module)
 
-        def megatron_to_hf(self, megatron_weights, megatron_module) -> dict[str, torch.Tensor]:
+        def megatron_to_hf(
+            self, megatron_weights, megatron_module
+        ) -> dict[str, torch.Tensor]:
             converted = super().megatron_to_hf(megatron_weights, megatron_module)
             return converted
 
@@ -221,7 +247,9 @@ def _register_bridge_compat_aliases() -> None:
     class Qwen35RouterMapping(AutoMapping):
         """Bridge mapping for Qwen3.5 router weights with bench expert truncation."""
 
-        def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module) -> torch.Tensor:
+        def hf_to_megatron(
+            self, hf_weights: torch.Tensor, megatron_module
+        ) -> torch.Tensor:
             config = self._get_config(megatron_module)
             num_experts = getattr(config, "num_moe_experts", None)
             if num_experts is not None and hf_weights.shape[0] != num_experts:
@@ -233,7 +261,9 @@ def _register_bridge_compat_aliases() -> None:
 
         def __init__(self, megatron_param: str, hf_param: str, permute_dims=None):
             super().__init__(
-                megatron_param=megatron_param, hf_param=hf_param, permute_dims=permute_dims
+                megatron_param=megatron_param,
+                hf_param=hf_param,
+                permute_dims=permute_dims,
             )
             self.allow_hf_name_mismatch = True
             GatedMLPMapping._validate_patterns = lambda *args, **kwargs: None
@@ -243,14 +273,22 @@ def _register_bridge_compat_aliases() -> None:
                 up=f"{self.hf_param}.up",
             )
 
-        def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module) -> torch.Tensor:
+        def hf_to_megatron(
+            self, hf_weights: torch.Tensor, megatron_module
+        ) -> torch.Tensor:
             expert_number = extract_expert_number_from_param(self.megatron_param)
             expert_weight = hf_weights[expert_number].contiguous()
             gate, up = torch.chunk(expert_weight, 2, dim=0)
-            return self._gated_mapping.hf_to_megatron({"gate": gate, "up": up}, megatron_module)
+            return self._gated_mapping.hf_to_megatron(
+                {"gate": gate, "up": up}, megatron_module
+            )
 
-        def megatron_to_hf(self, megatron_weights, megatron_module) -> dict[str, torch.Tensor]:
-            converted = self._gated_mapping.megatron_to_hf(megatron_weights, megatron_module)
+        def megatron_to_hf(
+            self, megatron_weights, megatron_module
+        ) -> dict[str, torch.Tensor]:
+            converted = self._gated_mapping.megatron_to_hf(
+                megatron_weights, megatron_module
+            )
             if not converted:
                 return {}
 
@@ -472,7 +510,10 @@ def _build_ddp_config(cfg: BridgeConfig):
 
 def _resolve_benchmark_protocol(cfg: BridgeConfig, bridge) -> Any | None:
     """Best-effort protocol lookup for model stats used by bench examples."""
-    from megatron.lite.model.registry import get_train_runtime_module, resolve_model_type_from_hf
+    from megatron.lite.model.registry import (
+        get_train_runtime_module,
+        resolve_model_type_from_hf,
+    )
 
     model_name = cfg.model_name
     if model_name == "auto":
@@ -548,7 +589,9 @@ def _bridge_forward_kwargs_from_packed_batch(
         split_cp=False,
         labels=_nested_from_packed(batch.labels, seq_lens),
         roll_labels=batch.labels is not None,
-        loss_mask=_nested_from_packed(batch.loss_mask, seq_lens) if has_loss_mask else None,
+        loss_mask=(
+            _nested_from_packed(batch.loss_mask, seq_lens) if has_loss_mask else None
+        ),
         roll_loss_mask=has_loss_mask,
     )
     sample: dict[str, Any] = {
@@ -574,6 +617,8 @@ def _bridge_forward_kwargs_from_packed_batch(
             if tensor is not None or key in sample:
                 sample[key] = tensor
     return sample
+
+
 # MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_END
 
 
@@ -592,9 +637,13 @@ def _bridge_forward_kwargs_bshd(batch: PackedBatch) -> dict[str, Any]:
     return {
         "input_ids": batch.input_ids.reshape(1, total).contiguous(),
         "labels": (
-            batch.labels.reshape(1, total).contiguous() if batch.labels is not None else None
+            batch.labels.reshape(1, total).contiguous()
+            if batch.labels is not None
+            else None
         ),
-        "attention_mask": torch.ones((1, total), dtype=torch.long, device=batch.input_ids.device),
+        "attention_mask": torch.ones(
+            (1, total), dtype=torch.long, device=batch.input_ids.device
+        ),
     }
 
 
@@ -603,12 +652,17 @@ class BridgeRuntime(RuntimeBase):
 
     def __init__(self, hf_path: str, cfg: BridgeConfig | dict[str, Any]):
         self._hf_path = hf_path
-        self._cfg = cfg if isinstance(cfg, BridgeConfig) else BridgeConfig.from_dict(cfg)
+        self._cfg = (
+            cfg if isinstance(cfg, BridgeConfig) else BridgeConfig.from_dict(cfg)
+        )
         self._offload_param = self._cfg.param_offload
         self._offload_optimizer = self._cfg.optimizer_offload
 
     def build_model(
-        self, hf_path: str | None = None, cfg: BridgeConfig | dict[str, Any] | None = None, **kwargs
+        self,
+        hf_path: str | None = None,
+        cfg: BridgeConfig | dict[str, Any] | None = None,
+        **kwargs,
     ) -> ModelHandle:
         from megatron.core import parallel_state as mpu
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -644,7 +698,8 @@ class BridgeRuntime(RuntimeBase):
 
         bridge = _build_bridge(hf_path, rt_cfg)
         provider = bridge.to_megatron_provider(
-            load_weights=rt_cfg.load_hf_weights, hf_path=hf_path if rt_cfg.load_hf_weights else None
+            load_weights=rt_cfg.load_hf_weights,
+            hf_path=hf_path if rt_cfg.load_hf_weights else None,
         )
         _configure_provider(provider, rt_cfg)
         if hasattr(provider, "finalize"):
@@ -657,8 +712,12 @@ class BridgeRuntime(RuntimeBase):
             bf16=True,
         )
 
-        optimizer = _build_optimizer(model_list, rt_cfg) if rt_cfg.build_optimizer else None
-        lr_scheduler = _build_lr_scheduler(optimizer, rt_cfg) if optimizer is not None else None
+        optimizer = (
+            _build_optimizer(model_list, rt_cfg) if rt_cfg.build_optimizer else None
+        )
+        lr_scheduler = (
+            _build_lr_scheduler(optimizer, rt_cfg) if optimizer is not None else None
+        )
         register_training_hooks(model_list, optimizer)
 
         if self._offload_param:
@@ -666,7 +725,13 @@ class BridgeRuntime(RuntimeBase):
         if self._offload_optimizer and optimizer is not None:
             offload_optimizer(optimizer)
 
-        logger.info("BridgeRuntime: model built, tp=%d ep=%d pp=%d cp=%d", p.tp, p.ep, p.pp, p.cp)
+        logger.info(
+            "BridgeRuntime: model built, tp=%d ep=%d pp=%d cp=%d",
+            p.tp,
+            p.ep,
+            p.pp,
+            p.cp,
+        )
 
         return ModelHandle(
             model=model_list[0],
@@ -721,15 +786,14 @@ class BridgeRuntime(RuntimeBase):
             owns_transient_metadata = False
             if isinstance(sample, PackedBatch):
                 if self._cfg.use_thd:
-                    sample = _bridge_forward_kwargs_from_packed_batch(sample, **cp_kwargs)
+                    sample = _bridge_forward_kwargs_from_packed_batch(
+                        sample, **cp_kwargs
+                    )
                     owns_transient_metadata = True
                 else:
                     sample = _bridge_forward_kwargs_bshd(sample)
             elif isinstance(sample, Batch):
-                sample = {
-                    "input_ids": sample["input_ids"],
-                    "labels": sample["labels"],
-                }
+                sample = {"input_ids": sample["input_ids"], "labels": sample["labels"]}
             if not isinstance(sample, dict):
                 raise TypeError(
                     f"BridgeRuntime expected dict or Batch data, got {type(sample).__name__}."
@@ -761,7 +825,9 @@ class BridgeRuntime(RuntimeBase):
 
             def _bridge_loss_fn(output_tensor, non_loss_data=False):
                 if loss_fn is not None:
-                    loss, _metrics = loss_fn({"output_tensor": output_tensor}, loss_sample)
+                    loss, _metrics = loss_fn(
+                        {"output_tensor": output_tensor}, loss_sample
+                    )
                 else:
                     loss = output_tensor.mean()
                 last_loss[0] = float(loss.detach().item())
@@ -794,7 +860,9 @@ class BridgeRuntime(RuntimeBase):
 
         result_loss = torch.tensor(loss_val or 0.0)
         return ForwardResult(
-            model_output=ModelOutputs(loss=result_loss, vocab_parallel_logits=last_output[0]),
+            model_output=ModelOutputs(
+                loss=result_loss, vocab_parallel_logits=last_output[0]
+            ),
             metrics={"loss": loss_val if loss_val is not None else 0.0},
         )
 
@@ -844,7 +912,9 @@ class BridgeRuntime(RuntimeBase):
             if optimizer and opt is not None:
                 offload_optimizer(opt)
         else:
-            raise ValueError(f"BridgeRuntime.to supports only 'cpu' or 'cuda', got {device!r}.")
+            raise ValueError(
+                f"BridgeRuntime.to supports only 'cpu' or 'cuda', got {device!r}."
+            )
 
     def train_mode(self, handle: ModelHandle):
         return _BridgeTrainCtx(self, handle)
@@ -852,7 +922,9 @@ class BridgeRuntime(RuntimeBase):
     def eval_mode(self, handle: ModelHandle):
         return _BridgeEvalCtx(self, handle)
 
-    def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
+    def export_weights(
+        self, handle: ModelHandle, **kwargs
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         bridge = handle._extras["bridge"]
         model_list = handle._extras["model_list"]
         load_model_to_gpu(model_list, load_grad=False)
@@ -928,7 +1000,9 @@ class _BridgeEvalCtx:
 
     def __enter__(self):
         if self._runtime._offload_param:
-            self._runtime.to(self._handle, "cuda", model=True, optimizer=False, grad=False)
+            self._runtime.to(
+                self._handle, "cuda", model=True, optimizer=False, grad=False
+            )
         for model in self._handle._extras["model_list"]:
             model.eval()
         torch.set_grad_enabled(False)
@@ -937,7 +1011,9 @@ class _BridgeEvalCtx:
     def __exit__(self, *exc):
         torch.set_grad_enabled(self._prev_grad)
         if self._runtime._offload_param:
-            self._runtime.to(self._handle, "cpu", model=True, optimizer=False, grad=False)
+            self._runtime.to(
+                self._handle, "cpu", model=True, optimizer=False, grad=False
+            )
         return False
 
 

@@ -35,7 +35,9 @@ pytestmark = pytest.mark.optional
 
 @pytest.fixture(autouse=True)
 def _require_verl() -> None:
-    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
+    pytest.importorskip(
+        "verl", reason="VERL is required for this optional example test."
+    )
 
 
 def _tensor_dict(data, batch_size):
@@ -101,7 +103,8 @@ def test_full_length_nested_loss_mask_is_unchanged():
     response_lengths = [100, 100]
     input_ids = _full_input_ids(full_lengths)
     loss_mask = torch.nested.as_nested_tensor(
-        [torch.ones(r, dtype=torch.float32) for r in response_lengths], layout=torch.jagged
+        [torch.ones(r, dtype=torch.float32) for r in response_lengths],
+        layout=torch.jagged,
     )
     micro_batch = _tensor_dict(
         {"input_ids": input_ids, "loss_mask": loss_mask}, batch_size=[len(full_lengths)]
@@ -138,6 +141,8 @@ def test_response_longer_than_input_is_rejected():
     loss_mask = torch.nested.as_nested_tensor(
         [torch.ones(64, dtype=torch.float32)], layout=torch.jagged
     )
-    micro_batch = _tensor_dict({"input_ids": input_ids, "loss_mask": loss_mask}, batch_size=[1])
+    micro_batch = _tensor_dict(
+        {"input_ids": input_ids, "loss_mask": loss_mask}, batch_size=[1]
+    )
     with pytest.raises(ValueError, match="tokens but packed input"):
         _loss_mask_for_packing(micro_batch, input_ids)

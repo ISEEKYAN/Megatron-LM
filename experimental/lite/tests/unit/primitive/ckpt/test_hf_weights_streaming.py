@@ -8,9 +8,9 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
-import pytest
 
 if importlib.util.find_spec("safetensors") is None:
     safetensors = types.ModuleType("safetensors")
@@ -208,10 +208,7 @@ def test_bucketed_all_gather_uses_bounded_flat_buffers(monkeypatch) -> None:
     )
 
     gathered = bucketed_all_gather_into_tensor(
-        bucket,
-        group="tp",
-        group_size=2,
-        buffer_max_size_bytes=32,
+        bucket, group="tp", group_size=2, buffer_max_size_bytes=32
     )
 
     assert len(calls) == 3
@@ -255,19 +252,13 @@ def test_fsdp_dtensors_share_one_bounded_flat_collective(monkeypatch) -> None:
     equivalent_group = object()
     single_rank_group = object()
     first = FakeDTensor(
-        torch.arange(6, dtype=torch.float32).reshape(2, 3),
-        (4, 3),
-        0,
-        first_group,
+        torch.arange(6, dtype=torch.float32).reshape(2, 3), (4, 3), 0, first_group
     )
     single = FakeDTensor(
         torch.arange(3, dtype=torch.float32), (3,), 0, single_rank_group
     )
     second = FakeDTensor(
-        torch.arange(4, dtype=torch.float32).reshape(2, 2),
-        (2, 4),
-        1,
-        equivalent_group,
+        torch.arange(4, dtype=torch.float32).reshape(2, 2), (2, 4), 1, equivalent_group
     )
     calls = []
 
@@ -605,10 +596,7 @@ def test_packed_expert_export_rejects_incomplete_group() -> None:
         },
     )()
 
-    with pytest.raises(
-        RuntimeError,
-        match=r"experts\.packed.*3/4",
-    ):
+    with pytest.raises(RuntimeError, match=r"experts\.packed.*3/4"):
         list(export_hf_weights(Model(), Spec(), ps, cpu=True))
 
 
@@ -628,10 +616,7 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
         num_experts = 0
         is_expert = staticmethod(lambda name: False)
         weight_map = staticmethod(
-            lambda: {
-                "weight": ["weight"],
-                "router_bias": ["router_bias"],
-            }
+            lambda: {"weight": ["weight"], "router_bias": ["router_bias"]}
         )
         tp_spec = staticmethod(lambda name: None)
         native_to_hf = staticmethod(lambda name, tensor: [(name, tensor)])
@@ -721,8 +706,7 @@ def test_persistent_buffer_load_export_mapping_must_match() -> None:
     )()
 
     with pytest.raises(
-        RuntimeError,
-        match=r"Spec.*router_bias.*hf\.expected_bias.*hf\.different_bias",
+        RuntimeError, match=r"Spec.*router_bias.*hf\.expected_bias.*hf\.different_bias"
     ):
         dict(export_hf_weights(Model(), Spec(), ps))
 

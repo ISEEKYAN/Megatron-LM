@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 from megatron.lite.primitive.modules.attention.cp import iter_cp_sources
@@ -258,11 +257,7 @@ def _dense_cp_layout(
 
 
 def _packed_cp_layout(
-    cu_seqlens: torch.Tensor,
-    *,
-    cp_size: int,
-    cp_rank: int,
-    device: torch.device,
+    cu_seqlens: torch.Tensor, *, cp_size: int, cp_rank: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return contiguous THD local-query positions and global KV order."""
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.long)
@@ -280,8 +275,7 @@ def _packed_cp_layout(
 
 
 def _pad_cp_projected_kv(
-    kv: torch.Tensor,
-    index_k: torch.Tensor | None,
+    kv: torch.Tensor, index_k: torch.Tensor | None
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Physically align gathered CP KV for cuDNN top-k score loads."""
     logical_rows = kv.shape[0]
@@ -332,12 +326,7 @@ def _index_scores_and_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Kernel-routed CP indexer over local Q and gathered projected K."""
     result = _dsa_kernels.indexer_topk_with_mask(
-        q,
-        k,
-        weights,
-        topk,
-        mask,
-        indexer_softmax_scale=scale,
+        q, k, weights, topk, mask, indexer_softmax_scale=scale
     )
     if q.is_cuda:
         # cuDNN FE 1.27's decode-varlen wrapper owns an asynchronous scratch
@@ -865,11 +854,7 @@ class DynamicSparseAttention(nn.Module):
 
         if self.cp_size > 1 and self.cp_mode == "native":
             return self._forward_dense_cp_native(
-                x,
-                cos,
-                sin,
-                position_ids,
-                index_share_state=index_share_state,
+                x, cos, sin, position_ids, index_share_state=index_share_state
             )
 
         cp_restore = self.cp_size > 1
@@ -949,16 +934,11 @@ class DynamicSparseAttention(nn.Module):
         contiguous: bool = False,
     ) -> torch.Tensor:
         if not contiguous:
-            parts = _all_gather_cp(
-                tensor, cp_size=self.cp_size, cp_group=self.cp_group
-            )
+            parts = _all_gather_cp(tensor, cp_size=self.cp_size, cp_group=self.cp_group)
             rank_major = torch.cat(parts, dim=0)
             return rank_major.index_select(0, kv_reorder)
         local_positions = contiguous_position_ids_for_cp(
-            tensor.shape[0] * self.cp_size,
-            self.cp_rank,
-            self.cp_size,
-            tensor.device,
+            tensor.shape[0] * self.cp_size, self.cp_rank, self.cp_size, tensor.device
         )
         parts = [
             source
@@ -1011,16 +991,11 @@ class DynamicSparseAttention(nn.Module):
             )
             if self.index_share_enabled and index_share_state is not None:
                 index_share_state.save_topk(
-                    self.layer_number,
-                    topk_indices,
-                    sequence_key=index_share_cache_key,
+                    self.layer_number, topk_indices, sequence_key=index_share_cache_key
                 )
 
         flat_idxs, flat_tlen = _dsa_kernels.build_flat_topk_idxs(
-            topk_indices,
-            batch_size=batch,
-            seqlen_kv=kv.shape[0],
-            compact=True,
+            topk_indices, batch_size=batch, seqlen_kv=kv.shape[0], compact=True
         )
         out = _dsa_kernels.dsa_sparse_attn(
             query,
@@ -1085,8 +1060,7 @@ class DynamicSparseAttention(nn.Module):
         if kv.is_cuda and not self.skip_topk:
             kv, k_idx = _pad_cp_projected_kv(kv, k_idx)
         mask = _build_cp_causal_mask(
-            query_pos,
-            torch.arange(kv.shape[0], device=x.device),
+            query_pos, torch.arange(kv.shape[0], device=x.device)
         )
         out = self._run_cp_sparse_segment(
             query,
@@ -1122,10 +1096,7 @@ class DynamicSparseAttention(nn.Module):
                 f"got {cp_layout!r}."
             )
         query_pos, kv_reorder = _packed_cp_layout(
-            cu_seqlens,
-            cp_size=self.cp_size,
-            cp_rank=self.cp_rank,
-            device=x.device,
+            cu_seqlens, cp_size=self.cp_size, cp_rank=self.cp_rank, device=x.device
         )
         if query_pos.numel() != x.shape[1]:
             raise RuntimeError(
@@ -1144,11 +1115,7 @@ class DynamicSparseAttention(nn.Module):
         if kv.is_cuda and not self.skip_topk:
             kv, k_idx = _pad_cp_projected_kv(kv, k_idx)
         key_pos = torch.arange(kv.shape[0], device=x.device, dtype=torch.long)
-        mask = _build_cp_causal_mask(
-            query_pos,
-            key_pos,
-            cu_seqlens=cu_seqlens,
-        )
+        mask = _build_cp_causal_mask(query_pos, key_pos, cu_seqlens=cu_seqlens)
         out = self._run_cp_sparse_segment(
             query,
             kv,
@@ -1412,10 +1379,7 @@ class DynamicSparseAttention(nn.Module):
             )
         cos_parts = _all_gather_cp(cos, cp_size=self.cp_size, cp_group=self.cp_group)
         sin_parts = _all_gather_cp(sin, cp_size=self.cp_size, cp_group=self.cp_group)
-        return (
-            torch.cat(cos_parts, dim=1),
-            torch.cat(sin_parts, dim=1),
-        )
+        return (torch.cat(cos_parts, dim=1), torch.cat(sin_parts, dim=1))
 
     def _full_cp_position_ids(
         self,

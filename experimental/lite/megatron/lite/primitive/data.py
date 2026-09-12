@@ -6,7 +6,6 @@ from __future__ import annotations
 import os
 
 import torch  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
@@ -36,7 +35,9 @@ def _resolve_thd_padding(seq_len: int, cp_size: int) -> tuple[int, int, bool]:
     if pad_to_alignment is None:
         pad_to_alignment = cp_size > 1
 
-    pad_multiple_env = os.environ.get("MEGATRON_LITE_THD_PAD_MULTIPLE", "auto").strip().lower()
+    pad_multiple_env = (
+        os.environ.get("MEGATRON_LITE_THD_PAD_MULTIPLE", "auto").strip().lower()
+    )
     if pad_multiple_env in ("", "auto", "cp", "min_cp"):
         align_size = cp_size * 2 if cp_size > 1 else 1
     else:
@@ -72,14 +73,22 @@ def fixed_batches(
     g = torch.Generator().manual_seed(seed)
     batches = []
     for _ in range(num_steps):
-        ids = torch.randint(0, vocab_size, (batch_size, seq_len), generator=g).to(device)
-        labels = torch.randint(0, vocab_size, (batch_size, seq_len), generator=g).to(device)
+        ids = torch.randint(0, vocab_size, (batch_size, seq_len), generator=g).to(
+            device
+        )
+        labels = torch.randint(0, vocab_size, (batch_size, seq_len), generator=g).to(
+            device
+        )
         batches.append((ids, labels))
     return batches
 
 
 def infinite_batches(
-    vocab_size: int, seq_len: int, batch_size: int = 1, device: str = "cuda", seed: int = 42
+    vocab_size: int,
+    seq_len: int,
+    batch_size: int = 1,
+    device: str = "cuda",
+    seed: int = 42,
 ):
     """Infinite deterministic batch generator (for throughput benchmarks)."""
     g = torch.Generator(device=device).manual_seed(seed)
@@ -122,7 +131,9 @@ def infinite_batches_thd(
         raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}")
 
     g = torch.Generator(device=device).manual_seed(seed)
-    seq_len_padded, _align_size, _pad_to_alignment = _resolve_thd_padding(seq_len, cp_size)
+    seq_len_padded, _align_size, _pad_to_alignment = _resolve_thd_padding(
+        seq_len, cp_size
+    )
 
     # position_ids always stay full length; RoPE auto-slices for CP.
     position_ids = (
@@ -132,10 +143,14 @@ def infinite_batches_thd(
         .contiguous()
     )
     cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
-    cu_seqlens_padded = torch.tensor([0, seq_len_padded], dtype=torch.int32, device=device)
+    cu_seqlens_padded = torch.tensor(
+        [0, seq_len_padded], dtype=torch.int32, device=device
+    )
 
     if cp_size > 1:
-        from megatron.lite.primitive.parallel.cp import zigzag_split_for_cp  # noqa: I001
+        from megatron.lite.primitive.parallel.cp import (  # noqa: I001
+            zigzag_split_for_cp,
+        )
 
         # cu_seqlens stays full; MC GDN internally divides by cp_size.
         packed_seq_params = PackedSeqParams(
@@ -148,11 +163,19 @@ def infinite_batches_thd(
             cu_seqlens_kv_padded=cu_seqlens_padded,
         )
         while True:
-            ids_full = torch.randint(0, vocab_size, (seq_len,), device=device, generator=g)
-            lbl_full = torch.randint(0, vocab_size, (seq_len,), device=device, generator=g)
+            ids_full = torch.randint(
+                0, vocab_size, (seq_len,), device=device, generator=g
+            )
+            lbl_full = torch.randint(
+                0, vocab_size, (seq_len,), device=device, generator=g
+            )
             if seq_len_padded != seq_len:
-                ids_padded = torch.zeros(seq_len_padded, dtype=ids_full.dtype, device=device)
-                lbl_padded = torch.zeros(seq_len_padded, dtype=lbl_full.dtype, device=device)
+                ids_padded = torch.zeros(
+                    seq_len_padded, dtype=ids_full.dtype, device=device
+                )
+                lbl_padded = torch.zeros(
+                    seq_len_padded, dtype=lbl_full.dtype, device=device
+                )
                 ids_padded[:seq_len] = ids_full
                 lbl_padded[:seq_len] = lbl_full
             else:
@@ -177,7 +200,9 @@ def infinite_batches_thd(
             cu_seqlens_kv_padded=cu_seqlens_padded,
         )
         while True:
-            input_ids = torch.zeros((1, seq_len_padded), dtype=torch.long, device=device)
+            input_ids = torch.zeros(
+                (1, seq_len_padded), dtype=torch.long, device=device
+            )
             labels = torch.zeros((1, seq_len_padded), dtype=torch.long, device=device)
             input_ids[:, :seq_len] = torch.randint(
                 0, vocab_size, (1, seq_len), device=device, generator=g

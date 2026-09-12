@@ -11,7 +11,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 from transformer_engine.pytorch.optimizers import (  # pyright: ignore[reportMissingImports]
     multi_tensor_applier,
     multi_tensor_l2norm,
@@ -46,14 +45,23 @@ def sharded_grad_sq_sum(
     for group in groups.values():
         local_sq = _group_local_sq_sum(group, dtype=dtype)
         meta = group[0][2]
-        if meta is not None and not _has_partial_placement(meta) and dist.is_initialized():
+        if (
+            meta is not None
+            and not _has_partial_placement(meta)
+            and dist.is_initialized()
+        ):
             _reduce_dtensor_scalar_(
-                local_sq, meta, op=dist.ReduceOp.SUM, scalar_all_reduce=scalar_all_reduce
+                local_sq,
+                meta,
+                op=dist.ReduceOp.SUM,
+                scalar_all_reduce=scalar_all_reduce,
             )
         total = local_sq if total is None else total.to(local_sq.device) + local_sq
 
     if total is None:
-        return torch.zeros((), device=default_device or torch.device("cpu"), dtype=dtype)
+        return torch.zeros(
+            (), device=default_device or torch.device("cpu"), dtype=dtype
+        )
     return total
 
 
@@ -74,13 +82,24 @@ def sharded_grad_norm(
 
     if math.isinf(float(norm_type)):
         total = sharded_grad_abs_max(
-            params, pp_group=pp_group, accum_dtype=accum_dtype, default_device=default_device
+            params,
+            pp_group=pp_group,
+            accum_dtype=accum_dtype,
+            default_device=default_device,
         )
         return total
     if float(norm_type) != 2.0:
-        raise ValueError(f"sharded_grad_norm supports norm_type=2.0 or inf, got {norm_type!r}.")
-    sq_sum = sharded_grad_sq_sum(params, accum_dtype=accum_dtype, default_device=default_device)
-    if pp_group is not None and dist.is_initialized() and dist.get_world_size(pp_group) > 1:
+        raise ValueError(
+            f"sharded_grad_norm supports norm_type=2.0 or inf, got {norm_type!r}."
+        )
+    sq_sum = sharded_grad_sq_sum(
+        params, accum_dtype=accum_dtype, default_device=default_device
+    )
+    if (
+        pp_group is not None
+        and dist.is_initialized()
+        and dist.get_world_size(pp_group) > 1
+    ):
         all_reduce_scalar_(sq_sum, op=dist.ReduceOp.SUM, group=pp_group)
     return sq_sum.sqrt()
 
@@ -100,22 +119,33 @@ def sharded_grad_abs_max(
     for group in groups.values():
         local_max = _group_local_abs_max(group, dtype=dtype)
         meta = group[0][2]
-        if meta is not None and not _has_partial_placement(meta) and dist.is_initialized():
+        if (
+            meta is not None
+            and not _has_partial_placement(meta)
+            and dist.is_initialized()
+        ):
             _reduce_dtensor_scalar_(local_max, meta, op=dist.ReduceOp.MAX)
-        total = local_max if total is None else torch.maximum(total.to(local_max.device), local_max)
+        total = (
+            local_max
+            if total is None
+            else torch.maximum(total.to(local_max.device), local_max)
+        )
 
     if total is None:
-        total = torch.zeros((), device=default_device or torch.device("cpu"), dtype=dtype)
-    if pp_group is not None and dist.is_initialized() and dist.get_world_size(pp_group) > 1:
+        total = torch.zeros(
+            (), device=default_device or torch.device("cpu"), dtype=dtype
+        )
+    if (
+        pp_group is not None
+        and dist.is_initialized()
+        and dist.get_world_size(pp_group) > 1
+    ):
         all_reduce_scalar_(total, op=dist.ReduceOp.MAX, group=pp_group)
     return total
 
 
 def all_reduce_scalar_(
-    value: torch.Tensor,
-    *,
-    op: dist.ReduceOp,
-    group: dist.ProcessGroup,
+    value: torch.Tensor, *, op: dist.ReduceOp, group: dist.ProcessGroup
 ) -> None:
     """All-reduce a scalar on a device compatible with the process group backend."""
 
@@ -159,18 +189,22 @@ def resolve_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
         name = dtype.removeprefix("torch.")
         resolved = getattr(torch, name, None)
     if not isinstance(resolved, torch.dtype):
-        raise ValueError(f"Unsupported torch dtype for grad norm accumulation: {dtype!r}")
+        raise ValueError(
+            f"Unsupported torch dtype for grad norm accumulation: {dtype!r}"
+        )
     if not torch.empty((), dtype=resolved).is_floating_point():
-        raise ValueError(f"Grad norm accumulation dtype must be floating point: {dtype!r}")
+        raise ValueError(
+            f"Grad norm accumulation dtype must be floating point: {dtype!r}"
+        )
     return resolved
 
 
 def _group_grads(
     params: Iterable[nn.Parameter],
 ) -> dict[tuple[Any, ...], list[tuple[nn.Parameter, torch.Tensor, Any | None]]]:
-    groups: dict[tuple[Any, ...], list[tuple[nn.Parameter, torch.Tensor, Any | None]]] = (
-        defaultdict(list)
-    )
+    groups: dict[
+        tuple[Any, ...], list[tuple[nn.Parameter, torch.Tensor, Any | None]]
+    ] = defaultdict(list)
     for param in params:
         grad = param.grad
         if grad is None:
@@ -182,7 +216,10 @@ def _group_grads(
             key = (
                 "dtensor",
                 id(meta.device_mesh),
-                tuple((type(placement).__name__, repr(placement)) for placement in meta.placements),
+                tuple(
+                    (type(placement).__name__, repr(placement))
+                    for placement in meta.placements
+                ),
             )
         groups[key].append((param, grad, meta))
     return groups
@@ -195,14 +232,18 @@ def fused_sq_sum(
 
     total = torch.zeros((), device=device, dtype=dtype)
     # multi_tensor_applier dispatches on the list's scalar type, so bucket by dtype.
-    buckets: dict[tuple[torch.dtype, torch.device], list[torch.Tensor]] = defaultdict(list)
+    buckets: dict[tuple[torch.dtype, torch.device], list[torch.Tensor]] = defaultdict(
+        list
+    )
     for tensor in tensors:
         if tensor.numel() == 0:
             continue
         if _is_fused_eligible(tensor):
             buckets[(tensor.dtype, tensor.device)].append(tensor)
         else:
-            total += torch.linalg.vector_norm(tensor, 2.0, dtype=dtype).pow_(2).to(device)
+            total += (
+                torch.linalg.vector_norm(tensor, 2.0, dtype=dtype).pow_(2).to(device)
+            )
     for (_bucket_dtype, bucket_device), bucket in buckets.items():
         noop_flag = torch.zeros(1, dtype=torch.int, device=bucket_device)
         norm, _ = multi_tensor_applier(multi_tensor_l2norm, noop_flag, [bucket], False)
@@ -228,7 +269,9 @@ def _group_local_sq_sum(
             local = _local_grad(grad, grad_meta).detach()
             total += fused_sq_sum([local], dtype=dtype, device=device)
         return total
-    locals_ = [_local_grad(grad, grad_meta).detach() for _param, grad, grad_meta in group]
+    locals_ = [
+        _local_grad(grad, grad_meta).detach() for _param, grad, grad_meta in group
+    ]
     return fused_sq_sum(locals_, dtype=dtype, device=device)
 
 
@@ -241,7 +284,9 @@ def _group_local_abs_max(
         local_grad = _local_grad(grad, meta)
         if local_grad.numel() > 0:
             # vector_norm(inf) is abs().max() without the intermediate tensors.
-            local_max = torch.linalg.vector_norm(local_grad.detach(), float("inf"), dtype=dtype)
+            local_max = torch.linalg.vector_norm(
+                local_grad.detach(), float("inf"), dtype=dtype
+            )
             total = torch.maximum(total, local_max.to(device))
     return total
 
@@ -286,7 +331,9 @@ def _is_dtensor_like(tensor: Any) -> bool:
 
 
 def _has_partial_placement(dtensor: Any) -> bool:
-    return any(_placement_name(placement) == "Partial" for placement in dtensor.placements)
+    return any(
+        _placement_name(placement) == "Partial" for placement in dtensor.placements
+    )
 
 
 def _is_replicate_placement(placement: Any) -> bool:

@@ -63,14 +63,18 @@ _HF_FIELDS = frozenset(
 _INDEXER_TYPES = frozenset({"full", "shared"})
 
 
-def _infer_dsa_indexer_type(layer_number: int, *, topk_freq: int, skip_topk_offset: int) -> str:
+def _infer_dsa_indexer_type(
+    layer_number: int, *, topk_freq: int, skip_topk_offset: int
+) -> str:
     if topk_freq <= 1:
         return "full"
     skip_topk = (max(layer_number - skip_topk_offset, 0) % topk_freq) != 0
     return "shared" if skip_topk else "full"
 
 
-def _source_dsa_compute_layer(layer_number: int, *, topk_freq: int, skip_topk_offset: int) -> int:
+def _source_dsa_compute_layer(
+    layer_number: int, *, topk_freq: int, skip_topk_offset: int
+) -> int:
     if (
         _infer_dsa_indexer_type(
             layer_number, topk_freq=topk_freq, skip_topk_offset=skip_topk_offset
@@ -199,22 +203,23 @@ class Glm5Config:
             "index_head_dim must be >= qk_rope_head_dim",
         )
         check(self.index_topk_freq >= 1, "index_topk_freq must be >= 1")
-        check(
-            self.index_skip_topk_offset >= 0,
-            "index_skip_topk_offset must be >= 0",
-        )
+        check(self.index_skip_topk_offset >= 0, "index_skip_topk_offset must be >= 0")
         check(
             self.num_key_value_heads == self.num_attention_heads,
             "initial GLM5 native path expects MLA heads to be ungrouped",
         )
         check(self.vocab_size > 0, "vocab_size must be > 0")
-        check(self.num_nextn_predict_layers >= 0, "num_nextn_predict_layers must be >= 0")
+        check(
+            self.num_nextn_predict_layers >= 0, "num_nextn_predict_layers must be >= 0"
+        )
         check(self.n_routed_experts >= 1, "n_routed_experts must be >= 1")
         check(
             1 <= self.num_experts_per_tok <= self.n_routed_experts,
             "num_experts_per_tok must be in [1, n_routed_experts]",
         )
-        check(1 <= self.topk_group <= self.n_group, "topk_group must be in [1, n_group]")
+        check(
+            1 <= self.topk_group <= self.n_group, "topk_group must be in [1, n_group]"
+        )
         if self.mlp_layer_types is not None:
             expected_layer_type_lengths = {
                 self.num_hidden_layers,
@@ -254,7 +259,10 @@ class Glm5Config:
                 except ValueError as exc:
                     check(False, str(exc))
 
-            if self.indexer_types is not None and len(self.indexer_types) == self.num_hidden_layers:
+            if (
+                self.indexer_types is not None
+                and len(self.indexer_types) == self.num_hidden_layers
+            ):
                 for idx, indexer_type in enumerate(self.indexer_types):
                     expected = _infer_dsa_indexer_type(
                         idx + 1,
@@ -288,12 +296,19 @@ class Glm5Config:
     @classmethod
     def _from_hf_dict(cls, hf: dict[str, Any], **overrides) -> Glm5Config:
         kwargs = {
-            key: value for key, value in hf.items() if key in _HF_FIELDS and value is not None
+            key: value
+            for key, value in hf.items()
+            if key in _HF_FIELDS and value is not None
         }
-        if "num_nextn_predict_layers" not in kwargs and hf.get("num_nextn_predict") is not None:
+        if (
+            "num_nextn_predict_layers" not in kwargs
+            and hf.get("num_nextn_predict") is not None
+        ):
             kwargs["num_nextn_predict_layers"] = int(hf["num_nextn_predict"])
         rope_parameters = hf.get("rope_parameters")
         if isinstance(rope_parameters, dict) and "rope_theta" not in kwargs:
-            kwargs["rope_theta"] = float(rope_parameters.get("rope_theta", cls.rope_theta))
+            kwargs["rope_theta"] = float(
+                rope_parameters.get("rope_theta", cls.rope_theta)
+            )
         kwargs.update(overrides)
         return cls(**kwargs)

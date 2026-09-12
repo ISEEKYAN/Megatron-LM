@@ -3,10 +3,7 @@
 
 from __future__ import annotations
 
-_OPTIMIZER_BACKEND_TO_IMPL = {
-    "dist_opt": "dist_opt",
-    "fsdp2": "fsdp2",
-}
+_OPTIMIZER_BACKEND_TO_IMPL = {"dist_opt": "dist_opt", "fsdp2": "fsdp2"}
 
 
 def optimizer_backend_to_impl(backend: str) -> str:
@@ -76,7 +73,9 @@ def add_mlite_arguments(parser):
 
 def validate_mlite_args(args) -> None:
     if not getattr(args, "hf_checkpoint", None):
-        raise ValueError("--hf-checkpoint is required for the Megatron Lite backend patch.")
+        raise ValueError(
+            "--hf-checkpoint is required for the Megatron Lite backend patch."
+        )
     args.variable_seq_lengths = True
     if not hasattr(args, "calculate_per_token_loss"):
         args.calculate_per_token_loss = False

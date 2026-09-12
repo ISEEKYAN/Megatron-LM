@@ -9,13 +9,14 @@ import torch.nn as nn
 
 
 def test_replay_mask_uses_live_scores_and_keeps_native_unmasked_row():
-    from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
 
     RouterReplay.clear_global_router_replay_instances()
     replay = RouterReplay()
-    dense = torch.tensor(
-        [[0.1, 0.2, 0.7], [0.6, 0.3, 0.1]], requires_grad=True
-    )
+    dense = torch.tensor([[0.1, 0.2, 0.7], [0.6, 0.3, 0.1]], requires_grad=True)
     native_indices = torch.tensor([[2, 1], [0, 1]])
     native_scores = dense.gather(1, native_indices)
     target = torch.tensor([[0, 1], [2, 1]])
@@ -41,10 +42,7 @@ def test_replayed_sqrtsoftplus_scores_are_live_normalized_and_nonzero():
     # tensor would contain zeros here, which was the PR49 half-finished bug.
     indices = torch.tensor([[1, 3]])
     scores = gather_replayed_router_scores(
-        logits,
-        indices,
-        score_function="sqrtsoftplus",
-        scaling_factor=2.5,
+        logits, indices, score_function="sqrtsoftplus", scaling_factor=2.5
     )
     assert torch.all(scores > 0)
     torch.testing.assert_close(scores.sum(dim=-1), torch.tensor([2.5]))
@@ -55,7 +53,10 @@ def test_replayed_sqrtsoftplus_scores_are_live_normalized_and_nonzero():
 
 
 def test_backward_replay_keeps_fifo_across_pipeline_warmup_forwards():
-    from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
 
     RouterReplay.clear_global_router_replay_instances()
     replay = RouterReplay()
@@ -77,7 +78,10 @@ def test_ds4_hash_router_records_and_replays_its_layer_column():
 
     pytest.importorskip("transformer_engine")
     from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE
-    from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
 
     RouterReplay.clear_global_router_replay_instances()
     module = DeepseekV4MoE.__new__(DeepseekV4MoE)
@@ -179,8 +183,7 @@ def test_replay_roots_exclude_mtp_layers():
 
 
 @pytest.mark.parametrize(
-    "protocol_name",
-    ["qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2"],
+    "protocol_name", ["qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2"]
 )
 def test_supported_moe_protocols_expose_mtp_safe_replay_roots(protocol_name):
     from pathlib import Path
@@ -205,8 +208,7 @@ def test_r3_driver_begin_fails_loudly_when_model_has_no_moe_router():
 
     chunk = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
     handle = SimpleNamespace(
-        _model=chunk,
-        _extras={"model_chunks": [chunk], "protocol": None},
+        _model=chunk, _extras={"model_chunks": [chunk], "protocol": None}
     )
     driver = RouterReplayDriver.maybe_create(handle, {"action": "replay"})
     assert driver is not None
@@ -236,8 +238,7 @@ def test_r3_driver_replays_layer_order_and_causal_rows_end_to_end():
 
     model = FakeModel()
     handle = SimpleNamespace(
-        _model=model,
-        _extras={"model_chunks": [model], "protocol": None},
+        _model=model, _extras={"model_chunks": [model], "protocol": None}
     )
     batch = PackedBatch(
         input_ids=torch.arange(5),
@@ -248,18 +249,9 @@ def test_r3_driver_replays_layer_order_and_causal_rows_end_to_end():
         routed_experts=torch.nested.as_nested_tensor(
             [
                 torch.tensor(
-                    [
-                        [[10, 11], [20, 21]],
-                        [[12, 13], [22, 23]],
-                        [[14, 15], [24, 25]],
-                    ]
+                    [[[10, 11], [20, 21]], [[12, 13], [22, 23]], [[14, 15], [24, 25]]]
                 ),
-                torch.tensor(
-                    [
-                        [[16, 17], [26, 27]],
-                        [[18, 19], [28, 29]],
-                    ]
-                ),
+                torch.tensor([[[16, 17], [26, 27]], [[18, 19], [28, 29]]]),
             ],
             layout=torch.jagged,
         ),
@@ -271,7 +263,9 @@ def test_r3_driver_replays_layer_order_and_causal_rows_end_to_end():
     driver.begin()
     try:
         stepped = driver.wrap(
-            lambda active_model, _batch: [router(native) for router in active_model.routers]
+            lambda active_model, _batch: [
+                router(native) for router in active_model.routers
+            ]
         )
         layer0, layer1 = stepped(model, batch)
     finally:
@@ -280,12 +274,10 @@ def test_r3_driver_replays_layer_order_and_causal_rows_end_to_end():
     # Every row that can causally affect a response token uses rollout routes.
     # The final row of each sequence stays native because it predicts no token.
     assert torch.equal(
-        layer0,
-        torch.tensor([[10, 11], [12, 13], [4, 5], [16, 17], [8, 9]]),
+        layer0, torch.tensor([[10, 11], [12, 13], [4, 5], [16, 17], [8, 9]])
     )
     assert torch.equal(
-        layer1,
-        torch.tensor([[20, 21], [22, 23], [4, 5], [26, 27], [8, 9]]),
+        layer1, torch.tensor([[20, 21], [22, 23], [4, 5], [26, 27], [8, 9]])
     )
     assert all(router.router_replay is None for router in model.routers)
 
@@ -311,8 +303,7 @@ def test_r3_driver_accepts_next_token_routes_without_final_input_row():
 
     model = FakeModel()
     handle = SimpleNamespace(
-        _model=model,
-        _extras={"model_chunks": [model], "protocol": None},
+        _model=model, _extras={"model_chunks": [model], "protocol": None}
     )
     batch = PackedBatch(
         input_ids=torch.arange(5),
@@ -321,10 +312,7 @@ def test_r3_driver_accepts_next_token_routes_without_final_input_row():
         loss_mask=torch.tensor([0, 1, 1, 0, 1], dtype=torch.float32),
         r3_replay_mask=torch.tensor([True, True, False, True, False]),
         routed_experts=torch.nested.as_nested_tensor(
-            [
-                torch.tensor([[[10, 11]], [[12, 13]]]),
-                torch.tensor([[[20, 21]]]),
-            ],
+            [torch.tensor([[[10, 11]], [[12, 13]]]), torch.tensor([[[20, 21]]])],
             layout=torch.jagged,
         ),
     )
@@ -334,7 +322,9 @@ def test_r3_driver_accepts_next_token_routes_without_final_input_row():
     assert driver is not None
     driver.begin()
     try:
-        stepped = driver.wrap(lambda active_model, _batch: active_model.routers[0](native))
+        stepped = driver.wrap(
+            lambda active_model, _batch: active_model.routers[0](native)
+        )
         actual = stepped(model, batch)
     finally:
         driver.end()
@@ -342,8 +332,7 @@ def test_r3_driver_accepts_next_token_routes_without_final_input_row():
     # vLLM supplies routes for causal rows only.  The absent final row of each
     # input sequence remains native and therefore needs no synthetic route.
     assert torch.equal(
-        actual,
-        torch.tensor([[10, 11], [12, 13], [4, 5], [20, 21], [8, 9]]),
+        actual, torch.tensor([[10, 11], [12, 13], [4, 5], [20, 21], [8, 9]])
     )
 
 
@@ -351,8 +340,7 @@ def test_r3_driver_slices_global_layer_axis_for_pipeline_stage():
     from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
 
     driver = RouterReplayDriver(
-        SimpleNamespace(_model=nn.Module(), _extras={}),
-        "replay",
+        SimpleNamespace(_model=nn.Module(), _extras={}), "replay"
     )
     driver._ps = SimpleNamespace(pp_size=2)
     driver._num_routers = 2

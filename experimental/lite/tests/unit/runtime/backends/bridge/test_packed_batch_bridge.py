@@ -61,12 +61,10 @@ def test_bridge_forward_kwargs_are_transient_bridge_metadata() -> None:
     # like the native pack_thd_forward_kwargs path, so both backends train on the
     # same shifted targets.
     assert torch.equal(
-        out["labels"].reshape(-1),
-        torch.tensor([101, 102, 0, 104, 105, 106, 107, 0]),
+        out["labels"].reshape(-1), torch.tensor([101, 102, 0, 104, 105, 106, 107, 0])
     )
     assert torch.equal(
-        out["position_ids"].reshape(-1),
-        torch.tensor([0, 1, 2, 0, 1, 2, 3, 4]),
+        out["position_ids"].reshape(-1), torch.tensor([0, 1, 2, 0, 1, 2, 3, 4])
     )
 
     psp = out["packed_seq_params"]
@@ -82,8 +80,7 @@ def test_bridge_forward_kwargs_carry_loss_mask_only_inside_bridge() -> None:
     assert "loss_mask" in out
     # loss_mask is rolled with the labels so it masks the shifted targets.
     assert torch.equal(
-        out["loss_mask"].reshape(-1),
-        torch.tensor([1, 0, 0, 1, 1, 0, 1, 0]),
+        out["loss_mask"].reshape(-1), torch.tensor([1, 0, 0, 1, 1, 0, 1, 0])
     )
 
 

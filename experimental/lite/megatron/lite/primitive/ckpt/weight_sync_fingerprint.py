@@ -45,7 +45,9 @@ def _sample_payload(name: str, tensor: torch.Tensor) -> tuple[bool, bytes]:
 
 def _sample_indices(numel: int, count: int, *, device=None) -> torch.Tensor:
     if not 1 <= count <= numel:
-        raise ValueError(f"expected 1 <= count <= numel, got count={count}, numel={numel}")
+        raise ValueError(
+            f"expected 1 <= count <= numel, got count={count}, numel={numel}"
+        )
     if count == 1:
         return torch.zeros(1, dtype=torch.int64, device=device)
     positions = torch.arange(count, dtype=torch.int64, device=device)

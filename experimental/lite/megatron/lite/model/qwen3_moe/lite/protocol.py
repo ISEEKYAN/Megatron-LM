@@ -31,14 +31,23 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     pack_thd_forward_kwargs,
+)
+from megatron.lite.model.protocol_utils import (
     router_replay_roots as router_replay_roots,
+)
+from megatron.lite.model.protocol_utils import (
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
 from megatron.lite.model.qwen3_moe.common import is_expert_param
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
-from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
+from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+    EXPERT_CLASSIFIER,
+    PLACEMENT_FN,
+)
+from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+    load_hf_weights as _load_hf_weights_impl,
+)
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.lora import (
@@ -113,7 +122,9 @@ def _validate_meta_parameters(model: torch.nn.Module) -> None:
             )
     if non_meta:
         details = "\n".join(non_meta)
-        raise RuntimeError(f"FSDP2 meta initialization left materialized parameters:\n{details}")
+        raise RuntimeError(
+            f"FSDP2 meta initialization left materialized parameters:\n{details}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +172,9 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
 
 def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
     labels = batch.labels.reshape(1, -1) if batch.labels is not None else None
-    return model(input_ids=batch.input_ids.reshape(1, -1), labels=labels, packed_seq_params=None)
+    return model(
+        input_ids=batch.input_ids.reshape(1, -1), labels=labels, packed_seq_params=None
+    )
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
@@ -187,7 +200,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
     if mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
-            raise ValueError("mtp_enable=True but HF config has no num_nextn_predict_layers.")
+            raise ValueError(
+                "mtp_enable=True but HF config has no num_nextn_predict_layers."
+            )
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
         if impl_cfg.mtp_use_repeated_layer is not None:
             model_cfg.mtp_use_repeated_layer = impl_cfg.mtp_use_repeated_layer
@@ -217,7 +232,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
     def build_chunk(**kwargs):
         with torch.device("meta") if meta_init else nullcontext():
-            chunk = Qwen3MoEModel(model_cfg, ps, **kwargs, **model_kwargs).to(torch.bfloat16)
+            chunk = Qwen3MoEModel(model_cfg, ps, **kwargs, **model_kwargs).to(
+                torch.bfloat16
+            )
         if meta_init:
             _validate_meta_parameters(chunk)
         chunk._mlite_meta_init = meta_init
@@ -283,7 +300,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
         def _post_model_load_hook():
             from megatron.lite.model.qwen3_moe.lite.model import TransformerLayer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(
@@ -350,7 +369,9 @@ def export_hf_weights(
     chunks: list[nn.Module], model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs
 ):
     """Export HF weights from model chunks."""
-    from megatron.lite.model.qwen3_moe.lite.checkpoint import export_hf_weights as _export
+    from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+        export_hf_weights as _export,
+    )
 
     for chunk in chunks:
         yield from _export(chunk, model_cfg, ps, **kwargs)

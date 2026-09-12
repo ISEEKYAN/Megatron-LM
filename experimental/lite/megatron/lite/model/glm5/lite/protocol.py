@@ -28,11 +28,17 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     nested_from_packed,
-    pack_r3_replay_mask as _pack_r3_replay_mask,
-    pack_routed_experts as _pack_routed_experts,
-    router_replay_roots as router_replay_roots,
-    set_cross_entropy_fusion,
 )
+from megatron.lite.model.protocol_utils import (
+    pack_r3_replay_mask as _pack_r3_replay_mask,
+)
+from megatron.lite.model.protocol_utils import (
+    pack_routed_experts as _pack_routed_experts,
+)
+from megatron.lite.model.protocol_utils import (
+    router_replay_roots as router_replay_roots,
+)
+from megatron.lite.model.protocol_utils import set_cross_entropy_fusion
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
@@ -42,12 +48,12 @@ from megatron.lite.primitive.parallel.thd import (
     thd_pack_meta,
     unpack_thd_to_nested,
 )
-from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.primitive.quantization import (
     QATSpec,
     apply_qat_to_chunks,
     normalize_qat_spec,
 )
+from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
@@ -324,13 +330,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         ]
     else:
         chunks = [
-            Glm5Model(
-                model_cfg,
-                train_cfg,
-                ps,
-                vpp_chunk_id=i,
-                **model_kwargs,
-            )
+            Glm5Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **model_kwargs)
             .to(torch.bfloat16)
             .cuda()
             for i in range(vpp)

@@ -20,11 +20,7 @@ from megatron.lite.primitive.quantization.mxfp4 import MXFP4_BLOCK_SIZE, quantiz
 # ``ignore_patterns`` must still leave fragile output, embedding, and router
 # tensors in BF16; callers can explicitly provide a different list when their
 # checkpoint naming requires it.
-_DEFAULT_IGNORE_PATTERNS = (
-    "lm_head",
-    "embed_tokens",
-    "re:.*mlp.gate$",
-)
+_DEFAULT_IGNORE_PATTERNS = ("lm_head", "embed_tokens", "re:.*mlp.gate$")
 
 
 def _get_field(config: Any, name: str, default: Any) -> Any:

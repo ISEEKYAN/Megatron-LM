@@ -305,17 +305,12 @@ def _select_context(
             "Dynamic CP cannot merge incompatible per-sample loss policies."
         )
     return replace(
-        first,
-        source_batch=_merge_source([source for _, source in selected], device),
+        first, source_batch=_merge_source([source for _, source in selected], device)
     )
 
 
 def _select_batch(
-    samples: list[dict[str, Any]],
-    ids: list[int],
-    *,
-    cp_size: int,
-    leader: bool,
+    samples: list[dict[str, Any]], ids: list[int], *, cp_size: int, leader: bool
 ) -> PackedBatch:
     selected = [samples[index] for index in ids]
 
@@ -372,12 +367,7 @@ def _context_parallel_modules(model: Any) -> list[Any]:
             setter = getattr(module, "set_context_parallel_group", None)
             if callable(setter) and all(
                 hasattr(module, name)
-                for name in (
-                    "cp_group",
-                    "cp_global_ranks",
-                    "cp_stream",
-                    "cp_comm_type",
-                )
+                for name in ("cp_group", "cp_global_ranks", "cp_stream", "cp_comm_type")
             ):
                 found.append(module)
                 seen.add(id(module))
@@ -655,9 +645,7 @@ class DynamicCPPlugin:
     """Runtime-instance sidecar implementing logical-DP=1 Dynamic CP."""
 
     def __init__(
-        self,
-        config: Mapping[str, Any],
-        create_groups: Callable | None = None,
+        self, config: Mapping[str, Any], create_groups: Callable | None = None
     ):
         if not isinstance(config, Mapping):
             raise TypeError("dynamic_context_parallel plugin config must be a mapping.")
@@ -666,8 +654,7 @@ class DynamicCPPlugin:
             raise ValueError("Dynamic CP requires max_seqlen_per_dp_cp_rank >= 1.")
         self.max_length = max_length
         self.minimum = _positive_power_of_two(
-            int(config.get("min_context_parallel_size", 1)),
-            "min_context_parallel_size",
+            int(config.get("min_context_parallel_size", 1)), "min_context_parallel_size"
         )
         require_coverage = config.get("require_full_cp_size_coverage", False)
         if type(require_coverage) is not bool:
@@ -724,11 +711,7 @@ class DynamicCPPlugin:
         return handle
 
     def _prepare(
-        self,
-        handle: Any,
-        data: Any,
-        loss_fn: Callable | None,
-        num_microbatches: int,
+        self, handle: Any, data: Any, loss_fn: Callable | None, num_microbatches: int
     ) -> _Prepared:
         if self._groups is None or self._pool is None:
             raise RuntimeError(
@@ -944,11 +927,7 @@ class DynamicCPPlugin:
                 if collect_outputs and bool(batch.extras[_GROUP_LEADER]):
                     records.append(
                         _record_output(
-                            output,
-                            batch,
-                            loss * output_loss_scale,
-                            metrics,
-                            extractor,
+                            output, batch, loss * output_loss_scale, metrics, extractor
                         )
                     )
                 # DDP still reduces over the physical pool. A sample computed by

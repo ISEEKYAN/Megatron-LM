@@ -7,7 +7,6 @@ from collections.abc import Callable
 
 import torch
 import torch.nn as nn
-
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.parallel import (
     ParallelState,
@@ -25,7 +24,9 @@ def roll_mtp_tensor_left(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Roll MTP inputs/labels one token left for dense or packed THD batches."""
     if packed_seq_params is not None:
-        return roll_packed_thd_left(tensor, packed_seq_params=packed_seq_params, dims=dims)
+        return roll_packed_thd_left(
+            tensor, packed_seq_params=packed_seq_params, dims=dims
+        )
 
     dim = dims if dims >= 0 else tensor.dim() + dims
     rolled = torch.roll(tensor, shifts=-1, dims=dim)
@@ -46,7 +47,9 @@ class MTPLossAutoScaler(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (mtp_loss,) = ctx.saved_tensors
-        scaled_mtp_grad = torch.ones_like(mtp_loss) * MTPLossAutoScaler.main_loss_backward_scale
+        scaled_mtp_grad = (
+            torch.ones_like(mtp_loss) * MTPLossAutoScaler.main_loss_backward_scale
+        )
         return grad_output, scaled_mtp_grad
 
     @staticmethod
@@ -77,7 +80,9 @@ class MTPDecoderLayer(nn.Module):
             hidden_size * 2, hidden_size, ps, sp=ps.tp_size > 1, gather_output=True
         )
         self.transformer_layer = transformer_layer
-        self.final_layernorm = te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
+        self.final_layernorm = te.RMSNorm(
+            hidden_size, eps=rms_norm_eps, zero_centered_gamma=True
+        )
 
     def forward(
         self,
@@ -91,7 +96,9 @@ class MTPDecoderLayer(nn.Module):
         attention_position_ids = (
             rotary_position_ids if rotary_position_ids is not None else position_ids
         )
-        input_ids, _ = roll_mtp_tensor_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
+        input_ids, _ = roll_mtp_tensor_left(
+            input_ids, packed_seq_params=packed_seq_params, dims=-1
+        )
         if position_ids is not None:
             position_ids, _ = roll_mtp_tensor_left(
                 position_ids, packed_seq_params=packed_seq_params, dims=-1
@@ -103,9 +110,13 @@ class MTPDecoderLayer(nn.Module):
         decoder_input = self.enorm(decoder_input)
         hidden_states = self.hnorm(hidden_states)
         hidden_states = torch.cat((decoder_input, hidden_states), dim=-1)
-        hidden_states = scatter_to_sequence_parallel(self.eh_proj(hidden_states), self.ps)
+        hidden_states = scatter_to_sequence_parallel(
+            self.eh_proj(hidden_states), self.ps
+        )
         hidden_states = self.transformer_layer(
-            hidden_states, position_ids=attention_position_ids, packed_seq_params=packed_seq_params
+            hidden_states,
+            position_ids=attention_position_ids,
+            packed_seq_params=packed_seq_params,
         )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids
@@ -123,7 +134,9 @@ class MTPBlock(nn.Module):
         self.num_layers = num_layers
         self.repeated_layer = repeated_layer
         layers_to_build = 1 if repeated_layer else num_layers
-        self.layers = nn.ModuleList([layer_factory(idx) for idx in range(layers_to_build)])
+        self.layers = nn.ModuleList(
+            [layer_factory(idx) for idx in range(layers_to_build)]
+        )
 
     def forward(
         self,

@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import torch.nn as nn
-
 from megatron.lite.model.deepseek_v4.lite.protocol import _iter_transformer_units
 
 

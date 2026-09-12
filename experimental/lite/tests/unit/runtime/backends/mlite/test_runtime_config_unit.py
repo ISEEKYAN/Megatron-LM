@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import pytest
-
 from megatron.lite.runtime import RuntimeConfig, create_runtime
 from megatron.lite.runtime.backends.mlite.config import DebugConfig, MegatronLiteConfig
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
+
 
 def test_mlite_config_defaults_are_stable():
     cfg = MegatronLiteConfig(model_name="qwen3_moe")

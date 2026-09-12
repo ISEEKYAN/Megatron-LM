@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch.nn as nn
-
 from megatron.lite.primitive.parallel.state import ParallelState
 
 
