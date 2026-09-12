@@ -229,11 +229,17 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     # ── validation ──
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
+    try:
+        topk = model_cfg.num_experts_per_tok
+    except AttributeError as exc:
+        raise ValueError(
+            "Qwen3MoE model config requires num_experts_per_tok (router top-k)"
+        ) from exc
     validate_ep_chunk_overlap_config(
         impl_cfg.enable_ep_chunk_overlap,
         use_deepep=impl_cfg.use_deepep,
         ep_size=p.ep,
-        topk=model_cfg.num_experts_per_tok,
+        topk=topk,
         max_token_rows_per_rank=impl_cfg.ep_chunk_max_token_rows_per_rank,
         chunk_count=impl_cfg.ep_chunk_count,
     )

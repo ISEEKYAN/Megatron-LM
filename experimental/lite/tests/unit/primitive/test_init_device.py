@@ -29,7 +29,9 @@ def _build_fsdp2(monkeypatch, transformer_engine_import_stub):
     monkeypatch.setattr(protocol, "set_cross_entropy_fusion", lambda *_args: None)
     monkeypatch.setattr(protocol, "apply_qat_to_chunks", lambda *_args: None)
     monkeypatch.setattr(nn.Module, "cuda", lambda self: self)
-    cfg = SimpleNamespace(num_nextn_predict_layers=0)
+    # Use the real Qwen3-30B-A3B architecture defaults, including router top-k.
+    # Model construction is replaced above; this remains a device-policy test.
+    cfg = protocol.Qwen3MoEConfig()
     bundle = protocol.build_model(cfg, impl_cfg=protocol.ImplConfig(optimizer="fsdp2"))
     return seen, [param.device.type for param in bundle.chunks[0].parameters()]
 
@@ -272,3 +274,14 @@ def test_dispatcher_metadata_stays_materialized_in_meta_context() -> None:
 
     assert dispatcher._sort_by_experts == [0, 2, 1, 3]
     assert dispatcher._restore_by_ranks == [0, 2, 1, 3]
+
+
+def test_model_config_requires_router_topk(transformer_engine_import_stub):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import protocol
+
+    with pytest.raises(ValueError, match="num_experts_per_tok"):
+        protocol.build_model(
+            SimpleNamespace(num_nextn_predict_layers=0),
+            impl_cfg=protocol.ImplConfig(optimizer="fsdp2"),
+        )
