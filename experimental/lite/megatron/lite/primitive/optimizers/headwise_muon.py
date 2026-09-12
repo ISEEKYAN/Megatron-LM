@@ -1,19 +1,72 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Muon on explicitly declared logical matrices, with FP32 owner state.
-
-The caller owns layout interpretation. ``matrix_shape`` is (rows, columns) or
-(heads, rows, columns), independent of parameter names and physical flattening.
-Newton-Schulz is supplied by NVIDIA emerging_optimizers, never reimplemented.
-This local primitive requires reassembled matrices; distributed lowering is a
-separate contract. prepare/commit permits an atomic mixed-optimizer coordinator.
-"""
+"""Muon on explicitly declared logical matrices, with FP32 owner state."""
 
 import math
 
 import torch
 
 
-class HeadwiseMuon(torch.optim.Optimizer):
+def _matrix_shape(shape):
+    return (
+        isinstance(shape, (tuple, list))
+        and len(shape) in (2, 3)
+        and all(type(d) is int and d > 0 for d in shape)
+    )
+
+
+class StagedMatrixOptimizer(torch.optim.Optimizer):
+    """Common candidate publication; subclasses supply direction and layout checks."""
+
+    def _idle(self, action):
+        if self._prepared is not None:
+            raise RuntimeError(f'Cannot {action} a prepared {self._label} step')
+
+    def candidates(self):
+        if self._prepared is None:
+            raise RuntimeError(f'No prepared {self._label} step')
+        return tuple((p, value) for p, value, _ in self._prepared)
+
+    @torch.no_grad()
+    def commit_step(self):
+        for (p, value), (_, _, momentum) in zip(self.candidates(), self._prepared):
+            p.copy_(value)
+            self.state[p][self._momentum_key] = momentum
+        self.discard_step()
+
+    def discard_step(self):
+        self._prepared = None
+
+    def step(self, closure=None):
+        if closure is not None:
+            raise ValueError(f'{self._label} requires explicit accumulated gradients')
+        if not self.prepare_step():
+            return False
+        self.commit_step()
+        return True
+
+    def state_dict(self):
+        self._idle('checkpoint')
+        return super().state_dict()
+
+    def _validate_momentum(self, saved, shape):
+        if saved is None:
+            return
+        momentum = saved.get(self._momentum_key)
+        if (
+            set(saved) != {self._momentum_key}
+            or not isinstance(momentum, torch.Tensor)
+            or momentum.dtype != torch.float32
+            or momentum.shape != shape
+            or not torch.isfinite(momentum).all()
+        ):
+            raise ValueError(
+                f'{self._label} checkpoint requires matching finite FP32 momentum'
+            )
+
+
+class HeadwiseMuon(StagedMatrixOptimizer):
+    _label, _momentum_key = 'Muon', 'momentum_buffer'
+
     def __init__(
         self,
         params,
@@ -52,11 +105,7 @@ class HeadwiseMuon(torch.optim.Optimizer):
         seen = set()
         for group in self.param_groups:
             shape = group.get('matrix_shape')
-            if (
-                not isinstance(shape, (tuple, list))
-                or len(shape) not in (2, 3)
-                or any(type(d) is not int or d < 1 for d in shape)
-            ):
+            if not _matrix_shape(shape):
                 raise ValueError(
                     'An explicit positive logical matrix shape is required'
                 )
@@ -64,12 +113,7 @@ class HeadwiseMuon(torch.optim.Optimizer):
             if partitions is not None and (
                 not isinstance(partitions, (list, tuple))
                 or not partitions
-                or any(
-                    not isinstance(part, (list, tuple))
-                    or len(part) not in (2, 3)
-                    or any(type(d) is not int or d < 1 for d in part)
-                    for part in partitions
-                )
+                or not all(_matrix_shape(part) for part in partitions)
                 or sum(math.prod(part) for part in partitions) != math.prod(shape)
             ):
                 raise ValueError(
@@ -159,39 +203,8 @@ class HeadwiseMuon(torch.optim.Optimizer):
         self._prepared = prepared
         return True
 
-    def candidates(self):
-        if self._prepared is None:
-            raise RuntimeError('No prepared Muon step')
-        return tuple((p, value) for p, value, _ in self._prepared)
-
-    @torch.no_grad()
-    def commit_step(self):
-        if self._prepared is None:
-            raise RuntimeError('No prepared Muon step')
-        for p, value, momentum in self._prepared:
-            p.copy_(value)
-            self.state[p]['momentum_buffer'] = momentum
-        self._prepared = None
-
-    def discard_step(self):
-        self._prepared = None
-
-    def step(self, closure=None):
-        if closure is not None:
-            raise ValueError('Muon requires explicit accumulated gradients')
-        if not self.prepare_step():
-            return False
-        self.commit_step()
-        return True
-
-    def state_dict(self):
-        if self._prepared is not None:
-            raise RuntimeError('Cannot checkpoint a prepared Muon step')
-        return super().state_dict()
-
     def load_state_dict(self, state_dict):
-        if self._prepared is not None:
-            raise RuntimeError('Cannot restore a prepared Muon step')
+        self._idle('restore')
         saved = state_dict['param_groups']
         if len(saved) != len(self.param_groups) or any(
             tuple(a['matrix_shape']) != tuple(b['matrix_shape'])
@@ -206,19 +219,6 @@ class HeadwiseMuon(torch.optim.Optimizer):
             ):
                 raise ValueError('Muon backend recipe or owner count changed')
             for pid, parameter in zip(old['params'], current['params']):
-                state = state_dict['state'].get(pid)
-                if state is None:
-                    continue
-                momentum = state.get('momentum_buffer')
-                if (
-                    set(state) != {'momentum_buffer'}
-                    or not isinstance(momentum, torch.Tensor)
-                    or momentum.dtype != torch.float32
-                    or momentum.shape != parameter.shape
-                    or not torch.isfinite(momentum).all()
-                ):
-                    raise ValueError(
-                        'Muon checkpoint requires matching finite FP32 momentum'
-                    )
+                self._validate_momentum(state_dict['state'].get(pid), parameter.shape)
         super().load_state_dict(state_dict)
         self._validate_groups()
