@@ -213,16 +213,17 @@ def _install_cpu_te_construction_stubs(transformer_engine_import_stub, monkeypat
     for name, replacement in te_types.items():
         monkeypatch.setattr(te, name, replacement, raising=False)
     # Parameterized tests may have imported model/primitive modules under a
-    # previous fixture-owned TE stub. Patch every retained module-local ``te``
-    # reference as well as the current sys.modules entry.
+    # previous fixture-owned TE stub. Patch retained ``te`` and centralized
+    # constructor ``_TE`` references as well as the current sys.modules entry.
     for module in tuple(sys.modules.values()):
-        module_te = getattr(module, "te", None)
-        if not isinstance(module_te, types.ModuleType):
-            continue
-        if module_te.__name__ != "transformer_engine.pytorch":
-            continue
-        for name, replacement in te_types.items():
-            monkeypatch.setattr(module_te, name, replacement, raising=False)
+        for alias in ("te", "_TE"):
+            module_te = getattr(module, alias, None)
+            if not isinstance(module_te, types.ModuleType):
+                continue
+            if module_te.__name__ != "transformer_engine.pytorch":
+                continue
+            for name, replacement in te_types.items():
+                monkeypatch.setattr(module_te, name, replacement, raising=False)
 
     te_root = importlib.import_module("transformer_engine")
     monkeypatch.setattr(te_root, "__version__", "2.0.0")
