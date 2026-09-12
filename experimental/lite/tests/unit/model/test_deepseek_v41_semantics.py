@@ -932,10 +932,15 @@ def _real_model_worker(rank, rendezvous):
     start, end = boundaries[rank : rank + 2]
     owned_modules = list(model.layers[start:end])
     if rank == 0:
-        owned_modules.append(model.embed)
+        owned_modules.extend((model.embed, model.vision, model.aligner))
     if rank == 3:
         owned_modules.extend((model.norm, model.head))
     owned_ids = {id(p) for module in owned_modules for p in module.parameters()}
+    if rank == 0:
+        owned_ids.update(
+            id(getattr(model, key))
+            for key in ('image_start', 'image_end', 'image_newline')
+        )
     bindings = [b for b in model.parameter_bindings() if id(b.tensor) in owned_ids]
     assert {id(b.tensor) for b in bindings} == owned_ids
     params = [b.tensor for b in bindings if b.tensor.requires_grad]
@@ -968,6 +973,7 @@ def _real_model_worker(rank, rendezvous):
         for module in owned_modules
         for value in (*module.parameters(), *module.buffers())
     }
+    owned_values.update(owned_ids)
     local_state = {
         name: tensor.detach().clone()
         for name, tensor in model.state_dict(keep_vars=True).items()
@@ -1007,6 +1013,9 @@ def _real_model_worker(rank, rendezvous):
     assert (
         sum(p.numel() for p in model.parameters()) < reference_parameter_count
     ), 'PP parameter allocation did not shrink to the local stage'
+    assert (
+        local_state.keys() == model.state_dict().keys()
+    ), 'G1_STAGE_STATE: fixture must retain every first-stage visual owner and every local text owner'
     model.load_state_dict(local_state, strict=True)
     del local_state
     bindings = list(model.parameter_bindings())
