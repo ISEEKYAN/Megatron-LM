@@ -154,143 +154,6 @@ def test_sinkhorn_shards(configuration, tmp_path):
     )
 
 
-def _run_engram(rank, rendezvous, checkpoint_root, trainable):
-    import megatron.lite.model.deepseek_v41.lite.parallel as engram_parallel
-    from megatron.lite.model.deepseek_v41.lite import prefetch, table_state
-    from megatron.lite.primitive.modules import engram_lookup
-    from megatron.lite.primitive.quantization import block_fp8
-
-    torch.cuda.set_device(rank)
-    dist.init_process_group(
-        'nccl',
-        init_method=rendezvous,
-        rank=rank,
-        world_size=4,
-        timeout=timedelta(seconds=120),
-    )
-    try:
-        layout = engram_parallel.EngramLayout(5, ((0, 1), (2, 3)), world_size=4)
-        row_groups, replicas = layout.create_groups()
-        optimizer_group = layout.create_optimizer_group()
-        begin, end = span(5, 2, rank % 2)
-
-        def construct():
-            table = engram_lookup.ShardedEngramTable(
-                torch.full((end - begin, 32), 256.0, device='cuda').to(
-                    torch.float8_e4m3fn
-                ),
-                torch.full((end - begin, 1), 1 / 256, device='cuda').to(
-                    torch.float8_e8m0fnu
-                ),
-                engram_lookup.RowLookup((0, 3, 5), row_groups[rank // 2]),
-                trainable=trainable,
-                output_dtype=torch.float32,
-            )
-            return table_state.EngramSinkhornState(
-                table, row_group=optimizer_group, replica_group=replicas[rank % 2]
-            )
-
-        state = construct()
-        expected = torch.ones(5, 32, dtype=torch.float64)
-        momentum = torch.zeros_like(expected)
-        features = torch.arange(1.0, 33.0, dtype=torch.float64)
-        for step in range(3):
-            schedules = [
-                {
-                    'a': [] if worker == 3 else [step, step, 4],
-                    'b': [1, 4] if worker % 2 == 0 else [2],
-                }
-                for worker in range(4)
-            ]
-            ids = {
-                name: torch.tensor(rows, device='cuda', dtype=torch.int64)
-                for name, rows in schedules[rank].items()
-            }
-            batch = prefetch.EngramPrefetch(state).start(
-                step, ids, stream=torch.cuda.Stream()
-            )
-            for name in ('b', 'a'):
-                output = batch.view(name)(ids[name])
-                if trainable:
-                    coefficient = (rank + 1) * (1 if name == 'a' else 2**-10)
-                    (output * features.float().cuda() * coefficient).sum().backward()
-            if trainable:
-                assert state.table.master.grad is None
-                assert not torch.count_nonzero(state.main_grad)
-            batch.flush()
-            global_grad = torch.zeros(5, 32, dtype=torch.float64)
-            local_grad = torch.zeros_like(global_grad)
-            for worker, schedule in enumerate(schedules):
-                for name, rows in schedule.items():
-                    coefficient = (worker + 1) * (1 if name == 'a' else 2**-10)
-                    for row in rows:
-                        global_grad[row] += coefficient * features
-                        if worker // 2 == rank // 2:
-                            local_grad[row] += coefficient * features
-            if trainable:
-                torch.testing.assert_close(
-                    state.main_grad.cpu().double(),
-                    local_grad[begin:end],
-                    atol=0,
-                    rtol=0,
-                )
-                expected, momentum = scalar_step(
-                    expected.tolist(), momentum.tolist(), global_grad.tolist(), 0.001, 5
-                )
-                assert state.step(lr=0.001)
-                torch.testing.assert_close(
-                    state.table.master.cpu().double(),
-                    expected[begin:end],
-                    atol=3e-6,
-                    rtol=3e-6,
-                )
-                owned_start, owned_end = span(end - begin, 2, rank // 2)
-                torch.testing.assert_close(
-                    state.momentum.cpu().double(),
-                    momentum[begin:end][owned_start:owned_end],
-                    atol=2e-5,
-                    rtol=3e-6,
-                )
-                values, scales = block_fp8.quantize_block_fp8(
-                    state.table.master.detach(), (1, 32), scale_format='e8m0'
-                )
-                assert torch.equal(
-                    values.view(torch.uint8), state.table.weight.view(torch.uint8)
-                )
-                assert torch.equal(
-                    scales.view(torch.uint8), state.table.scale.view(torch.uint8)
-                )
-                assert state.momentum.is_cuda and state.main_grad.is_cuda
-            else:
-                assert not state.step(lr=0.001)
-                assert state.table.master is state.main_grad is state.momentum is None
-                assert torch.all(state.table.weight.float() == 256)
-                assert torch.all(state.table.scale.float() == 1 / 256)
-            path = f'{checkpoint_root}/state-{rank}.pt'
-            torch.save(state.state_dict(), path)
-            state = construct()
-            state.load_state_dict(
-                torch.load(path, map_location=f'cuda:{rank}', weights_only=True)
-            )
-            assert state.last_step == step
-            assert state.table.weight.is_cuda and state.table.scale.is_cuda
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.parametrize('trainable', [False, True])
-def test_engram_sinkhorn_lookup_prefetch_restart(trainable, tmp_path):
-    assert os.getenv('SLURM_JOB_ID'), 'Run distributed GPU qualification through Slurm'
-    if torch.cuda.device_count() < 4:
-        pytest.skip('Requires the declared four-GPU allocation')
-    mp.spawn(
-        _run_engram,
-        args=(f'file://{tmp_path}/rendezvous', str(tmp_path), trainable),
-        nprocs=4,
-        join=True,
-    )
-
-
 @pytest.mark.gpus(1)
 def test_sinkhorn_epsilon_first_division_cuda():
     from megatron.lite.primitive.optimizers.sinkhorn import sinkhorn_direction
@@ -306,3 +169,99 @@ def test_sinkhorn_epsilon_first_division_cuda():
         observed[0], torch.tensor([[0.5]], device='cuda'), atol=0, rtol=0
     )
     torch.testing.assert_close(output, torch.ones_like(output), atol=1e-6, rtol=0)
+
+
+def _row_lookup(rank, rendezvous, trainable):
+    from megatron.lite.primitive.modules.engram_lookup import (
+        RowLookup,
+        ShardedEngramTable,
+    )
+    from megatron.lite.primitive.optimizers.sinkhorn import Sinkhorn
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        'nccl',
+        init_method=rendezvous,
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=120),
+    )
+    try:
+        cuts = (0, 2, 3, 4, 5)
+        begin, end = cuts[rank : rank + 2]
+        full = (
+            (torch.arange(160).reshape(5, 32).float() / 32)
+            .to(torch.float8_e4m3fn)
+            .cuda()
+        )
+        scales = torch.ones(5, 1, device='cuda').to(torch.float8_e8m0fnu)
+        lookup = RowLookup(cuts, dist.group.WORLD)
+        table = ShardedEngramTable(
+            full[begin:end],
+            scales[begin:end],
+            lookup,
+            trainable=trainable,
+            output_dtype=torch.float32,
+        )
+        ids = torch.tensor(
+            [] if rank == 0 else [rank, (rank + 1) % 5, rank],
+            dtype=torch.int64,
+            device='cuda',
+        )
+        values, row_scales, _ = table.lookup_fp8(ids)
+        assert torch.equal(values.view(torch.uint8), full.view(torch.uint8)[ids])
+        assert torch.equal(row_scales.view(torch.uint8), scales.view(torch.uint8)[ids])
+        result = table(ids)
+        torch.testing.assert_close(result, full.float()[ids], atol=0, rtol=0)
+        if trainable:
+            (result.sum() * ((rank + 1) / 1024)).backward()
+            gradient = torch.zeros(5, 32)
+            for peer in range(1, 4):
+                for row in [peer, (peer + 1) % 5, peer]:
+                    gradient[row] += (peer + 1) / 1024
+            torch.testing.assert_close(
+                table.master.grad.cpu(), gradient[begin:end], atol=0, rtol=0
+            )
+            expected, momentum = scalar_step(
+                full.float().cpu().tolist(),
+                torch.zeros(5, 32).tolist(),
+                gradient.tolist(),
+                0.001,
+                5,
+            )
+            opt = Sinkhorn(
+                [{'params': [table.master], 'multiplier': 5}],
+                lr=0.001,
+                row_group=dist.group.WORLD,
+            )
+            assert opt.step()
+            torch.testing.assert_close(
+                table.master.cpu().double(), expected[begin:end], atol=2e-6, rtol=2e-6
+            )
+            torch.testing.assert_close(
+                opt.state[table.master]['momentum'].cpu().double(),
+                momentum[begin:end],
+                atol=2e-6,
+                rtol=2e-6,
+            )
+            table.refresh_storage()
+            assert table.weight.is_cuda and table.scale.is_cuda and table.master.is_cuda
+        else:
+            assert table.master is None and not result.requires_grad
+        with pytest.raises(ValueError, match='Row ID outside logical table'):
+            lookup.route(torch.tensor([-1 if rank == 0 else 0], device='cuda'))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize('trainable', [False, True])
+def test_resident_row_lookup_backward_and_update(trainable, tmp_path):
+    assert os.getenv('SLURM_JOB_ID'), 'Run GPU qualification through Slurm'
+    if torch.cuda.device_count() < 4:
+        pytest.skip('Requires the declared four-GPU allocation')
+    mp.spawn(
+        _row_lookup,
+        args=(f'file://{tmp_path}/row-lookup', trainable),
+        nprocs=4,
+        join=True,
+    )
