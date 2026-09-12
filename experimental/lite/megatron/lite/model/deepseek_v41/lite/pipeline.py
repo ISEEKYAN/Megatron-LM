@@ -4,6 +4,7 @@
 from dataclasses import dataclass
 
 import torch
+from megatron.lite.primitive.parallel.tensor_payload import PipelineLedger, PipelineTag
 
 PAYLOAD_FIELDS = (
     'h',
