@@ -29,9 +29,7 @@ class VisionOptimizerConfig:
 
     def __post_init__(self):
         if any(not math.isfinite(value) or value < 0 for value in vars(self).values()):
-            raise ValueError(
-                'Visual optimizer policy requires finite nonnegative values'
-            )
+            raise ValueError('Visual optimizer policy requires finite nonnegative values')
 
 
 @dataclass(frozen=True)
@@ -41,6 +39,27 @@ class OptimizerConfig:
     coefficient_type: str
     clip_grad: float = 1.0
     vision_policy: VisionOptimizerConfig | None = None
+
+
+# Role -> (matrix algorithm, matrix decay, vector decay, LR multiplier).
+# Roles are validated against an independently enumerated object inventory below.
+_RULES = {
+    **dict.fromkeys(
+        ('wq_a', 'wq_b', 'wkv', 'wo_a', 'wo_b', 'router', 'expert', 'shared_expert', 'compressor'),
+        ('muon', 0.1, 0.1, 1),
+    ),
+    'embedding': ('sinkhorn', 0, 0, 1),
+    'head': ('sinkhorn', 0, 0, 1),
+    'norm': ('adamw', 0.1, 0.1, 1),
+    'attention_sink': ('adamw', 0, 0, 1),
+    'hyper_connection': ('muon', 0.1, 0, 1),
+    'engram_table': ('sinkhorn', 0, 0, 5),
+    'engram_projection': ('muon', 0.1, 0.1, 5),
+    'engram_norm': ('adamw', 0.1, 0.1, 5),
+    'vision': ('muon', 0.1, 0.1, 1),
+    'aligner': ('muon', 0.1, 0.1, 1),
+    'image_delimiter': ('adamw', 0, 0, 1),
+}
 
 
 def parameter_groups(model, *, lr, vision_policy=None):
@@ -53,17 +72,7 @@ def parameter_groups(model, *, lr, vision_policy=None):
         raise ValueError('Unexpected parameter alias in module tree')
     groups, seen = [], set()
 
-    def add(
-        p,
-        algorithm,
-        *,
-        role,
-        shape=None,
-        multiplier=1,
-        decay=0.1,
-        heads=None,
-        partitions=None
-    ):
+    def add(p, role, *, shape=None, heads=None, partitions=None, vector=False, **policy):
         if id(p) in seen:
             raise ValueError('Duplicate optimizer owner')
         seen.add(id(p))
@@ -74,10 +83,12 @@ def parameter_groups(model, *, lr, vision_policy=None):
             raise ValueError('Unresolved or incorrect logical head count')
         if not p.requires_grad:
             return
+        algorithm, matrix_decay, vector_decay, multiplier = _RULES[role]
+        # Selection follows logical matrix rank, never a release-key prefix.
+        if vector:
+            algorithm = 'adamw'
         if algorithm in ('muon', 'sinkhorn') and p.ndim != 2:
-            raise ValueError(
-                'Matrix optimizer requires the declared two-dimensional owner'
-            )
+            raise ValueError('Matrix optimizer requires the declared two-dimensional owner')
         if shape is not None and math.prod(shape) != p.numel():
             raise ValueError('Logical matrix shape disagrees with actual owner')
         if (
@@ -86,6 +97,7 @@ def parameter_groups(model, *, lr, vision_policy=None):
             and tuple(p.shape) != (shape[0] * shape[1], shape[2])
         ):
             raise ValueError('Head layout disagrees with physical matrix axes')
+        decay = vector_decay if vector else matrix_decay
         groups.append(
             dict(
                 params=[p],
@@ -93,37 +105,36 @@ def parameter_groups(model, *, lr, vision_policy=None):
                 owner_key=b.release_key,
                 matrix_shape=tuple(p.shape) if shape is None else tuple(shape),
                 matrix_partitions=partitions,
-                lr=lr * multiplier,
-                weight_decay=decay,
+                lr=lr * policy.get('multiplier', multiplier),
+                weight_decay=policy.get('decay', decay),
             )
         )
 
-    def route(owner, paths, algorithm, role, **policy):
+    def route(owner, paths, role, **policy):
         for path in paths.split():
-            add(attrgetter(path)(owner), algorithm, role=role, **policy)
+            add(attrgetter(path)(owner), role, **policy)
 
-    route(model, 'embed.weight', 'sinkhorn', 'embedding', decay=0)
-    route(model, 'head.weight', 'sinkhorn', 'head', decay=0)
-    route(model, 'norm.weight', 'adamw', 'norm')
+    for paths, role in (
+        ('embed.weight', 'embedding'),
+        ('head.weight', 'head'),
+        ('norm.weight', 'norm'),
+    ):
+        route(model, paths, role)
     for block in model.layers:
         a, c = block.attn, block.attn.config
         for role in ('wq_a', 'wkv', 'wo_a', 'wo_b'):
-            route(a, role + '.weight', 'muon', role)
-        route(
-            a,
-            'wq_b.weight',
-            'muon',
-            'wq_b',
-            shape=(c.heads, c.head_dim, c.q_rank),
-            heads=c.heads,
-        )
-        route(a, 'q_norm.weight kv_norm.weight', 'adamw', 'norm')
-        route(a, 'attn_sink', 'adamw', 'attention_sink', decay=0)
+            route(a, role + '.weight', role)
+        route(a, 'wq_b.weight', 'wq_b', shape=(c.heads, c.head_dim, c.q_rank), heads=c.heads)
+        for owner, paths, role in (
+            (a, 'q_norm.weight kv_norm.weight', 'norm'),
+            (a, 'attn_sink', 'attention_sink'),
+        ):
+            route(owner, paths, role)
         if a.compressor is not None:
-            route(a.compressor, 'wkv.weight', 'muon', 'compressor')
-            route(a.compressor, 'norm.weight', 'adamw', 'compressor')
+            route(a.compressor, 'wkv.weight', 'compressor')
+            route(a.compressor, 'norm.weight', 'compressor', vector=True)
             if hasattr(a.compressor, 'wgate'):
-                route(a.compressor, 'wgate.weight', 'muon', 'compressor')
+                route(a.compressor, 'wgate.weight', 'compressor')
         if a.indexer is not None:
             for p in a.indexer.parameters():
                 if p.requires_grad:
@@ -131,33 +142,31 @@ def parameter_groups(model, *, lr, vision_policy=None):
                 if id(p) not in bindings or bindings[id(p)].role != 'indexer':
                     raise ValueError('Unknown indexer parameter')
                 seen.add(id(p))
-        route(block, 'attn_norm.weight ffn_norm.weight', 'adamw', 'norm')
+        route(block, 'attn_norm.weight ffn_norm.weight', 'norm')
         for mixes in (block.attn_mixes, block.ffn_mixes):
-            route(mixes, 'fn', 'muon', 'hyper_connection')
-            route(mixes, 'base scale', 'adamw', 'hyper_connection', decay=0)
-        route(block.ffn, 'gate.router.gate.weight', 'muon', 'router')
+            route(mixes, 'fn', 'hyper_connection')
+            route(mixes, 'base scale', 'hyper_connection', vector=True)
+        route(block.ffn, 'gate.router.gate.weight', 'router')
         for role, experts in (
             ('expert', block.ffn.experts),
             ('shared_expert', [block.ffn.shared_experts]),
         ):
             for expert in experts:
                 if expert is not None:
-                    route(expert, 'w1.weight w2.weight w3.weight', 'muon', role)
+                    route(expert, 'w1.weight w2.weight w3.weight', role)
         if block.engram is not None:
             e = block.engram
             if e.embed.master is not None:
-                route(
-                    e, 'embed.master', 'sinkhorn', 'engram_table', multiplier=5, decay=0
-                )
-            route(e, 'wkv.weight', 'muon', 'engram_projection', multiplier=5)
-            route(e, 'q_weight k_weight', 'adamw', 'engram_norm', multiplier=5)
-    # Enumerate live visual objects explicitly; frozen owners are still audited.
+                route(e, 'embed.master', 'engram_table')
+            for paths, role in (
+                ('wkv.weight', 'engram_projection'),
+                ('q_weight k_weight', 'engram_norm'),
+            ):
+                route(e, paths, role)
     vision = model.vision
     if hasattr(vision, 'patch_embed'):
         encoder_active = any(
-            p.requires_grad
-            for module in (vision.patch_embed, vision.blocks)
-            for p in module.parameters()
+            p.requires_grad for m in (vision.patch_embed, vision.blocks) for p in m.parameters()
         )
         vectors = (model.image_start, model.image_end, model.image_newline)
         if (encoder_active or any(p.requires_grad for p in vectors)) and not isinstance(
@@ -170,70 +179,46 @@ def parameter_groups(model, *, lr, vision_policy=None):
 
         def visual_linear(module, role, *, multiplier=1, partitions=None):
             shape = (module.out_features, module.in_features)
-            if (
-                math.prod(shape) != module.weight.numel()
-                or tuple(module.weight.shape) != shape
-            ):
+            if math.prod(shape) != module.weight.numel() or tuple(module.weight.shape) != shape:
                 raise ValueError('Visual linear shape disagrees with physical owner')
             if module.bias is not None and tuple(module.bias.shape) != (shape[0],):
                 raise ValueError('Visual bias shape disagrees with physical owner')
             if partitions is not None and (
-                any(
-                    any(type(d) is not int or d < 1 for d in part)
-                    for part in partitions
-                )
+                any(any(type(d) is not int or d < 1 for d in part) for part in partitions)
                 or sum(math.prod(part) for part in partitions) != module.weight.numel()
                 or any(part[-1] != shape[-1] for part in partitions)
             ):
                 raise ValueError('Logical partitions disagree with visual matrix shape')
-            add(
-                module.weight,
-                'muon',
-                role=role,
-                shape=shape,
-                multiplier=multiplier,
-                partitions=partitions,
-            )
+            add(module.weight, role, shape=shape, multiplier=multiplier, partitions=partitions)
             if module.bias is not None:
-                add(module.bias, 'adamw', role=role, multiplier=multiplier, decay=0)
+                add(module.bias, role, multiplier=multiplier, decay=0, vector=True)
 
         visual_linear(vision.patch_embed.proj, 'vision', multiplier=multiplier)
         for block in vision.blocks:
-            a = block.attn
-            dim = a.wqkv.in_features
-            partitions = (
-                (a.n_heads, a.head_dim, dim),
-                (a.n_heads, a.head_dim, dim),
-                (dim, dim),
-            )
-            visual_linear(
-                a.wqkv, 'vision', multiplier=multiplier, partitions=partitions
-            )
-            visual_linear(a.wo, 'vision', multiplier=multiplier)
-            # Inherit the existing fused physical gate/up matrix, without a new split.
-            for module in (block.mlp.w1, block.mlp.w2):
-                visual_linear(module, 'vision', multiplier=multiplier)
+            a, dim = block.attn, block.attn.wqkv.in_features
+            partitions = ((a.n_heads, a.head_dim, dim), (a.n_heads, a.head_dim, dim), (dim, dim))
+            for module, parts in (
+                (a.wqkv, partitions),
+                (a.wo, None),
+                (block.mlp.w1, None),
+                (block.mlp.w2, None),
+            ):
+                visual_linear(module, 'vision', multiplier=multiplier, partitions=parts)
             for module in (block.norm1, block.norm2):
-                add(module.weight, 'adamw', role='vision', multiplier=multiplier)
-        route(vision, 'norm.weight', 'adamw', 'vision')
+                add(module.weight, 'vision', multiplier=multiplier, vector=True)
+        route(vision, 'norm.weight', 'vision', vector=True)
         for module in (model.aligner.w1, model.aligner.w2):
             visual_linear(module, 'aligner')
         for vector in vectors:
-            add(
-                vector,
-                'adamw',
-                role='image_delimiter',
-                multiplier=(
-                    vision_policy.image_vector_lr_multiplier
-                    if vector.requires_grad
-                    else 1
-                ),
-                decay=(
-                    vision_policy.image_vector_weight_decay
-                    if vector.requires_grad
-                    else 0
-                ),
+            policy = (
+                dict(
+                    multiplier=vision_policy.image_vector_lr_multiplier,
+                    decay=vision_policy.image_vector_weight_decay,
+                )
+                if vector.requires_grad
+                else {}
             )
+            add(vector, 'image_delimiter', **policy)
     if seen != set(bindings):
         raise ValueError('Unknown parameter owner; no catch-all optimizer route')
     return groups
@@ -252,9 +237,7 @@ class V41Optimizer(MixedOptimizer):
             raise TypeError('V4.1 requires an explicit model OptimizerConfig')
         if not math.isfinite(config.clip_grad) or config.clip_grad < 0:
             raise ValueError('Invalid gradient clipping threshold')
-        groups = parameter_groups(
-            model, lr=config.lr, vision_policy=config.vision_policy
-        )
+        groups = parameter_groups(model, lr=config.lr, vision_policy=config.vision_policy)
         self.model = model
         tables = [
             b.engram.embed
@@ -307,6 +290,4 @@ class V41Optimizer(MixedOptimizer):
         expected = {id(p) for p in self.model.parameters() if p.requires_grad}
         actual = {id(p) for g in self.param_groups for p in g['params']}
         if actual != expected:
-            raise ValueError(
-                'Trainability changed; rebuild optimizer groups before training'
-            )
+            raise ValueError('Trainability changed; rebuild optimizer groups before training')

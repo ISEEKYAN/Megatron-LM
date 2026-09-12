@@ -6,7 +6,7 @@ import json
 import os
 import struct
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -40,9 +40,7 @@ def _coverage(entries, expected_keys):
         raise ValueError("duplicate expected keys")
     missing, extra = set(expected) - entries.keys(), entries.keys() - set(expected)
     if missing or extra:
-        raise ValueError(
-            f"key coverage mismatch: missing={len(missing)} extra={len(extra)}"
-        )
+        raise ValueError(f"key coverage mismatch: missing={len(missing)} extra={len(extra)}")
 
 
 @dataclass(frozen=True)
@@ -92,9 +90,7 @@ class CheckpointTensorStore:
                 raise ValueError(f"invalid safetensors file: {path}") from error
             with path.open("rb") as source:
                 length = struct.unpack("<Q", source.read(8))[0]
-                header = json.loads(
-                    source.read(length), object_pairs_hook=_unique_object
-                )
+                header = json.loads(source.read(length), object_pairs_hook=_unique_object)
             for name in keys:
                 if key_prefix is not None and not name.startswith(key_prefix):
                     continue
@@ -111,9 +107,7 @@ class CheckpointTensorStore:
                     8 + length + start,
                     "",
                 )
-                entries[name] = TensorEntry(
-                    **{**asdict(entry), "payload_digest": _stream(entry)}
-                )
+                entries[name] = replace(entry, payload_digest=_stream(entry))
         _coverage(entries, expected_keys)
         return cls(entries)
 
@@ -175,24 +169,39 @@ def _tensor(store, name):
     if entry.byte_length == 0:
         return torch.empty(entry.shape, dtype=dtype)
     # Own the backing storage; neither the immutable entry nor a mapped file is mutated.
-    return torch.frombuffer(bytearray(store.read(name)), dtype=dtype).reshape(
-        entry.shape
-    )
+    return torch.frombuffer(bytearray(store.read(name)), dtype=dtype).reshape(entry.shape)
+
+
+def _decode_fp8(weight, scale, row_block):
+    rows, columns = weight.shape
+    expected = ((rows + row_block - 1) // row_block, (columns + 31) // 32)
+    if tuple(scale.shape) != expected:
+        raise ValueError(f"scale shape mismatch: {tuple(scale.shape)} != {expected}")
+    padded = torch.zeros(expected[0] * row_block, expected[1] * 32, dtype=weight.dtype)
+    padded[:rows, :columns] = weight
+    return dequantize_block_fp8(padded, scale, (row_block, 32))[:rows, :columns]
+
+
+def _decode_fp4(weight, scale, row_block):
+    if weight.shape[-1] % 16:
+        raise ValueError("packed FP4 width must be divisible by 16")
+    return dequantize_mxfp4(weight, scale)
+
+
+# Checkpoint format -> (default row block, decoder). Activations' group16/E4M3
+# QAT is a different contract; serialized expert FP4 here uses group32/E8M0.
+_CODECS = {torch.int8: (1, _decode_fp4), torch.float8_e4m3fn: (32, _decode_fp8)}
+_PLAIN = (torch.float32, torch.bfloat16, torch.float16)
 
 
 def load_weight(store, name, *, output_dtype=torch.bfloat16):
-    """Decode one weight with its exact scale sibling, or reload a plain export.
-
-    This is a CPU numerical binding, not the runtime FP8 activation/GEMM path.
-    Engram tables use row-by-32 scales; ordinary matrices use 32-by-32 scales.
-    """
-    if output_dtype not in (torch.float32, torch.bfloat16, torch.float16):
+    """Decode the declared storage format; plain exports have no scale sibling."""
+    if output_dtype not in _PLAIN:
         raise TypeError("output dtype must be F32, BF16 or F16")
     if not name.endswith(".weight"):
         raise ValueError("load_weight requires an explicit .weight key")
-    weight = _tensor(store, name)
-    scale_name = name[:-6] + "scale"
-    if weight.dtype in (torch.bfloat16, torch.float16, torch.float32):
+    weight, scale_name = _tensor(store, name), name[:-6] + "scale"
+    if weight.dtype in _PLAIN:
         if scale_name in store.entries:
             raise ValueError(f"unexpected scale for plain weight: {name}")
         result = weight.float()
@@ -206,28 +215,10 @@ def load_weight(store, name, *, output_dtype=torch.bfloat16):
             raise TypeError("release scales must be E8M0")
         if not torch.isfinite(scale.float()).all():
             raise ValueError("nonfinite release scale")
-        if weight.dtype == torch.int8:
-            if weight.shape[-1] % 16:
-                raise ValueError("packed FP4 width must be divisible by 16")
-            result = dequantize_mxfp4(weight, scale)
-        elif weight.dtype == torch.float8_e4m3fn:
-            rows, columns = weight.shape
-            row_block = 1 if name.endswith(".engram.embed.weight") else 32
-            expected = ((rows + row_block - 1) // row_block, (columns + 31) // 32)
-            if tuple(scale.shape) != expected:
-                raise ValueError(
-                    f"scale shape mismatch: {tuple(scale.shape)} != {expected}"
-                )
-            # Reuse the aligned primitive, allowing a final partially occupied block.
-            padded = torch.zeros(
-                expected[0] * row_block, expected[1] * 32, dtype=weight.dtype
-            )
-            padded[:rows, :columns] = weight
-            result = dequantize_block_fp8(padded, scale, (row_block, 32))[
-                :rows, :columns
-            ]
-        else:
+        if weight.dtype not in _CODECS:
             raise TypeError(f"unsupported weight dtype: {weight.dtype}")
+        row_block, decode = _CODECS[weight.dtype]
+        result = decode(weight, scale, 1 if name.endswith(".engram.embed.weight") else row_block)
     result = result.to(output_dtype)
     if not torch.isfinite(result).all():
         raise ValueError(f"nonfinite decoded weight: {name}")
@@ -238,8 +229,6 @@ def load_weight(store, name, *, output_dtype=torch.bfloat16):
 # Header validation is separate from key-only topology checks: the latter never
 # claim to have inspected release payloads or release tensor dimensions.
 def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
-    from dataclasses import replace
-
     records = list(records)
     names, headers = [], {}
     for record in records:
@@ -297,9 +286,7 @@ def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
                 elif dtype not in ('F32', 'BF16', 'F16'):
                     raise ValueError(f'unsupported dtype: {name}: {dtype}')
             if tuple(header['shape']) != shape:
-                raise ValueError(
-                    f'checkpoint shape mismatch: {name}: {header["shape"]} != {shape}'
-                )
+                raise ValueError(f'checkpoint shape mismatch: {name}: {header["shape"]} != {shape}')
         result[name] = replace(binding, header=header, store=store)
     model.validate_parameter_bindings()
     model.checkpoint_bindings = result
@@ -320,9 +307,7 @@ def export_model(model):
     from .engram import EngramTable
 
     if model.local_layer_range != (0, len(model.layers)):
-        raise NotImplementedError(
-            'Pipeline stage export requires distributed checkpoint assembly'
-        )
+        raise NotImplementedError('Pipeline stage export requires distributed checkpoint assembly')
     model.validate_parameter_bindings()
     for name, binding in model.tensor_bindings.items():
         if binding.role == 'scale':
@@ -345,9 +330,7 @@ def save_model(model, path):
     archive = model.archival_store
     required = set(model.archival_bindings)
     if archive is None or not required <= archive.entries.keys():
-        raise ValueError(
-            'Complete MTP/vision/aligner archival storage is required for export'
-        )
+        raise ValueError('Complete MTP/vision/aligner archival storage is required for export')
     if archive.entries.keys() - model.archival_bindings.keys():
         raise ValueError('Unknown archival keys')
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -372,9 +355,7 @@ def save_model(model, path):
                 stream.write(raw)
         CheckpointTensorStore(entries).save(staging / 'model.safetensors')
         spool.unlink()
-        (staging / 'config.json').write_text(
-            json.dumps(model.config.to_hf_dict(), indent=2) + '\n'
-        )
+        (staging / 'config.json').write_text(json.dumps(model.config.to_hf_dict(), indent=2) + '\n')
         os.rename(staging, path)
     except BaseException:
         shutil.rmtree(staging)
@@ -401,10 +382,7 @@ def load_model(model, path):
             expected = list(json.loads(source.read(size)))
         expected = [name for name in expected if name != '__metadata__']
     store = CheckpointTensorStore.load(paths, expected_keys=expected)
-    records = [
-        dict(name=name, dtype=e.dtype, shape=e.shape)
-        for name, e in store.entries.items()
-    ]
+    records = [dict(name=name, dtype=e.dtype, shape=e.shape) for name, e in store.entries.items()]
     bindings = bind_checkpoint(model, records, store=store)
     for name, binding in bindings.items():
         if binding.role in ('archival', 'scale'):
@@ -412,22 +390,12 @@ def load_model(model, path):
         target = binding.tensor
         if target.is_meta:
             raise ValueError('Materialize the model before loading checkpoint tensors')
-        if isinstance(binding.owner, EngramTable):
-            table = binding.owner
-            if table.master is None:
-                if store.entries[name].dtype != 'F8_E4M3':
-                    raise ValueError('Frozen Engram requires FP8 table storage')
-                table.weight.copy_(_tensor(store, name).to(table.weight.device))
-                table.scale.copy_(
-                    _tensor(store, name[:-6] + 'scale').to(table.scale.device)
-                )
-            else:
-                table.master.copy_(
-                    load_weight(store, name, output_dtype=torch.float32).to(
-                        table.master.device
-                    )
-                )
-                table.refresh_storage()
+        table = binding.owner if isinstance(binding.owner, EngramTable) else None
+        if table is not None and table.master is None:
+            if store.entries[name].dtype != 'F8_E4M3':
+                raise ValueError('Frozen Engram requires FP8 table storage')
+            for key, destination in ((name, table.weight), (name[:-6] + 'scale', table.scale)):
+                destination.copy_(_tensor(store, key).to(destination.device))
         else:
             value = (
                 load_weight(store, name, output_dtype=target.dtype)
@@ -435,10 +403,8 @@ def load_model(model, path):
                 else _tensor(store, name)
             )
             target.copy_(value.to(target.device))
+            if table is not None:
+                table.refresh_storage()
     model.archival_store = CheckpointTensorStore(
-        {
-            name: e
-            for name, e in store.entries.items()
-            if bindings[name].role == 'archival'
-        }
+        {name: e for name, e in store.entries.items() if bindings[name].role == 'archival'}
     )
