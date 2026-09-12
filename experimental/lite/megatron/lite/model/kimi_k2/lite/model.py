@@ -11,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from megatron.lite.model.kimi_k2.config import KimiK2Config
 from megatron.lite.primitive import transformer_engine as te
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl
 from megatron.lite.primitive.modules.attention import MultiLatentAttention
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -21,6 +20,12 @@ from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entro
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
 from megatron.lite.primitive.ops.sp_ops import ReduceScatterDim0
+
+# Keep SwiGLU JIT initialization after attention/expert module initialization.
+# isort: off
+from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl
+
+# isort: on
 from megatron.lite.primitive.parallel import (
     ColumnParallelLinear,
     ParallelState,

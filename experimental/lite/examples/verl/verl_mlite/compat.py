@@ -1210,11 +1210,16 @@ def _instrument_bucketed_weight_sender(sender_cls: type) -> bool:
 
     import torch
     import torch.distributed as dist
+
+    # Check the private API before checkpoint imports initialize global state.
+    # isort: off
+    from torch.utils._python_dispatch import TorchDispatchMode
     from megatron.lite.primitive.ckpt.weight_sync_probe import (
         get_weight_sync_probe,
         weight_sync_probe_session,
     )
-    from torch.utils._python_dispatch import TorchDispatchMode
+
+    # isort: on
 
     probe = get_weight_sync_probe()
     original_init_socket = sender_cls._init_socket

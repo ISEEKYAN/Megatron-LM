@@ -13,6 +13,12 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+
+# Resolve DTensor before contract modules allocate their global context state.
+# isort: off
+from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
+
+# isort: on
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import (
@@ -26,7 +32,6 @@ from megatron.lite.runtime.contracts.loss import (
     split_loss_context,
     use_loss_context,
 )
-from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):

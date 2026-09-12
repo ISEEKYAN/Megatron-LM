@@ -5,6 +5,10 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+# Initialize TE before Core imports and its optional-kernel fallback.
+# isort: off
+from megatron.lite.primitive import transformer_engine as te
+
 # Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core. The
 # lite CSA module reuses Core's differentiable kernels, CP row-mapping utilities,
 # and CuTeDSL layout kernels rather than vendoring them; see the module docstring
@@ -12,15 +16,14 @@ import torch.nn as nn
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.experimental_attention_variant import (
     csa_cp_layout_kernels,
-)
-from megatron.core.transformer.experimental_attention_variant import (
     csa_cp_utils as cp_utils,
 )
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
-from megatron.lite.primitive import transformer_engine as te
+
+# isort: on
 
 # MCore moved the fused CSA entry points in the development branch. Keep the
 # Lite adapter compatible with both layouts while downstream snapshots migrate.
