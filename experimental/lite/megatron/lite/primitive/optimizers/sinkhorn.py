@@ -72,31 +72,6 @@ def sinkhorn_direction(nesterov, *, row_group=None, column_group=None, trace=Non
     return update * math.sqrt(columns.item())
 
 
-def algorithm1_update(
-    weight: torch.Tensor,
-    momentum: torch.Tensor,
-    gradient: torch.Tensor,
-    *,
-    lr: float,
-    beta: float = 0.95,
-    multiplier: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One exact local Algorithm-1 update, returning ``(W_next, M, N)``."""
-    if any(
-        x.shape != weight.shape or x.dtype != torch.float32
-        for x in (momentum, gradient)
-    ):
-        raise ValueError('Algorithm 1 requires matching FP32 momentum and gradient')
-    if weight.ndim != 2 or not all(math.isfinite(x) for x in (lr, beta, multiplier)):
-        raise ValueError('Invalid Algorithm 1 inputs')
-    if not 0 <= beta < 1 or lr < 0:
-        raise ValueError('Invalid Algorithm 1 hyperparameters')
-    m = beta * momentum + (1 - beta) * gradient
-    n = beta * m + (1 - beta) * gradient
-    direction = sinkhorn_direction(n)
-    return weight - (GAMMA * lr * multiplier) * direction, m, n
-
-
 def _span(rows, parts, rank):
     size, extra = divmod(rows, parts)
     begin = rank * size + min(rank, extra)

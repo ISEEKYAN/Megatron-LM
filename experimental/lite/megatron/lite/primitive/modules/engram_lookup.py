@@ -10,22 +10,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-
-class _GatherRows(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, master, route):
-        ctx.route = route
-        ctx.shape = master.shape
-        return route.return_rows(master[route.local_ids])
-
-    @staticmethod
-    def backward(ctx, gradient):
-        route = ctx.route
-        ordered = gradient[route.order].contiguous()
-        received = route.exchange(ordered, route.send_counts, route.recv_counts)
-        result = received.new_zeros(ctx.shape)
-        result.index_add_(0, route.local_ids, received)
-        return result, None
+from .moe import _AllToAll
 
 
 class _Route:
@@ -39,11 +24,7 @@ class _Route:
     def exchange(self, tensor, send_counts, recv_counts):
         if self.group is None:
             return tensor
-        result = tensor.new_empty((sum(recv_counts), *tensor.shape[1:]))
-        dist.all_to_all_single(
-            result, tensor.contiguous(), recv_counts, send_counts, group=self.group
-        )
-        return result
+        return _AllToAll.apply(tensor, send_counts, recv_counts, self.group)
 
     def return_rows(self, rows):
         ordered = self.exchange(rows, self.recv_counts, self.send_counts)
@@ -153,7 +134,9 @@ class RowLookup:
         scale = scale.view(scales.dtype).reshape(*shape, scales.shape[1])
         floating = None
         if master is not None:
-            floating = _GatherRows.apply(master, route).reshape(*shape, values.shape[1])
+            floating = route.return_rows(master[route.local_ids]).reshape(
+                *shape, values.shape[1]
+            )
         return raw, scale, floating
 
     def raw_rows(self, values, scales, ids):
