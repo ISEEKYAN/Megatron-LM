@@ -76,10 +76,7 @@ def test_thd_rank_indices_rejects_indivisible_length():
 
 
 # --------------------------------------------------------------------- gloo round-trip
-def _reshuffle_worker(rank, world, cu_list, port, results):
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(world)
-    )
+def _reshuffle_worker(rank, world, cu_list, rendezvous, results):
     import torch.distributed as dist
 
     from megatron.lite.primitive.parallel.cp import (
@@ -87,7 +84,7 @@ def _reshuffle_worker(rank, world, cu_list, port, results):
         zigzag_to_contiguous_chunks,
     )
 
-    dist.init_process_group("gloo", rank=rank, world_size=world)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world)
     group = dist.new_group(list(range(world)))
     try:
         cu = torch.tensor(cu_list, dtype=torch.long)
@@ -118,12 +115,13 @@ def _reshuffle_worker(rank, world, cu_list, port, results):
         (2, [0, 16, 24], 29632),
     ],
 )
-def test_thd_reshuffle_roundtrip_gloo(cp, cu, port):
+def test_thd_reshuffle_roundtrip_gloo(cp, cu, port, tmp_path):
     import torch.multiprocessing as mp
 
     mgr = multiprocessing.Manager()
     results = mgr.list()
-    mp.spawn(_reshuffle_worker, args=(cp, cu, port, results), nprocs=cp, join=True)
+    rendezvous = f"file://{tmp_path}/rdzv-{os.environ.get('SLURM_JOB_ID', 'cpu')}-{port}"
+    mp.spawn(_reshuffle_worker, args=(cp, cu, rendezvous, results), nprocs=cp, join=True)
     assert len(results) == cp, f"missing ranks: {list(results)}"
     for rank, fwd, rt in results:
         assert fwd == 0.0, f"rank{rank} zigzag->contiguous not bitwise: max_abs={fwd}"
