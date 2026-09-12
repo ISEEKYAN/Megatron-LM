@@ -8,6 +8,7 @@ import os
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 
+from megatron.lite.primitive.modules.ep_participation import check_ep_participation
 from megatron.lite.primitive.modules.moe import _AllToAll
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
@@ -324,6 +325,7 @@ class TokenDispatcher:
         return result
 
     def _dispatch_alltoall(self, hidden_states, topk_scores, topk_indices):
+        check_ep_participation(self.ps.ep_group, "dispatch.metadata")
         t, h = hidden_states.shape
         e = self.num_experts
 
