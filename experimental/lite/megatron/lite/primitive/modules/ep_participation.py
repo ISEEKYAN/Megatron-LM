@@ -19,13 +19,11 @@ _TIMEOUT = 10.0
 
 
 class _Participation:
-    def __init__(self, group):
-        # Reuse the group's namespace: no extra collective or group creation on
-        # a rank-local dispatch path, so an absent rank need not run this code.
-        self.store = dist.PrefixStore("mlite_ep_participation", _get_process_group_store(group))
-        self.ranks = dist.get_process_group_ranks(group)
-        self.keys = [str(rank) for rank in self.ranks]
-        self.key = str(dist.get_rank())
+    def __init__(self, store, ranks, rank):
+        self.store = store
+        self.ranks = ranks
+        self.keys = [str(r) for r in ranks]
+        self.key = str(rank)
         self.sequence, self.phase, self.failure, self.ready = 0, "", None, False
 
     def _records(self):
@@ -84,6 +82,9 @@ def check_ep_participation(group, phase):
         return None
     state = _participation.get(group)
     if state is None:
-        state = _Participation(group)
+        # Reuse the group's namespace: no extra collective or group creation on
+        # a rank-local dispatch path, so an absent rank need not run this code.
+        store = dist.PrefixStore("mlite_ep_participation", _get_process_group_store(group))
+        state = _Participation(store, dist.get_process_group_ranks(group), dist.get_rank())
         _participation[group] = state
     return state.check(phase)
