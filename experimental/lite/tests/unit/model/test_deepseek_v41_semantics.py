@@ -247,10 +247,14 @@ def test_v41_ced_boundaries_match_pinned_official_oracle(dtype, length, monkeypa
 
     root = Path(__file__).resolve().parents[3]
     monkeypatch.syspath_prepend(str(root / "tools/deepseek_v41"))
+    import os
+
     from fixtures import REFERENCE_SHA256, dense_values, reduced_overrides
     from oracle import Recorder
 
-    reference = root / "tests/fixtures/deepseek_v41/reference"
+    reference = Path(
+        os.environ.get("DS41_REFERENCE_DIR", "/tmp/ds41-fixture-reference")
+    )
     for name in ("model.py", "config.json", "inference_config.json"):
         assert (
             hashlib.sha256((reference / name).read_bytes()).hexdigest()
