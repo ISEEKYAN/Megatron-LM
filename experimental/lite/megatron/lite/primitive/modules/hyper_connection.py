@@ -73,7 +73,6 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        normalized = x.float() * torch.rsqrt(
-            x.float().square().mean(-1, keepdim=True) + self.eps
-        )
+        xf = x.float()
+        normalized = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
         return (normalized * self.weight).to(x.dtype)
