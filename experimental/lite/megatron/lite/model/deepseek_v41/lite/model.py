@@ -16,10 +16,10 @@ from .attention import AttentionState, CSA2Attention, Linear
 from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc
 from .checkpoint_store import validate_execution
 from .engram import Engram, EngramTable, NgramHash, hash_multipliers, prime_buckets
+from .image_data import TEXT, merge_image_embeddings
 from .moe import DeepseekV41MoE, ModalityRouter, SwiGLUExpert
 from .packing import packed_forward
-from .vision import ViT, Aligner
-from .image_data import merge_image_embeddings, TEXT
+from .vision import Aligner, ViT
 
 
 @dataclass(frozen=True)
@@ -287,9 +287,13 @@ class DeepseekV41Model(nn.Module):
                 module = getattr(self, root)
                 for name, parameter in module.named_parameters():
                     path, attribute = name.rsplit('.', 1)
-                    self._bind(root + '.' + name, module.get_submodule(path), attribute, root)
+                    self._bind(
+                        root + '.' + name, module.get_submodule(path), attribute, root
+                    )
             for key in ('image_start', 'image_end', 'image_newline'):
-                self.register_parameter(key, nn.Parameter(torch.zeros(t['hidden_size'])))
+                self.register_parameter(
+                    key, nn.Parameter(torch.zeros(t['hidden_size']))
+                )
                 self._bind(key, self, key, 'image_delimiter')
         self.mtp = DeferredModule('DSpark')
         for root, key in self._archive_keys(t, v):
@@ -459,8 +463,12 @@ class DeepseekV41Model(nn.Module):
         hashes = None
         if self.engram_layer_ids:
             if self.engram_hash is None:
-                raise ValueError('Engram execution requires an explicit tokenizer token_map')
-            hashes = self.engram_hash(input_ids, None if image_mask is None else ~image_mask)
+                raise ValueError(
+                    'Engram execution requires an explicit tokenizer token_map'
+                )
+            hashes = self.engram_hash(
+                input_ids, None if image_mask is None else ~image_mask
+            )
         state = AttentionState()
         for index, layer in enumerate(self.layers):
             if layer.engram is not None:
@@ -568,7 +576,11 @@ class DeepseekV41Model(nn.Module):
     def forward(self, input_ids, *, cu_seqlens=None, images=None, token_types=None):
         if self.local_layer_range != (0, len(self.layers)):
             raise RuntimeError('A local pipeline stage requires the range protocol')
-        if input_ids.ndim != 2 or input_ids.dtype != torch.int64 or not input_ids.shape[1]:
+        if (
+            input_ids.ndim != 2
+            or input_ids.dtype != torch.int64
+            or not input_ids.shape[1]
+        ):
             raise ValueError('Expected nonempty int64 input_ids [B,S]')
         embeddings = self.embed(input_ids)
         image_mask = None
@@ -584,9 +596,11 @@ class DeepseekV41Model(nn.Module):
                             a <= img.start and img.start + img.types.numel() <= b
                             for a, b in zip(boundaries, boundaries[1:])
                         ):
-                            raise ValueError('Image span crosses a packed sequence boundary')
-                    expected_types[batch, img.start : img.start + img.types.numel()] = img.types.to(
-                        input_ids.device
+                            raise ValueError(
+                                'Image span crosses a packed sequence boundary'
+                            )
+                    expected_types[batch, img.start : img.start + img.types.numel()] = (
+                        img.types.to(input_ids.device)
                     )
             if token_types is not None and not torch.equal(
                 token_types.to(input_ids.device), expected_types
@@ -601,10 +615,17 @@ class DeepseekV41Model(nn.Module):
             embeddings = embeddings.to(self.residual_dtype)
         hidden, pre = expand_hc(embeddings, self.hc_mult)
         if cu_seqlens is None:
-            hidden, pre = self._sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
+            hidden, pre = self._sequence(
+                hidden, pre, input_ids=input_ids, image_mask=image_mask
+            )
         else:
             hidden, pre = packed_forward(
-                self._sequence, hidden, pre, cu_seqlens, input_ids=input_ids, image_mask=image_mask
+                self._sequence,
+                hidden,
+                pre,
+                cu_seqlens,
+                input_ids=input_ids,
+                image_mask=image_mask,
             )
         hidden = self.norm(contract_hc(hidden, pre))
         return {'logits': F.linear(hidden.float(), self.head.weight.float())}
@@ -616,7 +637,10 @@ class DeepseekV41Model(nn.Module):
 
     def merge_image_embeddings(self, images, h):
         features = [
-            [self.encode_image(img.patches, img.n_vit_h, img.n_vit_w) for img in sample or ()]
+            [
+                self.encode_image(img.patches, img.n_vit_h, img.n_vit_w)
+                for img in sample or ()
+            ]
             for sample in images
         ]
         return merge_image_embeddings(

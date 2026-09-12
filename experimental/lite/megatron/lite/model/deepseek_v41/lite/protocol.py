@@ -31,6 +31,7 @@ class ImplConfig:
     quantized: bool = True
     token_map: list[int] | None = None
     trainable_engram: bool = False
+    text_only: bool = True
     gate_temperature: float = 1.0
     bias_rate: float = 0.001
     enable_dspark_execution: bool = False
@@ -79,7 +80,9 @@ def build_model(model_cfg, *, impl_cfg):
             'Data parallel construction requires the distributed integration'
         )
     if p.pp > 1 and impl_cfg.optimizer is not None:
-        raise NotImplementedError('Pipeline optimizer construction requires distributed routing integration')
+        raise NotImplementedError(
+            'Pipeline optimizer construction requires distributed routing integration'
+        )
     if impl_cfg.optimizer not in (None, 'muon'):
         raise ValueError('V4.1 optimizer must be explicitly selected as muon')
     if impl_cfg.optimizer is None and impl_cfg.optimizer_config is not None:
@@ -117,6 +120,10 @@ def build_model(model_cfg, *, impl_cfg):
             module.output_dtype = impl_cfg.dtype
     if model.engram_hash is not None:
         model.engram_hash.to(device=impl_cfg.device)
+    if impl_cfg.text_only:
+        for binding in model.parameter_bindings():
+            if binding.role in ('vision', 'aligner', 'image_delimiter'):
+                binding.tensor.requires_grad_(False)
     optimizer = None
     if impl_cfg.optimizer == 'muon':
         if impl_cfg.device == 'meta':
@@ -200,7 +207,8 @@ def _forward_step(model, batch):
     _validate_replay(model, batch)
     precision = (
         torch.autocast(device_type=batch.input_ids.device.type, enabled=False)
-        if hasattr(model, 'residual_dtype') else nullcontext()
+        if hasattr(model, 'residual_dtype')
+        else nullcontext()
     )
     with precision:
         logits = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens)['logits'][0]
@@ -215,7 +223,9 @@ def pipeline_forward_step(model, batch, *, start, end, payload=None, owners=(-1,
     """
     _validate_text_batch(batch)
     if batch.routed_experts is not None or batch.r3_replay_mask is not None:
-        raise NotImplementedError('Pipeline routing replay requires scheduler integration')
+        raise NotImplementedError(
+            'Pipeline routing replay requires scheduler integration'
+        )
     if batch.seq_lens.numel() != 1:
         raise NotImplementedError(
             'Pipeline packed sequences require per-sample state routing'
@@ -238,7 +248,9 @@ def packed_pipeline_forward_step(model, batch, *, start, end, state=None):
     """
     _validate_text_batch(batch)
     if batch.routed_experts is not None or batch.r3_replay_mask is not None:
-        raise NotImplementedError('Pipeline routing replay requires scheduler integration')
+        raise NotImplementedError(
+            'Pipeline routing replay requires scheduler integration'
+        )
     lengths = batch.seq_lens.tolist()
     if not lengths or any(length <= 0 for length in lengths):
         raise ValueError('Packed pipeline requires positive sequence lengths')
