@@ -8,7 +8,7 @@ import math
 import torch
 import torch.distributed as dist
 
-from .headwise_muon import StagedMatrixOptimizer
+from .headwise_muon import StagedMatrixOptimizer, _parameters
 
 K = 11
 TAU = 1e-3
@@ -34,14 +34,10 @@ def sinkhorn_direction(nesterov, *, row_group=None, column_group=None, trace=Non
     if nesterov.ndim != 2 or nesterov.dtype != torch.float32:
         raise ValueError('Sinkhorn requires an FP32 matrix [m, n]')
     rows = _reduce(torch.tensor(nesterov.shape[0], device=nesterov.device), row_group)
-    columns = _reduce(
-        torch.tensor(nesterov.shape[1], device=nesterov.device), column_group
-    )
+    columns = _reduce(torch.tensor(nesterov.shape[1], device=nesterov.device), column_group)
     if rows.item() <= 0 or columns.item() <= 0:
         raise ValueError('Sinkhorn requires a nonempty logical matrix')
-    if _any(
-        not torch.isfinite(nesterov).all(), nesterov.device, row_group, column_group
-    ):
+    if _any(not torch.isfinite(nesterov).all(), nesterov.device, row_group, column_group):
         raise ValueError('Sinkhorn requires a finite logical matrix')
 
     def norm(matrix, axis):
@@ -83,21 +79,17 @@ class Sinkhorn(StagedMatrixOptimizer):
 
     """FP32 Algorithm 1 with replica-sharded momentum and staged publication."""
 
-    def __init__(
-        self, params, *, lr, row_group=None, column_group=None, replica_group=None
-    ):
+    def __init__(self, params, *, lr, row_group=None, column_group=None, replica_group=None):
         super().__init__(params, dict(lr=lr, multiplier=1.0))
         self.row_group = row_group
         self.column_group = column_group
         self.replica_group = replica_group
-        self.replica_size = (
-            1 if replica_group is None else dist.get_world_size(replica_group)
-        )
+        self.replica_size = 1 if replica_group is None else dist.get_world_size(replica_group)
         self.replica_rank = 0 if replica_group is None else dist.get_rank(replica_group)
         self._prepared = None
         if self.replica_size > 1 and row_group is None:
             raise ValueError('Replica-owned rows require a logical row group')
-        parameters = [p for group in self.param_groups for p in group['params']]
+        parameters = _parameters(self)
         if len({id(p) for p in parameters}) != len(parameters):
             raise ValueError('Each Sinkhorn parameter owner must appear once')
         for group in self.param_groups:
@@ -112,9 +104,7 @@ class Sinkhorn(StagedMatrixOptimizer):
                     any(g is not None for g in (row_group, column_group, replica_group))
                     and not parameter.is_cuda
                 ):
-                    raise ValueError(
-                        'Distributed Sinkhorn requires resident CUDA state'
-                    )
+                    raise ValueError('Distributed Sinkhorn requires resident CUDA state')
 
     def _gradient_shard(self, gradient):
         if self.replica_group is None:
@@ -126,9 +116,7 @@ class Sinkhorn(StagedMatrixOptimizer):
             start, end = _span(rows, self.replica_size, rank)
             packed[rank, : end - start].copy_(gradient[start:end])
         result = gradient.new_empty(width, columns)
-        dist.reduce_scatter_tensor(
-            result, packed.flatten(0, 1), group=self.replica_group
-        )
+        dist.reduce_scatter_tensor(result, packed.flatten(0, 1), group=self.replica_group)
         start, end = _span(rows, self.replica_size, self.replica_rank)
         return result[: end - start]
 
@@ -140,11 +128,12 @@ class Sinkhorn(StagedMatrixOptimizer):
         padded[: shard.shape[0]].copy_(shard)
         gathered = [torch.empty_like(padded) for _ in range(self.replica_size)]
         dist.all_gather(gathered, padded, group=self.replica_group)
-        pieces = []
-        for rank, value in enumerate(gathered):
-            start, end = _span(rows, self.replica_size, rank)
-            pieces.append(value[: end - start])
-        return torch.cat(pieces)
+        return torch.cat(
+            [
+                value[: rows // self.replica_size + (rank < rows % self.replica_size)]
+                for rank, value in enumerate(gathered)
+            ]
+        )
 
     @torch.no_grad()
     def prepare_step(self):
@@ -202,9 +191,7 @@ class Sinkhorn(StagedMatrixOptimizer):
                 self.column_group,
             ):
                 return False
-            prepared.append(
-                (parameter, self._replicate(candidate, parameter.shape[0]), momentum)
-            )
+            prepared.append((parameter, self._replicate(candidate, parameter.shape[0]), momentum))
         self._prepared = prepared
         return True
 
@@ -231,17 +218,11 @@ class Sinkhorn(StagedMatrixOptimizer):
         current = self.state_dict()['sinkhorn_layout']
         if state_dict.get('sinkhorn_layout') != current:
             raise ValueError('Sinkhorn checkpoint layout differs; reshard explicitly')
-        saved_ids = [
-            pid for group in state_dict['param_groups'] for pid in group['params']
-        ]
-        parameters = [p for group in self.param_groups for p in group['params']]
+        saved_ids = [pid for group in state_dict['param_groups'] for pid in group['params']]
+        parameters = _parameters(self)
         if len(saved_ids) != len(parameters):
             raise ValueError('Sinkhorn checkpoint parameter count differs')
         for pid, parameter in zip(saved_ids, parameters):
             start, end = _span(parameter.shape[0], self.replica_size, self.replica_rank)
-            self._validate_momentum(
-                state_dict['state'].get(pid), (end - start, parameter.shape[1])
-            )
-        super().load_state_dict(
-            {k: v for k, v in state_dict.items() if k != 'sinkhorn_layout'}
-        )
+            self._validate_momentum(state_dict['state'].get(pid), (end - start, parameter.shape[1]))
+        super().load_state_dict({k: v for k, v in state_dict.items() if k != 'sinkhorn_layout'})
