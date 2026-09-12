@@ -198,13 +198,21 @@ single-rank implementation, without distributed external-encoder replication
 or overlap.
 
 The model state dict persists the mask. Restore it before constructing optimizer
-groups. Mixed-optimizer integration is not yet available with active visual
-owners: the current optimizer dependency only accepts frozen visual owners.
-The integration tests intentionally remain red until the optimizer provides
-explicit visual LR/decay policy, physical-owner Q/K-head and whole-V partitions,
-and stage reconfiguration preserving common-owner state. Pending visual backward
-must also prevent optimizer stepping and saving. These are required integration
-contracts, not capabilities supplied by the schedule itself.
+groups. `OptimizerConfig(..., vision_policy=VisionOptimizerConfig(
+encoder_lr_multiplier=0.5, image_vector_lr_multiplier=1.0,
+image_vector_weight_decay=0.0))` selects explicit post-training rates; these
+example values are caller policy, not official pretraining defaults.
+The existing object-based router covers visual linears and the aligner with
+Muon, norms and biases with AdamW, and one-dimensional delimiters with AdamW.
+Fused Q/K are partitioned by head; V and fused gate/up retain their physical
+matrix layout. Every visual linear validates physical axes and element count.
+Unknown owners and aliases fail closed; no parameter-name dispatch is used.
+
+Use `optimizer.zero_grad()` then `optimizer.reconfigure_vision(mask)` at a
+completed microbatch boundary to change stages. Common physical owners retain
+their optimizer state; frozen owners release state and newly active owners
+start with empty state. Pending visual backward prevents optimizer step/save/load.
+A mask changed outside this operation rejects stale optimizer groups.
 
 Runtime-owned SFT normalization uses the total valid-token denominator
 across microbatches; external RL losses retain responsibility for their own

@@ -148,7 +148,6 @@ def build_model(model_cfg, *, impl_cfg):
             if p.requires_grad:
                 p.data = p.data.float()
                 p.main_grad = None
-                p.register_post_accumulate_grad_hook(_publish_main_grad)
         model.residual_dtype = impl_cfg.dtype
         optimizer = V41Optimizer(model, impl_cfg.optimizer_config)
     if impl_cfg.external_vision_device is not None:
@@ -168,12 +167,6 @@ def build_model(model_cfg, *, impl_cfg):
             'parameter_bindings': model.parameter_bindings,
         },
     )
-
-
-def _publish_main_grad(parameter):
-    if parameter.grad.dtype != torch.float32:
-        raise RuntimeError('V4.1 gradient producer did not return native FP32')
-    parameter.main_grad = parameter.grad
 
 
 def prepare_microbatches(data_iter, count):

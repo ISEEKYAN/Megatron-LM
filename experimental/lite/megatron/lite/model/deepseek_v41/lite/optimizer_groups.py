@@ -3,7 +3,7 @@
 
 Release keys are audit labels, never dispatch inputs. Unknown active objects
 fail closed. Vision execution/its explicit trainability mask belong to the
-multimodal assembly; archival vision/MTP owners allocate no optimizer state.
+multimodal assembly; frozen visual and archival MTP owners allocate no state.
 """
 
 import math
@@ -17,14 +17,34 @@ from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
 
 
 @dataclass(frozen=True)
+class VisionOptimizerConfig:
+    """Caller-selected post-training LR/decay, not pretraining defaults.
+
+    Image vectors retain the DS4 non-matrix AdamW representation. They are
+    never reshaped into Muon/Sinkhorn matrices. All numeric policy is explicit.
+    """
+
+    encoder_lr_multiplier: float
+    image_vector_lr_multiplier: float
+    image_vector_weight_decay: float
+
+    def __post_init__(self):
+        if any(not math.isfinite(value) or value < 0 for value in vars(self).values()):
+            raise ValueError(
+                'Visual optimizer policy requires finite nonnegative values'
+            )
+
+
+@dataclass(frozen=True)
 class OptimizerConfig:
     lr: float
     ns_steps: int
     coefficient_type: str
     clip_grad: float = 1.0
+    vision_policy: VisionOptimizerConfig | None = None
 
 
-def parameter_groups(model, *, lr):
+def parameter_groups(model, *, lr, vision_policy=None):
     if not math.isfinite(lr) or lr < 0:
         raise ValueError('Invalid base learning rate')
     model.validate_parameter_bindings()
@@ -34,7 +54,17 @@ def parameter_groups(model, *, lr):
         raise ValueError('Unexpected parameter alias in module tree')
     groups, seen = [], set()
 
-    def add(p, algorithm, *, role, shape=None, multiplier=1, decay=0.1, heads=None):
+    def add(
+        p,
+        algorithm,
+        *,
+        role,
+        shape=None,
+        multiplier=1,
+        decay=0.1,
+        heads=None,
+        partitions=None
+    ):
         if id(p) in seen:
             raise ValueError('Duplicate optimizer owner')
         seen.add(id(p))
@@ -63,6 +93,7 @@ def parameter_groups(model, *, lr):
                 algorithm=algorithm,
                 owner_key=b.release_key,
                 matrix_shape=tuple(p.shape) if shape is None else tuple(shape),
+                matrix_partitions=partitions,
                 lr=lr * multiplier,
                 weight_decay=decay,
             )
@@ -132,23 +163,83 @@ def parameter_groups(model, *, lr):
             add(e.wkv.weight, 'muon', role='engram_projection', multiplier=5)
             for p in (e.q_weight, e.k_weight):
                 add(p, 'adamw', role='engram_norm', multiplier=5)
-    # F3a owners stay live for archive/export but text-only training freezes them.
-    for module, role in ((model.vision, 'vision'), (model.aligner, 'aligner')):
-        if module is not None:
-            for p in module.parameters():
-                if p.requires_grad:
-                    raise ValueError(
-                        'Trainable visual owners require multimodal optimizer routing'
-                    )
-                add(p, 'adamw', role=role)
-    for attribute in ('image_start', 'image_end', 'image_newline'):
-        p = getattr(model, attribute, None)
-        if p is not None:
-            if p.requires_grad:
-                raise ValueError(
-                    'Trainable image delimiters require multimodal optimizer routing'
-                )
-            add(p, 'adamw', role='image_delimiter')
+    # Enumerate live visual objects explicitly; frozen owners are still audited.
+    vision = model.vision
+    if hasattr(vision, 'patch_embed'):
+        encoder_active = any(
+            p.requires_grad
+            for module in (vision.patch_embed, vision.blocks)
+            for p in module.parameters()
+        )
+        vectors = (model.image_start, model.image_end, model.image_newline)
+        if (encoder_active or any(p.requires_grad for p in vectors)) and not isinstance(
+            vision_policy, VisionOptimizerConfig
+        ):
+            raise ValueError(
+                'Active encoder/image vectors require an explicit visual optimizer policy'
+            )
+        multiplier = vision_policy.encoder_lr_multiplier if encoder_active else 1
+
+        def visual_linear(module, role, *, multiplier=1, partitions=None):
+            shape = (module.out_features, module.in_features)
+            if math.prod(shape) != module.weight.numel() or tuple(module.weight.shape) != shape:
+                raise ValueError('Visual linear shape disagrees with physical owner')
+            if module.bias is not None and tuple(module.bias.shape) != (shape[0],):
+                raise ValueError('Visual bias shape disagrees with physical owner')
+            if partitions is not None and (
+                any(any(type(d) is not int or d < 1 for d in part) for part in partitions)
+                or sum(math.prod(part) for part in partitions) != module.weight.numel()
+                or any(part[-1] != shape[-1] for part in partitions)
+            ):
+                raise ValueError('Logical partitions disagree with visual matrix shape')
+            add(
+                module.weight,
+                'muon',
+                role=role,
+                shape=shape,
+                multiplier=multiplier,
+                partitions=partitions,
+            )
+            if module.bias is not None:
+                add(module.bias, 'adamw', role=role, multiplier=multiplier, decay=0)
+
+        visual_linear(vision.patch_embed.proj, 'vision', multiplier=multiplier)
+        for block in vision.blocks:
+            a = block.attn
+            dim = a.wqkv.in_features
+            partitions = (
+                (a.n_heads, a.head_dim, dim),
+                (a.n_heads, a.head_dim, dim),
+                (dim, dim),
+            )
+            visual_linear(
+                a.wqkv, 'vision', multiplier=multiplier, partitions=partitions
+            )
+            visual_linear(a.wo, 'vision', multiplier=multiplier)
+            # Inherit the existing fused physical gate/up matrix, without a new split.
+            for module in (block.mlp.w1, block.mlp.w2):
+                visual_linear(module, 'vision', multiplier=multiplier)
+            for module in (block.norm1, block.norm2):
+                add(module.weight, 'adamw', role='vision', multiplier=multiplier)
+        norm(vision.norm, 'vision')
+        for module in (model.aligner.w1, model.aligner.w2):
+            visual_linear(module, 'aligner')
+        for vector in vectors:
+            add(
+                vector,
+                'adamw',
+                role='image_delimiter',
+                multiplier=(
+                    vision_policy.image_vector_lr_multiplier
+                    if vector.requires_grad
+                    else 1
+                ),
+                decay=(
+                    vision_policy.image_vector_weight_decay
+                    if vector.requires_grad
+                    else 0
+                ),
+            )
     if seen != set(bindings):
         raise ValueError('Unknown parameter owner; no catch-all optimizer route')
     return groups
@@ -167,12 +258,22 @@ class V41Optimizer:
             raise TypeError('V4.1 requires an explicit model OptimizerConfig')
         if not math.isfinite(config.clip_grad) or config.clip_grad < 0:
             raise ValueError('Invalid gradient clipping threshold')
-        groups = parameter_groups(model, lr=config.lr)
+        groups = parameter_groups(
+            model, lr=config.lr, vision_policy=config.vision_policy
+        )
         if not groups or any(
             p.dtype != torch.float32 for g in groups for p in g['params']
         ):
             raise ValueError('V4.1 optimizer requires native FP32 parameter masters')
+        for group in groups:
+            for p in group['params']:
+                if not hasattr(p, '_v41_main_grad_hook'):
+                    p.main_grad = p.grad
+                    p._v41_main_grad_hook = p.register_post_accumulate_grad_hook(
+                        _publish_main_grad
+                    )
         self.config = config
+        self.model = model
         self.optimizers = []
         for algorithm in ('muon', 'sinkhorn', 'adamw'):
             selected = [g for g in groups if g['algorithm'] == algorithm]
@@ -198,6 +299,43 @@ class V41Optimizer:
             if b.engram is not None and b.engram.embed.master is not None
         ]
 
+    def reconfigure_vision(self, mask):
+        """Change a completed training stage, retaining common owners' momentum.
+
+        Frozen owners release their state. Newly trainable owners start with
+        empty state. This is an explicit post-training transition, not an
+        automatic pretraining unfreeze or LR schedule.
+        """
+        from .training import VisionTrainability
+
+        if not isinstance(mask, VisionTrainability):
+            raise TypeError('Expected explicit visual trainability mask')
+        self._validate_trainability()
+        if any(
+            p.grad is not None or getattr(p, 'main_grad', None) is not None
+            for p in self.model.parameters()
+        ):
+            raise RuntimeError('Zero gradients before changing the training stage')
+        previous = self.model.vision_trainability
+        try:
+            mask.apply(self.model)
+            candidate = type(self)(self.model, self.config)
+        except Exception:
+            previous.apply(self.model)
+            raise
+        old_states = {
+            (id(p), type(backend)): state
+            for backend in self.optimizers
+            for p, state in backend.state.items()
+        }
+        for backend in candidate.optimizers:
+            for group in backend.param_groups:
+                for p in group['params']:
+                    old = old_states.get((id(p), type(backend)))
+                    if old is not None:
+                        backend.state[p] = deepcopy(old)
+        self.optimizers, self.tables = candidate.optimizers, candidate.tables
+
     @property
     def param_groups(self):
         return [g for o in self.optimizers for g in o.param_groups]
@@ -209,8 +347,20 @@ class V41Optimizer:
             for p in group['params']:
                 p.main_grad = p.grad
 
+    def _validate_trainability(self):
+        schedule = getattr(self.model, 'vision_schedule', None)
+        if schedule is not None and schedule.stage != 'idle':
+            raise RuntimeError('Optimizer requires completed vision backward')
+        expected = {id(p) for p in self.model.parameters() if p.requires_grad}
+        actual = {id(p) for g in self.param_groups for p in g['params']}
+        if actual != expected:
+            raise ValueError(
+                'Trainability changed; rebuild optimizer groups before training'
+            )
+
     @torch.no_grad()
     def step(self):
+        self._validate_trainability()
         parameters = [p for g in self.param_groups for p in g['params']]
         gradients = [
             p.main_grad if getattr(p, 'main_grad', None) is not None else p.grad
@@ -295,6 +445,7 @@ class V41Optimizer:
                 p.grad, p.main_grad = grad, main
 
     def state_dict(self):
+        self._validate_trainability()
         return dict(
             owners=[g['owner_key'] for g in self.param_groups],
             clip_grad=self.config.clip_grad,
@@ -302,6 +453,7 @@ class V41Optimizer:
         )
 
     def load_state_dict(self, state):
+        self._validate_trainability()
         if state.get('clip_grad') != self.config.clip_grad:
             raise ValueError('Optimizer clipping contract differs')
         if state.get('owners') != [g['owner_key'] for g in self.param_groups] or len(
@@ -310,3 +462,9 @@ class V41Optimizer:
             raise ValueError('Optimizer owner layout differs')
         for backend, saved in zip(self.optimizers, state['optimizers']):
             backend.load_state_dict(saved)
+
+
+def _publish_main_grad(parameter):
+    if parameter.grad.dtype != torch.float32:
+        raise RuntimeError('V4.1 gradient producer did not return native FP32')
+    parameter.main_grad = parameter.grad

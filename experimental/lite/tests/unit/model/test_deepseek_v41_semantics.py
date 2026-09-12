@@ -3303,9 +3303,8 @@ def test_v41_unequal_microbatch_global_token_denominator(moe):
 
 @pytest.mark.gpus(2)
 def test_v41_external_two_device_optimizer_resume(moe):
-    assert (
-        torch.cuda.device_count() >= 2
-    ), 'Cross-device vision test requires two Slurm GPUs'
+    if torch.cuda.device_count() < 2:
+        pytest.skip('Requires the declared two-GPU allocation')
     with torch.device('cuda:0'):
         test_v41_external_mixed_optimizer_resume(
             moe, True, device='cuda:0', external_device='cuda:1'
@@ -3529,3 +3528,120 @@ def test_v41_multimodal_loss_individual_guard(moe, guard):
         with use_loss_context(LossContext(normalization_denominator=value)):
             with pytest.raises(ValueError, match='Loss denominator must be finite and positive'):
                 protocol._text_output(torch.randn(3, 256), batch)
+
+
+@pytest.mark.parametrize('fault', ['unknown', 'alias', 'matrix_axes', 'bias_shape', 'head_count'])
+def test_v41_visual_routing_rejects_unresolved_owner(moe, fault):
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import parameter_groups, VisionOptimizerConfig
+    from megatron.lite.model.deepseek_v41.lite.training import VisionTrainability
+
+    _, bundle = _assembly_bundle()
+    model = bundle.chunks[0]
+    VisionTrainability(True, True, True, True).apply(model)
+    if fault == 'unknown':
+        model.vision.register_parameter('unrouted', torch.nn.Parameter(torch.ones(3)))
+        model._bind('vision.unrouted', model.vision, 'unrouted', 'vision')
+        message = 'Unknown parameter owner'
+    elif fault == 'alias':
+        model.vision.register_parameter('alias', model.aligner.w1.weight)
+        message = 'alias|one release key|Duplicate'
+    elif fault == 'bias_shape':
+        p = model.aligner.w1.bias
+        p.data = torch.zeros(p.numel() + 1)
+        message = 'Visual bias shape'
+    elif fault == 'matrix_axes':
+        p = model.aligner.w1.weight
+        p.data = p.detach().T.contiguous()
+        message = 'Visual linear shape'
+    else:
+        model.vision.blocks[0].attn.n_heads += 1
+        message = 'Logical partitions'
+    with pytest.raises(ValueError, match=message):
+        parameter_groups(model, lr=0.001, vision_policy=VisionOptimizerConfig(0.5, 1.0, 0.0))
+
+
+def test_v41_visual_routing_ignores_names(moe, monkeypatch):
+    from dataclasses import replace
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import parameter_groups, VisionOptimizerConfig
+    from megatron.lite.model.deepseek_v41.lite.training import VisionTrainability
+
+    _, bundle = _assembly_bundle()
+    model = bundle.chunks[0]
+    VisionTrainability(True, True, True, True).apply(model)
+    labels = {id(model.aligner.w1.weight): 'decoy.norm.weight',
+              id(model.vision.norm.weight): 'decoy.projector.weight',
+              id(model.image_start): 'decoy.query.weight'}
+    named = model.named_parameters
+    monkeypatch.setattr(model, 'named_parameters', lambda *a, **kw: (
+        (labels.get(id(p), name), p) for name, p in named(*a, **kw)))
+    for key, binding in list(model.tensor_bindings.items()):
+        if id(binding.tensor) in labels:
+            model.tensor_bindings[key] = replace(binding, release_key=labels[id(binding.tensor)])
+    groups = {id(g['params'][0]): g for g in parameter_groups(
+        model, lr=0.001, vision_policy=VisionOptimizerConfig(0.5, 1.0, 0.0))}
+    assert groups[id(model.aligner.w1.weight)]['algorithm'] == 'muon', 'F3_OBJECT_ROUTE: projector'
+    assert groups[id(model.vision.norm.weight)]['algorithm'] == 'adamw', 'F3_OBJECT_ROUTE: norm'
+    assert groups[id(model.image_start)]['algorithm'] == 'adamw', 'F3_OBJECT_ROUTE: vector'
+
+
+@pytest.mark.parametrize('guard', ['policy_value', 'missing_policy', 'reconfigure_type',
+                                 'reconfigure_grad', 'pending_step', 'pending_save', 'pending_load'])
+def test_v41_visual_optimizer_individual_guard(moe, guard):
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import (
+        OptimizerConfig, VisionOptimizerConfig, parameter_groups)
+
+    if guard == 'policy_value':
+        with pytest.raises(ValueError, match='finite nonnegative'):
+            VisionOptimizerConfig(float('nan'), 1.0, 0.0)
+        return
+    if guard == 'missing_policy':
+        _, bundle = _assembly_bundle()
+        model = bundle.chunks[0]
+        protocol.VisionTrainability(True, True, True, True).apply(model)
+        with pytest.raises(ValueError, match='explicit visual optimizer policy'):
+            parameter_groups(model, lr=0.001)
+        return
+    bundle = protocol.build_model(_assembly_config(), impl_cfg=protocol.ImplConfig(
+        device='cpu', dtype=torch.bfloat16, quantized=False, token_map=list(range(256)),
+        vision_trainability=protocol.VisionTrainability(True, True, True, True),
+        external_vision_device='cpu', optimizer='muon',
+        optimizer_config=OptimizerConfig(lr=0.001, ns_steps=5, coefficient_type='quintic',
+                                         vision_policy=VisionOptimizerConfig(0.5, 1.0, 0.0)),
+    ))
+    model, opt = bundle.chunks[0], bundle.optimizer
+    if guard == 'reconfigure_type':
+        with pytest.raises(TypeError, match='explicit visual trainability mask'):
+            opt.reconfigure_vision({})
+    elif guard == 'reconfigure_grad':
+        model.head.weight.grad = torch.ones_like(model.head.weight)
+        with pytest.raises(RuntimeError, match='Zero gradients before changing'):
+            opt.reconfigure_vision(protocol.VisionTrainability(False, True, True, False))
+    else:
+        saved = opt.state_dict()
+        model.vision_schedule.forward([[]])
+        operation = {'pending_step': opt.step, 'pending_save': opt.state_dict,
+                     'pending_load': lambda: opt.load_state_dict(saved)}[guard]
+        with pytest.raises(RuntimeError, match='completed vision backward'):
+            operation()
+        model.vision_schedule.abort()
+
+
+@pytest.mark.parametrize('guard', ['partitions', 'restore_layout'])
+def test_v41_visual_muon_partition_guard(guard):
+    from copy import deepcopy
+    from megatron.lite.primitive.optimizers.headwise_muon import HeadwiseMuon
+
+    p = torch.nn.Parameter(torch.ones(6, 3))
+    settings = dict(lr=0.001, ns_steps=5, coefficient_type='quintic')
+    group = dict(params=[p], matrix_shape=(6, 3), matrix_partitions=((2, 3),) * 3)
+    if guard == 'partitions':
+        group['matrix_partitions'] = ((7, 3),)
+        with pytest.raises(ValueError, match='Logical partitions must cover'):
+            HeadwiseMuon([group], **settings)
+    else:
+        opt = HeadwiseMuon([group], **settings)
+        saved = deepcopy(opt.state_dict())
+        saved['param_groups'][0]['matrix_partitions'] = ((6, 3),)
+        with pytest.raises(ValueError, match='Muon logical layout changed'):
+            opt.load_state_dict(saved)
