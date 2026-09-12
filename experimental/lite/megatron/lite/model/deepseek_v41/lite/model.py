@@ -96,9 +96,13 @@ class DeepseekV41Model(nn.Module):
         bias_rate=0.001,
         enable_dspark_execution=False,
         layer_range=None,
+        parallel_state=None,
     ):
         super().__init__()
         validate_execution(enable_dspark_execution=enable_dspark_execution)
+        from megatron.lite.primitive.parallel.state import ParallelState
+
+        self.ps = ParallelState() if parallel_state is None else parallel_state
         self.config = config
         cfg = config.to_hf_dict()
         t, v = cfg['text_config'], cfg['vision_config']
@@ -145,7 +149,7 @@ class DeepseekV41Model(nn.Module):
             attention = CSA2Attention(ac, layer_id)
             router = ModalityRouter(
                 SimpleNamespace(**t),
-                SimpleNamespace(tp_size=1),
+                self.ps,
                 gate_temperature=gate_temperature,
                 bias_rate=bias_rate,
             )
@@ -459,16 +463,23 @@ class DeepseekV41Model(nn.Module):
         if len(ids) != len(set(ids)) or set(ids) != {id(p) for p in self.parameters()}:
             raise ValueError('Every parameter must have exactly one binding')
 
-    def _sequence(self, hidden, pre, *, input_ids, image_mask=None):
+    def _sequence(self, hidden, pre, *, input_ids, image_mask=None, cp_context=None):
         hashes = None
         if self.engram_layer_ids:
             if self.engram_hash is None:
                 raise ValueError(
                     'Engram execution requires an explicit tokenizer token_map'
                 )
-            hashes = self.engram_hash(
-                input_ids, None if image_mask is None else ~image_mask
-            )
+            if cp_context is None:
+                hashes = self.engram_hash(
+                    input_ids, None if image_mask is None else ~image_mask
+                )
+            else:
+                offset = sum(cp_context.layout.lengths[: cp_context.index])
+                full_ids = cp_context.layout.batch.input_ids[
+                    offset : offset + cp_context.length
+                ][None]
+                hashes = cp_context.slice(self.engram_hash(full_ids))
         state = AttentionState()
         for index, layer in enumerate(self.layers):
             if layer.engram is not None:
@@ -478,7 +489,13 @@ class DeepseekV41Model(nn.Module):
                     None if image_mask is None else ~image_mask,
                 )
             hidden, pre, state = layer.forward_with_state(
-                hidden, pre, state, ffn_kwargs={'image_mask': image_mask}
+                hidden,
+                pre,
+                state,
+                ffn_kwargs={'image_mask': image_mask},
+                attention_kwargs=(
+                    None if cp_context is None else {'context': cp_context}
+                ),
             )
         return hidden, pre
 

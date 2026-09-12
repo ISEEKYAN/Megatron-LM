@@ -117,12 +117,20 @@ class Compressor(nn.Module):
         if ratio > 1:
             self.wgate = Linear(config.dim, config.head_dim, dtype=torch.float32)
 
-    def forward(self, x):
+    def forward(self, x, *, context=None):
         if self.ratio == 1:
-            return self.norm(self.wkv(x))
-        cutoff = x.shape[1] // self.ratio * self.ratio
-        values = self.wkv(x[:, :cutoff].float()).unflatten(1, (-1, self.ratio))
-        gates = self.wgate(x[:, :cutoff].float()).unflatten(1, (-1, self.ratio))
+            value = self.norm(self.wkv(x))
+            return value if context is None else context.gather(value)
+        if context is None:
+            cutoff = x.shape[1] // self.ratio * self.ratio
+            values = self.wkv(x[:, :cutoff].float())
+            gates = self.wgate(x[:, :cutoff].float())
+        else:
+            cutoff = context.length // self.ratio * self.ratio
+            values = context.gather(self.wkv(x.float()))[:, :cutoff]
+            gates = context.gather(self.wgate(x.float()))[:, :cutoff]
+        values = values.unflatten(1, (-1, self.ratio))
+        gates = gates.unflatten(1, (-1, self.ratio))
         return self.norm((values * gates.softmax(2)).sum(2).to(x.dtype))
 
 
@@ -176,10 +184,16 @@ class CSA2Attention(nn.Module):
         self.compressor = Compressor(config, self.ratio) if self.owns_kv else None
         self.indexer = Indexer(config, self.owns_kv) if self.owns_index else None
 
-    def forward(self, x, state, *, candidate_mask=None):
+    def forward(self, x, state, *, candidate_mask=None, context=None):
         c, layer, ratio = self.config, self.layer_id, self.ratio
         b, length, _ = x.shape
-        positions = torch.arange(length, device=x.device)
+        full_length = length if context is None else context.length
+        positions = (
+            torch.arange(length, device=x.device)
+            if context is None
+            else context.positions
+        )
+        key_positions = torch.arange(full_length, device=x.device)
         qr = self.q_norm(self.wq_a(x))
         # V4.1 deliberately has no per-query-head RMS after wq_b.
         q = rotate(
@@ -188,14 +202,16 @@ class CSA2Attention(nn.Module):
         window = rotate(self.kv_norm(self.wkv(x)), positions, c, ratio)
         if c.swa_fp8:
             window = ds41_fp8.fake_quant_swa(window)
+        if context is not None:
+            window = context.gather(window)
         kv = window
-        visible = (positions[None, :] <= positions[:, None]) & (
-            positions[None, :] > positions[:, None] - c.window
+        visible = (key_positions[None, :] <= positions[:, None]) & (
+            key_positions[None, :] > positions[:, None] - c.window
         )
         mask = visible.expand(b, -1, -1)
         if ratio:
             if self.owns_kv:
-                latent = self.compressor(x)
+                latent = self.compressor(x, context=context)
                 cp = torch.arange(latent.shape[1], device=x.device) * ratio
                 # Index keys branch BEFORE main RoPE/QAT. No in-place aliasing.
                 index_k = self.indexer.k_norm(self.indexer.wk(latent))
@@ -217,7 +233,7 @@ class CSA2Attention(nn.Module):
                 or state.index_k is None
             ):
                 raise ValueError("Missing or incorrect CSA2 KV source state")
-            if state.main_kv.shape[:2] != (b, length // ratio):
+            if state.main_kv.shape[:2] != (b, full_length // ratio):
                 raise ValueError("Shared KV belongs to a different sequence shape")
             lengths = ((positions + 1) // ratio).unsqueeze(-1)
             if self.owns_index:
@@ -279,7 +295,7 @@ class CSA2Attention(nn.Module):
         probabilities = torch.cat([logits, sink], -1).softmax(-1)[..., :-1]
         output = torch.einsum('bsht,btd->bshd', probabilities, kv.float()).to(x.dtype)
         output = rotate(output, positions, c, ratio, inverse=True)
-        grouped = output.reshape(b, length, c.groups, -1)
+        grouped = output.reshape(b, length, c.groups, c.heads * c.head_dim // c.groups)
         weight = self.wo_a.weight.reshape(c.groups, c.o_rank, -1)
         if getattr(self.wo_a, 'native_fp32', False):
             from megatron.lite.primitive.modules.native_fp32_linear import (

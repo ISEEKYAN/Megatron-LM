@@ -53,29 +53,32 @@ def build_model(model_cfg, *, impl_cfg):
 
     p = impl_cfg.parallel
     if (
-        any(getattr(p, key) != 1 for key in ('tp', 'ep', 'cp', 'vpp'))
+        any(getattr(p, key) != 1 for key in ('tp', 'ep', 'vpp'))
         or p.etp not in (None, 1)
         or p.pp_layout is not None
     ):
         raise NotImplementedError(
             'V4.1 stage construction supports PP only; TP/EP/CP/VPP remain pending'
         )
+    if p.cp > 1 and p.pp > 1:
+        raise NotImplementedError('Combined paired PP and CP transport is pending')
     ps = ParallelState()
     layer_range = None
-    if p.pp > 1:
+    if p.pp > 1 or p.cp > 1:
         if (
             not torch.distributed.is_initialized()
-            or torch.distributed.get_world_size() != p.pp
+            or torch.distributed.get_world_size() != p.pp * p.cp
         ):
             raise ValueError(
-                'PP stage construction requires exactly pp initialized ranks'
+                'Parallel construction requires exactly pp*cp initialized ranks'
             )
         count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
         if count % p.pp:
             raise ValueError('Equal PP stages must divide the real layer count')
         ps = init_parallel(p)
         width = count // p.pp
-        layer_range = (ps.pp_rank * width, (ps.pp_rank + 1) * width)
+        if p.pp > 1:
+            layer_range = (ps.pp_rank * width, (ps.pp_rank + 1) * width)
     elif torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
         raise NotImplementedError(
             'Data parallel construction requires the distributed integration'
@@ -102,6 +105,7 @@ def build_model(model_cfg, *, impl_cfg):
             bias_rate=impl_cfg.bias_rate,
             enable_dspark_execution=impl_cfg.enable_dspark_execution,
             layer_range=layer_range,
+            parallel_state=ps,
         )
     # Keep HC coefficients, router and normalization tensors in their native
     # precision. Only residual projections change dtype in diagnostic mode.
@@ -142,12 +146,14 @@ def build_model(model_cfg, *, impl_cfg):
                 p.register_post_accumulate_grad_hook(_publish_main_grad)
         model.residual_dtype = impl_cfg.dtype
         optimizer = V41Optimizer(model, impl_cfg.optimizer_config, parallel_state=ps)
+    from .parallel import finalize_context_gradients
     from .pipeline import PackedPipelineAdapter
 
     return ModelBundle(
         [model],
         ps,
         optimizer=optimizer,
+        finalize_grads=lambda: finalize_context_gradients(model),
         forward_step=_forward_step,
         extras={
             'model_cfg': model_cfg,
@@ -215,7 +221,18 @@ def _forward_step(model, batch):
         else nullcontext()
     )
     with precision:
-        logits = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens)['logits'][0]
+        if model.ps.cp_size > 1:
+            from .parallel import context_parallel_forward
+
+            if batch.routed_experts is not None or batch.r3_replay_mask is not None:
+                raise NotImplementedError(
+                    'Context routing replay execution requires aligned local routes'
+                )
+            logits = context_parallel_forward(model, batch)
+        else:
+            logits = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens)[
+                'logits'
+            ][0]
     return _text_output(logits, batch)
 
 

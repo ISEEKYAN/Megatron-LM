@@ -2978,3 +2978,144 @@ def test_real_packed_pipeline_mixed_optimizer_clip_and_atomic_skip(tmp_path):
         nprocs=4,
         join=True,
     )
+
+
+def test_v41_contiguous_cp_layout_keeps_global_sequence_positions():
+    from megatron.lite.model.deepseek_v41.lite.parallel import PackedContextLayout
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    batch = PackedBatch(torch.arange(16), None, torch.tensor([5, 8, 3]))
+    layouts = [PackedContextLayout(batch, cp_size=2, cp_rank=rank) for rank in range(2)]
+    assert layouts[0].meta.cu_seqlens_padded.tolist() == [0, 6, 14, 18]
+    assert [layout.local_token_indices.tolist() for layout in layouts] == [
+        [0, 1, 2, 3, 4, -1, 5, 6, 7],
+        [8, 9, 10, 11, 12, 13, 14, 15, -1],
+    ]
+    assert [
+        [layout.sequence(i).positions.tolist() for i in range(3)] for layout in layouts
+    ] == [[[0, 1, 2, 3, 4], [0, 1, 2], []], [[], [3, 4, 5, 6, 7], [0, 1, 2]]]
+    for i in range(3):
+        assert layouts[0].sequence(i).length == [5, 8, 3][i]
+        assert layouts[1].sequence(i).length == [5, 8, 3][i]
+
+
+def _context_model_worker(rank, rendezvous):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import OptimizerConfig
+    from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
+
+    torch.cuda.set_device(rank)
+    device = torch.device('cuda', rank)
+    torch.manual_seed(917)
+    options = dict(
+        device=str(device),
+        dtype=torch.float32,
+        quantized=False,
+        token_map=list(range(256)),
+        trainable_engram=True,
+        optimizer='muon',
+        optimizer_config=OptimizerConfig(
+            lr=1e-4, ns_steps=5, coefficient_type='quintic', clip_grad=0.5
+        ),
+    )
+    reference = protocol.build_model(
+        _assembly_config(), impl_cfg=protocol.ImplConfig(**options)
+    )
+    initial = {n: t.clone() for n, t in reference.chunks[0].state_dict().items()}
+    batches = [
+        PackedBatch(
+            torch.arange(3, 3 + sum(ns), device=device),
+            torch.arange(3, 3 + sum(ns), device=device),
+            torch.tensor(ns, device=device),
+        )
+        for ns in ((5, 8, 3), (4, 7, 2))
+    ]
+    expected = []
+    for batch in batches:
+        output = reference.forward_step(reference.chunks[0], batch)
+        expected.append({k: v.detach().clone() for k, v in output.items()})
+        (output['loss'] / len(batches)).backward()
+    gradients = {
+        n: None if p.grad is None else p.grad.clone()
+        for n, p in reference.chunks[0].named_parameters()
+    }
+    success, reference_norm, _ = reference.optimizer.step()
+    assert success
+    updated = {n: p.detach().clone() for n, p in reference.chunks[0].named_parameters()}
+    del reference
+    dist.init_process_group(
+        'nccl',
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=180),
+    )
+    errors = []
+
+    def compare(actual, expected, name):
+        try:
+            torch.testing.assert_close(actual, expected, atol=3e-5, rtol=3e-5)
+        except AssertionError as error:
+            errors.append(name + ': ' + str(error))
+
+    try:
+        bundle = protocol.build_model(
+            _assembly_config(),
+            impl_cfg=protocol.ImplConfig(**options, parallel=ParallelConfig(cp=2)),
+        )
+        model = bundle.chunks[0]
+        model.load_state_dict(initial, strict=True)
+        del initial
+        query_lengths = []
+        hook = model.layers[0].attn.wq_a.register_forward_pre_hook(
+            lambda module, args: query_lengths.append(args[0].shape[1])
+        )
+        for batch, target in zip(batches, expected):
+            output = bundle.forward_step(model, batch)
+            for key in target:
+                compare(output[key], target[key], 'CP full packed ' + key)
+            (output['loss'] / len(batches)).backward()
+        hook.remove()
+        assert query_lengths[:3] == (
+            [5, 3, 0] if rank == 0 else [0, 5, 3]
+        ), 'CP_QUERY_LOCAL: full packed input was not split before query computation'
+        bundle.finalize_grads()
+        for name, p in model.named_parameters():
+            if gradients[name] is None:
+                assert p.grad is None, name
+            else:
+                assert p.main_grad.dtype == torch.float32
+                compare(p.main_grad, gradients[name], name + ' CP gradient')
+        success, norm, _ = bundle.optimizer.step()
+        assert success
+        compare(torch.tensor(norm), torch.tensor(reference_norm), 'CP clip norm')
+        for name, p in model.named_parameters():
+            compare(p, updated[name], name + ' CP update')
+        for table in bundle.optimizer.tables:
+            assert table.master.is_cuda and table.weight.is_cuda and table.scale.is_cuda
+        messages = [None] * 2
+        dist.all_gather_object(messages, errors)
+        failures = [message for group in messages for message in group]
+        if failures:
+            raise AssertionError(
+                'CP model differs from monolithic reference: ' + failures[0]
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.gpus(2)
+def test_real_contiguous_context_packed_forward_backward_update(tmp_path):
+    import os
+
+    import torch.multiprocessing as mp
+
+    assert os.getenv('SLURM_JOB_ID'), 'Real context validation requires Slurm'
+    if torch.cuda.device_count() < 2:
+        pytest.skip('Requires the declared two-GPU allocation')
+    mp.spawn(
+        _context_model_worker, args=(f'file://{tmp_path}/context',), nprocs=2, join=True
+    )
