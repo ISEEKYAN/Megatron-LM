@@ -12,6 +12,7 @@ def validate_ep_chunk_overlap_config(
     ep_size: int,
     topk: int,
     max_token_rows_per_rank: int | None = None,
+    chunk_count: int = 2,
 ) -> bool:
     if not isinstance(enabled, bool):
         raise TypeError("enable_ep_chunk_overlap must be a bool")
@@ -25,6 +26,8 @@ def validate_ep_chunk_overlap_config(
         or max_token_rows_per_rank < 2
     ):
         raise ValueError("ChunkedEP requires ep_chunk_max_token_rows_per_rank >= 2")
+    if enabled:
+        ep_chunk_ranges(max_token_rows_per_rank, chunk_count=chunk_count)
     return enabled
 
 

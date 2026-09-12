@@ -1148,6 +1148,10 @@ class EPChunkWorkspace:
             ),
             "deepep_buffer_count": len(buffers),
             "deepep_buffer_resident_bytes": sum(buffers.values()),
+            # TODO: expose outer CUDA graph pool identity through its owner.
+            # These legacy fields describe only private pools owned here (none).
+            # They do not measure the default allocator or externally owned
+            # graph pools, and must not be used as total allocator evidence.
             "allocation_pool_count": 0,
             "allocation_pool_ids": {},
             "expert_activation_pool_count": 0,

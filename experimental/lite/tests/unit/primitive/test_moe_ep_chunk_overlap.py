@@ -207,3 +207,19 @@ def test_three_ops_direct_behavior_contracts(transformer_engine_import_stub):
     assert router_grads == []
     assert expert_grads == []
     assert calls["fused"] == 1
+
+
+@pytest.mark.parametrize("chunk_count", [True, 1.5, 0, 1, 9])
+def test_chunk_count_validated_against_capacity(chunk_count):
+    with pytest.raises((TypeError, ValueError), match="chunk|token"):
+        validate_ep_chunk_overlap_config(
+            True, use_deepep=True, ep_size=2, topk=2,
+            max_token_rows_per_rank=8, chunk_count=chunk_count,
+        )
+
+
+def test_chunk_count_supports_more_than_two_logical_chunks():
+    assert validate_ep_chunk_overlap_config(
+        True, use_deepep=True, ep_size=2, topk=2,
+        max_token_rows_per_rank=8, chunk_count=3,
+    )

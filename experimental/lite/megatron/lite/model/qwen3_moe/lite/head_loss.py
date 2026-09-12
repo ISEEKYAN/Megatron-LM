@@ -37,4 +37,17 @@ def balanced_head_loss_chunk_size(token_count: int, chunk_count: int) -> int:
     return (token_count + chunk_count - 1) // chunk_count
 
 
-__all__ = ["balanced_head_loss_chunk_size", "use_chunked_head_loss"]
+def validate_chunked_ep_mtp(*, enable_ep_chunk_overlap: bool, mtp_enable: bool) -> None:
+    """Reject MTP before allocation until its auxiliary head loss is bounded."""
+    if enable_ep_chunk_overlap and mtp_enable:
+        raise ValueError(
+            "ChunkedEP with MTP is unsupported: MTP auxiliary head loss can "
+            "materialize full-vocabulary logits; disable MTP or ChunkedEP."
+        )
+
+
+__all__ = [
+    "balanced_head_loss_chunk_size",
+    "use_chunked_head_loss",
+    "validate_chunked_ep_mtp",
+]

@@ -40,6 +40,7 @@ from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entrop
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
 from megatron.lite.model.qwen3_moe.lite.head_loss import (
     balanced_head_loss_chunk_size,
+    validate_chunked_ep_mtp,
     use_chunked_head_loss,
 )
 from megatron.lite.primitive.parallel import (
@@ -215,6 +216,7 @@ class MoELayer(nn.Module):
             ep_size=ps.ep_size,
             topk=config.num_experts_per_tok,
             max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+            chunk_count=ep_chunk_count,
         )
         # Match Qwen3-MoE's `load_balancing_type="none"` setting: no aux loss.
         self.router = TopKRouter(
@@ -789,6 +791,9 @@ class Qwen3MoEModel(nn.Module):
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
+        validate_chunked_ep_mtp(
+            enable_ep_chunk_overlap=enable_ep_chunk_overlap, mtp_enable=mtp_enable
+        )
         validate_qwen3_ep_chunk_recompute_composition(
             enable_ep_chunk_overlap=enable_ep_chunk_overlap,
             ep_chunk_full_recompute=ep_chunk_full_recompute,

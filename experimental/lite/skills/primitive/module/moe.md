@@ -36,12 +36,13 @@ def moe(task, implementation, config, reference, budget):
         "config": require_config_keys(config, [
             "num_experts", "top_k", "expert_parallel_size", "use_deepep",
             "enable_ep_chunk_overlap", "ep_chunk_max_token_rows_per_rank",
-            "ep_chunk_full_recompute",
+            "ep_chunk_full_recompute", "ep_chunk_count",
         ]),
         "choose_when": ["model architecture has sparse experts", "expert count justifies EP or grouped GEMM"],
         "avoid_when": ["router tie behavior cannot be stabilized", "DeepEP metadata cannot be validated against all-to-all"],
         "compose_with": ["primitive.parallel.ep", "DeepEP dispatcher when EP>1", "primitive.parallel.tp for expert MLP if explicit"],
         "unsupported_combinations": [
+            "Qwen3 ChunkedEP with MTP (auxiliary head loss is not bounded)",
             "ChunkedEP without DeepEP or with EP<=1",
             "ChunkedEP with top_k>expert_parallel_size",
             "ChunkedEP without explicit per-rank flattened-token capacity",

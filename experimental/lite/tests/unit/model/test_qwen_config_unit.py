@@ -365,18 +365,16 @@ def test_qwen3_layer_builds_lazy_selected_ops_from_real_token_capacity(
 
 
 @pytest.mark.parametrize(
-    ("mtp_enable", "requested_chunk_count", "expected_chunk_count", "expected_moe_layers"),
-    [(False, None, 2, 1), (True, 3, 3, 3)],
+    ("requested_chunk_count", "expected_chunk_count"),
+    [(None, 2), (3, 3)],
 )
-def test_qwen3_model_build_propagates_logical_chunk_count_to_decoder_and_mtp(
-    mtp_enable,
+def test_qwen3_model_build_propagates_logical_chunk_count_to_decoder(
     requested_chunk_count,
     expected_chunk_count,
-    expected_moe_layers,
     monkeypatch,
     transformer_engine_import_stub,
 ):
-    """Exercise the real Qwen composition, including MTP's nested TransformerLayer."""
+    """Exercise configurable logical chunks through the real Qwen composition."""
     transformer_engine_import_stub()
     from megatron.lite.model.qwen3_moe.lite import model
     from megatron.lite.primitive.parallel import ParallelState
@@ -411,12 +409,9 @@ def test_qwen3_model_build_propagates_logical_chunk_count_to_decoder_and_mtp(
     monkeypatch.setattr(model, "EPChunkFusedForwardBackwardOp", FakeOp)
 
     hf = _tiny_qwen3_hf_dict()
-    if mtp_enable:
-        hf["num_nextn_predict_layers"] = 2
     config = Qwen3MoEConfig._from_hf_dict(hf)
     model_kwargs = dict(
         use_deepep=True,
-        mtp_enable=mtp_enable,
         enable_ep_chunk_overlap=True,
         ep_chunk_max_token_rows_per_rank=8,
     )
@@ -429,10 +424,8 @@ def test_qwen3_model_build_propagates_logical_chunk_count_to_decoder_and_mtp(
     )
 
     moe_layers = [layer.moe for layer in built.layers]
-    if mtp_enable:
-        assert built.mtp is not None
-        moe_layers.extend(layer.transformer_layer.moe for layer in built.mtp.layers)
-    assert len(moe_layers) == expected_moe_layers
+    assert built.mtp is None
+    assert len(moe_layers) == 1
     assert {
         moe.ep_chunk_forward.workspace.key.shape_profile.chunk_count for moe in moe_layers
     } == {expected_chunk_count}
@@ -1281,3 +1274,31 @@ def _checkpoint_import_names(tree: ast.Module) -> set[str]:
             continue
         names.update(alias.name for alias in node.names)
     return names
+
+
+@pytest.mark.parametrize("entry", ["model", "protocol"])
+@pytest.mark.parametrize("mtp_enable_train", [False, True])
+def test_chunked_ep_mtp_rejected_before_model_allocation(
+    entry, mtp_enable_train, monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite import model, protocol
+
+    def unexpected_allocation(*args, **kwargs):
+        pytest.fail("unsupported composition must fail before allocation")
+
+    monkeypatch.setattr(model, "build_pipeline_chunk_layout", unexpected_allocation)
+    monkeypatch.setattr(protocol, "init_parallel", unexpected_allocation)
+    config = Qwen3MoEConfig._from_hf_dict(_tiny_qwen3_hf_dict())
+    config.num_nextn_predict_layers = 1
+    with pytest.raises(ValueError, match="ChunkedEP.*MTP.*full-vocabulary logits"):
+        if entry == "model":
+            model.Qwen3MoEModel(
+                config, SimpleNamespace(), enable_ep_chunk_overlap=True,
+                mtp_enable=True, mtp_enable_train=mtp_enable_train,
+            )
+        else:
+            protocol.build_model(config, impl_cfg=protocol.ImplConfig(
+                enable_ep_chunk_overlap=True, mtp_enable=True,
+                mtp_enable_train=mtp_enable_train,
+            ))

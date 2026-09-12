@@ -19,12 +19,12 @@ Protocol convention (what runtime calls):
 
 Qwen3 ChunkedEP fields in ``ImplConfig``:
   ``enable_ep_chunk_overlap`` enables the two-physical-slot DeepEP composition
-  (the current Qwen3 profile selects two logical chunks);
+  (``ep_chunk_count`` selects the logical chunk count, default 2);
   ``ep_chunk_max_token_rows_per_rank`` is the required flattened per-rank
   forward capacity; ``ep_chunk_full_recompute`` selects fwd+fused-fwd-bwd
   composition. ChunkedEP requires DeepEP, EP>1, top-k<=EP, and an explicit
   capacity. Full recompute requires ChunkedEP; normal ChunkedEP rejects outer
-  ``moe``/``full`` recompute.
+  ``moe``/``full`` recompute. ChunkedEP with MTP is rejected before allocation.
 """
 
 from __future__ import annotations
@@ -53,6 +53,7 @@ from megatron.lite.model.qwen3_moe.lite.checkpoint import (
 from megatron.lite.model.qwen3_moe.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
 )
+from megatron.lite.model.qwen3_moe.lite.head_loss import validate_chunked_ep_mtp
 from megatron.lite.model.qwen3_moe.lite.model import (
     MTPLossAutoScaler,
     Qwen3MoEModel,
@@ -210,6 +211,10 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
     Model owns all construction. Runtime just consumes the ModelBundle.
     """
+    validate_chunked_ep_mtp(
+        enable_ep_chunk_overlap=impl_cfg.enable_ep_chunk_overlap,
+        mtp_enable=impl_cfg.mtp_enable,
+    )
     p = impl_cfg.parallel
     lora_config = normalize_lora_config(impl_cfg.lora)
     validate_qwen3_ep_chunk_recompute_composition(
@@ -227,6 +232,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         ep_size=p.ep,
         topk=model_cfg.num_experts_per_tok,
         max_token_rows_per_rank=impl_cfg.ep_chunk_max_token_rows_per_rank,
+        chunk_count=impl_cfg.ep_chunk_count,
     )
 
     # ── override model config from impl_cfg ──
