@@ -23,6 +23,47 @@ This benchmark separates two validation lines:
 
 Use the `mbridge` line for Core/distopt precision and speed claims.
 
+## Qwen3 MoE ChunkedEP
+
+Qwen3 MoE can compose the two-physical-slot DeepEP overlap implementation
+through its lite implementation config:
+
+```python
+from megatron.lite.model.qwen3_moe.lite.protocol import ImplConfig
+from megatron.lite.runtime.contracts import ParallelConfig
+
+impl = ImplConfig(
+    parallel=ParallelConfig(ep=8),
+    use_deepep=True,
+    enable_ep_chunk_overlap=True,
+    ep_chunk_max_token_rows_per_rank=4096,
+)
+```
+
+The public bench consumes the same fields through ``--impl-cfg-json``; use this
+surface for controlled MLite runs rather than a private validation entrypoint:
+
+```bash
+python experimental/lite/examples/bench/bench.py \
+  --backend mlite \
+  --hf-path /models/Qwen3-MoE \
+  --ep 8 \
+  --impl-cfg-json '{"use_deepep":true,"enable_ep_chunk_overlap":true,"ep_chunk_max_token_rows_per_rank":4096,"ep_chunk_full_recompute":false}'
+```
+
+The primitive keeps two physical workspace slots while its profile owns the
+logical chunk count; the current Qwen3 configuration selects two logical
+chunks. It requires DeepEP with `EP > 1`; there is no per-model scheduling
+policy. The caller must set
+`ep_chunk_max_token_rows_per_rank` to the true maximum flattened MoE input rows
+for one rank and one forward (including BSHD micro-batches or all packed THD
+tokens). Inputs above that fixed capacity fail loudly; scratch tensors are
+not allocated during Qwen3 model construction. The selected phase lazily
+materializes two dispatcher/dispatch-recv allocation-pool slots, while
+backward scratch is allocated at the actual received shape and may grow only
+within the fixed profile during preflight. Repeating the same preflight shape
+must not allocate or grow again.
+
 ## Dry-Run
 
 ```bash
