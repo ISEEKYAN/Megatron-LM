@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Text-only single-rank protocol. Distributed and optimizer routing are separate."""
+"""Text protocol and PP-only local construction; mixed parallel routing is separate."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import torch
@@ -12,22 +13,25 @@ from megatron.lite.model.protocol_utils import (
     pack_routed_experts as _pack_routed_experts,
 )
 from megatron.lite.primitive.bundle import ModelBundle
-from megatron.lite.primitive.parallel.state import ParallelState
+from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
 from megatron.lite.runtime.contracts import ParallelConfig
 from torch.nn import functional as F
 
 from .checkpoint import export_model, load_model, save_model
+from .optimizer_groups import OptimizerConfig, V41Optimizer
 
 
 @dataclass(frozen=True)
 class ImplConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
     optimizer: str | None = None
+    optimizer_config: OptimizerConfig | None = None
     device: str = 'cuda'
     dtype: torch.dtype = torch.bfloat16
     quantized: bool = True
     token_map: list[int] | None = None
     trainable_engram: bool = False
+    text_only: bool = True
     gate_temperature: float = 1.0
     bias_rate: float = 0.001
     enable_dspark_execution: bool = False
@@ -37,7 +41,9 @@ def build_model_config(source, **overrides):
     if overrides:
         raise ValueError('Apply overrides to the explicit nested source config')
     return (
-        DeepseekV41Config(source) if isinstance(source, dict) else DeepseekV41Config.from_hf(source)
+        DeepseekV41Config(source)
+        if isinstance(source, dict)
+        else DeepseekV41Config.from_hf(source)
     )
 
 
@@ -46,16 +52,46 @@ def build_model(model_cfg, *, impl_cfg):
 
     p = impl_cfg.parallel
     if (
-        any(getattr(p, key) != 1 for key in ('tp', 'ep', 'cp', 'pp', 'vpp'))
+        any(getattr(p, key) != 1 for key in ('tp', 'ep', 'cp', 'vpp'))
         or p.etp not in (None, 1)
         or p.pp_layout is not None
     ):
-        raise NotImplementedError('V4.1 assembly currently requires single-rank parallelism')
-    if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
-        raise NotImplementedError('Distributed V4.1 construction requires the parallel integration')
-    if impl_cfg.optimizer is not None:
         raise NotImplementedError(
-            'Optimizer construction requires the V4.1 object-based routing integration'
+            'V4.1 stage construction supports PP only; TP/EP/CP/VPP remain pending'
+        )
+    ps = ParallelState()
+    layer_range = None
+    if p.pp > 1:
+        if (
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() != p.pp
+        ):
+            raise ValueError(
+                'PP stage construction requires exactly pp initialized ranks'
+            )
+        count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
+        if count % p.pp:
+            raise ValueError('Equal PP stages must divide the real layer count')
+        ps = init_parallel(p)
+        width = count // p.pp
+        layer_range = (ps.pp_rank * width, (ps.pp_rank + 1) * width)
+    elif torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
+        raise NotImplementedError(
+            'Data parallel construction requires the distributed integration'
+        )
+    if p.pp > 1 and impl_cfg.optimizer is not None:
+        raise NotImplementedError(
+            'Pipeline optimizer construction requires distributed routing integration'
+        )
+    if impl_cfg.optimizer not in (None, 'muon'):
+        raise ValueError('V4.1 optimizer must be explicitly selected as muon')
+    if impl_cfg.optimizer is None and impl_cfg.optimizer_config is not None:
+        raise ValueError('optimizer_config requires selecting the V4.1 optimizer')
+    if impl_cfg.optimizer == 'muon' and not isinstance(
+        impl_cfg.optimizer_config, OptimizerConfig
+    ):
+        raise ValueError(
+            'V4.1 Muon requires explicit optimizer_config including NS backend settings'
         )
     if impl_cfg.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
@@ -68,6 +104,7 @@ def build_model(model_cfg, *, impl_cfg):
             gate_temperature=impl_cfg.gate_temperature,
             bias_rate=impl_cfg.bias_rate,
             enable_dspark_execution=impl_cfg.enable_dspark_execution,
+            layer_range=layer_range,
         )
     # Keep HC coefficients, router and normalization tensors in their native
     # precision. Only residual projections change dtype in diagnostic mode.
@@ -83,19 +120,51 @@ def build_model(model_cfg, *, impl_cfg):
             module.output_dtype = impl_cfg.dtype
     if model.engram_hash is not None:
         model.engram_hash.to(device=impl_cfg.device)
+    if impl_cfg.text_only:
+        for binding in model.parameter_bindings():
+            if binding.role in ('vision', 'aligner', 'image_delimiter'):
+                binding.tensor.requires_grad_(False)
+    optimizer = None
+    if impl_cfg.optimizer == 'muon':
+        if impl_cfg.device == 'meta':
+            raise ValueError(
+                'Materialize V4.1 parameters before constructing optimizer state'
+            )
+        # Persistent FP32 owners receive FP32 wgrad from the numerical providers.
+        # No post-hoc BF16 gradient widening is used.
+        from .attention import Linear
+
+        for module in model.modules():
+            if isinstance(module, Linear):
+                module.native_fp32 = True
+                module.weight.data = module.weight.data.float()
+        for p in model.parameters():
+            if p.requires_grad:
+                p.data = p.data.float()
+                p.main_grad = None
+                p.register_post_accumulate_grad_hook(_publish_main_grad)
+        model.residual_dtype = impl_cfg.dtype
+        optimizer = V41Optimizer(model, impl_cfg.optimizer_config)
     return ModelBundle(
         [model],
-        ParallelState(),
+        ps,
+        optimizer=optimizer,
         forward_step=_forward_step,
         extras={
             'model_cfg': model_cfg,
-            'optimizer_backend': 'none',
+            'optimizer_backend': 'none' if optimizer is None else 'v41',
             'parameter_bindings': model.parameter_bindings,
         },
     )
 
 
-def _forward_step(model, batch):
+def _publish_main_grad(parameter):
+    if parameter.grad.dtype != torch.float32:
+        raise RuntimeError('V4.1 gradient producer did not return native FP32')
+    parameter.main_grad = parameter.grad
+
+
+def _validate_replay(model, batch):
     if batch.routed_experts is not None:
         from megatron.lite.primitive.modules.router_replay import RouterReplayAction
 
@@ -112,22 +181,117 @@ def _forward_step(model, batch):
             for module in routers
         ):
             raise RuntimeError('V4.1 routed inputs require an active replay driver')
+
+
+def _validate_text_batch(batch):
     if batch.extras:
-        raise NotImplementedError('Text-only protocol does not accept extra modality fields')
+        raise NotImplementedError(
+            'Text-only protocol does not accept extra modality fields'
+        )
     if batch.input_ids.ndim != 1 or batch.total_tokens != batch.input_ids.numel():
         raise ValueError('Expected packed 1-D tokens matching seq_lens')
     if batch.position_ids is not None and not torch.equal(
         batch.position_ids,
-        torch.cat([torch.arange(int(n), device=batch.input_ids.device) for n in batch.seq_lens]),
+        torch.cat(
+            [
+                torch.arange(int(n), device=batch.input_ids.device)
+                for n in batch.seq_lens
+            ]
+        ),
     ):
         raise ValueError('Only sequence-local positions are supported')
+
+
+def _forward_step(model, batch):
+    _validate_text_batch(batch)
+    _validate_replay(model, batch)
+    precision = (
+        torch.autocast(device_type=batch.input_ids.device.type, enabled=False)
+        if hasattr(model, 'residual_dtype')
+        else nullcontext()
+    )
+    with precision:
+        logits = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens)['logits'][0]
+    return _text_output(logits, batch)
+
+
+def pipeline_forward_step(model, batch, *, start, end, payload=None, owners=(-1, -1)):
+    """Model/protocol range boundary; a scheduler owns transport and generation.
+
+    Packed multi-sequence/CP partitioning is a separate integration. Reject it
+    explicitly until the scheduler can carry separate CSA2 state per sample.
+    """
+    _validate_text_batch(batch)
+    if batch.routed_experts is not None or batch.r3_replay_mask is not None:
+        raise NotImplementedError(
+            'Pipeline routing replay requires scheduler integration'
+        )
+    if batch.seq_lens.numel() != 1:
+        raise NotImplementedError(
+            'Pipeline packed sequences require per-sample state routing'
+        )
+    payload, owners = model.forward_pipeline_range(
+        batch.input_ids[None], start=start, end=end, payload=payload, owners=owners
+    )
+    result = {'pipeline_payload': payload, 'pipeline_owners': owners}
+    if end == len(model.layers):
+        result.update(_text_output(model.finish_pipeline(payload)[0], batch))
+    return result
+
+
+def packed_pipeline_forward_step(model, batch, *, start, end, state=None):
+    """CP1 packed range with an independent carrier per unpadded sequence.
+
+    State is an ordered tuple of (PairedPayload, owners) pairs. Transport must
+    preserve this sequence order and all native compressed-state shapes. This
+    entry does not partition CP or replace the distributed PP scheduler.
+    """
+    _validate_text_batch(batch)
+    if batch.routed_experts is not None or batch.r3_replay_mask is not None:
+        raise NotImplementedError(
+            'Pipeline routing replay requires scheduler integration'
+        )
+    lengths = batch.seq_lens.tolist()
+    if not lengths or any(length <= 0 for length in lengths):
+        raise ValueError('Packed pipeline requires positive sequence lengths')
+    if start == 0:
+        if state is not None:
+            raise ValueError('First packed range requires fresh sequence states')
+        state = tuple((None, (-1, -1)) for _ in lengths)
+    elif state is None or len(state) != len(lengths):
+        raise ValueError('Packed pipeline requires one state per sequence')
+    outputs = []
+    offset = 0
+    for length, (payload, owners) in zip(lengths, state):
+        payload, owners = model.forward_pipeline_range(
+            batch.input_ids[offset : offset + length][None],
+            start=start,
+            end=end,
+            payload=payload,
+            owners=owners,
+        )
+        outputs.append((payload, owners))
+        offset += length
+    result = {'packed_pipeline_state': tuple(outputs)}
+    if end == len(model.layers):
+        from .pipeline import PairedPayload
+
+        final = PairedPayload(
+            h=torch.cat([payload.h for payload, _ in outputs], dim=1),
+            p=torch.cat([payload.p for payload, _ in outputs], dim=1),
+        )
+        result.update(_text_output(model.finish_pipeline(final)[0], batch))
+    return result
+
+
+def _text_output(logits, batch):
     from megatron.lite.runtime.contracts.loss import get_loss_context
 
     context = get_loss_context()
     temperature = 1.0 if context is None else context.temperature
     if temperature <= 0:
         raise ValueError('Temperature must be positive')
-    logits = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens)['logits'][0] / temperature
+    logits = logits / temperature
     result = {'logits': logits}
     if batch.labels is not None:
         if batch.labels.shape != batch.input_ids.shape:
@@ -159,13 +323,18 @@ def _forward_step(model, batch):
 
 def unpack_forward_output(model, batch, output):
     if isinstance(output, dict):
-        return {key: unpack_forward_output(model, batch, value) for key, value in output.items()}
+        return {
+            key: unpack_forward_output(model, batch, value)
+            for key, value in output.items()
+        }
     if (
         isinstance(output, torch.Tensor)
         and output.ndim > 0
         and output.shape[0] == batch.total_tokens
     ):
-        return torch.nested.as_nested_tensor(list(output.split(batch.seq_lens.tolist())))
+        return torch.nested.as_nested_tensor(
+            list(output.split(batch.seq_lens.tolist()))
+        )
     return output
 
 
@@ -184,7 +353,9 @@ def export_hf_weights(chunks, model_cfg, ps, **kwargs):
     if kwargs:
         raise ValueError('Unsupported export options')
     model = _single(chunks)
-    if model.archival_store is None or set(model.archival_store.entries) != set(model.archival_bindings):
+    if model.archival_store is None or set(model.archival_store.entries) != set(
+        model.archival_bindings
+    ):
         raise ValueError('Complete archival storage is required for export')
     yield from export_model(model)
     if model.archival_store is not None:
