@@ -20,12 +20,12 @@ assembly over shared primitives; reusable logic lives in `primitive/`
   Engram supports frozen (FP8 only) and trainable (persistent FP32 master) under
   one switch, and is never offloaded.
 
-## Core reuse
-mHC projection, aggregation and residual mixing use Megatron Core kernels through
-`primitive/kernels/mhc.py`; execution requires Core's `native_sinkhorn`,
-`native_h_aggregate` and `native_h_post_bda` APIs (reference: `nv/dev@0cd11658f`).
-The shifted layer boundary and V4.1 RMS formula remain model contracts.
-Aggregation uses Core's eager execution to preserve the bitwise CED gradient.
+## mHC execution
+mHC uses the original pure PyTorch implementation, including FP32 accumulation,
+source-to-destination residual orientation and the shifted layer boundary.
+The attempted Core-kernel delegation was reverted: making these operations depend
+on an optional Core installation broke standalone CPU execution and CED tests.
+V4.1 mHC execution does not require `megatron.core`.
 
 ## Official reference
 Oracle comparisons load the pinned upstream source from `DS41_REFERENCE_DIR` at
