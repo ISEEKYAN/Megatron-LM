@@ -184,6 +184,7 @@ def test_kimi_k2_impl_config_accepts_runtime_mtp_fields():
 
 
 def test_kimi_k2_mtp_and_pp_layout_rules_are_explicit():
+    pytest.importorskip("megatron.core")
     from megatron.lite.primitive.parallel import (  # isort: skip
         ParallelState,
         build_pipeline_chunk_layout,
