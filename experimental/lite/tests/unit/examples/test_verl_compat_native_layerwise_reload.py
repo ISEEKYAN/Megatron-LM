@@ -131,3 +131,68 @@ def test_non_ds4_keeps_verl_reload_path(monkeypatch) -> None:
     assert loaded[0][1] is source
     fp8_utils.process_quanted_weights_after_loading(runner, state)
     assert events == ["legacy-state"]
+
+
+def test_ds4_reload_import_failure_is_loud(monkeypatch):
+    import pytest
+
+    monkeypatch.setattr(compat, "_vllm_importable", lambda: True)
+    failure = ImportError("incompatible VERL reload dependency")
+
+    def broken_import(name):
+        raise failure
+
+    monkeypatch.setattr(compat.importlib, "import_module", broken_import)
+    with pytest.raises(RuntimeError, match="DS4.*reload") as exc:
+        compat._patch_verl_dsv4_native_layerwise_reload()
+    assert exc.value.__cause__ is failure
+
+
+def test_ds4_reload_without_vllm_is_not_applicable(monkeypatch):
+    monkeypatch.setattr(compat, "_vllm_importable", lambda: False)
+    assert compat._patch_verl_dsv4_native_layerwise_reload() is False
+
+
+def test_ds4_reload_missing_api_is_loud(monkeypatch):
+    from types import SimpleNamespace
+
+    import pytest
+
+    monkeypatch.setattr(compat, "_vllm_importable", lambda: True)
+    monkeypatch.setattr(
+        compat.importlib, "import_module", lambda name: SimpleNamespace()
+    )
+    with pytest.raises(RuntimeError, match="DS4.*reload APIs"):
+        compat._patch_verl_dsv4_native_layerwise_reload()
+
+
+def test_reload_preserves_non_ds4_and_installs_once(monkeypatch):
+    from types import SimpleNamespace
+
+    events = []
+    fp8 = SimpleNamespace(
+        prepare_quanted_weights_for_loading=lambda runner: "original-state",
+        process_quanted_weights_after_loading=lambda runner, state: events.append(
+            state
+        ),
+        load_quanted_weights=lambda weights, runner: list(weights),
+    )
+    rollout = SimpleNamespace()
+    modules = {
+        "verl.utils.vllm.vllm_fp8_utils": fp8,
+        "verl.utils.vllm.vllm_dsv4_fp8_utils": SimpleNamespace(
+            is_deepseek_v4_model=lambda m: False
+        ),
+        "verl.workers.rollout.vllm_rollout.utils": rollout,
+    }
+    monkeypatch.setattr(compat, "_vllm_importable", lambda: True)
+    monkeypatch.setattr(compat.importlib, "import_module", modules.__getitem__)
+    assert compat._patch_verl_dsv4_native_layerwise_reload()
+    prepare = fp8.prepare_quanted_weights_for_loading
+    assert compat._patch_verl_dsv4_native_layerwise_reload()
+    assert fp8.prepare_quanted_weights_for_loading is prepare
+    runner = SimpleNamespace(model=object())
+    state = prepare(runner)
+    fp8.process_quanted_weights_after_loading(runner, state)
+    assert events == ["original-state"]
+    assert rollout.load_quanted_weights([("weight", 1)], runner) == [("weight", 1)]

@@ -355,3 +355,51 @@ def test_correctness_compare_supports_explicit_numeric_tolerances():
 
     assert comparison["passed"] is True
     assert abs(comparison["max_tensor_abs"] - 2e-3) < 1e-12
+
+
+def test_correctness_gradient_fingerprint_is_a_quality_gate(tmp_path):
+    import pytest
+    from examples.bench.correctness import main
+    from examples.bench.results import compare_correctness_artifacts
+
+    baseline = {
+        "steps": [
+            {
+                "loss": {"value": 1.0},
+                "grad_norm": {"value": 2.0},
+                "grad_fingerprint": {"sha256": "a", "tensor_count": 1},
+            }
+        ]
+    }
+    candidate = json.loads(json.dumps(baseline))
+    candidate["steps"][0]["grad_fingerprint"]["sha256"] = "b"
+    base_path, cand_path = tmp_path / "base.json", tmp_path / "cand.json"
+    base_path.write_text(json.dumps(baseline))
+    cand_path.write_text(json.dumps(candidate))
+    with pytest.raises(SystemExit) as exc:
+        main(["compare", str(base_path), str(cand_path), "--fail-on-mismatch"])
+    assert exc.value.code == 1
+    comparison = compare_correctness_artifacts(baseline, candidate)
+    assert comparison["passed"] is False
+    assert {"step": 0, "field": "grad_fingerprint"} in comparison["mismatches"]
+
+
+def test_correctness_gradient_digest_contract():
+    from examples.bench.results import compare_correctness_artifacts
+
+    baseline = {
+        "steps": [
+            {
+                "loss": {"value": 1.0},
+                "grad_norm": {"value": 2.0},
+                "grad_fingerprint": {"sha256": "a", "tensor_count": 1},
+            }
+        ]
+    }
+    candidate = json.loads(json.dumps(baseline))
+    candidate["steps"][0]["grad_fingerprint"]["details"] = [{"name": "weight"}]
+    assert compare_correctness_artifacts(baseline, candidate)["passed"]
+    candidate["steps"][0]["grad_fingerprint"]["tensor_count"] = 2
+    assert not compare_correctness_artifacts(baseline, candidate)["passed"]
+    del candidate["steps"][0]["grad_fingerprint"]
+    assert not compare_correctness_artifacts(baseline, candidate)["passed"]
