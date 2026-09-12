@@ -15,13 +15,16 @@ from megatron.lite.model.protocol_utils import (
     pack_routed_experts as _pack_routed_experts,
 )
 from megatron.lite.primitive.bundle import ModelBundle
-from megatron.lite.primitive.ckpt.hf_weights import allgather_concat
+from megatron.lite.primitive.ckpt.hf_weights import (
+    DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+    allgather_concat,
+)
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.runtime.contracts import ParallelConfig
 from torch.nn import functional as F
 
-from .checkpoint import export_model, load_model, save_model
+from .checkpoint import export_checkpoint, load_model, save_model
 from .optimizer_groups import OptimizerConfig, V41Optimizer
 from .training import VisionSchedule, VisionTrainability
 
@@ -381,25 +384,40 @@ def _single(chunks):
     return chunks[0]
 
 
-def export_hf_weights(chunks, model_cfg, ps, **kwargs):
-    if kwargs:
-        raise ValueError('Unsupported export options')
-    model = _single(chunks)
-    if model.archival_store is None or set(model.archival_store.entries) != set(
-        model.archival_bindings
-    ):
-        raise ValueError('Complete archival storage is required for export')
-    yield from export_model(model)
-    from .checkpoint import _tensor
+def export_hf_weights(
+    chunks,
+    model_cfg,
+    ps,
+    *,
+    export_dtype=None,
+    cpu=False,
+    buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
+):
+    yield from export_checkpoint(
+        _single(chunks),
+        export_dtype=export_dtype,
+        cpu=cpu,
+        buffer_max_size_bytes=buffer_max_size_bytes,
+    )
 
-    for key in model.archival_store.entries:
-        yield key, _tensor(model.archival_store, key)
 
-
-def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
-    if kwargs:
-        raise ValueError('Unsupported export options')
-    save_model(_single(chunks), path)
+def save_hf_weights(
+    chunks,
+    path,
+    model_cfg,
+    ps,
+    *,
+    export_dtype=None,
+    cpu=True,
+    buffer_max_size_bytes=None
+):
+    save_model(
+        _single(chunks),
+        path,
+        export_dtype=export_dtype,
+        cpu=cpu,
+        buffer_max_size_bytes=buffer_max_size_bytes,
+    )
 
 
 def vocab_size(model_cfg):

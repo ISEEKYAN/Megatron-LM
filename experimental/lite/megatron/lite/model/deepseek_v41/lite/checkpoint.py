@@ -11,6 +11,11 @@ from pathlib import Path
 from types import MappingProxyType
 
 import torch
+from megatron.lite.primitive.ckpt.hf_weights import (
+    DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+    _resolve_export_dtype,
+    stream_export_to_shards,
+)
 from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
 from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 from safetensors import SafetensorError, safe_open
@@ -40,7 +45,9 @@ def _coverage(entries, expected_keys):
         raise ValueError("duplicate expected keys")
     missing, extra = set(expected) - entries.keys(), entries.keys() - set(expected)
     if missing or extra:
-        raise ValueError(f"key coverage mismatch: missing={len(missing)} extra={len(extra)}")
+        raise ValueError(
+            f"key coverage mismatch: missing={len(missing)} extra={len(extra)}"
+        )
 
 
 @dataclass(frozen=True)
@@ -90,7 +97,9 @@ class CheckpointTensorStore:
                 raise ValueError(f"invalid safetensors file: {path}") from error
             with path.open("rb") as source:
                 length = struct.unpack("<Q", source.read(8))[0]
-                header = json.loads(source.read(length), object_pairs_hook=_unique_object)
+                header = json.loads(
+                    source.read(length), object_pairs_hook=_unique_object
+                )
             for name in keys:
                 if key_prefix is not None and not name.startswith(key_prefix):
                     continue
@@ -169,7 +178,9 @@ def _tensor(store, name):
     if entry.byte_length == 0:
         return torch.empty(entry.shape, dtype=dtype)
     # Own the backing storage; neither the immutable entry nor a mapped file is mutated.
-    return torch.frombuffer(bytearray(store.read(name)), dtype=dtype).reshape(entry.shape)
+    return torch.frombuffer(bytearray(store.read(name)), dtype=dtype).reshape(
+        entry.shape
+    )
 
 
 def _decode_fp8(weight, scale, row_block):
@@ -218,7 +229,9 @@ def load_weight(store, name, *, output_dtype=torch.bfloat16):
         if weight.dtype not in _CODECS:
             raise TypeError(f"unsupported weight dtype: {weight.dtype}")
         row_block, decode = _CODECS[weight.dtype]
-        result = decode(weight, scale, 1 if name.endswith(".engram.embed.weight") else row_block)
+        result = decode(
+            weight, scale, 1 if name.endswith(".engram.embed.weight") else row_block
+        )
     result = result.to(output_dtype)
     if not torch.isfinite(result).all():
         raise ValueError(f"nonfinite decoded weight: {name}")
@@ -286,7 +299,9 @@ def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
                 elif dtype not in ('F32', 'BF16', 'F16'):
                     raise ValueError(f'unsupported dtype: {name}: {dtype}')
             if tuple(header['shape']) != shape:
-                raise ValueError(f'checkpoint shape mismatch: {name}: {header["shape"]} != {shape}')
+                raise ValueError(
+                    f'checkpoint shape mismatch: {name}: {header["shape"]} != {shape}'
+                )
         result[name] = replace(binding, header=header, store=store)
     model.validate_parameter_bindings()
     model.checkpoint_bindings = result
@@ -307,7 +322,9 @@ def export_model(model):
     from .engram import EngramTable
 
     if model.local_layer_range != (0, len(model.layers)):
-        raise NotImplementedError('Pipeline stage export requires distributed checkpoint assembly')
+        raise NotImplementedError(
+            'Pipeline stage export requires distributed checkpoint assembly'
+        )
     model.validate_parameter_bindings()
     for name, binding in model.tensor_bindings.items():
         if binding.role == 'scale':
@@ -320,22 +337,102 @@ def export_model(model):
             yield name[:-6] + 'scale', binding.owner.scale.detach()
 
 
-def save_model(model, path):
+def export_checkpoint(
+    model,
+    *,
+    export_dtype=None,
+    cpu=False,
+    buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+):
+    """Stream complete tensors, bounding conversion copies by the buffer budget.
+
+    A returned tensor is indivisible and may exceed the budget. Encoded FP8
+    tables/scales and inactive archival payloads retain their original bytes;
+    export_dtype applies only to active plain floating-point weights.
+    """
+    dtype = _resolve_export_dtype(export_dtype)
+    if dtype not in (None, torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f'Unsupported export_dtype={export_dtype!r}')
+    if type(cpu) is not bool:
+        raise ValueError('cpu must be bool')
+    if type(buffer_max_size_bytes) is not int or buffer_max_size_bytes < 4:
+        raise ValueError('buffer_max_size_bytes must be an integer >= 4')
+    if model.archival_store is None or set(model.archival_store.entries) != set(
+        model.archival_bindings
+    ):
+        raise ValueError('Complete archival storage is required for export')
+    for name, tensor in export_model(model):
+        target_dtype = (
+            dtype
+            if tensor.dtype in (torch.float32, torch.float16, torch.bfloat16)
+            else None
+        )
+        target_dtype = target_dtype or tensor.dtype
+        device = torch.device('cpu') if cpu else tensor.device
+        if target_dtype != tensor.dtype or device != tensor.device:
+            output = torch.empty(tensor.shape, dtype=target_dtype, device=device)
+            count = buffer_max_size_bytes // max(
+                tensor.element_size(), output.element_size()
+            )
+            # copy_ performs the cast directly into destination slices, without
+            # a second full-size temporary on the source device.
+            source = tensor.reshape(-1)
+            destination = output.view(-1)
+            for start in range(0, tensor.numel(), count):
+                destination[start : start + count].copy_(source[start : start + count])
+            tensor = output
+        yield name, tensor
+    for name in model.archival_store.entries:
+        tensor = _tensor(model.archival_store, name)
+        if not cpu:
+            tensor = tensor.to(next(iter(model.tensor_bindings.values())).tensor.device)
+        yield name, tensor
+
+
+def save_model(model, path, *, export_dtype=None, cpu=True, buffer_max_size_bytes=None):
     """Stream masters plus byte-identical archival entries to an atomic directory."""
     import shutil
 
+    if type(cpu) is not bool:
+        raise ValueError("cpu must be bool")
     path = Path(path)
-    if path.exists():
+    if path.exists() and (not path.is_dir() or any(path.iterdir())):
         raise FileExistsError(path)
     archive = model.archival_store
     required = set(model.archival_bindings)
     if archive is None or not required <= archive.entries.keys():
-        raise ValueError('Complete MTP/vision/aligner archival storage is required for export')
+        raise ValueError(
+            'Complete MTP/vision/aligner archival storage is required for export'
+        )
     if archive.entries.keys() - model.archival_bindings.keys():
         raise ValueError('Unknown archival keys')
     path.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix='.v41-export-', dir=path.parent))
     try:
+        if export_dtype is not None or buffer_max_size_bytes is not None or not cpu:
+            stream_export_to_shards(
+                export_checkpoint(
+                    model,
+                    export_dtype=export_dtype,
+                    cpu=cpu,
+                    buffer_max_size_bytes=(
+                        buffer_max_size_bytes
+                        if buffer_max_size_bytes is not None
+                        else DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
+                    ),
+                ),
+                str(staging),
+                shard_size_bytes=(
+                    buffer_max_size_bytes
+                    if buffer_max_size_bytes is not None
+                    else DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
+                ),
+            )
+            (staging / 'config.json').write_text(
+                json.dumps(model.config.to_hf_dict(), indent=2) + '\n'
+            )
+            os.rename(staging, path)
+            return
         spool = staging / '.active-bytes'
         entries = dict(archive.entries)
         with spool.open('wb') as stream:
@@ -355,7 +452,9 @@ def save_model(model, path):
                 stream.write(raw)
         CheckpointTensorStore(entries).save(staging / 'model.safetensors')
         spool.unlink()
-        (staging / 'config.json').write_text(json.dumps(model.config.to_hf_dict(), indent=2) + '\n')
+        (staging / 'config.json').write_text(
+            json.dumps(model.config.to_hf_dict(), indent=2) + '\n'
+        )
         os.rename(staging, path)
     except BaseException:
         shutil.rmtree(staging)
@@ -382,7 +481,10 @@ def load_model(model, path):
             expected = list(json.loads(source.read(size)))
         expected = [name for name in expected if name != '__metadata__']
     store = CheckpointTensorStore.load(paths, expected_keys=expected)
-    records = [dict(name=name, dtype=e.dtype, shape=e.shape) for name, e in store.entries.items()]
+    records = [
+        dict(name=name, dtype=e.dtype, shape=e.shape)
+        for name, e in store.entries.items()
+    ]
     bindings = bind_checkpoint(model, records, store=store)
     for name, binding in bindings.items():
         if binding.role in ('archival', 'scale'):
@@ -394,7 +496,10 @@ def load_model(model, path):
         if table is not None and table.master is None:
             if store.entries[name].dtype != 'F8_E4M3':
                 raise ValueError('Frozen Engram requires FP8 table storage')
-            for key, destination in ((name, table.weight), (name[:-6] + 'scale', table.scale)):
+            for key, destination in (
+                (name, table.weight),
+                (name[:-6] + 'scale', table.scale),
+            ):
                 destination.copy_(_tensor(store, key).to(destination.device))
         else:
             value = (
@@ -406,5 +511,9 @@ def load_model(model, path):
             if table is not None:
                 table.refresh_storage()
     model.archival_store = CheckpointTensorStore(
-        {name: e for name, e in store.entries.items() if bindings[name].role == 'archival'}
+        {
+            name: e
+            for name, e in store.entries.items()
+            if bindings[name].role == 'archival'
+        }
     )

@@ -43,3 +43,17 @@ Meta construction inspects assembly; execution needs a tokenizer-derived Engram
 map and materialized weights. Select post-training trainability explicitly.
 Single-rank execution is supported. `build_model` rejects PP > 1 (and TP/EP/CP/VPP)
 at construction time; local pipeline range helpers are not a supported PP runtime.
+
+
+## Weight export
+The registered protocol accepts the Verl engine's `export_dtype`, `cpu` and
+`buffer_max_size_bytes` options. `export_dtype` casts active plain FP32/FP16/BF16
+weights; encoded Engram FP8 tables/scales and inactive archival payloads retain
+exact bytes. `cpu=True` returns CPU tensors; otherwise tensors use the model device.
+Conversion copies use the buffer budget, and HF save reuses the shared safetensors
+shard writer with that shard budget. A single named tensor is indivisible and may
+exceed the budget; this is not a hard bound on the returned tensor's memory.
+The default save accepts the engine's precreated empty directory. Existing nonempty
+checkpoints are not overwritten. With no options, the lossless archival save remains
+byte-streamed. Deployment conversion options such as `target` and `resync_config`
+are rejected by name; quantized rollout conversion is not implemented here.
