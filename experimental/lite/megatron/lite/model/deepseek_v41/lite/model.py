@@ -69,14 +69,14 @@ class DeepseekV41Model(nn.Module):
         validate_execution(enable_dspark_execution=enable_dspark_execution)
         self.config = config
         cfg = config.to_hf_dict()
-        t, v = cfg['text_config'], cfg['vision_config']
-        self.hc_mult = t['hc_mult']
+        t, v = (SimpleNamespace(**cfg[key]) for key in ('text_config', 'vision_config'))
+        self.hc_mult = t.hc_mult
         self.vision_schedule = None
         self.register_buffer(
             '_vision_trainability', torch.full((4,), -1, dtype=torch.int8)
         )
         self.register_load_state_dict_post_hook(self._restore_vision_trainability)
-        count = t['num_hidden_layers']
+        count = t.num_hidden_layers
         start, end = (0, count) if layer_range is None else layer_range
         if (
             type(start) is not int
@@ -91,55 +91,49 @@ class DeepseekV41Model(nn.Module):
         self.checkpoint_bindings = None
         self.embed = self.norm = self.head = None
         if start == 0:
-            self.embed = nn.Embedding(
-                t['vocab_size'], t['hidden_size'], dtype=torch.bfloat16
-            )
+            self.embed = nn.Embedding(t.vocab_size, t.hidden_size, dtype=torch.bfloat16)
             self._bind('embed.weight', self.embed, 'weight', 'embedding')
         if end == count:
-            self.norm = RMSNorm(t['hidden_size'], t['rms_norm_eps'])
+            self.norm = RMSNorm(t.hidden_size, t.rms_norm_eps)
             self.head = nn.Linear(
-                t['hidden_size'], t['vocab_size'], bias=False, dtype=torch.float32
+                t.hidden_size, t.vocab_size, bias=False, dtype=torch.float32
             )
             self._bind('norm.weight', self.norm, 'weight', 'norm')
             self._bind('head.weight', self.head, 'weight', 'head')
         self.layers = nn.ModuleList()
-        flags = dict(
-            linear_fp8=quantized,
-            main_qat=quantized,
-            index_qat=quantized,
-            swa_fp8=quantized,
+        ac = config.attention_config(
+            **dict.fromkeys(
+                ('linear_fp8', 'main_qat', 'index_qat', 'swa_fp8'), quantized
+            )
         )
-        ac = config.attention_config(**flags)
-        for layer_id in range(t['num_hidden_layers']):
+        for layer_id in range(t.num_hidden_layers):
             if not start <= layer_id < end:
                 self.layers.append(None)  # Preserve canonical global layer indices.
                 continue
             prefix = f'layers.{layer_id}'
             attention = CSA2Attention(ac, layer_id)
             router = ModalityRouter(
-                SimpleNamespace(**t),
+                t,
                 SimpleNamespace(tp_size=1),
                 gate_temperature=gate_temperature,
                 bias_rate=bias_rate,
             )
             experts = [
                 self._expert(t, quantized, shared=False)
-                for _ in range(t['n_routed_experts'])
+                for _ in range(t.n_routed_experts)
             ]
             shared = (
-                self._expert(t, quantized, shared=True)
-                if t['n_shared_experts']
-                else None
+                self._expert(t, quantized, shared=True) if t.n_shared_experts else None
             )
             ffn = DeepseekV41MoE(router, experts, shared)
             block = DeepseekV41Block(
-                t['hidden_size'],
-                t['hc_mult'],
+                t.hidden_size,
+                t.hc_mult,
                 attention,
                 ffn,
-                norm_eps=t['rms_norm_eps'],
-                hc_eps=t['hc_eps'],
-                iterations=t['hc_sinkhorn_iters'],
+                norm_eps=t.rms_norm_eps,
+                hc_eps=t.hc_eps,
+                iterations=t.hc_sinkhorn_iters,
             )
             block.engram = None
             self.layers.append(block)
@@ -170,55 +164,51 @@ class DeepseekV41Model(nn.Module):
                         prefix + f'.hc_{side}_{attr}', mixes, attr, 'hyper_connection'
                     )
         self.engram_hash = None
-        self.engram_layer_ids = tuple(t['engram_layer_ids'])
+        self.engram_layer_ids = tuple(t.engram_layer_ids)
         if self.engram_layer_ids:
             if token_map is not None:
                 # Integer layout construction stays on CPU even for meta allocation.
                 with torch.device('cpu'):
                     primes = prime_buckets(
                         self.engram_layer_ids,
-                        t['engram_max_ngram_size'],
-                        t['engram_n_heads'],
-                        t['engram_vocab_size'],
+                        t.engram_max_ngram_size,
+                        t.engram_n_heads,
+                        t.engram_vocab_size,
                     )
-                    if primes.flatten(1).sum(1).tolist() != t['engram_num_embeddings']:
+                    if primes.flatten(1).sum(1).tolist() != t.engram_num_embeddings:
                         raise ValueError(
                             'engram_num_embeddings disagrees with prime layout'
                         )
                     if (
-                        len(token_map) != t['vocab_size']
+                        len(token_map) != t.vocab_size
                         or min(token_map) < 0
-                        or max(token_map) >= t['engram_compressed_vocab_size']
+                        or max(token_map) >= t.engram_compressed_vocab_size
                     ):
                         raise ValueError('token_map disagrees with Engram vocabulary')
                     multipliers = hash_multipliers(
                         self.engram_layer_ids,
-                        t['engram_max_ngram_size'],
-                        t['engram_compressed_vocab_size'],
+                        t.engram_max_ngram_size,
+                        t.engram_compressed_vocab_size,
                     )
                     self.engram_hash = NgramHash(
-                        token_map, t['engram_pad_token_id'], multipliers, primes
+                        token_map, t.engram_pad_token_id, multipliers, primes
                     )
             for offset, layer_id in enumerate(self.engram_layer_ids):
                 if not start <= layer_id < end:
                     continue
-                rows, width = t['engram_num_embeddings'][offset], t['engram_head_dim']
+                rows, width = t.engram_num_embeddings[offset], t.engram_head_dim
                 table = EngramTable(
                     torch.zeros(rows, width, dtype=torch.float8_e4m3fn),
                     torch.ones(rows, width // 32, dtype=torch.float8_e8m0fnu),
                     trainable=trainable_engram,
                 )
                 projection = Linear(
-                    (t['engram_max_ngram_size'] - 1) * t['engram_n_heads'] * width,
-                    (t['hc_mult'] + 1) * t['hidden_size'],
+                    (t.engram_max_ngram_size - 1) * t.engram_n_heads * width,
+                    (t.hc_mult + 1) * t.hidden_size,
                     fp8=quantized,
                 )
                 module = Engram(
-                    t['hidden_size'],
-                    t['hc_mult'],
-                    table,
-                    projection,
-                    eps=t['rms_norm_eps'],
+                    t.hidden_size, t.hc_mult, table, projection, eps=t.rms_norm_eps
                 )
                 self.layers[layer_id].engram = module
                 prefix = f'layers.{layer_id}.engram'
@@ -245,14 +235,14 @@ class DeepseekV41Model(nn.Module):
         self.aligner = None
         if start == 0:
             vision_args = SimpleNamespace(
-                vision_dim=v['hidden_size'],
-                vision_n_heads=v['num_attention_heads'],
-                vision_n_layers=v['num_hidden_layers'],
-                vision_inter_dim=v['intermediate_size'],
-                vision_patch_size=v['patch_size'],
-                vision_rope_theta=v['rope_theta'],
-                vision_downsample_ratio=v['downsample_ratio'],
-                dim=t['hidden_size'],
+                vision_dim=v.hidden_size,
+                vision_n_heads=v.num_attention_heads,
+                vision_n_layers=v.num_hidden_layers,
+                vision_inter_dim=v.intermediate_size,
+                vision_patch_size=v.patch_size,
+                vision_rope_theta=v.rope_theta,
+                vision_downsample_ratio=v.downsample_ratio,
+                dim=t.hidden_size,
             )
             self.vision = ViT(vision_args)
             self.aligner = Aligner(vision_args)
@@ -264,9 +254,7 @@ class DeepseekV41Model(nn.Module):
                         root + '.' + name, module.get_submodule(path), attribute, root
                     )
             for key in ('image_start', 'image_end', 'image_newline'):
-                self.register_parameter(
-                    key, nn.Parameter(torch.zeros(t['hidden_size']))
-                )
+                self.register_parameter(key, nn.Parameter(torch.zeros(t.hidden_size)))
                 self._bind(key, self, key, 'image_delimiter')
         self.mtp = DeferredModule('DSpark')
         self.archival_bindings = {
@@ -289,8 +277,8 @@ class DeepseekV41Model(nn.Module):
 
     @staticmethod
     def _expert(t, quantized, shared):
-        dim = t['hidden_size']
-        width = t['moe_intermediate_size'] * (t['n_shared_experts'] if shared else 1)
+        dim = t.hidden_size
+        width = t.moe_intermediate_size * (t.n_shared_experts if shared else 1)
 
         def projection(a, b):
             return (
@@ -303,18 +291,12 @@ class DeepseekV41Model(nn.Module):
             projection(dim, width),
             projection(width, dim),
             projection(dim, width),
-            swiglu_limit=t['swiglu_limit'],
+            swiglu_limit=t.swiglu_limit,
         )
 
     def _bind_weight(self, prefix, owner, name, role, heads=None, encoding=None):
-        self._bind(
-            f'{prefix}.{name}.weight',
-            getattr(owner, name),
-            'weight',
-            role,
-            heads,
-            encoding,
-        )
+        module = getattr(owner, name)
+        self._bind(f'{prefix}.{name}.weight', module, 'weight', role, heads, encoding)
 
     def _bind_expert(self, prefix, expert, role, encoding):
         for name in ('w1', 'w2', 'w3'):
@@ -322,7 +304,7 @@ class DeepseekV41Model(nn.Module):
 
     def _bind_attention(self, prefix, a, t):
         for name in ('wq_a', 'wq_b', 'wkv', 'wo_a', 'wo_b'):
-            heads = t['num_attention_heads'] if name == 'wq_b' else None
+            heads = t.num_attention_heads if name == 'wq_b' else None
             self._bind_weight(prefix, a, name, name, heads, 'F8_E4M3')
         for name in ('q_norm', 'kv_norm'):
             self._bind_weight(prefix, a, name, 'norm')
@@ -340,13 +322,13 @@ class DeepseekV41Model(nn.Module):
                         owner,
                         name,
                         role,
-                        t['index_n_heads'] if indexed else None,
+                        t.index_n_heads if indexed else None,
                         'F8_E4M3' if indexed else None,
                     )
 
     @staticmethod
     def _archive_keys(t):
-        for index in range(t['num_nextn_predict_layers']):
+        for index in range(t.num_nextn_predict_layers):
             prefix = f'mtp.{index}.'
             plain = (
                 'attn.attn_sink attn.kv_norm.weight attn.q_norm.weight '
@@ -361,8 +343,8 @@ class DeepseekV41Model(nn.Module):
                 for side in ('attn', 'ffn')
                 for suffix in ('fn', 'base', 'scale')
             ]
-            experts = [f'experts.{i}' for i in range(t['dspark_n_routed_experts'])]
-            if t['n_shared_experts']:
+            experts = [f'experts.{i}' for i in range(t.dspark_n_routed_experts)]
+            if t.n_shared_experts:
                 experts.append('shared_experts')
             matrices += [
                 f'ffn.{expert}.{name}'
@@ -372,7 +354,7 @@ class DeepseekV41Model(nn.Module):
             if index == 0:
                 plain.append('main_norm.weight')
                 matrices.append('main_proj')
-            if index == t['num_nextn_predict_layers'] - 1:
+            if index == t.num_nextn_predict_layers - 1:
                 plain += (
                     'confidence_head.proj.weight markov_head.embed.weight '
                     'markov_head.head.weight norm.weight'
@@ -396,28 +378,39 @@ class DeepseekV41Model(nn.Module):
         if len(ids) != len(set(ids)) or set(ids) != {id(p) for p in self.parameters()}:
             raise ValueError('Every parameter must have exactly one binding')
 
-    def _sequence(self, hidden, pre, *, input_ids, image_mask=None):
+    def _layers(self, hidden, pre, input_ids, start, end, state, ced, image_mask=None):
+        token_mask = None if image_mask is None else ~image_mask
         hashes = None
-        if self.engram_layer_ids:
+        if any(start <= layer < end for layer in self.engram_layer_ids):
             if self.engram_hash is None:
                 raise ValueError(
                     'Engram execution requires an explicit tokenizer token_map'
                 )
-            hashes = self.engram_hash(
-                input_ids, None if image_mask is None else ~image_mask
-            )
-        state = AttentionState()
-        for index, layer in enumerate(self.layers):
+            hashes = self.engram_hash(input_ids, token_mask)
+        for index in range(start, end):
+            layer = self.layers[index]
             if layer.engram is not None:
                 hidden = layer.engram(
-                    hidden,
-                    hashes[:, :, self.engram_layer_ids.index(index)],
-                    None if image_mask is None else ~image_mask,
+                    hidden, hashes[:, :, self.engram_layer_ids.index(index)], token_mask
                 )
             hidden, pre, state = layer.forward_with_state(
                 hidden, pre, state, ffn_kwargs={'image_mask': image_mask}
             )
-        return hidden, pre
+            if index == 19:
+                ced = hidden, pre
+        return hidden, pre, state, ced
+
+    def _sequence(self, hidden, pre, *, input_ids, image_mask=None):
+        return self._layers(
+            hidden,
+            pre,
+            input_ids,
+            0,
+            len(self.layers),
+            AttentionState(),
+            (None, None),
+            image_mask,
+        )[:2]
 
     def forward_pipeline_range(
         self, input_ids, *, start, end, payload=None, owners=(-1, -1)
@@ -467,26 +460,13 @@ class DeepseekV41Model(nn.Module):
                 indices=payload.topk,
                 candidates=payload.candidates,
             )
-        hashes = None
-        if any(start <= layer < end for layer in self.engram_layer_ids):
-            if self.engram_hash is None:
-                raise ValueError(
-                    'Engram execution requires an explicit tokenizer token_map'
-                )
-            hashes = self.engram_hash(input_ids)
-        for index in range(start, end):
-            if index == 20:
-                # Block(19)'s shifted coefficients belong to h20. They cannot
-                # be reconstructed from a later block's current coefficients.
-                hidden, pre = ced_h, ced_p
-            layer = self.layers[index]
-            if layer.engram is not None:
-                hidden = layer.engram(
-                    hidden, hashes[:, :, self.engram_layer_ids.index(index)]
-                )
-            hidden, pre, state = layer.forward_with_state(hidden, pre, state)
-            if index == 19:
-                ced_h, ced_p = hidden, pre
+        # A stage beginning at p20 consumes the transported CED pair. A range
+        # crossing p20 already holds this exact h19/p19 pair in its live stream.
+        if start == 20:
+            hidden, pre = ced_h, ced_p
+        hidden, pre, state, (ced_h, ced_p) = self._layers(
+            hidden, pre, input_ids, start, end, state, (ced_h, ced_p)
+        )
         return PairedPayload(
             h=hidden,
             p=pre,

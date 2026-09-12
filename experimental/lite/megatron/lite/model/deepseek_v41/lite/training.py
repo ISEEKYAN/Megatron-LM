@@ -6,7 +6,6 @@ copy executes vision only: weights flow owner -> copy before each microbatch;
 gradients flow copy -> owner after the complete language-model backward.
 """
 
-from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
@@ -31,28 +30,24 @@ class VisionTrainability:
                 'Cannot change trainability with a pending vision backward'
             )
         model.vision_trainability = self
-        model._vision_trainability.copy_(
-            torch.tensor(
-                [self.encoder, self.norm, self.aligner, self.delimiter],
-                dtype=torch.int8,
-                device=model._vision_trainability.device,
-            )
-        )
-        for parameter in model.vision.parameters():
-            parameter.requires_grad_(self.encoder)
-        for parameter in model.vision.norm.parameters():
-            parameter.requires_grad_(self.norm)
-        for parameter in model.aligner.parameters():
-            parameter.requires_grad_(self.aligner)
-        for key in ('image_start', 'image_end', 'image_newline'):
-            getattr(model, key).requires_grad_(self.delimiter)
+        mask = model._vision_trainability
+        mask.copy_(mask.new_tensor(tuple(vars(self).values())))
+        for module, enabled in (
+            (model.vision, self.encoder),
+            (model.vision.norm, self.norm),
+            (model.aligner, self.aligner),
+        ):
+            module.requires_grad_(enabled)
+        vectors = [
+            getattr(model, key) for key in ('image_start', 'image_end', 'image_newline')
+        ]
+        for parameter in vectors:
+            parameter.requires_grad_(self.delimiter)
         # A changed mask must never leave old gradients on frozen owners.
         for parameter in (
             *model.vision.parameters(),
             *model.aligner.parameters(),
-            model.image_start,
-            model.image_end,
-            model.image_newline,
+            *vectors,
         ):
             if not parameter.requires_grad:
                 parameter.grad = None
@@ -61,42 +56,36 @@ class VisionTrainability:
 
 
 class VisionSchedule:
-    """One outstanding microbatch; copies are deliberately outside the module tree.
+    """One microbatch: external vision forward, LM backward, then vision backward.
 
-    ``backward(loss)`` is the protocol's runtime backward callback. It also
-    supports external RL losses because the runtime passes the scaled loss.
-    Failed or abandoned forwards must call ``abort`` before reuse.
+    ``backward(loss)`` accepts runtime-scaled SFT/RL losses; abort failed forwards.
     """
 
     def __init__(self, model, device):
         self.model = model
-        self.vision = deepcopy(model.vision).to(device=device)
-        self.aligner = deepcopy(model.aligner).to(device=device)
+        self.device = device
+        self.weights = {}
         self.stage = 'idle'
-        self.features = []
-        self.leaves = []
+        self.pending = []
 
-    def _pairs(self):
-        for owner, copy in (
-            (self.model.vision, self.vision),
-            (self.model.aligner, self.aligner),
-        ):
-            yield from zip(owner.parameters(), copy.parameters(), strict=True)
-
-    @torch.no_grad()
     def sync_weights(self):
         if self.stage != 'idle':
             raise RuntimeError(
                 'Cannot synchronize weights with a pending vision backward'
             )
-        for owner, replica in self._pairs():
-            replica.copy_(owner)
-            replica.requires_grad_(owner.requires_grad)
-            replica.grad = None
-            if hasattr(replica, 'main_grad'):
-                replica.main_grad = None
-        self.vision.train(self.model.training)
-        self.aligner.train(self.model.training)
+        # CopyBackward returns the accumulated external gradient to its FP32 owner.
+        self.weights = {
+            root: {
+                name: value.to(self.device, copy=True)
+                for name, value in getattr(self.model, root).named_parameters()
+            }
+            for root in ('vision', 'aligner')
+        }
+
+    def _call(self, root, *args):
+        return torch.func.functional_call(
+            getattr(self.model, root), self.weights[root], args, strict=True
+        )
 
     def forward(self, images):
         self.sync_weights()
@@ -105,17 +94,17 @@ class VisionSchedule:
             for sample in images:
                 row = []
                 for img in sample or ():
-                    weight = self.vision.patch_embed.proj.weight
+                    weight = self.weights['vision']['patch_embed.proj.weight']
                     patches = img.patches.to(device=weight.device, dtype=weight.dtype)
-                    feature = self.aligner(
-                        self.vision(patches, img.n_vit_h, img.n_vit_w),
+                    feature = self._call(
+                        'aligner',
+                        self._call('vision', patches, img.n_vit_h, img.n_vit_w),
                         img.n_vit_h,
                         img.n_vit_w,
                     )
                     leaf = feature.detach().to(self.model.embed.weight.device)
                     leaf.requires_grad_(feature.requires_grad)
-                    self.features.append(feature)
-                    self.leaves.append(leaf)
+                    self.pending.append((feature, leaf))
                     row.append(leaf)
                 result.append(row)
         except Exception:
@@ -123,7 +112,7 @@ class VisionSchedule:
             raise
         self.stage = 'vision_forward' if torch.is_grad_enabled() else 'idle'
         if self.stage == 'idle':
-            self.features, self.leaves = [], []
+            self.abort()
         return result
 
     def backward(self, loss):
@@ -138,7 +127,7 @@ class VisionSchedule:
             raise RuntimeError('Vision backward must follow completed LLM backward')
         active = [
             (value, leaf.grad)
-            for value, leaf in zip(self.features, self.leaves)
+            for value, leaf in self.pending
             if value.requires_grad and leaf.grad is not None
         ]
         if active:
@@ -146,23 +135,10 @@ class VisionSchedule:
                 [value for value, _ in active],
                 [grad.to(value.device) for value, grad in active],
             )
-        for owner, replica in self._pairs():
-            if owner.requires_grad and replica.grad is not None:
-                gradient = replica.grad.to(device=owner.device, dtype=owner.dtype)
-                if owner.grad is None:
-                    owner.grad = gradient.clone()
-                else:
-                    owner.grad.add_(gradient)
-                if hasattr(owner, 'main_grad'):
-                    owner.main_grad = owner.grad
         self.abort()
 
     def state_dict(self):
-        """Save a completed post-training stage, never a live autograd graph.
-
-        Model weights, accumulated gradients and optimizer state belong to the
-        caller's training checkpoint. Mid-microbatch restart requires replay.
-        """
+        """Save the completed phase/mask; the caller checkpoints model/optimizer state."""
         if self.stage != 'idle':
             raise RuntimeError('Checkpoint requires a completed vision backward')
         return {
@@ -180,7 +156,6 @@ class VisionSchedule:
 
     def abort(self):
         """Release pending graphs; the caller must discard partial LLM gradients."""
-        self.features, self.leaves = [], []
-        for _, replica in self._pairs():
-            replica.grad = None
+        self.pending = []
+        self.weights = {}
         self.stage = 'idle'
