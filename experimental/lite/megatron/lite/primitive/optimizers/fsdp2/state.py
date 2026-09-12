@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
 from megatron.lite.primitive.optimizers.fsdp2.adamw import (
     dtensor_from_local,
     is_dtensor_like,
@@ -45,7 +44,10 @@ def move_optimizer_state_to_cpu(
                     if not include_dtensor_state:
                         continue
                     local_value = value.to_local()
-                    if not isinstance(local_value, torch.Tensor) or not local_value.is_cuda:
+                    if (
+                        not isinstance(local_value, torch.Tensor)
+                        or not local_value.is_cuda
+                    ):
                         continue
                     offloaded[(id(param), key)] = OffloadedStateEntry(
                         device=local_value.device,

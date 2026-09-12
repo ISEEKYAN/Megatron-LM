@@ -6,7 +6,9 @@ import torch.distributed as dist
 from torch.distributed.nn.functional import all_gather
 
 
-def _all_gather_cp(tensor: torch.Tensor, group: dist.ProcessGroup) -> list[torch.Tensor]:
+def _all_gather_cp(
+    tensor: torch.Tensor, group: dist.ProcessGroup
+) -> list[torch.Tensor]:
     return list(all_gather(tensor.contiguous(), group=group))
 
 
@@ -15,10 +17,14 @@ def iter_cp_sources(tensor, position_ids, *, cp_rank, cp_size, cp_group):
         yield cp_rank, tensor, position_ids
         return
     if cp_group is None:
-        raise RuntimeError("CP source iteration requires a context-parallel process group.")
+        raise RuntimeError(
+            "CP source iteration requires a context-parallel process group."
+        )
     tensor_parts = _all_gather_cp(tensor, cp_group)
     position_parts = _all_gather_cp(position_ids.to(dtype=torch.long), cp_group)
-    for rank, (source_tensor, source_positions) in enumerate(zip(tensor_parts, position_parts)):
+    for rank, (source_tensor, source_positions) in enumerate(
+        zip(tensor_parts, position_parts)
+    ):
         yield rank, source_tensor, source_positions
 
 
@@ -26,9 +32,13 @@ def _gather_contiguous_tail(tensor, *, tail_len, cp_size, cp_group, seq_dim):
     if cp_size <= 1 or tail_len <= 0:
         return None
     if cp_group is None:
-        raise RuntimeError("CP chunk-tail gather requires a context-parallel process group.")
+        raise RuntimeError(
+            "CP chunk-tail gather requires a context-parallel process group."
+        )
     if tensor.size(seq_dim) < tail_len:
-        raise ValueError(f"CP chunk tail needs len >= {tail_len}, got {tensor.size(seq_dim)}.")
+        raise ValueError(
+            f"CP chunk tail needs len >= {tail_len}, got {tensor.size(seq_dim)}."
+        )
     tail = tensor.narrow(seq_dim, tensor.size(seq_dim) - tail_len, tail_len)
     return _all_gather_cp(tail.contiguous(), cp_group)
 

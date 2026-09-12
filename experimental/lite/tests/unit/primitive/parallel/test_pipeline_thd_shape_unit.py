@@ -17,16 +17,19 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
 from megatron.lite.primitive.parallel import pipeline as pl
 
 
 def _make_ps(pp_size: int, pp_rank: int) -> SimpleNamespace:
     return SimpleNamespace(
-        pp_size=pp_size, pp_rank=pp_rank,
-        pp_is_first=(pp_rank == 0), pp_is_last=(pp_rank == pp_size - 1),
-        pp_prev_rank=pp_rank - 1, pp_next_rank=pp_rank + 1, pp_group=None,
+        pp_size=pp_size,
+        pp_rank=pp_rank,
+        pp_is_first=(pp_rank == 0),
+        pp_is_last=(pp_rank == pp_size - 1),
+        pp_prev_rank=pp_rank - 1,
+        pp_next_rank=pp_rank + 1,
+        pp_group=None,
     )
 
 
@@ -53,17 +56,32 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
     recorded_fwd, recorded_bwd = [], []
     fwd_q, bwd_q = list(fwd_shapes), list(fwd_shapes)  # both arrive in mb order
 
-    def fake_srp(send_fwd, send_bwd, recv_fwd, recv_bwd, ps_, tensor_shape,
-                 *, fwd_recv_buf=None, bwd_recv_buf=None, batch_p2p=True,
-                 clone_recv=False, dynamic_shape=False):
+    def fake_srp(
+        send_fwd,
+        send_bwd,
+        recv_fwd,
+        recv_bwd,
+        ps_,
+        tensor_shape,
+        *,
+        fwd_recv_buf=None,
+        bwd_recv_buf=None,
+        batch_p2p=True,
+        clone_recv=False,
+        dynamic_shape=False,
+    ):
         assert dynamic_shape, "1F1B schedule must use dynamic shape exchange"
-        assert fwd_recv_buf is None and bwd_recv_buf is None, "dynamic recv must not pre-size"
+        assert (
+            fwd_recv_buf is None and bwd_recv_buf is None
+        ), "dynamic recv must not pre-size"
         fwd_out = bwd_out = None
         if recv_fwd:
-            shp = fwd_q.pop(0); recorded_fwd.append(shp)
+            shp = fwd_q.pop(0)
+            recorded_fwd.append(shp)
             fwd_out = torch.ones(shp, requires_grad=True)
         if recv_bwd:
-            shp = bwd_q.pop(0); recorded_bwd.append(shp)
+            shp = bwd_q.pop(0)
+            recorded_bwd.append(shp)
             bwd_out = torch.ones(shp)
         return fwd_out, bwd_out
 
@@ -74,8 +92,11 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
         else:
             inp = unwrap_model(m)._input_tensor
             assert inp is not None, "middle/last stage forwarded with a None input"
-            assert tuple(inp.shape) == (s, 1, hidden), (
-                f"input shape {tuple(inp.shape)} != {(s, 1, hidden)} for mb S={s}")
+            assert tuple(inp.shape) == (
+                s,
+                1,
+                hidden,
+            ), f"input shape {tuple(inp.shape)} != {(s, 1, hidden)} for mb S={s}"
             base = inp
         hidden_t = base * m.weight.sum()
         out = {"hidden_states": hidden_t}
@@ -87,8 +108,14 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
     orig_srp, pl._send_recv_pipeline = pl._send_recv_pipeline, fake_srp
     try:
         pl._1f1b_schedule(
-            forward_step_fn, model, iter([(b, None) for b in batches]),
-            num_mb, SimpleNamespace(num_microbatches=num_mb), ps, fwd_shapes[0])
+            forward_step_fn,
+            model,
+            iter([(b, None) for b in batches]),
+            num_mb,
+            SimpleNamespace(num_microbatches=num_mb),
+            ps,
+            fwd_shapes[0],
+        )
     finally:
         pl._send_recv_pipeline = orig_srp
     return recorded_fwd, recorded_bwd, fwd_shapes
@@ -135,8 +162,12 @@ def _pp_hidden(mb_idx: int, seqlen: int) -> torch.Tensor:  # deterministic [S,1,
 
 
 def _dynamic_shape_worker(rank, world, port, results):
-    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port),
-                      RANK=str(rank), WORLD_SIZE=str(world))
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+        RANK=str(rank),
+        WORLD_SIZE=str(world),
+    )
     pl._PIPELINE_TENSOR_DTYPE = torch.float32  # gloo-safe; sizing is dtype-agnostic
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
@@ -144,34 +175,78 @@ def _dynamic_shape_worker(rank, world, port, results):
         detail = []
         for i, s in enumerate(_PP_VARLEN):
             if rank == 0:
-                pl._send_recv_pipeline(_pp_hidden(i, s), None, False, False, ps,
-                                       (1, 1, _PP_H), batch_p2p=False, dynamic_shape=True)
+                pl._send_recv_pipeline(
+                    _pp_hidden(i, s),
+                    None,
+                    False,
+                    False,
+                    ps,
+                    (1, 1, _PP_H),
+                    batch_p2p=False,
+                    dynamic_shape=True,
+                )
             else:
-                fwd_buf, _ = pl._send_recv_pipeline(None, None, True, False, ps,
-                                                    (1, 1, _PP_H), batch_p2p=False, dynamic_shape=True)
+                fwd_buf, _ = pl._send_recv_pipeline(
+                    None,
+                    None,
+                    True,
+                    False,
+                    ps,
+                    (1, 1, _PP_H),
+                    batch_p2p=False,
+                    dynamic_shape=True,
+                )
                 expect = _pp_hidden(i, s)
-                detail.append((s, tuple(fwd_buf.shape) == (s, 1, _PP_H),
-                               bool(torch.equal(fwd_buf.detach().float(), expect.float()))))
+                detail.append(
+                    (
+                        s,
+                        tuple(fwd_buf.shape) == (s, 1, _PP_H),
+                        bool(torch.equal(fwd_buf.detach().float(), expect.float())),
+                    )
+                )
         results.put((rank, detail))
     finally:
         dist.destroy_process_group()
 
 
 def _fixed_buffer_worker(rank, world, port, results):
-    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port),
-                      RANK=str(rank), WORLD_SIZE=str(world))
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+        RANK=str(rank),
+        WORLD_SIZE=str(world),
+    )
     pl._PIPELINE_TENSOR_DTYPE = torch.float32
     dist.init_process_group("gloo", rank=rank, world_size=world)
     try:
         ps = _make_ps(2, rank)
         first_len = _PP_VARLEN[0]  # fixed recv buffer sized from the FIRST mb (S=5)
         if rank == 0:
-            pl._send_recv_pipeline(_pp_hidden(2, _PP_VARLEN[2]), None, False, False, ps,
-                                   (first_len, 1, _PP_H), batch_p2p=False, dynamic_shape=False)
+            pl._send_recv_pipeline(
+                _pp_hidden(2, _PP_VARLEN[2]),
+                None,
+                False,
+                False,
+                ps,
+                (first_len, 1, _PP_H),
+                batch_p2p=False,
+                dynamic_shape=False,
+            )
         else:
-            fixed_buf = torch.empty(first_len, 1, _PP_H, dtype=torch.float32)  # only fits S=5
-            pl._send_recv_pipeline(None, None, True, False, ps, (first_len, 1, _PP_H),
-                                   fwd_recv_buf=fixed_buf, batch_p2p=False, dynamic_shape=False)
+            fixed_buf = torch.empty(
+                first_len, 1, _PP_H, dtype=torch.float32
+            )  # only fits S=5
+            pl._send_recv_pipeline(
+                None,
+                None,
+                True,
+                False,
+                ps,
+                (first_len, 1, _PP_H),
+                fwd_recv_buf=fixed_buf,
+                batch_p2p=False,
+                dynamic_shape=False,
+            )
         results.put((rank, "no_abort"))  # reaching here without abort is the bug
     finally:
         dist.destroy_process_group()
@@ -197,6 +272,7 @@ def test_dynamic_shape_variable_len_recv_gloo():  # NEW: recv sized from wire, 0
 
 def test_fixed_buffer_truncates_variable_len_gloo():  # OLD: fixed buffer overflows -> abort
     import torch.multiprocessing as mp
+
     results = mp.get_context("spawn").SimpleQueue()
     with pytest.raises(Exception):  # gloo aborts the receiver -> spawn failure
         mp.spawn(_fixed_buffer_worker, args=(2, 29664, results), nprocs=2, join=True)

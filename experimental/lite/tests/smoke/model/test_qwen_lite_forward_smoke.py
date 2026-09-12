@@ -10,10 +10,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-pytestmark = [
-    pytest.mark.gpus(1),
-    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
-]
+pytestmark = [pytest.mark.gpus(1), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
 
 
 def _qwen3_symbols():
@@ -117,7 +114,9 @@ def _assert_loss_and_backward(output: dict, model: torch.nn.Module):
     assert torch.isfinite(loss)
     loss.backward()
     grad_params = [
-        param for param in model.parameters() if param.requires_grad and param.grad is not None
+        param
+        for param in model.parameters()
+        if param.requires_grad and param.grad is not None
     ]
     assert grad_params
     assert all(
@@ -172,7 +171,9 @@ def test_qwen35_lite_tiny_forward_backward_smoke():
 @pytest.mark.gpus(4)
 def test_qwen35_tp2_tp4_mixed_attention_parity_and_backward():
     if dist.get_world_size() < 4 or dist.get_world_size() % 4 != 0:
-        pytest.skip("Qwen3.5 TP replication smoke requires a world size divisible by 4.")
+        pytest.skip(
+            "Qwen3.5 TP replication smoke requires a world size divisible by 4."
+        )
 
     Qwen35Config, Qwen35Model = _qwen35_symbols()
     from megatron.lite.model.qwen3_5.lite.checkpoint import (
@@ -206,9 +207,11 @@ def test_qwen35_tp2_tp4_mixed_attention_parity_and_backward():
     )
 
     path_box = [
-        tempfile.mkdtemp(prefix="mlite-qwen35-tp-replication-")
-        if dist.get_rank() == 0
-        else None
+        (
+            tempfile.mkdtemp(prefix="mlite-qwen35-tp-replication-")
+            if dist.get_rank() == 0
+            else None
+        )
     ]
     dist.broadcast_object_list(path_box, src=0)
     checkpoint_dir = path_box[0]
@@ -253,9 +256,13 @@ def test_qwen35_tp2_tp4_mixed_attention_parity_and_backward():
     if dist.get_rank() == 0:
         logits_max_abs = (tp4_logits - tp2_logits).abs().max().item()
         loss_abs = (tp4_output["loss"].float() - tp2_loss).abs().item()
-        print(f"QWEN35_TP_PARITY logits_max_abs={logits_max_abs:.8g} loss_abs={loss_abs:.8g}")
+        print(
+            f"QWEN35_TP_PARITY logits_max_abs={logits_max_abs:.8g} loss_abs={loss_abs:.8g}"
+        )
     torch.testing.assert_close(tp4_logits, tp2_logits, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(tp4_output["loss"].float(), tp2_loss, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(
+        tp4_output["loss"].float(), tp2_loss, atol=1e-3, rtol=1e-3
+    )
     tp4_output["loss"].backward()
 
     gdn = tp4_model.layers[0].linear_attn

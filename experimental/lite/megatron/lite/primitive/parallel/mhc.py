@@ -4,7 +4,9 @@ from typing import Any
 import torch
 
 
-def expand_mhc_hidden_for_pipeline(hidden: torch.Tensor, *, hc_mult: int) -> torch.Tensor:
+def expand_mhc_hidden_for_pipeline(
+    hidden: torch.Tensor, *, hc_mult: int
+) -> torch.Tensor:
     if hidden.dim() == 3:
         return hidden.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()
     return hidden
@@ -22,7 +24,9 @@ def fold_mhc_hidden_for_pipeline(hidden: torch.Tensor) -> torch.Tensor:
     return hidden
 
 
-def unfold_mhc_hidden_from_pipeline(hidden: torch.Tensor, *, hc_mult: int) -> torch.Tensor:
+def unfold_mhc_hidden_from_pipeline(
+    hidden: torch.Tensor, *, hc_mult: int
+) -> torch.Tensor:
     """Inverse of :func:`fold_mhc_hidden_for_pipeline`: [B, S, hc_mult * H] -> [B, S, hc_mult, H].
 
     Used on non-first PP stages to restore the hc_mult streams received over P2P. No-op when the
@@ -35,11 +39,7 @@ def unfold_mhc_hidden_from_pipeline(hidden: torch.Tensor, *, hc_mult: int) -> to
 
 
 def contract_mhc_hidden_for_pipeline(
-    hidden: torch.Tensor,
-    *,
-    norm: Any,
-    head: Any,
-    return_source: bool = False,
+    hidden: torch.Tensor, *, norm: Any, head: Any, return_source: bool = False
 ):
     if head is None or norm is None:
         if return_source:

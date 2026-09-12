@@ -47,9 +47,7 @@ def test_dense_recreate_runs_under_model_runner_vllm_config(monkeypatch) -> None
         original_calls.append(("prepare", model_runner.model))
         return "state"
 
-    fp8_utils, events = _install_fake_reload_modules(
-        monkeypatch, original
-    )
+    fp8_utils, events = _install_fake_reload_modules(monkeypatch, original)
     monkeypatch.setattr(
         compat,
         "_recreate_dense_fp8_linear_params",

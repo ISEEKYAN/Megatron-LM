@@ -31,10 +31,7 @@ from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
-pytestmark = [
-    pytest.mark.gpus(8),
-    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
-]
+pytestmark = [pytest.mark.gpus(8), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
 
 # 9 decoders over pp=4 is non-divisible; 9 is small enough to stay fast yet leaves no
 # empty stage even for the MTP model (deepseek_v4 adds a slot on the last stage).
@@ -442,11 +439,7 @@ def _build_handle_from_config(
 def _build_handle(model_name: str, *, seed: int, pp_layout=None):
     cfg, protocol = MODELS[model_name]()
     return _build_handle_from_config(
-        model_name,
-        cfg,
-        protocol,
-        seed=seed,
-        pp_layout=pp_layout,
+        model_name, cfg, protocol, seed=seed, pp_layout=pp_layout
     )
 
 
@@ -501,9 +494,9 @@ def test_uneven_pp_builds_trains_and_exports(model_name):
     result = runtime.forward_backward(handle, iter([batch]), None, num_microbatches=1)
     runtime.optimizer_step(handle)
     loss = result.model_output.loss
-    assert loss is not None and torch.isfinite(loss).all(), (
-        f"{model_name}: non-finite loss {loss} on uneven PP layout"
-    )
+    assert (
+        loss is not None and torch.isfinite(loss).all()
+    ), f"{model_name}: non-finite loss {loss} on uneven PP layout"
 
     # Export across the uneven PP split (every rank materializes the full HF state).
     protocol = handle._extras["protocol"]
@@ -516,7 +509,9 @@ def test_uneven_pp_builds_trains_and_exports(model_name):
         f"{sorted(expected - present)} (have {sorted(present)}); PP gather lost a stage"
     )
     for name, tensor in exported:
-        assert torch.isfinite(tensor.float()).all(), (
+        assert torch.isfinite(
+            tensor.float()
+        ).all(), (
             f"{model_name}: non-finite exported tensor {name} from uneven PP gather"
         )
     if dist.get_rank() == 0:
@@ -569,7 +564,9 @@ def test_glm52_indexshare_78_layer_uneven_pp_builds_trains_and_keeps_share_group
         for layer_idx in local
         if cfg.dsa_indexer_type(layer_idx) == "shared"
     ]
-    assert all(source_idx in local for _, source_idx in local_shared_sources), local_shared_sources
+    assert all(
+        source_idx in local for _, source_idx in local_shared_sources
+    ), local_shared_sources
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     batch = _random_packed_batch(cfg.vocab_size, num_tokens=512)
@@ -577,15 +574,17 @@ def test_glm52_indexshare_78_layer_uneven_pp_builds_trains_and_keeps_share_group
     result = runtime.forward_backward(handle, iter([batch]), None, num_microbatches=1)
     runtime.optimizer_step(handle)
     loss = result.model_output.loss
-    assert loss is not None and torch.isfinite(loss).all(), (
-        f"glm52_indexshare: non-finite loss {loss} on 78-layer uneven PP layout"
-    )
+    assert (
+        loss is not None and torch.isfinite(loss).all()
+    ), f"glm52_indexshare: non-finite loss {loss} on 78-layer uneven PP layout"
 
     stage_info = {
         "pp_rank": ps.pp_rank,
         "layers": local,
         "shared_sources": local_shared_sources,
-        "has_mtp": bool(unwrap_model(handle._extras["model_chunks"][0]).mtp is not None),
+        "has_mtp": bool(
+            unwrap_model(handle._extras["model_chunks"][0]).mtp is not None
+        ),
     }
     gathered = [None for _ in range(dist.get_world_size())]
     dist.all_gather_object(gathered, stage_info)

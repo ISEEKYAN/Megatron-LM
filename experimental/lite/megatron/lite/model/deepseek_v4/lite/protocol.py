@@ -6,20 +6,31 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     EXPERT_CLASSIFIER,
     PLACEMENT_FN,
+)
+from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     export_hf_weights as _export_hf_weights_impl,
+)
+from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
+)
+from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     save_hf_weights as _save_hf_weights_impl,
 )
 from megatron.lite.model.protocol_utils import (
     add_loss_context_kwargs,
     nested_from_packed,
+)
+from megatron.lite.model.protocol_utils import (
     pack_r3_replay_mask as _pack_r3_replay_mask,
+)
+from megatron.lite.model.protocol_utils import (
     pack_routed_experts as _pack_routed_experts,
+)
+from megatron.lite.model.protocol_utils import (
     router_replay_roots as router_replay_roots,
 )
 from megatron.lite.primitive.bundle import ModelBundle
@@ -36,12 +47,12 @@ from megatron.lite.primitive.parallel.thd import (
     thd_pack_meta,
     unpack_thd_to_nested,
 )
-from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.primitive.quantization import (
     QATSpec,
     apply_qat_to_chunks,
     normalize_qat_spec,
 )
+from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch, ParallelConfig
 
 
@@ -125,16 +136,14 @@ def _as_batch_row(tensor):
     return tensor
 
 
-def _infer_cp_local_seq_len(
-    *,
-    input_ids,
-    position_ids,
-    cp_size,
-):
+def _infer_cp_local_seq_len(*, input_ids, position_ids, cp_size):
     seq_len = input_ids.size(1)
     if cp_size <= 1:
         return seq_len
-    if position_ids is not None and position_ids.size(-1) in (seq_len, seq_len * cp_size):
+    if position_ids is not None and position_ids.size(-1) in (
+        seq_len,
+        seq_len * cp_size,
+    ):
         return seq_len
     return seq_len // cp_size if seq_len % cp_size == 0 else seq_len
 
@@ -194,7 +203,9 @@ def _prepare_packed_contiguous_cp_kwargs(model, kwargs):
     for key in ("input_ids", "labels", "loss_mask", "position_ids"):
         tensor = kwargs.get(key)
         if tensor is not None:
-            kwargs[key] = contiguous_slice_for_cp(tensor, ps.cp_rank, ps.cp_size, seq_dim=1)
+            kwargs[key] = contiguous_slice_for_cp(
+                tensor, ps.cp_rank, ps.cp_size, seq_dim=1
+            )
     return kwargs
 
 
@@ -247,7 +258,9 @@ def _prepare_model_forward_kwargs(model, batch: PackedBatch):
     # split per row under contiguous CP, where contiguous_position_ids_for_cp rebuilds
     # the per-rank global position ids.
     input_ids = batch.input_ids
-    is_thd_packed = input_ids.dim() == 1 or (input_ids.dim() == 2 and input_ids.size(0) == 1)
+    is_thd_packed = input_ids.dim() == 1 or (
+        input_ids.dim() == 2 and input_ids.size(0) == 1
+    )
     if is_thd_packed:
         return _prepare_packed_batch_kwargs(model, batch)
     kwargs = _base_model_forward_kwargs(batch)
@@ -294,11 +307,15 @@ def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None
         override = impl_cfg.mtp_num_layers
     if override is not None:
         if override < 0:
-            raise ValueError(f"DeepSeek V4 MTP layer count must be >=0, got {override}.")
+            raise ValueError(
+                f"DeepSeek V4 MTP layer count must be >=0, got {override}."
+            )
         model_cfg.num_nextn_predict_layers = int(override)
     if impl_cfg.mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
-            raise ValueError("mtp_enable=True but DeepSeek V4 config has no MTP layers.")
+            raise ValueError(
+                "mtp_enable=True but DeepSeek V4 config has no MTP layers."
+            )
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
     else:
         model_cfg.num_nextn_predict_layers = 0
@@ -330,7 +347,9 @@ def _optimizer_backend_name(optimizer: Any) -> str | None:
     return optimizer
 
 
-def _configure_attention_backend(chunks: list[nn.Module], *, backend: str | None) -> None:
+def _configure_attention_backend(
+    chunks: list[nn.Module], *, backend: str | None
+) -> None:
     backend_name = backend or "torch"
     for chunk in chunks:
         for module in chunk.modules():
@@ -455,7 +474,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
         def _post_model_load_hook():
             from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(
@@ -507,7 +528,11 @@ def export_hf_weights(
 
 
 def save_hf_weights(
-    chunks: list[nn.Module], path: str, model_cfg: DeepseekV4Config, ps: ParallelState, **kwargs
+    chunks: list[nn.Module],
+    path: str,
+    model_cfg: DeepseekV4Config,
+    ps: ParallelState,
+    **kwargs,
 ) -> None:
     _save_hf_weights_impl(chunks, path, model_cfg, ps, **kwargs)
 

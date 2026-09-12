@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import torch
 
-
 _RESYNC_PATH = (
     Path(__file__).resolve().parents[3]
     / "megatron"
@@ -27,8 +26,7 @@ export_resync_weights = _MODULE.export_resync_weights
 
 def test_fp8_resync_exports_float32_block_scales() -> None:
     config = SimpleNamespace(
-        expert_dtype="fp8",
-        quantization_config={"weight_block_size": [128, 128]},
+        expert_dtype="fp8", quantization_config={"weight_block_size": [128, 128]}
     )
     source = torch.randn(128, 128, dtype=torch.bfloat16)
 
@@ -51,10 +49,7 @@ def test_fp4_resync_uses_mxfp4_only_for_routed_experts(monkeypatch) -> None:
         return tensor.to(torch.uint8), torch.ones(1, dtype=torch.uint8)
 
     def fake_block_fp8(
-        tensor: torch.Tensor,
-        _block_shape: tuple[int, int],
-        *,
-        scale_format: str,
+        tensor: torch.Tensor, _block_shape: tuple[int, int], *, scale_format: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
         calls.append(("block_fp8", scale_format))
         return tensor.to(torch.float8_e4m3fn), torch.ones(1, dtype=torch.uint8)
@@ -62,8 +57,7 @@ def test_fp4_resync_uses_mxfp4_only_for_routed_experts(monkeypatch) -> None:
     monkeypatch.setattr(_MODULE, "quantize_mxfp4", fake_mxfp4)
     monkeypatch.setattr(_MODULE, "quantize_block_fp8", fake_block_fp8)
     config = SimpleNamespace(
-        expert_dtype="fp4",
-        quantization_config={"weight_block_size": [128, 128]},
+        expert_dtype="fp4", quantization_config={"weight_block_size": [128, 128]}
     )
     source = torch.randn(2, 2, dtype=torch.bfloat16)
 

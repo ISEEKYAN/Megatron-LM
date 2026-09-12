@@ -14,7 +14,9 @@ import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 
 def _ag_dim0(x: torch.Tensor, tp_size: int, group: dist.ProcessGroup) -> torch.Tensor:
     """AllGather on dim 0: [S/tp, B, H] → [S, B, H]."""
-    out = torch.empty(tp_size * x.shape[0], x.shape[1], x.shape[2], dtype=x.dtype, device=x.device)
+    out = torch.empty(
+        tp_size * x.shape[0], x.shape[1], x.shape[2], dtype=x.dtype, device=x.device
+    )
     dist.all_gather_into_tensor(out, x.contiguous(), group=group)
     return out
 
@@ -87,4 +89,9 @@ class ScatterToSP(torch.autograd.Function):
         return _ag_dim0(grad, ctx.tp_size, ctx.group), None, None, None
 
 
-__all__ = ["AllGatherDim0", "AllGatherDim0ForNonSPConsumer", "ReduceScatterDim0", "ScatterToSP"]
+__all__ = [
+    "AllGatherDim0",
+    "AllGatherDim0ForNonSPConsumer",
+    "ReduceScatterDim0",
+    "ScatterToSP",
+]

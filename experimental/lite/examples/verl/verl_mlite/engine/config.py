@@ -50,9 +50,7 @@ class MegatronLiteEngineConfig(EngineConfig):
             from megatron.lite.runtime.contracts.weights import ResyncFormat
 
             object.__setattr__(
-                self,
-                "resync_format",
-                ResyncFormat.parse(self.resync_format).value,
+                self, "resync_format", ResyncFormat.parse(self.resync_format).value
             )
         if not isinstance(self.resync_config, Mapping):
             raise TypeError("resync_config must be a mapping")

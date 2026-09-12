@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 
 
-def _all_reduce_if_needed(tensor: torch.Tensor, group, op=dist.ReduceOp.SUM) -> torch.Tensor:
+def _all_reduce_if_needed(
+    tensor: torch.Tensor, group, op=dist.ReduceOp.SUM
+) -> torch.Tensor:
     if group is not None and dist.is_initialized() and dist.get_world_size(group) > 1:
         dist.all_reduce(tensor, op=op, group=group)
     return tensor
@@ -51,13 +52,19 @@ def linear_cross_entropy(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return token log-probs and entropy without changing VERL's fused API."""
     try:
-        from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy as _verl_lce
+        from verl.utils.kernel.linear_cross_entropy import (
+            linear_cross_entropy as _verl_lce,
+        )
     except Exception:
         _verl_lce = None
 
     if _verl_lce is not None and hidden.is_cuda:
-        log_probs, entropy = _verl_lce(hidden, weight, labels, float(temperature), "none", tp_group)
-        return _reshape_like_labels(log_probs, labels), _reshape_like_labels(entropy, labels)
+        log_probs, entropy = _verl_lce(
+            hidden, weight, labels, float(temperature), "none", tp_group
+        )
+        return _reshape_like_labels(log_probs, labels), _reshape_like_labels(
+            entropy, labels
+        )
 
     logits = torch.matmul(hidden, weight.t())
     if temperature != 1.0:

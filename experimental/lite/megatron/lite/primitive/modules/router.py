@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 from megatron.lite.primitive.modules.router_replay import (
     RouterReplay,
@@ -43,10 +42,9 @@ def _ordered_topk_from_routing_map(
 
 
 def _reject_aux_loss_during_replay(router_replay: RouterReplay | None) -> None:
-    if (
-        router_replay is not None
-        and router_replay.router_replay_action
-        in (RouterReplayAction.REPLAY_FORWARD, RouterReplayAction.REPLAY_BACKWARD)
+    if router_replay is not None and router_replay.router_replay_action in (
+        RouterReplayAction.REPLAY_FORWARD,
+        RouterReplayAction.REPLAY_BACKWARD,
     ):
         raise RuntimeError(
             "R3 router aux loss must be disabled: replay dispatches the supplied "
@@ -87,7 +85,9 @@ class TopKRouter(nn.Module):
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.register_buffer(
-            "expert_bias", torch.zeros(config.num_experts, dtype=torch.float32), persistent=False
+            "expert_bias",
+            torch.zeros(config.num_experts, dtype=torch.float32),
+            persistent=False,
         )
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
@@ -142,13 +142,18 @@ class TopKRouter(nn.Module):
         if apply_aux_loss:
             _reject_aux_loss_during_replay(self.router_replay)
             routing_map, aux_scores = compute_routing_scores_for_aux_loss(
-                logits, self.topk, score_function="softmax", fused=self.moe_router_fusion
+                logits,
+                self.topk,
+                score_function="softmax",
+                fused=self.moe_router_fusion,
             )
             tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
             total_num_tokens = num_tokens
             if self._aux_loss_group is not None:
                 dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
+                total_num_tokens = num_tokens * dist.get_world_size(
+                    group=self._aux_loss_group
+                )
             aux_loss = switch_load_balancing_loss_func(
                 aux_scores,
                 tokens_per_expert,
@@ -219,12 +224,7 @@ class SigmoidTopKRouter(nn.Module):
         logits = (
             self.gate(x)
             if self.router_dtype is None
-            else router_gating_linear(
-                x,
-                self.gate.weight,
-                None,
-                self.router_dtype,
-            )
+            else router_gating_linear(x, self.gate.weight, None, self.router_dtype)
         )
         logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
@@ -268,13 +268,18 @@ class SigmoidTopKRouter(nn.Module):
         if apply_aux_loss:
             _reject_aux_loss_during_replay(self.router_replay)
             _, aux_scores = compute_routing_scores_for_aux_loss(
-                logits, self.topk, score_function=self.score_function, fused=self.moe_router_fusion
+                logits,
+                self.topk,
+                score_function=self.score_function,
+                fused=self.moe_router_fusion,
             )
             tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
             total_num_tokens = num_tokens
             if self._aux_loss_group is not None:
                 dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
+                total_num_tokens = num_tokens * dist.get_world_size(
+                    group=self._aux_loss_group
+                )
             aux_loss = switch_load_balancing_loss_func(
                 aux_scores,
                 tokens_per_expert,

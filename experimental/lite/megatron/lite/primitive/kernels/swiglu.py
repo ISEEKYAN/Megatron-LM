@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-
 from megatron.lite.primitive.kernels.jit import jit_fuser
 
 
@@ -32,7 +31,11 @@ def weighted_swiglu(y, weights):
 def swiglu_back(g, y):
     y_1, y_2 = torch.chunk(y, 2, -1)
     return torch.cat(
-        (g * torch.sigmoid(y_1) * (1 + y_1 * (1 - torch.sigmoid(y_1))) * y_2, g * F.silu(y_1)), -1
+        (
+            g * torch.sigmoid(y_1) * (1 + y_1 * (1 - torch.sigmoid(y_1))) * y_2,
+            g * F.silu(y_1),
+        ),
+        -1,
     )
 
 
@@ -114,7 +117,9 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
     assert len(original_shape) in [2, 3]
     input = input.view(-1, original_shape[-1])
     if bias is not None:
-        output = BiasSwiGLUFunction.apply(input, bias, fp8_input_store, cpu_offload_input)
+        output = BiasSwiGLUFunction.apply(
+            input, bias, fp8_input_store, cpu_offload_input
+        )
     else:
         output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input)
     return (

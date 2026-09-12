@@ -23,7 +23,6 @@ from megatron.lite.primitive.quantization.mxfp4 import MXFP4_BLOCK_SIZE, quantiz
 from megatron.lite.runtime.contracts.weights import ResyncFormat
 from torch.distributed.tensor import Replicate, Shard
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -281,11 +280,7 @@ def export_hf_weights(model, config: Qwen3MoEConfig, ps, **kwargs):
     target = kwargs.pop("target", "hf")
     resync_config = kwargs.pop("resync_config", None)
     weights = _export(
-        model,
-        Qwen3MoEWeightSpec(config),
-        ps,
-        vocab_size=config.vocab_size,
-        **kwargs,
+        model, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size, **kwargs
     )
     if target in {"hf", ResyncFormat.BF16.value}:
         if resync_config:

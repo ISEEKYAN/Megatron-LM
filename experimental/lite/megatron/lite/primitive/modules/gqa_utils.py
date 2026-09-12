@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import torch
-
 from megatron.lite.primitive.utils import ensure_divisible
 
 
@@ -16,7 +15,13 @@ def split_grouped_qkvg(
     group_width = (2 * q_heads_per_group + 2) * head_dim
     grouped = qkv.reshape(*lead, num_kv_heads, group_width)
     query, gate, key, value = grouped.split(
-        [q_heads_per_group * head_dim, q_heads_per_group * head_dim, head_dim, head_dim], dim=-1
+        [
+            q_heads_per_group * head_dim,
+            q_heads_per_group * head_dim,
+            head_dim,
+            head_dim,
+        ],
+        dim=-1,
     )
     return (
         query.reshape(*lead, num_heads, head_dim),
@@ -44,10 +49,7 @@ def split_grouped_qkvg_for_tp(
     q_rank_in_group = tp_rank % replicas_per_kv_head
     local_group = qkv.narrow(-1, kv_group_rank * group_width, group_width)
     query, gate, key, value = split_grouped_qkvg(
-        local_group,
-        num_heads=q_heads_per_group,
-        num_kv_heads=1,
-        head_dim=head_dim,
+        local_group, num_heads=q_heads_per_group, num_kv_heads=1, head_dim=head_dim
     )
     q_start = q_rank_in_group * q_heads_per_rank
     q_end = q_start + q_heads_per_rank

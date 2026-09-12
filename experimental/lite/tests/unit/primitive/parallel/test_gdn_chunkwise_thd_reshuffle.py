@@ -22,9 +22,7 @@ import os
 
 import pytest
 import torch
-
 from megatron.lite.primitive.parallel.cp import get_thd_context_parallel_rank_indices
-
 
 # Hand-computed indices for the anchor case (cp=2, cu=[0,8,12]): seq0 len8 splits into
 # 4 chunks [0,1|2,3|4,5|6,7] with zigzag owners r0,r1,r1,r0; seq1 len4 -> [8|9|10|11]
@@ -44,12 +42,7 @@ def test_thd_rank_indices_match_hand_computed_anchor():
 
 
 @pytest.mark.parametrize(
-    "cp, cu",
-    [
-        (2, [0, 8, 12]),
-        (4, [0, 16, 24, 32]),
-        (2, [0, 16, 24]),
-    ],
+    "cp, cu", [(2, [0, 8, 12]), (4, [0, 16, 24, 32]), (2, [0, 16, 24])]
 )
 def test_thd_rank_indices_partition_invariants(cp, cu):
     """Each layout partitions the global tokens exactly once; contiguous is a plain slice."""
@@ -58,7 +51,8 @@ def test_thd_rank_indices_partition_invariants(cp, cu):
     part = total // cp
     for layout in ("zigzag", "contiguous"):
         owned = [
-            get_thd_context_parallel_rank_indices(cu_t, cp, r, layout).tolist() for r in range(cp)
+            get_thd_context_parallel_rank_indices(cu_t, cp, r, layout).tolist()
+            for r in range(cp)
         ]
         flat = sorted(idx for span in owned for idx in span)
         assert flat == list(range(total)), f"{layout} not a clean partition: {flat}"
@@ -78,10 +72,12 @@ def test_thd_rank_indices_rejects_indivisible_length():
 # --------------------------------------------------------------------- gloo round-trip
 def _reshuffle_worker(rank, world, cu_list, port, results):
     os.environ.update(
-        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(world)
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+        RANK=str(rank),
+        WORLD_SIZE=str(world),
     )
     import torch.distributed as dist
-
     from megatron.lite.primitive.parallel.cp import (
         contiguous_to_zigzag_chunks,
         zigzag_to_contiguous_chunks,
@@ -99,7 +95,9 @@ def _reshuffle_worker(rank, world, cu_list, port, results):
         zz_idx = get_thd_context_parallel_rank_indices(cu, world, rank, "zigzag")
         local_zigzag = full.index_select(0, zz_idx).contiguous()
 
-        got_contig = zigzag_to_contiguous_chunks(local_zigzag, group, seq_dim=0, cu_seqlens=cu)
+        got_contig = zigzag_to_contiguous_chunks(
+            local_zigzag, group, seq_dim=0, cu_seqlens=cu
+        )
         expect_contig = full[rank * part : (rank + 1) * part].contiguous()
         fwd = (got_contig - expect_contig).abs().max().item()
 
@@ -112,11 +110,7 @@ def _reshuffle_worker(rank, world, cu_list, port, results):
 
 @pytest.mark.parametrize(
     "cp, cu, port",
-    [
-        (2, [0, 8, 12], 29630),
-        (4, [0, 16, 24, 32], 29631),
-        (2, [0, 16, 24], 29632),
-    ],
+    [(2, [0, 8, 12], 29630), (4, [0, 16, 24, 32], 29631), (2, [0, 16, 24], 29632)],
 )
 def test_thd_reshuffle_roundtrip_gloo(cp, cu, port):
     import torch.multiprocessing as mp

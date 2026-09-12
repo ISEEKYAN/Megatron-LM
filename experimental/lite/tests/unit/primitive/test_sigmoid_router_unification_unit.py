@@ -51,8 +51,7 @@ def _legacy_custom_router_output(config, weight, expert_bias, x):
 
 
 @pytest.mark.parametrize(
-    ("model_name", "aux_loss_alpha"),
-    [("glm5", None), ("kimi_k2", 0.0)],
+    ("model_name", "aux_loss_alpha"), [("glm5", None), ("kimi_k2", 0.0)]
 )
 def test_shared_router_is_bitwise_equal_to_legacy_custom_router(
     model_name, aux_loss_alpha, transformer_engine_import_stub
@@ -122,10 +121,7 @@ def test_qwen_topk_router_output_is_bitwise_unchanged(
     from megatron.lite.primitive.utils.moe import topk_routing_with_score_function
 
     config = SimpleNamespace(
-        hidden_size=8,
-        num_experts=8,
-        num_experts_per_tok=2,
-        router_aux_loss_coef=0.0,
+        hidden_size=8, num_experts=8, num_experts_per_tok=2, router_aux_loss_coef=0.0
     )
     router = TopKRouter(config, _ps(), compute_aux_loss=False)
     weight = torch.arange(64, dtype=torch.float32).view(8, 8) / 23
@@ -134,9 +130,7 @@ def test_qwen_topk_router_output_is_bitwise_unchanged(
         router.gate.weight.copy_(weight)
     logits = F.linear(x, weight)
     probs_dense, routing_map = topk_routing_with_score_function(
-        logits,
-        2,
-        score_function="softmax",
+        logits, 2, score_function="softmax"
     )
     expert_ids = torch.arange(8).expand_as(routing_map)
     masked_ids = torch.where(routing_map, expert_ids, torch.full_like(expert_ids, 8))
@@ -181,9 +175,7 @@ def test_router_buffers_remain_float32_after_dtype_apply(
     from megatron.lite.primitive.modules.router import SigmoidTopKRouter
 
     router = SigmoidTopKRouter(
-        _config(grouped=True, aux_loss_alpha=0.0),
-        _ps(),
-        compute_aux_loss=False,
+        _config(grouped=True, aux_loss_alpha=0.0), _ps(), compute_aux_loss=False
     ).to(torch.bfloat16)
 
     assert router.expert_bias.dtype == torch.float32

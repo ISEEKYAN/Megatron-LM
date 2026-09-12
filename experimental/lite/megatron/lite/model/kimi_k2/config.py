@@ -137,13 +137,21 @@ class KimiK2Config:
             )
             if self.n_group is not None and self.topk_group is not None:
                 _check(self.n_group >= 1, "n_group must be >= 1")
-                _check(1 <= self.topk_group <= self.n_group, "topk_group must be in [1, n_group]")
+                _check(
+                    1 <= self.topk_group <= self.n_group,
+                    "topk_group must be in [1, n_group]",
+                )
                 _check(
                     self.n_routed_experts % self.n_group == 0,
                     "n_routed_experts must be divisible by n_group",
                 )
-        _check(0 <= self.first_k_dense_replace <= self.num_hidden_layers, "bad dense prefix")
-        _check(self.num_nextn_predict_layers >= 0, "num_nextn_predict_layers must be >= 0")
+        _check(
+            0 <= self.first_k_dense_replace <= self.num_hidden_layers,
+            "bad dense prefix",
+        )
+        _check(
+            self.num_nextn_predict_layers >= 0, "num_nextn_predict_layers must be >= 0"
+        )
         if errors:
             raise ValueError("Invalid KimiK2Config:\n  " + "\n  ".join(errors))
 

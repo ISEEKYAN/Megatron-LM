@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.parallel import (
     PackedSeqParams,
     ParallelState,
@@ -18,10 +17,7 @@ from megatron.lite.primitive.parallel import (
     zigzag_to_contiguous_chunks,
 )
 
-pytestmark = [
-    pytest.mark.gpus(2),
-    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
-]
+pytestmark = [pytest.mark.gpus(2), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -176,11 +172,7 @@ def test_gdn_packed_thd_cp2_matches_full_sequence_reference():
         -0.5, 0.5, steps=8 * 16, device="cuda", dtype=torch.bfloat16
     ).reshape(8, 1, 16)
     local_hidden = split_packed_to_cp_local(
-        full_hidden,
-        cu_seqlens_padded=cu_seqlens,
-        cp_size=2,
-        cp_rank=ps.cp_rank,
-        dim=0,
+        full_hidden, cu_seqlens_padded=cu_seqlens, cp_size=2, cp_rank=ps.cp_rank, dim=0
     )
 
     with torch.no_grad():

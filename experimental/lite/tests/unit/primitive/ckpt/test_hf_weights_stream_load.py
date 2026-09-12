@@ -291,18 +291,11 @@ def test_dense_fused_gate_up_uses_interleaved_tp2_shard(monkeypatch, tp_rank) ->
         "megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader
     )
     load_hf_weights(
-        model,
-        "unused",
-        Spec(),
-        _parallel_state(tp_size=2, tp_rank=tp_rank),
+        model, "unused", Spec(), _parallel_state(tp_size=2, tp_rank=tp_rank)
     )
 
     expected = torch.cat(
-        [
-            gate.chunk(2, dim=0)[tp_rank],
-            up.chunk(2, dim=0)[tp_rank],
-        ],
-        dim=0,
+        [gate.chunk(2, dim=0)[tp_rank], up.chunk(2, dim=0)[tp_rank]], dim=0
     )
     assert torch.equal(model.gate_up.weight, expected)
 
@@ -398,8 +391,7 @@ def test_mapped_persistent_buffer_missing_from_checkpoint_fails(monkeypatch) -> 
     )
 
     with pytest.raises(
-        RuntimeError,
-        match=r"Spec.*router_expert_bias.*hf\.router_expert_bias",
+        RuntimeError, match=r"Spec.*router_expert_bias.*hf\.router_expert_bias"
     ):
         load_hf_weights(Model(), "unused", Spec(), _parallel_state())
 
@@ -426,7 +418,9 @@ def test_deferred_parameter_missing_from_checkpoint_fails(monkeypatch) -> None:
         def weight_map():
             return {}
 
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader
+    )
     with pytest.raises(RuntimeError, match="Deferred parameter 'weight'"):
         load_hf_weights(model, "unused", Spec(), _parallel_state())
 
@@ -496,8 +490,7 @@ def test_checkpoint_source_without_model_target_fails(monkeypatch) -> None:
     )
 
     with pytest.raises(
-        RuntimeError,
-        match=r"Spec.*hf\.ghost\.weight.*ghost\.weight.*no model target",
+        RuntimeError, match=r"Spec.*hf\.ghost\.weight.*ghost\.weight.*no model target"
     ):
         load_hf_weights(nn.Module(), "unused", Spec(), _parallel_state())
 
@@ -541,8 +534,7 @@ def test_undeclared_buffer_adds_no_warning_or_failure(monkeypatch) -> None:
 
 
 def test_nonpersistent_primitive_router_bias_needs_no_checkpoint(
-    tmp_path,
-    transformer_engine_import_stub,
+    tmp_path, transformer_engine_import_stub
 ) -> None:
     from types import SimpleNamespace
 
@@ -647,16 +639,11 @@ def test_missing_required_hf_tensor_fails_with_spec_and_key_context(
         "megatron.lite.primitive.ckpt.hf_weights.SafeTensorReader", Reader
     )
 
-    with pytest.raises(
-        KeyError,
-        match=r"RequiredSpec.*weight.*required\.hf\.weight",
-    ):
+    with pytest.raises(KeyError, match=r"RequiredSpec.*weight.*required\.hf\.weight"):
         load_hf_weights(model, "unused", RequiredSpec(), _parallel_state())
 
 
-def test_mapped_parameter_cannot_be_optional(
-    monkeypatch,
-) -> None:
+def test_mapped_parameter_cannot_be_optional(monkeypatch) -> None:
     _stub_parallel_import(monkeypatch)
     model = nn.Linear(1, 1, bias=False)
     model.weight.data.fill_(11)
@@ -747,8 +734,7 @@ def test_missing_required_expert_hf_tensor_fails_with_context(monkeypatch) -> No
     )
 
     with pytest.raises(
-        KeyError,
-        match=r"RequiredExpertSpec.*expert0.*required\.hf\.expert0",
+        KeyError, match=r"RequiredExpertSpec.*expert0.*required\.hf\.expert0"
     ):
         load_hf_weights(Model(), "unused", RequiredExpertSpec(), _parallel_state())
 

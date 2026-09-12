@@ -36,7 +36,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.kernels.jit import jit_fuser
 from megatron.lite.primitive.ops.gated_delta_rule import (
@@ -63,7 +62,6 @@ from megatron.lite.primitive.parallel.thd import (
     split_packed_to_cp_local,
 )
 from megatron.lite.primitive.utils import ensure_divisible
-
 
 try:
     from fla.modules.convolution import (
@@ -210,7 +208,11 @@ class GatedDeltaNet(nn.Module):
         agree.  HF loading already provides identical state; this closes the
         random-initialization path used by correctness and scratch training.
         """
-        if not self._replicate_heads or self.ps.tp_group is None or self.ps.tp_size <= 1:
+        if (
+            not self._replicate_heads
+            or self.ps.tp_group is None
+            or self.ps.tp_size <= 1
+        ):
             return
         if not dist.is_initialized() or dist.get_world_size(self.ps.tp_group) <= 1:
             return
@@ -234,7 +236,10 @@ class GatedDeltaNet(nn.Module):
         return [self.qk_dim_local, self.qk_dim_local, self.v_dim_local]
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
     ) -> torch.Tensor:
         del position_ids
         is_packed = packed_seq_params is not None
@@ -263,7 +268,9 @@ class GatedDeltaNet(nn.Module):
                 # Packed THD reshuffles with the global cu_seqlens (packing-aware); the
                 # non-packed path is a plain two-chunk swap (``cu_seqlens is None``).
                 reshuffle_cu = cu_seqlens if is_packed else None
-                qkvzba = self._chunkwise_reshuffle(qkvzba, reshuffle_cu, to_contiguous=True)
+                qkvzba = self._chunkwise_reshuffle(
+                    qkvzba, reshuffle_cu, to_contiguous=True
+                )
                 chunkwise = True
             else:  # headwise
                 if not is_packed and qkvzba.shape[0] > 1:
@@ -359,14 +366,14 @@ class GatedDeltaNet(nn.Module):
     def _state_parameters_for_tp(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return replicated GDN state with a TP gradient all-reduce."""
         A_log = _ReplicatedParameterWithGradReduce.apply(self.A_log, self.ps.tp_group)
-        dt_bias = _ReplicatedParameterWithGradReduce.apply(self.dt_bias, self.ps.tp_group)
+        dt_bias = _ReplicatedParameterWithGradReduce.apply(
+            self.dt_bias, self.ps.tp_group
+        )
         return A_log, dt_bias
 
     # ------------------------------------------------------------------ CP: headwise
     def _headwise_cp2hp(
-        self,
-        qkvzba: torch.Tensor,
-        cu_seqlens: torch.Tensor | None,
+        self, qkvzba: torch.Tensor, cu_seqlens: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Zigzag-sharded ``[b, s_local, h]`` -> contiguous full-seq ``[b, s_global, h/cp]``.
 
@@ -381,26 +388,25 @@ class GatedDeltaNet(nn.Module):
         qkvzba = qkvzba.index_select(-1, perm)
         h = qkvzba.shape[-1]
         hpc = h // cp_size
-        send_parts = [qkvzba[..., k * hpc : (k + 1) * hpc].contiguous() for k in range(cp_size)]
+        send_parts = [
+            qkvzba[..., k * hpc : (k + 1) * hpc].contiguous() for k in range(cp_size)
+        ]
         recv = all_to_all_hidden_shards(send_parts, self.ps.cp_group)
         if cu_seqlens is None:
             full = zigzag_reconstruct_from_cp_parts(recv, seq_dim=1)
             return full.contiguous(), None
         if qkvzba.shape[0] != 1:
-            raise ValueError("Packed THD GatedDeltaNet expects a single packed batch row.")
+            raise ValueError(
+                "Packed THD GatedDeltaNet expects a single packed batch row."
+            )
         parts = [p[0].contiguous() for p in recv]
         full = reconstruct_packed_from_cp_parts(
-            parts,
-            cu_seqlens_padded=cu_seqlens,
-            cp_size=cp_size,
-            dim=0,
+            parts, cu_seqlens_padded=cu_seqlens, cp_size=cp_size, dim=0
         )
         return full.unsqueeze(0).contiguous(), cu_seqlens
 
     def _headwise_hp2cp(
-        self,
-        out: torch.Tensor,
-        cu_seqlens: torch.Tensor | None,
+        self, out: torch.Tensor, cu_seqlens: torch.Tensor | None
     ) -> torch.Tensor:
         """Inverse of :meth:`_headwise_cp2hp` for the value output.
 
@@ -418,15 +424,13 @@ class GatedDeltaNet(nn.Module):
             recv = all_to_all_hidden_shards(send_parts, self.ps.cp_group)
             return torch.cat(recv, dim=-1).contiguous()
         if out.shape[0] != 1:
-            raise ValueError("Packed THD GatedDeltaNet expects a single packed batch row.")
+            raise ValueError(
+                "Packed THD GatedDeltaNet expects a single packed batch row."
+            )
         base = out[0].contiguous()
         send_parts = [
             split_packed_to_cp_local(
-                base,
-                cu_seqlens_padded=cu_seqlens,
-                cp_size=cp_size,
-                cp_rank=j,
-                dim=0,
+                base, cu_seqlens_padded=cu_seqlens, cp_size=cp_size, cp_rank=j, dim=0
             ).contiguous()
             for j in range(cp_size)
         ]
@@ -458,10 +462,7 @@ class GatedDeltaNet(nn.Module):
         return cu_seqlens
 
     def _build_chunkwise_cp_context(
-        self,
-        qkvzba: torch.Tensor,
-        cu_seqlens: torch.Tensor | None,
-        is_packed: bool,
+        self, qkvzba: torch.Tensor, cu_seqlens: torch.Tensor | None, is_packed: bool
     ) -> tuple[object, torch.Tensor]:
         """Build the FLA ring ``cp_context`` and resolve the global cu_seqlens.
 
@@ -480,9 +481,7 @@ class GatedDeltaNet(nn.Module):
         if is_packed:
             cu = self._resolve_cu_seqlens(cu_seqlens, seq_len_global)
             cp_context = _fla_build_cp_context(
-                cu_seqlens=cu,
-                group=self.ps.cp_group,
-                conv1d_kernel_size=conv_kernel,
+                cu_seqlens=cu, group=self.ps.cp_group, conv1d_kernel_size=conv_kernel
             )
             return cp_context, cu
 
@@ -515,7 +514,11 @@ class GatedDeltaNet(nn.Module):
         ``cu_seqlens`` (the global packed layout) selects the packing-aware THD swap;
         ``None`` selects the plain two-chunk SBHD swap. Shape is preserved either way.
         """
-        swap = zigzag_to_contiguous_chunks if to_contiguous else contiguous_to_zigzag_chunks
+        swap = (
+            zigzag_to_contiguous_chunks
+            if to_contiguous
+            else contiguous_to_zigzag_chunks
+        )
         return swap(tensor, self.ps.cp_group, seq_dim=1, cu_seqlens=cu_seqlens)
 
     # ------------------------------------------------------------------ compute
@@ -532,11 +535,15 @@ class GatedDeltaNet(nn.Module):
         # ``conv_weight`` is the (headwise) per-rank slice; None means use the full module.
         weight = self.conv1d.weight if conv_weight is None else conv_weight
         groups = self.conv_dim_local // cp_div
-        if _HAS_FLA and (cp_context is not None or cu_seqlens is not None or not self.deterministic):
+        if _HAS_FLA and (
+            cp_context is not None or cu_seqlens is not None or not self.deterministic
+        ):
             orig_seq_len = qkv.shape[1]
             # Chunkwise CP must not pad conv inputs: padding chunk-local causal-conv
             # inputs would change later chunk numerics across the ring.
-            pad_n = 0 if cp_context is not None else (-orig_seq_len % _CONV_PAD_ALIGNMENT)
+            pad_n = (
+                0 if cp_context is not None else (-orig_seq_len % _CONV_PAD_ALIGNMENT)
+            )
             conv_input = qkv
             conv_cu_seqlens = cu_seqlens
             if pad_n > 0:
@@ -582,7 +589,9 @@ class GatedDeltaNet(nn.Module):
         cu_seqlens: torch.Tensor | None,
         cp_context=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if _HAS_FLA and (cp_context is not None or cu_seqlens is not None or not self.deterministic):
+        if _HAS_FLA and (
+            cp_context is not None or cu_seqlens is not None or not self.deterministic
+        ):
             kwargs = {}
             if cp_context is not None:
                 kwargs["cp_context"] = cp_context
@@ -643,7 +652,14 @@ class GatedDeltaNet(nn.Module):
 
     @jit_fuser
     def _prepare_qkv(
-        self, qkv: torch.Tensor, gate, beta, alpha, batch: int, seq_len: int, cp_div: int
+        self,
+        qkv: torch.Tensor,
+        gate,
+        beta,
+        alpha,
+        batch: int,
+        seq_len: int,
+        cp_div: int,
     ):
         qk = self.qk_dim_local // cp_div
         nkh = self.num_k_heads_local // cp_div

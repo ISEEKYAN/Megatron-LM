@@ -15,30 +15,20 @@ _LAYER_INDEX_RE = re.compile(
 _MTP_INDEX_RE = re.compile(r"(?:^|\.)(?:(?:model\.)?mtp\.(?P<mtp>\d+))(?:\.|$)")
 
 _EMBED_NAMES = frozenset(
-    {
-        "embed.weight",
-        "model.embed.weight",
-        "model.embed_tokens.weight",
-    }
+    {"embed.weight", "model.embed.weight", "model.embed_tokens.weight"}
 )
 _NORM_NAMES = frozenset({"norm.weight", "model.norm.weight"})
-_HEAD_NAMES = frozenset(
-    {
-        "head.weight",
-        "lm_head.weight",
-        "model.lm_head.weight",
-    }
-)
+_HEAD_NAMES = frozenset({"head.weight", "lm_head.weight", "model.lm_head.weight"})
 
 
 def resync_layer_cluster_key(name: str) -> tuple[int, int]:
     """Return a stable sortable key that groups checkpoint tensors by decoder layer.
 
-    Tensors that belong to the same HF decoder layer (weights and their ``.scale``
-  companions) must be loaded in one contiguous ``load_weights`` batch while the
-    vLLM layerwise-reload lifecycle is active. Otherwise multiple submodules stay
-    in the deferred ``online_process_loader`` state and staging memory accumulates
-    across layers (observed as the 53-58 GiB receiver peak in r1-r11).
+      Tensors that belong to the same HF decoder layer (weights and their ``.scale``
+    companions) must be loaded in one contiguous ``load_weights`` batch while the
+      vLLM layerwise-reload lifecycle is active. Otherwise multiple submodules stay
+      in the deferred ``online_process_loader`` state and staging memory accumulates
+      across layers (observed as the 53-58 GiB receiver peak in r1-r11).
     """
     if name in _EMBED_NAMES:
         return (0, 0)
@@ -84,7 +74,7 @@ class LayerClusterBuffer:
 
 
 def iter_layer_clustered_weights(
-    weights: Iterable[tuple[str, Any]],
+    weights: Iterable[tuple[str, Any]]
 ) -> Iterator[tuple[str, Any]]:
     """Reorder a flat export stream so each HF layer cluster is contiguous."""
     current_key: tuple[int, int] | None = None

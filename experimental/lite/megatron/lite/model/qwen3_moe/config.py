@@ -55,7 +55,9 @@ class Qwen3MoEConfig:
             f"num_attention_heads({self.num_attention_heads}) % num_key_value_heads({self.num_key_value_heads}) != 0",
         )
         _check(self.head_dim > 0, f"head_dim must be > 0, got {self.head_dim}")
-        _check(self.num_experts >= 1, f"num_experts must be >= 1, got {self.num_experts}")
+        _check(
+            self.num_experts >= 1, f"num_experts must be >= 1, got {self.num_experts}"
+        )
         _check(
             1 <= self.num_experts_per_tok <= self.num_experts,
             f"num_experts_per_tok({self.num_experts_per_tok}) not in [1, {self.num_experts}]",
@@ -63,7 +65,9 @@ class Qwen3MoEConfig:
         _check(self.moe_intermediate_size > 0, "moe_intermediate_size must be > 0")
         _check(self.vocab_size > 0, "vocab_size must be > 0")
         _check(self.num_hidden_layers >= 1, "num_hidden_layers must be >= 1")
-        _check(self.num_nextn_predict_layers >= 0, "num_nextn_predict_layers must be >= 0")
+        _check(
+            self.num_nextn_predict_layers >= 0, "num_nextn_predict_layers must be >= 0"
+        )
         _check(
             len(self.layer_types) == self.num_hidden_layers,
             f"len(layer_types)={len(self.layer_types)} != "
@@ -71,11 +75,15 @@ class Qwen3MoEConfig:
         )
         valid_types = {"full_attention"}
         for i, lt in enumerate(self.layer_types):
-            _check(lt in valid_types, f"layer_types[{i}] must be one of {valid_types}, got '{lt}'")
+            _check(
+                lt in valid_types,
+                f"layer_types[{i}] must be one of {valid_types}, got '{lt}'",
+            )
 
         if errors:
             raise ValueError(
-                f"Invalid Qwen3MoEConfig ({len(errors)} errors):\n  " + "\n  ".join(errors)
+                f"Invalid Qwen3MoEConfig ({len(errors)} errors):\n  "
+                + "\n  ".join(errors)
             )
 
     @property
@@ -92,7 +100,9 @@ class Qwen3MoEConfig:
 
     @classmethod
     def from_hf_config(cls, hf_config, **overrides) -> Qwen3MoEConfig:
-        hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else vars(hf_config)
+        hf_dict = (
+            hf_config.to_dict() if hasattr(hf_config, "to_dict") else vars(hf_config)
+        )
         return cls._from_hf_dict(hf_dict, **overrides)
 
     @classmethod
@@ -102,7 +112,9 @@ class Qwen3MoEConfig:
 
         if "rope_theta" not in kwargs:
             if "rope_parameters" in hf and isinstance(hf["rope_parameters"], dict):
-                kwargs["rope_theta"] = float(hf["rope_parameters"].get("rope_theta", 1_000_000.0))
+                kwargs["rope_theta"] = float(
+                    hf["rope_parameters"].get("rope_theta", 1_000_000.0)
+                )
 
         if "head_dim" not in kwargs or kwargs["head_dim"] is None:
             hs = kwargs.get("hidden_size", 2048)
@@ -112,6 +124,8 @@ class Qwen3MoEConfig:
             kwargs["num_nextn_predict_layers"] = 0
 
         if "layer_types" not in kwargs:
-            kwargs["layer_types"] = ["full_attention"] * kwargs.get("num_hidden_layers", 48)
+            kwargs["layer_types"] = ["full_attention"] * kwargs.get(
+                "num_hidden_layers", 48
+            )
         kwargs.update(overrides)
         return cls(**kwargs)

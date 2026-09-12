@@ -30,9 +30,7 @@ def test_post_reload_restores_attention_and_only_finalizes_moe(monkeypatch) -> N
     utils.vLLMColocateWorkerExtension = Extension
     dsv4_utils = ModuleType("verl.utils.vllm.vllm_dsv4_fp8_utils")
     dsv4_utils.is_deepseek_v4_model = lambda model: True
-    routed_experts = ModuleType(
-        "vllm.model_executor.layers.fused_moe.routed_experts"
-    )
+    routed_experts = ModuleType("vllm.model_executor.layers.fused_moe.routed_experts")
     fp8 = ModuleType("vllm.model_executor.layers.quantization.fp8")
 
     class RoutedExperts:
@@ -62,9 +60,7 @@ def test_post_reload_restores_attention_and_only_finalizes_moe(monkeypatch) -> N
     moe = RoutedExperts()
     moe.quant_method = Fp8MoEMethod()
     dense = SimpleNamespace(quant_method=DenseQuantMethod())
-    model = SimpleNamespace(
-        modules=lambda: iter((moe, dense)),
-    )
+    model = SimpleNamespace(modules=lambda: iter((moe, dense)))
     assert compat._patch_verl_dsv4_fp8_process_weights()
     assert Extension(model).update_weights_from_ipc() == "loaded"
     assert events == ["load", "restore-attention", "finalize-moe"]

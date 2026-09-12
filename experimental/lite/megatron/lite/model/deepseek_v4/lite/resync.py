@@ -7,7 +7,6 @@ from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
 import torch
-
 from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
 from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
 
@@ -118,8 +117,4 @@ def export_resync_weights(
         yield _scale_name(name), scale
 
 
-__all__ = [
-    "export_resync_weights",
-    "is_release_unquantized_weight",
-    "is_routed_expert",
-]
+__all__ = ["export_resync_weights", "is_release_unquantized_weight", "is_routed_expert"]

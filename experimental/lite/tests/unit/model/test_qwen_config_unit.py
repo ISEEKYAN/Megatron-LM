@@ -7,10 +7,12 @@ from pathlib import Path
 
 import pytest
 import torch.nn as nn
-
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.model.registry import resolve_model_type_from_hf, resolve_runtime_model_name
+from megatron.lite.model.registry import (
+    resolve_model_type_from_hf,
+    resolve_runtime_model_name,
+)
 
 LITE_ROOT = Path(__file__).resolve().parents[3]
 
@@ -166,7 +168,9 @@ def test_qwen35_dense_and_moe_layers_select_distinct_ffn_branches(
     monkeypatch.setattr(qwen35_model, "ColumnParallelLinear", Linear)
     monkeypatch.setattr(qwen35_model, "RowParallelLinear", Linear)
     monkeypatch.setattr(qwen35_model, "MoELayer", MoE)
-    monkeypatch.setattr(qwen35_model.te, "RMSNorm", lambda *args, **kwargs: nn.Identity())
+    monkeypatch.setattr(
+        qwen35_model.te, "RMSNorm", lambda *args, **kwargs: nn.Identity()
+    )
 
     ps = object()
     dense = Qwen35Config(
@@ -207,7 +211,9 @@ def test_qwen35_dense_and_moe_layers_select_distinct_ffn_branches(
     assert MODULE_MAP["experts"](dense_layer) is None
 
 
-def test_qwen_lite_protocols_build_configs_from_hf_dicts(transformer_engine_import_stub):
+def test_qwen_lite_protocols_build_configs_from_hf_dicts(
+    transformer_engine_import_stub,
+):
     transformer_engine_import_stub()
 
     from megatron.lite.model.qwen3_5.lite import protocol as qwen35_protocol
@@ -215,7 +221,8 @@ def test_qwen_lite_protocols_build_configs_from_hf_dicts(transformer_engine_impo
 
     qwen3_cfg = qwen3_protocol.build_model_config(_tiny_qwen3_hf_dict(), vocab_size=128)
     qwen35_cfg = qwen35_protocol.build_model_config(
-        {"model_type": "qwen3_5_moe", "text_config": _tiny_qwen35_text_config()}, vocab_size=128
+        {"model_type": "qwen3_5_moe", "text_config": _tiny_qwen35_text_config()},
+        vocab_size=128,
     )
 
     assert qwen3_cfg.vocab_size == 128
@@ -246,10 +253,13 @@ def test_qwen35_attention_backend_override_resets_te_environment(
 
     _apply_attention_backend_override(backend)
 
-    assert tuple(
-        os.environ[name]
-        for name in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN")
-    ) == expected
+    assert (
+        tuple(
+            os.environ[name]
+            for name in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN")
+        )
+        == expected
+    )
 
 
 def test_qwen35_attention_backend_override_rejects_unknown_value(
@@ -283,11 +293,16 @@ def _string_list_assignment(tree: ast.Module, name: str) -> set[str]:
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
-        if not any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+        if not any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        ):
             continue
         if not isinstance(node.value, (ast.List, ast.Tuple)):
             return set()
-        return {item.value for item in node.value.elts if isinstance(item, ast.Constant)}
+        return {
+            item.value for item in node.value.elts if isinstance(item, ast.Constant)
+        }
     return set()
 
 

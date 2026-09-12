@@ -10,7 +10,9 @@ class MultiHeadHyperConnectionHead(nn.Module):
         self.hidden_size = hidden_size
         self.hc_mult = hc_mult
         self.eps = eps
-        self.hc_fn = nn.Parameter(torch.empty(hc_mult, hc_mult * hidden_size, dtype=torch.float32))
+        self.hc_fn = nn.Parameter(
+            torch.empty(hc_mult, hc_mult * hidden_size, dtype=torch.float32)
+        )
         self.hc_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
         self.reset_parameters()
@@ -27,6 +29,9 @@ class MultiHeadHyperConnectionHead(nn.Module):
         xf = x.flatten(2).float()
         rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
         mixes = F.linear(xf, self.hc_fn.float()) * rsqrt
-        pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
+        pre = (
+            torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float())
+            + self.eps
+        )
         y = torch.sum(pre.unsqueeze(-1) * xf.view(shape), dim=2)
         return y.to(dtype)

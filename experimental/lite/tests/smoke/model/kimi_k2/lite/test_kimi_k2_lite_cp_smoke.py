@@ -5,10 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-pytestmark = [
-    pytest.mark.gpus(2),
-    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
-]
+pytestmark = [pytest.mark.gpus(2), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
 
 
 def _init_dist_or_skip():
@@ -119,7 +116,9 @@ def _train_cfg(cp: int):
 
 
 def _to_hf_deepseek_v3_config(cfg):
-    from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+    from transformers.models.deepseek_v3.configuration_deepseek_v3 import (
+        DeepseekV3Config,
+    )
 
     rope_scaling = dict(cfg.rope_scaling)
     rope_scaling.setdefault("rope_type", rope_scaling.get("type", "yarn"))
@@ -166,7 +165,9 @@ def _distributed_diff_stats(actual, expected) -> tuple[float, float]:
 
     diff = (actual.float() - expected.float()).abs()
     max_abs = diff.max()
-    scale = torch.maximum(actual.float().abs().max(), expected.float().abs().max()).clamp_min(1e-6)
+    scale = torch.maximum(
+        actual.float().abs().max(), expected.float().abs().max()
+    ).clamp_min(1e-6)
     stats = torch.stack([max_abs, scale])
     if dist.is_initialized():
         dist.all_reduce(stats, op=dist.ReduceOp.MAX)
@@ -185,8 +186,12 @@ def _hf_state_dict_for_kimi_loader(model):
         down = state.get(f"{prefix}.down_proj")
         gate, up = gate_up.chunk(2, dim=1)
         for expert_idx in range(gate_up.size(0)):
-            state[f"{prefix}.{expert_idx}.gate_proj.weight"] = gate[expert_idx].contiguous().clone()
-            state[f"{prefix}.{expert_idx}.up_proj.weight"] = up[expert_idx].contiguous().clone()
+            state[f"{prefix}.{expert_idx}.gate_proj.weight"] = (
+                gate[expert_idx].contiguous().clone()
+            )
+            state[f"{prefix}.{expert_idx}.up_proj.weight"] = (
+                up[expert_idx].contiguous().clone()
+            )
             if down is not None:
                 state[f"{prefix}.{expert_idx}.down_proj.weight"] = (
                     down[expert_idx].contiguous().clone()
@@ -224,17 +229,24 @@ def test_kimi_k2_mla_cp2_matches_full_sequence_reference_forward_and_grad():
         use_thd=False,
     )
     torch.manual_seed(20260531)
-    cp_layer = MultiLatentAttention(ps=ps, **kwargs).to(device=device, dtype=torch.bfloat16)
+    cp_layer = MultiLatentAttention(ps=ps, **kwargs).to(
+        device=device, dtype=torch.bfloat16
+    )
     torch.manual_seed(20260531)
     ref_layer = MultiLatentAttention(ps=ParallelState(), **kwargs).to(
-        device=device,
-        dtype=torch.bfloat16,
+        device=device, dtype=torch.bfloat16
     )
 
     seq, batch = 8 * world, 1
     torch.manual_seed(123)
-    full_x = torch.randn(seq, batch, cfg.hidden_size, device=device, dtype=torch.bfloat16)
-    local_x = zigzag_slice_for_cp(full_x, rank, world, seq_dim=0).detach().requires_grad_(True)
+    full_x = torch.randn(
+        seq, batch, cfg.hidden_size, device=device, dtype=torch.bfloat16
+    )
+    local_x = (
+        zigzag_slice_for_cp(full_x, rank, world, seq_dim=0)
+        .detach()
+        .requires_grad_(True)
+    )
     ref_x = full_x.detach().clone().requires_grad_(True)
 
     cp_out = cp_layer(local_x)
@@ -267,13 +279,11 @@ def test_kimi_k2_tiny_model_cp2_matches_full_sequence_reference_forward():
 
     torch.manual_seed(777)
     cp_model = KimiK2Model(cfg, _train_cfg(world), ps, use_thd=False).to(
-        device=device,
-        dtype=torch.bfloat16,
+        device=device, dtype=torch.bfloat16
     )
     torch.manual_seed(777)
     ref_model = KimiK2Model(cfg, _train_cfg(1), ParallelState(), use_thd=False).to(
-        device=device,
-        dtype=torch.bfloat16,
+        device=device, dtype=torch.bfloat16
     )
     cp_model.eval()
     ref_model.eval()
@@ -289,16 +299,26 @@ def test_kimi_k2_tiny_model_cp2_matches_full_sequence_reference_forward():
         cp_out = cp_model(input_ids=input_ids, labels=labels)
         ref_out = ref_model(input_ids=full_ids, labels=full_labels)
 
-    expected_hidden = zigzag_slice_for_cp(ref_out["hidden_states"], rank, world, seq_dim=0)
-    expected_log_probs = zigzag_slice_for_cp(ref_out["log_probs"], rank, world, seq_dim=1)
-    torch.testing.assert_close(cp_out["hidden_states"], expected_hidden, atol=1e-1, rtol=1e-1)
-    torch.testing.assert_close(cp_out["log_probs"], expected_log_probs, atol=1e-1, rtol=1e-1)
+    expected_hidden = zigzag_slice_for_cp(
+        ref_out["hidden_states"], rank, world, seq_dim=0
+    )
+    expected_log_probs = zigzag_slice_for_cp(
+        ref_out["log_probs"], rank, world, seq_dim=1
+    )
+    torch.testing.assert_close(
+        cp_out["hidden_states"], expected_hidden, atol=1e-1, rtol=1e-1
+    )
+    torch.testing.assert_close(
+        cp_out["log_probs"], expected_log_probs, atol=1e-1, rtol=1e-1
+    )
 
 
 def test_kimi_k2_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     import torch
     import torch.distributed as dist
-    from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+    from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+        DeepseekV3ForCausalLM,
+    )
 
     device = _init_dist_or_skip()
     from megatron.lite.model.kimi_k2.lite.checkpoint import load_hf_weights
@@ -314,20 +334,15 @@ def test_kimi_k2_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
 
     torch.manual_seed(20260610)
     hf_ref = DeepseekV3ForCausalLM(_to_hf_deepseek_v3_config(cfg)).to(
-        device=device,
-        dtype=torch.bfloat16,
+        device=device, dtype=torch.bfloat16
     )
     hf_ref.eval()
     rank_tmp_path = tmp_path / f"rank{rank}"
-    save_safetensors(
-        _hf_state_dict_for_kimi_loader(hf_ref),
-        str(rank_tmp_path),
-    )
+    save_safetensors(_hf_state_dict_for_kimi_loader(hf_ref), str(rank_tmp_path))
 
     ps = init_parallel(ParallelConfig(tp=1, ep=1, etp=1, cp=world, pp=1))
     native = KimiK2Model(cfg, _train_cfg(world), ps, use_thd=False).to(
-        device=device,
-        dtype=torch.bfloat16,
+        device=device, dtype=torch.bfloat16
     )
     native.eval()
     load_hf_weights(native, str(rank_tmp_path), cfg, ps)
@@ -383,10 +398,7 @@ def test_kimi_k2_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
                 f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
             )
         torch.testing.assert_close(
-            actual.float(),
-            expected.float(),
-            atol=1.5e-1,
-            rtol=1.5e-1,
+            actual.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1
         )
 
     expected = zigzag_slice_for_cp(hf_logits, rank, world, seq_dim=1).contiguous()
@@ -397,10 +409,7 @@ def test_kimi_k2_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
             f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
         )
     torch.testing.assert_close(
-        native_logits.float(),
-        expected.float(),
-        atol=1.5e-1,
-        rtol=1.5e-1,
+        native_logits.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1
     )
 
 
@@ -411,7 +420,10 @@ def test_kimi_k2_packed_thd_variable_sequence_cp2_smoke():
     device = _init_dist_or_skip()
     from megatron.lite.model.kimi_k2.lite.model import KimiK2Model
     from megatron.lite.primitive.parallel.state import init_parallel
-    from megatron.lite.primitive.parallel.thd import pack_nested_thd, unpack_packed_thd_to_nested
+    from megatron.lite.primitive.parallel.thd import (
+        pack_nested_thd,
+        unpack_packed_thd_to_nested,
+    )
     from megatron.lite.runtime.contracts import ParallelConfig
 
     world = dist.get_world_size()
@@ -421,8 +433,7 @@ def test_kimi_k2_packed_thd_variable_sequence_cp2_smoke():
 
     torch.manual_seed(20260614)
     model = KimiK2Model(cfg, _train_cfg(world), ps, use_thd=True).to(
-        device=device,
-        dtype=torch.bfloat16,
+        device=device, dtype=torch.bfloat16
     )
     model.train()
 

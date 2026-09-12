@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from megatron.lite.primitive.parallel.cp import split_packed_for_cp
 from megatron.lite.primitive.parallel.pipeline import _num_microbatches_from_config
 from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
@@ -17,7 +16,9 @@ from megatron.lite.primitive.parallel.sp import (
 from megatron.lite.primitive.parallel.state import ParallelState
 
 
-def test_tp_vocab_embedding_and_output_single_rank_contract(transformer_engine_import_stub):
+def test_tp_vocab_embedding_and_output_single_rank_contract(
+    transformer_engine_import_stub,
+):
     transformer_engine_import_stub()
     from megatron.lite.primitive.parallel.linear import (
         VocabParallelEmbedding,
@@ -73,12 +74,16 @@ def test_cp_packed_split_handles_each_sample_independently():
     )
 
     torch.testing.assert_close(rank0[0], torch.tensor([0, 1, 6, 7, 8, 9, 14, 15]))
-    torch.testing.assert_close(rank0[1], torch.tensor([100, 101, 106, 107, 108, 109, 114, 115]))
+    torch.testing.assert_close(
+        rank0[1], torch.tensor([100, 101, 106, 107, 108, 109, 114, 115])
+    )
     torch.testing.assert_close(rank0[2], torch.tensor([0, 4, 8], dtype=torch.int32))
     assert rank0[3] == 4
 
     torch.testing.assert_close(rank1[0], torch.tensor([2, 3, 4, 5, 10, 11, 12, 13]))
-    torch.testing.assert_close(rank1[1], torch.tensor([102, 103, 104, 105, 110, 111, 112, 113]))
+    torch.testing.assert_close(
+        rank1[1], torch.tensor([102, 103, 104, 105, 110, 111, 112, 113])
+    )
     torch.testing.assert_close(rank1[2], torch.tensor([0, 4, 8], dtype=torch.int32))
     assert rank1[3] == 4
 
@@ -115,7 +120,9 @@ def test_ep_token_dispatcher_local_roundtrip_is_independent_of_deepep(
 
     ps = ParallelState(ep_size=1, ep_rank=0)
     dispatcher = TokenDispatcher(num_experts=3, hidden_size=2, ps=ps, use_deepep=False)
-    hidden = torch.tensor([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]], requires_grad=True)
+    hidden = torch.tensor(
+        [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]], requires_grad=True
+    )
     topk_indices = torch.tensor([[0], [2], [1], [2]])
     topk_scores = torch.ones(4, 1)
 
@@ -155,8 +162,7 @@ def test_ep_token_dispatcher_sums_scores_for_duplicate_experts(
 
 
 def test_alltoall_dispatch_sums_scores_for_duplicate_experts(
-    monkeypatch,
-    transformer_engine_import_stub,
+    monkeypatch, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules import dispatcher as dispatcher_module
@@ -166,7 +172,9 @@ def test_alltoall_dispatch_sums_scores_for_duplicate_experts(
         output.zero_()
         output[: local_counts.numel()].copy_(local_counts)
 
-    monkeypatch.setattr(dispatcher_module.dist, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(
+        dispatcher_module.dist, "all_gather_into_tensor", fake_all_gather
+    )
     monkeypatch.setattr(dispatcher_module.dist, "get_rank", lambda group: 0)
     monkeypatch.setattr(
         dispatcher_module._AllToAll,

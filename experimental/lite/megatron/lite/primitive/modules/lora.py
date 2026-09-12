@@ -29,7 +29,9 @@ class LoraConfig:
     rank: int = 0
     alpha: int | None = None
     dropout: float = 0.0
-    target_modules: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_TARGET_MODULES)
+    target_modules: tuple[str, ...] = field(
+        default_factory=lambda: _DEFAULT_TARGET_MODULES
+    )
 
     @property
     def enabled(self) -> bool:
@@ -56,7 +58,9 @@ def normalize_lora_config(config: LoraConfig | dict[str, Any] | None) -> LoraCon
     if isinstance(config, LoraConfig):
         return config
     if not isinstance(config, dict):
-        raise TypeError(f"LoRA config must be LoraConfig, dict, or None, got {type(config)!r}.")
+        raise TypeError(
+            f"LoRA config must be LoraConfig, dict, or None, got {type(config)!r}."
+        )
     values = dict(config)
     enabled = values.pop("enabled", None)
     if enabled is False:
@@ -134,13 +138,17 @@ class _AllGatherSequence(torch.autograd.Function):
         world_size = dist.get_world_size(group)
         ctx.group = group
         ctx.local_seq = x.shape[0]
-        out = torch.empty((x.shape[0] * world_size, *x.shape[1:]), dtype=x.dtype, device=x.device)
+        out = torch.empty(
+            (x.shape[0] * world_size, *x.shape[1:]), dtype=x.dtype, device=x.device
+        )
         dist.all_gather_into_tensor(out, x.contiguous(), group=group)
         return out
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
-        out = torch.empty((ctx.local_seq, *grad.shape[1:]), dtype=grad.dtype, device=grad.device)
+        out = torch.empty(
+            (ctx.local_seq, *grad.shape[1:]), dtype=grad.dtype, device=grad.device
+        )
         dist.reduce_scatter_tensor(out, grad.contiguous(), group=ctx.group)
         return out, None
 
@@ -155,14 +163,18 @@ class _ReduceScatterSequence(torch.autograd.Function):
             )
         ctx.group = group
         ctx.world_size = world_size
-        out = torch.empty((x.shape[0] // world_size, *x.shape[1:]), dtype=x.dtype, device=x.device)
+        out = torch.empty(
+            (x.shape[0] // world_size, *x.shape[1:]), dtype=x.dtype, device=x.device
+        )
         dist.reduce_scatter_tensor(out, x.contiguous(), group=group)
         return out
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         out = torch.empty(
-            (grad.shape[0] * ctx.world_size, *grad.shape[1:]), dtype=grad.dtype, device=grad.device
+            (grad.shape[0] * ctx.world_size, *grad.shape[1:]),
+            dtype=grad.dtype,
+            device=grad.device,
         )
         dist.all_gather_into_tensor(out, grad.contiguous(), group=ctx.group)
         return out, None
@@ -173,7 +185,9 @@ class _ScatterSequence(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, group, group_rank: int) -> torch.Tensor:
         world_size = dist.get_world_size(group)
         if x.shape[0] % world_size != 0:
-            raise ValueError(f"Cannot scatter sequence dim {x.shape[0]} over TP={world_size}.")
+            raise ValueError(
+                f"Cannot scatter sequence dim {x.shape[0]} over TP={world_size}."
+            )
         ctx.group = group
         ctx.world_size = world_size
         local_seq = x.shape[0] // world_size
@@ -183,7 +197,9 @@ class _ScatterSequence(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         out = torch.empty(
-            (grad.shape[0] * ctx.world_size, *grad.shape[1:]), dtype=grad.dtype, device=grad.device
+            (grad.shape[0] * ctx.world_size, *grad.shape[1:]),
+            dtype=grad.dtype,
+            device=grad.device,
         )
         dist.all_gather_into_tensor(out, grad.contiguous(), group=ctx.group)
         return out, None, None
@@ -204,7 +220,9 @@ class _AllReduceSum(torch.autograd.Function):
         return out, None
 
 
-def _all_gather_last_dim(x: torch.Tensor, group, *, reduce_backward: bool = False) -> torch.Tensor:
+def _all_gather_last_dim(
+    x: torch.Tensor, group, *, reduce_backward: bool = False
+) -> torch.Tensor:
     if group is None or dist.get_world_size(group) == 1:
         return x
     return _AllGatherLastDim.apply(x, group, reduce_backward)
@@ -222,11 +240,15 @@ class _AllGatherLastDim(torch.autograd.Function):
         ctx.reduce_backward = bool(reduce_backward)
         flat = x.movedim(-1, 0).contiguous().view(ctx.local_width, -1)
         gathered = torch.empty(
-            (ctx.local_width * world_size, flat.shape[1]), dtype=x.dtype, device=x.device
+            (ctx.local_width * world_size, flat.shape[1]),
+            dtype=x.dtype,
+            device=x.device,
         )
         dist.all_gather_into_tensor(gathered, flat, group=group)
         return (
-            gathered.view(ctx.local_width * world_size, *x.shape[:-1]).movedim(0, -1).contiguous()
+            gathered.view(ctx.local_width * world_size, *x.shape[:-1])
+            .movedim(0, -1)
+            .contiguous()
         )
 
     @staticmethod
@@ -236,7 +258,11 @@ class _AllGatherLastDim(torch.autograd.Function):
         out = flat.narrow(0, start, ctx.local_width).contiguous()
         if ctx.reduce_backward:
             dist.all_reduce(out, op=dist.ReduceOp.SUM, group=ctx.group)
-        return out.view(ctx.local_width, *grad.shape[:-1]).movedim(0, -1).contiguous(), None, None
+        return (
+            out.view(ctx.local_width, *grad.shape[:-1]).movedim(0, -1).contiguous(),
+            None,
+            None,
+        )
 
 
 class _SequenceParallelRankPartitionedLoRA(torch.autograd.Function):
@@ -251,7 +277,12 @@ class _SequenceParallelRankPartitionedLoRA(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, x: torch.Tensor, lora_a: torch.Tensor, lora_b: torch.Tensor, scale: float, group
+        ctx,
+        x: torch.Tensor,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+        scale: float,
+        group,
     ):
         world_size = dist.get_world_size(group) if group is not None else 1
         if world_size > 1:
@@ -302,25 +333,35 @@ class _SequenceParallelRankPartitionedLoRA(torch.autograd.Function):
         )
         grad_gathered = grad_hidden_local.matmul(lora_a)
         if world_size > 1:
-            grad_x = _reduce_scatter_sequence_forward(grad_gathered, group, ctx.local_seq)
+            grad_x = _reduce_scatter_sequence_forward(
+                grad_gathered, group, ctx.local_seq
+            )
         else:
             grad_x = grad_gathered
         return grad_x, grad_a, grad_b, None, None
 
 
-def _all_gather_sequence_forward(x: torch.Tensor, group, world_size: int) -> torch.Tensor:
-    out = torch.empty((x.shape[0] * world_size, *x.shape[1:]), dtype=x.dtype, device=x.device)
+def _all_gather_sequence_forward(
+    x: torch.Tensor, group, world_size: int
+) -> torch.Tensor:
+    out = torch.empty(
+        (x.shape[0] * world_size, *x.shape[1:]), dtype=x.dtype, device=x.device
+    )
     dist.all_gather_into_tensor(out, x.contiguous(), group=group)
     return out
 
 
-def _reduce_scatter_sequence_forward(x: torch.Tensor, group, local_seq: int) -> torch.Tensor:
+def _reduce_scatter_sequence_forward(
+    x: torch.Tensor, group, local_seq: int
+) -> torch.Tensor:
     out = torch.empty((local_seq, *x.shape[1:]), dtype=x.dtype, device=x.device)
     dist.reduce_scatter_tensor(out, x.contiguous(), group=group)
     return out
 
 
-def _all_gather_last_dim_forward(x: torch.Tensor, group, world_size: int) -> torch.Tensor:
+def _all_gather_last_dim_forward(
+    x: torch.Tensor, group, world_size: int
+) -> torch.Tensor:
     if world_size == 1:
         return x
     local_width = x.shape[-1]
@@ -329,7 +370,11 @@ def _all_gather_last_dim_forward(x: torch.Tensor, group, world_size: int) -> tor
         (local_width * world_size, flat.shape[1]), dtype=x.dtype, device=x.device
     )
     dist.all_gather_into_tensor(gathered, flat, group=group)
-    return gathered.view(local_width * world_size, *x.shape[:-1]).movedim(0, -1).contiguous()
+    return (
+        gathered.view(local_width * world_size, *x.shape[:-1])
+        .movedim(0, -1)
+        .contiguous()
+    )
 
 
 def _split_last_dim(x: torch.Tensor, group_rank: int, local_width: int) -> torch.Tensor:
@@ -429,7 +474,11 @@ class LinearLoRA(nn.Module):
         nn.init.zeros_(self.lora_b)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.sequence_parallel_input and self.rank_partitioned_a and not self.training:
+        if (
+            self.sequence_parallel_input
+            and self.rank_partitioned_a
+            and not self.training
+        ):
             # Keep eval/inference on the simple path; the memory optimization
             # matters only when autograd needs to retain forward activations.
             pass
@@ -447,7 +496,11 @@ class LinearLoRA(nn.Module):
             )
         if self.sequence_parallel_input:
             x = _gather_sequence_parallel(x, self.tp_group)
-        dropped = F.dropout(x, p=self.dropout_p, training=self.training) if self.dropout_p else x
+        dropped = (
+            F.dropout(x, p=self.dropout_p, training=self.training)
+            if self.dropout_p
+            else x
+        )
         hidden = dropped.matmul(self.lora_a.t())
         if self.rank_partitioned_a:
             hidden = _all_gather_last_dim(hidden, self.tp_group, reduce_backward=True)
@@ -511,7 +564,11 @@ class GroupedLinearLoRA(nn.Module):
                 h_i = dropped.matmul(self.lora_a[expert_idx].t())
                 outputs.append(h_i.matmul(self.lora_b[expert_idx].t()) * self.scale)
             offset += size
-        return torch.cat(outputs, dim=0) if outputs else x.new_empty((0, self.lora_b.shape[1]))
+        return (
+            torch.cat(outputs, dim=0)
+            if outputs
+            else x.new_empty((0, self.lora_b.shape[1]))
+        )
 
 
 class SharedGroupedLinearLoRA(nn.Module):
@@ -550,7 +607,11 @@ class SharedGroupedLinearLoRA(nn.Module):
             raise ValueError(
                 f"SharedGroupedLinearLoRA expected {self.num_local_experts} splits, got {len(splits)}."
             )
-        dropped = F.dropout(x, p=self.dropout_p, training=self.training) if self.dropout_p else x
+        dropped = (
+            F.dropout(x, p=self.dropout_p, training=self.training)
+            if self.dropout_p
+            else x
+        )
         return dropped.matmul(self.lora_a.t()).matmul(self.lora_b.t()) * self.scale
 
 

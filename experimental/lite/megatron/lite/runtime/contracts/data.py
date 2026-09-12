@@ -73,7 +73,10 @@ class PackedBatch(Batch):
         if self.position_ids is not None:
             return self.position_ids
         return torch.cat(
-            [torch.arange(s, device=self.seq_lens.device) for s in self.seq_lens.tolist()]
+            [
+                torch.arange(s, device=self.seq_lens.device)
+                for s in self.seq_lens.tolist()
+            ]
         )
 
 
@@ -114,10 +117,4 @@ class ForwardResult:
     metrics: dict[str, Any] = field(default_factory=dict)
 
 
-__all__ = [
-    "Batch",
-    "ForwardResult",
-    "ModelOutputs",
-    "PackedBatch",
-    "TrainBatch",
-]
+__all__ = ["Batch", "ForwardResult", "ModelOutputs", "PackedBatch", "TrainBatch"]

@@ -29,18 +29,26 @@ def _unpack_output(handle, runtime_batch, output: torch.Tensor) -> list[torch.Te
     proto = handle._extras.get("protocol")
     unpack = getattr(proto, "unpack_forward_output", None)
     if unpack is None:
-        raise ValueError("Model protocol must expose unpack_forward_output for miles losses.")
-    model = handle._model[0] if isinstance(handle._model, list | tuple) else handle._model
+        raise ValueError(
+            "Model protocol must expose unpack_forward_output for miles losses."
+        )
+    model = (
+        handle._model[0] if isinstance(handle._model, list | tuple) else handle._model
+    )
     return _nested_to_list(unpack(model, runtime_batch, output), runtime_batch.seq_lens)
 
 
-def extract_response_log_probs(raw_output: dict[str, torch.Tensor], runtime_batch, source_batch, handle):
+def extract_response_log_probs(
+    raw_output: dict[str, torch.Tensor], runtime_batch, source_batch, handle
+):
     log_probs = raw_output.get("log_probs")
     if log_probs is None:
         raise ValueError("Megatron Lite model output must contain token log_probs.")
     full_log_probs = _unpack_output(handle, runtime_batch, log_probs)
     response_log_probs = []
-    for values, mask in zip(full_log_probs, source_batch["aligned_loss_masks"], strict=True):
+    for values, mask in zip(
+        full_log_probs, source_batch["aligned_loss_masks"], strict=True
+    ):
         active = mask.to(device=values.device).bool()
         if values.numel() != active.numel():
             raise ValueError(
@@ -62,11 +70,13 @@ def _mean_scalars(values: list[torch.Tensor], device) -> torch.Tensor:
 
 
 def _policy_loss(
-    args,
-    current: list[torch.Tensor],
-    source_batch: dict[str, Any],
+    args, current: list[torch.Tensor], source_batch: dict[str, Any]
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    old = source_batch.get("rollout_log_probs") if getattr(args, "use_rollout_logprobs", False) else None
+    old = (
+        source_batch.get("rollout_log_probs")
+        if getattr(args, "use_rollout_logprobs", False)
+        else None
+    )
     if old is None:
         old = source_batch.get("log_probs")
     if old is None:
@@ -80,7 +90,9 @@ def _policy_loss(
     losses = []
     clipfracs = []
     kls = []
-    for cur, old_lp, adv, mask in zip(current, old, advantages, source_batch["loss_masks"], strict=True):
+    for cur, old_lp, adv, mask in zip(
+        current, old, advantages, source_batch["loss_masks"], strict=True
+    ):
         cur = cur.float()
         old_lp = old_lp.to(device=cur.device, dtype=cur.dtype)
         adv = adv.to(device=cur.device, dtype=cur.dtype)
@@ -116,7 +128,9 @@ def _policy_loss(
     return loss, metrics
 
 
-def _sft_loss(current: list[torch.Tensor], source_batch: dict[str, Any]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+def _sft_loss(
+    current: list[torch.Tensor], source_batch: dict[str, Any]
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     losses = []
     for log_probs, mask in zip(current, source_batch["loss_masks"], strict=True):
         mask = mask.to(device=log_probs.device, dtype=log_probs.dtype)
@@ -144,15 +158,21 @@ def make_runtime_loss_fn(
         try:
             return next(loss_context_iter)
         except StopIteration as exc:
-            raise RuntimeError("MLite miles loss context iterator ended before loss_fn calls.") from exc
+            raise RuntimeError(
+                "MLite miles loss context iterator ended before loss_fn calls."
+            ) from exc
 
     def _loss_fn(raw_output: dict[str, torch.Tensor], runtime_batch, loss_context=None):
         if loss_context is None:
             loss_context = _next_loss_context()
         if loss_context is None or loss_context.source_batch is None:
-            raise ValueError("MLite miles loss_fn requires a LossContext with source_batch.")
+            raise ValueError(
+                "MLite miles loss_fn requires a LossContext with source_batch."
+            )
         source_batch = loss_context.source_batch
-        current = extract_response_log_probs(raw_output, runtime_batch, source_batch, handle)
+        current = extract_response_log_probs(
+            raw_output, runtime_batch, source_batch, handle
+        )
         if forward_store is not None:
             forward_store.append({"log_probs": [x.detach() for x in current]})
             zero = torch.zeros((), device=current[0].device, dtype=torch.float32)
@@ -163,6 +183,8 @@ def make_runtime_loss_fn(
             return _sft_loss(current, source_batch)
         if loss_type == "policy_loss":
             return _policy_loss(args, current, source_batch)
-        raise NotImplementedError(f"Megatron Lite miles actor does not support loss_type={loss_type!r}.")
+        raise NotImplementedError(
+            f"Megatron Lite miles actor does not support loss_type={loss_type!r}."
+        )
 
     return _loss_fn

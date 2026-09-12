@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from verl_mlite.engine.mlite_engine import MegatronLiteEngine
 
 pytestmark = pytest.mark.mlite
@@ -18,8 +17,7 @@ def test_mtp_metric_averages_over_physical_pool_not_logical_singleton(monkeypatc
     logical_singleton = object()
     engine = object.__new__(MegatronLiteEngine)
     engine.handle = SimpleNamespace(
-        dp_group=logical_singleton,
-        metric_group=physical_pool,
+        dp_group=logical_singleton, metric_group=physical_pool
     )
     calls = []
 

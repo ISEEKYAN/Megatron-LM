@@ -10,7 +10,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-
 from megatron.lite.runtime.backends.bridge.config import BridgeConfig
 from megatron.lite.runtime.backends.bridge.runtime import (
     BridgeRuntime,
@@ -33,7 +32,6 @@ logger = logging.getLogger(__name__)
 def _build_mbridge(hf_path: str, cfg: BridgeConfig):
     """Build the legacy mbridge AutoBridge lazily from an HF model path."""
     from mbridge import AutoBridge
-
     from megatron.lite.primitive.deterministic import deterministic_requested
 
     bridge = AutoBridge.from_pretrained(hf_path, trust_remote_code=True)
@@ -44,7 +42,9 @@ def _build_mbridge(hf_path: str, cfg: BridgeConfig):
         bridge.set_extra_args(**transformer_overrides)
 
     if not hasattr(bridge.hf_config, "rope_theta"):
-        bridge.hf_config.rope_theta = bridge.hf_config.to_dict().get("rope_theta", 1000000.0)
+        bridge.hf_config.rope_theta = bridge.hf_config.to_dict().get(
+            "rope_theta", 1000000.0
+        )
 
     bridge.set_extra_args(bf16=True, fp16=False)
 
@@ -61,7 +61,10 @@ def _build_mbridge(hf_path: str, cfg: BridgeConfig):
 
 def _resolve_mbridge_benchmark_protocol(cfg: BridgeConfig, bridge) -> Any | None:
     """Best-effort protocol lookup for model stats used by bench examples."""
-    from megatron.lite.model.registry import get_train_runtime_module, resolve_model_type_from_hf
+    from megatron.lite.model.registry import (
+        get_train_runtime_module,
+        resolve_model_type_from_hf,
+    )
 
     model_name = cfg.model_name
     if model_name == "auto":
@@ -80,7 +83,10 @@ class MBridgeRuntime(BridgeRuntime):
     """mbridge training backend using Megatron-Core optimizer state."""
 
     def build_model(
-        self, hf_path: str | None = None, cfg: BridgeConfig | dict[str, Any] | None = None, **kwargs
+        self,
+        hf_path: str | None = None,
+        cfg: BridgeConfig | dict[str, Any] | None = None,
+        **kwargs,
     ) -> ModelHandle:
         from megatron.core import parallel_state as mpu
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -124,13 +130,19 @@ class MBridgeRuntime(BridgeRuntime):
         ddp_config.update(rt_cfg.override_ddp_config)
 
         model_list = bridge.get_model(
-            model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, ddp_config=ddp_config
+            model_type=ModelType.encoder_or_decoder,
+            wrap_with_ddp=True,
+            ddp_config=ddp_config,
         )
         if rt_cfg.load_hf_weights:
             bridge.load_weights(model_list, hf_path, memory_efficient=True)
 
-        optimizer = _build_optimizer(model_list, rt_cfg) if rt_cfg.build_optimizer else None
-        lr_scheduler = _build_lr_scheduler(optimizer, rt_cfg) if optimizer is not None else None
+        optimizer = (
+            _build_optimizer(model_list, rt_cfg) if rt_cfg.build_optimizer else None
+        )
+        lr_scheduler = (
+            _build_lr_scheduler(optimizer, rt_cfg) if optimizer is not None else None
+        )
         register_training_hooks(model_list, optimizer)
 
         if self._offload_param:
@@ -138,7 +150,13 @@ class MBridgeRuntime(BridgeRuntime):
         if self._offload_optimizer and optimizer is not None:
             offload_optimizer(optimizer)
 
-        logger.info("MBridgeRuntime: model built, tp=%d ep=%d pp=%d cp=%d", p.tp, p.ep, p.pp, p.cp)
+        logger.info(
+            "MBridgeRuntime: model built, tp=%d ep=%d pp=%d cp=%d",
+            p.tp,
+            p.ep,
+            p.pp,
+            p.cp,
+        )
 
         return ModelHandle(
             model=model_list[0],
@@ -157,7 +175,9 @@ class MBridgeRuntime(BridgeRuntime):
             },
         )
 
-    def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
+    def export_weights(
+        self, handle: ModelHandle, **kwargs
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         bridge = handle._extras["bridge"]
         model_list = handle._extras["model_list"]
         load_model_to_gpu(model_list, load_grad=False)

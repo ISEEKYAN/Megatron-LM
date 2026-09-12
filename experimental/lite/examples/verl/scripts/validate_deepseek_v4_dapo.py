@@ -16,7 +16,6 @@ from pathlib import Path
 
 from packaging.version import Version
 
-
 EXACT_DEPENDENCIES = {
     "vllm": "0.25.1",
     "flashinfer-python": "0.6.13",
@@ -102,9 +101,10 @@ def validate_environment() -> None:
             "DS4 requires PyTorch 2.12 nv26.05 / CUDA 13.2, "
             f"got torch={torch.__version__} cuda={torch.version.cuda}"
         )
-    if "q_causal_offsets" not in inspect.signature(
-        DSA.indexer_forward_wrapper
-    ).parameters:
+    if (
+        "q_causal_offsets"
+        not in inspect.signature(DSA.indexer_forward_wrapper).parameters
+    ):
         raise SystemExit(
             "nvidia-cudnn-frontend lacks q_causal_offsets required by fused DSA CP"
         )

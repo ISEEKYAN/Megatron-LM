@@ -5,8 +5,8 @@ from pathlib import Path
 
 from hydra import compose, initialize_config_module
 from megatron.lite.primitive.quantization.qat import (
-    QATSpec,
     _DEFAULT_IGNORE_PATTERNS,
+    QATSpec,
     normalize_qat_spec,
 )
 from omegaconf import OmegaConf
@@ -15,28 +15,19 @@ from omegaconf import OmegaConf
 def _compose_engine(*overrides: str) -> dict:
     config_root = Path(__file__).parents[3] / "examples" / "verl"
     assert (config_root / "verl_mlite" / "config" / "engine" / "mlite.yaml").is_file()
-    with initialize_config_module(
-        config_module="verl_mlite.config",
-        version_base=None,
-    ):
+    with initialize_config_module(config_module="verl_mlite.config", version_base=None):
         config = compose(
             config_name=None,
             overrides=["+engine@actor_rollout_ref.actor.engine=mlite", *overrides],
         )
-    return OmegaConf.to_container(
-        config.actor_rollout_ref.actor.engine,
-        resolve=True,
-    )
+    return OmegaConf.to_container(config.actor_rollout_ref.actor.engine, resolve=True)
 
 
 def test_default_yaml_keeps_export_and_training_qat_disabled() -> None:
     engine = _compose_engine()
 
     assert engine["qat"] == {}
-    assert engine["impl_cfg"]["qat"] == {
-        "enabled": False,
-        "format": "mxfp4",
-    }
+    assert engine["impl_cfg"]["qat"] == {"enabled": False, "format": "mxfp4"}
 
     spec = normalize_qat_spec(engine["impl_cfg"]["qat"])
     assert spec == QATSpec(enabled=False, format="mxfp4")
@@ -52,10 +43,7 @@ def test_colocated_ref_follows_actor_runtime_plugins() -> None:
         config_root / "verl_mlite" / "config" / "ref" / "mlite_ref.yaml"
     )
     actor_plugins = {
-        "dynamic_context_parallel": {
-            "enabled": True,
-            "max_seqlen_per_dp_cp_rank": 4096,
-        }
+        "dynamic_context_parallel": {"enabled": True, "max_seqlen_per_dp_cp_rank": 4096}
     }
     root = OmegaConf.create(
         {

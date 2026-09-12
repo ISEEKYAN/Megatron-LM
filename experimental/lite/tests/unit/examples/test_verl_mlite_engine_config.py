@@ -17,7 +17,9 @@ pytestmark = pytest.mark.optional
 
 @pytest.fixture(autouse=True)
 def _require_verl() -> None:
-    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
+    pytest.importorskip(
+        "verl", reason="VERL is required for this optional example test."
+    )
 
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
@@ -73,7 +75,10 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     engine.get_data_parallel_group = lambda: None
 
     hook = engine._make_runtime_loss_fn(
-        lambda model_output, **_kwargs: (model_output["log_probs"] / num_microbatches, {}),
+        lambda model_output, **_kwargs: (
+            model_output["log_probs"] / num_microbatches,
+            {},
+        ),
         num_microbatches=num_microbatches,
         output_lst=outputs,
     )
@@ -83,7 +88,9 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
         (loss / num_microbatches).backward()
 
     torch.testing.assert_close(weight.grad, torch.tensor(3.0))
-    assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
+    assert [output["loss"] for output in outputs] == [
+        3.0 / num_microbatches
+    ] * num_microbatches
 
 
 def test_verl_loss_hook_has_no_strong_self_reference():

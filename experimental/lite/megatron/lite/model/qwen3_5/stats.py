@@ -38,7 +38,11 @@ def num_floating_point_operations(
             if full_attention_interval <= 0:
                 return None
             layer_types = [
-                "full_attention" if (i + 1) % full_attention_interval == 0 else "linear_attention"
+                (
+                    "full_attention"
+                    if (i + 1) % full_attention_interval == 0
+                    else "linear_attention"
+                )
                 for i in range(num_hidden_layers)
             ]
 
@@ -99,7 +103,10 @@ def num_floating_point_operations(
             18
             * total_tokens
             * hidden_size
-            * (moe_intermediate_size * num_experts_per_tok + shared_expert_intermediate_size)
+            * (
+                moe_intermediate_size * num_experts_per_tok
+                + shared_expert_intermediate_size
+            )
             * num_hidden_layers
         )
 
@@ -145,7 +152,9 @@ def activated_params(model_cfg: Qwen35Config) -> int | None:
         num_key_value_heads = int(_get("num_key_value_heads"))
         head_dim = int(_get("head_dim"))
         full_qkv_dim = (num_attention_heads + 2 * num_key_value_heads) * head_dim
-        full_attention = hidden_size * full_qkv_dim + (num_attention_heads * head_dim) * hidden_size
+        full_attention = (
+            hidden_size * full_qkv_dim + (num_attention_heads * head_dim) * hidden_size
+        )
 
         linear_num_key_heads = int(_get("linear_num_key_heads"))
         linear_key_head_dim = int(_get("linear_key_head_dim"))
@@ -170,7 +179,8 @@ def activated_params(model_cfg: Qwen35Config) -> int | None:
         shared_expert_intermediate_size = int(_get("shared_expert_intermediate_size"))
         router = hidden_size * num_experts
         routed_expert = (
-            hidden_size * (2 * moe_intermediate_size) + moe_intermediate_size * hidden_size
+            hidden_size * (2 * moe_intermediate_size)
+            + moe_intermediate_size * hidden_size
         )
         shared_expert = (
             hidden_size * (2 * shared_expert_intermediate_size)

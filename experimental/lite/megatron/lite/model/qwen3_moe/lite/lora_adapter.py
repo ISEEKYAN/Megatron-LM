@@ -10,7 +10,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.modules.lora import LoraConfig, normalize_lora_config
 from megatron.lite.primitive.parallel import ParallelState
@@ -44,7 +43,9 @@ def _unwrap_model(module: nn.Module) -> nn.Module:
     return current
 
 
-def _iter_qwen_chunks(chunks: list[nn.Module] | tuple[nn.Module, ...]) -> list[nn.Module]:
+def _iter_qwen_chunks(
+    chunks: list[nn.Module] | tuple[nn.Module, ...]
+) -> list[nn.Module]:
     return [_unwrap_model(chunk) for chunk in chunks]
 
 
@@ -71,7 +72,9 @@ def _is_rank_partitioned_lora_a(lora: Any, ps: ParallelState) -> bool:
     return ps.tp_size > 1 and lora.lora_a.shape[0] != rank
 
 
-def _gather_lora_rank_partition(tensor: torch.Tensor, ps: ParallelState) -> torch.Tensor:
+def _gather_lora_rank_partition(
+    tensor: torch.Tensor, ps: ParallelState
+) -> torch.Tensor:
     return _all_gather_cat(tensor, ps.tp_group, dim=0)
 
 
@@ -79,7 +82,9 @@ def _slice_lora_rank_partition(tensor: torch.Tensor, ps: ParallelState) -> torch
     if ps.tp_size == 1:
         return tensor.contiguous()
     if tensor.shape[0] % ps.tp_size != 0:
-        raise ValueError(f"Cannot shard LoRA rank dim {tensor.shape[0]} over TP={ps.tp_size}.")
+        raise ValueError(
+            f"Cannot shard LoRA rank dim {tensor.shape[0]} over TP={ps.tp_size}."
+        )
     local_rank = tensor.shape[0] // ps.tp_size
     start = ps.tp_rank * local_rank
     return tensor[start : start + local_rank].contiguous()
@@ -88,7 +93,9 @@ def _slice_lora_rank_partition(tensor: torch.Tensor, ps: ParallelState) -> torch
 def _is_output_partitioned_lora_b(lora: Any, ps: ParallelState) -> bool:
     if getattr(lora, "output_partitioned_b", False):
         return True
-    return ps.tp_size > 1 and lora.lora_b.shape[0] * ps.tp_size == getattr(lora, "out_features", -1)
+    return ps.tp_size > 1 and lora.lora_b.shape[0] * ps.tp_size == getattr(
+        lora, "out_features", -1
+    )
 
 
 def _expert_lora_is_shared(lora: Any) -> bool:
@@ -100,8 +107,14 @@ def _expand_shared_expert_lora(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if _expert_lora_is_shared(lora):
         return (
-            lora.lora_a.detach().unsqueeze(0).expand(num_local_experts, -1, -1).contiguous(),
-            lora.lora_b.detach().unsqueeze(0).expand(num_local_experts, -1, -1).contiguous(),
+            lora.lora_a.detach()
+            .unsqueeze(0)
+            .expand(num_local_experts, -1, -1)
+            .contiguous(),
+            lora.lora_b.detach()
+            .unsqueeze(0)
+            .expand(num_local_experts, -1, -1)
+            .contiguous(),
         )
     return lora.lora_a.detach(), lora.lora_b.detach()
 
@@ -145,7 +158,9 @@ def _attn_key(layer_idx: int, module: str, suffix: str) -> str:
 
 
 def _expert_key(layer_idx: int, expert_idx: int, module: str, suffix: str) -> str:
-    return f"{_layer_prefix(layer_idx)}.mlp.experts.{expert_idx}.{module}.{suffix}.weight"
+    return (
+        f"{_layer_prefix(layer_idx)}.mlp.experts.{expert_idx}.{module}.{suffix}.weight"
+    )
 
 
 def _target_modules_from_lora_config(lora_config: LoraConfig) -> list[str]:
@@ -248,11 +263,17 @@ def _validate_adapter_config(
 ) -> None:
     peft_type = adapter_config.get("peft_type")
     if peft_type is not None and str(peft_type).upper() != "LORA":
-        raise ValueError(f"Expected PEFT adapter_config peft_type='LORA', got {peft_type!r}.")
+        raise ValueError(
+            f"Expected PEFT adapter_config peft_type='LORA', got {peft_type!r}."
+        )
 
     state_rank = _infer_state_rank(state)
     config_rank = adapter_config.get("r")
-    if config_rank is not None and state_rank is not None and int(config_rank) != state_rank:
+    if (
+        config_rank is not None
+        and state_rank is not None
+        and int(config_rank) != state_rank
+    ):
         raise ValueError(
             f"Adapter config rank r={config_rank} does not match tensor rank {state_rank}."
         )
@@ -267,7 +288,11 @@ def _validate_adapter_config(
 
     config_alpha = adapter_config.get("lora_alpha")
     native_alpha = _infer_native_alpha(chunks)
-    if config_alpha is not None and native_alpha is not None and int(config_alpha) != native_alpha:
+    if (
+        config_alpha is not None
+        and native_alpha is not None
+        and int(config_alpha) != native_alpha
+    ):
         raise ValueError(
             f"Adapter config lora_alpha={config_alpha} does not match native model alpha={native_alpha}."
         )
@@ -279,7 +304,9 @@ def _validate_adapter_config(
             raise ValueError(
                 f"Adapter config rank r={config_rank} does not match expected rank {expected.rank}."
             )
-        if config_alpha is not None and int(config_alpha) != _effective_lora_alpha(expected):
+        if config_alpha is not None and int(config_alpha) != _effective_lora_alpha(
+            expected
+        ):
             raise ValueError(
                 "Adapter config lora_alpha="
                 f"{config_alpha} does not match expected alpha {_effective_lora_alpha(expected)}."
@@ -348,7 +375,9 @@ def export_lora_adapter_state(
 
             if attn.qkv_lora is not None:
                 if _is_rank_partitioned_lora_a(attn.qkv_lora, ps):
-                    qkv_a = _gather_lora_rank_partition(attn.qkv_lora.lora_a.detach(), ps)
+                    qkv_a = _gather_lora_rank_partition(
+                        attn.qkv_lora.lora_a.detach(), ps
+                    )
                 else:
                     qkv_a = _select_tp_replicated(attn.qkv_lora.lora_a.detach(), ps)
                 q_b_local, k_b_local, v_b_local = _split_local_mcore_qkv_b(
@@ -369,9 +398,13 @@ def export_lora_adapter_state(
                     state[_attn_key(layer_idx, "v_proj", "lora_B")] = v_b
 
             if attn.proj_lora is not None:
-                proj_a = _all_gather_cat(attn.proj_lora.lora_a.detach(), ps.tp_group, dim=1)
+                proj_a = _all_gather_cat(
+                    attn.proj_lora.lora_a.detach(), ps.tp_group, dim=1
+                )
                 if _is_output_partitioned_lora_b(attn.proj_lora, ps):
-                    proj_b = _all_gather_cat(attn.proj_lora.lora_b.detach(), ps.tp_group, dim=0)
+                    proj_b = _all_gather_cat(
+                        attn.proj_lora.lora_b.detach(), ps.tp_group, dim=0
+                    )
                 else:
                     proj_b = _select_tp_replicated(attn.proj_lora.lora_b.detach(), ps)
                 if _rank() == 0:
@@ -388,18 +421,18 @@ def export_lora_adapter_state(
                 gate_b, up_b = fc1_b.chunk(2, dim=1)
                 if _rank() == 0:
                     for expert_idx in range(model_cfg.num_experts):
-                        state[_expert_key(layer_idx, expert_idx, "gate_proj", "lora_A")] = fc1_a[
-                            expert_idx
-                        ]
-                        state[_expert_key(layer_idx, expert_idx, "gate_proj", "lora_B")] = gate_b[
-                            expert_idx
-                        ]
-                        state[_expert_key(layer_idx, expert_idx, "up_proj", "lora_A")] = fc1_a[
-                            expert_idx
-                        ].clone()
-                        state[_expert_key(layer_idx, expert_idx, "up_proj", "lora_B")] = up_b[
-                            expert_idx
-                        ]
+                        state[
+                            _expert_key(layer_idx, expert_idx, "gate_proj", "lora_A")
+                        ] = fc1_a[expert_idx]
+                        state[
+                            _expert_key(layer_idx, expert_idx, "gate_proj", "lora_B")
+                        ] = gate_b[expert_idx]
+                        state[
+                            _expert_key(layer_idx, expert_idx, "up_proj", "lora_A")
+                        ] = fc1_a[expert_idx].clone()
+                        state[
+                            _expert_key(layer_idx, expert_idx, "up_proj", "lora_B")
+                        ] = up_b[expert_idx]
 
             if experts.fc2_lora is not None:
                 fc2_a_local, fc2_b_local = _expand_shared_expert_lora(
@@ -409,17 +442,19 @@ def export_lora_adapter_state(
                 fc2_b = _all_gather_cat(fc2_b_local, ps.ep_group, dim=0)
                 if _rank() == 0:
                     for expert_idx in range(model_cfg.num_experts):
-                        state[_expert_key(layer_idx, expert_idx, "down_proj", "lora_A")] = fc2_a[
-                            expert_idx
-                        ]
-                        state[_expert_key(layer_idx, expert_idx, "down_proj", "lora_B")] = fc2_b[
-                            expert_idx
-                        ]
+                        state[
+                            _expert_key(layer_idx, expert_idx, "down_proj", "lora_A")
+                        ] = fc2_a[expert_idx]
+                        state[
+                            _expert_key(layer_idx, expert_idx, "down_proj", "lora_B")
+                        ] = fc2_b[expert_idx]
 
     if _rank() != 0:
         return {}
     if cpu:
-        return {name: tensor.detach().cpu().contiguous() for name, tensor in state.items()}
+        return {
+            name: tensor.detach().cpu().contiguous() for name, tensor in state.items()
+        }
     return {name: tensor.detach().contiguous() for name, tensor in state.items()}
 
 
@@ -438,7 +473,9 @@ def save_lora_adapter(
     from safetensors.torch import save_file
 
     if lora_config is None:
-        raise ValueError("save_lora_adapter requires the LoRA config used to build the model.")
+        raise ValueError(
+            "save_lora_adapter requires the LoRA config used to build the model."
+        )
     lora = normalize_lora_config(lora_config)
     if not lora.enabled:
         raise ValueError("save_lora_adapter requires an enabled LoRA config.")
@@ -477,7 +514,12 @@ def save_lora_adapter(
             ),
             "num_tensors": len(state),
             "num_parameters": int(sum(t.numel() for t in state.values())),
-            "parallel": {"tp": ps.tp_size, "ep": ps.ep_size, "etp": ps.etp_size, "pp": ps.pp_size},
+            "parallel": {
+                "tp": ps.tp_size,
+                "ep": ps.ep_size,
+                "etp": ps.etp_size,
+                "pp": ps.pp_size,
+            },
             "model": {
                 "num_hidden_layers": model_cfg.num_hidden_layers,
                 "hidden_size": model_cfg.hidden_size,
@@ -489,7 +531,9 @@ def save_lora_adapter(
             },
             "metadata": metadata or {},
         }
-        (output / "megatron.lite_adapter_meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+        (output / "megatron.lite_adapter_meta.json").write_text(
+            json.dumps(meta, indent=2) + "\n"
+        )
         result = {
             "path": str(output),
             "adapter_model": str(output / "adapter_model.safetensors"),
@@ -510,12 +554,16 @@ def _require_tensor(state: dict[str, torch.Tensor], key: str) -> torch.Tensor:
         raise KeyError(f"Missing adapter tensor {key!r}") from exc
 
 
-def _slice_tp_output(tensor: torch.Tensor, local_width: int, ps: ParallelState) -> torch.Tensor:
+def _slice_tp_output(
+    tensor: torch.Tensor, local_width: int, ps: ParallelState
+) -> torch.Tensor:
     start = ps.tp_rank * local_width
     return tensor[start : start + local_width].contiguous()
 
 
-def _slice_tp_input(tensor: torch.Tensor, local_width: int, ps: ParallelState) -> torch.Tensor:
+def _slice_tp_input(
+    tensor: torch.Tensor, local_width: int, ps: ParallelState
+) -> torch.Tensor:
     start = ps.tp_rank * local_width
     return tensor[:, start : start + local_width].contiguous()
 
@@ -548,11 +596,17 @@ def load_lora_adapter_state(
             layer_idx = int(layer.layer_idx)
             attn = layer.attn
             if attn.qkv_lora is not None:
-                q_a = _require_tensor(state, _attn_key(layer_idx, "q_proj", "lora_A")).to(
+                q_a = _require_tensor(
+                    state, _attn_key(layer_idx, "q_proj", "lora_A")
+                ).to(
                     device=attn.qkv_lora.lora_a.device, dtype=attn.qkv_lora.lora_a.dtype
                 )
-                k_a = _require_tensor(state, _attn_key(layer_idx, "k_proj", "lora_A")).to(q_a)
-                v_a = _require_tensor(state, _attn_key(layer_idx, "v_proj", "lora_A")).to(q_a)
+                k_a = _require_tensor(
+                    state, _attn_key(layer_idx, "k_proj", "lora_A")
+                ).to(q_a)
+                v_a = _require_tensor(
+                    state, _attn_key(layer_idx, "v_proj", "lora_A")
+                ).to(q_a)
                 if strict and (not torch.equal(q_a, k_a) or not torch.equal(q_a, v_a)):
                     raise ValueError(
                         "Megatron Lite fused qkv_lora requires q/k/v lora_A tensors to match."
@@ -564,21 +618,24 @@ def load_lora_adapter_state(
                 )
                 q_b = _slice_tp_output(
                     _require_tensor(state, _attn_key(layer_idx, "q_proj", "lora_B")).to(
-                        device=attn.qkv_lora.lora_b.device, dtype=attn.qkv_lora.lora_b.dtype
+                        device=attn.qkv_lora.lora_b.device,
+                        dtype=attn.qkv_lora.lora_b.dtype,
                     ),
                     q_width_local,
                     ps,
                 )
                 k_b = _slice_tp_output(
                     _require_tensor(state, _attn_key(layer_idx, "k_proj", "lora_B")).to(
-                        device=attn.qkv_lora.lora_b.device, dtype=attn.qkv_lora.lora_b.dtype
+                        device=attn.qkv_lora.lora_b.device,
+                        dtype=attn.qkv_lora.lora_b.dtype,
                     ),
                     kv_width_local,
                     ps,
                 )
                 v_b = _slice_tp_output(
                     _require_tensor(state, _attn_key(layer_idx, "v_proj", "lora_B")).to(
-                        device=attn.qkv_lora.lora_b.device, dtype=attn.qkv_lora.lora_b.dtype
+                        device=attn.qkv_lora.lora_b.device,
+                        dtype=attn.qkv_lora.lora_b.dtype,
                     ),
                     kv_width_local,
                     ps,
@@ -599,16 +656,22 @@ def load_lora_adapter_state(
             if attn.proj_lora is not None:
                 proj_a = _slice_tp_input(
                     _require_tensor(state, _attn_key(layer_idx, "o_proj", "lora_A")).to(
-                        device=attn.proj_lora.lora_a.device, dtype=attn.proj_lora.lora_a.dtype
+                        device=attn.proj_lora.lora_a.device,
+                        dtype=attn.proj_lora.lora_a.dtype,
                     ),
                     attn_in_width_local,
                     ps,
                 )
-                proj_b = _require_tensor(state, _attn_key(layer_idx, "o_proj", "lora_B")).to(
-                    device=attn.proj_lora.lora_b.device, dtype=attn.proj_lora.lora_b.dtype
+                proj_b = _require_tensor(
+                    state, _attn_key(layer_idx, "o_proj", "lora_B")
+                ).to(
+                    device=attn.proj_lora.lora_b.device,
+                    dtype=attn.proj_lora.lora_b.dtype,
                 )
                 if _is_output_partitioned_lora_b(attn.proj_lora, ps):
-                    proj_b = _slice_tp_output(proj_b, attn.proj_lora.lora_b.shape[0], ps)
+                    proj_b = _slice_tp_output(
+                        proj_b, attn.proj_lora.lora_b.shape[0], ps
+                    )
                 attn.proj_lora.lora_a.data.copy_(proj_a)
                 attn.proj_lora.lora_b.data.copy_(proj_b)
                 loaded += 2
@@ -623,13 +686,15 @@ def load_lora_adapter_state(
                     local_up_b = []
                     for expert_idx in range(expert_start, expert_stop):
                         gate_a = _require_tensor(
-                            state, _expert_key(layer_idx, expert_idx, "gate_proj", "lora_A")
+                            state,
+                            _expert_key(layer_idx, expert_idx, "gate_proj", "lora_A"),
                         ).to(
                             device=experts.fc1_lora.lora_a.device,
                             dtype=experts.fc1_lora.lora_a.dtype,
                         )
                         up_a = _require_tensor(
-                            state, _expert_key(layer_idx, expert_idx, "up_proj", "lora_A")
+                            state,
+                            _expert_key(layer_idx, expert_idx, "up_proj", "lora_A"),
                         ).to(gate_a)
                         if strict and not torch.equal(gate_a, up_a):
                             raise ValueError(
@@ -638,7 +703,10 @@ def load_lora_adapter_state(
                         local_gate_a.append(gate_a)
                         local_gate_b.append(
                             _require_tensor(
-                                state, _expert_key(layer_idx, expert_idx, "gate_proj", "lora_B")
+                                state,
+                                _expert_key(
+                                    layer_idx, expert_idx, "gate_proj", "lora_B"
+                                ),
                             ).to(
                                 device=experts.fc1_lora.lora_b.device,
                                 dtype=experts.fc1_lora.lora_b.dtype,
@@ -646,7 +714,8 @@ def load_lora_adapter_state(
                         )
                         local_up_b.append(
                             _require_tensor(
-                                state, _expert_key(layer_idx, expert_idx, "up_proj", "lora_B")
+                                state,
+                                _expert_key(layer_idx, expert_idx, "up_proj", "lora_B"),
                             ).to(
                                 device=experts.fc1_lora.lora_b.device,
                                 dtype=experts.fc1_lora.lora_b.dtype,
@@ -654,20 +723,25 @@ def load_lora_adapter_state(
                         )
                     if strict:
                         if any(
-                            not torch.equal(local_gate_a[0], value) for value in local_gate_a[1:]
+                            not torch.equal(local_gate_a[0], value)
+                            for value in local_gate_a[1:]
                         ):
                             raise ValueError(
                                 "Megatron Lite shared expert fc1_lora can only import PEFT adapters "
                                 "whose local expert gate lora_A tensors are identical."
                             )
                         if any(
-                            not torch.equal(local_gate_b[0], value) for value in local_gate_b[1:]
+                            not torch.equal(local_gate_b[0], value)
+                            for value in local_gate_b[1:]
                         ):
                             raise ValueError(
                                 "Megatron Lite shared expert fc1_lora can only import PEFT adapters "
                                 "whose local expert gate lora_B tensors are identical."
                             )
-                        if any(not torch.equal(local_up_b[0], value) for value in local_up_b[1:]):
+                        if any(
+                            not torch.equal(local_up_b[0], value)
+                            for value in local_up_b[1:]
+                        ):
                             raise ValueError(
                                 "Megatron Lite shared expert fc1_lora can only import PEFT adapters "
                                 "whose local expert up lora_B tensors are identical."
@@ -678,28 +752,34 @@ def load_lora_adapter_state(
                     )
                     loaded += 2
                 else:
-                    for local_idx, expert_idx in enumerate(range(expert_start, expert_stop)):
+                    for local_idx, expert_idx in enumerate(
+                        range(expert_start, expert_stop)
+                    ):
                         gate_a = _require_tensor(
-                            state, _expert_key(layer_idx, expert_idx, "gate_proj", "lora_A")
+                            state,
+                            _expert_key(layer_idx, expert_idx, "gate_proj", "lora_A"),
                         ).to(
                             device=experts.fc1_lora.lora_a.device,
                             dtype=experts.fc1_lora.lora_a.dtype,
                         )
                         up_a = _require_tensor(
-                            state, _expert_key(layer_idx, expert_idx, "up_proj", "lora_A")
+                            state,
+                            _expert_key(layer_idx, expert_idx, "up_proj", "lora_A"),
                         ).to(gate_a)
                         if strict and not torch.equal(gate_a, up_a):
                             raise ValueError(
                                 "Megatron Lite fused fc1_lora requires gate/up lora_A tensors to match."
                             )
                         gate_b = _require_tensor(
-                            state, _expert_key(layer_idx, expert_idx, "gate_proj", "lora_B")
+                            state,
+                            _expert_key(layer_idx, expert_idx, "gate_proj", "lora_B"),
                         ).to(
                             device=experts.fc1_lora.lora_b.device,
                             dtype=experts.fc1_lora.lora_b.dtype,
                         )
                         up_b = _require_tensor(
-                            state, _expert_key(layer_idx, expert_idx, "up_proj", "lora_B")
+                            state,
+                            _expert_key(layer_idx, expert_idx, "up_proj", "lora_B"),
                         ).to(
                             device=experts.fc1_lora.lora_b.device,
                             dtype=experts.fc1_lora.lora_b.dtype,
@@ -717,7 +797,10 @@ def load_lora_adapter_state(
                     for expert_idx in range(expert_start, expert_stop):
                         local_a.append(
                             _require_tensor(
-                                state, _expert_key(layer_idx, expert_idx, "down_proj", "lora_A")
+                                state,
+                                _expert_key(
+                                    layer_idx, expert_idx, "down_proj", "lora_A"
+                                ),
                             ).to(
                                 device=experts.fc2_lora.lora_a.device,
                                 dtype=experts.fc2_lora.lora_a.dtype,
@@ -725,19 +808,26 @@ def load_lora_adapter_state(
                         )
                         local_b.append(
                             _require_tensor(
-                                state, _expert_key(layer_idx, expert_idx, "down_proj", "lora_B")
+                                state,
+                                _expert_key(
+                                    layer_idx, expert_idx, "down_proj", "lora_B"
+                                ),
                             ).to(
                                 device=experts.fc2_lora.lora_b.device,
                                 dtype=experts.fc2_lora.lora_b.dtype,
                             )
                         )
                     if strict:
-                        if any(not torch.equal(local_a[0], value) for value in local_a[1:]):
+                        if any(
+                            not torch.equal(local_a[0], value) for value in local_a[1:]
+                        ):
                             raise ValueError(
                                 "Megatron Lite shared expert fc2_lora can only import PEFT adapters "
                                 "whose local expert down lora_A tensors are identical."
                             )
-                        if any(not torch.equal(local_b[0], value) for value in local_b[1:]):
+                        if any(
+                            not torch.equal(local_b[0], value) for value in local_b[1:]
+                        ):
                             raise ValueError(
                                 "Megatron Lite shared expert fc2_lora can only import PEFT adapters "
                                 "whose local expert down lora_B tensors are identical."
@@ -746,10 +836,15 @@ def load_lora_adapter_state(
                     experts.fc2_lora.lora_b.data.copy_(local_b[0])
                     loaded += 2
                 else:
-                    for local_idx, expert_idx in enumerate(range(expert_start, expert_stop)):
+                    for local_idx, expert_idx in enumerate(
+                        range(expert_start, expert_stop)
+                    ):
                         experts.fc2_lora.lora_a.data[local_idx].copy_(
                             _require_tensor(
-                                state, _expert_key(layer_idx, expert_idx, "down_proj", "lora_A")
+                                state,
+                                _expert_key(
+                                    layer_idx, expert_idx, "down_proj", "lora_A"
+                                ),
                             ).to(
                                 device=experts.fc2_lora.lora_a.device,
                                 dtype=experts.fc2_lora.lora_a.dtype,
@@ -757,7 +852,10 @@ def load_lora_adapter_state(
                         )
                         experts.fc2_lora.lora_b.data[local_idx].copy_(
                             _require_tensor(
-                                state, _expert_key(layer_idx, expert_idx, "down_proj", "lora_B")
+                                state,
+                                _expert_key(
+                                    layer_idx, expert_idx, "down_proj", "lora_B"
+                                ),
                             ).to(
                                 device=experts.fc2_lora.lora_b.device,
                                 dtype=experts.fc2_lora.lora_b.dtype,

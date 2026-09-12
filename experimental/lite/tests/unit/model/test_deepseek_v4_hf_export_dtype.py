@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 import torch
 
-
 _CHECKPOINT_PATH = (
     Path(__file__).resolve().parents[3]
     / "megatron"

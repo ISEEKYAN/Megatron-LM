@@ -8,17 +8,13 @@ from typing import Any
 import pytest
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.deterministic import set_deterministic
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
-pytestmark = [
-    pytest.mark.gpus(8),
-    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
-]
+pytestmark = [pytest.mark.gpus(8), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
 
 
 def _qwen3_moe_symbols():
@@ -26,7 +22,9 @@ def _qwen3_moe_symbols():
         "transformer_engine.pytorch",
         reason="Qwen3MoE dist_opt checkpoint smoke requires real Transformer Engine.",
     )
-    assert hasattr(te, "Linear"), "Qwen3MoE smoke requires real Transformer Engine Linear."
+    assert hasattr(
+        te, "Linear"
+    ), "Qwen3MoE smoke requires real Transformer Engine Linear."
     from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
     from megatron.lite.model.qwen3_moe.lite import protocol
 
@@ -148,7 +146,9 @@ def _assert_batch_equal(actual: PackedBatch, expected: PackedBatch) -> None:
     assert torch.equal(actual.labels, expected.labels)
 
 
-def _train_step(runtime: MegatronLiteRuntime, handle: ModelHandle, batch: dict[str, Any]) -> None:
+def _train_step(
+    runtime: MegatronLiteRuntime, handle: ModelHandle, batch: dict[str, Any]
+) -> None:
     runtime.zero_grad(handle)
     runtime.forward_backward(handle, iter([batch]), None, num_microbatches=1)
     runtime.optimizer_step(handle)
@@ -168,12 +168,18 @@ def _assert_params_bitwise_equal(lhs: ModelHandle, rhs: ModelHandle) -> None:
     rhs_params = _local_named_params(rhs)
     assert lhs_params.keys() == rhs_params.keys()
     for name in lhs_params:
-        torch.testing.assert_close(lhs_params[name], rhs_params[name], atol=0.0, rtol=0.0)
+        torch.testing.assert_close(
+            lhs_params[name], rhs_params[name], atol=0.0, rtol=0.0
+        )
 
 
-def test_qwen3_moe_dist_opt_checkpoint_restores_rng_and_continues_bitwise_tp2_pp2_ep2(tmp_path):
+def test_qwen3_moe_dist_opt_checkpoint_restores_rng_and_continues_bitwise_tp2_pp2_ep2(
+    tmp_path,
+):
     if dist.get_world_size() != 8:
-        pytest.skip("Qwen3MoE tp2/pp2/ep2 dist_opt checkpoint smoke requires exactly 8 GPUs.")
+        pytest.skip(
+            "Qwen3MoE tp2/pp2/ep2 dist_opt checkpoint smoke requires exactly 8 GPUs."
+        )
 
     set_deterministic(2026)
     model_cfg = _tiny_qwen3_moe_config()

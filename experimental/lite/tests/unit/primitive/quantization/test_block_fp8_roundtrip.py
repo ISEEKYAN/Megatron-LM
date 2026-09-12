@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from megatron.lite.primitive.quantization.block_fp8 import (
     dequantize_block_fp8,
     quantize_block_fp8,
@@ -49,9 +48,9 @@ def test_roundtrip_extreme_negative_and_near_zero_values() -> None:
     source[:128, 128:] = torch.full((128, 128), 1e-4)
     source[128:, :128] = torch.randn(128, 128) * 0.02
     block = torch.randn(128, 128) * 0.02
-    block[0, 0] = fp8_max          # one large outlier in the block sets the scale
+    block[0, 0] = fp8_max  # one large outlier in the block sets the scale
     block[1, 1] = -fp8_max
-    block[2, 2] = 0.0              # exact zero must round-trip back to zero
+    block[2, 2] = 0.0  # exact zero must round-trip back to zero
     source[128:, 128:] = block
 
     weight, scale, restored = _roundtrip(source)
@@ -69,8 +68,8 @@ def test_roundtrip_extreme_negative_and_near_zero_values() -> None:
 @pytest.mark.parametrize(
     "shape,label",
     [
-        ((512, 1024), "w1_gate_up_I_by_H"),   # expert gate/up: [I, H]
-        ((1024, 512), "w2_down_H_by_I"),      # expert down:    [H, I]
+        ((512, 1024), "w1_gate_up_I_by_H"),  # expert gate/up: [I, H]
+        ((1024, 512), "w2_down_H_by_I"),  # expert down:    [H, I]
     ],
 )
 def test_roundtrip_ds4_expert_shapes(shape: tuple[int, int], label: str) -> None:
@@ -83,11 +82,15 @@ def test_roundtrip_ds4_expert_shapes(shape: tuple[int, int], label: str) -> None
 
     weight, scale, restored = _roundtrip(source)
 
-    assert weight.shape == source.shape, f"{label}: quantization changed the shape (suspect axis/layout error)"
+    assert (
+        weight.shape == source.shape
+    ), f"{label}: quantization changed the shape (suspect axis/layout error)"
     assert scale.shape == (shape[0] // 128, shape[1] // 128)
     assert torch.isfinite(restored).all()
     rel = _frobenius_rel_err(restored, source)
-    assert rel < FROBENIUS_TOL, f"{label}: Frobenius rel err {rel:.4f} >= {FROBENIUS_TOL}"
+    assert (
+        rel < FROBENIUS_TOL
+    ), f"{label}: Frobenius rel err {rel:.4f} >= {FROBENIUS_TOL}"
 
 
 def test_roundtrip_is_deterministic() -> None:

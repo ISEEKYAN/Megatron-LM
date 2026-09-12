@@ -6,7 +6,6 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
-
 from transformer_engine.pytorch.cpp_extensions import general_gemm
 from transformer_engine.pytorch.module import base as te_module_base
 from transformer_engine.pytorch.permutation import moe_permute as fused_permute
@@ -132,7 +131,9 @@ def permute(
 
         if probs is not None:
             probs_t_1d = probs.T.contiguous().view(-1)
-            indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
+            indices_dim0 = torch.arange(
+                num_experts, device=routing_map.device
+            ).unsqueeze(-1)
             indices_dim1 = sorted_indices.view(num_experts, capacity)
             indices_1d = (indices_dim0 * num_tokens + indices_dim1).view(-1)
             permuted_probs = probs_t_1d.index_select(0, indices_1d)
@@ -190,12 +191,16 @@ def unpermute(
             capacity = num_permuted_tokens // num_experts
             num_unpermuted_tokens = probs.size(0)
             probs_t_1d = probs.T.contiguous().view(-1)
-            indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
+            indices_dim0 = torch.arange(
+                num_experts, device=routing_map.device
+            ).unsqueeze(-1)
             indices_dim1 = sorted_indices.view(num_experts, capacity)
             indices_1d = (indices_dim0 * num_unpermuted_tokens + indices_dim1).view(-1)
             permuted_probs = probs_t_1d.index_select(0, indices_1d)
         else:
-            permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
+            permuted_probs = probs.T.contiguous().masked_select(
+                routing_map.T.contiguous()
+            )
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
     output_tokens = torch.zeros(
@@ -219,7 +224,9 @@ def group_limited_topk(
     group_topk: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     group_scores = (
-        scores.view(num_tokens, num_groups, -1).topk(topk // group_topk, dim=-1)[0].sum(dim=-1)
+        scores.view(num_tokens, num_groups, -1)
+        .topk(topk // group_topk, dim=-1)[0]
+        .sum(dim=-1)
     )
     group_idx = torch.topk(group_scores, k=group_topk, dim=-1, sorted=False)[1]
     group_mask = torch.zeros_like(group_scores)
@@ -245,7 +252,9 @@ def topk_routing_with_score_function(
     fused: bool = False,
     dense_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
+    assert (
+        logits.dim() == 2
+    ), f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
     if fused:
         return fused_topk_with_score_function(
@@ -291,11 +300,15 @@ def topk_routing_with_score_function(
             scores = torch.nn.functional.softplus(logits.float()).sqrt()
         if expert_bias is not None:
             scores_for_routing = scores + expert_bias.float()
-            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            _, top_indices = compute_topk(
+                scores_for_routing, topk, num_groups, group_topk
+            )
             scores = torch.gather(scores, dim=1, index=top_indices)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        probs = (
+            scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        )
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
@@ -312,7 +325,9 @@ def topk_routing_with_score_function(
         routing_probs.index_put_((rows, top_indices), probs, accumulate=False)
         routing_map = torch.zeros_like(logits, dtype=logits.dtype)
         routing_map.index_put_(
-            (rows, top_indices), torch.ones_like(probs, dtype=routing_map.dtype), accumulate=False
+            (rows, top_indices),
+            torch.ones_like(probs, dtype=routing_map.dtype),
+            accumulate=False,
         )
         routing_map = routing_map.bool()
     else:
@@ -372,7 +387,9 @@ class RouterGatingLinearFunction(torch.autograd.Function):
 
         gemm_out = None
         if router_dtype != torch.float64:
-            gemm_out = _te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
+            gemm_out = _te_general_gemm(
+                weight, inp, router_dtype, layout="TN", bias=bias
+            )
         if gemm_out is not None:
             output = gemm_out[0]
         elif bias is None:
@@ -394,23 +411,40 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         grad_input_out = grad_weight_out = None
         if ctx.router_dtype != torch.float64:
             grad_input_out = _te_general_gemm(
-                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
+                weight.to(ctx.router_dtype),
+                grad_output,
+                ctx.router_dtype,
+                layout="NN",
+                grad=True,
             )
             grad_weight_out = _te_general_gemm(
-                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
+                inp.to(ctx.router_dtype),
+                grad_output,
+                ctx.router_dtype,
+                layout="NT",
+                grad=True,
             )
         if grad_input_out is not None and grad_weight_out is not None:
             grad_input = grad_input_out[0].to(ctx.input_dtype)
             grad_weight = grad_weight_out[0].to(ctx.weight_dtype)
         else:
-            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
-            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
-        grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
+            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(
+                ctx.input_dtype
+            )
+            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(
+                ctx.weight_dtype
+            )
+        grad_bias = (
+            grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
+        )
         return grad_input.view(*inp_shape), grad_weight, grad_bias, None
 
 
 def router_gating_linear(
-    inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, router_dtype: torch.dtype
+    inp: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    router_dtype: torch.dtype,
 ) -> torch.Tensor:
     return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
 
