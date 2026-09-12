@@ -4,7 +4,6 @@
 from dataclasses import dataclass, fields
 
 import torch
-from megatron.lite.primitive.parallel.tensor_payload import PipelineLedger, PipelineTag
 
 
 @dataclass(frozen=True)

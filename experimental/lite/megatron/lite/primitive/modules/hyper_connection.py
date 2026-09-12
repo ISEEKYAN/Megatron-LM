@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Pure PyTorch shifted hyper-connection operations, layout [B,S,HC,D]."""
+"""Shifted hyper-connections using Core kernels, layout [B,S,HC,D]."""
 import torch
+from megatron.lite.primitive.kernels.mhc import aggregate, post_mix, sinkhorn
 from torch import nn
 from torch.nn import functional as F
 
@@ -8,7 +9,7 @@ from torch.nn import functional as F
 def contract_hc(hidden: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     if hidden.ndim != 4 or pre_mix.shape != hidden.shape[:-1]:
         raise ValueError("Expected paired hidden [B,S,HC,D] and pre_mix [B,S,HC]")
-    return (hidden.float() * pre_mix.float().unsqueeze(-1)).sum(2).to(hidden.dtype)
+    return aggregate(hidden, pre_mix)
 
 
 def expand_hc(tokens: torch.Tensor, copies: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -23,9 +24,7 @@ def expand_hc(tokens: torch.Tensor, copies: int) -> tuple[torch.Tensor, torch.Te
 def mix_residual(output, residual, post, comb):
     # comb axes are SOURCE, DESTINATION; matmul(comb, residual) transposes the
     # official information flow, even when Sinkhorn makes both sums near one.
-    placed = post.unsqueeze(-1) * output.unsqueeze(-2)
-    mixed = (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(2)
-    return (placed + mixed).to(output.dtype)
+    return post_mix(output, residual, post, comb)
 
 
 class HCMixes(nn.Module):
@@ -58,11 +57,7 @@ class HCMixes(nn.Module):
         comb = (comb * self.scale[2] + bc).reshape(
             *flat.shape[:-1], self.copies, self.copies
         )
-        comb = comb.softmax(-1) + self.hc_eps
-        comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
-        for _ in range(self.iterations - 1):
-            comb = comb / (comb.sum(-1, keepdim=True) + self.hc_eps)
-            comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
+        comb = sinkhorn(comb, self.iterations, self.hc_eps)
         return pre, post, comb
 
 

@@ -16,7 +16,7 @@ from megatron.lite.model.protocol_utils import (
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.ckpt.hf_weights import allgather_concat
-from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
+from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.runtime.contracts import ParallelConfig
 from torch.nn import functional as F
@@ -67,28 +67,9 @@ def build_model(model_cfg, *, impl_cfg):
             'V4.1 model construction requires single-rank execution; distributed integration remains pending'
         )
     ps = ParallelState()
-    layer_range = None
-    if p.pp > 1:
-        if (
-            not torch.distributed.is_initialized()
-            or torch.distributed.get_world_size() != p.pp
-        ):
-            raise ValueError(
-                'PP stage construction requires exactly pp initialized ranks'
-            )
-        count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
-        if count % p.pp:
-            raise ValueError('Equal PP stages must divide the real layer count')
-        ps = init_parallel(p)
-        width = count // p.pp
-        layer_range = (ps.pp_rank * width, (ps.pp_rank + 1) * width)
-    elif torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
         raise NotImplementedError(
             'Data parallel construction requires the distributed integration'
-        )
-    if p.pp > 1 and impl_cfg.optimizer is not None:
-        raise NotImplementedError(
-            'Pipeline optimizer construction requires distributed routing integration'
         )
     if impl_cfg.optimizer not in (None, 'muon'):
         raise ValueError('V4.1 optimizer must be explicitly selected as muon')
@@ -111,7 +92,6 @@ def build_model(model_cfg, *, impl_cfg):
             gate_temperature=impl_cfg.gate_temperature,
             bias_rate=impl_cfg.bias_rate,
             enable_dspark_execution=impl_cfg.enable_dspark_execution,
-            layer_range=layer_range,
         )
     from .attention import Linear
     from .engram import EngramTable

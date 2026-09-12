@@ -20,6 +20,13 @@ assembly over shared primitives; reusable logic lives in `primitive/`
   Engram supports frozen (FP8 only) and trainable (persistent FP32 master) under
   one switch, and is never offloaded.
 
+## Core reuse
+mHC projection, aggregation and residual mixing use Megatron Core kernels through
+`primitive/kernels/mhc.py`; execution requires Core's `native_sinkhorn`,
+`native_h_aggregate` and `native_h_post_bda` APIs (reference: `nv/dev@0cd11658f`).
+The shifted layer boundary and V4.1 RMS formula remain model contracts.
+Aggregation uses Core's eager execution to preserve the bitwise CED gradient.
+
 ## Official reference
 Oracle comparisons load the pinned upstream source from `DS41_REFERENCE_DIR` at
 test time and verify SHA-256; no official source is vendored into this repo.
