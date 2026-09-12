@@ -1,32 +1,37 @@
-# DeepSeek V4.1 Flash
+# DeepSeek-V4.1-Flash on Megatron-Lite
 
-The MLite model composes shared primitives for CSA2, shifted mHC, Engram,
-vision and object-based optimizer routing. Single-rank full-sequence training
-is supported; distributed execution is being consolidated separately.
+40-layer CED MoE model with Engram n-gram memory. `model/deepseek_v41/` is a thin
+assembly over shared primitives; reusable logic lives in `primitive/`
+(`optimizers/{sinkhorn,headwise_muon}`, `modules/{engram_lookup,router_replay}`,
+`quantization/*`, `parallel/*`).
 
-Use the released nested config with the `deepseek_v41` / `lite` registry entry.
-Inspect model assembly without allocating the released weights:
+## Semantics that differ from DeepSeek-V4
+- **mHC shift**: attention consumes `pre_mix`, FFN consumes `attn_pre`, the block
+  returns `ffn_pre`; reusing the current block's coefficients is wrong.
+- **CSA2 quantization**: main KV uses group 16 with E4M3 scales, the indexer uses
+  group 32 with E8M0; mixing them is wrong.
+- **Contiguous CP**: `pack_routed_experts` / `pack_r3_replay_mask` must pass
+  `contiguous=True`; the zigzag default misroutes silently.
+- **Optimizer routing** is by logical matrix shape, never parameter name: `wq_a`
+  is one shared matrix, `wq_b` is 64 independent ones, `wkv` is one shared latent
+  K/V head. Sinkhorn (Algorithm 1): K=11, tau=1e-3, eps=1e-20, momentum=0.95,
+  gamma=0.18, Engram LR 5x, no warm start.
+- **Post-training scope**: the indexer stays frozen and out of the optimizer;
+  Engram supports frozen (FP8 only) and trainable (persistent FP32 master) under
+  one switch, and is never offloaded.
 
+## Official reference
+Oracle comparisons load the pinned upstream source from `DS41_REFERENCE_DIR` at
+test time and verify SHA-256; no official source is vendored into this repo.
+
+## Assembly example
 ```python
 import os
-from megatron.lite.model.deepseek_v41.lite.protocol import (
-    ImplConfig, build_model, build_model_config,
-)
+from megatron.lite.model.deepseek_v41.lite.protocol import ImplConfig, build_model, build_model_config
 config = build_model_config(os.environ["DS41_MODEL_DIR"])
 bundle = build_model(config, impl_cfg=ImplConfig(device="meta"))
 print(sum(p.numel() for p in bundle.chunks[0].parameters()))
 ```
-
-Execution additionally requires the tokenizer-derived Engram token map and
-materialized checkpoint weights. Meta construction only inspects assembly.
-Select post-training trainability explicitly. Indexers remain frozen without
-an auxiliary loss. Engram uses frozen FP8 storage or a persistent FP32 master
-with regenerated FP8 scales; tables are resident, not offloaded.
-
-Muon handles logical linear matrices; AdamW handles norms, biases and vectors.
-External vision uses model-owned parameters, weight copies before forward,
-then LLM backward followed by visual backward and gradient publication.
-
-Reference tests read official sources only from `DS41_REFERENCE_DIR` and verify
-SHA-256. Missing references are errors. No official source or fixture payload
-is included in this repository. Run GPU tests through the Slurm test harness.
+Meta construction inspects assembly; execution needs a tokenizer-derived Engram
+map and materialized weights. Select post-training trainability explicitly.
+Single-rank execution is supported; distributed integration remains incomplete.
