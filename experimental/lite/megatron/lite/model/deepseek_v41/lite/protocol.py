@@ -14,7 +14,9 @@ from megatron.lite.model.protocol_utils import (
     pack_routed_experts as _pack_routed_experts,
 )
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.ckpt.hf_weights import allgather_concat
 from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
+from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.runtime.contracts import ParallelConfig
 from torch.nn import functional as F
 
@@ -110,44 +112,39 @@ def build_model(model_cfg, *, impl_cfg):
             enable_dspark_execution=impl_cfg.enable_dspark_execution,
             layer_range=layer_range,
         )
-    # Keep HC coefficients, router and normalization tensors in their native
-    # precision. Only residual projections change dtype in diagnostic mode.
-    for module in model.modules():
-        from .attention import Linear
-        from .engram import EngramTable
+    from .attention import Linear
+    from .engram import EngramTable
 
-        if isinstance(module, (Linear, torch.nn.Embedding)):
-            if isinstance(module, Linear) and module.weight.dtype == torch.float32:
-                continue  # ratio>1 compressor projections have an FP32 contract
-            module.to(dtype=impl_cfg.dtype)
-        if isinstance(module, EngramTable):
-            module.output_dtype = impl_cfg.dtype
-    if model.engram_hash is not None:
-        model.engram_hash.to(device=impl_cfg.device)
+    optimizing = impl_cfg.optimizer == 'muon'
+    if optimizing and impl_cfg.device == 'meta':
+        raise ValueError(
+            'Materialize V4.1 parameters before constructing optimizer state'
+        )
     if impl_cfg.vision_trainability is not None:
         impl_cfg.vision_trainability.apply(model)
     elif impl_cfg.text_only:
         for binding in model.parameter_bindings():
             if binding.role in ('vision', 'aligner', 'image_delimiter'):
                 binding.tensor.requires_grad_(False)
-    optimizer = None
-    if impl_cfg.optimizer == 'muon':
-        if impl_cfg.device == 'meta':
-            raise ValueError(
-                'Materialize V4.1 parameters before constructing optimizer state'
-            )
-        # Persistent FP32 owners receive FP32 wgrad from the numerical providers.
-        # No post-hoc BF16 gradient widening is used.
-        from .attention import Linear
-
-        for module in model.modules():
-            if isinstance(module, Linear):
+    # Cast residual projections first, preserving initialization rounding; native
+    # FP32 compressors/norms and Engram byte storage keep their own contracts.
+    for module in model.modules():
+        if isinstance(module, (Linear, torch.nn.Embedding)):
+            if not isinstance(module, Linear) or module.weight.dtype != torch.float32:
+                module.to(dtype=impl_cfg.dtype)
+            if optimizing and isinstance(module, Linear):
                 module.native_fp32 = True
                 module.weight.data = module.weight.data.float()
-        for p in model.parameters():
-            if p.requires_grad:
-                p.data = p.data.float()
-                p.main_grad = None
+        if isinstance(module, EngramTable):
+            module.output_dtype = impl_cfg.dtype
+    if model.engram_hash is not None:
+        model.engram_hash.to(device=impl_cfg.device)
+    optimizer = None
+    if optimizing:
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.data = parameter.data.float()
+                parameter.main_grad = None
         model.residual_dtype = impl_cfg.dtype
         optimizer = V41Optimizer(model, impl_cfg.optimizer_config)
     if impl_cfg.external_vision_device is not None:
@@ -206,7 +203,6 @@ def prepare_microbatches(data_iter, count):
     ]
 
 
-
 def _validate_replay(model, batch):
     if batch.routed_experts is not None:
         from megatron.lite.primitive.modules.router_replay import RouterReplayAction
@@ -257,7 +253,6 @@ def _forward_step(model, batch):
         raise
 
 
-
 def _forward_step_impl(model, batch):
     _validate_text_batch(batch, multimodal=True)
     _validate_replay(model, batch)
@@ -272,7 +267,9 @@ def _forward_step_impl(model, batch):
             raise ValueError('Packed token types must match the input IDs')
         modality['token_types'] = modality['token_types'][None]
     with precision:
-        logits = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality)['logits'][0]
+        logits = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality)[
+            'logits'
+        ][0]
     result = _text_output(logits, batch)
     if model.vision_schedule is not None and model.vision_schedule.stage != 'idle':
         result['backward'] = model.vision_schedule.backward
@@ -368,13 +365,10 @@ def _text_output(logits, batch):
         )
         if mask.shape != labels.shape:
             raise ValueError('Loss mask must match packed input shape')
-        offset = 0
-        for length in batch.seq_lens.tolist():
-            end = offset + length
-            labels[offset:end] = batch.labels[offset:end].roll(-1)
-            mask[offset:end] = mask[offset:end].roll(-1)
-            labels[end - 1], mask[end - 1] = 0, 0
-            offset = end
+        labels, mask = (
+            roll_packed_thd_left(value, cu_seqlens_padded=batch.cu_seqlens)[0]
+            for value in (labels, mask)
+        )
         token_loss = F.cross_entropy(logits, labels, reduction='none')
         denominator = mask.sum().clamp_min(1)
         if context is not None and context.normalization_denominator is not None:
@@ -429,11 +423,10 @@ def export_hf_weights(chunks, model_cfg, ps, **kwargs):
     ):
         raise ValueError('Complete archival storage is required for export')
     yield from export_model(model)
-    if model.archival_store is not None:
-        from .checkpoint import _tensor
+    from .checkpoint import _tensor
 
-        for key in model.archival_store.entries:
-            yield key, _tensor(model.archival_store, key)
+    for key in model.archival_store.entries:
+        yield key, _tensor(model.archival_store, key)
 
 
 def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
@@ -510,24 +503,18 @@ def unpack_recorded_routed_experts(model, batch, recorded, *, pipeline_drained=F
                 raise RuntimeError(
                     'V4.1 route gather requires the corresponding parallel group'
                 )
-            parts = [torch.empty_like(full) for _ in range(size)]
-            dist.all_gather(parts, full.contiguous(), group=group)
-            full = torch.cat(parts, dim=0)
+            full = allgather_concat(full, size, group, dim=0)
     if ps.pp_size > 1:
         if ps.pp_group is None:
             raise RuntimeError(
                 'V4.1 PP route gather requires pp_group after pipeline drain'
             )
-        counts = [
-            torch.empty(1, dtype=torch.long, device=full.device)
-            for _ in range(ps.pp_size)
-        ]
-        dist.all_gather(
-            counts,
+        widths = allgather_concat(
             torch.tensor([full.shape[1]], dtype=torch.long, device=full.device),
-            group=ps.pp_group,
-        )
-        widths = [int(count.item()) for count in counts]
+            ps.pp_size,
+            ps.pp_group,
+            dim=0,
+        ).tolist()
         current = model
         while hasattr(current, 'module'):
             current = current.module

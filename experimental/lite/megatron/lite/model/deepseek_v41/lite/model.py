@@ -5,7 +5,10 @@ Vision/aligner have live differentiable owners; DSpark remains archival.
 The floating diagnostic mode is explicit; it is not native quantized parity.
 """
 
+from collections import namedtuple
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
+from functools import partial
 from types import SimpleNamespace
 
 import torch
@@ -33,6 +36,7 @@ class TensorBinding:
     encoding: str | None = None
     header: object = None
     store: object = None
+    matrix_shape: tuple | None = None
 
     @property
     def tensor(self):
@@ -50,6 +54,20 @@ class DeferredModule(nn.Module):
         raise NotImplementedError(
             f'{self.scope} execution is not implemented in text-only mode'
         )
+
+
+Rule = namedtuple(
+    'Rule', 'attributes role encoding shape key', defaults=(None, None, None)
+)
+
+
+# Attention state -> PP carrier; native shapes and frozen selection are preserved.
+_STATE_PAYLOAD = dict(
+    zip(
+        'latent main_kv index_k indices candidates'.split(),
+        'latent kv index_k topk candidates'.split(),
+    )
+)
 
 
 class DeepseekV41Model(nn.Module):
@@ -70,7 +88,8 @@ class DeepseekV41Model(nn.Module):
         self.config = config
         cfg = config.to_hf_dict()
         t, v = (SimpleNamespace(**cfg[key]) for key in ('text_config', 'vision_config'))
-        self.hc_mult = t.hc_mult
+        dim, copies, eps = t.hidden_size, t.hc_mult, t.rms_norm_eps
+        self.hc_mult = copies
         self.vision_schedule = None
         self.register_buffer(
             '_vision_trainability', torch.full((4,), -1, dtype=torch.int8)
@@ -91,26 +110,17 @@ class DeepseekV41Model(nn.Module):
         self.checkpoint_bindings = None
         self.embed = self.norm = self.head = None
         if start == 0:
-            self.embed = nn.Embedding(t.vocab_size, t.hidden_size, dtype=torch.bfloat16)
-            self._bind('embed.weight', self.embed, 'weight', 'embedding')
+            self.embed = nn.Embedding(t.vocab_size, dim, dtype=torch.bfloat16)
         if end == count:
-            self.norm = RMSNorm(t.hidden_size, t.rms_norm_eps)
-            self.head = nn.Linear(
-                t.hidden_size, t.vocab_size, bias=False, dtype=torch.float32
-            )
-            self._bind('norm.weight', self.norm, 'weight', 'norm')
-            self._bind('head.weight', self.head, 'weight', 'head')
-        self.layers = nn.ModuleList()
+            self.norm = RMSNorm(dim, eps)
+            self.head = nn.Linear(dim, t.vocab_size, bias=False, dtype=torch.float32)
+        self.layers = nn.ModuleList([None] * count)
         ac = config.attention_config(
             **dict.fromkeys(
                 ('linear_fp8', 'main_qat', 'index_qat', 'swa_fp8'), quantized
             )
         )
-        for layer_id in range(t.num_hidden_layers):
-            if not start <= layer_id < end:
-                self.layers.append(None)  # Preserve canonical global layer indices.
-                continue
-            prefix = f'layers.{layer_id}'
+        for layer_id in range(start, end):
             attention = CSA2Attention(ac, layer_id)
             router = ModalityRouter(
                 t,
@@ -127,42 +137,16 @@ class DeepseekV41Model(nn.Module):
             )
             ffn = DeepseekV41MoE(router, experts, shared)
             block = DeepseekV41Block(
-                t.hidden_size,
-                t.hc_mult,
+                dim,
+                copies,
                 attention,
                 ffn,
-                norm_eps=t.rms_norm_eps,
+                norm_eps=eps,
                 hc_eps=t.hc_eps,
                 iterations=t.hc_sinkhorn_iters,
             )
             block.engram = None
-            self.layers.append(block)
-            self._bind_attention(prefix + '.attn', attention, t)
-            self._bind(
-                prefix + '.ffn.gate.weight', router.router.gate, 'weight', 'router'
-            )
-            for attr in ('bias', 'bias_vl'):
-                self._bind(prefix + '.ffn.gate.' + attr, router, attr, 'router_bias')
-            for index, expert in enumerate(experts):
-                self._bind_expert(
-                    f'{prefix}.ffn.experts.{index}', expert, 'expert', 'I8'
-                )
-            if shared is not None:
-                self._bind_expert(
-                    prefix + '.ffn.shared_experts', shared, 'shared_expert', 'F8_E4M3'
-                )
-            for side in ('attn', 'ffn'):
-                self._bind(
-                    prefix + f'.{side}_norm.weight',
-                    getattr(block, f'{side}_norm'),
-                    'weight',
-                    'norm',
-                )
-                mixes = getattr(block, f'{side}_mixes')
-                for attr in ('fn', 'base', 'scale'):
-                    self._bind(
-                        prefix + f'.hc_{side}_{attr}', mixes, attr, 'hyper_connection'
-                    )
+            self.layers[layer_id] = block
         self.engram_hash = None
         self.engram_layer_ids = tuple(t.engram_layer_ids)
         if self.engram_layer_ids:
@@ -204,33 +188,11 @@ class DeepseekV41Model(nn.Module):
                 )
                 projection = Linear(
                     (t.engram_max_ngram_size - 1) * t.engram_n_heads * width,
-                    (t.hc_mult + 1) * t.hidden_size,
+                    (copies + 1) * dim,
                     fp8=quantized,
                 )
-                module = Engram(
-                    t.hidden_size, t.hc_mult, table, projection, eps=t.rms_norm_eps
-                )
+                module = Engram(dim, copies, table, projection, eps=eps)
                 self.layers[layer_id].engram = module
-                prefix = f'layers.{layer_id}.engram'
-                self._bind(
-                    prefix + '.embed.weight',
-                    table,
-                    'master' if trainable_engram else 'weight',
-                    'engram_table',
-                    encoding='F8_E4M3',
-                )
-                self._bind(
-                    prefix + '.embed.scale', table, 'scale', 'scale', encoding='F8_E8M0'
-                )
-                self._bind(
-                    prefix + '.wkv.weight',
-                    projection,
-                    'weight',
-                    'engram_projection',
-                    encoding='F8_E4M3',
-                )
-                for attr in ('q_weight', 'k_weight'):
-                    self._bind(prefix + '.' + attr, module, attr, 'engram_norm')
         self.vision = None
         self.aligner = None
         if start == 0:
@@ -242,32 +204,34 @@ class DeepseekV41Model(nn.Module):
                 vision_patch_size=v.patch_size,
                 vision_rope_theta=v.rope_theta,
                 vision_downsample_ratio=v.downsample_ratio,
-                dim=t.hidden_size,
+                dim=dim,
             )
             self.vision = ViT(vision_args)
             self.aligner = Aligner(vision_args)
-            for root in ('vision', 'aligner'):
-                module = getattr(self, root)
-                for name, parameter in module.named_parameters():
-                    path, attribute = name.rsplit('.', 1)
-                    self._bind(
-                        root + '.' + name, module.get_submodule(path), attribute, root
-                    )
             for key in ('image_start', 'image_end', 'image_newline'):
-                self.register_parameter(key, nn.Parameter(torch.zeros(t.hidden_size)))
-                self._bind(key, self, key, 'image_delimiter')
+                self.register_parameter(key, nn.Parameter(torch.zeros(dim)))
         self.mtp = DeferredModule('DSpark')
         self.archival_bindings = {
             key: TensorBinding(key, self.mtp, None, 'archival')
             for key in self._archive_keys(t)
         }
+        self._bind_table(t)
         self.validate_parameter_bindings()
 
-    def _bind(self, key, owner, attribute, role, head_count=None, encoding=None):
+    def _bind(
+        self,
+        key,
+        owner,
+        attribute,
+        role,
+        head_count=None,
+        encoding=None,
+        matrix_shape=None,
+    ):
         if key in self.tensor_bindings:
             raise ValueError(f'duplicate binding: {key}')
         self.tensor_bindings[key] = TensorBinding(
-            key, owner, attribute, role, head_count, encoding
+            key, owner, attribute, role, head_count, encoding, matrix_shape=matrix_shape
         )
         if encoding in ('I8', 'F8_E4M3') and role != 'engram_table':
             scale = key[:-6] + 'scale'
@@ -280,91 +244,136 @@ class DeepseekV41Model(nn.Module):
         dim = t.hidden_size
         width = t.moe_intermediate_size * (t.n_shared_experts if shared else 1)
 
-        def projection(a, b):
-            return (
-                Linear(a, b, fp8=quantized)
-                if shared
-                else FP4Linear(a, b, quantized=quantized)
-            )
-
+        projection = (
+            partial(Linear, fp8=quantized)
+            if shared
+            else partial(FP4Linear, quantized=quantized)
+        )
         return SwiGLUExpert(
-            projection(dim, width),
-            projection(width, dim),
-            projection(dim, width),
+            *(projection(a, b) for a, b in ((dim, width), (width, dim), (dim, width))),
             swiglu_limit=t.swiglu_limit,
         )
 
-    def _bind_weight(self, prefix, owner, name, role, heads=None, encoding=None):
-        module = getattr(owner, name)
-        self._bind(f'{prefix}.{name}.weight', module, 'weight', role, heads, encoding)
-
-    def _bind_expert(self, prefix, expert, role, encoding):
-        for name in ('w1', 'w2', 'w3'):
-            self._bind_weight(prefix, expert, name, role, encoding=encoding)
-
-    def _bind_attention(self, prefix, a, t):
-        for name in ('wq_a', 'wq_b', 'wkv', 'wo_a', 'wo_b'):
-            heads = t.num_attention_heads if name == 'wq_b' else None
-            self._bind_weight(prefix, a, name, name, heads, 'F8_E4M3')
-        for name in ('q_norm', 'kv_norm'):
-            self._bind_weight(prefix, a, name, 'norm')
-        self._bind(prefix + '.attn_sink', a, 'attn_sink', 'attention_sink')
+    def _bind_table(self, t):
+        # Checkpoint patterns bind objects; optimizer routes independently audit
+        # actual owners and logical matrix shapes, never release-name prefixes.
+        fp8 = 'F8_E4M3'
+        heads = (t.num_attention_heads, t.head_dim, t.q_lora_rank)
+        index_heads = (t.index_n_heads, t.index_head_dim, t.q_lora_rank)
+        rules = {
+            'embed': Rule('weight', 'embedding'),
+            'norm': Rule('weight', 'norm'),
+            'head': Rule('weight', 'head'),
+            'layers.*.attn.wq_b': Rule('weight', 'wq_b', fp8, heads),
+            'layers.*.attn': Rule('attn_sink', 'attention_sink'),
+            'layers.*.ffn.gate': Rule('bias bias_vl', 'router_bias'),
+            'layers.*.ffn.gate.router.gate': Rule(
+                'weight', 'router', key='{grandparent}.{a}'
+            ),
+            'layers.*.ffn.experts.*.w[123]': Rule('weight', 'expert', 'I8'),
+            'layers.*.ffn.shared_experts.w[123]': Rule('weight', 'shared_expert', fp8),
+            'layers.*.engram.wkv': Rule('weight', 'engram_projection', fp8),
+            'layers.*.engram': Rule('q_weight k_weight', 'engram_norm'),
+            'layers.*.engram.embed': Rule('scale', 'scale', 'F8_E8M0'),
+            '': Rule(
+                'image_start image_end image_newline', 'image_delimiter', key='{a}'
+            ),
+        }
+        rules.update(
+            (f'layers.*.attn.{n}', Rule('weight', n, fp8))
+            for n in ('wq_a', 'wkv', 'wo_a', 'wo_b')
+        )
+        rules.update(
+            (f'layers.*.attn.{n}_norm', Rule('weight', 'norm')) for n in ('q', 'kv')
+        )
         for role, names in (
-            ('compressor', ('wkv', 'norm', 'wgate')),
-            ('indexer', ('wq_b', 'weights_proj', 'wk', 'k_norm')),
+            ('compressor', 'wkv norm wgate'),
+            ('indexer', 'wq_b weights_proj wk k_norm'),
         ):
-            owner = getattr(a, role)
-            for name in names:
-                if hasattr(owner, name):
-                    indexed = role == 'indexer' and name == 'wq_b'
-                    self._bind_weight(
-                        f'{prefix}.{role}',
-                        owner,
+            for n in names.split():
+                indexed = role == 'indexer' and n == 'wq_b'
+                rules[f'layers.*.attn.{role}.{n}'] = Rule(
+                    'weight',
+                    role,
+                    fp8 if indexed else None,
+                    index_heads if indexed else None,
+                )
+        for side in ('attn', 'ffn'):
+            rules[f'layers.*.{side}_norm'] = Rule('weight', 'norm')
+            rules[f'layers.*.{side}_mixes'] = Rule(
+                'fn base scale', 'hyper_connection', key='{parent}.hc_' + side + '_{a}'
+            )
+        for path, owner in self.named_modules():
+            entries = [
+                rule for pattern, rule in rules.items() if fnmatchcase(path, pattern)
+            ]
+            if isinstance(owner, EngramTable):
+                attribute = 'weight' if owner.master is None else 'master'
+                entries.append(
+                    Rule(attribute, 'engram_table', fp8, key='{module}.weight')
+                )
+            if path.split('.')[0] in ('vision', 'aligner'):
+                entries.append(
+                    Rule(
+                        ' '.join(dict(owner.named_parameters(recurse=False))),
+                        path.split('.')[0],
+                    )
+                )
+            for attributes, role, encoding, shape, key in entries:
+                for attribute in attributes.split():
+                    tensor = getattr(owner, attribute, None)
+                    if tensor is None:
+                        continue
+                    name = (key or '{module}.{a}').format(
+                        module=path,
+                        a=attribute,
+                        parent=path.rsplit('.', 1)[0],
+                        grandparent=path.rsplit('.', 2)[0],
+                    )
+                    axes = tuple(tensor.shape) if shape is None else shape
+                    self._bind(
                         name,
+                        owner,
+                        attribute,
                         role,
-                        t.index_n_heads if indexed else None,
-                        'F8_E4M3' if indexed else None,
+                        None if shape is None else shape[0],
+                        encoding,
+                        axes,
                     )
 
     @staticmethod
     def _archive_keys(t):
-        for index in range(t.num_nextn_predict_layers):
-            prefix = f'mtp.{index}.'
-            plain = (
-                'attn.attn_sink attn.kv_norm.weight attn.q_norm.weight '
-                'attn_norm.weight ffn_norm.weight ffn.gate.weight '
-                'ffn.gate.bias ffn.gate.bias_vl'
-            ).split()
-            matrices = [
-                f'attn.{name}' for name in ('wkv', 'wo_a', 'wo_b', 'wq_a', 'wq_b')
-            ]
-            plain += [
-                f'hc_{side}_{suffix}'
-                for side in ('attn', 'ffn')
-                for suffix in ('fn', 'base', 'scale')
-            ]
-            experts = [f'experts.{i}' for i in range(t.dspark_n_routed_experts)]
-            if t.n_shared_experts:
-                experts.append('shared_experts')
-            matrices += [
-                f'ffn.{expert}.{name}'
-                for expert in experts
-                for name in ('w1', 'w2', 'w3')
-            ]
-            if index == 0:
-                plain.append('main_norm.weight')
-                matrices.append('main_proj')
-            if index == t.num_nextn_predict_layers - 1:
-                plain += (
-                    'confidence_head.proj.weight markov_head.embed.weight '
-                    'markov_head.head.weight norm.weight'
-                ).split()
-            yield from (prefix + name for name in plain)
-            yield from (
-                prefix + name + '.' + suffix
-                for name in matrices
-                for suffix in ('weight', 'scale')
-            )
+        plain = (
+            'attn.attn_sink attn.kv_norm.weight attn.q_norm.weight '
+            'attn_norm.weight ffn_norm.weight ffn.gate.weight '
+            'ffn.gate.bias ffn.gate.bias_vl'
+        ).split()
+        plain += [
+            f'hc_{side}_{attr}'
+            for side in ('attn', 'ffn')
+            for attr in ('fn', 'base', 'scale')
+        ]
+        experts = [f'experts.{i}' for i in range(t.dspark_n_routed_experts)]
+        experts += ['shared_experts'] if t.n_shared_experts else []
+        matrices = [f'attn.{n}' for n in ('wkv', 'wo_a', 'wo_b', 'wq_a', 'wq_b')]
+        matrices += [f'ffn.{e}.{n}' for e in experts for n in ('w1', 'w2', 'w3')]
+        common = plain + [f'{n}.{a}' for n in matrices for a in ('weight', 'scale')]
+        scopes = (
+            (range(t.num_nextn_predict_layers), common),
+            ((0,), ('main_norm.weight', 'main_proj.weight', 'main_proj.scale')),
+            (
+                (t.num_nextn_predict_layers - 1,),
+                (
+                    'confidence_head.proj.weight',
+                    'markov_head.embed.weight',
+                    'markov_head.head.weight',
+                    'norm.weight',
+                ),
+            ),
+        )
+        return (
+            f'mtp.{i}.{key}' for layers, keys in scopes for i in layers for key in keys
+        )
 
     def parameter_bindings(self):
         return (
@@ -454,11 +463,10 @@ class DeepseekV41Model(nn.Module):
             state = AttentionState(
                 kv_owner=None if owners[0] == -1 else owners[0],
                 index_owner=None if owners[1] == -1 else owners[1],
-                latent=payload.latent,
-                main_kv=payload.kv,
-                index_k=payload.index_k,
-                indices=payload.topk,
-                candidates=payload.candidates,
+                **{
+                    name: getattr(payload, field)
+                    for name, field in _STATE_PAYLOAD.items()
+                },
             )
         # A stage beginning at p20 consumes the transported CED pair. A range
         # crossing p20 already holds this exact h19/p19 pair in its live stream.
@@ -467,20 +475,13 @@ class DeepseekV41Model(nn.Module):
         hidden, pre, state, (ced_h, ced_p) = self._layers(
             hidden, pre, input_ids, start, end, state, (ced_h, ced_p)
         )
-        return PairedPayload(
-            h=hidden,
-            p=pre,
-            ced_h=ced_h,
-            ced_p=ced_p,
-            kv=state.main_kv,
-            latent=state.latent,
-            # O12: index selection is discrete and has no indexer objective.
-            index_k=None if state.index_k is None else state.index_k.detach(),
-            topk=state.indices,
-            candidates=state.candidates,
-        ), (
-            -1 if state.kv_owner is None else state.kv_owner,
-            -1 if state.index_owner is None else state.index_owner,
+        fields = {field: getattr(state, name) for name, field in _STATE_PAYLOAD.items()}
+        # O12: index selection is discrete and has no indexer objective.
+        if fields['index_k'] is not None:
+            fields['index_k'] = fields['index_k'].detach()
+        return PairedPayload(hidden, pre, ced_h, ced_p, **fields), tuple(
+            -1 if owner is None else owner
+            for owner in (state.kv_owner, state.index_owner)
         )
 
     def finish_pipeline(self, payload):
